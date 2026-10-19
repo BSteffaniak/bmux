@@ -124,23 +124,15 @@ pub(crate) fn build(workspace: &Path) -> Result<BuiltBundle> {
         .open(owned.join("run.lock"))?;
     lock.try_lock()
         .map_err(|err| error(format!("another bterm build/run may be active: {err}")))?;
-    let status = cargo()
-        .args([
-            "build",
-            "--locked",
-            "--target",
-            &target,
-            "-p",
-            "bmux_bterm",
-            "--bin",
-            "bterm",
-            "-p",
-            "bmux_cli",
-            "--bin",
-            "bmux",
-        ])
-        .current_dir(workspace)
-        .status()?;
+    let mut arguments =
+        crate::build::arguments(&target, "dev", &crate::artifacts::declarations(workspace)?)?;
+    arguments.extend([
+        "-p".into(),
+        "bmux_bterm".into(),
+        "--bin".into(),
+        "bterm".into(),
+    ]);
+    let status = cargo().args(arguments).current_dir(workspace).status()?;
     if !status.success() {
         return Err(error(format!("bterm build failed: {status}")));
     }
@@ -191,7 +183,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let source = temp.path().join("source");
         fs::create_dir(&source).unwrap();
-        for name in ["bterm", "bmux"] {
+        for name in ["bterm", "bmux", "xtask", "bmux-pane-execution-supervisor"] {
             fs::write(source.join(name), "version one").unwrap();
             #[cfg(unix)]
             {

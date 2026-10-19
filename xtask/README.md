@@ -80,8 +80,11 @@ cargo xtask bterm stage --target TARGET --artifact-dir DIR --destination ABSENT_
 cargo xtask bterm verify --target TARGET --root EXECUTABLE_DIRECTORY
 ```
 
-Staging copies the actual `bterm` and `bmux` binaries, four bundled JetBrains
-Mono Nerd Font faces, and font/project notices. Static plugins remain part of
+Staging copies the actual `bterm` frontend plus the manifest-driven BMUX product
+payload: companion, installer, declared platform-supported helper executables
+(including the execution supervisor), and `artifacts.json`. That inventory and
+all helper bytes are covered by the Bterm bundle manifest. It also includes four
+bundled JetBrains Mono Nerd Font faces and font/project notices. Static plugins remain part of
 the BMUX companion. Both processes retain independent lifetimes; packaging never
 starts a runtime. The schema-1 `bterm-bundle.json` beside the executables records
 `bterm-bmux-v1`, the exact target, and relative paths with SHA-256 checksums.

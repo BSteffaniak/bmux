@@ -92,8 +92,29 @@ pub fn stage(workspace: &Path, source: &Path, destination: &Path, target: &str) 
     } else {
         payload.clone()
     };
-    fs::create_dir_all(&root)?;
+    // Use the same manifest-driven companion payload as the normal BMUX product.
+    // Helpers must remain beside the companion for owner-local plugin discovery.
+    crate::artifacts::stage(
+        source,
+        &root,
+        target,
+        &crate::artifacts::declarations(workspace)?,
+    )?;
+    let inventory = crate::artifacts::verify(&root)?;
     let mut artifacts = Vec::new();
+    for entry in fs::read_dir(&root)? {
+        let entry = entry?;
+        if entry.file_name() != "bmux" && entry.file_name() != "bmux.exe" {
+            artifacts.push(Artifact {
+                role: "runtime-payload".into(),
+                path: entry.file_name().into(),
+                sha256: digest(&entry.path())?,
+            });
+        }
+    }
+    if inventory.target != target {
+        return Err(error("companion inventory target mismatch"));
+    }
     for (name, role) in [("bterm", "frontend"), ("bmux", "companion")] {
         let name = if unix {
             name.into()
@@ -213,6 +234,28 @@ pub fn verify(root: &Path, expected_target: &str) -> Result<()> {
     if roles.len() != 2 {
         return Err(error("bundle requires frontend and companion"));
     }
+    if !paths.contains("artifacts.json") {
+        return Err(error("bundle requires companion artifact inventory"));
+    }
+    let inventory = crate::artifacts::verify_with_extra_members(
+        root,
+        &[
+            "bterm",
+            "bterm.exe",
+            "bterm-bundle.json",
+            "resources",
+            "notices",
+            "share",
+        ],
+    )?;
+    if inventory.target != expected_target
+        || inventory
+            .artifacts
+            .iter()
+            .any(|item| !paths.contains(&item.relative_path.to_ascii_lowercase()))
+    {
+        return Err(error("companion inventory is not covered by the bundle"));
+    }
     Ok(())
 }
 
@@ -225,7 +268,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("source");
         fs::create_dir(&source).unwrap();
-        for name in ["bmux", "bterm", "bmux.exe", "bterm.exe"] {
+        for name in [
+            "bmux",
+            "bterm",
+            "bmux.exe",
+            "bterm.exe",
+            "xtask",
+            "xtask.exe",
+            "bmux-pane-execution-supervisor",
+        ] {
             fs::write(source.join(name), name).unwrap();
             #[cfg(unix)]
             {
@@ -246,6 +297,22 @@ mod tests {
                 destination.clone()
             };
             verify(&root, target).unwrap();
+            if !target.contains("windows") {
+                let helper = root.join("bmux-pane-execution-supervisor");
+                assert!(helper.is_file());
+                let bytes = fs::read(&helper).unwrap();
+                fs::write(&helper, "corrupt").unwrap();
+                assert!(verify(&root, target).is_err());
+                fs::remove_file(&helper).unwrap();
+                assert!(verify(&root, target).is_err());
+                fs::write(&helper, bytes).unwrap();
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    fs::set_permissions(&helper, fs::Permissions::from_mode(0o755)).unwrap();
+                }
+                verify(&root, target).unwrap();
+            }
             assert!(verify(&root, "wrong-target").is_err());
             assert!(stage(&workspace, &source, &destination, target).is_err());
             fs::write(

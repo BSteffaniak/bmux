@@ -384,6 +384,14 @@ pub fn nfpm(config: &Path, destination: &Path, declarations: &[Value]) -> Result
     sync_dir(destination.parent().unwrap_or_else(|| Path::new(".")))
 }
 pub fn verify(source: &Path) -> Result<Inventory> {
+    verify_with_extra_members(source, &[])
+}
+
+/// Bterm has its own authenticated manifest covering additional frontend resources.
+pub(crate) fn verify_with_extra_members(
+    source: &Path,
+    extra_members: &[&str],
+) -> Result<Inventory> {
     let inventory: Inventory = serde_json::from_reader(regular(&source.join("artifacts.json"))?)?;
     if inventory.schema_version != 1 {
         return Err(error("unsupported artifact inventory"));
@@ -428,6 +436,7 @@ pub fn verify(source: &Path) -> Result<Inventory> {
             .to_str()
             .ok_or_else(|| error("non-UTF-8 artifact name"))?;
         if name != "artifacts.json"
+            && !extra_members.contains(&name)
             && !inventory
                 .artifacts
                 .iter()

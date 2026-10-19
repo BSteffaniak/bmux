@@ -39,11 +39,14 @@ jobs:
       - name: Bundle fixtures (all layouts)
         run: cargo test --locked -p xtask bterm::tests
       - name: Build actual frontend and companion
-        run: cargo build --locked -p bmux_bterm --bin bterm -p bmux_cli --bin bmux -p xtask --bin xtask
+        shell: bash
+        run: |
+          cargo xtask build --target '${{ matrix.target }}'
+          cargo build --locked --target '${{ matrix.target }}' -p bmux_bterm --bin bterm
       - name: Stage and verify installed artifacts
         shell: bash
         run: |
-          cargo run --locked -p xtask -- bterm stage --target '${{ matrix.target }}' --artifact-dir target/debug --destination "$PWD/dist/Bterm"
+          cargo run --locked -p xtask -- bterm stage --target '${{ matrix.target }}' --artifact-dir 'target/${{ matrix.target }}/debug' --destination "$PWD/dist/Bterm"
           root="$PWD/dist/Bterm"
           suffix=""
           if [[ '${{ runner.os }}' == macOS ]]; then root="$root/Contents/MacOS"; fi

@@ -24,7 +24,7 @@ fn build_only_replaces_bundle_without_launching_or_requiring_runtime_environment
     );
     executable(
         &tools.join("cargo"),
-        "#!/bin/sh\ncase \"$1\" in\nmetadata) cat \"$FIXTURE_METADATA\";;\nbuild) echo build >> \"$FIXTURE_BUILD_LOG\";;\n*) exit 99;;\nesac\n",
+        "#!/bin/sh\ncase \"$1\" in\nmetadata) cat \"$FIXTURE_METADATA\";;\nbuild) case \" $* \" in\n*\" --bin bmux-pane-execution-supervisor \"*) echo build >> \"$FIXTURE_BUILD_LOG\";;\n*) exit 98;;\nesac;;\n*) exit 99;;\nesac\n",
     );
     let metadata = temp.path().join("metadata.json");
     fs::write(
@@ -37,7 +37,7 @@ fn build_only_replaces_bundle_without_launching_or_requiring_runtime_environment
     .unwrap();
     let log = temp.path().join("build.log");
     // Neither bundled binary may be executed by the build-only command.
-    for name in ["bterm", "bmux"] {
+    for name in ["bterm", "bmux", "xtask", "bmux-pane-execution-supervisor"] {
         executable(
             &source.join(name),
             "#!/bin/sh\ntouch \"$FIXTURE_LAUNCHED\"\nexit 91\n",
@@ -72,6 +72,13 @@ fn build_only_replaces_bundle_without_launching_or_requiring_runtime_environment
         );
         assert!(!launched.exists());
         assert!(root.join("bterm-bundle.json").is_file());
+        assert!(root.join("bmux-pane-execution-supervisor").is_file());
+        let inventory: serde_json::Value =
+            serde_json::from_slice(&fs::read(root.join("artifacts.json")).unwrap()).unwrap();
+        assert!(inventory["artifacts"].as_array().unwrap().iter().any(
+            |item| item["relative_path"] == "bmux-pane-execution-supervisor"
+                && item["declaration"]["id"] == "execution-supervisor"
+        ));
         assert!(!root.join("obsolete").exists());
         if iteration == 0 {
             fs::write(root.join("obsolete"), "stale").unwrap();
