@@ -48,6 +48,7 @@ jobs:
           python3 scripts/test-compat-pty.py
           python3 scripts/test-live-guided-setup.py
           python3 scripts/test-live-deployment-boundary.py
+          node --test scripts/test-live-github-migration.mjs
           node --test scripts/test-site-cache-headers.mjs
           # Rust relay tests belong to workspace validation, not the retired runtime.
   acceptance:

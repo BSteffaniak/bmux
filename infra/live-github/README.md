@@ -11,13 +11,48 @@ The GitHub provider uses `GITHUB_TOKEN` from the operator environment. Do not pu
 credentials in tfvars, shell arguments, or committed files. Secret installation
 remains outside Terraform so reusable credentials never enter this root's state.
 
-## Existing installation: adopt before changing
+## Simplest path: temporary GitHub Actions migration
+
+1. Create a short-lived fine-grained GitHub token limited to this repository:
+   **Administration: read/write**, **Environments: read/write**, and
+   **Variables: read/write** (Metadata read is implicit). No contents-write or
+   secrets-read permission is needed.
+2. Add it as the `Production` environment secret `LIVE_GITHUB_ADMIN_TOKEN`.
+3. Push this code to `master`. Run **One-time GitHub Terraform migration** in
+   Actions. There are no inputs: it discovers existing IDs and public values,
+   shows the Terraform plan in the run summary, then waits for one approval.
+4. Review and approve `production-approval`. Wait for the apply and verification
+   job to finish successfully.
+5. Delete `.github/workflows/migrate-live-github.yml`,
+   `scripts/migrate-live-github.mjs`, `scripts/check-live-github-migration.mjs`,
+   and `scripts/test-live-github-migration.mjs`. Remove its test command from
+   `live-validation.yml`. Delete the admin secret and revoke the token.
+
+Keep this Terraform root, its lockfile, and `scripts/live-github-init.sh`.
+State persists encrypted in the existing R2 bucket under the separate key
+`bmux/github/production/terraform.tfstate`; the live application's state is untouched.
+Existing R2 credentials must permit this key and its `.tflock` object. No new bucket
+or application deployment is created. Plan artifacts expire after one day; they
+are **not** the state authority. Canonical state stays in R2.
+
+This deliberately stops for unexpected reviewers, timers, custom protections,
+branch policies, missing resources, or public configuration changes. It never
+silently deletes or recreates infrastructure. If a job fails after apply starts,
+keep the workflow/token, start a **new full run** to refresh canonical state and
+obtain a fresh approval; do not rerun only the old apply job or reset state.
+A repeated completed run should plan no changes.
+
+If this root was already applied using local state, stop: migrate that original
+state to the remote backend explicitly before running this workflow. Do not import
+the same resources into a second independent state.
+
+## Manual administration alternative
 
 Use a private working directory/state backup and restrictive umask (`umask 077`).
-The default local state belongs to this root, not the live application's R2 state.
-Keep it durable and backed up; never run from an ephemeral CI checkout. A dedicated
-remote backend can be configured and migrated explicitly later; do not reuse the
-application's state key.
+Export the existing R2 credentials, account ID, bucket, and encryption passphrase
+using the environment names consumed by `scripts/live-github-init.sh`. Source that
+script from Bash to initialize the dedicated backend and export Terraform's
+credential/encryption variables. Do not reuse the application's state key.
 
 Create an ignored `production.tfvars` with the **current** public values:
 
@@ -54,7 +89,7 @@ protection integrations exist, stop and explicitly reconcile them; do not assume
 the plan covers them. The Python admission checker rejects unexpected policies.
 
 ```sh
-tofu -chdir=infra/live-github init -lockfile=readonly
+source scripts/live-github-init.sh
 tofu -chdir=infra/live-github plan -var-file=production.tfvars -out=production.tfplan
 # Review imports, reviewer configuration, branch policies and public variables.
 tofu -chdir=infra/live-github apply production.tfplan

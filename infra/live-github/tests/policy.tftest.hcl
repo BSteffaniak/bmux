@@ -4,9 +4,10 @@ mock_provider "github" {
   }
 }
 variables {
-  owner             = "owner"
-  repository        = "repo"
-  approval_reviewer = "owner"
+  state_encryption_passphrase = "offline-test-only-not-a-production-credential"
+  owner                       = "owner"
+  repository                  = "repo"
+  approval_reviewer           = "owner"
   fly_config = {
     app    = "bmux-test"
     org    = "example"

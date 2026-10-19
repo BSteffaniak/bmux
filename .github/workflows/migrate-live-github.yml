@@ -1,0 +1,115 @@
+name: One-time GitHub Terraform migration (delete after success)
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: bmux-github-infrastructure
+  cancel-in-progress: false
+jobs:
+  plan:
+    if: github.repository == 'BSteffaniak/bmux' && github.ref == 'refs/heads/master'
+    runs-on: ubuntu-24.04
+    environment: Production
+    timeout-minutes: 15
+    outputs:
+      digest: ${{ steps.plan.outputs.digest }}
+    env:
+      GH_TOKEN: ${{ secrets.LIVE_GITHUB_ADMIN_TOKEN }}
+      GITHUB_TOKEN: ${{ secrets.LIVE_GITHUB_ADMIN_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      LIVE_STATE_BUCKET: ${{ secrets.LIVE_STATE_BUCKET }}
+      R2_STATE_ACCESS_KEY_ID: ${{ secrets.R2_STATE_ACCESS_KEY_ID }}
+      R2_STATE_SECRET_ACCESS_KEY: ${{ secrets.R2_STATE_SECRET_ACCESS_KEY }}
+      TOFU_STATE_ENCRYPTION_PASSPHRASE: ${{ secrets.TOFU_STATE_ENCRYPTION_PASSPHRASE }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with: {persist-credentials: false}
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with: {node-version: '22.16.0'}
+      - uses: opentofu/setup-opentofu@9d84900f3238fab8cd84ce47d658d25dd008be2f
+        with: {tofu_version: '1.10.9', tofu_wrapper: false}
+      - name: Discover existing resources and prepare exact encrypted plan
+        id: plan
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          test -n "$GH_TOKEN" || { echo 'Add temporary Production secret LIVE_GITHUB_ADMIN_TOKEN first'; exit 1; }
+          source scripts/live-github-init.sh
+          mkdir "$RUNNER_TEMP/github-migration"
+          node scripts/migrate-live-github.mjs "$RUNNER_TEMP/github-migration/adoption.tfvars.json"
+          tofu -chdir=infra/live-github plan -input=false -lock-timeout=5m \
+            -var-file="$RUNNER_TEMP/github-migration/adoption.tfvars.json" \
+            -out="$RUNNER_TEMP/github-migration/approved.tfplan" > "$RUNNER_TEMP/github-plan.log" 2>&1 || {
+              echo 'Plan failed; no apply attempted. Inspect provider access and canonical backend; do not reset state.'; exit 1;
+            }
+          tofu -chdir=infra/live-github show -json "$RUNNER_TEMP/github-migration/approved.tfplan" |
+            node scripts/check-live-github-migration.mjs
+          tofu -chdir=infra/live-github show -no-color "$RUNNER_TEMP/github-migration/approved.tfplan" >> "$GITHUB_STEP_SUMMARY"
+          cd "$RUNNER_TEMP/github-migration"
+          sha256sum approved.tfplan adoption.tfvars.json adoption.tfvars.json.snapshot.json > SHA256SUMS
+          echo "digest=$(sha256sum SHA256SUMS | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: github-migration-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/github-migration/
+          retention-days: 1
+          if-no-files-found: error
+  approve:
+    needs: plan
+    runs-on: ubuntu-24.04
+    environment: production-approval
+    steps:
+      - run: echo 'Approve the Terraform plan shown in this run summary; imports and policy updates only.'
+  apply:
+    needs: [plan, approve]
+    runs-on: ubuntu-24.04
+    environment: Production
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ secrets.LIVE_GITHUB_ADMIN_TOKEN }}
+      GITHUB_TOKEN: ${{ secrets.LIVE_GITHUB_ADMIN_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      LIVE_STATE_BUCKET: ${{ secrets.LIVE_STATE_BUCKET }}
+      R2_STATE_ACCESS_KEY_ID: ${{ secrets.R2_STATE_ACCESS_KEY_ID }}
+      R2_STATE_SECRET_ACCESS_KEY: ${{ secrets.R2_STATE_SECRET_ACCESS_KEY }}
+      TOFU_STATE_ENCRYPTION_PASSPHRASE: ${{ secrets.TOFU_STATE_ENCRYPTION_PASSPHRASE }}
+      APPROVED_DIGEST: ${{ needs.plan.outputs.digest }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with: {persist-credentials: false}
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with: {node-version: '22.16.0'}
+      - uses: opentofu/setup-opentofu@9d84900f3238fab8cd84ce47d658d25dd008be2f
+        with: {tofu_version: '1.10.9', tofu_wrapper: false}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: github-migration-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/github-migration
+      - name: Apply approved plan and verify durable configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          cd "$RUNNER_TEMP/github-migration"
+          test "$(sha256sum SHA256SUMS | cut -d ' ' -f 1)" = "$APPROVED_DIGEST"
+          sha256sum -c SHA256SUMS
+          cd "$GITHUB_WORKSPACE"
+          source scripts/live-github-init.sh
+          # Re-read authoritative GitHub metadata; do not apply against changed resources.
+          node scripts/migrate-live-github.mjs "$RUNNER_TEMP/current.tfvars.json"
+          cmp "$RUNNER_TEMP/current.tfvars.json" "$RUNNER_TEMP/github-migration/adoption.tfvars.json"
+          cmp "$RUNNER_TEMP/current.tfvars.json.snapshot.json" "$RUNNER_TEMP/github-migration/adoption.tfvars.json.snapshot.json"
+          tofu -chdir=infra/live-github show -json "$RUNNER_TEMP/github-migration/approved.tfplan" |
+            node scripts/check-live-github-migration.mjs
+          tofu -chdir=infra/live-github apply -input=false -lock-timeout=5m \
+            "$RUNNER_TEMP/github-migration/approved.tfplan" > "$RUNNER_TEMP/github-apply.log" 2>&1 || {
+              echo 'Apply failed or interrupted. Remote state may contain partial progress. Start a new full run; never reset state or rerun only apply.'; exit 1;
+            }
+          tofu -chdir=infra/live-github plan -input=false -lock-timeout=5m -detailed-exitcode \
+            -var-file="$RUNNER_TEMP/github-migration/adoption.tfvars.json" > "$RUNNER_TEMP/github-verify.log" 2>&1 || {
+              echo 'Verification failed; keep workflow and token for recovery. Do not reset remote state.'; exit 1;
+            }
+          echo 'Migration verified. Encrypted canonical state: bmux/github/production/terraform.tfstate' >> "$GITHUB_STEP_SUMMARY"
+          echo 'Now delete this workflow, its migration helpers and LIVE_GITHUB_ADMIN_TOKEN; revoke the token. Keep infra/live-github and live-github-init.sh.' >> "$GITHUB_STEP_SUMMARY"

@@ -6,8 +6,7 @@ terraform {
       version = "= 6.6.0"
     }
   }
-  # Local state is deliberate: this admin-only bootstrap root establishes the
-  # environments used by deployment. Never run it from a production release.
+  # Dedicated encrypted remote state; never share the live application's key.
 }
 
 provider "github" {
