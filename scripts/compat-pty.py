@@ -26,17 +26,31 @@ def controlling_terminal():
     fcntl.ioctl(0, termios.TIOCSCTTY, 0)
 
 
-def stop_group(child):
-    # The attach and its foreground descendants belong to this freshly created
-    # session. The isolated BMUX daemon is separately stopped by compat-matrix.
-    for sig in (signal.SIGTERM, signal.SIGKILL):
+def stop_child(child):
+    # wait()/poll() may already have reaped the attach. Its former numeric
+    # process group is not cleanup authority (Darwin also returns EPERM for a
+    # zombie-only group). Never signal that group after its leader is gone.
+    # This single-threaded driver alone owns/reaps the Popen child, so an exit
+    # racing poll(None) remains unreaped and cannot recycle its PID. Popen's
+    # terminate/kill check again before signaling that exact child. The isolated
+    # BMUX daemon and its executions are stopped separately by compat-matrix.
+    for send, grace in ((child.terminate, 0.1), (child.kill, 2)):
+        if child.poll() is not None:
+            return
         try:
-            os.killpg(child.pid, sig)
-        except ProcessLookupError:
-            break
-        if sig == signal.SIGTERM:
-            time.sleep(0.1)
-    child.wait(timeout=2)
+            send()
+        except OSError as exc:
+            print(f'compatibility owned attach cleanup signal failed: '
+                  f'pid={child.pid}: {exc}', flush=True)
+            raise
+        try:
+            child.wait(timeout=grace)
+            return
+        except subprocess.TimeoutExpired:
+            if grace == 2:
+                print(f'compatibility owned attach cleanup not acknowledged: '
+                      f'pid={child.pid}', flush=True)
+                raise
 
 
 def run(command, marker, transcript, timeout):
@@ -97,11 +111,13 @@ def run(command, marker, transcript, timeout):
                 return 1
             return code if code >= 0 else 128 - code
     finally:
-        if child is not None:
-            stop_group(child)
-        os.close(master)
-        if slave is not None:
-            os.close(slave)
+        try:
+            if child is not None:
+                stop_child(child)
+        finally:
+            os.close(master)
+            if slave is not None:
+                os.close(slave)
 
 
 def interrupted(signum, _frame):

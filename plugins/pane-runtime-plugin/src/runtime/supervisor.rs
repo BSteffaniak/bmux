@@ -102,23 +102,15 @@ pub(super) fn install_test_artifact() -> anyhow::Result<()> {
     Ok(())
 }
 
-// Ordinary terminals have no durable supervision promise. Managed executions
-// must fail before spawn instead of silently weakening their lifecycle contract.
+// Every execution requires the server-owned lifetime backend. A direct PTY
+// fallback cannot clean HUP-ignoring shell jobs after server death.
 pub(super) fn select_backend(
     preparation: anyhow::Result<(SupervisorControl, portable_pty::CommandBuilder)>,
-    required: bool,
+    _required: bool,
 ) -> anyhow::Result<Option<SupervisorControl>> {
     match preparation {
         Ok((control, _)) => Ok(Some(control)),
-        Err(error) if required => Err(error),
-        Err(error) => {
-            static WARNED: std::sync::atomic::AtomicBool =
-                std::sync::atomic::AtomicBool::new(false);
-            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                tracing::warn!(%error, "supervisor unavailable; ordinary terminals use direct PTYs without durable supervision or application resurrection");
-            }
-            Ok(None)
-        }
+        Err(error) => Err(error),
     }
 }
 
@@ -128,8 +120,88 @@ pub(super) struct SupervisorControl {
     authentication: String,
     version: u32,
     artifact: PathBuf,
+    #[cfg(unix)]
+    lifetime: Mutex<Lifetime>,
 }
+#[cfg(unix)]
+#[derive(Default)]
+struct Lifetime {
+    revoked: bool,
+    socket: Option<std::os::unix::net::UnixStream>,
+}
+#[cfg(unix)]
+impl Lifetime {
+    fn revoke(&mut self) {
+        self.revoked = true;
+        self.socket.take();
+    }
+    fn install(&mut self, socket: std::os::unix::net::UnixStream) -> anyhow::Result<()> {
+        anyhow::ensure!(!self.revoked, "execution lifetime already revoked");
+        anyhow::ensure!(
+            self.socket.is_none(),
+            "execution lifetime already installed"
+        );
+        self.socket = Some(socket);
+        Ok(())
+    }
+}
+
+/// Own the unreaped child throughout readiness negotiation. Drop never waits
+/// indefinitely on a wedged kernel process; a reaper retains Child ownership.
+#[cfg(unix)]
+struct StartupChild(Option<std::process::Child>);
+#[cfg(unix)]
+impl Drop for StartupChild {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.kill();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+            loop {
+                match child.try_wait() {
+                    Ok(Some(_)) => return,
+                    Ok(None) if std::time::Instant::now() < deadline => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    _ => break,
+                }
+            }
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+        }
+    }
+}
+
+#[cfg(unix)]
+fn negotiate_guardian(
+    mut child: StartupChild,
+    mut readiness: std::os::unix::net::UnixStream,
+    lifetime: &Mutex<Lifetime>,
+) -> anyhow::Result<Box<dyn portable_pty::Child + Send + Sync>> {
+    let version: u32 = protocol::read_frame(&mut readiness)?;
+    anyhow::ensure!(
+        version == protocol::VERSION,
+        "guardian startup negotiation rejected"
+    );
+    // Install and revocation share one lock. Prior revocation is sticky even
+    // when readiness arrived after pane close; rejected sockets close here.
+    lifetime
+        .lock()
+        .map_err(|_| anyhow::anyhow!("supervisor lifetime lock poisoned"))?
+        .install(readiness)?;
+    Ok(Box::new(child.0.take().expect("negotiated guardian child")))
+}
+
 impl SupervisorControl {
+    /// End pane lifetime without depending on PTY hangup or a numeric PID.
+    #[cfg(unix)]
+    pub(super) fn end_lifetime(&self) -> anyhow::Result<()> {
+        self.lifetime
+            .lock()
+            .map_err(|_| anyhow::anyhow!("supervisor lifetime lock poisoned"))?
+            .revoke();
+        Ok(())
+    }
     pub(super) fn prepare(
         token: uuid::Uuid,
     ) -> anyhow::Result<(Self, portable_pty::CommandBuilder)> {
@@ -195,8 +267,8 @@ impl SupervisorControl {
                 "artifact_sha256": installation.hash,
             }),
         )?;
-        // Execution-owned endpoint survives client/daemon disconnect; explicit
-        // retirement, not this stack frame, owns eventual removal.
+        // Keep the locator until explicit retirement. The execution itself is
+        // bounded by the server-owned lifetime socket, not this directory.
         let _retained_directory = endpoint_directory.keep();
         let mut command = portable_pty::CommandBuilder::new(&installation.path);
         command.arg("--guardian-terminal-session-v4");
@@ -209,6 +281,8 @@ impl SupervisorControl {
                 authentication,
                 version,
                 artifact: installation.path.clone(),
+                #[cfg(unix)]
+                lifetime: Mutex::new(Lifetime::default()),
             },
             command,
         ))
@@ -225,7 +299,7 @@ impl SupervisorControl {
             self.version == protocol::VERSION,
             "guardian requires explicit terminal-session protocol"
         );
-        let (mut readiness, ready_child) = std::os::unix::net::UnixStream::pair()?;
+        let (readiness, ready_child) = std::os::unix::net::UnixStream::pair()?;
         readiness.set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
         let ready_fd = ready_child.as_raw_fd();
         let mut command = std::process::Command::new(&self.artifact);
@@ -246,15 +320,10 @@ impl SupervisorControl {
                 Ok(())
             });
         }
-        let child = command.spawn()?;
+        let child = StartupChild(Some(command.spawn()?));
         drop(command);
         drop(ready_child);
-        let version: u32 = protocol::read_frame(&mut readiness)?;
-        anyhow::ensure!(
-            version == protocol::VERSION,
-            "guardian startup negotiation rejected"
-        );
-        Ok(Box::new(child))
+        negotiate_guardian(child, readiness, &self.lifetime)
     }
 
     #[cfg(unix)]

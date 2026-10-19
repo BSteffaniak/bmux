@@ -22,6 +22,68 @@ async fn wait_for(path: &std::path::Path, expected: &str, server: &support::Serv
     }
 }
 
+async fn wait_for_restores(path: &std::path::Path, count: usize, server: &support::ServerEnv) {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let text = std::fs::read_to_string(path).unwrap_or_default();
+        if text.lines().filter(|line| *line == "committed").count() == count + 1 {
+            let welcomes = text
+                .lines()
+                .filter(|line| *line != "committed")
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(welcomes.len(), count + 1);
+            assert!(welcomes[0]["restore"].is_null());
+            for welcome in &welcomes[1..] {
+                assert_eq!(welcome["restore"]["application"], "test");
+                assert_eq!(
+                    welcome["restore"]["session"],
+                    format!("saved-selection:{}", path.display()),
+                    "restoration selected another pane's application session"
+                );
+                assert_eq!(welcome["cwd"], welcomes[0]["cwd"], "restart changed cwd");
+            }
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "missing restoration {count}: {text}; {}",
+            server.server_output()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn layout_root(
+    connection: &mut bmux_client::BmuxClient,
+    session: uuid::Uuid,
+) -> serde_json::Value {
+    use bmux_pane_runtime_plugin_api::attach_runtime_commands::{self, client as attach};
+    let grant = attach::attach_session(
+        connection,
+        attach_runtime_commands::SessionSelector {
+            id: Some(session),
+            name: None,
+        },
+        true,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    attach::attach_open(connection, session, grant.token)
+        .await
+        .unwrap()
+        .unwrap();
+    let layout = bmux_pane_runtime_plugin_api::attach_runtime_state::client::attach_layout_state(
+        connection, session,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&layout.encoded).unwrap();
+    value.get("layout_root").expect("layout root").clone()
+}
+
 fn bash_path() -> String {
     let resolved = std::process::Command::new("which")
         .arg("bash")
@@ -75,7 +137,27 @@ async fn nushell_application_session_survives_real_daemon_restart() {
     round_trip(true, nu.trim()).await;
 }
 
+#[tokio::test]
+async fn application_sessions_survive_repeated_sigkill_restarts() {
+    restart_round_trip(false, &bash_path(), true, 2, 2).await;
+}
+
+#[tokio::test]
+async fn shell_application_session_survives_repeated_sigkill_restarts() {
+    restart_round_trip(true, &bash_path(), true, 1, 2).await;
+}
+
 async fn round_trip(shell: bool, shell_program: &str) {
+    restart_round_trip(shell, shell_program, false, 1, 1).await;
+}
+
+async fn restart_round_trip(
+    shell: bool,
+    shell_program: &str,
+    abrupt: bool,
+    pane_count: usize,
+    restarts: usize,
+) {
     let mut server = support::ServerEnv::new("application-resurrection");
     server.write_config(&format!(
         "[general]\ndefault_shell = '{shell_program}'\n[behavior]\nrestore_last_layout = true\n",
@@ -98,8 +180,9 @@ f = s.makefile('rwb', buffering=0)
 def send(value): f.write((json.dumps(value)+'\n').encode())
 send(dict(protocol='application-resurrection/1',application='test',pid=os.getpid(),accept_restore=True))
 welcome = json.loads(f.readline())
+welcome['cwd'] = os.getcwd()
 with open(sys.argv[1], 'a') as out: out.write(json.dumps(welcome)+'\n')
-send(dict(operation='selection',revision=1,descriptor=dict(application='test',session='saved-selection')))
+send(dict(operation='selection',revision=1,descriptor=dict(application='test',session='saved-selection:' + sys.argv[1])))
 ack = json.loads(f.readline())
 if ack != {'revision': 1}:
     raise RuntimeError('selection was not acknowledged: ' + repr(ack))
@@ -164,25 +247,43 @@ while True: time.sleep(1)
         .unwrap()
         .unwrap();
     } else {
-        let _: pane_runtime_commands::PaneAck = client::launch_pane(
-            &mut connection,
-            session.session_id,
-            None,
-            "horizontal".into(),
-            50,
-            None,
-            python.clone(),
-            vec![
-                script.to_string_lossy().into_owned(),
-                result.to_string_lossy().into_owned(),
-            ],
-            None,
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        for index in 0..pane_count {
+            let result = if index == 0 {
+                result.clone()
+            } else {
+                server.root().join(format!("offers-{index}.jsonl"))
+            };
+            let _: pane_runtime_commands::PaneAck = client::launch_pane(
+                &mut connection,
+                session.session_id,
+                None,
+                "horizontal".into(),
+                50,
+                None,
+                python.clone(),
+                vec![
+                    script.to_string_lossy().into_owned(),
+                    result.to_string_lossy().into_owned(),
+                ],
+                Some(server.root().to_string_lossy().into_owned()),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        }
     }
-    wait_for(&result, "committed", &server).await;
+    let results = (0..pane_count)
+        .map(|index| {
+            if index == 0 {
+                result.clone()
+            } else {
+                server.root().join(format!("offers-{index}.jsonl"))
+            }
+        })
+        .collect::<Vec<_>>();
+    for result in &results {
+        wait_for(result, "committed", &server).await;
+    }
     if shell {
         // Application selection commits over a different socket from shell
         // metadata. Do not snapshot until both authorities observed the launch.
@@ -210,10 +311,54 @@ while True: time.sleep(1)
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
+    let before = bmux_pane_runtime_plugin_api::pane_runtime_state::client::list_panes(
+        &mut connection,
+        Some(session.session_id),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let before_layout = layout_root(&mut connection, session.session_id).await;
     drop(connection);
-    server.stop();
-    server.start();
-    wait_for(&result, "saved-selection", &server).await;
+    for restart in 1..=restarts {
+        if abrupt {
+            // Selection acknowledgements fence the application checkpoint, not
+            // the layout snapshot. Commit both before deliberately losing the daemon.
+            let saved = server.run(&["server", "save"]);
+            assert!(saved.status.success(), "snapshot failed: {saved:?}");
+            server.restart();
+        } else {
+            server.stop();
+            server.start();
+        }
+        for result in &results {
+            wait_for_restores(result, restart, &server).await;
+        }
+        let mut connection = bmux_client::BmuxClient::connect(
+            &endpoint,
+            Duration::from_secs(10),
+            "resurrection-layout-test",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            layout_root(&mut connection, session.session_id).await,
+            before_layout,
+            "restart changed the pane split layout"
+        );
+        let after = bmux_pane_runtime_plugin_api::pane_runtime_state::client::list_panes(
+            &mut connection,
+            Some(session.session_id),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            before.panes.iter().map(|pane| pane.id).collect::<Vec<_>>(),
+            after.panes.iter().map(|pane| pane.id).collect::<Vec<_>>(),
+            "restart changed pane identities or ordering"
+        );
+    }
     if shell {
         manual_launch_after_restore(
             &endpoint,

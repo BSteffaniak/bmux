@@ -195,4 +195,34 @@ impl DurableCapture {
 }
 
 #[cfg(test)]
+mod server_loss_tests {
+    use super::*;
+
+    #[test]
+    fn abandoned_writer_preserves_committed_output_without_claiming_eof() {
+        let root = tempfile::tempdir().unwrap();
+        let mut capture = DurableCapture::create(root.path()).unwrap();
+        capture.append(b"before server loss").unwrap();
+        drop(capture); // No end acknowledgment, as with an interrupted owner.
+
+        // A crash can leave an uncommitted partial frame after the boundary.
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(root.path().join("events.bin"))
+            .unwrap()
+            .write_all(&[0xff, 0xff])
+            .unwrap();
+        let (boundary, bytes) = DurableCapture::read(root.path(), 0, 1024).unwrap();
+        assert_eq!(bytes, b"before server loss");
+        assert_eq!(boundary.bytes, u64::try_from(bytes.len()).unwrap());
+        assert!(!boundary.eof, "owner loss is not a committed capture end");
+        assert!(boundary.error.is_none());
+        assert!(DurableCapture::create(root.path()).is_err());
+        let (retained, bytes_again) = DurableCapture::read(root.path(), 0, 1024).unwrap();
+        assert_eq!(bytes_again, bytes);
+        assert!(!retained.eof);
+    }
+}
+
+#[cfg(test)]
 include!("durable_capture_tests.rs");

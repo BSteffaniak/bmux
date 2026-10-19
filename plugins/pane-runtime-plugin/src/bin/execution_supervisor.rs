@@ -11,6 +11,10 @@ mod receipts;
 mod session_guardian;
 
 #[cfg(unix)]
+#[path = "execution_supervisor/session_cleanup.rs"]
+mod session_cleanup;
+
+#[cfg(unix)]
 mod unix {
     pub(super) fn private_peer(socket: &std::os::unix::net::UnixStream) -> std::io::Result<()> {
         use std::os::fd::AsRawFd;
@@ -64,6 +68,9 @@ fn main() {
         let result = match args.get(1).map(String::as_str) {
             Some("--terminal-owner") if args.len() == 4 => {
                 session_guardian::owner(&args[2], &args[3])
+            }
+            Some("--join-and-kill-group") if args.len() == 3 => {
+                session_cleanup::join_and_kill(&args[2])
             }
             Some("--guardian-terminal-session-v4") if args.len() == 5 => {
                 session_guardian::run(&args[2], &args[3], &args[4])

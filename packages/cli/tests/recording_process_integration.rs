@@ -2038,6 +2038,188 @@ fn gif_dominant_colors(path: &Path) -> Vec<usize> {
     colors
 }
 
+/// An interrupted recording cannot be finalized, so its server needs explicit
+/// fixture-owned cleanup rather than the normal finish --cleanup-server path.
+struct InterruptedRecordingServer<'a> {
+    env: &'a RecordingEnv,
+    root: PathBuf,
+    stopped: bool,
+}
+
+impl Drop for InterruptedRecordingServer<'_> {
+    fn drop(&mut self) {
+        if self.stopped {
+            return;
+        }
+        let stopped = self
+            .env
+            .run_at_runtime(&["server", "stop"], None, Some(&self.root));
+        if !stopped.status.success() {
+            eprintln!("interrupted fixture server cleanup failed: {stopped:?}");
+        }
+        // Retain interrupted canonical evidence; never mark it finalized merely
+        // to make fixture cleanup succeed.
+        eprintln!(
+            "retained interrupted recording evidence: {}",
+            self.root.display()
+        );
+    }
+}
+
+#[test]
+#[serial]
+fn server_sigkill_does_not_resurrect_recorded_execution_or_invent_completion() {
+    let env = RecordingEnv::new();
+    let script = env.script(
+        "server-loss.sh",
+        "stty -echo -opost\nprintf launch >> launch-count\nprintf '%s' \"$$\" > target.pid\nprintf 'Ready>'\nIFS= read -r line\nprintf 'UNEXPECTED_REPLAY:%s' \"$line\"\n",
+    );
+    let key = uuid::Uuid::new_v4().to_string();
+    let args = [
+        "recording",
+        "process",
+        "start",
+        "--json",
+        "--idempotency-key",
+        &key,
+        "--profile",
+        "functional",
+        "--viewport",
+        "100x30",
+        "--cwd",
+        env.root.to_str().expect("cwd"),
+        "--",
+        "/bin/sh",
+        script.to_str().expect("script"),
+    ];
+    let first = env.json(&args);
+    let id = env.track_run(&first);
+    let runtime = PathBuf::from(first["runtime_root"].as_str().expect("owned root"));
+    let mut owner = InterruptedRecordingServer {
+        env: &env,
+        root: runtime.clone(),
+        stopped: false,
+    };
+    // Normal finish cleanup would restart this intentionally unfinished run.
+    // The guard above stops only its explicitly owned dedicated server instead.
+    env.runs.borrow_mut().retain(|run| run != &id);
+    env.json(&[
+        "recording",
+        "process",
+        "wait",
+        &id,
+        "--screen-contains",
+        "Ready>",
+        "--timeout",
+        "10s",
+        "--json",
+    ]);
+    let read_pid = |path: &Path| -> u32 {
+        let pid = fs::read_to_string(path)
+            .expect("fixture pid")
+            .trim()
+            .parse()
+            .expect("numeric pid");
+        assert!(pid > 1 && pid != std::process::id(), "unsafe fixture pid");
+        pid
+    };
+    let server_pid = read_pid(&runtime.join("runtime/server.pid"));
+    let target_pid = read_pid(&env.root.join("target.pid"));
+    assert_ne!(server_pid, target_pid);
+    let killed = Command::new("/bin/kill")
+        .args(["-KILL", &server_pid.to_string()])
+        .output()
+        .expect("kill only the dedicated recording server");
+    assert_success(&killed);
+
+    // Test the exact admitted target, not an unrelated process-name search.
+    // Treat an unreaped zombie as dead; kill(0) alone cannot distinguish it.
+    let target_running = || {
+        let output = Command::new("/bin/ps")
+            .args(["-o", "stat=", "-p", &target_pid.to_string()])
+            .output()
+            .expect("inspect exact fixture target");
+        output.status.success()
+            && !output.stdout.is_empty()
+            && !String::from_utf8_lossy(&output.stdout)
+                .trim_start()
+                .starts_with('Z')
+    };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while target_running() && Instant::now() < deadline {
+        thread::sleep(POLL_INTERVAL);
+    }
+    let leaked = target_running();
+    if leaked {
+        // Failure containment for the old independent-guardian implementation.
+        let _ = Command::new("/bin/kill")
+            .args(["-KILL", &target_pid.to_string()])
+            .status();
+    }
+
+    // Status reconnects the same owned server root, but not its recorded target.
+    // Missing current execution authority may return an explicit error instead
+    // of a status. Neither representation may claim a successful outcome.
+    for operation in [
+        vec!["recording", "process", "status", &id, "--json"],
+        args.to_vec(),
+    ] {
+        let output = env.run(&operation);
+        let value = parse_json(&output);
+        if output.status.success() {
+            assert_eq!(value["run_id"], first["run_id"]);
+            assert_eq!(value["execution"], first["execution"]);
+            assert_eq!(value["recording_id"], first["recording_id"]);
+            assert_eq!(value["recovery_required"], true);
+            assert_eq!(value["capture_finalized"], false);
+            assert_eq!(value["output_drained"], false);
+            assert!(value["exit_code"].is_null());
+        } else {
+            assert_eq!(value["ok"], false, "explicit recovery refusal: {value}");
+            assert!(
+                value["error"]
+                    .as_str()
+                    .is_some_and(|error| error.contains("execution status: NotFound")),
+                "must reach recording recovery, not fail bootstrap or service discovery: {value}"
+            );
+        }
+    }
+    let finish = env.run(&["recording", "process", "finish", &id, "--json"]);
+    assert!(
+        !finish.status.success(),
+        "server loss was finalized as complete"
+    );
+    assert_eq!(parse_json(&finish)["ok"], false);
+    // Recording commands above reached the restarted service. Dedicated runtimes
+    // deliberately omit the snapshot plugin, so `server status` is not a valid
+    // readiness probe here. Check the owned daemon identity instead.
+    assert_ne!(read_pid(&runtime.join("runtime/server.pid")), server_pid);
+    assert_eq!(fs::read(env.root.join("launch-count")).unwrap(), b"launch");
+    let retained: Value = serde_json::from_slice(
+        &fs::read(
+            runtime
+                .join("state/recordings/process-runs-v4")
+                .join(format!("{id}.json")),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(retained["execution"], first["execution"]);
+    assert_eq!(retained["capture_finalized"], false);
+    assert_eq!(retained["output_drained"], false);
+    assert_eq!(retained["capture_eof"], false);
+    assert_eq!(retained["target_exited"], false);
+    assert_eq!(retained["cleanup_complete"], false);
+    assert!(retained["exit_code"].is_null());
+    let stopped = env.run_at_runtime(&["server", "stop"], None, Some(&owner.root));
+    assert_success(&stopped);
+    owner.stopped = true;
+    assert!(
+        !leaked,
+        "recorded target survived its owning server SIGKILL"
+    );
+}
+
 #[test]
 #[serial]
 fn incomplete_capture_refuses_finalization_and_retries_without_relaunch() {

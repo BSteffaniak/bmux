@@ -389,9 +389,123 @@ pub(crate) fn session_runtime_handle() -> bmux_pane_runtime_state::SessionRuntim
 }
 
 async fn shutdown_runtime_handle(removed: RemovedRuntime) {
-    for pane in removed.handle.panes.into_values() {
-        shutdown_pane_handle(pane).await;
-    }
+    shutdown_panes(removed.handle.panes.into_values().collect()).await;
+}
+
+// A cancelled service waiter must not cancel its cleanup owner. Retain every
+// owner JoinHandle until it has awaited all pane tasks (including their reapers).
+// Unlike a detached JoinHandle, this registry makes outstanding cleanup owned.
+fn pane_shutdown_owners() -> &'static Mutex<BTreeMap<Uuid, JoinHandle<()>>> {
+    static OWNERS: std::sync::OnceLock<Mutex<BTreeMap<Uuid, JoinHandle<()>>>> =
+        std::sync::OnceLock::new();
+    OWNERS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+async fn shutdown_panes(mut panes: Vec<PaneRuntimeHandle>) {
+    let id = Uuid::new_v4();
+    let (begin, admission) = oneshot::channel();
+    let (settled, settlement) = oneshot::channel();
+    let owner = tokio::spawn(async move {
+        if admission.await.is_err() {
+            return;
+        }
+        // Send every stop before waiting for any one pane. Each runtime task
+        // freezes its checkpoint before signaling; Drop provides the same fence
+        // if startup has not yet reached its stop receiver.
+        for pane in &mut panes {
+            pane.publication.decide(false);
+            if let Some(stop) = pane.stop_tx.take() {
+                let _ = stop.send(());
+            }
+        }
+        // Freeze and revoke each lease before waiting on its task. In
+        // particular, a failed Sweep must not leave its slave holder alive
+        // while the cleanup task waits forever for reader EOF.
+        let lifetimes = panes
+            .iter()
+            .map(|pane| PaneLifetime {
+                execution: Arc::clone(&pane.execution),
+                resurrection: Arc::clone(&pane.resurrection_state),
+            })
+            .collect::<Vec<_>>();
+        let mut revocations = Vec::with_capacity(lifetimes.len());
+        for lifetime in lifetimes {
+            revocations.push(tokio::task::spawn_blocking(move || {
+                let frozen = lifetime
+                    .resurrection
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("resurrection lock poisoned"))
+                    .and_then(|mut state| state.freeze());
+                if let Err(error) = frozen {
+                    lifetime
+                        .execution
+                        .record_cleanup_error(format!("checkpoint freeze failed: {error}"));
+                }
+                // Prefer the acknowledged operation so the original target
+                // outcome is retained. Lease EOF is the mandatory fallback,
+                // even when that operation failed or remained uncertain.
+                if let Err(error) = lifetime.execution.signal_owned_group(execution::GROUP_KILL) {
+                    lifetime
+                        .execution
+                        .record_cleanup_error(format!("group stop failed: {error}"));
+                }
+                lifetime.revoke();
+            }));
+        }
+        for revocation in revocations {
+            if let Err(error) = revocation.await {
+                warn!(%error, "pane lifetime revocation worker failed");
+            }
+        }
+        let mut pending = vec![true; panes.len()];
+        std::future::poll_fn(|cx| {
+            use std::future::Future;
+            let mut waiting = false;
+            for (pane, pending) in panes.iter_mut().zip(&mut pending) {
+                if !*pending {
+                    continue;
+                }
+                match std::pin::Pin::new(&mut pane.task).poll(cx) {
+                    std::task::Poll::Ready(result) => {
+                        *pending = false;
+                        if let Err(error) = result {
+                            pane.execution
+                                .record_cleanup_error(format!("pane cleanup task failed: {error}"));
+                        } else if let Some(Err(error)) = pane.cleanup.borrow().as_ref() {
+                            pane.execution.record_cleanup_error(error.clone());
+                        } else if pane.cleanup.borrow().is_none() {
+                            pane.execution.record_cleanup_error(
+                                "pane task ended without cleanup acknowledgement".into(),
+                            );
+                        }
+                    }
+                    std::task::Poll::Pending => waiting = true,
+                }
+            }
+            if waiting {
+                std::task::Poll::Pending
+            } else {
+                std::task::Poll::Ready(())
+            }
+        })
+        .await;
+        // Lifetime guards are released only after all cleanup tasks settled.
+        for pane in &panes {
+            pane.lifetime.revoke();
+        }
+        drop(panes);
+        pane_shutdown_owners()
+            .lock()
+            .expect("pane shutdown owners lock")
+            .remove(&id);
+        let _ = settled.send(());
+    });
+    pane_shutdown_owners()
+        .lock()
+        .expect("pane shutdown owners lock")
+        .insert(id, owner);
+    let _ = begin.send(());
+    let _ = settlement.await;
 }
 
 struct LifecycleCompletion<'a>(&'a tokio::sync::watch::Sender<bool>);
@@ -462,33 +576,8 @@ async fn stop_unpublished_pane(pane: &mut PaneRuntimeHandle) -> Result<()> {
         .map_err(anyhow::Error::msg)
 }
 
-async fn shutdown_pane_handle(mut pane: PaneRuntimeHandle) {
-    pane.publication.decide(false);
-    if matches!(&*pane.startup.borrow(), Some(Err(_))) {
-        trace!(pane_id = %pane.meta.id, "cleaning up failed pane startup");
-    }
-    if let Some(stop_tx) = pane.stop_tx.take() {
-        let _ = stop_tx.send(());
-    }
-
-    if tokio::time::timeout(Duration::from_millis(250), &mut pane.task)
-        .await
-        .is_err()
-    {
-        let active_blocking_threads = PANE_BLOCKING_THREAD_COUNT.load(Ordering::SeqCst);
-        warn!(
-            pane_id = %pane.meta.id,
-            active_blocking_threads,
-            "pane runtime shutdown exceeded 250ms; aborting async task and leaving blocking thread cleanup detached",
-        );
-        // The pane runtime task owns OS-thread handles for PTY reader/waiter
-        // teardown. If one of those threads is stuck in a blocking read or
-        // wait, awaiting an aborted task here can wedge the server-side
-        // service dispatcher. Abort and detach instead; the task/thread
-        // resources are process-scoped cleanup best-effort after the pane has
-        // already been removed from runtime state.
-        pane.task.abort();
-    }
+async fn shutdown_pane_handle(pane: PaneRuntimeHandle) {
+    shutdown_panes(vec![pane]).await;
 }
 
 fn process_pane_output(
@@ -1169,6 +1258,8 @@ struct PaneResurrectionRuntime {
     launch: Option<crate::application_resurrection::Launch>,
     /// Ephemeral process incarnation; never persisted or reused on restart.
     observation_execution: Uuid,
+    /// Changes on every authenticated shell event, including repeated prompts.
+    metadata_revision: u64,
     /// Only metadata received from this incarnation, never restored CWD.
     observed_cwd: Option<String>,
     execution_token: Option<String>,
@@ -1189,6 +1280,7 @@ impl PaneResurrectionRuntime {
             frozen: false,
             launch: None,
             observation_execution: Uuid::new_v4(),
+            metadata_revision: 0,
             observed_cwd: None,
             execution_token: snapshot.execution_token.clone(),
             active_command: snapshot.active_command.clone(),
@@ -1198,11 +1290,22 @@ impl PaneResurrectionRuntime {
     }
 
     fn freeze(&mut self) -> anyhow::Result<()> {
-        if let Some(launch) = &self.launch {
-            launch.close_checked().map_err(anyhow::Error::msg)?;
-            self.launch = None;
-        }
+        self.freeze_with(|launch| {
+            launch.map_or(Ok(()), |launch| {
+                launch.close_checked().map_err(anyhow::Error::msg)
+            })
+        })
+    }
+
+    fn freeze_with(
+        &mut self,
+        close: impl FnOnce(Option<&crate::application_resurrection::Launch>) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        // In-memory fencing is unconditional: a failed durable close must not
+        // allow final prompt events to erase the invocation we are preserving.
         self.frozen = true;
+        close(self.launch.as_ref())?;
+        self.launch = None;
         Ok(())
     }
 
@@ -1221,10 +1324,49 @@ impl PaneResurrectionRuntime {
         }
     }
 
+    fn inspection_version(&self) -> (Uuid, u64, Option<String>) {
+        (
+            self.observation_execution,
+            self.metadata_revision,
+            self.execution_token.clone(),
+        )
+    }
+
+    fn apply_inspection(
+        &mut self,
+        version: &(Uuid, u64, Option<String>),
+        inspection: Option<ProcessInspectionResult>,
+    ) {
+        // A probe is only a best-effort projection. Never replace a newer
+        // invocation, prompt, command, or frozen final snapshot with its result.
+        if self.frozen
+            || self.inspection_version() != *version
+            || self.active_command_source == Some(PaneCommandSource::Verbatim)
+        {
+            return;
+        }
+        let Some(inspection) = inspection else {
+            // Unavailable/timeout is not evidence that a command reached prompt.
+            return;
+        };
+        self.metadata_revision = self.metadata_revision.wrapping_add(1);
+        if let Some(command) = inspection.command {
+            self.active_command = Some(command);
+            self.active_command_source = Some(PaneCommandSource::Inspection);
+        } else if self.active_command_source == Some(PaneCommandSource::Inspection) {
+            self.active_command = None;
+            self.active_command_source = None;
+        }
+        if let Some(cwd) = inspection.cwd {
+            self.last_known_cwd = Some(cwd);
+        }
+    }
+
     fn apply_event(&mut self, event: PaneShellMetadataEvent) {
         if self.frozen {
             return;
         }
+        self.metadata_revision = self.metadata_revision.wrapping_add(1);
         // Shell-marker authentication already scopes these events to this PTY.
         let (PaneShellMetadataEvent::CommandStart { cwd, .. }
         | PaneShellMetadataEvent::Prompt { cwd }) = &event;
@@ -1279,7 +1421,57 @@ enum SpawnDirectoryProbe {
     Process(u32, ProcessStartIdentity),
 }
 
+struct PaneLifetime {
+    execution: Arc<execution::ExecutionCapture>,
+    resurrection: Arc<std::sync::Mutex<PaneResurrectionRuntime>>,
+}
+
+impl PaneLifetime {
+    fn revoke(&self) {
+        // Handle drop is also a lifetime boundary, not just explicit shutdown.
+        // Fence checkpoint writers before any resulting shell prompt can mutate
+        // the invocation needed by the last durable restoration snapshot.
+        let frozen = self
+            .resurrection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("resurrection lock poisoned"))
+            .and_then(|mut resurrection| resurrection.freeze());
+        if let Err(error) = frozen {
+            self.execution.record_cleanup_error(format!(
+                "failed freezing resurrection before pane lifetime end: {error}"
+            ));
+            warn!(%error, "failed freezing resurrection before pane lifetime end");
+        }
+        #[cfg(unix)]
+        {
+            let revoked = self
+                .execution
+                .supervisor
+                .lock()
+                .map_err(|_| anyhow::anyhow!("supervisor lock poisoned"))
+                .and_then(|control| {
+                    control
+                        .as_ref()
+                        .map_or(Ok(()), |control| control.end_lifetime())
+                });
+            if let Err(error) = revoked {
+                self.execution.record_cleanup_error(format!(
+                    "failed revoking pane execution lifetime: {error}"
+                ));
+                warn!(%error, "failed revoking pane execution lifetime");
+            }
+        }
+    }
+}
+
+impl Drop for PaneLifetime {
+    fn drop(&mut self) {
+        self.revoke();
+    }
+}
+
 struct PaneRuntimeHandle {
+    lifetime: PaneLifetime,
     execution: Arc<execution::ExecutionCapture>,
     publication: Arc<StartupPublication>,
     cleanup: watch::Receiver<Option<std::result::Result<(), String>>>,
@@ -3285,6 +3477,7 @@ struct PanePersistenceDataRef {
     exited: Arc<AtomicBool>,
     process_id: Arc<std::sync::Mutex<Option<u32>>>,
     process_group_id: Arc<std::sync::Mutex<Option<i32>>>,
+    process_start_identity: Arc<std::sync::Mutex<Option<ProcessStartIdentity>>>,
     resurrection_state: Arc<std::sync::Mutex<PaneResurrectionRuntime>>,
 }
 
@@ -3304,6 +3497,7 @@ fn pane_persistence_data_ref(pane: &PaneRuntimeHandle) -> PanePersistenceDataRef
         exited: Arc::clone(&pane.exited),
         process_id: Arc::clone(&pane.process_id),
         process_group_id: Arc::clone(&pane.process_group_id),
+        process_start_identity: Arc::clone(&pane.process_start_identity),
         resurrection_state: Arc::clone(&pane.resurrection_state),
     }
 }
@@ -6373,6 +6567,11 @@ impl SessionRuntimeManager {
                             let mut exit_announced = false;
                             loop {
                                 let status = snapshot.status;
+                                if let Some(error) = status.capture_error {
+                                    // Incomplete capture is retained, but does not
+                                    // invalidate target termination or retirement.
+                                    execution_for_waiter.record_error(error);
+                                }
                                 if let Some(error) = status.error.or(status.cleanup_error) {
                                     anyhow::bail!(error);
                                 }
@@ -6810,22 +7009,25 @@ impl SessionRuntimeManager {
                         }
                         if execution_for_task.terminal_session_ended.load(Ordering::SeqCst)
                             && !natural_retirement_failed {
-                            // Keep the same control fence through publishing retirement
-                            // and closing the guardian, excluding late termination requests.
-                            let retirement_guard = execution_for_task.supervisor.lock();
-                            // Explicit termination may already have acknowledged this
-                            // exact control's retirement before this task acquired the
-                            // fence. Its waiter is then allowed to reap the guardian;
-                            // never open a second socket after that committed receipt.
-                            if retirement_guard.is_ok() && execution_for_task.terminal_owner_retired.load(Ordering::SeqCst) {
-                                execution_for_task.interrupt_lifecycle();
-                                break;
-                            }
-                            let retired = retirement_guard.as_ref().ok().and_then(|control| control.as_ref().map(|control| control.request(crate::supervisor_protocol::Operation::RetireOwner { mutation_id: "00000000-0000-4000-8000-000000000003".into() })));
+                            let execution = Arc::clone(&execution_for_task);
+                            let retired = tokio::task::spawn_blocking(move || {
+                                let guard = execution.supervisor.lock()
+                                    .map_err(|_| anyhow::anyhow!("supervisor lock poisoned"))?;
+                                if execution.terminal_owner_retired.load(Ordering::SeqCst) {
+                                    return Ok(());
+                                }
+                                let control = guard.as_ref().ok_or_else(|| anyhow::anyhow!("terminal-owner control unavailable"))?;
+                                let response = control.request(crate::supervisor_protocol::Operation::RetireOwner {
+                                    mutation_id: "00000000-0000-4000-8000-000000000003".into()
+                                })?;
+                                anyhow::ensure!(response.error.is_none(), "terminal-owner retirement rejected: {:?}", response.error);
+                                execution.terminal_owner_retired.store(true, Ordering::SeqCst);
+                                Ok::<(), anyhow::Error>(())
+                            }).await;
                             let retirement_error = match retired {
-                                Some(Ok(response)) => response.error,
-                                Some(Err(error)) => Some(error.to_string()),
-                                None => Some("terminal-owner control unavailable".into()),
+                                Ok(Ok(())) => None,
+                                Ok(Err(error)) => Some(error.to_string()),
+                                Err(error) => Some(error.to_string()),
                             };
                             if let Some(error) = retirement_error {
                                 execution_for_task.record_cleanup_error(format!("terminal-owner retirement failed: {error}"));
@@ -6839,20 +7041,44 @@ impl SessionRuntimeManager {
                             break;
                         }
                         if reader_thread_done.load(Ordering::SeqCst) && !execution_for_task.output_drained.load(Ordering::SeqCst) {
-                            if let Err(error) = execution_for_task.signal_owned_group(execution::GROUP_KILL) {
-                                execution_for_task.record_cleanup_error(format!("reader-failure group cleanup failed: {error}"));
+                            let lifetime = PaneLifetime {
+                                execution: Arc::clone(&execution_for_task),
+                                resurrection: Arc::clone(&resurrection_state_for_shutdown),
+                            };
+                            let cleanup = tokio::task::spawn_blocking(move || {
+                                if let Err(error) = lifetime.execution.signal_owned_group(execution::GROUP_KILL) {
+                                    lifetime.execution.record_cleanup_error(format!("reader-failure group cleanup failed: {error}"));
+                                }
+                                lifetime.revoke();
+                            }).await;
+                            if let Err(error) = cleanup {
+                                execution_for_task.record_cleanup_error(format!("reader cleanup worker failed: {error}"));
                             }
                             if !execution_for_task.terminal_owner_retired.load(Ordering::SeqCst) { let _ = child_killer.kill(); }
                             break;
                         }
                     }
                     _ = &mut stop_rx => {
-                        if let Ok(mut state) = resurrection_state_for_shutdown.lock() {
-                            state.close_launch();
-                            state.frozen = true;
-                        }
-                        if let Err(error) = execution_for_task.signal_owned_group(execution::GROUP_KILL) {
-                            execution_for_task.record_cleanup_error(format!("group stop failed: {error}"));
+                        let resurrection = Arc::clone(&resurrection_state_for_shutdown);
+                        let execution = Arc::clone(&execution_for_task);
+                        // Checkpoint/service IO and helper cleanup must not block
+                        // executor workers, otherwise multipane shutdown is serial
+                        // even when every pane received stop concurrently.
+                        let stopped = tokio::task::spawn_blocking(move || {
+                            let frozen = resurrection.lock()
+                                .map_err(|_| anyhow::anyhow!("resurrection lock poisoned"))
+                                .and_then(|mut state| state.freeze());
+                            if let Err(error) = frozen {
+                                execution.record_cleanup_error(format!("checkpoint freeze failed: {error}"));
+                            }
+                            if let Err(error) = execution.signal_owned_group(execution::GROUP_KILL) {
+                                execution.record_cleanup_error(format!("group stop failed: {error}"));
+                            }
+                            let lifetime = PaneLifetime { execution, resurrection };
+                            lifetime.revoke();
+                        }).await;
+                        if let Err(error) = stopped {
+                            execution_for_task.record_cleanup_error(format!("pane stop worker failed: {error}"));
                         }
                         if !execution_for_task.terminal_owner_retired.load(Ordering::SeqCst) { let _ = child_killer.kill(); }
                         break;
@@ -6957,10 +7183,15 @@ impl SessionRuntimeManager {
                 }
             }
             drop(writer);
-            // Release PTY authority only after actual capture drain and owner
-            // retirement. A pending descendant-held slave retains capture, not
-            // permission to signal a remembered process group.
-            if execution_for_task.output_drained.load(Ordering::SeqCst)
+            // A stopped reader can never drain again. After authoritative
+            // retirement, release its remaining master even when capture is
+            // incomplete: Darwin session-leader exit waits in ttywait() for
+            // unread output until the last master closes. Waiting for EOF here
+            // would retain that master while joining the child that needs it
+            // closed. This does not turn cancelled capture into observed EOF.
+            // A live reader (including an escaped slave holder) keeps its master.
+            if (execution_for_task.output_drained.load(Ordering::SeqCst)
+                || reader_thread_done.load(Ordering::SeqCst))
                 && (!program_execution
                     || execution_for_task
                         .terminal_owner_retired
@@ -7003,6 +7234,10 @@ impl SessionRuntimeManager {
             .get(&(session_id, pane_meta.id))
             .copied();
         PaneRuntimeHandle {
+            lifetime: PaneLifetime {
+                execution: Arc::clone(&execution),
+                resurrection: Arc::clone(&resurrection_state),
+            },
             execution,
             publication,
             startup,
@@ -10569,51 +10804,63 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
             return Ok(None);
         };
 
+        // One observation budget for the whole session, not one unbounded
+        // process-table scan per pane. Missing observations preserve metadata.
+        let inspection_deadline = Instant::now() + Duration::from_millis(250);
         let mut panes = Vec::with_capacity(parts.panes.len());
         for pane in parts.panes {
             let process_id = pane.process_id.lock().ok().and_then(|v| *v);
             let process_group_id = pane.process_group_id.lock().ok().and_then(|v| *v);
-            let mut resurrection_runtime = pane
+            let version = {
+                let state = pane
+                    .resurrection_state
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("resurrection state lock poisoned"))?;
+                (!state.frozen
+                    && !pane.exited.load(Ordering::SeqCst)
+                    && state.active_command_source != Some(PaneCommandSource::Verbatim)
+                    && pane.meta.launch.is_none())
+                .then(|| state.inspection_version())
+            };
+            let inspection = version.as_ref().and_then(|_| {
+                let budget = inspection_deadline.saturating_duration_since(Instant::now());
+                if budget.is_zero() {
+                    return None;
+                }
+                let shell = pane.meta.shell.clone();
+                let expected_identity = pane.process_start_identity.lock().ok().and_then(|v| *v);
+                bounded_directory_probe(&DIRECTORY_PROBES, budget, move || {
+                    let pid = process_id?;
+                    let identity = process_start_identity_for_pid(pid)?;
+                    if expected_identity
+                        .as_ref()
+                        .is_some_and(|expected| *expected != identity)
+                    {
+                        return None;
+                    }
+                    let observed =
+                        inspect_process_group_command_and_cwd(process_group_id, process_id, &shell);
+                    (process_start_identity_for_pid(pid).as_ref() == Some(&identity))
+                        .then_some(observed)
+                        .flatten()
+                })
+                .ok()
+                .flatten()
+            });
+            let same_process = pane.process_id.lock().ok().and_then(|value| *value) == process_id
+                && pane.process_group_id.lock().ok().and_then(|value| *value) == process_group_id;
+            let mut state = pane
                 .resurrection_state
                 .lock()
                 .map_err(|_| anyhow::anyhow!("resurrection state lock poisoned"))?;
-
-            if !resurrection_runtime.frozen
+            if let Some(version) = version
                 && !pane.exited.load(Ordering::SeqCst)
-                && resurrection_runtime.active_command_source != Some(PaneCommandSource::Verbatim)
+                && same_process
             {
-                match inspect_process_group_command_and_cwd(
-                    process_group_id,
-                    process_id,
-                    &pane.meta.shell,
-                ) {
-                    Some(inspection) => {
-                        if let Some(command) = inspection.command {
-                            resurrection_runtime.active_command = Some(command);
-                            resurrection_runtime.active_command_source =
-                                Some(PaneCommandSource::Inspection);
-                        } else if resurrection_runtime.active_command_source
-                            == Some(PaneCommandSource::Inspection)
-                        {
-                            resurrection_runtime.active_command = None;
-                            resurrection_runtime.active_command_source = None;
-                        }
-                        if let Some(cwd) = inspection.cwd {
-                            resurrection_runtime.last_known_cwd = Some(cwd);
-                        }
-                    }
-                    None if resurrection_runtime.active_command_source
-                        == Some(PaneCommandSource::Inspection) =>
-                    {
-                        resurrection_runtime.active_command = None;
-                        resurrection_runtime.active_command_source = None;
-                    }
-                    None => {}
-                }
+                state.apply_inspection(&version, inspection);
             }
-
             let mut meta = pane.meta;
-            meta.resurrection = resurrection_runtime.to_snapshot();
+            meta.resurrection = state.to_snapshot();
             panes.push(meta);
         }
 
@@ -11153,14 +11400,12 @@ pub(crate) fn observe_spawn_directory(
 static DIRECTORY_PROBES: AtomicUsize = AtomicUsize::new(0);
 const MAX_DIRECTORY_PROBES: usize = 4;
 
-fn bounded_directory_probe(
+fn bounded_directory_probe<T: Send + 'static>(
     active: &'static AtomicUsize,
     timeout: Duration,
-    probe: impl FnOnce() -> Option<String> + Send + 'static,
-) -> std::result::Result<
-    Option<String>,
-    bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::SpawnError,
-> {
+    probe: impl FnOnce() -> Option<T> + Send + 'static,
+) -> std::result::Result<Option<T>, bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::SpawnError>
+{
     use bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::SpawnError;
     struct Permit(&'static AtomicUsize);
     impl Drop for Permit {
@@ -11462,23 +11707,111 @@ fn send_process_signal(
 }
 
 #[cfg(unix)]
+struct InspectionChild {
+    child: Option<std::process::Child>,
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
+#[cfg(unix)]
+impl Drop for InspectionChild {
+    fn drop(&mut self) {
+        if let (Some(child), Some(permit)) = (self.child.take(), self.permit.take()) {
+            retire_inspection_child(child, permit);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn retire_inspection_child(
+    mut child: std::process::Child,
+    permit: tokio::sync::OwnedSemaphorePermit,
+) {
+    let _ = child.kill();
+    if matches!(child.try_wait(), Ok(Some(_))) {
+        return;
+    }
+    std::thread::spawn(move || {
+        let _permit = permit;
+        let _ = child.wait();
+    });
+}
+
+/// Deadline-bound observation. A kernel-stuck child retains an admission slot
+/// and its exact owned reaper, never extending the observation caller's wait.
+#[cfg(unix)]
+fn bounded_probe_output(
+    command: &mut std::process::Command,
+    timeout: Duration,
+) -> std::io::Result<Vec<u8>> {
+    use std::io::{Read, Seek};
+    use std::process::Stdio;
+    static SLOTS: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+    let permit = Arc::clone(SLOTS.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(4))))
+        .try_acquire_owned()
+        .map_err(|_| std::io::Error::other("inspection reapers busy"))?;
+    let mut output = tempfile::tempfile()?;
+    let child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(output.try_clone()?))
+        .stderr(Stdio::null())
+        .spawn()?;
+    let mut owned = InspectionChild {
+        child: Some(child),
+        permit: Some(permit),
+    };
+    let child = owned.child.as_mut().expect("inspection child owned");
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        let oversized = output.metadata().is_ok_and(|meta| meta.len() > 1_048_576);
+        if oversized {
+            return Err(std::io::Error::other(
+                "process inspection output exceeds limit",
+            ));
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            result => {
+                return Err(match result {
+                    Err(error) => error,
+                    _ => std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "process inspection timed out",
+                    ),
+                });
+            }
+        }
+    };
+    if !status.success() {
+        return Err(std::io::Error::other("process inspection failed"));
+    }
+    output.rewind()?;
+    let mut bytes = Vec::new();
+    output.take(1_048_577).read_to_end(&mut bytes)?;
+    if bytes.len() > 1_048_576 {
+        return Err(std::io::Error::other(
+            "process inspection output exceeds limit",
+        ));
+    }
+    Ok(bytes)
+}
+
+#[cfg(unix)]
 fn inspect_process_group_command_and_cwd(
     process_group_id: Option<i32>,
     shell_pid: Option<u32>,
     shell_path: &str,
 ) -> Option<ProcessInspectionResult> {
     let process_group_id = process_group_id?;
-    let output = std::process::Command::new("ps")
-        .arg("-A")
-        .arg("-o")
-        .arg("pid=,pgid=,state=,command=")
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
+    let bytes = bounded_probe_output(
+        std::process::Command::new("ps").args(["-A", "-o", "pid=,pgid=,state=,command="]),
+        Duration::from_millis(200),
+    )
+    .ok()?;
 
-    let entries = String::from_utf8_lossy(&output.stdout)
+    let entries = String::from_utf8_lossy(&bytes)
         .lines()
         .filter_map(parse_ps_process_entry)
         .collect::<Vec<_>>();
@@ -11533,7 +11866,38 @@ fn process_command_looks_like_shell(command: &str, shell_path: &str) -> bool {
         )
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
+fn resolve_process_working_directory(pid: u32) -> Option<String> {
+    let pid = i32::try_from(pid).ok()?;
+    // SAFETY: integer-only C storage is initialized and the kernel receives its
+    // exact size. No process-table subprocess or filesystem-wide lsof scan.
+    let mut info: libc::proc_vnodepathinfo = unsafe { std::mem::zeroed() };
+    let size = i32::try_from(std::mem::size_of_val(&info)).ok()?;
+    let read = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDVNODEPATHINFO,
+            0,
+            (&raw mut info).cast(),
+            size,
+        )
+    };
+    if read != size {
+        return None;
+    }
+    let bytes = info
+        .pvi_cdir
+        .vip_path
+        .iter()
+        .flatten()
+        .map(|byte| byte.to_ne_bytes()[0])
+        .take_while(|byte| *byte != 0)
+        .collect::<Vec<_>>();
+    let path = String::from_utf8(bytes).ok()?;
+    std::path::Path::new(&path).is_absolute().then_some(path)
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
 fn resolve_process_working_directory(pid: u32) -> Option<String> {
     let proc_cwd = std::path::PathBuf::from(format!("/proc/{pid}/cwd"));
     if let Ok(path) = std::fs::read_link(&proc_cwd)
@@ -11542,18 +11906,12 @@ fn resolve_process_working_directory(pid: u32) -> Option<String> {
         return Some(path.to_string_lossy().to_string());
     }
 
-    let lsof_output = std::process::Command::new("lsof")
-        .arg("-a")
-        .arg("-p")
-        .arg(pid.to_string())
-        .arg("-d")
-        .arg("cwd")
-        .arg("-Fn")
-        .output();
-    if let Ok(output) = lsof_output
-        && output.status.success()
-    {
-        for line in String::from_utf8_lossy(&output.stdout).lines() {
+    let lsof_output = bounded_probe_output(
+        std::process::Command::new("lsof").args(["-a", "-p", &pid.to_string(), "-d", "cwd", "-Fn"]),
+        Duration::from_millis(100),
+    );
+    if let Ok(bytes) = lsof_output {
+        for line in String::from_utf8_lossy(&bytes).lines() {
             if let Some(path) = line.strip_prefix('n')
                 && !path.trim().is_empty()
             {
@@ -11562,19 +11920,12 @@ fn resolve_process_working_directory(pid: u32) -> Option<String> {
         }
     }
 
-    let ps_output = std::process::Command::new("ps")
-        .arg("-o")
-        .arg("cwd=")
-        .arg("-p")
-        .arg(pid.to_string())
-        .output()
-        .ok()?;
-    if !ps_output.status.success() {
-        return None;
-    }
-    let cwd = String::from_utf8_lossy(&ps_output.stdout)
-        .trim()
-        .to_string();
+    let bytes = bounded_probe_output(
+        std::process::Command::new("ps").args(["-o", "cwd=", "-p", &pid.to_string()]),
+        Duration::from_millis(100),
+    )
+    .ok()?;
+    let cwd = String::from_utf8_lossy(&bytes).trim().to_string();
     (!cwd.is_empty()).then_some(cwd)
 }
 
@@ -11585,17 +11936,12 @@ fn resolve_process_working_directory(_pid: u32) -> Option<String> {
 
 #[cfg(unix)]
 fn resolve_process_group_id_for_pid(pid: u32) -> Option<i32> {
-    let output = std::process::Command::new("ps")
-        .arg("-o")
-        .arg("pgid=")
-        .arg("-p")
-        .arg(pid.to_string())
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let bytes = bounded_probe_output(
+        std::process::Command::new("ps").args(["-o", "pgid=", "-p", &pid.to_string()]),
+        Duration::from_millis(100),
+    )
+    .ok()?;
+    let value = String::from_utf8_lossy(&bytes).trim().to_string();
     let parsed = value.parse::<i32>().ok()?;
     (parsed > 0).then_some(parsed)
 }
@@ -11933,19 +12279,10 @@ pub fn activate_pane_runtime(config: PaneRuntimePluginConfig, padding_config: Pa
 mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn missing_helper_still_starts_an_ordinary_shell() {
-        use std::os::unix::fs::PermissionsExt;
-        let root = tempfile::tempdir().unwrap();
-        let shell = root.path().join("direct-shell");
-        std::fs::write(
-            &shell,
-            "#!/bin/sh\nread ready\npwd > witness\nprintf DIRECT\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o700)).unwrap();
+    async fn missing_helper_rejects_an_ordinary_shell_before_spawn() {
         let (exit_tx, _exit_rx) = mpsc::unbounded_channel();
-        let mut manager = SessionRuntimeManager::new(
-            shell.to_str().unwrap().into(),
+        let manager = SessionRuntimeManager::new(
+            "/bin/sh".into(),
             "xterm-256color".into(),
             protocol_profile_for_term("xterm-256color"),
             true,
@@ -11953,14 +12290,8 @@ mod tests {
             PanePaddingConfig::default(),
             exit_tx,
         );
-        let session_id = SessionId(Uuid::new_v4());
-        let options = Some(
-            bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::InitialShellOptions {
-                cwd: Some(root.path().to_str().unwrap().into()),
-            },
-        );
         let mut prepared = manager
-            .prepare_fresh_program_runtime(session_id, options, None, (17, 73))
+            .prepare_fresh_program_runtime(SessionId(Uuid::new_v4()), None, None, (17, 73))
             .unwrap();
         let pane = prepared
             .runtime
@@ -11973,46 +12304,15 @@ mod tests {
         pane.execution
             .inject_missing_supervisor
             .store(true, Ordering::SeqCst);
-        let execution = Arc::clone(&pane.execution);
-        let _cleanup = ExecutionTestCleanup(Arc::clone(&execution));
-        prepared.wait_until_ready().await.unwrap();
-        manager
-            .commit_fresh_runtime(session_id, &mut prepared, || Ok(()))
-            .unwrap();
-        let pane = manager.runtimes[&session_id].panes.values().next().unwrap();
-        pane.input_tx
-            .send(PaneRuntimeCommand::Input(b"\n".to_vec()))
-            .unwrap();
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while !pane.exited.load(Ordering::SeqCst)
-                || !execution.output_drained.load(Ordering::SeqCst)
-            {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .unwrap();
-        assert!(execution.supervisor.lock().unwrap().is_none());
-        assert_eq!(execution.outcome.lock().unwrap().0, Some(0));
-        assert!(execution.output_watermark.load(Ordering::SeqCst) >= 6);
-        assert_eq!(*pane.last_requested_size.lock().unwrap(), (17, 73));
+        let process_id = Arc::clone(&pane.process_id);
+        let error = prepared.wait_until_ready().await.unwrap_err();
         assert!(
-            pane.resurrection_state
-                .lock()
-                .unwrap()
-                .execution_token
-                .is_none()
+            error
+                .to_string()
+                .contains("durable supervision unavailable"),
+            "{error}"
         );
-        // Shells may canonicalize /tmp to /private/tmp on macOS.
-        assert_eq!(
-            std::fs::canonicalize(
-                std::fs::read_to_string(root.path().join("witness"))
-                    .unwrap()
-                    .trim()
-            )
-            .unwrap(),
-            root.path().canonicalize().unwrap()
-        );
+        assert!(process_id.lock().unwrap().is_none());
     }
 
     #[cfg(unix)]
@@ -12063,7 +12363,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn direct_terminal_accepts_input_resize_and_explicit_shutdown() {
+    async fn owned_terminal_accepts_input_resize_and_explicit_shutdown() {
         let (exit_tx, _exit_rx) = mpsc::unbounded_channel();
         let mut manager = SessionRuntimeManager::new(
             "/bin/sh".into(),
@@ -12088,9 +12388,6 @@ mod tests {
                 .values()
                 .next()
                 .unwrap();
-            pane.execution
-                .inject_missing_supervisor
-                .store(true, Ordering::SeqCst);
             let execution = Arc::clone(&pane.execution);
             let _cleanup = ExecutionTestCleanup(Arc::clone(&execution));
             prepared.wait_until_ready().await.unwrap();
@@ -12110,7 +12407,7 @@ mod tests {
             })
             .await
             .unwrap();
-            assert!(execution.supervisor.lock().unwrap().is_none());
+            assert!(execution.supervisor.lock().unwrap().is_some());
             assert!(!pane.exited.load(Ordering::SeqCst));
             let removed = manager.remove_runtime(session_id).unwrap();
             tokio::time::timeout(Duration::from_secs(5), shutdown_runtime_handle(removed))
@@ -12464,6 +12761,12 @@ mod tests {
                         r#"trap '' HUP TERM
 python3 -c 'import os,signal,time,errno,sys
 root=sys.argv[1]
+original_sid=os.getsid(0)
+if os.fork(): os._exit(0)
+assert os.getpid()!=os.getpgrp()
+os.setsid()
+assert os.getsid(0)!=original_sid
+open(root+"/original.sid","w").write(str(original_sid))
 for sig in (signal.SIGHUP,signal.SIGTERM): signal.signal(sig,signal.SIG_IGN)
 open(root+"/descendant.pid","w").write(str(os.getpid()))
 open(root+"/ready","w").close()
@@ -12472,7 +12775,8 @@ try:
  os.write(1,b"UNAUTHORIZED-LATE-OUTPUT")
  result="unexpected writable terminal"
 except OSError as error: result=str(error.errno)
-open(root+"/late-result","w").write(result)
+open(root+"/late-result.tmp","w").write(result)
+os.rename(root+"/late-result.tmp",root+"/late-result")
 while not os.path.exists(root+"/release"): time.sleep(0.01)
 for fd in (0,1,2): os.close(fd)
 open(root+"/released","w").close()
@@ -12547,6 +12851,16 @@ exit 7"#
             .unwrap();
         let identity = process_start_identity_for_pid(descendant)
             .expect("descendant must remain live after leader exit");
+        let original_sid: i32 = std::fs::read_to_string(witness.path().join("original.sid"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        let descendant_pid = i32::try_from(descendant).unwrap();
+        // SAFETY: identity-checked test child; verify this really escaped the
+        // terminal session rather than weakening same-session group cleanup.
+        let actual_sid = unsafe { libc::getsid(descendant_pid) };
+        assert_eq!(actual_sid, descendant_pid);
+        assert_ne!(actual_sid, original_sid);
         let _witness_cleanup = WitnessProcessCleanup {
             pid: descendant,
             identity,
@@ -14499,14 +14813,307 @@ exit 7"#
         );
     }
 
+    #[test]
+    fn failed_checkpoint_close_still_fences_prompt_and_invocation() {
+        let mut state = PaneResurrectionRuntime {
+            execution_token: Some("saved-invocation".into()),
+            active_command: Some("bcode tui".into()),
+            active_command_source: Some(PaneCommandSource::Verbatim),
+            ..PaneResurrectionRuntime::default()
+        };
+        let result = state.freeze_with(|_| anyhow::bail!("injected durable close failure"));
+        assert!(result.is_err());
+        state.apply_event(PaneShellMetadataEvent::Prompt {
+            cwd: "/late".into(),
+        });
+        assert!(state.frozen);
+        assert_eq!(state.execution_token.as_deref(), Some("saved-invocation"));
+        assert_eq!(state.active_command.as_deref(), Some("bcode tui"));
+    }
+
+    #[tokio::test]
+    async fn pane_shutdown_starts_every_pane_before_waiting() {
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+        let mut panes = Vec::new();
+        for _ in 0..3 {
+            let mut pane = dummy_pane(Uuid::new_v4());
+            let (stop, stopped) = oneshot::channel();
+            pane.stop_tx = Some(stop);
+            let barrier = Arc::clone(&barrier);
+            let task = tokio::spawn(async move {
+                stopped.await.unwrap();
+                barrier.wait().await;
+            });
+            let old = std::mem::replace(&mut pane.task, task);
+            old.abort();
+            let _ = old.await;
+            panes.push(pane);
+        }
+        tokio::time::timeout(Duration::from_secs(2), shutdown_panes(panes))
+            .await
+            .expect("serial shutdown deadlocks at the pane barrier");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_sweep_revokes_open_slave_even_when_shutdown_waiter_is_cancelled() {
+        supervisor::install_test_artifact().unwrap();
+        let (control, child, pty, endpoint) = tokio::task::spawn_blocking(|| {
+            let pty = portable_pty::native_pty_system()
+                .openpty(PtySize {
+                    rows: 24,
+                    cols: 80,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                })
+                .unwrap();
+            let (control, command) =
+                supervisor::SupervisorControl::prepare(Uuid::new_v4()).unwrap();
+            let endpoint = std::path::PathBuf::from(&command.get_argv()[3]);
+            let child = control
+                .spawn_guardian(&pty.master.tty_name().unwrap())
+                .unwrap();
+            control
+                .start(
+                    &PaneLaunchSpec {
+                        program: "/bin/sh".into(),
+                        args: vec![
+                            "-c".into(),
+                            "trap '' HUP TERM; while :; do sleep 1; done".into(),
+                        ],
+                        cwd: None,
+                        env: BTreeMap::new(),
+                    },
+                    || Ok(()),
+                )
+                .unwrap();
+            (Arc::new(control), child, pty, endpoint)
+        })
+        .await
+        .unwrap();
+        // Removing only this test's control socket forces a genuine Sweep
+        // failure while the product still owns the slave. Lease EOF must work.
+        std::fs::remove_file(endpoint).unwrap();
+        drop(pty.slave);
+        let mut pane = dummy_pane(Uuid::new_v4());
+        *pane.execution.supervisor.lock().unwrap() = Some(control);
+        let execution = Arc::clone(&pane.execution);
+        let state = Arc::clone(&pane.resurrection_state);
+        let observed_state = Arc::clone(&state);
+        let (done, mut completion) = watch::channel(false);
+        let (ack, cleanup) = watch::channel(None);
+        pane.cleanup = cleanup;
+        let (stop, stopped) = oneshot::channel();
+        let (started, start) = oneshot::channel();
+        pane.stop_tx = Some(stop);
+        let task = tokio::spawn(async move {
+            stopped.await.unwrap();
+            let _ = started.send(());
+            tokio::task::spawn_blocking(move || {
+                let mut child = child;
+                child.wait().unwrap();
+                assert!(observed_state.lock().unwrap().frozen);
+            })
+            .await
+            .unwrap();
+            ack.send_replace(Some(Err("Sweep failed; lease fallback used".into())));
+            done.send_replace(true);
+        });
+        let old = std::mem::replace(&mut pane.task, task);
+        old.abort();
+        let _ = old.await;
+        let waiter = tokio::spawn(shutdown_pane_handle(pane));
+        start.await.unwrap();
+        waiter.abort();
+        let _ = waiter.await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !*completion.borrow_and_update() {
+                completion.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("failed Sweep retained a live slave holder");
+        assert!(state.lock().unwrap().frozen);
+        assert!(execution.cleanup_failed.load(Ordering::SeqCst));
+        assert!(
+            !execution.cleanup_complete(true),
+            "fallback must not fabricate cleanup success"
+        );
+        drop(pty.master);
+    }
+
+    #[tokio::test]
+    async fn cancelled_shutdown_waiter_retains_cleanup_and_freezes_before_release() {
+        let mut pane = dummy_pane(Uuid::new_v4());
+        let state = Arc::clone(&pane.resurrection_state);
+        let execution = Arc::downgrade(&pane.execution);
+        let (stop, stopped) = oneshot::channel();
+        let (started, start) = oneshot::channel();
+        let (finish, finished) = oneshot::channel();
+        pane.stop_tx = Some(stop);
+        let task = tokio::spawn(async move {
+            stopped.await.unwrap();
+            let _ = started.send(());
+            let _ = finished.await;
+        });
+        let old = std::mem::replace(&mut pane.task, task);
+        old.abort();
+        let _ = old.await;
+        let waiter = tokio::spawn(shutdown_pane_handle(pane));
+        start.await.unwrap();
+        waiter.abort();
+        let _ = waiter.await;
+        assert!(
+            execution.upgrade().is_some(),
+            "cancellation dropped cleanup ownership"
+        );
+        finish.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while execution.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(state.lock().unwrap().frozen);
+    }
+
+    #[test]
+    fn unavailable_inspection_preserves_command_cwd_and_invocation() {
+        let mut state = PaneResurrectionRuntime {
+            execution_token: Some("actual-invocation".into()),
+            active_command: Some("bcode tui".into()),
+            active_command_source: Some(PaneCommandSource::Inspection),
+            last_known_cwd: Some("/work/project".into()),
+            ..PaneResurrectionRuntime::default()
+        };
+        let version = state.inspection_version();
+        state.apply_inspection(&version, None);
+        assert_eq!(state.active_command.as_deref(), Some("bcode tui"));
+        assert_eq!(state.last_known_cwd.as_deref(), Some("/work/project"));
+        assert_eq!(state.execution_token.as_deref(), Some("actual-invocation"));
+    }
+
+    #[test]
+    fn stale_inspection_cannot_replace_new_prompt_or_invocation() {
+        let mut state = PaneResurrectionRuntime::default();
+        let captured = state.inspection_version();
+        state.apply_event(PaneShellMetadataEvent::Prompt { cwd: "/new".into() });
+        state.apply_inspection(
+            &captured,
+            Some(ProcessInspectionResult {
+                command: Some("old command".into()),
+                cwd: Some("/old".into()),
+            }),
+        );
+        assert!(state.active_command.is_none());
+        assert_eq!(state.last_known_cwd.as_deref(), Some("/new"));
+        let captured = state.inspection_version();
+        state.execution_token = Some("next-invocation".into());
+        state.apply_inspection(
+            &captured,
+            Some(ProcessInspectionResult {
+                command: Some("old command".into()),
+                cwd: Some("/old".into()),
+            }),
+        );
+        assert!(state.active_command.is_none());
+        assert_eq!(state.execution_token.as_deref(), Some("next-invocation"));
+    }
+
+    #[test]
+    fn slow_snapshot_observation_does_not_hold_resurrection_lock() {
+        static ACTIVE: AtomicUsize = AtomicUsize::new(0);
+        let state = Arc::new(Mutex::new(PaneResurrectionRuntime::default()));
+        let version = state.lock().unwrap().inspection_version();
+        let observed_state = Arc::clone(&state);
+        let observed = bounded_directory_probe(&ACTIVE, Duration::from_secs(1), move || {
+            let mut state = observed_state
+                .try_lock()
+                .expect("observation must run outside the resurrection lock");
+            state.apply_event(PaneShellMetadataEvent::CommandStart {
+                command: "new command".into(),
+                cwd: "/new".into(),
+            });
+            Some(ProcessInspectionResult {
+                command: Some("old command".into()),
+                cwd: Some("/old".into()),
+            })
+        })
+        .unwrap();
+        let mut state = state.lock().unwrap();
+        state.apply_inspection(&version, observed);
+        assert_eq!(state.active_command.as_deref(), Some("new command"));
+        assert_eq!(state.last_known_cwd.as_deref(), Some("/new"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn slow_inspection_probe_is_killed_and_reaped() {
+        let root = tempfile::tempdir().unwrap();
+        let pidfile = root.path().join("pid");
+        let error = bounded_probe_output(
+            std::process::Command::new("/bin/sh")
+                .args(["-c", "echo $$ > \"$1\"; while :; do :; done", "probe"])
+                .arg(&pidfile),
+            Duration::from_millis(100),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        let pid: i32 = std::fs::read_to_string(pidfile)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            // WNOWAIT observes without stealing the retained reaper's child.
+            let result = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    u32::try_from(pid).unwrap(),
+                    &raw mut info,
+                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                )
+            };
+            if result == -1 {
+                assert_eq!(
+                    std::io::Error::last_os_error().raw_os_error(),
+                    Some(libc::ECHILD)
+                );
+                break;
+            }
+            assert!(Instant::now() < deadline, "inspection child was not reaped");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_cwd_probe_reads_current_directory_without_subprocess() {
+        let observed = resolve_process_working_directory(std::process::id()).unwrap();
+        assert_eq!(
+            std::fs::canonicalize(observed).unwrap(),
+            std::env::current_dir().unwrap().canonicalize().unwrap()
+        );
+    }
+
     fn dummy_pane(id: Uuid) -> PaneRuntimeHandle {
         let (input_tx, _input_rx) = mpsc::unbounded_channel();
         let (stop_tx, stop_rx) = oneshot::channel();
         let task = tokio::spawn(async move {
             let _ = stop_rx.await;
         });
+        let execution = Arc::new(execution::ExecutionCapture::default());
+        let resurrection_state =
+            Arc::new(std::sync::Mutex::new(PaneResurrectionRuntime::default()));
         PaneRuntimeHandle {
-            execution: Arc::new(execution::ExecutionCapture::default()),
+            lifetime: PaneLifetime {
+                execution: Arc::clone(&execution),
+                resurrection: Arc::clone(&resurrection_state),
+            },
+            execution,
             publication: Arc::new(StartupPublication::default()),
             startup: watch::channel(Some(Ok(()))).1,
             cleanup: watch::channel(Some(Ok(()))).1,
@@ -14522,7 +15129,7 @@ exit 7"#
             process_start_identity: Arc::new(std::sync::Mutex::new(None)),
             process_id: Arc::new(std::sync::Mutex::new(None)),
             process_group_id: Arc::new(std::sync::Mutex::new(None)),
-            resurrection_state: Arc::new(std::sync::Mutex::new(PaneResurrectionRuntime::default())),
+            resurrection_state,
             exit_reason: Arc::new(std::sync::Mutex::new(None)),
             stop_tx: Some(stop_tx),
             task,
@@ -14909,7 +15516,7 @@ exit 7"#
         static ACTIVE: AtomicUsize = AtomicUsize::new(0);
         let (release, blocked) = std::sync::mpsc::channel();
         assert_eq!(
-            bounded_directory_probe(&ACTIVE, Duration::ZERO, move || {
+            bounded_directory_probe::<String>(&ACTIVE, Duration::ZERO, move || {
                 blocked.recv().unwrap();
                 Some("/late".into())
             }),
@@ -14926,7 +15533,9 @@ exit 7"#
             std::thread::yield_now();
         }
         assert_eq!(
-            bounded_directory_probe(&ACTIVE, Duration::from_secs(2), || Some("/ready".into())),
+            bounded_directory_probe::<String>(&ACTIVE, Duration::from_secs(2), || Some(
+                "/ready".into()
+            )),
             Ok(Some("/ready".into()))
         );
     }
@@ -14936,7 +15545,9 @@ exit 7"#
         use bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::SpawnError;
         static ACTIVE: AtomicUsize = AtomicUsize::new(MAX_DIRECTORY_PROBES);
         assert_eq!(
-            bounded_directory_probe(&ACTIVE, Duration::from_secs(1), || panic!("must not run")),
+            bounded_directory_probe::<String>(&ACTIVE, Duration::from_secs(1), || panic!(
+                "must not run"
+            )),
             Err(SpawnError::Busy)
         );
         assert_eq!(ACTIVE.load(Ordering::SeqCst), MAX_DIRECTORY_PROBES);
@@ -19210,11 +19821,21 @@ exit 7"#
             let (control, _) = supervisor::SupervisorControl::prepare(Uuid::new_v4()).unwrap();
             let control = Arc::new(control);
             *setup_execution.supervisor.lock().unwrap() = Some(Arc::clone(&control));
-            // Readiness precedes the owner opening this path. A missing slave
-            // deterministically injects an owner-spawn failure, not target exit.
-            let child = control
-                .spawn_guardian(std::path::Path::new("/definitely/missing/bmux-slave"))
+            // The guardian now opens the slave before readiness. Remove only a
+            // test-owned alias after readiness to fail the later owner spawn.
+            let pty = portable_pty::native_pty_system()
+                .openpty(PtySize {
+                    rows: 24,
+                    cols: 80,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                })
                 .unwrap();
+            let root = tempfile::tempdir().unwrap();
+            let alias = root.path().join("slave");
+            std::os::unix::fs::symlink(pty.master.tty_name().unwrap(), &alias).unwrap();
+            let child = control.spawn_guardian(&alias).unwrap();
+            std::fs::remove_file(&alias).unwrap();
             let child = StartupChild {
                 child: Some(Box::new(GuardianStartupChild {
                     child,
@@ -19676,9 +20297,27 @@ exit 7"#
     #[cfg(unix)]
     #[tokio::test]
     async fn fresh_session_roster_failure_never_publishes_runtime() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let shell = directory.path().join("queued-output-shell");
+        let ready = directory.path().join("ready");
+        // Publication has not released the reader. Ensure output is queued
+        // before rollback: Darwin's session anchor cannot exit with this
+        // unread output until rollback releases the final master.
+        std::fs::write(
+            &shell,
+            format!(
+                "#!/bin/sh\n: > '{}'\nexec dd if=/dev/zero bs=1048576 count=1 2>/dev/null\n",
+                ready.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o700)).unwrap();
         let existing = SessionId(Uuid::new_v4());
         let target = Uuid::new_v4();
-        let manager = manager_with_runtime(existing, runtime_with_panes(&[target]));
+        let mut manager = manager_with_runtime(existing, runtime_with_panes(&[target]));
+        manager.shell = shell.to_string_lossy().into_owned();
         let adapter = ServerSessionRuntimeAdapter::new(Arc::new(Mutex::new(manager)));
         let created = SessionId(Uuid::new_v4());
         let checks = AtomicUsize::new(0);
@@ -19697,6 +20336,14 @@ exit 7"#
                     // validation; it must not re-enter the manager.
                     assert!(adapter.inner.try_lock().is_err());
                     assert!(adapter.pane_input_index.read().unwrap().is_empty());
+                    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                    while !ready.exists() && std::time::Instant::now() < deadline {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    assert!(ready.exists(), "shell must queue output before rollback");
+                    // Let the bounded startup capture queue fill while the
+                    // publication gate still excludes its projection reader.
+                    std::thread::sleep(Duration::from_millis(200));
                     published.store(true, Ordering::SeqCst);
                     anyhow::bail!("injected roster persistence failure")
                 },

@@ -21,7 +21,10 @@ const MAX_SNAPSHOT_BYTES: u32 = 4 * 1024 * 1024;
 const MAX_SNAPSHOT: usize = 4 * 1024 * 1024;
 // Give buffered output a bounded presentation grace without waiting for
 // surviving slave holders; capture remains pending until real EOF.
+// This is a presentation budget, not the authoritative EOF/cleanup deadline.
 const POST_EXIT_DRAIN_GRACE: Duration = Duration::from_millis(250);
+// Match the existing execution wait contract's maximum bounded wait.
+const POST_EXIT_CLEANUP_TIMEOUT_MS: u32 = 30_000;
 
 type InputModes = bmux_terminal_grid::ProtocolState;
 
@@ -262,7 +265,49 @@ pub(crate) async fn interact(
         _ = suspend.recv() => Err(anyhow::anyhow!("outer terminal suspension unsupported; execution retained for recovery").context(InteractiveFailureKind::Unsupported)),
         _ = hangup.recv() => Err(anyhow::anyhow!("interactive terminal disconnected; execution retained for recovery").context(InteractiveFailureKind::Disconnect)),
     };
-    combine_restore(operation, guard.restore().map_err(Into::into))
+    combine_restore(operation, guard.restore().map_err(Into::into))?;
+    // Presentation may stop before retirement/EOF. Wait only after restoring
+    // the outer terminal, through the owner's bounded, event-driven contract.
+    wait_for_post_exit_cleanup(client, run_id, POST_EXIT_CLEANUP_TIMEOUT_MS)
+        .await
+        .map_err(|error| error.context(RestorationObserved(true)))
+}
+
+fn post_exit_cleanup_complete(status: &process::RunStatus) -> bool {
+    status.target_exited
+        && status.terminal_session_ended
+        && status.capture_eof
+        && status.output_drained
+        && status.cleanup_complete
+        && !status.recovery_required
+        && status.errors.is_empty()
+}
+
+async fn wait_for_post_exit_cleanup(
+    client: &mut impl bmux_plugin_sdk::TypedDispatchClient,
+    run_id: Uuid,
+    timeout_ms: u32,
+) -> Result<process::RunStatus> {
+    let current = process::client::status(client, run_id)
+        .await?
+        .map_err(|error| anyhow::anyhow!("recording status: {error:?}"))?;
+    if !post_exit_cleanup_complete(&current) {
+        process::client::wait(client, run_id, timeout_ms)
+            .await?
+            .map_err(|error| anyhow::anyhow!("recording cleanup wait: {error:?}"))?;
+    }
+    // Reconciliation and execution status can straddle EOF. Do not finish from
+    // the pre-wait snapshot (or infer EOF from an exit/retirement receipt).
+    let current = process::client::status(client, run_id)
+        .await?
+        .map_err(|error| anyhow::anyhow!("recording status: {error:?}"))?;
+    ensure!(
+        post_exit_cleanup_complete(&current),
+        "terminal restored; capture/cleanup pending after bounded owner wait; run {} retained at {}; real EOF, drain and cleanup are required before finish",
+        run_id,
+        current.runtime_root
+    );
+    Ok(current)
 }
 
 async fn recorded_resize(
@@ -710,6 +755,160 @@ mod tests {
     use super::*;
     use crossterm::event::{KeyEvent, MouseButton};
     use std::io::Write;
+
+    struct PostExitClient {
+        status: process::RunStatus,
+        eof_delay: Option<Duration>,
+        wait_calls: usize,
+        status_calls: usize,
+    }
+
+    impl bmux_plugin_sdk::TypedDispatchClient for PostExitClient {
+        async fn invoke_service_raw(
+            &mut self,
+            _capability: &str,
+            _kind: bmux_ipc::InvokeServiceKind,
+            _interface: &str,
+            operation: &str,
+            payload: Vec<u8>,
+        ) -> bmux_plugin_sdk::TypedDispatchClientResult<Vec<u8>> {
+            let before = self.status.clone();
+            match operation {
+                "status" => {
+                    let request = bmux_plugin_sdk::decode_service_message::<
+                        process::client::StatusRequest,
+                    >(&payload)
+                    .unwrap();
+                    assert_eq!(request.run_id, self.status.run_id);
+                    self.status_calls += 1;
+                }
+                "wait" => {
+                    let request = bmux_plugin_sdk::decode_service_message::<
+                        process::client::WaitRequest,
+                    >(&payload)
+                    .unwrap();
+                    assert_eq!(request.run_id, self.status.run_id);
+                    self.wait_calls += 1;
+                    let eof = async {
+                        if let Some(delay) = self.eof_delay {
+                            tokio::time::sleep(delay).await;
+                        } else {
+                            std::future::pending::<()>().await;
+                        }
+                    };
+                    if tokio::time::timeout(
+                        Duration::from_millis(u64::from(request.timeout_ms)),
+                        eof,
+                    )
+                    .await
+                    .is_ok()
+                    {
+                        self.status.capture_eof = true;
+                        self.status.output_drained = true;
+                        self.status.cleanup_complete = true;
+                    }
+                }
+                _ => panic!("must not terminate or finish: {operation}"),
+            }
+            // Deliberately return a pre-EOF wait snapshot: the explicit final
+            // status refresh must obtain the current authoritative flags.
+            Ok(
+                bmux_plugin_sdk::encode_service_message(&Ok::<_, process::ProcessError>(
+                    if operation == "wait" {
+                        before
+                    } else {
+                        self.status.clone()
+                    },
+                ))
+                .unwrap(),
+            )
+        }
+    }
+
+    fn post_exit_client(eof_delay: Option<Duration>) -> PostExitClient {
+        PostExitClient {
+            status: process::RunStatus {
+                schema_version: 4,
+                run_id: Uuid::new_v4(),
+                revision: 1,
+                launch_mutation_id: Uuid::new_v4(),
+                recording_id: Uuid::new_v4(),
+                execution: None,
+                runtime_root: "/isolated/runtime".into(),
+                phase: process::RunPhase::Exited,
+                exit_code: Some(0),
+                target_exited: true,
+                terminal_session_ended: true,
+                capture_eof: false,
+                capture_watermark: 92,
+                recording_watermark: 92,
+                durable_recording_complete: false,
+                timing_complete: true,
+                cleanup_complete: false,
+                recovery_required: false,
+                output_drained: false,
+                output_watermark: 92,
+                capture_finalized: false,
+                errors: vec![],
+            },
+            eof_delay,
+            wait_calls: 0,
+            status_calls: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn post_exit_cleanup_accepts_real_eof_beyond_presentation_grace() {
+        let mut client = post_exit_client(Some(POST_EXIT_DRAIN_GRACE + Duration::from_millis(50)));
+        let run_id = client.status.run_id;
+        let started = tokio::time::Instant::now();
+        let status = wait_for_post_exit_cleanup(&mut client, run_id, 2000)
+            .await
+            .unwrap();
+        assert!(started.elapsed() > POST_EXIT_DRAIN_GRACE);
+        assert!(post_exit_cleanup_complete(&status));
+        assert_eq!(client.wait_calls, 1);
+        assert_eq!(client.status_calls, 2);
+        assert!(!status.capture_finalized);
+    }
+
+    #[test]
+    fn post_exit_cleanup_requires_each_authoritative_completion_flag() {
+        let mut status = post_exit_client(None).status;
+        status.capture_eof = true;
+        status.output_drained = true;
+        status.cleanup_complete = true;
+        assert!(post_exit_cleanup_complete(&status));
+        status.capture_eof = false;
+        assert!(!post_exit_cleanup_complete(&status));
+        status.capture_eof = true;
+        status.output_drained = false;
+        assert!(!post_exit_cleanup_complete(&status));
+        status.output_drained = true;
+        status.cleanup_complete = false;
+        assert!(!post_exit_cleanup_complete(&status));
+    }
+
+    #[tokio::test]
+    async fn post_exit_cleanup_refuses_real_no_eof_deadline() {
+        // Model an escaped slave holder: target/session ended, but EOF never
+        // occurs. The owner's real timeout returns pending, not completion.
+        let mut client = post_exit_client(None);
+        let run_id = client.status.run_id;
+        let deadline = Duration::from_millis(40);
+        let started = tokio::time::Instant::now();
+        let error = wait_for_post_exit_cleanup(&mut client, run_id, 40)
+            .await
+            .unwrap_err();
+        assert!(started.elapsed() >= deadline);
+        assert!(error.to_string().contains("capture/cleanup pending"));
+        assert_eq!(client.wait_calls, 1);
+        assert_eq!(client.status_calls, 2);
+        assert!(!client.status.capture_eof);
+        assert!(!client.status.output_drained);
+        assert!(!client.status.cleanup_complete);
+        assert!(!client.status.capture_finalized);
+    }
 
     fn key(code: KeyCode, modifiers: KeyModifiers) -> Event {
         Event::Key(KeyEvent::new(code, modifiers))

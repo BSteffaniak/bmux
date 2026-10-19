@@ -240,6 +240,55 @@ mod tests {
     use super::*;
 
     #[test]
+    fn reopened_launch_admission_preserves_identity_phase_and_unknown_outcome() {
+        let root = tempfile::tempdir().unwrap();
+        let mutation = uuid::Uuid::new_v4();
+        let options = ProgramOptions {
+            program: "/bin/sh".into(),
+            args: vec![],
+            cwd: None,
+            env: std::collections::BTreeMap::new(),
+            cols: 80,
+            rows: 24,
+        };
+        let store = ReservationStore::open(root.path()).unwrap();
+        let reservation = store
+            .reserve(mutation, options.clone(), |_| Ok(()))
+            .unwrap();
+        // Both sides of the launch-effect acknowledgment must survive owner loss.
+        for phase in [
+            LaunchPhase::Launching,
+            LaunchPhase::Running,
+            LaunchPhase::Uncertain,
+        ] {
+            let mut stored = store.read(mutation).unwrap();
+            stored.receipt.phase = phase;
+            stored.receipt.revision += 1;
+            store.commit(&stored).unwrap();
+            let expected = serde_json::to_vec(&stored.receipt).unwrap();
+            let reopened = ReservationStore::open(root.path()).unwrap();
+            let retry = reopened
+                .reserve(mutation, options.clone(), |_| Ok(()))
+                .unwrap();
+            assert_eq!(
+                serde_json::to_vec(&retry).unwrap(),
+                serde_json::to_vec(&reservation).unwrap()
+            );
+            let retained = reopened.read(mutation).unwrap();
+            assert_eq!(serde_json::to_vec(&retained.receipt).unwrap(), expected);
+            assert!(retained.receipt.exit_code.is_none());
+            assert!(retained.receipt.exit_signal.is_none());
+            assert!(!retained.receipt.cleanup_complete);
+            let mut conflicting = options.clone();
+            conflicting.args.push("different launch".into());
+            assert!(matches!(
+                reopened.reserve(mutation, conflicting, |_| Ok(())),
+                Err(RecoveryError::Conflict { .. })
+            ));
+        }
+    }
+
+    #[test]
     fn input_admission_checks_running_exact_token_recovery_and_end() {
         use bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::{
             TerminalCaptureIntegrity, TerminalExecutionPhase, TerminalExecutionStatus,

@@ -117,6 +117,7 @@ mod tests {
             target_terminated: false,
             terminal_session_ended: Some(false),
             cleanup_error: None,
+            capture_error: None,
             error: None,
         }
     }

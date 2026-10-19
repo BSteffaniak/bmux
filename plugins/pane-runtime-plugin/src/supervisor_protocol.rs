@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 
-pub const VERSION: u32 = 4;
+pub const VERSION: u32 = 6;
 pub const LIFECYCLE_CAPABILITY: u32 = 1;
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -52,7 +52,7 @@ pub enum Operation {
     Sweep {
         mutation_id: String,
     },
-    // V3 only: release a reaped terminal-session owner, not descendant cleanup.
+    // Release a reaped execution owner after terminal end is acknowledged.
     RetireOwner {
         mutation_id: String,
     },
@@ -75,6 +75,9 @@ pub struct Response {
     pub terminal_session_ended: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cleanup_error: Option<String>,
+    /// Capture failure does not invalidate acknowledged process cleanup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_error: Option<String>,
     pub error: Option<String>,
 }
 
