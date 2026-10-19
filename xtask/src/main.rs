@@ -29,7 +29,7 @@ fn invocation_args(executable: Option<&str>, mut args: Vec<String>) -> Vec<Strin
 fn run(args: Vec<String>) -> Result<()> {
     let Some(command) = args.first() else {
         return Err(error(
-            "usage: cargo xtask build [--target TARGET] [--profile PROFILE] | auxiliary {build,stage,nfpm} --target TARGET | bterm {run,stage,verify} --target TARGET | install SOURCE DESTINATION [--binary-name NAME | --activate-version VERSION]",
+            "usage: cargo xtask build [--target TARGET] [--profile PROFILE] | auxiliary {build,stage,nfpm} --target TARGET | bterm {build,run,stage,verify} --target TARGET | install SOURCE DESTINATION [--binary-name NAME | --activate-version VERSION]",
         ));
     };
     let mut positional = Vec::new();
@@ -85,17 +85,22 @@ fn run(args: Vec<String>) -> Result<()> {
                 .map(PathBuf::from)
                 .ok_or_else(|| error(format!("{name} is required")))
         };
-        if positional.as_slice() == ["run"] {
+        if matches!(positional.as_slice(), [operation] if operation == "build" || operation == "run")
+        {
             if options.keys().any(|key| key != "--workspace") {
                 return Err(error(
-                    "bterm run detects its host and paths; only --workspace is accepted",
+                    "bterm build/run detects its host and paths; only --workspace is accepted",
                 ));
             }
             let workspace = options
                 .get("--workspace")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".."));
-            return bterm_run::run(&workspace);
+            return if positional[0] == "build" {
+                bterm_run::build(&workspace).map(|_| ())
+            } else {
+                bterm_run::run(&workspace)
+            };
         }
         let target = options
             .get("--target")
@@ -111,7 +116,7 @@ fn run(args: Vec<String>) -> Result<()> {
                 target,
             ),
             [operation] if operation == "verify" => bterm::verify(&required("--root")?, target),
-            _ => Err(error("bterm requires run, stage or verify")),
+            _ => Err(error("bterm requires build, run, stage or verify")),
         };
     }
     if command == "build" {

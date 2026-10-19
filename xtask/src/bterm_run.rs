@@ -87,11 +87,18 @@ fn managed_root(workspace: &Path) -> Result<PathBuf> {
     Ok(root)
 }
 
-pub(crate) fn run(workspace: &Path) -> Result<()> {
+/// Holds the publication lock until the build-only caller returns or the window exits.
+pub(crate) struct BuiltBundle {
+    executable: PathBuf,
+    _lock: fs::File,
+}
+
+/// Build, replace and verify the bundle without consulting or starting a runtime.
+pub(crate) fn build(workspace: &Path) -> Result<BuiltBundle> {
     let target = crate::build::host_target(workspace)?;
     if !target.contains("apple-darwin") && !target.contains("linux") {
         return Err(error(
-            "bterm run currently supports Linux and macOS native backends",
+            "bterm build/run currently supports Linux and macOS native backends",
         ));
     }
     // Cargo resolves target-dir configuration and environment overrides itself.
@@ -116,7 +123,7 @@ pub(crate) fn run(workspace: &Path) -> Result<()> {
         .write(true)
         .open(owned.join("run.lock"))?;
     lock.try_lock()
-        .map_err(|err| error(format!("another bterm run may be active: {err}")))?;
+        .map_err(|err| error(format!("another bterm build/run may be active: {err}")))?;
     let status = cargo()
         .args([
             "build",
@@ -148,14 +155,22 @@ pub(crate) fn run(workspace: &Path) -> Result<()> {
         &bundle,
         &target,
     )?;
-    let executable = executable_root(&bundle, &target).join("bterm");
+    eprintln!("Built {}", bundle.display());
+    Ok(BuiltBundle {
+        executable: executable_root(&bundle, &target).join("bterm"),
+        _lock: lock,
+    })
+}
+
+pub(crate) fn run(workspace: &Path) -> Result<()> {
+    let built = build(workspace)?;
     let state = managed_root(workspace)?;
     eprintln!(
         "Launching {}\nManaged runtime root: {}",
-        executable.display(),
+        built.executable.display(),
         state.display()
     );
-    let status = Command::new(executable)
+    let status = Command::new(&built.executable)
         .arg("--managed-root")
         .arg(state)
         .current_dir(workspace)

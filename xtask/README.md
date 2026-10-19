@@ -46,15 +46,23 @@ hashes alone are not an authenticity signature. No Python installer is shipped.
 
 ## Bterm bundles
 
-Inside the development shell, build and launch natively with one command:
+Inside the development shell, build and package without launching:
+
+```sh
+cargo xtask bterm build
+```
+
+Or build, package and launch:
 
 ```sh
 cargo xtask bterm run
 ```
 
-This detects the compiler host and Cargo target directory, incrementally builds
-both binaries, stages and verifies a fresh bundle, and launches it directly so
-errors remain visible. Repeat runs replace the previous development bundle
+Both commands detect the compiler host and Cargo target directory, incrementally
+build both binaries, and stage and verify a fresh bundle. `build` prints its
+location and stops: it neither resolves runtime state nor executes either binary.
+`run` then launches it directly so errors remain visible. Repeat runs replace the
+previous development bundle
 (including stale files); failed staging leaves the old bundle intact. Concurrent
 runs are rejected while a window is open. The bundle lives under Cargo's target
 directory at `bterm-run/<host>/Bterm.app` on macOS (`Bterm` on Linux). Persistent
