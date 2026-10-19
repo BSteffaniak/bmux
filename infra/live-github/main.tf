@@ -2,8 +2,10 @@ terraform {
   required_version = "= 1.10.9"
   required_providers {
     github = {
-      source  = "integrations/github"
-      version = "= 6.6.0"
+      source = "integrations/github"
+      # 6.6.0's passthrough policy importer omitted ForceNew repository/environment
+      # fields and proposed destructive replacements. 6.10.2 restores them on import.
+      version = "= 6.10.2"
     }
   }
   # Dedicated encrypted remote state; never share the live application's key.

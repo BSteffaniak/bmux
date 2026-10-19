@@ -28,6 +28,7 @@ jobs:
           tofu -chdir=infra/live-github fmt -check -recursive
           tofu -chdir=infra/live-github validate
           tofu -chdir=infra/live-github test
+          node --test scripts/test-live-github-provider-import.mjs
           tofu -chdir=infra/live-terraform validate
           python3 scripts/test-live-bootstrap.py
           python3 scripts/test-live-github-environments.py

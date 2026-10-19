@@ -150,6 +150,7 @@ test('plan diagnostics classify errors without leaking provider prose or credent
     JSON.stringify({ diagnostic: { severity: 'error', summary: 'Invalid index',
       detail: credential, range: { filename: 'main.tf', start: { line: 12 }, snippet: credential } } }),
     JSON.stringify({ diagnostic: { severity: 'error', summary: '403 Forbidden', detail: credential } }),
+    JSON.stringify({ diagnostic: { severity: 'error', summary: 'Instance cannot be destroyed', detail: 'lifecycle.prevent_destroy ' + credential } }),
     JSON.stringify({ diagnostic: { severity: 'error', summary: credential, detail: credential } }),
     JSON.stringify({ diagnostic: { severity: 'warning', summary: credential } }),
   ].join('\n'));
@@ -160,7 +161,8 @@ test('plan diagnostics classify errors without leaking provider prose or credent
   assert.ok(result.stderr.includes('invalid index'));
   assert.ok(result.stderr.includes('permission denied'));
   assert.ok(result.stderr.includes('Source: main.tf:12'));
-  assert.ok(result.stderr.includes('diagnostics: 3'));
+  assert.ok(result.stderr.includes('diagnostics: 4'));
+  assert.ok(result.stderr.includes('Destructive replacement blocked by prevent_destroy'));
   assert.ok(!result.stderr.includes(credential));
   assert.equal(result.stdout, '');
 });

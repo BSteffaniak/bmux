@@ -7,6 +7,10 @@ This admin-only OpenTofu root owns:
 - The public `LIVE_FLY_APP`, `LIVE_FLY_ORG`, `LIVE_FLY_REGION` repository variables.
 
 Normal releases do not apply this root or receive repository-administration tokens.
+The provider is pinned to 6.10.2: 6.6.0's branch-policy importer omitted the
+repository/environment identity fields and incorrectly proposed replacements.
+`test-live-github-provider-import.mjs` exercises the real pinned provider against
+a loopback API fixture (no cloud access or apply), retaining `prevent_destroy`.
 The GitHub provider uses `GITHUB_TOKEN` from the operator environment. Do not put
 credentials in tfvars, shell arguments, or committed files. Secret installation
 remains outside Terraform so reusable credentials never enter this root's state.

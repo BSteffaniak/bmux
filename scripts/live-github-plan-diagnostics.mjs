@@ -2,6 +2,7 @@
 // Never print provider prose, source snippets, variable values, or raw logs.
 import { readFileSync } from 'node:fs';
 const categories = [
+  [/cannot be destroyed|prevent_destroy|prevent.destroy/i, 'Destructive replacement blocked by prevent_destroy; preserve state and inspect provider import'],
   [/resource not accessible|403|forbidden|permission/i, 'GitHub/provider permission denied'],
   [/401|unauthorized|bad credentials/i, 'Provider authentication rejected'],
   [/cannot import non-existent|404|not found/i, 'Import target or provider endpoint not found'],
