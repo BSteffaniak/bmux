@@ -476,20 +476,21 @@ impl Player {
     fn cycle_focus(&mut self, reverse: bool) {
         let registry = self.registry();
         let targets = self.focus_targets(&registry);
-        let next = self
+        // Include slide navigation in the focus ring, even for one control.
+        let current = self
             .local_view
             .focused_block
             .as_ref()
-            .and_then(|id| targets.iter().position(|target| target == id))
-            .map_or(0, |index| {
-                if reverse {
-                    (index + targets.len() - 1) % targets.len()
-                } else {
-                    (index + 1) % targets.len()
-                }
-            });
-        self.local_view.focused_block = targets.get(next).cloned();
+            .and_then(|id| targets.iter().position(|target| target == id));
+        self.local_view.focused_block = match (current, reverse) {
+            (None, false) => targets.first().cloned(),
+            (None, true) => targets.last().cloned(),
+            (Some(0), true) => None,
+            (Some(index), true) => targets.get(index - 1).cloned(),
+            (Some(index), false) => targets.get(index + 1).cloned(),
+        };
     }
+
     fn route_component(&mut self, event: &Event) -> bmux_tui::event::EventOutcome {
         let Some(layout) = &self.local_view.painted_layout else {
             return bmux_tui::event::EventOutcome::Ignored;
@@ -508,7 +509,9 @@ impl Player {
             &registry,
         )
         .rich_content(&displayed.rich);
-        if let Some(id) = &self.local_view.painted_focus {
+        if let Some(id) = &self.local_view.painted_focus
+            && self.local_view.focused_block.as_ref() == Some(id)
+        {
             component = component.focused_block(id);
         }
         let mirror = displayed
@@ -794,7 +797,21 @@ impl Program for Player {
                     );
                     return Ok(Update::redraw());
                 }
-                if self.remote.is_some() && self.route_mirror(&Event::Key(key))? {
+                // Focus escape belongs to the presenter, not the embedded control.
+                if key.key == KeyCode::Escape && self.local_view.focused_block.take().is_some() {
+                    self.local_view.pending_demo = None;
+                    return Ok(Update::redraw());
+                }
+                if key.key == KeyCode::Tab {
+                    self.cycle_focus(key.modifiers.shift);
+                    self.local_view.pending_demo = None;
+                    return Ok(Update::redraw());
+                }
+                if self.remote.is_some()
+                    && self.local_view.painted_focus.is_some()
+                    && self.local_view.focused_block == self.local_view.painted_focus
+                    && self.route_mirror(&Event::Key(key))?
+                {
                     return Ok(Update::redraw());
                 }
                 if key.key == KeyCode::Char('q')
@@ -807,15 +824,6 @@ impl Program for Player {
                     !(key.modifiers.ctrl && key.key == KeyCode::Char('z')),
                     "outer job suspension is unsupported; exiting with terminal restoration"
                 );
-                if self.route_mirror(&Event::Key(key))? {
-                    return Ok(Update::redraw());
-                }
-                if key.key == KeyCode::Tab {
-                    self.cycle_focus(key.modifiers.shift);
-                    // Focus changes invalidate input until the replacement frame commits.
-                    self.local_view.pending_demo = None;
-                    return Ok(Update::redraw());
-                }
                 if self.route_component(&Event::Key(key)) != bmux_tui::event::EventOutcome::Ignored
                 {
                     return Ok(Update::redraw());
@@ -1011,9 +1019,9 @@ fn paint_audience(
     if view
         .focused_block
         .as_ref()
-        .is_none_or(|id| !targets.contains(id))
+        .is_some_and(|id| !targets.contains(id))
     {
-        view.focused_block = targets.first().cloned();
+        view.focused_block = None;
     }
     let mirror_surface = content.state.current_slide(content.deck).and_then(|slide| {
         content.surfaces.iter().rev().find(|surface| {
@@ -1212,7 +1220,7 @@ fn paint_content(player: &mut Player, theme: &PresentationTheme, cx: &mut PaintC
     }
     let footer = player.status.clone().unwrap_or_else(|| {
         format!(
-            "{}  reveal {}  ←/→ navigate · ↑/↓/PgUp/PgDn scroll · Tab focus · q quit{}",
+            "{}  reveal {}  ←/→ navigate · ↑/↓/PgUp/PgDn scroll · Tab focus · Esc unfocus · q quit{}",
             slide.id.as_str(),
             player.state.reveal_step,
             if player.presenter {
@@ -2552,6 +2560,97 @@ mod tests {
         assert_eq!(player.local_view.viewer.scroll.get().vertical_offset(), 0);
     }
     #[test]
+    fn gallery_focus_can_be_released_without_repainting_it_back() {
+        for release in [KeyCode::Escape, KeyCode::Tab] {
+            for next in [KeyCode::Right, KeyCode::Char(' ')] {
+                let deck = DeckBuilder::new("focus")
+                    .slide(
+                        SlideBuilder::new("input")
+                            .custom(
+                                "input",
+                                "tui-gallery",
+                                serde_json::json!({"kind":"text-input-box"}),
+                            )
+                            .build(),
+                    )
+                    .slide(SlideBuilder::new("next").build())
+                    .build()
+                    .unwrap();
+                let mut player = Player::local(deck, None, false);
+                let mut terminal = Terminal::new(Vec::new(), Rect::new(0, 0, 80, 24));
+                let draw = |player: &mut Player, terminal: &mut Terminal<Vec<u8>>| {
+                    terminal.draw(|cx| paint(player, cx)).unwrap();
+                    player.local_view.commit();
+                };
+                draw(&mut player, &mut terminal);
+                assert!(player.local_view.painted_focus.is_none());
+                player
+                    .update(RuntimeEvent::Terminal(Event::Key(KeyStroke::simple(
+                        KeyCode::Tab,
+                    ))))
+                    .unwrap();
+                draw(&mut player, &mut terminal);
+                assert_eq!(player.local_view.painted_focus, Some("input".into()));
+                for key in [KeyCode::Char(' '), KeyCode::Right] {
+                    player
+                        .update(RuntimeEvent::Terminal(Event::Key(KeyStroke::simple(key))))
+                        .unwrap();
+                    draw(&mut player, &mut terminal);
+                    assert_eq!(player.state.slide_id, Some("input".into()));
+                }
+                let update = player
+                    .update(RuntimeEvent::Terminal(Event::Key(KeyStroke::simple(
+                        release,
+                    ))))
+                    .unwrap();
+                assert_eq!(update.lifecycle, bmux_tui_runtime::Lifecycle::Continue);
+                assert!(
+                    !player
+                        .route_component(&Event::Key(KeyStroke::simple(KeyCode::Char(' '))))
+                        .is_handled()
+                );
+                draw(&mut player, &mut terminal);
+                assert!(player.local_view.painted_focus.is_none());
+                player
+                    .update(RuntimeEvent::Terminal(Event::Key(KeyStroke::simple(next))))
+                    .unwrap();
+                assert_eq!(player.state.slide_id, Some("next".into()));
+            }
+        }
+    }
+
+    #[test]
+    fn component_focus_ring_includes_navigation_in_both_directions() {
+        let deck = DeckBuilder::new("focus")
+            .slide(
+                SlideBuilder::new("s")
+                    .custom("one", "counter", serde_json::json!({}))
+                    .custom("two", "toggle", serde_json::json!({}))
+                    .build(),
+            )
+            .build()
+            .unwrap();
+        let mut player = Player::local(deck, None, false);
+        for reverse in [false, true] {
+            for expected in if reverse {
+                [Some("two"), Some("one"), None]
+            } else {
+                [Some("one"), Some("two"), None]
+            } {
+                player.cycle_focus(reverse);
+                assert_eq!(
+                    player
+                        .local_view
+                        .focused_block
+                        .as_ref()
+                        .map(|id| id.as_str()),
+                    expected
+                );
+            }
+        }
+    }
+
+    #[test]
     fn local_linked_values_follow_stable_blocks_and_focus() {
         let deck = DeckBuilder::new("d")
             .slide(
@@ -2565,6 +2664,9 @@ mod tests {
             .unwrap();
         let mut player = Player::local(deck.clone(), None, false);
         let mut terminal = Terminal::new(Vec::new(), Rect::new(0, 0, 40, 18));
+        terminal.draw(|cx| paint(&mut player, cx)).unwrap();
+        player.local_view.commit();
+        player.cycle_focus(false);
         terminal.draw(|cx| paint(&mut player, cx)).unwrap();
         player.local_view.commit();
         assert!(

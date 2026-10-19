@@ -69,8 +69,9 @@ controls. Rust snippets are never evaluated and no external process is started.
 The existing `LinkedComponentFactory` extension point can return any application-
 linked `Component`; unregistered names are not implicitly activated.
 
-The tour includes 24 native examples. Tab focuses an example; Escape returns to
-navigation. Button, checkbox, breadcrumbs, radio, list, tabs, tree, table, and text
+The tour includes 24 native examples. Slides start in navigation mode. Tab and
+Shift-Tab cycle through controls and back to navigation, even for a single control.
+Escape releases control focus; a second Escape exits. Button, checkbox, breadcrumbs, radio, list, tabs, tree, table, and text
 input support keyboard input. Text input also accepts paste, capped at 4096 bytes.
 Other fixtures are display-only, including the dropdown shown open. Viewer helpers
 use real row-projection APIs; form validation is composed with native field controls.
