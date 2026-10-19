@@ -15,43 +15,22 @@ The GitHub provider uses `GITHUB_TOKEN` from the operator environment. Do not pu
 credentials in tfvars, shell arguments, or committed files. Secret installation
 remains outside Terraform so reusable credentials never enter this root's state.
 
-## Simplest path: temporary GitHub Actions migration
+## Completed migration and canonical state
 
-1. Create a short-lived fine-grained GitHub token limited to this repository:
-   **Administration: read/write**, **Environments: read/write**, and
-   **Variables: read/write** (Metadata read is implicit). No contents-write or
-   secrets-read permission is needed.
-2. Add it as the `Production` environment secret `LIVE_GITHUB_ADMIN_TOKEN`.
-3. Push this code to `master`. Run **One-time GitHub Terraform migration** in
-   Actions. There are no inputs: it discovers existing IDs and public values,
-   shows the Terraform plan in the run summary, then waits for one approval.
-4. Review and approve `production-approval`. Wait for the apply and verification
-   job to finish successfully.
-5. Delete `.github/workflows/migrate-live-github.yml`,
-   `scripts/migrate-live-github.mjs`, `scripts/check-live-github-migration.mjs`,
-   `scripts/live-github-plan-diagnostics.mjs`,
-   and `scripts/test-live-github-migration.mjs`. Remove its test command from
-   `live-validation.yml`. Delete the admin secret and revoke the token.
+The one-time migration completed successfully in
+[run 39306305396](https://github.com/BSteffaniak/bmux/actions/runs/39306305396).
+The temporary migration workflow and helpers have been retired. Do not recreate
+them or re-import these resources into a new state for routine administration.
 
 Keep this Terraform root, its lockfile, and `scripts/live-github-init.sh`.
 State persists encrypted in the existing R2 bucket under the separate key
 `bmux/github/production/terraform.tfstate`; the live application's state is untouched.
-Existing R2 credentials must permit this key and its `.tflock` object. No new bucket
-or application deployment is created. Plan artifacts expire after one day; they
-are **not** the state authority. Canonical state stays in R2.
+Existing R2 credentials must permit this key and its `.tflock` object. Plan artifacts
+are **not** the state authority. Canonical state stays in R2; never reset it or
+substitute a local state file. Preserve the encryption passphrase and R2 credentials
+for future administration.
 
-This deliberately stops for unexpected reviewers, timers, custom protections,
-branch policies, missing resources, or public configuration changes. It never
-silently deletes or recreates infrastructure. If a job fails after apply starts,
-keep the workflow/token, start a **new full run** to refresh canonical state and
-obtain a fresh approval; do not rerun only the old apply job or reset state.
-A repeated completed run should plan no changes.
-
-If this root was already applied using local state, stop: migrate that original
-state to the remote backend explicitly before running this workflow. Do not import
-the same resources into a second independent state.
-
-## Manual administration alternative
+## Manual administration
 
 Use a private working directory/state backup and restrictive umask (`umask 077`).
 Export the existing R2 credentials, account ID, bucket, and encryption passphrase
@@ -126,4 +105,12 @@ tofu -chdir=infra/live-github validate
 tofu -chdir=infra/live-github test
 ```
 
-Tests use a mocked provider and do not contact GitHub or change resources.
+The pinned provider also runs against a loopback API fixture (no cloud access or
+apply):
+
+```sh
+node --test scripts/test-live-github-provider-import.mjs
+```
+
+Initialize the provider locally with `init -backend=false -input=false
+-lockfile=readonly` before running this test; it uses that installed provider.
