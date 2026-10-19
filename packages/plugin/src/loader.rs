@@ -2380,6 +2380,13 @@ impl LoadedPlugin {
                 .map_err(|error| PluginError::ServiceProtocol {
                     details: error.to_string(),
                 })?;
+        if bmux_plugin_sdk::service_contract::is_checked(&context.request.payload)
+            && matches!(&self.backend, PluginBackend::Process(_))
+        {
+            return Err(PluginError::ServiceProtocol {
+                details: "checked service contracts unsupported by process provider".into(),
+            });
+        }
         if let PluginBackend::Process(runtime) = &self.backend {
             return self.invoke_process_service(runtime, context);
         }
@@ -2400,6 +2407,11 @@ impl LoadedPlugin {
                 .map_err(|error| PluginError::ServiceProtocol {
                     details: error.to_string(),
                 })?;
+        if bmux_plugin_sdk::service_contract::is_checked(&context.service.request.payload) {
+            return Err(PluginError::ServiceProtocol {
+                details: "checked streaming provider calls are not yet supported".into(),
+            });
+        }
         if let PluginBackend::Process(runtime) = &self.backend {
             return self.invoke_process_service(runtime, &context.service);
         }
@@ -2476,9 +2488,24 @@ impl LoadedPlugin {
         )?;
         let encode_us = encode_started.elapsed().as_micros();
 
+        let checked = bmux_plugin_sdk::service_contract::is_checked(&context.request.payload);
+        if checked && streaming {
+            return Err(PluginError::ServiceProtocol {
+                details: "checked streaming service representation is not supported".into(),
+            });
+        }
+        if checked
+            && matches!(&self.backend, PluginBackend::Static(table) if !table.checked_service_contracts)
+        {
+            return Err(PluginError::ServiceProtocol {
+                details: "provider has no checked service export".into(),
+            });
+        }
         let resolved_symbol = match &self.backend {
             PluginBackend::Dynamic(library) => {
-                let symbol = if streaming {
+                let symbol = if checked {
+                    "bmux_plugin_invoke_service_checked_v1"
+                } else if streaming {
                     DEFAULT_NATIVE_STREAMING_SERVICE_SYMBOL
                 } else {
                     DEFAULT_NATIVE_SERVICE_SYMBOL
@@ -3628,6 +3655,7 @@ minimum = "1.0"
             activate_with_async: |_context, _async_handle| 0,
             deactivate: test_static_plugin_lifecycle,
             handle_event: test_static_plugin_event,
+            checked_service_contracts: false,
             invoke_service: test_static_plugin_service,
             invoke_streaming_service: test_static_plugin_service,
             register_typed_services: test_static_plugin_typed_services,

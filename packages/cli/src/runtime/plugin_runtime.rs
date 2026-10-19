@@ -537,6 +537,17 @@ const fn static_bundled_workspace_plugin_dirs() -> &'static [&'static str] {
     ]
 }
 
+pub(super) fn initialize_native_runtime_state(
+    config: BmuxConfig,
+    paths: ConfigPaths,
+) -> Result<()> {
+    let registry = Arc::new(scan_available_plugins(&config, &paths)?);
+    install_enabled_client_adapters(&config, &registry, &paths);
+    let state = build_runtime_command_state(config, paths, registry)?;
+    RUNTIME_COMMAND_STATE_CACHE.with(|slot| *slot.borrow_mut() = Some(state));
+    Ok(())
+}
+
 fn runtime_command_state() -> Result<RuntimeCommandState> {
     RUNTIME_COMMAND_STATE_CACHE.with(|slot| {
         if let Some(state) = slot.borrow().clone() {
@@ -1875,9 +1886,24 @@ async fn dispatch_plugin_callback<F>(callback: F) -> Result<Result<()>>
 where
     F: FnOnce() -> Result<()> + Send + 'static,
 {
-    tokio::task::spawn_blocking(callback)
-        .await
-        .context("join plugin event dispatch")
+    // Event callbacks run on a blocking worker. Preserve the explicitly pinned
+    // attach configuration there too; never let a callback discover user roots.
+    let state = RUNTIME_COMMAND_STATE_CACHE.with(|slot| slot.borrow().clone());
+    tokio::task::spawn_blocking(move || {
+        struct RestoreState(Option<RuntimeCommandState>);
+        impl Drop for RestoreState {
+            fn drop(&mut self) {
+                RUNTIME_COMMAND_STATE_CACHE.with(|slot| *slot.borrow_mut() = self.0.take());
+            }
+        }
+        let _restore = RestoreState(
+            RUNTIME_COMMAND_STATE_CACHE
+                .with(|slot| std::mem::replace(&mut *slot.borrow_mut(), state)),
+        );
+        callback()
+    })
+    .await
+    .context("join plugin event dispatch")
 }
 
 fn is_pane_output_plugin_event(event: &bmux_client::ServerEvent) -> bool {
@@ -2411,6 +2437,48 @@ fn emit_external_plugin_phase_timing(
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn native_bootstrap_pins_explicit_paths_in_worker_local_actions() {
+        let root = temp_dir();
+        let paths = bmux_config::ConfigPaths::new(
+            root.join("config"),
+            root.join("runtime"),
+            root.join("data"),
+            root.join("state"),
+        );
+        let mut config = bmux_config::BmuxConfig::default();
+        config.plugins.search_paths.clear();
+        std::thread::spawn(move || {
+            initialize_native_runtime_state(config, paths.clone())
+                .expect("native explicit bootstrap");
+            let state = runtime_command_state().expect("pinned action state");
+            assert_eq!(state.paths.config_dir, paths.config_dir);
+            assert_eq!(state.paths.runtime_dir, paths.runtime_dir);
+            assert_eq!(state.paths.data_dir, paths.data_dir);
+            assert_eq!(state.paths.state_dir, paths.state_dir);
+            assert!(state.config.plugins.search_paths.is_empty());
+            let callback_paths = paths;
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async move {
+                    dispatch_plugin_callback(move || {
+                        let callback_state = runtime_command_state()?;
+                        assert_eq!(callback_state.paths.config_dir, callback_paths.config_dir);
+                        assert_eq!(callback_state.paths.runtime_dir, callback_paths.runtime_dir);
+                        Ok(())
+                    })
+                    .await
+                    .expect("callback joined")
+                    .expect("callback preserved selected roots");
+                });
+        })
+        .join()
+        .expect("worker finished");
+        std::fs::remove_dir_all(root).expect("remove owned test directory");
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn blocking_plugin_callback_does_not_stall_sibling_service_progress() {
         let (request_tx, request_rx) = tokio::sync::oneshot::channel();

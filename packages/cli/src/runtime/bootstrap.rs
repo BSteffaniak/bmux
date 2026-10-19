@@ -278,7 +278,16 @@ async fn run_server_start_inner(
     startup_recording: Option<ManualRecordingStartOptions>,
 ) -> Result<u8> {
     let local_connection_context = ConnectionContext::new(Some("local"));
-    cleanup_stale_pid_file().await?;
+    let paths = ConfigPaths::default();
+    // The daemon launcher owns no claim or metadata mutation authority.
+    let startup_ownership = if daemon && !foreground_internal {
+        None
+    } else {
+        let ownership = super::startup_ownership::StartupOwnership::acquire(&paths)?;
+        ownership.prepare_endpoint().await?;
+        cleanup_stale_pid_file().await?;
+        Some(ownership)
+    };
     let startup_recording = match startup_recording {
         Some(options) => Some(options),
         None => startup_recording_from_env()?,
@@ -334,11 +343,6 @@ async fn run_server_start_inner(
             "rolling recording is enabled but no rolling event kinds are selected; enable rolling capture flags or pass --rolling-event-kind/--rolling-event-kind-all"
         )
     }
-    let paths = ConfigPaths::default();
-    let registry = scan_available_plugins(&config, &paths)?;
-    validate_enabled_plugins(&config, &registry)?;
-    let _preloaded_plugins = load_enabled_plugins(&config, &registry)?;
-
     if daemon && !foreground_internal {
         let executable =
             std::env::current_exe().context("failed to resolve bmux executable path")?;
@@ -370,8 +374,6 @@ async fn run_server_start_inner(
             .stdout(Stdio::null())
             .stderr(Stdio::from(startup_output));
         let mut child = child.spawn().context("failed to spawn background server")?;
-        write_server_pid_file(child.id())?;
-        write_server_runtime_metadata(child.id())?;
 
         let started = std::time::Instant::now();
         loop {
@@ -379,7 +381,6 @@ async fn run_server_start_inner(
                 .try_wait()
                 .context("failed checking background server")?
             {
-                let _ = remove_server_pid_file();
                 anyhow::bail!(
                     "background server exited with {status}; startup diagnostics: {}\n{}",
                     startup_log.display(),
@@ -397,7 +398,6 @@ async fn run_server_start_inner(
             if started.elapsed() >= SERVER_START_TIMEOUT {
                 let _ = child.kill();
                 let _ = child.wait();
-                let _ = remove_server_pid_file();
                 anyhow::bail!(
                     "background server did not become ready before timeout; startup diagnostics: {}\n{}",
                     startup_log.display(),
@@ -411,6 +411,8 @@ async fn run_server_start_inner(
         return Ok(0);
     }
 
+    let registry = scan_available_plugins(&config, &paths)?;
+    validate_enabled_plugins(&config, &registry)?;
     let loaded_plugins = std::sync::Arc::new(load_enabled_plugins(&config, &registry)?);
     register_recording_plugin_config(
         &config,
@@ -543,10 +545,26 @@ async fn run_server_start_inner(
         }
     };
     let mut gateway_loop = Box::pin(gateway_loop);
+    let ownership = startup_ownership
+        .as_ref()
+        .context("foreground startup has no lifetime claim")?;
+    let mut server_loop = Box::pin(server.run());
+    // The first poll performs synchronous bind. Capture its receipt before any
+    // plugin restore await can turn a bound listener into a long startup window.
+    let mut owned_server_loop = Box::pin(std::future::poll_fn(|cx| {
+        use std::future::Future as _;
+        let result = server_loop.as_mut().poll(cx);
+        if !matches!(&result, std::task::Poll::Ready(Err(_)))
+            && let Err(error) = ownership.record_bound_endpoint()
+        {
+            return std::task::Poll::Ready(Err(error));
+        }
+        result
+    }));
     let run_result = if loaded_plugins.is_empty() {
         tokio::select! {
             biased;
-            result = server.run() => result,
+            result = &mut owned_server_loop => result,
             result = &mut gateway_loop => result,
         }
     } else {
@@ -558,7 +576,7 @@ async fn run_server_start_inner(
         );
         tokio::pin!(plugin_bridge);
         tokio::select! {
-            result = server.run() => {
+            result = &mut owned_server_loop => {
                 let _ = plugin_bridge_shutdown_tx.send(true);
                 result
             }
@@ -575,6 +593,8 @@ async fn run_server_start_inner(
     };
     // Cancellation must release gateway listeners before plugin teardown, which
     // can take time. A pinned reference would keep the underlying future alive.
+    drop(owned_server_loop);
+    drop(server_loop);
     drop(gateway_loop);
     if let Err(error) =
         dispatch_loaded_plugin_event(&loaded_plugins, &plugin_system_event("server_stopping"))

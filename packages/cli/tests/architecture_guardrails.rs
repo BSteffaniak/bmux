@@ -1,3 +1,8 @@
+//! Cross-cutting native/frontend dependency boundaries are checked separately
+//! from the legacy source guards below.
+#[path = "bterm_architecture/mod.rs"]
+mod bterm_architecture;
+
 /// Strip the `mod tests { ... }` block from a source file so
 /// downstream assertions only consider production code.
 ///

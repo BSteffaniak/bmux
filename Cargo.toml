@@ -17,6 +17,10 @@ members = [
     "packages/attach_pipeline",
     "packages/attach_pipeline/models",
     "packages/bmux",
+    "packages/bterm",
+    "packages/frontend-runtime",
+    "packages/native-platform",
+    "packages/native-renderer",
     "packages/codec",
     "packages/codec-derive",
     "packages/fonts",
@@ -171,9 +175,24 @@ repository = "https://github.com/BSteffaniak/bmux"
 version    = "0.0.1-alpha.4"
 
 [workspace.dependencies]
+accesskit = { version = "0.21.1", default-features = false }
+accesskit_winit = { version = "0.29.2", default-features = false }
 arc-swap = { version = "1.9", default-features = false }
+bmux_frontend_runtime = { version = "0.0.1-alpha.4", default-features = false, path = "packages/frontend-runtime" }
+bmux_native_platform = { version = "0.0.1-alpha.4", default-features = false, path = "packages/native-platform" }
+bmux_native_renderer = { version = "0.0.1-alpha.4", default-features = false, path = "packages/native-renderer" }
+bytemuck = { version = "1.25", default-features = false }
 cranelift-codegen = { version = "0.136.3", default-features = false, features = [
     "all-native-arch",
+] }
+pollster = { version = "0.4", default-features = false }
+raw-window-handle = { version = "0.6.2", default-features = false, features = [
+    "std",
+] }
+swash = { version = "0.2", default-features = false, features = [
+    "scale",
+    "render",
+    "std",
 ] }
 wasmtime = { version = "49.0.3", default-features = false, features = [
     "cranelift",
@@ -181,6 +200,20 @@ wasmtime = { version = "49.0.3", default-features = false, features = [
     "std",
 ] }
 wat = "1"
+wgpu = { version = "27.0.1", default-features = false, features = [
+    "std",
+    "wgsl",
+    "vulkan",
+    "gles",
+    "metal",
+    "dx12",
+] }
+winit = { version = "0.30.13", default-features = false, features = [
+    "rwh_06",
+    "x11",
+    "wayland",
+    "wayland-dlopen",
+] }
 # Internal bmux packages
 bmux = { version = "0.0.1-alpha.4", default-features = false, path = "packages/bmux" }
 bmux_appearance = { version = "0.0.1-alpha.4", default-features = false, path = "packages/appearance" }

@@ -48,6 +48,7 @@
 #![allow(clippy::module_name_repetitions)]
 
 pub mod ast;
+pub mod canonical;
 pub mod codegen_rust;
 pub mod lexer;
 pub mod parser;

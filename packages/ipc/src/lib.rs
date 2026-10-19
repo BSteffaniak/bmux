@@ -70,6 +70,9 @@ pub const CURRENT_PROTOCOL_REVISION: u32 = 1;
 pub const MIN_SUPPORTED_PROTOCOL_REVISION: u32 = 1;
 
 pub const CORE_CAPABILITY_CONTROL: &str = "core.control";
+/// Explicit opt-in support for invocation-bound exact BPDL service contracts.
+pub const CAPABILITY_SERVICE_CONTRACT_V1: &str = "core.service_contract.v1";
+
 pub const CORE_CAPABILITY_SERVICE_INVOCATION: &str = "core.service_invocation";
 pub const CORE_CAPABILITY_EVENT_STREAM: &str = "core.event_stream";
 pub const CORE_CAPABILITY_LIFECYCLE: &str = "core.lifecycle";
@@ -157,6 +160,7 @@ pub enum IncompatibilityReason {
 pub fn default_supported_capabilities() -> Vec<String> {
     #[allow(unused_mut)]
     let mut caps = vec![
+        CAPABILITY_SERVICE_CONTRACT_V1.to_string(),
         CORE_CAPABILITY_CONTROL.to_string(),
         CORE_CAPABILITY_SERVICE_INVOCATION.to_string(),
         CORE_CAPABILITY_EVENT_STREAM.to_string(),

@@ -787,7 +787,7 @@ pub(super) fn register_plugin_service_handlers(
         let connection_info_for_handler = connection_info.clone();
         let enabled_plugins_for_handler = enabled_plugins.clone();
 
-        server.register_service_handler_with_metadata(
+        server.register_checked_service_handler_with_metadata(
             service.capability.as_str().to_string(),
             invoke_kind,
             service.interface_id.clone(),

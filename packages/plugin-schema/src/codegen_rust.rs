@@ -87,6 +87,11 @@ pub fn emit_with_imports(schema: &Schema, imports: &ImportMap) -> String {
     let module_counts = interface_module_counts(schema);
     out.push_str("// AUTO-GENERATED FROM BPDL. DO NOT EDIT BY HAND.\n\n");
     out.push_str("use serde::{Deserialize, Serialize};\n\n");
+    let contract = crate::canonical::service_contract(schema, imports);
+    let _ = writeln!(
+        out,
+        "/// Exact BPDL v1 wire contract including imported definitions.\npub const SERVICE_CONTRACT: &[u8] = &{contract:?};\n"
+    );
     emit_capabilities(&schema.capabilities, &mut out);
     for iface in &schema.interfaces {
         emit_interface(
@@ -392,6 +397,7 @@ fn emit_schema_service_declarations(schema: &Schema, out: &mut String) {
     out.push_str("/// Type-level BPDL contract for this plugin API crate.\n");
     out.push_str("pub struct Contract;\n\n");
     out.push_str("impl ::bmux_plugin_sdk::PluginContract for Contract {\n");
+    out.push_str("    fn service_contract() -> &'static [u8] { SERVICE_CONTRACT }\n");
     out.push_str("    fn service_declarations() -> ::bmux_plugin_sdk::Result<Vec<::bmux_plugin_sdk::PluginService>> {\n");
     out.push_str("        service_declarations()\n");
     out.push_str("    }\n");
@@ -426,7 +432,7 @@ fn emit_interface_service_descriptor(iface: &Interface, out: &mut String) {
     };
     let _ = writeln!(
         out,
-        "    /// BPDL-generated service descriptor for this interface.\n    pub const SERVICE_DESCRIPTOR: ::bmux_plugin_sdk::ServiceInterfaceDescriptor = ::bmux_plugin_sdk::ServiceInterfaceDescriptor {{\n        capability: super::capabilities::{capability},\n        kind: ::bmux_plugin_sdk::ServiceKind::{kind},\n        interface_id: INTERFACE_ID,\n    }};\n"
+        "    /// BPDL-generated service descriptor for this interface.\n    pub const SERVICE_DESCRIPTOR: ::bmux_plugin_sdk::ServiceInterfaceDescriptor = ::bmux_plugin_sdk::ServiceInterfaceDescriptor {{\n        capability: super::capabilities::{capability},\n        kind: ::bmux_plugin_sdk::ServiceKind::{kind},\n        interface_id: INTERFACE_ID,\n        contract: super::SERVICE_CONTRACT,\n    }};\n"
     );
     out.push_str(
         "    /// Convert this BPDL interface descriptor into a plugin service declaration.\n",
@@ -711,6 +717,9 @@ fn emit_transport_endpoint(
     let _ = writeln!(
         out,
         "            const INTERFACE_ID: ::bmux_plugin_sdk::InterfaceId = super::INTERFACE_ID;"
+    );
+    out.push_str(
+        "            const SERVICE_CONTRACT: &'static [u8] = super::super::SERVICE_CONTRACT;\n",
     );
     let _ = writeln!(
         out,

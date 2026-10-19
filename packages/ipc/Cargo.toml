@@ -12,14 +12,20 @@ version     = { workspace = true }
 
 [dependencies]
 bmux_attach_image_protocol = { workspace = true }
-bmux_codec                 = { workspace = true }
-lz4_flex                   = { workspace = true, optional = true }
-serde                      = { workspace = true, features = ["derive", "std"] }
-serde_json                 = { workspace = true }
-thiserror                  = { workspace = true }
-tokio                      = { workspace = true, features = ["io-util", "macros", "net", "rt"] }
-uuid                       = { workspace = true, features = ["serde", "std", "v4"] }
-zstd                       = { workspace = true, optional = true }
+bmux_codec = { workspace = true }
+lz4_flex = { workspace = true, optional = true }
+serde = { workspace = true, features = ["derive", "std"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = [
+    "io-util",
+    "macros",
+    "net",
+    "rt",
+    "sync",
+] }
+uuid = { workspace = true, features = ["serde", "std", "v4"] }
+zstd = { workspace = true, optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }

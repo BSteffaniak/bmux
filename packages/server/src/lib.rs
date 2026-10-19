@@ -107,6 +107,7 @@ type ServiceResolverHandler = dyn Fn(ServiceRoute, Vec<u8>) -> ServiceInvokeFutu
 #[derive(Default)]
 struct ServiceRegistry {
     handlers: BTreeMap<ServiceRoute, Arc<ServiceInvokeHandler>>,
+    checked_handlers: std::collections::BTreeSet<ServiceRoute>,
 }
 
 impl ServiceRegistry {
@@ -116,11 +117,29 @@ impl ServiceRegistry {
         context: ServiceInvokeContext,
         payload: Vec<u8>,
     ) -> Option<ServiceInvokeFuture> {
+        let checked = bmux_plugin_sdk::service_contract::is_checked(&payload);
         if let Some(handler) = self.handlers.get(route).cloned() {
+            if checked && !self.checked_handlers.contains(route) {
+                return Some(Box::pin(async {
+                    Err(anyhow::anyhow!(
+                        "service handler has no checked BPDL contract boundary"
+                    ))
+                }));
+            }
             return Some(handler(route.clone(), context, payload));
         }
         let mut wildcard = route.clone();
         wildcard.operation = "*".to_string();
+        if checked
+            && self.handlers.contains_key(&wildcard)
+            && !self.checked_handlers.contains(&wildcard)
+        {
+            return Some(Box::pin(async {
+                Err(anyhow::anyhow!(
+                    "service handler has no checked BPDL contract boundary"
+                ))
+            }));
+        }
         self.handlers
             .get(&wildcard)
             .cloned()
@@ -210,6 +229,11 @@ async fn invoke_service_output(
     let invocation = if let Some(invocation) = dispatch {
         Some(invocation)
     } else {
+        if bmux_plugin_sdk::service_contract::is_checked(&payload) {
+            return Err(anyhow::anyhow!(
+                "no checked BPDL provider registered for service route"
+            ));
+        }
         let resolver = state
             .service_resolver
             .lock()
@@ -1028,21 +1052,72 @@ impl BmuxServer {
         F: Fn(ServiceRoute, ServiceInvokeContext, Vec<u8>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<ServiceInvokeOutput>> + Send + 'static,
     {
-        let route = ServiceRoute {
-            capability: capability.into(),
-            kind,
-            interface_id: interface_id.into(),
-            operation: operation.into(),
-        };
+        self.register_service_handler_boundary(
+            ServiceRoute {
+                capability: capability.into(),
+                kind,
+                interface_id: interface_id.into(),
+                operation: operation.into(),
+            },
+            false,
+            handler,
+        )
+    }
+
+    /// Register a handler that forwards checked frames to a provider-side generated
+    /// contract validator before any provider code executes. Do not use this for
+    /// legacy/manual handlers. Registration and admission policy share one lock.
+    ///
+    /// # Errors
+    /// Returns an error if the service registry lock is poisoned.
+    pub fn register_checked_service_handler_with_metadata<F, Fut>(
+        &self,
+        capability: impl Into<String>,
+        kind: bmux_ipc::InvokeServiceKind,
+        interface_id: impl Into<String>,
+        operation: impl Into<String>,
+        handler: F,
+    ) -> Result<()>
+    where
+        F: Fn(ServiceRoute, ServiceInvokeContext, Vec<u8>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<ServiceInvokeOutput>> + Send + 'static,
+    {
+        self.register_service_handler_boundary(
+            ServiceRoute {
+                capability: capability.into(),
+                kind,
+                interface_id: interface_id.into(),
+                operation: operation.into(),
+            },
+            true,
+            handler,
+        )
+    }
+
+    fn register_service_handler_boundary<F, Fut>(
+        &self,
+        route: ServiceRoute,
+        checked: bool,
+        handler: F,
+    ) -> Result<()>
+    where
+        F: Fn(ServiceRoute, ServiceInvokeContext, Vec<u8>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<ServiceInvokeOutput>> + Send + 'static,
+    {
         let wrapped: Arc<ServiceInvokeHandler> =
             Arc::new(move |route, context, payload| Box::pin(handler(route, context, payload)));
-
-        self.state
+        let mut registry = self
+            .state
             .service_registry
             .lock()
-            .map_err(|_| anyhow::anyhow!("service registry lock poisoned"))?
-            .handlers
-            .insert(route, wrapped);
+            .map_err(|_| anyhow::anyhow!("service registry lock poisoned"))?;
+        if checked {
+            registry.checked_handlers.insert(route.clone());
+        } else {
+            registry.checked_handlers.remove(&route);
+        }
+        registry.handlers.insert(route, wrapped);
+        drop(registry);
         Ok(())
     }
 
@@ -2247,6 +2322,10 @@ async fn handle_request(
             let resolver_started = std::time::Instant::now();
             let invocation = if let Some(invocation) = dispatch {
                 Some(invocation)
+            } else if bmux_plugin_sdk::service_contract::is_checked(&payload) {
+                // A legacy fallback cannot attest the provider contract and must
+                // never see a checked invocation. Absence remains NotFound below.
+                None
             } else {
                 let resolver = state
                     .service_resolver
@@ -3003,6 +3082,69 @@ mod tests {
     use super::*;
     use serde::{Deserialize, Serialize};
 
+    #[tokio::test]
+    async fn checked_handler_admission_is_bound_to_registered_handler() {
+        let endpoint =
+            IpcEndpoint::unix_socket(std::env::temp_dir().join("bmux-contract-test.sock"));
+        let server = BmuxServer::new(endpoint);
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&calls);
+        server
+            .register_service_handler(
+                "example.read",
+                bmux_ipc::InvokeServiceKind::Query,
+                "state/v1",
+                "*",
+                move |_, _, _| {
+                    counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    async { Ok(vec![]) }
+                },
+            )
+            .unwrap();
+        let route = ServiceRoute {
+            capability: "example.read".into(),
+            kind: bmux_ipc::InvokeServiceKind::Query,
+            interface_id: "state/v1".into(),
+            operation: "get".into(),
+        };
+        let payload = bmux_plugin_sdk::service_contract::encode(b"contract", b"request").unwrap();
+        let result = invoke_service_output(
+            &server.state,
+            &server.shutdown_tx,
+            ClientId(Uuid::new_v4()),
+            Uuid::new_v4(),
+            route.clone(),
+            payload.clone(),
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let counted = Arc::clone(&calls);
+        server
+            .register_checked_service_handler_with_metadata(
+                "example.read",
+                bmux_ipc::InvokeServiceKind::Query,
+                "state/v1",
+                "*",
+                move |_, _, _| {
+                    counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    async { Ok(ServiceInvokeOutput::from(vec![])) }
+                },
+            )
+            .unwrap();
+        invoke_service_output(
+            &server.state,
+            &server.shutdown_tx,
+            ClientId(Uuid::new_v4()),
+            Uuid::new_v4(),
+            route,
+            payload,
+        )
+        .await
+        .unwrap();
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     struct PipelineTemplateTarget {
         context_id: String,
@@ -3040,7 +3182,11 @@ mod tests {
         assert!(tx.is_closed());
         assert_eq!(pool.available_permits(), 1);
         drop((reader, peer, listener));
-        assert!(!path.exists(), "listener removes its endpoint");
+        assert!(
+            path.exists(),
+            "generic listener drop preserves endpoint ownership"
+        );
+        std::fs::remove_file(&path).unwrap(); // This isolated fixture owns the socket pathname.
     }
 
     #[tokio::test]

@@ -145,6 +145,818 @@ pub trait AttachTerminal: Write {
     fn detect_image_capabilities(&mut self) -> bmux_image::host_caps::HostImageCapabilities;
 }
 
+trait AttachHost {
+    fn queue_native_event(&mut self, _event: NativeAttachEvent) {}
+    fn viewport_generation(&self) -> Option<u64> {
+        None
+    }
+    fn accepted_revision(&self) -> u64 {
+        0
+    }
+    fn native_resize(&mut self, _columns: u16, _rows: u16, _generation: u64) -> Result<()> {
+        anyhow::bail!("terminal host cannot receive native resize")
+    }
+    fn output(&mut self) -> Option<&mut dyn Write>;
+    /// Output-only drivers bypass terminal encoding and lifecycle entirely.
+    fn presentation_only(&self) -> bool {
+        false
+    }
+    fn viewport_guard(&self) -> Option<Arc<dyn Fn() -> bool + Send + Sync>> {
+        None
+    }
+    fn geometry(&self) -> TerminalGeometry;
+    /// Optional provider-owned sizing observation; never claims a viewport.
+    fn render_provider(&self) -> Option<Arc<dyn bmux_client::AttachProvider>> {
+        None
+    }
+    fn accept_geometry(&mut self, _geometry: TerminalGeometry) -> Result<()> {
+        anyhow::bail!("driver cannot follow provider geometry")
+    }
+
+    fn enter_attach_mode(
+        &mut self,
+        kitty_keyboard_enabled: bool,
+        mouse_capture_enabled: bool,
+        bracketed_paste_enabled: bool,
+    ) -> Result<bool>;
+
+    fn next_event(&mut self) -> AttachHostEventFuture<'_>;
+
+    /// Optional trusted in-process action accompanying the just-consumed event.
+    /// Ordinary terminals and read-only observers cannot supply one.
+    fn take_owned_action(&mut self) -> Option<String> {
+        None
+    }
+
+    fn restore_after_attach_ui(&mut self) -> Result<()>;
+
+    fn set_attached_session_id(&self, _session_id: Uuid) {}
+
+    #[cfg(test)]
+    fn observe_scrollback(&self, _active: bool) {}
+
+    #[cfg(any(
+        feature = "image-sixel",
+        feature = "image-kitty",
+        feature = "image-iterm2"
+    ))]
+    fn detect_image_capabilities(&mut self) -> bmux_image::host_caps::HostImageCapabilities;
+}
+
+struct TerminalAttachHost<'a, T: AttachTerminal + ?Sized>(&'a mut T);
+impl<T: AttachTerminal + ?Sized> AttachHost for TerminalAttachHost<'_, T> {
+    fn output(&mut self) -> Option<&mut dyn Write> {
+        Some(&mut self.0)
+    }
+    fn presentation_only(&self) -> bool {
+        self.0.presentation_only()
+    }
+    fn viewport_guard(&self) -> Option<Arc<dyn Fn() -> bool + Send + Sync>> {
+        self.0.viewport_guard()
+    }
+    fn geometry(&self) -> TerminalGeometry {
+        self.0.geometry()
+    }
+    fn render_provider(&self) -> Option<Arc<dyn bmux_client::AttachProvider>> {
+        self.0.render_provider()
+    }
+    fn accept_geometry(&mut self, geometry: TerminalGeometry) -> Result<()> {
+        self.0.accept_geometry(geometry)
+    }
+    fn enter_attach_mode(&mut self, keyboard: bool, mouse: bool, paste: bool) -> Result<bool> {
+        self.0.enter_attach_mode(keyboard, mouse, paste)
+    }
+    fn next_event(&mut self) -> AttachHostEventFuture<'_> {
+        let event = self.0.next_event();
+        Box::pin(async move { Ok(event.await?.map(AttachHostEvent::Terminal)) })
+    }
+    fn take_owned_action(&mut self) -> Option<String> {
+        self.0.take_owned_action()
+    }
+    fn restore_after_attach_ui(&mut self) -> Result<()> {
+        self.0.restore_after_attach_ui()
+    }
+    fn set_attached_session_id(&self, id: Uuid) {
+        self.0.set_attached_session_id(id);
+    }
+    #[cfg(test)]
+    fn observe_scrollback(&self, active: bool) {
+        self.0.observe_scrollback(active);
+    }
+    #[cfg(any(
+        feature = "image-sixel",
+        feature = "image-kitty",
+        feature = "image-iterm2"
+    ))]
+    fn detect_image_capabilities(&mut self) -> bmux_image::host_caps::HostImageCapabilities {
+        self.0.detect_image_capabilities()
+    }
+}
+
+type AttachHostEventFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<Option<AttachHostEvent>>> + Send + 'a>>;
+enum AttachHostEvent {
+    Terminal(Event),
+    Native(NativeAttachEvent),
+}
+
+/// Native host commands. Pointer coordinates must be converted using only the
+/// successfully displayed presentation, never an enqueued frame's hit map.
+#[derive(Clone, Debug)]
+pub enum NativeAttachEvent {
+    Input(bmux_frontend_runtime::input::InputEvent),
+    /// Explicit execution-cell resize; physical pixels are not cell dimensions.
+    Resize {
+        columns: u16,
+        rows: u16,
+        viewport_generation: u64,
+    },
+    /// Already mapped cell input using the committed presentation's geometry.
+    /// All pointer variants retain that exact committed identity through queueing
+    /// and expansion; stale identities are rejected at reducer dequeue.
+    Mouse {
+        identity: bmux_frontend_runtime::presentation::PresentationIdentity,
+        column: u16,
+        row: u16,
+        button: bmux_frontend_runtime::input::PointerButton,
+        phase: bmux_frontend_runtime::input::KeyPhase,
+        modifiers: bmux_frontend_runtime::input::Modifiers,
+    },
+    Motion {
+        identity: bmux_frontend_runtime::presentation::PresentationIdentity,
+        column: u16,
+        row: u16,
+        drag: Option<bmux_frontend_runtime::input::PointerButton>,
+        modifiers: bmux_frontend_runtime::input::Modifiers,
+    },
+    Scroll {
+        identity: bmux_frontend_runtime::presentation::PresentationIdentity,
+        column: u16,
+        row: u16,
+        delta_x: i16,
+        delta_y: i16,
+        modifiers: bmux_frontend_runtime::input::Modifiers,
+    },
+    /// Invalidate input while suspended; resume with a newer Resize generation.
+    Suspend {
+        viewport_generation: u64,
+    },
+    Accessibility {
+        epoch: Uuid,
+        attached_id: Uuid,
+        viewport_generation: u64,
+        revision: u64,
+        semantic_id: String,
+        action: bmux_tui::semantic::SemanticAction,
+    },
+    PasteFromClipboard,
+    RetryPresentation {
+        viewport_generation: u64,
+    },
+    Close,
+}
+
+/// Bounded command sender. Closing all senders explicitly detaches the view.
+#[derive(Clone)]
+pub struct NativeAttachHandle(
+    tokio::sync::mpsc::Sender<NativeAttachEvent>,
+    Arc<std::sync::atomic::AtomicU64>,
+);
+impl NativeAttachHandle {
+    fn invalidate_pointer_authority(&self, event: &NativeAttachEvent) {
+        if let NativeAttachEvent::Resize {
+            viewport_generation,
+            ..
+        }
+        | NativeAttachEvent::Suspend {
+            viewport_generation,
+        } = event
+        {
+            // Fail closed even if enqueue hits backpressure.
+            self.1
+                .fetch_max(*viewport_generation, std::sync::atomic::Ordering::AcqRel);
+        }
+    }
+    /// Backpressure is explicit; callers must not discard input silently.
+    ///
+    /// # Errors
+    /// Returns an error if the bounded queue is full or closed.
+    pub fn try_send(&self, event: NativeAttachEvent) -> Result<()> {
+        self.invalidate_pointer_authority(&event);
+        self.0
+            .try_send(event)
+            .map_err(|error| anyhow::anyhow!("native attach input queue: {error}"))
+    }
+    /// Wait for input queue capacity.
+    ///
+    /// # Errors
+    /// Returns an error if the host has closed its input queue.
+    pub async fn send(&self, event: NativeAttachEvent) -> Result<()> {
+        self.invalidate_pointer_authority(&event);
+        self.0
+            .send(event)
+            .await
+            .map_err(|error| anyhow::anyhow!("native attach input queue: {error}"))
+    }
+}
+
+/// Clipboard work selected by the existing reducer, serviced by the owning
+/// native application. The callback must return actual OS completion, not enqueue.
+#[derive(Clone, Debug)]
+pub enum NativeClipboardRequest {
+    WriteText(String),
+    ReadText,
+}
+type NativeClipboardCallback =
+    Arc<Mutex<Box<dyn FnMut(NativeClipboardRequest) -> Result<Option<String>> + Send>>>;
+thread_local! {
+    static NATIVE_CLIPBOARD: std::cell::RefCell<Option<NativeClipboardCallback>> = const { std::cell::RefCell::new(None) };
+}
+struct NativeClipboardScope(Option<NativeClipboardCallback>);
+impl Drop for NativeClipboardScope {
+    fn drop(&mut self) {
+        NATIVE_CLIPBOARD.with(|slot| *slot.borrow_mut() = self.0.take());
+    }
+}
+fn native_clipboard_request(request: NativeClipboardRequest) -> Option<Result<Option<String>>> {
+    let callback = NATIVE_CLIPBOARD.with(|slot| slot.borrow().clone())?;
+    Some(
+        callback
+            .lock()
+            .map_err(|_| anyhow::anyhow!("native clipboard callback poisoned"))
+            .and_then(|mut callback| callback(request)),
+    )
+}
+
+/// Native half of the existing BMUX attach orchestrator. Implements no `Write`
+/// and owns no terminal mode, browser listener, or alternate compositor.
+pub struct NativeAttachHost {
+    geometry: TerminalGeometry,
+    viewport_generation: u64,
+    live_viewport_generation: Arc<std::sync::atomic::AtomicU64>,
+    events: tokio::sync::mpsc::Receiver<NativeAttachEvent>,
+    observer: Option<super::observer::AttachObserverPublisher>,
+    accepted_revision: Arc<std::sync::atomic::AtomicU64>,
+    pending: std::collections::VecDeque<NativeAttachEvent>,
+    clipboard: Option<NativeClipboardCallback>,
+}
+impl NativeAttachHost {
+    /// Install application-lifetime clipboard IO. Call before starting attach.
+    pub fn set_clipboard(
+        &mut self,
+        callback: impl FnMut(NativeClipboardRequest) -> Result<Option<String>> + Send + 'static,
+    ) {
+        self.clipboard = Some(Arc::new(Mutex::new(Box::new(callback))));
+    }
+
+    /// Construct a bounded native attachment.
+    ///
+    /// The delivery callback must wait
+    /// for actual complete backend acceptance, or return an error. Queueing is
+    /// not success. Generation must match the native owner's initial viewport.
+    ///
+    /// # Errors
+    /// Rejects an empty execution-cell viewport.
+    pub fn channel(
+        columns: u16,
+        rows: u16,
+        viewport_generation: u64,
+        mut delivery: impl FnMut(bmux_frontend_runtime::presentation::PreparedDelivery) -> Result<()>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Result<(NativeAttachHandle, Self)> {
+        anyhow::ensure!(
+            columns > 0 && rows > 0,
+            "native attach viewport must be nonempty"
+        );
+        let (sender, events) = tokio::sync::mpsc::channel(256);
+        let accepted_revision = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let receipt = accepted_revision.clone();
+        let live_viewport_generation =
+            Arc::new(std::sync::atomic::AtomicU64::new(viewport_generation));
+        Ok((
+            NativeAttachHandle(sender, live_viewport_generation.clone()),
+            Self {
+                geometry: TerminalGeometry {
+                    cols: columns,
+                    rows,
+                },
+                viewport_generation,
+                live_viewport_generation,
+                events,
+                observer: Some(
+                    super::observer::AttachObserverPublisher::for_prepared_delivery(
+                        viewport_generation,
+                        move |prepared| {
+                            let revision = prepared.identity.revision;
+                            delivery(prepared).map_err(|error| {
+                                anyhow::Error::new(super::observer::PresentationRejected(
+                                    error.to_string(),
+                                ))
+                            })?;
+                            receipt.store(revision, std::sync::atomic::Ordering::Release);
+                            Ok(())
+                        },
+                    ),
+                ),
+                accepted_revision,
+                pending: std::collections::VecDeque::new(),
+                clipboard: None,
+            },
+        ))
+    }
+}
+impl AttachHost for NativeAttachHost {
+    fn queue_native_event(&mut self, event: NativeAttachEvent) {
+        self.pending.push_front(event);
+    }
+    fn viewport_generation(&self) -> Option<u64> {
+        Some(
+            self.live_viewport_generation
+                .load(std::sync::atomic::Ordering::Acquire),
+        )
+    }
+    fn accepted_revision(&self) -> u64 {
+        self.accepted_revision
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+    fn native_resize(&mut self, columns: u16, rows: u16, generation: u64) -> Result<()> {
+        anyhow::ensure!(
+            columns > 0 && rows > 0 && generation > self.viewport_generation,
+            "native viewport must be nonempty with an increasing generation"
+        );
+        self.geometry = TerminalGeometry {
+            cols: columns,
+            rows,
+        };
+        self.viewport_generation = generation;
+        self.live_viewport_generation
+            .fetch_max(generation, std::sync::atomic::Ordering::AcqRel);
+        self.accepted_revision
+            .store(0, std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+    fn output(&mut self) -> Option<&mut dyn Write> {
+        None
+    }
+    fn presentation_only(&self) -> bool {
+        true
+    }
+    fn geometry(&self) -> TerminalGeometry {
+        self.geometry
+    }
+    fn enter_attach_mode(&mut self, _keyboard: bool, _mouse: bool, _paste: bool) -> Result<bool> {
+        Ok(false)
+    }
+    fn next_event(&mut self) -> AttachHostEventFuture<'_> {
+        Box::pin(async {
+            if let Some(event) = self.pending.pop_front() {
+                return Ok(Some(AttachHostEvent::Native(event)));
+            }
+            let Some(event) = self.events.recv().await else {
+                return Ok(None);
+            };
+            if let NativeAttachEvent::Scroll {
+                identity,
+                column,
+                row,
+                delta_x,
+                delta_y,
+                modifiers,
+            } = event
+            {
+                // Bound work per native input. The UI accumulates fractional
+                // deltas before admission; preserve each admitted whole step.
+                anyhow::ensure!(
+                    u32::from(delta_x.unsigned_abs()) + u32::from(delta_y.unsigned_abs()) <= 256,
+                    "native scroll burst exceeds bounded budget"
+                );
+                for _ in 0..delta_y.unsigned_abs() {
+                    self.pending.push_back(NativeAttachEvent::Scroll {
+                        identity,
+                        column,
+                        row,
+                        delta_x: 0,
+                        delta_y: delta_y.signum(),
+                        modifiers,
+                    });
+                }
+                for _ in 0..delta_x.unsigned_abs() {
+                    self.pending.push_back(NativeAttachEvent::Scroll {
+                        identity,
+                        column,
+                        row,
+                        delta_x: delta_x.signum(),
+                        delta_y: 0,
+                        modifiers,
+                    });
+                }
+                return Ok(Some(AttachHostEvent::Native(
+                    self.pending.pop_front().unwrap_or(NativeAttachEvent::Input(
+                        bmux_frontend_runtime::input::InputEvent::PointerLeft,
+                    )),
+                )));
+            }
+            Ok(Some(AttachHostEvent::Native(event)))
+        })
+    }
+    fn restore_after_attach_ui(&mut self) -> Result<()> {
+        Ok(())
+    }
+    #[cfg(any(
+        feature = "image-sixel",
+        feature = "image-kitty",
+        feature = "image-iterm2"
+    ))]
+    fn detect_image_capabilities(&mut self) -> bmux_image::host_caps::HostImageCapabilities {
+        bmux_image::host_caps::HostImageCapabilities::default()
+    }
+}
+
+/// Run the same BMUX reducer/plugin UI with direct retained native output.
+///
+/// The caller supplies an explicitly selected connected runtime and config;
+/// this entry never starts or replaces a daemon or resolves another root.
+///
+/// # Errors
+/// Returns runtime selection, attachment, input, or presentation failures.
+pub async fn run_native_with_client(
+    mut client: BmuxClient,
+    target: &str,
+    config: BmuxConfig,
+    mut host: NativeAttachHost,
+) -> Result<AttachRunOutcome> {
+    let clipboard = host.clipboard.take().or_else(|| {
+        let callback: NativeClipboardCallback = Arc::new(Mutex::new(Box::new(|_| {
+            anyhow::bail!("native clipboard is unavailable")
+        })));
+        Some(callback)
+    });
+    let _clipboard_scope = NativeClipboardScope(
+        NATIVE_CLIPBOARD.with(|slot| std::mem::replace(&mut *slot.borrow_mut(), clipboard)),
+    );
+    let default_target;
+    let target = if target.is_empty() {
+        default_target = crate::runtime::bootstrap::resolve_default_attach_target(&mut client)
+            .await?
+            .to_string();
+        default_target.as_str()
+    } else {
+        target
+    };
+    let observer = host.observer.take();
+    Box::pin(run_session_attach_with_host(
+        client,
+        Some(target),
+        None,
+        false,
+        None,
+        &mut host,
+        Some(config),
+        observer,
+    ))
+    .await
+}
+
+fn native_identity_is_current<T: AttachHost + ?Sized>(
+    view: &AttachViewState,
+    host: &T,
+    identity: bmux_frontend_runtime::presentation::PresentationIdentity,
+) -> bool {
+    identity.revision != 0
+        && identity.attached_id == view.attached_id
+        && host.viewport_generation() == Some(identity.viewport_generation)
+        && host.accepted_revision() == identity.revision
+        && view
+            .observer
+            .as_ref()
+            .and_then(super::observer::AttachObserverPublisher::committed_prepared_identity)
+            == Some(identity)
+}
+
+// Run at reducer dequeue, not enqueue: both external and internally expanded
+// events retain the displayed identity that supplied their cell coordinates.
+fn native_pointer_event_is_current<T: AttachHost + ?Sized>(
+    event: &NativeAttachEvent,
+    view: &AttachViewState,
+    host: &T,
+) -> bool {
+    match event {
+        NativeAttachEvent::Mouse { identity, .. }
+        | NativeAttachEvent::Motion { identity, .. }
+        | NativeAttachEvent::Scroll { identity, .. } => {
+            native_identity_is_current(view, host, *identity)
+        }
+        _ => true,
+    }
+}
+
+async fn native_attach_input(
+    event: NativeAttachEvent,
+    client: &mut StreamingBmuxClient,
+    view: &mut AttachViewState,
+    pointer_is_current: bool,
+    text_passthrough: bool,
+) -> Result<Option<Event>> {
+    use bmux_frontend_runtime::input::{ImeEvent, InputEvent};
+
+    if !pointer_is_current {
+        return Ok(None);
+    }
+    match event {
+        NativeAttachEvent::Input(InputEvent::Key(key)) => {
+            if let Some(key) =
+                TerminalKeyEvent::from_native(&key).and_then(|key| key.to_crossterm())
+            {
+                // The existing reducer handles bindings, plugin capture, prompt
+                // editing, and mode-aware encoding exactly once.
+                return Ok(Some(Event::Key(key)));
+            }
+            if let Some(text) = key.unhandled_text() {
+                native_committed_text(client, view, text, text_passthrough).await?;
+            }
+        }
+        NativeAttachEvent::Input(InputEvent::Ime(ImeEvent::Commit(text))) => {
+            clear_native_preedit(view);
+            native_committed_text(client, view, &text, text_passthrough).await?;
+        }
+        NativeAttachEvent::Input(InputEvent::Ime(ImeEvent::Preedit { text, .. })) => {
+            publish_native_preedit(view, &text)?;
+        }
+        NativeAttachEvent::Input(InputEvent::Ime(ImeEvent::Disabled)) => clear_native_preedit(view),
+        NativeAttachEvent::Motion {
+            identity: _,
+            column,
+            row,
+            drag,
+            modifiers,
+        } => {
+            let kind = drag
+                .and_then(native_mouse_button)
+                .map_or(MouseEventKind::Moved, MouseEventKind::Drag);
+            return Ok(Some(Event::Mouse(MouseEvent {
+                column,
+                row,
+                kind,
+                modifiers: native_modifiers(modifiers),
+            })));
+        }
+        NativeAttachEvent::Scroll {
+            identity: _,
+            column,
+            row,
+            delta_x,
+            delta_y,
+            modifiers,
+        } => {
+            let kind = if delta_y > 0 {
+                MouseEventKind::ScrollUp
+            } else if delta_y < 0 {
+                MouseEventKind::ScrollDown
+            } else if delta_x > 0 {
+                MouseEventKind::ScrollRight
+            } else if delta_x < 0 {
+                MouseEventKind::ScrollLeft
+            } else {
+                return Ok(None);
+            };
+            return Ok(Some(Event::Mouse(MouseEvent {
+                column,
+                row,
+                kind,
+                modifiers: native_modifiers(modifiers),
+            })));
+        }
+        NativeAttachEvent::Input(InputEvent::Focus(focused)) => {
+            if !focused {
+                clear_native_preedit(view);
+            }
+            return Ok(Some(if focused {
+                Event::FocusGained
+            } else {
+                Event::FocusLost
+            }));
+        }
+        NativeAttachEvent::Mouse {
+            identity: _,
+            column,
+            row,
+            button,
+            phase,
+            modifiers,
+        } => {
+            return Ok(native_button_event(column, row, button, phase, modifiers));
+        }
+        // Preedit stays in the native IME owner. Raw physical coordinates must
+        // be mapped using a successful presentation before entering the reducer.
+        NativeAttachEvent::Input(_)
+        | NativeAttachEvent::Suspend { .. }
+        | NativeAttachEvent::Close
+        | NativeAttachEvent::Resize { .. }
+        | NativeAttachEvent::Accessibility { .. }
+        | NativeAttachEvent::RetryPresentation { .. }
+        | NativeAttachEvent::PasteFromClipboard => {}
+    }
+    Ok(None)
+}
+
+fn native_button_event(
+    column: u16,
+    row: u16,
+    button: bmux_frontend_runtime::input::PointerButton,
+    phase: bmux_frontend_runtime::input::KeyPhase,
+    modifiers: bmux_frontend_runtime::input::Modifiers,
+) -> Option<Event> {
+    use bmux_frontend_runtime::input::KeyPhase;
+    let button = native_mouse_button(button)?;
+    Some(Event::Mouse(MouseEvent {
+        column,
+        row,
+        modifiers: native_modifiers(modifiers),
+        kind: match phase {
+            KeyPhase::Press => MouseEventKind::Down(button),
+            KeyPhase::Release => MouseEventKind::Up(button),
+            KeyPhase::Repeat => MouseEventKind::Drag(button),
+        },
+    }))
+}
+
+const fn native_mouse_button(
+    button: bmux_frontend_runtime::input::PointerButton,
+) -> Option<MouseButton> {
+    use bmux_frontend_runtime::input::PointerButton;
+    match button {
+        PointerButton::Left => Some(MouseButton::Left),
+        PointerButton::Middle => Some(MouseButton::Middle),
+        PointerButton::Right => Some(MouseButton::Right),
+        _ => None,
+    }
+}
+fn native_modifiers(modifiers: bmux_frontend_runtime::input::Modifiers) -> KeyModifiers {
+    let mut flags = KeyModifiers::empty();
+    if modifiers.shift {
+        flags |= KeyModifiers::SHIFT;
+    }
+    if modifiers.control {
+        flags |= KeyModifiers::CONTROL;
+    }
+    if modifiers.alt {
+        flags |= KeyModifiers::ALT;
+    }
+    if modifiers.super_key {
+        flags |= KeyModifiers::SUPER;
+    }
+    flags
+}
+
+fn native_accessibility_event(
+    view: &mut AttachViewState,
+    id: &str,
+    action: bmux_tui::semantic::SemanticAction,
+) -> Option<Event> {
+    use bmux_tui::semantic::SemanticAction;
+    let region = view
+        .presentation
+        .semantics()
+        .regions()
+        .iter()
+        .find(|region| region.id == id)?;
+    let metadata = region.accessibility.as_ref()?;
+    if metadata.disabled
+        || !metadata.actions.contains(&action)
+        || region.area.width == 0
+        || region.area.height == 0
+    {
+        return None;
+    }
+    let (column, row) = (region.area.x, region.area.y);
+    if action == SemanticAction::Focus {
+        // Normal retained pointer focus, without synthesizing activation.
+        if let Some(hit) = view.retained_compositor.hit_test(column, row) {
+            let _ = view.plugin_focus.focus_hit(&view.retained_compositor, &hit);
+            view.dirty
+                .mark_retained_surfaces_dirty(AttachDirtySource::FocusChanged);
+        }
+        return None;
+    }
+    Some(Event::Mouse(MouseEvent {
+        column,
+        row,
+        modifiers: KeyModifiers::empty(),
+        kind: MouseEventKind::Down(if action == SemanticAction::Activate {
+            MouseButton::Left
+        } else {
+            MouseButton::Right
+        }),
+    }))
+}
+
+const NATIVE_PREEDIT_OWNER: &str = "bmux.attach_native_ime";
+fn clear_native_preedit(view: &mut AttachViewState) {
+    view.presentation_surfaces
+        .remove_owner(NATIVE_PREEDIT_OWNER);
+    view.dirty
+        .mark_retained_surfaces_dirty(AttachDirtySource::PromptOverlay);
+}
+fn publish_native_preedit(view: &mut AttachViewState, text: &str) -> Result<()> {
+    use bmux_plugin::surface::{
+        PluginSurface, PluginSurfaceId, PluginSurfaceSnapshot, PluginSurfaceTarget,
+    };
+    if text.is_empty() {
+        clear_native_preedit(view);
+        return Ok(());
+    }
+    // Anchor only to the accepted cursor, never to a pending projection.
+    let Some(cursor) = view.presentation.cursor() else {
+        return Ok(());
+    };
+    let Some(geometry) = view.driver_geometry else {
+        return Ok(());
+    };
+    let width = geometry.cols.saturating_sub(cursor.position.x);
+    if width == 0 {
+        return Ok(());
+    }
+    let rect = ExtensionRect::new(cursor.position.x, cursor.position.y, width, 1);
+    let revision = view
+        .presentation_surfaces
+        .owner_snapshot(NATIVE_PREEDIT_OWNER)
+        .map_or(1, |snapshot| snapshot.revision.saturating_add(1));
+    view.presentation_surfaces
+        .publish(
+            NATIVE_PREEDIT_OWNER,
+            PluginSurfaceSnapshot {
+                revision,
+                surfaces: vec![PluginSurface {
+                    id: PluginSurfaceId::new(NATIVE_PREEDIT_OWNER, "preedit", view.attached_id),
+                    revision,
+                    target: PluginSurfaceTarget::Explicit(rect),
+                    clip_rect: Some(ExtensionRect::new(0, 0, width, 1)),
+                    metadata: None,
+                    interactive_regions: Vec::new(),
+                    accepts_input: false,
+                    layer: 50,
+                    z: i32::MAX,
+                    opaque: true,
+                    modal: false,
+                    visible: true,
+                    ops: vec![
+                        bmux_plugin::RenderOp::clear_rect(rect, bmux_plugin::RenderStyle::new()),
+                        bmux_plugin::RenderOp::text_run(
+                            0,
+                            0,
+                            text,
+                            bmux_plugin::RenderStyle::new().underline(),
+                        ),
+                    ],
+                }],
+            },
+        )
+        .map_err(|error| anyhow::anyhow!("native IME surface: {error:?}"))?;
+    view.dirty
+        .mark_retained_surfaces_dirty(AttachDirtySource::PromptOverlay);
+    Ok(())
+}
+
+// Text is a committed IME/keyboard edit, not another physical key or a
+// bracketed terminal paste. Offer it once to the same prompt/help/plugin
+// capture owners as paste; modal scopes must never fall through to a pane.
+fn native_capture_committed_text(view: &mut AttachViewState, text: &str) -> bool {
+    if text.is_empty() {
+        return true;
+    }
+    if view.prompt.is_active() {
+        let _ = view.prompt.handle_paste(text);
+        view.dirty.mark_full_frame(AttachDirtySource::PromptOverlay);
+        return true;
+    }
+    view.help_overlay_open
+        || try_handle_plugin_surface_paste(view, text)
+        || view.retained_compositor.has_modal_scope()
+}
+
+fn native_text_passthrough(config: &BmuxConfig, active_mode: Option<&str>) -> bool {
+    active_mode.is_none_or(|mode| {
+        config
+            .keybindings
+            .mode_config(mode)
+            .is_some_and(|mode| mode.passthrough)
+    })
+}
+
+async fn native_committed_text(
+    client: &mut StreamingBmuxClient,
+    view: &mut AttachViewState,
+    text: &str,
+    text_passthrough: bool,
+) -> Result<()> {
+    if !native_capture_committed_text(view, text) && text_passthrough {
+        send_attach_bytes_to_focused(client, view, text.as_bytes().to_vec()).await?;
+    }
+    Ok(())
+}
+
 pub struct RealAttachTerminal {
     terminal: bmux_attach_pipeline::terminal::TerminalIo<io::Stdout>,
 }
@@ -563,9 +1375,8 @@ use super::prompt_ui::{
 };
 use super::render::{
     AttachRenderTrace, AttachRenderTraceOp, AttachSceneRenderStats, ExtensionRenderStats,
-    append_pane_output, collect_visual_projection_updates, frame_damage_overlay_rects,
-    frame_damage_overlay_render_ops, plugin_scene_items_to_render_items,
-    queue_render_items_for_surface, queue_render_ops,
+    collect_visual_projection_updates, frame_damage_overlay_rects, frame_damage_overlay_render_ops,
+    plugin_scene_items_to_render_items, queue_render_items_for_surface, queue_render_ops,
     render_attach_scene_with_stats_and_trace_with_capabilities,
     render_attach_scene_with_stats_and_trace_with_capabilities_and_occluders,
     visible_scene_pane_ids,
@@ -813,6 +1624,23 @@ where
             code: bmux_ipc::ErrorCode::Internal,
             message: format!("encoding {operation} args: {error}"),
         })?;
+    let checked = bmux_plugin_sdk::TypedDispatchClient::requires_service_contracts(client);
+    let payload = if checked {
+        #[cfg(feature = "bundled-plugin-theme")]
+        {
+            bmux_plugin_sdk::service_contract::encode(bmux_theme_plugin::SERVICE_CONTRACT, &payload)
+                .map_err(|error| ClientError::ServerError {
+                    code: bmux_ipc::ErrorCode::Internal,
+                    message: format!("checking theme request: {error}"),
+                })?
+        }
+        #[cfg(not(feature = "bundled-plugin-theme"))]
+        return Err(ClientError::UnexpectedResponse(
+            "checked theme contract is not bundled",
+        ));
+    } else {
+        payload
+    };
     let response_bytes = client
         .invoke_service_raw(
             "bmux.theme.read",
@@ -822,7 +1650,17 @@ where
             payload,
         )
         .await?;
-    bmux_codec::from_positional_bytes(&response_bytes).map_err(|error| ClientError::ServerError {
+    let response_bytes = if checked {
+        bmux_plugin_sdk::service_contract::decode_response(&response_bytes).map_err(|error| {
+            ClientError::ServerError {
+                code: bmux_ipc::ErrorCode::Internal,
+                message: format!("checking theme response: {error}"),
+            }
+        })?
+    } else {
+        &response_bytes
+    };
+    bmux_codec::from_positional_bytes(response_bytes).map_err(|error| ClientError::ServerError {
         code: bmux_ipc::ErrorCode::Internal,
         message: format!("decoding {operation} response: {error}"),
     })
@@ -874,6 +1712,16 @@ where
             message: format!("encoding {operation}: {error}"),
         }
     })?;
+    let checked = bmux_plugin_sdk::TypedDispatchClient::requires_service_contracts(client);
+    let payload = if checked {
+        bmux_plugin_sdk::service_contract::encode(bmux_tabs_plugin_api::SERVICE_CONTRACT, &payload)
+            .map_err(|error| ClientError::ServerError {
+                code: bmux_ipc::ErrorCode::Internal,
+                message: format!("encoding checked {operation}: {error}"),
+            })?
+    } else {
+        payload
+    };
     let response_bytes = client
         .invoke_service_raw(
             tabs_commands::client::FocusPaneEndpoint::CAPABILITY.as_str(),
@@ -883,7 +1731,17 @@ where
             payload,
         )
         .await?;
-    bmux_plugin_sdk::decode_service_message::<Resp>(&response_bytes).map_err(|error| {
+    let response_bytes = if checked {
+        bmux_plugin_sdk::service_contract::decode_response(&response_bytes).map_err(|error| {
+            ClientError::ServerError {
+                code: bmux_ipc::ErrorCode::Internal,
+                message: format!("checking {operation} response: {error}"),
+            }
+        })?
+    } else {
+        &response_bytes
+    };
+    bmux_plugin_sdk::decode_service_message::<Resp>(response_bytes).map_err(|error| {
         ClientError::ServerError {
             code: bmux_ipc::ErrorCode::Internal,
             message: format!("decoding {operation} response: {error}"),
@@ -2984,79 +3842,10 @@ fn handle_native_provider_event<W: AttachTerminal>(
     }
 }
 
-fn provider_pane_buffers_from_snapshot(
-    snapshot: &AttachProviderSnapshot,
-) -> Result<BTreeMap<Uuid, PaneRenderBuffer>> {
-    let mut buffers = BTreeMap::new();
-    for stream in &snapshot.streams {
-        let mut buffer = provider_render_buffer(&snapshot.scene, stream.cursor.surface_id)?;
-        append_pane_output(&mut buffer, &stream.snapshot);
-        buffers.insert(stream.cursor.surface_id, buffer);
-    }
-    Ok(buffers)
-}
-
-fn provider_render_buffer(
-    scene: &bmux_attach_layout_protocol::AttachScene,
-    surface_id: Uuid,
-) -> Result<PaneRenderBuffer> {
-    let surface = scene
-        .surfaces
-        .iter()
-        .find(|surface| surface.id == surface_id)
-        .ok_or_else(|| anyhow::anyhow!("attach provider stream surface {surface_id} is missing"))?;
-    let mut buffer = PaneRenderBuffer::default();
-    buffer
-        .terminal_grid
-        .resize(surface.content_rect.w.max(1), surface.content_rect.h.max(1))
-        .map_err(|error| anyhow::anyhow!("attach provider surface grid is invalid: {error}"))?;
-    Ok(buffer)
-}
-
-fn apply_provider_delta(
-    scene: &bmux_attach_layout_protocol::AttachScene,
-    pane_buffers: &mut BTreeMap<Uuid, PaneRenderBuffer>,
-    delta: &bmux_client::AttachProviderDelta,
-) -> Result<()> {
-    for change in &delta.changes {
-        match change {
-            AttachProviderChange::StreamAppend { cursor, bytes, .. } => {
-                let buffer = pane_buffers
-                    .entry(cursor.surface_id)
-                    .or_insert(provider_render_buffer(scene, cursor.surface_id)?);
-                append_pane_output(buffer, bytes);
-            }
-            AttachProviderChange::StreamRepair(snapshot) => {
-                let mut buffer = provider_render_buffer(scene, snapshot.cursor.surface_id)?;
-                append_pane_output(&mut buffer, &snapshot.snapshot);
-                pane_buffers.insert(snapshot.cursor.surface_id, buffer);
-            }
-            AttachProviderChange::Scene(replacement) => {
-                for surface in &replacement.surfaces {
-                    if let Some(buffer) = pane_buffers.get_mut(&surface.id) {
-                        buffer
-                            .terminal_grid
-                            .resize(surface.content_rect.w.max(1), surface.content_rect.h.max(1))
-                            .map_err(|error| {
-                                anyhow::anyhow!(
-                                    "attach provider replacement surface grid is invalid: {error}"
-                                )
-                            })?;
-                    }
-                }
-            }
-            AttachProviderChange::StreamRemoved { stream_id: _ }
-            | AttachProviderChange::Status { message: _ } => {}
-        }
-    }
-    let visible = scene
-        .surfaces
-        .iter()
-        .map(|surface| surface.id)
-        .collect::<BTreeSet<_>>();
-    pane_buffers.retain(|surface_id, _| visible.contains(surface_id));
-    Ok(())
-}
+use bmux_frontend_runtime::state::{
+    apply_delta_to_buffers as apply_provider_delta,
+    pane_buffers_from_snapshot as provider_pane_buffers_from_snapshot,
+};
 
 fn render_native_provider_scene<W: AttachTerminal>(
     terminal: &mut W,
@@ -3512,6 +4301,30 @@ pub async fn run_session_attach_with_terminal_config<T: AttachTerminal + ?Sized>
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)] // Preserve legacy wrappers while threading an explicitly scoped observer through attach lifetime.
 pub async fn run_session_attach_with_terminal_config_observer<T: AttachTerminal + ?Sized>(
+    client: BmuxClient,
+    target: Option<&str>,
+    follow: Option<&str>,
+    global: bool,
+    kernel_client_factory: Option<KernelClientFactory>,
+    terminal: &mut T,
+    config: Option<BmuxConfig>,
+    observer: Option<super::observer::AttachObserverPublisher>,
+) -> Result<AttachRunOutcome> {
+    Box::pin(run_session_attach_with_host(
+        client,
+        target,
+        follow,
+        global,
+        kernel_client_factory,
+        &mut TerminalAttachHost(terminal),
+        config,
+        observer,
+    ))
+    .await
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // One existing BMUX reducer, shared by output backends.
+async fn run_session_attach_with_host<T: AttachHost + ?Sized>(
     mut client: BmuxClient,
     target: Option<&str>,
     follow: Option<&str>,
@@ -3958,7 +4771,7 @@ pub async fn run_session_attach_with_terminal_config_observer<T: AttachTerminal 
     }
 
     let mut observer_capture_pending = false;
-    loop {
+    'attach_loop: loop {
         terminal.set_attached_session_id(view_state.attached_id);
         #[cfg(test)]
         terminal.observe_scrollback(view_state.scrollback_active());
@@ -4025,6 +4838,7 @@ pub async fn run_session_attach_with_terminal_config_observer<T: AttachTerminal 
 
             // Terminal input (keyboard, mouse, resize) via async EventStream.
             terminal_result = terminal.next_event() => {
+                'host_input: {
                 let Some(result) = terminal_result? else {
                     // A closed output-only viewport is an explicit detach,
                     // not unexpected terminal loss (nor a terminal message).
@@ -4033,13 +4847,66 @@ pub async fn run_session_attach_with_terminal_config_observer<T: AttachTerminal 
                     } else {
                         AttachExitReason::StreamClosed
                     };
-                    break;
+                    break 'attach_loop;
                 };
-                let terminal_event = AttachTerminalEvent::from_crossterm(
-                    result,
-                    SystemAttachClock.now(),
-                    terminal.geometry(),
-                );
+                let result = match result {
+                    AttachHostEvent::Terminal(event) => event,
+                    AttachHostEvent::Native(NativeAttachEvent::PasteFromClipboard) => {
+                        let text = native_clipboard_request(NativeClipboardRequest::ReadText)
+                            .context("native clipboard is unavailable")??.context("native clipboard returned no text")?;
+                        Event::Paste(text)
+                    }
+                    AttachHostEvent::Native(NativeAttachEvent::RetryPresentation { viewport_generation }) => {
+                        request_native_presentation_retry(&mut view_state, terminal.viewport_generation(), viewport_generation);
+                        break 'host_input;
+                    }
+                    AttachHostEvent::Native(NativeAttachEvent::Close) => {
+                        exit_reason = AttachExitReason::Detached;
+                        break 'attach_loop;
+                    }
+                    AttachHostEvent::Native(NativeAttachEvent::Suspend { viewport_generation }) => {
+                        if Some(viewport_generation) != terminal.viewport_generation() {
+                            break 'host_input;
+                        }
+                        clear_native_preedit(&mut view_state);
+                        if let Some(observer) = &mut view_state.observer {
+                            observer.set_prepared_viewport_generation(viewport_generation)?;
+                        }
+                        break 'host_input;
+                    }
+                    AttachHostEvent::Native(NativeAttachEvent::Resize { columns, rows, viewport_generation }) => {
+                        if Some(viewport_generation) != terminal.viewport_generation() { break 'host_input; }
+                        terminal.native_resize(columns, rows, viewport_generation)?;
+                        clear_native_preedit(&mut view_state);
+                        if let Some(observer) = &mut view_state.observer {
+                            observer.set_prepared_viewport_generation(viewport_generation)?;
+                        }
+                        Event::Resize(columns, rows)
+                    }
+                    AttachHostEvent::Native(NativeAttachEvent::Accessibility { epoch, attached_id, viewport_generation, revision, semantic_id, action }) => {
+                        let expected = bmux_frontend_runtime::presentation::PresentationIdentity { epoch, revision, attached_id, viewport_generation };
+                        if !native_identity_is_current(&view_state, terminal, expected) { continue 'attach_loop; }
+                        let Some(event) = native_accessibility_event(&mut view_state, &semantic_id, action) else { break 'host_input; };
+                        if let Event::Mouse(mouse) = &event
+                            && let MouseEventKind::Down(button) = mouse.kind {
+                            let button = match button { MouseButton::Left => bmux_frontend_runtime::input::PointerButton::Left,
+                                MouseButton::Middle => bmux_frontend_runtime::input::PointerButton::Middle,
+                                MouseButton::Right => bmux_frontend_runtime::input::PointerButton::Right };
+                            terminal.queue_native_event(NativeAttachEvent::Mouse { identity: expected, column: mouse.column, row: mouse.row,
+                                button, phase: bmux_frontend_runtime::input::KeyPhase::Release,
+                                modifiers: bmux_frontend_runtime::input::Modifiers::default() });
+                        }
+                        event
+                    }
+                    AttachHostEvent::Native(event) => {
+                        let text_passthrough = native_text_passthrough(&attach_config, attach_input_processor.active_mode_id());
+                        let pointer_is_current = native_pointer_event_is_current(&event, &view_state, terminal);
+                        let Some(event) = native_attach_input(event, &mut client, &mut view_state, pointer_is_current, text_passthrough).await? else { break 'host_input; };
+                        event
+                    }
+                };
+                let terminal_event = AttachTerminalEvent::from_crossterm(result,
+                    SystemAttachClock.now(), terminal.geometry());
                 perf_window.record_wake(AttachWakeSource::Terminal);
 
                 if let Some(TerminalInputEvent::Resize { cols, rows }) = &terminal_event.normalized {
@@ -4073,9 +4940,10 @@ pub async fn run_session_attach_with_terminal_config_observer<T: AttachTerminal 
                     AttachLoopControl::Continue => {}
                     AttachLoopControl::Break(reason) => {
                         exit_reason = reason;
-                        break;
+                        break 'attach_loop;
                     }
                 }
+            }
             }
 
             history = async {
@@ -4615,8 +5483,8 @@ pub async fn run_session_attach_with_terminal_config_observer<T: AttachTerminal 
             let help_scroll = view_state.help_overlay_scroll;
             let render_started_at = SystemAttachClock.now();
             let render_geometry = terminal.geometry();
-            let frame_stats = render_attach_frame_to_writer(
-                terminal,
+            let frame_stats = render_attach_frame_to_output(
+                terminal.output(),
                 &mut view_state,
                 &layout_state,
                 &runtime_appearance,
@@ -4905,8 +5773,8 @@ pub async fn run_session_attach_with_terminal_config_observer<T: AttachTerminal 
         let help_scroll = view_state.help_overlay_scroll;
         let render_started_at = SystemAttachClock.now();
         let render_geometry = terminal.geometry();
-        let frame_stats = render_attach_frame_to_writer(
-            terminal,
+        let frame_stats = render_attach_frame_to_output(
+            terminal.output(),
             &mut view_state,
             &layout_state,
             &runtime_appearance,
@@ -4995,9 +5863,9 @@ pub async fn run_session_attach_with_terminal_config_observer<T: AttachTerminal 
     ))]
     if !terminal.presentation_only() {
         let mut candidate = view_state.kitty_host_state.clone();
-        let cleanup = candidate
-            .reset(&mut &mut *terminal)
-            .and_then(|()| terminal.flush());
+        let cleanup = terminal.output().map_or(Ok(()), |mut output| {
+            candidate.reset(&mut output).and_then(|()| output.flush())
+        });
         if let Err(error) = cleanup {
             view_state
                 .kitty_host_state
@@ -5024,8 +5892,10 @@ pub async fn run_session_attach_with_terminal_config_observer<T: AttachTerminal 
         )
         .await;
     }
-    if let Some(message) = attach_exit_message(exit_reason) {
-        writeln!(terminal, "{message}")?;
+    if let Some(message) = attach_exit_message(exit_reason)
+        && let Some(output) = terminal.output()
+    {
+        writeln!(output, "{message}")?;
     }
     display_capture.close_all();
     Ok(AttachRunOutcome {
@@ -7341,6 +8211,12 @@ pub struct ClipboardWriteRequest {
 }
 
 pub fn copy_text_with_clipboard_plugin(text: &str) -> Result<()> {
+    if let Some(result) =
+        native_clipboard_request(NativeClipboardRequest::WriteText(text.to_string()))
+    {
+        result?;
+        return Ok(());
+    }
     let config = BmuxConfig::load()?;
     let paths = ConfigPaths::default();
     let registry = scan_available_plugins(&config, &paths)?;
@@ -8916,6 +9792,21 @@ fn retained_frame_sync_pending(view: &AttachViewState, layout: &AttachLayoutStat
         })
 }
 
+fn request_native_presentation_retry(
+    view: &mut AttachViewState,
+    current_generation: Option<u64>,
+    requested_generation: u64,
+) {
+    if current_generation == Some(requested_generation) {
+        // A rejected attempt rolled back the graph and cleared dirty flags.
+        // Reconcile the current producer snapshot before repainting; painting
+        // only the restored graph would silently retry stale scene authority.
+        view.dirty
+            .mark_retained_surfaces_dirty(AttachDirtySource::ManualRedraw);
+        view.dirty.mark_full_frame(AttachDirtySource::ManualRedraw);
+    }
+}
+
 fn recover_browser_rejection(view: &mut AttachViewState, error: &anyhow::Error) -> bool {
     if view.observer.is_none()
         || error
@@ -8932,9 +9823,39 @@ fn recover_browser_rejection(view: &mut AttachViewState, error: &anyhow::Error) 
     true
 }
 
-#[allow(clippy::too_many_arguments)] // Preserve the public render entry point while committing interaction only after flush.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)] // Test entry retains real output failure injection.
 pub fn render_attach_frame_to_writer<W: Write + ?Sized>(
-    terminal_writer: &mut W,
+    mut terminal_writer: &mut W,
+    view_state: &mut AttachViewState,
+    layout_state: &AttachLayoutState,
+    runtime_appearance: &RuntimeAppearance,
+    help_lines: &[String],
+    help_scroll: usize,
+    damage_config: &bmux_config::DamageBehaviorConfig,
+    slow_terminal_write_ms: u64,
+    display_capture: &mut DisplayCaptureFanout,
+    geometry: TerminalGeometry,
+    render_trace: Option<&mut AttachRenderTrace>,
+) -> Result<AttachFrameRenderStats> {
+    render_attach_frame_to_output(
+        Some(&mut terminal_writer as &mut dyn Write),
+        view_state,
+        layout_state,
+        runtime_appearance,
+        help_lines,
+        help_scroll,
+        damage_config,
+        slow_terminal_write_ms,
+        display_capture,
+        geometry,
+        render_trace,
+    )
+}
+
+#[allow(clippy::too_many_arguments)] // Common retained composition with explicit optional terminal output.
+fn render_attach_frame_to_output(
+    terminal_writer: Option<&mut dyn Write>,
     view_state: &mut AttachViewState,
     layout_state: &AttachLayoutState,
     runtime_appearance: &RuntimeAppearance,
@@ -8957,6 +9878,7 @@ pub fn render_attach_frame_to_writer<W: Write + ?Sized>(
     // composition. All native/headless/test callers use this preparation entry.
     refresh_retained_extensions(view_state, layout_state, geometry, help_lines)?;
     let previous = view_state.retained_compositor.clone();
+    let previous_focus = view_state.plugin_focus.clone();
     let observing = view_state.observer.is_some();
     let (result, _operations) = if view_state.presentation_only {
         bmux_attach_pipeline::projection::capture_neutral(|| {
@@ -9010,6 +9932,7 @@ pub fn render_attach_frame_to_writer<W: Write + ?Sized>(
     };
     if let Err(error) = &result {
         view_state.retained_compositor = previous;
+        view_state.plugin_focus = previous_focus;
         view_state
             .dirty
             .mark_full_frame(AttachDirtySource::PluginCommand);
@@ -9066,8 +9989,8 @@ fn acknowledge_plugin_surface_output(view_state: &AttachViewState) {
 }
 
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
-fn render_attach_frame_inner<W: Write + ?Sized>(
-    terminal_writer: &mut W,
+fn render_attach_frame_inner(
+    terminal_writer: Option<&mut dyn Write>,
     view_state: &mut AttachViewState,
     layout_state: &AttachLayoutState,
     runtime_appearance: &RuntimeAppearance,
@@ -9556,8 +10479,12 @@ fn render_attach_frame_inner<W: Write + ?Sized>(
                 if headless {
                     Ok(())
                 } else {
-                    bmux_attach_pipeline::terminal::write_frame(terminal_writer, &frame_bytes)
-                        .context("failed writing or flushing attach frame")
+                    bmux_attach_pipeline::terminal::write_frame(
+                        terminal_writer
+                            .context("terminal output is unavailable for encoded presentation")?,
+                        &frame_bytes,
+                    )
+                    .context("failed writing or flushing attach frame")
                 }
             },
         );
@@ -9566,8 +10493,11 @@ fn render_attach_frame_inner<W: Write + ?Sized>(
         }
         delivered
     } else {
-        bmux_attach_pipeline::terminal::write_frame(terminal_writer, &frame_bytes)
-            .context("failed writing or flushing attach frame")
+        bmux_attach_pipeline::terminal::write_frame(
+            terminal_writer.context("terminal output is unavailable for encoded presentation")?,
+            &frame_bytes,
+        )
+        .context("failed writing or flushing attach frame")
     };
     if let Err(error) = write_result {
         #[cfg(any(
@@ -10196,7 +11126,7 @@ fn queue_attach_input_mode_restore<W: Write>(writer: &mut W) -> io::Result<()> {
 
 /// Refresh derived driver geometry through the selected provider, without
 /// publishing a viewport back to it. Layout invalidations drive this refresh.
-async fn refresh_observed_geometry<T: AttachTerminal + ?Sized>(
+async fn refresh_observed_geometry<T: AttachHost + ?Sized>(
     terminal: &mut T,
     client: &mut StreamingBmuxClient,
     target: Uuid,
@@ -15623,7 +16553,109 @@ pub fn is_attach_not_attached_runtime_error(error: &ClientError) -> bool {
     )
 }
 #[cfg(test)]
+#[path = "native_input_tests.rs"]
+mod native_input_tests;
+
+#[cfg(test)]
+#[path = "native_retry_tests.rs"]
+mod native_retry_tests;
+
+#[cfg(test)]
 mod tests {
+    #[test]
+    fn native_clipboard_copy_uses_scoped_owner_and_reports_failure() {
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let seen = writes.clone();
+        let callback: NativeClipboardCallback =
+            Arc::new(Mutex::new(Box::new(move |request| match request {
+                NativeClipboardRequest::WriteText(text) => {
+                    seen.lock().unwrap().push(text);
+                    Ok(None)
+                }
+                NativeClipboardRequest::ReadText => Err(anyhow::anyhow!("clipboard read refused")),
+            })));
+        let _scope =
+            NativeClipboardScope(NATIVE_CLIPBOARD.with(|slot| slot.replace(Some(callback))));
+        copy_text_with_clipboard_plugin("selected text").unwrap();
+        assert_eq!(*writes.lock().unwrap(), vec!["selected text"]);
+        assert!(
+            native_clipboard_request(NativeClipboardRequest::ReadText)
+                .unwrap()
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn native_host_has_no_writer_and_expands_bounded_scroll_without_loss() {
+        let (handle, mut host) = NativeAttachHost::channel(80, 24, 1, |_| Ok(())).unwrap();
+        assert!(host.output().is_none());
+        assert!(host.presentation_only());
+        handle
+            .try_send(NativeAttachEvent::Scroll {
+                identity: bmux_frontend_runtime::presentation::PresentationIdentity {
+                    epoch: Uuid::nil(),
+                    attached_id: Uuid::nil(),
+                    viewport_generation: 1,
+                    revision: 1,
+                },
+                column: 4,
+                row: 5,
+                delta_x: -1,
+                delta_y: 2,
+                modifiers: bmux_frontend_runtime::input::Modifiers::default(),
+            })
+            .unwrap();
+        for expected in [(0, 1), (0, 1), (-1, 0)] {
+            let Some(AttachHostEvent::Native(NativeAttachEvent::Scroll {
+                delta_x,
+                delta_y,
+                column,
+                row,
+                ..
+            })) = host.next_event().await.unwrap()
+            else {
+                panic!("expected scroll");
+            };
+            assert_eq!((delta_x, delta_y), expected);
+            assert_eq!((column, row), (4, 5));
+        }
+        drop(handle);
+        assert!(host.next_event().await.unwrap().is_none());
+    }
+
+    #[test]
+    fn native_host_resize_requires_fresh_generation_and_nonempty_cells() {
+        let (_, mut host) = NativeAttachHost::channel(80, 24, 1, |_| Ok(())).unwrap();
+        assert!(host.native_resize(100, 30, 1).is_err());
+        assert!(host.native_resize(0, 30, 2).is_err());
+        host.native_resize(100, 30, 2).unwrap();
+        assert_eq!((host.geometry().cols, host.geometry().rows), (100, 30));
+        assert_eq!(host.accepted_revision(), 0);
+    }
+
+    #[test]
+    fn native_preedit_without_committed_cursor_cannot_create_authority() {
+        let mut view = AttachViewState::with_private_presentation(AttachOpenInfo {
+            context_id: None,
+            session_id: Uuid::new_v4(),
+            can_write: true,
+        });
+        view.driver_geometry = Some(TerminalGeometry { cols: 80, rows: 24 });
+        publish_native_preedit(&mut view, "compose").unwrap();
+        assert!(
+            view.presentation_surfaces
+                .owner_snapshot(NATIVE_PREEDIT_OWNER)
+                .is_none()
+        );
+        assert!(
+            native_accessibility_event(
+                &mut view,
+                "missing",
+                bmux_tui::semantic::SemanticAction::Activate
+            )
+            .is_none()
+        );
+    }
     #[cfg(feature = "bundled-plugin-tab-bar")]
     fn installed_menu_action(
         state: &mut super::AttachViewState,
@@ -17796,7 +18828,7 @@ mod tests {
         assert!(focus.focused().is_none());
     }
 
-    async fn disconnected_focus_test_client() -> StreamingBmuxClient {
+    pub(super) async fn disconnected_focus_test_client() -> StreamingBmuxClient {
         let (client_stream, server_stream) = tokio::io::duplex(8192);
         let server = tokio::spawn(async move {
             use bmux_ipc::{Envelope, EnvelopeKind, Response, ResponsePayload};
@@ -19331,7 +20363,7 @@ mod tests {
         }
     }
 
-    fn attach_view_state_with_scrollback_fixture() -> AttachViewState {
+    pub(super) fn attach_view_state_with_scrollback_fixture() -> AttachViewState {
         let session_id = Uuid::new_v4();
         let pane_id = Uuid::new_v4();
         let mut view_state = AttachViewState::new(AttachOpenInfo {

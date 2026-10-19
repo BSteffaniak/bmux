@@ -1,0 +1,483 @@
+//! Startup tests never contact an installed BMUX endpoint. The Unix subprocess
+//! fixture is an explicit shell in a fresh root; its output proves launch count.
+
+use super::*;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
+
+struct Root(PathBuf);
+
+impl Root {
+    fn new() -> Self {
+        let root = std::env::temp_dir().join(format!(
+            "bterm-launch-{}-{}",
+            std::process::id(),
+            NEXT_ROOT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&root).unwrap();
+        Self(root)
+    }
+
+    fn spec(&self) -> RuntimeLaunchSpec {
+        RuntimeLaunchSpec {
+            executable: self.0.join("missing-companion"),
+            arguments: Vec::new(),
+            environment: BTreeMap::new(),
+            working_directory: self.0.clone(),
+            ownership_file: self.0.join("startup.lock"),
+            diagnostic_file: self.0.join("startup.log"),
+            timeout: Duration::from_secs(3),
+            poll_interval: Duration::from_millis(5),
+        }
+    }
+}
+
+impl Drop for Root {
+    fn drop(&mut self) {
+        // Delete only this fixture's known files, never recurse into user roots.
+        for name in [
+            "startup.lock",
+            "server-lifetime.lock",
+            "startup.log",
+            "server.sock",
+            "bterm-principal.lock",
+            "runtime/principal-id",
+            "launched",
+            "ready",
+            "release",
+            "done",
+        ] {
+            let _ = std::fs::remove_file(self.0.join(name));
+        }
+        let _ = std::fs::remove_dir(self.0.join("runtime"));
+        let _ = std::fs::remove_dir(&self.0);
+    }
+}
+
+#[cfg(unix)]
+fn probe_fixture_paths(root: &Root) -> bmux_config::ConfigPaths {
+    bmux_config::ConfigPaths::new(
+        root.0.clone(),
+        root.0.clone(),
+        root.0.clone(),
+        root.0.clone(),
+    )
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn missing_endpoint_is_absent_but_stale_and_dangling_names_are_not() {
+    let root = Root::new();
+    let paths = probe_fixture_paths(&root);
+    assert_eq!(
+        probe_paths(&paths, Duration::from_millis(100))
+            .await
+            .unwrap(),
+        RuntimeProbe::Absent
+    );
+    let stale = std::os::unix::net::UnixListener::bind(paths.server_socket()).unwrap();
+    drop(stale);
+    assert!(
+        probe_paths(&paths, Duration::from_millis(100))
+            .await
+            .is_err()
+    );
+    assert!(paths.server_socket().exists());
+    std::fs::remove_file(paths.server_socket()).unwrap();
+    std::os::unix::fs::symlink(root.0.join("missing-target"), paths.server_socket()).unwrap();
+    assert!(
+        probe_paths(&paths, Duration::from_millis(100))
+            .await
+            .is_err()
+    );
+    assert!(
+        std::fs::symlink_metadata(paths.server_socket())
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn listening_endpoint_without_handshake_is_uncertain_not_absent() {
+    let root = Root::new();
+    let paths = probe_fixture_paths(&root);
+    let listener = std::os::unix::net::UnixListener::bind(paths.server_socket()).unwrap();
+    let error = probe_paths(&paths, Duration::from_millis(40))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("uncertain"));
+    assert!(paths.server_socket().exists());
+    drop(listener);
+}
+
+#[tokio::test]
+async fn concurrent_waiter_reprobes_incompatibility_before_launch() {
+    let root = Root::new();
+    let spec = root.spec();
+    let mut calls = 0;
+    let error = ensure_runtime(&spec, || {
+        calls += 1;
+        let state = if calls == 1 {
+            RuntimeProbe::Absent
+        } else {
+            RuntimeProbe::Incompatible("another launcher won".into())
+        };
+        async move { Ok(state) }
+    })
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("incompatible"));
+    assert_eq!(calls, 2);
+    assert!(
+        !spec.diagnostic_file.exists(),
+        "must not spawn after post-lock recheck"
+    );
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn occupied_named_pipe_without_handshake_never_permits_startup() {
+    use tokio::net::windows::named_pipe::ServerOptions;
+    let root = Root::new();
+    let paths = bmux_config::ConfigPaths::new(
+        root.0.clone(),
+        root.0.clone(),
+        root.0.clone(),
+        root.0.clone(),
+    );
+    let pipe = ServerOptions::new()
+        .first_pipe_instance(true)
+        .create(paths.server_named_pipe())
+        .unwrap();
+    let error = probe_paths(&paths, Duration::from_millis(40))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("uncertain"));
+    assert!(
+        ServerOptions::new()
+            .first_pipe_instance(true)
+            .create(paths.server_named_pipe())
+            .is_err()
+    );
+    drop(pipe);
+    assert_eq!(
+        probe_paths(&paths, Duration::from_millis(100))
+            .await
+            .unwrap(),
+        RuntimeProbe::Absent
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn server_claim_survives_lost_frontend_startup_lock_before_readiness() {
+    let root = Root::new();
+    let paths = probe_fixture_paths(&root);
+    let server_claim = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(root.0.join("server-lifetime.lock"))
+        .unwrap();
+    server_claim.lock().unwrap();
+    let frontend_claim = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(root.0.join("startup.lock"))
+        .unwrap();
+    frontend_claim.lock().unwrap();
+    drop(frontend_claim); // simulated lost/crashed window launcher
+    assert_eq!(
+        probe_paths(&paths, Duration::from_millis(100))
+            .await
+            .unwrap(),
+        RuntimeProbe::Starting
+    );
+    let mut spec = root.spec();
+    spec.timeout = Duration::from_millis(30);
+    let error = ensure_runtime(&spec, || probe_paths(&paths, Duration::from_millis(100)))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("timed out"));
+    assert!(
+        !spec.diagnostic_file.exists(),
+        "must not launch while server owns pre-readiness claim"
+    );
+    drop(server_claim);
+    assert_eq!(
+        probe_paths(&paths, Duration::from_millis(100))
+            .await
+            .unwrap(),
+        RuntimeProbe::Absent
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn owned_stopped_socket_is_reclaimable_but_frontend_never_unlinks() {
+    use std::os::unix::fs::MetadataExt as _;
+    let root = Root::new();
+    let paths = probe_fixture_paths(&root);
+    let socket = std::os::unix::net::UnixListener::bind(paths.server_socket()).unwrap();
+    let metadata = std::fs::symlink_metadata(paths.server_socket()).unwrap();
+    std::fs::write(
+        root.0.join("server-lifetime.lock"),
+        format!("bmux-endpoint-v1 {} {}\n", metadata.dev(), metadata.ino()),
+    )
+    .unwrap();
+    drop(socket);
+    assert_eq!(
+        probe_paths(&paths, Duration::from_millis(100))
+            .await
+            .unwrap(),
+        RuntimeProbe::Absent
+    );
+    let after = std::fs::symlink_metadata(paths.server_socket()).unwrap();
+    assert_eq!((after.dev(), after.ino()), (metadata.dev(), metadata.ino()));
+    std::fs::write(
+        root.0.join("server-lifetime.lock"),
+        "unsupported-receipt-v2\n",
+    )
+    .unwrap();
+    assert!(
+        probe_paths(&paths, Duration::from_millis(100))
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn starting_becomes_compatible_without_spawning() {
+    let root = Root::new();
+    let mut calls = 0;
+    let outcome = ensure_runtime(&root.spec(), || {
+        calls += 1;
+        let state = if calls < 3 {
+            RuntimeProbe::Starting
+        } else {
+            RuntimeProbe::Compatible
+        };
+        async move { Ok(state) }
+    })
+    .await
+    .unwrap();
+    assert_eq!(outcome, RuntimeLaunchOutcome::AlreadyRunning);
+    assert!(!root.0.join("startup.log").exists());
+}
+
+#[tokio::test]
+async fn existing_compatible_does_not_spawn_or_create_ownership_file() {
+    let root = Root::new();
+    let result = ensure_runtime(&root.spec(), || async { Ok(RuntimeProbe::Compatible) })
+        .await
+        .unwrap();
+    assert_eq!(result, RuntimeLaunchOutcome::AlreadyRunning);
+    assert!(!root.0.join("startup.lock").exists());
+}
+
+#[tokio::test]
+async fn incompatible_and_uncertain_do_not_start_or_mutate() {
+    let root = Root::new();
+    let error = ensure_runtime(&root.spec(), || async {
+        Ok(RuntimeProbe::Incompatible("bundle identity differs".into()))
+    })
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("incompatible"));
+    let error = ensure_runtime(&root.spec(), || async { bail!("authentication refused") })
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("authentication"));
+    assert!(!root.0.join("startup.lock").exists());
+}
+
+#[tokio::test]
+async fn relative_executable_is_rejected_before_probe() {
+    let root = Root::new();
+    let mut spec = root.spec();
+    spec.executable = "bmux".into();
+    let error = ensure_runtime(&spec, || async { panic!("must validate first") })
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("absolute"));
+}
+
+#[tokio::test]
+async fn readiness_probe_is_deadline_bounded() {
+    let root = Root::new();
+    let mut spec = root.spec();
+    spec.timeout = Duration::from_millis(20);
+    let error = ensure_runtime(&spec, std::future::pending)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("timed out"));
+}
+
+#[tokio::test]
+async fn ownership_contention_times_out_without_unlinking_lock() {
+    let root = Root::new();
+    let mut spec = root.spec();
+    spec.timeout = Duration::from_millis(20);
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&spec.ownership_file)
+        .unwrap();
+    lock.lock().unwrap();
+    let error = ensure_runtime(&spec, || async { Ok(RuntimeProbe::Absent) })
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("timed out"));
+    assert!(spec.ownership_file.exists());
+    drop(lock);
+    assert!(
+        OpenOptions::new()
+            .write(true)
+            .open(spec.ownership_file)
+            .unwrap()
+            .try_lock()
+            .is_ok()
+    );
+}
+
+#[cfg(unix)]
+fn shell_spec(root: &Root, script: &str) -> RuntimeLaunchSpec {
+    let mut spec = root.spec();
+    spec.executable = "/bin/sh".into();
+    spec.arguments = vec!["-c".into(), script.into()];
+    spec
+}
+
+#[cfg(unix)]
+async fn await_file(root: &Root, name: &str) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !root.0.join(name).exists() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn concurrent_launchers_spawn_once_and_companion_outlives_result() {
+    let root = Root::new();
+    let spec = shell_spec(
+        &root,
+        "printf 'launch\\n' >> launched; : > ready; while [ ! -f release ]; do /bin/sleep 0.01; done; : > done",
+    );
+    let probe = || async {
+        Ok(if root.0.join("ready").exists() {
+            RuntimeProbe::Compatible
+        } else {
+            RuntimeProbe::Absent
+        })
+    };
+    let (left, right) = tokio::join!(ensure_runtime(&spec, probe), ensure_runtime(&spec, probe));
+    let left = left.unwrap();
+    let right = right.unwrap();
+    assert!(matches!(
+        (left, right),
+        (
+            RuntimeLaunchOutcome::Started { .. },
+            RuntimeLaunchOutcome::AlreadyRunning
+        ) | (
+            RuntimeLaunchOutcome::AlreadyRunning,
+            RuntimeLaunchOutcome::Started { .. }
+        )
+    ));
+    assert_eq!(
+        std::fs::read_to_string(root.0.join("launched")).unwrap(),
+        "launch\n"
+    );
+    assert!(
+        !root.0.join("done").exists(),
+        "child must persist after launch result"
+    );
+    std::fs::write(root.0.join("release"), b"").unwrap();
+    await_file(&root, "done").await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn child_exit_before_readiness_is_not_absence() {
+    let root = Root::new();
+    let spec = shell_spec(&root, "exit 23");
+    let error = ensure_runtime(&spec, || async { Ok(RuntimeProbe::Absent) })
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("exited before readiness"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cancelled_startup_retains_ownership_until_child_exits() {
+    let root = Root::new();
+    let spec = shell_spec(
+        &root,
+        ": > launched; while [ ! -f release ]; do /bin/sleep 0.01; done; : > done",
+    );
+    let mut launch = Box::pin(ensure_runtime(&spec, || async { Ok(RuntimeProbe::Absent) }));
+    tokio::select! {
+        result = &mut launch => panic!("startup unexpectedly settled: {result:?}"),
+        () = await_file(&root, "launched") => {}
+    }
+    drop(launch);
+    let lock = OpenOptions::new()
+        .write(true)
+        .open(&spec.ownership_file)
+        .unwrap();
+    assert!(matches!(
+        lock.try_lock(),
+        Err(std::fs::TryLockError::WouldBlock)
+    ));
+    std::fs::write(root.0.join("release"), b"").unwrap();
+    await_file(&root, "done").await;
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while lock.try_lock().is_err() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn timeout_keeps_startup_owned_until_child_exits_without_killing_it() {
+    let root = Root::new();
+    let mut spec = shell_spec(
+        &root,
+        ": > launched; while [ ! -f release ]; do /bin/sleep 0.01; done; : > done",
+    );
+    spec.timeout = Duration::from_millis(80);
+    let error = ensure_runtime(&spec, || async { Ok(RuntimeProbe::Absent) })
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("timed out"));
+    assert!(root.0.join("launched").exists());
+    let lock = OpenOptions::new()
+        .write(true)
+        .open(&spec.ownership_file)
+        .unwrap();
+    assert!(matches!(
+        lock.try_lock(),
+        Err(std::fs::TryLockError::WouldBlock)
+    ));
+    std::fs::write(root.0.join("release"), b"").unwrap();
+    await_file(&root, "done").await;
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while lock.try_lock().is_err() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+}

@@ -1,5 +1,6 @@
 //! Repository tasks, deliberately outside build.rs and the runtime.
 mod artifacts;
+mod bterm;
 mod build;
 
 use artifacts::{Result, error};
@@ -27,7 +28,7 @@ fn invocation_args(executable: Option<&str>, mut args: Vec<String>) -> Vec<Strin
 fn run(args: Vec<String>) -> Result<()> {
     let Some(command) = args.first() else {
         return Err(error(
-            "usage: cargo xtask build [--target TARGET] [--profile PROFILE] | auxiliary {build,stage,nfpm} --target TARGET | install SOURCE DESTINATION [--binary-name NAME | --activate-version VERSION]",
+            "usage: cargo xtask build [--target TARGET] [--profile PROFILE] | auxiliary {build,stage,nfpm} --target TARGET | bterm {stage,verify} --target TARGET | install SOURCE DESTINATION [--binary-name NAME | --activate-version VERSION]",
         ));
     };
     let mut positional = Vec::new();
@@ -50,6 +51,13 @@ fn run(args: Vec<String>) -> Result<()> {
         }
     }
     let allowed: &[&str] = match command.as_str() {
+        "bterm" => &[
+            "--workspace",
+            "--target",
+            "--artifact-dir",
+            "--destination",
+            "--root",
+        ],
         "build" => &["--workspace", "--target", "--profile"],
         "auxiliary" => &[
             "--workspace",
@@ -68,6 +76,30 @@ fn run(args: Vec<String>) -> Result<()> {
     };
     if options.keys().any(|key| !allowed.contains(&key.as_str())) {
         return Err(error("unknown option"));
+    }
+    if command == "bterm" {
+        let required = |name: &str| {
+            options
+                .get(name)
+                .map(PathBuf::from)
+                .ok_or_else(|| error(format!("{name} is required")))
+        };
+        let target = options
+            .get("--target")
+            .ok_or_else(|| error("--target is required"))?;
+        return match positional.as_slice() {
+            [operation] if operation == "stage" => bterm::stage(
+                &options
+                    .get("--workspace")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..")),
+                &required("--artifact-dir")?,
+                &required("--destination")?,
+                target,
+            ),
+            [operation] if operation == "verify" => bterm::verify(&required("--root")?, target),
+            _ => Err(error("bterm requires stage or verify")),
+        };
     }
     if command == "build" {
         if !positional.is_empty() {

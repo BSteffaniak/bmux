@@ -190,6 +190,30 @@ impl PreparedPresentation {
         &self.damage
     }
 
+    fn validate_semantic_limits(
+        &self,
+        add: &mut impl FnMut(usize, usize) -> Result<(), PresentationLimitError>,
+    ) -> Result<(), PresentationLimitError> {
+        for region in self.semantics.regions() {
+            add(1, region.id.len())?;
+            add(0, region.role.len())?;
+            if let Some(accessibility) = &region.accessibility {
+                for text in [
+                    &accessibility.label,
+                    &accessibility.description,
+                    &accessibility.text,
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    add(0, text.len())?;
+                }
+                add(accessibility.actions.len(), 0)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Recheck the complete snapshot after caller-owned metadata staging.
     ///
     /// # Errors
@@ -259,10 +283,7 @@ impl PreparedPresentation {
             add(0, fragment.scope_id.as_str().len())?;
             add(0, fragment.content_id.as_str().len())?;
         }
-        for region in self.semantics.regions() {
-            add(1, region.id.len())?;
-            add(0, region.role.len())?;
-        }
+        self.validate_semantic_limits(&mut add)?;
         for contribution in &self.images {
             match contribution {
                 ImageContribution::Present(placement) => {
@@ -1256,6 +1277,52 @@ mod tests {
         assert_transport::<ImageScene>();
         assert_transport::<ImageSceneDelta>();
         assert_transport::<Damage>();
+    }
+
+    #[test]
+    fn accessibility_payload_participates_in_prepared_admission() {
+        use crate::semantic::{SemanticAccessibility, SemanticAction, SemanticRegion};
+        let state = PresentationState::new(Rect::new(0, 0, 2, 1));
+        let prepared = state
+            .prepare(Damage::Full, |cx| {
+                let mut region = SemanticRegion::new("a", Rect::new(0, 0, 1, 1), "label");
+                region.accessibility = Some(SemanticAccessibility {
+                    label: Some("x".repeat(128)),
+                    description: Some("description".into()),
+                    text: Some("text".into()),
+                    actions: vec![SemanticAction::Focus, SemanticAction::Activate],
+                    ..SemanticAccessibility::default()
+                });
+                cx.push_semantic(region);
+            })
+            .unwrap();
+        assert_eq!(
+            prepared.semantics().regions()[0]
+                .accessibility
+                .as_ref()
+                .unwrap()
+                .label
+                .as_ref()
+                .unwrap()
+                .len(),
+            128
+        );
+        assert_eq!(
+            prepared.validate_limits(PresentationLimits {
+                max_cells: 2,
+                max_entries: 10,
+                max_bytes: 64,
+            }),
+            Err(PresentationLimitError::Bytes)
+        );
+        assert_eq!(
+            prepared.validate_limits(PresentationLimits {
+                max_cells: 2,
+                max_entries: 1,
+                max_bytes: 1024,
+            }),
+            Err(PresentationLimitError::Entries)
+        );
     }
 
     #[test]

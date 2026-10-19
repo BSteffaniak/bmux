@@ -19,33 +19,15 @@ use tokio::net::windows::named_pipe::{
 };
 
 /// Local IPC listener abstraction.
+///
+/// On Unix, bind and drop never unlink the endpoint pathname. A pathname's
+/// metadata cannot prove ownership across a later unlink: another process can
+/// replace it between either operation. Cleanup and stale-name recovery require
+/// caller-owned lifecycle serialization covering all binders and removers.
+/// Dropping closes this handle only; duplicated descriptors remain independent.
 #[derive(Debug)]
 pub struct LocalIpcListener {
     inner: ListenerInner,
-    #[cfg(unix)]
-    owner_pid: u32,
-    #[cfg(unix)]
-    endpoint_identity: (std::path::PathBuf, u64, u64),
-}
-
-impl Drop for LocalIpcListener {
-    fn drop(&mut self) {
-        #[cfg(unix)]
-        if self.owner_pid == std::process::id() {
-            use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
-            let (path, device, inode) = &self.endpoint_identity;
-            if let Ok(metadata) = std::fs::symlink_metadata(path)
-                && metadata.file_type().is_socket()
-                && metadata.dev() == *device
-                && metadata.ino() == *inode
-            {
-                // Do not remove a replacement endpoint or follow a symlink.
-                // Removing our name stops new connections even if a forked
-                // child temporarily retains the listening descriptor.
-                let _ = std::fs::remove_file(path);
-            }
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -53,7 +35,12 @@ enum ListenerInner {
     #[cfg(unix)]
     Unix(tokio::net::UnixListener),
     #[cfg(windows)]
-    WindowsNamedPipe { pipe_name: String },
+    WindowsNamedPipe {
+        pipe_name: String,
+        // Keep an instance open from bind through drop so another listener
+        // cannot claim first-instance ownership between accepts.
+        pending: tokio::sync::Mutex<NamedPipeServer>,
+    },
 }
 
 /// Local IPC stream abstraction.
@@ -116,15 +103,10 @@ impl LocalIpcListener {
         #[cfg(unix)]
         {
             if let IpcEndpoint::UnixSocket(path) = endpoint {
-                use std::os::unix::fs::MetadataExt as _;
                 prepare_unix_socket_path(path)?;
                 let listener = tokio::net::UnixListener::bind(path)?;
-                let path = std::path::absolute(path)?;
-                let metadata = std::fs::symlink_metadata(&path)?;
                 return Ok(Self {
                     inner: ListenerInner::Unix(listener),
-                    owner_pid: std::process::id(),
-                    endpoint_identity: (path, metadata.dev(), metadata.ino()),
                 });
             }
         }
@@ -132,9 +114,13 @@ impl LocalIpcListener {
         #[cfg(windows)]
         {
             if let IpcEndpoint::WindowsNamedPipe(pipe_name) = endpoint {
+                let pending = ServerOptions::new()
+                    .first_pipe_instance(true)
+                    .create(pipe_name)?;
                 return Ok(Self {
                     inner: ListenerInner::WindowsNamedPipe {
                         pipe_name: pipe_name.clone(),
+                        pending: tokio::sync::Mutex::new(pending),
                     },
                 });
             }
@@ -158,9 +144,13 @@ impl LocalIpcListener {
                 })
             }
             #[cfg(windows)]
-            ListenerInner::WindowsNamedPipe { pipe_name } => {
-                let server = ServerOptions::new().create(pipe_name)?;
-                server.connect().await?;
+            ListenerInner::WindowsNamedPipe { pipe_name, pending } => {
+                let mut pending = pending.lock().await;
+                pending.connect().await?;
+                // Create the successor while the connected instance still
+                // owns the name. On failure retain ownership and report it.
+                let next = ServerOptions::new().create(pipe_name)?;
+                let server = std::mem::replace(&mut *pending, next);
                 Ok(LocalIpcStream {
                     inner: StreamInner::WindowsServer(server),
                 })
@@ -769,9 +759,10 @@ fn prepare_unix_socket_path(path: &Path) -> Result<(), std::io::Error> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    if path.exists() {
-        std::fs::remove_file(path)?;
-    }
+    // Binding owns the name atomically. Never unlink an existing name: a failed
+    // connect is not proof that its listener is dead (backlog, startup and
+    // permission failures are indistinguishable). Explicit recovery belongs to
+    // the caller that can establish exclusive lifecycle ownership.
     Ok(())
 }
 
@@ -783,7 +774,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn dropping_listener_stops_connections_with_duplicate_descriptor() {
+    async fn drop_closes_only_owned_descriptor_and_preserves_pathname() {
         use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
         let socket_path = std::env::temp_dir().join(format!("bmux-ipc-{}.sock", Uuid::new_v4()));
         let endpoint = IpcEndpoint::unix_socket(&socket_path);
@@ -794,10 +785,17 @@ mod tests {
         assert!(duplicate >= 0);
         let duplicate = unsafe { OwnedFd::from_raw_fd(duplicate) };
         drop(listener);
-        let connected = LocalIpcStream::connect(&endpoint).await.is_ok();
+        assert!(
+            LocalIpcStream::connect(&endpoint).await.is_ok(),
+            "duplicate remains independently owned"
+        );
         drop(duplicate);
-        assert!(!socket_path.exists());
-        assert!(!connected, "dropped listener still accepts connections");
+        assert!(
+            socket_path.exists(),
+            "generic drop must never unlink a pathname"
+        );
+        assert!(LocalIpcStream::connect(&endpoint).await.is_err());
+        std::fs::remove_file(socket_path).unwrap();
     }
 
     #[cfg(unix)]
@@ -811,7 +809,126 @@ mod tests {
         drop(old);
         assert!(LocalIpcStream::connect(&endpoint).await.is_ok());
         drop(replacement);
-        assert!(!path.exists());
+        assert!(path.exists());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn drop_preserves_replacement_installed_after_construction() {
+        // There is deliberately no identity-capture or pre-unlink phase to
+        // inject into: generic drop performs no filesystem mutation at all.
+        // Replace the pathname before drop with each possible collision kind.
+        for replacement_is_symlink in [false, true] {
+            let path = std::env::temp_dir().join(format!("bmux-ipc-{}.sock", Uuid::new_v4()));
+            let target = path.with_extension("target");
+            let listener = LocalIpcListener::bind(&IpcEndpoint::unix_socket(&path)).unwrap();
+            std::fs::remove_file(&path).unwrap();
+            if replacement_is_symlink {
+                std::fs::write(&target, b"replacement").unwrap();
+                std::os::unix::fs::symlink(&target, &path).unwrap();
+            } else {
+                std::fs::write(&path, b"replacement").unwrap();
+            }
+            drop(listener);
+            assert_eq!(std::fs::read(&path).unwrap(), b"replacement");
+            assert_eq!(
+                std::fs::symlink_metadata(&path)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink(),
+                replacement_is_symlink
+            );
+            std::fs::remove_file(path).unwrap();
+            if replacement_is_symlink {
+                std::fs::remove_file(target).unwrap();
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn concurrent_binders_have_exactly_one_winner() {
+        let path = std::env::temp_dir().join(format!("bmux-ipc-{}.sock", Uuid::new_v4()));
+        let endpoint = IpcEndpoint::unix_socket(&path);
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let handle = tokio::runtime::Handle::current();
+        let (left, right) = std::thread::scope(|scope| {
+            let bind = || {
+                let _entered = handle.enter();
+                barrier.wait();
+                LocalIpcListener::bind(&endpoint)
+            };
+            let left = scope.spawn(bind);
+            let right = scope.spawn(bind);
+            barrier.wait();
+            (left.join().unwrap(), right.join().unwrap())
+        });
+        assert_ne!(left.is_ok(), right.is_ok());
+        assert!(LocalIpcStream::connect(&endpoint).await.is_ok());
+        drop(left);
+        drop(right);
+        assert!(path.exists());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bind_preserves_live_and_stale_socket_names() {
+        let path = std::env::temp_dir().join(format!("bmux-ipc-{}.sock", Uuid::new_v4()));
+        let endpoint = IpcEndpoint::unix_socket(&path);
+        let listener = LocalIpcListener::bind(&endpoint).unwrap();
+        assert!(LocalIpcListener::bind(&endpoint).is_err());
+        assert!(LocalIpcStream::connect(&endpoint).await.is_ok());
+        drop(listener);
+        std::fs::remove_file(&path).unwrap();
+        // A dead socket is not automatically recoverable without lifecycle authority.
+        let stale = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        drop(stale);
+        assert!(LocalIpcListener::bind(&endpoint).is_err());
+        assert!(path.exists());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bind_preserves_files_and_symlinks() {
+        use std::os::unix::fs::symlink;
+        let path = std::env::temp_dir().join(format!("bmux-ipc-{}.sock", Uuid::new_v4()));
+        let target = path.with_extension("target");
+        std::fs::write(&target, b"keep").unwrap();
+        std::fs::write(&path, b"keep").unwrap();
+        assert!(LocalIpcListener::bind(&IpcEndpoint::unix_socket(&path)).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"keep");
+        std::fs::remove_file(&path).unwrap();
+        symlink(&target, &path).unwrap();
+        assert!(LocalIpcListener::bind(&IpcEndpoint::unix_socket(&path)).is_err());
+        assert!(
+            std::fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"keep");
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_file(target).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn named_pipe_bind_claims_exclusive_ownership_before_accept() {
+        let endpoint =
+            IpcEndpoint::WindowsNamedPipe(format!(r"\\.\pipe\bmux-test-{}", Uuid::new_v4()));
+        let listener = LocalIpcListener::bind(&endpoint).unwrap();
+        assert!(LocalIpcListener::bind(&endpoint).is_err());
+        let client = LocalIpcStream::connect(&endpoint).await.unwrap();
+        let server = listener.accept().await.unwrap();
+        assert!(LocalIpcListener::bind(&endpoint).is_err());
+        drop(client);
+        drop(server);
+        assert!(LocalIpcListener::bind(&endpoint).is_err());
+        drop(listener);
+        assert!(LocalIpcListener::bind(&endpoint).is_ok());
     }
 
     #[cfg(unix)]

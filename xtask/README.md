@@ -43,5 +43,31 @@ Public download consumers must verify the archive checksum and reject unsafe
 archive entries **before** extraction and execution of `bmux-install`. Inventory
 hashes alone are not an authenticity signature. No Python installer is shipped.
 
-Tests are ordinary Rust unit tests under `xtask/src/tests.rs`; the public shell
-consumer maintains its own checksum/archive-security fixtures.
+
+## Bterm bundles
+
+```sh
+cargo xtask bterm stage --target TARGET --artifact-dir DIR --destination ABSENT_DIR
+cargo xtask bterm verify --target TARGET --root EXECUTABLE_DIRECTORY
+```
+
+Staging copies the actual `bterm` and `bmux` binaries, four bundled JetBrains
+Mono Nerd Font faces, and font/project notices. Static plugins remain part of
+the BMUX companion. Both processes retain independent lifetimes; packaging never
+starts a runtime. The schema-1 `bterm-bundle.json` beside the executables records
+`bterm-bmux-v1`, the exact target, and relative paths with SHA-256 checksums.
+This is corruption detection, not signing or publisher authentication. Runtime
+compatibility is separately negotiated over IPC.
+
+Linux includes `share/applications/bterm.desktop`; a distributor must expose the
+bundle's `bterm` on its launcher PATH. macOS produces `Contents/MacOS` plus an
+Info.plist; use a `.app` destination. Windows uses explicit `.exe` paths. No
+installer, signing, registration, or live user-directory mutation is performed.
+Verification rejects traversal, symlinks, duplicate paths/required roles, missing
+companions, wrong targets and corrupt bytes without executing either binary.
+
+The Bterm bundle CI builds real binaries and checks staged executable `--help`
+on Linux/macOS/Windows with the flake-selected compiler. Windows backend
+availability remains an application-level explicit error, not a claimed working
+GUI. Fixture tests cover all layouts on every host; native window/device testing
+still requires each platform and is not implied by bundle verification.

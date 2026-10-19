@@ -793,6 +793,27 @@ pub fn declared_services_concurrent_bundled<P: ConcurrentRustPlugin>()
 }
 
 #[doc(hidden)]
+/// Validate request evidence before obtaining plugin execution authority. Legacy
+/// frames are unchanged; checked frames require the actual plugin's generated contract.
+fn checked_context<C: crate::PluginContract>(
+    mut context: NativeServiceContext,
+) -> crate::Result<(NativeServiceContext, bool)> {
+    let checked = crate::service_contract::is_checked(&context.request.payload);
+    if checked {
+        context.request.payload =
+            crate::service_contract::decode(C::service_contract(), &context.request.payload)?
+                .to_vec();
+    }
+    Ok((context, checked))
+}
+
+fn checked_response(mut response: ServiceResponse, checked: bool) -> ServiceResponse {
+    if checked && response.error.is_none() {
+        response.payload = crate::service_contract::encode_response(&response.payload);
+    }
+    response
+}
+
 pub fn invoke_service_concurrent_export<P: ConcurrentRustPlugin>(
     instance: &'static Arc<P>,
     input_ptr: *const u8,
@@ -811,7 +832,11 @@ pub fn invoke_service_concurrent_export<P: ConcurrentRustPlugin>(
     >(input, ServiceEnvelopeKind::Request) else {
         return SERVICE_STATUS_DECODE_FAILED;
     };
+    let Ok((context, checked)) = checked_context::<P::Contract>(context) else {
+        return SERVICE_STATUS_DECODE_FAILED;
+    };
     let response = instance.invoke_service_concurrent(context);
+    let response = checked_response(response, checked);
     let Ok(encoded) = encode_service_envelope_with_invocation_id(
         invocation_id,
         request_id,
@@ -932,6 +957,9 @@ pub fn invoke_service_export<P: RustPlugin>(
         return SERVICE_STATUS_DECODE_FAILED;
     };
 
+    let Ok((context, checked)) = checked_context::<P::Contract>(context) else {
+        return SERVICE_STATUS_DECODE_FAILED;
+    };
     let plugin_id = context.plugin_id.clone();
     let interface_id = context.request.service.interface_id.clone();
     let operation = context.request.operation.clone();
@@ -966,6 +994,7 @@ pub fn invoke_service_export<P: RustPlugin>(
     }) else {
         return SERVICE_STATUS_PLUGIN_UNAVAILABLE;
     };
+    let response = checked_response(response, checked);
 
     let Ok(encoded) = encode_service_envelope_with_invocation_id(
         invocation_id,
@@ -1083,9 +1112,8 @@ mod concurrent_tests {
     };
     use crate::{
         ApiVersion, CancellationToken, HostConnectionInfo, HostMetadata, HostScope,
-        NoPluginContract, PluginInvocationId, ProviderId, RegisteredService, ServiceKind,
-        ServiceRequest, decode_service_envelope_with_invocation_id,
-        encode_service_envelope_with_invocation_id,
+        PluginInvocationId, ProviderId, RegisteredService, ServiceKind, ServiceRequest,
+        decode_service_envelope_with_invocation_id, encode_service_envelope_with_invocation_id,
     };
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1100,8 +1128,19 @@ mod concurrent_tests {
         deactivations: AtomicUsize,
     }
 
+    struct TestServiceContract;
+
+    impl crate::PluginContract for TestServiceContract {
+        fn service_contract() -> &'static [u8] {
+            b"test-exact-service-v1"
+        }
+        fn service_declarations() -> crate::Result<Vec<crate::PluginService>> {
+            Ok(Vec::new())
+        }
+    }
+
     impl ConcurrentRustPlugin for TestConcurrentPlugin {
-        type Contract = NoPluginContract;
+        type Contract = TestServiceContract;
 
         fn activate_concurrent(
             &self,
@@ -1259,6 +1298,53 @@ mod concurrent_tests {
         );
         assert_eq!(plugin.activations.load(Ordering::SeqCst), 1);
         assert_eq!(plugin.deactivations.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn checked_export_rejects_mismatch_before_provider_execution() {
+        let plugin: &'static Arc<TestConcurrentPlugin> =
+            Box::leak(Box::new(Arc::new(TestConcurrentPlugin::default())));
+        for (contract, accepted) in [
+            (b"wrong-contract".as_slice(), false),
+            (b"test-exact-service-v1".as_slice(), true),
+        ] {
+            let context =
+                service_context(crate::service_contract::encode(contract, b"request").unwrap());
+            let input = encode_service_envelope_with_invocation_id(
+                PluginInvocationId::new(),
+                9,
+                ServiceEnvelopeKind::Request,
+                &context,
+            )
+            .unwrap();
+            let mut output = vec![0; 16384];
+            let mut output_len = 0;
+            let status = super::invoke_service_concurrent_export(
+                plugin,
+                input.as_ptr(),
+                input.len(),
+                output.as_mut_ptr(),
+                output.len(),
+                &raw mut output_len,
+            );
+            if accepted {
+                assert_eq!(status, super::SERVICE_STATUS_OK);
+                let (_, _, response): (_, _, ServiceResponse) =
+                    decode_service_envelope_with_invocation_id(
+                        &output[..output_len],
+                        ServiceEnvelopeKind::Response,
+                    )
+                    .unwrap();
+                assert_eq!(
+                    crate::service_contract::decode_response(&response.payload).unwrap(),
+                    &[1]
+                );
+                assert_eq!(plugin.max_active_calls.load(Ordering::SeqCst), 1);
+            } else {
+                assert_eq!(status, super::SERVICE_STATUS_DECODE_FAILED);
+                assert_eq!(plugin.max_active_calls.load(Ordering::SeqCst), 0);
+            }
+        }
     }
 
     #[test]

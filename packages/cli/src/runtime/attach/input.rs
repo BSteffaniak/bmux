@@ -1,3 +1,6 @@
+//! Input conversion boundaries for terminal and native hosts. Both feed the same
+//! attach reducers; neither invents binding, focus, hit-testing, or PTY policy.
+
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
@@ -339,6 +342,76 @@ impl From<KeyModifiers> for TerminalModifiers {
     }
 }
 
+/// Convert native logical keys for the existing attach binding/UI reducer.
+/// Physical positions are deliberately not substituted for layout-aware keys.
+/// Multi-scalar characters and dead keys remain text/composition, never a
+/// guessed first character. Text fallback is a separate, post-binding decision.
+#[must_use]
+pub fn native_key_event(key: &bmux_frontend_runtime::input::KeyEvent) -> Option<TerminalKeyEvent> {
+    use bmux_frontend_runtime::input::{KeyPhase, LogicalKey, NamedKey};
+    let code = match &key.logical {
+        LogicalKey::Character(text) => {
+            let mut chars = text.chars();
+            let ch = chars.next()?;
+            if chars.next().is_some() {
+                return None;
+            }
+            TerminalKeyCode::Char(ch)
+        }
+        LogicalKey::Named(named) => match named {
+            NamedKey::Enter => TerminalKeyCode::Enter,
+            NamedKey::Tab if key.modifiers.shift => TerminalKeyCode::BackTab,
+            NamedKey::Tab => TerminalKeyCode::Tab,
+            NamedKey::Backspace => TerminalKeyCode::Backspace,
+            NamedKey::Delete => TerminalKeyCode::Delete,
+            NamedKey::Escape => TerminalKeyCode::Esc,
+            NamedKey::Space => TerminalKeyCode::Char(' '),
+            NamedKey::Up => TerminalKeyCode::Up,
+            NamedKey::Down => TerminalKeyCode::Down,
+            NamedKey::Left => TerminalKeyCode::Left,
+            NamedKey::Right => TerminalKeyCode::Right,
+            NamedKey::Home => TerminalKeyCode::Home,
+            NamedKey::End => TerminalKeyCode::End,
+            NamedKey::PageUp => TerminalKeyCode::PageUp,
+            NamedKey::PageDown => TerminalKeyCode::PageDown,
+            NamedKey::Insert => TerminalKeyCode::Insert,
+            NamedKey::Function(n) => TerminalKeyCode::Function(*n),
+            NamedKey::CapsLock => TerminalKeyCode::CapsLock,
+            NamedKey::ScrollLock => TerminalKeyCode::ScrollLock,
+            NamedKey::NumLock => TerminalKeyCode::NumLock,
+            NamedKey::PrintScreen => TerminalKeyCode::PrintScreen,
+            NamedKey::Pause => TerminalKeyCode::Pause,
+            NamedKey::Menu => TerminalKeyCode::Menu,
+            NamedKey::Shift | NamedKey::Control | NamedKey::Alt | NamedKey::Super => return None,
+        },
+        LogicalKey::Dead(_) | LogicalKey::Unidentified => return None,
+    };
+    Some(TerminalKeyEvent {
+        code,
+        kind: match key.phase {
+            KeyPhase::Press => TerminalKeyPhase::Press,
+            KeyPhase::Repeat => TerminalKeyPhase::Repeat,
+            KeyPhase::Release => TerminalKeyPhase::Release,
+        },
+        modifiers: TerminalModifiers {
+            shift: key.modifiers.shift,
+            control: key.modifiers.control,
+            alt: key.modifiers.alt,
+            super_key: key.modifiers.super_key,
+            hyper: false,
+            meta: false,
+        },
+    })
+}
+
+impl TerminalKeyEvent {
+    /// Native binding conversion without a terminal transport round trip.
+    #[must_use]
+    pub fn from_native(key: &bmux_frontend_runtime::input::KeyEvent) -> Option<Self> {
+        native_key_event(key)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -346,6 +419,61 @@ mod tests {
         TerminalMousePhase,
     };
     use crossterm::event::{Event, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+
+    #[test]
+    fn native_keys_preserve_cli_binding_semantics_without_text_conversion() {
+        use bmux_frontend_runtime::input::{
+            KeyEvent as NativeKey, KeyPhase, LogicalKey, Modifiers, NamedKey, PhysicalKey,
+        };
+        let mut key = NativeKey {
+            physical: PhysicalKey::Code("KeyQ".into()),
+            logical: LogicalKey::Character("A".into()),
+            phase: KeyPhase::Repeat,
+            modifiers: Modifiers {
+                shift: true,
+                ..Modifiers::default()
+            },
+            text: Some("A".into()),
+        };
+        let converted = super::native_key_event(&key).expect("logical character");
+        assert_eq!(converted.code, super::TerminalKeyCode::Char('A'));
+        assert_eq!(converted.kind, super::TerminalKeyPhase::Repeat);
+        assert!(converted.modifiers.shift);
+        key.logical = LogicalKey::Named(NamedKey::Tab);
+        key.phase = KeyPhase::Release;
+        let converted = super::TerminalKeyEvent::from_native(&key).expect("tab");
+        assert_eq!(converted.code, super::TerminalKeyCode::BackTab);
+        assert_eq!(converted.kind, super::TerminalKeyPhase::Release);
+        key.logical = LogicalKey::Character("éあ".into());
+        assert!(super::native_key_event(&key).is_none());
+        key.logical = LogicalKey::Dead(Some('´'));
+        assert!(super::native_key_event(&key).is_none());
+    }
+
+    #[test]
+    fn native_super_control_alt_are_not_lost() {
+        use bmux_frontend_runtime::input::{
+            KeyEvent as NativeKey, KeyPhase, LogicalKey, Modifiers, NamedKey, PhysicalKey,
+        };
+        let key = NativeKey {
+            physical: PhysicalKey::Unidentified,
+            logical: LogicalKey::Named(NamedKey::Left),
+            phase: KeyPhase::Press,
+            text: None,
+            modifiers: Modifiers {
+                control: true,
+                alt: true,
+                super_key: true,
+                shift: false,
+            },
+        };
+        let converted = super::TerminalKeyEvent::from_native(&key).expect("arrow");
+        assert!(converted.modifiers.control);
+        assert!(converted.modifiers.alt);
+        assert!(converted.modifiers.super_key);
+        assert!(!converted.modifiers.hyper);
+        assert!(!converted.modifiers.meta);
+    }
 
     #[test]
     fn maps_crossterm_mouse_down() {

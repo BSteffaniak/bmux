@@ -1,0 +1,30 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Owned native window and event interfaces for Bterm"
+edition     = { workspace = true }
+keywords    = ["bmux", "terminal", "native"]
+license     = { workspace = true }
+name        = "bmux_native_platform"
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+accesskit = { workspace = true }
+accesskit_winit = { workspace = true, features = [
+    "rwh_06",
+    "accesskit_unix",
+    "async-io",
+] }
+arboard = { workspace = true }
+bmux_frontend_runtime = { workspace = true }
+bmux_tui = { workspace = true }
+raw-window-handle = { workspace = true }
+thiserror = { workspace = true }
+winit = { workspace = true }
+
+[features]
+default          = []
+fail-on-warnings = []
+renderer-adapter = []

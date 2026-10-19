@@ -1,0 +1,57 @@
+name: Bterm bundle
+on:
+  pull_request:
+    paths:
+      - 'packages/bterm/**'
+      - 'packages/native-*/**'
+      - 'packages/frontend-runtime/**'
+      - 'xtask/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/bterm-bundle.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  rust-version:
+    uses: ./.github/workflows/rust-version.yml
+  bundle:
+    needs: rust-version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-14
+            target: x86_64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ needs.rust-version.outputs.version }}
+      - name: Linux native libraries
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev libxcursor-dev libxi-dev libxrandr-dev libegl1-mesa-dev libvulkan-dev
+      - name: Bundle fixtures (all layouts)
+        run: cargo test --locked -p xtask bterm::tests
+      - name: Build actual frontend and companion
+        run: cargo build --locked -p bmux_bterm --bin bterm -p bmux_cli --bin bmux -p xtask --bin xtask
+      - name: Stage and verify installed artifacts
+        shell: bash
+        run: |
+          cargo run --locked -p xtask -- bterm stage --target '${{ matrix.target }}' --artifact-dir target/debug --destination "$PWD/dist/Bterm"
+          root="$PWD/dist/Bterm"
+          suffix=""
+          if [[ '${{ runner.os }}' == macOS ]]; then root="$root/Contents/MacOS"; fi
+          if [[ '${{ runner.os }}' == Windows ]]; then suffix=".exe"; fi
+          cargo run --locked -p xtask -- bterm verify --target '${{ matrix.target }}' --root "$root"
+          "$root/bterm$suffix" --help
+          "$root/bmux$suffix" --help
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Bterm-${{ matrix.target }}
+          path: dist/Bterm

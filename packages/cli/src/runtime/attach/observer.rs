@@ -52,6 +52,9 @@ pub struct AttachSnapshot {
 type RejectionHandler = dyn FnMut(Option<&str>) + Send + Sync;
 
 type SnapshotDelivery = dyn FnMut(&AttachSnapshot) -> anyhow::Result<()> + Send + Sync;
+type PreparedOutput = dyn FnMut(bmux_frontend_runtime::presentation::PreparedDelivery) -> anyhow::Result<()>
+    + Send
+    + Sync;
 
 #[cfg(any(
     test,
@@ -116,6 +119,9 @@ pub struct AttachObserverPublisher {
     rejection: Option<Box<RejectionHandler>>,
     last_rejection: Option<String>,
     delivery: Option<Box<SnapshotDelivery>>,
+    prepared_delivery: Option<(u64, Box<PreparedOutput>)>,
+    prepared_revision: u64,
+    prepared_authority: Option<bmux_frontend_runtime::presentation::PresentationAuthority>,
     capture_interval: Option<std::time::Duration>,
     last_capture: Option<std::time::Instant>,
     #[cfg(any(
@@ -155,6 +161,9 @@ pub fn attach_observer_channel() -> (AttachObserverPublisher, AttachObserver) {
             rejection: None,
             last_rejection: None,
             delivery: None,
+            prepared_delivery: None,
+            prepared_revision: 0,
+            prepared_authority: None,
             capture_interval: None,
             last_capture: None,
             #[cfg(any(
@@ -203,6 +212,44 @@ impl Drop for AttachObserverPublisher {
 }
 
 impl AttachObserverPublisher {
+    /// Construct a direct owned-output adapter without a browser observer.
+    ///
+    /// The receiver is intentionally absent: the callback accepts the complete
+    /// canonical prepared scene synchronously. Returning success for queued work
+    /// would incorrectly promote interaction authority before native output.
+    #[must_use]
+    pub fn for_prepared_delivery(
+        viewport_generation: u64,
+        delivery: impl FnMut(
+            bmux_frontend_runtime::presentation::PreparedDelivery,
+        ) -> anyhow::Result<()>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
+        let (mut publisher, _) = attach_observer_channel();
+        publisher.set_prepared_delivery(viewport_generation, delivery);
+        publisher
+    }
+
+    /// Replace output with a direct prepared-scene sink for the given viewport.
+    ///
+    /// Reinstall on viewport generation changes. The native owner must validate
+    /// identity, generation and latest revision at actual output acceptance
+    /// (for example with `PresentationAuthority`), not merely at enqueue time.
+    pub fn set_prepared_delivery(
+        &mut self,
+        viewport_generation: u64,
+        delivery: impl FnMut(
+            bmux_frontend_runtime::presentation::PreparedDelivery,
+        ) -> anyhow::Result<()>
+        + Send
+        + Sync
+        + 'static,
+    ) {
+        self.delivery = None;
+        self.prepared_delivery = Some((viewport_generation, Box::new(delivery)));
+    }
     pub(super) fn set_max_fps(&mut self, fps: u8) {
         self.capture_interval = Some(std::time::Duration::from_nanos(
             1_000_000_000_u64.div_ceil(u64::from(fps.clamp(1, 60))),
@@ -235,11 +282,43 @@ impl AttachObserverPublisher {
         self.last_rejection = message.map(str::to_owned);
     }
 
+    /// Update the projection generation before capturing a resized native frame.
+    ///
+    /// The attach owner serializes this with synchronous delivery. Generations
+    /// never decrease, including resize rollback; equal values are idempotent.
+    ///
+    /// # Errors
+    /// Returns an error if no direct sink exists or the generation would regress.
+    pub fn set_prepared_viewport_generation(&mut self, generation: u64) -> anyhow::Result<()> {
+        let Some((current, _)) = &mut self.prepared_delivery else {
+            anyhow::bail!("no direct prepared output installed");
+        };
+        if generation < *current {
+            anyhow::bail!("prepared viewport generation regressed");
+        }
+        *current = generation;
+        Ok(())
+    }
+
+    /// Identity of the last acknowledged direct output for the active binding.
+    #[must_use]
+    pub fn committed_prepared_identity(
+        &self,
+    ) -> Option<bmux_frontend_runtime::presentation::PresentationIdentity> {
+        let (generation, _) = self.prepared_delivery.as_ref()?;
+        self.prepared_authority
+            .as_ref()?
+            .committed()
+            .filter(|delivery| delivery.identity.viewport_generation == *generation)
+            .map(|delivery| delivery.identity)
+    }
+
     /// Install synchronous bounded host admission/delivery before frame commit.
     pub fn set_delivery(
         &mut self,
         delivery: impl FnMut(&AttachSnapshot) -> anyhow::Result<()> + Send + Sync + 'static,
     ) {
+        self.prepared_delivery = None;
         self.delivery = Some(Box::new(delivery));
     }
     pub(super) fn publish(
@@ -300,30 +379,56 @@ impl AttachObserverPublisher {
                 }
             })
             .collect();
+        if let Some((viewport_generation, delivery)) = &mut self.prepared_delivery {
+            use bmux_frontend_runtime::presentation::{
+                PreparedDelivery, PresentationAuthority, PresentationIdentity,
+            };
+            self.prepared_revision = self
+                .prepared_revision
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("prepared delivery revision exhausted"))?;
+            let candidate = PreparedDelivery {
+                identity: PresentationIdentity {
+                    epoch: self.epoch,
+                    revision: self.prepared_revision,
+                    attached_id,
+                    viewport_generation: *viewport_generation,
+                },
+                prepared: Arc::new(prepared.clone()),
+            };
+            // These bindings come from the serialized attach owner, not an
+            // incoming transport frame. The UI independently validates its live
+            // viewport before acknowledging output.
+            let authority = self.prepared_authority.get_or_insert_with(|| {
+                PresentationAuthority::new(
+                    self.epoch,
+                    attached_id,
+                    *viewport_generation,
+                    prepared.buffer().area(),
+                )
+            });
+            authority.rebind(
+                self.epoch,
+                attached_id,
+                *viewport_generation,
+                prepared.buffer().area(),
+            );
+            authority.stage(&candidate)?;
+            authority
+                .present(candidate, |accepted| delivery(accepted.clone()))
+                .map_err(|error| match error {
+                    bmux_frontend_runtime::presentation::DeliveryError::Rejected(reason) => {
+                        anyhow::Error::new(reason)
+                    }
+                    bmux_frontend_runtime::presentation::DeliveryError::Output(error) => error,
+                })?;
+        }
         let snapshot = Arc::new(AttachSnapshot {
             epoch: self.epoch,
             revision,
             attached_id,
             selection_text: prepared.selection_text().clone(),
-            unsupported_metadata: match (
-                graph.surfaces().values().any(|surface| {
-                    surface
-                        .metadata
-                        .as_ref()
-                        .is_some_and(|metadata| metadata.selection.is_some())
-                }),
-                graph.surfaces().values().any(|surface| {
-                    surface
-                        .metadata
-                        .as_ref()
-                        .is_some_and(|metadata| metadata.semantics.is_some())
-                }),
-            ) {
-                (true, true) => &[],
-                (true, false) => &["semantics"],
-                (false, true) => &["selection"],
-                (false, false) => &["selection", "semantics"],
-            },
+            unsupported_metadata: unsupported_metadata(graph),
             prepared,
             surfaces,
         });
@@ -347,6 +452,27 @@ impl std::fmt::Display for PresentationRejected {
     }
 }
 impl std::error::Error for PresentationRejected {}
+
+fn unsupported_metadata(graph: &RetainedCompositor) -> &'static [&'static str] {
+    let selection = graph.surfaces().values().any(|surface| {
+        surface
+            .metadata
+            .as_ref()
+            .is_some_and(|metadata| metadata.selection.is_some())
+    });
+    let semantics = graph.surfaces().values().any(|surface| {
+        surface
+            .metadata
+            .as_ref()
+            .is_some_and(|metadata| metadata.semantics.is_some())
+    });
+    match (selection, semantics) {
+        (true, true) => &[],
+        (true, false) => &["semantics"],
+        (false, true) => &["selection"],
+        (false, false) => &["selection", "semantics"],
+    }
+}
 
 pub(super) fn deliver_prepared(
     view: &mut super::state::AttachViewState,
@@ -712,6 +838,75 @@ fn observed_image_payload(
 mod tests {
     use super::*;
     use bmux_tui::{damage::Damage, presentation::PresentationState};
+
+    #[test]
+    fn direct_delivery_failure_preserves_observer_and_uses_fresh_attempt_identity() {
+        use std::sync::Mutex;
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let collected = seen.clone();
+        let (mut publisher, observer) = attach_observer_channel();
+        publisher.set_prepared_delivery(7, move |delivery| {
+            let mut seen = collected.lock().unwrap();
+            seen.push(delivery.identity);
+            let reject = seen.len() == 2;
+            drop(seen);
+            if reject {
+                anyhow::bail!("surface lost");
+            }
+            Ok(())
+        });
+        let prepared = PresentationState::new(Rect::new(0, 0, 2, 1))
+            .prepare(Damage::Full, |_| {})
+            .unwrap();
+        let graph = RetainedCompositor::new();
+        let target = Uuid::new_v4();
+        let ends = std::collections::BTreeMap::new();
+        publisher
+            .publish(target, prepared.clone(), &graph, &ends)
+            .unwrap();
+        let committed = observer.latest().unwrap();
+        assert!(
+            publisher
+                .publish(target, prepared.clone(), &graph, &ends)
+                .is_err()
+        );
+        assert!(Arc::ptr_eq(&committed, &observer.latest().unwrap()));
+        assert_eq!(publisher.committed_prepared_identity().unwrap().revision, 1);
+        publisher.publish(target, prepared, &graph, &ends).unwrap();
+        assert_eq!(publisher.committed_prepared_identity().unwrap().revision, 3);
+        let seen = seen.lock().unwrap();
+        assert_eq!(
+            seen.iter().map(|id| id.revision).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert!(seen.iter().all(|id| id.epoch == observer.epoch()
+            && id.attached_id == target
+            && id.viewport_generation == 7));
+        drop(seen);
+        assert_eq!(observer.latest().unwrap().revision, 2);
+        publisher.set_prepared_viewport_generation(8).unwrap();
+        assert!(publisher.set_prepared_viewport_generation(7).is_err());
+    }
+
+    #[test]
+    fn direct_adapter_needs_no_receiver_and_browser_adapter_replaces_it() {
+        let mut publisher = AttachObserverPublisher::for_prepared_delivery(1, |_| {
+            panic!("replaced native output must not run");
+        });
+        publisher.set_delivery(|_| Ok(()));
+        let prepared = PresentationState::new(Rect::new(0, 0, 1, 1))
+            .prepare(Damage::Full, |_| {})
+            .unwrap();
+        publisher
+            .publish(
+                Uuid::nil(),
+                prepared,
+                &RetainedCompositor::new(),
+                &std::collections::BTreeMap::new(),
+            )
+            .unwrap();
+        assert_eq!(publisher.revision, 1);
+    }
 
     #[test]
     fn immutable_payload_cache_reuses_assets_not_placement() {

@@ -53,6 +53,7 @@ mod process_runtime;
 pub mod prompt;
 mod ready;
 mod service;
+pub mod service_contract;
 mod stateful_plugin;
 pub mod typed_dispatch;
 mod typed_dispatch_client;
@@ -445,6 +446,24 @@ macro_rules! export_plugin {
             }
 
             #[unsafe(no_mangle)]
+            pub extern "C" fn bmux_plugin_invoke_service_checked_v1(
+                input_ptr: *const u8,
+                input_len: usize,
+                output_ptr: *mut u8,
+                output_capacity: usize,
+                output_len: *mut usize,
+            ) -> i32 {
+                $crate::__private::invoke_service_export(
+                    __bmux_plugin_instance(),
+                    input_ptr,
+                    input_len,
+                    output_ptr,
+                    output_capacity,
+                    output_len,
+                )
+            }
+
+            #[unsafe(no_mangle)]
             pub extern "C" fn bmux_plugin_invoke_service_v1(
                 input_ptr: *const u8,
                 input_len: usize,
@@ -536,6 +555,24 @@ macro_rules! export_concurrent_plugin {
             ) -> i32 {
                 $crate::__private::register_contributions_concurrent_export(
                     __bmux_plugin_instance(),
+                    output_ptr,
+                    output_capacity,
+                    output_len,
+                )
+            }
+
+            #[unsafe(no_mangle)]
+            pub extern "C" fn bmux_plugin_invoke_service_checked_v1(
+                input_ptr: *const u8,
+                input_len: usize,
+                output_ptr: *mut u8,
+                output_capacity: usize,
+                output_len: *mut usize,
+            ) -> i32 {
+                $crate::__private::invoke_service_concurrent_export(
+                    __bmux_plugin_instance(),
+                    input_ptr,
+                    input_len,
                     output_ptr,
                     output_capacity,
                     output_len,
@@ -659,6 +696,7 @@ macro_rules! bundled_concurrent_plugin_vtable {
             activate_with_async: |_context, _async_handle| $crate::EXIT_OK,
             deactivate: __deactivate,
             handle_event: |_input_ptr, _input_len| $crate::EXIT_OK,
+            checked_service_contracts: true,
             invoke_service: __invoke_service,
             invoke_streaming_service: __invoke_streaming_service,
             register_typed_services: __register_typed_services,
@@ -775,6 +813,7 @@ macro_rules! bundled_plugin_vtable {
             activate_with_async: __activate_with_async,
             deactivate: __deactivate,
             handle_event: __handle_event,
+            checked_service_contracts: true,
             invoke_service: __invoke_service,
             invoke_streaming_service: __invoke_streaming_service,
             register_typed_services: __register_typed_services,
@@ -794,6 +833,8 @@ pub struct StaticPluginVtable {
     pub deactivate: fn(*const u8, usize) -> i32,
     pub handle_event: fn(*const u8, usize) -> i32,
     pub invoke_service: fn(*const u8, usize, *mut u8, usize, *mut usize) -> i32,
+    /// Export validates checked BPDL payloads before provider code runs.
+    pub checked_service_contracts: bool,
     pub invoke_streaming_service: fn(*const u8, usize, *mut u8, usize, *mut usize) -> i32,
     pub register_typed_services:
         fn(context: TypedServiceRegistrationContext<'_>) -> TypedServiceRegistry,

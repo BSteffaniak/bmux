@@ -126,6 +126,7 @@ pub trait TypedServiceEndpoint {
     const CAPABILITY: CapabilityId;
     const KIND: InvokeServiceKind;
     const INTERFACE_ID: InterfaceId;
+    const SERVICE_CONTRACT: &'static [u8] = &[];
     const OPERATION: OperationId;
 
     /// Interface-level service descriptor for this endpoint.
@@ -145,6 +146,7 @@ pub trait TypedServiceEndpoint {
             capability: Self::CAPABILITY,
             kind,
             interface_id: Self::INTERFACE_ID,
+            contract: Self::SERVICE_CONTRACT,
         }
     }
 }
@@ -197,6 +199,17 @@ where
             op: operation.to_string(),
             details: err.to_string(),
         })?;
+    let checked = client.requires_service_contracts();
+    let payload = if checked {
+        crate::service_contract::encode(E::SERVICE_CONTRACT, &payload).map_err(|err| {
+            TypedServiceClientError::Encode {
+                op: operation.to_string(),
+                details: err.to_string(),
+            }
+        })?
+    } else {
+        payload
+    };
     let response = client
         .invoke_service_raw(
             E::CAPABILITY.as_str(),
@@ -206,7 +219,17 @@ where
             payload,
         )
         .await?;
-    crate::decode_service_message(&response).map_err(|err| TypedServiceClientError::Decode {
+    let response = if checked {
+        crate::service_contract::decode_response(&response).map_err(|err| {
+            TypedServiceClientError::Decode {
+                op: operation.to_string(),
+                details: err.to_string(),
+            }
+        })?
+    } else {
+        &response
+    };
+    crate::decode_service_message(response).map_err(|err| TypedServiceClientError::Decode {
         op: operation.to_string(),
         details: err.to_string(),
     })
@@ -227,6 +250,11 @@ where
 /// callers that need `dyn TypedDispatchClient` object safety should
 /// box an adapter.
 pub trait TypedDispatchClient: Send {
+    /// Whether generated typed calls must use negotiated checked BPDL frames.
+    fn requires_service_contracts(&self) -> bool {
+        false
+    }
+
     /// Dispatch an encoded typed invocation and return the encoded response.
     ///
     /// # Errors
@@ -297,6 +325,53 @@ mod tests {
         assert_eq!(client.last_interface.as_deref(), Some("iface/v1"));
         assert_eq!(client.last_operation.as_deref(), Some("op"));
         assert!(matches!(client.last_kind, Some(InvokeServiceKind::Query)));
+    }
+
+    struct CheckedEndpoint;
+
+    impl TypedServiceEndpoint for CheckedEndpoint {
+        type Request = u32;
+        type Response = u32;
+        const CAPABILITY: CapabilityId = CapabilityId::from_static("example.read");
+        const KIND: InvokeServiceKind = InvokeServiceKind::Query;
+        const INTERFACE_ID: InterfaceId = InterfaceId::from_static("state/v1");
+        const OPERATION: OperationId = OperationId::from_static("get");
+        const SERVICE_CONTRACT: &'static [u8] = b"exact-contract-v1";
+    }
+
+    struct CheckedDispatch;
+
+    impl TypedDispatchClient for CheckedDispatch {
+        fn requires_service_contracts(&self) -> bool {
+            true
+        }
+
+        async fn invoke_service_raw(
+            &mut self,
+            _capability: &str,
+            _kind: InvokeServiceKind,
+            _interface_id: &str,
+            _operation: &str,
+            payload: Vec<u8>,
+        ) -> TypedDispatchClientResult<Vec<u8>> {
+            let request =
+                crate::service_contract::decode(CheckedEndpoint::SERVICE_CONTRACT, &payload)
+                    .unwrap();
+            let number: u32 = crate::decode_service_message(request).unwrap();
+            Ok(crate::service_contract::encode_response(
+                &crate::encode_service_message(&(number + 1)).unwrap(),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn typed_checked_endpoint_binds_request_and_decodes_acceptance() {
+        assert_eq!(
+            invoke_typed_service::<_, CheckedEndpoint>(&mut CheckedDispatch, &41)
+                .await
+                .unwrap(),
+            42
+        );
     }
 
     #[test]

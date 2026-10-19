@@ -2,6 +2,34 @@ use anyhow::Result;
 use bmux_client::BmuxClient;
 use tokio::sync::oneshot;
 
+pub use crate::runtime::attach::runtime::{
+    NativeAttachEvent, NativeAttachHandle, NativeAttachHost, NativeClipboardRequest,
+    run_native_with_client,
+};
+
+/// Install the same configured client plugin adapters as the standalone CLI.
+/// Uses explicit paths; does not parse CLI arguments or select another runtime.
+///
+/// # Errors
+/// Returns plugin discovery or configuration admission failures.
+pub fn initialize_native_runtime_state(
+    config: &bmux_config::BmuxConfig,
+    paths: &bmux_config::ConfigPaths,
+) -> Result<()> {
+    crate::runtime::initialize_native_plugins(config, paths)
+}
+
+/// Install native worker plugin configuration using explicit paths.
+///
+/// # Errors
+/// Returns plugin discovery or configuration admission failures.
+pub fn initialize_native_plugins(
+    config: &bmux_config::BmuxConfig,
+    paths: &bmux_config::ConfigPaths,
+) -> Result<()> {
+    crate::runtime::initialize_native_plugins(config, paths)
+}
+
 pub use crate::runtime::attach::adapters::{
     AttachAdapterFuture, AttachClock, AttachEventBus, AttachEventEnvelope, AttachRenderSink,
     AttachScheduledWake, AttachScheduler, AttachServiceCall, AttachServiceHost, AttachStorage,

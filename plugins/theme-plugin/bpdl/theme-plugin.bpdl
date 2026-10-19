@@ -3,6 +3,62 @@
 plugin bmux.theme version 1;
 
 capability THEME_CONTROL = bmux.theme.write;
+capability THEME_READ = bmux.theme.read;
+
+// Canonical wire definitions, not opaque aliases to bmux_appearance Rust paths.
+// appearance_wire.rs exhaustively converts neutral runtime values into these
+// generated records at the actual service response boundary.
+@capability(THEME_READ)
+interface theme-state {
+    record appearance {
+        foreground: string,
+        background: string,
+        cursor: string,
+        selection-background: string,
+        border: border-appearance,
+        status: status-appearance,
+        content-effects: map<string, content-effect>,
+        modes: map<string, appearance-patch>,
+    }
+    record appearance-patch {
+        foreground: string?,
+        background: string?,
+        cursor: string?,
+        selection-background: string?,
+        border: border-appearance-patch,
+        status: status-appearance-patch,
+        content-effects: map<string, content-effect-patch>,
+    }
+    record border-appearance { active: string, inactive: string }
+    record border-appearance-patch { active: string?, inactive: string? }
+    record status-appearance {
+        background: string, foreground: string, active-window: string, mode-indicator: string,
+    }
+    record status-appearance-patch {
+        background: string?, foreground: string?,
+        active-window: string?, mode-indicator: string?,
+    }
+    enum content-effect-scope { @default cells }
+    enum content-effect-bg-predicate { @default default }
+    record content-blend { color: string, amount-permille: u16 }
+    record content-blend-patch { color: string?, amount-permille: u16? }
+    record content-effect {
+        enabled: bool,
+        scope: content-effect-scope,
+        when-bg: content-effect-bg-predicate,
+        background-blend: content-blend?,
+    }
+    record content-effect-patch {
+        enabled: bool?,
+        scope: content-effect-scope?,
+        when-bg: content-effect-bg-predicate?,
+        background-blend: content-blend-patch,
+    }
+
+    query active-appearance() -> appearance;
+    query active-appearance-for-cwd(cwd: string) -> appearance;
+    query active-appearance-for-scope(scope: string, attributes: map<string, string>) -> appearance;
+}
 
 @capability(THEME_CONTROL)
 interface theme-control-v1 {

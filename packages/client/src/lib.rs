@@ -166,6 +166,7 @@ pub enum ClientError {
 /// Main client API for communicating with bmux server.
 #[derive(Debug)]
 pub struct BmuxClient {
+    checked_service_contracts: bool,
     stream: ClientStream,
     timeout: Duration,
     next_request_id: u64,
@@ -199,6 +200,26 @@ impl ClientStream {
 }
 
 impl BmuxClient {
+    /// Require negotiated invocation-bound BPDL contracts for typed service calls.
+    /// Call after connecting and on every replacement connection. Preserved by streaming conversion.
+    ///
+    /// # Errors
+    /// Rejects peers without explicit support; never silently downgrades representation.
+    pub fn require_service_contracts(&mut self) -> Result<()> {
+        if !self.negotiated_protocol.as_ref().is_some_and(|protocol| {
+            protocol
+                .capabilities
+                .iter()
+                .any(|capability| capability == bmux_ipc::CAPABILITY_SERVICE_CONTRACT_V1)
+        }) {
+            return Err(ClientError::UnexpectedResponse(
+                "peer does not support checked BPDL service contracts",
+            ));
+        }
+        self.checked_service_contracts = true;
+        Ok(())
+    }
+
     #[must_use]
     pub const fn negotiated_protocol(&self) -> Option<&NegotiatedProtocol> {
         self.negotiated_protocol.as_ref()
@@ -272,6 +293,7 @@ impl BmuxClient {
             next_request_id: 1,
             principal_id,
             negotiated_protocol: None,
+            checked_service_contracts: false,
         };
 
         let handshake_attempt = client
@@ -508,6 +530,7 @@ impl BmuxClient {
     ///
     /// Returns an error if transport/protocol validation fails.
     pub async fn request_raw(&mut self, request: Request) -> Result<Response> {
+        validate_service_representation(self.checked_service_contracts, &request)?;
         let request_id = self.take_request_id();
         let request_kind = request_kind_name(&request);
         let request_detail = request_detail(&request);
@@ -705,7 +728,30 @@ fn map_client_error(
     }
 }
 
+fn validate_service_representation(required: bool, request: &Request) -> Result<()> {
+    if !required {
+        return Ok(());
+    }
+    match request {
+        Request::InvokeService { payload, .. }
+            if !bmux_plugin_sdk::service_contract::is_checked(payload) =>
+        {
+            Err(ClientError::UnexpectedResponse(
+                "guarded service call requires a generated checked BPDL payload",
+            ))
+        }
+        Request::InvokeServicePipeline { .. } => Err(ClientError::UnexpectedResponse(
+            "service pipelines do not support checked BPDL invocation yet",
+        )),
+        _ => Ok(()),
+    }
+}
+
 impl TypedDispatchClient for BmuxClient {
+    fn requires_service_contracts(&self) -> bool {
+        self.checked_service_contracts
+    }
+
     fn invoke_service_raw(
         &mut self,
         capability: &str,
@@ -797,6 +843,7 @@ fn format_stream_disconnect_reason(error: &IpcTransportError) -> String {
 /// delivery.
 #[derive(Debug)]
 pub struct StreamingBmuxClient {
+    checked_service_contracts: bool,
     writer: StreamingClientWriter,
     timeout: Duration,
     next_request_id: u64,
@@ -867,6 +914,7 @@ impl StreamingBmuxClient {
             next_request_id,
             principal_id,
             negotiated_protocol,
+            checked_service_contracts,
         } = client;
 
         let (mut reader, mut writer) = match stream {
@@ -926,6 +974,7 @@ impl StreamingBmuxClient {
             next_request_id,
             principal_id,
             negotiated_protocol,
+            checked_service_contracts,
             pending,
             timed_out,
             event_rx,
@@ -1047,6 +1096,20 @@ impl StreamingBmuxClient {
         self.start_request(request).await?.await
     }
 
+    async fn send_pending_request(&mut self, request_id: u64, envelope: &Envelope) -> Result<()> {
+        match tokio::time::timeout(self.timeout, self.writer.send_envelope(envelope)).await {
+            Ok(Ok(())) => Ok(()),
+            result => {
+                self.pending.lock().await.remove(&request_id);
+                Err(match result {
+                    Ok(Err(error)) => ClientError::Transport(error),
+                    Err(_) => ClientError::Timeout(self.timeout),
+                    Ok(Ok(())) => unreachable!(),
+                })
+            }
+        }
+    }
+
     /// Send on this authenticated connection, returning an independently owned reply future.
     ///
     /// # Errors
@@ -1055,6 +1118,7 @@ impl StreamingBmuxClient {
         &mut self,
         request: Request,
     ) -> Result<impl std::future::Future<Output = Result<Response>> + Send + 'static> {
+        validate_service_representation(self.checked_service_contracts, &request)?;
         let request_id = self.take_request_id();
         let request_kind = request_kind_name(&request);
         let request_detail = request_detail(&request);
@@ -1078,17 +1142,7 @@ impl StreamingBmuxClient {
         }
 
         let send_started = std::time::Instant::now();
-        match tokio::time::timeout(self.timeout, self.writer.send_envelope(&envelope)).await {
-            Ok(Ok(())) => {}
-            result => {
-                self.pending.lock().await.remove(&request_id);
-                return Err(match result {
-                    Ok(Err(error)) => ClientError::Transport(error),
-                    Err(_) => ClientError::Timeout(self.timeout),
-                    Ok(Ok(())) => unreachable!(),
-                });
-            }
-        }
+        self.send_pending_request(request_id, &envelope).await?;
         let send_us = send_started.elapsed().as_micros();
 
         let timeout = self.timeout;
@@ -1188,6 +1242,7 @@ impl StreamingBmuxClient {
     ///
     /// Returns an error if the frame cannot be written to the transport.
     pub async fn send_one_way(&mut self, request: Request) -> Result<()> {
+        validate_service_representation(self.checked_service_contracts, &request)?;
         let request_id = self.take_request_id();
         let request_kind = request_kind_name(&request);
         trace!(
@@ -1441,6 +1496,10 @@ impl StreamingBmuxClient {
 }
 
 impl TypedDispatchClient for StreamingBmuxClient {
+    fn requires_service_contracts(&self) -> bool {
+        self.checked_service_contracts
+    }
+
     fn invoke_service_raw(
         &mut self,
         capability: &str,
@@ -1747,6 +1806,25 @@ mod tests {
     use tempfile::TempDir;
     use uuid::Uuid;
 
+    #[test]
+    fn checked_guard_rejects_raw_and_pipeline_bypass() {
+        let raw = bmux_ipc::Request::InvokeService {
+            capability: "example.read".into(),
+            kind: bmux_ipc::InvokeServiceKind::Query,
+            interface_id: "state/v1".into(),
+            operation: "get".into(),
+            payload: vec![],
+        };
+        assert!(super::validate_service_representation(false, &raw).is_ok());
+        assert!(super::validate_service_representation(true, &raw).is_err());
+        let mut checked = raw;
+        if let bmux_ipc::Request::InvokeService { payload, .. } = &mut checked {
+            *payload = bmux_plugin_sdk::service_contract::encode(b"contract", b"request").unwrap();
+        }
+        assert!(super::validate_service_representation(true, &checked).is_ok());
+        assert!(super::validate_service_representation(true, &bmux_ipc::Request::Ping).is_ok());
+    }
+
     fn temp_dir() -> TempDir {
         tempfile::Builder::new()
             .prefix("bmux-client-test-")
@@ -1807,6 +1885,7 @@ mod tests {
                         next_request_id: 1,
                         principal_id,
                         negotiated_protocol: None,
+                        checked_service_contracts: false,
                     })
                 },
             )
@@ -1843,6 +1922,7 @@ mod tests {
             next_request_id: 1,
             principal_id,
             negotiated_protocol: None,
+            checked_service_contracts: false,
         };
 
         let streaming =

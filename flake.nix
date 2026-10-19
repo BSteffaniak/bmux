@@ -107,24 +107,56 @@
         # Native non-Nix CI can consume this value instead of floating rustup stable.
         rustVersion = rustToolchain.version;
         devShells.default = pkgs.mkShell {
-          buildInputs = with pkgs; [
-            rustToolchain
-            cargo-deny
-            cargo-nextest
-            rust-analyzer
-            cargo-ndk
-            cargoMachete
-            markdownlint-cli
-            pkg-config
-            openssl
-            jdk21_headless
-            fish
-            codeql
-            python3
-            gh
-            hcloud
-            liveOpenTofu
-          ];
+          buildInputs =
+            with pkgs;
+            [
+              rustToolchain
+              cargo-deny
+              cargo-nextest
+              rust-analyzer
+              cargo-ndk
+              cargoMachete
+              markdownlint-cli
+              pkg-config
+              openssl
+              jdk21_headless
+              fish
+              codeql
+              python3
+              gh
+              hcloud
+              liveOpenTofu
+            ]
+            ++ pkgs.lib.optionals pkgs.stdenv.isLinux (
+              with pkgs;
+              [
+                libxkbcommon
+                wayland
+                libGL
+                vulkan-loader
+                libx11
+                libxcursor
+                libxi
+                libxrandr
+              ]
+            );
+
+          # Native dependencies remain development-shell inputs, never server crates.
+          LD_LIBRARY_PATH = pkgs.lib.optionalString pkgs.stdenv.isLinux (
+            pkgs.lib.makeLibraryPath (
+              with pkgs;
+              [
+                libxkbcommon
+                wayland
+                libGL
+                vulkan-loader
+                libx11
+                libxcursor
+                libxi
+                libxrandr
+              ]
+            )
+          );
 
           shellHook = ''
             for override in RUSTC_WRAPPER RUSTC_WORKSPACE_WRAPPER; do

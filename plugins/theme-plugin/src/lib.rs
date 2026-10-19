@@ -21,9 +21,21 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use tracing::{info, warn};
 
+mod appearance_wire;
+
 mod control_contract {
     bmux_plugin_schema_macros::schema! { source: "bpdl/theme-plugin.bpdl" }
 }
+
+/// Exact generated contract for checked theme-state and theme-control-v1 calls.
+///
+/// After negotiating `core.service_contract.v1`, callers using the legacy
+/// `theme-state` transport wrap their existing `encode_service_message` bytes
+/// with `bmux_plugin_sdk::service_contract::encode(SERVICE_CONTRACT, payload)`.
+/// Successful responses must pass `service_contract::decode_response` before
+/// decoding as `bmux_appearance::RuntimeAppearance`. Generated clients do this
+/// automatically. This evidence covers the full nested appearance wire shape.
+pub use control_contract::SERVICE_CONTRACT;
 
 const STORAGE_SELECTED_APPEARANCE: &str = "selected_theme";
 // Picker values are namespaced separately from catalog names.
@@ -913,7 +925,7 @@ impl ThemePlugin {
 }
 
 impl RustPlugin for ThemePlugin {
-    type Contract = bmux_plugin_sdk::NoPluginContract;
+    type Contract = control_contract::Contract;
 
     fn activate(&mut self, context: NativeLifecycleContext) -> Result<i32, PluginCommandError> {
         info!(
@@ -1010,16 +1022,16 @@ impl RustPlugin for ThemePlugin {
                     ServiceResponse::error("theme_not_found", "active theme was not found")
                 })?;
                 info!("active runtime appearance service returned resolved theme appearance");
-                Ok(appearance)
+                Ok(control_contract::theme_state::Appearance::from(appearance))
             },
-            "theme-state", "active-appearance-for-cwd" => |req: ActiveAppearanceForCwdArgs, ctx| {
+            "theme-state", "active-appearance-for-cwd" => |req: control_contract::theme_state::client::ActiveAppearanceForCwdRequest, ctx| {
                 let appearance = active_runtime_appearance_for_cwd(ctx, &req.cwd).ok_or_else(|| {
                     ServiceResponse::error("theme_not_found", "active theme was not found for cwd")
                 })?;
                 info!(cwd = %req.cwd, "active runtime appearance service returned cwd-scoped theme appearance");
-                Ok(appearance)
+                Ok(control_contract::theme_state::Appearance::from(appearance))
             },
-            "theme-state", "active-appearance-for-scope" => |req: ActiveAppearanceForScopeArgs, ctx| {
+            "theme-state", "active-appearance-for-scope" => |req: control_contract::theme_state::client::ActiveAppearanceForScopeRequest, ctx| {
                 let target = ConfigScopeTarget {
                     name: req.scope,
                     attributes: req.attributes,
@@ -1028,7 +1040,7 @@ impl RustPlugin for ThemePlugin {
                     ServiceResponse::error("theme_not_found", "active theme was not found for scope")
                 })?;
                 info!("active runtime appearance service returned scope-scoped theme appearance");
-                Ok(appearance)
+                Ok(control_contract::theme_state::Appearance::from(appearance))
             },
         })
     }
@@ -1332,17 +1344,6 @@ struct ActiveThemeResolution {
 struct ApplyThemeExtensionArgs {
     toml: String,
     config_dir_candidates: Vec<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct ActiveAppearanceForCwdArgs {
-    cwd: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct ActiveAppearanceForScopeArgs {
-    scope: String,
-    attributes: BTreeMap<String, String>,
 }
 
 trait ThemeHostContext: HostRuntimeApi {
@@ -3263,6 +3264,148 @@ mod tests {
     };
     use std::sync::{Arc, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[derive(Default)]
+    struct CountedTheme {
+        plugin: ThemePlugin,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl RustPlugin for CountedTheme {
+        type Contract = <ThemePlugin as RustPlugin>::Contract;
+
+        fn invoke_service(&self, context: NativeServiceContext) -> ServiceResponse {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.plugin.invoke_service(context)
+        }
+    }
+
+    #[test]
+    fn checked_theme_mismatch_prevents_actual_provider_invocation() {
+        use bmux_plugin_sdk::{PluginContract, PluginInvocationId, ServiceEnvelopeKind};
+        let plugin = Box::leak(Box::new(std::sync::RwLock::new(CountedTheme::default())));
+        assert_eq!(
+            <<ThemePlugin as RustPlugin>::Contract as PluginContract>::service_contract(),
+            SERVICE_CONTRACT,
+        );
+        assert!(!SERVICE_CONTRACT.is_empty());
+        assert!(bmux_plugin_sdk::service_contract::encode(&[], b"request").is_err());
+        assert!(bmux_plugin_sdk::service_contract::decode_response(b"legacy response").is_err());
+        for (contract, expected_status, expected_calls) in [
+            (b"incompatible-appearance".as_slice(), 3, 0),
+            (SERVICE_CONTRACT, 0, 1),
+        ] {
+            let mut context = service_context(None);
+            context.request.payload =
+                bmux_plugin_sdk::service_contract::encode(contract, &context.request.payload)
+                    .unwrap();
+            let request = bmux_plugin_sdk::encode_service_envelope_with_invocation_id(
+                PluginInvocationId::new(),
+                1,
+                ServiceEnvelopeKind::Request,
+                &context,
+            )
+            .unwrap();
+            let mut output = vec![0; 65536];
+            let mut output_len = 0;
+            let status = bmux_plugin_sdk::__private::invoke_service_export(
+                plugin,
+                request.as_ptr(),
+                request.len(),
+                output.as_mut_ptr(),
+                output.len(),
+                &raw mut output_len,
+            );
+            assert_eq!(status, expected_status);
+            assert_eq!(
+                plugin
+                    .read()
+                    .unwrap()
+                    .calls
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                expected_calls
+            );
+            if expected_calls == 0 {
+                assert_eq!(output_len, 0);
+            } else {
+                let (_, _, response): (_, _, ServiceResponse) =
+                    bmux_plugin_sdk::decode_service_envelope_with_invocation_id(
+                        &output[..output_len],
+                        ServiceEnvelopeKind::Response,
+                    )
+                    .unwrap();
+                assert!(response.error.is_none(), "{:?}", response.error);
+                let payload =
+                    bmux_plugin_sdk::service_contract::decode_response(&response.payload).unwrap();
+                let _: RuntimeAppearance = decode_service_message(payload).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn generated_appearance_preserves_neutral_wire_shape() {
+        let mut appearance = RuntimeAppearance::default();
+        appearance.content_effects.insert(
+            "base".into(),
+            bmux_appearance::RuntimeContentEffect {
+                background_blend: Some(bmux_appearance::RuntimeContentBlend {
+                    color: "#123456".into(),
+                    amount_permille: 750,
+                }),
+                ..Default::default()
+            },
+        );
+        let patch = RuntimeAppearancePatch {
+            foreground: Some("#abcdef".into()),
+            content_effects: BTreeMap::from([(
+                "base".into(),
+                RuntimeContentEffectPatch {
+                    enabled: Some(false),
+                    scope: Some(RuntimeContentEffectScope::Cells),
+                    when_bg: Some(RuntimeContentEffectBgPredicate::Default),
+                    background_blend: RuntimeContentBlendPatch {
+                        color: Some("#112233".into()),
+                        amount_permille: Some(125),
+                    },
+                },
+            )]),
+            ..Default::default()
+        };
+        appearance.modes.insert("copy".into(), patch);
+        let generated = control_contract::theme_state::Appearance::from(appearance.clone());
+        assert_eq!(
+            encode_service_message(&generated).unwrap(),
+            encode_service_message(&appearance).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(&generated).unwrap(),
+            serde_json::to_value(&appearance).unwrap()
+        );
+        let decoded: RuntimeAppearance =
+            decode_service_message(&encode_service_message(&generated).unwrap()).unwrap();
+        assert_eq!(decoded, appearance);
+    }
+
+    #[test]
+    fn generated_scope_requests_preserve_legacy_wire_shape() {
+        #[derive(Serialize)]
+        struct LegacyScope {
+            scope: String,
+            attributes: BTreeMap<String, String>,
+        }
+        let legacy = LegacyScope {
+            scope: "directory".into(),
+            attributes: BTreeMap::from([("cwd".into(), "/project".into())]),
+        };
+        let generated = control_contract::theme_state::client::ActiveAppearanceForScopeRequest {
+            scope: legacy.scope.clone(),
+            attributes: legacy.attributes.clone(),
+        };
+        assert_eq!(
+            encode_service_message(&generated).unwrap(),
+            encode_service_message(&legacy).unwrap()
+        );
+    }
 
     fn temp_theme_dir(label: &str) -> std::path::PathBuf {
         let unique = format!(

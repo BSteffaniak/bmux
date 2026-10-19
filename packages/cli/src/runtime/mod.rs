@@ -47,6 +47,7 @@ mod session_cli;
 mod session_follow;
 pub mod slot;
 mod slot_cli;
+mod startup_ownership;
 mod terminal_doctor;
 mod terminal_protocol;
 mod web_attach;
@@ -178,6 +179,13 @@ pub fn active_runtime_name() -> String {
 
 pub fn append_runtime_arg(command: &mut ProcessCommand) {
     command.arg("--runtime").arg(active_runtime_name());
+}
+
+pub fn initialize_native_plugins(
+    config: &BmuxConfig,
+    paths: &bmux_config::ConfigPaths,
+) -> Result<()> {
+    plugin_runtime::initialize_native_runtime_state(config.clone(), paths.clone())
 }
 
 pub async fn run_attach_with_client(

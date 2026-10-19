@@ -3116,6 +3116,49 @@ impl BmuxConfig {
         Self::load_from_path_with_overrides(&paths.config_file(), overrides)
     }
 
+    /// Load only the explicitly selected runtime's configuration layers.
+    ///
+    /// Unlike legacy discovered loading, this never reads process-scoped overrides,
+    /// ambient `BMUX_CONFIG`, or the default runtime's mutable overlay. Precedence
+    /// is base, primary, selected state overlay, explicit environment overlay, CLI.
+    /// Missing optional base/primary/state files are allowed; selected overlay
+    /// files must exist. The caller owns capture of environment-derived overrides.
+    ///
+    /// # Errors
+    /// Returns an error when an explicitly selected overlay is missing or any
+    /// selected configuration layer cannot be read, parsed, or resolved.
+    pub fn load_isolated_with_paths_and_overrides(
+        paths: &ConfigPaths,
+        overrides: &ConfigLoadOverrides,
+    ) -> Result<Self> {
+        let mut merged = toml::Value::Table(toml::Table::new());
+        let mut loaded_any = false;
+        let optional_paths = [
+            overrides.base_config_path.clone(),
+            Some(paths.config_file()),
+            Some(paths.state_config_file()),
+        ];
+        for path in optional_paths.into_iter().flatten() {
+            if path.exists() {
+                merge_toml_value(&mut merged, load_toml_file(&path)?);
+                loaded_any = true;
+            }
+        }
+        for path in [&overrides.env_config_path, &overrides.cli_config_path]
+            .into_iter()
+            .flatten()
+        {
+            if !path.exists() {
+                return Err(ConfigError::FileNotFound { path: path.clone() });
+            }
+            merge_toml_value(&mut merged, load_toml_file(path)?);
+            loaded_any = true;
+        }
+        let (config, _) =
+            Self::load_from_raw_value_with_resolution(loaded_any.then_some(merged), None)?;
+        Ok(config)
+    }
+
     /// Load configuration and include composition metadata using explicit overrides.
     ///
     /// # Errors
