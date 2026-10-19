@@ -163,7 +163,7 @@ def verify_environment(repo, environment, run=command):
     try:
         data = json.loads(run(['gh', 'api', f'repos/{repo}/environments/{urllib.parse.quote(environment, safe="")}']))
     except BootstrapError:
-        raise BootstrapError(f'Cannot inspect required environment {environment}; create it in repository Settings > Environments, then configure master-only branch protection; never auto-rewrite protections') from None
+        raise BootstrapError(f'Cannot inspect required environment {environment}; apply infra/live-github first') from None
     # Never PUT the environment: do not accidentally replace/erase existing protections.
     policy = data.get('deployment_branch_policy') or {}
     if not policy.get('custom_branch_policies'):
@@ -404,17 +404,12 @@ def state_bootstrap(args, run, pending, environ):
         raise BootstrapError('State review/apply/reconcile requires exact --state-operation')
     if operation and not re.fullmatch(r'[a-f0-9]{32}', operation):
         raise BootstrapError('Invalid state operation identity')
-    if (operation and (args.state_dir / 'github-environments' / (operation + '.json')).exists()
-            and not getattr(args, '_github', None)):
-        raise BootstrapError('This operation includes GitHub setup; retain --approval-reviewer selection')
     if mode == 'apply' and not args.accept_cost:
         raise BootstrapError('State apply requires explicit --accept-cost')
     fresh_backend = False
     if mode == 'plan':
         result = json.loads(run(base + ['--plan']))
         validate_state_result(result, args, result.get('operation'), ('planned',))
-        if getattr(args, '_github', None):
-            args._github.plan(result['operation'])
     else:
         review_base = base
         reviewed = json.loads(run(review_base + ['--review', operation])) if mode != 'reconcile' else None
@@ -425,8 +420,6 @@ def state_bootstrap(args, run, pending, environ):
             # An existing receipt must match the original completed operation before any GitHub mutation.
             receipt = json.loads(run(base + ['--review', operation, '--completion-file', str(completion)]))
             validate_state_result(receipt, args, operation, ('complete',))
-        if getattr(args, '_github', None):
-            args._github.execute(operation, mode)
         flags = ['--' + mode, operation]
         if mode == 'apply':
             flags.append('--accept-cost')
@@ -482,22 +475,8 @@ def retained_credential(args, name, create):
 
 
 def provision(args, run=command, environ=None, cloudflare=None):
-    if not getattr(args, 'approval_reviewer', None) or args.dry_run:
-        return provision_selected(args, run, environ, cloudflare)
-    if getattr(args, 'input_env', False) or not getattr(args, 'bootstrap_state', False):
-        raise BootstrapError('--approval-reviewer requires --bootstrap-state, not --input-env')
-    if not args.state_dir or not args.state_dir.is_absolute():
-        raise BootstrapError('Environment setup requires absolute private --state-dir')
-    spec = importlib.util.spec_from_file_location('live_github', Path(__file__).with_name('live-github-environments.py'))
-    github = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(github)
-    try:
-        github.local.private_dir(args.state_dir)
-        with github.local.lock(args.state_dir / 'github-environments'):
-            args._github = github.Environments(args, run)
-            return provision_selected(args, run, environ, cloudflare)
-    except github.Error as error:
-        raise BootstrapError(str(error)) from None
+    # Environment/branch policy resources are exclusively owned by infra/live-github.
+    return provision_selected(args, run, environ, cloudflare)
 
 
 def provision_selected(args, run=command, environ=None, cloudflare=None):
@@ -515,18 +494,14 @@ def provision_selected(args, run=command, environ=None, cloudflare=None):
         print(json.dumps({'repo': args.repo, 'environment': args.environment,
                           'mode': 'replace-selected' if args.rotate else 'skip-existing',
                           'secrets': selected, 'provider_requests': False,
-                          'protections': ('plan/review/apply master-only environments; explicit conflict approval'
-                                          if getattr(args, 'approval_reviewer', None) else 'verify only; never weaken'),
+                          'protections': 'verify only; managed by infra/live-github',
                           'approval_reviewer': getattr(args, 'approval_reviewer', None),
                           'state_mode': getattr(args, 'state_mode', 'plan')}))
         return
-    github = getattr(args, '_github', None)
-    if github is None:
-        verify_environment(args.repo, args.environment, run)
-        verify_environment(args.repo, 'production-approval', run)
-    existing = ({s['name'] for s in json.loads(run(['gh', 'secret', 'list', '--repo', args.repo,
+    verify_environment(args.repo, args.environment, run)
+    verify_environment(args.repo, 'production-approval', run)
+    existing = {s['name'] for s in json.loads(run(['gh', 'secret', 'list', '--repo', args.repo,
                                                  '--env', args.environment, '--json', 'name']))}
-                if github is None or github.current[args.environment] is not None else set())
     pending = [name for name in selected if args.rotate or name not in existing]
     if any(name in existing or environ.get(name) for name in ('LIVE_STATE_ROLE_ARN', 'LIVE_STATE_ACCESS_KEY_ID', 'LIVE_STATE_SECRET_ACCESS_KEY')):
         raise BootstrapError('Legacy AWS backend configured; manual state migration required')
@@ -650,9 +625,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--repo', required=True)
     parser.add_argument('--environment', default='Production')
-    parser.add_argument('--approval-reviewer', help='GitHub user login; manage environments in the state plan/review/apply')
+    parser.add_argument('--approval-reviewer', help='Deprecated: environments are managed by infra/live-github')
     parser.add_argument('--approve-environment-changes', action='store_true',
-                        help='Explicitly approve planned changes to existing GitHub environment protections')
+                        help='Deprecated: use infra/live-github to change environment protections')
     parser.add_argument('--zone', default='bmux.dev')
     parser.add_argument('--hostname')
     parser.add_argument('--pages-project', default='bmux')
@@ -676,10 +651,8 @@ def main():
         parser.error('--repo must be OWNER/REPO')
     if not re.fullmatch(r'[A-Za-z0-9_. -]{1,64}', args.environment):
         parser.error('invalid environment name')
-    if args.approval_reviewer and (not args.bootstrap_state or args.input_env):
-        parser.error('--approval-reviewer requires --bootstrap-state, not --input-env')
-    if args.approve_environment_changes and not args.approval_reviewer:
-        parser.error('--approve-environment-changes requires --approval-reviewer')
+    if args.approval_reviewer or args.approve_environment_changes:
+        parser.error('Environment mutation moved to infra/live-github; apply that root first')
     try:
         provision(args)
     except BootstrapError as error:

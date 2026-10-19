@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Guide missing Fly configuration installation; never create resources or deploy.
+"""Install missing Fly credentials after infra/live-github; never provision or deploy.
 
 Secrets travel only through private prompts/environment, HTTPS headers and gh stdin.
 No credentials or resume files are written. Existing repository values win.
@@ -96,6 +96,8 @@ def run_gh(command, *, input, env, check, capture_output, timeout):
 
 
 def gh(kind, action, repo, name=None, value=None):
+    if kind != 'secret' and action != 'list':
+        raise ValueError('Public configuration is owned by infra/live-github')
     command = ['gh', kind, action]
     if name:
         command.append(name)
@@ -171,20 +173,9 @@ def discover(token):
     return sorted(organizations), sorted(available)
 
 
-def select(label, choices):
-    for index, choice in enumerate(choices, 1):
-        print(f'{index}. {choice}')
-    answer = input(f'{label} (number or exact value; blank cancels): ').strip()
-    if answer in choices:
-        return answer
-    if answer.isascii() and answer.isdigit() and len(answer) <= 3 and 1 <= int(answer) <= len(choices):
-        return choices[int(answer) - 1]
-    raise ValueError('Selection cancelled or invalid')
-
-
 def next_step(repo):
     print('Manual next command (not dispatched; local setup authorizes no deployment spending):')
-    print(f'gh workflow run live-promote.yml --repo {repo} --ref master -f migrate=true')
+    print(f'gh workflow run configure-production-infra.yml --repo {repo} --ref master')
     print('Review the workflow preview, then approve production-approval to proceed.')
 
 
@@ -197,6 +188,8 @@ def install(repo, approve):
     if not (missing_secrets or missing_vars):
         next_step(repo)
         return
+    if missing_vars:
+        raise ValueError('Apply public Fly configuration with infra/live-github before installing credentials')
     if not approve:
         return
     token = os.environ.get('FLY_API_TOKEN')
@@ -206,20 +199,10 @@ def install(repo, approve):
         raise ValueError('Invalid token')
     organizations, regions = discover(token)
     config = {name: existing[name] for name in VARIABLES if name in existing}
-    if 'LIVE_FLY_ORG' not in config:
-        config['LIVE_FLY_ORG'] = select('Fly organization', organizations)
-    if config['LIVE_FLY_ORG'] not in organizations:
-        raise ValueError('Existing organization unavailable; not overwritten')
-    if 'LIVE_FLY_REGION' not in config:
-        config['LIVE_FLY_REGION'] = select('Fly region', regions)
-    if config['LIVE_FLY_REGION'] not in regions:
-        raise ValueError('Existing region unavailable; not overwritten')
-    if 'LIVE_FLY_APP' not in config:
-        config['LIVE_FLY_APP'] = input('New Fly app name (blank cancels): ').strip()
+    if config['LIVE_FLY_ORG'] not in organizations or config['LIVE_FLY_REGION'] not in regions:
+        raise ValueError('Terraform-managed Fly configuration unavailable; review infra/live-github')
     if not valid_name(config['LIVE_FLY_APP']):
         raise ValueError('Invalid app name')
-    if graphql(token, AVAILABILITY, {'name': config['LIVE_FLY_APP']}).get('appNameAvailable') is not True:
-        raise ValueError('App unavailable; no implicit adoption')
     values = {}
     if 'FLY_API_TOKEN' in missing_secrets:
         values['FLY_API_TOKEN'] = token
@@ -239,14 +222,13 @@ def install(repo, approve):
         raise ValueError('Installation cancelled')
     # Re-read before each write. If a concurrent installer changed any selected
     # public config, stop; never overwrite a newly observed secret or variable.
-    for kind, pending in [('variable', {n: config[n] for n in missing_vars}), ('secret', values)]:
-        for name, value in sorted(pending.items()):
-            current = gh('variable', 'list', repo)
-            if any(n in current and current[n] != v for n, v in config.items()):
-                raise ValueError('Configuration changed during installation')
-            inventory = current if kind == 'variable' else gh('secret', 'list', repo)
-            if name not in inventory:
-                gh(kind, 'set', repo, name, value)
+    for name, value in sorted(values.items()):
+        current = gh('variable', 'list', repo)
+        if any(current.get(n) != v for n, v in config.items()):
+            raise ValueError('Configuration changed during installation')
+        inventory = gh('secret', 'list', repo)
+        if name not in inventory:
+            gh('secret', 'set', repo, name, value)
     print('Missing Fly configuration installed. No deployment dispatched.')
     next_step(repo)
 

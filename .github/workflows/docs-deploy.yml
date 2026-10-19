@@ -37,9 +37,11 @@ jobs:
             ${{ runner.temp }}/site-candidate.tar.gz.sha256
           retention-days: 14
           if-no-files-found: error
+  # A same-run release candidate inherits the parent's successful shared gate.
+  # Independent site repair still requires its own review below.
   approve:
     if: >-
-      always() && (github.event_name != 'push' || inputs.publish_candidate) && github.ref == 'refs/heads/master' &&
+      always() && !inputs.publish_candidate && github.event_name != 'push' && github.ref == 'refs/heads/master' &&
       github.repository == 'BSteffaniak/bmux' &&
       ((inputs.publish_candidate && needs.build.result == 'skipped') || (!inputs.publish_candidate && needs.build.result == 'success'))
     needs: build
@@ -50,7 +52,10 @@ jobs:
   deploy:
     if: >-
       always() && (github.event_name != 'push' || inputs.publish_candidate) && github.ref == 'refs/heads/master' &&
-      github.repository == 'BSteffaniak/bmux' && needs.approve.result == 'success' &&
+      github.repository == 'BSteffaniak/bmux' &&
+      ((inputs.publish_candidate && needs.approve.result == 'skipped' &&
+        github.workflow_ref == 'BSteffaniak/bmux/.github/workflows/live-promote.yml@refs/heads/master') ||
+       (!inputs.publish_candidate && needs.approve.result == 'success')) &&
       ((inputs.publish_candidate && needs.build.result == 'skipped') || (!inputs.publish_candidate && needs.build.result == 'success'))
     needs: [build, approve]
     environment: Production

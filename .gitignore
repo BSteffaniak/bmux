@@ -31,6 +31,12 @@ node_modules
 infra/terraform/.terraform/
 infra/terraform/*.tfstate
 infra/terraform/*.tfstate.backup
+infra/live-github/.terraform/
+infra/live-github/*.tfstate*
+infra/live-github/*.tfplan
+infra/live-github/*.tfvars
+infra/live-github/*.tfvars.json
+infra/live-github/crash*.log
 infra/wrangler/.wrangler/
 
 __pycache__/

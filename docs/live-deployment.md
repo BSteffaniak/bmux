@@ -54,8 +54,10 @@ Each candidate is inventory verified; archive checksums and revision must match
 before deployment. Image transfer preserves the OCI digest. Deployment never
 recompiles the backend or rebuilds the site with production secrets.
 
-The `Production` environment supplies credentials; `production-approval` remains
-the explicit approval gate. Infrastructure uses `bmux-production-infrastructure`
+The `Production` environment supplies credentials without another review;
+`production-approval` is the single shared backend/frontend approval gate. The
+parent's approved same-run release skips the site publisher's duplicate gate;
+independent site repair still requires one approval. Infrastructure uses `bmux-production-infrastructure`
 concurrency with cancellation disabled; Pages uses `bmux-production-pages`.
 Do not add caller locks around reusable workflows that already own their lock.
 
@@ -65,6 +67,14 @@ from a hard-coded historical run. If only site publication fails, retry the site
 publisher rather than repeating backend setup or recovery.
 
 ## Initial installation and explicit configuration
+
+Initial installation starts with the admin-only OpenTofu root in
+[`infra/live-github`](../infra/live-github/README.md). It owns GitHub environments,
+approval protection, master-only policies and public Fly repository variables.
+Existing resources must be explicitly adopted using its import inputs before
+applying; do not recreate them. The former Python environment mutation ledger is
+no longer used. Setup scripts only verify this configuration and deliver private
+credentials; credentials stay out of Terraform state.
 
 First installation is a different operation from normal release. The guided
 `scripts/setup-live.sh` / `setup-live.py`, Fly setup, state provisioning and

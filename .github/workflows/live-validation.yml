@@ -24,6 +24,10 @@ jobs:
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           tofu -chdir=infra/live-terraform init -backend=false -input=false -lockfile=readonly
           tofu -chdir=infra/live-terraform fmt -check
+          tofu -chdir=infra/live-github init -backend=false -input=false -lockfile=readonly
+          tofu -chdir=infra/live-github fmt -check -recursive
+          tofu -chdir=infra/live-github validate
+          tofu -chdir=infra/live-github test
           tofu -chdir=infra/live-terraform validate
           python3 scripts/test-live-bootstrap.py
           python3 scripts/test-live-github-environments.py

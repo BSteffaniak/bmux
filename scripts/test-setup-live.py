@@ -32,6 +32,7 @@ class SetupTests(unittest.TestCase):
         self.args = argparse.Namespace(repo='owner/repo', approval_reviewer='owner', bucket='bmux-opentofu-state',
             state_dir=self.root, publisher_key_file=self.root / 'publisher-key')
         self.gh = fakes.GitHub()
+        fakes.seed(self.gh)
         self.cf = state.CF()
         self.creations = []
         self.backend_calls = []
@@ -172,7 +173,7 @@ class SetupTests(unittest.TestCase):
         self.assertEqual(len(self.backend_calls), before)
 
     def test_partial_preexisting_state_credentials_block_empty_backend(self):
-        self.gh.envs['Production'] = dict(id=3, config=dict(can_admins_bypass=False), branches=[])
+        fakes.seed(self.gh)
         self.gh.secrets['LIVE_STATE_BUCKET'] = 'existing'
         with self.assertRaises(s.Error):
             self.setup.execute()

@@ -88,9 +88,23 @@ class DeploymentBoundaryTests(unittest.TestCase):
                           'smoke-pty-runtime.sh', 'compat-matrix.sh', 'smoke-live-local.py'):
             self.assertNotIn(forbidden, docs)
 
+    def test_shared_release_uses_one_gate_but_standalone_site_requires_review(self):
+        release = (ROOT / '.github/workflows/live-promote.yml').read_text()
+        docs = (ROOT / '.github/workflows/docs-deploy.yml').read_text()
+        approval = docs.split('  approve:\n', 1)[1].split('  deploy:\n', 1)[0]
+        deploy = docs.split('  deploy:\n', 1)[1]
+        self.assertIn('!inputs.publish_candidate', approval)
+        self.assertIn("inputs.publish_candidate && needs.approve.result == 'skipped'", deploy)
+        self.assertIn("!inputs.publish_candidate && needs.approve.result == 'success'", deploy)
+        self.assertIn("github.workflow_ref == 'BSteffaniak/bmux/.github/workflows/live-promote.yml@refs/heads/master'", deploy)
+        self.assertIn("needs.production.result == 'success'", release.split('  site:\n', 1)[1])
+        self.assertIn('publish_candidate: true', release.split('  site:\n', 1)[1])
+        self.assertEqual(release.count('environment: production-approval'), 1)
+        self.assertIn("needs.approve.result == 'success'", release.split('  production:\n', 1)[1])
+
     def test_site_and_backend_have_separate_publishers(self):
         workflow = (ROOT / '.github/workflows/docs-deploy.yml').read_text()
-        for forbidden in ('live-promote.yml', 'live-deploy.sh', 'R2_STATE_', 'TOFU_', 'setup-opentofu'):
+        for forbidden in ('live-deploy.sh', 'R2_STATE_', 'TOFU_', 'setup-opentofu'):
             self.assertNotIn(forbidden, workflow)
         for required in ('build-site-artifact.sh', 'pages deploy site', '--component site',
                          'bmux-production-pages', 'sha256sum -c SHA256SUMS',

@@ -213,6 +213,8 @@ class Setup:
             b.provision(args, self.run, self.env, cloudflare=self.cloudflare)
 
     def execute(self):
+        # Fail before costs or credential generation if IaC has not been applied.
+        g.Environments(self.bootstrap_args(), self.run).verify()
         with local.lock(self.root / 'setup-lock'):
             return self.locked()
 
@@ -236,7 +238,7 @@ class Setup:
             check = self.bootstrap_args()
             # Verify selected protections without requiring a Cloudflare provisioning token.
             manager = g.Environments(check, self.run)
-            manager.execute(record['operation'], 'reconcile')
+            manager.verify()
             self.ready()
             print('Cloudflare/R2 setup verified; existing credentials unchanged. Fly setup is separate. No deployment dispatched.')
             return
@@ -279,21 +281,14 @@ class Setup:
         if record and record['operation'] != operation:
             raise Error('Setup and backend operation identities differ')
         args.state_operation = operation
-        env_path = self.root / 'github-environments' / (operation + '.json')
-        if not env_path.exists():
-            # Recover interruption between backend plan and its read-only GitHub plan save.
-            with local.lock(self.root / 'github-environments'):
-                g.Environments(args, self.run).plan(operation)
         record = dict(schema=1, binding=self.binding, phase='planned' if record is None else record['phase'], operation=operation)
         local.save(self.record_path, record)
         args.state_mode = 'review'
         self.invoke(args)
-        github_plan = local.private_read(env_path)
         print(json.dumps(dict(repository=self.args.repo, reviewer=self.args.approval_reviewer, backend=choices,
-                              bucket_changes=ledger['resources'], environments_before=github_plan['before'],
-                              environments_desired=github_plan['desired'],
+                              bucket_changes=ledger['resources'], environments='managed by infra/live-github',
                               secrets_to_install=sorted(required - names)), indent=2))
-        confirm('Apply/resume this exact setup, including displayed environment changes and possible Cloudflare costs?')
+        confirm('Apply/resume this exact setup, including possible Cloudflare costs?')
         if 'TOFU_STATE_ENCRYPTION_PASSPHRASE' not in names:
             def passphrase():
                 value = secret('Original/high-entropy state encryption passphrase from your password manager')
@@ -316,8 +311,7 @@ class Setup:
         self.invoke(args)
         if not required <= self.names():
             raise Error('Secret installation incomplete; rerun same command to resume retained credentials')
-        with local.lock(self.root / 'github-environments'):
-            g.Environments(args, self.run).execute(operation, 'reconcile')
+        g.Environments(args, self.run).verify()
         self.ready()
         record['phase'] = 'complete'
         local.save(self.record_path, record)

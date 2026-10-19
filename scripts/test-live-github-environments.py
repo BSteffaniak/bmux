@@ -87,227 +87,70 @@ class GitHub:
         return [(cmd, body) for cmd, body in self.calls if '--method' in cmd or cmd[:3] == ['gh', 'secret', 'set']]
 
 
+def seed(gh):
+    """Fixture represents already-applied infra/live-github resources."""
+    for i, name in enumerate(('Production', 'production-approval')):
+        gh.envs[name] = dict(id=100 + i, config=dict(wait_timer=0,
+            reviewers=[dict(type='User', id=7)] if name == 'production-approval' else [],
+            prevent_self_review=False, can_admins_bypass=False,
+            deployment_branch_policy=dict(protected_branches=False, custom_branch_policies=True)),
+            branches=[dict(id=200 + i, name='master', type='branch')])
+
+
 class EnvironmentTests(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temp.cleanup)
-        self.args = argparse.Namespace(repo='owner/repo', environment='Production', approval_reviewer='owner',
-            approve_environment_changes=False, state_dir=Path(self.temp.name), state_operation=OP,
-            bootstrap_state=True, state_mode='plan', dry_run=False, input_env=False, only=['LIVE_HOSTNAME'],
-            rotate=False, zone='bmux.dev', hostname=None, pages_project='bmux', publisher_key_file=None,
-            state_bucket=None, state_account_id=None, state_region='auto', approve_import=False,
-            state_completion_file=None, accept_cost=True)
         self.gh = GitHub()
-        g.local.private_dir(self.args.state_dir / 'github-environments')
-        self.output = contextlib.redirect_stdout(io.StringIO())
-        self.output.__enter__()
-        self.addCleanup(self.output.__exit__, None, None, None)
+        seed(self.gh)
+        self.args = argparse.Namespace(repo='owner/repo', environment='Production',
+            approval_reviewer='owner', state_dir=Path('/unused'))
 
-    def manager(self):
-        return g.Environments(self.args, self.gh.run)
+    def verify(self):
+        g.Environments(self.args, self.gh.run).verify()
 
-    def plan(self):
-        self.manager().plan(OP)
-
-    def review_apply(self):
-        self.manager().execute(OP, 'review')
-        self.manager().execute(OP, 'apply')
-
-    def seeded(self):
-        self.plan()
-        self.review_apply()
-        self.gh.calls.clear()
-        (self.args.state_dir / 'github-environments' / (OP + '.json')).unlink()
-
-    def test_missing_plan_review_read_only_apply_and_rerun_noop(self):
-        self.plan()
-        self.manager().execute(OP, 'review')
-        self.assertEqual(self.gh.writes(), [])
-        self.manager().execute(OP, 'apply')
-        self.assertEqual(set(self.gh.envs), {'Production', 'production-approval'})
-        for name, value in self.gh.envs.items():
-            self.assertEqual([dict(name=v['name'], type=v['type']) for v in value['branches']], [dict(name='master', type='branch')])
-            self.assertFalse(value['config']['can_admins_bypass'])
-            self.assertFalse(value['config']['prevent_self_review'])
-            self.assertEqual(value['config']['reviewers'], [dict(type='User', id=7)] if name == 'production-approval' else [])
-        self.gh.calls.clear()
-        self.manager().execute(OP, 'apply')
-        self.manager().execute(OP, 'reconcile')
+    def test_applied_environments_are_read_only(self):
+        self.verify()
         self.assertEqual(self.gh.writes(), [])
 
-    def test_existing_conflict_requires_approval_and_preserves_wait_timer(self):
-        self.seeded()
-        value = self.gh.envs['production-approval']
-        value['config'].update(can_admins_bypass=True, prevent_self_review=True, wait_timer=12)
-        value['branches'].append(dict(id=666, name='*', type='tag'))
-        self.plan()
-        self.manager().execute(OP, 'review')
-        with self.assertRaises(g.Error):
-            self.manager().execute(OP, 'apply')
-        self.assertEqual(self.gh.writes(), [])
-        self.args.approve_environment_changes = True
-        self.manager().execute(OP, 'apply')
-        self.assertEqual(self.gh.envs['production-approval']['config']['wait_timer'], 12)
-        self.assertEqual(len(self.gh.envs['production-approval']['branches']), 1)
-
-    def test_unreviewed_and_stale_plans_never_mutate(self):
-        self.plan()
-        with self.assertRaises(g.Error):
-            self.manager().execute(OP, 'apply')
-        self.manager().execute(OP, 'review')
-        self.gh.envs['Production'] = dict(id=4, config=self.manager().target('Production', None), branches=[])
-        with self.assertRaises(g.Error):
-            self.manager().execute(OP, 'apply')
+    def test_missing_environment_requires_terraform(self):
+        self.gh.envs.pop('Production')
+        with self.assertRaisesRegex(g.Error, 'infra/live-github'):
+            self.verify()
         self.assertEqual(self.gh.writes(), [])
 
-    def test_ambiguous_write_resume_after_exact_effect(self):
-        self.plan()
-        self.manager().execute(OP, 'review')
-        self.gh.fail_after_write = True
-        with self.assertRaises(b.BootstrapError):
-            self.manager().execute(OP, 'apply')
-        self.assertEqual(set(self.gh.envs), {'Production'})
-        self.manager().execute(OP, 'apply')
-        puts = [cmd for cmd, _ in self.gh.writes() if 'PUT' in cmd]
-        self.assertEqual(len(puts), 2)
+    def test_drift_requires_terraform_not_python_reconciliation(self):
+        for name in ('Production', 'production-approval'):
+            with self.subTest(name=name):
+                seed(self.gh)
+                self.gh.envs[name]['config']['can_admins_bypass'] = True
+                with self.assertRaises(g.Error):
+                    self.verify()
+                self.assertEqual(self.gh.writes(), [])
 
-    def test_ambiguous_no_effect_can_explicitly_resume(self):
-        self.plan()
-        self.manager().execute(OP, 'review')
-        self.gh.fail_before_write = True
-        with self.assertRaises(b.BootstrapError):
-            self.manager().execute(OP, 'apply')
-        self.assertEqual(self.gh.envs, {})
-        self.manager().execute(OP, 'apply')
-        self.assertEqual(len(self.gh.envs), 2)
-
-    def test_custom_protections_and_unknown_state_fail_closed(self):
-        self.seeded()
-        self.gh.custom = [dict(id=2)]
+    def test_no_second_reviewer_gate_allowed_on_credential_environment(self):
+        self.gh.envs['Production']['config']['reviewers'] = [dict(type='User', id=7)]
         with self.assertRaises(g.Error):
-            self.plan()
-        self.assertEqual(self.gh.writes(), [])
-        self.gh.custom = []
-        self.gh.envs['Production']['config']['deployment_branch_policy'] = dict(unknown=True)
-        with self.assertRaises(g.Error):
-            self.plan()
-
-    def test_corrupt_and_wrong_operation_reviewer_or_implementation_rejected(self):
-        self.plan()
-        self.manager().execute(OP, 'review')
-        with self.assertRaises(g.Error):
-            self.manager().execute('../outside', 'apply')
-        with patch.object(g.local, 'digest', return_value='changed'), self.assertRaises(g.Error):
-            self.manager().execute(OP, 'apply')
-        path = self.args.state_dir / 'github-environments' / (OP + '.json')
-        ledger = g.local.private_read(path)
-        ledger['schema'] = 99
-        g.local.save(path, ledger)
-        with self.assertRaises(g.Error):
-            self.manager().execute(OP, 'apply')
+            self.verify()
         self.assertEqual(self.gh.writes(), [])
 
-    def test_api_errors_do_not_mean_missing_and_inventory_must_be_complete(self):
-        def broken(*args, **kwargs):
-            raise b.BootstrapError('permission denied')
-        with self.assertRaises(b.BootstrapError):
-            g.Environments(self.args, broken)
+    def test_extra_branch_policy_fails_closed(self):
+        self.gh.envs['Production']['branches'].append(dict(id=999, name='*', type='tag'))
         with self.assertRaises(g.Error):
-            g.pages(lambda *a: '{"total_count": 1, "environments": []}', 'endpoint', 'environments')
-        with self.assertRaises(g.Error):
-            g.pages(lambda *a: '{"environments": []}', 'endpoint', 'environments')
-
-    def test_capitalization_collision_and_shared_approval_name_rejected(self):
-        self.gh.envs['production'] = {}
-        with self.assertRaises(g.Error):
-            self.plan()
-        self.args.environment = 'production-approval'
-        with self.assertRaises(g.Error):
-            self.plan()
+            self.verify()
         self.assertEqual(self.gh.writes(), [])
 
-    def test_new_operation_on_matching_environments_and_existing_secrets_is_noop(self):
-        self.seeded()
-        self.gh.secrets['LIVE_HOSTNAME'] = 'existing-secret-value'
-        self.plan()
-        self.review_apply()
-        self.assertEqual(self.gh.writes(), [])
-        self.assertEqual(self.gh.secrets, {'LIVE_HOSTNAME': 'existing-secret-value'})
-
-    def test_drift_after_ambiguous_write_is_not_accepted(self):
-        self.plan()
-        self.manager().execute(OP, 'review')
-        self.gh.fail_after_write = True
-        with self.assertRaises(b.BootstrapError):
-            self.manager().execute(OP, 'apply')
-        self.gh.envs['Production']['config']['can_admins_bypass'] = True
-        writes = len(self.gh.writes())
+    def test_custom_protection_rules_are_not_overwritten(self):
+        self.gh.custom = [dict(id=1)]
         with self.assertRaises(g.Error):
-            self.manager().execute(OP, 'apply')
-        self.assertEqual(len(self.gh.writes()), writes)
+            self.verify()
+        self.assertEqual(self.gh.writes(), [])
 
-    def test_partial_post_and_delete_resume_without_duplicate_effect(self):
-        self.seeded()
-        self.gh.envs['Production']['branches'] = [dict(id=42, name='*', type='branch')]
-        self.args.approve_environment_changes = True
-        self.plan()
-        self.manager().execute(OP, 'review')
-        original = self.gh.run
-        fail_methods = ['POST', 'DELETE']
-        def run(cmd, body=None):
-            if '--method' in cmd and cmd[cmd.index('--method') + 1] in fail_methods:
-                fail_methods.remove(cmd[cmd.index('--method') + 1])
-                self.gh.fail_after_write = True
-            return original(cmd, body)
-        for _ in range(2):
-            with self.assertRaises(b.BootstrapError):
-                g.Environments(self.args, run).execute(OP, 'apply')
-        g.Environments(self.args, run).execute(OP, 'apply')
-        self.assertEqual(len([cmd for cmd, _ in self.gh.writes() if 'POST' in cmd]), 1)
-        self.assertEqual(len([cmd for cmd, _ in self.gh.writes() if 'DELETE' in cmd]), 1)
-
-    def test_binding_cannot_be_dropped_on_later_apply(self):
-        self.plan()
-        self.args.approval_reviewer = None
-        self.args.state_mode = 'apply'
-        self.args.state_account_id = 'a' * 32
-        with self.assertRaises(b.BootstrapError):
-            b.state_bootstrap(self.args, lambda *a: self.fail('provider request'), ['LIVE_STATE_BUCKET'], {})
-
-    def test_provider_free_dryrun(self):
-        self.args.dry_run = True
-        b.provision(self.args, lambda *a: self.fail('provider request'))
-
-    def test_bootstrap_gates_backend_and_secret_writes_on_environment_verification(self):
-        backend_calls = []
-        backend = dict(bucket='bmux-opentofu-state', region='auto', key='bmux/live/production/terraform.tfstate',
-                       endpoint='https://' + 'a' * 32 + '.r2.cloudflarestorage.com', use_lockfile=True, encrypt=True)
-        def run(cmd, body=None):
-            if len(cmd) > 1 and cmd[1].endswith('provision-live-state.py'):
-                backend_calls.append(cmd)
-                return json.dumps(dict(schema=2, operation=OP, phase='complete' if '--apply' in cmd else 'planned',
-                                       backend=backend, resources=[]))
-            return self.gh.run(cmd, body)
-        def invoke():
-            b.provision(self.args, run, {}, cloudflare=object())
-        with patch.object(b, 'discover', return_value=('a' * 32, 'b' * 32)):
-            invoke()
-            self.assertEqual(self.gh.writes(), [])
-            self.args.state_mode = 'review'
-            invoke()
-            self.assertEqual(self.gh.writes(), [])
-            self.args.state_mode = 'apply'
-            self.gh.fail_after_write = True
-            with self.assertRaises(b.BootstrapError):
-                invoke()
-            self.assertFalse(any('--apply' in cmd for cmd in backend_calls))
-            self.assertEqual(self.gh.secrets, {})
-            invoke()
-            self.assertTrue(any('--apply' in cmd for cmd in backend_calls))
-            self.assertEqual(self.gh.secrets, {'LIVE_HOSTNAME': 'bmux.dev'})
-            self.gh.calls.clear()
-            invoke()
-            self.assertEqual(self.gh.writes(), [])
+    def test_terraform_owns_mutation(self):
+        source = Path(__file__).with_name('live-github-environments.py').read_text()
+        self.assertNotIn("'PUT'", source)
+        self.assertNotIn("'POST'", source)
+        self.assertNotIn("'DELETE'", source)
+        self.assertFalse(hasattr(g.Environments, 'execute'))
+        self.assertFalse(hasattr(g.Environments, 'plan'))
 
 
 if __name__ == '__main__':
