@@ -11,6 +11,19 @@ The one-time Worker-to-Fly cutover and app-taint repair workflows have been
 retired. Their remote completion markers remain durable replay fences, not
 infrastructure-state authorities. Do not delete or reset those records.
 
+## Relay startup platforms
+
+Linux production startup retains the fixed `/data/relay` volume validation,
+UID/GID 65532 privilege drop, supplementary-group clearing, and `no_new_privs`
+checks before constructing Tokio or reading credentials.
+
+On other Unix systems, including macOS, the relay can run only with nonzero,
+matching real/effective user and group IDs. It does not initialize or chown the
+Linux production volume and does not claim Linux privilege-hardening guarantees.
+Set `AUTHORITY_PATH` to a writable private development location when running
+locally; the default remains `/data/relay/authority.json`.
+Non-Unix startup fails explicitly before credentials or listeners are opened.
+
 ## Normal releases
 
 Every push to `master` starts a release relevance check, not a product build.

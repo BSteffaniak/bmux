@@ -34,6 +34,9 @@ impl TestRelay {
                     }
                     Err(error) => panic!("{error}"),
                 };
+                // Accepted sockets inherit nonblocking mode on some Unix platforms.
+                // The fixture's HTTP parser and WebSocket handler use blocking IO.
+                stream.set_nonblocking(false).unwrap();
                 stream
                     .set_read_timeout(Some(Duration::from_secs(2)))
                     .unwrap();
