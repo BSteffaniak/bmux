@@ -4,6 +4,12 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::image::{ImageContribution, ImageKey, ImageLifecycle, ImagePlacement};
 
+#[cfg(test)]
+thread_local! {
+    // Actual active snapshots and delta constructions on this test thread.
+    static RECONCILE_WORK: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+}
+
 /// Changes produced by reconciling one rendered frame with the active image scene.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -87,7 +93,27 @@ impl ImageScene {
     /// than once, contributions are applied in render order and the last one
     /// determines the final scene.
     pub fn reconcile(&mut self, contributions: &[ImageContribution]) -> ImageSceneDelta {
+        #[cfg(test)]
+        RECONCILE_WORK.with(|work| work.set((work.get().0 + 1, work.get().1)));
         let previous = self.active.clone();
+        self.apply_contributions(contributions);
+        #[cfg(test)]
+        RECONCILE_WORK.with(|work| work.set((work.get().0, work.get().1 + 1)));
+        let upserted = self
+            .active
+            .iter()
+            .filter(|(key, placement)| previous.get(*key) != Some(*placement))
+            .map(|(_, placement)| placement.clone())
+            .collect();
+        let removed = previous
+            .keys()
+            .filter(|key| !self.active.contains_key(*key))
+            .cloned()
+            .collect();
+
+        ImageSceneDelta { upserted, removed }
+    }
+    fn apply_contributions(&mut self, contributions: &[ImageContribution]) {
         if self.sources.is_empty() && self.visibility_sources.is_empty() {
             // Older serialized scenes contain only the original active map.
             self.sources.clone_from(&self.active);
@@ -118,20 +144,8 @@ impl ImageScene {
 
         self.active.clone_from(&self.sources);
         self.visibility_sources.clear();
-        let upserted = self
-            .active
-            .iter()
-            .filter(|(key, placement)| previous.get(*key) != Some(*placement))
-            .map(|(_, placement)| placement.clone())
-            .collect();
-        let removed = previous
-            .keys()
-            .filter(|key| !self.active.contains_key(*key))
-            .cloned()
-            .collect();
-
-        ImageSceneDelta { upserted, removed }
     }
+
     /// Reconcile original image lifetime, then project opaque paint-order clips.
     /// Hidden persistent sources remain retained; only visibility fragments are
     /// retired. Rectangles partition existing pieces, never duplicate pixels.
@@ -140,9 +154,11 @@ impl ImageScene {
         contributions: &[ImageContribution],
         occlusions: &[(usize, crate::geometry::Rect)],
     ) -> ImageSceneDelta {
+        #[cfg(test)]
+        RECONCILE_WORK.with(|work| work.set((work.get().0 + 1, work.get().1)));
         let previous = self.active.clone();
         let previous_sources = self.visibility_sources.clone();
-        self.reconcile(contributions);
+        self.apply_contributions(contributions);
         let mut painted_at = BTreeMap::new();
         for (index, contribution) in contributions.iter().enumerate() {
             if let ImageContribution::Present(placement) = contribution {
@@ -195,6 +211,8 @@ impl ImageScene {
                 self.active.insert(fragment_key, fragment);
             }
         }
+        #[cfg(test)]
+        RECONCILE_WORK.with(|work| work.set((work.get().0, work.get().1 + 1)));
         ImageSceneDelta {
             upserted: self
                 .active
@@ -263,6 +281,81 @@ mod tests {
             clip: Rect::new(0, 0, 80, 24),
             lifecycle,
         }
+    }
+
+    #[test]
+    fn occluded_reconcile_builds_only_final_snapshot_and_delta() {
+        for bytes in [4, 65_536] {
+            let mut image = placement("warm", 0, ImageLifecycle::Persistent);
+            image.payload = ImagePayload::Pixels {
+                bytes: vec![7; bytes],
+                width: 1,
+                height: u32::try_from(bytes / 4).unwrap(),
+                format: crate::image::ImagePixelFormat::Rgba8,
+            };
+            let mut scene = ImageScene::default();
+            scene.reconcile(&[ImageContribution::Present(image.clone())]);
+            super::RECONCILE_WORK.with(|work| work.set((0, 0)));
+            let delta = scene.reconcile_occluded(&[ImageContribution::Present(image.clone())], &[]);
+            assert_eq!(delta, ImageSceneDelta::default());
+            assert_eq!(scene.placements().next(), Some(&image));
+            assert_eq!(super::RECONCILE_WORK.with(std::cell::Cell::get), (1, 1));
+        }
+    }
+
+    #[test]
+    fn contribution_application_preserves_public_and_occluded_semantics() {
+        let persistent = placement("persistent", 0, ImageLifecycle::Persistent);
+        let frame = placement("frame", 1, ImageLifecycle::Frame);
+        let last = placement("frame", 2, ImageLifecycle::Frame);
+        // Model deserialization: only active placements, no composer-local maps.
+        let legacy = ImageScene {
+            active: [
+                (persistent.key.clone(), persistent.clone()),
+                (frame.key.clone(), frame.clone()),
+            ]
+            .into_iter()
+            .collect(),
+            ..ImageScene::default()
+        };
+        for contributions in [
+            vec![],
+            vec![
+                ImageContribution::Present(frame.clone()),
+                ImageContribution::Present(last.clone()),
+            ],
+            vec![
+                ImageContribution::Present(last.clone()),
+                ImageContribution::Remove(frame.key.clone()),
+            ],
+            vec![
+                ImageContribution::Remove(frame.key.clone()),
+                ImageContribution::Present(last.clone()),
+            ],
+            vec![ImageContribution::Remove(persistent.key.clone())],
+        ] {
+            let mut public = legacy.clone();
+            let mut occluded = legacy.clone();
+            let expected = public.reconcile(&contributions);
+            assert_eq!(occluded.reconcile_occluded(&contributions, &[]), expected);
+            assert_eq!(occluded, public);
+            assert_eq!(occluded.sources, public.sources);
+            assert_eq!(occluded.visibility_sources, public.visibility_sources);
+        }
+        let mut scene = legacy;
+        let delta = scene.reconcile_occluded(
+            &[
+                ImageContribution::Present(frame),
+                ImageContribution::Present(last.clone()),
+            ],
+            &[(2, Rect::new(0, 0, 1, 1))],
+        );
+        assert_eq!(delta.removed, vec![persistent.key.clone()]);
+        assert_eq!(delta.upserted, vec![last.clone()]);
+        assert_eq!(scene.placements().cloned().collect::<Vec<_>>(), vec![last]);
+        assert!(scene.sources.contains_key(&persistent.key));
+        scene.reconcile_occluded(&[], &[]);
+        assert_eq!(scene.placements().next(), Some(&persistent));
     }
 
     #[test]
