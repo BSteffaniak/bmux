@@ -1834,6 +1834,76 @@ mod history_tests {
         }
     }
 
+    struct CheckedHistoryClient;
+
+    impl bmux_plugin_sdk::TypedDispatchClient for CheckedHistoryClient {
+        fn requires_service_contracts(&self) -> bool {
+            true
+        }
+
+        async fn invoke_service_raw(
+            &mut self,
+            capability: &str,
+            kind: bmux_ipc::InvokeServiceKind,
+            interface: &str,
+            operation: &str,
+            payload: Vec<u8>,
+        ) -> bmux_plugin_sdk::TypedDispatchClientResult<Vec<u8>> {
+            // Model the same ingress validation as a checked IPC connection.
+            let payload = bmux_plugin_sdk::service_contract::decode_for(
+                interface,
+                super::AttachState::SERVICE_CONTRACT,
+                &payload,
+            )
+            .map_err(|error| bmux_plugin_sdk::TypedDispatchClientError::Server {
+                interface: interface.to_string(),
+                operation: operation.to_string(),
+                details: error.to_string(),
+            })?;
+            let reply = bmux_plugin_sdk::TypedDispatchClient::invoke_service_raw(
+                &mut HistoryClient,
+                capability,
+                kind,
+                interface,
+                operation,
+                payload.to_vec(),
+            )
+            .await?;
+            Ok(bmux_plugin_sdk::service_contract::encode_response(&reply))
+        }
+    }
+
+    #[tokio::test]
+    async fn captured_window_preserves_checked_contract_through_read_cache() {
+        let pin = bmux_attach_pipeline::ScrollbackPin {
+            capture: Some(bmux_attach_pipeline::ScrollbackCapture {
+                identity: uuid::Uuid::new_v4(),
+                lines: 1,
+                truncated: false,
+                width: 2,
+                height: 1,
+            }),
+            pin_id: 1,
+            total_scrolled_rows: 1,
+            max_scrollback_offset: 1,
+            stream_end: 9,
+            created_epoch_secs: 0,
+        };
+        let window = super::captured_history_window(
+            &mut CheckedHistoryClient,
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            pin,
+            2,
+            1,
+            (2, None, 0),
+        )
+        .await
+        .expect("captured selection must retain checked request and response evidence")
+        .expect("captured history must be available");
+        assert_eq!(bmux_terminal_grid::row_text(&window.rows[0], 2), "AB");
+    }
+
     #[tokio::test]
     #[allow(
         clippy::too_many_lines,
@@ -2048,6 +2118,10 @@ struct CaptureReadCache<'a, C> {
 impl<C: bmux_plugin_sdk::TypedDispatchClient> bmux_plugin_sdk::TypedDispatchClient
     for CaptureReadCache<'_, C>
 {
+    fn requires_service_contracts(&self) -> bool {
+        self.client.requires_service_contracts()
+    }
+
     async fn invoke_service_raw(
         &mut self,
         capability: &str,
@@ -4294,6 +4368,103 @@ mod one_way_input_contract_tests {
         }
     }
 
+    #[tokio::test]
+    async fn checked_native_input_observes_authoritative_denial() {
+        use bmux_ipc::{Envelope, EnvelopeKind, Response, ResponsePayload};
+        let (client_stream, server_stream) = tokio::io::duplex(8192);
+        let server = tokio::spawn(async move {
+            let mut stream = bmux_ipc::transport::ErasedIpcStream::new(Box::new(server_stream));
+            let hello = stream.recv_envelope().await.unwrap();
+            let bmux_ipc::Request::Hello { contract, .. } =
+                bmux_ipc::decode(&hello.payload).unwrap()
+            else {
+                panic!("hello");
+            };
+            stream
+                .send_envelope(&Envelope::new(
+                    hello.request_id,
+                    EnvelopeKind::Response,
+                    bmux_ipc::encode(&Response::Ok(ResponsePayload::HelloNegotiated {
+                        negotiated: bmux_ipc::NegotiatedProtocol {
+                            wire_epoch: contract.wire_epoch,
+                            revision: contract.revisions.max,
+                            capabilities: vec![bmux_ipc::CAPABILITY_SERVICE_CONTRACT_V2.into()],
+                        },
+                    }))
+                    .unwrap(),
+                ))
+                .await
+                .unwrap();
+            for _ in 0..2 {
+                let request = stream.recv_envelope().await.unwrap();
+                let bmux_ipc::Request::InvokeService {
+                    interface_id,
+                    payload,
+                    ..
+                } = bmux_ipc::decode(&request.payload).unwrap()
+                else {
+                    panic!("input invocation");
+                };
+                bmux_plugin_sdk::service_contract::interface_id_for(&interface_id, &payload)
+                    .unwrap();
+                let payload = if interface_id == AttachCommands::INTERFACE_ID.as_str() {
+                    bmux_plugin_sdk::encode_service_message(&Err::<u32, _>(
+                        AttachCommands::AttachCommandError::Denied {
+                            reason: "observer".into(),
+                        },
+                    ))
+                    .unwrap()
+                } else {
+                    bmux_plugin_sdk::encode_service_message(&Err::<PaneCommands::PaneAck, _>(
+                        PaneCommands::PaneCommandError::Denied {
+                            reason: "observer".into(),
+                        },
+                    ))
+                    .unwrap()
+                };
+                stream
+                    .send_envelope(&Envelope::new(
+                        request.request_id,
+                        EnvelopeKind::Response,
+                        bmux_ipc::encode(&Response::Ok(ResponsePayload::ServiceInvoked {
+                            payload: bmux_plugin_sdk::service_contract::encode_response(&payload),
+                        }))
+                        .unwrap(),
+                    ))
+                    .await
+                    .unwrap();
+            }
+        });
+        let mut client = bmux_client::BmuxClient::connect_with_bridge_stream(
+            bmux_ipc::transport::ErasedIpcStream::new(Box::new(client_stream)),
+            std::time::Duration::from_secs(2),
+            "checked-input-test",
+            Uuid::new_v4(),
+        )
+        .await
+        .unwrap();
+        client.require_service_contracts().unwrap();
+        let mut client = bmux_client::StreamingBmuxClient::from_client(client).unwrap();
+        let session = Uuid::new_v4();
+        assert!(
+            client
+                .send_one_way_attach_input(session, b"i".to_vec())
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("observer")
+        );
+        assert!(
+            client
+                .send_one_way_pane_direct_input(session, Uuid::new_v4(), b"i".to_vec())
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("observer")
+        );
+        server.await.unwrap();
+    }
+
     #[test]
     fn attach_and_direct_one_way_input_preserve_negotiated_contract_evidence() {
         let session_id = Uuid::new_v4();
@@ -4318,6 +4489,8 @@ mod one_way_input_contract_tests {
 }
 
 #[allow(dead_code)]
+/// Streaming input transport. Checked connections wait for the modeled reply
+/// so authoritative denials surface; legacy connections retain one-way delivery.
 pub trait StreamingAttachInputExt {
     fn send_one_way_attach_input(
         &mut self,
@@ -4340,6 +4513,15 @@ impl StreamingAttachInputExt for bmux_client::StreamingBmuxClient {
         session_id: Uuid,
         data: Vec<u8>,
     ) -> ClientResult<()> {
+        if bmux_plugin_sdk::TypedDispatchClient::requires_service_contracts(self) {
+            // Native checked connections must observe authoritative rejections,
+            // not treat successful transport delivery as permission to write.
+            return match AttachCommands::client::attach_input(self, session_id, data).await {
+                Ok(Ok(_)) => Ok(()),
+                Ok(Err(error)) => typed_server_error("attach-input", error),
+                Err(error) => typed_dispatch_error("attach-input", error),
+            };
+        }
         let typed_payload =
             bmux_plugin_sdk::encode_service_message(&AttachCommands::client::AttachInputRequest {
                 session_id,
@@ -4364,6 +4546,15 @@ impl StreamingAttachInputExt for bmux_client::StreamingBmuxClient {
         pane_id: Uuid,
         data: Vec<u8>,
     ) -> ClientResult<()> {
+        if bmux_plugin_sdk::TypedDispatchClient::requires_service_contracts(self) {
+            return match PaneCommands::client::pane_direct_input(self, session_id, pane_id, data)
+                .await
+            {
+                Ok(Ok(_)) => Ok(()),
+                Ok(Err(error)) => typed_server_error("pane-direct-input", error),
+                Err(error) => typed_dispatch_error("pane-direct-input", error),
+            };
+        }
         let typed_payload = bmux_plugin_sdk::encode_service_message(
             &PaneCommands::client::PaneDirectInputRequest {
                 session_id,

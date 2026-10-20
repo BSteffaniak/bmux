@@ -481,6 +481,7 @@ impl AttachWorker for BmuxWorker {
             move |prepared| delivery.present(prepared),
         )?;
         let clipboard = output.clone();
+        host.set_config_paths(self.selection.roots().config_paths());
         host.set_clipboard(move |request| clipboard.clipboard_request(request));
         self.handle = Some(handle);
         let selection = self.selection.clone();

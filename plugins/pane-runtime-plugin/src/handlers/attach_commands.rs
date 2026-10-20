@@ -116,11 +116,18 @@ fn session_write_allowed(
     session_id: SessionId,
     client_id: ClientId,
 ) -> Result<bool, AttachCommandError> {
+    if !ctx
+        .enabled_plugins
+        .iter()
+        .any(|id| id == "bmux.permissions")
+    {
+        return Ok(true);
+    }
     let principal_id = bmux_plugin::global_plugin_state_registry()
         .get::<bmux_client_state::ClientPrincipalHandle>()
         .and_then(|arc| arc.read().ok().map(|g| (*g).clone()))
         .and_then(|handle| handle.0.get(client_id))
-        .unwrap_or_else(Uuid::nil);
+        .ok_or_else(|| failed("session policy principal is unavailable"))?;
 
     let mut client = bmux_plugin::ServiceCallerDispatchClient::new(ctx);
     match bmux_plugin::block_on_typed_dispatch(
@@ -137,7 +144,6 @@ fn session_write_allowed(
         ),
     ) {
         Ok(response) => Ok(response.allowed),
-        Err(err) if err.to_string().contains("unsupported") => Ok(true),
         Err(err) => Err(failed(format!("session policy check failed: {err}"))),
     }
 }
@@ -903,6 +909,57 @@ pub fn detach(ctx: &NativeServiceContext) -> Result<u8, AttachCommandError> {
 #[cfg(test)]
 mod selection_tests {
     use super::*;
+    #[test]
+    fn absent_permissions_is_local_fallback_but_enabled_missing_principal_fails_closed() {
+        use bmux_plugin_sdk::{
+            ApiVersion, HostConnectionInfo, HostMetadata, HostScope, ProviderId, RegisteredService,
+            ServiceKind, ServiceRequest,
+        };
+        let mut context = NativeServiceContext {
+            plugin_id: "bmux.pane_runtime".into(),
+            request: ServiceRequest {
+                caller_plugin_id: String::new(),
+                service: RegisteredService {
+                    capability: HostScope::new("bmux.pane_runtime.write").unwrap(),
+                    kind: ServiceKind::Command,
+                    interface_id: "attach-runtime-commands".into(),
+                    provider: ProviderId::Plugin("bmux.pane_runtime".into()),
+                },
+                operation: "attach-open".into(),
+                payload: vec![],
+            },
+            required_capabilities: vec![],
+            provided_capabilities: vec![],
+            services: vec![],
+            available_capabilities: vec![],
+            enabled_plugins: vec![],
+            plugin_search_roots: vec![],
+            host: HostMetadata {
+                product_name: "bmux".into(),
+                product_version: "test".into(),
+                plugin_api_version: ApiVersion::new(1, 0),
+                plugin_abi_version: ApiVersion::new(1, 0),
+            },
+            connection: HostConnectionInfo {
+                config_dir: String::new(),
+                config_dir_candidates: vec![],
+                runtime_dir: String::new(),
+                data_dir: String::new(),
+                state_dir: String::new(),
+            },
+            settings: None,
+            plugin_settings_map: std::collections::BTreeMap::new(),
+            caller_client_id: None,
+            cancellation: bmux_plugin_sdk::CancellationToken::default(),
+            host_kernel_bridge: None,
+        };
+        let session = SessionId(Uuid::new_v4());
+        let client = ClientId(Uuid::new_v4());
+        assert!(session_write_allowed(&context, session, client).unwrap());
+        context.enabled_plugins.push("bmux.permissions".into());
+        assert!(session_write_allowed(&context, session, client).is_err());
+    }
+
     #[test]
     fn stale_and_suspended_input_targets_are_rejected() {
         let old = SessionId(Uuid::from_u128(1));

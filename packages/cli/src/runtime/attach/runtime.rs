@@ -371,6 +371,31 @@ type NativeClipboardCallback =
     Arc<Mutex<Box<dyn FnMut(NativeClipboardRequest) -> Result<Option<String>> + Send>>>;
 thread_local! {
     static NATIVE_CLIPBOARD: std::cell::RefCell<Option<NativeClipboardCallback>> = const { std::cell::RefCell::new(None) };
+    static NATIVE_CONFIG_PATHS: std::cell::RefCell<Option<ConfigPaths>> = const { std::cell::RefCell::new(None) };
+}
+
+struct NativeConfigScope(Option<ConfigPaths>);
+impl Drop for NativeConfigScope {
+    fn drop(&mut self) {
+        NATIVE_CONFIG_PATHS.with(|slot| *slot.borrow_mut() = self.0.take());
+    }
+}
+
+fn attach_config_paths() -> ConfigPaths {
+    NATIVE_CONFIG_PATHS
+        .with(|slot| slot.borrow().clone())
+        .unwrap_or_default()
+}
+
+fn load_attach_config() -> bmux_config::Result<BmuxConfig> {
+    NATIVE_CONFIG_PATHS
+        .with(|slot| slot.borrow().clone())
+        .map_or_else(BmuxConfig::load, |paths| {
+            BmuxConfig::load_isolated_with_paths_and_overrides(
+                &paths,
+                &bmux_config::ConfigLoadOverrides::default(),
+            )
+        })
 }
 struct NativeClipboardScope(Option<NativeClipboardCallback>);
 impl Drop for NativeClipboardScope {
@@ -398,9 +423,14 @@ pub struct NativeAttachHost {
     observer: Option<super::observer::AttachObserverPublisher>,
     accepted_revision: Arc<std::sync::atomic::AtomicU64>,
     pending: std::collections::VecDeque<NativeAttachEvent>,
+    config_paths: Option<ConfigPaths>,
     clipboard: Option<NativeClipboardCallback>,
 }
 impl NativeAttachHost {
+    /// Pin configuration and mutable UI state to the explicitly selected runtime.
+    pub fn set_config_paths(&mut self, paths: ConfigPaths) {
+        self.config_paths = Some(paths);
+    }
     /// Install application-lifetime clipboard IO. Call before starting attach.
     pub fn set_clipboard(
         &mut self,
@@ -462,6 +492,7 @@ impl NativeAttachHost {
                 ),
                 accepted_revision,
                 pending: std::collections::VecDeque::new(),
+                config_paths: None,
                 clipboard: None,
             },
         ))
@@ -587,6 +618,8 @@ pub async fn run_native_with_client(
     config: BmuxConfig,
     mut host: NativeAttachHost,
 ) -> Result<AttachRunOutcome> {
+    let _config_scope =
+        NativeConfigScope(NATIVE_CONFIG_PATHS.with(|slot| slot.replace(host.config_paths.take())));
     let clipboard = host.clipboard.take().or_else(|| {
         let callback: NativeClipboardCallback = Arc::new(Mutex::new(Box::new(|_| {
             anyhow::bail!("native clipboard is unavailable")
@@ -951,8 +984,16 @@ async fn native_committed_text(
     text: &str,
     text_passthrough: bool,
 ) -> Result<()> {
-    if !native_capture_committed_text(view, text) && text_passthrough {
-        send_attach_bytes_to_focused(client, view, text.as_bytes().to_vec()).await?;
+    if !native_capture_committed_text(view, text)
+        && text_passthrough
+        && let Err(error) =
+            send_attach_bytes_to_focused(client, view, text.as_bytes().to_vec()).await
+    {
+        view.set_transient_status(
+            format!("input failed: {}", map_attach_client_error(error)),
+            Instant::now(),
+            ATTACH_TRANSIENT_STATUS_TTL,
+        );
     }
     Ok(())
 }
@@ -1470,7 +1511,7 @@ use bmux_control_catalog_plugin_api::control_catalog_state::{
     self, ContextRow, ContextSessionBinding, SessionRow,
 };
 use bmux_performance_plugin_api::performance_state;
-use bmux_plugin_sdk::{TypedServiceClientError, TypedServiceEndpoint};
+use bmux_plugin_sdk::TypedServiceClientError;
 use bmux_sessions_plugin_api::{sessions_commands, sessions_state};
 use bmux_tabs_plugin_api::{tabs_commands, tabs_state};
 
@@ -1720,60 +1761,22 @@ async fn typed_list_contexts_bmux(
 
 /// Invoke a `tabs-commands` typed command by routing through the
 /// server's generic `Request::InvokeService` envelope.
-async fn invoke_windows_command<Req, Resp>(
-    client: &mut StreamingBmuxClient,
-    operation: &str,
-    args: &Req,
-) -> std::result::Result<Resp, ClientError>
-where
-    Req: serde::Serialize + Sync,
-    Resp: serde::de::DeserializeOwned,
-{
-    let payload = bmux_plugin_sdk::encode_service_message(args).map_err(|error| {
-        ClientError::ServerError {
-            code: bmux_ipc::ErrorCode::Internal,
-            message: format!("encoding {operation}: {error}"),
-        }
-    })?;
-    let checked = bmux_plugin_sdk::TypedDispatchClient::requires_service_contracts(client);
-    let payload = if checked {
-        bmux_plugin_sdk::service_contract::encode(
-            "tabs-commands",
-            bmux_tabs_plugin_api::tabs_commands::SERVICE_CONTRACT,
-            &payload,
-        )
-        .map_err(|error| ClientError::ServerError {
-            code: bmux_ipc::ErrorCode::Internal,
-            message: format!("encoding checked {operation}: {error}"),
-        })?
-    } else {
-        payload
-    };
-    let response_bytes = client
-        .invoke_service_raw(
-            tabs_commands::client::FocusPaneEndpoint::CAPABILITY.as_str(),
-            InvokeServiceKind::Command,
-            tabs_commands::INTERFACE_ID.as_str(),
-            operation,
-            payload,
-        )
-        .await?;
-    let response_bytes = if checked {
-        bmux_plugin_sdk::service_contract::decode_response(&response_bytes).map_err(|error| {
-            ClientError::ServerError {
-                code: bmux_ipc::ErrorCode::Internal,
-                message: format!("checking {operation} response: {error}"),
-            }
-        })?
-    } else {
-        &response_bytes
-    };
-    bmux_plugin_sdk::decode_service_message::<Resp>(response_bytes).map_err(|error| {
-        ClientError::ServerError {
-            code: bmux_ipc::ErrorCode::Internal,
-            message: format!("decoding {operation} response: {error}"),
-        }
-    })
+fn attach_async_service_route(
+    client: &impl bmux_plugin_sdk::TypedDispatchClient,
+    sender: tokio::sync::mpsc::Sender<bmux_plugin::AsyncServiceRequest>,
+) -> Result<bmux_plugin::AsyncServiceClient> {
+    Ok(
+        bmux_plugin::AsyncServiceClient::bind(bmux_plugin::ASYNC_SERVICE_ROUTE_V1, sender)
+            .map_err(anyhow::Error::msg)?
+            .with_service_contracts(client.requires_service_contracts()),
+    )
+}
+
+fn tabs_action_error(error: impl std::fmt::Debug) -> ClientError {
+    ClientError::ServerError {
+        code: bmux_ipc::ErrorCode::Internal,
+        message: format!("tabs action failed: {error:?}"),
+    }
 }
 
 #[derive(Default)]
@@ -3710,7 +3713,7 @@ pub async fn run_native_attach_session_with_terminal<T: AttachTerminal>(
         .map_err(|error| anyhow::anyhow!("invalid attach provider snapshot: {error}"))?;
 
     let keyboard_enhanced = terminal.enter_attach_mode(true, true, true)?;
-    let native_config = match BmuxConfig::load() {
+    let native_config = match load_attach_config() {
         Ok(config) => config,
         Err(error) => {
             eprintln!(
@@ -4381,7 +4384,7 @@ async fn run_session_attach_with_host<T: AttachHost + ?Sized>(
         None => None,
     };
 
-    let attach_config = config.unwrap_or_else(|| match BmuxConfig::load() {
+    let attach_config = config.unwrap_or_else(|| match load_attach_config() {
         Ok(config) => config,
         Err(error) => {
             eprintln!(
@@ -4685,13 +4688,7 @@ async fn run_session_attach_with_host<T: AttachHost + ?Sized>(
     let mut attach_input_processor = InputProcessor::new(attach_keymap.clone(), keyboard_enhanced);
     let async_service_slots = std::sync::Arc::new(tokio::sync::Semaphore::new(16));
     let (async_service_tx, mut async_service_rx) = tokio::sync::mpsc::channel(16);
-    view_state.async_services = Some(
-        bmux_plugin::AsyncServiceClient::bind(
-            bmux_plugin::ASYNC_SERVICE_ROUTE_V1,
-            async_service_tx,
-        )
-        .map_err(anyhow::Error::msg)?,
-    );
+    view_state.async_services = Some(attach_async_service_route(&client, async_service_tx)?);
     let (prompt_host_tx, mut prompt_host_rx) = tokio::sync::mpsc::unbounded_channel();
     let _prompt_host_guard = prompt::register_host(prompt_host_tx);
     let mut prompt_host_open = true;
@@ -7114,8 +7111,8 @@ pub async fn handle_attach_plugin_command_action(
             );
             return Ok(());
         };
-        let config = BmuxConfig::load().unwrap_or_default();
-        let paths = ConfigPaths::default();
+        let config = load_attach_config().unwrap_or_default();
+        let paths = attach_config_paths();
         let current = cached_mode(
             &paths,
             view_state.attached_id,
@@ -8277,8 +8274,8 @@ pub fn copy_text_with_clipboard_plugin(text: &str) -> Result<()> {
         result?;
         return Ok(());
     }
-    let config = BmuxConfig::load()?;
-    let paths = ConfigPaths::default();
+    let config = load_attach_config()?;
+    let paths = attach_config_paths();
     let registry = scan_available_plugins(&config, &paths)?;
     let services = available_service_descriptors(&config, &registry)?;
     let capability = HostScope::new("bmux.clipboard.write")?;
@@ -8798,7 +8795,7 @@ pub fn apply_attach_profile_switch(
     attach_input_processor: &mut InputProcessor,
     view_state: &mut AttachViewState,
 ) -> Result<()> {
-    let config_path = ConfigPaths::default().config_file();
+    let config_path = attach_config_paths().config_file();
     apply_attach_profile_switch_with_path(
         profile_id,
         attach_input_processor,
@@ -8832,9 +8829,17 @@ fn apply_attach_profile_switch_with_path(
     }
 
     let result = (|| -> Result<()> {
-        let (resolved_config, resolution) =
-            bmux_config::BmuxConfig::load_from_path_with_resolution(config_path, Some(profile_id))
+        let (resolved_config, selected_profile) =
+            if NATIVE_CONFIG_PATHS.with(|slot| slot.borrow().is_some()) {
+                (load_attach_config()?, Some(profile_id.to_ascii_lowercase()))
+            } else {
+                let (config, resolution) = bmux_config::BmuxConfig::load_from_path_with_resolution(
+                    config_path,
+                    Some(profile_id),
+                )
                 .map_err(|error| anyhow::anyhow!("{error}"))?;
+                (config, resolution.selected_profile)
+            };
         let keymap = attach_keymap_from_config(&resolved_config);
         attach_input_processor.replace_keymap(keymap);
         attach_input_processor.set_scroll_mode(view_state.scrollback_active());
@@ -8848,9 +8853,7 @@ fn apply_attach_profile_switch_with_path(
         view_state.set_transient_status(
             format!(
                 "active profile: {}",
-                resolution
-                    .selected_profile
-                    .unwrap_or_else(|| profile_id.to_ascii_lowercase())
+                selected_profile.unwrap_or_else(|| profile_id.to_ascii_lowercase())
             ),
             Instant::now(),
             ATTACH_TRANSIENT_STATUS_TTL,
@@ -11763,7 +11766,7 @@ async fn handle_attach_mouse_scrollback_with_window(
         && !was_active
         && view_state.scrollback_active_for(pane_id)
     {
-        let config = BmuxConfig::load().unwrap_or_default();
+        let config = load_attach_config().unwrap_or_default();
         if effective_scrollback_mode(client, &config, view_state.attached_id, pane_id).await
             == bmux_config::ScrollbackMode::Frozen
         {
@@ -11868,7 +11871,7 @@ async fn effective_scrollback_mode(
     pane_id: Uuid,
 ) -> bmux_config::ScrollbackMode {
     if let Some(mode) = cached_mode(
-        &ConfigPaths::default(),
+        &attach_config_paths(),
         session_id,
         pane_id,
         config.behavior.scrollback.persist_pane_modes,
@@ -12014,7 +12017,7 @@ async fn handle_attach_ui_action_with_scrollback(
             .focused_pane_id()
             .is_some_and(|pane| view_state.captured_alternate.contains(&pane))
     {
-        let config = BmuxConfig::load().unwrap_or_default();
+        let config = load_attach_config().unwrap_or_default();
         pin_focused_scrollback_if_configured(client, view_state, &config, now).await;
     }
     if !view_state.pane_scrollback.is_empty() {
@@ -12618,7 +12621,7 @@ async fn sync_remote_clipboard(
     trigger: ClipboardSyncTrigger,
     now: Instant,
 ) -> Result<()> {
-    let config = BmuxConfig::load().unwrap_or_default();
+    let config = load_attach_config().unwrap_or_default();
     let sync = &config.clipboard.remote_sync;
     if !sync.enabled
         || sync.mode == ClipboardRemoteSyncMode::Off
@@ -12864,7 +12867,7 @@ pub async fn handle_attach_terminal_event(
                 .is_some_and(|last| {
                     now.duration_since(last)
                         >= Duration::from_millis(
-                            BmuxConfig::load()
+                            load_attach_config()
                                 .unwrap_or_default()
                                 .clipboard
                                 .remote_sync
@@ -13247,18 +13250,26 @@ async fn close_pane_by_id_for_prompt(
     client: &mut StreamingBmuxClient,
     pane_id: Uuid,
 ) -> std::result::Result<(), ClientError> {
-    let _ack: bmux_tabs_plugin_api::tabs_commands::PaneAck = invoke_windows_command(
-        client,
-        "focus-pane",
-        &tabs_commands::client::FocusPaneRequest { id: pane_id },
-    )
-    .await?;
-    let _ack: bmux_tabs_plugin_api::tabs_commands::PaneAck = invoke_windows_command(
-        client,
-        "close-pane",
-        &tabs_commands::client::ClosePaneRequest { id: pane_id },
-    )
-    .await?;
+    tabs_commands::client::focus_pane(client, pane_id)
+        .await
+        .map_err(|error| ClientError::ServerError {
+            code: bmux_ipc::ErrorCode::ServiceIncompatible,
+            message: format!("focus-pane: {error}"),
+        })?
+        .map_err(|error| ClientError::ServerError {
+            code: bmux_ipc::ErrorCode::Internal,
+            message: format!("focus-pane: {error:?}"),
+        })?;
+    tabs_commands::client::close_pane(client, pane_id)
+        .await
+        .map_err(|error| ClientError::ServerError {
+            code: bmux_ipc::ErrorCode::ServiceIncompatible,
+            message: format!("close-pane: {error}"),
+        })?
+        .map_err(|error| ClientError::ServerError {
+            code: bmux_ipc::ErrorCode::Internal,
+            message: format!("close-pane: {error:?}"),
+        })?;
     Ok(())
 }
 
@@ -14774,7 +14785,7 @@ async fn handle_attach_mouse_event_at(
                 && let Some(pane_id) = focused_pane_before
                 && view_state.scrollback_active_for(pane_id)
             {
-                let config = BmuxConfig::load().unwrap_or_default();
+                let config = load_attach_config().unwrap_or_default();
                 pin_focused_scrollback_if_configured(client, view_state, &config, now).await;
                 ensure_pane_scrollback_windows(client, view_state, false)?;
             }
@@ -16078,28 +16089,18 @@ pub async fn focus_attach_pane(
         return Ok(());
     }
 
-    let selector = attached_session_selector(view_state);
-    if attach_scene_pane_is_floating(view_state, pane_id) {
-        let _ack: bmux_tabs_plugin_api::tabs_commands::PaneAck = invoke_windows_command(
-            client,
-            "focus-floating-pane",
-            &tabs_commands::client::FocusFloatingPaneRequest {
-                session: Some(ipc_to_windows_selector(selector)),
-                target: pane_id_windows_selector(pane_id),
-            },
-        )
-        .await?;
+    let selector = Some(ipc_to_windows_selector(attached_session_selector(
+        view_state,
+    )));
+    let target = pane_id_windows_selector(pane_id);
+    let result = if attach_scene_pane_is_floating(view_state, pane_id) {
+        tabs_commands::client::focus_floating_pane(client, selector, target).await
     } else {
-        let _ack: bmux_tabs_plugin_api::tabs_commands::PaneAck = invoke_windows_command(
-            client,
-            "focus-pane-by-selector",
-            &tabs_commands::client::FocusPaneBySelectorRequest {
-                session: Some(ipc_to_windows_selector(selector)),
-                target: pane_id_windows_selector(pane_id),
-            },
-        )
-        .await?;
-    }
+        tabs_commands::client::focus_pane_by_selector(client, selector, target).await
+    };
+    result
+        .map_err(tabs_action_error)?
+        .map_err(tabs_action_error)?;
 
     let previous_focus = focused_attach_pane_id(view_state);
     view_state.mouse.last_focused_pane_id = Some(pane_id);
@@ -16133,18 +16134,18 @@ async fn resize_attach_pane(
     direction: bmux_tabs_plugin_api::tabs_commands::PaneResizeDirection,
     cells: u16,
 ) -> std::result::Result<(), ClientError> {
-    let selector = attached_session_selector(view_state);
-    let _ack: bmux_tabs_plugin_api::tabs_commands::PaneAck = invoke_windows_command(
+    tabs_commands::client::resize_pane(
         client,
-        "resize-pane",
-        &tabs_commands::client::ResizePaneRequest {
-            session: Some(ipc_to_windows_selector(selector)),
-            target: Some(pane_id_windows_selector(pane_id)),
-            direction,
-            cells: cells.max(1),
-        },
+        Some(ipc_to_windows_selector(attached_session_selector(
+            view_state,
+        ))),
+        Some(pane_id_windows_selector(pane_id)),
+        direction,
+        cells.max(1),
     )
-    .await?;
+    .await
+    .map_err(tabs_action_error)?
+    .map_err(tabs_action_error)?;
 
     view_state
         .dirty
@@ -16159,18 +16160,18 @@ async fn move_attach_floating_pane(
     x: u16,
     y: u16,
 ) -> std::result::Result<(), ClientError> {
-    let selector = attached_session_selector(view_state);
-    let _ack: bmux_tabs_plugin_api::tabs_commands::PaneAck = invoke_windows_command(
+    tabs_commands::client::move_floating_pane(
         client,
-        "move-floating-pane",
-        &tabs_commands::client::MoveFloatingPaneRequest {
-            session: Some(ipc_to_windows_selector(selector)),
-            target: pane_id_windows_selector(pane_id),
-            x,
-            y,
-        },
+        Some(ipc_to_windows_selector(attached_session_selector(
+            view_state,
+        ))),
+        pane_id_windows_selector(pane_id),
+        x,
+        y,
     )
-    .await?;
+    .await
+    .map_err(tabs_action_error)?
+    .map_err(tabs_action_error)?;
 
     view_state
         .dirty
@@ -16645,6 +16646,69 @@ mod native_retry_tests;
 
 #[cfg(test)]
 mod tests {
+    use bmux_plugin_sdk::TypedServiceEndpoint;
+
+    #[test]
+    fn native_background_route_retains_connection_contract_mode_in_clones() {
+        struct ContractMode(bool);
+        impl bmux_plugin_sdk::TypedDispatchClient for ContractMode {
+            fn requires_service_contracts(&self) -> bool {
+                self.0
+            }
+            async fn invoke_service_raw(
+                &mut self,
+                _: &str,
+                _: bmux_ipc::InvokeServiceKind,
+                _: &str,
+                _: &str,
+                _: Vec<u8>,
+            ) -> bmux_plugin_sdk::TypedDispatchClientResult<Vec<u8>> {
+                unreachable!()
+            }
+        }
+        for checked in [false, true] {
+            let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+            let route = attach_async_service_route(&ContractMode(checked), sender).unwrap();
+            assert_eq!(
+                bmux_plugin_sdk::TypedDispatchClient::requires_service_contracts(&route.clone()),
+                checked
+            );
+        }
+    }
+
+    #[test]
+    fn native_config_reads_and_profile_paths_stay_in_selected_root() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = ConfigPaths::new(
+            root.path().join("config"),
+            root.path().join("runtime"),
+            root.path().join("data"),
+            root.path().join("state"),
+        );
+        std::fs::create_dir_all(&paths.config_dir).unwrap();
+        std::fs::write(
+            paths.config_file(),
+            "[general]\ndefault_shell = '/selected/runtime/shell'\n",
+        )
+        .unwrap();
+        let previous = NATIVE_CONFIG_PATHS.with(|slot| slot.replace(Some(paths.clone())));
+        let scope = NativeConfigScope(previous.clone());
+        assert_eq!(attach_config_paths().config_file(), paths.config_file());
+        assert_eq!(
+            load_attach_config()
+                .unwrap()
+                .general
+                .default_shell
+                .as_deref(),
+            Some("/selected/runtime/shell")
+        );
+        drop(scope);
+        assert_eq!(
+            NATIVE_CONFIG_PATHS.with(|slot| slot.borrow().as_ref().map(ConfigPaths::config_file)),
+            previous.as_ref().map(ConfigPaths::config_file)
+        );
+    }
+
     #[test]
     fn native_clipboard_copy_uses_scoped_owner_and_reports_failure() {
         let writes = Arc::new(Mutex::new(Vec::new()));

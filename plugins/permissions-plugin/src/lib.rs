@@ -999,11 +999,31 @@ fn classify_action(action: &str) -> PolicyActionKind {
     let normalized = action.trim().to_ascii_lowercase();
     match normalized.as_str() {
         "admin" | "session.kill" => PolicyActionKind::Admin,
-        "mutation" | "attach.input" | "session.create" | "session.select" | "pane.split"
-        | "pane.focus" | "pane.direct_input" | "pane.resize" | "pane.close" | "follow"
-        | "unfollow" | "context.create" | "context.select" | "context.close" => {
-            PolicyActionKind::Mutation
-        }
+        "mutation"
+        | "attach.input"
+        | "session.create"
+        | "session.select"
+        | "pane.split"
+        | "pane.focus"
+        | "pane.direct_input"
+        | "pane.resize"
+        | "pane.close"
+        | "pane.launch"
+        | "pane.restart"
+        | "pane.zoom"
+        | "pane.floating.create"
+        | "pane.floating.focus"
+        | "pane.floating.move"
+        | "pane.floating.resize"
+        | "pane.floating.raise"
+        | "pane.floating.lower"
+        | "pane.floating.set_z"
+        | "pane.floating.set_layer"
+        | "follow"
+        | "unfollow"
+        | "context.create"
+        | "context.select"
+        | "context.close" => PolicyActionKind::Mutation,
         "read" | "list" | "status" | "context.list" => PolicyActionKind::Read,
         _ => PolicyActionKind::Unknown,
     }
@@ -1615,6 +1635,47 @@ mod tests {
         )
         .expect("policy evaluation should succeed");
         assert!(!admin.allowed);
+    }
+
+    #[test]
+    fn pane_mutation_actions_are_explicit_and_role_gated() {
+        for action in [
+            "pane.split",
+            "pane.launch",
+            "pane.focus",
+            "pane.resize",
+            "pane.close",
+            "pane.restart",
+            "pane.zoom",
+            "pane.floating.create",
+            "pane.floating.focus",
+            "pane.floating.move",
+            "pane.floating.resize",
+            "pane.floating.raise",
+            "pane.floating.lower",
+            "pane.floating.set_z",
+            "pane.floating.set_layer",
+        ] {
+            for role in ["owner", "writer", "observer"] {
+                assert_eq!(
+                    evaluate_role_action(role, action).allowed,
+                    role != "observer",
+                    "{role}: {action}"
+                );
+            }
+        }
+        for action in [
+            "pane.arbitrary",
+            "pane.floating.arbitrary",
+            "pane.zoom.extra",
+        ] {
+            for role in ["owner", "writer", "observer"] {
+                assert!(
+                    !evaluate_role_action(role, action).allowed,
+                    "{role}: {action}"
+                );
+            }
+        }
     }
 
     #[test]

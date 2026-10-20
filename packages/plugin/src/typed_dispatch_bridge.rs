@@ -127,6 +127,7 @@ impl AsyncServiceRequest {
 /// A captured route that never reconnects or switches to another registration.
 #[derive(Debug, Clone)]
 pub struct AsyncServiceClient {
+    checked_service_contracts: bool,
     wait_for_capacity: bool,
     sender: tokio::sync::mpsc::Sender<AsyncServiceRequest>,
     services: Option<std::sync::Arc<[bmux_plugin_sdk::RegisteredService]>>,
@@ -148,10 +149,20 @@ impl AsyncServiceClient {
             return Err("async service route capacity exceeds 16".into());
         }
         Ok(Self {
+            checked_service_contracts: false,
             wait_for_capacity: false,
             sender,
             services: None,
         })
+    }
+
+    /// Preserve the issuing connection's service representation requirement.
+    /// This grants no authority and performs no negotiation; the issuing host
+    /// must obtain the value from its already-negotiated connection.
+    #[must_use]
+    pub const fn with_service_contracts(mut self, required: bool) -> Self {
+        self.checked_service_contracts = required;
+        self
     }
 
     /// Opt into cancellable asynchronous queue admission for background work.
@@ -221,6 +232,10 @@ pub fn capture_async_command_route(version: u16) -> Result<AsyncServiceClient, S
 }
 
 impl TypedDispatchClient for AsyncServiceClient {
+    fn requires_service_contracts(&self) -> bool {
+        self.checked_service_contracts
+    }
+
     async fn invoke_service_raw(
         &mut self,
         capability: &str,

@@ -1098,7 +1098,7 @@ fn set_floating_pane_layer_command(
 fn zoom_pane(
     caller: &(impl ServiceCaller + Sync),
     session: Option<&Selector>,
-) -> Result<api_pane_runtime_commands::PaneAck, String> {
+) -> Result<PaneZoomAck, String> {
     let session_id = resolve_session_id(caller, session)?;
     let mut client = dispatch_client(caller);
     let result = bmux_plugin::block_on_typed_dispatch(
@@ -1109,7 +1109,10 @@ fn zoom_pane(
     emit_pane_event(bmux_tabs_plugin_api::tabs_events::PaneEvent::Zoomed {
         pane_id: ack.pane_id,
     });
-    Ok(ack)
+    Ok(PaneZoomAck {
+        pane_id: ack.pane_id,
+        zoomed: zoomed_pane_id_for_session(session_id).is_some(),
+    })
 }
 
 const fn pane_direction_name(direction: PaneDirection) -> &'static str {
@@ -1279,41 +1282,38 @@ impl RustPlugin for TabsPlugin {
             },
             "tabs-commands", "focus-pane" => |req: FocusPaneArgs, ctx| {
                 let target = Selector { id: Some(req.id), name: None, index: None };
-                focus_pane(ctx, None, Some(&target), "")
-                    .map(|ack| PaneAck { ok: true, pane_id: Some(ack.pane_id) })
-                    .map_err(|e| ServiceResponse::error("focus_failed", e))
+                Ok::<_, ServiceResponse>(focus_pane(ctx, None, Some(&target), "")
+                    .map(|_| ())
+                    .map_err(|reason| bmux_tabs_plugin_api::tabs_commands::FocusError::FocusDenied { reason }))
             },
             "tabs-commands", "close-pane" => |req: ClosePaneArgs, ctx| {
                 let target = Selector { id: Some(req.id), name: None, index: None };
-                close_pane(ctx, None, Some(&target))
-                    .map(|ack| PaneAck { ok: true, pane_id: Some(ack.pane_id) })
-                    .map_err(|e| ServiceResponse::error("close_failed", e))
+                Ok::<_, ServiceResponse>(close_pane(ctx, None, Some(&target))
+                    .map(|_| ())
+                    .map_err(|reason| bmux_tabs_plugin_api::tabs_commands::CloseError::CloseDenied { reason }))
             },
             "tabs-commands", "focus-pane-by-selector" => |req: FocusPaneBySelectorArgs, ctx| {
-                focus_pane(ctx, req.session.as_ref(), Some(&req.target), "")
+                Ok::<_, ServiceResponse>(focus_pane(ctx, req.session.as_ref(), Some(&req.target), "")
                     .map(|ack| PaneAck { ok: true, pane_id: Some(ack.pane_id) })
-                    .map_err(|e| ServiceResponse::error("focus_failed", e))
+                    .map_err(|reason| bmux_tabs_plugin_api::tabs_commands::PaneMutationError::Failed { reason }))
             },
             "tabs-commands", "close-pane-by-selector" => |req: ClosePaneBySelectorArgs, ctx| {
-                close_pane(ctx, req.session.as_ref(), Some(&req.target))
+                Ok::<_, ServiceResponse>(close_pane(ctx, req.session.as_ref(), Some(&req.target))
                     .map(|ack| PaneAck { ok: true, pane_id: Some(ack.pane_id) })
-                    .map_err(|e| ServiceResponse::error("close_failed", e))
+                    .map_err(|reason| bmux_tabs_plugin_api::tabs_commands::PaneMutationError::Failed { reason }))
             },
             "tabs-commands", "close-active-pane" => |req: CloseActivePaneArgs, ctx| {
-                close_pane(ctx, req.session.as_ref(), None)
+                Ok::<_, ServiceResponse>(close_pane(ctx, req.session.as_ref(), None)
                     .map(|ack| PaneAck { ok: true, pane_id: Some(ack.pane_id) })
-                    .map_err(|e| ServiceResponse::error("close_failed", e))
+                    .map_err(|reason| bmux_tabs_plugin_api::tabs_commands::PaneMutationError::Failed { reason }))
             },
             "tabs-commands", "focus-pane-in-direction" => |req: FocusPaneInDirectionArgs, ctx| {
                 let Some(focus_dir) = focus_direction_name(req.direction) else {
-                    return Err(ServiceResponse::error(
-                        "invalid_request",
-                        "direction must be left/right/up/down",
-                    ));
+                    return Ok::<_, ServiceResponse>(Err(bmux_tabs_plugin_api::tabs_commands::PaneMutationError::InvalidArgument { reason: "direction must be left/right/up/down".into() }));
                 };
-                focus_pane(ctx, req.session.as_ref(), None, focus_dir)
+                Ok::<_, ServiceResponse>(focus_pane(ctx, req.session.as_ref(), None, focus_dir)
                     .map(|ack| PaneAck { ok: true, pane_id: Some(ack.pane_id) })
-                    .map_err(|e| ServiceResponse::error("focus_failed", e))
+                    .map_err(|reason| bmux_tabs_plugin_api::tabs_commands::PaneMutationError::Failed { reason }))
             },
             "tabs-commands", "split-pane" => |req: SplitPaneArgs, ctx| {
                 let result: Result<PaneAck, bmux_tabs_plugin_api::tabs_commands::PaneMutationError> =
@@ -1323,7 +1323,7 @@ impl RustPlugin for TabsPlugin {
                 Ok::<_, ServiceResponse>(result)
             },
             "tabs-commands", "launch-pane" => |req: LaunchPaneArgs, ctx| {
-                launch_pane(ctx, req.session.as_ref(), req.target.as_ref(), LaunchPaneRequest {
+                Ok::<_, ServiceResponse>(launch_pane(ctx, req.session.as_ref(), req.target.as_ref(), LaunchPaneRequest {
                     direction: req.direction,
                     name: req.name,
                     program: req.program,
@@ -1331,27 +1331,31 @@ impl RustPlugin for TabsPlugin {
                     cwd: None,
                 })
                     .map(|ack| PaneAck { ok: true, pane_id: Some(ack.pane_id) })
-                    .map_err(|e| ServiceResponse::error("launch_failed", e))
+                    .map_err(|reason| bmux_tabs_plugin_api::tabs_commands::PaneMutationError::Failed { reason }))
             },
             "tabs-commands", "resize-pane" => |req: ResizePaneArgs, ctx| {
-                resize_pane(ctx, req.session.as_ref(), req.target.as_ref(), req.direction, req.cells)
+                Ok::<_, ServiceResponse>(resize_pane(ctx, req.session.as_ref(), req.target.as_ref(), req.direction, req.cells)
                     .map(|_| PaneAck { ok: true, pane_id: None })
-                    .map_err(|e| ServiceResponse::error("resize_failed", e))
+                    .map_err(|reason| bmux_tabs_plugin_api::tabs_commands::PaneMutationError::Failed { reason }))
+            },
+            "tabs-commands", "focus-floating-pane" => |req: FocusPaneBySelectorArgs, ctx| {
+                Ok::<_, ServiceResponse>(mutate_floating_pane(ctx, req.session.as_ref(), &req.target, "focus")
+                    .map(|ack| PaneAck { ok: true, pane_id: Some(ack.pane_id) })
+                    .map_err(|reason| bmux_tabs_plugin_api::tabs_commands::PaneMutationError::Failed { reason }))
             },
             "tabs-commands", "move-floating-pane" => |req: MoveFloatingPaneArgs, ctx| {
-                move_floating_pane(ctx, req.session.as_ref(), &req.target, req.x, req.y)
+                Ok::<_, ServiceResponse>(move_floating_pane(ctx, req.session.as_ref(), &req.target, req.x, req.y)
                     .map(|ack| PaneAck { ok: true, pane_id: Some(ack.pane_id) })
-                    .map_err(|e| ServiceResponse::error("move_floating_failed", e))
+                    .map_err(|reason| bmux_tabs_plugin_api::tabs_commands::PaneMutationError::Failed { reason }))
             },
             "tabs-commands", "zoom-pane" => |req: ZoomPaneArgs, ctx| {
-                zoom_pane(ctx, req.session.as_ref())
-                    .map(|ack| PaneZoomAck { pane_id: ack.pane_id, zoomed: true })
-                    .map_err(|e| ServiceResponse::error("zoom_failed", e))
+                Ok::<_, ServiceResponse>(zoom_pane(ctx, req.session.as_ref())
+                    .map_err(|reason| bmux_tabs_plugin_api::tabs_commands::PaneMutationError::Failed { reason }))
             },
             "tabs-commands", "restart-pane" => |req: RestartPaneArgs, ctx| {
-                restart_pane(ctx, req.session.as_ref(), req.target.as_ref())
+                Ok::<_, ServiceResponse>(restart_pane(ctx, req.session.as_ref(), req.target.as_ref())
                     .map(|ack| PaneAck { ok: true, pane_id: Some(ack.pane_id) })
-                    .map_err(|e| ServiceResponse::error("restart_failed", e))
+                    .map_err(|reason| bmux_tabs_plugin_api::tabs_commands::PaneMutationError::Failed { reason }))
             },
         })
     }
@@ -3735,14 +3739,7 @@ impl TabsCommandsService for TabsCommandsHandle {
         session: Option<Selector>,
     ) -> Pin<Box<dyn Future<Output = Result<PaneZoomAck, PaneMutationError>> + Send + 'a>> {
         let caller = Arc::clone(&self.shared.caller);
-        Box::pin(async move {
-            zoom_pane(&*caller, session.as_ref())
-                .map(|response| PaneZoomAck {
-                    pane_id: response.pane_id,
-                    zoomed: true,
-                })
-                .map_err(map_host_error)
-        })
+        Box::pin(async move { zoom_pane(&*caller, session.as_ref()).map_err(map_host_error) })
     }
 
     fn restart_pane<'a>(
@@ -6983,11 +6980,13 @@ mod tests {
         );
 
         let response = plugin.invoke_service(context);
-        let error = response.error.expect("expected restart dispatch failure");
-        assert_eq!(
-            error.code, "restart_failed",
-            "restart-pane must dispatch, not return the `unsupported` stub",
+        assert!(
+            response.error.is_none(),
+            "modeled failures must use the BPDL result"
         );
+        let result: Result<PaneAck, PaneMutationError> =
+            decode_service_message(&response.payload).expect("typed restart result");
+        assert!(matches!(result, Err(PaneMutationError::Failed { .. })));
     }
 
     #[test]

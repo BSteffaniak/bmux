@@ -198,6 +198,21 @@ async fn non_passthrough_binding_mode_blocks_committed_text_without_pty_io() {
         .unwrap();
 }
 
+#[tokio::test]
+async fn native_committed_text_failure_is_recoverable_and_reported() {
+    let (mut view, _, _, layout) = fixture();
+    view.cached_layout_state = Some(layout);
+    let mut client = disconnected_focus_test_client().await;
+    native_committed_text(&mut client, &mut view, "i", true)
+        .await
+        .expect("input rejection must not terminate the native host");
+    assert!(
+        view.transient_status
+            .as_ref()
+            .is_some_and(|status| status.starts_with("input failed:"))
+    );
+}
+
 #[test]
 fn lifecycle_backpressure_fails_closed_for_already_queued_pointer() {
     let (view, handle, mut host, _) = fixture();

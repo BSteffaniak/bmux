@@ -1449,44 +1449,11 @@ impl AttachInputRuntime {
     }
 }
 
-/// Invoke a `tabs-commands` typed operation on a [`BmuxClient`] by
-/// routing through `Request::InvokeService`. Mirrors the pattern the
-/// attach runtime uses on its `StreamingBmuxClient` handle; separate
-/// helpers exist because the two client types share no trait.
-async fn invoke_windows_command_bmux<Req, Resp>(
-    client: &mut BmuxClient,
-    operation: &str,
-    args: &Req,
-) -> anyhow::Result<Resp>
-where
-    Req: serde::Serialize + Sync,
-    Resp: serde::de::DeserializeOwned,
-{
-    let payload = bmux_plugin_sdk::encode_service_message(args)
-        .map_err(|error| anyhow::anyhow!("encoding {operation}: {error}"))?;
-    let response_bytes = client
-        .invoke_service_raw(
-            tabs_commands::client::FocusPaneEndpoint::CAPABILITY.as_str(),
-            bmux_ipc::InvokeServiceKind::Command,
-            tabs_commands::INTERFACE_ID.as_str(),
-            operation,
-            payload,
-        )
-        .await
-        .map_err(|e| anyhow::anyhow!("client invoke_service_raw failed: {e}"))?;
-    bmux_plugin_sdk::decode_service_message::<Resp>(&response_bytes)
-        .map_err(|error| anyhow::anyhow!("decoding {operation} response: {error}"))
-}
-
 async fn switch_window_by_id_playbook(client: &mut BmuxClient, id: Uuid) -> anyhow::Result<()> {
-    let _ack = invoke_windows_command_bmux::<_, bmux_tabs_plugin_api::tabs_commands::TabAck>(
-        client,
-        "switch-tab",
-        &tabs_commands::client::SwitchTabRequest {
-            target: id.to_string(),
-        },
-    )
-    .await?;
+    tabs_commands::client::switch_tab(client, id.to_string())
+        .await
+        .map_err(|error| anyhow::anyhow!("switch-tab transport failed: {error}"))?
+        .map_err(|error| anyhow::anyhow!("switch-tab failed: {error:?}"))?;
     Ok(())
 }
 
@@ -3765,16 +3732,14 @@ async fn execute_step_paced(
             let sid = require_session(*session_id)?;
             require_attached(*attached)?;
             let selector = pane_to_windows_selector(&PaneSelector::ByIndex(*target));
-            let _ack: bmux_tabs_plugin_api::tabs_commands::PaneAck = invoke_windows_command_bmux(
+            tabs_commands::client::focus_pane_by_selector(
                 client,
-                "focus-pane-by-selector",
-                &tabs_commands::client::FocusPaneBySelectorRequest {
-                    session: Some(ipc_to_windows_selector(SessionSelector::ById(sid))),
-                    target: selector,
-                },
+                Some(ipc_to_windows_selector(SessionSelector::ById(sid))),
+                selector,
             )
             .await
-            .map_err(|e| anyhow::anyhow!("focus-pane failed: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("focus-pane transport failed: {e}"))?
+            .map_err(|e| anyhow::anyhow!("focus-pane failed: {e:?}"))?;
             runtime_vars.focused_pane = *target;
             Ok(None)
         }
@@ -3786,16 +3751,14 @@ async fn execute_step_paced(
                 || pane_to_windows_selector(&PaneSelector::Active),
                 |idx| pane_to_windows_selector(&PaneSelector::ByIndex(*idx)),
             );
-            let _ack: bmux_tabs_plugin_api::tabs_commands::PaneAck = invoke_windows_command_bmux(
+            tabs_commands::client::close_pane_by_selector(
                 client,
-                "close-pane-by-selector",
-                &tabs_commands::client::ClosePaneBySelectorRequest {
-                    session: Some(ipc_to_windows_selector(SessionSelector::ById(sid))),
-                    target: selector,
-                },
+                Some(ipc_to_windows_selector(SessionSelector::ById(sid))),
+                selector,
             )
             .await
-            .map_err(|e| anyhow::anyhow!("close-pane failed: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("close-pane transport failed: {e}"))?
+            .map_err(|e| anyhow::anyhow!("close-pane failed: {e:?}"))?;
             runtime_vars.pane_count = runtime_vars.pane_count.saturating_sub(1);
             Ok(None)
         }
