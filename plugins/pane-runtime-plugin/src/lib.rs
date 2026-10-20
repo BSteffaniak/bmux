@@ -36,6 +36,25 @@ mod retired_execution_tests;
 #[cfg(test)]
 mod contract_tests {
     #[test]
+    fn readiness_commands_are_discoverable() {
+        use bmux_plugin_sdk::RustPlugin as _;
+        let services = super::PaneRuntimePlugin::declared_services().unwrap();
+        assert!(services.iter().any(
+            |service| service.interface_id == "pane-runtime-readiness-v1"
+                && service.capability.as_str() == "bmux.pane_runtime.write"
+                && service.kind == bmux_plugin_sdk::ServiceKind::Command
+        ));
+        let manifest =
+            bmux_plugin::PluginManifest::from_toml_str(include_str!("../plugin.toml")).unwrap();
+        assert!(
+            manifest
+                .services
+                .iter()
+                .any(|service| service.interface_id == "pane-runtime-readiness-v1")
+        );
+    }
+
+    #[test]
     fn only_cohesive_execution_contract_is_discoverable() {
         use bmux_plugin_sdk::RustPlugin;
         let services = super::PaneRuntimePlugin::declared_services().unwrap();

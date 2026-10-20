@@ -171,7 +171,7 @@ pub async fn connect_selection(
         )
         .await
         .context("runtime readiness timed out")?
-        .context("runtime lacks authoritative readiness; preserved without restart")?;
+        .with_context(|| readiness_failure_context(outcome, &spec))?;
         let receipt_path = roots.runtime_dir.join("companion-activation.json");
         let receipt = serde_json::json!({
             "schema_version": 1, "instance": readiness.instance,
@@ -322,6 +322,25 @@ async fn connect_at_paths(
         .require_service_contracts()
         .context("selected runtime lacks checked plugin service compatibility")?;
     Ok(client)
+}
+
+fn readiness_failure_context(outcome: RuntimeLaunchOutcome, spec: &RuntimeLaunchSpec) -> String {
+    let connection = match outcome {
+        RuntimeLaunchOutcome::AlreadyRunning => {
+            "reused an already-running daemon; rebuilding the bundle does not upgrade that process"
+        }
+        RuntimeLaunchOutcome::Started { .. } => {
+            "launched a new companion; its required plugin readiness service is unavailable"
+        }
+    };
+    format!(
+        "runtime lacks authoritative readiness: {connection}; preserved without restart. \
+         Selected companion: {}. Selected runtime startup diagnostics: {}. \
+         Inspect the selected daemon's plugin registration/activation errors; \
+         if it is a legacy daemon, explicitly stop only this selected runtime before retrying",
+        spec.executable.display(),
+        spec.diagnostic_file.display(),
+    )
 }
 
 fn runtime_incompatibility(error: &anyhow::Error) -> Option<String> {

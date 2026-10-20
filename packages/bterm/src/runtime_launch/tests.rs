@@ -7,6 +7,22 @@ use std::sync::atomic::{AtomicU64, Ordering};
 static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
 
 #[test]
+fn readiness_diagnostics_distinguish_reused_and_started_without_guessing_cause() {
+    let root = Root::new();
+    let spec = root.spec();
+    let reused = readiness_failure_context(RuntimeLaunchOutcome::AlreadyRunning, &spec);
+    let fresh = readiness_failure_context(RuntimeLaunchOutcome::Started { pid: 42 }, &spec);
+    assert!(reused.contains("reused an already-running daemon"));
+    assert!(!fresh.contains("reused an already-running daemon"));
+    assert!(fresh.contains("launched a new companion"));
+    for message in [reused, fresh] {
+        assert!(message.contains("preserved without restart"));
+        assert!(message.contains(spec.executable.to_str().unwrap()));
+        assert!(message.contains(spec.diagnostic_file.to_str().unwrap()));
+    }
+}
+
+#[test]
 fn service_incompatibility_is_not_optional_absence_or_starting() {
     for code in [
         bmux_ipc::ErrorCode::ServiceIncompatible,
