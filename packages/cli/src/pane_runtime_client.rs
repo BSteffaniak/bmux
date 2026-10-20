@@ -4223,16 +4223,97 @@ impl BmuxPaneRuntimeClientExt for bmux_client::BmuxClient {
     }
 }
 
-fn one_way_typed_service_request<E>(payload: Vec<u8>) -> bmux_ipc::Request
+fn one_way_typed_service_request<E>(
+    payload: Vec<u8>,
+    checked: bool,
+) -> ClientResult<bmux_ipc::Request>
 where
     E: bmux_plugin_sdk::TypedServiceEndpoint,
 {
-    bmux_ipc::Request::InvokeService {
+    let payload = if checked {
+        bmux_plugin_sdk::service_contract::encode(
+            E::INTERFACE_ID.as_str(),
+            E::SERVICE_CONTRACT,
+            &payload,
+        )
+        .map_err(|error| ClientError::ServerError {
+            code: ErrorCode::UnsupportedRepresentation,
+            message: format!(
+                "encoding checked one-way {}: {error}",
+                E::OPERATION.as_str()
+            ),
+        })?
+    } else {
+        payload
+    };
+    Ok(bmux_ipc::Request::InvokeService {
         capability: E::CAPABILITY.as_str().to_string(),
         kind: E::KIND,
         interface_id: E::INTERFACE_ID.as_str().to_string(),
         operation: E::OPERATION.as_str().to_string(),
         payload,
+    })
+}
+
+#[cfg(test)]
+mod one_way_input_contract_tests {
+    use super::*;
+
+    fn assert_evidence<E: bmux_plugin_sdk::TypedServiceEndpoint>(bytes: &[u8]) {
+        for checked in [false, true] {
+            let request = one_way_typed_service_request::<E>(bytes.to_vec(), checked).unwrap();
+            let bmux_ipc::Request::InvokeService {
+                capability,
+                kind,
+                interface_id,
+                operation,
+                payload,
+            } = request
+            else {
+                panic!("expected invocation");
+            };
+            assert_eq!(capability, E::CAPABILITY.as_str());
+            assert_eq!(kind, E::KIND);
+            assert_eq!(operation, E::OPERATION.as_str());
+            assert_eq!(interface_id, E::INTERFACE_ID.as_str());
+            let decoded = if checked {
+                bmux_plugin_sdk::service_contract::decode_for(
+                    &interface_id,
+                    E::SERVICE_CONTRACT,
+                    &payload,
+                )
+                .unwrap()
+            } else {
+                &payload
+            };
+            assert_eq!(decoded, bytes);
+            assert_eq!(
+                bmux_plugin_sdk::service_contract::is_checked(&payload),
+                checked
+            );
+        }
+    }
+
+    #[test]
+    fn attach_and_direct_one_way_input_preserve_negotiated_contract_evidence() {
+        let session_id = Uuid::new_v4();
+        assert_evidence::<AttachCommands::client::AttachInputEndpoint>(
+            &bmux_plugin_sdk::encode_service_message(&AttachCommands::client::AttachInputRequest {
+                session_id,
+                data: b"i".to_vec(),
+            })
+            .unwrap(),
+        );
+        assert_evidence::<PaneCommands::client::PaneDirectInputEndpoint>(
+            &bmux_plugin_sdk::encode_service_message(
+                &PaneCommands::client::PaneDirectInputRequest {
+                    session_id,
+                    pane_id: Uuid::new_v4(),
+                    data: b"i".to_vec(),
+                },
+            )
+            .unwrap(),
+        );
     }
 }
 
@@ -4270,8 +4351,11 @@ impl StreamingAttachInputExt for bmux_client::StreamingBmuxClient {
             })?;
         self.send_one_way(one_way_typed_service_request::<
             AttachCommands::client::AttachInputEndpoint,
-        >(typed_payload))
-            .await
+        >(
+            typed_payload,
+            bmux_plugin_sdk::TypedDispatchClient::requires_service_contracts(self),
+        )?)
+        .await
     }
 
     async fn send_one_way_pane_direct_input(
@@ -4293,8 +4377,11 @@ impl StreamingAttachInputExt for bmux_client::StreamingBmuxClient {
         })?;
         self.send_one_way(one_way_typed_service_request::<
             PaneCommands::client::PaneDirectInputEndpoint,
-        >(typed_payload))
-            .await
+        >(
+            typed_payload,
+            bmux_plugin_sdk::TypedDispatchClient::requires_service_contracts(self),
+        )?)
+        .await
     }
 }
 
