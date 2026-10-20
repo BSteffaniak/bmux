@@ -8,12 +8,15 @@ use bmux_tui::image_scene::{ImageScene, ImageSceneDelta};
 
 use crate::compositor::{KittyHostState, PaneRect, render_image_clipped};
 use crate::config::ImageConfig;
+use crate::frozen::FrozenImage;
 use crate::host_caps::HostImageCapabilities;
 use crate::model::{
     ImageCellSize, ImagePayload, ImagePixelSize, ImagePosition, ImageProtocol, PaneImage,
     PixelBuffer, PixelFormat,
 };
 use std::sync::Arc;
+
+type RetainedImage = Arc<FrozenImage>;
 
 /// Failure while adapting a TUI image scene into BMUX's image pipeline.
 #[derive(Debug)]
@@ -55,7 +58,7 @@ impl From<std::io::Error> for TuiImageError {
     }
 }
 
-type RetainedSource = (Arc<TuiImagePayload>, usize, Arc<PaneImage>);
+type RetainedSource = (Arc<TuiImagePayload>, usize, RetainedImage);
 type ContainSignature = (
     u64,
     bmux_tui::geometry::Rect,
@@ -74,7 +77,7 @@ pub struct TuiImageCompositor {
     sources: BTreeMap<ImageKey, RetainedSource>,
     // Access order, not caller key order: shared hot images survive page changes.
     source_order: VecDeque<ImageKey>,
-    fitted: BTreeMap<ImageKey, (ContainSignature, Arc<PaneImage>)>,
+    fitted: BTreeMap<ImageKey, (ContainSignature, RetainedImage)>,
     // Full allocation pixels survive changes to screen position and visible crop.
     rasters: BTreeMap<ImageKey, (RasterSignature, Arc<ImagePayload>)>,
     kitty_state: KittyHostState,
@@ -239,7 +242,7 @@ impl TuiImageCompositor {
                     .checked_add(1)
                     .expect("TUI image ID space exhausted");
                 let pixels = payload.pixels.as_ref().expect("validated pixels");
-                let image = Arc::new(PaneImage {
+                let image = FrozenImage::new(PaneImage {
                     id: self.next_id,
                     protocol: ImageProtocol::KittyGraphics,
                     position: ImagePosition { row: 0, col: 0 },
@@ -265,7 +268,7 @@ impl TuiImageCompositor {
             #[cfg(feature = "kitty")]
             if placement.fit == bmux_tui::image::ImageFit::Contain
                 && host_caps.preferred_protocol() == Some(ImageProtocol::KittyGraphics)
-                && self.kitty_state.contain_png(
+                && self.kitty_state.contain_frozen_png(
                     out,
                     &source,
                     placement,
@@ -319,7 +322,7 @@ impl TuiImageCompositor {
                 &[],
                 host_caps,
                 &mut self.kitty_state,
-                Some(&image),
+                Some(image.shared()),
             )?;
             self.trim_sources();
         }
@@ -334,10 +337,10 @@ impl TuiImageCompositor {
     fn contained_image(
         &mut self,
         placement: &bmux_tui::image::ImagePlacement,
-        source: &Arc<PaneImage>,
+        source: &RetainedImage,
         caps: &HostImageCapabilities,
         config: &ImageConfig,
-    ) -> Result<Arc<PaneImage>, TuiImageError> {
+    ) -> Result<RetainedImage, TuiImageError> {
         let bounds = placement
             .allocation
             .unwrap_or_else(|| placement.destination.into());
@@ -392,14 +395,14 @@ impl TuiImageCompositor {
             .checked_add(1)
             .expect("TUI image ID space exhausted");
         let pixels = payload.pixels.as_ref().expect("contained pixels");
-        let fitted = Arc::new(PaneImage {
+        let fitted = FrozenImage::new(PaneImage {
             id: self.next_id,
             pixel_size: ImagePixelSize {
                 width: pixels.width,
                 height: pixels.height,
             },
             payload,
-            ..(**source).clone()
+            ..(***source).clone()
         });
         self.fitted
             .insert(placement.key.clone(), (signature, Arc::clone(&fitted)));
@@ -968,6 +971,68 @@ mod tests {
     }
 
     #[cfg(feature = "kitty")]
+    #[test]
+    fn frozen_warm_candidate_forks_repair_and_retry_without_stale_binding() {
+        let caps = kitty_caps();
+        let terminal = PaneRect {
+            x: 0,
+            y: 0,
+            w: 40,
+            h: 20,
+        };
+        let config = ImageConfig::default();
+        let mut placed = placement(
+            "frozen-fork",
+            Rect::new(0, 0, 8, 4),
+            Rect::new(0, 0, 40, 20),
+            0,
+        );
+        placed.payload = transition_png();
+        placed.fit = bmux_tui::image::ImageFit::Contain;
+        let mut scene = ImageScene::default();
+        scene.reconcile(&[ImageContribution::Present(placed.clone())]);
+        let mut committed = TuiImageCompositor::new();
+        committed
+            .render(&mut Vec::new(), &scene, terminal, &caps, &config)
+            .unwrap();
+        // Both forks share immutable preparation but not committed residency.
+        let mut success = committed.clone();
+        let mut discarded = committed.clone();
+        placed.destination.x = 1;
+        scene.reconcile(&[ImageContribution::Present(placed)]);
+        let mut success_bytes = Vec::new();
+        success
+            .render(&mut success_bytes, &scene, terminal, &caps, &config)
+            .unwrap();
+        discarded
+            .render(&mut Vec::new(), &scene, terminal, &caps, &config)
+            .unwrap();
+        // Model enclosing flush failure: its bytes may have reached the host.
+        committed.invalidate_after_failed_output(&discarded);
+        let mut retry_bytes = Vec::new();
+        committed
+            .render(&mut retry_bytes, &scene, terminal, &caps, &config)
+            .unwrap();
+        let retry = String::from_utf8_lossy(&retry_bytes);
+        assert!(retry.find("d=I").unwrap() < retry.find("a=t").unwrap());
+        // The retry rebound the shared hint to its new generation. The success
+        // fork must reject that hint, revalidate exactly, then remain reusable.
+        let mut fork_bytes = Vec::new();
+        success
+            .render(&mut fork_bytes, &scene, terminal, &caps, &config)
+            .unwrap();
+        assert!(String::from_utf8_lossy(&fork_bytes).contains("a=p"));
+        assert!(!String::from_utf8_lossy(&fork_bytes).contains("a=t"));
+        crate::model::test_work::take();
+        success
+            .render(&mut Vec::new(), &scene, terminal, &caps, &config)
+            .unwrap();
+        let work = crate::model::test_work::take();
+        assert_eq!(work.hash_bytes, 0);
+        assert_eq!(work.equality_bytes, 0);
+    }
+
+    #[cfg(feature = "kitty")]
     fn distinct_pressure_png(value: u8) -> ImagePayload {
         use image::ImageEncoder;
         let mut bytes = Vec::new();
@@ -1177,6 +1242,62 @@ mod tests {
                 );
             }
             assert_eq!(uploaded.len(), 1);
+        }
+    }
+
+    /// Adapter-owned, unchanged representations must not rescan wire bytes on
+    /// warm frames. Keep this separate from the generic mutable PaneImage path,
+    /// which must continue checking content rather than trusting owner IDs.
+    #[cfg(feature = "kitty")]
+    #[test]
+    fn warm_owned_png_placement_does_not_hash_or_compare_payload_bytes() {
+        let caps = HostImageCapabilities {
+            kitty_graphics: true,
+            cell_pixel_width: 1,
+            cell_pixel_height: 1,
+            ..Default::default()
+        };
+        let terminal = PaneRect {
+            x: 0,
+            y: 0,
+            w: 40,
+            h: 20,
+        };
+        let config = ImageConfig::default();
+        let mut scene = ImageScene::default();
+        let mut placed = placement(
+            "frozen-warm",
+            Rect::new(0, 0, 8, 4),
+            Rect::new(0, 0, 40, 20),
+            0,
+        );
+        placed.payload = transition_png();
+        placed.fit = bmux_tui::image::ImageFit::Contain;
+        scene.reconcile(&[ImageContribution::Present(placed.clone())]);
+        let mut committed = TuiImageCompositor::new();
+        committed
+            .render(&mut Vec::new(), &scene, terminal, &caps, &config)
+            .unwrap();
+        let preparation = committed.work_counts();
+        for x in [1, 2, 1, 0] {
+            placed.destination.x = x;
+            scene.reconcile(&[ImageContribution::Present(placed.clone())]);
+            crate::model::test_work::take();
+            let mut candidate = committed.clone();
+            let mut output = Vec::new();
+            candidate
+                .render(&mut output, &scene, terminal, &caps, &config)
+                .unwrap();
+            let work = crate::model::test_work::take();
+            assert_eq!(candidate.work_counts(), preparation);
+            assert!(!String::from_utf8_lossy(&output).contains("a=t"));
+            assert_eq!(work.clone_bytes, 0);
+            assert_eq!(work.hash_bytes, 0, "warm owned PNG must not be rehashed");
+            assert_eq!(
+                work.equality_bytes, 0,
+                "warm owned PNG must not repeat canonical byte equality"
+            );
+            committed = candidate;
         }
     }
 
@@ -1661,7 +1782,7 @@ mod tests {
         };
         let mut compositor = TuiImageCompositor::new();
         let payload = super::decode_payload(&placed.key, &placed.payload, &config).unwrap();
-        let source = std::sync::Arc::new(crate::model::PaneImage {
+        let source = crate::frozen::FrozenImage::new(crate::model::PaneImage {
             id: 100,
             protocol: crate::model::ImageProtocol::KittyGraphics,
             position: crate::model::ImagePosition { row: 0, col: 0 },
@@ -1706,10 +1827,10 @@ mod tests {
             .contained_image(&placed, &source, &caps, &config)
             .unwrap();
         assert!(std::sync::Arc::ptr_eq(&clipped, &translated));
-        let mut revised = (*source).clone();
+        let mut revised = (**source).clone();
         revised.id += 1;
         revised.payload.pixels.as_mut().unwrap().data.fill(0);
-        let revised = std::sync::Arc::new(revised);
+        let revised = crate::frozen::FrozenImage::new(revised);
         compositor
             .contained_image(&placed, &revised, &caps, &config)
             .unwrap();
@@ -1841,7 +1962,7 @@ mod tests {
             );
             placed.fit = bmux_tui::image::ImageFit::Contain;
             let payload = super::decode_payload(&placed.key, &placed.payload, &config).unwrap();
-            let source = std::sync::Arc::new(crate::model::PaneImage {
+            let source = crate::frozen::FrozenImage::new(crate::model::PaneImage {
                 id: i,
                 protocol: crate::model::ImageProtocol::KittyGraphics,
                 position: crate::model::ImagePosition { row: 0, col: 0 },

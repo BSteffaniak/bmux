@@ -3369,9 +3369,34 @@ printf 'BMUXPRC1\000\000\000\004\000\001\004\000'
 sleep 60
 ";
 
+    // Consume one complete request before replying. An unsolicited response
+    // followed by immediate exit races the host's pre-request child-exit check
+    // and does not model a request/response worker.
     #[cfg(unix)]
-    const PERSISTENT_WORKER_RESPAWN_SCRIPT: &str = r"#!/bin/sh
-printf 'BMUXPRC1\000\000\000\004\000\001\002\000'
+    const PERSISTENT_WORKER_RESPAWN_SCRIPT: &str = r"
+import struct
+import sys
+
+
+def read_exact(length):
+    data = bytearray()
+    while len(data) < length:
+        part = sys.stdin.buffer.read(length - len(data))
+        if not part:
+            raise EOFError('incomplete process request frame')
+        data.extend(part)
+    return bytes(data)
+
+
+header = read_exact(12)
+if header[:8] != b'BMUXPRC1':
+    raise ValueError('invalid process request magic')
+length = struct.unpack('>I', header[8:])[0]
+if length > 16 * 1024 * 1024:
+    raise ValueError('process request exceeds fixture bound')
+read_exact(length)
+sys.stdout.buffer.write(b'BMUXPRC1\x00\x00\x00\x04\x00\x01\x02\x00')
+sys.stdout.buffer.flush()
 ";
 
     #[cfg(unix)]
@@ -4209,13 +4234,35 @@ minimum = "1.0"
             "process.worker.respawn.plugin",
             "Process Worker Respawn Plugin",
             &script_path,
-            "sh",
+            "python3",
         );
 
         let args: Vec<String> = Vec::new();
         let first = loaded
             .run_command("hello", &args)
             .expect("first worker command should run");
+        // Observe this exact owned child, not a PID probe or a guessed delay.
+        // Keep a deadline so a broken fixture cannot hang the test indefinitely.
+        let PluginBackend::Process(runtime) = &loaded.backend else {
+            panic!("expected process backend");
+        };
+        {
+            let mut guard = runtime.persistent.lock().expect("worker lock");
+            let worker = guard.as_mut().expect("first worker retained");
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                if let Some(status) = worker.child.try_wait().expect("poll owned first worker") {
+                    assert!(status.success(), "first worker failed: {status}");
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "first worker did not exit"
+                );
+                thread::yield_now();
+            }
+            drop(guard);
+        }
         let second = loaded
             .run_command("hello", &args)
             .expect("second worker command should run after respawn");
@@ -4223,6 +4270,7 @@ minimum = "1.0"
         assert_eq!(first, 1);
         assert_eq!(second, 1);
         let metrics = process_runtime_metrics_snapshot(&loaded);
+        assert!(metrics.persistent_respawns >= 1);
         assert!(metrics.persistent_respawns + metrics.persistent_retries >= 1);
 
         let _ = std::fs::remove_file(&script_path);

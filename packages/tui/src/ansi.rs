@@ -143,8 +143,14 @@ pub fn write_ansi_frame_diff(
     write!(writer, "\x1b[?25l")?;
     for y in area.y..area.bottom() {
         if let Some((start, end)) = changed_row_suffix(previous, current, y) {
-            emit_row_span(writer, current, y, start, end, &mut active_style)?;
-            changed_cells = changed_cells.saturating_add(usize::from(end.saturating_sub(start)));
+            changed_cells = changed_cells.saturating_add(emit_sparse_row_span(
+                writer,
+                previous,
+                current,
+                y,
+                start..end,
+                &mut active_style,
+            )?);
         }
     }
     write_ansi_style(writer, Style::new())?;
@@ -160,6 +166,62 @@ pub fn write_ansi_frame_diff(
         changed_cells,
         full_repaint: false,
     })
+}
+
+// Only skip gaps whose omitted output is exactly one byte per cell and cannot
+// affect the active style. A CUP is at most 14 bytes for u16 coordinates (plus
+// one), so 16 cells conservatively pays for it without buffering or costing SGR.
+fn emit_sparse_row_span(
+    writer: &mut impl Write,
+    previous: &Buffer,
+    current: &Buffer,
+    y: u16,
+    span: std::ops::Range<u16>,
+    active_style: &mut Style,
+) -> io::Result<usize> {
+    let mut start = span.start;
+    let mut x = start;
+    let mut written = 0;
+    while x < span.end {
+        let gap_start = x;
+        let style = current.get(Point::new(x, y)).map(|cell| cell.style);
+        while x < span.end {
+            let point = Point::new(x, y);
+            let Some(cell) = current.get(point) else {
+                break;
+            };
+            if previous.get(point) != Some(cell)
+                || Some(cell.style) != style
+                || cell.width() != 1
+                || cell.is_wide_continuation()
+                || cell.symbol.len() != 1
+                || !cell.symbol.as_bytes()[0].is_ascii_graphic() && cell.symbol != " "
+            {
+                break;
+            }
+            x += 1;
+        }
+        if x - gap_start >= 16
+            && gap_start > start
+            && x < span.end
+            && current
+                .get(Point::new(gap_start - 1, y))
+                .is_some_and(|cell| Some(cell.style) == style)
+            && current
+                .get(Point::new(x, y))
+                .is_some_and(|cell| Some(cell.style) == style && !cell.is_wide_continuation())
+        {
+            emit_row_span(writer, current, y, start, gap_start, active_style)?;
+            written += usize::from(gap_start - start);
+            start = x;
+        }
+        // Advance past a changed/ineligible cell; an eligible run was already scanned.
+        if x < span.end {
+            x += 1;
+        }
+    }
+    emit_row_span(writer, current, y, start, span.end, active_style)?;
+    Ok(written + usize::from(span.end - start))
 }
 
 fn changed_row_suffix(previous: &Buffer, current: &Buffer, y: u16) -> Option<(u16, u16)> {
@@ -588,6 +650,106 @@ mod tests {
     use crate::geometry::{Point, Rect};
     use crate::style::{Color, Modifier, Style};
     use crate::text::Line;
+
+    #[test]
+    fn distant_changes_bound_gap_bytes() {
+        for width in [80, 800, 8_000] {
+            let previous = Buffer::empty(Rect::new(0, 0, width, 1));
+            let mut current = previous.clone();
+            current.set_cell(Point::new(0, 0), "A", Style::new());
+            current.set_cell(Point::new(width - 1, 0), "Z", Style::new());
+            let mut reference = b"\x1b[?25l".to_vec();
+            reference.extend(reference_row_diff(&previous, &current));
+            let mut output = Vec::new();
+            let stats = write_ansi_frame_diff(&mut output, &previous, &current, None).unwrap();
+            eprintln!(
+                "sparse width={width}: reference_bytes={} new_bytes={}",
+                reference.len(),
+                output.len()
+            );
+            assert!(reference.len() > 40, "reference must fail the same budget");
+            assert_eq!(replay_frame(previous.clone(), &reference), current);
+            assert_eq!(replay_frame(previous, &output), current);
+            assert!(output.len() <= 40, "width {width}: {} bytes", output.len());
+            assert_eq!(stats.changed_cells, 2);
+            assert!(!output.windows(16).any(|bytes| bytes == b"                "));
+        }
+    }
+
+    // Replay just the frame encoder's wire vocabulary, independently of its span selection.
+    fn replay_frame(mut buffer: Buffer, wire: &[u8]) -> Buffer {
+        use unicode_segmentation::UnicodeSegmentation;
+
+        let wire = std::str::from_utf8(wire).unwrap();
+        let mut remaining = wire;
+        let mut point = Point::new(0, 0);
+        let mut style = Style::new();
+        while !remaining.is_empty() {
+            if let Some(csi) = remaining.strip_prefix("\x1b[") {
+                let end = csi.find(|ch: char| ch.is_ascii_alphabetic()).unwrap();
+                let parameters = &csi[..end];
+                match csi.as_bytes()[end] {
+                    b'H' => {
+                        let (row, col) = parameters.split_once(';').unwrap();
+                        point = Point::new(
+                            col.parse::<u16>().unwrap() - 1,
+                            row.parse::<u16>().unwrap() - 1,
+                        );
+                    }
+                    b'm' => super::apply_sgr(&mut style, parameters),
+                    b'h' | b'l' => {}
+                    command => panic!("unexpected CSI {command}"),
+                }
+                remaining = &csi[end + 1..];
+            } else {
+                let end = remaining.find('\x1b').unwrap_or(remaining.len());
+                for grapheme in remaining[..end].graphemes(true) {
+                    buffer.set_cell(point, grapheme, style);
+                    point.x += u16::try_from(super::display_width(grapheme)).unwrap();
+                }
+                remaining = &remaining[end..];
+            }
+        }
+        buffer
+    }
+
+    fn reference_row_diff(previous: &Buffer, current: &Buffer) -> Vec<u8> {
+        let mut wire = Vec::new();
+        let mut style = Style::new();
+        for y in current.area().y..current.area().bottom() {
+            if let Some((start, end)) = super::changed_row_suffix(previous, current, y) {
+                super::emit_row_span(&mut wire, current, y, start, end, &mut style).unwrap();
+            }
+        }
+        super::write_ansi_style(&mut wire, Style::new()).unwrap();
+        wire
+    }
+
+    #[test]
+    fn sparse_diff_matches_reference_wire_semantics_without_byte_growth() {
+        let red = Style::new().fg(Color::Red);
+        for gap in [0, 1, 8, 15, 16, 17, 40, 80] {
+            for symbol in ["x", "界", "👩‍💻", "e\u{301}"] {
+                for gap_style in [Style::new(), red] {
+                    let mut previous = Buffer::empty(Rect::new(0, 0, 100, 2));
+                    previous.fill(Rect::new(0, 0, 100, 2), ".", gap_style);
+                    previous.set_cell(Point::new(0, 0), "界", red);
+                    let mut current = previous.clone();
+                    current.set_cell(Point::new(0, 0), symbol, Style::new());
+                    current.set_cell(Point::new(3 + gap, 0), symbol, Style::new());
+                    current.set_cell(Point::new(1, 1), "👩‍💻", red);
+                    current.set_cell(Point::new(90, 1), "e\u{301}", red);
+                    let reference = reference_row_diff(&previous, &current);
+                    let mut wire = Vec::new();
+                    write_ansi_frame_diff(&mut wire, &previous, &current, None).unwrap();
+                    // The reference omits the common cursor-hide prefix.
+                    assert!(wire.len() <= reference.len() + b"\x1b[?25l".len());
+                    assert_eq!(replay_frame(previous.clone(), &reference), current);
+                    assert_eq!(replay_frame(previous, &wire), current);
+                }
+            }
+        }
+    }
 
     #[test]
     fn raw_cell_controls_cannot_escape_full_or_diff_output() {

@@ -9,6 +9,7 @@
 pub mod codec;
 pub mod compositor;
 pub mod config;
+mod frozen;
 pub mod host_caps;
 pub mod intercept;
 pub mod ipc_convert;

@@ -5,6 +5,9 @@ use std::time::Duration;
 /// Bounded scheduling and presentation configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RuntimeConfig {
+    /// Opt in to bounded queue-age, timing histograms and presentation samples.
+    /// Disabled by default; legacy counters and accumulated timings remain active.
+    pub collect_detailed_telemetry: bool,
     /// Maximum reliable application messages waiting for delivery.
     pub reliable_capacity: usize,
     /// Maximum terminal events waiting for delivery.
@@ -32,6 +35,7 @@ impl RuntimeConfig {
     #[must_use]
     pub fn normalized(self) -> Self {
         Self {
+            collect_detailed_telemetry: self.collect_detailed_telemetry,
             reliable_capacity: self.reliable_capacity.max(1),
             terminal_capacity: self.terminal_capacity.max(1),
             latest_capacity: self.latest_capacity.max(1),
@@ -49,6 +53,7 @@ impl RuntimeConfig {
 impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
+            collect_detailed_telemetry: false,
             reliable_capacity: 256,
             terminal_capacity: 64,
             latest_capacity: 128,

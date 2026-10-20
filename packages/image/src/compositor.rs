@@ -8,7 +8,7 @@
 mod cache;
 pub(crate) mod clipping;
 #[cfg(feature = "kitty")]
-mod residency;
+pub(crate) mod residency;
 #[cfg(all(test, any(feature = "kitty", feature = "sixel")))]
 mod tests;
 use std::io::Write;
@@ -49,6 +49,8 @@ pub struct KittyHostState {
     content_bytes: std::collections::HashMap<u64, usize>,
     #[cfg(feature = "kitty")]
     residency: residency::Residency,
+    #[cfg(feature = "kitty")]
+    frozen_upload: Option<std::sync::Arc<crate::frozen::FrozenImage>>,
     frame_seen: std::collections::HashSet<u64>,
     // Retained resources needed later in this frame, before their paint turn.
     frame_protected: std::collections::HashSet<u64>,
@@ -66,6 +68,21 @@ impl KittyHostState {
     /// Place an already-validated PNG with protocol-native aspect-preserving scaling.
     /// One cell dimension is deliberately omitted so Kitty derives it from source
     /// aspect ratio. No CPU resize, letterbox raster, or decoded upload is needed.
+    #[cfg(feature = "kitty")]
+    pub(crate) fn contain_frozen_png(
+        &mut self,
+        out: &mut impl Write,
+        image: &std::sync::Arc<crate::frozen::FrozenImage>,
+        placement: &bmux_tui::image::ImagePlacement,
+        caps: &HostImageCapabilities,
+        clip: bmux_tui::geometry::Rect,
+    ) -> std::io::Result<bool> {
+        self.frozen_upload = Some(std::sync::Arc::clone(image));
+        let result = self.contain_png(out, image, placement, caps, clip);
+        self.frozen_upload = None;
+        result
+    }
+
     #[cfg(feature = "kitty")]
     pub(crate) fn contain_png(
         &mut self,
@@ -241,6 +258,21 @@ impl KittyHostState {
     /// No resampling is needed: every cell boundary maps to an integer raster pixel.
     #[cfg(feature = "kitty")]
     pub(crate) fn contained_raster(
+        &mut self,
+        out: &mut impl Write,
+        image: &std::sync::Arc<crate::frozen::FrozenImage>,
+        placement: &bmux_tui::image::ImagePlacement,
+        caps: &HostImageCapabilities,
+        clip: bmux_tui::geometry::Rect,
+    ) -> std::io::Result<()> {
+        self.frozen_upload = Some(std::sync::Arc::clone(image));
+        let result = self.contained_raster_impl(out, image, placement, caps, clip);
+        self.frozen_upload = None;
+        result
+    }
+
+    #[cfg(feature = "kitty")]
+    fn contained_raster_impl(
         &mut self,
         out: &mut impl Write,
         image: &PaneImage,
@@ -1036,8 +1068,20 @@ fn upload_kitty_data(
     state.emit_repair(out)?;
     // Content identity never supplies placement identity. In particular two
     // owners at the same cell still need two independent host placements.
-    let hash = residency::Residency::fingerprint(format, width, height, data);
-    let existing = state.residency.find(hash, format, width, height, data);
+    // A frozen hint is applicable only to the exact wire slice borrowed from
+    // its privately owned image, never to arbitrary caller-owned Arc storage.
+    let frozen = state.frozen_upload.clone().filter(|frozen| {
+        let (f, bytes, w, h) = frozen.wire();
+        f == format && w == width && h == height && std::ptr::eq(bytes, data)
+    });
+    let warm = frozen
+        .as_ref()
+        .and_then(|frozen| state.residency.find_frozen(frozen));
+    let hash = frozen.as_ref().map_or_else(
+        || residency::Residency::fingerprint(format, width, height, data),
+        |frozen| frozen.fingerprint(),
+    );
+    let existing = warm.or_else(|| state.residency.find(hash, format, width, height, data));
     let content_id = if let Some(id) = existing {
         id
     } else if state.resources.contains_key(&image.id) {
@@ -1088,9 +1132,16 @@ fn upload_kitty_data(
         }
     }
     if existing.is_none() {
-        state
-            .residency
-            .insert(content_id, hash, format, width, height, data);
+        if let Some(frozen) = &frozen {
+            state.residency.insert_frozen(content_id, hash, frozen);
+        } else {
+            state
+                .residency
+                .insert(content_id, hash, format, width, height, data);
+        }
+    }
+    if let Some(frozen) = &frozen {
+        state.residency.bind(content_id, frozen);
     }
     state.residency.alias(image.id, content_id);
     state

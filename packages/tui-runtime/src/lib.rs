@@ -47,9 +47,14 @@ pub use mailbox::{LatestSendError, LatestSendOutcome, LatestSender, SendError, T
 pub use presenter::{HeadlessPresenter, PresentReport, Presenter, ResetReason};
 pub use program::{Invalidation, Lifecycle, Program, RuntimeEvent, Update};
 pub use runtime::{Runtime, RuntimeError, RuntimeHandle, RuntimeOutput};
-pub use stats::RuntimeStats;
+pub use stats::{
+    DetailedRuntimeStats, DurationHistogram, PresentationSample, QueueSource, RuntimeStats,
+    TerminalDispatchRange,
+};
 pub use subscription::Subscription;
 pub use terminal_presenter::TerminalPresenter;
 
+#[cfg(test)]
+mod telemetry_bench;
 #[cfg(test)]
 mod tests;

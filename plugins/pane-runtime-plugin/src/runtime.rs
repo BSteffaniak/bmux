@@ -12238,9 +12238,13 @@ pub fn activate_pane_runtime(config: PaneRuntimePluginConfig, padding_config: Pa
         }
     });
 
-    let shutdown_rx = watch::channel(false).1;
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let exit_manager = Arc::clone(&manager);
     tokio::spawn(async move {
+        // No external shutdown owner is wired here. Keep the sender alive for
+        // this task's scope: exit_rx closure or runtime abort owns its lifetime.
+        // A named binding (not `let _ = ...`) drops only after the await ends.
+        let _shutdown_guard = shutdown_tx;
         process_pane_exit_events(exit_manager, pane_exit_rx, shutdown_rx).await;
     });
 
@@ -12277,6 +12281,72 @@ pub fn activate_pane_runtime(config: PaneRuntimePluginConfig, padding_config: Pa
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn activated_exit_consumer_survives_initialization_and_publishes_exit() {
+        let bus = bmux_plugin::global_event_bus();
+        bus.register_channel::<PaneEvent>(pane_runtime_events::EVENT_KIND);
+        let mut events = bus
+            .subscribe::<PaneEvent>(&pane_runtime_events::EVENT_KIND)
+            .unwrap();
+        activate_pane_runtime(
+            PaneRuntimePluginConfig {
+                shell: "/bin/sh".into(),
+                pane_term: "xterm-256color".into(),
+                bracketed_paste: true,
+                shell_integration_root: None,
+            },
+            PanePaddingConfig::default(),
+        );
+        let manager = spawn_runtime_handle().expect("activated runtime").0;
+        let session_id = SessionId(Uuid::new_v4());
+        let pane_id = Uuid::new_v4();
+        let reason = "activation exit regression";
+        let mut runtime = runtime_with_panes(&[pane_id]);
+        let pane = runtime.panes.get_mut(&pane_id).unwrap();
+        pane.exited.store(true, Ordering::SeqCst);
+        *pane.exit_reason.lock().unwrap() = Some(reason.to_owned());
+        let exit_tx = {
+            let mut manager = manager.lock().unwrap();
+            manager.runtimes.insert(session_id, runtime);
+            manager.pane_exit_tx.clone()
+        };
+        // Let the activation task poll its shutdown receiver before enqueueing
+        // exit. The old disconnected watch sender closes this listener here.
+        tokio::task::yield_now().await;
+        assert!(
+            !exit_tx.is_closed(),
+            "activation dropped the pane exit listener"
+        );
+        exit_tx
+            .send(PaneExitEvent {
+                session_id,
+                pane_id,
+            })
+            .unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let event = events.recv().await.unwrap();
+                if matches!(&*event, PaneEvent::Exited { session_id: sid, pane_id: pid, .. }
+                    if *sid == session_id.0 && *pid == pane_id)
+                {
+                    break event;
+                }
+            }
+        })
+        .await
+        .expect("activated consumer must publish the typed exit");
+        assert!(
+            matches!(&*event, PaneEvent::Exited { reason: Some(actual), .. } if actual == reason)
+        );
+        let mut removed = manager
+            .lock()
+            .unwrap()
+            .runtimes
+            .remove(&session_id)
+            .unwrap();
+        removed.panes.remove(&pane_id).unwrap().task.abort();
+    }
+
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn missing_helper_rejects_an_ordinary_shell_before_spawn() {

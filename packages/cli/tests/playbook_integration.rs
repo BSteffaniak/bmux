@@ -52,6 +52,10 @@ impl TempDirGuard {
 
 impl Drop for TempDirGuard {
     fn drop(&mut self) {
+        if std::thread::panicking() {
+            eprintln!("playbook evidence retained at {}", self.path.display());
+            return;
+        }
         let _ = std::fs::remove_dir_all(&self.path);
     }
 }
@@ -1877,24 +1881,164 @@ assert-screen contains='concurrent_test'
 // B: Shell exit mid-playbook
 // ---------------------------------------------------------------------------
 
-#[test]
-fn playbook_shell_exit_mid_playbook() {
-    let (json, pass) = run_playbook_fixture("shell_exit.dsl");
-    assert!(!pass, "should fail after shell exit: {json:#}");
+#[tokio::test]
+#[serial]
+async fn playbook_shell_exit_mid_playbook() {
+    use bmux_pane_runtime_plugin_api::pane_runtime_events::{EVENT_KIND, PaneEvent};
+    use tokio::io::BufReader;
 
-    // Verify we got a failure, not a hang or panic.
-    let steps = json["steps"].as_array().expect("should have steps");
-    let failed = steps.iter().find(|s| s["status"] == "fail");
-    assert!(
-        failed.is_some(),
-        "should have a failed step after shell exit: {json:#}"
+    fn pane_event(message: &serde_json::Value) -> Option<PaneEvent> {
+        let event: bmux_client::ServerEvent =
+            serde_json::from_value(message["server_event"]["payload"].clone()).ok()?;
+        let bmux_client::ServerEvent::PluginBusEvent { kind, payload } = event else {
+            return None;
+        };
+        (kind == EVENT_KIND.as_str())
+            .then(|| serde_json::from_slice(&payload).ok())
+            .flatten()
+    }
+
+    let sandbox = BmuxCommandSandbox::new("shell-exit-barrier");
+    let mut child = sandbox
+        .command()
+        .args([
+            "playbook",
+            "interactive",
+            "--viewport",
+            "80x24",
+            "--shell",
+            "sh",
+            "--timeout",
+            "120",
+        ])
+        .env("BMUX_PLAYBOOK_ENV_MODE", "clean")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn interactive exit fixture");
+    let _guard = ProcessGuard::new(&child);
+    let mut stderr = child.stderr.take().expect("stderr pipe");
+    let stderr_path = sandbox.root.path().join("interactive.stderr");
+    let stderr_task = std::thread::spawn(move || {
+        use std::io::Read;
+        let mut file = std::fs::File::create(stderr_path).expect("diagnostic file");
+        std::io::copy(&mut stderr.by_ref().take(16_384), &mut file)
+            .expect("bounded stderr capture");
+        std::io::copy(&mut stderr, &mut std::io::sink()).expect("drain remaining stderr");
+    });
+    let stdout = child.stdout.take().expect("stdout pipe");
+    let mut ready_reader = std::io::BufReader::new(stdout);
+    let mut ready_line = String::new();
+    std::io::BufRead::read_line(&mut ready_reader, &mut ready_line).expect("ready line");
+    let ready: serde_json::Value = serde_json::from_str(&ready_line).expect("ready JSON");
+    let endpoint = endpoint_from_socket_path(ready["socket"].as_str().expect("socket"));
+    let stream = bmux_ipc::transport::LocalIpcStream::connect(&endpoint)
+        .await
+        .expect("interactive socket");
+    let (reader, mut writer) = tokio::io::split(stream);
+    let mut reader = BufReader::new(reader);
+    send_json_line(
+        &mut writer,
+        &serde_json::json!({"op":"command","request_id":"exit-new","dsl":"new-session"}),
+    )
+    .await;
+    let created = read_response_for_request_id(&mut reader, "exit-new").await;
+    assert_eq!(created["status"], "ok", "{created:#}");
+    send_json_line(
+        &mut writer,
+        &serde_json::json!({"op":"status","request_id":"exit-status"}),
+    )
+    .await;
+    let status = read_response_for_request_id(&mut reader, "exit-status").await;
+    let session_id: uuid::Uuid = status["session_id"]
+        .as_str()
+        .expect("session identity")
+        .parse()
+        .unwrap();
+    assert_eq!(status["pane_count"], 1);
+    send_json_line(&mut writer, &serde_json::json!({"op":"subscribe","request_id":"exit-subscribe","event_types":["server_event"]})).await;
+    let mut evidence = std::fs::File::create(sandbox.root.path().join("barrier-events.jsonl"))
+        .expect("event diagnostic file");
+    let mut remaining_evidence = 64 * 1024;
+    let mut capture = |message: &serde_json::Value| {
+        use std::io::Write;
+        let mut bytes = serde_json::to_vec(message).expect("event diagnostic JSON");
+        bytes.push(b'\n');
+        let length = bytes.len().min(remaining_evidence);
+        evidence
+            .write_all(&bytes[..length])
+            .expect("bounded event diagnostics");
+        remaining_evidence -= length;
+    };
+    let subscribed = read_response_for_request_id(&mut reader, "exit-subscribe").await;
+    capture(&subscribed);
+    assert_eq!(subscribed["status"], "ok", "{subscribed:#}");
+    // Identify this sole pane from a typed event while it is still alive.
+    send_json_line(&mut writer, &serde_json::json!({"op":"command","request_id":"exit-probe","dsl":"send-keys keys='printf EXIT_BARRIER_READY\\r'"})).await;
+    let observed = tokio::time::timeout(std::time::Duration::from_secs(3),
+        read_until_json(&mut reader, 128, "typed pane identity", |msg| {
+            capture(msg);
+            matches!(pane_event(msg), Some(PaneEvent::OutputAvailable { session_id: sid, .. }) if sid == session_id)
+        })).await.expect("pane identity deadline");
+    let Some(PaneEvent::OutputAvailable { pane_id, .. }) = pane_event(&observed) else {
+        panic!("expected typed pane identity: {observed:#}");
+    };
+    let exit_dsl = "send-keys keys='exit\\r'";
+    let (parsed, _) = bmux_cli::playbook::parse_dsl::parse_dsl(exit_dsl).unwrap();
+    assert!(matches!(&parsed.steps[0].action,
+        bmux_cli::playbook::types::Action::SendKeys { keys, .. } if keys == b"exit\r"));
+    send_json_line(
+        &mut writer,
+        &serde_json::json!({"op":"command","request_id":"exit-send","dsl":exit_dsl}),
+    )
+    .await;
+    // Do not discard an exit event that arrives before the command response.
+    let exited = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        read_until_json(&mut reader, 128, "authoritative pane exit", |msg| {
+            capture(msg);
+            matches!(pane_event(msg), Some(PaneEvent::Exited { session_id: sid, pane_id: pid, .. })
+                if sid == session_id && pid == pane_id)
+        }),
+    )
+    .await;
+    if exited.is_err() {
+        send_json_line(&mut writer, &serde_json::json!({"op":"hydrate","request_id":"exit-diagnostic","kind":"screen_full"})).await;
+        if let Ok(screen) = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            read_response_for_request_id(&mut reader, "exit-diagnostic"),
+        )
+        .await
+        {
+            capture(&screen);
+        }
+    }
+    let exited = exited.expect("matching pane exit deadline");
+    assert_eq!(exited["server_event"]["name"], "pane_exited");
+    send_json_line(&mut writer, &serde_json::json!({"op":"command","request_id":"after-exit","dsl":"send-keys keys='echo after_exit\\r'"})).await;
+    let rejected = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        read_response_for_request_id(&mut reader, "after-exit"),
+    )
+    .await
+    .expect("post-exit rejection deadline");
+    capture(&rejected);
+    assert_eq!(
+        rejected["status"], "fail",
+        "input admitted after authoritative exit: {rejected:#}"
     );
-    // The failed step should have a detail with an error message.
-    let detail = failed.unwrap()["detail"].as_str().unwrap_or("");
     assert!(
-        !detail.is_empty(),
-        "failed step should have a detail: {json:#}"
+        !rejected["error"].as_str().unwrap_or("").is_empty(),
+        "missing rejection detail: {rejected:#}"
     );
+    send_json_line(
+        &mut writer,
+        &serde_json::json!({"op":"quit","request_id":"exit-quit"}),
+    )
+    .await;
+    let _ = read_response_for_request_id(&mut reader, "exit-quit").await;
+    assert!(child.wait().expect("interactive child exit").success());
+    stderr_task.join().expect("stderr capture thread");
 }
 
 // ---------------------------------------------------------------------------

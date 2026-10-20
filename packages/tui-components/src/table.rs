@@ -1370,6 +1370,11 @@ impl Component for BodyRows<'_, '_> {
     }
 
     fn paint(&self, _layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
+        #[cfg(test)]
+        if tests::REFERENCE_BODY.with(std::cell::Cell::get) {
+            tests::paint_reference_body(self, cx);
+            return;
+        }
         let body = self.layout.body;
         let offset = self.state.scroll.vertical_offset();
         let end = offset.saturating_add(u64::from(body.height));
@@ -1378,32 +1383,47 @@ impl Component for BodyRows<'_, '_> {
             if row >= end {
                 break;
             }
-            for line_index in 0..table_row.height() {
-                if row >= offset && row < end {
-                    let line = self.table.row_line(
+            let height = table_row.height();
+            let next_row = row.saturating_add(height);
+            let first = offset.saturating_sub(row).min(height);
+            let last = end.saturating_sub(row).min(height);
+            // Since row < end and line_index < end - row, every visited
+            // logical row is strictly below end, even when end is u64::MAX.
+            // Empty ranges skip offscreen rows without traversing their lines.
+            for line_index in first..last {
+                #[cfg(test)]
+                tests::BODY_LINE_VISITS.with(|visits| visits.set(visits.get() + 1));
+                let logical_row = row
+                    .checked_add(line_index)
+                    .expect("visible line is strictly below the viewport end");
+                let line = self.table.row_line(
+                    &self.layout.column_widths,
+                    table_row.cells.iter().map(|cell| {
+                        cell.get(usize::try_from(line_index).unwrap_or(usize::MAX))
+                            .cloned()
+                            .unwrap_or_else(|| Line::from(""))
+                    }),
+                    false,
+                    Some(source),
+                    self.state,
+                );
+                cx.write_line_with_fallback_style(
+                    LocalRect::new(
+                        0,
+                        i64::try_from(logical_row).unwrap_or(i64::MAX),
+                        body.width,
+                        1,
+                    ),
+                    &self.table.visible_line(
+                        &line,
                         &self.layout.column_widths,
-                        table_row.cells.iter().map(|cell| {
-                            cell.get(usize::try_from(line_index).unwrap_or(usize::MAX))
-                                .cloned()
-                                .unwrap_or_else(|| Line::from(""))
-                        }),
-                        false,
-                        Some(source),
                         self.state,
-                    );
-                    cx.write_line_with_fallback_style(
-                        LocalRect::new(0, i64::try_from(row).unwrap_or(i64::MAX), body.width, 1),
-                        &self.table.visible_line(
-                            &line,
-                            &self.layout.column_widths,
-                            self.state,
-                            body.width,
-                        ),
-                        self.table.row_style(source, table_row, self.state),
-                    );
-                }
-                row = row.saturating_add(1);
+                        body.width,
+                    ),
+                    self.table.row_style(source, table_row, self.state),
+                );
             }
+            row = next_row;
         }
     }
 }
@@ -1796,6 +1816,135 @@ mod tests {
         Table, TableAlign, TableColumn, TableComponent, TableHit, TableOutcome, TablePolicy,
         TableRow, TableSortDirection, TableState, TableStyles, format_cell,
     };
+
+    std::thread_local! {
+        pub(super) static BODY_LINE_VISITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+        pub(super) static REFERENCE_BODY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    // Keep the original exhaustive traversal as an independent paint oracle.
+    pub(super) fn paint_reference_body(body: &super::BodyRows<'_, '_>, cx: &mut PaintCx<'_, '_>) {
+        let offset = body.state.scroll.vertical_offset();
+        let end = offset.saturating_add(u64::from(body.layout.body.height));
+        let mut row = 0u64;
+        for (source, table_row) in body.table.rows.iter().enumerate() {
+            if row >= end {
+                break;
+            }
+            for line_index in 0..table_row.height() {
+                BODY_LINE_VISITS.with(|visits| visits.set(visits.get() + 1));
+                if row >= offset && row < end {
+                    let line = body.table.row_line(
+                        &body.layout.column_widths,
+                        table_row.cells.iter().map(|cell| {
+                            cell.get(usize::try_from(line_index).unwrap_or(usize::MAX))
+                                .cloned()
+                                .unwrap_or_else(|| Line::from(""))
+                        }),
+                        false,
+                        Some(source),
+                        body.state,
+                    );
+                    cx.write_line_with_fallback_style(
+                        LocalRect::new(
+                            0,
+                            i64::try_from(row).unwrap_or(i64::MAX),
+                            body.layout.body.width,
+                            1,
+                        ),
+                        &body.table.visible_line(
+                            &line,
+                            &body.layout.column_widths,
+                            body.state,
+                            body.layout.body.width,
+                        ),
+                        body.table.row_style(source, table_row, body.state),
+                    );
+                }
+                row = row.saturating_add(1);
+            }
+        }
+    }
+
+    #[test]
+    fn body_line_visits_are_viewport_bounded_and_match_exhaustive_paint() {
+        let columns = [TableColumn::new("Unicode").fixed(12)];
+        let rich = Line::from_spans([
+            Span::styled("界e\u{301}", Style::new().fg(Color::Yellow)),
+            Span::raw(" 👩‍💻 tail"),
+        ]);
+        for height in [32usize, 100_000] {
+            // A fully skipped row, a partially visible row, then a short row.
+            let rows = [
+                TableRow::multiline(vec![vec![rich.clone(); height]]),
+                TableRow::multiline(vec![vec![rich.clone(); height]]).disabled(true),
+                TableRow::new(["last"]),
+            ];
+            let table = Table::new(&columns, &rows).policy(TablePolicy {
+                auto_scroll_selected: false,
+                ..TablePolicy::default()
+            });
+            for area in [
+                Rect::new(0, 0, 12, 5),
+                Rect::new(2, 1, 7, 3),
+                Rect::new(0, 0, 12, 0),
+            ] {
+                for offset in [
+                    0,
+                    u64::try_from(height - 1).expect("test offset fits"),
+                    u64::try_from(height + 1).expect("test offset fits"),
+                    u64::try_from(2 * height - 2).expect("test offset fits"),
+                    u64::MAX,
+                ] {
+                    for focused in [false, true] {
+                        let mut state = TableState::new(Some(1));
+                        state.set_focused(focused);
+                        state.set_selected_column(Some(0));
+                        state.set_scroll(offset);
+                        state.set_horizontal_scroll(1);
+                        let bounds = Rect::new(0, 0, 16, 8);
+                        let mut actual = Buffer::empty(bounds);
+                        BODY_LINE_VISITS.with(|visits| visits.set(0));
+                        let actual_hits = {
+                            let mut frame = Frame::new(&mut actual);
+                            table.render(area, &state, &mut frame);
+                            frame.hits().regions().to_vec()
+                        };
+                        let visits = BODY_LINE_VISITS.with(std::cell::Cell::get);
+                        let mut expected = Buffer::empty(bounds);
+                        REFERENCE_BODY.with(|reference| reference.set(true));
+                        let expected_hits = {
+                            let mut frame = Frame::new(&mut expected);
+                            table.render(area, &state, &mut frame);
+                            frame.hits().regions().to_vec()
+                        };
+                        REFERENCE_BODY.with(|reference| reference.set(false));
+                        let reference_visits = BODY_LINE_VISITS.with(std::cell::Cell::get) - visits;
+                        assert_eq!(actual, expected, "cells/styles at offset {offset}");
+                        assert_eq!(actual_hits, expected_hits, "hits at offset {offset}");
+                        let layout = table.layout(area);
+                        assert_eq!(
+                            visits,
+                            u64::from(layout.body.height),
+                            "inner traversal must not depend on offscreen line count"
+                        );
+                        if layout.body.height > 0 {
+                            assert!(
+                                reference_visits > visits,
+                                "reference traverses offscreen lines"
+                            );
+                            if offset == 0 {
+                                assert_eq!(reference_visits, u64::try_from(height).unwrap());
+                                assert_eq!(visits, u64::from(layout.body.height));
+                            }
+                        } else {
+                            assert_eq!(reference_visits, 0);
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn table_paint_revision_tracks_hover_and_sticky_columns() {

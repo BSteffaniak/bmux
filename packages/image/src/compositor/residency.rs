@@ -3,6 +3,7 @@ use std::collections::{HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
+use crate::frozen::FrozenImage;
 use crate::model::KittyFormat;
 
 #[derive(Clone, Debug)]
@@ -10,11 +11,27 @@ struct Content {
     format: KittyFormat,
     width: u32,
     height: u32,
-    bytes: Arc<[u8]>,
+    bytes: ContentBytes,
+    generation: Arc<()>,
+}
+
+#[derive(Clone, Debug)]
+enum ContentBytes {
+    Checked(Arc<[u8]>),
+    Frozen(Arc<FrozenImage>),
+}
+
+impl ContentBytes {
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Self::Checked(bytes) => bytes,
+            Self::Frozen(image) => image.wire().1,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
-pub(super) struct Residency {
+pub(crate) struct Residency {
     entries: HashMap<u64, Content>,
     index: HashMap<u64, Vec<u64>>,
     // Only recent owners are useful for pre-paint protection; never retain an
@@ -49,7 +66,7 @@ impl Residency {
             content.format == format && content.width == width && content.height == height && {
                 #[cfg(test)]
                 crate::model::test_work::update(|counts| counts.equality_bytes += bytes.len());
-                &*content.bytes == bytes
+                content.bytes.bytes() == bytes
             }
         })
     }
@@ -69,10 +86,36 @@ impl Residency {
                 format,
                 width,
                 height,
-                bytes: Arc::from(bytes),
+                bytes: ContentBytes::Checked(Arc::from(bytes)),
+                generation: Arc::new(()),
             },
         );
         self.index.entry(hash).or_default().push(id);
+    }
+
+    pub fn find_frozen(&self, frozen: &FrozenImage) -> Option<u64> {
+        let (id, generation) = frozen.binding()?;
+        let content = self.entries.get(&id)?;
+        Arc::ptr_eq(&generation, &content.generation).then_some(id)
+    }
+
+    pub fn insert_frozen(&mut self, id: u64, hash: u64, frozen: &Arc<FrozenImage>) {
+        let (format, _, width, height) = frozen.wire();
+        self.entries.insert(
+            id,
+            Content {
+                format,
+                width,
+                height,
+                bytes: ContentBytes::Frozen(Arc::clone(frozen)),
+                generation: Arc::new(()),
+            },
+        );
+        self.index.entry(hash).or_default().push(id);
+    }
+
+    pub fn bind(&self, id: u64, frozen: &FrozenImage) {
+        frozen.bind(id, &self.entries[&id].generation);
     }
 
     pub fn alias(&mut self, owner: u64, content: u64) {
@@ -113,7 +156,7 @@ impl Residency {
     pub fn retained_bytes(&self) -> usize {
         self.entries
             .values()
-            .map(|content| content.bytes.len())
+            .map(|content| content.bytes.bytes().len())
             .sum()
     }
 
@@ -150,6 +193,75 @@ mod tests {
         residency.remove(1);
         assert_eq!(residency.resolve(2), 2);
         assert!(residency.index.is_empty());
+    }
+
+    fn frozen(value: u8) -> Arc<FrozenImage> {
+        use crate::model::{
+            ImageCellSize, ImagePayload, ImagePixelSize, ImagePosition, ImageProtocol, PaneImage,
+            PixelBuffer, PixelFormat,
+        };
+        FrozenImage::new(PaneImage {
+            id: 1,
+            protocol: ImageProtocol::KittyGraphics,
+            position: ImagePosition { row: 0, col: 0 },
+            cell_size: ImageCellSize::default(),
+            pixel_size: ImagePixelSize {
+                width: 1,
+                height: 1,
+            },
+            payload: ImagePayload {
+                raw: None,
+                pixels: Some(PixelBuffer {
+                    width: 1,
+                    height: 1,
+                    format: PixelFormat::Rgba8,
+                    data: vec![value; 4],
+                }),
+            },
+        })
+    }
+
+    #[test]
+    fn frozen_generation_checks_candidate_branches_eviction_and_id_reuse() {
+        let image = frozen(1);
+        let mut committed = Residency::default();
+        committed.insert_frozen(1, 7, &image);
+        committed.bind(1, &image);
+        let mut candidate = committed.clone();
+        assert_eq!(candidate.find_frozen(&image), Some(1));
+        candidate.remove(1);
+        let replacement = frozen(2);
+        candidate.insert_frozen(1, 7, &replacement);
+        assert_eq!(candidate.find_frozen(&image), None);
+        // Candidate failure must not invalidate the committed generation.
+        assert_eq!(committed.find_frozen(&image), Some(1));
+        candidate.bind(1, &replacement);
+        assert_eq!(candidate.find_frozen(&replacement), Some(1));
+        assert_eq!(committed.find_frozen(&replacement), None);
+        candidate.clear();
+        assert_eq!(candidate.find_frozen(&replacement), None);
+    }
+
+    #[test]
+    fn frozen_new_handles_require_exact_collision_checked_canonicalization() {
+        let first = frozen(1);
+        let equal = frozen(1);
+        let changed = frozen(2);
+        let mut residency = Residency::default();
+        residency.insert_frozen(1, 7, &first);
+        assert_eq!(residency.find_frozen(&equal), None);
+        let (_, bytes, _, _) = equal.wire();
+        assert_eq!(residency.find(7, KittyFormat::Rgba, 1, 1, bytes), Some(1));
+        residency.bind(1, &equal);
+        assert_eq!(residency.find_frozen(&equal), Some(1));
+        let (_, bytes, _, _) = changed.wire();
+        assert_eq!(residency.find(7, KittyFormat::Rgba, 1, 1, bytes), None);
+        // Residency shares storage rather than cloning a second equality buffer.
+        let ContentBytes::Frozen(retained) = &residency.entries[&1].bytes else {
+            panic!("frozen entry must share storage");
+        };
+        assert!(Arc::ptr_eq(retained, &first));
+        assert_eq!(residency.retained_bytes(), 4);
     }
 
     #[test]

@@ -19,6 +19,46 @@ mod linux_process_groups;
 #[cfg(target_os = "linux")]
 use linux_process_groups::groups;
 
+// These are administrator-managed system locations, including NixOS's system
+// profile. They carry the same trusted-system authority assumption as /bin/ps;
+// never search the caller's PATH or fall back after an execution failure.
+#[cfg(not(target_os = "linux"))]
+fn ps_program() -> io::Result<&'static std::path::Path> {
+    select_ps_program(
+        &["/bin/ps", "/usr/bin/ps", "/run/current-system/sw/bin/ps"],
+        |path| {
+            use std::os::unix::fs::PermissionsExt;
+            let metadata = path.metadata()?;
+            if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "cleanup ps is not an executable file",
+                ));
+            }
+            Ok(())
+        },
+    )
+}
+
+#[cfg(any(not(target_os = "linux"), test))]
+fn select_ps_program<'a>(
+    candidates: &[&'a str],
+    mut check: impl FnMut(&std::path::Path) -> io::Result<()>,
+) -> io::Result<&'a std::path::Path> {
+    for &candidate in candidates {
+        let path = std::path::Path::new(candidate);
+        match check(path) {
+            Ok(()) => return Ok(path),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        "cleanup ps unavailable in trusted system locations",
+    ))
+}
+
 #[cfg(not(target_os = "linux"))]
 fn groups(
     session: i32,
@@ -27,7 +67,7 @@ fn groups(
     deadline: Instant,
 ) -> io::Result<BTreeSet<i32>> {
     let bytes = probe::capture(
-        Command::new("/bin/ps")
+        Command::new(ps_program()?)
             .args(["-axo", "pid=,pgid=,stat="])
             .env_clear()
             .stdin(Stdio::null())
@@ -148,6 +188,46 @@ pub(super) fn join_and_kill(group: &str) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trusted_ps_selection_is_ordered_and_missing_is_fail_closed() {
+        let candidates = ["/bin/ps", "/usr/bin/ps", "/run/current-system/sw/bin/ps"];
+        for available in 0..candidates.len() {
+            let mut visited = Vec::new();
+            let selected = select_ps_program(&candidates, |path| {
+                visited.push(path.to_owned());
+                if path == std::path::Path::new(candidates[available]) {
+                    Ok(())
+                } else {
+                    Err(io::Error::from(io::ErrorKind::NotFound))
+                }
+            })
+            .unwrap();
+            assert_eq!(selected, std::path::Path::new(candidates[available]));
+            assert_eq!(visited.len(), available + 1);
+        }
+        let error = select_ps_program(&candidates, |_| {
+            Err(io::Error::from(io::ErrorKind::NotFound))
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert!(error.to_string().contains("trusted system locations"));
+    }
+
+    #[test]
+    fn trusted_ps_selection_does_not_mask_access_or_metadata_failures() {
+        for kind in [io::ErrorKind::PermissionDenied, io::ErrorKind::Other] {
+            let mut checks = 0;
+            let error = select_ps_program(&["/bin/ps", "/usr/bin/ps"], |_| {
+                checks += 1;
+                Err(io::Error::from(kind))
+            })
+            .unwrap_err();
+            assert_eq!(error.kind(), kind);
+            assert_eq!(checks, 1, "only absence permits the next system location");
+        }
+    }
+
     #[test]
     fn residual_members_are_not_hidden_by_successful_join_helper() {
         let error = sweep_with(|| Ok(BTreeSet::from([42])), |_| Ok(())).unwrap_err();

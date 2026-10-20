@@ -390,6 +390,92 @@ mod tests {
     }
 
     #[test]
+    fn sparse_output_short_writes_and_failures_repair_transactionally() {
+        struct ShortWriter {
+            bytes: Vec<u8>,
+            remaining: Option<usize>,
+            fail_flush: bool,
+        }
+        impl Write for ShortWriter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if self.remaining == Some(0) {
+                    self.remaining = None;
+                    return Err(io::Error::other("injected prefix failure"));
+                }
+                let count = bytes.len().min(3).min(self.remaining.unwrap_or(usize::MAX));
+                self.bytes.extend_from_slice(&bytes[..count]);
+                if let Some(remaining) = &mut self.remaining {
+                    *remaining -= count;
+                }
+                Ok(count)
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                if self.fail_flush {
+                    Err(io::Error::other("injected flush failure"))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        let paint = |cx: &mut PaintCx<'_, '_>| {
+            cx.fill(LocalRect::new(0, 0, 1, 1), "A", Style::new());
+            cx.fill(LocalRect::new(79, 0, 1, 1), "Z", Style::new());
+            cx.push_hit(HitRegion::new("new", cx.clip()).focusable(true));
+            cx.set_cursor(Point::new(79, 0), true);
+        };
+        for (budget, fail_flush) in [
+            (Some(0), false),
+            (Some(1), false),
+            (Some(6), false),
+            (Some(12), false),
+            (Some(20), false),
+            (Some(30), false),
+            (None, true),
+            (None, false),
+        ] {
+            let mut terminal = Terminal::new(
+                ShortWriter {
+                    bytes: Vec::new(),
+                    remaining: None,
+                    fail_flush: false,
+                },
+                Rect::new(0, 0, 80, 1),
+            );
+            terminal
+                .draw(|cx| {
+                    cx.push_hit(HitRegion::new("old", cx.clip()).focusable(true));
+                    cx.set_cursor(Point::new(0, 0), true);
+                })
+                .unwrap();
+            terminal.writer_mut().bytes.clear();
+            terminal.writer_mut().remaining = budget;
+            terminal.writer_mut().fail_flush = fail_flush;
+            let result = terminal.draw(paint);
+            if budget.is_some() || fail_flush {
+                assert!(result.is_err());
+                assert!(terminal.retained_buffer().is_none());
+                assert_eq!(terminal.hits().regions()[0].id.as_str(), "old");
+                assert_eq!(terminal.focused().unwrap().as_str(), "old");
+                assert_eq!(terminal.cursor(), Some(Cursor::visible(Point::new(0, 0))));
+                terminal.writer_mut().remaining = None;
+                terminal.writer_mut().fail_flush = false;
+                terminal.writer_mut().bytes.clear();
+                assert!(terminal.draw(paint).unwrap().full_repaint);
+            } else {
+                assert_eq!(result.unwrap().changed_cells, 2);
+                assert!(terminal.writer().bytes.len() < 80);
+            }
+            assert_eq!(terminal.hits().regions()[0].id.as_str(), "new");
+            assert_eq!(terminal.cursor(), Some(Cursor::visible(Point::new(79, 0))));
+            let buffer = terminal.retained_buffer().unwrap();
+            assert_eq!(buffer.get(Point::new(0, 0)).unwrap().symbol, "A");
+            assert_eq!(buffer.get(Point::new(79, 0)).unwrap().symbol, "Z");
+            terminal.resize(Rect::new(0, 0, 81, 1));
+            assert!(terminal.draw(paint).unwrap().full_repaint);
+        }
+    }
+
+    #[test]
     fn failed_overlay_does_not_commit_image_or_interaction_scene() {
         let mut terminal = Terminal::new(
             FailingWriter {

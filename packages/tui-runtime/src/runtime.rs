@@ -16,7 +16,9 @@ use crate::mailbox::{
 };
 use crate::presenter::{Presenter, ResetReason};
 use crate::program::{Invalidation, Lifecycle, Program, RuntimeEvent, Update};
-use crate::stats::RuntimeStats;
+use crate::stats::{
+    Admitted, PresentationSample, QueueSource, RuntimeStats, TerminalDispatchRange, micros,
+};
 use crate::subscription_scheduler::SubscriptionScheduler;
 
 fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -43,7 +45,8 @@ struct SharedControl {
 /// Cloneable bounded sender supplied to one long-lived subscription.
 #[derive(Debug)]
 pub struct SubscriptionSender<M> {
-    sender: mpsc::Sender<M>,
+    sender: mpsc::Sender<Admitted<M>>,
+    detailed: bool,
     stats: Arc<Mutex<RuntimeStats>>,
 }
 
@@ -51,6 +54,7 @@ impl<M> Clone for SubscriptionSender<M> {
     fn clone(&self) -> Self {
         Self {
             sender: self.sender.clone(),
+            detailed: self.detailed,
             stats: Arc::clone(&self.stats),
         }
     }
@@ -63,12 +67,13 @@ impl<M> SubscriptionSender<M> {
     ///
     /// Returns [`SendError`] after runtime shutdown closes subscription admission.
     pub async fn send(&self, message: M) -> Result<(), SendError> {
-        self.sender.send(message).await.map_err(|_| {
+        let permit = self.sender.reserve().await.map_err(|_| {
             with_stats(&self.stats, |stats| {
                 stats.subscription_rejected = stats.subscription_rejected.saturating_add(1);
             });
             SendError
         })?;
+        permit.send(Admitted::new(message, self.detailed));
         let depth = self.sender.max_capacity() - self.sender.capacity();
         with_stats(&self.stats, |stats| {
             stats.subscription_depth = depth;
@@ -264,10 +269,10 @@ pub struct Runtime<P: Program, R> {
     program: P,
     presenter: R,
     config: RuntimeConfig,
-    reliable_rx: mpsc::Receiver<P::Message>,
-    terminal_rx: mpsc::Receiver<Event>,
+    reliable_rx: mpsc::Receiver<Admitted<P::Message>>,
+    terminal_rx: mpsc::Receiver<Admitted<Event>>,
     terminal_latest_rx: LatestReceiver<Event>,
-    subscription_rx: mpsc::Receiver<P::Message>,
+    subscription_rx: mpsc::Receiver<Admitted<P::Message>>,
     latest_rx: LatestReceiver<P::Message>,
     control: Arc<SharedControl>,
     stats: Arc<Mutex<RuntimeStats>>,
@@ -277,6 +282,11 @@ pub struct Runtime<P: Program, R> {
     next_ready_source: u8,
     next_application_source: u8,
     exiting: bool,
+    constructed_at: Option<Instant>,
+    terminal_ordinal: Option<u64>,
+    dispatch_window: TerminalDispatchRange,
+    presentation_attempt: u64,
+    pending_queue_age: Option<(QueueSource, Instant)>,
 }
 
 impl<P, R> Runtime<P, R>
@@ -292,12 +302,24 @@ where
         config: RuntimeConfig,
     ) -> (Self, RuntimeHandle<P::Message>) {
         let config = config.normalized();
-        let stats = Arc::new(Mutex::new(RuntimeStats::default()));
+        let stats = Arc::new(Mutex::new(RuntimeStats::new(
+            config.collect_detailed_telemetry,
+        )));
         let (reliable_tx, reliable_rx) = mpsc::channel(config.reliable_capacity);
         let (terminal_tx, terminal_rx) = mpsc::channel(config.terminal_capacity);
-        let (terminal_latest, terminal_latest_rx) = latest_channel(2, Arc::clone(&stats));
+        let (terminal_latest, terminal_latest_rx) = latest_channel(
+            2,
+            Arc::clone(&stats),
+            QueueSource::TerminalLatest,
+            config.collect_detailed_telemetry,
+        );
         let (subscription_tx, subscription_rx) = mpsc::channel(config.subscription_capacity);
-        let (latest, latest_rx) = latest_channel(config.latest_capacity, Arc::clone(&stats));
+        let (latest, latest_rx) = latest_channel(
+            config.latest_capacity,
+            Arc::clone(&stats),
+            QueueSource::ApplicationLatest,
+            config.collect_detailed_telemetry,
+        );
         let control = Arc::new(SharedControl {
             state: Mutex::new(ControlState {
                 timers: BTreeMap::new(),
@@ -309,8 +331,18 @@ where
             notify: Notify::new(),
         });
         let handle = RuntimeHandle {
-            reliable: ReliableSender::new(reliable_tx, Arc::clone(&stats), false),
-            terminal: ReliableSender::new(terminal_tx, Arc::clone(&stats), true),
+            reliable: ReliableSender::new(
+                reliable_tx,
+                Arc::clone(&stats),
+                false,
+                config.collect_detailed_telemetry,
+            ),
+            terminal: ReliableSender::new(
+                terminal_tx,
+                Arc::clone(&stats),
+                true,
+                config.collect_detailed_telemetry,
+            ),
             terminal_latest,
             latest,
             control: Arc::clone(&control),
@@ -320,11 +352,13 @@ where
             config.max_active_commands,
             config.max_queued_commands,
             Arc::clone(&stats),
+            config.collect_detailed_telemetry,
         );
         let subscriptions = SubscriptionScheduler::new(
             config.max_active_subscriptions,
             SubscriptionSender {
                 sender: subscription_tx,
+                detailed: config.collect_detailed_telemetry,
                 stats: Arc::clone(&stats),
             },
             Arc::clone(&stats),
@@ -347,6 +381,11 @@ where
                 next_ready_source: 0,
                 next_application_source: 0,
                 exiting: false,
+                constructed_at: config.collect_detailed_telemetry.then(Instant::now),
+                terminal_ordinal: Some(0),
+                dispatch_window: TerminalDispatchRange::Empty,
+                presentation_attempt: 0,
+                pending_queue_age: None,
             },
             handle,
         )
@@ -394,14 +433,14 @@ where
                 biased;
                 terminal = self.terminal_rx.recv(), if !self.exiting => {
                     if let Some(event) = terminal
-                        && let Err(error) = self.apply_event(RuntimeEvent::Terminal(event))
+                        && let Err(error) = self.apply_admitted(event, QueueSource::TerminalFifo, RuntimeEvent::Terminal)
                     {
                         return Err(self.program_error(error).await);
                     }
                 }
                 reliable = self.reliable_rx.recv(), if !self.exiting => {
                     if let Some(message) = reliable
-                        && let Err(error) = self.apply_event(RuntimeEvent::Message(message))
+                        && let Err(error) = self.apply_admitted(message, QueueSource::ApplicationFifo, RuntimeEvent::Message)
                     {
                         return Err(self.program_error(error).await);
                     }
@@ -415,7 +454,7 @@ where
                 }
                 subscription = self.subscription_rx.recv(), if !self.exiting => {
                     if let Some(message) = subscription
-                        && let Err(error) = self.apply_event(RuntimeEvent::Message(message))
+                        && let Err(error) = self.apply_admitted(message, QueueSource::Subscription, RuntimeEvent::Message)
                     {
                         return Err(self.program_error(error).await);
                     }
@@ -437,7 +476,13 @@ where
             && processed < self.config.messages_per_turn
             && started.elapsed() < self.config.processing_time_per_turn
         {
-            if !self.process_next_ready()? {
+            let result = self.process_next_ready();
+            if result.is_err() && self.config.collect_detailed_telemetry {
+                with_stats(&self.stats, |stats| {
+                    stats.record_turn(started.elapsed(), self.config.processing_time_per_turn);
+                });
+            }
+            if !result? {
                 break;
             }
             processed = processed.saturating_add(1);
@@ -446,12 +491,16 @@ where
                 break;
             }
         }
-        if processed == self.config.messages_per_turn
-            || started.elapsed() >= self.config.processing_time_per_turn
-        {
+        let elapsed = started.elapsed();
+        let exhausted = processed == self.config.messages_per_turn
+            || elapsed >= self.config.processing_time_per_turn;
+        // Under-budget turns add no telemetry lock. Exhausted turns reuse the
+        // existing budget-counter lock for the histogram.
+        if exhausted {
             with_stats(&self.stats, |stats| {
                 stats.scheduler_budget_exhausted =
                     stats.scheduler_budget_exhausted.saturating_add(1);
+                stats.record_turn(elapsed, self.config.processing_time_per_turn);
             });
         }
         self.subscriptions.try_next_completion();
@@ -479,7 +528,7 @@ where
                 with_stats(&self.stats, |stats| {
                     stats.terminal_processed = stats.terminal_processed.saturating_add(1);
                 });
-                RuntimeEvent::Terminal(event)
+                RuntimeEvent::Terminal(self.receive(event, QueueSource::TerminalFifo))
             }),
             1 => self.terminal_latest_rx.try_recv().map(|(_key, event)| {
                 with_stats(&self.stats, |stats| {
@@ -509,7 +558,7 @@ where
             _ => self.subscription_rx.try_recv().ok().map(|message| {
                 let depth = self.subscription_rx.max_capacity() - self.subscription_rx.capacity();
                 with_stats(&self.stats, |stats| stats.subscription_depth = depth);
-                RuntimeEvent::Message(message)
+                RuntimeEvent::Message(self.receive(message, QueueSource::Subscription))
             }),
         };
         let Some(event) = event else {
@@ -523,11 +572,12 @@ where
         for offset in 0..2 {
             let source = (self.next_application_source + offset) % 2;
             let message = match source {
-                0 => self.reliable_rx.try_recv().ok().inspect(|_| {
+                0 => self.reliable_rx.try_recv().ok().map(|message| {
                     observe_receive(&self.reliable_rx, &self.stats, false);
                     with_stats(&self.stats, |stats| {
                         stats.reliable_processed = stats.reliable_processed.saturating_add(1);
                     });
+                    self.receive(message, QueueSource::ApplicationFifo)
                 }),
                 _ => self.latest_rx.try_recv().map(|(_key, message)| {
                     with_stats(&self.stats, |stats| {
@@ -544,19 +594,118 @@ where
         None
     }
 
+    fn receive<T>(&mut self, admitted: Admitted<T>, source: QueueSource) -> T {
+        // Scratch state for exactly one dispatch, consumed by apply_event.
+        // Reuse its update-start clock and existing accounting lock.
+        debug_assert!(self.pending_queue_age.is_none());
+        self.pending_queue_age = admitted.at.map(|at| (source, at));
+        admitted.value
+    }
+
+    fn apply_admitted<T>(
+        &mut self,
+        admitted: Admitted<T>,
+        source: QueueSource,
+        event: impl FnOnce(T) -> RuntimeEvent<P::Message>,
+    ) -> Result<(), P::Error> {
+        let value = self.receive(admitted, source);
+        self.apply_event(event(value))
+    }
+
+    fn record_terminal_dispatch(&mut self) {
+        self.terminal_ordinal = self.terminal_ordinal.and_then(|last| last.checked_add(1));
+        self.dispatch_window = match (self.terminal_ordinal, self.dispatch_window) {
+            (Some(last), TerminalDispatchRange::Empty) => {
+                TerminalDispatchRange::Span { first: last, last }
+            }
+            (Some(last), TerminalDispatchRange::Span { first, .. }) => {
+                TerminalDispatchRange::Span { first, last }
+            }
+            _ => TerminalDispatchRange::Unknown,
+        };
+    }
+
+    fn record_presentation(
+        &mut self,
+        started: Instant,
+        ended: Instant,
+        succeeded: bool,
+        committed: Option<(crate::presenter::PresentReport, Instant)>,
+    ) {
+        if !self.config.collect_detailed_telemetry && !succeeded {
+            return;
+        }
+        if self.config.collect_detailed_telemetry {
+            if let Some(attempt) = self.presentation_attempt.checked_add(1) {
+                self.presentation_attempt = attempt;
+            } else {
+                self.terminal_ordinal = None;
+                self.dispatch_window = TerminalDispatchRange::Unknown;
+            }
+        }
+        let terminal_dispatches = self.dispatch_window;
+        if self.config.collect_detailed_telemetry {
+            self.dispatch_window = if self.terminal_ordinal.is_some() {
+                TerminalDispatchRange::Empty
+            } else {
+                TerminalDispatchRange::Unknown
+            };
+        }
+        with_stats(&self.stats, |stats| {
+            let elapsed = ended.saturating_duration_since(started);
+            if let Some((report, scheduled_at)) = committed {
+                stats.frames_presented = stats.frames_presented.saturating_add(1);
+                stats.full_repaints = stats
+                    .full_repaints
+                    .saturating_add(u64::from(report.full_repaint));
+                stats.presented_changed_cells = stats
+                    .presented_changed_cells
+                    .saturating_add(u64::try_from(report.changed_cells).unwrap_or(u64::MAX));
+                stats.presentation_delay_us = stats
+                    .presentation_delay_us
+                    .saturating_add(micros(ended.saturating_duration_since(scheduled_at)));
+                stats.presentation_time_us =
+                    stats.presentation_time_us.saturating_add(micros(elapsed));
+            }
+            if let Some(detailed) = &mut stats.detailed {
+                detailed.present_duration.record(elapsed);
+                if !succeeded {
+                    detailed.presentations_failed = detailed.presentations_failed.saturating_add(1);
+                }
+                detailed.last_presentation = Some(PresentationSample {
+                    attempt: self.presentation_attempt,
+                    started_us: micros(
+                        started.saturating_duration_since(self.constructed_at.unwrap()),
+                    ),
+                    elapsed_us: micros(elapsed),
+                    succeeded,
+                    terminal_dispatches,
+                });
+            }
+        });
+    }
+
     fn apply_event(&mut self, event: RuntimeEvent<P::Message>) -> Result<(), P::Error> {
         let resize = match &event {
             RuntimeEvent::Terminal(Event::Resize(size)) => Some(*size),
             RuntimeEvent::Terminal(_) | RuntimeEvent::Message(_) | RuntimeEvent::Timer(_) => None,
         };
+        if self.config.collect_detailed_telemetry && matches!(&event, RuntimeEvent::Terminal(_)) {
+            self.record_terminal_dispatch();
+        }
         let update_started = Instant::now();
-        let update = self.program.update(event)?;
-        let update_time_us =
-            u64::try_from(update_started.elapsed().as_micros()).unwrap_or(u64::MAX);
-        with_stats(&self.stats, |stats| {
-            stats.updates_completed = stats.updates_completed.saturating_add(1);
-            stats.update_time_us = stats.update_time_us.saturating_add(update_time_us);
-        });
+        let queue_age = self.pending_queue_age.take();
+        let result = self.program.update(event);
+        if result.is_ok() || self.config.collect_detailed_telemetry {
+            let elapsed = update_started.elapsed();
+            with_stats(&self.stats, |stats| {
+                if let Some((source, admitted_at)) = queue_age {
+                    stats.record_queue_age(source, admitted_at, update_started);
+                }
+                stats.record_update(elapsed, result.is_ok());
+            });
+        }
+        let update = result?;
         if let Some(size) = resize {
             self.presenter.resize(size);
             self.presenter.reset(ResetReason::Resize);
@@ -643,31 +792,16 @@ where
             self.presenter.reset(ResetReason::Application);
         }
         let presentation_started = Instant::now();
-        let report = self.presenter.present(&mut self.program)?;
+        let result = self.presenter.present(&mut self.program);
         let presented_at = Instant::now();
-        let presentation_time_us = u64::try_from(
-            presented_at
-                .saturating_duration_since(presentation_started)
-                .as_micros(),
-        )
-        .unwrap_or(u64::MAX);
+        self.record_presentation(
+            presentation_started,
+            presented_at,
+            result.is_ok(),
+            result.as_ref().ok().map(|report| (*report, scheduled_at)),
+        );
+        let report = result?;
         self.last_presented = Some(presented_at);
-        let delay = presented_at.saturating_duration_since(scheduled_at);
-        with_stats(&self.stats, |stats| {
-            stats.frames_presented = stats.frames_presented.saturating_add(1);
-            stats.full_repaints = stats
-                .full_repaints
-                .saturating_add(u64::from(report.full_repaint));
-            stats.presented_changed_cells = stats
-                .presented_changed_cells
-                .saturating_add(u64::try_from(report.changed_cells).unwrap_or(u64::MAX));
-            stats.presentation_delay_us = stats
-                .presentation_delay_us
-                .saturating_add(u64::try_from(delay.as_micros()).unwrap_or(u64::MAX));
-            stats.presentation_time_us = stats
-                .presentation_time_us
-                .saturating_add(presentation_time_us);
-        });
         let update = self.program.presentation_committed(report);
         self.apply_update(update);
         Ok(())
@@ -685,7 +819,18 @@ where
             drop(state);
             due
         }?;
-        lock_unpoisoned(&self.control.state).timers.remove(&due);
+        let deadline = lock_unpoisoned(&self.control.state).timers.remove(&due);
+        if self.config.collect_detailed_telemetry
+            && let Some(deadline) = deadline
+        {
+            with_stats(&self.stats, |stats| {
+                if let Some(detailed) = &mut stats.detailed {
+                    detailed
+                        .timer_lateness
+                        .record(now.saturating_duration_since(deadline));
+                }
+            });
+        }
         Some(due)
     }
 
@@ -963,5 +1108,279 @@ mod fairness_tests {
         );
         assert_eq!(runtime.terminal_rx.len(), 1);
         runtime.close().await;
+    }
+}
+
+#[cfg(test)]
+mod telemetry_tests {
+    use super::*;
+    use crate::{HeadlessPresenter, PresentReport};
+
+    #[derive(Default)]
+    struct TestProgram {
+        fail: bool,
+        commits: usize,
+    }
+
+    impl Program for TestProgram {
+        type Message = ();
+        type Error = &'static str;
+
+        fn update(&mut self, _: RuntimeEvent<()>) -> Result<Update<()>, Self::Error> {
+            if self.fail {
+                Err("update")
+            } else {
+                Ok(Update::none())
+            }
+        }
+
+        fn presentation_committed(&mut self, _: PresentReport) -> Update<()> {
+            self.commits += 1;
+            Update::none()
+        }
+    }
+
+    struct FailingPresenter;
+
+    impl Presenter<TestProgram> for FailingPresenter {
+        type Error = &'static str;
+
+        fn reset(&mut self, _: ResetReason) {}
+
+        fn present(&mut self, _: &mut TestProgram) -> Result<PresentReport, Self::Error> {
+            Err("present")
+        }
+    }
+
+    #[test]
+    fn synthetic_presentation_times_consume_failed_window_without_commit() {
+        let (mut runtime, handle) = Runtime::new(
+            TestProgram::default(),
+            HeadlessPresenter::default(),
+            RuntimeConfig {
+                collect_detailed_telemetry: true,
+                ..RuntimeConfig::default()
+            },
+        );
+        let start = runtime.constructed_at.unwrap() + Duration::from_millis(1);
+        runtime.record_terminal_dispatch();
+        runtime.record_terminal_dispatch();
+        runtime.record_presentation(start, start + Duration::from_micros(501), false, None);
+        let stats = handle.stats();
+        assert_eq!(
+            stats.detailed.as_ref().unwrap().present_duration.buckets[2],
+            1
+        );
+        assert_eq!(stats.detailed.as_ref().unwrap().presentations_failed, 1);
+        assert_eq!(stats.frames_presented, 0);
+        assert_eq!(runtime.program.commits, 0);
+        let sample = stats.detailed.as_ref().unwrap().last_presentation.unwrap();
+        assert_eq!(sample.started_us, 1_000);
+        assert_eq!(sample.elapsed_us, 501);
+        assert!(!sample.succeeded);
+        assert_eq!(
+            sample.terminal_dispatches,
+            TerminalDispatchRange::Span { first: 1, last: 2 }
+        );
+        runtime.record_presentation(start, start, true, None);
+        assert_eq!(
+            handle
+                .stats()
+                .detailed
+                .unwrap()
+                .last_presentation
+                .unwrap()
+                .terminal_dispatches,
+            TerminalDispatchRange::Empty
+        );
+        runtime.terminal_ordinal = Some(u64::MAX);
+        runtime.record_terminal_dispatch();
+        runtime.record_presentation(start, start, true, None);
+        assert_eq!(
+            handle
+                .stats()
+                .detailed
+                .unwrap()
+                .last_presentation
+                .unwrap()
+                .terminal_dispatches,
+            TerminalDispatchRange::Unknown
+        );
+        runtime.record_presentation(start, start, true, None);
+        assert_eq!(
+            handle
+                .stats()
+                .detailed
+                .unwrap()
+                .last_presentation
+                .unwrap()
+                .terminal_dispatches,
+            TerminalDispatchRange::Unknown
+        );
+    }
+
+    #[test]
+    fn actual_failed_calls_are_recorded_without_committing() {
+        let (mut runtime, handle) = Runtime::new(
+            TestProgram {
+                fail: true,
+                commits: 0,
+            },
+            FailingPresenter,
+            RuntimeConfig {
+                collect_detailed_telemetry: true,
+                ..RuntimeConfig::default()
+            },
+        );
+        assert_eq!(
+            runtime.apply_event(RuntimeEvent::Terminal(Event::Tick)),
+            Err("update")
+        );
+        assert_eq!(runtime.present(), Err("present"));
+        let stats = handle.stats();
+        assert_eq!(stats.detailed.as_ref().unwrap().updates_failed, 1);
+        assert_eq!(stats.updates_completed, 0);
+        assert_eq!(
+            stats
+                .detailed
+                .as_ref()
+                .unwrap()
+                .update_duration
+                .buckets
+                .iter()
+                .sum::<u64>(),
+            1
+        );
+        assert_eq!(
+            stats
+                .detailed
+                .as_ref()
+                .unwrap()
+                .present_duration
+                .buckets
+                .iter()
+                .sum::<u64>(),
+            1
+        );
+        assert_eq!(stats.detailed.as_ref().unwrap().presentations_failed, 1);
+        assert_eq!(stats.frames_presented, 0);
+        assert_eq!(runtime.program.commits, 0);
+        assert!(runtime.last_presented.is_none());
+        assert_eq!(
+            stats
+                .detailed
+                .as_ref()
+                .unwrap()
+                .last_presentation
+                .unwrap()
+                .terminal_dispatches,
+            TerminalDispatchRange::Span { first: 1, last: 1 }
+        );
+    }
+
+    #[test]
+    fn disabled_runtime_preserves_legacy_accounting_without_detailed_state() {
+        let (mut runtime, handle) = Runtime::new(
+            TestProgram::default(),
+            HeadlessPresenter::default(),
+            RuntimeConfig::default(),
+        );
+        assert!(!runtime.config.collect_detailed_telemetry);
+        assert!(runtime.constructed_at.is_none());
+        handle.try_send_terminal(Event::Tick).unwrap();
+        runtime.process_ready_turn().unwrap();
+        runtime.present().unwrap();
+        let stats = handle.stats();
+        assert!(stats.detailed.is_none());
+        assert!(stats.queue_age(QueueSource::TerminalFifo).is_none());
+        assert_eq!(stats.terminal_processed, 1);
+        assert_eq!(stats.updates_completed, 1);
+        assert_eq!(stats.frames_presented, 1);
+        assert_eq!(runtime.presentation_attempt, 0);
+        assert_eq!(runtime.terminal_ordinal, Some(0));
+        assert!(runtime.pending_queue_age.is_none());
+        assert_eq!(runtime.dispatch_window, TerminalDispatchRange::Empty);
+    }
+
+    #[test]
+    fn admitted_age_is_batched_once_even_when_update_fails() {
+        let (mut runtime, handle) = Runtime::new(
+            TestProgram {
+                fail: true,
+                commits: 0,
+            },
+            HeadlessPresenter::default(),
+            RuntimeConfig {
+                collect_detailed_telemetry: true,
+                ..RuntimeConfig::default()
+            },
+        );
+        let admitted = Admitted {
+            value: (),
+            at: Some(Instant::now()),
+        };
+        assert_eq!(
+            runtime.apply_admitted(
+                admitted,
+                QueueSource::ApplicationFifo,
+                RuntimeEvent::Message
+            ),
+            Err("update")
+        );
+        assert!(runtime.pending_queue_age.is_none());
+        runtime.program.fail = false;
+        runtime
+            .apply_event(RuntimeEvent::Terminal(Event::Tick))
+            .unwrap();
+        let stats = handle.stats();
+        assert_eq!(
+            stats
+                .queue_age(QueueSource::ApplicationFifo)
+                .unwrap()
+                .buckets
+                .iter()
+                .sum::<u64>(),
+            1
+        );
+        assert_eq!(
+            stats
+                .queue_age(QueueSource::TerminalFifo)
+                .unwrap()
+                .buckets
+                .iter()
+                .sum::<u64>(),
+            0
+        );
+        assert_eq!(stats.detailed.as_ref().unwrap().updates_failed, 1);
+        assert_eq!(stats.updates_completed, 1);
+    }
+
+    #[test]
+    fn synthetic_timer_lateness_is_not_mailbox_age() {
+        let (runtime, handle) = Runtime::new(
+            TestProgram::default(),
+            HeadlessPresenter::default(),
+            RuntimeConfig {
+                collect_detailed_telemetry: true,
+                ..RuntimeConfig::default()
+            },
+        );
+        let deadline = Instant::now();
+        let timer = TimerId::new("late");
+        handle.schedule_timer(timer.clone(), deadline);
+        assert_eq!(
+            runtime.take_due_timer(deadline + Duration::from_micros(4_001)),
+            Some(timer)
+        );
+        let stats = handle.stats();
+        assert_eq!(
+            stats.detailed.as_ref().unwrap().timer_lateness.sum_us,
+            4_001
+        );
+        assert_eq!(
+            stats.queue_age(QueueSource::TerminalFifo).unwrap().sum_us,
+            0
+        );
+        assert!(runtime.take_due_timer(deadline).is_none());
     }
 }

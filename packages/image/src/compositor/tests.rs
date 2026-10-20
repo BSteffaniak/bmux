@@ -817,6 +817,59 @@ fn native_png_work_source(side: u32) -> PaneImage {
 
 #[cfg(feature = "kitty")]
 #[test]
+fn frozen_native_png_matches_checked_wire_and_skips_only_warm_scans() {
+    use bmux_tui::geometry::Rect;
+    use bmux_tui::image::{ImageFit, ImageKey, ImageLifecycle, ImagePlacement};
+
+    let source = native_png_work_source(16);
+    let frozen = crate::frozen::FrozenImage::new(source.clone());
+    let pixels = source.payload.pixels.as_ref().unwrap();
+    let mut placement = ImagePlacement {
+        key: ImageKey::new("frozen-wire-reference"),
+        payload: bmux_tui::image::ImagePayload::Png {
+            bytes: pixels.data.clone(),
+            width: 16,
+            height: 16,
+        },
+        destination: Rect::new(3, 5, 32, 40),
+        allocation: None,
+        clip: Rect::new(0, 0, 100, 100),
+        fit: ImageFit::Contain,
+        lifecycle: ImageLifecycle::Frame,
+    };
+    let mut checked = KittyHostState::default();
+    let mut owned = KittyHostState::default();
+    for frame in 0..4 {
+        placement.destination.x += 1;
+        checked.begin_frame();
+        owned.begin_frame();
+        let mut expected = Vec::new();
+        assert!(
+            checked
+                .contain_png(&mut expected, &source, &placement, &kitty(), placement.clip)
+                .unwrap()
+        );
+        checked.finish_frame(&mut expected).unwrap();
+        crate::model::test_work::take();
+        let mut actual = Vec::new();
+        assert!(
+            owned
+                .contain_frozen_png(&mut actual, &frozen, &placement, &kitty(), placement.clip)
+                .unwrap()
+        );
+        owned.finish_frame(&mut actual).unwrap();
+        let work = crate::model::test_work::take();
+        assert_eq!(actual, expected);
+        assert_eq!(work.clone_bytes, 0);
+        if frame > 0 {
+            assert_eq!(work.hash_bytes, 0);
+            assert_eq!(work.equality_bytes, 0);
+        }
+    }
+}
+
+#[cfg(feature = "kitty")]
+#[test]
 fn native_png_warm_placement_scans_content_without_cloning_payload() {
     use bmux_tui::geometry::Rect;
     use bmux_tui::image::{ImageFit, ImageKey, ImageLifecycle, ImagePlacement};
