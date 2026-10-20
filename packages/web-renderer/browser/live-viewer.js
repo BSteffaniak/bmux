@@ -126,7 +126,7 @@ export async function mountLiveViewer({ container, status, apiBase = '/', assetB
         if (pending || busy) throw new Error('frame credit exceeded');
         const bytes = new Uint8Array(event.data);
         if (bytes.length < 5 || bytes[0] !== 66 || bytes[1] !== 77 || bytes[2] !== 87
-            || bytes[3] !== 80 || bytes[4] !== 4) throw new Error('incompatible presentation');
+            || bytes[3] !== 80 || bytes[4] !== 5) throw new Error('incompatible presentation');
         counters.bytes = Math.min(Number.MAX_SAFE_INTEGER, counters.bytes + bytes.length);
         pending = { bytes, socket: connection, ticket };
         schedule();

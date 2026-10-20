@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mountLiveViewer, revision, validateStatus } from '../browser/live-viewer.js';
 
 const epoch = '11111111-1111-4111-8111-111111111111';
-const bytes = () => new Uint8Array([66, 77, 87, 80, 4, 0]).buffer;
+const bytes = () => new Uint8Array([66, 77, 87, 80, 5, 0]).buffer;
 async function fixture(options = {}) {
   const frames = new Map(), timers = new Map(), sockets = [];
   let id = 0, paints = 0, clears = 0, identity, clock = 0;
@@ -60,6 +60,18 @@ test('tiny update schedules one RAF and only acknowledges admitted identity', as
   assert.deepEqual(socket.sent, [{ type: 'ack', generation: 'scene', revision: '1' }]);
   assert.equal(f.frames.size, 0); assert.equal(f.timers.size, 1); f.handle.dispose();
 });
+test('obsolete and unknown BMWP versions request repair without paint or ACK', async () => {
+  for (const version of [2, 4, 6]) {
+    const f = await fixture(); const s = f.sockets[0]; s.state();
+    const frame = new Uint8Array(bytes()); frame[4] = version;
+    s.onmessage({ data: frame.buffer });
+    await f.raf(0);
+    assert.equal(f.paints, 0);
+    assert.deepEqual(s.sent, [{ type: 'repair' }]);
+    f.handle.dispose();
+  }
+});
+
 test('FPS cap waits only while dirty, then returns to idle', async () => {
   const f = await fixture({ maxFps: 30 }); const s = f.sockets[0]; s.state(); s.frame(); await f.raf(0);
   s.frame(); await f.raf(1); assert.equal(f.paints, 1); assert.equal(f.timers.size, 2);
