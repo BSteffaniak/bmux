@@ -647,24 +647,89 @@ impl bmux_presenter::custom::LinkedComponentFactory for DemoFactory {
         let BlockKind::Custom { config, .. } = &block.kind else {
             return Err("custom block required".into());
         };
-        let text = if config.is_null() {
-            Text::from("Live playbook\nOwner display pending")
+        let title = if config.is_null() {
+            "Live playbook\nOwner display pending".to_owned()
         } else {
-            let config = DemoConfig::parse(config).map_err(|error| error.to_string())?;
-            Text::from_lines(vec![
-                Line::raw(config.title),
-                Line::from_spans(vec![Span::styled(
-                    " ▶ Open live demo [o] ",
-                    Style::new()
-                        .fg(Color::Black)
-                        .bg(Color::Green)
-                        .add_modifier(Modifier::BOLD),
-                )]),
-            ])
+            DemoConfig::parse(config)
+                .map_err(|error| error.to_string())?
+                .title
         };
-        Ok(Element::new(
-            TextBlock::new(text).id(format!("playbook-demo/{}", block.id.as_str())),
-        ))
+        Ok(Element::new(DemoLauncher {
+            title,
+            id: block.id.as_str().to_owned(),
+            enabled: !config.is_null(),
+        }))
+    }
+}
+
+/// Launcher cells and hit targets share one layout, including wrapped titles.
+struct DemoLauncher {
+    title: String,
+    id: String,
+    enabled: bool,
+}
+impl DemoLauncher {
+    fn content(&self) -> bmux_tui::composition::Column<'_> {
+        let mut column = bmux_tui::composition::Column::new()
+            .child(TextBlock::new(self.title.clone()).id(format!("{}/title", self.id)));
+        if self.enabled {
+            column = column.child(
+                TextBlock::new(Text::from_lines(vec![Line::from_spans(vec![
+                    Span::styled(
+                        " ▶ Open live demo [o] ",
+                        Style::new()
+                            .fg(Color::Black)
+                            .bg(Color::Green)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ])]))
+                .id(format!("{}/launch", self.id)),
+            );
+        }
+        column
+    }
+}
+impl bmux_tui::component::Component for DemoLauncher {
+    fn layout(
+        &self,
+        constraints: bmux_tui::component::Constraints,
+        cx: &mut bmux_tui::component::LayoutCx,
+    ) -> bmux_tui::component::LayoutNode {
+        self.content().layout(constraints, cx)
+    }
+    fn paint(
+        &self,
+        layout: &bmux_tui::component::LayoutNode,
+        cx: &mut bmux_tui::paint::PaintCx<'_, '_>,
+    ) {
+        self.content().paint(layout, cx);
+        if self.enabled
+            && let Some(child) = layout.children.last()
+        {
+            cx.with_child_size(
+                i32::try_from(child.x).unwrap_or(i32::MAX),
+                i64::try_from(child.y).unwrap_or(i64::MAX),
+                child.node.size,
+                |cx| {
+                    cx.push_hit(
+                        bmux_tui::hit::HitRegion::new(
+                            format!("{}/launch", self.id),
+                            bmux_tui::geometry::Rect::new(
+                                0,
+                                0,
+                                u16::try_from(child.node.size.width)
+                                    .unwrap_or(u16::MAX)
+                                    .min(22),
+                                u16::try_from(child.node.size.height).unwrap_or(u16::MAX),
+                            ),
+                        )
+                        .layer(1)
+                        .role(bmux_tui::hit::HitRole::Action)
+                        .focusable(true),
+                    );
+                },
+            );
+        }
     }
 }
 

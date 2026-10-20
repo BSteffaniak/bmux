@@ -16,7 +16,8 @@ Private setup and pacing notes. Use [the cue sheet](speaker-script.md), not a sp
 - Overflowing slides scroll at the normal readable size; use the wheel or Up/Down and Page Up/Down. Home/End jump within the content. Child controls receive input first; Left/Right remain the slide-navigation controls.
 - Scroll deliberately between code sections; there is no timed auto-scroll or nested code viewport.
 - Responsive browser audiences scroll locally; fixed-frame viewers see the producer viewport. Neither implies synchronized source-anchor following.
-- Live demo: Tab → `o` → `r` to focus/open/start.
+- Live demo: `o` or click the green Open button to open, then `r` to start.
+  When a slide has multiple demos, Tab to the intended demo before pressing `o`.
 - `s`: stop the focused demo. Wait for status before treating cleanup as complete.
 - If a demo fails: stop, acknowledge it, continue. Do not narrate success over a failed check.
 

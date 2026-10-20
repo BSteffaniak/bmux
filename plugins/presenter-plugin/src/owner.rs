@@ -22,6 +22,7 @@ struct Geometry {
     deck_revision: u64,
     interaction_revision: u64,
     control_scene: Option<bmux_presenter_runtime::mirror::MirrorPrivateScene>,
+    launcher: Option<bmux_tui::geometry::Rect>,
 }
 /// Canonical fixed-canvas owner for trusted, application-registered components.
 /// Shared and independent host instance identities select separate state maps.
@@ -379,6 +380,12 @@ impl LinkedOwner {
                     deck_revision: context.cursor.deck_revision,
                     interaction_revision,
                     control_scene: private_scene.clone(),
+                    launcher: frame
+                        .hits()
+                        .regions()
+                        .iter()
+                        .find(|hit| hit.id.as_str() == format!("{}/launch", block.id.as_str()))
+                        .map(|hit| hit.area),
                 },
             );
         }
@@ -713,6 +720,13 @@ impl Owner for LinkedOwner {
                 let generation = scene.identity["generation"].as_u64();
                 demos.input_committed(input.surface_id.as_str(), epoch, generation, &input.input)
             } else {
+                if input.input == "click"
+                    && !geometry.launcher.is_some_and(|area| {
+                        area.contains(bmux_tui::geometry::Point::new(input.x, input.y))
+                    })
+                {
+                    return Err(HostError::Stale);
+                }
                 demos.input(input.surface_id.as_str(), &input.input, false)
             }
             .map_err(|_| HostError::Unauthorized)?;

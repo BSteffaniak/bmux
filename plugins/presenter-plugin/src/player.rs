@@ -344,6 +344,9 @@ impl Player {
         registry
     }
     fn route_mirror(&self, event: &Event) -> Result<bool> {
+        self.route_mirror_target(event, None)
+    }
+    fn route_mirror_target(&self, event: &Event, launcher: Option<&str>) -> Result<bool> {
         let Some(remote) = &self.remote else {
             return Ok(false);
         };
@@ -351,10 +354,12 @@ impl Player {
             return Ok(false);
         }
         let selected_surface = self.surfaces.iter().find(|surface| {
-            self.local_view
-                .painted_focus
-                .as_ref()
-                .is_some_and(|id| id.as_str() == surface.surface_id)
+            launcher.is_some_and(|id| id == surface.surface_id)
+                || self
+                    .local_view
+                    .painted_focus
+                    .as_ref()
+                    .is_some_and(|id| id.as_str() == surface.surface_id)
         });
         let geometry = match event {
             Event::Mouse(mouse) => {
@@ -369,7 +374,9 @@ impl Player {
                     })
             }
             Event::Key(_) | Event::Paste(_) => {
-                if self.local_view.focused_block != self.local_view.painted_focus {
+                if launcher.is_none()
+                    && self.local_view.focused_block != self.local_view.painted_focus
+                {
                     return Ok(false);
                 }
                 selected_surface.and_then(|surface| {
@@ -1017,22 +1024,46 @@ impl Program for Player {
                     }
                     return Ok(Update::redraw());
                 }
-                if key.key == KeyCode::Char('o')
-                    && self.remote.is_none()
-                    && self.local_view.focused_block.as_ref().is_some_and(|id| {
-                        self.state
-                            .current_slide(&self.deck)
-                            .is_some_and(|slide| is_playbook_block(&slide.blocks, id.as_str()))
-                    })
-                    && let (Some(demos), Some(id)) =
-                        (&mut self.live_demos, &self.local_view.focused_block)
+                if key.key == KeyCode::Char('o') && key.modifiers == bmux_keyboard::Modifiers::NONE
                 {
-                    self.status = Some(
-                        demos
-                            .input(id.as_str(), "open", false)
-                            .unwrap_or_else(|error| error),
-                    );
-                    return Ok(Update::redraw());
+                    let registry = self.registry();
+                    let demos: Vec<_> = self
+                        .focus_targets(&registry)
+                        .into_iter()
+                        .filter(|id| {
+                            self.state
+                                .current_slide(&self.deck)
+                                .is_some_and(|slide| is_playbook_block(&slide.blocks, id.as_str()))
+                        })
+                        .collect();
+                    let target = self
+                        .local_view
+                        .focused_block
+                        .as_ref()
+                        .filter(|id| demos.contains(id))
+                        .cloned()
+                        .or_else(|| {
+                            (self.local_view.focused_block.is_none() && demos.len() == 1)
+                                .then(|| demos[0].clone())
+                        });
+                    if let Some(id) = target.filter(|_| {
+                        self.local_view
+                            .displayed
+                            .as_ref()
+                            .is_some_and(|shown| shown.state == self.state)
+                    }) {
+                        if self.remote.is_some() {
+                            let _ =
+                                self.route_mirror_target(&Event::Key(key), Some(id.as_str()))?;
+                        } else if let Some(demos) = &mut self.live_demos {
+                            self.status = Some(
+                                demos
+                                    .input(id.as_str(), "open", false)
+                                    .unwrap_or_else(|error| error),
+                            );
+                        }
+                        return Ok(Update::redraw());
+                    }
                 }
                 // Give a focused control's overlay first refusal; otherwise Escape
                 // releases viewer-local focus without changing shared component state.
@@ -1237,8 +1268,20 @@ impl Program for Player {
                 } else {
                     None
                 };
+                let launch = pointer_focus.as_ref().filter(|id| {
+                    matches!(&event, Event::Mouse(mouse) if self.local_view.painted_hits.hit_mouse(*mouse)
+                        .is_some_and(|hit| hit.id().as_str() == format!("{}/launch", id.as_str())))
+                });
                 if !self.route_mirror(&event)? {
-                    let _ = self.route_component(&event);
+                    if let (Some(id), Some(demos)) = (launch, &mut self.live_demos) {
+                        self.status = Some(
+                            demos
+                                .input(id.as_str(), "open", false)
+                                .unwrap_or_else(|error| error),
+                        );
+                    } else {
+                        let _ = self.route_component(&event);
+                    }
                 }
                 if let Some(id) = pointer_focus {
                     self.local_view.focused_block = Some(id);
@@ -2282,6 +2325,174 @@ mod tests {
             bmux_tui_runtime::Invalidation::None
         ));
         assert_eq!(player.audience_epoch().0, 2);
+    }
+
+    #[tokio::test]
+    async fn playbook_launcher_opens_with_unfocused_o_or_committed_button_click() {
+        use bmux_tui::event::{MouseButton, MouseEvent, MouseEventKind};
+        for presenter in [false, true] {
+            for click in [false, true] {
+                let fixture = crate::playbook_live::reload_tests::Fixture::new();
+                let deck = crate::playbook_live::reload_tests::deck("s", "demo");
+                let mut player = Player::local(deck.clone(), None, presenter);
+                player.live_demos = Some(
+                    crate::playbook_live::LiveDemos::prepare_local(
+                        &deck,
+                        &fixture.environment,
+                        vec![],
+                    )
+                    .unwrap(),
+                );
+                let mut terminal = Terminal::new(Vec::new(), Rect::new(0, 0, 80, 24));
+                // No committed output, hence no keyboard launch authority yet.
+                player
+                    .update(RuntimeEvent::Terminal(Event::Key(KeyStroke::simple(
+                        KeyCode::Char('o'),
+                    ))))
+                    .unwrap();
+                assert!(!player.live_demos.as_ref().unwrap().entries["demo"].open);
+                let scene = bmux_tui::presentation::PresentationState::new(Rect::new(0, 0, 80, 24));
+                let prepared = scene
+                    .prepare(bmux_tui::damage::Damage::Full, |cx| paint(&mut player, cx))
+                    .unwrap();
+                player.local_view.pending_hits = prepared.hits().clone();
+                player.local_view.commit();
+                assert!(player.local_view.focused_block.is_none());
+                let event = if click {
+                    let hit = player
+                        .local_view
+                        .painted_hits
+                        .regions()
+                        .iter()
+                        .find(|hit| hit.id.as_str() == "demo/launch")
+                        .expect("launch button hit");
+                    let point = bmux_tui::geometry::Point::new(hit.area.x, hit.area.y);
+                    let mouse = MouseEvent::new(MouseEventKind::Down(MouseButton::Left), point);
+                    assert!(
+                        player
+                            .local_view
+                            .painted_hits
+                            .hit_mouse(mouse)
+                            .is_some_and(|hit| hit.id().as_str() == "demo/launch"),
+                        "hits={:?}",
+                        player.local_view.painted_hits
+                    );
+                    Event::Mouse(mouse)
+                } else {
+                    Event::Key(KeyStroke::simple(KeyCode::Char('o')))
+                };
+                player.update(RuntimeEvent::Terminal(event)).unwrap();
+                assert!(
+                    player.live_demos.as_ref().unwrap().entries["demo"].open,
+                    "presenter={presenter} click={click} status={:?} focus={:?}",
+                    player.status,
+                    player.local_view.focused_block
+                );
+                assert!(
+                    player.live_demos.as_ref().unwrap().entries["demo"]
+                        .snapshot
+                        .attempt
+                        .is_none()
+                );
+                terminal.draw(|cx| paint(&mut player, cx)).unwrap();
+                player.local_view.commit();
+                assert!(player.local_view.painted_demo.is_some());
+                player
+                    .live_demos
+                    .as_mut()
+                    .unwrap()
+                    .shutdown()
+                    .await
+                    .unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn managed_playbook_launcher_routes_unfocused_o_and_button_click_to_owner() {
+        use bmux_presenter_runtime::{Owner, OwnerContext, SurfaceInput};
+        use bmux_tui::event::{MouseButton, MouseEvent, MouseEventKind};
+        for click in [false, true] {
+            let fixture = crate::playbook_live::reload_tests::Fixture::new();
+            let deck = crate::playbook_live::reload_tests::deck("s", "demo");
+            let state = PresentationState::new(&deck);
+            let cursor = bmux_presenter_runtime::Cursor {
+                run_id: "run".into(),
+                deck_revision: 1,
+                revision: 1,
+            };
+            let context = || OwnerContext {
+                participant: "presenter",
+                instance: "shared",
+                state: &state,
+                cursor: &cursor,
+            };
+            let mut owner =
+                crate::owner::LinkedOwner::new(deck.clone(), &[], crate::demo::linked_registry())
+                    .unwrap();
+            owner.configure_demos(fixture.environment.clone()).unwrap();
+            let surfaces = owner.scenes(context()).unwrap();
+            // Clicking the surrounding canvas must not open the demo.
+            assert!(
+                owner
+                    .demo_input(
+                        context(),
+                        &SurfaceInput {
+                            surface_id: "demo".into(),
+                            surface_revision: surfaces[0]
+                                .interaction_revision
+                                .unwrap_or(surfaces[0].revision),
+                            x: 0,
+                            y: 0,
+                            input: "click".into()
+                        }
+                    )
+                    .is_err()
+            );
+            let mut player = Player::local(deck, None, false);
+            let (send, mut actions) = tokio::sync::mpsc::channel(4);
+            let (_updates, receiver) = tokio::sync::mpsc::channel(4);
+            player.remote = Some(RemoteConnection {
+                actions: send,
+                updates: receiver,
+                receive_only: false,
+            });
+            player.surfaces = surfaces;
+            let scene = bmux_tui::presentation::PresentationState::new(Rect::new(0, 0, 80, 24));
+            let prepared = scene
+                .prepare(bmux_tui::damage::Damage::Full, |cx| paint(&mut player, cx))
+                .unwrap();
+            player.local_view.pending_hits = prepared.hits().clone();
+            player.local_view.commit();
+            assert!(player.local_view.painted_focus.is_none());
+            let event = if click {
+                let placement = player.local_view.mirror_geometry[0].3;
+                Event::Mouse(MouseEvent::new(
+                    MouseEventKind::Down(MouseButton::Left),
+                    bmux_tui::geometry::Point::new(
+                        placement.destination_x + 1,
+                        placement.destination_y + 2,
+                    ),
+                ))
+            } else {
+                Event::Key(KeyStroke::simple(KeyCode::Char('o')))
+            };
+            player
+                .update(RuntimeEvent::Terminal(event.clone()))
+                .unwrap();
+            let bmux_presenter_runtime::Action::DemoInput(input) =
+                actions.try_recv().expect("launch admitted")
+            else {
+                panic!("launch action");
+            };
+            let opened = owner.demo_input(context(), &input).unwrap();
+            assert!(opened.surfaces[0].private_scene.is_some());
+            assert!(opened.surfaces[0].playbook.is_some());
+            assert!(actions.try_recv().is_err());
+            player.remote.as_mut().unwrap().receive_only = true;
+            assert!(!player.route_mirror_target(&event, Some("demo")).unwrap());
+            owner.shutdown().await.unwrap();
+        }
     }
 
     #[tokio::test]
