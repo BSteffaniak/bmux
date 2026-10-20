@@ -114,7 +114,9 @@ impl Default for SelectableListStyles {
             background: Style::new(),
             scrollbar: ScrollbarStyles::default(),
             normal: Style::new(),
-            focused: Style::new().add_modifier(Modifier::REVERSED),
+            focused: Style::new()
+                .add_modifier(Modifier::REVERSED)
+                .add_modifier(Modifier::UNDERLINE),
             selected: Style::new().add_modifier(Modifier::BOLD),
             hovered: Style::new().add_modifier(Modifier::UNDERLINE),
             pressed: Style::new().add_modifier(Modifier::BOLD | Modifier::REVERSED),
@@ -239,7 +241,8 @@ impl Default for SelectableListPolicy {
 }
 
 /// Runtime selectable-list state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SelectableListState {
     /// Common list interaction flags.
     pub interaction: InteractionState,
@@ -252,6 +255,25 @@ pub struct SelectableListState {
 }
 
 impl SelectableListState {
+    /// Capture native caller-owned state for an in-memory control rebuild.
+    /// This is not a stable wire or durable storage contract. Reapply canonical
+    /// values and current keyboard focus after restoring a snapshot.
+    #[must_use]
+    pub fn snapshot(&self) -> serde_json::Value {
+        crate::common::state_snapshot(self)
+    }
+
+    /// Restore a bounded native rebuild snapshot, including private interaction
+    /// state. Malformed snapshots return an error without changing this state.
+    ///
+    /// # Errors
+    /// Returns an error for malformed, oversized, or incompatible snapshots.
+    pub fn restore_snapshot(&mut self, snapshot: &serde_json::Value) -> Result<(), String> {
+        let restored = crate::common::decode_state_snapshot(snapshot)?;
+        *self = restored;
+        Ok(())
+    }
+
     /// Create enabled selectable-list state.
     #[must_use]
     pub const fn new(selected: Option<usize>) -> Self {
@@ -714,7 +736,7 @@ impl<'a> SelectableList<'a> {
         let interaction_styled = state.interaction.disabled
             || item.disabled
             || state.pressed == Some(index)
-            || state.focused == Some(index)
+            || (state.interaction.focused && state.focused == Some(index))
             || state.hovered == Some(index)
             || state.selected == Some(index);
         let mut spans = Vec::new();
@@ -765,8 +787,13 @@ impl<'a> SelectableList<'a> {
             self.styles.disabled
         } else if state.pressed == Some(index) {
             self.styles.pressed
-        } else if state.focused == Some(index) {
-            self.styles.focused
+        } else if state.interaction.focused && state.focused == Some(index) {
+            let base = if state.selected == Some(index) {
+                self.styles.selected
+            } else {
+                self.styles.normal
+            };
+            base.patch(self.styles.focused)
         } else if state.hovered == Some(index) {
             self.styles.hovered
         } else if state.selected == Some(index) {
@@ -1840,7 +1867,10 @@ mod tests {
         for kind in 0..5 {
             let mut state = inactive;
             match kind {
-                0 => state.focused = Some(0),
+                0 => {
+                    state.focused = Some(0);
+                    state.interaction.focused = true;
+                }
                 1 => state.selected = Some(0),
                 2 => state.hovered = Some(0),
                 3 => state.pressed = Some(0),
@@ -2551,5 +2581,95 @@ mod tests {
 
         assert_eq!(outcome, SelectableListOutcome::Ignored);
         assert_eq!(state.selected(), Some(0));
+    }
+}
+
+#[cfg(test)]
+mod focus_visual_tests {
+    use std::cell::Cell;
+
+    use bmux_tui::component::Component;
+    use bmux_tui::style::{Color, Modifier, Style};
+    use bmux_tui::text::{Line, Span};
+
+    use super::*;
+
+    #[test]
+    fn remembered_cursor_does_not_paint_focus_or_replace_selection() {
+        let items = [SelectableListItem::new("one", "One")];
+        let styles = SelectableListStyles {
+            selected: Style::new().bg(Color::Blue),
+            focused: crate::common::DEFAULT_FOCUS_STYLE,
+            ..SelectableListStyles::default()
+        };
+        let list = SelectableList::new(&items).styles(styles);
+        let mut state = SelectableListState::new(Some(0));
+        assert_eq!(list.style_for(0, &items[0], state), styles.selected);
+        state.interaction.focused = true;
+        let focused = list.style_for(0, &items[0], state);
+        assert_eq!(focused.bg, styles.selected.bg);
+        assert!(focused.modifiers.contains(Modifier::UNDERLINE));
+        assert_eq!(state.selected(), Some(0));
+        assert_eq!(state.focused(), Some(0));
+        state.interaction.disabled = true;
+        assert_eq!(list.style_for(0, &items[0], state), styles.disabled);
+    }
+
+    #[test]
+    fn inactive_cursor_preserves_rich_label_accents() {
+        let accent = Style::new().fg(Color::Yellow);
+        let items = [SelectableListItem::multiline(
+            "one",
+            [Line::from_spans([Span::styled("One", accent)])],
+        )];
+        let list = SelectableList::new(&items);
+        let mut state = SelectableListState::new(None);
+        state.focused = Some(0);
+        assert_eq!(
+            list.line(0, &items[0], 0, state)
+                .spans
+                .last()
+                .unwrap()
+                .style,
+            accent
+        );
+    }
+
+    #[test]
+    fn keyboard_focus_is_paint_only() {
+        let items = [SelectableListItem::new("one", "One")];
+        let state = Cell::new(SelectableListState::new(Some(0)));
+        let component = SelectableListComponent::new("focus.list", &items, &state);
+        let before = component.revision();
+        let mut focused = state.get();
+        focused.interaction.focused = true;
+        state.set(focused);
+        let after = component.revision();
+        assert_eq!(before.layout, after.layout);
+        assert_ne!(before.paint, after.paint);
+    }
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::SelectableListState;
+
+    #[test]
+    fn native_snapshot_preserves_private_state_and_rejects_bad_input_atomically() {
+        let mut state = SelectableListState::new(Some(1));
+        state.focused = Some(2);
+        state.hovered = Some(2);
+        state.pressed = Some(2);
+        state.set_vertical_scroll(7);
+        let snapshot = state.snapshot();
+        let mut rebuilt = SelectableListState::new(Some(1));
+        rebuilt.restore_snapshot(&snapshot).unwrap();
+        assert_eq!(rebuilt, state);
+        let mut malformed = snapshot.clone();
+        malformed["unknown_field"] = serde_json::json!(true);
+        assert!(rebuilt.restore_snapshot(&malformed).is_err());
+        assert_eq!(rebuilt, state);
+        assert!(rebuilt.restore_snapshot(&serde_json::Value::Null).is_err());
+        assert_eq!(rebuilt, state);
     }
 }

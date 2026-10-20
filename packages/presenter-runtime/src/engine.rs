@@ -151,10 +151,20 @@ pub trait Owner: Send {
     {
         Box::pin(async { Ok(()) })
     }
+    /// Reconstruct participant-local interaction appearance without changing shared values.
+    /// The host retains the validated result for input admission for this participant only.
+    fn view_scene(
+        &mut self,
+        _context: OwnerContext<'_>,
+        surfaces: &[MirrorFrame],
+    ) -> Result<Vec<MirrorFrame>, HostError> {
+        Ok(surfaces.to_vec())
+    }
     fn disconnect(&mut self, _participant: &str) {}
 }
 
 struct Participant {
+    view_surfaces: Option<(u64, BTreeMap<String, MirrorFrame>)>,
     grant: Option<String>,
     mode: InteractionMode,
     state: PresentationState,
@@ -376,6 +386,7 @@ impl Host {
         self.participants.insert(
             id.clone(),
             Participant {
+                view_surfaces: None,
                 grant,
                 mode,
                 state,
@@ -492,6 +503,21 @@ impl Host {
     pub fn poll(&mut self, id: &str, previous: Option<&Cursor>) -> Result<Poll, HostError> {
         self.project(id, previous, false)
     }
+    fn participant_surfaces<'a>(
+        &'a self,
+        participant: &'a Participant,
+    ) -> &'a BTreeMap<String, MirrorFrame> {
+        if participant.mode == InteractionMode::Independent {
+            &participant.surfaces
+        } else if let Some((revision, frames)) = &participant.view_surfaces
+            && *revision == self.revision
+        {
+            frames
+        } else {
+            &self.surfaces
+        }
+    }
+
     fn project(
         &mut self,
         id: &str,
@@ -508,17 +534,35 @@ impl Host {
         if previous == Some(&cursor) {
             return Ok(Poll::Unchanged(cursor));
         }
+        if participant.mode != InteractionMode::Independent
+            && participant.mode != InteractionMode::ReceiveOnly
+            && scopes.demo_input
+            && let Some(owner) = &mut self.owner
+        {
+            let originals: Vec<_> = self.surfaces.values().cloned().collect();
+            let frames = owner.view_scene(
+                OwnerContext {
+                    participant: id,
+                    instance: "shared",
+                    state: &self.state,
+                    cursor: &cursor,
+                },
+                &originals,
+            )?;
+            let frames = validate_scene(frames, &self.deck, &self.config.limits, &self.state)?;
+            self.participants
+                .get_mut(id)
+                .ok_or(HostError::Authentication)?
+                .view_surfaces = Some((self.revision, frames));
+        }
+        let participant = self.participants.get(id).ok_or(HostError::Authentication)?;
         let independent = participant.mode == InteractionMode::Independent;
         let state = if independent {
             &participant.state
         } else {
             &self.state
         };
-        let surfaces = if independent {
-            &participant.surfaces
-        } else {
-            &self.surfaces
-        };
+        let surfaces = self.participant_surfaces(participant);
         let snapshot = Snapshot {
             cursor: cursor.clone(),
             deck: self.public_deck.clone(),
@@ -545,6 +589,11 @@ impl Host {
                         || participant.mode == InteractionMode::ReceiveOnly
                     {
                         frame.private_scene = None;
+                    }
+                    if !scopes.demo_input || participant.mode == InteractionMode::ReceiveOnly {
+                        frame.focused = None;
+                        frame.cursor = None;
+                        frame.focusable = false;
                     }
                     frame
                 })
@@ -640,7 +689,7 @@ impl Host {
         }
         let current_cursor = self.cursor(id)?;
         let stable_control_input = matches!(&submission.action, Action::DemoInput(input) if {
-            let surfaces = if participant.mode == InteractionMode::Independent { &participant.surfaces } else { &self.surfaces };
+            let surfaces = self.participant_surfaces(participant);
             surfaces.get(&input.surface_id).is_some_and(|surface| surface.private_scene.as_ref().map_or(surface.interaction_revision.unwrap_or(surface.revision), |scene| scene.frame.revision) == input.surface_revision)
         });
         if submission.expected != current_cursor
@@ -656,11 +705,7 @@ impl Host {
             Action::DemoInput(input)
                 if !scopes.effects
                     && self.participants.get(id).is_some_and(|participant| {
-                        let surfaces = if participant.mode == InteractionMode::Independent {
-                            &participant.surfaces
-                        } else {
-                            &self.surfaces
-                        };
+                        let surfaces = self.participant_surfaces(participant);
                         surfaces
                             .get(&input.surface_id)
                             .is_some_and(|surface| surface.private_scene.is_some())
@@ -677,11 +722,7 @@ impl Host {
         } else {
             &self.state
         };
-        let surfaces = if independent {
-            &participant.surfaces
-        } else {
-            &self.surfaces
-        };
+        let surfaces = self.participant_surfaces(participant);
         if let Action::DemoInput(input) = &submission.action
             && (surfaces.get(&input.surface_id).is_none_or(|surface| {
                 surface.private_scene.as_ref().map_or(

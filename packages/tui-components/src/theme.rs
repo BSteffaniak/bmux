@@ -92,7 +92,9 @@ impl ComponentTheme {
                 scrim: None,
             },
             text: Style::new().fg(Color::White),
-            focused: Style::new().add_modifier(Modifier::REVERSED),
+            focused: Style::new()
+                .add_modifier(Modifier::REVERSED)
+                .add_modifier(Modifier::UNDERLINE),
             selected: Style::new().fg(Color::Black).bg(Color::Cyan),
             disabled: Style::new()
                 .fg(Color::BrightBlack)
@@ -119,7 +121,9 @@ impl ComponentTheme {
                 scrim: Some(Style::new().bg(Color::Black)),
             },
             text: Style::new().fg(Color::BrightWhite),
-            focused: Style::new().fg(Color::BrightCyan),
+            focused: Style::new()
+                .fg(Color::BrightCyan)
+                .add_modifier(Modifier::UNDERLINE),
             selected: Style::new().fg(Color::Black).bg(Color::Cyan),
             disabled: Style::new()
                 .fg(Color::BrightBlack)
@@ -146,7 +150,10 @@ impl ComponentTheme {
                 scrim: Some(Style::new().bg(Color::BrightBlack)),
             },
             text: Style::new().fg(Color::Black),
-            focused: Style::new().fg(Color::Blue).add_modifier(Modifier::BOLD),
+            focused: Style::new()
+                .fg(Color::Blue)
+                .add_modifier(Modifier::BOLD)
+                .add_modifier(Modifier::UNDERLINE),
             selected: Style::new().fg(Color::White).bg(Color::Blue),
             disabled: Style::new()
                 .fg(Color::BrightBlack)
@@ -177,7 +184,9 @@ impl ComponentTheme {
                 scrim: None,
             },
             text: Style::new().fg(Color::Default),
-            focused: Style::new().add_modifier(Modifier::REVERSED),
+            focused: Style::new()
+                .add_modifier(Modifier::REVERSED)
+                .add_modifier(Modifier::UNDERLINE),
             selected: Style::new().add_modifier(Modifier::REVERSED),
             disabled: Style::new().add_modifier(Modifier::DIM),
             muted: Style::new().add_modifier(Modifier::DIM),
@@ -512,5 +521,26 @@ mod tests {
         assert_eq!(badge.error.fg, theme.error.fg);
         assert_eq!(theme.empty_state_styles().body, normal.muted);
         assert_eq!(theme.progress_bar_styles().indeterminate, normal.info);
+    }
+}
+
+#[cfg(test)]
+mod focus_visual_tests {
+    use bmux_tui::style::Modifier;
+
+    use super::ComponentTheme;
+
+    #[test]
+    fn built_in_focus_has_a_non_color_cue_distinct_from_selection() {
+        for theme in [
+            ComponentTheme::default(),
+            ComponentTheme::opaque_dark(),
+            ComponentTheme::opaque_light(),
+            ComponentTheme::terminal_default(),
+        ] {
+            assert!(theme.focused.modifiers.contains(Modifier::UNDERLINE));
+            assert!(!theme.selected.modifiers.contains(Modifier::UNDERLINE));
+            assert_ne!(theme.selected, theme.focused);
+        }
     }
 }

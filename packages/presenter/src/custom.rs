@@ -3,10 +3,28 @@ use crate::model::Block;
 use bmux_tui::component::{Component, Element};
 use std::collections::BTreeMap;
 
+/// Viewer-local build input; never stored in shared component state.
+#[derive(Clone, Debug, Default)]
+pub struct PresentationBuildContext {
+    pub focused: bool,
+    /// Caller-owned per-view transient interaction, never canonical linked state.
+    pub interaction: Option<LinkedState>,
+}
+
 /// Factories can borrow caller-owned state, including canonical control state.
 /// Build must be deterministic/read-only; effects belong to the host event loop.
 pub trait CustomComponentFactory {
     fn build<'a>(&'a self, block: &'a Block) -> Result<Element<'a>, String>;
+    fn build_with_context<'a>(
+        &'a self,
+        block: &'a Block,
+        _context: PresentationBuildContext,
+    ) -> Result<Element<'a>, String> {
+        self.build(block)
+    }
+    fn focusable(&self, _block: &Block) -> bool {
+        true
+    }
     /// Invalidate derived geometry/paint when external caller-owned state changes.
     fn revision(&self) -> bmux_tui::component::ComponentRevision {
         bmux_tui::component::ComponentRevision::default()
@@ -39,13 +57,28 @@ impl<'registry> CustomRegistry<'registry> {
         self.factories.contains_key(name)
     }
     pub fn build<'a>(&'a self, block: &'a Block) -> Result<Element<'a>, String> {
+        self.build_with_context(block, PresentationBuildContext::default())
+    }
+    pub fn focusable(&self, block: &Block) -> bool {
+        let crate::model::BlockKind::Custom { name, .. } = &block.kind else {
+            return false;
+        };
+        self.factories
+            .get(name)
+            .is_some_and(|factory| factory.focusable(block))
+    }
+    pub fn build_with_context<'a>(
+        &'a self,
+        block: &'a Block,
+        context: PresentationBuildContext,
+    ) -> Result<Element<'a>, String> {
         let crate::model::BlockKind::Custom { name, .. } = &block.kind else {
             return Err("factory requires a custom block".into());
         };
         self.factories
             .get(name)
             .ok_or_else(|| format!("unregistered component: {name}"))?
-            .build(block)
+            .build_with_context(block, context)
     }
     pub fn revision(&self) -> bmux_tui::component::ComponentRevision {
         self.factories.values().fold(
@@ -66,6 +99,19 @@ pub trait LinkedComponentFactory: Send + Sync {
     fn state_version(&self) -> u64;
     fn initial_state(&self, block: &Block) -> Result<serde_json::Value, String>;
     fn build<'a>(&'a self, block: &'a Block, state: LinkedState) -> Result<Element<'a>, String>;
+    /// Read-only projection context. Focus may change paint/cursor, never layout
+    /// IDs, sizes, child placement, or shared state. The host owns active focus.
+    fn build_with_context<'a>(
+        &'a self,
+        block: &'a Block,
+        state: LinkedState,
+        _context: PresentationBuildContext,
+    ) -> Result<Element<'a>, String> {
+        self.build(block, state)
+    }
+    fn focusable(&self, _block: &Block) -> bool {
+        true
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -151,6 +197,76 @@ pub trait RichContent {
 mod tests {
     use super::*;
     use bmux_tui::prelude::TextBlock;
+    #[test]
+    fn focus_context_is_build_local_and_invalidates_paint_without_layout() {
+        struct ContextFactory;
+        struct ContextDisplay(bool);
+        impl Component for ContextDisplay {
+            fn revision(&self) -> bmux_tui::component::ComponentRevision {
+                bmux_tui::component::ComponentRevision::new(0, u64::from(self.0))
+            }
+            fn layout(
+                &self,
+                c: bmux_tui::prelude::Constraints,
+                cx: &mut bmux_tui::prelude::LayoutCx,
+            ) -> bmux_tui::prelude::LayoutNode {
+                TextBlock::new("BLUR!").layout(c, cx)
+            }
+            fn paint(
+                &self,
+                layout: &bmux_tui::prelude::LayoutNode,
+                cx: &mut bmux_tui::prelude::PaintCx<'_, '_>,
+            ) {
+                TextBlock::new(if self.0 { "FOCUS" } else { "BLUR!" }).paint(layout, cx);
+            }
+        }
+        impl CustomComponentFactory for ContextFactory {
+            fn build<'a>(&'a self, _block: &'a Block) -> Result<Element<'a>, String> {
+                Ok(Element::new(TextBlock::new("legacy")))
+            }
+            fn build_with_context<'a>(
+                &'a self,
+                _block: &'a Block,
+                context: PresentationBuildContext,
+            ) -> Result<Element<'a>, String> {
+                Ok(Element::new(ContextDisplay(context.focused)))
+            }
+            fn focusable(&self, _block: &Block) -> bool {
+                false
+            }
+        }
+        let deck = crate::DeckBuilder::new("context")
+            .slide(
+                crate::SlideBuilder::new("s")
+                    .custom("b", "context", serde_json::Value::Null)
+                    .build(),
+            )
+            .build()
+            .unwrap();
+        let block = &deck.slides[0].blocks[0];
+        let mut registry = CustomRegistry::new();
+        registry.register("context", ContextFactory).unwrap();
+        assert!(!registry.focusable(block));
+        let theme = crate::PresentationTheme::for_deck(&deck);
+        let normal = crate::SlideComponent::new(&deck.slides[0], 0, &theme, &registry);
+        let focused = crate::SlideComponent::new(&deck.slides[0], 0, &theme, &registry)
+            .focused_block(&block.id);
+        use bmux_tui::prelude::{Buffer, Constraints, Frame, LayoutCx, PaintCx};
+        let layout = normal.layout(Constraints::for_width(30), &mut LayoutCx::default());
+        assert_eq!(normal.revision().layout, focused.revision().layout);
+        assert_ne!(normal.revision().paint, focused.revision().paint);
+        for (component, expected) in [(&normal, "BLUR!"), (&focused, "FOCUS"), (&normal, "BLUR!")] {
+            let mut buffer = Buffer::empty(bmux_tui::geometry::Rect::new(0, 0, 30, 10));
+            let mut frame = Frame::new(&mut buffer);
+            component.paint(&layout, &mut PaintCx::new(&mut frame));
+            let text = buffer
+                .cells()
+                .iter()
+                .map(|cell| cell.symbol.as_str())
+                .collect::<String>();
+            assert!(text.contains(expected));
+        }
+    }
     #[test]
     fn registry_rejects_duplicates_and_unknown_components() {
         let mut registry = CustomRegistry::new();

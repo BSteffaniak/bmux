@@ -24,9 +24,22 @@ pub(crate) struct RemoteConnection {
     pub receive_only: bool,
 }
 
+fn is_playbook_block(blocks: &[bmux_presenter::Block], id: &str) -> bool {
+    blocks.iter().any(|block| match &block.kind {
+        bmux_presenter::BlockKind::Custom { name, .. } => {
+            block.id.as_str() == id && name == "playbook-demo"
+        }
+        bmux_presenter::BlockKind::Columns { columns } => columns
+            .iter()
+            .any(|column| is_playbook_block(&column.blocks, id)),
+        _ => false,
+    })
+}
+
 struct LocalFactory {
     factory: std::sync::Arc<dyn bmux_presenter::custom::LinkedComponentFactory>,
     states: std::collections::BTreeMap<String, bmux_presenter::custom::LinkedState>,
+    interactions: std::collections::BTreeMap<String, bmux_presenter::custom::LinkedState>,
 }
 impl bmux_presenter::custom::CustomComponentFactory for LocalFactory {
     fn revision(&self) -> bmux_tui::component::ComponentRevision {
@@ -44,11 +57,26 @@ impl bmux_presenter::custom::CustomComponentFactory for LocalFactory {
         &'a self,
         block: &'a bmux_presenter::Block,
     ) -> Result<bmux_tui::component::Element<'a>, String> {
+        self.build_with_context(
+            block,
+            bmux_presenter::custom::PresentationBuildContext::default(),
+        )
+    }
+    fn focusable(&self, block: &bmux_presenter::Block) -> bool {
+        self.factory.focusable(block)
+    }
+    fn build_with_context<'a>(
+        &'a self,
+        block: &'a bmux_presenter::Block,
+        mut context: bmux_presenter::custom::PresentationBuildContext,
+    ) -> Result<bmux_tui::component::Element<'a>, String> {
         let state = self
             .states
             .get(block.id.as_str())
             .ok_or("missing prepared component state")?;
-        self.factory.build(block, std::sync::Arc::clone(state))
+        context.interaction = self.interactions.get(block.id.as_str()).cloned();
+        self.factory
+            .build_with_context(block, std::sync::Arc::clone(state), context)
     }
 }
 type LocalStates = std::collections::BTreeMap<
@@ -123,7 +151,11 @@ struct PresentationView {
     viewer: ViewerState,
     painted_viewer: ViewerState,
     pending_viewer: ViewerState,
+    interactions: std::cell::RefCell<LocalStates>,
     focused_block: Option<bmux_presenter::BlockId>,
+    managed_focus_nonce: u64,
+    pending_managed_focus: Option<crate::managed_input::FocusAck>,
+    managed_focus_started: Option<Instant>,
     painted_focus: Option<bmux_presenter::BlockId>,
     pending_focus: Option<bmux_presenter::BlockId>,
     painted_layout: Option<bmux_tui::component::LayoutNode>,
@@ -253,9 +285,17 @@ impl Player {
     }
 
     fn registry(&self) -> CustomRegistry<'static> {
+        self.registry_for_view(None)
+    }
+    fn registry_for_view(&self, view: Option<&PresentationView>) -> CustomRegistry<'static> {
         let mut registry = CustomRegistry::new();
         if self.remote.is_some() {
             return registry;
+        }
+        if let Some(view) = view {
+            view.interactions
+                .borrow_mut()
+                .retain(|key, _| self.instances.contains_key(key));
         }
         let mut grouped = std::collections::BTreeMap::<
             String,
@@ -271,9 +311,30 @@ impl Player {
             if let Some(factory) = self.linked.factory(&name) {
                 registry
                     .register(
-                        name,
+                        name.clone(),
                         LocalFactory {
                             factory: std::sync::Arc::clone(factory),
+                            interactions: states
+                                .keys()
+                                .filter_map(|id| {
+                                    let view = view?;
+                                    let key = self
+                                        .instances
+                                        .keys()
+                                        .find(|key| key.id == *id && key.component_type == name)?;
+                                    let state = view
+                                        .interactions
+                                        .borrow_mut()
+                                        .entry(key.clone())
+                                        .or_insert_with(|| {
+                                            std::sync::Arc::new(std::sync::Mutex::new(
+                                                serde_json::json!({}),
+                                            ))
+                                        })
+                                        .clone();
+                                    Some((id.clone(), state))
+                                })
+                                .collect(),
                             states,
                         },
                     )
@@ -295,14 +356,31 @@ impl Player {
                 .as_ref()
                 .is_some_and(|id| id.as_str() == surface.surface_id)
         });
-        let geometry = selected_surface
-            .and_then(|surface| {
+        let geometry = match event {
+            Event::Mouse(mouse) => {
                 self.local_view
                     .mirror_geometry
                     .iter()
-                    .find(|(id, _, _, _)| *id == surface.surface_id)
-            })
-            .or_else(|| self.local_view.mirror_geometry.first());
+                    .rev()
+                    .find(|(_, _, _, placement)| {
+                        placement
+                            .input_point(mouse.position.x, mouse.position.y)
+                            .is_some()
+                    })
+            }
+            Event::Key(_) | Event::Paste(_) => {
+                if self.local_view.focused_block != self.local_view.painted_focus {
+                    return Ok(false);
+                }
+                selected_surface.and_then(|surface| {
+                    self.local_view
+                        .mirror_geometry
+                        .iter()
+                        .find(|(id, _, _, _)| *id == surface.surface_id)
+                })
+            }
+            _ => None,
+        };
         let Some((surface_id, revision, slide_id, placement)) = geometry else {
             return Ok(false);
         };
@@ -367,27 +445,48 @@ impl Player {
                 .context("managed modal key admission full or disconnected")?;
             return Ok(true);
         }
-        let (x, y, input) = match event {
-            Event::Key(key) => {
-                let Some(input) = overlay_key_input(key) else {
-                    return Ok(false);
-                };
-                (0, 0, input)
+        let playbook = self
+            .state
+            .current_slide(&self.deck)
+            .is_some_and(|slide| is_playbook_block(&slide.blocks, surface_id));
+        let (x, y, input) = if playbook {
+            match event {
+                Event::Key(key) => {
+                    let Some(input) = overlay_key_input(key) else {
+                        return Ok(false);
+                    };
+                    (0, 0, input)
+                }
+                Event::Mouse(mouse)
+                    if mouse.kind
+                        == bmux_tui::event::MouseEventKind::Down(
+                            bmux_tui::event::MouseButton::Left,
+                        ) =>
+                {
+                    let Some((x, y)) = placement.input_point(mouse.position.x, mouse.position.y)
+                    else {
+                        return Ok(false);
+                    };
+                    (x, y, "click".to_owned())
+                }
+                _ => return Ok(false),
             }
-            Event::Mouse(mouse)
-                if mouse.kind
-                    == bmux_tui::event::MouseEventKind::Down(
-                        bmux_tui::event::MouseButton::Left,
-                    ) =>
-            {
-                let Some((x, y)) = placement.input_point(mouse.position.x, mouse.position.y) else {
-                    return Ok(false);
-                };
-                (x, y, "click".to_owned())
-            }
-            _ => return Ok(false),
+        } else {
+            let Some(input) = crate::managed_input::encode(event) else {
+                return Ok(false);
+            };
+            let (x, y) = match event {
+                Event::Mouse(mouse) => {
+                    let Some(point) = placement.input_point(mouse.position.x, mouse.position.y)
+                    else {
+                        return Ok(false);
+                    };
+                    point
+                }
+                _ => (0, 0),
+            };
+            (x, y, input)
         };
-        let playbook = self.deck.slides.iter().flat_map(|slide| slide.blocks.iter()).any(|block| block.id.as_str() == surface_id && matches!(&block.kind, bmux_presenter::BlockKind::Custom { name, .. } if name == "playbook-demo"));
         if playbook {
             if !matches!(
                 input.as_str(),
@@ -436,7 +535,7 @@ impl Player {
         ) {
             for block in blocks.iter().filter(|block| block.reveal_step <= step) {
                 match &block.kind {
-                    bmux_presenter::BlockKind::Custom { name, .. } if registry.contains(name) => {
+                    bmux_presenter::BlockKind::Custom { .. } if registry.focusable(block) => {
                         out.push(block.id.clone())
                     }
                     bmux_presenter::BlockKind::Columns { columns } => {
@@ -453,6 +552,7 @@ impl Player {
             if let Some(slide) = &self.state.slide_id {
                 for surface in &self.surfaces {
                     if surface.slide_id == slide.as_str()
+                        && surface.focusable
                         && !targets
                             .iter()
                             .any(|id: &bmux_presenter::BlockId| id.as_str() == surface.surface_id)
@@ -473,6 +573,109 @@ impl Player {
         }
         targets
     }
+    fn route_managed_focus_key(&mut self, key: bmux_keyboard::KeyStroke) -> Result<bool> {
+        let Some(remote) = &self.remote else {
+            return Ok(false);
+        };
+        if remote.receive_only {
+            return Ok(false);
+        }
+        if self.local_view.pending_managed_focus.is_some() {
+            return Ok(true);
+        }
+        let Some(id) = &self.local_view.painted_focus else {
+            return Ok(false);
+        };
+        if self.local_view.focused_block.as_ref() != Some(id) {
+            return Ok(true);
+        }
+        if self
+            .state
+            .current_slide(&self.deck)
+            .is_some_and(|slide| is_playbook_block(&slide.blocks, id.as_str()))
+        {
+            return Ok(false);
+        }
+        let Some((surface_id, revision, slide_id, _)) = self
+            .local_view
+            .mirror_geometry
+            .iter()
+            .find(|(surface, _, _, _)| surface == id.as_str())
+        else {
+            return Ok(true);
+        };
+        if self
+            .state
+            .slide_id
+            .as_ref()
+            .is_none_or(|id| id.as_str() != slide_id)
+            || !self.surfaces.iter().any(|surface| {
+                surface.surface_id == *surface_id
+                    && surface.private_scene.is_none()
+                    && surface.interaction_revision.unwrap_or(surface.revision) == *revision
+            })
+        {
+            return Ok(true);
+        }
+        self.local_view.managed_focus_nonce = self
+            .local_view
+            .managed_focus_nonce
+            .checked_add(1)
+            .context("managed focus request identity exhausted")?;
+        let input = crate::managed_input::encode_focus(key, self.local_view.managed_focus_nonce)
+            .context("invalid managed focus key")?;
+        let ack = crate::managed_input::focus_ack(surface_id, *revision, &input, false)
+            .context("invalid managed focus request")?;
+        crate::managed_input::encode_ack(&ack).context("focus acknowledgment too large")?;
+        let input = bmux_presenter_runtime::SurfaceInput {
+            surface_id: surface_id.clone(),
+            surface_revision: *revision,
+            x: 0,
+            y: 0,
+            input,
+        };
+        remote
+            .actions
+            .try_send(bmux_presenter_runtime::Action::DemoInput(input))
+            .context("managed focus admission full or disconnected")?;
+        self.local_view.pending_managed_focus = Some(ack);
+        self.local_view.managed_focus_started = Some(Instant::now());
+        Ok(true)
+    }
+    fn apply_managed_focus_ack(&mut self, wire: &str) -> bool {
+        let Some(ack) = crate::managed_input::decode_ack(wire) else {
+            return false;
+        };
+        let Some(pending) = &self.local_view.pending_managed_focus else {
+            return false;
+        };
+        if ack.surface_id != pending.surface_id
+            || ack.revision != pending.revision
+            || ack.request != pending.request
+        {
+            return false;
+        }
+        self.local_view.pending_managed_focus = None;
+        self.local_view.managed_focus_started = None;
+        if !ack.handled
+            && self
+                .local_view
+                .focused_block
+                .as_ref()
+                .is_some_and(|id| id.as_str() == ack.surface_id)
+        {
+            match crate::managed_input::decode(&ack.request, 0, 0) {
+                Some(Event::Key(key)) if key.key == KeyCode::Tab => {
+                    self.cycle_focus(key.modifiers.shift)
+                }
+                Some(Event::Key(key)) if key.key == KeyCode::Escape => {
+                    self.local_view.focused_block = None
+                }
+                _ => {}
+            }
+        }
+        true
+    }
     fn cycle_focus(&mut self, reverse: bool) {
         let registry = self.registry();
         let targets = self.focus_targets(&registry);
@@ -492,6 +695,11 @@ impl Player {
     }
 
     fn route_component(&mut self, event: &Event) -> bmux_tui::event::EventOutcome {
+        if matches!(event, Event::Key(_) | Event::Paste(_))
+            && self.local_view.focused_block != self.local_view.painted_focus
+        {
+            return bmux_tui::event::EventOutcome::Ignored;
+        }
         let Some(layout) = &self.local_view.painted_layout else {
             return bmux_tui::event::EventOutcome::Ignored;
         };
@@ -499,7 +707,7 @@ impl Player {
             return bmux_tui::event::EventOutcome::Ignored;
         };
         let theme = PresentationTheme::for_deck(&displayed.deck);
-        let registry = self.registry();
+        let registry = self.registry_for_view(Some(&self.local_view));
         let committed_scroll = self.local_view.painted_viewer.scroll.get();
         let mut component = ViewerComponent::new(
             &displayed.deck,
@@ -557,6 +765,7 @@ impl Player {
         self.local_view.pending_evidence = None;
         self.local_view.pending_demo = None;
         self.local_view.focused_block = None;
+        self.local_view.pending_managed_focus = None;
         self.local_view.mirror_geometry.clear();
         self.local_view.pending_mirror_geometry.clear();
     }
@@ -689,6 +898,18 @@ impl Program for Player {
             RuntimeEvent::Timer(_) => {
                 let previous_status = self.status.clone();
                 let mut changed = self.reload();
+                if self.local_view.pending_managed_focus.is_some()
+                    && self
+                        .local_view
+                        .managed_focus_started
+                        .is_some_and(|started| started.elapsed() >= Duration::from_secs(5))
+                {
+                    self.local_view.pending_managed_focus = None;
+                    self.local_view.managed_focus_started = None;
+                    self.status =
+                        Some("Managed focus acknowledgment timed out; focus retained".into());
+                    changed = true;
+                }
                 if let Some(demos) = &mut self.live_demos {
                     changed |= demos.update();
                 }
@@ -717,6 +938,9 @@ impl Program for Player {
                                     continue;
                                 }
                                 let notes = if self.presenter { snapshot.notes } else { None };
+                                let focus_epoch_changed = self.producer_run.as_deref()
+                                    != Some(&snapshot.cursor.run_id)
+                                    || self.deck != snapshot.deck;
                                 changed |= self.producer_run.as_deref()
                                     != Some(&snapshot.cursor.run_id)
                                     || self.deck != snapshot.deck
@@ -730,16 +954,20 @@ impl Program for Player {
                                 self.observe_producer_run(&snapshot.cursor.run_id)?;
                                 self.deck = snapshot.deck;
                                 self.state = snapshot.state;
-                                if previous_slide != self.state.slide_id {
+                                if previous_slide != self.state.slide_id || focus_epoch_changed {
+                                    self.local_view.pending_managed_focus = None;
                                     self.local_view.viewer.reset_scroll();
                                     self.local_view.focused_block = None;
                                 }
                                 self.rich = update.rich;
                                 self.surfaces = snapshot.surfaces;
                                 self.notes = notes;
-                                self.status = update.acknowledgment;
+                                self.status = update
+                                    .acknowledgment
+                                    .filter(|wire| !self.apply_managed_focus_ack(wire));
                             }
                             Err(error) => {
+                                self.local_view.pending_managed_focus = None;
                                 self.status = Some(format!(
                                     "Update rejected; retaining last valid deck: {error}"
                                 ));
@@ -759,10 +987,14 @@ impl Program for Player {
                 })
             }
             RuntimeEvent::Terminal(Event::Key(key)) => {
-                // Exit is a caller lifecycle action, not an overlay control. It
-                // must remain available when the runner has failed cleanup.
-                if key.key == KeyCode::Char('q')
-                    || (key.modifiers.ctrl && key.key == KeyCode::Char('c'))
+                if self.local_view.pending_managed_focus.is_some() {
+                    return Ok(Update::none());
+                }
+                // Failed playbook cleanup must not trap the caller. Ordinary
+                // focused editors still own q/Ctrl-C; they are not global exits.
+                if self.local_view.painted_demo.is_some()
+                    && (key.key == KeyCode::Char('q')
+                        || (key.modifiers.ctrl && key.key == KeyCode::Char('c')))
                 {
                     return Ok(Update::exit());
                 }
@@ -787,6 +1019,11 @@ impl Program for Player {
                 }
                 if key.key == KeyCode::Char('o')
                     && self.remote.is_none()
+                    && self.local_view.focused_block.as_ref().is_some_and(|id| {
+                        self.state
+                            .current_slide(&self.deck)
+                            .is_some_and(|slide| is_playbook_block(&slide.blocks, id.as_str()))
+                    })
                     && let (Some(demos), Some(id)) =
                         (&mut self.live_demos, &self.local_view.focused_block)
                 {
@@ -797,12 +1034,42 @@ impl Program for Player {
                     );
                     return Ok(Update::redraw());
                 }
-                // Focus escape belongs to the presenter, not the embedded control.
-                if key.key == KeyCode::Escape && self.local_view.focused_block.take().is_some() {
+                // Give a focused control's overlay first refusal; otherwise Escape
+                // releases viewer-local focus without changing shared component state.
+                if key.key == KeyCode::Escape
+                    && key.modifiers == bmux_keyboard::Modifiers::NONE
+                    && self.local_view.focused_block.is_some()
+                {
+                    if self.route_managed_focus_key(key)? {
+                        return Ok(Update::redraw());
+                    }
+                    if self.route_component(&Event::Key(key))
+                        != bmux_tui::event::EventOutcome::Ignored
+                    {
+                        return Ok(Update::redraw());
+                    }
+                    self.local_view.focused_block = None;
                     self.local_view.pending_demo = None;
                     return Ok(Update::redraw());
                 }
-                if key.key == KeyCode::Tab {
+                if key.key == KeyCode::Tab
+                    && key.modifiers
+                        == (bmux_keyboard::Modifiers {
+                            shift: key.modifiers.shift,
+                            ..Default::default()
+                        })
+                {
+                    if self.local_view.focused_block.is_some()
+                        && self.route_managed_focus_key(key)?
+                    {
+                        return Ok(Update::redraw());
+                    }
+                    if self.local_view.focused_block.is_some()
+                        && self.route_component(&Event::Key(key))
+                            != bmux_tui::event::EventOutcome::Ignored
+                    {
+                        return Ok(Update::redraw());
+                    }
                     self.cycle_focus(key.modifiers.shift);
                     self.local_view.pending_demo = None;
                     return Ok(Update::redraw());
@@ -814,8 +1081,14 @@ impl Program for Player {
                 {
                     return Ok(Update::redraw());
                 }
-                if key.key == KeyCode::Char('q')
-                    || key.key == KeyCode::Escape
+                // A focused editor owns editing keys, even when it ignores them.
+                // Only Escape/Tab releases focus; ignored control keys never navigate.
+                if self.local_view.focused_block.is_some() {
+                    let _ = self.route_component(&Event::Key(key));
+                    return Ok(Update::redraw());
+                }
+                if (key.modifiers == bmux_keyboard::Modifiers::NONE
+                    && matches!(key.key, KeyCode::Char('q') | KeyCode::Escape))
                     || (key.modifiers.ctrl && key.key == KeyCode::Char('c'))
                 {
                     return Ok(Update::exit());
@@ -827,6 +1100,9 @@ impl Program for Player {
                 if self.route_component(&Event::Key(key)) != bmux_tui::event::EventOutcome::Ignored
                 {
                     return Ok(Update::redraw());
+                }
+                if key.modifiers != bmux_keyboard::Modifiers::NONE {
+                    return Ok(Update::none());
                 }
                 let action = match key.key {
                     KeyCode::Right
@@ -866,6 +1142,13 @@ impl Program for Player {
                 Ok(Update::redraw())
             }
             RuntimeEvent::Terminal(event) => {
+                if self.local_view.pending_managed_focus.is_some() {
+                    return Ok(Update::none());
+                }
+                if matches!(&event, Event::Paste(text) if text.len() > crate::managed_input::MAX_PASTE_BYTES)
+                {
+                    return Ok(Update::none());
+                }
                 // A displayed local modal never forwards pointer/paste to its
                 // obscured slide. Closing takes effect after the next commit.
                 if let Some(demo) = self.local_view.painted_demo.clone() {
@@ -913,8 +1196,53 @@ impl Program for Player {
                     }
                     return Ok(Update::none());
                 }
-                let _ = self.route_mirror(&event)?;
-                let _ = self.route_component(&event);
+                let pointer_focus = if let Event::Mouse(mouse) = &event
+                    && mouse.kind
+                        == bmux_tui::event::MouseEventKind::Down(bmux_tui::event::MouseButton::Left)
+                {
+                    if self.remote.is_some() {
+                        self.local_view
+                            .mirror_geometry
+                            .iter()
+                            .rev()
+                            .find(|(_, _, _, placement)| {
+                                placement
+                                    .input_point(mouse.position.x, mouse.position.y)
+                                    .is_some()
+                            })
+                            .and_then(|(id, _, _, _)| {
+                                self.surfaces
+                                    .iter()
+                                    .find(|surface| surface.surface_id == *id && surface.focusable)
+                            })
+                            .map(|surface| bmux_presenter::BlockId::new(&surface.surface_id))
+                    } else {
+                        let registry = self.registry();
+                        self.local_view
+                            .painted_hits
+                            .hit_mouse(*mouse)
+                            .and_then(|hit| {
+                                let hit = hit.id().as_str();
+                                self.focus_targets(&registry)
+                                    .into_iter()
+                                    .filter(|id| {
+                                        hit == id.as_str()
+                                            || hit.strip_prefix(id.as_str()).is_some_and(|suffix| {
+                                                suffix.starts_with('.') || suffix.starts_with('/')
+                                            })
+                                    })
+                                    .max_by_key(|id| id.as_str().len())
+                            })
+                    }
+                } else {
+                    None
+                };
+                if !self.route_mirror(&event)? {
+                    let _ = self.route_component(&event);
+                }
+                if let Some(id) = pointer_focus {
+                    self.local_view.focused_block = Some(id);
+                }
                 Ok(Update::redraw())
             }
         }
@@ -1050,7 +1378,17 @@ fn paint_audience(
         None
     };
     let mirror = mirror_surface.and_then(|surface| {
-        crate::mirror::MirrorComponent::new(surface, 16_384, 2 * 1024 * 1024).ok()
+        crate::mirror::MirrorComponent::new(surface, 16_384, 2 * 1024 * 1024)
+            .ok()
+            .map(|mirror| {
+                mirror.focused(
+                    show_local_focus
+                        && view
+                            .focused_block
+                            .as_ref()
+                            .is_some_and(|id| id.as_str() == surface.surface_id),
+                )
+            })
     });
     let mut component = ViewerComponent::new(
         content.deck,
@@ -1432,7 +1770,11 @@ fn paint_view(
     local: bool,
     cx: &mut PaintCx<'_, '_>,
 ) {
-    let registry = player.registry();
+    let registry = player.registry_for_view(if local {
+        Some(&player.local_view)
+    } else {
+        None
+    });
     let targets = player.focus_targets(&registry);
     let content = AudienceContent {
         deck: &player.deck,
@@ -2390,6 +2732,9 @@ mod tests {
             .unwrap();
         let mut player = Player::local(deck, None, false);
         let surface = MirrorFrame {
+            focusable: true,
+            focused: None,
+            cursor: None,
             interaction_revision: None,
             private_scene: None,
             playbook: None,
@@ -2441,6 +2786,8 @@ mod tests {
         assert_eq!(playbook.progress, 2500);
         assert_eq!(playbook.terminal.buffer().area(), Rect::new(0, 0, 80, 24));
         assert_eq!(audience[0].frame.buffer().area(), Rect::new(0, 0, 1, 1));
+        player.local_view.focused_block = Some("demo".into());
+        player.local_view.painted_focus = Some("demo".into());
         for (shift, expected) in [(false, "r"), (true, "R")] {
             let key = KeyStroke::with_modifiers(
                 KeyCode::Char('r'),
@@ -2469,6 +2816,9 @@ mod tests {
             .unwrap();
         let mut player = Player::local(deck, None, false);
         let surface = MirrorFrame {
+            focusable: true,
+            focused: None,
+            cursor: None,
             interaction_revision: None,
             private_scene: None,
             playbook: None,
@@ -2499,6 +2849,8 @@ mod tests {
             updates: receiver,
             receive_only: false,
         });
+        player.local_view.focused_block = Some("demo".into());
+        player.local_view.painted_focus = Some("demo".into());
         let event = Event::Key(KeyStroke::simple(KeyCode::Char('+')));
         assert!(!player.route_mirror(&event).unwrap());
         player
@@ -2510,10 +2862,441 @@ mod tests {
             panic!("demo input expected");
         };
         assert_eq!(input.surface_revision, 4);
+        assert!(
+            matches!(crate::managed_input::decode(&input.input, input.x, input.y),
+            Some(Event::Key(key)) if key.key == KeyCode::Char('+'))
+        );
+        player.local_view.focused_block = None;
+        assert!(!player.route_mirror(&event).unwrap());
+        player.local_view.focused_block = Some("demo".into());
+        for event in [
+            Event::Key(KeyStroke::with_modifiers(
+                KeyCode::Home,
+                bmux_keyboard::Modifiers {
+                    ctrl: true,
+                    shift: true,
+                    ..Default::default()
+                },
+            )),
+            Event::Paste("bounded é paste".into()),
+            Event::Mouse(bmux_tui::event::MouseEvent::new(
+                bmux_tui::event::MouseEventKind::ScrollDown,
+                bmux_tui::geometry::Point::new(placement.destination_x, placement.destination_y),
+            )),
+        ] {
+            assert!(player.route_mirror(&event).unwrap());
+            let bmux_presenter_runtime::Action::DemoInput(input) = actions.try_recv().unwrap()
+            else {
+                panic!("surface input");
+            };
+            assert!(crate::managed_input::decode(&input.input, input.x, input.y).is_some());
+        }
+        assert!(
+            !player
+                .route_mirror(&Event::Paste(
+                    "x".repeat(crate::managed_input::MAX_PASTE_BYTES + 1)
+                ))
+                .unwrap()
+        );
         player.surfaces[0].revision = 5;
         assert!(!player.route_mirror(&event).unwrap());
         player.remote.as_mut().unwrap().receive_only = true;
         assert!(!player.route_mirror(&event).unwrap());
+    }
+    #[test]
+    fn focused_controls_keep_editing_keys_and_modified_navigation_local() {
+        for key in [
+            KeyStroke::simple(KeyCode::Char('q')),
+            KeyStroke::simple(KeyCode::Right),
+            KeyStroke::simple(KeyCode::Enter),
+            KeyStroke::simple(KeyCode::Backspace),
+            KeyStroke::with_modifiers(
+                KeyCode::Right,
+                bmux_keyboard::Modifiers {
+                    ctrl: true,
+                    ..Default::default()
+                },
+            ),
+            KeyStroke::with_modifiers(
+                KeyCode::Char('c'),
+                bmux_keyboard::Modifiers {
+                    ctrl: true,
+                    ..Default::default()
+                },
+            ),
+        ] {
+            let deck = DeckBuilder::new("keys")
+                .slide(
+                    SlideBuilder::new("s")
+                        .custom("count", "counter", serde_json::Value::Null)
+                        .build(),
+                )
+                .slide(SlideBuilder::new("next").build())
+                .build()
+                .unwrap();
+            let mut player = Player::local(deck, None, false);
+            let mut terminal = Terminal::new(Vec::new(), Rect::new(0, 0, 80, 24));
+            terminal.draw(|cx| paint(&mut player, cx)).unwrap();
+            player.local_view.commit();
+            player.local_view.focused_block = Some("count".into());
+            terminal.draw(|cx| paint(&mut player, cx)).unwrap();
+            player.local_view.commit();
+            let update = player
+                .update(RuntimeEvent::Terminal(Event::Key(key)))
+                .unwrap();
+            assert_eq!(update.lifecycle, bmux_tui_runtime::Lifecycle::Continue);
+            assert_eq!(player.state.slide_id, Some("s".into()));
+            assert_eq!(player.local_view.focused_block, Some("count".into()));
+        }
+        for modifiers in [
+            bmux_keyboard::Modifiers {
+                ctrl: true,
+                ..Default::default()
+            },
+            bmux_keyboard::Modifiers {
+                alt: true,
+                ..Default::default()
+            },
+        ] {
+            let deck = DeckBuilder::new("keys")
+                .slide(SlideBuilder::new("s").build())
+                .slide(SlideBuilder::new("next").build())
+                .build()
+                .unwrap();
+            let mut player = Player::local(deck, None, false);
+            player
+                .update(RuntimeEvent::Terminal(Event::Key(
+                    KeyStroke::with_modifiers(KeyCode::Right, modifiers),
+                )))
+                .unwrap();
+            assert_eq!(player.state.slide_id, Some("s".into()));
+        }
+    }
+    #[test]
+    fn escape_closes_gallery_overlay_before_releasing_focus_and_shift_tab_reverses() {
+        let deck = DeckBuilder::new("escape")
+            .slide(
+                SlideBuilder::new("s")
+                    .custom(
+                        "menu",
+                        "tui-gallery",
+                        serde_json::json!({"kind":"select-dropdown"}),
+                    )
+                    .custom("count", "counter", serde_json::Value::Null)
+                    .build(),
+            )
+            .slide(SlideBuilder::new("next").build())
+            .build()
+            .unwrap();
+        let mut player = Player::local(deck, None, false);
+        let mut terminal = Terminal::new(Vec::new(), Rect::new(0, 0, 80, 24));
+        let draw = |player: &mut Player, terminal: &mut Terminal<Vec<u8>>| {
+            terminal.draw(|cx| paint(player, cx)).unwrap();
+            player.local_view.commit();
+        };
+        draw(&mut player, &mut terminal);
+        player
+            .update(RuntimeEvent::Terminal(Event::Key(KeyStroke::simple(
+                KeyCode::Tab,
+            ))))
+            .unwrap();
+        draw(&mut player, &mut terminal);
+        assert_eq!(player.local_view.focused_block, Some("menu".into()));
+        player
+            .update(RuntimeEvent::Terminal(Event::Key(KeyStroke::simple(
+                KeyCode::Enter,
+            ))))
+            .unwrap();
+        draw(&mut player, &mut terminal);
+        let menu = player
+            .local_view
+            .interactions
+            .borrow()
+            .iter()
+            .find(|(key, _)| key.id == "menu")
+            .unwrap()
+            .1
+            .clone();
+        assert_eq!(
+            menu.lock().unwrap()["menu"]["native"]["open"],
+            serde_json::json!(true)
+        );
+        player
+            .update(RuntimeEvent::Terminal(Event::Key(KeyStroke::simple(
+                KeyCode::Escape,
+            ))))
+            .unwrap();
+        draw(&mut player, &mut terminal);
+        assert_eq!(
+            menu.lock().unwrap()["menu"]["native"]["open"],
+            serde_json::json!(false)
+        );
+        assert_eq!(player.local_view.focused_block, Some("menu".into()));
+        player
+            .update(RuntimeEvent::Terminal(Event::Key(KeyStroke::simple(
+                KeyCode::Escape,
+            ))))
+            .unwrap();
+        draw(&mut player, &mut terminal);
+        assert!(player.local_view.focused_block.is_none());
+        let backwards = || {
+            RuntimeEvent::Terminal(Event::Key(KeyStroke::with_modifiers(
+                KeyCode::Tab,
+                bmux_keyboard::Modifiers {
+                    shift: true,
+                    ..Default::default()
+                },
+            )))
+        };
+        player.update(backwards()).unwrap();
+        draw(&mut player, &mut terminal);
+        assert_eq!(player.local_view.focused_block, Some("count".into()));
+        player.update(backwards()).unwrap();
+        draw(&mut player, &mut terminal);
+        assert_eq!(player.local_view.focused_block, Some("menu".into()));
+        assert_eq!(player.state.slide_id, Some("s".into()));
+    }
+    #[test]
+    fn managed_escape_waits_for_correlated_owner_result_before_releasing_focus() {
+        let deck = DeckBuilder::new("escape")
+            .slide(
+                SlideBuilder::new("s")
+                    .custom(
+                        "menu",
+                        "tui-gallery",
+                        serde_json::json!({"kind":"select-dropdown"}),
+                    )
+                    .build(),
+            )
+            .build()
+            .unwrap();
+        let mut player = Player::local(deck.clone(), None, false);
+        let state = PresentationState::new(&deck);
+        let cursor = bmux_presenter_runtime::Cursor {
+            run_id: "r".into(),
+            deck_revision: 1,
+            revision: 1,
+        };
+        let context = || bmux_presenter_runtime::OwnerContext {
+            participant: "p",
+            instance: "shared",
+            state: &state,
+            cursor: &cursor,
+        };
+        let mut owner =
+            crate::owner::LinkedOwner::new(deck, &[], crate::demo::linked_registry()).unwrap();
+        let frames = owner.scenes(context()).unwrap();
+        let opened = bmux_presenter_runtime::Owner::demo_input(
+            &mut owner,
+            context(),
+            &bmux_presenter_runtime::SurfaceInput {
+                surface_id: "menu".into(),
+                surface_revision: frames[0].interaction_revision.unwrap(),
+                x: 0,
+                y: 0,
+                input: crate::managed_input::encode(&Event::Key(KeyStroke::simple(KeyCode::Enter)))
+                    .unwrap(),
+            },
+        )
+        .unwrap();
+        player.surfaces = opened.surfaces;
+        let (sender, mut actions) = tokio::sync::mpsc::channel(2);
+        let (_, receiver) = tokio::sync::mpsc::channel(1);
+        player.remote = Some(RemoteConnection {
+            actions: sender,
+            updates: receiver,
+            receive_only: false,
+        });
+        player.local_view.focused_block = Some("menu".into());
+        player.local_view.painted_focus = Some("menu".into());
+        for release in [false, true] {
+            let surface = &player.surfaces[0];
+            player.local_view.mirror_geometry = vec![(
+                "menu".into(),
+                surface.interaction_revision.unwrap(),
+                "s".into(),
+                surface.placement(0, 0),
+            )];
+            assert!(
+                player
+                    .route_managed_focus_key(KeyStroke::simple(KeyCode::Escape))
+                    .unwrap()
+            );
+            assert_eq!(player.local_view.focused_block, Some("menu".into()));
+            let bmux_presenter_runtime::Action::DemoInput(input) = actions.try_recv().unwrap()
+            else {
+                panic!("input");
+            };
+            let mut forged = player.local_view.pending_managed_focus.clone().unwrap();
+            forged.revision += 1;
+            assert!(
+                !player
+                    .apply_managed_focus_ack(&crate::managed_input::encode_ack(&forged).unwrap())
+            );
+            let update =
+                bmux_presenter_runtime::Owner::demo_input(&mut owner, context(), &input).unwrap();
+            assert_eq!(
+                crate::managed_input::decode_ack(&update.outcome)
+                    .unwrap()
+                    .handled,
+                !release
+            );
+            player.surfaces = update.surfaces;
+            assert!(player.apply_managed_focus_ack(&update.outcome));
+            assert_eq!(player.local_view.focused_block.is_none(), release);
+            assert!(!player.apply_managed_focus_ack(&update.outcome));
+        }
+        // A consumed nested Tab keeps the block; only the correlated ignored
+        // result hands off to presenter navigation. Reverse Tab uses the same path.
+        for (handled, reverse) in [(true, false), (false, false), (false, true)] {
+            player.local_view.focused_block = Some("menu".into());
+            player.local_view.painted_focus = Some("menu".into());
+            let surface = &player.surfaces[0];
+            player.local_view.mirror_geometry = vec![(
+                "menu".into(),
+                surface.interaction_revision.unwrap(),
+                "s".into(),
+                surface.placement(0, 0),
+            )];
+            assert!(
+                player
+                    .route_managed_focus_key(KeyStroke::with_modifiers(
+                        KeyCode::Tab,
+                        bmux_keyboard::Modifiers {
+                            shift: reverse,
+                            ..Default::default()
+                        }
+                    ))
+                    .unwrap()
+            );
+            let _ = actions.try_recv().unwrap();
+            let mut ack = player.local_view.pending_managed_focus.clone().unwrap();
+            ack.handled = handled;
+            assert!(
+                player.apply_managed_focus_ack(&crate::managed_input::encode_ack(&ack).unwrap())
+            );
+            assert_eq!(player.local_view.focused_block.is_some(), handled);
+        }
+    }
+    #[test]
+    fn local_view_interaction_handles_are_stable_but_not_shared_with_another_view() {
+        let deck = DeckBuilder::new("views")
+            .slide(
+                SlideBuilder::new("s")
+                    .custom(
+                        "menu",
+                        "tui-gallery",
+                        serde_json::json!({"kind":"select-dropdown"}),
+                    )
+                    .build(),
+            )
+            .build()
+            .unwrap();
+        let mut player = Player::local(deck, None, false);
+        let other = PresentationView::default();
+        let _ = player.registry_for_view(Some(&player.local_view));
+        let _ = player.registry_for_view(Some(&other));
+        let first = player
+            .local_view
+            .interactions
+            .borrow()
+            .values()
+            .next()
+            .unwrap()
+            .clone();
+        let second = other.interactions.borrow().values().next().unwrap().clone();
+        assert!(!std::sync::Arc::ptr_eq(&first, &second));
+        let mut terminal = Terminal::new(Vec::new(), Rect::new(0, 0, 80, 24));
+        terminal.draw(|cx| paint(&mut player, cx)).unwrap();
+        player.local_view.commit();
+        player.cycle_focus(false);
+        terminal.draw(|cx| paint(&mut player, cx)).unwrap();
+        player.local_view.commit();
+        player
+            .update(RuntimeEvent::Terminal(Event::Key(KeyStroke::simple(
+                KeyCode::Enter,
+            ))))
+            .unwrap();
+        assert_eq!(
+            first.lock().unwrap()["menu"]["native"]["open"],
+            serde_json::json!(true)
+        );
+        assert_eq!(*second.lock().unwrap(), serde_json::json!({}));
+        assert!(
+            player
+                .instances
+                .values()
+                .all(|state| state.lock().unwrap().get("open").is_none())
+        );
+        let _ = player.registry_for_view(Some(&player.local_view));
+        assert!(std::sync::Arc::ptr_eq(
+            &first,
+            player
+                .local_view
+                .interactions
+                .borrow()
+                .values()
+                .next()
+                .unwrap()
+        ));
+        // Public/browser construction receives no transient handles.
+        assert!(player.browser_view.interactions.borrow().is_empty());
+    }
+    #[test]
+    fn static_gallery_is_not_a_local_or_managed_tab_stop() {
+        let deck = DeckBuilder::new("static")
+            .slide(
+                SlideBuilder::new("s")
+                    .custom("static", "tui-gallery", serde_json::json!({"kind":"badge"}))
+                    .custom("count", "counter", serde_json::Value::Null)
+                    .build(),
+            )
+            .build()
+            .unwrap();
+        let mut player = Player::local(deck, None, false);
+        assert_eq!(
+            player.focus_targets(&player.registry()),
+            vec![bmux_presenter::BlockId::new("count")]
+        );
+        let (sender, _) = tokio::sync::mpsc::channel(1);
+        let (_, receiver) = tokio::sync::mpsc::channel(1);
+        player.remote = Some(RemoteConnection {
+            actions: sender,
+            updates: receiver,
+            receive_only: false,
+        });
+        let state = PresentationState::new(&player.deck);
+        let cursor = bmux_presenter_runtime::Cursor {
+            run_id: "r".into(),
+            deck_revision: 1,
+            revision: 1,
+        };
+        let mut owner = crate::owner::LinkedOwner::new(
+            player.deck.clone(),
+            &[],
+            crate::demo::linked_registry(),
+        )
+        .unwrap();
+        player.surfaces = owner
+            .scenes(bmux_presenter_runtime::OwnerContext {
+                participant: "p",
+                instance: "shared",
+                state: &state,
+                cursor: &cursor,
+            })
+            .unwrap();
+        assert!(
+            !player
+                .surfaces
+                .iter()
+                .find(|surface| surface.surface_id == "static")
+                .unwrap()
+                .focusable
+        );
+        assert_eq!(
+            player.focus_targets(&player.registry()),
+            vec![bmux_presenter::BlockId::new("count")]
+        );
     }
     #[test]
     fn scroll_input_uses_committed_viewport_and_resets_on_slide_change() {

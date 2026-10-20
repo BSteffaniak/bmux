@@ -218,7 +218,8 @@ impl Default for TabBarStyles {
 }
 
 /// Runtime tab-bar state.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TabBarState {
     selected: Option<usize>,
     hovered: Option<usize>,
@@ -228,6 +229,25 @@ pub struct TabBarState {
 }
 
 impl TabBarState {
+    /// Capture native caller-owned state for an in-memory control rebuild.
+    /// This is not a stable wire or durable storage contract. Reapply canonical
+    /// values and current keyboard focus after restoring a snapshot.
+    #[must_use]
+    pub fn snapshot(&self) -> serde_json::Value {
+        crate::common::state_snapshot(self)
+    }
+
+    /// Restore a bounded native rebuild snapshot, including private interaction
+    /// state. Malformed snapshots return an error without changing this state.
+    ///
+    /// # Errors
+    /// Returns an error for malformed, oversized, or incompatible snapshots.
+    pub fn restore_snapshot(&mut self, snapshot: &serde_json::Value) -> Result<(), String> {
+        let restored = crate::common::decode_state_snapshot(snapshot)?;
+        *self = restored;
+        Ok(())
+    }
+
     /// Create state with the supplied selected index.
     #[must_use]
     pub const fn new(selected: Option<usize>) -> Self {
@@ -480,7 +500,7 @@ impl<'a> TabBar<'a> {
             styles: TabBarStyles {
                 normal: Style::new(),
                 selected: Style::new(),
-                focused: Style::new(),
+                focused: crate::common::DEFAULT_FOCUS_STYLE,
                 hovered: Style::new(),
                 pressed: Style::new(),
                 disabled: Style::new(),
@@ -626,16 +646,18 @@ impl<'a> TabBar<'a> {
     }
 
     fn item_style(&self, index: usize, item: &TabItem<'_>, state: &TabBarState) -> Style {
-        if item.disabled {
+        if state.interaction.disabled || item.disabled {
             self.styles.disabled
         } else if state.pressed == Some(index) {
             self.styles.pressed
         } else if state.selected == Some(index) {
-            self.styles.selected
+            if state.interaction.focused {
+                self.styles.selected.patch(self.styles.focused)
+            } else {
+                self.styles.selected
+            }
         } else if state.hovered == Some(index) {
             self.styles.hovered
-        } else if state.interaction.focused {
-            self.styles.focused
         } else {
             self.styles.normal
         }
@@ -1579,5 +1601,77 @@ mod tests {
         TabBar::new(&items).render(Rect::new(0, 0, 0, 0), &state, &mut frame);
 
         assert!(TabBar::new(&items).hit_rects(Rect::new(0, 0, 0, 0))[0].is_empty());
+    }
+}
+
+#[cfg(test)]
+mod focus_visual_tests {
+    use std::cell::RefCell;
+
+    use bmux_tui::component::Component;
+    use bmux_tui::style::{Color, Modifier, Style};
+
+    use super::*;
+
+    #[test]
+    fn focus_overlays_only_selected_tab() {
+        let items = [TabItem::new("one", "One"), TabItem::new("two", "Two")];
+        let styles = TabBarStyles {
+            selected: Style::new().bg(Color::Blue),
+            focused: crate::common::DEFAULT_FOCUS_STYLE,
+            ..TabBarStyles::default()
+        };
+        let bar = TabBar::new(&items).styles(styles);
+        let mut state = TabBarState::new(Some(0));
+        assert_eq!(bar.item_style(0, &items[0], &state), styles.selected);
+        state.set_focused(true);
+        let focused = bar.item_style(0, &items[0], &state);
+        assert_eq!(focused.bg, styles.selected.bg);
+        assert!(focused.modifiers.contains(Modifier::UNDERLINE));
+        assert_eq!(bar.item_style(1, &items[1], &state), styles.normal);
+        assert_eq!(
+            bar.styles(TabBarStyles {
+                focused: Style::new(),
+                ..styles
+            })
+            .item_style(0, &items[0], &state),
+            styles.selected
+        );
+        assert_eq!(state.selected, Some(0));
+    }
+
+    #[test]
+    fn keyboard_focus_is_paint_only() {
+        let items = [TabItem::new("one", "One")];
+        let state = RefCell::new(TabBarState::new(Some(0)));
+        let component = TabBarComponent::new("focus.tabs", &items, &state);
+        let before = component.revision();
+        state.borrow_mut().set_focused(true);
+        let after = component.revision();
+        assert_eq!(before.layout, after.layout);
+        assert_ne!(before.paint, after.paint);
+    }
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::TabBarState;
+
+    #[test]
+    fn native_snapshot_preserves_private_state_and_rejects_bad_input_atomically() {
+        let mut state = TabBarState::new(Some(1));
+        state.hovered = Some(2);
+        state.pressed = Some(2);
+        state.set_focused(true);
+        let snapshot = state.snapshot();
+        let mut rebuilt = TabBarState::new(Some(1));
+        rebuilt.restore_snapshot(&snapshot).unwrap();
+        assert_eq!(rebuilt, state);
+        let mut malformed = snapshot.clone();
+        malformed["unknown_field"] = serde_json::json!(true);
+        assert!(rebuilt.restore_snapshot(&malformed).is_err());
+        assert_eq!(rebuilt, state);
+        assert!(rebuilt.restore_snapshot(&serde_json::Value::Null).is_err());
+        assert_eq!(rebuilt, state);
     }
 }

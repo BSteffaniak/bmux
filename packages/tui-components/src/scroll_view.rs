@@ -68,7 +68,8 @@ impl ScrollAnchor {
 }
 
 /// Caller-owned logical scroll state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ScrollViewState {
     /// Common enabled and focus state.
     pub interaction: InteractionState,

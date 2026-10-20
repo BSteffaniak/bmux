@@ -15,12 +15,17 @@ name              = "virtual_list_benchmark"
 required-features = ["virtual-list"]
 
 [dependencies]
-bmux_keyboard        = { workspace = true, optional = true }
-bmux_terminal_grid   = { workspace = true, optional = true }
-bmux_text_edit       = { workspace = true, features = ["keyboard"], optional = true }
-bmux_tui             = { workspace = true }
+bmux_keyboard = { workspace = true, optional = true }
+bmux_terminal_grid = { workspace = true, optional = true }
+bmux_text_edit = { workspace = true, features = [
+    "keyboard",
+    "serde",
+], optional = true }
+bmux_tui = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
 unicode-segmentation = { workspace = true, optional = true }
-unicode-width        = { workspace = true, optional = true }
+unicode-width = { workspace = true, optional = true }
 
 [features]
 default = []

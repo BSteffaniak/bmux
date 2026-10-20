@@ -91,13 +91,22 @@ impl<'a> SlideComponent<'a> {
                     block_gap: self.theme.block_gap,
                 })
             }
-            BlockKind::Custom { .. } => self.custom.build(block).unwrap_or_else(|error| {
-                Element::new(
-                    TextBlock::new(format!("[component unavailable: {error}]"))
-                        .id(format!("{id}/diagnostic"))
-                        .style(self.theme.diagnostic),
+            BlockKind::Custom { .. } => self
+                .custom
+                .build_with_context(
+                    block,
+                    crate::custom::PresentationBuildContext {
+                        focused: self.focused_block == Some(&block.id),
+                        interaction: None,
+                    },
                 )
-            }),
+                .unwrap_or_else(|error| {
+                    Element::new(
+                        TextBlock::new(format!("[component unavailable: {error}]"))
+                            .id(format!("{id}/diagnostic"))
+                            .style(self.theme.diagnostic),
+                    )
+                }),
             BlockKind::Text {
                 content,
                 format: TextFormat::Plain,
@@ -324,7 +333,7 @@ impl Component for RevealComponent<'_> {
             } else {
                 u64::from(self.visible)
             },
-            u64::from(self.visible),
+            u64::from(self.visible) | (u64::from(self.keyboard_target) << 1),
         ))
     }
     fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {

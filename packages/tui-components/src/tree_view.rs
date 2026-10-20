@@ -173,7 +173,8 @@ impl Default for TreeViewStyles {
 }
 
 /// Runtime state for [`TreeViewComponent`].
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TreeViewState {
     selected_visible: Option<usize>,
     expanded: Vec<String>,
@@ -184,6 +185,25 @@ pub struct TreeViewState {
 }
 
 impl TreeViewState {
+    /// Capture native caller-owned state for an in-memory control rebuild.
+    /// This is not a stable wire or durable storage contract. Reapply canonical
+    /// values and current keyboard focus after restoring a snapshot.
+    #[must_use]
+    pub fn snapshot(&self) -> serde_json::Value {
+        crate::common::state_snapshot(self)
+    }
+
+    /// Restore a bounded native rebuild snapshot, including private interaction
+    /// state. Malformed snapshots return an error without changing this state.
+    ///
+    /// # Errors
+    /// Returns an error for malformed, oversized, or incompatible snapshots.
+    pub fn restore_snapshot(&mut self, snapshot: &serde_json::Value) -> Result<(), String> {
+        let restored = crate::common::decode_state_snapshot(snapshot)?;
+        *self = restored;
+        Ok(())
+    }
+
     /// Create tree-view state with a selected visible row.
     #[must_use]
     pub const fn new(selected_visible: Option<usize>) -> Self {
@@ -281,6 +301,7 @@ struct TreeView<'a> {
     items: &'a [TreeViewItem],
     policy: TreeViewPolicy,
     styles: TreeViewStyles,
+    focus_style: Style,
 }
 
 impl<'a> TreeView<'a> {
@@ -302,6 +323,7 @@ impl<'a> TreeView<'a> {
                 },
                 indent_width: 2,
             },
+            focus_style: crate::common::DEFAULT_FOCUS_STYLE,
             styles: TreeViewStyles {
                 normal: Style::new(),
                 selected: Style::new(),
@@ -417,7 +439,11 @@ impl<'a> TreeView<'a> {
         } else if state.pressed_visible == Some(visible) {
             self.styles.pressed
         } else if state.selected_visible == Some(visible) {
-            self.styles.selected
+            if state.interaction.focused {
+                self.styles.selected.patch(self.focus_style)
+            } else {
+                self.styles.selected
+            }
         } else if state.hovered_visible == Some(visible) {
             self.styles.hovered
         } else {
@@ -665,6 +691,14 @@ impl<'a, 'state> TreeViewComponent<'a, 'state> {
         self
     }
 
+    /// Set the active-item keyboard-focus overlay (`theme.focused` for themed
+    /// focus, `Style::new()` to opt out). Selection and layout are unaffected.
+    #[must_use]
+    pub const fn focus_style(mut self, style: Style) -> Self {
+        self.tree.focus_style = style;
+        self
+    }
+
     /// Set visual styles.
     #[must_use]
     pub const fn styles(mut self, styles: TreeViewStyles) -> Self {
@@ -691,6 +725,7 @@ impl Component for TreeViewComponent<'_, '_> {
         for item in self.tree.items {
             item.disabled.hash(&mut paint);
         }
+        self.tree.focus_style.hash(&mut paint);
         self.tree.styles.normal.hash(&mut paint);
         self.tree.styles.selected.hash(&mut paint);
         self.tree.styles.hovered.hash(&mut paint);
@@ -1928,5 +1963,85 @@ mod tests {
             TreeViewItem::new("main", "main.rs", 1),
             TreeViewItem::new("readme", "README.md", 0),
         ]
+    }
+}
+
+#[cfg(test)]
+mod focus_visual_tests {
+    use std::cell::RefCell;
+
+    use bmux_tui::component::Component;
+    use bmux_tui::style::{Color, Modifier, Style};
+
+    use super::*;
+
+    #[test]
+    fn selected_row_focus_is_an_optional_overlay() {
+        let items = [TreeViewItem::new("one", "One", 0)];
+        let state = RefCell::new(TreeViewState::new(Some(0)));
+        let styles = TreeViewStyles {
+            selected: Style::new().bg(Color::Blue),
+            ..TreeViewStyles::default()
+        };
+        let component = TreeViewComponent::new("focus.tree", &items, &state).styles(styles);
+        assert_eq!(
+            component.tree.row_style(&items[0], &state.borrow(), 0),
+            styles.selected
+        );
+        state.borrow_mut().set_focused(true);
+        let focused = component.tree.row_style(&items[0], &state.borrow(), 0);
+        assert_eq!(focused.bg, styles.selected.bg);
+        assert!(focused.modifiers.contains(Modifier::UNDERLINE));
+        let component = component.focus_style(Style::new());
+        assert_eq!(
+            component.tree.row_style(&items[0], &state.borrow(), 0),
+            styles.selected
+        );
+        state.borrow_mut().interaction.disabled = true;
+        assert_eq!(
+            component.tree.row_style(&items[0], &state.borrow(), 0),
+            styles.disabled
+        );
+        assert_eq!(state.borrow().selected_visible, Some(0));
+    }
+
+    #[test]
+    fn focus_state_and_style_are_paint_only() {
+        let items = [TreeViewItem::new("one", "One", 0)];
+        let state = RefCell::new(TreeViewState::new(Some(0)));
+        let component = TreeViewComponent::new("focus.tree", &items, &state);
+        let before = component.revision();
+        state.borrow_mut().set_focused(true);
+        let focused = component.revision();
+        let restyled = component
+            .focus_style(Style::new().fg(Color::Red))
+            .revision();
+        assert_eq!(before.layout, focused.layout);
+        assert_eq!(focused.layout, restyled.layout);
+        assert_ne!(before.paint, focused.paint);
+        assert_ne!(focused.paint, restyled.paint);
+    }
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::TreeViewState;
+
+    #[test]
+    fn native_snapshot_preserves_private_state_and_rejects_bad_input_atomically() {
+        let mut state = TreeViewState::new(Some(1));
+        state.expanded.push("root".into());
+        state.hovered_visible = Some(2);
+        state.pressed_visible = Some(2);
+        let snapshot = state.snapshot();
+        let mut rebuilt = TreeViewState::new(Some(1));
+        rebuilt.restore_snapshot(&snapshot).unwrap();
+        assert_eq!(rebuilt, state);
+        let mut malformed = snapshot.clone();
+        malformed["unknown_field"] = serde_json::json!(true);
+        assert!(rebuilt.restore_snapshot(&malformed).is_err());
+        assert_eq!(rebuilt, state);
+        assert!(rebuilt.restore_snapshot(&serde_json::Value::Null).is_err());
+        assert_eq!(rebuilt, state);
     }
 }

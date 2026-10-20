@@ -70,6 +70,17 @@ pub struct MirrorPrivateScene {
     pub identity: serde_json::Value,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MirrorCursor {
+    pub x: u16,
+    pub y: u16,
+    pub visible: bool,
+}
+
+const fn default_focusable() -> bool {
+    true
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MirrorFrame {
     pub surface_id: String,
@@ -79,6 +90,14 @@ pub struct MirrorFrame {
     pub height: u16,
     pub cells: Vec<WireCell>,
     pub images: Vec<WireImage>,
+    /// Capability only; the selected focus remains viewer-local.
+    #[serde(default = "default_focusable")]
+    pub focusable: bool,
+    /// Reconstructible focused appearance, selected only by the local viewer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focused: Option<Box<MirrorFrame>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<MirrorCursor>,
     /// Audience-safe authored terminal and chrome; native rendering uses fallback cells.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub playbook: Option<bmux_presenter::audience::AudiencePlaybook>,
@@ -247,6 +266,13 @@ impl MirrorFrame {
             height: area.height,
             cells,
             images: wire_images,
+            focusable: true,
+            focused: None,
+            cursor: frame.cursor().map(|cursor| MirrorCursor {
+                x: cursor.position.x,
+                y: cursor.position.y,
+                visible: cursor.visible,
+            }),
             playbook: None,
             interaction_revision: None,
             private_scene: None,
@@ -265,6 +291,27 @@ impl MirrorFrame {
         max_bytes: usize,
         decode_png: bool,
     ) -> Result<(), HostError> {
+        if self
+            .cursor
+            .is_some_and(|cursor| cursor.x >= self.width || cursor.y >= self.height)
+        {
+            return Err(HostError::Invalid);
+        }
+        if let Some(focused) = &self.focused {
+            if focused.focused.is_some()
+                || focused.private_scene.is_some()
+                || focused.playbook.is_some()
+                || !self.focusable
+                || focused.surface_id != self.surface_id
+                || focused.slide_id != self.slide_id
+                || focused.revision != self.revision
+                || focused.width != self.width
+                || focused.height != self.height
+            {
+                return Err(HostError::Invalid);
+            }
+            focused.validate_wire(max_cells, max_bytes, decode_png)?;
+        }
         if let Some(scene) = &self.private_scene {
             if scene.frame.private_scene.is_some()
                 || scene.frame.playbook.is_some()

@@ -5,6 +5,7 @@ mod cli;
 mod commands;
 mod demo;
 mod gallery;
+mod managed_input;
 mod mirror;
 mod owned_runtime;
 mod owner;

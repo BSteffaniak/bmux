@@ -43,7 +43,7 @@ impl ActionButton {
 pub type ActionRowStyles = crate::button::ButtonStyles;
 
 /// Runtime action-row state.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ActionRowState {
     /// Common row interaction flags.
     pub interaction: InteractionState,
@@ -53,6 +53,20 @@ pub struct ActionRowState {
 }
 
 impl ActionRowState {
+    /// Capture caller-owned in-memory rebuild state, not a stable wire contract.
+    #[must_use]
+    pub fn snapshot(&self) -> serde_json::Value {
+        crate::common::state_snapshot(self)
+    }
+
+    /// Restore bounded native state atomically.
+    ///
+    /// # Errors
+    /// Returns an error for malformed or oversized snapshots.
+    pub fn restore_snapshot(&mut self, snapshot: &serde_json::Value) -> Result<(), String> {
+        *self = crate::common::decode_state_snapshot(snapshot)?;
+        Ok(())
+    }
     /// Create enabled action-row state.
     #[must_use]
     pub const fn new() -> Self {
@@ -502,10 +516,10 @@ impl<'a> ActionRow<'a> {
             self.styles.disabled
         } else if state.interaction.pressed {
             self.styles.pressed
-        } else if state.interaction.hovered {
-            self.styles.hovered
         } else if state.interaction.focused {
             self.styles.focused
+        } else if state.interaction.hovered {
+            self.styles.hovered
         } else {
             self.styles.normal
         }
@@ -513,7 +527,7 @@ impl<'a> ActionRow<'a> {
 
     fn button_state(state: &ActionRowState, index: usize) -> ButtonState {
         let mut button_state = ButtonState::new();
-        button_state.set_focused(state.focused == Some(index));
+        button_state.set_focused(state.interaction.focused && state.focused == Some(index));
         button_state.interaction.hovered = state.hovered == Some(index);
         button_state.interaction.pressed = state.pressed == Some(index);
         button_state.interaction.disabled = state.interaction.disabled;
@@ -985,5 +999,21 @@ mod tests {
 
     fn mouse(kind: MouseEventKind, x: u16, y: u16) -> Event {
         Event::Mouse(MouseEvent::new(kind, Point::new(x, y)))
+    }
+}
+
+#[cfg(test)]
+mod focus_visual_tests {
+    use super::*;
+
+    #[test]
+    fn remembered_action_index_is_not_keyboard_focus() {
+        let mut state = ActionRowState::new();
+        state.set_focused(Some(0));
+        assert!(ActionRow::button_state(&state, 0).interaction.focused);
+        assert!(!ActionRow::button_state(&state, 1).interaction.focused);
+        state.interaction.focused = false;
+        assert!(!ActionRow::button_state(&state, 0).interaction.focused);
+        assert_eq!(state.focused(), Some(0));
     }
 }

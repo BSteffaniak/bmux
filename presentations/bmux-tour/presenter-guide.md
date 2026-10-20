@@ -22,12 +22,29 @@ Private setup and pacing notes. Use [the cue sheet](speaker-script.md), not a sp
 
 ## Native component examples
 
-Tab focuses an embedded example; Escape returns to slide navigation. Use arrow
-keys and Enter/Space on interactive controls, or type/paste into the text input.
-These are real linked controls, not evaluated code snippets. Some examples are
-intentionally display-only; their slides say so. Long implementation walkthroughs
-follow the example and can be scrolled. Use a rebuilt presenter plugin to register
-`tui-gallery`; the Markdown alone cannot teach an old binary new components.
+Tab focuses an interactive embedded example; Escape returns to slide navigation
+(after closing an open dropdown). Use arrows and Enter/Space, or type/paste into
+the text input. Click actual controls to interact; the bounded `[focus]` cue and
+native focus styling identify the focused example. Selection remains visible
+when focus moves away. Focus is local to each view, not linked shared state.
+Dropdowns start closed: Enter opens, arrows move the pending option, Enter commits,
+and Escape cancels. Button activation counts, edits, selections, and tree expansion
+survive component rebuilds. Input text is limited to 4096 bytes. Dropdown open state,
+pending option, pointer presses, input caret, and input selection belong to the
+current view only; another audience view shares chosen values, not those gestures.
+
+Tab includes the two-input form and the scroll/virtual-list viewports. In the form,
+Tab/Shift-Tab moves Name → Email → Save and yields at either boundary; Enter validates
+and updates the status. Click a field or Save to target it. Arrow/Page/Home/End keys
+and the wheel scroll focused scroll examples; offsets are view-local.
+
+The dialog uses native Save/Cancel actions: arrows or Tab/Shift-Tab traverse the
+action row (Tab yields at its boundaries); Enter/Space or a click activates.
+Escape cancels. The result closes this view's dialog; Reopen / reset starts again.
+Charts, badges, progress, notifications, and source/diff/terminal viewers are static.
+The slide itself still scrolls when an embedded viewport yields at its edge.
+Long implementation walkthroughs follow each example. Use a rebuilt presenter
+plugin to register `tui-gallery`; Markdown alone cannot add new components.
 
 ## Route and pacing
 

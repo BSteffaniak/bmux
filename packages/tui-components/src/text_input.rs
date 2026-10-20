@@ -60,6 +60,101 @@ impl Default for TextInputState {
 }
 
 impl TextInputState {
+    /// Capture ephemeral rebuild state, not a stable wire/storage contract.
+    /// Derived wrap geometry is rebuilt; editor undo history is not serialized.
+    #[must_use]
+    pub fn snapshot(&self) -> serde_json::Value {
+        let snapshot = TextInputSnapshot {
+            buffer: &self.buffer,
+            content_area: (
+                self.content_area.x,
+                self.content_area.y,
+                self.content_area.width,
+                self.content_area.height,
+            ),
+            logical_width: self.logical_width,
+            viewport_height: self.viewport_height,
+            pointer_offset: self.pointer_offset,
+            scroll: self.scroll,
+            active: self.mouse_selection.active,
+            last_click: self.mouse_selection.last_click.map(|click| ClickSnapshot {
+                x: click.x,
+                y: click.y,
+                age: click.at.elapsed().min(Duration::from_secs(1)),
+                count: click.count,
+            }),
+        };
+        crate::common::state_snapshot(&snapshot)
+    }
+
+    /// Restore bounded ephemeral native state atomically. Reapply canonical text
+    /// afterwards if needed. Cached wrapping and undo history are reconstructed.
+    ///
+    /// # Errors
+    /// Rejects malformed, oversized snapshots or invalid UTF-8/grapheme positions.
+    pub fn restore_snapshot(&mut self, snapshot: &serde_json::Value) -> Result<(), String> {
+        crate::common::validate_state_snapshot(snapshot)?;
+        let buffer = snapshot.get("buffer").ok_or("missing editor buffer")?;
+        let text = buffer
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("missing editor text")?;
+        for field in ["cursor", "selection_anchor"] {
+            let position = buffer.get(field).ok_or("missing editor position")?;
+            if field == "selection_anchor" && position.is_null() {
+                continue;
+            }
+            let index = position
+                .as_u64()
+                .and_then(|n| usize::try_from(n).ok())
+                .ok_or("invalid editor position")?;
+            if index != text.len()
+                && !text
+                    .grapheme_indices(true)
+                    .any(|(offset, _)| offset == index)
+            {
+                return Err("editor position is not a grapheme boundary".into());
+            }
+        }
+        let restored: TextInputSnapshot = crate::common::decode_state_snapshot(snapshot)?;
+        let last_click = restored
+            .last_click
+            .map(|click| {
+                if !(1..=3).contains(&click.count) || click.age > Duration::from_secs(1) {
+                    return Err("invalid editor click state".to_owned());
+                }
+                let at = Instant::now()
+                    .checked_sub(click.age)
+                    .ok_or("invalid editor click time")?;
+                Ok(MouseClickState {
+                    x: click.x,
+                    y: click.y,
+                    at,
+                    count: click.count,
+                })
+            })
+            .transpose()?;
+        *self = Self {
+            buffer: restored.buffer,
+            content_area: Rect::new(
+                restored.content_area.0,
+                restored.content_area.1,
+                restored.content_area.2,
+                restored.content_area.3,
+            ),
+            logical_width: restored.logical_width,
+            viewport_height: restored.viewport_height,
+            pointer_offset: restored.pointer_offset,
+            scroll: restored.scroll,
+            mouse_selection: MouseSelectionState {
+                last_click,
+                active: restored.active,
+            },
+            wrapped: RefCell::new(None),
+        };
+        Ok(())
+    }
+
     /// Create state around an edit buffer.
     #[must_use]
     pub fn new(buffer: TextEditBuffer) -> Self {
@@ -1003,7 +1098,7 @@ impl EdgePolicy {
 }
 
 /// Selection granularity for mouse actions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SelectionGranularity {
     /// Select by character/cell hit target.
     Character,
@@ -2124,5 +2219,81 @@ mod tests {
 
         assert_eq!(state.vertical_scroll(), 2);
         assert_eq!(state.buffer().selected_text(), Some("2\n3\n".to_string()));
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TextInputSnapshot<B = TextEditBuffer> {
+    buffer: B,
+    content_area: (u16, u16, u16, u16),
+    logical_width: u64,
+    viewport_height: u64,
+    pointer_offset: (usize, usize),
+    scroll: ScrollViewState,
+    active: SelectionGranularity,
+    last_click: Option<ClickSnapshot>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ClickSnapshot {
+    x: u16,
+    y: u16,
+    age: Duration,
+    count: u8,
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use bmux_text_edit::{SelectionMode, TextEditBuffer, TextMotion};
+
+    use super::{MouseClickState, SelectionGranularity, TextInputState};
+
+    #[test]
+    fn editor_snapshot_preserves_selection_scroll_and_pending_drag() {
+        let mut state = TextInputState::new(TextEditBuffer::from_text("hello world"));
+        state.buffer.move_cursor(TextMotion::Left);
+        state
+            .buffer
+            .move_cursor_with_selection(TextMotion::Left, SelectionMode::Extend);
+        state.scroll.set_vertical_offset(7);
+        state.mouse_selection.active = SelectionGranularity::Word;
+        state.mouse_selection.last_click = Some(MouseClickState {
+            x: 2,
+            y: 1,
+            at: std::time::Instant::now(),
+            count: 2,
+        });
+        let snapshot = state.snapshot();
+        let mut rebuilt = TextInputState::default();
+        rebuilt.restore_snapshot(&snapshot).unwrap();
+        assert_eq!(rebuilt.buffer.text(), state.buffer.text());
+        assert_eq!(
+            rebuilt.buffer.cursor_byte_index(),
+            state.buffer.cursor_byte_index()
+        );
+        assert_eq!(rebuilt.buffer.selection(), state.buffer.selection());
+        assert_eq!(rebuilt.scroll, state.scroll);
+        assert_eq!(rebuilt.mouse_selection.active, SelectionGranularity::Word);
+        assert_eq!(rebuilt.mouse_selection.last_click.unwrap().count, 2);
+        let before = rebuilt.clone();
+        let mut malformed = snapshot;
+        malformed["buffer"]["cursor"] = serde_json::json!(99);
+        assert!(rebuilt.restore_snapshot(&malformed).is_err());
+        assert_eq!(rebuilt, before);
+    }
+
+    #[test]
+    fn editor_rejects_non_grapheme_cursor_and_bad_click_count() {
+        let state = TextInputState::new(TextEditBuffer::from_text("e\u{301}"));
+        let mut snapshot = state.snapshot();
+        snapshot["buffer"]["cursor"] = serde_json::json!(1);
+        let mut rebuilt = TextInputState::default();
+        assert!(rebuilt.restore_snapshot(&snapshot).is_err());
+        let mut snapshot = state.snapshot();
+        snapshot["last_click"] =
+            serde_json::json!({"x": 0, "y": 0, "age": {"secs": 0, "nanos": 0}, "count": 255});
+        assert!(rebuilt.restore_snapshot(&snapshot).is_err());
     }
 }

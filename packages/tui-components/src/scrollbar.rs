@@ -17,7 +17,10 @@ use bmux_tui::style::{Color, Style};
 use crate::hit_test::HitRegion;
 
 /// Scrollbar orientation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
+)]
+#[serde(deny_unknown_fields)]
 pub enum ScrollbarOrientation {
     /// Vertical scrollbar.
     #[default]

@@ -223,7 +223,8 @@ impl TableRow {
 /// scrolls through the same controller as every other viewport. Vertical
 /// offsets are logical body rows; horizontal offsets are content cells past
 /// the sticky columns.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TableState {
     selected: Option<usize>,
     selected_column: Option<usize>,
@@ -235,6 +236,25 @@ pub struct TableState {
 }
 
 impl TableState {
+    /// Capture native caller-owned state for an in-memory control rebuild.
+    /// This is not a stable wire or durable storage contract. Reapply canonical
+    /// values and current keyboard focus after restoring a snapshot.
+    #[must_use]
+    pub fn snapshot(&self) -> serde_json::Value {
+        crate::common::state_snapshot(self)
+    }
+
+    /// Restore a bounded native rebuild snapshot, including private interaction
+    /// state. Malformed snapshots return an error without changing this state.
+    ///
+    /// # Errors
+    /// Returns an error for malformed, oversized, or incompatible snapshots.
+    pub fn restore_snapshot(&mut self, snapshot: &serde_json::Value) -> Result<(), String> {
+        let restored = crate::common::decode_state_snapshot(snapshot)?;
+        *self = restored;
+        Ok(())
+    }
+
     /// Create table state with a selected row.
     #[must_use]
     pub const fn new(selected: Option<usize>) -> Self {
@@ -536,6 +556,7 @@ pub struct Table<'a> {
     rows: &'a [TableRow],
     policy: TablePolicy,
     styles: TableStyles,
+    focus_style: Style,
     empty: &'a str,
 }
 
@@ -565,6 +586,7 @@ impl<'a> Table<'a> {
                 horizontal_scrollbar: ScrollbarAxisLayoutMode::Hidden,
                 horizontal_scrollbar_policy: ScrollbarPolicy::horizontal(),
             },
+            focus_style: crate::common::DEFAULT_FOCUS_STYLE,
             styles: TableStyles {
                 header: Style::new(),
                 row: Style::new(),
@@ -585,6 +607,13 @@ impl<'a> Table<'a> {
     #[must_use]
     pub const fn policy(mut self, policy: TablePolicy) -> Self {
         self.policy = policy;
+        self
+    }
+
+    /// Set the selected-row keyboard-focus overlay; `Style::new()` opts out.
+    #[must_use]
+    pub const fn focus_style(mut self, style: Style) -> Self {
+        self.focus_style = style;
         self
     }
 
@@ -1239,10 +1268,14 @@ impl<'a> Table<'a> {
     }
 
     fn row_style(&self, index: usize, row: &TableRow, state: &TableState) -> Style {
-        if row.disabled {
+        if state.interaction.disabled || row.disabled {
             self.styles.disabled
         } else if state.selected == Some(index) {
-            self.styles.selected
+            if state.interaction.focused {
+                self.styles.selected.patch(self.focus_style)
+            } else {
+                self.styles.selected
+            }
         } else if state.hovered == Some(index) {
             self.styles.hovered
         } else {
@@ -1292,11 +1325,22 @@ impl<'a> Table<'a> {
             } else {
                 self.styles.row
             };
-            spans.extend(
-                line.spans
-                    .into_iter()
-                    .map(|span| Span::styled(span.content, base.patch(span.style))),
-            );
+            let focus = !header
+                && row_index == state.selected
+                && state.interaction.focused
+                && !state.interaction.disabled
+                && row_index.is_some_and(|row| self.rows.get(row).is_some_and(|row| !row.disabled));
+            spans.extend(line.spans.into_iter().map(|span| {
+                let style = base.patch(span.style);
+                Span::styled(
+                    span.content,
+                    if focus {
+                        style.patch(self.focus_style)
+                    } else {
+                        style
+                    },
+                )
+            }));
         }
         Line::from_spans(spans)
     }
@@ -1514,7 +1558,7 @@ impl From<crate::theme::ComponentTheme> for TableStyles {
             header: theme.info.add_modifier(bmux_tui::style::Modifier::BOLD),
             row: theme.text,
             selected: theme.selected,
-            selected_column: theme.focused,
+            selected_column: theme.selected,
             selected_cell: theme.warning,
             hovered: theme.info,
             disabled: theme.disabled,
@@ -1586,6 +1630,14 @@ impl<'a, 'state> TableComponent<'a, 'state> {
         self
     }
 
+    /// Set the active-item keyboard-focus overlay (`theme.focused` for themed
+    /// focus, `Style::new()` to opt out). Selection and layout are unaffected.
+    #[must_use]
+    pub const fn focus_style(mut self, style: Style) -> Self {
+        self.table.focus_style = style;
+        self
+    }
+
     /// Set visual styles.
     #[must_use]
     pub const fn styles(mut self, styles: TableStyles) -> Self {
@@ -1634,6 +1686,7 @@ impl Component for TableComponent<'_, '_> {
             format!("{:?}", column.sort).hash(&mut paint);
             format!("{:?}", column.align).hash(&mut paint);
         }
+        self.table.focus_style.hash(&mut paint);
         format!("{:?}", self.table.styles).hash(&mut paint);
         format!("{:?}", *state).hash(&mut paint);
         ComponentRevision::new(layout.finish(), paint.finish())
@@ -2784,5 +2837,88 @@ mod tests {
             2,
             "hit regions agree with the painted offset"
         );
+    }
+}
+
+#[cfg(test)]
+mod focus_visual_tests {
+    use std::cell::RefCell;
+
+    use bmux_tui::component::Component;
+    use bmux_tui::style::{Color, Modifier, Style};
+    use bmux_tui::text::{Line, Span};
+
+    use super::*;
+
+    #[test]
+    fn selected_row_focus_reaches_rich_cells_without_changing_content() {
+        let columns = [TableColumn::new("Name")];
+        let rows = [TableRow::new(["One"])];
+        let styles = TableStyles {
+            selected: Style::new().bg(Color::Blue),
+            ..TableStyles::default()
+        };
+        let table = Table::new(&columns, &rows).styles(styles);
+        let mut state = TableState::new(Some(0));
+        assert_eq!(table.row_style(0, &rows[0], &state), styles.selected);
+        let rich = Line::from_spans([Span::styled("One", Style::new().fg(Color::Yellow))]);
+        let before = table.row_line(&[5], std::iter::once(rich.clone()), false, Some(0), &state);
+        state.interaction.focused = true;
+        let after = table.row_line(&[5], std::iter::once(rich), false, Some(0), &state);
+        assert_eq!(before.width(), after.width());
+        assert_eq!(before.spans[0].content, after.spans[0].content);
+        assert!(after.spans[0].style.modifiers.contains(Modifier::UNDERLINE));
+        assert_eq!(after.spans[0].style.fg, Some(Color::Yellow));
+        let focused = table.row_style(0, &rows[0], &state);
+        assert_eq!(focused.bg, styles.selected.bg);
+        assert!(focused.modifiers.contains(Modifier::UNDERLINE));
+        assert_eq!(
+            table
+                .focus_style(Style::new())
+                .row_style(0, &rows[0], &state),
+            styles.selected
+        );
+        assert_eq!(state.selected, Some(0));
+    }
+
+    #[test]
+    fn focus_state_and_style_are_paint_only() {
+        let columns = [TableColumn::new("Name")];
+        let rows = [TableRow::new(["One"])];
+        let state = RefCell::new(TableState::new(Some(0)));
+        let component = TableComponent::new("focus.table", &columns, &rows, &state);
+        let before = component.revision();
+        state.borrow_mut().interaction.focused = true;
+        let focused = component.revision();
+        let restyled = component
+            .focus_style(Style::new().fg(Color::Red))
+            .revision();
+        assert_eq!(before.layout, focused.layout);
+        assert_eq!(focused.layout, restyled.layout);
+        assert_ne!(before.paint, focused.paint);
+        assert_ne!(focused.paint, restyled.paint);
+    }
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::TableState;
+
+    #[test]
+    fn native_snapshot_preserves_private_state_and_rejects_bad_input_atomically() {
+        let mut state = TableState::new(Some(1));
+        state.selected_column = Some(2);
+        state.hovered = Some(2);
+        state.scroll.set_vertical_offset(7);
+        let snapshot = state.snapshot();
+        let mut rebuilt = TableState::new(Some(1));
+        rebuilt.restore_snapshot(&snapshot).unwrap();
+        assert_eq!(rebuilt, state);
+        let mut malformed = snapshot.clone();
+        malformed["unknown_field"] = serde_json::json!(true);
+        assert!(rebuilt.restore_snapshot(&malformed).is_err());
+        assert_eq!(rebuilt, state);
+        assert!(rebuilt.restore_snapshot(&serde_json::Value::Null).is_err());
+        assert_eq!(rebuilt, state);
     }
 }

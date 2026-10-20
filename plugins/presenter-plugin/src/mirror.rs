@@ -95,6 +95,9 @@ mod tests {
         let frame = MirrorFrame {
             interaction_revision: None,
             private_scene: None,
+            focusable: true,
+            focused: None,
+            cursor: None,
             playbook: None,
             surface_id: "demo".into(),
             slide_id: "s".into(),

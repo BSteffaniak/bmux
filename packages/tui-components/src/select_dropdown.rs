@@ -69,7 +69,9 @@ impl Default for SelectDropdownStyles {
     fn default() -> Self {
         Self {
             normal: Style::new(),
-            focused: Style::new().add_modifier(Modifier::REVERSED),
+            focused: Style::new()
+                .add_modifier(Modifier::REVERSED)
+                .add_modifier(Modifier::UNDERLINE),
             hovered: Style::new().add_modifier(Modifier::UNDERLINE),
             pressed: Style::new().add_modifier(Modifier::BOLD),
             disabled: Style::new().add_modifier(Modifier::DIM),
@@ -110,7 +112,8 @@ impl Default for SelectDropdownPolicy {
 }
 
 /// Runtime select/dropdown state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SelectDropdownState {
     /// Common select/dropdown interaction flags.
     pub interaction: InteractionState,
@@ -120,6 +123,25 @@ pub struct SelectDropdownState {
 }
 
 impl SelectDropdownState {
+    /// Capture native caller-owned state for an in-memory control rebuild.
+    /// This is not a stable wire or durable storage contract. Reapply canonical
+    /// values and current keyboard focus after restoring a snapshot.
+    #[must_use]
+    pub fn snapshot(&self) -> serde_json::Value {
+        crate::common::state_snapshot(self)
+    }
+
+    /// Restore a bounded native rebuild snapshot, including private interaction
+    /// state. Malformed snapshots return an error without changing this state.
+    ///
+    /// # Errors
+    /// Returns an error for malformed, oversized, or incompatible snapshots.
+    pub fn restore_snapshot(&mut self, snapshot: &serde_json::Value) -> Result<(), String> {
+        let restored = crate::common::decode_state_snapshot(snapshot)?;
+        *self = restored;
+        Ok(())
+    }
+
     /// Create enabled select/dropdown state.
     #[must_use]
     pub const fn new(selected: Option<usize>) -> Self {
@@ -141,6 +163,12 @@ impl SelectDropdownState {
     pub const fn set_selected(&mut self, selected: Option<usize>) {
         self.selected = selected;
         self.list.set_selected(selected);
+    }
+
+    /// Return the pending keyboard option, independently of committed selection.
+    #[must_use]
+    pub const fn focused(self) -> Option<usize> {
+        self.list.focused()
     }
 
     /// Return whether the dropdown list is open.
@@ -210,7 +238,9 @@ impl<'a> SelectDropdown<'a> {
             },
             styles: SelectDropdownStyles {
                 normal: Style::new(),
-                focused: Style::new().add_modifier(Modifier::REVERSED),
+                focused: Style::new()
+                    .add_modifier(Modifier::REVERSED)
+                    .add_modifier(Modifier::UNDERLINE),
                 hovered: Style::new().add_modifier(Modifier::UNDERLINE),
                 pressed: Style::new().add_modifier(Modifier::BOLD),
                 disabled: Style::new().add_modifier(Modifier::DIM),
@@ -1413,5 +1443,149 @@ mod tests {
             SelectOption::new("draft", "Draft"),
             SelectOption::new("published", "Published"),
         ]
+    }
+}
+
+#[cfg(test)]
+mod focus_visual_tests {
+    use bmux_tui::style::{Modifier, Style};
+
+    use super::*;
+
+    #[test]
+    fn selected_value_survives_focus_and_style_opt_out() {
+        let options = [SelectOption::new("one", "One")];
+        let dropdown = SelectDropdown::new(&options);
+        let mut state = SelectDropdownState::new(Some(0));
+        let before = dropdown.closed_line(state);
+        state.interaction.focused = true;
+        let after = dropdown.closed_line(state);
+        assert_eq!(before.width(), after.width());
+        assert_eq!(before.spans[0].content, after.spans[0].content);
+        assert!(after.spans[0].style.modifiers.contains(Modifier::UNDERLINE));
+        assert_eq!(state.selected(), Some(0));
+        state.interaction.disabled = true;
+        assert_eq!(dropdown.style_for(state), dropdown.styles.disabled);
+        state.interaction.disabled = false;
+        let styles = SelectDropdownStyles {
+            focused: Style::new(),
+            ..dropdown.styles
+        };
+        assert_eq!(dropdown.styles(styles).style_for(state), Style::new());
+    }
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::SelectDropdownState;
+
+    #[test]
+    fn native_snapshot_preserves_private_state_and_rejects_bad_input_atomically() {
+        let mut state = SelectDropdownState::new(Some(1));
+        state.set_open(true);
+        state.list.set_focused(Some(2));
+        state.list.interaction.pressed = true;
+        let snapshot = state.snapshot();
+        let mut rebuilt = SelectDropdownState::new(Some(1));
+        rebuilt.restore_snapshot(&snapshot).unwrap();
+        assert_eq!(rebuilt, state);
+        let mut malformed = snapshot.clone();
+        malformed["unknown_field"] = serde_json::json!(true);
+        assert!(rebuilt.restore_snapshot(&malformed).is_err());
+        assert_eq!(rebuilt, state);
+        assert!(rebuilt.restore_snapshot(&serde_json::Value::Null).is_err());
+        assert_eq!(rebuilt, state);
+    }
+}
+
+#[cfg(test)]
+mod pending_snapshot_tests {
+    use super::SelectDropdownState;
+
+    #[test]
+    fn restoring_pending_choice_does_not_commit_it() {
+        let mut state = SelectDropdownState::new(Some(0));
+        state.set_open(true);
+        state.list.set_focused(Some(2));
+        let mut rebuilt = SelectDropdownState::new(None);
+        rebuilt.restore_snapshot(&state.snapshot()).unwrap();
+        assert!(rebuilt.is_open());
+        assert_eq!(rebuilt.focused(), Some(2));
+        assert_eq!(rebuilt.selected(), Some(0));
+        rebuilt.set_selected(Some(1));
+        rebuilt.interaction.focused = false;
+        assert!(rebuilt.is_open());
+        assert_eq!(rebuilt.focused(), Some(2));
+        assert_eq!(rebuilt.selected(), Some(1));
+    }
+}
+
+#[cfg(test)]
+mod snapshot_event_tests {
+    use bmux_keyboard::{KeyCode, KeyStroke};
+    use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
+    use bmux_tui::geometry::{Point, Rect};
+
+    use super::{SelectDropdown, SelectDropdownOutcome, SelectDropdownState, SelectOption};
+
+    #[test]
+    fn pending_pointer_press_survives_rebuild_until_release() {
+        let options = [
+            SelectOption::new("one", "One"),
+            SelectOption::new("two", "Two"),
+        ];
+        let control = SelectDropdown::new(&options);
+        let area = Rect::new(0, 0, 12, 3);
+        let mut state = SelectDropdownState::new(Some(0));
+        state.set_open(true);
+        let down = Event::Mouse(MouseEvent::new(
+            MouseEventKind::Down(MouseButton::Left),
+            Point::new(1, 2),
+        ));
+        control.handle_event(area, &mut state, &down);
+        assert_eq!(state.selected(), Some(0));
+        let mut rebuilt = SelectDropdownState::new(None);
+        rebuilt.restore_snapshot(&state.snapshot()).unwrap();
+        let up = Event::Mouse(MouseEvent::new(
+            MouseEventKind::Up(MouseButton::Left),
+            Point::new(1, 2),
+        ));
+        assert_eq!(
+            control.handle_event(area, &mut rebuilt, &up),
+            SelectDropdownOutcome::Selected(1)
+        );
+        assert_eq!(rebuilt.selected(), Some(1));
+        assert!(!rebuilt.is_open());
+    }
+
+    #[test]
+    fn pending_keyboard_choice_can_be_cancelled_after_rebuild() {
+        let options = [
+            SelectOption::new("one", "One"),
+            SelectOption::new("two", "Two"),
+        ];
+        let control = SelectDropdown::new(&options);
+        let area = Rect::new(0, 0, 12, 3);
+        let mut state = SelectDropdownState::new(Some(0));
+        state.set_open(true);
+        control.handle_event(
+            area,
+            &mut state,
+            &Event::Key(KeyStroke::simple(KeyCode::Down)),
+        );
+        assert_eq!(state.focused(), Some(1));
+        assert_eq!(state.selected(), Some(0));
+        let mut rebuilt = SelectDropdownState::new(None);
+        rebuilt.restore_snapshot(&state.snapshot()).unwrap();
+        assert_eq!(
+            control.handle_event(
+                area,
+                &mut rebuilt,
+                &Event::Key(KeyStroke::simple(KeyCode::Escape))
+            ),
+            SelectDropdownOutcome::Closed
+        );
+        assert_eq!(rebuilt.selected(), Some(0));
+        assert!(!rebuilt.is_open());
     }
 }

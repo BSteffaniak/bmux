@@ -9,6 +9,15 @@
 //! separate from component policy so applications can opt into behavior one
 //! feature at a time.
 //!
+//! Keyboard focus is presentation, not selection: callers retain indices while
+//! clearing `interaction.focused` when a control loses focus. Lists, menus, radio
+//! groups, and action rows keep a separate remembered keyboard cursor. Tabs,
+//! tables, trees, and breadcrumbs paint focus on their selected/current item.
+//! Table, tree, and breadcrumbs component `focus_style` builders accept an
+//! overlay (for example `ComponentTheme::opaque_dark().focused`); `Style::new()`
+//! disables it without changing geometry. Other controls expose focused fields
+//! in their existing style structures. Built-in themes use a non-color cue.
+//!
 //! Every public component is opt-in. Composed component features enable their
 //! implementation prerequisites, and the additive `all` feature exists for
 //! galleries, documentation, and comprehensive validation.

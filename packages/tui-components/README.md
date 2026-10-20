@@ -229,3 +229,24 @@ remapping, explicit disablement and application shortcut precedence before
 passing the semantic action; do not call the default history handler afterward.
 Undo storage bounds, oversized-edit clearing and serde omission are documented
 in the `bmux_text_edit` README.
+
+### Ephemeral control rebuild snapshots
+
+Interactive native states expose `snapshot() -> serde_json::Value` and
+`restore_snapshot(&Value) -> Result<(), String>`. These JSON values are opaque,
+in-memory rebuild state, not stable wire formats or durable schemas. A snapshot
+retains selection and private cursor/hover/press state; dropdown snapshots also
+retain the open list and its pending option independently of the committed value.
+Applications keep these snapshots per view, restore them into caller-owned state,
+and then reapply canonical values and current keyboard-focus flags. Restore does
+not clamp indices against item collections; callers still own item reconciliation.
+Malformed snapshots leave state unchanged. Restore is bounded to 32 nesting levels,
+16,384 JSON nodes and 256 KiB of string/key data. A larger native state can be
+captured but cannot be restored through this bounded API.
+
+Text-input snapshots retain text, caret, selection, viewport/scroll state and active
+mouse selection. Derived wrap layouts and editor undo/redo history are not included.
+Multi-click timing is restored from a bounded relative age, not a serialized clock
+identity. Snapshot APIs are available with each control's existing feature; there is
+no additional feature a caller must enable. `CheckboxState::interaction()` and
+`set_focused(bool)` expose focus without making its private state fields public.

@@ -31,7 +31,8 @@ pub struct LinkedOwner {
     rich: crate::rich::RichAssets,
     linked: LinkedRegistry,
     instances: BTreeMap<String, InstanceState>,
-    layouts: BTreeMap<(String, String), Geometry>,
+    interactions: BTreeMap<(String, String), InstanceState>,
+    layouts: BTreeMap<(String, String, String), Geometry>,
     revisions: BTreeMap<String, u64>,
     demo_environment: Option<crate::playbook_live::DemoEnvironment>,
     demos: BTreeMap<String, crate::playbook_live::LiveDemos>,
@@ -59,6 +60,7 @@ impl LinkedOwner {
             rich,
             linked,
             instances: BTreeMap::new(),
+            interactions: BTreeMap::new(),
             layouts: BTreeMap::new(),
             revisions: BTreeMap::new(),
             demo_environment: None,
@@ -127,7 +129,25 @@ impl LinkedOwner {
                 entry.insert(Arc::new(Mutex::new(initial)));
             }
         }
-        let registry = render_registry(&self.linked, states, None)?;
+        if self.interactions.len() >= 256
+            && !self
+                .interactions
+                .contains_key(&(context.participant.to_owned(), context.instance.to_owned()))
+        {
+            return Err(HostError::Limit);
+        }
+        let interactions = self
+            .interactions
+            .entry((context.participant.to_owned(), context.instance.to_owned()))
+            .or_default();
+        interactions.retain(|key, _| states.contains_key(key));
+        for key in states.keys() {
+            interactions
+                .entry(key.clone())
+                .or_insert_with(|| Arc::new(Mutex::new(serde_json::json!({}))));
+        }
+        let focused_registry = render_registry(&self.linked, states, None, Some(interactions))?;
+        let registry = render_registry(&self.linked, states, None, None)?;
         for block in &blocks {
             if self.linked.compatibility_key(block).is_some() {
                 registry.build(block).map_err(|_| HostError::Invalid)?;
@@ -244,9 +264,11 @@ impl LinkedOwner {
                     "phase":demo.snapshot.attempt.as_ref().map(|attempt| attempt.phase.as_str())}),
             });
             if let Some(scene) = &mut private_scene
-                && let Some(previous) = self
-                    .layouts
-                    .get(&(context.instance.to_owned(), id.to_owned()))
+                && let Some(previous) = self.layouts.get(&(
+                    context.participant.to_owned(),
+                    context.instance.to_owned(),
+                    id.to_owned(),
+                ))
                 && previous.deck_revision == context.cursor.deck_revision
                 && previous.slide_id == slide.id.as_str()
                 && previous.reveal_step == context.state.reveal_step
@@ -287,10 +309,49 @@ impl LinkedOwner {
                     );
                 }
             }
-            surface.validate(16_384, 2 * 1024 * 1024)?;
+            surface.focusable = registry.focusable(block);
+            if surface.focusable && overlay.is_none() {
+                // This is an immutable alternative projection, not shared focus state.
+                // Every viewer selects it independently only after committing focus.
+                let focused_component = bmux_presenter::SlideComponent::new(
+                    slide,
+                    context.state.reveal_step,
+                    &theme,
+                    &focused_registry,
+                )
+                .rich_content(&self.rich)
+                .focused_block(&block.id);
+                let mut focused_buffer = bmux_tui::buffer::Buffer::empty(
+                    bmux_tui::geometry::Rect::new(0, 0, canvas_size.width, canvas_size.height),
+                );
+                let mut focused_frame = bmux_tui::frame::Frame::new(&mut focused_buffer);
+                let focused_layout = focused_component
+                    .layout(Constraints::tight(canvas_size), &mut LayoutCx::default());
+                if !same_geometry(&layout, &focused_layout) {
+                    return Err(HostError::Invalid);
+                }
+                focused_component.paint(&layout, &mut PaintCx::new(&mut focused_frame));
+                let mut focused_images = bmux_tui::image_scene::ImageScene::default();
+                focused_images.reconcile(focused_frame.images());
+                let mut focused = MirrorFrame::capture(
+                    id.clone(),
+                    slide.id.as_str().into(),
+                    revision,
+                    &focused_frame,
+                    &focused_images,
+                    16_384,
+                    2 * 1024 * 1024,
+                )?;
+                focused.focusable = true;
+                surface.focused = Some(Box::new(focused));
+            }
             let interaction_revision = self
                 .layouts
-                .get(&(context.instance.to_owned(), id.clone()))
+                .get(&(
+                    context.participant.to_owned(),
+                    context.instance.to_owned(),
+                    id.clone(),
+                ))
                 .filter(|old| {
                     old.deck_revision == context.cursor.deck_revision
                         && old.slide_id == slide.id.as_str()
@@ -300,9 +361,17 @@ impl LinkedOwner {
                 })
                 .map_or(revision, |old| old.interaction_revision);
             surface.interaction_revision = Some(interaction_revision);
+            if let Some(focused) = &mut surface.focused {
+                focused.interaction_revision = Some(interaction_revision);
+            }
+            surface.validate(16_384, 2 * 1024 * 1024)?;
             surfaces.push(surface);
             geometries.insert(
-                (context.instance.to_owned(), id),
+                (
+                    context.participant.to_owned(),
+                    context.instance.to_owned(),
+                    id,
+                ),
                 Geometry {
                     layout: layout.clone(),
                     slide_id: slide.id.as_str().into(),
@@ -314,12 +383,25 @@ impl LinkedOwner {
             );
         }
         // Publish derived geometry only after every frame capture succeeds.
-        self.layouts
-            .retain(|(instance, _), _| instance != context.instance);
+        self.layouts.retain(|(participant, instance, _), _| {
+            participant != context.participant || instance != context.instance
+        });
         self.layouts.extend(geometries);
         self.revisions.insert(context.instance.to_owned(), revision);
         Ok(surfaces)
     }
+}
+fn same_geometry(left: &LayoutNode, right: &LayoutNode) -> bool {
+    left.id == right.id
+        && left.size == right.size
+        && left.children.len() == right.children.len()
+        && left
+            .children
+            .iter()
+            .zip(&right.children)
+            .all(|(left, right)| {
+                left.x == right.x && left.y == right.y && same_geometry(&left.node, &right.node)
+            })
 }
 fn custom_blocks(blocks: &[Block], reveal: u32) -> Vec<&Block> {
     let mut found = Vec::new();
@@ -342,16 +424,33 @@ fn custom_blocks(blocks: &[Block], reveal: u32) -> Vec<&Block> {
 struct BoundFactory {
     factory: Arc<dyn LinkedComponentFactory>,
     states: BTreeMap<String, LinkedState>,
+    interactions: BTreeMap<String, LinkedState>,
     active: Option<String>,
 }
 impl CustomComponentFactory for BoundFactory {
     fn build<'a>(&'a self, block: &'a Block) -> Result<Element<'a>, String> {
+        self.build_with_context(
+            block,
+            bmux_presenter::custom::PresentationBuildContext::default(),
+        )
+    }
+    fn focusable(&self, block: &Block) -> bool {
+        self.factory.focusable(block)
+    }
+    fn build_with_context<'a>(
+        &'a self,
+        block: &'a Block,
+        mut context: bmux_presenter::custom::PresentationBuildContext,
+    ) -> Result<Element<'a>, String> {
         let state = self
             .states
             .get(block.id.as_str())
             .ok_or("missing owner state")?;
+        context.interaction = self.interactions.get(block.id.as_str()).cloned();
         Ok(Element::new(TargetComponent {
-            child: self.factory.build(block, Arc::clone(state))?,
+            child: self
+                .factory
+                .build_with_context(block, Arc::clone(state), context)?,
             active: self.active.as_deref() == Some(block.id.as_str()),
         }))
     }
@@ -385,6 +484,7 @@ fn render_registry(
     linked: &LinkedRegistry,
     states: &InstanceState,
     active: Option<&str>,
+    interactions: Option<&InstanceState>,
 ) -> Result<bmux_presenter::CustomRegistry<'static>, HostError> {
     let mut grouped: BTreeMap<String, BTreeMap<String, LinkedState>> = BTreeMap::new();
     for (key, state) in states {
@@ -398,9 +498,15 @@ fn render_registry(
         let factory = Arc::clone(linked.factory(&name).ok_or(HostError::Invalid)?);
         registry
             .register(
-                name,
+                name.clone(),
                 BoundFactory {
                     factory,
+                    interactions: interactions
+                        .into_iter()
+                        .flat_map(|states| states.iter())
+                        .filter(|(key, _)| key.component_type == name)
+                        .map(|(key, state)| (key.id.clone(), Arc::clone(state)))
+                        .collect(),
                     states,
                     active: active.map(str::to_owned),
                 },
@@ -462,6 +568,11 @@ impl Owner for LinkedOwner {
             Ok(())
         })
     }
+    fn disconnect(&mut self, participant: &str) {
+        self.interactions
+            .retain(|(owner, _), _| owner != participant);
+        self.layouts.retain(|(owner, _, _), _| owner != participant);
+    }
     fn advance(&mut self, context: OwnerContext<'_>) -> Result<bool, HostError> {
         if !self.demos.contains_key(context.instance)
             && let Some(environment) = &self.demo_environment
@@ -509,6 +620,34 @@ impl Owner for LinkedOwner {
     fn reconcile_reload(&mut self, context: OwnerContext<'_>) -> Result<Vec<MirrorFrame>, String> {
         self.scene(context)
     }
+    fn view_scene(
+        &mut self,
+        context: OwnerContext<'_>,
+        surfaces: &[MirrorFrame],
+    ) -> Result<Vec<MirrorFrame>, HostError> {
+        let mut projected = self.scenes(context)?;
+        if projected.len() != surfaces.len() {
+            return Err(HostError::Stale);
+        }
+        for surface in &mut projected {
+            let base = surfaces
+                .iter()
+                .find(|base| base.surface_id == surface.surface_id)
+                .ok_or(HostError::Stale)?;
+            if base.slide_id != surface.slide_id
+                || base.width != surface.width
+                || base.height != surface.height
+            {
+                return Err(HostError::Invalid);
+            }
+            surface.revision = base.revision;
+            if let Some(focused) = &mut surface.focused {
+                focused.revision = base.revision;
+            }
+            surface.validate(16_384, 2 * 1024 * 1024)?;
+        }
+        Ok(projected)
+    }
     fn scene(&mut self, context: OwnerContext<'_>) -> Result<Vec<MirrorFrame>, String> {
         self.scenes(context).map_err(|error| error.to_string())
     }
@@ -519,7 +658,11 @@ impl Owner for LinkedOwner {
     ) -> Result<OwnerUpdate, HostError> {
         let geometry = self
             .layouts
-            .get(&(context.instance.to_owned(), input.surface_id.clone()))
+            .get(&(
+                context.participant.to_owned(),
+                context.instance.to_owned(),
+                input.surface_id.clone(),
+            ))
             .ok_or(HostError::Stale)?;
         let slide = context
             .state
@@ -582,7 +725,28 @@ impl Owner for LinkedOwner {
             .instances
             .get(context.instance)
             .ok_or(HostError::Stale)?;
-        let registry = render_registry(&self.linked, states, Some(&input.surface_id))?;
+        if self.interactions.len() >= 256
+            && !self
+                .interactions
+                .contains_key(&(context.participant.to_owned(), context.instance.to_owned()))
+        {
+            return Err(HostError::Limit);
+        }
+        let interactions = self
+            .interactions
+            .entry((context.participant.to_owned(), context.instance.to_owned()))
+            .or_default();
+        for key in states.keys() {
+            interactions
+                .entry(key.clone())
+                .or_insert_with(|| Arc::new(Mutex::new(serde_json::json!({}))));
+        }
+        let registry = render_registry(
+            &self.linked,
+            states,
+            Some(&input.surface_id),
+            Some(interactions),
+        )?;
         let theme = bmux_presenter::PresentationTheme::for_deck(&self.deck);
         let component = bmux_presenter::SlideComponent::new(
             slide,
@@ -592,38 +756,42 @@ impl Owner for LinkedOwner {
         )
         .rich_content(&self.rich)
         .focused_block(&block.id);
-        let event = if input.input == "click" {
-            Event::Mouse(bmux_tui::event::MouseEvent::new(
-                bmux_tui::event::MouseEventKind::Down(bmux_tui::event::MouseButton::Left),
-                bmux_tui::geometry::Point::new(input.x, input.y),
-            ))
-        } else {
-            let mut chars = input.input.chars();
-            let character = chars.next().ok_or(HostError::Invalid)?;
-            if chars.next().is_some() {
-                return Err(HostError::Invalid);
-            }
-            Event::Key(bmux_keyboard::KeyStroke::simple(
-                bmux_keyboard::KeyCode::Char(character),
-            ))
-        };
+        let event = crate::managed_input::decode(&input.input, input.x, input.y)
+            .ok_or(HostError::Invalid)?;
         let outcome = component.event(
             &event,
             &geometry.layout,
             &mut EventCx::with_clip(
                 &geometry.layout,
-                bmux_tui::geometry::Rect::new(0, 0, 80, 24),
+                bmux_tui::geometry::Rect::new(
+                    0,
+                    0,
+                    u16::try_from(geometry.layout.size.width).map_err(|_| HostError::Limit)?,
+                    u16::try_from(geometry.layout.size.height).map_err(|_| HostError::Limit)?,
+                ),
             ),
         );
-        self.layouts
-            .remove(&(context.instance.to_owned(), input.surface_id.clone()));
-        Ok(OwnerUpdate {
-            outcome: if outcome == EventOutcome::Ignored {
-                "input outside active control"
+        self.layouts.remove(&(
+            context.participant.to_owned(),
+            context.instance.to_owned(),
+            input.surface_id.clone(),
+        ));
+        let outcome = crate::managed_input::focus_ack(
+            &input.surface_id,
+            input.surface_revision,
+            &input.input,
+            outcome != EventOutcome::Ignored,
+        )
+        .and_then(|ack| crate::managed_input::encode_ack(&ack))
+        .unwrap_or_else(|| {
+            if outcome == EventOutcome::Ignored {
+                "input outside active control".into()
             } else {
-                "component updated"
+                "component updated".into()
             }
-            .into(),
+        });
+        Ok(OwnerUpdate {
+            outcome,
             surfaces: self.scenes(context)?,
         })
     }
@@ -649,7 +817,11 @@ impl Owner for LinkedOwner {
             .ok_or(HostError::Unauthorized)?;
         let outcome = if let Some(scene) = self
             .layouts
-            .get(&(context.instance.to_owned(), id.to_owned()))
+            .get(&(
+                context.participant.to_owned(),
+                context.instance.to_owned(),
+                id.to_owned(),
+            ))
             .and_then(|geometry| geometry.control_scene.as_ref())
         {
             let epoch = scene.identity["owner_epoch"]
@@ -824,6 +996,249 @@ mod tests {
             .lock()
             .unwrap()
             .clone()
+    }
+    #[test]
+    fn owner_focus_projection_is_viewer_selectable_without_mutating_shared_state() {
+        let deck = bmux_presenter::DeckBuilder::new("focus")
+            .slide(
+                bmux_presenter::SlideBuilder::new("s")
+                    .custom(
+                        "edit",
+                        "tui-gallery",
+                        serde_json::json!({"kind":"text-input-box"}),
+                    )
+                    .custom("static", "tui-gallery", serde_json::json!({"kind":"badge"}))
+                    .build(),
+            )
+            .build()
+            .unwrap();
+        let state = bmux_presenter::PresentationState::new(&deck);
+        let cursor = bmux_presenter_runtime::Cursor {
+            run_id: "r".into(),
+            deck_revision: 1,
+            revision: 1,
+        };
+        let mut owner = LinkedOwner::new(deck, &[], crate::demo::linked_registry()).unwrap();
+        let frames = owner.scenes(context("shared", &state, &cursor)).unwrap();
+        let previous = value(&owner, "shared", "edit");
+        let edit = frames
+            .iter()
+            .find(|frame| frame.surface_id == "edit")
+            .unwrap();
+        let focused = edit.focused.as_ref().unwrap();
+        assert!(edit.focusable);
+        assert!(edit.cursor.is_none());
+        assert!(focused.cursor.is_some());
+        assert_eq!(edit.width, focused.width);
+        assert_eq!(edit.height, focused.height);
+        assert_eq!(edit.revision, focused.revision);
+        assert_eq!(edit.interaction_revision, focused.interaction_revision);
+        assert!(focused.focused.is_none());
+        assert!(focused.private_scene.is_none());
+        assert!(focused.playbook.is_none());
+        let static_frame = frames
+            .iter()
+            .find(|frame| frame.surface_id == "static")
+            .unwrap();
+        assert!(!static_frame.focusable);
+        assert!(static_frame.focused.is_none());
+        owner.scenes(context("shared", &state, &cursor)).unwrap();
+        assert_eq!(value(&owner, "shared", "edit"), previous);
+    }
+    #[test]
+    fn transient_owner_interaction_is_independent_for_participants_sharing_values() {
+        let deck = bmux_presenter::DeckBuilder::new("participants")
+            .slide(
+                bmux_presenter::SlideBuilder::new("s")
+                    .custom(
+                        "menu",
+                        "tui-gallery",
+                        serde_json::json!({"kind":"select-dropdown"}),
+                    )
+                    .build(),
+            )
+            .build()
+            .unwrap();
+        let state = bmux_presenter::PresentationState::new(&deck);
+        let cursor = bmux_presenter_runtime::Cursor {
+            run_id: "r".into(),
+            deck_revision: 1,
+            revision: 1,
+        };
+        let mut owner = LinkedOwner::new(deck, &[], crate::demo::linked_registry()).unwrap();
+        let context = |participant| OwnerContext {
+            participant,
+            instance: "shared",
+            state: &state,
+            cursor: &cursor,
+        };
+        let frames = owner.scenes(context("one")).unwrap();
+        let canonical = value(&owner, "shared", "menu");
+        owner
+            .demo_input(
+                context("one"),
+                &SurfaceInput {
+                    surface_id: "menu".into(),
+                    surface_revision: frames[0].interaction_revision.unwrap(),
+                    x: 0,
+                    y: 0,
+                    input: crate::managed_input::encode(&Event::Key(
+                        bmux_keyboard::KeyStroke::simple(bmux_keyboard::KeyCode::Enter),
+                    ))
+                    .unwrap(),
+                },
+            )
+            .unwrap();
+        let one = owner.scenes(context("one")).unwrap();
+        let two = owner.scenes(context("two")).unwrap();
+        assert_eq!(value(&owner, "shared", "menu"), canonical);
+        assert_eq!(
+            serde_json::to_value(&one[0].cells).unwrap(),
+            serde_json::to_value(&two[0].cells).unwrap()
+        );
+        assert_ne!(
+            serde_json::to_value(&one[0].focused.as_ref().unwrap().cells).unwrap(),
+            serde_json::to_value(&two[0].focused.as_ref().unwrap().cells).unwrap()
+        );
+        let one_interaction = owner.interactions[&("one".into(), "shared".into())]
+            .values()
+            .next()
+            .unwrap();
+        let two_interaction = owner.interactions[&("two".into(), "shared".into())]
+            .values()
+            .next()
+            .unwrap();
+        assert!(!Arc::ptr_eq(one_interaction, two_interaction));
+        let one_value = one_interaction.lock().unwrap().clone();
+        let two_value = two_interaction.lock().unwrap().clone();
+        assert_eq!(one_value["menu"]["native"]["open"], serde_json::json!(true));
+        assert!(two_value.get("menu").is_none());
+        owner.disconnect("one");
+        assert!(
+            !owner
+                .interactions
+                .contains_key(&("one".into(), "shared".into()))
+        );
+        assert!(
+            owner
+                .interactions
+                .contains_key(&("two".into(), "shared".into()))
+        );
+    }
+    #[test]
+    fn managed_codec_routes_full_events_only_after_revision_validation() {
+        struct Recorder;
+        struct RecordingControl(LinkedState);
+        impl LinkedComponentFactory for Recorder {
+            fn state_version(&self) -> u64 {
+                1
+            }
+            fn initial_state(&self, _block: &Block) -> Result<serde_json::Value, String> {
+                Ok(serde_json::json!([]))
+            }
+            fn build<'a>(
+                &'a self,
+                _block: &'a Block,
+                state: LinkedState,
+            ) -> Result<Element<'a>, String> {
+                Ok(Element::new(RecordingControl(state)))
+            }
+        }
+        impl Component for RecordingControl {
+            fn layout(&self, c: Constraints, cx: &mut LayoutCx) -> LayoutNode {
+                TextBlock::new("record").layout(c, cx)
+            }
+            fn paint(&self, _layout: &LayoutNode, _cx: &mut PaintCx<'_, '_>) {}
+            fn event(
+                &self,
+                event: &Event,
+                _layout: &LayoutNode,
+                _cx: &mut EventCx<'_>,
+            ) -> EventOutcome {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .as_array_mut()
+                    .unwrap()
+                    .push(serde_json::json!(format!("{event:?}")));
+                EventOutcome::Redraw
+            }
+        }
+        let deck = bmux_presenter::DeckBuilder::new("codec")
+            .slide(
+                bmux_presenter::SlideBuilder::new("s")
+                    .custom("record", "record", serde_json::Value::Null)
+                    .build(),
+            )
+            .build()
+            .unwrap();
+        let state = bmux_presenter::PresentationState::new(&deck);
+        let cursor = bmux_presenter_runtime::Cursor {
+            run_id: "r".into(),
+            deck_revision: 1,
+            revision: 1,
+        };
+        let mut linked = LinkedRegistry::default();
+        linked.register("record", Recorder).unwrap();
+        let mut owner = LinkedOwner::new(deck, &[], linked).unwrap();
+        for event in [
+            Event::Key(bmux_keyboard::KeyStroke::with_modifiers(
+                bmux_keyboard::KeyCode::Delete,
+                bmux_keyboard::Modifiers {
+                    ctrl: true,
+                    shift: true,
+                    ..Default::default()
+                },
+            )),
+            Event::Paste("é bounded".into()),
+            Event::Mouse(bmux_tui::event::MouseEvent::new(
+                bmux_tui::event::MouseEventKind::ScrollDown,
+                bmux_tui::geometry::Point::new(0, 0),
+            )),
+        ] {
+            let frames = owner.scenes(context("shared", &state, &cursor)).unwrap();
+            let input = SurfaceInput {
+                surface_id: "record".into(),
+                surface_revision: frames[0].interaction_revision.unwrap_or(frames[0].revision),
+                x: 0,
+                y: 0,
+                input: crate::managed_input::encode(&event).unwrap(),
+            };
+            let previous = value(&owner, "shared", "record");
+            let mut stale = input.clone();
+            stale.surface_revision += 1;
+            assert!(matches!(
+                owner.demo_input(context("shared", &state, &cursor), &stale),
+                Err(HostError::Stale)
+            ));
+            assert_eq!(value(&owner, "shared", "record"), previous);
+            owner
+                .demo_input(context("shared", &state, &cursor), &input)
+                .unwrap();
+            let recorded = value(&owner, "shared", "record");
+            assert_eq!(
+                recorded.as_array().unwrap().last().unwrap(),
+                &serde_json::json!(format!("{event:?}"))
+            );
+        }
+        owner.scenes(context("private", &state, &cursor)).unwrap();
+        assert_eq!(value(&owner, "private", "record"), serde_json::json!([]));
+        let frames = owner.scenes(context("shared", &state, &cursor)).unwrap();
+        let previous = value(&owner, "shared", "record");
+        assert!(matches!(
+            owner.demo_input(
+                context("shared", &state, &cursor),
+                &SurfaceInput {
+                    surface_id: "record".into(),
+                    surface_revision: frames[0].interaction_revision.unwrap_or(frames[0].revision),
+                    x: 0,
+                    y: 0,
+                    input: "presenter-input-v1:{}".into(),
+                }
+            ),
+            Err(HostError::Invalid)
+        ));
+        assert_eq!(value(&owner, "shared", "record"), previous);
     }
     #[test]
     fn public_embedding_constructor_hosts_both_linked_types() {
@@ -1056,6 +1471,274 @@ mod tests {
         assert_eq!(after.state.slide_id, Some("new".into()));
     }
     #[test]
+    fn host_followers_share_committed_selection_but_not_dropdown_interaction() {
+        use bmux_presenter_runtime::{
+            Action, Credential, Host, HostConfig, InteractionMode, PROTOCOL_VERSION, Scopes,
+            Snapshot, Submission,
+        };
+        fn join(host: &mut Host, mode: InteractionMode) -> String {
+            let credential = Credential::generate(
+                Scopes {
+                    demo_input: true,
+                    ..Default::default()
+                },
+                std::time::Duration::from_secs(60),
+            );
+            let secret = credential.secret.clone();
+            host.add_credential(credential).unwrap();
+            host.authenticate(PROTOCOL_VERSION, Some(&secret), mode)
+                .unwrap()
+        }
+        fn send(host: &mut Host, participant: &str, key: bmux_keyboard::KeyCode) {
+            let snapshot = host.snapshot(participant).unwrap();
+            let surface = snapshot
+                .surfaces
+                .iter()
+                .find(|surface| surface.surface_id == "menu")
+                .unwrap();
+            host.submit(
+                participant,
+                Submission {
+                    action_id: host.next_action_id(participant).unwrap().unwrap(),
+                    expected: snapshot.cursor,
+                    action: Action::DemoInput(SurfaceInput {
+                        surface_id: surface.surface_id.clone(),
+                        surface_revision: surface.interaction_revision.unwrap_or(surface.revision),
+                        x: 0,
+                        y: 0,
+                        input: crate::managed_input::encode(&Event::Key(
+                            bmux_keyboard::KeyStroke::simple(key),
+                        ))
+                        .unwrap(),
+                    }),
+                },
+            )
+            .unwrap();
+        }
+        fn menu(snapshot: &Snapshot) -> &MirrorFrame {
+            snapshot
+                .surfaces
+                .iter()
+                .find(|surface| surface.surface_id == "menu")
+                .unwrap()
+        }
+        fn text(surface: &MirrorFrame) -> String {
+            surface
+                .cells
+                .iter()
+                .map(|cell| cell.symbol.as_str())
+                .collect()
+        }
+        fn cells(surface: &MirrorFrame) -> serde_json::Value {
+            serde_json::to_value(&surface.cells).unwrap()
+        }
+        fn no_private_metadata(surface: &MirrorFrame) -> bool {
+            surface.focused.is_none() && surface.cursor.is_none() && surface.private_scene.is_none()
+        }
+        let deck = bmux_presenter::DeckBuilder::new("followers")
+            .slide(
+                bmux_presenter::SlideBuilder::new("s")
+                    .custom(
+                        "menu",
+                        "tui-gallery",
+                        serde_json::json!({"kind":"select-dropdown"}),
+                    )
+                    .build(),
+            )
+            .build()
+            .unwrap();
+        let mut host = Host::new(deck.clone(), vec![], HostConfig::default()).unwrap();
+        host.set_owner(Box::new(
+            LinkedOwner::new(deck, &[], crate::demo::linked_registry()).unwrap(),
+        ))
+        .unwrap();
+        // Separate credentials are deliberate: action ledgers are credential-scoped,
+        // while transient interaction must be participant-scoped, not shared-instance.
+        let a = join(&mut host, InteractionMode::Shared);
+        let b = join(&mut host, InteractionMode::Shared);
+        let readonly = join(&mut host, InteractionMode::ReceiveOnly);
+        let initial_a = host.snapshot(&a).unwrap();
+        let initial_b = host.snapshot(&b).unwrap();
+        assert!(menu(&initial_a).focused.is_some());
+        assert_eq!(
+            cells(menu(&initial_a).focused.as_ref().unwrap()),
+            cells(menu(&initial_b).focused.as_ref().unwrap())
+        );
+        assert!(text(menu(&initial_b)).contains("Ready"));
+        send(&mut host, &a, bmux_keyboard::KeyCode::Enter);
+        let opened_a = host.snapshot(&a).unwrap();
+        let bmux_presenter_runtime::Poll::Snapshot {
+            snapshot: unchanged_b,
+            ..
+        } = host.poll(&b, Some(&initial_b.cursor)).unwrap()
+        else {
+            panic!("follower must observe new shared revision through poll");
+        };
+        let unchanged_b = *unchanged_b;
+        assert_eq!(cells(menu(&opened_a)), cells(menu(&unchanged_b)));
+        assert_eq!(
+            cells(menu(&initial_b).focused.as_ref().unwrap()),
+            cells(menu(&unchanged_b).focused.as_ref().unwrap())
+        );
+        assert_ne!(
+            cells(menu(&opened_a).focused.as_ref().unwrap()),
+            cells(menu(&unchanged_b).focused.as_ref().unwrap())
+        );
+        send(&mut host, &a, bmux_keyboard::KeyCode::Down);
+        let moved_a = host.snapshot(&a).unwrap();
+        let still_b = host.snapshot(&b).unwrap();
+        assert_ne!(
+            cells(menu(&moved_a).focused.as_ref().unwrap()),
+            cells(menu(&opened_a).focused.as_ref().unwrap())
+        );
+        assert_eq!(
+            cells(menu(&still_b).focused.as_ref().unwrap()),
+            cells(menu(&initial_b).focused.as_ref().unwrap())
+        );
+        assert!(
+            text(menu(&still_b)).contains("Ready"),
+            "active option is not committed selection"
+        );
+        let readonly_snapshot = host.snapshot(&readonly).unwrap();
+        assert!(readonly_snapshot.surfaces.iter().all(no_private_metadata));
+        let readonly_surface = menu(&readonly_snapshot);
+        assert!(matches!(
+            host.submit(
+                &readonly,
+                Submission {
+                    action_id: host.next_action_id(&readonly).unwrap().unwrap(),
+                    expected: readonly_snapshot.cursor.clone(),
+                    action: Action::DemoInput(SurfaceInput {
+                        surface_id: "menu".into(),
+                        surface_revision: readonly_surface
+                            .interaction_revision
+                            .unwrap_or(readonly_surface.revision),
+                        x: 0,
+                        y: 0,
+                        input: "click".into()
+                    }),
+                }
+            ),
+            Err(HostError::Unauthorized)
+        ));
+        send(&mut host, &a, bmux_keyboard::KeyCode::Enter);
+        let committed_a = host.snapshot(&a).unwrap();
+        let committed_b = host.snapshot(&b).unwrap();
+        assert!(text(menu(&committed_a)).contains("Running"));
+        assert!(text(menu(&committed_b)).contains("Running"));
+        assert_eq!(cells(menu(&committed_a)), cells(menu(&committed_b)));
+        assert!(
+            host.snapshot(&readonly)
+                .unwrap()
+                .surfaces
+                .iter()
+                .all(no_private_metadata)
+        );
+        // B can open and move independently; A's committed closed projection stays put.
+        let closed_a = cells(menu(&committed_a).focused.as_ref().unwrap());
+        send(&mut host, &b, bmux_keyboard::KeyCode::Enter);
+        send(&mut host, &b, bmux_keyboard::KeyCode::Down);
+        assert_eq!(
+            cells(menu(&host.snapshot(&a).unwrap()).focused.as_ref().unwrap()),
+            closed_a
+        );
+    }
+    #[test]
+    fn host_followers_with_one_credential_keep_active_list_choices_personal() {
+        use bmux_presenter_runtime::{
+            Action, Credential, Host, HostConfig, InteractionMode, PROTOCOL_VERSION, Scopes,
+            Submission,
+        };
+        fn send(host: &mut Host, participant: &str, key: bmux_keyboard::KeyCode) {
+            let snapshot = host.snapshot(participant).unwrap();
+            let surface = &snapshot.surfaces[0];
+            host.submit(
+                participant,
+                Submission {
+                    action_id: host.next_action_id(participant).unwrap().unwrap(),
+                    expected: snapshot.cursor,
+                    action: Action::DemoInput(SurfaceInput {
+                        surface_id: surface.surface_id.clone(),
+                        surface_revision: surface.interaction_revision.unwrap_or(surface.revision),
+                        x: 0,
+                        y: 0,
+                        input: crate::managed_input::encode(&Event::Key(
+                            bmux_keyboard::KeyStroke::simple(key),
+                        ))
+                        .unwrap(),
+                    }),
+                },
+            )
+            .unwrap();
+        }
+        fn cells(surface: &MirrorFrame) -> serde_json::Value {
+            serde_json::to_value(&surface.cells).unwrap()
+        }
+        let deck = bmux_presenter::DeckBuilder::new("followers-list")
+            .slide(
+                bmux_presenter::SlideBuilder::new("s")
+                    .custom(
+                        "list",
+                        "tui-gallery",
+                        serde_json::json!({"kind":"selectable-list"}),
+                    )
+                    .build(),
+            )
+            .build()
+            .unwrap();
+        let mut host = Host::new(deck.clone(), vec![], HostConfig::default()).unwrap();
+        host.set_owner(Box::new(
+            LinkedOwner::new(deck, &[], crate::demo::linked_registry()).unwrap(),
+        ))
+        .unwrap();
+        let credential = Credential::generate(
+            Scopes {
+                demo_input: true,
+                ..Default::default()
+            },
+            std::time::Duration::from_secs(60),
+        );
+        let secret = credential.secret.clone();
+        host.add_credential(credential).unwrap();
+        let a = host
+            .authenticate(PROTOCOL_VERSION, Some(&secret), InteractionMode::Shared)
+            .unwrap();
+        let b = host
+            .authenticate(PROTOCOL_VERSION, Some(&secret), InteractionMode::Shared)
+            .unwrap();
+        let initial_a = host.snapshot(&a).unwrap().surfaces.remove(0);
+        let initial_b = host.snapshot(&b).unwrap().surfaces.remove(0);
+        // Both participants establish a transient active choice before A commits.
+        send(&mut host, &a, bmux_keyboard::KeyCode::Down);
+        send(&mut host, &b, bmux_keyboard::KeyCode::Down);
+        send(&mut host, &b, bmux_keyboard::KeyCode::Down);
+        let moved_a = host.snapshot(&a).unwrap().surfaces.remove(0);
+        let moved_b = host.snapshot(&b).unwrap().surfaces.remove(0);
+        assert_eq!(cells(&moved_a), cells(&initial_a));
+        assert_eq!(cells(&moved_b), cells(&initial_b));
+        assert_ne!(
+            cells(moved_a.focused.as_ref().unwrap()),
+            cells(moved_b.focused.as_ref().unwrap())
+        );
+        // Transient snapshots must not overwrite a newer canonical selected value.
+        send(&mut host, &a, bmux_keyboard::KeyCode::Enter);
+        let committed_a = host.snapshot(&a).unwrap().surfaces.remove(0);
+        let committed_b = host.snapshot(&b).unwrap().surfaces.remove(0);
+        assert_ne!(cells(&initial_a), cells(&committed_a));
+        assert_eq!(cells(&committed_a), cells(&committed_b));
+        assert_ne!(
+            cells(committed_a.focused.as_ref().unwrap()),
+            cells(committed_b.focused.as_ref().unwrap()),
+            "shared selection must not replace B's personal active item"
+        );
+        // B commits its own active item, not A's selected item restored from a stale snapshot.
+        send(&mut host, &b, bmux_keyboard::KeyCode::Enter);
+        let selected_a = host.snapshot(&a).unwrap().surfaces.remove(0);
+        let selected_b = host.snapshot(&b).unwrap().surfaces.remove(0);
+        assert_eq!(cells(&selected_a), cells(&selected_b));
+        assert_ne!(cells(&selected_a), cells(&committed_a));
+    }
+    #[test]
     fn hosted_modes_publish_scenes_and_preserve_private_notes() {
         use bmux_presenter_runtime::{
             Action, Credential, Host, HostConfig, InteractionMode, PROTOCOL_VERSION, Scopes,
@@ -1128,7 +1811,7 @@ mod tests {
                     expected: initial.cursor,
                     action: Action::DemoInput(SurfaceInput {
                         surface_id: frame.surface_id.clone(),
-                        surface_revision: frame.revision,
+                        surface_revision: frame.interaction_revision.unwrap_or(frame.revision),
                         x: 0,
                         y: 0,
                         input: "+".into(),

@@ -52,7 +52,10 @@ impl<'a> BreadcrumbItem<'a> {
 }
 
 /// Runtime breadcrumbs state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(deny_unknown_fields)]
 pub struct BreadcrumbsState {
     current: Option<usize>,
     hovered: Option<usize>,
@@ -61,6 +64,25 @@ pub struct BreadcrumbsState {
 }
 
 impl BreadcrumbsState {
+    /// Capture native caller-owned state for an in-memory control rebuild.
+    /// This is not a stable wire or durable storage contract. Reapply canonical
+    /// values and current keyboard focus after restoring a snapshot.
+    #[must_use]
+    pub fn snapshot(&self) -> serde_json::Value {
+        crate::common::state_snapshot(self)
+    }
+
+    /// Restore a bounded native rebuild snapshot, including private interaction
+    /// state. Malformed snapshots return an error without changing this state.
+    ///
+    /// # Errors
+    /// Returns an error for malformed, oversized, or incompatible snapshots.
+    pub fn restore_snapshot(&mut self, snapshot: &serde_json::Value) -> Result<(), String> {
+        let restored = crate::common::decode_state_snapshot(snapshot)?;
+        *self = restored;
+        Ok(())
+    }
+
     /// Create breadcrumbs state.
     #[must_use]
     pub const fn new(current: Option<usize>) -> Self {
@@ -187,6 +209,7 @@ struct Breadcrumbs<'a> {
     items: &'a [BreadcrumbItem<'a>],
     policy: BreadcrumbsPolicy,
     styles: BreadcrumbsStyles,
+    focus_style: Style,
 }
 
 /// Canonical component-lifecycle breadcrumbs control.
@@ -287,6 +310,14 @@ impl<'a, 'state> BreadcrumbsComponent<'a, 'state> {
         self
     }
 
+    /// Set the active-item keyboard-focus overlay (`theme.focused` for themed
+    /// focus, `Style::new()` to opt out). Selection and layout are unaffected.
+    #[must_use]
+    pub const fn focus_style(mut self, style: Style) -> Self {
+        self.breadcrumbs.focus_style = style;
+        self
+    }
+
     /// Set visual styles.
     #[must_use]
     pub const fn styles(mut self, styles: BreadcrumbsStyles) -> Self {
@@ -320,6 +351,7 @@ impl Component for BreadcrumbsComponent<'_, '_> {
             policy.mouse.click,
         )
             .hash(&mut paint);
+        self.breadcrumbs.focus_style.hash(&mut paint);
         self.breadcrumbs.styles.hash(&mut paint);
         self.state.get().hash(&mut paint);
         ComponentRevision::new(layout.finish(), paint.finish())
@@ -409,6 +441,7 @@ impl<'a> Breadcrumbs<'a> {
                 },
                 truncate: true,
             },
+            focus_style: crate::common::DEFAULT_FOCUS_STYLE,
             styles: BreadcrumbsStyles {
                 normal: Style::new(),
                 current: Style::new(),
@@ -601,6 +634,8 @@ impl<'a> Breadcrumbs<'a> {
             self.styles.disabled
         } else if state.pressed == Some(index) {
             self.styles.pressed
+        } else if state.focused && state.current == Some(index) {
+            self.styles.current.patch(self.focus_style)
         } else if state.hovered == Some(index) {
             self.styles.hovered
         } else if state.current == Some(index) {
@@ -1027,7 +1062,7 @@ mod tests {
             Constraints::for_width(u16::MAX.into()),
             &mut LayoutCx::new(),
         );
-        assert_eq!(layout.size.width, u16::MAX.into());
+        assert_eq!(layout.size.width, u64::from(u16::MAX));
         let mut buffer = Buffer::empty(Rect::new(0, 0, u16::MAX, 1));
         let mut frame = Frame::new(&mut buffer);
         component.paint(&layout, &mut PaintCx::new(&mut frame));
@@ -1708,5 +1743,92 @@ mod tests {
                 .revision()
                 .layout
         );
+    }
+}
+
+#[cfg(test)]
+mod focus_visual_tests {
+    use std::cell::Cell;
+
+    use bmux_tui::component::Component;
+    use bmux_tui::style::{Color, Modifier, Style};
+
+    use super::*;
+
+    #[test]
+    fn current_item_focus_is_an_optional_overlay() {
+        let items = [
+            BreadcrumbItem::new("one", "One"),
+            BreadcrumbItem::new("two", "Two"),
+        ];
+        let state = Cell::new(BreadcrumbsState::new(Some(0)));
+        let styles = BreadcrumbsStyles {
+            current: Style::new().fg(Color::Blue),
+            ..BreadcrumbsStyles::default()
+        };
+        let component = BreadcrumbsComponent::new("focus.crumbs", &items, &state).styles(styles);
+        assert_eq!(
+            component.breadcrumbs.item_style(0, &items[0], &state.get()),
+            styles.current
+        );
+        let mut focused = state.get();
+        focused.set_focused(true);
+        focused.hovered = Some(0);
+        state.set(focused);
+        let style = component.breadcrumbs.item_style(0, &items[0], &state.get());
+        assert_eq!(style.fg, styles.current.fg);
+        assert!(style.modifiers.contains(Modifier::UNDERLINE));
+        assert_eq!(
+            component.breadcrumbs.item_style(1, &items[1], &state.get()),
+            styles.normal
+        );
+        let component = component.focus_style(Style::new());
+        assert_eq!(
+            component.breadcrumbs.item_style(0, &items[0], &state.get()),
+            styles.current
+        );
+        assert_eq!(state.get().current(), Some(0));
+    }
+
+    #[test]
+    fn focus_state_and_style_are_paint_only() {
+        let items = [BreadcrumbItem::new("one", "One")];
+        let state = Cell::new(BreadcrumbsState::new(Some(0)));
+        let component = BreadcrumbsComponent::new("focus.crumbs", &items, &state);
+        let before = component.revision();
+        let mut focused = state.get();
+        focused.set_focused(true);
+        state.set(focused);
+        let after = component.revision();
+        let restyled = component
+            .focus_style(Style::new().fg(Color::Red))
+            .revision();
+        assert_eq!(before.layout, after.layout);
+        assert_eq!(after.layout, restyled.layout);
+        assert_ne!(before.paint, after.paint);
+        assert_ne!(after.paint, restyled.paint);
+    }
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::BreadcrumbsState;
+
+    #[test]
+    fn native_snapshot_preserves_private_state_and_rejects_bad_input_atomically() {
+        let mut state = BreadcrumbsState::new(Some(1));
+        state.hovered = Some(2);
+        state.pressed = Some(2);
+        state.set_focused(true);
+        let snapshot = state.snapshot();
+        let mut rebuilt = BreadcrumbsState::new(Some(1));
+        rebuilt.restore_snapshot(&snapshot).unwrap();
+        assert_eq!(rebuilt, state);
+        let mut malformed = snapshot.clone();
+        malformed["unknown_field"] = serde_json::json!(true);
+        assert!(rebuilt.restore_snapshot(&malformed).is_err());
+        assert_eq!(rebuilt, state);
+        assert!(rebuilt.restore_snapshot(&serde_json::Value::Null).is_err());
+        assert_eq!(rebuilt, state);
     }
 }

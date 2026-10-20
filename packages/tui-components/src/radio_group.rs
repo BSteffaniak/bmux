@@ -67,7 +67,9 @@ impl Default for RadioGroupStyles {
     fn default() -> Self {
         Self {
             normal: Style::new(),
-            focused: Style::new().add_modifier(Modifier::REVERSED),
+            focused: Style::new()
+                .add_modifier(Modifier::REVERSED)
+                .add_modifier(Modifier::UNDERLINE),
             hovered: Style::new().add_modifier(Modifier::UNDERLINE),
             pressed: Style::new().add_modifier(Modifier::BOLD),
             disabled: Style::new().add_modifier(Modifier::DIM),
@@ -156,7 +158,8 @@ impl Default for RadioGroupPolicy {
 }
 
 /// Runtime radio-group state.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RadioGroupState {
     /// Common group interaction flags.
     pub interaction: InteractionState,
@@ -167,6 +170,25 @@ pub struct RadioGroupState {
 }
 
 impl RadioGroupState {
+    /// Capture native caller-owned state for an in-memory control rebuild.
+    /// This is not a stable wire or durable storage contract. Reapply canonical
+    /// values and current keyboard focus after restoring a snapshot.
+    #[must_use]
+    pub fn snapshot(&self) -> serde_json::Value {
+        crate::common::state_snapshot(self)
+    }
+
+    /// Restore a bounded native rebuild snapshot, including private interaction
+    /// state. Malformed snapshots return an error without changing this state.
+    ///
+    /// # Errors
+    /// Returns an error for malformed, oversized, or incompatible snapshots.
+    pub fn restore_snapshot(&mut self, snapshot: &serde_json::Value) -> Result<(), String> {
+        let restored = crate::common::decode_state_snapshot(snapshot)?;
+        *self = restored;
+        Ok(())
+    }
+
     /// Create radio-group state.
     #[must_use]
     pub const fn new(selected: Option<usize>) -> Self {
@@ -582,8 +604,8 @@ impl<'a> RadioGroup<'a> {
             self.styles.disabled
         } else if state.pressed == Some(index) {
             self.styles.pressed
-        } else if state.focused == Some(index) {
-            self.styles.focused
+        } else if state.interaction.focused && state.focused == Some(index) {
+            self.styles.normal.patch(self.styles.focused)
         } else if state.hovered == Some(index) {
             self.styles.hovered
         } else {
@@ -1559,5 +1581,88 @@ mod tests {
 
         assert_eq!(outcome, RadioGroupOutcome::Ignored);
         assert_eq!(state.selected(), Some(0));
+    }
+}
+
+#[cfg(test)]
+mod focus_visual_tests {
+    use std::cell::Cell;
+
+    use bmux_tui::component::Component;
+    use bmux_tui::style::{Modifier, Style};
+
+    use super::*;
+
+    #[test]
+    fn checked_option_is_not_keyboard_focus() {
+        let options = [RadioOption::new("one", "One")];
+        let group = RadioGroup::new(&options);
+        let mut state = RadioGroupState::new(Some(0));
+        assert_eq!(group.style_for(0, &options[0], state), group.styles.normal);
+        let unchecked_focus = group.line(0, &options[0], state);
+        state.interaction.focused = true;
+        assert!(
+            group
+                .style_for(0, &options[0], state)
+                .modifiers
+                .contains(Modifier::UNDERLINE)
+        );
+        assert_eq!(
+            unchecked_focus.spans[0].content,
+            group.line(0, &options[0], state).spans[0].content
+        );
+        assert_eq!(state.selected(), Some(0));
+        state.interaction.disabled = true;
+        assert_eq!(
+            group.style_for(0, &options[0], state),
+            group.styles.disabled
+        );
+        state.interaction.disabled = false;
+        assert_eq!(
+            group
+                .styles(RadioGroupStyles {
+                    focused: Style::new(),
+                    ..group.styles
+                })
+                .style_for(0, &options[0], state),
+            group.styles.normal
+        );
+    }
+
+    #[test]
+    fn keyboard_focus_is_paint_only() {
+        let options = [RadioOption::new("one", "One")];
+        let state = Cell::new(RadioGroupState::new(Some(0)));
+        let component = RadioGroupComponent::new("focus.radio", &options, &state);
+        let before = component.revision();
+        let mut focused = state.get();
+        focused.interaction.focused = true;
+        state.set(focused);
+        let after = component.revision();
+        assert_eq!(before.layout, after.layout);
+        assert_ne!(before.paint, after.paint);
+    }
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::RadioGroupState;
+
+    #[test]
+    fn native_snapshot_preserves_private_state_and_rejects_bad_input_atomically() {
+        let mut state = RadioGroupState::new(Some(1));
+        state.focused = Some(2);
+        state.hovered = Some(2);
+        state.pressed = Some(2);
+        let snapshot = state.snapshot();
+        let mut rebuilt = RadioGroupState::new(Some(1));
+        rebuilt.restore_snapshot(&snapshot).unwrap();
+        assert_eq!(rebuilt, state);
+        let mut malformed = snapshot.clone();
+        malformed["unknown_field"] = serde_json::json!(true);
+        assert!(rebuilt.restore_snapshot(&malformed).is_err());
+        assert_eq!(rebuilt, state);
+        assert!(rebuilt.restore_snapshot(&serde_json::Value::Null).is_err());
+        assert_eq!(rebuilt, state);
     }
 }

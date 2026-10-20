@@ -2,7 +2,7 @@
 
 use bmux_tui::component::LogicalSize;
 use bmux_tui::geometry::{Point, Rect};
-use bmux_tui::style::Style;
+use bmux_tui::style::{Modifier, Style};
 
 /// Translate pointer input without treating a clipped edge as the control origin.
 /// Outside-clip releases still reach controls to cancel pointer capture.
@@ -48,6 +48,8 @@ pub(crate) fn local_control_event(
 /// Runtime interaction flags common to interactive controls.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 #[allow(clippy::struct_excessive_bools)]
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct InteractionState {
     /// Control currently has keyboard focus.
     pub focused: bool,
@@ -60,6 +62,21 @@ pub struct InteractionState {
 }
 
 impl InteractionState {
+    /// Capture ephemeral interaction flags, not a stable wire contract.
+    #[must_use]
+    pub fn snapshot(&self) -> serde_json::Value {
+        state_snapshot(self)
+    }
+
+    /// Restore bounded interaction flags atomically.
+    ///
+    /// # Errors
+    /// Returns an error for malformed or oversized snapshots.
+    pub fn restore_snapshot(&mut self, snapshot: &serde_json::Value) -> Result<(), String> {
+        *self = decode_state_snapshot(snapshot)?;
+        Ok(())
+    }
+
     /// Create enabled interaction state with no focus/hover/press flags set.
     #[must_use]
     pub const fn new() -> Self {
@@ -85,6 +102,10 @@ impl InteractionState {
         self
     }
 }
+
+/// Default keyboard-focus overlay, visible without color or extra layout cells.
+/// Controls with a `focus_style` builder can opt out with `Style::new()`.
+pub const DEFAULT_FOCUS_STYLE: Style = Style::new().add_modifier(Modifier::UNDERLINE);
 
 /// Styles resolved from common interaction flags.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -408,5 +429,98 @@ mod tests {
         let bounds = ResizeBounds::new(Size::new(3, 4), Some(Size::new(10, 12)));
 
         assert_eq!(bounds.clamp(Size::new(1, 20)), Size::new(3, 12));
+    }
+}
+
+/// Encode only native finite state; all callers consist of serializable fields.
+pub(crate) fn state_snapshot(state: &impl serde::Serialize) -> serde_json::Value {
+    serde_json::to_value(state).expect("native control state is JSON representable")
+}
+
+pub(crate) fn decode_state_snapshot<T: serde::de::DeserializeOwned + serde::Serialize>(
+    snapshot: &serde_json::Value,
+) -> Result<T, String> {
+    validate_state_snapshot(snapshot)?;
+    let restored: T =
+        serde_json::from_value(snapshot.clone()).map_err(|error| error.to_string())?;
+    // Require the complete native shape, including explicit null optional fields.
+    // This also rejects unknown fields in nested dependency-owned editor state.
+    if state_snapshot(&restored) != *snapshot {
+        return Err("control snapshot has missing, unknown, or noncanonical fields".into());
+    }
+    Ok(restored)
+}
+
+// Bound traversal before cloning/decoding caller-supplied JSON. Collection and
+// string budgets cover expanded tree identities and editor text as well as keys.
+pub(crate) fn validate_state_snapshot(snapshot: &serde_json::Value) -> Result<(), String> {
+    fn visit(
+        value: &serde_json::Value,
+        depth: usize,
+        nodes: &mut usize,
+        bytes: &mut usize,
+    ) -> Result<(), String> {
+        if depth > 32 || *nodes == 0 {
+            return Err("control snapshot exceeds nesting or item limit".into());
+        }
+        *nodes -= 1;
+        match value {
+            serde_json::Value::String(text) => {
+                *bytes = bytes
+                    .checked_sub(text.len())
+                    .ok_or("control snapshot exceeds string limit")?;
+            }
+            serde_json::Value::Array(values) => {
+                if values.len() > *nodes {
+                    return Err("control snapshot exceeds item limit".into());
+                }
+                for value in values {
+                    visit(value, depth + 1, nodes, bytes)?;
+                }
+            }
+            serde_json::Value::Object(values) => {
+                if values.len() > *nodes {
+                    return Err("control snapshot exceeds item limit".into());
+                }
+                for (key, value) in values {
+                    *bytes = bytes
+                        .checked_sub(key.len())
+                        .ok_or("control snapshot exceeds string limit")?;
+                    visit(value, depth + 1, nodes, bytes)?;
+                }
+            }
+            serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
+            }
+        }
+        Ok(())
+    }
+    visit(snapshot, 0, &mut 16_384, &mut 262_144)
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::{InteractionState, validate_state_snapshot};
+
+    #[test]
+    fn malformed_and_oversized_input_does_not_replace_state() {
+        let mut state = InteractionState::new().focused(true);
+        let before = state;
+        let mut malformed = state.snapshot();
+        malformed["pressed"] = serde_json::json!("true");
+        assert!(state.restore_snapshot(&malformed).is_err());
+        assert_eq!(state, before);
+        assert!(validate_state_snapshot(&serde_json::json!("x".repeat(262_145))).is_err());
+        assert!(
+            validate_state_snapshot(&serde_json::Value::Array(vec![
+                serde_json::Value::Null;
+                16_385
+            ]))
+            .is_err()
+        );
+        let mut nested = serde_json::Value::Null;
+        for _ in 0..34 {
+            nested = serde_json::json!([nested]);
+        }
+        assert!(validate_state_snapshot(&nested).is_err());
     }
 }

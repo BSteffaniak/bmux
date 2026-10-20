@@ -159,6 +159,7 @@ impl<'a> ViewerComponent<'a> {
                         ViewerViewport {
                             id: format!("{id}/viewport"),
                             state: self.state,
+                            control_focused: self.focused_block.is_some(),
                             child: content,
                         },
                     ))
@@ -214,6 +215,7 @@ impl Component for BorrowedComponent<'_> {
 struct ViewerViewport<'a> {
     id: String,
     state: &'a ViewerState,
+    control_focused: bool,
     child: Element<'a>,
 }
 impl ViewerViewport<'_> {
@@ -307,6 +309,9 @@ impl Component for ViewerViewport<'_> {
         });
         if outcome.is_handled() {
             return outcome;
+        }
+        if self.control_focused && matches!(event, Event::Key(_) | Event::Paste(_)) {
+            return EventOutcome::Ignored;
         }
         let area = cx.visible_rect(LogicalRect::new(
             0,

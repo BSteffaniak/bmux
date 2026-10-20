@@ -814,6 +814,8 @@ DialogComponent::new("confirm", dialog, &state);
 
 “Save changes before leaving?” with Save and Cancel. Display-only preview.
 
+Interactive dialog: arrows or Tab/Shift-Tab traverse Save/Cancel; Enter/Space or click activates. Escape cancels; Reopen / reset starts again.
+
 <!-- bmux:block-id gallery-dialog -->
 <!-- bmux:component tui-gallery {"kind":"dialog"} -->
 
@@ -893,6 +895,8 @@ Measure → clip → route child input → scroll unhandled input → repaint.
 ```rust
 ScrollViewComponent::new("details", viewport, state, content);
 ```
+
+Focus this viewport; arrows/Page/Home/End or the wheel scroll its rows. At the edge, input yields to the slide.
 
 <!-- bmux:block-id gallery-scroll-view -->
 <!-- bmux:component tui-gallery {"kind":"scroll-view"} -->
@@ -1089,6 +1093,8 @@ Large collection → retained measurements → visible range → clipped rows.
 VirtualList::new("jobs").component(job_id, row);
 ```
 
+Focus this virtual list; arrows/Page/Home/End or the wheel scroll jobs. The offset belongs to your view.
+
 <!-- bmux:block-id gallery-virtual-list -->
 <!-- bmux:component tui-gallery {"kind":"virtual-list"} -->
 
@@ -1245,6 +1251,8 @@ A form coordinates fields; it does not become the application’s data owner.
 let invalid = form.validate_ids();
 // Compose field controls with the returned validation errors.
 ```
+
+Edit Name and Email; Tab/Shift-Tab traverses fields and Save, yielding at either boundary. Enter validates; click a field or Save to target it.
 
 <!-- bmux:block-id gallery-form -->
 <!-- bmux:component tui-gallery {"kind":"form"} -->

@@ -38,7 +38,9 @@ impl Default for ButtonStyles {
     fn default() -> Self {
         Self {
             normal: Style::new(),
-            focused: Style::new().add_modifier(Modifier::REVERSED),
+            focused: Style::new()
+                .add_modifier(Modifier::REVERSED)
+                .add_modifier(Modifier::UNDERLINE),
             hovered: Style::new().add_modifier(Modifier::UNDERLINE),
             pressed: Style::new().add_modifier(Modifier::BOLD),
             disabled: Style::new().add_modifier(Modifier::DIM),
@@ -86,13 +88,33 @@ impl Default for ButtonPolicy {
 }
 
 /// Runtime button state.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ButtonState {
     /// Common focus/hover/press/disabled state.
     pub interaction: InteractionState,
 }
 
 impl ButtonState {
+    /// Capture native caller-owned state for an in-memory control rebuild.
+    /// This is not a stable wire or durable storage contract. Reapply canonical
+    /// values and current keyboard focus after restoring a snapshot.
+    #[must_use]
+    pub fn snapshot(&self) -> serde_json::Value {
+        crate::common::state_snapshot(self)
+    }
+
+    /// Restore a bounded native rebuild snapshot, including private interaction
+    /// state. Malformed snapshots return an error without changing this state.
+    ///
+    /// # Errors
+    /// Returns an error for malformed, oversized, or incompatible snapshots.
+    pub fn restore_snapshot(&mut self, snapshot: &serde_json::Value) -> Result<(), String> {
+        let restored = crate::common::decode_state_snapshot(snapshot)?;
+        *self = restored;
+        Ok(())
+    }
+
     /// Create enabled button state.
     #[must_use]
     pub const fn new() -> Self {
@@ -312,7 +334,9 @@ impl<'a> Button<'a> {
             policy: ButtonPolicy::interactive(),
             styles: ButtonStyles {
                 normal: Style::new(),
-                focused: Style::new().add_modifier(Modifier::REVERSED),
+                focused: Style::new()
+                    .add_modifier(Modifier::REVERSED)
+                    .add_modifier(Modifier::UNDERLINE),
                 hovered: Style::new().add_modifier(Modifier::UNDERLINE),
                 pressed: Style::new().add_modifier(Modifier::BOLD),
                 disabled: Style::new().add_modifier(Modifier::DIM),
@@ -1012,5 +1036,53 @@ mod tests {
         );
 
         assert_eq!(outcome, ButtonOutcome::Ignored);
+    }
+}
+
+#[cfg(test)]
+mod focus_visual_tests {
+    use bmux_tui::style::{Modifier, Style};
+
+    use super::*;
+
+    #[test]
+    fn focus_is_visible_optional_and_disabled_takes_precedence() {
+        let control = Button::new("Label");
+        let mut state = ButtonState::new();
+        let before = control.style_for(state);
+        state.interaction.focused = true;
+        let after = control.style_for(state);
+        assert_ne!(before, after);
+        assert!(after.modifiers.contains(Modifier::UNDERLINE));
+        state.interaction.disabled = true;
+        assert_eq!(control.style_for(state), control.styles.disabled);
+        state.interaction.disabled = false;
+        let styles = ButtonStyles {
+            focused: Style::new(),
+            ..control.styles
+        };
+        assert_eq!(control.styles(styles).style_for(state), Style::new());
+    }
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::ButtonState;
+
+    #[test]
+    fn native_snapshot_preserves_private_state_and_rejects_bad_input_atomically() {
+        let mut state = ButtonState::new();
+        state.interaction.hovered = true;
+        state.interaction.pressed = true;
+        let snapshot = state.snapshot();
+        let mut rebuilt = ButtonState::new();
+        rebuilt.restore_snapshot(&snapshot).unwrap();
+        assert_eq!(rebuilt, state);
+        let mut malformed = snapshot.clone();
+        malformed["unknown_field"] = serde_json::json!(true);
+        assert!(rebuilt.restore_snapshot(&malformed).is_err());
+        assert_eq!(rebuilt, state);
+        assert!(rebuilt.restore_snapshot(&serde_json::Value::Null).is_err());
+        assert_eq!(rebuilt, state);
     }
 }

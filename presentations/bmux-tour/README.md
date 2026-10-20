@@ -43,10 +43,15 @@ The component gallery combines short API calls, simplified architectural walkthr
 
 ## Native examples
 
-All 24 component slides embed real controls through `tui-gallery`. Tab focuses
-an example; Escape returns to navigation. Keyboard-interactive examples include
-button, checkbox, breadcrumbs, radio, list, tabs, tree, table, and text input.
-Others are display-only fixtures. Code is explanatory, not evaluated Rust.
+All 24 component slides embed native examples through `tui-gallery`. Tab focuses
+only interactive controls; Escape returns to navigation (closing an open dropdown
+first). Button, checkbox, breadcrumbs, radio, dropdown, list, tabs, tree, table,
+and text input accept keyboard and pointer input. The form routes input to one of
+two fields or Save, with Tab/Shift-Tab yielding at its boundaries. Scroll-view and
+virtual-list support keyboard/wheel scrolling with view-local offsets. `[focus]`
+and native styling show per-view focus; selection is separate. Static examples are
+labelled and skipped by Tab. Dialog Save/Cancel uses native actions; Escape cancels
+and Reopen / reset starts another interaction. Code is explanatory, not evaluated Rust.
 The terminal viewer renders a fixed transcript and launches no process.
 Long walkthroughs follow the live example so it appears without scrolling.
 Use a rebuilt presenter plugin; older builds do not register `tui-gallery`.
