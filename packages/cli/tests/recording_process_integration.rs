@@ -2126,7 +2126,7 @@ fn server_sigkill_does_not_resurrect_recorded_execution_or_invent_completion() {
     let server_pid = read_pid(&runtime.join("runtime/server.pid"));
     let target_pid = read_pid(&env.root.join("target.pid"));
     assert_ne!(server_pid, target_pid);
-    let killed = Command::new("/bin/kill")
+    let killed = Command::new("kill")
         .args(["-KILL", &server_pid.to_string()])
         .output()
         .expect("kill only the dedicated recording server");
@@ -2135,7 +2135,7 @@ fn server_sigkill_does_not_resurrect_recorded_execution_or_invent_completion() {
     // Test the exact admitted target, not an unrelated process-name search.
     // Treat an unreaped zombie as dead; kill(0) alone cannot distinguish it.
     let target_running = || {
-        let output = Command::new("/bin/ps")
+        let output = Command::new("ps")
             .args(["-o", "stat=", "-p", &target_pid.to_string()])
             .output()
             .expect("inspect exact fixture target");
@@ -2152,7 +2152,7 @@ fn server_sigkill_does_not_resurrect_recorded_execution_or_invent_completion() {
     let leaked = target_running();
     if leaked {
         // Failure containment for the old independent-guardian implementation.
-        let _ = Command::new("/bin/kill")
+        let _ = Command::new("kill")
             .args(["-KILL", &target_pid.to_string()])
             .status();
     }

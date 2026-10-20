@@ -119,7 +119,9 @@ resized = False
 sent = False
 acknowledged = False
 exited = False
-deadline = time.monotonic() + (120 if mode == 'gif' else 30)
+# Pending capture deliberately exhausts the product's 30-second post-exit
+# cleanup wait, after startup/rendering. The driver must outlive that contract.
+deadline = time.monotonic() + (120 if mode == 'gif' else 60 if mode == 'pending-capture' else 30)
 try:
     while not exited:
         remaining = deadline - time.monotonic()

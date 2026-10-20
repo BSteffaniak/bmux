@@ -52,6 +52,13 @@ try:
         root = sys.argv[2]
         descendant = os.fork()
         if descendant == 0:
+            # This fixture deliberately holds capture beyond session cleanup.
+            # Same-session descendants are now correctly retired by the guardian;
+            # escape the session so only ReleaseSlave owns this holder's lifetime.
+            os.setsid()
+            # Retain only the terminal descriptors, not the supervisor's owner
+            # event/control descriptors inherited through the target launch.
+            os.closerange(3, 1024)
             signal.signal(signal.SIGHUP, signal.SIG_IGN)
             with open(root + '/slave-holder.pid', 'w') as output:
                 output.write(str(os.getpid()))

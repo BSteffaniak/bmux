@@ -13,6 +13,13 @@ use std::time::{Duration, Instant};
 #[path = "cleanup_probe.rs"]
 mod probe;
 
+#[cfg(target_os = "linux")]
+#[path = "linux_process_groups.rs"]
+mod linux_process_groups;
+#[cfg(target_os = "linux")]
+use linux_process_groups::groups;
+
+#[cfg(not(target_os = "linux"))]
 fn groups(
     session: i32,
     own_group: i32,

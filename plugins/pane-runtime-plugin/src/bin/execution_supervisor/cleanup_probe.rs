@@ -1,6 +1,7 @@
 //! Deadline-bound subprocess IO for private cleanup probes. Never signals a
 //! discovered PID: cancellation owns the still-unreaped direct Child.
 use std::io::{self, Read};
+#[cfg(any(not(target_os = "linux"), test))]
 use std::os::fd::AsRawFd;
 use std::process::{Child, Command, ExitStatus};
 use std::time::{Duration, Instant};
@@ -22,6 +23,7 @@ impl Drop for ProbeChild {
     }
 }
 
+#[cfg(any(not(target_os = "linux"), test))]
 pub(super) fn capture(
     command: &mut Command,
     deadline: Instant,
@@ -161,7 +163,9 @@ mod tests {
     }
     #[test]
     fn stalled_output_and_stalled_exit_are_deadline_bound_and_reaped() {
-        for script in ["exec /bin/sleep 60", "exec 1>&-; exec /bin/sleep 60"] {
+        // Shell builtins keep the direct child alive without /bin/sleep or
+        // grandchildren. The deadline and ProbeChild cancellation bound the loop.
+        for script in ["while :; do :; done", "exec 1>&-; while :; do :; done"] {
             let start = Instant::now();
             let mut child = ProbeChild(Some(command(script).spawn().unwrap()));
             let pid = child.0.as_ref().unwrap().id();
@@ -194,7 +198,7 @@ mod tests {
                 Err(io::Error::other("injected read failure"))
             }
         }
-        let mut child = ProbeChild(Some(command("exec /bin/sleep 60").spawn().unwrap()));
+        let mut child = ProbeChild(Some(command("while :; do :; done").spawn().unwrap()));
         let pid = child.0.as_ref().unwrap().id();
         let error = collect(
             &mut child,
@@ -228,7 +232,7 @@ mod tests {
         let start = Instant::now();
         assert_eq!(
             status(
-                &mut command("exec /bin/sleep 60"),
+                &mut command("while :; do :; done"),
                 start + Duration::from_millis(30)
             )
             .unwrap_err()

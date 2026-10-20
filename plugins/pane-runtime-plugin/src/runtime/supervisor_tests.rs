@@ -128,8 +128,8 @@ fn negotiation_failure_or_revocation_kills_and_reaps_guardian() {
         server
             .set_read_timeout(Some(std::time::Duration::from_millis(25)))
             .unwrap();
-        let child = std::process::Command::new("/bin/sleep")
-            .arg("60")
+        let child = std::process::Command::new("/bin/sh")
+            .args(["-c", "while :; do :; done"])
             .spawn()
             .unwrap();
         let pid = child.id();

@@ -693,7 +693,7 @@ fn interactive_restores_terminal_while_descendant_capture_remains_pending() {
         result["error"]
             .as_str()
             .unwrap()
-            .contains("capture pending"),
+            .contains("capture/cleanup pending after bounded owner wait"),
         "{result}"
     );
     assert!(!fixture.root.join("exports").exists());
