@@ -147,8 +147,9 @@ fn managed_root(workspace: &Path) -> Result<PathBuf> {
     }
     let root = base.join("bterm-dev").join(identity);
     // macOS sockaddr_un.sun_path is 104 bytes, including its terminating NUL.
+    // Bterm boot-scopes managed transports using the kernel's full boot UUID.
     if root
-        .join("runtime/server.sock")
+        .join("run/00000000000000000000000000000000/server.sock")
         .as_os_str()
         .as_encoded_bytes()
         .len()

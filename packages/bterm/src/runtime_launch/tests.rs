@@ -6,6 +6,60 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(unix)]
+#[tokio::test]
+async fn legacy_migration_preserves_stale_files_and_refuses_live_or_uncertain_owners() {
+    use std::os::unix::net::UnixListener;
+    let root = Root::new();
+    let mut roots = crate::runtime_paths::RuntimeRoots::from_root(root.0.clone()).unwrap();
+    roots.runtime_dir = root.0.join("run/boot-test");
+    assert!(
+        guard_legacy_managed_runtime(&roots)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let legacy = root.0.join("runtime");
+    std::fs::create_dir(&legacy).unwrap();
+    let socket = legacy.join("server.sock");
+    let claim_path = legacy.join("server-lifetime.lock");
+    // A mismatched device number from an earlier boot is not reinterpreted or
+    // rewritten. The old endpoint remains untouched in its retired namespace.
+    let receipt = "bmux-endpoint-v1 1 2\n";
+    std::fs::write(&claim_path, receipt).unwrap();
+    let owner = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&claim_path)
+        .unwrap();
+    owner.try_lock().unwrap();
+    assert!(guard_legacy_managed_runtime(&roots).await.is_err());
+    drop(owner);
+    let listener = UnixListener::bind(&socket).unwrap();
+    assert!(guard_legacy_managed_runtime(&roots).await.is_err());
+    drop(listener);
+    let guard = guard_legacy_managed_runtime(&roots).await.unwrap().unwrap();
+    assert_eq!(std::fs::read_to_string(&claim_path).unwrap(), receipt);
+    assert!(socket.exists());
+    let contender = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&claim_path)
+        .unwrap();
+    assert!(contender.try_lock().is_err());
+    drop(guard);
+    contender.try_lock().unwrap();
+    drop(contender);
+    std::fs::write(&claim_path, "unsupported receipt").unwrap();
+    assert!(guard_legacy_managed_runtime(&roots).await.is_err());
+    std::fs::remove_file(&claim_path).unwrap();
+    assert!(guard_legacy_managed_runtime(&roots).await.is_err());
+    std::fs::remove_file(&socket).unwrap();
+    std::fs::write(&socket, "not a socket").unwrap();
+    assert!(guard_legacy_managed_runtime(&roots).await.is_err());
+    std::fs::remove_file(&socket).unwrap();
+}
+
 #[test]
 fn readiness_diagnostics_distinguish_reused_and_started_without_guessing_cause() {
     let root = Root::new();

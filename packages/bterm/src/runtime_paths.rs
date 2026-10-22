@@ -2,7 +2,7 @@
 
 use std::path::{Component, Path, PathBuf};
 
-use anyhow::{Result, ensure};
+use anyhow::{Context as _, Result, ensure};
 use bmux_config::{BmuxConfig, ConfigLoadOverrides, ConfigPaths};
 
 /// A single runtime's complete configuration, endpoint, data and state namespace.
@@ -25,6 +25,35 @@ impl RuntimeRoots {
             data_dir: root.join("data"),
             state_dir: root.join("state"),
         })
+    }
+
+    /// Managed transport names are valid only for one OS boot. Durable roots do
+    /// not move, and external selections deliberately retain their exact layout.
+    pub fn managed(root: PathBuf) -> Result<Self> {
+        Self::managed_for_boot(root, &boot_identity()?)
+    }
+
+    fn managed_for_boot(root: PathBuf, boot: &str) -> Result<Self> {
+        ensure!(
+            boot.len() == 32 && boot.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "invalid OS boot identity"
+        );
+        let runtime_dir = root.join("run").join(boot);
+        let mut roots = Self::from_root(root)?;
+        // Keep the full boot UUID while fitting macOS's short sockaddr_un.
+        roots.runtime_dir = runtime_dir;
+        #[cfg(unix)]
+        ensure!(
+            roots
+                .runtime_dir
+                .join("server.sock")
+                .as_os_str()
+                .as_encoded_bytes()
+                .len()
+                < if cfg!(target_os = "macos") { 104 } else { 108 },
+            "managed socket path is too long; select a shorter absolute managed root"
+        );
+        Ok(roots)
     }
 
     /// Build BMUX's existing path model without its ambient candidate fallback chain.
@@ -72,9 +101,110 @@ pub(crate) fn validate_absolute(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Read the kernel's boot UUID, never wall time, process identity or a random
+/// per-launch value. Failure must not silently select a different namespace.
+fn boot_identity() -> Result<String> {
+    #[cfg(target_os = "linux")]
+    let value = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .context("read OS boot identity")?;
+    #[cfg(target_os = "macos")]
+    let value = {
+        let mut buffer = [0_u8; 128];
+        let mut length = buffer.len();
+        // SAFETY: name is NUL-terminated; buffer and length describe writable
+        // storage for this read-only sysctl. No new value is supplied.
+        let result = unsafe {
+            libc::sysctlbyname(
+                c"kern.bootsessionuuid".as_ptr(),
+                buffer.as_mut_ptr().cast(),
+                &raw mut length,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if result != 0 {
+            return Err(std::io::Error::last_os_error()).context("read OS boot identity");
+        }
+        ensure!(length <= buffer.len(), "oversized OS boot identity");
+        std::str::from_utf8(&buffer[..length])
+            .context("invalid OS boot identity encoding")?
+            .trim_end_matches('\0')
+            .to_owned()
+    };
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    anyhow::bail!("boot-scoped managed runtimes require Linux or macOS");
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        let value = value.trim();
+        ensure!(
+            value.len() == 36
+                && value.bytes().enumerate().all(|(index, byte)| {
+                    if [8, 13, 18, 23].contains(&index) {
+                        byte == b'-'
+                    } else {
+                        byte.is_ascii_hexdigit()
+                    }
+                }),
+            "invalid OS boot UUID"
+        );
+        Ok(value.replace('-', "").to_ascii_lowercase())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn boot_namespace_changes_only_transport_and_keeps_checkout_isolation() {
+        let root = PathBuf::from("/bterm-test");
+        let first =
+            RuntimeRoots::managed_for_boot(root.clone(), "0123456789abcdef0123456789abcdef")
+                .unwrap();
+        let again =
+            RuntimeRoots::managed_for_boot(root.clone(), "0123456789abcdef0123456789abcdef")
+                .unwrap();
+        let reboot =
+            RuntimeRoots::managed_for_boot(root.clone(), "fedcba9876543210fedcba9876543210")
+                .unwrap();
+        let external = RuntimeRoots::from_root(root).unwrap();
+        assert_eq!(first, again);
+        assert_ne!(first.runtime_dir, reboot.runtime_dir);
+        assert_ne!(first.runtime_dir, external.runtime_dir);
+        for roots in [&reboot, &external] {
+            assert_eq!(first.config_dir, roots.config_dir);
+            assert_eq!(first.data_dir, roots.data_dir);
+            assert_eq!(first.state_dir, roots.state_dir);
+        }
+        let other = RuntimeRoots::managed_for_boot(
+            PathBuf::from("/other-checkout"),
+            "0123456789abcdef0123456789abcdef",
+        )
+        .unwrap();
+        assert_ne!(first.runtime_dir, other.runtime_dir);
+        assert_ne!(first.data_dir, other.data_dir);
+        assert_ne!(first.state_dir, other.state_dir);
+    }
+
+    #[test]
+    fn boot_identity_is_stable_and_rejects_invalid_names_and_long_paths() {
+        assert_eq!(boot_identity().unwrap(), boot_identity().unwrap());
+        for invalid in [
+            "",
+            "../escape",
+            "unknown",
+            "0123456789abcdef0123456789abcdeg",
+        ] {
+            assert!(RuntimeRoots::managed_for_boot(PathBuf::from("/bterm-test"), invalid).is_err());
+        }
+        assert!(
+            RuntimeRoots::managed_for_boot(
+                PathBuf::from(format!("/{}", "x".repeat(108))),
+                "0123456789abcdef0123456789abcdef"
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn complete_roots_have_no_config_fallback() {

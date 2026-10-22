@@ -35,7 +35,7 @@ impl RuntimeSelection {
             });
         }
         Ok(Self::Managed {
-            roots: RuntimeRoots::from_root(managed_root)?,
+            roots: RuntimeRoots::managed(managed_root)?,
             companion: VerifiedCompanion::load(companion)?,
         })
     }

@@ -8,6 +8,20 @@ without ANSI capture, a browser listener, or a second layout/hit-test model.
 `--runtime-root /absolute/root` selects an external runtime, attach-only.
 It conflicts with managed companion options. Managed selection uses a verified
 BMUX companion and a complete persistent root, never a runtime-name fallback.
+On Linux and macOS, managed transports live in `run/<kernel-boot-uuid>/` under
+that root; configuration, data, and durable state stay in `config/`, `data/`,
+and `state/`. All windows in the same boot reuse the same endpoint. A reboot
+selects a fresh transport namespace without trusting persisted device numbers
+or deleting old sockets/locks. External `--runtime-root` paths retain the
+explicit `runtime/` layout and are never migrated or repaired by Bterm.
+
+When upgrading from the legacy managed `runtime/` layout, Bterm checks and
+locks its existing lifetime claim during startup. A running/starting legacy
+companion, live endpoint, or uncertain ownership blocks migration; explicitly
+stop that selected companion first. Stopped legacy files are preserved, even
+when their device-number receipt no longer matches after reboot. Old boot
+namespaces are not automatically deleted.
+
 Window closure detaches; it does not stop the companion or its executions.
 Failures are printed to stderr and return a failing process status.
 

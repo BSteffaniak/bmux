@@ -157,6 +157,7 @@ pub async fn connect_selection(
             Err(error) => bail!("runtime reconciliation lock unavailable: {error}"),
         }
     }
+    let _legacy_claim = guard_legacy_managed_runtime(roots).await?;
     let mut repaired = false;
     loop {
         let outcome = ensure_runtime(&spec, || probe_paths(&paths, timeout)).await?;
@@ -341,6 +342,80 @@ fn readiness_failure_context(outcome: RuntimeLaunchOutcome, spec: &RuntimeLaunch
         spec.executable.display(),
         spec.diagnostic_file.display(),
     )
+}
+
+/// Do not bypass a live pre-boot-namespace companion sharing the durable roots.
+/// Keep its existing lifetime claim locked through startup admission. Stale files
+/// are preserved: a device mismatch here is not permission to unlink anything.
+async fn guard_legacy_managed_runtime(
+    roots: &crate::runtime_paths::RuntimeRoots,
+) -> Result<Option<std::fs::File>> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
+        let root = roots.config_dir.parent().context("missing managed root")?;
+        let legacy = root.join("runtime");
+        if roots.runtime_dir == legacy {
+            return Ok(None);
+        }
+        let claim_path = legacy.join("server-lifetime.lock");
+        let claim = match OpenOptions::new().read(true).write(true).open(&claim_path) {
+            Ok(file) => {
+                file.try_lock().context(
+                    "legacy managed runtime is running or starting; explicitly stop it before migrating",
+                )?;
+                let named = std::fs::symlink_metadata(&claim_path)?;
+                let opened = file.metadata()?;
+                anyhow::ensure!(
+                    named.is_file() && named.dev() == opened.dev() && named.ino() == opened.ino(),
+                    "legacy lifetime claim was replaced"
+                );
+                use std::io::{Read as _, Seek as _};
+                anyhow::ensure!(opened.len() <= 128, "oversized legacy ownership receipt");
+                let mut receipt = String::new();
+                let mut reader = &file;
+                reader.rewind()?;
+                reader.read_to_string(&mut receipt)?;
+                if !receipt.is_empty() {
+                    let parts: Vec<_> = receipt.split_whitespace().collect();
+                    anyhow::ensure!(
+                        parts.len() == 3
+                            && parts[0] == "bmux-endpoint-v1"
+                            && parts[1].parse::<u64>().is_ok()
+                            && parts[2].parse::<u64>().is_ok()
+                            && receipt == format!("bmux-endpoint-v1 {} {}\n", parts[1], parts[2]),
+                        "unsupported or corrupt legacy ownership receipt"
+                    );
+                }
+                Some(file)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error).context("inspect legacy lifetime claim"),
+        };
+        let socket = legacy.join("server.sock");
+        match std::fs::symlink_metadata(&socket) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(claim),
+            Err(error) => return Err(error).context("inspect legacy endpoint"),
+            Ok(metadata) => anyhow::ensure!(
+                metadata.file_type().is_socket() && claim.is_some(),
+                "legacy endpoint has uncertain ownership; refusing migration"
+            ),
+        }
+        match tokio::time::timeout(
+            Duration::from_millis(500),
+            tokio::net::UnixStream::connect(socket),
+        )
+        .await
+        {
+            Ok(Err(error)) if error.kind() == std::io::ErrorKind::ConnectionRefused => Ok(claim),
+            _ => bail!("legacy managed endpoint is live or uncertain; refusing migration"),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = roots;
+        Ok(None)
+    }
 }
 
 fn runtime_incompatibility(error: &anyhow::Error) -> Option<String> {
