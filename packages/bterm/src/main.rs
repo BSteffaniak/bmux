@@ -4,7 +4,7 @@
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
-    match bmux_bterm::app::run() {
+    match bterm::app::run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("bterm: {error:#}");

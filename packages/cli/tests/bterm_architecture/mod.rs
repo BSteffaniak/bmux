@@ -121,14 +121,28 @@ fn assert_boundary(graph: &Graph, start: &str, denied: impl Fn(&str) -> bool) {
 fn native_backend(package: &str) -> bool {
     matches!(
         package,
-        "bmux_native_platform"
-            | "bmux_native_renderer"
-            | "bmux_bterm"
+        "bterm_native_platform"
+            | "bterm_native_renderer"
+            | "bterm"
             | "winit"
             | "wgpu"
             | "softbuffer"
             | "accesskit_winit"
     )
+}
+
+#[test]
+fn bterm_packages_use_product_namespace() {
+    let graph = workspace_graph(&root());
+    for package in ["bterm", "bterm_native_platform", "bterm_native_renderer"] {
+        assert!(graph.contains_key(package), "missing package {package}");
+    }
+    for package in ["bmux_bterm", "bmux_native_platform", "bmux_native_renderer"] {
+        assert!(
+            !graph.contains_key(package),
+            "obsolete Bterm package name {package}"
+        );
+    }
 }
 
 #[test]
@@ -158,8 +172,8 @@ fn bterm_native_mechanisms_do_not_own_plugin_or_browser_runtime() {
     let graph = workspace_graph(&root());
     for package in [
         "bmux_frontend_runtime",
-        "bmux_native_platform",
-        "bmux_native_renderer",
+        "bterm_native_platform",
+        "bterm_native_renderer",
     ] {
         let denied = |dependency: &str| {
             (dependency.ends_with("_plugin") && dependency != "bmux_plugin")

@@ -5,7 +5,7 @@ description = "Owned native window and event interfaces for Bterm"
 edition     = { workspace = true }
 keywords    = ["bmux", "terminal", "native"]
 license     = { workspace = true }
-name        = "bmux_native_platform"
+name        = "bterm_native_platform"
 readme      = "README.md"
 repository  = { workspace = true }
 version     = { workspace = true }

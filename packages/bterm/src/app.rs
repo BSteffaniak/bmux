@@ -6,10 +6,10 @@
 //! without acknowledging output or advancing committed interaction state.
 
 use anyhow::{Context, Result, bail};
-use bmux_native_platform::{
+use bterm_native_platform::{
     PlatformError, PlatformEvent, WindowApplication, WindowContext, WindowMetrics, WindowOptions,
 };
-use bmux_native_renderer::{NativeRenderer, RendererOptions};
+use bterm_native_renderer::{NativeRenderer, RendererOptions};
 use clap::Parser;
 use std::path::PathBuf;
 
@@ -97,7 +97,7 @@ pub trait AttachWorker: 'static {
     fn accessibility(
         &mut self,
         identity: bmux_frontend_runtime::presentation::PresentationIdentity,
-        action: bmux_native_platform::accessibility::AccessibilityAction,
+        action: bterm_native_platform::accessibility::AccessibilityAction,
     ) -> Result<()>;
 }
 
@@ -164,8 +164,8 @@ pub struct Application<W: AttachWorker> {
     metrics: Option<WindowMetrics>,
     retry: RetryBudget,
     clipboard: Result<
-        bmux_native_platform::clipboard::Clipboard,
-        bmux_native_platform::clipboard::ClipboardError,
+        bterm_native_platform::clipboard::Clipboard,
+        bterm_native_platform::clipboard::ClipboardError,
     >,
 }
 
@@ -191,7 +191,7 @@ impl<W: AttachWorker> Application<W> {
             retained_output: None,
             metrics: None,
             retry: RetryBudget::default(),
-            clipboard: bmux_native_platform::clipboard::Clipboard::new(),
+            clipboard: bterm_native_platform::clipboard::Clipboard::new(),
         })
     }
 
@@ -334,7 +334,7 @@ impl<W: AttachWorker> Application<W> {
                                 if let Err(error) = context.commit_accessibility(
                                     *semantic_generation,
                                     delivery.prepared.semantics(),
-                                    bmux_native_platform::accessibility::AccessibilityGeometry {
+                                    bterm_native_platform::accessibility::AccessibilityGeometry {
                                         clip: delivery.prepared.buffer().area(),
                                         origin_x: 0.0,
                                         origin_y: 0.0,
@@ -351,7 +351,7 @@ impl<W: AttachWorker> Application<W> {
                                     delivery.prepared.cursor().filter(|cursor| cursor.visible)
                                 {
                                     context.set_ime_cursor_area(
-                                        bmux_native_platform::PhysicalRect {
+                                        bterm_native_platform::PhysicalRect {
                                             x: (f32::from(cursor.position.x) * cell[0]) as i32,
                                             y: (f32::from(cursor.position.y) * cell[1]) as i32,
                                             width: cell[0].ceil() as u32,
@@ -638,7 +638,7 @@ impl AttachWorker for BmuxWorker {
     fn accessibility(
         &mut self,
         identity: bmux_frontend_runtime::presentation::PresentationIdentity,
-        action: bmux_native_platform::accessibility::AccessibilityAction,
+        action: bterm_native_platform::accessibility::AccessibilityAction,
     ) -> Result<()> {
         if let Some(handle) = &self.handle {
             handle.try_send(bmux_cli::attach::NativeAttachEvent::Accessibility {
@@ -711,7 +711,7 @@ impl AttachWorker for BmuxWorker {
 
 /// Open the real platform host with an existing BMUX frontend integration.
 pub fn run_window(worker: impl AttachWorker) -> Result<()> {
-    bmux_native_platform::run(WindowOptions::default(), Application::new(worker)?)
+    bterm_native_platform::run(WindowOptions::default(), Application::new(worker)?)
         .context("run native window")
 }
 

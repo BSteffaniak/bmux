@@ -1,4 +1,4 @@
-# bmux_native_renderer
+# bterm_native_renderer
 
 Window-owned GPU output for BMUX's retained `PreparedPresentation`. This crate
 projects existing cell/image geometry into physical pixels; it does not own

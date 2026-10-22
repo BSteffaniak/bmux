@@ -31,6 +31,18 @@ success. The observer receives success only after actual renderer presentation.
 Closing/dropping the receiver rejects blocked publication. Pixel metrics project
 presentation cells independently of execution geometry.
 
+## Package ownership
+
+The application package and executable are `bterm`. Bterm-owned native backends
+are `bterm_native_platform` and `bterm_native_renderer`; new Bterm-specific crates
+use the `bterm_*` prefix. Shared attachment, presentation, fonts, protocols, and
+plugin contracts retain their existing BMUX names. Inclusion in Bterm's dependency
+tree does not make a crate Bterm-specific.
+
+Build the frontend with `cargo build -p bterm --bin bterm`, or build its verified
+companion bundle with `cargo xtask bterm build`. Package naming does not change
+runtime roots, executable names, or attachment and recovery contracts.
+
 ## Integration
 
 The native frontend currently hosts the existing `bmux_cli::attach` orchestrator

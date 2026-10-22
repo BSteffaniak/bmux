@@ -1,0 +1,27 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Native GPU rendering of BMUX retained presentation"
+edition     = { workspace = true }
+keywords    = ["bmux", "terminal", "native"]
+license     = { workspace = true }
+name        = "bterm_native_renderer"
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+bmux_fonts            = { workspace = true, features = ["bundled-nerd-fonts"] }
+bmux_tui              = { workspace = true }
+bterm_native_platform = { workspace = true, features = ["renderer-adapter"] }
+bytemuck              = { workspace = true, features = ["derive"] }
+fontdb                = { workspace = true }
+image                 = { workspace = true }
+pollster              = { workspace = true }
+swash                 = { workspace = true }
+thiserror             = { workspace = true }
+wgpu                  = { workspace = true }
+
+[features]
+default          = []
+fail-on-warnings = []

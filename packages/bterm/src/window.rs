@@ -3,7 +3,7 @@
 
 use anyhow::{Result, anyhow, bail};
 use bmux_frontend_runtime::presentation::PreparedDelivery;
-use bmux_native_platform::PlatformProxy;
+use bterm_native_platform::PlatformProxy;
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
@@ -186,7 +186,7 @@ impl NativeOutput {
         let deadline = Instant::now() + OUTPUT_TIMEOUT;
         self.check(deadline)?;
         if let bmux_cli::attach::NativeClipboardRequest::WriteText(text) = &request
-            && text.len() > bmux_native_platform::clipboard::MAX_CLIPBOARD_BYTES
+            && text.len() > bterm_native_platform::clipboard::MAX_CLIPBOARD_BYTES
         {
             bail!("native clipboard payload exceeds transfer budget");
         }
@@ -263,8 +263,8 @@ impl NativeOutputReceiver {
     pub(crate) fn service_clipboard(
         &self,
         clipboard: &mut Result<
-            bmux_native_platform::clipboard::Clipboard,
-            bmux_native_platform::clipboard::ClipboardError,
+            bterm_native_platform::clipboard::Clipboard,
+            bterm_native_platform::clipboard::ClipboardError,
         >,
     ) {
         if let Ok(pending) = self.clipboard.try_recv() {
@@ -484,7 +484,7 @@ mod tests {
         notification.recv_timeout(Duration::from_secs(1)).unwrap();
         assert!(!worker.is_finished());
         receiver.service_clipboard(&mut Err(
-            bmux_native_platform::clipboard::ClipboardError::Unavailable,
+            bterm_native_platform::clipboard::ClipboardError::Unavailable,
         ));
         assert!(worker.join().unwrap().is_err());
     }
@@ -501,7 +501,7 @@ mod tests {
         receiver.close();
         assert!(worker.join().unwrap().is_err());
         receiver.service_clipboard(&mut Err(
-            bmux_native_platform::clipboard::ClipboardError::Unavailable,
+            bterm_native_platform::clipboard::ClipboardError::Unavailable,
         ));
     }
 

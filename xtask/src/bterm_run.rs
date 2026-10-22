@@ -199,12 +199,7 @@ pub(crate) fn build(workspace: &Path) -> Result<BuiltBundle> {
         .map_err(|err| error(format!("another bterm build/run may be active: {err}")))?;
     let mut arguments =
         crate::build::arguments(&target, "dev", &crate::artifacts::declarations(workspace)?)?;
-    arguments.extend([
-        "-p".into(),
-        "bmux_bterm".into(),
-        "--bin".into(),
-        "bterm".into(),
-    ]);
+    arguments.extend(["-p".into(), "bterm".into(), "--bin".into(), "bterm".into()]);
     let status = cargo().args(arguments).current_dir(workspace).status()?;
     if !status.success() {
         return Err(error(format!("bterm build failed: {status}")));

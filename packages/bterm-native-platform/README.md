@@ -1,4 +1,4 @@
-# bmux_native_platform
+# bterm_native_platform
 
 Native main-thread window/event-loop host for Bterm. Linux (X11/Wayland) and
 macOS use Winit privately; the initial Windows entry explicitly returns

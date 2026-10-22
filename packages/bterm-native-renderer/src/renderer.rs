@@ -5,11 +5,11 @@ use crate::{
     images,
     text::{BitmapFormat, TextRasterizer, TextStyle},
 };
-use bmux_native_platform::{PhysicalSize, SurfaceTarget};
 use bmux_tui::{
     presentation::PreparedPresentation,
     style::{Color, Modifier},
 };
+use bterm_native_platform::{PhysicalSize, SurfaceTarget};
 use std::collections::HashMap;
 
 /// Window-local raster and framebuffer configuration. Sizes are physical except font_size.

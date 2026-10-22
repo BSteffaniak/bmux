@@ -3,7 +3,8 @@ on:
   pull_request:
     paths:
       - 'packages/bterm/**'
-      - 'packages/native-*/**'
+      - 'packages/bterm-native-platform/**'
+      - 'packages/bterm-native-renderer/**'
       - 'packages/frontend-runtime/**'
       - 'xtask/**'
       - 'Cargo.toml'
@@ -42,7 +43,7 @@ jobs:
         shell: bash
         run: |
           cargo xtask build --target '${{ matrix.target }}'
-          cargo build --locked --target '${{ matrix.target }}' -p bmux_bterm --bin bterm
+          cargo build --locked --target '${{ matrix.target }}' -p bterm --bin bterm
       - name: Stage and verify installed artifacts
         shell: bash
         run: |

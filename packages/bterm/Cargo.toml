@@ -1,11 +1,11 @@
 [package]
 authors     = { workspace = true }
 categories  = ["development-tools"]
-description = "BMUX native minimal desktop window"
+description = "Bterm native terminal window powered by BMUX"
 edition     = { workspace = true }
-keywords    = ["bmux", "terminal", "native"]
+keywords    = ["bterm", "bmux", "terminal", "native"]
 license     = { workspace = true }
-name        = "bmux_bterm"
+name        = "bterm"
 readme      = "README.md"
 repository  = { workspace = true }
 version     = { workspace = true }
@@ -21,9 +21,9 @@ bmux_client = { workspace = true }
 bmux_config = { workspace = true }
 bmux_frontend_runtime = { workspace = true }
 bmux_ipc = { workspace = true }
-bmux_native_platform = { workspace = true }
-bmux_native_renderer = { workspace = true }
 bmux_pane_runtime_plugin_api = { workspace = true }
+bterm_native_platform = { workspace = true }
+bterm_native_renderer = { workspace = true }
 clap = { workspace = true, features = [
     "derive",
     "std",

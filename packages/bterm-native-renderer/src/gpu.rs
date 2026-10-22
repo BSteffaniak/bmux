@@ -1,6 +1,6 @@
 //! Private bounded texture upload and a single alpha-blended quad batch.
 use crate::renderer::RenderError;
-use bmux_native_platform::{PhysicalSize, SurfaceTarget};
+use bterm_native_platform::{PhysicalSize, SurfaceTarget};
 use std::sync::{Arc, Mutex};
 use wgpu::util::DeviceExt;
 

@@ -19,8 +19,8 @@ members = [
     "packages/bmux",
     "packages/bterm",
     "packages/frontend-runtime",
-    "packages/native-platform",
-    "packages/native-renderer",
+    "packages/bterm-native-platform",
+    "packages/bterm-native-renderer",
     "packages/codec",
     "packages/codec-derive",
     "packages/fonts",
@@ -179,8 +179,8 @@ accesskit = { version = "0.21.1", default-features = false }
 accesskit_winit = { version = "0.29.2", default-features = false }
 arc-swap = { version = "1.9", default-features = false }
 bmux_frontend_runtime = { version = "0.0.1-alpha.4", default-features = false, path = "packages/frontend-runtime" }
-bmux_native_platform = { version = "0.0.1-alpha.4", default-features = false, path = "packages/native-platform" }
-bmux_native_renderer = { version = "0.0.1-alpha.4", default-features = false, path = "packages/native-renderer" }
+bterm_native_platform = { version = "0.0.1-alpha.4", default-features = false, path = "packages/bterm-native-platform" }
+bterm_native_renderer = { version = "0.0.1-alpha.4", default-features = false, path = "packages/bterm-native-renderer" }
 bytemuck = { version = "1.25", default-features = false }
 cranelift-codegen = { version = "0.136.3", default-features = false, features = [
     "all-native-arch",

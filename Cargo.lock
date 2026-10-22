@@ -1662,28 +1662,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "bmux_bterm"
-version = "0.0.1-alpha.4"
-dependencies = [
- "anyhow",
- "bmux_cli",
- "bmux_client",
- "bmux_config",
- "bmux_frontend_runtime",
- "bmux_ipc",
- "bmux_native_platform",
- "bmux_native_renderer",
- "bmux_pane_runtime_plugin_api",
- "bmux_tui 0.0.1-alpha.4",
- "clap",
- "libc",
- "serde",
- "serde_json",
- "sha2 0.11.0",
- "tokio",
-]
-
-[[package]]
 name = "bmux_cli"
 version = "0.0.1-alpha.4"
 dependencies = [
@@ -2428,36 +2406,6 @@ dependencies = [
  "thiserror 2.0.20",
  "uniffi",
  "uuid",
-]
-
-[[package]]
-name = "bmux_native_platform"
-version = "0.0.1-alpha.4"
-dependencies = [
- "accesskit",
- "accesskit_winit",
- "arboard",
- "bmux_frontend_runtime",
- "bmux_tui 0.0.1-alpha.4",
- "raw-window-handle",
- "thiserror 2.0.20",
- "winit",
-]
-
-[[package]]
-name = "bmux_native_renderer"
-version = "0.0.1-alpha.4"
-dependencies = [
- "bmux_fonts",
- "bmux_native_platform",
- "bmux_tui 0.0.1-alpha.4",
- "bytemuck",
- "fontdb",
- "image",
- "pollster",
- "swash",
- "thiserror 2.0.20",
- "wgpu",
 ]
 
 [[package]]
@@ -3567,6 +3515,58 @@ checksum = "5cee35f73844aa3014bb606320a6c1f010249dbdf43342fe54b5a4f6a8ed4b79"
 dependencies = [
  "memchr",
  "serde_core",
+]
+
+[[package]]
+name = "bterm"
+version = "0.0.1-alpha.4"
+dependencies = [
+ "anyhow",
+ "bmux_cli",
+ "bmux_client",
+ "bmux_config",
+ "bmux_frontend_runtime",
+ "bmux_ipc",
+ "bmux_pane_runtime_plugin_api",
+ "bmux_tui 0.0.1-alpha.4",
+ "bterm_native_platform",
+ "bterm_native_renderer",
+ "clap",
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tokio",
+]
+
+[[package]]
+name = "bterm_native_platform"
+version = "0.0.1-alpha.4"
+dependencies = [
+ "accesskit",
+ "accesskit_winit",
+ "arboard",
+ "bmux_frontend_runtime",
+ "bmux_tui 0.0.1-alpha.4",
+ "raw-window-handle",
+ "thiserror 2.0.20",
+ "winit",
+]
+
+[[package]]
+name = "bterm_native_renderer"
+version = "0.0.1-alpha.4"
+dependencies = [
+ "bmux_fonts",
+ "bmux_tui 0.0.1-alpha.4",
+ "bterm_native_platform",
+ "bytemuck",
+ "fontdb",
+ "image",
+ "pollster",
+ "swash",
+ "thiserror 2.0.20",
+ "wgpu",
 ]
 
 [[package]]
