@@ -1,9 +1,139 @@
 //! Complete, explicit BMUX roots. Resolution never consults environment variables.
 
+use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context as _, Result, ensure};
 use bmux_config::{BmuxConfig, ConfigLoadOverrides, ConfigPaths};
+
+/// Bterm's own locations, independent of host BMUX selectors and runtime roots.
+/// Capturing these paths never creates directories or opens a companion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BtermPaths {
+    pub config_dir: PathBuf,
+    pub data_dir: PathBuf,
+    pub state_dir: PathBuf,
+    pub log_dir: PathBuf,
+    pub cache_dir: PathBuf,
+}
+
+impl BtermPaths {
+    /// Fully isolated locations for an explicitly selected managed root.
+    pub fn from_root(root: PathBuf) -> Result<Self> {
+        validate_absolute(&root)?;
+        Ok(Self {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            state_dir: root.join("state"),
+            log_dir: root.join("logs"),
+            cache_dir: root.join("cache"),
+        })
+    }
+
+    /// Resolve only the supplied environment snapshot. BMUX variables are ignored.
+    pub fn from_environment(cwd: &Path, env: &BTreeMap<String, OsString>) -> Result<Self> {
+        Self::for_application("bterm", "BTERM", cwd, env)
+    }
+
+    pub(crate) fn for_application(
+        application: &str,
+        prefix: &str,
+        cwd: &Path,
+        env: &BTreeMap<String, OsString>,
+    ) -> Result<Self> {
+        validate_absolute(cwd)?;
+        let home = env
+            .get("HOME")
+            .or_else(|| env.get("USERPROFILE"))
+            .map(PathBuf::from);
+        let selected = |name: &str, fallback: Result<PathBuf>| -> Result<PathBuf> {
+            let path = if let Some(value) = env.get(&format!("{prefix}_{name}_DIR")) {
+                PathBuf::from(value)
+            } else {
+                fallback?
+            };
+            let path = if path.is_absolute() {
+                path
+            } else {
+                cwd.join(path)
+            };
+            validate_absolute(&path)?;
+            Ok(path)
+        };
+        let base = |key: &str, suffix: &str| -> Result<PathBuf> {
+            if let Some(value) = env.get(key) {
+                return Ok(PathBuf::from(value));
+            }
+            Ok(home
+                .as_ref()
+                .context("home directory missing from captured environment")?
+                .join(suffix))
+        };
+        let config = if cfg!(target_os = "macos") {
+            base("XDG_CONFIG_HOME", "Library/Application Support")
+        } else if cfg!(windows) {
+            base("APPDATA", "AppData/Roaming")
+        } else {
+            base("XDG_CONFIG_HOME", ".config")
+        };
+        let data = if cfg!(target_os = "macos") {
+            base("XDG_DATA_HOME", "Library/Application Support")
+        } else if cfg!(windows) {
+            base("LOCALAPPDATA", "AppData/Local")
+        } else {
+            base("XDG_DATA_HOME", ".local/share")
+        };
+        let state = base("XDG_STATE_HOME", ".local/state");
+        let cache = if cfg!(target_os = "macos") {
+            base("XDG_CACHE_HOME", "Library/Caches")
+        } else {
+            base("XDG_CACHE_HOME", ".cache")
+        };
+        let state_dir = selected("STATE", state.map(|path| path.join(application)))?;
+        let log_default = if cfg!(target_os = "macos") {
+            base("XDG_LOG_HOME", "Library/Logs").map(|path| path.join(application))
+        } else {
+            Ok(state_dir.join("logs"))
+        };
+        Ok(Self {
+            config_dir: selected("CONFIG", config.map(|path| path.join(application)))?,
+            data_dir: selected("DATA", data.map(|path| path.join(application)))?,
+            state_dir,
+            log_dir: selected("LOG", log_default)?,
+            cache_dir: selected("CACHE", cache.map(|path| path.join(application)))?,
+        })
+    }
+
+    #[must_use]
+    pub fn config_file(&self) -> PathBuf {
+        self.config_dir.join("bterm.toml")
+    }
+
+    #[must_use]
+    pub fn state_config_file(&self) -> PathBuf {
+        self.state_dir.join("config-overlay.toml")
+    }
+
+    #[must_use]
+    pub fn default_managed_root(&self) -> PathBuf {
+        self.state_dir.join("bmux")
+    }
+
+    /// Boot-scoped transport plus Bterm-owned durable state; no BMUX selector
+    /// can redirect these writable roots. The config directory is for private
+    /// launch snapshots, not Bterm source discovery.
+    pub fn managed_roots(&self) -> Result<RuntimeRoots> {
+        let mut roots = RuntimeRoots::managed(self.default_managed_root())?;
+        // Older Bterm versions stored principal/plugin data beside runtime state.
+        // Keep that canonical location when present; never silently replace it
+        // with a fresh identity merely to adopt the split directory defaults.
+        if !roots.data_dir.try_exists()? {
+            roots.data_dir = self.data_dir.join("bmux");
+        }
+        Ok(roots)
+    }
+}
 
 /// A single runtime's complete configuration, endpoint, data and state namespace.
 #[derive(Debug, Clone, PartialEq, Eq)]

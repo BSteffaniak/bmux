@@ -67,6 +67,23 @@ pub enum RuntimeLaunchOutcome {
 pub async fn connect_selection(
     selection: &crate::runtime_selection::RuntimeSelection,
 ) -> Result<bmux_client::BmuxClient> {
+    connect_selection_inner(selection, None).await
+}
+
+/// Start a managed companion with the same immutable BMUX configuration used by
+/// its frontend. A live companion with a different generation is never restarted
+/// or silently reconfigured by opening another window.
+pub async fn connect_selection_configured(
+    selection: &crate::runtime_selection::RuntimeSelection,
+    configuration: &crate::configuration::ResolvedConfiguration,
+) -> Result<bmux_client::BmuxClient> {
+    connect_selection_inner(selection, Some(configuration)).await
+}
+
+async fn connect_selection_inner(
+    selection: &crate::runtime_selection::RuntimeSelection,
+    configuration: Option<&crate::configuration::ResolvedConfiguration>,
+) -> Result<bmux_client::BmuxClient> {
     use crate::runtime_selection::RuntimeSelection;
     let roots = selection.roots();
     let paths = roots.config_paths();
@@ -117,7 +134,10 @@ pub async fn connect_selection(
         unreachable!()
     };
     let mut environment: BTreeMap<OsString, OsString> = std::env::vars_os()
-        .filter(|(key, _)| !key.to_string_lossy().starts_with("BMUX_"))
+        .filter(|(key, _)| {
+            let key = key.to_string_lossy();
+            !key.starts_with("BMUX_") && !key.starts_with("BTERM_")
+        })
         .collect();
     for (key, value) in [
         ("BMUX_CONFIG_DIR", &roots.config_dir),
@@ -127,7 +147,13 @@ pub async fn connect_selection(
     ] {
         environment.insert(key.into(), value.as_os_str().to_owned());
     }
-    let spec = RuntimeLaunchSpec {
+    if let Some(configuration) = configuration {
+        environment.insert(
+            "BMUX_LOG_DIR".into(),
+            configuration.inputs.paths.log_dir.as_os_str().to_owned(),
+        );
+    }
+    let mut spec = RuntimeLaunchSpec {
         executable: companion.executable.clone(),
         arguments: ["server", "start", "--foreground-internal"]
             .into_iter()
@@ -158,6 +184,23 @@ pub async fn connect_selection(
         }
     }
     let _legacy_claim = guard_legacy_managed_runtime(roots).await?;
+    let configuration = configuration.map(|configuration| configuration.bmux_toml.as_bytes());
+    let config_generation = configuration.map(configuration_digest);
+    if let Some(bytes) = configuration {
+        let generation = config_generation.as_deref().unwrap();
+        let snapshot = roots
+            .runtime_dir
+            .join(format!("configuration-{generation}.toml"));
+        write_configuration_snapshot(&snapshot, bytes)?;
+        spec.arguments.splice(
+            0..0,
+            [OsString::from("--config"), snapshot.into_os_string()],
+        );
+        // A snapshot already contains its selected base/profile layers. Ambient
+        // slot inheritance must not add host configuration underneath it.
+        spec.environment
+            .insert("BMUX_NO_BASE_CONFIG".into(), "1".into());
+    }
     let mut repaired = false;
     loop {
         let outcome = ensure_runtime(&spec, || probe_paths(&paths, timeout)).await?;
@@ -174,10 +217,36 @@ pub async fn connect_selection(
         .context("runtime readiness timed out")?
         .with_context(|| readiness_failure_context(outcome, &spec))?;
         let receipt_path = roots.runtime_dir.join("companion-activation.json");
-        let receipt = serde_json::json!({
+        let existing_receipt = match std::fs::read(&receipt_path) {
+            Ok(bytes) => Some(
+                serde_json::from_slice::<serde_json::Value>(&bytes)
+                    .context("corrupt managed activation receipt")?,
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error).context("read managed activation receipt"),
+        };
+        if matches!(outcome, RuntimeLaunchOutcome::AlreadyRunning)
+            && let Some(generation) = &config_generation
+        {
+            anyhow::ensure!(
+                existing_receipt.as_ref().is_some_and(|receipt| {
+                    receipt
+                        .get("configuration_sha256")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(generation.as_str())
+                        && receipt.get("instance") == Some(&serde_json::json!(readiness.instance))
+                }),
+                "selected companion uses a different or unproved configuration generation; \
+                 explicitly stop only this runtime before applying changed configuration"
+            );
+        }
+        let mut receipt = serde_json::json!({
             "schema_version": 1, "instance": readiness.instance,
             "executable_sha256": readiness.executable_sha256,
         });
+        if let Some(generation) = &config_generation {
+            receipt["configuration_sha256"] = generation.clone().into();
+        }
         let owned = if matches!(outcome, RuntimeLaunchOutcome::Started { pid } if pid == readiness.process_id)
             && readiness.executable_sha256.as_deref() == Some(companion.sha256.as_str())
         {
@@ -342,6 +411,54 @@ fn readiness_failure_context(outcome: RuntimeLaunchOutcome, spec: &RuntimeLaunch
         spec.executable.display(),
         spec.diagnostic_file.display(),
     )
+}
+
+fn configuration_digest(bytes: &[u8]) -> String {
+    use sha2::{Digest as _, Sha256};
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn write_configuration_snapshot(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write as _;
+    if path.symlink_metadata().is_ok() {
+        anyhow::ensure!(
+            std::fs::symlink_metadata(path)?.file_type().is_file() && std::fs::read(path)? == bytes,
+            "managed configuration snapshot changed or is not a regular file"
+        );
+        return Ok(());
+    }
+    // Startup reconciliation holds the runtime lock. Only this staging name may
+    // be left incomplete by a crash; the immutable digest name is published only
+    // after all contents are durable. Never truncate a pre-existing staging file.
+    let temporary = path.with_extension("next");
+    if let Ok(metadata) = std::fs::symlink_metadata(&temporary) {
+        anyhow::ensure!(metadata.is_file(), "invalid configuration staging file");
+        std::fs::remove_file(&temporary)?;
+    }
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(&temporary)
+        .context("create private configuration staging file")?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(&temporary, path).context("publish private configuration snapshot")?;
+    #[cfg(unix)]
+    std::fs::File::open(
+        path.parent()
+            .context("configuration snapshot has no parent")?,
+    )?
+    .sync_all()?;
+    Ok(())
 }
 
 /// Do not bypass a live pre-boot-namespace companion sharing the durable roots.

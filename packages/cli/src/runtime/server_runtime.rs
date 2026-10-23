@@ -153,8 +153,17 @@ pub(super) fn write_server_pid_file(pid: u32) -> Result<()> {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed creating runtime dir {}", parent.display()))?;
     }
-    std::fs::write(&path, pid.to_string())
-        .with_context(|| format!("failed writing pid file {}", path.display()))
+    publish_server_pid_file(&path, pid)
+}
+
+fn publish_server_pid_file(path: &std::path::Path, pid: u32) -> Result<()> {
+    // Readers reclaim malformed PID files. Publish only a complete value so a
+    // concurrent readiness/stop probe cannot unlink a partially written PID.
+    let temporary = path.with_extension(format!("{}.next", std::process::id()));
+    std::fs::write(&temporary, pid.to_string())
+        .with_context(|| format!("failed staging pid file {}", temporary.display()))?;
+    std::fs::rename(&temporary, path)
+        .with_context(|| format!("failed publishing pid file {}", path.display()))
 }
 
 pub(super) fn read_server_pid_file() -> Result<Option<u32>> {
@@ -276,6 +285,28 @@ mod tests {
     use crate::runtime::attach::runtime::describe_timeout;
     use crate::runtime::server_commands::server_event_name;
     use bmux_config::ResolvedTimeout;
+
+    #[test]
+    fn pid_publication_never_exposes_partial_contents() {
+        let root = std::env::temp_dir().join(format!("bmux-pid-publish-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("server.pid");
+        publish_server_pid_file(&path, 111).unwrap();
+        std::thread::scope(|scope| {
+            let path = &path;
+            scope.spawn(move || {
+                for _ in 0..500 {
+                    publish_server_pid_file(path, 222).unwrap();
+                }
+            });
+            for _ in 0..500 {
+                let content = std::fs::read_to_string(path).unwrap();
+                assert!(matches!(parse_pid_content(&content), Some(111 | 222)));
+            }
+        });
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
 
     #[test]
     fn describe_timeout_formats_resolved_timeout_states() {

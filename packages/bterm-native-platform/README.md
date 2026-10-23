@@ -11,6 +11,16 @@ physical pixels and scale together; these are not terminal execution dimensions.
 Suspension and zero drawable extents suppress redraw delivery. Callback errors
 terminate the loop and are returned to the caller.
 
+`WindowOptions::decorations` defaults to `true`. Set it to `false` before `run`
+to request a window without native titlebar/chrome. The option is passed to
+Winit's native window creation on macOS and Linux (X11/Wayland), not a renderer
+or terminal layout toggle. Native decoration requests remain subject to the
+window manager/compositor. Resizability and focus options, input routing,
+clipboard ownership, and accessibility attachment are unchanged; hiding chrome
+also removes its titlebar buttons and drag affordance. This is a creation-time
+option: configuration changes do not restyle an existing window; apply them to
+new windows. There is no live-decoration setter in `WindowContext`.
+
 The renderer receives only an opaque `SurfaceTarget` lifetime token. Its raw
 handle trait implementations, enabled only by the `renderer-adapter` feature,
 form the quarantined adapter seam; consumers must not build a

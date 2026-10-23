@@ -50,10 +50,14 @@ fn private_write(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn snapshot() -> Result<toml::Value> {
-    let value = BmuxConfig::snapshot_raw_configuration()?;
+fn snapshot(bterm_snapshot: &[u8]) -> Result<toml::Value> {
+    let value = crate::application_execution::inherited_application_configuration(
+        bterm_snapshot,
+        &ConfigPaths::default(),
+        &bmux_config::ConfigLoadOverrides::for_process(),
+    )?;
     // Reading plugin artifacts is distinct from sharing their writable state.
-    let config = BmuxConfig::load()?;
+    let config: BmuxConfig = value.clone().try_into()?;
     let roots = super::super::plugin_runtime::resolve_plugin_search_paths(
         &config,
         &ConfigPaths::default(),
@@ -114,7 +118,11 @@ pub async fn run_inherited_sandbox(
             "--print-env is unavailable with --inherit-config: inherited environment may contain secrets"
         );
     }
-    let config = snapshot()?;
+    let bterm_snapshot = crate::application_execution::capture_bterm_snapshot(
+        &crate::application_execution::CapturedEnvironment::capture(),
+        &std::env::current_dir()?,
+    )?;
+    let config = snapshot(&bterm_snapshot)?;
     if options.json && args.is_empty() {
         bail!("--json requires an explicit non-interactive child command");
     }
@@ -137,6 +145,10 @@ pub async fn run_inherited_sandbox(
     private_write(
         &sandbox.config_paths.config_file(),
         toml::to_string(&config)?.as_bytes(),
+    )?;
+    private_write(
+        &sandbox.root_dir.join("bterm-configuration.json"),
+        &bterm_snapshot,
     )?;
     private_write(
         &sandbox.root_dir.join(DESCRIPTOR),
@@ -192,6 +204,10 @@ pub(super) fn apply_environment(command: &mut Command, sandbox: &SandboxPaths) -
         .env("BMUX_DATA_DIR", &sandbox.config_paths.data_dir)
         .env("BMUX_STATE_DIR", &sandbox.config_paths.state_dir)
         .env("BMUX_LOG_DIR", &sandbox.log_dir)
+        .env(
+            crate::application_execution::CONTEXT_ENV,
+            crate::application_execution::handoff_path(&sandbox.root_dir),
+        )
         .env("BMUX_NO_BASE_CONFIG", "1")
         .env("BMUX_RUNTIME_NAME", "default")
         .env("BMUX_TARGET", "local");

@@ -348,27 +348,58 @@ impl Guardian {
     }
 
     fn signal(&mut self, signal: i32) -> io::Result<()> {
+        self.signal_with(
+            signal,
+            Instant::now() + Duration::from_secs(3),
+            |stream, signal| protocol::write_frame(stream, &signal),
+        )
+    }
+
+    fn signal_with(
+        &mut self,
+        signal: i32,
+        deadline: Instant,
+        send: impl FnOnce(&mut UnixStream, i32) -> io::Result<()>,
+    ) -> io::Result<()> {
         if self.preowner_failure {
             // There is no target to signal, not a fabricated target exit.
             self.consumed = true;
             return Ok(());
         }
-        let deadline = Instant::now() + Duration::from_secs(3);
         let status = self.lifecycle.wait_until(deadline, |s| {
             s.target_pid.is_some() || s.terminal_session_ended == Some(true) || s.error.is_some()
         })?;
+        let mut owner_disconnected = false;
         if status.terminal_session_ended != Some(true) {
-            protocol::write_frame(
+            match send(
                 self.owner_control
                     .as_mut()
                     .ok_or_else(|| io::Error::other("terminal owner control unavailable"))?,
-                &signal,
-            )?;
+                signal,
+            ) {
+                Ok(()) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset
+                    ) =>
+                {
+                    // The owner may close control before the observer has
+                    // waited for its exact identity and finished session cleanup.
+                    // Disconnection alone proves neither: require that observer's
+                    // retained completion, within the original operation budget.
+                    owner_disconnected = true;
+                }
+                Err(error) => return Err(error),
+            }
         }
-        if signal == libc::SIGKILL || status.terminal_session_ended == Some(true) {
-            let status = self
-                .lifecycle
-                .wait_until(deadline, |s| s.terminal_session_ended == Some(true))?;
+        if owner_disconnected
+            || signal == libc::SIGKILL
+            || status.terminal_session_ended == Some(true)
+        {
+            let status = self.lifecycle.wait_until(deadline, |s| {
+                s.terminal_session_ended == Some(true) || s.error.is_some()
+            })?;
             acknowledge_cleanup(&status)?;
             self.consumed = true;
         }
@@ -880,6 +911,128 @@ mod tests {
             env: BTreeMap::new(),
         }
     }
+    fn disconnected_owner_fixture() -> (tempfile::TempDir, Guardian) {
+        let root = tempfile::tempdir().unwrap();
+        let lifecycle = Arc::new(
+            Lifecycle::new(
+                root.path().join("lifecycle.json"),
+                Response {
+                    version: protocol::VERSION,
+                    execution_token: "execution".into(),
+                    started: true,
+                    target_pid: Some(42),
+                    exit_code: None,
+                    exit_signal: None,
+                    group_consumed: false,
+                    target_terminated: false,
+                    terminal_session_ended: Some(false),
+                    error: None,
+                    capture_error: None,
+                    cleanup_error: None,
+                },
+            )
+            .unwrap(),
+        );
+        let (control, owner) = UnixStream::pair().unwrap();
+        drop(owner);
+        let guardian = Guardian {
+            bootstrap: Bootstrap {
+                version: protocol::VERSION,
+                execution_token: "execution".into(),
+                authentication: "secret".into(),
+            },
+            root: root.path().to_path_buf(),
+            slave: String::new(),
+            owner: None,
+            start: None,
+            consumed: false,
+            signal_failure: None,
+            lifecycle,
+            owner_control: Some(control),
+            preowner_failure: false,
+            fail_owner_spawn: false,
+        };
+        (root, guardian)
+    }
+
+    #[test]
+    fn disconnected_owner_signal_requires_retained_session_cleanup() {
+        for signal in [libc::SIGTERM, libc::SIGKILL] {
+            for failure in [None, Some("cleanup"), Some("lifecycle")] {
+                let (_root, mut guardian) = disconnected_owner_fixture();
+                let lifecycle = Arc::clone(&guardian.lifecycle);
+                let result = guardian.signal_with(
+                    signal,
+                    Instant::now() + Duration::from_secs(3),
+                    |stream, signal| {
+                        // Deterministically close control before completion is
+                        // published, after signal_with's initial stale snapshot.
+                        let error = protocol::write_frame(stream, &signal).unwrap_err();
+                        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+                        assert_eq!(
+                            lifecycle.snapshot().status.terminal_session_ended,
+                            Some(false)
+                        );
+                        lifecycle
+                            .update(|s| {
+                                if failure == Some("lifecycle") {
+                                    s.error = Some("injected owner lifecycle failure".into());
+                                } else {
+                                    s.terminal_session_ended = Some(true);
+                                    s.exit_signal = Some(libc::SIGTERM);
+                                    if failure == Some("cleanup") {
+                                        s.cleanup_error = Some("injected cleanup failure".into());
+                                    }
+                                }
+                            })
+                            .unwrap();
+                        Err(error)
+                    },
+                );
+                if let Some(failure) = failure {
+                    assert!(result.unwrap_err().to_string().contains(failure));
+                    assert!(!guardian.consumed);
+                } else {
+                    result.unwrap();
+                    assert!(guardian.consumed);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn disconnected_owner_without_completion_is_not_consumed() {
+        for signal in [libc::SIGTERM, libc::SIGKILL] {
+            let (_root, mut guardian) = disconnected_owner_fixture();
+            let error = guardian
+                .signal_with(signal, Instant::now(), |stream, signal| {
+                    protocol::write_frame(stream, &signal)
+                })
+                .unwrap_err();
+            assert!(error.to_string().contains("outcome uncertain"));
+            assert!(!guardian.consumed);
+            assert_eq!(
+                guardian.lifecycle.snapshot().status.terminal_session_ended,
+                Some(false)
+            );
+        }
+    }
+
+    #[test]
+    fn owner_signal_transport_errors_are_not_completion() {
+        let (_root, mut guardian) = disconnected_owner_fixture();
+        let error = guardian
+            .signal_with(libc::SIGTERM, Instant::now(), |_, _| {
+                Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "injected transport",
+                ))
+            })
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(!guardian.consumed);
+    }
+
     #[test]
     fn capture_and_cleanup_errors_remain_independent_and_durable() {
         for (capture, cleanup) in [(true, false), (false, true), (true, true)] {

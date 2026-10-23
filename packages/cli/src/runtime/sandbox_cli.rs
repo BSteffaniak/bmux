@@ -469,6 +469,15 @@ async fn run_sandbox_at(
         options.keep,
     );
     write_manifest(&sandbox.root_dir, &manifest)?;
+    crate::application_execution::write_sandbox_handoff(&sandbox.root_dir)?;
+    if !options.json {
+        eprintln!(
+            "Bterm attach-only handoff: bterm --execution-context {}",
+            shell_quote(
+                &crate::application_execution::handoff_path(&sandbox.root_dir).to_string_lossy()
+            ),
+        );
+    }
     let _ = upsert_sandbox_index_entry(&manifest);
     write_lock(&sandbox.root_dir)?;
     let lock_guard = SandboxLockGuard::new(&sandbox.root_dir);
@@ -3212,6 +3221,10 @@ fn apply_sandbox_env(
     if matches!(env_mode, SandboxEnvModeArg::Hermetic) {
         command.env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin");
     }
+    command.env(
+        crate::application_execution::CONTEXT_ENV,
+        crate::application_execution::handoff_path(&sandbox.root_dir),
+    );
 }
 
 fn collect_effective_sandbox_env(

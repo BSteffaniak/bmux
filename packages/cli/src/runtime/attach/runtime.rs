@@ -369,9 +369,18 @@ pub enum NativeClipboardRequest {
 }
 type NativeClipboardCallback =
     Arc<Mutex<Box<dyn FnMut(NativeClipboardRequest) -> Result<Option<String>> + Send>>>;
+type NativeConfigLoader = Arc<dyn Fn() -> bmux_config::Result<BmuxConfig> + Send + Sync>;
 thread_local! {
+    static NATIVE_CONFIG_LOADER: std::cell::RefCell<Option<NativeConfigLoader>> = const { std::cell::RefCell::new(None) };
     static NATIVE_CLIPBOARD: std::cell::RefCell<Option<NativeClipboardCallback>> = const { std::cell::RefCell::new(None) };
     static NATIVE_CONFIG_PATHS: std::cell::RefCell<Option<ConfigPaths>> = const { std::cell::RefCell::new(None) };
+}
+
+struct NativeConfigLoaderScope(Option<NativeConfigLoader>);
+impl Drop for NativeConfigLoaderScope {
+    fn drop(&mut self) {
+        NATIVE_CONFIG_LOADER.with(|slot| *slot.borrow_mut() = self.0.take());
+    }
 }
 
 struct NativeConfigScope(Option<ConfigPaths>);
@@ -388,6 +397,9 @@ fn attach_config_paths() -> ConfigPaths {
 }
 
 fn load_attach_config() -> bmux_config::Result<BmuxConfig> {
+    if let Some(loader) = NATIVE_CONFIG_LOADER.with(|slot| slot.borrow().clone()) {
+        return loader();
+    }
     NATIVE_CONFIG_PATHS
         .with(|slot| slot.borrow().clone())
         .map_or_else(BmuxConfig::load, |paths| {
@@ -424,6 +436,7 @@ pub struct NativeAttachHost {
     accepted_revision: Arc<std::sync::atomic::AtomicU64>,
     pending: std::collections::VecDeque<NativeAttachEvent>,
     config_paths: Option<ConfigPaths>,
+    config_loader: Option<NativeConfigLoader>,
     clipboard: Option<NativeClipboardCallback>,
 }
 impl NativeAttachHost {
@@ -431,6 +444,15 @@ impl NativeAttachHost {
     pub fn set_config_paths(&mut self, paths: ConfigPaths) {
         self.config_paths = Some(paths);
     }
+    /// Resolve reloads through the application's captured source policy rather
+    /// than discovering unrelated ambient configuration on the attach thread.
+    pub fn set_config_loader(
+        &mut self,
+        loader: impl Fn() -> bmux_config::Result<BmuxConfig> + Send + Sync + 'static,
+    ) {
+        self.config_loader = Some(Arc::new(loader));
+    }
+
     /// Install application-lifetime clipboard IO. Call before starting attach.
     pub fn set_clipboard(
         &mut self,
@@ -493,6 +515,7 @@ impl NativeAttachHost {
                 accepted_revision,
                 pending: std::collections::VecDeque::new(),
                 config_paths: None,
+                config_loader: None,
                 clipboard: None,
             },
         ))
@@ -620,6 +643,9 @@ pub async fn run_native_with_client(
 ) -> Result<AttachRunOutcome> {
     let _config_scope =
         NativeConfigScope(NATIVE_CONFIG_PATHS.with(|slot| slot.replace(host.config_paths.take())));
+    let _loader_scope = NativeConfigLoaderScope(
+        NATIVE_CONFIG_LOADER.with(|slot| slot.replace(host.config_loader.take())),
+    );
     let clipboard = host.clipboard.take().or_else(|| {
         let callback: NativeClipboardCallback = Arc::new(Mutex::new(Box::new(|_| {
             anyhow::bail!("native clipboard is unavailable")
@@ -8810,6 +8836,10 @@ fn apply_attach_profile_switch_with_path(
     view_state: &mut AttachViewState,
     config_path: &std::path::Path,
 ) -> Result<()> {
+    anyhow::ensure!(
+        !NATIVE_CONFIG_LOADER.with(|slot| slot.borrow().is_some()),
+        "this application pins configuration authority; select a profile in its source configuration and restart explicitly"
+    );
     let previous_config_source = if config_path.exists() {
         Some(
             std::fs::read_to_string(config_path)

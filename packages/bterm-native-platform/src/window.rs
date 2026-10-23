@@ -16,17 +16,36 @@ use crate::{LogicalSize, PhysicalRect, PhysicalSize, WindowMetrics};
 pub struct WindowOptions {
     pub title: String,
     pub initial_size: LogicalSize,
+    /// Whether to request native titlebar/chrome (default: `true`).
+    /// Applied only when creating the window; changing configuration does not
+    /// update an existing window. This does not disable resizing or focus.
+    pub decorations: bool,
 }
 
 impl Default for WindowOptions {
     fn default() -> Self {
         Self {
             title: "Bterm".into(),
+            decorations: true,
             initial_size: LogicalSize {
                 width: 960.0,
                 height: 640.0,
             },
         }
+    }
+}
+
+impl WindowOptions {
+    fn attributes(&self) -> winit::window::WindowAttributes {
+        Window::default_attributes()
+            // AccessKit must attach before the native window becomes visible.
+            .with_visible(false)
+            .with_title(&self.title)
+            .with_decorations(self.decorations)
+            .with_inner_size(winit::dpi::LogicalSize::new(
+                self.initial_size.width,
+                self.initial_size.height,
+            ))
     }
 }
 
@@ -256,15 +275,7 @@ impl<A: WindowApplication> ApplicationHandler<()> for Host<A> {
             return;
         }
         if self.window.is_none() {
-            let attributes = Window::default_attributes()
-                // AccessKit must attach before the native window becomes visible.
-                .with_visible(false)
-                .with_title(&self.options.title)
-                .with_inner_size(winit::dpi::LogicalSize::new(
-                    self.options.initial_size.width,
-                    self.options.initial_size.height,
-                ));
-            match event_loop.create_window(attributes) {
+            match event_loop.create_window(self.options.attributes()) {
                 Ok(window) => self.window = Some(Arc::new(window)),
                 Err(err) => {
                     self.error = Some(PlatformError::Window(err.to_string()));
@@ -423,6 +434,42 @@ fn valid_initial_size(size: LogicalSize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_decorations_are_enabled_by_default() {
+        let options = WindowOptions::default();
+        assert!(options.decorations);
+        assert!(options.attributes().decorations);
+    }
+
+    #[test]
+    fn decoration_choice_reaches_native_creation_without_changing_interaction_options() {
+        let native_defaults = Window::default_attributes();
+        for decorations in [false, true] {
+            let options = WindowOptions {
+                title: "Decoration test".into(),
+                initial_size: LogicalSize {
+                    width: 800.0,
+                    height: 600.0,
+                },
+                decorations,
+            };
+            let attributes = options.attributes();
+            assert_eq!(attributes.decorations, decorations);
+            assert_eq!(attributes.title, options.title);
+            assert_eq!(
+                attributes.inner_size,
+                Some(winit::dpi::Size::Logical(winit::dpi::LogicalSize::new(
+                    800.0, 600.0,
+                )))
+            );
+            assert_eq!(attributes.resizable, native_defaults.resizable);
+            assert_eq!(attributes.active, native_defaults.active);
+            assert_eq!(attributes.enabled_buttons, native_defaults.enabled_buttons);
+            // Keep the AccessKit-before-show lifecycle for both choices.
+            assert!(!attributes.visible);
+        }
+    }
 
     #[test]
     fn wake_storm_retains_only_one_pending_notification() {

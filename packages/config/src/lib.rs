@@ -14,6 +14,42 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use thiserror::Error;
 
+pub mod application;
+
+pub use application::{
+    ApplicationConfiguration, ConfigDocument, ConfigEvaluationContext, ConfigFamily,
+    ConfigFamilyResolution, ConfigSource, capture_host_configuration,
+    resolve_application_configuration, resolve_application_configuration_with_context,
+};
+
+const STARTUP_SNAPSHOT_MARKER: &str = "_bmux_startup_snapshot";
+
+fn startup_snapshot_error() -> ConfigError {
+    ConfigError::ParseError {
+        error: "invalid or unsupported private startup snapshot (source values redacted)"
+            .to_owned(),
+    }
+}
+
+// This is a representation selector, not an authorization or provenance claim.
+// Exact matching prevents future versions from silently inheriting v1 behavior.
+fn is_startup_snapshot(value: &toml::Value) -> Result<bool> {
+    let Some(marker) = value.get(STARTUP_SNAPSHOT_MARKER) else {
+        return Ok(false);
+    };
+    let Some(table) = marker.as_table() else {
+        return Err(startup_snapshot_error());
+    };
+    if table.len() != 2
+        || table.get("version").and_then(toml::Value::as_integer) != Some(1)
+        || table.get("representation").and_then(toml::Value::as_str) != Some("resolved-paths")
+        || value.get("composition").is_some()
+    {
+        return Err(startup_snapshot_error());
+    }
+    Ok(true)
+}
+
 pub const RECORDINGS_DIR_OVERRIDE_ENV: &str = "BMUX_RECORDINGS_DIR";
 pub const BMUX_CONFIG_ENV: &str = "BMUX_CONFIG";
 
@@ -493,9 +529,12 @@ fn canonical_profile_id(profile_id: &str) -> String {
     profile_id.trim().to_ascii_lowercase()
 }
 
-fn evaluate_auto_select_rule(rule: &CompositionAutoSelectRule) -> bool {
+fn evaluate_auto_select_rule(
+    rule: &CompositionAutoSelectRule,
+    context: &ConfigEvaluationContext,
+) -> bool {
     if let Some(cwd_prefix) = &rule.cwd_prefix {
-        let Some(cwd) = std::env::current_dir().ok() else {
+        let Some(cwd) = &context.cwd else {
             return false;
         };
         let cwd_value = cwd.to_string_lossy().to_string();
@@ -504,9 +543,9 @@ fn evaluate_auto_select_rule(rule: &CompositionAutoSelectRule) -> bool {
         }
     }
     if let Some(host) = &rule.host {
-        let candidate = std::env::var("HOSTNAME")
-            .ok()
-            .or_else(|| std::env::var("HOST").ok())
+        let candidate = context
+            .variable("HOSTNAME")
+            .or_else(|| context.variable("HOST"))
             .unwrap_or_default();
         if !candidate.eq_ignore_ascii_case(host) {
             return false;
@@ -518,7 +557,7 @@ fn evaluate_auto_select_rule(rule: &CompositionAutoSelectRule) -> bool {
         return false;
     }
     if let Some(term_prefix) = &rule.term_prefix {
-        let term = std::env::var("TERM").unwrap_or_default();
+        let term = context.variable("TERM").unwrap_or_default();
         if !term
             .to_ascii_lowercase()
             .starts_with(&term_prefix.to_ascii_lowercase())
@@ -527,7 +566,7 @@ fn evaluate_auto_select_rule(rule: &CompositionAutoSelectRule) -> bool {
         }
     }
     if let Some(runtime_name) = &rule.runtime {
-        let runtime = std::env::var("BMUX_RUNTIME").unwrap_or_default();
+        let runtime = context.variable("BMUX_RUNTIME").unwrap_or_default();
         if !runtime.eq_ignore_ascii_case(runtime_name) {
             return false;
         }
@@ -864,9 +903,6 @@ fn resolve_composed_config_value(
     Ok((resolved, resolution))
 }
 
-#[allow(clippy::too_many_lines)]
-// Composition resolution intentionally keeps validation and merge flow in one place
-// so precedence behavior is easy to audit end-to-end.
 fn resolve_composed_config_value_with_explain(
     raw: &toml::Value,
 ) -> std::result::Result<
@@ -877,6 +913,40 @@ fn resolve_composed_config_value_with_explain(
     ),
     ConfigError,
 > {
+    resolve_composed_config_value_with_initial(
+        raw,
+        toml::Value::try_from(BmuxConfig::default()).map_err(|error| ConfigError::ParseError {
+            error: format!("failed to serialize default config: {error}"),
+        })?,
+    )
+}
+
+// Both standalone loading and explicit application families use this resolver.
+// Supplying an empty table keeps a family sparse until cross-family precedence
+// has been applied; supplying defaults preserves standalone BMUX behavior.
+fn resolve_composed_config_value_with_initial(
+    raw: &toml::Value,
+    resolved: toml::Value,
+) -> Result<(
+    toml::Value,
+    CompositionResolution,
+    Vec<CompositionLayerChange>,
+)> {
+    resolve_composed_config_value_with_context(raw, resolved, &ConfigEvaluationContext::capture())
+}
+
+#[allow(clippy::too_many_lines)]
+// Keep the shared composition state machine together for precedence auditing.
+fn resolve_composed_config_value_with_context(
+    raw: &toml::Value,
+    mut resolved: toml::Value,
+    context: &ConfigEvaluationContext,
+) -> Result<(
+    toml::Value,
+    CompositionResolution,
+    Vec<CompositionLayerChange>,
+)> {
+    is_startup_snapshot(raw)?;
     let mut raw_table = raw
         .as_table()
         .cloned()
@@ -901,7 +971,7 @@ fn resolve_composed_config_value_with_explain(
     let auto_selected_profile = composition
         .auto_select
         .iter()
-        .position(evaluate_auto_select_rule)
+        .position(|rule| evaluate_auto_select_rule(rule, context))
         .map(|index| {
             (
                 index,
@@ -933,15 +1003,6 @@ fn resolve_composed_config_value_with_explain(
         composition.layer_order
     };
 
-    let mut resolved = toml::Value::Table(
-        toml::Value::try_from(BmuxConfig::default())
-            .map_err(|error| ConfigError::ParseError {
-                error: format!("failed to serialize default config: {error}"),
-            })?
-            .as_table()
-            .cloned()
-            .unwrap_or_else(toml::Table::new),
-    );
     let mut applied_layers = Vec::new();
 
     for layer in &layer_order {
@@ -2821,13 +2882,17 @@ impl BmuxConfig {
     }
 
     fn expand_home_prefix(input: &str) -> (String, bool) {
+        Self::expand_home_prefix_with_home(input, switchy::fs::directories::home_dir())
+    }
+
+    fn expand_home_prefix_with_home(input: &str, home: Option<PathBuf>) -> (String, bool) {
         let Some(rest) = input.strip_prefix('~') else {
             return (input.to_string(), false);
         };
         if !(rest.is_empty() || rest.starts_with('/') || rest.starts_with('\\')) {
             return (input.to_string(), false);
         }
-        let Some(home) = switchy::fs::directories::home_dir() else {
+        let Some(home) = home else {
             return (input.to_string(), true);
         };
         let mut expanded = home.to_string_lossy().into_owned();
@@ -2836,6 +2901,13 @@ impl BmuxConfig {
     }
 
     fn expand_env_tokens(input: &str) -> (String, Vec<String>) {
+        Self::expand_env_tokens_with_lookup(input, |name| std::env::var_os(name))
+    }
+
+    fn expand_env_tokens_with_lookup(
+        input: &str,
+        lookup: impl Fn(&str) -> Option<std::ffi::OsString>,
+    ) -> (String, Vec<String>) {
         let chars: Vec<char> = input.chars().collect();
         let mut output = String::with_capacity(input.len());
         let mut unresolved = Vec::new();
@@ -2873,7 +2945,7 @@ impl BmuxConfig {
 
                 let name: String = chars[(index + 2)..end].iter().collect();
                 if Self::is_valid_env_var_name(&name) {
-                    if let Some(value) = std::env::var_os(&name) {
+                    if let Some(value) = lookup(&name) {
                         output.push_str(&value.to_string_lossy());
                     } else {
                         output.push_str("${");
@@ -2899,7 +2971,7 @@ impl BmuxConfig {
                 }
 
                 let name: String = chars[(index + 1)..end].iter().collect();
-                if let Some(value) = std::env::var_os(&name) {
+                if let Some(value) = lookup(&name) {
                     output.push_str(&value.to_string_lossy());
                 } else {
                     output.push('$');
@@ -3382,26 +3454,58 @@ impl BmuxConfig {
         };
         apply_forced_profile(&mut raw_value, forced_profile)?;
         let (resolved_value, resolution) = resolve_composed_config_value(&raw_value)?;
-        let mut config: Self = resolved_value
-            .try_into()
-            .map_err(|e| ConfigError::ParseError {
-                error: format!("failed to deserialize resolved config: {e}"),
-            })?;
+        Self::deserialize_resolved_value(resolved_value).map(|config| (config, resolution))
+    }
 
-        let interpolation_warnings = config.interpolate_path_fields();
-        for warning in interpolation_warnings {
-            eprintln!("bmux warning: {warning}");
+    /// Deserialize a composition-free BMUX snapshot without source discovery.
+    /// Defaults, path-token interpolation, repairs and validation match loading.
+    ///
+    /// # Errors
+    /// Returns an error for malformed or invalid BMUX configuration.
+    pub fn from_resolved_raw_value(resolved_value: toml::Value) -> Result<Self> {
+        let mut defaults =
+            toml::Value::try_from(Self::default()).map_err(|error| ConfigError::ParseError {
+                error: format!("failed to serialize default config: {error}"),
+            })?;
+        reject_removed_presentation_settings(&resolved_value, "")?;
+        merge_toml_value(&mut defaults, resolved_value);
+        Self::deserialize_resolved_value(defaults)
+    }
+
+    fn deserialize_resolved_value(resolved_value: toml::Value) -> Result<Self> {
+        let snapshot = is_startup_snapshot(&resolved_value)?;
+        let mut config: Self = resolved_value.try_into().map_err(|e| {
+            if snapshot {
+                startup_snapshot_error()
+            } else {
+                ConfigError::ParseError {
+                    error: format!("failed to deserialize resolved config: {e}"),
+                }
+            }
+        })?;
+
+        if !snapshot {
+            let interpolation_warnings = config.interpolate_path_fields();
+            for warning in interpolation_warnings {
+                eprintln!("bmux warning: {warning}");
+            }
         }
 
         let repaired_fields = config.sanitize_invalid_values();
-        if !repaired_fields.is_empty() {
+        if !snapshot {
             for warning in &repaired_fields {
                 eprintln!("bmux warning: repaired invalid config value {warning}");
             }
         }
 
-        config.validate()?;
-        Ok((config, resolution))
+        config.validate().map_err(|error| {
+            if snapshot {
+                startup_snapshot_error()
+            } else {
+                error
+            }
+        })?;
+        Ok(config)
     }
 
     /// Load configuration from a specific path with layer-by-layer explain data.
@@ -3450,25 +3554,7 @@ impl BmuxConfig {
         apply_forced_profile(&mut raw_value, forced_profile)?;
         let (resolved_value, resolution, applied_layers) =
             resolve_composed_config_value_with_explain(&raw_value)?;
-        let mut config: Self = resolved_value
-            .try_into()
-            .map_err(|e| ConfigError::ParseError {
-                error: format!("failed to deserialize resolved config: {e}"),
-            })?;
-
-        let interpolation_warnings = config.interpolate_path_fields();
-        for warning in interpolation_warnings {
-            eprintln!("bmux warning: {warning}");
-        }
-
-        let repaired_fields = config.sanitize_invalid_values();
-        if !repaired_fields.is_empty() {
-            for warning in &repaired_fields {
-                eprintln!("bmux warning: repaired invalid config value {warning}");
-            }
-        }
-
-        config.validate()?;
+        let config = Self::deserialize_resolved_value(resolved_value)?;
         Ok((
             config,
             CompositionExplain {
@@ -3843,20 +3929,22 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_config_path() -> std::path::PathBuf {
+        static NEXT_DIRECTORY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let unique = format!(
-            "bmux-config-test-{}-{}",
+            "bmux-config-test-{}-{}-{}",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .expect("system time before epoch")
-                .as_nanos()
+                .as_nanos(),
+            NEXT_DIRECTORY.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         );
         let dir = std::env::temp_dir().join(unique);
         std::fs::create_dir_all(&dir).expect("failed to create temp test directory");
         dir.join("bmux.toml")
     }
 
-    fn env_lock() -> &'static std::sync::Mutex<()> {
+    pub fn env_lock() -> &'static std::sync::Mutex<()> {
         static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
         LOCK.get_or_init(|| std::sync::Mutex::new(()))
     }

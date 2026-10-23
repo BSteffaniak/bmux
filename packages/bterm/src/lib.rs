@@ -5,6 +5,7 @@
 
 pub mod app;
 pub mod compatibility;
+pub mod configuration;
 mod reconciliation;
 pub mod runtime_launch;
 pub mod runtime_paths;

@@ -40,6 +40,32 @@ impl RuntimeSelection {
         })
     }
 
+    /// Select already-captured managed paths (including sandbox contexts).
+    /// External attachment keeps its exact layout and never opens a companion.
+    pub fn resolve_captured(
+        runtime_root: Option<PathBuf>,
+        companion: PathBuf,
+        managed_roots: RuntimeRoots,
+    ) -> Result<Self> {
+        if let Some(root) = runtime_root {
+            return Ok(Self::External {
+                roots: RuntimeRoots::from_root(root)?,
+            });
+        }
+        for path in [
+            &managed_roots.config_dir,
+            &managed_roots.runtime_dir,
+            &managed_roots.data_dir,
+            &managed_roots.state_dir,
+        ] {
+            crate::runtime_paths::validate_absolute(path)?;
+        }
+        Ok(Self::Managed {
+            roots: managed_roots,
+            companion: VerifiedCompanion::load(companion)?,
+        })
+    }
+
     /// Exact resolved paths shared by connection and launch code.
     #[must_use]
     pub const fn roots(&self) -> &RuntimeRoots {

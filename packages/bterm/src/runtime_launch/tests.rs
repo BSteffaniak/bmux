@@ -61,6 +61,26 @@ async fn legacy_migration_preserves_stale_files_and_refuses_live_or_uncertain_ow
 }
 
 #[test]
+fn configuration_snapshot_publication_recovers_interrupted_staging_and_rejects_drift() {
+    let root = Root::new();
+    let path = root.0.join("configuration.toml");
+    std::fs::write(path.with_extension("next"), b"partial").unwrap();
+    write_configuration_snapshot(&path, b"[general]\nscrollback_limit = 42\n").unwrap();
+    assert!(!path.with_extension("next").exists());
+    write_configuration_snapshot(&path, b"[general]\nscrollback_limit = 42\n").unwrap();
+    assert!(write_configuration_snapshot(&path, b"different").is_err());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn readiness_diagnostics_distinguish_reused_and_started_without_guessing_cause() {
     let root = Root::new();
     let spec = root.spec();

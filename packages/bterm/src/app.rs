@@ -10,7 +10,7 @@ use bterm_native_platform::{
     PlatformError, PlatformEvent, WindowApplication, WindowContext, WindowMetrics, WindowOptions,
 };
 use bterm_native_renderer::{NativeRenderer, RendererOptions};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 use crate::runtime_selection::RuntimeSelection;
@@ -70,9 +70,50 @@ pub struct Arguments {
     /// Complete persistent root for the managed companion.
     #[arg(long)]
     pub managed_root: Option<PathBuf>,
+    /// Validated sandbox execution descriptor; never an implicit host fallback.
+    #[arg(long, conflicts_with_all = ["runtime_root", "managed_root", "companion"])]
+    pub execution_context: Option<PathBuf>,
+    /// Explicit named slot; attach only, never launch or replace its companion.
+    #[arg(long, requires = "slots_manifest", conflicts_with_all = ["runtime_root", "managed_root", "companion", "execution_context"])]
+    pub slot: Option<String>,
+    /// Explicit absolute slot manifest used only with --slot.
+    #[arg(long, requires = "slot")]
+    pub slots_manifest: Option<PathBuf>,
+    /// Bterm configuration overlay (below all selected BMUX sources).
+    #[arg(long)]
+    pub config: Option<PathBuf>,
+    /// BMUX configuration overlay (highest BMUX file priority).
+    #[arg(long)]
+    pub bmux_config: Option<PathBuf>,
+    /// Do not discover the host BMUX configuration family.
+    #[arg(long)]
+    pub no_bmux_config: bool,
+    /// Resolve scoped/project configuration for this target kind.
+    #[arg(long)]
+    pub config_scope: Option<String>,
+    /// Select a composition profile using the existing BMUX resolver.
+    #[arg(long)]
+    pub config_profile: Option<String>,
+    #[command(subcommand)]
+    pub command: Option<ConfigurationCommand>,
     /// Existing BMUX attachment target; omission uses BMUX's normal selection.
     #[arg(long)]
     pub session: Option<String>,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ConfigurationCommand {
+    /// Read-only configuration inspection; never opens a companion or window.
+    Config {
+        #[command(subcommand)]
+        command: ConfigurationAction,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ConfigurationAction {
+    /// Explain selected configuration sources, safe settings, and execution paths.
+    Explain,
 }
 
 /// Existing BMUX attach integration, not a second resource manager. Implementors
@@ -438,27 +479,252 @@ impl<W: AttachWorker> Drop for Application<W> {
 /// Selection, compatibility, attach, and graphics failures remain visible.
 pub fn run() -> Result<()> {
     let arguments = Arguments::parse();
-    let selection = arguments.resolve()?;
-    let config = selection
-        .roots()
-        .load_config(&bmux_config::ConfigLoadOverrides::default())?;
-    run_window(BmuxWorker {
-        selection,
-        config: Some(config),
-        target: arguments.session.unwrap_or_default(),
-        handle: None,
-        thread: None,
-        result: None,
-        committed_geometry: None,
-        pointer: None,
-        drag: None,
-        scroll_remainder: [0.0; 2],
-        modifiers: bmux_frontend_runtime::input::Modifiers::default(),
-    })
+    let (configuration, sandbox, slot) = arguments.capture_configuration()?;
+    if arguments.command.is_none()
+        && let Some(context) = &sandbox
+    {
+        let current: std::collections::BTreeMap<_, _> = std::env::vars_os().collect();
+        if current != context.environment.0 {
+            let mut command = std::process::Command::new(std::env::current_exe()?);
+            command.args(std::env::args_os().skip(1));
+            command.env_clear().envs(context.environment.0.iter());
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::CommandExt as _;
+                return Err(command.exec()).context("enter selected sandbox environment");
+            }
+            #[cfg(not(unix))]
+            {
+                let status = command
+                    .status()
+                    .context("enter selected sandbox environment")?;
+                anyhow::ensure!(status.success(), "sandbox application exited: {status}");
+                return Ok(());
+            }
+        }
+    }
+    if arguments.command.is_some() {
+        let roots = if let Some(context) = &sandbox {
+            sandbox_roots(context)
+        } else if let Some(root) = &arguments.runtime_root {
+            crate::runtime_paths::RuntimeRoots::from_root(root.clone())?
+        } else if let Some(root) = &arguments.managed_root {
+            crate::runtime_paths::RuntimeRoots::managed(root.clone())?
+        } else if let Some(slot) = &slot {
+            crate::runtime_paths::RuntimeRoots {
+                config_dir: slot.config_paths.config_dir.clone(),
+                runtime_dir: slot.config_paths.runtime_dir.clone(),
+                data_dir: slot.config_paths.data_dir.clone(),
+                state_dir: slot.config_paths.state_dir.clone(),
+            }
+        } else {
+            configuration.inputs.paths.managed_roots()?
+        };
+        let mut output = configuration.effective_json();
+        output["execution"] = serde_json::json!({
+            "mode": if sandbox.is_some() { "sandbox-attach" } else if arguments.slot.is_some() { "slot-attach" } else if arguments.runtime_root.is_some() { "external" } else { "managed" },
+            "config_dir": roots.config_dir,
+            "runtime_dir": roots.runtime_dir,
+            "data_dir": roots.data_dir,
+            "state_dir": roots.state_dir,
+            "sandbox_id": sandbox.as_ref().map(|context| &context.sandbox_id),
+        });
+        println!("{}", serde_json::to_string_pretty(&output)?);
+        return Ok(());
+    }
+    let selection = if let Some(context) = &sandbox {
+        RuntimeSelection::External {
+            roots: sandbox_roots(context),
+        }
+    } else if let Some(slot) = &slot {
+        RuntimeSelection::External {
+            roots: crate::runtime_paths::RuntimeRoots {
+                config_dir: slot.config_paths.config_dir.clone(),
+                runtime_dir: slot.config_paths.runtime_dir.clone(),
+                data_dir: slot.config_paths.data_dir.clone(),
+                state_dir: slot.config_paths.state_dir.clone(),
+            },
+        }
+    } else if arguments.runtime_root.is_some() || arguments.managed_root.is_some() {
+        arguments.resolve()?
+    } else {
+        let mut selection = arguments.resolve()?;
+        if let RuntimeSelection::Managed { roots, .. } = &mut selection {
+            *roots = configuration.inputs.paths.managed_roots()?;
+        }
+        selection
+    };
+    let decorations = configuration.native.window.decorations;
+    run_window_with_options(
+        BmuxWorker {
+            selection,
+            config: Some(configuration.bmux.clone()),
+            configuration: Some(configuration),
+            frozen_configuration: sandbox.is_some(),
+            target: arguments.session.unwrap_or_default(),
+            handle: None,
+            thread: None,
+            result: None,
+            committed_geometry: None,
+            pointer: None,
+            drag: None,
+            scroll_remainder: [0.0; 2],
+            modifiers: bmux_frontend_runtime::input::Modifiers::default(),
+        },
+        WindowOptions {
+            decorations,
+            ..WindowOptions::default()
+        },
+    )
+}
+
+fn sandbox_roots(
+    context: &bmux_cli::application_execution::ValidatedExecutionContext,
+) -> crate::runtime_paths::RuntimeRoots {
+    let paths = &context.config_paths;
+    crate::runtime_paths::RuntimeRoots {
+        config_dir: paths.config_dir.clone(),
+        runtime_dir: paths.runtime_dir.clone(),
+        data_dir: paths.data_dir.clone(),
+        state_dir: paths.state_dir.clone(),
+    }
+}
+
+impl Arguments {
+    fn capture_configuration(
+        &self,
+    ) -> Result<(
+        crate::configuration::ResolvedConfiguration,
+        Option<bmux_cli::application_execution::ValidatedExecutionContext>,
+        Option<bmux_cli::application_execution::ValidatedSlotContext>,
+    )> {
+        use crate::configuration::{ConfigOptions, SourcePaths, SourcePolicy};
+        use bmux_cli::application_execution::{CapturedEnvironment, ConfigurationInheritance};
+        let environment = CapturedEnvironment::capture();
+        let sandbox = bmux_cli::application_execution::recognize(
+            &environment,
+            self.execution_context.as_deref(),
+        )?;
+        let slot = self
+            .slot
+            .as_ref()
+            .map(|name| {
+                bmux_cli::application_execution::capture_slot(
+                    name,
+                    self.slots_manifest
+                        .as_deref()
+                        .context("slot requires explicit manifest")?,
+                    &environment,
+                )
+            })
+            .transpose()?;
+        anyhow::ensure!(
+            sandbox.is_none() || slot.is_none(),
+            "slot selection conflicts with sandbox execution context"
+        );
+        if sandbox.is_some() {
+            anyhow::ensure!(
+                self.runtime_root.is_none()
+                    && self.managed_root.is_none()
+                    && self.companion.is_none(),
+                "sandbox execution context conflicts with explicit runtime or companion selection"
+            );
+        }
+        let mut options = ConfigOptions {
+            policy: if self.no_bmux_config {
+                SourcePolicy::BtermOnly
+            } else {
+                SourcePolicy::Inherit
+            },
+            bterm: SourcePaths {
+                cli: self.config.clone(),
+                ..SourcePaths::default()
+            },
+            bmux: SourcePaths {
+                cli: self.bmux_config.clone(),
+                ..SourcePaths::default()
+            },
+            forced_profile: self.config_profile.clone(),
+            ..ConfigOptions::default()
+        };
+        let cwd = std::env::current_dir()?;
+        options.scope = self
+            .config_scope
+            .as_ref()
+            .map(|name| bmux_config::ConfigScopeTarget::with_cwd(name.clone(), cwd.clone()));
+        let mut inputs = if let Some(context) = &sandbox {
+            anyhow::ensure!(
+                self.config.is_none() && self.bmux_config.is_none(),
+                "sandbox configuration is selected by its descriptor; overlays require a new sandbox snapshot"
+            );
+            options.policy = SourcePolicy::Explicit;
+            options.bterm.primary = Some(context.root.join("config/bterm/bterm.toml"));
+            options.bmux.primary = Some(match &context.configuration {
+                ConfigurationInheritance::Clean => context.config_paths.config_file(),
+                ConfigurationInheritance::Snapshot { path, .. } => path.clone(),
+            });
+            let selected_environment = context
+                .environment
+                .0
+                .iter()
+                .filter_map(|(key, value)| {
+                    key.clone()
+                        .into_string()
+                        .ok()
+                        .map(|key| (key, value.clone()))
+                })
+                .collect();
+            options.capture_selected_with_environment(
+                crate::runtime_paths::BtermPaths::from_root(context.root.clone())?,
+                cwd,
+                selected_environment,
+            )?
+        } else if let Some(slot) = &slot {
+            options.policy = SourcePolicy::Explicit;
+            let paths = crate::runtime_paths::BtermPaths {
+                config_dir: slot.config_paths.config_dir.clone(),
+                cache_dir: slot.config_paths.state_dir.join("cache"),
+                data_dir: slot.config_paths.data_dir.clone(),
+                state_dir: slot.config_paths.state_dir.clone(),
+                log_dir: slot.log_dir.clone(),
+            };
+            options.bterm.primary = Some(paths.config_file());
+            options.bterm.state = Some(paths.state_config_file());
+            options.bmux.base = slot.base_config_path.clone();
+            options.bmux.primary = Some(slot.config_paths.config_file());
+            options.bmux.state = Some(slot.config_paths.state_config_file());
+            let selected = environment
+                .0
+                .iter()
+                .filter_map(|(key, value)| {
+                    key.clone()
+                        .into_string()
+                        .ok()
+                        .map(|key| (key, value.clone()))
+                })
+                .collect();
+            options.capture_selected_with_environment(paths, cwd, selected)?
+        } else {
+            let environment = environment
+                .0
+                .into_iter()
+                .filter_map(|(key, value)| key.into_string().ok().map(|key| (key, value)))
+                .collect();
+            options.capture_with_environment(cwd, environment, self.managed_root.as_deref())?
+        };
+        if let Some(context) = &sandbox
+            && let Some(frozen) = &context.bterm_configuration
+        {
+            inputs.bterm = frozen.clone();
+        }
+        Ok((inputs.resolve()?, sandbox, slot))
+    }
 }
 
 struct BmuxWorker {
     selection: RuntimeSelection,
+    configuration: Option<crate::configuration::ResolvedConfiguration>,
+    frozen_configuration: bool,
     config: Option<bmux_config::BmuxConfig>,
     target: String,
     handle: Option<bmux_cli::attach::NativeAttachHandle>,
@@ -482,6 +748,22 @@ impl AttachWorker for BmuxWorker {
         )?;
         let clipboard = output.clone();
         host.set_config_paths(self.selection.roots().config_paths());
+        let configuration = self.configuration.clone();
+        if let Some(configuration) = &configuration {
+            let captured = configuration.clone();
+            let frozen = self.frozen_configuration
+                || matches!(self.selection, RuntimeSelection::External { .. });
+            host.set_config_loader(move || {
+                if frozen {
+                    return Ok(captured.bmux.clone());
+                }
+                let next = captured.reload().map_err(|error| bmux_config::ConfigError::ReadError { error: error.to_string() })?;
+                if next.bmux_toml != captured.bmux_toml || next.native != captured.native {
+                    return Err(bmux_config::ConfigError::ReadError { error: "configuration changed; restart the selected runtime explicitly before applying a new generation".into() });
+                }
+                Ok(next.bmux)
+            });
+        }
         host.set_clipboard(move |request| clipboard.clipboard_request(request));
         self.handle = Some(handle);
         let selection = self.selection.clone();
@@ -505,8 +787,15 @@ impl AttachWorker for BmuxWorker {
                                 &config,
                                 &selection.roots().config_paths(),
                             )?;
-                            let client =
-                                crate::runtime_launch::connect_selection(&selection).await?;
+                            let client = if let Some(configuration) = &configuration {
+                                crate::runtime_launch::connect_selection_configured(
+                                    &selection,
+                                    configuration,
+                                )
+                                .await?
+                            } else {
+                                crate::runtime_launch::connect_selection(&selection).await?
+                            };
                             bmux_cli::attach::run_native_with_client(client, &target, config, host)
                                 .await?;
                             Ok(())
@@ -711,8 +1000,11 @@ impl AttachWorker for BmuxWorker {
 
 /// Open the real platform host with an existing BMUX frontend integration.
 pub fn run_window(worker: impl AttachWorker) -> Result<()> {
-    bterm_native_platform::run(WindowOptions::default(), Application::new(worker)?)
-        .context("run native window")
+    run_window_with_options(worker, WindowOptions::default())
+}
+
+fn run_window_with_options(worker: impl AttachWorker, options: WindowOptions) -> Result<()> {
+    bterm_native_platform::run(options, Application::new(worker)?).context("run native window")
 }
 
 fn accumulate_scroll(remainder: &mut [f64; 2], x: f64, y: f64) -> (i16, i16) {
@@ -785,6 +1077,8 @@ mod tests {
                 roots: crate::runtime_paths::RuntimeRoots::from_root(std::env::temp_dir()).unwrap(),
             },
             config: None,
+            configuration: None,
+            frozen_configuration: false,
             target: String::new(),
             handle: None,
             thread: None,

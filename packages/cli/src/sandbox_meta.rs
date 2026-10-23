@@ -289,7 +289,7 @@ fn write_index_entries(entries: Vec<SandboxIndexEntry>) -> Result<()> {
         .with_context(|| format!("failed writing {}", index_path.display()))
 }
 
-fn write_atomic_file(path: &Path, bytes: &[u8]) -> Result<()> {
+pub fn write_atomic_file(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
 
     let temp_path = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));

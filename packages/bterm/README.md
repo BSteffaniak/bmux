@@ -45,6 +45,17 @@ success. The observer receives success only after actual renderer presentation.
 Closing/dropping the receiver rejects blocked publication. Pixel metrics project
 presentation cells independently of execution geometry.
 
+## Configuration and isolation
+
+See [Bterm configuration](../../docs/bterm-configuration.md) for superset
+configuration, source/profile precedence, read-only redacted inspection,
+explicit managed-root policy, and sandbox handoff. An isolated runtime namespace
+is not an OS security sandbox.
+
+Native decorations are a creation-time native platform option, separate from
+BMUX presentation and plugin resource ownership. Configuration inspection reports
+the requested policy; the window manager/compositor determines visible chrome.
+
 ## Package ownership
 
 The application package and executable are `bterm`. Bterm-owned native backends

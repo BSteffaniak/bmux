@@ -12,6 +12,7 @@ mod runtime;
 pub(crate) mod sandbox_meta;
 mod ssh_access;
 
+pub mod application_execution;
 pub mod attach;
 pub mod input;
 
