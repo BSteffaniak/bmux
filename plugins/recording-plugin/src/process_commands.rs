@@ -48,45 +48,45 @@ pub(crate) fn run(context: &NativeCommandContext) -> i32 {
 
 pub(crate) async fn execute_interactive_start(
     context: &NativeCommandContext,
-) -> Result<(serde_json::Value, i32)> {
-    let args = Arguments::parse(&context.arguments)?;
-    program_options(&args)?;
-    let launch_key = args
-        .one("idempotency-key")?
-        .context("interactive launch identity missing")?
-        .parse::<Uuid>()?;
-    crate::process_bootstrap::record_launch(context, launch_key, &context.arguments, None)?;
+    options: process::ProgramOptions,
+    environment: Vec<bmux_pane_runtime_plugin_api::pane_runtime_environment_v1::EnvironmentEntry>,
+) -> Result<process::RunStatus> {
+    use bmux_recording_plugin_api::recording_process_environment_v1 as complete;
+    let mutation = Uuid::new_v4();
     let mut dedicated = crate::process_bootstrap::bootstrap(context).await?;
-    // Probe this exact isolated server before target admission. An advertised
-    // facade alone cannot prove its pane provider has coherent presentation.
-    let capabilities =
+    let capabilities = complete::client::capabilities(&mut dedicated.client)
+        .await
+        .context("complete caller environment capability unavailable; target not launched")?;
+    ensure!(
+        capabilities == 1,
+        "unsupported complete caller environment capability; target not launched"
+    );
+    let presentation =
         bmux_recording_plugin_api::recording_process_presentation_v1::client::capabilities(
             &mut dedicated.client,
         )
         .await
-        .context(
-            "interactive presentation capability negotiation unavailable; target not launched",
-        )?
-        .map_err(|error| {
-            anyhow::anyhow!(
-                "interactive presentation capability negotiation: {error:?}; target not launched"
-            )
-        })?;
-    validate_interactive_capabilities(&capabilities)?;
-    let wait =
-        bmux_recording_plugin_api::recording_process_presentation_wait_v1::client::capabilities(
-            &mut dedicated.client,
-        )
+        .context("interactive presentation capability unavailable; target not launched")?
+        .map_err(|error| anyhow::anyhow!("interactive presentation capability: {error:?}"))?;
+    validate_interactive_capabilities(&presentation)?;
+    let path = crate::process_bootstrap::retain_launch_root(context, mutation, &dedicated.root)?;
+    crate::process_bootstrap::remember(context, mutation, &dedicated.root)?;
+    crate::process_bootstrap::record_launch(context, mutation, &[], Some(mutation))?;
+    // Once admission can have happened, preserve the owned runtime on uncertainty.
+    dedicated.armed = false;
+    let status = complete::client::start(&mut dedicated.client, mutation, options, environment)
         .await
-        .context("interactive wait capability unavailable; target not launched")?;
-    ensure!(
-        wait.schema_version == 1
-            && wait.token_bytes == 32
-            && wait.max_timeout_ms == 1000
-            && wait.max_response_bytes == 4 * 1024 * 1024,
-        "unsupported interactive wait capability; target not launched"
-    );
-    command_start(context, "start", &args, &mut dedicated, launch_key).await
+        .context("launch outcome unresolved; retained runtime; do not automatically retry")?
+        .map_err(|error| anyhow::anyhow!("complete environment launch: {error:?}"))?;
+    crate::process_bootstrap::record_native_launch_identity(
+        &path,
+        mutation,
+        &dedicated.root,
+        status.run_id,
+        true,
+    )?;
+    crate::process_bootstrap::remember(context, status.run_id, &dedicated.root)?;
+    Ok(status)
 }
 
 fn validate_interactive_capabilities(

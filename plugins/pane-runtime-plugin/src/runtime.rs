@@ -2,6 +2,7 @@
 
 mod capture_writer;
 mod durable_capture;
+mod environment;
 pub(crate) mod execution;
 pub(crate) mod human_input;
 pub(crate) mod live_presentation;
@@ -6421,7 +6422,14 @@ impl SessionRuntimeManager {
                 for (key, value) in &launch.env {
                     command.env(key, value);
                 }
-                configure_device_seal_broker_env(&mut command);
+                if execution_for_task
+                    .exact_environment
+                    .lock()
+                    .ok()
+                    .is_none_or(|env| env.is_none())
+                {
+                    configure_device_seal_broker_env(&mut command);
+                }
                 if let Some(cwd) = launch.cwd.as_deref().or(initial_cwd.as_deref()) {
                     command.cwd(cwd);
                 }
@@ -6484,6 +6492,12 @@ impl SessionRuntimeManager {
                     return;
                 }
             };
+            let exact_environment = execution_for_task
+                .exact_environment
+                .lock()
+                .ok()
+                .and_then(|env| env.clone())
+                .map(|env| environment::terminal_environment(env, &command));
             let guardian_launch = PaneLaunchSpec {
                 program: argv[0].clone(),
                 args: argv[1..].to_vec(),
@@ -6699,7 +6713,7 @@ impl SessionRuntimeManager {
                 // this async waiter is cancelled, the completed task result
                 // still drops through supervised cleanup, never a raw Child.
                 let started = tokio::task::spawn_blocking(move || {
-                    let result = startup_control.start(&launch, || {
+                    let result = startup_control.start(&launch, exact_environment, || {
                         authorization.authorize_spawn()?;
                         launch_attempted.store(true, Ordering::SeqCst);
                         Ok(())
@@ -15614,6 +15628,7 @@ exit 7"#
                         cwd: None,
                         env: BTreeMap::new(),
                     },
+                    None,
                     || Ok(()),
                 )
                 .unwrap();
@@ -20624,6 +20639,7 @@ exit 7"#
                         cwd: None,
                         env: BTreeMap::new(),
                     },
+                    None,
                     || Ok(()),
                 )
                 .unwrap_err()

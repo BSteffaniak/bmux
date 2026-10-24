@@ -13,6 +13,9 @@ use std::sync::{Mutex, OnceLock};
 struct StoredReservation {
     version: u32,
     receipt: LaunchReceipt,
+    #[serde(default)]
+    environment:
+        Option<Vec<bmux_pane_runtime_plugin_api::pane_runtime_environment_v1::EnvironmentEntry>>,
 }
 static STORE: OnceLock<Mutex<Result<ReservationStore, String>>> = OnceLock::new();
 pub(crate) fn activate(context: &bmux_plugin_sdk::NativeLifecycleContext) {
@@ -46,6 +49,21 @@ pub(crate) fn reserve(
 ) -> Result<LaunchReservation, RecoveryError> {
     crate::readiness::check_admission().map_err(failed)?;
     with_store(|store| store.reserve(mutation, options, authorize))
+}
+pub(crate) fn reserve_environment(
+    mutation: uuid::Uuid,
+    options: ProgramOptions,
+    environment: Vec<bmux_pane_runtime_plugin_api::pane_runtime_environment_v1::EnvironmentEntry>,
+    authorize: impl Fn(uuid::Uuid) -> Result<(), RecoveryError>,
+) -> Result<LaunchReservation, RecoveryError> {
+    super::environment::validate(&environment)
+        .map_err(|reason| RecoveryError::OperationFailed { reason })?;
+    if !options.env.is_empty() {
+        return Err(RecoveryError::Conflict {
+            reason: "complete environment cannot include overlay".into(),
+        });
+    }
+    with_store(|store| store.reserve_environment(mutation, options, Some(environment), authorize))
 }
 pub(crate) fn launch(
     reservation: &LaunchReservation,
@@ -95,12 +113,24 @@ pub(super) fn launch_named(
         }
         return Ok(admitted.1);
     }
-    let result = super::execution::create_reserved(
-        name,
-        reservation.options.clone(),
-        Some(&reservation.execution),
-        authorize,
-    );
+    let environment =
+        with_store(|store| Ok(store.read(reservation.launch_mutation_id)?.environment))?;
+    let result = if let Some(environment) = environment {
+        super::execution::create_reserved_environment(
+            name,
+            reservation.options.clone(),
+            Some(&reservation.execution),
+            Some(environment),
+            authorize,
+        )
+    } else {
+        super::execution::create_reserved(
+            name,
+            reservation.options.clone(),
+            Some(&reservation.execution),
+            authorize,
+        )
+    };
     with_store(|store| {
         let mut stored = store.read(reservation.launch_mutation_id)?;
         stored.receipt.revision += 1;
@@ -143,10 +173,19 @@ impl ReservationStore {
         let bytes =
             std::fs::read(self.root.join(format!("launch-{mutation}.json"))).map_err(failed)?;
         let stored: StoredReservation = serde_json::from_slice(&bytes).map_err(failed)?;
-        if stored.version != 4 {
+        if stored.version != 4 && stored.version != 5 {
             return Err(RecoveryError::RecoveryRequired {
                 reason: "unsupported execution authority format".into(),
             });
+        }
+        if (stored.version == 5) != stored.environment.is_some() {
+            return Err(RecoveryError::RecoveryRequired {
+                reason: "invalid execution environment format".into(),
+            });
+        }
+        if let Some(environment) = &stored.environment {
+            super::environment::validate(environment)
+                .map_err(|reason| RecoveryError::RecoveryRequired { reason })?;
         }
         Ok(stored)
     }
@@ -166,10 +205,28 @@ impl ReservationStore {
         options: ProgramOptions,
         authorize: impl Fn(uuid::Uuid) -> Result<(), RecoveryError>,
     ) -> Result<LaunchReservation, RecoveryError> {
+        self.reserve_environment(mutation, options, None, authorize)
+    }
+    pub(super) fn reserve_environment(
+        &self,
+        mutation: uuid::Uuid,
+        options: ProgramOptions,
+        environment: Option<
+            Vec<bmux_pane_runtime_plugin_api::pane_runtime_environment_v1::EnvironmentEntry>,
+        >,
+        authorize: impl Fn(uuid::Uuid) -> Result<(), RecoveryError>,
+    ) -> Result<LaunchReservation, RecoveryError> {
         let path = self.root.join(format!("launch-{mutation}.json"));
         if path.exists() {
             let stored = self.read(mutation)?;
             authorize(stored.receipt.reservation.execution.session_id)?;
+            if serde_json::to_vec(&environment).map_err(failed)?
+                != serde_json::to_vec(&stored.environment).map_err(failed)?
+            {
+                return Err(RecoveryError::Conflict {
+                    reason: "conflicting environment semantics".into(),
+                });
+            }
             if serde_json::to_vec(&options).map_err(failed)?
                 != serde_json::to_vec(&stored.receipt.reservation.options).map_err(failed)?
             {
@@ -216,7 +273,8 @@ impl ReservationStore {
             options,
         };
         self.commit(&StoredReservation {
-            version: 4,
+            version: if environment.is_some() { 5 } else { 4 },
+            environment,
             receipt: LaunchReceipt {
                 reservation: reservation.clone(),
                 phase: LaunchPhase::Reserved,

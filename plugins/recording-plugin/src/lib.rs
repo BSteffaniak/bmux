@@ -351,6 +351,12 @@ impl RustPlugin for RecordingPlugin {
             "recording-process-presentation-v1", "present" => |req: bmux_recording_plugin_api::recording_process_presentation_v1::client::PresentRequest, ctx| {
                 process_runtime::dispatch(ctx, move |service| Box::pin(async move { service.present(req.run_id).await })).map_err(|error| ServiceResponse::error("process_dispatch", error.to_string()))
             },
+            "recording-process-environment-v1", "capabilities" => |_req: (), ctx| {
+                process_runtime::dispatch(ctx, move |service| Box::pin(async move { service.environment_capabilities().await })).and_then(|value| value).map_err(|error| ServiceResponse::error("process_dispatch", error.to_string()))
+            },
+            "recording-process-environment-v1", "start" => |req: bmux_recording_plugin_api::recording_process_environment_v1::client::StartRequest, ctx| {
+                process_runtime::dispatch(ctx, move |service| Box::pin(async move { service.start_environment(req.launch_mutation_id, req.options, req.environment).await.map_err(|error| process::ProcessError::OperationFailed { reason: error.to_string() }) })).map_err(|error| ServiceResponse::error("process_dispatch", error.to_string()))
+            },
             "recording-process-v4", "start" => |req: process::client::StartRequest, ctx| {
                 process_runtime::dispatch(ctx, move |service| Box::pin(async move { service.start(req.run_id, req.launch_mutation_id, req.options, req.runtime_root).await })).map_err(|error| ServiceResponse::error("process_dispatch", error.to_string()))
             },

@@ -21,6 +21,53 @@ async fn capture_resume(
         .await?
         .map_err(|error| anyhow::anyhow!("canonical capture read: {error:?}"))
 }
+async fn reserve_program(
+    client: &mut impl bmux_plugin_sdk::TypedDispatchClient,
+    environment: Option<
+        Vec<bmux_pane_runtime_plugin_api::pane_runtime_environment_v1::EnvironmentEntry>,
+    >,
+    mutation: Uuid,
+    options: pane::TerminalProgramOptions,
+) -> bmux_plugin_sdk::TypedServiceClientResult<
+    Result<pane::TerminalLaunchReservation, pane::TerminalRecoveryError>,
+> {
+    if let Some(environment) = environment {
+        bmux_pane_runtime_plugin_api::pane_runtime_environment_v1::client::reserve(
+            client,
+            mutation,
+            options,
+            environment,
+        )
+        .await
+    } else {
+        pane::client::reserve(client, mutation, options).await
+    }
+}
+fn launch_intent(
+    id: Uuid,
+    mutation: Uuid,
+    options: &process::ProgramOptions,
+    root: &str,
+    environment: Option<
+        &[bmux_pane_runtime_plugin_api::pane_runtime_environment_v1::EnvironmentEntry],
+    >,
+) -> Result<Vec<u8>> {
+    if environment.is_some() {
+        use sha2::{Digest, Sha256};
+        Ok(Sha256::digest(serde_json::to_vec(&(
+            "complete-environment-v1",
+            id,
+            mutation,
+            options,
+            root,
+            environment,
+        ))?)
+        .to_vec())
+    } else {
+        Ok(serde_json::to_vec(&(id, mutation, options, root))?)
+    }
+}
+
 type Reply<'a, T> = Pin<Box<dyn Future<Output = Result<T, process::ProcessError>> + Send + 'a>>;
 
 static PROCESS_SERVICE: std::sync::OnceLock<Arc<ProcessService>> = std::sync::OnceLock::new();
@@ -560,6 +607,9 @@ impl ProcessService {
         id: Uuid,
         launch_mutation_id: Uuid,
         options: process::ProgramOptions,
+        environment: Option<
+            Vec<bmux_pane_runtime_plugin_api::pane_runtime_environment_v1::EnvironmentEntry>,
+        >,
     ) -> Result<process::RunStatus> {
         let store = self.store()?;
         let mut existing = store.load(id).context("admitted launch has no committed run metadata; recovery required; refusing blind relaunch")?;
@@ -567,8 +617,9 @@ impl ProcessService {
             let mut client = ServiceCallerDispatchClient::new(self.caller.as_ref());
             // Reserve is idempotent against the exact persisted mutation/options;
             // it cannot spawn. Lost reserve replies recover the same identity.
-            let reservation = pane::client::reserve(
+            let reservation = reserve_program(
                 &mut client,
+                environment,
                 launch_mutation_id,
                 pane::TerminalProgramOptions {
                     program: options.program,
@@ -640,6 +691,37 @@ impl ProcessService {
         Ok(())
     }
 
+    pub(crate) async fn environment_capabilities(&self) -> Result<u32> {
+        let mut client = ServiceCallerDispatchClient::new(self.caller.as_ref());
+        Ok(
+            bmux_pane_runtime_plugin_api::pane_runtime_environment_v1::client::capabilities(
+                &mut client,
+            )
+            .await?,
+        )
+    }
+    pub(crate) async fn start_environment(
+        &self,
+        mutation: Uuid,
+        options: process::ProgramOptions,
+        environment: Vec<
+            bmux_pane_runtime_plugin_api::pane_runtime_environment_v1::EnvironmentEntry,
+        >,
+    ) -> Result<process::RunStatus> {
+        ensure!(
+            self.environment_capabilities().await? == 1,
+            "unsupported complete environment capability"
+        );
+        self.launch_environment(
+            mutation,
+            mutation,
+            options,
+            self.runtime_root.clone(),
+            Some(environment),
+        )
+        .await
+    }
+
     async fn launch(
         &self,
         id: Uuid,
@@ -647,13 +729,35 @@ impl ProcessService {
         options: process::ProgramOptions,
         runtime_root: String,
     ) -> Result<process::RunStatus> {
+        self.launch_environment(id, launch_mutation_id, options, runtime_root, None)
+            .await
+    }
+
+    async fn launch_environment(
+        &self,
+        id: Uuid,
+        launch_mutation_id: Uuid,
+        options: process::ProgramOptions,
+        runtime_root: String,
+        environment: Option<
+            Vec<bmux_pane_runtime_plugin_api::pane_runtime_environment_v1::EnvironmentEntry>,
+        >,
+    ) -> Result<process::RunStatus> {
         self.require_isolation()?;
         let runtime_root = verified_launch_root(&runtime_root, &self.runtime_root)?;
         Self::validate_options(&options)?;
         let store = self.store()?;
-        let intent = serde_json::to_vec(&(id, launch_mutation_id, &options, &runtime_root))?;
+        let intent = launch_intent(
+            id,
+            launch_mutation_id,
+            &options,
+            &runtime_root,
+            environment.as_deref(),
+        )?;
         if store.admit_launch(id, launch_mutation_id, &intent)? {
-            return self.retry_launch(id, launch_mutation_id, options).await;
+            return self
+                .retry_launch(id, launch_mutation_id, options, environment)
+                .await;
         }
         let recording = self.prepare_capture(&options)?;
         let mut value = Self::initial_status(id, launch_mutation_id, recording.id, runtime_root);
@@ -663,8 +767,9 @@ impl ProcessService {
             return Err(error);
         }
         let mut client = ServiceCallerDispatchClient::new(self.caller.as_ref());
-        let reservation = pane::client::reserve(
+        let reservation = reserve_program(
             &mut client,
+            environment,
             launch_mutation_id,
             pane::TerminalProgramOptions {
                 program: options.program,

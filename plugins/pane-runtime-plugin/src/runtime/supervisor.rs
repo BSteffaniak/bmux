@@ -370,6 +370,9 @@ impl SupervisorControl {
     pub(super) fn start(
         &self,
         launch: &super::PaneLaunchSpec,
+        environment: Option<
+            Vec<bmux_pane_runtime_plugin_api::pane_runtime_environment_v1::EnvironmentEntry>,
+        >,
         authorize: impl Fn() -> anyhow::Result<()>,
     ) -> anyhow::Result<Option<u32>> {
         // Startup readiness was acknowledged over inherited IPC in spawn_guardian.
@@ -381,6 +384,12 @@ impl SupervisorControl {
             args: launch.args.clone(),
             cwd: launch.cwd.clone(),
             env: launch.env.clone(),
+            native_env: environment.map(|entries| {
+                entries
+                    .into_iter()
+                    .map(|entry| (entry.key, entry.value))
+                    .collect()
+            }),
         })?;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         let mut snapshot = watcher.initial().clone();

@@ -10,8 +10,16 @@ capability RECORDING_PROCESS_PRESENTATION_WAIT_V1 = bmux.recording.process.prese
 capability RECORDING_PROCESS_PRESENTATION_V1 = bmux.recording.process.presentation.v1;
 capability RECORDING_PROCESS_V4 = bmux.recording.process.v4;
 
+capability RECORDING_PROCESS_ENVIRONMENT_V1 = bmux.recording.process.environment.v1;
 capability RECORDING_PROCESS_LIVE_PRESENTATION_V1 = bmux.recording.process.live.presentation.v1;
 capability RECORDING_PROCESS_HUMAN_INPUT_V1 = bmux.recording.process.human.input.v1;
+
+@capability(RECORDING_PROCESS_ENVIRONMENT_V1)
+interface recording-process-environment-v1 {
+    command capabilities() -> u32;
+    command start(launch_mutation_id: uuid, options: recording-process-v4.program-options,
+        environment: list<pane.environment-entry>) -> result<recording-process-v4.run-status, recording-process-v4.process-error>;
+}
 
 @capability(RECORDING_PROCESS_LIVE_PRESENTATION_V1)
 interface recording-process-live-presentation-v1 {

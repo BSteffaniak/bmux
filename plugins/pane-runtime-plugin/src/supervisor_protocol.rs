@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 
-pub const VERSION: u32 = 6;
+pub const VERSION: u32 = 7;
 pub const LIFECYCLE_CAPABILITY: u32 = 1;
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -44,6 +44,8 @@ pub enum Operation {
         args: Vec<String>,
         cwd: Option<String>,
         env: BTreeMap<String, String>,
+        #[serde(default)]
+        native_env: Option<Vec<(Vec<u8>, Vec<u8>)>>,
     },
     Status,
     Term {

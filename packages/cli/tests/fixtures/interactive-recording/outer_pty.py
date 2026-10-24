@@ -495,6 +495,10 @@ def visible_green_marker(output):
     return b'FINALMARKER' in text
 
 root, binary, mode, fixture = sys.argv[1:]
+# Synthetic caller values only; prove complete native environment forwarding.
+os.environb[b'BMUX_TEST_NATIVE_ENV'] = b'byte-\xff'
+os.environ['BMUX_TEST_EMPTY_ENV'] = ''
+os.environ['BMUX_TEST_EXPECT_RUNTIME'] = os.environ['BMUX_RUNTIME_DIR']
 if mode == 'no-tty':
     command = [binary, '--runtime', 'default', '--target', 'local', '--config',
                root + '/config/bmux.toml', 'record', '--output', root + '/exports',

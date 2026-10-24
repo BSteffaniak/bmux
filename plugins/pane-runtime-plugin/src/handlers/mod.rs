@@ -50,6 +50,10 @@ pub fn route(context: NativeServiceContext) -> ServiceResponse {
         return error;
     }
     bmux_plugin_sdk::route_service!(context, {
+        "pane-runtime-environment-v1", "capabilities" => |_req: (), _ctx| { Ok::<_, ServiceResponse>(1_u32) },
+        "pane-runtime-environment-v1", "reserve" => |req: bmux_pane_runtime_plugin_api::pane_runtime_environment_v1::client::ReserveRequest, ctx| {
+            Ok::<_, ServiceResponse>(crate::runtime::reservations::reserve_environment(req.launch_mutation_id, req.options, req.environment, |id| spawn::authorize_creation(ctx, id, "session.create").map_err(|error| bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::TerminalRecoveryError::Denied { reason: format!("{error:?}") })))
+        },
         "pane-runtime-live-presentation-v1", "capabilities" => |_req: (), _ctx| {
             Ok::<_, ServiceResponse>(live_presentation::capabilities())
         },

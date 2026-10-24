@@ -133,59 +133,45 @@ fn executable(path: &Path) -> bool {
     }
 }
 
-fn launch_arguments(options: &Options) -> Result<Vec<String>> {
+fn launch_options(options: &Options) -> Result<process::ProgramOptions> {
     let program = resolve_program(&options.argv[0])?;
-    let (cols, rows) = crossterm::terminal::size().context("reading outer terminal viewport")?;
+    let (cols, rows) = crossterm::terminal::size()?;
     ensure!(
         cols > 0 && rows > 0,
         "outer terminal has zero-sized viewport"
     );
-    let mut args = vec![
-        "--profile".into(),
-        "full".into(),
-        "--viewport".into(),
-        format!("{cols}x{rows}"),
-        "--cwd".into(),
-        std::env::current_dir()?
-            .to_str()
-            .context("cwd is not UTF-8")?
-            .into(),
-        "--idempotency-key".into(),
-        Uuid::new_v4().to_string(),
-        "--json".into(),
-    ];
-    // Capture the invoking environment before isolated startup. Never pass
-    // BMUX routing variables or override runtime-owned terminal/identity fields.
-    for (key, value) in std::env::vars_os() {
-        let key = key
-            .into_string()
-            .map_err(|_| anyhow::anyhow!("environment key is not UTF-8"))?;
-        if key.starts_with("BMUX_")
-            || matches!(
-                key.as_str(),
-                "TERM"
-                    | "COLORTERM"
-                    | "TERM_PROGRAM"
-                    | "TERM_PROGRAM_VERSION"
-                    | "APPLICATION_RESURRECTION_HOST"
-            )
-        {
-            continue;
-        }
-        let value = value
-            .into_string()
-            .map_err(|_| anyhow::anyhow!("environment value is not UTF-8 for {key}"))?;
-        args.extend(["--env".into(), format!("{key}={value}")]);
-    }
-    args.push("--".into());
-    args.push(
-        program
+    Ok(process::ProgramOptions {
+        program: program
             .to_str()
             .context("program path is not UTF-8")?
             .into(),
-    );
-    args.extend_from_slice(&options.argv[1..]);
-    Ok(args)
+        args: options.argv[1..].to_vec(),
+        cwd: Some(
+            std::env::current_dir()?
+                .to_str()
+                .context("cwd is not UTF-8")?
+                .into(),
+        ),
+        env: std::collections::BTreeMap::new(),
+        cols,
+        rows,
+        profile: bmux_recording_plugin_api::recording_types::RecordingProfile::Full,
+    })
+}
+
+fn caller_environment()
+-> Vec<bmux_pane_runtime_plugin_api::pane_runtime_environment_v1::EnvironmentEntry> {
+    use std::os::unix::ffi::OsStringExt;
+    let mut entries: Vec<_> = std::env::vars_os()
+        .map(|(key, value)| {
+            bmux_pane_runtime_plugin_api::pane_runtime_environment_v1::EnvironmentEntry {
+                key: key.into_vec(),
+                value: value.into_vec(),
+            }
+        })
+        .collect();
+    entries.sort_by(|a, b| a.key.cmp(&b.key));
+    entries
 }
 
 pub(crate) fn run(context: &NativeCommandContext) -> i32 {
@@ -196,7 +182,7 @@ pub(crate) fn run(context: &NativeCommandContext) -> i32 {
         .any(|arg| arg == "--help" || arg == "-h")
     {
         eprintln!(
-            "bmux record [--output NEW_DIR] [--export text|raw|events|gif]... [--gif NEW_PATH] [--json] -- PROGRAM ARGS\nRequires stdin/stdout TTY. Uses full profile, caller cwd/PATH/environment (excluding BMUX routing and runtime-owned terminal identity), actual terminal size. No implicit shell. Canonical evidence is retained; GIF is opt-in. Detachment preserves work; outer job suspension is unsupported (Ctrl-Z reaches the child, external SIGTSTP restores and retains the execution)."
+            "bmux record [--output NEW_DIR] [--export text|raw|events|gif]... [--gif NEW_PATH] [--json] -- PROGRAM ARGS\nRequires stdin/stdout TTY. Uses full profile, caller cwd/PATH/complete environment (except runtime-owned terminal identity), actual terminal size. No implicit shell. Canonical evidence is retained; GIF is opt-in. Detachment preserves work; outer job suspension is unsupported (Ctrl-Z reaches the child, external SIGTSTP restores and retains the execution)."
         );
         return 0;
     }
@@ -210,9 +196,10 @@ pub(crate) fn run(context: &NativeCommandContext) -> i32 {
         let options = Options::parse(&owned.arguments)?;
         ensure!(std::io::stdin().is_terminal() && std::io::stdout().is_terminal(),
             "bmux record requires an interactive terminal on stdin and stdout; use bmux recording process run for headless execution");
-        let launch_args = launch_arguments(&options)?;
+        let launch = launch_options(&options)?;
+        let environment = caller_environment();
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-        runtime.block_on(execute(&owned, options, launch_args))
+        runtime.block_on(execute(&owned, options, launch, environment))
     }).join().map_err(|_| anyhow::anyhow!("record command worker panicked")).and_then(|result| result);
     let (value, code) = match result {
         Ok(result) => result,
@@ -232,12 +219,11 @@ pub(crate) fn run(context: &NativeCommandContext) -> i32 {
 async fn execute(
     context: &NativeCommandContext,
     options: Options,
-    launch_args: Vec<String>,
+    launch: process::ProgramOptions,
+    environment: Vec<bmux_pane_runtime_plugin_api::pane_runtime_environment_v1::EnvironmentEntry>,
 ) -> Result<(serde_json::Value, i32)> {
-    let mut launch = context.clone();
-    launch.arguments = launch_args;
-    let (value, _) = crate::process_commands::execute_interactive_start(&launch).await?;
-    let mut status: process::RunStatus = serde_json::from_value(value)?;
+    let mut status =
+        crate::process_commands::execute_interactive_start(context, launch, environment).await?;
     let mut artifacts = Vec::<PathBuf>::new();
     let mut terminal_restored = None;
     let mut owned_server_cleanup_acknowledged = None;

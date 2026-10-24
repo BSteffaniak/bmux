@@ -7,6 +7,9 @@ import tty
 import time
 
 mode = sys.argv[1]
+assert os.environb[b'BMUX_TEST_NATIVE_ENV'] == b'byte-\xff'
+assert os.environ['BMUX_TEST_EMPTY_ENV'] == ''
+assert os.environ['BMUX_RUNTIME_DIR'] == os.environ['BMUX_TEST_EXPECT_RUNTIME']
 assert all(os.isatty(fd) for fd in (0, 1, 2))
 with open('/dev/tty', 'rb', buffering=0):
     assert os.tcgetpgrp(0) == os.getpgrp()

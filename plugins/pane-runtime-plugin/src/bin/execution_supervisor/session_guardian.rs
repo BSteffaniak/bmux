@@ -101,6 +101,7 @@ pub(super) fn owner(launch_path: &str, outcome_path: &str) -> io::Result<()> {
         args,
         cwd,
         env,
+        native_env,
         ..
     } = operation
     else {
@@ -113,7 +114,18 @@ pub(super) fn owner(launch_path: &str, outcome_path: &str) -> io::Result<()> {
         libc::signal(libc::SIGTTOU, libc::SIG_IGN);
     }
     let mut command = Command::new(program);
-    command.args(args).env_clear().envs(env);
+    command.args(args).env_clear();
+    if let Some(entries) = native_env {
+        use std::os::unix::ffi::OsStringExt;
+        for (key, value) in entries {
+            command.env(
+                std::ffi::OsString::from_vec(key),
+                std::ffi::OsString::from_vec(value),
+            );
+        }
+    } else {
+        command.envs(env);
+    }
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }
@@ -909,6 +921,7 @@ mod tests {
             args: Vec::new(),
             cwd: None,
             env: BTreeMap::new(),
+            native_env: None,
         }
     }
     fn disconnected_owner_fixture() -> (tempfile::TempDir, Guardian) {

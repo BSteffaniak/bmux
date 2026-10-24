@@ -5,12 +5,14 @@ owns_namespaces = ["recording", "record"]
 owns_paths      = [["server", "recording"], ["playbook", "from-recording"]]
 
 optional_capabilities = [
+    "bmux.pane_runtime.environment.v1",
     "bmux.pane_runtime.live.presentation.v1",
     "bmux.pane_runtime.human.input.v1",
     "bmux.pane_runtime.presentation.v1",
     "bmux.pane_runtime.presentation.wait.v1",
 ]
 provided_capabilities = [
+    "bmux.recording.process.environment.v1",
     "bmux.recording.process.live.presentation.v1",
     "bmux.recording.process.human.input.v1",
     "bmux.recording.read",
@@ -592,3 +594,8 @@ name                = "args"
 position            = 0
 trailing_var_arg    = true
 value_name          = "ARGS"
+
+[[services]]
+capability   = "bmux.recording.process.environment.v1"
+interface_id = "recording-process-environment-v1"
+kind         = "command"

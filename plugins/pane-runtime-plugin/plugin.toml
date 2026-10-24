@@ -4,6 +4,7 @@ name = "bmux Pane Runtime"
 optional_capabilities = ["bmux.application_resurrection.host"]
 owns_namespaces = ["pane-padding"]
 provided_capabilities = [
+    "bmux.pane_runtime.environment.v1",
     "bmux.pane_runtime.live.presentation.v1",
     "bmux.pane_runtime.human.input.v1",
     "bmux.pane_runtime.presentation.wait.v1",
@@ -33,7 +34,7 @@ minimum = "1.1"
 cargo_binary     = "bmux-pane-execution-supervisor"
 cargo_package    = "bmux_pane_runtime_plugin"
 id               = "execution-supervisor"
-protocol_version = 6
+protocol_version = 7
 relative_path    = "bmux-pane-execution-supervisor"
 
 [[dependencies]]
@@ -248,3 +249,8 @@ kind       = "string"
 long       = "pane-id"
 name       = "pane-id"
 value_name = "UUID"
+
+[[services]]
+capability   = "bmux.pane_runtime.environment.v1"
+interface_id = "pane-runtime-environment-v1"
+kind         = "command"

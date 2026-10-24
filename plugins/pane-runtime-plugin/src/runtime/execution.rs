@@ -25,6 +25,9 @@ pub(super) struct ExecutionCapture {
     #[cfg(unix)]
     pub(super) lifecycle_interrupter: Mutex<Option<std::os::unix::net::UnixStream>>,
     pub(super) spawn_authorization: Mutex<Option<SpawnAuthorization>>,
+    pub(super) exact_environment: Mutex<
+        Option<Vec<bmux_pane_runtime_plugin_api::pane_runtime_environment_v1::EnvironmentEntry>>,
+    >,
     pub(super) group_kill_issued: AtomicBool,
     pub(super) target_stop_issued: AtomicBool,
     pub(super) cleanup_failed: AtomicBool,
@@ -57,6 +60,7 @@ impl Default for ExecutionCapture {
             #[cfg(unix)]
             lifecycle_interrupter: Mutex::new(None),
             spawn_authorization: Mutex::new(None),
+            exact_environment: Mutex::new(None),
             group_kill_issued: AtomicBool::new(false),
             target_stop_issued: AtomicBool::new(false),
             cleanup_failed: AtomicBool::new(false),
@@ -670,6 +674,38 @@ pub(super) fn create_reserved(
     reserved: Option<&ExecutionRef>,
     authorize: impl Fn(uuid::Uuid) -> anyhow::Result<()> + Send + Sync + 'static,
 ) -> Result<ExecutionRef, ExecutionError> {
+    create_reserved_environment(name, options, reserved, None, authorize)
+}
+
+fn install_environment(
+    prepared: &super::PreparedFreshRuntime,
+    environment: Option<
+        Vec<bmux_pane_runtime_plugin_api::pane_runtime_environment_v1::EnvironmentEntry>,
+    >,
+) -> Result<(), ExecutionError> {
+    if let Some(environment) = environment {
+        for pane in prepared
+            .runtime
+            .as_ref()
+            .expect("prepared runtime")
+            .panes
+            .values()
+        {
+            *pane.execution.exact_environment.lock().map_err(failed)? = Some(environment.clone());
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn create_reserved_environment(
+    name: Option<String>,
+    options: ProgramOptions,
+    reserved: Option<&ExecutionRef>,
+    environment: Option<
+        Vec<bmux_pane_runtime_plugin_api::pane_runtime_environment_v1::EnvironmentEntry>,
+    >,
+    authorize: impl Fn(uuid::Uuid) -> anyhow::Result<()> + Send + Sync + 'static,
+) -> Result<ExecutionRef, ExecutionError> {
     let authorize = Arc::new(authorize);
     let mut session = bmux_session_models::Session::new(name);
     if let Some(reference) = &reserved {
@@ -706,6 +742,7 @@ pub(super) fn create_reserved(
             )
             .map_err(failed)?;
         install_reserved_capture(&prepared, reserved)?;
+        install_environment(&prepared, environment)?;
         for pane in prepared
             .runtime
             .as_ref()

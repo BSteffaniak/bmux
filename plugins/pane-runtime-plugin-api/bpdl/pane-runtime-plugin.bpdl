@@ -27,8 +27,17 @@ capability ATTACH_RUNTIME_WRITE = bmux.attach_runtime.write;
 capability ATTACH_RUNTIME_READ = bmux.attach_runtime.read;
 capability PANE_RUNTIME_SPAWN_V1 = bmux.pane_runtime.spawn.v1;
 
+capability PANE_RUNTIME_ENVIRONMENT_V1 = bmux.pane_runtime.environment.v1;
 capability PANE_RUNTIME_LIVE_PRESENTATION_V1 = bmux.pane_runtime.live.presentation.v1;
 capability PANE_RUNTIME_HUMAN_INPUT_V1 = bmux.pane_runtime.human.input.v1;
+
+@capability(PANE_RUNTIME_ENVIRONMENT_V1)
+interface pane-runtime-environment-v1 {
+    record environment-entry { key: bytes, value: bytes }
+    command capabilities() -> u32;
+    command reserve(launch_mutation_id: uuid, options: pane-runtime-execution-v4.terminal-program-options,
+        environment: list<environment-entry>) -> result<pane-runtime-execution-v4.terminal-launch-reservation, pane-runtime-execution-v4.terminal-recovery-error>;
+}
 
 // Projection may lead persistence. These receipts are never durable v4 receipts.
 @capability(PANE_RUNTIME_LIVE_PRESENTATION_V1)
