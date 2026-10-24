@@ -445,7 +445,7 @@ fn plugin_bus_event_name(kind: &str, payload: &[u8]) -> &'static str {
 mod owned_stop_tests;
 
 const OWNED_STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-const STOP_TIMEOUT_MESSAGE: &str = "server shutdown completion is unconfirmed after 30 seconds; no termination signal was sent. Cleanup may still be running. Inspect the selected runtime's server logs and retry `server stop`; do not kill a numeric PID from a stale PID file";
+const STOP_TIMEOUT_MESSAGE: &str = "no observable shutdown progress for 30 seconds; no termination signal was sent. Cleanup may still be running. Inspect the selected runtime's server logs and retry `server stop`; do not kill a numeric PID from a stale PID file";
 
 #[derive(Debug, serde::Deserialize)]
 struct ShutdownReceipt {
@@ -591,11 +591,78 @@ pub(super) async fn run_server_stop(connection_context: ConnectionContext<'_>) -
         println!("bmux server is not reachable; no local process identity is available");
         return Ok(1);
     };
-    anyhow::ensure!(process.wait(deadline).await?, "{STOP_TIMEOUT_MESSAGE}");
+    wait_for_shutdown_progress(
+        &process,
+        metadata.as_ref(),
+        &ConfigPaths::default()
+            .runtime_dir
+            .join("shutdown-progress.json"),
+    )
+    .await?;
     // Bootstrap publishes the receipt before process exit. A missing receipt
     // supports old servers, but never proves their cleanup was successful.
     let receipt = read_shutdown_receipt(receipt_path.as_deref().expect("local receipt path"))?;
     report_local_stop(cleanup_proof(metadata.as_ref(), receipt.as_ref()))
+}
+
+async fn wait_for_shutdown_progress(
+    process: &super::server_runtime::ProcessObservation,
+    metadata: Option<&ServerRuntimeMetadata>,
+    path: &std::path::Path,
+) -> Result<()> {
+    use bmux_plugin_runtime::shutdown_progress::{ShutdownIdleTimer, ShutdownProgressSnapshot};
+    let mut idle = ShutdownIdleTimer::new(std::time::Instant::now(), OWNED_STOP_TIMEOUT);
+    loop {
+        if process.exited()? {
+            return Ok(());
+        }
+        match std::fs::read(path) {
+            Ok(bytes) => {
+                anyhow::ensure!(
+                    bytes.len() <= 4096,
+                    "oversized shutdown progress observation"
+                );
+                let snapshot: ShutdownProgressSnapshot = serde_json::from_slice(&bytes)
+                    .context("invalid shutdown progress observation")?;
+                if let Some(metadata) = metadata {
+                    idle.observe(
+                        &snapshot,
+                        metadata.pid,
+                        metadata.started_at_epoch_ms,
+                        std::time::Instant::now(),
+                    )
+                    .map_err(anyhow::Error::msg)?;
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("cannot read shutdown progress observation"),
+        }
+        if idle.expired(std::time::Instant::now()) {
+            // One final observation resolves a racing exit/progress publication.
+            if process.exited()? {
+                return Ok(());
+            }
+            if let Some(metadata) = metadata
+                && let Ok(bytes) = std::fs::read(path)
+            {
+                let snapshot: ShutdownProgressSnapshot = serde_json::from_slice(&bytes)
+                    .context("invalid shutdown progress observation")?;
+                idle.observe(
+                    &snapshot,
+                    metadata.pid,
+                    metadata.started_at_epoch_ms,
+                    std::time::Instant::now(),
+                )
+                .map_err(anyhow::Error::msg)?;
+            }
+            anyhow::ensure!(
+                !idle.expired(std::time::Instant::now()),
+                "{STOP_TIMEOUT_MESSAGE}; last step: {}",
+                idle.last_step()
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
 }
 
 const BRIDGE_PREFLIGHT_TOKEN: &str = "BMUX_BRIDGE_READY";

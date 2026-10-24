@@ -1923,15 +1923,25 @@ impl BmuxServer {
             self.endpoint
         );
 
+        let progress = bmux_plugin::shutdown_progress();
+        if let Err(error) = progress.begin() {
+            warn!(%error, "shutdown progress publication failed");
+        }
         drop(listener);
         info!(
             outstanding = connections.len(),
             "shutdown draining admitted requests"
         );
         while let Some(result) = connections.join_next().await {
+            if let Err(error) = progress.advance("admitted request drained") {
+                warn!(%error, "shutdown progress publication failed");
+            }
             if let Err(error) = result {
                 warn!(%error, "connection task failed during shutdown");
             }
+        }
+        if let Err(error) = progress.advance("admitted requests drained") {
+            warn!(%error, "shutdown progress publication failed");
         }
         info!("shutdown admitted requests drained");
 
@@ -1947,10 +1957,16 @@ impl BmuxServer {
             })
             .transpose()?;
         let shutdown_result = if let Some(lifecycle) = lifecycle {
-            lifecycle.run().await.map_err(anyhow::Error::msg)
+            lifecycle
+                .run_with_progress(progress.clone())
+                .await
+                .map_err(anyhow::Error::msg)
         } else {
             Ok(())
         };
+        if let Err(error) = progress.advance("lifecycle participants settled") {
+            warn!(%error, "shutdown progress publication failed");
+        }
         let _ = emit_event(&self.state, Event::ServerStopping);
         if let Ok(mut attach_tokens) = self.state.attach_tokens.lock() {
             attach_tokens.clear();

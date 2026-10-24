@@ -174,13 +174,20 @@ impl PluginStateRegistry {
     }
 }
 
+/// Shared observational lifecycle counter for this host registry.
+///
+/// # Panics
+/// Panics if the host state registry lock is poisoned.
+#[must_use]
+pub fn shutdown_progress() -> bmux_plugin_runtime::shutdown_progress::ShutdownProgress {
+    global_registry()
+        .get_or_insert_with(bmux_plugin_runtime::shutdown_progress::ShutdownProgress::default)
+        .read()
+        .expect("shutdown progress registry lock poisoned")
+        .clone()
+}
+
 /// Process-wide shared registry instance.
-///
-/// Used by bundled plugins whose `activate` / `initialize` FFI path
-/// does not carry a registry reference in its context. Server code
-/// and plugin code both go through this singleton.
-///
-/// The returned `Arc` reference is cheap to clone.
 #[must_use]
 pub fn global_registry() -> Arc<PluginStateRegistry> {
     static GLOBAL: OnceLock<Arc<PluginStateRegistry>> = OnceLock::new();

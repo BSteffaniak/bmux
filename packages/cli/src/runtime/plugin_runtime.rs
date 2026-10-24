@@ -1735,6 +1735,7 @@ pub(super) async fn deactivate_loaded_plugins(
     let drains = loaded_plugins.iter().map(|plugin| async move {
         tracing::info!(plugin_id = plugin.declaration.id.as_str(), "shutdown background drain started");
         let result = plugin.drain_background_tasks().await;
+        if let Err(error) = bmux_plugin::shutdown_progress().advance("plugin background scope drained") { tracing::warn!(%error, "shutdown progress publication failed"); }
         tracing::info!(plugin_id = plugin.declaration.id.as_str(), error = ?result.as_ref().err(), "shutdown background drain completed");
         result
     });
@@ -1777,6 +1778,9 @@ pub(super) async fn deactivate_loaded_plugins(
                 plugin.declaration.id.as_str()
             )
         })?;
+        if let Err(error) = bmux_plugin::shutdown_progress().advance("plugin deactivated") {
+            tracing::warn!(%error, "shutdown progress publication failed");
+        }
     }
 
     Ok(())

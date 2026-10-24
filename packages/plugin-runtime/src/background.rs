@@ -102,11 +102,21 @@ impl BackgroundTasks {
     /// # Errors
     /// Reports timeout, task failure, panic, or poisoned state.
     pub async fn shutdown(&self, timeout: Duration) -> Result<(), String> {
-        self.cancel()?;
-        let deadline = tokio::time::Instant::now() + timeout;
-        let _drain = tokio::time::timeout_at(deadline, self.drain.lock())
+        tokio::time::timeout(timeout, self.shutdown_retained(None))
             .await
-            .map_err(|_| "another background drain is in progress")?;
+            .map_err(|_| "background tasks did not drain".to_string())?
+    }
+
+    /// Drain without a total deadline; observers own inactivity policy.
+    ///
+    /// # Errors
+    /// Reports task failures or poisoned state while retaining unfinished owners.
+    pub async fn shutdown_retained(
+        &self,
+        progress: Option<crate::shutdown_progress::ShutdownProgress>,
+    ) -> Result<(), String> {
+        self.cancel()?;
+        let _drain = self.drain.lock().await;
         loop {
             // Poll retained handles without removing them: cancelling shutdown
             // itself must not detach unfinished work.
@@ -116,28 +126,33 @@ impl BackgroundTasks {
                         "background task scope poisoned".to_string()
                     ));
                 };
-                let Some((name, task)) = state.tasks.last_mut() else {
+                if state.tasks.is_empty() {
                     return std::task::Poll::Ready(Ok(None));
-                };
-                match std::pin::Pin::new(task).poll(cx) {
-                    std::task::Poll::Pending => std::task::Poll::Pending,
-                    std::task::Poll::Ready(result) => {
+                }
+                for index in (0..state.tasks.len()).rev() {
+                    let (name, task) = &mut state.tasks[index];
+                    if let std::task::Poll::Ready(result) = std::pin::Pin::new(task).poll(cx) {
                         let name = name.clone();
-                        state.tasks.pop();
+                        let (_, task) = state.tasks.swap_remove(index);
+                        drop(task);
                         if !matches!(result, Ok(Ok(()))) {
                             state.failures.push(format!("{name}: {result:?}"));
                         }
-                        std::task::Poll::Ready(Ok(Some(())))
+                        return std::task::Poll::Ready(Ok(Some(())));
                     }
                 }
+                std::task::Poll::Pending
             });
-            match tokio::time::timeout_at(deadline, done).await {
-                Err(_) => {
-                    return Err("background tasks did not drain".into());
+            match done.await {
+                Err(error) => return Err(error),
+                Ok(None) => break,
+                Ok(Some(())) => {
+                    if let Some(progress) = &progress
+                        && let Err(error) = progress.advance("background task settled")
+                    {
+                        tracing::warn!(%error, "shutdown progress publication failed");
+                    }
                 }
-                Ok(Err(error)) => return Err(error),
-                Ok(Ok(None)) => break,
-                Ok(Ok(Some(()))) => {}
             }
         }
         let state = self

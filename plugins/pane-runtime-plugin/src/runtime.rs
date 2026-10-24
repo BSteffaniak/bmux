@@ -463,6 +463,11 @@ async fn await_pane_cleanup(
                 match acknowledgements[index].as_mut().poll(cx) {
                     std::task::Poll::Ready(result) => {
                         acknowledged[index] = true;
+                        if let Err(error) = bmux_plugin::shutdown_progress()
+                            .advance("resource cleanup acknowledged")
+                        {
+                            warn!(%error, "shutdown progress publication failed");
+                        }
                         if let Err(error) = result {
                             pane.execution.record_cleanup_error(error.clone());
                             errors.push(error);
@@ -477,6 +482,11 @@ async fn await_pane_cleanup(
             match std::pin::Pin::new(&mut pane.task).poll(cx) {
                 std::task::Poll::Ready(result) => {
                     *pending = false;
+                    if let Err(error) =
+                        bmux_plugin::shutdown_progress().advance("resource cleanup task settled")
+                    {
+                        warn!(%error, "shutdown progress publication failed");
+                    }
                     if let Err(error) = result {
                         let error = format!("pane cleanup task failed: {error}");
                         pane.execution.record_cleanup_error(error.clone());
@@ -660,6 +670,7 @@ fn supervision_join(
     })
 }
 
+#[cfg(test)]
 async fn join_supervision_threads(
     join: &mut tokio::task::JoinHandle<std::result::Result<(), String>>,
     timeout: Duration,
@@ -909,26 +920,23 @@ fn cleanup_failed_startup_child_on(
     // future must not drop the only reaper for this newly spawned process.
     let fallback = failure.clone();
     let cleanup = runtime.spawn(async move {
-        let mut reaper = tokio::task::spawn_blocking(move || {
+        let reaper = tokio::task::spawn_blocking(move || {
             let kill_error = child.kill().err();
             (child.wait(), kill_error)
         });
-        let result = match tokio::time::timeout(Duration::from_secs(2), &mut reaper).await {
-            Ok(Ok((Ok(_), None))) => Ok(()),
-            Ok(Ok((Ok(_), Some(error)))) => Err(format!("kill failed: {error}")),
-            Ok(Ok((Err(error), kill_error))) => {
+        let result = match reaper.await {
+            Ok((Ok(_), None)) => Ok(()),
+            Ok((Ok(_), Some(error))) => Err(format!("kill failed: {error}")),
+            Ok((Err(error), kill_error)) => {
                 Err(format!("wait failed: {error}; kill error: {kill_error:?}"))
             }
-            Ok(Err(error)) => Err(format!("child reaper failed: {error}")),
-            Err(_) => Err("timed out; owned child cleanup not acknowledged".into()),
+            Err(error) => Err(format!("child reaper failed: {error}")),
         };
+        if let Err(error) = bmux_plugin::shutdown_progress().advance("startup child reaped") {
+            warn!(%error, "shutdown progress publication failed");
+        }
         if let Some(acknowledgement) = acknowledgement {
             acknowledgement.send_replace(Some(result.clone()));
-        }
-        if !reaper.is_finished() {
-            // The startup task retains admission until the actual wait returns.
-            let late = reaper.await;
-            warn!(?late, "failed startup child settled after cleanup deadline");
         }
         match result {
             Ok(()) => (failure, Ok(())),
@@ -7564,8 +7572,12 @@ impl SessionRuntimeManager {
             let mut threads = vec![child_waiter, reader_thread];
             threads.extend(capture_owner.take().into_iter().map(Some));
             let mut join = supervision_join(&mut threads);
-            let cleanup_result = join_supervision_threads(&mut join, Duration::from_secs(4)).await;
-            let join_timed_out = !join.is_finished();
+            // Shutdown observers own inactivity policy; elapsed time alone does
+            // not make a retained cleanup join a failure.
+            let cleanup_result = (&mut join)
+                .await
+                .map_err(|error| format!("pane supervision join failed: {error}"))
+                .and_then(std::convert::identity);
             let cleanup_result = cleanup_result.and_then(|()| {
                 if let Some(error) = execution_for_task.capture_failure() {
                     Err(format!("capture cleanup incomplete: {error}"))
@@ -7576,13 +7588,6 @@ impl SessionRuntimeManager {
                 }
             });
             cleanup_tx.send_replace(Some(cleanup_result));
-            // Deadline failure is already visible. Keep the handles and the
-            // owning task alive so unpublished cleanup retains its admission
-            // reservation until all OS work actually finishes.
-            if join_timed_out {
-                let late = join.await;
-                warn!(%pane_id, ?late, "supervision threads settled after cleanup failure");
-            }
 
             exited_for_task.store(true, Ordering::SeqCst);
             execution_for_task.notify();
@@ -20677,7 +20682,7 @@ exit 7"#
     }
 
     #[tokio::test]
-    async fn failed_child_deadline_retains_owner_until_late_exit() {
+    async fn failed_child_cleanup_retains_owner_until_observed_exit() {
         let exited = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
         let dropped = Arc::new(AtomicBool::new(false));
         let child = Box::new(DelayedCleanupChild {
@@ -20691,21 +20696,24 @@ exit 7"#
             "injected startup failure".into(),
             Some(ack),
         );
-        tokio::time::timeout(Duration::from_secs(5), observation.changed())
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(observation.borrow().as_ref().unwrap().is_err());
-        assert!(!dropped.load(Ordering::SeqCst));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), observation.changed())
+                .await
+                .is_err()
+        );
+        let still_owned = !dropped.load(Ordering::SeqCst);
+        // Release the fixture before asserting: a failed assertion must not
+        // leave a blocking reaper hanging during runtime teardown.
         *exited.0.lock().unwrap() = true;
         exited.1.notify_all();
         let (reason, result) = tokio::time::timeout(Duration::from_secs(2), waiter)
             .await
             .unwrap();
-        assert!(reason.contains("child cleanup failed"));
-        assert!(result.is_err(), "late exit must not erase deadline failure");
+        assert!(still_owned);
+        assert_eq!(reason, "injected startup failure");
+        assert!(result.is_ok(), "elapsed time alone is not cleanup failure");
         assert!(dropped.load(Ordering::SeqCst));
-        assert!(observation.borrow().as_ref().unwrap().is_err());
+        assert!(observation.borrow().as_ref().unwrap().is_ok());
     }
 
     #[test]

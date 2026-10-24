@@ -6,6 +6,7 @@
 
 pub mod background;
 pub mod shutdown;
+pub mod shutdown_progress;
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;

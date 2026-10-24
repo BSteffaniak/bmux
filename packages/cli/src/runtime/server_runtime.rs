@@ -326,6 +326,7 @@ impl ProcessObservation {
         }
     }
 
+    #[cfg(test)]
     pub(super) async fn wait(&self, deadline: tokio::time::Instant) -> Result<bool> {
         loop {
             match process_wait_decision(self.exited()?, tokio::time::Instant::now() >= deadline) {
@@ -341,6 +342,7 @@ impl ProcessObservation {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum ProcessWaitDecision {
     Exited,
@@ -348,6 +350,7 @@ pub(super) enum ProcessWaitDecision {
     Wait,
 }
 
+#[cfg(test)]
 pub(super) const fn process_wait_decision(
     exited: bool,
     deadline_elapsed: bool,

@@ -279,10 +279,14 @@ pub(super) async fn acknowledge_cleanup(
     reason: String,
 ) -> String {
     let mut threads: Vec<_> = threads.into_iter().map(Some).collect();
-    let mut join = super::supervision_join(&mut threads);
-    let capture_result =
-        super::join_supervision_threads(&mut join, std::time::Duration::from_secs(4)).await;
-    let join_pending = !join.is_finished();
+    let join = super::supervision_join(&mut threads);
+    let capture_result = join
+        .await
+        .map_err(|error| format!("startup capture join failed: {error}"))
+        .and_then(std::convert::identity);
+    if let Err(error) = bmux_plugin::shutdown_progress().advance("startup capture settled") {
+        tracing::warn!(%error, "shutdown progress publication failed");
+    }
     let result = match (previous.unwrap_or(Ok(())), capture_result) {
         (Ok(()), capture) => capture,
         (Err(process), Ok(())) => Err(process),
@@ -293,11 +297,6 @@ pub(super) async fn acknowledge_cleanup(
         Err(error) => format!("{reason}; startup capture cleanup failed: {error}"),
     };
     cleanup.send_replace(Some(result));
-    // A failed deadline is not completion: retain admission until the blocking
-    // join owner acknowledges actual settlement, without probing thread state.
-    if join_pending {
-        let _ = join.await;
-    }
     reason
 }
 

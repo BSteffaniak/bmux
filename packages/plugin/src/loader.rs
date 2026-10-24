@@ -2278,7 +2278,7 @@ impl LoadedPlugin {
             .clone();
         if let Some(tasks) = tasks {
             tasks
-                .shutdown(std::time::Duration::from_secs(10))
+                .shutdown_retained(Some(crate::shutdown_progress()))
                 .await
                 .map_err(|details| PluginError::ServiceProtocol { details })?;
             *self

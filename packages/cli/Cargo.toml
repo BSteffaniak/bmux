@@ -16,6 +16,7 @@ path = "src/main.rs"
 
 [dependencies]
 bmux_frontend_runtime = { workspace = true }
+bmux_plugin_runtime   = { workspace = true }
 # Internal bmux packages
 bmux_appearance = { workspace = true }
 bmux_attach_image_protocol = { workspace = true }

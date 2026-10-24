@@ -82,8 +82,8 @@ pub use manifest::{
     PluginManifest, PluginManifestCompatibility, PluginManifestExtension,
     PluginManifestKeybindings, PluginRuntime,
 };
-pub use plugin_state::PluginStateRegistry;
 pub use plugin_state::global_registry as global_plugin_state_registry;
+pub use plugin_state::{PluginStateRegistry, shutdown_progress};
 pub use registry::{
     CapabilityProvider, PluginCompatibilityReport, PluginRegistry, RegisteredPlugin,
     ServiceProvider,

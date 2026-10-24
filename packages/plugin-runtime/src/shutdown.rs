@@ -63,6 +63,18 @@ impl ShutdownRegistry {
     /// # Errors
     /// Reports every participant failure without discarding other cleanup work.
     pub async fn run(&self) -> Result<(), String> {
+        self.run_with_progress(crate::shutdown_progress::ShutdownProgress::default())
+            .await
+    }
+
+    /// Run with the host's observational progress counter.
+    ///
+    /// # Errors
+    /// Reports the retained participant result, just like run.
+    pub async fn run_with_progress(
+        &self,
+        progress: crate::shutdown_progress::ShutdownProgress,
+    ) -> Result<(), String> {
         let mut completion = {
             let mut state = self.0.lock().map_err(|_| "shutdown registry poisoned")?;
             if let Some(receiver) = &state.completion {
@@ -72,7 +84,7 @@ impl ShutdownRegistry {
                 state.completion = Some(receiver.clone());
                 let participants = state.participants.clone();
                 tokio::spawn(async move {
-                    let result = run_participants(participants).await;
+                    let result = run_participants(participants, progress).await;
                     sender.send_replace(Some(result));
                 });
                 receiver
@@ -90,7 +102,10 @@ impl ShutdownRegistry {
     }
 }
 
-async fn run_participants(participants: Vec<Arc<dyn ShutdownParticipant>>) -> Result<(), String> {
+async fn run_participants(
+    participants: Vec<Arc<dyn ShutdownParticipant>>,
+    progress: crate::shutdown_progress::ShutdownProgress,
+) -> Result<(), String> {
     let mut errors = Vec::new();
     for phase in [
         ShutdownPhase::Persist,
@@ -100,6 +115,7 @@ async fn run_participants(participants: Vec<Arc<dyn ShutdownParticipant>>) -> Re
         let mut tasks = tokio::task::JoinSet::new();
         for participant in participants.iter().filter(|p| p.phase() == phase) {
             let participant = Arc::clone(participant);
+            let progress = progress.clone();
             tasks.spawn(async move {
                 let start = Instant::now();
                 tracing::info!(participant = participant.id(), ?phase, "shutdown participant started");
@@ -113,6 +129,7 @@ async fn run_participants(participants: Vec<Arc<dyn ShutdownParticipant>>) -> Re
                     }
                 };
                 tracing::info!(participant = participant.id(), ?phase, elapsed_ms = start.elapsed().as_millis(), error = ?result.as_ref().err(), "shutdown participant completed");
+                if let Err(error) = progress.advance(&format!("participant {} settled", participant.id())) { tracing::warn!(%error, "shutdown progress publication failed"); }
                 result.map_err(|error| format!("{}: {error}", participant.id()))
             });
         }

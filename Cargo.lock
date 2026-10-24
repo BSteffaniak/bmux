@@ -1716,6 +1716,7 @@ dependencies = [
  "bmux_playbook_plugin",
  "bmux_plugin",
  "bmux_plugin_cli_plugin",
+ "bmux_plugin_runtime",
  "bmux_plugin_sdk",
  "bmux_presenter_plugin",
  "bmux_prompted_actions_plugin",

@@ -2,7 +2,11 @@
 
 The current CLI is server-backed by default. Running `bmux` with no subcommand starts or reuses a server, creates a session when needed, and attaches.
 
-`bmux server stop` waits up to 30 seconds for the selected local process to exit.
+`bmux server stop` waits for the selected local process to exit, timing out after
+30 seconds without observable shutdown progress (not 30 seconds total). Completed
+cleanup milestones advance an instance-bound status counter; repeated status reads
+and waiting diagnostics do not extend the wait. The last known step is included
+on inactivity timeout. Older servers without progress retain a bounded wait.
 Graceful completion requires an instance-matching cleanup record; an older server
 without that record is reported as stopped with cleanup unverified. Cleanup errors
 are failures, not successful stops. An unavailable endpoint never authorizes killing

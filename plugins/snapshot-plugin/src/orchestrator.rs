@@ -126,6 +126,9 @@ impl BmuxSnapshotOrchestrator {
         let sections = self.collect_sections()?;
         let envelope = CombinedSnapshotEnvelope::build(sections)?;
         write_envelope_atomic(&path, &envelope)?;
+        if let Err(error) = bmux_plugin::shutdown_progress().advance("snapshot persisted") {
+            warn!(%error, "shutdown progress publication failed");
+        }
         if let Ok(mut status) = self.status.lock() {
             status.last_write_epoch_ms = Some(epoch_millis_now());
         }
@@ -196,6 +199,11 @@ impl BmuxSnapshotOrchestrator {
                     details: StatefulErrorDisplay(&error).to_string(),
                 }
             })?;
+            if let Err(error) =
+                bmux_plugin::shutdown_progress().advance("snapshot participant collected")
+            {
+                warn!(%error, "shutdown progress publication failed");
+            }
             sections.push(SectionV1 {
                 id: payload.id.as_str().to_string(),
                 version: payload.version,
@@ -381,6 +389,11 @@ impl SnapshotOrchestrator for BmuxSnapshotOrchestrator {
                         details: StatefulErrorDisplay(&error).to_string(),
                     }
                 })?;
+                if let Err(error) =
+                    bmux_plugin::shutdown_progress().advance("snapshot participant prepared")
+                {
+                    warn!(%error, "shutdown progress publication failed");
+                }
             }
         }
         self.save_locked()

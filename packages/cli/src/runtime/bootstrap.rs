@@ -645,6 +645,13 @@ async fn run_server_start_inner(
     write_server_runtime_metadata(std::process::id())?;
     let server_identity = crate::connection::read_server_runtime_metadata()?
         .context("server metadata missing after publication")?;
+    bmux_plugin::shutdown_progress()
+        .configure(
+            paths.runtime_dir.join("shutdown-progress.json"),
+            server_identity.pid,
+            server_identity.started_at_epoch_ms,
+        )
+        .map_err(anyhow::Error::msg)?;
     dispatch_loaded_plugin_event(&loaded_plugins, &plugin_system_event("server_started"))?;
     let gateway_loop = async move {
         match configured_gateway {
@@ -735,6 +742,11 @@ async fn run_server_start_inner(
     // Do not erase ownership metadata published by a replacement instance.
     if crate::connection::read_server_runtime_metadata()?.as_ref() == Some(&server_identity) {
         remove_server_pid_file()?;
+    }
+    if let Err(error) = bmux_plugin::shutdown_progress()
+        .advance("cleanup result published; waiting for process exit")
+    {
+        tracing::warn!(%error, "shutdown progress publication failed");
     }
     tracing::info!(error = ?result.as_ref().err(), "shutdown completed");
     result?;
