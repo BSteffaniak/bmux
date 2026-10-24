@@ -67,6 +67,23 @@ fn client_event_variants_are_tagged() {
 }
 
 #[test]
+fn current_stream_provenance_contract_has_no_caller_selected_identity() {
+    use bmux_clients_plugin_api::clients_identity::{self, StreamProvenance};
+    assert_eq!(clients_identity::INTERFACE_ID, "clients-identity/v1");
+    let admitted = StreamProvenance::Admitted {
+        subject_id: uuid::Uuid::from_u128(1),
+        lease_id: uuid::Uuid::from_u128(2),
+    };
+    for value in [StreamProvenance::Local, admitted, StreamProvenance::Invalid] {
+        let bytes = serde_json::to_vec(&value).unwrap();
+        let decoded: StreamProvenance = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(decoded, value);
+    }
+    let source = include_str!("../bpdl/clients-plugin.bpdl");
+    assert!(source.contains("query current-stream-provenance()"));
+}
+
+#[test]
 fn interface_ids_match_bpdl_source() {
     assert_eq!(clients_state::INTERFACE_ID, "clients-state");
     assert_eq!(clients_events::INTERFACE_ID, "clients-events");

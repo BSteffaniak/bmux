@@ -248,7 +248,13 @@ mod tests {
             assert_eq!(interface_id, "connections-commands");
             assert_eq!(operation, "invoke-service");
             let request: connections_commands::client::InvokeServiceRequest =
-                bmux_plugin_sdk::decode_service_message(&payload)?;
+                bmux_plugin_sdk::decode_service_message(
+                    bmux_plugin_sdk::service_contract::decode_for(
+                        interface_id,
+                        connections_commands::SERVICE_CONTRACT,
+                        &payload,
+                    )?,
+                )?;
             *self.invocation.lock().expect("invocation lock poisoned") = Some(request.invocation);
 
             let endpoint_response = ClusterStatusResult {
@@ -260,10 +266,14 @@ mod tests {
                 }],
             };
             let endpoint_payload = bmux_plugin_sdk::encode_service_message(&endpoint_response)?;
-            bmux_plugin_sdk::encode_service_message(&Ok::<
-                _,
-                bmux_connections_plugin_api::connection_types::ConnectionError,
-            >(endpoint_payload))
+            let response =
+                bmux_plugin_sdk::encode_service_message(&Ok::<
+                    _,
+                    bmux_connections_plugin_api::connection_types::ConnectionError,
+                >(endpoint_payload))?;
+            Ok(bmux_plugin_sdk::service_contract::encode_response(
+                &response,
+            ))
         }
 
         fn execute_kernel_request(

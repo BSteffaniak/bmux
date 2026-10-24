@@ -60,7 +60,7 @@ impl TypedServiceCaller {
             plugin_search_roots: context.plugin_search_roots.to_vec(),
             host: context.host.clone(),
             connection: context.connection.clone(),
-            host_kernel_bridge: context.host_kernel_bridge.copied(),
+            host_kernel_bridge: context.host_kernel_bridge.cloned(),
             plugin_settings_map: context.plugin_settings_map.clone(),
         }
     }
@@ -80,7 +80,7 @@ impl TypedServiceCaller {
             plugin_search_roots: context.plugin_search_roots.clone(),
             host: context.host.clone(),
             connection: context.connection.clone(),
-            host_kernel_bridge: context.host_kernel_bridge,
+            host_kernel_bridge: context.host_kernel_bridge.clone(),
             plugin_settings_map: context.plugin_settings_map.clone(),
         }
     }
@@ -100,7 +100,7 @@ impl TypedServiceCaller {
             plugin_search_roots: context.plugin_search_roots.clone(),
             host: context.host.clone(),
             connection: context.connection.clone(),
-            host_kernel_bridge: context.host_kernel_bridge,
+            host_kernel_bridge: context.host_kernel_bridge.clone(),
             plugin_settings_map: context.plugin_settings_map.clone(),
         }
     }
@@ -120,7 +120,7 @@ impl TypedServiceCaller {
             plugin_search_roots: context.plugin_search_roots.clone(),
             host: context.host.clone(),
             connection: context.connection.clone(),
-            host_kernel_bridge: context.host_kernel_bridge,
+            host_kernel_bridge: context.host_kernel_bridge.clone(),
             plugin_settings_map: context.plugin_settings_map.clone(),
         }
     }
@@ -167,7 +167,7 @@ impl ServiceCaller for TypedServiceCaller {
             &self.plugin_search_roots,
             &self.host,
             &self.connection,
-            self.host_kernel_bridge,
+            self.host_kernel_bridge.clone(),
             &self.plugin_settings_map,
             self.cancellation.as_ref(),
             capability,
@@ -183,11 +183,12 @@ impl ServiceCaller for TypedServiceCaller {
         request: bmux_ipc::Request,
     ) -> Result<bmux_ipc::ResponsePayload> {
         self.check_cancellation()?;
-        let bridge = self
-            .host_kernel_bridge
-            .ok_or(PluginError::UnsupportedHostOperation {
-                operation: "execute_kernel_request",
-            })?;
+        let bridge =
+            self.host_kernel_bridge
+                .clone()
+                .ok_or(PluginError::UnsupportedHostOperation {
+                    operation: "execute_kernel_request",
+                })?;
         execute_kernel_request(Some(bridge), request)
     }
 }

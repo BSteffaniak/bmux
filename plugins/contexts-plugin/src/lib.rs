@@ -1577,6 +1577,34 @@ bmux_plugin_sdk::export_plugin!(ContextsPlugin, include_str!("../plugin.toml"));
 
 #[cfg(test)]
 mod tests {
+    fn checked_test_router(
+        router: bmux_plugin::test_support::TestServiceRouter,
+    ) -> bmux_plugin::test_support::TestServiceRouter {
+        std::sync::Arc::new(
+            // The test router ABI returns PluginError by value.
+            #[allow(clippy::result_large_err)]
+            move |caller, client, capability, kind, interface, operation, payload| {
+                if !bmux_plugin_sdk::service_contract::is_checked(&payload) {
+                    return router(
+                        caller, client, capability, kind, interface, operation, payload,
+                    );
+                }
+                let contract = <bmux_sessions_plugin_api::Contract as bmux_plugin_sdk::PluginContract>::service_contract_for(interface)
+                .or_else(|| <bmux_clients_plugin_api::Contract as bmux_plugin_sdk::PluginContract>::service_contract_for(interface))
+                    .expect("mock service must have a declared generated contract");
+                let request =
+                    bmux_plugin_sdk::service_contract::decode_for(interface, contract, &payload)?
+                        .to_vec();
+                let response = router(
+                    caller, client, capability, kind, interface, operation, request,
+                )?;
+                Ok(bmux_plugin_sdk::service_contract::encode_response(
+                    &response,
+                ))
+            },
+        )
+    }
+
     struct FailedFreshSelection {
         session: Uuid,
         cleanup: std::sync::Mutex<Vec<Uuid>>,
@@ -1598,42 +1626,62 @@ mod tests {
             operation: &str,
             payload: Vec<u8>,
         ) -> bmux_plugin_sdk::Result<Vec<u8>> {
-            use bmux_sessions_plugin_api::{sessions_commands, sessions_spawn_v1};
-            match (interface, operation) {
-                ("sessions-spawn-v1", "new-session") => {
-                    let request: sessions_spawn_v1::client::NewSessionRequest =
-                        bmux_plugin_sdk::decode_service_message(&payload)?;
-                    assert_eq!(request.options.cwd.as_deref(), Some("/execution/project"));
-                    bmux_plugin_sdk::encode_service_message(&Ok::<
-                        _,
-                        sessions_commands::NewSessionError,
-                    >(
-                        sessions_commands::SessionAck { id: self.session },
-                    ))
-                }
-                ("sessions-commands", "select-session") => {
-                    let request: sessions_commands::client::SelectSessionRequest =
-                        bmux_plugin_sdk::decode_service_message(&payload)?;
-                    assert_eq!(request.selector.id, Some(self.session));
-                    bmux_plugin_sdk::encode_service_message(
-                        &Err::<sessions_commands::SessionAck, _>(
+            let checked = bmux_plugin_sdk::service_contract::is_checked(&payload);
+            let payload = if checked {
+                let contract = <bmux_sessions_plugin_api::Contract as bmux_plugin_sdk::PluginContract>::service_contract_for(interface).expect("generated mock contract");
+                bmux_plugin_sdk::service_contract::decode_for(interface, contract, &payload)?
+                    .to_vec()
+            } else {
+                payload
+            };
+            // This mock preserves the ServiceCaller error ABI by value.
+            #[allow(clippy::result_large_err)]
+            let mock_response = || -> bmux_plugin_sdk::Result<Vec<u8>> {
+                use bmux_sessions_plugin_api::{sessions_commands, sessions_spawn_v1};
+                match (interface, operation) {
+                    ("sessions-spawn-v1", "new-session") => {
+                        let request: sessions_spawn_v1::client::NewSessionRequest =
+                            bmux_plugin_sdk::decode_service_message(&payload)?;
+                        assert_eq!(request.options.cwd.as_deref(), Some("/execution/project"));
+                        bmux_plugin_sdk::encode_service_message(&Ok::<
+                            _,
+                            sessions_commands::NewSessionError,
+                        >(
+                            sessions_commands::SessionAck { id: self.session },
+                        ))
+                    }
+                    ("sessions-commands", "select-session") => {
+                        let request: sessions_commands::client::SelectSessionRequest =
+                            bmux_plugin_sdk::decode_service_message(&payload)?;
+                        assert_eq!(request.selector.id, Some(self.session));
+                        bmux_plugin_sdk::encode_service_message(&Err::<
+                            sessions_commands::SessionAck,
+                            _,
+                        >(
                             sessions_commands::SelectSessionError::NotFound,
-                        ),
-                    )
-                }
-                ("sessions-commands", "kill-session") => {
-                    let request: sessions_commands::client::KillSessionRequest =
-                        bmux_plugin_sdk::decode_service_message(&payload)?;
-                    assert_eq!(request.selector.id, Some(self.session));
-                    self.cleanup.lock().unwrap().push(self.session);
-                    bmux_plugin_sdk::encode_service_message(
-                        &Err::<sessions_commands::SessionAck, _>(
+                        ))
+                    }
+                    ("sessions-commands", "kill-session") => {
+                        let request: sessions_commands::client::KillSessionRequest =
+                            bmux_plugin_sdk::decode_service_message(&payload)?;
+                        assert_eq!(request.selector.id, Some(self.session));
+                        self.cleanup.lock().unwrap().push(self.session);
+                        bmux_plugin_sdk::encode_service_message(&Err::<
+                            sessions_commands::SessionAck,
+                            _,
+                        >(
                             sessions_commands::KillSessionError::NotFound,
-                        ),
-                    )
+                        ))
+                    }
+                    _ => panic!("unexpected service {interface}/{operation}"),
                 }
-                _ => panic!("unexpected service {interface}/{operation}"),
-            }
+            };
+            let response = mock_response()?;
+            Ok(if checked {
+                bmux_plugin_sdk::service_contract::encode_response(&response)
+            } else {
+                response
+            })
         }
     }
 
@@ -1695,21 +1743,30 @@ mod tests {
     use bmux_plugin_sdk::{ServiceKind as SdkServiceKind, encode_service_message};
     use std::collections::BTreeMap;
 
-    #[test]
-    fn restored_non_default_context_activates_without_creating_replacement() {
-        struct ExistingSession {
-            id: SessionId,
-            available: bool,
-        }
-        impl ServiceCaller for ExistingSession {
-            fn call_service_raw(
-                &self,
-                _: &str,
-                _: SdkServiceKind,
-                interface: &str,
-                operation: &str,
-                _: Vec<u8>,
-            ) -> bmux_plugin_sdk::Result<Vec<u8>> {
+    struct ExistingSession {
+        id: SessionId,
+        available: bool,
+    }
+    impl ServiceCaller for ExistingSession {
+        fn call_service_raw(
+            &self,
+            _: &str,
+            _: SdkServiceKind,
+            interface: &str,
+            operation: &str,
+            payload: Vec<u8>,
+        ) -> bmux_plugin_sdk::Result<Vec<u8>> {
+            let checked = bmux_plugin_sdk::service_contract::is_checked(&payload);
+            let _payload = if checked {
+                let contract = <bmux_sessions_plugin_api::Contract as bmux_plugin_sdk::PluginContract>::service_contract_for(interface).expect("generated mock contract");
+                bmux_plugin_sdk::service_contract::decode_for(interface, contract, &payload)?
+                    .to_vec()
+            } else {
+                payload
+            };
+            // This mock preserves the ServiceCaller error ABI by value.
+            #[allow(clippy::result_large_err)]
+            let mock_response = || -> bmux_plugin_sdk::Result<Vec<u8>> {
                 assert_eq!(
                     (interface, operation),
                     ("sessions-commands", "select-session")
@@ -1723,14 +1780,24 @@ mod tests {
                     Err(bmux_sessions_plugin_api::sessions_commands::SelectSessionError::NotFound)
                 };
                 encode_service_message(&result)
-            }
-            fn execute_kernel_request(
-                &self,
-                _: bmux_ipc::Request,
-            ) -> bmux_plugin_sdk::Result<bmux_ipc::ResponsePayload> {
-                panic!("no kernel calls")
-            }
+            };
+            let response = mock_response()?;
+            Ok(if checked {
+                bmux_plugin_sdk::service_contract::encode_response(&response)
+            } else {
+                response
+            })
         }
+        fn execute_kernel_request(
+            &self,
+            _: bmux_ipc::Request,
+        ) -> bmux_plugin_sdk::Result<bmux_ipc::ResponsePayload> {
+            panic!("no kernel calls")
+        }
+    }
+
+    #[test]
+    fn restored_non_default_context_activates_without_creating_replacement() {
         let client = ClientId::new();
         let session = SessionId::new();
         let workspace = Uuid::new_v4();
@@ -2003,7 +2070,7 @@ mod tests {
                 }
             },
         );
-        install_test_service_router(router)
+        install_test_service_router(checked_test_router(router))
     }
 
     /// Minimal `NativeServiceContext` wired to the fake router above.

@@ -5,10 +5,7 @@ use bmux_config::{BmuxConfig, ConfigPaths, RemoteServerStartMode, TlsTrustMode};
 use bmux_connections_plugin_api::connection_types::ConnectionError;
 use bmux_ipc::compressed_stream::CompressedStream;
 use bmux_ipc::transport::ErasedIpcStream;
-use git_sshripped_ssh_agent::{
-    ChallengeProof, DEFAULT_SSHSIG_NAMESPACE, sign_challenge_with_any_agent_key,
-};
-use iroh::{Endpoint, EndpointAddr, EndpointId, endpoint::presets};
+use iroh::{EndpointAddr, EndpointId};
 use rustls::RootCertStore;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
@@ -21,25 +18,50 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll};
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, ReadBuf};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio_rustls::TlsConnector;
 use uuid::Uuid;
-
-const BMUX_IROH_ALPN: &[u8] = b"bmux/gateway/iroh/1";
-const AUTH_PROTOCOL_VERSION: u8 = 1;
 
 pub async fn connect(
     config: &BmuxConfig,
     paths: &ConfigPaths,
     target: &ResolvedTarget,
 ) -> Result<BmuxClient, ConnectionError> {
+    let timeout_ms = match target {
+        ResolvedTarget::Local { .. } => {
+            return BmuxClient::connect_with_paths(paths, "bmux-connections-local")
+                .await
+                .map_err(|error| connection_error(target, error));
+        }
+        ResolvedTarget::Ssh(target) => target.connect_timeout_ms,
+        ResolvedTarget::Tls(target) => target.connect_timeout_ms,
+        ResolvedTarget::Iroh(target) => target.connect_timeout_ms,
+    }
+    .max(1);
+    // One budget covers readiness, endpoint discovery, authentication and Hello,
+    // not just the underlying transport's socket/connect operation.
+    tokio::time::timeout(
+        Duration::from_millis(timeout_ms),
+        Box::pin(connect_remote(config, paths, target)),
+    )
+    .await
+    .map_err(|_| ConnectionError::TimedOut {
+        target: target.reference().to_string(),
+        phase: "connect".to_string(),
+        timeout_ms,
+    })?
+}
+
+async fn connect_remote(
+    config: &BmuxConfig,
+    paths: &ConfigPaths,
+    target: &ResolvedTarget,
+) -> Result<BmuxClient, ConnectionError> {
     match target {
         ResolvedTarget::Local { .. } => {
-            BmuxClient::connect_with_paths(paths, "bmux-connections-local")
-                .await
-                .map_err(|error| connection_error(target, error))
+            unreachable!("local connections do not use remote deadlines")
         }
         ResolvedTarget::Ssh(target) => connect_ssh(paths, target).await,
         ResolvedTarget::Tls(target) => connect_tls(config, paths, target).await,
@@ -589,16 +611,40 @@ fn certificate_fingerprint(certificate: &[u8]) -> String {
 }
 
 async fn connect_iroh(
-    config: &BmuxConfig,
+    _config: &BmuxConfig,
     paths: &ConfigPaths,
     target: &IrohTarget,
 ) -> Result<BmuxClient, ConnectionError> {
-    let endpoint = Endpoint::builder(presets::N0)
-        .alpns(vec![BMUX_IROH_ALPN.to_vec()])
+    if target.require_ssh_auth {
+        return Err(trust_failure(
+            target,
+            "legacy SSH-agent Iroh authentication is unsupported; pair a persistent device",
+        ));
+    }
+    let device_id = target.device_id.ok_or_else(|| {
+        trust_failure(
+            target,
+            "paired Iroh target requires ?device-id=<paired-device-uuid>; pair this runtime first",
+        )
+    })?;
+    if target.compression == CompressionMode::Zstd {
+        return Err(trust_failure(
+            target,
+            "admitted Iroh streams require uncompressed preamble; explicit zstd is unsupported",
+        ));
+    }
+    let identity =
+        crate::identity::DeviceIdentity::load_or_create(&paths.state_dir, &paths.runtime_dir)
+            .map_err(|error| connection_error(target, error))?;
+    let mut builder = identity.endpoint_builder();
+    if target.ip_addr.is_some() && target.relay_url.is_none() {
+        builder = builder.clear_address_lookup().clear_relay_transports();
+    }
+    let endpoint = builder
+        .alpns(vec![crate::device_client::alpn().to_vec()])
         .bind()
         .await
         .map_err(|error| connection_error(target, error))?;
-    endpoint.online().await;
     let endpoint_id: EndpointId = target
         .endpoint_id
         .parse()
@@ -616,152 +662,34 @@ async fn connect_iroh(
     }
     let connection = tokio::time::timeout(
         Duration::from_millis(target.connect_timeout_ms),
-        endpoint.connect(address, BMUX_IROH_ALPN),
+        endpoint.connect(address, crate::device_client::alpn()),
     )
     .await
     .map_err(|error| connection_error(target, error))?
     .map_err(|error| connection_error(target, error))?;
-    if target.require_ssh_auth {
-        authenticate_iroh(&connection)
-            .await
-            .map_err(|error| authentication_error(target, error))?;
-    }
-    let (mut send, mut receive) = connection
-        .open_bi()
-        .await
-        .map_err(|error| connection_error(target, error))?;
-    let (client_stream, bridge_stream) = tokio::io::duplex(64 * 1024);
-    let (mut bridge_read, mut bridge_write) = tokio::io::split(bridge_stream);
-    tokio::spawn(async move {
-        let _ = tokio::io::copy(&mut receive, &mut bridge_write).await;
-        let _ = bridge_write.shutdown().await;
-    });
-    tokio::spawn(async move {
-        let _endpoint = endpoint;
-        let _connection = connection;
-        let _ = tokio::io::copy(&mut bridge_read, &mut send).await;
-        let _ = send.finish();
-    });
-    let use_compression = match target.compression {
-        CompressionMode::None => false,
-        CompressionMode::Zstd => true,
-        CompressionMode::Auto => remote_compression_enabled(config),
-    };
-    let stream = if use_compression {
-        ErasedIpcStream::new(Box::new(CompressedStream::new(client_stream, 1)))
-    } else {
-        ErasedIpcStream::new(Box::new(client_stream))
-    };
+    let (stream, subject) = crate::device_client::admit(
+        &endpoint,
+        &connection,
+        &identity,
+        &device_id.to_string(),
+        None,
+        Duration::from_millis(target.connect_timeout_ms.max(1)),
+    )
+    .await
+    .map_err(|_| {
+        trust_failure(
+            target,
+            "device admission denied; verify pairing and access grant",
+        )
+    })?;
     BmuxClient::connect_with_bridge_stream(
         stream,
-        Duration::from_millis(target.connect_timeout_ms),
+        Duration::from_millis(target.connect_timeout_ms.max(1)),
         "bmux-connections-iroh".to_string(),
-        load_or_create_principal_id(paths).map_err(|error| connection_error(target, error))?,
+        subject,
     )
     .await
     .map_err(|error| connection_error(target, error))
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum ClientAuthMessage {
-    Hello { version: u8 },
-    Proof { proof: ChallengeProofWire },
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum ServerAuthMessage {
-    Challenge {
-        challenge: Vec<u8>,
-        allowed_fingerprints: Vec<String>,
-    },
-    Result {
-        ok: bool,
-        error: Option<String>,
-    },
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct ChallengeProofWire {
-    fingerprint: String,
-    public_key_openssh: String,
-    signature_pem: String,
-}
-
-impl From<ChallengeProof> for ChallengeProofWire {
-    fn from(value: ChallengeProof) -> Self {
-        Self {
-            fingerprint: value.fingerprint,
-            public_key_openssh: value.public_key_openssh,
-            signature_pem: value.signature_pem,
-        }
-    }
-}
-
-async fn authenticate_iroh(connection: &iroh::endpoint::Connection) -> Result<()> {
-    let (mut send, receive) = connection.open_bi().await.context("opening auth stream")?;
-    let mut reader = BufReader::new(receive);
-    write_json_line(
-        &mut send,
-        &ClientAuthMessage::Hello {
-            version: AUTH_PROTOCOL_VERSION,
-        },
-    )
-    .await?;
-    let (challenge, allowed_fingerprints) = match read_json_line(&mut reader).await? {
-        ServerAuthMessage::Challenge {
-            challenge,
-            allowed_fingerprints,
-        } => (challenge, allowed_fingerprints),
-        ServerAuthMessage::Result { error, .. } => {
-            anyhow::bail!("authentication rejected: {}", error.unwrap_or_default());
-        }
-    };
-    let proof = sign_challenge_with_any_agent_key(
-        &challenge,
-        DEFAULT_SSHSIG_NAMESPACE,
-        &allowed_fingerprints,
-    )?
-    .context("no SSH agent key matches the remote allowlist")?;
-    write_json_line(
-        &mut send,
-        &ClientAuthMessage::Proof {
-            proof: proof.into(),
-        },
-    )
-    .await?;
-    match read_json_line(&mut reader).await? {
-        ServerAuthMessage::Result { ok: true, .. } => {
-            send.finish().context("finishing auth stream")?;
-            Ok(())
-        }
-        ServerAuthMessage::Result { error, .. } => {
-            anyhow::bail!("authentication failed: {}", error.unwrap_or_default());
-        }
-        ServerAuthMessage::Challenge { .. } => anyhow::bail!("unexpected second challenge"),
-    }
-}
-
-async fn write_json_line<T: Serialize + Sync>(
-    send: &mut iroh::endpoint::SendStream,
-    value: &T,
-) -> Result<()> {
-    let mut bytes = serde_json::to_vec(value)?;
-    bytes.push(b'\n');
-    send.write_all(&bytes).await?;
-    send.flush().await?;
-    Ok(())
-}
-
-async fn read_json_line<T: serde::de::DeserializeOwned>(
-    reader: &mut BufReader<iroh::endpoint::RecvStream>,
-) -> Result<T> {
-    let mut line = String::new();
-    if reader.read_line(&mut line).await? == 0 {
-        anyhow::bail!("authentication stream closed");
-    }
-    Ok(serde_json::from_str(line.trim_end())?)
 }
 
 fn load_or_create_principal_id(paths: &ConfigPaths) -> Result<Uuid> {
@@ -822,16 +750,6 @@ fn connection_failure(target: &impl TargetLabel, reason: &str) -> ConnectionErro
     }
 }
 
-fn authentication_error(
-    target: &impl TargetLabel,
-    error: impl std::fmt::Display,
-) -> ConnectionError {
-    ConnectionError::AuthenticationFailed {
-        target: target.reference().to_string(),
-        reason: error.to_string(),
-    }
-}
-
 fn trust_error(target: &impl TargetLabel, error: impl std::fmt::Display) -> ConnectionError {
     ConnectionError::TrustFailed {
         target: target.reference().to_string(),
@@ -860,6 +778,46 @@ mod tests {
         assert!(remote_compression_enabled(&config));
         config.behavior.compression.enabled = false;
         assert!(!remote_compression_enabled(&config));
+    }
+
+    #[tokio::test]
+    async fn remote_connect_deadline_includes_tls_handshake() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = ConfigPaths::new(
+            root.path().join("config"),
+            root.path().join("runtime"),
+            root.path().join("data"),
+            root.path().join("state"),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = ResolvedTarget::Tls(TlsTarget {
+            reference: "stalled-tls".to_string(),
+            label: "stalled-tls".to_string(),
+            host: "127.0.0.1".to_string(),
+            port: listener.local_addr().unwrap().port(),
+            server_name: "localhost".to_string(),
+            ca_file: None,
+            connect_timeout_ms: 100,
+        });
+        let mut config = BmuxConfig::default();
+        config.connections.tls_trust.mode = TlsTrustMode::TrustNew;
+        let connecting = connect(&config, &paths, &target);
+        tokio::pin!(connecting);
+        let (stream, _) = tokio::select! {
+            result = listener.accept() => result.unwrap(),
+            result = &mut connecting => panic!("connect finished before accept: {result:?}"),
+        };
+        // Hold TCP open without answering ClientHello. The socket connection
+        // succeeded, so only the end-to-end connect budget bounds this wait.
+        let result = tokio::time::timeout(Duration::from_secs(2), &mut connecting)
+            .await
+            .expect("TLS negotiation must respect the overall connect deadline");
+        assert!(matches!(
+            result,
+            Err(ConnectionError::TimedOut { target, phase, timeout_ms: 100 })
+                if target == "stalled-tls" && phase == "connect"
+        ));
+        drop(stream);
     }
 
     #[tokio::test]

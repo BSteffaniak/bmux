@@ -36,6 +36,73 @@ mod retired_execution_tests;
 #[cfg(test)]
 mod contract_tests {
     #[test]
+    fn admitted_route_contribution_is_exact_and_matches_boundary_guard() {
+        use bmux_plugin_sdk::RustPlugin;
+        let mut registrar = bmux_plugin_sdk::ContributionRegistrar::new();
+        super::PaneRuntimePlugin
+            .register_contributions(&mut registrar)
+            .unwrap();
+        let contributions = registrar.into_contributions();
+        let [
+            bmux_plugin_sdk::PluginContribution::Extension {
+                extension_point,
+                payload,
+                ..
+            },
+        ] = contributions.as_slice()
+        else {
+            panic!("expected exact route contribution");
+        };
+        assert_eq!(
+            extension_point,
+            bmux_plugin::stream_admission::STREAM_ADMITTED_ROUTES_EXTENSION
+        );
+        let routes: Vec<bmux_plugin::stream_admission::StreamAdmittedRoute> =
+            bmux_plugin_sdk::decode_service_message(payload).unwrap();
+        assert_eq!(routes.len(), 20);
+        let services = super::PaneRuntimePlugin::declared_services().unwrap();
+        let unique: std::collections::BTreeSet<_> = routes
+            .iter()
+            .map(|route| {
+                (
+                    &route.capability,
+                    route.kind,
+                    &route.interface_id,
+                    &route.operation,
+                )
+            })
+            .collect();
+        assert_eq!(unique.len(), routes.len());
+        for route in routes {
+            assert!(
+                services.iter().any(|service| {
+                    service.capability.as_str() == route.capability
+                        && service.kind == route.kind
+                        && service.interface_id == route.interface_id
+                }),
+                "approval must match an actual owned service export"
+            );
+            assert_ne!(route.capability, "bmux.pane_runtime.spawn.v1");
+            assert!(super::handlers::execution::migrated_route(
+                &route.interface_id,
+                &route.operation
+            ));
+            assert!(route.capability.starts_with("bmux.pane_runtime."));
+            assert!(
+                !route.interface_id.contains("attach") && !route.interface_id.contains("readiness")
+            );
+            assert_eq!(
+                route.kind,
+                if route.interface_id == "pane-runtime-spawn-v1" {
+                    bmux_plugin_sdk::ServiceKind::Query
+                } else {
+                    bmux_plugin_sdk::ServiceKind::Command
+                }
+            );
+        }
+    }
+
+    #[test]
     fn readiness_commands_are_discoverable() {
         use bmux_plugin_sdk::RustPlugin as _;
         let services = super::PaneRuntimePlugin::declared_services().unwrap();
@@ -76,6 +143,95 @@ pub struct PaneRuntimePlugin;
 
 impl RustPlugin for PaneRuntimePlugin {
     type Contract = bmux_pane_runtime_plugin_api::Contract;
+
+    fn register_contributions(
+        &self,
+        registrar: &mut bmux_plugin_sdk::ContributionRegistrar,
+    ) -> bmux_plugin_sdk::Result<()> {
+        use bmux_plugin::stream_admission::{
+            STREAM_ADMITTED_ROUTES_EXTENSION, StreamAdmittedRoute,
+        };
+        let interfaces = [
+            (
+                "bmux.pane_runtime.execution.v4",
+                ServiceKind::Command,
+                "pane-runtime-execution-v4",
+                &[
+                    "reserve",
+                    "launch",
+                    "reconcile",
+                    "send-admitted",
+                    "input-receipt",
+                    "resolve",
+                    "retire",
+                    "new-program-session",
+                    "status",
+                    "screen",
+                    "send",
+                    "resize",
+                    "terminate",
+                    "wait",
+                ][..],
+            ),
+            (
+                "bmux.pane_runtime.presentation.v1",
+                ServiceKind::Command,
+                "pane-runtime-presentation-v1",
+                &["capabilities", "resize", "capture-events", "present"][..],
+            ),
+            (
+                "bmux.pane_runtime.presentation.wait.v1",
+                ServiceKind::Command,
+                "pane-runtime-presentation-wait-v1",
+                &["capabilities", "wait-present"][..],
+            ),
+            (
+                "bmux.pane_runtime.spawn.v1",
+                ServiceKind::Command,
+                "pane-runtime-spawn-commands-v1",
+                &["new-session", "split-shell"][..],
+            ),
+            (
+                "bmux.pane_runtime.spawn.v1",
+                ServiceKind::Query,
+                "pane-runtime-spawn-v1",
+                &["home-directory", "capture-source", "observe-directory"][..],
+            ),
+        ];
+        let services = Self::declared_services()?;
+        let routes: Vec<StreamAdmittedRoute> = interfaces
+            .into_iter()
+            .flat_map(|(capability, kind, interface_id, operations)| {
+                operations.iter().map(move |operation| StreamAdmittedRoute {
+                    capability: capability.into(),
+                    kind,
+                    interface_id: interface_id.into(),
+                    operation: (*operation).into(),
+                })
+            })
+            // Approval cannot make a modeled but unsupported service available.
+            // Match the actual exports, including capability and invocation kind.
+            .filter(|route| {
+                services.iter().any(|service| {
+                    service.capability.as_str() == route.capability
+                        && service.kind == route.kind
+                        && service.interface_id == route.interface_id
+                })
+            })
+            .collect();
+        registrar
+            .register(bmux_plugin_sdk::PluginContribution::Extension {
+                id: "pane-runtime.stream-admitted-routes".into(),
+                extension_point: STREAM_ADMITTED_ROUTES_EXTENSION.into(),
+                payload: bmux_plugin_sdk::encode_service_message(&routes)?,
+            })
+            .map_err(
+                |details| bmux_plugin_sdk::PluginError::InvalidNativeServiceOutput {
+                    plugin_id: "bmux.pane_runtime".into(),
+                    details,
+                },
+            )
+    }
 
     fn declared_services() -> bmux_plugin_sdk::Result<Vec<bmux_plugin_sdk::PluginService>> {
         // Modeled contracts do not imply runtime support: keep incomplete

@@ -2,6 +2,14 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
+mod admission;
+mod config;
+mod device_client;
+mod directory;
+mod identity;
+mod listener;
+mod pairing;
+mod storage;
 mod target;
 mod transport;
 
@@ -9,21 +17,341 @@ use bmux_client::{
     BmuxClient, ConnectionPoolAcquireError, ConnectionPoolLimits, EndpointConnectionLease,
     EndpointConnectionPool,
 };
+use bmux_connections_plugin_api::pairing_commands::client as pairing_requests;
 use bmux_connections_plugin_api::{
     connection_types::{ConnectionError, InvocationOptions, ServiceInvokeKind},
     connections_commands::client::InvokeServiceRequest,
 };
+use bmux_plugin::stream_admission::StreamAdmissionAuthorityHandle;
 use bmux_plugin_sdk::{CancellationToken, prelude::*};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
+
+pub use admission::AdmissionProviderCodec;
+use bmux_plugin::stream_admission::StreamAdmissionAuthority;
+pub use directory::LocalStatus;
 
 #[derive(Default)]
-pub struct ConnectionsPlugin;
+pub struct ConnectionsPlugin {
+    local_runtime: Option<directory::LocalRuntime>,
+    pairing: Option<Arc<pairing::PairingAuthority>>,
+    admission: Option<Arc<admission::AdmissionAuthority>>,
+    admission_handle: Option<StreamAdmissionAuthorityHandle>,
+    listener: tokio::sync::Mutex<Option<listener::Listener>>,
+}
+
+impl ConnectionsPlugin {
+    /// Host integration must install this handle in its own registry before
+    /// accepting admitted streams. This does not enable a listener.
+    #[must_use]
+    pub fn admission_handle(&self) -> Option<StreamAdmissionAuthorityHandle> {
+        self.admission_handle.clone()
+    }
+
+    fn pairing(&self) -> Result<&pairing::PairingAuthority, ServiceResponse> {
+        self.pairing
+            .as_deref()
+            .ok_or_else(|| ServiceResponse::error("unavailable", "pairing authority is inactive"))
+    }
+
+    fn admission(&self) -> Result<&admission::AdmissionAuthority, ServiceResponse> {
+        self.admission
+            .as_deref()
+            .ok_or_else(|| ServiceResponse::error("unavailable", "admission authority is inactive"))
+    }
+
+    fn listener_status(
+        &self,
+    ) -> Result<bmux_connections_plugin_api::pairing_types::ListenerStatus, ServiceResponse> {
+        let runtime = self
+            .local_runtime
+            .as_ref()
+            .ok_or_else(|| ServiceResponse::error("unavailable", "inactive runtime"))?;
+        let listener = self
+            .listener
+            .try_lock()
+            .map_err(|_| ServiceResponse::error("busy", "listener transition in progress"))?;
+        Ok(bmux_connections_plugin_api::pairing_types::ListenerStatus {
+            endpoint_id: runtime.status().endpoint_id,
+            enabled: listener.is_some(),
+            endpoint_address: listener
+                .as_ref()
+                .map(|listener| format!("{:?}", listener.status())),
+        })
+    }
+
+    fn start_listener(
+        &self,
+        context: &NativeServiceContext,
+    ) -> Result<bmux_connections_plugin_api::pairing_types::ListenerStatus, ServiceResponse> {
+        let _owner = pairing_owner(context)?;
+        let runtime = self
+            .local_runtime
+            .as_ref()
+            .ok_or_else(|| ServiceResponse::error("unavailable", "inactive runtime"))?;
+        if !runtime.ingress_allowed() {
+            return Err(ServiceResponse::error(
+                "ingress_denied",
+                "explicit full-runtime ingress policy required",
+            ));
+        }
+        let caller = bmux_plugin::TypedServiceCaller::from_service_context(context);
+        let mut client = bmux_plugin::ServiceCallerDispatchClient::new(&caller);
+        let backend = bmux_plugin::block_on_typed_dispatch(
+            bmux_clients_plugin_api::clients_identity::client::stream_admission_backend(
+                &mut client,
+            ),
+        );
+        let admission = self.admission()?;
+        if !matches!(backend, Ok(Ok(Some(id))) if id == admission.instance()) {
+            return Err(ServiceResponse::error(
+                "backend_unconfirmed",
+                "same-instance host admission registration required",
+            ));
+        }
+        let pairing = Arc::clone(
+            self.pairing
+                .as_ref()
+                .ok_or_else(|| ServiceResponse::error("unavailable", "inactive pairing"))?,
+        );
+        let admission = Arc::clone(
+            self.admission
+                .as_ref()
+                .ok_or_else(|| ServiceResponse::error("unavailable", "inactive admission"))?,
+        );
+        let backend = bmux_ipc::IpcEndpoint::unix_socket(
+            target::context_paths(&context.connection).server_socket(),
+        );
+        block_on_connection(async {
+            let mut listener = self.listener.lock().await;
+            if listener.is_none() {
+                *listener = Some(
+                    listener::Listener::start(
+                        runtime.endpoint_builder(),
+                        pairing,
+                        admission,
+                        backend,
+                    )
+                    .await
+                    .map_err(pairing_error)?,
+                );
+            }
+            drop(listener);
+            Ok::<_, ServiceResponse>(())
+        })?;
+        self.listener_status()
+    }
+
+    fn stop_listener(
+        &self,
+        context: &NativeServiceContext,
+    ) -> Result<bmux_connections_plugin_api::pairing_types::ListenerStatus, ServiceResponse> {
+        let _owner = pairing_owner(context)?;
+        block_on_connection(async {
+            let mut listener = self.listener.lock().await;
+            if let Some(mut active) = listener.take() {
+                active.stop().await;
+            }
+        });
+        self.listener_status()
+    }
+
+    /// Local activation status without private key material or network activity.
+    #[must_use]
+    pub fn local_status(&self) -> Option<LocalStatus> {
+        self.local_runtime
+            .as_ref()
+            .map(directory::LocalRuntime::status)
+    }
+}
 
 impl RustPlugin for ConnectionsPlugin {
     type Contract = bmux_connections_plugin_api::Contract;
 
+    fn register_contributions(
+        &self,
+        registrar: &mut bmux_plugin_sdk::ContributionRegistrar,
+    ) -> bmux_plugin_sdk::Result<()> {
+        use bmux_connections_plugin_api::pairing_state;
+        use bmux_connections_plugin_api::{
+            admission_provider_commands as commands, admission_provider_state as state,
+        };
+        use bmux_plugin::stream_admission::{
+            STREAM_ADMISSION_PROVIDER_EXTENSION, StreamAdmissionProviderDeclaration,
+            StreamAdmissionProviderOperation,
+        };
+        use bmux_plugin::stream_admission::{
+            STREAM_ADMITTED_ROUTES_EXTENSION, StreamAdmittedRoute,
+        };
+        let operation = |interface: &str, operation: &str, contract: &[u8]| {
+            Ok::<_, &str>(StreamAdmissionProviderOperation {
+                capability: "bmux.connections.pairing".into(),
+                interface_id: interface.into(),
+                operation: operation.into(),
+                contract: contract
+                    .try_into()
+                    .map_err(|_| "generated contract is not SHA-256")?,
+            })
+        };
+        let invalid_contract =
+            |details: &str| bmux_plugin_sdk::PluginError::InvalidNativeServiceOutput {
+                plugin_id: "bmux.connections".into(),
+                details: details.into(),
+            };
+        let declaration = StreamAdmissionProviderDeclaration {
+            probe: operation(
+                state::INTERFACE_ID.as_str(),
+                state::OP_PROBE.as_str(),
+                state::SERVICE_CONTRACT,
+            )
+            .map_err(invalid_contract)?,
+            consume: operation(
+                commands::INTERFACE_ID.as_str(),
+                commands::OP_CONSUME.as_str(),
+                commands::SERVICE_CONTRACT,
+            )
+            .map_err(invalid_contract)?,
+            validate: operation(
+                state::INTERFACE_ID.as_str(),
+                state::OP_VALIDATE.as_str(),
+                state::SERVICE_CONTRACT,
+            )
+            .map_err(invalid_contract)?,
+            deadline_ms: 5_000,
+            max_in_flight: 16,
+        };
+        registrar
+            .register(bmux_plugin_sdk::PluginContribution::Extension {
+                id: "connections.stream-admission-provider".into(),
+                extension_point: STREAM_ADMISSION_PROVIDER_EXTENSION.into(),
+                payload: bmux_plugin_sdk::encode_service_message(&declaration)?,
+            })
+            .map_err(
+                |details| bmux_plugin_sdk::PluginError::InvalidNativeServiceOutput {
+                    plugin_id: "bmux.connections".into(),
+                    details,
+                },
+            )?;
+        let routes: Vec<_> = [
+            pairing_state::OP_CURRENT_PROVENANCE,
+            pairing_state::OP_CHECK_DEVICE_ACCESS,
+        ]
+        .into_iter()
+        .map(|operation| StreamAdmittedRoute {
+            capability: "bmux.connections.pairing".into(),
+            kind: bmux_plugin_sdk::ServiceKind::Query,
+            interface_id: pairing_state::INTERFACE_ID.to_string(),
+            operation: operation.to_string(),
+        })
+        .collect();
+        registrar
+            .register(bmux_plugin_sdk::PluginContribution::Extension {
+                id: "connections.admitted-read-routes".into(),
+                extension_point: STREAM_ADMITTED_ROUTES_EXTENSION.into(),
+                payload: bmux_plugin_sdk::encode_service_message(&routes)?,
+            })
+            .map_err(
+                |details| bmux_plugin_sdk::PluginError::InvalidNativeServiceOutput {
+                    plugin_id: "bmux.connections".into(),
+                    details,
+                },
+            )
+    }
+
+    fn activate(&mut self, context: NativeLifecycleContext) -> Result<i32, PluginCommandError> {
+        *self.listener.get_mut() = None;
+        self.local_runtime = None;
+        self.pairing = None;
+        self.admission = None;
+        self.admission_handle = None;
+        let settings = config::RemoteSettings::load(context.settings.as_ref())
+            .map_err(|error| PluginCommandError::failed(error.to_string()))?;
+        let identity = identity::RuntimeIdentity::load_or_create(
+            std::path::Path::new(&context.connection.state_dir),
+            std::path::Path::new(&context.connection.runtime_dir),
+        )
+        .map_err(|error| {
+            PluginCommandError::failed(format!(
+                "endpoint identity initialization failed: {error:#}"
+            ))
+        })?;
+        let local_runtime = directory::LocalRuntime::new(identity, settings);
+        let pairing = Arc::new(
+            pairing::PairingAuthority::open(
+                std::path::Path::new(&context.connection.state_dir),
+                std::path::Path::new(&context.connection.runtime_dir),
+                local_runtime.status().endpoint_id,
+            )
+            .map_err(|error| {
+                PluginCommandError::failed(format!("pairing initialization failed: {error:#}"))
+            })?,
+        );
+        let admission = Arc::new(admission::AdmissionAuthority::new(Arc::clone(&pairing)));
+        self.admission_handle = Some(StreamAdmissionAuthorityHandle::new(admission.clone()));
+        self.admission = Some(admission);
+        self.pairing = Some(pairing);
+        self.local_runtime = Some(local_runtime);
+        Ok(EXIT_OK)
+    }
+
+    fn deactivate(&mut self, _context: NativeLifecycleContext) -> Result<i32, PluginCommandError> {
+        *self.listener.get_mut() = None;
+        self.local_runtime = None;
+        self.pairing = None;
+        self.admission = None;
+        self.admission_handle = None;
+        Ok(EXIT_OK)
+    }
+
     fn invoke_service(&self, context: NativeServiceContext) -> ServiceResponse {
         bmux_plugin_sdk::route_service!(context, {
+            "pairing-commands", "start-listener" => |(): (), ctx| { self.start_listener(ctx) },
+            "pairing-commands", "stop-listener" => |(): (), ctx| { self.stop_listener(ctx) },
+            "pairing-state", "listener-status" => |(): (), ctx| { let _owner = pairing_owner(ctx)?; self.listener_status() },
+            "admission-provider-state", "probe" => |(): (), ctx| {
+                host_internal(ctx)?;
+                Ok::<_, ServiceResponse>(self.admission()?.instance())
+            },
+            "admission-provider-commands", "consume" => |request: bmux_connections_plugin_api::admission_provider_commands::client::ConsumeRequest, ctx| {
+                host_internal(ctx)?;
+                let binding = self.admission()?.consume(&request.ticket).map_err(|_| ServiceResponse::error("admission_denied", "invalid ticket"))?;
+                Ok::<_, ServiceResponse>(bmux_connections_plugin_api::pairing_types::AdmissionBinding { subject_id: binding.subject_id(), lease_id: binding.lease_id() })
+            },
+            "admission-provider-state", "validate" => |request: bmux_connections_plugin_api::admission_provider_state::client::ValidateRequest, ctx| {
+                host_internal(ctx)?;
+                let binding = bmux_plugin::stream_admission::StreamAdmissionBinding::new(request.subject_id, request.lease_id);
+                Ok::<_, ServiceResponse>(self.admission()?.validate(&binding).is_ok())
+            },
+            "pairing-commands", "create-invitation" => |request: pairing_requests::CreateInvitationRequest, ctx| {
+                let owner = pairing_owner(ctx)?;
+                self.pairing()?.create_invitation(&owner, &request.device_key, request.ttl_seconds, request.access).map_err(pairing_error)
+            },
+            "pairing-commands", "redeem-invitation" => |request: pairing_requests::RedeemInvitationRequest, _ctx| {
+                self.pairing()?.redeem(&request.invitation_id, &request.secret, &request.signature).map_err(pairing_error)
+            },
+            "pairing-commands", "grant-device" => |request: pairing_requests::GrantDeviceRequest, ctx| {
+                let owner = pairing_owner(ctx)?;
+                self.pairing()?.grant(&owner, &request.device_id, request.access).map_err(pairing_error)
+            },
+            "pairing-commands", "revoke-device" => |request: pairing_requests::RevokeDeviceRequest, ctx| {
+                let owner = pairing_owner(ctx)?;
+                self.pairing()?.revoke(&owner, &request.device_id).map_err(pairing_error)
+            },
+            "pairing-commands", "begin-admission" => |request: pairing_requests::BeginAdmissionRequest, _ctx| {
+                self.admission()?.begin(&request.device_id).map_err(pairing_error)
+            },
+            "pairing-commands", "finish-admission" => |request: pairing_requests::FinishAdmissionRequest, _ctx| {
+                self.admission()?.finish(&request.challenge, &request.signature).map_err(pairing_error)
+            },
+            "pairing-state", "current-provenance" => |(): (), ctx| {
+                Ok::<_, ServiceResponse>(current_provenance(ctx))
+            },
+            "pairing-state", "list-devices" => |(): (), ctx| {
+                let owner = pairing_owner(ctx)?;
+                self.pairing()?.list_devices(&owner).map_err(pairing_error)
+            },
+            "pairing-state", "check-device-access" => |request: bmux_connections_plugin_api::pairing_state::client::CheckDeviceAccessRequest, _ctx| {
+                self.pairing()?.check_device_access(request.subject_id).map_err(pairing_error)
+            },
             "connections-state", "resolve" => |request: bmux_connections_plugin_api::connections_state::client::ResolveRequest, ctx| {
                 let config = target::load_config(&ctx.connection)
                     .map_err(|error| ServiceResponse::error("config_failed", error.to_string()))?;
@@ -49,6 +377,68 @@ impl RustPlugin for ConnectionsPlugin {
                 ))
             },
         })
+    }
+}
+
+fn pairing_error(_error: anyhow::Error) -> ServiceResponse {
+    // No secret-bearing parser/crypto details cross the service boundary.
+    ServiceResponse::error("pairing_denied", "pairing operation failed")
+}
+
+fn current_provenance(
+    context: &NativeServiceContext,
+) -> bmux_connections_plugin_api::pairing_types::StreamProvenance {
+    use bmux_clients_plugin_api::clients_identity::StreamProvenance as Origin;
+    use bmux_connections_plugin_api::pairing_types::StreamProvenance as Output;
+    let caller = bmux_plugin::TypedServiceCaller::from_service_context(context);
+    let mut client = bmux_plugin::ServiceCallerDispatchClient::new(&caller);
+    match bmux_plugin::block_on_typed_dispatch(
+        bmux_clients_plugin_api::clients_identity::client::current_stream_provenance(&mut client),
+    ) {
+        Ok(Ok(Origin::Local)) => Output::Local,
+        Ok(Ok(Origin::Admitted {
+            subject_id,
+            lease_id,
+        })) => Output::Admitted {
+            subject_id,
+            lease_id,
+        },
+        _ => Output::Invalid,
+    }
+}
+
+fn host_internal(context: &NativeServiceContext) -> Result<(), ServiceResponse> {
+    let caller = bmux_plugin::TypedServiceCaller::from_service_context(context);
+    let mut client = bmux_plugin::ServiceCallerDispatchClient::new(&caller);
+    if matches!(
+        bmux_plugin::block_on_typed_dispatch(
+            bmux_clients_plugin_api::clients_identity::client::current_stream_provenance(
+                &mut client
+            )
+        ),
+        Ok(Ok(
+            bmux_clients_plugin_api::clients_identity::StreamProvenance::HostInternal
+        ))
+    ) {
+        Ok(())
+    } else {
+        Err(ServiceResponse::error(
+            "host_required",
+            "host-internal provider invocation required",
+        ))
+    }
+}
+
+fn pairing_owner(context: &NativeServiceContext) -> Result<pairing::LocalOwner, ServiceResponse> {
+    if current_provenance(context)
+        == bmux_connections_plugin_api::pairing_types::StreamProvenance::Local
+    {
+        Ok(pairing::LocalOwner::from_trusted_local_owner())
+    } else {
+        Err(ServiceResponse::error(
+            "owner_required",
+            "trusted local owner provenance required",
+        ))
     }
 }
 
@@ -333,6 +723,31 @@ mod tests {
         )
     }
 
+    #[test]
+    fn activation_loads_identity_and_settings_without_ingress() {
+        let root = tempfile::tempdir().unwrap();
+        let state = root.path().join("state");
+        let runtime = root.path().join("runtime");
+        std::fs::create_dir(&state).unwrap();
+        std::fs::create_dir(&runtime).unwrap();
+        let context: NativeLifecycleContext = serde_json::from_value(serde_json::json!({
+            "plugin_id": "bmux.connections",
+            "host": { "product_name": "bmux", "product_version": "test", "plugin_api_version": bmux_plugin_sdk::CURRENT_PLUGIN_API_VERSION, "plugin_abi_version": bmux_plugin_sdk::CURRENT_PLUGIN_ABI_VERSION },
+            "connection": { "config_dir": root.path(), "runtime_dir": runtime, "data_dir": root.path(), "state_dir": state },
+            "settings": serde_json::to_string(&toml::from_str::<toml::Value>("[remote]\nstartup_wait_ms = 1234\n[remote.relay]\nmode = 'disabled'").unwrap()).unwrap()
+        })).unwrap();
+        let mut plugin = ConnectionsPlugin::default();
+        plugin.activate(context.clone()).unwrap();
+        let first = plugin.local_status().unwrap();
+        assert_eq!(first.relay_mode, "disabled");
+        assert_eq!(first.startup_wait_ms, 1234);
+        assert!(!first.listener_enabled);
+        plugin.deactivate(context.clone()).unwrap();
+        assert!(plugin.local_status().is_none());
+        plugin.activate(context).unwrap();
+        assert_eq!(plugin.local_status().unwrap(), first);
+    }
+
     fn service_context(
         paths: &ConfigPaths,
         operation: &str,
@@ -394,6 +809,356 @@ mod tests {
         }
     }
 
+    fn trusted_local_router() -> bmux_plugin::test_support::TestServiceRouterGuard {
+        provenance_router(bmux_clients_plugin_api::clients_identity::StreamProvenance::Local)
+    }
+
+    fn provenance_router(
+        origin: bmux_clients_plugin_api::clients_identity::StreamProvenance,
+    ) -> bmux_plugin::test_support::TestServiceRouterGuard {
+        bmux_plugin::test_support::install_test_service_router(Arc::new(
+            // The required test router signature uses PluginError by value.
+            #[allow(clippy::result_large_err)]
+            move |_, _, _, _, interface, operation, payload| {
+                bmux_plugin_sdk::service_contract::decode_for(
+                    interface,
+                    bmux_clients_plugin_api::clients_identity::SERVICE_CONTRACT,
+                    &payload,
+                )?;
+                assert_eq!(
+                    interface,
+                    bmux_clients_plugin_api::clients_identity::INTERFACE_ID.as_str()
+                );
+                assert_eq!(operation, "current-stream-provenance");
+                let response =
+                    bmux_plugin_sdk::encode_service_message(&Ok::<
+                        _,
+                        bmux_clients_plugin_api::clients_identity::IdentityError,
+                    >(origin.clone()))?;
+                Ok(bmux_plugin_sdk::service_contract::encode_response(
+                    &response,
+                ))
+            },
+        ))
+        // The router remains installed only for this test scope.
+    }
+
+    #[test]
+    fn activation_contribution_matches_generated_provider_contracts() {
+        use bmux_connections_plugin_api::{
+            admission_provider_commands as commands, admission_provider_state as state,
+        };
+        use bmux_plugin::stream_admission::{
+            STREAM_ADMISSION_PROVIDER_EXTENSION, StreamAdmissionProviderCodec,
+            StreamAdmissionProviderDeclaration,
+        };
+        let mut registrar = bmux_plugin_sdk::ContributionRegistrar::new();
+        ConnectionsPlugin::default()
+            .register_contributions(&mut registrar)
+            .unwrap();
+        let contributions = registrar.into_contributions();
+        let [
+            bmux_plugin_sdk::PluginContribution::Extension {
+                extension_point,
+                payload,
+                ..
+            },
+            bmux_plugin_sdk::PluginContribution::Extension {
+                extension_point: routes_point,
+                payload: routes_payload,
+                ..
+            },
+        ] = contributions.as_slice()
+        else {
+            panic!("expected provider extension")
+        };
+        assert_eq!(extension_point, STREAM_ADMISSION_PROVIDER_EXTENSION);
+        assert_eq!(
+            routes_point,
+            bmux_plugin::stream_admission::STREAM_ADMITTED_ROUTES_EXTENSION
+        );
+        let routes: Vec<bmux_plugin::stream_admission::StreamAdmittedRoute> =
+            bmux_plugin_sdk::decode_service_message(routes_payload).unwrap();
+        assert_eq!(routes.len(), 2);
+        assert!(
+            routes
+                .iter()
+                .all(|route| route.kind == bmux_plugin_sdk::ServiceKind::Query
+                    && route.interface_id == "pairing-state"
+                    && matches!(
+                        route.operation.as_str(),
+                        "current-provenance" | "check-device-access"
+                    ))
+        );
+        let declaration: StreamAdmissionProviderDeclaration =
+            bmux_plugin_sdk::decode_service_message(payload).unwrap();
+        assert_eq!(declaration.probe.interface_id, state::INTERFACE_ID.as_str());
+        assert_eq!(
+            declaration.consume.interface_id,
+            commands::INTERFACE_ID.as_str()
+        );
+        assert_eq!(
+            declaration.probe.contract.as_slice(),
+            state::SERVICE_CONTRACT
+        );
+        assert_eq!(
+            declaration.consume.contract.as_slice(),
+            commands::SERVICE_CONTRACT
+        );
+        assert_eq!(declaration.validate.operation, "validate");
+        assert_eq!(declaration.deadline_ms, 5_000);
+        assert_eq!(declaration.max_in_flight, 16);
+        let codec = AdmissionProviderCodec;
+        assert_eq!(
+            declaration.encode_probe().unwrap(),
+            codec.encode_probe().unwrap()
+        );
+        assert_eq!(
+            declaration.encode_consume(&[9; 32]).unwrap(),
+            codec.encode_consume(&[9; 32]).unwrap()
+        );
+        let binding = bmux_plugin::stream_admission::StreamAdmissionBinding::new(
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+        );
+        assert_eq!(
+            declaration.encode_validate(&binding).unwrap(),
+            codec.encode_validate(&binding).unwrap()
+        );
+    }
+
+    #[test]
+    fn listener_start_requires_owner_policy_and_same_backend_instance() {
+        use bmux_clients_plugin_api::clients_identity::StreamProvenance as Origin;
+        let root = tempfile::tempdir().unwrap();
+        let paths = test_paths(root.path());
+        std::fs::create_dir_all(&paths.state_dir).unwrap();
+        std::fs::create_dir_all(&paths.runtime_dir).unwrap();
+        let identity =
+            identity::RuntimeIdentity::load_or_create(&paths.state_dir, &paths.runtime_dir)
+                .unwrap();
+        let pairing = Arc::new(
+            pairing::PairingAuthority::open(
+                &paths.state_dir,
+                &paths.runtime_dir,
+                identity.endpoint_id(),
+            )
+            .unwrap(),
+        );
+        let admission = Arc::new(admission::AdmissionAuthority::new(pairing));
+        let mut plugin = ConnectionsPlugin {
+            local_runtime: Some(directory::LocalRuntime::new(
+                identity,
+                config::RemoteSettings::default(),
+            )),
+            admission: Some(admission),
+            ..ConnectionsPlugin::default()
+        };
+        let context = service_context(&paths, "start-listener", Vec::new());
+        assert!(plugin.start_listener(&context).is_err());
+        {
+            let _router = provenance_router(Origin::Admitted {
+                subject_id: uuid::Uuid::new_v4(),
+                lease_id: uuid::Uuid::new_v4(),
+            });
+            assert!(plugin.start_listener(&context).is_err());
+        }
+        {
+            let _router = trusted_local_router();
+            let error = plugin.start_listener(&context).unwrap_err();
+            assert_eq!(error.error.unwrap().code, "ingress_denied");
+        }
+        let identity =
+            identity::RuntimeIdentity::load_or_create(&paths.state_dir, &paths.runtime_dir)
+                .unwrap();
+        let settings = config::RemoteSettings {
+            allow_full_runtime_ingress: true,
+            ..config::RemoteSettings::default()
+        };
+        plugin.local_runtime = Some(directory::LocalRuntime::new(identity, settings));
+        let _router = bmux_plugin::test_support::install_test_service_router(Arc::new(
+            // The required test router signature uses PluginError by value.
+            #[allow(clippy::result_large_err)]
+            |_, _, _, _, interface, operation, payload| {
+                bmux_plugin_sdk::service_contract::decode_for(
+                    interface,
+                    bmux_clients_plugin_api::clients_identity::SERVICE_CONTRACT,
+                    &payload,
+                )?;
+                let response = match operation {
+                    "current-stream-provenance" => Ok::<_, bmux_plugin_sdk::PluginError>(
+                        bmux_plugin_sdk::encode_service_message(&Ok::<
+                            _,
+                            bmux_clients_plugin_api::clients_identity::IdentityError,
+                        >(
+                            Origin::Local
+                        ))
+                        .unwrap(),
+                    ),
+                    "stream-admission-backend" => Ok::<_, bmux_plugin_sdk::PluginError>(
+                        bmux_plugin_sdk::encode_service_message(&Ok::<
+                            _,
+                            bmux_clients_plugin_api::clients_identity::IdentityError,
+                        >(Some(
+                            uuid::Uuid::new_v4(),
+                        )))
+                        .unwrap(),
+                    ),
+                    _ => panic!("unexpected foundational operation"),
+                }?;
+                Ok(bmux_plugin_sdk::service_contract::encode_response(
+                    &response,
+                ))
+            },
+        ));
+        let error = plugin.start_listener(&context).unwrap_err();
+        assert_eq!(error.error.unwrap().code, "backend_unconfirmed");
+        assert!(!plugin.listener_status().unwrap().enabled);
+    }
+
+    #[test]
+    fn provider_routes_require_host_internal_not_local_or_remote() {
+        use bmux_clients_plugin_api::clients_identity::StreamProvenance as Origin;
+        let root = tempfile::tempdir().unwrap();
+        let paths = test_paths(root.path());
+        std::fs::create_dir_all(&paths.state_dir).unwrap();
+        std::fs::create_dir_all(&paths.runtime_dir).unwrap();
+        let pairing = Arc::new(
+            pairing::PairingAuthority::open(
+                &paths.state_dir,
+                &paths.runtime_dir,
+                iroh::SecretKey::generate().public().to_string(),
+            )
+            .unwrap(),
+        );
+        let admission = Arc::new(admission::AdmissionAuthority::new(pairing));
+        let instance = admission.instance();
+        let plugin = ConnectionsPlugin {
+            admission: Some(admission),
+            ..ConnectionsPlugin::default()
+        };
+        let mut context = service_context(
+            &paths,
+            "probe",
+            bmux_plugin_sdk::encode_service_message(&()).unwrap(),
+        );
+        context.request.service.interface_id = "admission-provider-state".into();
+        assert!(plugin.invoke_service(context.clone()).error.is_some());
+        for origin in [
+            Origin::Local,
+            Origin::Invalid,
+            Origin::Admitted {
+                subject_id: uuid::Uuid::new_v4(),
+                lease_id: uuid::Uuid::new_v4(),
+            },
+        ] {
+            let _router = provenance_router(origin);
+            assert!(plugin.invoke_service(context.clone()).error.is_some());
+        }
+        let _router = provenance_router(Origin::HostInternal);
+        let response = plugin.invoke_service(context);
+        assert!(response.error.is_none());
+        assert_eq!(
+            bmux_plugin_sdk::decode_service_message::<uuid::Uuid>(&response.payload).unwrap(),
+            instance
+        );
+        let context = service_context(&paths, "create-invitation", Vec::new());
+        assert!(pairing_owner(&context).is_err());
+    }
+
+    #[test]
+    fn generated_pairing_routes_require_owner_and_read_durable_grants() {
+        use bmux_connections_plugin_api::pairing_types::{DeviceAccess, DeviceAccessCheck};
+        let root = tempfile::tempdir().unwrap();
+        let paths = test_paths(root.path());
+        std::fs::create_dir_all(&paths.state_dir).unwrap();
+        std::fs::create_dir_all(&paths.runtime_dir).unwrap();
+        let pairing = Arc::new(
+            pairing::PairingAuthority::open(
+                &paths.state_dir,
+                &paths.runtime_dir,
+                iroh::SecretKey::generate().public().to_string(),
+            )
+            .unwrap(),
+        );
+        let admission = Arc::new(admission::AdmissionAuthority::new(Arc::clone(&pairing)));
+        let plugin = ConnectionsPlugin {
+            pairing: Some(Arc::clone(&pairing)),
+            admission_handle: Some(StreamAdmissionAuthorityHandle::new(admission.clone())),
+            admission: Some(admission),
+            ..ConnectionsPlugin::default()
+        };
+        let request = pairing_requests::CreateInvitationRequest {
+            device_key: iroh::SecretKey::generate().public().to_string(),
+            ttl_seconds: 300,
+            access: DeviceAccess::FullLocalRuntime,
+        };
+        let mut context = service_context(
+            &paths,
+            "create-invitation",
+            bmux_plugin_sdk::encode_service_message(&request).unwrap(),
+        );
+        context.request.service.interface_id = "pairing-commands".into();
+        // Missing provenance is not local. Supplying a client ID is not proof either.
+        assert!(plugin.invoke_service(context.clone()).error.is_some());
+        context.caller_client_id = Some(uuid::Uuid::new_v4());
+        assert!(plugin.invoke_service(context).error.is_some());
+        let _router = trusted_local_router();
+        let mut trusted = service_context(
+            &paths,
+            "create-invitation",
+            bmux_plugin_sdk::encode_service_message(&request).unwrap(),
+        );
+        trusted.request.service.interface_id = "pairing-commands".into();
+        assert!(plugin.invoke_service(trusted).error.is_none());
+        let key = iroh::SecretKey::generate();
+        let owner = pairing::LocalOwner::from_trusted_local_owner();
+        let invitation = pairing
+            .create_invitation(
+                &owner,
+                &key.public().to_string(),
+                300,
+                DeviceAccess::FullLocalRuntime,
+            )
+            .unwrap();
+        let request = pairing_requests::RedeemInvitationRequest {
+            invitation_id: invitation.invitation_id,
+            secret: invitation.secret,
+            signature: key.sign(&invitation.possession_message).to_bytes().to_vec(),
+        };
+        let mut context = service_context(
+            &paths,
+            "redeem-invitation",
+            bmux_plugin_sdk::encode_service_message(&request).unwrap(),
+        );
+        context.request.service.interface_id = "pairing-commands".into();
+        let response = plugin.invoke_service(context);
+        assert!(response.error.is_none());
+        let device: bmux_connections_plugin_api::pairing_types::Device =
+            bmux_plugin_sdk::decode_service_message(&response.payload).unwrap();
+        let request =
+            bmux_connections_plugin_api::pairing_state::client::CheckDeviceAccessRequest {
+                subject_id: uuid::Uuid::parse_str(&device.device_id).unwrap(),
+            };
+        let mut context = service_context(
+            &paths,
+            "check-device-access",
+            bmux_plugin_sdk::encode_service_message(&request).unwrap(),
+        );
+        context.request.service.interface_id = "pairing-state".into();
+        let response = plugin.invoke_service(context.clone());
+        assert!(response.error.is_none());
+        let check: DeviceAccessCheck =
+            bmux_plugin_sdk::decode_service_message(&response.payload).unwrap();
+        assert_eq!(check.access, DeviceAccess::FullLocalRuntime);
+        pairing.revoke(&owner, &device.device_id).unwrap();
+        let response = plugin.invoke_service(context);
+        let check: DeviceAccessCheck =
+            bmux_plugin_sdk::decode_service_message(&response.payload).unwrap();
+        assert_eq!(check.access, DeviceAccess::Denied);
+        assert!(plugin.admission_handle().is_some());
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn plugin_service_routes_resolution_and_invocation() {
         let root = tempfile::tempdir().expect("tempdir");
@@ -437,8 +1202,11 @@ mod tests {
         };
         let resolve_payload =
             bmux_plugin_sdk::encode_service_message(&resolve).expect("encode resolve");
-        let response =
-            ConnectionsPlugin.invoke_service(service_context(&paths, "resolve", resolve_payload));
+        let response = ConnectionsPlugin::default().invoke_service(service_context(
+            &paths,
+            "resolve",
+            resolve_payload,
+        ));
         assert!(response.error.is_none());
         let resolved: Result<
             bmux_connections_plugin_api::connection_types::ResolvedEndpoint,
@@ -458,8 +1226,11 @@ mod tests {
             },
         };
         let payload = bmux_plugin_sdk::encode_service_message(&request).expect("encode invoke");
-        let response =
-            ConnectionsPlugin.invoke_service(service_context(&paths, "invoke-service", payload));
+        let response = ConnectionsPlugin::default().invoke_service(service_context(
+            &paths,
+            "invoke-service",
+            payload,
+        ));
         assert!(response.error.is_none());
         let invoked: Result<Vec<u8>, ConnectionError> =
             bmux_plugin_sdk::decode_service_message(&response.payload).expect("decode invoke");

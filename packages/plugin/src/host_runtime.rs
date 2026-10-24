@@ -27,6 +27,20 @@ use serde::{Serialize, de::DeserializeOwned};
 /// long-lived [`TypedServiceCaller`](crate::TypedServiceCaller)
 /// implement this trait.
 pub trait ServiceCaller {
+    /// Resolve the current invocation's host-authenticated neutral origin.
+    /// This is a host-context primitive, independent of domain plugin presence.
+    /// No supplied identity or missing-provider fallback can establish locality.
+    ///
+    /// # Errors
+    /// Fails closed when the bound bridge or representation is unavailable.
+    fn current_stream_origin(&self) -> Result<crate::StreamOrigin> {
+        match self.execute_kernel_request(bmux_ipc::Request::CurrentStreamProvenance)? {
+            bmux_ipc::ResponsePayload::CurrentStreamProvenance { provenance } => Ok(provenance),
+            _ => Err(bmux_plugin_sdk::PluginError::ServiceProtocol {
+                details: "host stream origin unavailable".into(),
+            }),
+        }
+    }
     /// Dispatch a raw service call with a binary payload.
     ///
     /// # Errors

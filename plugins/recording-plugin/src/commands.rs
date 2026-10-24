@@ -274,7 +274,7 @@ where
         InvokeServiceKind::Command => "recording-commands",
     };
     let response = invoke_service_raw_bridge(
-        context.host_kernel_bridge,
+        context.host_kernel_bridge.clone(),
         capability,
         kind,
         interface_id,
@@ -321,7 +321,7 @@ impl TypedDispatchClient for HostBridgeTypedClient {
         payload: Vec<u8>,
     ) -> TypedDispatchClientResult<Vec<u8>> {
         invoke_service_raw_bridge(
-            self.bridge,
+            self.bridge.clone(),
             capability,
             kind,
             interface_id,
@@ -341,7 +341,7 @@ fn execute_kernel_request(
     let bridge = bridge.context("recording command requires a running bmux server")?;
     let encoded_request = bmux_ipc::encode(request)
         .map_err(|error| anyhow::anyhow!("failed encoding kernel request: {error}"))?;
-    let encoded_response = invoke_host_kernel_bridge(bridge, encoded_request)?;
+    let encoded_response = invoke_host_kernel_bridge(&bridge, encoded_request)?;
     let response: Response = bmux_ipc::decode(&encoded_response)
         .map_err(|error| anyhow::anyhow!("failed decoding kernel response: {error}"))?;
     match response {
@@ -350,7 +350,7 @@ fn execute_kernel_request(
     }
 }
 
-fn invoke_host_kernel_bridge(bridge: HostKernelBridge, payload: Vec<u8>) -> Result<Vec<u8>> {
+fn invoke_host_kernel_bridge(bridge: &HostKernelBridge, payload: Vec<u8>) -> Result<Vec<u8>> {
     let request = encode_service_message(&HostKernelBridgeRequest::new(payload))
         .map_err(|error| anyhow::anyhow!("failed encoding host bridge request: {error}"))?;
     let mut output = vec![0u8; request.len().saturating_mul(4).max(1024)];
@@ -965,8 +965,12 @@ fn run_cut(context: &NativeCommandContext, args: &ArgCursor<'_>) -> Result<i32> 
     let last_seconds = args.u64_option("last-seconds")?;
     let export_fps = args.u32_option("export-fps")?;
     let name = normalize_recording_name(args.option("name").as_deref())?;
-    let completed_job =
-        queue_cut_generated_and_wait(context.host_kernel_bridge, last_seconds, name, export_fps)?;
+    let completed_job = queue_cut_generated_and_wait(
+        context.host_kernel_bridge.clone(),
+        last_seconds,
+        name,
+        export_fps,
+    )?;
     let recording_path = completed_job.recording_path.as_deref().unwrap_or("-");
     let export_path = completed_job.export_output_path.as_deref();
     match completed_job.status {

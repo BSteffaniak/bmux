@@ -1054,31 +1054,40 @@ mod tests {
             operation: &str,
             payload: Vec<u8>,
         ) -> bmux_plugin_sdk::Result<Vec<u8>> {
-            use bmux_contexts_plugin_api::contexts_commands;
-            // Any preallocation/current-client lookup fails these assertions. The
-            // generated dispatcher must reach just the target's contexts provider.
-            assert_eq!(
-                capability,
-                bmux_contexts_plugin_api::capabilities::CONTEXTS_WRITE.as_str()
-            );
-            assert_eq!(kind, bmux_plugin_sdk::ServiceKind::Command);
-            assert_eq!(interface, contexts_commands::INTERFACE_ID.as_str());
-            assert_eq!(operation, contexts_commands::OP_CREATE_CONTEXT.as_str());
-            let request: contexts_commands::client::CreateContextRequest =
-                bmux_plugin_sdk::decode_service_message(&payload)?;
-            assert_eq!(request.name, self.expected_name);
-            assert_eq!(
-                request.attributes,
-                BTreeMap::from([("workspace".to_string(), "default".to_string())])
-            );
-            self.calls
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if self.transport_failure {
-                return Err(bmux_plugin_sdk::PluginError::ServiceProtocol {
-                    details: "target contexts unavailable".into(),
-                });
-            }
-            bmux_plugin_sdk::encode_service_message(&self.result)
+            let payload = bmux_plugin_sdk::service_contract::decode_for(interface, <bmux_contexts_plugin_api::Contract as bmux_plugin_sdk::PluginContract>::service_contract_for(interface).expect("generated mock contract"), &payload)?.to_vec();
+            // This mock preserves the ServiceCaller error ABI by value.
+            #[allow(clippy::result_large_err)]
+            let mock_response = || -> bmux_plugin_sdk::Result<Vec<u8>> {
+                use bmux_contexts_plugin_api::contexts_commands;
+                // Any preallocation/current-client lookup fails these assertions. The
+                // generated dispatcher must reach just the target's contexts provider.
+                assert_eq!(
+                    capability,
+                    bmux_contexts_plugin_api::capabilities::CONTEXTS_WRITE.as_str()
+                );
+                assert_eq!(kind, bmux_plugin_sdk::ServiceKind::Command);
+                assert_eq!(interface, contexts_commands::INTERFACE_ID.as_str());
+                assert_eq!(operation, contexts_commands::OP_CREATE_CONTEXT.as_str());
+                let request: contexts_commands::client::CreateContextRequest =
+                    bmux_plugin_sdk::decode_service_message(&payload)?;
+                assert_eq!(request.name, self.expected_name);
+                assert_eq!(
+                    request.attributes,
+                    BTreeMap::from([("workspace".to_string(), "default".to_string())])
+                );
+                self.calls
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if self.transport_failure {
+                    return Err(bmux_plugin_sdk::PluginError::ServiceProtocol {
+                        details: "target contexts unavailable".into(),
+                    });
+                }
+                bmux_plugin_sdk::encode_service_message(&self.result)
+            };
+            let response = mock_response()?;
+            Ok(bmux_plugin_sdk::service_contract::encode_response(
+                &response,
+            ))
         }
 
         fn execute_kernel_request(
@@ -1185,19 +1194,28 @@ mod tests {
                 operation: &str,
                 payload: Vec<u8>,
             ) -> bmux_plugin_sdk::Result<Vec<u8>> {
-                assert_eq!(capability, "bmux.pane_runtime.spawn.v1");
-                assert_eq!(interface, "pane-runtime-spawn-commands-v1");
-                assert_eq!(operation, "new-session");
-                let request: bmux_pane_runtime_plugin_api::pane_runtime_spawn_commands_v1::client::NewSessionRequest =
+                let payload = bmux_plugin_sdk::service_contract::decode_for(interface, <bmux_pane_runtime_plugin_api::Contract as bmux_plugin_sdk::PluginContract>::service_contract_for(interface).expect("generated mock contract"), &payload)?.to_vec();
+                // This mock preserves the ServiceCaller error ABI by value.
+                #[allow(clippy::result_large_err)]
+                let mock_response = || -> bmux_plugin_sdk::Result<Vec<u8>> {
+                    assert_eq!(capability, "bmux.pane_runtime.spawn.v1");
+                    assert_eq!(interface, "pane-runtime-spawn-commands-v1");
+                    assert_eq!(operation, "new-session");
+                    let request: bmux_pane_runtime_plugin_api::pane_runtime_spawn_commands_v1::client::NewSessionRequest =
                     bmux_plugin_sdk::decode_service_message(&payload)?;
-                assert_eq!(request.name.as_deref(), Some("fresh"));
-                assert_eq!(
-                    request.options.cwd.as_deref(),
-                    Some("/execution-host/project")
-                );
-                Err(bmux_plugin_sdk::PluginError::ServiceProtocol {
-                    details: "spawn capability unavailable".into(),
-                })
+                    assert_eq!(request.name.as_deref(), Some("fresh"));
+                    assert_eq!(
+                        request.options.cwd.as_deref(),
+                        Some("/execution-host/project")
+                    );
+                    Err(bmux_plugin_sdk::PluginError::ServiceProtocol {
+                        details: "spawn capability unavailable".into(),
+                    })
+                };
+                let response = mock_response()?;
+                Ok(bmux_plugin_sdk::service_contract::encode_response(
+                    &response,
+                ))
             }
 
             fn execute_kernel_request(

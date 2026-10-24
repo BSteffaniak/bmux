@@ -17122,6 +17122,46 @@ exit 7"#
         }
     }
 
+    unsafe extern "C" fn history_fixture_origin(
+        input: *const u8,
+        length: usize,
+        output: *mut u8,
+        capacity: usize,
+        written: *mut usize,
+    ) -> i32 {
+        std::panic::catch_unwind(|| {
+            let request: bmux_plugin_sdk::HostKernelBridgeRequest =
+                bmux_plugin_sdk::decode_service_message(unsafe {
+                    std::slice::from_raw_parts(input, length)
+                })
+                .unwrap();
+            let request: bmux_ipc::Request = bmux_ipc::decode(&request.payload).unwrap();
+            assert!(matches!(
+                request,
+                bmux_ipc::Request::CurrentStreamProvenance
+            ));
+            let payload = bmux_ipc::encode(&bmux_ipc::Response::Ok(
+                bmux_ipc::ResponsePayload::CurrentStreamProvenance {
+                    provenance: bmux_ipc::StreamProvenance::Local,
+                },
+            ))
+            .unwrap();
+            let response = bmux_plugin_sdk::encode_service_message(
+                &bmux_plugin_sdk::HostKernelBridgeResponse { payload },
+            )
+            .unwrap();
+            if response.len() > capacity {
+                return 4;
+            }
+            unsafe {
+                std::ptr::copy_nonoverlapping(response.as_ptr(), output, response.len());
+                *written = response.len();
+            }
+            0
+        })
+        .unwrap_or(1)
+    }
+
     struct HistoryDispatch(Uuid);
     impl bmux_plugin_sdk::TypedDispatchClient for HistoryDispatch {
         async fn invoke_service_raw(
@@ -17173,7 +17213,9 @@ exit 7"#
                 plugin_settings_map: std::collections::BTreeMap::new(),
                 caller_client_id: Some(self.0),
                 cancellation: bmux_plugin_sdk::CancellationToken::default(),
-                host_kernel_bridge: None,
+                host_kernel_bridge: Some(bmux_plugin_sdk::HostKernelBridge::from_fn(
+                    history_fixture_origin,
+                )),
             });
             assert_eq!(response.error, None);
             Ok(response.payload)

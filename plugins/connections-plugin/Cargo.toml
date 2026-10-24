@@ -16,12 +16,14 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 anyhow = { workspace = true, features = ["std"] }
 bmux_client = { workspace = true }
+bmux_clients_plugin_api = { workspace = true }
 bmux_config = { workspace = true }
 bmux_connections_plugin_api = { workspace = true }
 bmux_ipc = { workspace = true, features = ["compression-zstd"] }
+bmux_plugin = { workspace = true }
 bmux_plugin_sdk = { workspace = true }
-git_sshripped_ssh_agent = { workspace = true }
 iroh = { workspace = true }
+libc = { workspace = true }
 reqwest = { workspace = true }
 rustls = { workspace = true }
 rustls-native-certs = { workspace = true }
@@ -39,6 +41,7 @@ tokio = { workspace = true, features = [
 ] }
 tokio-rustls = { workspace = true }
 toml = { workspace = true }
+url = { workspace = true }
 uuid = { workspace = true, features = ["std", "v4"] }
 
 [features]
@@ -52,5 +55,10 @@ fail-on-warnings = [
 static-bundled = []
 
 [dev-dependencies]
-bmux_server = { workspace = true }
-tempfile    = { workspace = true }
+bmux_pane_runtime_plugin     = { workspace = true, features = ["static-bundled"] }
+bmux_pane_runtime_plugin_api = { workspace = true }
+bmux_permissions_plugin      = { workspace = true, features = ["static-bundled"] }
+bmux_permissions_plugin_api  = { workspace = true }
+bmux_server                  = { workspace = true }
+bmux_sessions_plugin         = { workspace = true, features = ["static-bundled"] }
+tempfile                     = { workspace = true }

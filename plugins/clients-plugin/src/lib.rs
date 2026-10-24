@@ -459,6 +459,12 @@ impl RustPlugin for ClientsPlugin {
             "clients-selection-commands-v1", "commit" => |req: clients_selection_commands_v1::client::CommitRequest, ctx| {
                 Ok::<Result<Selection, SelectionError>, ServiceResponse>(commit_client_selection(ctx, ctx.caller_client_id, &req))
             },
+            "clients-identity/v1", "stream-admission-backend" => |_req: (), ctx| {
+                Ok::<_, ServiceResponse>(identity::stream_admission_backend(ctx))
+            },
+            "clients-identity/v1", "current-stream-provenance" => |_req: (), ctx| {
+                Ok::<_, ServiceResponse>(identity::current_stream_provenance(ctx))
+            },
             "clients-identity/v1", "current-principal" => |_req: (), ctx| {
                 let identity = identity::CallerIdentity::new(ctx.caller_client_id);
                 Ok::<_, ServiceResponse>(bmux_plugin::block_on_typed_dispatch(

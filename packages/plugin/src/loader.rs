@@ -918,7 +918,7 @@ impl ServiceCaller for NativeCommandContext {
             &self.plugin_search_roots,
             &self.host,
             &self.connection,
-            self.host_kernel_bridge,
+            self.host_kernel_bridge.clone(),
             &self.plugin_settings_map,
             None,
             capability,
@@ -933,7 +933,7 @@ impl ServiceCaller for NativeCommandContext {
         &self,
         request: bmux_ipc::Request,
     ) -> Result<bmux_ipc::ResponsePayload> {
-        execute_kernel_request(self.host_kernel_bridge, request)
+        execute_kernel_request(self.host_kernel_bridge.clone(), request)
     }
 }
 
@@ -957,7 +957,7 @@ impl ServiceCaller for NativeLifecycleContext {
             &self.plugin_search_roots,
             &self.host,
             &self.connection,
-            self.host_kernel_bridge,
+            self.host_kernel_bridge.clone(),
             &self.plugin_settings_map,
             None,
             capability,
@@ -972,7 +972,7 @@ impl ServiceCaller for NativeLifecycleContext {
         &self,
         request: bmux_ipc::Request,
     ) -> Result<bmux_ipc::ResponsePayload> {
-        execute_kernel_request(self.host_kernel_bridge, request)
+        execute_kernel_request(self.host_kernel_bridge.clone(), request)
     }
 }
 
@@ -1001,7 +1001,7 @@ impl ServiceCaller for NativeServiceContext {
             &self.plugin_search_roots,
             &self.host,
             &self.connection,
-            self.host_kernel_bridge,
+            self.host_kernel_bridge.clone(),
             &self.plugin_settings_map,
             Some(&self.cancellation),
             capability,
@@ -1021,7 +1021,7 @@ impl ServiceCaller for NativeServiceContext {
                 details: "service invocation cancelled before kernel dispatch".into(),
             });
         }
-        execute_kernel_request(self.host_kernel_bridge, request)
+        execute_kernel_request(self.host_kernel_bridge.clone(), request)
     }
 }
 
@@ -1597,7 +1597,7 @@ pub fn execute_kernel_request(
         bmux_ipc::encode(&request).map_err(|error| PluginError::ServiceProtocol {
             details: format!("failed encoding kernel request: {error}"),
         })?;
-    let encoded_response = invoke_host_kernel_bridge(bridge, encoded_request)?;
+    let encoded_response = invoke_host_kernel_bridge(&bridge, encoded_request)?;
     let response: IpcResponse =
         bmux_ipc::decode(&encoded_response).map_err(|error| PluginError::ServiceProtocol {
             details: format!("failed decoding kernel response: {error}"),
@@ -1626,7 +1626,7 @@ fn execute_cli_command_request(
         operation: "call_service",
     })?;
     let payload = encode_host_kernel_bridge_cli_command_payload(request)?;
-    let encoded_response = invoke_host_kernel_bridge(bridge, payload)?;
+    let encoded_response = invoke_host_kernel_bridge(&bridge, payload)?;
     let response: CoreCliCommandResponse = decode_service_message(&encoded_response)?;
     if response.protocol_version != CORE_CLI_BRIDGE_PROTOCOL_V1 {
         return Err(PluginError::ServiceProtocol {
@@ -1655,7 +1655,7 @@ fn execute_plugin_command_request(
         operation: "call_service",
     })?;
     let payload = encode_host_kernel_bridge_plugin_command_payload(request)?;
-    let encoded_response = invoke_host_kernel_bridge(bridge, payload)?;
+    let encoded_response = invoke_host_kernel_bridge(&bridge, payload)?;
     let response: PluginCliCommandResponse = decode_service_message(&encoded_response)?;
     if response.protocol_version != CORE_CLI_BRIDGE_PROTOCOL_V1 {
         return Err(PluginError::ServiceProtocol {
@@ -1671,8 +1671,10 @@ fn execute_plugin_command_request(
     Ok(response)
 }
 
-fn invoke_host_kernel_bridge(bridge: HostKernelBridge, payload: Vec<u8>) -> Result<Vec<u8>> {
-    let request = encode_service_message(&HostKernelBridgeRequest::new(payload))?;
+fn invoke_host_kernel_bridge(bridge: &HostKernelBridge, payload: Vec<u8>) -> Result<Vec<u8>> {
+    let mut request = HostKernelBridgeRequest::new(payload);
+    request.context_token = bridge.token();
+    let request = encode_service_message(&request)?;
     let mut output = vec![0u8; request.len().saturating_mul(4).max(1024)];
     let mut output_len = 0usize;
 

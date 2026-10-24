@@ -2,10 +2,48 @@
 
 use bmux_client_state::ClientPrincipalHandle;
 use bmux_clients_plugin_api::clients_identity::{
-    ClientsIdentityService, IdentityError, LocalPrincipal,
+    ClientsIdentityService, IdentityError, LocalPrincipal, StreamProvenance,
 };
 use bmux_session_models::ClientId;
 use uuid::Uuid;
+
+/// Foundational facade over the serialized host-bound kernel bridge. Missing or
+/// old bridges fail closed; caller metadata is never used to choose an origin.
+pub fn current_stream_provenance(
+    caller: &impl bmux_plugin::ServiceCaller,
+) -> Result<StreamProvenance, IdentityError> {
+    match caller
+        .execute_kernel_request(bmux_ipc::Request::CurrentStreamProvenance)
+        .map_err(|_| IdentityError::UnsupportedContext)?
+    {
+        bmux_ipc::ResponsePayload::CurrentStreamProvenance { provenance } => Ok(match provenance {
+            bmux_ipc::StreamProvenance::HostInternal => StreamProvenance::HostInternal,
+            bmux_ipc::StreamProvenance::Local => StreamProvenance::Local,
+            bmux_ipc::StreamProvenance::Admitted {
+                subject_id,
+                lease_id,
+            } => StreamProvenance::Admitted {
+                subject_id,
+                lease_id,
+            },
+            bmux_ipc::StreamProvenance::Invalid => StreamProvenance::Invalid,
+        }),
+        _ => Err(IdentityError::UnsupportedContext),
+    }
+}
+
+/// Query live backend instance through the authenticated host bridge.
+pub fn stream_admission_backend(
+    caller: &impl bmux_plugin::ServiceCaller,
+) -> Result<Option<Uuid>, IdentityError> {
+    match caller
+        .execute_kernel_request(bmux_ipc::Request::StreamAdmissionBackend)
+        .map_err(|_| IdentityError::UnsupportedContext)?
+    {
+        bmux_ipc::ResponsePayload::StreamAdmissionBackend { authority_id } => Ok(authority_id),
+        _ => Err(IdentityError::UnsupportedContext),
+    }
+}
 
 /// Bound only at invocation entry, never from a registration-time fallback connection.
 pub struct CallerIdentity {
@@ -19,6 +57,21 @@ impl CallerIdentity {
 }
 
 impl ClientsIdentityService for CallerIdentity {
+    fn stream_admission_backend<'a>(
+        &'a self,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Option<Uuid>, IdentityError>> + Send + 'a>,
+    > {
+        Box::pin(async { Err(IdentityError::UnsupportedContext) })
+    }
+    fn current_stream_provenance<'a>(
+        &'a self,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<StreamProvenance, IdentityError>> + Send + 'a>,
+    > {
+        // This legacy principal-only adapter has no authenticated host bridge.
+        Box::pin(async { Err(IdentityError::UnsupportedContext) })
+    }
     fn current_principal<'a>(
         &'a self,
     ) -> std::pin::Pin<
@@ -144,10 +197,18 @@ mod tests {
                 let mut invocation = target.clone();
                 invocation.caller_client_id = caller;
                 invocation.request.operation = operation.into();
-                invocation.request.payload = payload;
+                invocation.request.payload = bmux_plugin_sdk::service_contract::decode_for(
+                    interface,
+                    clients_identity::SERVICE_CONTRACT,
+                    &payload,
+                )
+                .unwrap()
+                .to_vec();
                 let response = crate::ClientsPlugin.invoke_service(invocation);
                 assert!(response.error.is_none(), "{:?}", response.error);
-                Ok(response.payload)
+                Ok(bmux_plugin_sdk::service_contract::encode_response(
+                    &response.payload,
+                ))
             },
         ));
         for (caller, expected) in [(first, owner), (second, other_owner)] {
@@ -172,6 +233,70 @@ mod tests {
             ))
             .unwrap(),
             Err(IdentityError::PrincipalUnavailable),
+        );
+    }
+
+    struct KernelCaller {
+        provenance: Option<bmux_ipc::StreamProvenance>,
+    }
+
+    impl bmux_plugin::ServiceCaller for KernelCaller {
+        fn call_service_raw(
+            &self,
+            _: &str,
+            _: bmux_plugin_sdk::ServiceKind,
+            _: &str,
+            _: &str,
+            _: Vec<u8>,
+        ) -> bmux_plugin_sdk::Result<Vec<u8>> {
+            unreachable!("the foundational facade uses only the kernel bridge")
+        }
+
+        fn execute_kernel_request(
+            &self,
+            request: bmux_ipc::Request,
+        ) -> bmux_plugin_sdk::Result<bmux_ipc::ResponsePayload> {
+            assert_eq!(request, bmux_ipc::Request::CurrentStreamProvenance);
+            let provenance = self.provenance.clone().ok_or(
+                bmux_plugin_sdk::PluginError::UnsupportedHostOperation {
+                    operation: "execute_kernel_request",
+                },
+            )?;
+            Ok(bmux_ipc::ResponsePayload::CurrentStreamProvenance { provenance })
+        }
+    }
+
+    #[test]
+    fn provenance_facade_preserves_all_origins_and_denies_missing_bridge() {
+        let subject_id = Uuid::from_u128(1);
+        let lease_id = Uuid::from_u128(2);
+        for (wire, expected) in [
+            (bmux_ipc::StreamProvenance::Local, StreamProvenance::Local),
+            (
+                bmux_ipc::StreamProvenance::Admitted {
+                    subject_id,
+                    lease_id,
+                },
+                StreamProvenance::Admitted {
+                    subject_id,
+                    lease_id,
+                },
+            ),
+            (
+                bmux_ipc::StreamProvenance::Invalid,
+                StreamProvenance::Invalid,
+            ),
+        ] {
+            assert_eq!(
+                current_stream_provenance(&KernelCaller {
+                    provenance: Some(wire)
+                }),
+                Ok(expected)
+            );
+        }
+        assert_eq!(
+            current_stream_provenance(&KernelCaller { provenance: None }),
+            Err(IdentityError::UnsupportedContext)
         );
     }
 

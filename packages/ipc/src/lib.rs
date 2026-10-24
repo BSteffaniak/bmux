@@ -364,6 +364,21 @@ pub enum Request {
         #[serde(default)]
         error: Option<String>,
     },
+    /// Optional admission preamble, sent before Hello with uncompressed framing.
+    /// Version 1 carries an opaque single-use ticket, never a claimed identity.
+    /// Appended to preserve existing binary enum discriminants and local Hello.
+    /// Old peers reject this variant; senders MUST NOT retry with plain Hello.
+    /// No acknowledgement is sent: a successful following Hello completes admission.
+    AdmitStream {
+        admission_version: u16,
+        #[serde(with = "bmux_codec::serde_bytes_vec")]
+        ticket: Vec<u8>,
+    },
+    /// Host kernel bridge only. No caller-supplied stream or identity.
+    /// Ordinary IPC requests must reject this operation.
+    CurrentStreamProvenance,
+    /// Kernel bridge only: live registered admission provider instance.
+    StreamAdmissionBackend,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -446,6 +461,27 @@ pub enum ResponsePayload {
         payload: Vec<u8>,
     },
     DeviceSealBrokerResponseAccepted,
+    CurrentStreamProvenance {
+        provenance: StreamProvenance,
+    },
+    StreamAdmissionBackend {
+        authority_id: Option<Uuid>,
+    },
+}
+
+/// Host-authenticated origin snapshot. Invalid/unsupported must never mean local.
+/// Requery at authoritative side effects; snapshots do not survive revocation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StreamProvenance {
+    /// Only a host-created internal provider invocation may report this origin.
+    HostInternal,
+    Local,
+    Admitted {
+        subject_id: Uuid,
+        lease_id: Uuid,
+    },
+    Invalid,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -614,6 +650,18 @@ mod tests {
 
     type RecordingPayload = ProtocolRecordingPayload<Event, ErrorCode>;
     type RecordingEventEnvelope = ProtocolRecordingEventEnvelope<Event, ErrorCode>;
+
+    #[test]
+    fn admission_preamble_roundtrip() {
+        let request = Request::AdmitStream {
+            admission_version: 1,
+            ticket: vec![0, 255, 1],
+        };
+        let bytes = encode(&request).unwrap();
+        assert_eq!(decode::<Request>(&bytes).unwrap(), request);
+        // Existing variants retain their typed wire ordinal (Ping follows Hello).
+        assert_eq!(encode(&Request::Ping).unwrap(), vec![1]);
+    }
 
     #[test]
     fn serializes_request_roundtrip() {

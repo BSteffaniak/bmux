@@ -33,6 +33,10 @@ impl<C> TypedDispatchClient for ServiceCallerDispatchClient<'_, C>
 where
     C: ServiceCaller + Sync + ?Sized,
 {
+    fn requires_service_contracts(&self) -> bool {
+        true
+    }
+
     fn invoke_service_raw(
         &mut self,
         capability: &str,

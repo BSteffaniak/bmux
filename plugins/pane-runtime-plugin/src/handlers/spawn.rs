@@ -1,7 +1,6 @@
 //! Authoritative access checks for execution-directory queries.
 use bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::SpawnError;
 use bmux_plugin_sdk::NativeServiceContext;
-use bmux_session_models::ClientId;
 use uuid::Uuid;
 
 pub(super) fn home_directory() -> Result<String, SpawnError> {
@@ -26,9 +25,25 @@ fn validate_home_directory(home: Option<std::path::PathBuf>) -> Result<String, S
 fn check_read_identity(
     permissions_enabled: bool,
     caller: Option<Uuid>,
+    provenance: &bmux_plugin::StreamOrigin,
 ) -> Result<Option<Uuid>, SpawnError> {
+    use bmux_plugin::StreamOrigin as StreamProvenance;
+    if matches!(
+        provenance,
+        StreamProvenance::Invalid | StreamProvenance::HostInternal
+    ) {
+        return Err(SpawnError::Denied {
+            reason: "trusted caller provenance unavailable or revoked".into(),
+        });
+    }
     if !permissions_enabled {
-        return Ok(None);
+        return if matches!(provenance, StreamProvenance::Local) {
+            Ok(None)
+        } else {
+            Err(SpawnError::Denied {
+                reason: "remote execution requires resource authorization".into(),
+            })
+        };
     }
     caller.map(Some).ok_or_else(|| SpawnError::Denied {
         reason: "directory query requires caller identity when permissions are enabled".into(),
@@ -57,24 +72,29 @@ pub(super) fn authorize_session(
     session_id: Uuid,
     action: &str,
 ) -> Result<(), SpawnError> {
-    // Local single-user fallback is tied to plugin absence, never an error
-    // substring or a failed policy request. Federated services must retain
-    // their own authenticated authority checks before reaching local execution.
-    let Some(client_id) = check_read_identity(
-        ctx.enabled_plugins
-            .iter()
-            .any(|id| id == "bmux.permissions"),
-        ctx.caller_client_id,
-    )?
+    use bmux_plugin::StreamOrigin as StreamProvenance;
+    // Never infer local from absent admission, missing plugins, or wire identity.
+    let provenance = caller_provenance(ctx)?;
+    let permissions_enabled = ctx
+        .enabled_plugins
+        .iter()
+        .any(|id| id == "bmux.permissions");
+    let Some(client_id) =
+        check_read_identity(permissions_enabled, ctx.caller_client_id, &provenance)?
     else {
         return Ok(());
     };
-    let denied = |reason: String| SpawnError::Denied { reason };
-    let principal = bmux_plugin::global_plugin_state_registry()
-        .get::<bmux_client_state::ClientPrincipalHandle>()
-        .and_then(|entry| entry.read().ok().map(|guard| guard.clone()))
-        .and_then(|handle| handle.0.get(ClientId(client_id)))
-        .ok_or_else(|| denied("directory query principal is unavailable".into()))?;
+    let principal = match provenance {
+        StreamProvenance::Admitted { subject_id, .. } => subject_id,
+        // The permissions service derives local identity from its own host
+        // context; this required legacy request field grants no authority.
+        StreamProvenance::Local => client_id,
+        StreamProvenance::Invalid | StreamProvenance::HostInternal => {
+            return Err(SpawnError::Denied {
+                reason: "trusted caller provenance invalid".into(),
+            });
+        }
+    };
     let mut client = bmux_plugin::ServiceCallerDispatchClient::new(ctx);
     let response = bmux_plugin::block_on_typed_dispatch(
         bmux_permissions_plugin_api::session_policy_state::client::check(
@@ -91,6 +111,15 @@ pub(super) fn authorize_session(
     )
     .map_err(|error| format!("directory policy check failed: {error}"));
     enforce_read_policy(response.map(|response| (response.allowed, response.reason)))
+}
+
+// No process-local global: the foundational service queries the actual host.
+pub(super) fn caller_provenance(
+    ctx: &NativeServiceContext,
+) -> Result<bmux_plugin::StreamOrigin, SpawnError> {
+    bmux_plugin::ServiceCaller::current_stream_origin(ctx).map_err(|error| SpawnError::Denied {
+        reason: format!("trusted provenance unavailable: {error}"),
+    })
 }
 
 fn enforce_read_policy(response: Result<(bool, Option<String>), String>) -> Result<(), SpawnError> {
@@ -158,13 +187,29 @@ mod tests {
 
     #[test]
     fn local_fallback_only_applies_to_missing_permissions() {
+        use bmux_plugin::StreamOrigin as StreamProvenance;
         let caller = Uuid::new_v4();
-        assert_eq!(check_read_identity(false, None), Ok(None));
-        assert_eq!(check_read_identity(false, Some(caller)), Ok(None));
-        assert_eq!(check_read_identity(true, Some(caller)), Ok(Some(caller)));
+        let local = StreamProvenance::Local;
+        let remote = StreamProvenance::Admitted {
+            subject_id: Uuid::new_v4(),
+            lease_id: Uuid::new_v4(),
+        };
+        assert_eq!(check_read_identity(false, None, &local), Ok(None));
+        assert_eq!(check_read_identity(false, Some(caller), &local), Ok(None));
+        assert_eq!(
+            check_read_identity(true, Some(caller), &local),
+            Ok(Some(caller))
+        );
         assert!(matches!(
-            check_read_identity(true, None),
+            check_read_identity(true, None, &local),
             Err(SpawnError::Denied { .. })
         ));
+        assert!(check_read_identity(false, Some(caller), &remote).is_err());
+        assert!(check_read_identity(false, None, &StreamProvenance::Invalid).is_err());
+        assert!(check_read_identity(true, Some(caller), &StreamProvenance::Invalid).is_err());
+        assert_eq!(
+            check_read_identity(true, Some(caller), &remote),
+            Ok(Some(caller))
+        );
     }
 }

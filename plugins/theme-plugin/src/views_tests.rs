@@ -8,7 +8,7 @@ type Preferences = Arc<Mutex<BTreeMap<String, Vec<u8>>>>;
 fn router(preferences: &Preferences, writes: &Arc<Mutex<usize>>) -> TestServiceRouter {
     let preferences = Arc::clone(preferences);
     let writes = Arc::clone(writes);
-    Arc::new(
+    crate::tests::checked_test_router(Arc::new(
         move |_, _, capability, _, _, operation, payload| match (capability, operation) {
             ("bmux.storage", "get") => {
                 let request: bmux_plugin_sdk::StorageGetRequest = decode_service_message(&payload)?;
@@ -43,7 +43,7 @@ fn router(preferences: &Preferences, writes: &Arc<Mutex<usize>>) -> TestServiceR
             ) => encode_service_message(&Ok::<(), String>(())),
             _ => panic!("unexpected {capability}/{operation}"),
         },
-    )
+    ))
 }
 
 fn context(owner: u8) -> NativeServiceContext {

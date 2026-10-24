@@ -1584,6 +1584,9 @@ fn request_detail(request: &Request) -> String {
 
 const fn request_kind_name(request: &Request) -> &'static str {
     match request {
+        Request::StreamAdmissionBackend => "stream_admission_backend",
+        Request::CurrentStreamProvenance => "current_stream_provenance",
+        Request::AdmitStream { .. } => "admit_stream",
         Request::Hello { .. } => "hello",
         Request::Ping => "ping",
         Request::WhoAmIPrincipal => "whoami_principal",
@@ -1727,6 +1730,8 @@ fn ipc_client_request_phase_payload(
 const fn response_kind_name(response: &Response) -> &'static str {
     match response {
         Response::Ok(payload) => match payload {
+            ResponsePayload::StreamAdmissionBackend { .. } => "stream_admission_backend",
+            ResponsePayload::CurrentStreamProvenance { .. } => "current_stream_provenance",
             ResponsePayload::Pong => "pong",
             ResponsePayload::PrincipalIdentity { .. } => "principal_identity",
             ResponsePayload::HelloNegotiated { .. } => "hello_negotiated",

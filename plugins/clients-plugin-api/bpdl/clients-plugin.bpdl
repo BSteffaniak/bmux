@@ -29,6 +29,17 @@ interface clients-identity {
         unsupported-context,
     }
 
+    // Host-bound stream origin. No caller-chosen ID, principal, or lease.
+    variant stream-provenance {
+        host-internal,
+        local,
+        admitted { subject-id: uuid, lease-id: uuid },
+        invalid,
+    }
+
+    query stream-admission-backend() -> result<uuid?, identity-error>;
+    query current-stream-provenance() -> result<stream-provenance, identity-error>;
+
     // Resolves only the host-supplied caller; never accepts a chosen owner.
     query current-principal() -> result<local-principal, identity-error>;
 }

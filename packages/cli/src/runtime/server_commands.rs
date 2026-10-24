@@ -507,8 +507,14 @@ pub(super) async fn run_server_stop(connection_context: ConnectionContext<'_>) -
 
 const BRIDGE_PREFLIGHT_TOKEN: &str = "BMUX_BRIDGE_READY";
 
-#[allow(clippy::similar_names)] // stdin/stdout are standard names
+pub(super) fn refuse_unadmitted_remote_ingress(surface: &str) -> Result<()> {
+    anyhow::bail!(
+        "{surface} is disabled: legacy remote ingress cannot establish trusted stream admission; use the connections plugin admission protocol (no downgrade)"
+    )
+}
+
 pub(super) async fn run_server_bridge(stdio: bool, preflight: bool) -> Result<u8> {
+    refuse_unadmitted_remote_ingress("stdio/SSH bridge")?;
     if !stdio {
         anyhow::bail!("server bridge currently requires --stdio");
     }
@@ -524,11 +530,11 @@ pub(super) async fn run_server_bridge(stdio: bool, preflight: bool) -> Result<u8
         .await
         .context("failed connecting local IPC endpoint for bridge")?;
     let (mut ipc_reader, mut ipc_writer) = tokio::io::split(stream);
-    let mut stdin = tokio::io::stdin();
+    let mut input_stream = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
 
     let to_server = tokio::spawn(async move {
-        tokio::io::copy(&mut stdin, &mut ipc_writer).await?;
+        tokio::io::copy(&mut input_stream, &mut ipc_writer).await?;
         ipc_writer.shutdown().await?;
         Ok::<(), std::io::Error>(())
     });
@@ -578,6 +584,7 @@ pub(super) async fn prepare_configured_gateway(
     if !config.enabled {
         return Ok(None);
     }
+    refuse_unadmitted_remote_ingress("TLS gateway")?;
     prepare_gateway(
         &config.listen,
         config.quick,
@@ -624,6 +631,7 @@ pub(super) async fn run_server_gateway(
         return run_server_gateway_iroh().await;
     }
 
+    refuse_unadmitted_remote_ingress("TLS gateway")?;
     let gateway = prepare_gateway(listen, quick, cert_file, key_file).await?;
 
     if host {
@@ -642,6 +650,7 @@ pub(super) async fn run_server_gateway(
 async fn run_server_gateway_iroh() -> Result<u8> {
     const BMUX_IROH_ALPN: &[u8] = b"bmux/gateway/iroh/1";
     const IROH_DIRECT_BIND_ENV: &str = "BMUX_IROH_DIRECT_BIND";
+    refuse_unadmitted_remote_ingress("legacy Iroh gateway")?;
     let config = bmux_config::BmuxConfig::load().context("failed loading bmux config")?;
     ensure_iroh_ssh_access_ready(&config)?;
     let require_ssh_auth = iroh_ssh_access_enabled(&config);
@@ -1080,6 +1089,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn legacy_ingress_refuses_before_connecting_or_binding() {
+        assert!(super::run_server_bridge(true, true).await.is_err());
+        assert!(super::run_server_gateway_iroh().await.is_err());
+        assert!(
+            super::run_server_gateway(
+                "not-a-socket",
+                false,
+                bmux_cli_schema::GatewayHostMode::Iroh,
+                "unused",
+                false,
+                None,
+                None,
+            )
+            .await
+            .is_err_and(|error| error.to_string().contains("trusted stream admission"))
+        );
+    }
+
+    #[tokio::test]
     async fn disabled_config_does_not_prepare_gateway() {
         let gateway = prepare_configured_gateway(&ServerGatewayConfig::default())
             .await
@@ -1088,7 +1116,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn enabled_config_prepares_gateway_from_typed_options() {
+    async fn enabled_config_refuses_unadmitted_gateway() {
         let certificate = TestCertificate::create();
         let config = ServerGatewayConfig {
             enabled: true,
@@ -1097,11 +1125,8 @@ mod tests {
             cert_file: Some(certificate.cert_file.clone()),
             key_file: Some(certificate.key_file.clone()),
         };
-        let gateway = prepare_configured_gateway(&config)
-            .await
-            .expect("enabled gateway should prepare")
-            .expect("enabled gateway should return runtime");
-        assert!(gateway.listener.local_addr().is_ok());
+        let result = prepare_configured_gateway(&config).await;
+        assert!(result.is_err_and(|error| error.to_string().contains("trusted stream admission")));
     }
 
     #[tokio::test]

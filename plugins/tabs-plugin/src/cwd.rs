@@ -317,14 +317,20 @@ mod tests {
             operation: &str,
             payload: Vec<u8>,
         ) -> bmux_plugin_sdk::Result<Vec<u8>> {
-            assert_eq!(capability, "bmux.pane_runtime.spawn.v1");
-            assert_eq!(interface, "pane-runtime-spawn-v1");
-            assert_eq!(operation, "home-directory");
-            let request: pane_runtime_spawn_v1::client::HomeDirectoryRequest =
-                bmux_plugin_sdk::decode_service_message(&payload)?;
-            assert_eq!(request.session_id, uuid::Uuid::nil());
-            bmux_plugin_sdk::encode_service_message(&Ok::<String, SpawnError>(
-                "/execution-authority/home".into(),
+            let payload = bmux_plugin_sdk::service_contract::decode_for(interface, <bmux_pane_runtime_plugin_api::Contract as bmux_plugin_sdk::PluginContract>::service_contract_for(interface).expect("generated mock contract"), &payload)?.to_vec();
+            let response = {
+                assert_eq!(capability, "bmux.pane_runtime.spawn.v1");
+                assert_eq!(interface, "pane-runtime-spawn-v1");
+                assert_eq!(operation, "home-directory");
+                let request: pane_runtime_spawn_v1::client::HomeDirectoryRequest =
+                    bmux_plugin_sdk::decode_service_message(&payload)?;
+                assert_eq!(request.session_id, uuid::Uuid::nil());
+                bmux_plugin_sdk::encode_service_message(&Ok::<String, SpawnError>(
+                    "/execution-authority/home".into(),
+                ))?
+            };
+            Ok(bmux_plugin_sdk::service_contract::encode_response(
+                &response,
             ))
         }
     }

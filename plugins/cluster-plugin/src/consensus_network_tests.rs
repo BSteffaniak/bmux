@@ -39,7 +39,13 @@ impl ServiceCaller for ForwardingCaller {
             });
         }
         let request: connections_commands::client::InvokeServiceRequest =
-            bmux_plugin_sdk::decode_service_message(&payload)?;
+            bmux_plugin_sdk::decode_service_message(
+                bmux_plugin_sdk::service_contract::decode_for(
+                    interface_id,
+                    connections_commands::SERVICE_CONTRACT,
+                    &payload,
+                )?,
+            )?;
         let invocation = request.invocation;
         self.forwarded.lock().unwrap().push(format!(
             "{}/{}",
@@ -89,8 +95,11 @@ impl ServiceCaller for ForwardingCaller {
                 });
             }
         };
-        bmux_plugin_sdk::encode_service_message(&Result::<Vec<u8>, ConnectionError>::Ok(
-            response_payload,
+        let response = bmux_plugin_sdk::encode_service_message(
+            &Result::<Vec<u8>, ConnectionError>::Ok(response_payload),
+        )?;
+        Ok(bmux_plugin_sdk::service_contract::encode_response(
+            &response,
         ))
     }
 

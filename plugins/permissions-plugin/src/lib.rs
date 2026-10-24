@@ -152,6 +152,8 @@ impl RustPlugin for PermissionsPlugin {
                 Ok(entries)
             },
             "permissions-commands", "grant" => |req: GrantRequest, ctx| {
+                require_local_owner(ctx)
+                    .map_err(|e| ServiceResponse::error("admin_denied", e))?;
                 let mutation = grant_entry(ctx, req)
                     .map_err(|e| ServiceResponse::error("grant_failed", e))?;
                 apply_permission_cache_mutation(ctx, &mutation)
@@ -159,14 +161,30 @@ impl RustPlugin for PermissionsPlugin {
                 Ok(CommandAck { ok: true })
             },
             "permissions-commands", "revoke" => |req: RevokeRequest, ctx| {
+                require_local_owner(ctx)
+                    .map_err(|e| ServiceResponse::error("admin_denied", e))?;
                 let mutation = revoke_entry(ctx, &req)
                     .map_err(|e| ServiceResponse::error("revoke_failed", e))?;
                 apply_permission_cache_mutation(ctx, &mutation)
                     .map_err(|e| ServiceResponse::error("revoke_failed", e))?;
                 Ok(CommandAck { ok: true })
             },
+            "permissions-commands", "grant-resource" => |req: bmux_permissions_plugin_api::permissions_commands::client::GrantResourceRequest, ctx| {
+                require_local_owner(ctx)
+                    .map_err(|e| ServiceResponse::error("admin_denied", e))?;
+                mutate_resource_grant(ctx, req.subject_id, req.session_id, Some(req.role))
+                    .map_err(|e| ServiceResponse::error("grant_failed", e))?;
+                Ok(CommandAck { ok: true })
+            },
+            "permissions-commands", "revoke-resource" => |req: bmux_permissions_plugin_api::permissions_commands::client::RevokeResourceRequest, ctx| {
+                require_local_owner(ctx)
+                    .map_err(|e| ServiceResponse::error("admin_denied", e))?;
+                mutate_resource_grant(ctx, req.subject_id, req.session_id, None)
+                    .map_err(|e| ServiceResponse::error("revoke_failed", e))?;
+                Ok(CommandAck { ok: true })
+            },
             "session-policy-state", "check" => |req: SessionPolicyCheckRequest, ctx| {
-                evaluate_policy(ctx, &req)
+                evaluate_authoritative_policy(ctx, &req)
                     .map_err(|e| ServiceResponse::error("policy_failed", e))
             },
             "session-policy-state", "list-hot-path-overrides" => |req: ListHotPathOverridesRequest, ctx| {
@@ -178,11 +196,15 @@ impl RustPlugin for PermissionsPlugin {
                     .map_err(|e| ServiceResponse::error("resolve_hot_path_decision_failed", e))
             },
             "session-policy-commands", "grant-hot-path-override" => |req: GrantHotPathOverrideRequest, ctx| {
+                require_local_owner(ctx)
+                    .map_err(|e| ServiceResponse::error("admin_denied", e))?;
                 grant_hot_path_override(ctx, req)
                     .map_err(|e| ServiceResponse::error("grant_hot_path_override_failed", e))?;
                 Ok(bmux_permissions_plugin_api::session_policy_commands::CommandAck { ok: true })
             },
             "session-policy-commands", "revoke-hot-path-override" => |req: RevokeHotPathOverrideRequest, ctx| {
+                require_local_owner(ctx)
+                    .map_err(|e| ServiceResponse::error("admin_denied", e))?;
                 revoke_hot_path_override(ctx, &req)
                     .map_err(|e| ServiceResponse::error("revoke_hot_path_override_failed", e))?;
                 Ok(bmux_permissions_plugin_api::session_policy_commands::CommandAck { ok: true })
@@ -193,6 +215,12 @@ impl RustPlugin for PermissionsPlugin {
 
 #[allow(clippy::too_many_lines)]
 fn handle_command(context: &NativeCommandContext) -> Result<(), String> {
+    if matches!(
+        context.command.as_str(),
+        "grant" | "revoke" | "grant-hot-path-override" | "revoke-hot-path-override"
+    ) {
+        require_local_owner(context)?;
+    }
     // Gate stdout writes on invocation source: attach keybindings run
     // inside a raw-mode TUI, where `println!` would corrupt pane
     // rendering. The `permissions-current` command (bound to shift+p
@@ -396,6 +424,148 @@ fn resolve_current_session(caller: &(impl HostRuntimeApi + Sync)) -> Result<Stri
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ResourceGrant {
+    subject_id: Uuid,
+    // None is an explicit runtime-wide resource grant, not a default.
+    session_id: Option<Uuid>,
+    role: String,
+}
+
+// Host-bound origin is independent of optional domain services.
+fn caller_provenance(
+    caller: &(impl ServiceCaller + Sync),
+) -> Result<bmux_plugin::StreamOrigin, String> {
+    caller
+        .current_stream_origin()
+        .map_err(|error| format!("trusted provenance unavailable: {error}"))
+}
+
+fn require_local_owner(caller: &(impl ServiceCaller + Sync)) -> Result<(), String> {
+    if matches!(caller_provenance(caller)?, bmux_plugin::StreamOrigin::Local) {
+        Ok(())
+    } else {
+        Err("administration requires positively recorded host-local authority".into())
+    }
+}
+
+fn load_resource_grants(caller: &impl HostRuntimeApi) -> Result<Vec<ResourceGrant>, String> {
+    let response = caller
+        .storage_get(&StorageGetRequest::new(bmux_plugin_sdk::storage_key!(
+            "resource-grants-v1"
+        )))
+        .map_err(|error| error.to_string())?;
+    response.value.map_or_else(
+        || Ok(Vec::new()),
+        |value| decode_service_message(&value).map_err(|error| error.to_string()),
+    )
+}
+
+fn mutate_resource_grant(
+    caller: &impl HostRuntimeApi,
+    subject_id: Uuid,
+    session_id: Option<Uuid>,
+    role: Option<String>,
+) -> Result<(), String> {
+    static MUTATION: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    if subject_id.is_nil() {
+        return Err("resource subject must not be nil".into());
+    }
+    if let Some(role) = &role {
+        validate_role(role)?;
+    }
+    // Serialize read/modify/write within this implementation. Durable storage is
+    // authoritative; no connection-local or pane write-permission cache is used.
+    let _guard = MUTATION
+        .lock()
+        .map_err(|_| "resource grant lock poisoned")?;
+    let mut grants = load_resource_grants(caller)?;
+    grants.retain(|grant| grant.subject_id != subject_id || grant.session_id != session_id);
+    grants.push(ResourceGrant {
+        subject_id,
+        session_id,
+        // A scoped revoke must not reveal a broader runtime grant.
+        role: role.unwrap_or_else(|| "revoked".into()),
+    });
+    let value = encode_service_message(&grants).map_err(|error| error.to_string())?;
+    caller
+        .storage_set(&StorageSetRequest::new(
+            bmux_plugin_sdk::storage_key!("resource-grants-v1"),
+            value,
+        ))
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn resource_decision(
+    grants: &[ResourceGrant],
+    subject_id: Uuid,
+    session_id: Uuid,
+    action: &str,
+) -> SessionPolicyCheckResponse {
+    // A session-specific grant takes precedence over runtime-wide scope.
+    grants
+        .iter()
+        .find(|grant| grant.subject_id == subject_id && grant.session_id == Some(session_id))
+        .or_else(|| {
+            grants
+                .iter()
+                .find(|grant| grant.subject_id == subject_id && grant.session_id.is_none())
+        })
+        .map_or_else(
+            || SessionPolicyCheckResponse {
+                allowed: false,
+                reason: Some("no explicit resource grant for admitted subject".into()),
+            },
+            |grant| evaluate_role_action(&grant.role, action),
+        )
+}
+
+fn evaluate_authoritative_policy(
+    ctx: &NativeServiceContext,
+    request: &SessionPolicyCheckRequest,
+) -> Result<SessionPolicyCheckResponse, String> {
+    use bmux_plugin::StreamOrigin as StreamProvenance;
+    match caller_provenance(ctx)? {
+        StreamProvenance::Local => {
+            let mut request = request.clone();
+            request.client_id = ctx
+                .caller_client_id
+                .ok_or("host-local caller identity unavailable")?;
+            evaluate_policy(ctx, &request)
+        }
+        StreamProvenance::Admitted {
+            subject_id,
+            lease_id: _,
+        } => {
+            let mut client = bmux_plugin::ServiceCallerDispatchClient::new(ctx);
+            let access = bmux_plugin::block_on_typed_dispatch(
+                bmux_connections_plugin_api::pairing_state::client::check_device_access(
+                    &mut client,
+                    subject_id,
+                ),
+            )
+            .map_err(|error| format!("device authorization unavailable: {error}"))?;
+            if access.access
+                != bmux_connections_plugin_api::pairing_types::DeviceAccess::FullLocalRuntime
+            {
+                return Err("device access denied".into());
+            }
+            // Wire client/principal claims never choose the resource subject.
+            let grants = load_resource_grants(ctx)?;
+            Ok(resource_decision(
+                &grants,
+                subject_id,
+                request.session_id,
+                &request.action,
+            ))
+        }
+        StreamProvenance::Invalid | StreamProvenance::HostInternal => {
+            Err("trusted caller provenance unavailable or revoked".into())
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct StoredPermissions {
     by_session_id: BTreeMap<Uuid, Vec<PermissionEntry>>,
     hot_path_overrides: Vec<HotPathOverrideEntry>,
@@ -486,12 +656,21 @@ fn revoke_entry(
     if let Some(entries) = state.by_session_id.get_mut(&session_id) {
         entries.retain(|entry| entry.client_id != normalized_client_id);
     }
+    // Explicit tombstone: removing the entry would restore the local default.
+    state
+        .by_session_id
+        .entry(session_id)
+        .or_default()
+        .push(PermissionEntry {
+            client_id: normalized_client_id,
+            role: "revoked".into(),
+        });
     save_state(caller, &state)?;
     Ok(PermissionMutation {
         cache_update: PermissionCacheUpdate {
             session_id,
             client_id,
-            allowed: true,
+            allowed: false,
         },
         rollback_state,
     })
@@ -1175,6 +1354,34 @@ bmux_plugin_sdk::export_plugin!(PermissionsPlugin, include_str!("../plugin.toml"
 
 #[cfg(test)]
 mod tests {
+    fn checked_test_router(
+        router: bmux_plugin::test_support::TestServiceRouter,
+    ) -> bmux_plugin::test_support::TestServiceRouter {
+        std::sync::Arc::new(
+            // The test router ABI returns PluginError by value.
+            #[allow(clippy::result_large_err)]
+            move |caller, client, capability, kind, interface, operation, payload| {
+                if !bmux_plugin_sdk::service_contract::is_checked(&payload) {
+                    return router(
+                        caller, client, capability, kind, interface, operation, payload,
+                    );
+                }
+                let contract = <bmux_connections_plugin_api::Contract as bmux_plugin_sdk::PluginContract>::service_contract_for(interface)
+                .or_else(|| <bmux_pane_runtime_plugin_api::Contract as bmux_plugin_sdk::PluginContract>::service_contract_for(interface))
+                    .expect("mock service must have a declared generated contract");
+                let request =
+                    bmux_plugin_sdk::service_contract::decode_for(interface, contract, &payload)?
+                        .to_vec();
+                let response = router(
+                    caller, client, capability, kind, interface, operation, request,
+                )?;
+                Ok(bmux_plugin_sdk::service_contract::encode_response(
+                    &response,
+                ))
+            },
+        )
+    }
+
     use super::*;
     use bmux_plugin::ServiceCaller;
     use bmux_plugin::test_support::{
@@ -1251,70 +1458,88 @@ mod tests {
             operation: &str,
             payload: Vec<u8>,
         ) -> bmux_plugin_sdk::Result<Vec<u8>> {
-            match (interface_id, operation) {
-                // Typed host surfaces used by permissions-plugin's
-                // domain helpers. Keep test fixtures aligned with the
-                // production plugin-api contracts so legacy host
-                // interfaces do not linger in tests.
-                ("storage-query/v1", "get") => {
-                    let request: StorageGetRequest = decode_service_message(&payload)?;
-                    let value = self
-                        .storage
-                        .lock()
-                        .expect("storage lock should succeed")
-                        .get(request.key.as_str())
-                        .cloned();
-                    encode_service_message(&bmux_plugin_sdk::StorageGetResponse { value })
-                }
-                ("storage-command/v1", "set") => {
-                    let request: StorageSetRequest = decode_service_message(&payload)?;
-                    self.storage
-                        .lock()
-                        .expect("storage lock should succeed")
-                        .insert(request.key.to_string(), request.value);
-                    encode_service_message(&())
-                }
-                ("contexts-state", "list-contexts") => encode_service_message(&self.contexts),
-                ("contexts-state", "current-context") => {
-                    let current = self.contexts.first().cloned();
-                    encode_service_message(&current)
-                }
-                ("sessions-state", "list-sessions") => {
-                    #[derive(serde::Serialize)]
-                    struct Entry {
-                        id: Uuid,
-                        name: Option<String>,
-                        client_count: u32,
+            let checked = bmux_plugin_sdk::service_contract::is_checked(&payload);
+            let payload = if checked {
+                let contract = <bmux_sessions_plugin_api::Contract as bmux_plugin_sdk::PluginContract>::service_contract_for(interface_id).or_else(|| <bmux_contexts_plugin_api::Contract as bmux_plugin_sdk::PluginContract>::service_contract_for(interface_id)).or_else(|| <bmux_clients_plugin_api::Contract as bmux_plugin_sdk::PluginContract>::service_contract_for(interface_id)).or_else(|| <bmux_connections_plugin_api::Contract as bmux_plugin_sdk::PluginContract>::service_contract_for(interface_id)).expect("generated mock contract");
+                bmux_plugin_sdk::service_contract::decode_for(interface_id, contract, &payload)?
+                    .to_vec()
+            } else {
+                payload
+            };
+            // This mock preserves the ServiceCaller error ABI by value.
+            #[allow(clippy::result_large_err)]
+            let mock_response = || -> bmux_plugin_sdk::Result<Vec<u8>> {
+                match (interface_id, operation) {
+                    // Typed host surfaces used by permissions-plugin's
+                    // domain helpers. Keep test fixtures aligned with the
+                    // production plugin-api contracts so legacy host
+                    // interfaces do not linger in tests.
+                    ("storage-query/v1", "get") => {
+                        let request: StorageGetRequest = decode_service_message(&payload)?;
+                        let value = self
+                            .storage
+                            .lock()
+                            .expect("storage lock should succeed")
+                            .get(request.key.as_str())
+                            .cloned();
+                        encode_service_message(&bmux_plugin_sdk::StorageGetResponse { value })
                     }
-                    let entries: Vec<Entry> = self
-                        .sessions
-                        .iter()
-                        .map(|s| Entry {
-                            id: s.id,
-                            name: s.name.clone(),
-                            client_count: u32::try_from(s.client_count).unwrap_or(0),
-                        })
-                        .collect();
-                    encode_service_message(&entries)
+                    ("storage-command/v1", "set") => {
+                        let request: StorageSetRequest = decode_service_message(&payload)?;
+                        self.storage
+                            .lock()
+                            .expect("storage lock should succeed")
+                            .insert(request.key.to_string(), request.value);
+                        encode_service_message(&())
+                    }
+                    ("contexts-state", "list-contexts") => encode_service_message(&self.contexts),
+                    ("contexts-state", "current-context") => {
+                        let current = self.contexts.first().cloned();
+                        encode_service_message(&current)
+                    }
+                    ("sessions-state", "list-sessions") => {
+                        #[derive(serde::Serialize)]
+                        struct Entry {
+                            id: Uuid,
+                            name: Option<String>,
+                            client_count: u32,
+                        }
+                        let entries: Vec<Entry> = self
+                            .sessions
+                            .iter()
+                            .map(|s| Entry {
+                                id: s.id,
+                                name: s.name.clone(),
+                                client_count: u32::try_from(s.client_count).unwrap_or(0),
+                            })
+                            .collect();
+                        encode_service_message(&entries)
+                    }
+                    ("clients-state", "current-client") => {
+                        let summary = bmux_clients_plugin_api::clients_state::ClientSummary {
+                            id: Uuid::from_u128(0x1111_1111_1111_1111_1111_1111_1111_1111),
+                            selected_session_id: self.selected_session_id,
+                            selected_context_id: None,
+                            following_client_id: None,
+                            following_global: false,
+                        };
+                        let result: std::result::Result<
+                            bmux_clients_plugin_api::clients_state::ClientSummary,
+                            bmux_clients_plugin_api::clients_state::ClientQueryError,
+                        > = Ok(summary);
+                        encode_service_message(&result)
+                    }
+                    _ => Err(bmux_plugin_sdk::PluginError::UnsupportedHostOperation {
+                        operation: "mock_service",
+                    }),
                 }
-                ("clients-state", "current-client") => {
-                    let summary = bmux_clients_plugin_api::clients_state::ClientSummary {
-                        id: Uuid::from_u128(0x1111_1111_1111_1111_1111_1111_1111_1111),
-                        selected_session_id: self.selected_session_id,
-                        selected_context_id: None,
-                        following_client_id: None,
-                        following_global: false,
-                    };
-                    let result: std::result::Result<
-                        bmux_clients_plugin_api::clients_state::ClientSummary,
-                        bmux_clients_plugin_api::clients_state::ClientQueryError,
-                    > = Ok(summary);
-                    encode_service_message(&result)
-                }
-                _ => Err(bmux_plugin_sdk::PluginError::UnsupportedHostOperation {
-                    operation: "mock_service",
-                }),
-            }
+            };
+            let response = mock_response()?;
+            Ok(if checked {
+                bmux_plugin_sdk::service_contract::encode_response(&response)
+            } else {
+                response
+            })
         }
 
         fn execute_kernel_request(
@@ -1327,14 +1552,9 @@ mod tests {
         }
     }
 
-    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-    struct BridgeRequest {
-        payload: Vec<u8>,
-    }
-
-    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-    struct BridgeResponse {
-        payload: Vec<u8>,
+    thread_local! {
+        static TEST_ORIGIN: std::cell::RefCell<Arc<Mutex<bmux_plugin::StreamOrigin>>> =
+            std::cell::RefCell::new(Arc::new(Mutex::new(bmux_plugin::StreamOrigin::Local)));
     }
 
     unsafe extern "C" fn service_test_kernel_bridge(
@@ -1345,7 +1565,8 @@ mod tests {
         output_len: *mut usize,
     ) -> i32 {
         let input = unsafe { std::slice::from_raw_parts(input_ptr, input_len) };
-        let request: BridgeRequest = match decode_service_message(input) {
+        let request: bmux_plugin_sdk::HostKernelBridgeRequest = match decode_service_message(input)
+        {
             Ok(request) => request,
             Err(_) => return 1,
         };
@@ -1354,16 +1575,20 @@ mod tests {
             Err(_) => return 1,
         };
 
-        let _ = kernel_request;
-        let response = bmux_ipc::Response::Err(bmux_ipc::ErrorResponse {
-            code: bmux_ipc::ErrorCode::InvalidRequest,
-            message: "unsupported request in permissions service test bridge".to_string(),
-        });
+        let response = if matches!(kernel_request, bmux_ipc::Request::CurrentStreamProvenance) {
+            bmux_ipc::Response::Ok(bmux_ipc::ResponsePayload::CurrentStreamProvenance {
+                provenance: TEST_ORIGIN.with(|origin| origin.borrow().lock().unwrap().clone()),
+            })
+        } else {
+            return 1;
+        };
 
         let Ok(encoded) = bmux_ipc::encode(&response) else {
             return 1;
         };
-        let Ok(output) = encode_service_message(&BridgeResponse { payload: encoded }) else {
+        let Ok(output) =
+            encode_service_message(&bmux_plugin_sdk::HostKernelBridgeResponse { payload: encoded })
+        else {
             return 1;
         };
 
@@ -1389,6 +1614,27 @@ mod tests {
     // bmux_plugin_sdk::Result, whose PluginError is intentionally rich.
     #[allow(clippy::result_large_err)]
     fn install_service_test_router() -> TestServiceRouterGuard {
+        install_authorization_router(Arc::new(Mutex::new(bmux_plugin::StreamOrigin::Local)))
+    }
+
+    #[allow(clippy::result_large_err)] // Test router uses the SDK error contract.
+    fn install_authorization_router(
+        provenance: Arc<Mutex<bmux_plugin::StreamOrigin>>,
+    ) -> TestServiceRouterGuard {
+        install_authorization_router_with_access(
+            provenance,
+            Arc::new(Mutex::new(
+                bmux_connections_plugin_api::pairing_types::DeviceAccess::FullLocalRuntime,
+            )),
+        )
+    }
+
+    #[allow(clippy::result_large_err)] // Test router uses the SDK error contract.
+    fn install_authorization_router_with_access(
+        provenance: Arc<Mutex<bmux_plugin::StreamOrigin>>,
+        device_access: Arc<Mutex<bmux_connections_plugin_api::pairing_types::DeviceAccess>>,
+    ) -> TestServiceRouterGuard {
+        TEST_ORIGIN.with(|origin| *origin.borrow_mut() = Arc::clone(&provenance));
         let storage = Arc::new(Mutex::new(BTreeMap::<String, Vec<u8>>::new()));
         let router_storage = Arc::clone(&storage);
         let router: TestServiceRouter = Arc::new(
@@ -1400,6 +1646,15 @@ mod tests {
                   operation,
                   payload| {
                 match (interface_id, operation) {
+                    ("pairing-state", "current-provenance") => {
+                        encode_service_message(&*provenance.lock().unwrap())
+                    }
+                    ("pairing-state", "check-device-access") => encode_service_message(
+                        &bmux_connections_plugin_api::pairing_types::DeviceAccessCheck {
+                            access: *device_access.lock().unwrap(),
+                            revision: 1,
+                        },
+                    ),
                     ("storage-query/v1", "get") => {
                         let request: StorageGetRequest = decode_service_message(&payload)?;
                         let value = router_storage
@@ -1428,7 +1683,16 @@ mod tests {
                 }
             },
         );
-        install_test_service_router(router)
+        install_test_service_router(checked_test_router(router))
+    }
+
+    fn service_test_caller_id(interface_id: &str, operation: &str, payload: &[u8]) -> Uuid {
+        if interface_id == "session-policy-state" && operation == "check" {
+            decode_service_message::<SessionPolicyCheckRequest>(payload)
+                .map_or_else(|_| Uuid::new_v4(), |req| req.client_id)
+        } else {
+            Uuid::new_v4()
+        }
     }
 
     fn service_test_context(
@@ -1440,6 +1704,13 @@ mod tests {
         data_dir: &Path,
     ) -> NativeServiceContext {
         let host_services = vec![
+            RegisteredService {
+                capability: HostScope::new("bmux.connections.pairing")
+                    .expect("capability should parse"),
+                kind: ServiceKind::Query,
+                interface_id: "pairing-state".into(),
+                provider: ProviderId::Plugin("bmux.connections".into()),
+            },
             RegisteredService {
                 capability: HostScope::new("bmux.sessions.read").expect("capability should parse"),
                 kind: ServiceKind::Query,
@@ -1479,6 +1750,7 @@ mod tests {
             },
         ];
 
+        let caller_client_id = Some(service_test_caller_id(interface_id, operation, &payload));
         NativeServiceContext {
             plugin_id: "bmux.permissions".to_string(),
             request: ServiceRequest {
@@ -1528,7 +1800,7 @@ mod tests {
             },
             settings: None,
             plugin_settings_map: std::collections::BTreeMap::new(),
-            caller_client_id: None,
+            caller_client_id,
             cancellation: bmux_plugin_sdk::CancellationToken::default(),
             host_kernel_bridge: Some(HostKernelBridge::from_fn(service_test_kernel_bridge)),
         }
@@ -1889,7 +2161,195 @@ mod tests {
     }
 
     #[test]
-    fn revoke_removes_entry_from_policy_state() {
+    fn generated_calls_recheck_subject_grants_revocation_and_admin_authority() {
+        use bmux_plugin::StreamOrigin as StreamProvenance;
+        let origin = Arc::new(Mutex::new(StreamProvenance::Local));
+        let access = Arc::new(Mutex::new(
+            bmux_connections_plugin_api::pairing_types::DeviceAccess::FullLocalRuntime,
+        ));
+        let _router =
+            install_authorization_router_with_access(Arc::clone(&origin), Arc::clone(&access));
+        let plugin = PermissionsPlugin;
+        let data_dir = service_test_data_dir();
+        let subject = Uuid::new_v4();
+        let session = service_test_session_id();
+        let policy = || {
+            service_test_context(
+                "session-policy-state",
+                "check",
+                encode_service_message(&SessionPolicyCheckRequest {
+                    session_id: session,
+                    client_id: Uuid::new_v4(),
+                    principal_id: Uuid::new_v4(),
+                    action: "pane.direct_input".into(),
+                    context_id: None,
+                    plugin_id: None,
+                    capability: None,
+                    execution_class: None,
+                })
+                .unwrap(),
+                "bmux.sessions.policy",
+                ServiceKind::Query,
+                &data_dir,
+            )
+        };
+        let grant = |subject_id| {
+            service_test_context(
+            "permissions-commands", "grant-resource", encode_service_message(
+                &bmux_permissions_plugin_api::permissions_commands::client::GrantResourceRequest {
+                    subject_id, session_id: Some(session), role: "writer".into(),
+                },
+            ).unwrap(), "bmux.permissions.write", ServiceKind::Command, &data_dir,
+        )
+        };
+        // A grant to a forged/different subject never grants the admitted subject.
+        assert!(plugin.invoke_service(grant(Uuid::new_v4())).error.is_none());
+        *origin.lock().unwrap() = StreamProvenance::Admitted {
+            subject_id: subject,
+            lease_id: Uuid::new_v4(),
+        };
+        let response = plugin.invoke_service(policy());
+        assert!(
+            !decode_service_message::<SessionPolicyCheckResponse>(&response.payload)
+                .unwrap()
+                .allowed
+        );
+        assert_eq!(
+            plugin.invoke_service(grant(subject)).error.unwrap().code,
+            "admin_denied"
+        );
+        *origin.lock().unwrap() = StreamProvenance::Local;
+        assert!(plugin.invoke_service(grant(subject)).error.is_none());
+        *origin.lock().unwrap() = StreamProvenance::Admitted {
+            subject_id: subject,
+            lease_id: Uuid::new_v4(),
+        };
+        let response = plugin.invoke_service(policy());
+        assert!(
+            decode_service_message::<SessionPolicyCheckResponse>(&response.payload)
+                .unwrap()
+                .allowed
+        );
+        // Device revocation wins even while the resource grant remains durable.
+        *access.lock().unwrap() = bmux_connections_plugin_api::pairing_types::DeviceAccess::Denied;
+        assert!(plugin.invoke_service(policy()).error.is_some());
+        *access.lock().unwrap() =
+            bmux_connections_plugin_api::pairing_types::DeviceAccess::FullLocalRuntime;
+        *origin.lock().unwrap() = StreamProvenance::Local;
+        let revoke = service_test_context(
+            "permissions-commands",
+            "revoke-resource",
+            encode_service_message(
+                &bmux_permissions_plugin_api::permissions_commands::client::RevokeResourceRequest {
+                    subject_id: subject,
+                    session_id: Some(session),
+                },
+            )
+            .unwrap(),
+            "bmux.permissions.write",
+            ServiceKind::Command,
+            &data_dir,
+        );
+        assert!(plugin.invoke_service(revoke).error.is_none());
+        *origin.lock().unwrap() = StreamProvenance::Admitted {
+            subject_id: subject,
+            lease_id: Uuid::new_v4(),
+        };
+        let response = plugin.invoke_service(policy());
+        assert!(
+            !decode_service_message::<SessionPolicyCheckResponse>(&response.payload)
+                .unwrap()
+                .allowed
+        );
+        *origin.lock().unwrap() = StreamProvenance::Invalid;
+        assert!(plugin.invoke_service(policy()).error.is_some());
+    }
+
+    #[test]
+    fn resource_grants_are_explicit_subject_scoped_and_durably_revocable() {
+        let session = Uuid::new_v4();
+        let subject = Uuid::new_v4();
+        let host = MockHost::with_session(session, "alpha");
+        assert!(
+            !resource_decision(
+                &load_resource_grants(&host).unwrap(),
+                subject,
+                session,
+                "pane.direct_input"
+            )
+            .allowed
+        );
+        mutate_resource_grant(&host, subject, Some(session), Some("writer".into())).unwrap();
+        let persisted = load_resource_grants(&host).unwrap();
+        assert!(resource_decision(&persisted, subject, session, "pane.direct_input").allowed);
+        assert!(
+            !resource_decision(&persisted, Uuid::new_v4(), session, "pane.direct_input").allowed
+        );
+        assert!(
+            !resource_decision(&persisted, subject, Uuid::new_v4(), "pane.direct_input").allowed
+        );
+        assert!(!resource_decision(&persisted, subject, session, "admin").allowed);
+        mutate_resource_grant(&host, subject, Some(session), None).unwrap();
+        assert!(
+            !resource_decision(
+                &load_resource_grants(&host).unwrap(),
+                subject,
+                session,
+                "pane.direct_input"
+            )
+            .allowed
+        );
+    }
+
+    #[test]
+    fn runtime_resource_scope_is_explicit_and_unknown_actions_deny() {
+        let subject = Uuid::new_v4();
+        let session = Uuid::new_v4();
+        let host = MockHost::with_session(session, "alpha");
+        mutate_resource_grant(&host, subject, None, Some("owner".into())).unwrap();
+        let grants = load_resource_grants(&host).unwrap();
+        assert!(resource_decision(&grants, subject, Uuid::new_v4(), "session.create").allowed);
+        assert!(!resource_decision(&grants, subject, session, "unmigrated.action").allowed);
+        mutate_resource_grant(&host, subject, Some(session), Some("observer".into())).unwrap();
+        assert!(
+            !resource_decision(
+                &load_resource_grants(&host).unwrap(),
+                subject,
+                session,
+                "pane.resize"
+            )
+            .allowed
+        );
+        mutate_resource_grant(&host, subject, Some(session), None).unwrap();
+        assert!(
+            !resource_decision(
+                &load_resource_grants(&host).unwrap(),
+                subject,
+                session,
+                "pane.resize"
+            )
+            .allowed
+        );
+        mutate_resource_grant(&host, subject, None, None).unwrap();
+        assert!(
+            !resource_decision(
+                &load_resource_grants(&host).unwrap(),
+                subject,
+                Uuid::new_v4(),
+                "session.create"
+            )
+            .allowed
+        );
+    }
+
+    #[test]
+    fn absent_host_provenance_is_never_local_owner() {
+        let host = MockHost::with_session(Uuid::new_v4(), "alpha");
+        assert!(require_local_owner(&host).is_err());
+    }
+
+    #[test]
+    fn revoke_preserves_explicit_denial_in_policy_state() {
         let session_id = Uuid::new_v4();
         let client_id = Uuid::new_v4();
         let host = MockHost::with_session(session_id, "alpha");
@@ -1926,7 +2386,7 @@ mod tests {
             },
         )
         .expect("policy evaluation should succeed");
-        assert!(decision.allowed);
+        assert!(!decision.allowed);
     }
 
     #[test]
@@ -2018,7 +2478,8 @@ mod tests {
         );
         let relisted_payload: Vec<PermissionEntry> =
             decode_service_message(&relisted.payload).expect("relist response should decode");
-        assert!(relisted_payload.is_empty());
+        assert_eq!(relisted_payload.len(), 1);
+        assert_eq!(relisted_payload[0].role, "revoked");
     }
 
     #[test]
@@ -2081,6 +2542,7 @@ mod tests {
 
     #[test]
     fn invoke_service_grant_rejects_invalid_role() {
+        let _router = install_service_test_router();
         let plugin = PermissionsPlugin;
         let data_dir = service_test_data_dir();
         let context = service_test_context(
@@ -2145,6 +2607,7 @@ mod tests {
 
     #[test]
     fn invoke_service_policy_defaults_to_allow_without_entry() {
+        let _router = install_service_test_router();
         let plugin = PermissionsPlugin;
         let data_dir = service_test_data_dir();
         let context = service_test_context(

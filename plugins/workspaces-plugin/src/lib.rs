@@ -1254,6 +1254,35 @@ bmux_plugin_sdk::export_plugin!(WorkspacesPlugin, include_str!("../plugin.toml")
 
 #[cfg(test)]
 mod tests {
+    fn checked_test_router(
+        router: bmux_plugin::test_support::TestServiceRouter,
+    ) -> bmux_plugin::test_support::TestServiceRouter {
+        std::sync::Arc::new(
+            // The test router ABI returns PluginError by value.
+            #[allow(clippy::result_large_err)]
+            move |caller, client, capability, kind, interface, operation, payload| {
+                if !bmux_plugin_sdk::service_contract::is_checked(&payload) {
+                    return router(
+                        caller, client, capability, kind, interface, operation, payload,
+                    );
+                }
+                let contract = <bmux_clients_plugin_api::Contract as bmux_plugin_sdk::PluginContract>::service_contract_for(interface)
+                .or_else(|| <bmux_contexts_plugin_api::Contract as bmux_plugin_sdk::PluginContract>::service_contract_for(interface))
+                .or_else(|| <bmux_tabs_plugin_api::Contract as bmux_plugin_sdk::PluginContract>::service_contract_for(interface))
+                    .expect("mock service must have a declared generated contract");
+                let request =
+                    bmux_plugin_sdk::service_contract::decode_for(interface, contract, &payload)?
+                        .to_vec();
+                let response = router(
+                    caller, client, capability, kind, interface, operation, request,
+                )?;
+                Ok(bmux_plugin_sdk::service_contract::encode_response(
+                    &response,
+                ))
+            },
+        )
+    }
+
     #[test]
     fn catalog_write_failure_does_not_publish_new_workspace() {
         struct FailingStorage;
@@ -1356,132 +1385,154 @@ mod tests {
             operation: &str,
             payload: Vec<u8>,
         ) -> bmux_plugin_sdk::Result<Vec<u8>> {
-            match (interface_id, operation) {
-                ("clients-state", "current-client") => {
-                    let id = *self
-                        .current_client_id
-                        .lock()
-                        .expect("current client lock should succeed");
-                    let result: Result<ClientSummary, ClientQueryError> = Ok(ClientSummary {
-                        id,
-                        selected_session_id: None,
-                        selected_context_id: None,
-                        following_client_id: None,
-                        following_global: false,
-                    });
-                    encode_service_message(&result)
-                }
-                ("contexts-state", "list-contexts") => encode_service_message(
-                    &self
-                        .contexts
-                        .lock()
-                        .expect("contexts lock should succeed")
-                        .clone(),
-                ),
-                ("contexts-activation-v1", "activate") => {
-                    let request: bmux_contexts_plugin_api::contexts_activation_v1::client::ActivateRequest = decode_service_message(&payload)?;
-                    self.selected_contexts
-                        .lock()
-                        .unwrap()
-                        .push(request.context_id);
-                    let result: Result<
-                        ContextAck,
-                        bmux_contexts_plugin_api::contexts_commands::SelectContextError,
-                    > = Ok(ContextAck {
-                        id: request.context_id,
-                        session_id: None,
-                    });
-                    encode_service_message(&result)
-                }
-                ("contexts-commands", "select-context") => {
-                    #[derive(Deserialize)]
-                    struct Args {
-                        selector: contexts_state::ContextSelector,
+            let checked = bmux_plugin_sdk::service_contract::is_checked(&payload);
+            let payload = if checked {
+                let contract = <bmux_clients_plugin_api::Contract as bmux_plugin_sdk::PluginContract>::service_contract_for(interface_id).or_else(|| <bmux_contexts_plugin_api::Contract as bmux_plugin_sdk::PluginContract>::service_contract_for(interface_id)).or_else(|| <bmux_tabs_plugin_api::Contract as bmux_plugin_sdk::PluginContract>::service_contract_for(interface_id)).expect("generated mock contract");
+                bmux_plugin_sdk::service_contract::decode_for(interface_id, contract, &payload)?
+                    .to_vec()
+            } else {
+                payload
+            };
+            // This mock preserves the ServiceCaller error ABI by value.
+            #[allow(clippy::result_large_err)]
+            let mock_response = || -> bmux_plugin_sdk::Result<Vec<u8>> {
+                match (interface_id, operation) {
+                    ("clients-state", "current-client") => {
+                        let id = *self
+                            .current_client_id
+                            .lock()
+                            .expect("current client lock should succeed");
+                        let result: Result<ClientSummary, ClientQueryError> = Ok(ClientSummary {
+                            id,
+                            selected_session_id: None,
+                            selected_context_id: None,
+                            following_client_id: None,
+                            following_global: false,
+                        });
+                        encode_service_message(&result)
                     }
-                    let request: Args = decode_service_message(&payload)?;
-                    let id = request
-                        .selector
-                        .id
-                        .ok_or_else(|| PluginError::ServiceProtocol {
-                            details: "test select requires an id".to_string(),
-                        })?;
-                    self.selected_contexts
-                        .lock()
-                        .expect("selected contexts lock should succeed")
-                        .push(id);
-                    let result: Result<
-                        ContextAck,
-                        bmux_contexts_plugin_api::contexts_commands::SelectContextError,
-                    > = Ok(ContextAck {
-                        id,
-                        session_id: None,
-                    });
-                    encode_service_message(&result)
-                }
-                ("tabs-placement-v1", "place-tab") => {
-                    let request: bmux_tabs_plugin_api::tabs_placement_v1::client::PlaceTabRequest =
+                    ("contexts-state", "list-contexts") => encode_service_message(
+                        &self
+                            .contexts
+                            .lock()
+                            .expect("contexts lock should succeed")
+                            .clone(),
+                    ),
+                    ("contexts-activation-v1", "activate") => {
+                        let request: bmux_contexts_plugin_api::contexts_activation_v1::client::ActivateRequest = decode_service_message(&payload)?;
+                        self.selected_contexts
+                            .lock()
+                            .unwrap()
+                            .push(request.context_id);
+                        let result: Result<
+                            ContextAck,
+                            bmux_contexts_plugin_api::contexts_commands::SelectContextError,
+                        > = Ok(ContextAck {
+                            id: request.context_id,
+                            session_id: None,
+                        });
+                        encode_service_message(&result)
+                    }
+                    ("contexts-commands", "select-context") => {
+                        #[derive(Deserialize)]
+                        struct Args {
+                            selector: contexts_state::ContextSelector,
+                        }
+                        let request: Args = decode_service_message(&payload)?;
+                        let id =
+                            request
+                                .selector
+                                .id
+                                .ok_or_else(|| PluginError::ServiceProtocol {
+                                    details: "test select requires an id".to_string(),
+                                })?;
+                        self.selected_contexts
+                            .lock()
+                            .expect("selected contexts lock should succeed")
+                            .push(id);
+                        let result: Result<
+                            ContextAck,
+                            bmux_contexts_plugin_api::contexts_commands::SelectContextError,
+                        > = Ok(ContextAck {
+                            id,
+                            session_id: None,
+                        });
+                        encode_service_message(&result)
+                    }
+                    ("tabs-placement-v1", "place-tab") => {
+                        let request: bmux_tabs_plugin_api::tabs_placement_v1::client::PlaceTabRequest =
                         decode_service_message(&payload)?;
-                    let mut contexts = self.contexts.lock().unwrap();
-                    let context = contexts
-                        .iter_mut()
-                        .find(|context| context.id == request.context_id)
-                        .unwrap();
-                    context
-                        .attributes
-                        .insert("workspace".into(), request.workspace_id.to_string());
-                    drop(contexts);
-                    encode_service_message(&Ok::<(), String>(()))
-                }
-                ("contexts-commands", "set-context-attributes") => {
-                    #[derive(Deserialize)]
-                    struct Args {
-                        selector: contexts_state::ContextSelector,
-                        attributes: BTreeMap<String, String>,
+                        let mut contexts = self.contexts.lock().unwrap();
+                        let context = contexts
+                            .iter_mut()
+                            .find(|context| context.id == request.context_id)
+                            .unwrap();
+                        context
+                            .attributes
+                            .insert("workspace".into(), request.workspace_id.to_string());
+                        drop(contexts);
+                        encode_service_message(&Ok::<(), String>(()))
                     }
-                    let request: Args = decode_service_message(&payload)?;
-                    let id = request
-                        .selector
-                        .id
-                        .ok_or_else(|| PluginError::ServiceProtocol {
-                            details: "test attribute update requires an id".to_string(),
-                        })?;
-                    let mut contexts = self.contexts.lock().expect("contexts lock should succeed");
-                    let context = contexts
-                        .iter_mut()
-                        .find(|context| context.id == id)
-                        .ok_or_else(|| PluginError::ServiceProtocol {
-                            details: "test context not found".to_string(),
-                        })?;
-                    context.attributes = request.attributes;
-                    drop(contexts);
-                    let result: Result<ContextAck, SetContextAttributesError> = Ok(ContextAck {
-                        id,
-                        session_id: None,
-                    });
-                    encode_service_message(&result)
+                    ("contexts-commands", "set-context-attributes") => {
+                        #[derive(Deserialize)]
+                        struct Args {
+                            selector: contexts_state::ContextSelector,
+                            attributes: BTreeMap<String, String>,
+                        }
+                        let request: Args = decode_service_message(&payload)?;
+                        let id =
+                            request
+                                .selector
+                                .id
+                                .ok_or_else(|| PluginError::ServiceProtocol {
+                                    details: "test attribute update requires an id".to_string(),
+                                })?;
+                        let mut contexts =
+                            self.contexts.lock().expect("contexts lock should succeed");
+                        let context = contexts
+                            .iter_mut()
+                            .find(|context| context.id == id)
+                            .ok_or_else(|| PluginError::ServiceProtocol {
+                                details: "test context not found".to_string(),
+                            })?;
+                        context.attributes = request.attributes;
+                        drop(contexts);
+                        let result: Result<ContextAck, SetContextAttributesError> =
+                            Ok(ContextAck {
+                                id,
+                                session_id: None,
+                            });
+                        encode_service_message(&result)
+                    }
+                    ("storage-query/v1", "get") => {
+                        let request: StorageGetRequest = decode_service_message(&payload)?;
+                        let value = self
+                            .storage
+                            .lock()
+                            .expect("storage lock should succeed")
+                            .get(request.key.as_str())
+                            .cloned();
+                        encode_service_message(&StorageGetResponse { value })
+                    }
+                    ("storage-command/v1", "set") => {
+                        let request: StorageSetRequest = decode_service_message(&payload)?;
+                        self.storage
+                            .lock()
+                            .expect("storage lock should succeed")
+                            .insert(request.key.as_str().to_string(), request.value);
+                        encode_service_message(&())
+                    }
+                    _ => Err(PluginError::UnsupportedHostOperation {
+                        operation: "workspaces_test_host",
+                    }),
                 }
-                ("storage-query/v1", "get") => {
-                    let request: StorageGetRequest = decode_service_message(&payload)?;
-                    let value = self
-                        .storage
-                        .lock()
-                        .expect("storage lock should succeed")
-                        .get(request.key.as_str())
-                        .cloned();
-                    encode_service_message(&StorageGetResponse { value })
-                }
-                ("storage-command/v1", "set") => {
-                    let request: StorageSetRequest = decode_service_message(&payload)?;
-                    self.storage
-                        .lock()
-                        .expect("storage lock should succeed")
-                        .insert(request.key.as_str().to_string(), request.value);
-                    encode_service_message(&())
-                }
-                _ => Err(PluginError::UnsupportedHostOperation {
-                    operation: "workspaces_test_host",
-                }),
-            }
+            };
+            let response = mock_response()?;
+            Ok(if checked {
+                bmux_plugin_sdk::service_contract::encode_response(&response)
+            } else {
+                response
+            })
         }
 
         fn execute_kernel_request(
@@ -1505,7 +1556,7 @@ mod tests {
                 host.call_service_raw("", kind, interface, operation, payload)
             },
         );
-        install_test_service_router(router)
+        install_test_service_router(checked_test_router(router))
     }
 
     fn context(id: u128, workspace_id: Uuid) -> contexts_state::ContextSummary {

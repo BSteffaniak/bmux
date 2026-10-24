@@ -2870,6 +2870,34 @@ fn normalized_theme_name(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::ThemeView as ThemePlugin;
+    pub fn checked_test_router(
+        router: bmux_plugin::test_support::TestServiceRouter,
+    ) -> bmux_plugin::test_support::TestServiceRouter {
+        std::sync::Arc::new(
+            // The test router ABI returns PluginError by value.
+            #[allow(clippy::result_large_err)]
+            move |caller, client, capability, kind, interface, operation, payload| {
+                if !bmux_plugin_sdk::service_contract::is_checked(&payload) {
+                    return router(
+                        caller, client, capability, kind, interface, operation, payload,
+                    );
+                }
+                let contract = <bmux_decoration_plugin_api::Contract as bmux_plugin_sdk::PluginContract>::service_contract_for(interface)
+                .or_else(|| <control_contract::Contract as bmux_plugin_sdk::PluginContract>::service_contract_for(interface))
+                    .expect("mock service must have a declared generated contract");
+                let request =
+                    bmux_plugin_sdk::service_contract::decode_for(interface, contract, &payload)?
+                        .to_vec();
+                let response = router(
+                    caller, client, capability, kind, interface, operation, request,
+                )?;
+                Ok(bmux_plugin_sdk::service_contract::encode_response(
+                    &response,
+                ))
+            },
+        )
+    }
+
     use super::*;
     use bmux_plugin::test_support::{TestServiceRouter, install_test_service_router};
     use bmux_plugin_sdk::StorageSetRequest;
@@ -3143,7 +3171,7 @@ mod tests {
             *observed.lock().expect("calls") += 1;
             Ok(Vec::new())
         });
-        let _router = install_test_service_router(router);
+        let _router = install_test_service_router(checked_test_router(router));
         let (sender, mut requests) = tokio::sync::mpsc::unbounded_channel();
         let _host = prompt::register_host(sender);
         let host = async {
@@ -3214,7 +3242,7 @@ mod tests {
                     _ => encode_service_message(&()),
                 }
             });
-        let _router = install_test_service_router(router);
+        let _router = install_test_service_router(checked_test_router(router));
         let (sender, mut requests) = tokio::sync::mpsc::unbounded_channel();
         let _host = prompt::register_host(sender);
         let mut context = picker_context();
@@ -3251,7 +3279,7 @@ mod tests {
                 },
             ))
         });
-        let _router = install_test_service_router(router);
+        let _router = install_test_service_router(checked_test_router(router));
         let payload = encode_service_message(&ApplyThemeExtensionArgs {
             toml: String::new(),
             config_dir_candidates: Vec::new(),
@@ -3295,7 +3323,7 @@ mod tests {
                 _ => encode_service_message(&()),
             },
         );
-        let _router = install_test_service_router(router);
+        let _router = install_test_service_router(checked_test_router(router));
         let (sender, mut requests) = tokio::sync::mpsc::unbounded_channel();
         let _host = prompt::register_host(sender);
         let mut context = picker_context();
@@ -3434,7 +3462,7 @@ mod tests {
                 bmux_decoration_plugin_api::decoration_state::ValidationResult,
             >(()))
         });
-        let _router = install_test_service_router(router);
+        let _router = install_test_service_router(checked_test_router(router));
         let context = service_context(Some(
             toml::from_str("persistence = 'persist_between_connects'").expect("settings"),
         ));
@@ -3500,7 +3528,7 @@ mod tests {
                 bmux_decoration_plugin_api::decoration_state::ValidationResult,
             >(()))
         });
-        let _router = install_test_service_router(router);
+        let _router = install_test_service_router(checked_test_router(router));
         let snapshot = plugin.refresh_live_theme(&context, 4).expect("refresh");
         assert_eq!(snapshot.revision, 5);
         assert_eq!(
@@ -3554,7 +3582,7 @@ mod tests {
                 bmux_decoration_plugin_api::decoration_state::ValidationResult,
             >(()))
         });
-        let _router = install_test_service_router(router);
+        let _router = install_test_service_router(checked_test_router(router));
         plugin
             .refresh_live_theme(&context, 1)
             .expect("refresh fallback");
@@ -3578,9 +3606,10 @@ mod tests {
     #[test]
     #[allow(clippy::result_large_err)] // TestServiceRouter fixes the external error type; this test cannot shrink it.
     fn preview_rejects_foreign_owner_and_competing_mutations() {
-        let _checkpoint = install_test_service_router(Arc::new(|_, _, _, _, _, _, _| {
-            encode_service_message(&Ok::<(), String>(()))
-        }));
+        let _checkpoint =
+            install_test_service_router(checked_test_router(Arc::new(|_, _, _, _, _, _, _| {
+                encode_service_message(&Ok::<(), String>(()))
+            })));
         let plugin = ThemePlugin::default();
         let mut context = service_context(None);
         context.caller_client_id = Some(
@@ -3616,9 +3645,10 @@ mod tests {
     #[test]
     #[allow(clippy::result_large_err)] // TestServiceRouter fixes the external error type.
     fn preview_confirmation_commits_once_and_releases_owner() {
-        let _checkpoint = install_test_service_router(Arc::new(|_, _, _, _, _, _, _| {
-            encode_service_message(&Ok::<(), String>(()))
-        }));
+        let _checkpoint =
+            install_test_service_router(checked_test_router(Arc::new(|_, _, _, _, _, _, _| {
+                encode_service_message(&Ok::<(), String>(()))
+            })));
         let plugin = ThemePlugin::default();
         let mut context = service_context(None);
         context.caller_client_id = Some(
@@ -3637,7 +3667,7 @@ mod tests {
                 bmux_decoration_plugin_api::decoration_state::ValidationResult,
             >(()))
         });
-        let _router = install_test_service_router(router);
+        let _router = install_test_service_router(checked_test_router(router));
         let choice = ThemeSelection::Preset {
             name: "hacker".into(),
         };
@@ -3680,7 +3710,7 @@ mod tests {
                 observed.lock().expect("cancelled").push(request.token);
                 encode_service_message(&Ok::<(), String>(()))
             });
-        let _router = install_test_service_router(router);
+        let _router = install_test_service_router(checked_test_router(router));
         drop(PickerPreviewGuard {
             route: None,
             context: picker_context(),
@@ -3708,9 +3738,10 @@ mod tests {
         context.request.service.interface_id = "theme-control-v1".into();
         context.request.operation = "current".into();
         assert!(plugin.invoke_service(context.clone()).error.is_none());
-        let checkpoint_router = install_test_service_router(Arc::new(|_, _, _, _, _, _, _| {
-            encode_service_message(&Ok::<(), String>(()))
-        }));
+        let checkpoint_router =
+            install_test_service_router(checked_test_router(Arc::new(|_, _, _, _, _, _, _| {
+                encode_service_message(&Ok::<(), String>(()))
+            })));
         let token = plugin.begin_preview(&context, 0).expect("preview");
         drop(checkpoint_router);
         let router: TestServiceRouter = Arc::new(|_, _, _, _, _, _, _| {
@@ -3720,7 +3751,7 @@ mod tests {
                 },
             ))
         });
-        let _router = install_test_service_router(router);
+        let _router = install_test_service_router(checked_test_router(router));
         assert!(plugin.cancel_preview(&context, token).is_err());
         assert!(
             plugin
@@ -3744,9 +3775,10 @@ mod tests {
         context.request.service.interface_id = "theme-control-v1".into();
         context.request.operation = "current".into();
         assert!(plugin.invoke_service(context.clone()).error.is_none());
-        let checkpoint_router = install_test_service_router(Arc::new(|_, _, _, _, _, _, _| {
-            encode_service_message(&Ok::<(), String>(()))
-        }));
+        let checkpoint_router =
+            install_test_service_router(checked_test_router(Arc::new(|_, _, _, _, _, _, _| {
+                encode_service_message(&Ok::<(), String>(()))
+            })));
         let token = plugin.begin_preview(&context, 0).expect("begin");
         drop(checkpoint_router);
         let calls = Arc::new(Mutex::new(0));
@@ -3774,7 +3806,7 @@ mod tests {
                 };
             encode_service_message(&result)
         });
-        let _router = install_test_service_router(router);
+        let _router = install_test_service_router(checked_test_router(router));
         assert!(
             plugin
                 .preview_theme(
@@ -3858,7 +3890,7 @@ mod tests {
                 value: Some(b"not json".to_vec()),
             })
         });
-        let _router = install_test_service_router(router);
+        let _router = install_test_service_router(checked_test_router(router));
         let result = resolve_live_selection(
             &service_context(None),
             &catalog,
@@ -3989,7 +4021,7 @@ mod tests {
                 bmux_decoration_plugin_api::decoration_state::ValidationResult,
             >(()))
         });
-        let _router = install_test_service_router(router);
+        let _router = install_test_service_router(checked_test_router(router));
         let context = service_context(Some(
             toml::from_str("persistence = 'persist_between_connects'").expect("settings"),
         ));
@@ -4041,7 +4073,7 @@ mod tests {
         context.connection.config_dir_candidates = vec![context.connection.config_dir.clone()];
         let router: TestServiceRouter =
             Arc::new(|_, _, _, _, _, _, _| panic!("invalid refresh must not invoke services"));
-        let _router = install_test_service_router(router);
+        let _router = install_test_service_router(checked_test_router(router));
         assert!(plugin.refresh_live_theme(&context, 9).is_err());
         let retained = plugin
             .selection
@@ -4097,7 +4129,7 @@ mod tests {
                     bmux_decoration_plugin_api::decoration_state::ValidationResult,
                 >(()))
             });
-        let _router = install_test_service_router(router);
+        let _router = install_test_service_router(checked_test_router(router));
         restore_preview_checkpoint(&service_context(None), &preview, &[]).expect("restore");
         assert_eq!(*calls.lock().expect("calls"), 1);
     }
@@ -4127,7 +4159,7 @@ mod tests {
                 bmux_decoration_plugin_api::decoration_state::ValidationResult,
             >(()))
         });
-        let _router = install_test_service_router(router);
+        let _router = install_test_service_router(checked_test_router(router));
         assert!(plugin.invoke_service(context.clone()).error.is_none());
         let token = plugin.begin_preview(&context, 0).expect("begin");
         assert!(
@@ -4200,7 +4232,7 @@ mod tests {
                 >(())),
             },
         );
-        let _router = install_test_service_router(router);
+        let _router = install_test_service_router(checked_test_router(router));
         assert!(plugin.invoke_service(context.clone()).error.is_none());
         let token = plugin.begin_preview(&context, 0).expect("begin");
         assert!(
@@ -4250,7 +4282,7 @@ mod tests {
         };
         let router: TestServiceRouter =
             Arc::new(|_, _, _, _, _, _, _| panic!("stale form must not invoke services"));
-        let _router = install_test_service_router(router);
+        let _router = install_test_service_router(checked_test_router(router));
         assert_eq!(
             ThemePlugin::apply_external_form(&service_context(None), 7, "performance", b"{}")
                 .expect_err("stale form"),
@@ -5530,7 +5562,7 @@ mod tests {
                 })
             },
         );
-        install_test_service_router(router)
+        install_test_service_router(checked_test_router(router))
     }
 
     fn performance_settings_provider() -> ThemeSettingsProviderSpec {
@@ -5606,7 +5638,7 @@ mod tests {
                 }
             },
         );
-        install_test_service_router(router)
+        install_test_service_router(checked_test_router(router))
     }
 
     #[allow(clippy::result_large_err)] // Test router signature is fixed by bmux_plugin test support.
@@ -5649,7 +5681,7 @@ mod tests {
                 }
             },
         );
-        install_test_service_router(router)
+        install_test_service_router(checked_test_router(router))
     }
 }
 

@@ -974,6 +974,7 @@ pub(super) async fn run_host(
     if stop {
         return run_host_stop();
     }
+    super::server_commands::refuse_unadmitted_remote_ingress("legacy Iroh host")?;
     let mut config = BmuxConfig::load()?;
     ensure_iroh_ssh_access_ready(&config)?;
     let require_ssh_auth = iroh_ssh_access_enabled(&config);
@@ -2793,6 +2794,97 @@ async fn delete_share_link(control_plane_url: &str, token: &str, name: &str) -> 
     Ok(())
 }
 
+// Only connection establishment is retried. Never wrap attachment, input, or a
+// service mutation in this helper: a lost response does not establish non-execution.
+async fn retry_iroh_connection<T, Connect, ConnectFuture, Sleep, SleepFuture>(
+    attempts: &mut usize,
+    forever: bool,
+    mut connect: Connect,
+    mut sleep: Sleep,
+) -> Result<Option<(T, u64)>>
+where
+    Connect: FnMut(usize) -> ConnectFuture,
+    ConnectFuture: std::future::Future<Output = Result<T>>,
+    Sleep: FnMut(Duration) -> SleepFuture,
+    SleepFuture: std::future::Future<Output = ()>,
+{
+    while forever || *attempts < SSH_RECONNECT_MAX_ATTEMPTS {
+        *attempts = attempts.saturating_add(1);
+        let backoff_ms = reconnect_backoff_ms(*attempts);
+        sleep(Duration::from_millis(backoff_ms)).await;
+        match connect(*attempts).await {
+            Ok(connection) => return Ok(Some((connection, backoff_ms))),
+            Err(error) if iroh_connect_error_is_transient(&error) => {
+                tracing::debug!(attempt = *attempts, %error, "transient iroh reconnect failure");
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(None)
+}
+
+fn iroh_connect_error_is_transient(error: &anyhow::Error) -> bool {
+    // SSH auth currently exposes anyhow rather than a typed rejection contract.
+    // Treat its existing stage boundary as terminal, including local agent I/O;
+    // connectivity errors inside authentication must not retry revoked trust.
+    if error
+        .chain()
+        .any(|source| source.to_string() == "iroh SSH auth handshake failed")
+    {
+        return false;
+    }
+    // Fail closed for unknown/untyped failures, including SSH auth rejections.
+    // Inspect the outermost typed boundary first so a protocol/auth error cannot
+    // become retryable merely because its source contains an I/O error.
+    for source in error.chain() {
+        if let Some(error) = source.downcast_ref::<bmux_client::ClientError>() {
+            return match error {
+                bmux_client::ClientError::Timeout(_) => true,
+                bmux_client::ClientError::Transport(
+                    bmux_ipc::transport::IpcTransportError::Io(error),
+                ) => iroh_io_error_is_transient(error),
+                _ => false,
+            };
+        }
+        if let Some(error) = source.downcast_ref::<iroh::endpoint::ConnectingError>()
+            && !matches!(
+                error,
+                iroh::endpoint::ConnectingError::ConnectionError { .. }
+            )
+        {
+            return false;
+        }
+        if let Some(error) = source.downcast_ref::<iroh::endpoint::ConnectionError>() {
+            return matches!(
+                error,
+                iroh::endpoint::ConnectionError::TimedOut | iroh::endpoint::ConnectionError::Reset
+            );
+        }
+        if source.is::<tokio::time::error::Elapsed>() {
+            return true;
+        }
+        if let Some(error) = source.downcast_ref::<io::Error>() {
+            return iroh_io_error_is_transient(error);
+        }
+    }
+    false
+}
+
+fn iroh_io_error_is_transient(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::TimedOut
+            | io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::NotConnected
+            | io::ErrorKind::BrokenPipe
+            | io::ErrorKind::UnexpectedEof
+            | io::ErrorKind::Interrupted
+            | io::ErrorKind::WouldBlock
+    )
+}
+
 #[allow(clippy::too_many_arguments)] // keep reconnect parameters explicit at call sites
 async fn run_iroh_attach_with_reconnect(
     mut client: BmuxClient,
@@ -2816,29 +2908,34 @@ async fn run_iroh_attach_with_reconnect(
             return Ok(outcome.status_code);
         }
         let outage_started_at = Instant::now();
-        if !reconnect_forever && reconnect_attempt >= SSH_RECONNECT_MAX_ATTEMPTS {
+        let recovered = retry_iroh_connection(
+            &mut reconnect_attempt,
+            reconnect_forever,
+            |attempt| async move {
+                println!(
+                    "reconnecting to iroh target '{}' (attempt {attempt})...",
+                    target.label
+                );
+                let mut perf = IrohConnectPerfSummary::default();
+                let (client, connection) = connect_iroh_bridge(
+                    target,
+                    "bmux-cli-connect-remote-iroh-reconnect",
+                    Some(&mut perf),
+                )
+                .await?;
+                Ok((client, connection, perf))
+            },
+            tokio::time::sleep,
+        )
+        .await?;
+        let Some(((mut new_client, new_connection, connect_perf), reconnect_backoff_ms)) =
+            recovered
+        else {
             println!(
                 "remote iroh connection closed; giving up after {SSH_RECONNECT_MAX_ATTEMPTS} reconnect attempts"
             );
             return Ok(1);
-        }
-        reconnect_attempt = reconnect_attempt.saturating_add(1);
-        let reconnect_backoff_ms = reconnect_backoff_ms(reconnect_attempt);
-        let backoff = Duration::from_millis(reconnect_backoff_ms);
-        println!(
-            "remote iroh connection closed; reconnecting to '{}' (attempt {reconnect_attempt}/{}) in {}ms...",
-            target.label,
-            SSH_RECONNECT_MAX_ATTEMPTS,
-            backoff.as_millis()
-        );
-        tokio::time::sleep(backoff).await;
-        let mut connect_perf = IrohConnectPerfSummary::default();
-        let (mut new_client, new_connection) = connect_iroh_bridge(
-            target,
-            "bmux-cli-connect-remote-iroh-reconnect",
-            Some(&mut connect_perf),
-        )
-        .await?;
+        };
         refresh_perf_emitter_settings_from_server(&mut perf_emitter, &mut new_client).await;
         emit_iroh_connect_perf_event(
             &mut perf_emitter,
@@ -3714,8 +3811,31 @@ async fn try_connect_tls_bridge(target: &TlsTarget, client_name: &str) -> Result
         .map_err(map_cli_client_error)
 }
 
-#[allow(clippy::too_many_lines)] // staged iroh bridge setup is clearer inline for troubleshooting
 async fn connect_iroh_bridge(
+    target: &IrohTarget,
+    client_name: &str,
+    perf_summary: Option<&mut IrohConnectPerfSummary>,
+) -> Result<(BmuxClient, iroh::endpoint::Connection)> {
+    // One deadline bounds bind, endpoint-online, QUIC, authentication, and IPC.
+    iroh_connect_with_deadline(
+        target.connect_timeout_ms,
+        Box::pin(connect_iroh_bridge_inner(target, client_name, perf_summary)),
+    )
+    .await
+    .with_context(|| format!("failed establishing iroh target '{}'", target.label))
+}
+
+async fn iroh_connect_with_deadline<T>(
+    timeout_ms: u64,
+    connect: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    tokio::time::timeout(Duration::from_millis(timeout_ms.max(1)), connect)
+        .await
+        .context("iroh connection establishment deadline elapsed")?
+}
+
+#[allow(clippy::too_many_lines)] // staged iroh bridge setup is clearer inline for troubleshooting
+async fn connect_iroh_bridge_inner(
     target: &IrohTarget,
     client_name: &str,
     perf_summary: Option<&mut IrohConnectPerfSummary>,
@@ -3817,7 +3937,9 @@ async fn connect_iroh_bridge(
         principal_id,
     )
     .await
-    .map_err(map_cli_client_error)?;
+    // Preserve typed errors for reconnect policy; the local-IPC diagnostic mapper
+    // erases EOF/refused errors and suggests starting a local server.
+    .map_err(anyhow::Error::from)?;
     perf.ipc_handshake_ms = duration_millis_u64(ipc_handshake_started_at.elapsed());
     perf.total_ms = duration_millis_u64(total_started_at.elapsed());
     perf.relay_enabled = target.relay_url.is_some();
@@ -5359,6 +5481,153 @@ mod tests {
     fn command_requires_remote_server_keeps_list_sessions() {
         let command = Command::ListSessions { json: false };
         assert!(command_requires_remote_server(Some(&command)));
+    }
+
+    #[tokio::test]
+    async fn iroh_reconnect_retries_failures_without_reattaching() {
+        let mut attempts = 0;
+        let mut delays = Vec::new();
+        let recovered = retry_iroh_connection(
+            &mut attempts,
+            false,
+            |attempt| {
+                std::future::ready(if attempt < 3 {
+                    Err(io::Error::from(io::ErrorKind::ConnectionReset).into())
+                } else {
+                    Ok("replacement connection")
+                })
+            },
+            |delay| {
+                delays.push(delay.as_millis());
+                std::future::ready(())
+            },
+        )
+        .await
+        .expect("transient errors retry");
+        assert_eq!(recovered, Some(("replacement connection", 1_200)));
+        assert_eq!(attempts, 3);
+        assert_eq!(delays, [300, 600, 1_200]);
+    }
+
+    #[tokio::test]
+    async fn iroh_reconnect_exhausts_lifetime_budget() {
+        let mut attempts = SSH_RECONNECT_MAX_ATTEMPTS - 1;
+        let recovered = retry_iroh_connection::<(), _, _, _, _>(
+            &mut attempts,
+            false,
+            |_| std::future::ready(Err(io::Error::from(io::ErrorKind::UnexpectedEof).into())),
+            |_| std::future::ready(()),
+        )
+        .await
+        .expect("budget exhaustion is not terminal auth failure");
+        assert_eq!(recovered, None);
+        assert_eq!(attempts, SSH_RECONNECT_MAX_ATTEMPTS);
+        let recovered = retry_iroh_connection::<(), _, _, _, _>(
+            &mut attempts,
+            false,
+            |_| async { panic!("exhausted budget must not dial again") },
+            |_| std::future::ready(()),
+        )
+        .await
+        .expect("exhausted budget");
+        assert_eq!(recovered, None);
+    }
+
+    #[tokio::test]
+    async fn iroh_reconnect_forever_caps_backoff_and_saturates_attempts() {
+        let mut attempts = usize::MAX;
+        let mut calls = 0;
+        let recovered = retry_iroh_connection(
+            &mut attempts,
+            true,
+            |_| {
+                calls += 1;
+                std::future::ready(if calls < 3 {
+                    Err(io::Error::from(io::ErrorKind::ConnectionRefused).into())
+                } else {
+                    Ok(())
+                })
+            },
+            |delay| {
+                assert_eq!(delay, Duration::from_millis(307_200));
+                std::future::ready(())
+            },
+        )
+        .await
+        .expect("forever ignores finite attempt budget");
+        assert!(recovered.is_some());
+        assert_eq!(calls, 3);
+        assert_eq!(attempts, usize::MAX);
+    }
+
+    #[tokio::test]
+    async fn iroh_reconnect_forever_stops_on_auth_failure() {
+        let mut attempts = 0;
+        let error = retry_iroh_connection::<(), _, _, _, _>(
+            &mut attempts,
+            true,
+            |_| std::future::ready(Err(anyhow::anyhow!("iroh SSH auth rejected: revoked"))),
+            |_| std::future::ready(()),
+        )
+        .await
+        .expect_err("authentication rejection must terminate even forever");
+        assert!(error.to_string().contains("revoked"));
+        assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    fn iroh_reconnect_classifies_typed_errors_not_messages() {
+        for error in [
+            anyhow::Error::from(iroh::endpoint::ConnectionError::TimedOut),
+            anyhow::Error::from(iroh::endpoint::ConnectionError::Reset),
+            anyhow::Error::from(bmux_client::ClientError::Timeout(Duration::from_secs(1))),
+            anyhow::Error::from(bmux_client::ClientError::Transport(
+                bmux_ipc::transport::IpcTransportError::Io(io::Error::from(
+                    io::ErrorKind::UnexpectedEof,
+                )),
+            )),
+        ] {
+            assert!(iroh_connect_error_is_transient(
+                &error.context("setup failed")
+            ));
+        }
+        for error in [
+            anyhow::anyhow!("timed out: unauthenticated peer"),
+            anyhow::Error::from(io::Error::from(io::ErrorKind::ConnectionRefused))
+                .context("iroh SSH auth handshake failed"),
+            anyhow::Error::from(io::Error::from(io::ErrorKind::PermissionDenied)),
+            anyhow::Error::from(iroh::endpoint::ConnectionError::VersionMismatch),
+            anyhow::Error::from(iroh::endpoint::ConnectionError::LocallyClosed),
+            anyhow::Error::from(bmux_client::ClientError::ServerError {
+                code: bmux_ipc::ErrorCode::InvalidRequest,
+                message: "revoked authority".to_string(),
+            }),
+        ] {
+            assert!(!iroh_connect_error_is_transient(
+                &error.context("setup failed")
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn iroh_reconnect_deadline_bounds_pending_setup() {
+        // No network or live endpoint: a permanently pending online/setup phase
+        // must be cancelled by the same deadline as all other connect stages.
+        let error = iroh_connect_with_deadline::<()>(0, std::future::pending())
+            .await
+            .expect_err("pending setup must time out");
+        assert!(iroh_connect_error_is_transient(&error));
+        assert!(
+            error
+                .downcast_ref::<tokio::time::error::Elapsed>()
+                .is_some()
+        );
+        assert_eq!(
+            iroh_connect_with_deadline(1, std::future::ready(Ok(7)))
+                .await
+                .expect("ready setup completes"),
+            7
+        );
     }
 
     #[test]

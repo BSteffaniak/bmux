@@ -80,6 +80,61 @@ fn contract_declares_both_services() {
         bmux_connections_plugin_api::service_declarations()
             .expect("valid declarations")
             .len(),
-        2
+        6
+    );
+}
+
+#[test]
+fn pairing_contract_is_generated_and_explicit() {
+    use bmux_connections_plugin_api::{pairing_commands, pairing_state, pairing_types};
+    let request = pairing_commands::client::CreateInvitationRequest {
+        device_key: "device-public-key".into(),
+        ttl_seconds: 300,
+        access: pairing_types::DeviceAccess::FullLocalRuntime,
+    };
+    let json = serde_json::to_string(&request).expect("serialize generated request");
+    let decoded: pairing_commands::client::CreateInvitationRequest =
+        serde_json::from_str(&json).expect("deserialize generated request");
+    assert_eq!(
+        decoded.access,
+        pairing_types::DeviceAccess::FullLocalRuntime
+    );
+    assert_eq!(decoded.ttl_seconds, 300);
+    assert_eq!(pairing_commands::INTERFACE_ID, "pairing-commands");
+    assert_eq!(pairing_commands::OP_REDEEM_INVITATION, "redeem-invitation");
+    assert_eq!(pairing_commands::OP_FINISH_ADMISSION, "finish-admission");
+    assert_eq!(pairing_state::OP_LIST_DEVICES, "list-devices");
+    assert_eq!(pairing_state::OP_CHECK_DEVICE_ACCESS, "check-device-access");
+    assert_eq!(
+        bmux_connections_plugin_api::admission_provider_state::INTERFACE_ID,
+        "admission-provider-state"
+    );
+    assert_eq!(
+        bmux_connections_plugin_api::admission_provider_commands::INTERFACE_ID,
+        "admission-provider-commands"
+    );
+    assert_eq!(
+        bmux_connections_plugin_api::admission_provider_commands::OP_CONSUME,
+        "consume"
+    );
+    let check = pairing_types::DeviceAccessCheck {
+        access: pairing_types::DeviceAccess::Denied,
+        revision: 9,
+    };
+    let json = serde_json::to_string(&check).expect("serialize access check");
+    assert_eq!(
+        serde_json::from_str::<pairing_types::DeviceAccessCheck>(&json).unwrap(),
+        check
+    );
+    let device = pairing_types::Device {
+        device_id: "device-id".into(),
+        device_key: request.device_key,
+        access: pairing_types::DeviceAccess::Denied,
+        revision: 2,
+    };
+    let json = serde_json::to_string(&device).expect("serialize device");
+    assert_eq!(
+        serde_json::from_str::<pairing_types::Device>(&json).unwrap(),
+        device
     );
 }

@@ -1,6 +1,7 @@
 execution_class = "native_fast"
 id = "bmux.permissions"
 name = "bmux Permissions"
+optional_capabilities = ["bmux.connections.pairing"]
 owns_namespaces = [
     "session",
     "permissions",

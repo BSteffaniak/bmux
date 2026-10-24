@@ -57,6 +57,7 @@ pub struct IrohTarget {
     pub relay_url: Option<String>,
     pub ip_addr: Option<std::net::SocketAddr>,
     pub require_ssh_auth: bool,
+    pub device_id: Option<uuid::Uuid>,
     pub compression: CompressionMode,
     pub connect_timeout_ms: u64,
 }
@@ -245,6 +246,7 @@ fn resolve_named(
             relay_url: target.relay_url.clone(),
             ip_addr: target.iroh_ip_addr,
             require_ssh_auth: target.iroh_ssh_auth,
+            device_id: None,
             compression: CompressionMode::Auto,
             connect_timeout_ms: target.connect_timeout_ms.max(1),
         })),
@@ -315,6 +317,7 @@ fn parse_iroh(reference: &str) -> Result<ResolvedTarget, ConnectionError> {
     let mut relay_url = None;
     let mut ip_addr = None;
     let mut require_ssh_auth = false;
+    let mut device_id = None;
     let mut compression = CompressionMode::Auto;
     if let Some(query) = query {
         for part in query.split('&').filter(|part| !part.is_empty()) {
@@ -329,6 +332,17 @@ fn parse_iroh(reference: &str) -> Result<ResolvedTarget, ConnectionError> {
                     );
                 }
                 "auth" if value.eq_ignore_ascii_case("ssh") => require_ssh_auth = true,
+                "device-id" => {
+                    let id = value.parse::<uuid::Uuid>().map_err(|_| {
+                        invalid(reference, "device-id must be a paired device UUID")
+                    })?;
+                    if id.is_nil() || device_id.replace(id).is_some() {
+                        return Err(invalid(
+                            reference,
+                            "device-id must occur once and must not be nil",
+                        ));
+                    }
+                }
                 "compression" if value.eq_ignore_ascii_case("none") => {
                     compression = CompressionMode::None;
                 }
@@ -353,6 +367,7 @@ fn parse_iroh(reference: &str) -> Result<ResolvedTarget, ConnectionError> {
         relay_url,
         ip_addr,
         require_ssh_auth,
+        device_id,
         compression,
         connect_timeout_ms: 8_000,
     }))
@@ -463,7 +478,7 @@ impl ResolvedTarget {
                 file_identity(Some(&paths.known_gateways_file())),
             ),
             Self::Iroh(target) => format!(
-                "iroh:{}|relay={}|addr={}|ssh_auth={}|compression={:?}",
+                "iroh:{}|relay={}|addr={}|ssh_auth={}|compression={:?}|device={:?}",
                 target.endpoint_id,
                 target.relay_url.as_deref().unwrap_or(""),
                 target
@@ -471,6 +486,7 @@ impl ResolvedTarget {
                     .map_or_else(String::new, |addr| addr.to_string()),
                 target.require_ssh_auth,
                 target.compression,
+                target.device_id,
             ),
         }
     }
@@ -520,6 +536,38 @@ impl ResolvedTarget {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn iroh_device_selector_is_strict_and_part_of_pool_identity() {
+        let config = BmuxConfig::default();
+        let id = uuid::Uuid::new_v4();
+        let reference = format!("iroh://endpoint?device-id={id}");
+        let target = resolve_internal(&config, &reference).unwrap();
+        assert!(matches!(&target, ResolvedTarget::Iroh(value) if value.device_id == Some(id)));
+        for query in [
+            "device-id=bad".to_string(),
+            "device-id=".to_string(),
+            format!("device-id={}", uuid::Uuid::nil()),
+            format!("device-id={id}&device-id={id}"),
+        ] {
+            assert!(resolve_internal(&config, &format!("iroh://endpoint?{query}")).is_err());
+        }
+        let paths = ConfigPaths::new(
+            "/config".into(),
+            "/runtime".into(),
+            "/data".into(),
+            "/state".into(),
+        );
+        let other = resolve_internal(
+            &config,
+            &format!("iroh://endpoint?device-id={}", uuid::Uuid::new_v4()),
+        )
+        .unwrap();
+        assert_ne!(
+            target.connection_identity(&config, &paths),
+            other.connection_identity(&config, &paths)
+        );
+    }
 
     #[test]
     fn resolves_all_inline_transports() {

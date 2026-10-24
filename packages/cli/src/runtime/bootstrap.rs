@@ -433,6 +433,112 @@ async fn run_server_start_inner(
         pane_shell_integration_override,
     );
     register_plugin_service_handlers(&server, &config, &paths, &registry)?;
+    {
+        use bmux_plugin::stream_admission::{
+            STREAM_ADMISSION_PROVIDER_EXTENSION, STREAM_ADMITTED_ROUTES_EXTENSION,
+            StreamAdmissionProviderDeclaration, StreamAdmittedRoute,
+        };
+        let mut selected = None;
+        for plugin in loaded_plugins.iter() {
+            for contribution in plugin.collect_activation_contributions()? {
+                if let bmux_plugin_sdk::PluginContribution::Extension {
+                    extension_point,
+                    payload,
+                    ..
+                } = &contribution
+                    && extension_point == STREAM_ADMITTED_ROUTES_EXTENSION
+                {
+                    let routes: Vec<StreamAdmittedRoute> =
+                        bmux_plugin_sdk::decode_service_message(payload)?;
+                    for route in routes {
+                        anyhow::ensure!(
+                            !route.operation.is_empty()
+                                && route.operation != "*"
+                                && plugin.declaration.services.iter().any(|service| service
+                                    .capability
+                                    .as_str()
+                                    == route.capability
+                                    && service.interface_id == route.interface_id
+                                    && service.kind == route.kind),
+                            "invalid admitted route declaration: provider={} capability={} kind={:?} interface={} operation={}",
+                            plugin.declaration.id.as_str(),
+                            route.capability,
+                            route.kind,
+                            route.interface_id,
+                            route.operation
+                        );
+                        server.approve_admitted_route(bmux_server::ServiceRoute {
+                            capability: route.capability,
+                            interface_id: route.interface_id,
+                            operation: route.operation,
+                            kind: match route.kind {
+                                bmux_plugin_sdk::ServiceKind::Query => {
+                                    bmux_ipc::InvokeServiceKind::Query
+                                }
+                                bmux_plugin_sdk::ServiceKind::Command => {
+                                    bmux_ipc::InvokeServiceKind::Command
+                                }
+                                bmux_plugin_sdk::ServiceKind::Event => {
+                                    anyhow::bail!("event cannot be an admitted request route")
+                                }
+                            },
+                        })?;
+                    }
+                }
+                if let bmux_plugin_sdk::PluginContribution::Extension {
+                    extension_point,
+                    payload,
+                    ..
+                } = contribution
+                    && extension_point == STREAM_ADMISSION_PROVIDER_EXTENSION
+                {
+                    anyhow::ensure!(
+                        selected.is_none(),
+                        "multiple stream admission providers declared"
+                    );
+                    let declaration: StreamAdmissionProviderDeclaration =
+                        bmux_plugin_sdk::decode_service_message(&payload)?;
+                    let route = |operation: &bmux_plugin::stream_admission::StreamAdmissionProviderOperation, kind| {
+                        anyhow::ensure!(plugin.declaration.services.iter().any(|service|
+                            service.capability.as_str() == operation.capability
+                            && service.interface_id == operation.interface_id
+                            && service.kind == kind), "admission route not owned by declaring provider");
+                        Ok::<_, anyhow::Error>(bmux_server::ServiceRoute {
+                            capability: operation.capability.clone(),
+                            kind: match kind {
+                                bmux_plugin_sdk::ServiceKind::Query => bmux_ipc::InvokeServiceKind::Query,
+                                bmux_plugin_sdk::ServiceKind::Command => bmux_ipc::InvokeServiceKind::Command,
+                                bmux_plugin_sdk::ServiceKind::Event => anyhow::bail!("event cannot be an admission operation"),
+                            },
+                            interface_id: operation.interface_id.clone(), operation: operation.operation.clone(),
+                        })
+                    };
+                    let routes = bmux_server::StreamAdmissionProviderRoutes {
+                        probe: route(&declaration.probe, bmux_plugin_sdk::ServiceKind::Query)?,
+                        consume: route(
+                            &declaration.consume,
+                            bmux_plugin_sdk::ServiceKind::Command,
+                        )?,
+                        validate: route(
+                            &declaration.validate,
+                            bmux_plugin_sdk::ServiceKind::Query,
+                        )?,
+                    };
+                    selected = Some((routes, declaration));
+                }
+            }
+        }
+        if let Some((routes, declaration)) = selected {
+            let deadline = std::time::Duration::from_millis(declaration.deadline_ms);
+            let capacity = declaration.max_in_flight;
+            server.install_stream_admission_provider(
+                routes,
+                std::sync::Arc::new(declaration),
+                deadline,
+                capacity,
+            )?;
+        }
+    }
     // Spawn a plugin-bus → streaming-client forwarder task for every
     // `event_publications` entry that opted into
     // `forward_to_streaming_clients`. These live for the server's

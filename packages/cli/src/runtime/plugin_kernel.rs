@@ -51,7 +51,95 @@ static HOST_KERNEL_CONNECTION_FALLBACK: OnceLock<Mutex<Option<HostConnectionInfo
 static HOST_KERNEL_CLIENT_FACTORY_FALLBACK: OnceLock<Mutex<Option<KernelClientFactory>>> =
     OnceLock::new();
 
-pub(super) struct ServiceKernelContextGuard;
+struct RetainedInvocation {
+    context: ServiceInvokeContext,
+    owners: usize,
+    cancellation: bmux_plugin_sdk::CancellationToken,
+}
+type RetainedInvocationRegistry = std::collections::BTreeMap<uuid::Uuid, RetainedInvocation>;
+fn retained_kernel_contexts() -> &'static Mutex<RetainedInvocationRegistry> {
+    static CONTEXTS: OnceLock<Mutex<RetainedInvocationRegistry>> = OnceLock::new();
+    CONTEXTS.get_or_init(Mutex::default)
+}
+
+struct RetainedKernelContext(uuid::Uuid);
+impl RetainedKernelContext {
+    fn register(context: ServiceInvokeContext) -> Result<Self> {
+        let token = uuid::Uuid::new_v4();
+        let mut contexts = retained_kernel_contexts()
+            .lock()
+            .map_err(|_| anyhow::anyhow!("retained kernel context unavailable"))?;
+        anyhow::ensure!(
+            contexts.len() < 4096,
+            "retained kernel context capacity exceeded"
+        );
+        contexts.insert(
+            token,
+            RetainedInvocation {
+                context,
+                owners: 1,
+                cancellation: bmux_plugin_sdk::CancellationToken::default(),
+            },
+        );
+        drop(contexts);
+        Ok(Self(token))
+    }
+    fn cancellation(&self) -> bmux_plugin_sdk::CancellationToken {
+        retained_kernel_contexts()
+            .lock()
+            .ok()
+            .and_then(|contexts| {
+                contexts
+                    .get(&self.0)
+                    .map(|entry| entry.cancellation.clone())
+            })
+            .unwrap_or_default()
+    }
+    fn bridge(&self) -> bmux_plugin_sdk::HostKernelBridge {
+        bmux_plugin_sdk::HostKernelBridge::bound(
+            host_kernel_bridge,
+            self.0,
+            retained_kernel_ownership,
+        )
+    }
+}
+impl Drop for RetainedKernelContext {
+    fn drop(&mut self) {
+        unsafe {
+            retained_kernel_ownership(self.0.as_bytes().as_ptr(), false);
+        }
+    }
+}
+
+unsafe extern "C" fn retained_kernel_ownership(token: *const u8, retain: bool) -> bool {
+    if token.is_null() {
+        return false;
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(token, 16) };
+    let Ok(token) = uuid::Uuid::from_slice(bytes) else {
+        return false;
+    };
+    let Ok(mut contexts) = retained_kernel_contexts().lock() else {
+        return false;
+    };
+    let Some(entry) = contexts.get_mut(&token) else {
+        return false;
+    };
+    if retain {
+        let Some(next) = entry.owners.checked_add(1) else {
+            return false;
+        };
+        entry.owners = next;
+    } else {
+        entry.owners -= 1;
+        if entry.owners == 0 {
+            contexts.remove(&token);
+        }
+    }
+    true
+}
+
+pub(super) struct ServiceKernelContextGuard(Option<ServiceInvokeContext>);
 pub(super) struct HostKernelConnectionGuard;
 pub(super) struct HostKernelClientFactoryGuard;
 
@@ -74,7 +162,7 @@ pub(super) static LOG_CONTROL: OnceLock<bmux_diagnostic_log::DiagnosticLogContro
 impl Drop for ServiceKernelContextGuard {
     fn drop(&mut self) {
         SERVICE_KERNEL_CONTEXT.with(|slot| {
-            *slot.borrow_mut() = None;
+            *slot.borrow_mut() = self.0.take();
         });
     }
 }
@@ -98,10 +186,8 @@ impl Drop for HostKernelClientFactoryGuard {
 pub(super) fn enter_service_kernel_context(
     context: ServiceInvokeContext,
 ) -> ServiceKernelContextGuard {
-    SERVICE_KERNEL_CONTEXT.with(|slot| {
-        *slot.borrow_mut() = Some(context);
-    });
-    ServiceKernelContextGuard
+    let previous = SERVICE_KERNEL_CONTEXT.with(|slot| slot.borrow_mut().replace(context));
+    ServiceKernelContextGuard(previous)
 }
 
 pub(super) fn enter_host_kernel_connection(
@@ -280,16 +366,27 @@ fn call_host_kernel_bridge_payload(payload: &[u8]) -> Result<Vec<u8>> {
     }
     if let Some(context) = SERVICE_KERNEL_CONTEXT.with(|slot| slot.borrow().clone()) {
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            tokio::task::block_in_place(|| {
-                handle.block_on(async { context.execute_raw(payload.to_vec()).await })
+            if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread {
+                return tokio::task::block_in_place(|| {
+                    handle.block_on(async { context.execute_raw(payload.to_vec()).await })
+                });
+            }
+            let payload = payload.to_vec();
+            return std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .context("failed creating retained bridge runtime")?;
+                runtime.block_on(context.execute_raw(payload))
             })
-        } else {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .context("failed creating kernel bridge runtime")?;
-            runtime.block_on(async { context.execute_raw(payload.to_vec()).await })
+            .join()
+            .map_err(|_| anyhow::anyhow!("retained bridge worker panicked"))?;
         }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("failed creating kernel bridge runtime")?;
+        runtime.block_on(async { context.execute_raw(payload.to_vec()).await })
     } else if let Some(factory) = HOST_KERNEL_CLIENT_FACTORY.with(|slot| slot.borrow().clone()) {
         call_host_kernel_via_factory(&factory, payload)
     } else if let Some(connection) = HOST_KERNEL_CONNECTION.with(|slot| slot.borrow().clone()) {
@@ -335,6 +432,47 @@ fn write_host_kernel_bridge_response(
     0
 }
 
+fn enter_retained_kernel_context(
+    token: Option<uuid::Uuid>,
+) -> std::result::Result<Option<ServiceKernelContextGuard>, ()> {
+    // Resolve before replay as well: stale registrations must not obtain cached
+    // output. Never consult thread-local/fallback state for a bound request.
+    let retained = if let Some(token) = token {
+        match retained_kernel_contexts().lock().ok().and_then(|contexts| {
+            contexts
+                .get(&token)
+                .filter(|entry| !entry.cancellation.is_cancelled())
+                .map(|entry| entry.context.clone())
+        }) {
+            Some(context) => Some(context),
+            None => return Err(()),
+        }
+    } else {
+        None
+    };
+    let scope = retained.map(enter_service_kernel_context);
+    if token.is_some() {
+        let valid = bmux_ipc::encode(&bmux_ipc::Request::CurrentStreamProvenance)
+            .ok()
+            .and_then(|payload| call_host_kernel_bridge_payload(&payload).ok())
+            .and_then(|bytes| bmux_ipc::decode::<bmux_ipc::Response>(&bytes).ok());
+        if !matches!(
+            valid,
+            Some(bmux_ipc::Response::Ok(
+                bmux_ipc::ResponsePayload::CurrentStreamProvenance {
+                    provenance: bmux_ipc::StreamProvenance::Local
+                        | bmux_ipc::StreamProvenance::Admitted { .. }
+                        | bmux_ipc::StreamProvenance::HostInternal
+                }
+            ))
+        ) {
+            return Err(());
+        }
+    }
+
+    Ok(scope)
+}
+
 pub(super) unsafe extern "C" fn host_kernel_bridge(
     input_ptr: *const u8,
     input_len: usize,
@@ -352,6 +490,10 @@ pub(super) unsafe extern "C" fn host_kernel_bridge(
             Ok(value) => value,
             Err(_) => return 3,
         };
+
+    let Ok(_retained_scope) = enter_retained_kernel_context(request.context_token) else {
+        return 2;
+    };
 
     if let Some(encoded) = HOST_KERNEL_RESPONSE_REPLAY.with(|cache| {
         cache
@@ -830,6 +972,7 @@ pub(super) fn register_plugin_service_handlers(
                         enter_service_kernel_context(invoke_context.clone());
                     let _host_kernel_connection_guard =
                         enter_host_kernel_connection(connection.clone());
+                    let retained = RetainedKernelContext::register(invoke_context.clone())?;
                     let response =
                         loaded_provider.invoke_service(&bmux_plugin_sdk::NativeServiceContext {
                             plugin_id: provider_declaration.id.as_str().to_string(),
@@ -873,10 +1016,8 @@ pub(super) fn register_plugin_service_handlers(
                                 .cloned(),
                             plugin_settings_map: config.plugins.settings.clone(),
                             caller_client_id: Some(invoke_context.client_id().0),
-                            cancellation: bmux_plugin_sdk::CancellationToken::default(),
-                            host_kernel_bridge: Some(bmux_plugin_sdk::HostKernelBridge::from_fn(
-                                host_kernel_bridge,
-                            )),
+                            cancellation: retained.cancellation(),
+                            host_kernel_bridge: Some(retained.bridge()),
                         })?;
                     let elapsed_us = started_at.elapsed().as_micros();
                     tracing::trace!(
@@ -941,6 +1082,447 @@ mod tests {
             data_dir: format!("/{label}/data"),
             state_dir: format!("/{label}/state"),
         }
+    }
+
+    fn invoke_test_bridge(
+        bridge: Option<bmux_plugin_sdk::HostKernelBridge>,
+        request: &bmux_ipc::Request,
+    ) -> Result<bmux_ipc::ResponsePayload> {
+        let bridge = bridge.unwrap();
+        let mut envelope =
+            bmux_plugin_sdk::HostKernelBridgeRequest::new(bmux_ipc::encode(request)?);
+        envelope.context_token = bridge.token();
+        let bytes = bmux_plugin_sdk::encode_service_message(&envelope)?;
+        let mut output = vec![0; 65536];
+        let mut len = 0;
+        anyhow::ensure!(
+            bridge.invoke(
+                bytes.as_ptr(),
+                bytes.len(),
+                output.as_mut_ptr(),
+                output.len(),
+                &raw mut len
+            ) == 0,
+            "bridge denied"
+        );
+        let response: bmux_plugin_sdk::HostKernelBridgeResponse =
+            bmux_plugin_sdk::decode_service_message(&output[..len])?;
+        match bmux_ipc::decode(&response.payload)? {
+            bmux_ipc::Response::Ok(payload) => Ok(payload),
+            bmux_ipc::Response::Err(_) => anyhow::bail!("request denied"),
+        }
+    }
+
+    fn check_retained_worker_lifetime(context: &ServiceInvokeContext) -> Result<()> {
+        let retained = RetainedKernelContext::register(context.clone())?;
+        let bridge = retained.bridge();
+        let token = bridge.token().unwrap();
+        let cancellation = retained.cancellation();
+        let encoded = bmux_plugin_sdk::encode_service_message(&bridge)?;
+        let captured: bmux_plugin_sdk::HostKernelBridge =
+            bmux_plugin_sdk::decode_service_message(&encoded)?;
+        drop(retained);
+        drop(bridge);
+        let captured = std::thread::spawn(move || {
+            let response = invoke_test_bridge(
+                Some(captured.clone()),
+                &bmux_ipc::Request::CurrentStreamProvenance,
+            )
+            .unwrap();
+            assert!(matches!(
+                response,
+                bmux_ipc::ResponsePayload::CurrentStreamProvenance {
+                    provenance: bmux_ipc::StreamProvenance::Local
+                }
+            ));
+            captured
+        })
+        .join()
+        .unwrap();
+        let _ = cancellation;
+        retained_kernel_contexts()
+            .lock()
+            .unwrap()
+            .get_mut(&token)
+            .unwrap()
+            .cancellation
+            .cancel();
+        assert!(invoke_test_bridge(Some(captured.clone()), &bmux_ipc::Request::Ping).is_err());
+        drop(captured);
+        assert!(
+            !retained_kernel_contexts()
+                .lock()
+                .unwrap()
+                .contains_key(&token)
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn nested_service_kernel_scope_restores_bound_parent() {
+        let path =
+            std::env::temp_dir().join(format!("bmux-origin-scope-{}.sock", uuid::Uuid::new_v4()));
+        let endpoint = bmux_ipc::IpcEndpoint::unix_socket(path.clone());
+        let server = BmuxServer::new(endpoint.clone());
+        server
+            .register_service_handler(
+                "test.scope",
+                bmux_ipc::InvokeServiceKind::Query,
+                "scope/v1",
+                "check",
+                |_, context, _| async move {
+                    assert!(SERVICE_KERNEL_CONTEXT.with(|slot| slot.borrow().is_none()));
+                    let id = context.client_id();
+                    check_retained_worker_lifetime(&context)?;
+
+                    let parent = enter_service_kernel_context(context.clone());
+                    {
+                        let child = enter_service_kernel_context(context);
+                        assert_eq!(
+                            SERVICE_KERNEL_CONTEXT.with(|slot| slot
+                                .borrow()
+                                .as_ref()
+                                .unwrap()
+                                .client_id()),
+                            id
+                        );
+                        drop(child);
+                    }
+                    assert_eq!(
+                        SERVICE_KERNEL_CONTEXT.with(|slot| slot
+                            .borrow()
+                            .as_ref()
+                            .unwrap()
+                            .client_id()),
+                        id
+                    );
+                    let response = call_host_kernel_bridge_payload(&bmux_ipc::encode(
+                        &bmux_ipc::Request::CurrentStreamProvenance,
+                    )?)?;
+                    assert!(matches!(
+                        bmux_ipc::decode::<bmux_ipc::Response>(&response)?,
+                        bmux_ipc::Response::Ok(
+                            bmux_ipc::ResponsePayload::CurrentStreamProvenance {
+                                provenance: bmux_ipc::StreamProvenance::Local
+                            }
+                        )
+                    ));
+                    drop(parent);
+                    assert!(SERVICE_KERNEL_CONTEXT.with(|slot| slot.borrow().is_none()));
+                    Ok(Vec::new())
+                },
+            )
+            .unwrap();
+        let task = tokio::spawn(async move { server.run().await });
+        let mut peer = loop {
+            match bmux_ipc::transport::LocalIpcStream::connect(&endpoint).await {
+                Ok(peer) => break peer,
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(5)).await,
+            }
+        };
+        for (id, request) in [
+            bmux_ipc::Request::Hello {
+                contract: bmux_ipc::ProtocolContract::current(
+                    bmux_ipc::default_supported_capabilities(),
+                ),
+                client_name: "scope-test".into(),
+                principal_id: uuid::Uuid::new_v4(),
+            },
+            bmux_ipc::Request::InvokeService {
+                capability: "test.scope".into(),
+                kind: bmux_ipc::InvokeServiceKind::Query,
+                interface_id: "scope/v1".into(),
+                operation: "check".into(),
+                payload: Vec::new(),
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            peer.send_envelope(&bmux_ipc::Envelope::new(
+                id as u64,
+                bmux_ipc::EnvelopeKind::Request,
+                bmux_ipc::encode(&request).unwrap(),
+            ))
+            .await
+            .unwrap();
+            let response = peer.recv_envelope().await.unwrap();
+            assert!(matches!(
+                bmux_ipc::decode::<bmux_ipc::Response>(&response.payload).unwrap(),
+                bmux_ipc::Response::Ok(_)
+            ));
+        }
+        task.abort();
+        let _ = task.await;
+        std::fs::remove_file(path).unwrap();
+    }
+
+    // Keep the ordered capture/revoke/cancel/release lifecycle together so ownership
+    // and identity assertions can be audited against the same two live streams.
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn overlapping_retained_admitted_identities_remain_isolated() {
+        use bmux_plugin::stream_admission::{
+            StreamAdmissionAuthority, StreamAdmissionAuthorityHandle, StreamAdmissionBinding,
+            StreamAdmissionError,
+        };
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct Authority {
+            bindings: [Arc<StreamAdmissionBinding>; 2],
+            revoked: [AtomicBool; 2],
+        }
+        impl StreamAdmissionAuthority for Authority {
+            fn consume(
+                &self,
+                ticket: &[u8],
+            ) -> Result<Arc<StreamAdmissionBinding>, StreamAdmissionError> {
+                match ticket {
+                    [index @ 0..=1] => Ok(self.bindings[usize::from(*index)].clone()),
+                    _ => Err(StreamAdmissionError),
+                }
+            }
+            fn validate(
+                &self,
+                binding: &StreamAdmissionBinding,
+            ) -> Result<(), StreamAdmissionError> {
+                self.bindings
+                    .iter()
+                    .position(|candidate| candidate.as_ref() == binding)
+                    .filter(|index| !self.revoked[*index].load(Ordering::SeqCst))
+                    .map(|_| ())
+                    .ok_or(StreamAdmissionError)
+            }
+        }
+
+        let path = std::env::temp_dir().join(format!("bmux-overlap-{}.sock", uuid::Uuid::new_v4()));
+        let endpoint = bmux_ipc::IpcEndpoint::unix_socket(path.clone());
+        let server = BmuxServer::new(endpoint.clone());
+        let authority = Arc::new(Authority {
+            bindings: std::array::from_fn(|_| {
+                Arc::new(StreamAdmissionBinding::new(
+                    uuid::Uuid::new_v4(),
+                    uuid::Uuid::new_v4(),
+                ))
+            }),
+            revoked: std::array::from_fn(|_| AtomicBool::new(false)),
+        });
+        server
+            .plugin_state_registry()
+            .register(&Arc::new(std::sync::RwLock::new(
+                StreamAdmissionAuthorityHandle::new(authority.clone()),
+            )));
+        let (captured_tx, mut captured_rx) = tokio::sync::mpsc::unbounded_channel();
+        server
+            .approve_admitted_route(bmux_server::ServiceRoute {
+                capability: "test.overlap".into(),
+                kind: bmux_ipc::InvokeServiceKind::Query,
+                interface_id: "overlap/v1".into(),
+                operation: "capture".into(),
+            })
+            .unwrap();
+        server
+            .register_service_handler(
+                "test.overlap",
+                bmux_ipc::InvokeServiceKind::Query,
+                "overlap/v1",
+                "capture",
+                move |_, context, _| {
+                    let captured_tx = captured_tx.clone();
+                    async move {
+                        let guard = enter_service_kernel_context(context.clone());
+                        let retained = RetainedKernelContext::register(context.clone())?;
+                        let bridge = retained.bridge();
+                        // Exercise the same serialization/retain path used by plugin capture.
+                        let captured: bmux_plugin_sdk::HostKernelBridge =
+                            bmux_plugin_sdk::decode_service_message(
+                                &bmux_plugin_sdk::encode_service_message(&bridge)?,
+                            )?;
+                        captured_tx.send((captured, context)).unwrap();
+                        drop(bridge);
+                        drop(retained);
+                        drop(guard);
+                        Ok(Vec::new())
+                    }
+                },
+            )
+            .unwrap();
+        let task = tokio::spawn(async move { server.run().await });
+        let mut peers = Vec::new();
+        let mut captures = Vec::new();
+        for index in 0..2_u8 {
+            let mut peer = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    match bmux_ipc::transport::LocalIpcStream::connect(&endpoint).await {
+                        Ok(peer) => break peer,
+                        Err(_) => tokio::time::sleep(std::time::Duration::from_millis(5)).await,
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            for (id, request) in [
+                bmux_ipc::Request::AdmitStream {
+                    admission_version: 1,
+                    ticket: vec![index],
+                },
+                bmux_ipc::Request::Hello {
+                    contract: bmux_ipc::ProtocolContract::current(
+                        bmux_ipc::default_supported_capabilities(),
+                    ),
+                    client_name: "overlap-test".into(),
+                    principal_id: authority.bindings[usize::from(index)].subject_id(),
+                },
+                bmux_ipc::Request::InvokeService {
+                    capability: "test.overlap".into(),
+                    kind: bmux_ipc::InvokeServiceKind::Query,
+                    interface_id: "overlap/v1".into(),
+                    operation: "capture".into(),
+                    payload: Vec::new(),
+                },
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                peer.send_envelope(&bmux_ipc::Envelope::new(
+                    id as u64,
+                    bmux_ipc::EnvelopeKind::Request,
+                    bmux_ipc::encode(&request).unwrap(),
+                ))
+                .await
+                .unwrap();
+                if id != 0 {
+                    let response = peer.recv_envelope().await.unwrap();
+                    assert!(matches!(
+                        bmux_ipc::decode::<bmux_ipc::Response>(&response.payload).unwrap(),
+                        bmux_ipc::Response::Ok(_)
+                    ));
+                }
+            }
+            // The handler has returned; only captured ownership keeps its token alive.
+            captures.push(captured_rx.recv().await.unwrap());
+            peers.push(peer);
+        }
+        let tokens = captures
+            .iter()
+            .map(|(bridge, _)| bridge.token().unwrap())
+            .collect::<Vec<_>>();
+        assert_ne!(tokens[0], tokens[1]);
+        assert_ne!(captures[0].1.client_id(), captures[1].1.client_id());
+        let mut workers = Vec::new();
+        let mut commands = Vec::new();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        for index in 0..2 {
+            let own = captures[index].0.clone();
+            let other = captures[1 - index].0.clone();
+            let own_context = captures[index].1.clone();
+            let other_context = captures[1 - index].1.clone();
+            let expected = authority.bindings.clone();
+            let done_tx = done_tx.clone();
+            let (tx, rx) = std::sync::mpsc::channel::<[bool; 2]>();
+            commands.push(tx);
+            workers.push(std::thread::spawn(move || {
+                for valid in rx {
+                    assert!(SERVICE_KERNEL_CONTEXT.with(|slot| slot.borrow().is_none()));
+                    let outer = enter_service_kernel_context(other_context.clone());
+                    {
+                        let inner = enter_service_kernel_context(own_context.clone());
+                        // A nested bridge call must select its token, not ambient TLS.
+                        for (bridge, subject_index) in [
+                            (&other, 1 - index),
+                            (&own, index),
+                            (&other, 1 - index),
+                            (&own, index),
+                        ] {
+                            let result = invoke_test_bridge(
+                                Some(bridge.clone()),
+                                &bmux_ipc::Request::CurrentStreamProvenance,
+                            );
+                            if valid[subject_index] {
+                                assert_eq!(
+                                    result.unwrap(),
+                                    bmux_ipc::ResponsePayload::CurrentStreamProvenance {
+                                        provenance: bmux_ipc::StreamProvenance::Admitted {
+                                            subject_id: expected[subject_index].subject_id(),
+                                            lease_id: expected[subject_index].lease_id(),
+                                        },
+                                    }
+                                );
+                            } else {
+                                assert!(result.is_err());
+                            }
+                            assert_eq!(
+                                SERVICE_KERNEL_CONTEXT.with(|slot| slot
+                                    .borrow()
+                                    .as_ref()
+                                    .unwrap()
+                                    .client_id()),
+                                own_context.client_id()
+                            );
+                        }
+                        assert!(enter_retained_kernel_context(Some(uuid::Uuid::new_v4())).is_err());
+                        drop(inner);
+                    }
+                    assert_eq!(
+                        SERVICE_KERNEL_CONTEXT.with(|slot| slot
+                            .borrow()
+                            .as_ref()
+                            .unwrap()
+                            .client_id()),
+                        other_context.client_id()
+                    );
+                    drop(outer);
+                    assert!(SERVICE_KERNEL_CONTEXT.with(|slot| slot.borrow().is_none()));
+                    done_tx.send(()).unwrap();
+                }
+            }));
+        }
+        for valid in [[true, true], [true, true], [false, true], [false, false]] {
+            if !valid[0] {
+                authority.revoked[0].store(true, Ordering::SeqCst);
+            }
+            if !valid[1] {
+                retained_kernel_contexts()
+                    .lock()
+                    .unwrap()
+                    .get_mut(&tokens[1])
+                    .unwrap()
+                    .cancellation
+                    .cancel();
+            }
+            // Deterministic worker alternation exercises both identities after return.
+            for command in &commands {
+                command.send(valid).unwrap();
+                done_rx
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+            }
+        }
+        drop(captures);
+        assert!(tokens.iter().all(|token| {
+            retained_kernel_contexts()
+                .lock()
+                .unwrap()
+                .contains_key(token)
+        }));
+        drop(commands);
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        for token in tokens {
+            assert!(
+                !retained_kernel_contexts()
+                    .lock()
+                    .unwrap()
+                    .contains_key(&token)
+            );
+            assert!(enter_retained_kernel_context(Some(token)).is_err());
+        }
+        drop(peers);
+        task.abort();
+        let _ = task.await;
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

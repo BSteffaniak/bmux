@@ -211,7 +211,7 @@ impl NativeLifecycleContext {
             connection: self.connection.clone(),
             settings: self.settings.clone(),
             plugin_settings_map: self.plugin_settings_map.clone(),
-            host_kernel_bridge: self.host_kernel_bridge,
+            host_kernel_bridge: self.host_kernel_bridge.clone(),
         }
     }
 }
@@ -388,14 +388,148 @@ type HostKernelBridgeFn = unsafe extern "C" fn(
 ///
 /// Used internally by the service dispatch machinery. Plugin authors
 /// do not interact with this type directly.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct HostKernelBridge(u64);
+///
+/// Deserialize only trusted host context in the same address space: this
+/// representation contains executable callbacks, never untrusted wire metadata.
+#[derive(Debug, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub enum HostKernelBridge {
+    Legacy(u64),
+    Bound {
+        version: u16,
+        pointer: u64,
+        token: uuid::Uuid,
+        ownership: u64,
+    },
+}
+
+// The ownership callback has a C ABI and accepts only opaque token bytes. It
+// never receives Rust pointers, Arc layout, or caller identity metadata.
+type BridgeOwnershipFn = unsafe extern "C" fn(*const u8, bool) -> bool;
+
+impl HostKernelBridge {
+    fn ownership(&self, retain: bool) -> bool {
+        match self {
+            Self::Legacy(_) => true,
+            Self::Bound {
+                token,
+                ownership,
+                version: 1,
+                ..
+            } => {
+                let Ok(pointer) = usize::try_from(*ownership) else {
+                    return false;
+                };
+                if pointer == 0 {
+                    return false;
+                }
+                let callback: BridgeOwnershipFn = unsafe { std::mem::transmute(pointer) };
+                unsafe { callback(token.as_bytes().as_ptr(), retain) }
+            }
+            Self::Bound { .. } => false,
+        }
+    }
+}
+
+impl Clone for HostKernelBridge {
+    fn clone(&self) -> Self {
+        if !self.ownership(true) {
+            return Self::Legacy(0);
+        }
+        match self {
+            Self::Legacy(pointer) => Self::Legacy(*pointer),
+            Self::Bound {
+                version,
+                pointer,
+                token,
+                ownership,
+            } => Self::Bound {
+                version: *version,
+                pointer: *pointer,
+                token: *token,
+                ownership: *ownership,
+            },
+        }
+    }
+}
+
+impl Drop for HostKernelBridge {
+    fn drop(&mut self) {
+        let _ = self.ownership(false);
+    }
+}
+
+impl<'de> Deserialize<'de> for HostKernelBridge {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Wire {
+            Legacy(u64),
+            Bound {
+                version: u16,
+                pointer: u64,
+                token: uuid::Uuid,
+                ownership: u64,
+            },
+        }
+        let bridge = std::mem::ManuallyDrop::new(match Wire::deserialize(deserializer)? {
+            Wire::Legacy(pointer) => Self::Legacy(pointer),
+            Wire::Bound {
+                version: 1,
+                pointer,
+                token,
+                ownership,
+            } => Self::Bound {
+                version: 1,
+                pointer,
+                token,
+                ownership,
+            },
+            Wire::Bound { .. } => {
+                return Err(serde::de::Error::custom("unsupported bound bridge version"));
+            }
+        });
+        if !bridge.ownership(true) {
+            return Err(serde::de::Error::custom("expired bound bridge"));
+        }
+        Ok(std::mem::ManuallyDrop::into_inner(bridge))
+    }
+}
 
 impl HostKernelBridge {
     #[must_use]
     pub fn from_fn(pointer: HostKernelBridgeFn) -> Self {
-        Self(pointer as usize as u64)
+        Self::Legacy(pointer as usize as u64)
+    }
+
+    /// Bind an invocation to an opaque host-owned registration.
+    #[must_use]
+    pub fn bound(
+        pointer: HostKernelBridgeFn,
+        token: uuid::Uuid,
+        ownership: BridgeOwnershipFn,
+    ) -> Self {
+        let bridge = std::mem::ManuallyDrop::new(Self::Bound {
+            version: 1,
+            pointer: pointer as usize as u64,
+            token,
+            ownership: ownership as usize as u64,
+        });
+        if bridge.ownership(true) {
+            std::mem::ManuallyDrop::into_inner(bridge)
+        } else {
+            Self::Legacy(0)
+        }
+    }
+
+    #[must_use]
+    pub const fn token(&self) -> Option<uuid::Uuid> {
+        match self {
+            Self::Legacy(_) => None,
+            Self::Bound { token, .. } => Some(*token),
+        }
     }
 
     /// Invoke the kernel bridge function pointer.
@@ -405,7 +539,7 @@ impl HostKernelBridge {
     /// The caller must ensure the bridge pointer is still valid (i.e. the host
     /// process has not been terminated or the function unmapped).
     pub fn invoke(
-        self,
+        &self,
         input_ptr: *const u8,
         input_len: usize,
         output_ptr: *mut u8,
@@ -414,7 +548,22 @@ impl HostKernelBridge {
     ) -> i32 {
         #[allow(clippy::cast_possible_truncation)]
         // pointer was stored as u64 for serialization; fits in usize on supported 64-bit targets
-        let bridge: HostKernelBridgeFn = unsafe { std::mem::transmute(self.0 as usize) };
+        let pointer = match self {
+            Self::Legacy(pointer)
+            | Self::Bound {
+                version: 1,
+                pointer,
+                ..
+            } => pointer,
+            Self::Bound { .. } => return 2,
+        };
+        let Ok(pointer) = usize::try_from(*pointer) else {
+            return 2;
+        };
+        if pointer == 0 {
+            return 2;
+        }
+        let bridge: HostKernelBridgeFn = unsafe { std::mem::transmute(pointer) };
         unsafe {
             bridge(
                 input_ptr,
@@ -429,6 +578,9 @@ impl HostKernelBridge {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostKernelBridgeRequest {
+    /// Opaque host-issued invocation capability, not a claimed identity.
+    #[serde(default)]
+    pub context_token: Option<uuid::Uuid>,
     /// Opaque invocation identity used to replay an oversized response without
     /// re-executing a side-effecting host operation.
     #[serde(default)]
@@ -443,6 +595,7 @@ impl HostKernelBridgeRequest {
         static NEXT_INVOCATION_ID: std::sync::atomic::AtomicU64 =
             std::sync::atomic::AtomicU64::new(1);
         Self {
+            context_token: None,
             invocation_id: NEXT_INVOCATION_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             payload,
         }
@@ -630,6 +783,52 @@ mod tests {
         encode_host_kernel_bridge_cli_command_payload,
         encode_host_kernel_bridge_plugin_command_payload,
     };
+
+    #[test]
+    fn bound_bridge_ownership_acquisition_release_and_failures() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        static OWNERS: AtomicUsize = AtomicUsize::new(0);
+        static ALLOW: AtomicBool = AtomicBool::new(true);
+        unsafe extern "C" fn ownership(_: *const u8, retain: bool) -> bool {
+            if retain {
+                if !ALLOW.load(Ordering::SeqCst) {
+                    return false;
+                }
+                OWNERS.fetch_add(1, Ordering::SeqCst);
+            } else {
+                assert!(OWNERS.fetch_sub(1, Ordering::SeqCst) > 0);
+            }
+            true
+        }
+        unsafe extern "C" fn invoke(
+            _: *const u8,
+            _: usize,
+            _: *mut u8,
+            _: usize,
+            _: *mut usize,
+        ) -> i32 {
+            0
+        }
+        let bridge = super::HostKernelBridge::bound(invoke, uuid::Uuid::from_u128(1), ownership);
+        assert_eq!(OWNERS.load(Ordering::SeqCst), 1);
+        let cloned = bridge.clone();
+        let bytes = super::encode_service_message(&bridge).unwrap();
+        let decoded: super::HostKernelBridge = super::decode_service_message(&bytes).unwrap();
+        assert_eq!(OWNERS.load(Ordering::SeqCst), 3);
+        ALLOW.store(false, Ordering::SeqCst);
+        let failed = bridge.clone();
+        assert!(super::decode_service_message::<super::HostKernelBridge>(&bytes).is_err());
+        drop(failed);
+        assert_eq!(OWNERS.load(Ordering::SeqCst), 3);
+        drop(bridge);
+        drop(cloned);
+        assert_eq!(OWNERS.load(Ordering::SeqCst), 1);
+        drop(decoded);
+        assert_eq!(OWNERS.load(Ordering::SeqCst), 0);
+        let failed = super::HostKernelBridge::bound(invoke, uuid::Uuid::from_u128(1), ownership);
+        drop(failed);
+        assert_eq!(OWNERS.load(Ordering::SeqCst), 0);
+    }
 
     #[test]
     fn host_kernel_bridge_request_preserves_raw_payload_bytes() {

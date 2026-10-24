@@ -24,6 +24,11 @@ interface permissions-commands {
 
     command grant(session: string, client-id: string, role: string) -> command-ack;
     command revoke(session: string, client-id: string) -> command-ack;
+
+    // Stable admitted subject, never a transient client ID. Absent session-id
+    // explicitly grants runtime-wide resource scope; device admission is separate.
+    command grant-resource(subject-id: uuid, session-id: uuid?, role: string) -> command-ack;
+    command revoke-resource(subject-id: uuid, session-id: uuid?) -> command-ack;
 }
 
 @capability(SESSIONS_POLICY)

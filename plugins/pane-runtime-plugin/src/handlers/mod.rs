@@ -44,6 +44,9 @@ pub fn route(context: NativeServiceContext) -> ServiceResponse {
             "observer connection cannot mutate pane runtime",
         );
     }
+    if let Err(error) = execution::authorize_route(&context) {
+        return error;
+    }
     bmux_plugin_sdk::route_service!(context, {
         "pane-runtime-presentation-wait-v1", "capabilities" => |_req: (), _ctx| {
             Ok::<_, ServiceResponse>(crate::runtime::execution::presentation_wait_capabilities())

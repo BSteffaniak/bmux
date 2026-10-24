@@ -4,6 +4,7 @@ plugin bmux.connections version 1;
 
 capability CONNECTIONS_READ = bmux.connections.read;
 capability CONNECTIONS_INVOKE = bmux.connections.invoke;
+capability CONNECTIONS_PAIRING = bmux.connections.pairing;
 
 interface connection-types {
     enum connection-transport {
@@ -58,6 +59,74 @@ interface connection-types {
     }
 }
 
+// Device admission grants access to this runtime only, not cluster membership.
+interface pairing-types {
+    enum device-access {
+        denied,
+        full-local-runtime,
+    }
+    record admission-binding {
+        subject_id: uuid,
+        lease_id: uuid,
+    }
+    record listener-status {
+        endpoint_id: string,
+        enabled: bool,
+        endpoint_address: string?,
+    }
+    record device {
+        device_id: string,
+        device_key: string,
+        access: device-access,
+        revision: u64,
+    }
+    variant stream-provenance {
+        local,
+        admitted { subject_id: uuid, lease_id: uuid },
+        invalid,
+    }
+    record device-access-check {
+        access: device-access,
+        revision: u64,
+    }
+    record invitation {
+        invitation_id: string,
+        endpoint_id: string,
+        device_key: string,
+        secret: bytes,
+        expires_at: u64,
+        access: device-access,
+        // Sign these exact bytes with the device Iroh secret key.
+        possession_message: bytes,
+    }
+    record admission-challenge {
+        challenge: bytes,
+        possession_message: bytes,
+    }
+}
+
+// The capability is discoverability, not owner authority. Handlers additionally
+// require host-trusted local owner provenance for administrative operations.
+@capability(CONNECTIONS_PAIRING)
+interface pairing-commands {
+    command start-listener() -> pairing-types.listener-status;
+    command stop-listener() -> pairing-types.listener-status;
+    command create-invitation(device_key: string, ttl_seconds: u64, access: pairing-types.device-access) -> pairing-types.invitation;
+    command redeem-invitation(invitation_id: string, secret: bytes, signature: bytes) -> pairing-types.device;
+    command grant-device(device_id: string, access: pairing-types.device-access) -> pairing-types.device;
+    command revoke-device(device_id: string) -> pairing-types.device;
+    command begin-admission(device_id: string) -> pairing-types.admission-challenge;
+    command finish-admission(challenge: bytes, signature: bytes) -> bytes;
+}
+
+@capability(CONNECTIONS_PAIRING)
+interface pairing-state {
+    query listener-status() -> pairing-types.listener-status;
+    query current-provenance() -> pairing-types.stream-provenance;
+    query list-devices() -> list<pairing-types.device>;
+    query check-device-access(subject_id: uuid) -> pairing-types.device-access-check;
+}
+
 @capability(CONNECTIONS_READ)
 interface connections-state {
     query resolve(target: string) -> result<connection-types.resolved-endpoint, connection-types.connection-error>;
@@ -67,4 +136,16 @@ interface connections-state {
 @capability(CONNECTIONS_INVOKE)
 interface connections-commands {
     command invoke-service(invocation: connection-types.service-invocation) -> result<bytes, connection-types.connection-error>;
+}
+
+// Private host-selected provider. Every operation also requires HostInternal
+// provenance; ordinary local and admitted callers are rejected.
+@capability(CONNECTIONS_PAIRING)
+interface admission-provider-state {
+    query probe() -> uuid;
+    query validate(subject_id: uuid, lease_id: uuid) -> bool;
+}
+@capability(CONNECTIONS_PAIRING)
+interface admission-provider-commands {
+    command consume(ticket: bytes) -> pairing-types.admission-binding;
 }

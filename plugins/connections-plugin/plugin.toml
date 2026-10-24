@@ -1,10 +1,14 @@
-execution_class       = "native_standard"
-id                    = "bmux.connections"
-name                  = "bmux Connections"
-provided_capabilities = ["bmux.connections.read", "bmux.connections.invoke"]
-provided_features     = ["bmux.connections"]
-required_capabilities = []
-version               = "0.0.1-alpha.0"
+execution_class = "native_standard"
+id = "bmux.connections"
+name = "bmux Connections"
+provided_capabilities = [
+    "bmux.connections.read",
+    "bmux.connections.invoke",
+    "bmux.connections.pairing",
+]
+provided_features = ["bmux.connections"]
+required_capabilities = ["bmux.clients.read"]
+version = "0.0.1-alpha.0"
 
 [[services]]
 capability   = "bmux.connections.read"
@@ -14,4 +18,24 @@ kind         = "query"
 [[services]]
 capability   = "bmux.connections.invoke"
 interface_id = "connections-commands"
+kind         = "command"
+
+[[services]]
+capability   = "bmux.connections.pairing"
+interface_id = "pairing-commands"
+kind         = "command"
+
+[[services]]
+capability   = "bmux.connections.pairing"
+interface_id = "pairing-state"
+kind         = "query"
+
+[[services]]
+capability   = "bmux.connections.pairing"
+interface_id = "admission-provider-state"
+kind         = "query"
+
+[[services]]
+capability   = "bmux.connections.pairing"
+interface_id = "admission-provider-commands"
 kind         = "command"

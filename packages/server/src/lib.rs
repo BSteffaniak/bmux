@@ -180,6 +180,11 @@ pub struct BmuxServer {
 }
 
 struct ServerState {
+    stream_provenance: bmux_plugin::stream_admission::StreamProvenanceRegistry,
+    private_admission_routes: Mutex<BTreeSet<ServiceRoute>>,
+    admission_backend: Mutex<Option<Arc<SerializedAdmissionAuthority>>>,
+    admitted_routes: Mutex<BTreeSet<ServiceRoute>>,
+    plugin_states: Arc<bmux_plugin::PluginStateRegistry>,
     attach_tokens: Arc<Mutex<AttachTokenManager>>,
     performance_settings: PerformanceSettingsStore,
     operation_lock: AsyncMutex<()>,
@@ -312,8 +317,123 @@ impl ServiceRegistry {
     }
 }
 
+/// Explicit serialized provider selection; routes are private to host admission.
+#[derive(Clone)]
+pub struct StreamAdmissionProviderRoutes {
+    pub probe: ServiceRoute,
+    pub consume: ServiceRoute,
+    pub validate: ServiceRoute,
+}
+
+struct SerializedAdmissionAuthority {
+    state: std::sync::Weak<ServerState>,
+    routes: StreamAdmissionProviderRoutes,
+    codec: Arc<dyn bmux_plugin::stream_admission::StreamAdmissionProviderCodec>,
+    deadline: Duration,
+    capacity: Arc<tokio::sync::Semaphore>,
+    instance: Uuid,
+}
+
+impl SerializedAdmissionAuthority {
+    fn call(
+        &self,
+        route: ServiceRoute,
+        payload: Vec<u8>,
+    ) -> Result<Vec<u8>, bmux_plugin::stream_admission::StreamAdmissionError> {
+        use bmux_plugin::stream_admission::StreamAdmissionError;
+        let state = self.state.upgrade().ok_or(StreamAdmissionError)?;
+        let permit = Arc::clone(&self.capacity)
+            .try_acquire_owned()
+            .map_err(|_| StreamAdmissionError)?;
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let deadline = self.deadline;
+        std::thread::Builder::new()
+            .name("stream-admission-provider".into())
+            .spawn(move || {
+                let _permit = permit;
+                let result = (|| {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .map_err(|_| StreamAdmissionError)?;
+                    runtime.block_on(async {
+                        let context = ServiceInvokeContext {
+                            host_internal: true,
+                            state: Arc::clone(&state),
+                            shutdown_tx: watch::channel(false).0,
+                            client_id: ClientId::new(),
+                            client_principal_id: Uuid::nil(),
+                        };
+                        let invocation = state
+                            .service_registry
+                            .lock()
+                            .map_err(|_| StreamAdmissionError)?
+                            .dispatch(&route, context, payload)
+                            .ok_or(StreamAdmissionError)?;
+                        tokio::time::timeout(deadline, invocation)
+                            .await
+                            .map_err(|_| StreamAdmissionError)?
+                            .map_err(|error| {
+                                tracing::warn!(interface = %route.interface_id, operation = %route.operation,
+                                    error = %error, "stream admission provider invocation failed");
+                                StreamAdmissionError
+                            })
+                            .map(|output| output.payload)
+                    })
+                })();
+                let _ = tx.send(result);
+            })
+            .map_err(|_| StreamAdmissionError)?;
+        rx.recv_timeout(deadline)
+            .map_err(|_| StreamAdmissionError)?
+    }
+
+    fn probe(&self) -> Result<Uuid, bmux_plugin::stream_admission::StreamAdmissionError> {
+        let payload = self.codec.encode_probe().inspect_err(|error| {
+            tracing::warn!(%error, "stream admission probe encoding failed");
+        })?;
+        let response = self.call(self.routes.probe.clone(), payload)?;
+        self.codec.decode_probe(&response).inspect_err(|error| {
+            tracing::warn!(%error, response_len = response.len(), "stream admission probe decoding failed");
+        })
+    }
+}
+
+impl bmux_plugin::stream_admission::StreamAdmissionAuthority for SerializedAdmissionAuthority {
+    fn consume(
+        &self,
+        ticket: &[u8],
+    ) -> Result<
+        Arc<bmux_plugin::stream_admission::StreamAdmissionBinding>,
+        bmux_plugin::stream_admission::StreamAdmissionError,
+    > {
+        if self.probe()? != self.instance {
+            return Err(bmux_plugin::stream_admission::StreamAdmissionError);
+        }
+        let binding = self.codec.decode_consume(&self.call(
+            self.routes.consume.clone(),
+            self.codec.encode_consume(ticket)?,
+        )?)?;
+        Ok(Arc::new(binding))
+    }
+
+    fn validate(
+        &self,
+        binding: &bmux_plugin::stream_admission::StreamAdmissionBinding,
+    ) -> Result<(), bmux_plugin::stream_admission::StreamAdmissionError> {
+        if self.probe()? != self.instance {
+            return Err(bmux_plugin::stream_admission::StreamAdmissionError);
+        }
+        self.codec.decode_validate(&self.call(
+            self.routes.validate.clone(),
+            self.codec.encode_validate(binding)?,
+        )?)
+    }
+}
+
 #[derive(Clone)]
 pub struct ServiceInvokeContext {
+    host_internal: bool,
     state: Arc<ServerState>,
     shutdown_tx: watch::Sender<bool>,
     client_id: ClientId,
@@ -332,6 +452,69 @@ impl ServiceInvokeContext {
 
 impl ServiceInvokeContext {
     async fn execute_request(&self, request: Request) -> Result<Response> {
+        if matches!(request, Request::StreamAdmissionBackend) {
+            let backend = self
+                .state
+                .admission_backend
+                .lock()
+                .map_err(|_| anyhow::anyhow!("admission backend unavailable"))?
+                .clone();
+            let authority_id = backend
+                .and_then(|backend| backend.probe().ok().filter(|id| *id == backend.instance));
+            return Ok(Response::Ok(ResponsePayload::StreamAdmissionBackend {
+                authority_id,
+            }));
+        }
+        if matches!(request, Request::CurrentStreamProvenance) {
+            if self.host_internal {
+                return Ok(Response::Ok(ResponsePayload::CurrentStreamProvenance {
+                    provenance: bmux_ipc::StreamProvenance::HostInternal,
+                }));
+            }
+            return Ok(current_stream_provenance(
+                &self.state.stream_provenance,
+                self.client_id.0,
+            ));
+        }
+        if self.host_internal {
+            // Preserve host-internal origin across foundational facade calls;
+            // no synthetic local Hello or metadata principal is involved.
+            if let Request::InvokeService {
+                capability,
+                kind,
+                interface_id,
+                operation,
+                payload,
+            } = request
+            {
+                let route = ServiceRoute {
+                    capability,
+                    kind,
+                    interface_id,
+                    operation,
+                };
+                let invocation = self
+                    .state
+                    .service_registry
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("service registry unavailable"))?
+                    .dispatch(&route, self.clone(), payload)
+                    .context("host internal service unavailable")?;
+                return Ok(Response::Ok(ResponsePayload::ServiceInvoked {
+                    payload: invocation.await?.payload,
+                }));
+            }
+            anyhow::bail!("unsupported host internal kernel request");
+        }
+        // Every nested kernel dispatch retains and revalidates the host origin.
+        if !self.host_internal
+            && matches!(
+                self.state.stream_provenance.lookup(self.client_id.0),
+                bmux_plugin::stream_admission::StreamProvenance::Invalid
+            )
+        {
+            anyhow::bail!("invalid stream provenance");
+        }
         // Selection state is owned by the clients-plugin's FollowState now;
         // plugins that need the caller's selected session should query it
         // through the FollowStateHandle rather than relying on
@@ -362,6 +545,33 @@ impl ServiceInvokeContext {
     }
 }
 
+fn check_stream_route(state: &ServerState, id: Uuid, route: &ServiceRoute) -> Result<()> {
+    use bmux_plugin::stream_admission::StreamProvenance;
+    anyhow::ensure!(
+        !state
+            .private_admission_routes
+            .lock()
+            .map_err(|_| anyhow::anyhow!("private routes unavailable"))?
+            .contains(route),
+        "host-private route"
+    );
+    match state.stream_provenance.lookup(id) {
+        StreamProvenance::Local => Ok(()),
+        StreamProvenance::Admitted(_) => {
+            anyhow::ensure!(
+                state
+                    .admitted_routes
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("admitted routes unavailable"))?
+                    .contains(route),
+                "unmigrated admitted route"
+            );
+            Ok(())
+        }
+        StreamProvenance::Invalid => anyhow::bail!("invalid stream origin"),
+    }
+}
+
 async fn invoke_service_output(
     state: &Arc<ServerState>,
     shutdown_tx: &watch::Sender<bool>,
@@ -370,12 +580,14 @@ async fn invoke_service_output(
     route: ServiceRoute,
     payload: Vec<u8>,
 ) -> Result<ServiceInvokeOutput> {
+    check_stream_route(state, client_id.0, &route)?;
     let total_timer = PhaseTimer::start();
     let capability = route.capability.clone();
     let kind = route.kind;
     let interface_id = route.interface_id.clone();
     let operation = route.operation.clone();
     let invoke_context = ServiceInvokeContext {
+        host_internal: false,
         state: Arc::clone(state),
         shutdown_tx: shutdown_tx.clone(),
         client_id,
@@ -1003,6 +1215,98 @@ fn register_performance_plugin_state(config: &BmuxConfig) -> PerformanceSettings
 }
 
 impl BmuxServer {
+    /// Install an explicitly selected serialized provider after its services are
+    /// registered. Returns its live instance ID, never a caller-supplied claim.
+    ///
+    /// # Errors
+    /// Rejects invalid bounds, missing handlers, failed probes, or replacement.
+    pub fn install_stream_admission_provider(
+        &self,
+        routes: StreamAdmissionProviderRoutes,
+        codec: Arc<dyn bmux_plugin::stream_admission::StreamAdmissionProviderCodec>,
+        deadline: Duration,
+        max_in_flight: usize,
+    ) -> Result<Uuid> {
+        anyhow::ensure!(
+            !deadline.is_zero()
+                && deadline <= Duration::from_secs(30)
+                && (1..=64).contains(&max_in_flight),
+            "invalid provider bounds"
+        );
+        let mut installed = self
+            .state
+            .admission_backend
+            .lock()
+            .map_err(|_| anyhow::anyhow!("admission backend lock poisoned"))?;
+        anyhow::ensure!(installed.is_none(), "admission provider already installed");
+        {
+            let registry = self
+                .state
+                .service_registry
+                .lock()
+                .map_err(|_| anyhow::anyhow!("service registry lock poisoned"))?;
+            anyhow::ensure!(
+                [&routes.probe, &routes.consume, &routes.validate]
+                    .into_iter()
+                    .all(|route| registry.handlers.contains_key(route)
+                        || registry.handlers.contains_key(&ServiceRoute {
+                            operation: "*".into(),
+                            ..(*route).clone()
+                        })),
+                "admission provider handlers missing"
+            );
+        }
+        self.state
+            .private_admission_routes
+            .lock()
+            .map_err(|_| anyhow::anyhow!("private routes lock poisoned"))?
+            .extend([
+                routes.probe.clone(),
+                routes.consume.clone(),
+                routes.validate.clone(),
+            ]);
+        let mut authority = SerializedAdmissionAuthority {
+            state: Arc::downgrade(&self.state),
+            routes,
+            codec,
+            deadline,
+            capacity: Arc::new(tokio::sync::Semaphore::new(max_in_flight)),
+            instance: Uuid::nil(),
+        };
+        let instance = authority.probe()?;
+        anyhow::ensure!(!instance.is_nil(), "invalid provider instance");
+        authority.instance = instance;
+        let authority = Arc::new(authority);
+        let handle =
+            bmux_plugin::stream_admission::StreamAdmissionAuthorityHandle::new(authority.clone());
+        self.state
+            .plugin_states
+            .register(&Arc::new(std::sync::RwLock::new(handle)));
+        *installed = Some(authority);
+        drop(installed);
+        Ok(instance)
+    }
+
+    /// Explicitly approve a migrated route for admitted streams. The provider
+    /// must enforce resource authority at its side effects; this is not a grant.
+    ///
+    /// # Errors
+    /// Returns an error when host route bookkeeping is unavailable.
+    pub fn approve_admitted_route(&self, route: ServiceRoute) -> Result<()> {
+        self.state
+            .admitted_routes
+            .lock()
+            .map_err(|_| anyhow::anyhow!("admitted routes unavailable"))?
+            .insert(route);
+        Ok(())
+    }
+    /// Actual host-owned generic state context for in-process provider wiring.
+    /// Pass this context explicitly; a plugin library's own global registry is
+    /// not shared across dynamic-library or process boundaries.
+    #[must_use]
+    pub fn plugin_state_registry(&self) -> Arc<bmux_plugin::PluginStateRegistry> {
+        Arc::clone(&self.state.plugin_states)
+    }
     fn new_with_snapshot(
         endpoint: IpcEndpoint,
         snapshot_manager: Option<()>,
@@ -1041,6 +1345,9 @@ impl BmuxServer {
             tokio::sync::broadcast::channel::<Event>(EVENT_PUSH_CHANNEL_CAPACITY);
 
         let attach_tokens = Arc::new(Mutex::new(AttachTokenManager::new(ATTACH_TOKEN_TTL)));
+        let plugin_states = bmux_plugin::global_plugin_state_registry();
+        let stream_provenance = bmux_plugin::stream_admission::StreamProvenanceRegistry::default();
+        plugin_states.register(&Arc::new(std::sync::RwLock::new(stream_provenance.clone())));
         let client_principals: Arc<Mutex<BTreeMap<ClientId, Uuid>>> =
             Arc::new(Mutex::new(BTreeMap::new()));
 
@@ -1076,6 +1383,11 @@ impl BmuxServer {
                 event_broadcast: event_broadcast_tx,
                 event_push_clients: AsyncMutex::new(BTreeSet::new()),
                 retained_wire_events: Arc::new(RetainedWireEvents::default()),
+                admission_backend: Mutex::default(),
+                admitted_routes: Mutex::default(),
+                private_admission_routes: Mutex::default(),
+                stream_provenance,
+                plugin_states,
                 client_principals,
                 server_control_principal_id,
                 handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
@@ -1634,6 +1946,572 @@ impl BmuxServer {
     }
 }
 
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+    use bmux_plugin::stream_admission::{
+        StreamAdmissionAuthority, StreamAdmissionAuthorityHandle, StreamAdmissionBinding,
+        StreamAdmissionError, StreamProvenance,
+    };
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct Authority {
+        binding: Arc<StreamAdmissionBinding>,
+        consumed: AtomicBool,
+        revoked: AtomicBool,
+    }
+
+    impl StreamAdmissionAuthority for Authority {
+        fn consume(
+            &self,
+            ticket: &[u8],
+        ) -> Result<Arc<StreamAdmissionBinding>, StreamAdmissionError> {
+            if ticket != b"opaque" || self.consumed.swap(true, Ordering::SeqCst) {
+                return Err(StreamAdmissionError);
+            }
+            Ok(Arc::clone(&self.binding))
+        }
+
+        fn validate(&self, _: &StreamAdmissionBinding) -> Result<(), StreamAdmissionError> {
+            if self.revoked.load(Ordering::SeqCst) {
+                Err(StreamAdmissionError)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn authenticated_stream_identity_and_revocation() {
+        let subject = Uuid::new_v4();
+        let authority = Arc::new(Authority {
+            binding: Arc::new(StreamAdmissionBinding::new(subject, Uuid::new_v4())),
+            consumed: AtomicBool::new(false),
+            revoked: AtomicBool::new(false),
+        });
+        let handle = StreamAdmissionAuthorityHandle::new(authority.clone());
+        let stream_id = Uuid::new_v4();
+        assert!(handle.admit(stream_id, b"invalid").is_err());
+        let admitted = handle.admit(stream_id, b"opaque").unwrap();
+        let provenance = bmux_plugin::stream_admission::StreamProvenanceRegistry::default();
+        let host_context = Arc::new(bmux_plugin::PluginStateRegistry::new());
+        host_context.register(&Arc::new(std::sync::RwLock::new(provenance.clone())));
+        // A consumer receives the host context explicitly, not a crate static.
+        let consumer_context = Arc::clone(&host_context);
+        let consumer = bmux_plugin::stream_admission::StreamProvenanceRegistry::from_host_registry(
+            &consumer_context,
+        )
+        .unwrap();
+        assert!(
+            bmux_plugin::stream_admission::StreamProvenanceRegistry::from_host_registry(
+                &bmux_plugin::PluginStateRegistry::new(),
+            )
+            .is_none()
+        );
+        let origin_guard = provenance.record(stream_id, Some(&admitted)).unwrap();
+        assert!(matches!(
+            consumer.lookup(stream_id),
+            StreamProvenance::Admitted(_)
+        ));
+        assert!(matches!(
+            provenance.lookup(stream_id),
+            StreamProvenance::Admitted(_)
+        ));
+        assert!(handle.admit(Uuid::new_v4(), b"opaque").is_err());
+        assert!(Arc::ptr_eq(
+            &handle.binding(stream_id).unwrap(),
+            &authority.binding
+        ));
+        assert_eq!(stream_principal(Some(&admitted), subject).unwrap(), subject);
+        // Wire UUIDs, including a known privileged UUID, never replace the binding.
+        let control_principal = Uuid::new_v4();
+        for forged in [Uuid::nil(), Uuid::new_v4(), control_principal] {
+            assert!(stream_principal(Some(&admitted), forged).is_err());
+        }
+        authority.revoked.store(true, Ordering::SeqCst);
+        assert!(admitted.validate().is_err());
+        assert!(matches!(
+            consumer.lookup(stream_id),
+            StreamProvenance::Invalid
+        ));
+        assert!(matches!(
+            provenance.lookup(stream_id),
+            StreamProvenance::Invalid
+        ));
+        drop(origin_guard);
+        assert!(matches!(
+            provenance.lookup(stream_id),
+            StreamProvenance::Invalid
+        ));
+        assert!(stream_principal(Some(&admitted), subject).is_err());
+        assert!(handle.binding(stream_id).is_none());
+        drop(admitted);
+        authority.revoked.store(false, Ordering::SeqCst);
+        assert!(handle.binding(stream_id).is_none());
+    }
+
+    #[tokio::test]
+    async fn serialized_kernel_provenance_uses_host_context_and_wire_dispatch_rejects() {
+        let server = BmuxServer::new(IpcEndpoint::UnixSocket(std::path::PathBuf::from("unused")));
+        let client_id = ClientId::new();
+        let claimed = Uuid::new_v4();
+        let context = ServiceInvokeContext {
+            host_internal: false,
+            state: Arc::clone(&server.state),
+            shutdown_tx: server.shutdown_tx.clone(),
+            client_id,
+            client_principal_id: claimed,
+        };
+        let query = encode(&Request::CurrentStreamProvenance).unwrap();
+        let read = |bytes: Vec<u8>| decode::<Response>(&bytes).unwrap();
+        assert_eq!(
+            read(context.execute_raw(query.clone()).await.unwrap()),
+            Response::Ok(ResponsePayload::CurrentStreamProvenance {
+                provenance: bmux_ipc::StreamProvenance::Invalid
+            })
+        );
+        let local = server
+            .state
+            .stream_provenance
+            .record(client_id.0, None)
+            .unwrap();
+        assert_eq!(
+            read(context.execute_raw(query.clone()).await.unwrap()),
+            Response::Ok(ResponsePayload::CurrentStreamProvenance {
+                provenance: bmux_ipc::StreamProvenance::Local
+            })
+        );
+        let mut selected = None;
+        assert!(matches!(
+            handle_request(
+                &server.state,
+                &server.shutdown_tx,
+                client_id,
+                claimed,
+                &mut selected,
+                Request::CurrentStreamProvenance
+            )
+            .await
+            .unwrap(),
+            Response::Err(_)
+        ));
+        drop(local);
+        let subject = Uuid::new_v4();
+        let lease = Uuid::new_v4();
+        let authority = Arc::new(Authority {
+            binding: Arc::new(StreamAdmissionBinding::new(subject, lease)),
+            consumed: AtomicBool::new(false),
+            revoked: AtomicBool::new(false),
+        });
+        let handle = StreamAdmissionAuthorityHandle::new(authority.clone());
+        let admitted = handle.admit(client_id.0, b"opaque").unwrap();
+        let _origin = server
+            .state
+            .stream_provenance
+            .record(client_id.0, Some(&admitted))
+            .unwrap();
+        assert_eq!(
+            read(context.execute_raw(query.clone()).await.unwrap()),
+            Response::Ok(ResponsePayload::CurrentStreamProvenance {
+                provenance: bmux_ipc::StreamProvenance::Admitted {
+                    subject_id: subject,
+                    lease_id: lease
+                }
+            })
+        );
+        authority.revoked.store(true, Ordering::SeqCst);
+        assert_eq!(
+            read(context.execute_raw(query).await.unwrap()),
+            Response::Ok(ResponsePayload::CurrentStreamProvenance {
+                provenance: bmux_ipc::StreamProvenance::Invalid
+            })
+        );
+        assert!(
+            context
+                .execute_raw(encode(&Request::Ping).unwrap())
+                .await
+                .is_err()
+        );
+    }
+
+    // One end-to-end fixture keeps install, one-use consumption, and revocation
+    // assertions together so the security ordering remains reviewable.
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn serialized_provider_install_consume_revoke_and_private_routes() {
+        use bmux_plugin::stream_admission::{
+            StreamAdmissionProviderDeclaration, StreamAdmissionProviderOperation,
+        };
+        let server = BmuxServer::new(IpcEndpoint::unix_socket("provider-test"));
+        let instance = Uuid::new_v4();
+        let subject_id = Uuid::new_v4();
+        let lease_id = Uuid::new_v4();
+        let revoked = Arc::new(AtomicBool::new(false));
+        let consumed = Arc::new(AtomicBool::new(false));
+        let operation = |name: &str| StreamAdmissionProviderOperation {
+            capability: "example.admission".into(),
+            interface_id: "admission-state/v1".into(),
+            operation: name.into(),
+            contract: [3; 32],
+        };
+        let declaration = StreamAdmissionProviderDeclaration {
+            probe: operation("probe"),
+            consume: operation("consume"),
+            validate: operation("validate"),
+            deadline_ms: 1000,
+            max_in_flight: 2,
+        };
+        let route = |name: &str| ServiceRoute {
+            capability: "example.admission".into(),
+            interface_id: "admission-state/v1".into(),
+            operation: name.into(),
+            kind: if name == "consume" {
+                bmux_ipc::InvokeServiceKind::Command
+            } else {
+                bmux_ipc::InvokeServiceKind::Query
+            },
+        };
+        for name in ["probe", "consume", "validate"] {
+            let revoked = Arc::clone(&revoked);
+            let consumed = Arc::clone(&consumed);
+            server
+                .register_checked_service_handler_with_metadata(
+                    "example.admission",
+                    route(name).kind,
+                    "admission-state/v1",
+                    name,
+                    move |route, context, payload| {
+                        let revoked = Arc::clone(&revoked);
+                        let consumed = Arc::clone(&consumed);
+                        async move {
+                            let response: Response = decode(
+                                &context
+                                    .execute_raw(encode(&Request::CurrentStreamProvenance)?)
+                                    .await?,
+                            )?;
+                            anyhow::ensure!(
+                                matches!(
+                                    response,
+                                    Response::Ok(ResponsePayload::CurrentStreamProvenance {
+                                        provenance: bmux_ipc::StreamProvenance::HostInternal
+                                    })
+                                ),
+                                "private provider requires host origin"
+                            );
+                            let bytes = bmux_plugin_sdk::service_contract::decode_for(
+                                &route.interface_id,
+                                &[3; 32],
+                                &payload,
+                            )?;
+                            let output = match route.operation.as_str() {
+                                "probe" => bmux_plugin_sdk::encode_service_message(&instance)?,
+                                "consume" => {
+                                    #[derive(serde::Deserialize)]
+                                    struct Ticket {
+                                        #[serde(with = "bmux_codec::serde_bytes_vec")]
+                                        ticket: Vec<u8>,
+                                    }
+                                    #[derive(serde::Serialize)]
+                                    struct Binding {
+                                        subject_id: Uuid,
+                                        lease_id: Uuid,
+                                    }
+                                    let ticket: Ticket =
+                                        bmux_plugin_sdk::decode_service_message(bytes)?;
+                                    anyhow::ensure!(
+                                        ticket.ticket == b"valid"
+                                            && !consumed.swap(true, Ordering::SeqCst),
+                                        "invalid ticket"
+                                    );
+                                    bmux_plugin_sdk::encode_service_message(&Binding {
+                                        subject_id,
+                                        lease_id,
+                                    })?
+                                }
+                                _ => bmux_plugin_sdk::encode_service_message(
+                                    &!revoked.load(Ordering::SeqCst),
+                                )?,
+                            };
+                            Ok(ServiceInvokeOutput::from(
+                                bmux_plugin_sdk::service_contract::encode_response(&output),
+                            ))
+                        }
+                    },
+                )
+                .unwrap();
+        }
+        let routes = StreamAdmissionProviderRoutes {
+            probe: route("probe"),
+            consume: route("consume"),
+            validate: route("validate"),
+        };
+        assert_eq!(
+            server
+                .install_stream_admission_provider(
+                    routes,
+                    Arc::new(declaration.clone()),
+                    Duration::from_secs(1),
+                    2
+                )
+                .unwrap(),
+            instance
+        );
+        let stream_id = Uuid::new_v4();
+        let admitted =
+            consume_stream_preamble(&server.state.plugin_states, stream_id, 1, b"valid").unwrap();
+        assert_eq!(admitted.binding().subject_id(), subject_id);
+        assert!(
+            consume_stream_preamble(&server.state.plugin_states, Uuid::new_v4(), 1, b"valid")
+                .is_err()
+        );
+        let local_id = ClientId::new();
+        let _local = server
+            .state
+            .stream_provenance
+            .record(local_id.0, None)
+            .unwrap();
+        assert!(
+            invoke_service_output(
+                &server.state,
+                &server.shutdown_tx,
+                local_id,
+                Uuid::new_v4(),
+                route("probe"),
+                bmux_plugin::stream_admission::StreamAdmissionProviderCodec::encode_probe(
+                    &declaration
+                )
+                .unwrap()
+            )
+            .await
+            .is_err()
+        );
+        let host = ServiceInvokeContext {
+            host_internal: true,
+            state: Arc::clone(&server.state),
+            shutdown_tx: server.shutdown_tx.clone(),
+            client_id: ClientId::new(),
+            client_principal_id: Uuid::nil(),
+        };
+        assert_eq!(
+            decode::<Response>(
+                &host
+                    .execute_raw(encode(&Request::StreamAdmissionBackend).unwrap())
+                    .await
+                    .unwrap()
+            )
+            .unwrap(),
+            Response::Ok(ResponsePayload::StreamAdmissionBackend {
+                authority_id: Some(instance)
+            })
+        );
+        revoked.store(true, Ordering::SeqCst);
+        assert!(admitted.validate().is_err());
+    }
+
+    struct Lease {
+        binding: Arc<StreamAdmissionBinding>,
+        revoked: AtomicBool,
+        expires: std::sync::Mutex<Option<Instant>>,
+    }
+    impl StreamAdmissionAuthority for Lease {
+        fn consume(&self, _: &[u8]) -> Result<Arc<StreamAdmissionBinding>, StreamAdmissionError> {
+            Ok(Arc::clone(&self.binding))
+        }
+        fn validate(&self, _: &StreamAdmissionBinding) -> Result<(), StreamAdmissionError> {
+            if self.revoked.load(Ordering::SeqCst)
+                || self
+                    .expires
+                    .lock()
+                    .unwrap()
+                    .is_some_and(|expires| Instant::now() >= expires)
+            {
+                Err(StreamAdmissionError)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn idle_admitted_stream_closes_on_revoke_and_expiry() {
+        for expire in [false, true] {
+            let path =
+                std::env::temp_dir().join(format!("bmux-idle-lease-{}.sock", Uuid::new_v4()));
+            let endpoint = IpcEndpoint::unix_socket(path.clone());
+            let listener = LocalIpcListener::bind(&endpoint).unwrap();
+            let mut server = BmuxServer::new(endpoint.clone());
+            let registry = Arc::new(bmux_plugin::PluginStateRegistry::new());
+            Arc::get_mut(&mut server.state).unwrap().plugin_states = Arc::clone(&registry);
+            let subject = Uuid::new_v4();
+            let authority = Arc::new(Lease {
+                binding: Arc::new(StreamAdmissionBinding::new(subject, Uuid::new_v4())),
+                revoked: AtomicBool::new(false),
+                expires: std::sync::Mutex::new(None),
+            });
+            registry.register(&Arc::new(std::sync::RwLock::new(
+                StreamAdmissionAuthorityHandle::new(authority.clone()),
+            )));
+            let mut peer = LocalIpcStream::connect(&endpoint).await.unwrap();
+            let stream = listener.accept().await.unwrap();
+            let permit = Arc::new(
+                Arc::new(tokio::sync::Semaphore::new(1))
+                    .acquire_owned()
+                    .await
+                    .unwrap(),
+            );
+            let state = Arc::clone(&server.state);
+            let shutdown = server.shutdown_tx.clone();
+            let task =
+                tokio::spawn(
+                    async move { handle_connection(state, shutdown, stream, permit).await },
+                );
+            for (id, request) in [
+                Request::AdmitStream {
+                    admission_version: 1,
+                    ticket: vec![1],
+                },
+                Request::Hello {
+                    contract: ProtocolContract::current(default_supported_capabilities()),
+                    client_name: "idle-lease-test".into(),
+                    principal_id: subject,
+                },
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                peer.send_envelope(&Envelope::new(
+                    id as u64,
+                    EnvelopeKind::Request,
+                    encode(&request).unwrap(),
+                ))
+                .await
+                .unwrap();
+            }
+            let hello = peer.recv_envelope().await.unwrap();
+            assert!(matches!(
+                decode::<Response>(&hello.payload).unwrap(),
+                Response::Ok(ResponsePayload::HelloNegotiated { .. })
+            ));
+            if expire {
+                // Exercise expiry without waiting out the provider's production TTL.
+                *authority.expires.lock().unwrap() =
+                    Some(Instant::now() + Duration::from_millis(100));
+            } else {
+                authority.revoked.store(true, Ordering::SeqCst);
+            }
+            assert!(
+                tokio::time::timeout(Duration::from_secs(3), peer.recv_envelope())
+                    .await
+                    .unwrap()
+                    .is_err()
+            );
+            tokio::time::timeout(Duration::from_secs(3), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn admission_requires_registered_authority_and_supported_version() {
+        let registry = bmux_plugin::PluginStateRegistry::new();
+        assert!(consume_stream_preamble(&registry, Uuid::new_v4(), 1, b"opaque").is_err());
+        let authority = Arc::new(Authority {
+            binding: Arc::new(StreamAdmissionBinding::new(Uuid::new_v4(), Uuid::new_v4())),
+            consumed: AtomicBool::new(false),
+            revoked: AtomicBool::new(false),
+        });
+        let handle = StreamAdmissionAuthorityHandle::new(authority.clone());
+        registry.register(&Arc::new(std::sync::RwLock::new(handle)));
+        assert!(consume_stream_preamble(&registry, Uuid::new_v4(), 2, b"opaque").is_err());
+        assert!(!authority.consumed.load(Ordering::SeqCst));
+        assert!(consume_stream_preamble(&registry, Uuid::new_v4(), 1, b"bad").is_err());
+        assert!(consume_stream_preamble(&registry, Uuid::new_v4(), 1, b"opaque").is_ok());
+    }
+
+    #[test]
+    fn admission_rejects_nil_authority_bindings() {
+        for (subject, lease) in [(Uuid::nil(), Uuid::new_v4()), (Uuid::new_v4(), Uuid::nil())] {
+            let handle = StreamAdmissionAuthorityHandle::new(Arc::new(Authority {
+                binding: Arc::new(StreamAdmissionBinding::new(subject, lease)),
+                consumed: AtomicBool::new(false),
+                revoked: AtomicBool::new(false),
+            }));
+            assert!(handle.admit(Uuid::new_v4(), b"opaque").is_err());
+        }
+    }
+
+    #[test]
+    fn local_hello_principal_is_unchanged() {
+        use bmux_plugin::stream_admission::{StreamProvenance, StreamProvenanceRegistry};
+        let provenance = StreamProvenanceRegistry::default();
+        let host_context = bmux_plugin::PluginStateRegistry::new();
+        host_context.register(&Arc::new(std::sync::RwLock::new(provenance.clone())));
+        let consumer = StreamProvenanceRegistry::from_host_registry(&host_context).unwrap();
+        let id = Uuid::new_v4();
+        assert!(matches!(consumer.lookup(id), StreamProvenance::Invalid));
+        let guard = provenance.record(id, None).unwrap();
+        assert!(matches!(consumer.lookup(id), StreamProvenance::Local));
+        drop(guard);
+        assert!(matches!(consumer.lookup(id), StreamProvenance::Invalid));
+        for claimed in [Uuid::nil(), Uuid::new_v4()] {
+            assert_eq!(stream_principal(None, claimed).unwrap(), claimed);
+        }
+    }
+}
+
+fn current_stream_provenance(
+    registry: &bmux_plugin::stream_admission::StreamProvenanceRegistry,
+    host_stream_id: Uuid,
+) -> Response {
+    use bmux_plugin::stream_admission::StreamProvenance as HostProvenance;
+    let provenance = match registry.lookup(host_stream_id) {
+        HostProvenance::Local => bmux_ipc::StreamProvenance::Local,
+        HostProvenance::Admitted(binding) => bmux_ipc::StreamProvenance::Admitted {
+            subject_id: binding.subject_id(),
+            lease_id: binding.lease_id(),
+        },
+        HostProvenance::Invalid => bmux_ipc::StreamProvenance::Invalid,
+    };
+    Response::Ok(ResponsePayload::CurrentStreamProvenance { provenance })
+}
+
+fn consume_stream_preamble(
+    registry: &bmux_plugin::PluginStateRegistry,
+    stream_id: Uuid,
+    admission_version: u16,
+    ticket: &[u8],
+) -> Result<bmux_plugin::stream_admission::AdmittedStream> {
+    anyhow::ensure!(
+        admission_version == 1,
+        "unsupported stream admission version"
+    );
+    let handle = registry
+        .get::<bmux_plugin::stream_admission::StreamAdmissionAuthorityHandle>()
+        .context("stream admission authority unavailable")?
+        .read()
+        .map_err(|_| anyhow::anyhow!("stream admission authority unavailable"))?
+        .clone();
+    Ok(handle.admit(stream_id, ticket)?)
+}
+
+fn stream_principal(
+    admitted: Option<&bmux_plugin::stream_admission::AdmittedStream>,
+    claimed: Uuid,
+) -> Result<Uuid> {
+    if let Some(admitted) = admitted {
+        admitted.validate()?;
+        let subject = admitted.binding().subject_id();
+        anyhow::ensure!(claimed == subject, "admitted stream principal mismatch");
+        Ok(subject)
+    } else {
+        Ok(claimed)
+    }
+}
+
+// Keep the serial handshake and connection cleanup visible in one state machine.
 #[allow(clippy::too_many_lines)]
 async fn handle_connection(
     state: Arc<ServerState>,
@@ -1652,11 +2530,32 @@ async fn handle_connection(
 
     // ── Handshake (serial, before split) ─────────────────────────────────
 
-    let first_envelope = tokio::time::timeout(state.handshake_timeout, stream.recv_envelope())
+    let mut first_envelope = tokio::time::timeout(state.handshake_timeout, stream.recv_envelope())
         .await
         .context("handshake timed out")??;
 
-    let handshake = parse_request(&first_envelope)?;
+    // Only this pre-Hello path can install trusted identity. The authority and
+    // binding stay pinned for the entire connection, including provider reloads.
+    let mut handshake = parse_request(&first_envelope)?;
+    let admitted_stream = if let Request::AdmitStream {
+        admission_version,
+        ticket,
+    } = handshake
+    {
+        let admitted = consume_stream_preamble(
+            &state.plugin_states,
+            client_id.0,
+            admission_version,
+            &ticket,
+        )?;
+        first_envelope = tokio::time::timeout(state.handshake_timeout, stream.recv_envelope())
+            .await
+            .context("admitted handshake timed out")??;
+        handshake = parse_request(&first_envelope)?;
+        Some(admitted)
+    } else {
+        None
+    };
     if let Request::Hello {
         contract,
         client_name,
@@ -1670,7 +2569,7 @@ async fn handle_connection(
                     .capabilities
                     .iter()
                     .any(|capability| capability == bmux_ipc::CAPABILITY_SERVICE_CONTRACT_V2);
-                client_principal_id = principal_id;
+                client_principal_id = stream_principal(admitted_stream.as_ref(), principal_id)?;
                 debug!(
                     "accepted client handshake: {client_name} revision={} caps={}",
                     negotiated.revision,
@@ -1707,6 +2606,9 @@ async fn handle_connection(
         return Ok(());
     }
 
+    let _provenance = state
+        .stream_provenance
+        .record(client_id.0, admitted_stream.as_ref())?;
     follow_handle().0.connect_client(client_id);
     {
         let mut principals = state
@@ -1748,6 +2650,38 @@ async fn handle_connection(
     });
 
     let _writer_abort = AbortOnDrop(writer_task.abort_handle());
+    let (lease_cancel_tx, mut lease_cancel_rx) = watch::channel(false);
+    let _lease_monitor = admitted_stream.as_ref().map(|_| {
+        let provenance = state.stream_provenance.clone();
+        let writer_abort = writer_task.abort_handle();
+        let task = tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_millis(250));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tick.tick().await;
+                let lookup = provenance.clone();
+                // Provider validation is synchronous. Never run it on an async
+                // executor or retain a host registry lock across the bridge.
+                // A timed-out lookup is not retried; provider concurrency stays
+                // charged until its bounded call actually exits.
+                let validation = tokio::task::spawn_blocking(move || {
+                    matches!(
+                        lookup.lookup(client_id.0),
+                        bmux_plugin::stream_admission::StreamProvenance::Admitted(_)
+                    )
+                });
+                if !matches!(
+                    tokio::time::timeout(Duration::from_secs(1), validation).await,
+                    Ok(Ok(true))
+                ) {
+                    let _ = lease_cancel_tx.send(true);
+                    writer_abort.abort();
+                    break;
+                }
+            }
+        });
+        AbortOnDrop(task.abort_handle())
+    });
     let mut push_abort = None;
     let mut event_push_task: Option<tokio::task::JoinHandle<()>> = None;
 
@@ -1759,6 +2693,7 @@ async fn handle_connection(
             break;
         }
         let received = tokio::select! {
+            _ = lease_cancel_rx.changed(), if admitted_stream.is_some() => break,
             result = reader.recv_envelope_with_timing() => result,
             _ = &mut writer_done_rx => break,
             changed = connection_shutdown.changed() => {
@@ -1795,6 +2730,11 @@ async fn handle_connection(
             }
         };
         let request_decode_us = request_decode_started.elapsed().as_micros();
+        if admitted_stream.is_some() && !matches!(request,
+            Request::InvokeService { .. } | Request::InvokeServicePipeline { .. })
+        {
+            break;
+        }
 
         // Track whether this request enables event push delivery.
         let is_enable_push = matches!(request, Request::EnableEventPush);
@@ -1814,15 +2754,25 @@ async fn handle_connection(
         let request_record_us = 0_u128;
 
         let handle_started = Instant::now();
-        let mut response = handle_request(
-            &state,
-            &shutdown_tx,
-            client_id,
-            client_principal_id,
-            &mut selected_session,
-            request,
-        )
-        .await?;
+        // Revalidate after reading, immediately before request dispatch. This
+        // never downgrades an admitted stream to the ordinary local path.
+        if let Some(admitted) = &admitted_stream
+            && admitted.validate().is_err()
+        {
+            break;
+        }
+        let mut response = tokio::select! {
+            biased;
+            _ = lease_cancel_rx.changed(), if admitted_stream.is_some() => break,
+            response = handle_request(
+                &state,
+                &shutdown_tx,
+                client_id,
+                client_principal_id,
+                &mut selected_session,
+                request,
+            ) => response?,
+        };
         if !supports_service_contract_v2
             && let Response::Err(error) = &mut response
             && matches!(error.code, ErrorCode::UnsupportedRepresentation | ErrorCode::ServiceIncompatible)
@@ -2442,7 +3392,10 @@ async fn handle_request(
     )?;
 
     let response = match request {
-        Request::Hello { .. } => Response::Err(ErrorResponse {
+        Request::StreamAdmissionBackend
+        | Request::CurrentStreamProvenance
+        | Request::Hello { .. }
+        | Request::AdmitStream { .. } => Response::Err(ErrorResponse {
             code: ErrorCode::InvalidRequest,
             message: "hello request is only valid during handshake".to_string(),
         }),
@@ -2529,7 +3482,9 @@ async fn handle_request(
                 interface_id: interface_id.clone(),
                 operation: operation.clone(),
             };
+            check_stream_route(state, client_id.0, &route)?;
             let invoke_context = ServiceInvokeContext {
+                host_internal: false,
                 state: Arc::clone(state),
                 shutdown_tx: shutdown_tx.clone(),
                 client_id,
@@ -2825,6 +3780,9 @@ const fn response_requires_snapshot(_response: &Response) -> bool {
 
 const fn request_kind_name(request: &Request) -> &'static str {
     match request {
+        Request::StreamAdmissionBackend => "stream_admission_backend",
+        Request::CurrentStreamProvenance => "current_stream_provenance",
+        Request::AdmitStream { .. } => "admit_stream",
         Request::Hello { .. } => "hello",
         Request::Ping => "ping",
         Request::WhoAmIPrincipal => "whoami_principal",
@@ -3087,6 +4045,8 @@ const fn response_payload_kind_name(payload: &ResponsePayload) -> &'static str {
     match payload {
         ResponsePayload::Pong => "pong",
         ResponsePayload::PrincipalIdentity { .. } => "principal_identity",
+        ResponsePayload::StreamAdmissionBackend { .. } => "stream_admission_backend",
+        ResponsePayload::CurrentStreamProvenance { .. } => "current_stream_provenance",
         ResponsePayload::HelloNegotiated { .. } => "hello_negotiated",
         ResponsePayload::HelloIncompatible { .. } => "hello_incompatible",
         ResponsePayload::ServerStatus { .. } => "server_status",
@@ -3597,6 +4557,12 @@ mod tests {
         let endpoint =
             IpcEndpoint::unix_socket(std::env::temp_dir().join("bmux-pipeline-contract-test.sock"));
         let server = BmuxServer::new(endpoint);
+        let local_id = ClientId::new();
+        let _origin = server
+            .state
+            .stream_provenance
+            .record(local_id.0, None)
+            .unwrap();
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let provider_calls = Arc::clone(&calls);
         server
@@ -3642,7 +4608,7 @@ mod tests {
             let outcome = execute_service_pipeline(
                 &server.state,
                 &server.shutdown_tx,
-                ClientId(Uuid::new_v4()),
+                local_id,
                 Uuid::new_v4(),
                 pipeline,
             )
@@ -3667,6 +4633,12 @@ mod tests {
         let endpoint =
             IpcEndpoint::unix_socket(std::env::temp_dir().join("bmux-contract-test.sock"));
         let server = BmuxServer::new(endpoint);
+        let local_id = ClientId::new();
+        let _origin = server
+            .state
+            .stream_provenance
+            .record(local_id.0, None)
+            .unwrap();
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counted = Arc::clone(&calls);
         server
@@ -3692,7 +4664,7 @@ mod tests {
         let result = invoke_service_output(
             &server.state,
             &server.shutdown_tx,
-            ClientId(Uuid::new_v4()),
+            local_id,
             Uuid::new_v4(),
             route.clone(),
             payload.clone(),
@@ -3716,7 +4688,7 @@ mod tests {
         invoke_service_output(
             &server.state,
             &server.shutdown_tx,
-            ClientId(Uuid::new_v4()),
+            local_id,
             Uuid::new_v4(),
             route,
             payload,
