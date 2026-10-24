@@ -63,6 +63,48 @@ pub(super) fn authorize_route(ctx: &NativeServiceContext) -> Result<(), ServiceR
     }
 }
 
+pub(crate) fn local_input_authority(
+    ctx: &NativeServiceContext,
+    session_id: uuid::Uuid,
+) -> crate::runtime::input_authority::InputAuthority {
+    let ctx = ctx.clone();
+    crate::runtime::input_authority::InputAuthority::new(move || {
+        if ctx.cancellation.is_cancelled() {
+            return Err("local input cancelled".into());
+        }
+        authorize_route(&ctx).map_err(|_| "local input authority ended".to_string())?;
+        super::spawn::authorize_session(&ctx, session_id, "pane.direct_input")
+            .map_err(|error| format!("{error:?}"))?;
+        if let Some(client) = ctx.caller_client_id {
+            let runtime = super::session_runtime_handle()
+                .ok_or_else(|| "input runtime unavailable".to_string())?;
+            if !runtime.0.client_can_write(
+                bmux_session_models::SessionId(session_id),
+                bmux_session_models::ClientId(client),
+            ) {
+                return Err("local input write permission revoked".into());
+            }
+        }
+        Ok(())
+    })
+}
+
+/// Retain the owned host bridge: deferred checks must never run under ambient
+/// worker identity or substitute caller-supplied IDs for admission authority.
+pub(crate) fn input_authority(
+    ctx: &NativeServiceContext,
+    execution: &ExecutionRef,
+) -> Result<crate::runtime::input_authority::InputAuthority, ExecutionError> {
+    authorize(ctx, execution, "pane.direct_input")?;
+    let ctx = ctx.clone();
+    let execution = execution.clone();
+    Ok(crate::runtime::input_authority::InputAuthority::new(
+        move || {
+            authorize(&ctx, &execution, "pane.direct_input").map_err(|error| format!("{error:?}"))
+        },
+    ))
+}
+
 pub(crate) fn authorize(
     ctx: &NativeServiceContext,
     execution: &ExecutionRef,
@@ -93,6 +135,7 @@ mod tests {
     use uuid::Uuid;
 
     thread_local! {
+        static TEST_CANCELLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         static TEST_ORIGIN: std::cell::RefCell<Arc<Mutex<StreamProvenance>>> =
             std::cell::RefCell::new(Arc::new(Mutex::new(StreamProvenance::Invalid)));
     }
@@ -104,6 +147,11 @@ mod tests {
         output_capacity: usize,
         output_len: *mut usize,
     ) -> i32 {
+        // Live cancellation is owned by the bound host bridge, not the SDK's
+        // serialized cancellation snapshot retained in the cloned context.
+        if TEST_CANCELLED.with(std::cell::Cell::get) {
+            return 1;
+        }
         let input = unsafe { std::slice::from_raw_parts(input_ptr, input_len) };
         let Ok(request) = bmux_plugin_sdk::decode_service_message::<
             bmux_plugin_sdk::HostKernelBridgeRequest,
@@ -132,6 +180,7 @@ mod tests {
     }
 
     fn context(interface: &str, operation: &str, payload: Vec<u8>) -> NativeServiceContext {
+        TEST_CANCELLED.with(|cancelled| cancelled.set(false));
         NativeServiceContext {
             plugin_id: "bmux.pane_runtime".into(),
             request: ServiceRequest {
@@ -170,6 +219,66 @@ mod tests {
             cancellation: bmux_plugin_sdk::CancellationToken::default(),
             host_kernel_bridge: Some(bmux_plugin_sdk::HostKernelBridge::from_fn(origin_bridge)),
         }
+    }
+
+    #[test]
+    fn queued_service_input_rechecks_origin_and_cancellation() {
+        let origin = Arc::new(Mutex::new(StreamProvenance::Local));
+        TEST_ORIGIN.with(|current| *current.borrow_mut() = origin.clone());
+        let mut ctx = context("pane-runtime-execution-v4", "send", Vec::new());
+        ctx.caller_client_id = None;
+        let execution = ExecutionRef {
+            session_id: Uuid::new_v4(),
+            pane_id: Uuid::new_v4(),
+            execution_token: Uuid::new_v4(),
+        };
+        // No optional domain plugins: baseline local execution still works.
+        let authority = input_authority(&ctx, &execution).unwrap();
+        let mut output = Vec::new();
+        authority.write(&mut output, b"local").unwrap();
+        assert_eq!(output, b"local");
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(authority).unwrap();
+        *origin.lock().unwrap() = StreamProvenance::Invalid;
+        assert!(rx.recv().unwrap().write(&mut output, b"revoked").is_err());
+        assert_eq!(output, b"local");
+        *origin.lock().unwrap() = StreamProvenance::Local;
+        let authority = input_authority(&ctx, &execution).unwrap();
+        ctx.cancellation.cancel();
+        TEST_CANCELLED.with(|cancelled| cancelled.set(true));
+        assert!(authority.write(&mut output, b"cancelled").is_err());
+        assert_eq!(output, b"local");
+        *origin.lock().unwrap() = StreamProvenance::Admitted {
+            subject_id: Uuid::new_v4(),
+            lease_id: Uuid::new_v4(),
+        };
+        let remote = context("pane-runtime-execution-v4", "send", Vec::new());
+        assert!(input_authority(&remote, &execution).is_err());
+    }
+
+    #[test]
+    fn legacy_local_queue_keeps_authority_after_ingress_scope() {
+        use crate::runtime::input_authority::{local_command, with_local};
+        let origin = Arc::new(Mutex::new(StreamProvenance::Local));
+        TEST_ORIGIN.with(|current| *current.borrow_mut() = origin.clone());
+        let mut ctx = context("attach-runtime-commands", "attach-input", Vec::new());
+        ctx.caller_client_id = None;
+        let session = bmux_session_models::SessionId(Uuid::new_v4());
+        let command = with_local(ctx.clone(), || local_command(b"queued".to_vec(), session));
+        let crate::runtime::PaneRuntimeCommand::AuthorizedInput(bytes, authority) = command else {
+            panic!("service input lost authority");
+        };
+        let mut output = Vec::new();
+        authority.write(&mut output, &bytes).unwrap();
+        assert_eq!(output, b"queued");
+        ctx.cancellation.cancel();
+        TEST_CANCELLED.with(|cancelled| cancelled.set(true));
+        assert!(authority.write(&mut output, &bytes).is_err());
+        // Scope restoration keeps ordinary in-process terminal input unchanged.
+        assert!(matches!(
+            local_command(b"local".to_vec(), session),
+            crate::runtime::PaneRuntimeCommand::Input(_)
+        ));
     }
 
     #[test]

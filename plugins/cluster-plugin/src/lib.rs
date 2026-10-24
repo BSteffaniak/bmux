@@ -618,11 +618,12 @@ fn authoritative_members(ctx: &NativeServiceContext) -> Result<ClusterMemberList
     let runtime = tokio::runtime::Handle::try_current().map_err(|error| {
         format!("authoritative membership read requires the host runtime: {error}")
     })?;
-    let members = tokio::task::block_in_place(|| runtime.block_on(handle.authoritative_members()))
+    let view = tokio::task::block_in_place(|| runtime.block_on(handle.authoritative_members()))
         .map_err(|error| format!("authoritative membership read failed: {error:?}"))?;
     Ok(ClusterMemberList {
         cluster_id: Some(cluster_id),
-        members,
+        membership_epoch: view.membership_epoch,
+        members: view.members,
     })
 }
 
@@ -653,46 +654,26 @@ fn reconcile_consensus_members(
     ctx: &NativeServiceContext,
     req: bmux_cluster_plugin_api::cluster_command::client::ConsensusReconcileMembersRequest,
 ) -> Result<ClusterMemberList, String> {
-    let current = authoritative_members(ctx)?;
-    let cluster_id = current
-        .cluster_id
-        .as_deref()
-        .ok_or_else(|| "cluster membership is not initialized".to_string())?;
-    let target = req
-        .members
-        .iter()
-        .find(|member| {
-            member.node_id == req.authorization.target_node_id
-                && member.state == ClusterMemberState::Active
-                && member.capabilities.consensus_role == ClusterConsensusRole::Voter
-        })
-        .ok_or_else(|| "membership transition target is not an active voter".to_string())?;
-    consensus_membership::verify_voter_change_authorization(
-        &req.authorization,
-        cluster_id,
-        bmux_cluster_plugin_api::cluster_types::ConsensusVoterChangeAction::Add,
-        target.node_id.parse::<NodeId>()?,
-        &req.members,
-    )?;
-    consensus_membership::validate_membership_transition(&current.members, &req.members)?;
+    if req.authorization.action
+        != bmux_cluster_plugin_api::cluster_types::ConsensusVoterChangeAction::Add
+    {
+        return Err("membership reconciliation requires an add authorization".into());
+    }
+    apply_signed_voter_transition(ctx, &req.authorization, req.members)
+}
+
+fn apply_signed_voter_transition(
+    ctx: &NativeServiceContext,
+    authorization: &bmux_cluster_plugin_api::cluster_types::ConsensusVoterChangeAuthorization,
+    proposed: Vec<ClusterMember>,
+) -> Result<ClusterMemberList, String> {
     let identity = load_or_create_node_identity(ctx)?;
-    let nodes = consensus_network::global_consensus_nodes();
-    let handle = tokio::runtime::Handle::try_current()
-        .map_err(|error| format!("consensus reconciliation requires the host runtime: {error}"))?;
+    let node = consensus_network::global_consensus_nodes()
+        .active(*identity.node_id())
+        .map_err(|error| format!("consensus transition unavailable: {error:?}"))?;
+    let handle = tokio::runtime::Handle::try_current().map_err(|error| error.to_string())?;
     tokio::task::block_in_place(|| {
-        handle.block_on(consensus_membership::reconcile_members(
-            req.members.clone(),
-            *identity.node_id(),
-            &nodes,
-        ))
-    })?;
-    let node = nodes.get(*identity.node_id())?;
-    tokio::task::block_in_place(|| {
-        handle.block_on(consensus_membership::publish_members(
-            node,
-            &req.authorization.actor_node_id,
-            req.members,
-        ))
+        handle.block_on(node.apply_voter_transition(authorization, proposed))
     })?;
     authoritative_members(ctx)
 }
@@ -701,48 +682,15 @@ fn remove_consensus_voter(
     ctx: &NativeServiceContext,
     req: &bmux_cluster_plugin_api::cluster_command::client::ConsensusRemoveVoterRequest,
 ) -> Result<ClusterMemberList, String> {
-    let identity = load_or_create_node_identity(ctx)?;
-    let remove_node_id = req.authorization.target_node_id.parse::<NodeId>()?;
+    if req.authorization.action
+        != bmux_cluster_plugin_api::cluster_types::ConsensusVoterChangeAction::Remove
+    {
+        return Err("voter removal requires a remove authorization".into());
+    }
     let membership = authoritative_members(ctx)?;
-    let cluster_id = membership
-        .cluster_id
-        .as_deref()
-        .ok_or_else(|| "cluster membership is not initialized".to_string())?;
-    consensus_membership::verify_voter_change_authorization(
-        &req.authorization,
-        cluster_id,
-        bmux_cluster_plugin_api::cluster_types::ConsensusVoterChangeAction::Remove,
-        remove_node_id,
-        &membership.members,
-    )?;
-    let members = membership.members.clone();
-    let nodes = consensus_network::global_consensus_nodes();
-    let handle = tokio::runtime::Handle::try_current()
-        .map_err(|error| format!("consensus voter removal requires the host runtime: {error}"))?;
-    tokio::task::block_in_place(|| {
-        handle.block_on(consensus_membership::remove_voter(
-            members,
-            remove_node_id,
-            *identity.node_id(),
-            &nodes,
-        ))
-    })?;
-    let mut published = membership.members;
-    let target = published
-        .iter_mut()
-        .find(|member| member.node_id == remove_node_id.to_string())
-        .ok_or_else(|| "removed consensus voter is not a member".to_string())?;
-    target.state = ClusterMemberState::Left;
-    target.updated_at_unix_ms = now_unix_ms();
-    let node = nodes.get(*identity.node_id())?;
-    tokio::task::block_in_place(|| {
-        handle.block_on(consensus_membership::publish_members(
-            node,
-            &req.authorization.actor_node_id,
-            published,
-        ))
-    })?;
-    authoritative_members(ctx)
+    let proposed =
+        consensus_membership::removal_plan(&membership.members, &req.authorization.target_node_id)?;
+    apply_signed_voter_transition(ctx, &req.authorization, proposed)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -899,7 +847,7 @@ fn invoke_cluster_lifecycle_service(context: &NativeServiceContext) -> ServiceRe
                 .map_err(|error| ServiceResponse::error("consensus_remove_voter_failed", error))
         },
         "cluster-command/v1", "redeem_enrollment" => |req: ClusterCommandRedeemEnrollmentRequest, ctx| {
-            let result = redeem_enrollment(ctx, &req)
+            let mut result = redeem_enrollment(ctx, &req)
                 .map_err(|error| ServiceResponse::error("redeem_enrollment_failed", error))?;
             if let Ok(node) = consensus_network::global_consensus_nodes().get(
                 *load_or_create_node_identity(ctx)
@@ -918,6 +866,34 @@ fn invoke_cluster_lifecycle_service(context: &NativeServiceContext) -> ServiceRe
                     })
                     .map_err(|error| ServiceResponse::error("redeem_enrollment_failed", error))?;
                 }
+            }
+            if result.member.capabilities.consensus_role == ClusterConsensusRole::Voter {
+                let committed = authoritative_members(ctx)
+                    .map_err(|error| ServiceResponse::error("redeem_enrollment_failed", error))?;
+                let epoch = committed.membership_epoch.as_deref().ok_or_else(||
+                    ServiceResponse::error("redeem_enrollment_failed", "committed membership epoch unavailable"))?;
+                let identity = load_or_create_node_identity(ctx)
+                    .map_err(|error| ServiceResponse::error("redeem_enrollment_failed", error))?;
+                let mut proposed = committed.members.clone();
+                if let Some(existing) = proposed.iter().find(|member| member.node_id == result.member.node_id) {
+                    if existing != &result.member {
+                        return Err(ServiceResponse::error("redeem_enrollment_failed", "enrollment retry conflicts with committed member"));
+                    }
+                    // A fresh signed exact-plan acknowledgement handles a lost
+                    // success response without reusing an old transition proof.
+                } else {
+                    proposed.push(result.member.clone());
+                }
+                let authorization = consensus_membership::authorize_voter_change(
+                    &result.member.cluster_id,
+                    bmux_cluster_plugin_api::cluster_types::ConsensusVoterChangeAction::Add,
+                    &result.member.node_id, &identity, epoch, &committed.members, &proposed,
+                ).map_err(|error| ServiceResponse::error("redeem_enrollment_failed", error))?;
+                consensus_membership::verify_voter_change_authorization(
+                    &authorization, &result.member.cluster_id, epoch, &committed.members, &proposed,
+                ).map_err(|error| ServiceResponse::error("redeem_enrollment_failed", error))?;
+                result.members = proposed;
+                result.voter_authorization = Some(authorization);
             }
             Ok(result)
         },

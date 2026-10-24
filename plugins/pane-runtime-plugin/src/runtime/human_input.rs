@@ -254,6 +254,7 @@ pub(crate) fn push(
     stream: &HumanInputStream,
     sequence: u64,
     data: Vec<u8>,
+    authority: super::input_authority::InputAuthority,
 ) -> Result<HumanInputAck, HumanInputError> {
     let registry = STREAMS.get_or_init(Registry::default);
     if let Err(error) = validate_live(&stream.execution) {
@@ -273,7 +274,7 @@ pub(crate) fn push(
         // This closure runs only for a fresh sequence, never retained outcomes.
         // Its error may follow a PTY effect or failed capture enqueue: close the
         // epoch as uncertain instead of retrying either write or input capture.
-        super::execution::send_human_recorded_acknowledged(execution, bytes)
+        super::execution::send_human_recorded_acknowledged(execution, bytes, authority)
             .map_err(|error| format!("{error:?}"))
     })
 }

@@ -98,7 +98,7 @@ impl ConnectionsPlugin {
             .as_ref()
             .ok_or_else(|| ServiceResponse::error("unavailable", "inactive runtime"))?;
         if !remote_preferences::update(&target::context_paths(&context.connection), |p| {
-            Ok(p.enabled.unwrap_or_else(|| runtime.ingress_allowed()))
+            Ok(runtime.ingress_enabled(p.enabled))
         })
         .map_err(pairing_error)?
         {
@@ -218,6 +218,17 @@ impl ConnectionsPlugin {
         enabled: bool,
     ) -> Result<bmux_connections_plugin_api::pairing_types::ListenerStatus, ServiceResponse> {
         let _owner = pairing_owner(ctx)?;
+        if enabled
+            && self
+                .local_runtime
+                .as_ref()
+                .is_some_and(directory::LocalRuntime::ingress_prohibited)
+        {
+            return Err(ServiceResponse::error(
+                "ingress_prohibited",
+                "remote hosting is prohibited by allow_full_runtime_ingress = false; change host configuration and restart first",
+            ));
+        }
         let paths = target::context_paths(&ctx.connection);
         if !enabled {
             self.stop_listener(ctx)?;
@@ -472,10 +483,8 @@ impl RustPlugin for ConnectionsPlugin {
                 Ok(p.enabled)
             })
             .map_err(|e| PluginCommandError::failed(e.to_string()))?;
-        if let Some(enabled) = preferences_enabled {
-            settings.allow_full_runtime_ingress = enabled;
-            settings.auto_start = enabled;
-        }
+        // A persisted CLI opt-in never overrides a declarative prohibition.
+        settings.auto_start = settings.startup_enabled(preferences_enabled);
         let identity = identity::RuntimeIdentity::load_or_create(
             std::path::Path::new(&context.connection.state_dir),
             std::path::Path::new(&context.connection.runtime_dir),
@@ -1341,6 +1350,70 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn explicit_config_denial_rejects_enable_without_persisting() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = test_paths(root.path());
+        std::fs::create_dir_all(&paths.state_dir).unwrap();
+        std::fs::create_dir_all(&paths.runtime_dir).unwrap();
+        let identity =
+            identity::RuntimeIdentity::load_or_create(&paths.state_dir, &paths.runtime_dir)
+                .unwrap();
+        let plugin = ConnectionsPlugin {
+            local_runtime: Some(directory::LocalRuntime::new(
+                identity,
+                config::RemoteSettings {
+                    allow_full_runtime_ingress: Some(false),
+                    ..config::RemoteSettings::default()
+                },
+            )),
+            ..ConnectionsPlugin::default()
+        };
+        remote_preferences::update(&paths, |p| {
+            p.enabled = Some(true);
+            Ok(())
+        })
+        .unwrap();
+        let context = service_context(&paths, "set-enabled", Vec::new());
+        let _router = trusted_local_router();
+        assert_eq!(
+            plugin
+                .set_remote_enabled(&context, true)
+                .unwrap_err()
+                .error
+                .unwrap()
+                .code,
+            "ingress_prohibited"
+        );
+        assert_eq!(
+            plugin
+                .start_listener(&context)
+                .unwrap_err()
+                .error
+                .unwrap()
+                .code,
+            "ingress_denied"
+        );
+        plugin.set_remote_enabled(&context, false).unwrap();
+        assert_eq!(
+            remote_preferences::update(&paths, |p| Ok(p.enabled)).unwrap(),
+            Some(false)
+        );
+        assert_eq!(
+            plugin
+                .set_remote_enabled(&context, true)
+                .unwrap_err()
+                .error
+                .unwrap()
+                .code,
+            "ingress_prohibited"
+        );
+        assert_eq!(
+            remote_preferences::update(&paths, |p| Ok(p.enabled)).unwrap(),
+            Some(false)
+        );
+    }
+
     #[test]
     fn listener_start_requires_owner_policy_and_same_backend_instance() {
         use bmux_clients_plugin_api::clients_identity::StreamProvenance as Origin;
@@ -1386,7 +1459,7 @@ mod tests {
             identity::RuntimeIdentity::load_or_create(&paths.state_dir, &paths.runtime_dir)
                 .unwrap();
         let settings = config::RemoteSettings {
-            allow_full_runtime_ingress: true,
+            allow_full_runtime_ingress: Some(true),
             ..config::RemoteSettings::default()
         };
         plugin.local_runtime = Some(directory::LocalRuntime::new(identity, settings));

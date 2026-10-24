@@ -732,6 +732,7 @@ pub(crate) fn send_admitted(
     reference: &ExecutionRef,
     mutation: uuid::Uuid,
     data: Vec<u8>,
+    authority: super::input_authority::InputAuthority,
 ) -> Result<
     bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::TerminalInputReceipt,
     RecoveryError,
@@ -802,7 +803,7 @@ pub(crate) fn send_admitted(
     if !claim.0 {
         return Ok(claim.1.receipt);
     }
-    let result = super::execution::send_acknowledged(reference, data);
+    let result = super::execution::send_acknowledged(reference, data, authority);
     with_store(|store| {
         let mut stored = claim.1;
         stored.receipt.revision += 1;

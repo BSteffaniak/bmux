@@ -158,18 +158,14 @@ pub fn run_cluster_join(context: &NativeCommandContext) -> Result<i32, String> {
     let joining_voter =
         enrollment.member.capabilities.consensus_role == ClusterConsensusRole::Voter;
     let prospective_members = enrollment.members.clone();
-    let add_authorization = if joining_voter {
-        let local_identity = load_node_identity(context)?
-            .ok_or_else(|| "local node identity is not initialized".to_string())?;
-        Some(consensus_membership::authorize_voter_change(
-            &token.claims.cluster_id,
-            bmux_cluster_plugin_api::cluster_types::ConsensusVoterChangeAction::Add,
-            &enrollment.member.node_id,
-            &local_identity,
-        )?)
-    } else {
-        None
-    };
+    // Only the currently committed issuer can authorize a new voter. A joining
+    // node's possession proof is not authority to promote itself.
+    let add_authorization = enrollment.voter_authorization.clone();
+    if joining_voter && add_authorization.is_none() {
+        return Err(
+            "issuer lacks voter authorization v2; upgrade cluster peers before joining".into(),
+        );
+    }
 
     let mut local = bmux_plugin::ServiceCallerDispatchClient::new(context);
     let result = tokio::task::block_in_place(|| {
@@ -237,6 +233,7 @@ fn read_authoritative_members(context: &NativeCommandContext) -> Result<ClusterM
     .map_err(|error| format!("replicated membership dispatch failed: {error}"))?
     .map(|view| ClusterMemberList {
         cluster_id: Some(view.cluster_id),
+        membership_epoch: view.membership_epoch,
         members: view.members,
     })
     .or_else(|error| {
@@ -263,19 +260,15 @@ pub fn run_cluster_leave(context: &NativeCommandContext) -> Result<i32, String> 
     })
     .map_err(|error| format!("cluster leave prepare failed: {error}"))?;
 
-    let membership = read_authoritative_members(context)?.members;
+    let committed = read_authoritative_members(context)?;
+    let epoch = committed.membership_epoch.as_deref();
+    let membership = committed.members;
     let cluster_id = membership
         .first()
         .map(|member| member.cluster_id.as_str())
         .ok_or_else(|| "cluster membership is empty".to_string())?;
     let local_identity = load_node_identity(context)?
         .ok_or_else(|| "local node identity is not initialized".to_string())?;
-    let remove_authorization = consensus_membership::authorize_voter_change(
-        cluster_id,
-        bmux_cluster_plugin_api::cluster_types::ConsensusVoterChangeAction::Remove,
-        &prepared.node_id,
-        &local_identity,
-    )?;
     let active_voter_count = membership
         .iter()
         .filter(|member| {
@@ -291,6 +284,20 @@ pub fn run_cluster_leave(context: &NativeCommandContext) -> Result<i32, String> 
                 && member.capabilities.consensus_role == ClusterConsensusRole::Voter
                 && active_voter_count > 1
         });
+
+    let remove_authorization = if departing_voter {
+        Some(consensus_membership::authorize_voter_change(
+            cluster_id,
+            bmux_cluster_plugin_api::cluster_types::ConsensusVoterChangeAction::Remove,
+            &prepared.node_id,
+            &local_identity,
+            epoch.ok_or("committed membership epoch unavailable")?,
+            &membership,
+            &consensus_membership::removal_plan(&membership, &prepared.node_id)?,
+        )?)
+    } else {
+        None
+    };
 
     if let Some(issuer) = prepared.issuer_endpoint.as_deref() {
         let authenticated = tokio::task::block_in_place(|| {
@@ -324,7 +331,7 @@ pub fn run_cluster_leave(context: &NativeCommandContext) -> Result<i32, String> 
                 handle.block_on(
                     bmux_cluster_plugin_api::cluster_command::client::consensus_remove_voter(
                         &mut remote,
-                        remove_authorization.clone(),
+                        remove_authorization.clone().expect("departing voter proof"),
                     ),
                 )
             })
@@ -350,7 +357,7 @@ pub fn run_cluster_leave(context: &NativeCommandContext) -> Result<i32, String> 
                 handle.block_on(
                     bmux_cluster_plugin_api::cluster_command::client::consensus_remove_voter(
                         &mut local,
-                        remove_authorization,
+                        remove_authorization.clone().expect("departing voter proof"),
                     ),
                 )
             })
@@ -436,8 +443,9 @@ pub fn run_cluster_member_revoke(context: &NativeCommandContext) -> Result<i32, 
         .ok_or_else(|| "cluster member revoke requires a node ID".to_string())?;
     let handle = tokio::runtime::Handle::try_current()
         .map_err(|error| format!("member revocation requires the host runtime: {error}"))?;
-    let members = read_authoritative_members(context)?.members;
-    let target = members
+    let committed = read_authoritative_members(context)?;
+    let target = committed
+        .members
         .iter()
         .find(|member| member.node_id == node_id)
         .ok_or_else(|| "member is unknown".to_string())?;
@@ -451,6 +459,12 @@ pub fn run_cluster_member_revoke(context: &NativeCommandContext) -> Result<i32, 
             bmux_cluster_plugin_api::cluster_types::ConsensusVoterChangeAction::Remove,
             node_id,
             &local_identity,
+            committed
+                .membership_epoch
+                .as_deref()
+                .ok_or("committed membership epoch unavailable")?,
+            &committed.members,
+            &consensus_membership::removal_plan(&committed.members, node_id)?,
         )?;
         let mut client = bmux_plugin::ServiceCallerDispatchClient::new(context);
         tokio::task::block_in_place(|| {

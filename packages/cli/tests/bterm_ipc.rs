@@ -4,6 +4,7 @@
 //! actual listener binding, not a duplicated lock or pathname model.
 #![cfg(unix)]
 
+use std::os::unix::fs::PermissionsExt as _;
 use std::sync::{Arc, Barrier};
 
 use bmux_ipc::IpcEndpoint;
@@ -11,7 +12,10 @@ use bmux_ipc::transport::{LocalIpcListener, LocalIpcStream};
 
 #[tokio::test]
 async fn competing_startups_have_one_owner_and_losers_do_not_remove_live_endpoint() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = tempfile::Builder::new()
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir()
+        .unwrap();
     let endpoint = IpcEndpoint::unix_socket(directory.path().join("runtime.sock"));
     let start = Arc::new(Barrier::new(8));
     let reactor = tokio::runtime::Handle::current();

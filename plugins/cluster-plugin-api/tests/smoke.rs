@@ -26,6 +26,7 @@ use bmux_cluster_plugin_api::{
 #[test]
 fn generated_control_services_expose_consistency_and_structured_errors() {
     let view = ControlStateView {
+        membership_epoch: None,
         schema_version: 1,
         cluster_id: "cluster:test".to_string(),
         revision: 7,
@@ -390,10 +391,12 @@ fn cluster_command_results_round_trip() {
         state: ClusterMemberState::Active,
     };
     let members = ClusterMemberList {
+        membership_epoch: None,
         cluster_id: identity.cluster_id.clone(),
         members: vec![member.clone()],
     };
     let join = ClusterJoinResult {
+        voter_authorization: None,
         identity: identity.clone(),
         member: member.clone(),
         members: vec![member],
@@ -563,4 +566,51 @@ fn generated_contract_declares_all_services() {
     assert!(manifest.contains("cluster-attach-state/v1"));
     assert!(manifest.contains("cluster-attach-command/v1"));
     assert!(manifest.contains("cluster-worker-state/v1"));
+}
+
+#[test]
+fn generated_voter_authorization_v2_round_trips_and_legacy_proofs_are_not_promoted() {
+    use bmux_cluster_plugin_api::cluster_types::{
+        ConsensusVoterChangeAction, ConsensusVoterChangeAuthorization,
+    };
+    let authorization = ConsensusVoterChangeAuthorization {
+        protocol_version: 2,
+        cluster_id: "cluster:test".into(),
+        membership_epoch: "1:node:test:7".into(),
+        current_members_digest: vec![1; 32],
+        proposed_members_digest: vec![2; 32],
+        expires_at_unix_ms: 123_456,
+        action: ConsensusVoterChangeAction::Add,
+        target_node_id: "node:joining".into(),
+        actor_node_id: "node:issuer".into(),
+        signature: vec![3; 64],
+    };
+    let request =
+        bmux_cluster_plugin_api::cluster_command::client::ConsensusReconcileMembersRequest {
+            members: Vec::new(),
+            authorization: authorization.clone(),
+        };
+    let encoded = bmux_plugin_sdk::encode_service_message(&request).unwrap();
+    let decoded: bmux_cluster_plugin_api::cluster_command::client::ConsensusReconcileMembersRequest =
+        bmux_plugin_sdk::decode_service_message(&encoded).unwrap();
+    assert_eq!(decoded.authorization, authorization);
+    // This is an old peer's record, not a second runtime transport envelope.
+    let mut legacy = serde_json::to_value(&authorization).unwrap();
+    for field in [
+        "protocol_version",
+        "membership_epoch",
+        "current_members_digest",
+        "proposed_members_digest",
+        "expires_at_unix_ms",
+    ] {
+        legacy.as_object_mut().unwrap().remove(field);
+    }
+    let decoded = serde_json::from_value::<ConsensusVoterChangeAuthorization>(legacy).unwrap();
+    // Generated records default absent scalar fields. The authorization verifier
+    // explicitly rejects version 0; decoding must never silently create v2.
+    assert_eq!(decoded.protocol_version, 0);
+    assert!(decoded.membership_epoch.is_empty());
+    assert!(decoded.current_members_digest.is_empty());
+    assert!(decoded.proposed_members_digest.is_empty());
+    assert_eq!(decoded.expires_at_unix_ms, 0);
 }

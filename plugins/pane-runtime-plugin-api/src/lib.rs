@@ -45,6 +45,69 @@ mod tests {
     use super::{pane_runtime_commands, pane_runtime_state};
 
     #[test]
+    fn reusable_credentials_redact_debug_without_changing_serde() {
+        use super::attach_runtime_commands::{AttachGrant, client::AttachOpenRequest};
+        use super::pane_runtime_execution_v4::{TerminalExecutionRef, client::SendRequest};
+        #[derive(serde::Serialize)]
+        struct WireExecutionRef {
+            session_id: uuid::Uuid,
+            pane_id: uuid::Uuid,
+            execution_token: uuid::Uuid,
+        }
+        let secret = uuid::Uuid::new_v4();
+        let execution = TerminalExecutionRef {
+            session_id: uuid::Uuid::new_v4(),
+            pane_id: uuid::Uuid::new_v4(),
+            execution_token: secret,
+        };
+        let request = SendRequest {
+            execution: execution.clone(),
+            data: vec![0, 255],
+        };
+        let grant = AttachGrant {
+            token: secret,
+            session_id: execution.session_id,
+            context_id: None,
+            expires_epoch_ms: 42,
+        };
+        let open = AttachOpenRequest {
+            session_id: execution.session_id,
+            attach_token: secret,
+        };
+        for debug in [
+            format!("{execution:?}"),
+            format!("{request:?}"),
+            format!("{grant:?}"),
+            format!("{open:?}"),
+        ] {
+            assert!(!debug.contains(&secret.to_string()));
+            assert!(debug.contains("[REDACTED]"));
+        }
+        assert_eq!(
+            serde_json::to_value(&execution).unwrap()["execution_token"],
+            secret.to_string()
+        );
+        assert_eq!(
+            serde_json::to_value(&grant).unwrap()["token"],
+            secret.to_string()
+        );
+        assert_eq!(
+            serde_json::to_value(&open).unwrap()["attach_token"],
+            secret.to_string()
+        );
+        // Compare against the unannotated, named-field wire representation.
+        let expected = bmux_codec::to_vec(&WireExecutionRef {
+            session_id: execution.session_id,
+            pane_id: execution.pane_id,
+            execution_token: secret,
+        })
+        .unwrap();
+        assert_eq!(bmux_codec::to_vec(&execution).unwrap(), expected);
+        let decoded: TerminalExecutionRef = bmux_codec::from_bytes(&expected).unwrap();
+        assert_eq!(decoded, execution);
+    }
+
+    #[test]
     fn program_execution_contract_keeps_literal_binary_input_and_identity() {
         use super::pane_runtime_execution_v4::{TerminalExecutionRef, client::SendRequest};
         let execution = TerminalExecutionRef {

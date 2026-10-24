@@ -298,7 +298,7 @@ impl ConfigPaths {
     /// Returns an error if any directory cannot be created.
     pub fn ensure_dirs(&self) -> std::io::Result<()> {
         std::fs::create_dir_all(&self.config_dir)?;
-        std::fs::create_dir_all(&self.runtime_dir)?;
+        create_runtime_dir(&self.runtime_dir)?;
         std::fs::create_dir_all(&self.data_dir)?;
         std::fs::create_dir_all(self.state_dir())?;
         std::fs::create_dir_all(self.recordings_dir())?;
@@ -307,6 +307,37 @@ impl ConfigPaths {
         std::fs::create_dir_all(self.logs_dir())?;
         Ok(())
     }
+}
+
+fn default_runtime_root(xdg_runtime_dir: Option<&std::ffi::OsStr>) -> PathBuf {
+    #[cfg(unix)]
+    {
+        if let Some(path) = xdg_runtime_dir.filter(|path| !path.is_empty()) {
+            return PathBuf::from(path).join("bmux");
+        }
+        // Do not use USER/UID environment variables as an identity boundary.
+        // SAFETY: geteuid has no preconditions.
+        let uid = unsafe { libc::geteuid() };
+        std::env::temp_dir().join(format!("bmux-{uid}"))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = xdg_runtime_dir;
+        std::env::temp_dir().join("bmux")
+    }
+}
+
+fn create_runtime_dir(path: &std::path::Path) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        builder.mode(0o700);
+    }
+    // Existing directories are deliberately not chmod/chowned. The IPC bind
+    // boundary validates ownership, ancestors, symlinks and private mode.
+    builder.create(path)
 }
 
 fn sanitize_endpoint_component(value: &str) -> String {
@@ -484,15 +515,7 @@ impl ConfigPaths {
         );
 
         let runtime_root = runtime_dir_override.map_or_else(
-            || {
-                if cfg!(unix) {
-                    std::env::var("XDG_RUNTIME_DIR")
-                        .map(PathBuf::from)
-                        .map_or_else(|_| std::env::temp_dir().join("bmux"), |d| d.join("bmux"))
-                } else {
-                    std::env::temp_dir().join("bmux")
-                }
-            },
+            || default_runtime_root(std::env::var_os("XDG_RUNTIME_DIR").as_deref()),
             PathBuf::from,
         );
         let runtime_dir = if runtime_name == "default" {
@@ -616,6 +639,52 @@ mod tests {
         );
         paths.config_dir_candidates = candidates;
         paths
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_default_is_user_scoped_and_xdg_is_unchanged() {
+        // SAFETY: geteuid has no preconditions.
+        let uid = unsafe { libc::geteuid() };
+        assert_eq!(
+            super::default_runtime_root(None),
+            std::env::temp_dir().join(format!("bmux-{uid}"))
+        );
+        assert_eq!(
+            super::default_runtime_root(Some(std::ffi::OsStr::new("/run/user/123"))),
+            PathBuf::from("/run/user/123/bmux")
+        );
+        assert_eq!(
+            super::default_runtime_root(Some(std::ffi::OsStr::new(""))),
+            super::default_runtime_root(None)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_creation_is_private_and_does_not_repair_existing_modes() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = std::env::temp_dir().join(format!(
+            "bmux-config-runtime-mode-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let runtime = root.join("runtime");
+        super::create_runtime_dir(&runtime).unwrap();
+        assert_eq!(
+            std::fs::metadata(&runtime).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o755)).unwrap();
+        super::create_runtime_dir(&runtime).unwrap();
+        assert_eq!(
+            std::fs::metadata(&runtime).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

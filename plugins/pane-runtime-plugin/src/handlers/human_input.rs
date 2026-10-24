@@ -38,7 +38,13 @@ pub(crate) fn push(
     data: Vec<u8>,
 ) -> Result<HumanInputAck, HumanInputError> {
     authorize(ctx, &stream.execution)?;
-    crate::runtime::human_input::push(stream, sequence, data)
+    crate::runtime::human_input::push(
+        stream,
+        sequence,
+        data,
+        super::execution::input_authority(ctx, &stream.execution)
+            .map_err(|error| HumanInputError::Authority { error })?,
+    )
 }
 
 pub(crate) fn close(

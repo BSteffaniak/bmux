@@ -5,6 +5,7 @@ mod durable_capture;
 mod environment;
 pub(crate) mod execution;
 pub(crate) mod human_input;
+pub(crate) mod input_authority;
 pub(crate) mod live_presentation;
 pub(crate) mod reservations;
 mod startup_capture;
@@ -1649,18 +1650,24 @@ struct PaneRuntimeHandle {
     image_dirty: Arc<AtomicBool>,
 }
 
-enum PaneRuntimeCommand {
+pub(crate) enum PaneRuntimeCommand {
     AdmittedInput(
         Vec<u8>,
         std::sync::mpsc::SyncSender<Result<(), String>>,
         tokio::sync::OwnedSemaphorePermit,
+        input_authority::InputAuthority,
     ),
-    GuardedInput(Vec<u8>, tokio::sync::OwnedSemaphorePermit),
+    GuardedInput(
+        Vec<u8>,
+        tokio::sync::OwnedSemaphorePermit,
+        input_authority::InputAuthority,
+    ),
     GuardedResize {
         rows: u16,
         cols: u16,
         _permit: tokio::sync::OwnedSemaphorePermit,
     },
+    AuthorizedInput(Vec<u8>, input_authority::InputAuthority),
     Input(Vec<u8>),
     Resize {
         rows: u16,
@@ -3338,7 +3345,7 @@ impl PaneInputHandle {
             return Err(SessionRuntimeError::Closed);
         }
         self.input_tx
-            .send(PaneRuntimeCommand::Input(data))
+            .send(input_authority::local_command(data, self.session_id))
             .map_err(|_| SessionRuntimeError::Closed)
     }
 }
@@ -3352,9 +3359,13 @@ impl PaneRuntimeHandle {
         }
     }
 
-    fn send_input(&self, data: Vec<u8>) -> std::result::Result<(), SessionRuntimeError> {
+    fn send_input(
+        &self,
+        data: Vec<u8>,
+        session_id: SessionId,
+    ) -> std::result::Result<(), SessionRuntimeError> {
         self.input_tx
-            .send(PaneRuntimeCommand::Input(data))
+            .send(input_authority::local_command(data, session_id))
             .map_err(|_| SessionRuntimeError::Closed)
     }
 
@@ -7453,16 +7464,31 @@ impl SessionRuntimeManager {
                     }
                     input = input_rx.recv() => {
                         let (input, _permit) = match input {
-                            Some(PaneRuntimeCommand::GuardedInput(bytes, permit)) =>
-                                (Some(PaneRuntimeCommand::Input(bytes)), Some(permit)),
+                            Some(PaneRuntimeCommand::GuardedInput(bytes, permit, authority)) => {
+                                // Keep the bounded admission permit through the actual write.
+                                let _permit = permit;
+                                if let Ok(mut writer) = writer.lock() {
+                                    // Denial drops this chunk; never replay uncertain input.
+                                    let _ = authority.write(&mut *writer, &bytes);
+                                }
+                                continue;
+                            }
                             Some(PaneRuntimeCommand::GuardedResize { rows, cols, _permit: permit }) =>
                                 (Some(PaneRuntimeCommand::Resize { rows, cols }), Some(permit)),
                             other => (other, None),
                         };
                         match input {
-                            Some(PaneRuntimeCommand::AdmittedInput(bytes, acknowledgement, _permit)) => {
-                                let result = writer.lock().map_err(|_| "PTY writer lock poisoned".to_string()).and_then(|mut writer| writer.write_all(&bytes).and_then(|()| writer.flush()).map_err(|error| error.to_string()));
+                            Some(PaneRuntimeCommand::AdmittedInput(bytes, acknowledgement, _permit, authority)) => {
+                                let result = writer.lock().map_err(|_| "PTY writer lock poisoned".to_string()).and_then(|mut writer| authority.write(&mut *writer, &bytes).map_err(|error| error.to_string()));
                                 let _ = acknowledgement.send(result);
+                            }
+                            Some(PaneRuntimeCommand::AuthorizedInput(bytes, authority)) => {
+                                if !execution_for_task.terminal_session_ended.load(Ordering::SeqCst)
+                                    && !execution_for_task.terminal_owner_retired.load(Ordering::SeqCst)
+                                    && let Ok(mut writer) = writer.lock()
+                                {
+                                    let _ = authority.write(&mut *writer, &bytes);
+                                }
                             }
                             Some(PaneRuntimeCommand::Input(bytes)) => {
                                 if let Ok(mut writer) = writer.lock()
@@ -9185,7 +9211,7 @@ impl SessionRuntimeManager {
         let recording_data =
             crate::private_input::with_capture_barrier(focused_pane_id, |capture| {
                 let recording_data = capture.then(|| pane_input_recording_data(&data)).flatten();
-                pane.send_input(data)?;
+                pane.send_input(data, owner_session_id)?;
                 if let Some((handle, data)) = recording_data {
                     record_pane_input_raw(
                         &handle,

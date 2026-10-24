@@ -75,7 +75,7 @@ impl SandboxServer {
         let (paths, root_dir) = if let Some(root) = std::env::var_os("BMUX_PLAYBOOK_MANAGED_ROOT") {
             let root = PathBuf::from(root).join("sandbox");
             anyhow::ensure!(root.is_absolute(), "managed sandbox root must be absolute");
-            std::fs::create_dir(&root)
+            create_private_directory(&root)
                 .context("managed sandbox root already exists or cannot be created")?;
             let runtime = std::env::var_os("BMUX_PLAYBOOK_MANAGED_RUNTIME_DIR")
                 .map(PathBuf::from)
@@ -89,7 +89,10 @@ impl SandboxServer {
                 root,
             )
         } else {
-            create_temp_paths()
+            let (paths, root) = create_temp_paths();
+            create_private_directory(&root)?;
+            create_private_directory(&paths.runtime_dir)?;
+            (paths, root)
         };
         write_sandbox_config(
             &paths,
@@ -279,6 +282,17 @@ impl Drop for SandboxServer {
 }
 
 // ── Temp directory creation ──────────────────────────────────────────────────
+
+fn create_private_directory(path: &Path) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        builder.mode(0o700);
+    }
+    // Exclusive creation: never adopt, follow or repair an existing root.
+    builder.create(path)
+}
 
 fn create_temp_paths() -> (ConfigPaths, PathBuf) {
     let nanos = SystemTime::now()
@@ -804,6 +818,34 @@ impl ServerHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn private_sandbox_creation_does_not_repair_or_follow_existing_paths() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("sandbox");
+        create_private_directory(&directory).unwrap();
+        assert_eq!(
+            std::fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(create_private_directory(&directory).is_err());
+        assert_eq!(
+            std::fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        let alias = root.path().join("alias");
+        std::os::unix::fs::symlink(&directory, &alias).unwrap();
+        assert!(create_private_directory(&alias).is_err());
+        assert!(
+            std::fs::symlink_metadata(alias)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
 
     fn test_timestamp_millis() -> u128 {
         SystemTime::now()

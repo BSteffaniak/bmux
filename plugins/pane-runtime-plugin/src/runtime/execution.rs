@@ -420,7 +420,6 @@ pub(crate) fn status(reference: &ExecutionRef) -> Result<ExecutionStatus, Execut
             .clone()
             .or_else(|| pane.execution.capture_failure());
         tracing::debug!(
-            execution_token = %reference.execution_token,
             exit_code = ?outcome.0,
             signal = ?outcome.1,
             exited = pane.exited.load(Ordering::SeqCst),
@@ -871,7 +870,45 @@ async fn rollback_prepared(
     }
 }
 
-pub(crate) fn send(reference: &ExecutionRef, data: Vec<u8>) -> Result<(), ExecutionError> {
+fn queued_input_authority(
+    pane: &super::PaneRuntimeHandle,
+    authority: super::input_authority::InputAuthority,
+    deadline: Option<std::time::Instant>,
+) -> super::input_authority::InputAuthority {
+    let execution = Arc::clone(&pane.execution);
+    let exited = Arc::clone(&pane.exited);
+    let generation = Arc::clone(&pane.resurrection_state);
+    let token = generation
+        .lock()
+        .ok()
+        .map(|state| state.observation_execution);
+    super::input_authority::InputAuthority::new(move || {
+        authority.check().map_err(|error| error.to_string())?;
+        let current = generation
+            .lock()
+            .map_err(|_| "execution identity poisoned".to_string())?
+            .observation_execution;
+        if token != Some(current) {
+            return Err("queued input execution replaced".into());
+        }
+        if exited.load(Ordering::SeqCst)
+            || execution.terminal_session_ended.load(Ordering::SeqCst)
+            || execution.terminal_owner_retired.load(Ordering::SeqCst)
+            || execution.capture_failure().is_some()
+            || deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline)
+        {
+            return Err("queued input authority ended".into());
+        }
+        Ok(())
+    })
+}
+
+pub(crate) fn send(
+    reference: &ExecutionRef,
+    data: Vec<u8>,
+    authority: super::input_authority::InputAuthority,
+) -> Result<(), ExecutionError> {
+    authority.check().map_err(failed)?;
     if data.len() > 65_536 {
         return Err(ExecutionError::InvalidOptions {
             reason: "send exceeds 65536 bytes".into(),
@@ -884,9 +921,10 @@ pub(crate) fn send(reference: &ExecutionRef, data: Vec<u8>) -> Result<(), Execut
         let permit = Arc::clone(&pane.execution.admission)
             .try_acquire_owned()
             .map_err(failed)?;
+        let authority = queued_input_authority(pane, authority, None);
         let recording = super::pane_input_recording_data(&data);
         pane.input_tx
-            .send(PaneRuntimeCommand::GuardedInput(data, permit))
+            .send(PaneRuntimeCommand::GuardedInput(data, permit, authority))
             .map_err(failed)?;
         if let Some((sink, bytes)) = recording {
             sink.0.record(
@@ -1211,9 +1249,10 @@ async fn await_cleanup_acknowledgement(
 pub(super) fn send_human_recorded_acknowledged(
     reference: &ExecutionRef,
     data: Vec<u8>,
+    authority: super::input_authority::InputAuthority,
 ) -> Result<(), ExecutionError> {
     let sink = super::recording_sink().ok_or_else(|| failed("recording sink unavailable"))?;
-    send_human_acknowledged(reference, data.clone())?;
+    send_human_acknowledged(reference, data.clone(), authority)?;
     // Fresh-effect caller owns deduplication. This enqueue is volatile; failure
     // after PTY write is uncertain and must close the epoch, never replay input.
     let result = sink.0.record_checked(
@@ -1239,19 +1278,22 @@ pub(super) fn send_human_recorded_acknowledged(
 pub(super) fn send_human_acknowledged(
     reference: &ExecutionRef,
     data: Vec<u8>,
+    authority: super::input_authority::InputAuthority,
 ) -> Result<(), ExecutionError> {
     if data.is_empty() || data.len() > 16_384 {
         return Err(ExecutionError::InvalidOptions {
             reason: "human input must contain 1..=16384 bytes".into(),
         });
     }
-    send_acknowledged(reference, data)
+    send_acknowledged(reference, data, authority)
 }
 
 pub(super) fn send_acknowledged(
     reference: &ExecutionRef,
     data: Vec<u8>,
+    authority: super::input_authority::InputAuthority,
 ) -> Result<(), ExecutionError> {
+    authority.check().map_err(failed)?;
     let (sender, receiver) = std::sync::mpsc::sync_channel(1);
     with_pane(reference, |pane| {
         if pane.exited.load(Ordering::SeqCst)
@@ -1263,8 +1305,15 @@ pub(super) fn send_acknowledged(
         let permit = Arc::clone(&pane.execution.admission)
             .try_acquire_owned()
             .map_err(failed)?;
+        let authority = queued_input_authority(
+            pane,
+            authority,
+            Some(std::time::Instant::now() + Duration::from_secs(5)),
+        );
         pane.input_tx
-            .send(PaneRuntimeCommand::AdmittedInput(data, sender, permit))
+            .send(PaneRuntimeCommand::AdmittedInput(
+                data, sender, permit, authority,
+            ))
             .map_err(failed)
     })?;
     receiver

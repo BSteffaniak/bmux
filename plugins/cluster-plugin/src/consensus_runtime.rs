@@ -300,6 +300,15 @@ impl ConsensusNode {
             wait_ms = submission_started.elapsed().as_millis(),
             "consensus membership submission admitted"
         );
+        self.change_voters_locked(voters, None).await
+    }
+
+    async fn change_voters_locked(
+        &self,
+        voters: std::collections::BTreeMap<NodeId, BasicNode>,
+        expected_term: Option<u64>,
+    ) -> Result<ClientWriteResponse<ControlRaftConfig>, ConsensusWriteError> {
+        let submission_started = std::time::Instant::now();
         let authenticated = voters
             .into_iter()
             .map(|(node_id, node)| {
@@ -329,7 +338,8 @@ impl ConsensusNode {
                 return Err(ConsensusWriteError::QuorumUnavailable(error.to_string()));
             }
         }
-        let admission_term = self.current_term();
+        let admission_term = expected_term.unwrap_or_else(|| self.current_term());
+        validate_admission_term(admission_term, self.current_term())?;
         // Retained publication commands/snapshots require their decoder even
         // before activation advances the schema floor. Endpoint authentication
         // does not prove that a newly added learner can consume this history.
@@ -387,6 +397,80 @@ impl ConsensusNode {
         result
     }
 
+    /// Applies a signed exact transition under the membership submission lock.
+    /// # Errors
+    /// Rejects stale authority, unsupported proofs, failed quorum and invalid plans.
+    pub async fn apply_voter_transition(
+        &self,
+        authorization: &bmux_cluster_plugin_api::cluster_types::ConsensusVoterChangeAuthorization,
+        proposed: Vec<bmux_cluster_plugin_api::cluster_types::ClusterMember>,
+    ) -> Result<(), String> {
+        let _submission = self.membership_submission.lock().await;
+        self.linearizable_control_state()
+            .await
+            .map_err(|error| error.to_string())?;
+        let expected_term = self.current_term();
+        let snapshot = self
+            .storage
+            .state_machine()
+            .map_err(|error| error.to_string())?;
+        let committed = snapshot.committed_membership();
+        let effective = self.raft.metrics().borrow().membership_config.clone();
+        if &*effective != committed
+            || !committed
+                .membership()
+                .voter_ids()
+                .any(|id| id.to_string() == authorization.actor_node_id)
+        {
+            return Err("voter-change signer is not a current committed Raft voter".into());
+        }
+        let epoch =
+            membership_epoch(committed).ok_or("committed membership epoch is unavailable")?;
+        let current = snapshot
+            .control_state()
+            .members
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        crate::consensus_membership::verify_voter_change_authorization(
+            authorization,
+            &self.cluster_id,
+            &epoch,
+            &current,
+            &proposed,
+        )?;
+        if authorization.current_members_digest == authorization.proposed_members_digest {
+            // Successful join retry: quorum and signature were checked above.
+            // A metadata entry alone is insufficient evidence of Raft promotion.
+            if !committed
+                .membership()
+                .voter_ids()
+                .any(|id| id.to_string() == authorization.target_node_id)
+            {
+                return Err("acknowledged target is not a committed Raft voter".into());
+            }
+            return Ok(());
+        }
+        let plan =
+            crate::consensus_membership::validate_membership_transition(&current, &proposed)?;
+        crate::consensus_membership::preflight_publication(
+            snapshot.control_state().clone(),
+            &authorization.actor_node_id,
+            &proposed,
+        )?;
+        // Even an identical voter set commits a fresh membership log position.
+        // Replays cannot reuse this epoch, including after removal/re-enrollment.
+        self.change_voters_locked(plan.voters, Some(expected_term))
+            .await
+            .map_err(|error| error.to_string())?;
+        crate::consensus_membership::publish_members_locked(
+            self.clone(),
+            &authorization.actor_node_id,
+            proposed,
+        )
+        .await
+    }
+
     /// Executes a generated control mutation and returns its typed response.
     ///
     /// # Errors
@@ -396,9 +480,17 @@ impl ConsensusNode {
         &self,
         command: bmux_cluster_plugin_api::cluster_types::ControlCommand,
     ) -> Result<ControlResponse, ControlServiceError> {
+        let _submission = self.membership_submission.lock().await;
+        self.mutate_locked(command).await
+    }
+
+    pub(crate) async fn mutate_locked(
+        &self,
+        command: bmux_cluster_plugin_api::cluster_types::ControlCommand,
+    ) -> Result<ControlResponse, ControlServiceError> {
         let command_id = command.command_id.clone();
         let encoded = crate::control_codec::encode_control_command(&command);
-        Self::decode_write_response(&command_id, self.write(encoded).await)
+        Self::decode_write_response(&command_id, self.write_locked(encoded).await)
     }
 
     /// Activates one durable schema feature after membership eligibility checks.
@@ -599,8 +691,18 @@ impl ConsensusNode {
     pub async fn read_linearizable_view(&self) -> Result<ControlStateView, ControlServiceError> {
         self.linearizable_control_state()
             .await
-            .map(|state| state.to_view(ControlReadConsistency::Linearizable))
-            .map_err(control_read_error)
+            .map_err(control_read_error)?;
+        let snapshot =
+            self.storage
+                .state_machine()
+                .map_err(|error| ControlServiceError::Internal {
+                    reason: error.to_string(),
+                })?;
+        let mut view = snapshot
+            .control_state()
+            .to_view(ControlReadConsistency::Linearizable);
+        view.membership_epoch = membership_epoch(snapshot.committed_membership());
+        Ok(view)
     }
 
     /// Returns an explicitly stale generated state view.
@@ -624,6 +726,14 @@ impl ConsensusNode {
     /// errors, or fatal Raft failures. A command is never replayed internally
     /// after dispatch.
     pub async fn write(
+        &self,
+        command: Vec<u8>,
+    ) -> Result<ClientWriteResponse<ControlRaftConfig>, ConsensusWriteError> {
+        let _submission = self.membership_submission.lock().await;
+        self.write_locked(command).await
+    }
+
+    async fn write_locked(
         &self,
         command: Vec<u8>,
     ) -> Result<ClientWriteResponse<ControlRaftConfig>, ConsensusWriteError> {
@@ -747,6 +857,15 @@ fn consensus_config(cluster_id: &str) -> Result<Arc<Config>, ConsensusRuntimeErr
     .validate()
     .map_err(|error| ConsensusRuntimeError::Configuration(error.to_string()))?;
     Ok(Arc::new(config))
+}
+
+fn membership_epoch(membership: &openraft::StoredMembership<NodeId, BasicNode>) -> Option<String> {
+    membership.log_id().map(|log| {
+        format!(
+            "{}:{}:{}",
+            log.leader_id.term, log.leader_id.node_id, log.index
+        )
+    })
 }
 
 #[cfg(test)]
@@ -1828,6 +1947,221 @@ pub(crate) mod tests {
                 .bootstrap_principal(conflict, revision)
                 .await
                 .is_err()
+        );
+        recovered.shutdown().await.unwrap();
+    }
+
+    // Keep the complete add/remove/restart scenario together so epoch and
+    // authority assertions remain adjacent to the operations they protect.
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn signed_voter_transitions_commit_and_replay_fails_after_restart() {
+        use crate::consensus_membership::{authorize_voter_change, removal_plan};
+        use crate::membership::{
+            ClusterId, NodeIdentity, initializer_capabilities, issue_test_member,
+        };
+        use bmux_cluster_plugin_api::cluster_types::ConsensusVoterChangeAction;
+        let roots = [TempDir::new().unwrap(), TempDir::new().unwrap()];
+        let identities = [
+            NodeIdentity::new_for_test(91),
+            NodeIdentity::new_for_test(92),
+        ];
+        let ids = [*identities[0].node_id(), *identities[1].node_id()];
+        let endpoints = ["tls://127.0.0.1:49991", "tls://127.0.0.1:49992"];
+        let cluster: ClusterId = "cluster:00000000-0000-0000-0000-000000000091"
+            .parse()
+            .unwrap();
+        let network = InMemoryNetworkFactory::default();
+        let mut nodes = Vec::new();
+        for index in 0..2 {
+            let node = ConsensusNode::start(
+                roots[index].path(),
+                &cluster.to_string(),
+                ids[index],
+                network.clone(),
+            )
+            .await
+            .unwrap();
+            network.register(
+                ids[index],
+                BasicNode::new(endpoints[index]),
+                node.raft().clone(),
+            );
+            nodes.push(node);
+        }
+        nodes[0]
+            .initialize_single(ids[0], endpoints[0])
+            .await
+            .unwrap();
+        wait_for_leader(&[&nodes[0]]).await;
+        let current = vec![issue_test_member(
+            &identities[0],
+            cluster,
+            &identities[0],
+            endpoints[0],
+            initializer_capabilities(),
+            crate::now_unix_ms(),
+        )];
+        crate::consensus_membership::publish_members(
+            nodes[0].clone(),
+            &ids[0].to_string(),
+            current.clone(),
+        )
+        .await
+        .unwrap();
+        let target = issue_test_member(
+            &identities[0],
+            cluster,
+            &identities[1],
+            endpoints[1],
+            initializer_capabilities(),
+            crate::now_unix_ms(),
+        );
+        let proposed = vec![current[0].clone(), target];
+        let epoch = nodes[0]
+            .read_linearizable_view()
+            .await
+            .unwrap()
+            .membership_epoch
+            .unwrap();
+        let add = authorize_voter_change(
+            &cluster.to_string(),
+            ConsensusVoterChangeAction::Add,
+            &ids[1].to_string(),
+            &identities[0],
+            &epoch,
+            &current,
+            &proposed,
+        )
+        .unwrap();
+        let mut altered = proposed.clone();
+        altered[1].endpoint = Some("tls://127.0.0.1:49993".into());
+        assert!(
+            nodes[0]
+                .apply_voter_transition(&add, altered)
+                .await
+                .is_err()
+        );
+        assert_eq!(nodes[0].committed_voter_ids(), BTreeSet::from([ids[0]]));
+        let wire = bmux_plugin_sdk::encode_service_message(
+            &bmux_cluster_plugin_api::cluster_command::client::ConsensusReconcileMembersRequest {
+                members: proposed.clone(),
+                authorization: add.clone(),
+            },
+        )
+        .unwrap();
+        let request: bmux_cluster_plugin_api::cluster_command::client::ConsensusReconcileMembersRequest =
+            bmux_plugin_sdk::decode_service_message(&wire).unwrap();
+        nodes[0]
+            .apply_voter_transition(&request.authorization, request.members)
+            .await
+            .unwrap();
+        assert_eq!(nodes[0].committed_voter_ids(), BTreeSet::from(ids));
+        assert!(
+            nodes[0]
+                .apply_voter_transition(&add, proposed.clone())
+                .await
+                .is_err()
+        );
+        let promoted = nodes[0].read_linearizable_view().await.unwrap();
+        let acknowledgement = authorize_voter_change(
+            &cluster.to_string(),
+            ConsensusVoterChangeAction::Add,
+            &ids[1].to_string(),
+            &identities[0],
+            promoted.membership_epoch.as_deref().unwrap(),
+            &promoted.members,
+            &promoted.members,
+        )
+        .unwrap();
+        nodes[0]
+            .apply_voter_transition(&acknowledgement, promoted.members.clone())
+            .await
+            .unwrap();
+        let acknowledged = nodes[0].read_linearizable_view().await.unwrap();
+        assert_eq!(acknowledged.membership_epoch, promoted.membership_epoch);
+        assert_eq!(acknowledged.revision, promoted.revision);
+        let removed = removal_plan(&proposed, &ids[1].to_string()).unwrap();
+        let epoch = nodes[0]
+            .read_linearizable_view()
+            .await
+            .unwrap()
+            .membership_epoch
+            .unwrap();
+        let remove = authorize_voter_change(
+            &cluster.to_string(),
+            ConsensusVoterChangeAction::Remove,
+            &ids[1].to_string(),
+            &identities[0],
+            &epoch,
+            &proposed,
+            &removed,
+        )
+        .unwrap();
+        nodes[0]
+            .apply_voter_transition(&remove, removed.clone())
+            .await
+            .unwrap();
+        assert_eq!(nodes[0].committed_voter_ids(), BTreeSet::from([ids[0]]));
+        let committed = nodes[0].read_linearizable_view().await.unwrap();
+        let expected_digest = crate::control_codec::canonical_members_digest(&removed).unwrap();
+        assert_eq!(
+            crate::control_codec::canonical_members_digest(&committed.members).unwrap(),
+            expected_digest,
+        );
+        assert_ne!(
+            committed.membership_epoch.as_deref(),
+            Some(add.membership_epoch.as_str())
+        );
+        assert_ne!(
+            committed.membership_epoch.as_deref(),
+            Some(remove.membership_epoch.as_str())
+        );
+        for node in &nodes {
+            node.shutdown().await.unwrap();
+        }
+        for id in ids {
+            network.unregister(id);
+        }
+        drop(nodes);
+        let recovered = ConsensusNode::start(
+            roots[0].path(),
+            &cluster.to_string(),
+            ids[0],
+            network.clone(),
+        )
+        .await
+        .unwrap();
+        network.register(
+            ids[0],
+            BasicNode::new(endpoints[0]),
+            recovered.raft().clone(),
+        );
+        wait_for_leader(&[&recovered]).await;
+        let restored = recovered.read_linearizable_view().await.unwrap();
+        assert_eq!(restored.membership_epoch, committed.membership_epoch);
+        assert_eq!(restored.revision, committed.revision);
+        assert_eq!(recovered.committed_voter_ids(), BTreeSet::from([ids[0]]));
+        assert_eq!(
+            crate::control_codec::canonical_members_digest(&restored.members).unwrap(),
+            expected_digest,
+        );
+        for (authorization, plan) in [(&add, proposed), (&remove, removed)] {
+            let error = recovered
+                .apply_voter_transition(authorization, plan)
+                .await
+                .unwrap_err();
+            assert!(
+                error.contains("stale epoch"),
+                "unexpected replay rejection: {error}"
+            );
+        }
+        let unchanged = recovered.read_linearizable_view().await.unwrap();
+        assert_eq!(unchanged.membership_epoch, restored.membership_epoch);
+        assert_eq!(unchanged.revision, restored.revision);
+        assert_eq!(
+            crate::control_codec::canonical_members_digest(&unchanged.members).unwrap(),
+            expected_digest,
         );
         recovered.shutdown().await.unwrap();
     }

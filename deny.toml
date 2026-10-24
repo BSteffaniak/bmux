@@ -73,13 +73,9 @@ ignore = [
     { id = "RUSTSEC-2023-0089", reason = "atomic-polyfill unmaintained — transitive dep, no direct replacement available" },
     { id = "RUSTSEC-2025-0141", reason = "bincode unmaintained — transitive dep via portable-pty" },
     { id = "RUSTSEC-2021-0153", reason = "encoding unmaintained — transitive dep via portable-pty" },
-    { id = "RUSTSEC-2021-0078", reason = "hyper Content-Length smuggling — transitive dep via old hyper version in portable-pty" },
-    { id = "RUSTSEC-2021-0079", reason = "hyper Transfer-Encoding overflow — transitive dep via old hyper version in portable-pty" },
-    { id = "RUSTSEC-2024-0421", reason = "idna Punycode issue — transitive dep, awaiting upstream update" },
     { id = "RUSTSEC-2024-0436", reason = "paste unmaintained — transitive dep, no action needed" },
     { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile unmaintained — migration to rustls-pem planned" },
     { id = "RUSTSEC-2023-0081", reason = "safemem unmaintained — transitive dep via portable-pty" },
-    { id = "RUSTSEC-2020-0071", reason = "time potential segfault — transitive dep, not using affected code path" },
     { id = "RUSTSEC-2021-0144", reason = "traitobject unmaintained — transitive dep via portable-pty" },
     { id = "RUSTSEC-2024-0320", reason = "yaml-rust unmaintained — transitive dep via portable-pty" },
 ]

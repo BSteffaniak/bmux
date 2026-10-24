@@ -1,3 +1,7 @@
+#[cfg(unix)]
+#[path = "unix_security.rs"]
+mod unix_security;
+
 use crate::frame::{
     FrameDecodeError, FrameEncodeError, decode_frame_compressed, decode_frame_exact, encode_frame,
     encode_frame_compressed,
@@ -95,16 +99,28 @@ pub enum IpcTransportError {
 impl LocalIpcListener {
     /// Bind a local listener for the provided endpoint.
     ///
+    /// On Unix the immediate parent must be owned by the effective user, have
+    /// mode 0700, and not be a symlink. Missing parents are created privately. Existing insecure
+    /// directories are rejected, never repaired; stop an old runtime before
+    /// explicitly migrating its directory or choosing a new private runtime.
+    /// Socket mode is 0600. Ancestors must prevent other users replacing it.
+    ///
     /// # Errors
     ///
-    /// Returns an error when the endpoint is unsupported on this platform or
-    /// the listener cannot be created.
+    /// Returns an error when the endpoint is unsupported on this platform,
+    /// its directory is insecure, or the listener cannot be created.
     pub fn bind(endpoint: &IpcEndpoint) -> Result<Self, IpcTransportError> {
         #[cfg(unix)]
         {
             if let IpcEndpoint::UnixSocket(path) = endpoint {
                 prepare_unix_socket_path(path)?;
                 let listener = tokio::net::UnixListener::bind(path)?;
+                // The validated private parent prevents access before chmod.
+                // Never change the process-wide umask in a multithreaded host.
+                {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+                }
                 return Ok(Self {
                     inner: ListenerInner::Unix(listener),
                 });
@@ -139,6 +155,7 @@ impl LocalIpcListener {
             #[cfg(unix)]
             ListenerInner::Unix(listener) => {
                 let (stream, _) = listener.accept().await?;
+                unix_security::verify_peer(&stream)?;
                 Ok(LocalIpcStream {
                     inner: StreamInner::Unix(stream),
                 })
@@ -436,6 +453,7 @@ impl LocalIpcStream {
         {
             if let IpcEndpoint::UnixSocket(path) = endpoint {
                 let stream = tokio::net::UnixStream::connect(path).await?;
+                unix_security::verify_peer(&stream)?;
                 return Ok(Self {
                     inner: StreamInner::Unix(stream),
                 });
@@ -756,9 +774,7 @@ where
 
 #[cfg(unix)]
 fn prepare_unix_socket_path(path: &Path) -> Result<(), std::io::Error> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
+    unix_security::prepare_parent(path)?;
     // Binding owns the name atomically. Never unlink an existing name: a failed
     // connect is not proof that its listener is dead (backlog, startup and
     // permission failures are indistinguishable). Explicit recovery belongs to
@@ -773,10 +789,121 @@ mod tests {
     use uuid::Uuid;
 
     #[cfg(unix)]
+    struct PrivateTestDir(std::path::PathBuf);
+
+    #[cfg(unix)]
+    impl PrivateTestDir {
+        fn new() -> Self {
+            use std::os::unix::fs::DirBuilderExt as _;
+            // Keep Unix socket names within macOS's shorter sun_path limit.
+            let path =
+                std::path::PathBuf::from("/tmp").join(format!("bmux-ipc-{}", Uuid::new_v4()));
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&path)
+                .unwrap();
+            Self(path)
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for PrivateTestDir {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn peer_uid_requires_exact_known_identity() {
+        assert!(super::unix_security::require_uid(Some(123), 123).is_ok());
+        assert!(super::unix_security::require_uid(Some(124), 123).is_err());
+        assert!(super::unix_security::require_uid(None, 123).is_err());
+        assert!(super::unix_security::require_uid(Some(0), 123).is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn private_directory_and_socket_modes_allow_same_user() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let directory = PrivateTestDir::new();
+        let parent = directory.0.join("nested").join("private");
+        let path = parent.join("ipc.sock");
+        let endpoint = IpcEndpoint::unix_socket(&path);
+        let listener = LocalIpcListener::bind(&endpoint).unwrap();
+        assert_eq!(
+            std::fs::metadata(&parent).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let client = LocalIpcStream::connect(&endpoint).await.unwrap();
+        let accepted = listener.accept().await.unwrap();
+        drop((client, accepted));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn insecure_parent_modes_are_rejected_without_repair() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let directory = PrivateTestDir::new();
+        let path = directory.0.join("ipc.sock");
+        for mode in [0o755, 0o770, 0o777, 0o1700 | 0o077] {
+            std::fs::set_permissions(&directory.0, std::fs::Permissions::from_mode(mode)).unwrap();
+            assert!(LocalIpcListener::bind(&IpcEndpoint::unix_socket(&path)).is_err());
+            assert!(!path.exists());
+            assert_eq!(
+                std::fs::metadata(&directory.0)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o7777,
+                mode
+            );
+        }
+        std::fs::set_permissions(&directory.0, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlink_parent_is_rejected_without_touching_target() {
+        let directory = PrivateTestDir::new();
+        let target = PrivateTestDir::new();
+        let link = directory.0.join("alias");
+        std::os::unix::fs::symlink(&target.0, &link).unwrap();
+        let endpoint = IpcEndpoint::unix_socket(link.join("ipc.sock"));
+        assert!(LocalIpcListener::bind(&endpoint).is_err());
+        assert!(!target.0.join("ipc.sock").exists());
+        assert!(
+            std::fs::symlink_metadata(link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn writable_ancestor_is_rejected_before_child_creation() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let directory = PrivateTestDir::new();
+        std::fs::set_permissions(&directory.0, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let parent = directory.0.join("child");
+        assert!(
+            LocalIpcListener::bind(&IpcEndpoint::unix_socket(parent.join("ipc.sock"))).is_err()
+        );
+        assert!(!parent.exists());
+        std::fs::set_permissions(&directory.0, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn drop_closes_only_owned_descriptor_and_preserves_pathname() {
         use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
-        let socket_path = std::env::temp_dir().join(format!("bmux-ipc-{}.sock", Uuid::new_v4()));
+        let directory = PrivateTestDir::new();
+        let socket_path = directory.0.join("ipc.sock");
         let endpoint = IpcEndpoint::unix_socket(&socket_path);
         let listener = LocalIpcListener::bind(&endpoint).unwrap();
         let super::ListenerInner::Unix(socket) = &listener.inner;
@@ -801,7 +928,8 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn old_listener_drop_preserves_replacement_endpoint() {
-        let path = std::env::temp_dir().join(format!("bmux-ipc-{}.sock", Uuid::new_v4()));
+        let directory = PrivateTestDir::new();
+        let path = directory.0.join("ipc.sock");
         let endpoint = IpcEndpoint::unix_socket(&path);
         let old = LocalIpcListener::bind(&endpoint).unwrap();
         std::fs::remove_file(&path).unwrap();
@@ -820,7 +948,8 @@ mod tests {
         // inject into: generic drop performs no filesystem mutation at all.
         // Replace the pathname before drop with each possible collision kind.
         for replacement_is_symlink in [false, true] {
-            let path = std::env::temp_dir().join(format!("bmux-ipc-{}.sock", Uuid::new_v4()));
+            let directory = PrivateTestDir::new();
+            let path = directory.0.join("ipc.sock");
             let target = path.with_extension("target");
             let listener = LocalIpcListener::bind(&IpcEndpoint::unix_socket(&path)).unwrap();
             std::fs::remove_file(&path).unwrap();
@@ -849,7 +978,8 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn concurrent_binders_have_exactly_one_winner() {
-        let path = std::env::temp_dir().join(format!("bmux-ipc-{}.sock", Uuid::new_v4()));
+        let directory = PrivateTestDir::new();
+        let path = directory.0.join("ipc.sock");
         let endpoint = IpcEndpoint::unix_socket(&path);
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
         let handle = tokio::runtime::Handle::current();
@@ -875,7 +1005,8 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn bind_preserves_live_and_stale_socket_names() {
-        let path = std::env::temp_dir().join(format!("bmux-ipc-{}.sock", Uuid::new_v4()));
+        let directory = PrivateTestDir::new();
+        let path = directory.0.join("ipc.sock");
         let endpoint = IpcEndpoint::unix_socket(&path);
         let listener = LocalIpcListener::bind(&endpoint).unwrap();
         assert!(LocalIpcListener::bind(&endpoint).is_err());
@@ -894,7 +1025,8 @@ mod tests {
     #[tokio::test]
     async fn bind_preserves_files_and_symlinks() {
         use std::os::unix::fs::symlink;
-        let path = std::env::temp_dir().join(format!("bmux-ipc-{}.sock", Uuid::new_v4()));
+        let directory = PrivateTestDir::new();
+        let path = directory.0.join("ipc.sock");
         let target = path.with_extension("target");
         std::fs::write(&target, b"keep").unwrap();
         std::fs::write(&path, b"keep").unwrap();
@@ -934,7 +1066,8 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn unix_transport_roundtrip_between_client_and_server() {
-        let socket_path = std::env::temp_dir().join(format!("bmux-ipc-{}.sock", Uuid::new_v4()));
+        let directory = PrivateTestDir::new();
+        let socket_path = directory.0.join("ipc.sock");
         let endpoint = IpcEndpoint::unix_socket(&socket_path);
 
         let listener = LocalIpcListener::bind(&endpoint).expect("listener should bind");

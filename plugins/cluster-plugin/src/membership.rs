@@ -510,6 +510,7 @@ fn existing_join_result(
         .cloned()
         .ok_or_else(|| "local membership snapshot omits this node".to_string())?;
     Ok(ClusterJoinResult {
+        voter_authorization: None,
         identity: ClusterIdentityResponse {
             cluster_id: Some(cluster_id.to_string()),
             node_id: token.claims.issuer_node_id.clone(),
@@ -1380,6 +1381,7 @@ pub fn local_members(caller: &impl ClusterRuntimeOps) -> Result<ClusterMemberLis
         .map(|state| state.members.into_values().collect())
         .unwrap_or_default();
     Ok(ClusterMemberList {
+        membership_epoch: None,
         cluster_id,
         members,
     })
@@ -2078,6 +2080,7 @@ pub fn redeem_enrollment(
             return Err("enrollment retry does not match the committed member".to_string());
         }
         return Ok(ClusterJoinResult {
+            voter_authorization: None,
             identity: public_identity(
                 cluster_id,
                 &local_identity,
@@ -2120,6 +2123,7 @@ pub fn redeem_enrollment(
         .insert(request.node_id.clone(), member.clone());
     store_membership_state(caller, &state)?;
     Ok(ClusterJoinResult {
+        voter_authorization: None,
         identity: public_identity(
             cluster_id,
             &local_identity,

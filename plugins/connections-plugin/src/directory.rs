@@ -28,8 +28,12 @@ impl LocalRuntime {
         Self { identity, settings }
     }
 
-    pub(crate) const fn ingress_allowed(&self) -> bool {
-        self.settings.allow_full_runtime_ingress
+    pub(crate) fn ingress_enabled(&self, preference: Option<bool>) -> bool {
+        self.settings.ingress_enabled(preference)
+    }
+
+    pub(crate) fn ingress_prohibited(&self) -> bool {
+        self.settings.allow_full_runtime_ingress == Some(false)
     }
 
     pub(crate) const fn auto_start(&self) -> bool {

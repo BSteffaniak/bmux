@@ -278,9 +278,20 @@ fn create_temp_paths() -> (ConfigPaths, PathBuf) {
 }
 
 fn ensure_sandbox_dirs(paths: &ConfigPaths, root_dir: &Path) -> Result<()> {
+    let mut private_dir = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        private_dir.mode(0o700);
+    }
+    // Claim a fresh sandbox root, never adopt or chmod a pre-existing path.
+    private_dir
+        .create(root_dir)
+        .with_context(|| format!("failed creating fresh sandbox {}", root_dir.display()))?;
     std::fs::create_dir_all(&paths.config_dir)
         .with_context(|| format!("failed creating {}", paths.config_dir.display()))?;
-    std::fs::create_dir_all(&paths.runtime_dir)
+    private_dir
+        .create(&paths.runtime_dir)
         .with_context(|| format!("failed creating {}", paths.runtime_dir.display()))?;
     std::fs::create_dir_all(&paths.data_dir)
         .with_context(|| format!("failed creating {}", paths.data_dir.display()))?;
@@ -424,6 +435,27 @@ mod tests {
         .await
         .expect("idle connection should close on shutdown");
         sandbox.shutdown(false).await.expect("shutdown");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sandbox_directories_are_private_and_existing_roots_are_not_repaired() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let (paths, root) = create_temp_paths();
+        ensure_sandbox_dirs(&paths, &root).unwrap();
+        for path in [&root, &paths.runtime_dir] {
+            assert_eq!(
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(ensure_sandbox_dirs(&paths, &root).is_err());
+        assert_eq!(
+            std::fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

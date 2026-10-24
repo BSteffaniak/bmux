@@ -561,7 +561,7 @@ impl<C> ControlServiceHandle<C> {
 
     pub(crate) async fn authoritative_members(
         &self,
-    ) -> Result<Vec<bmux_cluster_plugin_api::cluster_types::ClusterMember>, ControlServiceError>
+    ) -> Result<ControlStateView, ControlServiceError>
     where
         C: ServiceCaller + Send + Sync + 'static,
     {
@@ -577,7 +577,7 @@ impl<C> ControlServiceHandle<C> {
                 }) if tokio::time::Instant::now() < deadline => {
                     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
                 }
-                result => return result.map(|view| view.members),
+                result => return result,
             }
         }
     }
@@ -604,6 +604,20 @@ where
         &self,
         request: bmux_cluster_plugin_api::cluster_types::ControlCommand,
     ) -> Result<ControlResponse, ControlServiceError> {
+        if matches!(
+            &request.request,
+            bmux_cluster_plugin_api::cluster_types::ControlCommandRequest::UpsertMember { .. }
+                | bmux_cluster_plugin_api::cluster_types::ControlCommandRequest::SetMemberState { .. }
+        ) {
+            return Err(ControlServiceError::Rejected {
+                error:
+                    bmux_cluster_plugin_api::cluster_types::ControlCommandError::InvalidTransition {
+                        reason:
+                            "membership metadata requires an authenticated lifecycle transition"
+                                .into(),
+                    },
+            });
+        }
         match self.active()?.mutate(request.clone()).await {
             Err(ControlServiceError::NotLeader {
                 leader_endpoint: Some(endpoint),

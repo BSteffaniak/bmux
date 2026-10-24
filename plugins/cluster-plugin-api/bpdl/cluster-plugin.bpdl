@@ -402,6 +402,7 @@ interface cluster-types {
         schema_version: u16,
         cluster_id: string,
         revision: u64,
+        membership_epoch: string?,
         members: list<cluster-member>,
         workspaces: list<workspace-record>,
         tabs: list<logical-tab-record>,
@@ -468,6 +469,7 @@ interface cluster-types {
 
     record cluster-member-list {
         cluster_id: string?,
+        membership_epoch: string?,
         members: list<cluster-member>,
     }
 
@@ -541,6 +543,7 @@ interface cluster-types {
     }
 
     record cluster-join-result {
+        voter_authorization: consensus-voter-change-authorization?,
         identity: cluster-identity,
         member: cluster-member,
         members: list<cluster-member>,
@@ -579,6 +582,11 @@ interface cluster-types {
     }
 
     record consensus-voter-change-authorization {
+        protocol_version: u16,
+        membership_epoch: string,
+        current_members_digest: bytes,
+        proposed_members_digest: bytes,
+        expires_at_unix_ms: u64,
         cluster_id: string,
         action: consensus-voter-change-action,
         target_node_id: string,

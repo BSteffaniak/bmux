@@ -266,7 +266,15 @@ impl SandboxPaths {
             .with_context(|| format!("failed creating {}", self.config_home.display()))?;
         std::fs::create_dir_all(&self.data_home)
             .with_context(|| format!("failed creating {}", self.data_home.display()))?;
-        std::fs::create_dir_all(&self.runtime_dir)
+        let mut runtime_builder = std::fs::DirBuilder::new();
+        runtime_builder.recursive(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt as _;
+            runtime_builder.mode(0o700);
+        }
+        runtime_builder
+            .create(&self.runtime_dir)
             .with_context(|| format!("failed creating {}", self.runtime_dir.display()))?;
         std::fs::create_dir_all(&self.state_dir)
             .with_context(|| format!("failed creating {}", self.state_dir.display()))?;

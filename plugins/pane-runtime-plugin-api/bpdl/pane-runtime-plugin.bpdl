@@ -127,7 +127,7 @@ interface pane-runtime-execution-v4 {
     record terminal-execution-ref {
         session_id: uuid,
         pane_id: uuid,
-        execution_token: uuid,
+        @secret execution_token: uuid,
     }
     enum terminal-lifecycle { conventional-terminal-session }
     enum terminal-session-end { active, draining, ended, recovery-required }
@@ -368,7 +368,7 @@ interface pane-runtime-spawn-v1 {
     record source-execution {
         session_id: uuid,
         pane_id: uuid,
-        execution_token: uuid,
+        @secret execution_token: uuid,
     }
 
     enum observation-method {
@@ -613,11 +613,11 @@ interface pane-runtime-commands {
     ) -> result<pane-runtime-state.pane-padding-state, pane-command-error>;
 
     record pane-padding-preview-token {
-        token: uuid,
+        @secret token: uuid,
     }
 
     record pane-padding-preview-state {
-        token: uuid,
+        @secret token: uuid,
         pane-ids: list<uuid>,
         padding: pane-runtime-state.pane-padding-spec,
         panes: list<pane-runtime-state.pane-padding-state>,
@@ -634,17 +634,17 @@ interface pane-runtime-commands {
     ) -> result<pane-padding-preview-state, pane-command-error>;
 
     command update-pane-padding-preview(
-        token: uuid,
+        @secret token: uuid,
         pane-ids: list<uuid>,
         padding: pane-runtime-state.pane-padding-spec,
     ) -> result<pane-padding-preview-state, pane-command-error>;
 
     command cancel-pane-padding-preview(
-        token: uuid,
+        @secret token: uuid,
     ) -> result<pane-padding-preview-token, pane-command-error>;
 
     command commit-pane-padding-preview(
-        token: uuid,
+        @secret token: uuid,
         persistence: pane-padding-persistence,
     ) -> result<list<pane-runtime-state.pane-padding-state>, pane-command-error>;
 
@@ -865,7 +865,7 @@ interface attach-runtime-commands {
     // attach grant issued by the AttachTokenManager; client re-presents
     // it on `attach-open`.
     record attach-grant {
-        token: uuid,
+        @secret token: uuid,
         session_id: uuid,
         context_id: uuid?,
         expires_epoch_ms: u64,
@@ -939,7 +939,7 @@ interface attach-runtime-commands {
     // escalate through mutation commands, even after detach. Retired disconnected
     // transport UUIDs alone may be reclaimed; they must never be reused.
     command observer-grant(selector: session-selector) -> result<attach-grant, attach-command-error>;
-    command observer-open(session_id: uuid, attach_token: uuid) -> result<attach-ready, attach-command-error>;
+    command observer-open(session_id: uuid, @secret attach_token: uuid) -> result<attach-ready, attach-command-error>;
 
     command attach-session(
         selector: session-selector,
@@ -953,7 +953,7 @@ interface attach-runtime-commands {
 
     command attach-open(
         session_id: uuid,
-        attach_token: uuid,
+        @secret attach_token: uuid,
     ) -> result<attach-ready, attach-command-error>;
 
     record input-capture-ack-v1 {

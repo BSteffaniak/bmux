@@ -13,7 +13,8 @@ struct Settings {
 pub struct RemoteSettings {
     pub relay: RelayPolicy,
     pub startup_wait_ms: u64,
-    pub allow_full_runtime_ingress: bool,
+    /// None permits an explicit owner CLI opt-in; Some(false) is a hard prohibition.
+    pub allow_full_runtime_ingress: Option<bool>,
     pub bind_addr: Option<std::net::SocketAddr>,
     pub auto_start: bool,
 }
@@ -23,7 +24,7 @@ impl Default for RemoteSettings {
         Self {
             relay: RelayPolicy::Default,
             startup_wait_ms: 5_000,
-            allow_full_runtime_ingress: false,
+            allow_full_runtime_ingress: None,
             bind_addr: None,
             auto_start: false,
         }
@@ -63,6 +64,15 @@ impl RelayPolicy {
 }
 
 impl RemoteSettings {
+    /// Resolve declarative policy before persisted owner preferences.
+    pub(crate) fn ingress_enabled(&self, preference: Option<bool>) -> bool {
+        self.allow_full_runtime_ingress != Some(false)
+            && preference.unwrap_or_else(|| self.allow_full_runtime_ingress == Some(true))
+    }
+
+    pub(crate) fn startup_enabled(&self, preference: Option<bool>) -> bool {
+        self.ingress_enabled(preference) && preference.unwrap_or(self.auto_start)
+    }
     pub(crate) fn load(value: Option<&toml::Value>) -> Result<Self> {
         if let Some(relay) = value
             .and_then(|value| value.get("remote"))
@@ -82,7 +92,7 @@ impl RemoteSettings {
         )?;
         let remote = settings.remote;
         if remote.auto_start
-            && (!remote.allow_full_runtime_ingress
+            && (remote.allow_full_runtime_ingress != Some(true)
                 || remote.bind_addr.is_none_or(|addr| addr.port() == 0))
         {
             bail!("auto_start requires explicit ingress permission and a fixed bind_addr");
@@ -136,6 +146,39 @@ mod tests {
             assert!(load(&format!("[remote.relay]\nmode = '{mode}'")).is_ok());
         }
         assert!(load("[remote.relay]\nmode = 'custom'\nurls = ['https://relay.example']").is_ok());
+    }
+
+    #[test]
+    fn declarative_prohibition_wins_over_persisted_opt_in() {
+        for declared in [None, Some(false), Some(true)] {
+            for preference in [None, Some(false), Some(true)] {
+                for auto_start in [false, true] {
+                    let settings = RemoteSettings {
+                        allow_full_runtime_ingress: declared,
+                        auto_start,
+                        ..RemoteSettings::default()
+                    };
+                    let expected = declared != Some(false)
+                        && preference.unwrap_or_else(|| declared == Some(true));
+                    assert_eq!(settings.ingress_enabled(preference), expected);
+                    assert_eq!(
+                        settings.startup_enabled(preference),
+                        expected && preference.unwrap_or(auto_start)
+                    );
+                }
+            }
+        }
+        assert!(
+            !load("[remote]\nallow_full_runtime_ingress = false")
+                .unwrap()
+                .ingress_enabled(Some(true))
+        );
+        assert!(
+            RemoteSettings::load(None)
+                .unwrap()
+                .ingress_enabled(Some(true))
+        );
+        assert!(!RemoteSettings::load(None).unwrap().ingress_enabled(None));
     }
 
     #[test]

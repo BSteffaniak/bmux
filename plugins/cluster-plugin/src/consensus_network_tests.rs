@@ -342,6 +342,28 @@ async fn follower_forwards_mutations_and_linearizable_reads_once() {
     caller.set_leader(leader_service);
     let follower_service = ControlServiceHandle::new(caller.clone(), follower_id, registry);
 
+    let before = leader.read_linearizable_view().await.unwrap();
+    let mut metadata_bypass = command(99, 999);
+    metadata_bypass.request = ControlCommandRequest::SetMemberState {
+        node_id: before.members[0].node_id.clone(),
+        expected_credential_serial: before.members[0].credential_serial.clone(),
+        state: bmux_cluster_plugin_api::cluster_types::ClusterMemberState::Left,
+    };
+    assert!(matches!(
+        follower_service.mutate(metadata_bypass.clone()).await,
+        Err(bmux_cluster_plugin_api::cluster_types::ControlServiceError::Rejected { .. })
+    ));
+    metadata_bypass.request = ControlCommandRequest::UpsertMember {
+        member: before.members[0].clone(),
+    };
+    assert!(matches!(
+        follower_service.mutate(metadata_bypass).await,
+        Err(bmux_cluster_plugin_api::cluster_types::ControlServiceError::Rejected { .. })
+    ));
+    assert_eq!(
+        leader.read_linearizable_view().await.unwrap().revision,
+        before.revision
+    );
     follower_service.mutate(command(1, 100)).await.unwrap();
     caller
         .drop_next_mutation_response

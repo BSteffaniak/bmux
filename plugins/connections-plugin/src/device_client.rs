@@ -416,6 +416,16 @@ mod tests {
     use bmux_connections_plugin_api::pairing_types::DeviceAccess;
     use std::sync::Arc;
 
+    fn private_runtime_dir(path: &std::path::Path) {
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt as _;
+            builder.mode(0o700);
+        }
+        builder.create(path).unwrap();
+    }
+
     fn direct(builder: iroh::endpoint::Builder) -> iroh::endpoint::Builder {
         builder
             .clear_address_lookup()
@@ -433,7 +443,7 @@ mod tests {
         let state = root.path().join("state");
         let runtime = root.path().join("runtime");
         std::fs::create_dir_all(&state).unwrap();
-        std::fs::create_dir_all(&runtime).unwrap();
+        private_runtime_dir(&runtime);
         let host = RuntimeIdentity::load_or_create(&state, &runtime).unwrap();
         let device = DeviceIdentity::load_or_create(&state, &runtime).unwrap();
         let pairing =
@@ -511,7 +521,7 @@ mod tests {
         let state = root.path().join("state");
         let runtime = root.path().join("runtime");
         std::fs::create_dir_all(&state).unwrap();
-        std::fs::create_dir_all(&runtime).unwrap();
+        private_runtime_dir(&runtime);
         let host = RuntimeIdentity::load_or_create(&state, &runtime).unwrap();
         let device = DeviceIdentity::load_or_create(&state, &runtime).unwrap();
         let pairing =
@@ -1314,7 +1324,7 @@ mod tests {
             root.path().join("state"),
         );
         std::fs::create_dir_all(&paths.state_dir).unwrap();
-        std::fs::create_dir_all(&paths.runtime_dir).unwrap();
+        private_runtime_dir(&paths.runtime_dir);
         let host = RuntimeIdentity::load_or_create(&paths.state_dir, &paths.runtime_dir).unwrap();
         let identity =
             DeviceIdentity::load_or_create(&paths.state_dir, &paths.runtime_dir).unwrap();
@@ -1470,7 +1480,7 @@ mod tests {
         let state = root.path().join("state");
         let runtime = root.path().join("runtime");
         std::fs::create_dir_all(&state).unwrap();
-        std::fs::create_dir_all(&runtime).unwrap();
+        private_runtime_dir(&runtime);
         let host = RuntimeIdentity::load_or_create(&state, &runtime).unwrap();
         let device = DeviceIdentity::load_or_create(&state, &runtime).unwrap();
         let pairing =

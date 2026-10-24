@@ -788,6 +788,34 @@ fn decode_assignment(reader: &mut Reader<'_>) -> Result<ExecutionAssignment, Cod
     })
 }
 
+/// Canonical digest of every member field, sorted by node identity.
+/// # Errors
+/// Rejects duplicate identities and plans exceeding the supported bounds.
+pub fn canonical_members_digest(members: &[ClusterMember]) -> Result<Vec<u8>, String> {
+    if members.len() > MAX_LIST_ITEMS {
+        return Err("membership plan exceeds supported size".into());
+    }
+    let mut members = members.iter().collect::<Vec<_>>();
+    members.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+    if members
+        .windows(2)
+        .any(|pair| pair[0].node_id == pair[1].node_id)
+    {
+        return Err("membership plan contains duplicate identities".into());
+    }
+    let mut writer = Writer::default();
+    writer.raw(b"BMMEM001");
+    writer.u64(members.len() as u64);
+    for member in members {
+        validate_member(member).map_err(|error| error.to_string())?;
+        encode_member(&mut writer, member);
+        if writer.bytes.len() > MAX_BYTES {
+            return Err("membership plan exceeds supported size".into());
+        }
+    }
+    Ok(Sha256::digest(writer.into_bytes()).to_vec())
+}
+
 fn encode_member(writer: &mut Writer, member: &ClusterMember) {
     writer.string(&member.cluster_id);
     writer.string(&member.node_id);

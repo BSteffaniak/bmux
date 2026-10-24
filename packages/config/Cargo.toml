@@ -25,6 +25,9 @@ switchy   = { workspace = true, features = ["fs-native-directories"] }
 thiserror = { workspace = true }
 toml      = { workspace = true, features = ["display", "parse"] }
 
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
 
 [features]
 # Default features

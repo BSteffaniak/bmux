@@ -142,17 +142,22 @@ impl Owner {
             }
         }
         let root = attempts_root.join(format!("playbook-{}", uuid::Uuid::new_v4()));
-        fs::create_dir(&root).map_err(message)?;
+        let mut private_dir = fs::DirBuilder::new();
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).map_err(message)?;
+            use std::os::unix::fs::DirBuilderExt as _;
+            private_dir.mode(0o700);
         }
+        private_dir.create(&root).map_err(message)?;
         let sandbox = root.join("sandbox");
-        let temporary = tempfile::Builder::new()
-            .prefix("bpr-")
-            .tempdir()
-            .map_err(message)?;
+        let mut temporary = tempfile::Builder::new();
+        temporary.prefix("bpr-");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            temporary.permissions(fs::Permissions::from_mode(0o700));
+        }
+        let temporary = temporary.tempdir().map_err(message)?;
         let runtime = temporary.path().to_path_buf();
         // Leave room for the longest currently used socket basename, including
         // server.sock. No alternate runtime is selected when TMPDIR is too deep.
@@ -167,11 +172,7 @@ impl Owner {
                 "selected temporary root cannot accommodate managed Unix socket paths".into(),
             );
         }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).map_err(message)?;
-        }
+        // The temporary runtime was created privately; never chmod it later.
         let snapshot = Attempt {
             generation: self.generation,
             revision: 1,

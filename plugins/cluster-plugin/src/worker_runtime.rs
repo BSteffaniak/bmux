@@ -867,6 +867,7 @@ where
                     format!("authoritative worker lease membership read failed: {error:?}")
                 })?;
         let issuer = members
+            .members
             .iter()
             .find(|member| member.node_id == authority.issuer_node_id)
             .ok_or_else(|| "worker lease issuer is not a cluster member".to_string())?;

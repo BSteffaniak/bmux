@@ -11,24 +11,28 @@ use openraft::BasicNode;
 use sha2::Digest as _;
 use std::collections::BTreeMap;
 
-const VOTER_CHANGE_DOMAIN: &[u8] = b"bmux.cluster.voter-change.v1\0";
+const VOTER_CHANGE_DOMAIN: &[u8] = b"bmux.cluster.voter-change.v2\0";
+const AUTHORIZATION_LIFETIME_MS: u64 = 300_000;
 
-fn authorization_payload(
-    cluster_id: &str,
-    action: ConsensusVoterChangeAction,
-    target_node_id: &str,
-    actor_node_id: &str,
-) -> Result<Vec<u8>, String> {
-    let action = match action {
-        ConsensusVoterChangeAction::Add => b"add".as_slice(),
-        ConsensusVoterChangeAction::Remove => b"remove".as_slice(),
-    };
+fn authorization_payload(auth: &ConsensusVoterChangeAuthorization) -> Result<Vec<u8>, String> {
+    if auth.protocol_version != 2 {
+        return Err(
+            "unsupported voter-change authorization version; upgrade all cluster peers".into(),
+        );
+    }
     let mut payload = VOTER_CHANGE_DOMAIN.to_vec();
     for field in [
-        cluster_id.as_bytes(),
-        action,
-        target_node_id.as_bytes(),
-        actor_node_id.as_bytes(),
+        auth.cluster_id.as_bytes(),
+        match auth.action {
+            ConsensusVoterChangeAction::Add => b"add".as_slice(),
+            ConsensusVoterChangeAction::Remove => b"remove".as_slice(),
+        },
+        auth.target_node_id.as_bytes(),
+        auth.actor_node_id.as_bytes(),
+        auth.membership_epoch.as_bytes(),
+        &auth.current_members_digest,
+        &auth.proposed_members_digest,
+        &auth.expires_at_unix_ms.to_be_bytes(),
     ] {
         let length = u64::try_from(field.len())
             .map_err(|_| "voter-change authorization field is too large".to_string())?;
@@ -38,74 +42,151 @@ fn authorization_payload(
     Ok(payload)
 }
 
-/// Signs one voter-set transition authorization with the local node identity.
-///
+/// Signs an exact transition from one committed membership epoch.
 /// # Errors
-///
-/// Returns an error if canonical authorization encoding fails.
+/// Rejects noncanonical or oversized membership plans.
 pub fn authorize_voter_change(
     cluster_id: &str,
     action: ConsensusVoterChangeAction,
     target_node_id: &str,
     identity: &crate::membership::NodeIdentity,
+    membership_epoch: &str,
+    current: &[ClusterMember],
+    prospective: &[ClusterMember],
 ) -> Result<ConsensusVoterChangeAuthorization, String> {
-    let actor_node_id = identity.node_id().to_string();
-    let signature = identity.sign(&authorization_payload(
-        cluster_id,
-        action,
-        target_node_id,
-        &actor_node_id,
-    )?);
-    Ok(ConsensusVoterChangeAuthorization {
+    let mut auth = ConsensusVoterChangeAuthorization {
+        protocol_version: 2,
         cluster_id: cluster_id.to_string(),
         action,
         target_node_id: target_node_id.to_string(),
-        actor_node_id,
-        signature,
-    })
+        actor_node_id: identity.node_id().to_string(),
+        membership_epoch: membership_epoch.to_string(),
+        current_members_digest: crate::control_codec::canonical_members_digest(current)?,
+        proposed_members_digest: crate::control_codec::canonical_members_digest(prospective)?,
+        expires_at_unix_ms: crate::now_unix_ms().saturating_add(AUTHORIZATION_LIFETIME_MS),
+        signature: Vec::new(),
+    };
+    auth.signature = identity.sign(&authorization_payload(&auth)?);
+    Ok(auth)
 }
 
-/// Verifies that a voter-change authorization is signed by an active voter.
-///
+/// Constructs the exact removal plan without introducing unsigned timestamps.
 /// # Errors
-///
-/// Returns cluster, action, target, actor, credential, or signature failures.
+/// Rejects unknown or inactive targets.
+pub fn removal_plan(current: &[ClusterMember], target: &str) -> Result<Vec<ClusterMember>, String> {
+    let mut proposed = current.to_vec();
+    let member = proposed
+        .iter_mut()
+        .find(|member| member.node_id == target)
+        .ok_or("removed consensus voter is not a member")?;
+    if member.state != ClusterMemberState::Active
+        || member.capabilities.consensus_role != ClusterConsensusRole::Voter
+    {
+        return Err("removed member is not an active voter".into());
+    }
+    member.state = ClusterMemberState::Left;
+    member.updated_at_unix_ms = member
+        .updated_at_unix_ms
+        .checked_add(1)
+        .ok_or("membership transition timestamp exhausted")?;
+    Ok(proposed)
+}
+
+/// Verifies current committed authority, exact plan, freshness and issuer trust.
+/// The caller must serialize verification with the actual Raft membership change.
+/// # Errors
+/// Rejects stale/replayed authorizations, untrusted signers and modified plans.
 pub fn verify_voter_change_authorization(
-    authorization: &ConsensusVoterChangeAuthorization,
+    auth: &ConsensusVoterChangeAuthorization,
     expected_cluster_id: &str,
-    expected_action: ConsensusVoterChangeAction,
-    expected_target_node_id: NodeId,
-    members: &[ClusterMember],
+    membership_epoch: &str,
+    current: &[ClusterMember],
+    prospective: &[ClusterMember],
 ) -> Result<(), String> {
-    if authorization.cluster_id != expected_cluster_id {
-        return Err("voter-change authorization belongs to another cluster".to_string());
+    let payload = authorization_payload(auth)?;
+    let now = crate::now_unix_ms();
+    if auth.cluster_id != expected_cluster_id
+        || auth.membership_epoch != membership_epoch
+        || auth.expires_at_unix_ms < now
+        || auth.expires_at_unix_ms > now.saturating_add(AUTHORIZATION_LIFETIME_MS)
+        || auth.current_members_digest != crate::control_codec::canonical_members_digest(current)?
+        || auth.proposed_members_digest
+            != crate::control_codec::canonical_members_digest(prospective)?
+    {
+        return Err(
+            "voter-change authorization has a stale epoch, expired proof or modified plan".into(),
+        );
     }
-    if authorization.action != expected_action {
-        return Err("voter-change authorization has the wrong action".to_string());
-    }
-    if authorization.target_node_id != expected_target_node_id.to_string() {
-        return Err("voter-change authorization has the wrong target".to_string());
-    }
-    let actor = members
+    let actor = current
         .iter()
-        .find(|member| member.node_id == authorization.actor_node_id)
-        .ok_or_else(|| "voter-change authorization actor is not a member".to_string())?;
-    if actor.state != ClusterMemberState::Active
+        .find(|member| member.node_id == auth.actor_node_id)
+        .ok_or("voter-change authorization actor is not a committed member")?;
+    if actor.cluster_id != expected_cluster_id
+        || actor.state != ClusterMemberState::Active
         || actor.capabilities.consensus_role != ClusterConsensusRole::Voter
     {
-        return Err("voter-change authorization actor is not an active voter".to_string());
+        return Err("voter-change authorization actor is not a current active voter".into());
     }
-    crate::membership::verify_membership_credential(actor, crate::now_unix_ms())?;
-    crate::membership::verify_node_signature(
-        &actor.node_id,
-        &authorization_payload(
-            &authorization.cluster_id,
-            authorization.action,
-            &authorization.target_node_id,
-            &authorization.actor_node_id,
-        )?,
-        &authorization.signature,
-    )
+    // A committed member is already a trust anchor. Do not require its historical
+    // credential issuer to remain active (issuer departure must not strand peers).
+    crate::membership::verify_membership_credential(actor, now)?;
+    crate::membership::verify_node_signature(&actor.node_id, &payload, &auth.signature)?;
+    match auth.action {
+        ConsensusVoterChangeAction::Add => {
+            let target = prospective
+                .iter()
+                .find(|member| member.node_id == auth.target_node_id)
+                .ok_or("membership transition omitted its target")?;
+            if target.cluster_id != expected_cluster_id
+                || target.state != ClusterMemberState::Active
+                || target.capabilities.consensus_role != ClusterConsensusRole::Voter
+            {
+                return Err("membership transition target is not an active voter".into());
+            }
+            crate::membership::verify_membership_credential(target, now)?;
+            if current
+                .iter()
+                .any(|member| member.node_id == target.node_id)
+            {
+                // An explicit current-epoch proof of an exact committed plan is
+                // an acknowledgement, never permission to promote or rewrite it.
+                if auth.current_members_digest != auth.proposed_members_digest {
+                    return Err("existing voter acknowledgement may not modify membership".into());
+                }
+                validate_membership_transition(current, prospective)?;
+                return Ok(());
+            }
+            let issuer = current
+                .iter()
+                .find(|member| {
+                    member.node_id == target.credential_issuer_node_id
+                        && member.public_key == target.credential_issuer_public_key
+                        && member.cluster_id == expected_cluster_id
+                        && member.state == ClusterMemberState::Active
+                        && member.capabilities.consensus_role == ClusterConsensusRole::Voter
+                })
+                .ok_or("joining credential issuer is not a trusted current voter")?;
+            crate::membership::verify_membership_credential(issuer, now)?;
+            let mut exact = current.to_vec();
+            exact.push(target.clone());
+            if crate::control_codec::canonical_members_digest(&exact)?
+                != auth.proposed_members_digest
+            {
+                return Err("voter addition may not modify other committed members".into());
+            }
+        }
+        ConsensusVoterChangeAction::Remove => {
+            if crate::control_codec::canonical_members_digest(&removal_plan(
+                current,
+                &auth.target_node_id,
+            )?)? != auth.proposed_members_digest
+            {
+                return Err("voter removal may not modify other committed members".into());
+            }
+        }
+    }
+    validate_membership_transition(current, prospective)?;
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -269,22 +350,69 @@ pub async fn publish_members(
     principal_id: &str,
     members: impl IntoIterator<Item = ClusterMember>,
 ) -> Result<(), String> {
-    let mut members = members.into_iter().collect::<Vec<_>>();
+    publish_members_impl(node, principal_id, members.into_iter().collect(), false).await
+}
+
+pub(crate) async fn publish_members_locked(
+    node: ConsensusNode,
+    principal_id: &str,
+    members: Vec<ClusterMember>,
+) -> Result<(), String> {
+    publish_members_impl(node, principal_id, members, true).await
+}
+
+async fn publish_members_impl(
+    node: ConsensusNode,
+    principal_id: &str,
+    mut members: Vec<ClusterMember>,
+    locked: bool,
+) -> Result<(), String> {
     members.sort_by(|left, right| left.node_id.cmp(&right.node_id));
     for member in members {
-        let command_id = membership_command_id(&member)?;
-        let command = bmux_cluster_plugin_api::cluster_types::ControlCommand {
-            schema_version: crate::control_state::CONTROL_SCHEMA_VERSION,
-            principal_id: principal_id.to_string(),
-            command_id: bmux_cluster_plugin_api::cluster_types::CommandId { value: command_id },
-            issued_at_unix_ms: member.updated_at_unix_ms,
-            request: bmux_cluster_plugin_api::cluster_types::ControlCommandRequest::UpsertMember {
-                member,
-            },
+        let command = membership_command(member, principal_id)?;
+        let result = if locked {
+            node.mutate_locked(command).await
+        } else {
+            node.mutate(command).await
         };
-        node.mutate(command)
-            .await
-            .map_err(|error| format!("replicated membership mutation failed: {error:?}"))?;
+        result.map_err(|error| format!("replicated membership mutation failed: {error:?}"))?;
+    }
+    Ok(())
+}
+
+fn membership_command(
+    member: ClusterMember,
+    principal_id: &str,
+) -> Result<bmux_cluster_plugin_api::cluster_types::ControlCommand, String> {
+    Ok(bmux_cluster_plugin_api::cluster_types::ControlCommand {
+        schema_version: crate::control_state::CONTROL_SCHEMA_VERSION,
+        principal_id: principal_id.to_string(),
+        command_id: bmux_cluster_plugin_api::cluster_types::CommandId {
+            value: membership_command_id(&member)?,
+        },
+        issued_at_unix_ms: member.updated_at_unix_ms,
+        request: bmux_cluster_plugin_api::cluster_types::ControlCommandRequest::UpsertMember {
+            member,
+        },
+    })
+}
+
+pub(crate) fn preflight_publication(
+    mut state: crate::control_state::ControlState,
+    principal_id: &str,
+    members: &[ClusterMember],
+) -> Result<(), String> {
+    let mut members = members.to_vec();
+    members.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+    for member in members {
+        let response = state.apply(&membership_command(member, principal_id)?);
+        if let bmux_cluster_plugin_api::cluster_types::ControlCommandResult::Rejected { error } =
+            response.result
+        {
+            return Err(format!(
+                "membership publication preflight failed: {error:?}"
+            ));
+        }
     }
     Ok(())
 }
@@ -449,47 +577,206 @@ mod tests {
         );
     }
 
-    #[test]
-    fn voter_change_authorization_is_target_and_action_bound() {
+    fn transition_fixture() -> (
+        crate::membership::NodeIdentity,
+        Vec<ClusterMember>,
+        Vec<ClusterMember>,
+    ) {
+        let issuer = crate::membership::NodeIdentity::new_for_test(1);
+        let joiner = crate::membership::NodeIdentity::new_for_test(2);
         let current = member(
             NodeId::from(1),
             ClusterConsensusRole::Voter,
             ClusterMemberState::Active,
         );
-        let target = member(
+        let target = crate::membership::issue_test_member(
+            &issuer,
+            current.cluster_id.parse().unwrap(),
+            &joiner,
+            "tls://node-2:7443",
+            current.capabilities.clone(),
+            crate::now_unix_ms(),
+        );
+        (issuer, vec![current.clone()], vec![current, target])
+    }
+
+    #[test]
+    fn exact_signed_add_and_remove_transitions_are_valid() {
+        let (issuer, current, proposed) = transition_fixture();
+        let auth = authorize_voter_change(
+            &current[0].cluster_id,
+            ConsensusVoterChangeAction::Add,
+            &proposed[1].node_id,
+            &issuer,
+            "epoch-1",
+            &current,
+            &proposed,
+        )
+        .unwrap();
+        verify_voter_change_authorization(
+            &auth,
+            &current[0].cluster_id,
+            "epoch-1",
+            &current,
+            &proposed,
+        )
+        .unwrap();
+        // Canonical order is independent of presentation order.
+        let mut reordered = proposed.clone();
+        reordered.reverse();
+        verify_voter_change_authorization(
+            &auth,
+            &current[0].cluster_id,
+            "epoch-1",
+            &current,
+            &reordered,
+        )
+        .unwrap();
+        let removed = removal_plan(&proposed, &proposed[1].node_id).unwrap();
+        let auth = authorize_voter_change(
+            &current[0].cluster_id,
+            ConsensusVoterChangeAction::Remove,
+            &proposed[1].node_id,
+            &issuer,
+            "epoch-2",
+            &proposed,
+            &removed,
+        )
+        .unwrap();
+        verify_voter_change_authorization(
+            &auth,
+            &current[0].cluster_id,
+            "epoch-2",
+            &proposed,
+            &removed,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn authorization_rejects_prospective_signer_and_untrusted_credential_issuer() {
+        let (issuer, current, proposed) = transition_fixture();
+        let outsider = crate::membership::NodeIdentity::new_for_test(2);
+        let mut auth = authorize_voter_change(
+            &current[0].cluster_id,
+            ConsensusVoterChangeAction::Add,
+            &proposed[1].node_id,
+            &outsider,
+            "epoch-1",
+            &current,
+            &proposed,
+        )
+        .unwrap();
+        assert!(
+            verify_voter_change_authorization(
+                &auth,
+                &current[0].cluster_id,
+                "epoch-1",
+                &current,
+                &proposed
+            )
+            .unwrap_err()
+            .contains("committed member")
+        );
+        let mut forged = proposed;
+        forged[1] = member(
             NodeId::from(2),
             ClusterConsensusRole::Voter,
             ClusterMemberState::Active,
         );
-        let actor_identity = crate::membership::NodeIdentity::new_for_test(1);
-        let authorization = authorize_voter_change(
-            &current.cluster_id,
+        // Even a trusted signer cannot turn a self-issued outsider into an enrolled voter.
+        auth = authorize_voter_change(
+            &current[0].cluster_id,
             ConsensusVoterChangeAction::Add,
-            &target.node_id,
-            &actor_identity,
+            &forged[1].node_id,
+            &issuer,
+            "epoch-1",
+            &current,
+            &forged,
         )
         .unwrap();
-        verify_voter_change_authorization(
-            &authorization,
-            &current.cluster_id,
-            ConsensusVoterChangeAction::Add,
-            target.node_id.parse().unwrap(),
-            std::slice::from_ref(&current),
-        )
-        .unwrap();
-
-        let mut tampered = authorization;
-        tampered.target_node_id = current.node_id.clone();
         assert!(
             verify_voter_change_authorization(
-                &tampered,
-                &current.cluster_id,
-                ConsensusVoterChangeAction::Add,
-                target.node_id.parse().unwrap(),
-                std::slice::from_ref(&current),
+                &auth,
+                &current[0].cluster_id,
+                "epoch-1",
+                &current,
+                &forged
+            )
+            .unwrap_err()
+            .contains("credential issuer")
+        );
+    }
+
+    #[test]
+    fn authorization_binds_every_plan_field_epoch_action_and_expiry() {
+        let (issuer, current, proposed) = transition_fixture();
+        let auth = authorize_voter_change(
+            &current[0].cluster_id,
+            ConsensusVoterChangeAction::Add,
+            &proposed[1].node_id,
+            &issuer,
+            "epoch-1",
+            &current,
+            &proposed,
+        )
+        .unwrap();
+        for index in 0..7 {
+            let mut changed = proposed.clone();
+            match index {
+                0 => changed[1].endpoint = Some("tls://changed:7443".into()),
+                1 => changed[1].capabilities.worker = !changed[1].capabilities.worker,
+                2 => changed[1].credential_serial.push('x'),
+                3 => changed[1]
+                    .negotiated_protocol
+                    .features
+                    .push("injected".into()),
+                4 => changed[0].state = ClusterMemberState::Left,
+                5 => changed[1].updated_at_unix_ms += 1,
+                _ => changed.push(changed[1].clone()),
+            }
+            assert!(
+                verify_voter_change_authorization(
+                    &auth,
+                    &current[0].cluster_id,
+                    "epoch-1",
+                    &current,
+                    &changed
+                )
+                .is_err()
+            );
+        }
+        assert!(
+            verify_voter_change_authorization(
+                &auth,
+                &current[0].cluster_id,
+                "epoch-2",
+                &current,
+                &proposed
             )
             .is_err()
         );
+        for index in 0..6 {
+            let mut changed = auth.clone();
+            match index {
+                0 => changed.action = ConsensusVoterChangeAction::Remove,
+                1 => changed.target_node_id = current[0].node_id.clone(),
+                2 => changed.expires_at_unix_ms = crate::now_unix_ms().saturating_sub(1),
+                3 => changed.protocol_version = 1,
+                4 => changed.protocol_version = 0,
+                _ => changed.signature = vec![0; 64],
+            }
+            assert!(
+                verify_voter_change_authorization(
+                    &changed,
+                    &current[0].cluster_id,
+                    "epoch-1",
+                    &current,
+                    &proposed
+                )
+                .is_err()
+            );
+        }
     }
 
     #[test]

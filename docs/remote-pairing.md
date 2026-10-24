@@ -41,6 +41,30 @@ and reachable. This is currently single-terminal access, not remote layout/tab
 synchronization. Do not interpret a failed or uncertain input delivery as a safe
 reason to replay that input.
 
+## Hosting policy and startup
+
+Remote hosting is off by default. Omitting `allow_full_runtime_ingress` allows a
+trusted local owner to opt in with `bmux remote enable`; that preference persists
+across server restarts. `bmux remote disable` persists an off preference.
+
+An explicit `allow_full_runtime_ingress = false` is a **hard prohibition**:
+CLI enablement and previously saved opt-ins cannot override it. Change the
+configuration and restart the host before enabling again. This differs from
+omitting the field, which leaves the owner opt-in available.
+
+To host automatically from configuration:
+
+```toml
+[plugins.settings."bmux.connections".remote]
+allow_full_runtime_ingress = true
+auto_start = true
+bind_addr = "0.0.0.0:7443"
+```
+
+Auto-start from configuration requires an explicit, nonzero UDP bind port.
+A saved CLI disable still suppresses configured auto-start until the owner
+explicitly enables it again. Enabling hosting never enrolls a device by itself.
+
 ## Managing trust
 
 Client-side saved-host commands require no local server:
@@ -86,6 +110,24 @@ For a managed relay, use `mode = "custom"` and `urls = ["https://relay.example/"
 `mode = "disabled"` is useful for direct-only/offline setups and deterministic
 local testing. A pasted invitation does not override the client's local relay
 policy.
+
+## Local socket upgrade compatibility
+
+Local IPC now requires a same-user peer and a private, owned runtime directory
+(`0700` on Unix); sockets are created with mode `0600`. Existing directories
+are not silently chmodded or chowned, and live sockets are not unlinked to
+repair an unsafe configuration. Custom `BMUX_RUNTIME_DIR` locations remain
+supported when they meet these requirements.
+
+With `XDG_RUNTIME_DIR`, the default location is unchanged. Without it, the Unix
+fallback changes from the shared temporary `bmux` directory to `bmux-UID`.
+Because runtime identity is scoped to the runtime path, this fallback change
+also selects a different identity/grant namespace. To retain the old namespace,
+stop the old runtime, verify that the old directory belongs to your user and
+has private permissions, and explicitly select it with
+`BMUX_RUNTIME_DIR=/tmp/bmux` (adjust for a nonstandard temporary directory).
+Do not reuse a directory owned by another user or remove another user's files.
+Otherwise, use the new default and pair clients to its new identity.
 
 ## Validation boundaries
 

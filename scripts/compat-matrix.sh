@@ -133,7 +133,7 @@ export BMUX_DATA_DIR="$XDG_DATA_HOME/bmux"
 export BMUX_STATE_DIR="$XDG_STATE_HOME"
 export BMUX_LOG_DIR="$WORK_DIR/logs"
 export BMUX_RECORDINGS_DIR="$WORK_DIR/recordings"
-mkdir -p "$XDG_CONFIG_HOME/bmux" "$XDG_DATA_HOME/bmux" "$XDG_RUNTIME_DIR" \
+mkdir -p -m 700 "$XDG_CONFIG_HOME/bmux" "$XDG_DATA_HOME/bmux" "$XDG_RUNTIME_DIR" \
   "$XDG_STATE_HOME" "$XDG_CACHE_HOME" "$TMPDIR" "$BMUX_CONFIG_DIR" \
   "$BMUX_LOG_DIR" "$BMUX_RECORDINGS_DIR"
 
@@ -333,7 +333,7 @@ run_case() {
 
   "$BMUX_BIN" --runtime default --target local --config "$CONFIG_FILE" server stop >/dev/null 2>&1 || true
   rm -rf "$XDG_RUNTIME_DIR" "$XDG_DATA_HOME/bmux"
-  mkdir -p "$XDG_RUNTIME_DIR" "$XDG_DATA_HOME/bmux"
+  mkdir -p -m 700 "$XDG_RUNTIME_DIR" "$XDG_DATA_HOME/bmux"
 
   local status="PASS"
   local notes="ok"

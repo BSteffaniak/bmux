@@ -12,7 +12,7 @@ declare -a SMOKE_SANDBOXES=()
 create_sandbox() {
   local root
   root="$(mktemp -d "${TMPDIR:-/tmp}/bmux-smoke.XXXXXX")"
-  mkdir -p "$root/config" "$root/data" "$root/runtime" "$root/state" "$root/logs" "$root/tmp"
+  mkdir -p -m 700 "$root/config" "$root/data" "$root/runtime" "$root/state" "$root/logs" "$root/tmp"
   printf '%s' "$root"
 }
 

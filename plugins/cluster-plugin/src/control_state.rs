@@ -481,6 +481,7 @@ impl ControlState {
             schema_version: self.schema_version,
             cluster_id: self.cluster_id.clone(),
             revision: self.revision,
+            membership_epoch: None,
             members: self.members.values().cloned().collect(),
             workspaces: self.workspaces.values().cloned().collect(),
             tabs: self.tabs.values().cloned().collect(),
