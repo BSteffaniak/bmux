@@ -72,7 +72,7 @@ async fn prompt(context: &NativeCommandContext, label: &str) -> Result<String, P
     if context.invocation_source == NativeCommandInvocationSource::AttachKeybinding {
         return structured_text(label).await;
     }
-    if context.invocation_source == NativeCommandInvocationSource::Cli {
+    if context.invocation_source.is_cli() {
         return crate::setup_ui::text(label)
             .await
             .map_err(|error| PluginCommandError::failed(error.to_string()))?
@@ -149,7 +149,7 @@ fn terminal_defaults(
     })
 }
 async fn output(context: &NativeCommandContext, text: &str) {
-    if context.invocation_source == NativeCommandInvocationSource::Cli {
+    if context.invocation_source.is_cli() {
         println!("{text}");
     } else if context.invocation_source == NativeCommandInvocationSource::AttachKeybinding {
         let _ = bmux_plugin::prompt::request(
@@ -405,17 +405,13 @@ pub(crate) async fn connected(
     {
         let mut map = options(args.get(1..).unwrap_or_default())?;
         if !map.contains_key("--source") && !map.contains_key("--session") {
-            let choices = terminal_choices(
-                client,
-                context.invocation_source != NativeCommandInvocationSource::Cli,
-            )
-            .await?;
+            let choices = terminal_choices(client, !context.invocation_source.is_cli()).await?;
             if choices.is_empty() {
                 return Err(failed(
                     "no terminal sessions available; register a presentation source first",
                 ));
             }
-            let inline = context.invocation_source == NativeCommandInvocationSource::Cli;
+            let inline = context.invocation_source.is_cli();
             let session = if inline {
                 let destination = profiles::selected(
                     Path::new(&context.connection.config_dir),
@@ -552,7 +548,7 @@ pub(crate) async fn connected(
                 let sources = turnkey::client::sources(client)
                     .await
                     .map_err(|_| failed("source list unavailable"))?;
-                if context.invocation_source == NativeCommandInvocationSource::Cli {
+                if context.invocation_source.is_cli() {
                     for source in sources {
                         emit!(context, "{}  {}", source.source_id, source.label);
                     }
@@ -634,13 +630,9 @@ pub(crate) async fn connected(
             )
             .await
             .map_err(|_| failed("broadcast start rejected"))?;
-            let live = crate::startup_ui::wait(
-                client,
-                &id,
-                context.invocation_source == NativeCommandInvocationSource::Cli,
-            )
-            .await
-            .map_err(PluginCommandError::failed)?;
+            let live = crate::startup_ui::wait(client, &id, context.invocation_source.is_cli())
+                .await
+                .map_err(PluginCommandError::failed)?;
             emit!(
                 context,
                 "{} / {} source={} {}",
@@ -665,13 +657,9 @@ pub(crate) async fn connected(
                     "broadcast start rejected; run broadcast setup and register an explicit source",
                 )
             })?;
-            let live = crate::startup_ui::wait(
-                client,
-                &id,
-                context.invocation_source == NativeCommandInvocationSource::Cli,
-            )
-            .await
-            .map_err(PluginCommandError::failed)?;
+            let live = crate::startup_ui::wait(client, &id, context.invocation_source.is_cli())
+                .await
+                .map_err(PluginCommandError::failed)?;
             // Ownership token is private teardown authority: do not print/log it.
             emit!(
                 context,
@@ -692,7 +680,7 @@ pub(crate) async fn connected(
         let status = turnkey::client::status(client)
             .await
             .map_err(|_| failed("broadcast status unavailable"))?;
-        if context.invocation_source == NativeCommandInvocationSource::Cli {
+        if context.invocation_source.is_cli() {
             println!(
                 "{}",
                 serde_json::to_string(&status)

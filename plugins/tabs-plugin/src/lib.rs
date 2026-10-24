@@ -1867,10 +1867,7 @@ fn handle_command(plugin: &TabsPlugin, context: &NativeCommandContext) -> Result
     // attach runtime observes state changes (current context id,
     // context list) directly and refreshes from those, so silence is
     // correct there.
-    let emit_to_stdout = matches!(
-        context.invocation_source,
-        bmux_plugin_sdk::NativeCommandInvocationSource::Cli
-    );
+    let emit_to_stdout = context.invocation_source.is_cli();
     match context.command.as_str() {
         "explain-spawn-directory" => {
             let operation = option_value(&context.arguments, "operation")

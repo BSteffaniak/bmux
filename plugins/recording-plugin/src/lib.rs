@@ -509,8 +509,7 @@ impl RustPlugin for RecordingPlugin {
 }
 
 fn should_queue_recording_cut_for_non_cli(context: &NativeCommandContext) -> bool {
-    context.command == "recording-cut"
-        && context.invocation_source != bmux_plugin_sdk::NativeCommandInvocationSource::Cli
+    context.command == "recording-cut" && !context.invocation_source.is_cli()
 }
 
 fn run_recording_export_command(

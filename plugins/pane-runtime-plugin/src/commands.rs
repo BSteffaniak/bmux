@@ -5,10 +5,9 @@ use bmux_pane_runtime_plugin_api::{
 };
 use bmux_plugin::{ServiceCallerDispatchClient, prompt};
 use bmux_plugin_sdk::{
-    COMMAND_OUTCOME_STATUS_MESSAGE_KEY, NativeCommandContext, NativeCommandInvocationSource,
-    PluginCommandError, PromptEvent, PromptFormField, PromptFormFieldKind, PromptFormSection,
-    PromptFormValue, PromptOption, PromptPolicy, PromptRequest, PromptResponse, PromptValue,
-    record_command_outcome_metadata,
+    COMMAND_OUTCOME_STATUS_MESSAGE_KEY, NativeCommandContext, PluginCommandError, PromptEvent,
+    PromptFormField, PromptFormFieldKind, PromptFormSection, PromptFormValue, PromptOption,
+    PromptPolicy, PromptRequest, PromptResponse, PromptValue, record_command_outcome_metadata,
 };
 use bmux_sessions_plugin_api::sessions_state;
 use std::collections::BTreeMap;
@@ -166,10 +165,7 @@ fn status_text(state: &PanePaddingState) -> String {
 fn emit_result(context: &NativeCommandContext, state: PanePaddingState) {
     let status = status_text(&state);
     record_command_outcome_metadata(COMMAND_OUTCOME_STATUS_MESSAGE_KEY, status.clone().into());
-    if matches!(
-        context.invocation_source,
-        NativeCommandInvocationSource::Cli
-    ) {
+    if context.invocation_source.is_cli() {
         println!("{status}");
         println!("session: {}", state.session_id);
         println!("pane: {}", state.pane_id);
@@ -1171,6 +1167,7 @@ fn configure(context: &NativeCommandContext) -> Result<(), PluginCommandError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bmux_plugin_sdk::NativeCommandInvocationSource;
 
     #[test]
     fn attach_outcome_records_status_without_cli_output_path() {

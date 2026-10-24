@@ -104,6 +104,230 @@ impl TypedDispatchClient for PreAdmission {
     }
 }
 
+/// Direct daemonless invitation client. Caller creates/loads its device identity
+/// locally and persists the returned host/device alias only after `result`.
+/// Every poll uses a fresh bounded stream; no local bmux daemon is involved.
+pub struct PairingClient {
+    endpoint: iroh::Endpoint,
+    connection: iroh::endpoint::Connection,
+    link: crate::pairing::invitation::InvitationLink,
+    nonce: [u8; 32],
+    peer_key: String,
+    phrase: String,
+    expiry_task: tokio::task::JoinHandle<()>,
+}
+// Cancellation/drop closes transport even while connect/submit is suspended.
+struct PairingEndpointGuard(Option<iroh::Endpoint>);
+fn drop_guard_without_close(mut guard: PairingEndpointGuard) {
+    guard.0.take();
+}
+impl Drop for PairingEndpointGuard {
+    fn drop(&mut self) {
+        let Some(endpoint) = self.0.take() else {
+            return;
+        };
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                endpoint.close().await;
+            });
+        }
+    }
+}
+impl Drop for PairingClient {
+    fn drop(&mut self) {
+        self.expiry_task.abort();
+        self.connection.close(0u32.into(), b"pairing finished");
+        let endpoint = self.endpoint.clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                endpoint.close().await;
+            });
+        }
+    }
+}
+impl PairingClient {
+    /// Local relay policy is authoritative; invitation routing never enables a
+    /// disabled relay or adds an unapproved custom relay.
+    pub async fn connect_named_with_policy(
+        identity: &DeviceIdentity,
+        link: crate::pairing::invitation::InvitationLink,
+        mut address: iroh::EndpointAddr,
+        device_name: Option<String>,
+        policy: &crate::config::RelayPolicy,
+        timeout: Duration,
+    ) -> Result<Self> {
+        ensure!(
+            address.id.to_string() == link.host_key,
+            "pairing host mismatch"
+        );
+        match policy {
+            crate::config::RelayPolicy::Disabled => {
+                address = address
+                    .ip_addrs()
+                    .fold(iroh::EndpointAddr::new(address.id), |value, ip| {
+                        value.with_ip_addr(*ip)
+                    });
+            }
+            crate::config::RelayPolicy::Custom { urls } => {
+                ensure!(
+                    address.relay_urls().all(|relay| urls.iter().any(|url| url
+                        .parse::<iroh::RelayUrl>()
+                        .ok()
+                        .as_ref()
+                        == Some(relay))),
+                    "pairing relay denied by local policy"
+                );
+            }
+            crate::config::RelayPolicy::Default => {}
+        }
+        // Validate before acquiring endpoint/network resources.
+        link.transcript_named(&identity.public_key(), &[0; 32], device_name.as_deref())?;
+        let endpoint = policy
+            .apply(identity.endpoint_builder())?
+            .alpns(vec![ALPN.to_vec()])
+            .bind()
+            .await?;
+        let guard = PairingEndpointGuard(Some(endpoint.clone()));
+        let result = tokio::time::timeout(timeout.min(Duration::from_secs(30)), async {
+            let connection = endpoint.connect(address, ALPN).await?;
+            Self::on_connection_named(
+                endpoint.clone(),
+                connection,
+                identity,
+                link,
+                device_name,
+                timeout,
+            )
+            .await
+        })
+        .await;
+        if let Ok(Ok(client)) = result {
+            drop_guard_without_close(guard);
+            Ok(client)
+        } else {
+            endpoint.close().await;
+            anyhow::bail!("pairing connection failed")
+        }
+    }
+    async fn on_connection_named(
+        endpoint: iroh::Endpoint,
+        connection: iroh::endpoint::Connection,
+        identity: &DeviceIdentity,
+        link: crate::pairing::invitation::InvitationLink,
+        device_name: Option<String>,
+        timeout: Duration,
+    ) -> Result<Self> {
+        ensure!(
+            connection.remote_id().to_string() == link.host_key,
+            "pairing host mismatch"
+        );
+        let nonce = crate::pairing::random_secret();
+        let transcript =
+            link.transcript_named(&identity.public_key(), &nonce, device_name.as_deref())?;
+        let phrase = {
+            let hash = crate::pairing::digest(&transcript);
+            hash[..8]
+                .chunks_exact(2)
+                .map(|pair| format!("{:02x}{:02x}", pair[0], pair[1]))
+                .collect::<Vec<_>>()
+                .join("-")
+        };
+        let signature = identity.sign(&transcript).to_bytes().to_vec();
+        let expires_in = link
+            .expires_at
+            .saturating_sub(crate::pairing::now()?)
+            .min(600);
+        let expiring = connection.clone();
+        let expiry_task = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(expires_in)).await;
+            expiring.close(0u32.into(), b"pairing expired");
+        });
+        let client = Self {
+            endpoint,
+            connection,
+            link,
+            nonce,
+            peer_key: identity.public_key(),
+            phrase,
+            expiry_task,
+        };
+        let info = tokio::time::timeout(timeout, async {
+            let mut stream = client.stream().await?;
+            Ok::<_, anyhow::Error>(
+                bmux_connections_plugin_api::pairing_peer_commands::client::submit_pairing(
+                    &mut stream,
+                    client.link.session_id.clone(),
+                    client.nonce.to_vec(),
+                    signature,
+                    device_name,
+                )
+                .await?,
+            )
+        })
+        .await??;
+        ensure!(
+            info.verification_phrase.as_deref() == Some(&client.phrase),
+            "pairing transcript mismatch"
+        );
+        Ok(client)
+    }
+    async fn stream(&self) -> Result<PreAdmission> {
+        ensure!(
+            self.link.expires_at > crate::pairing::now()?,
+            "pairing invitation expired"
+        );
+        let (send, receive) = self.connection.open_bi().await?;
+        Ok(PreAdmission {
+            stream: tokio::io::join(receive, send),
+            request_id: 0,
+        })
+    }
+    pub fn session_id(&self) -> &str {
+        &self.link.session_id
+    }
+    pub fn verification_phrase(&self) -> &str {
+        &self.phrase
+    }
+    pub async fn status(
+        &self,
+        timeout: Duration,
+    ) -> Result<bmux_connections_plugin_api::pairing_types::PairingRequest> {
+        tokio::time::timeout(timeout.min(Duration::from_secs(10)), async {
+            let mut stream = self.stream().await?;
+            Ok(
+                bmux_connections_plugin_api::pairing_peer_commands::client::poll_pairing(
+                    &mut stream,
+                    self.link.session_id.clone(),
+                    self.nonce.to_vec(),
+                )
+                .await?,
+            )
+        })
+        .await?
+    }
+    pub async fn result(
+        &self,
+        timeout: Duration,
+    ) -> Result<bmux_connections_plugin_api::pairing_types::Device> {
+        tokio::time::timeout(timeout.min(Duration::from_secs(10)), async {
+            let mut stream = self.stream().await?;
+            let device = bmux_connections_plugin_api::pairing_peer_commands::client::pairing_result(
+                &mut stream,
+                self.link.session_id.clone(),
+                self.nonce.to_vec(),
+            ).await?;
+            ensure!(device.device_key == self.peer_key && device.device_id == self.link.session_id
+                && device.access == bmux_connections_plugin_api::pairing_types::DeviceAccess::FullLocalRuntime,
+                "pairing result binding mismatch");
+            Ok(device)
+        })
+        .await?
+    }
+    pub async fn close(self) {
+        self.endpoint.close().await;
+    }
+}
+
 /// Establish a proof-bound stream ready for ordinary Hello. The returned subject
 /// MUST be used for Hello, not a local principal file. No downgrade is attempted.
 /// The caller retains Endpoint/Connection until the IPC stream is dropped.
@@ -199,6 +423,86 @@ mod tests {
             .clear_ip_transports()
             .bind_addr("127.0.0.1:0")
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn invitation_pairing_loopback_grant_gate_and_no_backend() {
+        use crate::pairing::invitation::InvitationLink;
+        use bmux_connections_plugin_api::pairing_types::SessionPhase;
+        let root = tempfile::tempdir().unwrap();
+        let state = root.path().join("state");
+        let runtime = root.path().join("runtime");
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::create_dir_all(&runtime).unwrap();
+        let host = RuntimeIdentity::load_or_create(&state, &runtime).unwrap();
+        let device = DeviceIdentity::load_or_create(&state, &runtime).unwrap();
+        let pairing =
+            Arc::new(PairingAuthority::open(&state, &runtime, host.endpoint_id()).unwrap());
+        let admission = Arc::new(AdmissionAuthority::new(Arc::clone(&pairing)));
+        // No backend socket exists: pairing must never attempt generic IPC.
+        let backend = bmux_ipc::IpcEndpoint::unix_socket(runtime.join("absent.sock"));
+        let mut listener = Listener::start(
+            direct(host.endpoint_builder()),
+            Arc::clone(&pairing),
+            admission,
+            backend,
+        )
+        .await
+        .unwrap();
+        let owner = LocalOwner::from_trusted_local_owner();
+        let session = pairing
+            .sessions
+            .begin_session(&owner, &pairing, 60, listener.targets())
+            .unwrap();
+        let endpoint = direct(device.endpoint_builder())
+            .alpns(vec![alpn().to_vec()])
+            .bind()
+            .await
+            .unwrap();
+        let connection = endpoint.connect(listener.status(), alpn()).await.unwrap();
+        let client = PairingClient::on_connection_named(
+            endpoint,
+            connection,
+            &device,
+            InvitationLink::parse(&session.invitation_link).unwrap(),
+            Some("Loopback laptop".into()),
+            Duration::from_secs(3),
+        )
+        .await
+        .unwrap();
+        let pending = client.status(Duration::from_secs(3)).await.unwrap();
+        assert_eq!(pending.phase, SessionPhase::PendingApproval);
+        assert_eq!(pending.device_name.as_deref(), Some("Loopback laptop"));
+        assert_eq!(
+            pending.verification_phrase.as_deref(),
+            Some(client.verification_phrase())
+        );
+        assert_eq!(pending.session_id, session.session_id);
+        assert!(client.result(Duration::from_secs(3)).await.is_err());
+        let staged = pairing
+            .sessions
+            .approve_session(
+                &owner,
+                &pairing,
+                &session.session_id,
+                client.verification_phrase(),
+            )
+            .unwrap();
+        assert_eq!(staged.access, DeviceAccess::Denied);
+        assert!(client.result(Duration::from_secs(3)).await.is_err());
+        pairing
+            .sessions
+            .activate_session(&owner, &pairing, &session.session_id)
+            .unwrap();
+        let enrolled = client.result(Duration::from_secs(3)).await.unwrap();
+        assert_eq!(enrolled.device_key, device.public_key());
+        pairing
+            .sessions
+            .abort_session(&owner, &pairing, &session.session_id, false)
+            .unwrap();
+        assert!(client.result(Duration::from_secs(3)).await.is_err());
+        client.close().await;
+        listener.stop().await;
     }
 
     #[tokio::test]

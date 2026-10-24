@@ -29,8 +29,7 @@ pub use demo::linked_registry as linked_demo_registry;
 pub use owner::LinkedOwner;
 
 use bmux_plugin_sdk::{
-    NativeCommandContext, NativeCommandInvocationSource, NativeServiceContext, PluginCommandError,
-    RustPlugin, ServiceResponse,
+    NativeCommandContext, NativeServiceContext, PluginCommandError, RustPlugin, ServiceResponse,
 };
 
 #[derive(Default)]
@@ -38,7 +37,7 @@ pub struct PresenterPlugin;
 impl RustPlugin for PresenterPlugin {
     type Contract = bmux_presenter_plugin_api::Contract;
     fn run_command(&mut self, context: NativeCommandContext) -> Result<i32, PluginCommandError> {
-        if context.invocation_source != NativeCommandInvocationSource::Cli {
+        if !context.invocation_source.is_cli() {
             return Err(PluginCommandError::failed(
                 "present commands require standalone CLI invocation; attach terminal is already owned",
             ));

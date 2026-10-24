@@ -11,14 +11,21 @@ owns_namespaces = [
     "remote-list",
     "remote-status",
     "remote-revoke",
+    "remote-rename",
+    "remote-forget",
 ]
+owns_paths = [["connect"]]
 provided_capabilities = [
     "bmux.connections.read",
     "bmux.connections.invoke",
     "bmux.connections.pairing",
 ]
 provided_features = ["bmux.connections"]
-required_capabilities = ["bmux.clients.read", "bmux.permissions.write"]
+required_capabilities = [
+    "bmux.clients.read",
+    "bmux.commands",
+    "bmux.permissions.write",
+]
 version = "0.0.1-alpha.0"
 
 [[services]]
@@ -178,3 +185,99 @@ kind     = "string"
 name     = "value"
 position = 0
 required = false
+
+[[services]]
+capability   = "bmux.connections.pairing"
+interface_id = "pairing-session-commands"
+kind         = "command"
+
+[[services]]
+capability   = "bmux.connections.pairing"
+interface_id = "pairing-session-state"
+kind         = "query"
+
+[[commands]]
+expose_in_cli = true
+name          = "connect"
+path          = ["connect"]
+summary       = "Connect to a host, or pair this device interactively"
+
+[[commands.arguments]]
+kind     = "string"
+name     = "target"
+position = 0
+required = false
+
+[[commands.arguments]]
+kind     = "string"
+name     = "session"
+position = 1
+required = false
+
+[[commands.arguments]]
+kind     = "string"
+long     = "follow"
+name     = "follow"
+required = false
+
+[[commands.arguments]]
+kind     = "boolean"
+long     = "global"
+name     = "global"
+required = false
+
+[[commands.arguments]]
+kind     = "boolean"
+long     = "reconnect-forever"
+name     = "reconnect-forever"
+required = false
+
+[[commands.arguments]]
+kind     = "boolean"
+long     = "pair"
+name     = "pair"
+required = false
+
+[[commands.arguments]]
+kind     = "string"
+long     = "name"
+name     = "name"
+required = false
+
+[[commands.arguments]]
+kind     = "string"
+long     = "device-name"
+name     = "device-name"
+required = false
+
+[[commands]]
+aliases       = [["remote", "rename"]]
+expose_in_cli = true
+name          = "remote-rename"
+path          = ["remote-rename"]
+summary       = "Rename a saved host on this client only"
+
+[[commands.arguments]]
+kind     = "string"
+name     = "old"
+position = 0
+required = true
+
+[[commands.arguments]]
+kind     = "string"
+name     = "new"
+position = 1
+required = true
+
+[[commands]]
+aliases       = [["remote", "forget"]]
+expose_in_cli = true
+name          = "remote-forget"
+path          = ["remote-forget"]
+summary       = "Forget a saved host on this client; does not revoke host authorization"
+
+[[commands.arguments]]
+kind     = "string"
+name     = "name"
+position = 0
+required = true

@@ -252,6 +252,22 @@ fn emit_interface(
     out.push_str("}\n\n");
 }
 
+/// Never inspect secret values while formatting diagnostics.
+fn emit_redacted_debug(name: &str, fields: &[Field], out: &mut String) {
+    let _ = writeln!(out, "impl ::core::fmt::Debug for {name} {{");
+    out.push_str("fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {\n");
+    let _ = writeln!(out, "let mut debug = f.debug_struct({name:?});");
+    for field in fields {
+        let member = snake_case(&field.name);
+        if field.secret {
+            let _ = writeln!(out, "debug.field({member:?}, &\"[REDACTED]\");");
+        } else {
+            let _ = writeln!(out, "debug.field({member:?}, &self.{member});");
+        }
+    }
+    out.push_str("debug.finish()\n}\n}\n");
+}
+
 fn emit_record(
     r: &RecordDef,
     imports: &ImportMap,
@@ -260,12 +276,18 @@ fn emit_record(
     out: &mut String,
 ) {
     let name = pascal_case(&r.name);
+    let secret = r.fields.iter().any(|field| field.secret);
+    let debug = if secret { "" } else { "Debug, " };
     if non_eq_types.contains(&r.name) {
-        out.push_str(
-            "    #[derive(Debug, Clone, PartialEq, ::serde::Serialize, ::serde::Deserialize)]\n",
+        let _ = writeln!(
+            out,
+            "    #[derive({debug}Clone, PartialEq, ::serde::Serialize, ::serde::Deserialize)]"
         );
     } else {
-        out.push_str("    #[derive(Debug, Clone, PartialEq, Eq, ::serde::Serialize, ::serde::Deserialize)]\n");
+        let _ = writeln!(
+            out,
+            "    #[derive({debug}Clone, PartialEq, Eq, ::serde::Serialize, ::serde::Deserialize)]"
+        );
     }
     let _ = writeln!(out, "    pub struct {name} {{");
     for f in &r.fields {
@@ -286,6 +308,9 @@ fn emit_record(
         let _ = writeln!(out, "        pub {field_name}: {ty},");
     }
     out.push_str("    }\n\n");
+    if secret {
+        emit_redacted_debug(&name, &r.fields, out);
+    }
 }
 
 /// Best-effort check: does the type we'd emit for `ty` derive
@@ -694,7 +719,12 @@ fn emit_transport_endpoint(
     }
     if !op.params.is_empty() {
         let request_name = request_ty.clone();
-        out.push_str("        #[derive(Debug, Clone, ::serde::Serialize, ::serde::Deserialize)]\n");
+        let secret = op.params.iter().any(|field| field.secret);
+        let debug = if secret { "" } else { "Debug, " };
+        let _ = writeln!(
+            out,
+            "        #[derive({debug}Clone, ::serde::Serialize, ::serde::Deserialize)]"
+        );
         let _ = writeln!(out, "        pub struct {request_name} {{");
         for param in &op.params {
             let field_name = snake_case(&param.name);
@@ -705,6 +735,9 @@ fn emit_transport_endpoint(
             let _ = writeln!(out, "            pub {field_name}: {ty},");
         }
         out.push_str("        }\n\n");
+        if secret {
+            emit_redacted_debug(&request_ty, &op.params, out);
+        }
     }
 
     let _ = writeln!(out, "        /// Typed endpoint marker for `{}`.", op.name);
@@ -1063,6 +1096,46 @@ fn pascal_case(s: &str) -> String {
 mod tests {
     use super::{ImportInfo, ImportMap, emit, emit_with_imports};
     use crate::compile;
+
+    #[test]
+    fn secret_fields_redact_records_and_requests_without_changing_contract() {
+        let source = "plugin example version 1; capability SEND = example.send; @capability(SEND) interface send { record payload { public: string, @secret credential: bytes } command send(@secret credential: bytes, payload: payload) -> payload; }";
+        let schema = compile(source).unwrap();
+        let plain = compile(&source.replace("@secret ", "")).unwrap();
+        let generated = emit(&schema);
+        assert!(generated.contains("impl ::core::fmt::Debug for Payload"));
+        assert!(generated.contains("impl ::core::fmt::Debug for SendRequest"));
+        assert!(generated.contains("debug.field(\"credential\", &\"[REDACTED]\")"));
+        assert!(generated.contains("debug.field(\"public\", &self.public)"));
+        assert!(!generated.contains("&self.credential"));
+        assert!(
+            !crate::canonical::interface_contract(
+                &schema,
+                &schema.interfaces[0],
+                &ImportMap::new()
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            crate::canonical::interface_contract(&schema, &schema.interfaces[0], &ImportMap::new()),
+            crate::canonical::interface_contract(&plain, &plain.interfaces[0], &ImportMap::new())
+        );
+    }
+
+    #[test]
+    fn secret_annotations_reject_unsupported_or_ambiguous_positions() {
+        for source in [
+            "plugin example version 1; interface types { record payload { @unknown value: string } }",
+            "plugin example version 1; interface types { record payload { @secret @secret value: string } }",
+            "plugin example version 1; interface types { variant payload { value { @secret value: string } } }",
+            "plugin example version 1; interface types { @secret record payload { value: string } }",
+            "plugin example version 1; interface types { enum payload { @secret value } }",
+            "plugin example version 1; capability SEND = example.send; @capability(SEND) interface send { @secret command send(value: string) -> string; }",
+            "plugin example version 1; capability SEND = example.send; @capability(SEND) interface send { command send(@unknown value: string) -> string; }",
+        ] {
+            assert!(compile(source).is_err(), "accepted {source}");
+        }
+    }
 
     #[test]
     fn generated_clients_are_explicit_and_document_fallibility() {

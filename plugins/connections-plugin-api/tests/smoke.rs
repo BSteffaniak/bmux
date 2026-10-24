@@ -4,6 +4,43 @@ use bmux_connections_plugin_api::{
 };
 
 #[test]
+fn invitation_pairing_contracts_are_generated_and_separate() {
+    use bmux_connections_plugin_api::{
+        pairing_peer_commands, pairing_session_commands, pairing_session_state,
+        pairing_types::{PairingRequest, SessionPhase},
+    };
+    let request = pairing_peer_commands::client::SubmitPairingRequest {
+        device_name: None,
+        session_id: "session".into(),
+        nonce: vec![1; 32],
+        signature: vec![2; 64],
+    };
+    let json = serde_json::to_string(&request).unwrap();
+    assert!(!json.contains("secret"));
+    assert_ne!(
+        pairing_peer_commands::INTERFACE_ID.as_str(),
+        pairing_session_commands::INTERFACE_ID.as_str()
+    );
+    assert_ne!(
+        pairing_peer_commands::INTERFACE_ID.as_str(),
+        pairing_session_state::INTERFACE_ID.as_str()
+    );
+    let pending = PairingRequest {
+        device_name: None,
+        session_id: "session".into(),
+        phase: SessionPhase::PendingGrant,
+        peer_key: None,
+        verification_phrase: None,
+        device_id: None,
+        expires_at: 123,
+    };
+    assert_eq!(
+        serde_json::from_str::<PairingRequest>(&serde_json::to_string(&pending).unwrap()).unwrap(),
+        pending
+    );
+}
+
+#[test]
 fn endpoint_round_trips() {
     let endpoint = ResolvedEndpoint {
         endpoint_id: "prod".to_string(),
@@ -80,7 +117,7 @@ fn contract_declares_both_services() {
         bmux_connections_plugin_api::service_declarations()
             .expect("valid declarations")
             .len(),
-        6
+        9
     );
 }
 
@@ -136,5 +173,117 @@ fn pairing_contract_is_generated_and_explicit() {
     assert_eq!(
         serde_json::from_str::<pairing_types::Device>(&json).unwrap(),
         device
+    );
+}
+
+#[test]
+fn generated_secret_debug_redacts_without_changing_serialization() {
+    use bmux_connections_plugin_api::{
+        admission_provider_commands, pairing_commands, pairing_peer_commands,
+        pairing_types::{DeviceAccess, Invitation, PairingSession},
+    };
+    const SENTINEL: &str = "REUSABLE-CREDENTIAL-SENTINEL";
+    fn check<T: serde::Serialize + serde::de::DeserializeOwned + std::fmt::Debug>(value: &T) {
+        let debug = format!("{value:?}");
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains(SENTINEL));
+        assert!(!debug.contains("82, 69, 85, 83"));
+        let encoded = bmux_codec::to_typed_vec(value).unwrap();
+        let decoded: T = bmux_codec::from_typed_bytes(&encoded).unwrap();
+        assert_eq!(
+            serde_json::to_value(value).unwrap(),
+            serde_json::to_value(&decoded).unwrap()
+        );
+        let serialized = serde_json::to_string(value).unwrap();
+        // Bytes serialize as integer arrays; strings retain their original contents.
+        assert!(serialized.contains(SENTINEL) || serialized.contains("82,69,85,83"));
+    }
+    let invitation = Invitation {
+        invitation_id: "invitation".into(),
+        endpoint_id: "endpoint".into(),
+        device_key: "device".into(),
+        secret: SENTINEL.as_bytes().to_vec(),
+        expires_at: 123,
+        access: DeviceAccess::Denied,
+        possession_message: SENTINEL.as_bytes().to_vec(),
+    };
+    check(&invitation);
+    let decoded: Invitation =
+        serde_json::from_str(&serde_json::to_string(&invitation).unwrap()).unwrap();
+    assert_eq!(decoded, invitation);
+    assert_eq!(decoded.secret, SENTINEL.as_bytes());
+    assert_eq!(decoded.possession_message, SENTINEL.as_bytes());
+    check(&PairingSession {
+        session_id: "session".into(),
+        invitation_link: SENTINEL.into(),
+        expires_at: 123,
+    });
+    check(&pairing_commands::client::PairEndpointRequest {
+        target: "host".into(),
+        invitation,
+    });
+    check(&pairing_commands::client::RedeemInvitationRequest {
+        invitation_id: "id".into(),
+        secret: SENTINEL.as_bytes().to_vec(),
+        signature: SENTINEL.as_bytes().to_vec(),
+    });
+    check(&admission_provider_commands::client::ConsumeRequest {
+        ticket: SENTINEL.as_bytes().to_vec(),
+    });
+    check(&pairing_peer_commands::client::SubmitPairingRequest {
+        session_id: "session".into(),
+        nonce: SENTINEL.as_bytes().to_vec(),
+        signature: SENTINEL.as_bytes().to_vec(),
+        device_name: None,
+    });
+}
+
+#[test]
+fn secret_metadata_keeps_existing_typed_wire_layout() {
+    use bmux_connections_plugin_api::pairing_types::{DeviceAccess, Invitation, PairingSession};
+    // Mirrors the pre-annotation serde layout, without any diagnostic metadata.
+    #[derive(serde::Serialize)]
+    struct PlainInvitation {
+        invitation_id: String,
+        endpoint_id: String,
+        device_key: String,
+        #[serde(with = "bmux_codec::serde_bytes_vec")]
+        secret: Vec<u8>,
+        expires_at: u64,
+        access: DeviceAccess,
+        #[serde(with = "bmux_codec::serde_bytes_vec")]
+        possession_message: Vec<u8>,
+    }
+    let plain = PlainInvitation {
+        invitation_id: "id".into(),
+        endpoint_id: "host".into(),
+        device_key: "device".into(),
+        secret: vec![1, 2, 3],
+        expires_at: 42,
+        access: DeviceAccess::Denied,
+        possession_message: vec![4, 5, 6],
+    };
+    let generated: Invitation =
+        serde_json::from_value(serde_json::to_value(&plain).unwrap()).unwrap();
+    assert_eq!(
+        bmux_codec::to_typed_vec(&plain).unwrap(),
+        bmux_codec::to_typed_vec(&generated).unwrap()
+    );
+    #[derive(serde::Serialize)]
+    struct PlainSession {
+        session_id: String,
+        invitation_link: String,
+        expires_at: u64,
+    }
+    let plain = PlainSession {
+        session_id: "id".into(),
+        invitation_link: "secret link".into(),
+        expires_at: 42,
+    };
+    let generated: PairingSession =
+        serde_json::from_value(serde_json::to_value(&plain).unwrap()).unwrap();
+    assert_eq!(
+        bmux_codec::to_typed_vec(&plain).unwrap(),
+        bmux_codec::to_typed_vec(&generated).unwrap()
     );
 }

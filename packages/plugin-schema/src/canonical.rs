@@ -51,6 +51,7 @@ fn ty(out: &mut Vec<u8>, value: &TypeRef) {
 fn fields(out: &mut Vec<u8>, values: &[Field]) {
     out.extend_from_slice(&(values.len() as u64).to_le_bytes());
     for field in values {
+        // `secret` affects Rust diagnostics only, never wire compatibility.
         text(out, &field.name);
         ty(out, &field.ty);
     }

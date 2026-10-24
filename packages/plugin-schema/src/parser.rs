@@ -247,10 +247,12 @@ impl Parser<'_> {
         let mut params = Vec::new();
         while !self.check(&TokenKind::RParen) {
             let param_span = self.peek().map_or(Span::new(0, 0), |t| t.span);
+            let secret = self.parse_field_secret()?;
             let param_name = self.expect_identifier("expected parameter name")?;
             self.expect(&TokenKind::Colon, "expected `:` after parameter name")?;
             let ty = self.parse_type()?;
             params.push(Field {
+                secret,
                 name: param_name,
                 ty,
                 span: param_span,
@@ -381,14 +383,35 @@ impl Parser<'_> {
         }
     }
 
+    fn parse_field_secret(&mut self) -> Result<bool, Error> {
+        if !self.check(&TokenKind::At) {
+            return Ok(false);
+        }
+        let span = self.expect(&TokenKind::At, "expected `@`")?;
+        let name = self.expect_identifier("expected field annotation")?;
+        if name != "secret" || self.check(&TokenKind::At) {
+            return Err(Error::Parse {
+                span,
+                message: "only one `@secret` annotation is allowed on a field or parameter".into(),
+            });
+        }
+        Ok(true)
+    }
+
     fn parse_fields(&mut self) -> Result<Vec<Field>, Error> {
         let mut fields = Vec::new();
         while !self.check(&TokenKind::RBrace) {
             let span = self.peek().map_or(Span::new(0, 0), |t| t.span);
+            let secret = self.parse_field_secret()?;
             let name = self.expect_contextual_name("expected field name")?;
             self.expect(&TokenKind::Colon, "expected `:` after field name")?;
             let ty = self.parse_type()?;
-            fields.push(Field { name, ty, span });
+            fields.push(Field {
+                secret,
+                name,
+                ty,
+                span,
+            });
             if self.check(&TokenKind::Comma) {
                 self.advance();
             } else {

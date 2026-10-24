@@ -2425,6 +2425,26 @@ mod admission_tests {
                 decode::<Response>(&hello.payload).unwrap(),
                 Response::Ok(ResponsePayload::HelloNegotiated { .. })
             ));
+            // Hello is written before host provenance is recorded. Wait for
+            // registration before revoking so this tests an idle admitted stream,
+            // not a revocation racing the final handshake registration.
+            tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    if server
+                        .state
+                        .client_principals
+                        .lock()
+                        .unwrap()
+                        .values()
+                        .any(|principal| *principal == subject)
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
             if expire {
                 // Exercise expiry without waiting out the provider's production TTL.
                 *authority.expires.lock().unwrap() =

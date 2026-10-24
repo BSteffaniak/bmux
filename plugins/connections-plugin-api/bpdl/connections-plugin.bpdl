@@ -95,15 +95,40 @@ interface pairing-types {
         invitation_id: string,
         endpoint_id: string,
         device_key: string,
-        secret: bytes,
+        @secret secret: bytes,
         expires_at: u64,
         access: device-access,
         // Sign these exact bytes with the device Iroh secret key.
-        possession_message: bytes,
+        @secret possession_message: bytes,
+    }
+    enum session-phase {
+        waiting-peer,
+        pending-approval,
+        pending-grant,
+        active,
+        rejected,
+        cancelled,
+        expired,
+    }
+    record pairing-session {
+        session_id: string,
+        // Display explicitly; never log this reusable pre-approval secret.
+        @secret invitation_link: string,
+        expires_at: u64,
+    }
+    record pairing-request {
+        session_id: string,
+        phase: session-phase,
+        peer_key: string?,
+        // Untrusted display label, authenticated as part of the transcript.
+        device_name: string?,
+        verification_phrase: string?,
+        device_id: string?,
+        expires_at: u64,
     }
     record admission-challenge {
-        challenge: bytes,
-        possession_message: bytes,
+        @secret challenge: bytes,
+        @secret possession_message: bytes,
     }
 }
 
@@ -117,11 +142,11 @@ interface pairing-commands {
     command pair-endpoint(target: string, invitation: pairing-types.invitation) -> string;
     command stop-listener() -> pairing-types.listener-status;
     command create-invitation(device_key: string, ttl_seconds: u64, access: pairing-types.device-access) -> pairing-types.invitation;
-    command redeem-invitation(invitation_id: string, secret: bytes, signature: bytes) -> pairing-types.device;
+    command redeem-invitation(invitation_id: string, @secret secret: bytes, @secret signature: bytes) -> pairing-types.device;
     command grant-device(device_id: string, access: pairing-types.device-access) -> pairing-types.device;
     command revoke-device(device_id: string) -> pairing-types.device;
     command begin-admission(device_id: string) -> pairing-types.admission-challenge;
-    command finish-admission(challenge: bytes, signature: bytes) -> bytes;
+    command finish-admission(@secret challenge: bytes, @secret signature: bytes) -> bytes;
 }
 
 @capability(CONNECTIONS_PAIRING)
@@ -144,6 +169,26 @@ interface connections-commands {
     command invoke-service(invocation: connection-types.service-invocation) -> result<bytes, connection-types.connection-error>;
 }
 
+// Owner-only short operations. Handler must prove trusted local owner provenance.
+@capability(CONNECTIONS_PAIRING)
+interface pairing-session-commands {
+    command begin-session(ttl_seconds: u64, endpoint_targets: list<string>) -> pairing-types.pairing-session;
+    command approve-session(session_id: string, verification_phrase: string) -> pairing-types.device;
+    command reject-session(session_id: string) -> pairing-types.pairing-request;
+    command cancel-session(session_id: string) -> pairing-types.pairing-request;
+}
+@capability(CONNECTIONS_PAIRING)
+interface pairing-session-state {
+    query pending-request(session_id: string) -> pairing-types.pairing-request;
+}
+// Only this generated surface is exposed to an unadmitted Iroh peer.
+@capability(CONNECTIONS_PAIRING)
+interface pairing-peer-commands {
+    command submit-pairing(session_id: string, @secret nonce: bytes, @secret signature: bytes, device_name: string?) -> pairing-types.pairing-request;
+    command poll-pairing(session_id: string, @secret nonce: bytes) -> pairing-types.pairing-request;
+    command pairing-result(session_id: string, @secret nonce: bytes) -> pairing-types.device;
+}
+
 // Private host-selected provider. Every operation also requires HostInternal
 // provenance; ordinary local and admitted callers are rejected.
 @capability(CONNECTIONS_PAIRING)
@@ -153,5 +198,5 @@ interface admission-provider-state {
 }
 @capability(CONNECTIONS_PAIRING)
 interface admission-provider-commands {
-    command consume(ticket: bytes) -> pairing-types.admission-binding;
+    command consume(@secret ticket: bytes) -> pairing-types.admission-binding;
 }

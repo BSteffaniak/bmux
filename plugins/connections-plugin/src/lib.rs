@@ -3,6 +3,8 @@
 #![allow(clippy::multiple_crate_versions)]
 
 mod admission;
+mod attach_provider;
+mod client_cli;
 mod config;
 mod device_client;
 mod directory;
@@ -177,6 +179,182 @@ impl ConnectionsPlugin {
             }
         });
         self.listener_status()
+    }
+
+    fn local_device_identity(ctx: &NativeServiceContext) -> Result<String, ServiceResponse> {
+        let _owner = pairing_owner(ctx)?;
+        let paths = target::context_paths(&ctx.connection);
+        identity::DeviceIdentity::load_or_create(&paths.state_dir, &paths.runtime_dir)
+            .map(|identity| identity.public_key())
+            .map_err(pairing_error)
+    }
+
+    fn pair_endpoint(
+        ctx: &NativeServiceContext,
+        request: &pairing_requests::PairEndpointRequest,
+    ) -> Result<String, ServiceResponse> {
+        let _owner = pairing_owner(ctx)?;
+        let paths = target::context_paths(&ctx.connection);
+        let config = target::load_config(&ctx.connection).map_err(pairing_error)?;
+        let resolved = target::resolve_internal(&config, &request.target)
+            .map_err(|_| ServiceResponse::error("invalid_target", "device endpoint required"))?;
+        let target::ResolvedTarget::Iroh(target) = resolved else {
+            return Err(ServiceResponse::error(
+                "invalid_target",
+                "device endpoint required",
+            ));
+        };
+        block_on_connection(transport::pair_endpoint(
+            &paths,
+            &target,
+            &request.invitation,
+        ))
+        .map_err(pairing_error)
+    }
+
+    fn set_remote_enabled(
+        &self,
+        ctx: &NativeServiceContext,
+        enabled: bool,
+    ) -> Result<bmux_connections_plugin_api::pairing_types::ListenerStatus, ServiceResponse> {
+        let _owner = pairing_owner(ctx)?;
+        let paths = target::context_paths(&ctx.connection);
+        if !enabled {
+            self.stop_listener(ctx)?;
+        }
+        remote_preferences::update(&paths, |p| {
+            p.enabled = Some(enabled);
+            Ok(())
+        })
+        .map_err(pairing_error)?;
+        if enabled {
+            self.start_listener(ctx)
+        } else {
+            self.listener_status()
+        }
+    }
+
+    fn begin_pairing_session(
+        &self,
+        ctx: &NativeServiceContext,
+        request: &bmux_connections_plugin_api::pairing_session_commands::client::BeginSessionRequest,
+    ) -> Result<bmux_connections_plugin_api::pairing_types::PairingSession, ServiceResponse> {
+        let owner = pairing_owner(ctx)?;
+        let status = self.listener_status()?;
+        if !status.enabled {
+            return Err(ServiceResponse::error(
+                "disabled",
+                "remote listener is disabled",
+            ));
+        }
+        // Routes are selected by this host, never supplied by the caller.
+        if !request.endpoint_targets.is_empty()
+            && request.endpoint_targets != status.endpoint_targets
+        {
+            return Err(ServiceResponse::error(
+                "invalid_routes",
+                "use current listener routes",
+            ));
+        }
+        let authority = self.pairing()?;
+        authority
+            .sessions
+            .begin_session(
+                &owner,
+                authority,
+                request.ttl_seconds,
+                status.endpoint_targets,
+            )
+            .map_err(pairing_error)
+    }
+
+    fn pending_pairing_request(
+        &self,
+        ctx: &NativeServiceContext,
+        session_id: &str,
+    ) -> Result<bmux_connections_plugin_api::pairing_types::PairingRequest, ServiceResponse> {
+        let owner = pairing_owner(ctx)?;
+        self.pairing()?
+            .sessions
+            .pending_request(&owner, session_id)
+            .map_err(pairing_error)
+    }
+
+    fn list_devices(
+        &self,
+        ctx: &NativeServiceContext,
+    ) -> Result<Vec<bmux_connections_plugin_api::pairing_types::Device>, ServiceResponse> {
+        let owner = pairing_owner(ctx)?;
+        self.pairing()?.list_devices(&owner).map_err(pairing_error)
+    }
+
+    fn revoke_device(
+        &self,
+        ctx: &NativeServiceContext,
+        device_id: &str,
+    ) -> Result<bmux_connections_plugin_api::pairing_types::Device, ServiceResponse> {
+        let owner = pairing_owner(ctx)?;
+        self.pairing()?
+            .revoke(&owner, device_id)
+            .map_err(pairing_error)
+    }
+
+    fn approve_pairing_session(
+        &self,
+        ctx: &NativeServiceContext,
+        session_id: &str,
+        verification_phrase: &str,
+    ) -> Result<bmux_connections_plugin_api::pairing_types::Device, ServiceResponse> {
+        let owner = pairing_owner(ctx)?;
+        let authority = self.pairing()?;
+        let staged = authority
+            .sessions
+            .approve_session(&owner, authority, session_id, verification_phrase)
+            .map_err(pairing_error)?;
+        let caller = bmux_plugin::TypedServiceCaller::from_service_context(ctx);
+        let mut client = bmux_plugin::ServiceCallerDispatchClient::new(&caller);
+        let subject = staged
+            .device_id
+            .parse()
+            .map_err(|error: uuid::Error| pairing_error(error.into()))?;
+        let grant = bmux_plugin::block_on_typed_dispatch(
+            bmux_permissions_plugin_api::permissions_commands::client::grant_resource(
+                &mut client,
+                subject,
+                None,
+                "writer".to_owned(),
+            ),
+        );
+        let activation = match grant {
+            Ok(ack) if ack.ok => authority
+                .sessions
+                .activate_session(&owner, authority, session_id)
+                .map_err(pairing_error),
+            _ => Err(ServiceResponse::error(
+                "grant_failed",
+                "resource grant failed; pairing remains denied",
+            )),
+        };
+        if activation.is_err() {
+            // Deny transport first. Permission compensation cannot revive it.
+            let abort = authority
+                .sessions
+                .abort_session(&owner, authority, session_id, false);
+            let compensation = bmux_plugin::block_on_typed_dispatch(
+                bmux_permissions_plugin_api::permissions_commands::client::revoke_resource(
+                    &mut client,
+                    subject,
+                    None,
+                ),
+            );
+            if abort.is_err() || !matches!(compensation, Ok(ack) if ack.ok) {
+                return Err(ServiceResponse::error(
+                    "pairing_recovery_required",
+                    "pairing failed; owner must revoke the pending device and its resource grant before retrying",
+                ));
+            }
+        }
+        activation
     }
 
     /// Local activation status without private key material or network activity.
@@ -367,28 +545,13 @@ impl RustPlugin for ConnectionsPlugin {
     fn invoke_service(&self, context: NativeServiceContext) -> ServiceResponse {
         bmux_plugin_sdk::route_service!(context, {
             "pairing-state", "local-device-identity" => |(): (), ctx| {
-                let _owner = pairing_owner(ctx)?;
-                let paths = target::context_paths(&ctx.connection);
-                identity::DeviceIdentity::load_or_create(&paths.state_dir, &paths.runtime_dir)
-                    .map(|identity| identity.public_key()).map_err(pairing_error)
+                Self::local_device_identity(ctx)
             },
             "pairing-commands", "pair-endpoint" => |request: pairing_requests::PairEndpointRequest, ctx| {
-                let _owner = pairing_owner(ctx)?;
-                let paths = target::context_paths(&ctx.connection);
-                let config = target::load_config(&ctx.connection).map_err(pairing_error)?;
-                let resolved = target::resolve_internal(&config, &request.target)
-                    .map_err(|_| ServiceResponse::error("invalid_target", "device endpoint required"))?;
-                let target::ResolvedTarget::Iroh(target) = resolved else {
-                    return Err(ServiceResponse::error("invalid_target", "device endpoint required"));
-                };
-                block_on_connection(transport::pair_endpoint(&paths, &target, &request.invitation)).map_err(pairing_error)
+                Self::pair_endpoint(ctx, &request)
             },
             "pairing-commands", "set-enabled" => |request: pairing_requests::SetEnabledRequest, ctx| {
-                let _owner = pairing_owner(ctx)?;
-                let paths = target::context_paths(&ctx.connection);
-                if !request.enabled { self.stop_listener(ctx)?; }
-                remote_preferences::update(&paths, |p| { p.enabled = Some(request.enabled); Ok(()) }).map_err(pairing_error)?;
-                if request.enabled { self.start_listener(ctx) } else { self.listener_status() }
+                self.set_remote_enabled(ctx, request.enabled)
             },
             "pairing-commands", "start-listener" => |(): (), ctx| { self.start_listener(ctx) },
             "pairing-commands", "stop-listener" => |(): (), ctx| { self.stop_listener(ctx) },
@@ -407,6 +570,25 @@ impl RustPlugin for ConnectionsPlugin {
                 let binding = bmux_plugin::stream_admission::StreamAdmissionBinding::new(request.subject_id, request.lease_id);
                 Ok::<_, ServiceResponse>(self.admission()?.validate(&binding).is_ok())
             },
+            "pairing-session-commands", "begin-session" => |request: bmux_connections_plugin_api::pairing_session_commands::client::BeginSessionRequest, ctx| {
+                self.begin_pairing_session(ctx, &request)
+            },
+            "pairing-session-state", "pending-request" => |request: bmux_connections_plugin_api::pairing_session_state::client::PendingRequestRequest, ctx| {
+                self.pending_pairing_request(ctx, &request.session_id)
+            },
+            "pairing-session-commands", "approve-session" => |request: bmux_connections_plugin_api::pairing_session_commands::client::ApproveSessionRequest, ctx| {
+                self.approve_pairing_session(ctx, &request.session_id, &request.verification_phrase)
+            },
+            "pairing-session-commands", "reject-session" => |request: bmux_connections_plugin_api::pairing_session_commands::client::RejectSessionRequest, ctx| {
+                let owner = pairing_owner(ctx)?;
+                let authority = self.pairing()?;
+                authority.sessions.abort_session(&owner, authority, &request.session_id, true).map_err(pairing_error)
+            },
+            "pairing-session-commands", "cancel-session" => |request: bmux_connections_plugin_api::pairing_session_commands::client::CancelSessionRequest, ctx| {
+                let owner = pairing_owner(ctx)?;
+                let authority = self.pairing()?;
+                authority.sessions.abort_session(&owner, authority, &request.session_id, false).map_err(pairing_error)
+            },
             "pairing-commands", "create-invitation" => |request: pairing_requests::CreateInvitationRequest, ctx| {
                 let owner = pairing_owner(ctx)?;
                 self.pairing()?.create_invitation(&owner, &request.device_key, request.ttl_seconds, request.access).map_err(pairing_error)
@@ -419,8 +601,7 @@ impl RustPlugin for ConnectionsPlugin {
                 self.pairing()?.grant(&owner, &request.device_id, request.access).map_err(pairing_error)
             },
             "pairing-commands", "revoke-device" => |request: pairing_requests::RevokeDeviceRequest, ctx| {
-                let owner = pairing_owner(ctx)?;
-                self.pairing()?.revoke(&owner, &request.device_id).map_err(pairing_error)
+                self.revoke_device(ctx, &request.device_id)
             },
             "pairing-commands", "begin-admission" => |request: pairing_requests::BeginAdmissionRequest, _ctx| {
                 self.admission()?.begin(&request.device_id).map_err(pairing_error)
@@ -432,8 +613,7 @@ impl RustPlugin for ConnectionsPlugin {
                 Ok::<_, ServiceResponse>(current_provenance(ctx))
             },
             "pairing-state", "list-devices" => |(): (), ctx| {
-                let owner = pairing_owner(ctx)?;
-                self.pairing()?.list_devices(&owner).map_err(pairing_error)
+                self.list_devices(ctx)
             },
             "pairing-state", "check-device-access" => |request: bmux_connections_plugin_api::pairing_state::client::CheckDeviceAccessRequest, _ctx| {
                 self.pairing()?.check_device_access(request.subject_id).map_err(pairing_error)
@@ -635,6 +815,12 @@ fn invoke_service(
             }
         }
     })
+}
+
+/// Install plugin-owned client attachment without activating a local server.
+pub fn install_client_adapter(paths: &bmux_config::ConfigPaths) {
+    attach_provider::set_paths(paths.clone());
+    attach_provider::install();
 }
 
 /// Resolve an owner-paired display name without exposing private device credentials.

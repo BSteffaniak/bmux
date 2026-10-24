@@ -10,6 +10,24 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
+/// Durable local-process namespace. Profiles are explicit and never inferred from
+/// an ephemeral runtime path or the process environment.
+pub fn client_directory(state_dir: &Path, profile: &str) -> Result<PathBuf> {
+    if !state_dir.is_absolute()
+        || profile.is_empty()
+        || profile.len() > 128
+        || !profile
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        bail!("client storage requires an absolute state root and an explicit valid profile");
+    }
+    std::fs::create_dir_all(state_dir).context("create client state root")?;
+    Ok(state_dir
+        .canonicalize()?
+        .join(format!("connections-client-{profile}")))
+}
+
 /// Resolve only explicit host paths; named runtimes sharing state get distinct namespaces.
 pub fn runtime_directory(state_dir: &Path, runtime_dir: &Path) -> Result<PathBuf> {
     if !state_dir.is_absolute() || !runtime_dir.is_absolute() {
@@ -42,6 +60,43 @@ pub struct PairingStore {
 }
 
 impl PairingStore {
+    pub(crate) fn client(state_dir: &Path, profile: &str, record: &'static CStr) -> Result<Self> {
+        Ok(Self {
+            directory: PrivateDirectory::open(&client_directory(state_dir, profile)?)?,
+            record,
+            // One client lock also serializes migration and related client writes.
+            lock: c"client.lock",
+        })
+    }
+
+    /// Read only known client portions of legacy runtime stores. Host grants and
+    /// endpoint identity are never read or moved by client migration.
+    pub(crate) fn legacy_records(
+        state_dir: &Path,
+        record: &'static CStr,
+    ) -> Result<Vec<(String, Vec<u8>)>> {
+        let mut records = Vec::new();
+        for entry in std::fs::read_dir(state_dir)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            let Some(suffix) = name.strip_prefix("connections-") else {
+                continue;
+            };
+            if suffix.len() != 64 || !suffix.bytes().all(|b| b.is_ascii_hexdigit()) {
+                continue;
+            }
+            let directory = PrivateDirectory::open(&entry.path())?;
+            if let Some(bytes) = directory.read_record(record, 1_048_576)? {
+                records.push((name.to_owned(), bytes));
+            }
+        }
+        records.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(records)
+    }
+
     pub(crate) fn open(state_dir: &Path, runtime_dir: &Path) -> Result<Self> {
         Ok(Self {
             directory: PrivateDirectory::open(&runtime_directory(state_dir, runtime_dir)?)?,
@@ -58,6 +113,7 @@ impl PairingStore {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn outbound(state_dir: &Path, runtime_dir: &Path) -> Result<Self> {
         Ok(Self {
             directory: PrivateDirectory::open(&runtime_directory(state_dir, runtime_dir)?)?,

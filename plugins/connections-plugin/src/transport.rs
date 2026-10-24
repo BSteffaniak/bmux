@@ -610,7 +610,61 @@ fn certificate_fingerprint(certificate: &[u8]) -> String {
     value
 }
 
+/// Typed connection path for bounded attach recovery. Keep trust and admission
+/// failures distinct from retryable transport failures instead of parsing text.
+pub async fn connect_paired_for_attach(
+    paths: &ConfigPaths,
+    reference: &str,
+) -> Result<BmuxClient, ConnectionError> {
+    connect_paired_attach_host(paths, reference)
+        .await
+        .map(|(client, _, _)| client)
+}
+
+/// The endpoint and resolved route come from the same authenticated dial.
+pub async fn connect_paired_attach_host(
+    paths: &ConfigPaths,
+    reference: &str,
+) -> Result<(BmuxClient, String, String), ConnectionError> {
+    let invalid = |error: anyhow::Error| ConnectionError::InvalidTarget {
+        target: reference.to_owned(),
+        reason: error.to_string(),
+    };
+    let config = BmuxConfig::load_isolated_with_paths_and_overrides(
+        paths,
+        &bmux_config::ConfigLoadOverrides::default(),
+    )
+    .map_err(|error| invalid(error.into()))?;
+    let reference = crate::remote_preferences::alias(paths, reference)
+        .map_err(invalid)?
+        .unwrap_or_else(|| reference.to_owned());
+    let target = crate::target::resolve_internal(&config, &reference)?;
+    if !matches!(target, ResolvedTarget::Iroh(_)) {
+        return Err(ConnectionError::InvalidTarget {
+            target: reference,
+            reason: "paired device endpoint required".into(),
+        });
+    }
+    let endpoint_id = match &target {
+        ResolvedTarget::Iroh(target) => target
+            .endpoint_id
+            .parse::<EndpointId>()
+            .map_err(|error| invalid(error.into()))?
+            .to_string(),
+        _ => unreachable!("validated Iroh target"),
+    };
+    let mut client = connect(&config, paths, &target).await?;
+    client
+        .require_service_contracts()
+        .map_err(|error| ConnectionError::TrustFailed {
+            target: reference.clone(),
+            reason: error.to_string(),
+        })?;
+    Ok((client, endpoint_id, reference))
+}
+
 async fn dial_device(
+    paths: &ConfigPaths,
     identity: &crate::identity::DeviceIdentity,
     target: &IrohTarget,
 ) -> Result<(iroh::Endpoint, iroh::endpoint::Connection)> {
@@ -618,10 +672,13 @@ async fn dial_device(
         !target.require_ssh_auth && target.compression != CompressionMode::Zstd,
         "unsupported device transport options"
     );
-    let mut builder = identity.endpoint_builder();
-    if target.ip_addr.is_some() && target.relay_url.is_none() {
-        builder = builder.clear_address_lookup().clear_relay_transports();
-    }
+    let config = BmuxConfig::load_isolated_with_paths_and_overrides(
+        paths,
+        &bmux_config::ConfigLoadOverrides::default(),
+    )?;
+    let settings =
+        crate::config::RemoteSettings::load(config.plugins.settings.get("bmux.connections"))?;
+    let builder = device_endpoint_builder(identity.endpoint_builder(), target, &settings.relay)?;
     let endpoint = builder
         .alpns(vec![crate::device_client::alpn().to_vec()])
         .bind()
@@ -634,11 +691,49 @@ async fn dial_device(
         address = address.with_ip_addr(addr);
     }
     let connection = tokio::time::timeout(
-        Duration::from_millis(target.connect_timeout_ms),
+        Duration::from_millis(target.connect_timeout_ms.max(1)),
         endpoint.connect(address, crate::device_client::alpn()),
     )
     .await??;
     Ok((endpoint, connection))
+}
+
+fn device_endpoint_builder(
+    builder: iroh::endpoint::Builder,
+    target: &IrohTarget,
+    policy: &crate::config::RelayPolicy,
+) -> Result<iroh::endpoint::Builder> {
+    let mut builder = policy.apply(builder)?;
+    match (policy, &target.relay_url) {
+        (crate::config::RelayPolicy::Disabled, Some(_)) => {
+            anyhow::bail!("relay disabled by local policy")
+        }
+        (crate::config::RelayPolicy::Custom { urls }, Some(url)) => {
+            let requested: iroh::RelayUrl = url.parse()?;
+            anyhow::ensure!(
+                urls.iter()
+                    .filter_map(|url| url.parse::<iroh::RelayUrl>().ok())
+                    .any(|url| url == requested),
+                "target relay is outside configured custom relay policy"
+            );
+        }
+        (crate::config::RelayPolicy::Default, Some(url)) => {
+            builder = builder
+                .clear_address_lookup()
+                .relay_mode(iroh::RelayMode::Custom(iroh::RelayMap::from_iter([
+                    url.parse::<iroh::RelayUrl>()?,
+                ])));
+        }
+        _ => {}
+    }
+    // An explicit direct-only descriptor has no dependency on public discovery.
+    if target.ip_addr.is_some()
+        && target.relay_url.is_none()
+        && matches!(policy, crate::config::RelayPolicy::Default)
+    {
+        builder = builder.clear_address_lookup().clear_relay_transports();
+    }
+    Ok(builder)
 }
 
 pub async fn pair_endpoint(
@@ -657,7 +752,7 @@ pub async fn pair_endpoint(
         target.device_id.is_none(),
         "pair a public device endpoint without device-id"
     );
-    let (endpoint, connection) = dial_device(&identity, target).await?;
+    let (endpoint, connection) = dial_device(paths, &identity, target).await?;
     let (stream, subject) = crate::device_client::admit(
         &endpoint,
         &connection,
@@ -680,11 +775,13 @@ async fn connect_iroh(
     target: &IrohTarget,
 ) -> Result<BmuxClient, ConnectionError> {
     let identity =
-        crate::identity::DeviceIdentity::load_or_create(&paths.state_dir, &paths.runtime_dir)
-            .map_err(|error| connection_error(target, error))?;
+        crate::identity::DeviceIdentity::load_or_create_local(&paths.state_dir, "default")
+            .map_err(|_| {
+                trust_failure(target, "local device identity is invalid or unavailable")
+            })?;
     let device_id = crate::outbound::subject(paths, target, &identity)
         .map_err(|_| trust_failure(target, "outbound host is not paired for this device"))?;
-    let (endpoint, connection) = dial_device(&identity, target)
+    let (endpoint, connection) = dial_device(paths, &identity, target)
         .await
         .map_err(|error| connection_error(target, error))?;
     let (stream, subject) = crate::device_client::admit(
@@ -696,11 +793,15 @@ async fn connect_iroh(
         Duration::from_millis(target.connect_timeout_ms.max(1)),
     )
     .await
-    .map_err(|_| {
-        trust_failure(
-            target,
-            "device admission denied; verify pairing and access grant",
-        )
+    .map_err(|error| {
+        if admission_transport_failure(&error) {
+            connection_failure(target, "device admission transport interrupted")
+        } else {
+            trust_failure(
+                target,
+                "device admission denied; verify pairing and access grant",
+            )
+        }
     })?;
     BmuxClient::connect_with_bridge_stream(
         stream,
@@ -710,6 +811,31 @@ async fn connect_iroh(
     )
     .await
     .map_err(|error| connection_error(target, error))
+}
+
+fn admission_transport_failure(error: &anyhow::Error) -> bool {
+    use bmux_plugin_sdk::{TypedDispatchClientError, TypedServiceClientError};
+    error.chain().any(|cause| {
+        cause.is::<tokio::time::error::Elapsed>()
+            || matches!(
+                cause.downcast_ref::<TypedServiceClientError>(),
+                Some(TypedServiceClientError::Dispatch(
+                    TypedDispatchClientError::Transport { .. }
+                ))
+            )
+            || matches!(
+                cause
+                    .downcast_ref::<std::io::Error>()
+                    .map(std::io::Error::kind),
+                Some(
+                    std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::UnexpectedEof
+                        | std::io::ErrorKind::TimedOut
+                )
+            )
+    })
 }
 
 fn load_or_create_principal_id(paths: &ConfigPaths) -> Result<Uuid> {
@@ -787,6 +913,117 @@ fn trust_failure(target: &impl TargetLabel, reason: &str) -> ConnectionError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn direct_target(endpoint_id: String) -> IrohTarget {
+        IrohTarget {
+            reference: "loopback".into(),
+            label: "loopback".into(),
+            endpoint_id,
+            relay_url: None,
+            ip_addr: Some("127.0.0.1:1".parse().unwrap()),
+            device_id: None,
+            require_ssh_auth: false,
+            compression: CompressionMode::None,
+            connect_timeout_ms: 1_000,
+        }
+    }
+
+    #[test]
+    fn device_relay_policy_rejects_disabled_and_unconfigured_relays() {
+        use crate::config::RelayPolicy;
+        let mut target = direct_target(iroh::SecretKey::generate().public().to_string());
+        target.relay_url = Some("https://relay.example".into());
+        let builder = || iroh::Endpoint::builder(iroh::endpoint::presets::N0);
+        assert!(device_endpoint_builder(builder(), &target, &RelayPolicy::Disabled).is_err());
+        assert!(
+            device_endpoint_builder(
+                builder(),
+                &target,
+                &RelayPolicy::Custom {
+                    urls: vec!["https://other.example".into()]
+                }
+            )
+            .is_err()
+        );
+        assert!(
+            device_endpoint_builder(
+                builder(),
+                &target,
+                &RelayPolicy::Custom {
+                    urls: vec!["https://relay.example/".into()]
+                }
+            )
+            .is_ok()
+        );
+        assert!(device_endpoint_builder(builder(), &target, &RelayPolicy::Default).is_ok());
+    }
+
+    #[tokio::test]
+    async fn device_direct_descriptor_connects_loopback_without_relay() {
+        use crate::config::RelayPolicy;
+        // Both endpoints have only loopback UDP. This proves direct transport,
+        // NOT a relay path or a public-infrastructure reachability claim.
+        let local = || {
+            iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+                .clear_address_lookup()
+                .clear_relay_transports()
+                .clear_ip_transports()
+                .bind_addr("127.0.0.1:0")
+                .unwrap()
+        };
+        let host = local()
+            .alpns(vec![crate::device_client::alpn().to_vec()])
+            .bind()
+            .await
+            .unwrap();
+        let mut target = direct_target(host.id().to_string());
+        target.ip_addr = host.addr().ip_addrs().next().copied();
+        assert!(target.ip_addr.is_some());
+        let client = device_endpoint_builder(local(), &target, &RelayPolicy::Default)
+            .unwrap()
+            .bind()
+            .await
+            .unwrap();
+        let address = EndpointAddr::new(host.id()).with_ip_addr(target.ip_addr.unwrap());
+        let connected = async {
+            tokio::join!(
+                client.connect(address, crate::device_client::alpn()),
+                async { host.accept().await.unwrap().await.unwrap() }
+            )
+        };
+        let (outbound, inbound) = tokio::time::timeout(Duration::from_secs(3), connected)
+            .await
+            .unwrap();
+        let outbound = outbound.unwrap();
+        assert_eq!(outbound.remote_id(), host.id());
+        assert_eq!(inbound.remote_id(), client.id());
+        assert!(host.addr().relay_urls().next().is_none());
+        assert!(client.addr().relay_urls().next().is_none());
+        outbound.close(0u8.into(), b"test complete");
+        inbound.close(0u8.into(), b"test complete");
+        client.close().await;
+        host.close().await;
+    }
+
+    #[test]
+    fn admission_denial_is_not_a_transient_transport_failure() {
+        use bmux_plugin_sdk::{TypedDispatchClientError, TypedServiceClientError};
+        let denied = TypedServiceClientError::Dispatch(TypedDispatchClientError::server(
+            "admission",
+            "begin",
+            "revoked",
+        ));
+        assert!(!admission_transport_failure(&denied.into()));
+        let interrupted = TypedServiceClientError::Dispatch(TypedDispatchClientError::transport(
+            "admission",
+            "begin",
+            "closed",
+        ));
+        assert!(admission_transport_failure(&interrupted.into()));
+        assert!(!admission_transport_failure(&anyhow::anyhow!(
+            "identity mismatch"
+        )));
+    }
 
     #[test]
     fn remote_compression_policy_matches_gateway_defaults_and_overrides() {

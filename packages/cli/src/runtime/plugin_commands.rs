@@ -261,6 +261,9 @@ impl PluginCommandRegistry {
         for command in &self.commands {
             for path in std::iter::once(&command.canonical_path).chain(command.aliases.iter()) {
                 if clap_path_exists(&root, path) {
+                    if self.owned_exact_paths.get(path) == Some(&command.plugin_id) {
+                        replace_plugin_path(&mut root, path, &command.schema)?;
+                    }
                     continue;
                 }
                 insert_plugin_path(&mut root, path, &command.schema)?;
@@ -334,6 +337,21 @@ fn insert_plugin_path(root: &mut Command, path: &[String], schema: &PluginComman
     }
 
     insert_plugin_path(child, tail, schema)
+}
+
+// Only an exact path owner may replace a static leaf schema. Unowned static
+// paths retain their built-in grammar; global options remain on the parent.
+fn replace_plugin_path(root: &mut Command, path: &[String], schema: &PluginCommand) -> Result<()> {
+    let (head, tail) = path.split_first().context("empty plugin command path")?;
+    let child = root
+        .find_subcommand_mut(head)
+        .context("missing owned command path")?;
+    if tail.is_empty() {
+        *child = build_plugin_leaf_command(head, schema);
+        Ok(())
+    } else {
+        replace_plugin_path(child, tail, schema)
+    }
 }
 
 fn build_plugin_namespace_command(name: &str) -> Command {
@@ -526,6 +544,66 @@ mod tests {
         let mut config = BmuxConfig::default();
         config.plugins.enabled.push(plugin_id.to_string());
         config
+    }
+
+    #[test]
+    fn exact_owner_schema_replaces_static_leaf_and_preserves_globals() {
+        let manifest = PluginManifest::from_toml_str(
+            r#"
+id = "example.plugin"
+name = "Example"
+version = "0.1.0"
+entry = "plugin.dylib"
+owns_paths = [["existing"]]
+[[commands]]
+name = "existing"
+path = ["existing"]
+summary = "owned"
+expose_in_cli = true
+[[commands.arguments]]
+name = "extended"
+long = "extended"
+kind = "boolean"
+required = false
+[plugin_api]
+minimum = "1.0"
+[native_abi]
+minimum = "1.0"
+"#,
+        )
+        .unwrap();
+        let mut plugins = PluginRegistry::new();
+        plugins
+            .register_manifest_from_root(
+                Path::new("/plugins"),
+                Path::new("/plugins/plugin.toml"),
+                manifest,
+            )
+            .unwrap();
+        let registry =
+            PluginCommandRegistry::build(&config_with_enabled("example.plugin"), &plugins).unwrap();
+        let root = Command::new("bmux")
+            .arg(clap::Arg::new("runtime").long("runtime").global(true))
+            .subcommand(Command::new("existing").arg(clap::Arg::new("old").long("old")));
+        let extended = registry.augment_clap_command(root.clone()).unwrap();
+        let matches = extended
+            .try_get_matches_from(["bmux", "--runtime", "test", "existing", "--extended"])
+            .unwrap();
+        assert_eq!(
+            matches.get_one::<String>("runtime").map(String::as_str),
+            Some("test")
+        );
+        assert!(
+            matches
+                .subcommand_matches("existing")
+                .unwrap()
+                .get_flag("extended")
+        );
+        // The core-only parsing route retains its untouched static grammar.
+        assert!(
+            root.try_get_matches_from(["bmux", "existing", "--extended"])
+                .is_err()
+        );
     }
 
     #[test]

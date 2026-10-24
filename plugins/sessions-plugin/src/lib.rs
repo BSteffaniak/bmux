@@ -377,10 +377,7 @@ impl RustPlugin for SessionsPlugin {
                 match new_session_with_context(&context, name) {
                     Ok(ack) => {
                         record_selected_context_outcome(ack.id);
-                        if matches!(
-                            context.invocation_source,
-                            bmux_plugin_sdk::NativeCommandInvocationSource::Cli
-                        ) {
+                        if context.invocation_source.is_cli() {
                             println!("created session: {}", ack.id);
                         }
                         Ok(bmux_plugin_sdk::EXIT_OK)

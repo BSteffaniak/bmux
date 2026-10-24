@@ -227,7 +227,7 @@ fn run_command(mut context: NativeCommandContext) -> Result<i32, PluginCommandEr
             _ => return Err(PluginCommandError::failed("usage: broadcast start ENDPOINT CHANNEL CREDENTIAL_FILE SOURCE_UUID | pause | resume | stop | status | source SOURCE_UUID | terminal SOURCE_UUID SESSION_UUID ABSOLUTE_EXECUTABLE SHA256 VERSION COLS ROWS")),
         };
         let status = result.map_err(|_| PluginCommandError::failed("broadcast operation rejected"))?;
-        if context.invocation_source == bmux_plugin_sdk::NativeCommandInvocationSource::Cli { println!("{}", serde_json::to_string(&status).map_err(|_| PluginCommandError::failed("broadcast status unavailable"))?); }
+        if context.invocation_source.is_cli() { println!("{}", serde_json::to_string(&status).map_err(|_| PluginCommandError::failed("broadcast status unavailable"))?); }
         Ok(bmux_plugin_sdk::EXIT_OK)
     })
 }

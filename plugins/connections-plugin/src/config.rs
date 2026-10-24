@@ -41,6 +41,27 @@ pub enum RelayPolicy {
     },
 }
 
+impl RelayPolicy {
+    pub(crate) fn apply(
+        &self,
+        builder: iroh::endpoint::Builder,
+    ) -> Result<iroh::endpoint::Builder> {
+        Ok(match self {
+            Self::Default => builder,
+            Self::Disabled => builder.clear_address_lookup().clear_relay_transports(),
+            Self::Custom { urls } => {
+                let urls = urls
+                    .iter()
+                    .map(|url| url.parse())
+                    .collect::<Result<Vec<iroh::RelayUrl>, _>>()?;
+                builder
+                    .clear_address_lookup()
+                    .relay_mode(iroh::RelayMode::Custom(iroh::RelayMap::from_iter(urls)))
+            }
+        })
+    }
+}
+
 impl RemoteSettings {
     pub(crate) fn load(value: Option<&toml::Value>) -> Result<Self> {
         if let Some(relay) = value

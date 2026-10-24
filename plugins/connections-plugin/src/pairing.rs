@@ -1,4 +1,7 @@
 //! Durable device authority. Transport access is never administrative authority.
+#[path = "invitation.rs"]
+pub mod invitation;
+
 use crate::storage::PairingStore;
 use anyhow::{Context, Result, bail, ensure};
 use bmux_connections_plugin_api::pairing_types::{
@@ -22,6 +25,7 @@ impl LocalOwner {
 }
 
 pub struct PairingAuthority {
+    pub sessions: invitation::PairingSessions,
     store: PairingStore,
     endpoint: String,
 }
@@ -48,6 +52,7 @@ struct StoredInvitation {
 impl PairingAuthority {
     pub fn open(state: &Path, runtime: &Path, endpoint: String) -> Result<Self> {
         let authority = Self {
+            sessions: invitation::PairingSessions::default(),
             store: PairingStore::open(state, runtime)?,
             endpoint,
         };
@@ -253,6 +258,30 @@ impl PairingAuthority {
                 bail!("device access denied");
             }
             Ok(device.clone())
+        })
+    }
+
+    /// Stage enrollment with no admission authority. Resource grants are a
+    /// separate coordinator-owned operation; activate only after they succeed.
+    pub fn stage_device(&self, _owner: &LocalOwner, id: Uuid, key: &str) -> Result<Device> {
+        let key = key.parse::<iroh::PublicKey>()?.to_string();
+        self.update(|state| {
+            ensure!(!state.devices.contains_key(&id), "device already staged");
+            ensure!(
+                !state
+                    .devices
+                    .values()
+                    .any(|device| device.device_key == key),
+                "device already enrolled"
+            );
+            let device = Device {
+                device_id: id.to_string(),
+                device_key: key,
+                access: DeviceAccess::Denied,
+                revision: 1,
+            };
+            state.devices.insert(id, device.clone());
+            Ok(device)
         })
     }
 

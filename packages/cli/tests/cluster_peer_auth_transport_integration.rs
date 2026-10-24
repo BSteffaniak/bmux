@@ -629,46 +629,83 @@ async fn assert_transport_is_not_cluster_authority(joiner: &ServerEnv, endpoint:
     );
 }
 
+// Reuse only the coordinator's bounded, secret-redacting PTY primitive. Rust
+// retains ownership of the single host daemon and all persistence/revoke checks.
+fn pair_daemonless_cli(host: &ServerEnv, laptop: &ServerEnv) {
+    let script =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/smoke-remote-pairing.py");
+    let client_environment: std::collections::BTreeMap<_, _> = laptop
+        .command(&[])
+        .get_envs()
+        .filter_map(|(key, value)| {
+            value.map(|value| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.to_string_lossy().into_owned(),
+                )
+            })
+        })
+        .collect();
+    let output = Command::new("python3")
+        .args(["-c", r#"
+import importlib.util, json, os, signal, sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("pairing_smoke", sys.argv[2])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+signal.alarm(120)
+client_env = dict(os.environ, **json.loads(sys.argv[3]))
+owner = module.Terminal(Path(sys.argv[1]), os.environ, ["remote", "pair"])
+connecting = None
+try:
+    link = owner.expect(rb"(bmux-pair:v1:[0-9a-f]+)").group(1)
+    connecting = module.Terminal(Path(sys.argv[1]), client_env, ["connect", "--pair", "--name", "workstation", "--device-name", "laptop"])
+    connecting.expect(rb"Pairing link.*: ")
+    connecting.send(link + b"\n")
+    phrase = rb"([0-9a-f]{4}(?:-[0-9a-f]{4}){3})"
+    host_phrase = owner.expect(rb"Compare this phrase on the other device: " + phrase).group(1)
+    client_phrase = connecting.expect(rb"Verify on the host: " + phrase).group(1)
+    assert host_phrase == client_phrase, "authenticated verification phrases must match"
+    owner.expect(rb"\[y/N\]")
+    owner.send(b"y\n")
+    connecting.expect(rb"Paired\. Saved host: workstation")
+    assert owner.process.wait(timeout=10) == 0, "host approval failed"
+    connecting.expect(rb"\x1b\[\?2004h")
+finally:
+    if connecting is not None:
+        connecting.close()
+    owner.close()
+"#])
+        .arg(bmux_binary()).arg(script).arg(serde_json::to_string(&client_environment).unwrap())
+        .envs(host.command(&[]).get_envs().filter_map(|(key, value)| value.map(|value| (key, value))))
+        .stdin(Stdio::null()).output().expect("run isolated interactive pairing harness");
+    assert_success(
+        &output,
+        "host invitation and daemonless connect --pair with phrase approval",
+    );
+}
+
 #[test]
 #[serial_test::serial]
 fn account_free_cli_pairs_persists_and_revokes() {
     let mut host = ServerEnv::new("remote-ux-host");
-    let mut laptop = ServerEnv::new("remote-ux-laptop");
+    let laptop = ServerEnv::new("remote-ux-laptop");
     let port = reserve_tcp_port();
     host.write_config(&format!("[plugins.settings.\"bmux.connections\".remote]\nbind_addr = '127.0.0.1:{port}'\n[plugins.settings.\"bmux.connections\".remote.relay]\nmode = 'disabled'\n"));
     laptop.write_config("");
     host.start();
-    laptop.start();
-    let request = laptop.run(&["remote", "pair-request"]);
-    assert_success(&request, "generate device-bound pairing request");
-    let request_file = host.config_dir.join("request.json");
-    std::fs::write(&request_file, &request.stdout).unwrap();
-    let enabled = host.run(&["remote", "enable", "--yes"]);
-    assert_success(&enabled, "explicitly enable admitted remote listener");
-    let invitation = host.run(&[
-        "remote",
-        "approve",
-        "--file",
-        request_file.to_str().unwrap(),
-        "--name",
-        "laptop",
-        "--yes",
-    ]);
-    assert_success(&invitation, "approve exact requesting device");
-    let offer = laptop.config_dir.join("invitation.json");
-    std::fs::write(&offer, &invitation.stdout).unwrap();
-    let paired = laptop.run(&[
-        "remote",
-        "pair",
-        "--file",
-        offer.to_str().unwrap(),
-        "--name",
-        "workstation",
-    ]);
-    assert_success(&paired, "redeem invitation and save host alias");
+    assert_success(
+        &host.run(&["remote", "enable", "--yes"]),
+        "enable host listener",
+    );
+    pair_daemonless_cli(&host, &laptop);
+    assert!(
+        !laptop.runtime_dir.join("server.sock").exists(),
+        "pairing must not start a laptop daemon"
+    );
     let status = laptop.run(&["remote", "status", "workstation"]);
     assert_success(&status, "named host admits paired device");
-    assert!(combined_output(&status).contains("reachable and admitted"));
+    assert!(combined_output(&status).contains("saved on this client"));
     let paths = bmux_config::ConfigPaths::new(
         laptop.config_dir.clone(),
         laptop.runtime_dir.clone(),
@@ -732,21 +769,31 @@ fn account_free_cli_pairs_persists_and_revokes() {
         );
     });
     host.restart();
-    laptop.restart();
     assert_success(
         &laptop.run(&["remote", "status", "workstation"]),
         "trust and listener survive restart",
     );
+    runtime.block_on(async {
+        bmux_connections_plugin::connect_paired(&paths, "workstation")
+            .await
+            .expect("durable trust authenticates after host restart without laptop server");
+    });
     let revoke = host.run(&["remote", "revoke", "laptop"]);
     assert_success(&revoke, "owner revokes named device");
-    assert!(
-        !laptop
-            .run(&["remote", "status", "workstation"])
-            .status
-            .success()
-    );
+    runtime.block_on(async {
+        assert!(
+            bmux_connections_plugin::connect_paired(&paths, "workstation")
+                .await
+                .is_err(),
+            "revoked device must not reauthenticate"
+        );
+    });
     assert_success(
         &host.run(&["remote", "disable"]),
         "disable admitted listener",
+    );
+    assert!(
+        !laptop.runtime_dir.join("server.sock").exists(),
+        "client must remain daemonless after restart and revoke"
     );
 }

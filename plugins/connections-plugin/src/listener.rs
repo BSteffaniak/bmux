@@ -28,6 +28,10 @@ impl Listener {
         backend: IpcEndpoint,
     ) -> Result<Self> {
         let endpoint = builder.alpns(vec![ALPN.to_vec()]).bind().await?;
+        ensure!(
+            endpoint.id().to_string() == pairing.endpoint(),
+            "pairing listener identity mismatch"
+        );
         let accepting = endpoint.clone();
         let task = tokio::spawn(async move {
             let mut connections = JoinSet::new();
@@ -43,8 +47,12 @@ impl Listener {
                             let mut streams = JoinSet::new();
                             loop {
                                 tokio::select! {
-                                    stream = connection.accept_bi(), if streams.len() < 16 => {
-                                        let Ok((send, receive)) = stream else { break };
+                                    stream = tokio::time::timeout(Duration::from_secs(15), connection.accept_bi()), if streams.len() < 16 => {
+                                        let (send, receive) = match stream {
+                                            Ok(Ok(stream)) => stream,
+                                            Err(_) if !streams.is_empty() => continue,
+                                            _ => { connection.close(0u32.into(), b"idle pairing connection"); break; }
+                                        };
                                         let pairing = Arc::clone(&pairing);
                                         let admission = Arc::clone(&admission);
                                         let backend = backend.clone();
@@ -115,16 +123,29 @@ async fn serve_stream(
             let envelope = read_envelope(&mut receive).await?;
             ensure!(envelope.kind == EnvelopeKind::Request, "expected request");
             let request: Request = bmux_ipc::decode(&envelope.payload)?;
+            if let Request::InvokeService {
+                capability,
+                kind: bmux_ipc::InvokeServiceKind::Command,
+                interface_id,
+                operation,
+                payload,
+            } = &request
+                && capability == "bmux.connections.pairing"
+                && interface_id
+                    == bmux_connections_plugin_api::pairing_peer_commands::INTERFACE_ID.as_str()
+            {
+                let response = pairing_response(pairing, peer, interface_id, operation, payload)?;
+                write_response(&mut send, envelope.request_id, &response).await?;
+                // One short operation per stream. Approval polling cannot hold
+                // a host command or the admission handshake open.
+                return Ok(None);
+            }
             if let Request::AdmitStream {
                 admission_version: 1,
                 ticket: presented,
             } = request
             {
-                ensure!(
-                    ticket.as_ref() == Some(&presented),
-                    "ticket not issued on this stream"
-                );
-                return Ok(envelope);
+                return admitted_preamble(ticket.as_deref(), &presented, envelope);
             }
             let Request::InvokeService {
                 capability,
@@ -183,21 +204,90 @@ async fn serve_stream(
             let response = Response::Ok(ResponsePayload::ServiceInvoked {
                 payload: service_contract::encode_response(&result),
             });
-            write_envelope(
-                &mut send,
-                &Envelope::new(
-                    envelope.request_id,
-                    EnvelopeKind::Response,
-                    bmux_ipc::encode(&response)?,
-                ),
-            )
-            .await?;
+            write_response(&mut send, envelope.request_id, &response).await?;
         }
         bail!("pre-admission operation limit exceeded")
     })
     .await
     .context("pre-admission deadline")??;
-    bridge_admitted(send, receive, backend, &preamble).await
+    if let Some(preamble) = preamble {
+        bridge_admitted(send, receive, backend, &preamble).await?;
+    }
+    Ok(())
+}
+
+fn admitted_preamble(
+    ticket: Option<&[u8]>,
+    presented: &[u8],
+    envelope: Envelope,
+) -> Result<Option<Envelope>> {
+    ensure!(
+        ticket == Some(presented),
+        "ticket not issued on this stream"
+    );
+    Ok(Some(envelope))
+}
+
+async fn write_response(
+    send: &mut iroh::endpoint::SendStream,
+    request_id: u64,
+    response: &Response,
+) -> Result<()> {
+    write_envelope(
+        send,
+        &Envelope::new(
+            request_id,
+            EnvelopeKind::Response,
+            bmux_ipc::encode(response)?,
+        ),
+    )
+    .await
+}
+
+fn pairing_response(
+    pairing: &PairingAuthority,
+    peer: &str,
+    interface_id: &str,
+    operation: &str,
+    payload: &[u8],
+) -> Result<Response> {
+    use bmux_connections_plugin_api::pairing_peer_commands::{
+        self as api, client as peer_requests,
+    };
+    let payload = service_contract::decode_for(interface_id, api::SERVICE_CONTRACT, payload)?;
+    let result = match operation {
+        "submit-pairing" => {
+            let request: peer_requests::SubmitPairingRequest = decode_service_message(payload)?;
+            encode_service_message(&pairing.sessions.submit_named(
+                &request.session_id,
+                peer,
+                &request.nonce,
+                &request.signature,
+                request.device_name.as_deref(),
+            )?)?
+        }
+        "poll-pairing" => {
+            let request: peer_requests::PollPairingRequest = decode_service_message(payload)?;
+            encode_service_message(&pairing.sessions.poll(
+                &request.session_id,
+                peer,
+                &request.nonce,
+            )?)?
+        }
+        "pairing-result" => {
+            let request: peer_requests::PairingResultRequest = decode_service_message(payload)?;
+            encode_service_message(&pairing.sessions.result(
+                pairing,
+                &request.session_id,
+                peer,
+                &request.nonce,
+            )?)?
+        }
+        _ => bail!("pre-admission operation denied"),
+    };
+    Ok(Response::Ok(ResponsePayload::ServiceInvoked {
+        payload: service_contract::encode_response(&result),
+    }))
 }
 
 async fn bridge_admitted(

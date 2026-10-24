@@ -139,6 +139,7 @@ macro_rules! declare_bundled_plugins {
 
 /// Register an optional client-side adapter owned by one bundled plugin.
 #[cfg(any(
+    feature = "bundled-plugin-connections",
     feature = "bundled-plugin-cluster",
     feature = "bundled-plugin-tab-bar",
     feature = "bundled-plugin-sidebar",
@@ -150,6 +151,10 @@ fn install_bundled_client_adapter(
     settings: Option<&toml::Value>,
     paths: &ConfigPaths,
 ) {
+    #[cfg(feature = "bundled-plugin-connections")]
+    if plugin_id == "bmux.connections" {
+        bmux_connections_plugin::install_client_adapter(paths);
+    }
     #[cfg(feature = "bundled-plugin-pane-runtime")]
     if plugin_id == "bmux.pane_runtime" {
         bmux_pane_runtime_plugin::observation::install();
@@ -1212,7 +1217,14 @@ pub(super) fn plugin_command_context(
             .cloned(),
         plugin_settings_map: config.plugins.settings.clone(),
         caller_client_id,
-        invocation_source,
+        invocation_source: if invocation_source
+            == bmux_plugin_sdk::NativeCommandInvocationSource::Cli
+            && caller_client_id.is_none()
+        {
+            bmux_plugin_sdk::NativeCommandInvocationSource::LocalProcess
+        } else {
+            invocation_source
+        },
         host_kernel_bridge: Some(bmux_plugin_sdk::HostKernelBridge::from_fn(
             host_kernel_bridge,
         )),

@@ -116,6 +116,8 @@ pub struct RecordDef {
 /// A single field inside a record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Field {
+    /// Diagnostic-only: redact Debug without altering serialization.
+    pub secret: bool,
     pub name: String,
     pub ty: TypeRef,
     pub span: Span,

@@ -306,6 +306,10 @@ pub enum NativeCommandInvocationSource {
     /// (`bmux <plugin> <command>`). The host stdout is an ordinary
     /// terminal or pipe; `println!` is appropriate.
     Cli,
+    /// Positively identified standalone local process, not dispatched through a
+    /// service, invoking transport, or attached client. Only the host assigns
+    /// this value; absence of a caller or bridge alone is not this proof.
+    LocalProcess,
     /// Dispatched from a keybinding while the host is rendering the
     /// attach TUI in raw mode. Plugins must not write to stdout/stderr.
     AttachKeybinding,
@@ -313,6 +317,17 @@ pub enum NativeCommandInvocationSource {
     /// plugin should follow the same silence rules as
     /// [`Self::AttachKeybinding`].
     Internal,
+}
+
+impl NativeCommandInvocationSource {
+    /// Whether the invocation uses standalone CLI presentation and interaction.
+    ///
+    /// This is a UX classification, not authorization or proof of local provenance.
+    /// Security-sensitive callers must check trusted provenance independently.
+    #[must_use]
+    pub const fn is_cli(self) -> bool {
+        matches!(self, Self::Cli | Self::LocalProcess)
+    }
 }
 
 /// Context passed to [`RustPlugin::invoke_service`].
@@ -775,6 +790,20 @@ pub fn decode_host_kernel_bridge_plugin_command_payload(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn invocation_source_cli_classification_preserves_non_cli_silence() {
+        use super::NativeCommandInvocationSource;
+        assert!(NativeCommandInvocationSource::Cli.is_cli());
+        assert!(NativeCommandInvocationSource::LocalProcess.is_cli());
+        for source in [
+            NativeCommandInvocationSource::Unknown,
+            NativeCommandInvocationSource::AttachKeybinding,
+            NativeCommandInvocationSource::Internal,
+        ] {
+            assert!(!source.is_cli());
+        }
+    }
+
     use super::{
         CORE_CLI_BRIDGE_PROTOCOL_V1, CoreCliCommandRequest, HostKernelBridgeRequest,
         HostKernelBridgeResponse, PluginCliCommandRequest,

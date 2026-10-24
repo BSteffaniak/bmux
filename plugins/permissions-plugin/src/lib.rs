@@ -228,10 +228,7 @@ fn handle_command(context: &NativeCommandContext) -> Result<(), String> {
     // function from a keybinding; the others are CLI-only but
     // following the same rule uniformly is simpler and avoids future
     // drift.
-    let emit_to_stdout = matches!(
-        context.invocation_source,
-        bmux_plugin_sdk::NativeCommandInvocationSource::Cli
-    );
+    let emit_to_stdout = context.invocation_source.is_cli();
     match context.command.as_str() {
         "permissions" => {
             let session = required_option_value(&context.arguments, "session")?;

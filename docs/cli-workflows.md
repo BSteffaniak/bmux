@@ -1,5 +1,8 @@
 # CLI workflows
 
+For account-free remote terminal pairing without a client-side server, see
+[Remote pairing and daemonless clients](remote-pairing.md).
+
 The current CLI is server-backed by default. Running `bmux` with no subcommand starts or reuses a server, creates a session when needed, and attaches.
 
 `bmux server stop` waits for the selected local process to exit, timing out after

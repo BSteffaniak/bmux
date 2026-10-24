@@ -78,51 +78,89 @@ struct DeviceRecord {
 }
 
 impl DeviceIdentity {
-    pub fn load_or_create(state_dir: &Path, runtime_dir: &Path) -> Result<Self> {
-        // Reuse strict absolute/canonical root validation, not the host key path.
-        let host_directory = runtime_directory(state_dir, runtime_dir)?;
-        let runtime = runtime_dir
-            .canonicalize()
-            .context("resolve client runtime directory")?;
-        let runtime = runtime.to_str().context("client runtime must be UTF-8")?;
-        let namespace = Sha256::digest(format!("bmux.device-identity.v1\0{runtime}").as_bytes())
-            .iter()
-            .fold(String::with_capacity(64), |mut output, byte| {
-                use std::fmt::Write;
-                write!(&mut output, "{byte:02x}").expect("writing to String cannot fail");
-                output
-            });
-        let directory = PrivateDirectory::open(
-            &host_directory
-                .parent()
-                .context("client identity needs state parent")?
-                .join(format!("connections-device-{namespace}")),
-        )?;
-        let bytes = if let Some(bytes) = directory.read()? {
-            bytes
-        } else {
-            let secret = iroh::SecretKey::generate();
-            directory.publish(&serde_json::to_vec(&DeviceRecord {
-                version: 1,
-                purpose: "bmux.connecting-device.v1".into(),
-                runtime: runtime.into(),
-                device_key: secret.public().to_string(),
-                secret: secret.to_bytes(),
-            })?)?
-        };
-        let record: DeviceRecord = serde_json::from_slice(&bytes)
-            .map_err(|_| anyhow::anyhow!("invalid device identity record"))?;
-        if record.version != 1
-            || record.purpose != "bmux.connecting-device.v1"
-            || record.runtime != runtime
-        {
-            bail!("device identity purpose/version/runtime mismatch");
-        }
-        let secret = iroh::SecretKey::from_bytes(&record.secret);
-        if secret.public().to_string() != record.device_key {
-            bail!("device identity key mismatch");
-        }
-        Ok(Self { secret })
+    /// Compatibility entry point. Runtime is only a legacy locator, never identity scope.
+    pub fn load_or_create(state_dir: &Path, _runtime_dir: &Path) -> Result<Self> {
+        Self::load_or_create_local(state_dir, "default")
+    }
+
+    /// Local-process identity: requires no daemon or live runtime directory.
+    /// Only the default profile imports legacy identities, and only if all agree.
+    pub fn load_or_create_local(state_dir: &Path, profile: &str) -> Result<Self> {
+        let store = crate::storage::PairingStore::client(state_dir, profile, c"identity.json")?;
+        store.transaction(|bytes| {
+            let mut legacy_secret = None;
+            if profile == "default" {
+                for entry in std::fs::read_dir(state_dir)? {
+                    let entry = entry?;
+                    if !entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with("connections-device-")
+                    {
+                        continue;
+                    }
+                    let raw = PrivateDirectory::open(&entry.path())?
+                        .read()?
+                        .context("legacy device identity missing")?;
+                    let record: DeviceRecord = serde_json::from_slice(&raw)
+                        .map_err(|_| anyhow::anyhow!("invalid legacy device identity record"))?;
+                    let secret = iroh::SecretKey::from_bytes(&record.secret);
+                    if record.version != 1
+                        || record.purpose != "bmux.connecting-device.v1"
+                        || secret.public().to_string() != record.device_key
+                        || !Path::new(&record.runtime).is_absolute()
+                    {
+                        bail!("invalid legacy device identity metadata");
+                    }
+                    let namespace = Sha256::digest(
+                        format!("bmux.device-identity.v1\0{}", record.runtime).as_bytes(),
+                    )
+                    .iter()
+                    .fold(String::new(), |mut out, b| {
+                        use std::fmt::Write;
+                        write!(out, "{b:02x}").expect("write to String");
+                        out
+                    });
+                    if entry.file_name()
+                        != std::ffi::OsString::from(format!("connections-device-{namespace}"))
+                    {
+                        bail!("legacy device identity scope mismatch");
+                    }
+                    if legacy_secret.is_some_and(|value| value != record.secret) {
+                        bail!("conflicting legacy device identities; explicit migration required");
+                    }
+                    legacy_secret = Some(record.secret);
+                }
+            }
+            let record = if let Some(raw) = bytes.as_deref() {
+                serde_json::from_slice::<DeviceRecord>(raw)
+                    .map_err(|_| anyhow::anyhow!("invalid device identity record"))?
+            } else {
+                let secret = legacy_secret.map_or_else(iroh::SecretKey::generate, |key| {
+                    iroh::SecretKey::from_bytes(&key)
+                });
+                DeviceRecord {
+                    version: 2,
+                    purpose: "bmux.connecting-device.v2".into(),
+                    runtime: profile.into(),
+                    device_key: secret.public().to_string(),
+                    secret: secret.to_bytes(),
+                }
+            };
+            let secret = iroh::SecretKey::from_bytes(&record.secret);
+            if record.version != 2
+                || record.purpose != "bmux.connecting-device.v2"
+                || record.runtime != profile
+                || secret.public().to_string() != record.device_key
+            {
+                bail!("device identity purpose/version/profile/key mismatch");
+            }
+            if legacy_secret.is_some_and(|value| value != record.secret) {
+                bail!("durable and legacy device identity conflict");
+            }
+            *bytes = Some(serde_json::to_vec(&record)?);
+            Ok(Self { secret })
+        })
     }
 
     pub fn public_key(&self) -> String {
@@ -141,6 +179,7 @@ impl DeviceIdentity {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fmt::Write;
     use std::os::unix::fs::{PermissionsExt, symlink};
 
     fn roots(root: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
@@ -159,6 +198,91 @@ mod tests {
             .unwrap()
             .path()
             .join("identity.json")
+    }
+
+    #[test]
+    fn local_identity_is_runtime_independent_and_profile_isolated() {
+        let root = tempfile::tempdir().unwrap();
+        let state = root.path().join("new-state");
+        let first = DeviceIdentity::load_or_create_local(&state, "default")
+            .unwrap()
+            .public_key();
+        assert_eq!(
+            first,
+            DeviceIdentity::load_or_create(&state, &root.path().join("missing-runtime"))
+                .unwrap()
+                .public_key()
+        );
+        assert_ne!(
+            first,
+            DeviceIdentity::load_or_create_local(&state, "work")
+                .unwrap()
+                .public_key()
+        );
+        assert_ne!(
+            first,
+            DeviceIdentity::load_or_create_local(&root.path().join("other-state"), "default")
+                .unwrap()
+                .public_key()
+        );
+        assert!(DeviceIdentity::load_or_create_local(&state, "../escape").is_err());
+        std::thread::scope(|scope| {
+            let handles: [_; 8] = std::array::from_fn(|_| {
+                scope.spawn(|| {
+                    DeviceIdentity::load_or_create_local(&state, "concurrent")
+                        .unwrap()
+                        .public_key()
+                })
+            });
+            let mut keys = handles.into_iter().map(|handle| handle.join().unwrap());
+            let first = keys.next().unwrap();
+            assert!(keys.all(|key| key == first));
+        });
+    }
+
+    fn legacy_device(state: &Path, runtime: &str, secret: &iroh::SecretKey) {
+        let digest = Sha256::digest(format!("bmux.device-identity.v1\0{runtime}").as_bytes())
+            .iter()
+            .fold(String::new(), |mut output, byte| {
+                write!(&mut output, "{byte:02x}").unwrap();
+                output
+            });
+        let directory =
+            PrivateDirectory::open(&state.join(format!("connections-device-{digest}"))).unwrap();
+        directory
+            .publish(
+                &serde_json::to_vec(&DeviceRecord {
+                    version: 1,
+                    purpose: "bmux.connecting-device.v1".into(),
+                    runtime: runtime.into(),
+                    secret: secret.to_bytes(),
+                    device_key: secret.public().to_string(),
+                })
+                .unwrap(),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn legacy_identity_migration_preserves_key_and_conflicts_fail_closed() {
+        let root = tempfile::tempdir().unwrap();
+        let state = root.path();
+        let secret = iroh::SecretKey::generate();
+        legacy_device(state, "/expired-runtime", &secret);
+        assert_eq!(
+            DeviceIdentity::load_or_create_local(state, "default")
+                .unwrap()
+                .public_key(),
+            secret.public().to_string()
+        );
+        legacy_device(state, "/other-runtime", &iroh::SecretKey::generate());
+        let path = crate::storage::client_directory(state, "default")
+            .unwrap()
+            .join("identity.json");
+        let before = std::fs::read(&path).unwrap();
+        assert!(DeviceIdentity::load_or_create_local(state, "default").is_err());
+        assert_eq!(std::fs::read(path).unwrap(), before);
+        assert!(DeviceIdentity::load_or_create_local(state, "explicit-profile").is_ok());
     }
 
     #[test]
@@ -184,7 +308,7 @@ mod tests {
                     .unwrap()
                     .to_str()
                     .unwrap()
-                    .starts_with("connections-device-")
+                    .starts_with("connections-client-")
             })
             .unwrap()
             .join("identity.json");

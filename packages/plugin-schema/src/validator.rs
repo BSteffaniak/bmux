@@ -342,6 +342,14 @@ fn insert_type_name(set: &mut BTreeSet<String>, name: &str, iface_name: &str) ->
 }
 
 fn validate_variant_cases(v: &crate::ast::VariantDef) -> Result<(), Error> {
+    if v.cases
+        .iter()
+        .any(|case| case.payload.iter().any(|field| field.secret))
+    {
+        return Err(Error::Validate {
+            message: "`@secret` is supported only on record fields and operation parameters".into(),
+        });
+    }
     let mut case_names = BTreeSet::new();
     let mut defaults = 0;
     for c in &v.cases {

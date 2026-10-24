@@ -37,20 +37,10 @@ impl LocalRuntime {
     }
 
     pub(crate) fn endpoint_builder(&self) -> anyhow::Result<iroh::endpoint::Builder> {
-        let mut builder = self.identity.endpoint_builder();
-        builder = match &self.settings.relay {
-            RelayPolicy::Default => builder,
-            RelayPolicy::Disabled => builder.clear_address_lookup().clear_relay_transports(),
-            RelayPolicy::Custom { urls } => {
-                let urls = urls
-                    .iter()
-                    .map(|url| url.parse())
-                    .collect::<Result<Vec<iroh::RelayUrl>, _>>()?;
-                builder
-                    .clear_address_lookup()
-                    .relay_mode(iroh::RelayMode::Custom(iroh::RelayMap::from_iter(urls)))
-            }
-        };
+        let mut builder = self
+            .settings
+            .relay
+            .apply(self.identity.endpoint_builder())?;
         if let Some(addr) = self.settings.bind_addr {
             builder = builder.clear_ip_transports().bind_addr(addr)?;
         }

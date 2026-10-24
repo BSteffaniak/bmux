@@ -126,31 +126,104 @@ async fn approve(
     Ok(())
 }
 
-async fn pair(
+fn remember_device(paths: &bmux_config::ConfigPaths, name: &str, key: &str) -> Result<()> {
+    remote_preferences::name_valid(name)?;
+    remote_preferences::update(paths, |preferences| {
+        ensure!(
+            preferences
+                .devices
+                .get(name)
+                .is_none_or(|existing| existing == key),
+            "device name already belongs to another key"
+        );
+        preferences.devices.insert(name.to_owned(), key.to_owned());
+        Ok(())
+    })
+}
+
+async fn host_pair(
     paths: &bmux_config::ConfigPaths,
     client: &mut bmux_client::BmuxClient,
     args: &[String],
 ) -> Result<()> {
-    let offer: Offer = serde_json::from_str(&input(args)?)
-        .map_err(|_| anyhow::anyhow!("invalid pairing invitation"))?;
-    ensure!(offer.version == 1, "unsupported invitation version");
-    let name = value(args, "--name").context("--name is required")?;
-    remote_preferences::name_valid(&name)?;
-    remote_preferences::update(paths, |p| {
-        ensure!(!p.aliases.contains_key(&name), "target name already exists");
-        Ok(())
-    })?;
-    let target = commands::pair_endpoint(client, offer.target, offer.invitation).await?;
-    remote_preferences::update(paths, |p| {
-        ensure!(!p.aliases.contains_key(&name), "target name already exists");
-        p.aliases.insert(name.clone(), target);
-        Ok(())
-    })?;
-    println!("Paired. Connect with: bmux connect {name}");
-    Ok(())
+    use bmux_connections_plugin_api::{
+        pairing_session_commands::client as sessions,
+        pairing_session_state::client as session_state, pairing_types::SessionPhase,
+    };
+    ensure!(
+        args.is_empty() || args == ["--yes"],
+        "remote pair creates a host invitation; use connect --pair on the other device"
+    );
+    let listener = state::listener_status(client).await?;
+    ensure!(
+        listener.enabled,
+        "remote listener is disabled; run bmux remote enable first"
+    );
+    let session = sessions::begin_session(client, 300, listener.endpoint_targets).await?;
+    println!(
+        "Pairing link (expires at {}):\n{}",
+        session.expires_at, session.invitation_link
+    );
+    println!("On the other device run: bmux connect --pair");
+    std::io::stdout().flush()?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_mins(5);
+    loop {
+        if std::time::Instant::now() >= deadline {
+            let _ = sessions::cancel_session(client, session.session_id.clone()).await;
+            bail!("pairing invitation expired");
+        }
+        let request = session_state::pending_request(client, session.session_id.clone()).await?;
+        match request.phase {
+            SessionPhase::PendingApproval => {
+                let name = request
+                    .device_name
+                    .context("pairing request has no device name")?;
+                remote_preferences::name_valid(&name)?;
+                let key = request
+                    .peer_key
+                    .context("pairing request has no device key")?;
+                remote_preferences::update(paths, |preferences| {
+                    ensure!(
+                        preferences
+                            .devices
+                            .get(&name)
+                            .is_none_or(|existing| existing == &key),
+                        "device name already belongs to another key"
+                    );
+                    Ok(())
+                })?;
+                eprintln!("Device requesting access: {name}");
+                let phrase = request
+                    .verification_phrase
+                    .context("missing verification phrase")?;
+                eprintln!("Compare this phrase on the other device: {phrase}");
+                if let Err(error) = confirm(&[]) {
+                    let _ = sessions::reject_session(client, session.session_id.clone()).await;
+                    return Err(error);
+                }
+                let device =
+                    sessions::approve_session(client, session.session_id.clone(), phrase).await?;
+                ensure!(device.device_key == key, "approved device key mismatch");
+                remember_device(paths, &name, &key)?;
+                println!("Approved device {name} ({})", device.device_id);
+                return Ok(());
+            }
+            SessionPhase::Active => {
+                println!("Device paired");
+                return Ok(());
+            }
+            SessionPhase::Expired | SessionPhase::Rejected | SessionPhase::Cancelled => {
+                bail!("pairing expired, rejected, or cancelled")
+            }
+            _ => tokio::time::sleep(std::time::Duration::from_secs(1)).await,
+        }
+    }
 }
 
 pub fn run(context: &NativeCommandContext) -> Result<i32> {
+    if let Some(code) = crate::client_cli::run(context)? {
+        return Ok(code);
+    }
     let caller = bmux_plugin::TypedServiceCaller::from_command_context(context);
     let mut dispatch = bmux_plugin::ServiceCallerDispatchClient::new(&caller);
     let origin = bmux_plugin::block_on_typed_dispatch(
@@ -197,7 +270,7 @@ pub fn run(context: &NativeCommandContext) -> Result<i32> {
                 println!("Remote disabled");
             }
             "remote-approve" => approve(&paths, &mut client, args).await?,
-            "remote-pair" => pair(&paths, &mut client, args).await?,
+            "remote-pair" => host_pair(&paths, &mut client, args).await?,
             "remote-list" => {
                 remote_preferences::update(&paths, |p| {
                     for (name, target) in &p.aliases {
@@ -248,6 +321,30 @@ pub fn run(context: &NativeCommandContext) -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn approved_device_name_supports_revoke_lookup_without_rebinding() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = bmux_config::ConfigPaths::new(
+            root.path().join("config"),
+            root.path().join("runtime"),
+            root.path().join("data"),
+            root.path().join("state"),
+        );
+        std::fs::create_dir_all(&paths.runtime_dir).unwrap();
+        std::fs::create_dir_all(&paths.state_dir).unwrap();
+        remember_device(&paths, "mac", "device-key").unwrap();
+        remember_device(&paths, "mac", "device-key").unwrap();
+        assert!(remember_device(&paths, "mac", "different-key").is_err());
+        assert_eq!(
+            remote_preferences::update(&paths, |preferences| Ok(preferences
+                .devices
+                .get("mac")
+                .cloned()))
+            .unwrap()
+            .as_deref(),
+            Some("device-key")
+        );
+    }
     #[test]
     fn requests_reject_unknown_fields() {
         assert!(
