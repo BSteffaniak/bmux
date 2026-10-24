@@ -23,32 +23,63 @@ import time
 LIMIT = 8 * 1024 * 1024
 
 
-def latency_fixture(root, count):
+def latency_fixture(root, count, repaint=False):
     import tty
     assert all(os.isatty(fd) for fd in (0, 1, 2))
     before = termios.tcgetattr(0)
     samples = []
     tty.setraw(0)
+    emitted = bytearray()
+    output_lock = threading.Lock()
+    stop = threading.Event()
+    def emit(data):
+        with output_lock:
+            if len(emitted) + len(data) > LIMIT:
+                raise RuntimeError('fixture output exceeded bound')
+            offset = 0
+            while offset < len(data):
+                offset += os.write(1, data[offset:])
+            emitted.extend(data)
+    def repainting():
+        for revision in range(3000):
+            if stop.is_set():
+                return
+            emit(b'\x1b[6;1H' + (('%06d' % revision).encode() + b'x' * 70 + b'\r\n') * 16)
+            stop.wait(0.001)  # fixture animation cadence, not product batching
+    painter = None
     try:
-        os.write(1, b'LATENCY_BYTE0\x1b[?1049h\x1b[2J\x1b[HLATENCY_READY')
+        emit(b'LATENCY_BYTE0\x1b[?1049h\x1b[2J\x1b[HLATENCY_READY')
+        if repaint:
+            painter = threading.Thread(target=repainting)
+            painter.start()
         for number in range(1, count + 1):
             if os.read(0, 1) != b'x':
                 raise RuntimeError('fixture expected synthetic sample input')
             received = time.monotonic_ns()
             token = ('ECHO%06d' % number).encode()
             before_write = time.monotonic_ns()
-            os.write(1, b'\x1b[2;1H' + token)
+            emit(b'\x1b[2;1H' + token)
             samples.append({'sample_id': number, 'pty_read_ns': received,
                             'before_echo_write_ns': before_write,
                             'after_echo_write_ns': time.monotonic_ns()})
         # Driver acknowledges the final displayed sample before target exit.
         if os.read(0, 1) != b'!':
             raise RuntimeError('missing final displayed-echo acknowledgement')
+        stop.set()
+        if painter is not None:
+            painter.join(timeout=5)
+            if painter.is_alive():
+                raise RuntimeError('fixture repaint thread did not stop')
         # A single metadata write after measurement, never on the per-key path.
         with open(root + '/fixture-samples.json', 'x') as output:
             json.dump(samples, output)
-        os.write(1, ('\x1b[3;1HLATENCY_TAIL%06d\x1b[?1049l' % count).encode())
+        emit(('\x1b[3;1HLATENCY_TAIL%06d\x1b[?1049l' % count).encode())
+        with open(root + '/fixture-output.pty', 'xb') as output:
+            output.write(emitted)
     finally:
+        stop.set()
+        if painter is not None:
+            painter.join(timeout=5)
         # All synthetic inputs (including final acknowledgement) are consumed.
         # On macOS TCSANOW when restoring ICANON leaves kernel PENDIN set;
         # TCSAFLUSH clears that pending-input state and restores exact attrs.
@@ -151,7 +182,10 @@ def digest_file(path):
 def latency_acceptance(arguments):
     # Explicit existing binary, new evidence directory, separate short socket
     # parent, direct/recorded path. No implicit PATH executable or runtime reuse.
-    binary, root, socket_parent, mode, count_string = arguments
+    binary, root, socket_parent, mode, count_string = arguments[:5]
+    repaint = arguments[5:] == ['repaint']
+    if arguments[5:] and not repaint:
+        raise ValueError('optional final argument must be repaint')
     if mode not in ('direct', 'recorded'):
         raise ValueError('latency mode must be direct or recorded')
     count = int(count_string)
@@ -181,7 +215,7 @@ def latency_acceptance(arguments):
     env.update(TMPDIR=short, BMUX_NO_BASE_CONFIG='1', BMUX_RUNTIME_NAME='default',
                BMUX_TARGET='local', TERM='xterm-256color')
     script = os.path.realpath(__file__)
-    args = [sys.executable, script, '--latency-child', root, str(count)]
+    args = [sys.executable, script, '--latency-child', root, str(count), str(int(repaint))]
     if mode == 'recorded':
         args = [binary, '--runtime', 'default', '--target', 'local', 'record',
                 '--output', root + '/exports', '--export', 'raw', '--json', '--'] + args
@@ -336,10 +370,8 @@ def latency_acceptance(arguments):
                 raise RuntimeError('raw capture exceeded fixture bound')
             with open(raw_path, 'rb') as source:
                 raw = source.read(LIMIT + 1)
-            expected = b'LATENCY_BYTE0\x1b[?1049h\x1b[2J\x1b[HLATENCY_READY'
-            for number in range(1, count + 1):
-                expected += ('\x1b[2;1HECHO%06d' % number).encode()
-            expected += ('\x1b[3;1HLATENCY_TAIL%06d\x1b[?1049l' % count).encode()
+            with open(root + '/fixture-output.pty', 'rb') as source:
+                expected = source.read(LIMIT + 1)
             if raw != expected:
                 raise RuntimeError('durable capture differs from complete numbered fixture stream')
             for field in ('output_watermark', 'capture_watermark', 'recording_watermark'):
@@ -377,7 +409,7 @@ def latency_acceptance(arguments):
 
 
 if sys.argv[1] == '--latency-child':
-    latency_fixture(sys.argv[2], int(sys.argv[3]))
+    latency_fixture(sys.argv[2], int(sys.argv[3]), bool(int(sys.argv[4])))
     sys.exit(0)
 if sys.argv[1] == '--latency':
     latency_acceptance(sys.argv[2:])

@@ -101,60 +101,61 @@ fn read_current(
     after: Option<&LiveCursor>,
     max_bytes: u32,
 ) -> Result<Option<LiveFrame>, LiveError> {
-    // Finite retries bound work under continuous output. Busy means retry, not
-    // EOF, unchanged state, or permission to reuse an unvalidated input target.
-    for _ in 0..3 {
-        let before = cursor(reference)?;
-        if after.is_some_and(|previous| same_cursor(previous, &before)) {
-            return Ok(None);
-        }
-        let screen = if after.is_some_and(|previous| same_grid(previous, &before)) {
-            None
-        } else {
-            let screen = execution::live_screen(reference).map_err(|error| match error {
-                TerminalExecutionError::OperationFailed { ref reason }
-                    if reason == "screen exceeds response budget" =>
-                {
-                    LiveError::Oversized { max_bytes }
-                }
-                error => authority(error),
-            })?;
-            // Decoding occurs only on a changed grid; unchanged waits perform
-            // no full clone, snapshot, JSON encoding/decoding or content hash.
-            let grid: bmux_terminal_grid::GridSnapshot =
-                serde_json::from_slice(&screen.encoded_grid).map_err(|error| failed(&error))?;
-            if screen.execution != *reference
-                || grid.width != screen.cols
-                || grid.height != screen.rows
-            {
-                return Err(failed(&"incoherent live screen identity or geometry"));
-            }
-            if grid.revision != before.grid_revision
-                || screen.output_watermark != before.projected_raw_watermark
-            {
-                continue;
-            }
-            Some(screen)
-        };
-        let current = cursor(reference)?;
-        if !same_grid(&before, &current)
-            || before.projected_raw_watermark != current.projected_raw_watermark
-        {
-            continue;
-        }
-        let frame = LiveFrame {
-            cursor: current,
-            screen,
-        };
-        let mut budget = ResponseBudget {
-            remaining: max_bytes as usize,
-        };
-        if serde_json::to_writer(&mut budget, &frame).is_err() {
-            return Err(LiveError::Oversized { max_bytes });
-        }
-        return Ok(Some(frame));
+    read_current_with(
+        after,
+        max_bytes,
+        || cursor(reference),
+        || execution::live_screen(reference),
+    )
+}
+
+fn read_current_with(
+    after: Option<&LiveCursor>,
+    max_bytes: u32,
+    mut read_cursor: impl FnMut() -> Result<LiveCursor, LiveError>,
+    mut read_screen: impl FnMut() -> Result<
+        (
+            bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::TerminalExecutionScreen,
+            execution::LiveRevision,
+        ),
+        TerminalExecutionError,
+    >,
+) -> Result<Option<LiveFrame>, LiveError> {
+    let before = read_cursor()?;
+    if after.is_some_and(|previous| same_cursor(previous, &before)) {
+        return Ok(None);
     }
-    Err(LiveError::Busy)
+    let (current, screen) = if after.is_some_and(|previous| same_grid(previous, &before)) {
+        (before, None)
+    } else {
+        let (screen, revision) = read_screen().map_err(|error| match error {
+            TerminalExecutionError::OperationFailed { ref reason }
+                if reason == "screen exceeds response budget" =>
+            {
+                LiveError::Oversized { max_bytes }
+            }
+            error => authority(error),
+        })?;
+        // The immutable screen and grid cursor were captured together. Output
+        // continuing during encoding is normal, not a reason to discard them.
+        let mut current = read_cursor()?;
+        current.source_reset_revision = revision.reset_revision;
+        current.grid_revision = revision.grid_revision;
+        current.geometry_revision = revision.geometry_revision;
+        current.projected_raw_watermark = revision.projected_watermark;
+        (current, Some(screen))
+    };
+    let frame = LiveFrame {
+        cursor: current,
+        screen,
+    };
+    let mut budget = ResponseBudget {
+        remaining: max_bytes as usize,
+    };
+    if serde_json::to_writer(&mut budget, &frame).is_err() {
+        return Err(LiveError::Oversized { max_bytes });
+    }
+    Ok(Some(frame))
 }
 
 /// Stateless read is wait with a zero deadline. No delivery acknowledgment or
@@ -299,6 +300,69 @@ mod tests {
         assert!(validate(&reference(), Some(&next), 0, 4096).is_err());
         assert!(validate(&reference(), None, 1001, 4096).is_err());
         assert!(validate(&reference(), None, 0, 0).is_err());
+    }
+
+    #[test]
+    fn continuous_output_during_encoding_returns_captured_frame_without_retry() {
+        use bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::TerminalExecutionScreen;
+        let calls = std::cell::Cell::new(0_u64);
+        let frame = read_current_with(
+            None,
+            65536,
+            || {
+                let mut cursor = token();
+                calls.set(calls.get() + 1);
+                cursor.grid_revision = calls.get() * 10;
+                cursor.projected_raw_watermark = calls.get() * 100;
+                Ok(cursor)
+            },
+            || {
+                Ok((
+                    TerminalExecutionScreen {
+                        execution: reference(),
+                        output_watermark: 150,
+                        cols: 1,
+                        rows: 1,
+                        cursor_col: 0,
+                        cursor_row: 0,
+                        cursor_visible: true,
+                        text: "x".into(),
+                        encoded_grid: vec![],
+                    },
+                    execution::LiveRevision {
+                        grid_revision: 15,
+                        reset_revision: 3,
+                        geometry_revision: 4,
+                        projected_watermark: 150,
+                        durable_watermark: 100,
+                        capture_failure: None,
+                    },
+                ))
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(calls.get(), 2);
+        assert_eq!(frame.cursor.grid_revision, 15);
+        assert_eq!(frame.cursor.projected_raw_watermark, 150);
+        assert_eq!(frame.cursor.source_reset_revision, 3);
+        assert_eq!(frame.cursor.geometry_revision, 4);
+        assert_eq!(frame.screen.unwrap().output_watermark, 150);
+    }
+
+    #[test]
+    fn unchanged_read_never_captures_or_encodes_a_screen() {
+        let cursor = token();
+        assert!(
+            read_current_with(
+                Some(&cursor),
+                65536,
+                || Ok(cursor.clone()),
+                || panic!("unchanged read captured a screen")
+            )
+            .unwrap()
+            .is_none()
+        );
     }
 
     #[test]

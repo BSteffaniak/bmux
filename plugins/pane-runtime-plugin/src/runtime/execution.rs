@@ -466,8 +466,10 @@ pub(crate) fn screen(reference: &ExecutionRef) -> Result<ExecutionScreen, Execut
 }
 
 /// Only the explicitly negotiated live presentation interface may call this.
-pub(crate) fn live_screen(reference: &ExecutionRef) -> Result<ExecutionScreen, ExecutionError> {
-    screen_mode(reference, false)
+pub(crate) fn live_screen(
+    reference: &ExecutionRef,
+) -> Result<(ExecutionScreen, LiveRevision), ExecutionError> {
+    capture_screen(reference, false)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -506,55 +508,70 @@ pub(crate) fn subscribe(
 }
 
 fn screen_mode(reference: &ExecutionRef, durable: bool) -> Result<ExecutionScreen, ExecutionError> {
-    let (screen, barrier) = with_pane(reference, |pane| {
-        // Same first lock as the reader and resize path: geometry, grid and
-        // watermark describe one committed output boundary, even after exit.
+    capture_screen(reference, durable).map(|(screen, _)| screen)
+}
+
+fn capture_screen(
+    reference: &ExecutionRef,
+    durable: bool,
+) -> Result<(ExecutionScreen, LiveRevision), ExecutionError> {
+    let (snapshot, text, revision, barrier) = with_pane(reference, |pane| {
+        // Capture immutable grid and its cursor in ONE geometry/grid transaction.
+        // Encoding after unlocking cannot invalidate this captured publication.
         let _size = pane.last_requested_size.lock().map_err(failed)?;
+        let stream = pane.terminal_grid.lock().map_err(failed)?;
+        let writer = pane.execution.writer().map_err(failed)?;
+        let progress = writer
+            .as_ref()
+            .map(super::capture_writer::CaptureWriter::progress)
+            .transpose()
+            .map_err(failed)?;
+        let projected_watermark = pane.execution.output_watermark.load(Ordering::SeqCst);
+        let grid = stream.grid();
+        let revision = LiveRevision {
+            grid_revision: grid.revision(),
+            reset_revision: grid.reset_revision(),
+            geometry_revision: pane.execution.geometry_revision.load(Ordering::SeqCst),
+            projected_watermark,
+            durable_watermark: progress
+                .as_ref()
+                .map_or(projected_watermark, |p| p.boundary.bytes),
+            capture_failure: pane.execution.capture_failure(),
+        };
         let barrier = if durable {
-            pane.execution
-                .writer()
-                .map_err(failed)?
-                .map(|writer| {
-                    writer
-                        .progress()
-                        .map(|progress| (writer, progress.projected))
-                })
-                .transpose()
-                .map_err(failed)?
+            writer
+                .zip(progress)
+                .map(|(writer, progress)| (writer, progress.projected))
         } else {
             None
         };
-        let stream = pane.terminal_grid.lock().map_err(failed)?;
-        let grid = stream.grid();
         let snapshot = stream
             .try_snapshot(0, grid.height(), super::RESPONSE_OUTPUT_BUDGET)
             .ok_or_else(|| failed("screen exceeds response budget"))?;
-        let encoded_grid = serde_json::to_vec(&snapshot).map_err(failed)?;
         let text = bmux_terminal_grid::visible_text(grid, 0, grid.height());
-        if encoded_grid.len().saturating_add(text.len()) > super::RESPONSE_OUTPUT_BUDGET {
-            return Err(failed("screen exceeds response budget"));
-        }
-        Ok((
-            ExecutionScreen {
-                execution: reference.clone(),
-                output_watermark: pane.execution.output_watermark.load(Ordering::SeqCst),
-                cols: snapshot.width,
-                rows: snapshot.height,
-                cursor_col: snapshot.cursor.col,
-                cursor_row: snapshot.cursor.row,
-                cursor_visible: snapshot.cursor.visible,
-                text,
-                encoded_grid,
-            },
-            barrier,
-        ))
+        Ok((snapshot, text, revision, barrier))
     })?;
-    // The immutable coherent snapshot may be returned only after its exact
-    // projection is durable. No manager/geometry/parser/order lock survives.
+    let encoded_grid = serde_json::to_vec(&snapshot).map_err(failed)?;
+    if encoded_grid.len().saturating_add(text.len()) > super::RESPONSE_OUTPUT_BUDGET {
+        return Err(failed("screen exceeds response budget"));
+    }
     if let Some((writer, ticket)) = barrier {
         writer.wait_committed(ticket).map_err(failed)?;
     }
-    Ok(screen)
+    Ok((
+        ExecutionScreen {
+            execution: reference.clone(),
+            output_watermark: revision.projected_watermark,
+            cols: snapshot.width,
+            rows: snapshot.height,
+            cursor_col: snapshot.cursor.col,
+            cursor_row: snapshot.cursor.row,
+            cursor_visible: snapshot.cursor.visible,
+            text,
+            encoded_grid,
+        },
+        revision,
+    ))
 }
 
 pub(crate) fn validate_options(options: &ProgramOptions) -> Result<(), ExecutionError> {
