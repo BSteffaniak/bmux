@@ -322,7 +322,7 @@ mod tests {
                 "execution-supervisor".into(),
                 bmux_plugin_sdk::ResolvedAuxiliaryExecutable {
                     path: helper.to_string_lossy().into(),
-                    protocol_version: 6,
+                    protocol_version: 7,
                     artifact_sha256: hash,
                 },
             )]),

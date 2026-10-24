@@ -2352,8 +2352,8 @@ mod admission_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn idle_admitted_stream_closes_on_revoke_and_expiry() {
         for expire in [false, true] {
-            let path =
-                std::env::temp_dir().join(format!("bmux-idle-lease-{}.sock", Uuid::new_v4()));
+            // Keep the basename within macOS's Unix socket budget under Nix TMPDIR.
+            let path = std::env::temp_dir().join(format!("{}.s", Uuid::new_v4().simple()));
             let endpoint = IpcEndpoint::unix_socket(path.clone());
             let listener = LocalIpcListener::bind(&endpoint).unwrap();
             let mut server = BmuxServer::new(endpoint.clone());

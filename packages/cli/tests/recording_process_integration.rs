@@ -1268,7 +1268,7 @@ fn whole_frame_loss_never_publishes_or_overwrites_live_capture() {
 fn finite_launch_status_before_wait_reports_drain() {
     let mut env = RecordingEnv::new();
     env.profile_export = true;
-    let id = env.start("stty -opost\nprintf FINITE\ni=0\nwhile [ \"$i\" -lt 4096 ]; do printf '0123456789abcdef'; i=$((i+1)); done\nprintf LAST\nexit 7\n", &[]);
+    let id = env.start("stty -opost\nprintf FINITE\nchunk=0123456789abcdef\ni=0\nwhile [ \"$i\" -lt 12 ]; do chunk=$chunk$chunk; i=$((i+1)); done\nprintf '%s' \"$chunk\"\nprintf LAST\nexit 7\n", &[]);
     let expected = format!("FINITE{}LAST", "0123456789abcdef".repeat(4096)).into_bytes();
     let deadline = Instant::now() + Duration::from_secs(3);
     let mut timeline = Vec::new();

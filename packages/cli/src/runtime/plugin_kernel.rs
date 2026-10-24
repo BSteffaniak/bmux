@@ -1161,9 +1161,10 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn nested_service_kernel_scope_restores_bound_parent() {
-        let path =
-            std::env::temp_dir().join(format!("bmux-origin-scope-{}.sock", uuid::Uuid::new_v4()));
-        let endpoint = bmux_ipc::IpcEndpoint::unix_socket(path.clone());
+        // Nix's TMPDIR can be long; keep the socket name short enough for
+        // macOS's sockaddr_un rather than appending a UUID to the full path.
+        let directory = tempfile::tempdir().unwrap();
+        let endpoint = bmux_ipc::IpcEndpoint::unix_socket(directory.path().join("s"));
         let server = BmuxServer::new(endpoint.clone());
         server
             .register_service_handler(
@@ -1214,12 +1215,20 @@ mod tests {
                 },
             )
             .unwrap();
-        let task = tokio::spawn(async move { server.run().await });
-        let mut peer = loop {
-            match bmux_ipc::transport::LocalIpcStream::connect(&endpoint).await {
-                Ok(peer) => break peer,
-                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(5)).await,
-            }
+        let mut task = tokio::spawn(async move { server.run().await });
+        let mut peer = tokio::select! {
+            result = &mut task => panic!("scope test server stopped before connection: {result:?}"),
+            result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    match bmux_ipc::transport::LocalIpcStream::connect(&endpoint).await {
+                        Ok(peer) => break peer,
+                        Err(error) => {
+                            assert!(matches!(&error, bmux_ipc::transport::IpcTransportError::Io(source) if matches!(source.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused)), "scope test connection failed: {error}");
+                            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                        }
+                    }
+                }
+            }) => result.expect("scope test server did not become ready within five seconds"),
         };
         for (id, request) in [
             bmux_ipc::Request::Hello {
@@ -1255,7 +1264,6 @@ mod tests {
         }
         task.abort();
         let _ = task.await;
-        std::fs::remove_file(path).unwrap();
     }
 
     // Keep the ordered capture/revoke/cancel/release lifecycle together so ownership

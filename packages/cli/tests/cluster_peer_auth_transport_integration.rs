@@ -155,7 +155,7 @@ fn assert_join_and_leave(issuer: &ServerEnv, joiner: &ServerEnv, token: &str, ta
 
 #[test]
 #[serial]
-fn ssh_join_and_leave_require_real_mutual_peer_authentication() {
+fn legacy_ssh_bridge_cannot_redeem_cluster_enrollment() {
     if !Path::new("/usr/sbin/sshd").exists() {
         eprintln!("skipping SSH transport integration: /usr/sbin/sshd unavailable");
         return;
@@ -245,7 +245,32 @@ fn ssh_join_and_leave_require_real_mutual_peer_authentication() {
     joiner.start();
 
     let token = create_enrollment_token(&issuer, "issuer");
-    assert_join_and_leave(&issuer, &joiner, &token, "issuer");
+    // SSH authentication is not trusted stream admission. Keep this legacy
+    // path fail-closed; the admitted transport below covers successful joining.
+    let join = joiner.run(&[
+        "cluster",
+        "join",
+        &token,
+        "--issuer",
+        "issuer",
+        "--endpoint",
+        "issuer",
+    ]);
+    assert!(
+        !join.status.success(),
+        "legacy SSH bridge unexpectedly redeemed enrollment"
+    );
+    assert!(
+        combined_output(&join).contains("remote enrollment redemption failed"),
+        "{}",
+        combined_output(&join)
+    );
+    let log = std::fs::read_to_string(joiner.root().join("server.stderr.log"))
+        .expect("joiner server diagnostics");
+    assert!(
+        log.contains("legacy remote ingress cannot establish trusted stream admission"),
+        "{log}"
+    );
 }
 
 #[test]
