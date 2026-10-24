@@ -4,7 +4,10 @@
 //! Decoded frames are output data, never authoritative TUI state.
 #![cfg_attr(feature = "fail-on-warnings", deny(warnings))]
 
+mod local;
+pub use local::LocalSurface;
 mod contract;
+pub mod input;
 pub mod wire;
 pub use wire::{
     BINARY_WIRE_VERSION, ImageResource, ResourceRequirement, decode_binary,

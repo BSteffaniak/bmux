@@ -1,6 +1,6 @@
 # Browser rendering
 
-BMUX shares retained presentation primitives between terminal output and a Rust/WASM browser renderer. Canvas 2D is the initial browser backend; `BrowserBackend` keeps output replaceable without exposing Canvas, DOM, or GPU objects in the shared contract. HTML/WebGL and interactive browser input remain future work.
+BMUX shares retained presentation primitives between terminal output and a Rust/WASM browser renderer. Canvas 2D is the initial browser backend; `BrowserBackend` keeps output replaceable without exposing Canvas, DOM, or GPU objects in the shared contract. Attach and presenter viewers remain read-only. Applications can opt into [interactive browser-local surfaces](interactive-browser-surfaces.md) using the same compositor and a separate browser input bridge; this does not make attach viewers remotely interactive.
 
 ## Attach locally
 

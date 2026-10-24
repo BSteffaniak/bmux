@@ -2,6 +2,12 @@
 
 Directional browser output for `bmux_tui::presentation::PreparedPresentation`.
 Native transport, clients, CLI, plugin loading, and product state are not dependencies.
+
+For interactive applications composed locally in WASM, `LocalSurface` and the
+callback-driven browser input bridge reuse this compositor without decoding remote
+frames or granting terminal access. See
+[`interactive browser surfaces`](../../docs/interactive-browser-surfaces.md).
+The existing attach/presenter viewer remains read-only.
 The compositor remains the only authority; browsers consume its final buffer and
 shared cursor/hit/focus/selection/semantic/image/damage vocabulary.
 

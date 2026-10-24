@@ -600,6 +600,23 @@ impl CanvasRenderer {
         self.present_frame(frame, repair).await
     }
 
+    /// Paint browser-local retained Rust output without transport encoding.
+    /// Serialize calls with the owning LocalSurface; do not mix directional
+    /// remote frames and local presentations on the same renderer.
+    pub async fn present_prepared(
+        &mut self,
+        prepared: &bmux_tui::presentation::PreparedPresentation,
+    ) -> Result<(), JsValue> {
+        let revision = self
+            .renderer
+            .committed()
+            .map_or(Some(1), |frame| frame.revision().checked_add(1))
+            .ok_or_else(|| error("local revision exhausted"))?;
+        let frame = BrowserFrame::from_prepared_in_generation("browser-local", revision, prepared)
+            .map_err(error)?;
+        self.present_frame(frame, true).await
+    }
+
     async fn present_frame(&mut self, frame: BrowserFrame, repair: bool) -> Result<(), JsValue> {
         if let Some(previous) = self.renderer.committed() {
             if !repair && frame.generation() != previous.generation() {

@@ -101,12 +101,14 @@ impl CancellableOutput for bmux_tui::terminal::LinuxTerminalOutput {
     }
 }
 
+#[cfg(any(feature = "images", test))]
 pub(crate) struct Delivery<O> {
     worker: Option<std::thread::JoinHandle<O>>,
     receiver: tokio::sync::oneshot::Receiver<std::io::Result<()>>,
     cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
+#[cfg(any(feature = "images", test))]
 impl<O: CancellableOutput> Delivery<O> {
     pub(crate) fn start(output: &mut Option<O>, bytes: Vec<u8>) -> std::io::Result<Self> {
         Self::start_with(output, bytes, |job| {
@@ -177,6 +179,7 @@ impl<O: CancellableOutput> Delivery<O> {
     }
 }
 
+#[cfg(any(feature = "images", test))]
 impl<O> Drop for Delivery<O> {
     fn drop(&mut self) {
         self.cancelled
@@ -190,6 +193,55 @@ impl<O> Drop for Delivery<O> {
 #[cfg(test)]
 mod delivery_fault_tests {
     use super::*;
+
+    #[test]
+    fn successful_delivery_can_be_polled_and_reclaimed() {
+        struct Output(Vec<u8>);
+        impl CancellableOutput for Output {
+            fn deliver(
+                &mut self,
+                bytes: &[u8],
+                _: &std::sync::atomic::AtomicBool,
+            ) -> std::io::Result<()> {
+                self.0.extend_from_slice(bytes);
+                Ok(())
+            }
+        }
+        let mut output = Some(Output(Vec::new()));
+        let mut delivery = Delivery::start(&mut output, vec![1, 2]).expect("start");
+        assert!(output.is_none());
+        // Joining the owned worker makes completion deterministic before polling.
+        let reclaimed = delivery.reclaim().expect("reclaim");
+        assert_eq!(reclaimed.0, [1, 2]);
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(matches!(
+            delivery.poll(&mut cx),
+            std::task::Poll::Ready(Ok(()))
+        ));
+    }
+    #[test]
+    fn dropping_delivery_cancels_and_joins_the_owned_worker() {
+        struct Output(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl CancellableOutput for Output {
+            fn deliver(
+                &mut self,
+                _: &[u8],
+                cancelled: &std::sync::atomic::AtomicBool,
+            ) -> std::io::Result<()> {
+                while !cancelled.load(std::sync::atomic::Ordering::Acquire) {
+                    std::thread::yield_now();
+                }
+                self.0.store(true, std::sync::atomic::Ordering::Release);
+                Ok(())
+            }
+        }
+        let completed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut output = Some(Output(std::sync::Arc::clone(&completed)));
+        let delivery = Delivery::start(&mut output, Vec::new()).expect("start");
+        drop(delivery);
+        assert!(completed.load(std::sync::atomic::Ordering::Acquire));
+    }
+
     #[test]
     fn thread_start_failure_retains_output_for_cleanup_without_writes() {
         struct Output;

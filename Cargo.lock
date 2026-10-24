@@ -3450,6 +3450,7 @@ name = "bmux_web_renderer"
 version = "0.0.1-alpha.4"
 dependencies = [
  "bmux_codec",
+ "bmux_keyboard 0.0.1-alpha.4",
  "bmux_tui 0.0.1-alpha.4",
  "js-sys",
  "serde",
