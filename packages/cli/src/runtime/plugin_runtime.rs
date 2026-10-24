@@ -1732,9 +1732,23 @@ pub(super) async fn deactivate_loaded_plugins(
     for plugin in loaded_plugins {
         plugin.cancel_background_tasks()?;
     }
-    for plugin in loaded_plugins {
-        plugin.drain_background_tasks().await?;
+    let drains = loaded_plugins.iter().map(|plugin| async move {
+        tracing::info!(plugin_id = plugin.declaration.id.as_str(), "shutdown background drain started");
+        let result = plugin.drain_background_tasks().await;
+        tracing::info!(plugin_id = plugin.declaration.id.as_str(), error = ?result.as_ref().err(), "shutdown background drain completed");
+        result
+    });
+    let mut failures = Vec::new();
+    for result in futures_util::future::join_all(drains).await {
+        if let Err(error) = result {
+            failures.push(error.to_string());
+        }
     }
+    anyhow::ensure!(
+        failures.is_empty(),
+        "background cleanup failed: {}",
+        failures.join("; ")
+    );
     for plugin in loaded_plugins.iter().rev() {
         if !plugin.declaration.lifecycle.activate_on_startup {
             continue;

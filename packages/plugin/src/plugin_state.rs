@@ -92,6 +92,30 @@ impl PluginStateRegistry {
         })
     }
 
+    /// Retrieve or atomically initialize shared neutral state.
+    ///
+    /// # Panics
+    /// Panics if the registry lock is poisoned. The initializer must not reenter it.
+    #[must_use]
+    pub fn get_or_insert_with<T>(&self, initialize: impl FnOnce() -> T) -> Arc<RwLock<T>>
+    where
+        T: Any + Send + Sync,
+    {
+        let mut entries = self
+            .entries
+            .write()
+            .expect("plugin state registry lock poisoned");
+        let entry = entries
+            .entry(TypeId::of::<Arc<RwLock<T>>>())
+            .or_insert_with(|| Arc::new(Arc::new(RwLock::new(initialize()))));
+        let handle = entry
+            .downcast_ref::<Arc<RwLock<T>>>()
+            .expect("registered state type")
+            .clone();
+        drop(entries);
+        handle
+    }
+
     /// Retrieve the registered state for concrete type `T` if any.
     ///
     /// # Panics

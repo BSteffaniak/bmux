@@ -131,9 +131,8 @@ use server_commands::{
     run_server_stop, run_server_whoami_principal, server_event_name,
 };
 use server_runtime::{
-    cleanup_stale_pid_file, fetch_server_status, is_pid_running, read_server_pid_file,
-    remove_server_pid_file, server_is_running, try_kill_pid, wait_for_process_exit,
-    wait_for_server_running, wait_until_server_stopped, write_server_pid_file,
+    cleanup_stale_pid_file, fetch_server_status, read_server_pid_file, remove_server_pid_file,
+    server_is_running, wait_for_server_running, wait_until_server_stopped, write_server_pid_file,
 };
 
 /// Re-export of [`server_runtime::is_pid_running`] for cross-module callers
@@ -160,7 +159,6 @@ use terminal_protocol::{
 const SERVER_POLL_INTERVAL: Duration = Duration::from_millis(200);
 const SERVER_START_TIMEOUT: Duration = Duration::from_secs(5);
 const SERVER_STATUS_TIMEOUT: Duration = Duration::from_secs(1);
-const SERVER_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 const ATTACH_SCROLLBACK_UNAVAILABLE_STATUS: &str = "scrollback unavailable for focused pane";
 const ATTACH_SELECTION_STARTED_STATUS: &str = "selection started";
 const ATTACH_SELECTION_CLEARED_STATUS: &str = "selection cleared";

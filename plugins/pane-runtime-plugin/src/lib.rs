@@ -290,7 +290,8 @@ impl RustPlugin for PaneRuntimePlugin {
             });
         let padding_config = padding::PanePaddingConfig::parse(context.settings.as_ref())
             .map_err(PluginCommandError::invalid_arguments)?;
-        runtime::activate_pane_runtime(config, padding_config);
+        runtime::activate_pane_runtime(config, padding_config)
+            .map_err(PluginCommandError::failed)?;
         Ok(bmux_plugin_sdk::EXIT_OK)
     }
 

@@ -2,6 +2,15 @@
 
 The current CLI is server-backed by default. Running `bmux` with no subcommand starts or reuses a server, creates a session when needed, and attaches.
 
+`bmux server stop` waits up to 30 seconds for the selected local process to exit.
+Graceful completion requires an instance-matching cleanup record; an older server
+without that record is reported as stopped with cleanup unverified. Cleanup errors
+are failures, not successful stops. An unavailable endpoint never authorizes killing
+a numeric PID: a timed-out stop leaves cleanup ownership intact and directs you to
+the selected runtime's logs. Remote endpoint loss alone cannot prove cleanup;
+remote completion remains unconfirmed until a completion protocol is available.
+
+
 ```bash
 # Start or inspect the server
 bmux server start

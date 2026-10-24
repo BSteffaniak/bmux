@@ -643,6 +643,8 @@ async fn run_server_start_inner(
     }
     write_server_pid_file(std::process::id())?;
     write_server_runtime_metadata(std::process::id())?;
+    let server_identity = crate::connection::read_server_runtime_metadata()?
+        .context("server metadata missing after publication")?;
     dispatch_loaded_plugin_event(&loaded_plugins, &plugin_system_event("server_started"))?;
     let gateway_loop = async move {
         match configured_gateway {
@@ -707,11 +709,35 @@ async fn run_server_start_inner(
     {
         warn!("failed delivering server_stopping plugin event: {error}");
     }
+    tracing::info!("shutdown plugin teardown started");
     let shutdown_result =
         Box::pin(deactivate_loaded_plugins(&loaded_plugins, &config, &paths)).await;
-    let _ = remove_server_pid_file();
-    shutdown_result?;
-    run_result?;
+    let result = match (run_result, shutdown_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(run), Err(teardown)) => Err(anyhow::anyhow!(
+            "shutdown failed: {run:#}; plugin teardown failed: {teardown:#}"
+        )),
+    };
+    let receipt = serde_json::json!({
+        "pid": server_identity.pid,
+        "started_at_epoch_ms": server_identity.started_at_epoch_ms,
+        "error": result.as_ref().err().map(|error| format!("{error:#}")),
+    });
+    let receipt_path = paths.runtime_dir.join("shutdown-result.json");
+    let staged_receipt = paths
+        .runtime_dir
+        .join(format!("shutdown-result.{}.next", std::process::id()));
+    std::fs::write(&staged_receipt, serde_json::to_vec(&receipt)?)?;
+    std::fs::File::open(&staged_receipt)?.sync_all()?;
+    std::fs::rename(&staged_receipt, &receipt_path)?;
+    std::fs::File::open(&paths.runtime_dir)?.sync_all()?;
+    // Do not erase ownership metadata published by a replacement instance.
+    if crate::connection::read_server_runtime_metadata()?.as_ref() == Some(&server_identity) {
+        remove_server_pid_file()?;
+    }
+    tracing::info!(error = ?result.as_ref().err(), "shutdown completed");
+    result?;
     Ok(0)
 }
 

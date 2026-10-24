@@ -162,6 +162,30 @@ struct IrohTarget {
 
 const BMUX_IROH_ALPN: &[u8] = b"bmux/gateway/iroh/1";
 
+/// A stop operation resolves its target once, so retries cannot switch to a
+/// newly selected default target midway through shutdown.
+pub struct StopTarget(ActiveTarget);
+
+impl StopTarget {
+    pub async fn resolve(context: ConnectionContext<'_>) -> Result<Self> {
+        Ok(Self(resolve_active_target(context).await?))
+    }
+
+    pub const fn is_local(&self) -> bool {
+        matches!(self.0, ActiveTarget::Local)
+    }
+
+    pub async fn connect(&self, client_name: &'static str) -> Result<BmuxClient> {
+        match &self.0 {
+            ActiveTarget::Local => BmuxClient::connect_default(client_name)
+                .await
+                .map_err(map_client_connect_error),
+            ActiveTarget::Tls(target) => connect_tls_target(target, client_name).await,
+            ActiveTarget::Iroh(target) => connect_iroh_target(target, client_name).await,
+        }
+    }
+}
+
 async fn connect_for_active_target(
     client_name: &'static str,
     context: ConnectionContext<'_>,
@@ -301,13 +325,6 @@ fn build_tls_connector(target: &TlsTarget) -> Result<TlsConnector> {
         .with_root_certificates(roots)
         .with_no_client_auth();
     Ok(TlsConnector::from(Arc::new(config)))
-}
-
-pub async fn target_is_local(context: ConnectionContext<'_>) -> Result<bool> {
-    Ok(matches!(
-        resolve_active_target(context).await?,
-        ActiveTarget::Local
-    ))
 }
 
 async fn resolve_active_target(context: ConnectionContext<'_>) -> Result<ActiveTarget> {

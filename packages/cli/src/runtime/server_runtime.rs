@@ -1,7 +1,12 @@
 use anyhow::{Context, Result};
 use std::path::PathBuf;
-use std::process::Command as ProcessCommand;
 use std::time::{Duration, Instant};
+
+#[cfg(any(
+    all(test, any(target_os = "linux", target_os = "macos")),
+    all(unix, not(any(target_os = "linux", target_os = "macos")))
+))]
+use std::process::Command as ProcessCommand;
 
 use super::{
     ConnectionContext, SERVER_POLL_INTERVAL, SERVER_STATUS_TIMEOUT, connect_raw_with_context,
@@ -77,31 +82,17 @@ pub(super) async fn wait_for_server_running(
     Ok(false)
 }
 
+/// Remote endpoint disappearance is evidence only of transport closure, not
+/// process exit or successful cleanup. The caller must report that limitation.
 pub(super) async fn wait_until_server_stopped(
-    timeout: Duration,
-    connection_context: ConnectionContext<'_>,
+    deadline: tokio::time::Instant,
+    target: &crate::connection::StopTarget,
 ) -> Result<bool> {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        let reconnect = tokio::time::timeout(
-            SERVER_STATUS_TIMEOUT,
-            connect_raw_with_context("bmux-cli-stop-check", connection_context),
-        )
-        .await;
-        if reconnect.is_err() || matches!(reconnect, Ok(Err(_))) {
-            return Ok(true);
-        }
-        tokio::time::sleep(SERVER_POLL_INTERVAL).await;
-    }
-
-    Ok(false)
-}
-
-pub(super) async fn wait_for_process_exit_async(pid: u32, timeout: Duration) -> Result<bool> {
-    let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        if !is_pid_running(pid)? || process_has_exited(pid)? {
-            return Ok(true);
+        match tokio::time::timeout_at(deadline, target.connect("bmux-cli-stop-check")).await {
+            Ok(Err(_)) => return Ok(true),
+            Err(_) => return Ok(false),
+            Ok(Ok(_)) => {}
         }
         if tokio::time::Instant::now() >= deadline {
             return Ok(false);
@@ -111,36 +102,270 @@ pub(super) async fn wait_for_process_exit_async(pid: u32, timeout: Duration) -> 
     }
 }
 
-// An exited foreground server can remain a zombie until its launching parent
-// reaps it. It has released its resources even though kill -0 still succeeds.
-fn process_has_exited(pid: u32) -> Result<bool> {
-    #[cfg(unix)]
-    {
-        let output = ProcessCommand::new("ps")
-            .args(["-o", "stat=", "-p", &pid.to_string()])
-            .output()
-            .context("failed inspecting server process state")?;
-        Ok(output.status.success()
-            && String::from_utf8_lossy(&output.stdout)
-                .trim_start()
-                .starts_with('Z'))
-    }
+/// Retain an OS process observation, not a numeric-PID polling loop. pidfds,
+/// kqueue registrations and Windows handles survive numeric PID reuse.
+/// No shutdown path sends a signal merely because IPC is unavailable.
+pub(super) struct ProcessObservation {
+    #[cfg(target_os = "linux")]
+    fd: Option<std::os::fd::OwnedFd>,
+    #[cfg(target_os = "macos")]
+    queue: Option<std::os::fd::OwnedFd>,
+    #[cfg(target_os = "macos")]
+    exit_seen: std::sync::atomic::AtomicBool,
     #[cfg(windows)]
-    {
-        let _ = pid;
-        Ok(false)
+    handle: Option<std::os::windows::io::OwnedHandle>,
+}
+
+impl ProcessObservation {
+    pub(super) fn open(pid: u32) -> Result<Self> {
+        anyhow::ensure!(pid > 0, "invalid server PID");
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::FromRawFd;
+            // SAFETY: pidfd_open accepts an integer PID and zero flags; it does
+            // not dereference any pointers. The returned descriptor is owned.
+            let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+            if fd < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::ESRCH) {
+                    return Ok(Self { fd: None });
+                }
+                return Err(error).context("cannot safely observe server identity with pidfd");
+            }
+            let fd = i32::try_from(fd).context("invalid pidfd descriptor")?;
+            // SAFETY: a successful pidfd_open returns a new owned descriptor.
+            Ok(Self {
+                fd: Some(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) }),
+            })
+        }
+        #[cfg(target_os = "macos")]
+        {
+            Self::open_macos(pid)
+        }
+        #[cfg(windows)]
+        {
+            Self::open_windows(pid)
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+        {
+            anyhow::bail!(
+                "identity-safe local shutdown observation is unavailable on this platform; no signal sent"
+            )
+        }
+    }
+
+    pub(super) fn exited(&self) -> Result<bool> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+            let Some(fd) = &self.fd else {
+                return Ok(true);
+            };
+            let mut pollfd = libc::pollfd {
+                fd: fd.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: pollfd references one initialized descriptor for this
+            // call; timeout zero never blocks. pidfd readiness includes zombies.
+            let result = unsafe { libc::poll(&raw mut pollfd, 1, 0) };
+            if result < 0 {
+                return Err(std::io::Error::last_os_error()).context("failed polling server pidfd");
+            }
+            anyhow::ensure!(pollfd.revents & libc::POLLNVAL == 0, "invalid server pidfd");
+            Ok(pollfd.revents & (libc::POLLIN | libc::POLLHUP) != 0)
+        }
+        #[cfg(target_os = "macos")]
+        {
+            self.exited_macos()
+        }
+        #[cfg(windows)]
+        {
+            self.exited_windows()
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+        {
+            anyhow::bail!(
+                "identity-safe local shutdown observation is unavailable on this platform"
+            )
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn open_macos(pid: u32) -> Result<Self> {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        // SAFETY: kqueue takes no arguments and returns a new owned descriptor.
+        let queue = unsafe { libc::kqueue() };
+        if queue < 0 {
+            return Err(std::io::Error::last_os_error()).context("failed creating process kqueue");
+        }
+        // SAFETY: successful kqueue returned a fresh owned descriptor.
+        let queue = unsafe { OwnedFd::from_raw_fd(queue) };
+        let change = libc::kevent {
+            ident: usize::try_from(pid).context("invalid server PID")?,
+            filter: libc::EVFILT_PROC,
+            flags: libc::EV_ADD | libc::EV_ENABLE,
+            fflags: libc::NOTE_EXIT,
+            data: 0,
+            udata: std::ptr::null_mut(),
+        };
+        // SAFETY: change is initialized; there is one change, no output buffer,
+        // and no wait when no output events are requested. Registration pins
+        // this process rather than observing a future reuse of its PID.
+        let result = unsafe {
+            libc::kevent(
+                queue.as_raw_fd(),
+                &raw const change,
+                1,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null(),
+            )
+        };
+        if result < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ESRCH) {
+                return Ok(Self {
+                    queue: None,
+                    exit_seen: std::sync::atomic::AtomicBool::new(true),
+                });
+            }
+            return Err(error).context("failed registering server process exit observation");
+        }
+        Ok(Self {
+            queue: Some(queue),
+            exit_seen: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+
+    #[cfg(target_os = "macos")]
+    fn exited_macos(&self) -> Result<bool> {
+        use std::os::fd::AsRawFd;
+        use std::sync::atomic::Ordering;
+        if self.exit_seen.load(Ordering::Relaxed) {
+            return Ok(true);
+        }
+        let Some(queue) = &self.queue else {
+            return Ok(true);
+        };
+        let mut event = std::mem::MaybeUninit::<libc::kevent>::uninit();
+        let timeout = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: event has space for one kevent, no changes are submitted,
+        // and the initialized zero timeout makes this call nonblocking.
+        let result = unsafe {
+            libc::kevent(
+                queue.as_raw_fd(),
+                std::ptr::null(),
+                0,
+                event.as_mut_ptr(),
+                1,
+                &raw const timeout,
+            )
+        };
+        if result < 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("failed polling server process kqueue");
+        }
+        if result == 0 {
+            return Ok(false);
+        }
+        // SAFETY: kevent returned one initialized event.
+        let event = unsafe { event.assume_init() };
+        anyhow::ensure!(
+            event.flags & libc::EV_ERROR == 0,
+            "server process kqueue returned an error"
+        );
+        let exited = event.filter == libc::EVFILT_PROC && event.fflags & libc::NOTE_EXIT != 0;
+        if exited {
+            self.exit_seen.store(true, Ordering::Relaxed);
+        }
+        Ok(exited)
+    }
+
+    #[cfg(windows)]
+    fn open_windows(pid: u32) -> Result<Self> {
+        use std::os::windows::io::{FromRawHandle, OwnedHandle};
+        use windows_sys::Win32::Foundation::{ERROR_INVALID_PARAMETER, GetLastError};
+        use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE};
+        // SAFETY: request only wait access, no inheritance, for a positive PID.
+        let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
+        if handle.is_null() {
+            // SAFETY: immediately read the calling thread's last OS error.
+            let error = unsafe { GetLastError() };
+            if error == ERROR_INVALID_PARAMETER {
+                return Ok(Self { handle: None });
+            }
+            return Err(std::io::Error::from_raw_os_error(i32::try_from(error)?))
+                .context("failed opening server process observation handle");
+        }
+        // SAFETY: successful OpenProcess returned a new owned handle.
+        Ok(Self {
+            handle: Some(unsafe { OwnedHandle::from_raw_handle(handle) }),
+        })
+    }
+
+    #[cfg(windows)]
+    fn exited_windows(&self) -> Result<bool> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::{WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT};
+        use windows_sys::Win32::System::Threading::WaitForSingleObject;
+        let Some(handle) = &self.handle else {
+            return Ok(true);
+        };
+        // SAFETY: owned handle stays alive for this nonblocking wait.
+        match unsafe { WaitForSingleObject(handle.as_raw_handle(), 0) } {
+            WAIT_OBJECT_0 => Ok(true),
+            WAIT_TIMEOUT => Ok(false),
+            WAIT_FAILED => {
+                Err(std::io::Error::last_os_error()).context("failed polling server process handle")
+            }
+            result => anyhow::bail!("unexpected server process wait result: {result}"),
+        }
+    }
+
+    pub(super) async fn wait(&self, deadline: tokio::time::Instant) -> Result<bool> {
+        loop {
+            match process_wait_decision(self.exited()?, tokio::time::Instant::now() >= deadline) {
+                ProcessWaitDecision::Exited => return Ok(true),
+                ProcessWaitDecision::TimedOut => return Ok(false),
+                ProcessWaitDecision::Wait => {}
+            }
+            tokio::time::sleep_until(
+                deadline.min(tokio::time::Instant::now() + SERVER_POLL_INTERVAL),
+            )
+            .await;
+        }
     }
 }
 
-pub(super) fn wait_for_process_exit(pid: u32, timeout: Duration) -> Result<bool> {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if !is_pid_running(pid)? {
-            return Ok(true);
-        }
-        std::thread::sleep(SERVER_POLL_INTERVAL);
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum ProcessWaitDecision {
+    Exited,
+    TimedOut,
+    Wait,
+}
+
+pub(super) const fn process_wait_decision(
+    exited: bool,
+    deadline_elapsed: bool,
+) -> ProcessWaitDecision {
+    if exited {
+        ProcessWaitDecision::Exited
+    } else if deadline_elapsed {
+        ProcessWaitDecision::TimedOut
+    } else {
+        ProcessWaitDecision::Wait
     }
-    Ok(!is_pid_running(pid)?)
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+pub(super) async fn wait_for_process_exit_async(pid: u32, timeout: Duration) -> Result<bool> {
+    ProcessObservation::open(pid)?
+        .wait(tokio::time::Instant::now() + timeout)
+        .await
 }
 
 pub(super) fn server_pid_file_path() -> PathBuf {
@@ -199,62 +424,26 @@ pub(super) fn remove_server_pid_file() -> Result<()> {
     remove_pid_result.and(remove_metadata_result)
 }
 
-pub(super) fn try_kill_pid(pid: u32) -> Result<bool> {
-    if pid == 0 {
-        return Ok(false);
-    }
-
-    #[cfg(unix)]
-    {
-        let status = ProcessCommand::new("kill")
-            .arg("-TERM")
-            .arg(pid.to_string())
-            .status()
-            .context("failed to execute kill command")?;
-        Ok(status.success())
-    }
-
-    #[cfg(windows)]
-    {
-        let status = ProcessCommand::new("taskkill")
-            .arg("/PID")
-            .arg(pid.to_string())
-            .arg("/T")
-            .arg("/F")
-            .status()
-            .context("failed to execute taskkill command")?;
-        return Ok(status.success());
-    }
-}
-
 pub fn is_pid_running(pid: u32) -> Result<bool> {
     if pid == 0 {
         return Ok(false);
     }
 
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     {
-        let status = ProcessCommand::new("kill")
-            .arg("-0")
-            .arg(pid.to_string())
-            .status()
-            .context("failed to execute kill -0 command")?;
-        Ok(status.success())
+        Ok(!ProcessObservation::open(pid)?.exited()?)
     }
 
-    #[cfg(windows)]
+    #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
     {
-        let filter = format!("PID eq {pid}");
-        let output = ProcessCommand::new("tasklist")
-            .arg("/FI")
-            .arg(filter)
+        let output = ProcessCommand::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
             .output()
-            .context("failed to execute tasklist command")?;
-        if !output.status.success() {
-            return Ok(false);
-        }
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        return Ok(stdout.lines().any(|line| line.contains(&pid.to_string())));
+            .context("failed inspecting server process state")?;
+        let state = String::from_utf8_lossy(&output.stdout);
+        Ok(output.status.success()
+            && !state.trim().is_empty()
+            && !state.trim_start().starts_with('Z'))
     }
 }
 
@@ -324,7 +513,7 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[tokio::test]
     async fn process_exit_wait_does_not_report_a_live_process_as_stopped() {
         // No IPC endpoint exists for this child. IPC failure alone must not
@@ -349,7 +538,7 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[tokio::test]
     async fn process_exit_wait_accepts_an_unreaped_child() {
         let mut child = ProcessCommand::new("sleep").arg("0.1").spawn().unwrap();
@@ -361,7 +550,7 @@ mod tests {
         assert!(exited.unwrap());
     }
 
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[tokio::test]
     async fn process_exit_wait_waits_for_delayed_exit() {
         let mut child = tokio::process::Command::new("sleep")

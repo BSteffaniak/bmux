@@ -293,6 +293,23 @@ impl WireSelector {
     }
 }
 
+struct SessionsShutdown(Arc<dyn SessionManagerWriter>);
+impl bmux_plugin_runtime::shutdown::ShutdownParticipant for SessionsShutdown {
+    fn id(&self) -> &'static str {
+        "bmux.sessions"
+    }
+    fn phase(&self) -> bmux_plugin_runtime::shutdown::ShutdownPhase {
+        bmux_plugin_runtime::shutdown::ShutdownPhase::Clear
+    }
+    fn shutdown(&self) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'static>> {
+        let writer = Arc::clone(&self.0);
+        Box::pin(async move {
+            writer.restore_snapshot(SessionManagerSnapshot::default());
+            Ok(())
+        })
+    }
+}
+
 #[derive(Default)]
 pub struct SessionsPlugin;
 
@@ -324,6 +341,13 @@ impl RustPlugin for SessionsPlugin {
                 .expect("freshly-created SessionManagerHandle lock is poisoned");
             Arc::clone(&guard.0)
         };
+        let lifecycle = global_plugin_state_registry()
+            .get_or_insert_with(bmux_plugin_runtime::shutdown::ShutdownRegistry::default);
+        lifecycle
+            .read()
+            .map_err(|_| PluginCommandError::failed("shutdown registry poisoned"))?
+            .register(Arc::new(SessionsShutdown(Arc::clone(&writer_for_snapshot))))
+            .map_err(PluginCommandError::failed)?;
         let stateful = StatefulPluginHandle::new(SessionsStatefulPlugin {
             writer: writer_for_snapshot,
         });

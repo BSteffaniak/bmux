@@ -13,11 +13,10 @@ use std::process::{Command as ProcessCommand, Stdio};
 use uuid::Uuid;
 
 use super::{
-    ConnectionContext, ConnectionPolicyScope, SERVER_STATUS_TIMEOUT, SERVER_STOP_TIMEOUT,
-    ServerRuntimeMetadata, active_runtime_name, cleanup_stale_pid_file, connect_raw_with_context,
-    connect_with_context, current_cli_build_id, fetch_server_status, is_pid_running,
-    map_cli_client_error, read_server_pid_file, read_server_runtime_metadata,
-    remove_server_pid_file, try_kill_pid, wait_for_process_exit, wait_until_server_stopped,
+    ConnectionContext, ConnectionPolicyScope, SERVER_STATUS_TIMEOUT, ServerRuntimeMetadata,
+    active_runtime_name, cleanup_stale_pid_file, connect_raw_with_context, connect_with_context,
+    current_cli_build_id, fetch_server_status, map_cli_client_error, read_server_pid_file,
+    read_server_runtime_metadata, wait_until_server_stopped,
 };
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls_pemfile::{certs, pkcs8_private_keys};
@@ -441,68 +440,162 @@ fn plugin_bus_event_name(kind: &str, payload: &[u8]) -> &'static str {
     "plugin_bus_event"
 }
 
+#[cfg(test)]
+#[path = "owned_stop_tests.rs"]
+mod owned_stop_tests;
+
+const OWNED_STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const STOP_TIMEOUT_MESSAGE: &str = "server shutdown completion is unconfirmed after 30 seconds; no termination signal was sent. Cleanup may still be running. Inspect the selected runtime's server logs and retry `server stop`; do not kill a numeric PID from a stale PID file";
+
+#[derive(Debug, serde::Deserialize)]
+struct ShutdownReceipt {
+    pid: u32,
+    started_at_epoch_ms: u64,
+    error: Option<String>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum CleanupProof {
+    Complete,
+    Failed(String),
+    Unavailable,
+}
+
+fn cleanup_proof(
+    metadata: Option<&ServerRuntimeMetadata>,
+    receipt: Option<&ShutdownReceipt>,
+) -> CleanupProof {
+    match (metadata, receipt) {
+        (Some(metadata), Some(receipt))
+            if metadata.pid == receipt.pid
+                && metadata.started_at_epoch_ms == receipt.started_at_epoch_ms =>
+        {
+            receipt
+                .error
+                .as_ref()
+                .map_or(CleanupProof::Complete, |error| {
+                    CleanupProof::Failed(error.clone())
+                })
+        }
+        _ => CleanupProof::Unavailable,
+    }
+}
+
+fn read_shutdown_receipt(path: &std::path::Path) -> Result<Option<ShutdownReceipt>> {
+    match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map(Some)
+            .with_context(|| format!("invalid shutdown completion record {}", path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "failed reading shutdown completion record {}",
+                path.display()
+            )
+        }),
+    }
+}
+
+fn report_local_stop(proof: CleanupProof) -> Result<u8> {
+    match proof {
+        CleanupProof::Complete => println!("bmux server stopped; cleanup completed"),
+        CleanupProof::Failed(error) => {
+            anyhow::bail!("bmux server exited, but cleanup failed: {error}")
+        }
+        CleanupProof::Unavailable => println!(
+            "bmux server process stopped; cleanup completion is unverified (no matching completion record)"
+        ),
+    }
+    Ok(0)
+}
+
+fn report_remote_completion() -> Result<u8> {
+    anyhow::bail!(
+        "remote shutdown acknowledged and endpoint unavailable, but process exit and cleanup completion cannot be proved: the remote protocol exposes no shutdown completion record (no local fallback)"
+    )
+}
+
+#[allow(clippy::too_many_lines)] // Keep the single deadline and no-signal policy visible together.
 pub(super) async fn run_server_stop(connection_context: ConnectionContext<'_>) -> Result<u8> {
-    let local = crate::connection::target_is_local(connection_context).await?;
-    // Capture the process before requesting shutdown: the server removes its PID
-    // file during cleanup, before the process itself has necessarily exited.
-    let pid = if local {
-        cleanup_stale_pid_file().await?;
-        read_server_pid_file()?
+    let deadline = tokio::time::Instant::now() + OWNED_STOP_TIMEOUT;
+    let target = tokio::time::timeout_at(
+        deadline,
+        crate::connection::StopTarget::resolve(connection_context),
+    )
+    .await
+    .context(STOP_TIMEOUT_MESSAGE)??;
+    // Do not prune PID/metadata files: cleanup owns them, and an older stop
+    // invocation must never remove a replacement server's identity.
+    let local = target.is_local();
+    let metadata = if local {
+        read_server_runtime_metadata()?
     } else {
         None
     };
-    let graceful_stopped = match tokio::time::timeout(
-        SERVER_STOP_TIMEOUT,
-        connect_raw_with_context("bmux-cli-stop", connection_context),
-    )
-    .await
-    {
+    let pid = if local { read_server_pid_file()? } else { None };
+    if let (Some(metadata), Some(pid)) = (&metadata, pid) {
+        anyhow::ensure!(
+            metadata.pid == pid,
+            "server PID and metadata disagree; refusing shutdown"
+        );
+    }
+    let observed_pid = pid.or_else(|| metadata.as_ref().map(|metadata| metadata.pid));
+    let process = observed_pid
+        .map(super::server_runtime::ProcessObservation::open)
+        .transpose()?;
+    let receipt_path = local.then(|| {
+        ConfigPaths::default()
+            .runtime_dir
+            .join("shutdown-result.json")
+    });
+    let connected = tokio::time::timeout_at(deadline, target.connect("bmux-cli-stop")).await;
+    let acknowledged = match connected {
         Ok(Ok(mut client)) => {
-            tokio::time::timeout(SERVER_STOP_TIMEOUT, client.stop_server())
+            if local {
+                anyhow::ensure!(
+                    read_server_runtime_metadata()? == metadata && read_server_pid_file()? == pid,
+                    "server identity changed while connecting; retry for the selected runtime"
+                );
+            }
+            tokio::time::timeout_at(deadline, client.stop_server())
                 .await
-                .context("timed out requesting server shutdown")?
+                .context(STOP_TIMEOUT_MESSAGE)?
                 .map_err(map_cli_client_error)?;
-            let stopped = if local {
-                let pid = pid.context(
-                    "shutdown requested, but no server PID is available to verify process exit",
-                )?;
-                super::server_runtime::wait_for_process_exit_async(pid, SERVER_STOP_TIMEOUT).await?
-            } else {
-                wait_until_server_stopped(SERVER_STOP_TIMEOUT, connection_context).await?
-            };
-            anyhow::ensure!(
-                stopped,
-                "server shutdown is still in progress; timed out waiting for completion"
-            );
             true
         }
-        Ok(Err(_)) | Err(_) => false,
+        Ok(Err(error)) => {
+            tracing::debug!(%error, "stop endpoint unavailable; no signal fallback permitted");
+            false
+        }
+        Err(_) => anyhow::bail!(STOP_TIMEOUT_MESSAGE),
     };
 
-    if graceful_stopped {
-        println!("bmux server stopped gracefully");
-        return Ok(0);
+    if !local {
+        anyhow::ensure!(
+            acknowledged,
+            "remote server is unreachable; shutdown and cleanup completion are unconfirmed (no local fallback)"
+        );
+        anyhow::ensure!(
+            wait_until_server_stopped(deadline, &target).await?,
+            "{STOP_TIMEOUT_MESSAGE}"
+        );
+        return report_remote_completion();
     }
 
-    if let Some(pid) = pid {
-        if try_kill_pid(pid)? {
-            if wait_for_process_exit(pid, SERVER_STOP_TIMEOUT)? {
-                println!("bmux server stop fallback succeeded (pid {pid})");
-                let _ = remove_server_pid_file();
-                return Ok(0);
-            }
+    let Some(process) = process else {
+        if acknowledged {
             anyhow::bail!(
-                "server process {pid} is still running after the stop fallback timed out"
+                "shutdown acknowledged, but no local process identity is available; cleanup completion is unconfirmed (no signal sent)"
             );
-        } else if !is_pid_running(pid)? {
-            let _ = remove_server_pid_file();
-        } else {
-            anyhow::bail!("failed to stop server process {pid}; it is still running");
         }
-    }
-
-    println!("bmux server is not running");
-    Ok(1)
+        println!("bmux server is not reachable; no local process identity is available");
+        return Ok(1);
+    };
+    anyhow::ensure!(process.wait(deadline).await?, "{STOP_TIMEOUT_MESSAGE}");
+    // Bootstrap publishes the receipt before process exit. A missing receipt
+    // supports old servers, but never proves their cleanup was successful.
+    let receipt = read_shutdown_receipt(receipt_path.as_deref().expect("local receipt path"))?;
+    report_local_stop(cleanup_proof(metadata.as_ref(), receipt.as_ref()))
 }
 
 const BRIDGE_PREFLIGHT_TOKEN: &str = "BMUX_BRIDGE_READY";

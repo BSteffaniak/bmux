@@ -104,6 +104,14 @@ impl RustPlugin for SnapshotPlugin {
             );
         }
 
+        let lifecycle =
+            registry.get_or_insert_with(bmux_plugin_runtime::shutdown::ShutdownRegistry::default);
+        lifecycle
+            .read()
+            .map_err(|_| PluginCommandError::failed("shutdown registry poisoned"))?
+            .register(Arc::new(SnapshotShutdown(Arc::clone(&orchestrator))))
+            .map_err(PluginCommandError::failed)?;
+
         Ok(bmux_plugin_sdk::EXIT_OK)
     }
 
@@ -233,6 +241,32 @@ where
     tokio::task::block_in_place(|| rt.block_on(fut))
 }
 
+struct SnapshotShutdown(Arc<BmuxSnapshotOrchestrator>);
+impl bmux_plugin_runtime::shutdown::ShutdownParticipant for SnapshotShutdown {
+    fn id(&self) -> &'static str {
+        "bmux.snapshot"
+    }
+    fn phase(&self) -> bmux_plugin_runtime::shutdown::ShutdownPhase {
+        bmux_plugin_runtime::shutdown::ShutdownPhase::Persist
+    }
+    fn shutdown(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'static>>
+    {
+        let orchestrator = Arc::clone(&self.0);
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || {
+                orchestrator.stop_debounce()?;
+                bmux_snapshot_runtime::SnapshotOrchestrator::finalize(orchestrator.as_ref())
+                    .map(|_| ())
+                    .map_err(|error| error.to_string())
+            })
+            .await
+            .map_err(|error| error.to_string())?
+        })
+    }
+}
+
 fn spawn_debounce_loop(
     orchestrator: Arc<BmuxSnapshotOrchestrator>,
     dirty_flag: Arc<bmux_snapshot_runtime::SnapshotDirtyFlag>,
@@ -242,12 +276,17 @@ fn spawn_debounce_loop(
     // of their own, and we want the flush cadence to be independent
     // of any host scheduling decisions. The thread blocks on
     // `thread::sleep` between ticks.
-    std::thread::Builder::new()
+    let (stop, stopped) = std::sync::mpsc::channel();
+    let owner = Arc::clone(&orchestrator);
+    let thread = std::thread::Builder::new()
         .name("bmux-snapshot-debounce".into())
         .spawn(move || {
             debug!("snapshot debounce loop started (debounce_ms={debounce_ms})");
             loop {
-                std::thread::sleep(std::time::Duration::from_millis(DEBOUNCE_POLL_MS));
+                match stopped.recv_timeout(std::time::Duration::from_millis(DEBOUNCE_POLL_MS)) {
+                    Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                }
                 if Arc::strong_count(&orchestrator) <= 1 {
                     // The only remaining Arc is ours; orchestrator is
                     // going away, exit the loop.
@@ -266,6 +305,7 @@ fn spawn_debounce_loop(
             debug!("snapshot debounce loop exited");
         })
         .expect("failed to spawn snapshot debounce thread");
+    owner.install_debounce(stop, thread);
 }
 
 bmux_plugin_sdk::export_plugin!(SnapshotPlugin, include_str!("../plugin.toml"));

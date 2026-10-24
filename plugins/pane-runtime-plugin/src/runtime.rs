@@ -398,19 +398,132 @@ async fn shutdown_runtime_handle(removed: RemovedRuntime) {
 // A cancelled service waiter must not cancel its cleanup owner. Retain every
 // owner JoinHandle until it has awaited all pane tasks (including their reapers).
 // Unlike a detached JoinHandle, this registry makes outstanding cleanup owned.
-fn pane_shutdown_owners() -> &'static Mutex<BTreeMap<Uuid, JoinHandle<()>>> {
-    static OWNERS: std::sync::OnceLock<Mutex<BTreeMap<Uuid, JoinHandle<()>>>> =
+type PaneShutdownOwner = JoinHandle<std::result::Result<(), String>>;
+
+fn pane_shutdown_owners() -> &'static Mutex<BTreeMap<Uuid, PaneShutdownOwner>> {
+    static OWNERS: std::sync::OnceLock<Mutex<BTreeMap<Uuid, PaneShutdownOwner>>> =
         std::sync::OnceLock::new();
     OWNERS.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
-async fn shutdown_panes(mut panes: Vec<PaneRuntimeHandle>) {
+async fn shutdown_panes(panes: Vec<PaneRuntimeHandle>) {
+    if let Err(error) = shutdown_panes_result(panes).await {
+        warn!(%error, "pane shutdown failed; cleanup owner retained until settlement");
+    }
+}
+
+async fn shutdown_panes_result(panes: Vec<PaneRuntimeHandle>) -> std::result::Result<(), String> {
+    shutdown_panes_owned(panes, false).await
+}
+
+async fn await_pane_cleanup(
+    panes: &mut [PaneRuntimeHandle],
+    id: Uuid,
+    wait_for_settlement: bool,
+    settled: &mut Option<oneshot::Sender<std::result::Result<(), String>>>,
+    errors: &mut Vec<String>,
+) {
+    // Cleanup acknowledgement can fail before the task exits: the task
+    // still owns late OS reapers. Observe both independently, returning
+    // failure promptly without dropping or aborting that owner.
+    let mut acknowledgements = panes
+        .iter()
+        .map(|pane| {
+            let mut cleanup = pane.cleanup.clone();
+            Box::pin(async move {
+                loop {
+                    if let Some(result) = cleanup.borrow_and_update().clone() {
+                        return result;
+                    }
+                    if cleanup.changed().await.is_err() {
+                        return Err("pane task ended without cleanup acknowledgement".into());
+                    }
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut acknowledged = vec![false; panes.len()];
+    let mut pending = vec![true; panes.len()];
+    let mut diagnostic = Box::pin(tokio::time::sleep(Duration::from_secs(5)));
+    std::future::poll_fn(|cx| {
+        use std::future::Future;
+        if diagnostic.as_mut().poll(cx).is_ready() {
+            warn!(phase = "Release", cleanup_id = %id,
+                pending_tasks = pending.iter().filter(|pending| **pending).count(),
+                errors = ?errors,
+                "pane cleanup still waiting; owners/reapers retained, plugin unload fenced");
+            diagnostic
+                .as_mut()
+                .reset(tokio::time::Instant::now() + Duration::from_secs(5));
+            let _ = diagnostic.as_mut().poll(cx);
+        }
+        for (index, (pane, pending)) in panes.iter_mut().zip(&mut pending).enumerate() {
+            if !acknowledged[index] {
+                match acknowledgements[index].as_mut().poll(cx) {
+                    std::task::Poll::Ready(result) => {
+                        acknowledged[index] = true;
+                        if let Err(error) = result {
+                            pane.execution.record_cleanup_error(error.clone());
+                            errors.push(error);
+                        }
+                    }
+                    std::task::Poll::Pending => {}
+                }
+            }
+            if !*pending {
+                continue;
+            }
+            match std::pin::Pin::new(&mut pane.task).poll(cx) {
+                std::task::Poll::Ready(result) => {
+                    *pending = false;
+                    if let Err(error) = result {
+                        let error = format!("pane cleanup task failed: {error}");
+                        pane.execution.record_cleanup_error(error.clone());
+                        errors.push(error);
+                    } else if let Some(Err(error)) = pane.cleanup.borrow().as_ref() {
+                        pane.execution.record_cleanup_error(error.clone());
+                    } else if pane.cleanup.borrow().is_none() {
+                        let error = "pane task ended without cleanup acknowledgement".to_string();
+                        pane.execution.record_cleanup_error(error.clone());
+                        errors.push(error);
+                    }
+                    acknowledged[index] = true;
+                }
+                std::task::Poll::Pending => {}
+            }
+        }
+        if errors.is_empty()
+            && panes
+                .iter()
+                .any(|pane| pane.execution.cleanup_failed.load(Ordering::SeqCst))
+        {
+            errors.push("pane resource cleanup failed; recovery required".into());
+        }
+        if !errors.is_empty()
+            && !wait_for_settlement
+            && let Some(settled) = settled.take()
+        {
+            let _ = settled.send(Err(errors.join("; ")));
+        }
+        if pending.iter().any(|pending| *pending) || acknowledged.iter().any(|ack| !*ack) {
+            std::task::Poll::Pending
+        } else {
+            std::task::Poll::Ready(())
+        }
+    })
+    .await;
+}
+
+async fn shutdown_panes_owned(
+    mut panes: Vec<PaneRuntimeHandle>,
+    wait_for_settlement: bool,
+) -> std::result::Result<(), String> {
     let id = Uuid::new_v4();
     let (begin, admission) = oneshot::channel();
     let (settled, settlement) = oneshot::channel();
     let owner = tokio::spawn(async move {
         if admission.await.is_err() {
-            return;
+            return Ok(());
         }
         // Send every stop before waiting for any one pane. Each runtime task
         // freezes its checkpoint before signaling; Drop provides the same fence
@@ -424,8 +537,13 @@ async fn shutdown_panes(mut panes: Vec<PaneRuntimeHandle>) {
         // Freeze and revoke each lease before waiting on its task. In
         // particular, a failed Sweep must not leave its slave holder alive
         // while the cleanup task waits forever for reader EOF.
+        // Startup still owns its guardian/child until readiness is published.
+        // Do not race Start with Sweep or revoke its lease underneath startup's
+        // acknowledged child cleanup. The stop above cancels startup, whose
+        // task retains the child/reaper until cleanup actually settles.
         let lifetimes = panes
             .iter()
+            .filter(|pane| matches!(*pane.startup.borrow(), Some(Ok(()))))
             .map(|pane| PaneLifetime {
                 execution: Arc::clone(&pane.execution),
                 resurrection: Arc::clone(&pane.resurrection_state),
@@ -455,42 +573,20 @@ async fn shutdown_panes(mut panes: Vec<PaneRuntimeHandle>) {
                 lifetime.revoke();
             }));
         }
+        let mut settled = Some(settled);
+        let mut errors = Vec::new();
         for revocation in revocations {
             if let Err(error) = revocation.await {
-                warn!(%error, "pane lifetime revocation worker failed");
+                errors.push(format!("pane lifetime revocation worker failed: {error}"));
             }
         }
-        let mut pending = vec![true; panes.len()];
-        std::future::poll_fn(|cx| {
-            use std::future::Future;
-            let mut waiting = false;
-            for (pane, pending) in panes.iter_mut().zip(&mut pending) {
-                if !*pending {
-                    continue;
-                }
-                match std::pin::Pin::new(&mut pane.task).poll(cx) {
-                    std::task::Poll::Ready(result) => {
-                        *pending = false;
-                        if let Err(error) = result {
-                            pane.execution
-                                .record_cleanup_error(format!("pane cleanup task failed: {error}"));
-                        } else if let Some(Err(error)) = pane.cleanup.borrow().as_ref() {
-                            pane.execution.record_cleanup_error(error.clone());
-                        } else if pane.cleanup.borrow().is_none() {
-                            pane.execution.record_cleanup_error(
-                                "pane task ended without cleanup acknowledgement".into(),
-                            );
-                        }
-                    }
-                    std::task::Poll::Pending => waiting = true,
-                }
-            }
-            if waiting {
-                std::task::Poll::Pending
-            } else {
-                std::task::Poll::Ready(())
-            }
-        })
+        await_pane_cleanup(
+            &mut panes,
+            id,
+            wait_for_settlement,
+            &mut settled,
+            &mut errors,
+        )
         .await;
         // Lifetime guards are released only after all cleanup tasks settled.
         for pane in &panes {
@@ -501,14 +597,24 @@ async fn shutdown_panes(mut panes: Vec<PaneRuntimeHandle>) {
             .lock()
             .expect("pane shutdown owners lock")
             .remove(&id);
-        let _ = settled.send(());
+        let result = if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("; "))
+        };
+        if let Some(settled) = settled {
+            let _ = settled.send(result.clone());
+        }
+        result
     });
     pane_shutdown_owners()
         .lock()
         .expect("pane shutdown owners lock")
         .insert(id, owner);
     let _ = begin.send(());
-    let _ = settlement.await;
+    settlement
+        .await
+        .map_err(|error| format!("pane cleanup owner failed: {error}"))?
 }
 
 struct LifecycleCompletion<'a>(&'a tokio::sync::watch::Sender<bool>);
@@ -1258,6 +1364,7 @@ fn encode_grid_window(
 #[derive(Debug, Clone)]
 struct PaneResurrectionRuntime {
     frozen: bool,
+    freeze_error: Option<String>,
     launch: Option<crate::application_resurrection::Launch>,
     /// Ephemeral process incarnation; never persisted or reused on restart.
     observation_execution: Uuid,
@@ -1281,6 +1388,7 @@ impl PaneResurrectionRuntime {
     fn from_snapshot(snapshot: &PaneResurrectionSnapshot) -> Self {
         Self {
             frozen: false,
+            freeze_error: None,
             launch: None,
             observation_execution: Uuid::new_v4(),
             metadata_revision: 0,
@@ -1306,8 +1414,21 @@ impl PaneResurrectionRuntime {
     ) -> anyhow::Result<()> {
         // In-memory fencing is unconditional: a failed durable close must not
         // allow final prompt events to erase the invocation we are preserving.
+        // Keep one close attempt and its result: a stale-endpoint error from a
+        // repeated close must not replace success, nor may a repeated freeze
+        // hide an earlier durable failure. This lock also orders metadata
+        // boundary commits before close; no manager lock is held by callers.
+        if self.frozen {
+            return self
+                .freeze_error
+                .clone()
+                .map_or(Ok(()), |error| Err(anyhow::Error::msg(error)));
+        }
         self.frozen = true;
-        close(self.launch.as_ref())?;
+        if let Err(error) = close(self.launch.as_ref()) {
+            self.freeze_error = Some(error.to_string());
+            return Err(error);
+        }
         self.launch = None;
         Ok(())
     }
@@ -12431,7 +12552,81 @@ impl PanePaddingRuntimeHandle {
     }
 }
 
-pub fn activate_pane_runtime(config: PaneRuntimePluginConfig, padding_config: PanePaddingConfig) {
+struct PaneRuntimeShutdown(Arc<Mutex<SessionRuntimeManager>>);
+
+impl bmux_plugin_runtime::shutdown::ShutdownParticipant for PaneRuntimeShutdown {
+    fn id(&self) -> &'static str {
+        "bmux.pane_runtime.release"
+    }
+
+    fn phase(&self) -> bmux_plugin_runtime::shutdown::ShutdownPhase {
+        bmux_plugin_runtime::shutdown::ShutdownPhase::Release
+    }
+
+    fn shutdown(
+        &self,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = std::result::Result<(), String>> + Send + 'static>,
+    > {
+        let manager = Arc::clone(&self.0);
+        Box::pin(async move {
+            let removed = manager
+                .lock()
+                .map_err(|_| "runtime lock poisoned".to_string())?
+                .remove_all_runtimes();
+            let result = shutdown_removed_runtimes(removed).await;
+            // Earlier close/remove callers may already have received a failure
+            // receipt while their tasks still own OS reapers. They also fence
+            // unloading, even though their panes are no longer in the manager.
+            let owners = {
+                let mut owners = pane_shutdown_owners()
+                    .lock()
+                    .map_err(|_| "pane shutdown owners lock poisoned".to_string())?;
+                std::mem::take(&mut *owners)
+            };
+            let mut errors = result.err().into_iter().collect::<Vec<_>>();
+            for (id, mut owner) in owners {
+                loop {
+                    match tokio::time::timeout(Duration::from_secs(5), &mut owner).await {
+                        Ok(Ok(Ok(()))) => break,
+                        Ok(Ok(Err(error))) => {
+                            errors.push(error);
+                            break;
+                        }
+                        Ok(Err(error)) => {
+                            errors.push(format!("pane cleanup owner failed: {error}"));
+                            break;
+                        }
+                        Err(_) => warn!(phase = "Release", cleanup_id = %id,
+                            "prior pane cleanup still waiting; plugin unload fenced"),
+                    }
+                }
+            }
+            if errors.is_empty() {
+                Ok(())
+            } else {
+                Err(errors.join("; "))
+            }
+        })
+    }
+}
+
+async fn shutdown_removed_runtimes(
+    removed: Vec<RemovedRuntime>,
+) -> std::result::Result<(), String> {
+    // One cleanup owner across sessions: no runtime can wait for another
+    // runtime whose stop has not yet been admitted.
+    let panes = removed
+        .into_iter()
+        .flat_map(|runtime| runtime.handle.panes.into_values())
+        .collect();
+    shutdown_panes_owned(panes, true).await
+}
+
+pub fn activate_pane_runtime(
+    config: PaneRuntimePluginConfig,
+    padding_config: PanePaddingConfig,
+) -> std::result::Result<(), String> {
     tracing::debug!(
         persist_runtime_overrides = padding_config.persist_runtime_overrides,
         "activating pane padding configuration"
@@ -12446,6 +12641,13 @@ pub fn activate_pane_runtime(config: PaneRuntimePluginConfig, padding_config: Pa
         padding_config,
         pane_exit_tx,
     )));
+    let lifecycle = bmux_plugin::global_plugin_state_registry()
+        .get_or_insert_with(bmux_plugin_runtime::shutdown::ShutdownRegistry::default);
+    let lifecycle = lifecycle
+        .read()
+        .map_err(|_| "shutdown registry lock poisoned".to_string())?
+        .clone();
+    lifecycle.register(Arc::new(PaneRuntimeShutdown(Arc::clone(&manager))))?;
     let runtime_handle = bmux_pane_runtime_state::SessionRuntimeManagerHandle::new(
         ServerSessionRuntimeAdapter::new(Arc::clone(&manager)),
     );
@@ -12510,15 +12712,13 @@ pub fn activate_pane_runtime(config: PaneRuntimePluginConfig, padding_config: Pa
             let mut state = state
                 .lock()
                 .map_err(|_| anyhow::anyhow!("resurrection lock poisoned"))?;
-            if state.frozen {
-                continue;
-            }
             // The metadata reader holds this same lock across boundary commit and
             // identity publication. Closing drains descriptor writers as well.
             state.freeze()?;
         }
         Ok(())
     });
+    Ok(())
 }
 
 #[cfg(test)]
@@ -12538,7 +12738,8 @@ mod tests {
                 shell_integration_root: None,
             },
             PanePaddingConfig::default(),
-        );
+        )
+        .expect("activate pane runtime");
         let manager = spawn_runtime_handle().expect("activated runtime").0;
         let session_id = SessionId(Uuid::new_v4());
         let pane_id = Uuid::new_v4();
@@ -15226,6 +15427,138 @@ exit 7"#
         assert!(state.frozen);
         assert_eq!(state.execution_token.as_deref(), Some("saved-invocation"));
         assert_eq!(state.active_command.as_deref(), Some("bcode tui"));
+        assert_eq!(
+            state
+                .freeze_with(|_| panic!("close retried"))
+                .unwrap_err()
+                .to_string(),
+            "injected durable close failure"
+        );
+    }
+
+    #[test]
+    fn successful_checkpoint_freeze_is_idempotent() {
+        let mut state = PaneResurrectionRuntime::default();
+        state.freeze_with(|_| Ok(())).unwrap();
+        state.freeze_with(|_| panic!("close retried")).unwrap();
+    }
+
+    #[tokio::test]
+    async fn pane_shutdown_pending_startup_keeps_cleanup_authority_with_startup_owner() {
+        let mut pane = dummy_pane(Uuid::new_v4());
+        pane.startup = watch::channel(None).1;
+        // An external Sweep without a ready guardian would fail. Startup alone
+        // must own this cleanup, not concurrent Release lease revocation.
+        pane.execution
+            .inject_missing_supervisor
+            .store(true, Ordering::SeqCst);
+        let execution = Arc::clone(&pane.execution);
+        let state = Arc::clone(&pane.resurrection_state);
+        let (stop, stopped) = oneshot::channel();
+        pane.stop_tx = Some(stop);
+        let task = tokio::spawn(async move {
+            stopped.await.unwrap();
+        });
+        let old = std::mem::replace(&mut pane.task, task);
+        old.abort();
+        let _ = old.await;
+        shutdown_panes_owned(vec![pane], true).await.unwrap();
+        assert!(!execution.cleanup_failed.load(Ordering::SeqCst));
+        assert!(state.lock().unwrap().frozen);
+    }
+
+    #[tokio::test]
+    async fn pane_shutdown_starts_every_runtime_before_waiting() {
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+        let mut removed = Vec::new();
+        for _ in 0..3 {
+            let pane_id = Uuid::new_v4();
+            let mut runtime = runtime_with_panes(&[pane_id]);
+            let pane = runtime.panes.get_mut(&pane_id).unwrap();
+            let (stop, stopped) = oneshot::channel();
+            pane.stop_tx = Some(stop);
+            let barrier = Arc::clone(&barrier);
+            let task = tokio::spawn(async move {
+                stopped.await.unwrap();
+                barrier.wait().await;
+            });
+            let old = std::mem::replace(&mut pane.task, task);
+            old.abort();
+            let _ = old.await;
+            removed.push(RemovedRuntime {
+                session_id: SessionId(Uuid::new_v4()),
+                handle: runtime,
+            });
+        }
+        tokio::time::timeout(Duration::from_secs(2), shutdown_removed_runtimes(removed))
+            .await
+            .expect("cross-runtime cleanup deadlocked")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn pane_shutdown_error_receipt_retains_owner_until_reaper_settles() {
+        let mut pane = dummy_pane(Uuid::new_v4());
+        let execution = Arc::downgrade(&pane.execution);
+        let (cleanup, receiver) = watch::channel(None);
+        pane.cleanup = receiver;
+        let (finish, finished) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            cleanup.send_replace(Some(Err("injected acknowledgement failure".into())));
+            let _ = finished.await;
+        });
+        let old = std::mem::replace(&mut pane.task, task);
+        old.abort();
+        let _ = old.await;
+        let error = tokio::time::timeout(Duration::from_secs(2), shutdown_panes_result(vec![pane]))
+            .await
+            .expect("failure receipt waited for reaper")
+            .unwrap_err();
+        assert!(error.contains("injected acknowledgement failure"));
+        assert!(
+            execution.upgrade().is_some(),
+            "cleanup owner dropped before reaper settled"
+        );
+        finish.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while execution.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cleanup owner not released after settlement");
+    }
+
+    #[tokio::test]
+    async fn pane_shutdown_release_waits_for_failed_cleanup_owner() {
+        let pane_id = Uuid::new_v4();
+        let mut runtime = runtime_with_panes(&[pane_id]);
+        let pane = runtime.panes.get_mut(&pane_id).unwrap();
+        let (cleanup, receiver) = watch::channel(None);
+        pane.cleanup = receiver;
+        let (acknowledged, acknowledgement) = oneshot::channel();
+        let (finish, finished) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            cleanup.send_replace(Some(Err("late reaper".into())));
+            acknowledged.send(()).unwrap();
+            let _ = finished.await;
+        });
+        let old = std::mem::replace(&mut pane.task, task);
+        old.abort();
+        let _ = old.await;
+        let mut release = tokio::spawn(shutdown_removed_runtimes(vec![RemovedRuntime {
+            session_id: SessionId(Uuid::new_v4()),
+            handle: runtime,
+        }]));
+        acknowledgement.await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut release)
+                .await
+                .is_err(),
+            "release authorized unloading before reaper settlement"
+        );
+        finish.send(()).unwrap();
+        assert!(release.await.unwrap().unwrap_err().contains("late reaper"));
     }
 
     #[tokio::test]

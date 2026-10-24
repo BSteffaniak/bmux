@@ -51,6 +51,7 @@ pub struct BmuxSnapshotOrchestrator {
     // Serializes collection and replacement, not just file IO. Once finalized,
     // no writer may observe host teardown state or reopen persistence.
     finalized: Mutex<bool>,
+    debounce: Mutex<Option<(std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>)>>,
 }
 
 impl BmuxSnapshotOrchestrator {
@@ -68,11 +69,35 @@ impl BmuxSnapshotOrchestrator {
             dirty_flag,
             stateful_registry,
             finalized: Mutex::new(false),
+            debounce: Mutex::new(None),
             status: Mutex::new(Status {
                 writes_allowed,
                 ..Status::default()
             }),
         }
+    }
+
+    pub(crate) fn install_debounce(
+        &self,
+        stop: std::sync::mpsc::Sender<()>,
+        thread: std::thread::JoinHandle<()>,
+    ) {
+        *self.debounce.lock().expect("debounce owner lock") = Some((stop, thread));
+    }
+
+    pub(crate) fn stop_debounce(&self) -> Result<(), String> {
+        let owner = self
+            .debounce
+            .lock()
+            .map_err(|_| "debounce owner lock poisoned")?
+            .take();
+        if let Some((stop, thread)) = owner {
+            let _ = stop.send(());
+            thread
+                .join()
+                .map_err(|_| "snapshot debounce thread panicked")?;
+        }
+        Ok(())
     }
 
     /// Synchronous variant of `save_now()` for the debounce-flush
@@ -537,10 +562,12 @@ fn write_envelope_atomic(
         .sync_all()
         .map_err(|e| SnapshotOrchestratorError::Io(e.to_string()))?;
     std::fs::rename(&temp_path, path).map_err(|e| SnapshotOrchestratorError::Io(e.to_string()))?;
-    if let Some(parent) = path.parent()
-        && let Ok(parent_dir) = std::fs::File::open(parent)
-    {
-        let _ = parent_dir.sync_all();
+    if let Some(parent) = path.parent() {
+        let parent_dir = std::fs::File::open(parent)
+            .map_err(|error| SnapshotOrchestratorError::Io(error.to_string()))?;
+        parent_dir
+            .sync_all()
+            .map_err(|error| SnapshotOrchestratorError::Io(error.to_string()))?;
     }
     Ok(())
 }

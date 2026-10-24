@@ -23,7 +23,7 @@ use bmux_perf_telemetry::{
 use bmux_plugin_sdk::{WireEventSink, WireEventSinkError, WireEventSinkHandle};
 use bmux_recording_protocol::{RecordingEventKind, RecordingRollingStartOptions};
 use bmux_session_models::{ClientId, SessionId};
-use bmux_session_state::{SessionManagerHandle, SessionManagerSnapshot};
+use bmux_session_state::SessionManagerHandle;
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::pin::Pin;
@@ -1115,10 +1115,6 @@ fn session_runtime_handle() -> bmux_pane_runtime_state::SessionRuntimeManagerHan
         .unwrap_or_else(bmux_pane_runtime_state::SessionRuntimeManagerHandle::noop)
 }
 
-fn shutdown_runtime_info(info: bmux_pane_runtime_state::RemovedRuntimeInfo) {
-    session_runtime_handle().0.shutdown_removed_runtime(info);
-}
-
 /// Look up the snapshot orchestrator handle from the plugin state
 /// registry. Returns the noop orchestrator when the snapshot plugin
 /// isn't loaded or its handle isn't registered yet.
@@ -1879,6 +1875,7 @@ impl BmuxServer {
         // waiting handler tasks, each with its own frame queue and encoder.
         let transport_admission = Arc::new(tokio::sync::Semaphore::new(64));
         let mut shutdown_rx = self.shutdown_tx.subscribe();
+        let mut connections = tokio::task::JoinSet::new();
         let shutdown_reason = loop {
             tokio::select! {
                 changed = shutdown_rx.changed() => {
@@ -1890,6 +1887,9 @@ impl BmuxServer {
                         break "shutdown_channel_closed";
                     }
                 }
+                Some(result) = connections.join_next(), if !connections.is_empty() => {
+                    if let Err(error) = result { warn!(%error, "connection task panicked"); }
+                }
                 accepted = listener.accept() => {
                     match accepted {
                         Ok(stream) => {
@@ -1900,7 +1900,7 @@ impl BmuxServer {
                             let permit = Arc::new(permit);
                             let state = Arc::clone(&self.state);
                             let shutdown_tx = self.shutdown_tx.clone();
-                            tokio::spawn(async move {
+                            connections.spawn(async move {
                                 if let Err(error) = handle_connection(state, shutdown_tx, stream, permit).await {
                                     warn!("connection handler failed: {error:#}");
                                 }
@@ -1923,20 +1923,34 @@ impl BmuxServer {
             self.endpoint
         );
 
-        // Drain in-flight writes and seal persistence before destroying state.
-        if let Err(error) =
-            tokio::task::block_in_place(|| snapshot_orchestrator_handle().as_dyn().finalize())
-        {
-            warn!("final snapshot flush failed: {error}");
+        drop(listener);
+        info!(
+            outstanding = connections.len(),
+            "shutdown draining admitted requests"
+        );
+        while let Some(result) = connections.join_next().await {
+            if let Err(error) = result {
+                warn!(%error, "connection task failed during shutdown");
+            }
         }
+        info!("shutdown admitted requests drained");
 
-        let removed_runtimes = session_runtime_handle().0.remove_all_runtimes();
-        for removed_runtime in removed_runtimes {
-            shutdown_runtime_info(removed_runtime);
-        }
-        session_handle()
-            .0
-            .restore_snapshot(SessionManagerSnapshot::default());
+        // The host drives only neutral participants. Persistence and resource
+        // policy, including ordering, belong to their owning plugins.
+        let lifecycle = bmux_plugin::global_plugin_state_registry()
+            .get::<bmux_plugin_runtime::shutdown::ShutdownRegistry>()
+            .map(|entry| {
+                entry
+                    .read()
+                    .map(|registry| registry.clone())
+                    .map_err(|_| anyhow::anyhow!("shutdown registry poisoned"))
+            })
+            .transpose()?;
+        let shutdown_result = if let Some(lifecycle) = lifecycle {
+            lifecycle.run().await.map_err(anyhow::Error::msg)
+        } else {
+            Ok(())
+        };
         let _ = emit_event(&self.state, Event::ServerStopping);
         if let Ok(mut attach_tokens) = self.state.attach_tokens.lock() {
             attach_tokens.clear();
@@ -1945,7 +1959,7 @@ impl BmuxServer {
         info!("bmux server listener closed on {:?}", self.endpoint);
         flush_phase_timing();
 
-        Ok(())
+        shutdown_result
     }
 }
 

@@ -1753,6 +1753,7 @@ dependencies = [
  "git_sshripped_ssh_agent",
  "git_sshripped_ssh_identity",
  "iroh",
+ "libc",
  "moosicbox_log_runtime",
  "moosicbox_log_watch",
  "qrcode",
@@ -2444,6 +2445,7 @@ dependencies = [
  "bmux_pane_runtime_state",
  "bmux_permissions_plugin_api",
  "bmux_plugin",
+ "bmux_plugin_runtime",
  "bmux_plugin_sdk",
  "bmux_presentation_state",
  "bmux_recording_protocol",
@@ -2701,6 +2703,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.20",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -3020,6 +3023,7 @@ dependencies = [
  "bmux_perf_telemetry",
  "bmux_performance_state",
  "bmux_plugin",
+ "bmux_plugin_runtime",
  "bmux_plugin_sdk",
  "bmux_recording_protocol",
  "bmux_recording_runtime",
@@ -3059,6 +3063,7 @@ dependencies = [
  "bmux_ipc",
  "bmux_pane_runtime_plugin_api",
  "bmux_plugin",
+ "bmux_plugin_runtime",
  "bmux_plugin_sdk",
  "bmux_session_models",
  "bmux_session_state",
@@ -3115,6 +3120,7 @@ name = "bmux_snapshot_plugin"
 version = "0.0.1-alpha.4"
 dependencies = [
  "bmux_plugin",
+ "bmux_plugin_runtime",
  "bmux_plugin_sdk",
  "bmux_snapshot_plugin_api",
  "bmux_snapshot_runtime",

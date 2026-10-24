@@ -5,6 +5,7 @@
 //! runtime rather than plugin API contracts or product-domain plugins.
 
 pub mod background;
+pub mod shutdown;
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
