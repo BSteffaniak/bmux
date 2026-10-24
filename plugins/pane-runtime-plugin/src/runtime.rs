@@ -1,7 +1,10 @@
 //! Concrete pane runtime implementation owned by the pane-runtime plugin.
 
+mod capture_writer;
 mod durable_capture;
 pub(crate) mod execution;
+pub(crate) mod human_input;
+pub(crate) mod live_presentation;
 pub(crate) mod reservations;
 mod startup_capture;
 pub(crate) mod supervisor;
@@ -3243,12 +3246,13 @@ impl PaneRuntimeHandle {
             },
             None => PaneRuntimeCommand::Resize { rows, cols },
         };
-        let captured = self
-            .execution
-            .durable_capture
-            .lock()
-            .ok()
-            .is_some_and(|capture| capture.is_some());
+        let captured = self.execution.writer().ok().flatten().is_some()
+            || self
+                .execution
+                .durable_capture
+                .lock()
+                .ok()
+                .is_some_and(|capture| capture.is_some());
         if !captured {
             let _ = self.input_tx.send(command);
         }
@@ -3313,6 +3317,10 @@ impl PaneRuntimeHandle {
             .capture_order
             .lock()
             .map_err(|_| std::io::Error::other("capture ordering lock poisoned"))?;
+        if let Some(writer) = self.execution.writer()? {
+            let boundary = writer.progress()?.admitted.raw_end;
+            writer.wait_projected_raw(boundary, Duration::from_secs(2))?;
+        }
         let boundary = self
             .execution
             .durable_capture
@@ -3332,11 +3340,75 @@ impl PaneRuntimeHandle {
         cols: u16,
         permit: Option<tokio::sync::OwnedSemaphorePermit>,
     ) {
-        // Freeze new capture commits, not raw reads or parser progress. Drain
-        // the finite captured prefix before entering the geometry/parser locks.
+        // Managed ordered captures use execution::resize, which prepares the
+        // fence outside the runtime manager. Never wait for disk here.
+        if self.execution.writer().ok().flatten().is_some() {
+            self.execution
+                .record_error("ordered capture resize requires execution control path".into());
+            return;
+        }
         let Ok(_order) = self.lock_resize_capture_order() else {
             return;
         };
+        let mut ticket = None;
+        self.resize_pty_under_order(rows, cols, permit, None, &mut ticket);
+    }
+
+    fn publish_ordered_resize(
+        &self,
+        reservation: capture_writer::Reservation,
+        grid: &mut TerminalGridStream,
+        rows: u16,
+        cols: u16,
+    ) -> Option<capture_writer::Ticket> {
+        let resized = self.execution.master.lock().ok().is_some_and(|master| {
+            master.as_ref().is_some_and(|master| {
+                master
+                    .resize(PtySize {
+                        rows,
+                        cols,
+                        pixel_width: 0,
+                        pixel_height: 0,
+                    })
+                    .is_ok()
+            })
+        });
+        if !resized || grid.resize(cols, rows).is_err() {
+            self.execution
+                .fail_capture("ordered geometry side effect failed; recovery required");
+            return None;
+        }
+        match reservation.resize(cols, rows) {
+            Ok(admitted) => {
+                if let Ok(Some(writer)) = self.execution.writer()
+                    && let Err(error) = writer.projected(admitted)
+                {
+                    self.execution.fail_capture(&error.to_string());
+                    return None;
+                }
+                Some(admitted)
+            }
+            Err(error) => {
+                self.execution
+                    .fail_capture(&format!("geometry admission failed after resize: {error}"));
+                None
+            }
+        }
+    }
+
+    // Caller owns capture_order and has drained the admitted live prefix before
+    // entering the runtime manager. All capacity was reserved outside locks.
+    // Keep geometry, image, parser, and PTY publication in one lock-ordered
+    // transaction; splitting this sequence would obscure the resize barrier.
+    #[allow(clippy::too_many_lines)]
+    fn resize_pty_under_order(
+        &self,
+        rows: u16,
+        cols: u16,
+        permit: Option<tokio::sync::OwnedSemaphorePermit>,
+        reservation: Option<capture_writer::Reservation>,
+        ticket: &mut Option<capture_writer::Ticket>,
+    ) {
         // Serialize geometry publication with the reader's entire output chunk.
         // The reader acquires size before image state, grid, and output.
         let Ok(mut last) = self.last_requested_size.lock() else {
@@ -3421,7 +3493,14 @@ impl PaneRuntimeHandle {
                 }
                 images_changed = images.sequence() != revision;
             }
-            if !self.commit_captured_resize(&mut capture, &mut grid, rows, cols) {
+            if let Some(reservation) = reservation {
+                let Some(admitted) =
+                    self.publish_ordered_resize(reservation, &mut grid, rows, cols)
+                else {
+                    return;
+                };
+                *ticket = Some(admitted);
+            } else if !self.commit_captured_resize(&mut capture, &mut grid, rows, cols) {
                 return;
             }
         } else {
@@ -3432,6 +3511,7 @@ impl PaneRuntimeHandle {
         self.execution
             .geometry_revision
             .fetch_add(1, Ordering::SeqCst);
+        self.execution.notify();
         self.dispatch_uncaptured_resize(rows, cols, permit);
         #[cfg(feature = "image-registry")]
         drop(images);
@@ -6329,21 +6409,104 @@ impl SessionRuntimeManager {
                     return;
                 }
             };
-            let (mut reader, capture_thread) = match startup_capture::start_captured(
-                raw_reader,
-                Arc::clone(&execution_for_task),
-            ) {
+            // Reserved capture was installed before the launch permit opened.
+            // Transfer the sole disk owner before starting any raw PTY reader.
+            let pending_capture = execution_for_task
+                .durable_capture
+                .lock()
+                .expect("capture authority lock")
+                .take();
+            let mut writer_owner = None;
+            let capture_writer = match pending_capture {
+                Some(capture) => match capture_writer::CaptureWriter::start(capture) {
+                    Ok((writer, owner)) => {
+                        *execution_for_task
+                            .capture_writer
+                            .lock()
+                            .expect("capture writer lock") = Some(writer.clone());
+                        writer_owner = Some(owner);
+                        let mut changes = writer.subscribe();
+                        let execution = Arc::downgrade(&execution_for_task);
+                        let observed = writer.clone();
+                        tokio::spawn(async move {
+                            loop {
+                                let Some(execution) = execution.upgrade() else {
+                                    break;
+                                };
+                                let terminal = match observed.progress() {
+                                    Ok(progress) => {
+                                        if let Some(error) = progress
+                                            .failure
+                                            .as_ref()
+                                            .or(progress.boundary.error.as_ref())
+                                        {
+                                            execution.record_error(error.clone());
+                                        }
+                                        progress.failure.is_some()
+                                            || progress.boundary.eof
+                                            || progress.boundary.error.is_some()
+                                    }
+                                    Err(error) => {
+                                        execution.record_error(error.to_string());
+                                        true
+                                    }
+                                };
+                                execution.notify();
+                                drop(execution);
+                                if terminal || changes.changed().await.is_err() {
+                                    break;
+                                }
+                            }
+                        });
+                        Some(writer)
+                    }
+                    Err(error) => {
+                        fail_startup!(format!("failed to start durable capture writer: {error}"));
+                        return;
+                    }
+                },
+                None => None,
+            };
+            let capture_started = match &capture_writer {
+                Some(writer) => startup_capture::start_ordered(
+                    raw_reader,
+                    Arc::clone(&execution_for_task),
+                    writer.clone(),
+                ),
+                None => {
+                    startup_capture::start_captured(raw_reader, Arc::clone(&execution_for_task))
+                }
+            };
+            let (mut reader, capture_thread) = match capture_started {
                 Ok(capture) => capture,
                 Err(error) => {
-                    fail_startup!(format!("failed to start PTY capture: {error}"));
+                    let mut reason = format!("failed to start PTY capture: {error}");
+                    if let (Some(mut owner), Some(writer)) =
+                        (writer_owner.take(), capture_writer.as_ref())
+                    {
+                        writer.fail(&reason);
+                        reason = startup_capture::acknowledge_cleanup(
+                            vec![owner.take()],
+                            &cleanup_tx,
+                            Some(Ok(())),
+                            reason,
+                        )
+                        .await;
+                        child_spawned = true;
+                    }
+                    fail_startup!(reason);
                     return;
                 }
             };
             let mut capture_owner = startup_capture::CaptureOwner::new(capture_thread);
+            if let (Some(owner), Some(writer)) = (writer_owner.take(), capture_writer.as_ref()) {
+                capture_owner.add_writer(owner, writer.clone());
+            }
             macro_rules! fail_captured_startup {
                 ($reason:expr, $previous:expr) => {{
                     let reason = $reason;
                     let previous = $previous;
+                    if let Some(writer) = &capture_writer { writer.fail("startup rejected before capture drain"); }
                     drop(reader);
                     drop(pty_pair);
                     let reason = startup_capture::acknowledge_cleanup(capture_owner.take(), &cleanup_tx, previous, reason).await;
@@ -6529,6 +6692,9 @@ impl SessionRuntimeManager {
                         &startup_cleanup_tx,
                     )
                     .await;
+                    if let Some(writer) = &capture_writer {
+                        writer.fail("PTY writer installation failed");
+                    }
                     drop(reader);
                     drop(master);
                     let previous = startup_cleanup_tx.borrow().clone();
@@ -6762,6 +6928,11 @@ impl SessionRuntimeManager {
                         }
                         match reader.read(&mut buffer) {
                             Ok(0) => {
+                                if let (Ok(Some(writer)), Some(ticket)) = (execution_for_reader.writer(), reader.publication_ticket())
+                                    && let Err(error) = writer.projected(ticket) {
+                                    execution_for_reader.fail_capture(&error.to_string());
+                                    break;
+                                }
                                 execution_for_reader.output_drained.store(true, Ordering::SeqCst);
                         execution_for_reader.notify();
                                 break;
@@ -6780,12 +6951,7 @@ impl SessionRuntimeManager {
                                 // Serialize the watermark with geometry and the
                                 // entire retained parser publication, not merely read.
                                 let Ok(requested_size) = last_requested_size_for_reader.lock() else { break; };
-                                // This watermark describes raw PTY capture, independently
-                                // of optional recording sinks or projection processing.
-                                execution_for_reader.output_watermark.fetch_add(
-                                    u64::try_from(bytes_read).unwrap_or(u64::MAX), Ordering::SeqCst,
-                                );
-                                execution_for_reader.notify();
+                                let publication_ticket = reader.publication_ticket();
                                 let (capture_output, capture_reply) = capture_handshake.process(&buffer[..bytes_read], pane_id);
                                 if !capture_reply.is_empty() {
                                     if let Ok(mut writer) = writer_for_reader.lock() {
@@ -6904,7 +7070,16 @@ impl SessionRuntimeManager {
                                 #[cfg(feature = "image-registry")]
                                 drop(registry);
                                 drop(cursor_tracker);
+                                execution_for_reader.output_watermark.fetch_add(
+                                    u64::try_from(bytes_read).unwrap_or(u64::MAX), Ordering::SeqCst,
+                                );
+                                if let (Ok(Some(writer)), Some(ticket)) = (execution_for_reader.writer(), publication_ticket)
+                                    && let Err(error) = writer.projected(ticket) {
+                                    execution_for_reader.fail_capture(&error.to_string());
+                                    break;
+                                }
                                 if execution_for_reader.commit_projection().is_err() { break; }
+                                execution_for_reader.notify();
                                 drop(requested_size);
                                 // Metadata callbacks can acquire the runtime manager. Never
                                 // invoke them while holding image/grid/output capture locks.
@@ -7000,7 +7175,7 @@ impl SessionRuntimeManager {
                         }
                     }
                     if !execution_for_reader.output_drained.load(Ordering::SeqCst) {
-                        execution_for_reader.record_error("PTY reader stopped before EOF".into());
+                        execution_for_reader.fail_capture("PTY reader stopped before EOF");
                     }
                     reader_thread_done_for_thread.store(true, Ordering::SeqCst);
                         execution_for_reader.notify();
@@ -7080,7 +7255,8 @@ impl SessionRuntimeManager {
                             execution_for_task.notify();
                             break;
                         }
-                        if reader_thread_done.load(Ordering::SeqCst) && !execution_for_task.output_drained.load(Ordering::SeqCst) {
+                        if execution_for_task.capture_failure().is_some()
+                            || (reader_thread_done.load(Ordering::SeqCst) && !execution_for_task.output_drained.load(Ordering::SeqCst)) {
                             let lifetime = PaneLifetime {
                                 execution: Arc::clone(&execution_for_task),
                                 resurrection: Arc::clone(&resurrection_state_for_shutdown),
@@ -7245,12 +7421,20 @@ impl SessionRuntimeManager {
             }
             // Never occupy a blocking-pool worker with an unbounded join.
             // A timeout is an explicit failure, not acknowledged restoration.
-            let mut threads = [child_waiter, reader_thread, Some(capture_owner.take())];
+            if !execution_for_task.output_drained.load(Ordering::SeqCst)
+                && let Some(writer) = &capture_writer
+            {
+                writer.fail("projection stopped before real EOF");
+            }
+            let mut threads = vec![child_waiter, reader_thread];
+            threads.extend(capture_owner.take().into_iter().map(Some));
             let mut join = supervision_join(&mut threads);
             let cleanup_result = join_supervision_threads(&mut join, Duration::from_secs(4)).await;
             let join_timed_out = !join.is_finished();
             let cleanup_result = cleanup_result.and_then(|()| {
-                if execution_for_task.cleanup_failed.load(Ordering::SeqCst) {
+                if let Some(error) = execution_for_task.capture_failure() {
+                    Err(format!("capture cleanup incomplete: {error}"))
+                } else if execution_for_task.cleanup_failed.load(Ordering::SeqCst) {
                     Err("execution group cleanup failed; recovery required".into())
                 } else {
                     Ok(())

@@ -4,6 +4,8 @@ name = "bmux Pane Runtime"
 optional_capabilities = ["bmux.application_resurrection.host"]
 owns_namespaces = ["pane-padding"]
 provided_capabilities = [
+    "bmux.pane_runtime.live.presentation.v1",
+    "bmux.pane_runtime.human.input.v1",
     "bmux.pane_runtime.presentation.wait.v1",
     "bmux.pane_runtime.presentation.v1",
     "bmux.pane_runtime.execution.v4",
@@ -50,6 +52,16 @@ version_req = ">=0.0.1-alpha.0"
 
 # Native terminal-session operations are implemented. Durable admission/recovery
 # operations return explicit Unavailable until their separate authority milestone.
+[[services]]
+capability   = "bmux.pane_runtime.live.presentation.v1"
+interface_id = "pane-runtime-live-presentation-v1"
+kind         = "command"
+
+[[services]]
+capability   = "bmux.pane_runtime.human.input.v1"
+interface_id = "pane-runtime-human-input-v1"
+kind         = "command"
+
 [[services]]
 capability   = "bmux.pane_runtime.presentation.v1"
 interface_id = "pane-runtime-presentation-v1"

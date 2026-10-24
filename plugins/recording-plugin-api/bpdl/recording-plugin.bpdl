@@ -10,6 +10,26 @@ capability RECORDING_PROCESS_PRESENTATION_WAIT_V1 = bmux.recording.process.prese
 capability RECORDING_PROCESS_PRESENTATION_V1 = bmux.recording.process.presentation.v1;
 capability RECORDING_PROCESS_V4 = bmux.recording.process.v4;
 
+capability RECORDING_PROCESS_LIVE_PRESENTATION_V1 = bmux.recording.process.live.presentation.v1;
+capability RECORDING_PROCESS_HUMAN_INPUT_V1 = bmux.recording.process.human.input.v1;
+
+@capability(RECORDING_PROCESS_LIVE_PRESENTATION_V1)
+interface recording-process-live-presentation-v1 {
+    command capabilities() -> pane.live-capabilities;
+    command read(run_id: uuid, after: pane.live-cursor?, max_bytes: u32) -> result<pane.live-frame?, pane.live-error>;
+    command wait-present(run_id: uuid, after: pane.live-cursor?, timeout_ms: u32, max_bytes: u32) -> result<pane.live-frame?, pane.live-error>;
+}
+
+// Volatile input receipts are NOT durable recording receipts. Unknown outcomes
+// must not be automatically replayed; finalization still drains durable capture.
+@capability(RECORDING_PROCESS_HUMAN_INPUT_V1)
+interface recording-process-human-input-v1 {
+    command capabilities() -> pane.human-input-capabilities;
+    command open(run_id: uuid) -> result<pane.human-input-stream, pane.human-input-error>;
+    command push(run_id: uuid, stream: pane.human-input-stream, sequence: u64, data: bytes) -> result<pane.human-input-ack, pane.human-input-error>;
+    command close(run_id: uuid, stream: pane.human-input-stream) -> result<unit, pane.human-input-error>;
+}
+
 // Additive stateless wait; durable process v4 and presentation v1 are unchanged.
 @capability(RECORDING_PROCESS_PRESENTATION_WAIT_V1)
 interface recording-process-presentation-wait-v1 {

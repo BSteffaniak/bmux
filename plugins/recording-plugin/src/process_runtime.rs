@@ -82,7 +82,7 @@ where
 }
 
 pub(crate) struct ProcessService {
-    caller: Arc<TypedServiceCaller>,
+    pub(super) caller: Arc<TypedServiceCaller>,
     root: PathBuf,
     runtime_root: String,
     isolated: bool,
@@ -266,14 +266,104 @@ impl ProcessService {
         Ok(())
     }
 
-    fn load(&self, id: Uuid) -> Result<process::RunStatus> {
+    pub(super) fn load(&self, id: Uuid) -> Result<process::RunStatus> {
         self.require_isolation()?;
-        let value = self.store()?.load(id)?;
+        let value = ProcessStore::existing(&self.root).load(id)?;
         ensure!(
             value.runtime_root == self.runtime_root,
             "run belongs to a different isolated runtime"
         );
         Ok(value)
+    }
+
+    pub(crate) async fn human_capabilities(
+        &self,
+    ) -> Result<bmux_pane_runtime_plugin_api::pane_runtime_human_input_v1::HumanInputCapabilities>
+    {
+        let mut client = ServiceCallerDispatchClient::new(self.caller.as_ref());
+        Ok(
+            bmux_pane_runtime_plugin_api::pane_runtime_human_input_v1::client::capabilities(
+                &mut client,
+            )
+            .await?,
+        )
+    }
+
+    fn human_reference(
+        &self,
+        run_id: Uuid,
+    ) -> Result<
+        pane::TerminalExecutionRef,
+        bmux_pane_runtime_plugin_api::pane_runtime_human_input_v1::HumanInputError,
+    > {
+        self.load(run_id)
+            .and_then(|value| execution(&value))
+            .map_err(|error| {
+                bmux_pane_runtime_plugin_api::pane_runtime_human_input_v1::HumanInputError::Closed {
+                    reason: error.to_string(),
+                }
+            })
+    }
+
+    pub(crate) async fn human_open(
+        &self,
+        run_id: Uuid,
+    ) -> Result<
+        bmux_pane_runtime_plugin_api::pane_runtime_human_input_v1::HumanInputStream,
+        bmux_pane_runtime_plugin_api::pane_runtime_human_input_v1::HumanInputError,
+    > {
+        use bmux_pane_runtime_plugin_api::pane_runtime_human_input_v1 as human;
+        let reference = self.human_reference(run_id)?;
+        let mut client = ServiceCallerDispatchClient::new(self.caller.as_ref());
+        human::client::open(&mut client, reference)
+            .await
+            .map_err(|error| human::HumanInputError::Closed {
+                reason: error.to_string(),
+            })?
+    }
+
+    pub(crate) async fn human_push(
+        &self,
+        run_id: Uuid,
+        stream: bmux_pane_runtime_plugin_api::pane_runtime_human_input_v1::HumanInputStream,
+        sequence: u64,
+        data: Vec<u8>,
+    ) -> Result<
+        bmux_pane_runtime_plugin_api::pane_runtime_human_input_v1::HumanInputAck,
+        bmux_pane_runtime_plugin_api::pane_runtime_human_input_v1::HumanInputError,
+    > {
+        use bmux_pane_runtime_plugin_api::pane_runtime_human_input_v1 as human;
+        if self.human_reference(run_id)? != stream.execution {
+            return Err(human::HumanInputError::Authority {
+                error: pane::TerminalExecutionError::StaleExecution,
+            });
+        }
+        let mut client = ServiceCallerDispatchClient::new(self.caller.as_ref());
+        human::client::push(&mut client, stream, sequence, data)
+            .await
+            .map_err(|error| human::HumanInputError::Uncertain {
+                reason: error.to_string(),
+            })?
+    }
+
+    pub(crate) async fn human_close(
+        &self,
+        run_id: Uuid,
+        stream: bmux_pane_runtime_plugin_api::pane_runtime_human_input_v1::HumanInputStream,
+    ) -> Result<(), bmux_pane_runtime_plugin_api::pane_runtime_human_input_v1::HumanInputError>
+    {
+        use bmux_pane_runtime_plugin_api::pane_runtime_human_input_v1 as human;
+        if self.human_reference(run_id)? != stream.execution {
+            return Err(human::HumanInputError::Authority {
+                error: pane::TerminalExecutionError::StaleExecution,
+            });
+        }
+        let mut client = ServiceCallerDispatchClient::new(self.caller.as_ref());
+        human::client::close(&mut client, stream)
+            .await
+            .map_err(|error| human::HumanInputError::Closed {
+                reason: error.to_string(),
+            })?
     }
 
     pub(crate) async fn wait_capabilities(

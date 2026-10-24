@@ -25,6 +25,7 @@ mod process_artifacts;
 mod process_bootstrap;
 mod process_commands;
 mod process_display;
+mod process_live_presentation;
 mod process_runtime;
 mod process_store;
 pub mod recording_runtime;
@@ -151,6 +152,34 @@ struct DualRuntimeSink {
 }
 
 impl RecordingSink for DualRuntimeSink {
+    fn record_checked(
+        &self,
+        kind: RecordingEventKind,
+        payload: RecordingPayload,
+        meta: RecordMeta,
+    ) -> Result<(), String> {
+        let manual = self
+            .manual
+            .lock()
+            .map_err(|_| "manual recording lock poisoned")?;
+        if manual.active_capture_target().is_none() {
+            return Err("manual recording capture owner unavailable".into());
+        }
+        manual
+            .record(kind, payload.clone(), meta)
+            .map_err(|error| error.to_string())?;
+        let rolling = self
+            .rolling
+            .lock()
+            .map_err(|_| "rolling recording lock poisoned")?;
+        if let Some(runtime) = rolling.as_ref() {
+            runtime
+                .record(kind, payload, meta)
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+
     fn record(&self, kind: RecordingEventKind, payload: RecordingPayload, meta: RecordMeta) {
         if let Ok(runtime) = self.manual.lock() {
             let _ = runtime.record(kind, payload.clone(), meta);
@@ -286,6 +315,27 @@ impl RustPlugin for RecordingPlugin {
             self as process, RecordingProcessV4Service,
         };
         bmux_plugin_sdk::route_service!(context, {
+            "recording-process-live-presentation-v1", "capabilities" => |_req: (), ctx| {
+                process_runtime::dispatch(ctx, move |service| Box::pin(async move { service.live_capabilities().await })).and_then(|value| value).map_err(|error| ServiceResponse::error("process_dispatch", error.to_string()))
+            },
+            "recording-process-live-presentation-v1", "read" => |req: bmux_recording_plugin_api::recording_process_live_presentation_v1::client::ReadRequest, ctx| {
+                process_runtime::dispatch(ctx, move |service| Box::pin(async move { service.live_read(req.run_id, req.after, req.max_bytes).await })).map_err(|error| ServiceResponse::error("process_dispatch", error.to_string()))
+            },
+            "recording-process-live-presentation-v1", "wait-present" => |req: bmux_recording_plugin_api::recording_process_live_presentation_v1::client::WaitPresentRequest, ctx| {
+                process_runtime::dispatch(ctx, move |service| Box::pin(async move { service.live_wait_present(req.run_id, req.after, req.timeout_ms, req.max_bytes).await })).map_err(|error| ServiceResponse::error("process_dispatch", error.to_string()))
+            },
+            "recording-process-human-input-v1", "capabilities" => |_req: (), ctx| {
+                process_runtime::dispatch(ctx, move |service| Box::pin(async move { service.human_capabilities().await })).and_then(|value| value).map_err(|error| ServiceResponse::error("process_dispatch", error.to_string()))
+            },
+            "recording-process-human-input-v1", "open" => |req: bmux_recording_plugin_api::recording_process_human_input_v1::client::OpenRequest, ctx| {
+                process_runtime::dispatch(ctx, move |service| Box::pin(async move { service.human_open(req.run_id).await })).map_err(|error| ServiceResponse::error("process_dispatch", error.to_string()))
+            },
+            "recording-process-human-input-v1", "push" => |req: bmux_recording_plugin_api::recording_process_human_input_v1::client::PushRequest, ctx| {
+                process_runtime::dispatch(ctx, move |service| Box::pin(async move { service.human_push(req.run_id, req.stream, req.sequence, req.data).await })).map_err(|error| ServiceResponse::error("process_dispatch", error.to_string()))
+            },
+            "recording-process-human-input-v1", "close" => |req: bmux_recording_plugin_api::recording_process_human_input_v1::client::CloseRequest, ctx| {
+                process_runtime::dispatch(ctx, move |service| Box::pin(async move { service.human_close(req.run_id, req.stream).await })).map_err(|error| ServiceResponse::error("process_dispatch", error.to_string()))
+            },
             "recording-process-presentation-wait-v1", "capabilities" => |_req: (), ctx| {
                 process_runtime::dispatch(ctx, move |service| Box::pin(async move { service.wait_capabilities().await })).and_then(|value| value).map_err(|error| ServiceResponse::error("process_dispatch", error.to_string()))
             },

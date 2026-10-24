@@ -42,6 +42,19 @@ pub trait RecordingSink: Send + Sync {
     /// call is expected to be cheap (lock a mutex, append to a
     /// channel) and must not block on disk I/O.
     fn record(&self, kind: RecordingEventKind, payload: RecordingPayload, meta: RecordMeta);
+
+    /// Enqueue with explicit failure reporting, without a durability claim.
+    ///
+    /// # Errors
+    /// Unsupported sinks reject rather than silently acknowledge lost events.
+    fn record_checked(
+        &self,
+        _kind: RecordingEventKind,
+        _payload: RecordingPayload,
+        _meta: RecordMeta,
+    ) -> Result<(), String> {
+        Err("recording sink does not support checked enqueue".into())
+    }
 }
 
 /// Registry newtype wrapping an `Arc<dyn RecordingSink>`. Server reads

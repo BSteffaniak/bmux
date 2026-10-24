@@ -20,6 +20,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub mod attach_commands;
 pub mod attach_state;
 pub(crate) mod execution;
+pub(crate) mod human_input;
+pub(crate) mod live_presentation;
 pub mod padding;
 pub mod pane_commands;
 pub mod pane_state;
@@ -48,6 +50,15 @@ pub fn route(context: NativeServiceContext) -> ServiceResponse {
         return error;
     }
     bmux_plugin_sdk::route_service!(context, {
+        "pane-runtime-live-presentation-v1", "capabilities" => |_req: (), _ctx| {
+            Ok::<_, ServiceResponse>(live_presentation::capabilities())
+        },
+        "pane-runtime-live-presentation-v1", "read" => |req: bmux_pane_runtime_plugin_api::pane_runtime_live_presentation_v1::client::ReadRequest, ctx| {
+            Ok::<_, ServiceResponse>(live_presentation::read(ctx, &req.execution, req.after.as_ref(), req.max_bytes))
+        },
+        "pane-runtime-live-presentation-v1", "wait-present" => |req: bmux_pane_runtime_plugin_api::pane_runtime_live_presentation_v1::client::WaitPresentRequest, ctx| {
+            Ok::<_, ServiceResponse>(live_presentation::wait_present(ctx, &req.execution, req.after.as_ref(), req.timeout_ms, req.max_bytes))
+        },
         "pane-runtime-presentation-wait-v1", "capabilities" => |_req: (), _ctx| {
             Ok::<_, ServiceResponse>(crate::runtime::execution::presentation_wait_capabilities())
         },
@@ -96,6 +107,18 @@ pub fn route(context: NativeServiceContext) -> ServiceResponse {
             Ok::<_, ServiceResponse>(crate::runtime::execution::create(req.name, req.options, move |id| {
                 spawn::authorize_creation(&context, id, "session.create").map_err(crate::runtime::spawn_failure)
             }))
+        },
+        "pane-runtime-human-input-v1", "capabilities" => |_req: (), _ctx| {
+            Ok::<_, ServiceResponse>(human_input::capabilities())
+        },
+        "pane-runtime-human-input-v1", "open" => |req: bmux_pane_runtime_plugin_api::pane_runtime_human_input_v1::client::OpenRequest, ctx| {
+            Ok::<_, ServiceResponse>(human_input::open(ctx, req.execution))
+        },
+        "pane-runtime-human-input-v1", "push" => |req: bmux_pane_runtime_plugin_api::pane_runtime_human_input_v1::client::PushRequest, ctx| {
+            Ok::<_, ServiceResponse>(human_input::push(ctx, &req.stream, req.sequence, req.data))
+        },
+        "pane-runtime-human-input-v1", "close" => |req: bmux_pane_runtime_plugin_api::pane_runtime_human_input_v1::client::CloseRequest, ctx| {
+            Ok::<_, ServiceResponse>(human_input::close(ctx, &req.stream))
         },
         "pane-runtime-execution-v4", "status" => |req: bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::client::StatusRequest, ctx| {
             Ok::<_, ServiceResponse>(execution::authorize(ctx, &req.execution, "read").and_then(|()| crate::runtime::execution::status(&req.execution)))

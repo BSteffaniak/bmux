@@ -27,6 +27,82 @@ capability ATTACH_RUNTIME_WRITE = bmux.attach_runtime.write;
 capability ATTACH_RUNTIME_READ = bmux.attach_runtime.read;
 capability PANE_RUNTIME_SPAWN_V1 = bmux.pane_runtime.spawn.v1;
 
+capability PANE_RUNTIME_LIVE_PRESENTATION_V1 = bmux.pane_runtime.live.presentation.v1;
+capability PANE_RUNTIME_HUMAN_INPUT_V1 = bmux.pane_runtime.human.input.v1;
+
+// Projection may lead persistence. These receipts are never durable v4 receipts.
+@capability(PANE_RUNTIME_LIVE_PRESENTATION_V1)
+interface pane-runtime-live-presentation-v1 {
+    record live-capabilities {
+        schema_version: u32,
+        max_timeout_ms: u32,
+        max_response_bytes: u32,
+    }
+    record live-cursor {
+        execution: pane-runtime-execution-v4.terminal-execution-ref,
+        source_epoch: uuid,
+        source_reset_revision: u64,
+        grid_revision: u64,
+        geometry_revision: u64,
+        projected_raw_watermark: u64,
+        durable_raw_watermark: u64,
+        target_exited: bool,
+        output_drained: bool,
+        terminal_session_ended: bool,
+        recovery_required: bool,
+    }
+    record live-frame {
+        cursor: live-cursor,
+        screen: pane-runtime-execution-v4.terminal-execution-screen?,
+    }
+    variant live-error {
+        invalid-request { reason: string },
+        oversized { max_bytes: u32 },
+        busy,
+        authority { error: pane-runtime-execution-v4.terminal-execution-error },
+    }
+    command capabilities() -> live-capabilities;
+    command read(execution: pane-runtime-execution-v4.terminal-execution-ref,
+        after: live-cursor?, max_bytes: u32) -> result<live-frame?, live-error>;
+    command wait-present(execution: pane-runtime-execution-v4.terminal-execution-ref,
+        after: live-cursor?, timeout_ms: u32, max_bytes: u32) -> result<live-frame?, live-error>;
+}
+
+// Volatile HUMAN delivery is explicitly distinct from durable v4 mutations.
+
+@capability(PANE_RUNTIME_HUMAN_INPUT_V1)
+interface pane-runtime-human-input-v1 {
+    record human-input-capabilities {
+        protocol_version: u32,
+        max_payload_bytes: u32,
+        max_active_streams: u32,
+        dedup_window: u32,
+    }
+    record human-input-stream {
+        execution: pane-runtime-execution-v4.terminal-execution-ref,
+        stream_id: uuid,
+    }
+    // PTY write/flush only: neither durable capture nor application consumption.
+    record human-input-ack {
+        stream: human-input-stream,
+        sequence: u64,
+        written_bytes: u64,
+    }
+    variant human-input-error {
+        authority { error: pane-runtime-execution-v4.terminal-execution-error },
+        closed { reason: string },
+        capacity { reason: string },
+        invalid { reason: string },
+        conflict { reason: string },
+        sequence { reason: string },
+        uncertain { reason: string },
+    }
+    command capabilities() -> human-input-capabilities;
+    command open(execution: pane-runtime-execution-v4.terminal-execution-ref) -> result<human-input-stream, human-input-error>;
+    command push(stream: human-input-stream, sequence: u64, data: bytes) -> result<human-input-ack, human-input-error>;
+    command close(stream: human-input-stream) -> result<unit, human-input-error>;
+}
+
 // Exact execution controls. A replacement never inherits the old token.
 // Cohesive execution contract. Earlier execution identities are unsupported.
 @capability(PANE_RUNTIME_EXECUTION_V4)

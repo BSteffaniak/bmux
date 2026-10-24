@@ -4,27 +4,42 @@ use std::sync::mpsc::{Receiver, sync_channel};
 use std::thread::JoinHandle;
 
 pub(super) struct CaptureOwner {
-    thread: Option<JoinHandle<()>>,
+    threads: Vec<JoinHandle<()>>,
+    writer: Option<super::capture_writer::CaptureWriter>,
     runtime: tokio::runtime::Handle,
 }
 impl CaptureOwner {
     pub(super) fn new(thread: JoinHandle<()>) -> Self {
         Self {
-            thread: Some(thread),
+            threads: vec![thread],
+            writer: None,
             runtime: tokio::runtime::Handle::current(),
         }
     }
-    pub(super) fn take(&mut self) -> JoinHandle<()> {
-        self.thread.take().expect("capture thread owner")
+    pub(super) fn add_writer(
+        &mut self,
+        mut owner: super::capture_writer::WriterOwner,
+        writer: super::capture_writer::CaptureWriter,
+    ) {
+        self.writer = Some(writer);
+        self.threads.push(owner.take());
+    }
+    pub(super) fn take(&mut self) -> Vec<JoinHandle<()>> {
+        std::mem::take(&mut self.threads)
     }
 }
 impl Drop for CaptureOwner {
     fn drop(&mut self) {
-        if let Some(thread) = self.thread.take() {
+        if !self.threads.is_empty() {
+            if let Some(writer) = &self.writer {
+                writer.fail("capture supervision cancelled");
+            }
+            let threads = self.take();
             // Cancellation transfers ownership to the persistent runtime rather
             // than detaching the blocking thread or claiming completed cleanup.
             self.runtime.spawn(async move {
-                let mut join = super::supervision_join(&mut [Some(thread)]);
+                let mut threads: Vec<_> = threads.into_iter().map(Some).collect();
+                let mut join = super::supervision_join(&mut threads);
                 if let Err(error) = (&mut join)
                     .await
                     .unwrap_or_else(|error| Err(error.to_string()))
@@ -36,31 +51,53 @@ impl Drop for CaptureOwner {
     }
 }
 
+struct StartupChunk {
+    bytes: Vec<u8>,
+    ticket: Option<super::capture_writer::Ticket>,
+}
+
 pub(super) struct StartupReader {
-    receiver: Receiver<io::Result<Vec<u8>>>,
+    receiver: Receiver<io::Result<StartupChunk>>,
     pending: Vec<u8>,
     offset: usize,
+    publication_ticket: Option<super::capture_writer::Ticket>,
+    pending_ticket: Option<super::capture_writer::Ticket>,
+    ended: bool,
+}
+
+impl StartupReader {
+    /// Mark this ticket projected only after processing the returned bytes.
+    /// None means that an ordered chunk has only been partially consumed.
+    pub(super) fn publication_ticket(&self) -> Option<super::capture_writer::Ticket> {
+        self.publication_ticket
+    }
 }
 
 impl Read for StartupReader {
     fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
-        if output.is_empty() {
+        self.publication_ticket = None;
+        if output.is_empty() || self.ended {
             return Ok(0);
         }
         if self.offset == self.pending.len() {
-            self.pending = match self.receiver.recv() {
-                Ok(chunk) => chunk?,
-                Err(_) => {
-                    return Err(io::Error::other(
-                        "raw capture ended without an explicit EOF boundary",
-                    ));
-                }
-            };
+            let chunk = self.receiver.recv().map_err(|_| {
+                io::Error::other("capture producer disconnected without terminal boundary")
+            })??;
+            self.pending = chunk.bytes;
+            self.pending_ticket = chunk.ticket;
             self.offset = 0;
+            if self.pending.is_empty() {
+                self.ended = true;
+                self.publication_ticket = self.pending_ticket;
+                return Ok(0);
+            }
         }
         let count = output.len().min(self.pending.len() - self.offset);
         output[..count].copy_from_slice(&self.pending[self.offset..self.offset + count]);
         self.offset += count;
+        if self.offset == self.pending.len() {
+            self.publication_ticket = self.pending_ticket;
+        }
         Ok(count)
     }
 }
@@ -109,7 +146,7 @@ pub(super) fn start_captured(
                     eprintln!("startup raw capture boundary: eof={} error={:?}", chunk.as_ref().is_ok_and(Vec::is_empty), chunk.as_ref().err());
                     tracing::debug!(eof = chunk.as_ref().is_ok_and(Vec::is_empty), error = ?chunk.as_ref().err(), "startup raw capture reached terminal read boundary");
                 }
-                if sender.send(chunk).is_err() || done {
+                if sender.send(chunk.map(|bytes| StartupChunk { bytes, ticket: None })).is_err() || done {
                     break;
                 }
             }
@@ -119,18 +156,130 @@ pub(super) fn start_captured(
             receiver,
             pending: Vec::new(),
             offset: 0,
+            publication_ticket: None,
+            pending_ticket: None,
+            ended: false,
+        },
+        thread,
+    ))
+}
+
+/// Async persistence path. The coordinator installs the same writer on the
+/// execution before starting this reader and retains `WriterOwner` in supervision.
+/// Resize must use `execution.capture_order` and wait for the admitted raw prefix
+/// to be projected before changing geometry. Disk waits never hold that gate.
+pub(super) fn start_ordered(
+    mut raw: Box<dyn Read + Send>,
+    execution: std::sync::Arc<super::execution::ExecutionCapture>,
+    writer: super::capture_writer::CaptureWriter,
+) -> io::Result<(StartupReader, JoinHandle<()>)> {
+    if execution
+        .durable_capture
+        .lock()
+        .map_err(|_| io::Error::other("capture authority lock poisoned"))?
+        .is_some()
+    {
+        return Err(io::Error::other(
+            "ordered writer and legacy synchronous capture cannot coexist",
+        ));
+    }
+    let (sender, receiver) = sync_channel(32);
+    let thread = std::thread::Builder::new()
+        .name("bmux-pty-ordered-capture".into())
+        .spawn(move || {
+            let mut buffer = [0; 8192];
+            loop {
+                let read = loop {
+                    match raw.read(&mut buffer) {
+                        Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                        // PTY adapters use EIO for last-slave closure. This is
+                        // the sole normalization point for the ordered path.
+                        #[cfg(unix)]
+                        Err(error) if error.raw_os_error() == Some(libc::EIO) => break Ok(0),
+                        result => break result,
+                    }
+                };
+                let terminal = !matches!(&read, Ok(count) if *count > 0);
+                let mut end_admitted = false;
+                let result = (|| {
+                    // The single raw producer reserves outside capture_order.
+                    // Live send is also outside the gate; resize fences on the
+                    // admitted prefix so it cannot overtake this publication.
+                    let reservation = if terminal {
+                        writer.reserve_end()?
+                    } else {
+                        writer.reserve_output()?
+                    };
+                    let order = execution
+                        .capture_order
+                        .lock()
+                        .map_err(|_| io::Error::other("capture ordering lock poisoned"))?;
+                    let chunk = match read {
+                        Ok(0) => StartupChunk {
+                            bytes: Vec::new(),
+                            ticket: Some(reservation.end(None)?),
+                        },
+                        Ok(count) => {
+                            let bytes = buffer[..count].to_vec();
+                            let ticket = reservation.output(bytes.clone())?;
+                            StartupChunk {
+                                bytes,
+                                ticket: Some(ticket),
+                            }
+                        }
+                        Err(error) => {
+                            let end = reservation.end(Some(error.to_string()))?;
+                            end_admitted = true;
+                            drop(order);
+                            // Terminal error publication is allowed to wait:
+                            // preserve the captured prefix/error before the
+                            // projection supervisor reacts by stopping authority.
+                            writer.wait_committed(end)?;
+                            return Err(error);
+                        }
+                    };
+                    drop(order);
+                    Ok(chunk)
+                })();
+                // A raw read error is represented by an ordered error end, so
+                // allow that prefix to drain. Admission failures instead stop
+                // writer authority and wake all blocked capacity/barrier waits.
+                if let Err(error) = &result
+                    && !end_admitted
+                {
+                    writer.fail(&error.to_string());
+                }
+                let failed = result.is_err();
+                if sender.send(result).is_err() {
+                    writer.fail("live projection receiver disconnected");
+                    break;
+                }
+                if terminal || failed {
+                    break;
+                }
+            }
+        })?;
+    Ok((
+        StartupReader {
+            receiver,
+            pending: Vec::new(),
+            offset: 0,
+            publication_ticket: None,
+            pending_ticket: None,
+            ended: false,
         },
         thread,
     ))
 }
 
 pub(super) async fn acknowledge_cleanup(
-    thread: JoinHandle<()>,
+    threads: Vec<JoinHandle<()>>,
     cleanup: &tokio::sync::watch::Sender<Option<Result<(), String>>>,
     previous: Option<Result<(), String>>,
     reason: String,
 ) -> String {
-    let mut join = super::supervision_join(&mut [Some(thread)]);
+    let mut threads: Vec<_> = threads.into_iter().map(Some).collect();
+    let mut join = super::supervision_join(&mut threads);
     let capture_result =
         super::join_supervision_threads(&mut join, std::time::Duration::from_secs(4)).await;
     let join_pending = !join.is_finished();
@@ -156,6 +305,114 @@ pub(super) async fn acknowledge_cleanup(
 mod tests {
     use std::io::Read;
 
+    #[test]
+    fn channel_disconnect_is_not_eof_and_explicit_eof_is_sticky() {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let mut reader = super::StartupReader {
+            receiver,
+            pending: Vec::new(),
+            offset: 0,
+            publication_ticket: None,
+            pending_ticket: None,
+            ended: false,
+        };
+        drop(sender);
+        assert!(reader.read(&mut [0; 1]).is_err());
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let mut reader = super::StartupReader {
+            receiver,
+            pending: Vec::new(),
+            offset: 0,
+            publication_ticket: None,
+            pending_ticket: None,
+            ended: false,
+        };
+        sender
+            .send(Ok(super::StartupChunk {
+                bytes: Vec::new(),
+                ticket: None,
+            }))
+            .unwrap();
+        drop(sender);
+        assert_eq!(reader.read(&mut [0; 1]).unwrap(), 0);
+        assert_eq!(reader.read(&mut [0; 1]).unwrap(), 0);
+    }
+
+    #[test]
+    fn partial_reads_do_not_publish_a_whole_chunk_ticket() {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let ticket = super::super::capture_writer::Ticket {
+            sequence: 1,
+            raw_end: 4,
+        };
+        sender
+            .send(Ok(super::StartupChunk {
+                bytes: b"tail".to_vec(),
+                ticket: Some(ticket),
+            }))
+            .unwrap();
+        let mut reader = super::StartupReader {
+            receiver,
+            pending: Vec::new(),
+            offset: 0,
+            publication_ticket: None,
+            pending_ticket: None,
+            ended: false,
+        };
+        assert_eq!(reader.read(&mut [0; 2]).unwrap(), 2);
+        assert!(reader.publication_ticket().is_none());
+        assert_eq!(reader.read(&mut [0; 2]).unwrap(), 2);
+        assert_eq!(reader.publication_ticket(), Some(ticket));
+    }
+
+    #[tokio::test]
+    async fn ordered_reader_publishes_exact_tail_and_durable_end_separately() {
+        let root = tempfile::tempdir().unwrap();
+        let capture = super::super::durable_capture::DurableCapture::create(root.path()).unwrap();
+        let (writer, mut owner) =
+            super::super::capture_writer::CaptureWriter::start(capture).unwrap();
+        let (mut reader, raw_thread) = super::start_ordered(
+            Box::new(std::io::Cursor::new(b"tail".to_vec())),
+            std::sync::Arc::new(super::super::execution::ExecutionCapture::default()),
+            writer.clone(),
+        )
+        .unwrap();
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"tail");
+        raw_thread.join().unwrap();
+        let end = writer.progress().unwrap().admitted;
+        assert!(writer.wait_committed(end).unwrap().eof);
+        owner.take().join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ordered_pty_eio_is_one_real_terminal_boundary() {
+        struct ClosedPty;
+        impl Read for ClosedPty {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::from_raw_os_error(libc::EIO))
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let capture = super::super::durable_capture::DurableCapture::create(root.path()).unwrap();
+        let (writer, mut owner) =
+            super::super::capture_writer::CaptureWriter::start(capture).unwrap();
+        let (mut reader, raw_thread) = super::start_ordered(
+            Box::new(ClosedPty),
+            std::sync::Arc::new(super::super::execution::ExecutionCapture::default()),
+            writer.clone(),
+        )
+        .unwrap();
+        assert_eq!(reader.read(&mut [0; 1]).unwrap(), 0);
+        let end = reader.publication_ticket().unwrap();
+        assert!(writer.wait_committed(end).unwrap().eof);
+        assert_eq!(writer.progress().unwrap().admitted.sequence, 1);
+        raw_thread.join().unwrap();
+        owner.take().join().unwrap();
+    }
+
     #[tokio::test]
     async fn cancelled_capture_owner_retains_blocked_thread_until_release() {
         let (release, blocked) = std::sync::mpsc::channel();
@@ -179,7 +436,7 @@ mod tests {
         let thread = std::thread::spawn(|| {});
         let (cleanup, mut acknowledged) = tokio::sync::watch::channel(None);
         let reason = super::acknowledge_cleanup(
-            thread,
+            vec![thread],
             &cleanup,
             Some(Err("process cleanup failed".into())),
             "startup rejected".into(),

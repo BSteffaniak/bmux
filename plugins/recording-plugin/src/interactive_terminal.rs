@@ -9,8 +9,8 @@ use bmux_client::BmuxClient;
 use bmux_keyboard::encode::{KeyEncodingModes, encode_key_with_modes};
 use bmux_pane_runtime_plugin_api::pane_runtime_execution_v4 as pane;
 use bmux_recording_plugin_api::{
-    recording_process_presentation_v1 as presentation,
-    recording_process_presentation_wait_v1 as presentation_wait, recording_process_v4 as process,
+    recording_process_live_presentation_v1 as live,
+    recording_process_presentation_v1 as presentation, recording_process_v4 as process,
 };
 use bmux_terminal_grid::{GridLimits, GridSnapshot, TerminalGridStream};
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind};
@@ -238,11 +238,10 @@ pub(crate) async fn interact(
     let mut receiving =
         crate::process_bootstrap::connect_owned(root, "recording-presentation").await?;
     let observing = crate::process_bootstrap::connect_owned(root, "recording-status").await?;
-    let caps = presentation_wait::client::capabilities(&mut receiving).await
-        .context("interactive recording requires bmux.recording.process.presentation.wait.v1; no legacy polling fallback")?;
+    let caps = live::client::capabilities(&mut receiving).await
+        .context("interactive recording requires bmux.recording.process.live.presentation.v1; no legacy fallback")?;
     ensure!(
         caps.schema_version == 1
-            && caps.token_bytes == 32
             && caps.max_timeout_ms >= 1000
             && caps.max_response_bytes >= MAX_SNAPSHOT_BYTES,
         "unsupported presentation wait capabilities"
@@ -258,13 +257,20 @@ pub(crate) async fn interact(
     }) {
         return combine_restore(Err(error.into()), guard.restore().map_err(Into::into));
     }
-    let operation = tokio::select! {
-        result = interact_loop(client, receiving, observing, &mut guard, run_id, execution) => result,
-        _ = interrupt.recv() => Err(anyhow::anyhow!("interactive frontend interrupted; execution retained, pending mutations must be reconciled").context(InteractiveFailureKind::Interrupted)),
-        _ = terminate.recv() => Err(anyhow::anyhow!("interactive frontend terminated; execution retained, pending mutations must be reconciled").context(InteractiveFailureKind::Interrupted)),
-        _ = suspend.recv() => Err(anyhow::anyhow!("outer terminal suspension unsupported; execution retained for recovery").context(InteractiveFailureKind::Unsupported)),
-        _ = hangup.recv() => Err(anyhow::anyhow!("interactive terminal disconnected; execution retained for recovery").context(InteractiveFailureKind::Disconnect)),
+    let stop = async {
+        tokio::select! {
+            _ = interrupt.recv() => anyhow::anyhow!("interactive frontend interrupted; execution retained; outstanding input is uncertain, no retry").context(InteractiveFailureKind::Interrupted),
+            _ = terminate.recv() => anyhow::anyhow!("interactive frontend terminated; execution retained; outstanding input is uncertain, no retry").context(InteractiveFailureKind::Interrupted),
+            _ = suspend.recv() => anyhow::anyhow!("outer terminal suspension unsupported; input suspended, no automatic resume").context(InteractiveFailureKind::Unsupported),
+            _ = hangup.recv() => anyhow::anyhow!("interactive terminal disconnected; execution retained; no automatic input resume").context(InteractiveFailureKind::Disconnect),
+        }
     };
+    // Signals terminate the loop cooperatively: dropping its future would skip
+    // asynchronous stream close and could strand a live epoch on every repeat.
+    let operation = interact_loop(
+        client, receiving, observing, &mut guard, run_id, execution, stop,
+    )
+    .await;
     combine_restore(operation, guard.restore().map_err(Into::into))?;
     // Presentation may stop before retirement/EOF. Wait only after restoring
     // the outer terminal, through the owner's bounded, event-driven contract.
@@ -311,7 +317,7 @@ async fn wait_for_post_exit_cleanup(
 }
 
 async fn recorded_resize(
-    client: &mut BmuxClient,
+    client: &mut impl bmux_plugin_sdk::TypedDispatchClient,
     run_id: Uuid,
     dimensions: (u16, u16),
 ) -> Result<()> {
@@ -327,28 +333,7 @@ async fn recorded_resize(
         .map_err(|error| anyhow::anyhow!("recorded resize rejected; input suspended: {error:?}"))
 }
 
-async fn send_batch(
-    client: &mut BmuxClient,
-    run_id: Uuid,
-    reference: &pane::TerminalExecutionRef,
-    data: Vec<u8>,
-) -> Result<()> {
-    let mutation_id = Uuid::new_v4();
-    let bytes = data.len();
-    let receipt = process::client::send(&mut *client, run_id, data, mutation_id)
-        .await
-        .with_context(|| {
-            format!("interactive input outcome uncertain; reconcile mutation_id={mutation_id}")
-        })
-        .context(InteractiveFailureKind::Transport)?
-        .map_err(|error| {
-            anyhow::anyhow!(
-                "interactive input rejected; mutation_id={mutation_id}; input suspended: {error:?}"
-            )
-        })?;
-    validate_input_receipt(&receipt, reference, mutation_id, bytes)
-}
-
+#[cfg(test)]
 fn validate_input_receipt(
     receipt: &pane::TerminalInputReceipt,
     reference: &pane::TerminalExecutionRef,
@@ -381,10 +366,21 @@ enum ControlCommand {
 struct ControlQueue {
     commands: std::collections::VecDeque<ControlCommand>,
     bytes: usize,
+    closed: bool,
 }
 
 impl ControlQueue {
+    fn shutdown(&mut self) {
+        self.closed = true;
+        self.commands.clear();
+        self.bytes = 0;
+    }
+
     fn push(&mut self, command: ControlCommand) -> Result<()> {
+        ensure!(
+            !self.closed,
+            "interactive control queue closed; input not resumed"
+        );
         let bytes = match &command {
             ControlCommand::Input(data) => data.len(),
             ControlCommand::Resize(_) => 0,
@@ -401,6 +397,9 @@ impl ControlQueue {
     }
 
     fn take_batch(&mut self) -> Option<(ControlCommand, usize)> {
+        if self.closed {
+            return None;
+        }
         let command = self.commands.pop_front()?;
         let ControlCommand::Input(mut data) = command else {
             return Some((command, 1));
@@ -442,41 +441,113 @@ fn queue_control(
 }
 
 async fn drive_controls(
-    client: &mut BmuxClient,
+    client: &mut impl bmux_plugin_sdk::TypedDispatchClient,
     run_id: Uuid,
     reference: &pane::TerminalExecutionRef,
     queue: &SharedControlQueue,
     wake: &tokio::sync::Notify,
     completed: tokio::sync::mpsc::Sender<ControlCompletion>,
 ) -> Result<()> {
-    loop {
-        let command = queue
-            .lock()
-            .map_err(|_| anyhow::anyhow!("control queue poisoned"))?
-            .take_batch();
-        let Some((command, items)) = command else {
-            wake.notified().await;
-            continue;
-        };
-        // No timer or collection delay: first available input is sent now.
-        // Subsequent queued bytes share one durable mutation, never a resize.
-        let resized = match command {
-            ControlCommand::Input(data) => {
-                send_batch(client, run_id, reference, data).await?;
-                None
+    use bmux_recording_plugin_api::recording_process_human_input_v1::client as human;
+    let capabilities = human::capabilities(client).await?;
+    ensure!(
+        capabilities.protocol_version == 1 && capabilities.max_payload_bytes >= 16_384,
+        "unsupported human-input contract; refusing durable fallback"
+    );
+    let stream = tokio::time::timeout(Duration::from_secs(2), human::open(client, run_id))
+        .await
+        .context("human stream open timed out; outcome unknown; no automatic reopen")?
+        .context("human stream open outcome unknown; no automatic reopen")?
+        .map_err(|error| anyhow::anyhow!("human stream open: {error:?}"))?;
+    // All paths after open attempt close, including identity/ack failures. The
+    // owner retains an idle expiry for a lost open response or broken transport.
+    let result: Result<()> = async {
+        ensure!(
+            &stream.execution == reference,
+            "human stream execution mismatch"
+        );
+        let mut sequence = 1_u64;
+        loop {
+            let command = {
+                let mut queue = queue
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("control queue poisoned"))?;
+                if queue.closed {
+                    break;
+                }
+                queue.take_batch()
+            };
+            let Some((command, items)) = command else {
+                wake.notified().await;
+                continue;
+            };
+            // Only already queued bytes coalesce; no timer, durable mutation,
+            // automatic resend, or reconnection with outstanding input.
+            let resized = match command {
+                ControlCommand::Input(data) => {
+                    let expected_bytes = u64::try_from(data.len())?;
+                    let ack = tokio::time::timeout(
+                        Duration::from_secs(6),
+                        human::push(client, run_id, stream.clone(), sequence, data),
+                    )
+                    .await
+                    .context("human input timeout; outcome unknown; no retry")?
+                    .context("human input transport outcome unknown; no retry")?
+                    .map_err(|error| anyhow::anyhow!("human input: {error:?}; no retry"))?;
+                    validate_human_ack(&ack, &stream, sequence, expected_bytes)?;
+                    sequence = sequence
+                        .checked_add(1)
+                        .context("human sequence exhausted")?;
+                    None
+                }
+                ControlCommand::Resize(dimensions) => {
+                    tokio::time::timeout(
+                        Duration::from_secs(6),
+                        recorded_resize(client, run_id, dimensions),
+                    )
+                    .await
+                    .context("resize timed out; outcome unknown; no retry")??;
+                    Some(dimensions)
+                }
+            };
+            // Teardown closes the receiver to unblock a worker finishing its
+            // current operation. Never drain queued effects during teardown.
+            if completed
+                .send(ControlCompletion { items, resized })
+                .await
+                .is_err()
+            {
+                break;
             }
-            ControlCommand::Resize(dimensions) => {
-                recorded_resize(client, run_id, dimensions).await?;
-                Some(dimensions)
-            }
-        };
-        completed
-            .send(ControlCompletion { items, resized })
-            .await
-            .map_err(|_| {
-                anyhow::anyhow!("control completion receiver disconnected; outcome retained")
-            })?;
+        }
+        Ok(())
     }
+    .await;
+    let close = tokio::time::timeout(Duration::from_secs(2), human::close(client, run_id, stream))
+        .await
+        .context("human stream close timed out; epoch may remain until idle expiry")
+        .and_then(|value| value.map_err(anyhow::Error::from))
+        .and_then(|value| value.map_err(|error| anyhow::anyhow!("human stream close: {error:?}")));
+    match (result, close) {
+        (Ok(()), result) => result,
+        (Err(error), Ok(())) => Err(error),
+        (Err(error), Err(close)) => {
+            Err(error.context(format!("stream cleanup also failed: {close:#}")))
+        }
+    }
+}
+
+fn validate_human_ack(
+    ack: &bmux_pane_runtime_plugin_api::pane_runtime_human_input_v1::HumanInputAck,
+    stream: &bmux_pane_runtime_plugin_api::pane_runtime_human_input_v1::HumanInputStream,
+    sequence: u64,
+    expected_bytes: u64,
+) -> Result<()> {
+    ensure!(
+        ack.stream == *stream && ack.sequence == sequence && ack.written_bytes == expected_bytes,
+        "invalid human input acknowledgment; outcome unknown; no retry"
+    );
+    Ok(())
 }
 
 struct ReceivingTasks(Vec<tokio::task::JoinHandle<()>>);
@@ -552,7 +623,7 @@ async fn wait_for_exit_grace(deadline: Option<tokio::time::Instant>) {
 struct ReceivingChannels {
     tasks: ReceivingTasks,
     frames: tokio::sync::mpsc::Receiver<
-        Result<bmux_pane_runtime_plugin_api::pane_runtime_presentation_wait_v1::PresentationFrame>,
+        Result<bmux_pane_runtime_plugin_api::pane_runtime_live_presentation_v1::LiveFrame>,
     >,
     statuses: tokio::sync::mpsc::Receiver<Result<process::RunStatus>>,
 }
@@ -570,7 +641,7 @@ fn spawn_receiving(
     let frame_task = tokio::spawn(async move {
         let mut after = None;
         loop {
-            let result = presentation_wait::client::wait_present(
+            let result = live::client::wait_present(
                 &mut receiving,
                 run_id,
                 after.clone(),
@@ -584,7 +655,7 @@ fn spawn_receiving(
             });
             match result {
                 Ok(Some(frame)) => {
-                    after = Some(frame.revision.clone());
+                    after = Some(frame.cursor.clone());
                     if frames_tx.send(Ok(frame)).await.is_err() {
                         break;
                     }
@@ -621,26 +692,139 @@ fn spawn_receiving(
     }
 }
 
-fn present_frame(
-    frame: &bmux_pane_runtime_plugin_api::pane_runtime_presentation_wait_v1::PresentationFrame,
-    reference: &pane::TerminalExecutionRef,
-    dimensions: (u16, u16),
-    terminal: &mut TerminalIo<std::io::Stdout>,
-    presenter: &mut UndecoratedGridPresenter,
-) -> Result<Option<(u64, InputModes)>> {
-    ensure!(
-        frame.revision.len() == 32,
-        "invalid presentation revision token"
-    );
-    let snapshot = validate_screen(&frame.screen, reference)?;
-    if (frame.screen.cols, frame.screen.rows) != dimensions {
-        return Ok(None);
+/// Received state is distinct from the presenter's successfully committed scene.
+/// Watermark-only frames retain the last canonical snapshot without repainting.
+#[derive(Default)]
+struct LiveScene {
+    cursor: Option<bmux_pane_runtime_plugin_api::pane_runtime_live_presentation_v1::LiveCursor>,
+    snapshot: Option<GridSnapshot>,
+    displayed: Option<(u64, u64, u64)>,
+}
+
+impl LiveScene {
+    fn accept(
+        &mut self,
+        frame: bmux_pane_runtime_plugin_api::pane_runtime_live_presentation_v1::LiveFrame,
+        reference: &pane::TerminalExecutionRef,
+    ) -> Result<()> {
+        let cursor = &frame.cursor;
+        ensure!(
+            cursor.execution == *reference && cursor.source_epoch == reference.execution_token,
+            "live presentation source changed; input suspended; no automatic resume"
+        );
+        ensure!(
+            !cursor.recovery_required,
+            "live presentation requires recovery; input suspended"
+        );
+        let changed = if let Some(previous) = &self.cursor {
+            ensure!(
+                cursor.execution == previous.execution
+                    && cursor.source_epoch == previous.source_epoch,
+                "live source epoch changed; no automatic resume"
+            );
+            ensure!(
+                cursor.source_reset_revision >= previous.source_reset_revision
+                    && (cursor.source_reset_revision != previous.source_reset_revision
+                        || (cursor.grid_revision >= previous.grid_revision
+                            && cursor.geometry_revision >= previous.geometry_revision))
+                    && cursor.projected_raw_watermark >= previous.projected_raw_watermark
+                    && cursor.durable_raw_watermark >= previous.durable_raw_watermark
+                    && (!previous.target_exited || cursor.target_exited)
+                    && (!previous.output_drained || cursor.output_drained)
+                    && (!previous.terminal_session_ended || cursor.terminal_session_ended),
+                "live cursor regressed; input suspended"
+            );
+            cursor.source_reset_revision != previous.source_reset_revision
+                || cursor.grid_revision != previous.grid_revision
+                || cursor.geometry_revision != previous.geometry_revision
+        } else {
+            true
+        };
+        ensure!(
+            !changed || frame.screen.is_some(),
+            "changed live scene omitted its canonical screen"
+        );
+        let snapshot = if let Some(screen) = &frame.screen {
+            ensure!(
+                screen.output_watermark == cursor.projected_raw_watermark,
+                "live screen projected watermark mismatch"
+            );
+            let snapshot = validate_screen(screen, reference)?;
+            ensure!(
+                snapshot.revision == cursor.grid_revision,
+                "live canonical grid revision mismatch"
+            );
+            if let (Some(previous), Some(retained)) = (&self.cursor, &self.snapshot)
+                && cursor.source_reset_revision == previous.source_reset_revision
+                && cursor.geometry_revision == previous.geometry_revision
+            {
+                ensure!(
+                    snapshot.width == retained.width && snapshot.height == retained.height,
+                    "live geometry changed without geometry revision"
+                );
+            }
+            Some(snapshot)
+        } else {
+            None
+        };
+        // Commit receive state only after the entire envelope validates. It is
+        // not displayed authority until present() successfully flushes output.
+        if let Some(snapshot) = snapshot {
+            self.snapshot = Some(snapshot);
+        }
+        self.cursor = Some(frame.cursor);
+        Ok(())
     }
-    presenter.present(terminal, &snapshot)?;
-    Ok(Some((
-        frame.screen.output_watermark,
-        modes_from_protocol(snapshot.protocol)?,
-    )))
+
+    fn present(
+        &mut self,
+        dimensions: (u16, u16),
+        terminal: &mut impl std::io::Write,
+        presenter: &mut UndecoratedGridPresenter,
+    ) -> Result<Option<(u64, InputModes)>> {
+        let (Some(cursor), Some(snapshot)) = (&self.cursor, &self.snapshot) else {
+            return Ok(None);
+        };
+        if (snapshot.width, snapshot.height) != dimensions {
+            return Ok(None);
+        }
+        let revision = (
+            cursor.source_reset_revision,
+            cursor.grid_revision,
+            cursor.geometry_revision,
+        );
+        if self.displayed != Some(revision) {
+            if self
+                .displayed
+                .is_some_and(|(reset, _, _)| reset != cursor.source_reset_revision)
+            {
+                // A parser reset invalidates retained damage/cursor baselines.
+                // Publish the replacement presenter only after its full repair
+                // successfully reaches the outer terminal.
+                let mut repair = UndecoratedGridPresenter::new(dimensions.0, dimensions.1);
+                repair.present(terminal, snapshot)?;
+                *presenter = repair;
+            } else {
+                presenter.present(terminal, snapshot)?;
+            }
+            self.displayed = Some(revision);
+        }
+        Ok(Some((
+            cursor.projected_raw_watermark,
+            modes_from_protocol(snapshot.protocol)?,
+        )))
+    }
+
+    fn input_suspended(&self) -> bool {
+        self.cursor.as_ref().is_some_and(|cursor| {
+            cursor.target_exited
+                || cursor.terminal_session_ended
+                || cursor.recovery_required
+                || self
+                    .displayed
+                    .is_none_or(|(reset, _, _)| reset != cursor.source_reset_revision)
+        })
+    }
 }
 
 // Keep completion, resize barriers and input scheduling in one select state
@@ -653,7 +837,9 @@ async fn interact_loop(
     terminal: &mut TerminalIo<std::io::Stdout>,
     run_id: Uuid,
     execution: process::ExecutionRef,
+    stop: impl std::future::Future<Output = anyhow::Error>,
 ) -> Result<process::RunStatus> {
+    tokio::pin!(stop);
     let reference = pane::TerminalExecutionRef {
         session_id: execution.session_id,
         pane_id: execution.pane_id,
@@ -677,16 +863,20 @@ async fn interact_loop(
     tokio::pin!(controls);
     let mut pending = 0_usize;
     let mut resize_pending = false;
-    let mut retained_frame = None;
+    let mut live_scene = LiveScene::default();
     let mut target_exit_deadline = None;
+    let mut controls_finished = false;
+    let result = async {
     loop {
-        if !resize_pending && let Some(frame) = retained_frame.take() {
-            let frame: bmux_pane_runtime_plugin_api::pane_runtime_presentation_wait_v1::PresentationFrame = frame;
+        if !resize_pending {
             if let Some((watermark, protocol)) =
-                present_frame(&frame, &reference, dimensions, terminal, &mut presenter)?
+                live_scene.present(dimensions, terminal, &mut presenter)?
             {
                 displayed_watermark = Some(watermark);
                 modes = Some(protocol);
+            } else {
+                // Never route input using a scene from the previous geometry.
+                modes = None;
             }
         }
         if let (Some(status), Some(watermark)) = (&observed, displayed_watermark) {
@@ -703,7 +893,9 @@ async fn interact_loop(
         }
         tokio::select! {
             // Unbiased selection keeps continuous output from starving input.
+            error = &mut stop => return Err(error),
             result = &mut controls => {
+                controls_finished = true;
                 return Err(result.err().unwrap_or_else(|| anyhow::anyhow!("control worker stopped"))
                     .context(format!("{pending} queued/in-flight input effects unresolved; execution retained; no retry")));
             }
@@ -716,7 +908,7 @@ async fn interact_loop(
                 }
             }
             frame = frames.recv() => {
-                retained_frame = Some(frame.context("presentation receiver ended")??);
+                live_scene.accept(frame.context("presentation receiver ended")??, &reference)?;
             }
             () = wait_for_exit_grace(target_exit_deadline) => {
                 ensure!(pending == 0,
@@ -731,7 +923,7 @@ async fn interact_loop(
                 }
                 observed = Some(status);
             }
-            event = terminal.next_event(), if modes.is_some() && !observed.as_ref().is_some_and(|status| status.target_exited || status.terminal_session_ended) => {
+            event = terminal.next_event(), if modes.is_some() && !live_scene.input_suspended() && !observed.as_ref().is_some_and(|status| status.target_exited || status.terminal_session_ended) => {
                 let event = event.context(InteractiveFailureKind::Disconnect)?.context("interactive terminal disconnected; execution retained")?;
                 if matches!(event, Event::Resize(_, _)) {
                     let current = terminal.geometry()?;
@@ -748,6 +940,29 @@ async fn interact_loop(
             }
         }
     }
+    }.await;
+    // Poison is already a failure, but must not bypass best-effort epoch close.
+    queue
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .shutdown();
+    completed.close();
+    wake.notify_one();
+    if !controls_finished {
+        let cleanup = tokio::time::timeout(Duration::from_secs(10), &mut controls)
+            .await
+            .context("control shutdown timed out; outstanding effects uncertain; no retry")
+            .and_then(|value| value);
+        if let Err(cleanup) = cleanup {
+            return match result {
+                Ok(_) => Err(cleanup),
+                Err(error) => {
+                    Err(error.context(format!("control cleanup also failed: {cleanup:#}")))
+                }
+            };
+        }
+    }
+    result
 }
 
 #[cfg(test)]
@@ -755,6 +970,400 @@ mod tests {
     use super::*;
     use crossterm::event::{KeyEvent, MouseButton};
     use std::io::Write;
+
+    fn live_frame() -> bmux_pane_runtime_plugin_api::pane_runtime_live_presentation_v1::LiveFrame {
+        use bmux_pane_runtime_plugin_api::pane_runtime_live_presentation_v1::{
+            LiveCursor, LiveFrame,
+        };
+        let mut grid = TerminalGridStream::new(4, 2, GridLimits::default()).unwrap();
+        grid.process(b"hi");
+        let snapshot = grid.snapshot(0, 2);
+        let execution = pane::TerminalExecutionRef {
+            session_id: Uuid::new_v4(),
+            pane_id: Uuid::new_v4(),
+            execution_token: Uuid::new_v4(),
+        };
+        LiveFrame {
+            cursor: LiveCursor {
+                source_epoch: execution.execution_token,
+                source_reset_revision: 0,
+                execution: execution.clone(),
+                grid_revision: snapshot.revision,
+                geometry_revision: 1,
+                projected_raw_watermark: 2,
+                durable_raw_watermark: 0,
+                target_exited: false,
+                output_drained: false,
+                terminal_session_ended: false,
+                recovery_required: false,
+            },
+            screen: Some(pane::TerminalExecutionScreen {
+                execution,
+                output_watermark: 2,
+                cols: 4,
+                rows: 2,
+                cursor_col: 0,
+                cursor_row: 0,
+                cursor_visible: true,
+                text: "hi".into(),
+                encoded_grid: serde_json::to_vec(&snapshot).unwrap(),
+            }),
+        }
+    }
+
+    #[test]
+    fn live_watermark_and_lifecycle_only_updates_retain_scene() {
+        let frame = live_frame();
+        let reference = frame.cursor.execution.clone();
+        let mut scene = LiveScene::default();
+        scene.accept(frame.clone(), &reference).unwrap();
+        let retained = serde_json::to_vec(scene.snapshot.as_ref().unwrap()).unwrap();
+        let revision = (
+            frame.cursor.source_reset_revision,
+            frame.cursor.grid_revision,
+            frame.cursor.geometry_revision,
+        );
+        scene.displayed = Some(revision);
+        let mut progress = frame;
+        progress.screen = None;
+        progress.cursor.projected_raw_watermark = 4;
+        progress.cursor.durable_raw_watermark = 1;
+        progress.cursor.target_exited = true;
+        scene.accept(progress.clone(), &reference).unwrap();
+        assert_eq!(scene.displayed, Some(revision));
+        assert_eq!(
+            serde_json::to_vec(scene.snapshot.as_ref().unwrap()).unwrap(),
+            retained
+        );
+        assert_eq!(scene.cursor, Some(progress.cursor));
+        assert!(scene.input_suspended());
+        // A projected tail and target exit do not fabricate durable process
+        // status, capture EOF, cleanup, or a durable recording receipt.
+        assert!(!post_exit_cleanup_complete(&post_exit_client(None).status));
+    }
+
+    #[test]
+    fn live_changed_scene_requires_screen_and_rejects_stale_source() {
+        let frame = live_frame();
+        let reference = frame.cursor.execution.clone();
+        for kind in 0..7 {
+            let mut scene = LiveScene::default();
+            scene.accept(frame.clone(), &reference).unwrap();
+            let before = scene.cursor.clone();
+            let mut invalid = frame.clone();
+            match kind {
+                0 => {
+                    invalid.screen = None;
+                    invalid.cursor.grid_revision += 1;
+                }
+                1 => {
+                    invalid.screen = None;
+                    invalid.cursor.geometry_revision += 1;
+                }
+                2 => invalid.cursor.source_epoch = Uuid::new_v4(),
+                3 => invalid.cursor.execution.execution_token = Uuid::new_v4(),
+                4 => invalid.cursor.grid_revision += 1,
+                5 => invalid.cursor.projected_raw_watermark += 1,
+                _ => invalid.cursor.recovery_required = true,
+            }
+            assert!(scene.accept(invalid, &reference).is_err());
+            assert_eq!(scene.cursor, before);
+            assert!(scene.displayed.is_none());
+        }
+        let mut missing = frame;
+        missing.screen = None;
+        assert!(LiveScene::default().accept(missing, &reference).is_err());
+    }
+
+    #[test]
+    fn live_changed_grid_accepts_matching_canonical_snapshot() {
+        let frame = live_frame();
+        let reference = frame.cursor.execution.clone();
+        let mut scene = LiveScene::default();
+        scene.accept(frame.clone(), &reference).unwrap();
+        let mut changed = frame;
+        let screen = changed.screen.as_mut().unwrap();
+        let mut grid = TerminalGridStream::from_snapshot(
+            scene.snapshot.as_ref().unwrap(),
+            GridLimits::default(),
+        )
+        .unwrap();
+        grid.process(b"!");
+        let snapshot = grid.snapshot(0, 2);
+        changed.cursor.grid_revision = snapshot.revision;
+        changed.cursor.projected_raw_watermark += 1;
+        screen.output_watermark = changed.cursor.projected_raw_watermark;
+        screen.encoded_grid = serde_json::to_vec(&snapshot).unwrap();
+        scene.accept(changed.clone(), &reference).unwrap();
+        assert_eq!(scene.cursor, Some(changed.cursor));
+        assert_eq!(scene.snapshot.as_ref().unwrap().revision, snapshot.revision);
+        assert!(scene.displayed.is_none());
+    }
+
+    #[test]
+    fn live_source_reset_requires_repair_and_successful_display_before_input() {
+        struct FailedFlush;
+        impl std::io::Write for FailedFlush {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Err(std::io::Error::other("flush failed"))
+            }
+        }
+        let frame = live_frame();
+        let reference = frame.cursor.execution.clone();
+        let mut scene = LiveScene::default();
+        let mut presenter = UndecoratedGridPresenter::new(4, 2);
+        let mut bytes = Vec::new();
+        scene.accept(frame.clone(), &reference).unwrap();
+        scene.present((4, 2), &mut bytes, &mut presenter).unwrap();
+        assert!(!scene.input_suspended());
+        let displayed = scene.displayed;
+        let mut reset = frame.clone();
+        reset.cursor.source_reset_revision += 1;
+        // Parser replacement can restart grid/geometry revisions without
+        // changing execution identity or the ordered raw-output position.
+        let grid = TerminalGridStream::new(4, 2, GridLimits::default()).unwrap();
+        let snapshot = grid.snapshot(0, 2);
+        reset.cursor.grid_revision = snapshot.revision;
+        reset.cursor.geometry_revision = 0;
+        reset.screen.as_mut().unwrap().encoded_grid = serde_json::to_vec(&snapshot).unwrap();
+        let mut missing = reset.clone();
+        missing.screen = None;
+        assert!(scene.accept(missing, &reference).is_err());
+        assert_eq!(scene.displayed, displayed);
+        scene.accept(reset.clone(), &reference).unwrap();
+        assert!(scene.input_suspended());
+        assert_eq!(scene.displayed, displayed);
+        assert!(
+            scene
+                .present((5, 2), &mut bytes, &mut presenter)
+                .unwrap()
+                .is_none()
+        );
+        assert!(scene.input_suspended());
+        assert!(
+            scene
+                .present((4, 2), &mut FailedFlush, &mut presenter)
+                .is_err()
+        );
+        assert!(scene.input_suspended());
+        assert_eq!(scene.displayed, displayed);
+        scene.present((4, 2), &mut bytes, &mut presenter).unwrap();
+        assert!(!scene.input_suspended());
+        assert_eq!(
+            scene.displayed,
+            Some((
+                reset.cursor.source_reset_revision,
+                reset.cursor.grid_revision,
+                reset.cursor.geometry_revision,
+            ))
+        );
+        assert!(
+            scene.accept(frame, &reference).is_err(),
+            "old reset generation must not return"
+        );
+    }
+
+    #[test]
+    fn live_cursor_cannot_regress_or_resurrect_input() {
+        let frame = live_frame();
+        let reference = frame.cursor.execution.clone();
+        let mut scene = LiveScene::default();
+        scene.accept(frame.clone(), &reference).unwrap();
+        let mut exited = frame.clone();
+        exited.screen = None;
+        exited.cursor.target_exited = true;
+        exited.cursor.durable_raw_watermark = 2;
+        scene.accept(exited, &reference).unwrap();
+        assert!(scene.accept(frame, &reference).is_err());
+        assert!(scene.input_suspended());
+    }
+
+    struct HumanClient {
+        stream: bmux_pane_runtime_plugin_api::pane_runtime_human_input_v1::HumanInputStream,
+        calls: Vec<String>,
+        fail_push: bool,
+        bad_ack: bool,
+    }
+
+    impl bmux_plugin_sdk::TypedDispatchClient for HumanClient {
+        async fn invoke_service_raw(
+            &mut self,
+            _capability: &str,
+            _kind: bmux_ipc::InvokeServiceKind,
+            _interface: &str,
+            operation: &str,
+            payload: Vec<u8>,
+        ) -> bmux_plugin_sdk::TypedDispatchClientResult<Vec<u8>> {
+            use bmux_pane_runtime_plugin_api::pane_runtime_human_input_v1 as human;
+            use bmux_recording_plugin_api::recording_process_human_input_v1::client;
+            self.calls.push(operation.into());
+            let bytes = match operation {
+                "capabilities" => {
+                    bmux_plugin_sdk::encode_service_message(&human::HumanInputCapabilities {
+                        protocol_version: 1,
+                        max_payload_bytes: 16_384,
+                        max_active_streams: 32,
+                        dedup_window: 32,
+                    })
+                }
+                "open" => bmux_plugin_sdk::encode_service_message(
+                    &Ok::<_, human::HumanInputError>(self.stream.clone()),
+                ),
+                "push" => {
+                    let request =
+                        bmux_plugin_sdk::decode_service_message::<client::PushRequest>(&payload)
+                            .unwrap();
+                    assert_eq!(request.stream, self.stream);
+                    assert_eq!(request.sequence, 1);
+                    if self.fail_push {
+                        bmux_plugin_sdk::encode_service_message(&Err::<human::HumanInputAck, _>(
+                            human::HumanInputError::Uncertain {
+                                reason: "PTY acknowledgment lost".into(),
+                            },
+                        ))
+                    } else {
+                        bmux_plugin_sdk::encode_service_message(&Ok::<_, human::HumanInputError>(
+                            human::HumanInputAck {
+                                stream: self.stream.clone(),
+                                sequence: if self.bad_ack { 2 } else { request.sequence },
+                                written_bytes: u64::try_from(request.data.len()).unwrap(),
+                            },
+                        ))
+                    }
+                }
+                "close" => {
+                    bmux_plugin_sdk::encode_service_message(&Ok::<_, human::HumanInputError>(()))
+                }
+                unexpected => panic!(
+                    "unexpected operation: {unexpected}; no durable fallback or retry allowed"
+                ),
+            };
+            Ok(bytes.unwrap())
+        }
+    }
+
+    fn human_client() -> HumanClient {
+        HumanClient {
+            stream: bmux_pane_runtime_plugin_api::pane_runtime_human_input_v1::HumanInputStream {
+                execution: pane::TerminalExecutionRef {
+                    session_id: Uuid::new_v4(),
+                    pane_id: Uuid::new_v4(),
+                    execution_token: Uuid::new_v4(),
+                },
+                stream_id: Uuid::new_v4(),
+            },
+            calls: Vec::new(),
+            fail_push: false,
+            bad_ack: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn human_controls_close_on_uncertain_and_invalid_ack_without_retry() {
+        for bad_ack in [false, true] {
+            let mut client = human_client();
+            client.fail_push = !bad_ack;
+            client.bad_ack = bad_ack;
+            let queue = std::sync::Arc::new(std::sync::Mutex::new(ControlQueue::default()));
+            queue
+                .lock()
+                .unwrap()
+                .push(ControlCommand::Input(vec![1]))
+                .unwrap();
+            let reference = client.stream.execution.clone();
+            let (completed, _receiver) = tokio::sync::mpsc::channel(1);
+            let result = drive_controls(
+                &mut client,
+                Uuid::new_v4(),
+                &reference,
+                &queue,
+                &tokio::sync::Notify::new(),
+                completed,
+            )
+            .await;
+            assert!(result.is_err());
+            assert_eq!(client.calls, ["capabilities", "open", "push", "close"]);
+        }
+    }
+
+    #[tokio::test]
+    async fn human_controls_close_on_identity_mismatch_and_each_clean_shutdown() {
+        let mut client = human_client();
+        let queue = std::sync::Arc::new(std::sync::Mutex::new(ControlQueue::default()));
+        let mut wrong = client.stream.execution.clone();
+        wrong.execution_token = Uuid::new_v4();
+        let (completed, _receiver) = tokio::sync::mpsc::channel(1);
+        assert!(
+            drive_controls(
+                &mut client,
+                Uuid::new_v4(),
+                &wrong,
+                &queue,
+                &tokio::sync::Notify::new(),
+                completed,
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(client.calls, ["capabilities", "open", "close"]);
+        for _ in 0..2 {
+            client.calls.clear();
+            queue.lock().unwrap().shutdown();
+            let reference = client.stream.execution.clone();
+            let (completed, _receiver) = tokio::sync::mpsc::channel(1);
+            drive_controls(
+                &mut client,
+                Uuid::new_v4(),
+                &reference,
+                &queue,
+                &tokio::sync::Notify::new(),
+                completed,
+            )
+            .await
+            .unwrap();
+            assert_eq!(client.calls, ["capabilities", "open", "close"]);
+        }
+    }
+
+    #[tokio::test]
+    async fn human_completion_disconnect_closes_stream_after_single_write() {
+        let mut client = human_client();
+        let queue = std::sync::Arc::new(std::sync::Mutex::new(ControlQueue::default()));
+        queue
+            .lock()
+            .unwrap()
+            .push(ControlCommand::Input(vec![1]))
+            .unwrap();
+        let (completed, receiver) = tokio::sync::mpsc::channel(1);
+        drop(receiver);
+        let reference = client.stream.execution.clone();
+        drive_controls(
+            &mut client,
+            Uuid::new_v4(),
+            &reference,
+            &queue,
+            &tokio::sync::Notify::new(),
+            completed,
+        )
+        .await
+        .unwrap();
+        assert_eq!(client.calls, ["capabilities", "open", "push", "close"]);
+    }
+
+    #[test]
+    fn control_shutdown_discards_queued_input_and_never_resumes_it() {
+        let mut queue = ControlQueue::default();
+        queue.push(ControlCommand::Input(vec![1])).unwrap();
+        queue.push(ControlCommand::Resize((80, 24))).unwrap();
+        queue.shutdown();
+        assert_eq!(queue.bytes, 0);
+        assert!(queue.commands.is_empty());
+        assert!(queue.take_batch().is_none());
+        assert!(queue.push(ControlCommand::Input(vec![2])).is_err());
+    }
 
     struct PostExitClient {
         status: process::RunStatus,

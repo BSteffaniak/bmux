@@ -39,6 +39,7 @@ pub(super) struct ExecutionCapture {
     projection_progress: Mutex<u64>,
     projection_changed: std::sync::Condvar,
     pub(super) durable_capture: Mutex<Option<super::durable_capture::DurableCapture>>,
+    pub(super) capture_writer: Mutex<Option<super::capture_writer::CaptureWriter>>,
     pub(super) master: Mutex<Option<Box<dyn portable_pty::MasterPty + Send>>>,
     pub(super) output_drained: AtomicBool,
     pub(super) geometry_revision: AtomicU64,
@@ -70,6 +71,7 @@ impl Default for ExecutionCapture {
             projection_progress: Mutex::new(0),
             projection_changed: std::sync::Condvar::new(),
             durable_capture: Mutex::new(None),
+            capture_writer: Mutex::new(None),
             master: Mutex::new(None),
             output_drained: AtomicBool::new(false),
             geometry_revision: AtomicU64::new(0),
@@ -83,6 +85,56 @@ impl Default for ExecutionCapture {
 }
 
 impl ExecutionCapture {
+    pub(super) fn writer(&self) -> std::io::Result<Option<super::capture_writer::CaptureWriter>> {
+        self.capture_writer
+            .lock()
+            .map(|writer| writer.clone())
+            .map_err(|_| std::io::Error::other("capture writer authority poisoned"))
+    }
+
+    pub(super) fn capture_failure(&self) -> Option<String> {
+        match self.writer() {
+            Ok(Some(writer)) => match writer.progress() {
+                Ok(progress) => progress.failure.or(progress.boundary.error),
+                Err(error) => Some(error.to_string()),
+            },
+            Ok(None) => None,
+            Err(error) => Some(error.to_string()),
+        }
+    }
+
+    pub(super) fn fail_capture(&self, reason: &str) {
+        if let Ok(Some(writer)) = self.writer() {
+            writer.fail(reason);
+        }
+        self.record_error(reason.to_string());
+    }
+
+    pub(super) fn durable_capture_complete(&self) -> bool {
+        match self.writer() {
+            Ok(Some(writer)) => writer.progress().is_ok_and(|progress| {
+                progress.boundary.eof
+                    && progress.boundary.error.is_none()
+                    && progress.failure.is_none()
+            }),
+            Ok(None) => self.output_drained.load(Ordering::SeqCst),
+            Err(_) => false,
+        }
+    }
+
+    pub(super) fn durable_watermark(&self) -> u64 {
+        match self.writer() {
+            Ok(Some(writer)) => writer.progress().map_or(0, |progress| {
+                progress
+                    .boundary
+                    .bytes
+                    .min(self.output_watermark.load(Ordering::SeqCst))
+            }),
+            Ok(None) => self.output_watermark.load(Ordering::SeqCst),
+            Err(_) => 0,
+        }
+    }
+
     // Resize freezes capture publication, then waits without holding parser locks.
     // The bounded capture queue can drain while no new bytes enter its boundary.
     pub(super) fn wait_for_projection(&self, boundary: u64) -> std::io::Result<()> {
@@ -359,6 +411,10 @@ pub(super) fn with_pane<T>(
 pub(crate) fn status(reference: &ExecutionRef) -> Result<ExecutionStatus, ExecutionError> {
     with_pane(reference, |pane| {
         let outcome = pane.execution.outcome.lock().map_err(failed)?;
+        let error = outcome
+            .2
+            .clone()
+            .or_else(|| pane.execution.capture_failure());
         tracing::debug!(
             execution_token = %reference.execution_token,
             exit_code = ?outcome.0,
@@ -372,13 +428,15 @@ pub(crate) fn status(reference: &ExecutionRef) -> Result<ExecutionStatus, Execut
             lifecycle: bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::TerminalLifecycle::ConventionalTerminalSession,
             session_end: if pane.execution.terminal_session_ended.load(Ordering::SeqCst) {
                 bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::TerminalSessionEnd::Ended
-            } else if outcome.2.is_some() {
+            } else if error.is_some() {
                 bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::TerminalSessionEnd::RecoveryRequired
             } else if pane.exited.load(Ordering::SeqCst) {
                 bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::TerminalSessionEnd::Draining
             } else { bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::TerminalSessionEnd::Active },
             terminal_session_ended: pane.execution.terminal_session_ended.load(Ordering::SeqCst),
-            capture_integrity: if pane.execution.output_drained.load(Ordering::SeqCst) {
+            capture_integrity: if pane.execution.capture_failure().is_some() {
+                bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::TerminalCaptureIntegrity::Incomplete
+            } else if pane.execution.durable_capture_complete() && pane.execution.output_drained.load(Ordering::SeqCst) {
                 bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::TerminalCaptureIntegrity::Complete
             } else if outcome.2.is_some() { bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::TerminalCaptureIntegrity::Incomplete
             } else { bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::TerminalCaptureIntegrity::Capturing },
@@ -387,7 +445,7 @@ pub(crate) fn status(reference: &ExecutionRef) -> Result<ExecutionStatus, Execut
                 Some(Ok(()))
             )),
             execution: reference.clone(),
-            phase: if outcome.2.is_some() {
+            phase: if error.is_some() {
                 ExecutionPhase::Failed
             } else if pane.exited.load(Ordering::SeqCst) {
                 ExecutionPhase::Exited
@@ -396,18 +454,76 @@ pub(crate) fn status(reference: &ExecutionRef) -> Result<ExecutionStatus, Execut
             },
             exit_code: if outcome.1.is_none() { outcome.0 } else { None },
             signal: outcome.1.clone(),
-            error: outcome.2.clone(),
-            output_drained: pane.execution.output_drained.load(Ordering::SeqCst),
-            output_watermark: pane.execution.output_watermark.load(Ordering::SeqCst),
+            error,
+            output_drained: pane.execution.output_drained.load(Ordering::SeqCst) && pane.execution.durable_capture_complete(),
+            output_watermark: pane.execution.durable_watermark(),
         })
     })
 }
 
 pub(crate) fn screen(reference: &ExecutionRef) -> Result<ExecutionScreen, ExecutionError> {
+    screen_mode(reference, true)
+}
+
+/// Only the explicitly negotiated live presentation interface may call this.
+pub(crate) fn live_screen(reference: &ExecutionRef) -> Result<ExecutionScreen, ExecutionError> {
+    screen_mode(reference, false)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LiveRevision {
+    pub(crate) grid_revision: u64,
+    pub(crate) reset_revision: u64,
+    pub(crate) geometry_revision: u64,
+    pub(crate) projected_watermark: u64,
+    pub(crate) durable_watermark: u64,
+    pub(crate) capture_failure: Option<String>,
+}
+
+pub(crate) fn live_revision(reference: &ExecutionRef) -> Result<LiveRevision, ExecutionError> {
     with_pane(reference, |pane| {
+        let _size = pane.last_requested_size.lock().map_err(failed)?;
+        let grid = pane.terminal_grid.lock().map_err(failed)?;
+        let durable_watermark = match pane.execution.writer().map_err(failed)? {
+            Some(writer) => writer.progress().map_err(failed)?.boundary.bytes,
+            None => pane.execution.output_watermark.load(Ordering::SeqCst),
+        };
+        Ok(LiveRevision {
+            grid_revision: grid.grid().revision(),
+            reset_revision: grid.grid().reset_revision(),
+            geometry_revision: pane.execution.geometry_revision.load(Ordering::SeqCst),
+            projected_watermark: pane.execution.output_watermark.load(Ordering::SeqCst),
+            durable_watermark,
+            capture_failure: pane.execution.capture_failure(),
+        })
+    })
+}
+
+pub(crate) fn subscribe(
+    reference: &ExecutionRef,
+) -> Result<tokio::sync::watch::Receiver<()>, ExecutionError> {
+    with_pane(reference, |pane| Ok(pane.execution.subscribe()))
+}
+
+fn screen_mode(reference: &ExecutionRef, durable: bool) -> Result<ExecutionScreen, ExecutionError> {
+    let (screen, barrier) = with_pane(reference, |pane| {
         // Same first lock as the reader and resize path: geometry, grid and
         // watermark describe one committed output boundary, even after exit.
         let _size = pane.last_requested_size.lock().map_err(failed)?;
+        let barrier = if durable {
+            pane.execution
+                .writer()
+                .map_err(failed)?
+                .map(|writer| {
+                    writer
+                        .progress()
+                        .map(|progress| (writer, progress.projected))
+                })
+                .transpose()
+                .map_err(failed)?
+        } else {
+            None
+        };
         let stream = pane.terminal_grid.lock().map_err(failed)?;
         let grid = stream.grid();
         let snapshot = stream
@@ -418,18 +534,27 @@ pub(crate) fn screen(reference: &ExecutionRef) -> Result<ExecutionScreen, Execut
         if encoded_grid.len().saturating_add(text.len()) > super::RESPONSE_OUTPUT_BUDGET {
             return Err(failed("screen exceeds response budget"));
         }
-        Ok(ExecutionScreen {
-            execution: reference.clone(),
-            output_watermark: pane.execution.output_watermark.load(Ordering::SeqCst),
-            cols: snapshot.width,
-            rows: snapshot.height,
-            cursor_col: snapshot.cursor.col,
-            cursor_row: snapshot.cursor.row,
-            cursor_visible: snapshot.cursor.visible,
-            text,
-            encoded_grid,
-        })
-    })
+        Ok((
+            ExecutionScreen {
+                execution: reference.clone(),
+                output_watermark: pane.execution.output_watermark.load(Ordering::SeqCst),
+                cols: snapshot.width,
+                rows: snapshot.height,
+                cursor_col: snapshot.cursor.col,
+                cursor_row: snapshot.cursor.row,
+                cursor_visible: snapshot.cursor.visible,
+                text,
+                encoded_grid,
+            },
+            barrier,
+        ))
+    })?;
+    // The immutable coherent snapshot may be returned only after its exact
+    // projection is durable. No manager/geometry/parser/order lock survives.
+    if let Some((writer, ticket)) = barrier {
+        writer.wait_committed(ticket).map_err(failed)?;
+    }
+    Ok(screen)
 }
 
 pub(crate) fn validate_options(options: &ProgramOptions) -> Result<(), ExecutionError> {
@@ -620,6 +745,17 @@ pub(super) fn create_reserved(
     result
 }
 
+/// Drive plugin-local asynchronous live reads on the persistent owner runtime.
+pub(crate) fn drive_live<F>(future: F) -> Result<F::Output, ExecutionError>
+where
+    F: std::future::Future + Send,
+    F::Output: Send,
+{
+    let owner =
+        spawn_runtime_handle().ok_or_else(|| failed("pane execution runtime unavailable"))?;
+    drive_startup(&owner.1, future)
+}
+
 fn drive_startup<F>(
     runtime: &tokio::runtime::Handle,
     future: F,
@@ -719,12 +855,13 @@ pub(crate) fn resize_ordered(
     rows: u16,
 ) -> Result<(), ExecutionError> {
     with_pane(reference, |pane| {
-        if pane
-            .execution
-            .durable_capture
-            .lock()
-            .map_err(failed)?
-            .is_none()
+        if pane.execution.writer().map_err(failed)?.is_none()
+            && pane
+                .execution
+                .durable_capture
+                .lock()
+                .map_err(failed)?
+                .is_none()
         {
             return Err(failed(
                 "ordered-events-v1 capture is not available for this execution",
@@ -737,7 +874,43 @@ pub(crate) fn resize_ordered(
 
 pub(crate) fn resize(reference: &ExecutionRef, cols: u16, rows: u16) -> Result<(), ExecutionError> {
     validate_size(cols, rows)?;
-    with_pane(reference, |pane| {
+    let execution = with_pane(reference, |pane| Ok(Arc::clone(&pane.execution)))?;
+    let writer = execution.writer().map_err(failed)?;
+    if writer.is_none() {
+        return with_pane(reference, |pane| {
+            if pane.exited.load(Ordering::SeqCst) {
+                return Err(failed("execution has exited"));
+            }
+            let permit = Arc::clone(&pane.execution.admission)
+                .try_acquire_owned()
+                .map_err(failed)?;
+            if *pane.last_requested_size.lock().map_err(failed)? == (rows, cols) {
+                return Ok(());
+            }
+            let revision = pane.execution.geometry_revision.load(Ordering::SeqCst);
+            pane.resize_pty_admitted(rows, cols, Some(permit));
+            if pane.execution.geometry_revision.load(Ordering::SeqCst) == revision {
+                return Err(failed("terminal geometry could not be committed"));
+            }
+            Ok(())
+        });
+    }
+    // Capacity and the ordering fence are acquired without the runtime manager.
+    let reservation = writer
+        .as_ref()
+        .map(super::capture_writer::CaptureWriter::reserve_resize)
+        .transpose()
+        .map_err(failed)?;
+    let order = execution.capture_order.lock().map_err(failed)?;
+    if let Some(writer) = &writer {
+        writer.check_open().map_err(failed)?;
+        let boundary = writer.progress().map_err(failed)?.admitted.raw_end;
+        writer
+            .wait_projected_raw(boundary, Duration::from_secs(2))
+            .map_err(failed)?;
+    }
+    let mut ticket = None;
+    let result = with_pane(reference, |pane| {
         if pane.exited.load(Ordering::SeqCst) {
             return Err(failed("execution has exited"));
         }
@@ -745,10 +918,13 @@ pub(crate) fn resize(reference: &ExecutionRef, cols: u16, rows: u16) -> Result<(
             .try_acquire_owned()
             .map_err(failed)?;
         if *pane.last_requested_size.lock().map_err(failed)? == (rows, cols) {
+            if let Some(writer) = &writer {
+                ticket = Some(writer.progress().map_err(failed)?.projected);
+            }
             return Ok(());
         }
         let geometry_revision = pane.execution.geometry_revision.load(Ordering::SeqCst);
-        pane.resize_pty_admitted(rows, cols, Some(permit));
+        pane.resize_pty_under_order(rows, cols, Some(permit), reservation, &mut ticket);
         if pane.execution.geometry_revision.load(Ordering::SeqCst) == geometry_revision
             || *pane.last_requested_size.lock().map_err(failed)? != (rows, cols)
         {
@@ -756,7 +932,13 @@ pub(crate) fn resize(reference: &ExecutionRef, cols: u16, rows: u16) -> Result<(
         }
         pane.execution.notify();
         Ok(())
-    })
+    });
+    drop(order);
+    result?;
+    if let (Some(writer), Some(ticket)) = (writer, ticket) {
+        writer.wait_committed(ticket).map_err(failed)?;
+    }
+    Ok(())
 }
 
 pub(crate) fn presentation_wait_capabilities()
@@ -969,14 +1151,60 @@ async fn await_cleanup_acknowledgement(
     }
 }
 
+/// Live human-input acknowledgment: PTY write/flush only, never durability or
+/// application consumption. Admission is bounded and the manager lock is released
+/// before waiting. A timeout is uncertain and must not trigger an automatic retry.
+pub(super) fn send_human_recorded_acknowledged(
+    reference: &ExecutionRef,
+    data: Vec<u8>,
+) -> Result<(), ExecutionError> {
+    let sink = super::recording_sink().ok_or_else(|| failed("recording sink unavailable"))?;
+    send_human_acknowledged(reference, data.clone())?;
+    // Fresh-effect caller owns deduplication. This enqueue is volatile; failure
+    // after PTY write is uncertain and must close the epoch, never replay input.
+    let result = sink.0.record_checked(
+        super::RecordingEventKind::PaneInputRaw,
+        super::RecordingPayload::Bytes { data },
+        super::RecordMeta {
+            session_id: Some(reference.session_id),
+            pane_id: Some(reference.pane_id),
+            client_id: None,
+        },
+    );
+    if let Err(error) = result {
+        with_pane(reference, |pane| {
+            pane.execution
+                .fail_capture(&format!("human input recording failed: {error}"));
+            Ok(())
+        })?;
+        return Err(failed(error));
+    }
+    Ok(())
+}
+
+pub(super) fn send_human_acknowledged(
+    reference: &ExecutionRef,
+    data: Vec<u8>,
+) -> Result<(), ExecutionError> {
+    if data.is_empty() || data.len() > 16_384 {
+        return Err(ExecutionError::InvalidOptions {
+            reason: "human input must contain 1..=16384 bytes".into(),
+        });
+    }
+    send_acknowledged(reference, data)
+}
+
 pub(super) fn send_acknowledged(
     reference: &ExecutionRef,
     data: Vec<u8>,
 ) -> Result<(), ExecutionError> {
     let (sender, receiver) = std::sync::mpsc::sync_channel(1);
     with_pane(reference, |pane| {
-        if pane.exited.load(Ordering::SeqCst) {
-            return Err(failed("execution exited before input admission"));
+        if pane.exited.load(Ordering::SeqCst)
+            || pane.execution.terminal_session_ended.load(Ordering::SeqCst)
+            || pane.execution.capture_failure().is_some()
+        {
+            return Err(failed("execution is not accepting input"));
         }
         let permit = Arc::clone(&pane.execution.admission)
             .try_acquire_owned()
@@ -1013,6 +1241,56 @@ fn install_reserved_capture(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn execution_keeps_live_drain_and_committed_capture_distinct() {
+        let root = tempfile::tempdir().unwrap();
+        let capture = super::super::durable_capture::DurableCapture::create(root.path()).unwrap();
+        let (writer, mut owner) =
+            super::super::capture_writer::CaptureWriter::start(capture).unwrap();
+        let execution = super::ExecutionCapture::default();
+        *execution.capture_writer.lock().unwrap() = Some(writer.clone());
+        let ticket = writer
+            .reserve_output()
+            .unwrap()
+            .output(b"tail".to_vec())
+            .unwrap();
+        writer.wait_committed(ticket).unwrap();
+        // Disk may run ahead of projection, but v4 status cannot claim unseen
+        // projected bytes. Nor does observed live EOF imply durable clean EOF.
+        assert_eq!(execution.durable_watermark(), 0);
+        execution.output_watermark.store(4, super::Ordering::SeqCst);
+        assert_eq!(execution.durable_watermark(), 4);
+        execution
+            .output_drained
+            .store(true, super::Ordering::SeqCst);
+        assert!(!execution.durable_capture_complete());
+        let end = writer.reserve_end().unwrap().end(None).unwrap();
+        writer.wait_committed(end).unwrap();
+        assert!(execution.durable_capture_complete());
+        owner.take().join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn execution_capture_failure_never_acknowledges_clean_completion() {
+        let root = tempfile::tempdir().unwrap();
+        let capture = super::super::durable_capture::DurableCapture::create(root.path()).unwrap();
+        let (writer, mut owner) =
+            super::super::capture_writer::CaptureWriter::start(capture).unwrap();
+        let execution = super::ExecutionCapture::default();
+        *execution.capture_writer.lock().unwrap() = Some(writer.clone());
+        execution
+            .output_drained
+            .store(true, super::Ordering::SeqCst);
+        writer.fail("injected persistence failure");
+        assert!(!execution.durable_capture_complete());
+        assert_eq!(
+            execution.capture_failure().as_deref(),
+            Some("injected persistence failure")
+        );
+        assert!(writer.reserve_resize().is_err());
+        owner.take().join().unwrap();
+    }
+
     #[test]
     fn resize_barrier_waits_for_committed_projection_not_capture_or_early_watermark() {
         let execution = std::sync::Arc::new(super::ExecutionCapture::default());

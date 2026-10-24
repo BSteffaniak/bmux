@@ -16,6 +16,14 @@ impl ProcessStore {
         Ok(Self { root })
     }
 
+    /// Read-only access never creates or synchronizes authoritative storage.
+    /// Missing/corrupt state is reported by load, never treated as a fresh run.
+    pub(crate) fn existing(recordings_root: &Path) -> Self {
+        Self {
+            root: recordings_root.join("process-runs-v4"),
+        }
+    }
+
     pub(crate) fn load(&self, run_id: Uuid) -> Result<RunStatus> {
         let bytes = std::fs::read(self.path(run_id)).context("reading process run metadata")?;
         let value: RunStatus =
@@ -324,6 +332,14 @@ mod tests {
             capture_finalized: false,
             errors: vec![],
         }
+    }
+
+    #[test]
+    fn read_only_store_never_initializes_missing_authority() {
+        let root = std::env::temp_dir().join(format!("bmux-process-missing-{}", Uuid::new_v4()));
+        let store = ProcessStore::existing(&root);
+        assert!(store.load(Uuid::new_v4()).is_err());
+        assert!(!root.exists());
     }
 
     #[test]

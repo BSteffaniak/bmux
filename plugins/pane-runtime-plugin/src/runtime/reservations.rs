@@ -426,12 +426,15 @@ pub(crate) fn reconcile(
         let root = store
             .root
             .join(format!("capture-{}", reference.execution_token));
+        let recovering = current.is_err();
         let boundary = if root.exists() {
-            Some(
+            Some(if recovering {
+                super::durable_capture::DurableCapture::validate_recovery(&root).map_err(failed)?
+            } else {
                 super::durable_capture::DurableCapture::read(&root, 0, 1)
                     .map_err(failed)?
-                    .0,
-            )
+                    .0
+            })
         } else {
             None
         };
