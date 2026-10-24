@@ -24,6 +24,7 @@ use std::future::Future;
 use std::io::{Read, Seek, SeekFrom};
 use std::sync::Arc;
 
+pub(crate) const PEER_READ_OPERATION: &str = "cluster-peer-read/v1/read_linearizable";
 const RAFT_RPC_DOMAIN: &[u8] = b"bmux.cluster.raft-rpc.v1\0";
 const DECODER_PROBE_OPERATION: &str = "capability-publication-decoder-v1";
 
@@ -709,8 +710,38 @@ where
         &self,
         endpoint: &str,
     ) -> Result<ControlStateView, ControlServiceError> {
+        let fail = |reason: String| ControlServiceError::RuntimeUnavailable { reason };
+        let identity = crate::membership::load_node_identity(self.caller.as_ref())
+            .map_err(fail)?
+            .ok_or_else(|| fail("local node identity unavailable".into()))?;
+        let local = self.active()?.read_stale_view()?;
+        let leader = local
+            .members
+            .iter()
+            .find(|member| {
+                member.endpoint.as_deref() == Some(endpoint)
+                    && member.state
+                        == bmux_cluster_plugin_api::cluster_types::ClusterMemberState::Active
+            })
+            .ok_or_else(|| fail("read leader endpoint is not a committed active member".into()))?;
+        let proof = crate::endpoint::peer_authentication_proof(
+            self.caller.as_ref(),
+            endpoint,
+            &self.local_node_id.to_string(),
+            &leader.node_id,
+        )
+        .await
+        .map_err(|error| fail(error.to_string()))?;
+        let request = authenticated_request(
+            PEER_READ_OPERATION,
+            leader.node_id.parse().map_err(fail)?,
+            &identity,
+            proof,
+            encode_service_message(&()).map_err(|error| fail(error.to_string()))?,
+        )
+        .map_err(fail)?;
         let mut remote = EndpointDispatchClient::new(self.caller.as_ref(), endpoint);
-        bmux_cluster_plugin_api::cluster_control_state::client::read_linearizable(&mut remote)
+        bmux_cluster_plugin_api::cluster_peer_read::client::read_linearizable(&mut remote, request)
             .await
             .map_err(|error| ControlServiceError::RuntimeUnavailable {
                 reason: format!("leader read forwarding failed: {error}"),

@@ -73,6 +73,8 @@ interface pairing-types {
         endpoint_id: string,
         enabled: bool,
         endpoint_address: string?,
+        // Pinned device endpoint URIs, one per advertised direct address/relay.
+        endpoint_targets: list<string>,
     }
     record device {
         device_id: string,
@@ -110,6 +112,8 @@ interface pairing-types {
 @capability(CONNECTIONS_PAIRING)
 interface pairing-commands {
     command start-listener() -> pairing-types.listener-status;
+    // Local owner authorizes this exact host and invitation-bound device key.
+    command pair-endpoint(target: string, invitation: pairing-types.invitation) -> string;
     command stop-listener() -> pairing-types.listener-status;
     command create-invitation(device_key: string, ttl_seconds: u64, access: pairing-types.device-access) -> pairing-types.invitation;
     command redeem-invitation(invitation_id: string, secret: bytes, signature: bytes) -> pairing-types.device;
@@ -121,6 +125,7 @@ interface pairing-commands {
 
 @capability(CONNECTIONS_PAIRING)
 interface pairing-state {
+    query local-device-identity() -> string;
     query listener-status() -> pairing-types.listener-status;
     query current-provenance() -> pairing-types.stream-provenance;
     query list-devices() -> list<pairing-types.device>;

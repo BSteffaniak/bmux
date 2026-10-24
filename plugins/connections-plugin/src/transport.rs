@@ -610,32 +610,14 @@ fn certificate_fingerprint(certificate: &[u8]) -> String {
     value
 }
 
-async fn connect_iroh(
-    _config: &BmuxConfig,
-    paths: &ConfigPaths,
+async fn dial_device(
+    identity: &crate::identity::DeviceIdentity,
     target: &IrohTarget,
-) -> Result<BmuxClient, ConnectionError> {
-    if target.require_ssh_auth {
-        return Err(trust_failure(
-            target,
-            "legacy SSH-agent Iroh authentication is unsupported; pair a persistent device",
-        ));
-    }
-    let device_id = target.device_id.ok_or_else(|| {
-        trust_failure(
-            target,
-            "paired Iroh target requires ?device-id=<paired-device-uuid>; pair this runtime first",
-        )
-    })?;
-    if target.compression == CompressionMode::Zstd {
-        return Err(trust_failure(
-            target,
-            "admitted Iroh streams require uncompressed preamble; explicit zstd is unsupported",
-        ));
-    }
-    let identity =
-        crate::identity::DeviceIdentity::load_or_create(&paths.state_dir, &paths.runtime_dir)
-            .map_err(|error| connection_error(target, error))?;
+) -> Result<(iroh::Endpoint, iroh::endpoint::Connection)> {
+    anyhow::ensure!(
+        !target.require_ssh_auth && target.compression != CompressionMode::Zstd,
+        "unsupported device transport options"
+    );
     let mut builder = identity.endpoint_builder();
     if target.ip_addr.is_some() && target.relay_url.is_none() {
         builder = builder.clear_address_lookup().clear_relay_transports();
@@ -643,30 +625,68 @@ async fn connect_iroh(
     let endpoint = builder
         .alpns(vec![crate::device_client::alpn().to_vec()])
         .bind()
-        .await
-        .map_err(|error| connection_error(target, error))?;
-    let endpoint_id: EndpointId = target
-        .endpoint_id
-        .parse()
-        .map_err(|error| connection_error(target, error))?;
-    let mut address = EndpointAddr::new(endpoint_id);
+        .await?;
+    let mut address = EndpointAddr::new(target.endpoint_id.parse::<EndpointId>()?);
     if let Some(relay) = &target.relay_url {
-        address = address.with_relay_url(
-            relay
-                .parse()
-                .map_err(|error| connection_error(target, error))?,
-        );
+        address = address.with_relay_url(relay.parse()?);
     }
-    if let Some(ip_addr) = target.ip_addr {
-        address = address.with_ip_addr(ip_addr);
+    if let Some(addr) = target.ip_addr {
+        address = address.with_ip_addr(addr);
     }
     let connection = tokio::time::timeout(
         Duration::from_millis(target.connect_timeout_ms),
         endpoint.connect(address, crate::device_client::alpn()),
     )
-    .await
-    .map_err(|error| connection_error(target, error))?
-    .map_err(|error| connection_error(target, error))?;
+    .await??;
+    Ok((endpoint, connection))
+}
+
+pub async fn pair_endpoint(
+    paths: &ConfigPaths,
+    target: &IrohTarget,
+    invitation: &bmux_connections_plugin_api::pairing_types::Invitation,
+) -> Result<String> {
+    let identity =
+        crate::identity::DeviceIdentity::load_or_create(&paths.state_dir, &paths.runtime_dir)?;
+    anyhow::ensure!(
+        target.endpoint_id == invitation.endpoint_id
+            && identity.public_key() == invitation.device_key,
+        "invitation endpoint/device mismatch"
+    );
+    anyhow::ensure!(
+        target.device_id.is_none(),
+        "pair a public device endpoint without device-id"
+    );
+    let (endpoint, connection) = dial_device(&identity, target).await?;
+    let (stream, subject) = crate::device_client::admit(
+        &endpoint,
+        &connection,
+        &identity,
+        "",
+        Some(invitation),
+        Duration::from_millis(target.connect_timeout_ms),
+    )
+    .await?;
+    // The redeemed binding is local trust configuration, never membership state.
+    crate::outbound::remember(paths, &target.endpoint_id, &identity.public_key(), subject)?;
+    drop(stream);
+    endpoint.close().await;
+    Ok(target.reference.clone())
+}
+
+async fn connect_iroh(
+    _config: &BmuxConfig,
+    paths: &ConfigPaths,
+    target: &IrohTarget,
+) -> Result<BmuxClient, ConnectionError> {
+    let identity =
+        crate::identity::DeviceIdentity::load_or_create(&paths.state_dir, &paths.runtime_dir)
+            .map_err(|error| connection_error(target, error))?;
+    let device_id = crate::outbound::subject(paths, target, &identity)
+        .map_err(|_| trust_failure(target, "outbound host is not paired for this device"))?;
+    let (endpoint, connection) = dial_device(&identity, target)
+        .await
+        .map_err(|error| connection_error(target, error))?;
     let (stream, subject) = crate::device_client::admit(
         &endpoint,
         &connection,
@@ -685,7 +705,7 @@ async fn connect_iroh(
     BmuxClient::connect_with_bridge_stream(
         stream,
         Duration::from_millis(target.connect_timeout_ms.max(1)),
-        "bmux-connections-iroh".to_string(),
+        "bmux-connections-device".to_string(),
         subject,
     )
     .await

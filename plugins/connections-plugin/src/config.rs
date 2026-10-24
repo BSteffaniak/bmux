@@ -14,6 +14,8 @@ pub struct RemoteSettings {
     pub relay: RelayPolicy,
     pub startup_wait_ms: u64,
     pub allow_full_runtime_ingress: bool,
+    pub bind_addr: Option<std::net::SocketAddr>,
+    pub auto_start: bool,
 }
 
 impl Default for RemoteSettings {
@@ -22,6 +24,8 @@ impl Default for RemoteSettings {
             relay: RelayPolicy::Default,
             startup_wait_ms: 5_000,
             allow_full_runtime_ingress: false,
+            bind_addr: None,
+            auto_start: false,
         }
     }
 }
@@ -56,6 +60,12 @@ impl RemoteSettings {
             },
         )?;
         let remote = settings.remote;
+        if remote.auto_start
+            && (!remote.allow_full_runtime_ingress
+                || remote.bind_addr.is_none_or(|addr| addr.port() == 0))
+        {
+            bail!("auto_start requires explicit ingress permission and a fixed bind_addr");
+        }
         if !(1..=60_000).contains(&remote.startup_wait_ms) {
             bail!("remote.startup_wait_ms must be in 1..=60000");
         }
@@ -110,6 +120,8 @@ mod tests {
     #[test]
     fn invalid_settings_fail_closed() {
         for text in [
+            "[remote]\nauto_start = true",
+            "[remote]\nauto_start = true\nallow_full_runtime_ingress = true\nbind_addr = '127.0.0.1:0'",
             "[remote]\nstartup_wait_ms = 0",
             "[remote]\nstartup_wait_ms = 60001",
             "[remote]\nstartup_wait_ms = -1",

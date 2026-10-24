@@ -8,6 +8,7 @@ mod device_client;
 mod directory;
 mod identity;
 mod listener;
+mod outbound;
 mod pairing;
 mod storage;
 mod target;
@@ -75,7 +76,10 @@ impl ConnectionsPlugin {
             enabled: listener.is_some(),
             endpoint_address: listener
                 .as_ref()
-                .map(|listener| format!("{:?}", listener.status())),
+                .and_then(|listener| listener.targets().into_iter().next()),
+            endpoint_targets: listener
+                .as_ref()
+                .map_or_else(Vec::new, listener::Listener::targets),
         })
     }
 
@@ -93,6 +97,19 @@ impl ConnectionsPlugin {
                 "ingress_denied",
                 "explicit full-runtime ingress policy required",
             ));
+        }
+        // Auto-started listeners already retain their admission authority. An
+        // idempotent owner start must not re-enter host service dispatch merely
+        // to return status, nor retain the listener lock while reading status.
+        {
+            let listener = self
+                .listener
+                .try_lock()
+                .map_err(|_| ServiceResponse::error("busy", "listener transition in progress"))?;
+            if listener.is_some() {
+                drop(listener);
+                return self.listener_status();
+            }
         }
         let caller = bmux_plugin::TypedServiceCaller::from_service_context(context);
         let mut client = bmux_plugin::ServiceCallerDispatchClient::new(&caller);
@@ -126,7 +143,7 @@ impl ConnectionsPlugin {
             if listener.is_none() {
                 *listener = Some(
                     listener::Listener::start(
-                        runtime.endpoint_builder(),
+                        runtime.endpoint_builder().map_err(pairing_error)?,
                         pairing,
                         admission,
                         backend,
@@ -290,6 +307,31 @@ impl RustPlugin for ConnectionsPlugin {
         self.admission = Some(admission);
         self.pairing = Some(pairing);
         self.local_runtime = Some(local_runtime);
+        if self
+            .local_runtime
+            .as_ref()
+            .is_some_and(directory::LocalRuntime::auto_start)
+        {
+            let runtime = self.local_runtime.as_ref().expect("initialized runtime");
+            let pairing = Arc::clone(self.pairing.as_ref().expect("initialized pairing"));
+            let admission = Arc::clone(self.admission.as_ref().expect("initialized admission"));
+            let backend = bmux_ipc::IpcEndpoint::unix_socket(
+                target::context_paths(&context.connection).server_socket(),
+            );
+            // Local configuration explicitly enables this listener. Admission is
+            // still enforced by the backend; no unadmitted fallback is possible.
+            let builder = runtime
+                .endpoint_builder()
+                .map_err(|error| PluginCommandError::failed(error.to_string()))?;
+            *self.listener.get_mut() = Some(
+                block_on_connection(listener::Listener::start(
+                    builder, pairing, admission, backend,
+                ))
+                .map_err(|error| {
+                    PluginCommandError::failed(format!("listener startup failed: {error}"))
+                })?,
+            );
+        }
         Ok(EXIT_OK)
     }
 
@@ -304,6 +346,23 @@ impl RustPlugin for ConnectionsPlugin {
 
     fn invoke_service(&self, context: NativeServiceContext) -> ServiceResponse {
         bmux_plugin_sdk::route_service!(context, {
+            "pairing-state", "local-device-identity" => |(): (), ctx| {
+                let _owner = pairing_owner(ctx)?;
+                let paths = target::context_paths(&ctx.connection);
+                identity::DeviceIdentity::load_or_create(&paths.state_dir, &paths.runtime_dir)
+                    .map(|identity| identity.public_key()).map_err(pairing_error)
+            },
+            "pairing-commands", "pair-endpoint" => |request: pairing_requests::PairEndpointRequest, ctx| {
+                let _owner = pairing_owner(ctx)?;
+                let paths = target::context_paths(&ctx.connection);
+                let config = target::load_config(&ctx.connection).map_err(pairing_error)?;
+                let resolved = target::resolve_internal(&config, &request.target)
+                    .map_err(|_| ServiceResponse::error("invalid_target", "device endpoint required"))?;
+                let target::ResolvedTarget::Iroh(target) = resolved else {
+                    return Err(ServiceResponse::error("invalid_target", "device endpoint required"));
+                };
+                block_on_connection(transport::pair_endpoint(&paths, &target, &request.invitation)).map_err(pairing_error)
+            },
             "pairing-commands", "start-listener" => |(): (), ctx| { self.start_listener(ctx) },
             "pairing-commands", "stop-listener" => |(): (), ctx| { self.stop_listener(ctx) },
             "pairing-state", "listener-status" => |(): (), ctx| { let _owner = pairing_owner(ctx)?; self.listener_status() },
@@ -515,7 +574,10 @@ fn invoke_service(
         // dispatch has an ambiguous completion state, especially for
         // non-idempotent commands. Ambiguous or failed clients are discarded
         // instead of returning to the idle pool.
-        match tokio::time::timeout(
+        // Connection setup and each service invocation have independent budgets.
+        // A pooled client must not retain another invocation's request timeout.
+        let previous_timeout = client.set_request_timeout(remaining);
+        let response = tokio::time::timeout(
             remaining,
             client.invoke_service_raw(
                 &invocation.capability,
@@ -525,8 +587,9 @@ fn invoke_service(
                 invocation.payload,
             ),
         )
-        .await
-        {
+        .await;
+        client.set_request_timeout(previous_timeout);
+        match response {
             Ok(Ok(payload)) => Ok(payload),
             Ok(Err(error)) => {
                 client.mark_unhealthy();
@@ -746,6 +809,108 @@ mod tests {
         assert!(plugin.local_status().is_none());
         plugin.activate(context).unwrap();
         assert_eq!(plugin.local_status().unwrap(), first);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn configured_listener_restarts_at_stable_public_endpoint() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = test_paths(root.path());
+        std::fs::create_dir_all(&paths.state_dir).unwrap();
+        std::fs::create_dir_all(&paths.runtime_dir).unwrap();
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let address = socket.local_addr().unwrap();
+        drop(socket);
+        let settings = format!(
+            "[remote]\nallow_full_runtime_ingress = true\nauto_start = true\nbind_addr = '{address}'\n[remote.relay]\nmode = 'disabled'"
+        );
+        let context: NativeLifecycleContext = serde_json::from_value(serde_json::json!({
+            "plugin_id": "bmux.connections",
+            "host": { "product_name": "bmux", "product_version": "test", "plugin_api_version": bmux_plugin_sdk::CURRENT_PLUGIN_API_VERSION, "plugin_abi_version": bmux_plugin_sdk::CURRENT_PLUGIN_ABI_VERSION },
+            "connection": { "config_dir": paths.config_dir, "runtime_dir": paths.runtime_dir, "data_dir": paths.data_dir, "state_dir": paths.state_dir },
+            "settings": serde_json::to_string(&toml::from_str::<toml::Value>(&settings).unwrap()).unwrap()
+        })).unwrap();
+        let mut plugin = ConnectionsPlugin::default();
+        plugin.activate(context.clone()).unwrap();
+        let first = plugin.listener_status().unwrap();
+        assert!(first.enabled);
+        let _router = trusted_local_router();
+        let owner_start = service_context(&paths, "start-listener", Vec::new());
+        // Router accepts only provenance queries: redundant backend callbacks
+        // fail this test rather than hiding idempotency behind a permissive stub.
+        for _ in 0..2 {
+            assert_eq!(
+                plugin
+                    .start_listener(&owner_start)
+                    .unwrap()
+                    .endpoint_targets,
+                first.endpoint_targets
+            );
+        }
+        assert!(
+            first
+                .endpoint_targets
+                .contains(&format!("device://{}?addr={address}", first.endpoint_id))
+        );
+        plugin.deactivate(context.clone()).unwrap();
+        plugin.activate(context.clone()).unwrap();
+        assert_eq!(
+            plugin
+                .start_listener(&owner_start)
+                .unwrap()
+                .endpoint_targets,
+            first.endpoint_targets
+        );
+        assert_eq!(
+            plugin.listener_status().unwrap().endpoint_targets,
+            first.endpoint_targets
+        );
+        plugin.deactivate(context).unwrap();
+    }
+
+    #[test]
+    fn outbound_owner_api_rejects_admitted_origin() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = test_paths(root.path());
+        let _router = provenance_router(
+            bmux_clients_plugin_api::clients_identity::StreamProvenance::Admitted {
+                subject_id: uuid::Uuid::new_v4(),
+                lease_id: uuid::Uuid::new_v4(),
+            },
+        );
+        let plugin = ConnectionsPlugin::default();
+        let mut context = service_context(
+            &paths,
+            "local-device-identity",
+            bmux_plugin_sdk::encode_service_message(&()).unwrap(),
+        );
+        context.request.service.interface_id = "pairing-state".into();
+        assert_eq!(
+            plugin.invoke_service(context).error.unwrap().code,
+            "owner_required"
+        );
+        let invitation = bmux_connections_plugin_api::pairing_types::Invitation {
+            invitation_id: String::new(),
+            endpoint_id: String::new(),
+            device_key: String::new(),
+            secret: Vec::new(),
+            expires_at: 0,
+            access: bmux_connections_plugin_api::pairing_types::DeviceAccess::Denied,
+            possession_message: Vec::new(),
+        };
+        let mut context = service_context(
+            &paths,
+            "pair-endpoint",
+            bmux_plugin_sdk::encode_service_message(&pairing_requests::PairEndpointRequest {
+                target: "device://invalid".into(),
+                invitation,
+            })
+            .unwrap(),
+        );
+        context.request.service.interface_id = "pairing-commands".into();
+        assert_eq!(
+            plugin.invoke_service(context).error.unwrap().code,
+            "owner_required"
+        );
     }
 
     fn service_context(
@@ -1240,6 +1405,20 @@ mod tests {
         task.await.expect("server task join").expect("server run");
     }
 
+    async fn cached_test_client(
+        identity: &str,
+        deadline: tokio::time::Instant,
+    ) -> EndpointConnectionLease<BmuxClient> {
+        connection_pool()
+            .acquire(identity.to_owned(), deadline, || async {
+                Err::<BmuxClient, ConnectionError>(ConnectionError::Cancelled {
+                    target: "unexpected reconnect".into(),
+                })
+            })
+            .await
+            .unwrap()
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn local_endpoint_invokes_typed_service_end_to_end() {
         let root = tempfile::tempdir().expect("tempdir");
@@ -1253,7 +1432,12 @@ mod tests {
                 bmux_ipc::InvokeServiceKind::Query,
                 "echo/v1",
                 "echo",
-                |_route, _context, payload| async move { Ok(payload) },
+                |_route, _context, payload| async move {
+                    if payload == b"reused payload" {
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    }
+                    Ok(payload)
+                },
             )
             .expect("register service");
         let running = std::sync::Arc::clone(&server);
@@ -1299,6 +1483,13 @@ mod tests {
             .connection_identity(&BmuxConfig::default(), &paths);
         assert_eq!(connection_pool().endpoint_counts(&identity), (0, 1, 1));
 
+        // Seed a pooled client with a request timeout shorter than the next
+        // operation. Its setup/default budget must not cap that invocation.
+        let pool_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut pooled = cached_test_client(&identity, pool_deadline).await;
+        pooled.set_request_timeout(std::time::Duration::from_millis(1));
+        drop(pooled);
+
         let second = InvokeServiceRequest {
             invocation: bmux_connections_plugin_api::connection_types::ServiceInvocation {
                 target: "local".to_string(),
@@ -1307,7 +1498,11 @@ mod tests {
                 interface_id: "echo/v1".to_string(),
                 operation: "echo".to_string(),
                 payload: b"reused payload".to_vec(),
-                options: None,
+                options: Some(InvocationOptions {
+                    timeout_ms: 1_000,
+                    max_attempts: 1,
+                    retry_backoff_ms: 0,
+                }),
             },
         };
         let response = invoke_service(
@@ -1319,6 +1514,12 @@ mod tests {
         .expect("reused local invocation");
         assert_eq!(response, b"reused payload");
         assert_eq!(connection_pool().endpoint_counts(&identity), (0, 1, 1));
+        let mut pooled = cached_test_client(&identity, pool_deadline).await;
+        assert_eq!(
+            pooled.set_request_timeout(std::time::Duration::from_secs(5)),
+            std::time::Duration::from_millis(1)
+        );
+        drop(pooled);
 
         server.request_shutdown();
         task.await.expect("server task join").expect("server run");

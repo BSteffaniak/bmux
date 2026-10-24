@@ -196,7 +196,7 @@ pub fn resolve_internal(
     if target.starts_with("tls://") || target.starts_with("https://") {
         return parse_tls(target);
     }
-    if target.starts_with("iroh://") {
+    if target.starts_with("iroh://") || target.starts_with("device://") {
         return parse_iroh(target);
     }
     parse_ssh(target)
@@ -307,6 +307,7 @@ fn parse_tls(reference: &str) -> Result<ResolvedTarget, ConnectionError> {
 fn parse_iroh(reference: &str) -> Result<ResolvedTarget, ConnectionError> {
     let raw = reference
         .strip_prefix("iroh://")
+        .or_else(|| reference.strip_prefix("device://"))
         .ok_or_else(|| invalid(reference, "iroh target requires iroh://"))?;
     let (endpoint_id, query) = raw
         .split_once('?')
@@ -315,6 +316,12 @@ fn parse_iroh(reference: &str) -> Result<ResolvedTarget, ConnectionError> {
         return Err(invalid(reference, "iroh target requires endpoint id"));
     }
     let mut relay_url = None;
+    let strict = reference.starts_with("device://");
+    if strict {
+        endpoint_id
+            .parse::<iroh::EndpointId>()
+            .map_err(|_| invalid(reference, "device target requires a valid endpoint id"))?;
+    }
     let mut ip_addr = None;
     let mut require_ssh_auth = false;
     let mut device_id = None;
@@ -323,8 +330,13 @@ fn parse_iroh(reference: &str) -> Result<ResolvedTarget, ConnectionError> {
         for part in query.split('&').filter(|part| !part.is_empty()) {
             let (key, value) = part.split_once('=').unwrap_or((part, ""));
             match key {
-                "relay" if !value.is_empty() => relay_url = Some(value.to_string()),
-                "addr" if !value.is_empty() => {
+                "relay" if !value.is_empty() && relay_url.is_none() => {
+                    value
+                        .parse::<iroh::RelayUrl>()
+                        .map_err(|_| invalid(reference, "invalid relay URL"))?;
+                    relay_url = Some(value.to_string());
+                }
+                "addr" if !value.is_empty() && ip_addr.is_none() => {
                     ip_addr = Some(
                         value
                             .parse()
@@ -354,6 +366,12 @@ fn parse_iroh(reference: &str) -> Result<ResolvedTarget, ConnectionError> {
                     return Err(invalid(
                         reference,
                         "compression must be auto, none, or zstd",
+                    ));
+                }
+                _ if strict => {
+                    return Err(invalid(
+                        reference,
+                        "unknown or duplicate device endpoint option",
                     ));
                 }
                 _ => {}

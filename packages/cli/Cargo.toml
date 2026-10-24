@@ -435,8 +435,10 @@ image-sixel = [
 ]
 
 [dev-dependencies]
-bmux_workspaces_plugin_api = { workspace = true }
-gif                        = { workspace = true }
-serde_json                 = { workspace = true }
-serial_test                = { workspace = true }
-tempfile                   = { workspace = true }
+bmux_cluster_plugin_api     = { workspace = true }
+bmux_connections_plugin_api = { workspace = true }
+bmux_workspaces_plugin_api  = { workspace = true }
+gif                         = { workspace = true }
+serde_json                  = { workspace = true }
+serial_test                 = { workspace = true }
+tempfile                    = { workspace = true }

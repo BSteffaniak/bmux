@@ -3,6 +3,7 @@
 #![allow(clippy::multiple_crate_versions)]
 #![allow(clippy::wildcard_imports)] // Focused private modules expose a crate-internal domain facade.
 
+mod admission;
 pub(crate) mod attach_state;
 pub mod capability_publication;
 pub(crate) mod commands;
@@ -451,7 +452,29 @@ impl RustPlugin for ClusterPlugin {
         })
     }
 
+    fn register_contributions(
+        &self,
+        registrar: &mut bmux_plugin_sdk::ContributionRegistrar,
+    ) -> bmux_plugin_sdk::Result<()> {
+        registrar
+            .register(bmux_plugin_sdk::PluginContribution::Extension {
+                id: "cluster.stream-admitted-routes".into(),
+                extension_point: bmux_plugin::stream_admission::STREAM_ADMITTED_ROUTES_EXTENSION
+                    .into(),
+                payload: bmux_plugin_sdk::encode_service_message(&admission::routes())?,
+            })
+            .map_err(
+                |details| bmux_plugin_sdk::PluginError::InvalidNativeServiceOutput {
+                    plugin_id: "bmux.cluster".into(),
+                    details,
+                },
+            )
+    }
+
     fn invoke_service(&self, context: NativeServiceContext) -> ServiceResponse {
+        if let Err(response) = admission::authorize(&context) {
+            return response;
+        }
         if let Some(response) = invoke_native_consensus_service(&context) {
             return response;
         }
@@ -1474,6 +1497,9 @@ mod tests {
             operation: &str,
             request: &T,
         ) -> ServiceResponse {
+            let _origin = provenance_router(
+                bmux_clients_plugin_api::clients_identity::StreamProvenance::Local,
+            );
             let context = service_test_context(
                 self.fixture
                     .dir
@@ -1984,6 +2010,96 @@ mod tests {
             )
             .unwrap_err()
             .contains("expired")
+        );
+    }
+
+    #[test]
+    fn peer_read_proof_binds_query_target_operation_and_is_single_use() {
+        let verifier = FakeRuntime::default();
+        load_or_create_node_identity(&verifier).unwrap();
+        initialize_cluster(&verifier).unwrap();
+        let claimant = FakeRuntime::default();
+        let claimant_identity = load_or_create_node_identity(&claimant).unwrap();
+        complete_test_join(&verifier, &claimant, "peer-read-join");
+        let verifier_identity = load_or_create_node_identity(&verifier).unwrap();
+        let request = || {
+            let challenge = create_peer_auth_challenge(
+                &verifier,
+                &ClusterPeerChallengeRequest {
+                    claimant_node_id: claimant_identity.node_id().to_string(),
+                },
+            )
+            .unwrap();
+            let proof = create_peer_auth_proof(&claimant, challenge).unwrap();
+            consensus_network::authenticated_request(
+                consensus_network::PEER_READ_OPERATION,
+                *verifier_identity.node_id(),
+                &claimant_identity,
+                proof,
+                bmux_plugin_sdk::encode_service_message(&()).unwrap(),
+            )
+            .unwrap()
+        };
+        let valid = request();
+        let (_, query) = consensus_network::authenticate_request(
+            &verifier,
+            consensus_network::PEER_READ_OPERATION,
+            *verifier_identity.node_id(),
+            valid.clone(),
+        )
+        .unwrap();
+        bmux_plugin_sdk::decode_service_message::<()>(&query).unwrap();
+        assert!(
+            consensus_network::authenticate_request(
+                &verifier,
+                consensus_network::PEER_READ_OPERATION,
+                *verifier_identity.node_id(),
+                valid
+            )
+            .unwrap_err()
+            .contains("already consumed")
+        );
+        let mut wrong_payload = request();
+        wrong_payload.payload.push(1);
+        assert!(
+            consensus_network::authenticate_request(
+                &verifier,
+                consensus_network::PEER_READ_OPERATION,
+                *verifier_identity.node_id(),
+                wrong_payload
+            )
+            .is_err()
+        );
+        assert!(
+            consensus_network::authenticate_request(
+                &verifier,
+                "vote",
+                *verifier_identity.node_id(),
+                request()
+            )
+            .is_err()
+        );
+        let mut wrong_target = request();
+        wrong_target.target_node_id = claimant_identity.node_id().to_string();
+        assert!(
+            consensus_network::authenticate_request(
+                &verifier,
+                consensus_network::PEER_READ_OPERATION,
+                *verifier_identity.node_id(),
+                wrong_target
+            )
+            .is_err()
+        );
+        let mut forged = request();
+        forged.signature.fill(0);
+        assert!(
+            consensus_network::authenticate_request(
+                &verifier,
+                consensus_network::PEER_READ_OPERATION,
+                *verifier_identity.node_id(),
+                forged
+            )
+            .is_err()
         );
     }
 
@@ -2515,6 +2631,204 @@ mod tests {
     fn target_from_host_ref_accepts_string_variant() {
         let host = ClusterHostRef::Target("prod-a".to_string());
         assert_eq!(target_from_host_ref(&host).as_deref(), Some("prod-a"));
+    }
+
+    fn provenance_router(
+        origin: bmux_clients_plugin_api::clients_identity::StreamProvenance,
+    ) -> bmux_plugin::test_support::TestServiceRouterGuard {
+        provenance_router_with(move || origin.clone())
+    }
+
+    fn provenance_router_with(
+        origin: impl Fn() -> bmux_clients_plugin_api::clients_identity::StreamProvenance
+        + Send
+        + Sync
+        + 'static,
+    ) -> bmux_plugin::test_support::TestServiceRouterGuard {
+        bmux_plugin::test_support::install_test_service_router(Arc::new(
+            // Test router has a fixed by-value PluginError signature.
+            #[allow(clippy::result_large_err)]
+            move |_, _, _, _, interface, operation, payload| {
+                use bmux_clients_plugin_api::clients_identity;
+                if (interface, operation) != ("clients-identity/v1", "current-stream-provenance") {
+                    return Err(bmux_plugin_sdk::PluginError::UnsupportedHostOperation {
+                        operation: "test_router",
+                    });
+                }
+                bmux_plugin_sdk::service_contract::decode_for(
+                    interface,
+                    clients_identity::SERVICE_CONTRACT,
+                    &payload,
+                )?;
+                let response =
+                    bmux_plugin_sdk::encode_service_message(&Ok::<
+                        _,
+                        clients_identity::IdentityError,
+                    >(origin()))?;
+                Ok(bmux_plugin_sdk::service_contract::encode_response(
+                    &response,
+                ))
+            },
+        ))
+    }
+
+    #[test]
+    fn admitted_origin_cannot_invoke_admin_signing_or_control_services() {
+        use bmux_clients_plugin_api::clients_identity::StreamProvenance;
+        let _origin = provenance_router(StreamProvenance::Admitted {
+            subject_id: Uuid::new_v4(),
+            lease_id: Uuid::new_v4(),
+        });
+        for (interface, operation) in [
+            ("cluster-command/v1", "init"),
+            ("cluster-command/v1", "member_revoke"),
+            ("cluster-command/v1", "enrollment_token_create"),
+            ("cluster-command/v1", "join"),
+            ("cluster-command/v1", "leave_prepare"),
+            ("cluster-peer-auth/v1", "prove"),
+            ("cluster-control-command/v1", "mutate"),
+            ("cluster-query/v1", "members"),
+        ] {
+            let context = service_test_context("/unused", interface, operation, &(), None);
+            assert_eq!(
+                ClusterPlugin::default()
+                    .invoke_service(context)
+                    .error
+                    .unwrap()
+                    .code,
+                "cluster_admission_denied"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_revoked_and_cancelled_origins_fail_closed() {
+        use bmux_clients_plugin_api::clients_identity::StreamProvenance;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let revoked = Arc::new(AtomicBool::new(false));
+        let current_revoked = revoked.clone();
+        let origin_guard = provenance_router_with(move || {
+            // Models the host registry's live validate result, not cached
+            // admitted metadata: revocation changes provenance to Invalid.
+            if current_revoked.load(Ordering::SeqCst) {
+                StreamProvenance::Invalid
+            } else {
+                StreamProvenance::Admitted {
+                    subject_id: Uuid::nil(),
+                    lease_id: Uuid::nil(),
+                }
+            }
+        });
+        let context = service_test_context(
+            "/unused",
+            "cluster-command/v1",
+            "redeem_enrollment",
+            &(),
+            None,
+        );
+        assert!(admission::authorize(&context).is_ok());
+        revoked.store(true, Ordering::SeqCst);
+        assert!(admission::authorize(&context).is_err());
+        drop(origin_guard);
+        let _origin = provenance_router(StreamProvenance::HostInternal);
+        let mut context = service_test_context("/unused", "cluster-command/v1", "init", &(), None);
+        context.cancellation.cancel();
+        assert!(admission::authorize(&context).is_err());
+    }
+
+    #[test]
+    fn local_and_host_internal_preserve_lifecycle_access() {
+        use bmux_clients_plugin_api::clients_identity::StreamProvenance;
+        for origin in [StreamProvenance::Local, StreamProvenance::HostInternal] {
+            let _origin = provenance_router(origin);
+            let context = service_test_context("/unused", "cluster-command/v1", "init", &(), None);
+            assert!(admission::authorize(&context).is_ok());
+        }
+    }
+
+    #[test]
+    fn admitted_protocol_routes_require_independent_cluster_proofs() {
+        use bmux_clients_plugin_api::clients_identity::StreamProvenance;
+        let _origin = provenance_router(StreamProvenance::Admitted {
+            subject_id: Uuid::new_v4(),
+            lease_id: Uuid::new_v4(),
+        });
+        let fixture = ServiceTestConfigDir::create();
+        let config_dir = fixture.dir.to_str().unwrap();
+        let request = ClusterCommandRedeemEnrollmentRequest {
+            token: "forged-token".into(),
+            node_id: NodeId::from_secret_key(&iroh::SecretKey::generate()).to_string(),
+            public_key: iroh::SecretKey::generate().public().to_string(),
+            endpoint: None,
+            protocol: current_protocol_offer(),
+            possession_signature: vec![0; 64],
+        };
+        let context = service_test_context(
+            config_dir,
+            "cluster-command/v1",
+            "redeem_enrollment",
+            &request,
+            None,
+        );
+        assert!(admission::authorize(&context).is_ok());
+        for _ in 0..2 {
+            let response = ClusterPlugin::default().invoke_service(context.clone());
+            assert_eq!(response.error.unwrap().code, "redeem_enrollment_failed");
+        }
+        let request = ClusterCommandAcceptLeaveRequest {
+            leave_id: Uuid::new_v4().to_string(),
+            cluster_id: ClusterId::generate().to_string(),
+            node_id: request.node_id,
+            signature: vec![0; 64],
+        };
+        let context = service_test_context(
+            config_dir,
+            "cluster-command/v1",
+            "accept_leave",
+            &request,
+            None,
+        );
+        assert!(admission::authorize(&context).is_ok());
+        assert_eq!(
+            ClusterPlugin::default()
+                .invoke_service(context)
+                .error
+                .unwrap()
+                .code,
+            "accept_leave_failed"
+        );
+    }
+
+    #[test]
+    fn admitted_route_contributions_are_exact_proof_protocols() {
+        let routes = admission::routes();
+        assert_eq!(routes.len(), 11);
+        let declarations = ClusterPlugin::declared_services().unwrap();
+        for route in routes {
+            assert_eq!(route.kind, ServiceKind::Command);
+            assert!(
+                declarations
+                    .iter()
+                    .any(|service| service.capability.as_str() == route.capability
+                        && service.kind == route.kind
+                        && service.interface_id == route.interface_id)
+            );
+            assert!(
+                !["prove", "init", "join", "leave", "mutate", "member_revoke"]
+                    .contains(&route.operation.as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn advertised_device_endpoint_preserves_distinct_host_identity() {
+        let endpoint = format!(
+            "device://{}?device-id={}",
+            iroh::SecretKey::generate().public(),
+            Uuid::new_v4()
+        );
+        assert_eq!(validate_advertised_endpoint(&endpoint).unwrap(), endpoint);
+        assert!(validate_advertised_endpoint("device://not-a-key").is_err());
     }
 
     #[test]

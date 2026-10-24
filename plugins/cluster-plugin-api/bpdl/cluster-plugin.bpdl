@@ -815,6 +815,14 @@ interface cluster-peer-auth {
     command authenticate(proof: cluster-types.peer-auth-proof) -> cluster-types.authenticated-peer;
 }
 
+// Member-only forwarding uses a fresh single-use peer proof and a signature
+// bound to the read operation, receiver, and exact query payload.
+@capability(CLUSTER_AUTH)
+@interface-version(1)
+interface cluster-peer-read {
+    command read_linearizable(request: cluster-types.raft-rpc-request) -> result<cluster-types.control-state-view, cluster-types.control-service-error>;
+}
+
 @capability(CLUSTER_AUTH)
 @interface-version(1)
 interface cluster-raft-rpc {

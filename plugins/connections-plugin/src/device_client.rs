@@ -1027,13 +1027,6 @@ mod tests {
                 DeviceAccess::FullLocalRuntime,
             )
             .unwrap();
-        let device = pairing
-            .redeem(
-                &invitation.invitation_id,
-                &invitation.secret,
-                &identity.sign(&invitation.possession_message).to_bytes(),
-            )
-            .unwrap();
         let authority = Arc::new(AdmissionAuthority::new(Arc::clone(&pairing)));
         let backend = bmux_ipc::IpcEndpoint::unix_socket(paths.server_socket());
         let server = Arc::new(BmuxServer::new(backend.clone()));
@@ -1052,13 +1045,25 @@ mod tests {
         .await
         .unwrap();
         let address = listener.status().ip_addrs().next().copied().unwrap();
-        let target = format!(
-            "iroh://{}?addr={address}&device-id={}",
-            host.endpoint_id(),
-            device.device_id
-        );
+        let target = format!("device://{}?addr={address}", host.endpoint_id());
         let config = bmux_config::BmuxConfig::default();
         let target = crate::target::resolve_internal(&config, &target).unwrap();
+        assert!(
+            crate::transport::connect(&config, &paths, &target)
+                .await
+                .is_err()
+        );
+        let crate::target::ResolvedTarget::Iroh(ref device_target) = target else {
+            panic!("device target")
+        };
+        assert_eq!(
+            crate::transport::pair_endpoint(&paths, device_target, &invitation)
+                .await
+                .unwrap(),
+            device_target.reference
+        );
+        // Re-open the private durable map and device key on every connection.
+        let device = pairing.list_devices(&owner).unwrap().remove(0);
         let mut client = crate::transport::connect(&config, &paths, &target)
             .await
             .expect("generated proof admission and trusted-subject Hello");

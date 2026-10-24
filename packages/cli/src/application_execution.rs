@@ -791,6 +791,7 @@ mod tests {
     use crate::sandbox_meta::{SandboxManifest, SandboxManifestPaths, write_manifest};
 
     #[test]
+    #[serial_test::serial] // Capture checks the complete environment; serialize with environment-mutating tests.
     fn explicit_slot_capture_preserves_manifest_paths_and_artifact() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();

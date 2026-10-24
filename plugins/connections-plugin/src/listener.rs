@@ -66,6 +66,22 @@ impl Listener {
         Ok(Self { endpoint, task })
     }
 
+    pub fn targets(&self) -> Vec<String> {
+        let address = self.status();
+        let mut targets: Vec<_> = address
+            .ip_addrs()
+            .map(|addr| format!("device://{}?addr={addr}", address.id))
+            .collect();
+        targets.extend(
+            address
+                .relay_urls()
+                .map(|url| format!("device://{}?relay={url}", address.id)),
+        );
+        targets.sort();
+        targets.dedup();
+        targets
+    }
+
     pub fn status(&self) -> iroh::EndpointAddr {
         self.endpoint.addr()
     }

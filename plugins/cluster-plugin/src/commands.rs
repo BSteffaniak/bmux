@@ -191,7 +191,8 @@ pub fn run_cluster_join(context: &NativeCommandContext) -> Result<i32, String> {
             ))
         })
         .map_err(|error| format!("pre-promotion mutual peer authentication failed: {error}"))?;
-        let mut remote = endpoint::EndpointDispatchClient::new(context, issuer);
+        let mut remote =
+            endpoint::EndpointDispatchClient::for_membership_transition(context, issuer);
         tokio::task::block_in_place(|| {
             handle.block_on(
                 bmux_cluster_plugin_api::cluster_command::client::consensus_reconcile_members(
@@ -317,7 +318,8 @@ pub fn run_cluster_leave(context: &NativeCommandContext) -> Result<i32, String> 
             return Err("pre-leave peer authentication returned the wrong claimant".to_string());
         }
         if departing_voter {
-            let mut remote = endpoint::EndpointDispatchClient::new(context, issuer);
+            let mut remote =
+                endpoint::EndpointDispatchClient::for_membership_transition(context, issuer);
             tokio::task::block_in_place(|| {
                 handle.block_on(
                     bmux_cluster_plugin_api::cluster_command::client::consensus_remove_voter(

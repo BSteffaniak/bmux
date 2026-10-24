@@ -5,6 +5,7 @@ pub fn invoke_native_consensus_service(context: &NativeServiceContext) -> Option
         context.request.service.interface_id.as_str(),
         context.request.operation.as_str(),
     ) {
+        ("cluster-peer-read/v1", "read_linearizable") => invoke_peer_read(context),
         ("cluster-control-command/v1", "mutate") => invoke_control_mutation(context),
         ("cluster-control-state/v1", "read_linearizable") => invoke_control_read(context, true),
         ("cluster-control-state/v1", "read_stale") => invoke_control_read(context, false),
@@ -14,6 +15,33 @@ pub fn invoke_native_consensus_service(context: &NativeServiceContext) -> Option
         _ => return None,
     };
     Some(response)
+}
+
+fn invoke_peer_read(context: &NativeServiceContext) -> ServiceResponse {
+    let result: Result<_, String> = (|| {
+        let request: bmux_cluster_plugin_api::cluster_peer_read::client::ReadLinearizableRequest =
+            bmux_plugin_sdk::decode_service_message(&context.request.payload)
+                .map_err(|error| error.to_string())?;
+        let identity = load_node_identity(context)?
+            .ok_or_else(|| "cluster identity unavailable".to_string())?;
+        let (_, query) = consensus_network::authenticate_request(
+            context,
+            consensus_network::PEER_READ_OPERATION,
+            *identity.node_id(),
+            request.request,
+        )?;
+        // Query meaning is signed; no payload extensions or stale-read downgrade.
+        bmux_plugin_sdk::decode_service_message::<()>(&query).map_err(|error| error.to_string())?;
+        let node = active_node(context)?;
+        let runtime = tokio::runtime::Handle::try_current().map_err(|error| error.to_string())?;
+        Ok(tokio::task::block_in_place(|| {
+            runtime.block_on(node.read_linearizable_view())
+        }))
+    })();
+    match result {
+        Ok(result) => typed_result(&result),
+        Err(reason) => ServiceResponse::error("peer_read_denied", reason),
+    }
 }
 
 fn active_node(context: &NativeServiceContext) -> Result<consensus_runtime::ConsensusNode, String> {

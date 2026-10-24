@@ -358,6 +358,16 @@ impl BmuxClient {
         Self::connect_with_paths(&ConfigPaths::default(), client_name).await
     }
 
+    /// Set the response deadline for subsequent requests, independently of the
+    /// connection and handshake budget used when constructing this client.
+    /// Callers reusing a client across operations should set each operation's
+    /// remaining budget before dispatch; this does not retry an ambiguous call.
+    pub const fn set_request_timeout(&mut self, timeout: Duration) -> Duration {
+        let previous = self.timeout;
+        self.timeout = timeout;
+        previous
+    }
+
     /// Ping the server.
     ///
     /// # Errors
@@ -1933,6 +1943,30 @@ mod tests {
         fs::write(&path, "not-a-uuid").expect("principal file should be written");
         let error = load_or_create_principal_id(&paths).expect_err("invalid principal should fail");
         assert!(error.to_string().contains("invalid principal id"));
+    }
+
+    #[tokio::test]
+    async fn request_timeout_can_be_scoped_and_restored_without_changing_identity() {
+        let (stream, _peer) = tokio::io::duplex(8192);
+        let principal_id = Uuid::new_v4();
+        let mut client = BmuxClient {
+            stream: ClientStream::Bridge(ErasedIpcStream::new(Box::new(stream))),
+            timeout: Duration::from_millis(500),
+            next_request_id: 7,
+            principal_id,
+            negotiated_protocol: None,
+            checked_service_contracts: false,
+        };
+        let previous = client.set_request_timeout(Duration::from_secs(30));
+        assert_eq!(previous, Duration::from_millis(500));
+        assert_eq!(client.timeout, Duration::from_secs(30));
+        assert_eq!(
+            client.set_request_timeout(previous),
+            Duration::from_secs(30)
+        );
+        assert_eq!(client.timeout, Duration::from_millis(500));
+        assert_eq!(client.principal_id(), principal_id);
+        assert_eq!(client.next_request_id, 7);
     }
 
     #[tokio::test]

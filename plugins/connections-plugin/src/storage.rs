@@ -37,12 +37,24 @@ pub fn runtime_directory(state_dir: &Path, runtime_dir: &Path) -> Result<PathBuf
 /// a one-shot operation without first reading authoritative state.
 pub struct PairingStore {
     directory: PrivateDirectory,
+    record: &'static CStr,
+    lock: &'static CStr,
 }
 
 impl PairingStore {
     pub(crate) fn open(state_dir: &Path, runtime_dir: &Path) -> Result<Self> {
         Ok(Self {
             directory: PrivateDirectory::open(&runtime_directory(state_dir, runtime_dir)?)?,
+            record: c"pairing.json",
+            lock: c"pairing.lock",
+        })
+    }
+
+    pub(crate) fn outbound(state_dir: &Path, runtime_dir: &Path) -> Result<Self> {
+        Ok(Self {
+            directory: PrivateDirectory::open(&runtime_directory(state_dir, runtime_dir)?)?,
+            record: c"outbound.json",
+            lock: c"outbound.lock",
         })
     }
 
@@ -52,10 +64,9 @@ impl PairingStore {
     ) -> Result<T> {
         // Open a fresh lock fd per transaction: flock locks open descriptions,
         // so sharing a single fd would not serialize concurrent threads.
-        let lock = self.directory.open_file(
-            c"pairing.lock",
-            libc::O_RDWR | libc::O_CREAT | libc::O_NONBLOCK,
-        )?;
+        let lock = self
+            .directory
+            .open_file(self.lock, libc::O_RDWR | libc::O_CREAT | libc::O_NONBLOCK)?;
         check_private(&lock, false)?;
         loop {
             // SAFETY: lock owns a live fd. Closing it releases the lock on every return path.
@@ -67,7 +78,7 @@ impl PairingStore {
                 return Err(error).context("lock pairing store");
             }
         }
-        let original = self.directory.read_record(c"pairing.json", 1_048_576)?;
+        let original = self.directory.read_record(self.record, 1_048_576)?;
         let mut value = original.clone();
         let result = f(&mut value)?;
         if value.as_ref().is_some_and(|bytes| bytes.len() > 1_048_576) {
@@ -75,15 +86,11 @@ impl PairingStore {
         }
         if value != original {
             if let Some(bytes) = value {
-                self.directory.replace_record(c"pairing.json", &bytes)?;
+                self.directory.replace_record(self.record, &bytes)?;
             } else {
                 // SAFETY: checked directory fd and static NUL-terminated name.
                 if unsafe {
-                    libc::unlinkat(
-                        self.directory.handle.as_raw_fd(),
-                        c"pairing.json".as_ptr(),
-                        0,
-                    )
+                    libc::unlinkat(self.directory.handle.as_raw_fd(), self.record.as_ptr(), 0)
                 } != 0
                 {
                     return Err(std::io::Error::last_os_error()).context("remove pairing record");

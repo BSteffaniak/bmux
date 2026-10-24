@@ -32,8 +32,29 @@ impl LocalRuntime {
         self.settings.allow_full_runtime_ingress
     }
 
-    pub(crate) fn endpoint_builder(&self) -> iroh::endpoint::Builder {
-        self.identity.endpoint_builder()
+    pub(crate) const fn auto_start(&self) -> bool {
+        self.settings.auto_start
+    }
+
+    pub(crate) fn endpoint_builder(&self) -> anyhow::Result<iroh::endpoint::Builder> {
+        let mut builder = self.identity.endpoint_builder();
+        builder = match &self.settings.relay {
+            RelayPolicy::Default => builder,
+            RelayPolicy::Disabled => builder.clear_address_lookup().clear_relay_transports(),
+            RelayPolicy::Custom { urls } => {
+                let urls = urls
+                    .iter()
+                    .map(|url| url.parse())
+                    .collect::<Result<Vec<iroh::RelayUrl>, _>>()?;
+                builder
+                    .clear_address_lookup()
+                    .relay_mode(iroh::RelayMode::Custom(iroh::RelayMap::from_iter(urls)))
+            }
+        };
+        if let Some(addr) = self.settings.bind_addr {
+            builder = builder.clear_ip_transports().bind_addr(addr)?;
+        }
+        Ok(builder)
     }
 
     pub(crate) fn status(&self) -> LocalStatus {

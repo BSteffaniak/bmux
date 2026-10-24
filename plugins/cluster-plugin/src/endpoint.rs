@@ -27,7 +27,17 @@ impl<'a, C: ServiceCaller + ?Sized> EndpointDispatchClient<'a, C> {
         }
     }
 
-    #[cfg(test)]
+    /// Quorum transitions include learner catch-up and committed voter changes;
+    /// their operation budget is not the transport's 8-second connect default.
+    /// Never retry a consumed independent proof automatically.
+    pub fn for_membership_transition(caller: &'a C, endpoint: impl Into<String>) -> Self {
+        Self::new(caller, endpoint).with_options(InvocationOptions {
+            timeout_ms: 30_000,
+            max_attempts: 1,
+            retry_backoff_ms: 0,
+        })
+    }
+
     pub const fn with_options(mut self, options: InvocationOptions) -> Self {
         self.options = Some(options);
         self

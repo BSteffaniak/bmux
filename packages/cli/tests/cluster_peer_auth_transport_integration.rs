@@ -1,5 +1,6 @@
 mod support;
 
+use bmux_connections_plugin_api::{pairing_commands, pairing_state, pairing_types};
 use serial_test::serial;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -9,6 +10,70 @@ use support::{
     ProcessGuard, ServerEnv, assert_success, bmux_binary, combined_output, generate_ed25519_key,
     reserve_tcp_port,
 };
+
+async fn local_connection(server: &ServerEnv) -> bmux_client::BmuxClient {
+    bmux_client::BmuxClient::connect(
+        &bmux_ipc::IpcEndpoint::UnixSocket(server.runtime_dir.join("server.sock")),
+        Duration::from_secs(30),
+        "cluster-admission-integration",
+    )
+    .await
+    .expect("connect to isolated local owner endpoint")
+}
+
+async fn start_admitted_listener(server: &ServerEnv) -> String {
+    let mut connection = local_connection(server).await;
+    let status = pairing_commands::client::start_listener(&mut connection)
+        .await
+        .expect("start plugin-owned admitted listener");
+    assert!(status.enabled);
+    status
+        .endpoint_targets
+        .into_iter()
+        .find(|target| target.contains("127.0.0.1"))
+        .expect("listener advertises a pinned loopback target")
+}
+
+async fn assert_idempotent_listener_start(
+    connection: &mut bmux_client::BmuxClient,
+    expected_targets: &[String],
+) {
+    for _ in 0..2 {
+        let status = tokio::time::timeout(
+            Duration::from_secs(5),
+            pairing_commands::client::start_listener(connection),
+        )
+        .await
+        .expect("listener start completes within five seconds with active Raft")
+        .expect("owner idempotent listener start");
+        assert!(status.enabled);
+        assert_eq!(status.endpoint_targets, expected_targets);
+    }
+}
+
+async fn pair_runtime(issuer: &ServerEnv, joining: &ServerEnv, endpoint: &str) {
+    let mut joining_connection = local_connection(joining).await;
+    let key = pairing_state::client::local_device_identity(&mut joining_connection)
+        .await
+        .expect("read joining runtime public device key");
+    let mut issuer_connection = local_connection(issuer).await;
+    let invitation = pairing_commands::client::create_invitation(
+        &mut issuer_connection,
+        key,
+        60,
+        pairing_types::DeviceAccess::FullLocalRuntime,
+    )
+    .await
+    .expect("owner issues device-specific transport invitation");
+    let paired = pairing_commands::client::pair_endpoint(
+        &mut joining_connection,
+        endpoint.to_owned(),
+        invitation,
+    )
+    .await
+    .expect("redeem invitation and retain outbound pairing");
+    assert!(paired.starts_with("device://"));
+}
 
 fn create_enrollment_token(issuer: &ServerEnv, endpoint: &str) -> String {
     let init = issuer.run(&["cluster", "init", "--endpoint", endpoint]);
@@ -288,45 +353,58 @@ fn join_voter(
     assert!(combined_output(&retry).contains("joined cluster:"));
 }
 
-fn tls_cluster_config(own_port: u16, ports: &[u16; 3]) -> String {
+fn admitted_cluster_config(port: u16) -> String {
     format!(
-        "[general]\nserver_timeout = 30000\n\n[server.gateway]\nenabled = true\nlisten = \"127.0.0.1:{own_port}\"\nquick = true\n\n[connections.tls_trust]\nmode = \"trust_new\"\n\n[connections.targets.node-a]\ntransport = \"tls\"\nhost = \"127.0.0.1\"\nport = {}\nserver_name = \"localhost\"\nconnect_timeout_ms = 30000\nserver_start_mode = \"require_running\"\n\n[connections.targets.node-b]\ntransport = \"tls\"\nhost = \"127.0.0.1\"\nport = {}\nserver_name = \"localhost\"\nconnect_timeout_ms = 30000\nserver_start_mode = \"require_running\"\n\n[connections.targets.node-c]\ntransport = \"tls\"\nhost = \"127.0.0.1\"\nport = {}\nserver_name = \"localhost\"\nconnect_timeout_ms = 30000\nserver_start_mode = \"require_running\"\n",
-        ports[0], ports[1], ports[2]
+        "[general]\nserver_timeout = 30000\n\n[plugins.settings.\"bmux.connections\".remote]\nallow_full_runtime_ingress = true\nauto_start = true\nbind_addr = \"127.0.0.1:{port}\"\n\n[plugins.settings.\"bmux.connections\".remote.relay]\nmode = \"disabled\"\n"
     )
 }
 
 #[test]
 #[serial]
-fn three_real_tls_voters_form_membership_and_survive_one_node_restart() {
-    let ports = [reserve_tcp_port(), reserve_tcp_port(), reserve_tcp_port()];
+fn three_admitted_voters_form_membership_and_survive_one_node_restart() {
+    let runtime = tokio::runtime::Runtime::new().expect("test runtime");
     let mut harness =
         support::ClusterProcessHarness::new(["three-voter-a", "three-voter-b", "three-voter-c"]);
-    for (index, port) in ports.iter().copied().enumerate() {
+    for index in 0..harness.len() {
         harness
             .node(index)
-            .write_config(&tls_cluster_config(port, &ports));
+            .write_config(&admitted_cluster_config(reserve_tcp_port()));
     }
     harness.start_all();
+    let endpoints: Vec<_> = (0..harness.len())
+        .map(|index| runtime.block_on(start_admitted_listener(harness.node(index))))
+        .collect();
+    for (issuer, endpoint) in endpoints.iter().enumerate() {
+        for joining in 0..harness.len() {
+            if issuer != joining {
+                runtime.block_on(pair_runtime(
+                    harness.node(issuer),
+                    harness.node(joining),
+                    endpoint,
+                ));
+            }
+        }
+    }
 
     let init = harness
         .node(0)
-        .run(&["cluster", "init", "--endpoint", "node-a"]);
+        .run(&["cluster", "init", "--endpoint", &endpoints[0]]);
     assert_success(&init, "initialize real three-voter cluster");
-    let token_b = create_voter_enrollment_token(harness.node(0), "node-a");
+    let token_b = create_voter_enrollment_token(harness.node(0), &endpoints[0]);
     join_voter(
         harness.node(0),
         harness.node(1),
         &token_b,
-        "node-a",
-        "node-b",
+        &endpoints[0],
+        &endpoints[1],
     );
-    let token_c = create_voter_enrollment_token(harness.node(0), "node-a");
+    let token_c = create_voter_enrollment_token(harness.node(0), &endpoints[0]);
     join_voter(
         harness.node(0),
         harness.node(2),
         &token_c,
-        "node-a",
-        "node-c",
+        &endpoints[0],
+        &endpoints[2],
     );
 
     for index in 0..harness.len() {
@@ -340,6 +418,20 @@ fn three_real_tls_voters_form_membership_and_survive_one_node_restart() {
         );
     }
 
+    let mut owner_connection = runtime.block_on(local_connection(harness.node(2)));
+    let owner_status = runtime
+        .block_on(pairing_state::client::listener_status(
+            &mut owner_connection,
+        ))
+        .expect("read listener status with active three-voter Raft");
+    assert!(owner_status.enabled);
+    assert!(owner_status.endpoint_targets.contains(&endpoints[2]));
+    runtime.block_on(assert_idempotent_listener_start(
+        &mut owner_connection,
+        &owner_status.endpoint_targets,
+    ));
+    drop(owner_connection);
+
     harness.node_mut(2).kill();
     for index in 0..2 {
         let members = harness.node(index).run(&["cluster", "members"]);
@@ -352,6 +444,21 @@ fn three_real_tls_voters_form_membership_and_survive_one_node_restart() {
         );
     }
     harness.node_mut(2).restart();
+    let mut restarted_connection = runtime.block_on(local_connection(harness.node(2)));
+    let restarted_status = runtime
+        .block_on(pairing_state::client::listener_status(
+            &mut restarted_connection,
+        ))
+        .expect("restart restores admitted listener without manual intervention");
+    assert!(restarted_status.enabled);
+    assert_eq!(
+        restarted_status.endpoint_targets,
+        owner_status.endpoint_targets
+    );
+    runtime.block_on(assert_idempotent_listener_start(
+        &mut restarted_connection,
+        &owner_status.endpoint_targets,
+    ));
     // IPC readiness precedes Raft leader discovery after restart. Wait for that
     // specific transient state, while failing immediately on other read errors.
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
@@ -377,6 +484,10 @@ fn three_real_tls_voters_form_membership_and_survive_one_node_restart() {
             .count(),
         3
     );
+    runtime.block_on(assert_idempotent_listener_start(
+        &mut restarted_connection,
+        &owner_status.endpoint_targets,
+    ));
 }
 
 #[test]
@@ -425,20 +536,70 @@ fn shared_process_harness_supports_three_isolated_lifecycles_and_log_capture() {
 
 #[test]
 #[serial]
-fn tls_join_and_leave_require_real_mutual_peer_authentication() {
-    let port = reserve_tcp_port();
-    let mut issuer = ServerEnv::new("tls-issuer");
-    issuer.write_config(&format!(
-        "[server.gateway]\nenabled = true\nlisten = \"127.0.0.1:{port}\"\nquick = true\n"
-    ));
-    let mut joiner = ServerEnv::new("tls-joiner");
-    joiner.write_config(&format!(
-        "[connections.tls_trust]\nmode = \"trust_new\"\n\n[connections.targets.issuer]\ntransport = \"tls\"\nhost = \"127.0.0.1\"\nport = {port}\nserver_name = \"localhost\"\nserver_start_mode = \"require_running\"\n"
-    ));
-
+fn admitted_join_and_leave_require_real_mutual_peer_authentication() {
+    let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+    let mut issuer = ServerEnv::new("admitted-issuer");
+    let mut joiner = ServerEnv::new("admitted-joiner");
+    issuer.write_config(&admitted_cluster_config(reserve_tcp_port()));
+    joiner.write_config(&admitted_cluster_config(reserve_tcp_port()));
     issuer.start();
     joiner.start();
+    let endpoint = runtime.block_on(start_admitted_listener(&issuer));
+    runtime.block_on(pair_runtime(&issuer, &joiner, &endpoint));
+    let token = create_enrollment_token(&issuer, &endpoint);
+    runtime.block_on(assert_transport_is_not_cluster_authority(
+        &joiner, &endpoint,
+    ));
+    assert_join_and_leave(&issuer, &joiner, &token, &endpoint);
+}
 
-    let token = create_enrollment_token(&issuer, "issuer");
-    assert_join_and_leave(&issuer, &joiner, &token, "issuer");
+#[test]
+#[serial]
+fn legacy_tls_ingress_cannot_bypass_stream_admission() {
+    let server = ServerEnv::new("legacy-tls-admission-denial");
+    let port = reserve_tcp_port();
+    server.write_config(&format!(
+        "[server.gateway]\nenabled = true\nlisten = \"127.0.0.1:{port}\"\nquick = true\n"
+    ));
+    let output = server.run(&["server", "start", "--foreground-internal"]);
+    assert!(!output.status.success());
+    assert!(
+        combined_output(&output)
+            .contains("legacy remote ingress cannot establish trusted stream admission"),
+        "legacy ingress must fail closed: {}",
+        combined_output(&output)
+    );
+    assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_err());
+}
+
+async fn assert_transport_is_not_cluster_authority(joiner: &ServerEnv, endpoint: &str) {
+    use bmux_connections_plugin_api::{connection_types, connections_commands};
+    let mut connection = local_connection(joiner).await;
+    let payload = bmux_plugin_sdk::service_contract::encode(
+        bmux_cluster_plugin_api::cluster_command::INTERFACE_ID.as_str(),
+        bmux_cluster_plugin_api::cluster_command::SERVICE_CONTRACT,
+        &bmux_plugin_sdk::encode_service_message(
+            &bmux_cluster_plugin_api::cluster_command::client::InitRequest { endpoint: None },
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let result = connections_commands::client::invoke_service(
+        &mut connection,
+        connection_types::ServiceInvocation {
+            target: endpoint.to_owned(),
+            capability: "bmux.server_clusters.write".into(),
+            kind: connection_types::ServiceInvokeKind::InvokeCommand,
+            interface_id: "cluster-command/v1".into(),
+            operation: "init".into(),
+            payload,
+            options: None,
+        },
+    )
+    .await
+    .expect("local owner invocation envelope");
+    assert!(
+        result.is_err(),
+        "pairing must not expose cluster administration"
+    );
 }

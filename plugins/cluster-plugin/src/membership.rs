@@ -1804,7 +1804,7 @@ pub fn validate_advertised_endpoint(endpoint: &str) -> Result<&str, String> {
         match scheme {
             "tls" | "https" => validate_network_authority(endpoint, reference, false)?,
             "ssh" => validate_network_authority(endpoint, reference, true)?,
-            "iroh" => validate_iroh_endpoint(endpoint, reference)?,
+            "iroh" | "device" => validate_iroh_endpoint(endpoint, reference)?,
             _ => return Err(format!("unsupported advertised endpoint scheme '{scheme}'")),
         }
         return Ok(endpoint);

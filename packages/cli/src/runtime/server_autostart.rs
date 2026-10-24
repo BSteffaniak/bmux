@@ -1739,7 +1739,6 @@ fn command_error(result: &CommandResult) -> String {
 mod tests {
     use super::*;
     use std::sync::Mutex;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
@@ -1809,15 +1808,13 @@ mod tests {
     }
 
     fn temp_path(name: &str) -> PathBuf {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos();
-        std::env::temp_dir()
-            .join(format!(
-                "bmux-autostart-test-{}-{unique}",
-                std::process::id()
-            ))
+        // Reserve a unique directory atomically: parallel tests must not share
+        // timestamp-derived paths that another fixture can remove during repair.
+        tempfile::Builder::new()
+            .prefix("bmux-autostart-test-")
+            .tempdir()
+            .expect("isolated autostart test directory")
+            .keep()
             .join(name)
     }
 
