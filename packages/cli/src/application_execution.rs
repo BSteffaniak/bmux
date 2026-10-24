@@ -348,7 +348,9 @@ pub(crate) fn write_sandbox_handoff(root: &Path) -> Result<PathBuf> {
 /// fails closed: a slot's BMUX binary is not a bundled companion identity.
 /// `Ok(None)` means no execution-context selection was present. Ordinary
 /// `BMUX_CONFIG`, `BMUX_CONFIG_DIR`, `BMUX_BASE_CONFIG`, and
-/// `BMUX_NO_BASE_CONFIG` preferences alone are not execution identities.
+/// `BMUX_NO_BASE_CONFIG` preferences alone are not execution identities. Neither
+/// are pane hints, terminal capabilities, logging or build metadata. The default
+/// runtime name alone is neutral; non-default runtime selection requires a handoff.
 ///
 /// # Errors
 /// Returns an error for partial selectors, slots, invalid membership/layout,
@@ -366,9 +368,9 @@ pub fn recognize(
     }
     let Some(path) = explicit_descriptor.or(ambient.as_deref()) else {
         ensure!(
-            !captured.0.keys().any(|key| {
+            !captured.0.iter().any(|(key, value)| {
                 let key = key.to_string_lossy();
-                key.starts_with("BMUX_") && !is_config_preference(&key)
+                is_execution_selector(&key) && !(key == "BMUX_RUNTIME_NAME" && value == "default")
             }),
             "partial or unsupported BMUX execution context; refusing host fallback"
         );
@@ -409,6 +411,25 @@ pub fn recognize(
         bterm_configuration,
         environment,
     }))
+}
+
+// These select an endpoint, owned state, or attachment identity. Do not infer
+// execution authority from the BMUX_ namespace: pane hints, logging, terminal
+// capabilities and build-tool metadata are inherited by ordinary child apps.
+fn is_execution_selector(key: &str) -> bool {
+    matches!(
+        key,
+        "BMUX_RUNTIME_DIR"
+            | "BMUX_RUNTIME_NAME"
+            | "BMUX_DATA_DIR"
+            | "BMUX_STATE_DIR"
+            | "BMUX_LOG_DIR"
+            | "BMUX_TARGET"
+            | "BMUX_SOCKET"
+            | "BMUX_CONTROL_PLANE_URL"
+            | "BMUX_SESSION_ID"
+    ) || key.starts_with("BMUX_SLOT_")
+        || key.starts_with("BMUX_SANDBOX_")
 }
 
 fn is_config_preference(key: &str) -> bool {
@@ -720,7 +741,7 @@ fn validate_selectors(captured: &CapturedEnvironment, descriptor: &Descriptor) -
             "BMUX_NO_BASE_CONFIG" if value == "1" => continue,
             "BMUX_RUNTIME_NAME" if value == "default" => continue,
             "BMUX_TARGET" if value == "local" => continue,
-            _ if key.starts_with("BMUX_") => {
+            _ if is_execution_selector(&key) || is_config_preference(&key) => {
                 bail!("conflicting or unsupported sandbox selector: {key}")
             }
             _ => continue,
@@ -1074,6 +1095,49 @@ mod tests {
         env.0
             .insert("BTERM_CONFIG".into(), "missing-required.toml".into());
         assert!(capture_bterm_snapshot(&env, host.path()).is_err());
+    }
+
+    #[test]
+    fn ordinary_bmux_metadata_is_not_execution_authority() {
+        let mut env = CapturedEnvironment::default();
+        for (key, value) in [
+            ("BMUX_PANE", "pane-hint"),
+            ("BMUX_LOG_LEVEL", "debug"),
+            ("BMUX_IMAGE_PROTOCOL", "kitty"),
+            ("BMUX_NIX_TOOLCHAIN", "1"),
+            ("BMUX_RUNTIME_NAME", "default"),
+            ("BMUX_FUTURE_TERMINAL_HINT", "hint"),
+        ] {
+            env.0.insert(key.into(), value.into());
+            assert!(recognize(&env, None).unwrap().is_none(), "{key}");
+        }
+        let (_temp, path, mut sandbox) = fixture(false);
+        sandbox.0.extend(env.0.clone());
+        assert!(recognize(&sandbox, Some(&path)).unwrap().is_some());
+        for key in [
+            "BMUX_SLOT_NAME",
+            "BMUX_SANDBOX_ROOT",
+            "BMUX_RUNTIME_DIR",
+            "BMUX_DATA_DIR",
+            "BMUX_STATE_DIR",
+            "BMUX_LOG_DIR",
+            "BMUX_TARGET",
+            "BMUX_SOCKET",
+            "BMUX_CONTROL_PLANE_URL",
+            "BMUX_SESSION_ID",
+            "BMUX_RUNTIME_NAME",
+        ] {
+            let mut selected = env.clone();
+            selected
+                .0
+                .insert(key.into(), "unsupported-selection".into());
+            assert!(recognize(&selected, None).is_err(), "{key}");
+            let mut selected = sandbox.clone();
+            selected
+                .0
+                .insert(key.into(), "unsupported-selection".into());
+            assert!(recognize(&selected, Some(&path)).is_err(), "{key}");
+        }
     }
 
     #[test]

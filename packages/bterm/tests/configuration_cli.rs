@@ -388,6 +388,49 @@ fn typed_configuration_errors_do_not_echo_secret_values() {
 }
 
 #[test]
+fn ordinary_bmux_pane_environment_allows_managed_startup_configuration() {
+    let inspection = Inspection::new();
+    let root = inspection.root.join("managed");
+    let arguments = [
+        OsStr::new("--managed-root"),
+        root.as_os_str(),
+        OsStr::new("config"),
+        OsStr::new("explain"),
+    ];
+    let metadata = [
+        ("BMUX_PANE", OsStr::new("pane-hint")),
+        ("BMUX_LOG_LEVEL", OsStr::new("debug")),
+        ("BMUX_IMAGE_PROTOCOL", OsStr::new("kitty")),
+        ("BMUX_NIX_TOOLCHAIN", OsStr::new("1")),
+        ("BMUX_RUNTIME_NAME", OsStr::new("default")),
+    ];
+    let clean = inspection.inspect(&arguments, &[]);
+    let inherited = inspection.inspect(&arguments, &metadata);
+    assert!(
+        inherited.status.success(),
+        "{}",
+        String::from_utf8_lossy(&inherited.stderr)
+    );
+    assert!(clean.status.success());
+    assert_eq!(clean.stdout, inherited.stdout);
+    for key in [
+        "BMUX_SLOT_NAME",
+        "BMUX_RUNTIME_DIR",
+        "BMUX_SOCKET",
+        "BMUX_SANDBOX_ROOT",
+        "BMUX_CONTROL_PLANE_URL",
+    ] {
+        let mut selected = metadata.to_vec();
+        selected.push((key, OsStr::new("unsupported-selection")));
+        let output = inspection.inspect(&arguments, &selected);
+        assert!(
+            !output.status.success(),
+            "{key} must not fall back to managed execution"
+        );
+    }
+}
+
+#[test]
 fn explicit_slot_inspection_uses_manifest_roots_without_launching() {
     let inspection = Inspection::new();
     let binary = std::fs::canonicalize(env!("CARGO_BIN_EXE_bterm")).unwrap();
