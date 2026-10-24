@@ -3,6 +3,28 @@
 #[path = "bterm_architecture/mod.rs"]
 mod bterm_architecture;
 
+#[test]
+fn context_retarget_preserves_attachment_owned_decoration_lifetime() {
+    let source = include_str!("../src/runtime/attach/runtime.rs");
+    let retarget = source
+        .split("pub async fn retarget_attach_to_context(")
+        .nth(1)
+        .expect("context retarget implementation")
+        .split("\n}\n")
+        .next()
+        .expect("context retarget body");
+    assert!(
+        !retarget.contains("::close(") && !retarget.contains("decoration_lifetime ="),
+        "context retarget must update layout without retiring attachment-owned theme/preview state"
+    );
+    assert!(
+        source.contains(
+            "// Await the empty retirement barrier after all layout updates, also on error."
+        ),
+        "final attachment cleanup must still retire the decoration view"
+    );
+}
+
 /// Strip the `mod tests { ... }` block from a source file so
 /// downstream assertions only consider production code.
 ///

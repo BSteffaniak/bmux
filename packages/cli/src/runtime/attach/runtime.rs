@@ -6853,19 +6853,10 @@ pub async fn retarget_attach_to_context(
         to_context_id = %context_id,
         "attach.retarget.start"
     );
-    if let Err(error) = bmux_decoration_plugin_api::decoration_view_v1::client::close(
-        client,
-        view_state.decoration_lifetime,
-    )
-    .await
-    {
-        let error = typed_client_error(&error);
-        if !optional_appearance_absent(&error) {
-            return Err(error);
-        }
-    }
-    view_state.decoration_lifetime = Uuid::new_v4();
-    // Layout and scene baselines belong to this connection, not the target.
+    // The decoration view belongs to the attachment, not its current context.
+    // Retiring it here discards the theme owner's applied components/preview
+    // while leaving its selection initialized. Publish the new layout into the
+    // existing view instead; final attach cleanup owns the retirement barrier.
     let retarget_service_started = Instant::now();
     let geometry = selected_attach_geometry(view_state);
     let insets = resolved_attach_viewport_insets(geometry, &view_state.presentation_layouts);

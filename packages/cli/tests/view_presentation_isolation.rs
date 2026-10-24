@@ -157,6 +157,110 @@ fn hydrated(
 }
 
 #[tokio::test]
+async fn replacing_context_surfaces_preserves_configured_selected_and_preview_themes() {
+    let mut server = support::ServerEnv::new("theme-context-retarget");
+    std::fs::write(
+        server.config_dir.join("bmux.toml"),
+        "[plugins.settings.\"bmux.theme\"]\nappearance_themes = ['hacker']\ncomponent_themes = ['minimal']\n",
+    )
+    .expect("configured split theme");
+    server.start();
+    let mut client = connect(&server).await;
+    let lifetime = Uuid::new_v4();
+    let mut revision = 0;
+    let configured = current(&mut client).await;
+    assert_eq!(configured.selection, theme::Selection::Configured);
+
+    // Context changes replace all surfaces, not the attachment's decoration lifetime.
+    // Exercise both the declared split stack and a manually selected preset.
+    for selection in [
+        theme::Selection::Configured,
+        theme::Selection::Preset {
+            name: "hacker".into(),
+        },
+    ] {
+        let snapshot = current(&mut client).await;
+        if snapshot.selection != selection {
+            theme::client::select(&mut client, snapshot.revision, selection.clone())
+                .await
+                .expect("select dispatch")
+                .expect("select theme");
+        }
+        let expected = appearance(&mut client).await;
+        let first = Uuid::new_v4();
+        revision += 1;
+        layout(&mut client, lifetime, first, 30, revision).await;
+        let before = view::scene(&mut client)
+            .await
+            .expect("initial context scene");
+        assert!(!before.surfaces[&first].paint_commands.is_empty());
+        let second = Uuid::new_v4();
+        revision += 1;
+        layout(&mut client, lifetime, second, 30, revision).await;
+        let after = view::scene(&mut client)
+            .await
+            .expect("replacement context scene");
+        assert!(!after.surfaces.contains_key(&first));
+        assert_eq!(
+            after.surfaces[&second].paint_commands,
+            before.surfaces[&first].paint_commands
+        );
+        assert_eq!(appearance(&mut client).await, expected);
+        assert_eq!(current(&mut client).await.selection, selection);
+    }
+
+    let selected = current(&mut client).await;
+    let token = theme::client::begin_preview(&mut client, selected.revision)
+        .await
+        .expect("begin dispatch")
+        .expect("begin preview");
+    theme::client::preview(
+        &mut client,
+        token,
+        theme::Selection::Preset {
+            name: "minimal".into(),
+        },
+    )
+    .await
+    .expect("preview dispatch")
+    .expect("preview theme");
+    let preview_appearance = appearance(&mut client).await;
+    let pane = Uuid::new_v4();
+    revision += 1;
+    layout(&mut client, lifetime, pane, 30, revision).await;
+    let preview_scene = view::scene(&mut client)
+        .await
+        .expect("preview context scene");
+    assert!(!preview_scene.surfaces[&pane].paint_commands.is_empty());
+    assert_eq!(appearance(&mut client).await, preview_appearance);
+    theme::client::cancel_preview(&mut client, token)
+        .await
+        .expect("cancel dispatch")
+        .expect("cancel after context replacement");
+    assert_eq!(current(&mut client).await, selected);
+    let restored = view::scene(&mut client)
+        .await
+        .expect("restored context scene");
+    assert_ne!(
+        restored.surfaces[&pane].paint_commands,
+        preview_scene.surfaces[&pane].paint_commands
+    );
+    view::close(&mut client, lifetime)
+        .await
+        .expect("close dispatch")
+        .expect("close attachment");
+    assert!(
+        view::scene(&mut client)
+            .await
+            .expect("retired scene")
+            .surfaces
+            .is_empty()
+    );
+    drop(client);
+    server.stop();
+}
+
+#[tokio::test]
 async fn real_connections_keep_layout_theme_and_retained_lifetimes_private() {
     let mut server = support::ServerEnv::new("view-presentation-isolation");
     server.start();
