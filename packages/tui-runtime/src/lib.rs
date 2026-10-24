@@ -39,12 +39,14 @@ pub use command::{Command, CommandPolicy};
 pub use config::RuntimeConfig;
 pub use ids::{CommandKey, MessageKey, SubscriptionKey, TimerId};
 #[cfg(feature = "images")]
-pub use image_terminal_presenter::{ImagePresentationError, ImageTerminalPresenter};
+pub use image_terminal_presenter::{
+    AsyncImageTerminalPresenter, ImagePresentationError, ImageTerminalPresenter,
+};
 #[cfg(feature = "crossterm")]
 pub use input::{ManagedTerminalInput, TerminalInput};
 pub use invalidation::InvalidationSignal;
 pub use mailbox::{LatestSendError, LatestSendOutcome, LatestSender, SendError, TrySendError};
-pub use presenter::{HeadlessPresenter, PresentReport, Presenter, ResetReason};
+pub use presenter::{CancellableOutput, HeadlessPresenter, PresentReport, Presenter, ResetReason};
 pub use program::{Invalidation, Lifecycle, Program, RuntimeEvent, Update};
 pub use runtime::{Runtime, RuntimeError, RuntimeHandle, RuntimeOutput};
 pub use stats::{

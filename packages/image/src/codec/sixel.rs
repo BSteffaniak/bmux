@@ -250,8 +250,30 @@ fn paint_sixel_column(
 ///
 /// Uses a fixed 216-color palette (6x6x6 RGB cube).
 pub fn encode(pixels: &PixelBuffer) -> Option<Vec<u8>> {
+    encode_cancellable(pixels, || false).expect("uncancelled Sixel")
+}
+
+/// Encode with checkpoints inside band fill, palette and RLE traversal.
+///
+/// # Errors
+/// * Interrupted when cancellation is requested; no partial body is returned.
+pub fn encode_cancellable(
+    pixels: &PixelBuffer,
+    mut cancelled: impl FnMut() -> bool,
+) -> std::io::Result<Option<Vec<u8>>> {
+    let mut check = || {
+        if cancelled() {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "Sixel cancelled",
+            ))
+        } else {
+            Ok(())
+        }
+    };
+    check()?;
     if pixels.width == 0 || pixels.height == 0 || pixels.format == PixelFormat::Png {
-        return None;
+        return Ok(None);
     }
 
     let width = pixels.width as usize;
@@ -259,10 +281,14 @@ pub fn encode(pixels: &PixelBuffer) -> Option<Vec<u8>> {
     let bpp = match pixels.format {
         PixelFormat::Rgba8 => 4,
         PixelFormat::Rgb8 => 3,
-        PixelFormat::Png => return None,
+        PixelFormat::Png => return Ok(None),
     };
-    let pixel_count = width.checked_mul(height)?;
-    pixel_count.checked_mul(bpp)?;
+    let Some(pixel_count) = width.checked_mul(height) else {
+        return Ok(None);
+    };
+    if pixel_count.checked_mul(bpp).is_none() {
+        return Ok(None);
+    }
 
     let mut out = Vec::with_capacity(pixel_count);
 
@@ -271,6 +297,7 @@ pub fn encode(pixels: &PixelBuffer) -> Option<Vec<u8>> {
 
     // Build a simple 216-color palette (6x6x6 RGB cube).
     for r in 0..6u8 {
+        check()?;
         for g in 0..6u8 {
             for b in 0..6u8 {
                 let idx = (r as u16) * 36 + (g as u16) * 6 + (b as u16);
@@ -286,11 +313,12 @@ pub fn encode(pixels: &PixelBuffer) -> Option<Vec<u8>> {
     let num_bands = height.div_ceil(6);
     let mut band_data = SixelBand::new();
     for band in 0..num_bands {
-        band_data.fill(pixels, band, quantize_color);
+        band_data.fill(pixels, band, quantize_color, &mut check)?;
         let mut band_has_output = false;
 
         // Palette order is part of the established byte representation.
         for color_idx in 0..216 {
+            check()?;
             if !band_data.contains(color_idx) {
                 continue;
             }
@@ -305,11 +333,15 @@ pub fn encode(pixels: &PixelBuffer) -> Option<Vec<u8>> {
             // Emit sixel characters with run-length encoding.
             let mut i = 0;
             while i < columns.len() {
+                check()?;
                 let ch = columns[i];
                 let sixel_char = ch + 0x3F;
                 // Count consecutive identical characters.
                 let mut run = 1;
                 while i + run < columns.len() && columns[i + run] == ch {
+                    if run % 256 == 0 {
+                        check()?;
+                    }
                     run += 1;
                 }
                 if run > 3 {
@@ -332,7 +364,7 @@ pub fn encode(pixels: &PixelBuffer) -> Option<Vec<u8>> {
         }
     }
 
-    Some(out)
+    Ok(Some(out))
 }
 
 /// Quantize once, retaining the established round-to-nearest cube mapping.
@@ -365,10 +397,14 @@ impl SixelBand {
         pixels: &PixelBuffer,
         band: usize,
         mut quantize: impl FnMut([u8; 3]) -> usize,
-    ) {
+        check: &mut impl FnMut() -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
         for color in 0..216 {
             if self.contains(color) {
-                self.columns[color].fill(0);
+                for chunk in self.columns[color].chunks_mut(256) {
+                    check()?;
+                    chunk.fill(0);
+                }
             }
         }
         self.used.fill(0);
@@ -385,6 +421,9 @@ impl SixelBand {
                 break;
             }
             for x in 0..width {
+                if x % 256 == 0 {
+                    check()?;
+                }
                 let offset = (y * width + x) * bpp;
                 let Some(rgb) = pixels.data.get(offset..offset + 3) else {
                     continue;
@@ -406,12 +445,43 @@ impl SixelBand {
                 self.columns[color][x] |= 1 << bit;
             }
         }
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cancellable_encoding_preserves_wire_and_stops_inside_band_steps() {
+        let pixels = PixelBuffer {
+            width: 769,
+            height: 13,
+            format: PixelFormat::Rgba8,
+            data: (0..769 * 13 * 4).map(|i| (i % 251) as u8).collect(),
+        };
+        let expected = encode(&pixels).unwrap();
+        let mut total = 0;
+        let actual = encode_cancellable(&pixels, || {
+            total += 1;
+            false
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(actual, expected);
+        assert!(total > 216 * 3);
+        for stop in [1, 8, 20, total / 3, total / 2, total - 1] {
+            let mut steps = 0;
+            let error = encode_cancellable(&pixels, || {
+                steps += 1;
+                steps == stop
+            })
+            .unwrap_err();
+            assert_eq!(steps, stop);
+            assert_eq!(error.kind(), std::io::ErrorKind::Interrupted);
+        }
+    }
 
     #[test]
     fn band_work_quantizes_each_drawable_pixel_once_and_reuses_scratch() {
@@ -426,10 +496,17 @@ mod tests {
         let mut scratch = SixelBand::new();
         let mut quantizations = 0;
         for band in 0..(height as usize).div_ceil(6) {
-            scratch.fill(&pixels, band, |rgb| {
-                quantizations += 1;
-                quantize_color(rgb)
-            });
+            scratch
+                .fill(
+                    &pixels,
+                    band,
+                    |rgb| {
+                        quantizations += 1;
+                        quantize_color(rgb)
+                    },
+                    &mut || Ok(()),
+                )
+                .unwrap();
             assert_eq!(
                 scratch
                     .used
@@ -453,17 +530,29 @@ mod tests {
         for pixel in pixels.data.chunks_exact_mut(4) {
             pixel[3] = 127;
         }
-        scratch.fill(&pixels, 0, |_| {
-            panic!("transparent pixels must not be quantized")
-        });
+        scratch
+            .fill(
+                &pixels,
+                0,
+                |_| panic!("transparent pixels must not be quantized"),
+                &mut || Ok(()),
+            )
+            .unwrap();
         assert_eq!(scratch.used, [0; 4]);
         assert!(scratch.columns[180].iter().all(|&column| column == 0));
         pixels.data[..4].copy_from_slice(&[255, 0, 0, 128]);
         let mut quantizations = 0;
-        scratch.fill(&pixels, 0, |rgb| {
-            quantizations += 1;
-            quantize_color(rgb)
-        });
+        scratch
+            .fill(
+                &pixels,
+                0,
+                |rgb| {
+                    quantizations += 1;
+                    quantize_color(rgb)
+                },
+                &mut || Ok(()),
+            )
+            .unwrap();
         assert_eq!(quantizations, 1);
         assert_eq!(scratch.columns[180].as_ptr(), allocation);
         assert_eq!(scratch.columns[180][0], 1);
@@ -488,10 +577,17 @@ mod tests {
         };
         let mut scratch = SixelBand::new();
         let mut quantizations = 0;
-        scratch.fill(&pixels, 0, |rgb| {
-            quantizations += 1;
-            quantize_color(rgb)
-        });
+        scratch
+            .fill(
+                &pixels,
+                0,
+                |rgb| {
+                    quantizations += 1;
+                    quantize_color(rgb)
+                },
+                &mut || Ok(()),
+            )
+            .unwrap();
         assert_eq!(quantizations, 216);
         assert_eq!(scratch.used, [u64::MAX, u64::MAX, u64::MAX, (1 << 24) - 1]);
         assert_eq!(

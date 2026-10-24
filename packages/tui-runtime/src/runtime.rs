@@ -279,6 +279,8 @@ pub struct Runtime<P: Program, R> {
     commands: CommandScheduler<P::Message>,
     subscriptions: SubscriptionScheduler<P::Message>,
     last_presented: Option<Instant>,
+    pending_presentation: Option<(Instant, Instant)>,
+    pending_resize: Option<bmux_tui::geometry::Size>,
     next_ready_source: u8,
     next_application_source: u8,
     exiting: bool,
@@ -378,6 +380,8 @@ where
                 commands,
                 subscriptions,
                 last_presented: None,
+                pending_presentation: None,
+                pending_resize: None,
                 next_ready_source: 0,
                 next_application_source: 0,
                 exiting: false,
@@ -406,6 +410,29 @@ where
                 Err(error) => return Err(self.program_error(error).await),
             };
 
+            if self.pending_presentation.is_some() {
+                let ready = std::future::poll_fn(|cx| {
+                    std::task::Poll::Ready(
+                        match self.presenter.poll_present(cx, &mut self.program) {
+                            std::task::Poll::Ready(result) => Some(result),
+                            std::task::Poll::Pending => None,
+                        },
+                    )
+                })
+                .await;
+                if let Some(result) = ready
+                    && let Some((started, scheduled)) = self.pending_presentation.take()
+                    && let Err(error) = self.complete_presentation(result, started, scheduled)
+                {
+                    return Err(self.presenter_error(error).await);
+                }
+            }
+            if self.exiting && self.pending_presentation.is_some() {
+                self.presenter.cancel_present();
+                self.pending_presentation = None;
+                lock_unpoisoned(&self.control.state).dirty = false;
+                return Ok(self.finish().await);
+            }
             if self.presentation_due()
                 && let Err(error) = self.present()
             {
@@ -431,6 +458,12 @@ where
 
             tokio::select! {
                 biased;
+                delivery = std::future::poll_fn(|cx| self.presenter.poll_present(cx, &mut self.program)), if self.pending_presentation.is_some() => {
+                    if let Some((started, scheduled)) = self.pending_presentation.take()
+                        && let Err(error) = self.complete_presentation(delivery, started, scheduled) {
+                        return Err(self.presenter_error(error).await);
+                    }
+                }
                 terminal = self.terminal_rx.recv(), if !self.exiting => {
                     if let Some(event) = terminal
                         && let Err(error) = self.apply_admitted(event, QueueSource::TerminalFifo, RuntimeEvent::Terminal)
@@ -707,8 +740,12 @@ where
         }
         let update = result?;
         if let Some(size) = resize {
-            self.presenter.resize(size);
-            self.presenter.reset(ResetReason::Resize);
+            if self.pending_presentation.is_some() {
+                self.pending_resize = Some(size);
+            } else {
+                self.presenter.resize(size);
+                self.presenter.reset(ResetReason::Resize);
+            }
             let mut state = lock_unpoisoned(&self.control.state);
             state.reset = false;
             state.dirty = true;
@@ -759,6 +796,9 @@ where
     }
 
     fn presentation_due(&self) -> bool {
+        if self.pending_presentation.is_some() {
+            return false;
+        }
         let state = lock_unpoisoned(&self.control.state);
         let dirty = state.dirty;
         let frame_interval = state.frame_interval;
@@ -788,11 +828,33 @@ where
             drop(state);
             (reset, scheduled_at)
         };
+        if let Some(size) = self.pending_resize.take() {
+            self.presenter.resize(size);
+            self.presenter.reset(ResetReason::Resize);
+        }
         if reset {
             self.presenter.reset(ResetReason::Application);
         }
         let presentation_started = Instant::now();
-        let result = self.presenter.present(&mut self.program);
+        match self.presenter.start_present(&mut self.program) {
+            Ok(None) => {
+                self.pending_presentation = Some((presentation_started, scheduled_at));
+                Ok(())
+            }
+            result => self.complete_presentation(
+                result.map(|report| report.expect("immediate report")),
+                presentation_started,
+                scheduled_at,
+            ),
+        }
+    }
+
+    fn complete_presentation(
+        &mut self,
+        result: Result<crate::PresentReport, R::Error>,
+        presentation_started: Instant,
+        scheduled_at: Instant,
+    ) -> Result<(), R::Error> {
         let presented_at = Instant::now();
         self.record_presentation(
             presentation_started,
@@ -841,7 +903,7 @@ where
         } else {
             state.timers.values().min().copied()
         };
-        let presentation = if state.dirty {
+        let presentation = if state.dirty && self.pending_presentation.is_none() {
             Some(
                 state
                     .frame_interval
@@ -870,6 +932,7 @@ where
     }
 
     async fn finish(mut self) -> RuntimeOutput<P, R> {
+        self.presenter.cancel_present();
         self.close().await;
         RuntimeOutput {
             program: self.program,
@@ -879,6 +942,7 @@ where
     }
 
     async fn program_error(mut self, error: P::Error) -> RuntimeError<P::Error, R::Error, P, R> {
+        self.presenter.cancel_present();
         self.close().await;
         RuntimeError::Program {
             error,
@@ -891,6 +955,7 @@ where
     }
 
     async fn presenter_error(mut self, error: R::Error) -> RuntimeError<P::Error, R::Error, P, R> {
+        self.presenter.cancel_present();
         self.close().await;
         RuntimeError::Presenter {
             error,

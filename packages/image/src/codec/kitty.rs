@@ -3,6 +3,62 @@
 //! Kitty graphics uses APC sequences: `ESC _ G <key>=<value>;... ; <payload> ESC \`
 //! The first byte after `ESC _ ` is always `G`.
 
+pub mod shared_memory;
+
+/// Status of a complete Kitty graphics reply.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KittyReplyStatus<'a> {
+    /// The terminal consumed the image data.
+    Ok,
+    /// Terminal-supplied printable error text.
+    Error(&'a str),
+}
+
+/// A bounded, complete reply. Matching outstanding requests is the caller's job.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KittyReply<'a> {
+    pub image_id: u32,
+    pub placement_id: Option<u32>,
+    pub status: KittyReplyStatus<'a>,
+}
+
+/// Parse exactly one complete APC reply, never a stream or partial input.
+/// Unrecognized input remains owned by the caller. Maximum frame: 1024 bytes.
+pub fn parse_reply_frame(frame: &[u8]) -> Option<KittyReply<'_>> {
+    if frame.len() > 1024 {
+        return None;
+    }
+    let body = frame.strip_prefix(b"\x1b_G")?.strip_suffix(b"\x1b\\")?;
+    if !body.iter().all(|b| (0x20..=0x7e).contains(b)) {
+        return None;
+    }
+    let (headers, status) = std::str::from_utf8(body).ok()?.split_once(';')?;
+    let mut image_id = None;
+    let mut placement_id = None;
+    for field in headers.split(',') {
+        let (key, value) = field.split_once('=')?;
+        if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let value = value.parse::<u32>().ok()?;
+        match key {
+            "i" if image_id.is_none() && value != 0 => image_id = Some(value),
+            "p" if placement_id.is_none() => placement_id = Some(value),
+            _ => return None,
+        }
+    }
+    let status = match status {
+        "OK" => KittyReplyStatus::Ok,
+        error if error.starts_with('E') && error.contains(':') => KittyReplyStatus::Error(error),
+        _ => return None,
+    };
+    Some(KittyReply {
+        image_id: image_id?,
+        placement_id,
+        status,
+    })
+}
+
 use crate::model::{
     ImagePosition, KittyCommand, KittyDeleteSpecifier, KittyFormat, KittyPlacement, KittySourceRect,
 };
@@ -193,6 +249,23 @@ pub fn encode_transmit_chunks(
     width: u32,
     height: u32,
 ) -> Vec<Vec<u8>> {
+    encode_transmit_chunks_cancellable(image_id, format, data, width, height, || false)
+        .expect("uncancelled Kitty encoding")
+}
+
+/// Encode exact existing Kitty chunk bodies with bounded cancellation checks.
+/// No partial chunk collection is returned on cancellation.
+///
+/// # Errors
+/// * Returns `Interrupted` when cancellation is requested.
+pub fn encode_transmit_chunks_cancellable(
+    image_id: u32,
+    format: KittyFormat,
+    data: &[u8],
+    width: u32,
+    height: u32,
+    mut cancelled: impl FnMut() -> bool,
+) -> std::io::Result<Vec<Vec<u8>>> {
     let fmt = match format {
         KittyFormat::Rgb => 24,
         KittyFormat::Rgba => 32,
@@ -206,8 +279,8 @@ pub fn encode_transmit_chunks(
             let more = u8::from(index + 1 < chunk_count);
             let mut body = format!("Ga=t,i={image_id},f={fmt},s={width},v={height},m={more},q=2;")
                 .into_bytes();
-            super::base64::base64_encode_into(chunk, &mut body);
-            body
+            super::base64::base64_encode_into_cancellable(chunk, &mut body, &mut cancelled)?;
+            Ok(body)
         })
         .collect()
 }
@@ -288,6 +361,93 @@ pub use super::base64::{base64_decode, base64_encode};
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Parser is intentionally separate from input routing; tests exercise only
+    // complete frames and the caller retains all unclaimed input.
+    #[test]
+    fn reply_frame_parses_typed_success_and_error() {
+        let reply = parse_reply_frame(b"\x1b_Gi=42;OK\x1b\\").unwrap();
+        assert_eq!(reply.image_id, 42);
+        assert_eq!(reply.placement_id, None);
+        assert_eq!(reply.status, KittyReplyStatus::Ok);
+
+        let reply =
+            parse_reply_frame(b"\x1b_Gi=43,p=7;ENOENT: missing shared memory\x1b\\").unwrap();
+        assert_eq!(reply.image_id, 43);
+        assert_eq!(reply.placement_id, Some(7));
+        assert_eq!(
+            reply.status,
+            KittyReplyStatus::Error("ENOENT: missing shared memory")
+        );
+    }
+
+    #[test]
+    fn reply_frame_does_not_claim_input_queries_commands_or_partial_frames() {
+        let unclaimed: &[&[u8]] = &[
+            b"typed text",
+            b"\x1b[?62;c",
+            b"\x1b_Ga=q,i=42;AAAA\x1b\\",
+            b"\x1b_Gi=42;OK",
+            b"\x1b_Gi=42;OK\x1b",
+            b"x\x1b_Gi=42;OK\x1b\\",
+            b"\x1b_Gi=42;OK\x1b\\x",
+            b"\x1b_Gi=42;OK\x1b\\\x1b_Gi=43;OK\x1b\\",
+        ];
+        for frame in unclaimed {
+            assert!(parse_reply_frame(frame).is_none(), "{frame:?}");
+        }
+    }
+
+    #[test]
+    fn reply_frame_rejects_ambiguous_identifiers_and_malformed_status() {
+        let unclaimed: &[&[u8]] = &[
+            b"\x1b_G;OK\x1b\\",
+            b"\x1b_Gi=0;OK\x1b\\",
+            b"\x1b_Gi=4294967296;OK\x1b\\",
+            b"\x1b_Gi=42,i=43;OK\x1b\\",
+            b"\x1b_Gi=42,p=1,p=2;OK\x1b\\",
+            b"\x1b_Gi=42;\x1b\\",
+            b"\x1b_Gi=42;OK\n\x1b\\",
+            b"\x1b_Gi=42;\xff\x1b\\",
+        ];
+        for frame in unclaimed {
+            assert!(parse_reply_frame(frame).is_none(), "{frame:?}");
+        }
+    }
+
+    #[test]
+    fn reply_frame_bounds_error_payload_before_parsing() {
+        let mut frame = b"\x1b_Gi=42;EIO: ".to_vec();
+        frame.extend(std::iter::repeat_n(b'x', 4096));
+        frame.extend_from_slice(b"\x1b\\");
+        assert!(parse_reply_frame(&frame).is_none());
+    }
+
+    #[test]
+    fn native_png_chunk_cancellation_has_bounded_steps_and_identical_wire() {
+        let data = vec![0x91; 20_003];
+        let expected = encode_transmit_chunks(42, KittyFormat::Png, &data, 111, 45);
+        let mut checks = 0;
+        let actual =
+            encode_transmit_chunks_cancellable(42, KittyFormat::Png, &data, 111, 45, || {
+                checks += 1;
+                false
+            })
+            .unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(checks, expected.len() * 2);
+        for stop in 1..=checks {
+            let mut steps = 0;
+            let error =
+                encode_transmit_chunks_cancellable(42, KittyFormat::Png, &data, 111, 45, || {
+                    steps += 1;
+                    steps == stop
+                })
+                .unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::Interrupted);
+            assert_eq!(steps, stop);
+        }
+    }
 
     #[test]
     fn parse_transmit_command() {

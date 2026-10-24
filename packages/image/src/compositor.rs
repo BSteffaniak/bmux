@@ -41,6 +41,11 @@ pub struct KittyHostState {
     // never determine content identity or cause duplicate resource deletion.
     pub(super) resources: std::collections::HashMap<u64, u32>,
     /// Next host-side kitty image ID to allocate.
+    cancelled: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    #[cfg(feature = "kitty")]
+    shared_memory: crate::codec::kitty::shared_memory::Transport,
+    #[cfg(feature = "kitty")]
+    shared_memory_generation: u64,
     #[cfg(feature = "kitty")]
     next_host_id: u32,
     cache: cache::Cache,
@@ -65,6 +70,71 @@ pub struct KittyHostState {
 }
 
 impl KittyHostState {
+    pub(crate) fn set_cancellation(
+        &mut self,
+        cancelled: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    ) {
+        self.cancelled = cancelled;
+    }
+
+    pub(crate) fn cancellation(&self) -> Option<std::sync::Arc<std::sync::atomic::AtomicBool>> {
+        self.cancelled.clone()
+    }
+
+    pub(crate) fn check_cancelled(&self) -> std::io::Result<()> {
+        if self
+            .cancelled
+            .as_ref()
+            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire))
+        {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "image encoding cancelled",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+    /// Explicitly opt in to a host-local SHM probe. Only a matching successful
+    /// terminal reply enables uploads. Call once per physical connection, never
+    /// because TERM, SSH variables or a loopback socket suggest locality.
+    ///
+    /// # Errors
+    /// * Identifier exhaustion or output failure. After partial output the host
+    ///   must repair its stream; never append direct fallback to the failed APC.
+    #[cfg(feature = "kitty")]
+    pub fn begin_shared_memory_probe(
+        &mut self,
+        out: &mut impl Write,
+        now: std::time::Instant,
+    ) -> std::io::Result<bool> {
+        self.next_host_id = self.shared_memory.allocate_id(self.next_host_id)?;
+        self.shared_memory.begin_probe(out, self.next_host_id, now)
+    }
+
+    /// Claim only complete replies matching this connection's pending SHM IDs.
+    /// The runtime must preserve all other input and expire leases on a timer.
+    #[cfg(feature = "kitty")]
+    #[must_use]
+    pub fn handle_shared_memory_reply(&mut self, frame: &[u8], now: std::time::Instant) -> bool {
+        self.shared_memory.handle_reply(frame, now)
+    }
+
+    /// Release expired leases and invalidate uncertain host residency on the
+    /// next output. Deadlines are two seconds; pending bounds are 16 / 16 MiB.
+    #[cfg(feature = "kitty")]
+    pub fn expire_shared_memory(&mut self, now: std::time::Instant) {
+        self.shared_memory.expire(now);
+    }
+
+    /// Release pending leases on physical connection teardown only. Candidate
+    /// output/flush failure must use `invalidate_after_failed_output` instead.
+    /// SIGKILL before
+    /// terminal consumption can leave objects; no foreign orphan cleanup occurs.
+    #[cfg(feature = "kitty")]
+    pub fn abort_shared_memory(&mut self) {
+        self.shared_memory.abort();
+    }
     /// Place an already-validated PNG with protocol-native aspect-preserving scaling.
     /// One cell dimension is deliberately omitted so Kitty derives it from source
     /// aspect ratio. No CPU resize, letterbox raster, or decoded upload is needed.
@@ -356,6 +426,8 @@ impl KittyHostState {
     /// Invalidate uncertain host output without advancing committed scene state.
     /// Supply the candidate that may have partially reached the terminal.
     pub fn invalidate_after_failed_output(&mut self, candidate: &Self) {
+        #[cfg(feature = "kitty")]
+        self.shared_memory.invalidate();
         self.repair_ids.extend(self.resources.values().copied());
         self.repair_ids
             .extend(candidate.resources.values().copied());
@@ -413,6 +485,17 @@ impl KittyHostState {
     }
 
     fn emit_repair(&mut self, out: &mut impl Write) -> std::io::Result<()> {
+        self.check_cancelled()?;
+        #[cfg(feature = "kitty")]
+        {
+            self.shared_memory.repair_stream(out)?;
+            self.shared_memory.expire(std::time::Instant::now());
+            let generation = self.shared_memory.generation();
+            if self.shared_memory_generation != generation {
+                self.repair_ids.extend(self.resources.values().copied());
+                self.shared_memory_generation = generation;
+            }
+        }
         #[cfg(feature = "kitty")]
         if !self.repair_ids.is_empty() {
             for id in &self.repair_ids {
@@ -436,6 +519,8 @@ impl KittyHostState {
     /// Release every owned host resource, including retained invisible content.
     /// Perform on a candidate and commit only after flush succeeds.
     pub fn reset(&mut self, out: &mut impl Write) -> std::io::Result<()> {
+        // Scene reset is speculative. Connection leases survive until their
+        // ACK/deadline or an explicit physical-connection abort.
         self.repair_ids.extend(self.resources.values().copied());
         self.emit_repair(out)?;
         self.cache.clear();
@@ -451,7 +536,11 @@ impl KittyHostState {
         protocol: Option<crate::model::ImageProtocol>,
     ) -> std::io::Result<()> {
         if self.protocol != protocol {
-            self.reset(out)?;
+            // Protocol selection belongs to a speculative scene candidate,
+            // not physical connection lifetime. Never revoke pending leases.
+            self.repair_ids.extend(self.resources.values().copied());
+            self.emit_repair(out)?;
+            self.cache.clear();
             self.protocol = protocol;
         }
         self.emit_repair(out)
@@ -604,10 +693,7 @@ impl KittyHostState {
         if let Some(&host_id) = self.resources.get(&bmux_image_id) {
             Ok((host_id, false)) // Already transmitted.
         } else {
-            self.next_host_id = self
-                .next_host_id
-                .checked_add(1)
-                .ok_or_else(|| std::io::Error::other("kitty image ID space exhausted"))?;
+            self.next_host_id = self.shared_memory.allocate_id(self.next_host_id)?;
             let host_id = self.next_host_id;
             self.allocated_ids.insert(host_id);
             self.resources.insert(bmux_image_id, host_id);
@@ -745,7 +831,8 @@ pub(crate) fn render_image_clipped(
         let prepared = if let Some(fragment) = state.cache.find(image, shared, crop, size, host) {
             fragment
         } else {
-            let decoded = state.cache.decoded(image, shared)?;
+            let token = state.cancellation();
+            let decoded = state.cache.decoded(image, shared, token.as_deref())?;
             let (prepared_pixels, pixel_size) = if visible != destination {
                 let mut payload = crate::model::ImagePayload {
                     raw: None,
@@ -950,7 +1037,13 @@ fn emit_pixels(
                         "sixel placement exceeds pixel budget",
                     ));
                 }
-                let decoded = if pixels.format == crate::model::PixelFormat::Png {
+                let decoded = if pixels.format == crate::model::PixelFormat::Png
+                    && kitty_state.cancellation().is_some()
+                {
+                    clipping::decode_png_cancellable(&pixels.data, 64 * 1024 * 1024, || {
+                        kitty_state.check_cancelled().is_err()
+                    })?
+                } else if pixels.format == crate::model::PixelFormat::Png {
                     clipping::pixels(&crate::model::ImagePayload {
                         raw: None,
                         pixels: Some(pixels.clone()),
@@ -968,13 +1061,35 @@ fn emit_pixels(
                         .ok_or_else(|| std::io::Error::other("invalid RGBA image"))?,
                 };
                 scaled = crate::model::PixelBuffer {
-                    data: image::imageops::resize(
-                        &rgba,
-                        target_width,
-                        target_height,
-                        image::imageops::FilterType::Nearest,
-                    )
-                    .into_raw(),
+                    data: if kitty_state.cancellation().is_some() {
+                        let mut output = image::RgbaImage::new(target_width, target_height);
+                        for y in 0..target_height {
+                            kitty_state.check_cancelled()?;
+                            let sy = (((y as f32 + 0.5) * rgba.height() as f32
+                                / target_height as f32)
+                                .floor() as u32)
+                                .min(rgba.height() - 1);
+                            for x in 0..target_width {
+                                if x.is_multiple_of(256) {
+                                    kitty_state.check_cancelled()?;
+                                }
+                                let sx = (((x as f32 + 0.5) * rgba.width() as f32
+                                    / target_width as f32)
+                                    .floor() as u32)
+                                    .min(rgba.width() - 1);
+                                output.put_pixel(x, y, *rgba.get_pixel(sx, sy));
+                            }
+                        }
+                        output.into_raw()
+                    } else {
+                        image::imageops::resize(
+                            &rgba,
+                            target_width,
+                            target_height,
+                            image::imageops::FilterType::Nearest,
+                        )
+                        .into_raw()
+                    },
                     width: target_width,
                     height: target_height,
                     format: crate::model::PixelFormat::Rgba8,
@@ -983,7 +1098,9 @@ fn emit_pixels(
             } else {
                 pixels
             };
-            if let Some(sixel_data) = crate::codec::sixel::encode(pixels) {
+            if let Some(sixel_data) = crate::codec::sixel::encode_cancellable(pixels, || {
+                kitty_state.check_cancelled().is_err()
+            })? {
                 out.write_all(b"\x1bPq")?;
                 out.write_all(&sixel_data)?;
                 out.write_all(b"\x1b\\")?;
@@ -1016,13 +1133,41 @@ fn emit_pixels(
         }
         #[cfg(feature = "iterm2")]
         Some(crate::model::ImageProtocol::ITerm2) => {
-            let png = pixels_as_png(pixels)?;
+            let png = if kitty_state.cancellation().is_some()
+                && pixels.format != crate::model::PixelFormat::Png
+            {
+                let converted;
+                let rgba = if pixels.format == crate::model::PixelFormat::Rgb8 {
+                    let mut data = Vec::with_capacity(pixels.data.len() / 3 * 4);
+                    for row in pixels.data.chunks(pixels.width as usize * 3) {
+                        kitty_state.check_cancelled()?;
+                        for pixel in row.chunks_exact(3) {
+                            data.extend_from_slice(&[pixel[0], pixel[1], pixel[2], 255]);
+                        }
+                    }
+                    converted = crate::model::PixelBuffer {
+                        width: pixels.width,
+                        height: pixels.height,
+                        format: crate::model::PixelFormat::Rgba8,
+                        data,
+                    };
+                    &converted
+                } else {
+                    pixels
+                };
+                clipping::encode_rgba_png_cancellable(rgba, || {
+                    kitty_state.check_cancelled().is_err()
+                })?
+            } else {
+                pixels_as_png(pixels)?
+            };
             out.write_all(b"\x1b]1337;File=")?;
-            out.write_all(&crate::codec::iterm2::encode_body_with_cells(
+            out.write_all(&crate::codec::iterm2::encode_body_with_cells_cancellable(
                 &png,
                 image.cell_size.cols,
                 image.cell_size.rows,
-            ))?;
+                || kitty_state.check_cancelled().is_err(),
+            )?)?;
             out.write_all(b"\x07")?;
         }
         _ => {}
@@ -1122,10 +1267,24 @@ fn upload_kitty_data(
     }
     state.reserve_content(out, content_id, cost)?;
     let (host_id, transmit) = state.get_or_allocate(content_id)?;
-    if transmit {
-        for chunk in
-            crate::codec::kitty::encode_transmit_chunks(host_id, format, data, width, height)
-        {
+    if transmit
+        && !state.shared_memory.upload(
+            out,
+            host_id,
+            format,
+            data,
+            (width, height),
+            std::time::Instant::now(),
+        )?
+    {
+        for chunk in crate::codec::kitty::encode_transmit_chunks_cancellable(
+            host_id,
+            format,
+            data,
+            width,
+            height,
+            || state.check_cancelled().is_err(),
+        )? {
             out.write_all(b"\x1b_")?;
             out.write_all(&chunk)?;
             out.write_all(b"\x1b\\")?;

@@ -11,7 +11,7 @@ use crate::hit::HitMap;
 use crate::image::ImageContribution;
 use crate::image_scene::{ImageScene, ImageSceneDelta};
 use crate::paint::PaintCx;
-use crate::presentation::{PreparedPresentation, PresentationState};
+use crate::presentation::{PreparedPresentation, PresentationPhase, PresentationState};
 use crate::selection::SelectionScene;
 
 /// Statistics from one terminal draw.
@@ -58,6 +58,21 @@ impl<W: Write> Terminal<W> {
             writer,
             state: PresentationState::new(area),
         }
+    }
+
+    /// Fork committed authority into a staging terminal with a different writer.
+    /// The original remains authoritative until the caller acknowledges delivery.
+    #[must_use]
+    pub fn fork<V: Write>(&self, writer: V) -> Terminal<V> {
+        Terminal {
+            writer,
+            state: self.state.clone(),
+        }
+    }
+
+    /// Adopt an exactly delivered staging terminal's authority, retaining this writer.
+    pub fn acknowledge<V>(&mut self, staged: Terminal<V>) {
+        self.state = staged.state;
     }
 
     /// Return the terminal area.
@@ -244,33 +259,59 @@ impl<W: Write> Terminal<W> {
     ) -> io::Result<DrawStats> {
         let mut prepared = self.state.prepare(damage, render);
         if let Some(prepared) = &mut prepared {
-            configure(prepared)?;
+            PresentationPhase::Configure.measure(|| configure(prepared), Result::is_ok)?;
         }
+        self.draw_prepared_with_output_hooks(prepared, before, overlay)
+    }
+
+    /// Paint an owned frame without encoding or committing it.
+    pub fn prepare_frame(
+        &self,
+        damage: Damage,
+        render: impl FnOnce(&mut PaintCx<'_, '_>),
+    ) -> Option<PreparedPresentation> {
+        self.state.prepare(damage, render)
+    }
+
+    /// Encode and commit an owned prepared frame through this terminal's writer.
+    /// # Errors
+    /// Returns output or hook errors without committing failed output.
+    pub fn draw_prepared_with_output_hooks(
+        &mut self,
+        prepared: Option<PreparedPresentation>,
+        before: impl FnOnce(&mut W) -> io::Result<bool>,
+        overlay: impl FnOnce(&mut W, &ImageScene, &ImageSceneDelta) -> io::Result<()>,
+    ) -> io::Result<DrawStats> {
         let writer = &mut self.writer;
         self.state
             .present_prepared(prepared, |prepared, previous| {
                 writer.write_all(b"\x1b[?2026h")?;
                 let output: io::Result<DrawStats> = (|| {
                     let repaint = before(writer)?;
-                    let stats = if let Some(previous) = previous.filter(|_| !repaint) {
-                        write_ansi_frame_diff(
-                            writer,
-                            previous,
-                            prepared.buffer(),
-                            prepared.cursor(),
-                        )?
-                        .into()
-                    } else {
-                        write_ansi_frame(writer, prepared.buffer(), prepared.cursor())?;
-                        DrawStats::full(prepared.buffer().cells().len())
-                    };
+                    let stats = PresentationPhase::AnsiEncode.measure(
+                        || -> io::Result<DrawStats> {
+                            Ok(if let Some(previous) = previous.filter(|_| !repaint) {
+                                write_ansi_frame_diff(
+                                    writer,
+                                    previous,
+                                    prepared.buffer(),
+                                    prepared.cursor(),
+                                )?
+                                .into()
+                            } else {
+                                write_ansi_frame(writer, prepared.buffer(), prepared.cursor())?;
+                                DrawStats::full(prepared.buffer().cells().len())
+                            })
+                        },
+                        Result::is_ok,
+                    )?;
                     overlay(writer, prepared.image_scene(), prepared.image_delta())?;
                     Ok(stats)
                 })();
                 let end_result = writer.write_all(b"\x1b[?2026l");
                 let stats = output?;
                 end_result?;
-                writer.flush()?;
+                PresentationPhase::WriterFlush.measure(|| writer.flush(), Result::is_ok)?;
                 Ok(stats)
             })
             .map(|stats| {
@@ -298,6 +339,114 @@ impl<W: Write> Terminal<W> {
     }
 }
 
+/// Linux output owner opened independently from stdin/stdout.
+/// Uses nonblocking writes and at most 10ms poll waits, so cancellation never
+/// waits for a terminal consumer to drain. Dropping does not flush.
+#[cfg(target_os = "linux")]
+pub struct LinuxTerminalOutput(std::fs::File);
+
+#[cfg(target_os = "linux")]
+impl LinuxTerminalOutput {
+    /// Reopen the actual stdout tty with independent nonblocking flags.
+    ///
+    /// Does not use `/dev/tty`, which can differ from redirected stdout.
+    /// # Errors
+    /// Returns `Unsupported` for non-tty stdout or identity mismatch; otherwise
+    /// returns the procfs reopen/metadata error. No shared descriptor flags change.
+    pub fn open() -> io::Result<Self> {
+        Self::reopen_tty(libc::STDOUT_FILENO)
+    }
+
+    fn reopen_tty(fd: std::os::fd::RawFd) -> io::Result<Self> {
+        use std::os::{
+            fd::AsRawFd,
+            unix::fs::{MetadataExt, OpenOptionsExt},
+        };
+        // SAFETY: isatty only inspects the supplied descriptor.
+        if unsafe { libc::isatty(fd) } != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "stdout is not a tty",
+            ));
+        }
+        let source = std::fs::metadata(format!("/proc/self/fd/{fd}"))?;
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
+            .open(format!("/proc/self/fd/{fd}"))?;
+        let reopened = file.metadata()?;
+        // SAFETY: file owns a live descriptor for this entire call.
+        if unsafe { libc::isatty(file.as_raw_fd()) } != 1
+            || (source.dev(), source.ino(), source.rdev())
+                != (reopened.dev(), reopened.ino(), reopened.rdev())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "stdout tty identity changed",
+            ));
+        }
+        Ok(Self(file))
+    }
+
+    /// Deliver a complete terminal transaction with bounded cancellation latency.
+    /// Successful writes deliver to the kernel terminal queue; no `tcdrain` is
+    /// performed. Like `File::flush`, flushing a tty has no userspace buffer.
+    /// Partial output on failure requires a full repaint before reuse.
+    /// # Errors
+    /// Returns write/poll errors or `Interrupted` when cancellation is requested.
+    pub fn deliver(
+        &mut self,
+        bytes: &[u8],
+        cancelled: &std::sync::atomic::AtomicBool,
+    ) -> io::Result<()> {
+        use std::os::fd::AsRawFd;
+        use std::sync::atomic::Ordering;
+        let mut remaining = bytes;
+        while !remaining.is_empty() {
+            if cancelled.load(Ordering::Acquire) {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "presentation cancelled",
+                ));
+            }
+            let chunk = remaining.len().min(4096);
+            match self.0.write(&remaining[..chunk]) {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "terminal write returned zero",
+                    ));
+                }
+                Ok(count) => remaining = &remaining[count..],
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    let mut fd = libc::pollfd {
+                        fd: self.0.as_raw_fd(),
+                        events: libc::POLLOUT,
+                        revents: 0,
+                    };
+                    // SAFETY: fd points to one initialized pollfd and remains owned by self.
+                    let result = unsafe { libc::poll(&raw mut fd, 1, 10) };
+                    if result < 0 {
+                        let error = io::Error::last_os_error();
+                        if error.kind() != io::ErrorKind::Interrupted {
+                            return Err(error);
+                        }
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        if cancelled.load(Ordering::Acquire) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "presentation cancelled",
+            ));
+        }
+        self.0.flush()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::Terminal;
@@ -311,6 +460,113 @@ mod tests {
     use crate::semantic::SemanticRegion;
     use crate::style::Style;
     use std::io::{self, Write};
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stdout_reopen_rejects_redirects_and_preserves_tty_flags() {
+        use super::LinuxTerminalOutput;
+        use std::os::fd::{AsRawFd, FromRawFd};
+        let regular = std::fs::File::open("/dev/null").unwrap();
+        assert!(
+            matches!(LinuxTerminalOutput::reopen_tty(regular.as_raw_fd()), Err(error) if error.kind() == io::ErrorKind::Unsupported)
+        );
+        let mut master = -1;
+        let mut slave = -1;
+        // SAFETY: valid output pointers with optional configuration omitted.
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &raw mut master,
+                    &raw mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                )
+            },
+            0
+        );
+        // SAFETY: successful openpty transfers distinct owned descriptors.
+        let _master = unsafe { std::fs::File::from_raw_fd(master) };
+        // SAFETY: successful openpty transfers an owned slave descriptor.
+        let slave = unsafe { std::fs::File::from_raw_fd(slave) };
+        // SAFETY: F_GETFL only inspects a live owned descriptor.
+        let before = unsafe { libc::fcntl(slave.as_raw_fd(), libc::F_GETFL) };
+        let reopened = LinuxTerminalOutput::reopen_tty(slave.as_raw_fd()).unwrap();
+        // SAFETY: F_GETFL only inspects live owned descriptors.
+        assert_eq!(
+            unsafe { libc::fcntl(slave.as_raw_fd(), libc::F_GETFL) },
+            before
+        );
+        // SAFETY: F_GETFL only inspects the independent live descriptor.
+        assert_ne!(
+            unsafe { libc::fcntl(reopened.0.as_raw_fd(), libc::F_GETFL) } & libc::O_NONBLOCK,
+            0
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn nonblocking_tty_backpressure_is_cancellable_without_drain() {
+        use super::LinuxTerminalOutput;
+        use std::os::fd::{AsRawFd, FromRawFd};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        let mut master = -1;
+        let mut slave = -1;
+        // SAFETY: valid output pointers, no optional configuration pointers.
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &raw mut master,
+                    &raw mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                )
+            },
+            0
+        );
+        // SAFETY: successful openpty yields two distinct owned descriptors.
+        let _master = unsafe { std::fs::File::from_raw_fd(master) };
+        // SAFETY: successful openpty yields an owned slave descriptor.
+        let slave = unsafe { std::fs::File::from_raw_fd(slave) };
+        // SAFETY: live exclusively owned PTY descriptor.
+        assert_eq!(
+            unsafe { libc::fcntl(slave.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) },
+            0
+        );
+        let mut output = LinuxTerminalOutput(slave);
+        // Fill the real kernel tty queue without reading the peer.
+        let bytes = [b'x'; 4096];
+        loop {
+            match output.0.write(&bytes) {
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("fill tty: {error}"),
+            }
+        }
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = Arc::clone(&cancelled);
+        let (done, completed) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let result = output.deliver(&vec![b'y'; 1024 * 1024], &worker_cancelled);
+            done.send(result).unwrap();
+        });
+        assert!(
+            completed
+                .recv_timeout(std::time::Duration::from_millis(30))
+                .is_err(),
+            "output is genuinely backpressured"
+        );
+        cancelled.store(true, Ordering::Release);
+        let result = completed
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("bounded cancellation without peer drain");
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Interrupted);
+        worker.join().unwrap();
+    }
 
     struct FailingWriter {
         bytes: Vec<u8>,
@@ -334,6 +590,79 @@ mod tests {
                 Ok(())
             }
         }
+    }
+
+    #[test]
+    fn observer_preserves_bytes_and_reports_flush_failure_without_commit() {
+        use crate::presentation::{PresentationPhase, with_presentation_observer};
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let draw = |terminal: &mut Terminal<FailingWriter>| {
+            terminal.draw(|cx| {
+                cx.fill(
+                    crate::paint::LocalRect::new(0, 0, 2, 1),
+                    "x",
+                    crate::style::Style::new(),
+                );
+            })
+        };
+        let make = || {
+            Terminal::new(
+                FailingWriter {
+                    bytes: Vec::new(),
+                    fail: false,
+                },
+                Rect::new(0, 0, 2, 1),
+            )
+        };
+        let mut baseline = make();
+        draw(&mut baseline).unwrap();
+        draw(&mut baseline).unwrap();
+        let records = Rc::new(RefCell::new(Vec::with_capacity(32)));
+        let sink = Rc::clone(&records);
+        let mut observed = make();
+        with_presentation_observer(
+            7,
+            move |record| sink.borrow_mut().push(record),
+            || {
+                draw(&mut observed).unwrap();
+                draw(&mut observed).unwrap();
+            },
+        );
+        assert_eq!(baseline.writer().bytes, observed.writer().bytes);
+        assert_eq!(baseline.retained_buffer(), observed.retained_buffer());
+        assert!(
+            records
+                .borrow()
+                .iter()
+                .all(|record| record.attempt == 7 && record.success)
+        );
+        assert!(
+            records
+                .borrow()
+                .iter()
+                .any(|record| record.phase == PresentationPhase::AnsiEncode)
+        );
+        let sink = Rc::clone(&records);
+        observed.writer_mut().fail = true;
+        with_presentation_observer(
+            8,
+            move |record| sink.borrow_mut().push(record),
+            || {
+                assert!(draw(&mut observed).is_err());
+            },
+        );
+        assert!(observed.retained_buffer().is_none());
+        assert!(records.borrow().iter().any(|record| record.attempt == 8
+            && record.phase == PresentationPhase::TerminalOutputTotal
+            && !record.success));
+        assert!(
+            !records
+                .borrow()
+                .iter()
+                .any(|record| record.attempt == 8
+                    && record.phase == PresentationPhase::TerminalCommit)
+        );
     }
 
     #[test]

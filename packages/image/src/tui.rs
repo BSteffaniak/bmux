@@ -28,6 +28,8 @@ pub enum TuiImageError {
         /// Human-readable validation failure.
         reason: String,
     },
+    /// Cooperative image encoding cancellation.
+    Cancelled,
     /// Image output failed.
     Io(std::io::Error),
 }
@@ -38,6 +40,7 @@ impl std::fmt::Display for TuiImageError {
             Self::InvalidPayload { key, reason } => {
                 write!(formatter, "invalid TUI image '{}': {reason}", key.as_str())
             }
+            Self::Cancelled => formatter.write_str("image encoding cancelled"),
             Self::Io(error) => error.fmt(formatter),
         }
     }
@@ -46,7 +49,7 @@ impl std::fmt::Display for TuiImageError {
 impl std::error::Error for TuiImageError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::InvalidPayload { .. } => None,
+            Self::InvalidPayload { .. } | Self::Cancelled => None,
             Self::Io(error) => Some(error),
         }
     }
@@ -54,7 +57,11 @@ impl std::error::Error for TuiImageError {
 
 impl From<std::io::Error> for TuiImageError {
     fn from(value: std::io::Error) -> Self {
-        Self::Io(value)
+        if value.kind() == std::io::ErrorKind::Interrupted {
+            Self::Cancelled
+        } else {
+            Self::Io(value)
+        }
     }
 }
 
@@ -95,6 +102,51 @@ impl TuiImageCompositor {
         Self::default()
     }
 
+    /// Explicitly opt in to a physical-host-local Kitty SHM probe. Append to
+    /// the host's serialized output queue, never a concurrent stdout writer.
+    /// Returns false without output when unsupported/setup is unavailable.
+    /// Call once per connection; TERM/SSH/loopback are not locality evidence.
+    ///
+    /// # Errors
+    /// * Identifier exhaustion or output failure. Use
+    ///   `invalidate_after_failed_output` after failed candidate delivery/flush;
+    ///   abort is reserved for physical connection teardown.
+    #[cfg(feature = "kitty")]
+    pub fn begin_shared_memory_probe(
+        &mut self,
+        out: &mut impl Write,
+        now: std::time::Instant,
+    ) -> std::io::Result<bool> {
+        self.kitty_state.begin_shared_memory_probe(out, now)
+    }
+
+    /// Route a complete APC frame from this physical connection. Returns true
+    /// only for a matching pending reply. Runtime owns framing and must preserve
+    /// unmatched input. Candidate clones share ACK/lease state, not scene commits;
+    /// independent connections must use independently constructed compositors.
+    #[cfg(feature = "kitty")]
+    #[must_use]
+    pub fn handle_shared_memory_reply(&mut self, frame: &[u8], now: std::time::Instant) -> bool {
+        self.kitty_state.handle_shared_memory_reply(frame, now)
+    }
+
+    /// Run on the host timer even without image output. Releases expired pending
+    /// leases (16 objects / 16 MiB / two seconds) and schedules residency repair.
+    #[cfg(feature = "kitty")]
+    pub fn expire_shared_memory(&mut self, now: std::time::Instant) {
+        self.kitty_state.expire_shared_memory(now);
+    }
+
+    /// Release leases and disable SHM on physical connection teardown only.
+    /// For failed candidate output/flush, use `invalidate_after_failed_output`:
+    /// older uploads may still be read by the terminal and retain their leases.
+    /// SIGKILL before terminal consumption can leave objects behind; there is no
+    /// orphan scavenger and no foreign objects are deliberately reclaimed.
+    #[cfg(feature = "kitty")]
+    pub fn abort_shared_memory(&mut self) {
+        self.kitty_state.abort_shared_memory();
+    }
+
     /// Observe lifecycle removals without discarding bounded content preparation.
     /// Visibility is owned by the complete scene passed to render; finish_frame
     /// removes absent host placements. Inactive sources remain reusable until
@@ -121,8 +173,47 @@ impl TuiImageCompositor {
         host_caps: &HostImageCapabilities,
         config: &ImageConfig,
     ) -> Result<(), TuiImageError> {
+        self.render_cancellable(out, scene, terminal, host_caps, config, None)
+    }
+
+    /// Render with an optional live worker cancellation token. Cancellation
+    /// discards candidate image state. PNG/resampling checkpoint coverage remains
+    /// incomplete; this API alone does not guarantee bounded worker shutdown.
+    ///
+    /// # Errors
+    /// * `Cancelled` when encoding observes the cancellation token.
+    /// * The same payload/output errors as `render`.
+    pub fn render_cancellable(
+        &mut self,
+        out: &mut impl Write,
+        scene: &ImageScene,
+        terminal: PaneRect,
+        host_caps: &HostImageCapabilities,
+        config: &ImageConfig,
+        cancelled: Option<Arc<std::sync::atomic::AtomicBool>>,
+    ) -> Result<(), TuiImageError> {
+        if cancelled
+            .as_ref()
+            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire))
+        {
+            return Err(TuiImageError::Cancelled);
+        }
         let mut candidate = self.clone();
-        match candidate.render_candidate(out, scene, terminal, host_caps, config) {
+        candidate.kitty_state.set_cancellation(cancelled);
+        let result = candidate.render_candidate(out, scene, terminal, host_caps, config);
+        let result = result.and_then(|()| {
+            candidate
+                .kitty_state
+                .check_cancelled()
+                .map_err(TuiImageError::from)
+        });
+        let result = if candidate.kitty_state.check_cancelled().is_err() {
+            Err(TuiImageError::Cancelled)
+        } else {
+            result
+        };
+        candidate.kitty_state.set_cancellation(None);
+        match result {
             Ok(()) => {
                 *self = candidate;
                 Ok(())
@@ -235,7 +326,12 @@ impl TuiImageCompositor {
                     **payload == placement.payload && *limit == config.max_image_bytes
                 });
             if !unchanged {
-                let payload = decode_payload(&placement.key, &placement.payload, config)?;
+                let payload = decode_payload_cancellable(
+                    &placement.key,
+                    &placement.payload,
+                    config,
+                    self.kitty_state.cancellation().as_deref(),
+                )?;
                 self.validations += 1;
                 self.next_id = self
                     .next_id
@@ -376,7 +472,14 @@ impl TuiImageCompositor {
             allocation.destination =
                 bmux_tui::geometry::Rect::new(0, 0, bounds.width, bounds.height);
             allocation.allocation = None;
-            let raster = contain_payload(&allocation, &source.payload, caps, config)?;
+            let cancellation = self.kitty_state.cancellation();
+            let raster = contain_payload_cancellable(
+                &allocation,
+                &source.payload,
+                caps,
+                config,
+                cancellation.as_deref(),
+            )?;
             self.rasters
                 .insert(placement.key.clone(), (raster_signature, Arc::new(raster)));
         }
@@ -388,7 +491,20 @@ impl TuiImageCompositor {
         );
         #[cfg(feature = "kitty")]
         if caps.preferred_protocol() == Some(ImageProtocol::KittyGraphics) {
-            encode_fitted_png(&mut payload);
+            if self.kitty_state.cancellation().is_some() {
+                let token = self.kitty_state.cancellation();
+                let pixels = payload.pixels.as_ref().expect("fitted pixels");
+                let png = crate::compositor::clipping::encode_rgba_png_cancellable(pixels, || {
+                    token
+                        .as_ref()
+                        .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire))
+                })?;
+                if png.len() < pixels.data.len() {
+                    payload.raw = Some(png);
+                }
+            } else {
+                encode_fitted_png(&mut payload);
+            }
         }
         self.next_id = self
             .next_id
@@ -542,11 +658,23 @@ fn encode_fitted_png_with_compression(
 // Rasterize the allocated fit once per source/geometry/metric revision. Letterbox
 // pixels keep fractional-cell sizing exact; protocol emitters retain one geometry.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // Values are bounded by the allocation and byte limit below.
+#[cfg(test)]
 fn contain_payload(
     placement: &bmux_tui::image::ImagePlacement,
     source: &ImagePayload,
     caps: &HostImageCapabilities,
     config: &ImageConfig,
+) -> Result<ImagePayload, TuiImageError> {
+    contain_payload_cancellable(placement, source, caps, config, None)
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // Bounded allocation coordinates.
+fn contain_payload_cancellable(
+    placement: &bmux_tui::image::ImagePlacement,
+    source: &ImagePayload,
+    caps: &HostImageCapabilities,
+    config: &ImageConfig,
+    cancelled: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<ImagePayload, TuiImageError> {
     let (cw, ch) = caps.fitting_cell_size();
     let cw = u32::from(cw);
@@ -581,6 +709,18 @@ fn contain_payload(
             image::RgbaImage::from_raw(pixels.width, pixels.height, pixels.data.clone())
                 .expect("validated RGBA"),
         ),
+        PixelFormat::Png if cancelled.is_some() => {
+            let token = cancelled.expect("checked token");
+            let rgba = crate::compositor::clipping::decode_png_cancellable(
+                &pixels.data,
+                config.max_image_bytes,
+                || token.load(std::sync::atomic::Ordering::Acquire),
+            )?;
+            image::DynamicImage::ImageRgba8(
+                image::RgbaImage::from_raw(rgba.width, rgba.height, rgba.data)
+                    .expect("validated PNG rows"),
+            )
+        }
         PixelFormat::Png => image::ImageReader::with_format(
             std::io::Cursor::new(&pixels.data),
             image::ImageFormat::Png,
@@ -588,9 +728,18 @@ fn contain_payload(
         .decode()
         .map_err(|error| invalid(&placement.key, format!("PNG decode failed: {error}")))?,
     };
-    let fitted = decoded
-        .resize_exact(fit_width, fit_height, image::imageops::FilterType::Lanczos3)
-        .into_rgba8();
+    let fitted = if let Some(token) = cancelled {
+        crate::compositor::clipping::resize_rgba_cancellable(
+            &decoded.into_rgba8(),
+            fit_width,
+            fit_height,
+            || token.load(std::sync::atomic::Ordering::Acquire),
+        )?
+    } else {
+        decoded
+            .resize_exact(fit_width, fit_height, image::imageops::FilterType::Lanczos3)
+            .into_rgba8()
+    };
     let mut canvas = image::RgbaImage::new(width, height);
     image::imageops::overlay(
         &mut canvas,
@@ -739,10 +888,20 @@ fn proportional_pixels(pixels: u32, visible_cells: u16, destination_cells: u16) 
         .min(pixels)
 }
 
+#[cfg(test)]
 fn decode_payload(
     key: &ImageKey,
     payload: &TuiImagePayload,
     config: &ImageConfig,
+) -> Result<ImagePayload, TuiImageError> {
+    decode_payload_cancellable(key, payload, config, None)
+}
+
+fn decode_payload_cancellable(
+    key: &ImageKey,
+    payload: &TuiImagePayload,
+    config: &ImageConfig,
+    cancelled: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<ImagePayload, TuiImageError> {
     let (bytes, width, height, format) = match payload {
         TuiImagePayload::Pixels {
@@ -769,13 +928,24 @@ fn decode_payload(
                     "encoded payload exceeds configured byte limit",
                 ));
             }
-            let decoder = image::ImageReader::with_format(
-                std::io::Cursor::new(bytes),
-                image::ImageFormat::Png,
-            );
-            let decoded = decoder
+            let decoded = if let Some(token) = cancelled {
+                let rgba = crate::compositor::clipping::decode_png_cancellable(
+                    bytes,
+                    config.max_image_bytes,
+                    || token.load(std::sync::atomic::Ordering::Acquire),
+                )?;
+                image::DynamicImage::ImageRgba8(
+                    image::RgbaImage::from_raw(rgba.width, rgba.height, rgba.data)
+                        .expect("validated PNG rows"),
+                )
+            } else {
+                image::ImageReader::with_format(
+                    std::io::Cursor::new(bytes),
+                    image::ImageFormat::Png,
+                )
                 .decode()
-                .map_err(|error| invalid(key, format!("PNG decode failed: {error}")))?;
+                .map_err(|error| invalid(key, format!("PNG decode failed: {error}")))?
+            };
             if decoded.width() != *width || decoded.height() != *height {
                 return Err(invalid(
                     key,
@@ -848,6 +1018,191 @@ mod tests {
     use crate::compositor::PaneRect;
     use crate::config::ImageConfig;
     use crate::host_caps::HostImageCapabilities;
+
+    #[cfg(all(feature = "kitty", target_os = "linux"))]
+    #[test]
+    fn shared_memory_public_hooks_share_candidate_ack_not_connection_eligibility() {
+        let now = std::time::Instant::now();
+        let caps = kitty_caps();
+        let terminal = PaneRect {
+            x: 0,
+            y: 0,
+            w: 40,
+            h: 20,
+        };
+        let config = ImageConfig::default();
+        let mut scene = ImageScene::default();
+        scene.reconcile(&[ImageContribution::Present(placement(
+            "cover",
+            Rect::new(0, 0, 8, 4),
+            Rect::new(0, 0, 40, 20),
+            91,
+        ))]);
+        let mut committed = TuiImageCompositor::new();
+        let mut direct_candidate = committed.clone();
+        let mut direct = Vec::new();
+        direct_candidate
+            .render(&mut direct, &scene, terminal, &caps, &config)
+            .unwrap();
+        assert!(String::from_utf8_lossy(&direct).contains("a=t"));
+        assert!(!String::from_utf8_lossy(&direct).contains("t=s"));
+        drop(direct_candidate);
+
+        // Build probe bytes in the same output queue as ordinary frames. This
+        // test never opens stdout or a TTY and never runs a concurrent writer.
+        let mut ordered = b"previous-output".to_vec();
+        assert!(
+            committed
+                .begin_shared_memory_probe(&mut ordered, now)
+                .unwrap()
+        );
+        assert!(ordered.starts_with(b"previous-output\x1b\\\x1b_Ga=q,t=s"));
+        let command = String::from_utf8_lossy(&ordered);
+        let probe_id = command
+            .split_once(",i=")
+            .unwrap()
+            .1
+            .split(',')
+            .next()
+            .unwrap();
+        let encoded = command
+            .split_once(';')
+            .unwrap()
+            .1
+            .strip_suffix("\x1b\\")
+            .unwrap();
+        let name =
+            String::from_utf8(crate::codec::kitty::base64_decode(encoded.as_bytes())).unwrap();
+        let path = std::path::Path::new("/dev/shm").join(&name[1..]);
+        let mut candidate = committed.clone();
+        let other = TuiImageCompositor::new();
+        let mut other_candidate = other.clone();
+        let ack = format!("\x1b_Gi={probe_id};OK\x1b\\");
+        assert!(!other_candidate.handle_shared_memory_reply(ack.as_bytes(), now));
+        assert!(!candidate.handle_shared_memory_reply(b"user input", now));
+        assert!(path.exists());
+        // ACK reaches the committed owner while a presentation clone exists.
+        assert!(committed.handle_shared_memory_reply(ack.as_bytes(), now));
+        assert!(!path.exists());
+        let mut shm = Vec::new();
+        candidate
+            .render(&mut shm, &scene, terminal, &caps, &config)
+            .unwrap();
+        let shm = String::from_utf8(shm).unwrap();
+        assert!(shm.contains("a=t,t=s"));
+        assert!(shm.contains("a=p"));
+        // Same 8x4 RGBA fixture and placement. This compares emitted bytes,
+        // not latency, terminal rendering or system-wide memory traffic.
+        assert!(shm.len() < direct.len());
+        eprintln!(
+            "same-image wire bytes: direct={} shm={} probe={}",
+            direct.len(),
+            shm.len(),
+            ordered.len() - b"previous-output".len()
+        );
+        let upload = shm.split_once("a=t,t=s").unwrap().1;
+        let encoded = upload
+            .split_once(';')
+            .unwrap()
+            .1
+            .split_once("\x1b\\")
+            .unwrap()
+            .0;
+        let name =
+            String::from_utf8(crate::codec::kitty::base64_decode(encoded.as_bytes())).unwrap();
+        let upload_path = std::path::Path::new("/dev/shm").join(&name[1..]);
+        assert_eq!(std::fs::read(&upload_path).unwrap(), vec![91; 8 * 4 * 4]);
+        let mut isolated = Vec::new();
+        other_candidate
+            .render(&mut isolated, &scene, terminal, &caps, &config)
+            .unwrap();
+        assert!(!String::from_utf8_lossy(&isolated).contains("t=s"));
+        drop(candidate); // Pending upload lease remains owned by committed.
+        assert!(upload_path.exists());
+        committed.expire_shared_memory(now + std::time::Duration::from_secs(3));
+        assert!(!upload_path.exists());
+        committed.abort_shared_memory();
+    }
+
+    #[cfg(feature = "kitty")]
+    #[test]
+    fn render_cancellable_precancel_does_not_advance_actual_image_state() {
+        use std::sync::atomic::AtomicBool;
+        let mut compositor = TuiImageCompositor::new();
+        let mut scene = ImageScene::default();
+        scene.reconcile(&[ImageContribution::Present(placement(
+            "cancelled-cover",
+            Rect::new(0, 0, 8, 4),
+            Rect::new(0, 0, 40, 20),
+            91,
+        ))]);
+        let cancelled = std::sync::Arc::new(AtomicBool::new(true));
+        let mut bytes = b"existing-output".to_vec();
+        let error = compositor
+            .render_cancellable(
+                &mut bytes,
+                &scene,
+                PaneRect {
+                    x: 0,
+                    y: 0,
+                    w: 40,
+                    h: 20,
+                },
+                &kitty_caps(),
+                &ImageConfig::default(),
+                Some(cancelled),
+            )
+            .unwrap_err();
+        assert!(matches!(error, super::TuiImageError::Cancelled));
+        assert_eq!(bytes, b"existing-output");
+        assert!(compositor.sources.is_empty());
+        assert!(compositor.fitted.is_empty());
+        assert!(compositor.rasters.is_empty());
+        assert!(compositor.kitty_state.resources.is_empty());
+    }
+
+    #[cfg(feature = "kitty")]
+    #[test]
+    fn actual_render_cancellation_after_output_begins_does_not_commit_sources() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct CancelOnWrite(std::sync::Arc<AtomicBool>);
+        impl std::io::Write for CancelOnWrite {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.store(true, Ordering::Release);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let flag = std::sync::Arc::new(AtomicBool::new(false));
+        let mut compositor = TuiImageCompositor::new();
+        let mut scene = ImageScene::default();
+        scene.reconcile(&[ImageContribution::Present(placement(
+            "cancel-cover",
+            Rect::new(0, 0, 8, 4),
+            Rect::new(0, 0, 40, 20),
+            91,
+        ))]);
+        let error = compositor
+            .render_cancellable(
+                &mut CancelOnWrite(flag.clone()),
+                &scene,
+                PaneRect {
+                    x: 0,
+                    y: 0,
+                    w: 40,
+                    h: 20,
+                },
+                &kitty_caps(),
+                &ImageConfig::default(),
+                Some(flag),
+            )
+            .unwrap_err();
+        assert!(matches!(error, super::TuiImageError::Cancelled));
+        assert!(compositor.sources.is_empty());
+        assert!(compositor.kitty_state.resources.is_empty());
+    }
 
     #[cfg(feature = "kitty")]
     #[test]

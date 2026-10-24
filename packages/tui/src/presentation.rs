@@ -16,6 +16,119 @@ use crate::paint::PaintCx;
 use crate::selection::SelectionScene;
 use crate::semantic::SemanticScene;
 
+/// Fixed diagnostic boundaries.
+///
+/// `TerminalOutputTotal` includes compositor,
+/// ANSI (encoding plus writer writes), and flush phases; never sum it with them.
+/// Other phases are disjoint on the synchronous presentation path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PresentationPhase {
+    /// Grid allocation or retained-grid copy.
+    BufferAlloc,
+    /// Producer paint callback.
+    Paint,
+    /// Metadata extraction after paint; excludes frame construction/teardown.
+    MetadataExtract,
+    /// Repair retained cell spans.
+    RetainedCellRepair,
+    /// Copy the committed image scene for staging.
+    ImageSceneClone,
+    /// Reconcile staged image contributions and occlusions.
+    ImageReconcile,
+    /// Finalize focus and owned prepared metadata.
+    FocusFinalize,
+    /// Install successfully delivered staging, including retired state drops.
+    TerminalCommit,
+    /// Stage an image compositor copy.
+    CompositorClone,
+    /// Configure prepared output.
+    Configure,
+    /// Prepare image protocol output.
+    CompositorPrepareOutput,
+    /// Apply image scene delta.
+    CompositorApplyDelta,
+    /// Render image protocol output, including writer calls.
+    CompositorRender,
+    /// ANSI encoding including synchronous writer calls, not flush.
+    AnsiEncode,
+    /// Flush writer (not necessarily terminal acknowledgement).
+    WriterFlush,
+    /// Inclusive output transaction, excluding authority commit.
+    TerminalOutputTotal,
+}
+
+/// One version-1 diagnostic record; no payload or terminal content.
+#[derive(Debug, Clone, Copy)]
+pub struct PresentationTiming {
+    /// Caller-selected frame/attempt identity.
+    pub attempt: u64,
+    /// Measured boundary.
+    pub phase: PresentationPhase,
+    /// Monotonic duration in nanoseconds.
+    pub elapsed_ns: u128,
+    /// False on error or unwinding.
+    pub success: bool,
+}
+
+type Observer = (u64, std::rc::Rc<dyn Fn(PresentationTiming)>);
+thread_local! {
+    static OBSERVER: std::cell::RefCell<Option<Observer>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Observe synchronous work on this thread only.
+///
+/// Nested scopes restore their
+/// predecessor, including on unwind. Callbacks should collect bounded records;
+/// they should not panic or perform timed/logging work. Callback panics are
+/// contained so diagnostics cannot fail delivery. No clocks or allocations
+/// are used by instrumentation when no observer is installed.
+pub fn with_presentation_observer<R>(
+    attempt: u64,
+    observer: impl Fn(PresentationTiming) + 'static,
+    run: impl FnOnce() -> R,
+) -> R {
+    struct Restore(Option<Observer>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            OBSERVER.with(|slot| {
+                slot.replace(self.0.take());
+            });
+        }
+    }
+    let _restore =
+        Restore(OBSERVER.with(|slot| slot.replace(Some((attempt, std::rc::Rc::new(observer))))));
+    run()
+}
+
+impl PresentationPhase {
+    /// Measure a boundary; the predicate identifies success without changing its
+    /// result. Unwinding reports failure. Disabled instrumentation calls only `run`.
+    pub fn measure<R>(self, run: impl FnOnce() -> R, success: impl FnOnce(&R) -> bool) -> R {
+        struct Record(Observer, PresentationPhase, std::time::Instant, bool);
+        impl Drop for Record {
+            fn drop(&mut self) {
+                let timing = PresentationTiming {
+                    attempt: self.0.0,
+                    phase: self.1,
+                    elapsed_ns: self.2.elapsed().as_nanos(),
+                    success: self.3,
+                };
+                // Diagnostics must never interrupt delivery or double-panic on unwind.
+                let _ =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (self.0.1)(timing)));
+            }
+        }
+        let observer = OBSERVER.with(|slot| slot.borrow().clone());
+        let Some(observer) = observer else {
+            return run();
+        };
+        let mut record = Record(observer, self, std::time::Instant::now(), false);
+        let result = run();
+        record.3 = success(&result);
+        result
+    }
+}
+
 /// Complete owned output of the authoritative paint/retention path.
 ///
 /// Cell coordinates and all metadata share the same clipped paint geometry.
@@ -383,7 +496,7 @@ impl<E: std::error::Error + 'static> std::error::Error for PresentationError<E> 
 ///
 /// Preparation does not mutate this state. Output failure preserves committed
 /// interactions and invalidates cell history so a retry must repaint fully.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PresentationState {
     area: Rect,
     previous: Option<Buffer>,
@@ -639,6 +752,9 @@ impl PresentationState {
         }
     }
 
+    // Keep the ordered staged transaction together; timers add boundary syntax,
+    // not additional work or independently meaningful preparation stages.
+    #[allow(clippy::too_many_lines)]
     fn prepare_from(
         &self,
         damage: Damage,
@@ -654,91 +770,121 @@ impl PresentationState {
             return None;
         }
         let mut requested_regions = damage.retained_regions().to_vec();
-        let mut buffer = if repair {
-            self.previous
-                .clone()
-                .unwrap_or_else(|| Buffer::empty(self.area))
-        } else {
-            Buffer::empty(self.area)
-        };
+        let mut buffer = PresentationPhase::BufferAlloc.measure(
+            || {
+                if repair {
+                    self.previous
+                        .clone()
+                        .unwrap_or_else(|| Buffer::empty(self.area))
+                } else {
+                    Buffer::empty(self.area)
+                }
+            },
+            |_| true,
+        );
         let metadata_availability;
         let (cursor, hits, focus_scope, images, selection, semantics, occlusions) = {
             let mut frame = Frame::new(&mut buffer);
-            render(&mut PaintCx::new(&mut frame));
-            // Occlusion replaces scene geometry globally. A producer invoking
-            // it must paint the complete tree, not a regional-only patch.
-            if !frame.occlusions().is_empty() || !self.modal_focus.is_empty() {
-                damage = Damage::Full;
-                requested_regions.clear();
-            }
-            metadata_availability = self.reconcile_metadata_availability(&frame, &damage);
-            let hits = self.reconcile_staged_hits(frame.hits(), &damage);
-            let mut images = if matches!(damage, Damage::Regions(_)) {
-                self.image_scene.contributions_outside(&requested_regions)
-            } else {
-                Vec::new()
-            };
-            let retained_image_count = images.len();
-            images.extend_from_slice(frame.images());
-            let cursor = frame.cursor().or_else(|| {
-                matches!(damage, Damage::Regions(_))
-                    .then_some(self.cursor)
-                    .flatten()
-            });
-            let focus_scope = frame.focus_scope().cloned().or_else(|| {
-                matches!(damage, Damage::Regions(_))
-                    .then(|| self.focus_scope.clone())
-                    .flatten()
-            });
-            let selection = if matches!(damage, Damage::Regions(_)) {
-                self.selection
-                    .merge_regions(frame.selection(), &requested_regions)
-            } else {
-                frame.selection().clone()
-            };
-            let semantics = if matches!(damage, Damage::Regions(_)) {
-                self.semantics
-                    .merge_regions(frame.semantics(), &requested_regions)
-            } else {
-                frame.semantics().clone()
-            };
-            let occlusions: Vec<_> = frame
-                .occlusions()
-                .iter()
-                .map(|(boundary, area)| (boundary.saturating_add(retained_image_count), *area))
-                .collect();
+            PresentationPhase::Paint.measure(|| render(&mut PaintCx::new(&mut frame)), |()| true);
+            let metadata = PresentationPhase::MetadataExtract.measure(
+                || {
+                    // Occlusion replaces scene geometry globally. A producer invoking
+                    // it must paint the complete tree, not a regional-only patch.
+                    if !frame.occlusions().is_empty() || !self.modal_focus.is_empty() {
+                        damage = Damage::Full;
+                        requested_regions.clear();
+                    }
+                    let metadata_availability =
+                        self.reconcile_metadata_availability(&frame, &damage);
+                    let hits = self.reconcile_staged_hits(frame.hits(), &damage);
+                    let mut images = if matches!(damage, Damage::Regions(_)) {
+                        self.image_scene.contributions_outside(&requested_regions)
+                    } else {
+                        Vec::new()
+                    };
+                    let retained_image_count = images.len();
+                    images.extend_from_slice(frame.images());
+                    let cursor = frame.cursor().or_else(|| {
+                        matches!(damage, Damage::Regions(_))
+                            .then_some(self.cursor)
+                            .flatten()
+                    });
+                    let focus_scope = frame.focus_scope().cloned().or_else(|| {
+                        matches!(damage, Damage::Regions(_))
+                            .then(|| self.focus_scope.clone())
+                            .flatten()
+                    });
+                    let selection = if matches!(damage, Damage::Regions(_)) {
+                        self.selection
+                            .merge_regions(frame.selection(), &requested_regions)
+                    } else {
+                        frame.selection().clone()
+                    };
+                    let semantics = if matches!(damage, Damage::Regions(_)) {
+                        self.semantics
+                            .merge_regions(frame.semantics(), &requested_regions)
+                    } else {
+                        frame.semantics().clone()
+                    };
+                    let occlusions: Vec<_> = frame
+                        .occlusions()
+                        .iter()
+                        .map(|(boundary, area)| {
+                            (boundary.saturating_add(retained_image_count), *area)
+                        })
+                        .collect();
+                    (
+                        cursor,
+                        hits,
+                        focus_scope,
+                        images,
+                        selection,
+                        semantics,
+                        occlusions,
+                        metadata_availability,
+                    )
+                },
+                |_| true,
+            );
+            metadata_availability = metadata.7;
             (
-                cursor,
-                hits,
-                focus_scope,
-                images,
-                selection,
-                semantics,
-                occlusions,
+                metadata.0, metadata.1, metadata.2, metadata.3, metadata.4, metadata.5, metadata.6,
             )
         };
-        let damage = self.restore_retained_cells(&mut buffer, damage, &requested_regions);
-        let mut image_scene = self.image_scene.clone();
-        let image_delta = image_scene.reconcile_occluded(&images, &occlusions);
+        let damage = PresentationPhase::RetainedCellRepair.measure(
+            || self.restore_retained_cells(&mut buffer, damage, &requested_regions),
+            |_| true,
+        );
+        let mut image_scene =
+            PresentationPhase::ImageSceneClone.measure(|| self.image_scene.clone(), |_| true);
+        let image_delta = PresentationPhase::ImageReconcile.measure(
+            || image_scene.reconcile_occluded(&images, &occlusions),
+            |_| true,
+        );
 
-        let focus = FocusTrap::from_hits(&hits, focus_scope.as_ref(), self.focus.active());
-        Some(PreparedPresentation {
-            buffer,
-            cursor,
-            hits,
-            focus_scope,
-            focus,
-            modal_focus: self.modal_focus.clone(),
-            modal_origin: self.focus.clone(),
-            images,
-            image_scene,
-            image_delta,
-            selection,
-            selection_text: std::collections::BTreeMap::new(),
-            semantics,
-            metadata_availability,
-            damage,
-        })
+        PresentationPhase::FocusFinalize.measure(
+            || {
+                let focus = FocusTrap::from_hits(&hits, focus_scope.as_ref(), self.focus.active());
+                Some(PreparedPresentation {
+                    buffer,
+                    cursor,
+                    hits,
+                    focus_scope,
+                    focus,
+                    modal_focus: self.modal_focus.clone(),
+                    modal_origin: self.focus.clone(),
+                    images,
+                    image_scene,
+                    image_delta,
+                    selection,
+                    selection_text: std::collections::BTreeMap::new(),
+                    semantics,
+                    metadata_availability,
+                    damage,
+                })
+            },
+            |_| true,
+        )
     }
 
     /// Prepare a snapshot subject to caller-selected resource admission limits.
@@ -819,26 +965,33 @@ impl PresentationState {
         let Some(prepared) = prepared else {
             return Ok(None);
         };
-        let result = match output(&prepared, self.previous.as_ref()) {
+        let result = match PresentationPhase::TerminalOutputTotal
+            .measure(|| output(&prepared, self.previous.as_ref()), Result::is_ok)
+        {
             Ok(result) => result,
             Err(error) => {
                 self.reset();
                 return Err(error);
             }
         };
-        self.previous = Some(prepared.buffer);
-        self.hits = prepared.hits;
-        self.focus = prepared.focus;
-        self.focus_scope = prepared.focus_scope;
-        self.modal_focus = prepared.modal_focus;
-        self.images = prepared.images;
-        self.image_scene = prepared.image_scene;
-        self.image_delta = prepared.image_delta;
-        self.cursor = prepared.cursor;
-        self.selection = prepared.selection;
-        self.selection_text = prepared.selection_text;
-        self.semantics = prepared.semantics;
-        self.metadata_availability = prepared.metadata_availability;
+        PresentationPhase::TerminalCommit.measure(
+            || {
+                self.previous = Some(prepared.buffer);
+                self.hits = prepared.hits;
+                self.focus = prepared.focus;
+                self.focus_scope = prepared.focus_scope;
+                self.modal_focus = prepared.modal_focus;
+                self.images = prepared.images;
+                self.image_scene = prepared.image_scene;
+                self.image_delta = prepared.image_delta;
+                self.cursor = prepared.cursor;
+                self.selection = prepared.selection;
+                self.selection_text = prepared.selection_text;
+                self.semantics = prepared.semantics;
+                self.metadata_availability = prepared.metadata_availability;
+            },
+            |()| true,
+        );
         Ok(Some(result))
     }
 }
@@ -850,6 +1003,39 @@ mod tests {
     use crate::hit::HitRegion;
     use crate::paint::LocalRect;
     use crate::style::Style;
+
+    #[test]
+    fn diagnostic_scope_restores_after_nested_unwind_and_disabled_skips_predicate() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let records = Rc::new(RefCell::new(Vec::with_capacity(4)));
+        let sink = Rc::clone(&records);
+        with_presentation_observer(
+            10,
+            move |record| sink.borrow_mut().push(record),
+            || {
+                let inner = Rc::clone(&records);
+                let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    with_presentation_observer(
+                        20,
+                        move |record| inner.borrow_mut().push(record),
+                        || {
+                            PresentationPhase::Paint.measure(|| panic!("producer"), |()| true);
+                        },
+                    );
+                }));
+                assert!(panic.is_err());
+                PresentationPhase::Configure
+                    .measure(|| Err::<(), _>("rejected"), Result::is_ok)
+                    .unwrap_err();
+            },
+        );
+        PresentationPhase::Paint.measure(|| (), |()| panic!("disabled predicate"));
+        let records = records.borrow();
+        assert_eq!(records.len(), 2);
+        assert_eq!((records[0].attempt, records[0].success), (20, false));
+        assert_eq!((records[1].attempt, records[1].success), (10, false));
+    }
 
     fn paint(cx: &mut PaintCx<'_, '_>, id: &str, symbol: &str) {
         cx.fill(LocalRect::new(0, 0, 2, 1), symbol, Style::new());

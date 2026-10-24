@@ -43,6 +43,69 @@ impl Program for RecordingProgram {
     }
 }
 
+#[tokio::test]
+async fn pending_presentation_services_input_and_cancels_on_quit() {
+    use crate::presenter::{PresentReport, Presenter, ResetReason};
+    use std::task::{Context, Poll};
+
+    struct PendingPresenter {
+        started: Arc<tokio::sync::Notify>,
+        cancelled: Arc<std::sync::atomic::AtomicBool>,
+    }
+    impl Presenter<RecordingProgram> for PendingPresenter {
+        type Error = Infallible;
+        fn reset(&mut self, _: ResetReason) {}
+        fn present(&mut self, _: &mut RecordingProgram) -> Result<PresentReport, Infallible> {
+            panic!("asynchronous path must not call synchronous output")
+        }
+        fn start_present(
+            &mut self,
+            _: &mut RecordingProgram,
+        ) -> Result<Option<PresentReport>, Infallible> {
+            self.started.notify_one();
+            Ok(None)
+        }
+        fn poll_present(
+            &mut self,
+            _: &mut Context<'_>,
+            _: &mut RecordingProgram,
+        ) -> Poll<Result<PresentReport, Infallible>> {
+            Poll::Pending
+        }
+        fn cancel_present(&mut self) {
+            self.cancelled
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    let started = Arc::new(tokio::sync::Notify::new());
+    let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (runtime, handle) = Runtime::new(
+        RecordingProgram {
+            exit_after: Some(2),
+            ..RecordingProgram::default()
+        },
+        PendingPresenter {
+            started: Arc::clone(&started),
+            cancelled: Arc::clone(&cancelled),
+        },
+        unlimited_config(),
+    );
+    let send = async {
+        started.notified().await;
+        handle.send(7).await.expect("first input");
+        handle.send(7).await.expect("duplicate input");
+    };
+    let (result, ()) = tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::join!(runtime.run(), send)
+    })
+    .await
+    .expect("quit does not wait for blocked flush");
+    let output = runtime_output(result);
+    assert_eq!(output.program.messages, [7, 7]);
+    assert!(cancelled.load(std::sync::atomic::Ordering::SeqCst));
+    assert_eq!(output.stats.frames_presented, 0);
+}
+
 fn unlimited_config() -> RuntimeConfig {
     RuntimeConfig {
         frame_interval: None,

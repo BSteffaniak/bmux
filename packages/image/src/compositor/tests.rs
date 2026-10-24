@@ -29,6 +29,299 @@ fn image() -> PaneImage {
 
 #[cfg(feature = "kitty")]
 #[test]
+fn kitty_protocol_support_alone_never_selects_shared_memory() {
+    let mut state = KittyHostState::default();
+    let output = frame(&mut state, &[image()], &[], &kitty());
+    let output = String::from_utf8(output).unwrap();
+    assert_eq!(output.matches("a=t").count(), 1);
+    assert_eq!(output.matches("a=p").count(), 1);
+    assert!(!output.contains("t=s"));
+    assert!(!output.contains("a=q"));
+    assert!(!output.contains("/dev/shm"));
+    assert!(output.find("a=t").unwrap() < output.find("a=p").unwrap());
+}
+
+#[cfg(feature = "kitty")]
+#[test]
+fn separate_host_states_upload_independently_and_keep_duplicate_placements() {
+    let mut first = KittyHostState::default();
+    let mut second = KittyHostState::default();
+    let mut duplicate = image();
+    duplicate.id = 2;
+    let images = [image(), duplicate];
+    for state in [&mut first, &mut second] {
+        let output = frame(state, &images, &[], &kitty());
+        let output = String::from_utf8(output).unwrap();
+        assert_eq!(output.matches("a=t").count(), 1);
+        assert_eq!(output.matches("a=p").count(), 2);
+        assert!(!output.contains("t=s"));
+        assert!(!output.contains("a=q"));
+        let warm = frame(state, &images, &[], &kitty());
+        let warm = String::from_utf8(warm).unwrap();
+        assert!(!warm.contains("a=t"));
+        assert_eq!(warm.matches("a=p").count(), 2);
+    }
+}
+
+#[cfg(all(feature = "kitty", target_os = "linux"))]
+#[test]
+fn shared_memory_probe_ack_upload_timeout_and_repair_use_actual_compositor() {
+    let mut state = KittyHostState::default();
+    let now = std::time::Instant::now();
+    let mut probe = Vec::new();
+    assert!(state.begin_shared_memory_probe(&mut probe, now).unwrap());
+    let probe = String::from_utf8(probe).unwrap();
+    assert!(probe.contains("a=q,t=s"));
+    assert!(probe.contains("q=0;"));
+    let probe_id = state.next_host_id;
+    let encoded = probe
+        .split_once(';')
+        .unwrap()
+        .1
+        .strip_suffix("\x1b\\")
+        .unwrap();
+    let name = String::from_utf8(crate::codec::kitty::base64_decode(encoded.as_bytes())).unwrap();
+    let probe_path = std::path::Path::new("/dev/shm").join(&name[1..]);
+    assert_eq!(std::fs::read(&probe_path).unwrap(), [0, 0, 0]);
+    assert!(!state.handle_shared_memory_reply(b"\x1b_Gi=4294967295;OK\x1b\\", now));
+    assert!(probe_path.exists());
+    assert!(
+        state.handle_shared_memory_reply(format!("\x1b_Gi={probe_id};OK\x1b\\").as_bytes(), now)
+    );
+    assert!(!probe_path.exists());
+    let images = [image()];
+    let output = String::from_utf8(frame(&mut state, &images, &[], &kitty())).unwrap();
+    assert_eq!(output.matches("a=t,t=s").count(), 1);
+    assert_eq!(output.matches("a=p").count(), 1);
+    assert!(output.find("a=t").unwrap() < output.find("a=p").unwrap());
+    let upload = output.split_once("a=t,t=s").unwrap().1;
+    let encoded = upload
+        .split_once(';')
+        .unwrap()
+        .1
+        .split_once("\x1b\\")
+        .unwrap()
+        .0;
+    let name = String::from_utf8(crate::codec::kitty::base64_decode(encoded.as_bytes())).unwrap();
+    let path = std::path::Path::new("/dev/shm").join(&name[1..]);
+    assert_eq!(std::fs::read(&path).unwrap(), (0..32).collect::<Vec<_>>());
+    let fork = state.clone();
+    drop(fork);
+    assert!(
+        path.exists(),
+        "dropping a speculative clone must retain pending leases"
+    );
+    state.expire_shared_memory(now + std::time::Duration::from_secs(3));
+    assert!(!path.exists());
+    let repaired = String::from_utf8(frame(&mut state, &images, &[], &kitty())).unwrap();
+    assert!(repaired.contains("a=d"));
+    assert!(repaired.contains("a=t"));
+    assert!(!repaired.contains("t=s"));
+    assert!(repaired.find("a=d").unwrap() < repaired.find("a=t").unwrap());
+}
+
+#[cfg(all(feature = "kitty", target_os = "linux"))]
+#[test]
+fn shared_memory_probe_error_drop_and_partial_output_release_owned_objects() {
+    let now = std::time::Instant::now();
+    for reject in [false, true] {
+        let mut state = KittyHostState::default();
+        let mut probe = Vec::new();
+        assert!(state.begin_shared_memory_probe(&mut probe, now).unwrap());
+        let command = String::from_utf8(probe).unwrap();
+        let encoded = command
+            .split_once(';')
+            .unwrap()
+            .1
+            .strip_suffix("\x1b\\")
+            .unwrap();
+        let name =
+            String::from_utf8(crate::codec::kitty::base64_decode(encoded.as_bytes())).unwrap();
+        let path = std::path::Path::new("/dev/shm").join(&name[1..]);
+        assert!(path.exists());
+        if reject {
+            let id = state.next_host_id;
+            assert!(state.handle_shared_memory_reply(
+                format!("\x1b_Gi={id};ENOENT: inaccessible\x1b\\").as_bytes(),
+                now
+            ));
+            assert!(!path.exists());
+        }
+        drop(state);
+        assert!(!path.exists());
+    }
+    struct Partial(Vec<u8>);
+    impl std::io::Write for Partial {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if self.0.is_empty() {
+                self.0.extend_from_slice(&bytes[..3]);
+                Ok(3)
+            } else {
+                Err(std::io::Error::other("injected partial APC failure"))
+            }
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut state = KittyHostState::default();
+    let mut output = Partial(Vec::new());
+    assert!(state.begin_shared_memory_probe(&mut output, now).is_err());
+    assert_eq!(output.0, b"\x1b\\\x1b");
+    let repaired = frame(&mut state, &[image()], &[], &kitty());
+    assert!(repaired.starts_with(b"\x1b\\"));
+    let repaired = String::from_utf8(repaired).unwrap();
+    assert!(repaired.contains("a=t"));
+    assert!(!repaired.contains("t=s"));
+    state.expire_shared_memory(now + std::time::Duration::from_secs(3));
+    assert!(!state.handle_shared_memory_reply(
+        format!("\x1b_Gi={};OK\x1b\\", state.next_host_id).as_bytes(),
+        now + std::time::Duration::from_secs(3),
+    ));
+}
+
+#[cfg(all(feature = "kitty", target_os = "linux"))]
+fn pending_probe() -> (KittyHostState, std::path::PathBuf, std::time::Instant) {
+    let mut state = KittyHostState::default();
+    let now = std::time::Instant::now();
+    let mut bytes = Vec::new();
+    assert!(state.begin_shared_memory_probe(&mut bytes, now).unwrap());
+    let command = String::from_utf8(bytes).unwrap();
+    let encoded = command
+        .split_once(';')
+        .unwrap()
+        .1
+        .strip_suffix("\x1b\\")
+        .unwrap();
+    let name = String::from_utf8(crate::codec::kitty::base64_decode(encoded.as_bytes())).unwrap();
+    (
+        state,
+        std::path::Path::new("/dev/shm").join(&name[1..]),
+        now,
+    )
+}
+
+#[cfg(all(feature = "kitty", target_os = "linux"))]
+#[test]
+fn discarded_and_failed_repair_candidates_cannot_discharge_stream_repair() {
+    let (mut committed, path, _) = pending_probe();
+    committed.abort_shared_memory();
+    assert!(!path.exists());
+    for fail in [false, true] {
+        let mut candidate = committed.clone();
+        let bytes = frame(&mut candidate, &[image()], &[], &kitty());
+        assert!(bytes.starts_with(b"\x1b\\"));
+        if fail {
+            committed.invalidate_after_failed_output(&candidate);
+        }
+        drop(candidate); // Bytes were discarded, or their flush failed.
+        let retry = frame(&mut committed.clone(), &[image()], &[], &kitty());
+        assert!(
+            retry.starts_with(b"\x1b\\"),
+            "repair must survive buffered output"
+        );
+    }
+}
+
+#[cfg(all(feature = "kitty", target_os = "linux"))]
+#[test]
+fn speculative_reset_protocol_switch_and_failed_output_retain_committed_upload_lease() {
+    let (mut committed, probe_path, now) = pending_probe();
+    let probe_id = committed.next_host_id;
+    assert!(
+        committed
+            .handle_shared_memory_reply(format!("\x1b_Gi={probe_id};OK\x1b\\").as_bytes(), now)
+    );
+    assert!(!probe_path.exists());
+    let bytes = String::from_utf8(frame(&mut committed, &[image()], &[], &kitty())).unwrap();
+    let upload = bytes.split_once("a=t,t=s").unwrap().1;
+    let encoded = upload
+        .split_once(';')
+        .unwrap()
+        .1
+        .split_once("\x1b\\")
+        .unwrap()
+        .0;
+    let name = String::from_utf8(crate::codec::kitty::base64_decode(encoded.as_bytes())).unwrap();
+    let path = std::path::Path::new("/dev/shm").join(&name[1..]);
+    let upload_id = committed.next_host_id;
+    for switch in [false, true] {
+        let mut candidate = committed.clone();
+        let mut discarded = Vec::new();
+        if switch {
+            candidate.select_protocol(&mut discarded, None).unwrap();
+        } else {
+            candidate.reset(&mut discarded).unwrap();
+        }
+        assert!(
+            path.exists(),
+            "speculative scene reset cannot revoke host-readable bytes"
+        );
+        committed.invalidate_after_failed_output(&candidate);
+        drop(candidate);
+        assert!(
+            path.exists(),
+            "failed candidate cannot revoke prior committed upload"
+        );
+    }
+    assert!(
+        committed
+            .handle_shared_memory_reply(format!("\x1b_Gi={upload_id};OK\x1b\\").as_bytes(), now)
+    );
+    assert!(!path.exists());
+}
+
+#[cfg(all(feature = "sixel", feature = "iterm2"))]
+#[test]
+fn cancellable_raster_protocols_match_existing_actual_output() {
+    let mut png = Vec::new();
+    use image::ImageEncoder;
+    image::codecs::png::PngEncoder::new(&mut png)
+        .write_image(
+            &(0..32).collect::<Vec<u8>>(),
+            4,
+            2,
+            image::ExtendedColorType::Rgba8,
+        )
+        .unwrap();
+    let mut source = image();
+    source.payload.pixels = Some(PixelBuffer {
+        width: 4,
+        height: 2,
+        format: PixelFormat::Png,
+        data: png,
+    });
+    for caps in [
+        HostImageCapabilities {
+            sixel: true,
+            cell_pixel_width: 3,
+            cell_pixel_height: 4,
+            ..Default::default()
+        },
+        HostImageCapabilities {
+            iterm2_inline: true,
+            cell_pixel_width: 1,
+            cell_pixel_height: 1,
+            ..Default::default()
+        },
+    ] {
+        let direct = frame(
+            &mut KittyHostState::default(),
+            &[source.clone()],
+            &[],
+            &caps,
+        );
+        let mut candidate = KittyHostState::default();
+        candidate.set_cancellation(Some(std::sync::Arc::new(
+            std::sync::atomic::AtomicBool::new(false),
+        )));
+        let actual = frame(&mut candidate, &[source.clone()], &[], &caps);
+        assert_eq!(actual, direct, "PNG passthrough / Sixel scaled wire parity");
+    }
+}
+
+#[cfg(feature = "kitty")]
+#[test]
 fn declared_working_set_preserves_late_hot_resource_under_pressure() {
     let mut state = KittyHostState::default();
     // Resource 1 is hot but painted late; resource 2 is cold. Fill the budget

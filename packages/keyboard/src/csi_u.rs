@@ -226,7 +226,7 @@ pub fn decode(bytes: &[u8]) -> Option<DecodeResult> {
             break;
         }
         // Only digits and semicolons are valid in the parameter area.
-        if !byte.is_ascii_digit() && byte != b';' {
+        if !byte.is_ascii_digit() && byte != b';' && byte != b':' {
             return None;
         }
     }
@@ -237,6 +237,18 @@ pub fn decode(bytes: &[u8]) -> Option<DecodeResult> {
     let consumed = 2 + final_idx + 1; // ESC + [ + params + final
 
     // Parse parameters (semicolon-separated numbers).
+    // Validate every subparameter; never skip malformed fields and shift modifiers.
+    if params_bytes.split(|byte| *byte == b';').any(|field| {
+        field.split(|byte| *byte == b':').any(|part| {
+            !part.is_empty()
+                && std::str::from_utf8(part)
+                    .ok()
+                    .and_then(|value| value.parse::<u32>().ok())
+                    .is_none()
+        })
+    }) {
+        return None;
+    }
     let params = parse_params(params_bytes);
 
     if final_byte == b'u' {
@@ -328,7 +340,7 @@ fn parse_params(bytes: &[u8]) -> Vec<u32> {
             if part.is_empty() {
                 Some(0) // Empty param defaults to 0 per ECMA-48
             } else {
-                part.parse::<u32>().ok()
+                part.split(':').next()?.parse::<u32>().ok()
             }
         })
         .collect()
@@ -338,6 +350,17 @@ fn parse_params(bytes: &[u8]) -> Vec<u32> {
 mod tests {
     use super::*;
     use crate::types::{KeyCode, KeyStroke, Modifiers};
+
+    #[test]
+    fn decode_colon_event_and_alternate_key_fields() {
+        let event = decode(b"\x1b[97;5:1u").expect("Ctrl-a press subparameter");
+        assert_eq!(event.stroke.key, KeyCode::Char('a'));
+        assert!(event.stroke.modifiers.ctrl);
+        let alternate = decode(b"\x1b[97:65;2u").expect("alternate shifted key");
+        assert_eq!(alternate.stroke.key, KeyCode::Char('a'));
+        assert!(alternate.stroke.modifiers.shift);
+        assert!(decode(b"\x1b[97;bad:1u").is_none());
+    }
 
     #[test]
     fn modifier_param_none() {

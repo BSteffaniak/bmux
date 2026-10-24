@@ -146,6 +146,15 @@ impl ImageScene {
         self.visibility_sources.clear();
     }
 
+    fn snapshot_active(&mut self) -> BTreeMap<ImageKey, ImagePlacement> {
+        if self.sources.is_empty() && self.visibility_sources.is_empty() {
+            // Bootstrap legacy serialized active-only scenes before detaching
+            // their payloads; normal composed scenes already own originals.
+            self.sources.clone_from(&self.active);
+        }
+        std::mem::take(&mut self.active)
+    }
+
     /// Reconcile original image lifetime, then project opaque paint-order clips.
     /// Hidden persistent sources remain retained; only visibility fragments are
     /// retired. Rectangles partition existing pieces, never duplicate pixels.
@@ -156,7 +165,7 @@ impl ImageScene {
     ) -> ImageSceneDelta {
         #[cfg(test)]
         RECONCILE_WORK.with(|work| work.set((work.get().0 + 1, work.get().1)));
-        let previous = self.active.clone();
+        let previous = self.snapshot_active();
         let previous_sources = self.visibility_sources.clone();
         self.apply_contributions(contributions);
         let mut painted_at = BTreeMap::new();
@@ -281,6 +290,82 @@ mod tests {
             clip: Rect::new(0, 0, 80, 24),
             lifecycle,
         }
+    }
+
+    fn payload_ptr(image: &ImagePlacement) -> *const u8 {
+        match &image.payload {
+            ImagePayload::Png { bytes, .. } | ImagePayload::Pixels { bytes, .. } => bytes.as_ptr(),
+        }
+    }
+
+    #[test]
+    fn occluded_previous_snapshot_moves_payload_allocation() {
+        let mut scene = ImageScene::default();
+        scene.reconcile(&[ImageContribution::Present(placement(
+            "warm",
+            0,
+            ImageLifecycle::Persistent,
+        ))]);
+        let key = ImageKey::new("warm");
+        let original = payload_ptr(&scene.active[&key]);
+        let previous = scene.snapshot_active();
+        assert_eq!(
+            payload_ptr(&previous[&key]),
+            original,
+            "staged previous snapshot must move, not copy, encoded payload bytes"
+        );
+    }
+
+    #[test]
+    fn occluded_moved_snapshot_preserves_legacy_duplicate_lifetime_and_fragments() {
+        let persistent = placement("persistent", 0, ImageLifecycle::Persistent);
+        let stale = placement("stale", 4, ImageLifecycle::Frame);
+        let mut legacy = ImageScene::default();
+        legacy
+            .active
+            .insert(persistent.key.clone(), persistent.clone());
+        legacy.active.insert(stale.key.clone(), stale);
+        let mut canonical = ImageScene::default();
+        canonical.reconcile(&[
+            ImageContribution::Present(persistent),
+            ImageContribution::Present(placement("stale", 4, ImageLifecycle::Frame)),
+        ]);
+        let mut replacement = placement("dup", 2, ImageLifecycle::Persistent);
+        replacement.destination = Rect::new(2, 0, 4, 1);
+        replacement.clip = replacement.destination;
+        let contributions = [
+            ImageContribution::Present(placement("dup", 1, ImageLifecycle::Frame)),
+            ImageContribution::Remove(ImageKey::new("dup")),
+            ImageContribution::Present(replacement),
+        ];
+        let occlusions = [(3, Rect::new(3, 0, 1, 1))];
+        let original_legacy = legacy.clone();
+        let delta = legacy.reconcile_occluded(&contributions, &occlusions);
+        let expected = canonical.reconcile_occluded(&contributions, &occlusions);
+        assert_eq!(delta, expected);
+        assert_eq!(legacy, canonical);
+        assert_eq!(legacy.visibility_sources, canonical.visibility_sources);
+        assert_eq!(legacy.sources, canonical.sources);
+        assert_eq!(
+            original_legacy.active.len(),
+            2,
+            "staging must leave rollback original untouched"
+        );
+        assert_eq!(original_legacy.sources.len(), 0);
+        assert!(delta.removed.contains(&ImageKey::new("stale")));
+        assert!(!legacy.active.contains_key(&ImageKey::new("stale")));
+        assert_eq!(
+            legacy.sources[&ImageKey::new("dup")].lifecycle,
+            ImageLifecycle::Persistent
+        );
+        let warm = legacy.reconcile_occluded(&contributions, &occlusions);
+        assert_eq!(warm, ImageSceneDelta::default());
+        assert_eq!(
+            legacy.reconcile_occluded(&[], &[]),
+            canonical.reconcile_occluded(&[], &[])
+        );
+        assert_eq!(legacy, canonical);
+        assert_eq!(legacy.sources.len(), 2);
     }
 
     #[test]

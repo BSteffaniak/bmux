@@ -71,6 +71,7 @@ impl Cache {
         &mut self,
         image: &PaneImage,
         shared: Option<&Arc<PaneImage>>,
+        cancelled: Option<&std::sync::atomic::AtomicBool>,
     ) -> std::io::Result<Arc<PixelBuffer>> {
         if let Some(index) = self.sources.iter().position(|source| {
             source.protocol == image.protocol && same(&source.payload, image, shared)
@@ -80,7 +81,28 @@ impl Cache {
             self.sources.push(source);
             return Ok(pixels);
         }
-        let pixels = Arc::new(super::clipping::decoded(image)?);
+        let pixels = Arc::new(if let Some(token) = cancelled {
+            let png = image
+                .payload
+                .pixels
+                .as_ref()
+                .filter(|p| p.format == crate::model::PixelFormat::Png)
+                .map(|p| p.data.as_slice())
+                .or_else(|| {
+                    (image.protocol == crate::model::ImageProtocol::KittyGraphics)
+                        .then_some(image.payload.raw.as_deref())
+                        .flatten()
+                });
+            if let Some(bytes) = png {
+                super::clipping::decode_png_cancellable(bytes, 64 * 1024 * 1024, || {
+                    token.load(std::sync::atomic::Ordering::Acquire)
+                })?
+            } else {
+                super::clipping::decoded(image)?
+            }
+        } else {
+            super::clipping::decoded(image)?
+        });
         self.decodes += 1;
         self.sources.push(Source {
             protocol: image.protocol,

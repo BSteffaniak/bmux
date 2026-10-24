@@ -47,6 +47,38 @@ pub fn base64_decode(input: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Append padded base64 with a cancellation check per at most 3072 input bytes.
+/// Cancellation rolls back this call's output; existing prefix bytes survive.
+///
+/// # Errors
+/// * Returns `Interrupted` when the checkpoint requests cancellation.
+pub fn base64_encode_into_cancellable(
+    input: &[u8],
+    out: &mut Vec<u8>,
+    mut cancelled: impl FnMut() -> bool,
+) -> std::io::Result<()> {
+    let original = out.len();
+    // All non-final boundaries are multiples of three, preserving exact padding.
+    for chunk in input.chunks(3072) {
+        if cancelled() {
+            out.truncate(original);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "image encoding cancelled",
+            ));
+        }
+        base64_encode_into(chunk, out);
+    }
+    if cancelled() {
+        out.truncate(original);
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            "image encoding cancelled",
+        ));
+    }
+    Ok(())
+}
+
 /// Simple base64 encoder (standard alphabet with padding).
 pub fn base64_encode(input: &[u8]) -> String {
     let mut out = Vec::with_capacity(input.len().div_ceil(3) * 4);
@@ -79,6 +111,38 @@ pub fn base64_encode_into(input: &[u8], out: &mut Vec<u8>) {
             out.push(CHARS[(triple & 0x3F) as usize]);
         } else {
             out.push(b'=');
+        }
+    }
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+
+    #[test]
+    fn bounded_steps_cancel_and_rollback_without_padding_changes() {
+        let input: Vec<u8> = (0..20_003).map(|i| (i % 251) as u8).collect();
+        let expected = base64_encode(&input);
+        let mut complete = b"prefix".to_vec();
+        let mut steps = 0;
+        base64_encode_into_cancellable(&input, &mut complete, || {
+            steps += 1;
+            false
+        })
+        .unwrap();
+        assert_eq!(&complete[6..], expected.as_bytes());
+        assert_eq!(steps, input.len().div_ceil(3072) + 1);
+        for stop in 1..=steps {
+            let mut actual = b"prefix".to_vec();
+            let mut checks = 0;
+            let error = base64_encode_into_cancellable(&input, &mut actual, || {
+                checks += 1;
+                checks == stop
+            })
+            .unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::Interrupted);
+            assert_eq!(checks, stop);
+            assert_eq!(actual, b"prefix");
         }
     }
 }

@@ -159,6 +159,9 @@ fn pop_keyboard_enhancement_flags<W: Write>(writer: &mut W) -> io::Result<()> {
     writer.flush()
 }
 
+#[cfg(target_os = "linux")]
+pub mod input;
+
 /// Async Crossterm event stream converted into backend-neutral BMUX events.
 pub struct CrosstermEventStream {
     inner: EventStream,

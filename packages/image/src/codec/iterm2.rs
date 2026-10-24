@@ -142,9 +142,50 @@ pub fn encode_body_with_cells(image_data: &[u8], columns: u16, rows: u16) -> Vec
     body
 }
 
+/// Encode the exact iTerm2 cell-sized body with bounded base64 checkpoints.
+///
+/// # Errors
+/// * Interrupted when cancellation is requested; no partial body is returned.
+pub fn encode_body_with_cells_cancellable(
+    image_data: &[u8],
+    columns: u16,
+    rows: u16,
+    cancelled: impl FnMut() -> bool,
+) -> std::io::Result<Vec<u8>> {
+    let mut body =
+        format!("inline=1;width={columns};height={rows};preserveAspectRatio=0:").into_bytes();
+    super::base64::base64_encode_into_cancellable(image_data, &mut body, cancelled)?;
+    Ok(body)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cancellable_body_keeps_wire_and_cancels_in_base64() {
+        let bytes = vec![0x83; 20_003];
+        let expected = encode_body_with_cells(&bytes, 17, 9);
+        let mut total = 0;
+        assert_eq!(
+            encode_body_with_cells_cancellable(&bytes, 17, 9, || {
+                total += 1;
+                false
+            })
+            .unwrap(),
+            expected
+        );
+        for stop in 1..=total {
+            let mut steps = 0;
+            let error = encode_body_with_cells_cancellable(&bytes, 17, 9, || {
+                steps += 1;
+                steps == stop
+            })
+            .unwrap_err();
+            assert_eq!(steps, stop);
+            assert_eq!(error.kind(), std::io::ErrorKind::Interrupted);
+        }
+    }
 
     #[test]
     fn parse_basic_inline_image() {

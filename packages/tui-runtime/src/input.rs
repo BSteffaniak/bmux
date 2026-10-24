@@ -13,6 +13,126 @@ type PrivateRouter<M> = (
     Box<dyn Fn(super::private_input::PrivateInputRoute) -> M + Send>,
 );
 
+/// Bounded retrievable opaque packets for a single input connection.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Default)]
+pub struct OpaqueInputQueue(std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<Vec<u8>>>>);
+#[cfg(target_os = "linux")]
+impl OpaqueInputQueue {
+    /// Retain unchanged bytes, rejecting overflow instead of dropping old packets.
+    /// # Errors
+    /// Returns a budget error at 64 packets or 64 KiB total.
+    pub fn push(&self, bytes: Vec<u8>) -> std::io::Result<()> {
+        let mut queue = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if queue.len() >= 64
+            || queue
+                .iter()
+                .map(Vec::len)
+                .sum::<usize>()
+                .saturating_add(bytes.len())
+                > 65536
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::OutOfMemory,
+                "opaque input queue budget exceeded",
+            ));
+        }
+        queue.push_back(bytes);
+        drop(queue);
+        Ok(())
+    }
+    /// Whether no opaque packets remain retained.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty()
+    }
+
+    /// Retrieve the oldest unmatched packet unchanged.
+    pub fn take(&self) -> Option<Vec<u8>> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pop_front()
+    }
+}
+
+/// Bounded opt-in packet reader. No Crossterm reader is constructed on this path.
+#[cfg(target_os = "linux")]
+pub struct ManagedRawInput {
+    receiver: mpsc::Receiver<std::io::Result<bmux_tui::crossterm::input::LinuxInputPacket>>,
+    shutdown: watch::Sender<bool>,
+    task: Option<JoinHandle<()>>,
+}
+#[cfg(target_os = "linux")]
+impl ManagedRawInput {
+    fn start(capacity: usize) -> std::io::Result<Self> {
+        let reader = bmux_tui::crossterm::input::RawInput::open_stdout_tty()?;
+        Ok(Self::from_reader(reader, capacity))
+    }
+    /// Adopt an exclusive raw reader, retaining the same bounded admission contract.
+    #[must_use]
+    pub fn from_reader(mut reader: bmux_tui::crossterm::input::RawInput, capacity: usize) -> Self {
+        // Explicit cap bounds queued opaque bytes even for untrusted capacities.
+        let (sender, receiver) = mpsc::channel(capacity.clamp(1, 256));
+        let (shutdown, mut stopped) = watch::channel(false);
+        let task = tokio::spawn(async move {
+            loop {
+                if *stopped.borrow() {
+                    break;
+                }
+                let packet = match reader.read_ready(std::time::Instant::now()) {
+                    Ok(Some(packet)) => Ok(packet),
+                    Ok(None) => {
+                        tokio::select! { biased; _ = stopped.changed() => break,
+                        () = tokio::time::sleep(std::time::Duration::from_millis(2)) => {} }
+                        continue;
+                    }
+                    Err(error) => Err(error),
+                };
+                let terminal = packet.is_err();
+                tokio::select! { biased; _ = stopped.changed() => break,
+                result = sender.send(packet) => if result.is_err() { break; } }
+                if terminal {
+                    break;
+                }
+            }
+        });
+        Self {
+            receiver,
+            shutdown,
+            task: Some(task),
+        }
+    }
+    /// Receive an ordinary event or unchanged opaque packet, in read order.
+    pub async fn recv(
+        &mut self,
+    ) -> Option<std::io::Result<bmux_tui::crossterm::input::LinuxInputPacket>> {
+        self.receiver.recv().await
+    }
+    /// Stop admission and await reader ownership release, even under channel backpressure.
+    pub async fn shutdown(&mut self) {
+        let _ = self.shutdown.send(true);
+        if let Some(task) = self.task.take() {
+            let _ = task.await;
+        }
+    }
+}
+#[cfg(target_os = "linux")]
+impl Drop for ManagedRawInput {
+    fn drop(&mut self) {
+        let _ = self.shutdown.send(true);
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
+}
+
 /// Managed bounded terminal event stream.
 pub struct ManagedTerminalInput {
     receiver: mpsc::Receiver<Result<Event, std::io::Error>>,
@@ -21,6 +141,15 @@ pub struct ManagedTerminalInput {
 }
 
 impl ManagedTerminalInput {
+    /// Open an opt-in sole Linux raw packet owner. Legacy constructors are unchanged.
+    /// Never combine this owner with another terminal reader.
+    /// # Errors
+    /// Returns tty identity/open errors.
+    #[cfg(target_os = "linux")]
+    pub fn start_raw_packets(capacity: usize) -> std::io::Result<ManagedRawInput> {
+        ManagedRawInput::start(capacity)
+    }
+
     /// Start an asynchronous terminal reader with the requested bounded event capacity.
     ///
     /// # Panics

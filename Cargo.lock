@@ -2308,6 +2308,7 @@ dependencies = [
  "bmux_ipc",
  "bmux_tui 0.0.1-alpha.4",
  "image",
+ "png",
  "serde",
  "uuid",
  "windows-sys 0.61.2",
