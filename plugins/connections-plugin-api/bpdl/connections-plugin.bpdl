@@ -111,6 +111,7 @@ interface pairing-types {
 // require host-trusted local owner provenance for administrative operations.
 @capability(CONNECTIONS_PAIRING)
 interface pairing-commands {
+    command set-enabled(enabled: bool) -> pairing-types.listener-status;
     command start-listener() -> pairing-types.listener-status;
     // Local owner authorizes this exact host and invitation-bound device key.
     command pair-endpoint(target: string, invitation: pairing-types.invitation) -> string;

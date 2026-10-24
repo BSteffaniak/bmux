@@ -1,13 +1,24 @@
 execution_class = "native_standard"
 id = "bmux.connections"
 name = "bmux Connections"
+owns_namespaces = [
+    "remote",
+    "remote-enable",
+    "remote-disable",
+    "remote-pair-request",
+    "remote-approve",
+    "remote-pair",
+    "remote-list",
+    "remote-status",
+    "remote-revoke",
+]
 provided_capabilities = [
     "bmux.connections.read",
     "bmux.connections.invoke",
     "bmux.connections.pairing",
 ]
 provided_features = ["bmux.connections"]
-required_capabilities = ["bmux.clients.read"]
+required_capabilities = ["bmux.clients.read", "bmux.permissions.write"]
 version = "0.0.1-alpha.0"
 
 [[services]]
@@ -39,3 +50,131 @@ kind         = "query"
 capability   = "bmux.connections.pairing"
 interface_id = "admission-provider-commands"
 kind         = "command"
+
+[[commands]]
+aliases       = [["remote", "enable"]]
+expose_in_cli = true
+name          = "remote-enable"
+path          = ["remote-enable"]
+summary       = "Remote enable"
+
+[[commands.arguments]]
+kind     = "boolean"
+long     = "yes"
+name     = "yes"
+required = false
+
+[[commands]]
+aliases       = [["remote", "disable"]]
+expose_in_cli = true
+name          = "remote-disable"
+path          = ["remote-disable"]
+summary       = "Remote disable"
+
+[[commands]]
+aliases       = [["remote", "pair-request"]]
+expose_in_cli = true
+name          = "remote-pair-request"
+path          = ["remote-pair-request"]
+summary       = "Remote pair-request"
+
+[[commands]]
+aliases       = [["remote", "approve"]]
+expose_in_cli = true
+name          = "remote-approve"
+path          = ["remote-approve"]
+summary       = "Remote approve"
+
+[[commands.arguments]]
+kind     = "string"
+name     = "value"
+position = 0
+required = false
+
+[[commands.arguments]]
+kind     = "string"
+long     = "name"
+name     = "name"
+required = false
+
+[[commands.arguments]]
+kind     = "string"
+long     = "file"
+name     = "file"
+required = false
+
+[[commands.arguments]]
+kind     = "boolean"
+long     = "stdin"
+name     = "stdin"
+required = false
+
+[[commands.arguments]]
+kind     = "boolean"
+long     = "yes"
+name     = "yes"
+required = false
+
+[[commands]]
+aliases       = [["remote", "pair"]]
+expose_in_cli = true
+name          = "remote-pair"
+path          = ["remote-pair"]
+summary       = "Remote pair"
+
+[[commands.arguments]]
+kind     = "string"
+name     = "value"
+position = 0
+required = false
+
+[[commands.arguments]]
+kind     = "string"
+long     = "name"
+name     = "name"
+required = false
+
+[[commands.arguments]]
+kind     = "string"
+long     = "file"
+name     = "file"
+required = false
+
+[[commands.arguments]]
+kind     = "boolean"
+long     = "stdin"
+name     = "stdin"
+required = false
+
+[[commands]]
+aliases       = [["remote", "list"]]
+expose_in_cli = true
+name          = "remote-list"
+path          = ["remote-list"]
+summary       = "Remote list"
+
+[[commands]]
+aliases       = [["remote", "status"]]
+expose_in_cli = true
+name          = "remote-status"
+path          = ["remote-status"]
+summary       = "Remote status"
+
+[[commands.arguments]]
+kind     = "string"
+name     = "value"
+position = 0
+required = false
+
+[[commands]]
+aliases       = [["remote", "revoke"]]
+expose_in_cli = true
+name          = "remote-revoke"
+path          = ["remote-revoke"]
+summary       = "Remote revoke"
+
+[[commands.arguments]]
+kind     = "string"
+name     = "value"
+position = 0
+required = false

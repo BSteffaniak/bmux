@@ -10,8 +10,11 @@ mod identity;
 mod listener;
 mod outbound;
 mod pairing;
+mod remote_cli;
+mod remote_preferences;
 mod storage;
 mod target;
+pub mod terminal_attach;
 mod transport;
 
 use bmux_client::{
@@ -92,7 +95,11 @@ impl ConnectionsPlugin {
             .local_runtime
             .as_ref()
             .ok_or_else(|| ServiceResponse::error("unavailable", "inactive runtime"))?;
-        if !runtime.ingress_allowed() {
+        if !remote_preferences::update(&target::context_paths(&context.connection), |p| {
+            Ok(p.enabled.unwrap_or_else(|| runtime.ingress_allowed()))
+        })
+        .map_err(pairing_error)?
+        {
             return Err(ServiceResponse::error(
                 "ingress_denied",
                 "explicit full-runtime ingress policy required",
@@ -280,8 +287,17 @@ impl RustPlugin for ConnectionsPlugin {
         self.pairing = None;
         self.admission = None;
         self.admission_handle = None;
-        let settings = config::RemoteSettings::load(context.settings.as_ref())
+        let mut settings = config::RemoteSettings::load(context.settings.as_ref())
             .map_err(|error| PluginCommandError::failed(error.to_string()))?;
+        let preferences_enabled =
+            remote_preferences::update(&target::context_paths(&context.connection), |p| {
+                Ok(p.enabled)
+            })
+            .map_err(|e| PluginCommandError::failed(e.to_string()))?;
+        if let Some(enabled) = preferences_enabled {
+            settings.allow_full_runtime_ingress = enabled;
+            settings.auto_start = enabled;
+        }
         let identity = identity::RuntimeIdentity::load_or_create(
             std::path::Path::new(&context.connection.state_dir),
             std::path::Path::new(&context.connection.runtime_dir),
@@ -344,6 +360,10 @@ impl RustPlugin for ConnectionsPlugin {
         Ok(EXIT_OK)
     }
 
+    fn run_command(&mut self, context: NativeCommandContext) -> Result<i32, PluginCommandError> {
+        remote_cli::run(&context).map_err(|e| PluginCommandError::failed(e.to_string()))
+    }
+
     fn invoke_service(&self, context: NativeServiceContext) -> ServiceResponse {
         bmux_plugin_sdk::route_service!(context, {
             "pairing-state", "local-device-identity" => |(): (), ctx| {
@@ -362,6 +382,13 @@ impl RustPlugin for ConnectionsPlugin {
                     return Err(ServiceResponse::error("invalid_target", "device endpoint required"));
                 };
                 block_on_connection(transport::pair_endpoint(&paths, &target, &request.invitation)).map_err(pairing_error)
+            },
+            "pairing-commands", "set-enabled" => |request: pairing_requests::SetEnabledRequest, ctx| {
+                let _owner = pairing_owner(ctx)?;
+                let paths = target::context_paths(&ctx.connection);
+                if !request.enabled { self.stop_listener(ctx)?; }
+                remote_preferences::update(&paths, |p| { p.enabled = Some(request.enabled); Ok(()) }).map_err(pairing_error)?;
+                if request.enabled { self.start_listener(ctx) } else { self.listener_status() }
             },
             "pairing-commands", "start-listener" => |(): (), ctx| { self.start_listener(ctx) },
             "pairing-commands", "stop-listener" => |(): (), ctx| { self.stop_listener(ctx) },
@@ -608,6 +635,42 @@ fn invoke_service(
             }
         }
     })
+}
+
+/// Resolve an owner-paired display name without exposing private device credentials.
+///
+/// # Errors
+/// Returns an error if the private runtime preferences cannot be read.
+pub fn paired_target(
+    paths: &bmux_config::ConfigPaths,
+    name: &str,
+) -> anyhow::Result<Option<String>> {
+    remote_preferences::alias(paths, name)
+}
+
+/// Open a dedicated admitted connection using the plugin-owned identity and trust binding.
+///
+/// # Errors
+/// Fails closed for unpaired, revoked, unreachable or incompatible endpoints.
+pub async fn connect_paired(
+    paths: &bmux_config::ConfigPaths,
+    reference: &str,
+) -> anyhow::Result<BmuxClient> {
+    let config = bmux_config::BmuxConfig::load_isolated_with_paths_and_overrides(
+        paths,
+        &bmux_config::ConfigLoadOverrides::default(),
+    )?;
+    let reference =
+        remote_preferences::alias(paths, reference)?.unwrap_or_else(|| reference.to_owned());
+    let resolved = target::resolve_internal(&config, &reference)
+        .map_err(|_| anyhow::anyhow!("invalid paired target"))?;
+    anyhow::ensure!(
+        matches!(resolved, target::ResolvedTarget::Iroh(_)),
+        "paired device endpoint required"
+    );
+    transport::connect(&config, paths, &resolved)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e:?}"))
 }
 
 struct AcquisitionPolicy<'a> {

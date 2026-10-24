@@ -191,7 +191,7 @@ impl PairingAuthority {
                     .any(|device| device.device_key == invitation.key),
                 "device already enrolled; owner must grant explicitly"
             );
-            let device_id = Uuid::new_v4();
+            let device_id = id;
             let device = Device {
                 device_id: device_id.to_string(),
                 device_key: invitation.key.clone(),

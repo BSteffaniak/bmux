@@ -2013,11 +2013,13 @@ name = "bmux_connections_plugin"
 version = "0.0.1-alpha.4"
 dependencies = [
  "anyhow",
+ "bmux_attach_layout_protocol",
  "bmux_client",
  "bmux_clients_plugin_api",
  "bmux_config",
  "bmux_connections_plugin_api",
  "bmux_ipc",
+ "bmux_keyboard 0.0.1-alpha.4",
  "bmux_pane_runtime_plugin",
  "bmux_pane_runtime_plugin_api",
  "bmux_permissions_plugin",
@@ -2026,6 +2028,7 @@ dependencies = [
  "bmux_plugin_sdk",
  "bmux_server",
  "bmux_sessions_plugin",
+ "bmux_terminal_grid",
  "iroh",
  "libc",
  "reqwest 0.13.4",

@@ -15,13 +15,18 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 anyhow = { workspace = true, features = ["std"] }
+bmux_attach_layout_protocol = { workspace = true }
 bmux_client = { workspace = true }
 bmux_clients_plugin_api = { workspace = true }
 bmux_config = { workspace = true }
 bmux_connections_plugin_api = { workspace = true }
 bmux_ipc = { workspace = true, features = ["compression-zstd"] }
+bmux_keyboard = { workspace = true }
+bmux_pane_runtime_plugin_api = { workspace = true }
+bmux_permissions_plugin_api = { workspace = true }
 bmux_plugin = { workspace = true }
 bmux_plugin_sdk = { workspace = true }
+bmux_terminal_grid = { workspace = true }
 iroh = { workspace = true }
 libc = { workspace = true }
 reqwest = { workspace = true }
@@ -55,10 +60,8 @@ fail-on-warnings = [
 static-bundled = []
 
 [dev-dependencies]
-bmux_pane_runtime_plugin     = { workspace = true, features = ["static-bundled"] }
-bmux_pane_runtime_plugin_api = { workspace = true }
-bmux_permissions_plugin      = { workspace = true, features = ["static-bundled"] }
-bmux_permissions_plugin_api  = { workspace = true }
-bmux_server                  = { workspace = true }
-bmux_sessions_plugin         = { workspace = true, features = ["static-bundled"] }
-tempfile                     = { workspace = true }
+bmux_pane_runtime_plugin = { workspace = true, features = ["static-bundled"] }
+bmux_permissions_plugin  = { workspace = true, features = ["static-bundled"] }
+bmux_server              = { workspace = true }
+bmux_sessions_plugin     = { workspace = true, features = ["static-bundled"] }
+tempfile                 = { workspace = true }

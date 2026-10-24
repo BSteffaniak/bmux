@@ -490,6 +490,14 @@ pub(super) async fn should_proxy_to_target(cli: &Cli) -> Result<bool> {
     ) {
         return Ok(false);
     }
+    #[cfg(feature = "bundled-plugin-connections")]
+    if let Some(name) = cli.target.as_deref()
+        && paired_reference(name)?.is_some()
+    {
+        anyhow::bail!(
+            "paired targets support 'bmux connect {name}' and 'bmux remote status {name}'; arbitrary command forwarding is not supported"
+        );
+    }
     let config = BmuxConfig::load()?;
     let target = resolve_effective_target(&config, cli.target.as_deref()).await?;
     Ok(matches!(target, ResolvedTarget::Ssh(_)))
@@ -560,6 +568,18 @@ pub(super) async fn run_connect(
     } else {
         choose_default_target_interactively(&config)?
     };
+    #[cfg(feature = "bundled-plugin-connections")]
+    if let Some(reference) = paired_reference(&selected_target)? {
+        return run_paired_connect(
+            &selected_target,
+            &reference,
+            session,
+            follow,
+            global,
+            reconnect_forever,
+        )
+        .await;
+    }
     let resolved = resolve_target_reference(&config, &selected_target)
         .await
         .map_err(|error| map_connect_target_resolution_error(&selected_target, error))?;
@@ -2885,7 +2905,56 @@ fn iroh_io_error_is_transient(error: &io::Error) -> bool {
     )
 }
 
-#[allow(clippy::too_many_arguments)] // keep reconnect parameters explicit at call sites
+#[cfg(feature = "bundled-plugin-connections")]
+fn paired_reference(name: &str) -> Result<Option<String>> {
+    if name.starts_with("device://") {
+        return Ok(Some(name.to_owned()));
+    }
+    bmux_connections_plugin::paired_target(&ConfigPaths::default(), name)
+}
+
+#[cfg(feature = "bundled-plugin-connections")]
+async fn run_paired_connect(
+    label: &str,
+    reference: &str,
+    session: Option<&str>,
+    follow: Option<&str>,
+    global: bool,
+    reconnect_forever: bool,
+) -> Result<u8> {
+    anyhow::ensure!(
+        follow.is_none() && !global,
+        "remote single-terminal view does not support follow/global mode"
+    );
+    let _ = label;
+    anyhow::ensure!(
+        !reconnect_forever,
+        "unbounded reconnect is not supported for admitted terminals; reconnect with the same terminal name"
+    );
+    let terminal = bmux_connections_plugin::terminal_attach::RemoteTerminal::open(
+        ConfigPaths::default(),
+        reference.to_owned(),
+        session.unwrap_or("main").to_owned(),
+    )
+    .await?;
+    let outcome = super::attach::runtime::run_session_attach_with_provider_session(
+        bmux_client::AttachProviderSession {
+            backend: bmux_client::AttachProviderBackend::Session(Box::new(terminal)),
+            target: None,
+        },
+        None,
+        None,
+        false,
+        None,
+    )
+    .await?;
+    Ok(outcome.status_code)
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "Existing transport attachment passes independent runtime and telemetry state."
+)]
 async fn run_iroh_attach_with_reconnect(
     mut client: BmuxClient,
     mut iroh_connection: iroh::endpoint::Connection,

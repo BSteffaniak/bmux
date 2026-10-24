@@ -50,6 +50,14 @@ impl PairingStore {
         })
     }
 
+    pub(crate) fn remote(state_dir: &Path, runtime_dir: &Path) -> Result<Self> {
+        Ok(Self {
+            directory: PrivateDirectory::open(&runtime_directory(state_dir, runtime_dir)?)?,
+            record: c"remote.json",
+            lock: c"remote.lock",
+        })
+    }
+
     pub(crate) fn outbound(state_dir: &Path, runtime_dir: &Path) -> Result<Self> {
         Ok(Self {
             directory: PrivateDirectory::open(&runtime_directory(state_dir, runtime_dir)?)?,

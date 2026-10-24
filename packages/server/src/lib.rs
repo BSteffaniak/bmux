@@ -350,7 +350,7 @@ impl SerializedAdmissionAuthority {
         std::thread::Builder::new()
             .name("stream-admission-provider".into())
             .spawn(move || {
-                let _permit = permit;
+                let in_flight_permit = permit;
                 let result = (|| {
                     let runtime = tokio::runtime::Builder::new_current_thread()
                         .enable_all()
@@ -381,6 +381,9 @@ impl SerializedAdmissionAuthority {
                             .map(|output| output.payload)
                     })
                 })();
+                // Release completed work before waking a caller that may immediately
+                // issue the next request. Timed-out work retains its slot until done.
+                drop(in_flight_permit);
                 let _ = tx.send(result);
             })
             .map_err(|_| StreamAdmissionError)?;

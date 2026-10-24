@@ -603,3 +603,125 @@ async fn assert_transport_is_not_cluster_authority(joiner: &ServerEnv, endpoint:
         "pairing must not expose cluster administration"
     );
 }
+
+#[test]
+#[serial_test::serial]
+fn account_free_cli_pairs_persists_and_revokes() {
+    let mut host = ServerEnv::new("remote-ux-host");
+    let mut laptop = ServerEnv::new("remote-ux-laptop");
+    let port = reserve_tcp_port();
+    host.write_config(&format!("[plugins.settings.\"bmux.connections\".remote]\nbind_addr = '127.0.0.1:{port}'\n[plugins.settings.\"bmux.connections\".remote.relay]\nmode = 'disabled'\n"));
+    laptop.write_config("");
+    host.start();
+    laptop.start();
+    let request = laptop.run(&["remote", "pair-request"]);
+    assert_success(&request, "generate device-bound pairing request");
+    let request_file = host.config_dir.join("request.json");
+    std::fs::write(&request_file, &request.stdout).unwrap();
+    let enabled = host.run(&["remote", "enable", "--yes"]);
+    assert_success(&enabled, "explicitly enable admitted remote listener");
+    let invitation = host.run(&[
+        "remote",
+        "approve",
+        "--file",
+        request_file.to_str().unwrap(),
+        "--name",
+        "laptop",
+        "--yes",
+    ]);
+    assert_success(&invitation, "approve exact requesting device");
+    let offer = laptop.config_dir.join("invitation.json");
+    std::fs::write(&offer, &invitation.stdout).unwrap();
+    let paired = laptop.run(&[
+        "remote",
+        "pair",
+        "--file",
+        offer.to_str().unwrap(),
+        "--name",
+        "workstation",
+    ]);
+    assert_success(&paired, "redeem invitation and save host alias");
+    let status = laptop.run(&["remote", "status", "workstation"]);
+    assert_success(&status, "named host admits paired device");
+    assert!(combined_output(&status).contains("reachable and admitted"));
+    let paths = bmux_config::ConfigPaths::new(
+        laptop.config_dir.clone(),
+        laptop.runtime_dir.clone(),
+        laptop.data_dir.clone(),
+        laptop.state_dir.clone(),
+    );
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        use bmux_client::{
+            AttachInputPayload, AttachProviderInput, AttachProviderViewport, AttachSession,
+        };
+        let mut terminal = bmux_connections_plugin::terminal_attach::RemoteTerminal::open(
+            paths.clone(),
+            "workstation".into(),
+            "main".into(),
+        )
+        .await
+        .expect("open authorized remote terminal");
+        let initial = terminal.initial_snapshot().await.unwrap();
+        let cursor = initial.streams[0].cursor.clone();
+        terminal
+            .send_input(AttachProviderInput {
+                command_sequence: 1,
+                stream_id: cursor.stream_id.clone(),
+                generation: cursor.generation,
+                payload: AttachInputPayload::Bytes(b"printf 'REMOTE_UX_PROOF\\n'\n".to_vec()),
+            })
+            .await
+            .unwrap();
+        terminal
+            .update_viewport(AttachProviderViewport {
+                command_sequence: 2,
+                columns: 100,
+                rows: 30,
+                pixel_width: None,
+                pixel_height: None,
+            })
+            .await
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let event = terminal.next_event().await.unwrap();
+            if let bmux_client::AttachProviderEvent::Delta(delta) = event
+                && delta.changes.iter().any(|change| matches!(change, bmux_client::AttachProviderChange::StreamRepair(stream) if String::from_utf8_lossy(&stream.snapshot).contains("REMOTE_UX_PROOF"))) { break; }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "remote PTY output not observed"
+            );
+        }
+        terminal.detach().await.unwrap();
+        let mut resumed = bmux_connections_plugin::terminal_attach::RemoteTerminal::open(
+            paths.clone(),
+            "workstation".into(),
+            "main".into(),
+        )
+        .await
+        .expect("resume same remote execution");
+        assert_eq!(
+            resumed.initial_snapshot().await.unwrap().scene.session_id,
+            initial.scene.session_id
+        );
+    });
+    host.restart();
+    laptop.restart();
+    assert_success(
+        &laptop.run(&["remote", "status", "workstation"]),
+        "trust and listener survive restart",
+    );
+    let revoke = host.run(&["remote", "revoke", "laptop"]);
+    assert_success(&revoke, "owner revokes named device");
+    assert!(
+        !laptop
+            .run(&["remote", "status", "workstation"])
+            .status
+            .success()
+    );
+    assert_success(
+        &host.run(&["remote", "disable"]),
+        "disable admitted listener",
+    );
+}
