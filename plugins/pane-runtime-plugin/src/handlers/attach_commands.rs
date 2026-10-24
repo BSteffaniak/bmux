@@ -22,6 +22,200 @@ use bmux_session_models::{ClientId, SessionId};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+// Observer identity is absorbing while its authenticated connection is live,
+// including after detach. Only verified disconnected UUIDs (never reused by the
+// transport) may be reclaimed; missing lifecycle authority preserves the bound.
+#[derive(Default)]
+struct ObserverIdentities {
+    clients: std::collections::BTreeMap<ClientId, (Uuid, SessionId)>,
+    pending_expiry: std::collections::BTreeMap<ClientId, u64>,
+}
+impl ObserverIdentities {
+    fn reclaim_disconnected(
+        &mut self,
+        connected: Option<&dyn bmux_client_state::FollowStateReader>,
+    ) {
+        if let Some(connected) = connected {
+            self.clients
+                .retain(|client, _| connected.is_connected(*client));
+            self.pending_expiry
+                .retain(|client, _| self.clients.contains_key(client));
+        }
+    }
+
+    fn expire_pending(&mut self, now_epoch_ms: u64) {
+        self.pending_expiry.retain(|client, expires| {
+            if *expires > now_epoch_ms {
+                return true;
+            }
+            if let Some((token, _)) = self.clients.get_mut(client) {
+                *token = Uuid::nil();
+            }
+            false
+        });
+    }
+
+    fn consume_grant(
+        &mut self,
+        client: ClientId,
+        token: Uuid,
+        session: SessionId,
+        consume: impl FnOnce() -> Result<(), AttachTokenValidationError>,
+    ) -> Result<(), AttachCommandError> {
+        if token.is_nil() || self.clients.get(&client) != Some(&(token, session)) {
+            return Err(AttachCommandError::InvalidGrant);
+        }
+        consume().map_err(|error| match error {
+            AttachTokenValidationError::Expired => AttachCommandError::ExpiredGrant,
+            _ => AttachCommandError::InvalidGrant,
+        })?;
+        self.pending_expiry.remove(&client);
+        self.clients.insert(client, (Uuid::nil(), session));
+        Ok(())
+    }
+}
+
+fn epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+        .unwrap_or(u64::MAX)
+}
+
+static OBSERVERS: std::sync::OnceLock<std::sync::Mutex<ObserverIdentities>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+pub(crate) fn mark_test_observer(client: ClientId, session: SessionId) {
+    OBSERVERS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .clients
+        .insert(client, (Uuid::nil(), session));
+}
+
+pub(crate) fn observer_identity(client: ClientId) -> bool {
+    OBSERVERS
+        .get_or_init(Default::default)
+        .lock()
+        .map_or(true, |state| state.clients.contains_key(&client))
+}
+
+pub(crate) fn observer_operation_allowed(
+    client: ClientId,
+    interface: &str,
+    operation: &str,
+) -> bool {
+    if !observer_identity(client) {
+        return true;
+    }
+    match interface {
+        "attach-runtime-state" | "pane-runtime-state" => true,
+        "attach-runtime-commands" => matches!(
+            operation,
+            "observer-grant" | "observer-open" | "observe-viewport" | "attach-output" | "detach"
+        ),
+        _ => false,
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ObserverGrantArgs {
+    pub selector: SessionSelector,
+}
+
+pub fn observer_grant(
+    req: &ObserverGrantArgs,
+    ctx: &NativeServiceContext,
+) -> Result<AttachGrantRecord, AttachCommandError> {
+    let client = caller_client_id(ctx)?;
+    let manager = session_manager()?;
+    let follow = follow_state()?;
+    if OBSERVERS
+        .get_or_init(Default::default)
+        .lock()
+        .map_err(|_| failed("observer identities unavailable"))?
+        .clients
+        .contains_key(&client)
+    {
+        return Err(failed("observer connection already granted"));
+    }
+    // Require a dedicated connection, not a downgrade of an interactive attach.
+    if follow.0.selected_session(client).is_some()
+        || follow.0.attached_stream_session(client).is_some()
+    {
+        return Err(failed("observer requires a dedicated connection"));
+    }
+    let session = resolve_session_by_selector(&*manager.0, &req.selector)
+        .ok_or(AttachCommandError::SessionNotFound)?;
+    let tokens = attach_token_handle()?;
+    let mut observers = OBSERVERS
+        .get_or_init(Default::default)
+        .lock()
+        .map_err(|_| failed("observer identities unavailable"))?;
+    observers.reclaim_disconnected(Some(&*follow.0));
+    observers.expire_pending(epoch_ms());
+    if !follow.0.is_connected(client) {
+        return Err(failed("observer requires a live authenticated connection"));
+    }
+    if observers.clients.contains_key(&client) {
+        return Err(failed("observer connection already granted"));
+    }
+    if observers.clients.len() >= 4096 {
+        return Err(failed("observer identity limit"));
+    }
+    // Same host capability authorization as attach-session. Existing normal
+    // attach has no separate read-policy check; do not substitute write policy.
+    let grant = tokens.0.issue(session);
+    observers
+        .pending_expiry
+        .insert(client, grant.expires_at_epoch_ms);
+    observers
+        .clients
+        .insert(client, (grant.attach_token, session));
+    Ok(to_api_grant(&grant))
+}
+
+pub fn observer_open(
+    req: &AttachOpenArgs,
+    ctx: &NativeServiceContext,
+) -> Result<AttachReady, AttachCommandError> {
+    let client = caller_client_id(ctx)?;
+    let session = SessionId(req.session_id);
+    let tokens = attach_token_handle()?;
+    let mut observers = OBSERVERS
+        .get_or_init(Default::default)
+        .lock()
+        .map_err(|_| failed("observer identities unavailable"))?;
+    if observers
+        .pending_expiry
+        .get(&client)
+        .is_some_and(|expires| *expires <= epoch_ms())
+    {
+        observers.expire_pending(epoch_ms());
+        return Err(AttachCommandError::ExpiredGrant);
+    }
+    observers.consume_grant(client, req.attach_token, session, || {
+        tokens.0.consume(session, req.attach_token)
+    })?;
+    // Keep the absorbing identity fence but destroy the grant binding on use.
+    drop(observers);
+    crate::runtime::begin_observer_attach(session, client)
+        .map_err(|error| failed(format!("observer open failed: {error:?}")))?;
+    // Deliberately no selection, membership, follow, focus, or layout events.
+    let runtime = super::session_runtime_handle().ok_or_else(|| failed("runtime unavailable"))?;
+    runtime
+        .0
+        .set_client_write_permission(session, client, false);
+    Ok(AttachReady {
+        session_id: session.0,
+        context_id: None,
+        can_write: false,
+    })
+}
+
 // ── Wire-format argument structs ─────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -399,6 +593,9 @@ pub fn attach_session(
     ctx: &NativeServiceContext,
 ) -> Result<AttachGrantRecord, AttachCommandError> {
     let client_id = caller_client_id(ctx)?;
+    if observer_identity(client_id) {
+        return Err(failed("observer connection is read-only"));
+    }
     let manager = session_manager()?;
     let follow = follow_state()?;
 
@@ -479,10 +676,23 @@ pub fn attach_open(
     ctx: &NativeServiceContext,
 ) -> Result<AttachReady, AttachCommandError> {
     let client_id = caller_client_id(ctx)?;
+    if observer_identity(client_id) {
+        return Err(failed("observer connection is read-only"));
+    }
     let session_id = SessionId(req.session_id);
     let runtime = super::session_runtime_handle()
         .ok_or_else(|| failed("pane-runtime manager handle not registered"))?;
     let tokens = attach_token_handle()?;
+    if OBSERVERS
+        .get_or_init(Default::default)
+        .lock()
+        .map_err(|_| failed("observer identities unavailable"))?
+        .clients
+        .values()
+        .any(|(token, _)| *token == req.attach_token)
+    {
+        return Err(AttachCommandError::InvalidGrant);
+    }
     let follow = follow_state()?;
 
     // Ensure the session runtime exists (start it if the session
@@ -880,6 +1090,21 @@ pub fn set_client_attach_policy(
 
 pub fn detach(ctx: &NativeServiceContext) -> Result<u8, AttachCommandError> {
     let client_id = caller_client_id(ctx)?;
+    if observer_identity(client_id) {
+        let session = OBSERVERS
+            .get_or_init(Default::default)
+            .lock()
+            .map_err(|_| failed("observer identities unavailable"))?
+            .clients
+            .get(&client_id)
+            .map(|(_, session)| *session);
+        if let Some(session) = session {
+            let runtime =
+                super::session_runtime_handle().ok_or_else(|| failed("runtime unavailable"))?;
+            runtime.0.end_attach(session, client_id);
+        }
+        return Ok(0);
+    }
     let follow = follow_state()?;
     if !follow.0.attach_detach_allowed(client_id) {
         return Err(failed("detach is disabled for this connection"));
@@ -909,6 +1134,174 @@ pub fn detach(ctx: &NativeServiceContext) -> Result<u8, AttachCommandError> {
 #[cfg(test)]
 mod selection_tests {
     use super::*;
+    struct ConnectionFixture(ClientId);
+    impl bmux_client_state::FollowStateReader for ConnectionFixture {
+        fn selected_session(&self, _: ClientId) -> Option<SessionId> {
+            None
+        }
+        fn selected_context(&self, _: ClientId) -> Option<Uuid> {
+            None
+        }
+        fn follow_target(&self, _: ClientId) -> Option<bmux_client_state::FollowEntry> {
+            None
+        }
+        fn list_clients(&self) -> Vec<bmux_client_state::ClientSummary> {
+            vec![]
+        }
+        fn selected_target(&self, _: ClientId) -> Option<(Option<Uuid>, Option<SessionId>)> {
+            None
+        }
+        fn is_connected(&self, client: ClientId) -> bool {
+            client == self.0
+        }
+        fn attached_stream_session(&self, _: ClientId) -> Option<SessionId> {
+            None
+        }
+        fn attach_detach_allowed(&self, _: ClientId) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn observer_cleanup_requires_disconnect_not_detach_and_missing_provider_retains_fence() {
+        let live_detached = ClientId(Uuid::new_v4());
+        let retired = ClientId(Uuid::new_v4());
+        let session = SessionId(Uuid::new_v4());
+        let mut identities = ObserverIdentities::default();
+        identities
+            .clients
+            .insert(live_detached, (Uuid::nil(), session));
+        identities.clients.insert(retired, (Uuid::nil(), session));
+        identities.reclaim_disconnected(None);
+        assert_eq!(identities.clients.len(), 2);
+        let follow = ConnectionFixture(live_detached);
+        assert!(
+            bmux_client_state::FollowStateReader::attached_stream_session(&follow, live_detached)
+                .is_none()
+        );
+        identities.reclaim_disconnected(Some(&follow));
+        assert!(identities.clients.contains_key(&live_detached));
+        assert!(!identities.clients.contains_key(&retired));
+    }
+
+    #[test]
+    fn observer_teardown_reclaims_capacity_and_expiry_only_removes_pending_grant() {
+        let live = ClientId(Uuid::new_v4());
+        let session = SessionId(Uuid::new_v4());
+        let mut identities = ObserverIdentities::default();
+        let live_token = Uuid::new_v4();
+        identities.clients.insert(live, (live_token, session));
+        identities.pending_expiry.insert(live, 100);
+        let follow = ConnectionFixture(live);
+        // More than the admission cap over time must not exhaust the registry.
+        for _ in 0..5000 {
+            let retired = ClientId(Uuid::new_v4());
+            identities
+                .clients
+                .insert(retired, (Uuid::new_v4(), session));
+            identities.pending_expiry.insert(retired, 100);
+            identities.reclaim_disconnected(Some(&follow));
+            assert_eq!(identities.clients.len(), 1);
+            assert_eq!(identities.pending_expiry.len(), 1);
+        }
+        identities.expire_pending(99);
+        assert_eq!(identities.clients[&live].0, live_token);
+        identities.expire_pending(100);
+        assert!(identities.pending_expiry.is_empty());
+        assert!(identities.clients.contains_key(&live));
+        assert!(identities.clients[&live].0.is_nil());
+        assert!(matches!(
+            identities.consume_grant(live, live_token, session, || panic!("expired grant")),
+            Err(AttachCommandError::InvalidGrant)
+        ));
+        // Missing authority must not clear even an expired connection fence.
+        identities.reclaim_disconnected(None);
+        assert!(identities.clients.contains_key(&live));
+    }
+
+    #[test]
+    fn observer_grant_preserves_owner_session_expiry_and_single_use() {
+        let owner = ClientId(Uuid::new_v4());
+        let other = ClientId(Uuid::new_v4());
+        let session = SessionId(Uuid::new_v4());
+        let token = Uuid::new_v4();
+        let mut identities = ObserverIdentities::default();
+        identities.clients.insert(owner, (token, session));
+        for (client, request_token, request_session) in [
+            (other, token, session),
+            (owner, Uuid::new_v4(), session),
+            (owner, token, SessionId(Uuid::new_v4())),
+        ] {
+            assert!(matches!(
+                identities.consume_grant(client, request_token, request_session, || panic!(
+                    "invalid owner must not consume grant"
+                )),
+                Err(AttachCommandError::InvalidGrant)
+            ));
+        }
+        assert!(matches!(
+            identities.consume_grant(owner, token, session, || Err(
+                AttachTokenValidationError::Expired
+            )),
+            Err(AttachCommandError::ExpiredGrant)
+        ));
+        assert!(matches!(
+            identities.consume_grant(owner, token, session, || Err(
+                AttachTokenValidationError::SessionMismatch
+            )),
+            Err(AttachCommandError::InvalidGrant)
+        ));
+        identities
+            .consume_grant(owner, token, session, || Ok(()))
+            .unwrap();
+        assert!(identities.clients.contains_key(&owner));
+        assert!(matches!(
+            identities.consume_grant(owner, token, session, || panic!("replayed grant")),
+            Err(AttachCommandError::InvalidGrant)
+        ));
+        assert!(matches!(
+            identities.consume_grant(owner, Uuid::nil(), session, || panic!("nil grant")),
+            Err(AttachCommandError::InvalidGrant)
+        ));
+    }
+
+    #[test]
+    fn observer_route_fence_is_absorbing_and_owner_specific() {
+        let observer = ClientId(Uuid::new_v4());
+        let ordinary = ClientId(Uuid::new_v4());
+        mark_test_observer(observer, SessionId(Uuid::new_v4()));
+        for (interface, operation) in [
+            ("attach-runtime-commands", "attach-input"),
+            ("attach-runtime-commands", "attach-set-viewport"),
+            ("attach-runtime-commands", "attach-open"),
+            ("attach-runtime-commands", "attach-session"),
+            ("attach-runtime-commands", "attach-context"),
+            ("attach-runtime-commands", "attach-retarget-context"),
+            ("pane-runtime-commands", "focus-pane"),
+            ("pane-runtime-commands", "pane-set-pty-size"),
+        ] {
+            assert!(!observer_operation_allowed(observer, interface, operation));
+            assert!(observer_operation_allowed(ordinary, interface, operation));
+        }
+        assert!(observer_operation_allowed(
+            observer,
+            "attach-runtime-state",
+            "attach-snapshot"
+        ));
+        assert!(observer_operation_allowed(
+            observer,
+            "attach-runtime-commands",
+            "observe-viewport"
+        ));
+        assert!(observer_operation_allowed(
+            observer,
+            "attach-runtime-commands",
+            "detach"
+        ));
+        // Detach/grant consumption must not erase the connection's fence.
+        assert!(observer_identity(observer));
+    }
+
     #[test]
     fn absent_permissions_is_local_fallback_but_enabled_missing_principal_fails_closed() {
         use bmux_plugin_sdk::{

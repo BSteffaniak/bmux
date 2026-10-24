@@ -35,6 +35,8 @@ use bmux_config::{
     BmuxConfig, ClipboardRemoteSyncMode, ConfigPaths, PaneRestoreMethod, ResolvedTimeout,
 };
 use bmux_context_state::ContextSelector;
+#[cfg(test)]
+use bmux_decoration_plugin_api::decoration_view_v1 as attach_decoration_view_api;
 use bmux_ipc::InvokeServiceKind;
 use bmux_keybind::{action_to_config_name, parse_action};
 use bmux_pane_runtime_plugin_api::pane_runtime_events as pane_events;
@@ -99,6 +101,10 @@ pub const fn bracketed_paste_enabled(config_enabled: bool) -> bool {
 }
 
 pub trait AttachTerminal: Write {
+    /// Independent observers never acquire input, focus, or viewport authority.
+    fn observation_only(&self) -> bool {
+        false
+    }
     /// Output-only drivers bypass terminal encoding and lifecycle entirely.
     fn presentation_only(&self) -> bool {
         false
@@ -157,6 +163,10 @@ trait AttachHost {
         anyhow::bail!("terminal host cannot receive native resize")
     }
     fn output(&mut self) -> Option<&mut dyn Write>;
+    /// Independent observers never acquire input, focus, or viewport authority.
+    fn observation_only(&self) -> bool {
+        false
+    }
     /// Output-only drivers bypass terminal encoding and lifecycle entirely.
     fn presentation_only(&self) -> bool {
         false
@@ -205,6 +215,9 @@ trait AttachHost {
 
 struct TerminalAttachHost<'a, T: AttachTerminal + ?Sized>(&'a mut T);
 impl<T: AttachTerminal + ?Sized> AttachHost for TerminalAttachHost<'_, T> {
+    fn observation_only(&self) -> bool {
+        self.0.observation_only()
+    }
     fn output(&mut self) -> Option<&mut dyn Write> {
         Some(&mut self.0)
     }
@@ -2731,7 +2744,7 @@ fn duration_millis_u64(duration: Duration) -> u64 {
 /// Publish the current attach-layout snapshot on the generic
 /// [`AttachLayoutSnapshot`] state channel. Plugins that need
 /// per-pane geometry (decoration renderers, overlays, etc.)
-/// subscribe to that channel via [`bmux_plugin::global_event_bus`]
+/// subscribe to that channel on the private presentation bus
 /// and receive the current value plus live updates.
 ///
 /// Returns the set of pane ids present in the latest layout so the
@@ -2740,14 +2753,14 @@ fn duration_millis_u64(duration: Duration) -> u64 {
 /// empty too.
 async fn notify_extensions_of_layout(
     client: &mut bmux_client::StreamingBmuxClient,
-    bus: &bmux_plugin::EventBus,
+    view: &mut AttachViewState,
     _previous: Option<&bmux_client::AttachLayoutState>,
     current: Option<&bmux_client::AttachLayoutState>,
 ) -> std::collections::BTreeSet<Uuid> {
     use bmux_scene_protocol::scene_protocol::Rect as SceneRect;
 
     let Some(current) = current else {
-        publish_attach_layout_snapshot(client, bus, &[]).await;
+        publish_attach_layout_snapshot(client, view, &[], None).await;
         return std::collections::BTreeSet::new();
     };
 
@@ -2773,7 +2786,8 @@ async fn notify_extensions_of_layout(
             visible: surface.visible,
         })
         .collect();
-    publish_attach_layout_snapshot(client, bus, &layout_entries).await;
+    publish_attach_layout_snapshot(client, view, &layout_entries, Some(current.focused_pane_id))
+        .await;
 
     let mut current_pane_ids = std::collections::BTreeSet::new();
     for surface in &current.scene.surfaces {
@@ -2788,12 +2802,6 @@ async fn notify_extensions_of_layout(
     current_pane_ids
 }
 
-/// Publish an [`AttachLayoutSnapshot`] on the attach-layout state
-/// channel (client-side event bus) AND forward the same payload to
-/// the server's event bus via [`Request::EmitOnPluginBus`]. Plugins
-/// that live in the server process (e.g. the decoration plugin)
-/// subscribe to the server-side channel and see the snapshot
-/// alongside client-side subscribers.
 fn mark_pane_surface_dirty(
     dirty: &mut AttachDirtyFlags,
     layout_state: &AttachLayoutState,
@@ -2811,38 +2819,34 @@ fn mark_pane_surface_dirty(
     marked
 }
 
+/// Keep the private layout bus and caller-owned daemon decoration view in sync.
 async fn publish_attach_layout_snapshot(
     client: &mut bmux_client::StreamingBmuxClient,
-    bus: &bmux_plugin::EventBus,
+    view: &mut AttachViewState,
     surfaces: &[AttachSurfaceSummary],
+    focused_pane_id: Option<Uuid>,
 ) {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static REVISION: AtomicU64 = AtomicU64::new(0);
-    let revision = REVISION.fetch_add(1, Ordering::Relaxed) + 1;
+    view.decoration_layout_revision = view
+        .decoration_layout_revision
+        .checked_add(1)
+        .expect("attach layout revision exhausted");
     let payload = AttachLayoutSnapshot {
         surfaces: surfaces.to_vec(),
-        revision,
+        revision: view.decoration_layout_revision,
     };
-    // Client-side publish: any render extension running in this
-    // process picks up the snapshot.
-    let _ = bus.publish_state(&ATTACH_LAYOUT_STATE_KIND, payload.clone());
-    // Server-side publish via IPC: any plugin that registered the
-    // attach-layout channel with a decoder picks up the snapshot on
-    // its process-local event bus. When the server hasn't registered
-    // a decoder (no subscribing plugin), the server silently drops
-    // the payload.
-    let encoded = match serde_json::to_vec(&payload) {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            tracing::warn!(%error, "failed encoding attach-layout snapshot for plugin-bus relay");
-            return;
-        }
-    };
-    if let Err(error) = client
-        .emit_on_plugin_bus(ATTACH_LAYOUT_STATE_KIND.as_str(), encoded)
-        .await
+    let _ = view
+        .presentation_events
+        .publish_state(&ATTACH_LAYOUT_STATE_KIND, payload);
+    if let Err(error) = bmux_decoration_plugin_api::decoration_view_v1::client::update_layout(
+        client,
+        view.decoration_lifetime,
+        view.decoration_layout_revision,
+        surfaces.to_vec(),
+        focused_pane_id,
+    )
+    .await
     {
-        tracing::debug!(%error, "emit_on_plugin_bus for attach-layout failed");
+        tracing::debug!(%error, "optional caller-scoped decoration layout unavailable");
     }
 }
 
@@ -4419,6 +4423,10 @@ async fn run_session_attach_with_host<T: AttachHost + ?Sized>(
             BmuxConfig::default()
         }
     });
+    anyhow::ensure!(
+        !terminal.observation_only() || follow.is_none(),
+        "independent observer cannot mutate client following"
+    );
     let attach_keymap = attach_keymap_from_config(&attach_config);
     let attach_help_lines = build_attach_help_lines(&attach_config);
     let mut perf_emitter = perf_telemetry::PerfEventEmitter::new(
@@ -4474,7 +4482,36 @@ async fn run_session_attach_with_host<T: AttachHost + ?Sized>(
     crate::runtime::set_logging_client_id(self_client_id.to_string());
     tracing::info!(client_id = %self_client_id, "attach.client_log.initialized");
 
-    let attach_info = if let Some(leader_client_id) = follow_target_id {
+    let attach_info = if terminal.observation_only() {
+        use bmux_pane_runtime_plugin_api::attach_runtime_commands as commands;
+        anyhow::ensure!(
+            follow_target_id.is_none(),
+            "independent observers cannot follow client identity"
+        );
+        let selector = match parse_session_selector(
+            target.ok_or_else(|| anyhow::anyhow!("observer requires session"))?,
+        ) {
+            SessionSelector::ById(id) => commands::SessionSelector {
+                id: Some(id),
+                name: None,
+            },
+            SessionSelector::ByName(name) => commands::SessionSelector {
+                id: None,
+                name: Some(name),
+            },
+        };
+        let grant = commands::client::observer_grant(&mut client, selector)
+            .await?
+            .map_err(|error| anyhow::anyhow!("observer grant rejected: {error:?}"))?;
+        let ready = commands::client::observer_open(&mut client, grant.session_id, grant.token)
+            .await?
+            .map_err(|error| anyhow::anyhow!("observer open rejected: {error:?}"))?;
+        bmux_client::AttachOpenInfo {
+            context_id: ready.context_id,
+            session_id: ready.session_id,
+            can_write: false,
+        }
+    } else if let Some(leader_client_id) = follow_target_id {
         // Inline follow target resolution using BmuxClient (before streaming upgrade).
         let clients = typed_list_clients_bmux(&mut client)
             .await
@@ -4584,10 +4621,15 @@ async fn run_session_attach_with_host<T: AttachHost + ?Sized>(
 
     let mut view_state = AttachViewState::with_private_presentation(attach_info);
     view_state.presentation_only = terminal.presentation_only();
+    view_state.observation_only = terminal.observation_only();
+    if view_state.observation_only {
+        view_state.can_write = false;
+    }
     view_state.viewport_guard = terminal.viewport_guard();
-    view_state.allow_retarget = terminal
-        .render_provider()
-        .is_none_or(|provider| provider.allows_retarget());
+    view_state.allow_retarget = !view_state.observation_only
+        && terminal
+            .render_provider()
+            .is_none_or(|provider| provider.allows_retarget());
     if let Some(publisher) = observer {
         view_state.set_observer(publisher);
     }
@@ -4696,11 +4738,13 @@ async fn run_session_attach_with_host<T: AttachHost + ?Sized>(
     // per-pane rects at attach entry. Subsequent layout changes flow
     // through the loop-body call to
     // `notify_extensions_of_layout` at the layout-refresh site.
+    let attach_result = async {
+    let initial_layout = view_state.cached_layout_state.clone();
     let _ = notify_extensions_of_layout(
         &mut client,
-        &view_state.presentation_events,
+        &mut view_state,
         None,
-        view_state.cached_layout_state.as_ref(),
+        initial_layout.as_ref(),
     )
     .await;
     refresh_attach_status_catalog_best_effort(&mut client, &mut view_state).await;
@@ -4767,8 +4811,12 @@ async fn run_session_attach_with_host<T: AttachHost + ?Sized>(
     // runtime can mark the frame dirty whenever a new scene arrives. Render
     // extensions subscribe to the same channel independently. When no plugin
     // has registered the channel the subscription returns `Err` and we run
-    // without scene updates — extensions that aren't loaded simply have
-    // nothing to draw.
+    // without scene updates — extensions that aren't loaded simply have nothing to draw.
+    #[cfg(feature = "bundled-plugin-decoration")]
+    if let Ok(scene) = bmux_decoration_plugin_api::decoration_view_v1::client::scene(&mut client).await {
+        bmux_decoration_plugin_renderer::publish_relayed_scene_on(&view_state.presentation_events, scene);
+    }
+
     let (mut last_scene_revision, mut scene_event_rx) =
         match view_state
             .presentation_events
@@ -4822,6 +4870,8 @@ async fn run_session_attach_with_host<T: AttachHost + ?Sized>(
             .publish_state(&bmux_tabs_plugin_api::tabs_list::STATE_KIND, snapshot);
     }
 
+    let mut publication_tick = tokio::time::interval(Duration::from_secs(1));
+    publication_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut observer_capture_pending = false;
     'attach_loop: loop {
         terminal.set_attached_session_id(view_state.attached_id);
@@ -4836,6 +4886,12 @@ async fn run_session_attach_with_host<T: AttachHost + ?Sized>(
             None
         };
         tokio::select! {
+            _ = publication_tick.tick(), if view_state.committed_source.is_some() => {
+                let snapshot = super::committed_source::latest(&view_state);
+                if let Some(source) = view_state.committed_source.as_mut() {
+                    source.poll(&mut client, snapshot.as_deref()).await;
+                }
+            }
             // This timer is armed only for deferred damage, never idle polling.
             () = async {
                 match capture_deadline {
@@ -5164,7 +5220,7 @@ async fn run_session_attach_with_host<T: AttachHost + ?Sized>(
             } => {
                 if let Some(scene) = scene_result {
                     perf_window.record_wake(AttachWakeSource::Scene);
-                    if scene.revision != last_scene_revision {
+                    if scene.revision > last_scene_revision {
                         last_scene_revision = scene.revision;
                         view_state
                             .dirty
@@ -5481,11 +5537,12 @@ async fn run_session_attach_with_host<T: AttachHost + ?Sized>(
             // channel. Render extensions (decoration, overlays, etc.)
             // subscribe to this channel and react without core needing
             // to know which plugins care.
+            let published_layout = view_state.cached_layout_state.clone();
             let current_pane_ids = notify_extensions_of_layout(
                 &mut client,
-                &view_state.presentation_events,
+                &mut view_state,
                 previous_layout.as_ref(),
-                view_state.cached_layout_state.as_ref(),
+                published_layout.as_ref(),
             )
             .await;
             drop(current_pane_ids);
@@ -5549,6 +5606,7 @@ async fn run_session_attach_with_host<T: AttachHost + ?Sized>(
                 None,
             )?;
             flush_visual_projection_updates(&mut client, &mut view_state).await;
+
             let render_ms = duration_millis_u64(render_started_at.elapsed());
             if render_ms >= attach_config.logs.client.slow_frame_ms {
                 tracing::warn!(
@@ -5839,6 +5897,7 @@ async fn run_session_attach_with_host<T: AttachHost + ?Sized>(
             None,
         )?;
         flush_visual_projection_updates(&mut client, &mut view_state).await;
+
         let render_ms = duration_millis_u64(render_started_at.elapsed());
         if render_ms >= attach_config.logs.client.slow_frame_ms {
             tracing::warn!(
@@ -5955,6 +6014,20 @@ async fn run_session_attach_with_host<T: AttachHost + ?Sized>(
         exit_reason,
         resume: None,
     })
+    }.await;
+    if let Some(source) = view_state.committed_source.take() {
+        source.unregister(&mut client).await;
+    }
+    // Await the empty retirement barrier after all layout updates, also on error.
+    if let Err(error) = bmux_decoration_plugin_api::decoration_view_v1::client::close(
+        &mut client,
+        view_state.decoration_lifetime,
+    )
+    .await
+    {
+        tracing::debug!(%error, "closing caller-scoped decoration view");
+    }
+    attach_result
 }
 
 fn handle_device_seal_broker_request(payload: &[u8]) -> (bool, Vec<u8>, Option<String>) {
@@ -5975,6 +6048,15 @@ fn store_device_seal_keychain_secret(
 struct AttachServerEventHandling {
     control: AttachLoopControl,
     image_fetch_requested: bool,
+}
+
+/// Connection-scoped scene baseline: never reset on target/lifetime replacement.
+const fn accept_scene_revision(baseline: &mut u64, incoming: u64) -> bool {
+    if incoming <= *baseline {
+        return false;
+    }
+    *baseline = incoming;
+    true
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -6245,6 +6327,12 @@ async fn handle_attach_stream_server_event(
             ) {
                 Ok(scene) => {
                     let scene_revision = scene.revision;
+                    if !accept_scene_revision(last_scene_revision, scene_revision) {
+                        return Ok(AttachServerEventHandling {
+                            control: AttachLoopControl::Continue,
+                            image_fetch_requested: false,
+                        });
+                    }
                     #[cfg(feature = "bundled-plugin-decoration")]
                     bmux_decoration_plugin_renderer::publish_relayed_scene_on(
                         &view_state.presentation_events,
@@ -6252,12 +6340,9 @@ async fn handle_attach_stream_server_event(
                     );
                     #[cfg(not(feature = "bundled-plugin-decoration"))]
                     let _ = scene;
-                    if scene_revision != *last_scene_revision {
-                        *last_scene_revision = scene_revision;
-                        view_state
-                            .dirty
-                            .mark_extension_dirty(AttachDirtySource::SceneChanged);
-                    }
+                    view_state
+                        .dirty
+                        .mark_extension_dirty(AttachDirtySource::SceneChanged);
                 }
                 Err(error) => {
                     tracing::warn!(
@@ -6768,6 +6853,19 @@ pub async fn retarget_attach_to_context(
         to_context_id = %context_id,
         "attach.retarget.start"
     );
+    if let Err(error) = bmux_decoration_plugin_api::decoration_view_v1::client::close(
+        client,
+        view_state.decoration_lifetime,
+    )
+    .await
+    {
+        let error = typed_client_error(&error);
+        if !optional_appearance_absent(&error) {
+            return Err(error);
+        }
+    }
+    view_state.decoration_lifetime = Uuid::new_v4();
+    // Layout and scene baselines belong to this connection, not the target.
     let retarget_service_started = Instant::now();
     let geometry = selected_attach_geometry(view_state);
     let insets = resolved_attach_viewport_insets(geometry, &view_state.presentation_layouts);
@@ -7128,6 +7226,12 @@ pub async fn handle_attach_plugin_command_action(
     kernel_client_factory: Option<&KernelClientFactory>,
     active_keybindings: Vec<bmux_plugin_sdk::ActiveKeybinding>,
 ) -> std::result::Result<(), ClientError> {
+    if plugin_id == "bmux.broadcast" {
+        let message =
+            super::committed_source::control(client, view_state, command_name, args).await;
+        view_state.set_transient_status(message, Instant::now(), ATTACH_TRANSIENT_STATUS_TTL);
+        return Ok(());
+    }
     if plugin_id == "bmux.pane_runtime" && command_name == "scrollback-mode-set" {
         let Some(pane_id) = view_state.focused_pane_id() else {
             view_state.set_transient_status(
@@ -11271,7 +11375,7 @@ pub async fn update_attach_viewport_with_geometry(
     view_state: &AttachViewState,
     geometry: TerminalGeometry,
 ) -> std::result::Result<(), ClientError> {
-    if geometry.cols == 0 || geometry.rows == 0 {
+    if view_state.observation_only || geometry.cols == 0 || geometry.rows == 0 {
         return Ok(());
     }
     if view_state
@@ -24905,3 +25009,7 @@ server_timeout = 2345
         let _ = std::fs::remove_file(temp_path);
     }
 }
+
+#[cfg(test)]
+#[path = "view_integration_tests.rs"]
+mod view_integration_tests;

@@ -30,7 +30,12 @@ toml                       = { workspace = true, features = ["parse"] }
 tracing                    = { workspace = true }
 
 [dev-dependencies]
-bmux_decoration_plugin = { workspace = true, features = ["static-bundled"] }
+bmux_decoration_plugin = { workspace = true, features = [
+    "static-bundled",
+    "bundled-decoration-scripts",
+    "scripting-luau",
+] }
+uuid = { workspace = true }
 
 [package.metadata.cargo-machete]
 # BPDL-generated clients and byte-list fields reference these crates directly.

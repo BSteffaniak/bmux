@@ -114,6 +114,9 @@ impl std::io::Write for HeadlessAttachDriver {
 }
 
 impl AttachTerminal for HeadlessAttachDriver {
+    fn observation_only(&self) -> bool {
+        self.observe_only
+    }
     fn presentation_only(&self) -> bool {
         true
     }

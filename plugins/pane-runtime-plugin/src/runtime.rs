@@ -5157,7 +5157,9 @@ pub(crate) fn observe_viewport(
             .get(&session_id)
             .is_some_and(|runtime| runtime.attach_viewport.is_none());
         let result = manager.observe_viewport(session_id, client_id, cols, rows);
-        let seeded = unset && result.is_ok();
+        let seeded = unset
+            && result.is_ok()
+            && !crate::handlers::attach_commands::observer_identity(client_id);
         (result, seeded)
     };
     if seeded {
@@ -5168,7 +5170,41 @@ pub(crate) fn observe_viewport(
     result
 }
 
+/// Open an already-running output stream without selection or PTY sizing.
+pub(crate) fn begin_observer_attach(
+    session: SessionId,
+    client: ClientId,
+) -> Result<(), SessionRuntimeError> {
+    let handle = pane_padding_handle().ok_or(SessionRuntimeError::NotFound)?;
+    let mut manager = handle.0.lock().map_err(|_| SessionRuntimeError::Closed)?;
+    manager.begin_observer_attach(session, client)
+}
+
 impl SessionRuntimeManager {
+    fn begin_observer_attach(
+        &mut self,
+        session: SessionId,
+        client: ClientId,
+    ) -> Result<(), SessionRuntimeError> {
+        let runtime = self
+            .runtimes
+            .get_mut(&session)
+            .ok_or(SessionRuntimeError::NotFound)?;
+        // Register readers before exposing attached membership. Never restart,
+        // select a pane, mutate shared geometry or resize any PTY here.
+        for pane in runtime.panes.values_mut() {
+            pane.output_buffer
+                .lock()
+                .map_err(|_| SessionRuntimeError::Closed)?
+                .register_client_at_tail(client);
+        }
+        runtime.attached_clients.insert(client);
+        if let Ok(mut permissions) = self.client_write_permissions.write() {
+            permissions.entry(session).or_default().remove(&client);
+        }
+        Ok(())
+    }
+
     fn observe_viewport(
         &mut self,
         session_id: SessionId,
@@ -5190,6 +5226,10 @@ impl SessionRuntimeManager {
             return Err(SessionRuntimeError::Closed);
         }
         let viewport = AttachViewport::normalized(cols, rows, 0, 0, 0, 0);
+        if crate::handlers::attach_commands::observer_identity(client_id) {
+            // Detached fallback is a local projection, not sizing authority.
+            return Ok(viewport);
+        }
         runtime.attach_viewport = Some(viewport);
         resize_session_ptys(&self.padding_config, runtime);
         Ok(viewport)
@@ -8631,6 +8671,9 @@ impl SessionRuntimeManager {
         session_id: SessionId,
         client_id: ClientId,
     ) -> Result<(), SessionRuntimeError> {
+        if crate::handlers::attach_commands::observer_identity(client_id) {
+            return Err(SessionRuntimeError::NotAttached);
+        }
         let runtime = self
             .runtimes
             .get_mut(&session_id)
@@ -8721,6 +8764,9 @@ impl SessionRuntimeManager {
         cell_pixel_width: u16,
         cell_pixel_height: u16,
     ) -> Result<(u16, u16, u16, u16, u16, u16), SessionRuntimeError> {
+        if crate::handlers::attach_commands::observer_identity(client_id) {
+            return Err(SessionRuntimeError::NotAttached);
+        }
         let runtime = self
             .runtimes
             .get_mut(&session_id)
@@ -8779,6 +8825,9 @@ impl SessionRuntimeManager {
         client_id: ClientId,
         data: Vec<u8>,
     ) -> Result<(usize, Uuid), SessionRuntimeError> {
+        if crate::handlers::attach_commands::observer_identity(client_id) {
+            return Err(SessionRuntimeError::NotAttached);
+        }
         let fallback_focused_pane_id = {
             let runtime = self
                 .runtimes
@@ -9584,6 +9633,9 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
         pane_id: Uuid,
         data: Vec<u8>,
     ) -> Result<usize, SessionRuntimeError> {
+        if crate::handlers::attach_commands::observer_identity(client_id) {
+            return Err(SessionRuntimeError::NotAttached);
+        }
         let lookup_started = std::time::Instant::now();
         let owner_session_id = self
             .with_lock_read(|m| {
@@ -9667,6 +9719,9 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
         client_id: ClientId,
         allowed: bool,
     ) {
+        if allowed && crate::handlers::attach_commands::observer_identity(client_id) {
+            return;
+        }
         if let Ok(mut permissions) = self.client_write_permissions.write() {
             let writers = permissions.entry(session_id).or_default();
             if allowed {
@@ -9678,6 +9733,9 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
     }
 
     fn client_can_write(&self, session_id: SessionId, client_id: ClientId) -> bool {
+        if crate::handlers::attach_commands::observer_identity(client_id) {
+            return false;
+        }
         self.client_write_permissions
             .read()
             .ok()
@@ -13417,6 +13475,91 @@ exit 7"#
                 h: 35,
             }
         );
+    }
+
+    #[tokio::test]
+    async fn observer_open_preserves_focus_and_pty_size_and_cannot_escalate() {
+        use crate::handlers::attach_commands::{mark_test_observer, observer_operation_allowed};
+        let session = SessionId(Uuid::new_v4());
+        let owner = ClientId(Uuid::new_v4());
+        let observer = ClientId(Uuid::new_v4());
+        let pane = Uuid::new_v4();
+        let mut runtime = runtime_with_panes(&[pane]);
+        runtime.attached_clients.insert(owner);
+        let mut manager = manager_with_runtime(session, runtime);
+        manager
+            .set_attach_viewport(session, owner, 120, 40, 2, 7, 3, 11, 0, 0)
+            .unwrap();
+        let viewport = manager.runtimes[&session].attach_viewport;
+        let focus = manager.runtimes[&session].focused_pane_id;
+        let size = *manager.runtimes[&session].panes[&pane]
+            .last_requested_size
+            .lock()
+            .unwrap();
+        mark_test_observer(observer, session);
+        manager.begin_observer_attach(session, observer).unwrap();
+        assert_eq!(manager.runtimes[&session].focused_pane_id, focus);
+        assert_eq!(manager.runtimes[&session].attach_viewport, viewport);
+        assert_eq!(
+            *manager.runtimes[&session].panes[&pane]
+                .last_requested_size
+                .lock()
+                .unwrap(),
+            size
+        );
+        assert!(manager.begin_attach(session, observer).is_err());
+        assert!(
+            manager
+                .set_attach_viewport(session, observer, 9, 9, 0, 0, 0, 0, 0, 0)
+                .is_err()
+        );
+        assert!(
+            manager
+                .write_input(session, observer, b"not allowed".to_vec())
+                .is_err()
+        );
+        for operation in [
+            "attach-open",
+            "attach-session",
+            "attach-context",
+            "attach-retarget-context",
+            "attach-input",
+            "attach-set-viewport",
+        ] {
+            assert!(!observer_operation_allowed(
+                observer,
+                "attach-runtime-commands",
+                operation
+            ));
+        }
+        assert!(!observer_operation_allowed(
+            observer,
+            "pane-runtime-commands",
+            "focus-pane"
+        ));
+        assert!(!observer_operation_allowed(
+            observer,
+            "pane-runtime-commands",
+            "pane-direct-input"
+        ));
+        // Even a detached fallback does not establish shared sizing authority.
+        manager.runtimes.get_mut(&session).unwrap().attach_viewport = None;
+        let fallback = manager.observe_viewport(session, observer, 80, 24).unwrap();
+        assert_eq!((fallback.cols, fallback.rows), (80, 24));
+        assert!(manager.runtimes[&session].attach_viewport.is_none());
+        assert_eq!(
+            *manager.runtimes[&session].panes[&pane]
+                .last_requested_size
+                .lock()
+                .unwrap(),
+            size
+        );
+        assert_eq!(manager.runtimes[&session].focused_pane_id, focus);
+        // Ordinary owner still has the unchanged interactive path.
+        manager.begin_attach(session, owner).unwrap();
+        manager
+            .set_attach_viewport(session, owner, 100, 30, 0, 0, 0, 0, 0, 0)
+            .unwrap();
     }
 
     #[tokio::test]

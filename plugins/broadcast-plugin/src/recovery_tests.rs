@@ -11,6 +11,7 @@ pub(super) struct TestRelay {
     worker: Option<std::thread::JoinHandle<()>>,
     _credential: tempfile::NamedTempFile,
     pub relay: Option<Relay>,
+    pub fail_pause: Arc<AtomicBool>,
 }
 impl TestRelay {
     pub fn new(repair_once: bool) -> Self {
@@ -21,6 +22,8 @@ impl TestRelay {
         let (send, events) = std::sync::mpsc::channel();
         let stopped = Arc::new(AtomicBool::new(false));
         let stop = stopped.clone();
+        let fail_pause = Arc::new(AtomicBool::new(false));
+        let reject_pause = fail_pause.clone();
         let worker = std::thread::spawn(move || {
             let epoch = Uuid::new_v4();
             let mut fence = 1_u64;
@@ -102,6 +105,11 @@ impl TestRelay {
                     .unwrap_or(0);
                 let mut body = vec![0; length];
                 stream.read_exact(&mut body).unwrap();
+                if route == "pause" && reject_pause.load(Ordering::SeqCst) {
+                    write!(stream, "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                    send.send((route.into(), Vec::new())).unwrap();
+                    continue;
+                }
                 if matches!(route, "pause" | "resume" | "stop") {
                     fence += 1;
                 }
@@ -130,6 +138,7 @@ impl TestRelay {
             worker: Some(worker),
             _credential: credential,
             relay: Some(relay),
+            fail_pause,
         }
     }
     pub fn event(&self, expected: &str) -> Vec<u8> {

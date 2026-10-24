@@ -11,9 +11,19 @@
 plugin bmux.decoration version 1;
 
 import scene = bmux.scene;
+import layout = bmux.attach_layout;
 
 capability DECORATION_READ = bmux.decoration.read;
 capability DECORATION_WRITE = bmux.decoration.write;
+
+@capability(DECORATION_WRITE)
+interface decoration-view-v1 {
+    // Connection ownership comes exclusively from authenticated service context.
+    // A lifetime is a generation token within that connection, never a selector.
+    command update-layout(lifetime: uuid, revision: u64, surfaces: list<layout.attach-surface-summary>, focused-pane-id: uuid?) -> result<unit, string>;
+    command scene() -> scene.decoration-scene;
+    command close(lifetime: uuid) -> result<unit, string>;
+}
 
 @capability(DECORATION_READ)
 interface decoration-state {
@@ -320,6 +330,12 @@ interface decoration-state {
 
 @capability(DECORATION_WRITE)
 interface decoration-commands {
+    // Caller-bound personal state. Missing caller identity is an error. Checkpoint
+    // operations additionally require the theme coordinator as plugin caller.
+    command apply-view-theme-extension(toml: string, config-dir-candidates: list<string>) -> result<unit, decoration-state.validation-result>;
+    command checkpoint-view-script-state() -> result<unit, string>;
+    command restore-view-script-state() -> result<unit, string>;
+    command discard-view-script-checkpoint() -> result<unit, string>;
     command checkpoint-script-state() -> result<unit, string>;
     command restore-script-state() -> result<unit, string>;
     command discard-script-checkpoint() -> result<unit, string>;

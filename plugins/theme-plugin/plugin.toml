@@ -28,7 +28,7 @@ kind         = "command"
 
 [[event_publications]]
 delivery                     = "state"
-forward_to_streaming_clients = true
+forward_to_streaming_clients = false
 kind                         = "bmux.runtime/appearance"
 
 [[commands]]

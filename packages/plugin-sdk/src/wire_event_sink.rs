@@ -43,6 +43,45 @@ pub trait WireEventSink: Send + Sync {
     /// encounters an internal failure (lock poison, queue saturation,
     /// transport error) that prevents delivering to all subscribers.
     fn publish(&self, event: Event) -> Result<(), WireEventSinkError>;
+
+    /// Report whether a recipient currently has a live transport registration.
+    ///
+    /// Returns `None` when liveness inspection is unsupported or unavailable.
+    /// This is a point-in-time observation, not a delivery guarantee.
+    fn is_connected(&self, _recipient: uuid::Uuid) -> Option<bool> {
+        None
+    }
+
+    /// Retain the latest opaque value for one live connection and kind.
+    ///
+    /// # Errors
+    /// Returns an error when unsupported, disconnected, or retention limits
+    /// are exceeded. Implementations must never fall back to broadcasting.
+    fn publish_retained_to(
+        &self,
+        _recipient: uuid::Uuid,
+        _kind: String,
+        _payload: Vec<u8>,
+    ) -> Result<(), WireEventSinkError> {
+        Err(WireEventSinkError::PublishFailed(
+            "recipient-scoped retained delivery is unsupported".into(),
+        ))
+    }
+
+    /// Remove a recipient's retained value and any pending delivery.
+    ///
+    /// # Errors
+    /// Returns an error when recipient-scoped retention is unsupported or
+    /// the recipient is disconnected.
+    fn clear_retained_to(
+        &self,
+        _recipient: uuid::Uuid,
+        _kind: &str,
+    ) -> Result<(), WireEventSinkError> {
+        Err(WireEventSinkError::PublishFailed(
+            "recipient-scoped retained delivery is unsupported".into(),
+        ))
+    }
 }
 
 /// Errors returned by [`WireEventSink::publish`].
@@ -118,6 +157,32 @@ mod tests {
                 .push(event);
             Ok(())
         }
+    }
+
+    #[test]
+    fn unsupported_retention_never_uses_public_publish() {
+        let sink = CapturingSink {
+            events: Mutex::new(Vec::new()),
+        };
+        let recipient = uuid::Uuid::nil();
+        assert_eq!(sink.is_connected(recipient), None);
+        assert_eq!(NoopWireEventSink.is_connected(recipient), None);
+        assert!(
+            sink.publish_retained_to(recipient, "private".into(), vec![1])
+                .is_err()
+        );
+        assert!(sink.clear_retained_to(recipient, "private").is_err());
+        assert!(sink.events.lock().unwrap().is_empty());
+        assert!(
+            NoopWireEventSink
+                .publish_retained_to(recipient, "private".into(), vec![])
+                .is_err()
+        );
+        assert!(
+            NoopWireEventSink
+                .clear_retained_to(recipient, "private")
+                .is_err()
+        );
     }
 
     #[test]

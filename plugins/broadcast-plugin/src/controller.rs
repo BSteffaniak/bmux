@@ -33,6 +33,9 @@ struct Owned {
 struct State {
     sources: BTreeMap<String, Source>,
     selected: Option<String>,
+    // Retained even after lease loss/unregister: a selected ID must not rebind
+    // to another authenticated view while its publication is still selected.
+    selected_owner: Option<Uuid>,
     refresh: u64,
     local: &'static str,
     remote: &'static str,
@@ -49,6 +52,7 @@ impl Default for State {
         Self {
             sources: BTreeMap::new(),
             selected: None,
+            selected_owner: None,
             refresh: 1,
             local: "stopped",
             remote: "offline",
@@ -147,18 +151,42 @@ impl Controller {
             .map_err(|_| "controller_unavailable")?
             .status())
     }
-    pub fn control(&self, control: Control) -> Result<Status, &'static str> {
+    fn control(&self, control: Control) -> Result<Status, &'static str> {
         let _operation = self
             .operation
             .lock()
             .map_err(|_| "controller_unavailable")?;
-        self.control_locked(control)
+        self.control_locked(control, None)
     }
-    fn control_locked(&self, control: Control) -> Result<Status, &'static str> {
+    pub fn control_owned(&self, owner: Uuid, control: Control) -> Result<Status, &'static str> {
+        let _operation = self
+            .operation
+            .lock()
+            .map_err(|_| "controller_unavailable")?;
+        self.control_locked(control, Some(owner))
+    }
+    fn control_locked(
+        &self,
+        control: Control,
+        owner: Option<Uuid>,
+    ) -> Result<Status, &'static str> {
         let (reply, response) = std::sync::mpsc::sync_channel(1);
         // Admission and the local gate transition are atomic. A full command queue
         // rejects the action without changing local state.
         let mut state = self.state.lock().map_err(|_| "controller_unavailable")?;
+        if let Some(owner) = owner {
+            if state.local != "stopped" && state.selected_owner != Some(owner) {
+                return Err("source_not_owned");
+            }
+            if let Control::Start(_, id) | Control::Source(id) = &control
+                && state
+                    .sources
+                    .get(id)
+                    .is_none_or(|source| source.owner != owner)
+            {
+                return Err("source_not_owned");
+            }
+        }
         let permit = self.commands.try_reserve().map_err(|_| "controller_busy")?;
         match &control {
             Control::Start(_, id) => {
@@ -170,7 +198,12 @@ impl Controller {
                 {
                     return Err("source_unavailable_or_already_started");
                 }
+                state.selected_owner = state.sources.get(id).map(|source| source.owner);
                 state.selected = Some(id.clone());
+                if let Some(source) = state.sources.get_mut(id) {
+                    source.last = None;
+                    source.content = None;
+                }
                 state.local = "starting";
             }
             Control::Pause => {
@@ -194,6 +227,9 @@ impl Controller {
             Control::Stop | Control::Shutdown => {
                 state.local = "stopped";
                 for source in state.sources.values() {
+                    if owner.is_some_and(|owner| owner != source.owner) {
+                        continue;
+                    }
                     if let Some(stop) = &source.terminal_stop {
                         stop.send_replace(true);
                     }
@@ -210,7 +246,12 @@ impl Controller {
                 if state.local == "stopped" {
                     return Err("not_started");
                 }
+                state.selected_owner = state.sources.get(id).map(|source| source.owner);
                 state.selected = Some(id.clone());
+                if let Some(source) = state.sources.get_mut(id) {
+                    source.last = None;
+                    source.content = None;
+                }
                 if state.local != "paused" {
                     state.local = "starting";
                 }
@@ -341,7 +382,7 @@ impl Controller {
         }
         crate::start_identity::claim(state_root, id)?;
         // Keep the token even on remote uncertainty: retries return the same admitted start.
-        let result = self.control_locked(Control::Start(Box::new(relay), id.into()));
+        let result = self.control_locked(Control::Start(Box::new(relay), id.into()), Some(owner));
         let mut state = self.state.lock().map_err(|_| "controller_unavailable")?;
         if state.selected.as_deref() != Some(id) || state.local == "stopped" {
             return Err(result.err().unwrap_or("start_not_admitted"));
@@ -372,7 +413,7 @@ impl Controller {
                 return Ok(false);
             }
         }
-        self.control_locked(Control::Stop)?;
+        self.control_locked(Control::Stop, Some(owner))?;
         Ok(true)
     }
     pub fn source(
@@ -384,6 +425,13 @@ impl Controller {
         Uuid::parse_str(id).map_err(|_| "invalid_source")?;
         let mut state = self.state.lock().map_err(|_| "controller_unavailable")?;
         let now = Instant::now();
+        if state.selected.as_deref() == Some(id)
+            && state
+                .selected_owner
+                .is_some_and(|selected_owner| selected_owner != owner)
+        {
+            return Err("source_not_owned");
+        }
         if let Some(source) = state.sources.get(id) {
             if source.expires > now && source.owner != owner {
                 return Err("source_not_owned");

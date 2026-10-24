@@ -1,9 +1,8 @@
 # bmux Theme Plugin
 
-Owns runtime theme selection for bmux. Declare the startup theme in
-`[plugins.settings."bmux.theme"]`; this plugin handles live selection,
-preview, persistence, additive theme stacks, and generic theme-extension
-fanout.
+Owns attachment-local theme selection for bmux. Declare the baseline theme in
+`[plugins.settings."bmux.theme"]`; use the picker for a temporary per-view
+selection and explicit default control to save a startup preference.
 
 The performance settings capability is optional: themes without performance
 settings do not require the performance plugin. Applying settings for an absent
@@ -11,11 +10,12 @@ provider returns an error rather than silently accepting an incomplete theme.
 Decoration remains a required dependency for extension application and script
 preview checkpoints.
 
-With `persistence = "persist_between_connects"`, a saved picker preset takes
-precedence over both `themes` and split `appearance_themes` / `component_themes`
-stacks on reconnect. The preset resolves the same way as a live picker selection;
-declared component overrides and targets still apply. With the default
-`declared_on_connect` policy, reconnect uses the configured composition instead.
+When no explicit `default_theme` exists, legacy `selected_theme` preferences
+are honored only with `persistence = "persist_between_connects"`. That legacy
+preset takes precedence over `themes` and split `appearance_themes` /
+`component_themes`; declared component overrides and targets still apply.
+Otherwise, `declared_on_connect` uses the configured composition. Ordinary
+picker confirmation never creates or updates either durable preference.
 
 ## Configured Selection and Stored Preferences
 
@@ -25,19 +25,39 @@ saved interactive provider settings without deleting them. Preset selections
 remain distinct from this option, including presets with names resembling picker
 control values.
 
-Selection writes store a version-1 JSON record at `selected_theme`, with an
-explicit nullable `preset` field: `null` selects the configuration; a string
-selects that preset. Existing UTF-8 preset-name records remain readable and are
-replaced only on a subsequent confirmed, persisted selection. Reading does not
-rewrite configuration or storage. Unsupported versions, missing fields, and
-malformed records are errors rather than configured-mode defaults. Older BMUX
-versions do not understand these records; downgrade requires restoring a legacy
-preference from a backup rather than treating the new record as a preset name.
+Selection and preview are attachment-local, keyed only by authenticated
+`caller_client_id`. Normal selection, confirmation, refresh, and component
+settings never persist a preference or publish global appearance. Missing caller
+identity is rejected for view mutations. Appearance queries return that caller's
+effective preview/selection over its scoped configuration; unattached queries
+inspect the baseline without applying decorations.
+
+`theme-control-v1.current-default` and `select-default` inspect and explicitly
+save the durable startup default. `reset-view` returns the caller to its latest
+requested scoped baseline/default. Default changes affect new/reset views, not
+existing views. The explicit `default_theme` preference uses the version-1 JSON
+nullable `preset` representation and applies independently of the legacy
+`persistence` setting. Legacy `selected_theme` records remain readable under
+`persist_between_connects`, are not rewritten, and are superseded only when an
+explicit default exists. A configured default preserves the complete declared
+stack. Unsupported external providers without caller-scoped mutation contracts
+are rejected rather than invoked globally.
+
+Appearance snapshots retain the existing wire shape and are delivered only
+through recipient-scoped retained transport. Unchanged appearances are not
+serialized/published again; detach and reconciliation retire view state and
+clear its retained appearance. Reconciliation uses neutral transport liveness,
+so cleanup does not require the clients plugin: `Some(false)` retires a view;
+unknown liveness preserves it. Global appearance forwarding is disabled.
+Malformed or unsupported preference records are errors rather than implicit
+configured-mode defaults; reading never rewrites configuration or storage.
 
 The picker reads the theme owner's current selection and uses revision-checked
-control services for selection, preview, confirmation, and cancellation. One
-attachment owns a preview at a time. Active pickers renew their preview lease;
-detach or lease expiry restores the prior theme. Lua-backed decoration previews
+control services for selection, preview, confirmation, and cancellation. Each
+attachment owns its own preview, independently of other attachments. Enter
+confirms only that attachment's ephemeral selection; Esc removes its preview
+overlay. Active pickers renew their preview lease. Detach retires that view;
+lease expiry removes only its preview. Lua-backed decoration previews
 retain a checkpoint of the original script instances, and cancellation restores
 those instances rather than recompiling them. Failed rollback requires recovery
 instead of being reported as a successful restoration.

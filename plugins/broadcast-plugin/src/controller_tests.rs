@@ -204,6 +204,75 @@ fn websocket_lifecycle_refresh_fencing_and_shutdown() {
 }
 
 #[test]
+fn failed_source_switch_keeps_explicit_target_and_requires_full_refresh() {
+    use std::sync::atomic::Ordering;
+    let mut server = super::recovery_tests::TestRelay::new(false);
+    let controller = Controller::new().unwrap();
+    let owner = Uuid::new_v4();
+    let first = Uuid::new_v4().to_string();
+    let second = Uuid::new_v4().to_string();
+    controller.source(owner, &first, true).unwrap();
+    controller.source(owner, &second, true).unwrap();
+    controller
+        .control_owned(
+            owner,
+            Control::Start(Box::new(server.relay.take().unwrap()), first.clone()),
+        )
+        .unwrap();
+    server.event("start");
+    let refresh = controller.source(owner, &first, false).unwrap().refresh;
+    assert!(
+        controller
+            .publish(owner, &first, refresh, frame("first-view", 1))
+            .unwrap()
+    );
+    server.event("frame");
+    server.fail_pause.store(true, Ordering::SeqCst);
+    let failed = controller
+        .control_owned(owner, Control::Source(second.clone()))
+        .unwrap();
+    server.event("pause");
+    assert_eq!(failed.source_id.as_deref(), Some(second.as_str()));
+    assert_eq!(failed.local, "unavailable");
+    assert!(failed.error_code.is_some());
+    assert!(
+        !controller
+            .publish(owner, &first, refresh, frame("first-view", 2))
+            .unwrap()
+    );
+    assert!(!controller.source(owner, &second, false).unwrap().selected);
+    assert!(controller.state.lock().unwrap().pending.is_none());
+    server.fail_pause.store(false, Ordering::SeqCst);
+    controller.control_owned(owner, Control::Resume).unwrap();
+    // Unavailable-source pausing may already be retrying when recovery is admitted.
+    loop {
+        let (event, _) = server.events.recv_timeout(Duration::from_secs(5)).unwrap();
+        if event == "resume" {
+            break;
+        }
+        assert!(matches!(event.as_str(), "pause" | "heartbeat"));
+    }
+    let renewed = controller.source(owner, &second, false).unwrap();
+    assert!(renewed.selected);
+    assert!(renewed.refresh > refresh);
+    assert!(
+        !controller
+            .publish(owner, &second, refresh, frame("second-view", 1))
+            .unwrap()
+    );
+    assert!(
+        controller
+            .publish(owner, &second, renewed.refresh, frame("second-view", 1))
+            .unwrap()
+    );
+    let bytes = server.event("frame");
+    let mirrored = bmux_web_renderer::decode_binary(&bytes, None).unwrap();
+    assert_eq!(mirrored.generation(), "second-view");
+    controller.shutdown();
+    server.event("stop");
+}
+
+#[test]
 fn lease_expiry_and_unregister_never_revive_old_authority() {
     let controller = Controller::new().unwrap();
     let owner = Uuid::new_v4();
@@ -228,7 +297,97 @@ fn lease_expiry_and_unregister_never_revive_old_authority() {
 }
 
 #[test]
-fn expired_uuid_rebinds_but_unauthorized_attempts_are_atomic() {
+fn scoped_controls_cannot_select_or_stop_another_owners_view() {
+    let controller = Controller::new().unwrap();
+    let owner = Uuid::new_v4();
+    let other = Uuid::new_v4();
+    let id = Uuid::new_v4().to_string();
+    let other_id = Uuid::new_v4().to_string();
+    controller.source(owner, &id, true).unwrap();
+    controller.source(other, &other_id, true).unwrap();
+    let (stop, stopped) = tokio::sync::watch::channel(false);
+    {
+        let mut state = controller.state.lock().unwrap();
+        state.selected = Some(id.clone());
+        state.selected_owner = Some(owner);
+        state.local = "running";
+        state.sources.get_mut(&other_id).unwrap().terminal_stop = Some(stop);
+    }
+    let refresh = controller.source(owner, &id, false).unwrap().refresh;
+    for action in [
+        Control::Pause,
+        Control::Resume,
+        Control::Stop,
+        Control::Source(other_id.clone()),
+    ] {
+        assert_eq!(
+            controller.control_owned(other, action).err(),
+            Some("source_not_owned")
+        );
+    }
+    assert_eq!(
+        controller
+            .control_owned(owner, Control::Source(other_id))
+            .err(),
+        Some("source_not_owned")
+    );
+    assert_eq!(
+        controller.source(owner, &id, false).unwrap().refresh,
+        refresh
+    );
+    assert_eq!(
+        controller.status().unwrap().source_id.as_deref(),
+        Some(id.as_str())
+    );
+    controller.control_owned(owner, Control::Stop).unwrap();
+    assert!(!*stopped.borrow());
+    controller.shutdown();
+    assert!(*stopped.borrow());
+}
+
+#[test]
+fn switching_sources_clears_pending_and_selected_baseline() {
+    let controller = Controller::new().unwrap();
+    let owner = Uuid::new_v4();
+    let first = Uuid::new_v4().to_string();
+    let second = Uuid::new_v4().to_string();
+    controller.source(owner, &first, true).unwrap();
+    controller.source(owner, &second, true).unwrap();
+    let before;
+    {
+        let mut state = controller.state.lock().unwrap();
+        state.selected = Some(first);
+        state.selected_owner = Some(owner);
+        state.local = "running";
+        before = state.refresh;
+        state.pending = Some(Pending {
+            refresh: before,
+            bytes: frame("old", 4),
+            relay_revision: None,
+        });
+        let source = state.sources.get_mut(&second).unwrap();
+        source.last = Some((before, "old".into(), 99));
+        source.content = Some([1; 32]);
+    }
+    controller
+        .control_owned(owner, Control::Source(second.clone()))
+        .unwrap();
+    let state = controller.state.lock().unwrap();
+    assert!(state.refresh > before);
+    assert!(state.pending.is_none());
+    let source = state.sources.get(&second).unwrap();
+    assert!(source.last.is_none());
+    assert!(source.content.is_none());
+    drop(state);
+    controller.unregister(owner, &second).unwrap();
+    let status = controller.status().unwrap();
+    assert_eq!(status.source_id.as_deref(), Some(second.as_str()));
+    assert_eq!(status.local, "unavailable");
+    controller.shutdown();
+}
+
+#[test]
+fn selected_uuid_retains_owner_after_expiry_and_unregister() {
     let controller = Controller::new().unwrap();
     // This tests synchronous authority transitions, not frame delivery. Stop
     // the worker before staging pending data so it cannot consume the fixture.
@@ -240,6 +399,7 @@ fn expired_uuid_rebinds_but_unauthorized_attempts_are_atomic() {
     {
         let mut state = controller.state.lock().unwrap();
         state.selected = Some(id.clone());
+        state.selected_owner = Some(owner);
         state.local = "running";
         state.pending = Some(Pending {
             refresh: state.refresh,
@@ -259,10 +419,26 @@ fn expired_uuid_rebinds_but_unauthorized_attempts_are_atomic() {
         let mut state = controller.state.lock().unwrap();
         state.sources.get_mut(&id).unwrap().expires = Instant::now() - Duration::from_secs(1);
     }
-    let replacement = controller.source(hostile, &id, true).unwrap();
+    assert_eq!(
+        controller.source(hostile, &id, true).err(),
+        Some("source_not_owned")
+    );
+    let replacement = controller.source(owner, &id, true).unwrap();
     assert!(replacement.refresh > before);
     assert!(!replacement.selected);
-    assert!(controller.source(owner, &id, false).is_err());
-    assert!(controller.unregister(owner, &id).is_err());
+    assert_eq!(
+        controller.status().unwrap().source_id.as_deref(),
+        Some(id.as_str())
+    );
+    controller.unregister(owner, &id).unwrap();
+    assert_eq!(
+        controller.source(hostile, &id, true).err(),
+        Some("source_not_owned")
+    );
+    assert_eq!(controller.status().unwrap().local, "unavailable");
+    assert_eq!(
+        controller.status().unwrap().source_id.as_deref(),
+        Some(id.as_str())
+    );
     controller.shutdown();
 }

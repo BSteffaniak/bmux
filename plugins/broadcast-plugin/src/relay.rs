@@ -87,6 +87,10 @@ impl Relay {
         }
         if operation == "heartbeat" {
             self.service_keepalive().await?;
+        } else {
+            // Local pause/source-switch admission already invalidated the view.
+            // Even a failed remote transition must not retain its delta baseline.
+            *self.stream.lock().await = Stream::default();
         }
         let epoch = self.epoch.ok_or("not_started")?;
         let fence = self.fence.lock().await.clone().ok_or("not_started")?;
@@ -110,9 +114,6 @@ impl Relay {
             return Err("relay_epoch_lost");
         }
         *self.fence.lock().await = Some(next.fence);
-        if operation != "heartbeat" {
-            *self.stream.lock().await = Stream::default();
-        }
         Ok(())
     }
     /// Reconcile a durable relay restart without guessing a new authority.
@@ -386,6 +387,38 @@ pub(crate) fn credential_key(path: &Path) -> Result<String, &'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn failed_source_transition_discards_acknowledged_baseline() {
+        // Nextest isolates each test: do not rely on Relay::new in another test
+        // installing the provider before this fixture constructs its HTTP client.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let mut relay = Relay {
+            client: reqwest::Client::new(),
+            base: reqwest::Url::parse("http://127.0.0.1:1/v1/publisher/").unwrap(),
+            key: "unused".into(),
+            publisher: Uuid::new_v4(),
+            epoch: None,
+            fence: Mutex::new(None),
+            stream: Mutex::new(Stream::default()),
+        };
+        let scene = bmux_tui::presentation::PresentationState::new(bmux_tui::geometry::Rect::new(
+            0, 0, 2, 1,
+        ));
+        let prepared = scene
+            .prepare(bmux_tui::damage::Damage::Full, |_| {})
+            .unwrap();
+        relay.stream.get_mut().base = Some(
+            bmux_web_renderer::BrowserFrame::from_prepared_in_generation(
+                "previous-view",
+                1,
+                &prepared,
+            )
+            .unwrap(),
+        );
+        assert_eq!(relay.mutation("resume", None).await, Err("not_started"));
+        assert!(relay.stream.lock().await.base.is_none());
+    }
+
     #[test]
     fn rejects_insecure_or_credential_bearing_endpoints_before_file_io() {
         for endpoint in [

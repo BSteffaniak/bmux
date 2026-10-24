@@ -14,7 +14,7 @@ use bmux_plugin::{HostRuntimeApi, ServiceCaller};
 use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::{
     HostConnectionInfo, NativeServiceContext, PluginEvent, PromptEvent, PromptResponse,
-    PromptValue, ServiceKind, ServiceResponse, StorageGetRequest, StorageKey, StorageSetRequest,
+    PromptValue, ServiceKind, ServiceResponse, StorageGetRequest, StorageKey,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -22,18 +22,21 @@ use std::path::Path;
 use tracing::{info, warn};
 
 mod appearance_wire;
+mod views;
+pub use views::ThemePlugin;
 
 mod control_contract {
     bmux_plugin_schema_macros::schema! { source: "bpdl/theme-plugin.bpdl" }
 }
 
+pub use control_contract::theme_state::SERVICE_CONTRACT;
 /// Generated interface identity for checked `theme-state` calls.
 ///
 /// After negotiating `core.service_contract.v2`, callers bind encoded requests
 /// to `theme-state` and this compact interface identity. Successful responses
 /// must pass `service_contract::decode_response` before appearance decoding.
 /// Generated clients perform these steps automatically.
-pub use control_contract::theme_state::SERVICE_CONTRACT;
+pub use control_contract::{theme_control_v1, theme_state};
 
 const STORAGE_SELECTED_APPEARANCE: &str = "selected_theme";
 // Picker values are namespaced separately from catalog names.
@@ -124,40 +127,14 @@ fn restore_preview_checkpoint(
     active: &ThemePreview,
     config_dirs: &[String],
 ) -> Result<(), String> {
-    reset_removed_providers(context, &active.displayed, &active.original.resolved)?;
-    let owners: Vec<_> = active
-        .owners
-        .iter()
-        .filter(|id| id.as_str() != "bmux.decoration")
-        .cloned()
-        .collect();
-    try_apply_theme_extensions(context, &active.original.resolved, &owners, config_dirs)?;
-    if active
-        .original
-        .resolved
-        .plugins
-        .contains_key("bmux.decoration")
-    {
-        let mut client = bmux_plugin::ServiceCallerDispatchClient::new(context);
-        bmux_plugin::block_on_typed_dispatch(
-            bmux_decoration_plugin_api::decoration_commands::client::restore_script_state(
-                &mut client,
-            ),
-        )
-        .map_err(|error| error.to_string())??;
-    } else if active.owners.contains("bmux.decoration") {
-        let mut client = bmux_plugin::ServiceCallerDispatchClient::new(context);
-        bmux_plugin::block_on_typed_dispatch(
-            bmux_decoration_plugin_api::decoration_commands::client::apply_theme_extension(
-                &mut client,
-                String::new(),
-                config_dirs.to_vec(),
-            ),
-        )
-        .map_err(|error| error.to_string())?
-        .map_err(|error| format!("clearing preview decorations failed: {error:?}"))?;
-    }
-    Ok(())
+    let _ = (active, config_dirs);
+    let mut client = bmux_plugin::ServiceCallerDispatchClient::new(context);
+    bmux_plugin::block_on_typed_dispatch(
+        bmux_decoration_plugin_api::decoration_commands::client::restore_view_script_state(
+            &mut client,
+        ),
+    )
+    .map_err(|error| error.to_string())?
 }
 
 struct DetachTask(tokio::task::JoinHandle<()>);
@@ -169,117 +146,22 @@ impl Drop for DetachTask {
 }
 
 #[derive(Default)]
-pub struct ThemePlugin {
-    lifecycle_context: Option<NativeLifecycleContext>,
+struct ThemeView {
     selection: std::sync::Mutex<Option<LiveTheme>>,
     preview: std::sync::Arc<std::sync::Mutex<Option<ThemePreview>>>,
-    preview_sequence: std::sync::atomic::AtomicU64,
+    preview_sequence: std::sync::Arc<std::sync::atomic::AtomicU64>,
     recovery_required: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    detach_task: Option<DetachTask>,
     refreshed_settings: std::sync::Mutex<Option<toml::Value>>,
 }
 
-impl ThemePlugin {
+impl ThemeView {
     fn apply_external_form(
-        &self,
-        context: &NativeServiceContext,
-        revision: u64,
-        provider_id: &str,
-        json: &[u8],
+        _context: &NativeServiceContext,
+        _revision: u64,
+        _provider_id: &str,
+        _json: &[u8],
     ) -> Result<control_contract::theme_control_v1::Snapshot, String> {
-        if json.len() > 65_536 {
-            return Err("settings form exceeds 64 KiB".into());
-        }
-        let preview = self
-            .preview
-            .lock()
-            .map_err(|_| "preview requires recovery")?;
-        if preview.is_some() {
-            return Err("theme preview is active".into());
-        }
-        let mut state = self
-            .selection
-            .lock()
-            .map_err(|_| "theme requires recovery")?;
-        let live = state.as_mut().ok_or("read current theme first")?;
-        if live.snapshot.revision != revision {
-            return Err("stale theme revision".into());
-        }
-        let next_revision = revision.checked_add(1).ok_or("theme revision exhausted")?;
-        if live
-            .resolved
-            .settings
-            .component_settings
-            .contains_key(provider_id)
-        {
-            return Err("use component settings operation".into());
-        }
-        let provider = live
-            .resolved
-            .settings
-            .providers
-            .get(provider_id)
-            .ok_or("unknown settings provider")?;
-        let endpoint = provider
-            .apply_form
-            .as_ref()
-            .ok_or("provider has no form application contract")?;
-        let values: BTreeMap<String, bmux_plugin_sdk::PromptFormValue> =
-            serde_json::from_slice(json).map_err(|error| error.to_string())?;
-        let settings = self.current_settings(context)?;
-        let key = StorageKey::new(provider_storage_key(provider_id, provider))
-            .map_err(|error| error.to_string())?;
-        let previous = live.resolved.external_payloads.get(provider_id).cloned();
-        let outcome =
-            call_theme_settings_service::<_, ThemeSettingsPayload>(context, endpoint, &values)
-                .map_err(|error| error.to_string());
-        let outcome = outcome.and_then(|payload| {
-            if matches!(
-                settings.persistence,
-                ThemePersistence::PersistBetweenConnects
-            ) {
-                context
-                    .storage_set(&StorageSetRequest::new(key, payload.json.clone()))
-                    .map_err(|error| error.to_string())?;
-            }
-            Ok(payload)
-        });
-        match outcome {
-            Ok(payload) => {
-                live.resolved
-                    .external_payloads
-                    .insert(provider_id.to_string(), payload);
-            }
-            Err(error) => {
-                let restored = previous.as_ref().map_or_else(
-                    || {
-                        provider.reset_settings.as_ref().is_some_and(|endpoint| {
-                            call_theme_settings_service::<_, ()>(context, endpoint, &()).is_ok()
-                        })
-                    },
-                    |payload| {
-                        provider.apply_settings.is_some()
-                            && apply_theme_settings_provider_payload(
-                                context,
-                                provider_id,
-                                provider,
-                                payload,
-                            )
-                            .is_ok()
-                    },
-                );
-                if !restored {
-                    self.recovery_required
-                        .store(true, std::sync::atomic::Ordering::Release);
-                }
-                return Err(error);
-            }
-        }
-        live.snapshot.revision = next_revision;
-        let snapshot = live.snapshot.clone();
-        drop(state);
-        drop(preview);
-        Ok(snapshot)
+        Err("provider has no caller-scoped settings contract".into())
     }
 
     fn current_settings(
@@ -337,39 +219,13 @@ impl ThemePlugin {
             &mut next.resolved,
             &BTreeMap::from([(provider.to_string(), json_settings_to_toml(&value))]),
         );
-        let settings = self.current_settings(context)?;
-        let persistence_key = if matches!(
-            settings.persistence,
-            ThemePersistence::PersistBetweenConnects
-        ) {
-            let spec = live
-                .resolved
-                .settings
-                .providers
-                .get(provider)
-                .ok_or("missing settings provider contract")?;
-            Some(
-                StorageKey::new(provider_storage_key(provider, spec))
-                    .map_err(|error| error.to_string())?,
-            )
-        } else {
-            None
-        };
         let owners: Vec<_> = next.resolved.plugins.keys().cloned().collect();
         if let Err(error) = try_apply_theme_extensions(
             context,
             &next.resolved,
             &owners,
             &context.connection.config_dir_candidates,
-        )
-        .and_then(|()| {
-            if let Some(key) = persistence_key {
-                context
-                    .storage_set(&StorageSetRequest::new(key, json.to_vec()))
-                    .map_err(|error| error.to_string())?;
-            }
-            Ok(())
-        }) {
+        ) {
             if try_apply_theme_extensions(
                 context,
                 &live.resolved,
@@ -389,90 +245,6 @@ impl ThemePlugin {
         drop(state);
         drop(preview);
         Ok(snapshot)
-    }
-
-    fn reapply_live_theme(
-        &self,
-        context: &NativeLifecycleContext,
-    ) -> Result<(), PluginCommandError> {
-        let preview = self
-            .preview
-            .lock()
-            .map_err(|_| PluginCommandError::unavailable("preview requires recovery"))?;
-        if preview.is_some() {
-            return Ok(());
-        }
-        let selection = self
-            .selection
-            .lock()
-            .map_err(|_| PluginCommandError::unavailable("theme requires recovery"))?;
-        if let Some(live) = selection.as_ref() {
-            try_apply_theme_extensions(
-                context,
-                &live.resolved,
-                &live.resolved.plugins.keys().cloned().collect::<Vec<_>>(),
-                &context.connection.config_dir_candidates,
-            )
-            .map_err(PluginCommandError::unavailable)?;
-            publish_runtime_appearance(&live.resolved);
-        } else {
-            apply_configured_theme_extensions(context);
-        }
-        drop(selection);
-        drop(preview);
-        Ok(())
-    }
-
-    fn watch_detach(&mut self, context: &NativeLifecycleContext) {
-        if self.detach_task.is_some() {
-            return;
-        }
-        let Ok(handle) = tokio::runtime::Handle::try_current() else {
-            return;
-        };
-        let mut events = bmux_plugin::global_event_bus()
-            .subscribe::<bmux_clients_plugin_api::clients_events::ClientEvent>(
-                &bmux_clients_plugin_api::clients_events::EVENT_KIND,
-            )
-            .ok();
-        let preview = self.preview.clone();
-        let recovery = self.recovery_required.clone();
-        let context = context.clone();
-        self.detach_task = Some(DetachTask(handle.spawn(async move {
-            let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
-            loop {
-                if recovery.load(std::sync::atomic::Ordering::Acquire) { break; }
-                let owner = tokio::select! {
-                    _ = tick.tick() => None,
-                    event = async {
-                        match events.as_mut() {
-                            Some(events) => events.recv().await,
-                            None => std::future::pending().await,
-                        }
-                    } => if let Ok(event) = event {
-                        match event.as_ref() {
-                            bmux_clients_plugin_api::clients_events::ClientEvent::Detached { client_id } => Some(client_id.to_string()),
-                            _ => continue,
-                        }
-                    } else { events = None; None }
-                };
-                let Ok(mut guard) = preview.lock() else {
-                    recovery.store(true, std::sync::atomic::Ordering::Release);
-                    break;
-                };
-                let Some(active) = guard.as_ref().filter(|active| owner.as_ref() == Some(&active.owner) || std::time::Instant::now() >= active.expires_at) else {
-                    continue;
-                };
-                if restore_preview_checkpoint(&context, active, &context.connection.config_dir_candidates)
-                .is_err()
-                {
-                    recovery.store(true, std::sync::atomic::Ordering::Release);
-                    break;
-                }
-                publish_runtime_appearance(&active.original.resolved);
-                *guard = None;
-            }
-        })));
     }
 
     fn begin_preview(&self, context: &NativeServiceContext, revision: u64) -> Result<u64, String> {
@@ -506,15 +278,13 @@ impl ThemePlugin {
             .map_err(|_| "preview sequence exhausted")?
             + 1;
         let owners = original.resolved.plugins.keys().cloned().collect();
-        if original.resolved.plugins.contains_key("bmux.decoration") {
-            let mut client = bmux_plugin::ServiceCallerDispatchClient::new(context);
-            bmux_plugin::block_on_typed_dispatch(
-                bmux_decoration_plugin_api::decoration_commands::client::checkpoint_script_state(
-                    &mut client,
-                ),
-            )
-            .map_err(|error| error.to_string())??;
-        }
+        let mut client = bmux_plugin::ServiceCallerDispatchClient::new(context);
+        bmux_plugin::block_on_typed_dispatch(
+            bmux_decoration_plugin_api::decoration_commands::client::checkpoint_view_script_state(
+                &mut client,
+            ),
+        )
+        .map_err(|error| error.to_string())??;
         *preview = Some(ThemePreview {
             token,
             owner,
@@ -595,11 +365,9 @@ impl ThemePlugin {
                     .store(true, std::sync::atomic::Ordering::Release);
                 return Err(format!("{error}; preview recovery failed: {restore}"));
             }
-            publish_runtime_appearance(&active.original.resolved);
             *preview = None;
             return Err(error);
         }
-        publish_runtime_appearance(&theme);
         drop(preview);
         Ok(())
     }
@@ -643,22 +411,17 @@ impl ThemePlugin {
             self.select_without_preview(context, active.original.snapshot.revision, value)
         });
         if result.is_ok() {
-            if active
-                .original
-                .resolved
-                .plugins
-                .contains_key("bmux.decoration")
-            {
-                let mut client = bmux_plugin::ServiceCallerDispatchClient::new(context);
-                let disposal = bmux_plugin::block_on_typed_dispatch(bmux_decoration_plugin_api::decoration_commands::client::discard_script_checkpoint(&mut client)).map_err(|error| error.to_string()).and_then(|result| result);
-                if let Err(error) = disposal {
-                    *preview = None;
-                    self.recovery_required
-                        .store(true, std::sync::atomic::Ordering::Release);
-                    return Err(format!(
-                        "selection committed, but checkpoint disposal requires recovery: {error}"
-                    ));
-                }
+            let mut client = bmux_plugin::ServiceCallerDispatchClient::new(context);
+            let disposal = bmux_plugin::block_on_typed_dispatch(
+                bmux_decoration_plugin_api::decoration_commands::client::discard_view_script_checkpoint(&mut client),
+            ).map_err(|error| error.to_string()).and_then(|result| result);
+            if let Err(error) = disposal {
+                *preview = None;
+                self.recovery_required
+                    .store(true, std::sync::atomic::Ordering::Release);
+                return Err(format!(
+                    "selection committed, but checkpoint disposal requires recovery: {error}"
+                ));
             }
         } else {
             let restoration = restore_preview_checkpoint(
@@ -673,7 +436,6 @@ impl ThemePlugin {
                     "theme confirmation failed and checkpoint restoration requires recovery: {error}"
                 ));
             }
-            publish_runtime_appearance(&active.original.resolved);
         }
         *preview = None;
         drop(preview);
@@ -698,7 +460,6 @@ impl ThemePlugin {
                 self.recovery_required
                     .store(true, std::sync::atomic::Ordering::Release);
             })?;
-        publish_runtime_appearance(&active.original.resolved);
         *preview = None;
         drop(preview);
         Ok(())
@@ -813,7 +574,6 @@ impl ThemePlugin {
             revision,
             selection: current.snapshot.selection.clone(),
         };
-        publish_runtime_appearance(&theme);
         *state = Some(LiveTheme {
             snapshot: snapshot.clone(),
             resolved: theme,
@@ -872,25 +632,14 @@ impl ThemePlugin {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect();
-        let apply = reset_removed_providers(context, &current.resolved, &theme)
-            .and_then(|()| {
-                try_apply_theme_extensions(
-                    context,
-                    &theme,
-                    &owners,
-                    &context.connection.config_dir_candidates,
-                )
-            })
-            .and_then(|()| {
-                if matches!(
-                    settings.persistence,
-                    ThemePersistence::PersistBetweenConnects
-                ) {
-                    persist_theme_name(context, &value.picker_value())
-                } else {
-                    Ok(())
-                }
-            });
+        let apply = reset_removed_providers(context, &current.resolved, &theme).and_then(|()| {
+            try_apply_theme_extensions(
+                context,
+                &theme,
+                &owners,
+                &context.connection.config_dir_candidates,
+            )
+        });
         if let Err(error) = apply {
             if let Err(restore_error) = reset_removed_providers(context, &theme, &current.resolved)
                 .and_then(|()| {
@@ -908,7 +657,6 @@ impl ThemePlugin {
             }
             return Err(error);
         }
-        publish_runtime_appearance(&theme);
         let snapshot = control_contract::theme_control_v1::Snapshot {
             revision,
             selection: value,
@@ -922,40 +670,8 @@ impl ThemePlugin {
     }
 }
 
-impl RustPlugin for ThemePlugin {
+impl RustPlugin for ThemeView {
     type Contract = control_contract::Contract;
-
-    fn activate(&mut self, context: NativeLifecycleContext) -> Result<i32, PluginCommandError> {
-        info!(
-            data_dir = %context.connection.data_dir,
-            config_dirs = ?context.connection.config_dir_candidate_paths(),
-            settings_present = context.settings.is_some(),
-            "theme plugin activating",
-        );
-        self.lifecycle_context = Some(context.clone());
-        self.watch_detach(&context);
-        apply_configured_theme_extensions(&context);
-        Ok(EXIT_OK)
-    }
-
-    fn handle_event(&mut self, event: PluginEvent) -> Result<i32, PluginCommandError> {
-        if self.detach_task.is_none()
-            && let Some(context) = self.lifecycle_context.clone()
-        {
-            self.watch_detach(&context);
-        }
-        if event.kind.as_str() == "bmux.core/server_started"
-            && let Some(context) = self.lifecycle_context.as_ref()
-        {
-            info!(
-                data_dir = %context.connection.data_dir,
-                event_kind = %event.kind.as_str(),
-                "theme plugin handling lifecycle event; reapplying theme state",
-            );
-            self.reapply_live_theme(context)?;
-        }
-        Ok(EXIT_OK)
-    }
 
     fn run_command(&mut self, context: NativeCommandContext) -> Result<i32, PluginCommandError> {
         bmux_plugin_sdk::route_command!(context, {
@@ -979,7 +695,7 @@ impl RustPlugin for ThemePlugin {
                 Ok::<_, ServiceResponse>(self.set_component_settings(ctx, req.expected_revision, &req.provider, &req.json))
             },
             "theme-control-v1", "apply-external-form" => |req: control_contract::theme_control_v1::client::ApplyExternalFormRequest, ctx| {
-                Ok::<_, ServiceResponse>(self.apply_external_form(ctx, req.expected_revision, &req.provider, &req.json))
+                Ok::<_, ServiceResponse>(Self::apply_external_form(ctx, req.expected_revision, &req.provider, &req.json))
             },
             "theme-control-v1", "current" => |_req: (), ctx| {
                 let mut selection = self.selection.lock().map_err(|_| ServiceResponse::error("theme_state_poisoned", "theme selection requires recovery"))?;
@@ -1273,7 +989,7 @@ fn amount_to_permille(amount: f32) -> u16 {
     (amount.clamp(0.0, 1.0) * 1000.0).round() as u16
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
 #[serde(rename_all = "snake_case")]
 enum ThemePersistence {
     #[default]
@@ -1281,7 +997,7 @@ enum ThemePersistence {
     PersistBetweenConnects,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 struct ThemePluginSettings {
     #[serde(default)]
     theme: Option<String>,
@@ -1405,6 +1121,7 @@ fn pick_theme(context: &NativeCommandContext) -> Result<i32, PluginCommandError>
     Ok(EXIT_OK)
 }
 
+#[cfg(test)]
 fn apply_configured_theme_extensions(context: &NativeLifecycleContext) {
     let Some(active) = configured_theme(context) else {
         warn!("no active theme resolved for startup extension apply");
@@ -1429,19 +1146,11 @@ fn apply_configured_theme_extensions(context: &NativeLifecycleContext) {
         return;
     }
     log_active_theme(context, &active);
-    publish_runtime_appearance(&active.theme);
 }
 
 fn active_runtime_appearance(
     context: &(impl ThemeHostContext + ?Sized),
 ) -> Option<RuntimeAppearance> {
-    // Queries must agree with the appearance already published to attachments.
-    // Configuration is only the bootstrap fallback before a retained value exists.
-    if let Ok((appearance, _)) = bmux_plugin::global_event_bus()
-        .subscribe_state::<RuntimeAppearance>(&RUNTIME_APPEARANCE_STATE_KIND)
-    {
-        return Some((*appearance).clone());
-    }
     configured_theme(context).map(|active| active.theme.appearance)
 }
 
@@ -1468,7 +1177,9 @@ fn configured_theme(context: &(impl ThemeHostContext + ?Sized)) -> Option<Active
             return None;
         }
     };
-    configured_theme_with_settings(context, &settings)
+    let active = configured_theme_with_settings(context, &settings)?;
+    log_active_theme(context, &active);
+    Some(active)
 }
 
 fn configured_theme_with_settings(
@@ -1507,7 +1218,7 @@ fn configured_theme_with_settings(
     })
 }
 
-fn log_active_theme(context: &impl ThemeHostContext, active: &ActiveThemeResolution) {
+fn log_active_theme(context: &(impl ThemeHostContext + ?Sized), active: &ActiveThemeResolution) {
     info!(
         data_dir = %context.connection_info().data_dir,
         config_dirs = ?context.connection_info().config_dir_candidate_paths(),
@@ -1516,20 +1227,6 @@ fn log_active_theme(context: &impl ThemeHostContext, active: &ActiveThemeResolut
         stack = ?active.stack,
         "active theme resolved",
     );
-}
-
-fn publish_runtime_appearance(theme: &ResolvedTheme) {
-    let appearance = theme.appearance.clone();
-    if bmux_plugin::global_event_bus()
-        .publish_state(&RUNTIME_APPEARANCE_STATE_KIND, appearance.clone())
-        .is_err()
-    {
-        let _ = bmux_plugin::global_event_bus()
-            .register_state_channel_with_decoder::<RuntimeAppearance>(
-                RUNTIME_APPEARANCE_STATE_KIND,
-                appearance,
-            );
-    }
 }
 
 fn picker_active_name(stack: &[String]) -> String {
@@ -1873,19 +1570,7 @@ async fn configure_theme_settings_provider(
         submit_external_settings(control, form_revision, provider_id, &values).await;
         return;
     }
-    let settings_payload = if let Some(apply_endpoint) = provider.apply_form.as_ref() {
-        match call_theme_settings_service::<_, ThemeSettingsPayload>(
-            context,
-            apply_endpoint,
-            &values,
-        ) {
-            Ok(settings_payload) => settings_payload,
-            Err(error) => {
-                warn!(%error, provider_id, "failed applying theme settings form");
-                return;
-            }
-        }
-    } else if let Some(form) = theme.settings.forms.get(provider_id) {
+    let settings_payload = if let Some(form) = theme.settings.forms.get(provider_id) {
         builtin_theme_settings_payload_from_form(form, &values)
     } else {
         return;
@@ -1901,18 +1586,10 @@ async fn configure_theme_settings_provider(
         if !matches!(result, Ok(Ok(_))) {
             warn!(?result, provider_id, "component settings update failed");
         }
-        return;
-    }
-    if matches!(
-        settings.persistence,
-        ThemePersistence::PersistBetweenConnects
-    ) {
-        persist_theme_settings(context, provider_id, provider, &settings_payload);
     } else {
-        info!(
+        warn!(
             provider_id,
-            persistence = ?settings.persistence,
-            "theme settings not persisted because persistence is disabled",
+            "provider has no caller-scoped settings contract"
         );
     }
 }
@@ -2206,22 +1883,6 @@ fn json_settings_to_toml(value: &serde_json::Value) -> toml::Value {
 }
 
 #[cfg(test)]
-fn apply_builtin_component_theme_settings(
-    context: &(impl ServiceCaller + Sync),
-    theme: &ResolvedTheme,
-    provider_id: &str,
-    payload: &ThemeSettingsPayload,
-    all_plugin_ids: &[String],
-) {
-    let settings_value = json_settings_to_toml(&payload_to_json_value(payload));
-    let mut theme = theme.clone();
-    apply_theme_settings_component_overrides(
-        &mut theme,
-        &BTreeMap::from([(provider_id.to_string(), settings_value)]),
-    );
-    apply_theme_extensions(context, &theme, all_plugin_ids, &[]);
-}
-
 fn persist_theme_settings(
     context: &impl ServiceCaller,
     provider_id: &str,
@@ -2229,7 +1890,10 @@ fn persist_theme_settings(
     settings: &ThemeSettingsPayload,
 ) {
     let key = provider_storage_key(provider_id, provider);
-    let request = StorageSetRequest::new(storage_key_from_string(&key), settings.json.clone());
+    let request = bmux_plugin_sdk::StorageSetRequest::new(
+        storage_key_from_string(&key),
+        settings.json.clone(),
+    );
     if let Err(error) = context.storage_set(&request) {
         warn!(%error, key, provider_id, "failed persisting theme settings");
     } else {
@@ -2467,19 +2131,10 @@ fn reset_removed_providers(
     previous: &ResolvedTheme,
     next: &ResolvedTheme,
 ) -> Result<(), String> {
+    let _ = context;
     validate_provider_transition(previous, next)?;
-    for id in previous.external_payloads.keys() {
-        if next.external_payloads.contains_key(id) {
-            continue;
-        }
-        let endpoint = previous
-            .settings
-            .providers
-            .get(id)
-            .and_then(|provider| provider.reset_settings.as_ref())
-            .ok_or("missing reset contract")?;
-        call_theme_settings_service::<_, ()>(context, endpoint, &())
-            .map_err(|error| format!("reset provider {id}: {error}"))?;
+    if !previous.external_payloads.is_empty() || !next.external_payloads.is_empty() {
+        return Err("theme provider has no caller-scoped extension contract".into());
     }
     Ok(())
 }
@@ -2923,39 +2578,6 @@ fn read_persisted_theme_name(
     decode_theme_selection(&value)
 }
 
-fn persist_theme_name(context: &impl ThemeHostContext, name: &str) -> Result<(), String> {
-    let selection = ThemeSelection::from_picker_value(name).ok_or("invalid picker selection")?;
-    let result = context.storage_set(&StorageSetRequest::new(
-        bmux_plugin_sdk::storage_key!("selected_theme"),
-        serde_json::to_vec(&PersistedThemeSelection {
-            version: 1,
-            preset: match selection {
-                ThemeSelection::Configured => None,
-                ThemeSelection::Preset { name } => Some(name),
-            },
-        })
-        .expect("theme selection contains only JSON-serializable fields"),
-    ));
-    if let Err(error) = result {
-        warn!(
-            %error,
-            data_dir = %context.connection_info().data_dir,
-            key = STORAGE_SELECTED_APPEARANCE,
-            theme = %name,
-            "failed persisting selected theme",
-        );
-        Err(error.to_string())
-    } else {
-        info!(
-            data_dir = %context.connection_info().data_dir,
-            key = STORAGE_SELECTED_APPEARANCE,
-            theme = %name,
-            "persisted selected theme",
-        );
-        Ok(())
-    }
-}
-
 fn load_theme_catalog(config_dir_candidates: &[std::path::PathBuf]) -> Vec<ThemeCatalogEntry> {
     let mut entries = vec![ThemeCatalogEntry {
         name: "default".to_string(),
@@ -3141,27 +2763,21 @@ fn theme_by_name<'a>(catalog: &'a [ThemeCatalogEntry], name: &str) -> Option<&'a
         .map(|entry| &entry.theme)
 }
 
-#[cfg(test)]
-fn apply_theme_extensions(
-    context: &(impl ServiceCaller + Sync),
-    theme: &ResolvedTheme,
-    plugin_ids: &[String],
-    config_dir_candidates: &[String],
-) {
-    if let Err(error) =
-        try_apply_theme_extensions(context, theme, plugin_ids, config_dir_candidates)
-    {
-        warn!(%error, "theme extension application failed");
-    }
-}
-
 fn try_apply_theme_extensions(
     context: &(impl ServiceCaller + Sync),
     theme: &ResolvedTheme,
     plugin_ids: &[String],
     config_dir_candidates: &[String],
 ) -> Result<(), String> {
+    if plugin_ids.iter().any(|id| id != "bmux.decoration") || !theme.external_payloads.is_empty() {
+        return Err("theme provider has no caller-scoped extension contract".into());
+    }
     for plugin_id in plugin_ids {
+        if plugin_id != "bmux.decoration" {
+            return Err(format!(
+                "{plugin_id}: caller-scoped theme extensions are unsupported"
+            ));
+        }
         let toml = match theme.plugins.get(plugin_id) {
             Some(extension) => {
                 toml::to_string(extension).map_err(|error| format!("{plugin_id}: {error}"))?
@@ -3221,7 +2837,7 @@ fn execute_theme_extension_apply(
             bmux_plugin_sdk::decode_service_message(&payload).map_err(|error| error.to_string())?;
         let mut client = bmux_plugin::ServiceCallerDispatchClient::new(context);
         return bmux_plugin::block_on_typed_dispatch(
-            bmux_decoration_plugin_api::decoration_commands::client::apply_theme_extension(
+            bmux_decoration_plugin_api::decoration_commands::client::apply_view_theme_extension(
                 &mut client,
                 request.toml,
                 request.config_dir_candidates,
@@ -3253,12 +2869,13 @@ fn normalized_theme_name(name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::ThemeView as ThemePlugin;
     use super::*;
     use bmux_plugin::test_support::{TestServiceRouter, install_test_service_router};
+    use bmux_plugin_sdk::StorageSetRequest;
     use bmux_plugin_sdk::{
-        ApiVersion, HostMetadata, HostScope, PluginEventKind, ProviderId, RegisteredService,
-        ServiceKind, ServiceRequest, StorageGetResponse, decode_service_message,
-        encode_service_message,
+        ApiVersion, HostMetadata, HostScope, ProviderId, RegisteredService, ServiceKind,
+        ServiceRequest, StorageGetResponse, decode_service_message, encode_service_message,
     };
     use std::sync::{Arc, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -3585,7 +3202,7 @@ mod tests {
                     ("bmux.storage", "set") => Err(bmux_plugin_sdk::PluginError::InvalidPluginId {
                         id: "injected storage failure".into(),
                     }),
-                    ("bmux.decoration.write", "apply-theme-extension") => {
+                    ("bmux.decoration.write", "apply-view-theme-extension") => {
                         let request: ApplyThemeExtensionArgs =
                             decode_service_message(&payload).expect("extension");
                         observed.lock().expect("applied").push(request.toml);
@@ -3622,7 +3239,7 @@ mod tests {
         let router: TestServiceRouter = Arc::new(|_, _, capability, _, interface, operation, _| {
             assert_eq!(capability, "bmux.decoration.write");
             assert_eq!(interface, "decoration-commands");
-            assert_eq!(operation, "apply-theme-extension");
+            assert_eq!(operation, "apply-view-theme-extension");
             encode_service_message(&Err::<(), _>(
                 bmux_decoration_plugin_api::decoration_state::ValidationResult::Errors {
                     errors: vec![
@@ -3668,7 +3285,7 @@ mod tests {
                     *observed.lock().expect("writes") += 1;
                     encode_service_message(&())
                 }
-                ("bmux.decoration.write", "apply-theme-extension") => {
+                ("bmux.decoration.write", "apply-view-theme-extension") => {
                     encode_service_message(&Err::<(), _>(
                         bmux_decoration_plugin_api::decoration_state::ValidationResult::Errors {
                             errors: Vec::new(),
@@ -3728,49 +3345,6 @@ mod tests {
         let catalog = load_theme_catalog(&[primary]);
         assert!(theme_by_name(&catalog, "hacker").is_none());
         assert!(theme_by_name(&catalog, "minimal").is_some());
-    }
-
-    #[test]
-    fn active_appearance_query_returns_published_live_appearance() {
-        let catalog = load_theme_catalog(&[]);
-        let live =
-            resolve_theme_picker_selection(&catalog, "hacker", &ThemePluginSettings::default())
-                .expect("live theme");
-        publish_runtime_appearance(&live);
-        let context = service_context(Some(
-            toml::from_str("theme = 'minimal'").expect("startup settings"),
-        ));
-        let actual = active_runtime_appearance(&context).expect("retained appearance");
-        assert_eq!(actual, live.appearance);
-    }
-
-    #[test]
-    #[allow(clippy::result_large_err)] // TestServiceRouter fixes the external error type.
-    fn startup_rejection_keeps_previous_published_appearance() {
-        let previous = resolve_theme_picker_selection(
-            &load_theme_catalog(&[]),
-            "hacker",
-            &ThemePluginSettings::default(),
-        )
-        .expect("previous");
-        publish_runtime_appearance(&previous);
-        let router: TestServiceRouter = Arc::new(|_, _, _, _, _, _, _| {
-            encode_service_message(&Err::<(), _>(
-                bmux_decoration_plugin_api::decoration_state::ValidationResult::Errors {
-                    errors: Vec::new(),
-                },
-            ))
-        });
-        let _router = install_test_service_router(router);
-        let context =
-            lifecycle_context(Some(toml::from_str("theme = 'minimal'").expect("settings")));
-        ThemePlugin::default()
-            .activate(context.clone())
-            .expect("activation remains available");
-        assert_eq!(
-            active_runtime_appearance(&context).expect("retained"),
-            previous.appearance
-        );
     }
 
     #[test]
@@ -3850,7 +3424,7 @@ mod tests {
             ..ThemePlugin::default()
         };
         let router: TestServiceRouter = Arc::new(|_, _, capability, _, _, operation, _| {
-            if capability == "bmux.storage" && operation == "set" {
+            if capability == "bmux.decoration.write" && operation == "apply-view-theme-extension" {
                 return Err(bmux_plugin_sdk::PluginError::InvalidPluginId {
                     id: "storage failure".into(),
                 });
@@ -3920,7 +3494,7 @@ mod tests {
                 capability, "bmux.storage",
                 "refresh must not write preferences"
             );
-            assert_eq!(operation, "apply-theme-extension");
+            assert_eq!(operation, "apply-view-theme-extension");
             encode_service_message(&Ok::<
                 (),
                 bmux_decoration_plugin_api::decoration_state::ValidationResult,
@@ -4002,7 +3576,11 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::result_large_err)] // TestServiceRouter fixes the external error type; this test cannot shrink it.
     fn preview_rejects_foreign_owner_and_competing_mutations() {
+        let _checkpoint = install_test_service_router(Arc::new(|_, _, _, _, _, _, _| {
+            encode_service_message(&Ok::<(), String>(()))
+        }));
         let plugin = ThemePlugin::default();
         let mut context = service_context(None);
         context.caller_client_id = Some(
@@ -4037,109 +3615,10 @@ mod tests {
 
     #[test]
     #[allow(clippy::result_large_err)] // TestServiceRouter fixes the external error type.
-    fn legacy_selection_preview_refresh_and_reconnect_lifecycle() {
-        let dir = temp_theme_dir("selection-lifecycle");
-        let settings_text = "persistence = 'persist_between_connects'\nthemes = ['minimal']\n";
-        std::fs::write(
-            dir.join("bmux.toml"),
-            format!("[plugins.settings.\"bmux.theme\"]\n{settings_text}"),
-        )
-        .expect("config");
-        let mut context = service_context(Some(toml::from_str(settings_text).expect("settings")));
-        context.connection.config_dir = dir.display().to_string();
-        context.connection.config_dir_candidates = vec![dir.display().to_string()];
-        context.caller_client_id = Some(
-            "00000000-0000-0000-0000-000000000001"
-                .parse()
-                .expect("uuid"),
-        );
-        context.request.service.interface_id = "theme-control-v1".into();
-        context.request.operation = "current".into();
-        let stored = Arc::new(Mutex::new(b"hacker".to_vec()));
-        let writes = Arc::new(Mutex::new(0));
-        let observed_store = stored.clone();
-        let observed_writes = writes.clone();
-        let decoration = bmux_decoration_plugin::DecorationPlugin::new();
-        let dispatch_context = context.clone();
-        let router: TestServiceRouter = Arc::new(
-            move |caller, caller_client, capability, kind, interface, operation, payload| {
-                if capability == "bmux.storage" {
-                    return match operation {
-                        "get" => encode_service_message(&StorageGetResponse {
-                            value: Some(observed_store.lock().expect("storage").clone()),
-                        }),
-                        "set" => {
-                            let request: StorageSetRequest =
-                                decode_service_message(&payload).expect("set");
-                            assert_eq!(request.key.as_str(), STORAGE_SELECTED_APPEARANCE);
-                            *observed_store.lock().expect("storage") = request.value;
-                            *observed_writes.lock().expect("writes") += 1;
-                            encode_service_message(&())
-                        }
-                        _ => panic!("unexpected storage operation"),
-                    };
-                }
-                assert_eq!(capability, "bmux.decoration.write");
-                let mut routed = dispatch_context.clone();
-                assert_eq!(caller, "bmux.theme");
-                routed.request.caller_plugin_id = caller.into();
-                routed.caller_client_id = caller_client;
-                routed.request.service.kind = kind;
-                routed.request.service.interface_id = interface.into();
-                routed.request.operation = operation.into();
-                routed.request.payload = payload;
-                let response = decoration.invoke_service(routed);
-                assert!(response.error.is_none(), "{response:?}");
-                Ok(response.payload)
-            },
-        );
-        let _router = install_test_service_router(router);
-        let plugin = ThemePlugin::default();
-        let response = plugin.invoke_service(context.clone());
-        assert!(response.error.is_none());
-        let initial: control_contract::theme_control_v1::Snapshot =
-            decode_service_message(&response.payload).expect("snapshot");
-        assert_eq!(initial.selection.picker_value(), "preset:hacker");
-        assert_eq!(*stored.lock().expect("storage"), b"hacker");
-        let token = plugin
-            .begin_preview(&context, initial.revision)
-            .expect("begin");
-        plugin
-            .preview_theme(&context, token, &ThemeSelection::Configured)
-            .expect("preview");
-        plugin.cancel_preview(&context, token).expect("cancel");
-        assert_eq!(*writes.lock().expect("writes"), 0);
-        let token = plugin
-            .begin_preview(&context, initial.revision)
-            .expect("begin again");
-        plugin
-            .preview_theme(&context, token, &ThemeSelection::Configured)
-            .expect("preview again");
-        let committed = plugin
-            .confirm_preview(&context, token, ThemeSelection::Configured)
-            .expect("confirm");
-        assert_eq!(committed.selection, ThemeSelection::Configured);
-        assert_eq!(*writes.lock().expect("writes"), 1);
-        let record: serde_json::Value =
-            serde_json::from_slice(&stored.lock().expect("storage")).expect("versioned record");
-        assert_eq!(record["version"], 1);
-        assert!(record["preset"].is_null());
-        let refreshed = plugin
-            .refresh_live_theme(&context, committed.revision)
-            .expect("refresh");
-        assert_eq!(refreshed.selection, ThemeSelection::Configured);
-        assert_eq!(refreshed.revision, committed.revision + 1);
-        assert_eq!(*writes.lock().expect("writes"), 1);
-        let reconnected = ThemePlugin::default().invoke_service(context);
-        let snapshot: control_contract::theme_control_v1::Snapshot =
-            decode_service_message(&reconnected.payload).expect("reconnected snapshot");
-        assert_eq!(snapshot.selection, ThemeSelection::Configured);
-        assert_eq!(*writes.lock().expect("writes"), 1);
-    }
-
-    #[test]
-    #[allow(clippy::result_large_err)] // TestServiceRouter fixes the external error type.
     fn preview_confirmation_commits_once_and_releases_owner() {
+        let _checkpoint = install_test_service_router(Arc::new(|_, _, _, _, _, _, _| {
+            encode_service_message(&Ok::<(), String>(()))
+        }));
         let plugin = ThemePlugin::default();
         let mut context = service_context(None);
         context.caller_client_id = Some(
@@ -4251,139 +3730,6 @@ mod tests {
         assert!(plugin.invoke_service(context).error.is_some());
     }
 
-    #[tokio::test]
-    async fn detached_owner_releases_server_preview() {
-        let bus = bmux_plugin::global_event_bus();
-        bus.register_channel::<bmux_clients_plugin_api::clients_events::ClientEvent>(
-            bmux_clients_plugin_api::clients_events::EVENT_KIND,
-        );
-        let mut plugin = ThemePlugin::default();
-        plugin.watch_detach(&lifecycle_context(None));
-        let mut context = service_context(None);
-        let id = "00000000-0000-0000-0000-000000000001"
-            .parse()
-            .expect("uuid");
-        context.caller_client_id = Some(id);
-        context.request.service.interface_id = "theme-control-v1".into();
-        context.request.operation = "current".into();
-        assert!(plugin.invoke_service(context.clone()).error.is_none());
-        plugin.begin_preview(&context, 0).expect("begin");
-        bus.emit(
-            &bmux_clients_plugin_api::clients_events::EVENT_KIND,
-            bmux_clients_plugin_api::clients_events::ClientEvent::Detached { client_id: id },
-        )
-        .expect("detach");
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            loop {
-                if plugin.preview.lock().expect("preview").is_none() {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("server cleanup");
-    }
-
-    #[tokio::test]
-    async fn expired_preview_is_cleaned_without_clients_event_stream() {
-        let mut plugin = ThemePlugin::default();
-        plugin.watch_detach(&lifecycle_context(None));
-        let mut context = service_context(None);
-        context.caller_client_id = Some(
-            "00000000-0000-0000-0000-000000000001"
-                .parse()
-                .expect("uuid"),
-        );
-        context.request.service.interface_id = "theme-control-v1".into();
-        context.request.operation = "current".into();
-        assert!(plugin.invoke_service(context.clone()).error.is_none());
-        let token = plugin.begin_preview(&context, 0).expect("begin");
-        plugin
-            .preview
-            .lock()
-            .expect("preview")
-            .as_mut()
-            .expect("active")
-            .expires_at = std::time::Instant::now();
-        assert!(plugin.renew_preview(&context, token).is_err());
-        assert!(
-            plugin
-                .preview_theme(&context, token, &ThemeSelection::Configured)
-                .is_err()
-        );
-        assert!(
-            plugin
-                .confirm_preview(&context, token, ThemeSelection::Configured)
-                .is_err()
-        );
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            loop {
-                if plugin.preview.lock().expect("preview").is_none() {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("expired preview cleanup");
-    }
-
-    #[test]
-    #[allow(clippy::result_large_err)] // TestServiceRouter fixes the external error type.
-    fn lifecycle_reapply_preserves_committed_live_selection() {
-        let theme = resolve_theme_picker_selection(
-            &load_theme_catalog(&[]),
-            "hacker",
-            &ThemePluginSettings::default(),
-        )
-        .expect("theme");
-        let context =
-            lifecycle_context(Some(toml::from_str("theme = 'minimal'").expect("settings")));
-        let mut plugin = ThemePlugin {
-            lifecycle_context: Some(context),
-            selection: std::sync::Mutex::new(Some(LiveTheme {
-                snapshot: control_contract::theme_control_v1::Snapshot {
-                    revision: 7,
-                    selection: ThemeSelection::Preset {
-                        name: "hacker".into(),
-                    },
-                },
-                resolved: theme.clone(),
-            })),
-            ..ThemePlugin::default()
-        };
-        let router: TestServiceRouter = Arc::new(|_, _, capability, _, _, _, _| {
-            assert_eq!(capability, "bmux.decoration.write");
-            encode_service_message(&Ok::<
-                (),
-                bmux_decoration_plugin_api::decoration_state::ValidationResult,
-            >(()))
-        });
-        let _router = install_test_service_router(router);
-        plugin
-            .handle_event(PluginEvent {
-                kind: PluginEventKind::from_owned("bmux.core/server_started".into()),
-                payload: serde_json::json!({}),
-            })
-            .expect("reapply");
-        assert_eq!(
-            active_runtime_appearance(&service_context(None)).expect("appearance"),
-            theme.appearance
-        );
-        assert_eq!(
-            plugin
-                .selection
-                .lock()
-                .expect("state")
-                .as_ref()
-                .expect("live")
-                .snapshot
-                .revision,
-            7
-        );
-    }
-
     #[test]
     #[allow(clippy::result_large_err)] // TestServiceRouter fixes the external error type.
     fn rejected_preview_restores_original_before_returning() {
@@ -4407,7 +3753,7 @@ mod tests {
         let observed = calls.clone();
         let router: TestServiceRouter = Arc::new(move |_, _, capability, _, _, operation, _| {
             assert_eq!(capability, "bmux.decoration.write");
-            if operation == "restore-script-state" {
+            if operation == "restore-view-script-state" {
                 *observed.lock().expect("count") += 1;
                 return encode_service_message(&Ok::<(), String>(()));
             }
@@ -4597,7 +3943,7 @@ mod tests {
 
     #[test]
     #[allow(clippy::result_large_err)] // TestServiceRouter fixes the external error type.
-    fn component_settings_write_failure_preserves_live_snapshot() {
+    fn component_settings_are_ephemeral_even_when_storage_is_unwritable() {
         let mut catalog = load_theme_catalog(&[]);
         let mut definition = performance_theme_with_component();
         definition
@@ -4650,7 +3996,7 @@ mod tests {
         assert!(
             plugin
                 .set_component_settings(&context, 4, "performance", br#"{"color":"red"}"#)
-                .is_err()
+                .is_ok()
         );
         let live = plugin
             .selection
@@ -4658,111 +4004,12 @@ mod tests {
             .expect("state")
             .clone()
             .expect("live");
-        assert_eq!(live.snapshot.revision, 4);
-        assert_eq!(live.resolved.plugins, original.plugins);
+        assert_eq!(live.snapshot.revision, 5);
+        assert_ne!(live.resolved.plugins, original.plugins);
         assert_eq!(
             &*calls.lock().expect("calls"),
-            &["apply-theme-extension", "set", "apply-theme-extension"]
+            &["apply-view-theme-extension"]
         );
-    }
-
-    #[test]
-    #[allow(clippy::result_large_err)] // TestServiceRouter fixes the external error type.
-    fn failed_selection_and_refresh_reset_new_provider() {
-        for refresh in [false, true] {
-            let dir = temp_theme_dir("provider-rollback");
-            std::fs::create_dir_all(dir.join("themes")).expect("themes");
-            std::fs::write(
-                dir.join("themes/rollback.toml"),
-                r#"
-[settings.providers.test.apply_settings]
-capability = "example.settings"
-interface_id = "settings-v1"
-kind = "command"
-operation = "apply"
-[settings.providers.test.reset_settings]
-capability = "example.settings"
-interface_id = "settings-v1"
-kind = "command"
-operation = "reset"
-"#,
-            )
-            .expect("theme");
-            let settings_text = "appearance_themes = ['rollback']\ncomponent_themes = ['rollback']\n[theme_settings.test]\nvalue = 1\n";
-            std::fs::write(
-                dir.join("bmux.toml"),
-                format!(
-                    "[plugins.settings.\"bmux.theme\"]\n{}",
-                    settings_text.replace(
-                        "[theme_settings.test]",
-                        "[plugins.settings.\"bmux.theme\".theme_settings.test]"
-                    )
-                ),
-            )
-            .expect("config");
-            let mut context =
-                service_context(Some(toml::from_str(settings_text).expect("settings")));
-            context.connection.config_dir = dir.display().to_string();
-            context.connection.config_dir_candidates = vec![dir.display().to_string()];
-            let original = resolve_picker_value(
-                &load_theme_catalog(&[]),
-                CONFIGURED_SELECTION,
-                &ThemePluginSettings::default(),
-            )
-            .expect("original theme");
-            let plugin = ThemePlugin {
-                selection: Mutex::new(Some(LiveTheme {
-                    snapshot: control_contract::theme_control_v1::Snapshot {
-                        revision: 4,
-                        selection: ThemeSelection::Configured,
-                    },
-                    resolved: original,
-                })),
-                ..ThemePlugin::default()
-            };
-            let calls = Arc::new(Mutex::new(Vec::new()));
-            let observed = calls.clone();
-            let router: TestServiceRouter =
-                Arc::new(move |_, _, capability, _, _, operation, _| {
-                    if capability == "example.settings" {
-                        observed.lock().expect("calls").push(operation.to_string());
-                        if operation == "apply" {
-                            return Err(bmux_plugin_sdk::PluginError::InvalidPluginId {
-                                id: "injected partial apply failure".into(),
-                            });
-                        }
-                        assert_eq!(operation, "reset");
-                        return encode_service_message(&());
-                    }
-                    assert_eq!(operation, "apply-theme-extension");
-                    encode_service_message(&Ok::<
-                        (),
-                        bmux_decoration_plugin_api::decoration_state::ValidationResult,
-                    >(()))
-                });
-            let _router = install_test_service_router(router);
-            let result = if refresh {
-                plugin.refresh_live_theme(&context, 4)
-            } else {
-                plugin.select_live_theme(&context, 4, ThemeSelection::Configured)
-            };
-            assert!(result.is_err(), "refresh={refresh}: {result:?}");
-            assert_eq!(*calls.lock().expect("calls"), ["apply", "reset"]);
-            let live = plugin
-                .selection
-                .lock()
-                .expect("state")
-                .clone()
-                .expect("live");
-            assert_eq!(live.snapshot.revision, 4);
-            assert_eq!(live.snapshot.selection, ThemeSelection::Configured);
-            assert!(live.resolved.external_payloads.is_empty());
-            assert!(
-                !plugin
-                    .recovery_required
-                    .load(std::sync::atomic::Ordering::Acquire)
-            );
-        }
     }
 
     #[test]
@@ -4841,10 +4088,9 @@ operation = "reset"
         let router: TestServiceRouter =
             Arc::new(move |_, _, capability, _, _, operation, payload| {
                 assert_eq!(capability, "bmux.decoration.write");
-                assert_eq!(operation, "apply-theme-extension");
-                let request: ApplyThemeExtensionArgs =
-                    decode_service_message(&payload).expect("request");
-                assert!(request.toml.is_empty());
+                assert_eq!(operation, "restore-view-script-state");
+                let request: () = decode_service_message(&payload).expect("request");
+                assert_eq!(request, ());
                 *observed.lock().expect("calls") += 1;
                 encode_service_message(&Ok::<
                     (),
@@ -4870,10 +4116,10 @@ operation = "reset"
         context.request.service.interface_id = "theme-control-v1".into();
         context.request.operation = "current".into();
         let router: TestServiceRouter = Arc::new(|_, _, _, _, _, operation, _| {
-            if operation == "discard-script-checkpoint" {
+            if operation == "discard-view-script-checkpoint" {
                 return encode_service_message(&Err::<(), String>("disposal failure".into()));
             }
-            if operation == "checkpoint-script-state" {
+            if operation == "checkpoint-view-script-state" {
                 return encode_service_message(&Ok::<(), String>(()));
             }
             encode_service_message(&Ok::<
@@ -4936,11 +4182,15 @@ operation = "reset"
                 ("bmux.storage", "get") => {
                     encode_service_message(&StorageGetResponse { value: None })
                 }
-                ("bmux.storage", "set") => Err(bmux_plugin_sdk::PluginError::InvalidPluginId {
-                    id: "write failure".into(),
-                }),
-                (_, "checkpoint-script-state") => encode_service_message(&Ok::<(), String>(())),
-                (_, "restore-script-state") => {
+                ("bmux.decoration.write", "apply-view-theme-extension") => {
+                    Err(bmux_plugin_sdk::PluginError::InvalidPluginId {
+                        id: "write failure".into(),
+                    })
+                }
+                (_, "checkpoint-view-script-state") => {
+                    encode_service_message(&Ok::<(), String>(()))
+                }
+                (_, "restore-view-script-state") => {
                     *observed.lock().expect("restored") += 1;
                     encode_service_message(&Ok::<(), String>(()))
                 }
@@ -5002,10 +4252,9 @@ operation = "reset"
             Arc::new(|_, _, _, _, _, _, _| panic!("stale form must not invoke services"));
         let _router = install_test_service_router(router);
         assert_eq!(
-            plugin
-                .apply_external_form(&service_context(None), 7, "performance", b"{}")
+            ThemePlugin::apply_external_form(&service_context(None), 7, "performance", b"{}")
                 .expect_err("stale form"),
-            "stale theme revision"
+            "provider has no caller-scoped settings contract"
         );
         assert_eq!(
             plugin
@@ -5018,73 +4267,6 @@ operation = "reset"
                 .revision,
             8
         );
-        assert!(
-            !plugin
-                .recovery_required
-                .load(std::sync::atomic::Ordering::Acquire)
-        );
-    }
-
-    #[test]
-    #[allow(clippy::result_large_err)] // TestServiceRouter fixes the external error type.
-    fn failed_first_external_form_uses_reset_contract() {
-        let mut original = resolve_picker_value(
-            &load_theme_catalog(&[]),
-            CONFIGURED_SELECTION,
-            &ThemePluginSettings::default(),
-        )
-        .expect("theme");
-        let endpoint = |operation: &str| ThemeSettingsEndpoint {
-            capability: "test.settings".into(),
-            interface_id: "settings-v1".into(),
-            operation: operation.into(),
-            kind: ThemeSettingsServiceKind::Command,
-        };
-        original.settings.providers.insert(
-            "test".into(),
-            ThemeSettingsProviderSpec {
-                apply_form: Some(endpoint("apply")),
-                reset_settings: Some(endpoint("reset")),
-                ..ThemeSettingsProviderSpec::default()
-            },
-        );
-        let plugin = ThemePlugin {
-            selection: Mutex::new(Some(LiveTheme {
-                snapshot: control_contract::theme_control_v1::Snapshot {
-                    revision: 8,
-                    selection: ThemeSelection::Configured,
-                },
-                resolved: original,
-            })),
-            ..ThemePlugin::default()
-        };
-        let calls = Arc::new(Mutex::new(Vec::new()));
-        let observed = calls.clone();
-        let router: TestServiceRouter = Arc::new(move |_, _, _, _, _, operation, _| {
-            observed.lock().expect("calls").push(operation.to_string());
-            if operation == "apply" {
-                return Err(bmux_plugin_sdk::PluginError::InvalidPluginId {
-                    id: "injected failure".into(),
-                });
-            }
-            assert_eq!(operation, "reset");
-            encode_service_message(&())
-        });
-        let _router = install_test_service_router(router);
-        assert!(
-            plugin
-                .apply_external_form(&service_context(None), 8, "test", b"{}")
-                .is_err()
-        );
-        assert_eq!(*calls.lock().expect("calls"), ["apply", "reset"]);
-        let live = plugin
-            .selection
-            .lock()
-            .expect("state")
-            .clone()
-            .expect("live");
-        assert_eq!(live.snapshot.revision, 8);
-        assert!(live.resolved.external_payloads.is_empty());
         assert!(
             !plugin
                 .recovery_required
@@ -5125,90 +4307,6 @@ operation = "reset"
         );
         assert!(validate_provider_transition(&previous, &next).is_err());
         assert!(validate_provider_transition(&previous, &previous).is_ok());
-    }
-
-    #[test]
-    #[allow(clippy::result_large_err)] // TestServiceRouter fixes the external error type.
-    fn removed_provider_uses_declared_reset_endpoint() {
-        let next = resolve_picker_value(
-            &load_theme_catalog(&[]),
-            CONFIGURED_SELECTION,
-            &ThemePluginSettings::default(),
-        )
-        .expect("theme");
-        let mut previous = next.clone();
-        previous.external_payloads.insert(
-            "test".into(),
-            ThemeSettingsPayload {
-                json: b"{}".to_vec(),
-            },
-        );
-        previous.settings.providers.insert(
-            "test".into(),
-            ThemeSettingsProviderSpec {
-                reset_settings: Some(ThemeSettingsEndpoint {
-                    capability: "example.settings".into(),
-                    interface_id: "settings-v2".into(),
-                    operation: "reset".into(),
-                    kind: ThemeSettingsServiceKind::Command,
-                }),
-                ..ThemeSettingsProviderSpec::default()
-            },
-        );
-        let calls = Arc::new(Mutex::new(0));
-        let observed = calls.clone();
-        let router: TestServiceRouter = Arc::new(
-            move |_, _, capability, kind, interface, operation, payload| {
-                assert_eq!(capability, "example.settings");
-                assert_eq!(kind, ServiceKind::Command);
-                assert_eq!(interface, "settings-v2");
-                assert_eq!(operation, "reset");
-                decode_service_message::<()>(&payload).expect("unit request");
-                *observed.lock().expect("calls") += 1;
-                encode_service_message(&())
-            },
-        );
-        let _router = install_test_service_router(router);
-        reset_removed_providers(&service_context(None), &previous, &next).expect("reset");
-        assert_eq!(*calls.lock().expect("calls"), 1);
-
-        // A provider introduced only by a preview must also be reset on cancel,
-        // without persisting a selection or advancing the authoritative revision.
-        let mut original = next;
-        original.plugins.clear();
-        let live = LiveTheme {
-            snapshot: control_contract::theme_control_v1::Snapshot {
-                revision: 7,
-                selection: ThemeSelection::Configured,
-            },
-            resolved: original,
-        };
-        let mut context = service_context(None);
-        context.caller_client_id = Some(
-            "00000000-0000-0000-0000-000000000001"
-                .parse()
-                .expect("uuid"),
-        );
-        let plugin = ThemePlugin {
-            selection: Mutex::new(Some(live.clone())),
-            preview: Arc::new(Mutex::new(Some(ThemePreview {
-                token: 1,
-                owner: context.caller_client_id.expect("owner").to_string(),
-                original: live,
-                displayed: previous,
-                owners: BTreeSet::new(),
-                expires_at: std::time::Instant::now() + std::time::Duration::from_secs(30),
-            }))),
-            ..ThemePlugin::default()
-        };
-        plugin.cancel_preview(&context, 1).expect("cancel preview");
-        assert_eq!(*calls.lock().expect("calls"), 2);
-        assert!(plugin.preview.lock().expect("preview").is_none());
-        let selection = plugin.selection.lock().expect("selection");
-        let snapshot = &selection.as_ref().expect("live selection").snapshot;
-        assert_eq!(snapshot.revision, 7);
-        assert_eq!(snapshot.selection, ThemeSelection::Configured);
-        drop(selection);
     }
 
     #[test]
@@ -5269,8 +4367,13 @@ operation = "reset"
         );
         let plugin = bmux_decoration_plugin::DecorationPlugin::new();
         let mut context = service_context(None);
+        context.caller_client_id = Some(
+            "00000000-0000-0000-0000-000000000001"
+                .parse()
+                .expect("uuid"),
+        );
         context.request.service.interface_id = "decoration-commands".into();
-        context.request.operation = "apply-theme-extension".into();
+        context.request.operation = "apply-view-theme-extension".into();
         context.request.payload = encode_service_message(&ApplyThemeExtensionArgs {
             toml: toml::to_string(extension).expect("extension"),
             config_dir_candidates: vec![],
@@ -5497,83 +4600,6 @@ operation = "reset"
     }
 
     #[test]
-    #[allow(clippy::result_large_err)] // TestServiceRouter fixes the external error type.
-    fn startup_restores_saved_provider_value_over_configuration_without_writes() {
-        let applied = Arc::new(Mutex::new(Vec::new()));
-        let observed = applied.clone();
-        let router: TestServiceRouter =
-            Arc::new(move |_, _, capability, _, interface, operation, payload| {
-                if capability == "bmux.storage" {
-                    assert_eq!(operation, "get", "startup must not rewrite preferences");
-                    let request: StorageGetRequest = decode_service_message(&payload).expect("get");
-                    let value = if request.key.as_str() == "selected_theme" {
-                        b"performance".to_vec()
-                    } else {
-                        assert_eq!(request.key.as_str(), "theme_settings.performance");
-                        br#"{"sample_interval_ms":2500}"#.to_vec()
-                    };
-                    return encode_service_message(&StorageGetResponse { value: Some(value) });
-                }
-                if interface == "performance-theme-settings" {
-                    assert_eq!(operation, "set-settings");
-                    let settings: ThemeSettingsPayload =
-                        decode_service_message(&payload).expect("settings");
-                    observed
-                        .lock()
-                        .expect("applied")
-                        .push(settings.json.clone());
-                    return encode_service_message(&settings);
-                }
-                assert_eq!(capability, "bmux.decoration.write");
-                encode_service_message(&Ok::<
-                    (),
-                    bmux_decoration_plugin_api::decoration_state::ValidationResult,
-                >(()))
-            });
-        let _router = install_test_service_router(router);
-        let context = lifecycle_context(Some(toml::from_str(
-            "persistence = 'persist_between_connects'\n[theme_settings.performance]\nsample_interval_ms = 999\n"
-        ).expect("configuration")));
-        apply_configured_theme_extensions(&context);
-        let restored = applied.lock().expect("applied").clone();
-        assert_eq!(restored.len(), 1);
-        let value: serde_json::Value = serde_json::from_slice(&restored[0]).expect("payload");
-        assert_eq!(value["sample_interval_ms"], 2500);
-    }
-
-    #[test]
-    fn activate_applies_persisted_theme_extensions_immediately() {
-        let applied = Arc::new(Mutex::new(Vec::new()));
-        let _router =
-            install_persisted_theme_extension_router(Some("hacker"), Arc::clone(&applied));
-        let context = lifecycle_context(Some(toml::Value::Table(toml::map::Map::from_iter([
-            (
-                "theme".to_string(),
-                toml::Value::String("pulse-border".to_string()),
-            ),
-            (
-                "persistence".to_string(),
-                toml::Value::String("persist_between_connects".to_string()),
-            ),
-        ]))));
-        let mut plugin = ThemePlugin::default();
-
-        plugin
-            .activate(context)
-            .expect("theme activation should apply extensions");
-
-        let applied_toml = {
-            let applied = applied.lock().expect("applied extensions lock should hold");
-            assert_eq!(applied.len(), 1);
-            applied[0].toml.clone()
-        };
-        assert!(
-            applied_toml.contains("style = \"thick\""),
-            "activation should apply persisted hacker decoration extension: {applied_toml}",
-        );
-    }
-
-    #[test]
     fn theme_settings_provider_uses_storage_safe_key_for_persist_and_restore() {
         let settings = serde_json::json!({ "sample_interval_ms": 2_500 });
         let settings_bytes = serde_json::to_vec(&settings).expect("settings should encode");
@@ -5614,53 +4640,6 @@ operation = "reset"
             applied_settings.clone()
         };
         assert_eq!(applied_settings_snapshot.as_slice(), [settings]);
-    }
-
-    #[test]
-    fn server_started_republishes_persisted_runtime_appearance() {
-        let applied = Arc::new(Mutex::new(Vec::new()));
-        let _router =
-            install_persisted_theme_extension_router(Some("hacker"), Arc::clone(&applied));
-        bmux_plugin::global_event_bus().register_state_channel::<RuntimeAppearance>(
-            RUNTIME_APPEARANCE_STATE_KIND,
-            RuntimeAppearance::default(),
-        );
-        let context = lifecycle_context(Some(toml::Value::Table(toml::map::Map::from_iter([
-            (
-                "theme".to_string(),
-                toml::Value::String("pulse-border".to_string()),
-            ),
-            (
-                "persistence".to_string(),
-                toml::Value::String("persist_between_connects".to_string()),
-            ),
-        ]))));
-        let mut plugin = ThemePlugin {
-            lifecycle_context: Some(context),
-            ..ThemePlugin::default()
-        };
-
-        plugin
-            .handle_event(PluginEvent {
-                kind: PluginEventKind::from_owned("bmux.core/server_started".to_string()),
-                payload: serde_json::json!({}),
-            })
-            .expect("server_started should reapply theme");
-
-        let (appearance, _rx) = bmux_plugin::global_event_bus()
-            .subscribe_state::<RuntimeAppearance>(&RUNTIME_APPEARANCE_STATE_KIND)
-            .expect("runtime appearance state should be registered");
-        assert_eq!(appearance.foreground, "#39ff14");
-        assert_eq!(appearance.border.active, "#39ff14");
-        let applied_toml = {
-            let applied = applied.lock().expect("applied extensions lock should hold");
-            assert_eq!(applied.len(), 1);
-            applied[0].toml.clone()
-        };
-        assert!(
-            applied_toml.contains("style = \"thick\""),
-            "server_started should also apply persisted decoration extension: {applied_toml}",
-        );
     }
 
     #[test]
@@ -6451,7 +5430,7 @@ operation = "reset"
         std::fs::remove_dir_all(root).ok();
     }
 
-    fn service_context(settings: Option<toml::Value>) -> NativeServiceContext {
+    pub fn service_context(settings: Option<toml::Value>) -> NativeServiceContext {
         NativeServiceContext {
             plugin_id: "bmux.theme".to_string(),
             request: ServiceRequest {
@@ -6653,7 +5632,7 @@ operation = "reset"
                         "bmux.decoration.write",
                         ServiceKind::Command,
                         "decoration-commands",
-                        "apply-theme-extension",
+                        "apply-view-theme-extension",
                     ) => {
                         let request: ApplyThemeExtensionArgs = decode_service_message(&payload)
                             .expect("theme extension payload should decode");

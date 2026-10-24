@@ -848,6 +848,14 @@ interface attach-runtime-commands {
         context-not-found,
     }
 
+    // Dedicated read-only connection: grant/open never select or focus a view.
+    // The same attach capability and normal one-shot expiring tokens apply.
+    // Grant is caller/session-bound; after grant this live connection cannot
+    // escalate through mutation commands, even after detach. Retired disconnected
+    // transport UUIDs alone may be reclaimed; they must never be reused.
+    command observer-grant(selector: session-selector) -> result<attach-grant, attach-command-error>;
+    command observer-open(session_id: uuid, attach_token: uuid) -> result<attach-ready, attach-command-error>;
+
     command attach-session(
         selector: session-selector,
         can_write: bool,

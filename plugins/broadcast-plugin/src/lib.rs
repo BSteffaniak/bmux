@@ -5,6 +5,8 @@ pub mod authorization;
 #[path = "service_tests.rs"]
 mod service_tests;
 
+mod committed_output;
+pub use committed_output::authorize_committed_output;
 mod controller;
 mod deploy;
 mod indicator;
@@ -137,13 +139,13 @@ impl RustPlugin for BroadcastPlugin {
                 authorization::authorize(caller, &r.local_proof).map_err(error)
             },
             "broadcast-control-v1", "start" => |r: control::client::StartRequest, ctx| {
-                authenticated(ctx)?;
+                let owner = authenticated(ctx)?;
                 let relay = relay::Relay::new(&r.endpoint, &r.channel, std::path::Path::new(&r.credential_file)).map_err(error)?;
-                controller()?.control(controller::Control::Start(Box::new(relay), r.source_id)).map_err(error)
+                controller()?.control_owned(owner, controller::Control::Start(Box::new(relay), r.source_id)).map_err(error)
             },
-            "broadcast-control-v1", "pause" => |_r: (), ctx| { authenticated(ctx)?; controller()?.control(controller::Control::Pause).map_err(error) },
-            "broadcast-control-v1", "resume" => |_r: (), ctx| { authenticated(ctx)?; controller()?.control(controller::Control::Resume).map_err(error) },
-            "broadcast-control-v1", "stop" => |_r: (), ctx| { authenticated(ctx)?; controller()?.control(controller::Control::Stop).map_err(error) },
+            "broadcast-control-v1", "pause" => |_r: (), ctx| { let owner = authenticated(ctx)?; controller()?.control_owned(owner, controller::Control::Pause).map_err(error) },
+            "broadcast-control-v1", "resume" => |_r: (), ctx| { let owner = authenticated(ctx)?; controller()?.control_owned(owner, controller::Control::Resume).map_err(error) },
+            "broadcast-control-v1", "stop" => |_r: (), ctx| { let owner = authenticated(ctx)?; controller()?.control_owned(owner, controller::Control::Stop).map_err(error) },
             "broadcast-control-v1", "status" => |_r: (), ctx| { authenticated(ctx)?; controller()?.status().map_err(error) },
             "broadcast-control-v1", "terminal" => |r: control::client::TerminalRequest, ctx| {
                 let owner = authenticated(ctx)?;
@@ -154,7 +156,7 @@ impl RustPlugin for BroadcastPlugin {
                 let controller = controller()?;
                 std::thread::scope(|scope| scope.spawn(move || controller.terminal(owner, r.source_id, selection, target, cols, rows)).join().map_err(|_| "executor_unavailable")?).map_err(error)
             },
-            "broadcast-control-v1", "source" => |r: control::client::SourceRequest, ctx| { authenticated(ctx)?; controller()?.control(controller::Control::Source(r.source_id)).map_err(error) },
+            "broadcast-control-v1", "source" => |r: control::client::SourceRequest, ctx| { let owner = authenticated(ctx)?; controller()?.control_owned(owner, controller::Control::Source(r.source_id)).map_err(error) },
             "broadcast-output-v1", "register" => |r: output::client::RegisterRequest, ctx| { let owner = authenticated(ctx)?; controller()?.source(owner, &r.source_id, true).map_err(error) },
             "broadcast-output-v1", "poll" => |r: output::client::PollRequest, ctx| { let owner = authenticated(ctx)?; controller()?.source(owner, &r.source_id, false).map_err(error) },
             "broadcast-output-v1", "publish" => |r: output::client::PublishRequest, ctx| { let owner = authenticated(ctx)?; controller()?.publish(owner, &r.source_id, r.refresh, r.frame).map_err(error) },

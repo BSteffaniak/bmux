@@ -6,6 +6,8 @@ capability BROADCAST_PRESENTATION = bmux.broadcast.presentation.v1;
 
 @capability(BROADCAST_PRESENTATION)
 interface broadcast-presentation-v1 {
+    // Publication-global status only, not a selected-view/decorations selector.
+    // Scoped consumers must not interpret this as ownership of their view.
     record indicator { state: string, revision: u64 }
     command status() -> indicator;
 }
@@ -29,17 +31,26 @@ interface broadcast-control-v1 {
     record status { local: string, remote: string, source_id: string?, error_code: string? }
     command prepare-local() -> bool;
     command authorize(local_proof: bytes) -> bool;
+    // One process-wide publication. Start/source require caller-owned source IDs;
+    // pause/resume/stop require the selected source's authenticated owner.
+    // No active-client fallback and no cross-owner publication replacement.
     command start(endpoint: string, channel: string, credential_file: string, source_id: string) -> status;
     command pause() -> status;
     command resume() -> status;
     command stop() -> status;
     command status() -> status;
+    // Independent output-only terminal observer, NOT a mirror of a client's
+    // committed view. This v1 command has no scoped view selector; callers that
+    // require a committed-view mirror must publish that view via output-v1.
     command terminal(source_id: string, session_id: string, executable: string, sha256: string, runtime_version: string, cols: u32, rows: u32) -> status;
     command source(source_id: string) -> status;
 }
 
 @capability(BROADCAST_OUTPUT)
 interface broadcast-output-v1 {
+    // source_id identifies one caller-owned committed view, never an active-client
+    // alias. A selected ID remains pinned to its owner across lease loss/removal.
+    // Source loss is unavailable, not implicit selection of another source.
     // Register/poll renew a six-second lease. Poll at least every two seconds.
     // A changed selected refresh requires re-submission of the current committed
     // complete inline BMWP5 frame, even when the scene revision has not changed.

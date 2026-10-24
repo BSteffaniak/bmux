@@ -44,6 +44,133 @@ const ATTACH_TOKEN_TTL: Duration = Duration::from_secs(10);
 
 const EVENT_PUSH_CHANNEL_CAPACITY: usize = 256;
 
+const RETAINED_RECIPIENT_LIMIT: usize = 4096;
+const RETAINED_KIND_LIMIT: usize = 64;
+const RETAINED_KIND_BYTES: usize = 256;
+const RETAINED_PAYLOAD_BYTES: usize = 256 * 1024;
+const RETAINED_TOTAL_BYTES: usize = 1024 * 1024;
+
+#[derive(Default)]
+struct RetainedWireEvents {
+    recipients: Mutex<BTreeMap<Uuid, RetainedRecipient>>,
+}
+
+#[derive(Default)]
+struct RetainedRecipient {
+    values: BTreeMap<String, (Vec<u8>, bool)>,
+    bytes: usize,
+    ready: Arc<tokio::sync::Notify>,
+}
+
+fn retained_error(message: &str) -> WireEventSinkError {
+    WireEventSinkError::PublishFailed(message.into())
+}
+
+impl RetainedWireEvents {
+    fn register(self: &Arc<Self>, recipient: Uuid) -> Result<RetainedRegistration> {
+        let mut recipients = self
+            .recipients
+            .lock()
+            .map_err(|_| retained_error("poisoned retention lock"))?;
+        anyhow::ensure!(
+            recipients.len() < RETAINED_RECIPIENT_LIMIT,
+            "retained recipient limit exceeded"
+        );
+        anyhow::ensure!(
+            !recipients.contains_key(&recipient),
+            "recipient already registered"
+        );
+        let entry = RetainedRecipient::default();
+        let ready = Arc::clone(&entry.ready);
+        recipients.insert(recipient, entry);
+        drop(recipients);
+        Ok(RetainedRegistration {
+            retention: Arc::clone(self),
+            recipient,
+            ready,
+        })
+    }
+
+    fn publish(
+        &self,
+        recipient: Uuid,
+        kind: String,
+        payload: Vec<u8>,
+    ) -> std::result::Result<(), WireEventSinkError> {
+        if kind.len() > RETAINED_KIND_BYTES || payload.len() > RETAINED_PAYLOAD_BYTES {
+            return Err(retained_error("retained kind or payload limit exceeded"));
+        }
+        let mut recipients = self
+            .recipients
+            .lock()
+            .map_err(|_| retained_error("poisoned retention lock"))?;
+        let entry = recipients
+            .get_mut(&recipient)
+            .ok_or_else(|| retained_error("recipient disconnected"))?;
+        let old_bytes = entry
+            .values
+            .get(&kind)
+            .map_or(0, |(value, _)| kind.len() + value.len());
+        let bytes = entry.bytes - old_bytes + kind.len() + payload.len();
+        if bytes > RETAINED_TOTAL_BYTES
+            || (old_bytes == 0
+                && entry.values.len() >= RETAINED_KIND_LIMIT
+                && !entry.values.contains_key(&kind))
+        {
+            return Err(retained_error("retained recipient capacity exceeded"));
+        }
+        entry.bytes = bytes;
+        entry.values.insert(kind, (payload, true));
+        entry.ready.notify_one();
+        drop(recipients);
+        Ok(())
+    }
+
+    fn clear(&self, recipient: Uuid, kind: &str) -> std::result::Result<(), WireEventSinkError> {
+        let mut recipients = self
+            .recipients
+            .lock()
+            .map_err(|_| retained_error("poisoned retention lock"))?;
+        let entry = recipients
+            .get_mut(&recipient)
+            .ok_or_else(|| retained_error("recipient disconnected"))?;
+        if let Some((payload, _)) = entry.values.remove(kind) {
+            entry.bytes -= kind.len() + payload.len();
+        }
+        drop(recipients);
+        Ok(())
+    }
+
+    fn take_pending(&self, recipient: Uuid) -> Option<Event> {
+        let mut recipients = self.recipients.lock().ok()?;
+        let entry = recipients.get_mut(&recipient)?;
+        let (kind, (payload, pending)) =
+            entry.values.iter_mut().find(|(_, (_, pending))| *pending)?;
+        *pending = false;
+        let event = Event::PluginBusEvent {
+            kind: kind.clone(),
+            payload: payload.clone(),
+        };
+        drop(recipients);
+        Some(event)
+    }
+}
+
+/// Owns the live routing identity; cancellation retires retained values too.
+struct RetainedRegistration {
+    retention: Arc<RetainedWireEvents>,
+    recipient: Uuid,
+    ready: Arc<tokio::sync::Notify>,
+}
+
+impl Drop for RetainedRegistration {
+    fn drop(&mut self) {
+        if let Ok(mut recipients) = self.retention.recipients.lock() {
+            recipients.remove(&self.recipient);
+        }
+    }
+}
+
 /// Main server implementation.
 #[derive(Clone)]
 pub struct BmuxServer {
@@ -60,6 +187,7 @@ struct ServerState {
     /// Broadcast channel for pushing events to streaming clients.
     event_broadcast: tokio::sync::broadcast::Sender<Event>,
     event_push_clients: AsyncMutex<BTreeSet<ClientId>>,
+    retained_wire_events: Arc<RetainedWireEvents>,
     client_principals: Arc<Mutex<BTreeMap<ClientId, Uuid>>>,
     server_control_principal_id: Uuid,
     handshake_timeout: Duration,
@@ -947,6 +1075,7 @@ impl BmuxServer {
                 event_hub: Mutex::new(EventHub::new(1024)),
                 event_broadcast: event_broadcast_tx,
                 event_push_clients: AsyncMutex::new(BTreeSet::new()),
+                retained_wire_events: Arc::new(RetainedWireEvents::default()),
                 client_principals,
                 server_control_principal_id,
                 handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
@@ -1587,6 +1716,9 @@ async fn handle_connection(
         principals.insert(client_id, client_principal_id);
     }
 
+    // Register only after the handshake has authenticated this connection.
+    let retained_registration = state.retained_wire_events.register(client_id.0)?;
+
     // ── Split stream for concurrent read/write ───────────────────────────
 
     let (mut reader, writer) = stream.into_split();
@@ -1807,6 +1939,7 @@ async fn handle_connection(
                 ),
             ).await.context("writer stalled during retained-state replay")?;
             let mut event_rx = state.event_broadcast.subscribe();
+            let retained_ready = Arc::clone(&retained_registration.ready);
             let push_frame_tx = frame_tx.clone();
             let push_frame_codec = negotiated_frame_codec.clone();
             let push_state = Arc::clone(&state);
@@ -1836,7 +1969,24 @@ async fn handle_connection(
                         push_window_lagged_receives = 0;
                     }
 
-                    match event_rx.recv().await {
+                    let received = tokio::select! {
+                        event = event_rx.recv() => event,
+                        () = retained_ready.notified() => {
+                            // Reserve before selecting the latest value: a slow writer
+                            // must not build a second queue of obsolete retained values.
+                            let Ok(permit) = push_frame_tx.reserve().await else {
+                                return;
+                            };
+                            if let Some(event) = push_state.retained_wire_events.take_pending(push_client_id.0) {
+                                if let Some(frame) = encode_event_frame(&event, push_frame_codec.as_deref()) {
+                                    permit.send(frame);
+                                }
+                                retained_ready.notify_one();
+                            }
+                            continue;
+                        }
+                    };
+                    match received {
                         Ok(event) => {
                             let Some(frame) =
                                 encode_event_frame(&event, push_frame_codec.as_deref())
@@ -1951,6 +2101,7 @@ async fn handle_connection(
     Ok(())
     }.await;
 
+    drop(retained_registration);
     state.event_push_clients.lock().await.remove(&client_id);
 
     // Abort the event push task if running.
@@ -2090,9 +2241,34 @@ struct ServerWireEventSink {
 }
 
 impl WireEventSink for ServerWireEventSink {
+    fn is_connected(&self, recipient: Uuid) -> Option<bool> {
+        let recipients = self.state.retained_wire_events.recipients.lock().ok()?;
+        let connected = recipients.contains_key(&recipient);
+        drop(recipients);
+        Some(connected)
+    }
     fn publish(&self, event: Event) -> std::result::Result<(), WireEventSinkError> {
         emit_event(&self.state, event)
             .map_err(|error| WireEventSinkError::PublishFailed(error.to_string()))
+    }
+
+    fn publish_retained_to(
+        &self,
+        recipient: Uuid,
+        kind: String,
+        payload: Vec<u8>,
+    ) -> std::result::Result<(), WireEventSinkError> {
+        self.state
+            .retained_wire_events
+            .publish(recipient, kind, payload)
+    }
+
+    fn clear_retained_to(
+        &self,
+        recipient: Uuid,
+        kind: &str,
+    ) -> std::result::Result<(), WireEventSinkError> {
+        self.state.retained_wire_events.clear(recipient, kind)
     }
 }
 
@@ -3139,6 +3315,246 @@ fn is_frame_too_large_error(err: &anyhow::Error) -> bool {
 mod tests {
     use super::*;
     use serde::{Deserialize, Serialize};
+
+    #[tokio::test]
+    async fn retained_transport_owner_hydration_coalescing_and_isolation() {
+        let retention = Arc::new(RetainedWireEvents::default());
+        let owner = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        let owner_registration = retention.register(owner).unwrap();
+        let other_registration = retention.register(other).unwrap();
+        retention.publish(owner, "opaque".into(), vec![1]).unwrap();
+        retention.publish(owner, "opaque".into(), vec![2]).unwrap();
+        assert!(retention.take_pending(other).is_none());
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(10),
+                other_registration.ready.notified()
+            )
+            .await
+            .is_err()
+        );
+        owner_registration.ready.notified().await;
+        assert!(
+            matches!(retention.take_pending(owner), Some(Event::PluginBusEvent { kind, payload }) if kind == "opaque" && payload == vec![2])
+        );
+        assert!(retention.take_pending(owner).is_none());
+        retention.publish(owner, "opaque".into(), vec![3]).unwrap();
+        owner_registration.ready.notified().await;
+        assert!(
+            matches!(retention.take_pending(owner), Some(Event::PluginBusEvent { payload, .. }) if payload == vec![3])
+        );
+        retention.publish(owner, "opaque".into(), vec![4]).unwrap();
+        retention.clear(owner, "opaque").unwrap();
+        assert!(retention.take_pending(owner).is_none());
+    }
+
+    #[cfg(unix)]
+    async fn retained_transport_request(peer: &mut LocalIpcStream, request: Request) {
+        let envelope = Envelope::new(1, EnvelopeKind::Request, encode(&request).unwrap());
+        peer.send_envelope(&envelope).await.unwrap();
+        let response = peer.recv_envelope().await.unwrap();
+        assert_eq!(response.kind, EnvelopeKind::Response);
+    }
+
+    #[cfg(unix)]
+    async fn retained_transport_recipient(state: &ServerState, principal: Uuid) -> Uuid {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let found = state
+                    .client_principals
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .find_map(|(id, value)| (*value == principal).then_some(id.0));
+                if let Some(id) = found
+                    && state
+                        .retained_wire_events
+                        .recipients
+                        .lock()
+                        .unwrap()
+                        .contains_key(&id)
+                {
+                    break id;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn retained_transport_push_is_private_and_public_flow_is_preserved() {
+        let path = std::env::temp_dir().join(format!("bmux-retained-{}.sock", Uuid::new_v4()));
+        let endpoint = IpcEndpoint::unix_socket(path.clone());
+        let server = BmuxServer::new(endpoint.clone());
+        let sink = ServerWireEventSink {
+            state: server.state.clone(),
+        };
+        let listener = LocalIpcListener::bind(&endpoint).unwrap();
+        let pool = Arc::new(tokio::sync::Semaphore::new(2));
+        let mut peers = Vec::new();
+        let mut tasks = Vec::new();
+        let mut aborts = Vec::new();
+        let mut recipients = Vec::new();
+        for _ in 0..2 {
+            let mut peer = LocalIpcStream::connect(&endpoint).await.unwrap();
+            let stream = listener.accept().await.unwrap();
+            let state = Arc::clone(&server.state);
+            let shutdown = server.shutdown_tx.clone();
+            let permit = Arc::new(Arc::clone(&pool).try_acquire_owned().unwrap());
+            let task = tokio::spawn(handle_connection(state, shutdown, stream, permit));
+            aborts.push(AbortOnDrop(task.abort_handle()));
+            tasks.push(task);
+            let principal = Uuid::new_v4();
+            retained_transport_request(
+                &mut peer,
+                Request::Hello {
+                    contract: ProtocolContract::current(
+                        CORE_PROTOCOL_CAPABILITIES
+                            .iter()
+                            .map(|value| (*value).to_string())
+                            .collect(),
+                    ),
+                    client_name: "retained-transport-test".into(),
+                    principal_id: principal,
+                },
+            )
+            .await;
+            let recipient = retained_transport_recipient(&server.state, principal).await;
+            recipients.push(recipient);
+            peers.push(peer);
+        }
+        sink.publish_retained_to(recipients[0], "opaque".into(), vec![2])
+            .unwrap();
+        let mut public_rx = server.state.event_broadcast.subscribe();
+        sink.publish_retained_to(recipients[0], "opaque".into(), vec![3])
+            .unwrap();
+        assert!(matches!(
+            public_rx.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+        for peer in &mut peers {
+            retained_transport_request(peer, Request::EnableEventPush).await;
+        }
+        let event = tokio::time::timeout(Duration::from_secs(2), peers[0].recv_envelope())
+            .await
+            .unwrap()
+            .unwrap();
+        let event: Event = decode(&event.payload).unwrap();
+        assert!(
+            matches!(event, Event::PluginBusEvent { kind, payload } if kind == "opaque" && payload == vec![3])
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), peers[1].recv_envelope())
+                .await
+                .is_err()
+        );
+        sink.publish(Event::ServerStarted).unwrap();
+        for peer in &mut peers {
+            let event = tokio::time::timeout(Duration::from_secs(2), peer.recv_envelope())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(matches!(
+                decode::<Event>(&event.payload).unwrap(),
+                Event::ServerStarted
+            ));
+        }
+        drop(peers);
+        for task in tasks {
+            tokio::time::timeout(Duration::from_secs(2), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        }
+        assert!(
+            server
+                .state
+                .retained_wire_events
+                .recipients
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            sink.publish_retained_to(recipients[0], "opaque".into(), vec![4])
+                .is_err()
+        );
+        drop((aborts, listener));
+        std::fs::remove_file(path).unwrap(); // This fixture owns the socket pathname.
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retained_transport_liveness_tracks_registration_drop_and_poison() {
+        let endpoint = IpcEndpoint::unix_socket(
+            std::env::temp_dir().join(format!("bmux-liveness-{}.sock", Uuid::new_v4())),
+        );
+        let server = BmuxServer::new(endpoint);
+        let sink = ServerWireEventSink {
+            state: Arc::clone(&server.state),
+        };
+        let recipient = Uuid::new_v4();
+        assert_eq!(sink.is_connected(recipient), Some(false));
+        let registration = server
+            .state
+            .retained_wire_events
+            .register(recipient)
+            .unwrap();
+        assert_eq!(sink.is_connected(recipient), Some(true));
+        drop(registration);
+        assert_eq!(sink.is_connected(recipient), Some(false));
+        let retention = &server.state.retained_wire_events;
+        let poisoned = std::panic::catch_unwind(|| {
+            let _guard = retention.recipients.lock().unwrap();
+            panic!("poison isolated retention fixture");
+        });
+        assert!(poisoned.is_err());
+        assert_eq!(sink.is_connected(recipient), None);
+    }
+
+    #[test]
+    fn retained_transport_retirement_rejects_resurrection() {
+        let retention = Arc::new(RetainedWireEvents::default());
+        let owner = Uuid::new_v4();
+        let registration = retention.register(owner).unwrap();
+        retention.publish(owner, "opaque".into(), vec![1]).unwrap();
+        drop(registration);
+        assert!(retention.recipients.lock().unwrap().is_empty());
+        assert!(retention.publish(owner, "opaque".into(), vec![2]).is_err());
+        assert!(retention.clear(owner, "opaque").is_err());
+    }
+
+    #[test]
+    fn retained_transport_enforces_limits_and_allows_replacement() {
+        let retention = Arc::new(RetainedWireEvents::default());
+        let owner = Uuid::new_v4();
+        let _registration = retention.register(owner).unwrap();
+        retention.publish(owner, "opaque".into(), vec![1]).unwrap();
+        assert!(
+            retention
+                .publish(owner, "opaque".into(), vec![0; RETAINED_PAYLOAD_BYTES + 1])
+                .is_err()
+        );
+        assert!(
+            retention
+                .publish(owner, "x".repeat(RETAINED_KIND_BYTES + 1), vec![])
+                .is_err()
+        );
+        for index in 1..RETAINED_KIND_LIMIT {
+            retention.publish(owner, index.to_string(), vec![]).unwrap();
+        }
+        assert!(retention.publish(owner, "overflow".into(), vec![]).is_err());
+        retention.publish(owner, "opaque".into(), vec![2]).unwrap();
+        retention.clear(owner, "opaque").unwrap();
+        retention
+            .publish(owner, "replacement".into(), vec![])
+            .unwrap();
+    }
 
     #[test]
     fn service_compatibility_errors_are_structured_not_message_matched() {

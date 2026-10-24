@@ -80,6 +80,18 @@ pub(crate) enum DecorationEngineCommand {
         generation: u64,
         reply: Option<tokio::sync::oneshot::Sender<bool>>,
     },
+    CopyOverrides {
+        panes: std::collections::HashMap<Uuid, crate::PaneDecoration>,
+        reply: tokio::sync::oneshot::Sender<()>,
+    },
+    LayoutAndFocus {
+        snapshot: bmux_attach_layout_protocol::attach_layout_protocol::AttachLayoutSnapshot,
+        focused: Option<Uuid>,
+        reply: tokio::sync::oneshot::Sender<()>,
+    },
+    Retire {
+        reply: tokio::sync::oneshot::Sender<()>,
+    },
     PublishInitialScene {
         reply: tokio::sync::oneshot::Sender<()>,
     },
@@ -141,8 +153,12 @@ struct DecorationEngine {
 impl DecorationEngine {
     fn new(shared: SharedState, rx: Receiver<DecorationEngineCommand>) -> Self {
         Self {
+            state: State {
+                recipient: shared.runtime.recipient,
+                hook_scope: shared.runtime.hook_scope,
+                ..State::default()
+            },
             shared,
-            state: State::default(),
             rx,
             next_animation_tick: None,
         }
@@ -151,6 +167,9 @@ impl DecorationEngine {
     fn run(mut self) {
         self.publish_read_model();
         loop {
+            if *self.shared.runtime.stopped.borrow() {
+                break;
+            }
             self.update_animation_deadline();
             let received = match self.next_recv_timeout() {
                 Some(timeout) => self.rx.recv_timeout(timeout),
@@ -159,9 +178,15 @@ impl DecorationEngine {
             match received {
                 Ok(command) => {
                     self.handle_command(command);
-                    self.drain_pending_commands();
+                    if !*self.shared.runtime.stopped.borrow() {
+                        self.drain_pending_commands();
+                    }
                 }
-                Err(RecvTimeoutError::Timeout) => self.run_animation_tick(),
+                Err(RecvTimeoutError::Timeout) => {
+                    if self.next_animation_tick.is_some() {
+                        self.run_animation_tick();
+                    }
+                }
                 Err(RecvTimeoutError::Disconnected) => break,
             }
         }
@@ -184,6 +209,9 @@ impl DecorationEngine {
     }
 
     fn run_animation_tick(&mut self) {
+        if *self.shared.runtime.stopped.borrow() {
+            return;
+        }
         let policy = animation_driver_policy(&self.state);
         if run_animation_tick_if_current(&mut self.state, policy) {
             self.publish_read_model();
@@ -193,6 +221,9 @@ impl DecorationEngine {
     }
 
     fn drain_pending_commands(&mut self) {
+        if *self.shared.runtime.stopped.borrow() {
+            return;
+        }
         let mut pending = PendingCoalescedCommands::default();
         loop {
             match self.rx.try_recv() {
@@ -200,6 +231,9 @@ impl DecorationEngine {
                     if let Some(command) = pending.push(command) {
                         pending.flush(self);
                         self.handle_command(command);
+                        if *self.shared.runtime.stopped.borrow() {
+                            return;
+                        }
                     }
                 }
                 Err(TryRecvError::Empty | TryRecvError::Disconnected) => {
@@ -212,7 +246,12 @@ impl DecorationEngine {
 
     fn handle_script_checkpoint(&mut self, restore: bool) -> Result<(), String> {
         if !restore {
-            return crate::checkpoint_script_state(&mut self.state);
+            let result = crate::checkpoint_script_state(&mut self.state);
+            self.shared
+                .runtime
+                .subscription_generation
+                .send_replace(self.state.script_subscription_generation);
+            return result;
         }
         crate::restore_script_state(&mut self.state)?;
         let access = self
@@ -231,8 +270,88 @@ impl DecorationEngine {
         Ok(())
     }
 
+    fn handle_layout_and_focus(
+        &mut self,
+        snapshot: &bmux_attach_layout_protocol::attach_layout_protocol::AttachLayoutSnapshot,
+        focused: Option<Uuid>,
+    ) {
+        let mut changed = apply_attach_layout_snapshot(&mut self.state, snapshot);
+        for activity in self.state.activity.values_mut() {
+            let next = Some(activity.pane_id) == focused;
+            changed |= activity.focused != next;
+            activity.focused = next;
+        }
+        for geometry in self.state.geometry.values().cloned().collect::<Vec<_>>() {
+            let activity = self.state.activity_mut(geometry.pane_id);
+            let next = Some(geometry.pane_id) == focused;
+            changed |= activity.focused != next;
+            activity.focused = next;
+        }
+        if changed {
+            publish_scene_if_changed(&mut self.state);
+        }
+        self.publish_read_model();
+    }
+
+    fn retire(&mut self) {
+        let recipient = self.state.recipient;
+        self.state = State {
+            recipient,
+            hook_scope: self.shared.runtime.hook_scope,
+            ..State::default()
+        };
+        publish_scene_if_changed(&mut self.state);
+        self.publish_read_model();
+        self.shared.runtime.stopped.send_replace(true);
+    }
+
+    fn apply_theme(
+        &mut self,
+        toml_text: &str,
+        config_dir_candidates: &[PathBuf],
+        script_host_access: &ScriptHostAccess,
+    ) -> Result<(), ValidationResult> {
+        let outcome = apply_theme_extension_toml_direct(
+            &self.shared,
+            &mut self.state,
+            toml_text,
+            config_dir_candidates,
+            script_host_access,
+        );
+        self.next_animation_tick = None;
+        self.publish_read_model();
+        outcome
+    }
+
+    fn copy_overrides(&mut self, panes: std::collections::HashMap<Uuid, crate::PaneDecoration>) {
+        self.state.panes = panes;
+        publish_scene_if_changed(&mut self.state);
+        self.publish_read_model();
+    }
+
+    fn notify_pane(&mut self, event: &PaneEvent) {
+        let changed = notify_pane_event_direct(&mut self.state, event);
+        self.publish_read_model_if(changed);
+    }
+
     fn handle_command(&mut self, command: DecorationEngineCommand) {
         match command {
+            DecorationEngineCommand::Retire { reply } => {
+                self.retire();
+                let _ = reply.send(());
+            }
+            DecorationEngineCommand::LayoutAndFocus {
+                snapshot,
+                focused,
+                reply,
+            } => {
+                self.handle_layout_and_focus(&snapshot, focused);
+                let _ = reply.send(());
+            }
+            DecorationEngineCommand::CopyOverrides { panes, reply } => {
+                self.copy_overrides(panes);
+                let _ = reply.send(());
+            }
             DecorationEngineCommand::SetPaneBorder {
                 pane_id,
                 border,
@@ -262,20 +381,12 @@ impl DecorationEngine {
                 script_host_access,
                 reply,
             } => {
-                let outcome = apply_theme_extension_toml_direct(
-                    &self.shared,
-                    &mut self.state,
-                    &toml_text,
-                    &config_dir_candidates,
-                    &script_host_access,
-                );
-                self.next_animation_tick = None;
-                self.publish_read_model();
+                let outcome =
+                    self.apply_theme(&toml_text, &config_dir_candidates, &script_host_access);
                 let _ = reply.send(outcome);
             }
             DecorationEngineCommand::NotifyPaneEvent { event, reply } => {
-                let changed = notify_pane_event_direct(&mut self.state, &event);
-                self.publish_read_model_if(changed);
+                self.notify_pane(&event);
                 let _ = reply.send(Ok(()));
             }
             DecorationEngineCommand::AttachInput {
@@ -283,10 +394,7 @@ impl DecorationEngine {
                 enqueued_at,
                 reply,
             } => self.handle_attach_input_command(event, enqueued_at, &reply),
-            DecorationEngineCommand::PaneEvent(event) => {
-                let changed = notify_pane_event_direct(&mut self.state, &event);
-                self.publish_read_model_if(changed);
-            }
+            DecorationEngineCommand::PaneEvent(event) => self.notify_pane(&event),
             DecorationEngineCommand::FocusSnapshot(snapshot) => {
                 let changed = apply_focus_state_map(&mut self.state, &snapshot);
                 self.publish_read_model_if(changed);

@@ -20,6 +20,14 @@ All remaining control and producer operations require this local authorization.
 
 ## Controller contract
 
+One relay publication is selected at a time. Start/source require a source owned
+by the authenticated caller; pause/resume/stop require the selected publication's
+owner. Local proof does not grant another connection's view ownership. Fresh
+standalone command connections reject foreign controls with `source_not_owned`.
+Committed-view controls run through the owning attach's command path on the same
+connection that registers and publishes its source. Terminal-v1 is an independent
+read-only session observer, never an implicit committed-client-view selector.
+
 `broadcast_control_v1` exposes `start`, `pause`, `resume`, `stop`, `status`,
 `source`, and `terminal`. `start` explicitly selects an endpoint, channel,
 private publisher-credential file, and registered source UUID. `terminal`
@@ -63,7 +71,9 @@ Use `broadcast_output_v1::client::{register, poll, publish, unregister}` on the
 same authorized persistent connection. Register an explicit source UUID; the
 server binds it to that connection's caller UUID. Register/poll renew a six-second
 lease. Poll at least every two seconds and unregister when the producer stops.
-Expired registrations can be explicitly replaced; polling cannot revive them.
+Unselected expired registrations can be explicitly replaced; polling cannot
+revive them. A selected source UUID stays pinned to its owner across expiry or
+unregister, and source loss never falls back to another client.
 
 `register` and `poll` return `SourceState { refresh: u64, selected: bool }`.
 When selected, submit a self-contained full inline `BMWP\x05` frame with

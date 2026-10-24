@@ -212,6 +212,10 @@ impl Drop for AttachObserverPublisher {
 }
 
 impl AttachObserverPublisher {
+    pub(super) fn latest_committed(&self) -> Option<Arc<AttachSnapshot>> {
+        self.sender.borrow().clone()
+    }
+
     /// Construct a direct owned-output adapter without a browser observer.
     ///
     /// The receiver is intentionally absent: the callback accepts the complete

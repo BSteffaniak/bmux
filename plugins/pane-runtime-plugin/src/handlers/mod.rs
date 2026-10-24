@@ -32,6 +32,18 @@ mod spawn;
     reason = "`route_service!` centralizes all generated service route arms; splitting would obscure the macro dispatch table."
 )]
 pub fn route(context: NativeServiceContext) -> ServiceResponse {
+    if let Some(client) = context.caller_client_id
+        && !attach_commands::observer_operation_allowed(
+            bmux_session_models::ClientId(client),
+            &context.request.service.interface_id,
+            &context.request.operation,
+        )
+    {
+        return ServiceResponse::error(
+            "observer_read_only",
+            "observer connection cannot mutate pane runtime",
+        );
+    }
     bmux_plugin_sdk::route_service!(context, {
         "pane-runtime-presentation-wait-v1", "capabilities" => |_req: (), _ctx| {
             Ok::<_, ServiceResponse>(crate::runtime::execution::presentation_wait_capabilities())
@@ -255,6 +267,12 @@ pub fn route(context: NativeServiceContext) -> ServiceResponse {
         },
         "attach-runtime-commands", "attach-context" => |req: attach_commands::AttachContextArgs, ctx| {
             Ok::<_, ServiceResponse>(attach_commands::attach_context(&req, ctx))
+        },
+        "attach-runtime-commands", "observer-grant" => |req: attach_commands::ObserverGrantArgs, ctx| {
+            Ok::<_, ServiceResponse>(attach_commands::observer_grant(&req, ctx))
+        },
+        "attach-runtime-commands", "observer-open" => |req: attach_commands::AttachOpenArgs, ctx| {
+            Ok::<_, ServiceResponse>(attach_commands::observer_open(&req, ctx))
         },
         "attach-runtime-commands", "attach-open" => |req: attach_commands::AttachOpenArgs, ctx| {
             Ok::<_, ServiceResponse>(attach_commands::attach_open(&req, ctx))

@@ -1,4 +1,5 @@
 pub mod adapters;
+mod committed_source;
 pub mod cursor;
 mod display_capture;
 pub mod events;

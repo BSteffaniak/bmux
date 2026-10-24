@@ -5,16 +5,48 @@ The controller persists across CLI invocations, while fresh plugin activation
 starts offline. Relay failure cannot interrupt local presentation or terminal
 operation. No terminal input or presenter navigation is exposed to viewers.
 
+## Committed-view mirroring and ownership
+
+To mirror an interactive attach, invoke its broadcast actions through that
+owning attach's command/keybinding path. `start` (optionally `--profile NAME`)
+selects that attach's committed source; `pause`, `resume`, `stop`, and `source`
+use the same authenticated connection. The CLI calls generated controls directly
+and reports transient status in that attach. Only successfully committed retained
+frames are published; becoming the active client cannot replace the selected view.
+
+There is one relay publication, not one controller per client. Controls from a
+foreign connection are rejected with `source_not_owned`; a fresh standalone
+`bmux broadcast pause`, `resume`, `stop`, or `source` invocation does not inherit
+an existing attach's authority. Likewise, standalone `start --source UUID` cannot
+select another connection's committed view. Use the originating attach, not a
+copied source UUID. This intentionally rejects incompatible legacy cross-connection
+control. Standalone setup, profiles, status, and independent terminal-start flows
+remain available where they do not require foreign ownership.
+
+Source loss marks the selected view unavailable, never selects another client.
+A source switch clears queued output and delta baselines even if relay mutation
+fails. A failed running switch keeps the requested target unavailable (a paused
+switch remains paused); explicit recovery and a fresh complete frame are required.
+The presentation indicator reports publication-global status, not view ownership.
+
 ## Terminal observation and sizing
 
 Terminal broadcasts follow the selected session's authoritative viewport. Starting
-an observer does not resize an already-sized terminal. `--cols`/`--rows` seed only
-an unset viewport; they do not lock the terminal to a competing broadcast size.
+an observer does not resize a terminal or change shared focus/selection.
+`--cols`/`--rows` supply only a local fallback when shared geometry is unset;
+they do not establish shared PTY sizing authority.
 Normal attached clients continue to control sizing. Resize events update observer
 geometry and trigger a complete retained-frame repair before incremental updates
 resume. With no interactive client attached, the last authoritative size remains.
 An explicitly selected terminal source stays selected when another client changes
 tabs; select another broadcast source explicitly to change what is public.
+
+Terminal-v1 is an independent read-only session observer, not a mirror of an
+interactive client's committed view. Dedicated observer grants use the existing
+attach capability and expiring single-use tokens. The server denies input,
+focus, resize, and normal-attach escalation on that connection, even after detach.
+Disconnected transport UUIDs alone are reclaimed opportunistically; expired
+pending grants lose their token binding without removing a live connection fence.
 
 After updating this native adapter, rebuild BMUX and its bundled plugins on the
 broadcasting machine and restart its daemon with the updated executable. Updating

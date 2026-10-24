@@ -11,6 +11,11 @@ plugin_id   = "bmux.pane_runtime"
 version_req = ">=0.0.1-alpha.0"
 
 [[services]]
+capability   = "bmux.decoration.write"
+interface_id = "decoration-view-v1"
+kind         = "command"
+
+[[services]]
 capability   = "bmux.decoration.read"
 interface_id = "decoration-state"
 kind         = "query"
@@ -50,5 +55,5 @@ name        = "scene-published"
 # `ServerEvent::PluginBusEvent` over the per-client event channel.
 [[event_publications]]
 delivery                     = "state"
-forward_to_streaming_clients = true
+forward_to_streaming_clients = false
 kind                         = "bmux.scene/scene-protocol"

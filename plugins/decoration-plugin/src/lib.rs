@@ -13,6 +13,7 @@
 
 mod engine;
 mod input;
+mod views;
 
 pub use input::input_codec;
 pub mod glyphs;
@@ -105,6 +106,9 @@ impl std::fmt::Debug for ScriptComponentRuntime {
 /// In-memory state store.
 #[derive(Default)]
 struct State {
+    /// Private scenes never enter the process-global plugin bus.
+    recipient: Option<Uuid>,
+    hook_scope: u64,
     /// Per-pane overrides. Panes without an override fall through to
     /// [`State::default_border`].
     panes: HashMap<Uuid, PaneDecoration>,
@@ -270,6 +274,17 @@ struct DecorationRuntime {
     command_tx: Mutex<Option<std::sync::mpsc::SyncSender<DecorationEngineCommand>>>,
     read_model: ArcSwap<DecorationReadModel>,
     host_async_handle: Mutex<Option<HostAsyncHandle>>,
+    recipient: Option<Uuid>,
+    hook_scope: u64,
+    stopped: tokio::sync::watch::Sender<bool>,
+    subscription_generation: tokio::sync::watch::Sender<u64>,
+    #[cfg(test)]
+    active_subscriptions: std::sync::atomic::AtomicUsize,
+}
+
+fn next_hook_scope() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 impl Default for DecorationRuntime {
@@ -278,6 +293,12 @@ impl Default for DecorationRuntime {
             command_tx: Mutex::new(None),
             read_model: ArcSwap::from_pointee(DecorationReadModel::default()),
             host_async_handle: Mutex::new(None),
+            recipient: None,
+            hook_scope: next_hook_scope(),
+            stopped: tokio::sync::watch::channel(false).0,
+            subscription_generation: tokio::sync::watch::channel(0).0,
+            #[cfg(test)]
+            active_subscriptions: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 }
@@ -448,6 +469,35 @@ impl DecorationStateService for DecorationServiceHandle {
 }
 
 impl DecorationCommandsService for DecorationServiceHandle {
+    fn apply_view_theme_extension<'a>(
+        &'a self,
+        _toml: String,
+        _config_dir_candidates: Vec<String>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ValidationResult>> + Send + 'a>> {
+        Box::pin(async {
+            Err(ValidationResult::Errors {
+                errors: vec![ValidationError {
+                    path: "caller".into(),
+                    message: "view operations require identity-bearing service dispatch".into(),
+                }],
+            })
+        })
+    }
+    fn checkpoint_view_script_state<'a>(
+        &'a self,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async { Err("view operations require identity-bearing service dispatch".into()) })
+    }
+    fn restore_view_script_state<'a>(
+        &'a self,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async { Err("view operations require identity-bearing service dispatch".into()) })
+    }
+    fn discard_view_script_checkpoint<'a>(
+        &'a self,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async { Err("view operations require identity-bearing service dispatch".into()) })
+    }
     fn discard_script_checkpoint<'a>(
         &'a self,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
@@ -1697,6 +1747,11 @@ fn publish_scene_if_changed(state: &mut State) -> bool {
     // is compared without its revision so animation ticks that do not change
     // visible output do not force attach clients to repaint.
     let mut scene = build_scene(state);
+    if state.recipient.is_some() {
+        for hook in &mut scene.input_hooks {
+            hook.id = format!("view:{}:{}", state.hook_scope, hook.id);
+        }
+    }
     if state
         .last_published_scene
         .as_ref()
@@ -1708,8 +1763,17 @@ fn publish_scene_if_changed(state: &mut State) -> bool {
     state.scene_revision = state.scene_revision.saturating_add(1);
     scene.revision = state.scene_revision;
     state.last_published_scene = Some(scene.clone());
-    let _ = bmux_plugin::global_event_bus()
-        .publish_state(&bmux_scene_protocol::scene_protocol::STATE_KIND, scene);
+    if let Some(recipient) = state.recipient {
+        // Process-wide monotonicity also fences retired lifetimes on one connection.
+        static REVISION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        state.scene_revision = REVISION.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        scene.revision = state.scene_revision;
+        state.last_published_scene = Some(scene.clone());
+        views::publish_scene(recipient, &scene);
+    } else {
+        let _ = bmux_plugin::global_event_bus()
+            .publish_state(&bmux_scene_protocol::scene_protocol::STATE_KIND, scene);
+    }
     true
 }
 
@@ -1909,6 +1973,10 @@ fn apply_theme_extension_toml_direct(
         state.script_components.clear();
         clear_visual_projection_state(state);
         install_script_backend(state, None, ScriptHostAccess::default());
+        shared
+            .runtime
+            .subscription_generation
+            .send_replace(state.script_subscription_generation);
         publish_scene_if_changed(state);
         return Ok(());
     }
@@ -2125,6 +2193,10 @@ fn install_script_event_subscriptions(
     access: Option<bmux_decoration_plugin_api::decoration_state::ScriptAccessSpec>,
     generation: u64,
 ) {
+    shared
+        .runtime
+        .subscription_generation
+        .send_replace(generation);
     let Some(access) = access else {
         return;
     };
@@ -2150,16 +2222,45 @@ fn spawn_local_current_thread_runtime(
     label: &'static str,
     task: impl Future<Output = ()> + Send + 'static,
 ) {
-    std::thread::spawn(move || {
-        let Ok(rt) = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        else {
-            tracing::error!("{label} FAILED to build tokio runtime");
-            return;
-        };
-        rt.block_on(task);
+    static EXECUTOR: std::sync::OnceLock<tokio::runtime::Handle> = std::sync::OnceLock::new();
+    let executor = EXECUTOR.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        std::thread::Builder::new()
+            .name("decoration.events".into())
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("decoration event executor");
+                tx.send(runtime.handle().clone())
+                    .expect("executor startup receiver");
+                runtime.block_on(std::future::pending::<()>());
+            })
+            .expect("decoration event executor thread");
+        rx.recv().expect("decoration event executor startup")
     });
+    executor.spawn(task);
+    tracing::trace!(label, "decoration event subscriber scheduled");
+}
+
+#[cfg(test)]
+struct SubscriptionCount(Arc<DecorationRuntime>);
+#[cfg(test)]
+impl SubscriptionCount {
+    fn new(runtime: Arc<DecorationRuntime>) -> Self {
+        runtime
+            .active_subscriptions
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self(runtime)
+    }
+}
+#[cfg(test)]
+impl Drop for SubscriptionCount {
+    fn drop(&mut self) {
+        self.0
+            .active_subscriptions
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 fn spawn_script_state_subscription(
@@ -2179,8 +2280,22 @@ fn spawn_script_state_subscription(
     };
     enqueue_script_json_event_direct(state, initial.as_ref(), true, generation);
     let host_async_handle = shared.host_async_handle();
+    let mut stopped = shared.runtime.stopped.subscribe();
+    let mut subscription_generation = shared.runtime.subscription_generation.subscribe();
+    #[cfg(test)]
+    let count = SubscriptionCount::new(shared.runtime.clone());
     let task = async move {
-        while rx.changed().await.is_ok() {
+        #[cfg(test)]
+        let _count = count;
+        loop {
+            if *subscription_generation.borrow() != generation {
+                break;
+            }
+            tokio::select! {
+                _ = subscription_generation.changed() => break,
+                result = stopped.changed() => { if result.is_err() || *stopped.borrow() { break; } }
+                result = rx.changed() => { if result.is_err() { break; } }
+            }
             let event = rx.borrow().clone();
             if !send_engine_fire_and_forget(
                 &shared,
@@ -2212,8 +2327,22 @@ fn spawn_script_broadcast_subscription(shared: SharedState, kind: &str, generati
         return;
     };
     let host_async_handle = shared.host_async_handle();
+    let mut stopped = shared.runtime.stopped.subscribe();
+    let mut subscription_generation = shared.runtime.subscription_generation.subscribe();
+    #[cfg(test)]
+    let count = SubscriptionCount::new(shared.runtime.clone());
     let task = async move {
-        while let Ok(event) = rx.recv().await {
+        #[cfg(test)]
+        let _count = count;
+        loop {
+            if *subscription_generation.borrow() != generation {
+                break;
+            }
+            let event = tokio::select! {
+                _ = subscription_generation.changed() => break,
+                result = stopped.changed() => { if result.is_err() || *stopped.borrow() { break; } continue; }
+                result = rx.recv() => { let Ok(event) = result else { break; }; event }
+            };
             if !send_engine_fire_and_forget(
                 &shared,
                 DecorationEngineCommand::ScriptJsonEvent {
@@ -2295,6 +2424,7 @@ fn enqueue_script_json_event_direct(
 #[derive(Default)]
 pub struct DecorationPlugin {
     state: SharedState,
+    views: views::ViewRegistry,
     lifecycle_context: Option<NativeLifecycleContext>,
 }
 
@@ -2304,6 +2434,7 @@ impl DecorationPlugin {
     pub fn new() -> Self {
         Self {
             state: SharedState::new(),
+            views: views::ViewRegistry::default(),
             lifecycle_context: None,
         }
     }
@@ -3039,6 +3170,9 @@ impl RustPlugin for DecorationPlugin {
         &self,
         context: bmux_plugin_sdk::NativeServiceContext,
     ) -> bmux_plugin_sdk::ServiceResponse {
+        if let Some(response) = self.views.dispatch(&context, &self.state) {
+            return response;
+        }
         // IPC-level dispatch for every typed op declared in the
         // decoration BPDL. The server routes `Request::InvokeService`
         // here when a client (attach runtime, sibling plugin, etc.)
@@ -3099,6 +3233,7 @@ impl RustPlugin for DecorationPlugin {
                 Ok::<_, bmux_plugin_sdk::ServiceResponse>(validate_theme_extension_toml(&req.toml))
             },
             "decoration-commands", "set-pane-border" => |req: SetPaneBorderArgs, _ctx| {
+                self.views.set_shared_pane_border(req.pane_id, req.border);
                 let outcome = send_engine_command_blocking(&state, |reply| {
                     DecorationEngineCommand::SetPaneBorder {
                         pane_id: req.pane_id,
@@ -4031,7 +4166,10 @@ fn apply_attach_layout_snapshot(
         };
         if geometry_for_pane(state, removed.pane_id).is_none() {
             state.activity.remove(&removed.pane_id);
-            state.panes.remove(&removed.pane_id);
+            // Hiding a surface is not deletion of an explicit pane override.
+            if let Some(override_style) = state.panes.get_mut(&removed.pane_id) {
+                override_style.focused = false;
+            }
         }
         changed = true;
     }

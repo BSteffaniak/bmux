@@ -1674,6 +1674,7 @@ dependencies = [
  "bmux_attach_token_state",
  "bmux_attach_view_protocol",
  "bmux_broadcast_plugin",
+ "bmux_broadcast_plugin_api",
  "bmux_cli_schema",
  "bmux_client",
  "bmux_clients_plugin",
@@ -1692,6 +1693,7 @@ dependencies = [
  "bmux_control_catalog_plugin",
  "bmux_control_catalog_plugin_api",
  "bmux_decoration_plugin",
+ "bmux_decoration_plugin_api",
  "bmux_decoration_plugin_renderer",
  "bmux_diagnostic_log",
  "bmux_env",
@@ -2137,6 +2139,7 @@ dependencies = [
 name = "bmux_decoration_plugin_api"
 version = "0.0.1-alpha.4"
 dependencies = [
+ "bmux_attach_layout_protocol",
  "bmux_codec",
  "bmux_ipc",
  "bmux_plugin_schema_macros",
@@ -3276,6 +3279,7 @@ dependencies = [
  "tokio",
  "toml 1.1.4+spec-1.1.0",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
