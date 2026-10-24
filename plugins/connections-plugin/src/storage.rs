@@ -224,12 +224,14 @@ impl PrivateDirectory {
     fn open_file(&self, name: &CStr, flags: libc::c_int) -> std::io::Result<File> {
         // SAFETY: name is NUL-terminated, the parent fd is live, mode is supplied
         // for O_CREAT. Directory-relative IO pins the checked private directory.
+        // C variadic arguments require integer promotion: mode_t is u16 on macOS,
+        // so pass c_uint explicitly rather than the platform-dependent mode_t.
         let fd = unsafe {
             libc::openat(
                 self.handle.as_raw_fd(),
                 name.as_ptr(),
                 flags | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                0o600 as libc::mode_t,
+                0o600 as libc::c_uint,
             )
         };
         if fd < 0 {
@@ -364,6 +366,21 @@ mod tests {
         );
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         assert!(store.transaction(|_| Ok(())).is_err());
+    }
+
+    #[test]
+    fn directory_relative_creation_preserves_private_mode() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = PrivateDirectory::open(&root.path().join("private")).unwrap();
+        let file = directory
+            .open_file(c"created", libc::O_RDWR | libc::O_CREAT | libc::O_EXCL)
+            .unwrap();
+        check_private(&file, false).unwrap();
+        assert_eq!(file.metadata().unwrap().mode() & 0o777, 0o600);
+        drop(file);
+        let reopened = directory.open_file(c"created", libc::O_RDONLY).unwrap();
+        check_private(&reopened, false).unwrap();
+        assert_eq!(reopened.metadata().unwrap().mode() & 0o777, 0o600);
     }
 
     #[test]

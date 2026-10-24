@@ -1,0 +1,6 @@
+# Keep private-storage ABI and permission tests on both supported Unix platforms.
+[[config]]
+os = "ubuntu"
+
+[[config]]
+os = "macos"
