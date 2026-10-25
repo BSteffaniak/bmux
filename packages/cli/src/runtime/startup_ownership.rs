@@ -66,13 +66,26 @@ impl StartupOwnership {
                 "runtime lifetime claim is not a regular file"
             );
         }
+        #[cfg(unix)]
+        let file = {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+                .open(&path)
+        };
+        #[cfg(not(unix))]
         let file = OpenOptions::new()
             .create(true)
             .truncate(false)
             .read(true)
             .write(true)
-            .open(&path)
-            .context("open runtime lifetime claim")?;
+            .open(&path);
+        let file = file.context("open runtime lifetime claim")?;
         file.try_lock()
             .context("runtime already owns lifetime claim (running or starting)")?;
         ensure!(

@@ -859,15 +859,17 @@ pub fn prepare_private_directory(
 ) -> std::io::Result<bool> {
     #[cfg(unix)]
     {
-        unix_security::prepare_directory(path, migrate_legacy).map_err(|error| {
-            std::io::Error::new(
-                error.kind(),
-                format!(
-                    "preparing private IPC directory {}: {error}",
-                    path.display()
-                ),
-            )
-        })
+        UnixSecurityPolicy::strict()
+            .prepare_private_directory(path, migrate_legacy)
+            .map_err(|error| {
+                std::io::Error::new(
+                    error.kind(),
+                    format!(
+                        "preparing private IPC directory {}: {error}",
+                        path.display()
+                    ),
+                )
+            })
     }
     #[cfg(not(unix))]
     {

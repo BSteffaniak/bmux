@@ -295,10 +295,20 @@ impl ConfigPaths {
         &self.config_dir_candidates
     }
 
+    /// Local IPC keeps owner-private permissions and same-user authentication,
+    /// but does not require the user's volume ancestors to be private.
+    #[must_use]
+    pub const fn local_ipc_policy() -> bmux_ipc::transport::UnixSecurityPolicy {
+        bmux_ipc::transport::UnixSecurityPolicy {
+            trusted_ancestors: cfg!(not(unix)),
+            ..bmux_ipc::transport::UnixSecurityPolicy::strict()
+        }
+    }
+
     /// Prepare the resolved runtime directory before writing runtime artifacts.
     ///
     /// Default BMUX-owned paths may migrate safe legacy read/search permissions.
-    /// Custom paths remain strict, and changing the public runtime path does not
+    /// Custom paths retain private-parent checks, and changing the public runtime path does not
     /// carry migration authority to the replacement path. Tightening permissions
     /// does not stop listeners or grant endpoint/lifetime-claim ownership.
     ///
@@ -306,7 +316,7 @@ impl ConfigPaths {
     /// Returns an error for unsafe paths, modes, ownership, or filesystem errors.
     pub fn ensure_runtime_dir(&self) -> std::io::Result<()> {
         let migrate = self.managed_runtime_dir.as_ref() == Some(&self.runtime_dir);
-        if bmux_ipc::transport::prepare_private_directory(&self.runtime_dir, migrate)? {
+        if Self::local_ipc_policy().prepare_private_directory(&self.runtime_dir, migrate)? {
             tracing::info!(path = %self.runtime_dir.display(), "migrated legacy runtime directory permissions to 0700");
         }
         Ok(())
@@ -718,6 +728,42 @@ mod tests {
         assert!(
             paths.ensure_runtime_dir().is_err(),
             "public path mutation cannot transfer migration authority"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_runtime_preparation_preserves_shared_ancestor_and_private_child() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = std::env::temp_dir().join(format!(
+            "bmux-shared-runtime-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let runtime = root.join("runtime");
+        let mut paths = ConfigPaths::new(root.clone(), runtime.clone(), root.clone(), root.clone());
+        paths.ensure_runtime_dir().unwrap();
+        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o755)).unwrap();
+        paths.managed_runtime_dir = Some(runtime.clone());
+        paths.ensure_runtime_dir().unwrap();
+        assert_eq!(
+            std::fs::metadata(&runtime).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+            0o777
+        );
+        assert!(!ConfigPaths::local_ipc_policy().trusted_ancestors);
+        assert_eq!(
+            ConfigPaths::local_ipc_policy().peer,
+            bmux_ipc::transport::IdentityPolicy::EffectiveUser
         );
         std::fs::remove_dir_all(root).unwrap();
     }

@@ -199,6 +199,57 @@ fn symlink_policy_distinguishes_parent_from_ancestors() {
     );
 }
 
+#[tokio::test]
+async fn private_directory_migration_and_binding_share_explicit_ancestor_policy() {
+    let dir = Directory::new();
+    let shared = dir.0.join("shared");
+    std::fs::create_dir(&shared).unwrap();
+    std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let private = shared.join("private");
+    let policy = UnixSecurityPolicy {
+        trusted_ancestors: false,
+        ..UnixSecurityPolicy::strict()
+    };
+    assert!(!policy.prepare_private_directory(&private, false).unwrap());
+    std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(policy.prepare_private_directory(&private, true).unwrap());
+    assert!(
+        UnixSecurityPolicy::strict()
+            .prepare_private_directory(&private, true)
+            .is_err()
+    );
+    assert_eq!(
+        std::fs::metadata(&private).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    assert_eq!(
+        std::fs::metadata(&shared).unwrap().permissions().mode() & 0o777,
+        0o777
+    );
+    let endpoint = IpcEndpoint::unix_socket(private.join("s"));
+    assert!(LocalIpcListener::bind(&endpoint).is_err());
+    let listener = LocalIpcListener::bind_with_policy(&endpoint, policy).unwrap();
+    let client = LocalIpcStream::connect(&endpoint).await.unwrap();
+    let accepted = listener.accept().await.unwrap();
+    assert_eq!(
+        std::fs::metadata(private.join("s"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+    drop((client, accepted));
+    assert!(LocalIpcListener::bind_with_policy(&endpoint, policy).is_err());
+    std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o777)).unwrap();
+    assert!(policy.prepare_private_directory(&private, true).is_err());
+    let relaxed = UnixSecurityPolicy {
+        parent_owner: IdentityPolicy::Unrestricted,
+        ..policy
+    };
+    assert!(relaxed.prepare_private_directory(&private, true).is_err());
+}
+
 #[test]
 fn ancestor_checks_can_be_explicitly_relaxed() {
     let dir = Directory::new();

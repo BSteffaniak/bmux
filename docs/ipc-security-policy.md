@@ -2,8 +2,12 @@
 
 `bmux_ipc::transport` separates reusable Unix transport mechanisms from the
 consumer's security policy. `LocalIpcListener::bind` and
-`LocalIpcStream::connect` retain strict defaults. BMUX applications continue to
-use these defaults; there is no environment-controlled relaxation.
+`LocalIpcStream::connect` retain strict defaults. BMUX local runtime setup
+explicitly selects `trusted_ancestors: false`, retaining all other strict
+checks.
+There is no environment-controlled transport-policy relaxation. This supports
+private runtimes below writable external-volume ancestors without relocating
+endpoints, but cannot prevent ancestor-based path substitution.
 
 Consumers may use `LocalIpcListener::bind_with_policy` with
 `UnixSecurityPolicy` and `LocalIpcStream::connect_with_policy` with an
@@ -52,8 +56,14 @@ endpoint substitution; disabling peer checks removes OS-user authentication.
 The caller must supply whatever authorization its product requires. These APIs
 are not authentication for remote/federated application operations.
 
+The separate `UnixSecurityPolicy::prepare_private_directory` API supports
+private-directory migration with strict or unchecked ancestor trust. It rejects
+relaxed ownership, mode, and symlink policies before mutation. The free
+`prepare_private_directory` helper retains strict ancestor checks.
+
 Invalid mode bits fail before filesystem changes. Existing directories are never
-chmod/chowned automatically. Unavailable required peer checks fail closed;
+chmod/chowned by socket binding or `prepare_parent`. Unavailable required peer
+checks fail closed;
 explicitly unrestricted peers skip the check. Non-Unix transports reject
 non-default Unix policies instead of silently ignoring them. Unix peer
 verification is currently supported on Linux and macOS.

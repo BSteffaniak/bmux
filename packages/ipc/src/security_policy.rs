@@ -83,6 +83,39 @@ impl UnixSecurityPolicy {
         super::unix_security::prepare_parent_with_policy(path, self)
     }
 
+    /// Prepare an owner-private directory, optionally migrating safe legacy modes.
+    /// Only ancestor trust may differ from strict policy; migration never inherits
+    /// relaxed ownership, mode, or symlink checks from a transport policy.
+    ///
+    /// # Errors
+    /// Returns an error for incompatible policies, unsafe directories, or I/O failure.
+    pub fn prepare_private_directory(
+        self,
+        path: &std::path::Path,
+        migrate: bool,
+    ) -> std::io::Result<bool> {
+        let expected = Self {
+            trusted_ancestors: self.trusted_ancestors,
+            ..Self::strict()
+        };
+        if self != expected {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "private directory preparation requires strict ownership, modes, and symlink policy",
+            ));
+        }
+        #[cfg(unix)]
+        {
+            super::unix_security::prepare_directory(path, self, migrate)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = migrate;
+            std::fs::create_dir_all(path)?;
+            Ok(false)
+        }
+    }
+
     pub(super) fn validate(self) -> std::io::Result<()> {
         if [
             Some(self.directory_mode),

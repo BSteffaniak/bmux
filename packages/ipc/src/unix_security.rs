@@ -41,10 +41,14 @@ pub(super) fn prepare_parent_with_policy(
         })
 }
 
-/// Prepare a managed private directory without inheriting transport relaxations.
+/// Prepare a private directory using a validated private-directory policy.
 /// Returns whether existing permissions were migrated; never touches contents.
-pub(super) fn prepare_directory(path: &Path, migrate: bool) -> io::Result<bool> {
-    prepare_directory_checked(path, UnixSecurityPolicy::strict(), migrate)
+pub(super) fn prepare_directory(
+    path: &Path,
+    policy: UnixSecurityPolicy,
+    migrate: bool,
+) -> io::Result<bool> {
+    prepare_directory_checked(path, policy, migrate)
 }
 
 fn prepare_directory_checked(
@@ -120,7 +124,7 @@ fn prepare_directory_checked(
         let mode = metadata.permissions().mode();
         if last {
             if migrate && mode & 0o077 != 0 {
-                // Migration is only reachable with the strict policy above.
+                // Migration retains strict ownership, modes, and symlink checks.
                 // Do not repair writable, special-mode, or foreign directories.
                 if metadata.uid() != uid || mode & 0o700 != 0o700 || mode & 0o7022 != 0 {
                     return Err(denied());

@@ -175,6 +175,7 @@ impl Drop for RetainedRegistration {
 #[derive(Clone)]
 pub struct BmuxServer {
     endpoint: IpcEndpoint,
+    ipc_security: bmux_ipc::transport::UnixSecurityPolicy,
     state: Arc<ServerState>,
     shutdown_tx: watch::Sender<bool>,
 }
@@ -1374,6 +1375,7 @@ impl BmuxServer {
 
         Self {
             endpoint,
+            ipc_security: bmux_ipc::transport::UnixSecurityPolicy::strict(),
             state: Arc::new(ServerState {
                 attach_tokens,
                 performance_settings,
@@ -1397,6 +1399,16 @@ impl BmuxServer {
             }),
             shutdown_tx,
         }
+    }
+
+    /// Select the generic local transport policy without changing endpoint identity.
+    #[must_use]
+    pub const fn with_ipc_security(
+        mut self,
+        policy: bmux_ipc::transport::UnixSecurityPolicy,
+    ) -> Self {
+        self.ipc_security = policy;
+        self
     }
 
     /// Create a server with an explicit endpoint.
@@ -1476,6 +1488,7 @@ impl BmuxServer {
             shell_integration_root,
             server_control_principal_id,
         )
+        .with_ipc_security(ConfigPaths::local_ipc_policy())
     }
 
     /// Create a server using default bmux config paths.
@@ -1815,7 +1828,7 @@ impl BmuxServer {
         &self,
         mut ready_tx: Option<oneshot::Sender<std::result::Result<(), String>>>,
     ) -> Result<()> {
-        let listener = match LocalIpcListener::bind(&self.endpoint)
+        let listener = match LocalIpcListener::bind_with_policy(&self.endpoint, self.ipc_security)
             .with_context(|| format!("failed binding server endpoint {:?}", self.endpoint))
         {
             Ok(listener) => listener,

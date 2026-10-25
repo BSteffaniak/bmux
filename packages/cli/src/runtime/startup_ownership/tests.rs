@@ -10,6 +10,29 @@ fn paths(root: &tempfile::TempDir) -> ConfigPaths {
     )
 }
 
+#[cfg(unix)]
+#[test]
+fn shared_ancestor_preserves_lifetime_exclusion_and_rejects_claim_symlinks() {
+    use std::os::unix::fs::{PermissionsExt as _, symlink};
+    let root = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+    let paths = paths(&root);
+    let claim = StartupOwnership::acquire(&paths).unwrap();
+    assert!(StartupOwnership::acquire(&paths).is_err());
+    assert_eq!(
+        std::fs::metadata(root.path()).unwrap().permissions().mode() & 0o777,
+        0o777
+    );
+    drop(claim);
+    let lock = paths.runtime_dir.join(CLAIM_NAME);
+    std::fs::remove_file(&lock).unwrap();
+    let target = root.path().join("untouched");
+    std::fs::write(&target, b"unchanged").unwrap();
+    symlink(&target, &lock).unwrap();
+    assert!(StartupOwnership::acquire(&paths).is_err());
+    assert_eq!(std::fs::read(&target).unwrap(), b"unchanged");
+}
+
 #[test]
 fn clean_release_is_not_extended_by_an_inherited_open_description() {
     let root = tempfile::tempdir().unwrap();

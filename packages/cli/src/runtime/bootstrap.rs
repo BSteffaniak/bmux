@@ -189,19 +189,29 @@ pub(super) fn next_default_tab_name(sessions: &[SessionSummary]) -> String {
 }
 
 fn open_server_startup_log(runtime_dir: &std::path::Path) -> Result<std::fs::File> {
-    bmux_ipc::transport::prepare_private_directory(runtime_dir, false).with_context(|| {
-        format!(
-            "failed creating server runtime directory: {}",
-            runtime_dir.display()
-        )
-    })?;
+    ConfigPaths::local_ipc_policy()
+        .prepare_private_directory(runtime_dir, false)
+        .with_context(|| {
+            format!(
+                "failed creating server runtime directory: {}",
+                runtime_dir.display()
+            )
+        })?;
     let startup_log = runtime_dir.join("server-startup.log");
     let mut options = std::fs::OpenOptions::new();
     options.create(true).write(true).truncate(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+    }
+    if let Ok(metadata) = std::fs::symlink_metadata(&startup_log) {
+        anyhow::ensure!(
+            metadata.is_file() && !metadata.file_type().is_symlink(),
+            "startup log is not a regular file"
+        );
     }
     options.open(&startup_log).with_context(|| {
         format!(
@@ -282,6 +292,16 @@ async fn run_server_start_inner(
     // Directory preparation can only tighten safe default-path permissions; it
     // never grants the launcher endpoint or lifetime-claim mutation authority.
     paths.ensure_runtime_dir()?;
+    #[cfg(unix)]
+    if !daemon || foreground_internal {
+        let strict = bmux_ipc::transport::UnixSecurityPolicy {
+            create_parents: false,
+            ..bmux_ipc::transport::UnixSecurityPolicy::strict()
+        };
+        if let Err(error) = strict.prepare_parent(&paths.server_socket()) {
+            tracing::warn!(%error, "local IPC uses private modes and same-user peer authentication, but runtime ancestors permit path replacement; continuing on the selected runtime path");
+        }
+    }
     // The daemon launcher owns no claim or endpoint mutation authority.
     let startup_ownership = if daemon && !foreground_internal {
         None
@@ -1298,6 +1318,23 @@ mod tests {
         }
         drop(open_server_startup_log(&runtime_dir).expect("reopen startup log"));
         assert!(std::fs::read(&path).expect("read truncated log").is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_log_allows_shared_ancestors_but_rejects_symlink_artifacts() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+        let runtime = root.path().join("runtime");
+        drop(open_server_startup_log(&runtime).unwrap());
+        let log = runtime.join("server-startup.log");
+        std::fs::remove_file(&log).unwrap();
+        let target = root.path().join("untouched");
+        std::fs::write(&target, b"unchanged").unwrap();
+        symlink(&target, &log).unwrap();
+        assert!(open_server_startup_log(&runtime).is_err());
+        assert_eq!(std::fs::read(target).unwrap(), b"unchanged");
     }
 
     #[test]
