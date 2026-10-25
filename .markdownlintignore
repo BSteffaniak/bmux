@@ -1,4 +1,13 @@
 **/target/**
 **/dist/**
+# Preserve bundled license material rather than enforcing documentation formatting.
+**/[Ll][Ii][Cc][Ee][Nn][Ss][Ee][Ss]/**
+**/[Ll][Ii][Cc][Ee][Nn][Cc][Ee][Ss]/**
+**/[Ll][Ii][Cc][Ee][Nn][Ss][Ee].md
+**/[Ll][Ii][Cc][Ee][Nn][Ss][Ee]-*.md
+**/[Ll][Ii][Cc][Ee][Nn][Ss][Ee]_*.md
+**/[Ll][Ii][Cc][Ee][Nn][Cc][Ee].md
+**/[Ll][Ii][Cc][Ee][Nn][Cc][Ee]-*.md
+**/[Ll][Ii][Cc][Ee][Nn][Cc][Ee]_*.md
 # Parser fixtures intentionally exercise malformed and nonstandard Markdown.
 packages/markdown/tests/fixtures/**
