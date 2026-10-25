@@ -2369,7 +2369,9 @@ mod admission_tests {
     async fn idle_admitted_stream_closes_on_revoke_and_expiry() {
         for expire in [false, true] {
             // Keep the basename within macOS's Unix socket budget under Nix TMPDIR.
-            let path = std::env::temp_dir().join(format!("{}.s", Uuid::new_v4().simple()));
+            let path = std::path::PathBuf::from("/tmp")
+                .join(format!("bmux-{}", Uuid::new_v4().simple()))
+                .join("ipc.sock");
             let endpoint = IpcEndpoint::unix_socket(path.clone());
             let listener = LocalIpcListener::bind(&endpoint).unwrap();
             let mut server = BmuxServer::new(endpoint.clone());
@@ -4398,9 +4400,16 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn private_socket_path() -> std::path::PathBuf {
+        std::path::PathBuf::from("/tmp")
+            .join(format!("bmux-{}", Uuid::new_v4().simple()))
+            .join("ipc.sock")
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn retained_transport_push_is_private_and_public_flow_is_preserved() {
-        let path = std::env::temp_dir().join(format!("bmux-retained-{}.sock", Uuid::new_v4()));
+        let path = private_socket_path();
         let endpoint = IpcEndpoint::unix_socket(path.clone());
         let server = BmuxServer::new(endpoint.clone());
         let sink = ServerWireEventSink {
@@ -4761,7 +4770,9 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn nonreading_socket_terminates_writer_and_releases_admission() {
-        let path = std::env::temp_dir().join(format!("bmux-stall-{}.sock", Uuid::new_v4()));
+        let path = std::path::PathBuf::from("/tmp")
+            .join(format!("bmux-{}", Uuid::new_v4().simple()))
+            .join("ipc.sock");
         let endpoint = IpcEndpoint::UnixSocket(path.clone());
         let listener = LocalIpcListener::bind(&endpoint).unwrap();
         let peer = LocalIpcStream::connect(&endpoint).await.unwrap();

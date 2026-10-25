@@ -1164,7 +1164,7 @@ mod tests {
         // Nix's TMPDIR can be long; keep the socket name short enough for
         // macOS's sockaddr_un rather than appending a UUID to the full path.
         let directory = tempfile::tempdir().unwrap();
-        let endpoint = bmux_ipc::IpcEndpoint::unix_socket(directory.path().join("s"));
+        let endpoint = bmux_ipc::IpcEndpoint::unix_socket(directory.path().join("private/s"));
         let server = BmuxServer::new(endpoint.clone());
         server
             .register_service_handler(
@@ -1304,7 +1304,11 @@ mod tests {
             }
         }
 
-        let path = std::env::temp_dir().join(format!("bmux-overlap-{}.sock", uuid::Uuid::new_v4()));
+        let directory = tempfile::Builder::new()
+            .prefix("bmux-overlap-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let path = directory.path().join("private/s");
         let endpoint = bmux_ipc::IpcEndpoint::unix_socket(path.clone());
         let server = BmuxServer::new(endpoint.clone());
         let authority = Arc::new(Authority {

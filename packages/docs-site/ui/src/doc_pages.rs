@@ -327,6 +327,13 @@ pub static DOC_PAGES: &[DocPage] = &[
         section: TECHNICAL_REFERENCE,
         nav_label: "Stream Protocol",
     },
+    docs_markdown_page! {
+        source: "docs/ipc-security-policy.md",
+        route: "/docs/ipc-security-policy",
+        title: "Local IPC Security Policy",
+        section: TECHNICAL_REFERENCE,
+        nav_label: "IPC Security",
+    },
     // Performance & Operations
     docs_markdown_page! {
         source: "docs/performance-metrics.md",

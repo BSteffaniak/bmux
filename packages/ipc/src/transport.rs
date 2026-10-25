@@ -2,14 +2,16 @@
 #[path = "unix_security.rs"]
 mod unix_security;
 
+#[path = "security_policy.rs"]
+mod security_policy;
+pub use security_policy::{IdentityPolicy, SymlinkPolicy, UnixSecurityPolicy};
+
 use crate::frame::{
     FrameDecodeError, FrameEncodeError, decode_frame_compressed, decode_frame_exact, encode_frame,
     encode_frame_compressed,
 };
 use crate::{Envelope, IpcEndpoint};
 use std::io;
-#[cfg(unix)]
-use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -32,6 +34,8 @@ use tokio::net::windows::named_pipe::{
 #[derive(Debug)]
 pub struct LocalIpcListener {
     inner: ListenerInner,
+    #[cfg(unix)]
+    security: UnixSecurityPolicy,
 }
 
 #[derive(Debug)]
@@ -110,19 +114,43 @@ impl LocalIpcListener {
     /// Returns an error when the endpoint is unsupported on this platform,
     /// its directory is insecure, or the listener cannot be created.
     pub fn bind(endpoint: &IpcEndpoint) -> Result<Self, IpcTransportError> {
+        Self::bind_with_policy(endpoint, UnixSecurityPolicy::strict())
+    }
+
+    /// Bind with explicit Unix policy; other platforms reject non-default policies.
+    ///
+    /// # Errors
+    /// Returns an error for invalid/unsupported policy, insecure paths, or bind failure.
+    pub fn bind_with_policy(
+        endpoint: &IpcEndpoint,
+        policy: UnixSecurityPolicy,
+    ) -> Result<Self, IpcTransportError> {
+        policy.validate()?;
+        #[cfg(not(unix))]
+        if policy != UnixSecurityPolicy::strict() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Unix IPC policy on non-Unix platform",
+            )
+            .into());
+        }
         #[cfg(unix)]
         {
             if let IpcEndpoint::UnixSocket(path) = endpoint {
-                prepare_unix_socket_path(path)?;
+                unix_security::prepare_parent_with_policy(path, policy)?;
                 let listener = tokio::net::UnixListener::bind(path)?;
                 // The validated private parent prevents access before chmod.
                 // Never change the process-wide umask in a multithreaded host.
                 {
                     use std::os::unix::fs::PermissionsExt as _;
-                    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+                    std::fs::set_permissions(
+                        path,
+                        std::fs::Permissions::from_mode(policy.socket_mode),
+                    )?;
                 }
                 return Ok(Self {
                     inner: ListenerInner::Unix(listener),
+                    security: policy,
                 });
             }
         }
@@ -155,7 +183,7 @@ impl LocalIpcListener {
             #[cfg(unix)]
             ListenerInner::Unix(listener) => {
                 let (stream, _) = listener.accept().await?;
-                unix_security::verify_peer(&stream)?;
+                unix_security::verify_peer_with_policy(&stream, self.security.peer)?;
                 Ok(LocalIpcStream {
                     inner: StreamInner::Unix(stream),
                 })
@@ -449,11 +477,30 @@ impl LocalIpcStream {
     // `async` for the cross-platform public API.
     #[allow(clippy::unused_async)]
     pub async fn connect(endpoint: &IpcEndpoint) -> Result<Self, IpcTransportError> {
+        Self::connect_with_policy(endpoint, IdentityPolicy::EffectiveUser).await
+    }
+
+    /// Connect with an explicit peer identity requirement.
+    ///
+    /// # Errors
+    /// Returns errors for failed connections, rejected peers, or unsupported checks.
+    pub async fn connect_with_policy(
+        endpoint: &IpcEndpoint,
+        peer: IdentityPolicy,
+    ) -> Result<Self, IpcTransportError> {
+        #[cfg(not(unix))]
+        if peer != IdentityPolicy::EffectiveUser {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Unix peer policy on non-Unix platform",
+            )
+            .into());
+        }
         #[cfg(unix)]
         {
             if let IpcEndpoint::UnixSocket(path) = endpoint {
                 let stream = tokio::net::UnixStream::connect(path).await?;
-                unix_security::verify_peer(&stream)?;
+                unix_security::verify_peer_with_policy(&stream, peer)?;
                 return Ok(Self {
                     inner: StreamInner::Unix(stream),
                 });
@@ -772,15 +819,9 @@ where
     ))
 }
 
-#[cfg(unix)]
-fn prepare_unix_socket_path(path: &Path) -> Result<(), std::io::Error> {
-    unix_security::prepare_parent(path)?;
-    // Binding owns the name atomically. Never unlink an existing name: a failed
-    // connect is not proof that its listener is dead (backlog, startup and
-    // permission failures are indistinguishable). Explicit recovery belongs to
-    // the caller that can establish exclusive lifecycle ownership.
-    Ok(())
-}
+#[cfg(all(test, unix))]
+#[path = "security_policy_tests.rs"]
+mod security_policy_tests;
 
 #[cfg(test)]
 mod tests {
