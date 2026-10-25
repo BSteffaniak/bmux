@@ -394,7 +394,9 @@ impl BrowserFrame {
                 area,
             )?;
         }
-        if count == 0 || count > limits.cells || self.buffer.cells().len() != count {
+        // Empty grids represent a committed hidden/zero-sized viewport. They
+        // carry no cells or visible interaction, rather than inventing a cell.
+        if count > limits.cells || self.buffer.cells().len() != count {
             return Err(DecodeError::Invalid("cell dimensions"));
         }
         for (index, cell) in self.buffer.cells().iter().enumerate() {

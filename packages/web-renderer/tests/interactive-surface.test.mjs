@@ -410,6 +410,72 @@ test('semantic projection preserves producer IDs/order/state and suppresses sens
   f.handle.setSemanticMetadata(scene); assert.equal(f.container.children.length, 1);
 });
 
+test('release outside committed cells cancels instead of activating last mapped target', () => {
+  let inside = true;
+  const f = fixture({mapPoint: () => inside ? {x:1,y:0} : null});
+  f.canvas.fire('pointerdown', pointer()); inside = false;
+  f.canvas.fire('pointerup', pointer({buttons:0}));
+  assert.deepEqual(commands(f).map(e => e.action), ['down','cancel']);
+  assert.equal(f.canvas.captures.size, 0); f.handle.dispose();
+});
+
+test('single shared mouse gesture ignores competing pointers', () => {
+  const f = fixture();
+  f.canvas.fire('pointerdown', pointer());
+  f.canvas.fire('pointerdown', pointer({pointerId:2}));
+  f.canvas.fire('pointerup', pointer({pointerId:2,buttons:0}));
+  assert.deepEqual(commands(f).map(e => e.action), ['down']);
+  f.canvas.fire('pointerup', pointer({buttons:0}));
+  assert.deepEqual(commands(f).map(e => e.action), ['down','up']); f.handle.dispose();
+});
+
+test('zero-size embeds cancel captures and never invoke coordinate mapping', () => {
+  const f = fixture(); f.canvas.fire('pointerdown', pointer());
+  const before = f.points.length;
+  f.canvas.rect.width = 0; f.handle.resize();
+  assert.equal(commands(f).at(-1).action, 'cancel');
+  f.canvas.fire('pointerdown', pointer());
+  f.canvas.fire('wheel', {clientX:20,clientY:30,deltaX:0,deltaY:1});
+  assert.equal(f.points.length, before);
+  f.canvas.rect.width = 400; f.handle.resize();
+  f.canvas.fire('pointerdown', pointer());
+  assert.equal(commands(f).at(-1).action, 'down'); f.handle.dispose();
+});
+
+test('one bridge owns a canvas until disposal; failed initial resize releases it', () => {
+  const f = fixture();
+  const options = {container:f.container,canvas:f.canvas,onInput:()=>{},mapPoint:()=>null};
+  assert.throws(() => mountInteractiveSurface(options), /already/);
+  f.handle.dispose();
+  assert.throws(() => mountInteractiveSurface({...options,onResize:()=>{throw Error('resize failure');}}), /resize failure/);
+  assert.equal(f.container.children.length, 1);
+  assert.equal(f.canvas.listenerCount, 0);
+  mountInteractiveSurface(options).dispose();
+});
+
+test('disposal is reentrant and detaches resources before a throwing lifecycle callback', () => {
+  let fail = false;
+  const f = fixture({onInput:()=>{if (fail) throw Error('caller failure');}});
+  f.handle.focus(); f.canvas.fire('pointerdown', pointer()); fail = true;
+  assert.throws(() => f.handle.dispose(), /caller failure/);
+  assert.equal(f.canvas.captures.size, 0);
+  assert.equal(f.container.children.length, 1);
+  for (const target of [f.canvas,f.input,f.window,...f.media]) assert.equal(target.listenerCount, 0);
+  f.handle.dispose();
+});
+
+test('semantic validation bounds text before replacing committed accessibility', () => {
+  const f = fixture();
+  f.handle.setSemanticMetadata({regions:[{id:'ok',accessibility:{label:'Committed'}}]});
+  const previous = f.container.children[2];
+  for (const regions of [[null], [{id:'large',accessibility:{text:'x'.repeat(65537)}}],
+    [{id:'bad',accessibility:{label:{}}}]]) {
+    assert.throws(() => f.handle.setSemanticMetadata({regions}), /bounded/);
+    assert.equal(f.container.children[2], previous);
+  }
+  f.handle.dispose();
+});
+
 test('focus transitions are deduplicated; teardown removes every owned resource and restores tabindex', () => {
   const f = fixture({ tabindex: '7' }); f.canvas.focus();
   assert.equal(f.document.activeElement, f.input);

@@ -1,0 +1,108 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Browser-local custom BMUX component</title>
+<style>
+  body { font: 16px system-ui; background: #ddd; }
+  section { position: relative; width: min(100%, 540px); height: 160px; resize: both; overflow: hidden; border: 1px solid; margin: 12px; }
+  canvas { display: block; width: 100%; height: 100%; touch-action: none; }
+</style>
+<h1>Independent caller-owned counters</h1>
+<p>Click or press Enter to increment. Click the source line and type to append text, or Backspace to edit.
+Drag to select, then explicitly copy.
+Resize either embed, hide/show, or dispose it. No terminal or server connection.</p>
+<button id="hide">Hide/show first</button><button id="dispose">Dispose first</button>
+<button id="remount">Remount first</button>
+<button id="copy">Copy first selection (explicit clipboard capability)</button>
+<pre id="status" role="status"></pre>
+<section><canvas></canvas></section><section><canvas></canvas></section>
+<script type="module">
+import init, { CustomComponent } from './pkg/custom_component.js';
+import { mountInteractiveSurface } from '../browser/interactive-surface.js';
+await init();
+const status = document.querySelector('#status');
+function mount(container, {writeClipboard = text => navigator.clipboard.writeText(text)} = {}) {
+  const canvas = container.querySelector('canvas');
+  const app = new CustomComponent(canvas);
+  let bridge, dead = false, running = false, pendingSize, committed = null;
+  const queue = [];
+  // One mutable WASM call at a time, even while Canvas resource preparation
+  // yields. Bounded FIFO input is not replaced by a latest-frame mailbox.
+  function admit(event) {
+    if (dead) return;
+    if (queue.length >= 64 || (event.text?.length ?? 0) > 4096) {
+      status.textContent = 'Example input budget exhausted; surface detached';
+      dispose();
+      return;
+    }
+    queue.push({event, scene: committed});
+    void pump();
+  }
+  async function pump() {
+    if (running || dead || !bridge) return;
+    running = true;
+    try {
+      while (!dead && (queue.length || pendingSize)) {
+        // Events were mapped at collection time against committed pixels.
+        const events = queue.splice(0, 64);
+        for (const {event, scene} of events) {
+          if (scene !== committed && ['pointer', 'wheel'].includes(event.type)) {
+            app.input(JSON.stringify({type:'pointer', action:'cancel', x:0, y:0, button:0, buttons:0}));
+          } else app.input(JSON.stringify(event));
+        }
+        const size = pendingSize ?? committed;
+        pendingSize = null;
+        if (!size) continue;
+        const columns = Math.min(128, Math.floor(size.width / 10));
+        const rows = Math.min(64, Math.floor(size.height / 20));
+        const dpr = Math.max(.5, Math.min(4, size.device_pixel_ratio));
+        const semantics = JSON.parse(await app.present(columns, rows, dpr));
+        if (dead) break;
+        // This example's interaction geometry depends only on grid size;
+        // focus/text/counter repaints do not invalidate an in-flight gesture.
+        if (!committed || committed.columns !== columns || committed.rows !== rows) {
+          committed = { ...size, columns, rows };
+        }
+        bridge.setSemanticMetadata(semantics);
+        bridge.setAccessibility({label: 'Custom counter and selectable source'});
+      }
+    } catch (error) {
+      status.textContent = String(error);
+      dispose();
+    } finally {
+      running = false;
+      if (dead) app.free();
+    }
+  }
+  bridge = mountInteractiveSurface({container, canvas, onInput: admit,
+    onResize(size) { pendingSize = size; void pump(); },
+    mapPoint(point) {
+      if (!committed || committed.width <= 0 || committed.height <= 0) return null;
+      // Canvas backing pixels stretch with CSS until the next commit. Map to
+      // that displayed grid, never to the requested but undisplayed viewport.
+      const rect = canvas.getBoundingClientRect();
+      const x = Math.floor(point.x * committed.columns / rect.width);
+      const y = Math.floor(point.y * committed.rows / rect.height);
+      return x >= 0 && y >= 0 && x < committed.columns && y < committed.rows ? {x,y} : null;
+    },
+    writeClipboard,
+  });
+  function dispose() {
+    if (dead) return;
+    dead = true; queue.length = 0; pendingSize = null;
+    bridge?.dispose();
+    if (!running) app.free();
+  }
+  void pump();
+  return {dispose, async copy() {
+    if (dead || running || queue.length) throw Error('surface is disposed or busy');
+    await bridge.writeClipboard(app.selectedText());
+  }};
+}
+const roots = [...document.querySelectorAll('section')];
+const embeds = roots.map(root => mount(root));
+document.querySelector('#hide').onclick = () => { roots[0].hidden = !roots[0].hidden; };
+document.querySelector('#dispose').onclick = () => embeds[0].dispose();
+document.querySelector('#remount').onclick = () => { embeds[0].dispose(); embeds[0] = mount(roots[0]); };
+document.querySelector('#copy').onclick = () => embeds[0].copy().catch(error => { status.textContent = String(error); });
+addEventListener('pagehide', () => embeds.forEach(embed => embed.dispose()), {once:true});
+</script>

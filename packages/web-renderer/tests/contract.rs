@@ -17,6 +17,38 @@ use bmux_web_renderer::{
 };
 
 #[test]
+fn empty_viewports_roundtrip_and_replace_visible_metadata() {
+    let mut renderer = Renderer::new(Recording::default(), Limits::default());
+    for (revision, area) in [
+        (1, Rect::new(0, 0, 4, 2)),
+        (2, Rect::new(0, 0, 0, 0)),
+        (3, Rect::new(0, 0, 0, 2)),
+        (4, Rect::new(0, 0, 4, 0)),
+        (5, Rect::new(0, 0, 4, 2)),
+    ] {
+        let state = PresentationState::new(area);
+        let prepared = state
+            .prepare(Damage::Full, |cx| {
+                cx.push_hit(HitRegion::new("visible", Rect::new(0, 0, 1, 1)));
+            })
+            .unwrap();
+        let frame = BrowserFrame::from_prepared(revision, &prepared).unwrap();
+        let decoded = decode_json(&encode_json(&frame).unwrap(), Limits::default()).unwrap();
+        assert_eq!(decoded, frame);
+        let binary = bmux_web_renderer::encode_binary(&frame).unwrap();
+        assert_eq!(
+            bmux_web_renderer::decode_binary(&binary, None).unwrap(),
+            frame
+        );
+        if area.width == 0 || area.height == 0 {
+            assert!(frame.hits().regions().is_empty());
+        }
+        renderer.present(frame).unwrap();
+        assert_eq!(renderer.committed().unwrap().buffer().area(), area);
+    }
+}
+
+#[test]
 fn metadata_availability_is_required_bounded_and_strict_in_v3() {
     use bmux_web_renderer::MetadataKind;
     let state = PresentationState::new(Rect::new(0, 0, 8, 3));

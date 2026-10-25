@@ -210,7 +210,9 @@ impl BrowserBackend for CanvasBackend {
         });
         let mut dirty = vec![previous.is_none(); frame.buffer().cells().len()];
         if let Some(base) = previous {
-            staging_context.draw_image_with_html_canvas_element(&self.canvas, 0.0, 0.0)?;
+            if width != 0 && height != 0 {
+                staging_context.draw_image_with_html_canvas_element(&self.canvas, 0.0, 0.0)?;
+            }
             let columns = usize::from(area.width);
             for (index, cell) in frame.buffer().cells().iter().enumerate() {
                 if base.buffer().cells()[index] != *cell {
@@ -285,10 +287,16 @@ impl BrowserBackend for CanvasBackend {
         if old_height != height {
             self.canvas.set_height(height);
         }
-        if let Err(failure) = self
-            .output
-            .draw_image_with_html_canvas_element(&staging, 0.0, 0.0)
-        {
+        // drawImage rejects a zero-sized source in browsers. Empty output is a
+        // valid committed scene (for example a hidden embed); resizing above
+        // has already cleared the owned backing store and needs no blit.
+        let copied = if width == 0 || height == 0 {
+            Ok(())
+        } else {
+            self.output
+                .draw_image_with_html_canvas_element(&staging, 0.0, 0.0)
+        };
+        if let Err(failure) = copied {
             self.canvas.set_width(old_width);
             self.canvas.set_height(old_height);
             if old_width != 0 && old_height != 0 {
@@ -386,13 +394,6 @@ impl CanvasRenderer {
         cell_width: f64,
         cell_height: f64,
     ) -> Result<CanvasRenderer, JsValue> {
-        if !cell_width.is_finite()
-            || !cell_height.is_finite()
-            || !(1.0..=128.0).contains(&cell_width)
-            || !(1.0..=256.0).contains(&cell_height)
-        {
-            return Err(error("invalid cell metrics"));
-        }
         let document = web_sys::window()
             .and_then(|window| window.document())
             .ok_or_else(|| error("browser document unavailable"))?;
@@ -400,6 +401,24 @@ impl CanvasRenderer {
             .get_element_by_id(canvas_id)
             .ok_or_else(|| error("canvas not found"))?
             .dyn_into()?;
+        Self::from_canvas(canvas, cell_width, cell_height)
+    }
+
+    /// Mount a caller-owned Canvas directly, including in a shadow root or an
+    /// independent embed without a document-global element identifier.
+    #[wasm_bindgen(js_name = fromCanvas)]
+    pub fn from_canvas(
+        canvas: HtmlCanvasElement,
+        cell_width: f64,
+        cell_height: f64,
+    ) -> Result<CanvasRenderer, JsValue> {
+        if !cell_width.is_finite()
+            || !cell_height.is_finite()
+            || !(1.0..=128.0).contains(&cell_width)
+            || !(1.0..=256.0).contains(&cell_height)
+        {
+            return Err(error("invalid cell metrics"));
+        }
         let output = context(&canvas)?;
         Ok(Self {
             resource_bytes: BTreeMap::new(),

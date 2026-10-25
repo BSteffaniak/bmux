@@ -14,6 +14,7 @@
  * caller-owned. Call only after successful presentation, including on resize.
  */
 let nextSurfaceId = 0;
+const mountedCanvases = new WeakSet();
 
 export function mountInteractiveSurface({
   container, canvas, onInput, mapPoint, onResize = () => {},
@@ -22,7 +23,9 @@ export function mountInteractiveSurface({
   if (!container || !canvas || typeof onInput !== 'function' || typeof mapPoint !== 'function') {
     throw new TypeError('container, canvas, onInput and mapPoint are required');
   }
+  if (mountedCanvases.has(canvas)) throw new Error('canvas already has an interactive surface');
   const document = container.ownerDocument;
+  if (canvas.ownerDocument !== document) throw new TypeError('canvas and container must share a document');
   const window = document.defaultView;
   const input = document.createElement('textarea');
   input.setAttribute('data-bmux-input', '');
@@ -46,10 +49,21 @@ export function mountInteractiveSurface({
   // another layout or action router. IDs/order/text/state are producer-owned.
   function setSemanticMetadata({ regions = [] } = {}) {
     if (disposed) return;
+    let textBudget = 1_048_576;
     if (!Array.isArray(regions) || regions.length > 4096 ||
-        regions.some(region => typeof region.id !== 'string') ||
+        regions.some(region => !region || typeof region.id !== 'string' ||
+          region.id.length > 512 || !validSemanticText(region)) ||
         new Set(regions.map(region => region.id)).size !== regions.length) {
-      throw new TypeError('semantic regions require bounded unique string IDs');
+      throw new TypeError('semantic regions require bounded unique string IDs and text');
+    }
+    function validSemanticText(region) {
+      for (const value of [region.id, region.role, region.accessibility?.label,
+        region.accessibility?.description, region.accessibility?.text]) {
+        if (value == null) continue;
+        if (typeof value !== 'string' || value.length > 65_536) return false;
+        textBudget -= value.length;
+      }
+      return textBudget >= 0;
     }
     const host = document.createElement('div');
     host.setAttribute('data-bmux-semantics', '');
@@ -110,11 +124,12 @@ export function mountInteractiveSurface({
     input.value = '';
   }
   function releasePointers() {
-    for (const [id, previous] of pointers) {
-      pointers.delete(id);
-      emit({ ...previous, action: 'cancel', buttons: 0 });
+    const pending = [...pointers];
+    pointers.clear();
+    for (const [id] of pending) {
       if (canvas.hasPointerCapture?.(id)) canvas.releasePointerCapture(id);
     }
+    for (const [, previous] of pending) emit({ ...previous, action: 'cancel', buttons: 0 });
   }
   function setFocused(value) {
     if (focused === value) return;
@@ -206,22 +221,30 @@ export function mountInteractiveSurface({
   });
   function point(event) {
     const rect = canvas.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return null;
     const mapped = mapPoint({ x: event.clientX - rect.left, y: event.clientY - rect.top }, event);
     return mapped && Number.isFinite(mapped.x) && Number.isFinite(mapped.y) ? mapped : null;
   }
   for (const action of ['down', 'up', 'move', 'cancel']) {
     listen(canvas, `pointer${action}`, event => {
       if (disposed) return;
+      // Shared mouse input has one gesture owner. A second finger must not
+      // replace the first pointer's press or complete its activation.
+      if (pointers.size && !pointers.has(event.pointerId)) return;
       const previous = pointers.get(event.pointerId);
-      const mapped = point(event) ?? (previous && { x: previous.x, y: previous.y });
+      const current = point(event);
+      const mapped = current ?? (previous && { x: previous.x, y: previous.y });
       if (!mapped) return;
-      const value = { type: 'pointer', action, x: mapped.x, y: mapped.y,
+      // Releasing outside committed geometry aborts, never activates at the
+      // last in-bounds cell. Retain that point only to deliver cancellation.
+      const routedAction = !current && action === 'up' ? 'cancel' : action;
+      const value = { type: 'pointer', action: routedAction, x: mapped.x, y: mapped.y,
         button: event.button, buttons: event.buttons, ...modifiers(event) };
       if (action === 'down') {
         focus();
         if (disposed) return;
-        pointers.set(event.pointerId, value);
         canvas.setPointerCapture(event.pointerId);
+        pointers.set(event.pointerId, value);
       } else if (action === 'move' && previous) pointers.set(event.pointerId, value);
       else if (action === 'up' || action === 'cancel') {
         pointers.delete(event.pointerId);
@@ -256,7 +279,8 @@ export function mountInteractiveSurface({
       device_pixel_ratio: window.devicePixelRatio || 1 };
     if (lastSize && Object.keys(size).every(key => size[key] === lastSize[key])) return;
     lastSize = size;
-    onResize({ ...size });
+    if (size.width <= 0 || size.height <= 0) releasePointers();
+    if (!disposed) onResize({ ...size });
   }
   function watchDpr() {
     media?.removeEventListener('change', dprChanged);
@@ -268,8 +292,7 @@ export function mountInteractiveSurface({
   const observer = window.ResizeObserver ? new window.ResizeObserver(resize) : null;
   observer?.observe(canvas);
   watchDpr();
-  resize();
-  return {
+  const handle = {
     focus, resize, setSemanticMetadata,
     setAccessibility({ label, description } = {}) {
       if (disposed) return;
@@ -285,18 +308,36 @@ export function mountInteractiveSurface({
     },
     dispose() {
       if (disposed) return;
-      setFocused(false);
-      releasePointers();
+      // Detach before notifying caller code. Reentrant disposal and throwing
+      // callbacks cannot retain DOM resources or dispatch another gesture.
       disposed = true;
+      const cancellations = [...pointers.values()].map(previous => ({
+        ...previous, action: 'cancel', buttons: 0,
+      }));
+      const wasFocused = focused;
+      focused = false;
+      clearEditing();
+      const captured = [...pointers.keys()];
+      pointers.clear();
       for (const remove of removers) remove();
+      for (const id of captured) {
+        if (canvas.hasPointerCapture?.(id)) canvas.releasePointerCapture(id);
+      }
       observer?.disconnect();
       media?.removeEventListener('change', dprChanged);
       input.remove();
       semanticHost?.remove();
       if (oldTabIndex === null) canvas.removeAttribute('tabindex');
       else canvas.setAttribute('tabindex', oldTabIndex);
+      mountedCanvases.delete(canvas);
+      for (const value of cancellations) onInput(value);
+      if (wasFocused) onInput({ type: 'focus', focused: false });
     },
   };
+  mountedCanvases.add(canvas);
+  try { resize(); }
+  catch (error) { handle.dispose(); throw error; }
+  return handle;
 }
 
 function defaultCapturedKey(event) {

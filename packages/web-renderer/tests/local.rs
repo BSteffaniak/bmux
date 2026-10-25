@@ -168,6 +168,59 @@ fn clipped_targets_focus_and_cancel_share_the_committed_scene() {
 }
 
 #[test]
+fn zero_viewport_changes_authority_only_after_commit_and_resumes_independently() {
+    let mut a = surface();
+    let mut b = surface();
+    for surface in [&mut a, &mut b] {
+        surface
+            .present(
+                Damage::Full,
+                |cx| hit(cx, "control", Rect::new(0, 0, 2, 1)),
+                |_| Ok::<_, ()>(()),
+            )
+            .unwrap();
+    }
+    a.resize(Rect::new(0, 0, 0, 0));
+    assert!(
+        a.present(Damage::Full, |_| {}, |_| Err("not displayed"))
+            .is_err()
+    );
+    assert!(
+        a.route(Event::Key(KeyStroke::simple(KeyCode::Enter)))
+            .targets(&HitId::new("control"))
+    );
+    a.present(
+        Damage::Full,
+        |_| {},
+        |frame| {
+            assert!(frame.hits().regions().is_empty());
+            Ok::<_, ()>(())
+        },
+    )
+    .unwrap();
+    assert!(
+        a.route(Event::Key(KeyStroke::simple(KeyCode::Enter)))
+            .target
+            .is_none()
+    );
+    assert!(
+        b.route(Event::Key(KeyStroke::simple(KeyCode::Enter)))
+            .targets(&HitId::new("control"))
+    );
+    a.resize(Rect::new(0, 0, 4, 2));
+    a.present(
+        Damage::Full,
+        |cx| hit(cx, "resumed", Rect::new(0, 0, 2, 1)),
+        |_| Ok::<_, ()>(()),
+    )
+    .unwrap();
+    assert!(
+        a.route(Event::Key(KeyStroke::simple(KeyCode::Enter)))
+            .targets(&HitId::new("resumed"))
+    );
+}
+
+#[test]
 fn nonfinite_and_extreme_coordinates_never_cast_or_overflow() {
     use bmux_web_renderer::input::BrowserModifiers;
     let wheel = |x, delta_x, delta_mode| BrowserInput::Wheel {

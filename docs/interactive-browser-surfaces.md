@@ -75,6 +75,77 @@ No shell, filesystem, backend mutation, clipboard, or navigation authority is
 implied by mounting a surface. Capability access is explicitly supplied by the
 embedding application. Backend authorization remains authoritative.
 
+## Runnable custom component
+
+`packages/web-renderer/examples/custom_component.rs` implements a caller-owned
+counter using the public `Component` trait, retained `LocalSurface`, committed
+focus/hit routing, and logical source-text selection. It has no application-domain
+or terminal dependencies. Its native smoke entry point is runnable directly:
+
+```sh
+bash scripts/dev.sh cargo run -p bmux_web_renderer --example custom_component
+```
+
+For the interactive browser example, build the WASM binary with the locked Rust
+shell, then generate its browser bindings with **wasm-bindgen-cli 0.2.126** (the
+version must match the workspace's wasm-bindgen dependency):
+
+```sh
+# Optional local tool setup; never use a mismatched CLI or a global install.
+bash scripts/dev.sh cargo install --locked --root target/web-tools \
+  --version 0.2.126 wasm-bindgen-cli
+bash scripts/dev.sh bash packages/web-renderer/tests/build-custom-component.sh
+BMUX_CUSTOM_BROWSER_TEST=1 CHROMIUM_BIN=/absolute/path/to/chromium \
+  node --test packages/web-renderer/tests/custom-component-browser.test.mjs
+```
+
+The build helper verifies the CLI version and generates bindings in ignored
+`target/custom-component-web/pkg`. `BMUX_WASM_BINDGEN` can select another exact
+0.2.126 executable. For manual browsing, generate bindings into `examples/pkg`
+instead (build output only), then serve the source directory:
+
+```sh
+bash scripts/dev.sh bash -c 'target/web-tools/bin/wasm-bindgen --target web \
+  --out-dir packages/web-renderer/examples/pkg \
+  "$CARGO_TARGET_DIR/wasm32-unknown-unknown/debug/examples/custom_component.wasm"'
+python3 -m http.server 8000 --directory packages/web-renderer
+```
+
+Open `http://localhost:8000/examples/custom-component.html`. Each embed has its own
+Rust state, Canvas, input bridge, selection controller, and bounded FIFO (64
+pending events). Click/Enter increments; click the source line and type to append
+UTF-8 text or Backspace to remove the last scalar. This deliberately small editor
+is not a full grapheme-aware text control. Dragging selects logical source text,
+and the explicit copy button calls the supplied clipboard capability. Resize,
+hide/show, dispose, and remount exercise lifecycle transitions. The host serializes mutable
+WASM calls, coalesces resize requests, cancels pointer input queued against a
+superseded scene, and frees WASM only after an in-flight presentation settles.
+Queue exhaustion disconnects visibly rather than dropping a submission silently.
+Generated `examples/pkg` files are build output, not source.
+
+## Embedding lifecycle and budgets
+
+`CanvasRenderer::from_canvas` (`fromCanvas` in generated JS) accepts a caller-owned
+Canvas element, including one in a shadow root, without document-global IDs. The
+existing ID constructor and read-only viewers retain their behavior. Metrics are
+physical pixels; the host owns CSS size, cell size, and bounded DPR policy. Empty
+viewports are valid committed scenes and must not blit a zero-sized Canvas source.
+A resize notification alone never authorizes new hit geometry.
+
+Mount at most one interactive bridge per Canvas; dispose it before remounting.
+Competing pointers cannot replace the single shared mouse gesture. Releases
+outside the caller's committed mapping cancel instead of activating the last
+in-bounds target. Zero-size transitions cancel capture and suppress point mapping.
+Disposal detaches listeners, observers, pointer capture, and semantic DOM before
+notifying application callbacks, so even a throwing callback cannot retain those
+resources. Disposal is idempotent; pending application effects remain caller-owned.
+
+Semantic replacement validates IDs and text before changing the DOM (4096 regions,
+512 UTF-16 units per ID, 65536 per string, 1048576 aggregate units). It projects
+explicit committed accessibility only, suppresses sensitive text, and grants no
+semantic-action or clipboard authority. A native screen-reader acceptance audit is
+still required; this is not a claim of full accessibility or mobile IME parity.
+
 ## Validation
 
 Run Rust commands with the repository's Nix-selected toolchain:
@@ -86,6 +157,14 @@ node --test packages/web-renderer/tests/interactive-surface.test.mjs
 BMUX_INTERACTIVE_BROWSER_TEST=1 CHROMIUM_BIN=/absolute/path/to/chromium \
   node --test packages/web-renderer/tests/interactive-surface.test.mjs
 ```
+
+The standalone harness builds actual Rust/WASM and drives Chromium through its
+DevTools input path: independent counters, native UTF-8 insertion/Backspace,
+Canvas pixels, logical source selection and explicit copy callback, zero/tiny
+resize recovery, DPR 2, disposal/remount, and denied clipboard capability. The
+injected test access exposes only the example's existing caller-owned controls;
+it does not replace WASM, Canvas, routing, or application state. Clipboard denial
+is an injected capability rejection, not an OS permission-dialog acceptance test.
 
 The real-browser bridge case covers native text editing, composition event
 collection, independent embeds, resize, and cleanup. It does not itself prove
