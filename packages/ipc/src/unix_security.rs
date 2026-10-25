@@ -40,6 +40,15 @@ pub(super) fn prepare_parent_with_policy(
 }
 
 fn prepare_parent_checked(path: &Path, policy: UnixSecurityPolicy) -> io::Result<()> {
+    // mode_t is u16 on macOS and u32 on Linux. Keep the conversion checked
+    // on narrower targets; it is intentionally an identity conversion on Linux.
+    #[allow(clippy::useless_conversion)]
+    let directory_mode = libc::mode_t::try_from(policy.directory_mode).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "IPC directory mode exceeds platform mode_t",
+        )
+    })?;
     let absolute = std::env::current_dir()?.join(path);
     let parent = absolute.parent().ok_or_else(denied)?;
     let components: Vec<_> = parent.components().collect();
@@ -54,7 +63,7 @@ fn prepare_parent_checked(path: &Path, policy: UnixSecurityPolicy) -> io::Result
         let last = index == components.len() - 1;
         // SAFETY: the directory descriptor and NUL-terminated name are valid.
         let created = if policy.create_parents {
-            unsafe { libc::mkdirat(directory.as_raw_fd(), name.as_ptr(), policy.directory_mode) }
+            unsafe { libc::mkdirat(directory.as_raw_fd(), name.as_ptr(), directory_mode) }
         } else {
             0
         };
