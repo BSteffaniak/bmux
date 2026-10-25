@@ -86,6 +86,25 @@ pub struct ConfigOptions {
 #[serde(default, deny_unknown_fields)]
 pub struct NativeConfiguration {
     pub window: WindowConfiguration,
+    pub companion: CompanionConfiguration,
+}
+
+/// Managed server policy, not native window presentation. This policy is part
+/// of target identity so callers with different lifetimes never share a target.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct CompanionConfiguration {
+    /// Idle grace period in seconds. Zero disables automatic idle retirement.
+    /// Outstanding execution/recovery authority still prevents retirement.
+    pub idle_after_seconds: u64,
+}
+
+impl Default for CompanionConfiguration {
+    fn default() -> Self {
+        Self {
+            idle_after_seconds: 900,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -130,6 +149,9 @@ pub struct ResolvedConfiguration {
     pub native: NativeConfiguration,
     pub bmux_toml: String,
     pub generation: String,
+    /// Effective companion configuration only; native presentation and source
+    /// provenance are deliberately excluded. Computed before target path routing.
+    pub runtime_configuration_id: String,
     pub sources: Vec<SourceProvenance>,
     pub resolution: serde_json::Value,
     pub inputs: ConfigInputs,
@@ -253,18 +275,14 @@ impl ConfigInputs {
         )
     }
 
-    /// Resolve captured documents with the shared BMUX composition/merge engine.
-    ///
-    /// The current shared resolver retains ambient auto-profile/path-token
-    /// evaluation. File discovery is captured; deterministic evaluation awaits
-    /// its explicit evaluation-context entry point. Do not claim this result is
-    /// environment-isolated until that shared API is wired here.
+    /// Resolve captured documents using the shared merge engine and an explicit
+    /// evaluation context. No ambient environment or working-directory reads.
     pub fn resolve(&self) -> Result<ResolvedConfiguration> {
         let context = bmux_config::ConfigEvaluationContext {
             cwd: Some(self.cwd.clone()),
             environment: self.environment.clone(),
         };
-        let resolved = bmux_config::resolve_application_configuration_with_context(
+        let mut resolved = bmux_config::resolve_application_configuration_with_context(
             &self.bterm,
             &self.bmux,
             self.options.forced_profile.as_deref(),
@@ -275,6 +293,24 @@ impl ConfigInputs {
             resolved.application.clone().try_into().map_err(|_| {
                 anyhow::anyhow!("invalid [bterm] configuration (source values redacted)")
             })?;
+        // Match CLI startup precedence, but use only the captured environment.
+        // Pin before snapshotting and hashing so a later ambient SHELL cannot
+        // change server behavior while retaining the same managed target ID.
+        if resolved
+            .bmux
+            .general
+            .default_shell
+            .as_ref()
+            .is_none_or(|shell| shell.trim().is_empty())
+        {
+            let shell = self
+                .environment
+                .get("SHELL")
+                .and_then(|shell| shell.to_str())
+                .filter(|shell| !shell.trim().is_empty())
+                .unwrap_or(if cfg!(windows) { "cmd.exe" } else { "/bin/sh" });
+            resolved.bmux.general.default_shell = Some(shell.to_owned());
+        }
         // Pin the complete effective BMUX configuration so companion-side legacy
         // primary/state layers cannot reintroduce values omitted from a sparse
         // source document. Composition has already resolved exactly once.
@@ -295,6 +331,16 @@ impl ConfigInputs {
                 });
             }
         }
+        let mut runtime_fingerprint = Sha256::new();
+        runtime_fingerprint.update(b"bterm-runtime-configuration-v2\0");
+        // Length-delimited components prevent ambiguous concatenations. Native
+        // companion policy affects the server; window presentation does not.
+        let snapshot_length =
+            u64::try_from(bmux_toml.len()).context("captured BMUX configuration is too large")?;
+        runtime_fingerprint.update(snapshot_length.to_be_bytes());
+        runtime_fingerprint.update(bmux_toml.as_bytes());
+        runtime_fingerprint.update(serde_json::to_vec(&native.companion)?);
+        let runtime_configuration_id = hex(&runtime_fingerprint.finalize());
         let mut fingerprint = Sha256::new();
         fingerprint.update(b"bterm-configuration-v1\0");
         fingerprint.update(bmux_toml.as_bytes());
@@ -313,6 +359,7 @@ impl ConfigInputs {
             native,
             bmux_toml,
             generation: hex(&fingerprint.finalize()),
+            runtime_configuration_id,
             sources,
             inputs: self.clone(),
         })
@@ -325,6 +372,7 @@ impl ResolvedConfiguration {
     pub fn effective_json(&self) -> serde_json::Value {
         serde_json::json!({
             "generation": self.generation,
+            "runtime_configuration_id": self.runtime_configuration_id,
             "bterm": self.native,
             "bmux": "[redacted: private configuration]",
             "sources": self.sources,

@@ -47,6 +47,7 @@ pub struct BmuxSnapshotOrchestrator {
     path: Option<PathBuf>,
     dirty_flag: Arc<SnapshotDirtyFlag>,
     stateful_registry: Arc<RwLock<StatefulPluginRegistry>>,
+    managed_catalog: Option<crate::managed_catalog::ManagedCatalog>,
     status: Mutex<Status>,
     // Serializes collection and replacement, not just file IO. Once finalized,
     // no writer may observe host teardown state or reopen persistence.
@@ -65,6 +66,7 @@ impl BmuxSnapshotOrchestrator {
     ) -> Self {
         let writes_allowed = path.is_none();
         Self {
+            managed_catalog: None,
             path,
             dirty_flag,
             stateful_registry,
@@ -100,6 +102,17 @@ impl BmuxSnapshotOrchestrator {
         Ok(())
     }
 
+    pub(crate) fn with_managed_catalog(
+        mut self,
+        catalog: Option<crate::managed_catalog::ManagedCatalog>,
+    ) -> Self {
+        if let Some(catalog) = &catalog {
+            self.path = Some(catalog.path().to_path_buf());
+        }
+        self.managed_catalog = catalog;
+        self
+    }
+
     /// Synchronous variant of `save_now()` for the debounce-flush
     /// background thread. Returns the written path (or `None` if
     /// persistence is disabled) / a `SnapshotOrchestratorError`.
@@ -125,7 +138,11 @@ impl BmuxSnapshotOrchestrator {
         }
         let sections = self.collect_sections()?;
         let envelope = CombinedSnapshotEnvelope::build(sections)?;
-        write_envelope_atomic(&path, &envelope)?;
+        if let Some(catalog) = &self.managed_catalog {
+            catalog.save(&envelope)?;
+        } else {
+            write_envelope_atomic(&path, &envelope)?;
+        }
         if let Err(error) = bmux_plugin::shutdown_progress().advance("snapshot persisted") {
             warn!(%error, "shutdown progress publication failed");
         }
@@ -218,6 +235,9 @@ impl BmuxSnapshotOrchestrator {
         let Some(path) = self.path.as_ref() else {
             return Err(SnapshotOrchestratorError::Disabled);
         };
+        if let Some(catalog) = &self.managed_catalog {
+            return catalog.load();
+        }
         match std::fs::read(path) {
             Ok(bytes) => {
                 let envelope: CombinedSnapshotEnvelope = serde_json::from_slice(&bytes)
@@ -268,6 +288,15 @@ impl BmuxSnapshotOrchestrator {
         let mut restored = 0usize;
         let mut failed = 0usize;
         for id in restore_order {
+            // These participants already own shared durable arrangements and
+            // catalogs. A historical per-target projection is not authority to
+            // replace newer installation-wide state. Keep their live durable
+            // authority, while still satisfying dependencies of runtime layout.
+            if self.managed_catalog.is_some() && is_shared_durable_section(&id) {
+                sections.remove(&id);
+                restored_ids.insert(id);
+                continue;
+            }
             let participant = registered[&id];
             let dependencies = participant
                 .as_dyn()
@@ -478,13 +507,22 @@ impl SnapshotOrchestrator for BmuxSnapshotOrchestrator {
                 Ok(DryRunReport {
                     ok: true,
                     message: format!(
-                        "{section_count} sections, {validated} registered payloads validated: [{ids}]"
+                        "{section_count} sections, {validated} registered payloads validated: [{ids}]{}",
+                        if let Some(catalog) = &self.managed_catalog {
+                            format!("; {}", catalog.discovery()?)
+                        } else {
+                            String::new()
+                        },
                     ),
                 })
             }
             None => Ok(DryRunReport {
                 ok: false,
-                message: "no snapshot file on disk".into(),
+                message: if let Some(catalog) = &self.managed_catalog {
+                    catalog.discovery()?
+                } else {
+                    "no snapshot file on disk".into()
+                },
             }),
         }
     }
@@ -520,7 +558,15 @@ impl SnapshotOrchestrator for BmuxSnapshotOrchestrator {
     fn status(&self) -> SnapshotStatusReport {
         let enabled = self.path.is_some();
         let path_display = self.path.as_ref().map(|p| p.display().to_string());
-        let snapshot_exists = self.path.as_ref().is_some_and(|p| p.exists());
+        let managed_observation = self
+            .managed_catalog
+            .as_ref()
+            .map(crate::managed_catalog::ManagedCatalog::load);
+        let snapshot_exists = if let Some(observation) = &managed_observation {
+            observation.as_ref().is_ok_and(Option::is_some)
+        } else {
+            self.path.as_ref().is_some_and(|path| path.exists())
+        };
         let (last_write, last_restore, last_err) = self
             .status
             .lock()
@@ -538,51 +584,54 @@ impl SnapshotOrchestrator for BmuxSnapshotOrchestrator {
             snapshot_exists,
             last_write_epoch_ms: last_write,
             last_restore_epoch_ms: last_restore,
-            last_restore_error: last_err,
+            last_restore_error: managed_observation
+                .and_then(Result::err)
+                .map(|error| format!("snapshot catalog unavailable: {error}"))
+                .or(last_err),
         }
     }
 }
 
-/// Atomic file write: write to `.tmp`, fsync, rename over `path`,
-/// fsync parent dir. Same pattern the legacy `SnapshotManager` used.
+// Shared durable authorities are read by their owning plugins, not rolled back
+// from an older runtime projection during managed startup.
+fn is_shared_durable_section(id: &str) -> bool {
+    matches!(id, "bmux.tabs/arrangements" | "bmux.workspaces/catalog")
+}
+
 fn write_envelope_atomic(
     path: &Path,
     envelope: &CombinedSnapshotEnvelope,
 ) -> SnapshotOrchestratorResult<()> {
     let bytes = serde_json::to_vec_pretty(envelope)
-        .map_err(|e| SnapshotOrchestratorError::Codec(e.to_string()))?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| SnapshotOrchestratorError::Io(e.to_string()))?;
-    }
-    let mut temp_path = path.to_path_buf();
-    let temp_name = path.file_name().map_or_else(
-        || "bmux-snapshot.tmp".to_string(),
-        |name| format!("{}.tmp", name.to_string_lossy()),
-    );
-    temp_path.set_file_name(temp_name);
+        .map_err(|error| SnapshotOrchestratorError::Codec(error.to_string()))?;
+    write_bytes_atomic(path, &bytes)
+}
 
-    let mut temp_file = std::fs::OpenOptions::new()
-        .create(true)
+pub(crate) fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> SnapshotOrchestratorResult<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT_WRITE: AtomicU64 = AtomicU64::new(0);
+    let parent = path
+        .parent()
+        .ok_or_else(|| SnapshotOrchestratorError::Other("snapshot path has no parent".into()))?;
+    std::fs::create_dir_all(parent)
+        .map_err(|error| SnapshotOrchestratorError::Io(error.to_string()))?;
+    let sequence = NEXT_WRITE.fetch_add(1, Ordering::Relaxed);
+    let temp_path = path.with_extension(format!("pending-{}-{sequence}", std::process::id()));
+    let mut file = std::fs::OpenOptions::new()
+        .create_new(true)
         .write(true)
-        .truncate(true)
         .open(&temp_path)
-        .map_err(|e| SnapshotOrchestratorError::Io(e.to_string()))?;
-    temp_file
-        .write_all(&bytes)
-        .map_err(|e| SnapshotOrchestratorError::Io(e.to_string()))?;
-    temp_file
-        .sync_all()
-        .map_err(|e| SnapshotOrchestratorError::Io(e.to_string()))?;
-    std::fs::rename(&temp_path, path).map_err(|e| SnapshotOrchestratorError::Io(e.to_string()))?;
-    if let Some(parent) = path.parent() {
-        let parent_dir = std::fs::File::open(parent)
-            .map_err(|error| SnapshotOrchestratorError::Io(error.to_string()))?;
-        parent_dir
-            .sync_all()
-            .map_err(|error| SnapshotOrchestratorError::Io(error.to_string()))?;
-    }
-    Ok(())
+        .map_err(|error| SnapshotOrchestratorError::Io(error.to_string()))?;
+    // Failed publication leaves explicit recovery evidence; never truncate or
+    // remove another writer's temporary file.
+    file.write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|error| SnapshotOrchestratorError::Io(error.to_string()))?;
+    std::fs::rename(&temp_path, path)
+        .map_err(|error| SnapshotOrchestratorError::Io(error.to_string()))?;
+    std::fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| SnapshotOrchestratorError::Io(error.to_string()))
 }
 
 #[allow(clippy::cast_possible_truncation)]
@@ -638,6 +687,53 @@ mod tests {
             self.restored.lock().unwrap().push(self.id.to_string());
             Ok(())
         }
+    }
+
+    #[test]
+    fn managed_restore_keeps_shared_durable_layout_authority() {
+        let temp = tempfile::tempdir().unwrap();
+        let restored = Arc::new(Mutex::new(Vec::new()));
+        let workspace = PluginEventKind::from_static("bmux.workspaces/catalog");
+        let tabs = PluginEventKind::from_static("bmux.tabs/arrangements");
+        let runtime = PluginEventKind::from_static("test/runtime-layout");
+        let mut registry = StatefulPluginRegistry::new();
+        for (id, dependencies) in [
+            (workspace.clone(), Vec::new()),
+            (tabs.clone(), Vec::new()),
+            (runtime.clone(), vec![workspace.clone()]),
+        ] {
+            registry.push(StatefulPluginHandle::new(OrderedParticipant {
+                id,
+                dependencies,
+                restored: Arc::clone(&restored),
+            }));
+        }
+        let catalog = crate::managed_catalog::ManagedCatalog::new(
+            &temp.path().join("legacy.json"),
+            "a".repeat(64),
+            "{}",
+        )
+        .unwrap();
+        let orchestrator = BmuxSnapshotOrchestrator::new(
+            None,
+            Arc::new(SnapshotDirtyFlag::new()),
+            Arc::new(RwLock::new(registry)),
+        )
+        .with_managed_catalog(Some(catalog));
+        let sections = [workspace, tabs, runtime.clone()]
+            .into_iter()
+            .map(|id| bmux_snapshot_plugin_api::envelope::SectionV1 {
+                id: id.to_string(),
+                version: 1,
+                bytes: Vec::new(),
+            })
+            .collect();
+        let envelope =
+            bmux_snapshot_plugin_api::envelope::CombinedSnapshotEnvelope::build(sections).unwrap();
+        let summary = orchestrator.apply_envelope(envelope).unwrap();
+        assert_eq!(summary.restored_plugins, 1);
+        assert_eq!(summary.failed_plugins, 0);
+        assert_eq!(*restored.lock().unwrap(), vec![runtime.to_string()]);
     }
 
     #[test]

@@ -879,12 +879,7 @@ struct PluginStateKey {
     key: String,
 }
 
-static STORAGE_CACHE: OnceLock<Mutex<BTreeMap<PluginStateKey, Option<Vec<u8>>>>> = OnceLock::new();
 static VOLATILE_STATE: OnceLock<Mutex<BTreeMap<PluginStateKey, Vec<u8>>>> = OnceLock::new();
-
-fn storage_cache() -> &'static Mutex<BTreeMap<PluginStateKey, Option<Vec<u8>>>> {
-    STORAGE_CACHE.get_or_init(|| Mutex::new(BTreeMap::new()))
-}
 
 fn volatile_state() -> &'static Mutex<BTreeMap<PluginStateKey, Vec<u8>>> {
     VOLATILE_STATE.get_or_init(|| Mutex::new(BTreeMap::new()))
@@ -1275,35 +1270,23 @@ fn handle_core_service_call(
             let validate_started = Instant::now();
             validate_storage_key(&request.key)?;
             let validate_us = validate_started.elapsed().as_micros();
-            let cache_key = plugin_state_key(connection, caller_plugin_id, &request.key);
-            let cache_started = Instant::now();
-            let cached = storage_cache()
-                .lock()
-                .ok()
-                .and_then(|cache| cache.get(&cache_key).cloned());
-            let cache_us = cache_started.elapsed().as_micros();
-            let mut fs_us = 0_u128;
-            let cache_hit = cached.is_some();
-            let value = if let Some(value) = cached {
-                value
-            } else {
-                let fs_started = Instant::now();
-                let path = storage_file_path(connection, caller_plugin_id, &request.key);
-                let value = match fs::read(path) {
-                    Ok(bytes) => Some(bytes),
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-                    Err(error) => {
-                        return Err(PluginError::ServiceProtocol {
-                            details: format!("failed reading storage value: {error}"),
-                        });
-                    }
-                };
-                fs_us = fs_started.elapsed().as_micros();
-                if let Ok(mut cache) = storage_cache().lock() {
-                    cache.insert(cache_key, value.clone());
+            // Durable storage is authoritative across independent host processes.
+            // A process-local positive or negative cache cannot be coherent with
+            // domain-owned cross-process mutation transactions.
+            let cache_us = 0_u128;
+            let fs_started = Instant::now();
+            let path = storage_file_path(connection, caller_plugin_id, &request.key);
+            let value = match fs::read(path) {
+                Ok(bytes) => Some(bytes),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => {
+                    return Err(PluginError::ServiceProtocol {
+                        details: format!("failed reading storage value: {error}"),
+                    });
                 }
-                value
             };
+            let fs_us = fs_started.elapsed().as_micros();
+            let cache_hit = false;
             let encode_started = Instant::now();
             let response = encode_service_message(&CoreStorageGetResponse {
                 value: value.clone(),
@@ -1347,14 +1330,7 @@ fn handle_core_service_call(
                 }
             })?;
             let fs_us = fs_started.elapsed().as_micros();
-            let cache_started = Instant::now();
-            if let Ok(mut cache) = storage_cache().lock() {
-                cache.insert(
-                    plugin_state_key(connection, caller_plugin_id, &request.key),
-                    Some(request.value.clone()),
-                );
-            }
-            let cache_us = cache_started.elapsed().as_micros();
+            let cache_us = 0_u128;
             let encode_started = Instant::now();
             let response = encode_service_message(&());
             let encode_us = encode_started.elapsed().as_micros();
@@ -4702,6 +4678,29 @@ minimum = "1.0"
         let response: super::CoreStorageGetResponse =
             decode_service_message(&bytes).expect("get response should decode");
         assert_eq!(response.value, Some(b"sunset".to_vec()));
+
+        // Another host process can commit while this caller stays alive. Both
+        // positive and negative observations must be refreshed from durable IO.
+        let path = super::storage_file_path(&context.connection, "caller.plugin", "theme");
+        for expected in [None, Some(b"other-host".to_vec())] {
+            if let Some(bytes) = &expected {
+                super::write_storage_value(&path, bytes).unwrap();
+            } else {
+                std::fs::remove_file(&path).unwrap();
+            }
+            let response: super::CoreStorageGetResponse = context
+                .call_service(
+                    "bmux.storage",
+                    bmux_plugin_sdk::ServiceKind::Query,
+                    "storage-query/v1",
+                    "get",
+                    &super::CoreStorageGetRequest {
+                        key: "theme".into(),
+                    },
+                )
+                .unwrap();
+            assert_eq!(response.value, expected);
+        }
 
         let _ = std::fs::remove_dir_all(storage_root);
     }

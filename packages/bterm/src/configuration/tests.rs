@@ -27,6 +27,295 @@ fn inputs() -> ConfigInputs {
 }
 
 #[test]
+fn captured_shell_is_pinned_in_config_snapshot_and_runtime_identity() {
+    let mut input = inputs();
+    input
+        .environment
+        .insert("SHELL".to_owned(), OsString::from("/captured/shell-a"));
+    let first = input.resolve().unwrap();
+    assert_eq!(
+        first.bmux.general.default_shell.as_deref(),
+        Some("/captured/shell-a")
+    );
+    let snapshot: toml::Value = toml::from_str(&first.bmux_toml).unwrap();
+    assert_eq!(
+        snapshot["general"]["default_shell"].as_str(),
+        Some("/captured/shell-a")
+    );
+    // Resolution always uses the saved capture, not the caller's live SHELL.
+    assert_eq!(
+        first.runtime_configuration_id,
+        input.resolve().unwrap().runtime_configuration_id
+    );
+    input
+        .environment
+        .insert("SHELL".to_owned(), OsString::from("/captured/shell-b"));
+    let second = input.resolve().unwrap();
+    assert_ne!(
+        first.runtime_configuration_id,
+        second.runtime_configuration_id
+    );
+    assert_ne!(first.generation, second.generation);
+    let snapshot: toml::Value = toml::from_str(&second.bmux_toml).unwrap();
+    assert_eq!(
+        snapshot["general"]["default_shell"].as_str(),
+        Some("/captured/shell-b")
+    );
+}
+
+#[test]
+fn configured_shell_takes_precedence_over_captured_environment() {
+    let mut input = inputs();
+    input.bterm = family(
+        "/bterm.toml",
+        "[general]\ndefault_shell = '/configured/shell'\n",
+    );
+    input
+        .environment
+        .insert("SHELL".to_owned(), OsString::from("/captured/shell-a"));
+    let first = input.resolve().unwrap();
+    input
+        .environment
+        .insert("SHELL".to_owned(), OsString::from("/captured/shell-b"));
+    let second = input.resolve().unwrap();
+    assert_eq!(
+        first.bmux.general.default_shell.as_deref(),
+        Some("/configured/shell")
+    );
+    assert_eq!(first.bmux_toml, second.bmux_toml);
+    assert_eq!(
+        first.runtime_configuration_id,
+        second.runtime_configuration_id
+    );
+    let snapshot: toml::Value = toml::from_str(&first.bmux_toml).unwrap();
+    assert_eq!(
+        snapshot["general"]["default_shell"].as_str(),
+        Some("/configured/shell")
+    );
+}
+
+#[test]
+fn blank_shells_use_captured_environment_then_platform_fallback() {
+    let fallback = if cfg!(windows) { "cmd.exe" } else { "/bin/sh" };
+    let mut input = inputs();
+    for configured in ["", "[general]\ndefault_shell = '   '\n"] {
+        input.bterm = family("/bterm.toml", configured);
+        for captured in [None, Some(""), Some("   ")] {
+            input.environment.remove("SHELL");
+            if let Some(shell) = captured {
+                input
+                    .environment
+                    .insert("SHELL".to_owned(), OsString::from(shell));
+            }
+            let resolved = input.resolve().unwrap();
+            assert_eq!(
+                resolved.bmux.general.default_shell.as_deref(),
+                Some(fallback)
+            );
+            let snapshot: toml::Value = toml::from_str(&resolved.bmux_toml).unwrap();
+            assert_eq!(
+                snapshot["general"]["default_shell"].as_str(),
+                Some(fallback)
+            );
+        }
+        input
+            .environment
+            .insert("SHELL".to_owned(), OsString::from("/captured/shell"));
+        assert_eq!(
+            input
+                .resolve()
+                .unwrap()
+                .bmux
+                .general
+                .default_shell
+                .as_deref(),
+            Some("/captured/shell")
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn non_utf8_captured_shell_uses_platform_fallback() {
+    use std::os::unix::ffi::OsStringExt as _;
+    let mut input = inputs();
+    input
+        .environment
+        .insert("SHELL".to_owned(), OsString::from_vec(vec![0xff]));
+    assert_eq!(
+        input
+            .resolve()
+            .unwrap()
+            .bmux
+            .general
+            .default_shell
+            .as_deref(),
+        Some("/bin/sh")
+    );
+}
+
+#[test]
+fn companion_idle_policy_defaults_and_zero_disables() {
+    let mut input = inputs();
+    let default = input.resolve().unwrap();
+    assert_eq!(default.native.companion.idle_after_seconds, 900);
+    assert_eq!(
+        NativeConfiguration::default().companion.idle_after_seconds,
+        900
+    );
+    input.bterm = family("/bterm.toml", "[bterm.companion]\n");
+    assert_eq!(
+        input.resolve().unwrap().native.companion.idle_after_seconds,
+        900
+    );
+    input.bterm = family("/bterm.toml", "[bterm.companion]\nidle_after_seconds = 0\n");
+    let disabled = input.resolve().unwrap();
+    assert_eq!(disabled.native.companion.idle_after_seconds, 0);
+    assert_eq!(
+        disabled.effective_json()["bterm"]["companion"]["idle_after_seconds"],
+        0
+    );
+    assert!(!disabled.bmux_toml.contains("idle_after_seconds"));
+}
+
+#[test]
+fn companion_policy_changes_runtime_identity_but_window_presentation_does_not() {
+    let mut input = inputs();
+    let default = input.resolve().unwrap();
+    input.bterm = family(
+        "/bterm.toml",
+        "[bterm.companion]\nidle_after_seconds = 900\n",
+    );
+    let explicit_default = input.resolve().unwrap();
+    assert_eq!(
+        default.runtime_configuration_id,
+        explicit_default.runtime_configuration_id
+    );
+    for seconds in [0, 1, 60, 901] {
+        input.bterm = family(
+            "/bterm.toml",
+            &format!("[bterm.companion]\nidle_after_seconds = {seconds}\n"),
+        );
+        let configured = input.resolve().unwrap();
+        assert_ne!(
+            default.runtime_configuration_id,
+            configured.runtime_configuration_id
+        );
+        assert_ne!(default.generation, configured.generation);
+        input.bterm = family(
+            "/bterm.toml",
+            &format!(
+                "[bterm.companion]\nidle_after_seconds = {seconds}\n[bterm.window]\ndecorations = false\n"
+            ),
+        );
+        let undecorated = input.resolve().unwrap();
+        assert_eq!(
+            configured.runtime_configuration_id,
+            undecorated.runtime_configuration_id
+        );
+        assert_eq!(configured.bmux_toml, undecorated.bmux_toml);
+    }
+}
+
+#[test]
+fn companion_policy_rejects_invalid_types_and_unknown_keys() {
+    let mut input = inputs();
+    for value in ["-1", "1.5", "true", "'900'", "[]", "{}"] {
+        input.bterm = family(
+            "/invalid.toml",
+            &format!("[bterm.companion]\nidle_after_seconds = {value}\n"),
+        );
+        assert!(
+            input.resolve().is_err(),
+            "accepted invalid idle policy {value}"
+        );
+    }
+    input.bterm = family(
+        "/invalid.toml",
+        "[bterm.companion]\nidle_after_second = 900\n",
+    );
+    assert!(input.resolve().is_err());
+    input.bterm = family("/invalid.toml", "[bterm]\ncompanion = false\n");
+    assert!(input.resolve().is_err());
+}
+
+#[test]
+fn companion_policy_uses_bterm_family_not_host_bmux_native_settings() {
+    let mut input = inputs();
+    input.bterm = family(
+        "/bterm.toml",
+        "[bterm.companion]\nidle_after_seconds = 42\n",
+    );
+    input.bmux = family("/bmux.toml", "[bterm.companion]\nidle_after_seconds = 1\n");
+    assert_eq!(
+        input.resolve().unwrap().native.companion.idle_after_seconds,
+        42
+    );
+}
+
+#[test]
+fn companion_policy_serializes_and_round_trips_as_u64() {
+    let configured = NativeConfiguration {
+        companion: CompanionConfiguration {
+            idle_after_seconds: u64::MAX,
+        },
+        ..NativeConfiguration::default()
+    };
+    let encoded = serde_json::to_value(&configured).unwrap();
+    assert_eq!(
+        encoded["companion"]["idle_after_seconds"].as_u64(),
+        Some(u64::MAX)
+    );
+    assert_eq!(
+        serde_json::from_value::<NativeConfiguration>(encoded).unwrap(),
+        configured
+    );
+}
+
+#[test]
+fn runtime_configuration_excludes_presentation_and_source_provenance() {
+    let mut input = inputs();
+    input.bterm = family(
+        "/first.toml",
+        "[general]\nscrollback_limit = 111\n[bterm.window]\ndecorations = false\n",
+    );
+    let first = input.resolve().unwrap();
+    input.bterm = family(
+        "/second.toml",
+        "[general]\nscrollback_limit = 111\n[bterm.window]\ndecorations = true\n",
+    );
+    let second = input.resolve().unwrap();
+    assert_ne!(first.generation, second.generation);
+    assert_eq!(
+        first.runtime_configuration_id,
+        second.runtime_configuration_id
+    );
+    input.bterm = family("/second.toml", "[general]\nscrollback_limit = 222\n");
+    assert_ne!(
+        first.runtime_configuration_id,
+        input.resolve().unwrap().runtime_configuration_id
+    );
+}
+
+#[test]
+fn resolved_identity_does_not_include_generated_runtime_paths() {
+    let input = inputs();
+    let first = input.resolve().unwrap();
+    let base =
+        crate::runtime_paths::RuntimeRoots::from_root(PathBuf::from("/installation")).unwrap();
+    let target = "a".repeat(64);
+    let _routed = base.for_target(&target).unwrap();
+    // Deriving a transport never mutates captured source configuration or feeds
+    // generated roots into the next resolution's configuration fingerprint.
+    let again = input.resolve().unwrap();
+    assert_eq!(
+        first.runtime_configuration_id,
+        again.runtime_configuration_id
+    );
+    assert_eq!(first.bmux_toml, again.bmux_toml);
+}
+
+#[test]
 fn bmux_overlays_entire_bterm_family_but_not_native_settings() {
     let mut input = inputs();
     input.bterm = family(

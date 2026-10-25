@@ -3,6 +3,8 @@
 pub(crate) enum Observation {
     Absent,
     Starting,
+    /// Admission has closed. Wait for exact target exit; never restart it.
+    Draining,
     Ready,
     Unhealthy {
         owned: bool,
@@ -23,7 +25,7 @@ pub(crate) enum Action {
 pub(crate) fn plan(observed: Observation, repaired: bool) -> Action {
     match observed {
         Observation::Absent => Action::Start,
-        Observation::Starting => Action::Wait,
+        Observation::Starting | Observation::Draining => Action::Wait,
         Observation::Ready => Action::Attach,
         Observation::Unknown(reason) => Action::Refuse(reason),
         Observation::Unhealthy { owned: false, .. } => {
@@ -47,6 +49,8 @@ mod tests {
     fn reconciliation_converges_without_unsafe_or_repeated_restart() {
         assert_eq!(plan(Observation::Absent, false), Action::Start);
         assert_eq!(plan(Observation::Starting, false), Action::Wait);
+        assert_eq!(plan(Observation::Draining, false), Action::Wait);
+        assert_eq!(plan(Observation::Draining, true), Action::Wait);
         for repaired in [false, true] {
             assert_eq!(plan(Observation::Ready, repaired), Action::Attach);
             assert!(matches!(

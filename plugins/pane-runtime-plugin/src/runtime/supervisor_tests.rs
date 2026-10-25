@@ -35,6 +35,7 @@ fn pane_lifetime_close_is_idempotent_and_control_drop_closes_lease() {
     use std::os::unix::net::UnixStream;
     fn control(socket: UnixStream) -> super::SupervisorControl {
         super::SupervisorControl {
+            _admission: crate::runtime::managed_idle::admit().unwrap(),
             directory: std::path::PathBuf::new(),
             token: "test".into(),
             authentication: "test".into(),

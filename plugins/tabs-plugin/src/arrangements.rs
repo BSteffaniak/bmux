@@ -103,9 +103,7 @@ pub fn write(
 pub fn activate(context: &NativeLifecycleContext) -> Result<(), String> {
     let caller = TypedServiceCaller::from_lifecycle_context(context);
     {
-        let _guard = TAB_ORDER_MUTATION
-            .lock()
-            .map_err(|_| "tab order lock poisoned")?;
+        let _guard = TAB_ORDER_MUTATION.lock()?;
         if read(&caller)?.is_none() {
             let root =
                 std::path::Path::new(&context.connection.data_dir).join("plugin-storage/bmux.tabs");
@@ -183,9 +181,9 @@ impl StatefulPlugin for Arrangements {
         let _guard =
             TAB_ORDER_MUTATION
                 .lock()
-                .map_err(|_| StatefulPluginError::SnapshotFailed {
+                .map_err(|details| StatefulPluginError::SnapshotFailed {
                     plugin: ID.as_str().into(),
-                    details: "tab order lock poisoned".into(),
+                    details,
                 })?;
         let orders = read_state(&self.caller)
             .and_then(|value| value.ok_or_else(|| "arrangement authority missing".into()))
@@ -218,9 +216,7 @@ impl StatefulPlugin for Arrangements {
     fn restore_snapshot(&self, snapshot: StatefulPluginSnapshot) -> StatefulPluginResult<()> {
         self.validate_snapshot(&snapshot)?;
         let restore = || -> Result<(), String> {
-            let guard = TAB_ORDER_MUTATION
-                .lock()
-                .map_err(|_| "tab order lock poisoned")?;
+            let guard = TAB_ORDER_MUTATION.lock()?;
             write_state(&self.caller, &snapshot_state(&snapshot)?)?;
             drop(guard);
             super::recover_tab_placements(&self.caller)?;

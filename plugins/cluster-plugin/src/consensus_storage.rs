@@ -241,9 +241,12 @@ impl ConsensusLogStore {
             .join("consensus")
             .join(cluster_id);
         fs::create_dir_all(directory.join("snapshots"))?;
-        recover_snapshot_publication(&directory)?;
         let database_path = directory.join(CONSENSUS_DB_FILE);
+        // redb's exclusive database ownership is the cluster history writer
+        // authority. Claim it BEFORE filesystem recovery: another companion may
+        // already own this node, even though its IPC/transport scope differs.
         let database = Arc::new(Database::create(&database_path).map_err(redb::Error::from)?);
+        recover_snapshot_publication(&directory)?;
         initialize_metadata(&database, cluster_id)?;
         reconcile_snapshot_manifest(&directory, &database)?;
         Ok(Self {
@@ -1824,6 +1827,28 @@ mod tests {
                 ConsensusLogStore::open_for_suite(root.path()).map_err(storage_write_error)?;
             Ok((root, store, state_machine))
         }
+    }
+
+    #[test]
+    fn second_history_writer_cannot_mutate_snapshot_recovery_files() {
+        let root = TempDir::new().unwrap();
+        let owner = ConsensusLogStore::open(root.path(), "owned-cluster").unwrap();
+        let pending = owner
+            .database_path()
+            .parent()
+            .unwrap()
+            .join(format!("{SNAPSHOT_INSTALL_MANIFEST}.tmp"));
+        std::fs::write(&pending, b"retained owner publication").unwrap();
+        assert!(ConsensusLogStore::open(root.path(), "owned-cluster").is_err());
+        assert_eq!(
+            std::fs::read(&pending).unwrap(),
+            b"retained owner publication"
+        );
+        drop(owner);
+        // The next actual owner can complete the interrupted publication cleanup.
+        let recovered = ConsensusLogStore::open(root.path(), "owned-cluster").unwrap();
+        assert!(!pending.exists());
+        drop(recovered);
     }
 
     #[test]

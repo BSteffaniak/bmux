@@ -46,6 +46,45 @@ impl Inspection {
                 std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
             }
         }
+        // Managed inspection verifies the same bundle identities as startup;
+        // provide real frontend bytes without launching any companion process.
+        let bundle = root.join("bundle");
+        std::fs::create_dir(&bundle).unwrap();
+        let frontend = bundle.join("bterm");
+        std::fs::copy(env!("CARGO_BIN_EXE_bterm"), &frontend).unwrap();
+        let companion = bundle.join("bmux");
+        std::fs::write(&companion, b"inspection-only companion artifact").unwrap();
+        use sha2::{Digest as _, Sha256};
+        let digest = |path: &Path| {
+            use std::fmt::Write as _;
+            let mut output = String::new();
+            for byte in Sha256::digest(std::fs::read(path).unwrap()) {
+                write!(&mut output, "{byte:02x}").unwrap();
+            }
+            output
+        };
+        let manifest = bterm::compatibility::BundleManifest {
+            schema_version: 1,
+            compatibility_id: bterm::compatibility::COMPATIBILITY_ID.to_owned(),
+            target: bterm::compatibility::native_target(),
+            artifacts: vec![
+                bterm::compatibility::BundleArtifact {
+                    role: "frontend".to_owned(),
+                    path: "bterm".into(),
+                    sha256: digest(&frontend),
+                },
+                bterm::compatibility::BundleArtifact {
+                    role: "companion".to_owned(),
+                    path: "bmux".into(),
+                    sha256: digest(&companion),
+                },
+            ],
+        };
+        std::fs::write(
+            bundle.join(bterm::compatibility::BUNDLE_MANIFEST),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
         Self { root }
     }
 
@@ -57,7 +96,7 @@ impl Inspection {
     }
 
     fn command(&self) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_bterm"));
+        let mut command = Command::new(self.root.join("bundle/bterm"));
         command.env_clear().current_dir(self.root.join("w"));
         for (name, directory) in [
             ("HOME", "h"),
@@ -70,7 +109,7 @@ impl Inspection {
         ] {
             command.env(name, self.root.join(directory));
         }
-        // Inspection must not need any executable discovery, including a companion.
+        // Inspection uses only the selected bundle, never PATH discovery.
         command.env("PATH", self.root.join("w"));
         command
     }

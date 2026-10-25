@@ -129,7 +129,12 @@ fn refresh(workspace: &Path, source: &Path, bundle: &Path, target: &str) -> Resu
     Ok(published)
 }
 
-/// Keep Unix socket paths independent of potentially very long Cargo build roots.
+/// Existing development installation identity, deliberately stable across builds.
+///
+/// This is not a runtime compatibility key: Bterm owns artifact/configuration
+/// routing and short transport paths beneath its selected installation. Keep the
+/// established workspace mapping so rebuilding never silently abandons durable
+/// development data or switches to the canonical installed Bterm's roots.
 fn managed_root(workspace: &Path) -> Result<PathBuf> {
     use sha2::{Digest as _, Sha256};
     let workspace = workspace.canonicalize()?;
@@ -145,21 +150,10 @@ fn managed_root(workspace: &Path) -> Result<PathBuf> {
     if !base.is_absolute() {
         return Err(error("bterm development state base must be absolute"));
     }
-    let root = base.join("bterm-dev").join(identity);
-    // macOS sockaddr_un.sun_path is 104 bytes, including its terminating NUL.
-    // Bterm boot-scopes managed transports using the kernel's full boot UUID.
-    if root
-        .join("run/00000000000000000000000000000000/server.sock")
-        .as_os_str()
-        .as_encoded_bytes()
-        .len()
-        >= 104
-    {
-        return Err(error(
-            "development socket path is too long; set XDG_STATE_HOME to a shorter absolute path",
-        ));
-    }
-    Ok(root)
+    // Do not predict boot IDs, compatibility namespaces, socket suffixes, or
+    // sockaddr limits here. The selected Bterm validates its actual transport
+    // after resolving artifact/configuration/scope identity.
+    Ok(base.join("bterm-dev").join(identity))
 }
 
 /// Exact immutable generation selected by the completed build.
@@ -248,7 +242,7 @@ mod tests {
     #[test]
     fn repeated_refresh_replaces_bundle_and_preserves_state_and_failed_build() {
         let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
-        let temp = tempfile::tempdir().unwrap();
+        let temp = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         let source = temp.path().join("source");
         fs::create_dir(&source).unwrap();
         for name in ["bterm", "bmux", "xtask", "bmux-pane-execution-supervisor"] {
@@ -304,7 +298,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn refuses_symlink_destination() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         let outside = temp.path().join("outside");
         fs::create_dir(&outside).unwrap();
         let bundle = temp.path().join("bundle");

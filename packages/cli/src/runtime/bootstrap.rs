@@ -289,6 +289,13 @@ async fn run_server_start_inner(
 ) -> Result<u8> {
     let local_connection_context = ConnectionContext::new(Some("local"));
     let paths = ConfigPaths::default();
+    // Retain the launcher's inherited startup fence before any endpoint or
+    // plugin work. Dropping closes our copy; never unlock the shared description.
+    let _companion_startup_fence =
+        super::startup_ownership::inherit_companion_startup_fence(&paths, foreground_internal)?;
+    let _managed_executable =
+        super::startup_ownership::attest_managed_executable(foreground_internal)?;
+    let managed_idle_policy = super::managed_companion::ManagedIdlePolicy::capture()?;
     // Directory preparation can only tighten safe default-path permissions; it
     // never grants the launcher endpoint or lifetime-claim mutation authority.
     paths.ensure_runtime_dir()?;
@@ -686,7 +693,28 @@ async fn run_server_start_inner(
     let ownership = startup_ownership
         .as_ref()
         .context("foreground startup has no lifetime claim")?;
-    let mut server_loop = Box::pin(server.run());
+    let managed_idle_caller = managed_idle_policy
+        .as_ref()
+        .map(|_| super::plugin_runtime::managed_companion_caller(&loaded_plugins, &config, &paths))
+        .transpose()?;
+    let (server_ready_tx, server_ready_rx) = tokio::sync::oneshot::channel();
+    let managed_idle = async {
+        if !matches!(server_ready_rx.await, Ok(Ok(()))) {
+            return std::future::pending::<()>().await;
+        }
+        let Some(caller) = managed_idle_caller.as_ref() else {
+            return std::future::pending::<()>().await;
+        };
+        match super::managed_companion::watch(managed_idle_policy, Some(caller)).await {
+            Ok(()) => server.request_shutdown(),
+            Err(error) => {
+                tracing::error!(%error, "managed companion idle watcher disabled; shutdown not authorized");
+            }
+        }
+        std::future::pending::<()>().await;
+    };
+    tokio::pin!(managed_idle);
+    let mut server_loop = Box::pin(server.run_with_readiness(server_ready_tx));
     // The first poll performs synchronous bind. Capture its receipt before any
     // plugin restore await can turn a bound listener into a long startup window.
     let mut owned_server_loop = Box::pin(std::future::poll_fn(|cx| {
@@ -702,6 +730,7 @@ async fn run_server_start_inner(
     let run_result = if loaded_plugins.is_empty() {
         tokio::select! {
             biased;
+            () = &mut managed_idle => unreachable!("idle watcher remains pending after shutdown request"),
             result = &mut owned_server_loop => result,
             result = &mut gateway_loop => result,
         }
@@ -714,6 +743,7 @@ async fn run_server_start_inner(
         );
         tokio::pin!(plugin_bridge);
         tokio::select! {
+            () = &mut managed_idle => unreachable!("idle watcher remains pending after shutdown request"),
             result = &mut owned_server_loop => {
                 let _ = plugin_bridge_shutdown_tx.send(true);
                 result
@@ -832,7 +862,9 @@ fn startup_recording_from_env() -> Result<Option<ManualRecordingStartOptions>> {
 /// snapshot plugin's `activate` callback can read it and construct
 /// its orchestrator. The file name is versioned (`bmux-snapshot-v1.json`)
 /// so the new combined-envelope format never silently overwrites an
-/// older monolithic snapshot.
+/// older monolithic snapshot. Managed targets keep this legacy locator visible
+/// while the snapshot plugin coordinates exact-target entries in a shared durable
+/// catalog beside it; they never restore another target's retained runtime.
 fn register_snapshot_plugin_config(config: &BmuxConfig, paths: &ConfigPaths) {
     use bmux_snapshot_plugin_api::SnapshotPluginConfig;
     if !config.behavior.restore_last_layout {

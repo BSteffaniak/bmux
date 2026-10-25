@@ -1125,16 +1125,76 @@ pub(super) fn registered_plugin_infos_from_registry(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn plugin_lifecycle_context(
+/// Capture an in-process caller for the existing execution service, without a
+/// transport client that could itself affect companion idleness.
+pub(super) fn managed_companion_caller(
+    loaded_plugins: &[bmux_plugin::LoadedPlugin],
+    config: &BmuxConfig,
+    paths: &ConfigPaths,
+) -> Result<bmux_plugin::TypedServiceCaller> {
+    let plugin = loaded_plugins
+        .iter()
+        .find(|plugin| plugin.declaration.id.as_str() == "bmux.pane_runtime")
+        .context("managed companion requires execution lifecycle service")?;
+    let services = service_descriptors_from_declarations(
+        loaded_plugins.iter().map(|plugin| &plugin.declaration),
+    );
+    let capabilities = core_provided_capabilities()
+        .into_iter()
+        .chain(
+            loaded_plugins
+                .iter()
+                .flat_map(|plugin| plugin.declaration.provided_capabilities.iter().cloned()),
+        )
+        .map(|capability| capability.to_string())
+        .collect();
+    let enabled = loaded_plugins
+        .iter()
+        .map(|plugin| plugin.declaration.id.as_str().to_owned())
+        .collect();
+    let roots = resolve_plugin_search_paths(config, paths)?
+        .into_iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect();
+    let context = plugin_lifecycle_context(
+        config,
+        paths,
+        &plugin.declaration,
+        PluginLifecycleAvailability {
+            services,
+            capabilities,
+            enabled_plugins: enabled,
+            search_roots: roots,
+            registered_plugins: registered_plugin_infos_from_loaded(loaded_plugins),
+        },
+    );
+    Ok(bmux_plugin::TypedServiceCaller::from_lifecycle_context(
+        &context,
+    ))
+}
+
+/// Host inventory visible to a plugin during lifecycle dispatch.
+struct PluginLifecycleAvailability {
+    services: Vec<RegisteredService>,
+    capabilities: Vec<String>,
+    enabled_plugins: Vec<String>,
+    search_roots: Vec<String>,
+    registered_plugins: Vec<bmux_plugin_sdk::RegisteredPluginInfo>,
+}
+
+fn plugin_lifecycle_context(
     config: &BmuxConfig,
     paths: &ConfigPaths,
     declaration: &bmux_plugin::PluginDeclaration,
-    available_services: Vec<RegisteredService>,
-    available_capabilities: Vec<String>,
-    enabled_plugins: Vec<String>,
-    plugin_search_roots: Vec<String>,
-    registered_plugins: Vec<bmux_plugin_sdk::RegisteredPluginInfo>,
+    availability: PluginLifecycleAvailability,
 ) -> NativeLifecycleContext {
+    let PluginLifecycleAvailability {
+        services: available_services,
+        capabilities: available_capabilities,
+        enabled_plugins,
+        search_roots: plugin_search_roots,
+        registered_plugins,
+    } = availability;
     let host = plugin_host_for_declaration(declaration, paths, config, available_services.clone());
     NativeLifecycleContext {
         auxiliary_executables: BTreeMap::default(),
@@ -1597,11 +1657,13 @@ pub(super) async fn activate_loaded_plugins(
             config,
             paths,
             &plugin.declaration,
-            available_services.clone(),
-            available_capabilities.clone(),
-            enabled_plugins.clone(),
-            plugin_search_roots.clone(),
-            registered_plugins.clone(),
+            PluginLifecycleAvailability {
+                services: available_services.clone(),
+                capabilities: available_capabilities.clone(),
+                enabled_plugins: enabled_plugins.clone(),
+                search_roots: plugin_search_roots.clone(),
+                registered_plugins: registered_plugins.clone(),
+            },
         );
         let activation_connection_guard = enter_host_kernel_connection(connection_info.clone());
         // `map_or_else` trips `result_large_err` here because plugin activation
@@ -1643,11 +1705,13 @@ pub(super) async fn activate_loaded_plugins(
                     config,
                     paths,
                     &activated_plugin.declaration,
-                    available_services.clone(),
-                    available_capabilities.clone(),
-                    enabled_plugins.clone(),
-                    plugin_search_roots.clone(),
-                    registered_plugins.clone(),
+                    PluginLifecycleAvailability {
+                        services: available_services.clone(),
+                        capabilities: available_capabilities.clone(),
+                        enabled_plugins: enabled_plugins.clone(),
+                        search_roots: plugin_search_roots.clone(),
+                        registered_plugins: registered_plugins.clone(),
+                    },
                 );
                 activated_plugin.drain_background_tasks().await?;
                 let _host_kernel_connection_guard =
@@ -1771,11 +1835,13 @@ pub(super) async fn deactivate_loaded_plugins(
             config,
             paths,
             &plugin.declaration,
-            available_services.clone(),
-            available_capabilities.clone(),
-            enabled_plugins.clone(),
-            plugin_search_roots.clone(),
-            registered_plugins.clone(),
+            PluginLifecycleAvailability {
+                services: available_services.clone(),
+                capabilities: available_capabilities.clone(),
+                enabled_plugins: enabled_plugins.clone(),
+                search_roots: plugin_search_roots.clone(),
+                registered_plugins: registered_plugins.clone(),
+            },
         );
         plugin.drain_background_tasks().await?;
         let _host_kernel_connection_guard = enter_host_kernel_connection(connection_info.clone());
@@ -3412,14 +3478,16 @@ allow_hyphen_values=true
             &config,
             &paths,
             &declaration,
-            service_descriptors_from_declarations([&declaration]),
-            vec![
-                "bmux.commands".to_string(),
-                "example.provider.write".to_string(),
-            ],
-            vec!["example.plugin".to_string()],
-            vec!["/plugins".to_string()],
-            Vec::new(),
+            PluginLifecycleAvailability {
+                services: service_descriptors_from_declarations([&declaration]),
+                capabilities: vec![
+                    "bmux.commands".to_string(),
+                    "example.provider.write".to_string(),
+                ],
+                enabled_plugins: vec!["example.plugin".to_string()],
+                search_roots: vec!["/plugins".to_string()],
+                registered_plugins: Vec::new(),
+            },
         );
         assert_eq!(context.plugin_id, "example.plugin");
         assert_eq!(context.connection.data_dir, "/data");

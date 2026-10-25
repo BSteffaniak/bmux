@@ -11,6 +11,45 @@ use std::sync::{Mutex, OnceLock};
 mod tests;
 
 static INSTALLATION: OnceLock<Mutex<Option<Installation>>> = OnceLock::new();
+static SETTLED: OnceLock<Mutex<std::collections::BTreeSet<String>>> = OnceLock::new();
+
+/// Retained locators not settled by this owner require explicit recovery.
+pub(crate) fn idle_blocker() -> Option<String> {
+    let installation = match INSTALLATION.get() {
+        Some(installation) => match installation.lock() {
+            Ok(installation) => installation,
+            Err(_) => return Some("supervisor installation authority poisoned".into()),
+        },
+        None => return Some("supervisor installation authority unavailable".into()),
+    };
+    let Some(installation) = installation.as_ref() else {
+        return Some("execution supervisor installation unavailable".into());
+    };
+    let Ok(settled) = SETTLED.get_or_init(Mutex::default).lock() else {
+        return Some("supervisor settlement authority unavailable".into());
+    };
+    let entries = match std::fs::read_dir(&installation.root) {
+        Ok(entries) => entries,
+        Err(error) => return Some(format!("supervisor authority cannot be inspected: {error}")),
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => return Some(error.to_string()),
+        };
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if let Some(token) = name
+            .strip_prefix("supervisor-")
+            .and_then(|name| name.strip_suffix(".json"))
+            && !settled.contains(token)
+        {
+            return Some("retained supervisor authority requires execution or recovery".into());
+        }
+    }
+    None
+}
+
 struct Installation {
     path: PathBuf,
     hash: String,
@@ -115,6 +154,7 @@ pub(super) fn select_backend(
 }
 
 pub(super) struct SupervisorControl {
+    _admission: crate::runtime::managed_idle::Admission,
     directory: PathBuf,
     token: String,
     authentication: String,
@@ -207,6 +247,8 @@ impl SupervisorControl {
     ) -> anyhow::Result<(Self, portable_pty::CommandBuilder)> {
         #[cfg(test)]
         install_test_artifact()?;
+        super::reservations::check_authority()?;
+        let admission = super::managed_idle::admit()?;
         crate::readiness::check_admission()?;
         let version = protocol::VERSION;
         let installation = INSTALLATION
@@ -277,6 +319,7 @@ impl SupervisorControl {
         command.arg(directory.join("control.sock"));
         Ok((
             Self {
+                _admission: admission,
                 directory,
                 token: token.to_string(),
                 authentication,
@@ -357,6 +400,13 @@ impl SupervisorControl {
             "supervisor operation failed: {:?}",
             response.error
         );
+        if response.terminal_session_ended == Some(true)
+            && response.cleanup_error.is_none()
+            && response.capture_error.is_none()
+            && let Ok(mut settled) = SETTLED.get_or_init(Mutex::default).lock()
+        {
+            settled.insert(self.token.clone());
+        }
         Ok(response)
     }
 

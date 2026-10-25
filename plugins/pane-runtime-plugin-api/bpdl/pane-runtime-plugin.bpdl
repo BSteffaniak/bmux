@@ -446,6 +446,8 @@ interface pane-runtime-readiness-v1 {
         instance: uuid,
         process_id: u32,
         executable_sha256: string?,
+        // Explicit launch marker captured once; consumers verify canonical identity.
+        managed_target_identity: string?,
         runtime_dir: string,
         config_dir: string,
         data_dir: string,
@@ -455,6 +457,32 @@ interface pane-runtime-readiness-v1 {
         restart_blocker: string?,
         fenced: bool,
     }
+    record managed-preparation-lease {
+        instance: uuid,
+        lease_id: uuid,
+        ttl_seconds: u64,
+    }
+    // Connection-owned pre-effect admission. Expiration never authorizes replay.
+    // Renew until native attachment commits; release after commit or abandonment.
+    command acquire-managed-preparation(instance: uuid) -> result<managed-preparation-lease, string>;
+    command renew-managed-preparation(instance: uuid, lease-id: uuid) -> result<managed-preparation-lease, string>;
+    command release-managed-preparation(instance: uuid, lease-id: uuid) -> result<unit, string>;
+    record managed-idle-status {
+        instance: uuid,
+        managed: bool,
+        grace_seconds: u64,
+        idle_for_seconds: u64,
+        blocker: string?,
+        // Other targets/legacy evidence is discoverable, never adopted or deleted.
+        retained_authority: list<string>,
+        fenced: bool,
+    }
+    // Only the owning managed server configures this after exact readiness verification.
+    // Zero explicitly disables idle retirement. Diagnostics never refresh idle time.
+    command configure-managed-idle(instance: uuid, grace-seconds: u64) -> result<managed-idle-status, string>;
+    command managed-idle-status() -> result<managed-idle-status, string>;
+    // A successful fenced response authorizes normal graceful server shutdown.
+    command fence-managed-idle(instance: uuid) -> result<managed-idle-status, string>;
     command runtime-readiness() -> runtime-readiness;
     command fence-unhealthy(instance: uuid) -> result<runtime-readiness, string>;
 }

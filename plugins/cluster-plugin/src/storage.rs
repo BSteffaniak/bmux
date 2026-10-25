@@ -80,6 +80,7 @@ pub fn append_cluster_connection_event(
     caller: &impl ClusterRuntimeOps,
     event: ClusterConnectionEvent,
 ) -> Result<(), String> {
+    let _transaction = durable_storage::mutation()?;
     let mut events = get_cluster_connection_events(caller)?;
     events.push(event);
     if events.len() > CLUSTER_CONNECTION_EVENTS_MAX {

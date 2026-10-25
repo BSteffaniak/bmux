@@ -42,6 +42,8 @@ pub struct VerifiedCompanion {
     pub executable: PathBuf,
     pub bundle_id: String,
     pub sha256: String,
+    /// Digest of the complete verified manifest (including every artifact identity).
+    pub artifact_set_sha256: String,
     /// The frontend contract; the connected server must still negotiate it.
     pub protocol: ProtocolContract,
 }
@@ -57,6 +59,133 @@ impl VerifiedCompanion {
         #[cfg(not(target_os = "linux"))]
         let frontend = std::env::current_exe().context("locate running frontend")?;
         Self::load_for_frontend(executable, &frontend)
+    }
+
+    /// Prepare a private immutable launch bundle on macOS, without modifying
+    /// mutable development outputs. `cache` must already be a secured private
+    /// transport/artifact directory. The caller must spawn the returned path.
+    /// Other platforms retain their OS-backed executing-image verification.
+    pub fn prepare_launch_image(&self, cache: &Path) -> Result<PathBuf> {
+        let verified = Self::load(self.executable.clone())?;
+        ensure!(
+            verified.sha256 == self.sha256
+                && verified.artifact_set_sha256 == self.artifact_set_sha256,
+            "bundle changed before immutable image preparation"
+        );
+        #[cfg(target_os = "macos")]
+        {
+            self.prepare_macos_image(cache)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = cache;
+            Ok(self.executable.clone())
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn prepare_macos_image(&self, cache: &Path) -> Result<PathBuf> {
+        use std::os::darwin::fs::MetadataExt as _;
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _};
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        validate_absolute(cache)?;
+        let metadata = std::fs::symlink_metadata(cache)?;
+        // SAFETY: geteuid only queries the current effective user.
+        let uid = unsafe { libc::geteuid() };
+        ensure!(
+            metadata.is_dir()
+                && !metadata.file_type().is_symlink()
+                && metadata.uid() == uid
+                && metadata.mode() & 0o077 == 0,
+            "immutable image cache must be a private user-owned real directory"
+        );
+        let cache = cache.canonicalize()?;
+        let source_root = self
+            .executable
+            .parent()
+            .context("companion has no bundle root")?;
+        let manifest: BundleManifest =
+            serde_json::from_reader(File::open(source_root.join(BUNDLE_MANIFEST))?)?;
+        manifest.validate_contract()?;
+        ensure!(
+            hex_digest(&Sha256::digest(serde_json::to_vec(&manifest)?)) == self.artifact_set_sha256,
+            "bundle manifest changed before immutable image preparation"
+        );
+        let destination = cache.join(format!("image-{}", self.artifact_set_sha256));
+        let relative = self.executable.strip_prefix(source_root)?;
+        let selected = destination.join(relative);
+        let verify_image = || -> Result<()> {
+            let verified = Self::load(selected.clone())?;
+            ensure!(
+                verified.sha256 == self.sha256
+                    && verified.artifact_set_sha256 == self.artifact_set_sha256,
+                "immutable launch bundle identity mismatch"
+            );
+            let metadata = std::fs::symlink_metadata(&selected)?;
+            ensure!(
+                metadata.is_file()
+                    && metadata.st_flags() & (libc::UF_IMMUTABLE | libc::SF_IMMUTABLE) != 0,
+                "private launch image is not immutable"
+            );
+            Ok(())
+        };
+        if destination.try_exists()? {
+            let published = std::fs::symlink_metadata(&destination)?;
+            ensure!(
+                published.is_dir() && !published.file_type().is_symlink(),
+                "immutable image destination is not a real directory"
+            );
+            verify_image()?;
+            return Ok(selected);
+        }
+        let staging = cache.join(format!(
+            "image-pending-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::DirBuilder::new().mode(0o700).create(&staging)?;
+        for artifact in &manifest.artifacts {
+            let source = artifact.verify(source_root)?;
+            let path = staging.join(&artifact.path);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::copy(&source, &path)?;
+            ensure!(
+                file_sha256(&path)? == artifact.sha256,
+                "bundle artifact changed while preparing immutable image"
+            );
+        }
+        std::fs::write(
+            staging.join(BUNDLE_MANIFEST),
+            serde_json::to_vec(&manifest)?,
+        )?;
+        let image = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(staging.join(relative))?;
+        image.sync_all()?;
+        // SAFETY: the descriptor refers only to our newly copied private image.
+        // Source artifacts and live images are never changed or cleaned up.
+        ensure!(
+            unsafe { libc::fchflags(image.as_raw_fd(), libc::UF_IMMUTABLE) } == 0,
+            "cannot pin private macOS companion image: {}",
+            std::io::Error::last_os_error()
+        );
+        match std::fs::rename(&staging, &destination) {
+            Ok(()) => {}
+            Err(error) if destination.try_exists()? => {
+                // A concurrent preparer won. Preserve our immutable staging
+                // evidence rather than deleting files under uncertain ownership.
+                let _ = error;
+            }
+            Err(error) => return Err(error).context("publish immutable companion image"),
+        }
+        File::open(&cache)?.sync_all()?;
+        verify_image()?;
+        Ok(selected)
     }
 
     fn load_for_frontend(executable: PathBuf, running_frontend: &Path) -> Result<Self> {
@@ -111,6 +240,7 @@ impl VerifiedCompanion {
         );
         Ok(Self {
             executable: verified_path,
+            artifact_set_sha256: hex_digest(&Sha256::digest(serde_json::to_vec(&manifest)?)),
             bundle_id: manifest.compatibility_id,
             sha256,
             protocol: frontend_contract(),
@@ -252,6 +382,70 @@ pub fn verify_server_contract(server: &ProtocolContract) -> Result<NegotiatedPro
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn prepares_private_immutable_image_without_pinning_development_output() {
+        use std::os::darwin::fs::MetadataExt as _;
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::fs::PermissionsExt as _;
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().canonicalize().unwrap();
+        let source = root.join("development-bundle");
+        let cache = root.join("private-images");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::create_dir(&cache).unwrap();
+        std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::copy(std::env::current_exe().unwrap(), source.join("bterm")).unwrap();
+        std::fs::write(source.join("bmux"), b"private companion fixture").unwrap();
+        let manifest = BundleManifest {
+            schema_version: 1,
+            compatibility_id: COMPATIBILITY_ID.to_owned(),
+            target: native_target(),
+            artifacts: ["bterm", "bmux"]
+                .into_iter()
+                .map(|name| BundleArtifact {
+                    role: if name == "bterm" {
+                        "frontend"
+                    } else {
+                        "companion"
+                    }
+                    .to_owned(),
+                    path: name.into(),
+                    sha256: file_sha256(&source.join(name)).unwrap(),
+                })
+                .collect(),
+        };
+        std::fs::write(
+            source.join(BUNDLE_MANIFEST),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        let companion = VerifiedCompanion::load(source.join("bmux")).unwrap();
+        let image = companion.prepare_launch_image(&cache).unwrap();
+        assert_ne!(image, companion.executable);
+        assert_eq!(file_sha256(&image).unwrap(), companion.sha256);
+        assert_ne!(
+            std::fs::metadata(&image).unwrap().st_flags() & libc::UF_IMMUTABLE,
+            0
+        );
+        assert_eq!(
+            std::fs::metadata(&companion.executable).unwrap().st_flags() & libc::UF_IMMUTABLE,
+            0
+        );
+        assert_eq!(companion.prepare_launch_image(&cache).unwrap(), image);
+        std::fs::write(
+            &companion.executable,
+            b"development rebuild remains writable",
+        )
+        .unwrap();
+        assert_eq!(file_sha256(&image).unwrap(), companion.sha256);
+        assert!(companion.prepare_launch_image(&cache).is_err());
+        // Only the fixture-owned immutable image is unpinned for TempDir cleanup.
+        let file = File::open(&image).unwrap();
+        // SAFETY: this descriptor is the private image created by this test.
+        assert_eq!(unsafe { libc::fchflags(file.as_raw_fd(), 0) }, 0);
+    }
+
     #[test]
     fn rejects_unknown_bundle_contracts() {
         let mut manifest = BundleManifest {
@@ -325,6 +519,28 @@ mod tests {
         assert_eq!(
             verified.executable,
             root.join("bmux").canonicalize().unwrap()
+        );
+        // An additional verified plugin changes the artifact set even though
+        // the companion bytes and compatibility label remain identical.
+        let mut with_plugin = manifest.clone();
+        std::fs::write(root.join("plugin.so"), b"plugin bytes").unwrap();
+        with_plugin.artifacts.push(BundleArtifact {
+            role: "plugin".into(),
+            path: "plugin.so".into(),
+            sha256: hex_digest(&Sha256::digest(b"plugin bytes")),
+        });
+        std::fs::write(
+            root.join(BUNDLE_MANIFEST),
+            serde_json::to_vec(&with_plugin).unwrap(),
+        )
+        .unwrap();
+        let plugin_verified =
+            VerifiedCompanion::load_for_frontend(root.join("bmux"), &root.join("bterm")).unwrap();
+        assert_eq!(verified.sha256, plugin_verified.sha256);
+        assert_eq!(verified.bundle_id, plugin_verified.bundle_id);
+        assert_ne!(
+            verified.artifact_set_sha256,
+            plugin_verified.artifact_set_sha256
         );
         // Same length, different bytes: executable metadata is not identity.
         std::fs::write(root.join("bmux"), b"replaced companion").unwrap();

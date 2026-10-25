@@ -34,6 +34,18 @@ mod spawn;
     reason = "`route_service!` centralizes all generated service route arms; splitting would obscure the macro dispatch table."
 )]
 pub fn route(context: NativeServiceContext) -> ServiceResponse {
+    if context.caller_client_id.is_some()
+        && context.request.service.interface_id == "pane-runtime-readiness-v1"
+        && matches!(
+            context.request.operation.as_str(),
+            "configure-managed-idle" | "fence-managed-idle"
+        )
+    {
+        return ServiceResponse::error(
+            "managed_lifecycle_owner_required",
+            "managed retirement is owned by the local server launch policy",
+        );
+    }
     if let Some(client) = context.caller_client_id
         && !attach_commands::observer_operation_allowed(
             bmux_session_models::ClientId(client),
@@ -175,6 +187,24 @@ fn route_authorized(context: NativeServiceContext) -> ServiceResponse {
         },
         "pane-runtime-spawn-v1", "observe-directory" => |req: bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::client::ObserveDirectoryRequest, ctx| {
             Ok::<_, ServiceResponse>(spawn::authorize_read(ctx, req.source.session_id).and_then(|()| crate::runtime::observe_spawn_directory(&req.source)))
+        },
+        "pane-runtime-readiness-v1", "acquire-managed-preparation" => |req: bmux_pane_runtime_plugin_api::pane_runtime_readiness_v1::client::AcquireManagedPreparationRequest, ctx| {
+            Ok::<_, ServiceResponse>(crate::runtime::managed_idle::preparation(req.instance, ctx.caller_client_id, None, false).and_then(|lease| lease.ok_or_else(|| "preparation lease missing".into())))
+        },
+        "pane-runtime-readiness-v1", "renew-managed-preparation" => |req: bmux_pane_runtime_plugin_api::pane_runtime_readiness_v1::client::RenewManagedPreparationRequest, ctx| {
+            Ok::<_, ServiceResponse>(crate::runtime::managed_idle::preparation(req.instance, ctx.caller_client_id, Some(req.lease_id), false).and_then(|lease| lease.ok_or_else(|| "preparation lease missing".into())))
+        },
+        "pane-runtime-readiness-v1", "release-managed-preparation" => |req: bmux_pane_runtime_plugin_api::pane_runtime_readiness_v1::client::ReleaseManagedPreparationRequest, ctx| {
+            Ok::<_, ServiceResponse>(crate::runtime::managed_idle::preparation(req.instance, ctx.caller_client_id, Some(req.lease_id), true).map(|_| ()))
+        },
+        "pane-runtime-readiness-v1", "configure-managed-idle" => |req: bmux_pane_runtime_plugin_api::pane_runtime_readiness_v1::client::ConfigureManagedIdleRequest, _ctx| {
+            Ok::<_, ServiceResponse>(crate::runtime::managed_idle::configure(req.instance, req.grace_seconds))
+        },
+        "pane-runtime-readiness-v1", "managed-idle-status" => |_req: (), _ctx| {
+            Ok::<_, ServiceResponse>(crate::runtime::managed_idle::inspect(None, false))
+        },
+        "pane-runtime-readiness-v1", "fence-managed-idle" => |req: bmux_pane_runtime_plugin_api::pane_runtime_readiness_v1::client::FenceManagedIdleRequest, _ctx| {
+            Ok::<_, ServiceResponse>(crate::runtime::managed_idle::inspect(Some(req.instance), true))
         },
         "pane-runtime-readiness-v1", "runtime-readiness" => |_req: (), _ctx| {
             crate::readiness::snapshot().map_err(|reason| ServiceResponse::error("readiness_unavailable", reason))

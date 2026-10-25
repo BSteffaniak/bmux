@@ -40,6 +40,10 @@ const PANE_RUNTIME_PLUGIN_SNAPSHOT_VERSION: u32 = 3;
 /// layout tree, floating surfaces, focused pane).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct PaneRuntimeSnapshotV1 {
+    /// Restore is exact-owner only. Legacy/foreign payloads remain available for
+    /// explicit recovery but never authorize managed process replay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed_target_identity: Option<String>,
     /// Per-session pane-runtime record.
     pub sessions: Vec<PaneRuntimeSessionSnapshotV1>,
 }
@@ -312,7 +316,12 @@ fn build_pane_runtime_payload() -> anyhow::Result<PaneRuntimeSnapshotV1> {
         });
     }
 
-    Ok(PaneRuntimeSnapshotV1 { sessions: out })
+    Ok(PaneRuntimeSnapshotV1 {
+        managed_target_identity: crate::runtime::managed_target_identity()
+            .map_err(anyhow::Error::msg)?
+            .map(str::to_owned),
+        sessions: out,
+    })
 }
 
 /// Apply a pane-runtime payload: for each session present in the
@@ -320,6 +329,14 @@ fn build_pane_runtime_payload() -> anyhow::Result<PaneRuntimeSnapshotV1> {
 /// sessions-plugin participant's responsibility, restored earlier in
 /// the envelope iteration), reconstruct the pane runtime via
 /// `SessionRuntimeManager::restore_runtime`.
+fn validate_snapshot_owner(recorded: Option<&str>, selected: Option<&str>) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        recorded == selected,
+        "pane snapshot belongs to a legacy or different managed target; retained authority requires explicit recovery, not replay"
+    );
+    Ok(())
+}
+
 fn validate_resume_policy(payload: &PaneRuntimeSnapshotV1) -> anyhow::Result<()> {
     if let Some(pane) = payload
         .sessions
@@ -335,8 +352,16 @@ fn validate_resume_policy(payload: &PaneRuntimeSnapshotV1) -> anyhow::Result<()>
     Ok(())
 }
 
+fn validate_payload_restore(payload: &PaneRuntimeSnapshotV1) -> anyhow::Result<()> {
+    validate_snapshot_owner(
+        payload.managed_target_identity.as_deref(),
+        crate::runtime::managed_target_identity().map_err(anyhow::Error::msg)?,
+    )?;
+    validate_resume_policy(payload)
+}
+
 fn apply_pane_runtime_payload(payload: &PaneRuntimeSnapshotV1) -> anyhow::Result<()> {
-    validate_resume_policy(payload)?;
+    validate_payload_restore(payload)?;
     let session_manager = session_handle();
     let runtime_manager = session_runtime_handle();
     let padding_handle = bmux_plugin::global_plugin_state_registry()
@@ -484,7 +509,19 @@ impl StatefulPlugin for PaneRuntimeStateful {
     }
 
     fn validate_snapshot(&self, snapshot: &StatefulPluginSnapshot) -> StatefulPluginResult<()> {
-        decode_pane_runtime_snapshot(snapshot).map(|_| ())
+        let decoded = decode_pane_runtime_snapshot(snapshot)?;
+        let owner = crate::runtime::managed_target_identity().map_err(|details| {
+            StatefulPluginError::RestoreFailed {
+                plugin: PANE_RUNTIME_PLUGIN_SNAPSHOT_ID.as_str().to_string(),
+                details,
+            }
+        })?;
+        validate_snapshot_owner(decoded.managed_target_identity.as_deref(), owner).map_err(
+            |error| StatefulPluginError::RestoreFailed {
+                plugin: PANE_RUNTIME_PLUGIN_SNAPSHOT_ID.as_str().to_string(),
+                details: error.to_string(),
+            },
+        )
     }
 
     fn restore_snapshot(&self, snapshot: StatefulPluginSnapshot) -> StatefulPluginResult<()> {
@@ -540,6 +577,15 @@ mod tests {
     use bmux_plugin_sdk::StatefulPluginSnapshot;
     use std::collections::BTreeMap;
     use uuid::Uuid;
+
+    #[test]
+    fn managed_snapshot_restore_requires_exact_owner_not_legacy_or_foreign_work() {
+        assert!(super::validate_snapshot_owner(None, None).is_ok());
+        assert!(super::validate_snapshot_owner(Some("target-a"), Some("target-a")).is_ok());
+        assert!(super::validate_snapshot_owner(None, Some("target-a")).is_err());
+        assert!(super::validate_snapshot_owner(Some("target-a"), None).is_err());
+        assert!(super::validate_snapshot_owner(Some("target-a"), Some("target-b")).is_err());
+    }
 
     #[test]
     fn version_one_snapshot_migrates_to_generic_viewport_fields() {
@@ -630,6 +676,7 @@ mod tests {
         let context_id = Uuid::new_v4();
         let client_id = Uuid::new_v4();
         let snap = PaneRuntimeSnapshotV1 {
+            managed_target_identity: None,
             sessions: vec![PaneRuntimeSessionSnapshotV1 {
                 session_id,
                 panes: vec![PaneRuntimeSnapshotV1Pane {
@@ -711,6 +758,7 @@ mod tests {
             ]),
         };
         let snap = PaneRuntimeSnapshotV1 {
+            managed_target_identity: None,
             sessions: vec![PaneRuntimeSessionSnapshotV1 {
                 session_id,
                 panes: vec![PaneRuntimeSnapshotV1Pane {
@@ -768,6 +816,7 @@ mod tests {
         let session_id = Uuid::new_v4();
         let pane_id = Uuid::new_v4();
         let snap = PaneRuntimeSnapshotV1 {
+            managed_target_identity: None,
             sessions: vec![PaneRuntimeSessionSnapshotV1 {
                 session_id,
                 panes: vec![PaneRuntimeSnapshotV1Pane {

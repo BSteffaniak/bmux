@@ -3231,6 +3231,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "toml 1.1.4+spec-1.1.0",
+ "tracing",
  "uuid",
 ]
 
@@ -3560,6 +3561,7 @@ dependencies = [
  "bmux_frontend_runtime",
  "bmux_ipc",
  "bmux_pane_runtime_plugin_api",
+ "bmux_plugin_sdk",
  "bmux_tui 0.0.1-alpha.4",
  "bterm_native_platform",
  "bterm_native_renderer",
@@ -3568,6 +3570,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "tempfile",
  "tokio",
  "toml 1.1.4+spec-1.1.0",
 ]

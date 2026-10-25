@@ -30,6 +30,7 @@ mod hosted_output;
 mod kiosk_cli;
 mod logs_cli;
 mod logs_watch;
+mod managed_companion;
 mod perf_cli;
 mod perf_telemetry;
 mod playbook_cli;

@@ -6,58 +6,41 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
 
+mod identity;
+#[cfg(unix)]
+mod inherited;
+
 #[cfg(unix)]
 #[tokio::test]
-async fn legacy_migration_preserves_stale_files_and_refuses_live_or_uncertain_owners() {
+async fn unrelated_legacy_namespace_never_gates_selected_target() {
     use std::os::unix::net::UnixListener;
     let root = Root::new();
-    let mut roots = crate::runtime_paths::RuntimeRoots::from_root(root.0.clone()).unwrap();
-    roots.runtime_dir = root.0.join("run/boot-test");
-    assert!(
-        guard_legacy_managed_runtime(&roots)
-            .await
-            .unwrap()
-            .is_none()
-    );
     let legacy = root.0.join("runtime");
     std::fs::create_dir(&legacy).unwrap();
-    let socket = legacy.join("server.sock");
     let claim_path = legacy.join("server-lifetime.lock");
-    // A mismatched device number from an earlier boot is not reinterpreted or
-    // rewritten. The old endpoint remains untouched in its retired namespace.
-    let receipt = "bmux-endpoint-v1 1 2\n";
-    std::fs::write(&claim_path, receipt).unwrap();
     let owner = OpenOptions::new()
+        .create_new(true)
         .read(true)
         .write(true)
         .open(&claim_path)
         .unwrap();
     owner.try_lock().unwrap();
-    assert!(guard_legacy_managed_runtime(&roots).await.is_err());
-    drop(owner);
+    let socket = legacy.join("server.sock");
     let listener = UnixListener::bind(&socket).unwrap();
-    assert!(guard_legacy_managed_runtime(&roots).await.is_err());
-    drop(listener);
-    let guard = guard_legacy_managed_runtime(&roots).await.unwrap().unwrap();
-    assert_eq!(std::fs::read_to_string(&claim_path).unwrap(), receipt);
+    let mut spec = root.spec();
+    let target = root.0.join("target-namespace");
+    std::fs::create_dir(&target).unwrap();
+    spec.ownership_file = target.join("companion-startup.lock");
+    assert_eq!(
+        ensure_runtime(&spec, || async { Ok(RuntimeProbe::Compatible) })
+            .await
+            .unwrap(),
+        RuntimeLaunchOutcome::AlreadyRunning
+    );
     assert!(socket.exists());
-    let contender = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&claim_path)
-        .unwrap();
-    assert!(contender.try_lock().is_err());
-    drop(guard);
-    contender.try_lock().unwrap();
-    drop(contender);
-    std::fs::write(&claim_path, "unsupported receipt").unwrap();
-    assert!(guard_legacy_managed_runtime(&roots).await.is_err());
-    std::fs::remove_file(&claim_path).unwrap();
-    assert!(guard_legacy_managed_runtime(&roots).await.is_err());
-    std::fs::remove_file(&socket).unwrap();
-    std::fs::write(&socket, "not a socket").unwrap();
-    assert!(guard_legacy_managed_runtime(&roots).await.is_err());
-    std::fs::remove_file(&socket).unwrap();
+    assert!(!spec.ownership_file.exists());
+    drop(listener);
+    drop(owner);
 }
 
 #[test]
@@ -121,10 +104,10 @@ fn service_incompatibility_is_not_optional_absence_or_starting() {
     }
 }
 
-struct Root(PathBuf);
+pub(super) struct Root(pub(super) PathBuf);
 
 impl Root {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         let root = std::env::temp_dir().join(format!(
             "bterm-launch-{}-{}",
             std::process::id(),
@@ -226,6 +209,141 @@ async fn listening_endpoint_without_handshake_is_uncertain_not_absent() {
     assert!(error.to_string().contains("uncertain"));
     assert!(paths.server_socket().exists());
     drop(listener);
+}
+
+#[tokio::test]
+async fn contended_inherited_claim_allows_readiness_without_owner_exit() {
+    let root = Root::new();
+    let spec = root.spec();
+    let owner = OpenOptions::new()
+        .create_new(true)
+        .read(true)
+        .write(true)
+        .open(&spec.ownership_file)
+        .unwrap();
+    owner.try_lock().unwrap();
+    let mut calls = 0;
+    let outcome = ensure_runtime(&spec, || {
+        calls += 1;
+        let state = if calls == 1 {
+            RuntimeProbe::Absent
+        } else {
+            RuntimeProbe::Compatible
+        };
+        async move { Ok(state) }
+    })
+    .await
+    .unwrap();
+    assert_eq!(outcome, RuntimeLaunchOutcome::AlreadyRunning);
+    assert_eq!(
+        calls, 2,
+        "readiness must be re-probed while the claim is still held"
+    );
+    let contender = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&spec.ownership_file)
+        .unwrap();
+    assert!(matches!(
+        contender.try_lock(),
+        Err(std::fs::TryLockError::WouldBlock)
+    ));
+    assert!(!spec.diagnostic_file.exists());
+    drop(owner);
+}
+
+#[tokio::test]
+async fn contended_claim_preserves_incompatibility_without_waiting_for_exit() {
+    let root = Root::new();
+    let spec = root.spec();
+    let owner = OpenOptions::new()
+        .create_new(true)
+        .read(true)
+        .write(true)
+        .open(&spec.ownership_file)
+        .unwrap();
+    owner.try_lock().unwrap();
+    let mut calls = 0;
+    let result = ensure_runtime(&spec, || {
+        calls += 1;
+        let state = if calls == 1 {
+            RuntimeProbe::Absent
+        } else {
+            RuntimeProbe::Incompatible("selected target mismatch".into())
+        };
+        async move { Ok(state) }
+    })
+    .await;
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("selected target mismatch")
+    );
+    assert_eq!(calls, 2);
+    assert!(!spec.diagnostic_file.exists());
+    drop(owner);
+}
+
+#[tokio::test]
+async fn reconciliation_contention_uses_startup_budget_not_rpc_budget() {
+    let root = Root::new();
+    let path = root.0.join("reconciliation.lock");
+    let owner = OpenOptions::new()
+        .create_new(true)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    owner.try_lock().unwrap();
+    let waiter = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    let startup_deadline = Instant::now() + Duration::from_secs(2);
+    let release = async move {
+        // Model cold startup exceeding an individual probe's short budget.
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        drop(owner);
+    };
+    let (result, ()) = tokio::join!(
+        wait_for_reconciliation_claim(&waiter, startup_deadline, Duration::from_millis(2)),
+        release,
+    );
+    result.unwrap();
+    assert!(Instant::now() < startup_deadline);
+    assert!(MANAGED_STARTUP_TIMEOUT > MANAGED_RPC_TIMEOUT);
+    assert!(path.exists());
+}
+
+#[tokio::test]
+async fn reconciliation_expiry_preserves_the_live_owner_claim() {
+    let root = Root::new();
+    let path = root.0.join("reconciliation.lock");
+    let owner = OpenOptions::new()
+        .create_new(true)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    owner.try_lock().unwrap();
+    let waiter = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    let error = wait_for_reconciliation_claim(&waiter, Instant::now(), Duration::from_millis(1))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("startup timed out"));
+    assert!(matches!(
+        waiter.try_lock(),
+        Err(std::fs::TryLockError::WouldBlock)
+    ));
+    assert!(path.exists());
+    drop(owner);
+    waiter.try_lock().unwrap();
 }
 
 #[tokio::test]

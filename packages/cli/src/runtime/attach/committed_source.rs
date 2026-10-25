@@ -9,6 +9,15 @@ pub(super) struct CommittedSource {
 }
 
 impl CommittedSource {
+    #[cfg(not(feature = "bundled-plugin-broadcast"))]
+    pub(super) async fn register(
+        _client: &mut StreamingBmuxClient,
+        _runtime_dir: &std::path::Path,
+    ) -> Option<Self> {
+        None
+    }
+
+    #[cfg(feature = "bundled-plugin-broadcast")]
     pub(super) async fn register(
         client: &mut StreamingBmuxClient,
         runtime_dir: &std::path::Path,
@@ -17,11 +26,6 @@ impl CommittedSource {
         bmux_broadcast_plugin::authorize_committed_output(client, runtime_dir)
             .await
             .ok()?;
-        #[cfg(not(feature = "bundled-plugin-broadcast"))]
-        {
-            let _ = runtime_dir;
-            return None;
-        }
         let id = uuid::Uuid::new_v4().to_string();
         match client::register(client, id.clone()).await {
             Ok(_) => Some(Self { id, sent: None }),

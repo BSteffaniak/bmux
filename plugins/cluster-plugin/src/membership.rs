@@ -4,7 +4,6 @@ use super::*;
 use iroh::SecretKey;
 use std::fmt;
 use std::str::FromStr;
-use std::sync::{Mutex, OnceLock};
 use uuid::Uuid;
 
 pub const CLUSTER_IDENTITY_VERSION: u8 = 1;
@@ -155,8 +154,6 @@ fn validate_protocol_offer(offer: &ClusterProtocolOffer, source: &str) -> Result
     }
     Ok(())
 }
-
-static IDENTITY_INIT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 /// Durable identifier for one federated cluster.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -527,6 +524,7 @@ fn existing_join_result(
 }
 
 pub fn prepare_leave(caller: &impl ClusterRuntimeOps) -> Result<ClusterLeaveRequest, String> {
+    let _guard = identity_init_guard()?;
     let cluster_id =
         load_cluster_id(caller)?.ok_or_else(|| "this node is not a cluster member".to_string())?;
     let identity = load_node_identity(caller)?
@@ -561,6 +559,7 @@ pub fn commit_leave(
     caller: &impl ClusterRuntimeOps,
     leave_id: &str,
 ) -> Result<ClusterLeaveResult, String> {
+    let _guard = identity_init_guard()?;
     let value = load_identity_record(caller, PENDING_LEAVE_STORAGE_KEY)?
         .ok_or_else(|| "no prepared cluster leave exists".to_string())?;
     let pending = serde_json::from_slice::<PendingLeave>(&value)
@@ -2186,6 +2185,7 @@ pub fn configure_local_consensus_endpoint(
         return Ok(());
     };
     let endpoint = validate_advertised_endpoint(endpoint)?;
+    let _guard = identity_init_guard()?;
     let Some(cluster_id) = load_cluster_id(caller)? else {
         return Ok(());
     };
@@ -2201,6 +2201,8 @@ pub fn configure_local_consensus_endpoint(
     {
         return Ok(());
     }
+    // The domain helper already fences active-voter endpoint replacement
+    // behind an explicit membership transition, including across runtime scopes.
     advertise_local_endpoint(&mut state, &identity.node_id().to_string(), endpoint)?;
     store_membership_state(caller, &state)
 }
@@ -2236,6 +2238,7 @@ pub fn local_consensus_member(
 }
 
 pub fn clear_pending_join(caller: &impl ClusterRuntimeOps) -> Result<(), String> {
+    let _guard = identity_init_guard()?;
     clear_identity_record(caller, PENDING_JOIN_STORAGE_KEY)
 }
 
@@ -2289,6 +2292,9 @@ pub fn peer_authentication_members(
 pub fn load_membership_state(
     caller: &impl ClusterRuntimeOps,
 ) -> Result<Option<MembershipState>, String> {
+    // Reads can migrate legacy records, so they participate in the same full
+    // domain transaction (including when nested inside an existing mutation).
+    let _guard = identity_init_guard()?;
     let Some(value) = load_identity_record(caller, MEMBERSHIP_STATE_STORAGE_KEY)? else {
         return Ok(None);
     };
@@ -2545,11 +2551,8 @@ pub fn load_node_identity(caller: &impl ClusterRuntimeOps) -> Result<Option<Node
     }))
 }
 
-fn identity_init_guard() -> Result<std::sync::MutexGuard<'static, ()>, String> {
-    IDENTITY_INIT_LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .map_err(|_| "cluster identity initialization lock is poisoned".to_string())
+fn identity_init_guard() -> Result<durable_storage::MutationGuard, String> {
+    durable_storage::mutation()
 }
 
 fn ensure_identity_version(version: u8, kind: &str) -> Result<(), String> {

@@ -13,6 +13,7 @@ pub mod consensus_runtime;
 pub mod consensus_storage;
 pub mod control_codec;
 pub mod control_state;
+pub(crate) mod durable_storage;
 pub(crate) mod endpoint;
 pub(crate) mod events;
 mod gateway;
@@ -21,7 +22,7 @@ mod native_consensus_service;
 pub(crate) mod pane;
 pub mod placement;
 pub mod principal_bootstrap;
-pub(crate) mod storage;
+mod storage;
 pub mod worker_pane_runtime;
 pub mod worker_reconciler;
 pub mod worker_runtime;
@@ -200,6 +201,8 @@ impl RustPlugin for ClusterPlugin {
     const HANDLES_EVENTS: bool = false;
 
     fn activate(&mut self, context: NativeLifecycleContext) -> Result<i32, PluginCommandError> {
+        durable_storage::configure(&context.connection.data_dir)
+            .map_err(PluginCommandError::failed)?;
         let node_identity = load_or_create_node_identity(&context).map_err(|error| {
             PluginCommandError::failed(format!(
                 "failed initializing cluster node identity: {error}"
@@ -217,13 +220,14 @@ impl RustPlugin for ClusterPlugin {
         self.cluster_id = cluster_id;
         let configured_endpoint = configured_consensus_endpoint(context.settings.as_ref())
             .map_err(PluginCommandError::failed)?;
-        configure_local_consensus_endpoint(&context, configured_endpoint.as_deref()).map_err(
-            |error| {
-                PluginCommandError::failed(format!(
-                    "failed configuring local consensus endpoint: {error}"
-                ))
-            },
-        )?;
+        if let Err(error) =
+            configure_local_consensus_endpoint(&context, configured_endpoint.as_deref())
+        {
+            // A different companion scope is not a new cluster identity. Keep
+            // baseline terminal operation available without stealing the
+            // retained node endpoint/history from its existing authority.
+            tracing::warn!(%error, "cluster consensus capability requires its retained authority");
+        }
         Ok(EXIT_OK)
     }
 
@@ -270,6 +274,10 @@ impl RustPlugin for ClusterPlugin {
         context: bmux_plugin_sdk::TypedServiceRegistrationContext<'_>,
         registry: &mut bmux_plugin_sdk::TypedServiceRegistry,
     ) {
+        if let Err(error) = durable_storage::configure(&context.connection.data_dir) {
+            tracing::error!(%error, "cluster durable storage unavailable during service registration");
+            return;
+        }
         let caller = Arc::new(bmux_plugin::TypedServiceCaller::from_registration_context(
             &context,
         ));
@@ -409,6 +417,8 @@ impl RustPlugin for ClusterPlugin {
     }
 
     fn run_command(&mut self, context: NativeCommandContext) -> Result<i32, PluginCommandError> {
+        durable_storage::configure(&context.connection.data_dir)
+            .map_err(PluginCommandError::failed)?;
         let gateway_result = if context.command.starts_with("cluster-") {
             let handle = tokio::runtime::Handle::try_current().map_err(|error| {
                 PluginCommandError::failed(format!(
@@ -474,6 +484,9 @@ impl RustPlugin for ClusterPlugin {
     fn invoke_service(&self, context: NativeServiceContext) -> ServiceResponse {
         if let Err(response) = admission::authorize(&context) {
             return response;
+        }
+        if let Err(error) = durable_storage::configure(&context.connection.data_dir) {
+            return ServiceResponse::error("storage_authority_unavailable", error);
         }
         if let Some(response) = invoke_native_consensus_service(&context) {
             return response;

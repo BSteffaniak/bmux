@@ -15,6 +15,53 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 
+const MANAGED_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
+const MANAGED_RPC_TIMEOUT: Duration = Duration::from_secs(5);
+
+mod native_preparation;
+mod transport_directory;
+pub use native_preparation::NativePreparation;
+
+/// Prepare native admission before creating a surface. The lease stays on the
+/// authenticated connection; attachment gets a separately authenticated peer.
+pub async fn prepare_native_configured(
+    selection: &crate::runtime_selection::RuntimeSelection,
+    configuration: &crate::configuration::ResolvedConfiguration,
+) -> Result<(bmux_client::BmuxClient, Option<NativePreparation>)> {
+    let mut owner = connect_selection_configured(selection, configuration).await?;
+    if selection.managed_identity().is_none() {
+        return Ok((owner, None));
+    }
+    use bmux_pane_runtime_plugin_api::pane_runtime_readiness_v1::client;
+    let timeout = Duration::from_secs(5);
+    let readiness = tokio::time::timeout(timeout, client::runtime_readiness(&mut owner))
+        .await
+        .context("native preparation identity timed out")??;
+    authenticate_managed_readiness(selection, &readiness)?;
+    let lease = tokio::time::timeout(
+        timeout,
+        client::acquire_managed_preparation(&mut owner, readiness.instance),
+    )
+    .await
+    .context("native preparation admission timed out")??
+    .map_err(anyhow::Error::msg)?;
+    anyhow::ensure!(
+        lease.instance == readiness.instance && lease.ttl_seconds >= 3,
+        "native preparation returned an invalid instance or lease TTL"
+    );
+    let preparation = NativePreparation::start(owner, lease);
+    let mut attachment = connect_at_paths(&selection.roots().config_paths(), timeout).await?;
+    let current = tokio::time::timeout(timeout, client::runtime_readiness(&mut attachment))
+        .await
+        .context("native attachment identity timed out")??;
+    authenticate_managed_readiness(selection, &current)?;
+    anyhow::ensure!(
+        current.instance == readiness.instance && current.helper_ready && !current.fenced,
+        "native attachment target changed after preparation; no attachment attempted"
+    );
+    Ok((attachment, Some(preparation)))
+}
+
 /// Fully resolved launch authority. Arguments must select the same complete
 /// roots and endpoint inspected by `probe`; a runtime name alone is insufficient.
 #[derive(Debug, Clone)]
@@ -67,7 +114,14 @@ pub enum RuntimeLaunchOutcome {
 pub async fn connect_selection(
     selection: &crate::runtime_selection::RuntimeSelection,
 ) -> Result<bmux_client::BmuxClient> {
-    connect_selection_inner(selection, None).await
+    connect_selection_inner(selection, None)
+        .await
+        .with_context(|| {
+            format!(
+                "selected runtime {}",
+                selection.roots().runtime_dir.display()
+            )
+        })
 }
 
 /// Start a managed companion with the same immutable BMUX configuration used by
@@ -77,7 +131,14 @@ pub async fn connect_selection_configured(
     selection: &crate::runtime_selection::RuntimeSelection,
     configuration: &crate::configuration::ResolvedConfiguration,
 ) -> Result<bmux_client::BmuxClient> {
-    connect_selection_inner(selection, Some(configuration)).await
+    connect_selection_inner(selection, Some(configuration))
+        .await
+        .with_context(|| {
+            format!(
+                "selected runtime {}",
+                selection.roots().runtime_dir.display()
+            )
+        })
 }
 
 async fn connect_selection_inner(
@@ -87,7 +148,7 @@ async fn connect_selection_inner(
     use crate::runtime_selection::RuntimeSelection;
     let roots = selection.roots();
     let paths = roots.config_paths();
-    let timeout = Duration::from_secs(5);
+    let timeout = MANAGED_RPC_TIMEOUT;
     match selection {
         RuntimeSelection::External { .. } => {
             let mut client = connect_at_paths(&paths, timeout)
@@ -116,17 +177,16 @@ async fn connect_selection_inner(
             // earlier chooser's stale hash. No size/mtime identity is accepted.
             let verified =
                 crate::compatibility::VerifiedCompanion::load(companion.executable.clone())?;
-            if verified.sha256 != companion.sha256 || verified.bundle_id != companion.bundle_id {
+            if verified.sha256 != companion.sha256
+                || verified.bundle_id != companion.bundle_id
+                || verified.artifact_set_sha256 != companion.artifact_set_sha256
+            {
                 bail!("companion bundle changed after runtime selection");
             }
         }
     }
-    for path in [
-        &roots.config_dir,
-        &roots.runtime_dir,
-        &roots.data_dir,
-        &roots.state_dir,
-    ] {
+    transport_directory::ensure_transport_directory(&roots.runtime_dir)?;
+    for path in [&roots.config_dir, &roots.data_dir, &roots.state_dir] {
         std::fs::create_dir_all(path)
             .with_context(|| format!("create selected root {}", path.display()))?;
     }
@@ -153,8 +213,39 @@ async fn connect_selection_inner(
             configuration.inputs.paths.log_dir.as_os_str().to_owned(),
         );
     }
+    let expected_identity = selection
+        .managed_identity()
+        .context("managed target identity is missing")?;
+    if let Some(configuration) = configuration {
+        anyhow::ensure!(
+            expected_identity.configuration_id == configuration.runtime_configuration_id,
+            "configuration differs from the generation selected for this companion"
+        );
+    }
+    environment.insert(
+        "BMUX_MANAGED_TARGET_IDENTITY".into(),
+        serde_json::to_string(expected_identity)?.into(),
+    );
+    environment.insert(
+        "BMUX_MANAGED_TARGET_ID".into(),
+        expected_identity.target_id()?.into(),
+    );
+    let idle_seconds = configuration.map_or(900, |configuration| {
+        configuration.native.companion.idle_after_seconds
+    });
+    environment.insert(
+        "BMUX_MANAGED_IDLE_GRACE_SECONDS".into(),
+        idle_seconds.to_string().into(),
+    );
+    let launch_image = companion
+        .prepare_launch_image(&roots.runtime_dir)
+        .context("prepare verified companion launch image")?;
+    environment.insert(
+        "BMUX_MANAGED_EXECUTABLE_SHA256".into(),
+        companion.sha256.clone().into(),
+    );
     let mut spec = RuntimeLaunchSpec {
-        executable: companion.executable.clone(),
+        executable: launch_image,
         arguments: ["server", "start", "--foreground-internal"]
             .into_iter()
             .map(OsString::from)
@@ -163,27 +254,33 @@ async fn connect_selection_inner(
         working_directory: roots.data_dir.clone(),
         ownership_file: roots.runtime_dir.join("companion-startup.lock"),
         diagnostic_file: roots.runtime_dir.join("companion-startup.log"),
-        timeout: Duration::from_secs(20),
+        timeout: MANAGED_STARTUP_TIMEOUT,
         poll_interval: Duration::from_millis(25),
     };
-    // One reconciler per persistent runtime, independent of build directories.
-    let reconcile_lock = OpenOptions::new()
+    // One reconciler per selected generation target, never a durable-root-wide
+    // lock: unrelated builds may be running concurrently under storage fencing.
+    let reconcile_path = roots.runtime_dir.join("companion-reconcile.lock");
+    let mut reconcile_options = OpenOptions::new();
+    reconcile_options
         .create(true)
         .truncate(false)
         .read(true)
-        .write(true)
-        .open(roots.runtime_dir.join("companion-reconcile.lock"))?;
-    let deadline = Instant::now() + timeout;
-    loop {
-        match reconcile_lock.try_lock() {
-            Ok(()) => break,
-            Err(std::fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
-                tokio::time::sleep(Duration::from_millis(25)).await
-            }
-            Err(error) => bail!("runtime reconciliation lock unavailable: {error}"),
-        }
+        .write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        reconcile_options.custom_flags(libc::O_NOFOLLOW);
     }
-    let _legacy_claim = guard_legacy_managed_runtime(roots).await?;
+    let reconcile_lock = reconcile_options.open(&reconcile_path)?;
+    // Contention and readiness consume one startup budget, rather than giving
+    // contenders only the per-RPC timeout while the owner can take longer.
+    let reconciliation_deadline = Instant::now() + MANAGED_STARTUP_TIMEOUT;
+    wait_for_reconciliation_claim(&reconcile_lock, reconciliation_deadline, spec.poll_interval)
+        .await?;
+    validate_claim(&reconcile_path, &reconcile_lock)?;
+    if let Some(identity) = selection.managed_identity() {
+        crate::managed_storage::validate_managed_storage_roots(&identity.durable_roots, roots)?;
+    }
     let configuration = configuration.map(|configuration| configuration.bmux_toml.as_bytes());
     let config_generation = configuration.map(configuration_digest);
     if let Some(bytes) = configuration {
@@ -202,12 +299,41 @@ async fn connect_selection_inner(
             .insert("BMUX_NO_BASE_CONFIG".into(), "1".into());
     }
     let mut repaired = false;
+    let mut drain_retries = 0;
+    let mut reconnect_retries = 0;
     loop {
-        let outcome = ensure_runtime(&spec, || probe_paths(&paths, timeout)).await?;
-        let mut client = connect_at_paths(&paths, timeout)
-            .await
-            .context("connect selected companion for readiness")?;
-        let readiness = tokio::time::timeout(
+        anyhow::ensure!(
+            Instant::now() < reconciliation_deadline,
+            "selected target reconciliation timed out"
+        );
+        let remaining = reconciliation_deadline
+            .checked_duration_since(Instant::now())
+            .context("selected target reconciliation timed out")?;
+        let outcome = match tokio::time::timeout(
+            remaining,
+            ensure_runtime(&spec, || probe_managed_paths(selection, &paths, timeout)),
+        )
+        .await
+        .context("selected target reconciliation timed out")?
+        {
+            Ok(outcome) => outcome,
+            Err(error) if retryable_disconnect(&error) && reconnect_retries < 2 => {
+                reconnect_retries += 1;
+                pause(&spec, reconciliation_deadline).await?;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        let mut client = match connect_at_paths(&paths, timeout).await {
+            Ok(client) => client,
+            Err(error) if retryable_disconnect(&error) && reconnect_retries < 2 => {
+                reconnect_retries += 1;
+                pause(&spec, reconciliation_deadline).await?;
+                continue;
+            }
+            Err(error) => return Err(error).context("connect selected companion for readiness"),
+        };
+        let readiness = match tokio::time::timeout(
             timeout,
             bmux_pane_runtime_plugin_api::pane_runtime_readiness_v1::client::runtime_readiness(
                 &mut client,
@@ -215,7 +341,18 @@ async fn connect_selection_inner(
         )
         .await
         .context("runtime readiness timed out")?
-        .with_context(|| readiness_failure_context(outcome, &spec))?;
+        {
+            Ok(readiness) => readiness,
+            Err(error) if retryable_readiness_dispatch(&error) && reconnect_retries < 2 => {
+                reconnect_retries += 1;
+                pause(&spec, reconciliation_deadline).await?;
+                continue;
+            }
+            Err(error) => {
+                return Err(error).with_context(|| readiness_failure_context(outcome, &spec));
+            }
+        };
+        authenticate_managed_readiness(selection, &readiness)?;
         let receipt_path = roots.runtime_dir.join("companion-activation.json");
         let existing_receipt = match std::fs::read(&receipt_path) {
             Ok(bytes) => Some(
@@ -225,21 +362,8 @@ async fn connect_selection_inner(
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(error) => return Err(error).context("read managed activation receipt"),
         };
-        if matches!(outcome, RuntimeLaunchOutcome::AlreadyRunning)
-            && let Some(generation) = &config_generation
-        {
-            anyhow::ensure!(
-                existing_receipt.as_ref().is_some_and(|receipt| {
-                    receipt
-                        .get("configuration_sha256")
-                        .and_then(serde_json::Value::as_str)
-                        == Some(generation.as_str())
-                        && receipt.get("instance") == Some(&serde_json::json!(readiness.instance))
-                }),
-                "selected companion uses a different or unproved configuration generation; \
-                 explicitly stop only this runtime before applying changed configuration"
-            );
-        }
+        // Configuration identity is authenticated by live readiness, not this
+        // diagnostic receipt (which can survive a crashed activation).
         let mut receipt = serde_json::json!({
             "schema_version": 1, "instance": readiness.instance,
             "executable_sha256": readiness.executable_sha256,
@@ -262,30 +386,14 @@ async fn connect_selection_inner(
             std::fs::rename(temporary, &receipt_path)?;
             true
         } else {
-            match std::fs::read(&receipt_path) {
-                Ok(bytes) => {
-                    serde_json::from_slice::<serde_json::Value>(&bytes)
-                        .context("corrupt managed activation receipt")?
-                        == receipt
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-                Err(error) => return Err(error.into()),
-            }
+            existing_receipt.as_ref() == Some(&receipt)
         };
         let identity = tokio::time::timeout(timeout, client.whoami_principal())
             .await
             .context("runtime identity timed out")??;
-        let roots_match = readiness.runtime_dir == roots.runtime_dir.to_string_lossy()
-            && readiness.config_dir == roots.config_dir.to_string_lossy()
-            && readiness.data_dir == roots.data_dir.to_string_lossy()
-            && readiness.state_dir == roots.state_dir.to_string_lossy();
-        let observation = if readiness.executable_sha256.is_none() {
-            crate::reconciliation::Observation::Unknown(
-                "runtime executable identity is unavailable".into(),
-            )
-        } else if !roots_match {
-            crate::reconciliation::Observation::Unknown("runtime reported different roots".into())
-        } else if readiness.helper_ready && !readiness.fenced {
+        let observation = if readiness.fenced {
+            crate::reconciliation::Observation::Draining
+        } else if readiness.helper_ready {
             crate::reconciliation::Observation::Ready
         } else {
             crate::reconciliation::Observation::Unhealthy {
@@ -295,6 +403,26 @@ async fn connect_selection_inner(
         };
         match crate::reconciliation::plan(observation, repaired) {
             crate::reconciliation::Action::Attach => return Ok(client),
+            crate::reconciliation::Action::Wait => {
+                anyhow::ensure!(
+                    drain_retries < 2,
+                    "selected target repeatedly drained during connection admission"
+                );
+                drain_retries += 1;
+                drop(client);
+                let drain_deadline = reconciliation_deadline.min(Instant::now() + timeout);
+                loop {
+                    if matches!(
+                        probe_until(drain_deadline, probe_paths(&paths, timeout)).await?,
+                        RuntimeProbe::Absent
+                    ) {
+                        break;
+                    }
+                    pause(&spec, drain_deadline).await.context(
+                        "selected target is draining; preserved without forced shutdown",
+                    )?;
+                }
+            }
             crate::reconciliation::Action::FenceAndRestart => {
                 let fence = tokio::time::timeout(timeout,
                     bmux_pane_runtime_plugin_api::pane_runtime_readiness_v1::client::fence_unhealthy(&mut client, readiness.instance)
@@ -307,6 +435,7 @@ async fn connect_selection_inner(
                 let current = tokio::time::timeout(timeout,
                     bmux_pane_runtime_plugin_api::pane_runtime_readiness_v1::client::runtime_readiness(&mut client)
                 ).await.context("fenced runtime readiness timed out")??;
+                authenticate_managed_readiness(selection, &current)?;
                 anyhow::ensure!(
                     current.instance == fence.instance && current.fenced,
                     "runtime incarnation changed after fencing"
@@ -328,7 +457,10 @@ async fn connect_selection_inner(
                 repaired = true;
                 let stop_deadline = Instant::now() + timeout;
                 loop {
-                    if matches!(probe_paths(&paths, timeout).await?, RuntimeProbe::Absent) {
+                    if matches!(
+                        probe_until(stop_deadline, probe_paths(&paths, timeout)).await?,
+                        RuntimeProbe::Absent
+                    ) {
                         break;
                     }
                     anyhow::ensure!(
@@ -347,6 +479,36 @@ async fn connect_selection_inner(
             ),
         }
     }
+}
+
+fn authenticate_managed_readiness(
+    selection: &crate::runtime_selection::RuntimeSelection,
+    readiness: &bmux_pane_runtime_plugin_api::pane_runtime_readiness_v1::RuntimeReadiness,
+) -> Result<()> {
+    let expected = selection
+        .managed_identity()
+        .context("managed target identity is missing")?;
+    let observed: crate::runtime_selection::ManagedTargetIdentity = serde_json::from_str(
+        readiness
+            .managed_target_identity
+            .as_deref()
+            .context("live runtime did not report managed target identity")?,
+    )
+    .context("live runtime reported malformed managed target identity")?;
+    expected.verify_identity(&observed)?;
+    anyhow::ensure!(
+        readiness.executable_sha256.as_deref() == Some(expected.companion_sha256.as_str()),
+        "live runtime executable differs from selected companion"
+    );
+    let roots = selection.roots();
+    anyhow::ensure!(
+        readiness.runtime_dir == roots.runtime_dir.to_string_lossy()
+            && readiness.config_dir == roots.config_dir.to_string_lossy()
+            && readiness.data_dir == roots.data_dir.to_string_lossy()
+            && readiness.state_dir == roots.state_dir.to_string_lossy(),
+        "live runtime roots differ from selected target"
+    );
+    Ok(())
 }
 
 async fn connect_at_paths(
@@ -461,80 +623,7 @@ fn write_configuration_snapshot(path: &std::path::Path, bytes: &[u8]) -> Result<
     Ok(())
 }
 
-/// Do not bypass a live pre-boot-namespace companion sharing the durable roots.
-/// Keep its existing lifetime claim locked through startup admission. Stale files
-/// are preserved: a device mismatch here is not permission to unlink anything.
-async fn guard_legacy_managed_runtime(
-    roots: &crate::runtime_paths::RuntimeRoots,
-) -> Result<Option<std::fs::File>> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
-        let root = roots.config_dir.parent().context("missing managed root")?;
-        let legacy = root.join("runtime");
-        if roots.runtime_dir == legacy {
-            return Ok(None);
-        }
-        let claim_path = legacy.join("server-lifetime.lock");
-        let claim = match OpenOptions::new().read(true).write(true).open(&claim_path) {
-            Ok(file) => {
-                file.try_lock().context(
-                    "legacy managed runtime is running or starting; explicitly stop it before migrating",
-                )?;
-                let named = std::fs::symlink_metadata(&claim_path)?;
-                let opened = file.metadata()?;
-                anyhow::ensure!(
-                    named.is_file() && named.dev() == opened.dev() && named.ino() == opened.ino(),
-                    "legacy lifetime claim was replaced"
-                );
-                use std::io::{Read as _, Seek as _};
-                anyhow::ensure!(opened.len() <= 128, "oversized legacy ownership receipt");
-                let mut receipt = String::new();
-                let mut reader = &file;
-                reader.rewind()?;
-                reader.read_to_string(&mut receipt)?;
-                if !receipt.is_empty() {
-                    let parts: Vec<_> = receipt.split_whitespace().collect();
-                    anyhow::ensure!(
-                        parts.len() == 3
-                            && parts[0] == "bmux-endpoint-v1"
-                            && parts[1].parse::<u64>().is_ok()
-                            && parts[2].parse::<u64>().is_ok()
-                            && receipt == format!("bmux-endpoint-v1 {} {}\n", parts[1], parts[2]),
-                        "unsupported or corrupt legacy ownership receipt"
-                    );
-                }
-                Some(file)
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-            Err(error) => return Err(error).context("inspect legacy lifetime claim"),
-        };
-        let socket = legacy.join("server.sock");
-        match std::fs::symlink_metadata(&socket) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(claim),
-            Err(error) => return Err(error).context("inspect legacy endpoint"),
-            Ok(metadata) => anyhow::ensure!(
-                metadata.file_type().is_socket() && claim.is_some(),
-                "legacy endpoint has uncertain ownership; refusing migration"
-            ),
-        }
-        match tokio::time::timeout(
-            Duration::from_millis(500),
-            tokio::net::UnixStream::connect(socket),
-        )
-        .await
-        {
-            Ok(Err(error)) if error.kind() == std::io::ErrorKind::ConnectionRefused => Ok(claim),
-            _ => bail!("legacy managed endpoint is live or uncertain; refusing migration"),
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = roots;
-        Ok(None)
-    }
-}
-
+/// Protocol incompatibility is terminal, never interpreted as endpoint absence.
 fn runtime_incompatibility(error: &anyhow::Error) -> Option<String> {
     match error.downcast_ref::<bmux_client::ClientError>()? {
         bmux_client::ClientError::ProtocolIncompatible { reason } => Some(format!("{reason:?}")),
@@ -548,6 +637,57 @@ fn runtime_incompatibility(error: &anyhow::Error) -> Option<String> {
     }
 }
 
+/// Only read-only readiness calls use this broader transport classification:
+/// generated dispatch erases I/O kinds, so do not infer them from `details`.
+/// Server refusals and representation failures are never retried.
+fn retryable_readiness_dispatch(error: &bmux_plugin_sdk::TypedServiceClientError) -> bool {
+    matches!(
+        error,
+        bmux_plugin_sdk::TypedServiceClientError::Dispatch(
+            bmux_plugin_sdk::TypedDispatchClientError::Transport { .. }
+        )
+    )
+}
+
+fn retryable_disconnect(error: &anyhow::Error) -> bool {
+    if let Some(typed) = error.downcast_ref::<bmux_plugin_sdk::TypedServiceClientError>() {
+        return retryable_readiness_dispatch(typed);
+    }
+    transport_unavailable(error)
+        || matches!(error.downcast_ref::<bmux_client::ClientError>(),
+        Some(bmux_client::ClientError::Transport(bmux_ipc::transport::IpcTransportError::Io(io)))
+        if matches!(io.kind(), std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::UnexpectedEof))
+}
+
+fn transport_unavailable(error: &anyhow::Error) -> bool {
+    matches!(error.downcast_ref::<bmux_client::ClientError>(),
+        Some(bmux_client::ClientError::Transport(bmux_ipc::transport::IpcTransportError::Io(io)))
+        if matches!(io.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::WouldBlock)
+            || io.raw_os_error() == Some(231))
+}
+
+async fn probe_managed_paths(
+    selection: &crate::runtime_selection::RuntimeSelection,
+    paths: &bmux_config::ConfigPaths,
+    timeout: Duration,
+) -> Result<RuntimeProbe> {
+    let state = probe_paths(paths, timeout).await?;
+    if !matches!(state, RuntimeProbe::Compatible) {
+        return Ok(state);
+    }
+    let mut client = connect_at_paths(paths, timeout).await?;
+    let readiness = tokio::time::timeout(
+        timeout,
+        bmux_pane_runtime_plugin_api::pane_runtime_readiness_v1::client::runtime_readiness(
+            &mut client,
+        ),
+    )
+    .await
+    .context("managed identity readiness timed out")??;
+    authenticate_managed_readiness(selection, &readiness)?;
+    Ok(RuntimeProbe::Compatible)
+}
+
 async fn probe_paths(paths: &bmux_config::ConfigPaths, timeout: Duration) -> Result<RuntimeProbe> {
     match connect_at_paths(paths, timeout).await {
         Ok(_) => Ok(RuntimeProbe::Compatible),
@@ -557,10 +697,7 @@ async fn probe_paths(paths: &bmux_config::ConfigPaths, timeout: Duration) -> Res
             }
             // A held claim means starting only for transport-level unavailability.
             // Authentication/protocol/application failures remain explicit errors.
-            let unavailable = matches!(error.downcast_ref::<bmux_client::ClientError>(),
-                Some(bmux_client::ClientError::Transport(bmux_ipc::transport::IpcTransportError::Io(io)))
-                if matches!(io.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::WouldBlock)
-                    || io.raw_os_error() == Some(231));
+            let unavailable = transport_unavailable(&error);
             if !unavailable {
                 return Err(error)
                     .context("selected endpoint state is uncertain; refusing replacement");
@@ -723,22 +860,37 @@ where
             action => bail!("selected runtime is incompatible: {action:?}"),
         }
     }
-    let ownership = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let ownership = options
         .open(&spec.ownership_file)
         .context("open runtime startup ownership file")?;
     loop {
         match ownership.try_lock() {
             Ok(()) => break,
-            Err(std::fs::TryLockError::WouldBlock) => pause(spec, deadline).await?,
+            Err(std::fs::TryLockError::WouldBlock) => {
+                // The child deliberately retains this inherited claim for its
+                // foreground lifetime. Readiness, not lock release, lets another
+                // launcher reuse it. Never require the ready companion to exit.
+                match probe_until(deadline, probe()).await? {
+                    RuntimeProbe::Compatible => return Ok(RuntimeLaunchOutcome::AlreadyRunning),
+                    RuntimeProbe::Incompatible(reason) => {
+                        bail!("selected runtime is incompatible: {reason}");
+                    }
+                    RuntimeProbe::Absent | RuntimeProbe::Starting => pause(spec, deadline).await?,
+                }
+            }
             Err(std::fs::TryLockError::Error(error)) => {
                 return Err(error).context("lock runtime startup");
             }
         }
     }
+    validate_claim(&spec.ownership_file, &ownership)?;
     // The previous owner may have completed startup while this caller waited.
     loop {
         match probe_until(deadline, probe()).await? {
@@ -827,7 +979,7 @@ impl PendingChild {
             })
             .context("reserve companion reaper")?;
         Ok(Self {
-            child: Some(spawn_detached(spec)?),
+            child: Some(spawn_detached(spec, &ownership)?),
             ownership: Some(ownership),
             reaper: sender,
         })
@@ -854,6 +1006,47 @@ impl Drop for PendingChild {
             std::mem::forget(undelivered.0);
         }
     }
+}
+
+async fn wait_for_reconciliation_claim(
+    claim: &std::fs::File,
+    deadline: Instant,
+    poll_interval: Duration,
+) -> Result<()> {
+    loop {
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "selected target startup timed out waiting for reconciliation ownership; runtime preserved"
+        );
+        match claim.try_lock() {
+            Ok(()) => return Ok(()),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                tokio::time::sleep(poll_interval.min(remaining)).await;
+            }
+            Err(std::fs::TryLockError::Error(error)) => {
+                return Err(error).context("runtime reconciliation lock unavailable");
+            }
+        }
+    }
+}
+
+fn validate_claim(path: &std::path::Path, file: &std::fs::File) -> Result<()> {
+    let named = std::fs::symlink_metadata(path).context("inspect named startup claim")?;
+    let opened = file.metadata().context("inspect opened startup claim")?;
+    anyhow::ensure!(
+        named.is_file() && opened.is_file(),
+        "startup claim is not a regular file"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        anyhow::ensure!(
+            named.dev() == opened.dev() && named.ino() == opened.ino(),
+            "startup claim was replaced while waiting"
+        );
+    }
+    Ok(())
 }
 
 fn validate(spec: &RuntimeLaunchSpec) -> Result<()> {
@@ -896,7 +1089,7 @@ async fn pause(spec: &RuntimeLaunchSpec, deadline: Instant) -> Result<()> {
     Ok(())
 }
 
-fn spawn_detached(spec: &RuntimeLaunchSpec) -> Result<Child> {
+fn spawn_detached(spec: &RuntimeLaunchSpec, ownership: &std::fs::File) -> Result<Child> {
     let diagnostics = OpenOptions::new()
         .create(true)
         .append(true)
@@ -908,7 +1101,14 @@ fn spawn_detached(spec: &RuntimeLaunchSpec) -> Result<Child> {
         .env_clear()
         .envs(&spec.environment)
         .current_dir(&spec.working_directory)
-        .stdin(Stdio::null())
+        // An inherited duplicate, not a fresh open, keeps the same OS claim
+        // across launcher death and the child's pre-exec interval. Bootstrap
+        // authenticates this descriptor against the selected target lock path.
+        .stdin(Stdio::from(
+            ownership.try_clone().context("duplicate startup claim")?,
+        ))
+        .env("BMUX_COMPANION_STARTUP_LOCK_PROTOCOL", "v1")
+        .env("BMUX_COMPANION_STARTUP_LOCK", &spec.ownership_file)
         .stdout(Stdio::null())
         .stderr(Stdio::from(diagnostics));
     detach(&mut command);

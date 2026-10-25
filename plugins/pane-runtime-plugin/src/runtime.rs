@@ -7,6 +7,8 @@ pub(crate) mod execution;
 pub(crate) mod human_input;
 pub(crate) mod input_authority;
 pub(crate) mod live_presentation;
+pub(crate) mod managed_idle;
+mod managed_scope;
 pub(crate) mod reservations;
 mod startup_capture;
 pub(crate) mod supervisor;
@@ -48,6 +50,14 @@ use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tracing::{trace, warn};
+
+pub(crate) fn managed_target_identity() -> Result<Option<&'static str>, String> {
+    managed_scope::selected().map(|scope| scope.map(|scope| scope.identity.as_str()))
+}
+
+pub(crate) fn activate_managed_scope() {
+    managed_scope::activate();
+}
 
 static PANE_BLOCKING_THREAD_COUNT: AtomicUsize = AtomicUsize::new(0);
 
@@ -1067,6 +1077,7 @@ impl Drop for PendingPublicationGuard {
 }
 
 struct PreparedCleanup {
+    _admission: managed_idle::Admission,
     runtime: tokio::runtime::Handle,
     _permit: tokio::sync::OwnedSemaphorePermit,
 }
@@ -1085,6 +1096,7 @@ impl PreparedCleanup {
             spawn_failure(bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::SpawnError::Busy)
         })?;
         Ok(Arc::new(Self {
+            _admission: managed_idle::admit()?,
             runtime,
             _permit: permit,
         }))
@@ -2807,6 +2819,19 @@ fn configure_pane_terminal_env(
         command.env("BMUX_IMAGE_PROTOCOL", protocol);
     } else {
         command.env_remove("BMUX_IMAGE_PROTOCOL");
+    }
+}
+
+fn clear_managed_launch_env(command: &mut CommandBuilder) {
+    // Launch authority belongs to this server, not nested ordinary servers
+    // started by its shells or detached programs.
+    command.env_remove("BMUX_MANAGED_EXECUTABLE_SHA256");
+    for key in [
+        "BMUX_MANAGED_TARGET_IDENTITY",
+        "BMUX_MANAGED_TARGET_ID",
+        "BMUX_MANAGED_IDLE_GRACE_SECONDS",
+    ] {
+        command.env_remove(key);
     }
 }
 
@@ -5409,6 +5434,7 @@ impl SessionRuntimeManager {
         session: SessionId,
         client: ClientId,
     ) -> Result<(), SessionRuntimeError> {
+        let _admission = managed_idle::admit().map_err(|_| SessionRuntimeError::Closed)?;
         let runtime = self
             .runtimes
             .get_mut(&session)
@@ -5917,6 +5943,7 @@ impl SessionRuntimeManager {
             &bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::TerminalExecutionRef,
         >,
     ) -> Result<PreparedFreshRuntime> {
+        reservations::check_authority()?;
         validate_initial_shell_options(options.as_ref())?;
         if self.runtimes.contains_key(&session_id) {
             anyhow::bail!("runtime already exists for session {}", session_id.0);
@@ -5985,6 +6012,8 @@ impl SessionRuntimeManager {
         panes: &[PaneRuntimeMeta],
         request: RestoreRuntimeRequest,
     ) -> Result<()> {
+        reservations::check_authority()?;
+        let _admission = managed_idle::admit()?;
         let RestoreRuntimeRequest {
             layout_root,
             focused_pane_id,
@@ -6488,6 +6517,7 @@ impl SessionRuntimeManager {
                     );
                 (command, format!("shell '{shell}'"))
             };
+            clear_managed_launch_env(&mut command);
             command.env_remove("APPLICATION_RESURRECTION_HOST");
             if let Some(resume) = &application_resume {
                 command.env("APPLICATION_RESURRECTION_HOST", &resume.endpoint);
@@ -8073,6 +8103,8 @@ impl SessionRuntimeManager {
         session_id: SessionId,
         target: Option<PaneSelector>,
     ) -> Result<Uuid> {
+        let _admission = managed_idle::admit()?;
+        reservations::check_authority()?;
         let (pane_meta, padding_override, padding_override_persistence) = {
             let session = self
                 .runtimes
@@ -8220,6 +8252,8 @@ impl SessionRuntimeManager {
         context_id: Option<Uuid>,
         client_id: Option<ClientId>,
     ) -> Result<FloatingPaneRuntimeSummary> {
+        let _admission = managed_idle::admit()?;
+        reservations::check_authority()?;
         let (target_pane_id, next_pane_name, shell, client_ids) = {
             let session = self
                 .runtimes
@@ -9044,6 +9078,7 @@ impl SessionRuntimeManager {
         session_id: SessionId,
         client_id: ClientId,
     ) -> Result<(), SessionRuntimeError> {
+        let _admission = managed_idle::admit().map_err(|_| SessionRuntimeError::Closed)?;
         if crate::handlers::attach_commands::observer_identity(client_id) {
             return Err(SessionRuntimeError::NotAttached);
         }
@@ -13702,6 +13737,28 @@ exit 7"#
     }
 
     use super::*;
+
+    #[test]
+    fn nested_program_environment_cannot_inherit_managed_launch_authority() {
+        let mut command = CommandBuilder::new("sh");
+        for key in [
+            "BMUX_MANAGED_TARGET_IDENTITY",
+            "BMUX_MANAGED_TARGET_ID",
+            "BMUX_MANAGED_IDLE_GRACE_SECONDS",
+        ] {
+            command.env(key, "parent-owned");
+        }
+        command.env("BMUX_MANAGED_EXECUTABLE_SHA256", "parent-owned");
+        clear_managed_launch_env(&mut command);
+        assert!(command.get_env("BMUX_MANAGED_EXECUTABLE_SHA256").is_none());
+        for key in [
+            "BMUX_MANAGED_TARGET_IDENTITY",
+            "BMUX_MANAGED_TARGET_ID",
+            "BMUX_MANAGED_IDLE_GRACE_SECONDS",
+        ] {
+            assert!(command.get_env(key).is_none());
+        }
+    }
 
     #[test]
     fn pane_terminal_environment_hides_outer_host_and_advertises_virtual_images() {
@@ -20605,6 +20662,126 @@ exit 7"#
         publication.decide(false);
         publication.decide(true);
         assert!(!publication.wait());
+    }
+
+    fn assert_managed_idle_rejects_racing_preparation(
+        manager: &Arc<Mutex<SessionRuntimeManager>>,
+        session: SessionId,
+    ) {
+        let contender = Arc::clone(manager);
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let competing = Arc::clone(&barrier);
+        let runtime = tokio::runtime::Handle::current();
+        let thread = {
+            let guard = manager.lock().unwrap();
+            let thread = std::thread::spawn(move || {
+                let _runtime = runtime.enter();
+                competing.wait();
+                contender
+                    .lock()
+                    .unwrap()
+                    .prepare_fresh_runtime(session, None)
+                    .is_err()
+            });
+            barrier.wait();
+            assert!(managed_idle::fence_for_test(&guard));
+            thread
+        };
+        assert!(
+            thread.join().unwrap(),
+            "admission racing the shutdown fence must reject before spawn"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn managed_idle_fence_serializes_real_prepare_attach_and_restore() {
+        const CHILD: &str = "BMUX_TEST_MANAGED_IDLE_AUTHORITY_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            // Exercise the real singleton admission authority in a fresh process;
+            // its sticky fence must not poison unrelated concurrently running tests.
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "runtime::tests::managed_idle_fence_serializes_real_prepare_attach_and_restore",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env_remove("BMUX_MANAGED_TARGET_ID")
+                .env_remove("BMUX_MANAGED_TARGET_IDENTITY")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        let session = SessionId(Uuid::new_v4());
+        let client = ClientId(Uuid::new_v4());
+        let pane = Uuid::new_v4();
+        let mut manager = manager_with_runtime(session, runtime_with_panes(&[pane]));
+        manager.begin_attach(session, client).unwrap();
+        assert!(!managed_idle::fence_for_test(&manager));
+        manager.end_attach(session, client);
+        assert!(
+            !managed_idle::fence_for_test(&manager),
+            "detached quiet shell still owns work"
+        );
+        let runtime = manager.runtimes.remove(&session).unwrap();
+        shutdown_runtime_handle(RemovedRuntime {
+            session_id: session,
+            handle: runtime,
+        })
+        .await;
+        let prepared_connection = Uuid::new_v4();
+        let lease = managed_idle::preparation_for_test(prepared_connection, None, false);
+        assert!(
+            !managed_idle::fence_for_test(&manager),
+            "prepared connection blocks idle before any runtime exists"
+        );
+        assert_eq!(
+            managed_idle::preparation_for_test(prepared_connection, Some(lease), false),
+            lease
+        );
+        managed_idle::preparation_for_test(prepared_connection, Some(lease), true);
+        let prepared = manager.prepare_fresh_runtime(session, None).unwrap();
+        assert!(
+            !managed_idle::fence_for_test(&manager),
+            "unpublished startup must block retirement"
+        );
+        // Abandon before launch; the real cancellation cleanup keeps its admission.
+        drop(prepared);
+        // No spawned child exists in this preparation: the gated startup owner
+        // wakes on cancellation. Wait boundedly for actual cleanup ownership.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !managed_idle::admissions_settled_for_test() {
+            assert!(
+                Instant::now() < deadline,
+                "startup cleanup failed to settle"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let manager = Arc::new(Mutex::new(manager));
+        assert_managed_idle_rejects_racing_preparation(&manager, session);
+        let mut manager = Arc::try_unwrap(manager).ok().unwrap().into_inner().unwrap();
+        assert!(manager.prepare_fresh_runtime(session, None).is_err());
+        manager
+            .runtimes
+            .insert(session, runtime_with_panes(&[pane]));
+        assert!(manager.begin_attach(session, client).is_err());
+        assert!(manager.begin_observer_attach(session, client).is_err());
+        assert!(
+            manager
+                .restore_runtime(
+                    SessionId(Uuid::new_v4()),
+                    &[],
+                    RestoreRuntimeRequest::default()
+                )
+                .is_err()
+        );
+        let runtime = manager.runtimes.remove(&session).unwrap();
+        shutdown_runtime_handle(RemovedRuntime {
+            session_id: session,
+            handle: runtime,
+        })
+        .await;
     }
 
     #[test]

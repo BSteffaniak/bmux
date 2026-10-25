@@ -1642,7 +1642,8 @@ impl BmuxServer {
 
     /// Request server shutdown.
     pub fn request_shutdown(&self) {
-        let _ = self.shutdown_tx.send(true);
+        // Retain shutdown intent even before run() installs its receiver.
+        self.shutdown_tx.send_replace(true);
     }
 
     /// Spawn a forwarder that subscribes to the process-local plugin
@@ -1823,6 +1824,18 @@ impl BmuxServer {
         self.run_impl(None).await
     }
 
+    /// Run with a one-shot readiness notification after initialization and restore.
+    /// The notification is not a substitute for an authenticated client handshake.
+    ///
+    /// # Errors
+    /// Returns binding, initialization, and accept-loop failures.
+    pub async fn run_with_readiness(
+        &self,
+        ready: oneshot::Sender<std::result::Result<(), String>>,
+    ) -> Result<()> {
+        self.run_impl(Some(ready)).await
+    }
+
     #[allow(clippy::too_many_lines)]
     async fn run_impl(
         &self,
@@ -1850,10 +1863,6 @@ impl BmuxServer {
 
         info!("bmux server listening on {:?}", self.endpoint);
         emit_event(&self.state, Event::ServerStarted)?;
-        if let Some(tx) = ready_tx.take() {
-            let _ = tx.send(Ok(()));
-        }
-
         // Register the wire-event sink so plugins can publish wire
         // events through the `WireEventSinkHandle` trait object in the
         // plugin state registry, without depending on `packages/server`.
@@ -1880,6 +1889,9 @@ impl BmuxServer {
             }
         }
 
+        if let Some(tx) = ready_tx.take() {
+            let _ = tx.send(Ok(()));
+        }
         // Snapshot debounce + flush loop is owned by the snapshot
         // plugin's activate (see `plugins/snapshot-plugin/src/lib.rs`).
         // Server no longer spawns its own tokio flush task.
@@ -1890,6 +1902,9 @@ impl BmuxServer {
         let mut shutdown_rx = self.shutdown_tx.subscribe();
         let mut connections = tokio::task::JoinSet::new();
         let shutdown_reason = loop {
+            if *shutdown_rx.borrow() {
+                break "graceful_shutdown_requested";
+            }
             tokio::select! {
                 changed = shutdown_rx.changed() => {
                     if changed.is_ok() && *shutdown_rx.borrow() {
@@ -4410,6 +4425,16 @@ mod tests {
         })
         .await
         .unwrap()
+    }
+
+    #[test]
+    fn shutdown_requested_before_subscription_is_retained() {
+        let endpoint = IpcEndpoint::unix_socket(
+            std::env::temp_dir().join(format!("bmux-early-shutdown-{}.sock", Uuid::new_v4())),
+        );
+        let server = BmuxServer::new(endpoint);
+        server.request_shutdown();
+        assert!(*server.shutdown_tx.subscribe().borrow());
     }
 
     #[cfg(unix)]

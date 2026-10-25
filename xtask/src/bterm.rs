@@ -266,7 +266,7 @@ mod tests {
     #[test]
     fn stages_all_platform_layouts_and_detects_corruption() {
         let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         let source = dir.path().join("source");
         fs::create_dir(&source).unwrap();
         for name in [

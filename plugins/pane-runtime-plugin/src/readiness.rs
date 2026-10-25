@@ -65,8 +65,29 @@ fn sha256(path: &std::path::Path) -> std::io::Result<String> {
         }))
 }
 
+/// Linux exposes the mapped executable even after its directory entry is replaced.
+/// Do not canonicalize this procfs handle into the mutable installation pathname.
+#[cfg(target_os = "linux")]
+fn running_executable_sha256() -> Option<String> {
+    sha256(std::path::Path::new("/proc/self/exe")).ok()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn running_executable_sha256() -> Option<String> {
+    // This is an explicit startup attestation, not a hash of current_exe(). The
+    // application must verify its immutable bundle/manifest before activation.
+    std::env::var("BMUX_MANAGED_EXECUTABLE_SHA256")
+        .ok()
+        .filter(|digest| {
+            digest.len() == 64
+                && digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+}
+
 pub(crate) fn activate(context: &NativeLifecycleContext) {
-    let error = helper_error(context);
+    let mut error = helper_error(context);
     let _ = HELPER.set(
         context
             .auxiliary_executables
@@ -78,11 +99,16 @@ pub(crate) fn activate(context: &NativeLifecycleContext) {
                 )
             }),
     );
-    let executable_sha256 = std::env::current_exe().and_then(|path| sha256(&path)).ok();
+    let executable_sha256 = running_executable_sha256();
+    let managed_target_identity = std::env::var("BMUX_MANAGED_TARGET_IDENTITY").ok();
+    if managed_target_identity.is_some() && executable_sha256.is_none() {
+        error.get_or_insert_with(|| "running executable identity unavailable; immutable bundle startup attestation required on this platform".into());
+    }
     let _ = STATE.set(Mutex::new(RuntimeReadiness {
         instance: uuid::Uuid::new_v4(),
         process_id: std::process::id(),
         executable_sha256,
+        managed_target_identity,
         runtime_dir: context.connection.runtime_dir.clone(),
         config_dir: context.connection.config_dir.clone(),
         data_dir: context.connection.data_dir.clone(),
@@ -153,9 +179,11 @@ pub(crate) fn snapshot() -> Result<RuntimeReadiness, String> {
         .lock()
         .map_err(|_| "readiness lock poisoned")?
         .clone();
+    state.fenced |= crate::runtime::managed_idle::is_fenced()?;
     state.restart_blocker = blocker(&state);
     if state.helper_ready
-        && let Err(error) = verify_helper()
+        && let Err(error) =
+            crate::runtime::reservations::check_authority().and_then(|()| verify_helper())
     {
         state.helper_ready = false;
         state.helper_error = Some(error.to_string());
@@ -242,6 +270,7 @@ mod tests {
             instance: uuid::Uuid::new_v4(),
             process_id: 42,
             executable_sha256: Some("a".repeat(64)),
+            managed_target_identity: None,
             runtime_dir: "/runtime".into(),
             config_dir: "/config".into(),
             data_dir: "/data".into(),

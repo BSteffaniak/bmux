@@ -23,7 +23,20 @@ async fn fresh_companion_exposes_authoritative_readiness() {
         .expect("fresh companion must register readiness service");
     assert_eq!(readiness.runtime_dir, server.runtime_dir.to_string_lossy());
     assert!(!readiness.fenced);
-    assert!(readiness.executable_sha256.is_some());
+    assert!(
+        readiness.managed_target_identity.is_none(),
+        "ordinary test server is not a managed bundle launch"
+    );
+    #[cfg(target_os = "linux")]
+    assert!(
+        readiness.executable_sha256.is_some(),
+        "Linux has mapped-image proof through /proc/self/exe"
+    );
+    #[cfg(not(target_os = "linux"))]
+    assert!(
+        readiness.executable_sha256.is_none(),
+        "ordinary server has no immutable-bundle startup attestation; do not report a mutable pathname hash as mapped-image proof"
+    );
     assert!(readiness.helper_ready || readiness.helper_error.is_some());
     server.stop();
 }

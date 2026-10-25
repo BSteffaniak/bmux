@@ -139,6 +139,12 @@ impl raw_window_handle::HasDisplayHandle for SurfaceTarget {
 /// Application callbacks execute serially on the event-loop thread. Consumers own
 /// retained presentation, redraw scheduling, and successful-output acknowledgement.
 pub trait WindowApplication {
+    /// Keep the main window hidden until startup has produced usable output.
+    /// The default preserves immediate visibility for other native consumers.
+    fn ready_to_show(&self) -> bool {
+        true
+    }
+
     fn event(
         &mut self,
         context: &mut WindowContext<'_>,
@@ -241,6 +247,7 @@ struct Host<A> {
     window: Option<Arc<Window>>,
     proxy: PlatformProxy,
     active: bool,
+    shown: bool,
     input: crate::input::InputAdapter,
     error: Option<PlatformError>,
 }
@@ -265,6 +272,13 @@ impl<A: WindowApplication> Host<A> {
         if let Err(err) = self.application.event(&mut context, event) {
             self.error = Some(err);
             event_loop.exit();
+        } else if self.active
+            && !self.shown
+            && !event_loop.exiting()
+            && self.application.ready_to_show()
+        {
+            window.set_visible(true);
+            self.shown = true;
         }
     }
 }
@@ -303,11 +317,6 @@ impl<A: WindowApplication> ApplicationHandler<()> for Host<A> {
         {
             let size = metrics(window);
             self.dispatch(event_loop, PlatformEvent::Resized(size));
-        }
-        if self.error.is_none()
-            && let Some(window) = &self.window
-        {
-            window.set_visible(true);
         }
     }
 
@@ -417,6 +426,7 @@ pub fn run(
         window: None,
         proxy,
         active: false,
+        shown: false,
         input: crate::input::InputAdapter::default(),
         accessibility: None,
         error: None,
@@ -469,6 +479,21 @@ mod tests {
             // Keep the AccessKit-before-show lifecycle for both choices.
             assert!(!attributes.visible);
         }
+    }
+
+    #[test]
+    fn application_visibility_default_remains_opt_out() {
+        struct ImmediateApplication;
+        impl WindowApplication for ImmediateApplication {
+            fn event(
+                &mut self,
+                _context: &mut WindowContext<'_>,
+                _event: PlatformEvent,
+            ) -> Result<(), PlatformError> {
+                Ok(())
+            }
+        }
+        assert!(ImmediateApplication.ready_to_show());
     }
 
     #[test]

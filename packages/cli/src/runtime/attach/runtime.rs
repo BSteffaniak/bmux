@@ -228,6 +228,9 @@ trait AttachHost {
         feature = "image-iterm2"
     ))]
     fn detect_image_capabilities(&mut self) -> bmux_image::host_caps::HostImageCapabilities;
+
+    /// Embedding notification after the authoritative attachment commits.
+    fn attachment_committed(&mut self) {}
 }
 
 struct TerminalAttachHost<'a, T: AttachTerminal + ?Sized>(&'a mut T);
@@ -471,11 +474,16 @@ pub struct NativeAttachHost {
     observer: Option<super::observer::AttachObserverPublisher>,
     accepted_revision: Arc<std::sync::atomic::AtomicU64>,
     pending: std::collections::VecDeque<NativeAttachEvent>,
+    attach_committed: Option<Box<dyn FnOnce() + Send>>,
     config_paths: Option<ConfigPaths>,
     config_loader: Option<NativeConfigLoader>,
     clipboard: Option<NativeClipboardCallback>,
 }
 impl NativeAttachHost {
+    /// One-shot notification after the server commits this native attachment.
+    pub fn set_attach_committed(&mut self, callback: impl FnOnce() + Send + 'static) {
+        self.attach_committed = Some(Box::new(callback));
+    }
     /// Pin configuration and mutable UI state to the explicitly selected runtime.
     pub fn set_config_paths(&mut self, paths: ConfigPaths) {
         self.config_paths = Some(paths);
@@ -550,6 +558,7 @@ impl NativeAttachHost {
                 ),
                 accepted_revision,
                 pending: std::collections::VecDeque::new(),
+                attach_committed: None,
                 config_paths: None,
                 config_loader: None,
                 clipboard: None,
@@ -558,6 +567,11 @@ impl NativeAttachHost {
     }
 }
 impl AttachHost for NativeAttachHost {
+    fn attachment_committed(&mut self) {
+        if let Some(callback) = self.attach_committed.take() {
+            callback();
+        }
+    }
     fn queue_native_event(&mut self, event: NativeAttachEvent) {
         self.pending.push_front(event);
     }
@@ -4597,6 +4611,7 @@ async fn run_session_attach_with_host<T: AttachHost + ?Sized>(
             .map_err(map_attach_client_error)?
     };
 
+    terminal.attachment_committed();
     let capture_targets = match recording_state::client::capture_targets(&mut client).await {
         Ok(targets) => targets.into_iter().map(Into::into).collect(),
         Err(error) => {

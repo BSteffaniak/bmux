@@ -14,6 +14,7 @@
 #![warn(clippy::all, clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
 
+mod managed_catalog;
 mod orchestrator;
 
 pub use bmux_snapshot_plugin_api::envelope::{CombinedSnapshotEnvelope, SectionV1};
@@ -80,12 +81,25 @@ impl RustPlugin for SnapshotPlugin {
             },
         );
 
+        let managed_catalog = config
+            .as_ref()
+            .map(|config| managed_catalog::ManagedCatalog::capture(&config.snapshot_path))
+            .transpose()
+            .map_err(|error| PluginCommandError::failed(error.to_string()))?
+            .flatten();
+        if let Some(catalog) = &managed_catalog {
+            let discovery = catalog
+                .discovery()
+                .map_err(|error| PluginCommandError::failed(error.to_string()))?;
+            tracing::warn!(%discovery, "managed snapshot layout ownership and discovery");
+        }
         // Build the concrete orchestrator.
         let orchestrator = BmuxSnapshotOrchestrator::new(
             config.as_ref().map(|c| c.snapshot_path.clone()),
             Arc::clone(&dirty_flag_arc),
             Arc::clone(&stateful_registry),
-        );
+        )
+        .with_managed_catalog(managed_catalog);
         let orchestrator = Arc::new(orchestrator);
         let handle = SnapshotOrchestratorHandle::from_shared(Arc::clone(&orchestrator));
         let handle_entry = Arc::new(RwLock::new(handle));

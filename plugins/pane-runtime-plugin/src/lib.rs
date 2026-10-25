@@ -249,6 +249,7 @@ impl RustPlugin for PaneRuntimePlugin {
         &mut self,
         context: NativeLifecycleContext,
     ) -> std::result::Result<i32, PluginCommandError> {
+        runtime::activate_managed_scope();
         application_resurrection::activate(&context);
         readiness::activate(&context);
         runtime::supervisor::activate(&context);

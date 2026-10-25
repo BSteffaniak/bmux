@@ -52,6 +52,345 @@ impl Drop for StartupOwnership {
     }
 }
 
+pub(super) fn inherit_companion_startup_fence(
+    paths: &bmux_config::ConfigPaths,
+    foreground_internal: bool,
+) -> anyhow::Result<Option<File>> {
+    use anyhow::{Context as _, ensure};
+    let protocol = std::env::var_os("BMUX_COMPANION_STARTUP_LOCK_PROTOCOL");
+    let selected = std::env::var_os("BMUX_COMPANION_STARTUP_LOCK");
+    if protocol.is_none() && selected.is_none() {
+        return Ok(None);
+    }
+    ensure!(
+        foreground_internal,
+        "companion startup fence requires foreground server"
+    );
+    ensure!(
+        protocol.as_deref() == Some(std::ffi::OsStr::new("v1")),
+        "unsupported companion startup fence protocol"
+    );
+    let path = std::path::PathBuf::from(selected.context("missing companion startup fence path")?);
+    ensure!(
+        path.is_absolute() && path == paths.runtime_dir.join("companion-startup.lock"),
+        "companion startup fence selects different runtime"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsFd as _;
+        use std::os::unix::fs::MetadataExt as _;
+        // Descriptor cloning retains the inherited open-file description and
+        // sets CLOEXEC, so future execution children cannot prolong the fence.
+        let descriptor = std::io::stdin()
+            .as_fd()
+            .try_clone_to_owned()
+            .context("cannot retain companion startup fence")?;
+        let file = File::from(descriptor);
+        let named = std::fs::symlink_metadata(&path)?;
+        let opened = file.metadata()?;
+        ensure!(
+            named.is_file()
+                && opened.is_file()
+                && named.dev() == opened.dev()
+                && named.ino() == opened.ino(),
+            "companion startup fence descriptor does not match selected file"
+        );
+        // The original stdin also shares the fence; CLOEXEC on the duplicate
+        // alone would still let execution children retain the original forever.
+        // SAFETY: fcntl only changes descriptor flags on this process's stdin.
+        let flags = unsafe { libc::fcntl(libc::STDIN_FILENO, libc::F_GETFD) };
+        ensure!(
+            flags >= 0
+                && unsafe {
+                    libc::fcntl(libc::STDIN_FILENO, libc::F_SETFD, flags | libc::FD_CLOEXEC)
+                } >= 0,
+            "cannot protect companion startup fence from child inheritance: {}",
+            std::io::Error::last_os_error()
+        );
+        Ok(Some(file))
+    }
+    #[cfg(not(unix))]
+    anyhow::bail!("inherited companion startup fences are unsupported on this platform")
+}
+
+/// Verify inherited digest claims before any plugin may advertise them. Keep
+/// the opened image alive for the server lifetime. No environment mutation is
+/// safe here: bootstrap already runs inside a multithreaded Tokio runtime.
+pub(super) fn attest_managed_executable(foreground_internal: bool) -> Result<Option<File>> {
+    if std::env::var_os("BMUX_MANAGED_TARGET_IDENTITY").is_none() {
+        ensure!(
+            std::env::var_os("BMUX_MANAGED_EXECUTABLE_SHA256").is_none(),
+            "executable attestation requires explicit managed launch"
+        );
+        return Ok(None);
+    }
+    ensure!(
+        foreground_internal,
+        "managed executable attestation requires foreground launch"
+    );
+    #[cfg(target_os = "macos")]
+    {
+        macos_attestation::verify().map(Some)
+    }
+    // Linux readiness hashes the kernel's /proc/self/exe handle directly.
+    #[cfg(target_os = "linux")]
+    {
+        Ok(None)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    anyhow::bail!("managed executing-image attestation is unsupported on this platform")
+}
+
+#[cfg(target_os = "macos")]
+mod macos_attestation {
+    use anyhow::{Context as _, Result, ensure};
+    use serde::{Deserialize, Serialize};
+    use sha2::{Digest as _, Sha256};
+    use std::collections::BTreeSet;
+    use std::fs::{File, OpenOptions};
+    use std::io::Read as _;
+    use std::os::darwin::fs::MetadataExt as _;
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+    use std::path::{Component, Path, PathBuf};
+
+    // Darwin proc_info.h PROC_PIDREGIONPATHINFO layout. libc exposes the
+    // vnode portion, but not this enclosing VM region structure.
+    #[repr(C)]
+    struct RegionInfo {
+        protection: [u32; 4],
+        offset: u64,
+        accounting: [u32; 14],
+        address: u64,
+        size: u64,
+    }
+    #[repr(C)]
+    struct RegionPath {
+        region: RegionInfo,
+        vnode: libc::vnode_info_path,
+    }
+    unsafe extern "C" {
+        fn _dyld_get_image_header(index: u32) -> *const libc::c_void;
+    }
+
+    #[derive(Deserialize, Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct Manifest {
+        schema_version: u32,
+        compatibility_id: String,
+        target: String,
+        artifacts: Vec<Artifact>,
+    }
+    #[derive(Deserialize, Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct Artifact {
+        role: String,
+        path: PathBuf,
+        sha256: String,
+    }
+
+    fn hex_digest(bytes: &[u8]) -> String {
+        use std::fmt::Write as _;
+        let mut result = String::with_capacity(bytes.len() * 2);
+        for byte in bytes {
+            write!(&mut result, "{byte:02x}").expect("writing into String cannot fail");
+        }
+        result
+    }
+
+    fn hash(mut file: File) -> Result<String> {
+        let mut digest = Sha256::new();
+        let mut buffer = vec![0_u8; 65536];
+        loop {
+            let count = file.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            digest.update(&buffer[..count]);
+        }
+        Ok(hex_digest(&digest.finalize()))
+    }
+
+    fn open(path: &Path) -> Result<File> {
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+            .context("open selected managed artifact without following symlinks")
+    }
+
+    fn mapped_identity() -> Result<(u64, u64)> {
+        // SAFETY: image zero is the process's main Mach-O image. Its address is
+        // used only as a kernel query key; no image memory is dereferenced.
+        let header = unsafe { _dyld_get_image_header(0) };
+        ensure!(!header.is_null(), "main Mach-O image is unavailable");
+        let mut output = std::mem::MaybeUninit::<RegionPath>::zeroed();
+        let size = i32::try_from(std::mem::size_of::<RegionPath>())?;
+        // SAFETY: output is writable storage of exactly the advertised size;
+        // PROC_PIDREGIONPATHINFO=8 queries this process's mapped backing vnode.
+        let count = unsafe {
+            libc::proc_pidinfo(
+                libc::getpid(),
+                8,
+                header as u64,
+                output.as_mut_ptr().cast(),
+                size,
+            )
+        };
+        ensure!(
+            count == size,
+            "kernel cannot attest the executing Mach-O backing vnode: {}",
+            std::io::Error::last_os_error()
+        );
+        // SAFETY: the complete structure was initialized by the successful query.
+        let output = unsafe { output.assume_init() };
+        let address = header as u64;
+        ensure!(
+            output.region.address <= address
+                && address - output.region.address < output.region.size,
+            "kernel image evidence does not contain the main Mach-O header"
+        );
+        let stat = output.vnode.vip_vi.vi_stat;
+        ensure!(
+            stat.vst_ino != 0,
+            "executing image has no file-backed vnode evidence"
+        );
+        Ok((u64::from(stat.vst_dev), stat.vst_ino))
+    }
+
+    fn verify_image_evidence(selected: (u64, u64), mapped: (u64, u64), flags: u32) -> Result<()> {
+        ensure!(
+            selected == mapped,
+            "selected pathname is not the executing Mach-O image; preserve the original immutable bundle"
+        );
+        ensure!(
+            flags & (libc::UF_IMMUTABLE | libc::SF_IMMUTABLE) != 0,
+            "managed macOS companion image must be immutable (UF_IMMUTABLE or SF_IMMUTABLE) before exec"
+        );
+        Ok(())
+    }
+
+    pub(super) fn verify() -> Result<File> {
+        let claimed = std::env::var("BMUX_MANAGED_EXECUTABLE_SHA256")
+            .context("managed macOS launch requires verified executable SHA-256 evidence")?;
+        let identity: serde_json::Value =
+            serde_json::from_str(&std::env::var("BMUX_MANAGED_TARGET_IDENTITY")?)?;
+        ensure!(
+            identity["companion_sha256"].as_str() == Some(claimed.as_str()),
+            "managed executable claim differs from selected target"
+        );
+        let executable = std::env::current_exe().context("locate candidate managed image")?;
+        let image = open(&executable)?;
+        let metadata = image.metadata()?;
+        ensure!(metadata.is_file(), "managed image is not a regular file");
+        verify_image_evidence(
+            (metadata.dev(), metadata.ino()),
+            mapped_identity()?,
+            metadata.st_flags(),
+        )?;
+        ensure!(
+            hash(image.try_clone()?)? == claimed,
+            "executing immutable companion digest differs from selected target"
+        );
+        let root = executable
+            .parent()
+            .context("managed image has no bundle root")?
+            .canonicalize()?;
+        let manifest: Manifest = serde_json::from_reader(open(&root.join("bterm-bundle.json"))?)?;
+        ensure!(
+            manifest.schema_version == 1
+                && manifest.compatibility_id == "bterm-bmux-v1"
+                && manifest.target == format!("{}-apple-darwin", std::env::consts::ARCH),
+            "unsupported managed bundle contract"
+        );
+        let artifact_set = hex_digest(&Sha256::digest(serde_json::to_vec(&manifest)?));
+        ensure!(
+            identity["artifact_set_sha256"].as_str() == Some(artifact_set.as_str()),
+            "managed bundle manifest differs from selected target"
+        );
+        let mut paths = BTreeSet::new();
+        let mut companions = 0;
+        let mut frontends = 0;
+        for artifact in &manifest.artifacts {
+            ensure!(
+                !artifact.path.as_os_str().is_empty()
+                    && artifact
+                        .path
+                        .components()
+                        .all(|part| matches!(part, Component::Normal(_)))
+                    && paths.insert(&artifact.path),
+                "invalid or duplicate managed bundle artifact path"
+            );
+            let path = root.join(&artifact.path).canonicalize()?;
+            ensure!(
+                path.starts_with(&root),
+                "managed bundle artifact escapes its root"
+            );
+            let file = open(&path)?;
+            ensure!(
+                hash(file.try_clone()?)? == artifact.sha256,
+                "managed bundle artifact digest mismatch"
+            );
+            if artifact.role == "companion" {
+                companions += 1;
+                let selected = file.metadata()?;
+                ensure!(
+                    (selected.dev(), selected.ino()) == (metadata.dev(), metadata.ino())
+                        && artifact.sha256 == claimed,
+                    "manifest companion is not the executing immutable image"
+                );
+            }
+            if artifact.role == "frontend" {
+                frontends += 1;
+            }
+        }
+        ensure!(
+            companions == 1 && frontends == 1,
+            "managed bundle requires exactly one companion and frontend"
+        );
+        let final_metadata = image.metadata()?;
+        verify_image_evidence(
+            (final_metadata.dev(), final_metadata.ino()),
+            mapped_identity()?,
+            final_metadata.st_flags(),
+        )?;
+        Ok(image)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn sha256_encoding_is_lowercase_full_width() {
+            assert_eq!(hex_digest(&[0, 15, 16, 255]), "000f10ff");
+            assert_eq!(
+                hex_digest(&Sha256::digest(b"abc")),
+                "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+            );
+        }
+
+        #[test]
+        fn pathname_replacement_never_attests_old_running_image() {
+            assert!(verify_image_evidence((1, 20), (1, 10), libc::UF_IMMUTABLE).is_err());
+            assert!(verify_image_evidence((2, 10), (1, 10), libc::UF_IMMUTABLE).is_err());
+        }
+
+        #[test]
+        fn mutable_same_inode_is_not_executing_byte_proof() {
+            assert!(verify_image_evidence((1, 10), (1, 10), 0).is_err());
+            verify_image_evidence((1, 10), (1, 10), libc::UF_IMMUTABLE).unwrap();
+            verify_image_evidence((1, 10), (1, 10), libc::SF_IMMUTABLE).unwrap();
+        }
+
+        #[test]
+        fn darwin_region_query_layout_matches_sdk_contract() {
+            assert_eq!(std::mem::size_of::<RegionInfo>(), 96);
+            assert_eq!(std::mem::offset_of!(RegionPath, vnode), 96);
+            assert!(mapped_identity().is_ok());
+        }
+    }
+}
+
 impl StartupOwnership {
     /// Nonblocking exclusion: a starting owner is not a stopped runtime.
     /// Acquired only in the real server process, never its daemon launcher.

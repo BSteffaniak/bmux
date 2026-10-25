@@ -24,19 +24,23 @@ impl Arguments {
         if let Some(root) = &self.runtime_root {
             return RuntimeSelection::resolve(Some(root.clone()), PathBuf::new(), PathBuf::new());
         }
-        let companion = match &self.companion {
-            Some(path) => path.clone(),
-            None => std::env::current_exe()
-                .context("locate Bterm bundle")?
-                .parent()
-                .context("Bterm executable has no bundle directory")?
-                .join(if cfg!(windows) { "bmux.exe" } else { "bmux" }),
-        };
+        let companion = self.companion_path()?;
         let root = match &self.managed_root {
             Some(root) => root.clone(),
             None => default_managed_root()?,
         };
         RuntimeSelection::resolve(None, companion, root)
+    }
+
+    fn companion_path(&self) -> Result<PathBuf> {
+        match &self.companion {
+            Some(path) => Ok(path.clone()),
+            None => Ok(std::env::current_exe()
+                .context("locate Bterm bundle")?
+                .parent()
+                .context("Bterm executable has no bundle directory")?
+                .join(if cfg!(windows) { "bmux.exe" } else { "bmux" })),
+        }
     }
 }
 
@@ -103,6 +107,9 @@ pub struct Arguments {
 
 #[derive(Debug, Subcommand)]
 pub enum ConfigurationCommand {
+    /// Start or reuse the exact managed companion without opening a window.
+    #[command(hide = true)]
+    ManagedConnect,
     /// Read-only configuration inspection; never opens a companion or window.
     Config {
         #[command(subcommand)]
@@ -453,6 +460,10 @@ impl<W: AttachWorker> Application<W> {
 }
 
 impl<W: AttachWorker> WindowApplication for Application<W> {
+    fn ready_to_show(&self) -> bool {
+        self.last_output.is_some()
+    }
+
     fn event(
         &mut self,
         context: &mut WindowContext<'_>,
@@ -503,35 +514,6 @@ pub fn run() -> Result<()> {
             }
         }
     }
-    if arguments.command.is_some() {
-        let roots = if let Some(context) = &sandbox {
-            sandbox_roots(context)
-        } else if let Some(root) = &arguments.runtime_root {
-            crate::runtime_paths::RuntimeRoots::from_root(root.clone())?
-        } else if let Some(root) = &arguments.managed_root {
-            crate::runtime_paths::RuntimeRoots::managed(root.clone())?
-        } else if let Some(slot) = &slot {
-            crate::runtime_paths::RuntimeRoots {
-                config_dir: slot.config_paths.config_dir.clone(),
-                runtime_dir: slot.config_paths.runtime_dir.clone(),
-                data_dir: slot.config_paths.data_dir.clone(),
-                state_dir: slot.config_paths.state_dir.clone(),
-            }
-        } else {
-            configuration.inputs.paths.managed_roots()?
-        };
-        let mut output = configuration.effective_json();
-        output["execution"] = serde_json::json!({
-            "mode": if sandbox.is_some() { "sandbox-attach" } else if arguments.slot.is_some() { "slot-attach" } else if arguments.runtime_root.is_some() { "external" } else { "managed" },
-            "config_dir": roots.config_dir,
-            "runtime_dir": roots.runtime_dir,
-            "data_dir": roots.data_dir,
-            "state_dir": roots.state_dir,
-            "sandbox_id": sandbox.as_ref().map(|context| &context.sandbox_id),
-        });
-        println!("{}", serde_json::to_string_pretty(&output)?);
-        return Ok(());
-    }
     let selection = if let Some(context) = &sandbox {
         RuntimeSelection::External {
             roots: sandbox_roots(context),
@@ -545,18 +527,62 @@ pub fn run() -> Result<()> {
                 state_dir: slot.config_paths.state_dir.clone(),
             },
         }
-    } else if arguments.runtime_root.is_some() || arguments.managed_root.is_some() {
-        arguments.resolve()?
-    } else {
-        let mut selection = arguments.resolve()?;
-        if let RuntimeSelection::Managed { roots, .. } = &mut selection {
-            *roots = configuration.inputs.paths.managed_roots()?;
+    } else if let Some(root) = &arguments.runtime_root {
+        RuntimeSelection::External {
+            roots: crate::runtime_paths::RuntimeRoots::from_root(root.clone())?,
         }
-        selection
+    } else {
+        RuntimeSelection::resolve_configured(
+            None,
+            arguments.companion_path()?,
+            configuration.inputs.paths.managed_roots()?,
+            &configuration,
+        )?
     };
+    if matches!(arguments.command, Some(ConfigurationCommand::Config { .. })) {
+        let roots = selection.roots();
+        let mut output = configuration.effective_json();
+        output["execution"] = serde_json::json!({
+            "mode": if sandbox.is_some() { "sandbox-attach" } else if arguments.slot.is_some() { "slot-attach" } else if arguments.runtime_root.is_some() { "external" } else { "managed" },
+            "config_dir": roots.config_dir,
+            "runtime_dir": roots.runtime_dir,
+            "data_dir": roots.data_dir,
+            "state_dir": roots.state_dir,
+            "sandbox_id": sandbox.as_ref().map(|context| &context.sandbox_id),
+            "managed_identity": selection.managed_identity(),
+        });
+        println!("{}", serde_json::to_string_pretty(&output)?);
+        return Ok(());
+    }
+    if matches!(
+        arguments.command,
+        Some(ConfigurationCommand::ManagedConnect)
+    ) {
+        anyhow::ensure!(
+            sandbox.is_none() && slot.is_none(),
+            "managed-connect requires managed runtime selection"
+        );
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?;
+        let report = runtime.block_on(crate::headless::run(&selection, &configuration))?;
+        println!("{}", serde_json::to_string(&report)?);
+        return Ok(());
+    }
     let decorations = configuration.native.window.decorations;
+    // Complete compatibility/readiness admission before creating even a hidden
+    // native surface. Keep the executor that owns the client's transport tasks.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("create companion connection executor")?;
+    let (client, preparation) = runtime.block_on(
+        crate::runtime_launch::prepare_native_configured(&selection, &configuration),
+    )?;
     run_window_with_options(
         BmuxWorker {
+            preparation,
+            prepared: Some(PreparedConnection { client, runtime }),
             selection,
             config: Some(configuration.bmux.clone()),
             configuration: Some(configuration),
@@ -721,7 +747,17 @@ impl Arguments {
     }
 }
 
+/// The connection and its executor are one ownership unit. Dropping an
+/// intermediate executor and reconnecting would lose transport tasks and reopen
+/// admission against a potentially different runtime incarnation.
+struct PreparedConnection<C> {
+    client: C,
+    runtime: tokio::runtime::Runtime,
+}
+
 struct BmuxWorker {
+    preparation: Option<crate::runtime_launch::NativePreparation>,
+    prepared: Option<PreparedConnection<bmux_client::BmuxClient>>,
     selection: RuntimeSelection,
     configuration: Option<crate::configuration::ResolvedConfiguration>,
     frozen_configuration: bool,
@@ -759,19 +795,29 @@ impl AttachWorker for BmuxWorker {
                 }
                 let next = captured.reload().map_err(|error| bmux_config::ConfigError::ReadError { error: error.to_string() })?;
                 if next.bmux_toml != captured.bmux_toml || next.native != captured.native {
-                    return Err(bmux_config::ConfigError::ReadError { error: "configuration changed; restart the selected runtime explicitly before applying a new generation".into() });
+                    return Err(bmux_config::ConfigError::ReadError { error: "configuration changed; reopen with the newly selected configuration generation".into() });
                 }
                 Ok(next.bmux)
             });
         }
         host.set_clipboard(move |request| clipboard.clipboard_request(request));
         self.handle = Some(handle);
-        let selection = self.selection.clone();
         let config = self
             .config
             .take()
             .context("BMUX frontend was already started")?;
+        let prepared = self
+            .prepared
+            .take()
+            .context("verified companion connection was already transferred")?;
+        let mut preparation = self.preparation.take();
+        if let Some(preparation) = &mut preparation {
+            host.set_attach_committed(preparation.commit_callback());
+        }
+        let paths = self.selection.roots().config_paths();
         let target = self.target.clone();
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        let (admit_tx, admit_rx) = std::sync::mpsc::sync_channel(1);
         let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
         self.result = Some(result_rx);
         self.thread = Some(
@@ -779,26 +825,39 @@ impl AttachWorker for BmuxWorker {
                 .name("bterm-attach".into())
                 .spawn(move || {
                     let result = (|| -> Result<()> {
-                        let runtime = tokio::runtime::Builder::new_multi_thread()
-                            .enable_all()
-                            .build()?;
+                        // This state is thread-local: initialize it on the same
+                        // thread that polls attachment, and report failure while
+                        // the window is still hidden.
+                        if let Err(error) =
+                            bmux_cli::attach::initialize_native_runtime_state(&config, &paths)
+                        {
+                            let _ = ready_tx.send(Err(format!("{error:#}")));
+                            return Err(error);
+                        }
+                        ready_tx
+                            .send(Ok(()))
+                            .map_err(|_| anyhow::anyhow!("native startup was abandoned"))?;
+                        // A late initialization result cannot admit attachment
+                        // after the window thread's bounded wait has failed.
+                        admit_rx
+                            .recv_timeout(std::time::Duration::from_secs(10))
+                            .context("native attachment admission was abandoned")?;
+                        let PreparedConnection { client, runtime } = prepared;
+                        // Never retry this operation: default-target resolution
+                        // and attach may already have admitted execution effects.
                         runtime.block_on(async {
-                            bmux_cli::attach::initialize_native_runtime_state(
-                                &config,
-                                &selection.roots().config_paths(),
-                            )?;
-                            let client = if let Some(configuration) = &configuration {
-                                crate::runtime_launch::connect_selection_configured(
-                                    &selection,
-                                    configuration,
+                            let attach = async {
+                                bmux_cli::attach::run_native_with_client(
+                                    client, &target, config, host,
                                 )
-                                .await?
-                            } else {
-                                crate::runtime_launch::connect_selection(&selection).await?
-                            };
-                            bmux_cli::attach::run_native_with_client(client, &target, config, host)
                                 .await?;
-                            Ok(())
+                                Ok(())
+                            };
+                            if let Some(preparation) = preparation {
+                                preparation.run(attach).await
+                            } else {
+                                attach.await
+                            }
                         })
                     })();
                     let _ = result_tx.send(result);
@@ -806,6 +865,13 @@ impl AttachWorker for BmuxWorker {
                 })
                 .context("start BMUX attachment worker")?,
         );
+        ready_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .context("wait for native attachment initialization")?
+            .map_err(anyhow::Error::msg)?;
+        admit_tx
+            .send(())
+            .context("admit initialized native attachment")?;
         Ok(())
     }
 
@@ -1073,6 +1139,8 @@ mod tests {
 
     fn worker_without_runtime() -> BmuxWorker {
         BmuxWorker {
+            preparation: None,
+            prepared: None,
             selection: RuntimeSelection::External {
                 roots: crate::runtime_paths::RuntimeRoots::from_root(std::env::temp_dir()).unwrap(),
             },
@@ -1089,6 +1157,80 @@ mod tests {
             scroll_remainder: [0.0; 2],
             modifiers: bmux_frontend_runtime::input::Modifiers::default(),
         }
+    }
+
+    #[test]
+    fn main_window_waits_for_committed_output_not_worker_start() {
+        let mut application = Application::new(worker_without_runtime()).unwrap();
+        assert!(!application.ready_to_show());
+        application.active = true;
+        assert!(!application.ready_to_show());
+        application.last_output = Some(PresentationIdentity {
+            epoch: "11111111-1111-1111-1111-111111111111".parse().unwrap(),
+            attached_id: "22222222-2222-2222-2222-222222222222".parse().unwrap(),
+            revision: 1,
+            viewport_generation: 1,
+        });
+        assert!(application.ready_to_show());
+    }
+
+    #[test]
+    fn prepared_connection_transfers_its_original_executor_and_client() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let client = std::sync::Arc::new(());
+        let expected = client.clone();
+        let (release, released) = tokio::sync::oneshot::channel();
+        // Model a transport task created during connection preparation. It must
+        // still be driven after the client moves to the attachment thread.
+        let transport = runtime.spawn(async move {
+            released.await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            42
+        });
+        let prepared = PreparedConnection { client, runtime };
+        std::thread::spawn(move || {
+            let PreparedConnection { client, runtime } = prepared;
+            assert!(std::sync::Arc::ptr_eq(&client, &expected));
+            release.send(()).unwrap();
+            assert_eq!(
+                runtime.block_on(async {
+                    tokio::time::timeout(std::time::Duration::from_secs(5), transport)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                }),
+                42
+            );
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn abandoned_prepared_connection_drops_client_before_executor() {
+        struct ClientDropProbe {
+            runtime: tokio::runtime::Handle,
+        }
+        impl Drop for ClientDropProbe {
+            fn drop(&mut self) {
+                // The connection may release runtime-owned transport resources
+                // during drop; its executor must still be available then.
+                self.runtime.block_on(async {
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                });
+            }
+        }
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let client = ClientDropProbe {
+            runtime: runtime.handle().clone(),
+        };
+        drop(PreparedConnection { client, runtime });
     }
 
     #[test]

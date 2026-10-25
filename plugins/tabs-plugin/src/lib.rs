@@ -4,6 +4,7 @@
 
 mod arrangements;
 mod cwd;
+mod durable_storage;
 mod storage_migration;
 
 use api_contexts_state::{ContextSelector, ContextSummary};
@@ -1188,8 +1189,14 @@ impl RustPlugin for TabsPlugin {
     fn activate(&mut self, context: NativeLifecycleContext) -> Result<i32, PluginCommandError> {
         cwd::CwdSettings::parse(context.settings.as_ref())
             .map_err(PluginCommandError::invalid_arguments)?;
+        durable_storage::configure(&context.connection.data_dir)
+            .map_err(PluginCommandError::failed)?;
+        let migration_guard = TAB_ORDER_MUTATION
+            .lock()
+            .map_err(PluginCommandError::failed)?;
         storage_migration::migrate(std::path::Path::new(&context.connection.data_dir))
             .map_err(PluginCommandError::failed)?;
+        drop(migration_guard);
         arrangements::activate(&context).map_err(PluginCommandError::failed)?;
         // Register the typed event-bus channel for pane-event so
         // subscribers (decoration, future UI plugins) can wait on
@@ -1221,12 +1228,17 @@ impl RustPlugin for TabsPlugin {
     }
 
     fn run_command(&mut self, context: NativeCommandContext) -> Result<i32, PluginCommandError> {
+        durable_storage::configure(&context.connection.data_dir)
+            .map_err(PluginCommandError::failed)?;
         handle_command(self, &context)?;
         Ok(EXIT_OK)
     }
 
     #[allow(clippy::too_many_lines)] // route_service! covers every tabs-commands op; the block is naturally long.
     fn invoke_service(&self, context: NativeServiceContext) -> ServiceResponse {
+        if let Err(error) = durable_storage::configure(&context.connection.data_dir) {
+            return ServiceResponse::error("storage_authority_unavailable", error);
+        }
         bmux_plugin_sdk::route_service!(context, {
             "tabs-placement-v1", "place-tab" => |req: PlaceTabArgs, ctx| {
                 Ok(place_tab(ctx, req.context_id, req.workspace_id))
@@ -1427,6 +1439,10 @@ impl RustPlugin for TabsPlugin {
         registry: &mut TypedServiceRegistry,
     ) {
         let total_started = Instant::now();
+        if let Err(error) = durable_storage::configure(&context.connection.data_dir) {
+            tracing::error!(%error, "tabs durable storage unavailable during service registration");
+            return;
+        }
         // Provider handles share the same `LastSelectedByClient` map
         // as the byte-encoded path on `TabsPlugin` so state stays
         // consistent between transports.
@@ -1576,9 +1592,7 @@ fn place_tab(
         .lock()
         .map_err(|_| "tab transfer lock poisoned")?;
     {
-        let _mutation = TAB_ORDER_MUTATION
-            .lock()
-            .map_err(|_| "tab order lock poisoned")?;
+        let _mutation = TAB_ORDER_MUTATION.lock()?;
         let mut state = arrangements::read_state(caller)?.ok_or("arrangement authority missing")?;
         if state
             .pending
@@ -1595,7 +1609,8 @@ fn place_tab(
     Ok(())
 }
 
-static TAB_TRANSFER_MUTATION: Mutex<()> = Mutex::new(());
+static TAB_TRANSFER_MUTATION: durable_storage::ArrangementMutation =
+    durable_storage::ArrangementMutation::transfer();
 
 fn complete_tab_placement(
     caller: &(impl HostRuntimeApi + Sync),
@@ -1619,9 +1634,7 @@ fn complete_tab_placement(
     ))
     .map_err(|error| error.to_string())?
     .map_err(|error| format!("{error:?}"))?;
-    let _mutation = TAB_ORDER_MUTATION
-        .lock()
-        .map_err(|_| "tab order lock poisoned")?;
+    let _mutation = TAB_ORDER_MUTATION.lock()?;
     let mut state = arrangements::read_state(caller)?.ok_or("arrangement authority missing")?;
     state.pending.remove(&context_id);
     arrangements::write_state(caller, &state)?;
@@ -1647,16 +1660,15 @@ fn recover_tab_placements(caller: &(impl HostRuntimeApi + Sync)) -> Result<(), S
 
 // Serializes read/modify/write operations across command and event dispatch.
 // Readers use persisted state, never attachment-local order caches.
-static TAB_ORDER_MUTATION: Mutex<()> = Mutex::new(());
+static TAB_ORDER_MUTATION: durable_storage::ArrangementMutation =
+    durable_storage::ArrangementMutation::new();
 
 fn append_context_to_workspace_order(
     caller: &(impl HostRuntimeApi + Sync),
     workspace_id: Uuid,
     context_id: Uuid,
 ) -> Result<(), String> {
-    let _mutation = TAB_ORDER_MUTATION
-        .lock()
-        .map_err(|_| "tab order lock poisoned")?;
+    let _mutation = TAB_ORDER_MUTATION.lock()?;
     let mut order = get_stored_tab_order_ids_for_workspace(caller, workspace_id)?;
     // Seed pre-existing resources before appending, including installations
     // predating persisted order. Never let a new tab precede those resources.
@@ -1681,9 +1693,7 @@ fn remove_context_from_all_workspace_orders(
     caller: &(impl HostRuntimeApi + Sync),
     context_id: Uuid,
 ) -> Result<(), String> {
-    let _mutation = TAB_ORDER_MUTATION
-        .lock()
-        .map_err(|_| "tab order lock poisoned")?;
+    let _mutation = TAB_ORDER_MUTATION.lock()?;
     if let Some(mut orders) = arrangements::read(caller)? {
         for order in orders.values_mut() {
             order.retain(|id| *id != context_id);
@@ -2504,9 +2514,7 @@ fn reset_tab_order(
     caller: &(impl HostRuntimeApi + Sync),
     runtime_state: &TabRuntimeStateHandle,
 ) -> Result<usize, String> {
-    let _mutation = TAB_ORDER_MUTATION
-        .lock()
-        .map_err(|_| "tab order lock poisoned")?;
+    let _mutation = TAB_ORDER_MUTATION.lock()?;
     let contexts = list_contexts_in_active_workspace(caller)?;
     let mut ids: Vec<Uuid> = contexts.iter().map(|context| context.id).collect();
     ids.sort_by_key(uuid::Uuid::as_u128);
@@ -2879,9 +2887,7 @@ fn move_tab(
         return Err(format!("target tab context not found: {target}"));
     }
 
-    let _mutation = TAB_ORDER_MUTATION
-        .lock()
-        .map_err(|_| "tab order lock poisoned")?;
+    let _mutation = TAB_ORDER_MUTATION.lock()?;
     let mut order_ids =
         get_stored_tab_order_ids_for_workspace(caller, active_workspace_id(caller))?;
     for id in resolve_tab_order_ids(caller, runtime_state, &contexts)? {

@@ -120,23 +120,27 @@ impl BtermPaths {
         self.state_dir.join("bmux")
     }
 
-    /// Boot-scoped transport plus Bterm-owned durable state; no BMUX selector
-    /// can redirect these writable roots. The config directory is for private
-    /// launch snapshots, not Bterm source discovery.
-    pub fn managed_roots(&self) -> Result<RuntimeRoots> {
-        let mut roots = RuntimeRoots::managed(self.default_managed_root())?;
-        // Older Bterm versions stored principal/plugin data beside runtime state.
-        // Keep that canonical location when present; never silently replace it
-        // with a fresh identity merely to adopt the split directory defaults.
+    /// Explicit Bterm-owned installation roots; no BMUX selector redirects
+    /// these roots. Configured selection derives boot/target transport later.
+    /// The config directory is for private launch snapshots, not source discovery.
+    /// Resolve complete roots without transport derivation; configured selection
+    /// supplies the final short, target-scoped endpoint after hashing inputs.
+    pub fn managed_base_roots(&self) -> Result<RuntimeRoots> {
+        let mut roots = RuntimeRoots::from_root(self.default_managed_root())?;
         if !roots.data_dir.try_exists()? {
             roots.data_dir = self.data_dir.join("bmux");
         }
         Ok(roots)
     }
+
+    pub fn managed_roots(&self) -> Result<RuntimeRoots> {
+        self.managed_base_roots()
+    }
 }
 
 /// A single runtime's complete configuration, endpoint, data and state namespace.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RuntimeRoots {
     pub config_dir: PathBuf,
     pub runtime_dir: PathBuf,
@@ -145,6 +149,77 @@ pub struct RuntimeRoots {
 }
 
 impl RuntimeRoots {
+    /// Normalize existing ancestors too, so creation of an absent leaf cannot
+    /// change its scope identity. Reject traversal rather than guessing intent.
+    pub fn normalized(&self) -> Result<Self> {
+        Ok(Self {
+            config_dir: normalize_absolute(&self.config_dir)?,
+            runtime_dir: normalize_absolute(&self.runtime_dir)?,
+            data_dir: normalize_absolute(&self.data_dir)?,
+            state_dir: normalize_absolute(&self.state_dir)?,
+        })
+    }
+
+    /// Derive writable runtime-local state without feeding generated paths back
+    /// into identity. Durable data stays explicit; callers must fence its writers.
+    pub fn for_target(&self, target: &str) -> Result<Self> {
+        self.for_target_boot(target, &boot_identity()?)
+    }
+
+    fn for_target_boot(&self, target: &str, boot: &str) -> Result<Self> {
+        use sha2::{Digest as _, Sha256};
+        use std::fmt::Write as _;
+        ensure!(
+            target.len() == 64
+                && target
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()),
+            "invalid managed target digest"
+        );
+        ensure!(
+            boot.len() == 32 && boot.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "invalid OS boot identity"
+        );
+        let roots = self.normalized()?;
+        let mut digest = Sha256::new();
+        digest.update(b"bterm-transport-v1\0");
+        digest.update(target.as_bytes());
+        digest.update(boot.as_bytes());
+        let mut transport = String::with_capacity(64);
+        for byte in digest.finalize() {
+            write!(transport, "{byte:02x}")?;
+        }
+        // A fixed short platform path avoids sockaddr_un limits even when HOME
+        // or explicit durable roots are long. Startup MUST secure this directory
+        // to the effective user before opening locks, records, or endpoints.
+        #[cfg(unix)]
+        let transport_parent = {
+            // SAFETY: geteuid has no arguments and only reads process identity.
+            let uid = unsafe { libc::geteuid() };
+            PathBuf::from(format!("/tmp/bt-{uid}"))
+        };
+        #[cfg(not(unix))]
+        let transport_parent = roots.runtime_dir.join("targets");
+        let runtime_dir = transport_parent.join(transport);
+        #[cfg(unix)]
+        ensure!(
+            runtime_dir
+                .join("server.sock")
+                .as_os_str()
+                .as_encoded_bytes()
+                .len()
+                < if cfg!(target_os = "macos") { 104 } else { 108 },
+            "managed socket path exceeds platform limit"
+        );
+        let local = roots.state_dir.join("targets").join(target);
+        Ok(Self {
+            config_dir: local.join("config"),
+            runtime_dir,
+            data_dir: roots.data_dir,
+            state_dir: roots.state_dir,
+        })
+    }
+
     /// Resolve a dedicated root using the same layout for managed and external runtimes.
     /// The root must be absolute and must not contain `..`; nothing is created.
     pub fn from_root(root: PathBuf) -> Result<Self> {
@@ -217,6 +292,46 @@ impl RuntimeRoots {
     }
 }
 
+/// Canonicalize the longest existing ancestor, retaining absent leaves. This is
+/// stable before/after first installation and does not create anything.
+fn normalize_absolute(path: &Path) -> Result<PathBuf> {
+    validate_absolute(path)?;
+    let clean: PathBuf = path
+        .components()
+        .filter(|part| *part != Component::CurDir)
+        .collect();
+    let mut ancestor = clean.as_path();
+    let mut suffix = Vec::new();
+    loop {
+        match ancestor.canonicalize() {
+            Ok(mut resolved) => {
+                for component in suffix.into_iter().rev() {
+                    resolved.push(component);
+                }
+                return Ok(resolved);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if let Ok(metadata) = ancestor.symlink_metadata() {
+                    ensure!(
+                        !metadata.file_type().is_symlink(),
+                        "cannot select a dangling runtime root symlink"
+                    );
+                }
+                suffix.push(
+                    ancestor
+                        .file_name()
+                        .context("runtime root has no existing ancestor")?
+                        .to_os_string(),
+                );
+                ancestor = ancestor
+                    .parent()
+                    .context("runtime root has no existing ancestor")?;
+            }
+            Err(error) => return Err(error).context("normalize selected runtime root"),
+        }
+    }
+}
+
 pub(crate) fn validate_absolute(path: &Path) -> Result<()> {
     ensure!(
         path.is_absolute(),
@@ -284,6 +399,54 @@ fn boot_identity() -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn configured_transport_fits_long_durable_roots_and_is_boot_scoped() {
+        let root = (0..30).fold(PathBuf::from("/explicit-installation"), |path, _| {
+            path.join("long-directory")
+        });
+        let base = RuntimeRoots::from_root(root).unwrap();
+        let target = "a".repeat(64);
+        let first = base
+            .for_target_boot(&target, "0123456789abcdef0123456789abcdef")
+            .unwrap();
+        let second = base
+            .for_target_boot(&target, "fedcba9876543210fedcba9876543210")
+            .unwrap();
+        assert_ne!(first.runtime_dir, second.runtime_dir);
+        assert_eq!(first.state_dir, base.state_dir);
+        assert_eq!(first.data_dir, base.data_dir);
+        assert_eq!(first.config_dir, second.config_dir);
+        #[cfg(unix)]
+        assert!(
+            first
+                .runtime_dir
+                .join("server.sock")
+                .as_os_str()
+                .as_encoded_bytes()
+                .len()
+                < 104
+        );
+        assert!(
+            base.for_target_boot("../escape", "0123456789abcdef0123456789abcdef")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn absent_root_normalization_ignores_dot_components_without_creation() {
+        let root = std::env::temp_dir().join(format!("bterm-absent-scope-{}", std::process::id()));
+        let direct = RuntimeRoots::from_root(root.clone())
+            .unwrap()
+            .normalized()
+            .unwrap();
+        let dotted = RuntimeRoots::from_root(root.join("."))
+            .unwrap()
+            .normalized()
+            .unwrap();
+        assert_eq!(direct, dotted);
+        assert!(!root.exists());
+    }
 
     #[test]
     fn boot_namespace_changes_only_transport_and_keeps_checkout_isolation() {

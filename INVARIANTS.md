@@ -107,6 +107,15 @@ exceptions.
 * **Configuration resolution is deterministic.** Entry points honor documented authority and precedence. Inspection does not silently rewrite declaratively managed configuration.
 * **Compatibility is explicit at evolving boundaries.** Service, attach, federation, and durable storage contracts define supported representations and reject unsupported ones rather than guessing. Upgrades do not bypass authentication, quorum, fencing, or durable-format validation.
 
+## Managed companion lifecycle
+
+* **Managed companion selection is compatibility-scoped.** A managed frontend reuses only a companion with verified artifact, configuration, and runtime-scope identity. When none exists, it starts the selected compatible companion without replacing or requiring shutdown of unrelated artifact versions. Explicit external, slot, and sandbox targets do not confer managed launch or replacement authority.
+* **Runtime isolation is not durable-data isolation by accident.** Different runtime scopes do not share endpoints or startup coordination. Artifact changes do not silently select an empty installation; concurrent access to durable data requires an explicit compatible storage contract and domain-owned coordination, not merely different socket names.
+* **Startup has one fenced owner per target.** Concurrent launchers coordinate through the same target-scoped authority through readiness or proven launch termination. A timeout, disconnected launcher, PID file, or refused connection alone does not authorize replacement, termination, or removal of ownership records.
+* **Attachment lifetime does not own execution lifetime.** Closing windows or losing connections does not terminate detached work. Managed idle shutdown is admitted by the owning runtime only when no attachment, pending admission, execution, or recovery requires it; admission and shutdown cannot both claim the same runtime as available.
+* **Retirement preserves outstanding authority.** Stopping a companion, pruning executable artifacts, and deleting durable data are distinct operations. Executables and ownership evidence remain available while executions or recovery depend on them; uncertain ownership is not permission to clean up.
+* **Readiness and failures are explicit.** A reachable endpoint or local receipt alone does not prove a compatible, usable companion. Startup and retry are bounded, do not silently change targets or duplicate execution effects, and report the selected target and blocker without exposing private configuration.
+
 ## Invariant evolution
 
 * **Conflicts require an explicit architectural decision.** Conflicts between a request, these invariants, `AGENTS.md`, or accepted ADRs must be surfaced rather than resolved through silent implementation or weaker wording.
