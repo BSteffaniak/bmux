@@ -188,7 +188,8 @@ enum border-style {
 }
 ```
 
-The generated code includes `impl Default for BorderStyle { fn default() -> Self { Self::Ascii } }`.
+The generated code includes `impl Default for BorderStyle { fn default() -> Self
+{ Self::Ascii } }`.
 
 ### `query`
 

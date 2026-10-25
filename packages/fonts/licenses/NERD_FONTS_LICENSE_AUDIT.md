@@ -15,6 +15,7 @@
 - Bitstream License - do what you want, attribution required
 - Ubuntu Font License 1.0 - do what you want, attribution and license must be included. There may be some ambiguity on the naming, but I believe we comply with it:
   - > (c) Modified Versions which are not Substantially Changed must be
+
     > renamed to both (i) retain the name of the Original Version and (ii) add
     > additional naming elements to distinguish the Modified Version from the
     > Original Version. The name of such Modified Versions must be the name of
@@ -23,7 +24,8 @@
 
 ## Original source works under Nerd Fonts repository
 
-All files created such as `font-patcher` and any `ph` or `sh` script/source files are released under an MIT license.
+All files created such as `font-patcher` and any `ph` or `sh` script/source
+files are released under an MIT license.
 
 ## Glyph/icon sources
 

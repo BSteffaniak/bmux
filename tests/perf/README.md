@@ -26,7 +26,8 @@ Artifacts are written to `target/perf-audit/<timestamp>/` and include:
 The suite uses `@driver real-attach` scenarios so production `bmux.perf`
 recording telemetry is the source of truth for real performance. The driver runs
 the normal attach runtime against a headless terminal adapter instead of relying
-only on playbook-side render reconstruction. `scripts/perf-audit.sh` runs playbooks with
+only on playbook-side render reconstruction. `scripts/perf-audit.sh` runs
+playbooks with
 `BMUX_PLAYBOOK_PERF_RECORDING_LEVEL=trace` by default, and playbook recordings
 explicitly include the `custom` event kind so real attach/server telemetry is
 available whenever the scenario drives those production paths.

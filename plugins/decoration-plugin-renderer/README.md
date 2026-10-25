@@ -1,7 +1,6 @@
 # bmux_decoration_plugin_renderer
 
-Client-side render extension for the [bmux decoration
-plugin](../decoration-plugin).
+Client-side render extension for the [bmux decorationplugin](../decoration-plugin).
 
 The decoration plugin runs in the bmux server process. Every time its internal
 state changes, it publishes a retained `DecorationScene` on the typed plugin

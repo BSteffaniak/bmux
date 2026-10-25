@@ -5,9 +5,14 @@
 
 ## Context
 
-“Cohesive and robust” requires measurable expectations. Without budgets, implementations can be logically correct yet visibly disruptive, retain unbounded data, or regress local bmux behavior. Early federation work needs provisional service-level objectives that Phase 11 tests can enforce and refine from evidence.
+“Cohesive and robust” requires measurable expectations. Without budgets,
+implementations can be logically correct yet visibly disruptive, retain
+unbounded data, or regress local bmux behavior. Early federation work needs
+provisional service-level objectives that Phase 11 tests can enforce and refine
+from evidence.
 
-These targets apply to the first complete trusted-domain federation release. They are engineering acceptance budgets, not an external uptime contract.
+These targets apply to the first complete trusted-domain federation release.
+They are engineering acceptance budgets, not an external uptime contract.
 
 ## Reference environments
 
@@ -18,7 +23,10 @@ Measure and report at least:
 3. **Mixed worker topology:** three voters plus five workers, 24 active panes, one client.
 4. **Fan-out stress:** 100 active panes, four attached clients, bounded synthetic output.
 
-Measurements use release builds on documented hardware. Tests report median, p95, p99 where sample count permits. Failure tests repeat at least 100 times before release gating unless runtime makes a smaller statistically justified count necessary.
+Measurements use release builds on documented hardware. Tests report median,
+p95, p99 where sample count permits. Failure tests repeat at least 100 times
+before release gating unless runtime makes a smaller statistically justified
+count necessary.
 
 ## Availability budgets
 
@@ -161,8 +169,12 @@ Metrics/logging must avoid raw terminal content and secret material.
 
 ## Architecture placement
 
-Telemetry primitives may be core-neutral, but cluster metric definitions and decisions remain cluster-owned. Performance instrumentation must not require cluster-domain APIs in `HostRuntimeApi`.
+Telemetry primitives may be core-neutral, but cluster metric definitions and
+decisions remain cluster-owned. Performance instrumentation must not require
+cluster-domain APIs in `HostRuntimeApi`.
 
 ## Acceptance criteria
 
-Phase 11 must document reference hardware and produce repeatable reports demonstrating every zero-tolerance invariant and percentile/resource target, or amend this ADR with evidence before release.
+Phase 11 must document reference hardware and produce repeatable reports
+demonstrating every zero-tolerance invariant and percentile/resource target, or
+amend this ADR with evidence before release.

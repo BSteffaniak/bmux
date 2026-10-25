@@ -5,11 +5,18 @@
 
 ## Context
 
-Placement must choose a worker for a logical pane without making retries, leader changes, or map iteration produce different outcomes. It must honor explicit constraints, avoid unhealthy or draining nodes, expose why candidates were accepted or rejected, and prefer stability without overriding safety or user intent.
+Placement must choose a worker for a logical pane without making retries, leader
+changes, or map iteration produce different outcomes. It must honor explicit
+constraints, avoid unhealthy or draining nodes, expose why candidates were
+accepted or rejected, and prefer stability without overriding safety or user
+intent.
 
 ## Decision
 
-Placement evaluates a quorum-confirmed control-state snapshot plus one bounded, leader-collected observation set. The leader converts all observations into an explicit, ordered placement input before proposal; deterministic state-machine apply never reads health, clocks, capacity, or network state.
+Placement evaluates a quorum-confirmed control-state snapshot plus one bounded,
+leader-collected observation set. The leader converts all observations into an
+explicit, ordered placement input before proposal; deterministic state-machine
+apply never reads health, clocks, capacity, or network state.
 
 ### Eligibility filters
 
@@ -23,11 +30,13 @@ Apply these hard filters in order and record the first rejection reason:
 6. Required capacity floor is available from the bounded observation set.
 7. Health is not `unavailable` or `incompatible`. Unknown health is ineligible for automatic placement but may be selected only by an explicit-node request with a visible warning.
 
-An explicit node narrows eligibility; it never bypasses membership, worker capability, compatibility, drain, required-label, capacity, or safety checks.
+An explicit node narrows eligibility; it never bypasses membership, worker
+capability, compatibility, drain, required-label, capacity, or safety checks.
 
 ### Deterministic ranking
 
-Rank eligible candidates lexicographically by the following tuple, lower values first:
+Rank eligible candidates lexicographically by the following tuple, lower values
+first:
 
 1. `preserve_current`: 0 when the current authoritative execution is still eligible and no move/restart was requested; otherwise 1.
 2. `preferred_label_misses`: count of preferred labels not matched.
@@ -37,15 +46,23 @@ Rank eligible candidates lexicographically by the following tuple, lower values 
 6. `locality_rank`: same ingress/region/zone preferences in that order, represented as explicit integer ranks rather than latency floats.
 7. Canonical `NodeId` bytes as the final total-order tie-breaker.
 
-No floating-point arithmetic, randomness, wall-clock reads, hash-map iteration order, or live probes participate in ranking. Retries with identical canonical inputs produce byte-identical candidate ordering and explanation output.
+No floating-point arithmetic, randomness, wall-clock reads, hash-map iteration
+order, or live probes participate in ranking. Retries with identical canonical
+inputs produce byte-identical candidate ordering and explanation output.
 
 ### Stability and spread
 
-Previous placement is a preference only after all hard constraints. It prevents gratuitous movement but cannot keep an unhealthy, incompatible, drained, or constraint-violating worker. Spread is soft unless a future schema explicitly marks it required; soft spread cannot make all candidates ineligible.
+Previous placement is a preference only after all hard constraints. It prevents
+gratuitous movement but cannot keep an unhealthy, incompatible, drained, or
+constraint-violating worker. Spread is soft unless a future schema explicitly
+marks it required; soft spread cannot make all candidates ineligible.
 
 ### Explanations
 
-Every decision records the input revision/observation epoch, selected node, ordered candidate tuples, hard-filter rejection reasons, and whether stability, labels, spread, health, capacity, locality, or the NodeId tie-break selected the winner. Explanations contain no secrets or raw terminal data.
+Every decision records the input revision/observation epoch, selected node,
+ordered candidate tuples, hard-filter rejection reasons, and whether stability,
+labels, spread, health, capacity, locality, or the NodeId tie-break selected the
+winner. Explanations contain no secrets or raw terminal data.
 
 ## Consequences
 

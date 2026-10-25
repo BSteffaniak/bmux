@@ -8,7 +8,8 @@ Perf coverage is built from three reusable pieces:
 
 ## Phase Events
 
-Use `bmux_perf_telemetry::PhasePayload` for new runtime markers. Do not hand-build marker JSON in each caller unless the payload is genuinely ad hoc.
+Use `bmux_perf_telemetry::PhasePayload` for new runtime markers. Do not
+hand-build marker JSON in each caller unless the payload is genuinely ad hoc.
 
 Standard channels:
 
@@ -33,7 +34,8 @@ Common fields should keep stable names:
 
 ## Configs
 
-Benchmark SLOs and reports belong in `perf/*.toml`, not runtime code and not shell loops.
+Benchmark SLOs and reports belong in `perf/*.toml`, not runtime code and not
+shell loops.
 
 Each benchmark config starts with manifest metadata:
 
@@ -81,7 +83,8 @@ filters = [
 ]
 ```
 
-Use `tags` for expensive diagnostic reports so normal runs can skip them unless the script enables the tag.
+Use `tags` for expensive diagnostic reports so normal runs can skip them unless
+the script enables the tag.
 
 Run manifests directly with:
 
@@ -95,7 +98,8 @@ bmux-perf-tools list-benchmarks --dir perf
 bmux-perf-tools validate-phase-schema --input /tmp/bmux-benchmark.json
 ```
 
-The scripts in `scripts/perf-*.sh` are compatibility wrappers around `run-benchmark`.
+The scripts in `scripts/perf-*.sh` are compatibility wrappers around
+`run-benchmark`.
 
 ## Profiles
 
@@ -116,7 +120,8 @@ Profile metadata lives in `perf/profiles.toml`.
 
 ## Plugin Benchmark Contract
 
-Plugin-owned benchmark coverage should be added without special host code whenever possible:
+Plugin-owned benchmark coverage should be added without special host code
+whenever possible:
 
 1. Emit runtime phases through `bmux_plugin_sdk::perf_telemetry` or `bmux_perf_telemetry` directly.
 2. Use `PhaseChannel::Plugin` for plugin command/service internals. The stable host command phase is `plugin.command` with `plugin_id`, `command_name`, and `total_us`.
@@ -128,18 +133,20 @@ Plugin-owned benchmark coverage should be added without special host code whenev
 8. Keep SLO limits in the manifest. Runtime/plugin code should not contain benchmark thresholds.
 9. Prefer generic setup/previsit/measured stages over benchmark-only command shortcuts. If a cold path matters, report it separately from warmed SLOs.
 
-The benchmark runner forwards all standard phase channels when their profile enables them. Plugin owners should not need bespoke stderr parsing or shell wrappers for phase collection.
+The benchmark runner forwards all standard phase channels when their profile
+enables them. Plugin owners should not need bespoke stderr parsing or shell
+wrappers for phase collection.
 
 ## Registry
 
-| Benchmark          | Manifest                       | Runner Kind          | Normal SLO                                                |
-| ------------------ | ------------------------------ | -------------------- | --------------------------------------------------------- |
-| Attach tab switch  | `perf/attach-tab-switch.toml`  | `attach-tab-switch`  | `attach.plugin_command` p99 \<= 8ms, retarget p99 \<= 8ms |
-| Codec payloads     | `perf/codec-payloads.toml`     | `codec-payloads`     | codec payload p99 \<= 0.08ms                              |
-| Core services      | `perf/core-services.toml`      | `core-services`      | core service p99 \<= 1ms                                  |
-| Generic IPC        | `perf/generic-ipc.toml`        | `generic-ipc`        | ping/invoke p99 \<= 5ms                                   |
-| Plugin hot path    | `perf/plugin-hot-path.toml`    | `plugin-hot-path`    | static service dispatch p99 \<= 5ms                       |
-| TUI runtime/render | `perf/tui-runtime-render.toml` | `tui-runtime-render` | end-to-end runtime/render p99 \<= 100ms                   |
+| Benchmark          | Manifest                       | Runner Kind          | Normal SLO                                              |
+| ------------------ | ------------------------------ | -------------------- | ------------------------------------------------------- |
+| Attach tab switch  | `perf/attach-tab-switch.toml`  | `attach-tab-switch`  | `attach.plugin_command` p99 <= 8ms, retarget p99 <= 8ms |
+| Codec payloads     | `perf/codec-payloads.toml`     | `codec-payloads`     | codec payload p99 <= 0.08ms                             |
+| Core services      | `perf/core-services.toml`      | `core-services`      | core service p99 <= 1ms                                 |
+| Generic IPC        | `perf/generic-ipc.toml`        | `generic-ipc`        | ping/invoke p99 <= 5ms                                  |
+| Plugin hot path    | `perf/plugin-hot-path.toml`    | `plugin-hot-path`    | static service dispatch p99 <= 5ms                      |
+| TUI runtime/render | `perf/tui-runtime-render.toml` | `tui-runtime-render` | end-to-end runtime/render p99 <= 100ms                  |
 
 ## Maintenance Checklist
 

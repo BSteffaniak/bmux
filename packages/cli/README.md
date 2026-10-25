@@ -22,15 +22,26 @@ Default launch behavior:
 - If the server is not running, bmux starts it in daemon mode.
 - If no session exists, bmux creates `tab-1` (or the next available `tab-N`) and attaches.
 
-The native autostart service runs `bmux server start` in the foreground so launchd, systemd, or Task Scheduler owns supervision and restart behavior; it deliberately does not use `--daemon`. `install` starts the service immediately unless `--no-start` is passed. Rerun `install` after moving or upgrading a non-stable executable path. If `[server.gateway]` is enabled, the gateway starts normally with the managed server—there is no separate gateway setting for autostart.
+The native autostart service runs `bmux server start` in the foreground so
+launchd, systemd, or Task Scheduler owns supervision and restart behavior; it
+deliberately does not use `--daemon`. `install` starts the service immediately
+unless `--no-start` is passed. Rerun `install` after moving or upgrading a
+non-stable executable path. If `[server.gateway]` is enabled, the gateway starts
+normally with the managed server—there is no separate gateway setting for
+autostart.
 
-On Linux, autostart targets the user manager's `default.target` and therefore starts at login. bmux does not enable lingering; users who explicitly need startup before login can separately configure `loginctl enable-linger`.
+On Linux, autostart targets the user manager's `default.target` and therefore
+starts at login. bmux does not enable lingering; users who explicitly need
+startup before login can separately configure `loginctl enable-linger`.
 
-`autostart install` safely refuses declarations owned by Nix, Home Manager, another tool, or the user. `autostart print` is side-effect-free and can be used by declarative tooling.
+`autostart install` safely refuses declarations owned by Nix, Home Manager,
+another tool, or the user. `autostart print` is side-effect-free and can be used
+by declarative tooling.
 
 ### Nix/Home Manager
 
-Declarative users should have Nix own the native service and should not run imperative `autostart install`. For Home Manager on Linux:
+Declarative users should have Nix own the native service and should not run
+imperative `autostart install`. For Home Manager on Linux:
 
 ```nix
 systemd.user.services.bmux-server = {
@@ -62,7 +73,9 @@ launchd.agents.bmux-server = {
 };
 ```
 
-These immutable package paths update and roll back with the owning Nix generation. A read-only Nix-generated `bmux.toml` is supported because autostart only reads normal bmux configuration and never modifies it.
+These immutable package paths update and roll back with the owning Nix
+generation. A read-only Nix-generated `bmux.toml` is supported because autostart
+only reads normal bmux configuration and never modifies it.
 
 ## Server Commands
 
@@ -215,7 +228,8 @@ function __bmux_targets
 end
 ```
 
-A TLS gateway can be declared in `bmux.toml` and started automatically with the local server:
+A TLS gateway can be declared in `bmux.toml` and started automatically with the
+local server:
 
 ```toml
 [server.gateway]
@@ -224,7 +238,11 @@ listen = "0.0.0.0:7443"
 quick = true
 ```
 
-For production TLS material, omit `quick` and configure both `cert_file` and `key_file` instead. Gateway changes require a server restart. Binding `0.0.0.0` exposes the listener to reachable networks, so use appropriate firewall and access controls. Reverse-SSH and Iroh hosting remain explicit `bmux server gateway --host ...` commands.
+For production TLS material, omit `quick` and configure both `cert_file` and
+`key_file` instead. Gateway changes require a server restart. Binding `0.0.0.0`
+exposes the listener to reachable networks, so use appropriate firewall and
+access controls. Reverse-SSH and Iroh hosting remain explicit `bmux server
+gateway --host ...` commands.
 
 Target precedence for command routing:
 
@@ -260,9 +278,11 @@ server_name = "gateway.example.com"
 ca_file = "~/.config/bmux/gateway-ca.pem"
 ```
 
-TLS targets support standard command routing via `--target` (for commands that use normal client connections), plus `bmux connect` and remote utility commands.
+TLS targets support standard command routing via `--target` (for commands that
+use normal client connections), plus `bmux connect` and remote utility commands.
 
-Hosted URLs are accepted directly by connect (for example: `bmux connect https://abc123.example.net app`).
+Hosted URLs are accepted directly by connect (for example: `bmux connect
+https://abc123.example.net app`).
 
 For long-lived unstable links, `bmux connect` supports `--reconnect-forever`.
 
@@ -471,7 +491,8 @@ Window target values for `switch`/`kill` support:
 - window UUID
 - `active`
 
-When `--session` is omitted, window commands use the currently attached session context.
+When `--session` is omitted, window commands use the currently attached session
+context.
 
 ## Follow Commands
 
@@ -525,7 +546,8 @@ namespace = "plugin"
 path = ["playbook", "run"]
 ```
 
-`required_namespaces` and `required_paths` support optional `owner = "plugin.id"`
+`required_namespaces` and `required_paths` support optional `owner =
+"plugin.id"`
 when you want a specific plugin to own the claim.
 
 ## Permission Commands

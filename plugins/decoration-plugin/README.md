@@ -47,7 +47,8 @@ hz   = 30                             # ticks per second; no upper clamp
 ```
 
 Theme authors can also expose named, user-composable components. Users layer
-components relative to other component ids rather than writing numeric z-indexes:
+components relative to other component ids rather than writing numeric
+z-indexes:
 
 ```toml
 [plugins."bmux.decoration".components."performance.border"]
@@ -83,7 +84,8 @@ deprecated lookup alias, not a separate picker entry. Explicit user themes named
 component IDs are unchanged.
 
 Both themes remain independent: `performance` paints steady CPU-colored borders
-and headers; `pulse-border` pulses lime/cyan on the focused pane. To connect them,
+and headers; `pulse-border` pulses lime/cyan on the focused pane. To connect
+them,
 use this in your BMUX config (no combination theme file is needed):
 
 ```toml
@@ -111,12 +113,14 @@ brightness-max = "1"
 ```
 
 Performance supplies the existing `bmux.performance/metrics-state` access grant;
-pulse consumes only the channel declared by its color provider. Missing snapshots
+pulse consumes only the channel declared by its color provider. Missing
+snapshots
 fall back to lime/cyan; missing total system RAM contributes no memory heat.
 Unavailable pane metrics retain performance's system-metric fallback. Memory is
 measured against total physical system RAM, not against recent growth.
 
-Set `all-panes = "true"` in pulse settings to animate all panes (default: focused
+Set `all-panes = "true"` in pulse settings to animate all panes (default:
+focused
 only). Component targets can further restrict that set. Pulse period, smoothing,
 and brightness are animation settings; `heat-mode` (`cpu` by default or
 `cpu-memory`) and increasing memory thresholds belong to the performance color
@@ -126,7 +130,8 @@ color. Growth-sensitive pulse speed is not enabled.
 
 `bmux.module(name)` loads only compiled-in, versioned decoration modules—never
 filesystem paths or external packages. `performance-colors-v1` exposes
-`state_channel`, `metrics(snapshot, pane)`, `heat(snapshot, pane, settings)` (0–100),
+`state_channel`, `metrics(snapshot, pane)`, `heat(snapshot, pane, settings)`
+(0–100),
 and `color(heat)` (RGB channels). Providers do not paint or animate. Unknown
 modules and unsupported heat modes fail explicitly. Each script owns its module
 instance; no cross-component mutable globals are shared.

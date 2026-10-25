@@ -1,6 +1,7 @@
 # Remote pairing and daemonless clients
 
-Remote hosting is opt-in. Only the host needs a running bmux server; a connecting
+Remote hosting is opt-in. Only the host needs a running bmux server; a
+connecting
 client does not start or require a local server. This workflow uses a
 self-contained invitation over Iroh, not a short-code rendezvous service.
 
@@ -24,7 +25,8 @@ On the other computer:
 bmux connect --pair
 ```
 
-Paste the link at the hidden prompt. Choose a saved host alias and a device name.
+Paste the link at the hidden prompt. Choose a saved host alias and a device
+name.
 Compare the displayed verification phrase on both machines before approving on
 the host. Link possession alone does not authorize terminal access. The client
 saves the host's identity and its own device credentials, then attaches.
@@ -44,7 +46,8 @@ reason to replay that input.
 ## Hosting policy and startup
 
 Remote hosting is off by default. Omitting `allow_full_runtime_ingress` allows a
-trusted local owner to opt in with `bmux remote enable`; that preference persists
+trusted local owner to opt in with `bmux remote enable`; that preference
+persists
 across server restarts. `bmux remote disable` persists an off preference.
 
 An explicit `allow_full_runtime_ingress = false` is a **hard prohibition**:
@@ -94,7 +97,8 @@ are not authority to bypass it.
 The default Iroh preset uses external public connectivity infrastructure.
 Connections may use an encrypted relay path and upgrade to direct connectivity;
 restrictive networks can require relaying. Relays cannot decrypt terminal
-contents, but can observe traffic metadata, interrupt service, or be unavailable.
+contents, but can observe traffic metadata, interrupt service, or be
+unavailable.
 No port forwarding or separate bmux pairing-mailbox deployment is needed for
 this invitation format. Public relay availability is not an unconditional
 connectivity guarantee.
@@ -106,7 +110,8 @@ Host relay settings belong to the connections plugin:
 mode = "default"
 ```
 
-For a managed relay, use `mode = "custom"` and `urls = ["https://relay.example/"]`.
+For a managed relay, use `mode = "custom"` and `urls =
+["https://relay.example/"]`.
 `mode = "disabled"` is useful for direct-only/offline setups and deterministic
 local testing. A pasted invitation does not override the client's local relay
 policy.
@@ -140,8 +145,10 @@ bash scripts/dev.sh cargo build -p bmux_cli --bin bmux
 python3 scripts/smoke-remote-pairing.py --binary "$CARGO_TARGET_DIR/debug/bmux"
 ```
 
-The fixture owns all host/client state and processes; it does not manage a user's
-running server. It checks direct-loopback behavior, not public relay reachability
+The fixture owns all host/client state and processes; it does not manage a
+user's
+running server. It checks direct-loopback behavior, not public relay
+reachability
 or native macOS behavior. Release acceptance additionally needs native platform
 CI and a two-computer, two-network trial, including a proven relay-only path,
 network interruption, host restart, and revocation.

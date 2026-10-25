@@ -2,8 +2,10 @@
 ## Public live viewer
 
 `/live` is an output-only audience page backed by the same Rust/WASM Canvas
-renderer as the local browser. It receives versioned binary patches over a persistent
-WebSocket from `https://live.bmux.dev`; it never claims a local view, sends input, or
+renderer as the local browser. It receives versioned binary patches over a
+persistent
+WebSocket from `https://live.bmux.dev`; it never claims a local view, sends
+input, or
 reads a local bootstrap token. Paused, offline, incompatible, expired, and
 replaced-epoch output is removed, including detached pending render targets.
 
@@ -16,7 +18,8 @@ bash scripts/dev.sh bash scripts/build-web-renderer.sh
 ```
 
 The script builds the renderer in the Nix-selected target directory, writes the
-native asset bundle to `target/web-assets/` (or `BMUX_WEB_ASSET_OUTPUT`), and stages
+native asset bundle to `target/web-assets/` (or `BMUX_WEB_ASSET_OUTPUT`), and
+stages
 these audience files under `public/live-assets/<bundle-sha256>/`:
 
 - `canvas-viewer.js`
@@ -29,11 +32,14 @@ these audience files under `public/live-assets/<bundle-sha256>/`:
 The docs UI build reads `public/live-assets/current-version` and includes the
 immutable module URL on **every** shell entry route. The generated site's
 registered `live-assets` directory route must be copied to the deployment root,
-not served only under `/public`. `/live` is in the central site page registry and
+not served only under `/public`. `/live` is in the central site page registry
+and
 is included in normal static route generation. Serve `.wasm` as
 `application/wasm` and JS as JavaScript. Configure the relay origin with
-`BMUX_LIVE_ENDPOINT_ORIGIN` during the web build (default `https://live.bmux.dev`).
-The relay admits exact configured website origins. The unversioned fallback intentionally fails closed when the
+`BMUX_LIVE_ENDPOINT_ORIGIN` during the web build (default
+`https://live.bmux.dev`).
+The relay admits exact configured website origins. The unversioned fallback
+intentionally fails closed when the
 explicit web build has not run; ordinary native/doc builds do not install WASM
 tooling or contact the relay. Do not include `bootstrap.js` or its local token
 flow on the public page. The release packager also includes all three new module

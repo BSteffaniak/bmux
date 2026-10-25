@@ -1,6 +1,7 @@
 # Editorial revision
 
-This revision follows the presenter’s feedback rather than preserving the previous teaching-script format.
+This revision follows the presenter’s feedback rather than preserving the
+previous teaching-script format.
 
 - Replace the opening slogan with a direct introduction to BMUX and the features in the tour.
 - Remove chapter-number prefixes, ambiguous navigation language, and the basic finder-code detour.
@@ -13,6 +14,10 @@ This revision follows the presenter’s feedback rather than preserving the prev
 - Expand selected code into concise end-to-end walkthroughs: split policy, typed plugin contracts, Pong collision, shared component geometry, text editing, scrolling, virtualization, forms, and runtime updates. Mark simplification and schematic helpers explicitly; preserve existing gallery components.
 - Replace narration with brief presenter cues throughout the main deck and appendix; keep the companion cue sheet and setup guide consistent.
 
-The result is 53 main slides, including 24 rapid component slides. All seven live demo declarations remain unchanged. Short gallery calls and simplified walkthroughs are illustrative, not standalone applications. Embedded gallery controls remain separate from those listings; no new live-demo acceptance is claimed.
+The result is 53 main slides, including 24 rapid component slides. All seven
+live demo declarations remain unchanged. Short gallery calls and simplified
+walkthroughs are illustrative, not standalone applications. Embedded gallery
+controls remain separate from those listings; no new live-demo acceptance is
+claimed.
 
 No new independent audience review, model review, screenshot acceptance, or live-demo acceptance is claimed. See [sources.md](sources.md) for checks and remaining rehearsal work.

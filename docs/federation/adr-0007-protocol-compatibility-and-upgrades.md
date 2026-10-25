@@ -5,13 +5,19 @@
 
 ## Context
 
-Federation adds durable consensus state, typed cluster services, peer RPC, worker execution protocols, and attach resume data. Nodes will not always upgrade simultaneously. An incompatible voter can prevent progress or corrupt durable state if schema evolution is implicit.
+Federation adds durable consensus state, typed cluster services, peer RPC,
+worker execution protocols, and attach resume data. Nodes will not always
+upgrade simultaneously. An incompatible voter can prevent progress or corrupt
+durable state if schema evolution is implicit.
 
-bmux already negotiates a core protocol contract and BPDL interfaces are versioned. Federation must build on those mechanisms without coupling cluster release evolution to undocumented Rust serialization layouts.
+bmux already negotiates a core protocol contract and BPDL interfaces are
+versioned. Federation must build on those mechanisms without coupling cluster
+release evolution to undocumented Rust serialization layouts.
 
 ## Decision
 
-Version federation at four explicit layers and use capability-gated rolling upgrades:
+Version federation at four explicit layers and use capability-gated rolling
+upgrades:
 
 1. **Transport/core wire epoch:** existing bmux connection framing compatibility.
 2. **Cluster peer protocol epoch and revision range:** consensus peer, membership, and internal RPC compatibility.
@@ -24,11 +30,16 @@ A node participates only in roles for which all mandatory layers are compatible.
 
 ### Wire epochs
 
-An epoch change denotes no safe direct interoperability. Peers with different mandatory epochs fail before membership or state mutation with an actionable incompatibility report. Epoch downgrade is never silently attempted.
+An epoch change denotes no safe direct interoperability. Peers with different
+mandatory epochs fail before membership or state mutation with an actionable
+incompatibility report. Epoch downgrade is never silently attempted.
 
 ### Revision ranges
 
-Within one epoch, peers advertise inclusive supported revision ranges and feature bits. They select the highest mutually supported revision. Unknown optional fields use explicit defaults and must not change old semantics. Unknown required variants/features cause rejection.
+Within one epoch, peers advertise inclusive supported revision ranges and
+feature bits. They select the highest mutually supported revision. Unknown
+optional fields use explicit defaults and must not change old semantics. Unknown
+required variants/features cause rejection.
 
 ### BPDL interfaces
 
@@ -55,9 +66,14 @@ Replicated membership tracks:
 - A cluster **write floor** required to propose/apply current commands
 - Activated feature gates
 
-A feature that changes replicated state or worker authority activates only after all current voters support its write/apply semantics and required serving nodes support their role-specific interface. Activation is a committed command. Installing new binaries alone does not change state format.
+A feature that changes replicated state or worker authority activates only after
+all current voters support its write/apply semantics and required serving nodes
+support their role-specific interface. Activation is a committed command.
+Installing new binaries alone does not change state format.
 
-Once a feature writes state that old versions cannot understand, the cluster floor advances and downgrade below it is rejected until an explicit reversible deactivation/migration exists.
+Once a feature writes state that old versions cannot understand, the cluster
+floor advances and downgrade below it is rejected until an explicit reversible
+deactivation/migration exists.
 
 ## Rolling upgrade procedure
 
@@ -69,7 +85,9 @@ Once a feature writes state that old versions cannot understand, the cluster flo
 6. Commit feature activation/schema floor advancement separately.
 7. Keep old code paths until the documented compatibility window expires and downgrade policy is clear.
 
-Leader election must not select a node unable to apply the current cluster write floor. Incompatible nodes remain non-serving/rejected rather than partially participating.
+Leader election must not select a node unable to apply the current cluster write
+floor. Incompatible nodes remain non-serving/rejected rather than partially
+participating.
 
 ## Authenticated supported-capability publication
 
@@ -104,7 +122,8 @@ storage representation must preserve canonical membership and existing state.
 Report revision, mutation fingerprint/outcome, and applied position commit
 atomically and survive snapshots. Matching retries return the original outcome;
 conflicting reuse is rejected. Credential replacement, revocation, or membership
-change invalidates stale evidence. No report carries reusable private credentials.
+change invalidates stale evidence. No report carries reusable private
+credentials.
 
 Interruption before commit leaves the prior authoritative report intact; an
 uncertain acknowledgment is resolved by retrying the same mutation identity.
@@ -117,13 +136,19 @@ must remain unavailable rather than bypass activation or membership guards.
 
 ## Supported rolling window
 
-Before the first stable federation release, compatibility is guaranteed by explicit protocol/schema versions rather than semantic-version labels. At stable release, bmux will support rolling operation between **two adjacent released federation protocol revisions within the same epoch**, provided the cluster feature floor has not advanced beyond the older revision.
+Before the first stable federation release, compatibility is guaranteed by
+explicit protocol/schema versions rather than semantic-version labels. At stable
+release, bmux will support rolling operation between **two adjacent released
+federation protocol revisions within the same epoch**, provided the cluster
+feature floor has not advanced beyond the older revision.
 
-This is a minimum guarantee, not permission to infer compatibility from package versions. Tests use protocol fixtures and mixed binaries/revision adapters.
+This is a minimum guarantee, not permission to infer compatibility from package
+versions. Tests use protocol fixtures and mixed binaries/revision adapters.
 
 ## Attach resume compatibility
 
-Resume descriptors include provider protocol revision and feature requirements. A new ingress either:
+Resume descriptors include provider protocol revision and feature requirements.
+A new ingress either:
 
 - Resumes with a mutually compatible revision,
 - Performs a clean snapshot reopen while preserving logical workspace identity, or
@@ -142,7 +167,8 @@ Join preflight reports:
 - Role-specific missing features
 - Whether the node may join as observer, worker, ingress, or voter
 
-A node may join in a restricted role if that role is safe, but voter promotion requires full current voter compatibility.
+A node may join in a restricted role if that role is safe, but voter promotion
+requires full current voter compatibility.
 
 ## Consequences
 
@@ -169,8 +195,13 @@ A node may join in a restricted role if that role is safe, but voter promotion r
 
 ## Architecture placement
 
-Core wire negotiation remains generic. Federation-specific peer revisions, feature floors, BPDL versions, and durable schema live in cluster API/implementation crates. Core cannot encode cluster upgrade policy.
+Core wire negotiation remains generic. Federation-specific peer revisions,
+feature floors, BPDL versions, and durable schema live in cluster
+API/implementation crates. Core cannot encode cluster upgrade policy.
 
 ## Acceptance criteria
 
-Tests must cover adjacent mixed revisions, incompatible epochs, old/new snapshot install, feature activation only after voter support, voter promotion rejection, clean attach reopen on resume incompatibility, one-node-at-a-time upgrade, and prohibited downgrade after floor advancement.
+Tests must cover adjacent mixed revisions, incompatible epochs, old/new snapshot
+install, feature activation only after voter support, voter promotion rejection,
+clean attach reopen on resume incompatibility, one-node-at-a-time upgrade, and
+prohibited downgrade after floor advancement.

@@ -6,7 +6,8 @@ macOS use Winit privately; the initial Windows entry explicitly returns
 
 `run(WindowOptions, WindowApplication)` owns the event loop and window.
 Callbacks receive owned lifecycle/input events and a borrowed `WindowContext`.
-Workers may retain a coalescing wake proxy, not native windows. `Resized` carries
+Workers may retain a coalescing wake proxy, not native windows. `Resized`
+carries
 physical pixels and scale together; these are not terminal execution dimensions.
 Suspension and zero drawable extents suppress redraw delivery. Callback errors
 terminate the loop and are returned to the caller.

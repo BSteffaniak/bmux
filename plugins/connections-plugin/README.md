@@ -2,7 +2,10 @@
 
 Bundled implementation of the transport-neutral `bmux.connections` domain.
 
-It resolves local, SSH, TLS, and Iroh targets from bmux configuration and invokes an opaque typed service request on one selected endpoint. Selection policy remains with callers such as the cluster plugin; this crate does not contain cluster, workspace, placement, or gateway policy.
+It resolves local, SSH, TLS, and Iroh targets from bmux configuration and
+invokes an opaque typed service request on one selected endpoint. Selection
+policy remains with callers such as the cluster plugin; this crate does not
+contain cluster, workspace, placement, or gateway policy.
 
 ## Endpoint and invocation semantics
 
@@ -22,8 +25,10 @@ It resolves local, SSH, TLS, and Iroh targets from bmux configuration and invoke
 `device://<endpoint-public-key>?addr=<socket-address>` pins the remote host key.
 A relay address can instead be supplied as `?relay=<relay-url>`.
 `listener-status.endpoint_targets` contains public, source-independent endpoint
-URIs; never advertise a host-issued, source-specific `device-id` in cluster metadata.
-The `iroh://` spelling remains supported, but dialing also requires owner pairing.
+URIs; never advertise a host-issued, source-specific `device-id` in cluster
+metadata.
+The `iroh://` spelling remains supported, but dialing also requires owner
+pairing.
 
 Use generated BPDL clients over each runtime's trusted local `BmuxClient`:
 
@@ -57,7 +62,8 @@ mode = "disabled"
 ```
 
 `auto_start` requires explicit ingress permission and a nonzero fixed UDP port.
-Without auto-start, a local owner uses `start-listener`; that command also checks
+Without auto-start, a local owner uses `start-listener`; that command also
+checks
 same-instance backend admission registration. Configuration-enabled auto-start
 may run before backend readiness, but every stream still requires backend ticket
 consumption, subject-bound Hello, and revocation checks: there is no unadmitted

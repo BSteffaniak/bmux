@@ -5,7 +5,8 @@ description: Use bmux live playbook as a headless, token-efficient debugging eng
 
 # playbook-live-debug
 
-Use bmux live playbook as a headless, token-efficient debugging engine for LLM-driven troubleshooting.
+Use bmux live playbook as a headless, token-efficient debugging engine for
+LLM-driven troubleshooting.
 
 ## When to use this skill
 
@@ -19,7 +20,7 @@ Use this skill when you need to:
 
 Do not use this skill for static code review with no runtime behavior.
 
-______________________________________________________________________
+---
 
 ## Core principles
 
@@ -29,7 +30,7 @@ ______________________________________________________________________
 - Hydrate evidence windows only after a signal (`watchpoint_hit`).
 - Keep analysis tied to `seq`/`mono_ns` timeline.
 
-______________________________________________________________________
+---
 
 ## Event model quick reference
 
@@ -49,7 +50,7 @@ Hydration modes:
 - `event_window`
 - `incident`
 
-______________________________________________________________________
+---
 
 ## Fast-start workflow
 
@@ -64,7 +65,7 @@ ______________________________________________________________________
 09. Summarize root cause hypothesis with evidence seqs.
 10. Propose and run minimal confirmatory command(s).
 
-______________________________________________________________________
+---
 
 ## Canonical JSON ops
 
@@ -209,7 +210,7 @@ ______________________________________________________________________
 {"op":"quit","request_id":"r-quit"}
 ```
 
-______________________________________________________________________
+---
 
 ## Investigation playbook
 
@@ -246,7 +247,7 @@ ______________________________________________________________________
 - Re-check with targeted watchpoint or narrow event window.
 - Avoid broad replays unless new evidence contradicts hypothesis.
 
-______________________________________________________________________
+---
 
 ## nvim cursor-jump recipe
 
@@ -265,7 +266,7 @@ ______________________________________________________________________
    - did server event indicate attach/view churn?
 8. issue one confirmatory command and compare windows.
 
-______________________________________________________________________
+---
 
 ## Token-efficiency defaults
 
@@ -284,7 +285,7 @@ Escalate only when needed:
 - Add `server_event` for runtime/system-level context.
 - Increase budgets temporarily, then reduce again.
 
-______________________________________________________________________
+---
 
 ## Guardrails
 
@@ -294,7 +295,7 @@ ______________________________________________________________________
 - Do not emit conclusions without citing concrete `seq` evidence bands.
 - Keep one active hypothesis per loop to prevent token sprawl.
 
-______________________________________________________________________
+---
 
 ## Output contract (what to report)
 
@@ -311,7 +312,7 @@ Example evidence line:
 
 - `seq 1842-1868`: `request_lifecycle:start(nvim)` followed by `cursor_delta` burst and `screen_delta` burst, no server error events.
 
-______________________________________________________________________
+---
 
 ## Failure handling
 
@@ -324,7 +325,7 @@ If no useful signal appears:
 - Re-run repro once.
 - If still empty, report "insufficient runtime signal" and list exactly what telemetry is missing.
 
-______________________________________________________________________
+---
 
 ## Minimal command sequence template
 

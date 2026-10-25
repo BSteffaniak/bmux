@@ -3,3 +3,6 @@ required = ["mdformat"]
 
 [tools.clippier-md.files]
 exclude = ["/packages/markdown/tests/fixtures/**"]
+
+[runner.tools]
+clippier_md = { mode = "enabled", capabilities = ["format"], format-extensions = ["md"] }

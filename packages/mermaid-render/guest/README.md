@@ -1,7 +1,8 @@
 # Portable Mermaid guest
 
 The guest workspace is materialized under `OUT_DIR/guest` from `Cargo.toml.in`,
-`Cargo.lock.in`, and `src/lib.rs`. Templates prevent Cargo from excluding it as a
+`Cargo.lock.in`, and `src/lib.rs`. Templates prevent Cargo from excluding it as
+a
 nested package from the published archive. Ordinary native host builds compile
 its locked release artifact for `wasm32-unknown-unknown` and embed
 `OUT_DIR/mermaid.wasm`.
@@ -9,7 +10,8 @@ The build also precompiles epoch-only and fuel-enabled AOT artifacts for Cargo's
 explicit destination `TARGET`, using `wasm_config.rs` shared with the runtime.
 Browser (`wasm32`) host builds skip the nested guest. No target, compiler, font,
 or renderer is installed by the build script. Cargo retains its normal
-network/offline/cache behavior; offline builds require locked dependencies cached.
+network/offline/cache behavior; offline builds require locked dependencies
+cached.
 
 ## Isolation exception
 
@@ -37,30 +39,38 @@ length. Panics/resource exhaustion trap and must be handled by the host.
 The guest consumes <https://github.com/BSteffaniak/mermaid-rs-renderer>, branch
 `wasm-portability`. Cargo.lock retains the exact resolved commit (currently
 `7c06c9ab2c69da15f356ccfc5c27d1b77f59bec4`). Advance it explicitly with
-`cargo update --manifest-path "$OUT_DIR/guest/Cargo.toml" -p mermaid-rs-renderer`
+`cargo update --manifest-path "$OUT_DIR/guest/Cargo.toml" -p
+mermaid-rs-renderer`
 after a host build, then copy the updated lockfile back to `Cargo.lock.in`;
 ordinary locked builds do not automatically follow branch updates.
 It is based on upstream release 0.3.1 commit
-`2f993bd79a55235eb59a34d807852276ba25bea7`; no unrelated master updates are included.
-There is no vendored source or submodule. The host workspace contains no native Mermaid renderer; this guest is the
+`2f993bd79a55235eb59a34d807852276ba25bea7`; no unrelated master updates are
+included.
+There is no vendored source or submodule. The host workspace contains no native
+Mermaid renderer; this guest is the
 sole renderer implementation.
 
-Fork changes are general-purpose: clock-free diagnostic timings on wasm32 unknown,
-no system-font/cache IO on that target, and `set_text_measurement_font` accepting
+Fork changes are general-purpose: clock-free diagnostic timings on wasm32
+unknown,
+no system-font/cache IO on that target, and `set_text_measurement_font`
+accepting
 caller-supplied font bytes. Actual import-free execution tests live in the fork.
 No BMUX font or runtime policy lives there. The guest initializes its locally
 bundled font once per fresh instance through the public API.
 
-Offline builds require both Git and registry dependencies to be cached. To return
+Offline builds require both Git and registry dependencies to be cached. To
+return
 to upstream after a compatible release, replace the guest workspace dependency
-with that crates.io version and refresh its lockfile; the guest font API call and
+with that crates.io version and refresh its lockfile; the guest font API call
+and
 runtime policy need not change. No upstream PR has been created.
 
 ## Font provenance and fidelity
 
 The guest and presenter use identical `bmux_fonts::DIAGRAM_FONT`
 bytes. The host build stages those bytes with the guest sources; no sibling
-checkout path or host-crate dependency is needed inside the guest. The guest explicitly sets its SVG theme family to `BMUX Diagram`; the
+checkout path or host-crate dependency is needed inside the guest. The guest
+explicitly sets its SVG theme family to `BMUX Diagram`; the
 presenter selects that regular face for measurement-compatible label painting.
 The derived font includes technical-label alphabets plus monochrome symbols and
 emoji. See `packages/fonts/assets/diagram/README.md` for pinned inputs, hashes,

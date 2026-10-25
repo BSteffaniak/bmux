@@ -57,7 +57,8 @@ bmux sandbox rebuild-index --json
 
 ## Sandbox Triage Flow
 
-Use this sequence when a sandboxed run fails and you need fast reproduction data.
+Use this sequence when a sandboxed run fails and you need fast reproduction
+data.
 
 ```bmux-cli
 # 1) Confirm current sandbox health and reconcile activity
@@ -101,7 +102,8 @@ Troubleshooting notes:
 
 ### Bundle Verify Failures
 
-If `bmux sandbox bundle ... --verify` or `bmux sandbox verify-bundle ...` returns drift:
+If `bmux sandbox bundle ... --verify` or `bmux sandbox verify-bundle ...`
+returns drift:
 
 - Re-run verification in JSON mode and inspect `issues[]` for exact `path` + `field` mismatches.
 - `field=exists` usually means a bundled artifact was moved/deleted after creation.

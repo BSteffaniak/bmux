@@ -24,7 +24,8 @@ Use the helper script:
 ./scripts/install-example-plugin.sh
 ```
 
-This builds the example plugin and writes a generated manifest into your local bmux plugins directory with the correct absolute dylib path for your machine.
+This builds the example plugin and writes a generated manifest into your local
+bmux plugins directory with the correct absolute dylib path for your machine.
 
 Useful variants:
 
@@ -34,7 +35,8 @@ Useful variants:
 ./scripts/install-example-plugin.sh --force
 ```
 
-The checked-in `examples/native-plugin/plugin.toml` remains as a reference manifest for the example source tree.
+The checked-in `examples/native-plugin/plugin.toml` remains as a reference
+manifest for the example source tree.
 
 ## Enable In Config
 
@@ -51,7 +53,8 @@ bmux plugin run example.native hello world
 bmux plugin run example.native permissions-list my-session
 ```
 
-Start the server and the plugin will also log activation plus matching events such as `server_started` and `window_created`.
+Start the server and the plugin will also log activation plus matching events
+such as `server_started` and `window_created`.
 
 ## Plugin Prompt Demo
 

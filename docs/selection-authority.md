@@ -1,6 +1,7 @@
 # ADR: exact tab activation and effective workspace selection
 
-Status: authority decision accepted by the repository owner; implementation pending.
+Status: authority decision accepted by the repository owner; implementation
+pending.
 
 ## Decision
 
@@ -8,12 +9,15 @@ A caller has one effective context/session selection. The effective workspace is
 computed from that selected context's authoritative membership. Workspace
 navigation history is not another input-target authority.
 
-Global discovery activates an exact durable context ID. Workspace-local navigation
+Global discovery activates an exact durable context ID. Workspace-local
+navigation
 continues to resolve names, indexes, next, and previous within the current
 workspace. Existing versioned `switch-tab` semantics are unchanged.
 
-The workspaces implementation owns cross-workspace orchestration, exposed through
-an explicitly new generated BPDL interface. The finder supplies an ID and does not
+The workspaces implementation owns cross-workspace orchestration, exposed
+through
+an explicitly new generated BPDL interface. The finder supplies an ID and does
+not
 orchestrate two commands. No domain types or special cases are added to core,
 `HostRuntimeApi`, neutral runtime support, or plugin host infrastructure.
 
@@ -38,7 +42,8 @@ Current paths do not yet satisfy this decision:
   state separately owns a context/session selected target. Merely deriving the
   workspace from one of them does not reconcile their authority.
 
-Accordingly, adding an exact-target wrapper around the existing selection service
+Accordingly, adding an exact-target wrapper around the existing selection
+service
 is not sufficient. A mutex only in workspaces would not serialize local tab
 navigation or attach retargeting. Holding the context state write lock across a
 session-service call is unsafe: attach reads context state and its failure path
@@ -129,11 +134,15 @@ non-authoritative effect; do not return ambiguous success.
 Tests must cover default/non-default/third-workspace activation, same-workspace
 activation, workspace-local next/previous behavior, stale picker results,
 concurrent move/delete, denied access, injected failure at every effect/commit
-boundary, two independent callers, competing requests for one caller, cancellation,
+boundary, two independent callers, competing requests for one caller,
+cancellation,
 interrupted migration, corrupt/unknown persistence, and restart with stable IDs,
-membership, and valid restored execution bindings. Verify the execution is actually
-restored before selection; successful repair-on-select is not a resurrection test.
+membership, and valid restored execution bindings. Verify the execution is
+actually
+restored before selection; successful repair-on-select is not a resurrection
+test.
 
-Architecture guards should prevent finder-side two-command orchestration, new core
+Architecture guards should prevent finder-side two-command orchestration, new
+core
 domain leakage, and alternate selection mutation paths. Run the required
 `AGENTS.md` validations for each implementation phase.

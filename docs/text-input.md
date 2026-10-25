@@ -1,10 +1,12 @@
 # Text input
 
-BMUX prompt text fields, searchable selects, and editable text/number form fields use shared Unicode-aware text editing primitives from `bmux_text_edit`.
+BMUX prompt text fields, searchable selects, and editable text/number form
+fields use shared Unicode-aware text editing primitives from `bmux_text_edit`.
 
 ## Prompt input bindings
 
-Prompt text inputs support standard terminal editor behavior where the terminal reports the corresponding key event:
+Prompt text inputs support standard terminal editor behavior where the terminal
+reports the corresponding key event:
 
 | Binding                    | Behavior                                |
 | -------------------------- | --------------------------------------- |
@@ -16,7 +18,9 @@ Prompt text inputs support standard terminal editor behavior where the terminal 
 | `backspace` / `delete`     | Delete one grapheme backward or forward |
 | `ctrl+u`                   | Clear search-select query text          |
 
-The reusable `bmux_text_edit` crate owns text storage, cursor movement, deletion, word boundaries, Unicode grapheme handling, and terminal-width projection. Rendering and prompt submission remain owned by BMUX attach UI.
+The reusable `bmux_text_edit` crate owns text storage, cursor movement,
+deletion, word boundaries, Unicode grapheme handling, and terminal-width
+projection. Rendering and prompt submission remain owned by BMUX attach UI.
 
 ## Notes
 

@@ -1,17 +1,21 @@
 # AGENTS.md
 
-This file defines REQUIRED validation steps for coding agents working in this repo.
+This file defines REQUIRED validation steps for coding agents working in this
+repo.
 
 ## Toolchain (REQUIRED)
 
 `flake.lock` owns the Rust version. Run the commands below inside `nix develop`
-(or the direnv-loaded shell). Without direnv, use `bash scripts/dev.sh <command>`.
+(or the direnv-loaded shell). Without direnv, use `bash scripts/dev.sh
+<command>`.
 Do not use floating rustup stable or override the Nix-selected compiler/target
 directory. See `docs/development-toolchain.md` for editor and native CI setup.
 
 ## Core Architecture Boundary (REQUIRED)
 
-BMUX core must remain domain-agnostic. Tabs, sessions, contexts, clients, and permissions are all plugin domains, not core architecture. Core crates provide generic primitives; plugins own product-specific behavior.
+BMUX core must remain domain-agnostic. Tabs, sessions, contexts, clients, and
+permissions are all plugin domains, not core architecture. Core crates provide
+generic primitives; plugins own product-specific behavior.
 
 ### Hard Rules
 
@@ -42,7 +46,8 @@ BMUX core must remain domain-agnostic. Tabs, sessions, contexts, clients, and pe
 
 ### Plugin API Crate Boundary (REQUIRED)
 
-`plugins/*-plugin-api/**` crates are stable typed contracts, not runtime implementation crates.
+`plugins/*-plugin-api/**` crates are stable typed contracts, not runtime
+implementation crates.
 
 - Plugin API crates may contain BPDL schemas, generated service/client/event/capability modules, stable wire/model types, schema smoke tests, and intentional re-exports from neutral primitive crates.
 - Plugin API crates must not contain concrete runtime state implementations (`FollowState`, `ContextState`, `SessionManager`, runtime managers, registries, rate limiters, sinks, lifecycle state machines, etc.). Concrete runtime state belongs in the matching `plugins/*-plugin/**` crate unless it is deliberately neutral primitive state.
@@ -55,7 +60,8 @@ BMUX core must remain domain-agnostic. Tabs, sessions, contexts, clients, and pe
 
 ### Review Gate Before Finishing (REQUIRED)
 
-For any non-doc code change, verify no forbidden domain leakage was introduced in core architecture:
+For any non-doc code change, verify no forbidden domain leakage was introduced
+in core architecture:
 
 - Run content checks (or equivalent) to confirm no new core references to tabs/permissions/sessions/contexts/clients/panes domain concepts.
 - `HostRuntimeApi` must remain domain-agnostic — only `core_cli_command_run_path`, `plugin_command_run`, `storage_get`, `storage_set`, `log_write`, `recording_write_event`.
@@ -67,18 +73,22 @@ These boundary rules are strict and take precedence over convenience.
 
 ## Core Rule
 
-If you change code, run the relevant tests before finishing and report exactly what you ran and whether it passed.
+If you change code, run the relevant tests before finishing and report exactly
+what you ran and whether it passed.
 
-In addition, for any code change anywhere in the repo, run clippy before the full nextest suite:
+In addition, for any code change anywhere in the repo, run clippy before the
+full nextest suite:
 
 1. `cargo clippy --all-targets -- -D warnings`
 2. `cargo nextest run --no-fail-fast`
 
-These are required. Treat failures as blocking, and do not finish with known flaky/failing tests.
+These are required. Treat failures as blocking, and do not finish with known
+flaky/failing tests.
 
 ## Clippy (REQUIRED)
 
-For any code change anywhere in the repo, run before `cargo nextest run --no-fail-fast`:
+For any code change anywhere in the repo, run before `cargo nextest run
+--no-fail-fast`:
 
 - `cargo clippy --all-targets -- -D warnings`
 
@@ -96,8 +106,10 @@ Key rules when fixing clippy issues:
 
 ## Workspace Dependencies (REQUIRED)
 
-Local package dependency paths belong in the root `[workspace.dependencies]` table.
-Consuming manifests must use `workspace = true`, retaining any required features.
+Local package dependency paths belong in the root `[workspace.dependencies]`
+table.
+Consuming manifests must use `workspace = true`, retaining any required
+features.
 After changing Cargo manifests, run:
 
 - `bash scripts/check-workspace-dependencies.sh`
@@ -126,13 +138,18 @@ If a change touches `plugins/**`, rebuild bundled plugins before finishing:
 
 - `bmux plugin rebuild --all-workspace-plugins`
 
-During iteration you may run targeted rebuilds with selectors (plugin id, short name, or crate name), but final validation for plugin changes should run with `--all-workspace-plugins`.
+During iteration you may run targeted rebuilds with selectors (plugin id, short
+name, or crate name), but final validation for plugin changes should run with
+`--all-workspace-plugins`.
 
-If `bmux plugin rebuild --all-workspace-plugins` is unavailable in the current environment, run direct cargo builds for plugin crates (for example, `cargo build -p <plugin-crate> ...`).
+If `bmux plugin rebuild --all-workspace-plugins` is unavailable in the current
+environment, run direct cargo builds for plugin crates (for example, `cargo
+build -p <plugin-crate> ...`).
 
 ## Minimum Required Commands (CLI/runtime work)
 
-For changes in `packages/cli/**` (runtime, input, pane/layout, protocol, terminal handling), run:
+For changes in `packages/cli/**` (runtime, input, pane/layout, protocol,
+terminal handling), run:
 
 1. `cargo clippy --all-targets -- -D warnings`
 2. `cargo nextest run --no-fail-fast`
@@ -142,7 +159,8 @@ For changes in `packages/cli/**` (runtime, input, pane/layout, protocol, termina
 
 ## Compatibility-Related Changes (REQUIRED extra check)
 
-If the change touches terminal protocol behavior, TERM/profile logic, or query/reply handling, also run:
+If the change touches terminal protocol behavior, TERM/profile logic, or
+query/reply handling, also run:
 
 - `./scripts/compat-matrix.sh` (command 5 in the full CLI/runtime validation sequence)
 
@@ -168,7 +186,8 @@ This includes edits under:
 - Docs-only changes
   - No mandatory runtime commands.
 
-In addition, for any non-doc code change, always run clippy before the full nextest suite:
+In addition, for any non-doc code change, always run clippy before the full
+nextest suite:
 
 - `cargo clippy --all-targets -- -D warnings`
 - `cargo nextest run --no-fail-fast`

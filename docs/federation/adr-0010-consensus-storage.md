@@ -4,19 +4,30 @@
 - **Date:** 2026-07-24
 - **Amended by:** [ADR-0015](adr-0015-bmux-owned-consensus.md)
 
-ADR-0015 preserves this storage decision and its durability guarantees for the BMUX-owned replacement. OpenRaft API references below describe the existing adapter; their persistence-ordering obligations also bind the replacement. Existing durable representations are not implicitly reinterpreted or declared compatible.
+ADR-0015 preserves this storage decision and its durability guarantees for the
+BMUX-owned replacement. OpenRaft API references below describe the existing
+adapter; their persistence-ordering obligations also bind the replacement.
+Existing durable representations are not implicitly reinterpreted or declared
+compatible.
 
 ## Context
 
-OpenRaft requires durable vote/committed state, an ordered log with truncation, an applied state machine, membership metadata, and crash-safe snapshots. Generic plugin key/value storage does not expose the transaction, flush, file-layout, or corruption guarantees required for consensus.
+OpenRaft requires durable vote/committed state, an ordered log with truncation,
+an applied state machine, membership metadata, and crash-safe snapshots. Generic
+plugin key/value storage does not expose the transaction, flush, file-layout, or
+corruption guarantees required for consensus.
 
-The storage implementation must be plugin-owned, portable across BMUX platforms, easy to test under crash injection, and free from a large native build/runtime dependency.
+The storage implementation must be plugin-owned, portable across BMUX platforms,
+easy to test under crash injection, and free from a large native build/runtime
+dependency.
 
-Candidates evaluated were redb, SQLite through rusqlite, Fjall, RocksDB, and handwritten append-only files.
+Candidates evaluated were redb, SQLite through rusqlite, Fjall, RocksDB, and
+handwritten append-only files.
 
 ## Decision
 
-Use **redb 4.x**, exact-pinned to a reviewed patch release, as the embedded storage engine for OpenRaft 0.9.x.
+Use **redb 4.x**, exact-pinned to a reviewed patch release, as the embedded
+storage engine for OpenRaft 0.9.x.
 
 The database lives under a cluster-plugin-owned state directory:
 
@@ -28,11 +39,13 @@ The database lives under a cluster-plugin-owned state directory:
     <snapshot-id>.snapshot
 ```
 
-The exact path helper must reject traversal and bind an existing database to the expected `ClusterId` and storage schema before opening it.
+The exact path helper must reject traversal and bind an existing database to the
+expected `ClusterId` and storage schema before opening it.
 
 ### Database tables
 
-Use explicit byte-oriented tables so durable compatibility is owned by BMUX rather than Rust type layout:
+Use explicit byte-oriented tables so durable compatibility is owned by BMUX
+rather than Rust type layout:
 
 - `meta`: storage format version, cluster ID, active snapshot ID/checksum, migration state.
 - `hard_state`: OpenRaft vote and committed log ID.
@@ -41,7 +54,10 @@ Use explicit byte-oriented tables so durable compatibility is owned by BMUX rath
 - `state_machine`: versioned deterministic application records.
 - `dedup`: `CommandId` to request fingerprint, terminal/in-progress status, and canonical response/workflow state.
 
-Keys that require ordered iteration use fixed-width big-endian integer encoding. Values use explicit versioned envelopes and canonical serialization. Do not persist OpenRaft internal Rust values with unversioned `bincode` or rely on enum discriminants.
+Keys that require ordered iteration use fixed-width big-endian integer encoding.
+Values use explicit versioned envelopes and canonical serialization. Do not
+persist OpenRaft internal Rust values with unversioned `bincode` or rely on enum
+discriminants.
 
 ### Durability and transaction rules
 
@@ -55,7 +71,8 @@ Keys that require ordered iteration use fixed-width big-endian integer encoding.
 
 ### Snapshot rules
 
-State-machine snapshots are immutable versioned files outside the database so OpenRaft can stream them without holding a redb transaction.
+State-machine snapshots are immutable versioned files outside the database so
+OpenRaft can stream them without holding a redb transaction.
 
 Snapshot creation:
 
@@ -77,7 +94,8 @@ Snapshot install:
 5. Sync the parent directory, reopen, and run all invariants before acknowledging installation.
 6. On interruption, startup uses the manifest and checksums to select the last fully committed database; it never guesses from modification time.
 
-Snapshot building and installation run off terminal data paths and are cancellable before the atomic publication point.
+Snapshot building and installation run off terminal data paths and are
+cancellable before the atomic publication point.
 
 ### Startup and corruption behavior
 
@@ -91,7 +109,10 @@ Startup fails closed if any of these occur:
 - snapshot checksum or envelope validation fails;
 - an interrupted replacement manifest cannot identify one complete valid database.
 
-No automatic reset, truncation, or new cluster initialization is allowed. Recovery requires an explicit operator command that preserves the damaged directory, reports the exact invariant failure, and restores from a verified snapshot or healthy voter.
+No automatic reset, truncation, or new cluster initialization is allowed.
+Recovery requires an explicit operator command that preserves the damaged
+directory, reports the exact invariant failure, and restores from a verified
+snapshot or healthy voter.
 
 ### Migration policy
 

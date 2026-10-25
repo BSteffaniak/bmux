@@ -63,7 +63,8 @@ applications or put keys in `@env`, scripts, slide content, or command text.
 Jev uses an explicit `choice` judgement with stable `FLAP` and `WAIT` IDs.
 The selected ID is executed directly: confidence and probabilities are displayed
 and validated, never converted into a flap threshold. Each observation includes
-safe gap edges, contact/clear times, ceiling/floor clearance, and exact forecasts
+safe gap edges, contact/clear times, ceiling/floor clearance, and exact
+forecasts
 for both actions using the same physics as the game. Five ticks are committed;
 10/15-tick coasting samples illustrate momentum only, not a mandatory action
 horizon. Forecasting never changes live state or chooses an action. The prompt
@@ -88,9 +89,11 @@ connection when the server permits keep-alive. Errors discard the connection;
 there is no transparent POST replay. Pause, restart, stop, or a 15-second total
 deadline terminate and reap the worker and close its socket before replacement.
 Responses and IPC messages are size-bounded. Cancellation cannot undo remote
-billing. Redirects, unverified TLS, and ambient proxy configuration are not used.
+billing. Redirects, unverified TLS, and ambient proxy configuration are not
+used.
 
-Status/decision traces report dispatch (including first worker spawn), connection
+Status/decision traces report dispatch (including first worker spawn),
+connection
 setup (DNS/TCP/TLS together), request-to-headers, body/decode, transport total,
 and end-to-end time including polling. Setup is zero on reused connections.
 These are local measurements: headers time includes network and server work,
@@ -103,7 +106,8 @@ The demo uses the classic
 [FlapPyBird reference, pinned commit](https://github.com/sourabhv/FlapPyBird/blob/b7cc55bdd82e2c940d9a24fb910bf3415753ee11/flappy.py)
 for 30 Hz gravity (1 px/tick²), flap velocity (−9 px/tick), maximum descent
 (10 px/tick), pipe width (52 px), spacing (144 px), horizontal speed (128 px/s),
-and the approximate 34×24 px bird collision box. A flap skips gravity that tick;
+and the approximate 34×24 px bird collision box. A flap skips gravity that
+tick;
 the top is not lethal and flapping is disabled above the top boundary.
 
 This is deliberately an easier widescreen demo, not a faithful difficulty clone:
@@ -133,7 +137,8 @@ The reference is an open-source recreation, not verification of the proprietary
 original binary. Rectangular collision (no sprite hit masks/rotation), seeded
 randomness, center-based scoring, and five-tick agent decisions are explicit
 demo approximations. Offline tests cover full-width rendering, widened collision
-clearance, exact forecasts, lifecycle, and a constant-gap multi-pipe fixture—not
+clearance, exact forecasts, lifecycle, and a constant-gap multi-pipe
+fixture—not
 Jev's live score or survival on arbitrary random courses.
 
 After successful startup, the existing managed runner retains the actual sandbox
@@ -166,8 +171,10 @@ Round restart keeps
 the best score and discards outstanding decisions. Re-entering the slide is
 inert until explicit presenter Play/Restart.
 
-For standalone rehearsal, run `python3 presentations/bmux-tour/demos/jev_flappy.py`
-with the key set. Keys: `p` pause/resume, `r` restart, `q` quit. A private temporary
+For standalone rehearsal, run `python3
+presentations/bmux-tour/demos/jev_flappy.py`
+with the key set. Keys: `p` pause/resume, `r` restart, `q` quit. A private
+temporary
 socket and locator in HOME are generated automatically; the optional
 `--control-file` flag selects a different locator. Embedded presenter surfaces
 are not assumed to forward keyboard input to applications.
@@ -183,8 +190,11 @@ python3 presentations/bmux-tour/demos/smoke_jev_flappy.py \
 ```
 
 The smoke uses fake loopback credentials and isolated short `/tmp` paths. It
-checks frozen application startup, generated controls, retention past the startup
+checks frozen application startup, generated controls, retention past the
+startup
 deadline, pause/restart, auto-retry, slide-leave cleanup, re-entry/restart, and
-presenter-exit cleanup during a request. Terminal evidence is bounded and private.
-It does not prove real-provider playing ability, latency, cost, or browser/Canvas
+presenter-exit cleanup during a request. Terminal evidence is bounded and
+private.
+It does not prove real-provider playing ability, latency, cost, or
+browser/Canvas
 acceptance. Rehearse those separately with the intended audience setup and key.

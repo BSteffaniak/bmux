@@ -11,7 +11,8 @@ See [`../../docs/tui-framework.md`](../../docs/tui-framework.md) for the broader
 
 ## Streaming subprocess output
 
-`ansi::AnsiLog` incrementally decodes byte chunks into a bounded styled log tail.
+`ansi::AnsiLog` incrementally decodes byte chunks into a bounded styled log
+tail.
 It retains split UTF-8/SGR sequences, supports carriage-return overwrite and
 `CSI K`, strips unsupported controls, and limits both lines and line length.
 It is a log decoder, not a full terminal emulator. Use one decoder per stream;

@@ -120,21 +120,26 @@ to visible cells; resize, wrapping, clipping, and scrolling do not rewrite the
 logical selection.
 
 `SelectionController` is caller-owned. Components register scopes and fragments
-during scene construction. `PaintCx::paint_selection` is the deterministic visual
+during scene construction. `PaintCx::paint_selection` is the deterministic
+visual
 overlay stage after ordinary content painting. Copying reads the logical
 selection snapshot rather than scraping the terminal buffer.
 
 ## Text projection cost
 
-`TextBlock` measures wrapped height without constructing rendered text. Character
-measurement does not allocate output rows; word measurement still retains segment
-metadata but tracks row boundaries numerically without allocating row storage. Both measurement and rendering use the same
+`TextBlock` measures wrapped height without constructing rendered text.
+Character
+measurement does not allocate output rows; word measurement still retains
+segment
+metadata but tracks row boundaries numerically without allocating row storage.
+Both measurement and rendering use the same
 wrapping rules, including distinct first/continuation widths in the underlying
 text helpers.
 
 Painting and selection construct output lazily. They skip complete offscreen
 source lines before rendering and stop after the visible row range. Locating the
-first visible row counts only enough rows to determine which source line contains
+first visible row counts only enough rows to determine which source line
+contains
 it, and does not measure the retained line at an exact source-line boundary.
 Selection preserves original UTF-8 source offsets when starting at a later line.
 
@@ -150,7 +155,8 @@ These properties do **not** make arbitrary text projection viewport-bounded:
 
 Use `VirtualList` for independent variable-height items rather than flattening a
 large document into one text block. This bounds item construction and painting,
-not the work inside an individual oversized item. Applications must not compensate
+not the work inside an individual oversized item. Applications must not
+compensate
 with a second wrapping or source-coordinate engine; further projection indexing
 belongs in the framework and must retain the same authoritative wrapping rules.
 

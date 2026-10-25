@@ -54,20 +54,24 @@ See `npm/` and `.github/workflows/release-npm.yml`.
 
 Plugins declare executable artifacts in top-level `[[auxiliary_executables]]`
 entries in `plugins/*/plugin.toml`. The generic declaration fields are `id`,
-`cargo_package`, `cargo_binary`, `relative_path`, and positive `protocol_version`.
+`cargo_package`, `cargo_binary`, `relative_path`, and positive
+`protocol_version`.
 IDs and destination names are validated; destination paths are single safe
 basenames, never traversal paths. Duplicate destinations fail the release.
-The pane plugin owns `bmux-pane-execution-supervisor`; release infrastructure does
+The pane plugin owns `bmux-pane-execution-supervisor`; release infrastructure
+does
 not special-case its domain or protocol.
 
 `cargo xtask build` is the canonical product build: the CLI, installer, and all
 supported manifest-declared helpers are built in one Cargo invocation with the
 same target and profile. The default profile is `dev`; use `--profile release`
 for distribution. `--target` defaults to the compiler host triple. Outputs live
-under `$CARGO_TARGET_DIR/$TARGET/$PROFILE` (`dev` uses `debug`). Raw package-only
+under `$CARGO_TARGET_DIR/$TARGET/$PROFILE` (`dev` uses `debug`). Raw
+package-only
 Cargo builds are partial builds, not complete product installations.
 
-`cargo xtask auxiliary build --target TARGET` remains a release-profile alias for
+`cargo xtask auxiliary build --target TARGET` remains a release-profile alias
+for
 the complete product build. Staging and installation verify the complete bundle.
 
 Ordinary shells use direct PTYs when the supervisor is unavailable. They do not
@@ -76,13 +80,16 @@ executions fail before launch if their required supervisor is unavailable;
 failed guardian launches are never retried as direct executions.
 
 `cargo xtask auxiliary` discovers these manifests, builds each
-specified Cargo binary for the release target, and stages the exact build outputs
+specified Cargo binary for the release target, and stages the exact build
+outputs
 alongside BMUX. It does not resolve a binary from PATH, a previous installation,
 or a mutable default target directory. Callers pass the artifact directory
-explicitly. Native developer builds must use the Nix-selected `CARGO_TARGET_DIR`;
+explicitly. Native developer builds must use the Nix-selected
+`CARGO_TARGET_DIR`;
 release CI uses its pinned native target toolchain. The task itself runs on the
 host; `auxiliary build` also builds the Rust xtask for the release target and
-`auxiliary stage` records that exact executable as `bmux-install` in the inventory
+`auxiliary stage` records that exact executable as `bmux-install` in the
+inventory
 for Unix shell installation. The CLI, helpers, and installer all come from the
 same explicit release output directory.
 
@@ -93,9 +100,11 @@ cargo xtask auxiliary stage --target "$TARGET" \
 ```
 
 Do not run these build commands when another coordinator owns build outputs.
-Staging requires an empty directory and all required regular executable artifacts;
+Staging requires an empty directory and all required regular executable
+artifacts;
 missing artifacts fail rather than producing a nominally complete package.
-`artifacts.json` records target, exact relative paths, byte lengths, SHA-256 hashes,
+`artifacts.json` records target, exact relative paths, byte lengths, SHA-256
+hashes,
 and owner/declaration/protocol metadata. Its hashes establish artifact identity,
 not publisher authentication; verify the release archive's trusted checksum or
 signature before installation.
@@ -105,7 +114,8 @@ rendered from their stable/nightly templates with the same generic declarations:
 executables install beside `/usr/bin/bmux`; inventory installs under
 `/usr/share/bmux/artifacts.json`. npm platform artifacts are transferred through
 host-native `cargo xtask install`, which verifies the inventory before any copy.
-The npm publish job installs the pinned host Rust toolchain deliberately: it must
+The npm publish job installs the pinned host Rust toolchain deliberately: it
+must
 not execute downloaded cross-target binaries. Unix npm packages keep auxiliaries
 beside the package's actual BMUX binary.
 The launcher must execute that exact installed path, not a PATH substitute.
@@ -113,7 +123,8 @@ The launcher must execute that exact installed path, not a PATH substitute.
 Auxiliary execution is supported here only for Linux and macOS release targets.
 Windows archives/npm packages contain `bmux.exe` and an inventory explicitly
 listing declared auxiliaries as unavailable. No supervisor stub is built or
-advertised as Windows support. Unsupported platforms must return explicit feature
+advertised as Windows support. Unsupported platforms must return explicit
+feature
 unavailability; baseline BMUX operation remains independent of the helper.
 
 ### Explicit installation and slots
@@ -134,20 +145,25 @@ cargo xtask install /absolute/extracted/archive \
 
 Set the slot manifest's `binary` to that exact installed `bmux-stable` path.
 Helpers retain their manifest basenames in that same directory. Do not copy only
-the CLI into a shared `/usr/local/bin`, rename a helper to another slot's helper,
+the CLI into a shared `/usr/local/bin`, rename a helper to another slot's
+helper,
 or replace a running slot's files. `installation.json` records the renamed CLI;
 `artifacts.json` retains the original release identity. This task does not
 rewrite slot configuration, start/stop servers, or change runtime endpoints.
-The host resolver must select only the verified sibling of the selected executable
+The host resolver must select only the verified sibling of the selected
+executable
 and reject absent/incompatible artifacts instead of falling back to PATH.
 
 **Curl installation:** `/install` requires curl, tar, awk, and a SHA-256 utility
-(`sha256sum` or `shasum`), not Python, jq, or a Rust toolchain. It verifies exactly
-one archive `SHA256SUMS` entry **before** inspecting, extracting, or executing the
+(`sha256sum` or `shasum`), not Python, jq, or a Rust toolchain. It verifies
+exactly
+one archive `SHA256SUMS` entry **before** inspecting, extracting, or executing
+the
 archive. Flat-member checks reject traversal, links, special files, duplicates,
 and oversized archives. The authenticated archive contains `bmux-install`, built
 from the repository-owned Rust xtask for the release target (not a downloaded
-arbitrary installer script). The shell invokes it only after checksum and archive
+arbitrary installer script). The shell invokes it only after checksum and
+archive
 safety validation:
 
 ```sh
@@ -155,18 +171,22 @@ safety validation:
   --prefix /usr/local --version "$VERSION-$TARGET"
 ```
 
-Rust validates the inventory schema, required artifacts, lengths and hashes before
+Rust validates the inventory schema, required artifacts, lengths and hashes
+before
 publication. Both checksum and archive are obtained over the configured HTTPS
 publisher channel; checksums are not an independent signature/trust root.
 
 The packaged installer publishes all validated siblings into an immutable
 `$BMUX_INSTALL_PREFIX/lib/bmux/versions/<version>-<target>` directory (default
-prefix `/usr/local`), syncs it, then atomically replaces `bin/bmux` with a symlink
+prefix `/usr/local`), syncs it, then atomically replaces `bin/bmux` with a
+symlink
 to that version's CLI. Running older binaries retain their complete sibling
 installation; no CLI/helper pair is overwritten sequentially. Concurrent
 publishers fail via an exclusive install lock. Existing immutable versions are
-refused rather than changed. Old versions are retained, not automatically deleted.
-Legacy archives without an inventory are explicitly refused with a manual-install
+refused rather than changed. Old versions are retained, not automatically
+deleted.
+Legacy archives without an inventory are explicitly refused with a
+manual-install
 message; they are not silently represented as auxiliary-capable installations.
 
 Existing npm launcher fallback behavior still needs separate review: packaging
@@ -179,11 +199,15 @@ installation.
 node --test infra/wrangler/test/install.test.mjs
 ```
 
-These shell fixtures exercise checksum-before-extraction ordering, archive safety,
-and invocation of the owned Rust installer with isolated mocked downloads, without
-building Rust, contacting endpoints, or publishing packages. Rust xtask unit tests
+These shell fixtures exercise checksum-before-extraction ordering, archive
+safety,
+and invocation of the owned Rust installer with isolated mocked downloads,
+without
+building Rust, contacting endpoints, or publishing packages. Rust xtask unit
+tests
 cover inventory identity, corruption, slot layout and generated package entries;
-the coordinator runs these through the Nix-selected toolchain along with mandated
+the coordinator runs these through the Nix-selected toolchain along with
+mandated
 workspace checks. Full release builds, archive/deb/rpm inspection and installed-
 runtime validation remain coordinator/CI responsibilities.
 

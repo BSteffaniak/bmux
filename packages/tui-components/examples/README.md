@@ -77,11 +77,13 @@ traffic, not retained or peak memory. Buffer setup and ANSI encoding are outside
 the counted interval.
 
 One-row scrolling uses `scroll_by` and
-paints retained geometry before any new synchronization. Callers must synchronize
+paints retained geometry before any new synchronization. Callers must
+synchronize
 after item, layout revision, width, or environment changes, not merely because
 the scroll offset changed. For comparison, `row_sync_us`
 measures the unchanged-collection synchronization, `row_paint_us` measures only
-painting, and `row_sync_and_paint_us` sums those two operations. The sum excludes
+painting, and `row_sync_and_paint_us` sums those two operations. The sum
+excludes
 buffer setup, metadata inspection, and ANSI encoding in the benchmark harness;
 it is not an end-to-end frame latency. Zero remeasurement does not imply that
 synchronization is constant-time or sublinear. These fixed-viewport samples

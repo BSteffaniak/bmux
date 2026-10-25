@@ -8,8 +8,10 @@ Defaults search every workspace, order by caller-local last visit before typing,
 rank filtered results by relevance, and hide the current tab. Use
 `filtered_sort_order = "inherit"` for strict recency even while filtering.
 `wrap_selection = true` (default)
-wraps Up/Down and Ctrl-P/Ctrl-N at the filtered list boundaries; set it to `false`
-to stop at either end. Home/End and page navigation keep their existing behavior.
+wraps Up/Down and Ctrl-P/Ctrl-N at the filtered list boundaries; set it to
+`false`
+to stop at either end. Home/End and page navigation keep their existing
+behavior.
 Settings also support
 workspace/tab arrangement order, alphabetical labels, relevance ranking, and
 placing the current tab last or in normal order. See

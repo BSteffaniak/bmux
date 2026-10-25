@@ -4,7 +4,9 @@ title: BMUX — work, views, and evidence
 author: Braden
 theme: dark
 ---
+
 <!-- markdownlint-disable MD025 -->
+
 <!-- Slide decks intentionally have one top-level heading per slide. -->
 <!-- bmux:slide-id opening -->
 <!-- bmux:block-id opening-title -->
@@ -119,6 +121,7 @@ its line count with `wc -l`. That is just a visible file check, not part of navi
 These two checks are combined in `demos/navigation.dsl`.
 
 <!-- bmux:notes -->
+
 PID proves same shell. File supplies a second, visible check. Read these separately.
 <!-- bmux:end-notes -->
 ---
@@ -178,6 +181,7 @@ style         = "rounded"
 ```
 
 <!-- bmux:block-id theme-component-provenance -->
+
 `plugins/theme-plugin/assets/themes/minimal.toml` · `plugins."bmux.decoration".unfocused`
 
 <!-- bmux:block-id themes-composition-boundary -->
@@ -210,6 +214,7 @@ The compositor places the ball, paddles, score, and terminal content together.
 Source: `plugins/theme-plugin/assets/themes/pong.toml`
 
 <!-- bmux:notes -->
+
 Colors → animation → component list. Separate owners, one composed screen.
 <!-- bmux:end-notes -->
 ---
@@ -234,6 +239,7 @@ to parse terminal output or inspect every character on each collision check.
 Enable **Bounce off terminal content** in Pong settings; it is off by default.
 
 <!-- bmux:notes -->
+
 Content becomes collision data. Projection happens before transport; Lua consumes the mask.
 <!-- bmux:end-notes -->
 ---
@@ -261,6 +267,7 @@ The adapter is plugin-owned; the host carries the declared request and payload.
 Source: `plugins/theme-plugin/assets/themes/pong.toml`
 
 <!-- bmux:notes -->
+
 Point: content region, dirty-only, byte/rate limits. No Pong-specific core API.
 <!-- bmux:end-notes -->
 ---
@@ -305,6 +312,7 @@ are schematic, not Lua APIs provided by BMUX.
 Simplified from `plugins/decoration-plugin/assets/decorations/pong.lua` · `visual_bitset_occupied`, `visual_collision_candidate`. Names and plumbing are shortened; not a standalone program.
 
 <!-- bmux:notes -->
+
 Lookup first; scroll to crossed cells and hit axes. Revision changes reconcile occupancy. This is simplified algorithm structure, not copy/paste Lua.
 <!-- bmux:end-notes -->
 ---
@@ -359,6 +367,7 @@ snapshot id='verified-demo'
 ```
 
 <!-- bmux:block-id playbook-source-provenance -->
+
 `demos/evidence.dsl` · output/layout checks → named snapshot
 
 <!-- bmux:block-id playbook-source-contract -->
@@ -429,6 +438,7 @@ flowchart TB
 ```
 
 <!-- bmux:notes -->
+
 Follow a split request forward, then output back. Keystrokes target the program. Plugins organize; one compositor combines surfaces. Attachment loss does not end execution.
 <!-- bmux:end-notes -->
 ---
@@ -472,6 +482,7 @@ The tabs plugin owns the policy; it does not reach into another plugin’s priva
 Simplified from `plugins/tabs-plugin/src/lib.rs` · `split_pane_with_policy`. Names and plumbing are shortened; not a standalone program.
 
 <!-- bmux:notes -->
+
 Pause at target validation, then the two generated calls, then the event. Scroll as needed. Double ? abbreviates separate transport/service error mapping.
 <!-- bmux:end-notes -->
 ---
@@ -529,6 +540,7 @@ The declaration is an excerpt; client error conversions are omitted.
 This is not a claim that arbitrary plugin versions are interchangeable.
 
 <!-- bmux:notes -->
+
 Contract first, generated client second, provider-owned implementation third.
 No handwritten transport envelope or private runtime import. Scroll to the result layers.
 <!-- bmux:end-notes -->
@@ -574,6 +586,7 @@ Per-pane rules can match command, name, or shell; the first matching rule wins.
 Source: `packages/config/src/lib.rs` · `ScrollbackBehaviorConfig`
 
 <!-- bmux:notes -->
+
 Frozen history does not pause the process. Zero limits mean unlimited/disabled; shown values are examples.
 <!-- bmux:end-notes -->
 ---
@@ -640,6 +653,7 @@ trait signatures and geometry conversion, not application ownership.
 Simplified from `docs/tui-runtime.md` and `packages/tui-components/src/button.rs`. Names and plumbing are shortened; not a standalone program.
 
 <!-- bmux:notes -->
+
 State → layout → paint → event. Emphasize same committed geometry and caller-owned state; no independent hit rectangles.
 <!-- bmux:end-notes -->
 ---
@@ -666,6 +680,7 @@ Tab focuses a component; Escape returns to slide navigation.
 Source: `packages/tui-components/README.md`
 
 <!-- bmux:notes -->
+
 Opt in per control. Gallery: move quickly; pause only for questions.
 <!-- bmux:end-notes -->
 ---
@@ -683,6 +698,7 @@ ButtonComponent::new("save", "Save", &state);
 Save button with activation count. Enter/Space activates.
 
 <!-- bmux:block-id gallery-button -->
+
 <!-- bmux:component tui-gallery {"kind":"button"} -->
 
 <!-- bmux:notes -->
@@ -703,6 +719,7 @@ CheckboxComponent::new("enabled", "Enable", &state);
 Enable starts unchecked. Space toggles it.
 
 <!-- bmux:block-id gallery-checkbox -->
+
 <!-- bmux:component tui-gallery {"kind":"checkbox"} -->
 
 <!-- bmux:notes -->
@@ -723,6 +740,7 @@ RadioGroupComponent::new("choice", &options, &state);
 Live / Frozen / Automatic. Arrow keys move; Space selects.
 
 <!-- bmux:block-id gallery-radio-group -->
+
 <!-- bmux:component tui-gallery {"kind":"radio-group"} -->
 
 <!-- bmux:notes -->
@@ -742,6 +760,7 @@ TextInputBoxComponent::new("name", policy, &text)
 ```
 
 <!-- bmux:block-id gallery-text-input-box -->
+
 <!-- bmux:component tui-gallery {"kind":"text-input-box"} -->
 
 Implementation walkthrough:
@@ -778,6 +797,7 @@ application routes focus and supplies geometry. `request_redraw` is schematic.
 Simplified from `examples/tui-components-inputs/src/lib.rs` · `new`, `handle_text_event`; `packages/tui-components/src/text_input_box.rs`. Names and plumbing are shortened; not a standalone program.
 
 <!-- bmux:notes -->
+
 Pause on caller-owned buffer, then Edited versus Redraw, then painting the same state.
 <!-- bmux:end-notes -->
 ---
@@ -795,6 +815,7 @@ SelectDropdownComponent::new("status", &options, &state);
 Ready / Running / Done, shown open. Display-only preview.
 
 <!-- bmux:block-id gallery-select-dropdown -->
+
 <!-- bmux:component tui-gallery {"kind":"select-dropdown"} -->
 
 <!-- bmux:notes -->
@@ -817,6 +838,7 @@ DialogComponent::new("confirm", dialog, &state);
 Interactive dialog: arrows or Tab/Shift-Tab traverse Save/Cancel; Enter/Space or click activates. Escape cancels; Reopen / reset starts again.
 
 <!-- bmux:block-id gallery-dialog -->
+
 <!-- bmux:component tui-gallery {"kind":"dialog"} -->
 
 <!-- bmux:notes -->
@@ -837,6 +859,7 @@ SelectableListComponent::new("results", &items, &state);
 Build / Test / Ship. Arrow keys move; Enter selects.
 
 <!-- bmux:block-id gallery-selectable-list -->
+
 <!-- bmux:component tui-gallery {"kind":"selectable-list"} -->
 
 <!-- bmux:notes -->
@@ -857,6 +880,7 @@ TreeViewComponent::new("files", &items, &state);
 src → main.rs / lib.rs. Arrow keys navigate and expand.
 
 <!-- bmux:block-id gallery-tree-view -->
+
 <!-- bmux:component tui-gallery {"kind":"tree-view"} -->
 
 <!-- bmux:notes -->
@@ -879,6 +903,7 @@ TableComponent::new("jobs", &columns, &rows, &state);
 build: passed · test: running · release: waiting. Arrow keys navigate.
 
 <!-- bmux:block-id gallery-table -->
+
 <!-- bmux:component tui-gallery {"kind":"table"} -->
 
 <!-- bmux:notes -->
@@ -899,6 +924,7 @@ ScrollViewComponent::new("details", viewport, state, content);
 Focus this viewport; arrows/Page/Home/End or the wheel scroll its rows. At the edge, input yields to the slide.
 
 <!-- bmux:block-id gallery-scroll-view -->
+
 <!-- bmux:component tui-gallery {"kind":"scroll-view"} -->
 
 Implementation walkthrough:
@@ -934,6 +960,7 @@ Sizing helpers above are schematic.
 Simplified from `packages/presenter/src/viewer.rs` · `ViewerViewport`. Names and plumbing are shortened; not a standalone program.
 
 <!-- bmux:notes -->
+
 This is the mechanism viewing this slide. Scroll to child-first events, then retained offset and clipping.
 <!-- bmux:end-notes -->
 ---
@@ -951,6 +978,7 @@ BarChartComponent::new("usage", &items);
 build: 8 · test: 5 · lint: 3.
 
 <!-- bmux:block-id gallery-bar-chart -->
+
 <!-- bmux:component tui-gallery {"kind":"bar-chart"} -->
 
 <!-- bmux:notes -->
@@ -971,6 +999,7 @@ SparklineComponent::new("latency", &samples);
 Samples: 2, 4, 3, 7, 5, 9, 6, 8, 4, 6, 8, 10.
 
 <!-- bmux:block-id gallery-sparkline -->
+
 <!-- bmux:component tui-gallery {"kind":"sparkline"} -->
 
 <!-- bmux:notes -->
@@ -993,6 +1022,7 @@ ProgressBarComponent::new(
 Completed: 7 of 10.
 
 <!-- bmux:block-id gallery-progress-bar -->
+
 <!-- bmux:component tui-gallery {"kind":"progress-bar"} -->
 
 <!-- bmux:notes -->
@@ -1013,6 +1043,7 @@ BadgeComponent::new("status", "Running");
 Label: Running.
 
 <!-- bmux:block-id gallery-badge -->
+
 <!-- bmux:component tui-gallery {"kind":"badge"} -->
 
 <!-- bmux:notes -->
@@ -1033,6 +1064,7 @@ TabBarComponent::new("sections", &items, &state);
 Overview / Activity / Settings. Arrow keys change tabs.
 
 <!-- bmux:block-id gallery-tab-bar -->
+
 <!-- bmux:component tui-gallery {"kind":"tab-bar"} -->
 
 <!-- bmux:notes -->
@@ -1056,6 +1088,7 @@ BreadcrumbsComponent::new("path", &items, &state);
 Home / Projects / BMUX. Arrow keys move; Enter activates.
 
 <!-- bmux:block-id gallery-breadcrumbs -->
+
 <!-- bmux:component tui-gallery {"kind":"breadcrumbs"} -->
 
 <!-- bmux:notes -->
@@ -1076,6 +1109,7 @@ ToastStackComponent::new("notifications", &toasts, &state);
 Saved — Your changes are ready. Display-only preview.
 
 <!-- bmux:block-id gallery-toast-stack -->
+
 <!-- bmux:component tui-gallery {"kind":"toast-stack"} -->
 
 <!-- bmux:notes -->
@@ -1096,6 +1130,7 @@ VirtualList::new("jobs").component(job_id, row);
 Focus this virtual list; arrows/Page/Home/End or the wheel scroll jobs. The offset belongs to your view.
 
 <!-- bmux:block-id gallery-virtual-list -->
+
 <!-- bmux:component tui-gallery {"kind":"virtual-list"} -->
 
 Implementation walkthrough:
@@ -1129,6 +1164,7 @@ The indexing and clipped-paint helpers above are schematic.
 Simplified from `packages/tui-components/src/virtual_list.rs` · `sync_with_environment`, `paint`. Names and plumbing are shortened; not a standalone program.
 
 <!-- bmux:notes -->
+
 Pause at synchronization cost, then visible range, then keyed retained layout. Gallery remains below the code.
 <!-- bmux:end-notes -->
 ---
@@ -1148,6 +1184,7 @@ source_viewer_rows(input, width);
 hello.rs: a three-line Hello, BMUX program, with line numbers.
 
 <!-- bmux:block-id gallery-source-viewer -->
+
 <!-- bmux:component tui-gallery {"kind":"source-viewer"} -->
 
 <!-- bmux:notes -->
@@ -1168,6 +1205,7 @@ diff_viewer_rows(input, width);
 config.toml: theme changes from dark to pong.
 
 <!-- bmux:block-id gallery-diff-viewer -->
+
 <!-- bmux:component tui-gallery {"kind":"diff-viewer"} -->
 
 <!-- bmux:notes -->
@@ -1190,6 +1228,7 @@ terminal_viewer_rows(input, width);
 Recorded sample: cargo check, green Finished, exit code 0. No process is launched.
 
 <!-- bmux:block-id gallery-terminal-viewer -->
+
 <!-- bmux:component tui-gallery {"kind":"terminal-viewer"} -->
 
 <!-- bmux:notes -->
@@ -1212,6 +1251,7 @@ Canvas::new(
 Five points in normalized coordinates; six-row drawing area.
 
 <!-- bmux:block-id gallery-canvas -->
+
 <!-- bmux:component tui-gallery {"kind":"canvas"} -->
 
 <!-- bmux:notes -->
@@ -1234,6 +1274,7 @@ Chart::new(
 Line dataset: (0,1), (1,3), (2,2), (3,5); six-row chart.
 
 <!-- bmux:block-id gallery-chart -->
+
 <!-- bmux:component tui-gallery {"kind":"chart"} -->
 
 <!-- bmux:notes -->
@@ -1255,6 +1296,7 @@ let invalid = form.validate_ids();
 Edit Name and Email; Tab/Shift-Tab traverses fields and Save, yielding at either boundary. Enter validates; click a field or Save to target it.
 
 <!-- bmux:block-id gallery-form -->
+
 <!-- bmux:component tui-gallery {"kind":"form"} -->
 
 Implementation walkthrough:
@@ -1288,6 +1330,7 @@ Save/display helpers above are schematic.
 Simplified from `packages/tui-components/src/form.rs` · `validate_ids`, `handle_event`; `examples/tui-components-inputs/src/lib.rs`. Names and plumbing are shortened; not a standalone program.
 
 <!-- bmux:notes -->
+
 Fields → required values → application save decision → focus. Build on the text-input state example.
 <!-- bmux:end-notes -->
 ---
@@ -1329,6 +1372,7 @@ Refresh detection, message types, and loading helpers are illustrative applicati
 Simplified from `packages/tui-runtime/src/program.rs` · `RuntimeEvent`, `Update`, `Program`; `command_scheduler.rs`. Names and plumbing are shortened; not a standalone program.
 
 <!-- bmux:notes -->
+
 Event → command → message → redraw. Timers also enter the serialized update path. Presentation success is a separate acknowledgement.
 <!-- bmux:end-notes -->
 ---
@@ -1351,6 +1395,7 @@ Choose a protocol your terminal supports; these examples do not silently fall ba
 Source: `packages/tui-runtime/README.md`
 
 <!-- bmux:notes -->
+
 Optional runnable examples—not embedded demos. Protocol support depends on host terminal.
 <!-- bmux:end-notes -->
 ---

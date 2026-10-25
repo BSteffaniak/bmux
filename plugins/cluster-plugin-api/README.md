@@ -2,7 +2,10 @@
 
 Stable typed contract for the bmux cluster plugin.
 
-The crate contains BPDL schemas, generated service/client modules, stable wire types, and contract smoke tests. Runtime membership, gateway policy, federation state, placement, connection management, and background work belong in `bmux_cluster_plugin`, not this API crate.
+The crate contains BPDL schemas, generated service/client modules, stable wire
+types, and contract smoke tests. Runtime membership, gateway policy, federation
+state, placement, connection management, and background work belong in
+`bmux_cluster_plugin`, not this API crate.
 
 ## Interfaces
 
@@ -20,7 +23,8 @@ identifiers.
 The generated voter authorization explicitly requires `protocol_version = 2`.
 Its signature binds cluster, action, target, signer, canonical complete current
 and proposed member digests, the committed Raft membership log epoch, and a
-five-minute expiry. Missing v2 fields and unsupported proof versions fail closed;
+five-minute expiry. Missing v2 fields and unsupported proof versions fail
+closed;
 old proofs are never inferred or upgraded. Durable control-log formats are
 unchanged. Upgrade cluster peers and bundled plugins together before changing
 voters; ordinary observers do not need a voter promotion proof.
@@ -31,7 +35,8 @@ proofs automatically. A concurrent membership change or elapsed expiry requires
 obtaining a fresh proof; replay is rejected even after restart. A retry after a
 lost successful join response receives a fresh signed acknowledgement of the
 exact current plan. It is quorum-confirmed, requires the target to already be a
-committed Raft voter, and performs no metadata or voter-set mutation. Failed promotion
+committed Raft voter, and performs no metadata or voter-set mutation. Failed
+promotion
 can leave locally adopted enrollment state; do not treat the local member list
 as evidence of committed promotion. Use authoritative cluster status to inspect
 recovery. The existing local `cluster consensus reconcile` workflow reconciles

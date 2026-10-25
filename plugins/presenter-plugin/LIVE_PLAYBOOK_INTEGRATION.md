@@ -1,7 +1,8 @@
 # Playbook demo presentation
 
 Execution is opt-in through `--allow-playbooks` on local playback or host
-creation. Parsing, checking, viewing, and reloading a deck never start a playbook.
+creation. Parsing, checking, viewing, and reloading a deck never start a
+playbook.
 A browser audience is read-only and never receives an approval prompt.
 
 ## Authoring
@@ -14,7 +15,8 @@ Use the existing inert custom-component directive with a stable block identity:
 ```
 
 The component opens a manually controlled overlay. Opening is not execution.
-Run, Stop, and Restart are explicit actions. Hiding the overlay does not terminate
+Run, Stop, and Restart are explicit actions. Hiding the overlay does not
+terminate
 its owned run. Leaving the slide requests stop under `on_leave: stop`; restart
 waits for acknowledged cleanup before replaying. Completed output remains
 available without restarting.
@@ -57,14 +59,18 @@ an unresolved delivery stops subsequent actions, including direct pane input.
 Command acknowledgment is not asynchronous prompt readiness: always wait for the
 actual prompt before typing. `wait-rendered` waits for a committed post-input
 frame containing the requested text. `assert-rendered` reads that same retained
-buffer, not a pane grid or simulated UI. Counter-based `@render-trace` is rejected
+buffer, not a pane grid or simulated UI. Counter-based `@render-trace` is
+rejected
 for managed runs rather than asserted against a different render path.
 
-`send-keys` still targets a pane. Use `paste-attach` and `send-attach` for prompt
-text/navigation. `prefix-key key=c` sends the owned attach's effective configured
+`send-keys` still targets a pane. Use `paste-attach` and `send-attach` for
+prompt
+text/navigation. `prefix-key key=c` sends the owned attach's effective
+configured
 prefix followed by `c` through its actual keyboard runtime (not a direct tab
 service call). For fixed presentation geometry use `@viewport cols=80 rows=24`;
-80 by 24 is also the default. Finder searches real tabs across workspaces, not arbitrary
+80 by 24 is also the default. Finder searches real tabs across workspaces, not
+arbitrary
 standalone sessions. Theme picker lists the catalog available in the generated
 isolated configuration; host-local custom theme files are not implicitly copied.
 Ensure the relevant bundled plugins are present. A sleep is presentation pacing,
@@ -98,7 +104,8 @@ interface `theme-control-v1`, offers `current`, revision-checked `select`,
 `refresh`, and token-scoped preview operations. These mutate theme state but do
 not open the picker. `bmux.tabs.write` / `tabs-commands` offers `new-tab` and
 `switch-tab`; `bmux.sessions.write` / `sessions-commands` offers `new-session`
-and `select-session`. Raw playbook `invoke-service` is not a JSON-to-BPDL bridge:
+and `select-session`. Raw playbook `invoke-service` is not a JSON-to-BPDL
+bridge:
 it sends UTF-8 payload bytes, whereas these contracts use typed-stable encoding.
 Use the owned attach commands above for visible interaction, not JSON payloads
 or fabricated prompt surfaces.
@@ -125,9 +132,12 @@ responsible for choosing output suitable for broadcast.
 
 ## Runtime boundaries
 
-A presenter-private controller is shared by local playback and managed ownership.
-Its explicitly owned async task uses generated playbook services for preparation,
-start, bounded status/watch snapshots, and stop/settled/restart. Synchronous owner
+A presenter-private controller is shared by local playback and managed
+ownership.
+Its explicitly owned async task uses generated playbook services for
+preparation,
+start, bounded status/watch snapshots, and stop/settled/restart. Synchronous
+owner
 calls admit bounded commands only; network operations never run during paint,
 scene construction, snapshot, or poll. Action acknowledgment records admission;
 completion is a later retained update. A replayed action does not enqueue work
@@ -147,8 +157,10 @@ missing incremental output is never presented as a complete stream.
 
 Navigation cancellation is sticky and independent of command-queue capacity.
 It invalidates queued execution controls and is checked again after preparation
-and before start/restart. Uncertain preparation retains its original request UUID
-and is reconciled only by `lookup_preparation`; rejection/missing retention is not
+and before start/restart. Uncertain preparation retains its original request
+UUID
+and is reconciled only by `lookup_preparation`; rejection/missing retention is
+not
 proof of settlement and never creates a replacement preparation identity.
 
 Local input uses the owner epoch and attempt generation from the last successful

@@ -4,7 +4,9 @@ title: BMUX — implementation follow-ups
 author: Braden
 theme: dark
 ---
+
 <!-- markdownlint-disable MD025 -->
+
 <!-- Slide decks intentionally have one top-level heading per slide. -->
 <!-- bmux:slide-id vocabulary -->
 <!-- bmux:block-id vocabulary-title -->
@@ -103,6 +105,7 @@ Optional depth. Point to the contract and its owning layer.
 ```
 
 <!-- bmux:block-id split-provenance -->
+
 `plugins/tabs-plugin-api/bpdl/tabs-plugin.bpdl` · `tabs-commands.split-pane`
 
 <!-- bmux:block-id split-architecture -->
@@ -127,6 +130,7 @@ interface tabs-catalog-v1 {
 ```
 
 <!-- bmux:block-id catalog-provenance -->
+
 `plugins/tabs-plugin-api/bpdl/tabs-plugin.bpdl` · `tabs-catalog-v1`
 
 <!-- bmux:block-id ownership-boundary -->
@@ -155,6 +159,7 @@ flowchart LR
 ```
 
 <!-- bmux:block-id preview-lifecycle-takeaway -->
+
 **Revision checks protect entry; the token owns the preview.** This is the control-service contract; the live picker uses a separate interactive prompt path.
 
 <!-- bmux:notes -->
@@ -178,6 +183,7 @@ Optional depth. Point to the contract and its owning layer.
 ```
 
 <!-- bmux:block-id theme-control-provenance -->
+
 `plugins/theme-plugin/bpdl/theme-plugin.bpdl` · `theme-control-v1` · excerpt
 
 <!-- bmux:block-id theme-control-scope -->

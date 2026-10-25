@@ -4,7 +4,9 @@
 
 **A Rust terminal multiplexer and reusable terminal UI framework.**
 
-bmux combines server-backed terminal sessions with independent client views, modal interaction, typed plugin services, and composable themes. The UI framework can also be used without the multiplexer.
+bmux combines server-backed terminal sessions with independent client views,
+modal interaction, typed plugin services, and composable themes. The UI
+framework can also be used without the multiplexer.
 
 > **Early alpha.** APIs, configuration, and terminal compatibility are evolving. Source installation is the supported path described here. Package-release workflows exist, but npm/package-server availability must not be inferred from those workflows.
 
@@ -19,7 +21,10 @@ bmux combines server-backed terminal sessions with independent client views, mod
 
 ## Installation
 
-Install Git, Nix, and a native build toolchain. macOS and Linux are primary terminal environments; the repository also contains Windows support and platform-specific release configuration. A release target is not a guarantee of identical behavior on every terminal/OS combination.
+Install Git, Nix, and a native build toolchain. macOS and Linux are primary
+terminal environments; the repository also contains Windows support and
+platform-specific release configuration. A release target is not a guarantee of
+identical behavior on every terminal/OS combination.
 
 ```sh
 git clone https://github.com/BSteffaniak/bmux.git
@@ -31,11 +36,13 @@ TARGET="$(rustc -vV | awk '/^host:/ { print $2 }')"
 "$CARGO_TARGET_DIR/$TARGET/release/bmux"
 ```
 
-On Windows, use `target\release\bmux.exe`. Use the built binary's full path, or add its directory to `PATH` before using the examples below.
+On Windows, use `target\release\bmux.exe`. Use the built binary's full path, or
+add its directory to `PATH` before using the examples below.
 
 ## Current CLI Workflow
 
-Running without a subcommand starts or reuses a local server, creates a session when needed, and attaches.
+Running without a subcommand starts or reuses a local server, creates a session
+when needed, and attaches.
 
 ```sh
 bmux new-session dev
@@ -78,7 +85,9 @@ headless agent interaction, and explicit recovery.
 - [Shared Rust/WASM browser rendering](docs/browser-rendering.md) (local read-only view)
 - [Operations](docs/operations.md) and [testing](TESTING.md)
 
-Remote gateways and login startup are opt-in operations. Review their network exposure and supervision behavior before enabling them. Do not copy gateway examples into an internet-facing deployment without appropriate access controls.
+Remote gateways and login startup are opt-in operations. Review their network
+exposure and supervision behavior before enabling them. Do not copy gateway
+examples into an internet-facing deployment without appropriate access controls.
 
 ## Development
 

@@ -1,6 +1,7 @@
 # bmux_playbook
 
-Playbook models, DSL/TOML parsing, include resolution, immutable source snapshots,
+Playbook models, DSL/TOML parsing, include resolution, immutable source
+snapshots,
 substitution and result comparison are available with default features.
 
 The default-off `runtime` feature adds the real execution engine. This is a
@@ -9,7 +10,8 @@ on `bmux_cli` or plugin implementation crates.
 
 ## Execution boundary
 
-`run(playbook, target_server, options, Arc<dyn HostAdapter>)` owns step scheduling,
+`run(playbook, target_server, options, Arc<dyn HostAdapter>)` owns step
+scheduling,
 deadlines, action dispatch, assertions, recording, sandbox lifecycle and result
 settlement. There is no default or no-op host. Non-CLI callers provide their own
 required primitive adapters:

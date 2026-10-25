@@ -72,7 +72,8 @@ Current scope:
 
 ### Gateway Output Examples
 
-Text table columns are aligned and consistent across `cluster gateway status`, `cluster gateway explain`, and routed command `--dry-run`:
+Text table columns are aligned and consistent across `cluster gateway status`,
+`cluster gateway explain`, and routed command `--dry-run`:
 
 ```text
 candidate                 preferred stability  breaker    cooldown_ms  ok    reason         latency_ms skip           detail
@@ -116,7 +117,8 @@ JSON example for `cluster gateway explain --format json`:
 }
 ```
 
-JSON example for routed command dry-run (`cluster status prod --dry-run --format json`):
+JSON example for routed command dry-run (`cluster status prod --dry-run --format
+json`):
 
 ```json
 {

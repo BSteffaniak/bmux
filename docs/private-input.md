@@ -6,10 +6,12 @@ of secret contents and length. `TerminalInput::start_private` routes text before
 ordinary runtime admission. Applications must not trace, clone, persist or
 replay private delivery messages.
 
-A `PrivateInputGate` requires an explicit `CaptureSuppression` owner. Acquisition
+A `PrivateInputGate` requires an explicit `CaptureSuppression` owner.
+Acquisition
 quarantines ingress before requesting suppression; private focus is allowed only
 after acknowledgment. Lease destruction wipes local input but does not restore
-ordinary input. The ingress owner must drain raw, decoded and application-pending
+ordinary input. The ingress owner must drain raw, decoded and
+application-pending
 input before `drain_and_resume`; failure preserves quarantine. The trait is a
 contract, not proof that an enclosing process has been suppressed.
 

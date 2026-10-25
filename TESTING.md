@@ -1,6 +1,7 @@
 # TESTING.md
 
-Testing guidance for bmux development, with emphasis on CLI/runtime and terminal protocol correctness.
+Testing guidance for bmux development, with emphasis on CLI/runtime and terminal
+protocol correctness.
 
 ## Quick Start
 
@@ -77,7 +78,8 @@ Expected output ends with:
 
 - `compatibility matrix checks passed`
 
-Any `FAIL` line should be treated as a blocker for protocol/compatibility changes.
+Any `FAIL` line should be treated as a blocker for protocol/compatibility
+changes.
 
 ## When to Run What
 
@@ -108,7 +110,8 @@ bmux terminal doctor --trace --trace-limit 50
 bmux terminal doctor --json --trace --trace-limit 50
 ```
 
-Use trace mode when debugging protocol query/reply behavior (requires trace enabled in config).
+Use trace mode when debugging protocol query/reply behavior (requires trace
+enabled in config).
 
 ### Terminfo install helper
 

@@ -73,9 +73,11 @@ bold_active = true
 underline_active = false
 ```
 
-Tabs wrap between labels in authoritative order, left-to-right then top-to-bottom,
+Tabs wrap between labels in authoritative order, left-to-right then
+top-to-bottom,
 for either placement. The bar grows and shrinks from `layout.min_rows` to
-`layout.max_rows` (defaults 1 and 3; valid range `1 <= min_rows <= max_rows <= 16`).
+`layout.max_rows` (defaults 1 and 3; valid range `1 <= min_rows <= max_rows <=
+16`).
 Workspace and status modules appear only on the first row. Oversized labels clip
 to one row; overflow navigation remains available at the ceiling and selection
 reveals the active tab. Terminal allocation can reduce the visible row count.
@@ -87,9 +89,12 @@ The bar composes width-packed tabs with right-aligned mode, role, follow, and
 conditional hint/message modules. Optional session/context modules occupy the
 left side after tabs. Templates support `{name}`, `{index}`, `{index0}`,
 `{session}`, `{marker}`, `{id}`, and `{active}` with Unicode-cell-safe width
-limits and literal double braces. Tab names have no explicit width cap by default
-(or with `tab_label_max_width = "unlimited"`); the strip still clips to available
-terminal space. Set a positive integer such as `300` to cap names in terminal cells.
+limits and literal double braces. Tab names have no explicit width cap by
+default
+(or with `tab_label_max_width = "unlimited"`); the strip still clips to
+available
+terminal space. Set a positive integer such as `300` to cap names in terminal
+cells.
 
 Optional color keys under `[plugins.settings."bmux.tab_bar".colors]` cover
 the bar, active/inactive/hover tabs, modules, and overflow using `#RRGGBB`

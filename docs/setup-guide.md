@@ -23,7 +23,8 @@ bmux host --status
 
 ## SSH Kiosk Setup
 
-For locked SSH access flows, configure kiosk profiles and generate sshd/wrapper artifacts:
+For locked SSH access flows, configure kiosk profiles and generate sshd/wrapper
+artifacts:
 
 ```bmux-cli
 bmux kiosk status

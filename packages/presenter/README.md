@@ -65,8 +65,10 @@ viewport size. It does not open an interactive terminal player.
 ## Markdown dialect
 
 Front matter is YAML between opening/closing `---` (or closing `...`). Supported
-metadata keys: `id`, `title`, `author`, `theme`; other keys remain inert metadata.
-Outside front matter, only **top-level** Markdown thematic breaks separate slides.
+metadata keys: `id`, `title`, `author`, `theme`; other keys remain inert
+metadata.
+Outside front matter, only **top-level** Markdown thematic breaks separate
+slides.
 Rules inside fences, blockquotes, or lists do not separate slides.
 
 Directives are standalone, namespaced HTML comments:
@@ -95,7 +97,8 @@ Private speaker notes, including Markdown rules.
 Use explicit IDs for long-lived slides/blocks. Automatic IDs are deterministic
 content-derived keys with duplicate ordinals: unrelated insertions do not change
 unique-content IDs, but changing the identity-bearing first block changes an
-implicit slide ID. Editing duplicate content requires explicit IDs for continuity.
+implicit slide ID. Editing duplicate content requires explicit IDs for
+continuity.
 Column weights must be positive and every declared column needs its separator;
 nested directive columns are rejected (Rust models may compose nested columns).
 Unknown/malformed namespaced directives and unclosed groups are source-located
@@ -118,12 +121,14 @@ control state. `revision()` invalidates disposable caches when external state
 changes. `OwnedFactory::new` adapts factories of owning components. No dynamic
 Rust loading exists. Unknown factories produce visible diagnostics.
 
-`RichContent::build<'a>(&'a self, &'a Block) -> Option<Element<'a>>` receives code,
+`RichContent::build<'a>(&'a self, &'a Block) -> Option<Element<'a>>` receives
+code,
 image, or Mermaid blocks; `revision()` describes provider-owned revisions.
 Code providers return their prepared canonical component directly, without a
 second highlighting or Markdown wrapper. Returning `None` for code uses the
 shared Markdown renderer fallback.
-Attach with `.rich_content(&provider)` on slide/viewer components. Providers must
+Attach with `.rich_content(&provider)` on slide/viewer components. Providers
+must
 only use already-authorized/resolved assets and remain deterministic/read-only.
 Returning `None` uses readable alt text or Mermaid code fallback, reserving at
 least the block's requested rows. `ImageComponent::new(id, ImagePayload, rows)`
@@ -132,7 +137,8 @@ canonical transforms, clipping, and frame lifecycle. Images default to centered
 `Contain`: requested rows reserve an allocation, not a forced aspect ratio.
 Output adapters fit using measured cell pixel dimensions, and scrolling clips
 that original fit without squeezing it. Unknown terminal metrics use an explicit
-8x16 estimate; exact sizing requires reported metrics. Use `.fit(ImageFit::Stretch)`
+8x16 estimate; exact sizing requires reported metrics. Use
+`.fit(ImageFit::Stretch)`
 for intentional distortion. Resize/font metric changes invalidate derived fits.
 Rasterized Mermaid may use
 that same component; text Mermaid output may use canonical `TextBlock`. Runtime
@@ -144,7 +150,8 @@ owns rendering/decoding policy, limits, cancellation, and asset authorization.
 all nested diagnostic source locations, and all custom configuration. Local deck
 objects retain those values for diagnostics and linked applications.
 
-**`public()` is not a complete confidentiality or asset authorization boundary.**
+**`public()` is not a complete confidentiality or asset authorization
+boundary.**
 Authored raw Markdown (including inline destinations/HTML), `Image.destination`,
 text/code/Mermaid, metadata, IDs, and custom names may contain local paths or
 other sensitive authored information. The runtime must review/redact these
@@ -155,7 +162,8 @@ linked components need an explicitly reviewed public configuration projection.
 
 ## Examples and validation
 
-`examples/deck.md` is a runnable CLI deck covering metadata, reveals, notes, code,
+`examples/deck.md` is a runnable CLI deck covering metadata, reveals, notes,
+code,
 tables, columns, a bundled image, and embedded WASM Mermaid. No helper binary
 or custom registration is needed.
 `examples/linked_deck.rs` builds a Rust

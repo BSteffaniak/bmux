@@ -8,7 +8,8 @@ Provides config-driven prompted action sequences. A prompted action displays one
 or more prompt overlays, collects values from the user, substitutes those values
 into a command template, and dispatches the resulting bmux action.
 
-This is useful for keybindings that need a small amount of runtime input, such as
+This is useful for keybindings that need a small amount of runtime input, such
+as
 recording export settings or command arguments.
 
 ## Command

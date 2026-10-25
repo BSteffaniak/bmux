@@ -47,7 +47,8 @@ at `https://bmux.dev` and connects to
 publisher traffic uses authenticated `/v1/publisher/*` control and WebSocket
 routes; never put keys into WebSocket URLs.
 
-Protocol 1 carries BMWP version 5 (`bmwp-5`) full frames and deltas over persistent
+Protocol 1 carries BMWP version 5 (`bmwp-5`) full frames and deltas over
+persistent
 WebSockets. Connection and repair start from a complete full frame. A slow
 viewer repairs from bounded current state rather than accumulating an unbounded
 queue. Idle streams do not poll status or repeatedly upload snapshots. There is
@@ -85,10 +86,13 @@ asset integrity. It is not a persistent development backend or production
 configuration. It must not attach to or stop an existing user relay.
 
 Browser acceptance takes explicit `--browser`, `--site`, `--fixture`, `--relay`
-and `--wire-tool` paths. Native acceptance takes explicit `--binary`, `--sha256`,
+and `--wire-tool` paths. Native acceptance takes explicit `--binary`,
+`--sha256`,
 `--assets`, `--browser`, `--relay` and `--wire-tool`. Use the pinned-built
-`debug/examples/wire_frame` from Cargo's resolved target directory, not a guessed
-`target/debug` path. These additional harnesses establish browser/native behavior;
+`debug/examples/wire_frame` from Cargo's resolved target directory, not a
+guessed
+`target/debug` path. These additional harnesses establish browser/native
+behavior;
 the local smoke alone does not prove all interactive or visual privacy races.
 
 ## Production checks and observability limits
@@ -100,13 +104,16 @@ python3 scripts/smoke-live-broadcast.py --url https://bmux.dev --relay-url https
 ```
 
 It probes relay `/health` for protocol 1 / `bmwp-5`, discovers immutable site
-assets from `/live`, checks JS/WASM sizes and SHA-256 digests, and recomputes bundle
-identity. It does not poll legacy status endpoints, publish frames, use publisher
+assets from `/live`, checks JS/WASM sizes and SHA-256 digests, and recomputes
+bundle
+identity. It does not poll legacy status endpoints, publish frames, use
+publisher
 credentials, print remote bodies, or follow redirects. This is not visual or
 volume-persistence acceptance.
 
 `/metrics` requires an independent metrics bearer key and exposes content-free
-Prometheus data. **No authenticated scraper, durable metrics retention, dashboard,
+Prometheus data. **No authenticated scraper, durable metrics retention,
+dashboard,
 or alerting service is provisioned by this infrastructure.** The endpoint alone
 is not persistent observability; counters lost on process restart are not an
 incident history. Configure and review a private collector separately before

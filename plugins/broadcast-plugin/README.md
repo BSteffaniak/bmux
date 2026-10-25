@@ -11,45 +11,60 @@ To mirror an interactive attach, invoke its broadcast actions through that
 owning attach's command/keybinding path. `start` (optionally `--profile NAME`)
 selects that attach's committed source; `pause`, `resume`, `stop`, and `source`
 use the same authenticated connection. The CLI calls generated controls directly
-and reports transient status in that attach. Only successfully committed retained
-frames are published; becoming the active client cannot replace the selected view.
+and reports transient status in that attach. Only successfully committed
+retained
+frames are published; becoming the active client cannot replace the selected
+view.
 
 There is one relay publication, not one controller per client. Controls from a
 foreign connection are rejected with `source_not_owned`; a fresh standalone
-`bmux broadcast pause`, `resume`, `stop`, or `source` invocation does not inherit
-an existing attach's authority. Likewise, standalone `start --source UUID` cannot
+`bmux broadcast pause`, `resume`, `stop`, or `source` invocation does not
+inherit
+an existing attach's authority. Likewise, standalone `start --source UUID`
+cannot
 select another connection's committed view. Use the originating attach, not a
-copied source UUID. This intentionally rejects incompatible legacy cross-connection
-control. Standalone setup, profiles, status, and independent terminal-start flows
+copied source UUID. This intentionally rejects incompatible legacy
+cross-connection
+control. Standalone setup, profiles, status, and independent terminal-start
+flows
 remain available where they do not require foreign ownership.
 
 Source loss marks the selected view unavailable, never selects another client.
 A source switch clears queued output and delta baselines even if relay mutation
 fails. A failed running switch keeps the requested target unavailable (a paused
-switch remains paused); explicit recovery and a fresh complete frame are required.
-The presentation indicator reports publication-global status, not view ownership.
+switch remains paused); explicit recovery and a fresh complete frame are
+required.
+The presentation indicator reports publication-global status, not view
+ownership.
 
 ## Terminal observation and sizing
 
-Terminal broadcasts follow the selected session's authoritative viewport. Starting
+Terminal broadcasts follow the selected session's authoritative viewport.
+Starting
 an observer does not resize a terminal or change shared focus/selection.
 `--cols`/`--rows` supply only a local fallback when shared geometry is unset;
 they do not establish shared PTY sizing authority.
-Normal attached clients continue to control sizing. Resize events update observer
+Normal attached clients continue to control sizing. Resize events update
+observer
 geometry and trigger a complete retained-frame repair before incremental updates
-resume. With no interactive client attached, the last authoritative size remains.
-An explicitly selected terminal source stays selected when another client changes
+resume. With no interactive client attached, the last authoritative size
+remains.
+An explicitly selected terminal source stays selected when another client
+changes
 tabs; select another broadcast source explicitly to change what is public.
 
 Terminal-v1 is an independent read-only session observer, not a mirror of an
 interactive client's committed view. Dedicated observer grants use the existing
 attach capability and expiring single-use tokens. The server denies input,
-focus, resize, and normal-attach escalation on that connection, even after detach.
+focus, resize, and normal-attach escalation on that connection, even after
+detach.
 Disconnected transport UUIDs alone are reclaimed opportunistically; expired
-pending grants lose their token binding without removing a live connection fence.
+pending grants lose their token binding without removing a live connection
+fence.
 
 After updating this native adapter, rebuild BMUX and its bundled plugins on the
-broadcasting machine and restart its daemon with the updated executable. Updating
+broadcasting machine and restart its daemon with the updated executable.
+Updating
 only the website does not update the native observer.
 
 ## Guided publishing and profiles
@@ -65,19 +80,26 @@ bmux broadcast profiles
 
 No-argument start explicitly chooses and confirms one active terminal; it never
 shares a default session. The CLI uses a bounded, styled inline BMUX TUI on the
-normal screen: type to filter, use arrows or paging to navigate, Enter to review,
-and Enter again to explicitly start public sharing. Escape cancels selection or returns
+normal screen: type to filter, use arrows or paging to navigate, Enter to
+review,
+and Enter again to explicitly start public sharing. Escape cancels selection or
+returns
 from review; Ctrl-C cancels. Optional pane details load asynchronously without
 blocking navigation. Only the selected source's details are shown; UUIDs are not
-required for interactive input. Setup fields use inline text-input components too.
-Names are bounded, control-character-filtered display hints, not selection authority.
+required for interactive input. Setup fields use inline text-input components
+too.
+Names are bounded, control-character-filtered display hints, not selection
+authority.
 Duplicate names retain distinct UUIDs. The palette retains host-owned structured
-prompts. No terminal output preview is fetched. Standalone prompts require a real TTY.
+prompts. No terminal output preview is fetched. Standalone prompts require a
+real TTY.
 Interactive start waits up to 15 seconds for first-frame relay acknowledgement;
-closing that monitor does not stop the daemon-owned broadcast. Noninteractive starts
+closing that monitor does not stop the daemon-owned broadcast. Noninteractive
+starts
 retain accepted-start semantics and must inspect status to establish readiness.
 Explicit
-`--session` selects a terminal without a prompt, creates a source UUID and hashes
+`--session` selects a terminal without a prompt, creates a source UUID and
+hashes
 and verifies the currently executing installed bmux (never PATH). Explicit
 `--executable`, `--sha256`, `--version`, `--cols`, `--rows` remain available.
 Setup `--advanced` guides persistent viewport/executable defaults; the same
@@ -101,7 +123,8 @@ and containing directories. Corrupt configuration is rejected, not reset.
 Turnkey v1 adds owned starts and token-fenced teardown without changing control
 or output v1. `start_profile(profile, source_id)` requires an owned registered
 source; repeated identical starts return the same private teardown token.
-Manual source/start changes invalidate the token, and `stop_owned(token)` returns
+Manual source/start changes invalidate the token, and `stop_owned(token)`
+returns
 false for stale/foreign authority. Durable source-UUID fences prevent replay
 across restart; retry metadata contains no reusable credentials. A new attempt
 needs a fresh source UUID.
@@ -134,7 +157,8 @@ screen reconstruction. Stop terminates owned terminal observers, not their
 underlying sessions.
 
 Endpoints require HTTPS except loopback development HTTP. Channels are bounded
-lowercase alphanumeric/hyphen names. Publisher credentials are read from bounded,
+lowercase alphanumeric/hyphen names. Publisher credentials are read from
+bounded,
 owner-only regular files with symlinks rejected; never pass the key itself as an
 argument. Requests have deadlines and redirects disabled. Diagnostic responses
 use content-free error codes, never raw network errors or tokens.
@@ -142,7 +166,8 @@ use content-free error codes, never raw network errors or tokens.
 ## Local control and source handoff
 
 The CLI connects to the selected BMUX runtime, calls `prepare_local`, reads its
-local `broadcast-local-proof` file, and calls `authorize` with those bytes. Grants
+local `broadcast-local-proof` file, and calls `authorize` with those bytes.
+Grants
 bind the exact caller connection. An authenticated remote UUID cannot trigger
 credential reads, executable launch, or producer registration without proof
 possession. Deactivation revokes grants, cancels publishing and owned observers,
@@ -163,8 +188,10 @@ changes invalidate pending and in-flight uploads. Only matching ACKs advance the
 publisher delta baseline. New connections and repair requests send a standalone
 full snapshot; subsequent updates choose the smaller full or cell-span delta,
 never a full-plus-delta bundle. Immutable resources are inherited from validated
-bases. BMAO v2 capture is event-driven and reconstructs deltas before coalescing.
-`BMUX_BROADCAST_MAX_FPS` sets a 1–60 FPS ceiling (default 60), not a polling clock.
+bases. BMAO v2 capture is event-driven and reconstructs deltas before
+coalescing.
+`BMUX_BROADCAST_MAX_FPS` sets a 1–60 FPS ceiling (default 60), not a polling
+clock.
 Lease renewal and WebSocket keepalive do not generate frames. Lost relay epochs
 reacquire only under running local intent and require fresh producer repair.
 Pause, stop, and unavailable sources never silently resume.

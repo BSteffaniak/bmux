@@ -5,13 +5,23 @@
 
 ## Context
 
-Promoting a running local session transfers authoritative identity and mutation ownership into replicated federation state while preserving existing PTYs. Automatically reversing that ownership would require a second distributed transaction across control quorum, worker-local runtime state, layout conversion, permissions, output cursors, and potentially several workers. A partial demotion could create two authorities or lose live processes.
+Promoting a running local session transfers authoritative identity and mutation
+ownership into replicated federation state while preserving existing PTYs.
+Automatically reversing that ownership would require a second distributed
+transaction across control quorum, worker-local runtime state, layout
+conversion, permissions, output cursors, and potentially several workers. A
+partial demotion could create two authorities or lose live processes.
 
 ## Decision
 
-The first federation release treats successful promotion as one-way. It does not provide live transactional demotion.
+The first federation release treats successful promotion as one-way. It does not
+provide live transactional demotion.
 
-Before commit, promotion remains cancellable and the source local session remains authoritative and unchanged. After the replicated promotion commit and worker finalize complete, the federated workspace is authoritative. The original source metadata is retained as recovery/audit provenance but is not a second writable session.
+Before commit, promotion remains cancellable and the source local session
+remains authoritative and unchanged. After the replicated promotion commit and
+worker finalize complete, the federated workspace is authoritative. The original
+source metadata is retained as recovery/audit provenance but is not a second
+writable session.
 
 Users can leave federation through explicit snapshot/export workflows:
 
@@ -19,7 +29,10 @@ Users can leave federation through explicit snapshot/export workflows:
 - Restore the export as a new local session or a new federated workspace; restoration creates new local execution identities and does not claim live process migration.
 - If a live pane cannot be represented or safely relaunched, export reports it before destructive action and preserves available terminal history.
 
-No command may label export/restore as demotion or imply that running distributed processes moved into one local server. A future live demotion feature requires a superseding ADR and the same prepare/commit/finalize/failure-injection rigor as promotion.
+No command may label export/restore as demotion or imply that running
+distributed processes moved into one local server. A future live demotion
+feature requires a superseding ADR and the same
+prepare/commit/finalize/failure-injection rigor as promotion.
 
 ## Consequences
 

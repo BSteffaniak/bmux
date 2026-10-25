@@ -1,6 +1,8 @@
 # Legacy Attach Presentation Inventory
 
-This inventory records the production ownership that the plugin-owned presentation migration must remove or deliberately preserve. It is intentionally a migration map, not a new architecture contract.
+This inventory records the production ownership that the plugin-owned
+presentation migration must remove or deliberately preserve. It is intentionally
+a migration map, not a new architecture contract.
 
 ## Restoration status (2026-08-30)
 
@@ -34,11 +36,11 @@ justify any legacy core presentation ownership.
 
 ## Configuration and projection
 
-| Concern | Production owners | Migration obligation |
-| --- | --- | --- |
-| `StatusBarConfig` | Removed from `packages/config`; `[status_bar]` is rejected with a diagnostic pointing to plugin settings. | Full legacy-equivalent settings now live privately in `bmux.tab_bar`; migration-era aliases remain accepted when canonical keys are absent. |
-| `StatusPosition` | Removed from `packages/config`; legacy `appearance.status_position` is rejected with a migration diagnostic. | Generic plugin layout is authoritative; `bmux.tab_bar.placement` defaults to `bottom`. |
-| Tab/status projection | `plugins/tab-bar-plugin` | Width-aware full-row projection, modules, styling, hitboxes, editor, menu, and interactions are plugin-owned. |
+| Concern                   | Production owners                                                                                                                                                                                      | Migration obligation                                                                                                                                                                                                                                |
+| ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `StatusBarConfig`         | Removed from `packages/config`; `[status_bar]` is rejected with a diagnostic pointing to plugin settings.                                                                                              | Full legacy-equivalent settings now live privately in `bmux.tab_bar`; migration-era aliases remain accepted when canonical keys are absent.                                                                                                         |
+| `StatusPosition`          | Removed from `packages/config`; legacy `appearance.status_position` is rejected with a migration diagnostic.                                                                                           | Generic plugin layout is authoritative; `bmux.tab_bar.placement` defaults to `bottom`.                                                                                                                                                              |
+| Tab/status projection     | `plugins/tab-bar-plugin`                                                                                                                                                                               | Width-aware full-row projection, modules, styling, hitboxes, editor, menu, and interactions are plugin-owned.                                                                                                                                       |
 | Windows state consumption | `packages/cli/src/runtime/attach/runtime.rs`, state, simulation, bootstrap, and playbook support import `bmux_tabs_plugin_api`; runtime decodes `bmux.tabs/tabs-list` and projects it into `AttachTab` | Presentation consumption must move to the tab-bar companion using generated windows contracts. CLI bootstrap/runtime must stop interpreting window state for presentation. Other domain-owned plugin/mobile consumers are not part of this removal. |
 
 The generic four-edge viewport migration already removed production
@@ -49,13 +51,13 @@ pane-runtime attach contracts and implementation.
 
 ## Interaction and overlays
 
-| Concern | Production owners | Migration obligation |
-| --- | --- | --- |
-| Hover | `AttachViewState.hovered_tab_context_id`, attach mouse routing/simulation, and `packages/cli/src/status.rs` hover styling | Move semantic hover state and repaint publication into the tab-bar companion. |
-| Drag/reorder | `AttachMouseTabDrag`, runtime pointer handling, status hitboxes, simulation, and playbook coverage | Use generic committed-region input and pointer capture; invoke generated windows reorder commands. |
-| Rename | Attach prompt state/runtime actions, tab edit projection in `status.rs`, simulation, and playbooks | Move workflow ownership to the tab-bar plugin while retaining the existing prompt behavior or an equivalent plugin-owned editor. |
-| Tab menu | `AttachTabMenu`, `AttachTabMenuAction`, retained menu surface construction, runtime/state/simulation, and playbooks | Move menu model/actions/placement to the tab-bar plugin and target its resolved surface allocation. |
-| Click/hit testing | `AttachStatusTabHitbox` emitted by `status.rs`, then interpreted by attach runtime | Replace hardcoded status-row hitboxes with committed `PluginSurfaceRegion` routing. |
+| Concern           | Production owners                                                                                                         | Migration obligation                                                                                                             |
+| ----------------- | ------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| Hover             | `AttachViewState.hovered_tab_context_id`, attach mouse routing/simulation, and `packages/cli/src/status.rs` hover styling | Move semantic hover state and repaint publication into the tab-bar companion.                                                    |
+| Drag/reorder      | `AttachMouseTabDrag`, runtime pointer handling, status hitboxes, simulation, and playbook coverage                        | Use generic committed-region input and pointer capture; invoke generated windows reorder commands.                               |
+| Rename            | Attach prompt state/runtime actions, tab edit projection in `status.rs`, simulation, and playbooks                        | Move workflow ownership to the tab-bar plugin while retaining the existing prompt behavior or an equivalent plugin-owned editor. |
+| Tab menu          | `AttachTabMenu`, `AttachTabMenuAction`, retained menu surface construction, runtime/state/simulation, and playbooks       | Move menu model/actions/placement to the tab-bar plugin and target its resolved surface allocation.                              |
+| Click/hit testing | `AttachStatusTabHitbox` emitted by `status.rs`, then interpreted by attach runtime                                        | Replace hardcoded status-row hitboxes with committed `PluginSurfaceRegion` routing.                                              |
 
 ## Damage and rendering
 
@@ -76,16 +78,16 @@ pane-runtime attach contracts and implementation.
 The legacy status line combines independently owned facts. Migration must not
 turn those facts into generic core status state:
 
-| Module | Current projection source | Canonical owner and migration boundary |
-| --- | --- | --- |
-| Interaction mode | Attach input processor and `AttachViewState.active_mode_id/label`; overlay, scroll, zoom, and prompt state select derived labels | Attach client owns local input/overlay mode. A presentation companion may receive a neutral local view fact; no server plugin should become authoritative for terminal input mode. |
-| Role | `AttachOpenInfo.can_write` and retarget/follow attach results | Permissions/attach authorization remains authoritative. Presentation consumes the resulting typed authorization fact; it must not decide access. Missing permissions retains permissive baseline behavior. |
-| Follow state | Typed `bmux.clients` events plus local followed-client selection | `bmux.clients` owns follower/leader relationships. Presentation consumes its generated contract rather than duplicating follow state in core or a presentation plugin. |
-| Hints | Prompt/help/scroll state, transient message state, floating-pane summary, and configured keymap bindings | The workflow owner produces semantic/local hint text. Presentation only places/styles it. Pane/floating facts must come through the foundational typed contract when extracted. |
-| Transient messages | `AttachViewState.transient_status` with attach-local TTL, written by command, error, clipboard, follow, and workflow handlers | The attach workflow that performs an action owns its ephemeral result. Keep a neutral client-local notification stream/slot; do not make tab/sidebar or core server state authoritative. |
-| Session label/count | Cached typed sessions catalog | `bmux.sessions` is authoritative; consume generated session state/services. |
-| Context label | Cached typed contexts catalog and context/session bindings | `bmux.contexts` is authoritative; consume generated context state/services. |
-| Tab position/count | Derived from the ordered tab projection and active item | The tab-bar plugin derives this from authoritative `bmux.tabs` ordered state. It is tab-bar presentation, not a generic status fact. |
+| Module              | Current projection source                                                                                                        | Canonical owner and migration boundary                                                                                                                                                                     |
+| ------------------- | -------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Interaction mode    | Attach input processor and `AttachViewState.active_mode_id/label`; overlay, scroll, zoom, and prompt state select derived labels | Attach client owns local input/overlay mode. A presentation companion may receive a neutral local view fact; no server plugin should become authoritative for terminal input mode.                         |
+| Role                | `AttachOpenInfo.can_write` and retarget/follow attach results                                                                    | Permissions/attach authorization remains authoritative. Presentation consumes the resulting typed authorization fact; it must not decide access. Missing permissions retains permissive baseline behavior. |
+| Follow state        | Typed `bmux.clients` events plus local followed-client selection                                                                 | `bmux.clients` owns follower/leader relationships. Presentation consumes its generated contract rather than duplicating follow state in core or a presentation plugin.                                     |
+| Hints               | Prompt/help/scroll state, transient message state, floating-pane summary, and configured keymap bindings                         | The workflow owner produces semantic/local hint text. Presentation only places/styles it. Pane/floating facts must come through the foundational typed contract when extracted.                            |
+| Transient messages  | `AttachViewState.transient_status` with attach-local TTL, written by command, error, clipboard, follow, and workflow handlers    | The attach workflow that performs an action owns its ephemeral result. Keep a neutral client-local notification stream/slot; do not make tab/sidebar or core server state authoritative.                   |
+| Session label/count | Cached typed sessions catalog                                                                                                    | `bmux.sessions` is authoritative; consume generated session state/services.                                                                                                                                |
+| Context label       | Cached typed contexts catalog and context/session bindings                                                                       | `bmux.contexts` is authoritative; consume generated context state/services.                                                                                                                                |
+| Tab position/count  | Derived from the ordered tab projection and active item                                                                          | The tab-bar plugin derives this from authoritative `bmux.tabs` ordered state. It is tab-bar presentation, not a generic status fact.                                                                       |
 
 Current support remains intentional during migration: mode, role, follow, hints,
 transient messages, optional session/context labels, and tab position/count all
@@ -152,7 +154,8 @@ The repository exposes the required frame metrics through
 `AttachFrameRenderStats`, `attach_frame_trace_payload`, performance telemetry,
 playbook render summaries, and the manifest-driven perf runner. Canonical fields
 include frame bytes, damage rectangles/cells, full-surface/full-frame fallbacks,
-frame render and terminal write latency, retained scene counters, and wake/update
+frame render and terminal write latency, retained scene counters, and
+wake/update
 counts.
 
 A repaired local production `attach-tab-switch` run on 2026-08-21 (aarch64

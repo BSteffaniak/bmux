@@ -4,7 +4,8 @@ Data models and types for bmux session management.
 
 ## Overview
 
-This package defines the core data structures and types used throughout the bmux session management system.
+This package defines the core data structures and types used throughout the bmux
+session management system.
 
 ## Features
 

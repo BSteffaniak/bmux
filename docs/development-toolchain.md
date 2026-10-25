@@ -23,7 +23,8 @@ clippy, rustfmt, cargo-nextest, and cargo-machete.
 
 The shell explicitly selects rustc/rustdoc, verifies Rust executable provenance,
 and rejects inherited compiler wrappers. Build artifacts live in
-`target/nix/<toolchain-store-identity>` for this checkout. Different Nix compilers
+`target/nix/<toolchain-store-identity>` for this checkout. Different Nix
+compilers
 and ordinary non-Nix builds do not share that directory. Scripts must honor
 `CARGO_TARGET_DIR`; use `$CARGO_TARGET_DIR/debug/bmux` inside the shell rather
 than the legacy `target/debug/bmux` path. Old artifacts need not be deleted.

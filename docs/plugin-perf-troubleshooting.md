@@ -1,6 +1,7 @@
 # Plugin Perf Troubleshooting
 
-Use this guide when plugin perf gates fail or CI compare output reports regressions.
+Use this guide when plugin perf gates fail or CI compare output reports
+regressions.
 
 ## 1) Reproduce Locally With Artifacts
 
@@ -52,7 +53,8 @@ Use scale baseline compare for scale scenarios:
   --warn-regression-ms 30
 ```
 
-For variance-focused comparison (all metrics: startup, p95, p99, avg, steady-state p95/p99/avg), run repeated samples:
+For variance-focused comparison (all metrics: startup, p95, p99, avg,
+steady-state p95/p99/avg), run repeated samples:
 
 ```bash
 ./scripts/perf-plugin-variance.sh --runs 3 --iterations 8 --warmup 2
@@ -73,11 +75,15 @@ To evaluate compare output against policy (warn-only by default):
   --mode warn
 ```
 
-Use `--mode soft-fail` to trial enforcement locally before promoting CI behavior.
-Allowlist suppressions require an `expires_on` date and CI warns when entries expire.
+Use `--mode soft-fail` to trial enforcement locally before promoting CI
+behavior.
+Allowlist suppressions require an `expires_on` date and CI warns when entries
+expire.
 
-Scenario-level enforcement is controlled in `docs/perf-baselines/variance-policy.json`.
-Keep `plugin-list-json` and other known noisy paths in warn mode until they meet promotion criteria.
+Scenario-level enforcement is controlled in
+`docs/perf-baselines/variance-policy.json`.
+Keep `plugin-list-json` and other known noisy paths in warn mode until they meet
+promotion criteria.
 
 ## 4) Baseline Update Policy
 

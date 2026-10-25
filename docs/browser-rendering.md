@@ -4,7 +4,8 @@ BMUX shares retained presentation primitives between terminal output and a Rust/
 
 ## Attach locally
 
-Browser output is opt-in; ordinary terminal attachment needs no browser assets or
+Browser output is opt-in; ordinary terminal attachment needs no browser assets
+or
 network setup:
 
 ```sh
@@ -20,7 +21,8 @@ a cache miss needs setup to succeed. Setup errors stop web activation before
 opening a listener, entering raw mode, or attaching. Terminal-only commands and
 network-only flags never trigger asset setup.
 
-For attach and presenter entrypoints, cache authority is explicit `BMUX_CACHE_DIR`
+For attach and presenter entrypoints, cache authority is explicit
+`BMUX_CACHE_DIR`
 first, otherwise the selected BMUX state root's `cache` directory. The resolver
 adds its `web-assets` namespace underneath that durable root. Attach honors
 slot-selected paths and named-runtime/sandbox path selection; presenter uses its
@@ -39,7 +41,8 @@ compatible cache or an explicit matching asset directory.
 ### Advanced: locally built assets
 
 `--web-assets DIR` remains an explicit advanced override and also enables mirror
-mode. Asset selection is CLI `--web-assets` → `BMUX_WEB_ASSETS` → implicit setup;
+mode. Asset selection is CLI `--web-assets` → `BMUX_WEB_ASSETS` → implicit
+setup;
 an explicit path is validated, not silently replaced or installed over. Merely
 setting `BMUX_WEB_ASSETS` or network configuration does not enable web output.
 For source development, build matching native and WASM artifacts using the
@@ -51,24 +54,37 @@ bash scripts/dev.sh bash scripts/build-web-renderer.sh
 bash scripts/dev.sh cargo run -p bmux_cli --bin bmux -- attach "<SESSION_UUID>" --web-assets "$PWD/target/web-assets" --web-only
 ```
 
-Replace `<SESSION_UUID>` with an ID from `bmux list-sessions --json`. `--web-only` opens an independent output-only attachment: it does not require terminal input, raw mode, or ANSI output. Its initial viewport is 80×24 until the first browser supplies measured geometry. Stop the owned attachment with Ctrl-C; disconnecting its browser does not terminate the server-owned process.
+Replace `<SESSION_UUID>` with an ID from `bmux list-sessions --json`.
+`--web-only` opens an independent output-only attachment: it does not require
+terminal input, raw mode, or ANSI output. Its initial viewport is 80×24 until
+the first browser supplies measured geometry. Stop the owned attachment with
+Ctrl-C; disconnecting its browser does not terminate the server-owned process.
 
-An independent attachment does not follow another client's focused pane, zoom state, or selected tab. To follow your laptop view, identify that terminal client with `bmux list-clients --json`, then use its **client UUID** (not the session UUID):
+An independent attachment does not follow another client's focused pane, zoom
+state, or selected tab. To follow your laptop view, identify that terminal
+client with `bmux list-clients --json`, then use its **client UUID** (not the
+session UUID):
 
 ```sh
 bmux attach --follow "<LAPTOP_CLIENT_UUID>" --global --web-only
 ```
 
-`--global` keeps following when that client switches sessions. Choose the client explicitly; BMUX does not guess among attached clients.
+`--global` keeps following when that client switches sessions. Choose the client
+explicitly; BMUX does not guess among attached clients.
 
-Use `--web` instead of `--web-only` to mirror an interactive terminal attachment. In mirror mode the terminal owns viewport dimensions; browser resizing only changes local pixel metrics, not terminal layout. Native provider-only attachment is explicitly unsupported by this entry point.
+Use `--web` instead of `--web-only` to mirror an interactive terminal
+attachment. In mirror mode the terminal owns viewport dimensions; browser
+resizing only changes local pixel metrics, not terminal layout. Native
+provider-only attachment is explicitly unsupported by this entry point.
 
 The default browser URL is **<http://127.0.0.1:8080/>**: fixed loopback port,
-no token, and ordinary reload works. Any local user/process can read this output.
+no token, and ordinary reload works. Any local user/process can read this
+output.
 Host/Origin and Fetch Metadata checks still reject cross-site access; viewport
 control still requires the leased controller. No remote interface is exposed.
 
-Override settings in precedence order **CLI → environment → config → defaults**:
+Override settings in precedence order **CLI → environment → config →
+defaults**:
 
 ```sh
 # Opt into the original ephemeral capability-URL behavior:
@@ -84,9 +100,11 @@ auth = "none" # "token" requires the printed capability URL
 ```
 
 An occupied fixed port is an explicit startup error, never a silent switch to
-another port. Token mode prints a capability in the URL fragment. Open it locally;
+another port. Token mode prints a capability in the URL fragment. Open it
+locally;
 do not share or record it. The browser removes the fragment before network
-requests and retains credentials only in memory. Reloading in token mode requires
+requests and retains credentials only in memory. Reloading in token mode
+requires
 reopening the capability URL. The browser cannot send terminal input or invoke
 mutating plugin actions. Viewport changes are allowed only for the controlling
 browser of an independent attachment.
@@ -109,11 +127,14 @@ bmux attach "<SESSION_UUID>" --web-assets "$PWD/target/web-assets" --web-only \
 
 With a wildcard bind, the displayed URL uses loopback for local use. On another
 computer, use the serving computer's LAN IP or DNS name, e.g.
-`http://192.168.1.188:8080/` or `http://bmux.lan:8080/`. Never browse to `0.0.0.0`.
+`http://192.168.1.188:8080/` or `http://bmux.lan:8080/`. Never browse to
+`0.0.0.0`.
 Refresh works normally. `--web-public-host 192.168.1.188` optionally changes the
-printed URL only; it neither restricts hosts nor changes the listening interface.
+printed URL only; it neither restricts hosts nor changes the listening
+interface.
 Authentication is independent of the bind address: add `--web-auth token` to opt
-in. With token mode, open the full printed capability URL including `#token=...`.
+in. With token mode, open the full printed capability URL including
+`#token=...`.
 Deployment owners can instead provide access controls at their network boundary.
 
 Equivalent configuration:
@@ -126,9 +147,11 @@ auth = "none" # default on any bind address; "token" opts in
 ```
 
 `BMUX_WEB_HOST` and `BMUX_WEB_PUBLIC_HOST` are the environment equivalents.
-All fields independently honor CLI → environment → config → defaults precedence.
+All fields independently honor CLI → environment → config → defaults
+precedence.
 Bind and URL-display hosts must be literal IPv4/IPv6 addresses. Browser URLs can
-use DNS aliases or any reachable interface. For IPv6 use `--web-host ::`; displayed
+use DNS aliases or any reachable interface. For IPv6 use `--web-host ::`;
+displayed
 URLs bracket IPv6. Scoped link-local bind addresses are unsupported.
 
 By default any syntactically valid HTTP Host is accepted. A supplied Origin must
@@ -141,7 +164,8 @@ trusted. For optional exact host restrictions use:
 ```
 
 Or configure `allowed_hosts = ["bmux.lan:8080", "192.168.1.188:8080"]` under
-`[web]`, or set comma-separated `BMUX_WEB_ALLOWED_HOSTS`. The list includes ports;
+`[web]`, or set comma-separated `BMUX_WEB_ALLOWED_HOSTS`. The list includes
+ports;
 repeat the CLI flag to add entries. An empty list means unrestricted hosts (an
 empty environment value explicitly clears configured restrictions). This is
 independent of `public_host` and token authentication. DNS-rebinding host
@@ -164,33 +188,45 @@ refresh requires reopening the capability URL.
 - Native sizing uses the existing attachment/PTY policy and authoritative plugin layout; there is no browser-specific competing layout authority.
 - Temporary transport loss repairs from a complete snapshot. Source closure shuts down hosting rather than retaining a healthy-looking stale frame. The attachment host remains alive while an independent viewer disconnects; explicit shutdown closes it.
 
-The host defaults to IPv4 loopback port 8080 and supports IPv4/IPv6 listeners with opt-in token authentication. It restricts assets to an explicit allowlist, validates configured Host/Origin and optional capability headers, and bounds bodies, connections, requests and snapshots. Styles are external same-origin assets compatible with the strict CSP.
+The host defaults to IPv4 loopback port 8080 and supports IPv4/IPv6 listeners
+with opt-in token authentication. It restricts assets to an explicit allowlist,
+validates configured Host/Origin and optional capability headers, and bounds
+bodies, connections, requests and snapshots. Styles are external same-origin
+assets compatible with the strict CSP.
 
 ## Presentation admission and recovery
 
 Wildcard startup distinguishes the listener (`0.0.0.0` / `::`), a local-use URL,
-and LAN access instructions. Loopback in the local URL does not mean the listener
+and LAN access instructions. Loopback in the local URL does not mean the
+listener
 is loopback-only.
 
 Browser capture admits visible operations rather than terminal control-command
-count. Adjacent same-style text is coalesced, and captured image placements share
+count. Adjacent same-style text is coalesced, and captured image placements
+share
 owned resources instead of deep-cloning them on every capture read. Large raw
 pixel resources are losslessly PNG-compacted before placement expansion. Decoded
 image admission supports up to 16,777,216 pixels, including 4K images; encoded
 resource and aggregate memory limits still apply. Incompressible or heavily
-fragmented resources remain explicitly bounded rather than being silently dropped.
+fragmented resources remain explicitly bounded rather than being silently
+dropped.
 
 Browser-enabled frame rejection keeps the attachment and HTTP listener alive. It
-retains the last complete frame, compositor and interaction metadata, reports the
+retains the last complete frame, compositor and interaction metadata, reports
+the
 specific capture/admission stage and limits, and retries after a new source or
-viewport event. Identical rejection reports are deduplicated; the render loop does
+viewport event. Identical rejection reports are deduplicated; the render loop
+does
 not spin on unchanged rejected content. `/view` exposes bounded
-`presentation_status`, independent of the committed output generation. The browser
-shows a paused status on its next claim/long-poll refresh without clearing Canvas.
+`presentation_status`, independent of the committed output generation. The
+browser
+shows a paused status on its next claim/long-poll refresh without clearing
+Canvas.
 A successful complete publication clears the status. Terminal write failures and
 source closure retain their existing error/lifetime semantics.
 
-Regression coverage includes 600×300 per-cell command capture, sustained real PTY
+Regression coverage includes 600×300 per-cell command capture, sustained real
+PTY
 updates, 4K image rendering, oversized-image rejection/recovery, synchronized
 updates, and failed-publication rollback. This does not identify which branch
 caused a historical failure without its diagnostic evidence.
@@ -205,11 +241,22 @@ caused a historical failure without its diagnostic evidence.
 - `bmux_web_host` treats snapshots as opaque immutable bytes. Its latest-only feed uses transport revisions distinct from presentation revisions and attachment generations.
 - Complete snapshots remove omitted surfaces/images. Slow consumers skip intermediate values and repair from the latest complete frame. Delta transport is not implemented.
 
-Surface provenance preserves owner-local identity, retained identity, revision, clipping, ordering, content identity and continuation watermark. It describes authoritative output; it cannot install another compositor.
+Surface provenance preserves owner-local identity, retained identity, revision,
+clipping, ordering, content identity and continuation watermark. It describes
+authoritative output; it cannot install another compositor.
 
-Metadata availability is explicit in wire version 2. An empty scene does not imply that a producer supplied logical selection or semantics. Per-surface availability describes partial coverage, and unavailable categories are disclosed by the browser. Logical source text must come from the owning producer, never reconstructed from flattened display cells. Native terminal source metadata remains subject to its actual producer contract.
+Metadata availability is explicit in wire version 2. An empty scene does not
+imply that a producer supplied logical selection or semantics. Per-surface
+availability describes partial coverage, and unavailable categories are
+disclosed by the browser. Logical source text must come from the owning
+producer, never reconstructed from flattened display cells. Native terminal
+source metadata remains subject to its actual producer contract.
 
-Standalone TUI consumers can prepare the same presentation and use `BrowserFrame::from_prepared`; `packages/web-renderer/examples/snapshot.rs` demonstrates this without native attachment dependencies. Backends report supported features and fail explicitly on unsupported required output rather than silently omit it.
+Standalone TUI consumers can prepare the same presentation and use
+`BrowserFrame::from_prepared`; `packages/web-renderer/examples/snapshot.rs`
+demonstrates this without native attachment dependencies. Backends report
+supported features and fail explicitly on unsupported required output rather
+than silently omit it.
 
 ## Compact presentation transport
 
@@ -223,7 +270,8 @@ replacement generations use snapshots. Browser transport cursors advance only
 after successful presentation.
 
 Image placements reference immutable SHA-256 resource IDs. Authenticated
-`/resource/<id>` responses carry raw bytes; the host pins bounded latest/previous
+`/resource/<id>` responses carry raw bytes; the host pins bounded
+latest/previous
 manifests. WASM verifies resource digests and descriptions before committing,
 retains committed resources on failure, and evicts unreferenced resources after
 commit. JavaScript fetches bounded binary buffers and opaque resources; it does
@@ -237,7 +285,8 @@ mismatches fail explicitly; rebuild native and WASM assets together.
 
 ## Presenter audience output
 
-`present play` and `present host` use the same prepared TUI browser publisher for
+`present play` and `present host` use the same prepared TUI browser publisher
+for
 an explicit read-only audience projection. See [Presenter browser audience output](presenter-web.md)
 for mirror/web-only syntax, private-notes boundaries, configuration precedence,
 authorized host navigation, and the separate real-browser acceptance harness.
@@ -247,10 +296,21 @@ of the contract is not evidence that the runtime suite has passed.
 
 ## Acceptance testing
 
-`scripts/smoke-web-browser.sh` runs the real browser acceptance harness with explicit built artifacts and isolated owned runtime state. It requires Python, a Chromium executable, native BMUX, built WASM assets, and the snapshot example's JSON. Missing dependencies are failures, not successful skips. See `--help` for artifact arguments and credential-safe evidence output.
+`scripts/smoke-web-browser.sh` runs the real browser acceptance harness with
+explicit built artifacts and isolated owned runtime state. It requires Python, a
+Chromium executable, native BMUX, built WASM assets, and the snapshot example's
+JSON. Missing dependencies are failures, not successful skips. See `--help` for
+artifact arguments and credential-safe evidence output.
 
-Run repository validation inside the locked shell, build current native/WASM artifacts, then exercise live plugin chrome, terminal updates, images, resize, owner/mirror policy, reconnect, generation repair and backend lifecycle. Fixture decoding alone does not establish live acceptance.
+Run repository validation inside the locked shell, build current native/WASM
+artifacts, then exercise live plugin chrome, terminal updates, images, resize,
+owner/mirror policy, reconnect, generation repair and backend lifecycle. Fixture
+decoding alone does not establish live acceptance.
 
 ## Future work
 
-Faithful HTML/WebGL backends should implement the same presentation contract with private resource caches. Responsive web-native HTML is a separate presentation policy with its own authoritative geometry, not a backend silently rearranging cells. Interactive browser input, mobile behavior and remote hosting remain outside this release. Unsupported image formats fail explicitly.
+Faithful HTML/WebGL backends should implement the same presentation contract
+with private resource caches. Responsive web-native HTML is a separate
+presentation policy with its own authoritative geometry, not a backend silently
+rearranging cells. Interactive browser input, mobile behavior and remote hosting
+remain outside this release. Unsupported image formats fail explicitly.

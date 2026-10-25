@@ -1,13 +1,15 @@
 # bmux_syntax_render
 
 Reusable syntax classification and terminal highlighting extracted from Bcode's
-syntax-render crate. Uses the existing canonical `bmux_tui` types, Syntect parsing,
+syntax-render crate. Uses the existing canonical `bmux_tui` types, Syntect
+parsing,
 and two-face's curated grammar bundle; it does not own editor/application state.
 
 ## API handoff
 
 `SyntaxHighlighter::new` preserves the compatibility palette;
-`SyntaxHighlighter::with_palette` accepts an application-supplied `SyntaxPalette`.
+`SyntaxHighlighter::with_palette` accepts an application-supplied
+`SyntaxPalette`.
 Language names, common Markdown fence aliases, filenames, and extensions select
 grammars. Unknown hints safely fall back to plain text.
 

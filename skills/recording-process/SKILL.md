@@ -6,10 +6,12 @@ description: Run and inspect an explicitly owned recorded PTY process, interact 
 # recording-process
 
 Use this recipe for reproducible command recordings or interactive terminal
-investigation. This workflow launches processes, sends input, and writes artifacts;
+investigation. This workflow launches processes, sends input, and writes
+artifacts;
 it is not read-only. Obtain normal tool permission and user authorization for
 those effects. Read [recorded-process documentation](../../docs/recording-process.md)
-and current CLI help before acting; do not infer a JSON schema from old examples.
+and current CLI help before acting; do not infer a JSON schema from old
+examples.
 
 ## Safety boundary
 

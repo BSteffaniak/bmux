@@ -35,7 +35,8 @@ Planned additions:
 - `packages/mobile-ffi` (Rust): UniFFI surface for Android/iOS bindings.
 - `apps/android` (Kotlin/Compose): Android app and service lifecycle.
 
-M0 intentionally defines contracts and boundaries first. Runtime implementation work starts in M1.
+M0 intentionally defines contracts and boundaries first. Runtime implementation
+work starts in M1.
 
 ## Shared Rust Boundary
 
@@ -55,7 +56,8 @@ M0 intentionally defines contracts and boundaries first. Runtime implementation 
 
 ## Existing bmux Reuse Points
 
-The mobile core should be implemented by extracting/adapting existing logic from:
+The mobile core should be implemented by extracting/adapting existing logic
+from:
 
 - `packages/cli/src/runtime/remote_cli.rs` target parsing and resolution
 - `packages/cli/src/connection.rs` remote connection abstraction
@@ -90,7 +92,8 @@ To avoid blocking future terminal support:
 - keep pane/session/event contracts transport-neutral
 - avoid coupling connection APIs to current connection-only screens
 
-This allows terminal UI to be added later without changing transport/auth architecture.
+This allows terminal UI to be added later without changing transport/auth
+architecture.
 
 ## Milestone Map
 

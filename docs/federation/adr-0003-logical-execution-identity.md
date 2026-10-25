@@ -5,17 +5,27 @@
 
 ## Context
 
-Local bmux runtime IDs identify objects within one server process. Federation needs identities that remain stable when a client changes ingress, a leader changes, a worker restarts, or a pane is replaced on another worker. Retried distributed operations also need a stable identity separate from transport request IDs.
+Local bmux runtime IDs identify objects within one server process. Federation
+needs identities that remain stable when a client changes ingress, a leader
+changes, a worker restarts, or a pane is replaced on another worker. Retried
+distributed operations also need a stable identity separate from transport
+request IDs.
 
-Conflating logical panes with worker-local pane IDs would either expose placement to users or allow stale workers to become authoritative after replacement.
+Conflating logical panes with worker-local pane IDs would either expose
+placement to users or allow stale workers to become authoritative after
+replacement.
 
 ## Decision
 
-Use separate global logical identities, concrete execution identities, monotonic generations, and command idempotency identities.
+Use separate global logical identities, concrete execution identities, monotonic
+generations, and command idempotency identities.
 
 ## Identifier model
 
-All durable federation identifiers are opaque, globally unique typed values. The initial representation is UUID-compatible 128-bit values generated with a cryptographically secure source. Contracts must not expose untyped strings where a typed BPDL UUID/newtype is available.
+All durable federation identifiers are opaque, globally unique typed values. The
+initial representation is UUID-compatible 128-bit values generated with a
+cryptographically secure source. Contracts must not expose untyped strings where
+a typed BPDL UUID/newtype is available.
 
 - `ClusterId`: persistent cluster identity, created once at cluster initialization.
 - `NodeId`: persistent node identity bound to node credentials, never reused by a replacement installation.
@@ -26,7 +36,9 @@ All durable federation identifiers are opaque, globally unique typed values. The
 - `CommandId`: caller-generated identity for one logical mutation.
 - `PromotionId`: identity for one local-session promotion transaction.
 
-Names are mutable display/reference metadata, not identity. Name resolution either returns one unambiguous identity or a structured ambiguity/not-found error.
+Names are mutable display/reference metadata, not identity. Name resolution
+either returns one unambiguous identity or a structured ambiguity/not-found
+error.
 
 ## Execution generation
 
@@ -45,17 +57,24 @@ The authoritative tuple is:
 (LogicalPaneId, ExecutionGeneration, ExecutionId, NodeId)
 ```
 
-A logical pane has zero or one authoritative tuple in committed state. Zero represents pending, unavailable without an assigned execution, or permanently exited according to policy.
+A logical pane has zero or one authoritative tuple in committed state. Zero
+represents pending, unavailable without an assigned execution, or permanently
+exited according to policy.
 
 ## Worker-local identity
 
-The execution record may refer to worker-local session, context, and pane IDs. Those values are routing details and must not be used as global identities, durable user references, or command idempotency keys.
+The execution record may refer to worker-local session, context, and pane IDs.
+Those values are routing details and must not be used as global identities,
+durable user references, or command idempotency keys.
 
-Workers persist enough execution metadata to reconcile cluster execution IDs to local runtime state after restart. If process continuity cannot be proven, the worker reports `unknown`/`missing`; it does not fabricate continuity.
+Workers persist enough execution metadata to reconcile cluster execution IDs to
+local runtime state after restart. If process continuity cannot be proven, the
+worker reports `unknown`/`missing`; it does not fabricate continuity.
 
 ## Command idempotency
 
-Every externally initiated control mutation receives a `CommandId` before first transmission. The key is:
+Every externally initiated control mutation receives a `CommandId` before first
+transmission. The key is:
 
 ```text
 (OriginatingPrincipalId, CommandId)
@@ -79,11 +98,16 @@ Rules:
 6. The deduplication result is snapshotted with consensus state.
 7. Clients may query command outcome when delivery status is unknown.
 
-The minimum deduplication retention is **24 hours after terminal outcome** and must be configurable upward. Active/incomplete workflows are never evicted. Destructive or externally side-effecting workflow records may retain compact tombstones longer. Reducing the guaranteed window requires a compatibility review because clients use it for safe retry.
+The minimum deduplication retention is **24 hours after terminal outcome** and
+must be configurable upward. Active/incomplete workflows are never evicted.
+Destructive or externally side-effecting workflow records may retain compact
+tombstones longer. Reducing the guaranteed window requires a compatibility
+review because clients use it for safe retry.
 
 ## Multi-step side effects
 
-Control state and worker process creation cannot be one storage transaction. Use an explicit workflow state machine, for example:
+Control state and worker process creation cannot be one storage transaction. Use
+an explicit workflow state machine, for example:
 
 ```text
 requested -> assignment_committed -> worker_prepared -> active
@@ -91,7 +115,10 @@ requested -> assignment_committed -> worker_prepared -> active
 active -> replacement_committed -> replacement_active -> old_fenced
 ```
 
-Every transition is idempotent. Recovery scans non-terminal workflows and reconciles them using execution identity and generation. A worker may prepare an execution before activation, but it must not accept user input until authoritative activation/fencing state is established.
+Every transition is idempotent. Recovery scans non-terminal workflows and
+reconciles them using execution identity and generation. A worker may prepare an
+execution before activation, but it must not accept user input until
+authoritative activation/fencing state is established.
 
 ## Stale-worker handling
 
@@ -105,7 +132,10 @@ When a worker reports an execution:
 
 ## ID exposure
 
-CLI and diagnostics may accept short unique prefixes for convenience, but wire contracts and durable state use full typed IDs. Ambiguous prefixes fail. Logs include cluster, workspace, logical pane, execution, generation, node, command, and revision fields where relevant.
+CLI and diagnostics may accept short unique prefixes for convenience, but wire
+contracts and durable state use full typed IDs. Ambiguous prefixes fail. Logs
+include cluster, workspace, logical pane, execution, generation, node, command,
+and revision fields where relevant.
 
 ## Consequences
 
@@ -132,8 +162,14 @@ CLI and diagnostics may accept short unique prefixes for convenience, but wire c
 
 ## Architecture placement
 
-Federation ID types and wire records belong in `cluster-plugin-api`; generation, workflow, deduplication, and reconciliation runtime behavior belongs in `cluster-plugin`. Generic core request IDs remain unchanged and are not overloaded with cluster semantics.
+Federation ID types and wire records belong in `cluster-plugin-api`; generation,
+workflow, deduplication, and reconciliation runtime behavior belongs in
+`cluster-plugin`. Generic core request IDs remain unchanged and are not
+overloaded with cluster semantics.
 
 ## Acceptance criteria
 
-Tests must prove stable logical identity across ingress/leader/worker changes, at-most-one logical outcome for repeated command delivery, conflict rejection for reused command IDs, deterministic recovery of interrupted workflows, and rejection/quarantine of every stale or inconsistent execution tuple.
+Tests must prove stable logical identity across ingress/leader/worker changes,
+at-most-one logical outcome for repeated command delivery, conflict rejection
+for reused command IDs, deterministic recovery of interrupted workflows, and
+rejection/quarantine of every stale or inconsistent execution tuple.

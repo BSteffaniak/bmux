@@ -5,8 +5,10 @@
 
 ## Context
 
-bmux needs a mobile client that is fast to ship on Android while remaining iOS-ready.
-The product goal is connection-first remote workflows, with optional future terminal rendering.
+bmux needs a mobile client that is fast to ship on Android while remaining
+iOS-ready.
+The product goal is connection-first remote workflows, with optional future
+terminal rendering.
 
 ## Decision
 

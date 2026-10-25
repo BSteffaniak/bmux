@@ -1,6 +1,9 @@
 # BMUX TUI runtime
 
-`bmux_tui_runtime` is the domain-neutral execution layer for terminal user interfaces built from `bmux_tui` primitives and, optionally, `bmux_tui_components` controls. It owns scheduling and presentation mechanics; applications retain their state and product behavior.
+`bmux_tui_runtime` is the domain-neutral execution layer for terminal user
+interfaces built from `bmux_tui` primitives and, optionally,
+`bmux_tui_components` controls. It owns scheduling and presentation mechanics;
+applications retain their state and product behavior.
 
 ## Layer ownership
 
@@ -11,46 +14,80 @@ bmux_tui_runtime          bounded admission, scheduling, timers, commands, caden
 application/plugin        product state, semantic updates, effects, navigation, policy
 ```
 
-`bmux_tui_runtime` depends on `bmux_tui`. It does not depend on `bmux_tui_components`, and neither lower layer depends on the runtime. The runtime must not interpret BMUX or consumer product domains such as windows, sessions, panes, clients, contexts, permissions, model turns, or tools.
+`bmux_tui_runtime` depends on `bmux_tui`. It does not depend on
+`bmux_tui_components`, and neither lower layer depends on the runtime. The
+runtime must not interpret BMUX or consumer product domains such as windows,
+sessions, panes, clients, contexts, permissions, model turns, or tools.
 
 ## Logical content-selection contract
 
-Content selection is separate from ordinary hit routing. During rendering, components register a
-hierarchical `SelectionScene` containing caller-owned scope/content identities and visible fragments
-mapped to logical UTF-8 source boundaries. A caller-owned `SelectionController` resolves pointer
-gestures against the last committed scene, locks the deepest eligible initiation scope, and retains
-logical anchor/focus endpoints across redraws. Applications remain responsible for canonical source
+Content selection is separate from ordinary hit routing. During rendering,
+components register a
+hierarchical `SelectionScene` containing caller-owned scope/content identities
+and visible fragments
+mapped to logical UTF-8 source boundaries. A caller-owned `SelectionController`
+resolves pointer
+gestures against the last committed scene, locks the deepest eligible initiation
+scope, and retains
+logical anchor/focus endpoints across redraws. Applications remain responsible
+for canonical source
 content, scrolling, copy/export formatting, and clipboard effects.
 
-Selection scope is fixed where the drag begins. Initiation in a capturing child remains constrained
-to that child even when the pointer leaves it; delegated child chrome may instead select through an
-ancestor across ordered sibling content. Renderers can explicitly provide word and line ranges;
-item and whole-scope expansion use registered logical ordering. Missing semantic boundaries are
+Selection scope is fixed where the drag begins. Initiation in a capturing child
+remains constrained
+to that child even when the pointer leaves it; delegated child chrome may
+instead select through an
+ancestor across ordered sibling content. Renderers can explicitly provide word
+and line ranges;
+item and whole-scope expansion use registered logical ordering. Missing semantic
+boundaries are
 rejected rather than inferred from terminal cells.
 
-Only visible geometry belongs in a scene. Source text remains caller-owned, and snapshots contain
-logical source ranges rather than copied content. Reconcile controllers after each successful scene
-commit so content revision/removal invalidates stale endpoints. During modal or focus-trap
-activation, callers use `set_obscured`: active gestures are cancelled, while completed selections
-may be cleared or hidden and restored according to policy. Optional diagnostics deliberately expose
+Only visible geometry belongs in a scene. Source text remains caller-owned, and
+snapshots contain
+logical source ranges rather than copied content. Reconcile controllers after
+each successful scene
+commit so content revision/removal invalidates stale endpoints. During modal or
+focus-trap
+activation, callers use `set_obscured`: active gestures are cancelled, while
+completed selections
+may be cleared or hidden and restored according to policy. Optional diagnostics
+deliberately expose
 only bounded phase, granularity, obscuration, and endpoint-presence state.
 
-`PaintCx::paint_selection` is the deterministic overlay stage: consumers call it on the root paint
-context after normal content rendering with a snapshot from their controller. It patches only explicit selection style fields over
-the selected cells and never rewrites symbols. `Terminal::draw` commits the rendered selection scene
-transactionally with output, hits, focus, cursor, and images. Failed output and reset retain the prior
-scene as the authority corresponding to the last visible frame; resize forces a full redraw, whose
-successful commit replaces the old geometry. Regional draws retain selection fragments outside the
+`PaintCx::paint_selection` is the deterministic overlay stage: consumers call it
+on the root paint
+context after normal content rendering with a snapshot from their controller. It
+patches only explicit selection style fields over
+the selected cells and never rewrites symbols. `Terminal::draw` commits the
+rendered selection scene
+transactionally with output, hits, focus, cursor, and images. Failed output and
+reset retain the prior
+scene as the authority corresponding to the last visible frame; resize forces a
+full redraw, whose
+successful commit replaces the old geometry. Regional draws retain selection
+fragments outside the
 damaged regions and replace emitted metadata inside them.
 
-Selection scopes and fragments are generic renderer metadata. Runtime code must not interpret source
+Selection scopes and fragments are generic renderer metadata. Runtime code must
+not interpret source
 identities, ranges, selection meaning, or autoscroll requests.
 
 ## Automatic interaction contract
 
-Interactive geometry is frame metadata, not application state. A standard component registers a `HitRegion` while it renders, using the exact terminal-cell `Rect` it painted. A region has a caller-owned stable ID, semantic role, layer, visibility, enabled state, pointer/hover acceptance, focusability, optional explicit tab order, and optional focus scope. Render order is the default tie-breaker, so ordinary controls need no parallel focus list.
+Interactive geometry is frame metadata, not application state. A standard
+component registers a `HitRegion` while it renders, using the exact
+terminal-cell `Rect` it painted. A region has a caller-owned stable ID, semantic
+role, layer, visibility, enabled state, pointer/hover acceptance, focusability,
+optional explicit tab order, and optional focus scope. Render order is the
+default tie-breaker, so ordinary controls need no parallel focus list.
 
-`Terminal::draw` treats the frame metadata transactionally: terminal output must flush successfully before the frame's `HitMap`, scope, and reconciled `FocusTrap` become authoritative. `TerminalPresenter::with_commit` exposes those committed values to an application callback. Failed presentation keeps the previous scene authoritative. Runtime code remains domain-neutral and applications map routed stable IDs to product actions.
+`Terminal::draw` treats the frame metadata transactionally: terminal output must
+flush successfully before the frame's `HitMap`, scope, and reconciled
+`FocusTrap` become authoritative. `TerminalPresenter::with_commit` exposes those
+committed values to an application callback. Failed presentation keeps the
+previous scene authoritative. Runtime code remains domain-neutral and
+applications map routed stable IDs to product actions.
 
 Input follows this lifecycle:
 
@@ -60,11 +97,28 @@ Input follows this lifecycle:
 4. Route terminal input through the router. Pointer routes include the stable target, role, committed bounds, and target-local coordinates; keyboard and paste routes target current focus. Use `InteractionRoute::event_for` (or compare `target`) to dispatch only to the resolved control.
 5. Apply the resulting semantic action to application state and redraw when routing or application state changed.
 
-Component `handle_event` methods accept events that have already been dispatched to that component. They continue to reject disabled input, but local `focused` fields control cursor/focused styling and internal roving-child selection rather than repeating the router's global target check. Applications that bypass `InteractionRouter` may therefore call one selected component directly without first setting a visual-focus boolean. Applications with multiple controls must not broadcast raw keyboard or paste events to every component; route once and dispatch only to the matching stable target.
+Component `handle_event` methods accept events that have already been dispatched
+to that component. They continue to reject disabled input, but local `focused`
+fields control cursor/focused styling and internal roving-child selection rather
+than repeating the router's global target check. Applications that bypass
+`InteractionRouter` may therefore call one selected component directly without
+first setting a visual-focus boolean. Applications with multiple controls must
+not broadcast raw keyboard or paste events to every component; route once and
+dispatch only to the matching stable target.
 
-The router traverses enabled, visible, non-empty focusable regions with Tab/Shift-Tab, preserving stable focus IDs across redraw and responsive reflow. Explicit `tab_order` is only for exceptional visual order. Pointer presses transfer focus, activation requires press and release on the same target, one move reports both hover leave and enter, and the highest layer/latest rendered region wins overlaps.
+The router traverses enabled, visible, non-empty focusable regions with
+Tab/Shift-Tab, preserving stable focus IDs across redraw and responsive reflow.
+Explicit `tab_order` is only for exceptional visual order. Pointer presses
+transfer focus, activation requires press and release on the same target, one
+move reports both hover leave and enter, and the highest layer/latest rendered
+region wins overlaps.
 
-A frame `focus_scope` traps traversal and pointer routing to matching regions. Entering a scope saves background focus; nested scopes save their parent focus; leaving restores the most recent still-valid stable target. Components painted after `PaintCx::set_focus_scope` inherit that scope when focusable. Applications should render modal controls with stable IDs and must not separately route background geometry.
+A frame `focus_scope` traps traversal and pointer routing to matching regions.
+Entering a scope saves background focus; nested scopes save their parent focus;
+leaving restores the most recent still-valid stable target. Components painted
+after `PaintCx::set_focus_scope` inherit that scope when focusable. Applications
+should render modal controls with stable IDs and must not separately route
+background geometry.
 
 ### Minimal webpage-like surface
 
@@ -84,7 +138,10 @@ let cancel = ButtonComponent::new("profile.cancel", "Cancel", &cancel_state);
 // … same layout/paint pattern in cancel_area …
 ```
 
-Both buttons register themselves and become independent tab stops in render order. Every component takes a caller-chosen stable ID so input maps to semantic actions and focus survives reflow; automatic IDs are not part of the component model.
+Both buttons register themselves and become independent tab stops in render
+order. Every component takes a caller-chosen stable ID so input maps to semantic
+actions and focus survives reflow; automatic IDs are not part of the component
+model.
 
 ### Exceptional configuration
 
@@ -112,19 +169,46 @@ cx.set_focus_scope(Some(HitId::new("confirm-dialog")));
 dialog.paint(&dialog_layout, cx);
 ```
 
-Composite controls such as tab bars, lists, and tables register their composite/option regions and retain conventional arrow-key or row navigation internally. Ordinary action rows expose every rendered button as an individual global tab stop; local wrapping or custom ordering should be configured only when the component's interaction model intentionally requires it. Programmatic focus uses a stable `HitId` with `InteractionRouter::set_focused` (or `FocusTrap::set_active` when deliberately managing a trap directly) and succeeds only for a target in the committed active scope.
+Composite controls such as tab bars, lists, and tables register their
+composite/option regions and retain conventional arrow-key or row navigation
+internally. Ordinary action rows expose every rendered button as an individual
+global tab stop; local wrapping or custom ordering should be configured only
+when the component's interaction model intentionally requires it. Programmatic
+focus uses a stable `HitId` with `InteractionRouter::set_focused` (or
+`FocusTrap::set_active` when deliberately managing a trap directly) and succeeds
+only for a target in the committed active scope.
 
 ### Direct dispatch and custom focus models
 
-Component `handle_event` methods remain the component-local dispatch surface. Consumers should prefer committed semantic dispatch and must not fall through to recomputed mouse geometry once a committed pointer target exists. Every component registers its exact painted bounds and takes a caller-chosen stable ID, so semantic routing never depends on automatic identifiers. Explicit `FocusTrap::with_targets` remains useful for tests and deliberately custom focus models, but normal application traversal derives from committed frame hits.
+Component `handle_event` methods remain the component-local dispatch surface.
+Consumers should prefer committed semantic dispatch and must not fall through to
+recomputed mouse geometry once a committed pointer target exists. Every
+component registers its exact painted bounds and takes a caller-chosen stable
+ID, so semantic routing never depends on automatic identifiers. Explicit
+`FocusTrap::with_targets` remains useful for tests and deliberately custom focus
+models, but normal application traversal derives from committed frame hits.
 
-For local cross-repository development, Nextjob resolves `bmux_tui`, `bmux_tui_components`, and `bmux_tui_runtime` directly from `../bmux` workspace paths. A consuming workspace with transitive crates should use temporary root `[patch.crates-io]` entries for the same local BMUX packages so one dependency graph cannot contain both published and in-progress copies; verify the resolved sources with `cargo metadata` and remove patches that are not intentional long-term wiring.
+For local cross-repository development, Nextjob resolves `bmux_tui`,
+`bmux_tui_components`, and `bmux_tui_runtime` directly from `../bmux` workspace
+paths. A consuming workspace with transitive crates should use temporary root
+`[patch.crates-io]` entries for the same local BMUX packages so one dependency
+graph cannot contain both published and in-progress copies; verify the resolved
+sources with `cargo metadata` and remove patches that are not intentional
+long-term wiring.
 
 ## Program model
 
-A runtime serially delivers typed events to one `Program` owner. An event is terminal input, an application message, a keyed timer, or a command completion represented by an application message. `Program::update` mutates application-owned state and returns explicit presentation or exit intent. Long-running work is returned as owned `'static` commands rather than awaited in `update`; work that must continue borrowing mutable program state is not a runtime command and must first be split into an owned request/result boundary by the application.
+A runtime serially delivers typed events to one `Program` owner. An event is
+terminal input, an application message, a keyed timer, or a command completion
+represented by an application message. `Program::update` mutates
+application-owned state and returns explicit presentation or exit intent.
+Long-running work is returned as owned `'static` commands rather than awaited in
+`update`; work that must continue borrowing mutable program state is not a
+runtime command and must first be split into an owned request/result boundary by
+the application.
 
-The runtime never owns canonical application state. It owns only bounded queues, task generations, timer deadlines, redraw state, and presentation cadence.
+The runtime never owns canonical application state. It owns only bounded queues,
+task generations, timer deadlines, redraw state, and presentation cadence.
 
 ## Admission and ordering
 
@@ -135,41 +219,88 @@ Admission is explicit rather than inferred from message contents.
 - **Latest-value messages** are keyed and bounded by key count. Replacing a pending value is explicit, latest-wins, and counted. Applications may use it only when skipped intermediate values are semantically safe.
 - **Redraw requests** use a dirty latch. Repeated requests do not consume queue entries.
 
-FIFO is guaranteed within each reliable mailbox. No total ordering is invented across independent producers or between reliable and latest-value mailboxes. Applications that require cross-source ordering must carry and validate their own sequence contract.
+FIFO is guaranteed within each reliable mailbox. No total ordering is invented
+across independent producers or between reliable and latest-value mailboxes.
+Applications that require cross-source ordering must carry and validate their
+own sequence contract.
 
-The runtime has no generic drop-oldest policy. Lifecycle, authorization, cancellation, and durable semantic updates must use reliable admission unless their owning domain defines a safe replacement contract.
+The runtime has no generic drop-oldest policy. Lifecycle, authorization,
+cancellation, and durable semantic updates must use reliable admission unless
+their owning domain defines a safe replacement contract.
 
 ## Fairness and backpressure
 
-Each scheduler turn has both a message-count budget and a wall-time budget. Terminal input is checked before bounded application work, and due timers and presentation are reconsidered between turns. Saturated reliable producers are backpressured by bounded channel capacity. Latest-value producers are bounded by configured key capacity.
+Each scheduler turn has both a message-count budget and a wall-time budget.
+Terminal input is checked before bounded application work, and due timers and
+presentation are reconsidered between turns. Saturated reliable producers are
+backpressured by bounded channel capacity. Latest-value producers are bounded by
+configured key capacity.
 
-Budget exhaustion yields back to the Tokio scheduler and records a statistic. It does not discard accepted work.
+Budget exhaustion yields back to the Tokio scheduler and records a statistic. It
+does not discard accepted work.
 
 ## Timers
 
-Timers are keyed one-shot deadlines. Scheduling the same key replaces its pending deadline. A delivered timer is removed before `Program::update`; periodic behavior reschedules itself explicitly. This avoids an implicit global tick and allows idle runtimes to sleep until actual work is due.
+Timers are keyed one-shot deadlines. Scheduling the same key replaces its
+pending deadline. A delivered timer is removed before `Program::update`;
+periodic behavior reschedules itself explicitly. This avoids an implicit global
+tick and allows idle runtimes to sleep until actual work is due.
 
 ## Commands and cancellation
 
-Commands are application-supplied futures that return zero or one application message. The runtime supports concurrent commands and keyed start-if-idle, replace, queue-latest, and cancel policies. Keyed generations prevent stale completions from replaced work from entering the application mailbox.
+Commands are application-supplied futures that return zero or one application
+message. The runtime supports concurrent commands and keyed start-if-idle,
+replace, queue-latest, and cancel policies. Keyed generations prevent stale
+completions from replaced work from entering the application mailbox.
 
-Runtime task abortion is local lifecycle management only. It must not be represented as cancellation of canonical application or remote work unless the application separately performs and observes that domain operation.
+Runtime task abortion is local lifecycle management only. It must not be
+represented as cancellation of canonical application or remote work unless the
+application separately performs and observes that domain operation.
 
 ## Rendering
 
-Semantic updates never wait for frame cadence. An update marks presentation dirty; the runtime presents the latest application state when the frame deadline permits. Repeated invalidations coalesce. The next deadline is based on completion of the preceding presentation, so a delayed frame does not create catch-up bursts.
+Semantic updates never wait for frame cadence. An update marks presentation
+dirty; the runtime presents the latest application state when the frame deadline
+permits. Repeated invalidations coalesce. The next deadline is based on
+completion of the preceding presentation, so a delayed frame does not create
+catch-up bursts.
 
-Presentation is synchronous in the initial design. This keeps the committed terminal buffer, hit map, cursor, image scene, and application-visible presentation acknowledgement aligned. A future asynchronous presenter requires an owned frame snapshot and explicit commit acknowledgement; it must not be introduced merely to move a blocking write to another task.
+Presentation is synchronous in the initial design. This keeps the committed
+terminal buffer, hit map, cursor, image scene, and application-visible
+presentation acknowledgement aligned. A future asynchronous presenter requires
+an owned frame snapshot and explicit commit acknowledgement; it must not be
+introduced merely to move a blocking write to another task.
 
-Applications construct the canonical component tree and retain its caller-owned state and derived layout caches. The presenter's render callback receives the application and one root `bmux_tui::paint::PaintCx` covering the terminal area; the callback resolves its tree under the terminal constraints (`cx.area()`) and paints through that scoped context, including hit, semantic, selection, image, cursor, and damage contributions and the deterministic `PaintCx::paint_selection` overlay stage. The raw `Frame` and `Buffer` are never exposed to application code. The runtime schedules and commits this work; it does not own component measurement, choose application layout, or retain a second geometry tree. Input routing uses the exact successfully presented layout and interaction/selection scenes. A failed presentation must not publish the attempted layout, hit map, selection scene, focus geometry, image scene, or cursor as the source for subsequent input.
+Applications construct the canonical component tree and retain its caller-owned
+state and derived layout caches. The presenter's render callback receives the
+application and one root `bmux_tui::paint::PaintCx` covering the terminal area;
+the callback resolves its tree under the terminal constraints (`cx.area()`) and
+paints through that scoped context, including hit, semantic, selection, image,
+cursor, and damage contributions and the deterministic
+`PaintCx::paint_selection` overlay stage. The raw `Frame` and `Buffer` are never
+exposed to application code. The runtime schedules and commits this work; it
+does not own component measurement, choose application layout, or retain a
+second geometry tree. Input routing uses the exact successfully presented layout
+and interaction/selection scenes. A failed presentation must not publish the
+attempted layout, hit map, selection scene, focus geometry, image scene, or
+cursor as the source for subsequent input.
 
-Runtime APIs must not recreate area-assigned widget layout, line scrolling, or product-specific viewport correction, and must not reintroduce a frame- or buffer-level application callback.
+Runtime APIs must not recreate area-assigned widget layout, line scrolling, or
+product-specific viewport correction, and must not reintroduce a frame- or
+buffer-level application callback.
 
-A presenter failure terminates the runtime without treating the failed frame as committed. A reset request invalidates the terminal backend before the next presentation.
+A presenter failure terminates the runtime without treating the failed frame as
+committed. A reset request invalidates the terminal backend before the next
+presentation.
 
 ## Managed terminal input
 
-With the `crossterm` feature, the runtime can own a blocking terminal reader thread. It forwards events through bounded terminal admission. Dropping the input source requests shutdown and detaches a reader blocked in the operating-system backend; the thread exits after the next event or when runtime admission closes. The runtime does not claim that a blocking OS read is synchronously cancellable.
+With the `crossterm` feature, the runtime can own a blocking terminal reader
+thread. It forwards events through bounded terminal admission. Dropping the
+input source requests shutdown and detaches a reader blocked in the
+operating-system backend; the thread exits after the next event or when runtime
+admission closes. The runtime does not claim that a blocking OS read is
+synchronously cancellable.
 
 ## Image-capable presenters
 
@@ -182,7 +313,8 @@ interaction metadata only after both outputs succeed.
 Image support is split into additive Cargo features: `images` enables the
 presenter and individual `image-kitty`, `image-sixel`, and `image-iterm2`
 features enable host protocols. Defaults independently enable `all-protocols`
-(all three image protocols) and `crossterm`. Text-only runtime users can retain a minimal
+(all three image protocols) and `crossterm`. Text-only runtime users can retain
+a minimal
 dependency graph with `default-features = false` (`--no-default-features` for
 Cargo commands).
 
@@ -195,11 +327,24 @@ cleanup with retained-frame invalidation.
 
 ## Shutdown and errors
 
-Graceful exit stops admission processing, cancels runtime-owned command and subscription tasks, performs no speculative final semantic update, and returns the final program and runtime statistics to the caller. Immediate abort follows the same ownership cleanup but may skip an application-requested final redraw. Program and presenter errors are surfaced distinctly.
+Graceful exit stops admission processing, cancels runtime-owned command and
+subscription tasks, performs no speculative final semantic update, and returns
+the final program and runtime statistics to the caller. Immediate abort follows
+the same ownership cleanup but may skip an application-requested final redraw.
+Program and presenter errors are surfaced distinctly.
 
 ## Observability
 
-A lightweight runtime statistics snapshot reports queue depth and high-water marks, backpressure/rejection counts, latest-value replacements, processed event classes, scheduler budget exhaustion, redraw requests and coalescing, frame count and scheduling delay, successful update and presentation time, presenter-reported changed cells and full repaints, command lifecycle, stale completions, and timer activity. Timing fields are cumulative microsecond observations intended for attribution and consumer-side deltas, not embedded product SLOs. Failed updates and presentations do not advance successful-work or committed-output totals. Consumers translate these neutral measurements into their own metrics systems.
+A lightweight runtime statistics snapshot reports queue depth and high-water
+marks, backpressure/rejection counts, latest-value replacements, processed event
+classes, scheduler budget exhaustion, redraw requests and coalescing, frame
+count and scheduling delay, successful update and presentation time,
+presenter-reported changed cells and full repaints, command lifecycle, stale
+completions, and timer activity. Timing fields are cumulative microsecond
+observations intended for attribution and consumer-side deltas, not embedded
+product SLOs. Failed updates and presentations do not advance successful-work or
+committed-output totals. Consumers translate these neutral measurements into
+their own metrics systems.
 
 ## Non-goals
 

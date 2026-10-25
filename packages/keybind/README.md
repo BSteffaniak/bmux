@@ -4,7 +4,8 @@ Keybinding management for bmux terminal multiplexer.
 
 ## Overview
 
-This package handles keybinding configuration, key sequence processing, and custom key mapping functionality.
+This package handles keybinding configuration, key sequence processing, and
+custom key mapping functionality.
 
 ## Features
 

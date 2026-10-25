@@ -4,7 +4,8 @@ Configuration management for bmux terminal multiplexer.
 
 ## Overview
 
-This package handles all configuration aspects of bmux, including file paths, themes, keybindings, and behavior settings.
+This package handles all configuration aspects of bmux, including file paths,
+themes, keybindings, and behavior settings.
 
 ## Features
 

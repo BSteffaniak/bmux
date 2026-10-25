@@ -1,7 +1,8 @@
 # bmux_presenter_runtime
 
 Application-owned authoritative presentation engine, shared by standalone and
-BMUX-managed deployments. This crate adds no presentation domain behavior to core.
+BMUX-managed deployments. This crate adds no presentation domain behavior to
+core.
 Plugin implementations call `Host` and expose generated BPDL operations; the
 `protocol` messages here are exclusively the standalone TLS transport contract.
 
@@ -77,45 +78,66 @@ Plugin implementations call `Host` and expose generated BPDL operations; the
 Action IDs start at 1 and increase per credential, surviving reconnect within a
 live run. Retained identical submissions return their original success/error;
 changed retained payloads return `ActionConflict`. IDs below the high-water mark
-that have been evicted return `OutcomeEvicted`, never execute again. After eviction
-clients must fetch authoritative state and explicitly reconcile external outcomes;
-this is not durable exactly-once execution. A new host run has fresh identity and
+that have been evicted return `OutcomeEvicted`, never execute again. After
+eviction
+clients must fetch authoritative state and explicitly reconcile external
+outcomes;
+this is not durable exactly-once execution. A new host run has fresh identity
+and
 requires explicit new actions. Never replay uncertain effects into a new run.
 Owner calls consume the state revision before execution, even when their outcome
 is uncertain. Polling/snapshots never invoke effects. The owner must return only
 public, bounded outcomes; private external diagnostics should stay owner-local.
 
 The audience projection strips notes, source locations, custom configuration,
-extra metadata, Markdown link destinations/titles/references/autolinks and raw HTML.
-Markdown stays rich: source-range edits preserve shared renderer syntax for inline
-styles, lists, tables, code, math and footnotes; unsafe syntax exposed by reparsing
+extra metadata, Markdown link destinations/titles/references/autolinks and raw
+HTML.
+Markdown stays rich: source-range edits preserve shared renderer syntax for
+inline
+styles, lists, tables, code, math and footnotes; unsafe syntax exposed by
+reparsing
 fails closed. Inline and block images use only authorized opaque asset IDs;
-unreferenced assets are not served. Only exact `light`/`dark` theme names survive;
-unknown names reject preparation. The local loader normalizes inline image assets
+unreferenced assets are not served. Only exact `light`/`dark` theme names
+survive;
+unknown names reject preparation. The local loader normalizes inline image
+assets
 under the same bounded root policy as block images.
 Standalone transport version **2** explicitly selects these richer projection
-semantics; version 1 authentication is rejected. Plugin BPDL compatibility must be
+semantics; version 1 authentication is rejected. Plugin BPDL compatibility must
+be
 selected by the owning plugin; these standalone messages are not plugin IPC.
 Visible authored labels, code, Mermaid content, titles, authors, IDs, and custom
-names are public content: authors must not put secrets there. Custom configuration
+names are public content: authors must not put secrets there. Custom
+configuration
 is never activated from an audience deck. Notes are a separately scoped field.
 
-Limits cover messages, decks/notes, assets/cache bytes, frame/canvas/image decoded
-sizes, surfaces, principals, participants, action retention, action size, request
-rates, connections, handshake/read/write deadlines. Networking retains one request
+Limits cover messages, decks/notes, assets/cache bytes, frame/canvas/image
+decoded
+sizes, surfaces, principals, participants, action retention, action size,
+request
+rates, connections, handshake/read/write deadlines. Networking retains one
+request
 per connection and uses bounded admission rather than unbounded queues. Owner
 callbacks are synchronous trusted application code and must not block or spawn
-unbounded work; asynchronous demo lifecycle management belongs to the application.
+unbounded work; asynchronous demo lifecycle management belongs to the
+application.
 
 ## Validation/handoff
 
-Behavior tests cover auth/modes, private wire projection, shared/independent state,
-reconnect action dedup and uncertainty, eviction, atomic reload, malformed mirrors,
-all style bits, clipped placement, real loopback TCP and TLS certificate validation.
+Behavior tests cover auth/modes, private wire projection, shared/independent
+state,
+reconnect action dedup and uncertainty, eviction, atomic reload, malformed
+mirrors,
+all style bits, clipped placement, real loopback TCP and TLS certificate
+validation.
 Follow-up coverage adds rich Markdown privacy/opaque inline images, immutable
 candidate preparation, compatibility-key retention/reset, shared/live/cached
 instance reconciliation, unknown theme and oversized asset atomicity, slow peer
-timeouts and snapshot resync. Existing uncertain-effect reconnect/eviction coverage
-is retained. Focused rustfmt and source/diff inspection only were run in this lane;
-all cargo builds, clippy, tests and dependency validation belong to the coordinator.
-The `bmux present` command/plugin adapters belong to their assigned integration lane.
+timeouts and snapshot resync. Existing uncertain-effect reconnect/eviction
+coverage
+is retained. Focused rustfmt and source/diff inspection only were run in this
+lane;
+all cargo builds, clippy, tests and dependency validation belong to the
+coordinator.
+The `bmux present` command/plugin adapters belong to their assigned integration
+lane.

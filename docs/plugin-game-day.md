@@ -1,6 +1,7 @@
 # Plugin Game Day
 
-Use this game day to validate end-to-end operator workflows for common plugin incidents.
+Use this game day to validate end-to-end operator workflows for common plugin
+incidents.
 
 ## Scenario 1: Missing Plugin Invocation
 

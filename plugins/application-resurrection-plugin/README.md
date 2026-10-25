@@ -24,30 +24,41 @@ application session IDs or execute commands from descriptors.
 ## Recovery and validation
 
 Pane snapshots retain an opaque invocation identity. Before final snapshot
-collection, the snapshot orchestrator quiesces every participant through the generic
-`StatefulPlugin::prepare_final_snapshot` hook. The pane-runtime participant drains
+collection, the snapshot orchestrator quiesces every participant through the
+generic
+`StatefulPlugin::prepare_final_snapshot` hook. The pane-runtime participant
+drains
 application checkpoint writers while holding the shell-metadata lock and freezes
 its recovery metadata; late prompts, command markers, process exit, and process
-inspection cannot change the captured invocation. Normal saves do not freeze live
+inspection cannot change the captured invocation. Normal saves do not freeze
+live
 state. A quiescence failure preserves the previous snapshot.
 
 The v2 launch contract rejects
-missing or mismatched referenced checkpoints rather than adopting another command's
-state. Shell metadata and identity transitions share a lock during snapshot capture.
+missing or mismatched referenced checkpoints rather than adopting another
+command's
+state. Shell metadata and identity transitions share a lock during snapshot
+capture.
 Interrupted transitions can therefore produce an explicit recovery error, not an
-offer for the wrong invocation. Old snapshots without a checkpoint launch normally;
+offer for the wrong invocation. Old snapshots without a checkpoint launch
+normally;
 old snapshots with an unassociated checkpoint fail without overwriting it.
 
-Shell markers carry fresh per-launch tokens from private integration directories.
-This prevents ordinary output and stale recordings from impersonating shell hooks;
+Shell markers carry fresh per-launch tokens from private integration
+directories.
+This prevents ordinary output and stale recordings from impersonating shell
+hooks;
 same-user code able to read those files remains within the local trust boundary.
 Peer UID/PID and foreground child ownership are checked separately.
 
 `application_resurrection_integration` exercises real daemon restart for direct
 launch and Bash replay, including a subsequent manual launch receiving no offer.
-`bcode_resurrection_integration` runs the actual Bcode TUI with isolated state and
-no model requests. Its second launch omits the session argument and verifies that
-Bcode publishes the recovered session in the replacement generation. Run explicitly:
+`bcode_resurrection_integration` runs the actual Bcode TUI with isolated state
+and
+no model requests. Its second launch omits the session argument and verifies
+that
+Bcode publishes the recovered session in the replacement generation. Run
+explicitly:
 
 ```sh
 BCODE_RESURRECTION_TEST_BINARY=/absolute/path/to/bcode \
@@ -56,7 +67,8 @@ BCODE_RESURRECTION_TEST_BINARY=/absolute/path/to/bcode \
 ```
 
 The cross-repository test is ignored in the default suite because it requires a
-separately built Bcode binary. Nested/non-exec wrappers and remote applications are
+separately built Bcode binary. Nested/non-exec wrappers and remote applications
+are
 not automatically adopted. This experimental protocol is not an established
 cross-terminal standard.
 
@@ -68,18 +80,22 @@ persistence stops that endpoint rather than acknowledging uncertain state.
 ## Socket handshake failures
 
 A successful `application-resurrection/1` hello receives the existing
-`{"protocol":"application-resurrection/1","restore":null}` response (or a restore
+`{"protocol":"application-resurrection/1","restore":null}` response (or a
+restore
 reference). A rejected hello receives a bounded response such as
 `{"protocol":"application-resurrection/1","error":{"code":"ownership_rejected"}}`
 before the connection closes. Success and rejection are mutually exclusive.
-Rejections never contain descriptors, private paths, or raw operating-system errors.
+Rejections never contain descriptors, private paths, or raw operating-system
+errors.
 
 Codes are `invalid_handshake` (framing/protocol/peer identity),
 `ownership_verification_unavailable` (process inspection failed),
 `ownership_rejected` (the peer is not the current execution owner), and
 `launch_unavailable` (launch or registration state is unavailable).
-Clients must fail closed for rejections and unknown codes; older clients fail their
+Clients must fail closed for rejections and unknown codes; older clients fail
+their
 welcome decoding, and newer clients still recognize EOF from older hosts.
 
-On Linux, foreground inspection resolves `ps` through the host's PATH; macOS uses
+On Linux, foreground inspection resolves `ps` through the host's PATH; macOS
+uses
 its system `/bin/ps`. Failure to inspect ownership never grants ownership.

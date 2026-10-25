@@ -1,6 +1,7 @@
 # Plugin Performance and Usability Gates
 
-This document defines the non-negotiable "no regression" bar for plugin architecture changes.
+This document defines the non-negotiable "no regression" bar for plugin
+architecture changes.
 
 ## Goal
 
@@ -9,7 +10,8 @@ This document defines the non-negotiable "no regression" bar for plugin architec
 
 ## Release Gates
 
-Any change touching plugin runtime, plugin SDK, command routing, or bundled plugins must pass these gates.
+Any change touching plugin runtime, plugin SDK, command routing, or bundled
+plugins must pass these gates.
 
 ### 1) Build and correctness
 
@@ -50,13 +52,15 @@ Scale profile defaults:
 
 Use `--scale-plugin-count <N>` when you need an explicit custom size.
 
-Optional steady-state thresholds are available when you want to gate post-startup behavior:
+Optional steady-state thresholds are available when you want to gate
+post-startup behavior:
 
 - `--max-steady-p95-ms`
 - `--max-steady-p99-ms`
 - `--max-steady-avg-ms`
 
-Perf scripts are Python-free and use the workspace helper binary (`bmux-perf-tools`).
+Perf scripts are Python-free and use the workspace helper binary
+(`bmux-perf-tools`).
 The scripts auto-build the helper on first use.
 
 For CI artifact archiving, use:
@@ -94,7 +98,8 @@ CI soft-fail trial toggle:
 - `plugin run missing.plugin-id no-op`: p95 \<= 350ms, p99 \<= 550ms (expected non-zero path)
 - `plugin run <discovered-plugin> <discovered-command>`: p95 \<= 450ms, p99 \<= 650ms when an environment-supported command exists
 
-The matrix also applies matching steady-state p95/p99 thresholds (excluding first measured sample) for each scenario.
+The matrix also applies matching steady-state p95/p99 thresholds (excluding
+first measured sample) for each scenario.
 
 Use `--cold` to run the same matrix without warmup samples.
 

@@ -1,8 +1,13 @@
 # BMUX Invariants
 
-These invariants describe conditions that must remain true across valid changes to BMUX. They are acceptance criteria, not implementation suggestions.
+These invariants describe conditions that must remain true across valid changes
+to BMUX. They are acceptance criteria, not implementation suggestions.
 
-An invariant is a durable condition of a valid product or architecture. Contributor workflow and validation commands belong in `AGENTS.md`; design mechanics and rationale belong in `docs/`; implementation status and migration details belong in progress documents. Existing violations do not create implicit exceptions.
+An invariant is a durable condition of a valid product or architecture.
+Contributor workflow and validation commands belong in `AGENTS.md`; design
+mechanics and rationale belong in `docs/`; implementation status and migration
+details belong in progress documents. Existing violations do not create implicit
+exceptions.
 
 ## Product boundaries
 

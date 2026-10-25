@@ -4,7 +4,8 @@ Proc macros for generating configuration documentation schema.
 
 ## Overview
 
-Provides `#[derive(ConfigDoc)]` for config structs and `#[derive(ConfigDocEnum)]`
+Provides `#[derive(ConfigDoc)]` for config structs and
+`#[derive(ConfigDocEnum)]`
 for config enums. These macros generate `ConfigDocSchema` trait implementations
 that extract TOML field names, Rust doc comments, type information, enum variant
 values (respecting serde rename rules), and serialized defaults -- all consumed

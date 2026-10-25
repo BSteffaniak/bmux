@@ -1,8 +1,12 @@
 # bmux_tui_runtime
 
-Bounded, domain-neutral scheduling and presentation runtime for terminal user interfaces built with `bmux_tui`.
+Bounded, domain-neutral scheduling and presentation runtime for terminal user
+interfaces built with `bmux_tui`.
 
-The crate owns event admission, fair scheduling, commands, timers, redraw coalescing, render cadence, terminal input lifecycle, shutdown, and neutral runtime statistics. Application state and product behavior remain with the consumer.
+The crate owns event admission, fair scheduling, commands, timers, redraw
+coalescing, render cadence, terminal input lifecycle, shutdown, and neutral
+runtime statistics. Application state and product behavior remain with the
+consumer.
 
 ## Inline protocol examples
 
@@ -18,18 +22,22 @@ cargo run -p bmux_tui_runtime --example image_sixel
 cargo run -p bmux_tui_runtime --example image_iterm2
 ```
 
-With exactly one protocol feature enabled, `image_runtime` selects it automatically:
+With exactly one protocol feature enabled, `image_runtime` selects it
+automatically:
 
 ```sh
 cargo run -p bmux_tui_runtime --example image_runtime --no-default-features --features image-sixel
 ```
 
 Multiple enabled protocols require `--protocol`; disabled or unknown protocols
-produce an error before any terminal output. Selection does not probe the terminal
+produce an error before any terminal output. Selection does not probe the
+terminal
 or silently fall back to another protocol.
 
-Kitty and iTerm2 request 16×8 cells. Sixel uses a 128×96-pixel raster and reserves
-12 rows; use a terminal with at least 14 rows and cell height of at least 8 pixels.
+Kitty and iTerm2 request 16×8 cells. Sixel uses a 128×96-pixel raster and
+reserves
+12 rows; use a terminal with at least 14 rows and cell height of at least 8
+pixels.
 These demos do not enter raw mode or the alternate screen. Image scrollback
 retention depends on the terminal/multiplexer, not the shell's command history.
 
@@ -41,8 +49,10 @@ cargo run -p bmux_tui_runtime --example image_protocols
 
 Shows three labeled checkerboards simultaneously, emitting each source protocol
 independently. Press `q`, Escape, or Ctrl-C to quit. Resizing redraws the demo;
-windows smaller than 60×14 show a resize message. Sixel uses a 64×48-pixel raster
-(the other two request 12×6 cells), so sizes depend on font metrics. Use cells at
+windows smaller than 60×14 show a resize message. Sixel uses a 64×48-pixel
+raster
+(the other two request 12×6 cells), so sizes depend on font metrics. Use cells
+at
 least 4×8 pixels. Inside BMUX the source protocols are translated to the host's
 protocol; outside BMUX the terminal must support all three. The alternate screen
 and terminal modes are restored on exit.
@@ -51,7 +61,8 @@ and terminal modes are restored on exit.
 
 With the `images` feature, `ImageTerminalPresenter` connects protocol-neutral
 `bmux_tui::image::ImageContribution` values to BMUX's host image compositor.
-All three protocols and Crossterm are enabled by default. With defaults disabled,
+All three protocols and Crossterm are enabled by default. With defaults
+disabled,
 select protocols through `image-kitty`, `image-sixel`, and `image-iterm2`.
 
 The presenter commits cell output, the reconciled image scene, and interaction
@@ -77,7 +88,8 @@ See [`../../docs/tui-runtime.md`](../../docs/tui-runtime.md) for the full archit
 
 ## Cargo features
 
-Defaults enable `all-protocols` and `crossterm` independently. Use `--no-default-features`
+Defaults enable `all-protocols` and `crossterm` independently. Use
+`--no-default-features`
 (or `default-features = false` in a dependency declaration) for a minimal build,
 then opt into individual features as needed.
 

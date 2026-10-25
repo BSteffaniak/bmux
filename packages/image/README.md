@@ -40,8 +40,10 @@ alongside text. Feature-gated per protocol.
 The dependency-light `image_pipeline` benchmark generates fixed image data and
 reports encoder and public TUI/attach compositor timing distributions plus
 bytes/chunk/work counts. Select fixed `palette`, `solid`, `gradient`,
-`transparent`, or `detailed` fixtures with `--fixture`. A frozen pre-optimization
-Sixel encoder provides a same-build, same-fixture reference. It writes no graphics to the terminal and has no
+`transparent`, or `detailed` fixtures with `--fixture`. A frozen
+pre-optimization
+Sixel encoder provides a same-build, same-fixture reference. It writes no
+graphics to the terminal and has no
 wall-clock pass/fail thresholds. See [reproduction and audit notes](../../docs/image-performance.md)
 for release commands, baseline limitations, and separate nested-terminal repro.
 
@@ -50,5 +52,6 @@ bash scripts/dev.sh cargo bench -p bmux_image --bench image_pipeline \
   --features kitty,sixel,iterm2 -- --iterations 20 --json
 ```
 
-`tests/image_work_regression.rs` checks deterministic public encoder and retained
+`tests/image_work_regression.rs` checks deterministic public encoder and
+retained
 compositor behavior without elapsed-time gates.

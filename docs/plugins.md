@@ -39,7 +39,15 @@ being called from the terminal frame loop. The canonical path is:
    it removes the owner's retained layout or surfaces automatically; explicit
    owner removal is available for other lifecycle models.
 
-The selected execution model is an **in-process attach-client companion**. Geometry-dependent projection belongs beside the attach host because terminal dimensions, resolved allocations, and committed input coordinates are client-local facts. Server-side plugins continue to publish authoritative typed domain state; the companion consumes that state and publishes generic retained layout/surface snapshots locally. Declarative server-published retained presentation is not the canonical model because it would either guess client geometry or require synchronous geometry/render round trips. Another execution mechanism must not be introduced while this canonical path exists.
+The selected execution model is an **in-process attach-client companion**.
+Geometry-dependent projection belongs beside the attach host because terminal
+dimensions, resolved allocations, and committed input coordinates are
+client-local facts. Server-side plugins continue to publish authoritative typed
+domain state; the companion consumes that state and publishes generic retained
+layout/surface snapshots locally. Declarative server-published retained
+presentation is not the canonical model because it would either guess client
+geometry or require synchronous geometry/render round trips. Another execution
+mechanism must not be introduced while this canonical path exists.
 
 The public primitives are intentionally generic: layout edges, rectangles,
 paint operations, semantic regions, focus, cursor roles, and typed dispatch.
@@ -72,15 +80,15 @@ See the executable split-surface example and stable update guidance in
 BMUX has several scene-related representations, but they do not have equal
 ownership or form competing renderers:
 
-| Layer | Responsibility | Boundary |
-| --- | --- | --- |
-| `packages/tui` and `packages/tui-components` | Producer-side widgets, buffers, semantic hit regions, focus, and reusable visual components | A presentation companion lowers selected cells/widgets into generic `RenderOp` values and `PluginSurfaceRegion`s; TUI state is not retained by attach core. |
-| `packages/plugin/src/render.rs` | Generic paint vocabulary shared by extension adapters and independent retained surfaces | `RenderOp` is the canonical producer payload for in-process plugin surfaces. It contains no pane, tab, sidebar, or window semantics. |
-| `packages/plugin/src/layout.rs` and `surface.rs` | Canonical owner-scoped in-process publication, identity, revisions, validation, bounds, and lifecycle | Complete snapshots are the only input to independent presentation lowering. |
-| `packages/scene-protocol` | Typed retained **pane-decoration compatibility contract** for the decoration plugin | `DecorationScene` remains decoration-owned. It is not the wire format for independent plugin surfaces and must not grow tab/sidebar roles. |
-| `packages/scene-protocol-render` | Pure lowering/render helpers for decoration-protocol paint commands | It consumes the decoration wire vocabulary; it does not own retained state or composition. |
-| `packages/attach-layout-protocol` | Authoritative host pane scene, content rectangles, focus, and pane interactive summaries | It describes runtime-owned pane surfaces, not plugin presentation projection. |
-| `packages/attach_pipeline/src/compositor.rs` | Canonical composed retained graph, hit testing, damage, occlusion, repaint order, focus, and pointer routing | Both runtime pane surfaces and lowered plugin surfaces become `RetainedSurface`s here. This is the only in-process compositor representation. |
+| Layer                                            | Responsibility                                                                                               | Boundary                                                                                                                                                    |
+| ------------------------------------------------ | ------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `packages/tui` and `packages/tui-components`     | Producer-side widgets, buffers, semantic hit regions, focus, and reusable visual components                  | A presentation companion lowers selected cells/widgets into generic `RenderOp` values and `PluginSurfaceRegion`s; TUI state is not retained by attach core. |
+| `packages/plugin/src/render.rs`                  | Generic paint vocabulary shared by extension adapters and independent retained surfaces                      | `RenderOp` is the canonical producer payload for in-process plugin surfaces. It contains no pane, tab, sidebar, or window semantics.                        |
+| `packages/plugin/src/layout.rs` and `surface.rs` | Canonical owner-scoped in-process publication, identity, revisions, validation, bounds, and lifecycle        | Complete snapshots are the only input to independent presentation lowering.                                                                                 |
+| `packages/scene-protocol`                        | Typed retained **pane-decoration compatibility contract** for the decoration plugin                          | `DecorationScene` remains decoration-owned. It is not the wire format for independent plugin surfaces and must not grow tab/sidebar roles.                  |
+| `packages/scene-protocol-render`                 | Pure lowering/render helpers for decoration-protocol paint commands                                          | It consumes the decoration wire vocabulary; it does not own retained state or composition.                                                                  |
+| `packages/attach-layout-protocol`                | Authoritative host pane scene, content rectangles, focus, and pane interactive summaries                     | It describes runtime-owned pane surfaces, not plugin presentation projection.                                                                               |
+| `packages/attach_pipeline/src/compositor.rs`     | Canonical composed retained graph, hit testing, damage, occlusion, repaint order, focus, and pointer routing | Both runtime pane surfaces and lowered plugin surfaces become `RetainedSurface`s here. This is the only in-process compositor representation.               |
 
 Independent presentation state has no generic cross-process wire scene. The
 selected attach-client companion consumes typed domain state and publishes
@@ -361,12 +369,15 @@ receiving the same catalog-changed signal they did before the
 migration.
 
 Follow orchestration (client A mirrors client B's selected session)
-lives entirely in `clients-plugin`. The typed `clients-commands:: set-following` handler mutates plugin-owned `FollowState` directly,
+lives entirely in `clients-plugin`. The typed `clients-commands:: set-following`
+handler mutates plugin-owned `FollowState` directly,
 dispatches `contexts-commands::select-context` and
 `sessions-commands::reconcile-client-membership` to the other
-foundational plugins, and emits typed `ClientEvent::{FollowStarted, FollowStopped, FollowTargetChanged}` on the plugin event bus. The
+foundational plugins, and emits typed `ClientEvent::{FollowStarted,
+FollowStopped, FollowTargetChanged}` on the plugin event bus. The
 server's `spawn_client_events_bridge` task maps those typed events to
-the legacy wire `Event::{FollowStarted, FollowStopped, FollowTargetChanged}` for cross-process subscribers, following the
+the legacy wire `Event::{FollowStarted, FollowStopped, FollowTargetChanged}` for
+cross-process subscribers, following the
 same pattern as the control-catalog bridge.
 
 `SessionRuntimeManager` (the heavier pane-runtime struct that owns
@@ -446,7 +457,8 @@ spawn its own flush task — the plugin's debounce thread replaces it.
 
 ### IPC wiring
 
-Four IPC variants (`Request::{ServerStatus, ServerSave, ServerRestoreDryRun, ServerRestoreApply}`)
+Four IPC variants (`Request::{ServerStatus, ServerSave, ServerRestoreDryRun,
+ServerRestoreApply}`)
 stay on the wire for CLI-facing operations. Their server handlers
 delegate to the orchestrator through
 `snapshot_orchestrator_handle().as_dyn().save_now_boxed().await`
@@ -846,23 +858,32 @@ Resolution behavior is deterministic:
 
 Background caller-process work needs an explicitly negotiated, versioned generic
 asynchronous service handle captured in its command context. This direction was
-approved to repair service calls that outlive the synchronous command invocation.
+approved to repair service calls that outlive the synchronous command
+invocation.
 The bundled in-process command path implements version 1 through
-`enter_async_command_route` and `capture_async_command_route`. Capture must occur
+`enter_async_command_route` and `capture_async_command_route`. Capture must
+occur
 at command entry before spawning; the captured handle survives scope exit.
 Unsupported versions and absent routes fail explicitly. Dynamic-plugin wire
 negotiation is not implemented by this in-process capture mechanism.
 
-The handle must retain its original invoking transport and authority, use bounded
-requests and responses, and close permanently when that attachment ends. Old tasks
-must never acquire a later attachment's route. Closed or unsupported handles return
-explicit errors; they do not fall back to fresh connections. The attach loop must
-continue servicing input, presentation, and requests while plugin work is pending.
+The handle must retain its original invoking transport and authority, use
+bounded
+requests and responses, and close permanently when that attachment ends. Old
+tasks
+must never acquire a later attachment's route. Closed or unsupported handles
+return
+explicit errors; they do not fall back to fresh connections. The attach loop
+must
+continue servicing input, presentation, and requests while plugin work is
+pending.
 
 The existing native bridge representation and semantics remain unchanged. Hosts
-advertise the new version before plugins select it. Generated BPDL clients remain
+advertise the new version before plugins select it. Generated BPDL clients
+remain
 the modeled service interface; this mechanism adds no domain operations to
-`HostRuntimeApi`. Host-side checks bind the handle to the issuing context and its
+`HostRuntimeApi`. Host-side checks bind the handle to the issuing context and
+its
 permitted services rather than trusting caller-supplied identity.
 
 Acceptance requires coverage of task migration and command return, cancellation,

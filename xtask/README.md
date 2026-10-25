@@ -1,7 +1,8 @@
 # Release tasks
 
 These are explicit repository tasks, not Cargo build-script hooks. The task uses
-`bmux_plugin::PluginManifest` for the same declaration/ABI validation as the host;
+`bmux_plugin::PluginManifest` for the same declaration/ABI validation as the
+host;
 it does not initialize a plugin runtime or contact a daemon.
 
 ```
@@ -15,24 +16,31 @@ cargo xtask install SOURCE --prefix PREFIX --version VERSION
 Auxiliary operations accept `--workspace ROOT` (default: this repository).
 `--activate-version VERSION` is an alias for `--version`. Version activation and
 slot renaming are mutually exclusive. Install destinations must be absent or
-empty dedicated directories. Unix activation retains immutable version directories
+empty dedicated directories. Unix activation retains immutable version
+directories
 and atomically replaces only `PREFIX/bin/bmux`, under an exclusive publication
 lock. A failed activation may retain a fully published but inactive version;
 retrying that immutable version is explicitly refused, never overwritten.
 
 Build selects `xtask` and each declared Cargo package/binary explicitly, using
 `--locked --release --target`. Stage renames the target `xtask` binary to
-`bmux-install` (`.exe` on Windows); invocation under that basename defaults to the
-install task, without an `install` subcommand. The host task can install cross-target
+`bmux-install` (`.exe` on Windows); invocation under that basename defaults to
+the
+install task, without an `install` subcommand. The host task can install
+cross-target
 inventories without executing their binaries. Windows inventories include only
-`bmux.exe` and `bmux-install.exe`, with unavailable helper declarations recorded;
+`bmux.exe` and `bmux-install.exe`, with unavailable helper declarations
+recorded;
 symlink activation is Unix-only. Supported targets are x86_64/aarch64 Darwin and
 Linux GNU/musl, and x86_64 Windows MSVC.
 
-The inventory is schema 1 and includes SHA-256, length, target, and declarations.
-Install verifies every member, rejects unlisted payload members, unsafe/duplicate
+The inventory is schema 1 and includes SHA-256, length, target, and
+declarations.
+Install verifies every member, rejects unlisted payload members,
+unsafe/duplicate
 names and symlinked files or path ancestors, then copies into a private staging
-directory and verifies the copied bytes before atomic publication. Existing files
+directory and verifies the copied bytes before atomic publication. Existing
+files
 are never overwritten. On Unix files and directories are synchronized before
 success. Windows uses atomic directory publication but does not claim POSIX
 symlink activation or directory-fsync semantics. Installation prefixes must be
@@ -42,7 +50,6 @@ with concurrent write authority over an ancestor directory.
 Public download consumers must verify the archive checksum and reject unsafe
 archive entries **before** extraction and execution of `bmux-install`. Inventory
 hashes alone are not an authenticity signature. No Python installer is shipped.
-
 
 ## Bterm bundles
 
@@ -60,10 +67,13 @@ cargo xtask bterm run
 
 Both commands detect the compiler host and Cargo target directory, incrementally
 build both binaries, and stage and verify a fresh bundle. `build` prints its
-location and stops: it neither resolves runtime state nor executes either binary.
+location and stops: it neither resolves runtime state nor executes either
+binary.
 `run` then launches it directly so errors remain visible. Bundles are immutable:
-identical inputs reuse a verified generation; changed inputs publish a new one at
-`bterm-run/<host>/bundles/<manifest-sha256>/Bterm.app` on macOS (`Bterm` on Linux).
+identical inputs reuse a verified generation; changed inputs publish a new one
+at
+`bterm-run/<host>/bundles/<manifest-sha256>/Bterm.app` on macOS (`Bterm` on
+Linux).
 `bterm-run/<host>/latest.json` is an atomically updated informational reference.
 Older generations (including pre-generation legacy bundles) are retained so live
 daemons and supervisors never lose their artifact paths. Corrupt generations
@@ -87,9 +97,11 @@ Staging copies the actual `bterm` frontend plus the manifest-driven BMUX product
 payload: companion, installer, declared platform-supported helper executables
 (including the execution supervisor), and `artifacts.json`. That inventory and
 all helper bytes are covered by the Bterm bundle manifest. It also includes four
-bundled JetBrains Mono Nerd Font faces and font/project notices. Static plugins remain part of
+bundled JetBrains Mono Nerd Font faces and font/project notices. Static plugins
+remain part of
 the BMUX companion. Both processes retain independent lifetimes; packaging never
-starts a runtime. The schema-1 `bterm-bundle.json` beside the executables records
+starts a runtime. The schema-1 `bterm-bundle.json` beside the executables
+records
 `bterm-bmux-v1`, the exact target, and relative paths with SHA-256 checksums.
 This is corruption detection, not signing or publisher authentication. Runtime
 compatibility is separately negotiated over IPC.
@@ -98,7 +110,8 @@ Linux includes `share/applications/bterm.desktop`; a distributor must expose the
 bundle's `bterm` on its launcher PATH. macOS produces `Contents/MacOS` plus an
 Info.plist; use a `.app` destination. Windows uses explicit `.exe` paths. No
 installer, signing, registration, or live user-directory mutation is performed.
-Verification rejects traversal, symlinks, duplicate paths/required roles, missing
+Verification rejects traversal, symlinks, duplicate paths/required roles,
+missing
 companions, wrong targets and corrupt bytes without executing either binary.
 
 The Bterm bundle CI builds real binaries and checks staged executable `--help`

@@ -48,5 +48,6 @@ encoded outcome rather than executing the provider again. Retention is bounded
 and admission backpressure occurs before execution. Conflicting identity reuse
 fails explicitly. This process-local retention is not durable idempotency across
 provider reload or restart; application mutations still own any stronger durable
-retry guarantees. Startup claims, committed-frame input fences, and native output
+retry guarantees. Startup claims, committed-frame input fences, and native
+output
 receipts remain separate ownership safeguards.

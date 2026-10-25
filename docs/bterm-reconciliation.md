@@ -1,6 +1,7 @@
 # Bterm build and runtime reconciliation
 
-`cargo xtask bterm build` produces a verified, content-addressed bundle. It never
+`cargo xtask bterm build` produces a verified, content-addressed bundle. It
+never
 starts or probes a runtime. Generations include the frontend, companion, helper
 inventory and helper bytes, font notices, and launcher metadata. Publication
 uses a private same-filesystem staging directory and an atomic rename. Identical
@@ -17,7 +18,8 @@ state, or stop an existing execution. Window closure still only detaches.
 ## Observation and policy
 
 Bterm's pure reconciliation policy maps explicit observations to start, wait,
-attach, fence-and-restart, or refusal. Transport authentication, protocol errors,
+attach, fence-and-restart, or refusal. Transport authentication, protocol
+errors,
 unsupported readiness contracts, and unknown ownership never authorize process
 replacement. Startup remains bounded and uses the existing lifetime ownership
 claim. A runtime-root reconciliation lock serializes managed reconcilers across
@@ -38,7 +40,8 @@ server-side exact-instance fence. An unhealthy activation cannot admit processes
 or new reservation records; the fence prevents admission even after recovery is
 requested. The frontend verifies the fence on the same connection before asking
 for graceful shutdown, waits for authoritative absence, then starts the selected
-bundle. Only one recovery attempt is allowed per invocation. A healthy activation
+bundle. Only one recovery attempt is allowed per invocation. A healthy
+activation
 is never automatically restarted merely because a newer build exists.
 
 ## Conservative migration

@@ -13,7 +13,8 @@ Preparation explicitly selects source and allowed root, native executable and
 attempts root, and requires consent to executable deck input. `request_id` is a
 UUID for idempotent preparation and `lookup-preparation` reconciliation in the
 current owner lifetime; different fields under the same identity are rejected.
-`expected_closure_sha256` must be the approved full-include-closure identity from
+`expected_closure_sha256` must be the approved full-include-closure identity
+from
 `bmux_playbook::parser::source_closure_sha256`. The service verifies and freezes
 the exact same bounded bytes before admission; a changed include is rejected.
 An unknown lookup is not successful cleanup and must not cause automatic replay.

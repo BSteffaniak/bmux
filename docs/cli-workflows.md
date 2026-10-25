@@ -3,20 +3,27 @@
 For account-free remote terminal pairing without a client-side server, see
 [Remote pairing and daemonless clients](remote-pairing.md).
 
-The current CLI is server-backed by default. Running `bmux` with no subcommand starts or reuses a server, creates a session when needed, and attaches.
+The current CLI is server-backed by default. Running `bmux` with no subcommand
+starts or reuses a server, creates a session when needed, and attaches.
 
-`bmux server stop` waits for the selected local process to exit, timing out after
-30 seconds without observable shutdown progress (not 30 seconds total). Completed
-cleanup milestones advance an instance-bound status counter; repeated status reads
+`bmux server stop` waits for the selected local process to exit, timing out
+after
+30 seconds without observable shutdown progress (not 30 seconds total).
+Completed
+cleanup milestones advance an instance-bound status counter; repeated status
+reads
 and waiting diagnostics do not extend the wait. The last known step is included
 on inactivity timeout. Older servers without progress retain a bounded wait.
-Graceful completion requires an instance-matching cleanup record; an older server
-without that record is reported as stopped with cleanup unverified. Cleanup errors
-are failures, not successful stops. An unavailable endpoint never authorizes killing
-a numeric PID: a timed-out stop leaves cleanup ownership intact and directs you to
+Graceful completion requires an instance-matching cleanup record; an older
+server
+without that record is reported as stopped with cleanup unverified. Cleanup
+errors
+are failures, not successful stops. An unavailable endpoint never authorizes
+killing
+a numeric PID: a timed-out stop leaves cleanup ownership intact and directs you
+to
 the selected runtime's logs. Remote endpoint loss alone cannot prove cleanup;
 remote completion remains unconfirmed until a completion protocol is available.
-
 
 ```bash
 # Start or inspect the server
@@ -152,7 +159,8 @@ listen = "0.0.0.0:7443"
 quick = true
 ```
 
-For a production certificate, disable quick mode by omitting `quick` and provide both PEM files:
+For a production certificate, disable quick mode by omitting `quick` and provide
+both PEM files:
 
 ```toml
 [server.gateway]
@@ -162,9 +170,13 @@ cert_file = "/etc/bmux/gateway-cert.pem"
 key_file = "/etc/bmux/gateway-key.pem"
 ```
 
-Restart the bmux server after changing gateway settings. Listening on `0.0.0.0` exposes the gateway to reachable networks; apply appropriate firewall and access controls. Reverse-SSH and Iroh hosting remain explicit `bmux server gateway --host ...` command flows.
+Restart the bmux server after changing gateway settings. Listening on `0.0.0.0`
+exposes the gateway to reachable networks; apply appropriate firewall and access
+controls. Reverse-SSH and Iroh hosting remain explicit `bmux server gateway
+--host ...` command flows.
 
-`bmux logs watch` uses a ratatui interface and supports Vim-style navigation (`j`/`k`, `g`/`G`, `Ctrl-u`/`Ctrl-d`).
+`bmux logs watch` uses a ratatui interface and supports Vim-style navigation
+(`j`/`k`, `g`/`G`, `Ctrl-u`/`Ctrl-d`).
 
 Top-level and grouped command forms are supported in many areas of the CLI.
 
@@ -181,9 +193,18 @@ Environment overrides:
 
 - `BMUX_LOG_LEVEL`: effective runtime log level
 
-A native autostart service runs foreground `bmux server start` so the operating system owns supervision; it does not use `--daemon`. Installation is explicit and starts immediately unless `--no-start` is passed. Existing `[server.gateway]` configuration is loaded normally, so an enabled gateway also starts at login.
+A native autostart service runs foreground `bmux server start` so the operating
+system owns supervision; it does not use `--daemon`. Installation is explicit
+and starts immediately unless `--no-start` is passed. Existing
+`[server.gateway]` configuration is loaded normally, so an enabled gateway also
+starts at login.
 
-Imperative installation refuses symlinked, read-only, conflicting, or externally managed declarations. Nix/Home Manager users should define `${pkgs.bmux}/bin/bmux server start` through `systemd.user.services` or `launchd.agents` and let Nix own the declaration; bmux never mutates `bmux.toml`. Linux autostart begins at login and does not enable lingering automatically.
+Imperative installation refuses symlinked, read-only, conflicting, or externally
+managed declarations. Nix/Home Manager users should define
+`${pkgs.bmux}/bin/bmux server start` through `systemd.user.services` or
+`launchd.agents` and let Nix own the declaration; bmux never mutates
+`bmux.toml`. Linux autostart begins at login and does not enable lingering
+automatically.
 
 Runtime selection vs sandbox isolation:
 
@@ -253,7 +274,8 @@ namespace = "plugin"
 path = ["recording", "start"]
 ```
 
-Role policy: `owner` controls session and window mutations plus role changes, `writer` can send attach input, and `observer` is read-only.
+Role policy: `owner` controls session and window mutations plus role changes,
+`writer` can send attach input, and `observer` is read-only.
 
 Window presentation settings and the tab-bar/sidebar enablement combinations
 are documented in [Window presentation plugins](tab-presentations.md).

@@ -1,8 +1,10 @@
 # Mobile FFI Contract (M0 Draft)
 
-This document defines the initial API contract between platform apps and shared Rust.
+This document defines the initial API contract between platform apps and shared
+Rust.
 
-Status: draft for M0 alignment. Final names and signatures can evolve in M1 before freeze.
+Status: draft for M0 alignment. Final names and signatures can evolve in M1
+before freeze.
 
 ## Design Principles
 

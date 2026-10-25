@@ -3,17 +3,27 @@
 - **Status:** Superseded by [ADR-0015](adr-0015-bmux-owned-consensus.md)
 - **Date:** 2026-07-24
 
-ADR-0015 replaces this implementation selection with BMUX-owned established Raft. The decision below is retained as historical rationale and describes the current OpenRaft runtime until replacement qualification and explicit migration are complete; it is not the target architecture.
+ADR-0015 replaces this implementation selection with BMUX-owned established
+Raft. The decision below is retained as historical rationale and describes the
+current OpenRaft runtime until replacement qualification and explicit migration
+are complete; it is not the target architecture.
 
 ## Context
 
-BMUX federation needs a production Raft implementation for durable control metadata, leader election, quorum-safe writes, linearizable authorization reads, snapshots, and safe voter changes. The implementation must fit Tokio and plugin-owned typed endpoint transport without placing cluster policy in core.
+BMUX federation needs a production Raft implementation for durable control
+metadata, leader election, quorum-safe writes, linearizable authorization reads,
+snapshots, and safe voter changes. The implementation must fit Tokio and
+plugin-owned typed endpoint transport without placing cluster policy in core.
 
-The two credible maintained Rust candidates evaluated were OpenRaft and TiKV raft-rs. Both are actively maintained and implement Raft, but they expose different integration levels.
+The two credible maintained Rust candidates evaluated were OpenRaft and TiKV
+raft-rs. Both are actively maintained and implement Raft, but they expose
+different integration levels.
 
 ## Decision
 
-Use **OpenRaft 0.9.x**, pinned to a reviewed patch release, for the initial federated control plane. Do not adopt the 0.10 alpha line. Upgrades are explicit because OpenRaft's pre-1.0 API and durable types may change.
+Use **OpenRaft 0.9.x**, pinned to a reviewed patch release, for the initial
+federated control plane. Do not adopt the 0.10 alpha line. Upgrades are explicit
+because OpenRaft's pre-1.0 API and durable types may change.
 
 Implement OpenRaft entirely inside `plugins/cluster-plugin`:
 
@@ -23,7 +33,9 @@ Implement OpenRaft entirely inside `plugins/cluster-plugin`:
 - The plugin API crate contains only stable wire contracts and model types, never OpenRaft runtime or storage implementations.
 - Core IPC and `HostRuntimeApi` remain unchanged.
 
-OpenRaft's split storage-v2 interfaces (`RaftLogStorage` and `RaftStateMachine`) are the required integration surface. The deprecated combined storage interface is not used.
+OpenRaft's split storage-v2 interfaces (`RaftLogStorage` and `RaftStateMachine`)
+are the required integration surface. The deprecated combined storage interface
+is not used.
 
 ## Evaluation
 
@@ -39,7 +51,12 @@ OpenRaft's split storage-v2 interfaces (`RaftLogStorage` and `RaftStateMachine`)
 | Deterministic tests         | Network/storage traits are directly substitutable; project includes deterministic simulation work | Strong algorithm test history, but BMUX would need a larger custom harness around the raw node loop                                                     |
 | Dependency/integration cost | Larger and pre-1.0, but substantially less custom consensus plumbing                              | Smaller core abstraction, but significantly more BMUX-owned safety-critical code                                                                        |
 
-OpenRaft is selected because it minimizes custom consensus orchestration while directly providing the async storage, snapshot, membership, metrics, and testing seams required by the progress plan. raft-rs remains a capable alternative, but its raw-node integration would require BMUX to own more persistence-ordering and event-loop correctness, contrary to the requirement not to invent consensus infrastructure.
+OpenRaft is selected because it minimizes custom consensus orchestration while
+directly providing the async storage, snapshot, membership, metrics, and testing
+seams required by the progress plan. raft-rs remains a capable alternative, but
+its raw-node integration would require BMUX to own more persistence-ordering and
+event-loop correctness, contrary to the requirement not to invent consensus
+infrastructure.
 
 ## Version and upgrade policy
 
@@ -50,7 +67,10 @@ OpenRaft is selected because it minimizes custom consensus orchestration while d
 
 ## Storage implications
 
-This ADR selects the consensus library, not the durable storage engine. The following Phase 4 decision must separately select and document a crash-safe implementation of the log, vote/committed state, state machine, and snapshots. Generic plugin key/value storage is not sufficient for WAL semantics.
+This ADR selects the consensus library, not the durable storage engine. The
+following Phase 4 decision must separately select and document a crash-safe
+implementation of the log, vote/committed state, state machine, and snapshots.
+Generic plugin key/value storage is not sufficient for WAL semantics.
 
 Required storage properties are:
 

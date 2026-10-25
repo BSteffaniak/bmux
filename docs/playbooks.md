@@ -23,7 +23,7 @@ the server. Use `--target-server` to run against a live server instead.
 | Line-oriented DSL | `.dsl` or stdin  | Quick authoring, LLM generation, piping |
 | TOML              | `.playbook.toml` | Structured config, version control      |
 
-______________________________________________________________________
+---
 
 ## Declared application inputs
 
@@ -80,9 +80,12 @@ bmux playbook run <source> [flags]
 | `--var KEY=VALUE`        | string | none     | Define a variable (repeatable, overrides `@var`) |
 | `--verbose` / `-v`       | bool   | false    | Print step-by-step progress to stderr            |
 
-Note: global recording auto-export settings (`recording.auto_export` or `--recording-auto-export`) do not auto-export playbook recordings. Use `--export-gif <path>` for playbook runs.
+Note: global recording auto-export settings (`recording.auto_export` or
+`--recording-auto-export`) do not auto-export playbook recordings. Use
+`--export-gif <path>` for playbook runs.
 
-For production attach rendering bugs, a DSL playbook can opt into the real attach
+For production attach rendering bugs, a DSL playbook can opt into the real
+attach
 runtime and copy a specific bmux config into the sandbox:
 
 ```dsl
@@ -93,7 +96,8 @@ runtime and copy a specific bmux config into the sandbox:
 ```
 
 This keeps server/runtime directories isolated while loading the provided config
-and exercising the production attach renderer. `scripts/repro-decoration-flicker.sh`
+and exercising the production attach renderer.
+`scripts/repro-decoration-flicker.sh`
 wraps this flow for decoration flicker investigations.
 
 **Exit codes:** `0` = all steps passed, `1` = one or more steps failed or error.
@@ -130,7 +134,8 @@ Parse and validate a playbook without executing it.
 bmux playbook validate <source> [--json]
 ```
 
-Returns validation errors (missing `new-session` as first step, unknown actions, etc.).
+Returns validation errors (missing `new-session` as first step, unknown actions,
+etc.).
 
 ### `bmux playbook dry-run`
 
@@ -264,7 +269,7 @@ If `--output` is omitted, writes to stdout. The generated playbook includes
 `wait-for` barriers and `assert-screen` checks derived from the recorded output.
 See [Recording to Playbook Conversion](#recording-to-playbook-conversion).
 
-______________________________________________________________________
+---
 
 ## DSL Format
 
@@ -309,7 +314,7 @@ action-name key1=value1 key2='value with spaces' key3="also quoted"
 | `\"`   | `0x22` | Literal double quote |
 | `\xNN` | `0xNN` | Arbitrary hex byte   |
 
-______________________________________________________________________
+---
 
 ## Config Directives
 
@@ -342,10 +347,11 @@ directives are processed in a first pass).
 | `inherit` | Sandbox inherits the full parent environment, then overlays deterministic defaults for `TERM` (`xterm-256color`), `LANG` (`C.UTF-8`), `LC_ALL` (`C.UTF-8`), and `HOME` (sandbox temp dir). `@env` entries are applied on top. |
 | `clean`   | Sandbox starts with an empty environment. Only `PATH`, `USER`, and `SHELL` are inherited from the parent. All other variables use deterministic defaults or explicit `@env` entries.                                          |
 
-**Resolution chain:** `@env-mode` in playbook (if set) > `BMUX_PLAYBOOK_ENV_MODE`
+**Resolution chain:** `@env-mode` in playbook (if set) >
+`BMUX_PLAYBOOK_ENV_MODE`
 environment variable (if set) > `inherit`.
 
-______________________________________________________________________
+---
 
 ## Actions Reference
 
@@ -354,7 +360,8 @@ ______________________________________________________________________
 Use `@driver real-attach` for performance/runtime scenarios that should exercise
 the same attach loop as the interactive app. The driver still uses the normal
 sandbox or target server setup, but after `new-session` it starts the production
-attach runtime with a headless terminal adapter. Playbook actions can continue to
+attach runtime with a headless terminal adapter. Playbook actions can continue
+to
 use setup-oriented service calls, while the real attach loop receives server
 pushes, drains pane output, renders frames, writes to the terminal adapter, and
 emits normal `bmux.perf` recording telemetry.
@@ -435,7 +442,8 @@ new-session [name=<string>]
 | ------ | ------ | -------- | ------- | ------------ |
 | `name` | string | no       | auto    | Session name |
 
-Sets `${SESSION_ID}`, `${SESSION_NAME}`, `${PANE_COUNT}` (=1), `${FOCUSED_PANE}` (=1).
+Sets `${SESSION_ID}`, `${SESSION_NAME}`, `${PANE_COUNT}` (=1), `${FOCUSED_PANE}`
+(=1).
 
 #### `kill-session`
 
@@ -557,7 +565,8 @@ prefix-key key=<char>
 | `key` | char | yes      | -       | Single character to send after the prefix |
 
 Do not mix attach UI-mode entry with `send-keys` for follow-up navigation keys.
-`send-keys` writes bytes to the pane shell; `send-attach` runs attach key handling.
+`send-keys` writes bytes to the pane shell; `send-attach` runs attach key
+handling.
 
 ```
 # Bad: enters scrollback, then types into shell
@@ -705,9 +714,11 @@ summary to each step result. Use `render-mark` to name the current trace
 position, then `assert-render` to verify bounded render work since that mark.
 The step summary is derived from normalized pane/cell deltas and does not store
 raw ANSI bytes or pane text. Exact trace snapshots use compact semantic ops such
-as `full-frame` and `pane-row-segment:<pane>:<row>:<start_col>:<cells>`; the same
+as `full-frame` and `pane-row-segment:<pane>:<row>:<start_col>:<cells>`; the
+same
 compact format also covers actual attach-render trace ops such as `status-line`,
-`help-overlay`, and `extension-cached-replay:<surface>` for trace-backed summaries.
+`help-overlay`, and `extension-cached-replay:<surface>` for trace-backed
+summaries.
 
 ```
 @render-trace true
@@ -768,7 +779,8 @@ contains JSON-serialized pane captures. In interactive mode, the response
 screen
 ```
 
-No arguments. Useful for LLM debugging -- inspect screen state without asserting.
+No arguments. Useful for LLM debugging -- inspect screen state without
+asserting.
 
 #### `status`
 
@@ -814,7 +826,7 @@ invoke-service capability=<cap> interface=<id> operation=<op> [kind=query|comman
 | `kind`       | string | no       | `command` | `query`/`q` or `command`/`cmd` |
 | `payload`    | string | no       | `""`      | JSON payload string            |
 
-______________________________________________________________________
+---
 
 ## Step Modifiers
 
@@ -889,7 +901,7 @@ wait-for pattern='${MARKER}'
 
 Static variables take priority over environment variables with the same name.
 
-______________________________________________________________________
+---
 
 ## TOML Format
 
@@ -973,7 +985,7 @@ action = "assert-screen"
 contains = "hello_world"
 ```
 
-______________________________________________________________________
+---
 
 ## Sandbox Environment
 
@@ -1000,7 +1012,7 @@ By default, all bundled plugins are available. Use `@plugin` to control this:
 
 When any `enable` is specified, all other plugins are implicitly disabled.
 
-______________________________________________________________________
+---
 
 ## Assertions and Synchronization
 
@@ -1033,7 +1045,7 @@ ______________________________________________________________________
 6. **Prefer `contains` over `matches` when possible.** Substring matching is
    simpler and less fragile than regex.
 
-______________________________________________________________________
+---
 
 ## Interactive Mode Protocol
 
@@ -1061,7 +1073,8 @@ JSON.
 
 ### Wire Protocol
 
-Interactive mode is JSON-op only in v2: one JSON object per line (`\n`-delimited).
+Interactive mode is JSON-op only in v2: one JSON object per line
+(`\n`-delimited).
 
 JSON op examples:
 
@@ -1255,7 +1268,8 @@ Example (only trigger on pane output that matches):
 {"op":"set_watchpoint","id":"errors-only","kind":"event_burst","event_type":"pane_output","contains_regex":"(?i)error|panic","min_hits":1,"window_ms":1000}
 ```
 
-`watchpoint_hit` cannot be watched in v1 (recursive watchpoint loops are blocked).
+`watchpoint_hit` cannot be watched in v1 (recursive watchpoint loops are
+blocked).
 
 `hydrate` JSON options:
 
@@ -1284,7 +1298,7 @@ Use `unsubscribe` to stop receiving push events.
 ← {"status":"ok","action":"quit"}
 ```
 
-______________________________________________________________________
+---
 
 ## Recording to Playbook Conversion
 
@@ -1321,7 +1335,7 @@ Generated patterns are made robust to non-deterministic content:
 - Some manual editing may be needed for complex workflows (e.g., interactive
   programs, timing-sensitive sequences).
 
-______________________________________________________________________
+---
 
 ## JSON Output Schema
 
@@ -1434,7 +1448,7 @@ moment of failure, regardless of which pane was being asserted on.
 | `cursor_row`  | u16    | Cursor row (0-based)                               |
 | `cursor_col`  | u16    | Cursor column (0-based)                            |
 
-______________________________________________________________________
+---
 
 ## Examples
 

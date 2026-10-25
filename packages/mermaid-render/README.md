@@ -6,16 +6,19 @@ snapshot, or worker-path environment override.
 
 ## Build and deployment
 
-Ordinary Cargo builds stage the independently locked guest under `OUT_DIR`, compile
+Ordinary Cargo builds stage the independently locked guest under `OUT_DIR`,
+compile
 it, and embed portable WASM plus destination-baseline AOT artifacts. Guest
 `Cargo.toml.in` and `Cargo.lock.in` are shipped as templates so Cargo does not
 exclude the sources as a nested package. The build obtains the canonical diagram
-font from `bmux_fonts`, not a sibling checkout directory. The selected compiler must include
+font from `bmux_fonts`, not a sibling checkout directory. The selected compiler
+must include
 `wasm32-unknown-unknown`. Cranelift destination backends are enabled for release
 cross-compilation. No runtime guest file, Rust toolchain, network connection or
 helper executable is required on deployed machines.
 
-`WasmMermaidRenderer::new()` loads trusted embedded AOT; `new_jit()` compiles the
+`WasmMermaidRenderer::new()` loads trusted embedded AOT; `new_jit()` compiles
+the
 same embedded portable WASM. Both execute the same guest and enforce the same
 contract. Fuel budgets are explicitly opt-in.
 
@@ -46,7 +49,8 @@ The guest and presenter use identical BMUX Diagram regular font bytes, including
 monochrome emoji/symbol coverage. System fallback extends unsupported scripts;
 glyph coverage and complex-script layout are not universal. Oversized intrinsic
 SVGs scale into the requested viewport with their viewBox preserved and a typed
-info diagnostic; timeout/source/output/memory budgets remain enforced. Minor native layout differences are not compatibility failures.
+info diagnostic; timeout/source/output/memory budgets remain enforced. Minor
+native layout differences are not compatibility failures.
 See `guest/README.md` for fork and font provenance.
 
 ## Verification and measurements
@@ -56,6 +60,7 @@ archive in Cargo's extracted package directory without sibling sources.
 
 Run `cargo nextest run -p bmux_mermaid_render --no-fail-fast` for ABI, limits,
 interruption, destination AOT and worker-free relocated executable tests.
-`examples/compare.rs` and `scripts/benchmark-mermaid.py` measure only WASM AOT/JIT
+`examples/compare.rs` and `scripts/benchmark-mermaid.py` measure only WASM
+AOT/JIT
 modes. Historical process comparisons in `docs/mermaid-wasm-performance.md` are
 retained as historical evidence, not current invocation instructions.

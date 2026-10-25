@@ -53,25 +53,30 @@ explicit managed-root policy, and sandbox handoff. An isolated runtime namespace
 is not an OS security sandbox.
 
 Native decorations are a creation-time native platform option, separate from
-BMUX presentation and plugin resource ownership. Configuration inspection reports
+BMUX presentation and plugin resource ownership. Configuration inspection
+reports
 the requested policy; the window manager/compositor determines visible chrome.
 
 ## Package ownership
 
 The application package and executable are `bterm`. Bterm-owned native backends
-are `bterm_native_platform` and `bterm_native_renderer`; new Bterm-specific crates
+are `bterm_native_platform` and `bterm_native_renderer`; new Bterm-specific
+crates
 use the `bterm_*` prefix. Shared attachment, presentation, fonts, protocols, and
-plugin contracts retain their existing BMUX names. Inclusion in Bterm's dependency
+plugin contracts retain their existing BMUX names. Inclusion in Bterm's
+dependency
 tree does not make a crate Bterm-specific.
 
-Build the frontend with `cargo build -p bterm --bin bterm`, or build its verified
+Build the frontend with `cargo build -p bterm --bin bterm`, or build its
+verified
 companion bundle with `cargo xtask bterm build`. Package naming does not change
 runtime roots, executable names, or attachment and recovery contracts.
 
 ## Integration
 
 The native frontend currently hosts the existing `bmux_cli::attach` orchestrator
-through its no-`Write` native host. Runtime state and enabled plugin adapters are
+through its no-`Write` native host. Runtime state and enabled plugin adapters
+are
 initialized on the attachment worker thread with the selected root's explicit
 configuration paths, including lazy command dispatch. This is deliberate reuse,
 not a second plugin manager. The window never serializes a browser frame.

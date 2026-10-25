@@ -24,20 +24,25 @@ There are two source families:
 - **Bterm:** host `BTERM_CONFIG_DIR/bterm.toml`, then the `BTERM_CONFIG` overlay,
   then the explicit `--config PATH` overlay.
 
-Within each family, the implemented source order is base, primary, mutable state,
+Within each family, the implemented source order is base, primary, mutable
+state,
 environment overlay, CLI overlay, then explicitly selected scoped-local files.
 Later supplied fields replace earlier fields; absent fields remain inherited.
-Bterm's mutable state file is `config-overlay.toml` in its selected state directory.
+Bterm's mutable state file is `config-overlay.toml` in its selected state
+directory.
 `BTERM_BASE_CONFIG`/`BMUX_BASE_CONFIG` select base inputs; the corresponding
 `*_NO_BASE_CONFIG` switch suppresses the environment-selected base input.
 
 Resolve family composition and profiles independently, then apply the BMUX
-family over the BMUX fields of the Bterm superset. Only the Bterm family supplies
-`[bterm]` native settings; `[bterm]` in BMUX inputs is ignored. Thus a partial BMUX
+family over the BMUX fields of the Bterm superset. Only the Bterm family
+supplies
+`[bterm]` native settings; `[bterm]` in BMUX inputs is ignored. Thus a partial
+BMUX
 overlay replaces its supplied BMUX fields without erasing other superset fields.
 Do not deserialize each file with defaults
 and then merge: that would let an omitted field erase a supplied value. An
-explicit `false`, `0`, or empty collection is a value, not absence. Defaults belong
+explicit `false`, `0`, or empty collection is a value, not absence. Defaults
+belong
 after family/profile composition. Profile composition uses BMUX's existing
 `[composition]` model, including `active_profile`, profile inheritance,
 auto-selection, and `layer_order`. A forced profile applies independently to
@@ -48,7 +53,8 @@ An explicitly selected overlay that is missing, unreadable, or malformed must
 fail. It must not silently become an optional source or fall back to host state.
 Source-relative paths must retain their source context through composition.
 
-`--no-bmux-config` disables ordinary host BMUX configuration inheritance; it does
+`--no-bmux-config` disables ordinary host BMUX configuration inheritance; it
+does
 not disable BMUX itself or erase BMUX settings provided in the Bterm file.
 
 ## Superset file example
@@ -79,7 +85,8 @@ runtime, rewriting host configuration, or stopping a running companion.
 
 Managed runtime transports use `run/<kernel-boot-uuid>/` below the root on Linux
 and macOS; `config/`, `data/`, and `state/` remain durable. Runtime socket paths
-are length-limited, so use a short absolute root. Existing lifetime/compatibility
+are length-limited, so use a short absolute root. Existing
+lifetime/compatibility
 checks still apply; configuration must not bypass them.
 
 `--runtime-root ROOT` selects an external runtime, attach-only. Its explicit
@@ -103,11 +110,15 @@ folders, sockets, locks, snapshots, configuration files, or default files.
 Missing selected inputs and invalid execution contexts must remain errors even
 in inspection mode.
 
-The successful JSON output is a diagnostic summary, **not a configuration dump**.
-It includes a configuration generation, native window settings, source provenance,
+The successful JSON output is a diagnostic summary, **not a configuration
+dump**.
+It includes a configuration generation, native window settings, source
+provenance,
 a redacted BMUX marker, and an `execution` object. Execution mode is `managed`,
-`external`, `slot-attach`, or `sandbox-attach`, with selected configuration, runtime, data, and
-state paths. Arbitrary configuration values and environment contents are not part
+`external`, `slot-attach`, or `sandbox-attach`, with selected configuration,
+runtime, data, and
+state paths. Arbitrary configuration values and environment contents are not
+part
 of this JSON summary.
 
 Malformed TOML diagnostics identify the selected source without reproducing its
@@ -131,7 +142,8 @@ Inspection reports these roots without creating state or contacting the server.
 
 ## Reload behavior
 
-Configuration reload rereads the captured source selection rather than discovering
+Configuration reload rereads the captured source selection rather than
+discovering
 new host sources. If effective BMUX configuration or native settings differ from
 the startup snapshot, reload refuses the change and requires an explicit restart
 of the selected runtime before applying it. Bterm does not automatically restart
@@ -141,14 +153,16 @@ change with identical effective settings does not require that restart.
 ## Sandbox handoff and state isolation
 
 Sandbox execution is attach-only and requires a validated descriptor, selected
-with `--execution-context PATH` or `BTERM_EXECUTION_CONTEXT`. Bterm does not start
+with `--execution-context PATH` or `BTERM_EXECUTION_CONTEXT`. Bterm does not
+start
 or recover a companion from the descriptor's BMUX executable. Explicit runtime
 roots, companion selection, and CLI configuration overlays conflict with this
 handoff; new overlays require a new sandbox snapshot.
 
 A BMUX sandbox may supply a captured application execution context. Recognition
 must happen before stripping environment selectors or selecting Bterm defaults.
-A valid handoff supplies explicit configuration, runtime, data, state, temporary,
+A valid handoff supplies explicit configuration, runtime, data, state,
+temporary,
 and home paths, plus a validated BMUX artifact identity. That artifact is not a
 Bterm executable and is not automatically a verified Bterm companion bundle.
 
@@ -172,7 +186,8 @@ where needed, requires a separate security mechanism.
 ## Native decorations
 
 The native platform's creation-time `WindowOptions::decorations` defaults to
-`true`; `false` requests no native titlebar/chrome. This is native window policy,
+`true`; `false` requests no native titlebar/chrome. This is native window
+policy,
 not BMUX tab-bar or terminal presentation configuration. Removing chrome also
 removes its titlebar controls and drag affordance. It does not change plugin
 resource authority. Existing windows do not restyle through a live setter.

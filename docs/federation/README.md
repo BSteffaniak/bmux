@@ -1,6 +1,9 @@
 # bmux Federation Architecture Decisions
 
-This directory contains the accepted architecture decisions for native bmux server federation. Together they define the product semantics and implementation invariants that must be preserved while executing `local-server-cluster-federation-progress.md`.
+This directory contains the accepted architecture decisions for native bmux
+server federation. Together they define the product semantics and implementation
+invariants that must be preserved while executing
+`local-server-cluster-federation-progress.md`.
 
 ## Decision set
 
@@ -59,7 +62,8 @@ The decision set was reviewed against `AGENTS.md` on 2026-07-23.
 
 ### Plugin-owned domains
 
-The following belong in `plugins/cluster-plugin/**` and stable contracts in `plugins/cluster-plugin-api/**`:
+The following belong in `plugins/cluster-plugin/**` and stable contracts in
+`plugins/cluster-plugin-api/**`:
 
 - Membership and node roles
 - Consensus state machine and cluster persistence
@@ -69,7 +73,9 @@ The following belong in `plugins/cluster-plugin/**` and stable contracts in `plu
 - Promotion, cluster authorization orchestration, and audit events
 - Cluster attach composition and cluster-specific resume interpretation
 
-Transport target resolution and endpoint connection pooling should be owned by a neutral plugin domain such as `bmux.connections`, not by core and not by cluster-specific CLI branches.
+Transport target resolution and endpoint connection pooling should be owned by a
+neutral plugin domain such as `bmux.connections`, not by core and not by
+cluster-specific CLI branches.
 
 ### Permitted core primitives
 
@@ -81,12 +87,21 @@ Core architecture may provide only generic mechanisms:
 - Cancellation, deadlines, backpressure, logging, recording, and storage primitives
 - Neutral identifier newtypes required by generic protocols
 
-Core interfaces must not expose cluster IDs, membership, workspace placement, logical panes, worker policy, or gateway policy. `HostRuntimeApi` remains limited to its approved generic primitives.
+Core interfaces must not expose cluster IDs, membership, workspace placement,
+logical panes, worker policy, or gateway policy. `HostRuntimeApi` remains
+limited to its approved generic primitives.
 
 ### Plugin API boundary
 
-`cluster-plugin-api` may contain BPDL schemas, generated clients/services/events, stable wire/model types, schema tests, and intentional neutral re-exports. It must not contain consensus state, runtime managers, connection pools, registries, lifecycle behavior, background tasks, runtime IO, permission decisions, or handwritten public transport clients.
+`cluster-plugin-api` may contain BPDL schemas, generated
+clients/services/events, stable wire/model types, schema tests, and intentional
+neutral re-exports. It must not contain consensus state, runtime managers,
+connection pools, registries, lifecycle behavior, background tasks, runtime IO,
+permission decisions, or handwritten public transport clients.
 
 ## Change discipline
 
-When implementation contradicts an accepted ADR, do not silently work around it. Amend or supersede the ADR, record the reason and migration consequences, then update the local progress document. Open implementation choices that do not change these semantics may be resolved without superseding an ADR.
+When implementation contradicts an accepted ADR, do not silently work around it.
+Amend or supersede the ADR, record the reason and migration consequences, then
+update the local progress document. Open implementation choices that do not
+change these semantics may be resolved without superseding an ADR.

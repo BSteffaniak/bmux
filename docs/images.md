@@ -1,6 +1,9 @@
 # Images & Compression
 
-bmux supports inline terminal images through three protocols: **Sixel**, **Kitty Graphics**, and **iTerm2 inline images**. Images are automatically intercepted, stored in a per-pane registry, and re-emitted to the host terminal. They also appear in GIF recordings.
+bmux supports inline terminal images through three protocols: **Sixel**, **Kitty
+Graphics**, and **iTerm2 inline images**. Images are automatically intercepted,
+stored in a per-pane registry, and re-emitted to the host terminal. They also
+appear in GIF recordings.
 
 ## Supported Image Protocols
 
@@ -19,12 +22,17 @@ When a program running inside a bmux pane emits image escape sequences, bmux:
 3. **Re-emits** the image to the host terminal using the appropriate protocol for display
 4. **Tracks changes** -- when images scroll, move, or are removed, the registry updates automatically
 
-Applications can use the implemented image operations without a bmux-specific API. Compatibility depends on the host terminal, protocol operations, image format, and build features; support for a protocol does not imply support for every animation, transport, or placement extension. Test the applications and terminals you intend to use.
+Applications can use the implemented image operations without a bmux-specific
+API. Compatibility depends on the host terminal, protocol operations, image
+format, and build features; support for a protocol does not imply support for
+every animation, transport, or placement extension. Test the applications and
+terminals you intend to use.
 
 ## Scrollback Image Presentation
 
 Live output scrolling and attachment scrollback are different paths. Currently,
-inline images follow live output, but the attachment scrollback renderer does not
+inline images follow live output, but the attachment scrollback renderer does
+not
 consume captured image windows. Entering scrollback can therefore leave images
 positioned against live output while text displays history. Service-level image
 retention tests do not establish support for attachment scrollback rendering.
@@ -53,15 +61,18 @@ before admission; missing or evicted resources require explicit repair rather
 than silently displaying an incomplete window.
 
 Placements belong to the producer's own retained surface and use its geometry,
-clipping, stacking, and occlusion. They cannot target another owner's allocation.
+clipping, stacking, and occlusion. They cannot target another owner's
+allocation.
 Runtime content and plugin image placements must converge on the same retained
 compositor, not a second overlay ordering model. Reuse the neutral TUI image
 primitives and terminal presenter where compatible with these semantics.
 
 ### Atomic window and frame transitions
 
-The attachment-side plugin controller publishes complete text/image replacements,
-including empty image lists. It rejects responses for obsolete capture identities,
+The attachment-side plugin controller publishes complete text/image
+replacements,
+including empty image lists. It rejects responses for obsolete capture
+identities,
 request generations, dimensions, or attachment targets. Prefetched rows must be
 trimmed with the corresponding image origin adjustment; cached windows include
 both components and remain bounded.
@@ -81,13 +92,15 @@ placements without deleting unrelated terminal images.
 
 ### Required behavioral proof
 
-An attachment integration test must drive the production controller and presenter:
+An attachment integration test must drive the production controller and
+presenter:
 place an image beside identifiable text, scroll it offscreen, enter history,
 navigate away and back, append output while pinned, resize narrower and wider,
 and return live. Assert image identity, text-relative position, clipping, and
 removal at each transition. Include stale/out-of-order responses, unavailable
 captures, failed presentation, alternate-screen transitions, and image-disabled
-builds. Protocol-level coverage and a real PTY reproduction complement this test;
+builds. Protocol-level coverage and a real PTY reproduction complement this
+test;
 passing capture-service tests alone is insufficient.
 
 ## Testing Image Support
@@ -119,7 +132,8 @@ timg -pi /path/to/image.png
 
 ### Raw escape sequence test (no dependencies)
 
-You can test each protocol with raw escape sequences. This sends a tiny 1x1 red pixel:
+You can test each protocol with raw escape sequences. This sends a tiny 1x1 red
+pixel:
 
 **Kitty:**
 
@@ -135,7 +149,10 @@ printf '\ePq"1;1;1;1#0;2;100;0;0#0!6~-!6~-!6~-!6~-!6~-!6~\e\\'
 
 ## GIF Export with Images
 
-Images automatically appear in exported GIF recordings. When you record a session that displays images, bmux captures structured image data alongside the terminal text. During GIF export, images are decoded to pixels and composited onto the rasterized text frame.
+Images automatically appear in exported GIF recordings. When you record a
+session that displays images, bmux captures structured image data alongside the
+terminal text. During GIF export, images are decoded to pixels and composited
+onto the rasterized text frame.
 
 To record and export:
 
@@ -153,7 +170,8 @@ bmux recording export --format gif <recording-id-or-name>
 
 ### Optional auto-export for user-initiated recordings
 
-You can have bmux auto-export a GIF when you run user-initiated recording stop/cut flows (`bmux --record`, `bmux recording stop`, `bmux recording cut`).
+You can have bmux auto-export a GIF when you run user-initiated recording
+stop/cut flows (`bmux --record`, `bmux recording stop`, `bmux recording cut`).
 
 ```toml
 [recording]
@@ -176,7 +194,8 @@ bmux recording stop \
   --recording-auto-export-dir /tmp/bmux-gifs
 ```
 
-If auto-export cannot run (for example no display track data is present), bmux still completes the recording command and prints a warning.
+If auto-export cannot run (for example no display track data is present), bmux
+still completes the recording command and prints a warning.
 
 Supported decode formats in GIF export:
 
@@ -186,7 +205,8 @@ Supported decode formats in GIF export:
 
 ## Compression
 
-bmux compresses image data and remote connections to reduce bandwidth and improve performance. Compression is enabled by default and works transparently.
+bmux compresses image data and remote connections to reduce bandwidth and
+improve performance. Compression is enabled by default and works transparently.
 
 ### Configuration
 
@@ -236,7 +256,10 @@ remote = "none"
 
 ### Remote Compression Matching
 
-Both the client and the server gateway must have the same `remote` setting. If one side compresses and the other doesn't, the connection will fail. The default `auto` setting works correctly when both sides use the same bmux version and config.
+Both the client and the server gateway must have the same `remote` setting. If
+one side compresses and the other doesn't, the connection will fail. The default
+`auto` setting works correctly when both sides use the same bmux version and
+config.
 
 ## Image Configuration
 
@@ -268,7 +291,8 @@ max_images_per_pane = 100
 
 ### Images appearing in wrong positions after split/zoom
 
-This is expected during layout transitions. Images are re-fetched from the server with correct positions on the next render cycle.
+This is expected during layout transitions. Images are re-fetched from the
+server with correct positions on the next render cycle.
 
 ### Performance with many large images
 
@@ -278,4 +302,7 @@ This is expected during layout transitions. Images are re-fetched from the serve
 
 ### Remote connections failing with compression
 
-If TLS or Iroh connections fail immediately after connecting, the most likely cause is a compression mismatch. Ensure both the client and server gateway have the same `behavior.compression.remote` setting. Set both to `"none"` to diagnose.
+If TLS or Iroh connections fail immediately after connecting, the most likely
+cause is a compression mismatch. Ensure both the client and server gateway have
+the same `behavior.compression.remote` setting. Set both to `"none"` to
+diagnose.

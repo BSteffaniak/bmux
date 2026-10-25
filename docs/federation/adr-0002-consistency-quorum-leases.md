@@ -5,9 +5,15 @@
 
 ## Context
 
-Federation requires authoritative membership, workspace, layout, placement, and execution-generation metadata even when clients enter through different nodes. Allowing several nodes to mutate this state independently would permit duplicate executions, stale input routing, conflicting layouts, and unsafe membership changes.
+Federation requires authoritative membership, workspace, layout, placement, and
+execution-generation metadata even when clients enter through different nodes.
+Allowing several nodes to mutate this state independently would permit duplicate
+executions, stale input routing, conflicting layouts, and unsafe membership
+changes.
 
-Pane processes and terminal streams must remain available independently from control-leader lifetime. Therefore control metadata consistency and worker data flow require different mechanisms.
+Pane processes and terminal streams must remain available independently from
+control-leader lifetime. Therefore control metadata consistency and worker data
+flow require different mechanisms.
 
 ## Decision
 
@@ -20,7 +26,10 @@ Use established Raft to order durable cluster control mutations. [ADR-0015](adr-
 - **Ingress:** accepts clients and forwards authoritative operations; it may also be a voter and/or worker.
 - **Observer/edge:** receives cluster information and may serve ingress traffic without voting, subject to the consensus implementation's supported learner model.
 
-A production high-availability cluster requires at least three voters. One-voter mode may be supported for development or personal use with an explicit non-HA warning. Two voters provide no single-voter-failure write availability and must also warn.
+A production high-availability cluster requires at least three voters. One-voter
+mode may be supported for development or personal use with an explicit non-HA
+warning. Two voters provide no single-voter-failure write availability and must
+also warn.
 
 ### Write path
 
@@ -31,7 +40,8 @@ A production high-availability cluster requires at least three voters. One-voter
 5. Success is reported only after the entry and its result are durably committed according to consensus guarantees.
 6. The deduplication outcome is part of replicated state. A retry with the same command ID and principal returns the same logical outcome.
 
-A response lost after commit yields an unknown transport outcome, not permission to mint a new command ID. The client resolves or retries the original command.
+A response lost after commit yields an unknown transport outcome, not permission
+to mint a new command ID. The client resolves or retries the original command.
 
 ### Read classes
 
@@ -55,7 +65,9 @@ Without quorum:
 
 ### Control leases
 
-Workers must not accept indefinite mutation authority from a disconnected or deposed ingress. The leader may issue short-lived, signed/authenticated control leases scoped to:
+Workers must not accept indefinite mutation authority from a disconnected or
+deposed ingress. The leader may issue short-lived, signed/authenticated control
+leases scoped to:
 
 - Cluster and workspace
 - Logical pane and active execution generation
@@ -74,7 +86,10 @@ Lease rules:
 - Wall-clock time alone is not trusted for ordering. Lease validation uses authenticated issuance plus bounded duration and a monotonic local deadline established on receipt.
 - Node restart invalidates volatile lease acceptance state unless safely restored with current term validation.
 
-The initial maximum interactive control lease is **5 seconds**. This is short enough to bound stale control and long enough to bridge ordinary leader election. Phase 11 tests may justify a lower value; increasing it requires an ADR amendment because it expands split-brain exposure.
+The initial maximum interactive control lease is **5 seconds**. This is short
+enough to bound stale control and long enough to bridge ordinary leader
+election. Phase 11 tests may justify a lower value; increasing it requires an
+ADR amendment because it expands split-brain exposure.
 
 ### Fencing
 
@@ -98,7 +113,11 @@ The worker rejects:
 
 ### Membership safety
 
-Voter-set changes use the selected library's safe membership-change protocol, normally joint consensus. Nodes do not become voters merely because they possess a transport connection. Removal/revocation and consensus membership are coordinated so a removed node cannot regain control authority with stale credentials.
+Voter-set changes use the selected library's safe membership-change protocol,
+normally joint consensus. Nodes do not become voters merely because they possess
+a transport connection. Removal/revocation and consensus membership are
+coordinated so a removed node cannot regain control authority with stale
+credentials.
 
 ## State-machine requirements
 
@@ -135,8 +154,14 @@ Voter-set changes use the selected library's safe membership-change protocol, no
 
 ## Architecture placement
 
-Consensus state machine, leases, membership, and fencing policy live in `cluster-plugin`. Peer transport may use generic endpoint/stream primitives. No consensus- or cluster-specific variants are added to core IPC solely for federation; typed plugin services carry cluster RPC.
+Consensus state machine, leases, membership, and fencing policy live in
+`cluster-plugin`. Peer transport may use generic endpoint/stream primitives. No
+consensus- or cluster-specific variants are added to core IPC solely for
+federation; typed plugin services carry cluster RPC.
 
 ## Acceptance criteria
 
-A three-voter test cluster must repeatedly survive leader termination, preserve committed state, reject minority writes, deduplicate response-loss retries, fence stale terms/generations, and keep healthy worker processes running throughout.
+A three-voter test cluster must repeatedly survive leader termination, preserve
+committed state, reject minority writes, deduplicate response-loss retries,
+fence stale terms/generations, and keep healthy worker processes running
+throughout.

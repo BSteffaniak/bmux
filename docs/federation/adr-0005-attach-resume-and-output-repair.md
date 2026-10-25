@@ -5,9 +5,15 @@
 
 ## Context
 
-A federated attach combines control metadata and terminal data from executions on multiple workers. The client may reconnect through another ingress after transport or ingress failure. Terminal output can continue while disconnected, buffers are bounded, and independently sourced streams cannot share one global byte offset.
+A federated attach combines control metadata and terminal data from executions
+on multiple workers. The client may reconnect through another ingress after
+transport or ingress failure. Terminal output can continue while disconnected,
+buffers are bounded, and independently sourced streams cannot share one global
+byte offset.
 
-The design must avoid putting terminal data in consensus while preserving correct rendering, input fencing, and bounded resource use. Existing neutral attach/layout/scene/image protocols should be reused.
+The design must avoid putting terminal data in consensus while preserving
+correct rendering, input fencing, and bounded resource use. Existing neutral
+attach/layout/scene/image protocols should be reused.
 
 ## Decision
 
@@ -16,7 +22,9 @@ Use a two-level resume model:
 1. A **control revision** orders committed workspace/layout/execution-assignment state.
 2. A per-`(ExecutionId, ExecutionGeneration)` **output cursor** orders terminal output bytes/events produced by that worker execution.
 
-A client resumes by reconciling control state first, then each visible execution stream. Cursor gaps repair from a complete terminal snapshot rather than replaying through consensus.
+A client resumes by reconciling control state first, then each visible execution
+stream. Cursor gaps repair from a complete terminal snapshot rather than
+replaying through consensus.
 
 When persistent personal arrangements are negotiated, the [ADR-0012 personal-arrangement amendment](adr-0012-worker-output-and-attach-ownership.md#persistent-personal-arrangements-2026-09-09-amendment) governs their authority and resume semantics. The plugin-owned resume representation preserves selected view identity separately from attachment-local selection. Resume reauthenticates, resolves the authorized committed arrangement, and validates the selected reference and current execution authority before enabling input. It does not recreate resources from stale references or rewrite membership from incomplete catalog data. Deleted views and invalid selections require an explicit fallback or input-paused state. Existing v1 resume descriptors are not silently reinterpreted as supporting arrangements.
 
@@ -51,7 +59,8 @@ On reconnect:
 5. Repair any unavailable cursor range from a full snapshot.
 6. Resume input only after current generation and control authority are established.
 
-The descriptor contains no reusable private credential. Authentication is performed for the new connection.
+The descriptor contains no reusable private credential. Authentication is
+performed for the new connection.
 
 ## Output cursor semantics
 
@@ -65,7 +74,8 @@ The descriptor contains no reusable private credential. Authentication is perfor
 
 ## Snapshot semantics
 
-A full terminal snapshot contains everything required by the neutral attach renderer to resume correctly, including as applicable:
+A full terminal snapshot contains everything required by the neutral attach
+renderer to resume correctly, including as applicable:
 
 - Terminal grid and scrollback policy payload
 - Cursor and terminal modes
@@ -77,20 +87,27 @@ A full terminal snapshot contains everything required by the neutral attach rend
 - Execution ID/generation
 - Output cursor watermark after which deltas apply
 
-Snapshot and subsequent deltas use an atomic handoff: the worker captures a snapshot watermark and guarantees deltas strictly after that watermark are retained or streamed. Ingress must not combine a snapshot with an earlier-generation stream.
+Snapshot and subsequent deltas use an atomic handoff: the worker captures a
+snapshot watermark and guarantees deltas strictly after that watermark are
+retained or streamed. Ingress must not combine a snapshot with an
+earlier-generation stream.
 
-If some visual state cannot be serialized, the protocol explicitly invalidates that component using neutral attach-view change semantics; it does not silently render stale state.
+If some visual state cannot be serialized, the protocol explicitly invalidates
+that component using neutral attach-view change semantics; it does not silently
+render stale state.
 
 ## Ordering and composition
 
-There is no total order across independent pane output streams. The ingress/client preserves:
+There is no total order across independent pane output streams. The
+ingress/client preserves:
 
 - Total control revision order.
 - Per-execution output cursor order.
 - Causal rule that an execution is not rendered active before its assignment revision is applied.
 - Causal rule that output from an execution is not applied after a committed generation replacement/removal.
 
-Rendering order across panes follows normal frame/compositor scheduling and need not invent a distributed timestamp order.
+Rendering order across panes follows normal frame/compositor scheduling and need
+not invent a distributed timestamp order.
 
 ## Retention and backpressure
 
@@ -100,7 +117,9 @@ Rendering order across panes follows normal frame/compositor scheduling and need
 - Ingress applies per-client and per-worker flow control so one slow pane/client does not block unrelated panes.
 - Snapshot generation is rate-limited and coalesced per execution to prevent reconnect storms.
 
-The exact storage representation remains an implementation decision. These are observable guarantees, not a requirement to retain raw bytes in one specific structure.
+The exact storage representation remains an implementation decision. These are
+observable guarantees, not a requirement to retain raw bytes in one specific
+structure.
 
 ## Input during reconnect
 
@@ -122,7 +141,8 @@ The generic attach provider reports neutral states such as:
 - input paused/dropped
 - incompatible resume requiring clean reopen
 
-Cluster-specific explanation is supplied as provider status metadata, not hard-coded branches throughout core attach runtime.
+Cluster-specific explanation is supplied as provider status metadata, not
+hard-coded branches throughout core attach runtime.
 
 ## Consequences
 
@@ -149,8 +169,15 @@ Cluster-specific explanation is supplied as provider status metadata, not hard-c
 
 ## Architecture placement
 
-Generic attach snapshot/delta/cursor/provider mechanisms may live in neutral protocol/runtime crates. Cluster interpretation, worker fan-out, workspace revision reconciliation, candidate selection, and generation routing remain in cluster plugins. Existing local attach remains an implementation of the same generic provider semantics where practical.
+Generic attach snapshot/delta/cursor/provider mechanisms may live in neutral
+protocol/runtime crates. Cluster interpretation, worker fan-out, workspace
+revision reconciliation, candidate selection, and generation routing remain in
+cluster plugins. Existing local attach remains an implementation of the same
+generic provider semantics where practical.
 
 ## Acceptance criteria
 
-Tests must prove exact resume with retained cursors, snapshot repair after rollover, stale-generation output rejection, bounded slow-consumer memory, correct image/mode invalidation, safe input pause/drop, and successful resume through a different ingress without worker restart.
+Tests must prove exact resume with retained cursors, snapshot repair after
+rollover, stale-generation output rejection, bounded slow-consumer memory,
+correct image/mode invalidation, safe input pause/drop, and successful resume
+through a different ingress without worker restart.

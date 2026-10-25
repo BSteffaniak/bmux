@@ -2,7 +2,8 @@
 
 Reusable Markdown-to-terminal projection using canonical `bmux_tui::Line`,
 `Span`, and geometry types. Extracted from Bcode's markdown-render crate without
-rewriting rendering behavior. Applications retain interaction and resource authority.
+rewriting rendering behavior. Applications retain interaction and resource
+authority.
 
 ## API handoff
 
@@ -21,15 +22,18 @@ Images retain source/alt metadata and geometry while the text fallback remains
 `[image: description]`. The caller owns fetching, decoding, image lifecycle,
 terminal placement, link activation, selection/export effects, and slide state.
 Mermaid contributions expose source/output/fallback metadata without installing
-images or creating application state. Syntax rendering uses `bmux_syntax_render`.
+images or creating application state. Syntax rendering uses
+`bmux_syntax_render`.
 
 ## Compatibility and ownership
 
 All upstream fixtures and snapshot bodies are retained. Source mappings refer to
 canonical Markdown, not fallback strings reconstructed from terminal cells.
-The compatibility adapter's private `bcode-contribution:*` sentinel links are intentionally retained:
+The compatibility adapter's private `bcode-contribution:*` sentinel links are
+intentionally retained:
 these are parser/projection-adapter markers,
-not Bcode services or public activation targets. The original palette, destination
+not Bcode services or public activation targets. The original palette,
+destination
 rules, and Markdown extensions remain compatible. GitHub context is optional,
 caller-supplied destination metadata; no network access occurs here.
 
@@ -37,7 +41,8 @@ The extraction baseline uses HyperChad commit
 `82547e2d932e8ff4dc181808e9e58f0f63ce16e5`. Inspection found its Markdown,
 color, and transformer directories (including transformer models) byte-identical
 to BMUX's `5626b800db0d31deea3b4e1c16880bc2c4080cba`. Keep the existing coherent
-BMUX workspace URL/revision; no parser revision update is needed on this evidence.
+BMUX workspace URL/revision; no parser revision update is needed on this
+evidence.
 `hyperchad_markdown` needs workspace
 `xss-protection` plus this crate's `syntax-highlighting` feature.
 
@@ -46,17 +51,21 @@ BMUX workspace URL/revision; no parser revision update is needed on this evidenc
 The user explicitly authorized only `clippy::multiple_crate_versions` at this
 crate's root for incompatible upstream dependencies. HyperChad uses strum 0.28
 and thiserror 2; its unconditional Free Log client/models use strum 0.26 and
-thiserror 1. HyperChad's proptest/getrandom 0.3 branch also retains r-efi 5 while
-tempfile/jobserver's getrandom 0.4 uses r-efi 6. Lock-only unification cannot fix
+thiserror 1. HyperChad's proptest/getrandom 0.3 branch also retains r-efi 5
+while
+tempfile/jobserver's getrandom 0.4 uses r-efi 6. Lock-only unification cannot
+fix
 these incompatible requirements. Preserve the existing parser graph and fastrand
-2.3 lock selection; do not downgrade unrelated dependencies to silence this lint.
+2.3 lock selection; do not downgrade unrelated dependencies to silence this
+lint.
 All other crate-level lints remain enabled. The `render_markdown` function alone
 has a documented `too_many_lines` exception to keep canonical source, projected
 source, provenance, and diagnostic stage ordering readable together.
 
 ## Validation
 
-Run the workspace's required Nix clippy, nextest, and machete checks after workspace
+Run the workspace's required Nix clippy, nextest, and machete checks after
+workspace
 registration. The extraction lane deliberately did not run Cargo/build/test/fmt
 commands because the coordinator owns the shared target and lockfile. Regression
 coverage includes all original unit tests, Markdown fixtures, snapshots, and a

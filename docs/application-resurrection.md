@@ -1,27 +1,37 @@
 # Application resurrection: implementation contract
 
-Status: implemented for local Unix hosts. Bcode publishes session selection through
-an experimental host-independent control channel. The default-bundled, disableable
-BMUX plugin authenticates local peers, persists acknowledged descriptors, and uses
-v2 invocation identities to validate pane snapshot association. Shell markers are
-bound to each launch. Real-daemon tests cover direct launch, Bash replay, and manual
-launch isolation. The real Bcode TUI restart test passed with a freshly built Bcode
+Status: implemented for local Unix hosts. Bcode publishes session selection
+through
+an experimental host-independent control channel. The default-bundled,
+disableable
+BMUX plugin authenticates local peers, persists acknowledged descriptors, and
+uses
+v2 invocation identities to validate pane snapshot association. Shell markers
+are
+bound to each launch. Real-daemon tests cover direct launch, Bash replay, and
+manual
+launch isolation. The real Bcode TUI restart test passed with a freshly built
+Bcode
 binary and isolated state; the replayed launch omitted the original session ID.
 
 The cross-repository test is opt-in because it requires a Bcode binary. See
-`plugins/application-resurrection-plugin/README.md` for its command, supported scope,
+`plugins/application-resurrection-plugin/README.md` for its command, supported
+scope,
 and explicit recovery behavior. Nested/non-exec wrappers and remote applications
 are not automatically adopted. Same-user code with access to private integration
 files remains within the local trust boundary.
 
 ## Product outcome
 
-When a host resurrects a Bcode invocation, Bcode opens the persisted session that
+When a host resurrects a Bcode invocation, Bcode opens the persisted session
+that
 invocation was showing. Starting Bcode manually continues to use normal startup,
 even in the same pane after a resurrected invocation exits. Existing composer
-draft restoration is outside this change. Exact UI-state restoration is not a goal.
+draft restoration is outside this change. Exact UI-state restoration is not a
+goal.
 
-The application-facing contract is host-independent. BMUX supplies the first host
+The application-facing contract is host-independent. BMUX supplies the first
+host
 adapter as a dedicated, statically bundled, default-enabled, disableable plugin.
 Bcode must not require BMUX to publish or consume application recovery metadata.
 
@@ -71,10 +81,13 @@ alone are never sufficient evidence of restoration.
 
 ## Descriptor
 
-A versioned envelope identifies the application and an application-owned payload.
-Bcode's payload identifies the session and its storage authority. The latter must
+A versioned envelope identifies the application and an application-owned
+payload.
+Bcode's payload identifies the session and its storage authority. The latter
+must
 use Bcode's actual resolved state/context authority, not a guessed cwd or a
-transient daemon socket path. An endpoint address alone is not durable authority.
+transient daemon socket path. An endpoint address alone is not durable
+authority.
 
 The envelope must not include executable replacements, shell commands, arbitrary
 environment assignments, private credentials, permission grants, or prompt text.
@@ -83,7 +96,8 @@ Bcode's payload. Bcode validates its payload before opening the session through
 normal application boundaries. Missing or incompatible state is reported without
 opening an unrelated session or submitting work.
 
-A clear operation is explicit. A missing update must not be interpreted as clear,
+A clear operation is explicit. A missing update must not be interpreted as
+clear,
 and corrupt metadata must not become an apparently healthy empty descriptor.
 
 ## Invocation lifecycle
@@ -126,11 +140,14 @@ must not accidentally invalidate the pending restored command. A new prompt
 following the replayed command must invalidate it.
 
 Unsupported shells or ambiguous command ownership must produce an explicit
-unsupported/degraded result rather than silently treating a pane as an invocation.
+unsupported/degraded result rather than silently treating a pane as an
+invocation.
 Normal terminal operation and existing command resurrection remain available.
 
-A host-side claim must not permanently discard the only recovery descriptor before
-an application has successfully reopened its session. Separate durable descriptor
+A host-side claim must not permanently discard the only recovery descriptor
+before
+an application has successfully reopened its session. Separate durable
+descriptor
 retention from generation-bound delivery/claim state and define interruption
 behavior between claim, open, acknowledgement, and another host shutdown.
 
@@ -153,12 +170,14 @@ Do not introduce an arbitrary OSC number, claim an existing interoperability
 standard, or accept future command execution instructions from terminal output.
 Any terminal transport must define bounded parsing, fragmented sequences,
 forwarding/filtering, nested hosts, remote execution, capability discovery, and
-whether/how updates are acknowledged. An acknowledgement claiming durability must
+whether/how updates are acknowledged. An acknowledgement claiming durability
+must
 follow the required storage commit, not just an in-memory update.
 
 ## Persistence and shutdown
 
-BMUX currently seals its final snapshot before terminating its terminal processes.
+BMUX currently seals its final snapshot before terminating its terminal
+processes.
 Therefore Bcode publishes during ordinary session transitions, not only at exit.
 
 Descriptors must be captured coherently with the execution they describe. A

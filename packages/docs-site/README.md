@@ -40,7 +40,8 @@ This is not byte-for-byte or grammar parity with `env_logger`:
 The `logging` integration-test target exercises the same private initializer in
 isolated subprocesses, with redirected stderr and isolated filesystem paths.
 The existing library and application-binary test targets remain disabled. Run
-`cargo test -p bmux_docs_site --test logging` in the repository's Nix development
+`cargo test -p bmux_docs_site --test logging` in the repository's Nix
+development
 shell.
 
 ## Routes

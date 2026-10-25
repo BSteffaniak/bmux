@@ -2,7 +2,8 @@
 
 ## Opt-in pure benchmark
 
-`packages/image/benches/image_pipeline.rs` is a dependency-light `harness = false`
+`packages/image/benches/image_pipeline.rs` is a dependency-light `harness =
+false`
 benchmark. It generates fixed opaque eight-color RGBA fixtures and PNG bytes in
 memory. It never probes or writes graphics to a terminal. Default fixture:
 1280 × 720; default repetitions: 10. Select `--fixture palette` (default),
@@ -21,36 +22,46 @@ bash scripts/dev.sh cargo test -p bmux_image --features kitty,sixel,iterm2 \
 ```
 
 JSON output is JSON Lines, one object per case. Case names include fixture and
-dimensions, so results cannot silently mix input profiles. Capture stdout separately from
-Cargo diagnostics. Each case reports min/median/p95/max nanoseconds, sample count,
-output bytes, protocol command/chunk count, upload chunk count, source decode and
+dimensions, so results cannot silently mix input profiles. Capture stdout
+separately from
+Cargo diagnostics. Each case reports min/median/p95/max nanoseconds, sample
+count,
+output bytes, protocol command/chunk count, upload chunk count, source decode
+and
 fragment preparation deltas where available, and deterministic count stability.
 No duration is a pass/fail threshold. Work-count instability is an error, not a
 timing gate. Quantiles use sorted samples and integer indices (median `n/2`, p95
 `(n-1)*95/100`); small sample counts do not support tail-latency conclusions.
 
-Encoder cases isolate base64, bounded Kitty chunks, Sixel, and iTerm2 encoding of
+Encoder cases isolate base64, bounded Kitty chunks, Sixel, and iTerm2 encoding
+of
 pre-generated PNG. `encoder/sixel-reference` runs a frozen pre-optimization
-encoder from revision `73b533482f80`, in the same binary/profile on the identical
-fixture as `encoder/sixel`. It deliberately retains all 216 color scans per band,
+encoder from revision `73b533482f80`, in the same binary/profile on the
+identical
+fixture as `encoder/sixel`. It deliberately retains all 216 color scans per
+band,
 original quantization, allocation, palette order, and RLE behavior. The harness
 asserts exact reference/current byte equality outside timing. Compare their
 medians to compute a same-build speedup; no historical-machine timing is needed.
-The reference is benchmark/test-only, not a selectable production implementation.
+The reference is benchmark/test-only, not a selectable production
+implementation.
 PNG fixture construction is outside the encoder timing.
 Encoder byte counts exclude terminal framing. Scene byte counts include framing.
-Scene workloads cover cold/warm, movement, crop, hide/reveal, resize, replacement,
+Scene workloads cover cold/warm, movement, crop, hide/reveal, resize,
+replacement,
 and deletion for each host protocol. Attach additionally exercises overlay
 occlusion, a fresh-ID legacy baseline, and retained versus deliberately
 invalidated upload state. The clipped attach path clones a candidate, begins a
 frame, renders, finishes, then commits only after successful `Vec` output.
-Decode/preparation counts come from `KittyHostState::work_counts`; preparation is
+Decode/preparation counts come from `KittyHostState::work_counts`; preparation
+is
 not an independently measured scale count. Unsupported counters are zero (not
 proof of zero internal work). TUI scene reconciliation and fixture cloning are
 outside its render timing; attach candidate cloning is inside clipped timing.
 
 The attach benchmark calls public image compositor entry points, not the full
-CLI attach transport or PTY runtime. The TUI harness calls public scene and image
+CLI attach transport or PTY runtime. The TUI harness calls public scene and
+image
 adapter APIs, not a complete application cell renderer. Resize changes viewport
 and destination geometry; it is not a terminal scrollback/reflow simulation.
 The plain attach warm/fresh-ID path and clipped retained path are distinct APIs:
@@ -83,22 +94,27 @@ Historical user-provided isolated Kitty debug baseline: 1280 × 720 redraw,
 approximately 4.96 MB, 1200 upload chunks, 75–84 ms, with fresh IDs causing
 reupload. This lane did not execute it or establish machine/profile identity.
 The harness provides `attach/kitty/fresh-id-baseline` and
-`attach/kitty/invalidated-upload-baseline` to remeasure rather than treating that
+`attach/kitty/invalidated-upload-baseline` to remeasure rather than treating
+that
 observation as a universal target. Raw fixture size is 3,686,400 bytes; padded
 base64 payload is 4,915,200 bytes before headers/framing, split into 1200
 3072-byte raw chunks. Warm retained output should be assessed independently.
 
-There are **no flaky CI wall-clock performance gates**. Deterministic integration
+There are **no flaky CI wall-clock performance gates**. Deterministic
+integration
 tests cover base64 lengths/roundtrips, Kitty bounded chunks/continuations,
-iTerm2 body roundtrip/byte count, Sixel fixed-palette partial bands, and retained
+iTerm2 body roundtrip/byte count, Sixel fixed-palette partial bands, and
+retained
 compositor behavior, selected fixtures against frozen Sixel wire bytes, and
-injected partial-output repair without time thresholds. Coordinator owns compilation, full validation,
+injected partial-output repair without time thresholds. Coordinator owns
+compilation, full validation,
 and benchmark execution in the reserved shared build resource.
 
 ## Read-only transport/base64 audit
 
 Source observations from the initial ownership-v1 checkout (names are more
-stable than evolving line numbers; other lanes may subsequently implement these):
+stable than evolving line numbers; other lanes may subsequently implement
+these):
 
 - `codec/base64.rs::base64_encode` allocates the padded string and pushes four
   characters per three bytes. `base64_decode` allocates and accepts nonalphabet
@@ -135,11 +151,15 @@ lane. Suggestions require their owners' correctness review and measurements.
 ## TUI Sixel cold/warm audit (read-only)
 
 A reported warm sample slower than cold is not yet attributed by measurement.
-The current source path is `TuiImageCompositor::render` → `render_candidate` →
-`render_pane_images_clipped`. The clipped cache retains encoded non-Kitty output;
-`cache.find` success skips `emit_from_pixels` and Sixel encoding, then writes the
+The current source path is `TuiImageCompositor::render` → `render_candidate`
+→
+`render_pane_images_clipped`. The clipped cache retains encoded non-Kitty
+output;
+`cache.find` success skips `emit_from_pixels` and Sixel encoding, then writes
+the
 cached encoded bytes. Repeated encoding is therefore expected on misses,
-eviction, or changed source/crop/size/protocol/cell metrics, not an ordinary hit.
+eviction, or changed source/crop/size/protocol/cell metrics, not an ordinary
+hit.
 Sixel is stateless on the host: warm still emits its complete encoded image.
 
 Warm work that remains in the adapter:
@@ -159,7 +179,8 @@ Warm work that remains in the adapter:
   images. Candidate state destruction/allocation is part of the public render
   timing; scene reconciliation is not.
 
-At 1280 × 720 each RGBA clone is 3,686,400 bytes; do not interpret a zero encode
+At 1280 × 720 each RGBA clone is 3,686,400 bytes; do not interpret a zero
+encode
 or preparation counter as zero memory traffic. The public TUI adapter does not
 expose its decode/preparation counters, so the harness reports unavailable
 counts as zero there. A targeted owner follow-up could expose those counters,
@@ -174,11 +195,11 @@ candidate clones share source buffers and clip changes reuse the decoded source.
 On the Nix-selected Rust 1.96.0 toolchain, release profile with
 `kitty,sixel,iterm2`, 1280 × 720 fixtures:
 
-| Case | Reference median | Optimized median | Samples |
-| --- | ---: | ---: | ---: |
-| Palette Sixel encoding | 293.54 ms | 4.11 ms | 5 |
-| Detailed Sixel encoding | 353.50 ms | 46.45 ms | 3 |
-| Kitty deliberately invalidated upload / retained frame | 17.63 ms | 0.254 ms | 5 |
+| Case                                                   | Reference median | Optimized median | Samples |
+| ------------------------------------------------------ | ---------------: | ---------------: | ------: |
+| Palette Sixel encoding                                 |        293.54 ms |          4.11 ms |       5 |
+| Detailed Sixel encoding                                |        353.50 ms |         46.45 ms |       3 |
+| Kitty deliberately invalidated upload / retained frame |         17.63 ms |         0.254 ms |       5 |
 
 The frozen Sixel reference and optimized encoder produced identical bytes
 (144,262 palette; 4,115,157 detailed). The Kitty comparison used identical
@@ -223,10 +244,12 @@ size, selected image protocol, BMUX client and daemon artifact hashes and
 compatibility, isolated config/state endpoint, terminal size, and recording
 identity. Display the same fixture inside the nested pane, record cold and warm
 redraws, then movement, clipping/overlay, hide/reveal, resize/reflow,
-normal/alternate screen transitions, deletion/reset, and injected output failure.
+normal/alternate screen transitions, deletion/reset, and injected output
+failure.
 
 Capture wire bytes/chunks and decode/preparation counts alongside recording
-frames and verify scrollback anchors and committed output. CLI attach integration
+frames and verify scrollback anchors and committed output. CLI attach
+integration
 and rich presenter repro commands belong to the coordinator; this document does
 not invent a command or claim a nested run was performed. Keep nested timings
 separate from pure benchmark JSON and run release repetitions without a CI time

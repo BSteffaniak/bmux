@@ -6,7 +6,8 @@ Host-side plugin infrastructure for bmux.
 
 ## What This Crate Provides
 
-This crate is used by the bmux host runtime, not by plugin authors directly. It provides:
+This crate is used by the bmux host runtime, not by plugin authors directly. It
+provides:
 
 - **`PluginRegistry`** -- registers, validates, and indexes discovered plugins
 - **`NativePluginLoader`** / **`LoadedPlugin`** -- dynamic (`dlopen`) and static plugin loading
@@ -16,7 +17,8 @@ This crate is used by the bmux host runtime, not by plugin authors directly. It 
 - **`ServiceCaller`** -- trait for dispatching cross-plugin service calls (implemented for context types)
 - **`HostRuntimeApi`** -- ergonomic host service methods (`session_list`, `storage_get`, `context_create`, etc.)
 
-Plugins that call host services import `ServiceCaller` and `HostRuntimeApi` from this crate. Everything else comes from `bmux_plugin_sdk`.
+Plugins that call host services import `ServiceCaller` and `HostRuntimeApi` from
+this crate. Everything else comes from `bmux_plugin_sdk`.
 
 ## Design Notes
 

@@ -4,7 +4,8 @@ Data models and types for bmux event handling.
 
 ## Overview
 
-This package defines the event system data structures including keyboard events, mode transitions, and system events.
+This package defines the event system data structures including keyboard events,
+mode transitions, and system events.
 
 ## Features
 

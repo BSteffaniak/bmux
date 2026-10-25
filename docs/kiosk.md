@@ -1,6 +1,7 @@
 # Kiosk Access
 
-Use kiosk mode to grant SSH users controlled, token-based access to bmux sessions without exposing a general remote shell.
+Use kiosk mode to grant SSH users controlled, token-based access to bmux
+sessions without exposing a general remote shell.
 
 ## What Kiosk Mode Does
 
@@ -47,7 +48,8 @@ Kiosk config lives under `[kiosk]`:
 - `[kiosk.profiles.<name>]` applies per-profile overrides.
 - `[kiosk.files]` customizes output locations used by `bmux kiosk init`.
 
-Use one default SSH user via `kiosk.defaults.ssh_user` unless you need per-profile Unix users:
+Use one default SSH user via `kiosk.defaults.ssh_user` unless you need
+per-profile Unix users:
 
 ```bmux-config
 [kiosk.defaults]
@@ -101,7 +103,8 @@ Token behavior:
 
 ## SSH Integration
 
-`bmux kiosk issue-token` prints an `authorized_keys` example you can use directly:
+`bmux kiosk issue-token` prints an `authorized_keys` example you can use
+directly:
 
 ```text
 restrict,command="bmux kiosk attach demo --token <token>" <public-key>

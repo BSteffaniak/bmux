@@ -1,10 +1,14 @@
 # bmux_terminal_grid
 
-Neutral structured terminal grid primitives for bmux. The crate stores parsed terminal rows, style runs, cursor state, alternate-screen state, and soft-wrap metadata so retained scrollback can be reflowed on resize without replaying raw PTY bytes.
+Neutral structured terminal grid primitives for bmux. The crate stores parsed
+terminal rows, style runs, cursor state, alternate-screen state, and soft-wrap
+metadata so retained scrollback can be reflowed on resize without replaying raw
+PTY bytes.
 
 ## Embedding a transcript
 
-Keep the `TerminalGridStream` at the execution dimensions. Feed recorded output and
+Keep the `TerminalGridStream` at the execution dimensions. Feed recorded output
+and
 execution resize events in order. **Do not call `resize` for presentation-only
 changes**: it changes parser geometry, retention, and alternate-screen cells.
 
@@ -27,12 +31,14 @@ if let Some(anchor) = anchor {
 }
 ```
 
-`capture_content` copies only the requested logical tail, joins soft continuations
+`capture_content` copies only the requested logical tail, joins soft
+continuations
 across history and the live screen, and excludes unused trailing rectangle rows.
 It preserves styles (IDs refer to the source palette), explicit hard breaks, and
 wide-cell boundaries. It does not reconstruct text that the application omitted.
 
-A caller owns and reuses each capture. A width index costs O(captured cells) work
+A caller owns and reuses each capture. A width index costs O(captured cells)
+work
 and O(projected rows) metadata on a width change. Only one index is cached; a
 same-width preparation is O(1). Window projection touches selected cells rather
 than scanning the prefix of a long logical line. Capturing and indexing have
@@ -40,14 +46,17 @@ explicit cell-work and byte allowances; window allocations are also charged.
 Exhaustion returns `HistorySliceError::BudgetExhausted`, not partial success.
 A giant logical line that exceeds capture allowances requires an explicit larger
 budget or an unavailable presentation; this API does not silently clip a logical
-prefix. The older revision-fenced history-slice API remains available for streaming
+prefix. The older revision-fenced history-slice API remains available for
+streaming
 export; it is not required for repeated transcript projection.
 
 Anchors identify logical columns **within one capture**, not durable terminal
 identities. Reuse them across width changes. On live edits, eviction, reset, or
 recording replacement, create a new capture identity; resolving an old identity
-fails. `revision()` exposes the captured content revision for caller invalidation.
-`has_more_above`, `has_more_below`, and `history_truncated` distinguish a selected
+fails. `revision()` exposes the captured content revision for caller
+invalidation.
+`has_more_above`, `has_more_below`, and `history_truncated` distinguish a
+selected
 window from missing source history. This is not a persistent snapshot format.
 
 For live previews, use `grid.capture_viewport(identity, budget)` instead of
@@ -57,7 +66,8 @@ pending history, even when a long logical line crosses the viewport boundary.
 `viewport_prefix_continues()` identifies that case: the visible fragment starts
 at capture-local logical `(line: 0, column: 0)`, and widening cannot reveal its
 hidden prefix. Anchors and width preparation work identically to content
-captures. Alternate mode returns `Unavailable`; choose positioned cropping there.
+captures. Alternate mode returns `Unavailable`; choose positioned cropping
+there.
 
 For positioned output, use `screen_window(columns, rows, budget)` instead. It
 crops the active screen without reflow, accepts horizontal offsets, and blanks
@@ -68,7 +78,8 @@ choice between main-history projection and active-screen presentation.
 `ContentRows.sources` parallels `rows` and `anchors` with half-open logical
 source ranges. Their end columns count source cells, not display width: a wide
 glyph projected at width one still consumes two logical columns. Empty lines
-have equal start/end anchors but represent a visible row; `continues` distinguishes
+have equal start/end anchors but represent a visible row; `continues`
+distinguishes
 soft continuation (including outside the capture) from a hard end. An exclusive
 end is range metadata, not necessarily a resolvable content anchor. Consumers
 must not reconstruct these ranges from painted text. Range metadata is included
@@ -94,7 +105,8 @@ of its UTF-8 bytes, and combining characters remain with their source cell.
 Offsets are indexed once during capture, remain stable across width changes, and
 selected windows do not scan line prefixes. Metadata and cell work are budgeted.
 
-Use `export_text(capture, line, bytes, budget)` to copy those intervals. It rejects
+Use `export_text(capture, line, bytes, budget)` to copy those intervals. It
+rejects
 foreign captures, non-cell-aligned boundaries, and insufficient budgets. It does
 not invent newlines: join soft-wrapped fragments of one logical line directly;
 insert the caller's chosen separator only between hard-ended logical lines.
@@ -103,7 +115,8 @@ is normalized terminal text, not the original ANSI stream.
 
 For positioned screens, `screen_selection(revision, columns, rows, budget)`
 returns admitted text plus per-cell geometry and byte ranges in the full source
-row. `byte_start` locates the returned text in that row. Implicit blanks count as
+row. `byte_start` locates the returned text in that row. Implicit blanks count
+as
 spaces; clipped wide-glyph fragments have neither text nor selectable geometry.
 Scanning the source prefix to determine byte offsets is charged against the work
 allowance, but the prefix is not copied. Retain returned data with the committed

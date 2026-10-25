@@ -21,13 +21,15 @@ client can navigate tabs independently.
 ## Spawn-directory inspection (in development)
 
 Directory-aware creation is **not yet advertised by the bundled pane runtime**.
-Nondefault policies can currently fail with an unavailable spawn-interface error;
+Nondefault policies can currently fail with an unavailable spawn-interface
+error;
 these settings are not a claim that the end-to-end feature is shipped. Missing
 settings preserve the existing unspecified-CWD creation path.
 
 Tabs parses independent `cwd.new_pane` and `cwd.new_tab` policies under
 `[plugins.settings."bmux.tabs"]`. Each policy uses `source = "runtime-default"`,
-`"home"`, `"path"` (with an absolute `path`), or `"source-pane"` (with a required
+`"home"`, `"path"` (with an absolute `path`), or `"source-pane"` (with a
+required
 `fallback = "home"` or `"runtime-default"`). Paths are execution-host paths, not
 shell-expanded expressions. Fresh-shell options do not replace resurrection
 metadata. Workspace policy is not implemented by this plugin.
@@ -41,18 +43,24 @@ bmux explain-spawn-directory --operation pane --source-session UUID --source-pan
 ```
 
 The JSON report includes operation, structured policy, supplied source identity,
-resolved `cwd` or `error`, and `creation_validated: false`. A null CWD with no error
+resolved `cwd` or `error`, and `creation_validated: false`. A null CWD with no
+error
 means unspecified runtime CWD, not necessarily home. Without an explicit source,
-source-pane takes its configured fallback rather than another attachment's focus.
-Both source UUID options must be supplied together. `--cwd` overrides the policy.
-Resolution uses the plugin settings supplied by the host and the same resolver as
+source-pane takes its configured fallback rather than another attachment's
+focus.
+Both source UUID options must be supplied together. `--cwd` overrides the
+policy.
+Resolution uses the plugin settings supplied by the host and the same resolver
+as
 creation; this command does not yet explain configuration-layer provenance,
 observation method, or every fallback reason. A resolved fixed path has not been
 validated for availability by startup. An error is included in the JSON report.
 
-Do not edit a Home Manager `/nix/store` symlink to enable these settings. Edit the
+Do not edit a Home Manager `/nix/store` symlink to enable these settings. Edit
+the
 authoritative declarative source and activate it through its supported workflow
-only once the required runtime capability is available; source edits alone do not
+only once the required runtime capability is available; source edits alone do
+not
 verify effective behavior.
 
 ## Services

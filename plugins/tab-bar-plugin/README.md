@@ -55,8 +55,10 @@ unterminated placeholders remain visible. Tabs pack to the terminal width,
 retain the active item, and expose bounded interactive regions.
 
 Tabs wrap into 1–3 rows by default, growing only as needed. Configure
-`layout.min_rows` and `layout.max_rows` within 1–16, or set `layout.wrap = false`
-for one row. Labels do not split across rows; oversized labels clip, and overflow
+`layout.min_rows` and `layout.max_rows` within 1–16, or set `layout.wrap =
+false`
+for one row. Labels do not split across rows; oversized labels clip, and
+overflow
 navigation remains available at the row ceiling. Status modules appear once.
 Explicit legacy `height` preserves fixed-height single-row behavior and cannot
 be combined with the new row settings. See `docs/tab-presentations.md`.

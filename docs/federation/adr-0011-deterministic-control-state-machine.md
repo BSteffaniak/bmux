@@ -4,17 +4,29 @@
 - **Date:** 2026-07-24
 - **Amended by:** [ADR-0015](adr-0015-bmux-owned-consensus.md)
 
-ADR-0015 preserves this deterministic application contract. OpenRaft references below describe the current integration; the replacement supplies trusted apply context and committed voting configuration through its owned consensus adapter. Application member records still do not themselves grant voting authority.
+ADR-0015 preserves this deterministic application contract. OpenRaft references
+below describe the current integration; the replacement supplies trusted apply
+context and committed voting configuration through its owned consensus adapter.
+Application member records still do not themselves grant voting authority.
 
 ## Context
 
-Before OpenRaft network or storage wiring, BMUX needs a closed deterministic command and response model. Every voter must produce byte-identical logical state and stable command outcomes from the same committed log. Commands cannot read clocks, generate IDs, probe workers, consult configuration, or perform plugin IO while applying.
+Before OpenRaft network or storage wiring, BMUX needs a closed deterministic
+command and response model. Every voter must produce byte-identical logical
+state and stable command outcomes from the same committed log. Commands cannot
+read clocks, generate IDs, probe workers, consult configuration, or perform
+plugin IO while applying.
 
-The state machine must eventually own membership, logical workspaces/windows/layout, logical panes, placement intent, execution generations, restart policy, and command deduplication. Worker side effects are separate workflows driven after intent commits.
+The state machine must eventually own membership, logical
+workspaces/windows/layout, logical panes, placement intent, execution
+generations, restart policy, and command deduplication. Worker side effects are
+separate workflows driven after intent commits.
 
 ## Decision
 
-Use one versioned `ControlCommand` envelope and one versioned `ControlResponse` envelope. Stable wire/model definitions live in `cluster-plugin-api`; application and invariant enforcement live in `cluster-plugin`.
+Use one versioned `ControlCommand` envelope and one versioned `ControlResponse`
+envelope. Stable wire/model definitions live in `cluster-plugin-api`;
+application and invariant enforcement live in `cluster-plugin`.
 
 ## Command envelope
 
@@ -30,7 +42,11 @@ ControlCommand {
 }
 ```
 
-`principal_id` and `command_id` form the deduplication key. `issued_at_unix_ms` is supplied by the authorized leader and used only for deterministic retention/audit metadata; followers never read their local clocks while applying. Consensus log ID and term are supplied by OpenRaft apply context, not trusted from the request.
+`principal_id` and `command_id` form the deduplication key. `issued_at_unix_ms`
+is supplied by the authorized leader and used only for deterministic
+retention/audit metadata; followers never read their local clocks while
+applying. Consensus log ID and term are supplied by OpenRaft apply context, not
+trusted from the request.
 
 The initial command vocabulary is:
 
@@ -47,7 +63,11 @@ The initial command vocabulary is:
 - `complete-workflow`: record a stable terminal response/error for an intent-driven side-effect workflow.
 - `prune-dedup`: remove only terminal dedup records older than the replicated retention cutoff; incomplete workflows are never removed.
 
-Consensus membership configuration changes are driven through OpenRaft's learner/membership APIs. The application `upsert-member` record does not itself grant a Raft vote. Application membership credential activation/revocation and OpenRaft voter changes are coordinated workflows with separately committed steps.
+Consensus membership configuration changes are driven through OpenRaft's
+learner/membership APIs. The application `upsert-member` record does not itself
+grant a Raft vote. Application membership credential activation/revocation and
+OpenRaft voter changes are coordinated workflows with separately committed
+steps.
 
 ## Deterministic state
 
@@ -64,7 +84,9 @@ ControlState {
 }
 ```
 
-All maps are ordered by canonical full ID bytes. No hash-map iteration, locale comparison, filesystem ordering, or floating-point arithmetic is allowed in application logic.
+All maps are ordered by canonical full ID bytes. No hash-map iteration, locale
+comparison, filesystem ordering, or floating-point arithmetic is allowed in
+application logic.
 
 Each logical pane contains:
 
@@ -76,7 +98,9 @@ Each logical pane contains:
 - current execution tuple or none;
 - pane revision.
 
-The execution tuple is `(NodeId, ExecutionGeneration, ExecutionId)`. A replacement must commit a generation greater than the prior generation before any worker activation. Equality/reuse/regression is rejected.
+The execution tuple is `(NodeId, ExecutionGeneration, ExecutionId)`. A
+replacement must commit a generation greater than the prior generation before
+any worker activation. Equality/reuse/regression is rejected.
 
 ## Apply algorithm
 
@@ -93,7 +117,8 @@ For each committed application entry:
 7. Atomically persist state changes, last-applied metadata, membership metadata, and dedup result in the same storage transaction.
 8. Return the canonical response recorded in dedup.
 
-Panics are never an application response. Invalid committed bytes or impossible invariant violations stop the local consensus runtime as corruption.
+Panics are never an application response. Invalid committed bytes or impossible
+invariant violations stop the local consensus runtime as corruption.
 
 ## Responses and errors
 
@@ -119,7 +144,10 @@ Initial stable domain errors include:
 - `quorum-required` (generated before proposal/read, not by deterministic apply);
 - `not-leader` with optional authenticated leader hint (generated before proposal).
 
-Authorization failures occur before proposal and are not application state-machine outcomes. The authorized principal and decision inputs are nevertheless bound to the proposed command and audit record as required by ADR-0006.
+Authorization failures occur before proposal and are not application
+state-machine outcomes. The authorized principal and decision inputs are
+nevertheless bound to the proposed command and audit record as required by
+ADR-0006.
 
 ## Command-specific invariants
 
@@ -157,7 +185,8 @@ Authorization failures occur before proposal and are not application state-machi
 
 ## Canonical encoding
 
-BPDL JSON compatibility is for typed service transport and diagnostics; consensus persistence uses a separate canonical binary envelope:
+BPDL JSON compatibility is for typed service transport and diagnostics;
+consensus persistence uses a separate canonical binary envelope:
 
 - unsigned fixed-width integers in big-endian order;
 - UUIDs as 16 raw bytes;
@@ -169,7 +198,8 @@ BPDL JSON compatibility is for typed service transport and diagnostics; consensu
 - no floats, platform-sized integers, unknown fields, or unbounded allocation;
 - SHA-256 over the complete versioned request bytes for deduplication.
 
-A codec module in `cluster-plugin` owns these bytes and golden fixtures. Serde-derived Rust layout is not a durable consensus format.
+A codec module in `cluster-plugin` owns these bytes and golden fixtures.
+Serde-derived Rust layout is not a durable consensus format.
 
 ## Reads
 
@@ -179,7 +209,12 @@ A codec module in `cluster-plugin` owns these bytes and golden fixtures. Serde-d
 
 ## Side effects
 
-Applying a command never launches/closes a pane, contacts another node, emits terminal data, writes audit sinks, or checks permissions. It commits durable intent and a pending workflow. A leader-side reconciler executes idempotent typed worker operations and submits `complete-workflow` or subsequent generation-controlled commands. Leadership changes resume from replicated workflow state.
+Applying a command never launches/closes a pane, contacts another node, emits
+terminal data, writes audit sinks, or checks permissions. It commits durable
+intent and a pending workflow. A leader-side reconciler executes idempotent
+typed worker operations and submits `complete-workflow` or subsequent
+generation-controlled commands. Leadership changes resume from replicated
+workflow state.
 
 ## Migration
 

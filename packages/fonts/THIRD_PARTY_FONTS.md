@@ -1,6 +1,7 @@
 # Third-party bundled fonts
 
-This crate can optionally embed third-party font files for high-fidelity recording exports.
+This crate can optionally embed third-party font files for high-fidelity
+recording exports.
 
 ## Nerd Fonts JetBrains Mono preset
 

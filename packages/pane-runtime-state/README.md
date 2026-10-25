@@ -13,4 +13,5 @@ pane-runtime system:
 
 Depended on by both `packages/server` (connection-scoped consumers) and
 the `bmux.pane_runtime` plugin (owner of concrete state). Contains no
-PTY, tokio, or terminal parser primitives — those live in the plugin impl crate.
+PTY, tokio, or terminal parser primitives — those live in the plugin impl
+crate.

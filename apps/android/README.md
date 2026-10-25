@@ -21,7 +21,8 @@ M6 status: internal alpha packaging and dogfood process are now in place:
 - lightweight alpha telemetry in logcat (`BmuxAlpha`)
 - internal test checklist and failure-capture guide
 
-M7 status (in progress): terminal architecture has started with a renderer/transport
+M7 status (in progress): terminal architecture has started with a
+renderer/transport
 boundary and a native permissive renderer adapter (`org.connectbot:termlib`).
 
 ## UniFFI Kotlin Binding Task

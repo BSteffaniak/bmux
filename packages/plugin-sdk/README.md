@@ -4,7 +4,8 @@ Everything you need to write a bmux plugin.
 
 ## Quick Start
 
-A bmux plugin is a Rust crate with three files: a manifest, a library, and a `Cargo.toml`.
+A bmux plugin is a Rust crate with three files: a manifest, a library, and a
+`Cargo.toml`.
 
 ### 1. `plugin.toml`
 
@@ -60,11 +61,13 @@ bmux_plugin_sdk = { version = "..." }
 static-bundled = []
 ```
 
-`crate-type` must include `cdylib` (for dynamic loading) and `rlib` (for static bundling into the host binary).
+`crate-type` must include `cdylib` (for dynamic loading) and `rlib` (for static
+bundling into the host binary).
 
 ## The `RustPlugin` Trait
 
-Every plugin implements `RustPlugin`. All five methods have default implementations -- override only what your plugin needs:
+Every plugin implements `RustPlugin`. All five methods have default
+implementations -- override only what your plugin needs:
 
 | Method           | Return type                       | When to override                          |
 | ---------------- | --------------------------------- | ----------------------------------------- |
@@ -74,7 +77,8 @@ Every plugin implements `RustPlugin`. All five methods have default implementati
 | `deactivate`     | `Result<i32, PluginCommandError>` | Plugin needs cleanup on deactivation      |
 | `handle_event`   | `Result<i32, PluginCommandError>` | Plugin subscribes to system events        |
 
-The trait requires `Default + Send + 'static`. Use `#[derive(Default)]` on your struct.
+The trait requires `Default + Send + 'static`. Use `#[derive(Default)]` on your
+struct.
 
 ## Retained attach presentations
 
@@ -153,7 +157,8 @@ before they can use this path.
 
 ### Dispatching commands
 
-Use `route_command!` to match on the command name and auto-generate the unknown-command fallback:
+Use `route_command!` to match on the command name and auto-generate the
+unknown-command fallback:
 
 ```rust
 fn run_command(&mut self, ctx: NativeCommandContext) -> Result<i32, PluginCommandError> {
@@ -164,11 +169,13 @@ fn run_command(&mut self, ctx: NativeCommandContext) -> Result<i32, PluginComman
 }
 ```
 
-Each arm must evaluate to `Result<i32, PluginCommandError>`. Unrecognised commands automatically return `Err(PluginCommandError::unknown_command(...))`.
+Each arm must evaluate to `Result<i32, PluginCommandError>`. Unrecognised
+commands automatically return `Err(PluginCommandError::unknown_command(...))`.
 
 ### Error handling
 
-`PluginCommandError` implements `From` for common error types, so the `?` operator works naturally:
+`PluginCommandError` implements `From` for common error types, so the `?`
+operator works naturally:
 
 ```rust
 fn handle_list(ctx: &NativeCommandContext) -> Result<i32, PluginCommandError> {
@@ -179,7 +186,8 @@ fn handle_list(ctx: &NativeCommandContext) -> Result<i32, PluginCommandError> {
 }
 ```
 
-Supported conversions: `String`, `&str`, `std::io::Error`, `serde_json::Error`, `toml::de::Error`, `Box<dyn Error>`, `Box<dyn Error + Send + Sync>`.
+Supported conversions: `String`, `&str`, `std::io::Error`, `serde_json::Error`,
+`toml::de::Error`, `Box<dyn Error>`, `Box<dyn Error + Send + Sync>`.
 
 For custom error codes, construct directly:
 
@@ -199,7 +207,9 @@ Err(PluginCommandError::unavailable("feature not supported on this platform"))
 
 ### Arguments
 
-Commands receive arguments as `ctx.arguments: Vec<String>`. The host CLI layer handles parsing and validation based on the argument declarations in `plugin.toml` -- the plugin receives the parsed values as strings.
+Commands receive arguments as `ctx.arguments: Vec<String>`. The host CLI layer
+handles parsing and validation based on the argument declarations in
+`plugin.toml` -- the plugin receives the parsed values as strings.
 
 ## Writing Service Plugins
 
@@ -207,7 +217,8 @@ Service plugins handle inbound requests from other plugins or the host runtime.
 
 ### Dispatching services
 
-Use `route_service!` to match on `(interface_id, operation)` pairs. Each handler receives a typed request and returns a typed response:
+Use `route_service!` to match on `(interface_id, operation)` pairs. Each handler
+receives a typed request and returns a typed response:
 
 ```rust
 fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
@@ -220,13 +231,17 @@ fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
 }
 ```
 
-The macro wraps each handler in `handle_service()`, which handles request deserialization, response serialization, and error conversion. Unrecognised operations return a standard "unsupported" error.
+The macro wraps each handler in `handle_service()`, which handles request
+deserialization, response serialization, and error conversion. Unrecognised
+operations return a standard "unsupported" error.
 
-Request and response types must implement `serde::Deserialize` and `serde::Serialize` respectively.
+Request and response types must implement `serde::Deserialize` and
+`serde::Serialize` respectively.
 
 ### Returning errors from service handlers
 
-Service handler closures return `Result<Resp, ServiceResponse>`. Use `map_err` to convert domain errors:
+Service handler closures return `Result<Resp, ServiceResponse>`. Use `map_err`
+to convert domain errors:
 
 ```rust
 "my-service/v1", "create" => |req: CreateRequest, _ctx| {
@@ -237,7 +252,8 @@ Service handler closures return `Result<Resp, ServiceResponse>`. Use `map_err` t
 
 ### The `handle_service` function
 
-If you need more control than `route_service!` provides, use `handle_service` directly:
+If you need more control than `route_service!` provides, use `handle_service`
+directly:
 
 ```rust
 handle_service(&context, |req: MyRequest, ctx| {
@@ -271,13 +287,15 @@ The `bmux_plugin` crate provides two traits that live outside the SDK:
 - **`ServiceCaller`** -- the low-level trait for dispatching cross-plugin service calls
 - **`HostRuntimeApi`** -- ergonomic methods like `ctx.session_list()`, `ctx.storage_get(...)`, `ctx.context_create(...)`
 
-If your plugin calls host services (session management, storage, pane operations, etc.), add `bmux_plugin` as a dependency and import these traits:
+If your plugin calls host services (session management, storage, pane
+operations, etc.), add `bmux_plugin` as a dependency and import these traits:
 
 ```rust
 use bmux_plugin::{HostRuntimeApi, ServiceCaller};
 ```
 
-Simple plugins that only handle commands or receive service calls do **not** need `bmux_plugin`.
+Simple plugins that only handle commands or receive service calls do **not**
+need `bmux_plugin`.
 
 ## Manifest Reference (`plugin.toml`)
 

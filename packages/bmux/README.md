@@ -4,7 +4,9 @@ The main bmux library providing core functionality for the terminal multiplexer.
 
 ## Overview
 
-This package serves as the main entry point and orchestrates the various bmux components including session management, terminal handling, and event processing.
+This package serves as the main entry point and orchestrates the various bmux
+components including session management, terminal handling, and event
+processing.
 
 ## Features
 
@@ -14,4 +16,5 @@ This package serves as the main entry point and orchestrates the various bmux co
 
 ## Usage
 
-This is primarily used internally by the bmux CLI and other components. See the main bmux documentation for usage examples.
+This is primarily used internally by the bmux CLI and other components. See the
+main bmux documentation for usage examples.

@@ -5,7 +5,8 @@ choices and troubleshooting steps are easier to reason about.
 
 ## Canonical terminology
 
-This section is the vocabulary authority for BMUX code, contracts, configuration,
+This section is the vocabulary authority for BMUX code, contracts,
+configuration,
 commands, UI labels, and documentation. Distinct layers keep distinct names even
 when the ordinary single-terminal workflow maps them one-to-one.
 
@@ -57,13 +58,15 @@ wrap_selection = true
 `entry_format` supports the `{workspace}` and `{tab}` placeholders. Finder
 matching uses the workspace name only when `include_workspace_name` is true.
 
-Finder defaults now hide the current tab and show other tabs across all workspaces
+Finder defaults now hide the current tab and show other tabs across all
+workspaces
 in personal most-recently-visited order when the query is empty or whitespace.
 Filtering defaults to `relevance`: exact names/paths, prefixes, word-boundary
 matches, substrings, then scattered fuzzy matches. Equal-quality contiguous
 matches use opening order to break ties; loose matches use fuzzy score first.
 Clearing the query restores opening order. Set `filtered_sort_order = "inherit"`
-to preserve strict recency while filtering. `workspace_tab` follows workspace and tab
+to preserve strict recency while filtering. `workspace_tab` follows workspace
+and tab
 arrangements; `alphabetical` sorts displayed labels. These projections never
 rearrange the tab bar. `current_tab = "last"` places the current tab after other
 matches regardless of ranking; `in_order` treats it like any other result.

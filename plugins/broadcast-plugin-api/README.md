@@ -6,10 +6,12 @@ HTTP requests, and subprocess ownership live in `bmux_broadcast_plugin`.
 
 ## Local authorization
 
-Use `broadcast_control_v1::client::prepare_local` on a persistent BMUX connection.
+Use `broadcast_control_v1::client::prepare_local` on a persistent BMUX
+connection.
 It initializes the serving plugin's local capability and returns only a boolean,
 never a secret or filesystem path. The caller independently reads the 32-byte,
-owner-only `broadcast-local-proof` file in its selected `ConfigPaths.runtime_dir`,
+owner-only `broadcast-local-proof` file in its selected
+`ConfigPaths.runtime_dir`,
 then passes those bytes to `client::authorize` on the same connection. Proof
 possession authorizes that exact host-bound caller UUID; a UUID or plugin name
 alone does not authorize control. Grants are bounded and expire after five
@@ -21,11 +23,13 @@ All remaining control and producer operations require this local authorization.
 ## Controller contract
 
 One relay publication is selected at a time. Start/source require a source owned
-by the authenticated caller; pause/resume/stop require the selected publication's
+by the authenticated caller; pause/resume/stop require the selected
+publication's
 owner. Local proof does not grant another connection's view ownership. Fresh
 standalone command connections reject foreign controls with `source_not_owned`.
 Committed-view controls run through the owning attach's command path on the same
-connection that registers and publishes its source. Terminal-v1 is an independent
+connection that registers and publishes its source. Terminal-v1 is an
+independent
 read-only session observer, never an implicit committed-client-view selector.
 
 `broadcast_control_v1` exposes `start`, `pause`, `resume`, `stop`, `status`,
@@ -35,7 +39,8 @@ registers a retained terminal source using an explicit executable path, SHA-256,
 version, target UUID, and geometry; it does not choose an executable from PATH.
 
 `Status` separates `local` intent from `remote` acknowledgement and includes the
-selected `source_id` and an optional content-free `error_code`. Local stop closes
+selected `source_id` and an optional content-free `error_code`. Local stop
+closes
 the upload gate before remote acknowledgement; `stop_unacknowledged` does not
 claim that a remote frame has already disappeared. Startup is offline, and
 local rendering never depends on relay availability.
@@ -69,7 +74,8 @@ validate states/revisions outside rendering and clear/remove stale UI on loss.
 
 Use `broadcast_output_v1::client::{register, poll, publish, unregister}` on the
 same authorized persistent connection. Register an explicit source UUID; the
-server binds it to that connection's caller UUID. Register/poll renew a six-second
+server binds it to that connection's caller UUID. Register/poll renew a
+six-second
 lease. Poll at least every two seconds and unregister when the producer stops.
 Unselected expired registrations can be explicitly replaced; polling cannot
 revive them. A selected source UUID stays pinned to its owner across expiry or

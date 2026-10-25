@@ -29,13 +29,15 @@ interoperability and availability gates pass; enabling this feature does not
 currently remove it from the dependency graph.
 
 The Unix implementation uses pure-Rust `x11rb` and `wayland-client` transports,
-without requiring `libxcb.so.1` or `libwayland-client.so.0`. Windows and macOS use
+without requiring `libxcb.so.1` or `libwayland-client.so.0`. Windows and macOS
+use
 native system APIs/frameworks. Clipboard payloads are bounded to 256 MiB with
 explicit errors rather than silent truncation.
 
 Tests must not overwrite a live user clipboard. The ignored `native_interop`
 tests require both a disposable display and `BMUX_CLIPBOARD_ISOLATED_TEST=1`.
-Isolated Xvfb tests cover text/image roundtrips, large-text interoperability with
+Isolated Xvfb tests cover text/image roundtrips, large-text interoperability
+with
 xclip, and acknowledged clipboard-manager shutdown handoff. Isolated headless
 Sway tests cover text/image roundtrips and large-text interoperability with
 wl-copy/wl-paste. The X11 normal-exit hook requests a bounded manager handoff;

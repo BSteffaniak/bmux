@@ -30,7 +30,8 @@ identifiers does not change their tags, field order, schema versions, or bytes;
 existing recovery state remains canonical rather than being reconstructed from
 a presentation. The wire epoch separates incompatible public naming contracts.
 
-The Nix configuration source is `configs/bmux/bmux.toml`, consumed by its existing
+The Nix configuration source is `configs/bmux/bmux.toml`, consumed by its
+existing
 Home Manager module. Its source pin must point to a revision containing this
 cutover before deploying that configuration; do not switch the configuration
 against an old executable.
