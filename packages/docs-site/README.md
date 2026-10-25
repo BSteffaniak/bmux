@@ -46,6 +46,14 @@ shell.
 
 ## Routes
 
+`ui/src/doc_pages.rs` is the source of truth for documentation routes, sidebar
+sections, and Markdown link rewriting. Current guides are grouped into usage,
+browser/live, development, technical reference, and operations sections. See
+`../../docs/AGENTS.md` when adding documentation; the UI tests require every
+top-level `docs/*.md` file to be published or explicitly excluded with a reason.
+
+Selected routes:
+
 - `/` / `/home` -- landing page
 - `/docs/installation` -- build-from-source instructions
 - `/docs/quickstart` -- getting started guide
@@ -67,5 +75,3 @@ shell.
 - `/docs/plugin-ops` -- plugin operations playbook
 - `/docs/plugin-triage-playbook` -- plugin failure triage runbook
 - `/docs/plugin-perf-troubleshooting` -- plugin performance troubleshooting
-- `/docs/changelog` -- release history
-- `/faq` -- frequently asked questions
