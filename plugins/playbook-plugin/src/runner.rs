@@ -794,6 +794,46 @@ mod tests {
     }
 
     #[test]
+    fn unknown_preparation_lookup_does_not_create_or_settle_an_attempt() {
+        let mut owner = Owner::default();
+        let request_id = uuid::Uuid::new_v4().to_string();
+        for _ in 0..3 {
+            let error = owner.lookup_preparation(&request_id).unwrap_err();
+            assert!(error.contains("absence does not prove"));
+            assert!(owner.runs.is_empty());
+        }
+    }
+
+    #[test]
+    fn lost_preparation_reply_is_recovered_by_lookup_without_repreparing() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(
+            root.path().join("deck.playbook"),
+            "new-session name='approved'\n",
+        )
+        .unwrap();
+        let mut owner = Owner::default();
+        let request = specification(root.path());
+        // Model an admitted preparation whose response was lost. Recovery must
+        // not read/revalidate source or issue a second preparation mutation.
+        let admitted = owner.prepare(request.clone()).unwrap();
+        fs::remove_file(root.path().join("deck.playbook")).unwrap();
+        for _ in 0..3 {
+            let found = owner.lookup_preparation(&request.request_id).unwrap();
+            assert_eq!(found.generation, admitted.generation);
+            assert_eq!(found.phase, "prepared");
+            assert_eq!(found.cleanup_acknowledged, admitted.cleanup_acknowledged);
+            // Prepared is not terminal settlement, even before any child exists.
+            assert_ne!(found.phase, "stopped");
+        }
+        assert_eq!(owner.runs.len(), 1);
+        // A replacement owner cannot reinterpret absence as proof of cleanup.
+        let mut replacement = Owner::default();
+        assert!(replacement.lookup_preparation(&request.request_id).is_err());
+        assert!(replacement.runs.is_empty());
+    }
+
+    #[test]
     fn independent_attempts_do_not_replace_each_other_and_sources_are_pinned() {
         let root = tempfile::tempdir().unwrap();
         fs::write(

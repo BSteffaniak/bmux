@@ -272,16 +272,19 @@ fn versioned_prepare_rejects_checkpoint_from_another_invocation() {
     let launch = host
         .prepare_checked(&key, false, false, false, IdentityCheck::Expected(None))
         .unwrap();
-    assert!(
-        host.prepare_checked(
-            &key,
-            true,
-            false,
-            false,
-            IdentityCheck::Expected(Some("wrong-invocation"))
-        )
-        .is_err()
-    );
+    let file = directory.path().join(format!("{key}.json"));
+    let original = std::fs::read(&file).unwrap();
+    for expected in [Some("wrong-invocation"), None] {
+        let error = host
+            .prepare_checked(&key, true, false, false, IdentityCheck::Expected(expected))
+            .unwrap_err();
+        assert!(error.contains("does not match pane invocation"));
+        assert!(error.contains(&key));
+        assert!(error.contains(expected.unwrap_or("<missing>")));
+        assert!(error.contains(&launch.invocation));
+        assert!(error.contains("checkpoint preserved, resume refused"));
+        assert_eq!(std::fs::read(&file).unwrap(), original);
+    }
     let restored = host
         .prepare_checked(
             &key,

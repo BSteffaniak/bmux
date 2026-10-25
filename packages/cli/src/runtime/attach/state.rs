@@ -385,6 +385,8 @@ pub struct ClipboardSyncState {
     pub attempt_at: Option<Instant>,
     pub activity_at: Option<Instant>,
     pub payload_hash: Option<String>,
+    pub retry_after: Option<Instant>,
+    pub consecutive_failures: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

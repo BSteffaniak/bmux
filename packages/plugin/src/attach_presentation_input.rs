@@ -21,6 +21,35 @@ pub type AttachPresentationCommittedHandler = Arc<dyn Fn(u64) + Send + Sync>;
 
 pub type AttachPresentationResponseHandler = Arc<dyn Fn(&[u8]) -> AttachInputResult + Send + Sync>;
 
+/// Outcome of dispatch to a process-local presentation input endpoint.
+///
+/// Only `Unregistered` indicates that no local handler owns the endpoint.
+/// `Unhandled` is a local decline, not permission to retry through a remote
+/// service. A `Handled` result need not consume the event (for example, a
+/// handler may only update presentation).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AttachPresentationInputDispatch {
+    Unregistered,
+    Unhandled,
+    Handled(AttachInputResult),
+}
+
+impl AttachPresentationInputDispatch {
+    #[must_use]
+    pub const fn is_registered(&self) -> bool {
+        !matches!(self, Self::Unregistered)
+    }
+
+    /// Discard registration information for callers that do not route input.
+    #[must_use]
+    pub fn into_result(self) -> Option<AttachInputResult> {
+        match self {
+            Self::Handled(result) => Some(result),
+            Self::Unregistered | Self::Unhandled => None,
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct AttachPresentationInputRegistry {
     shortcuts: RwLock<BTreeMap<AttachInputEndpoint, AttachPresentationInputHandler>>,
@@ -86,17 +115,39 @@ impl AttachPresentationInputRegistry {
         }
     }
 
+    /// Dispatch locally without confusing an absent handler with a decline.
+    #[must_use]
+    pub fn dispatch(
+        &self,
+        endpoint: &AttachInputEndpoint,
+        event: &AttachInputEvent,
+    ) -> AttachPresentationInputDispatch {
+        // A poisoned lock does not establish absence. Recover the registered
+        // handler, and release the registry lock before invoking plugin code.
+        let handler = self
+            .handlers
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(endpoint)
+            .cloned();
+        handler.map_or(AttachPresentationInputDispatch::Unregistered, |handler| {
+            handler(event).map_or(
+                AttachPresentationInputDispatch::Unhandled,
+                AttachPresentationInputDispatch::Handled,
+            )
+        })
+    }
+
+    /// Invoke locally, discarding registration information.
+    ///
+    /// Routing callers should use [`Self::dispatch`] instead.
     #[must_use]
     pub fn invoke(
         &self,
         endpoint: &AttachInputEndpoint,
         event: &AttachInputEvent,
     ) -> Option<AttachInputResult> {
-        self.handlers
-            .read()
-            .ok()
-            .and_then(|handlers| handlers.get(endpoint).cloned())
-            .and_then(|handler| handler(event))
+        self.dispatch(endpoint, event).into_result()
     }
 
     pub fn register_focus_lost(
@@ -217,11 +268,19 @@ pub fn register_attach_presentation_input_handler(
 }
 
 #[must_use]
+pub fn dispatch_attach_presentation_input_handler(
+    endpoint: &AttachInputEndpoint,
+    event: &AttachInputEvent,
+) -> AttachPresentationInputDispatch {
+    global_attach_presentation_input_registry().dispatch(endpoint, event)
+}
+
+#[must_use]
 pub fn invoke_attach_presentation_input_handler(
     endpoint: &AttachInputEndpoint,
     event: &AttachInputEvent,
 ) -> Option<AttachInputResult> {
-    global_attach_presentation_input_registry().invoke(endpoint, event)
+    dispatch_attach_presentation_input_handler(endpoint, event).into_result()
 }
 
 pub fn remove_attach_presentation_input_handler(endpoint: &AttachInputEndpoint) {
@@ -253,6 +312,99 @@ mod tests {
         assert!(registry.notify_focus_lost(&endpoint, "owner:surface:region"));
         registry.remove(&endpoint);
         assert!(!registry.notify_focus_lost(&endpoint, "owner:surface:region"));
+    }
+
+    fn input_event() -> AttachInputEvent {
+        AttachInputEvent {
+            hook_id: String::new(),
+            event_kind: "pointer".to_string(),
+            phase: "move".to_string(),
+            button: None,
+            key: None,
+            col: Some(0),
+            row: Some(0),
+            wheel_delta: 0,
+            modifiers: crate::AttachInputModifiers::default(),
+            focused_pane: None,
+            hovered_pane: None,
+        }
+    }
+
+    fn input_endpoint() -> AttachInputEndpoint {
+        AttachInputEndpoint {
+            capability: "example.input".to_string(),
+            interface_id: "presentation-input".to_string(),
+            operation: "handle-input".to_string(),
+        }
+    }
+
+    #[test]
+    fn dispatch_distinguishes_absent_and_declining_handlers() {
+        let registry = AttachPresentationInputRegistry::new();
+        let endpoint = input_endpoint();
+        let mut event = input_event();
+        for kind in ["pointer", "key"] {
+            event.event_kind = kind.to_string();
+            assert!(matches!(
+                registry.dispatch(&endpoint, &event),
+                AttachPresentationInputDispatch::Unregistered
+            ));
+            assert!(!registry.dispatch(&endpoint, &event).is_registered());
+            assert!(registry.invoke(&endpoint, &event).is_none());
+            registry.register(endpoint.clone(), Arc::new(|_| None));
+            assert!(matches!(
+                registry.dispatch(&endpoint, &event),
+                AttachPresentationInputDispatch::Unhandled
+            ));
+            assert!(registry.dispatch(&endpoint, &event).is_registered());
+            assert!(registry.invoke(&endpoint, &event).is_none());
+            registry.remove(&endpoint);
+        }
+    }
+
+    #[test]
+    fn dispatch_preserves_handled_results_even_when_not_consumed() {
+        let registry = AttachPresentationInputRegistry::new();
+        let endpoint = input_endpoint();
+        let event = input_event();
+        for consumed in [false, true] {
+            registry.register(
+                endpoint.clone(),
+                Arc::new(move |_| {
+                    Some(AttachInputResult {
+                        consumed,
+                        dirty: true,
+                        ..AttachInputResult::default()
+                    })
+                }),
+            );
+            let outcome = registry.dispatch(&endpoint, &event);
+            assert!(outcome.is_registered());
+            let AttachPresentationInputDispatch::Handled(result) = outcome else {
+                panic!("registered handler returned a result");
+            };
+            assert_eq!(result.consumed, consumed);
+            assert!(result.dirty);
+            let legacy = registry.invoke(&endpoint, &event).unwrap();
+            assert_eq!(legacy.consumed, consumed);
+            assert!(legacy.dirty);
+        }
+    }
+
+    #[test]
+    fn dispatch_recovers_registration_from_a_poisoned_lock() {
+        let registry = AttachPresentationInputRegistry::new();
+        let endpoint = input_endpoint();
+        registry.register(endpoint.clone(), Arc::new(|_| None));
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = registry.handlers.write().unwrap();
+            panic!("poison registry lock");
+        }));
+        assert!(poisoned.is_err());
+        assert!(matches!(
+            registry.dispatch(&endpoint, &input_event()),
+            AttachPresentationInputDispatch::Unhandled
+        ));
     }
 
     #[test]

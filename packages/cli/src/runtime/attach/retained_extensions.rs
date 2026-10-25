@@ -29,9 +29,18 @@ struct RetainedExtension {
 }
 impl RetainedExtension {
     fn surface(&self, id: Uuid, rect: ExtensionRect) -> Option<&Surface> {
-        self.surfaces
-            .iter()
-            .find(|surface| surface.id == id && surface.rect == rect)
+        self.surfaces.iter().find(|surface| {
+            // Intent is sampled in authoritative geometry. Composition may use
+            // a viewport-clipped subrectangle; lowering still owns clipping and
+            // must not mistake that geometry for an imperative-only extension.
+            surface.id == id
+                && rect.x >= surface.rect.x
+                && rect.y >= surface.rect.y
+                && u32::from(rect.x) + u32::from(rect.w)
+                    <= u32::from(surface.rect.x) + u32::from(surface.rect.w)
+                && u32::from(rect.y) + u32::from(rect.h)
+                    <= u32::from(surface.rect.y) + u32::from(surface.rect.h)
+        })
     }
     fn layer(&self, id: Uuid, rect: ExtensionRect, layer: RenderExtensionLayer) -> Option<&Layer> {
         self.surface(id, rect)?
@@ -218,4 +227,262 @@ pub(super) fn refresh(
         }));
     }
     Ok(retained)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bmux_plugin::{RenderSceneItem, RenderStyle};
+
+    #[derive(Clone, Copy)]
+    enum Representation {
+        Scene,
+        EmptyScene,
+        Items,
+        EmptyOps,
+        ImperativeOnly,
+    }
+
+    struct Source(Representation);
+
+    impl AttachRenderExtension for Source {
+        fn name(&self) -> &'static str {
+            "test.retained"
+        }
+
+        fn render_layer_scene_with_context(
+            &self,
+            _: Uuid,
+            _: &ExtensionRect,
+            _: RenderExtensionLayer,
+            _: &RenderExtensionContext,
+        ) -> Option<RenderLayerScene> {
+            match self.0 {
+                Representation::Scene => Some(RenderLayerScene::new(
+                    Some(7),
+                    vec![RenderSceneItem::text(
+                        "label",
+                        0,
+                        2,
+                        3,
+                        "kept",
+                        RenderStyle::new(),
+                    )],
+                )),
+                Representation::EmptyScene => Some(RenderLayerScene::new(Some(7), Vec::new())),
+                _ => None,
+            }
+        }
+
+        fn render_layer_items_with_context(
+            &self,
+            _: Uuid,
+            _: &ExtensionRect,
+            _: &RenderDamage,
+            _: RenderExtensionLayer,
+            _: &RenderExtensionContext,
+        ) -> Option<Vec<RenderLayerItem>> {
+            match self.0 {
+                Representation::Scene | Representation::EmptyScene => {
+                    panic!("a selected retained scene must not probe lower representations")
+                }
+                Representation::Items => Some(vec![RenderLayerItem::Op(RenderOp::text_run(
+                    2,
+                    3,
+                    "kept",
+                    RenderStyle::new(),
+                ))]),
+                _ => None,
+            }
+        }
+
+        fn render_layer_ops_with_context(
+            &self,
+            _: Uuid,
+            _: &ExtensionRect,
+            _: &RenderDamage,
+            _: RenderExtensionLayer,
+            _: &RenderExtensionContext,
+        ) -> Option<Vec<RenderOp>> {
+            match self.0 {
+                Representation::EmptyOps => Some(Vec::new()),
+                Representation::ImperativeOnly => None,
+                _ => panic!("a selected representation must not probe operations"),
+            }
+        }
+
+        fn render_surface(
+            &self,
+            _: &mut dyn std::io::Write,
+            _: Uuid,
+            _: &ExtensionRect,
+            _: &RenderDamage,
+        ) -> std::io::Result<bool> {
+            panic!("sampling must never invoke imperative drawing")
+        }
+    }
+
+    fn snapshot(representation: Representation) -> Arc<dyn AttachRenderExtension> {
+        let sources: Vec<Arc<dyn AttachRenderExtension>> = vec![Arc::new(Source(representation))];
+        refresh(
+            &sources,
+            &[(
+                Uuid::from_u128(1),
+                ExtensionRect::new(2, 3, 80, 24),
+                RenderExtensionContext::default(),
+            )],
+        )
+        .expect("sample intent")
+        .remove(0)
+    }
+
+    #[test]
+    fn viewport_clipping_preserves_retained_scene_and_items() {
+        let id = Uuid::from_u128(1);
+        let rect = ExtensionRect::new(2, 3, 38, 17);
+        let context = RenderExtensionContext::default();
+        for layer in [
+            RenderExtensionLayer::BeforePaneContent,
+            RenderExtensionLayer::AfterPaneContent,
+        ] {
+            let retained = snapshot(Representation::Scene);
+            let scene = retained
+                .render_layer_scene_with_context(id, &rect, layer, &context)
+                .expect("clipped surface must retain its scene representation");
+            assert_eq!(scene.revision, Some(7));
+            assert_eq!(scene.items.len(), 1);
+            assert_eq!(
+                scene.items[0],
+                RenderSceneItem::text("label", 0, 2, 3, "kept", RenderStyle::new()),
+            );
+
+            let retained = snapshot(Representation::Items);
+            assert!(
+                retained
+                    .render_layer_scene_with_context(id, &rect, layer, &context)
+                    .is_none()
+            );
+            let items = retained
+                .render_layer_items_with_context(
+                    id,
+                    &rect,
+                    &RenderDamage::FullSurface,
+                    layer,
+                    &context,
+                )
+                .expect("clipped surface must retain its item representation");
+            assert_eq!(items.len(), 1);
+        }
+    }
+
+    #[test]
+    fn empty_retained_output_does_not_select_imperative_fallback() {
+        let id = Uuid::from_u128(1);
+        let rect = ExtensionRect::new(2, 3, 38, 17);
+        let context = RenderExtensionContext::default();
+        let layer = RenderExtensionLayer::AfterPaneContent;
+        let scene = snapshot(Representation::EmptyScene)
+            .render_layer_scene_with_context(id, &rect, layer, &context)
+            .expect("empty scene is a supported representation");
+        assert!(scene.items.is_empty());
+        let ops = snapshot(Representation::EmptyOps)
+            .render_layer_ops_with_context(id, &rect, &RenderDamage::FullSurface, layer, &context)
+            .expect("empty operations are a supported no-op");
+        assert!(ops.is_empty());
+    }
+
+    #[test]
+    fn unsampled_surface_or_geometry_does_not_reuse_retained_intent() {
+        let retained = snapshot(Representation::Scene);
+        for (id, rect) in [
+            (Uuid::from_u128(2), ExtensionRect::new(2, 3, 80, 24)),
+            (Uuid::from_u128(1), ExtensionRect::new(1, 3, 80, 24)),
+            (Uuid::from_u128(1), ExtensionRect::new(2, 3, 81, 24)),
+        ] {
+            assert!(
+                retained
+                    .render_layer_scene_with_context(
+                        id,
+                        &rect,
+                        RenderExtensionLayer::AfterPaneContent,
+                        &RenderExtensionContext::default(),
+                    )
+                    .is_none(),
+                "unsampled geometry must not reuse another surface's intent"
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_backpressure_does_not_change_retained_representation() {
+        struct BackpressuredTerminal;
+        impl std::io::Write for BackpressuredTerminal {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::ErrorKind::WouldBlock.into())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                panic!("failed delivery must not flush or claim success")
+            }
+        }
+
+        let retained = snapshot(Representation::Scene);
+        let id = Uuid::from_u128(1);
+        let rect = ExtensionRect::new(2, 3, 38, 17);
+        let context = RenderExtensionContext::default();
+        let layer = RenderExtensionLayer::AfterPaneContent;
+        let before = retained
+            .render_layer_scene_with_context(id, &rect, layer, &context)
+            .expect("retained intent before blocked delivery");
+        let error =
+            bmux_attach_pipeline::terminal::write_frame(&mut BackpressuredTerminal, b"frame")
+                .expect_err("blocked consumer is a delivery error, not successful output");
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        let after = retained
+            .render_layer_scene_with_context(id, &rect, layer, &context)
+            .expect("blocked delivery must not select imperative rendering");
+        assert_eq!(before.items, after.items);
+        assert_eq!(before.revision, after.revision);
+    }
+
+    #[test]
+    fn imperative_only_output_remains_rejected_without_touching_terminal() {
+        struct BlockedTerminal;
+        impl std::io::Write for BlockedTerminal {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                panic!("representation rejection must not wait for a slow terminal")
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                panic!("representation rejection must not flush a slow terminal")
+            }
+        }
+
+        let retained = snapshot(Representation::ImperativeOnly);
+        let id = Uuid::from_u128(1);
+        let rect = ExtensionRect::new(2, 3, 38, 17);
+        let context = RenderExtensionContext::default();
+        let layer = RenderExtensionLayer::AfterPaneContent;
+        assert!(
+            retained
+                .render_layer_scene_with_context(id, &rect, layer, &context)
+                .is_none()
+        );
+        assert!(
+            retained
+                .render_layer_ops_with_context(
+                    id,
+                    &rect,
+                    &RenderDamage::FullSurface,
+                    layer,
+                    &context
+                )
+                .is_none()
+        );
+        let error = retained
+            .render_surface(&mut BlockedTerminal, id, &rect, &RenderDamage::FullSurface)
+            .expect_err("unsupported output must not be silently treated as a no-op");
+        assert_eq!(
+            error.to_string(),
+            "imperative presentation is unsupported by retained output"
+        );
+    }
 }

@@ -2276,6 +2276,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ignored_pointer_events_remain_registered_local_declines() {
+        let resources = scoped_resources();
+        let presentation = TabBarPresentation::install(None, &resources).unwrap();
+        let id = Uuid::from_u128(7);
+        seed_input_owner(&presentation.owner, id);
+        let mut event = AttachInputEvent {
+            hook_id: format!("bmux.tab_bar:strip:tab:{id}"),
+            event_kind: "pointer".to_string(),
+            phase: "up".to_string(),
+            button: Some("middle".to_string()),
+            key: None,
+            col: Some(3),
+            row: Some(0),
+            wheel_delta: 0,
+            modifiers: bmux_plugin::AttachInputModifiers::default(),
+            focused_pane: None,
+            hovered_pane: None,
+        };
+        let revision = presentation
+            .owner
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .revision;
+        for phase in ["up", "leave", "wheel"] {
+            event.phase = phase.to_string();
+            let outcome = resources.input.dispatch(&input_endpoint(), &event);
+            // A local decline must not be mistaken for an absent route and
+            // retried as a remote presentation service invocation.
+            assert!(outcome.is_registered(), "{phase}");
+            assert!(outcome.into_result().is_none(), "{phase}");
+        }
+        event.hook_id = "bmux.tab_bar:strip:padding".to_string();
+        for phase in ["move", "down"] {
+            event.phase = phase.to_string();
+            let outcome = resources.input.dispatch(&input_endpoint(), &event);
+            assert!(outcome.is_registered(), "padding {phase}");
+            assert!(outcome.into_result().is_none(), "padding {phase}");
+        }
+        assert_eq!(
+            presentation
+                .owner
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .revision,
+            revision
+        );
+        event.hook_id = format!("bmux.tab_bar:strip:tab:{id}");
+        event.phase = "down".to_string();
+        event.button = Some("right".to_string());
+        let outcome = resources.input.dispatch(&input_endpoint(), &event);
+        assert!(outcome.is_registered());
+        let handled = outcome.into_result().unwrap();
+        assert!(handled.consumed);
+        assert!(handled.service_invocation.is_none());
+    }
+
+    #[tokio::test]
     async fn scoped_input_keeps_menu_paste_and_focus_on_the_owner() {
         let first_resources = scoped_resources();
         let second_resources = scoped_resources();

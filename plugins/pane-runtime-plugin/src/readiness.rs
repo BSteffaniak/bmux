@@ -34,6 +34,14 @@ fn resolution_error(version: Option<u32>, error: Option<&str>) -> Option<String>
                 .to_owned(),
         ),
     }
+    .map(|cause| {
+        format!(
+            "{cause}; install/rebuild the matching pane-runtime plugin package with its \
+             bmux-pane-execution-supervisor auxiliary artifact in the selected runtime's \
+             authoritative package location, then explicitly restart that runtime when safe; \
+             PATH helpers and direct-PTY fallback are not supported"
+        )
+    })
 }
 
 fn sha256(path: &std::path::Path) -> std::io::Result<String> {
@@ -263,9 +271,16 @@ mod tests {
             "permission denied",
             "inventory mismatch",
         ] {
-            assert_eq!(resolution_error(None, Some(error)).as_deref(), Some(error));
+            let diagnostic = resolution_error(None, Some(error)).unwrap();
+            assert!(diagnostic.starts_with(error));
+            assert!(diagnostic.contains("bmux-pane-execution-supervisor"));
+            assert!(diagnostic.contains("selected runtime"));
+            assert!(diagnostic.contains("explicitly restart that runtime when safe"));
+            assert!(diagnostic.contains("PATH helpers and direct-PTY fallback are not supported"));
         }
-        assert!(resolution_error(None, None).is_some());
+        let missing = resolution_error(None, None).unwrap();
+        assert!(missing.contains("not resolved at plugin activation"));
+        assert!(missing.contains("matching pane-runtime plugin package"));
         assert!(
             resolution_error(Some(0), None)
                 .unwrap()

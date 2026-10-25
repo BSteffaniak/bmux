@@ -27,6 +27,26 @@ pub enum ClipboardError {
     CommandFailed { program: String, message: String },
 }
 
+/// Stable, backend-independent failure classification for retry policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClipboardErrorKind {
+    Unavailable,
+    OperationalFailure,
+}
+
+impl ClipboardError {
+    /// Classify absence separately from a backend that was selected but failed.
+    #[must_use]
+    pub const fn kind(&self) -> ClipboardErrorKind {
+        match self {
+            Self::BackendUnavailable { .. } => ClipboardErrorKind::Unavailable,
+            Self::BackendFailed { .. } | Self::CommandFailed { .. } => {
+                ClipboardErrorKind::OperationalFailure
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Clipboard {
     command: ClipboardCommand,
@@ -47,9 +67,12 @@ impl Clipboard {
     where
         F: FnMut(&str) -> bool,
     {
-        detect_backend(os, &mut exists)
-            .map(|command| Self { command })
-            .ok_or_else(|| ClipboardError::BackendUnavailable { os: os.to_string() })
+        let displays = ClipboardDisplays::detect();
+        detect_backend(os, &mut |program| {
+            displays.supports(os, program) && exists(program)
+        })
+        .map(|command| Self { command })
+        .ok_or_else(|| ClipboardError::BackendUnavailable { os: os.to_string() })
     }
 
     /// Copy text to the system clipboard.
@@ -63,13 +86,18 @@ impl Clipboard {
     /// cannot be spawned, stdin writing fails, or the command exits with a
     /// non-zero status.
     pub fn copy_text(&self, text: &str) -> Result<(), ClipboardError> {
+        let displays = ClipboardDisplays::detect();
         copy_with_commands(
-            std::iter::once(self.command).chain(
-                clipboard_commands(env::consts::OS)
-                    .iter()
-                    .copied()
-                    .filter(|command| *command != self.command && command_exists(command.program)),
-            ),
+            std::iter::once(self.command)
+                .chain(
+                    clipboard_commands(env::consts::OS)
+                        .iter()
+                        .copied()
+                        .filter(|command| {
+                            *command != self.command && command_exists(command.program)
+                        }),
+                )
+                .filter(|command| displays.supports(env::consts::OS, command.program)),
             Vec::new(),
             |command| run_copy_command(command, text),
         )
@@ -137,6 +165,41 @@ fn copy_with_commands(
     }
 }
 
+/// Display hints are not connectivity guarantees. In particular SSH forwarding
+/// remains usable; only implicit local Wayland discovery is disabled over SSH.
+#[derive(Debug, Default)]
+struct ClipboardDisplays {
+    wayland: Option<OsString>,
+    x11: bool,
+}
+
+impl ClipboardDisplays {
+    fn detect() -> Self {
+        Self {
+            wayland: env::var_os("WAYLAND_DISPLAY")
+                .filter(|display| !display.is_empty())
+                .or_else(recovered_wayland_display),
+            x11: env::var_os("DISPLAY").is_some_and(|display| !display.is_empty()),
+        }
+    }
+
+    fn supports(&self, os: &str, program: &str) -> bool {
+        os != "linux"
+            || match program {
+                "wl-copy" | "wl-paste" => self.wayland.is_some(),
+                "xclip" | "xsel" => self.x11,
+                _ => true,
+            }
+    }
+
+    fn check_read_available(&self, os: &str) -> Result<(), ClipboardError> {
+        if os == "linux" && self.wayland.is_none() && !self.x11 {
+            return Err(ClipboardError::BackendUnavailable { os: os.to_string() });
+        }
+        Ok(())
+    }
+}
+
 fn recovered_wayland_display() -> Option<OsString> {
     if env::var_os("WAYLAND_DISPLAY").is_some()
         || env::var_os("SSH_CONNECTION").is_some()
@@ -190,6 +253,8 @@ const fn unique_wayland_display(_runtime_dir: &Path) -> Option<OsString> {
 /// Returns [`ClipboardError::BackendUnavailable`] if no clipboard backend
 /// is found, or [`ClipboardError::BackendFailed`] / [`ClipboardError::CommandFailed`] if copying fails.
 pub fn copy_text(text: &str) -> Result<(), ClipboardError> {
+    let displays = ClipboardDisplays::detect();
+    displays.check_read_available(env::consts::OS)?;
     #[cfg(feature = "native-clipboard")]
     let result = native::copy_text(text);
     #[cfg(not(feature = "native-clipboard"))]
@@ -207,7 +272,10 @@ pub fn copy_text(text: &str) -> Result<(), ClipboardError> {
             clipboard_commands(env::consts::OS)
                 .iter()
                 .copied()
-                .filter(|command| command_exists(command.program)),
+                .filter(|command| {
+                    displays.supports(env::consts::OS, command.program)
+                        && command_exists(command.program)
+                }),
             vec![error.to_string()],
             |command| run_copy_command(command, text),
         ),
@@ -425,6 +493,7 @@ pub fn read_payload(prefer_image: bool) -> Result<ClipboardPayload, ClipboardErr
 /// the backend command fails.
 #[allow(clippy::too_many_lines)]
 pub fn read_payload_detailed(prefer_image: bool) -> Result<ClipboardReadResult, ClipboardError> {
+    ClipboardDisplays::detect().check_read_available(env::consts::OS)?;
     let mut report = ClipboardReadReport {
         prefer_image,
         attempts: Vec::new(),
@@ -591,6 +660,7 @@ fn clipboard_read_result(
 /// Returns [`ClipboardError`] if no supported read backend is available or the
 /// backend command fails.
 pub fn read_text() -> Result<String, ClipboardError> {
+    ClipboardDisplays::detect().check_read_available(env::consts::OS)?;
     #[cfg(feature = "native-clipboard")]
     {
         match native::read_text() {
@@ -601,7 +671,7 @@ pub fn read_text() -> Result<String, ClipboardError> {
             }),
             Err(error) => {
                 tracing::debug!(error = %error, "native text read failed; trying command backend");
-                read_text_command()
+                read_text_fallback(error)
             }
         }
     }
@@ -614,7 +684,7 @@ pub fn read_text() -> Result<String, ClipboardError> {
                 error = %error,
                 "arboard text read initialization failed; falling back to command backend"
             );
-            read_text_command()
+            read_text_fallback(error)
         },
         |mut clipboard| {
             tracing::debug!(
@@ -640,24 +710,94 @@ pub fn read_text() -> Result<String, ClipboardError> {
     )
 }
 
+fn read_text_fallback(native_error: ClipboardError) -> Result<String, ClipboardError> {
+    match read_text_command() {
+        Err(ClipboardError::BackendUnavailable { .. }) => Err(native_error),
+        result => result,
+    }
+}
+
 fn read_text_command() -> Result<String, ClipboardError> {
-    let (program, args): (&str, &[&str]) = match env::consts::OS {
-        "macos" => ("pbpaste", &[]),
-        "linux" if command_exists("wl-paste") => ("wl-paste", &["--no-newline"]),
-        "linux" if command_exists("xclip") => ("xclip", &["-selection", "clipboard", "-out"]),
-        "linux" if command_exists("xsel") => ("xsel", &["--clipboard", "--output"]),
-        os => return Err(ClipboardError::BackendUnavailable { os: os.to_string() }),
-    };
+    let displays = ClipboardDisplays::detect();
+    read_with_commands(
+        read_commands(env::consts::OS)
+            .iter()
+            .copied()
+            .filter(|command| {
+                displays.supports(env::consts::OS, command.program)
+                    && command_exists(command.program)
+            }),
+        |command| run_read_command(command, &displays),
+    )
+}
+
+fn read_commands(os: &str) -> &'static [ClipboardCommand] {
+    match os {
+        "macos" => &[ClipboardCommand {
+            program: "pbpaste",
+            args: &[],
+        }],
+        "linux" => &[
+            ClipboardCommand {
+                program: "wl-paste",
+                args: &["--no-newline"],
+            },
+            ClipboardCommand {
+                program: "xclip",
+                args: &["-selection", "clipboard", "-out"],
+            },
+            ClipboardCommand {
+                program: "xsel",
+                args: &["--clipboard", "--output"],
+            },
+        ],
+        _ => &[],
+    }
+}
+
+fn read_with_commands(
+    commands: impl IntoIterator<Item = ClipboardCommand>,
+    mut read: impl FnMut(ClipboardCommand) -> Result<String, ClipboardError>,
+) -> Result<String, ClipboardError> {
+    let mut failure = None;
+    for command in commands {
+        match read(command) {
+            // Successful empty output is an empty clipboard, not a reason to
+            // try another display (and potentially return unrelated contents).
+            Ok(text) => return Ok(text),
+            Err(error) => failure = Some(error),
+        }
+    }
+    Err(
+        failure.unwrap_or_else(|| ClipboardError::BackendUnavailable {
+            os: env::consts::OS.to_string(),
+        }),
+    )
+}
+
+fn run_read_command(
+    command: ClipboardCommand,
+    displays: &ClipboardDisplays,
+) -> Result<String, ClipboardError> {
+    let ClipboardCommand { program, args } = command;
     tracing::debug!(
         bmux.component = "clipboard.remote_sync",
         stage = "command_text",
         program,
         "clipboard command text read attempted"
     );
-    let output = Command::new(program)
+    let mut process = Command::new(program);
+    process
         .args(args)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    if program == "wl-paste"
+        && let Some(display) = &displays.wayland
+    {
+        // Includes recovered displays without mutating shared process state.
+        process.env("WAYLAND_DISPLAY", display);
+    }
+    let output = process
         .output()
         .map_err(|error| ClipboardError::CommandFailed {
             program: program.to_string(),
@@ -1083,6 +1223,254 @@ mod tests {
             assert!(child.status().unwrap().success());
             child.env_remove(key);
         }
+    }
+
+    #[test]
+    fn read_selection_requires_matching_displays() {
+        for (wayland, x11, expected) in [
+            (false, false, vec![]),
+            (true, false, vec!["wl-paste"]),
+            (false, true, vec!["xclip", "xsel"]),
+            (true, true, vec!["wl-paste", "xclip", "xsel"]),
+        ] {
+            let displays = super::ClipboardDisplays {
+                wayland: wayland.then(|| "wayland-forwarded".into()),
+                x11,
+            };
+            let selected: Vec<_> = super::read_commands("linux")
+                .iter()
+                .filter(|command| displays.supports("linux", command.program))
+                .map(|command| command.program)
+                .collect();
+            assert_eq!(selected, expected);
+            assert_eq!(
+                displays.check_read_available("linux").is_ok(),
+                wayland || x11
+            );
+            assert!(displays.supports("macos", "pbpaste"));
+        }
+    }
+
+    #[test]
+    fn read_fallback_stops_at_success_including_empty_output() {
+        for text in ["", "clipboard text\n"] {
+            let mut attempted = Vec::new();
+            let result = super::read_with_commands(
+                super::read_commands("linux").iter().copied(),
+                |command| {
+                    attempted.push(command.program);
+                    if command.program == "wl-paste" {
+                        Err(ClipboardError::CommandFailed {
+                            program: command.program.into(),
+                            message: "compositor unavailable".into(),
+                        })
+                    } else {
+                        Ok(text.into())
+                    }
+                },
+            )
+            .unwrap();
+            assert_eq!(result, text);
+            assert_eq!(attempted, ["wl-paste", "xclip"]);
+        }
+    }
+
+    #[test]
+    fn read_errors_distinguish_unavailable_from_failed() {
+        let unavailable = super::read_with_commands([], |_| unreachable!()).unwrap_err();
+        assert_eq!(unavailable.kind(), super::ClipboardErrorKind::Unavailable);
+        let failed =
+            super::read_with_commands(super::read_commands("linux").iter().copied(), |command| {
+                Err(ClipboardError::CommandFailed {
+                    program: command.program.into(),
+                    message: "connection refused".into(),
+                })
+            })
+            .unwrap_err();
+        assert_eq!(failed.kind(), super::ClipboardErrorKind::OperationalFailure);
+        assert_eq!(
+            ClipboardError::BackendFailed {
+                backend: "native".into(),
+                message: "connection refused".into(),
+            }
+            .kind(),
+            super::ClipboardErrorKind::OperationalFailure
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn check_read_child_result(expected: &std::ffi::OsStr) {
+        let before = std::env::var_os("WAYLAND_DISPLAY");
+        let result = super::read_text_command();
+        if expected == "unavailable" {
+            assert_eq!(
+                result.unwrap_err().kind(),
+                super::ClipboardErrorKind::Unavailable
+            );
+            assert_eq!(
+                super::read_text().unwrap_err().kind(),
+                super::ClipboardErrorKind::Unavailable
+            );
+            assert_eq!(
+                super::read_payload(true).unwrap_err().kind(),
+                super::ClipboardErrorKind::Unavailable
+            );
+        } else if expected == "failed" {
+            assert_eq!(
+                result.unwrap_err().kind(),
+                super::ClipboardErrorKind::OperationalFailure
+            );
+        } else {
+            assert_eq!(result.unwrap(), expected.to_str().unwrap());
+        }
+        assert_eq!(std::env::var_os("WAYLAND_DISPLAY"), before);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn read_command_fixture() -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        for program in ["wl-paste", "xclip", "xsel"] {
+            let script = if program == "wl-paste" {
+                "#!/bin/sh\n[ -z \"$BMUX_CLIPBOARD_READ_TEST_FAIL\" ] || exit 1\n[ -z \"$BMUX_CLIPBOARD_READ_TEST_EMPTY\" ] || exit 0\nprintf '%s' \"$WAYLAND_DISPLAY\"\n"
+            } else if program == "xclip" {
+                "#!/bin/sh\n[ \"$BMUX_CLIPBOARD_READ_TEST_FAIL\" != all ] || exit 1\nprintf '%s' \"$DISPLAY\"\n"
+            } else {
+                "#!/bin/sh\nexit 1\n"
+            };
+            let path = directory.path().join(program);
+            std::fs::write(&path, script).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        directory
+    }
+
+    #[cfg(target_os = "linux")]
+    fn read_fixture_child(directory: &std::path::Path) -> std::process::Command {
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+        child
+            .args([
+                "--exact",
+                "tests::read_display_environment_in_isolated_process",
+            ])
+            .env("PATH", directory)
+            .env("XDG_RUNTIME_DIR", directory);
+        for key in [
+            "DISPLAY",
+            "WAYLAND_DISPLAY",
+            "SSH_CONNECTION",
+            "SSH_CLIENT",
+            "SSH_TTY",
+            "BMUX_CLIPBOARD_READ_TEST_FAIL",
+            "BMUX_CLIPBOARD_READ_TEST_EMPTY",
+        ] {
+            child.env_remove(key);
+        }
+        child
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn read_display_environment_in_isolated_process() {
+        use std::os::unix::net::UnixListener;
+
+        const EXPECTED: &str = "BMUX_CLIPBOARD_READ_TEST_EXPECTED";
+        if let Some(expected) = std::env::var_os(EXPECTED) {
+            check_read_child_result(&expected);
+            return;
+        }
+        let directory = read_command_fixture();
+        let child = || read_fixture_child(directory.path());
+        assert!(
+            child()
+                .env(EXPECTED, "unavailable")
+                .status()
+                .unwrap()
+                .success()
+        );
+        let _socket = UnixListener::bind(directory.path().join("wayland-1")).unwrap();
+        assert!(
+            child()
+                .env(EXPECTED, "wayland-1")
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            child()
+                .env(EXPECTED, "wayland-1")
+                .env("BMUX_CLIPBOARD_READ_TEST_EMPTY", "1")
+                .env(EXPECTED, "")
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            child()
+                .env("WAYLAND_DISPLAY", "")
+                .env("DISPLAY", "")
+                .env("SSH_CONNECTION", "ssh")
+                .env(EXPECTED, "unavailable")
+                .status()
+                .unwrap()
+                .success()
+        );
+        for ssh in ["SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"] {
+            assert!(
+                child()
+                    .env(ssh, "ssh")
+                    .env(EXPECTED, "unavailable")
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            assert!(
+                child()
+                    .env(ssh, "ssh")
+                    .env("DISPLAY", "localhost:10.0")
+                    .env(EXPECTED, "localhost:10.0")
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            assert!(
+                child()
+                    .env(ssh, "ssh")
+                    .env("WAYLAND_DISPLAY", "forwarded-wayland")
+                    .env(EXPECTED, "forwarded-wayland")
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        assert!(
+            child()
+                .env("WAYLAND_DISPLAY", "broken")
+                .env("DISPLAY", "localhost:10.0")
+                .env("BMUX_CLIPBOARD_READ_TEST_FAIL", "wayland")
+                .env(EXPECTED, "localhost:10.0")
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            child()
+                .env("WAYLAND_DISPLAY", "broken")
+                .env("DISPLAY", "localhost:10.0")
+                .env("BMUX_CLIPBOARD_READ_TEST_FAIL", "all")
+                .env(EXPECTED, "failed")
+                .status()
+                .unwrap()
+                .success()
+        );
+        let _other_socket = UnixListener::bind(directory.path().join("wayland-2")).unwrap();
+        assert!(
+            child()
+                .env(EXPECTED, "unavailable")
+                .status()
+                .unwrap()
+                .success()
+        );
     }
 
     #[test]

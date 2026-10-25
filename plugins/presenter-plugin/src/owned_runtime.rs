@@ -250,6 +250,8 @@ impl OwnedRuntime {
         let paths = state.paths.clone().ok_or("owned service paths missing")?;
         // Child is stored before awaiting: cancellation never abandons its ownership.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut retry_delay = Duration::from_millis(50);
+        let mut last_error = "owned service socket not ready".to_owned();
         loop {
             if let Some(status) = state
                 .child
@@ -285,21 +287,33 @@ impl OwnedRuntime {
                 .await;
                 if matches!(&readiness, Ok(Ok(Ok(_))))
                     || matches!(
-                        readiness,
+                        &readiness,
                         Ok(Ok(Err(bmux_playbook_plugin_api::playbook_types::PlaybookError::Rejected { message })))
                             if message.starts_with("preparation identity not found")
                     )
                 {
                     return Ok(paths);
                 }
+                last_error = match readiness {
+                    Err(_) => "playbook readiness lookup timed out".into(),
+                    Ok(Err(error)) => crate::playbook_controller::observation_error(&error),
+                    Ok(Ok(Err(error))) => format!("playbook readiness rejected: {error:?}"),
+                    Ok(Ok(Ok(_))) => unreachable!("successful readiness returned above"),
+                };
             }
             if tokio::time::Instant::now() >= deadline {
                 return Err(format!(
-                    "owned presenter service startup timed out; child retained; diagnostics: {}; no fallback",
+                    "owned presenter service startup timed out ({last_error}); child retained; diagnostics: {}; no fallback",
                     self.root.join("server.stderr.log").display()
                 ));
             }
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            // Readiness probes are observations, not preparation retries. Bound
+            // missing/incompatible-provider traffic without abandoning the child.
+            tokio::time::sleep(
+                retry_delay.min(deadline.saturating_duration_since(tokio::time::Instant::now())),
+            )
+            .await;
+            retry_delay = retry_delay.saturating_mul(2).min(Duration::from_secs(1));
         }
     }
     pub fn request_shutdown(self: &Arc<Self>) {

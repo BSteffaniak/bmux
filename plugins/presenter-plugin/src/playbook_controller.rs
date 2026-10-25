@@ -9,6 +9,79 @@ use tokio::sync::{mpsc, watch};
 
 const COMMAND_CAPACITY: usize = 8;
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
+const READ_RETRY_INITIAL: Duration = Duration::from_millis(500);
+const READ_RETRY_MAX: Duration = Duration::from_secs(30);
+
+/// Retry only observations, never preparation. Capping the delay (rather than
+/// giving up) permits provider recovery while retaining unresolved ownership.
+#[derive(Default)]
+struct ReadRetry {
+    next: Option<tokio::time::Instant>,
+    delay: Option<Duration>,
+}
+impl ReadRetry {
+    fn ready(&self, now: tokio::time::Instant) -> bool {
+        self.next.is_none_or(|next| now >= next)
+    }
+    fn failed(&mut self, now: tokio::time::Instant) {
+        let delay = self.delay.map_or(READ_RETRY_INITIAL, |delay| {
+            delay.saturating_mul(2).min(READ_RETRY_MAX)
+        });
+        self.delay = Some(delay);
+        self.next = Some(now + delay);
+    }
+    fn recovered(&mut self) {
+        *self = Self::default();
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ServiceFailure {
+    Absent,
+    Incompatible,
+    Transport,
+    Other,
+}
+fn service_failure(error: &bmux_plugin_sdk::TypedServiceClientError) -> ServiceFailure {
+    use bmux_plugin_sdk::{TypedDispatchClientError, TypedServiceClientError};
+    match error {
+        // Typed dispatch currently carries protocol error codes as text. Match
+        // the exact server code/prefix, not arbitrary 'not found' domain errors.
+        TypedServiceClientError::Dispatch(TypedDispatchClientError::Server { details, .. })
+            if details.starts_with("NotFound: no provider for service ") =>
+        {
+            ServiceFailure::Absent
+        }
+        TypedServiceClientError::Dispatch(TypedDispatchClientError::Server { details, .. })
+            if details.starts_with("ServiceIncompatible:") =>
+        {
+            ServiceFailure::Incompatible
+        }
+        TypedServiceClientError::Dispatch(TypedDispatchClientError::Transport { .. }) => {
+            ServiceFailure::Transport
+        }
+        _ => ServiceFailure::Other,
+    }
+}
+fn preparation_rejected_before_admission(error: &bmux_plugin_sdk::TypedServiceClientError) -> bool {
+    // Absence is a routing rejection. Incompatibility is explicit, but may be
+    // reported after dispatch: it is not proof a preparation had no effect.
+    service_failure(error) == ServiceFailure::Absent
+        || matches!(
+            error,
+            bmux_plugin_sdk::TypedServiceClientError::Encode { .. }
+        )
+}
+
+pub(super) fn observation_error(error: &bmux_plugin_sdk::TypedServiceClientError) -> String {
+    let kind = match service_failure(error) {
+        ServiceFailure::Absent => "playbook provider absent",
+        ServiceFailure::Incompatible => "playbook service incompatible",
+        ServiceFailure::Transport => "playbook observation transport failed",
+        ServiceFailure::Other => "playbook observation failed",
+    };
+    format!("{kind}; state retained, retrying with bounded backoff: {error}")
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PlaybackSpeed {
@@ -173,6 +246,7 @@ impl Controller {
                 playback_speed: PlaybackSpeed::Normal,
                 stop_requested: false,
                 uncertain: false,
+                read_retry: ReadRetry::default(),
             }
             .run(),
         );
@@ -322,6 +396,7 @@ struct Worker {
     playback_speed: PlaybackSpeed,
     stop_requested: bool,
     uncertain: bool,
+    read_retry: ReadRetry,
 }
 impl Worker {
     async fn run(mut self) {
@@ -401,16 +476,24 @@ impl Worker {
                     self.pending.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                 }
                 _ = tick.tick() => {
-                    if self.uncertain && self.attempt.is_none() {
-                        let result = self.lookup_preparation().await;
-                        if let Err(error) = result { self.publish_result(Err(error)); }
+                    if !self.read_retry.ready(tokio::time::Instant::now()) {
+                        continue;
                     }
-                    if self.attempt.is_some() {
-                        let result = match tokio::time::timeout(Duration::from_secs(5), self.refresh()).await {
+                    let result = if self.uncertain && self.attempt.is_none() {
+                        self.lookup_preparation().await
+                    } else if self.attempt.is_some() {
+                        match tokio::time::timeout(Duration::from_secs(5), self.refresh()).await {
                             Ok(result) => result,
                             Err(_) => { self.client = None; Err("status timed out; retaining last confirmed state".into()) },
-                        };
-                        if let Err(error) = result { self.publish_result(Err(error)); }
+                        }
+                    } else {
+                        continue;
+                    };
+                    if let Err(error) = result {
+                        self.read_retry.failed(tokio::time::Instant::now());
+                        self.publish_result(Err(error));
+                    } else {
+                        self.read_retry.recovered();
                     }
                 }
             }
@@ -670,6 +753,9 @@ impl Worker {
             .await;
             let attempt = match result {
                 Ok(result) => result.map_err(|error| format!("{error:?}"))?,
+                Err(error) if preparation_rejected_before_admission(&error) => {
+                    return Err(format!("preparation not admitted: {error}"));
+                }
                 Err(error) => {
                     self.uncertain = true;
                     self.client = None;
@@ -763,12 +849,7 @@ impl Worker {
     }
     async fn lookup_preparation(&mut self) -> Result<(), String> {
         match tokio::time::timeout(Duration::from_secs(5), self.lookup_preparation_inner()).await {
-            Ok(result) => {
-                if result.is_err() {
-                    self.client = None;
-                }
-                result
-            }
+            Ok(result) => result,
             Err(_) => {
                 self.client = None;
                 Err("preparation lookup timed out; ownership remains unresolved".into())
@@ -782,7 +863,12 @@ impl Worker {
             self.preparation_request_id.clone(),
         )
         .await
-        .map_err(|error| error.to_string())?
+        .map_err(|error| {
+            if service_failure(&error) == ServiceFailure::Transport {
+                self.client = None;
+            }
+            observation_error(&error)
+        })?
         .map_err(|error| format!("preparation remains unresolved: {error:?}"))?;
         self.attempt = Some(found);
         self.uncertain = false;
@@ -806,7 +892,12 @@ impl Worker {
             revision,
         )
         .await
-        .map_err(|error| error.to_string())?
+        .map_err(|error| {
+            if service_failure(&error) == ServiceFailure::Transport {
+                self.client = None;
+            }
+            observation_error(&error)
+        })?
         .map_err(|error| format!("{error:?}"))?;
         if next.generation != generation || next.revision < revision {
             return Ok(());
@@ -819,7 +910,10 @@ impl Worker {
         {
             self.uncertain = false;
         }
-        if next.revision != revision || self.snapshots.borrow().unresolved != self.uncertain {
+        if next.revision != revision
+            || self.snapshots.borrow().unresolved != self.uncertain
+            || self.read_retry.delay.is_some()
+        {
             self.attempt = Some(next);
             self.snapshots.send_modify(|snapshot| {
                 snapshot.revision = snapshot.revision.saturating_add(1);
@@ -843,6 +937,179 @@ impl Worker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn dispatch_error(details: &str) -> bmux_plugin_sdk::TypedServiceClientError {
+        bmux_plugin_sdk::TypedDispatchClientError::server(
+            "playbook-state",
+            "lookup-preparation",
+            details,
+        )
+        .into()
+    }
+
+    #[test]
+    fn missing_provider_and_incompatibility_are_not_transport_failures() {
+        let absent =
+            dispatch_error("NotFound: no provider for service capability='bmux.playbook.read'");
+        let incompatible = dispatch_error("ServiceIncompatible: contract mismatch");
+        let transport = bmux_plugin_sdk::TypedDispatchClientError::transport(
+            "playbook-commands",
+            "prepare",
+            "reply lost",
+        )
+        .into();
+        assert_eq!(service_failure(&absent), ServiceFailure::Absent);
+        assert_eq!(service_failure(&incompatible), ServiceFailure::Incompatible);
+        assert_eq!(service_failure(&transport), ServiceFailure::Transport);
+        assert!(preparation_rejected_before_admission(&absent));
+        assert!(!preparation_rejected_before_admission(&incompatible));
+        assert!(!preparation_rejected_before_admission(&transport));
+        assert!(!preparation_rejected_before_admission(&dispatch_error(
+            "NotFound: attempt missing"
+        )));
+        let decode = bmux_plugin_sdk::TypedServiceClientError::Decode {
+            op: "prepare".into(),
+            details: "reply corrupt".into(),
+        };
+        assert!(!preparation_rejected_before_admission(&decode));
+    }
+
+    #[test]
+    fn failed_reads_back_off_to_a_cap_and_recovery_resets_delay() {
+        let mut retry = ReadRetry::default();
+        let mut now = tokio::time::Instant::now();
+        for millis in [500, 1_000, 2_000, 4_000, 8_000, 16_000, 30_000, 30_000] {
+            assert!(retry.ready(now));
+            retry.failed(now);
+            now += Duration::from_millis(millis);
+            assert!(!retry.ready(now - Duration::from_nanos(1)));
+            assert!(retry.ready(now));
+        }
+        retry.recovered();
+        assert!(retry.ready(now));
+        retry.failed(now);
+        assert_eq!(retry.next, Some(now + READ_RETRY_INITIAL));
+    }
+
+    #[test]
+    fn prolonged_missing_provider_does_not_probe_on_every_paint_tick() {
+        let start = tokio::time::Instant::now();
+        let mut retry = ReadRetry::default();
+        let mut probes = 0;
+        // Model the historical error volume as timer opportunities, without a
+        // real clock, daemon, socket, or preparation mutation.
+        for tick in 0..18_444_u32 {
+            let now = start + POLL_INTERVAL * tick;
+            if retry.ready(now) {
+                probes += 1;
+                retry.failed(now);
+            }
+        }
+        assert!(
+            (60..=70).contains(&probes),
+            "actual bounded probes: {probes}"
+        );
+    }
+
+    struct PreparationLookup {
+        replies: std::collections::VecDeque<bmux_plugin_sdk::TypedDispatchClientResult<Vec<u8>>>,
+        requests: Vec<String>,
+    }
+    impl bmux_plugin_sdk::TypedDispatchClient for PreparationLookup {
+        async fn invoke_service_raw(
+            &mut self,
+            capability: &str,
+            kind: bmux_ipc::InvokeServiceKind,
+            interface_id: &str,
+            operation: &str,
+            payload: Vec<u8>,
+        ) -> bmux_plugin_sdk::TypedDispatchClientResult<Vec<u8>> {
+            assert_eq!(capability, "bmux.playbook.read");
+            assert_eq!(kind, bmux_ipc::InvokeServiceKind::Query);
+            assert_eq!(interface_id, "playbook-state");
+            assert_eq!(operation, "lookup-preparation", "never replay preparation");
+            let request: state::client::LookupPreparationRequest =
+                bmux_plugin_sdk::decode_service_message(&payload).unwrap();
+            self.requests.push(request.request_id);
+            self.replies.pop_front().expect("bounded read count")
+        }
+    }
+
+    #[tokio::test]
+    async fn uncertain_preparation_recovers_by_original_identity_using_only_queries() {
+        let request_id = "7b384300-c347-4f99-a381-043fb8bddaa3";
+        let recovered = Attempt {
+            generation: 7,
+            revision: 1,
+            phase: "prepared".into(),
+            step: 0,
+            playback_speed: "normal".into(),
+            current_action: String::new(),
+            action_count: 0,
+            typing_done: 0,
+            typing_total: 0,
+            viewport_cols: 80,
+            viewport_rows: 24,
+            paused: false,
+            cleanup_acknowledged: false,
+            root: String::new(),
+            runtime_dir: String::new(),
+            config_dir: String::new(),
+            data_dir: String::new(),
+            state_dir: String::new(),
+            session_id: None,
+            diagnostic: None,
+        };
+        let domain_unknown: Result<
+            Attempt,
+            bmux_playbook_plugin_api::playbook_types::PlaybookError,
+        > = Err(
+            bmux_playbook_plugin_api::playbook_types::PlaybookError::Rejected {
+                message: "identity not found; absence does not prove non-admission".into(),
+            },
+        );
+        let success: Result<Attempt, bmux_playbook_plugin_api::playbook_types::PlaybookError> =
+            Ok(recovered);
+        let mut client = PreparationLookup {
+            replies: [
+                Err(bmux_plugin_sdk::TypedDispatchClientError::server(
+                    "playbook-state",
+                    "lookup-preparation",
+                    "NotFound: no provider for service capability='bmux.playbook.read'",
+                )),
+                Ok(bmux_plugin_sdk::encode_service_message(&domain_unknown).unwrap()),
+                Ok(bmux_plugin_sdk::encode_service_message(&success).unwrap()),
+            ]
+            .into(),
+            requests: Vec::new(),
+        };
+        let mut retry = ReadRetry::default();
+        let mut now = tokio::time::Instant::now();
+        let mut resolved = None;
+        for _ in 0..3 {
+            assert!(retry.ready(now));
+            match state::client::lookup_preparation(&mut client, request_id.into()).await {
+                Ok(Ok(attempt)) => {
+                    resolved = Some(attempt);
+                    retry.recovered();
+                }
+                _ => {
+                    retry.failed(now);
+                    now = retry.next.unwrap();
+                }
+            }
+        }
+        let attempt = resolved.unwrap();
+        assert_eq!(attempt.generation, 7);
+        assert_eq!(attempt.phase, "prepared");
+        assert!(
+            !attempt.cleanup_acknowledged,
+            "lookup cannot acknowledge cleanup"
+        );
+        assert_eq!(client.requests, vec![request_id; 3]);
+        assert!(client.replies.is_empty());
+        assert!(retry.delay.is_none());
+    }
 
     #[test]
     fn observer_end_requires_current_cleanup_and_frame_boundary() {

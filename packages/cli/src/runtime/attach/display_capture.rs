@@ -6,8 +6,8 @@ use crossterm::terminal;
 use std::collections::VecDeque;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
@@ -154,7 +154,38 @@ pub(super) struct DisplayCaptureWriter {
     sender: mpsc::SyncSender<DisplayCaptureCommand>,
     queued_commands: Arc<AtomicUsize>,
     worker: Option<thread::JoinHandle<()>>,
-    dropped_events: u64,
+    failure: Arc<CaptureFailure>,
+}
+
+/// Partial protocol frames cannot safely be resumed. Finalization retains the
+/// original cause; recovery requires a new capture, never deleting the old one.
+#[derive(Default)]
+struct CaptureFailure {
+    cause: OnceLock<String>,
+    reported: AtomicBool,
+}
+
+impl CaptureFailure {
+    fn error(&self) -> Option<anyhow::Error> {
+        self.cause
+            .get()
+            .map(|cause| anyhow::anyhow!("display capture incomplete: {cause}"))
+    }
+
+    fn fail(&self, error: &anyhow::Error) {
+        if self.cause.set(format!("{error:#}")).is_ok() {
+            tracing::warn!(error = %error, "display capture degraded; recording incomplete; capture writes stopped");
+        }
+    }
+
+    fn report_once(&self) -> Result<()> {
+        if let Some(error) = self.error()
+            && !self.reported.swap(true, Ordering::Relaxed)
+        {
+            return Err(error);
+        }
+        Ok(())
+    }
 }
 
 enum DisplayCaptureCommand {
@@ -191,7 +222,7 @@ enum RecordOutcome {
 /// to rotate. That makes the "baseline writes must not rotate" invariant a
 /// property of the type rather than something callers must remember.
 struct DisplaySegmentWriter {
-    writer: BufWriter<std::fs::File>,
+    writer: Option<BufWriter<Box<dyn Write + Send>>>,
     stream_opened_baseline: DisplayTrackEvent,
     latest_resize: Option<(u16, u16)>,
     replay_grid: bmux_terminal_grid::TerminalGridStream,
@@ -233,37 +264,58 @@ impl DisplayCaptureWriter {
             client_id,
             rolling_window_secs.map(Duration::from_secs),
         )?;
-        writer.record_stream_opened()?;
+        let failure = Arc::new(CaptureFailure::default());
+        capture_write(
+            &mut writer,
+            &failure,
+            DisplayCaptureFileWriter::record_stream_opened,
+        )?;
         let (sender, receiver) = mpsc::sync_channel(DISPLAY_CAPTURE_QUEUE_CAPACITY);
         let queued_commands = Arc::new(AtomicUsize::new(0));
         let worker_queued_commands = Arc::clone(&queued_commands);
+        let worker_failure = Arc::clone(&failure);
         let worker = thread::Builder::new()
             .name(format!("bmux-display-capture-{recording_id}"))
             .spawn(move || {
-                display_capture_writer_loop(&mut writer, receiver, &worker_queued_commands);
+                display_capture_writer_loop(
+                    &mut writer,
+                    receiver,
+                    &worker_queued_commands,
+                    &worker_failure,
+                );
             })
             .context("failed spawning display capture writer thread")?;
         Ok(Self {
             sender,
             queued_commands,
             worker: Some(worker),
-            dropped_events: 0,
+            failure,
         })
     }
 
-    pub(super) fn record_resize(&mut self, cols: u16, rows: u16) -> Result<()> {
+    pub(super) fn record_resize(&self, cols: u16, rows: u16) -> Result<()> {
         self.enqueue(DisplayCaptureCommand::Event(DisplayTrackEvent::Resize {
             cols,
             rows,
         }))
     }
 
+    /// Degraded writers return true so the fanout will deliver the one-shot
+    /// error even when it normally skips frame allocation for full queues.
     pub(super) fn has_frame_capacity(&self) -> bool {
-        self.queued_commands.load(Ordering::Relaxed) < DISPLAY_CAPTURE_QUEUE_CAPACITY
+        if self.failure.error().is_some() {
+            return true;
+        }
+        if self.queued_commands.load(Ordering::Relaxed) >= DISPLAY_CAPTURE_QUEUE_CAPACITY {
+            self.failure
+                .fail(&anyhow::anyhow!("display capture queue capacity exceeded"));
+            return false;
+        }
+        true
     }
 
     pub(super) fn record_frame(
-        &mut self,
+        &self,
         data: Arc<[u8]>,
         cursor_state: Option<crate::runtime::attach::state::AttachCursorState>,
         cursor_changed: bool,
@@ -273,7 +325,7 @@ impl DisplayCaptureWriter {
         }
         if !self.has_frame_capacity() {
             self.record_dropped_event();
-            return Ok(());
+            return self.failure.report_once();
         }
         self.enqueue(DisplayCaptureCommand::Frame {
             data,
@@ -282,13 +334,16 @@ impl DisplayCaptureWriter {
         })
     }
 
-    pub(super) fn record_activity(&mut self, kind: DisplayActivityKind) -> Result<()> {
+    pub(super) fn record_activity(&self, kind: DisplayActivityKind) -> Result<()> {
         self.enqueue(DisplayCaptureCommand::Event(DisplayTrackEvent::Activity {
             kind,
         }))
     }
 
     pub(super) fn record_stream_closed(&mut self) -> Result<()> {
+        if self.worker.is_none() {
+            return self.failure.error().map_or(Ok(()), Err);
+        }
         let (sender, receiver) = mpsc::channel();
         self.queued_commands.fetch_add(1, Ordering::Relaxed);
         if let Err(error) = self.sender.send(DisplayCaptureCommand::Close(sender)) {
@@ -312,7 +367,7 @@ impl DisplayCaptureWriter {
         feature = "image-iterm2"
     ))]
     pub(super) fn record_images(
-        &mut self,
+        &self,
         images: &[bmux_attach_image_protocol::AttachPaneImage],
     ) -> Result<()> {
         self.enqueue(DisplayCaptureCommand::Event(
@@ -323,6 +378,12 @@ impl DisplayCaptureWriter {
     }
 
     pub(super) fn flush(&self) -> Result<()> {
+        if let Some(error) = self.failure.error() {
+            return Err(error);
+        }
+        if self.worker.is_none() {
+            return Ok(());
+        }
         let (sender, receiver) = mpsc::channel();
         self.queued_commands.fetch_add(1, Ordering::Relaxed);
         if let Err(error) = self.sender.send(DisplayCaptureCommand::Flush(sender)) {
@@ -334,30 +395,30 @@ impl DisplayCaptureWriter {
             .context("display capture writer closed without flushing")?
     }
 
-    fn enqueue(&mut self, command: DisplayCaptureCommand) -> Result<()> {
+    fn enqueue(&self, command: DisplayCaptureCommand) -> Result<()> {
+        if self.failure.error().is_some() {
+            return self.failure.report_once();
+        }
         self.queued_commands.fetch_add(1, Ordering::Relaxed);
         match self.sender.try_send(command) {
             Ok(()) => Ok(()),
             Err(mpsc::TrySendError::Full(_)) => {
                 self.queued_commands.fetch_sub(1, Ordering::Relaxed);
                 self.record_dropped_event();
-                Ok(())
+                self.failure.report_once()
             }
             Err(mpsc::TrySendError::Disconnected(_)) => {
                 self.queued_commands.fetch_sub(1, Ordering::Relaxed);
-                Err(anyhow::anyhow!("display capture writer is closed"))
+                self.failure
+                    .fail(&anyhow::anyhow!("display capture writer is closed"));
+                self.failure.report_once()
             }
         }
     }
 
-    fn record_dropped_event(&mut self) {
-        self.dropped_events = self.dropped_events.saturating_add(1);
-        if self.dropped_events == 1 || self.dropped_events.is_multiple_of(1024) {
-            tracing::warn!(
-                dropped_events = self.dropped_events,
-                "display capture queue is full; dropping recording display events"
-            );
-        }
+    fn record_dropped_event(&self) {
+        self.failure
+            .fail(&anyhow::anyhow!("display capture queue capacity exceeded"));
     }
 }
 
@@ -379,7 +440,7 @@ impl DisplaySegmentWriter {
     /// segment can emit a self-contained baseline.
     fn replace_output(&mut self, file: std::fs::File) -> Result<()> {
         self.flush()?;
-        self.writer = BufWriter::new(file);
+        self.writer = Some(BufWriter::new(Box::new(file)));
         Ok(())
     }
 
@@ -444,13 +505,19 @@ impl DisplaySegmentWriter {
             self.last_image_count = count;
         }
         let envelope = DisplayTrackEnvelope { mono_ns, event };
-        write_frame(&mut self.writer, &envelope)
+        let writer = self
+            .writer
+            .as_mut()
+            .context("display capture output stopped")?;
+        write_frame(writer, &envelope)
             .map_err(|e| anyhow::anyhow!("display track write_frame failed: {e}"))?;
         Ok(RecordOutcome::Written)
     }
 
     fn flush(&mut self) -> Result<()> {
         self.writer
+            .as_mut()
+            .context("display capture output stopped")?
             .flush()
             .context("failed flushing display capture writer")
     }
@@ -483,7 +550,7 @@ impl DisplayCaptureFileWriter {
         .expect("display capture replay grid dimensions are valid");
         Ok(Self {
             segment: DisplaySegmentWriter {
-                writer: BufWriter::new(file),
+                writer: Some(BufWriter::new(Box::new(file))),
                 stream_opened_baseline,
                 latest_resize,
                 replay_grid,
@@ -594,56 +661,83 @@ impl DisplayCaptureFileWriter {
     }
 }
 
+fn capture_write(
+    writer: &mut DisplayCaptureFileWriter,
+    failure: &CaptureFailure,
+    operation: impl FnOnce(&mut DisplayCaptureFileWriter) -> Result<()>,
+) -> Result<()> {
+    if let Some(error) = failure.error() {
+        stop_capture_output(writer);
+        return Err(error);
+    }
+    if let Err(error) = operation(writer) {
+        failure.fail(&error);
+        stop_capture_output(writer);
+        return Err(error).context("display capture incomplete");
+    }
+    Ok(())
+}
+
+fn stop_capture_output(writer: &mut DisplayCaptureFileWriter) {
+    if let Some(output) = writer.segment.writer.take() {
+        // BufWriter::drop retries buffered writes. Disassemble it instead: the
+        // failed tail remains incomplete and must not be appended to or retried.
+        let _ = output.into_parts();
+    }
+}
+
 fn display_capture_writer_loop(
     writer: &mut DisplayCaptureFileWriter,
     receiver: mpsc::Receiver<DisplayCaptureCommand>,
     queued_commands: &AtomicUsize,
+    failure: &CaptureFailure,
 ) {
     for command in receiver {
         queued_commands.fetch_sub(1, Ordering::Relaxed);
         match command {
             DisplayCaptureCommand::Event(event) => {
-                if let Err(error) = writer.record(event) {
-                    tracing::warn!(error = %error, "display capture write failed");
-                }
+                let _ = capture_write(writer, failure, |writer| writer.record(event));
             }
             DisplayCaptureCommand::Frame {
                 data,
                 cursor_state,
                 cursor_changed,
             } => {
-                if let Err(error) = writer.record(DisplayTrackEvent::FrameBytes {
-                    data: data.to_vec(),
-                }) {
-                    tracing::warn!(error = %error, "display capture write failed");
-                }
-                if let Err(error) = writer.record(DisplayTrackEvent::Activity {
-                    kind: DisplayActivityKind::Output,
-                }) {
-                    tracing::warn!(error = %error, "display capture activity write failed");
-                }
-                if let Err(error) = writer.record_cursor_snapshot(cursor_state) {
-                    tracing::warn!(error = %error, "display capture cursor snapshot failed");
-                }
-                if cursor_changed
-                    && let Err(error) = writer.record(DisplayTrackEvent::Activity {
-                        kind: DisplayActivityKind::Cursor,
-                    })
-                {
-                    tracing::warn!(error = %error, "display capture cursor activity write failed");
-                }
+                let _ = capture_write(writer, failure, |writer| {
+                    writer.record(DisplayTrackEvent::FrameBytes {
+                        data: data.to_vec(),
+                    })?;
+                    writer.record(DisplayTrackEvent::Activity {
+                        kind: DisplayActivityKind::Output,
+                    })?;
+                    writer.record_cursor_snapshot(cursor_state)?;
+                    if cursor_changed {
+                        writer.record(DisplayTrackEvent::Activity {
+                            kind: DisplayActivityKind::Cursor,
+                        })?;
+                    }
+                    Ok(())
+                });
             }
             DisplayCaptureCommand::Flush(ack) => {
-                let _ = ack.send(writer.flush());
+                let _ = ack.send(capture_write(
+                    writer,
+                    failure,
+                    DisplayCaptureFileWriter::flush,
+                ));
             }
             DisplayCaptureCommand::Close(ack) => {
-                let result = writer
-                    .record(DisplayTrackEvent::StreamClosed)
-                    .and_then(|()| writer.flush());
+                let result = capture_write(writer, failure, |writer| {
+                    writer.record(DisplayTrackEvent::StreamClosed)?;
+                    writer.flush()
+                });
                 let _ = ack.send(result);
                 break;
             }
         }
+    }
+    if failure.error().is_some() {
+        stop_capture_output(writer);
     }
 }
 
@@ -709,6 +803,288 @@ fn display_track_output_path(
 mod tests {
     use super::*;
     use bmux_recording_protocol::read_frames;
+    use std::sync::Mutex;
+
+    struct FailingOutput {
+        calls: Arc<AtomicUsize>,
+        bytes: Arc<Mutex<Vec<u8>>>,
+        successful_writes: usize,
+        fail_flush: bool,
+    }
+
+    impl Write for FailingOutput {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            let call = self.calls.fetch_add(1, Ordering::Relaxed);
+            if call >= self.successful_writes {
+                return Err(std::io::Error::other("injected capture disk full"));
+            }
+            self.bytes
+                .lock()
+                .expect("bytes lock")
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            if self.fail_flush {
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                return Err(std::io::Error::other("injected capture flush failure"));
+            }
+            Ok(())
+        }
+    }
+
+    /// Each encoded event performs a prefix write and a payload write. A
+    /// one-byte buffer makes the injected failure independent of OS buffering.
+    /// Exercise frame bytes, output activity, cursor snapshot and cursor activity.
+    #[test]
+    fn capture_failure_stops_frame_activity_and_cursor_writes() {
+        for successful_writes in 0..8 {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let (mut writer, client_id) = rolling_writer(dir.path());
+            writer.rolling_window = None;
+            let calls = Arc::new(AtomicUsize::new(0));
+            let bytes = Arc::new(Mutex::new(Vec::new()));
+            writer.segment.writer = Some(BufWriter::with_capacity(
+                1,
+                Box::new(FailingOutput {
+                    calls: Arc::clone(&calls),
+                    bytes: Arc::clone(&bytes),
+                    successful_writes,
+                    fail_flush: false,
+                }),
+            ));
+            let failure = CaptureFailure::default();
+            let (sender, receiver) = mpsc::sync_channel(4);
+            let (flush_ack, flush_result) = mpsc::channel();
+            let (close_ack, close_result) = mpsc::channel();
+            sender
+                .try_send(DisplayCaptureCommand::Frame {
+                    data: Arc::from(&b"hello"[..]),
+                    cursor_state: None,
+                    cursor_changed: true,
+                })
+                .expect("frame queued");
+            sender
+                .try_send(DisplayCaptureCommand::Event(DisplayTrackEvent::Activity {
+                    kind: DisplayActivityKind::Input,
+                }))
+                .expect("activity queued");
+            sender
+                .try_send(DisplayCaptureCommand::Flush(flush_ack))
+                .expect("flush queued");
+            sender
+                .try_send(DisplayCaptureCommand::Close(close_ack))
+                .expect("close queued");
+            let queued = AtomicUsize::new(4);
+            display_capture_writer_loop(&mut writer, receiver, &queued, &failure);
+
+            assert_eq!(queued.load(Ordering::Relaxed), 0);
+            assert_eq!(calls.load(Ordering::Relaxed), successful_writes + 1);
+            assert!(
+                writer.segment.writer.is_none(),
+                "failed buffers are disarmed"
+            );
+            assert!(
+                failure.report_once().is_err(),
+                "one degradation notification"
+            );
+            assert!(
+                failure.report_once().is_ok(),
+                "no repeated interactive errors"
+            );
+            for result in [flush_result, close_result] {
+                let error = result
+                    .recv()
+                    .expect("acknowledged")
+                    .expect_err("incomplete capture");
+                assert!(error.to_string().contains("incomplete"));
+                assert!(error.to_string().contains("injected capture disk full"));
+            }
+            let data = bytes.lock().expect("bytes lock");
+            let events = read_frames::<DisplayTrackEnvelope>(&data).expect("valid prefix");
+            assert_eq!(events.frames.len(), successful_writes / 2);
+            assert_eq!(events.bytes_remaining, (successful_writes % 2) * 4);
+            assert!(
+                !events
+                    .frames
+                    .iter()
+                    .any(|event| matches!(event.event, DisplayTrackEvent::StreamClosed))
+            );
+            drop(data);
+            drop(writer);
+            assert_eq!(
+                calls.load(Ordering::Relaxed),
+                successful_writes + 1,
+                "drop must not retry"
+            );
+            assert!(
+                display_track_segment_path(dir.path(), client_id, 0).exists(),
+                "recording retained"
+            );
+        }
+    }
+
+    #[test]
+    fn capture_standalone_activity_failure_stops_following_events() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut writer, _) = rolling_writer(dir.path());
+        writer.rolling_window = None;
+        let calls = Arc::new(AtomicUsize::new(0));
+        writer.segment.writer = Some(BufWriter::with_capacity(
+            1,
+            Box::new(FailingOutput {
+                calls: Arc::clone(&calls),
+                bytes: Arc::new(Mutex::new(Vec::new())),
+                successful_writes: 0,
+                fail_flush: false,
+            }),
+        ));
+        let failure = CaptureFailure::default();
+        let (sender, receiver) = mpsc::sync_channel(3);
+        for kind in [DisplayActivityKind::Input, DisplayActivityKind::Cursor] {
+            sender
+                .try_send(DisplayCaptureCommand::Event(DisplayTrackEvent::Activity {
+                    kind,
+                }))
+                .expect("activity queued");
+        }
+        let (ack, result) = mpsc::channel();
+        sender
+            .try_send(DisplayCaptureCommand::Close(ack))
+            .expect("close queued");
+        let queued = AtomicUsize::new(3);
+        display_capture_writer_loop(&mut writer, receiver, &queued, &failure);
+        assert!(result.recv().expect("close acknowledged").is_err());
+        assert_eq!(queued.load(Ordering::Relaxed), 0);
+        drop(writer);
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn capture_flush_failure_is_terminal_and_new_capture_can_recover() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut writer, client_id) = rolling_writer(dir.path());
+        writer.rolling_window = None;
+        let calls = Arc::new(AtomicUsize::new(0));
+        writer.segment.writer = Some(BufWriter::new(Box::new(FailingOutput {
+            calls: Arc::clone(&calls),
+            bytes: Arc::new(Mutex::new(Vec::new())),
+            successful_writes: usize::MAX,
+            fail_flush: true,
+        })));
+        writer
+            .record(DisplayTrackEvent::Resize { cols: 80, rows: 24 })
+            .expect("buffered event");
+        let failure = CaptureFailure::default();
+        assert!(capture_write(&mut writer, &failure, DisplayCaptureFileWriter::flush).is_err());
+        let failed_calls = calls.load(Ordering::Relaxed);
+        assert!(capture_write(&mut writer, &failure, DisplayCaptureFileWriter::flush).is_err());
+        drop(writer);
+        assert_eq!(calls.load(Ordering::Relaxed), failed_calls);
+        assert!(display_track_segment_path(dir.path(), client_id, 0).exists());
+
+        // Recovery deliberately uses a fresh identity, never appending to a
+        // failed stream or removing evidence from the previous capture.
+        let mut recovered =
+            DisplayCaptureWriter::open(Uuid::new_v4(), dir.path(), Uuid::new_v4(), None)
+                .expect("fresh capture opens");
+        recovered
+            .record_activity(DisplayActivityKind::Input)
+            .expect("capture usable");
+        recovered
+            .record_stream_closed()
+            .expect("fresh capture finalizes");
+        recovered
+            .record_stream_closed()
+            .expect("finalization is idempotent");
+        recovered
+            .flush()
+            .expect("finalized capture flush is harmless");
+    }
+
+    #[test]
+    fn capture_queue_overflow_is_bounded_and_reports_incomplete_once() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let mut capture = DisplayCaptureWriter {
+            sender,
+            queued_commands: Arc::new(AtomicUsize::new(0)),
+            worker: None,
+            failure: Arc::new(CaptureFailure::default()),
+        };
+        capture
+            .record_activity(DisplayActivityKind::Input)
+            .expect("first queued");
+        assert!(capture.record_activity(DisplayActivityKind::Input).is_err());
+        assert!(capture.record_activity(DisplayActivityKind::Input).is_ok());
+        assert_eq!(capture.queued_commands.load(Ordering::Relaxed), 1);
+        assert!(receiver.try_recv().is_ok());
+        assert!(
+            receiver.try_recv().is_err(),
+            "nothing more enqueued after degradation"
+        );
+        assert!(
+            capture.flush().is_err(),
+            "overflow cannot finalize as complete"
+        );
+        assert!(capture.record_stream_closed().is_err());
+    }
+
+    #[test]
+    fn capture_preflight_overflow_cannot_silently_drop_frames() {
+        let (sender, _receiver) = mpsc::sync_channel(1);
+        let mut capture = DisplayCaptureWriter {
+            sender,
+            queued_commands: Arc::new(AtomicUsize::new(DISPLAY_CAPTURE_QUEUE_CAPACITY)),
+            worker: None,
+            failure: Arc::new(CaptureFailure::default()),
+        };
+        assert!(
+            !capture.has_frame_capacity(),
+            "preflight detects the full queue"
+        );
+        assert!(
+            capture.has_frame_capacity(),
+            "fanout must deliver degradation"
+        );
+        assert!(
+            capture
+                .record_frame(Arc::from(&b"frame"[..]), None, false)
+                .is_err()
+        );
+        assert!(
+            capture
+                .record_frame(Arc::from(&b"frame"[..]), None, false)
+                .is_ok()
+        );
+        assert!(capture.record_stream_closed().is_err());
+    }
+
+    #[test]
+    fn capture_buffered_failure_does_not_retry_on_drop() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut writer, _) = rolling_writer(dir.path());
+        writer.rolling_window = None;
+        let calls = Arc::new(AtomicUsize::new(0));
+        writer.segment.writer = Some(BufWriter::new(Box::new(FailingOutput {
+            calls: Arc::clone(&calls),
+            bytes: Arc::new(Mutex::new(Vec::new())),
+            successful_writes: 0,
+            fail_flush: false,
+        })));
+        writer
+            .record(DisplayTrackEvent::Resize { cols: 80, rows: 24 })
+            .expect("buffered event");
+        assert_eq!(calls.load(Ordering::Relaxed), 0, "event is still buffered");
+        let failure = CaptureFailure::default();
+        assert!(capture_write(&mut writer, &failure, DisplayCaptureFileWriter::flush).is_err());
+        drop(writer);
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            1,
+            "buffered bytes are never retried"
+        );
+    }
 
     const ROLLING_WINDOW: Duration = Duration::from_secs(10);
     const SECOND_NS: u64 = 1_000_000_000;

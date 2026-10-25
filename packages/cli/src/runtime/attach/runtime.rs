@@ -12723,12 +12723,49 @@ async fn maybe_sync_remote_clipboard(
     trigger: ClipboardSyncTrigger,
     now: Instant,
 ) {
-    if let Err(error) = sync_remote_clipboard(client, view_state, trigger, now).await {
-        tracing::warn!(
-            error = %error,
-            "remote clipboard sync failed"
-        );
+    if view_state
+        .clipboard_sync_state
+        .retry_after
+        .is_some_and(|deadline| now < deadline)
+    {
+        return;
     }
+    let previous_attempt = view_state.clipboard_sync_state.attempt_at;
+    match sync_remote_clipboard(client, view_state, trigger, now).await {
+        Ok(()) => {
+            // Disabled, unchanged and rate-limited checks must not reset a failure streak.
+            if view_state.clipboard_sync_state.attempt_at != previous_attempt {
+                if view_state.clipboard_sync_state.consecutive_failures > 0 {
+                    tracing::info!("remote clipboard sync recovered");
+                }
+                view_state.clipboard_sync_state.consecutive_failures = 0;
+                view_state.clipboard_sync_state.retry_after = None;
+            }
+        }
+        Err(error) => {
+            let state = &mut view_state.clipboard_sync_state;
+            state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+            let retry_delay = clipboard_failure_retry_delay(state.consecutive_failures);
+            state.retry_after = now.checked_add(retry_delay);
+            if state.consecutive_failures == 1 {
+                tracing::warn!(
+                    error = %error,
+                    retry_after_secs = retry_delay.as_secs(),
+                    "remote clipboard sync failed; backing off"
+                );
+            } else {
+                tracing::debug!(
+                    error = %error,
+                    retry_after_secs = retry_delay.as_secs(),
+                    "remote clipboard sync remains unavailable"
+                );
+            }
+        }
+    }
+}
+
+fn clipboard_failure_retry_delay(consecutive_failures: u32) -> Duration {
+    Duration::from_secs((5_u64 << consecutive_failures.saturating_sub(1).min(6)).min(300))
 }
 
 #[tracing::instrument(
@@ -13868,16 +13905,20 @@ async fn invoke_plugin_surface_pointer_event(
         focused_pane: None,
         hovered_pane: None,
     };
-    let result = if let Some(result) = view_state.presentation_input.invoke(&endpoint, &input) {
-        result
-    } else {
-        invoke_remote_input(
-            client,
-            &view_state.presentation_extensions,
-            &endpoint,
-            &input,
-        )
-        .await?
+    let result = match view_state.presentation_input.dispatch(&endpoint, &input) {
+        bmux_plugin::AttachPresentationInputDispatch::Handled(result) => result,
+        bmux_plugin::AttachPresentationInputDispatch::Unhandled => {
+            return Ok(false);
+        }
+        bmux_plugin::AttachPresentationInputDispatch::Unregistered => {
+            invoke_remote_input(
+                client,
+                &view_state.presentation_extensions,
+                &endpoint,
+                &input,
+            )
+            .await?
+        }
     };
     if result.consumed && !result.preserve_focus {
         update_plugin_surface_focus(
@@ -14127,16 +14168,20 @@ async fn try_handle_plugin_surface_key(
         focused_pane: attach_input_focused_context(view_state),
         hovered_pane: None,
     };
-    let result = if let Some(result) = view_state.presentation_input.invoke(&endpoint, &input) {
-        result
-    } else {
-        invoke_remote_input(
-            client,
-            &view_state.presentation_extensions,
-            &endpoint,
-            &input,
-        )
-        .await?
+    let result = match view_state.presentation_input.dispatch(&endpoint, &input) {
+        bmux_plugin::AttachPresentationInputDispatch::Handled(result) => result,
+        bmux_plugin::AttachPresentationInputDispatch::Unhandled => {
+            return Ok(false);
+        }
+        bmux_plugin::AttachPresentationInputDispatch::Unregistered => {
+            invoke_remote_input(
+                client,
+                &view_state.presentation_extensions,
+                &endpoint,
+                &input,
+            )
+            .await?
+        }
     };
     if result.release_capture {
         let _ = view_state.plugin_focus.clear();
@@ -14243,12 +14288,23 @@ async fn invoke_remote_input(
     endpoint: &bmux_plugin::AttachInputEndpoint,
     event: &AttachInputEvent,
 ) -> std::result::Result<AttachInputResult, ClientError> {
-    let codec = extensions
-        .input_codec(endpoint)
-        .ok_or_else(|| ClientError::ServerError {
+    let codec = extensions.input_codec(endpoint).ok_or_else(|| {
+        tracing::debug!(
+            capability = endpoint.capability.as_str(),
+            interface = endpoint.interface_id.as_str(),
+            operation = endpoint.operation.as_str(),
+            event_kind = event.event_kind.as_str(),
+            phase = event.phase.as_str(),
+            "remote input endpoint has no owning-plugin wire codec"
+        );
+        ClientError::ServerError {
             code: bmux_ipc::ErrorCode::UnsupportedRepresentation,
-            message: "input endpoint has no owning-plugin wire codec".into(),
-        })?;
+            message: format!(
+                "input endpoint has no owning-plugin wire codec ({} / {} / {})",
+                endpoint.capability, endpoint.interface_id, endpoint.operation
+            ),
+        }
+    })?;
     let payload = codec
         .encode_event(event)
         .map_err(|message| ClientError::ServerError {
@@ -21081,6 +21137,96 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[tokio::test]
+    async fn declining_local_surface_input_never_uses_remote_transport() {
+        let endpoint = bmux_plugin::AttachInputEndpoint {
+            capability: "example.local-only".into(),
+            interface_id: "presentation-input".into(),
+            operation: "handle-input".into(),
+        };
+        let mut surface = bmux_plugin::surface::PluginSurface::layout(
+            bmux_plugin::surface::PluginSurfaceId::new("example.local", "surface", Uuid::new_v4()),
+            1,
+            bmux_plugin::layout::PluginLayoutId::new("example.local", "layout"),
+            Vec::new(),
+        );
+        surface.target =
+            bmux_plugin::surface::PluginSurfaceTarget::Explicit(ExtensionRect::new(2, 2, 8, 4));
+        let surface = surface.interactive_region(
+            bmux_plugin::surface::PluginSurfaceRegion::new("field", ExtensionRect::new(0, 0, 8, 4))
+                .endpoint(endpoint.clone())
+                .focusable(bmux_plugin::surface::PluginSurfaceCursor::Text),
+        );
+        let mut view = attach_view_state_with_scrollback_fixture();
+        view.presentation_input
+            .register(endpoint.clone(), std::sync::Arc::new(|_| None));
+        let _ = view.retained_compositor.replace_surfaces(
+            retained_surfaces_from_plugin_surfaces(
+                &[surface],
+                &BTreeMap::new(),
+                DamageRect::new(0, 0, 80, 24),
+            ),
+            DamageRect::new(0, 0, 80, 24),
+            DamageCoalescingPolicy::default(),
+        );
+        let hit = view.retained_compositor.hit_test(3, 3).unwrap();
+        let mut client = disconnected_focus_test_client().await;
+        for phase in [
+            bmux_attach_pipeline::RetainedPointerPhase::Enter,
+            bmux_attach_pipeline::RetainedPointerPhase::Move,
+            bmux_attach_pipeline::RetainedPointerPhase::Leave,
+            bmux_attach_pipeline::RetainedPointerPhase::Down,
+            bmux_attach_pipeline::RetainedPointerPhase::Up,
+            bmux_attach_pipeline::RetainedPointerPhase::Wheel,
+            bmux_attach_pipeline::RetainedPointerPhase::Drag,
+        ] {
+            let event = bmux_attach_pipeline::RetainedPointerEvent {
+                hit: hit.clone(),
+                phase,
+                button: Some(bmux_attach_pipeline::RetainedPointerButton::Primary),
+                wheel_delta: 0,
+            };
+            assert!(
+                !invoke_plugin_surface_pointer_event(
+                    &mut client,
+                    &mut view,
+                    event,
+                    KeyModifiers::NONE
+                )
+                .await
+                .unwrap()
+            );
+        }
+        view.plugin_focus.focus_hit(&view.retained_compositor, &hit);
+        let key = TerminalKeyEvent::from(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(
+            !try_handle_plugin_surface_key(&mut client, &mut view, &key)
+                .await
+                .unwrap()
+        );
+        view.presentation_input.remove(&endpoint);
+        // Negative control: an unknown endpoint must still reject missing wire representation.
+        assert!(matches!(
+            try_handle_plugin_surface_key(&mut client, &mut view, &key).await,
+            Err(ClientError::ServerError {
+                code: bmux_ipc::ErrorCode::UnsupportedRepresentation,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn clipboard_failure_retries_are_exponential_and_bounded() {
+        assert_eq!(clipboard_failure_retry_delay(1), Duration::from_secs(5));
+        assert_eq!(clipboard_failure_retry_delay(2), Duration::from_secs(10));
+        assert_eq!(clipboard_failure_retry_delay(6), Duration::from_secs(160));
+        assert_eq!(clipboard_failure_retry_delay(7), Duration::from_mins(5));
+        assert_eq!(
+            clipboard_failure_retry_delay(u32::MAX),
+            Duration::from_mins(5)
+        );
     }
 
     #[test]

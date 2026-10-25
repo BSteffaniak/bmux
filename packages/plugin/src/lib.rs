@@ -49,8 +49,9 @@ pub use attach_companion::{
 };
 pub use attach_presentation_input::{
     AttachPresentationCommittedHandler, AttachPresentationFocusLostHandler,
-    AttachPresentationInputHandler, AttachPresentationInputRegistry,
-    AttachPresentationPasteHandler, global_attach_presentation_input_registry,
+    AttachPresentationInputDispatch, AttachPresentationInputHandler,
+    AttachPresentationInputRegistry, AttachPresentationPasteHandler,
+    dispatch_attach_presentation_input_handler, global_attach_presentation_input_registry,
     global_attach_presentation_input_registry_handle, invoke_attach_presentation_input_handler,
     register_attach_presentation_input_handler, remove_attach_presentation_input_handler,
 };

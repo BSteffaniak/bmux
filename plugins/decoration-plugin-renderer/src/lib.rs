@@ -2644,6 +2644,60 @@ mod tests {
     }
 
     #[test]
+    fn empty_content_scene_is_explicit_retained_noop_for_both_layers() {
+        let (extension, _) = extension_with_visual_request();
+        for layer in [
+            RenderExtensionLayer::BeforePaneContent,
+            RenderExtensionLayer::AfterPaneContent,
+        ] {
+            let scene = extension
+                .render_layer_scene_with_context(
+                    Uuid::from_u128(42),
+                    &ExtensionRect::new(2, 3, 20, 8),
+                    layer,
+                    &RenderExtensionContext::default(),
+                )
+                .expect(
+                    "missing decoration must select an empty retained scene, not imperative output",
+                );
+            assert!(scene.items.is_empty());
+        }
+    }
+
+    #[test]
+    fn empty_decoration_publishes_retained_revision_without_legacy_rendering() {
+        let (extension, cache) = extension_with_visual_request();
+        let id = Uuid::from_u128(42);
+        cache
+            .lock()
+            .expect("cache lock")
+            .surfaces
+            .insert(id, surface(id, Vec::new()));
+        for layer in [
+            RenderExtensionLayer::BeforePaneContent,
+            RenderExtensionLayer::AfterPaneContent,
+        ] {
+            let scene = extension
+                .render_layer_scene_with_context(
+                    id,
+                    &ExtensionRect::new(2, 3, 20, 8),
+                    layer,
+                    &RenderExtensionContext::default(),
+                )
+                .expect("empty decoration must remain a supported retained representation");
+            assert!(scene.items.is_empty());
+            assert!(scene.revision.is_some());
+        }
+        assert!(
+            cache
+                .lock()
+                .expect("cache lock")
+                .rendered_surfaces
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn overlay_role_uses_plugin_owned_fallback_border() {
         let (extension, _) = extension_with_visual_request();
         let rect = ExtensionRect::new(2, 3, 20, 8);

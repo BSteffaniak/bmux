@@ -119,7 +119,13 @@ impl Host {
                     if let IdentityCheck::Expected(expected) = identity
                         && expected != Some(checkpoint.invocation.to_string().as_str())
                     {
-                        return Err("resurrection checkpoint does not match pane invocation".into());
+                        return Err(format!(
+                            "resurrection checkpoint does not match pane invocation for launch {key}: \
+                             pane expected {}, checkpoint contains {}; restore requires the matching \
+                             pane snapshot and checkpoint; checkpoint preserved, resume refused",
+                            expected.unwrap_or("<missing>"),
+                            checkpoint.invocation,
+                        ));
                     }
                     Execution::resurrect(checkpoint).map_err(str::to_owned)
                 },
