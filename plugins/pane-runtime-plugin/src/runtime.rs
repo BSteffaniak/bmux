@@ -9057,6 +9057,11 @@ impl SessionRuntimeManager {
             .get(&runtime.focused_pane_id)
             .ok_or(SessionRuntimeError::NotFound)?;
 
+        for pane in runtime.panes.values() {
+            if !crate::private_input::register_producer(pane.meta.id, client_id.0) {
+                return Err(SessionRuntimeError::Closed);
+            }
+        }
         runtime.attached_clients.insert(client_id);
         for pane in runtime.panes.values_mut() {
             let mut output = pane
@@ -9230,6 +9235,13 @@ impl SessionRuntimeManager {
             return Err(SessionRuntimeError::Closed);
         }
 
+        // Scene visibility and write authorization above establish this producer's
+        // target. Cross-session surfaces need not belong to the attached runtime.
+        // Registration still rejects new producers during an active private scope
+        // and invalidates an in-flight barrier when membership changes.
+        if !crate::private_input::register_producer(focused_pane_id, client_id.0) {
+            return Err(SessionRuntimeError::Closed);
+        }
         let bytes = data.len();
         let recording_data =
             crate::private_input::with_producer_admission(focused_pane_id, client_id.0, || {
@@ -10038,6 +10050,11 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
             warn!(attach_session_id = %session_id.0, owner_session_id = %owner_session_id.0, %pane_id, lookup_us = lookup.as_micros(), "pane direct input lookup exceeded hot-path budget");
         }
 
+        // Register only after the authorized visible target has been resolved.
+        // The admission barrier below remains authoritative for every write.
+        if !crate::private_input::register_producer(pane_id, client_id.0) {
+            return Err(SessionRuntimeError::Closed);
+        }
         let bytes = data.len();
         let send_started = std::time::Instant::now();
         let recording_data =
@@ -14022,6 +14039,42 @@ exit 7"#
         manager
             .set_attach_viewport(session, owner, 100, 30, 0, 0, 0, 0, 0, 0)
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn interactive_attach_registers_producers_without_bypassing_private_barriers() {
+        let session = SessionId(Uuid::new_v4());
+        let client = ClientId(Uuid::new_v4());
+        let newcomer = ClientId(Uuid::new_v4());
+        let panes = [Uuid::new_v4(), Uuid::new_v4()];
+        let mut manager = manager_with_runtime(session, runtime_with_panes(&panes));
+        manager.begin_attach(session, client).unwrap();
+        for pane in panes {
+            assert_eq!(
+                crate::private_input::with_producer_admission(pane, client.0, || true),
+                Some(true)
+            );
+        }
+        let nonce = Uuid::new_v4();
+        let generation = crate::private_input::begin_barrier(panes[0], nonce, true).unwrap();
+        // Repeated admission/attachment does not clear the private transition.
+        manager.begin_attach(session, client).unwrap();
+        assert!(crate::private_input::with_producer_admission(panes[0], client.0, || ()).is_none());
+        assert!(crate::private_input::acknowledge_producer(
+            panes[0], nonce, generation, client.0, true
+        ));
+        assert!(crate::private_input::finish_barrier(
+            panes[0], nonce, generation
+        ));
+        assert!(manager.begin_attach(session, newcomer).is_err());
+        assert!(
+            !manager.runtimes[&session]
+                .attached_clients
+                .contains(&newcomer)
+        );
+        assert!(
+            crate::private_input::with_producer_admission(panes[0], newcomer.0, || ()).is_none()
+        );
     }
 
     #[tokio::test]
