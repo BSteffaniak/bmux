@@ -23,11 +23,27 @@ pub enum LinuxInputPacket {
     Opaque(Vec<u8>),
 }
 
-#[derive(Default)]
 struct Decoder {
     pending: Vec<u8>,
     since: Option<Instant>,
     failed: bool,
+}
+impl Default for Decoder {
+    fn default() -> Self {
+        // Fixed capacity avoids reallocating un-wiped private prefixes while a
+        // fragmented key/paste frame is being assembled.
+        Self {
+            pending: Vec::with_capacity(MAX_PENDING),
+            since: None,
+            failed: false,
+        }
+    }
+}
+impl Drop for Decoder {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.pending.zeroize();
+    }
 }
 impl Decoder {
     fn feed(&mut self, bytes: &[u8], now: Instant) -> io::Result<()> {
@@ -54,7 +70,11 @@ impl Decoder {
         packet: LinuxInputPacket,
         now: Instant,
     ) -> Option<LinuxInputPacket> {
-        self.pending.drain(..count);
+        use zeroize::Zeroize;
+        let len = self.pending.len();
+        self.pending.copy_within(count.., 0);
+        self.pending[len - count..].zeroize();
+        self.pending.truncate(len - count);
         self.since = (!self.pending.is_empty()).then_some(now);
         Some(packet)
     }
@@ -309,11 +329,28 @@ fn mouse(button: u32, x: u32, y: u32, release: bool) -> Option<MouseEvent> {
     )
 }
 
+struct RawOwnership;
+impl RawOwnership {
+    fn acquire() -> io::Result<Self> {
+        if !super::claim_raw_input() {
+            return Err(io::Error::other("terminal input ownership unavailable"));
+        }
+        Ok(Self)
+    }
+}
+impl Drop for RawOwnership {
+    fn drop(&mut self) {
+        super::release_raw_input();
+    }
+}
+
 /// Sole nonblocking Linux raw input owner. Do not combine with Crossterm readers.
 pub struct RawInput {
     file: std::fs::File,
     decoder: Decoder,
     size: Option<Size>,
+    // Release only after the descriptor and decoder have been dropped.
+    _ownership: RawOwnership,
 }
 impl RawInput {
     /// Adopt an exclusively owned nonblocking raw tty reader.
@@ -322,6 +359,7 @@ impl RawInput {
     /// Returns `Unsupported` when the descriptor is not a nonblocking tty.
     pub fn from_owned_tty(file: std::fs::File) -> io::Result<Self> {
         use std::os::fd::AsRawFd;
+        let ownership = RawOwnership::acquire()?;
         // SAFETY: descriptor remains live and owned throughout inspection.
         if unsafe { libc::isatty(file.as_raw_fd()) } != 1
             || unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) } & libc::O_NONBLOCK == 0
@@ -332,6 +370,7 @@ impl RawInput {
             ));
         }
         Ok(Self {
+            _ownership: ownership,
             file,
             decoder: Decoder::default(),
             size: None,
@@ -346,6 +385,7 @@ impl RawInput {
             fd::AsRawFd,
             unix::fs::{MetadataExt, OpenOptionsExt},
         };
+        let ownership = RawOwnership::acquire()?;
         // SAFETY: isatty only inspects stdout.
         if unsafe { libc::isatty(libc::STDOUT_FILENO) } != 1 {
             return Err(io::Error::new(
@@ -369,11 +409,28 @@ impl RawInput {
             return Err(io::Error::other("not tty"));
         }
         Ok(Self {
+            _ownership: ownership,
             file,
             decoder: Decoder::default(),
             size: None,
         })
     }
+    /// Wipe buffered decoded input and flush pending raw tty input at an admission barrier.
+    /// The caller must serialize this with reads and fence all application-pending events.
+    /// # Errors
+    /// Returns a terminal flush failure, leaving the caller responsible for quarantine.
+    pub fn drain_and_reset(&mut self) -> io::Result<()> {
+        use std::os::fd::AsRawFd;
+        use zeroize::Zeroize;
+        self.decoder.pending.zeroize();
+        self.decoder = Decoder::default();
+        // SAFETY: the descriptor is live and exclusively owned by this reader.
+        if unsafe { libc::tcflush(self.file.as_raw_fd(), libc::TCIFLUSH) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
     /// Read or decode at most one bounded packet. Caller must retry after ESC deadline.
     /// # Errors
     /// Returns read/ioctl/budget errors; no bytes are silently truncated.
@@ -382,8 +439,8 @@ impl RawInput {
         if let Some(packet) = self.decoder.next(now)? {
             return Ok(Some(packet));
         }
-        let mut bytes = [0u8; 4096];
-        match self.file.read(&mut bytes) {
+        let mut bytes = zeroize::Zeroizing::new([0u8; 4096]);
+        match self.file.read(&mut bytes[..]) {
             Ok(0) => {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
@@ -533,11 +590,9 @@ mod tests {
             unsafe { libc::fcntl(slave.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) },
             0
         );
-        let mut reader = RawInput {
-            file: slave,
-            decoder: Decoder::default(),
-            size: None,
-        };
+        let mut reader = RawInput::from_owned_tty(slave).unwrap();
+        assert!(RawOwnership::acquire().is_err());
+        assert!(super::super::read_event().is_err());
         master.write_all(b"\x1b_Gi=42;O").unwrap();
         for _ in 0..10 {
             assert!(!matches!(
@@ -565,6 +620,28 @@ mod tests {
         assert!(
             matches!(&packets[1], LinuxInputPacket::Event(Event::Key(key)) if key.key == KeyCode::Char('q'))
         );
+        // Incomplete decoded paste and kernel-pending bytes are both erased by a
+        // real PTY barrier. The first fresh key is not appended to either canary.
+        master
+            .write_all(b"\x1b[200~decoded-private-canary")
+            .unwrap();
+        for _ in 0..10 {
+            let _ = reader.read_ready(Instant::now()).unwrap();
+        }
+        master.write_all(b"kernel-private-canary").unwrap();
+        reader.drain_and_reset().unwrap();
+        assert!(reader.decoder.pending.is_empty());
+        master.write_all(b"z").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            if let Some(LinuxInputPacket::Event(Event::Key(key))) =
+                reader.read_ready(Instant::now()).unwrap()
+            {
+                assert_eq!(key.key, KeyCode::Char('z'));
+                break;
+            }
+            assert!(Instant::now() < deadline);
+        }
         let size = libc::winsize {
             ws_row: 41,
             ws_col: 93,

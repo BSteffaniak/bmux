@@ -3,6 +3,9 @@
 //! The capture owner must acknowledge suppression before acquisition, and must
 //! drain both decoded and raw pending input before resuming. Dropping a lease
 //! deliberately does NOT resume capture or ordinary input.
+#[cfg(all(target_os = "linux", feature = "crossterm"))]
+pub mod ingress;
+
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
@@ -21,6 +24,27 @@ pub trait CaptureSuppression: Send {
     /// # Errors
     /// Return an error if any capture boundary cannot be suppressed.
     fn suppress(&mut self) -> Result<(), PrivateInputError>;
+    /// Negotiate an enclosing capture boundary using the already-owned raw reader.
+    /// No second reader may be constructed. Default owners need no wire handshake.
+    /// # Errors
+    /// Returns failure unless the containing capture owner acknowledges suppression.
+    #[cfg(all(target_os = "linux", feature = "crossterm"))]
+    fn suppress_with_reader(
+        &mut self,
+        _reader: &mut bmux_tui::crossterm::input::RawInput,
+    ) -> Result<(), PrivateInputError> {
+        self.suppress()
+    }
+    /// Restore an enclosing boundary through the same raw reader, after local reset.
+    /// # Errors
+    /// Returns failure unless restoration is acknowledged; quarantine remains active.
+    #[cfg(all(target_os = "linux", feature = "crossterm"))]
+    fn resume_with_reader(
+        &mut self,
+        _reader: &mut bmux_tui::crossterm::input::RawInput,
+    ) -> Result<(), PrivateInputError> {
+        self.drain_and_resume()
+    }
     /// Drain raw, decoded, and application-pending input, then restore capture.
     /// # Errors
     /// Return an error without restoring capture if the barrier cannot be proved.
@@ -83,11 +107,26 @@ impl PrivateInputGate {
     /// Route an owned event before any diagnostic, cloning, or normal admission.
     /// Secret key/paste events never leave this function while the gate is private.
     #[must_use]
-    pub fn route(&self, mut event: Event) -> PrivateInputRoute {
+    pub fn route(&self, event: Event) -> PrivateInputRoute {
+        self.route_checked(event, || true)
+    }
+
+    // Generation validation is serialized with acquire/drain by the gate lock.
+    // A reader may have decoded an event just before a capture barrier took ownership.
+    /// Route a decoded event only while its reader generation still owns admission.
+    pub(crate) fn route_checked(
+        &self,
+        mut event: Event,
+        current: impl FnOnce() -> bool,
+    ) -> PrivateInputRoute {
         let Ok(mut state) = self.0.lock() else {
             wipe_event(&mut event);
             return PrivateInputRoute::Consumed;
         };
+        if !current() {
+            wipe_event(&mut event);
+            return PrivateInputRoute::Consumed;
+        }
         if !state.quarantined {
             return PrivateInputRoute::Public(event);
         }
@@ -95,6 +134,13 @@ impl PrivateInputGate {
             wipe_event(&mut event);
             return PrivateInputRoute::Consumed;
         };
+        if controller.state() != bmux_tui::sensitive_input::SensitiveInputState::Active {
+            if matches!(&event, Event::Resize(_)) {
+                return PrivateInputRoute::Public(event);
+            }
+            wipe_event(&mut event);
+            return PrivateInputRoute::Consumed;
+        }
         match &mut event {
             Event::Paste(text) => {
                 controller.insert(text);
@@ -198,6 +244,16 @@ impl Drop for PrivateInputLease {
             && let Some(mut controller) = state.controller.take()
         {
             controller.close();
+        }
+    }
+}
+
+/// Securely discard a route rejected by an application lifecycle fence.
+impl PrivateInputRoute {
+    /// Wipe a rejected public payload; private buffers zeroize on drop.
+    pub fn discard(self) {
+        if let Self::Public(mut event) = self {
+            wipe_event(&mut event);
         }
     }
 }

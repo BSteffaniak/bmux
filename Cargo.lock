@@ -1586,6 +1586,7 @@ dependencies = [
  "crossterm",
  "futures-util",
  "image",
+ "tokio",
  "tracing",
  "unicode-width",
  "uuid",

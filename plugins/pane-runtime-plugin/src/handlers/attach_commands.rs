@@ -795,6 +795,38 @@ fn validate_input_selection(
     })
 }
 
+pub fn input_producer_barriers(
+    ctx: &NativeServiceContext,
+) -> Result<
+    Vec<bmux_pane_runtime_plugin_api::attach_runtime_commands::InputProducerBarrierV2>,
+    AttachCommandError,
+> {
+    let client = caller_client_id(ctx)?;
+    Ok(crate::private_input::pending_barriers(client.0))
+}
+
+#[derive(Deserialize)]
+pub struct AcknowledgeInputProducerBarrierArgs {
+    pub pane_id: Uuid,
+    pub nonce: Uuid,
+    pub generation: u64,
+    pub supported: bool,
+}
+
+pub fn acknowledge_input_producer_barrier(
+    req: &AcknowledgeInputProducerBarrierArgs,
+    ctx: &NativeServiceContext,
+) -> Result<bool, AttachCommandError> {
+    let client = caller_client_id(ctx)?;
+    Ok(crate::private_input::acknowledge_producer(
+        req.pane_id,
+        req.nonce,
+        req.generation,
+        client.0,
+        req.supported,
+    ))
+}
+
 /// Public, secret-free capture suppression request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SuppressPaneInputCaptureArgs {

@@ -1668,6 +1668,8 @@ pub(crate) enum PaneRuntimeCommand {
         _permit: tokio::sync::OwnedSemaphorePermit,
     },
     AuthorizedInput(Vec<u8>, input_authority::InputAuthority),
+    /// A producer fence must be ordered behind every already-admitted PTY write.
+    InputFence(std::sync::mpsc::SyncSender<()>),
     Input(Vec<u8>),
     Resize {
         rows: u16,
@@ -5414,6 +5416,9 @@ impl SessionRuntimeManager {
         // Register readers before exposing attached membership. Never restart,
         // select a pane, mutate shared geometry or resize any PTY here.
         for pane in runtime.panes.values_mut() {
+            if !crate::private_input::register_producer(pane.meta.id, client.0) {
+                return Err(SessionRuntimeError::Closed);
+            }
             pane.output_buffer
                 .lock()
                 .map_err(|_| SessionRuntimeError::Closed)?
@@ -6303,6 +6308,7 @@ impl SessionRuntimeManager {
 
         let (startup_tx, startup) = watch::channel(None);
         let (cleanup_tx, cleanup) = watch::channel(None);
+        let fence_input_for_reader = input_tx.clone();
         let task = tokio::spawn(async move {
             let _publication_guard = PendingPublicationGuard(Arc::clone(&publication_for_task));
             if let Some(permit) = launch_permit {
@@ -7106,7 +7112,11 @@ impl SessionRuntimeManager {
                                 // entire retained parser publication, not merely read.
                                 let Ok(requested_size) = last_requested_size_for_reader.lock() else { break; };
                                 let publication_ticket = reader.publication_ticket();
-                                let (capture_output, capture_reply) = capture_handshake.process(&buffer[..bytes_read], pane_id);
+                                let (capture_output, capture_reply) = capture_handshake.process_with_fence(&buffer[..bytes_read], pane_id, || {
+                                    let (sent, received) = std::sync::mpsc::sync_channel(1);
+                                    fence_input_for_reader.send(PaneRuntimeCommand::InputFence(sent)).is_ok()
+                                        && received.recv_timeout(Duration::from_secs(2)).is_ok()
+                                });
                                 if !capture_reply.is_empty() {
                                     if let Ok(mut writer) = writer_for_reader.lock() {
                                         if writer.write_all(&capture_reply).is_err() || writer.flush().is_err() { break; }
@@ -7490,6 +7500,11 @@ impl SessionRuntimeManager {
                                     let _ = authority.write(&mut *writer, &bytes);
                                 }
                             }
+                            Some(PaneRuntimeCommand::InputFence(ack)) => {
+                                // This task owns FIFO writes. The mutex also serializes
+                                // concurrent protocol replies from the output reader.
+                                if let Ok(_writer) = writer.lock() { let _ = ack.send(()); }
+                            }
                             Some(PaneRuntimeCommand::Input(bytes)) => {
                                 if let Ok(mut writer) = writer.lock()
                                     && writer.write_all(&bytes).is_ok()
@@ -7763,6 +7778,10 @@ impl SessionRuntimeManager {
         }
         let pane = prepared.pane.take().expect("prepared split owns pane");
         for client in &session.attached_clients {
+            anyhow::ensure!(
+                crate::private_input::register_producer(pane_id, client.0),
+                "input producer budget exhausted"
+            );
             if let Ok(mut output) = pane.output_buffer.lock() {
                 output.register_client_at_tail(*client);
             }
@@ -7864,6 +7883,10 @@ impl SessionRuntimeManager {
         );
         self.register_pane_input(session_id, &handle);
         for client_id in client_ids {
+            anyhow::ensure!(
+                crate::private_input::register_producer(pane_id, client_id.0),
+                "input producer budget exhausted"
+            );
             if let Ok(mut output) = handle.output_buffer.lock() {
                 output.register_client_at_tail(client_id);
             }
@@ -9209,20 +9232,24 @@ impl SessionRuntimeManager {
 
         let bytes = data.len();
         let recording_data =
-            crate::private_input::with_capture_barrier(focused_pane_id, |capture| {
-                let recording_data = capture.then(|| pane_input_recording_data(&data)).flatten();
-                pane.send_input(data, owner_session_id)?;
-                if let Some((handle, data)) = recording_data {
-                    record_pane_input_raw(
-                        &handle,
-                        data,
-                        owner_session_id,
-                        focused_pane_id,
-                        client_id,
-                    );
-                }
-                Ok::<(), SessionRuntimeError>(())
-            });
+            crate::private_input::with_producer_admission(focused_pane_id, client_id.0, || {
+                crate::private_input::with_capture_barrier(focused_pane_id, |capture| {
+                    let recording_data =
+                        capture.then(|| pane_input_recording_data(&data)).flatten();
+                    pane.send_input(data, owner_session_id)?;
+                    if let Some((handle, data)) = recording_data {
+                        record_pane_input_raw(
+                            &handle,
+                            data,
+                            owner_session_id,
+                            focused_pane_id,
+                            client_id,
+                        );
+                    }
+                    Ok::<(), SessionRuntimeError>(())
+                })
+            })
+            .flatten();
         match recording_data {
             Some(result) => result?,
             None => return Err(SessionRuntimeError::Closed),
@@ -10013,14 +10040,19 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
 
         let bytes = data.len();
         let send_started = std::time::Instant::now();
-        let recording_data = crate::private_input::with_capture_barrier(pane_id, |capture| {
-            let recording_data = capture.then(|| pane_input_recording_data(&data)).flatten();
-            pane.send_input(data)?;
-            if let Some((handle, data)) = recording_data {
-                record_pane_input_raw(&handle, data, owner_session_id, pane_id, client_id);
-            }
-            Ok::<(), SessionRuntimeError>(())
-        });
+        let recording_data =
+            crate::private_input::with_producer_admission(pane_id, client_id.0, || {
+                crate::private_input::with_capture_barrier(pane_id, |capture| {
+                    let recording_data =
+                        capture.then(|| pane_input_recording_data(&data)).flatten();
+                    pane.send_input(data)?;
+                    if let Some((handle, data)) = recording_data {
+                        record_pane_input_raw(&handle, data, owner_session_id, pane_id, client_id);
+                    }
+                    Ok::<(), SessionRuntimeError>(())
+                })
+            })
+            .flatten();
         match recording_data {
             Some(result) => result?,
             None => return Err(SessionRuntimeError::Closed),

@@ -316,6 +316,12 @@ fn route_authorized(context: NativeServiceContext) -> ServiceResponse {
         "attach-runtime-commands", "attach-open" => |req: attach_commands::AttachOpenArgs, ctx| {
             Ok::<_, ServiceResponse>(attach_commands::attach_open(&req, ctx))
         },
+        "attach-runtime-commands", "input-producer-barriers-v2" => |_req: serde_json::Value, ctx| {
+            Ok::<_, ServiceResponse>(attach_commands::input_producer_barriers(ctx))
+        },
+        "attach-runtime-commands", "acknowledge-input-producer-barrier-v2" => |req: attach_commands::AcknowledgeInputProducerBarrierArgs, ctx| {
+            Ok::<_, ServiceResponse>(attach_commands::acknowledge_input_producer_barrier(&req, ctx))
+        },
         "attach-runtime-commands", "suppress-pane-input-capture-v1" => |req: attach_commands::SuppressPaneInputCaptureArgs, ctx| {
             Ok::<_, ServiceResponse>(attach_commands::suppress_pane_input_capture(&req, ctx))
         },

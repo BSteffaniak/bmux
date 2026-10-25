@@ -13,7 +13,17 @@ pub(crate) struct CaptureHandshake {
 
 impl CaptureHandshake {
     /// Strip only complete, versioned control requests; ordinary output is preserved.
+    #[cfg(test)]
     pub(crate) fn process(&mut self, bytes: &[u8], pane_id: Uuid) -> (Vec<u8>, Vec<u8>) {
+        self.process_with_fence(bytes, pane_id, || false)
+    }
+
+    pub(crate) fn process_with_fence(
+        &mut self,
+        bytes: &[u8],
+        pane_id: Uuid,
+        mut settle_writes: impl FnMut() -> bool,
+    ) -> (Vec<u8>, Vec<u8>) {
         let mut output = Vec::with_capacity(bytes.len());
         let mut replies = Vec::new();
         for &byte in bytes {
@@ -32,6 +42,42 @@ impl CaptureHandshake {
             }
             if self.pending.len() > PREFIX.len() && byte == 7 {
                 let payload = &self.pending[PREFIX.len()..self.pending.len() - 1];
+                if let Ok(payload) = std::str::from_utf8(payload)
+                    && let Some((phase, nonce)) = payload.split_once(':')
+                    && matches!(phase, "enter-v2" | "exit-v2")
+                    && let Ok(nonce) = Uuid::parse_str(nonce)
+                {
+                    let entering = phase == "enter-v2";
+                    let generation = super::private_input::begin_barrier(pane_id, nonce, entering);
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                    let mut accepted = false;
+                    if let Some(generation) = generation {
+                        loop {
+                            // Producer acknowledgments precede the FIFO fence. This
+                            // never acknowledges bytes still queued for the PTY writer.
+                            if super::private_input::barrier_ready(pane_id, nonce, generation) {
+                                accepted = settle_writes()
+                                    && super::private_input::finish_barrier(
+                                        pane_id, nonce, generation,
+                                    );
+                                break;
+                            }
+                            if std::time::Instant::now() >= deadline {
+                                break;
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(2));
+                        }
+                    }
+                    replies.extend_from_slice(
+                        format!(
+                            "\x1b[200~bmux-input-capture-v2:{nonce}:{pane_id}:{phase}:{}\x1b[201~",
+                            if accepted { "ok" } else { "denied" }
+                        )
+                        .as_bytes(),
+                    );
+                    self.pending.clear();
+                    continue;
+                }
                 let nonce = std::str::from_utf8(payload)
                     .ok()
                     .and_then(|text| Uuid::parse_str(text).ok());

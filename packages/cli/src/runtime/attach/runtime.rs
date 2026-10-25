@@ -81,6 +81,7 @@ use crossterm::style::Print;
 use crossterm::terminal;
 use crossterm::terminal::{BeginSynchronizedUpdate, Clear, ClearType, EndSynchronizedUpdate};
 
+use bmux_pane_runtime_plugin_api::attach_runtime_commands as attach_terminal_commands;
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::hash::{Hash, Hasher};
@@ -129,6 +130,15 @@ pub trait AttachTerminal: Write {
     ) -> Result<bool>;
 
     fn next_event(&mut self) -> AttachTerminalEventFuture<'_>;
+
+    /// Pause/drain/reset the real input owner; unsupported producers deny private capture.
+    fn fence_private_input(&mut self) -> Result<u64> {
+        anyhow::bail!("input producer cannot acknowledge a private barrier")
+    }
+    /// Resume only after the matching domain-owned barrier settles.
+    fn resume_private_input(&mut self, _generation: u64) -> Result<()> {
+        anyhow::bail!("input producer cannot resume a private barrier")
+    }
 
     /// Optional trusted in-process action accompanying the just-consumed event.
     /// Ordinary terminals and read-only observers cannot supply one.
@@ -192,6 +202,13 @@ trait AttachHost {
 
     fn next_event(&mut self) -> AttachHostEventFuture<'_>;
 
+    fn fence_private_input(&mut self) -> Result<u64> {
+        anyhow::bail!("input host cannot acknowledge a private barrier")
+    }
+    fn resume_private_input(&mut self, _generation: u64) -> Result<()> {
+        anyhow::bail!("input host cannot resume a private barrier")
+    }
+
     /// Optional trusted in-process action accompanying the just-consumed event.
     /// Ordinary terminals and read-only observers cannot supply one.
     fn take_owned_action(&mut self) -> Option<String> {
@@ -238,6 +255,12 @@ impl<T: AttachTerminal + ?Sized> AttachHost for TerminalAttachHost<'_, T> {
     }
     fn enter_attach_mode(&mut self, keyboard: bool, mouse: bool, paste: bool) -> Result<bool> {
         self.0.enter_attach_mode(keyboard, mouse, paste)
+    }
+    fn fence_private_input(&mut self) -> Result<u64> {
+        self.0.fence_private_input()
+    }
+    fn resume_private_input(&mut self, generation: u64) -> Result<()> {
+        self.0.resume_private_input(generation)
     }
     fn next_event(&mut self) -> AttachHostEventFuture<'_> {
         let event = self.0.next_event();
@@ -1343,6 +1366,22 @@ fn headless_image_capabilities_from_env() -> bmux_image::host_caps::HostImageCap
 }
 
 impl AttachTerminal for RealAttachTerminal {
+    fn fence_private_input(&mut self) -> Result<u64> {
+        // A nested attach client has another cooperating capture boundary. Until
+        // recursive producer negotiation is available, never attest on its behalf.
+        if std::env::var_os("BMUX_PANE").is_some()
+            || std::env::var_os("TMUX").is_some()
+            || std::env::var_os("STY").is_some()
+        {
+            anyhow::bail!("enclosing attach input producer is unsupported");
+        }
+        Ok(self.terminal.fence_input()?)
+    }
+    fn resume_private_input(&mut self, generation: u64) -> Result<()> {
+        // Discard input that arrived while the producer was paused as well.
+        Ok(self.terminal.resume_input(generation)?)
+    }
+
     fn geometry(&self) -> TerminalGeometry {
         current_attach_terminal_geometry()
     }
@@ -4870,6 +4909,9 @@ async fn run_session_attach_with_host<T: AttachHost + ?Sized>(
             .publish_state(&bmux_tabs_plugin_api::tabs_list::STATE_KIND, snapshot);
     }
 
+    let mut producer_barrier_tick = tokio::time::interval(Duration::from_millis(20));
+    producer_barrier_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut producer_fences = BTreeMap::<(Uuid, Uuid, u64), u64>::new();
     let mut publication_tick = tokio::time::interval(Duration::from_secs(1));
     publication_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut observer_capture_pending = false;
@@ -4886,6 +4928,32 @@ async fn run_session_attach_with_host<T: AttachHost + ?Sized>(
             None
         };
         tokio::select! {
+            _ = producer_barrier_tick.tick() => {
+                let barriers = attach_terminal_commands::client::input_producer_barriers_v2(&mut client).await;
+                if let Ok(Ok(barriers)) = barriers {
+                    let current = barriers.iter().map(|b| (b.pane_id, b.nonce, b.generation)).collect::<std::collections::BTreeSet<_>>();
+                    for barrier in barriers {
+                        let key = (barrier.pane_id, barrier.nonce, barrier.generation);
+                        if producer_fences.contains_key(&key) { continue; }
+                        let fence: Result<u64> = producer_fences.values().next().copied().map_or_else(|| {
+                            let generation = terminal.fence_private_input()?;
+                            // Drop chord/decoder state before acknowledging the application barrier.
+                            attach_input_processor = InputProcessor::new(attach_input_processor.keymap().clone(), keyboard_enhanced);
+                            Ok(generation)
+                        }, Ok);
+                        let supported = fence.is_ok();
+                        if let Ok(generation) = fence { producer_fences.insert(key, generation); }
+                        let _ = attach_terminal_commands::client::acknowledge_input_producer_barrier_v2(
+                            &mut client, barrier.pane_id, barrier.nonce, barrier.generation, supported,
+                        ).await;
+                    }
+                    let generation = producer_fences.values().next().copied();
+                    producer_fences.retain(|key, _| current.contains(key));
+                    if producer_fences.is_empty() && let Some(generation) = generation {
+                        terminal.resume_private_input(generation)?;
+                    }
+                }
+            }
             _ = publication_tick.tick(), if view_state.committed_source.is_some() => {
                 let snapshot = super::committed_source::latest(&view_state);
                 if let Some(source) = view_state.committed_source.as_mut() {
@@ -4945,7 +5013,7 @@ async fn run_session_attach_with_host<T: AttachHost + ?Sized>(
             }
 
             // Terminal input (keyboard, mouse, resize) via async EventStream.
-            terminal_result = terminal.next_event() => {
+            terminal_result = terminal.next_event(), if producer_fences.is_empty() => {
                 'host_input: {
                 let Some(result) = terminal_result? else {
                     // A closed output-only viewport is an explicit detach,

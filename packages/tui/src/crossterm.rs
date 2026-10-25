@@ -162,9 +162,45 @@ fn pop_keyboard_enhancement_flags<W: Write>(writer: &mut W) -> io::Result<()> {
 #[cfg(target_os = "linux")]
 pub mod input;
 
+// 0: no owner, 1: exclusive raw owner, 2: permanent Crossterm global owner.
+static INPUT_OWNER: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+#[cfg(target_os = "linux")]
+pub(super) fn claim_raw_input() -> bool {
+    INPUT_OWNER
+        .compare_exchange(
+            0,
+            1,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        )
+        .is_ok()
+}
+#[cfg(target_os = "linux")]
+pub(super) fn release_raw_input() {
+    INPUT_OWNER.store(0, std::sync::atomic::Ordering::SeqCst);
+}
+fn claim_legacy_input() -> bool {
+    matches!(
+        INPUT_OWNER.compare_exchange(
+            0,
+            2,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst
+        ),
+        Ok(_) | Err(2)
+    )
+}
+
+/// Whether the process has initialized Crossterm's global input owner.
+#[must_use]
+pub fn legacy_input_used() -> bool {
+    INPUT_OWNER.load(std::sync::atomic::Ordering::SeqCst) == 2
+}
+
 /// Async Crossterm event stream converted into backend-neutral BMUX events.
 pub struct CrosstermEventStream {
-    inner: EventStream,
+    inner: Option<EventStream>,
 }
 
 impl CrosstermEventStream {
@@ -172,7 +208,7 @@ impl CrosstermEventStream {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            inner: EventStream::new(),
+            inner: claim_legacy_input().then(EventStream::new),
         }
     }
 
@@ -186,9 +222,16 @@ impl CrosstermEventStream {
     /// Returns any error reported by Crossterm's event stream.
     pub async fn next_event(&mut self) -> io::Result<Event> {
         loop {
-            let event = self.inner.next().await.transpose()?.ok_or_else(|| {
-                io::Error::new(io::ErrorKind::UnexpectedEof, "terminal event stream closed")
-            })?;
+            let event = self
+                .inner
+                .as_mut()
+                .ok_or_else(|| io::Error::other("terminal input already owned"))?
+                .next()
+                .await
+                .transpose()?
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::UnexpectedEof, "terminal event stream closed")
+                })?;
             if let Some(event) = event_from_crossterm(event) {
                 return Ok(event);
             }
@@ -200,8 +243,11 @@ impl Stream for CrosstermEventStream {
     type Item = io::Result<Event>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let Some(inner) = self.inner.as_mut() else {
+            return Poll::Ready(Some(Err(io::Error::other("terminal input already owned"))));
+        };
         loop {
-            match Pin::new(&mut self.inner).poll_next(cx) {
+            match Pin::new(&mut *inner).poll_next(cx) {
                 Poll::Ready(Some(Ok(event))) => {
                     if let Some(event) = event_from_crossterm(event) {
                         return Poll::Ready(Some(Ok(event)));
@@ -230,6 +276,9 @@ impl Default for CrosstermEventStream {
 ///
 /// Returns any error reported by crossterm while polling or reading events.
 pub fn poll_event(timeout: Duration) -> io::Result<Option<Event>> {
+    if !claim_legacy_input() {
+        return Err(io::Error::other("terminal input already owned"));
+    }
     if !crossterm_poll(timeout)? {
         return Ok(None);
     }
@@ -242,7 +291,96 @@ pub fn poll_event(timeout: Duration) -> io::Result<Option<Event>> {
 ///
 /// Returns any error reported by crossterm while reading events.
 pub fn read_event() -> io::Result<Option<Event>> {
+    if !claim_legacy_input() {
+        return Err(io::Error::other("terminal input already owned"));
+    }
     Ok(event_from_crossterm(crossterm_read()?))
+}
+
+/// Convert backend-neutral input into Crossterm's event vocabulary for existing consumers.
+/// Internal tick/user events have no wire equivalent.
+#[must_use]
+pub fn event_to_crossterm(event: crate::event::Event) -> Option<CrosstermEvent> {
+    use bmux_keyboard::KeyCode;
+    use crossterm::event::{
+        KeyCode as C, KeyEvent, KeyModifiers as M, MouseButton as B, MouseEvent as Mouse,
+        MouseEventKind as K,
+    };
+    Some(match event {
+        crate::event::Event::Key(stroke) => {
+            let code = match stroke.key {
+                KeyCode::Char(ch) => C::Char(ch),
+                KeyCode::Space => C::Char(' '),
+                KeyCode::Enter => C::Enter,
+                KeyCode::Tab => C::Tab,
+                KeyCode::Backspace => C::Backspace,
+                KeyCode::Delete => C::Delete,
+                KeyCode::Escape => C::Esc,
+                KeyCode::Up => C::Up,
+                KeyCode::Down => C::Down,
+                KeyCode::Left => C::Left,
+                KeyCode::Right => C::Right,
+                KeyCode::Home => C::Home,
+                KeyCode::End => C::End,
+                KeyCode::PageUp => C::PageUp,
+                KeyCode::PageDown => C::PageDown,
+                KeyCode::Insert => C::Insert,
+                KeyCode::F(n) => C::F(n),
+            };
+            let mut modifiers = M::empty();
+            for (enabled, flag) in [
+                (stroke.modifiers.ctrl, M::CONTROL),
+                (stroke.modifiers.alt, M::ALT),
+                (stroke.modifiers.shift, M::SHIFT),
+                (stroke.modifiers.super_key, M::SUPER),
+                (stroke.modifiers.hyper, M::HYPER),
+                (stroke.modifiers.meta, M::META),
+            ] {
+                if enabled {
+                    modifiers.insert(flag);
+                }
+            }
+            CrosstermEvent::Key(KeyEvent::new(code, modifiers))
+        }
+        crate::event::Event::Paste(text) => CrosstermEvent::Paste(text),
+        crate::event::Event::Resize(size) => CrosstermEvent::Resize(size.width, size.height),
+        crate::event::Event::Focus(crate::event::FocusEvent::Gained) => CrosstermEvent::FocusGained,
+        crate::event::Event::Focus(crate::event::FocusEvent::Lost) => CrosstermEvent::FocusLost,
+        crate::event::Event::Mouse(mouse) => {
+            let button = |button| match button {
+                crate::event::MouseButton::Left => B::Left,
+                crate::event::MouseButton::Middle => B::Middle,
+                _ => B::Right,
+            };
+            let kind = match mouse.kind {
+                crate::event::MouseEventKind::Down(b) => K::Down(button(b)),
+                crate::event::MouseEventKind::Up(b) => K::Up(button(b)),
+                crate::event::MouseEventKind::Drag(b) => K::Drag(button(b)),
+                crate::event::MouseEventKind::Move => K::Moved,
+                crate::event::MouseEventKind::ScrollUp => K::ScrollUp,
+                crate::event::MouseEventKind::ScrollDown => K::ScrollDown,
+                crate::event::MouseEventKind::ScrollLeft => K::ScrollLeft,
+                crate::event::MouseEventKind::ScrollRight => K::ScrollRight,
+            };
+            let mut modifiers = M::empty();
+            if mouse.modifiers.ctrl {
+                modifiers.insert(M::CONTROL);
+            }
+            if mouse.modifiers.alt {
+                modifiers.insert(M::ALT);
+            }
+            if mouse.modifiers.shift {
+                modifiers.insert(M::SHIFT);
+            }
+            CrosstermEvent::Mouse(Mouse {
+                kind,
+                column: mouse.position.x,
+                row: mouse.position.y,
+                modifiers,
+            })
+        }
+        crate::event::Event::Tick | crate::event::Event::User(_) => return None,
+    })
 }
 
 /// Convert a crossterm event into a BMUX TUI event.

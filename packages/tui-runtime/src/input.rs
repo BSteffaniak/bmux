@@ -157,9 +157,57 @@ impl ManagedTerminalInput {
     /// Panics when called outside a Tokio runtime.
     #[must_use]
     pub fn start(capacity: usize) -> Self {
+        #[cfg(target_os = "linux")]
+        {
+            let (sender, receiver) = mpsc::channel(capacity.max(1));
+            let (shutdown, mut stopped) = watch::channel(false);
+            let task = tokio::spawn(async move {
+                let mut reader = match bmux_tui::crossterm::input::RawInput::open_stdout_tty() {
+                    Ok(reader) => reader,
+                    Err(error) => {
+                        let _ = sender.send(Err(error)).await;
+                        return;
+                    }
+                };
+                loop {
+                    if *stopped.borrow() {
+                        break;
+                    }
+                    match reader.read_ready(std::time::Instant::now()) {
+                        Ok(Some(bmux_tui::crossterm::input::LinuxInputPacket::Event(event))) => {
+                            tokio::select! { biased; _ = stopped.changed() => break,
+                            result = sender.send(Ok(event)) => if result.is_err() { break; } }
+                        }
+                        Ok(Some(bmux_tui::crossterm::input::LinuxInputPacket::Opaque(
+                            mut bytes,
+                        ))) => {
+                            use zeroize::Zeroize;
+                            bytes.zeroize();
+                        }
+                        Ok(None) => {
+                            tokio::select! { biased; _ = stopped.changed() => break,
+                            () = tokio::time::sleep(std::time::Duration::from_millis(2)) => {} }
+                        }
+                        Err(error) => {
+                            let _ = sender.send(Err(error)).await;
+                            break;
+                        }
+                    }
+                }
+            });
+            Self {
+                receiver,
+                shutdown,
+                task: Some(task),
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
         Self::start_stream(capacity, CrosstermEventStream::new())
     }
 
+    /// Linux single-reader implementation is used by production; stream injection
+    /// remains available for non-Linux backends and deterministic runtime tests.
+    #[cfg(not(target_os = "linux"))]
     fn start_stream<S>(capacity: usize, mut events: S) -> Self
     where
         S: futures_util::Stream<Item = Result<Event, std::io::Error>> + Send + Unpin + 'static,
@@ -292,6 +340,38 @@ impl TerminalInput {
     where
         P: Program,
     {
+        #[cfg(target_os = "linux")]
+        {
+            let reader = bmux_tui::crossterm::input::RawInput::open_stdout_tty();
+            let events = Box::pin(futures_util::stream::unfold(
+                Some(reader),
+                |state| async move {
+                    let mut reader = match state? {
+                        Ok(reader) => reader,
+                        Err(error) => return Some((Err(error), None)),
+                    };
+                    loop {
+                        match reader.read_ready(std::time::Instant::now()) {
+                            Ok(Some(bmux_tui::crossterm::input::LinuxInputPacket::Event(
+                                event,
+                            ))) => return Some((Ok(event), Some(Ok(reader)))),
+                            Ok(Some(bmux_tui::crossterm::input::LinuxInputPacket::Opaque(
+                                mut bytes,
+                            ))) => {
+                                use zeroize::Zeroize;
+                                bytes.zeroize();
+                            }
+                            Ok(None) => {
+                                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                            }
+                            Err(error) => return Some((Err(error), None)),
+                        }
+                    }
+                },
+            ));
+            Self::start_stream::<P, _>(handle, map_error, events)
+        }
+        #[cfg(not(target_os = "linux"))]
         Self::start_stream::<P, _>(handle, map_error, CrosstermEventStream::new())
     }
 
