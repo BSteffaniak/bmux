@@ -181,13 +181,30 @@ impl LocalIpcListener {
     pub async fn accept(&self) -> Result<LocalIpcStream, IpcTransportError> {
         match &self.inner {
             #[cfg(unix)]
-            ListenerInner::Unix(listener) => {
+            ListenerInner::Unix(listener) => loop {
                 let (stream, _) = listener.accept().await?;
-                unix_security::verify_peer_with_policy(&stream, self.security.peer)?;
-                Ok(LocalIpcStream {
+                if let Err(error) =
+                    unix_security::verify_peer_with_policy(&stream, self.security.peer)
+                {
+                    if !matches!(
+                        error.kind(),
+                        std::io::ErrorKind::NotConnected
+                            | std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::ConnectionAborted
+                    ) {
+                        return Err(error.into());
+                    }
+                    // A disconnected readiness probe is not a listener failure.
+                    // Keep policy mismatches as errors; never admit unchecked
+                    // streams. Yield to bound work under repeated disconnects.
+                    drop(stream);
+                    tokio::task::yield_now().await;
+                    continue;
+                }
+                return Ok(LocalIpcStream {
                     inner: StreamInner::Unix(stream),
-                })
-            }
+                });
+            },
             #[cfg(windows)]
             ListenerInner::WindowsNamedPipe { pipe_name, pending } => {
                 let mut pending = pending.lock().await;
@@ -823,6 +840,43 @@ where
 #[path = "security_policy_tests.rs"]
 mod security_policy_tests;
 
+/// Create and validate an owner-private directory for local IPC artifacts.
+///
+/// `migrate_legacy` must only be selected by the owner of a managed directory,
+/// not by generic socket binding. It removes group/other read and search access
+/// from an owned, non-writable legacy directory without touching its contents.
+/// Existing sockets and running listeners are unaffected; this grants no
+/// authority to reclaim an endpoint or start a competing runtime.
+///
+/// Returns whether existing directory permissions were tightened.
+///
+/// # Errors
+/// Returns an error for unsafe ownership, ancestors, symlinks, shared writable
+/// modes, or filesystem failures. Non-Unix platforms only create the directory.
+pub fn prepare_private_directory(
+    path: &std::path::Path,
+    migrate_legacy: bool,
+) -> std::io::Result<bool> {
+    #[cfg(unix)]
+    {
+        unix_security::prepare_directory(path, migrate_legacy).map_err(|error| {
+            std::io::Error::new(
+                error.kind(),
+                format!(
+                    "preparing private IPC directory {}: {error}",
+                    path.display()
+                ),
+            )
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = migrate_legacy;
+        std::fs::create_dir_all(path)?;
+        Ok(false)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{IpcTransportError, LocalIpcListener, LocalIpcStream};
@@ -883,6 +937,108 @@ mod tests {
         let client = LocalIpcStream::connect(&endpoint).await.unwrap();
         let accepted = listener.accept().await.unwrap();
         drop((client, accepted));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn disconnected_readiness_probes_do_not_terminate_accept() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let directory = PrivateTestDir::new();
+        let path = directory.0.join("ipc.sock");
+        let endpoint = IpcEndpoint::unix_socket(&path);
+        let listener = LocalIpcListener::bind(&endpoint).unwrap();
+        for _ in 0..8 {
+            drop(std::os::unix::net::UnixStream::connect(&path).unwrap());
+        }
+        let mut client = LocalIpcStream::connect(&endpoint).await.unwrap();
+        client.write_all(&[42]).await.unwrap();
+        // Some systems can still authenticate a closed peer; those accepted
+        // streams are legitimate. Drain at most the probes plus the live client.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            for _ in 0..9 {
+                let mut stream = listener.accept().await.unwrap();
+                let mut byte = [0];
+                if stream.read(&mut byte).await.unwrap() == 1 {
+                    assert_eq!(byte, [42]);
+                    return;
+                }
+            }
+            panic!("live client was not accepted after readiness probes");
+        })
+        .await
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn managed_directory_migration_preserves_live_endpoint_and_contents() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        let directory = PrivateTestDir::new();
+        let path = directory.0.join("ipc.sock");
+        let endpoint = IpcEndpoint::unix_socket(&path);
+        let listener = LocalIpcListener::bind(&endpoint).unwrap();
+        let inode = std::fs::metadata(&path).unwrap().ino();
+        let state = directory.0.join("state");
+        std::fs::write(&state, b"retained").unwrap();
+        std::fs::set_permissions(&directory.0, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(super::prepare_private_directory(&directory.0, true).unwrap());
+        assert!(!super::prepare_private_directory(&directory.0, true).unwrap());
+        assert_eq!(
+            std::fs::metadata(&directory.0)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(std::fs::metadata(&path).unwrap().ino(), inode);
+        assert_eq!(std::fs::read(&state).unwrap(), b"retained");
+        assert!(LocalIpcListener::bind(&endpoint).is_err());
+        let client = LocalIpcStream::connect(&endpoint).await.unwrap();
+        let accepted = listener.accept().await.unwrap();
+        drop((client, accepted));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn migration_rejects_shared_modes_and_symlinks_without_repair() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let directory = PrivateTestDir::new();
+        let target = directory.0.join("target");
+        std::fs::create_dir(&target).unwrap();
+        for mode in [0o770, 0o777, 0o1755, 0o2755, 0o555] {
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(mode)).unwrap();
+            let actual_mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o7777;
+            // macOS can clear setgid for an unprivileged caller; only test
+            // rejection of special bits when the filesystem retained them.
+            if actual_mode != mode {
+                assert_eq!(mode, 0o2755);
+                continue;
+            }
+            assert!(
+                super::prepare_private_directory(&target, true).is_err(),
+                "requested mode {mode:o}, actual mode {actual_mode:o}"
+            );
+            assert_eq!(
+                std::fs::metadata(&target).unwrap().permissions().mode() & 0o7777,
+                mode
+            );
+        }
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let link = directory.0.join("alias");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(super::prepare_private_directory(&link, true).is_err());
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        std::fs::set_permissions(&directory.0, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(super::prepare_private_directory(&target, true).is_err());
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        std::fs::set_permissions(&directory.0, std::fs::Permissions::from_mode(0o700)).unwrap();
     }
 
     #[cfg(unix)]

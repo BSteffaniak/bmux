@@ -1987,6 +1987,7 @@ dependencies = [
  "bmux_config_doc",
  "bmux_config_doc_derive",
  "bmux_event_models",
+ "bmux_ipc",
  "bmux_keybind",
  "bmux_slots",
  "libc",
@@ -1994,6 +1995,7 @@ dependencies = [
  "switchy",
  "thiserror 2.0.20",
  "toml 1.1.4+spec-1.1.0",
+ "tracing",
 ]
 
 [[package]]

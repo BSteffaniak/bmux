@@ -1951,7 +1951,7 @@ fn host_runtime_state_path(paths: &ConfigPaths) -> PathBuf {
 }
 
 fn save_host_runtime_state(paths: &ConfigPaths, state: &HostRuntimeState) -> Result<()> {
-    std::fs::create_dir_all(&paths.runtime_dir).with_context(|| {
+    paths.ensure_runtime_dir().with_context(|| {
         format!(
             "failed creating runtime dir {}",
             paths.runtime_dir.display()
@@ -2255,7 +2255,7 @@ fn load_auth_state_optional(paths: &ConfigPaths) -> Result<Option<AuthState>> {
 }
 
 fn save_auth_state(paths: &ConfigPaths, state: &AuthState) -> Result<()> {
-    std::fs::create_dir_all(&paths.runtime_dir).with_context(|| {
+    paths.ensure_runtime_dir().with_context(|| {
         format!(
             "failed creating runtime dir {}",
             paths.runtime_dir.display()
@@ -5208,7 +5208,8 @@ mod tests {
                 "bmux-remote-cli-tests-{label}-{}",
                 uuid::Uuid::new_v4()
             ));
-            std::fs::create_dir_all(&path).expect("create temp dir");
+            bmux_ipc::transport::prepare_private_directory(&path, false)
+                .expect("create private temp dir");
             Self { path }
         }
 

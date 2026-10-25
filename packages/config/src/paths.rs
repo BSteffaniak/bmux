@@ -106,6 +106,9 @@ pub struct ConfigPaths {
     config_dir_candidates: Vec<PathBuf>,
     /// Runtime directory for sockets and temporary files
     pub runtime_dir: PathBuf,
+    /// Exact resolved default path eligible for legacy permission migration.
+    /// Explicit/custom roots are never inferred to be migration targets.
+    managed_runtime_dir: Option<PathBuf>,
     /// Data directory for persistent data
     pub data_dir: PathBuf,
     /// State directory for persisted local state (recordings, layout, traces)
@@ -129,6 +132,7 @@ impl ConfigPaths {
             config_dir,
             config_dir_candidates,
             runtime_dir,
+            managed_runtime_dir: None,
             data_dir,
             state_dir,
         }
@@ -291,6 +295,23 @@ impl ConfigPaths {
         &self.config_dir_candidates
     }
 
+    /// Prepare the resolved runtime directory before writing runtime artifacts.
+    ///
+    /// Default BMUX-owned paths may migrate safe legacy read/search permissions.
+    /// Custom paths remain strict, and changing the public runtime path does not
+    /// carry migration authority to the replacement path. Tightening permissions
+    /// does not stop listeners or grant endpoint/lifetime-claim ownership.
+    ///
+    /// # Errors
+    /// Returns an error for unsafe paths, modes, ownership, or filesystem errors.
+    pub fn ensure_runtime_dir(&self) -> std::io::Result<()> {
+        let migrate = self.managed_runtime_dir.as_ref() == Some(&self.runtime_dir);
+        if bmux_ipc::transport::prepare_private_directory(&self.runtime_dir, migrate)? {
+            tracing::info!(path = %self.runtime_dir.display(), "migrated legacy runtime directory permissions to 0700");
+        }
+        Ok(())
+    }
+
     /// Ensure all necessary directories exist
     ///
     /// # Errors
@@ -298,7 +319,7 @@ impl ConfigPaths {
     /// Returns an error if any directory cannot be created.
     pub fn ensure_dirs(&self) -> std::io::Result<()> {
         std::fs::create_dir_all(&self.config_dir)?;
-        create_runtime_dir(&self.runtime_dir)?;
+        self.ensure_runtime_dir()?;
         std::fs::create_dir_all(&self.data_dir)?;
         std::fs::create_dir_all(self.state_dir())?;
         std::fs::create_dir_all(self.recordings_dir())?;
@@ -325,19 +346,6 @@ fn default_runtime_root(xdg_runtime_dir: Option<&std::ffi::OsStr>) -> PathBuf {
         let _ = xdg_runtime_dir;
         std::env::temp_dir().join("bmux")
     }
-}
-
-fn create_runtime_dir(path: &std::path::Path) -> std::io::Result<()> {
-    let mut builder = std::fs::DirBuilder::new();
-    builder.recursive(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt as _;
-        builder.mode(0o700);
-    }
-    // Existing directories are deliberately not chmod/chowned. The IPC bind
-    // boundary validates ownership, ancestors, symlinks and private mode.
-    builder.create(path)
 }
 
 fn sanitize_endpoint_component(value: &str) -> String {
@@ -525,6 +533,9 @@ impl ConfigPaths {
         };
 
         let mut paths = Self::new(config_dir, runtime_dir, data_dir, default_state_dir());
+        if runtime_dir_override.is_none() {
+            paths.managed_runtime_dir = Some(paths.runtime_dir.clone());
+        }
         paths.config_dir_candidates = config_dir_candidates;
         paths
     }
@@ -662,9 +673,9 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn runtime_creation_is_private_and_does_not_repair_existing_modes() {
+    fn runtime_creation_and_managed_legacy_migration() {
         use std::os::unix::fs::PermissionsExt as _;
-        let root = std::env::temp_dir().join(format!(
+        let root = PathBuf::from("/tmp").join(format!(
             "bmux-config-runtime-mode-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
@@ -673,18 +684,60 @@ mod tests {
                 .as_nanos()
         ));
         let runtime = root.join("runtime");
-        super::create_runtime_dir(&runtime).unwrap();
+        let mut paths = ConfigPaths::new(root.clone(), runtime.clone(), root.clone(), root.clone());
+        paths.ensure_runtime_dir().unwrap();
         assert_eq!(
             std::fs::metadata(&runtime).unwrap().permissions().mode() & 0o777,
             0o700
         );
         std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o755)).unwrap();
-        super::create_runtime_dir(&runtime).unwrap();
+        assert!(
+            paths.ensure_runtime_dir().is_err(),
+            "custom roots must not migrate"
+        );
         assert_eq!(
             std::fs::metadata(&runtime).unwrap().permissions().mode() & 0o777,
             0o755
         );
+        paths.managed_runtime_dir = Some(runtime.clone());
+        std::fs::write(runtime.join("retained-state"), b"unchanged").unwrap();
+        paths.ensure_runtime_dir().unwrap();
+        paths.ensure_runtime_dir().unwrap();
+        assert_eq!(
+            std::fs::metadata(&runtime).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::read(runtime.join("retained-state")).unwrap(),
+            b"unchanged"
+        );
+        let replacement = root.join("replacement");
+        paths.runtime_dir = replacement.clone();
+        paths.ensure_runtime_dir().unwrap();
+        std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            paths.ensure_runtime_dir().is_err(),
+            "public path mutation cannot transfer migration authority"
+        );
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn only_default_runtime_resolution_selects_migration() {
+        let default = ConfigPaths::from_overrides("default", None, None, None);
+        assert_eq!(
+            default.managed_runtime_dir.as_ref(),
+            Some(&default.runtime_dir)
+        );
+        let named = ConfigPaths::from_overrides("test", None, None, None);
+        assert_eq!(named.managed_runtime_dir.as_ref(), Some(&named.runtime_dir));
+        let explicit = ConfigPaths::from_overrides(
+            "default",
+            Some(default.runtime_dir.as_os_str()),
+            None,
+            None,
+        );
+        assert!(explicit.managed_runtime_dir.is_none());
     }
 
     #[test]

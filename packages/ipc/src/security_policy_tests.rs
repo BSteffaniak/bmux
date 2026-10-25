@@ -127,12 +127,18 @@ async fn peer_policy_applies_to_both_connect_and_accept() {
         .await
         .is_err()
     );
-    // Drain the rejected outgoing connection; the listener's own policy still rejects it.
-    assert!(listener.accept().await.is_err());
+    // The failed outgoing connection is already closed. Accept may skip it as
+    // a disconnected probe; a subsequent live peer must still be rejected by
+    // the listener's independently selected identity policy.
     let client = LocalIpcStream::connect_with_policy(&dir.endpoint(), IdentityPolicy::Unrestricted)
         .await
         .unwrap();
-    assert!(listener.accept().await.is_err());
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept())
+            .await
+            .expect("live mismatched peer must be rejected, not skipped")
+            .is_err()
+    );
     drop((client, listener));
 }
 

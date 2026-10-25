@@ -1159,11 +1159,17 @@ mod tests {
         Ok(())
     }
 
+    fn private_scope_directory() -> tempfile::TempDir {
+        let directory = tempfile::tempdir().unwrap();
+        bmux_ipc::transport::prepare_private_directory(directory.path(), true).unwrap();
+        directory
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn nested_service_kernel_scope_restores_bound_parent() {
         // Nix's TMPDIR can be long; keep the socket name short enough for
         // macOS's sockaddr_un rather than appending a UUID to the full path.
-        let directory = tempfile::tempdir().unwrap();
+        let directory = private_scope_directory();
         let endpoint = bmux_ipc::IpcEndpoint::unix_socket(directory.path().join("private/s"));
         let server = BmuxServer::new(endpoint.clone());
         server

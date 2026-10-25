@@ -128,9 +128,19 @@ impl PairingStore {
     ) -> Result<T> {
         // Open a fresh lock fd per transaction: flock locks open descriptions,
         // so sharing a single fd would not serialize concurrent threads.
-        let lock = self
-            .directory
-            .open_file(self.lock, libc::O_RDWR | libc::O_CREAT | libc::O_NONBLOCK)?;
+        // Publish the lock with exclusive creation, then open existing names
+        // without O_CREAT. On macOS concurrent O_CREAT opens racing the first
+        // flock can spuriously fail with ENOENT. Never unlink a lock name.
+        let lock = match self.directory.open_file(
+            self.lock,
+            libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NONBLOCK,
+        ) {
+            Ok(lock) => lock,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => self
+                .directory
+                .open_file(self.lock, libc::O_RDWR | libc::O_NONBLOCK)?,
+            Err(error) => return Err(error).context("create pairing store lock"),
+        };
         check_private(&lock, false)?;
         loop {
             // SAFETY: lock owns a live fd. Closing it releases the lock on every return path.

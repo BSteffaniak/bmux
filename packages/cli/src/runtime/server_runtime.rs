@@ -376,11 +376,11 @@ pub(super) fn server_pid_file_path() -> PathBuf {
 }
 
 pub(super) fn write_server_pid_file(pid: u32) -> Result<()> {
-    let path = server_pid_file_path();
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("failed creating runtime dir {}", parent.display()))?;
-    }
+    let paths = bmux_config::ConfigPaths::default();
+    paths
+        .ensure_runtime_dir()
+        .context("prepare runtime PID directory")?;
+    let path = paths.server_pid_file();
     publish_server_pid_file(&path, pid)
 }
 

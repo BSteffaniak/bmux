@@ -11,7 +11,7 @@ use std::path::{Component, Path};
 fn denied() -> io::Error {
     io::Error::new(
         io::ErrorKind::PermissionDenied,
-        "IPC socket directory does not satisfy the selected ownership, mode, or ancestor policy; existing directories are never repaired automatically",
+        "IPC socket directory does not satisfy the selected ownership, mode, or ancestor policy; socket binding never repairs existing directories; automatic legacy migration is limited to managed private directories, and does not unlink live sockets",
     )
 }
 
@@ -20,28 +20,40 @@ pub(super) fn effective_uid() -> u32 {
     unsafe { libc::geteuid() }
 }
 
-/// Walk descriptor-relative, never chmod/chown an existing directory. Ancestors
-/// must not be replaceable by another user. Root-owned sticky directories (e.g.
-/// /tmp) are safe ancestors, but never safe socket parents themselves.
+/// Socket parent validation never repairs existing directories. Callers owning
+/// managed private directories may separately request strict legacy migration.
 pub(super) fn prepare_parent_with_policy(
     path: &Path,
     policy: UnixSecurityPolicy,
 ) -> io::Result<()> {
     policy.validate()?;
-    prepare_parent_checked(path, policy).map_err(|error| {
-        io::Error::new(
-            error.kind(),
-            format!(
-                "IPC parent validation for {} failed: {error}",
-                path.display()
-            ),
-        )
-    })
+    let absolute = std::env::current_dir()?.join(path);
+    prepare_directory_checked(absolute.parent().ok_or_else(denied)?, policy, false)
+        .map(|_| ())
+        .map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "IPC parent validation for {} failed: {error}",
+                    path.display()
+                ),
+            )
+        })
 }
 
-fn prepare_parent_checked(path: &Path, policy: UnixSecurityPolicy) -> io::Result<()> {
-    // mode_t is u16 on macOS and u32 on Linux. Keep the conversion checked
-    // on narrower targets; it is intentionally an identity conversion on Linux.
+/// Prepare a managed private directory without inheriting transport relaxations.
+/// Returns whether existing permissions were migrated; never touches contents.
+pub(super) fn prepare_directory(path: &Path, migrate: bool) -> io::Result<bool> {
+    prepare_directory_checked(path, UnixSecurityPolicy::strict(), migrate)
+}
+
+fn prepare_directory_checked(
+    path: &Path,
+    policy: UnixSecurityPolicy,
+    migrate: bool,
+) -> io::Result<bool> {
+    // mode_t is u16 on macOS and u32 on Linux. Keep conversion checked on
+    // narrower targets; it is intentionally an identity conversion on Linux.
     #[allow(clippy::useless_conversion)]
     let directory_mode = libc::mode_t::try_from(policy.directory_mode).map_err(|_| {
         io::Error::new(
@@ -50,9 +62,10 @@ fn prepare_parent_checked(path: &Path, policy: UnixSecurityPolicy) -> io::Result
         )
     })?;
     let absolute = std::env::current_dir()?.join(path);
-    let parent = absolute.parent().ok_or_else(denied)?;
+    let parent = absolute.as_path();
     let components: Vec<_> = parent.components().collect();
     let mut directory = File::open("/")?;
+    let mut migrated = false;
     for (index, component) in components.iter().enumerate() {
         let name = match component {
             Component::RootDir | Component::CurDir => continue,
@@ -106,10 +119,21 @@ fn prepare_parent_checked(path: &Path, policy: UnixSecurityPolicy) -> io::Result
         let uid = effective_uid();
         let mode = metadata.permissions().mode();
         if last {
+            if migrate && mode & 0o077 != 0 {
+                // Migration is only reachable with the strict policy above.
+                // Do not repair writable, special-mode, or foreign directories.
+                if metadata.uid() != uid || mode & 0o700 != 0o700 || mode & 0o7022 != 0 {
+                    return Err(denied());
+                }
+                directory.set_permissions(std::fs::Permissions::from_mode(0o700))?;
+                directory.sync_all()?;
+                migrated = true;
+            }
+            let metadata = directory.metadata()?;
             if !identity_matches(metadata.uid(), policy.parent_owner)
                 || policy
                     .parent_mode
-                    .is_some_and(|required| mode & 0o777 != required)
+                    .is_some_and(|required| metadata.permissions().mode() & 0o777 != required)
             {
                 return Err(denied());
             }
@@ -117,7 +141,16 @@ fn prepare_parent_checked(path: &Path, policy: UnixSecurityPolicy) -> io::Result
             && ((metadata.uid() != 0 && metadata.uid() != uid)
                 || (mode & 0o022 != 0 && !(metadata.uid() == 0 && mode & 0o1000 != 0)))
         {
-            return Err(denied());
+            let ancestor: std::path::PathBuf = components[..=index].iter().collect();
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "unsafe IPC socket ancestor {}: owner uid {}, mode {:04o}; ancestors must be root/current-user owned and not group/other writable (except root-owned sticky directories); repair the ancestor explicitly or select a safe runtime root",
+                    ancestor.display(),
+                    metadata.uid(),
+                    mode & 0o7777
+                ),
+            ));
         }
     }
     // A socket directly under / has no private parent.
@@ -126,7 +159,7 @@ fn prepare_parent_checked(path: &Path, policy: UnixSecurityPolicy) -> io::Result
     {
         return Err(denied());
     }
-    Ok(())
+    Ok(migrated)
 }
 
 pub(super) fn require_uid(peer_uid: Option<u32>, expected_uid: u32) -> io::Result<()> {

@@ -56,7 +56,9 @@ impl StartupOwnership {
     /// Nonblocking exclusion: a starting owner is not a stopped runtime.
     /// Acquired only in the real server process, never its daemon launcher.
     pub(super) fn acquire(paths: &ConfigPaths) -> Result<Self> {
-        std::fs::create_dir_all(&paths.runtime_dir).context("create runtime claim directory")?;
+        paths
+            .ensure_runtime_dir()
+            .context("prepare runtime claim directory")?;
         let path = paths.runtime_dir.join(CLAIM_NAME);
         if let Ok(metadata) = std::fs::symlink_metadata(&path) {
             ensure!(

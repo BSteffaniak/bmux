@@ -286,7 +286,7 @@ fn frontend_loss_does_not_release_child_claim_and_server_crash_does() {
 fn corrupt_and_future_receipts_fail_even_without_an_endpoint() {
     let root = tempfile::tempdir().unwrap();
     let paths = paths(&root);
-    std::fs::create_dir_all(&paths.runtime_dir).unwrap();
+    paths.ensure_runtime_dir().unwrap();
     for receipt in [
         "future-claim-v2\n",
         "bmux-endpoint-v1 1 broken\n",

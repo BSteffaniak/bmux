@@ -10,6 +10,39 @@ bmux doctor
 bmux perf status --json
 ```
 
+## Runtime Directory Security and Upgrades
+
+On Unix, the socket directory must be owned by the effective user and have mode
+`0700`. Ancestors must be owned by root or that user and must not be group/other
+writable, except for root-owned sticky directories such as `/tmp`. Untrusted
+symlinks are rejected; root-owned system aliases such as macOS `/tmp` are
+allowed
+as ancestors, but not as the immediate socket directory.
+
+BMUX creates new runtime directories privately before writing startup logs, PID
+files, or lifetime claims. For the default runtime root (including named runtime
+subdirectories), it automatically tightens owned legacy directories such as
+`0755` to `0700` when their ancestors are safe and their modes grant no
+group/other write access or special bits. The migration is logged, changes only
+that directory through an opened descriptor, and preserves its contents and live
+sockets. It does not grant startup ownership, stop a running server, reclaim a
+socket, or recursively change permissions.
+
+Explicit `BMUX_RUNTIME_DIR` overrides, slot-configured runtime roots, and other
+custom roots are validated but are not automatically migrated. For a rejected
+custom directory, verify its ownership and intended use, stop the old runtime
+before explicit repair or relocation, and change only the intended directory to
+`0700`. Do not recursively chmod an installation or unlink a live socket.
+
+An unsafe-ancestor error identifies the offending path, owner UID, and mode.
+Changing only the final directory will not repair a writable ancestor. For
+example, a `0777` volume mount without the sticky bit is rejected even when the
+runtime directory below it is private. BMUX does not chmod mount points or
+silently switch runtime roots: changing endpoints can strand existing work or
+start a second runtime. Have the owner/admin repair the ancestor, or explicitly
+select a safe runtime root and use it consistently for subsequent commands.
+Changing the runtime root does not migrate existing running work.
+
 ## Recording Hygiene
 
 ```bmux-cli

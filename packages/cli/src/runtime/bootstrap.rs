@@ -189,7 +189,7 @@ pub(super) fn next_default_tab_name(sessions: &[SessionSummary]) -> String {
 }
 
 fn open_server_startup_log(runtime_dir: &std::path::Path) -> Result<std::fs::File> {
-    std::fs::create_dir_all(runtime_dir).with_context(|| {
+    bmux_ipc::transport::prepare_private_directory(runtime_dir, false).with_context(|| {
         format!(
             "failed creating server runtime directory: {}",
             runtime_dir.display()
@@ -279,7 +279,10 @@ async fn run_server_start_inner(
 ) -> Result<u8> {
     let local_connection_context = ConnectionContext::new(Some("local"));
     let paths = ConfigPaths::default();
-    // The daemon launcher owns no claim or metadata mutation authority.
+    // Directory preparation can only tighten safe default-path permissions; it
+    // never grants the launcher endpoint or lifetime-claim mutation authority.
+    paths.ensure_runtime_dir()?;
+    // The daemon launcher owns no claim or endpoint mutation authority.
     let startup_ownership = if daemon && !foreground_internal {
         None
     } else {
@@ -1251,8 +1254,8 @@ mod tests {
     use bmux_ipc::ErrorCode;
     use bmux_ipc::transport::IpcTransportError;
 
-    #[test]
-    fn startup_log_creates_missing_runtime_directory_and_truncates_on_restart() {
+    #[tokio::test]
+    async fn startup_log_creates_missing_runtime_directory_and_truncates_on_restart() {
         use std::io::Write;
 
         let root = tempfile::tempdir().expect("temporary directory");
@@ -1272,6 +1275,18 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&runtime_dir)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+            let endpoint = bmux_ipc::IpcEndpoint::unix_socket(runtime_dir.join("test.sock"));
+            let listener = bmux_ipc::transport::LocalIpcListener::bind(&endpoint)
+                .expect("startup-created directory must support secure socket binding");
+            drop(listener);
             assert_eq!(
                 std::fs::metadata(&path)
                     .expect("log metadata")
