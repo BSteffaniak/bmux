@@ -48,7 +48,7 @@ wall-clock pass/fail thresholds. See [reproduction and audit notes](../../docs/i
 for release commands, baseline limitations, and separate nested-terminal repro.
 
 ```sh
-bash scripts/dev.sh cargo bench -p bmux_image --bench image_pipeline \
+nix develop --command cargo bench -p bmux_image --bench image_pipeline \
   --features kitty,sixel,iterm2 -- --iterations 20 --json
 ```
 

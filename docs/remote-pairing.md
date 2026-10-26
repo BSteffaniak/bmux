@@ -140,7 +140,7 @@ Run the isolated Unix PTY acceptance fixture against an explicit newly built
 binary:
 
 ```sh
-bash scripts/dev.sh cargo build -p bmux_cli --bin bmux
+nix develop --command cargo build -p bmux_cli --bin bmux
 # In the Nix development shell:
 python3 scripts/smoke-remote-pairing.py --binary "$CARGO_TARGET_DIR/debug/bmux"
 ```

@@ -22,7 +22,7 @@ case "${1:?inputs or result required}" in
             force=true ;;
           infra/live-*|.github/workflows/live-*.yml|.github/workflows/docs-deploy.yml|.github/workflows/configure-production-infra.yml)
             force=true ;;
-          scripts/*live*|scripts/*web*|scripts/*presenter*|scripts/build-site-artifact.sh|scripts/dev.sh|scripts/smoke-pty-runtime.sh|scripts/compat-matrix.sh|scripts/check-workspace-dependencies.sh|scripts/test-compat-pty.py)
+          scripts/*live*|scripts/*web*|scripts/*presenter*|scripts/build-site-artifact.sh|scripts/smoke-pty-runtime.sh|scripts/compat-matrix.sh|scripts/check-workspace-dependencies.sh|scripts/test-compat-pty.py)
             force=true ;;
           README.md) force=true ;;
           docs/*)

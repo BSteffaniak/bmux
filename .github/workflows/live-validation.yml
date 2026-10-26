@@ -73,7 +73,7 @@ jobs:
         run: python3 scripts/test-live-native-browser-startup.py --browser "$LIVE_ACCEPTANCE_BROWSER"
       - name: Native runtime and live renderer acceptance (no deployment)
         run: |
-          bash scripts/dev.sh bash -euo pipefail -c '
+          nix develop --command bash -euo pipefail -c '
             test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
             bash scripts/smoke-pty-runtime.sh
             bash scripts/compat-matrix.sh

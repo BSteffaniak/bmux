@@ -14,7 +14,7 @@ replaced-epoch output is removed, including detached pending render targets.
 Before compiling the docs application or generating the static site, run:
 
 ```sh
-bash scripts/dev.sh bash scripts/build-web-renderer.sh
+nix develop --command bash scripts/build-web-renderer.sh
 ```
 
 The script builds the renderer in the Nix-selected target directory, writes the

@@ -404,7 +404,7 @@ before exit: canonical raw-event parser replay must preserve that output.
 The coordinator runs builds and tests inside the Nix-selected toolchain:
 
 ```sh
-bash scripts/dev.sh cargo test -p bmux_cli --test recording_process_integration
+nix develop --command cargo test -p bmux_cli --test recording_process_integration
 ```
 
 Full repository validation remains governed by `AGENTS.md`; this focused command

@@ -75,7 +75,7 @@ harness with explicit artifacts. The following builds are for a deliberately
 reserved local development slot, not commands implicitly run by deployment:
 
 ```sh
-bash scripts/dev.sh bash -euo pipefail -c '
+nix develop --command bash -euo pipefail -c '
   cargo build --locked -p bmux-live-relay
   cargo build --locked -p bmux_web_renderer --example snapshot --example wire_frame
   target_dir="$(cargo metadata --locked --no-deps --format-version 1 | python3 -c "import json,sys; print(json.load(sys.stdin)[\"target_directory\"])")"

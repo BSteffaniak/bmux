@@ -6,7 +6,7 @@ repo.
 ## Toolchain (REQUIRED)
 
 `flake.lock` owns the Rust version. Run the commands below inside `nix develop`
-(or the direnv-loaded shell). Without direnv, use `bash scripts/dev.sh
+(or the direnv-loaded shell). Without direnv, use `nix develop --command
 <command>`.
 Do not use floating rustup stable or override the Nix-selected compiler/target
 directory. See `docs/development-toolchain.md` for editor and native CI setup.

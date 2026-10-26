@@ -70,7 +70,7 @@ left-to-right layout was too wide; the final layout uses two horizontal groups
 stacked vertically. Short edge labels avoid overlapping nodes. This is
 diagram-level inspection, not a full-slide or venue-legibility acceptance.
 
-Renderer validation build: `bash scripts/dev.sh cargo build -p
+Renderer validation build: `nix develop --command cargo build -p
 bmux_mermaid_render --example compare --release --quiet`.
 Explicit test artifact:
 `target/nix/jk0hczvfqqk0cm5wwjc521c868lcwqj8-rust-default-1.96.0/release/examples/compare`.
@@ -129,7 +129,8 @@ The gallery now reserves height for its dialog preview and tests scrolling to
 the
 actual gallery placement rather than assuming a gallery is at the slide end.
 
-Rust commands ran in `bash scripts/dev.sh`. CLI/runtime smoke and compatibility
+Rust commands ran in `nix develop --command`. CLI/runtime smoke and
+compatibility
 commands were not required: no CLI/runtime or terminal-protocol code changed.
 No browser or physical-terminal rehearsal, provider requests, or plugin
 deployment
@@ -167,7 +168,7 @@ factory registration by itself.
 - Formatting, Markdown lint, workspace manifest boundary check, deck parse, and
   `git diff --check` — PASS.
 
-Rust commands ran through `bash scripts/dev.sh`. The built plugin is
+Rust commands ran through `nix develop --command`. The built plugin is
 `target/nix/jk0hczvfqqk0cm5wwjc521c868lcwqj8-rust-default-1.96.0/debug/libbmux_presenter_plugin.dylib`,
 SHA-256 `deab4950d925138cc5ea4932aff04feb83a28bddbb3be4fa79ef1e05d5c82e59`.
 It was built locally, not installed over the running plugin. Use the normal

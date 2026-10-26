@@ -16,7 +16,6 @@ pub fn inputs(root: &Path) -> io::Result<Vec<PathBuf>> {
         "Cargo.lock",
         "flake.nix",
         "flake.lock",
-        "scripts/dev.sh",
         "scripts/presenter-adapter.js",
         ".cargo/config.toml",
     ] {
@@ -225,7 +224,6 @@ mod tests {
             "Cargo.lock",
             "flake.nix",
             "flake.lock",
-            "scripts/dev.sh",
             "scripts/presenter-adapter.js",
             ".cargo/config.toml",
         ] {

@@ -13,7 +13,7 @@ test('standalone compiled custom component browser acceptance', {
   timeout: 180000,
 }, async () => {
   assert.ok(process.env.CHROMIUM_BIN, 'explicit Chromium executable required');
-  const build = spawnSync('bash', ['scripts/dev.sh', 'bash', 'packages/web-renderer/tests/build-custom-component.sh'],
+  const build = spawnSync('nix', ['develop', '--command', 'bash', 'packages/web-renderer/tests/build-custom-component.sh'],
     { encoding:'utf8', timeout:120000 });
   assert.equal(build.status, 0, build.stdout + build.stderr);
   const root = resolve('packages/web-renderer');

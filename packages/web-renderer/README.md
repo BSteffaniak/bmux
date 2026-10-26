@@ -290,14 +290,14 @@ needed
 when the matching `wasm-bindgen` 0.2.126 CLI is already supplied:
 
 ```sh
-bash scripts/dev.sh cargo test -p bmux_web_renderer
-bash scripts/dev.sh cargo clippy -p bmux_web_renderer --all-targets -- -D warnings
-bash scripts/dev.sh cargo build -p bmux_web_renderer --features wasm --target wasm32-unknown-unknown
+nix develop --command cargo test -p bmux_web_renderer
+nix develop --command cargo clippy -p bmux_web_renderer --all-targets -- -D warnings
+nix develop --command cargo build -p bmux_web_renderer --features wasm --target wasm32-unknown-unknown
 # Resolve the workspace target directory under the selected Nix environment.
 target/web-tools/bin/wasm-bindgen --target web --out-dir <host-assets> \
   <workspace-target>/wasm32-unknown-unknown/debug/bmux_web_renderer.wasm
 # Copy browser/index.html and browser/bootstrap.js into that same asset directory.
-bash scripts/dev.sh cargo run -p bmux_web_renderer --example snapshot
+nix develop --command cargo run -p bmux_web_renderer --example snapshot
 ```
 
 The standalone example emits the exact full JSON without a BMUX runtime and

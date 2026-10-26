@@ -62,7 +62,7 @@ explicitly:
 
 ```sh
 BCODE_RESURRECTION_TEST_BINARY=/absolute/path/to/bcode \
-  bash scripts/dev.sh cargo test -p bmux_cli \
+  nix develop --command cargo test -p bmux_cli \
   --test bcode_resurrection_integration -- --ignored
 ```
 

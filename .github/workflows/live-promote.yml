@@ -77,7 +77,7 @@ jobs:
       - name: Build one immutable candidate without deployment secrets
         env:
           LIVE_FLY_APP: ${{ vars.LIVE_FLY_APP }}
-        run: bash scripts/dev.sh bash scripts/build-live-artifact.sh "$RUNNER_TEMP/live-candidate"
+        run: nix develop --command bash scripts/build-live-artifact.sh "$RUNNER_TEMP/live-candidate"
       - name: Package candidate
         run: |
           tar -C "$RUNNER_TEMP/live-candidate" -czf "$RUNNER_TEMP/live-candidate.tar.gz" .
@@ -114,7 +114,7 @@ jobs:
       - name: Build same-revision complete site without deployment secrets
         env:
           BMUX_LIVE_ENDPOINT_ORIGIN: https://live.bmux.dev
-        run: bash scripts/dev.sh bash scripts/build-site-artifact.sh "$RUNNER_TEMP/site-candidate"
+        run: nix develop --command bash scripts/build-site-artifact.sh "$RUNNER_TEMP/site-candidate"
       - name: Package site candidate
         run: |
           test "$(cat "$RUNNER_TEMP/site-candidate/REVISION")" = "$GITHUB_SHA"

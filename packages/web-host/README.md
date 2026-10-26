@@ -84,7 +84,7 @@ Roots must be absolute and real directories, not symlinks.
 
 Source builds capture an absolute root and SHA-256 in `build.rs`. Before
 executing
-`bash scripts/dev.sh`, runtime recomputes and compares the input identity.
+`nix develop --command`, runtime recomputes and compares the input identity.
 Missing
 or changed sources fail explicitly; an existing root is not sufficient
 authority.
@@ -116,7 +116,7 @@ recursively selected local normal/build dependencies (including
 target-specific),
 package manifests, `src/**`, `browser/**`, `build.rs`, plus workspace
 manifest/lock,
-`flake.nix`, `flake.lock`, `.cargo/config.toml`, and `scripts/dev.sh`. Paths are
+`flake.nix`, `flake.lock`, and `.cargo/config.toml`. Paths are
 sorted
 UTF-8 relative paths normalized with `/` separators (including on Windows). Hash
 framing starts with `bmux-web-renderer-inputs-v1\0`, then

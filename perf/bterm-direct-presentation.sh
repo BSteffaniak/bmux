@@ -11,7 +11,7 @@ if [[ $# -gt 1 ]]; then
     exit 2
 fi
 run() {
-    bash scripts/dev.sh cargo test --locked -p bmux_cli --test bterm_presentation \
+    nix develop --command cargo test --locked -p bmux_cli --test bterm_presentation \
         bterm_direct_presentation_perf -- --ignored --nocapture
 }
 if [[ $# -eq 1 ]]; then

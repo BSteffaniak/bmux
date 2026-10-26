@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Explicit web setup only; native product builds must never invoke this script.
-# Run through `bash scripts/dev.sh bash scripts/build-web-renderer.sh`.
+# Run through `nix develop --command bash scripts/build-web-renderer.sh`.
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
-: "${BMUX_NIX_TOOLCHAIN:?Run inside nix develop or bash scripts/dev.sh}"
+: "${BMUX_NIX_TOOLCHAIN:?Run inside nix develop or a direnv-loaded shell}"
 : "${CARGO_TARGET_DIR:?Use the Nix-selected target directory}"
 OUTPUT="${BMUX_WEB_ASSET_OUTPUT:-$ROOT/target/web-assets}"
 mkdir -p "$OUTPUT"

@@ -25,7 +25,7 @@ jobs:
         env:
           BMUX_LIVE_ENDPOINT_ORIGIN: https://live.bmux.dev
         run: |
-          bash scripts/dev.sh bash scripts/build-site-artifact.sh "$RUNNER_TEMP/site-candidate"
+          nix develop --command bash scripts/build-site-artifact.sh "$RUNNER_TEMP/site-candidate"
           tar -C "$RUNNER_TEMP/site-candidate" -czf "$RUNNER_TEMP/site-candidate.tar.gz" .
           cd "$RUNNER_TEMP"
           sha256sum site-candidate.tar.gz > site-candidate.tar.gz.sha256

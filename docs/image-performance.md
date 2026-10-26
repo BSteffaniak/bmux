@@ -13,11 +13,11 @@ not a photograph. Inputs are bounded to 4096 × 4096 and
 1000 repetitions. Run inside the flake-selected shell:
 
 ```sh
-bash scripts/dev.sh cargo bench -p bmux_image --bench image_pipeline \
+nix develop --command cargo bench -p bmux_image --bench image_pipeline \
   --features kitty,sixel,iterm2 -- --iterations 20
-bash scripts/dev.sh cargo bench -p bmux_image --bench image_pipeline \
+nix develop --command cargo bench -p bmux_image --bench image_pipeline \
   --features kitty,sixel,iterm2 -- --iterations 20 --fixture detailed --json
-bash scripts/dev.sh cargo test -p bmux_image --features kitty,sixel,iterm2 \
+nix develop --command cargo test -p bmux_image --features kitty,sixel,iterm2 \
   --test image_work_regression
 ```
 

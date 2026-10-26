@@ -5,7 +5,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 if [[ -z "${BMUX_NIX_TOOLCHAIN:-}" ]]; then
-  exec bash scripts/dev.sh bash scripts/setup-live.sh "$@"
+  exec nix develop --command bash scripts/setup-live.sh "$@"
 fi
 if [[ "${1:-}" == --fly ]]; then
   shift

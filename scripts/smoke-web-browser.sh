@@ -4,7 +4,7 @@
 # Example (inside the locked shell, with prebuilt artifacts):
 # bash scripts/smoke-web-browser.sh --assets "$PWD/target/web-assets" \
 #   --browser /absolute/path/to/chromium --standalone-snapshot /tmp/example.json
-# --binary overrides metadata discovery; otherwise scripts/dev.sh cargo metadata
+# --binary overrides metadata discovery; otherwise nix develop --command cargo metadata
 # supplies the locked toolchain target directory, never a guessed Nix path.
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -18,7 +18,7 @@ for arg in "${args[@]}"; do
   esac
 done
 if [[ "$has_binary" == 0 ]]; then
-  target="$(cd "$ROOT" && bash scripts/dev.sh cargo metadata --no-deps --format-version 1 |
+  target="$(cd "$ROOT" && nix develop --command cargo metadata --no-deps --format-version 1 |
     python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')"
   args=(--binary "$target/debug/bmux" "${args[@]}")
 fi

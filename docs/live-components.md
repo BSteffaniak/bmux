@@ -252,7 +252,7 @@ publication and full/delta encoding separately, with image/no-image,
 steady/changing, first-admission/reuse, and fast/slow-consumer cases:
 
 ```sh
-bash scripts/dev.sh cargo run -p bmux_web_host --release --features presentation --example live-publication-performance -- /absolute/target/web-assets 128
+nix develop --command cargo run -p bmux_web_host --release --features presentation --example live-publication-performance -- /absolute/target/web-assets 128
 python3 scripts/live-components-performance.py --binary /absolute/live-publication-performance --assets /absolute/target/web-assets --browser /absolute/chromium --samples 32
 ```
 
@@ -284,7 +284,7 @@ allocation. It does not measure browser rendering, encoding, network delivery,
 or end-to-end latency. Run in the pinned development environment:
 
 ```sh
-bash scripts/dev.sh cargo test -p bmux_web_host --release resource_admission_measurement -- --ignored --nocapture
+nix develop --command cargo test -p bmux_web_host --release resource_admission_measurement -- --ignored --nocapture
 ```
 
 Focused source regressions cover unchanged reuse, changed MIME/content
@@ -293,7 +293,7 @@ eviction/revalidation, unchanged retention budgets, and latest-full repair after
 a publication burst:
 
 ```sh
-bash scripts/dev.sh cargo test -p bmux_web_host --features presentation retained_
+nix develop --command cargo test -p bmux_web_host --features presentation retained_
 ```
 
 No performance result is implied by the existence of this harness.

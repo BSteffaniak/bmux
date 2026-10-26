@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Run through bash scripts/dev.sh; installs nothing unless explicitly requested.
+# Run inside nix develop or a direnv-loaded shell; installs nothing unless explicitly requested.
 set -euo pipefail
-: "${BMUX_NIX_TOOLCHAIN:?Use bash scripts/dev.sh}"
+: "${BMUX_NIX_TOOLCHAIN:?Use nix develop or a direnv-loaded shell}"
 : "${CARGO_TARGET_DIR:?Use the Nix-selected target directory}"
 BINDGEN="${BMUX_WASM_BINDGEN:-target/web-tools/bin/wasm-bindgen}"
 if [[ ! -x "$BINDGEN" ]] || [[ "$("$BINDGEN" --version)" != "wasm-bindgen 0.2.126" ]]; then

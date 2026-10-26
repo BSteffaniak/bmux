@@ -2,7 +2,7 @@
 """Package exact web assets for an immutable GitHub release (explicit web build only).
 
 The renderer identity comes from A's shared Rust provenance implementation, not
-an independent approximation. Invoke through scripts/dev.sh; this command may
+an independent approximation. Invoke inside nix develop or a direnv-loaded shell; this command may
 compile the identity example but is never part of a native product build.
 """
 
@@ -41,7 +41,7 @@ def durable_file(path, data):
 
 def package(root, assets, output):
     if not os.environ.get("BMUX_NIX_TOOLCHAIN"):
-        raise ValueError("run inside nix develop or bash scripts/dev.sh")
+        raise ValueError("run inside nix develop or a direnv-loaded shell")
     tag = os.environ.get("BMUX_WEB_RELEASE_TAG", "")
     if not re.fullmatch(r"[A-Za-z0-9._-]+", tag) or tag == "latest":
         raise ValueError("BMUX_WEB_RELEASE_TAG must name the exact immutable release")

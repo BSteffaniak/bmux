@@ -481,7 +481,7 @@ fn build_source(root: &Path, output: &Path, cache: &Path) -> io::Result<()> {
     drop(tools_lock);
     let _source_lock = Lock::acquire(&cache.join("source-build.lock"))?;
     verify_source(root)?;
-    // scripts/dev.sh owns compiler and target selection. The shell reads the Nix-selected
+    // The pinned Nix environment owns compiler and target selection. The shell reads the Nix-selected
     // target directory; never override CARGO_TARGET_DIR or call a PATH compiler directly.
     let script = "set -eu; test -n \"$BMUX_NIX_TOOLCHAIN\"; test -n \"$CARGO_TARGET_DIR\"; cargo build --locked --release -p bmux_web_renderer --features wasm --target wasm32-unknown-unknown; cargo build --locked --release -p bmux_presenter --no-default-features --features wasm --target wasm32-unknown-unknown; \"$1\" \"$CARGO_TARGET_DIR/wasm32-unknown-unknown/release/bmux_web_renderer.wasm\" --target web --out-dir \"$2\"; \"$1\" \"$CARGO_TARGET_DIR/wasm32-unknown-unknown/release/bmux_presenter.wasm\" --target web --out-dir \"$2\"";
     run_dev(
@@ -520,8 +520,10 @@ fn utf8(path: &Path) -> io::Result<&str> {
 }
 fn run_dev(root: &Path, args: &[&str]) -> io::Result<()> {
     verify_source(root)?;
-    let status = Command::new("bash")
-        .arg(root.join("scripts/dev.sh"))
+    let status = Command::new("nix")
+        .arg("develop")
+        .arg(root)
+        .arg("--command")
         .args(args)
         .current_dir(root)
         .stdin(Stdio::null())
@@ -769,7 +771,6 @@ mod tests {
             "Cargo.lock",
             "flake.nix",
             "flake.lock",
-            "scripts/dev.sh",
             "scripts/presenter-adapter.js",
             ".cargo/config.toml",
         ] {

@@ -65,7 +65,7 @@ Release target root:
 Combined prototype host uses `--features wasm`, both baseline and WASM paths,
 not two matched production products. Coordinator-reported release build elapsed
 146 seconds; **not a clean workspace build**; build CPU/peak memory unknown.
-Measurements ran via `bash scripts/dev.sh python3 ...`; rustc 1.96.0
+Measurements ran via `nix develop --command python3 ...`; rustc 1.96.0
 `ac68faa20c58cbccd01ee7208bf3b6e93a7d7f96`, LLVM 22.1.2, Cargo 1.96.0
 `30a34c682`. Linux 6.12.74, glibc 2.40, AMD Ryzen 9 7945HX, affinity CPUs 0..31.
 OS pages warm/uncontrolled; no SVG cache; governor `powersave`; no affinity,
@@ -224,7 +224,7 @@ claim clean build, cross-target validity, migration acceptance or visual PASS.
 
 ## Coordinator validation checkpoint
 
-All commands ran through `bash scripts/dev.sh` with the locked Nix toolchain.
+All commands ran through `nix develop --command` with the locked Nix toolchain.
 
 - `cargo clippy --all-targets -- -D warnings`: PASS.
 - `cargo nextest run --no-fail-fast`: FAIL initially (broadcast pending-state
@@ -365,7 +365,7 @@ with the same lockfile, renderer version/options, font inputs and target/native
 codegen assumptions. The combined example needs feature `wasm`:
 
 ```sh
-bash scripts/dev.sh cargo build --release -p bmux_mermaid_render --features wasm \
+nix develop --command cargo build --release -p bmux_mermaid_render --features wasm \
   --example compare --bin bmux-mermaid-worker
 ```
 
@@ -507,7 +507,7 @@ python3 scripts/benchmark-mermaid.py --phase timing \
   --concurrency 2 --trials 20 --rounds 10
 ```
 
-Q2 authorized focused validation, through `bash scripts/dev.sh`:
+Q2 authorized focused validation, through `nix develop --command`:
 
 - `cargo clippy -p bmux_mermaid_render --all-targets --features wasm -- -D warnings`: PASS.
 - `cargo test -p bmux_mermaid_render --features wasm`: PASS.

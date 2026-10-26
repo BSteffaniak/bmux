@@ -11,8 +11,8 @@ Use direnv (`direnv allow`) or enter `nix develop`. Noninteractive entry points:
 
 ```sh
 nix develop --command cargo clippy --all-targets -- -D warnings
-bash scripts/dev.sh cargo nextest run --no-fail-fast
-bash scripts/dev.sh ./scripts/smoke-pty-runtime.sh
+nix develop --command cargo nextest run --no-fail-fast
+nix develop --command ./scripts/smoke-pty-runtime.sh
 ```
 
 Launch editors from the shell (`nix develop --command code .`, for example) so

@@ -49,9 +49,9 @@ For source development, build matching native and WASM artifacts using the
 locked Nix shell:
 
 ```sh
-bash scripts/dev.sh cargo install wasm-bindgen-cli --version 0.2.126 --locked --root "$PWD/target/web-tools"
-bash scripts/dev.sh bash scripts/build-web-renderer.sh
-bash scripts/dev.sh cargo run -p bmux_cli --bin bmux -- attach "<SESSION_UUID>" --web-assets "$PWD/target/web-assets" --web-only
+nix develop --command cargo install wasm-bindgen-cli --version 0.2.126 --locked --root "$PWD/target/web-tools"
+nix develop --command bash scripts/build-web-renderer.sh
+nix develop --command cargo run -p bmux_cli --bin bmux -- attach "<SESSION_UUID>" --web-assets "$PWD/target/web-assets" --web-only
 ```
 
 Replace `<SESSION_UUID>` with an ID from `bmux list-sessions --json`.

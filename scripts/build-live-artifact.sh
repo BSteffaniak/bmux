@@ -3,7 +3,7 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
-: "${BMUX_NIX_TOOLCHAIN:?Use bash scripts/dev.sh bash scripts/build-live-artifact.sh OUTPUT}"
+: "${BMUX_NIX_TOOLCHAIN:?Use nix develop --command bash scripts/build-live-artifact.sh OUTPUT}"
 : "${CARGO_TARGET_DIR:?}"
 OUTPUT="${1:?New output directory required}"
 [[ ! -e "$OUTPUT" ]] || { echo 'Output already exists' >&2; exit 2; }

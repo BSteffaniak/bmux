@@ -66,9 +66,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: cachix/install-nix-action@v31
       - name: Build browser WASM once with locked Nix and matching bindgen
-        run: bash scripts/dev.sh bash scripts/build-web-renderer.sh
+        run: nix develop --command bash scripts/build-web-renderer.sh
       - name: Package exact renderer inputs and checksums
-        run: bash scripts/dev.sh python3 scripts/package-web-assets.py --assets "$BMUX_WEB_ASSET_OUTPUT" --output web-release
+        run: nix develop --command python3 scripts/package-web-assets.py --assets "$BMUX_WEB_ASSET_OUTPUT" --output web-release
       - uses: actions/upload-artifact@v4
         with:
           name: web-assets
