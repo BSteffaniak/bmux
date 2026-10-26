@@ -17,7 +17,7 @@ use bmux_tui::selection::{
 use bmux_tui::semantic::SemanticRegion;
 use bmux_tui::style::Style;
 
-use crate::common::local_rect;
+use crate::common::{local_area_of, local_rect};
 
 use crate::common::InteractionState;
 use crate::scrollbar::{
@@ -228,6 +228,7 @@ pub enum NestedScrollOutcome {
 
 /// A generic scroll viewport over one arbitrary component subtree.
 pub struct ScrollViewComponent<'a> {
+    pointer_intent: bmux_tui::pointer::PointerIntent,
     id: LayoutId,
     viewport: LogicalSize,
     content_width: u16,
@@ -241,6 +242,13 @@ pub struct ScrollViewComponent<'a> {
 }
 
 impl<'a> ScrollViewComponent<'a> {
+    /// Override pointer presentation without changing input routing or mouse policy.
+    #[must_use]
+    pub const fn pointer_intent(mut self, intent: bmux_tui::pointer::PointerIntent) -> Self {
+        self.pointer_intent = intent;
+        self
+    }
+
     /// Create a viewport with caller-owned logical offsets.
     #[must_use]
     pub fn new(
@@ -251,6 +259,7 @@ impl<'a> ScrollViewComponent<'a> {
     ) -> Self {
         Self {
             id: id.into(),
+            pointer_intent: bmux_tui::pointer::PointerIntent::Auto,
             viewport,
             content_width: u16::try_from(viewport.width).unwrap_or(u16::MAX),
             offset_x: state.horizontal_offset(),
@@ -377,6 +386,7 @@ impl Component for ScrollViewComponent<'_> {
         child.layout.hash(&mut layout);
 
         let mut paint = std::collections::hash_map::DefaultHasher::new();
+        format!("{:?}", self.pointer_intent).hash(&mut paint);
         self.offset_x.hash(&mut paint);
         self.offset_y.hash(&mut paint);
         self.follow_bottom.hash(&mut paint);
@@ -402,6 +412,16 @@ impl Component for ScrollViewComponent<'_> {
             return;
         };
         let resolved = self.effective_state(layout);
+        // A standalone viewport is normally passive. Explicit overrides remain
+        // below child controls so composition does not mask their intent.
+        if !matches!(self.pointer_intent, bmux_tui::pointer::PointerIntent::Auto) {
+            cx.push_hit(
+                HitRegion::new(self.id.as_str(), local_area_of(layout.size))
+                    .role(HitRole::Scroll)
+                    .pointer_intent(self.pointer_intent)
+                    .enabled(!resolved.interaction.disabled),
+            );
+        }
         let offset = resolved.vertical_offset();
         let horizontal_offset = resolved.horizontal_offset();
         if let Some(state) = self.retained_state {
@@ -471,6 +491,7 @@ impl Component for ScrollViewComponent<'_> {
 /// Generic interaction controller for one measured scroll viewport.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScrollView {
+    pointer_intent: bmux_tui::pointer::PointerIntent,
     policy: ScrollViewPolicy,
     scrollbar_styles: ScrollbarStyles,
     vertical_scrollbar_policy: ScrollbarPolicy,
@@ -478,10 +499,18 @@ pub struct ScrollView {
 }
 
 impl ScrollView {
+    /// Override viewport pointer presentation; scrollbar gutters retain their own intent.
+    #[must_use]
+    pub const fn pointer_intent(mut self, intent: bmux_tui::pointer::PointerIntent) -> Self {
+        self.pointer_intent = intent;
+        self
+    }
+
     /// Create an interactive scroll controller.
     #[must_use]
     pub const fn new() -> Self {
         Self {
+            pointer_intent: bmux_tui::pointer::PointerIntent::Auto,
             policy: ScrollViewPolicy::interactive(),
             scrollbar_styles: ScrollbarStyles::new(),
             vertical_scrollbar_policy: ScrollbarPolicy::vertical(),
@@ -569,6 +598,7 @@ impl ScrollView {
         cx.push_hit(
             HitRegion::new(id.clone(), content_local)
                 .role(HitRole::Scroll)
+                .pointer_intent(self.pointer_intent)
                 .pointer_events(self.policy.mouse_wheel)
                 .focusable(self.policy.keyboard)
                 .enabled(!state.interaction.disabled),

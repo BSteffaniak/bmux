@@ -60,6 +60,83 @@ pub trait Presenter<P> {
 
     /// Cancel and reclaim owned output work before returning. Must not detach blocked tasks.
     fn cancel_present(&mut self) {}
+
+    /// Observe input without consuming, routing, or reading it. Return true when
+    /// pointer presentation needs servicing, including during an in-flight frame.
+    fn observe_terminal_event(&mut self, _event: &bmux_tui::event::Event) -> bool {
+        false
+    }
+
+    /// Supply caller-owned scope/capture from the application's existing router.
+    fn set_pointer_context(&mut self, _context: bmux_tui::terminal::PointerContext) {}
+
+    /// Restore protocol ownership on exit, suspend, and recoverable error.
+    /// # Errors
+    /// Reports incomplete cleanup; cancellation alone is not restoration.
+    fn restore(&mut self) -> impl std::future::Future<Output = Result<(), Self::Error>> {
+        async { Ok(()) }
+    }
+}
+
+/// Adapter reading scope/capture from caller-owned application routing state.
+/// It adds no input router and forwards observation and lifecycle unchanged.
+pub struct PointerContextPresenter<R, F> {
+    inner: R,
+    context: F,
+}
+
+impl<R, F> PointerContextPresenter<R, F> {
+    /// Wrap a standard presenter with access to the application's existing router.
+    pub const fn new(inner: R, context: F) -> Self {
+        Self { inner, context }
+    }
+    /// Access the wrapped presenter for explicit lifecycle and configuration.
+    pub const fn inner_mut(&mut self) -> &mut R {
+        &mut self.inner
+    }
+    /// Recover the wrapped presenter.
+    pub fn into_inner(self) -> R {
+        self.inner
+    }
+}
+
+impl<P, R: Presenter<P>, F: FnMut(&P) -> bmux_tui::terminal::PointerContext> Presenter<P>
+    for PointerContextPresenter<R, F>
+{
+    type Error = R::Error;
+    fn resize(&mut self, size: Size) {
+        self.inner.resize(size);
+    }
+    fn reset(&mut self, reason: ResetReason) {
+        self.inner.reset(reason);
+    }
+    fn present(&mut self, program: &mut P) -> Result<PresentReport, Self::Error> {
+        self.inner.set_pointer_context((self.context)(program));
+        self.inner.present(program)
+    }
+    fn start_present(&mut self, program: &mut P) -> Result<Option<PresentReport>, Self::Error> {
+        self.inner.set_pointer_context((self.context)(program));
+        self.inner.start_present(program)
+    }
+    fn poll_present(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+        program: &mut P,
+    ) -> std::task::Poll<Result<PresentReport, Self::Error>> {
+        self.inner.poll_present(cx, program)
+    }
+    fn cancel_present(&mut self) {
+        self.inner.cancel_present();
+    }
+    fn observe_terminal_event(&mut self, event: &bmux_tui::event::Event) -> bool {
+        self.inner.observe_terminal_event(event)
+    }
+    fn set_pointer_context(&mut self, context: bmux_tui::terminal::PointerContext) {
+        self.inner.set_pointer_context(context);
+    }
+    async fn restore(&mut self) -> Result<(), Self::Error> {
+        self.inner.restore().await
+    }
 }
 
 /// Owned output transport for asynchronous presentation.
@@ -154,6 +231,24 @@ impl<O: CancellableOutput> Delivery<O> {
             receiver,
             cancelled,
         })
+    }
+
+    /// Bounded synchronous cleanup for Drop, never an async runtime dependency.
+    pub(crate) fn finish_before(&mut self, deadline: std::time::Duration) -> std::io::Result<()> {
+        let until = std::time::Instant::now() + deadline;
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        loop {
+            if let std::task::Poll::Ready(result) = self.poll(&mut cx) {
+                return result;
+            }
+            if std::time::Instant::now() >= until {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "output cleanup deadline",
+                ));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
     }
 
     pub(crate) fn poll(

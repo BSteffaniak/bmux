@@ -5,9 +5,14 @@ import android.view.PointerIcon
 internal class NativePointerRevisions {
     private var generation: String? = null
     private var revision: ULong = 0u
+    @Volatile private var active = true
+
+    fun invalidate() {
+        active = false
+    }
 
     fun accept(pointer: TerminalPointerFrame): Boolean {
-        if (pointer.version != 1 || pointer.generation.isEmpty()) return false
+        if (!active || pointer.version != 1 || pointer.generation.isEmpty()) return false
         // Updates arrive in FIFO order from one backend actor. A fresh generation
         // is explicit backend replacement (including pre-output recovery).
         if (generation == pointer.generation && pointer.revision <= revision) return false

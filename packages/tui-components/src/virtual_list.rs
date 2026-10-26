@@ -222,6 +222,7 @@ impl<'a, K> VirtualListItem<'a, K> {
 /// A variable-height collection that measures by stable key and paints only
 /// viewport-intersecting items.
 pub struct VirtualList<'a, K> {
+    pointer_intent: bmux_tui::pointer::PointerIntent,
     id: String,
     items: Vec<VirtualListItem<'a, K>>,
 }
@@ -230,11 +231,19 @@ impl<'a, K> VirtualList<'a, K>
 where
     K: Clone + Ord + ToString,
 {
+    /// Override pointer presentation without changing input routing or mouse policy.
+    #[must_use]
+    pub const fn pointer_intent(mut self, intent: bmux_tui::pointer::PointerIntent) -> Self {
+        self.pointer_intent = intent;
+        self
+    }
+
     /// Create an empty collection with a stable semantic identifier prefix.
     #[must_use]
     pub fn new(id: impl Into<String>) -> Self {
         Self {
             id: id.into(),
+            pointer_intent: bmux_tui::pointer::PointerIntent::Auto,
             items: Vec::new(),
         }
     }
@@ -383,7 +392,11 @@ where
                 |cx| cx.with_child_size(0, 0, layout.size, |cx| item.component.paint(layout, cx)),
             );
             let semantic_id = format!("{}.item.{}", self.id, item.key.to_string());
-            cx.push_hit(HitRegion::new(semantic_id.clone(), visible).role(HitRole::ListItem));
+            cx.push_hit(
+                HitRegion::new(semantic_id.clone(), visible)
+                    .role(HitRole::ListItem)
+                    .pointer_intent(self.pointer_intent),
+            );
             let visible_local = LocalRect::new(
                 i32::from(visible.x),
                 i64::from(visible.y),

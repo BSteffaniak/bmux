@@ -78,6 +78,7 @@ pub struct InteractionRouter {
     restore_focus: Vec<(Option<FocusScopeId>, Option<FocusId>)>,
     hovered: Option<HitId>,
     pressed: Option<HitId>,
+    pointer_position: Option<crate::geometry::Point>,
 }
 
 impl InteractionRouter {
@@ -91,6 +92,7 @@ impl InteractionRouter {
             restore_focus: Vec::new(),
             hovered: None,
             pressed: None,
+            pointer_position: None,
         }
     }
 
@@ -110,6 +112,31 @@ impl InteractionRouter {
     #[must_use]
     pub const fn hovered(&self) -> Option<&HitId> {
         self.hovered.as_ref()
+    }
+
+    /// Resolve pointer presentation against the current committed scene.
+    ///
+    /// This is intentionally computed on demand: stationary pointers observe
+    /// scene/scope changes only after a successful presentation commit. Existing
+    /// left-button press ownership supplies capture; no input is routed here.
+    #[must_use]
+    pub fn pointer_intent(&self) -> crate::pointer::PointerIntent {
+        crate::pointer::resolve_pointer_intent(
+            &self.scene,
+            self.pointer_position,
+            self.focus_scope.as_ref(),
+            self.pressed.as_ref(),
+        )
+    }
+
+    /// Return the existing modal scope and press owner for pointer presentation.
+    /// This snapshot does not route input or establish another capture authority.
+    #[must_use]
+    pub fn pointer_context(&self) -> crate::terminal::PointerContext {
+        crate::terminal::PointerContext {
+            scope: self.focus_scope.clone(),
+            capture: self.pressed.clone(),
+        }
     }
 
     /// Replace routing metadata after a successful frame commit.
@@ -149,11 +176,16 @@ impl InteractionRouter {
         {
             self.hovered = None;
         }
-        if self
-            .pressed
-            .as_ref()
-            .is_some_and(|id| !contains_enabled(&self.scene, id))
-        {
+        if self.pressed.as_ref().is_some_and(|id| {
+            !self.scene.regions().iter().any(|region| {
+                &region.id == id
+                    && region.visible
+                    && !region.area.is_empty()
+                    && region.enabled
+                    && region.pointer_events
+                    && region.focus_scope == self.focus_scope
+            })
+        }) {
             self.pressed = None;
         }
     }
@@ -197,6 +229,7 @@ impl InteractionRouter {
 
         match event {
             Event::Mouse(mouse) => {
+                self.pointer_position = Some(mouse.position);
                 let resolved = self
                     .scene
                     .hit_mouse_in_scope(mouse, self.focus_scope.as_ref());
@@ -278,7 +311,14 @@ impl InteractionRouter {
                 focus_changed: None,
                 traversal_consumed: false,
             },
-            Event::Focus(focus) => untargeted(Event::Focus(focus)),
+            Event::Focus(focus) => {
+                if focus == crate::event::FocusEvent::Lost {
+                    self.pointer_position = None;
+                    self.pressed = None;
+                    self.hovered = None;
+                }
+                untargeted(Event::Focus(focus))
+            }
             Event::Tick => untargeted(Event::Tick),
             Event::User(value) => untargeted(Event::User(value)),
         }
@@ -618,6 +658,124 @@ mod tests {
         router.commit_scene(scene.clone(), Some(HitId::new("second")));
         router.commit_scene(scene, None);
         assert_eq!(router.focused(), Some(&HitId::new("background")));
+    }
+
+    #[test]
+    fn stationary_pointer_uses_only_committed_scene_and_scope() {
+        use crate::hit::HitRole;
+        use crate::pointer::{PointerIntent, PointerShape};
+
+        let mut router = InteractionRouter::new();
+        let region = HitRegion::new("target", Rect::new(0, 0, 4, 2));
+        router.commit_scene(HitMap::new().with_region(region.clone()), None);
+        router.route(Event::Mouse(MouseEvent::new(
+            MouseEventKind::Move,
+            Point::new(1, 1),
+        )));
+        assert_eq!(
+            router.pointer_intent(),
+            PointerIntent::Shape(PointerShape::Pointer)
+        );
+
+        // Staging does not change committed pointer presentation.
+        let next = HitMap::new().with_region(region.clone().role(HitRole::TextInput));
+        assert_eq!(
+            router.pointer_intent(),
+            PointerIntent::Shape(PointerShape::Pointer)
+        );
+        router.commit_scene(next, None);
+        assert_eq!(
+            router.pointer_intent(),
+            PointerIntent::Shape(PointerShape::Text)
+        );
+        router.commit_scene(HitMap::new().with_region(region), Some(HitId::new("modal")));
+        assert_eq!(
+            router.pointer_intent(),
+            PointerIntent::Shape(PointerShape::Default)
+        );
+        router.commit_scene(HitMap::new(), None);
+        assert_eq!(
+            router.pointer_intent(),
+            PointerIntent::Shape(PointerShape::Default)
+        );
+    }
+
+    #[test]
+    fn pointer_capture_release_and_focus_loss_use_existing_press_state() {
+        use crate::event::FocusEvent;
+        use crate::hit::HitRole;
+        use crate::pointer::{PointerIntent, PointerShape};
+
+        let mut router = InteractionRouter::new();
+        router.commit_scene(
+            HitMap::new().with_region(
+                HitRegion::new("drag", Rect::new(0, 0, 4, 2)).role(HitRole::DragHandle),
+            ),
+            None,
+        );
+        router.route(Event::Mouse(MouseEvent::new(
+            MouseEventKind::Down(MouseButton::Left),
+            Point::new(1, 1),
+        )));
+        router.route(Event::Mouse(MouseEvent::new(
+            MouseEventKind::Drag(MouseButton::Left),
+            Point::new(20, 20),
+        )));
+        assert_eq!(
+            router.pointer_intent(),
+            PointerIntent::Shape(PointerShape::Grabbing)
+        );
+        router.route(Event::Mouse(MouseEvent::new(
+            MouseEventKind::Up(MouseButton::Left),
+            Point::new(20, 20),
+        )));
+        assert_eq!(
+            router.pointer_intent(),
+            PointerIntent::Shape(PointerShape::Default)
+        );
+        router.route(Event::Mouse(MouseEvent::new(
+            MouseEventKind::Down(MouseButton::Left),
+            Point::new(1, 1),
+        )));
+        router.route(Event::Focus(FocusEvent::Lost));
+        assert_eq!(
+            router.pointer_intent(),
+            PointerIntent::Shape(PointerShape::Default)
+        );
+        router.route(Event::Focus(FocusEvent::Gained));
+        assert_eq!(
+            router.pointer_intent(),
+            PointerIntent::Shape(PointerShape::Default)
+        );
+    }
+
+    #[test]
+    fn modal_commit_invalidates_capture_without_reviving_it_on_return() {
+        use crate::hit::HitRole;
+        use crate::pointer::{PointerIntent, PointerShape};
+
+        let mut router = InteractionRouter::new();
+        let scene = HitMap::new()
+            .with_region(HitRegion::new("drag", Rect::new(0, 0, 4, 2)).role(HitRole::DragHandle));
+        router.commit_scene(scene.clone(), None);
+        router.route(Event::Mouse(MouseEvent::new(
+            MouseEventKind::Down(MouseButton::Left),
+            Point::new(1, 1),
+        )));
+        assert_eq!(
+            router.pointer_intent(),
+            PointerIntent::Shape(PointerShape::Grabbing)
+        );
+        router.commit_scene(scene.clone(), Some(HitId::new("modal")));
+        assert_eq!(
+            router.pointer_intent(),
+            PointerIntent::Shape(PointerShape::Default)
+        );
+        router.commit_scene(scene, None);
+        assert_eq!(
+            router.pointer_intent(),
+            PointerIntent::Shape(PointerShape::Pointer)
+        );
     }
 
     #[test]

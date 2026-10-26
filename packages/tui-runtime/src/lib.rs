@@ -46,7 +46,10 @@ pub use image_terminal_presenter::{
 pub use input::{ManagedTerminalInput, TerminalInput};
 pub use invalidation::InvalidationSignal;
 pub use mailbox::{LatestSendError, LatestSendOutcome, LatestSender, SendError, TrySendError};
-pub use presenter::{CancellableOutput, HeadlessPresenter, PresentReport, Presenter, ResetReason};
+pub use presenter::{
+    CancellableOutput, HeadlessPresenter, PointerContextPresenter, PresentReport, Presenter,
+    ResetReason,
+};
 pub use program::{Invalidation, Lifecycle, Program, RuntimeEvent, Update};
 pub use runtime::{Runtime, RuntimeError, RuntimeHandle, RuntimeOutput};
 pub use stats::{
@@ -54,7 +57,7 @@ pub use stats::{
     TerminalDispatchRange,
 };
 pub use subscription::Subscription;
-pub use terminal_presenter::TerminalPresenter;
+pub use terminal_presenter::{AsyncTerminalPresenter, TerminalPresenter};
 
 #[cfg(test)]
 mod telemetry_bench;

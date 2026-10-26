@@ -1281,6 +1281,7 @@ impl Component for ItemRows<'_, '_> {
 /// one visible item region per stable item id. Interaction state remains
 /// caller-owned through an interior-mutable `Cell`.
 pub struct SelectableListComponent<'a, 'state> {
+    pointer_intent: bmux_tui::pointer::PointerIntent,
     id: LayoutId,
     list: SelectableList<'a>,
     state: &'state Cell<SelectableListState>,
@@ -1288,6 +1289,13 @@ pub struct SelectableListComponent<'a, 'state> {
 }
 
 impl<'a, 'state> SelectableListComponent<'a, 'state> {
+    /// Override pointer presentation without changing input routing or mouse policy.
+    #[must_use]
+    pub const fn pointer_intent(mut self, intent: bmux_tui::pointer::PointerIntent) -> Self {
+        self.pointer_intent = intent;
+        self
+    }
+
     /// Reveal the current focus using the measured list viewport and shared
     /// scroll controller. Call after semantic navigation, before painting the
     /// same layout. No content measurement is performed here.
@@ -1338,6 +1346,7 @@ impl<'a, 'state> SelectableListComponent<'a, 'state> {
     ) -> Self {
         Self {
             id: id.into(),
+            pointer_intent: bmux_tui::pointer::PointerIntent::Auto,
             list: SelectableList::new(items),
             state,
             fallback: None,
@@ -1399,6 +1408,7 @@ impl Component for SelectableListComponent<'_, '_> {
         self.list.policy.scrollbar.hash(&mut layout);
 
         let mut paint = std::collections::hash_map::DefaultHasher::new();
+        format!("{:?}", self.pointer_intent).hash(&mut paint);
         format!("{:?}", self.list.policy.mouse).hash(&mut paint);
         for item in self.list.items {
             item.disabled.hash(&mut paint);
@@ -1423,6 +1433,7 @@ impl Component for SelectableListComponent<'_, '_> {
         cx.push_hit(
             SceneRegion::new(self.id.as_str(), area)
                 .role(HitRole::ListItem)
+                .pointer_intent(self.pointer_intent)
                 .pointer_events(self.list.policy.mouse.enabled)
                 .hoverable(self.list.policy.mouse.enabled && self.list.policy.mouse.hover)
                 .focusable(true)
@@ -1450,6 +1461,7 @@ impl Component for SelectableListComponent<'_, '_> {
             cx.push_hit(
                 SceneRegion::new(item_id.clone(), region.rect)
                     .role(HitRole::ListItem)
+                    .pointer_intent(self.pointer_intent)
                     .pointer_events(self.list.policy.mouse.enabled)
                     .hoverable(self.list.policy.mouse.enabled && self.list.policy.mouse.hover)
                     .enabled(!state.interaction.disabled && !item.disabled),
@@ -1559,6 +1571,31 @@ mod tests {
     };
 
     #[test]
+    fn pointer_override_invalidates_paint_without_remeasuring_layout() {
+        use bmux_tui::pointer::{PointerIntent, PointerShape};
+
+        let items = [
+            SelectableListItem::new("one", "One"),
+            SelectableListItem::multiline("two", [Line::from("Two A"), Line::from("Two B")]),
+            SelectableListItem::new("three", "Three").disabled(true),
+        ];
+        let state = Cell::new(SelectableListState::new(Some(0)));
+        let component = SelectableListComponent::new("nav.list", &items, &state);
+        let original = component.revision();
+        let component = component.pointer_intent(PointerIntent::Hidden);
+        assert_eq!(component.pointer_intent, PointerIntent::Hidden);
+        let hidden = component.revision();
+        assert_eq!(original.layout, hidden.layout);
+        assert_ne!(original.paint, hidden.paint);
+        let component = component.pointer_intent(PointerIntent::Shape(PointerShape::Crosshair));
+        assert_eq!(
+            component.pointer_intent,
+            PointerIntent::Shape(PointerShape::Crosshair)
+        );
+        assert_ne!(hidden.paint, component.revision().paint);
+    }
+
+    #[test]
     fn mouse_policy_invalidates_list_paint_without_invalidating_layout() {
         let items = [SelectableListItem::new("one", "One")];
         let state = Cell::new(SelectableListState::new(Some(0)));
@@ -1590,6 +1627,7 @@ mod tests {
         fn render(&self, area: Rect, state: &SelectableListState, frame: &mut Frame<'_>) {
             let state = Cell::new(*state);
             let component = SelectableListComponent {
+                pointer_intent: bmux_tui::pointer::PointerIntent::Auto,
                 id: "test.list".into(),
                 list: *self,
                 state: &state,

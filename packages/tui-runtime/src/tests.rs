@@ -740,7 +740,7 @@ async fn presenter_failure_is_terminal_and_does_not_commit_frame() {
         unlimited_config(),
     );
     let error = runtime.run().await.err().expect("presenter fails");
-    let crate::RuntimeError::Presenter { error, output } = error;
+    let crate::RuntimeError::Presenter { error, output, .. } = error;
     assert_eq!(error, PresentFailure);
     assert_eq!(output.program.commits, 0);
     assert_eq!(output.stats.frames_presented, 0);

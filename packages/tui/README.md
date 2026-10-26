@@ -9,6 +9,50 @@ behavior live outside this crate.
 
 See [`../../docs/tui-framework.md`](../../docs/tui-framework.md) for the broader architecture and roadmap.
 
+## Pointer intent and committed geometry
+
+`pointer::PointerIntent` describes the mouse pointer, not the text caret.
+`Auto` derives a shape from `HitRole`; `Shape(PointerShape)` explicitly selects
+one of the shared terminal protocol shapes. `Hidden` expresses host-dependent
+pointer invisibility; it is not an OSC 22 shape or a caret-visibility operation.
+
+Set `HitRegion::pointer_intent` for an explicit region override. Resolve against
+the last successfully committed scene with `InteractionRouter::pointer_intent`,
+or use `pointer::resolve_pointer_intent` with the existing capture identity and
+active scope. Do not create a second input router for pointer presentation.
+
+Automatic roles select text for text inputs, pointer for actions/list items,
+horizontal resize for resize handles, and grabbing for captured drag handles.
+Explicit intent survives capture. Valid capture retains its owner's intent
+outside its bounds; removed, disabled, invisible, empty, non-pointer, or
+out-of-scope owners no longer capture presentation. Disabled and out-of-scope
+regions occlude lower regions without supplying their own override. Re-resolve
+after scene commits even when the pointer is stationary.
+
+```rust
+use bmux_tui::{
+    geometry::{Point, Rect},
+    hit::{HitMap, HitRegion, HitRole},
+    pointer::{PointerIntent, PointerShape, resolve_pointer_intent},
+};
+
+let scene = HitMap::new().with_region(
+    HitRegion::new("input", Rect::new(0, 0, 20, 1)).role(HitRole::TextInput),
+);
+assert_eq!(
+    resolve_pointer_intent(&scene, Some(Point::new(1, 0)), None, None),
+    PointerIntent::Shape(PointerShape::Text),
+);
+```
+
+This example resolves metadata only; it does not emit terminal output. A backend
+must explicitly support the resolved intent. Keep output and lifecycle handling
+in the standard terminal/presenter path rather than writing OSC sequences from
+controls or render callbacks. The runtime's
+[`pointer_controls` example](../tui-runtime/examples/pointer_controls.rs) uses
+that path for buttons, editable text, disabled controls, a modal, capture, and
+explicit shape overrides; see its [run instructions](../tui-runtime/README.md#interactive-pointer-controls).
+
 ## Streaming subprocess output
 
 `ansi::AnsiLog` incrementally decodes byte chunks into a bounded styled log

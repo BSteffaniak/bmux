@@ -42,13 +42,13 @@ pub fn resolve_pointer_shape(
         return ResolvedPointerShape::Shape(shape);
     }
     if let Some(cursor) = input.router.captured_cursor(input.compositor) {
-        return resolve_cursor(cursor);
+        return resolve_cursor(cursor, true);
     }
     let target = input
         .position
         .and_then(|(x, y)| input.compositor.pointer_target(x, y));
     match target {
-        Some(RetainedPointerTarget::Cursor(cursor)) => resolve_cursor(cursor),
+        Some(RetainedPointerTarget::Cursor(cursor)) => resolve_cursor(cursor, false),
         Some(RetainedPointerTarget::Content(id)) => {
             ResolvedPointerShape::Shape(content_shape(id).unwrap_or(PointerShape::Text))
         }
@@ -56,7 +56,7 @@ pub fn resolve_pointer_shape(
     }
 }
 
-const fn resolve_cursor(cursor: PluginSurfaceCursor) -> ResolvedPointerShape {
+const fn resolve_cursor(cursor: PluginSurfaceCursor, captured: bool) -> ResolvedPointerShape {
     let shape = match cursor {
         PluginSurfaceCursor::Default => PointerShape::Default,
         PluginSurfaceCursor::Pointer => PointerShape::Pointer,
@@ -65,6 +65,18 @@ const fn resolve_cursor(cursor: PluginSurfaceCursor) -> ResolvedPointerShape {
         PluginSurfaceCursor::ResizeHorizontal => PointerShape::EwResize,
         PluginSurfaceCursor::ResizeVertical => PointerShape::NsResize,
         PluginSurfaceCursor::Hidden => return ResolvedPointerShape::Hidden,
+        PluginSurfaceCursor::Tui { intent, role } => {
+            return match intent.resolve(role, captured) {
+                bmux_tui::pointer::PointerIntent::Shape(shape) => {
+                    ResolvedPointerShape::Shape(shape)
+                }
+                bmux_tui::pointer::PointerIntent::Hidden => ResolvedPointerShape::Hidden,
+                // resolve() always lowers Auto to a concrete shape.
+                bmux_tui::pointer::PointerIntent::Auto => {
+                    ResolvedPointerShape::Shape(PointerShape::Default)
+                }
+            };
+        }
     };
     ResolvedPointerShape::Shape(shape)
 }
@@ -198,6 +210,148 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn tui_shapes_and_hidden_survive_hover_and_capture() {
+        use bmux_tui::hit::HitRole;
+        use bmux_tui::pointer::PointerIntent;
+
+        for intent in PointerShape::ALL
+            .into_iter()
+            .map(PointerIntent::Shape)
+            .chain([PointerIntent::Hidden])
+        {
+            let compositor = scene(vec![
+                content(),
+                chrome(PluginSurfaceCursor::Tui {
+                    intent,
+                    role: HitRole::DragHandle,
+                }),
+            ]);
+            let mut router = RetainedPointerRouter::default();
+            let expected = match intent {
+                PointerIntent::Shape(shape) => ResolvedPointerShape::Shape(shape),
+                PointerIntent::Hidden => ResolvedPointerShape::Hidden,
+                PointerIntent::Auto => unreachable!(),
+            };
+            assert_eq!(
+                resolve_pointer_shape(input(&compositor, &router, Some((3, 3))), |_| panic!(
+                    "chrome fell through"
+                )),
+                expected
+            );
+            router.capture(compositor.hit_test(3, 3).unwrap());
+            assert_eq!(
+                resolve_pointer_shape(input(&compositor, &router, Some((15, 8))), |_| panic!(
+                    "capture fell through"
+                )),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn plugin_lowering_preserves_tui_metadata_and_disabled_visual_occlusion() {
+        use bmux_plugin::ExtensionRect;
+        use bmux_plugin::layout::PluginLayoutId;
+        use bmux_plugin::surface::{PluginSurface, PluginSurfaceRegion, PluginSurfaceTarget};
+        use bmux_tui::geometry::Rect;
+        use bmux_tui::hit::{HitRegion, HitRole};
+        use bmux_tui::pointer::PointerIntent;
+        use std::collections::BTreeMap;
+
+        let mut hit = HitRegion::new("control", Rect::new(0, 0, 4, 1))
+            .role(HitRole::DragHandle)
+            .pointer_intent(PointerIntent::Shape(PointerShape::Grab));
+        for enabled in [true, false] {
+            hit.enabled = enabled;
+            let mut plugin_surface = PluginSurface::layout(
+                PluginSurfaceId::new("test", "control", Uuid::from_u128(8)),
+                1,
+                PluginLayoutId::new("test", "allocation"),
+                Vec::new(),
+            )
+            .interactive_region(PluginSurfaceRegion::from_tui(&hit))
+            .order(0, 1);
+            plugin_surface.target = PluginSurfaceTarget::Explicit(ExtensionRect::new(2, 2, 4, 1));
+            let lowered = crate::compositor::retained_surfaces_from_plugin_surfaces(
+                &[plugin_surface],
+                &BTreeMap::new(),
+                DamageRect::new(0, 0, 20, 10),
+            );
+            let mut surfaces = vec![content()];
+            surfaces.extend(lowered);
+            let compositor = scene(surfaces);
+            assert_eq!(
+                resolve_pointer_shape(
+                    input(&compositor, &RetainedPointerRouter::default(), Some((3, 2))),
+                    |_| panic!("control borrowed underlying content intent"),
+                ),
+                ResolvedPointerShape::Shape(if enabled {
+                    PointerShape::Grab
+                } else {
+                    PointerShape::Default
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn tui_auto_role_defaults_match_legacy_hover_meaning() {
+        use bmux_tui::hit::HitRole;
+        use bmux_tui::pointer::PointerIntent;
+
+        for (role, expected) in [
+            (HitRole::Action, PointerShape::Pointer),
+            (HitRole::ListItem, PointerShape::Pointer),
+            (HitRole::DragHandle, PointerShape::Pointer),
+            (HitRole::TextInput, PointerShape::Text),
+            (HitRole::ResizeHandle, PointerShape::EwResize),
+            (HitRole::Scroll, PointerShape::Default),
+            (HitRole::Background, PointerShape::Default),
+            (HitRole::Custom(9), PointerShape::Default),
+        ] {
+            assert_eq!(
+                resolve_cursor(
+                    PluginSurfaceCursor::Tui {
+                        intent: PointerIntent::Auto,
+                        role
+                    },
+                    false
+                ),
+                ResolvedPointerShape::Shape(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn tui_auto_resolves_role_after_capture_validation() {
+        use bmux_tui::hit::HitRole;
+        use bmux_tui::pointer::PointerIntent;
+
+        let mut compositor = scene(vec![
+            content(),
+            chrome(PluginSurfaceCursor::Tui {
+                intent: PointerIntent::Auto,
+                role: HitRole::DragHandle,
+            }),
+        ]);
+        let mut router = RetainedPointerRouter::default();
+        assert_eq!(
+            resolve_pointer_shape(input(&compositor, &router, Some((3, 3))), |_| None),
+            ResolvedPointerShape::Shape(PointerShape::Pointer)
+        );
+        router.capture(compositor.hit_test(3, 3).unwrap());
+        assert_eq!(
+            resolve_pointer_shape(input(&compositor, &router, Some((15, 8))), |_| None),
+            ResolvedPointerShape::Shape(PointerShape::Grabbing)
+        );
+        replace(&mut compositor, vec![content()]);
+        assert_eq!(
+            resolve_pointer_shape(input(&compositor, &router, Some((15, 8))), |_| None),
+            ResolvedPointerShape::Shape(PointerShape::Text)
+        );
     }
 
     #[test]

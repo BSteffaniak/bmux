@@ -201,12 +201,20 @@ pub enum ToastStackOutcome<'a> {
 
 /// Canonical component-lifecycle toast stack.
 pub struct ToastStackComponent<'a, 'state> {
+    pointer_intent: bmux_tui::pointer::PointerIntent,
     id: LayoutId,
     stack: ToastStack<'a>,
     state: &'state Cell<ToastStackState>,
 }
 
 impl<'a, 'state> ToastStackComponent<'a, 'state> {
+    /// Override pointer presentation without changing input routing or mouse policy.
+    #[must_use]
+    pub const fn pointer_intent(mut self, intent: bmux_tui::pointer::PointerIntent) -> Self {
+        self.pointer_intent = intent;
+        self
+    }
+
     /// Create a toast stack with stable identity and caller-owned state.
     #[must_use]
     pub fn new(
@@ -216,6 +224,7 @@ impl<'a, 'state> ToastStackComponent<'a, 'state> {
     ) -> Self {
         Self {
             id: id.into(),
+            pointer_intent: bmux_tui::pointer::PointerIntent::Auto,
             stack: ToastStack::new(toasts),
             state,
         }
@@ -251,6 +260,7 @@ impl Component for ToastStackComponent<'_, '_> {
         }
 
         let mut paint = std::collections::hash_map::DefaultHasher::new();
+        format!("{:?}", self.pointer_intent).hash(&mut paint);
         self.stack.policy.close_button.hash(&mut paint);
         self.stack.policy.mouse.hash(&mut paint);
         for toast in self.stack.toasts {
@@ -330,6 +340,7 @@ impl Component for ToastStackComponent<'_, '_> {
                         Rect::new(rect.right().saturating_sub(1), rect.y, 1, 1),
                     )
                     .role(HitRole::Action)
+                    .pointer_intent(self.pointer_intent)
                     .hoverable(true)
                     .focusable(true),
                 );
@@ -653,6 +664,7 @@ mod tests {
         ) {
             let state = std::cell::Cell::new(*state);
             let component = ToastStackComponent {
+                pointer_intent: bmux_tui::pointer::PointerIntent::Auto,
                 id: id_prefix.into(),
                 stack: *self,
                 state: &state,
@@ -665,6 +677,27 @@ mod tests {
                 |cx| component.paint(&layout, cx),
             );
         }
+    }
+
+    #[test]
+    fn pointer_override_invalidates_paint_without_remeasuring_layout() {
+        use bmux_tui::pointer::{PointerIntent, PointerShape};
+
+        let toasts = [ToastItem::new("one", "Saved").body("Changes persisted")];
+        let state = std::cell::Cell::new(ToastStackState::default());
+        let component = ToastStackComponent::new("toasts", &toasts, &state);
+        let original = component.revision();
+        let component = component.pointer_intent(PointerIntent::Hidden);
+        assert_eq!(component.pointer_intent, PointerIntent::Hidden);
+        let hidden = component.revision();
+        assert_eq!(original.layout, hidden.layout);
+        assert_ne!(original.paint, hidden.paint);
+        let component = component.pointer_intent(PointerIntent::Shape(PointerShape::Crosshair));
+        assert_eq!(
+            component.pointer_intent,
+            PointerIntent::Shape(PointerShape::Crosshair)
+        );
+        assert_ne!(hidden.paint, component.revision().paint);
     }
 
     #[test]

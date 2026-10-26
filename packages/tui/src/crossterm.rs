@@ -103,20 +103,70 @@ impl<W: Write> CrosstermTerminalGuard<W> {
         Ok(writer)
     }
 
-    fn leave_inner(&mut self) -> io::Result<()> {
-        if let Some(writer) = &mut self.writer {
-            if self.keyboard_enhanced {
-                pop_keyboard_enhancement_flags(writer)?;
-                self.keyboard_enhanced = false;
-            }
-            execute!(
-                writer,
-                DisableBracketedPaste,
-                DisableMouseCapture,
-                LeaveAlternateScreen
-            )?;
+    /// Suspend an owned direct terminal without dropping application state.
+    /// Async presenters must reclaim pending output before calling this boundary.
+    /// # Errors
+    /// Reports pointer or terminal cleanup failure; raw-mode cleanup is always attempted.
+    pub fn suspend<T: Write>(
+        &mut self,
+        terminal: &mut crate::terminal::Terminal<T>,
+    ) -> io::Result<()> {
+        let pointer = terminal.suspend();
+        let modes = self.leave_inner();
+        if modes.is_ok() {
+            self.active = false;
         }
-        disable_raw_mode()
+        pointer.and(modes)
+    }
+
+    /// Reacquire terminal modes after a successful suspend.
+    /// # Errors
+    /// Reports acquisition failures without claiming successful restoration.
+    pub fn resume<T: Write>(
+        &mut self,
+        terminal: &mut crate::terminal::Terminal<T>,
+    ) -> io::Result<()> {
+        if self.active {
+            return Err(io::Error::other("terminal modes already active"));
+        }
+        let writer = self
+            .writer
+            .as_mut()
+            .ok_or_else(|| io::Error::other("terminal writer unavailable"))?;
+        enable_raw_mode()?;
+        self.active = true;
+        if let Err(error) = execute!(
+            writer,
+            EnterAlternateScreen,
+            EnableMouseCapture,
+            EnableBracketedPaste
+        ) {
+            let _ = self.leave_inner();
+            return Err(error);
+        }
+        self.keyboard_enhanced = push_keyboard_enhancement_flags(writer).is_ok();
+        terminal.resume();
+        Ok(())
+    }
+
+    fn leave_inner(&mut self) -> io::Result<()> {
+        let output = (|| {
+            if let Some(writer) = &mut self.writer {
+                if self.keyboard_enhanced {
+                    pop_keyboard_enhancement_flags(writer)?;
+                    self.keyboard_enhanced = false;
+                }
+                execute!(
+                    writer,
+                    DisableBracketedPaste,
+                    DisableMouseCapture,
+                    LeaveAlternateScreen
+                )?;
+            }
+            Ok(())
+        })();
+        let raw = disable_raw_mode();
+        output.and(raw)
     }
 }
 

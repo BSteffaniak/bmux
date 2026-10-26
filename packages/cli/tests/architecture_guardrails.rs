@@ -508,6 +508,8 @@ fn bmux_umbrella_has_no_domain_reexports() {
     let lib_source = include_str!("../../bmux/src/lib.rs");
     let manifest_source = include_str!("../../bmux/Cargo.toml");
 
+    // Match the retired domain crate exactly, not neutral crates such as
+    // bmux_terminal_protocol that intentionally share its name prefix.
     let lib_denied = [
         "bmux_session",
         "bmux_terminal",
@@ -522,7 +524,13 @@ fn bmux_umbrella_has_no_domain_reexports() {
     ];
     for marker in lib_denied {
         assert!(
-            !lib_source.contains(marker),
+            if marker == "bmux_terminal" {
+                !lib_source
+                    .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+                    .any(|token| token == marker)
+            } else {
+                !lib_source.contains(marker)
+            },
             "packages/bmux/src/lib.rs must not reference domain marker \
              {marker}",
         );
@@ -536,7 +544,13 @@ fn bmux_umbrella_has_no_domain_reexports() {
     ];
     for marker in manifest_denied {
         assert!(
-            !manifest_source.contains(marker),
+            if marker == "bmux_terminal" {
+                !manifest_source
+                    .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+                    .any(|token| token == marker)
+            } else {
+                !manifest_source.contains(marker)
+            },
             "packages/bmux/Cargo.toml must not depend on domain crate \
              {marker}",
         );

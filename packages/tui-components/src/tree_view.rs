@@ -622,12 +622,20 @@ fn visible_indices(items: &[TreeViewItem], state: &TreeViewState) -> Vec<usize> 
 /// item id, and routes events through the same resolved layout. Tree state
 /// remains caller-owned through an interior-mutable `RefCell`.
 pub struct TreeViewComponent<'a, 'state> {
+    pointer_intent: bmux_tui::pointer::PointerIntent,
     id: LayoutId,
     tree: TreeView<'a>,
     state: &'state RefCell<TreeViewState>,
 }
 
 impl<'a, 'state> TreeViewComponent<'a, 'state> {
+    /// Override pointer presentation without changing input routing or mouse policy.
+    #[must_use]
+    pub const fn pointer_intent(mut self, intent: bmux_tui::pointer::PointerIntent) -> Self {
+        self.pointer_intent = intent;
+        self
+    }
+
     /// Create a tree view with stable identity and caller-owned state.
     #[must_use]
     pub fn new(
@@ -637,6 +645,7 @@ impl<'a, 'state> TreeViewComponent<'a, 'state> {
     ) -> Self {
         Self {
             id: id.into(),
+            pointer_intent: bmux_tui::pointer::PointerIntent::Auto,
             tree: TreeView::new(items),
             state,
         }
@@ -722,6 +731,7 @@ impl Component for TreeViewComponent<'_, '_> {
         state.expanded_ids().hash(&mut layout);
 
         let mut paint = std::collections::hash_map::DefaultHasher::new();
+        format!("{:?}", self.pointer_intent).hash(&mut paint);
         for item in self.tree.items {
             item.disabled.hash(&mut paint);
         }
@@ -791,6 +801,7 @@ impl Component for TreeViewComponent<'_, '_> {
                     cx.push_hit(
                         SceneRegion::new(self.id.as_str(), area)
                             .role(HitRole::ListItem)
+                            .pointer_intent(self.pointer_intent)
                             .pointer_events(self.tree.policy.mouse.enabled)
                             .hoverable(
                                 self.tree.policy.mouse.enabled && self.tree.policy.mouse.hover,
@@ -812,6 +823,7 @@ impl Component for TreeViewComponent<'_, '_> {
                         cx.push_hit(
                             SceneRegion::new(item_id.clone(), row)
                                 .role(HitRole::ListItem)
+                                .pointer_intent(self.pointer_intent)
                                 .pointer_events(self.tree.policy.mouse.enabled)
                                 .hoverable(
                                     self.tree.policy.mouse.enabled && self.tree.policy.mouse.hover,
@@ -888,6 +900,27 @@ mod tests {
             LocalRect::new(0, 0, area.width, area.height),
             |cx| component.paint(&layout, cx),
         );
+    }
+
+    #[test]
+    fn pointer_override_invalidates_paint_without_remeasuring_layout() {
+        use bmux_tui::pointer::{PointerIntent, PointerShape};
+
+        let items = [TreeViewItem::new("row", "Row", 0)];
+        let state = RefCell::new(TreeViewState::new(None));
+        let component = TreeViewComponent::new("tree", &items, &state);
+        let original = component.revision();
+        let component = component.pointer_intent(PointerIntent::Hidden);
+        assert_eq!(component.pointer_intent, PointerIntent::Hidden);
+        let hidden = component.revision();
+        assert_eq!(original.layout, hidden.layout);
+        assert_ne!(original.paint, hidden.paint);
+        let component = component.pointer_intent(PointerIntent::Shape(PointerShape::Crosshair));
+        assert_eq!(
+            component.pointer_intent,
+            PointerIntent::Shape(PointerShape::Crosshair)
+        );
+        assert_ne!(hidden.paint, component.revision().paint);
     }
 
     #[test]

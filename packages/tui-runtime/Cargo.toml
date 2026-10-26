@@ -26,13 +26,26 @@ required-features = ["image-iterm2"]
 name              = "image_protocols"
 required-features = ["image-kitty", "image-sixel", "image-iterm2", "crossterm"]
 
+[[example]]
+name              = "pointer_controls"
+required-features = ["crossterm"]
+
+[dev-dependencies]
+bmux_text_edit = { workspace = true }
+bmux_tui_components = { workspace = true, features = [
+    "button",
+    "text-input",
+    "modal-frame",
+] }
+
 [dependencies]
-bmux_image    = { workspace = true, optional = true }
-bmux_keyboard = { workspace = true }
-bmux_tui      = { workspace = true }
-futures-util  = { workspace = true, features = ["std"] }
-tokio         = { workspace = true, features = ["macros", "rt", "sync", "time"] }
-zeroize       = { workspace = true }
+bmux_image             = { workspace = true, optional = true }
+bmux_keyboard          = { workspace = true }
+bmux_terminal_protocol = { workspace = true }
+bmux_tui               = { workspace = true }
+futures-util           = { workspace = true, features = ["std"] }
+tokio                  = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+zeroize                = { workspace = true }
 
 [features]
 # Image protocol bundle, independent of the terminal input/lifecycle backend.

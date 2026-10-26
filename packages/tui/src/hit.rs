@@ -2,6 +2,7 @@
 
 use crate::event::{MouseEvent, MouseEventKind};
 use crate::geometry::{Point, Rect};
+use crate::pointer::PointerIntent;
 
 /// Stable caller-owned identifier for an interaction region.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -72,6 +73,9 @@ pub struct HitRegion {
     pub layer: i16,
     /// Region role.
     pub role: HitRole,
+    /// Pointer presentation override; Auto derives the compatibility role default.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub pointer_intent: PointerIntent,
     /// Whether this region is present in the committed interaction scene.
     pub visible: bool,
     /// Whether this region accepts pointer button, drag, and scroll events.
@@ -97,6 +101,7 @@ impl HitRegion {
             area,
             layer: 0,
             role: HitRole::Action,
+            pointer_intent: PointerIntent::Auto,
             visible: true,
             pointer_events: true,
             hoverable: false,
@@ -105,6 +110,13 @@ impl HitRegion {
             tab_order: 0,
             focus_scope: None,
         }
+    }
+
+    /// Override pointer presentation without changing input routing or the caret.
+    #[must_use]
+    pub const fn pointer_intent(mut self, intent: PointerIntent) -> Self {
+        self.pointer_intent = intent;
+        self
     }
 
     /// Set the region layer.
@@ -292,6 +304,20 @@ impl HitMap {
             .map(|(_, region)| region.id.clone())
             .filter(|id| seen.insert(id.clone()))
             .collect()
+    }
+
+    /// Find the visually topmost region, including disabled and non-interactive
+    /// regions. Pointer presentation uses this geometry rather than looking
+    /// through an occluder for an actionable target. Scope and enabled policy
+    /// are applied by the resolver after this lookup.
+    #[must_use]
+    pub fn pointer_region(&self, point: Point) -> Option<&HitRegion> {
+        self.regions
+            .iter()
+            .enumerate()
+            .filter(|(_, region)| region.contains(point))
+            .max_by_key(|(index, region)| (region.layer, *index))
+            .map(|(_, region)| region)
     }
 
     /// Find the topmost enabled region containing `point`.

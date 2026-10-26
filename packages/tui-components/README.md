@@ -9,6 +9,36 @@ exact layout through `PaintCx`, and route events through `EventCx`. Applications
 should not assign raw frame areas to reusable controls or reconstruct component
 geometry after painting.
 
+## Pointer presentation
+
+Controls publish hit roles through their ordinary scoped paint path. The shared
+`bmux_tui::pointer` resolver maps those roles to automatic pointer intent using
+the committed scene: buttons use `HitRole::Action`, while editable text uses
+`HitRole::TextInput`. Keep disabled state in the control's caller-owned state;
+disabled regions must not advertise an actionable override or expose lower
+controls through their geometry.
+
+Custom controls may set `bmux_tui::hit::HitRegion::pointer_intent` when a role
+default is insufficient. Use `PointerIntent::Auto` to return to role-derived
+behavior rather
+than maintaining a separate hover-to-shape table. Explicit shape or hidden
+intent
+remains explicit during capture. Use the existing interaction router's capture
+and modal scope, not independent control-local terminal state. Modal
+presentation
+must publish the appropriate scoped hit geometry and exclude background input.
+
+Components do not write OSC 22, hide the text caret, or own terminal cleanup.
+The runtime's [pointer controls example](../tui-runtime/examples/pointer_controls.rs)
+combines real `ButtonComponent`, `TextInputComponent`, and `ModalFrameComponent`
+controls with a custom drag handle through the standard presenters and a single
+committed interaction router. Its [run instructions](../tui-runtime/README.md#interactive-pointer-controls)
+cover overrides, modal exclusion, capture, and explicit restoration.
+
+`Hidden` is a host-dependent pointer intent, not a portable OSC 22 value. Pass
+resolved intent through the terminal backend only when its output API supports
+it; component availability alone makes no claim about the host terminal.
+
 ## Cargo features
 
 The crate has no default component set. Enable only the controls an application

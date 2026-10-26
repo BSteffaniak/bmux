@@ -255,13 +255,25 @@ impl<W: Write, R, C, Q> ImageTerminalPresenter<W, R, C, Q> {
         Ok(())
     }
 
-    /// Consume the presenter after cleaning host image resources and return its terminal.
+    /// Restore all presentation protocols through the same output owner.
+    /// Both cleanups are attempted even if one fails.
+    /// # Errors
+    /// Reports image or pointer cleanup failure; uncertain stack state is not replayed.
+    pub fn cleanup_presentation(&mut self) -> Result<(), ImagePresentationError> {
+        let images = self.cleanup_images();
+        let pointer = self.terminal.restore_pointer();
+        images?;
+        pointer?;
+        Ok(())
+    }
+
+    /// Consume the presenter after cleaning host image and pointer resources and return its terminal.
     ///
     /// # Errors
     ///
     /// Returns an error when protocol cleanup cannot be written or flushed.
     pub fn into_clean_terminal(mut self) -> Result<Terminal<W>, ImagePresentationError> {
-        self.cleanup_images()?;
+        self.cleanup_presentation()?;
         Ok(self.terminal)
     }
 }
@@ -273,6 +285,16 @@ where
     Q: PreparedConfiguration<P>,
 {
     type Error = ImagePresentationError;
+
+    fn observe_terminal_event(&mut self, event: &bmux_tui::event::Event) -> bool {
+        self.terminal.observe_event(event)
+    }
+    fn set_pointer_context(&mut self, context: bmux_tui::terminal::PointerContext) {
+        self.terminal.set_pointer_context(context);
+    }
+    async fn restore(&mut self) -> Result<(), Self::Error> {
+        self.cleanup_presentation()
+    }
 
     fn resize(&mut self, size: Size) {
         self.refresh_cell_metrics();
@@ -306,6 +328,16 @@ where
     Q: PreparedConfiguration<P>,
 {
     type Error = ImagePresentationError;
+
+    fn observe_terminal_event(&mut self, event: &bmux_tui::event::Event) -> bool {
+        self.terminal.observe_event(event)
+    }
+    fn set_pointer_context(&mut self, context: bmux_tui::terminal::PointerContext) {
+        self.terminal.set_pointer_context(context);
+    }
+    async fn restore(&mut self) -> Result<(), Self::Error> {
+        self.cleanup_presentation()
+    }
 
     fn resize(&mut self, size: Size) {
         self.refresh_cell_metrics();
@@ -406,7 +438,14 @@ where
 ///
 /// The inner terminal uses an in-memory staging writer; it never writes to the host.
 /// Only the acknowledgment callback may publish application interaction authority.
-pub struct AsyncImageTerminalPresenter<R, Q, O, T, Take, Commit> {
+pub struct AsyncImageTerminalPresenter<
+    R,
+    Q,
+    O: crate::presenter::CancellableOutput,
+    T,
+    Take,
+    Commit,
+> {
     inner: ImageTerminalPresenter<Vec<u8>, R, NoopPresentationCommit, Q>,
     output: Option<O>,
     take: Take,
@@ -503,7 +542,9 @@ impl<O: crate::CancellableOutput> crate::CancellableOutput for FrameOutput<O> {
     }
 }
 
-impl<R, Q, O, T, Take, Commit> AsyncImageTerminalPresenter<R, Q, O, T, Take, Commit> {
+impl<R, Q, O: crate::presenter::CancellableOutput, T, Take, Commit>
+    AsyncImageTerminalPresenter<R, Q, O, T, Take, Commit>
+{
     /// Construct the opt-in asynchronous adapter. `take` extracts the exact prepared
     /// application snapshot; `commit` receives it only after successful host flush.
     #[must_use]
@@ -609,6 +650,9 @@ impl<R, Q, O: crate::presenter::CancellableOutput, T, Take, Commit>
         {
             self.output = Some(frame.output);
             self.inner
+                .terminal
+                .invalidate_after_failed_delivery(&frame.terminal);
+            self.inner
                 .compositor
                 .invalidate_after_failed_output(&frame.compositor);
         }
@@ -618,6 +662,10 @@ impl<R, Q, O: crate::presenter::CancellableOutput, T, Take, Commit>
         // appending ordinary image cleanup or terminal restoration commands.
         let mut bytes = b"\x18\x1b\\\x1b[?2026l".to_vec();
         candidate.cleanup(&mut bytes, &self.inner.host_capabilities)?;
+        let pointer = self.inner.terminal.prepare_pointer_restore();
+        if let Ok(Some(pointer)) = &pointer {
+            bytes.extend_from_slice(pointer.bytes());
+        }
         let mut delivery = crate::presenter::Delivery::start(&mut self.output, bytes)?;
         let result = tokio::time::timeout(deadline, std::future::poll_fn(|cx| delivery.poll(cx)))
             .await
@@ -628,6 +676,14 @@ impl<R, Q, O: crate::presenter::CancellableOutput, T, Take, Commit>
                 ))
             });
         self.output = Some(delivery.reclaim()?);
+        match pointer {
+            Ok(Some(pointer)) => self
+                .inner
+                .terminal
+                .complete_pointer_restore(pointer, result.is_ok()),
+            Ok(None) => {}
+            Err(error) => return Err(error.into()),
+        }
         self.inner.terminal.reset();
         if let Err(error) = result {
             self.inner
@@ -652,6 +708,17 @@ where
     Commit: FnMut(&mut P, T, &HitMap, &FocusTrap),
 {
     type Error = ImagePresentationError;
+
+    fn observe_terminal_event(&mut self, event: &bmux_tui::event::Event) -> bool {
+        self.inner.terminal.observe_event(event)
+    }
+    fn set_pointer_context(&mut self, context: bmux_tui::terminal::PointerContext) {
+        self.inner.terminal.set_pointer_context(context);
+    }
+    async fn restore(&mut self) -> Result<(), Self::Error> {
+        self.cleanup_images(std::time::Duration::from_millis(250))
+            .await
+    }
 
     fn resize(&mut self, size: Size) {
         self.inner.refresh_cell_metrics();
@@ -728,7 +795,9 @@ where
             self.inner
                 .compositor
                 .invalidate_after_failed_output(&frame.compositor);
-            self.inner.terminal.reset();
+            self.inner
+                .terminal
+                .invalidate_after_failed_delivery(&frame.terminal);
             return std::task::Poll::Ready(Err(error.into()));
         }
         self.inner.terminal.acknowledge(frame.terminal);
@@ -746,10 +815,53 @@ where
             if let Ok(frame) = pending.delivery.reclaim() {
                 self.output = Some(frame.output);
                 self.inner
+                    .terminal
+                    .invalidate_after_failed_delivery(&frame.terminal);
+                self.inner
                     .compositor
                     .invalidate_after_failed_output(&frame.compositor);
             }
             self.inner.terminal.reset();
+        }
+    }
+}
+
+impl<R, Q, O: crate::presenter::CancellableOutput, T, Take, Commit> Drop
+    for AsyncImageTerminalPresenter<R, Q, O, T, Take, Commit>
+{
+    fn drop(&mut self) {
+        if let Some(mut pending) = self.pending.take()
+            && let Ok(frame) = pending.delivery.reclaim()
+        {
+            self.output = Some(frame.output);
+            self.inner
+                .terminal
+                .invalidate_after_failed_delivery(&frame.terminal);
+            self.inner
+                .compositor
+                .invalidate_after_failed_output(&frame.compositor);
+        }
+        let mut candidate = self.inner.compositor.clone();
+        let mut bytes = b"\x18\x1b\\\x1b[?2026l".to_vec();
+        let _ = candidate.cleanup(&mut bytes, &self.inner.host_capabilities);
+        let pointer = self.inner.terminal.prepare_pointer_restore();
+        if let Ok(Some(pointer)) = &pointer {
+            bytes.extend_from_slice(pointer.bytes());
+        }
+        let succeeded =
+            if let Ok(mut delivery) = crate::presenter::Delivery::start(&mut self.output, bytes) {
+                let result = delivery.finish_before(std::time::Duration::from_millis(250));
+                if let Ok(output) = delivery.reclaim() {
+                    self.output = Some(output);
+                }
+                result.is_ok()
+            } else {
+                false
+            };
+        if let Ok(Some(pointer)) = pointer {
+            self.inner
+                .terminal
+                .complete_pointer_restore(pointer, succeeded);
         }
     }
 }
@@ -1477,12 +1589,27 @@ mod async_tests {
 
     #[tokio::test]
     async fn actual_image_quit_cancels_gated_flush_and_joins_worker() {
+        image_quit_cleanup(true).await;
+    }
+
+    #[tokio::test]
+    async fn image_quit_reports_blocked_cleanup_without_hanging_or_detaching() {
+        image_quit_cleanup(false).await;
+    }
+
+    async fn image_quit_cleanup(unblock_cleanup: bool) {
         let release = Arc::new(AtomicBool::new(false));
         let count = Arc::new(AtomicUsize::new(0));
         let alive = Arc::new(AtomicUsize::new(0));
         let (observed, _) = tokio::sync::mpsc::unbounded_channel();
+        let mut terminal = Terminal::new(Vec::new(), Rect::new(0, 0, 2, 1));
+        // This regression isolates image cancellation and restoration; pointer
+        // stack failure behavior has its own explicit-capability coverage.
+        terminal.set_pointer_capability(
+            bmux_terminal_protocol::pointer_output::PointerShapeCapability::Unsupported,
+        );
         let inner = ImageTerminalPresenter::new(
-            Terminal::new(Vec::new(), Rect::new(0, 0, 2, 1)),
+            terminal,
             paint,
             HostImageCapabilities::default(),
             ImageConfig::default(),
@@ -1490,7 +1617,7 @@ mod async_tests {
         let presenter = AsyncImageTerminalPresenter::new(
             inner,
             Gate {
-                release,
+                release: Arc::clone(&release),
                 started: Arc::clone(&count),
                 alive: Arc::clone(&alive),
                 fail: false,
@@ -1507,15 +1634,37 @@ mod async_tests {
         let drive = async {
             started(&count).await;
             handle.send(99).await.expect("quit");
+            if unblock_cleanup {
+                // The cancelled frame's gate remains closed. Open only after
+                // the restoration transaction has acquired the reclaimed owner.
+                while count.load(Ordering::SeqCst) < 2 {
+                    tokio::task::yield_now().await;
+                }
+                release.store(true, Ordering::SeqCst);
+            }
         };
         let (result, ()) = tokio::time::timeout(Duration::from_secs(3), async {
             tokio::join!(Box::pin(runtime.run()), drive)
         })
         .await
         .expect("bounded cancellation");
-        assert!(result.is_ok());
+        if unblock_cleanup {
+            assert!(result.is_ok());
+        } else {
+            let Err(crate::RuntimeError::Presenter {
+                error,
+                cleanup_error,
+                ..
+            }) = &result
+            else {
+                panic!("blocked restoration must be reported");
+            };
+            assert!(matches!(error, super::ImagePresentationError::Io(error)
+                if error.kind() == io::ErrorKind::TimedOut));
+            assert!(cleanup_error.is_none());
+        }
         assert_eq!(alive.load(Ordering::SeqCst), 0);
-        assert_eq!(count.load(Ordering::SeqCst), 1);
+        assert_eq!(count.load(Ordering::SeqCst), 2);
     }
 }
 
@@ -1612,6 +1761,70 @@ mod prepared_tests {
             program.scopes.last()
         );
     }
+    #[tokio::test]
+    async fn image_pointer_lifecycle_delegates_through_context_adapter() {
+        use crate::presenter::PointerContextPresenter;
+        use bmux_terminal_protocol::pointer_output::PointerShapeCapability;
+        let mut terminal = Terminal::new(Writer::default(), Rect::new(0, 0, 4, 2));
+        terminal.set_pointer_capability(PointerShapeCapability::Stack);
+        let inner = ImageTerminalPresenter::new(
+            terminal,
+            render,
+            bmux_image::HostImageCapabilities::default(),
+            bmux_image::ImageConfig::default(),
+        );
+        let mut presenter = PointerContextPresenter::new(inner, |_: &Program| {
+            bmux_tui::terminal::PointerContext::default()
+        });
+        assert!(
+            presenter.observe_terminal_event(&bmux_tui::event::Event::Mouse(
+                bmux_tui::event::MouseEvent::new(
+                    bmux_tui::event::MouseEventKind::Move,
+                    bmux_tui::geometry::Point::new(0, 0),
+                ),
+            ))
+        );
+        presenter.present(&mut Program::default()).unwrap();
+        let mut expected_pop = Vec::new();
+        bmux_terminal_protocol::pointer_shape::encode_pointer_shape_pop(&mut expected_pop);
+        presenter
+            .inner_mut()
+            .terminal_mut()
+            .writer_mut()
+            .bytes
+            .clear();
+        <_ as Presenter<Program>>::restore(&mut presenter)
+            .await
+            .unwrap();
+        assert!(
+            presenter
+                .inner_mut()
+                .terminal()
+                .writer()
+                .bytes
+                .windows(expected_pop.len())
+                .any(|bytes| bytes == expected_pop)
+        );
+        presenter
+            .inner_mut()
+            .terminal_mut()
+            .writer_mut()
+            .bytes
+            .clear();
+        <_ as Presenter<Program>>::restore(&mut presenter)
+            .await
+            .unwrap();
+        assert!(
+            !presenter
+                .inner_mut()
+                .terminal()
+                .writer()
+                .bytes
+                .windows(expected_pop.len())
+                .any(|bytes| bytes == expected_pop)
+        );
+    }
+
     #[test]
     fn prepared_configuration_also_supports_noop_commit_constructor() {
         let mut presenter = ImageTerminalPresenter::new(

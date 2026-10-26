@@ -272,12 +272,20 @@ pub struct ActionRow<'a> {
 
 /// Canonical component-lifecycle action row.
 pub struct ActionRowComponent<'a, 'state> {
+    pointer_intent: bmux_tui::pointer::PointerIntent,
     id: LayoutId,
     row: ActionRow<'a>,
     state: &'state Cell<ActionRowState>,
 }
 
 impl<'a, 'state> ActionRowComponent<'a, 'state> {
+    /// Override pointer presentation without changing input routing or mouse policy.
+    #[must_use]
+    pub const fn pointer_intent(mut self, intent: bmux_tui::pointer::PointerIntent) -> Self {
+        self.pointer_intent = intent;
+        self
+    }
+
     /// Create an action row with stable identity and caller-owned state.
     #[must_use]
     pub fn new(
@@ -287,6 +295,7 @@ impl<'a, 'state> ActionRowComponent<'a, 'state> {
     ) -> Self {
         Self {
             id: id.into(),
+            pointer_intent: bmux_tui::pointer::PointerIntent::Auto,
             row: ActionRow::new(actions),
             state,
         }
@@ -322,6 +331,7 @@ impl Component for ActionRowComponent<'_, '_> {
         self.row.spacing.hash(&mut layout);
 
         let mut paint = std::collections::hash_map::DefaultHasher::new();
+        format!("{:?}", self.pointer_intent).hash(&mut paint);
         self.row.policy.mouse.enabled.hash(&mut paint);
         self.row.policy.mouse.hover.hash(&mut paint);
         self.row.policy.mouse.click.hash(&mut paint);
@@ -379,6 +389,7 @@ impl Component for ActionRowComponent<'_, '_> {
             cx.push_hit(
                 SceneRegion::new(format!("{}.{}", self.id.as_str(), action.id), action_area)
                     .role(HitRole::Action)
+                    .pointer_intent(self.pointer_intent)
                     .pointer_events(self.row.policy.mouse.enabled)
                     .hoverable(self.row.policy.mouse.enabled && self.row.policy.mouse.hover)
                     .focusable(true)
@@ -718,6 +729,29 @@ mod tests {
         ActionButton, ActionRow, ActionRowComponent, ActionRowOutcome, ActionRowPolicy,
         ActionRowState,
     };
+
+    #[test]
+    fn pointer_override_invalidates_paint_without_remeasuring_layout() {
+        use bmux_tui::pointer::{PointerIntent, PointerShape};
+
+        let actions = [ActionButton::new("ok", "OK")];
+        let state = Cell::new(ActionRowState::new());
+        let mut policy = ActionRowPolicy::global();
+        policy.mouse.enabled = false;
+        let component = ActionRowComponent::new("actions", &actions, &state).policy(policy);
+        let original = component.revision();
+        let component = component.pointer_intent(PointerIntent::Hidden);
+        assert_eq!(component.pointer_intent, PointerIntent::Hidden);
+        let hidden = component.revision();
+        assert_eq!(original.layout, hidden.layout);
+        assert_ne!(original.paint, hidden.paint);
+        let component = component.pointer_intent(PointerIntent::Shape(PointerShape::Crosshair));
+        assert_eq!(
+            component.pointer_intent,
+            PointerIntent::Shape(PointerShape::Crosshair)
+        );
+        assert_ne!(hidden.paint, component.revision().paint);
+    }
 
     #[test]
     fn mouse_disabled_row_retains_keyboard_focus_without_pointer_regions() {

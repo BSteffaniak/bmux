@@ -571,6 +571,7 @@ impl Pane<'_> {
 /// Pane interaction state remains caller-owned. Layout, chrome, child placement,
 /// hit geometry, and event routing all consume the same resolved tree.
 pub struct PaneComponent<'a, 'state> {
+    pointer_intent: bmux_tui::pointer::PointerIntent,
     id: LayoutId,
     pane: Pane<'a>,
     state: &'state Cell<PaneState>,
@@ -578,6 +579,13 @@ pub struct PaneComponent<'a, 'state> {
 }
 
 impl<'a, 'state> PaneComponent<'a, 'state> {
+    /// Override pointer presentation without changing input routing or mouse policy.
+    #[must_use]
+    pub const fn pointer_intent(mut self, intent: bmux_tui::pointer::PointerIntent) -> Self {
+        self.pointer_intent = intent;
+        self
+    }
+
     /// Create a pane component with stable identity, caller-owned state, and one child.
     #[must_use]
     pub fn new(
@@ -588,6 +596,7 @@ impl<'a, 'state> PaneComponent<'a, 'state> {
     ) -> Self {
         Self {
             id: id.into(),
+            pointer_intent: bmux_tui::pointer::PointerIntent::Auto,
             pane,
             state,
             child: Element::new(child),
@@ -627,9 +636,11 @@ impl Component for PaneComponent<'_, '_> {
         state.area.height.hash(&mut layout);
 
         let mut paint = std::collections::hash_map::DefaultHasher::new();
+        format!("{:?}", self.pointer_intent).hash(&mut paint);
         format!("{:?}", self.pane.styles).hash(&mut paint);
         format!("{:?}", self.pane.policy).hash(&mut paint);
         format!("{:?}", state.interaction).hash(&mut paint);
+        format!("{:?}", state.drag).hash(&mut paint);
         ComponentRevision::new(layout.finish() ^ child.layout, paint.finish() ^ child.paint)
     }
 
@@ -650,6 +661,7 @@ impl Component for PaneComponent<'_, '_> {
             cx.push_hit(
                 SceneRegion::new(self.id.as_str(), size)
                     .role(HitRole::Background)
+                    .pointer_intent(self.pointer_intent)
                     .hoverable(true)
                     .focusable(false)
                     .enabled(!state.interaction.disabled),
@@ -658,6 +670,21 @@ impl Component for PaneComponent<'_, '_> {
                 cx.push_hit(
                     SceneRegion::new(format!("{}.title", self.id.as_str()), title_bar_area(size))
                         .role(HitRole::DragHandle)
+                        .pointer_intent(match self.pointer_intent {
+                            bmux_tui::pointer::PointerIntent::Auto => {
+                                bmux_tui::pointer::PointerIntent::Shape(
+                                    if state
+                                        .drag
+                                        .is_some_and(|drag| matches!(drag.mode, PaneDragMode::Move))
+                                    {
+                                        bmux_tui::pointer::PointerShape::Grabbing
+                                    } else {
+                                        bmux_tui::pointer::PointerShape::Grab
+                                    },
+                                )
+                            }
+                            intent => intent,
+                        })
                         .hoverable(true)
                         .focusable(false)
                         .enabled(!state.interaction.disabled),
@@ -667,6 +694,21 @@ impl Component for PaneComponent<'_, '_> {
                 cx.push_hit(
                     SceneRegion::new(format!("{}.resize.{suffix}", self.id.as_str()), area)
                         .role(HitRole::ResizeHandle)
+                        .pointer_intent(match self.pointer_intent {
+                            bmux_tui::pointer::PointerIntent::Auto => {
+                                bmux_tui::pointer::PointerIntent::Shape(match suffix {
+                                    "top" | "bottom" => bmux_tui::pointer::PointerShape::NsResize,
+                                    "top-left" | "bottom-right" => {
+                                        bmux_tui::pointer::PointerShape::NwseResize
+                                    }
+                                    "top-right" | "bottom-left" => {
+                                        bmux_tui::pointer::PointerShape::NeswResize
+                                    }
+                                    _ => bmux_tui::pointer::PointerShape::EwResize,
+                                })
+                            }
+                            intent => intent,
+                        })
                         .hoverable(true)
                         .focusable(false)
                         .enabled(!state.interaction.disabled),
@@ -929,6 +971,43 @@ mod tests {
         Pane, PaneBoundsPolicy, PaneComponent, PaneMousePolicy, PaneOutcome, PanePolicy, PaneState,
         ResizeHandles,
     };
+
+    #[test]
+    fn pointer_override_invalidates_paint_without_remeasuring_layout() {
+        use bmux_tui::pointer::{PointerIntent, PointerShape};
+
+        let state = Cell::new(PaneState::new(Rect::new(0, 0, 12, 5)));
+        let component = PaneComponent::new(
+            "pane",
+            Pane::new()
+                .title("Pane")
+                .padding(Insets::all(1))
+                .policy(PanePolicy {
+                    mouse: PaneMousePolicy {
+                        enabled: true,
+                        click_to_focus: true,
+                        title_bar_drag: true,
+                        scroll_wheel: false,
+                        resize_handles: ResizeHandles::ALL,
+                    },
+                    bounds: PaneBoundsPolicy::default(),
+                }),
+            &state,
+            TextBlock::new("body").id("pane.body"),
+        );
+        let original = component.revision();
+        let component = component.pointer_intent(PointerIntent::Hidden);
+        assert_eq!(component.pointer_intent, PointerIntent::Hidden);
+        let hidden = component.revision();
+        assert_eq!(original.layout, hidden.layout);
+        assert_ne!(original.paint, hidden.paint);
+        let component = component.pointer_intent(PointerIntent::Shape(PointerShape::Crosshair));
+        assert_eq!(
+            component.pointer_intent,
+            PointerIntent::Shape(PointerShape::Crosshair)
+        );
+        assert_ne!(hidden.paint, component.revision().paint);
+    }
 
     #[test]
     fn title_preserves_remaining_top_border() {

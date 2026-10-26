@@ -252,6 +252,8 @@ pub enum RuntimeError<PE, RE, P, R> {
     Program {
         /// Application error.
         error: PE,
+        /// Cleanup failure, if protocol ownership could not be restored.
+        cleanup_error: Option<RE>,
         /// Final state and measurements.
         output: RuntimeOutput<P, R>,
     },
@@ -259,6 +261,8 @@ pub enum RuntimeError<PE, RE, P, R> {
     Presenter {
         /// Presenter error.
         error: RE,
+        /// Additional cleanup failure after the original presentation error.
+        cleanup_error: Option<RE>,
         /// Final state and measurements.
         output: RuntimeOutput<P, R>,
     },
@@ -431,7 +435,7 @@ where
                 self.presenter.cancel_present();
                 self.pending_presentation = None;
                 lock_unpoisoned(&self.control.state).dirty = false;
-                return Ok(self.finish().await);
+                return self.finish().await;
             }
             if self.presentation_due()
                 && let Err(error) = self.present()
@@ -440,7 +444,7 @@ where
             }
             let dirty = lock_unpoisoned(&self.control.state).dirty;
             if self.exiting && !dirty {
-                return Ok(self.finish().await);
+                return self.finish().await;
             }
             if did_work {
                 tokio::task::yield_now().await;
@@ -719,6 +723,11 @@ where
     }
 
     fn apply_event(&mut self, event: RuntimeEvent<P::Message>) -> Result<(), P::Error> {
+        if let RuntimeEvent::Terminal(terminal_event) = &event
+            && self.presenter.observe_terminal_event(terminal_event)
+        {
+            self.mark_dirty(false);
+        }
         let resize = match &event {
             RuntimeEvent::Terminal(Event::Resize(size)) => Some(*size),
             RuntimeEvent::Terminal(_) | RuntimeEvent::Message(_) | RuntimeEvent::Timer(_) => None,
@@ -931,21 +940,36 @@ where
         self.subscriptions.shutdown().await;
     }
 
-    async fn finish(mut self) -> RuntimeOutput<P, R> {
+    async fn finish(
+        mut self,
+    ) -> Result<RuntimeOutput<P, R>, RuntimeError<P::Error, R::Error, P, R>> {
         self.presenter.cancel_present();
+        let restoration = self.presenter.restore().await;
         self.close().await;
-        RuntimeOutput {
+        let output = RuntimeOutput {
             program: self.program,
             presenter: self.presenter,
             stats: stats_snapshot(&self.stats),
+        };
+        match restoration {
+            Ok(()) => Ok(output),
+            // Restoration itself failed. Do not immediately retry cleanup as
+            // though this were an unrelated presentation failure.
+            Err(error) => Err(RuntimeError::Presenter {
+                error,
+                cleanup_error: None,
+                output,
+            }),
         }
     }
 
     async fn program_error(mut self, error: P::Error) -> RuntimeError<P::Error, R::Error, P, R> {
         self.presenter.cancel_present();
+        let cleanup_error = self.presenter.restore().await.err();
         self.close().await;
         RuntimeError::Program {
             error,
+            cleanup_error,
             output: RuntimeOutput {
                 program: self.program,
                 presenter: self.presenter,
@@ -956,9 +980,11 @@ where
 
     async fn presenter_error(mut self, error: R::Error) -> RuntimeError<P::Error, R::Error, P, R> {
         self.presenter.cancel_present();
+        let cleanup_error = self.presenter.restore().await.err();
         self.close().await;
         RuntimeError::Presenter {
             error,
+            cleanup_error,
             output: RuntimeOutput {
                 program: self.program,
                 presenter: self.presenter,

@@ -1,3 +1,4 @@
+import groovy.json.JsonSlurper
 import org.gradle.internal.os.OperatingSystem
 import java.io.ByteArrayOutputStream
 import java.io.File
@@ -183,8 +184,26 @@ tasks.register<Exec>("generateUniffiKotlinBindings") {
             else -> "libbmux_mobile_ffi.so"
         }
 
-        val libraryPath = workspaceRoot
-            .resolve("target")
+        // Ask Cargo under the same inherited environment and working directory
+        // as cargoBuildMobileFfi; Nix and .cargo/config may select another target.
+        val metadataProcess = ProcessBuilder(
+            "cargo", "metadata", "--locked", "--offline", "--no-deps", "--format-version", "1",
+        )
+            .directory(workspaceRoot)
+            .redirectError(ProcessBuilder.Redirect.INHERIT)
+            .start()
+        val metadataOutput = metadataProcess.inputStream.bufferedReader().use { it.readText() }
+        if (metadataProcess.waitFor() != 0) {
+            throw GradleException("cargo metadata failed while resolving the UniFFI library directory")
+        }
+        val metadata = JsonSlurper().parseText(metadataOutput) as? Map<*, *>
+            ?: throw GradleException("cargo metadata did not return a JSON object")
+        val targetDirectory = (metadata["target_directory"] as? String)
+            ?.takeIf { it.isNotBlank() }
+            ?.let(::File)
+            ?.takeIf { it.isAbsolute }
+            ?: throw GradleException("cargo metadata did not return an absolute target_directory")
+        val libraryPath = targetDirectory
             .resolve("debug")
             .resolve(libraryName)
             .absolutePath

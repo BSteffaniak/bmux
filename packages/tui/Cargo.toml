@@ -11,15 +11,16 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
-bmux_keyboard        = { workspace = true, features = ["csi-u"] }
-bmux_text_edit       = { workspace = true, features = ["keyboard"] }
-crossterm            = { workspace = true, optional = true }
-futures-util         = { workspace = true, optional = true, features = ["std"] }
-image                = { workspace = true, features = ["png"] }
-serde                = { workspace = true, optional = true, features = ["derive"] }
-unicode-segmentation = { workspace = true }
-unicode-width        = { workspace = true }
-zeroize              = { workspace = true, features = ["alloc"] }
+bmux_keyboard          = { workspace = true, features = ["csi-u"] }
+bmux_terminal_protocol = { workspace = true }
+bmux_text_edit         = { workspace = true, features = ["keyboard"] }
+crossterm              = { workspace = true, optional = true }
+futures-util           = { workspace = true, optional = true, features = ["std"] }
+image                  = { workspace = true, features = ["png"] }
+serde                  = { workspace = true, optional = true, features = ["derive"] }
+unicode-segmentation   = { workspace = true }
+unicode-width          = { workspace = true }
+zeroize                = { workspace = true, features = ["alloc"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = { workspace = true }

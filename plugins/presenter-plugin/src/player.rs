@@ -2085,7 +2085,11 @@ async fn run_owned(mut player: Player, guard: &mut TerminalGuard) -> Result<()> 
             images?;
             cleanup
         }
-        Err(bmux_tui_runtime::RuntimeError::Program { error, mut output }) => {
+        Err(bmux_tui_runtime::RuntimeError::Program {
+            error,
+            mut output,
+            cleanup_error,
+        }) => {
             let images = output
                 .presenter
                 .cleanup_images()
@@ -2095,9 +2099,16 @@ async fn run_owned(mut player: Player, guard: &mut TerminalGuard) -> Result<()> 
             restored?;
             images?;
             cleanup?;
+            if let Some(cleanup_error) = cleanup_error {
+                return Err(error.context(format!("pointer restoration failed: {cleanup_error}")));
+            }
             Err(error)
         }
-        Err(bmux_tui_runtime::RuntimeError::Presenter { error, mut output }) => {
+        Err(bmux_tui_runtime::RuntimeError::Presenter {
+            error,
+            mut output,
+            cleanup_error,
+        }) => {
             output.program.invalidate_committed_input();
             output.program.local_view.focused_block = None;
             let images = output
@@ -2109,6 +2120,10 @@ async fn run_owned(mut player: Player, guard: &mut TerminalGuard) -> Result<()> 
             restored?;
             images?;
             cleanup?;
+            if let Some(cleanup_error) = cleanup_error {
+                return Err(anyhow::anyhow!(error)
+                    .context(format!("pointer restoration failed: {cleanup_error}")));
+            }
             Err(anyhow::anyhow!(error))
         }
     }

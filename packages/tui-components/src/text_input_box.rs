@@ -169,12 +169,20 @@ struct TextInputBoxConfig<'a> {
 
 /// Canonical component-lifecycle text input box.
 pub struct TextInputBoxComponent<'a, 'state> {
+    pointer_intent: bmux_tui::pointer::PointerIntent,
     id: LayoutId,
     box_control: TextInputBoxConfig<'a>,
     state: &'state RefCell<TextInputState>,
 }
 
 impl<'a, 'state> TextInputBoxComponent<'a, 'state> {
+    /// Override pointer presentation without changing input routing or mouse policy.
+    #[must_use]
+    pub const fn pointer_intent(mut self, intent: bmux_tui::pointer::PointerIntent) -> Self {
+        self.pointer_intent = intent;
+        self
+    }
+
     /// Create a text input box with stable identity and caller-owned state.
     #[must_use]
     pub fn new(
@@ -184,6 +192,7 @@ impl<'a, 'state> TextInputBoxComponent<'a, 'state> {
     ) -> Self {
         Self {
             id: id.into(),
+            pointer_intent: bmux_tui::pointer::PointerIntent::Auto,
             box_control: TextInputBoxConfig::new(text_policy),
             state,
         }
@@ -244,6 +253,7 @@ impl<'a, 'state> TextInputBoxComponent<'a, 'state> {
             self.state,
             &self.box_control.text_policy,
         )
+        .pointer_intent(self.pointer_intent)
         .style(self.box_control.text_style())
         .selection_style(self.box_control.styles.selection)
         .focused(self.box_control.policy.cursor && self.box_control.policy.focused)
@@ -419,6 +429,36 @@ mod tests {
         let semantics = frame.semantics().regions().to_vec();
         drop(frame);
         (buffer, layout, cursor, hits, semantics)
+    }
+
+    #[test]
+    fn pointer_override_invalidates_paint_without_remeasuring_layout() {
+        use bmux_tui::pointer::{PointerIntent, PointerShape};
+
+        let state = RefCell::new(TextInputState::default());
+        let policy = TextInputPolicy::chat_composer();
+        let component = TextInputBoxComponent::new("composer", policy, &state)
+            .label("Message")
+            .required(true)
+            .help("Markdown supported")
+            .placeholder("Type a message")
+            .policy(
+                TextInputBoxPolicy::labeled_field()
+                    .focused(true)
+                    .rows(2, Some(2)),
+            );
+        let original = component.revision();
+        let component = component.pointer_intent(PointerIntent::Hidden);
+        assert_eq!(component.pointer_intent, PointerIntent::Hidden);
+        let hidden = component.revision();
+        assert_eq!(original.layout, hidden.layout);
+        assert_ne!(original.paint, hidden.paint);
+        let component = component.pointer_intent(PointerIntent::Shape(PointerShape::Crosshair));
+        assert_eq!(
+            component.pointer_intent,
+            PointerIntent::Shape(PointerShape::Crosshair)
+        );
+        assert_ne!(hidden.paint, component.revision().paint);
     }
 
     #[test]

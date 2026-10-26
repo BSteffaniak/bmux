@@ -109,6 +109,9 @@ impl ComponentViewport {
             .regions()
             .iter()
             .filter_map(|region| {
+                if !region.visible {
+                    return None;
+                }
                 let visible = region.area.intersection(Rect::new(
                     raster_origin.x,
                     raster_origin.y,
@@ -228,6 +231,60 @@ impl ComponentViewport {
 mod tests {
     use super::*;
     use bmux_tui::component::{LayoutId, LogicalSize};
+
+    #[test]
+    fn viewport_preserves_clipped_pointer_metadata_and_disabled_occlusion() {
+        use crate::surface::PluginSurfaceCursor;
+        use bmux_tui::component::{Constraints, LayoutCx};
+        use bmux_tui::hit::{HitRegion, HitRole};
+        use bmux_tui::pointer::{PointerIntent, PointerShape};
+
+        struct Targets;
+        impl Component for Targets {
+            fn layout(&self, _: Constraints, _: &mut LayoutCx) -> LayoutNode {
+                LayoutNode::leaf("targets".into(), LogicalSize::new(100, 2))
+            }
+            fn paint(&self, _: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
+                cx.push_hit(
+                    HitRegion::new("clipped", Rect::new(9, 0, 4, 1))
+                        .role(HitRole::DragHandle)
+                        .pointer_intent(PointerIntent::Shape(PointerShape::Grab)),
+                );
+                cx.push_hit(
+                    HitRegion::new("hidden", Rect::new(13, 0, 1, 1))
+                        .pointer_intent(PointerIntent::Hidden),
+                );
+                let mut disabled = HitRegion::new("disabled", Rect::new(14, 0, 1, 1))
+                    .pointer_intent(PointerIntent::Hidden);
+                disabled.enabled = false;
+                cx.push_hit(disabled);
+                cx.push_hit(HitRegion::new("offscreen", Rect::new(90, 0, 1, 1)));
+                cx.push_hit(HitRegion::new("invisible", Rect::new(15, 0, 1, 1)).visible(false));
+            }
+        }
+        let targets = Targets;
+        let layout = targets.layout(Constraints::for_width(100), &mut LayoutCx::new());
+        let viewport =
+            ComponentViewport::new(layout, Rect::new(3, 4, 8, 1), Point::new(10, 0)).unwrap();
+        let painted = viewport.paint(&targets);
+        assert_eq!(painted.hits.len(), 3);
+        assert_eq!(painted.hits[0].rect, crate::ExtensionRect::new(3, 4, 3, 1));
+        assert_eq!(
+            painted.hits[0].cursor,
+            PluginSurfaceCursor::Tui {
+                intent: PointerIntent::Shape(PointerShape::Grab),
+                role: HitRole::DragHandle,
+            }
+        );
+        assert_eq!(
+            painted.hits[1].cursor,
+            PluginSurfaceCursor::Tui {
+                intent: PointerIntent::Hidden,
+                role: HitRole::Action,
+            }
+        );
+        assert_eq!(painted.hits[2].cursor, PluginSurfaceCursor::Default);
+    }
 
     #[test]
     fn logical_extent_does_not_determine_raster_allocation() {

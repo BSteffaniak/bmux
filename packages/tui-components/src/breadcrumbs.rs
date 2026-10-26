@@ -214,12 +214,20 @@ struct Breadcrumbs<'a> {
 
 /// Canonical component-lifecycle breadcrumbs control.
 pub struct BreadcrumbsComponent<'a, 'state> {
+    pointer_intent: bmux_tui::pointer::PointerIntent,
     id: LayoutId,
     breadcrumbs: Breadcrumbs<'a>,
     state: &'state Cell<BreadcrumbsState>,
 }
 
 impl<'a, 'state> BreadcrumbsComponent<'a, 'state> {
+    /// Override pointer presentation without changing input routing or mouse policy.
+    #[must_use]
+    pub const fn pointer_intent(mut self, intent: bmux_tui::pointer::PointerIntent) -> Self {
+        self.pointer_intent = intent;
+        self
+    }
+
     /// Create breadcrumbs with stable identity and caller-owned state.
     #[must_use]
     pub fn new(
@@ -229,6 +237,7 @@ impl<'a, 'state> BreadcrumbsComponent<'a, 'state> {
     ) -> Self {
         Self {
             id: id.into(),
+            pointer_intent: bmux_tui::pointer::PointerIntent::Auto,
             breadcrumbs: Breadcrumbs::new(items),
             state,
         }
@@ -338,6 +347,7 @@ impl Component for BreadcrumbsComponent<'_, '_> {
         self.breadcrumbs.policy.separator.hash(&mut layout);
 
         let mut paint = std::collections::hash_map::DefaultHasher::new();
+        format!("{:?}", self.pointer_intent).hash(&mut paint);
         for item in self.breadcrumbs.items {
             item.disabled.hash(&mut paint);
         }
@@ -388,6 +398,7 @@ impl Component for BreadcrumbsComponent<'_, '_> {
                     Rect::new(0, 0, layout.size.width.try_into().unwrap_or(u16::MAX), 1),
                 )
                 .role(HitRole::ListItem)
+                .pointer_intent(self.pointer_intent)
                 .pointer_events(self.breadcrumbs.policy.mouse.enabled)
                 .hoverable(
                     self.breadcrumbs.policy.mouse.enabled && self.breadcrumbs.policy.mouse.hover,
@@ -711,6 +722,7 @@ mod tests {
         ) {
             let state = Cell::new(*state);
             let component = BreadcrumbsComponent {
+                pointer_intent: bmux_tui::pointer::PointerIntent::Auto,
                 id: id.into(),
                 breadcrumbs: *self,
                 state: &state,
@@ -723,6 +735,30 @@ mod tests {
                 |cx| component.paint(&layout, cx),
             );
         }
+    }
+
+    #[test]
+    fn pointer_override_invalidates_paint_without_remeasuring_layout() {
+        use bmux_tui::pointer::{PointerIntent, PointerShape};
+
+        let items = [
+            BreadcrumbItem::new("home", "Home"),
+            BreadcrumbItem::new("docs", "Docs"),
+        ];
+        let state = Cell::new(BreadcrumbsState::new(None));
+        let component = BreadcrumbsComponent::new("trail", &items, &state);
+        let original = component.revision();
+        let component = component.pointer_intent(PointerIntent::Hidden);
+        assert_eq!(component.pointer_intent, PointerIntent::Hidden);
+        let hidden = component.revision();
+        assert_eq!(original.layout, hidden.layout);
+        assert_ne!(original.paint, hidden.paint);
+        let component = component.pointer_intent(PointerIntent::Shape(PointerShape::Crosshair));
+        assert_eq!(
+            component.pointer_intent,
+            PointerIntent::Shape(PointerShape::Crosshair)
+        );
+        assert_ne!(hidden.paint, component.revision().paint);
     }
 
     #[test]

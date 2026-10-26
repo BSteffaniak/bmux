@@ -1603,12 +1603,20 @@ fn format_cell(text: &str, width: u16, align: TableAlign, truncate: bool) -> Str
 /// row, and routes events through the same resolved layout. Table state
 /// remains caller-owned through an interior-mutable `RefCell`.
 pub struct TableComponent<'a, 'state> {
+    pointer_intent: bmux_tui::pointer::PointerIntent,
     id: LayoutId,
     table: Table<'a>,
     state: &'state RefCell<TableState>,
 }
 
 impl<'a, 'state> TableComponent<'a, 'state> {
+    /// Override pointer presentation without changing input routing or mouse policy.
+    #[must_use]
+    pub const fn pointer_intent(mut self, intent: bmux_tui::pointer::PointerIntent) -> Self {
+        self.pointer_intent = intent;
+        self
+    }
+
     /// Dispatch through component geometry while retaining table selection details.
     pub fn handle_event(
         &self,
@@ -1638,6 +1646,7 @@ impl<'a, 'state> TableComponent<'a, 'state> {
     ) -> Self {
         Self {
             id: id.into(),
+            pointer_intent: bmux_tui::pointer::PointerIntent::Auto,
             table: Table::new(columns, rows),
             state,
         }
@@ -1698,6 +1707,7 @@ impl Component for TableComponent<'_, '_> {
         format!("{:?}", self.table.policy.horizontal_scrollbar).hash(&mut layout);
 
         let mut paint = std::collections::hash_map::DefaultHasher::new();
+        format!("{:?}", self.pointer_intent).hash(&mut paint);
         format!("{:?}", self.table.policy).hash(&mut paint);
         for row in self.table.rows {
             row.disabled.hash(&mut paint);
@@ -1758,6 +1768,7 @@ impl Component for TableComponent<'_, '_> {
         cx.push_hit(
             SceneRegion::new(self.id.as_str(), area)
                 .role(HitRole::ListItem)
+                .pointer_intent(self.pointer_intent)
                 .pointer_events(self.table.policy.mouse.enabled)
                 .hoverable(self.table.policy.mouse.enabled && self.table.policy.mouse.hover)
                 .focusable(true)
@@ -1773,6 +1784,7 @@ impl Component for TableComponent<'_, '_> {
             cx.push_hit(
                 SceneRegion::new(row_id.clone(), region.rect)
                     .role(HitRole::ListItem)
+                    .pointer_intent(self.pointer_intent)
                     .pointer_events(self.table.policy.mouse.enabled)
                     .hoverable(self.table.policy.mouse.enabled && self.table.policy.mouse.hover)
                     .enabled(!state.interaction.disabled && !disabled),
@@ -1864,6 +1876,31 @@ mod tests {
                 row = row.saturating_add(1);
             }
         }
+    }
+
+    #[test]
+    fn pointer_override_invalidates_paint_without_remeasuring_layout() {
+        use bmux_tui::pointer::{PointerIntent, PointerShape};
+
+        let columns = [TableColumn::new("Name")];
+        let rows = [TableRow::new(["alpha"])];
+        let state = RefCell::new(TableState::new(Some(0)));
+        let mut policy = TablePolicy::default();
+        policy.mouse.enabled = false;
+        policy.mouse.hover = true;
+        let component = TableComponent::new("table", &columns, &rows, &state).policy(policy);
+        let original = component.revision();
+        let component = component.pointer_intent(PointerIntent::Hidden);
+        assert_eq!(component.pointer_intent, PointerIntent::Hidden);
+        let hidden = component.revision();
+        assert_eq!(original.layout, hidden.layout);
+        assert_ne!(original.paint, hidden.paint);
+        let component = component.pointer_intent(PointerIntent::Shape(PointerShape::Crosshair));
+        assert_eq!(
+            component.pointer_intent,
+            PointerIntent::Shape(PointerShape::Crosshair)
+        );
+        assert_ne!(hidden.paint, component.revision().paint);
     }
 
     #[test]
@@ -2027,6 +2064,7 @@ mod tests {
         fn render(&self, area: Rect, state: &TableState, frame: &mut Frame<'_>) {
             let state = RefCell::new(state.clone());
             let component = TableComponent {
+                pointer_intent: bmux_tui::pointer::PointerIntent::Auto,
                 id: "test.table".into(),
                 table: self.clone(),
                 state: &state,

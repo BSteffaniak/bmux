@@ -249,6 +249,7 @@ pub enum RadioGroupOutcome {
 
 /// Canonical component-lifecycle radio group.
 pub struct RadioGroupComponent<'a, 'state> {
+    pointer_intent: bmux_tui::pointer::PointerIntent,
     id: LayoutId,
     group: RadioGroup<'a>,
     state: &'state Cell<RadioGroupState>,
@@ -256,6 +257,13 @@ pub struct RadioGroupComponent<'a, 'state> {
 }
 
 impl<'a, 'state> RadioGroupComponent<'a, 'state> {
+    /// Override pointer presentation without changing input routing or mouse policy.
+    #[must_use]
+    pub const fn pointer_intent(mut self, intent: bmux_tui::pointer::PointerIntent) -> Self {
+        self.pointer_intent = intent;
+        self
+    }
+
     /// Create a radio group with stable identity and caller-owned state.
     #[must_use]
     pub fn new(
@@ -265,6 +273,7 @@ impl<'a, 'state> RadioGroupComponent<'a, 'state> {
     ) -> Self {
         Self {
             id: id.into(),
+            pointer_intent: bmux_tui::pointer::PointerIntent::Auto,
             group: RadioGroup::new(options),
             state,
             fallback: Style::new(),
@@ -346,6 +355,7 @@ impl Component for RadioGroupComponent<'_, '_> {
         }
 
         let mut paint = std::collections::hash_map::DefaultHasher::new();
+        format!("{:?}", self.pointer_intent).hash(&mut paint);
         format!("{:?}", self.group.policy).hash(&mut paint);
         format!("{:?}", self.group.styles).hash(&mut paint);
         format!("{:?}", self.fallback).hash(&mut paint);
@@ -409,6 +419,7 @@ impl Component for RadioGroupComponent<'_, '_> {
                             Rect::new(0, 0, layout.size.width.try_into().unwrap_or(u16::MAX), 1),
                         )
                         .role(HitRole::Action)
+                        .pointer_intent(self.pointer_intent)
                         .pointer_events(self.group.policy.mouse.enabled)
                         .hoverable(self.group.policy.mouse.enabled && self.group.policy.mouse.hover)
                         .focusable(true)
@@ -883,6 +894,29 @@ mod tests {
     use bmux_tui::paint::PaintCx;
 
     use super::{RadioGroup, RadioGroupComponent, RadioGroupOutcome, RadioGroupState, RadioOption};
+
+    #[test]
+    fn pointer_override_invalidates_paint_without_remeasuring_layout() {
+        use bmux_tui::pointer::{PointerIntent, PointerShape};
+
+        let options: Vec<_> = (0..3)
+            .map(|index| RadioOption::new(format!("option-{index}"), format!("Row {index}")))
+            .collect();
+        let state = std::cell::Cell::new(RadioGroupState::new(Some(1)));
+        let component = RadioGroupComponent::new("choice", &options, &state);
+        let original = component.revision();
+        let component = component.pointer_intent(PointerIntent::Hidden);
+        assert_eq!(component.pointer_intent, PointerIntent::Hidden);
+        let hidden = component.revision();
+        assert_eq!(original.layout, hidden.layout);
+        assert_ne!(original.paint, hidden.paint);
+        let component = component.pointer_intent(PointerIntent::Shape(PointerShape::Crosshair));
+        assert_eq!(
+            component.pointer_intent,
+            PointerIntent::Shape(PointerShape::Crosshair)
+        );
+        assert_ne!(hidden.paint, component.revision().paint);
+    }
 
     #[test]
     fn deep_scroll_preserves_radio_rows_and_metadata() {

@@ -312,6 +312,14 @@ impl<W: AttachWorker> Application<W> {
         self.active = false;
         self.worker.invalidate_presentation();
         context.invalidate_accessibility();
+        // A suspended surface no longer owns a visible pointer target. In
+        // particular, do not leave an OSC 22 hidden cursor active on resume
+        // while waiting for the next committed presentation.
+        context.set_pointer_icon(native_pointer_icon(
+            bmux_attach_pipeline::pointer_shape::ResolvedPointerShape::Shape(
+                bmux_terminal_protocol::pointer_shape::PointerShape::Default,
+            ),
+        ));
         self.retry = RetryBudget::default();
         self.viewport.advance_generation()?;
         self.worker.event(PlatformEvent::Suspended, self.viewport)?;

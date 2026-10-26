@@ -32,7 +32,7 @@ class TermlibTerminalRenderer : TerminalRenderer {
     private var layoutHeightPx: Int = 0
     private val mainHandler = Handler(Looper.getMainLooper())
     private var pointer by mutableStateOf<TerminalPointerFrame?>(null)
-    private val pointerRevisions = NativePointerRevisions()
+    @Volatile private var pointerRevisions = NativePointerRevisions()
     @Volatile private var disposed = false
     private var outputAccepted = true
 
@@ -65,17 +65,27 @@ class TermlibTerminalRenderer : TerminalRenderer {
     }
 
     override fun applyPointer(pointer: TerminalPointerFrame) {
+        // Capture the attachment lifetime before queuing: a reset must also
+        // reject callbacks already waiting on the main thread.
+        val revisions = pointerRevisions
         // FIFO main-thread tasks: prior emulator.writeInput calls complete first.
         mainHandler.post {
-            if (disposed || !outputAccepted || !pointerRevisions.accept(pointer)) return@post
+            if (disposed || !outputAccepted || !revisions.accept(pointer)) return@post
             this.pointer = pointer
         }
     }
 
     override fun resetPointer() {
-        mainHandler.post {
-            pointer = null
-            pointerRevisions.reset()
+        pointerRevisions.invalidate()
+        val revisions = NativePointerRevisions()
+        pointerRevisions = revisions
+        val reset = {
+            if (!disposed && pointerRevisions === revisions) pointer = null
+        }
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            reset()
+        } else {
+            mainHandler.post { reset() }
         }
     }
 
@@ -217,7 +227,7 @@ class TermlibTerminalRenderer : TerminalRenderer {
     override fun dispose() {
         disposed = true
         pointer = null
-        pointerRevisions.reset()
+        pointerRevisions.invalidate()
         onInput = null
         onResize = null
         onMouseEvent = null

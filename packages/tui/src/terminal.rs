@@ -5,14 +5,28 @@ use std::io::{self, Write};
 use crate::ansi::{AnsiFrameDiffStats, write_ansi_frame, write_ansi_frame_diff};
 use crate::buffer::Buffer;
 use crate::damage::Damage;
+use crate::event::{Event, FocusEvent};
 use crate::focus::{FocusId, FocusTrap};
+use crate::geometry::Point;
 use crate::geometry::Rect;
+use crate::hit::HitId;
 use crate::hit::HitMap;
 use crate::image::ImageContribution;
 use crate::image_scene::{ImageScene, ImageSceneDelta};
 use crate::paint::PaintCx;
+use crate::pointer::{PointerIntent, PointerShape, resolve_pointer_intent};
 use crate::presentation::{PreparedPresentation, PresentationPhase, PresentationState};
 use crate::selection::SelectionScene;
+use bmux_terminal_protocol::pointer_output::{PointerOutput, PointerShapeCapability};
+
+/// Caller-owned routing context, never a second input router.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PointerContext {
+    /// Active modal scope from the application's committed router.
+    pub scope: Option<HitId>,
+    /// Existing capture owner from the application's router.
+    pub capture: Option<HitId>,
+}
 
 /// Statistics from one terminal draw.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,6 +62,10 @@ impl From<AnsiFrameDiffStats> for DrawStats {
 pub struct Terminal<W> {
     writer: W,
     state: PresentationState,
+    pointer_output: PointerOutput,
+    pointer_capability: PointerShapeCapability,
+    pointer_position: Option<Point>,
+    pointer_context: PointerContext,
 }
 
 impl<W: Write> Terminal<W> {
@@ -57,6 +75,12 @@ impl<W: Write> Terminal<W> {
         Self {
             writer,
             state: PresentationState::new(area),
+            pointer_output: PointerOutput::new(
+                bmux_terminal_protocol::pointer_output::tmux_passthrough_enabled(),
+            ),
+            pointer_capability: PointerShapeCapability::detect(),
+            pointer_position: None,
+            pointer_context: PointerContext::default(),
         }
     }
 
@@ -67,12 +91,72 @@ impl<W: Write> Terminal<W> {
         Terminal {
             writer,
             state: self.state.clone(),
+            pointer_output: self.pointer_output.clone(),
+            pointer_capability: self.pointer_capability,
+            pointer_position: self.pointer_position,
+            pointer_context: self.pointer_context.clone(),
         }
     }
 
     /// Adopt an exactly delivered staging terminal's authority, retaining this writer.
     pub fn acknowledge<V>(&mut self, staged: Terminal<V>) {
         self.state = staged.state;
+        self.pointer_output = staged.pointer_output;
+    }
+
+    /// Set explicit host capability before acquiring pointer ownership.
+    pub const fn set_pointer_capability(&mut self, capability: PointerShapeCapability) {
+        self.pointer_capability = capability;
+    }
+
+    /// Observe without consuming or routing input. Applications still receive
+    /// the exact original event. Returns whether presentation needs servicing.
+    pub fn observe_event(&mut self, event: &Event) -> bool {
+        let position = match event {
+            Event::Mouse(mouse) => Some(mouse.position),
+            Event::Focus(FocusEvent::Lost) => None,
+            _ => return false,
+        };
+        let changed = position != self.pointer_position;
+        self.pointer_position = position;
+        changed
+    }
+
+    /// Supply the existing application's routing authority, not a new router.
+    pub fn set_pointer_context(&mut self, context: PointerContext) {
+        self.pointer_context = context;
+    }
+
+    /// Invalidate host output knowledge after failed delivery of a staging terminal.
+    pub fn invalidate_after_failed_delivery<V>(&mut self, candidate: &Terminal<V>) {
+        self.pointer_output
+            .invalidate_after_failed_delivery(&candidate.pointer_output);
+        self.state.reset();
+    }
+
+    /// Restore this terminal's pointer lease before suspend, exit, or error recovery.
+    /// # Errors
+    /// Reports failed output or uncertain stack ownership without replaying it.
+    pub fn restore_pointer(&mut self) -> io::Result<()> {
+        self.pointer_output.restore(&mut self.writer)
+    }
+
+    /// Stage restoration for delivery by an exclusive asynchronous output owner.
+    /// # Errors
+    /// Returns uncertain stack ownership errors.
+    pub fn prepare_pointer_restore(
+        &mut self,
+    ) -> io::Result<Option<bmux_terminal_protocol::pointer_output::PointerOutputTransaction>> {
+        self.pointer_output.begin_restore()
+    }
+
+    /// Complete restoration only after actual host flush.
+    pub fn complete_pointer_restore(
+        &mut self,
+        transaction: bmux_terminal_protocol::pointer_output::PointerOutputTransaction,
+        succeeded: bool,
+    ) {
+        self.pointer_output.complete(transaction, succeeded);
     }
 
     /// Return the terminal area.
@@ -282,37 +366,81 @@ impl<W: Write> Terminal<W> {
         before: impl FnOnce(&mut W) -> io::Result<bool>,
         overlay: impl FnOnce(&mut W, &ImageScene, &ImageSceneDelta) -> io::Result<()>,
     ) -> io::Result<DrawStats> {
+        let position = self.pointer_position;
+        let context = &self.pointer_context;
+        let pointer_output = &mut self.pointer_output;
+        let capability = self.pointer_capability;
+        if prepared.is_none() {
+            let intent = resolve_pointer_intent(
+                self.state.hits(),
+                position,
+                self.state.focus().active_scope(),
+                context.capture.as_ref(),
+            );
+            let shape = match intent {
+                PointerIntent::Shape(shape) => shape,
+                PointerIntent::Auto | PointerIntent::Hidden => PointerShape::Default,
+            };
+            pointer_output.present(&mut self.writer, capability, shape)?;
+            return Ok(DrawStats {
+                changed_cells: 0,
+                full_repaint: false,
+            });
+        }
         let writer = &mut self.writer;
         self.state
             .present_prepared(prepared, |prepared, previous| {
-                writer.write_all(b"\x1b[?2026h")?;
-                let output: io::Result<DrawStats> = (|| {
-                    let repaint = before(writer)?;
-                    let stats = PresentationPhase::AnsiEncode.measure(
-                        || -> io::Result<DrawStats> {
-                            Ok(if let Some(previous) = previous.filter(|_| !repaint) {
-                                write_ansi_frame_diff(
-                                    writer,
-                                    previous,
-                                    prepared.buffer(),
-                                    prepared.cursor(),
-                                )?
-                                .into()
-                            } else {
-                                write_ansi_frame(writer, prepared.buffer(), prepared.cursor())?;
-                                DrawStats::full(prepared.buffer().cells().len())
-                            })
-                        },
-                        Result::is_ok,
-                    )?;
-                    overlay(writer, prepared.image_scene(), prepared.image_delta())?;
+                let intent = resolve_pointer_intent(
+                    prepared.hits(),
+                    position,
+                    prepared.focus_scope(),
+                    context.capture.as_ref(),
+                );
+                // Hidden is unsupported by OSC 22: explicitly restore a truthful
+                // visible fallback instead of retaining a stale hand or resize shape.
+                // The text caret remains entirely independent.
+                let shape = match intent {
+                    PointerIntent::Shape(shape) => shape,
+                    PointerIntent::Auto | PointerIntent::Hidden => PointerShape::Default,
+                };
+                let transaction = pointer_output.begin_present(capability, shape)?;
+                let result = (|| {
+                    writer.write_all(b"\x1b[?2026h")?;
+                    let output: io::Result<DrawStats> = (|| {
+                        let repaint = before(writer)?;
+                        let stats = PresentationPhase::AnsiEncode.measure(
+                            || -> io::Result<DrawStats> {
+                                Ok(if let Some(previous) = previous.filter(|_| !repaint) {
+                                    write_ansi_frame_diff(
+                                        writer,
+                                        previous,
+                                        prepared.buffer(),
+                                        prepared.cursor(),
+                                    )?
+                                    .into()
+                                } else {
+                                    write_ansi_frame(writer, prepared.buffer(), prepared.cursor())?;
+                                    DrawStats::full(prepared.buffer().cells().len())
+                                })
+                            },
+                            Result::is_ok,
+                        )?;
+                        overlay(writer, prepared.image_scene(), prepared.image_delta())?;
+                        if let Some(transaction) = &transaction {
+                            writer.write_all(transaction.bytes())?;
+                        }
+                        Ok(stats)
+                    })();
+                    let end_result = writer.write_all(b"\x1b[?2026l");
+                    let stats = output?;
+                    end_result?;
+                    PresentationPhase::WriterFlush.measure(|| writer.flush(), Result::is_ok)?;
                     Ok(stats)
                 })();
-                let end_result = writer.write_all(b"\x1b[?2026l");
-                let stats = output?;
-                end_result?;
-                PresentationPhase::WriterFlush.measure(|| writer.flush(), Result::is_ok)?;
-                Ok(stats)
+                if let Some(transaction) = transaction {
+                    pointer_output.complete(transaction, result.is_ok());
+                }
+                result
             })
             .map(|stats| {
                 stats.unwrap_or(DrawStats {
@@ -331,6 +459,29 @@ impl<W: Write> Terminal<W> {
     /// Return a mutable reference to the backend writer.
     pub const fn writer_mut(&mut self) -> &mut W {
         &mut self.writer
+    }
+
+    /// Release presentation protocols before temporarily returning terminal ownership.
+    /// # Errors
+    /// Reports output failure or uncertain stack ownership.
+    pub fn suspend(&mut self) -> io::Result<()> {
+        let result = self.restore_pointer();
+        self.reset();
+        result
+    }
+
+    /// Invalidate retained encoding after terminal ownership has been reacquired.
+    /// Pointer lease uncertainty is deliberately not cleared.
+    pub fn resume(&mut self) {
+        self.reset();
+    }
+
+    /// Restore protocol ownership before recovering the writer.
+    /// # Errors
+    /// Reports incomplete pointer restoration.
+    pub fn into_clean_inner(mut self) -> io::Result<W> {
+        self.restore_pointer()?;
+        Ok(self.writer)
     }
 
     /// Consume the terminal and return the backend writer.
@@ -1254,5 +1405,256 @@ mod tests {
         assert!(terminal.image_delta().upserted.is_empty());
         assert_eq!(terminal.image_delta().removed, [ImageKey::new("diagram")]);
         assert_eq!(terminal.image_scene().placements().len(), 0);
+    }
+}
+
+#[cfg(test)]
+mod pointer_output_tests {
+    use super::{PointerContext, Terminal};
+    use crate::event::{Event, MouseEvent, MouseEventKind};
+    use crate::geometry::{Point, Rect};
+    use crate::hit::{HitRegion, HitRole};
+    use crate::pointer::PointerIntent;
+    use bmux_terminal_protocol::pointer_output::PointerShapeCapability;
+    use std::io::{self, Write};
+
+    #[derive(Default)]
+    struct Output {
+        bytes: Vec<u8>,
+        fail_flush: bool,
+    }
+    impl Write for Output {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            if self.fail_flush {
+                Err(io::Error::other("injected flush"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+    fn terminal() -> Terminal<Output> {
+        let mut terminal = Terminal::new(Output::default(), Rect::new(0, 0, 4, 1));
+        terminal.set_pointer_capability(PointerShapeCapability::Set);
+        terminal.observe_event(&Event::Mouse(MouseEvent::new(
+            MouseEventKind::Move,
+            Point::new(0, 0),
+        )));
+        terminal
+    }
+    fn contains(bytes: &[u8], value: &[u8]) -> bool {
+        bytes.windows(value.len()).any(|bytes| bytes == value)
+    }
+
+    #[test]
+    fn stationary_scene_changes_and_setter_dedup_follow_commits() {
+        let mut terminal = terminal();
+        terminal
+            .draw(|cx| {
+                cx.push_hit(HitRegion::new("target", Rect::new(0, 0, 4, 1)).role(HitRole::Action));
+            })
+            .unwrap();
+        assert!(contains(&terminal.writer().bytes, b"\x1b]22;pointer\x1b\\"));
+        terminal.writer_mut().bytes.clear();
+        terminal
+            .draw(|cx| {
+                cx.push_hit(HitRegion::new("target", Rect::new(0, 0, 4, 1)).role(HitRole::Action));
+            })
+            .unwrap();
+        assert!(!contains(&terminal.writer().bytes, b"\x1b]22;"));
+        terminal.writer_mut().bytes.clear();
+        terminal
+            .draw(|cx| {
+                cx.push_hit(
+                    HitRegion::new("target", Rect::new(0, 0, 4, 1)).role(HitRole::TextInput),
+                );
+            })
+            .unwrap();
+        assert!(contains(&terminal.writer().bytes, b"\x1b]22;text\x1b\\"));
+    }
+
+    #[test]
+    fn failed_flush_preserves_hit_authority_and_retries_setter() {
+        let mut terminal = terminal();
+        terminal
+            .draw(|cx| cx.push_hit(HitRegion::new("old", Rect::new(0, 0, 4, 1))))
+            .unwrap();
+        terminal.writer_mut().fail_flush = true;
+        assert!(
+            terminal
+                .draw(|cx| cx.push_hit(
+                    HitRegion::new("new", Rect::new(0, 0, 4, 1)).role(HitRole::TextInput)
+                ))
+                .is_err()
+        );
+        assert_eq!(terminal.hits().regions()[0].id.as_str(), "old");
+        terminal.writer_mut().fail_flush = false;
+        terminal.writer_mut().bytes.clear();
+        terminal
+            .draw(|cx| {
+                cx.push_hit(HitRegion::new("new", Rect::new(0, 0, 4, 1)).role(HitRole::TextInput));
+            })
+            .unwrap();
+        assert!(contains(&terminal.writer().bytes, b"\x1b]22;text\x1b\\"));
+    }
+
+    #[test]
+    fn capture_uses_caller_authority_and_hidden_never_controls_caret() {
+        let mut terminal = terminal();
+        terminal.set_pointer_context(PointerContext {
+            scope: None,
+            capture: Some("drag".into()),
+        });
+        terminal
+            .draw(|cx| {
+                cx.push_hit(
+                    HitRegion::new("drag", Rect::new(2, 0, 2, 1)).role(HitRole::DragHandle),
+                );
+            })
+            .unwrap();
+        assert!(contains(
+            &terminal.writer().bytes,
+            b"\x1b]22;grabbing\x1b\\"
+        ));
+        terminal.writer_mut().bytes.clear();
+        terminal
+            .draw(|cx| {
+                cx.push_hit(
+                    HitRegion::new("drag", Rect::new(2, 0, 2, 1))
+                        .pointer_intent(PointerIntent::Hidden),
+                );
+            })
+            .unwrap();
+        assert!(contains(&terminal.writer().bytes, b"\x1b]22;default\x1b\\"));
+        // Caret commands remain entirely governed by ordinary frame output.
+        assert!(!contains(&terminal.writer().bytes, b"\x1b]22;none"));
+    }
+
+    #[test]
+    fn closing_modal_uses_new_scope_with_stationary_pointer_and_stale_context() {
+        let mut terminal = terminal();
+        let scope = crate::focus::FocusScopeId::new("modal");
+        terminal.set_pointer_context(PointerContext {
+            scope: Some(scope.clone()),
+            capture: Some("modal-input".into()),
+        });
+        terminal
+            .draw_damage_with_prepared_output_hooks(
+                crate::damage::Damage::Full,
+                |cx| {
+                    cx.push_hit(
+                        HitRegion::new("background", Rect::new(0, 0, 4, 1)).role(HitRole::Action),
+                    );
+                    cx.push_hit(
+                        HitRegion::new("modal-input", Rect::new(0, 0, 4, 1))
+                            .role(HitRole::TextInput)
+                            .focus_scope(scope.clone()),
+                    );
+                },
+                |prepared| {
+                    assert!(prepared.set_modal_scopes(std::slice::from_ref(&scope)));
+                    Ok(())
+                },
+                |_| Ok(false),
+                |_, _, _| Ok(()),
+            )
+            .unwrap();
+        assert!(contains(&terminal.writer().bytes, b"\x1b]22;text\x1b\\"));
+        terminal.writer_mut().bytes.clear();
+        // The application's router still describes the previously committed modal
+        // until this frame flushes. The new prepared None scope must win now.
+        terminal
+            .draw_damage_with_prepared_output_hooks(
+                crate::damage::Damage::Full,
+                |cx| {
+                    cx.push_hit(
+                        HitRegion::new("background", Rect::new(0, 0, 4, 1)).role(HitRole::Action),
+                    );
+                },
+                |prepared| {
+                    assert!(prepared.set_modal_scopes(&[]));
+                    Ok(())
+                },
+                |_| Ok(false),
+                |_, _, _| Ok(()),
+            )
+            .unwrap();
+        assert!(terminal.focus().active_scope().is_none());
+        assert!(contains(&terminal.writer().bytes, b"\x1b]22;pointer\x1b\\"));
+        terminal.writer_mut().bytes.clear();
+        terminal
+            .draw_damage(crate::damage::Damage::None, |_| {
+                panic!("no paint for pointer-only output")
+            })
+            .unwrap();
+        assert!(
+            terminal.writer().bytes.is_empty(),
+            "stale context must not emit default after closing"
+        );
+    }
+
+    #[test]
+    fn pointer_only_hidden_falls_back_to_default_and_retries_failed_flush() {
+        let mut terminal = terminal();
+        terminal
+            .draw(|cx| {
+                cx.push_hit(HitRegion::new("action", Rect::new(0, 0, 2, 1)).role(HitRole::Action));
+                cx.push_hit(
+                    HitRegion::new("hidden", Rect::new(2, 0, 2, 1))
+                        .pointer_intent(PointerIntent::Hidden),
+                );
+            })
+            .unwrap();
+        assert!(contains(&terminal.writer().bytes, b"\x1b]22;pointer\x1b\\"));
+        terminal.set_pointer_context(PointerContext {
+            scope: None,
+            capture: Some("hidden".into()),
+        });
+        terminal.writer_mut().bytes.clear();
+        terminal.writer_mut().fail_flush = true;
+        assert!(
+            terminal
+                .draw_damage(crate::damage::Damage::None, |_| panic!("no paint"))
+                .is_err()
+        );
+        terminal.writer_mut().bytes.clear();
+        terminal.writer_mut().fail_flush = false;
+        terminal
+            .draw_damage(crate::damage::Damage::None, |_| panic!("no paint"))
+            .unwrap();
+        assert_eq!(terminal.writer().bytes, b"\x1b]22;default\x1b\\");
+        terminal.writer_mut().bytes.clear();
+        terminal
+            .draw_damage(crate::damage::Damage::None, |_| panic!("no paint"))
+            .unwrap();
+        assert!(terminal.writer().bytes.is_empty());
+    }
+
+    #[test]
+    fn acknowledgment_does_not_erase_newer_pointer_observation() {
+        let mut terminal = terminal();
+        let mut candidate = terminal.fork(Vec::new());
+        candidate
+            .draw(|cx| {
+                cx.push_hit(HitRegion::new("target", Rect::new(0, 0, 1, 1)).role(HitRole::Action));
+            })
+            .unwrap();
+        terminal.observe_event(&Event::Mouse(MouseEvent::new(
+            MouseEventKind::Move,
+            Point::new(3, 0),
+        )));
+        terminal.acknowledge(candidate);
+        terminal.writer_mut().bytes.clear();
+        terminal
+            .draw(|cx| {
+                cx.push_hit(HitRegion::new("target", Rect::new(0, 0, 1, 1)).role(HitRole::Action));
+            })
+            .unwrap();
+        assert!(contains(&terminal.writer().bytes, b"\x1b]22;default\x1b\\"));
+        terminal.restore_pointer().unwrap();
+        assert!(contains(&terminal.writer().bytes, b"\x1b]22;\x1b\\"));
     }
 }

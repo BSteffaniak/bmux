@@ -162,6 +162,7 @@ pub struct Checkbox<'a> {
 
 /// Canonical component-lifecycle checkbox control.
 pub struct CheckboxComponent<'a, 'state> {
+    pointer_intent: bmux_tui::pointer::PointerIntent,
     id: LayoutId,
     checkbox: Checkbox<'a>,
     state: &'state Cell<CheckboxState>,
@@ -169,6 +170,13 @@ pub struct CheckboxComponent<'a, 'state> {
 }
 
 impl<'a, 'state> CheckboxComponent<'a, 'state> {
+    /// Override pointer presentation without changing input routing or mouse policy.
+    #[must_use]
+    pub const fn pointer_intent(mut self, intent: bmux_tui::pointer::PointerIntent) -> Self {
+        self.pointer_intent = intent;
+        self
+    }
+
     /// Create a checkbox with stable identity and caller-owned state.
     #[must_use]
     pub fn new(
@@ -178,6 +186,7 @@ impl<'a, 'state> CheckboxComponent<'a, 'state> {
     ) -> Self {
         Self {
             id: id.into(),
+            pointer_intent: bmux_tui::pointer::PointerIntent::Auto,
             checkbox: Checkbox::new(label),
             state,
             fallback: Style::new(),
@@ -213,6 +222,7 @@ impl Component for CheckboxComponent<'_, '_> {
         self.checkbox.label.hash(&mut layout);
 
         let mut paint = std::collections::hash_map::DefaultHasher::new();
+        format!("{:?}", self.pointer_intent).hash(&mut paint);
         let policy = self.checkbox.policy;
         (
             policy.mouse.enabled,
@@ -251,6 +261,7 @@ impl Component for CheckboxComponent<'_, '_> {
                 Rect::new(0, 0, layout.size.width.try_into().unwrap_or(u16::MAX), 1),
             )
             .role(HitRole::Action)
+            .pointer_intent(self.pointer_intent)
             .pointer_events(self.checkbox.policy.mouse.enabled)
             .hoverable(self.checkbox.policy.mouse.enabled && self.checkbox.policy.mouse.hover)
             .focusable(true)
@@ -535,6 +546,63 @@ mod tests {
             i64::from(area.y),
             LocalRect::new(0, 0, area.width, area.height),
             |cx| checkbox.paint(&layout, cx),
+        );
+    }
+
+    #[test]
+    fn pointer_override_invalidates_paint_without_remeasuring_layout() {
+        use bmux_tui::pointer::{PointerIntent, PointerShape};
+
+        let state = Cell::new(CheckboxState::new(false));
+        let component = CheckboxComponent::new("check", "Enable", &state);
+        let original = component.revision();
+        let component = component.pointer_intent(PointerIntent::Hidden);
+        assert_eq!(component.pointer_intent, PointerIntent::Hidden);
+        let hidden = component.revision();
+        assert_eq!(original.layout, hidden.layout);
+        assert_ne!(original.paint, hidden.paint);
+        let component = component.pointer_intent(PointerIntent::Shape(PointerShape::Crosshair));
+        assert_eq!(
+            component.pointer_intent,
+            PointerIntent::Shape(PointerShape::Crosshair)
+        );
+        assert_ne!(hidden.paint, component.revision().paint);
+    }
+
+    #[test]
+    fn committed_pointer_intent_respects_overrides_and_disabled_occlusion() {
+        use bmux_tui::pointer::{PointerIntent, PointerShape, resolve_pointer_intent};
+
+        let state = Cell::new(CheckboxState::new(false));
+        for intent in [
+            PointerIntent::Auto,
+            PointerIntent::Hidden,
+            PointerIntent::Shape(PointerShape::Crosshair),
+        ] {
+            let component =
+                CheckboxComponent::new("check", "Enable", &state).pointer_intent(intent);
+            let layout = component.layout(Constraints::for_width(10), &mut LayoutCx::new());
+            let mut buffer = Buffer::empty(Rect::new(0, 0, 10, 1));
+            let mut frame = Frame::new(&mut buffer);
+            component.paint(&layout, &mut PaintCx::new(&mut frame));
+            assert_eq!(frame.hits().regions()[0].pointer_intent, intent);
+            assert_eq!(
+                resolve_pointer_intent(frame.hits(), Some(Point::new(0, 0)), None, None),
+                intent.resolve(HitRole::Action, false)
+            );
+        }
+        let mut disabled = state.get();
+        disabled.set_disabled(true);
+        state.set(disabled);
+        let component =
+            CheckboxComponent::new("check", "Enable", &state).pointer_intent(PointerIntent::Hidden);
+        let layout = component.layout(Constraints::for_width(10), &mut LayoutCx::new());
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 10, 1));
+        let mut frame = Frame::new(&mut buffer);
+        component.paint(&layout, &mut PaintCx::new(&mut frame));
+        assert_eq!(
+            resolve_pointer_intent(frame.hits(), Some(Point::new(0, 0)), None, None),
+            PointerIntent::Shape(PointerShape::Default)
         );
     }
 

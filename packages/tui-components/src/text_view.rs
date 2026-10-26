@@ -232,6 +232,7 @@ impl Default for TextViewStyles {
 /// through the shared [`ScrollView`] controller. Scroll state remains
 /// caller-owned through an interior-mutable `Cell`.
 pub struct TextViewComponent<'a, 'state> {
+    pointer_intent: bmux_tui::pointer::PointerIntent,
     id: LayoutId,
     lines: &'a [Line],
     highlights: &'a [TextViewHighlight],
@@ -244,6 +245,13 @@ pub struct TextViewComponent<'a, 'state> {
 }
 
 impl<'a, 'state> TextViewComponent<'a, 'state> {
+    /// Override pointer presentation without changing input routing or mouse policy.
+    #[must_use]
+    pub const fn pointer_intent(mut self, intent: bmux_tui::pointer::PointerIntent) -> Self {
+        self.pointer_intent = intent;
+        self
+    }
+
     /// Create a text view with stable identity and caller-owned scroll state.
     #[must_use]
     pub fn new(
@@ -253,6 +261,9 @@ impl<'a, 'state> TextViewComponent<'a, 'state> {
     ) -> Self {
         Self {
             id: id.into(),
+            pointer_intent: bmux_tui::pointer::PointerIntent::Shape(
+                bmux_tui::pointer::PointerShape::Text,
+            ),
             lines,
             highlights: &[],
             selection: None,
@@ -327,6 +338,7 @@ impl<'a, 'state> TextViewComponent<'a, 'state> {
     #[must_use]
     pub const fn scroll_view(&self) -> ScrollView {
         ScrollView::new()
+            .pointer_intent(self.pointer_intent)
             .policy(self.policy.scroll_view_policy())
             .scrollbar_styles(self.styles.scrollbar)
     }
@@ -474,6 +486,7 @@ impl Component for TextViewComponent<'_, '_> {
         self.empty.hash(&mut layout);
 
         let mut paint = std::collections::hash_map::DefaultHasher::new();
+        format!("{:?}", self.pointer_intent).hash(&mut paint);
         text.paint.hash(&mut paint);
         self.policy.keyboard.hash(&mut paint);
         self.policy.mouse_wheel.hash(&mut paint);
@@ -1304,6 +1317,40 @@ mod tests {
             &TextViewComponent::new("text", &lines, &state),
             Rect::new(0, 0, 0, 0),
             &mut frame,
+        );
+    }
+
+    #[test]
+    fn text_pointer_default_and_override_follow_committed_viewport_geometry() {
+        use bmux_tui::pointer::{PointerIntent, PointerShape, resolve_pointer_intent};
+
+        // TextView only publishes scroll interaction geometry for overflow or
+        // gutters. Passive short views remain target-free; opt-in selection
+        // publishes its own Text pointer metadata through register_selection.
+        let lines = [
+            Line::from("first"),
+            Line::from("second"),
+            Line::from("third"),
+        ];
+        let state = Cell::new(ScrollViewState::new());
+        for intent in [
+            PointerIntent::Shape(PointerShape::Text),
+            PointerIntent::Hidden,
+        ] {
+            let view = TextViewComponent::new("preview", &lines, &state).pointer_intent(intent);
+            let mut buffer = Buffer::empty(Rect::new(0, 0, 10, 2));
+            let mut frame = Frame::new(&mut buffer);
+            paint_at(&view, Rect::new(0, 0, 10, 2), &mut frame);
+            assert_eq!(frame.hits().regions().len(), 1);
+            assert_eq!(frame.hits().regions()[0].pointer_intent, intent);
+            assert_eq!(
+                resolve_pointer_intent(frame.hits(), Some(Point::new(0, 0)), None, None),
+                intent
+            );
+        }
+        assert_eq!(
+            TextViewComponent::new("preview", &lines, &state).pointer_intent,
+            PointerIntent::Shape(PointerShape::Text)
         );
     }
 }

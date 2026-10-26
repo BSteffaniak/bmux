@@ -77,6 +77,7 @@ pub fn register_terminal_viewer_selection(
     cx: &mut PaintCx<'_, '_>,
 ) -> ComponentSelectionOutcome {
     let isolated_policy = ComponentSelectionPolicy {
+        pointer_intent: policy.pointer_intent,
         enabled: policy.enabled,
         content_capture: policy.content_capture,
         chrome_capture: SelectionCapture::Disabled,

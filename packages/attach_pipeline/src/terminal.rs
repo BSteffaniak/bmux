@@ -23,19 +23,8 @@ use crossterm::terminal::{
 use futures_util::StreamExt;
 
 use crate::pointer_capabilities::PointerShapeCapability;
-use bmux_terminal_protocol::pointer_shape::{
-    PointerShape, encode_pointer_shape_pop, encode_pointer_shape_push, encode_pointer_shape_set,
-};
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum PointerLease {
-    #[default]
-    Idle,
-    Set,
-    Stack,
-    // A failed non-idempotent write may have reached the host. Never replay it.
-    Uncertain,
-}
+use bmux_terminal_protocol::pointer_output::PointerOutput;
+use bmux_terminal_protocol::pointer_shape::PointerShape;
 
 /// Modes owned by one frontend. Keyboard enhancement is opt-in and negotiated
 /// with the outer terminal after entering raw mode, as in ordinary attach.
@@ -130,9 +119,7 @@ pub struct TerminalIo<W: Write> {
     input_paused: bool,
     owned: Option<TerminalOptions>,
     raw_owned: bool,
-    pointer_lease: PointerLease,
-    pointer_shape: Option<PointerShape>,
-    pointer_tmux_passthrough: bool,
+    pointer_output: PointerOutput,
 }
 
 impl<W: Write> TerminalIo<W> {
@@ -146,9 +133,7 @@ impl<W: Write> TerminalIo<W> {
             input_paused: false,
             owned: None,
             raw_owned: false,
-            pointer_lease: PointerLease::Idle,
-            pointer_shape: None,
-            pointer_tmux_passthrough: false,
+            pointer_output: PointerOutput::new(false),
         }
     }
 
@@ -160,19 +145,8 @@ impl<W: Write> TerminalIo<W> {
     #[must_use]
     pub const fn new_with_pointer_tmux_passthrough(writer: W, enabled: bool) -> Self {
         let mut terminal = Self::new(writer);
-        terminal.pointer_tmux_passthrough = enabled;
+        terminal.pointer_output = PointerOutput::new(enabled);
         terminal
-    }
-
-    fn write_pointer_output(&mut self, bytes: &[u8]) -> io::Result<()> {
-        if self.pointer_tmux_passthrough {
-            let mut wrapped = Vec::new();
-            bmux_terminal_protocol::pointer_shape::encode_pointer_shape_tmux(bytes, &mut wrapped)
-                .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
-            write_frame(&mut self.writer, &wrapped)
-        } else {
-            write_frame(&mut self.writer, bytes)
-        }
     }
 
     /// Install the sole fence-capable reader before entering terminal modes.
@@ -242,7 +216,7 @@ impl<W: Write> TerminalIo<W> {
         if self.raw_owned || self.owned.is_some() {
             return Err(io::Error::other("terminal modes already owned"));
         }
-        if self.pointer_lease == PointerLease::Uncertain {
+        if self.pointer_output.is_uncertain() {
             return Err(io::Error::other(
                 "cannot resume uncertain pointer stack ownership",
             ));
@@ -293,36 +267,11 @@ impl<W: Write> TerminalIo<W> {
         capability: PointerShapeCapability,
         shape: PointerShape,
     ) -> io::Result<()> {
-        if self.pointer_lease == PointerLease::Uncertain {
-            return Err(io::Error::other("pointer stack ownership is uncertain"));
-        }
         if capability == PointerShapeCapability::Unsupported {
             return self.restore_pointer_shape();
         }
-        if self.pointer_shape == Some(shape) {
-            return Ok(());
-        }
-        let pushing =
-            self.pointer_lease == PointerLease::Idle && capability == PointerShapeCapability::Stack;
-        let mut bytes = Vec::new();
-        if pushing {
-            encode_pointer_shape_push(shape, &mut bytes);
-            self.pointer_lease = PointerLease::Uncertain;
-        } else {
-            encode_pointer_shape_set(Some(shape), &mut bytes);
-            if self.pointer_lease == PointerLease::Idle {
-                self.pointer_lease = PointerLease::Set;
-            }
-        }
-        // Invalidate before attempting output; neither partial write nor failed
-        // flush establishes a successfully displayed shape.
-        self.pointer_shape = None;
-        self.write_pointer_output(&bytes)?;
-        if pushing {
-            self.pointer_lease = PointerLease::Stack;
-        }
-        self.pointer_shape = Some(shape);
-        Ok(())
+        self.pointer_output
+            .present(&mut self.writer, capability, shape)
     }
 
     /// Release only this lease's pointer state. Uncertain stack operations are
@@ -331,22 +280,7 @@ impl<W: Write> TerminalIo<W> {
     /// # Errors
     /// Reports failed output or ambiguous stack ownership.
     pub fn restore_pointer_shape(&mut self) -> io::Result<()> {
-        let mut bytes = Vec::new();
-        match self.pointer_lease {
-            PointerLease::Idle => return Ok(()),
-            PointerLease::Uncertain => {
-                return Err(io::Error::other("pointer stack restoration is uncertain"));
-            }
-            PointerLease::Stack => {
-                self.pointer_lease = PointerLease::Uncertain;
-                encode_pointer_shape_pop(&mut bytes);
-            }
-            PointerLease::Set => encode_pointer_shape_set(None, &mut bytes),
-        }
-        self.pointer_shape = None;
-        self.write_pointer_output(&bytes)?;
-        self.pointer_lease = PointerLease::Idle;
-        Ok(())
+        self.pointer_output.restore(&mut self.writer)
     }
 
     /// Whether the explicitly requested keyboard protocol was negotiated.
@@ -578,6 +512,33 @@ mod tests {
     }
 
     #[test]
+    fn shared_output_presents_every_shape_with_one_balanced_lease() {
+        let mut terminal = TerminalIo::new(PointerWriter::default());
+        let mut expected = Vec::new();
+        for (index, shape) in PointerShape::ALL.into_iter().enumerate() {
+            terminal
+                .present_pointer_shape(PointerShapeCapability::Stack, shape)
+                .unwrap();
+            if index == 0 {
+                bmux_terminal_protocol::pointer_shape::encode_pointer_shape_push(
+                    shape,
+                    &mut expected,
+                );
+            } else {
+                bmux_terminal_protocol::pointer_shape::encode_pointer_shape_set(
+                    Some(shape),
+                    &mut expected,
+                );
+            }
+        }
+        terminal.restore_pointer_shape().unwrap();
+        bmux_terminal_protocol::pointer_shape::encode_pointer_shape_pop(&mut expected);
+        assert_eq!(terminal.writer.bytes, expected);
+        terminal.restore_pointer_shape().unwrap();
+        assert_eq!(terminal.writer.bytes, expected);
+    }
+
+    #[test]
     fn pointer_stack_is_bounded_balanced_and_reacquired_after_restore() {
         let mut terminal = TerminalIo::new(Vec::new());
         for _ in 0..2 {
@@ -645,7 +606,7 @@ mod tests {
                     .present_pointer_shape(PointerShapeCapability::Stack, PointerShape::Text)
                     .is_err()
             );
-            assert_eq!(terminal.pointer_shape, None);
+            assert!(terminal.pointer_output.is_uncertain());
             let bytes = terminal.writer.bytes.clone();
             terminal.writer.remaining = None;
             terminal.writer.fail_flush = false;
@@ -671,7 +632,7 @@ mod tests {
         terminal.writer.fail_flush = false;
         assert!(terminal.restore().is_err());
         assert_eq!(terminal.writer.bytes, bytes);
-        assert_eq!(terminal.pointer_shape, None);
+        assert!(terminal.pointer_output.is_uncertain());
     }
 
     #[test]
@@ -686,7 +647,7 @@ mod tests {
                 .present_pointer_shape(PointerShapeCapability::Stack, PointerShape::Pointer)
                 .is_err()
         );
-        assert_eq!(terminal.pointer_shape, None);
+        assert!(!terminal.pointer_output.is_uncertain());
         terminal.writer.fail_flush = false;
         terminal
             .present_pointer_shape(PointerShapeCapability::Stack, PointerShape::Pointer)

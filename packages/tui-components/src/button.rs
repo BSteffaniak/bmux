@@ -186,17 +186,26 @@ pub struct Button<'a> {
 /// allowing the shared component protocol to update it without framework-owned
 /// application state.
 pub struct ButtonComponent<'a, 'state> {
+    pointer_intent: bmux_tui::pointer::PointerIntent,
     id: LayoutId,
     button: Button<'a>,
     state: &'state Cell<ButtonState>,
 }
 
 impl<'a, 'state> ButtonComponent<'a, 'state> {
+    /// Override pointer presentation without changing input routing or mouse policy.
+    #[must_use]
+    pub const fn pointer_intent(mut self, intent: bmux_tui::pointer::PointerIntent) -> Self {
+        self.pointer_intent = intent;
+        self
+    }
+
     /// Create a button component with stable identity and caller-owned state.
     #[must_use]
     pub fn new(id: impl Into<LayoutId>, label: &'a str, state: &'state Cell<ButtonState>) -> Self {
         Self {
             id: id.into(),
+            pointer_intent: bmux_tui::pointer::PointerIntent::Auto,
             button: Button::new(label),
             state,
         }
@@ -231,6 +240,7 @@ impl Component for ButtonComponent<'_, '_> {
         self.button.filled.hash(&mut layout);
 
         let mut paint = std::collections::hash_map::DefaultHasher::new();
+        format!("{:?}", self.pointer_intent).hash(&mut paint);
         let policy = self.button.policy;
         (
             policy.mouse.enabled,
@@ -277,6 +287,7 @@ impl Component for ButtonComponent<'_, '_> {
                 Rect::new(0, 0, layout.size.width.try_into().unwrap_or(u16::MAX), 1),
             )
             .role(HitRole::Action)
+            .pointer_intent(self.pointer_intent)
             .pointer_events(self.button.policy.mouse.enabled)
             .hoverable(self.button.policy.mouse.enabled && self.button.policy.mouse.hover)
             .focusable(true)
@@ -538,6 +549,26 @@ mod tests {
     use bmux_tui::paint::PaintCx;
 
     use super::{Button, ButtonComponent, ButtonOutcome, ButtonState};
+
+    #[test]
+    fn pointer_override_invalidates_paint_without_remeasuring_layout() {
+        use bmux_tui::pointer::{PointerIntent, PointerShape};
+
+        let state = Cell::new(ButtonState::new());
+        let component = ButtonComponent::new("save", "Save", &state);
+        let original = component.revision();
+        let component = component.pointer_intent(PointerIntent::Hidden);
+        assert_eq!(component.pointer_intent, PointerIntent::Hidden);
+        let hidden = component.revision();
+        assert_eq!(original.layout, hidden.layout);
+        assert_ne!(original.paint, hidden.paint);
+        let component = component.pointer_intent(PointerIntent::Shape(PointerShape::Crosshair));
+        assert_eq!(
+            component.pointer_intent,
+            PointerIntent::Shape(PointerShape::Crosshair)
+        );
+        assert_ne!(hidden.paint, component.revision().paint);
+    }
 
     #[test]
     fn clipped_button_row_cannot_activate_through_blank_layout_rows() {

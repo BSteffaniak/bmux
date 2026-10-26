@@ -644,6 +644,7 @@ impl<'a> SelectDropdown<'a> {
 /// routes events through the same resolved layout. Control state remains
 /// caller-owned through an interior-mutable `Cell`.
 pub struct SelectDropdownComponent<'a, 'state> {
+    pointer_intent: bmux_tui::pointer::PointerIntent,
     id: LayoutId,
     select: SelectDropdown<'a>,
     state: &'state Cell<SelectDropdownState>,
@@ -651,6 +652,13 @@ pub struct SelectDropdownComponent<'a, 'state> {
 }
 
 impl<'a, 'state> SelectDropdownComponent<'a, 'state> {
+    /// Override pointer presentation without changing input routing or mouse policy.
+    #[must_use]
+    pub const fn pointer_intent(mut self, intent: bmux_tui::pointer::PointerIntent) -> Self {
+        self.pointer_intent = intent;
+        self
+    }
+
     /// Create a select/dropdown with stable identity and caller-owned state.
     #[must_use]
     pub fn new(
@@ -660,6 +668,7 @@ impl<'a, 'state> SelectDropdownComponent<'a, 'state> {
     ) -> Self {
         Self {
             id: id.into(),
+            pointer_intent: bmux_tui::pointer::PointerIntent::Auto,
             select: SelectDropdown::new(options),
             state,
             fallback: Style::new(),
@@ -708,6 +717,7 @@ impl Component for SelectDropdownComponent<'_, '_> {
         state.open.hash(&mut layout);
 
         let mut paint = std::collections::hash_map::DefaultHasher::new();
+        format!("{:?}", self.pointer_intent).hash(&mut paint);
         for option in self.select.options {
             option.disabled.hash(&mut paint);
         }
@@ -746,6 +756,7 @@ impl Component for SelectDropdownComponent<'_, '_> {
         cx.push_hit(
             SceneRegion::new(self.id.as_str(), closed_area)
                 .role(HitRole::ListItem)
+                .pointer_intent(self.pointer_intent)
                 .pointer_events(self.select.policy.mouse.enabled)
                 .hoverable(self.select.policy.mouse.enabled && self.select.policy.mouse.hover)
                 .focusable(true)
@@ -757,6 +768,7 @@ impl Component for SelectDropdownComponent<'_, '_> {
                 cx.push_hit(
                     SceneRegion::new(format!("{}.options", self.id.as_str()), list_area)
                         .role(HitRole::ListItem)
+                        .pointer_intent(self.pointer_intent)
                         .pointer_events(self.select.policy.mouse.enabled)
                         .hoverable(
                             self.select.policy.mouse.enabled && self.select.policy.mouse.hover,
@@ -777,6 +789,7 @@ impl Component for SelectDropdownComponent<'_, '_> {
                     cx.push_hit(
                         SceneRegion::new(option_id.clone(), region.rect)
                             .role(HitRole::ListItem)
+                            .pointer_intent(self.pointer_intent)
                             .pointer_events(self.select.policy.mouse.enabled)
                             .hoverable(
                                 self.select.policy.mouse.enabled && self.select.policy.mouse.hover,
@@ -861,6 +874,27 @@ mod tests {
             LocalRect::new(0, 0, area.width, area.height),
             |cx| component.paint(&layout, cx),
         );
+    }
+
+    #[test]
+    fn pointer_override_invalidates_paint_without_remeasuring_layout() {
+        use bmux_tui::pointer::{PointerIntent, PointerShape};
+
+        let options = options();
+        let state = Cell::new(SelectDropdownState::new(Some(1)));
+        let component = SelectDropdownComponent::new("status", &options, &state);
+        let original = component.revision();
+        let component = component.pointer_intent(PointerIntent::Hidden);
+        assert_eq!(component.pointer_intent, PointerIntent::Hidden);
+        let hidden = component.revision();
+        assert_eq!(original.layout, hidden.layout);
+        assert_ne!(original.paint, hidden.paint);
+        let component = component.pointer_intent(PointerIntent::Shape(PointerShape::Crosshair));
+        assert_eq!(
+            component.pointer_intent,
+            PointerIntent::Shape(PointerShape::Crosshair)
+        );
+        assert_ne!(hidden.paint, component.revision().paint);
     }
 
     #[test]

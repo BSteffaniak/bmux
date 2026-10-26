@@ -55,6 +55,8 @@ impl Default for SelectionAutoScrollCadence {
 /// Component behavior for hierarchical logical content selection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ComponentSelectionPolicy {
+    /// Pointer presentation over selectable content; Auto derives the Text shape.
+    pub pointer_intent: bmux_tui::pointer::PointerIntent,
     /// Whether the component registers selection metadata.
     pub enabled: bool,
     /// Whether content locks the component scope or delegates to its parent.
@@ -66,10 +68,18 @@ pub struct ComponentSelectionPolicy {
 }
 
 impl ComponentSelectionPolicy {
+    /// Override selectable-content pointer presentation without changing capture policy.
+    #[must_use]
+    pub const fn pointer_intent(mut self, intent: bmux_tui::pointer::PointerIntent) -> Self {
+        self.pointer_intent = intent;
+        self
+    }
+
     /// Disabled component selection.
     #[must_use]
     pub const fn disabled() -> Self {
         Self {
+            pointer_intent: bmux_tui::pointer::PointerIntent::Auto,
             enabled: false,
             content_capture: SelectionCapture::Disabled,
             chrome_capture: SelectionCapture::Disabled,
@@ -81,6 +91,7 @@ impl ComponentSelectionPolicy {
     #[must_use]
     pub const fn content() -> Self {
         Self {
+            pointer_intent: bmux_tui::pointer::PointerIntent::Auto,
             enabled: true,
             content_capture: SelectionCapture::Capture,
             chrome_capture: SelectionCapture::Delegate,
@@ -92,6 +103,7 @@ impl ComponentSelectionPolicy {
     #[must_use]
     pub const fn delegated() -> Self {
         Self {
+            pointer_intent: bmux_tui::pointer::PointerIntent::Auto,
             enabled: true,
             content_capture: SelectionCapture::Delegate,
             chrome_capture: SelectionCapture::Delegate,
@@ -213,6 +225,22 @@ pub fn paint_component_scope(
     let Some(scope) = component_scope(state, policy, outer_area, content_area) else {
         return ComponentSelectionOutcome::Disabled;
     };
+    if !content_area.is_empty() && !matches!(policy.content_capture, SelectionCapture::Disabled) {
+        let intent = match policy.pointer_intent {
+            bmux_tui::pointer::PointerIntent::Auto => {
+                bmux_tui::pointer::PointerIntent::Shape(bmux_tui::pointer::PointerShape::Text)
+            }
+            intent => intent,
+        };
+        paint.push_hit(
+            bmux_tui::hit::HitRegion::new(
+                format!("{}.selection.pointer", state.scope_id.as_str()),
+                content_area,
+            )
+            .role(bmux_tui::hit::HitRole::Background)
+            .pointer_intent(intent),
+        );
+    }
     paint.push_selection_scope(scope);
     ComponentSelectionOutcome::ScopeRegistered
 }
@@ -293,5 +321,45 @@ mod tests {
             scope.parent.as_ref().map(SelectionScopeId::as_str),
             Some("root")
         );
+    }
+
+    #[test]
+    fn selection_pointer_is_opt_in_clipped_and_overridable() {
+        use bmux_tui::geometry::Point;
+        use bmux_tui::pointer::{PointerIntent, PointerShape, resolve_pointer_intent};
+
+        for (policy, expected) in [
+            (
+                ComponentSelectionPolicy::disabled(),
+                PointerIntent::Shape(PointerShape::Default),
+            ),
+            (
+                ComponentSelectionPolicy::content(),
+                PointerIntent::Shape(PointerShape::Text),
+            ),
+            (
+                ComponentSelectionPolicy::content().pointer_intent(PointerIntent::Hidden),
+                PointerIntent::Hidden,
+            ),
+        ] {
+            let mut buffer = Buffer::empty(Rect::new(0, 0, 10, 4));
+            let mut frame = Frame::new(&mut buffer);
+            paint_component_scope(
+                &mut PaintCx::new(&mut frame),
+                &ComponentSelectionState::new("content"),
+                &policy,
+                Rect::new(0, 0, 10, 4),
+                Rect::new(1, 1, 8, 2),
+            );
+            assert_eq!(
+                resolve_pointer_intent(frame.hits(), Some(Point::new(1, 1)), None, None),
+                expected
+            );
+            assert_eq!(
+                resolve_pointer_intent(frame.hits(), Some(Point::new(0, 0)), None, None),
+                PointerIntent::Shape(PointerShape::Default)
+            );
+            assert!(frame.hits().focus_targets(None).is_empty());
+        }
     }
 }

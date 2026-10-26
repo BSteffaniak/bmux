@@ -107,6 +107,12 @@ pub enum PluginSurfaceCursor {
     ResizeHorizontal,
     ResizeVertical,
     Hidden,
+    /// Neutral TUI metadata retained until hover or valid capture is resolved.
+    /// Existing cursor variants retain their original meaning.
+    Tui {
+        intent: bmux_tui::pointer::PointerIntent,
+        role: bmux_tui::hit::HitRole,
+    },
 }
 
 /// Stable owner-local input region within one retained surface.
@@ -207,17 +213,14 @@ impl PluginSurface {
 impl PluginSurfaceRegion {
     #[must_use]
     pub fn from_tui(region: &bmux_tui::hit::HitRegion) -> Self {
-        use bmux_tui::hit::HitRole;
-
-        let cursor = match region.role {
-            HitRole::TextInput => PluginSurfaceCursor::Text,
-            HitRole::ResizeHandle => PluginSurfaceCursor::ResizeHorizontal,
-            HitRole::Action | HitRole::ListItem | HitRole::DragHandle => {
-                PluginSurfaceCursor::Pointer
+        let cursor = if region.enabled && region.visible {
+            PluginSurfaceCursor::Tui {
+                intent: region.pointer_intent,
+                role: region.role,
             }
-            HitRole::Scroll | HitRole::Background | HitRole::Custom(_) => {
-                PluginSurfaceCursor::Default
-            }
+        } else {
+            // Disabled visible controls still occlude lower pointer intents.
+            PluginSurfaceCursor::Default
         };
         Self {
             local_id: region.id.as_str().to_owned(),
@@ -1150,7 +1153,53 @@ mod tests {
         assert_eq!(region.local_id, "field");
         assert_eq!(region.rect, ExtensionRect::new(2, 3, 8, 1));
         assert!(region.focusable);
-        assert_eq!(region.cursor, PluginSurfaceCursor::Text);
+        assert_eq!(
+            region.cursor,
+            PluginSurfaceCursor::Tui {
+                intent: bmux_tui::pointer::PointerIntent::Auto,
+                role: HitRole::TextInput,
+            }
+        );
+    }
+
+    #[test]
+    fn tui_pointer_overrides_and_role_survive_lowering() {
+        use bmux_tui::geometry::Rect;
+        use bmux_tui::hit::{HitRegion, HitRole};
+        use bmux_tui::pointer::{PointerIntent, PointerShape};
+
+        for intent in PointerShape::ALL
+            .into_iter()
+            .map(PointerIntent::Shape)
+            .chain([PointerIntent::Auto, PointerIntent::Hidden])
+        {
+            let hit = HitRegion::new("drag", Rect::new(0, 0, 2, 1))
+                .role(HitRole::DragHandle)
+                .pointer_intent(intent);
+            assert_eq!(
+                PluginSurfaceRegion::from_tui(&hit).cursor,
+                PluginSurfaceCursor::Tui {
+                    intent,
+                    role: HitRole::DragHandle
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn disabled_tui_control_blocks_lower_pointer_intent_with_default() {
+        use bmux_tui::geometry::Rect;
+        use bmux_tui::hit::HitRegion;
+        use bmux_tui::pointer::PointerIntent;
+
+        let mut hit = HitRegion::new("disabled", Rect::new(0, 0, 2, 1))
+            .focusable(true)
+            .pointer_intent(PointerIntent::Hidden);
+        hit.enabled = false;
+        let region = PluginSurfaceRegion::from_tui(&hit);
+        assert_eq!(region.cursor, PluginSurfaceCursor::Default);
+        assert!(!region.focusable);
+        assert_eq!(region.rect, ExtensionRect::new(0, 0, 2, 1));
     }
 
     #[test]

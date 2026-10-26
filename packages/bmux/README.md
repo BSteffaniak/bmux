@@ -1,20 +1,48 @@
 # bmux
 
-The main bmux library providing core functionality for the terminal multiplexer.
+Optional umbrella exports for BMUX's domain-neutral building blocks. Product
+policy and domain services belong to applications and plugins; this crate does
+not implement session or window management.
 
-## Overview
+## Reusable terminal UI
 
-This package serves as the main entry point and orchestrates the various bmux
-components including session management, terminal handling, and event
-processing.
+Enable only the exports needed by the consumer:
 
-## Features
+```toml
+bmux = { version = "0.0.1-alpha.1", default-features = false, features = [
+    "tui", "tui_runtime", "tui_components", "terminal_protocol",
+] }
+```
 
-- Core bmux functionality
-- Session and window management
-- Integration with all bmux components
+- `bmux::tui`: layout, painting, committed interaction scenes, and pointer intent.
+- `bmux::tui_runtime`: bounded scheduling and standard terminal presenters.
+- `bmux::tui_components`: reusable controls with caller-owned state.
+- `bmux::terminal_protocol`: protocol parsing and shared pointer-shape types.
 
-## Usage
+These are crate re-exports, not another UI framework or backend. Backend and
+component selection remain features of the underlying crates. For example,
+`bmux_tui_runtime/crossterm` enables managed input and
+`bmux_tui_components/button` enables the button API. Enable those features on
+direct dependencies when needed; Cargo unifies them with the re-exported crates.
+Components have no default component set. The runtime currently defaults to
+Crossterm and image protocols; the umbrella export does not imply a minimal
+backend configuration.
 
-This is primarily used internally by the bmux CLI and other components. See the
-main bmux documentation for usage examples.
+Pointer intent does not guarantee terminal support. In particular, the neutral
+`Hidden` intent is not an OSC 22 shape and is independent of text-caret
+visibility.
+See the [TUI](../tui/README.md), [runtime](../tui-runtime/README.md), and
+[components](../tui-components/README.md) documentation for ownership and lifecycle
+contracts.
+
+## Other exports
+
+Optional `config`, `cli`, `server`, `client`, `keybind`, `plugin`, `plugin_sdk`,
+and
+`sandbox_harness` features expose their matching crates. Use
+`default-features = false` to avoid the default `all` group when embedding only
+selected building blocks. The new `tui`, `tui_runtime`, `tui_components`, and
+`terminal_protocol` exports are opt-in; they are not added to the umbrella's
+current default `all` group.
+
+See the [main BMUX documentation](../../README.md) for product usage examples.

@@ -404,6 +404,7 @@ pub struct PanelGroup {
 /// consume the same resolved [`LayoutNode`]. Interactive state remains
 /// caller-owned.
 pub struct PanelGroupComponent<'a> {
+    pointer_intent: bmux_tui::pointer::PointerIntent,
     id: LayoutId,
     group: PanelGroup,
     state: &'a RefCell<PanelGroupState>,
@@ -411,6 +412,13 @@ pub struct PanelGroupComponent<'a> {
 }
 
 impl<'a> PanelGroupComponent<'a> {
+    /// Override pointer presentation without changing input routing or mouse policy.
+    #[must_use]
+    pub const fn pointer_intent(mut self, intent: bmux_tui::pointer::PointerIntent) -> Self {
+        self.pointer_intent = intent;
+        self
+    }
+
     /// Create a component using `group` policy and caller-owned `state`.
     #[must_use]
     pub fn new(
@@ -420,6 +428,7 @@ impl<'a> PanelGroupComponent<'a> {
     ) -> Self {
         Self {
             id: id.into(),
+            pointer_intent: bmux_tui::pointer::PointerIntent::Auto,
             group,
             state,
             children: Vec::new(),
@@ -502,6 +511,7 @@ impl<'a> PanelGroupComponent<'a> {
                 cx.push_hit(
                     SceneRegion::new(format!("{}.panel.{index}", self.id.as_str()), panel)
                         .role(HitRole::Background)
+                        .pointer_intent(self.pointer_intent)
                         .focusable(false),
                 );
             }
@@ -514,6 +524,19 @@ impl<'a> PanelGroupComponent<'a> {
                 cx.push_hit(
                     SceneRegion::new(format!("{}.divider.{index}", self.id.as_str()), divider)
                         .role(HitRole::ResizeHandle)
+                        .pointer_intent(match self.pointer_intent {
+                            bmux_tui::pointer::PointerIntent::Auto => {
+                                bmux_tui::pointer::PointerIntent::Shape(match self.group.axis {
+                                    PanelGroupAxis::Horizontal => {
+                                        bmux_tui::pointer::PointerShape::EwResize
+                                    }
+                                    PanelGroupAxis::Vertical => {
+                                        bmux_tui::pointer::PointerShape::NsResize
+                                    }
+                                })
+                            }
+                            intent => intent,
+                        })
                         .hoverable(self.group.policy.mouse.hover_dividers)
                         .focusable(false),
                 );
@@ -555,6 +578,7 @@ impl Component for PanelGroupComponent<'_> {
             child.revision().layout.hash(&mut layout);
         }
         let mut paint = std::collections::hash_map::DefaultHasher::new();
+        format!("{:?}", self.pointer_intent).hash(&mut paint);
         format!("{:?}", self.group.policy).hash(&mut paint);
         format!("{:?}", self.group.styles).hash(&mut paint);
         state.focused_panel.hash(&mut paint);
@@ -760,6 +784,7 @@ impl PanelGroup {
     ) -> Vec<ComponentSelectionOutcome> {
         let layout = self.layout(area, state);
         let parent_policy = ComponentSelectionPolicy {
+            pointer_intent: child_policy.pointer_intent,
             enabled: child_policy.enabled,
             content_capture: bmux_tui::selection::SelectionCapture::Capture,
             chrome_capture: bmux_tui::selection::SelectionCapture::Capture,
@@ -1116,6 +1141,35 @@ mod tests {
         PanelGroupPolicy, PanelGroupState, PanelSize,
     };
     use crate::selection::{ComponentSelectionPolicy, ComponentSelectionState};
+
+    #[test]
+    fn pointer_override_invalidates_paint_without_remeasuring_layout() {
+        use bmux_tui::pointer::{PointerIntent, PointerShape};
+
+        let state = RefCell::new(PanelGroupState::new([
+            PanelSize::fixed(4),
+            PanelSize::flex(1),
+        ]));
+        let component = PanelGroupComponent::new(
+            "workspace",
+            PanelGroup::new(PanelGroupAxis::Horizontal).policy(PanelGroupPolicy::interactive()),
+            &state,
+        )
+        .child(TextBlock::new("left").id("left"))
+        .child(TextBlock::new("right").id("right"));
+        let original = component.revision();
+        let component = component.pointer_intent(PointerIntent::Hidden);
+        assert_eq!(component.pointer_intent, PointerIntent::Hidden);
+        let hidden = component.revision();
+        assert_eq!(original.layout, hidden.layout);
+        assert_ne!(original.paint, hidden.paint);
+        let component = component.pointer_intent(PointerIntent::Shape(PointerShape::Crosshair));
+        assert_eq!(
+            component.pointer_intent,
+            PointerIntent::Shape(PointerShape::Crosshair)
+        );
+        assert_ne!(hidden.paint, component.revision().paint);
+    }
 
     #[test]
     fn horizontal_layout_allocates_fixed_and_flex_panels() {

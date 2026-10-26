@@ -20,6 +20,31 @@ class NativePointerAdapterTest {
     }
 
     @Test
+    fun resetInvalidatesQueuedPointerAdmissionWithoutRevivingOldLifetime() {
+        val old = NativePointerRevisions()
+        val hidden = TerminalPointerFrame(1, "old", 4u, null)
+        assertTrue(old.accept(hidden))
+        old.invalidate()
+        // These model callbacks captured before reset but run afterward.
+        assertFalse(old.accept(hidden.copy(revision = 5u)))
+        assertFalse(old.accept(hidden.copy(generation = "replacement", revision = 1u)))
+        old.reset()
+        assertFalse(old.accept(hidden))
+
+        val replacement = NativePointerRevisions()
+        assertTrue(replacement.accept(hidden.copy(generation = "replacement", revision = 1u)))
+    }
+
+    @Test
+    fun unsupportedMetadataDoesNotAdvanceRevisionAdmission() {
+        val gate = NativePointerRevisions()
+        val first = TerminalPointerFrame(1, "first", 1u, "default")
+        assertFalse(gate.accept(first.copy(generation = "")))
+        assertFalse(gate.accept(first.copy(version = 0, revision = 99u)))
+        assertTrue(gate.accept(first))
+    }
+
+    @Test
     fun revisionAdmissionIsExplicitAndGenerationScoped() {
         val gate = NativePointerRevisions()
         val first = TerminalPointerFrame(1, "first", 8u, "text")

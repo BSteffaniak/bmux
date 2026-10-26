@@ -35,6 +35,7 @@ pub mod layout;
 pub mod linux_input;
 pub mod measured_list;
 pub mod paint;
+pub mod pointer;
 pub mod presentation;
 pub mod selection;
 pub mod semantic;
@@ -87,6 +88,7 @@ pub mod prelude {
     };
     pub use crate::measured_list::{MeasuredListIndex, MeasuredListItem, VisibleItemRange};
     pub use crate::paint::{LocalRect, PaintCx};
+    pub use crate::pointer::{PointerIntent, PointerShape, resolve_pointer_intent};
     pub use crate::selection::{
         SelectionAffinity, SelectionAutoScrollPolicy, SelectionAutoScrollRequest, SelectionCapture,
         SelectionContentId, SelectionController, SelectionEndpoint, SelectionFragment,

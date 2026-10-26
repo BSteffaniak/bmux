@@ -447,6 +447,7 @@ impl<'a> Menu<'a> {
 /// an interior-mutable `Cell`; semantic outcomes such as activation and
 /// cancellation are returned by [`MenuComponent::handle_event`].
 pub struct MenuComponent<'a, 'state> {
+    pointer_intent: bmux_tui::pointer::PointerIntent,
     id: LayoutId,
     menu: Menu<'a>,
     state: &'state Cell<MenuState>,
@@ -455,6 +456,13 @@ pub struct MenuComponent<'a, 'state> {
 }
 
 impl<'a, 'state> MenuComponent<'a, 'state> {
+    /// Override pointer presentation without changing input routing or mouse policy.
+    #[must_use]
+    pub const fn pointer_intent(mut self, intent: bmux_tui::pointer::PointerIntent) -> Self {
+        self.pointer_intent = intent;
+        self
+    }
+
     /// Dispatch through component geometry while retaining menu action details.
     pub fn handle_event(
         &self,
@@ -488,6 +496,7 @@ impl<'a, 'state> MenuComponent<'a, 'state> {
     ) -> Self {
         Self {
             id: id.into(),
+            pointer_intent: bmux_tui::pointer::PointerIntent::Auto,
             menu: Menu::new(items),
             state,
             fallback: Style::new(),
@@ -547,6 +556,7 @@ impl Component for MenuComponent<'_, '_> {
         format!("{:?}", self.menu.policy.list.scrollbar).hash(&mut layout);
 
         let mut paint = std::collections::hash_map::DefaultHasher::new();
+        format!("{:?}", self.pointer_intent).hash(&mut paint);
         format!("{:?}", self.menu.policy.list.mouse).hash(&mut paint);
         for item in self.menu.items {
             item.disabled.hash(&mut paint);
@@ -583,6 +593,7 @@ impl Component for MenuComponent<'_, '_> {
         cx.push_hit(
             SceneRegion::new(self.id.as_str(), area)
                 .role(HitRole::ListItem)
+                .pointer_intent(self.pointer_intent)
                 .pointer_events(self.menu.policy.list.mouse.enabled)
                 .hoverable(self.menu.policy.list.mouse.enabled && self.menu.policy.list.mouse.hover)
                 .focusable(true)
@@ -603,6 +614,7 @@ impl Component for MenuComponent<'_, '_> {
             cx.push_hit(
                 SceneRegion::new(item_id.clone(), region.rect)
                     .role(HitRole::ListItem)
+                    .pointer_intent(self.pointer_intent)
                     .pointer_events(self.menu.policy.list.mouse.enabled)
                     .hoverable(
                         self.menu.policy.list.mouse.enabled && self.menu.policy.list.mouse.hover,
@@ -668,6 +680,7 @@ mod tests {
         fn render(&self, area: Rect, state: &MenuState, frame: &mut Frame<'_>) {
             let state = Cell::new(*state);
             let component = MenuComponent {
+                pointer_intent: bmux_tui::pointer::PointerIntent::Auto,
                 id: "test.menu".into(),
                 menu: self.clone(),
                 state: &state,
@@ -676,6 +689,32 @@ mod tests {
             };
             render_component(&component, area, frame);
         }
+    }
+
+    #[test]
+    fn pointer_override_invalidates_paint_without_remeasuring_layout() {
+        use bmux_tui::pointer::{PointerIntent, PointerShape};
+
+        let items = [
+            MenuItem::new("open", "Open"),
+            MenuItem::new("recent", "Recent").section(true),
+            MenuItem::new("close", "Close"),
+        ];
+        let enabled = Cell::new(MenuState::new(Some(0)));
+
+        let component = MenuComponent::new("file-menu", &items, &enabled);
+        let original = component.revision();
+        let component = component.pointer_intent(PointerIntent::Hidden);
+        assert_eq!(component.pointer_intent, PointerIntent::Hidden);
+        let hidden = component.revision();
+        assert_eq!(original.layout, hidden.layout);
+        assert_ne!(original.paint, hidden.paint);
+        let component = component.pointer_intent(PointerIntent::Shape(PointerShape::Crosshair));
+        assert_eq!(
+            component.pointer_intent,
+            PointerIntent::Shape(PointerShape::Crosshair)
+        );
+        assert_ne!(hidden.paint, component.revision().paint);
     }
 
     #[test]

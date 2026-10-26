@@ -289,6 +289,7 @@ impl TextInputState {
 /// The edit buffer, selection, scroll, and pointer gesture state remain
 /// caller-owned through the supplied `RefCell`.
 pub struct TextInputComponent<'policy, 'state> {
+    pointer_intent: bmux_tui::pointer::PointerIntent,
     id: LayoutId,
     state: &'state RefCell<TextInputState>,
     policy: &'policy TextInputPolicy,
@@ -302,6 +303,13 @@ pub struct TextInputComponent<'policy, 'state> {
 }
 
 impl<'policy, 'state> TextInputComponent<'policy, 'state> {
+    /// Override pointer presentation without changing input routing or mouse policy.
+    #[must_use]
+    pub const fn pointer_intent(mut self, intent: bmux_tui::pointer::PointerIntent) -> Self {
+        self.pointer_intent = intent;
+        self
+    }
+
     /// Create an editable text component with stable identity and caller-owned state.
     #[must_use]
     pub fn new(
@@ -311,6 +319,7 @@ impl<'policy, 'state> TextInputComponent<'policy, 'state> {
     ) -> Self {
         Self {
             id: id.into(),
+            pointer_intent: bmux_tui::pointer::PointerIntent::Auto,
             state,
             policy,
             history_bindings: TextInputHistoryBindings::standard(),
@@ -380,6 +389,7 @@ impl Component for TextInputComponent<'_, '_> {
         self.policy.viewport.max_rows.hash(&mut layout);
 
         let mut paint = std::collections::hash_map::DefaultHasher::new();
+        format!("{:?}", self.pointer_intent).hash(&mut paint);
         state.buffer().cursor_grapheme_index().hash(&mut paint);
         if let Some(selection) = state.buffer().selection() {
             selection.start.hash(&mut paint);
@@ -450,6 +460,7 @@ impl Component for TextInputComponent<'_, '_> {
                 cx.push_hit(
                     HitRegion::new(self.id.as_str(), Rect::new(0, 0, clip.width, clip.height))
                         .role(HitRole::TextInput)
+                        .pointer_intent(self.pointer_intent)
                         .hoverable(true)
                         .focusable(true)
                         .enabled(!self.disabled),
@@ -1452,6 +1463,30 @@ mod tests {
     use bmux_tui::frame::Frame;
     use bmux_tui::geometry::{Point, Size};
     use bmux_tui::paint::{LocalRect, PaintCx};
+
+    #[test]
+    fn pointer_override_invalidates_paint_without_remeasuring_layout() {
+        use bmux_tui::pointer::{PointerIntent, PointerShape};
+
+        let policy = TextInputPolicy::chat_composer();
+        let state = RefCell::new(TextInputState::new(TextEditBuffer::from_text("a")));
+        state.borrow_mut().buffer_mut().insert_str("b");
+        let component = TextInputComponent::new("editor", &state, &policy)
+            .with_history_bindings(TextInputHistoryBindings::disabled())
+            .focused(true);
+        let original = component.revision();
+        let component = component.pointer_intent(PointerIntent::Hidden);
+        assert_eq!(component.pointer_intent, PointerIntent::Hidden);
+        let hidden = component.revision();
+        assert_eq!(original.layout, hidden.layout);
+        assert_ne!(original.paint, hidden.paint);
+        let component = component.pointer_intent(PointerIntent::Shape(PointerShape::Crosshair));
+        assert_eq!(
+            component.pointer_intent,
+            PointerIntent::Shape(PointerShape::Crosshair)
+        );
+        assert_ne!(hidden.paint, component.revision().paint);
+    }
 
     #[test]
     fn undo_redo_controls_restore_atomic_edits_and_consume_empty_history() {
