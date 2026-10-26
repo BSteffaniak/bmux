@@ -13,12 +13,13 @@ version     = { workspace = true }
 [dependencies]
 anyhow = { workspace = true }
 # Internal bmux packages
-bmux_config_doc        = { workspace = true }
-bmux_config_doc_derive = { workspace = true }
-bmux_event_models      = { workspace = true, features = ["serde"] }
-bmux_ipc               = { workspace = true }
-bmux_keybind           = { workspace = true }
-bmux_slots             = { workspace = true }
+bmux_config_composition = { workspace = true }
+bmux_config_doc         = { workspace = true }
+bmux_config_doc_derive  = { workspace = true }
+bmux_event_models       = { workspace = true, features = ["serde"] }
+bmux_ipc                = { workspace = true }
+bmux_keybind            = { workspace = true }
+bmux_slots              = { workspace = true }
 
 # External dependencies
 serde     = { workspace = true, features = ["derive"] }

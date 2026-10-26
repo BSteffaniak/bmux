@@ -101,29 +101,10 @@ impl ConfigFamily {
                 path: resolve_config_override_path(source.path.as_os_str()),
                 required: source.required,
             };
-            let value = match std::fs::read_to_string(&source.path) {
-                Ok(contents) => {
-                    Some(
-                        toml::from_str(&contents).map_err(|_| ConfigError::ParseError {
-                            error: format!(
-                                "invalid TOML in {} (source values redacted)",
-                                source.path.display()
-                            ),
-                        })?,
-                    )
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    if source.required {
-                        return Err(ConfigError::FileNotFound { path: source.path });
-                    }
-                    None
-                }
-                Err(error) => {
-                    return Err(ConfigError::ReadError {
-                        error: format!("{error} ({})", source.path.display()),
-                    });
-                }
-            };
+            let value = super::engine::capture(&source.path)?;
+            if value.is_none() && source.required {
+                return Err(ConfigError::FileNotFound { path: source.path });
+            }
             documents.push(ConfigDocument {
                 source,
                 value,

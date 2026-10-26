@@ -1,0 +1,26 @@
+[package]
+authors     = { workspace = true }
+categories  = ["config"]
+description = "Deterministic, bounded configuration capture and composition primitives"
+edition     = { workspace = true }
+keywords    = ["config", "composition", "provenance", "serde"]
+license     = { workspace = true }
+name        = "bmux_config_composition"
+readme      = "API.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+serde = { workspace = true }
+toml  = { workspace = true, features = ["parse", "display"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[dev-dependencies]
+serde    = { workspace = true, features = ["derive"] }
+tempfile = { workspace = true }
+
+[features]
+default          = []
+fail-on-warnings = []

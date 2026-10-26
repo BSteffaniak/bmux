@@ -15,6 +15,10 @@ use std::path::PathBuf;
 use thiserror::Error;
 
 pub mod application;
+mod engine;
+
+#[cfg(test)]
+mod compatibility_tests;
 
 pub use application::{
     ApplicationConfiguration, ConfigDocument, ConfigEvaluationContext, ConfigFamily,
@@ -575,20 +579,7 @@ fn evaluate_auto_select_rule(
 }
 
 fn merge_toml_value(base: &mut toml::Value, overlay: toml::Value) {
-    match (base, overlay) {
-        (toml::Value::Table(base_table), toml::Value::Table(overlay_table)) => {
-            for (key, value) in overlay_table {
-                if let Some(existing) = base_table.get_mut(&key) {
-                    merge_toml_value(existing, value);
-                } else {
-                    base_table.insert(key, value);
-                }
-            }
-        }
-        (base_slot, overlay_value) => {
-            *base_slot = overlay_value;
-        }
-    }
+    engine::merge(base, overlay);
 }
 
 fn collect_changed_paths(
@@ -669,11 +660,11 @@ fn reject_removed_presentation_settings(value: &toml::Value, path: &str) -> Resu
 }
 
 fn load_toml_file(path: &std::path::Path) -> Result<toml::Value> {
-    let contents = std::fs::read_to_string(path).map_err(|error| ConfigError::ReadError {
-        error: format!("{} ({})", error, path.display()),
-    })?;
-    let value = toml::from_str(&contents).map_err(|error| ConfigError::ParseError {
-        error: format!("{} ({})", error, path.display()),
+    // Anchor relative paths exactly as legacy capture does; never lexically
+    // normalize parent components across a symlink.
+    let path = crate::resolve_config_override_path(path.as_os_str());
+    let value = engine::capture(&path)?.ok_or_else(|| ConfigError::ReadError {
+        error: format!("configuration file not found ({})", path.display()),
     })?;
     reject_removed_presentation_settings(&value, "")?;
     Ok(value)
@@ -842,55 +833,7 @@ fn resolve_profile_patch(
     requested_profile_id: &str,
     profiles: &BTreeMap<String, CompositionProfile>,
 ) -> std::result::Result<toml::Table, ConfigError> {
-    fn resolve_inner(
-        requested_profile_id: &str,
-        profiles: &BTreeMap<String, CompositionProfile>,
-        stack: &mut Vec<String>,
-        cache: &mut BTreeMap<String, toml::Table>,
-    ) -> std::result::Result<toml::Table, ConfigError> {
-        let canonical_id = canonical_profile_id(requested_profile_id);
-        if let Some(resolved) = cache.get(&canonical_id) {
-            return Ok(resolved.clone());
-        }
-        if stack.contains(&canonical_id) {
-            let mut cycle = stack.clone();
-            cycle.push(canonical_id.clone());
-            return Err(ConfigError::InvalidValue {
-                field: "composition.profiles".to_string(),
-                value: format!("profile inheritance cycle detected: {}", cycle.join(" -> ")),
-            });
-        }
-
-        let Some(profile) = profiles.get(&canonical_id) else {
-            return Err(ConfigError::InvalidValue {
-                field: "composition.active_profile".to_string(),
-                value: format!(
-                    "profile '{requested_profile_id}' is not defined (known profiles: {})",
-                    profiles.keys().cloned().collect::<Vec<_>>().join(", ")
-                ),
-            });
-        };
-
-        stack.push(canonical_id.clone());
-        let mut resolved = toml::Table::new();
-        for parent_id in &profile.extends {
-            let parent_patch = resolve_inner(parent_id, profiles, stack, cache)?;
-            let mut merged = toml::Value::Table(resolved);
-            merge_toml_value(&mut merged, toml::Value::Table(parent_patch));
-            resolved = merged.as_table().cloned().unwrap_or_else(toml::Table::new);
-        }
-        let mut merged = toml::Value::Table(resolved);
-        merge_toml_value(&mut merged, toml::Value::Table(profile.patch.clone()));
-        let resolved = merged.as_table().cloned().unwrap_or_else(toml::Table::new);
-        stack.pop();
-
-        cache.insert(canonical_id, resolved.clone());
-        Ok(resolved)
-    }
-
-    let mut stack = Vec::new();
-    let mut cache = BTreeMap::new();
-    resolve_inner(requested_profile_id, profiles, &mut stack, &mut cache)
+    engine::profile(requested_profile_id, profiles)
 }
 
 #[allow(clippy::too_many_lines)]

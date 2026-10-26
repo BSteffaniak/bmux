@@ -1984,6 +1984,7 @@ name = "bmux_config"
 version = "0.0.1-alpha.4"
 dependencies = [
  "anyhow",
+ "bmux_config_composition",
  "bmux_config_doc",
  "bmux_config_doc_derive",
  "bmux_event_models",
@@ -1996,6 +1997,16 @@ dependencies = [
  "thiserror 2.0.20",
  "toml 1.1.4+spec-1.1.0",
  "tracing",
+]
+
+[[package]]
+name = "bmux_config_composition"
+version = "0.0.1-alpha.4"
+dependencies = [
+ "libc",
+ "serde",
+ "tempfile",
+ "toml 1.1.4+spec-1.1.0",
 ]
 
 [[package]]

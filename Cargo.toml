@@ -31,6 +31,7 @@ members = [
     "packages/client-state",
     "packages/clipboard",
     "packages/config",
+    "packages/config-composition",
     "packages/config-doc",
     "packages/config-doc-derive",
     "packages/context-state",
@@ -239,6 +240,7 @@ bmux_codec = { version = "0.0.1-alpha.4", default-features = false, features = [
 ], path = "packages/codec" }
 bmux_codec_derive = { version = "0.0.1-alpha.4", default-features = false, path = "packages/codec-derive" }
 bmux_config = { version = "0.0.1-alpha.4", default-features = false, path = "packages/config" }
+bmux_config_composition = { version = "0.0.1-alpha.4", default-features = false, path = "packages/config-composition" }
 bmux_config_doc = { version = "0.0.1-alpha.4", default-features = false, path = "packages/config-doc" }
 bmux_config_doc_derive = { version = "0.0.1-alpha.4", default-features = false, path = "packages/config-doc-derive" }
 bmux_context_state = { version = "0.0.1-alpha.4", default-features = false, path = "packages/context-state" }
