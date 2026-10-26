@@ -183,7 +183,7 @@ bmux_frontend_runtime = { version = "0.0.1-alpha.4", default-features = false, p
 bterm_native_platform = { version = "0.0.1-alpha.4", default-features = false, path = "packages/bterm-native-platform" }
 bterm_native_renderer = { version = "0.0.1-alpha.4", default-features = false, path = "packages/bterm-native-renderer" }
 bytemuck = { version = "1.25", default-features = false }
-cranelift-codegen = { version = "0.136.3", default-features = false, features = [
+cranelift-codegen = { version = "0.136.4", default-features = false, features = [
     "all-native-arch",
 ] }
 pollster = { version = "0.4", default-features = false }
@@ -195,7 +195,7 @@ swash = { version = "0.2", default-features = false, features = [
     "render",
     "std",
 ] }
-wasmtime = { version = "49.0.3", default-features = false, features = [
+wasmtime = { version = "49.0.4", default-features = false, features = [
     "cranelift",
     "runtime",
     "std",
@@ -353,10 +353,10 @@ hyperchad_transformer_models = { version = "0.5.0", package = "hyperchad_transfo
 hyperchad_markdown = { version = "0.5.0", default-features = false, features = [
     "xss-protection",
 ] }
-insta = { version = "1.48.0", default-features = false }
-pulldown-cmark = { version = "0.13.4", default-features = false }
+insta = { version = "1.49.0", default-features = false }
+pulldown-cmark = { version = "0.13.5", default-features = false }
 serde_yaml = { package = "yaml_serde", version = "0.10.7", default-features = false }
-smallvec = { version = "1.15.2", default-features = false, features = [
+smallvec = { version = "1.16.4", default-features = false, features = [
     "union",
 ] }
 syntect = { version = "5.3.0", default-features = false, features = [
@@ -364,8 +364,8 @@ syntect = { version = "5.3.0", default-features = false, features = [
     "default-themes",
     "parsing",
 ] }
-two-face = { version = "0.5.1", default-features = false }
-url = { version = "2.5.7", default-features = false, features = ["std"] }
+two-face = { version = "0.5.2", default-features = false }
+url = { version = "2.5.8", default-features = false, features = ["std"] }
 
 switchy = { version = "0.5.0", package = "switchy", default-features = false }
 
@@ -378,20 +378,20 @@ git_sshripped_ssh_identity = { version = "0.10.0", default-features = false }
 
 # External dependencies
 ab_glyph = { version = "0.2.32" }
-anyhow = { version = "1.0.102", default-features = false }
-arboard = { version = "3.6.1", default-features = false, features = [
+anyhow = { version = "1.0.104", default-features = false }
+arboard = { version = "3.7.0", default-features = false, features = [
     "image-data",
     "wayland-data-control",
 ] }
 axum = { version = "0.8.9", default-features = false }
-clap = { version = "4.6.1", default-features = false }
+clap = { version = "4.6.7", default-features = false }
 crossterm = { version = "0.29.0", default-features = false }
 flate2 = { version = "1", default-features = false, features = [
     "rust_backend",
 ] }
 font8x8 = { version = "0.3.1", features = ["unicode"] }
 fontdb = { version = "0.24.0" }
-futures-util = { version = "0.3.32", default-features = false }
+futures-util = { version = "0.3.34", default-features = false }
 gif = { version = "0.14.2" }
 image = { version = "0.25", default-features = false, features = [
     "png",
@@ -399,58 +399,58 @@ image = { version = "0.25", default-features = false, features = [
     "gif",
     "bmp",
 ] }
-iroh = { version = "1.0.0", default-features = true }
+iroh = { version = "1.4.1", default-features = true }
 libc = { version = "0.2" }
 libloading = { version = "0.9.0", default-features = false, features = ["std"] }
-log = { version = "0.4.29", default-features = false }
+log = { version = "0.4.34", default-features = false }
 lz4_flex = { version = "0.13", default-features = false }
 png = { version = "0.18.1", default-features = false }
 portable-pty = { version = "0.9.0" }
-proc-macro2 = { version = "1.0.106", default-features = false }
-proptest = { version = "1.11.0", default-features = false, features = ["std"] }
+proc-macro2 = { version = "1.0.107", default-features = false }
+proptest = { version = "1.12.0", default-features = false, features = ["std"] }
 qrcode = { version = "0.14.1", default-features = false }
-quote = { version = "1.0.45", default-features = false }
-rcgen = { version = "0.14.8", default-features = false, features = [
+quote = { version = "1.0.47", default-features = false }
+rcgen = { version = "0.14.10", default-features = false, features = [
     "pem",
     "ring",
 ] }
-regex = { version = "1.12.3", default-features = false, features = ["std"] }
-reqwest = { version = "0.13.3", default-features = false, features = [
+regex = { version = "1.13.1", default-features = false, features = ["std"] }
+reqwest = { version = "0.13.5", default-features = false, features = [
     "json",
     "rustls-no-provider",
 ] }
 resvg = { version = "0.48.1", default-features = true }
-roxmltree = "0.21.1"
-rustls = { version = "0.23.40", default-features = false, features = [
+roxmltree = "0.21.2"
+rustls = { version = "0.23.46", default-features = false, features = [
     "std",
     "ring",
 ] }
-rustls-native-certs = { version = "0.8.3", default-features = false }
+rustls-native-certs = { version = "0.8.5", default-features = false }
 rustls-pemfile = { version = "2.2.0", default-features = false, features = [
     "std",
 ] }
 semver = { version = "1.0.28", default-features = false, features = ["std"] }
-serde = { version = "1.0.228", default-features = false, features = ["std"] }
-serde_json = { version = "1.0.149", default-features = false, features = [
+serde = { version = "1.0.229", default-features = false, features = ["std"] }
+serde_json = { version = "1.0.154", default-features = false, features = [
     "std",
 ] }
-sha2 = { version = "0.11.0", default-features = false }
+sha2 = { version = "0.11.1", default-features = false }
 sha2_010 = { package = "sha2", version = "0.10.9", default-features = false }
-ssh2 = { version = "0.9.5" }
+ssh2 = { version = "0.9.6" }
 sshenv_vault = { version = "0.0.1-alpha.6", features = ["macos-keychain"] }
-syn = { version = "2.0.117", default-features = false }
-sysinfo = { version = "0.38.1" }
+syn = { version = "2.0.119", default-features = false }
+sysinfo = { version = "0.38.4" }
 tempfile = { version = "3.27.0", default-features = false }
-thiserror = { version = "2.0.18", default-features = false }
-time = { version = "0.3.47", default-features = false }
-tokio = { version = "1.52.3", default-features = false }
-tokio-rustls = { version = "0.26.4", default-features = false }
+thiserror = { version = "2.0.21", default-features = false }
+time = { version = "0.3.55", default-features = false }
+tokio = { version = "1.54.1", default-features = false }
+tokio-rustls = { version = "0.26.6", default-features = false }
 tokio-tungstenite = { version = "0.29.0", default-features = false }
-toml = { version = "1.1.2", default-features = false, features = [
+toml = { version = "1.1.8", default-features = false, features = [
     "display",
     "serde",
 ] }
-toml_edit = { version = "0.25.11", default-features = false, features = [
+toml_edit = { version = "0.25.17", default-features = false, features = [
     "parse",
     "display",
 ] }
@@ -458,12 +458,12 @@ tracing = { version = "0.1.44", default-features = false }
 tracing-appender = { version = "0.2.5", default-features = false }
 tracing-log = { version = "0.2.0", default-features = false }
 tracing-subscriber = { version = "0.3.23", default-features = false }
-trybuild = { version = "1.0.116" }
+trybuild = { version = "1.0.122" }
 ttf-parser = { version = "0.25.1", default-features = true }
-unicode-segmentation = { version = "1.13.2", default-features = false }
+unicode-segmentation = { version = "1.13.3", default-features = false }
 unicode-width = { version = "0.2.2", default-features = false }
-uniffi = { version = "0.31.1" }
-uuid = { version = "1.23.1", default-features = false }
+uniffi = { version = "0.31.2" }
+uuid = { version = "1.29.0", default-features = false }
 windows-sys = { version = "0.61.2" }
 zeroize = { version = "1.9.1", default-features = false, features = ["std"] }
 zstd = { version = "0.13", default-features = false }
@@ -484,7 +484,7 @@ redb = { version = "=4.1.0", default-features = false }
 mlua = { version = "0.11", default-features = false }
 
 # Dev/test dependencies
-serial_test = { version = "3.4.0" }
+serial_test = { version = "3.5.0" }
 
 # Keep identity checks bounded in debug native acceptance runs with large binaries.
 [profile.dev.package.sha2]

@@ -23,10 +23,10 @@ sha2          = { workspace = true }
 unicode-width = { workspace = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-js-sys = { version = "0.3.103", optional = true }
-wasm-bindgen = { version = "0.2.126", optional = true }
-wasm-bindgen-futures = { version = "0.4.76", optional = true }
-web-sys = { version = "0.3.103", optional = true, features = [
+js-sys = { version = "0.3.106", optional = true }
+wasm-bindgen = { version = "0.2.129", optional = true }
+wasm-bindgen-futures = { version = "0.4.79", optional = true }
+web-sys = { version = "0.3.106", optional = true, features = [
     "Window",
     "Document",
     "Element",
