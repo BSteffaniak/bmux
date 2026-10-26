@@ -9,9 +9,13 @@ type, navigate, resize the source, or access private controller state. See the
 ## Native control interface
 
 The broadcast plugin is server-owned. Separate invocations address the same
-controller. Pause, resume, stop, and explicit source switching are runtime-wide
+controller. Start, pause, resume, stop, and explicit source switching are
+runtime-wide
 operator actions authorized by the selected runtime's private local proof, not
-by the short-lived CLI connection owning the source. Integrations retain
+by the short-lived CLI connection owning the source. Starting an existing source
+(`broadcast start --source UUID`, optionally with `--profile NAME`, or the
+positional form below) preserves its producer's ownership and requires a live
+registration. It cannot replace an active publication. Integrations retain
 owner-scoped controls and token-fenced `stop-owned` cleanup:
 
 ```sh

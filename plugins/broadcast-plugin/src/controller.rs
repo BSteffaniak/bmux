@@ -163,7 +163,11 @@ impl Controller {
     pub fn control_publication(&self, control: Control) -> Result<Status, &'static str> {
         if !matches!(
             control,
-            Control::Pause | Control::Resume | Control::Stop | Control::Source(_)
+            Control::Start(_, _)
+                | Control::Pause
+                | Control::Resume
+                | Control::Stop
+                | Control::Source(_)
         ) {
             return Err("invalid_publication_control");
         }
@@ -355,6 +359,42 @@ impl Controller {
                 viewer_url: state.viewer_url.clone(),
             },
         )
+    }
+    /// Operator start keeps the producer's ownership and returns no scoped cleanup token.
+    pub fn start_profile_publication(
+        &self,
+        id: &str,
+        relay: Relay,
+        url: String,
+        state_root: &std::path::Path,
+    ) -> Result<bmux_broadcast_plugin_api::broadcast_turnkey_v1::BroadcastStatus, &'static str>
+    {
+        let _operation = self
+            .operation
+            .lock()
+            .map_err(|_| "controller_unavailable")?;
+        {
+            let state = self.state.lock().map_err(|_| "controller_unavailable")?;
+            if state.local != "stopped"
+                || state
+                    .sources
+                    .get(id)
+                    .is_none_or(|source| source.expires <= Instant::now())
+            {
+                return Err("source_unavailable_or_already_started");
+            }
+        }
+        // Retain the no-replay fence used by profile starts. Never register or
+        // renew someone else's source as part of operator selection.
+        crate::start_identity::claim(state_root, id)?;
+        let result = self.control_locked(Control::Start(Box::new(relay), id.into()), None);
+        let mut state = self.state.lock().map_err(|_| "controller_unavailable")?;
+        if state.selected.as_deref() != Some(id) || state.local == "stopped" {
+            return Err(result.err().unwrap_or("start_not_admitted"));
+        }
+        state.viewer_url = Some(url);
+        drop(state);
+        self.turnkey_status()
     }
     pub fn start_owned(
         &self,

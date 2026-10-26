@@ -126,6 +126,13 @@ impl RustPlugin for BroadcastPlugin {
                 let url = guided::viewer_url(&profile.endpoint, &profile.channel).map_err(error)?;
                 controller()?.start_owned(owner, &r.source_id, r.profile, relay, url, std::path::Path::new(&ctx.connection.state_dir)).map_err(error)
             },
+            "broadcast-turnkey-v1", "start-profile-publication" => |r: turnkey::client::StartProfilePublicationRequest, ctx| {
+                authenticated(ctx)?;
+                let profile = profiles::selected(std::path::Path::new(&ctx.connection.config_dir), r.profile.as_deref()).map_err(error)?;
+                let relay = relay::Relay::new(&profile.endpoint, &profile.channel, &profile.credential_file).map_err(error)?;
+                let url = guided::viewer_url(&profile.endpoint, &profile.channel).map_err(error)?;
+                controller()?.start_profile_publication(&r.source_id, relay, url, std::path::Path::new(&ctx.connection.state_dir)).map_err(error)
+            },
             "broadcast-turnkey-v1", "stop-owned" => |r: turnkey::client::StopOwnedRequest, ctx| { let owner = authenticated(ctx)?; controller()?.stop_owned(owner, &r.token).map_err(error) },
             "broadcast-control-v1", "prepare-local" => |_r: (), ctx| {
                 if ctx.caller_client_id.is_none() { return Err(error("authentication_required")); }
@@ -146,6 +153,11 @@ impl RustPlugin for BroadcastPlugin {
             "broadcast-control-v1", "pause" => |_r: (), ctx| { let owner = authenticated(ctx)?; controller()?.control_owned(owner, controller::Control::Pause).map_err(error) },
             "broadcast-control-v1", "resume" => |_r: (), ctx| { let owner = authenticated(ctx)?; controller()?.control_owned(owner, controller::Control::Resume).map_err(error) },
             "broadcast-control-v1", "stop" => |_r: (), ctx| { let owner = authenticated(ctx)?; controller()?.control_owned(owner, controller::Control::Stop).map_err(error) },
+            "broadcast-control-v1", "start-publication" => |r: control::client::StartPublicationRequest, ctx| {
+                authenticated(ctx)?;
+                let relay = relay::Relay::new(&r.endpoint, &r.channel, std::path::Path::new(&r.credential_file)).map_err(error)?;
+                controller()?.control_publication(controller::Control::Start(Box::new(relay), r.source_id)).map_err(error)
+            },
             "broadcast-control-v1", "pause-publication" => |_r: (), ctx| { authenticated(ctx)?; controller()?.control_publication(controller::Control::Pause).map_err(error) },
             "broadcast-control-v1", "resume-publication" => |_r: (), ctx| { authenticated(ctx)?; controller()?.control_publication(controller::Control::Resume).map_err(error) },
             "broadcast-control-v1", "stop-publication" => |_r: (), ctx| { authenticated(ctx)?; controller()?.control_publication(controller::Control::Stop).map_err(error) },
@@ -217,7 +229,7 @@ fn run_command(mut context: NativeCommandContext) -> Result<i32, PluginCommandEr
         if guided::connected(&context, &mut client).await? { return Ok(bmux_plugin_sdk::EXIT_OK); }
         let args = &context.arguments;
         let result = match args.first().map(String::as_str) {
-            Some("start") if args.len() == 5 => control::client::start(&mut client, args[1].clone(), args[2].clone(), args[3].clone(), args[4].clone()).await,
+            Some("start") if args.len() == 5 => control::client::start_publication(&mut client, args[1].clone(), args[2].clone(), args[3].clone(), args[4].clone()).await,
             Some("pause") if args.len() == 1 => control::client::pause_publication(&mut client).await,
             Some("resume") if args.len() == 1 => control::client::resume_publication(&mut client).await,
             Some("stop") if args.len() == 1 => control::client::stop_publication(&mut client).await,

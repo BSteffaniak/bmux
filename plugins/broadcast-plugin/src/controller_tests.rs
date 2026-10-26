@@ -297,6 +297,137 @@ fn lease_expiry_and_unregister_never_revive_old_authority() {
 }
 
 #[test]
+fn operator_starts_existing_source_without_taking_producer_ownership() {
+    for profile in [false, true] {
+        let mut server = super::recovery_tests::TestRelay::new(false);
+        let controller = Controller::new().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let producer = Uuid::new_v4();
+        let operator = Uuid::new_v4();
+        let id = Uuid::new_v4().to_string();
+        controller
+            .register_label(producer, &id, "Existing source")
+            .unwrap();
+        let mut rejected = super::recovery_tests::TestRelay::new(false);
+        assert_eq!(
+            controller
+                .control_owned(
+                    operator,
+                    Control::Start(Box::new(rejected.relay.take().unwrap()), id.clone())
+                )
+                .err(),
+            Some("source_not_owned")
+        );
+        let relay = server.relay.take().unwrap();
+        let status = if profile {
+            controller
+                .start_profile_publication(
+                    &id,
+                    relay,
+                    "https://example.com/live".into(),
+                    root.path(),
+                )
+                .unwrap()
+                .local
+        } else {
+            // The old CLI path rejects this distinct connection before admission.
+            assert_eq!(
+                controller
+                    .control_owned(operator, Control::Source(id.clone()))
+                    .err(),
+                Some("source_not_owned")
+            );
+            controller
+                .control_publication(Control::Start(Box::new(relay), id.clone()))
+                .unwrap()
+                .local
+        };
+        assert_eq!(status, "running");
+        server.event("start");
+        assert_eq!(
+            controller.state.lock().unwrap().selected_owner,
+            Some(producer)
+        );
+        let mut replacement = super::recovery_tests::TestRelay::new(false);
+        assert_eq!(
+            controller
+                .start_profile_publication(
+                    &id,
+                    replacement.relay.take().unwrap(),
+                    "other-url".into(),
+                    root.path()
+                )
+                .err(),
+            Some("source_unavailable_or_already_started")
+        );
+        assert!(controller.state.lock().unwrap().owned.is_none());
+        assert_eq!(
+            controller.source(operator, &id, false).err(),
+            Some("source_not_owned")
+        );
+        let refresh = controller.source(producer, &id, false).unwrap().refresh;
+        assert!(
+            controller
+                .publish(producer, &id, refresh, frame("scene", 1))
+                .unwrap()
+        );
+        server.event("frame");
+        assert!(!controller.stop_owned(producer, "obsolete-token").unwrap());
+        assert_eq!(
+            controller.control_publication(Control::Stop).unwrap().local,
+            "stopped"
+        );
+        server.event("stop");
+        if profile {
+            assert_eq!(controller.turnkey_status().unwrap().viewer_url, None);
+            let mut replay = super::recovery_tests::TestRelay::new(false);
+            assert_eq!(
+                controller
+                    .start_profile_publication(
+                        &id,
+                        replay.relay.take().unwrap(),
+                        "url".into(),
+                        root.path()
+                    )
+                    .err(),
+                Some("start_identity_superseded")
+            );
+        }
+        controller.shutdown();
+    }
+}
+
+#[test]
+fn operator_profile_start_rejects_missing_and_expired_sources_before_claiming_identity() {
+    for expired in [false, true] {
+        let mut server = super::recovery_tests::TestRelay::new(false);
+        let controller = Controller::new().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let id = Uuid::new_v4().to_string();
+        if expired {
+            controller.source(Uuid::new_v4(), &id, true).unwrap();
+            controller
+                .state
+                .lock()
+                .unwrap()
+                .sources
+                .get_mut(&id)
+                .unwrap()
+                .expires = Instant::now() - Duration::from_secs(1);
+        }
+        let relay = server.relay.take().unwrap();
+        assert_eq!(
+            controller
+                .start_profile_publication(&id, relay, "url".into(), root.path())
+                .err(),
+            Some("source_unavailable_or_already_started")
+        );
+        assert!(!root.path().join("broadcast-starts").exists());
+        controller.shutdown();
+    }
+}
+
+#[test]
 fn publication_controls_work_across_connections_without_transferring_source_ownership() {
     let mut server = super::recovery_tests::TestRelay::new(false);
     let controller = Controller::new().unwrap();

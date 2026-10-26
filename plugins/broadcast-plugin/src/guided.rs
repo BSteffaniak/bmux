@@ -621,7 +621,7 @@ pub(crate) async fn connected(
             if let Some(v) = map.get("--credential-file") {
                 p.credential_file = v.into();
             }
-            let status = control::client::start(
+            let status = control::client::start_publication(
                 client,
                 p.endpoint.clone(),
                 p.channel.clone(),
@@ -646,7 +646,7 @@ pub(crate) async fn connected(
                 viewer_url(&p.endpoint, &p.channel).map_err(failed)?
             );
         } else {
-            let result = turnkey::client::start_profile(
+            let result = turnkey::client::start_profile_publication(
                 client,
                 map.get("--profile").cloned(),
                 id.clone(),
@@ -660,7 +660,7 @@ pub(crate) async fn connected(
             let live = crate::startup_ui::wait(client, &id, context.invocation_source.is_cli())
                 .await
                 .map_err(PluginCommandError::failed)?;
-            // Ownership token is private teardown authority: do not print/log it.
+            // Operator starts do not acquire the producer's scoped cleanup authority.
             emit!(
                 context,
                 "{} / {} source={} {}",

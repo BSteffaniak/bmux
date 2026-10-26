@@ -76,6 +76,20 @@ mod tests {
                 "{operation} must require local proof before mutation"
             );
         }
+        let mut explicit = context.clone();
+        explicit.request.operation = "start-publication".into();
+        explicit.request.payload =
+            bmux_codec::to_typed_vec(&control::client::StartPublicationRequest {
+                endpoint: "https://example.com".into(),
+                channel: "main".into(),
+                credential_file: "/nonexistent/private-file-must-not-be-read".into(),
+                source_id: uuid::Uuid::new_v4().to_string(),
+            })
+            .unwrap();
+        assert_eq!(
+            BroadcastPlugin.invoke_service(explicit).error.unwrap().code,
+            "local_authorization_required"
+        );
         let mut profile = context.clone();
         profile.request.service.interface_id = "broadcast-turnkey-v1".into();
         profile.request.operation = "start-profile".into();
@@ -84,10 +98,17 @@ mod tests {
             source_id: uuid::Uuid::new_v4().to_string(),
         })
         .unwrap();
-        assert_eq!(
-            BroadcastPlugin.invoke_service(profile).error.unwrap().code,
-            "local_authorization_required"
-        );
+        for operation in ["start-profile", "start-profile-publication"] {
+            profile.request.operation = operation.into();
+            assert_eq!(
+                BroadcastPlugin
+                    .invoke_service(profile.clone())
+                    .error
+                    .unwrap()
+                    .code,
+                "local_authorization_required"
+            );
+        }
         let mut register = context;
         register.request.service.interface_id = "broadcast-output-v1".into();
         register.request.operation = "register".into();

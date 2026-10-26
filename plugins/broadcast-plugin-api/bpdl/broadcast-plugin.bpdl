@@ -22,6 +22,9 @@ interface broadcast-turnkey-v1 {
     command sources() -> list<source-descriptor>;
     command status() -> broadcast-status;
     command start-profile(profile: string?, source_id: string) -> publication;
+    // Explicit local operator start of an existing source, without ownership transfer
+    // or an integration cleanup token. Requires local proof; cannot replace a publication.
+    command start-profile-publication(profile: string?, source_id: string) -> broadcast-status;
     // False means superseded/not owned: MUST NOT stop another publication.
     command stop-owned(token: string) -> bool;
 }
@@ -33,6 +36,7 @@ interface broadcast-control-v1 {
     command authorize(local_proof: bytes) -> bool;
     // Explicit runtime-wide operator controls. Require local proof authorization;
     // unlike scoped controls below, these do not require source ownership.
+    command start-publication(endpoint: string, channel: string, credential_file: string, source_id: string) -> status;
     command pause-publication() -> status;
     command resume-publication() -> status;
     command stop-publication() -> status;
