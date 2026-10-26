@@ -303,9 +303,10 @@ impl Decoder {
                             )
                         })
                     });
+                // Require the whole frame: the legacy decoder's unknown-frame
+                // fallback consumes only ESC, but CSI-u can encode a real Escape.
                 if let Some((key, consumed, kind)) = decoded
                     && consumed == end
-                    && key.key != KeyCode::Escape
                 {
                     let packet = if kind == bmux_keyboard::csi_u::KeyEventKind::Press {
                         LinuxInputPacket::Event(Event::Key(key))
@@ -541,6 +542,67 @@ impl RawInput {
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn encoded_escape_survives_fragmentation_and_attach_conversion() {
+        use crossterm::event::{Event as CEvent, KeyCode as CCode, KeyEventKind as Kind};
+        let now = Instant::now();
+        for (sequence, expected) in [
+            (b"\x1b[27u".as_slice(), Kind::Press),
+            (b"\x1b[27;1u".as_slice(), Kind::Press),
+            (b"\x1b[27;1:1u".as_slice(), Kind::Press),
+            (b"\x1b[27;1:2u".as_slice(), Kind::Repeat),
+            (b"\x1b[27;1:3u".as_slice(), Kind::Release),
+        ] {
+            for split in 1..sequence.len() {
+                let mut decoder = Decoder::default();
+                decoder.feed(&sequence[..split], now).unwrap();
+                assert!(decoder.next(now).unwrap().is_none());
+                decoder.feed(&sequence[split..], now).unwrap();
+                let packet = decoder.next(now).unwrap().unwrap();
+                let Some(CEvent::Key(key)) = packet.clone().into_crossterm() else {
+                    panic!("encoded Escape lost at split {split}: {sequence:?}");
+                };
+                assert_eq!(key.code, CCode::Esc);
+                assert_eq!(key.kind, expected);
+                assert!(key.modifiers.is_empty());
+                assert_eq!(
+                    packet.into_event(),
+                    (expected != Kind::Release)
+                        .then_some(Event::Key(KeyStroke::simple(KeyCode::Escape)))
+                );
+                assert!(decoder.next(now).unwrap().is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_csi_frames_remain_opaque_and_do_not_synthesize_escape() {
+        let now = Instant::now();
+        for sequence in [
+            b"\x1b[999z".as_slice(),
+            b"\x1b[?1;2c".as_slice(),
+            b"\x1b[27;1:4u".as_slice(),
+        ] {
+            for split in 1..sequence.len() {
+                let mut decoder = Decoder::default();
+                decoder.feed(&sequence[..split], now).unwrap();
+                assert!(decoder.next(now).unwrap().is_none());
+                decoder.feed(&sequence[split..], now).unwrap();
+                decoder.feed(b"q", now).unwrap();
+                let packet = decoder.next(now).unwrap().unwrap();
+                assert_eq!(packet, LinuxInputPacket::Opaque(sequence.to_vec()));
+                assert!(packet.into_crossterm().is_none());
+                assert_eq!(
+                    decoder.next(now).unwrap(),
+                    Some(LinuxInputPacket::Event(Event::Key(KeyStroke::simple(
+                        KeyCode::Char('q')
+                    ))))
+                );
+                assert!(decoder.next(now).unwrap().is_none());
+            }
+        }
+    }
 
     #[test]
     fn fragmented_key_kinds_survive_attach_and_filter_tui_actions() {
