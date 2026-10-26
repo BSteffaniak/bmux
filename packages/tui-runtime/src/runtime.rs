@@ -268,6 +268,12 @@ pub enum RuntimeError<PE, RE, P, R> {
     },
 }
 
+// Internal exit reason carries no runtime ownership. Finalization remains in `run`.
+enum LoopError<PE, RE> {
+    Program(PE),
+    Presenter(RE),
+}
+
 /// Domain-neutral bounded TUI runtime.
 pub struct Runtime<P: Program, R> {
     program: P,
@@ -408,10 +414,44 @@ where
     pub async fn run(
         mut self,
     ) -> Result<RuntimeOutput<P, R>, RuntimeError<P::Error, R::Error, P, R>> {
+        let result = self.run_loop().await;
+        self.presenter.cancel_present();
+        let restoration = self.presenter.restore().await;
+        self.close().await;
+        let output = RuntimeOutput {
+            program: self.program,
+            presenter: self.presenter,
+            stats: stats_snapshot(&self.stats),
+        };
+        match result {
+            Ok(()) => match restoration {
+                Ok(()) => Ok(output),
+                Err(error) => Err(RuntimeError::Presenter {
+                    error,
+                    cleanup_error: None,
+                    output,
+                }),
+            },
+            Err(LoopError::Program(error)) => Err(RuntimeError::Program {
+                error,
+                cleanup_error: restoration.err(),
+                output,
+            }),
+            Err(LoopError::Presenter(error)) => Err(RuntimeError::Presenter {
+                error,
+                cleanup_error: restoration.err(),
+                output,
+            }),
+        }
+    }
+
+    // Borrow the runtime throughout scheduling. Moving it into cleanup futures at every
+    // exit site duplicates large program/presenter temporaries in the generated poll frame.
+    async fn run_loop(&mut self) -> Result<(), LoopError<P::Error, R::Error>> {
         loop {
             let did_work = match self.process_ready_turn() {
                 Ok(did_work) => did_work,
-                Err(error) => return Err(self.program_error(error).await),
+                Err(error) => return Err(LoopError::Program(error)),
             };
 
             if self.pending_presentation.is_some() {
@@ -428,23 +468,23 @@ where
                     && let Some((started, scheduled)) = self.pending_presentation.take()
                     && let Err(error) = self.complete_presentation(result, started, scheduled)
                 {
-                    return Err(self.presenter_error(error).await);
+                    return Err(LoopError::Presenter(error));
                 }
             }
             if self.exiting && self.pending_presentation.is_some() {
                 self.presenter.cancel_present();
                 self.pending_presentation = None;
                 lock_unpoisoned(&self.control.state).dirty = false;
-                return self.finish().await;
+                return Ok(());
             }
             if self.presentation_due()
                 && let Err(error) = self.present()
             {
-                return Err(self.presenter_error(error).await);
+                return Err(LoopError::Presenter(error));
             }
             let dirty = lock_unpoisoned(&self.control.state).dirty;
             if self.exiting && !dirty {
-                return self.finish().await;
+                return Ok(());
             }
             if did_work {
                 tokio::task::yield_now().await;
@@ -465,35 +505,35 @@ where
                 delivery = std::future::poll_fn(|cx| self.presenter.poll_present(cx, &mut self.program)), if self.pending_presentation.is_some() => {
                     if let Some((started, scheduled)) = self.pending_presentation.take()
                         && let Err(error) = self.complete_presentation(delivery, started, scheduled) {
-                        return Err(self.presenter_error(error).await);
+                        return Err(LoopError::Presenter(error));
                     }
                 }
                 terminal = self.terminal_rx.recv(), if !self.exiting => {
                     if let Some(event) = terminal
                         && let Err(error) = self.apply_admitted(event, QueueSource::TerminalFifo, RuntimeEvent::Terminal)
                     {
-                        return Err(self.program_error(error).await);
+                        return Err(LoopError::Program(error));
                     }
                 }
                 reliable = self.reliable_rx.recv(), if !self.exiting => {
                     if let Some(message) = reliable
                         && let Err(error) = self.apply_admitted(message, QueueSource::ApplicationFifo, RuntimeEvent::Message)
                     {
-                        return Err(self.program_error(error).await);
+                        return Err(LoopError::Program(error));
                     }
                 }
                 completion = self.commands.next_completion(), if !self.exiting && !self.commands.is_empty() => {
                     if let Some(message) = completion.and_then(|completion| completion.message)
                         && let Err(error) = self.apply_event(RuntimeEvent::Message(message))
                     {
-                        return Err(self.program_error(error).await);
+                        return Err(LoopError::Program(error));
                     }
                 }
                 subscription = self.subscription_rx.recv(), if !self.exiting => {
                     if let Some(message) = subscription
                         && let Err(error) = self.apply_admitted(message, QueueSource::Subscription, RuntimeEvent::Message)
                     {
-                        return Err(self.program_error(error).await);
+                        return Err(LoopError::Program(error));
                     }
                 }
                 () = self.subscriptions.next_completion(), if !self.subscriptions.is_empty() => {}
@@ -938,59 +978,6 @@ where
         self.subscription_rx.close();
         self.commands.shutdown().await;
         self.subscriptions.shutdown().await;
-    }
-
-    async fn finish(
-        mut self,
-    ) -> Result<RuntimeOutput<P, R>, RuntimeError<P::Error, R::Error, P, R>> {
-        self.presenter.cancel_present();
-        let restoration = self.presenter.restore().await;
-        self.close().await;
-        let output = RuntimeOutput {
-            program: self.program,
-            presenter: self.presenter,
-            stats: stats_snapshot(&self.stats),
-        };
-        match restoration {
-            Ok(()) => Ok(output),
-            // Restoration itself failed. Do not immediately retry cleanup as
-            // though this were an unrelated presentation failure.
-            Err(error) => Err(RuntimeError::Presenter {
-                error,
-                cleanup_error: None,
-                output,
-            }),
-        }
-    }
-
-    async fn program_error(mut self, error: P::Error) -> RuntimeError<P::Error, R::Error, P, R> {
-        self.presenter.cancel_present();
-        let cleanup_error = self.presenter.restore().await.err();
-        self.close().await;
-        RuntimeError::Program {
-            error,
-            cleanup_error,
-            output: RuntimeOutput {
-                program: self.program,
-                presenter: self.presenter,
-                stats: stats_snapshot(&self.stats),
-            },
-        }
-    }
-
-    async fn presenter_error(mut self, error: R::Error) -> RuntimeError<P::Error, R::Error, P, R> {
-        self.presenter.cancel_present();
-        let cleanup_error = self.presenter.restore().await.err();
-        self.close().await;
-        RuntimeError::Presenter {
-            error,
-            cleanup_error,
-            output: RuntimeOutput {
-                program: self.program,
-                presenter: self.presenter,
-                stats: stats_snapshot(&self.stats),
-            },
-        }
     }
 }
 
@@ -1475,3 +1462,7 @@ mod telemetry_tests {
         assert!(runtime.take_due_timer(deadline).is_none());
     }
 }
+
+#[cfg(test)]
+#[path = "runtime_exit_tests.rs"]
+mod exit_tests;

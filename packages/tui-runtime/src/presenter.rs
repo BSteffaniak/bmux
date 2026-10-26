@@ -178,14 +178,12 @@ impl CancellableOutput for bmux_tui::terminal::LinuxTerminalOutput {
     }
 }
 
-#[cfg(any(feature = "images", test))]
 pub(crate) struct Delivery<O> {
     worker: Option<std::thread::JoinHandle<O>>,
     receiver: tokio::sync::oneshot::Receiver<std::io::Result<()>>,
     cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
-#[cfg(any(feature = "images", test))]
 impl<O: CancellableOutput> Delivery<O> {
     pub(crate) fn start(output: &mut Option<O>, bytes: Vec<u8>) -> std::io::Result<Self> {
         Self::start_with(output, bytes, |job| {
@@ -274,7 +272,6 @@ impl<O: CancellableOutput> Delivery<O> {
     }
 }
 
-#[cfg(any(feature = "images", test))]
 impl<O> Drop for Delivery<O> {
     fn drop(&mut self) {
         self.cancelled
