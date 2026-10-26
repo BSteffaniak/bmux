@@ -31,6 +31,12 @@ interface broadcast-control-v1 {
     record status { local: string, remote: string, source_id: string?, error_code: string? }
     command prepare-local() -> bool;
     command authorize(local_proof: bytes) -> bool;
+    // Explicit runtime-wide operator controls. Require local proof authorization;
+    // unlike scoped controls below, these do not require source ownership.
+    command pause-publication() -> status;
+    command resume-publication() -> status;
+    command stop-publication() -> status;
+    command source-publication(source_id: string) -> status;
     // One process-wide publication. Start/source require caller-owned source IDs;
     // pause/resume/stop require the selected source's authenticated owner.
     // No active-client fallback and no cross-owner publication replacement.

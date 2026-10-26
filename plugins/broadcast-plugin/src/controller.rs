@@ -158,6 +158,17 @@ impl Controller {
             .map_err(|_| "controller_unavailable")?;
         self.control_locked(control, None)
     }
+    /// Explicit publication-wide operator path; service callers must prove local authority.
+    /// Scoped integrations must keep using `control_owned` / `stop_owned`.
+    pub fn control_publication(&self, control: Control) -> Result<Status, &'static str> {
+        if !matches!(
+            control,
+            Control::Pause | Control::Resume | Control::Stop | Control::Source(_)
+        ) {
+            return Err("invalid_publication_control");
+        }
+        self.control(control)
+    }
     pub fn control_owned(&self, owner: Uuid, control: Control) -> Result<Status, &'static str> {
         let _operation = self
             .operation
@@ -226,8 +237,15 @@ impl Controller {
             }
             Control::Stop | Control::Shutdown => {
                 state.local = "stopped";
+                // Explicit stop closes only the selected publication's observers;
+                // unrelated registered sources remain available for later selection.
+                let stop_owner = if matches!(&control, Control::Shutdown) {
+                    None
+                } else {
+                    owner.or(state.selected_owner)
+                };
                 for source in state.sources.values() {
-                    if owner.is_some_and(|owner| owner != source.owner) {
+                    if stop_owner.is_some_and(|owner| owner != source.owner) {
                         continue;
                     }
                     if let Some(stop) = &source.terminal_stop {

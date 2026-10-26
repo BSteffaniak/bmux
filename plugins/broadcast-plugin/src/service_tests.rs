@@ -54,6 +54,28 @@ mod tests {
         };
         let response = BroadcastPlugin.invoke_service(context.clone());
         assert_eq!(response.error.unwrap().code, "local_authorization_required");
+        for operation in [
+            "pause-publication",
+            "resume-publication",
+            "stop-publication",
+            "source-publication",
+        ] {
+            let mut operator = context.clone();
+            operator.request.operation = operation.into();
+            operator.request.payload = if operation == "source-publication" {
+                bmux_codec::to_typed_vec(&control::client::SourcePublicationRequest {
+                    source_id: uuid::Uuid::new_v4().to_string(),
+                })
+                .unwrap()
+            } else {
+                bmux_codec::to_typed_vec(&()).unwrap()
+            };
+            assert_eq!(
+                BroadcastPlugin.invoke_service(operator).error.unwrap().code,
+                "local_authorization_required",
+                "{operation} must require local proof before mutation"
+            );
+        }
         let mut profile = context.clone();
         profile.request.service.interface_id = "broadcast-turnkey-v1".into();
         profile.request.operation = "start-profile".into();

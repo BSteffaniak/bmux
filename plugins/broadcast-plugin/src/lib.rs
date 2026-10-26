@@ -146,6 +146,10 @@ impl RustPlugin for BroadcastPlugin {
             "broadcast-control-v1", "pause" => |_r: (), ctx| { let owner = authenticated(ctx)?; controller()?.control_owned(owner, controller::Control::Pause).map_err(error) },
             "broadcast-control-v1", "resume" => |_r: (), ctx| { let owner = authenticated(ctx)?; controller()?.control_owned(owner, controller::Control::Resume).map_err(error) },
             "broadcast-control-v1", "stop" => |_r: (), ctx| { let owner = authenticated(ctx)?; controller()?.control_owned(owner, controller::Control::Stop).map_err(error) },
+            "broadcast-control-v1", "pause-publication" => |_r: (), ctx| { authenticated(ctx)?; controller()?.control_publication(controller::Control::Pause).map_err(error) },
+            "broadcast-control-v1", "resume-publication" => |_r: (), ctx| { authenticated(ctx)?; controller()?.control_publication(controller::Control::Resume).map_err(error) },
+            "broadcast-control-v1", "stop-publication" => |_r: (), ctx| { authenticated(ctx)?; controller()?.control_publication(controller::Control::Stop).map_err(error) },
+            "broadcast-control-v1", "source-publication" => |r: control::client::SourcePublicationRequest, ctx| { authenticated(ctx)?; controller()?.control_publication(controller::Control::Source(r.source_id)).map_err(error) },
             "broadcast-control-v1", "status" => |_r: (), ctx| { authenticated(ctx)?; controller()?.status().map_err(error) },
             "broadcast-control-v1", "terminal" => |r: control::client::TerminalRequest, ctx| {
                 let owner = authenticated(ctx)?;
@@ -214,16 +218,16 @@ fn run_command(mut context: NativeCommandContext) -> Result<i32, PluginCommandEr
         let args = &context.arguments;
         let result = match args.first().map(String::as_str) {
             Some("start") if args.len() == 5 => control::client::start(&mut client, args[1].clone(), args[2].clone(), args[3].clone(), args[4].clone()).await,
-            Some("pause") if args.len() == 1 => control::client::pause(&mut client).await,
-            Some("resume") if args.len() == 1 => control::client::resume(&mut client).await,
-            Some("stop") if args.len() == 1 => control::client::stop(&mut client).await,
+            Some("pause") if args.len() == 1 => control::client::pause_publication(&mut client).await,
+            Some("resume") if args.len() == 1 => control::client::resume_publication(&mut client).await,
+            Some("stop") if args.len() == 1 => control::client::stop_publication(&mut client).await,
             Some("status") if args.len() == 1 => control::client::status(&mut client).await,
             Some("terminal") if args.len() == 8 => {
                 let cols = args[6].parse().map_err(|_| PluginCommandError::failed("invalid columns"))?;
                 let rows = args[7].parse().map_err(|_| PluginCommandError::failed("invalid rows"))?;
                 control::client::terminal(&mut client, args[1].clone(), args[2].clone(), args[3].clone(), args[4].clone(), args[5].clone(), cols, rows).await
             },
-            Some("source") if args.len() == 2 => control::client::source(&mut client, args[1].clone()).await,
+            Some("source") if args.len() == 2 => control::client::source_publication(&mut client, args[1].clone()).await,
             _ => return Err(PluginCommandError::failed("usage: broadcast start ENDPOINT CHANNEL CREDENTIAL_FILE SOURCE_UUID | pause | resume | stop | status | source SOURCE_UUID | terminal SOURCE_UUID SESSION_UUID ABSOLUTE_EXECUTABLE SHA256 VERSION COLS ROWS")),
         };
         let status = result.map_err(|_| PluginCommandError::failed("broadcast operation rejected"))?;

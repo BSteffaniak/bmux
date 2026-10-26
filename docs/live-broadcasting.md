@@ -9,7 +9,10 @@ type, navigate, resize the source, or access private controller state. See the
 ## Native control interface
 
 The broadcast plugin is server-owned. Separate invocations address the same
-controller:
+controller. Pause, resume, stop, and explicit source switching are runtime-wide
+operator actions authorized by the selected runtime's private local proof, not
+by the short-lived CLI connection owning the source. Integrations retain
+owner-scoped controls and token-fenced `stop-owned` cleanup:
 
 ```sh
 bmux broadcast start https://live.bmux.dev main /PRIVATE/PATH/publisher-key SOURCE_UUID

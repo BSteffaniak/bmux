@@ -297,6 +297,74 @@ fn lease_expiry_and_unregister_never_revive_old_authority() {
 }
 
 #[test]
+fn publication_controls_work_across_connections_without_transferring_source_ownership() {
+    let mut server = super::recovery_tests::TestRelay::new(false);
+    let controller = Controller::new().unwrap();
+    let owner = Uuid::new_v4();
+    let other = Uuid::new_v4();
+    let first = Uuid::new_v4().to_string();
+    let second = Uuid::new_v4().to_string();
+    controller.source(owner, &first, true).unwrap();
+    controller.source(other, &second, true).unwrap();
+    assert_eq!(
+        controller
+            .control_owned(
+                owner,
+                Control::Start(Box::new(server.relay.take().unwrap()), first.clone())
+            )
+            .unwrap()
+            .local,
+        "running"
+    );
+    server.event("start");
+    let (first_stop, first_stopped) = tokio::sync::watch::channel(false);
+    let (second_stop, second_stopped) = tokio::sync::watch::channel(false);
+    {
+        let mut state = controller.state.lock().unwrap();
+        state.selected = Some(first.clone());
+        state.selected_owner = Some(owner);
+        state.local = "running";
+        state.sources.get_mut(&first).unwrap().terminal_stop = Some(first_stop);
+        state.sources.get_mut(&second).unwrap().terminal_stop = Some(second_stop);
+    }
+    assert_eq!(
+        controller
+            .control_publication(Control::Pause)
+            .unwrap()
+            .local,
+        "paused"
+    );
+    assert_eq!(
+        controller
+            .control_publication(Control::Resume)
+            .unwrap()
+            .local,
+        "running"
+    );
+    let status = controller
+        .control_publication(Control::Source(second.clone()))
+        .unwrap();
+    assert_eq!(status.source_id.as_deref(), Some(second.as_str()));
+    assert_eq!(controller.state.lock().unwrap().selected_owner, Some(other));
+    assert_eq!(
+        controller.source(owner, &second, false).err(),
+        Some("source_not_owned")
+    );
+    assert_eq!(
+        controller.control_owned(owner, Control::Stop).err(),
+        Some("source_not_owned")
+    );
+    assert_eq!(
+        controller.control_publication(Control::Stop).unwrap().local,
+        "stopped"
+    );
+    assert!(*second_stopped.borrow());
+    assert!(!*first_stopped.borrow());
+    controller.shutdown();
+    assert!(*first_stopped.borrow());
+}
+
+#[test]
 fn scoped_controls_cannot_select_or_stop_another_owners_view() {
     let controller = Controller::new().unwrap();
     let owner = Uuid::new_v4();
