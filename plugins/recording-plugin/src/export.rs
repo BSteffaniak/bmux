@@ -1207,7 +1207,9 @@ fn export_recording_gif(
 ) -> Result<()> {
     let mut profiler = ExportProfiler::new();
     let speed = if speed <= 0.0 { 1.0 } else { speed };
-    let fps = fps.max(1);
+    // Delays below 20ms are clamped by common GIF viewers. Sample less,
+    // never stretch the recording to accommodate unrepresentable updates.
+    let fps = fps.clamp(1, 50);
     let frame_interval_ns = (1_000_000_000_f64 / f64::from(fps)) as u64;
     let estimate = estimate_export_progress(events, speed, fps, max_duration, max_frames);
     let mut progress = ExportProgress::new(show_progress, estimate);
@@ -1422,8 +1424,8 @@ fn export_recording_gif(
     let mut current_rows = max_rows;
     let mut emitted_frames = 0_u32;
     let mut processed_frame_events = 0_u32;
-    let mut previous_emit_ns = None::<u64>;
-    let mut gif_delay_clock = GifDelayClock::default();
+    let mut pending_frame = None::<(GifFrame<'static>, u64)>;
+    let mut previous_pixels = Vec::new();
     let mut cursor_state = CursorReplayState::default();
     let mut snapshot_cursor_state = None::<RecordedCursorSnapshot>;
     let mut cursor_frames = export_metadata.map(|_| Vec::<ExportCursorFrame>::new());
@@ -1434,78 +1436,53 @@ fn export_recording_gif(
     let mut warned_cursor_snapshot_fallback = false;
     let mut previous_visual_state = None::<FrameVisualState>;
     let start_mono_ns = events.iter().map(|event| event.mono_ns).min().unwrap_or(0);
-    let frame_cutoff_ns = max_frames.map(|limit| {
-        if limit == 0 {
-            0_u64
-        } else {
-            u64::from(limit.saturating_sub(1)).saturating_mul(frame_interval_ns)
-        }
+    let mut end_scaled_ns = events.last().map_or(0, |event| {
+        ((event.mono_ns.saturating_sub(start_mono_ns) as f64) / speed) as u64
     });
-    let mut considered_event_count = 0_usize;
-    let mut end_scaled_ns = 0_u64;
-    for event in events {
-        let rel_mono_ns = event.mono_ns.saturating_sub(start_mono_ns);
-        if let Some(limit_secs) = max_duration
-            && rel_mono_ns / 1_000_000_000 > limit_secs
-        {
-            break;
-        }
-        let scaled_ns = ((rel_mono_ns as f64) / speed) as u64;
-        if let Some(cutoff) = frame_cutoff_ns
-            && scaled_ns > cutoff
-        {
-            break;
-        }
-        considered_event_count = considered_event_count.saturating_add(1);
-        end_scaled_ns = scaled_ns;
+    if let Some(seconds) = max_duration {
+        end_scaled_ns = end_scaled_ns.min(((seconds as f64 * 1_000_000_000.0) / speed) as u64);
     }
+    if let Some(frames) = max_frames {
+        end_scaled_ns = end_scaled_ns.min(u64::from(frames).saturating_mul(frame_interval_ns));
+    }
+    let considered_event_count = events
+        .iter()
+        .take_while(|event| {
+            ((event.mono_ns.saturating_sub(start_mono_ns) as f64) / speed) as u64 <= end_scaled_ns
+        })
+        .count();
 
-    let max_timeline_frames = if considered_event_count == 0 {
+    let max_timeline_frames = if considered_event_count == 0 || max_frames == Some(0) {
         0_u32
     } else {
         let base = end_scaled_ns
+            .saturating_sub(20_000_000)
             .saturating_div(frame_interval_ns.max(1))
             .saturating_add(1);
         base.min(u64::from(u32::MAX)) as u32
     };
-    // Preserve short-lived source states before a later frame/resize replaces
-    // them. Merge event boundaries with regular blink samples without a frame
-    // queue or a second replay model. Explicit limits still truncate the export.
-    let regular =
-        (0..max_timeline_frames).map(|index| u64::from(index).saturating_mul(frame_interval_ns));
-    let boundaries = events[..considered_event_count]
-        .iter()
-        .filter(|event| {
-            matches!(
-                event.event,
-                DisplayTrackEvent::FrameBytes { .. }
-                    | DisplayTrackEvent::Resize { .. }
-                    | DisplayTrackEvent::ImageUpdate { .. }
-                    | DisplayTrackEvent::StreamClosed
-            )
-        })
-        .map(|event| ((event.mono_ns.saturating_sub(start_mono_ns) as f64) / speed) as u64);
-    let mut regular = regular.peekable();
-    let mut boundaries = boundaries.peekable();
-    let mut last_sample = None;
+    // Replay every source event, but render only on the presentation clock.
+    // Event density must never add playback time. The final sample includes
+    // the terminal tail, whose sub-frame timing GIF cannot represent exactly.
     let mut event_index = 0_usize;
-    let mut considered_samples = 0_u32;
-    loop {
-        let frame_time_ns = match (regular.peek(), boundaries.peek()) {
-            (Some(a), Some(b)) if a <= b => regular.next().expect("peeked sample"),
-            (_, Some(_)) => boundaries.next().expect("peeked boundary"),
-            (Some(_), None) => regular.next().expect("peeked sample"),
-            (None, None) => break,
+    for index in 0..max_timeline_frames {
+        let regular_time_ns = u64::from(index).saturating_mul(frame_interval_ns);
+        let frame_time_ns = if index > 0 && index + 1 == max_timeline_frames {
+            // Reserve a viewer-safe final hold without advancing the final
+            // source state by more than 20ms (one effective sample interval).
+            end_scaled_ns.saturating_sub(20_000_000)
+        } else {
+            regular_time_ns
         };
-        if last_sample == Some(frame_time_ns) {
-            continue;
-        }
-        last_sample = Some(frame_time_ns);
-        if max_frames.is_some_and(|limit| considered_samples >= limit) {
+        let apply_until_ns = if index + 1 == max_timeline_frames {
+            end_scaled_ns
+        } else {
+            frame_time_ns
+        };
+        if max_frames.is_some_and(|limit| index >= limit) {
             break;
         }
-        anyhow::ensure!(considered_samples < 1_000_000, "GIF sample limit exceeded");
-        considered_samples += 1;
+        anyhow::ensure!(index < 1_000_000, "GIF sample limit exceeded");
         profiler.record_frame_considered();
         let apply_started_at = profiler.stage_started();
         let mut frame_had_display_change = false;
@@ -1513,7 +1490,7 @@ fn export_recording_gif(
             let event = &events[event_index];
             let rel_mono_ns = event.mono_ns.saturating_sub(start_mono_ns);
             let scaled_ns = ((rel_mono_ns as f64) / speed) as u64;
-            if scaled_ns > frame_time_ns {
+            if scaled_ns > apply_until_ns {
                 break;
             }
             match &event.event {
@@ -1565,11 +1542,6 @@ fn export_recording_gif(
         }
         profiler.record_apply_events(apply_started_at);
 
-        if processed_frame_events == 0 {
-            progress.update(processed_frame_events, emitted_frames, false);
-            continue;
-        }
-
         let (snapshot, cursor_source) = snapshot_cursor_state.map_or_else(
             || {
                 if !warned_cursor_snapshot_fallback {
@@ -1615,10 +1587,6 @@ fn export_recording_gif(
             continue;
         }
 
-        let elapsed_ns = previous_emit_ns.map_or(frame_interval_ns, |previous| {
-            frame_time_ns.saturating_sub(previous)
-        });
-        let delay_cs = gif_delay_clock.delay_for_nanoseconds(elapsed_ns);
         let render_started_at = profiler.stage_started();
         let mut pixels = if render_options.mode == RecordingRenderMode::Font {
             if let Some(renderer) = resvg_renderer.as_mut() {
@@ -1760,24 +1728,48 @@ fn export_recording_gif(
         }
         profiler.record_render(render_started_at);
         let encode_started_at = profiler.stage_started();
+        if previous_pixels == pixels {
+            // Rendering can be unchanged even when raw source bytes changed.
+            if let Some(frames) = cursor_frames.as_mut() {
+                frames.pop();
+            }
+            previous_visual_state = Some(visual_state);
+            profiler.record_frame_skipped();
+            continue;
+        }
+        previous_pixels.clone_from(&pixels);
         let mut frame =
             GifFrame::from_rgba_speed(width, height, &mut pixels, GIF_QUANTIZATION_SAMPLE_FACTOR);
-        frame.delay = delay_cs;
-        encoder
-            .write_frame(&frame)
-            .context("failed writing gif frame")?;
+        let start_cs = gif_centiseconds(frame_time_ns);
+        if let Some((mut previous, previous_cs)) = pending_frame.take() {
+            write_gif_hold(
+                &mut encoder,
+                &mut previous,
+                start_cs.saturating_sub(previous_cs),
+            )?;
+        }
+        frame.delay = 0;
+        pending_frame = Some((frame, start_cs));
         profiler.record_encode(encode_started_at);
         previous_visual_state = Some(visual_state);
-        previous_emit_ns = Some(frame_time_ns);
         emitted_frames = emitted_frames.saturating_add(1);
         profiler.record_frame_emitted();
         progress.update(processed_frame_events, emitted_frames, false);
     }
 
+    if let Some((mut frame, start_cs)) = pending_frame {
+        write_gif_hold(
+            &mut encoder,
+            &mut frame,
+            gif_centiseconds(end_scaled_ns)
+                .saturating_sub(start_cs)
+                .max(2),
+        )?;
+    }
     progress.finish(processed_frame_events, emitted_frames);
     profiler.finish(processed_frame_events, emitted_frames);
 
-    if emitted_frames == 0 {
+    if emitted_frames == 0 || processed_frame_events == 0 {
         anyhow::bail!("no drawable frame events found in display track")
     }
     if let Some(path) = export_metadata {
@@ -1867,24 +1859,30 @@ struct FrameVisualState {
     blink_on: bool,
 }
 
-/// Carries sub-centisecond rounding across variable event-boundary samples.
-#[derive(Debug, Default)]
-struct GifDelayClock {
-    remainder_ns: u64,
+/// Round absolute boundaries, not individual delays, so rounding cannot drift.
+fn gif_centiseconds(nanoseconds: u64) -> u64 {
+    nanoseconds.saturating_add(5_000_000) / 10_000_000
 }
 
-impl GifDelayClock {
-    fn delay_for_nanoseconds(&mut self, elapsed: u64) -> u16 {
-        let total = elapsed.saturating_add(self.remainder_ns);
-        let delay = total / 10_000_000;
-        self.remainder_ns = total % 10_000_000;
-        if delay == 0 {
-            // GIF cannot express a shorter visible frame; do not carry the same
-            // fractional interval again after granting its minimum delay.
-            self.remainder_ns = 0;
+/// Split long holds rather than silently truncating their duration. Avoid a
+/// one-centisecond remainder, which common viewers would play as 100ms.
+fn write_gif_hold(
+    encoder: &mut GifEncoder<impl Write>,
+    frame: &mut GifFrame<'_>,
+    mut centiseconds: u64,
+) -> Result<()> {
+    while centiseconds > 0 {
+        let mut delay = centiseconds.min(u64::from(u16::MAX));
+        if centiseconds - delay == 1 {
+            delay -= 1;
         }
-        u16::try_from(delay.max(1).min(u64::from(u16::MAX))).unwrap_or(u16::MAX)
+        frame.delay = u16::try_from(delay).expect("bounded GIF delay");
+        encoder
+            .write_frame(frame)
+            .context("failed writing gif frame")?;
+        centiseconds -= delay;
     }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -2005,52 +2003,31 @@ fn estimate_export_progress(
     max_frames: Option<u32>,
 ) -> ExportProgressEstimate {
     let speed = if speed <= 0.0 { 1.0 } else { speed };
-    let frame_interval_ns = (1_000_000_000_f64 / f64::from(fps.max(1))) as u64;
-    let mut total_frame_events = 0_u32;
-    let mut considered_event_count = 0_u32;
-    let start_mono_ns = events.iter().map(|event| event.mono_ns).min().unwrap_or(0);
-    let frame_cutoff_ns = max_frames.map(|limit| {
-        if limit == 0 {
-            0_u64
-        } else {
-            u64::from(limit.saturating_sub(1)).saturating_mul(frame_interval_ns)
-        }
+    let frame_interval_ns = 1_000_000_000 / u64::from(fps.clamp(1, 50));
+    let start_mono_ns = events.first().map_or(0, |event| event.mono_ns);
+    let mut end_scaled_ns = events.last().map_or(0, |event| {
+        ((event.mono_ns.saturating_sub(start_mono_ns) as f64) / speed) as u64
     });
-    let mut end_scaled_ns = 0_u64;
-
-    for event in events {
-        let rel_mono_ns = event.mono_ns.saturating_sub(start_mono_ns);
-        if let Some(limit_secs) = max_duration
-            && rel_mono_ns / 1_000_000_000 > limit_secs
-        {
-            break;
-        }
-        let scaled_ns = ((rel_mono_ns as f64) / speed) as u64;
-        if let Some(cutoff) = frame_cutoff_ns
-            && scaled_ns > cutoff
-        {
-            break;
-        }
-        considered_event_count = considered_event_count.saturating_add(1);
-        end_scaled_ns = scaled_ns;
-        if let DisplayTrackEvent::FrameBytes { .. } = event.event {
-            total_frame_events = total_frame_events.saturating_add(1);
-        }
+    if let Some(seconds) = max_duration {
+        end_scaled_ns = end_scaled_ns.min(((seconds as f64 * 1_000_000_000.0) / speed) as u64);
     }
-
-    let base_emitted_frames = if considered_event_count == 0 || total_frame_events == 0 {
-        0_u32
+    if let Some(frames) = max_frames {
+        end_scaled_ns = end_scaled_ns.min(u64::from(frames).saturating_mul(frame_interval_ns));
+    }
+    let total_frame_events = events
+        .iter()
+        .take_while(|event| {
+            ((event.mono_ns.saturating_sub(start_mono_ns) as f64) / speed) as u64 <= end_scaled_ns
+        })
+        .filter(|event| matches!(event.event, DisplayTrackEvent::FrameBytes { .. }))
+        .count()
+        .min(u32::MAX as usize) as u32;
+    let base = if total_frame_events == 0 || max_frames == Some(0) {
+        0
     } else {
-        end_scaled_ns
-            .saturating_div(frame_interval_ns.max(1))
-            .saturating_add(1)
-            .saturating_add(u64::from(
-                !end_scaled_ns.is_multiple_of(frame_interval_ns.max(1)),
-            ))
-            .min(u64::from(u32::MAX)) as u32
+        end_scaled_ns.saturating_sub(20_000_000) / frame_interval_ns + 1
     };
-    let estimated_emitted_frames =
-        max_frames.map_or(base_emitted_frames, |limit| limit.min(base_emitted_frames));
+    let estimated_emitted_frames = base.min(u64::from(u32::MAX)) as u32;
 
     ExportProgressEstimate {
         total_frame_events,
@@ -3804,17 +3781,162 @@ mod tests {
         ]
     }
 
-    #[test]
-    fn gif_variable_sample_clock_carries_fractional_centiseconds() {
-        let mut clock = GifDelayClock::default();
-        let total: u32 = (0..30)
-            .map(|_| u32::from(clock.delay_for_nanoseconds(33_333_333)))
-            .sum();
-        assert_eq!(total, 99);
+    fn timed_gif(events: &[DisplayTrackEnvelope], fps: u32, speed: f64) -> Vec<(u16, Vec<u8>)> {
+        let directory = std::env::temp_dir().join(format!("bmux-gif-timing-{}", Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(
+            directory.join("manifest.json"),
+            format!(r#"{{"summary":{{"format_version":{RECORDING_FORMAT_VERSION}}}}}"#),
+        )
+        .unwrap();
+        let mut bytes = Vec::new();
+        for event in events {
+            bmux_recording_protocol::write_frame(&mut bytes, event).unwrap();
+        }
+        std::fs::write(display_track_path(&directory, Uuid::nil()), bytes).unwrap();
+        let output = directory.join("out.gif");
+        export_recording_for_recording_dir(
+            &directory,
+            Uuid::nil(),
+            RecordingExportFormat::Gif,
+            output.to_str().unwrap(),
+            None,
+            speed,
+            fps,
+            None,
+            None,
+            RecordingRenderMode::Font,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            RecordingPaletteSource::Auto,
+            None,
+            None,
+            &[],
+            RecordingCursorMode::Off,
+            RecordingCursorShape::Auto,
+            RecordingCursorBlinkMode::Auto,
+            500,
+            "auto",
+            RecordingCursorProfile::Auto,
+            None,
+            None,
+            None,
+            None,
+            RecordingCursorPaintMode::Auto,
+            RecordingCursorTextMode::Auto,
+            10,
+            8,
+            None,
+            false,
+        )
+        .unwrap();
+        let mut options = gif::DecodeOptions::new();
+        options.set_color_output(gif::ColorOutput::RGBA);
+        let mut decoder = options
+            .read_info(std::fs::File::open(output).unwrap())
+            .unwrap();
+        let mut frames = Vec::new();
+        while let Some(frame) = decoder.read_next_frame().unwrap() {
+            frames.push((frame.delay, frame.buffer.to_vec()));
+        }
+        drop(decoder);
+        std::fs::remove_dir_all(directory).unwrap();
+        frames
     }
 
     #[test]
-    fn gif_preserves_colored_frame_replaced_between_regular_samples() {
+    fn gif_burst_density_and_fps_do_not_change_duration() {
+        let mut events = boundary_track(500_000_000, 1_000_000_000);
+        for index in 1..500_u64 {
+            events.push(DisplayTrackEnvelope {
+                mono_ns: index * 1_000_000,
+                event: DisplayTrackEvent::FrameBytes {
+                    data: b"\x1b[44m\x1b[2J".to_vec(),
+                },
+            });
+        }
+        events.sort_by_key(|event| event.mono_ns);
+        for fps in [10, 24, 30, 50, 120] {
+            for (speed, expected_duration) in [(0.5, 200), (1.0, 100), (2.0, 50)] {
+                let frames = timed_gif(&events, fps, speed);
+                let total: u64 = frames.iter().map(|(delay, _)| u64::from(*delay)).sum();
+                assert_eq!(total, expected_duration);
+                assert!(frames.iter().all(|(delay, _)| *delay >= 2));
+                assert_eq!(frames.len(), 2, "identical redraws must be merged");
+                let red_start = u64::from(frames[0].0);
+                let expected = total / 2;
+                assert!(
+                    red_start.abs_diff(expected) <= 11,
+                    "transition displaced: fps={fps} speed={speed}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn gif_initial_and_trailing_pauses_remain_on_the_source_clock() {
+        let events = vec![
+            DisplayTrackEnvelope {
+                mono_ns: 0,
+                event: DisplayTrackEvent::Resize { cols: 2, rows: 1 },
+            },
+            DisplayTrackEnvelope {
+                mono_ns: 500_000_000,
+                event: DisplayTrackEvent::FrameBytes {
+                    data: b"\x1b[?25l\x1b[41m\x1b[2J".to_vec(),
+                },
+            },
+            DisplayTrackEnvelope {
+                mono_ns: 2_000_000_000,
+                event: DisplayTrackEvent::StreamClosed,
+            },
+        ];
+        let frames = timed_gif(&events, 10, 1.0);
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].0, 50, "initial blank hold");
+        assert_eq!(frames[1].0, 150, "trailing pause");
+        assert!(
+            frames[1]
+                .1
+                .chunks_exact(4)
+                .any(|pixel| pixel[0] > 80 && u16::from(pixel[0]) > u16::from(pixel[1]) * 2)
+        );
+    }
+
+    #[test]
+    fn gif_hold_preserves_long_pauses_without_overflow_or_one_cs_frames() {
+        let mut bytes = Vec::new();
+        {
+            let mut encoder = GifEncoder::new(&mut bytes, 1, 1, &[]).unwrap();
+            let mut pixel = [0, 0, 0, 255];
+            let mut frame = GifFrame::from_rgba_speed(1, 1, &mut pixel, 1);
+            write_gif_hold(&mut encoder, &mut frame, 65_536).unwrap();
+        }
+        let mut decoder = gif::DecodeOptions::new()
+            .read_info(bytes.as_slice())
+            .unwrap();
+        let mut total = 0;
+        while let Some(frame) = decoder.read_next_frame().unwrap() {
+            assert!(frame.delay >= 2);
+            total += u64::from(frame.delay);
+        }
+        assert_eq!(total, 65_536);
+    }
+
+    #[test]
+    fn gif_absolute_clock_does_not_accumulate_rounding() {
+        assert_eq!(gif_centiseconds(999_999_990), 100);
+        assert_eq!(gif_centiseconds(0), 0);
+        assert_eq!(gif_centiseconds(41_666_666), 4);
+    }
+
+    #[test]
+    fn gif_coalesces_transient_updates_without_extending_playback() {
         let directory = std::env::temp_dir().join(format!("bmux-gif-transient-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&directory).unwrap();
         let events = vec![
@@ -3869,16 +3991,17 @@ mod tests {
             .read_info(std::fs::File::open(output).unwrap())
             .unwrap();
         let (mut red, mut green) = (false, false);
+        let mut duration_cs = 0_u64;
         while let Some(frame) = decoder.read_next_frame().unwrap() {
+            duration_cs += u64::from(frame.delay);
             for pixel in frame.buffer.chunks_exact(4).filter(|pixel| pixel[3] != 0) {
                 red |= pixel[0] > 80 && u16::from(pixel[0]) > u16::from(pixel[1]) * 2;
                 green |= pixel[1] > 80 && u16::from(pixel[1]) > u16::from(pixel[0]) * 2;
             }
         }
-        assert!(
-            red && green,
-            "transient source color must survive GIF sampling"
-        );
+        assert!(red);
+        assert!(!green, "sub-frame transient is coalesced, not stretched");
+        assert_eq!(duration_cs, 33, "duration follows the source timeline");
         drop(decoder);
         std::fs::remove_dir_all(directory).unwrap();
     }

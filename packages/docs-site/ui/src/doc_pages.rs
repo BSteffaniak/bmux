@@ -79,6 +79,13 @@ pub static DOC_PAGES: &[DocPage] = &[
     },
     // Reference
     docs_markdown_page! {
+        source: "docs/bterm-managed-storage.md",
+        route: "/docs/bterm-managed-storage",
+        title: "Managed Companion Storage",
+        section: REFERENCE,
+        nav_label: "Managed Storage",
+    },
+    docs_markdown_page! {
         source: "docs/concepts.md",
         route: "/docs/concepts",
         title: "Concepts",

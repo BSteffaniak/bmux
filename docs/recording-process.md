@@ -1,5 +1,14 @@
 # Recorded processes
 
+GIF exports replay the recorded display timeline at 1× speed by default. FPS
+controls sampling smoothness, not playback speed. Updates between samples are
+applied in order and combined; initial and trailing pauses remain intact.
+GIF delays have 10 ms precision, and BMUX caps sampling at 50 FPS to avoid
+short-delay clamping in common viewers. Very brief final states may appear up
+to one sampling interval early; recordings shorter than 20 ms use a 20 ms hold.
+Existing recordings can be re-exported with the corrected timing; canonical
+recording data is unchanged.
+
 ## Record an interactive program
 
 Run a program normally in an undecorated terminal, then finalize its recording
