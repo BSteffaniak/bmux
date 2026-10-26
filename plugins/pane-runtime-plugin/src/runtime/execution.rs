@@ -31,6 +31,9 @@ pub(super) struct ExecutionCapture {
     pub(super) group_kill_issued: AtomicBool,
     pub(super) target_stop_issued: AtomicBool,
     pub(super) cleanup_failed: AtomicBool,
+    // Cleanup has its own authority: an earlier reader/process error in outcome
+    // must not hide the reason resource release failed.
+    cleanup_error: Mutex<Option<String>>,
     pub(super) managed_program: AtomicBool,
     pub(super) terminal_session_ended: AtomicBool,
     pub(super) terminal_owner_retired: AtomicBool,
@@ -64,6 +67,7 @@ impl Default for ExecutionCapture {
             group_kill_issued: AtomicBool::new(false),
             target_stop_issued: AtomicBool::new(false),
             cleanup_failed: AtomicBool::new(false),
+            cleanup_error: Mutex::new(None),
             managed_program: AtomicBool::new(false),
             terminal_session_ended: AtomicBool::new(false),
             terminal_owner_retired: AtomicBool::new(false),
@@ -351,8 +355,27 @@ impl ExecutionCapture {
         self.notify();
     }
     pub(super) fn record_cleanup_error(&self, error: String) {
+        if let Ok(mut first) = self.cleanup_error.lock()
+            && first.is_none()
+        {
+            tracing::warn!(%error, "execution cleanup failed");
+            *first = Some(error.clone());
+        }
         self.cleanup_failed.store(true, Ordering::SeqCst);
         self.record_error(error);
+    }
+
+    pub(super) fn cleanup_error(&self) -> Option<String> {
+        if !self.cleanup_failed.load(Ordering::SeqCst) {
+            return None;
+        }
+        Some(
+            self.cleanup_error
+                .lock()
+                .ok()
+                .and_then(|error| error.clone())
+                .unwrap_or_else(|| "cleanup error detail unavailable".into()),
+        )
     }
 
     pub(super) fn record_error(&self, error: String) {
@@ -1651,9 +1674,12 @@ mod tests {
         capture.notify();
         changes.changed().await.unwrap();
         assert!(capture.outcome.lock().unwrap().0.is_none());
+        assert!(capture.cleanup_error().is_none());
         capture.record_cleanup_error("cleanup failed".into());
+        capture.record_cleanup_error("later cleanup failure".into());
         changes.changed().await.unwrap();
         assert!(capture.cleanup_failed.load(super::Ordering::SeqCst));
+        assert_eq!(capture.cleanup_error().as_deref(), Some("cleanup failed"));
         assert_eq!(
             capture.outcome.lock().unwrap().2.as_deref(),
             Some("reader failed")

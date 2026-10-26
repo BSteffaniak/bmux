@@ -428,6 +428,46 @@ async fn shutdown_panes_result(panes: Vec<PaneRuntimeHandle>) -> std::result::Re
     shutdown_panes_owned(panes, false).await
 }
 
+fn pane_cleanup_failure_summary(
+    failures: impl IntoIterator<Item = (Uuid, String)>,
+) -> Option<String> {
+    let mut causes = BTreeMap::<String, (usize, Vec<Uuid>)>::new();
+    let mut total = 0;
+    for (id, error) in failures {
+        total += 1;
+        let (count, examples) = causes.entry(error).or_default();
+        *count += 1;
+        if examples.len() < 3 {
+            examples.push(id);
+        }
+    }
+    if total == 0 {
+        return None;
+    }
+    let mut details = causes
+        .iter()
+        .take(8)
+        .map(|(cause, (count, examples))| {
+            let ids = examples
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("{count} pane(s) [{ids}]: {cause}")
+        })
+        .collect::<Vec<_>>();
+    if causes.len() > 8 {
+        details.push(format!(
+            "{} additional causes; see server logs",
+            causes.len() - 8
+        ));
+    }
+    Some(format!(
+        "cleanup failed for {total} pane(s): {}",
+        details.join("; ")
+    ))
+}
+
 async fn await_pane_cleanup(
     panes: &mut [PaneRuntimeHandle],
     id: Uuid,
@@ -435,6 +475,7 @@ async fn await_pane_cleanup(
     settled: &mut Option<oneshot::Sender<std::result::Result<(), String>>>,
     errors: &mut Vec<String>,
 ) {
+    let prior_errors = errors.clone();
     // Cleanup acknowledgement can fail before the task exits: the task
     // still owns late OS reapers. Observe both independently, returning
     // failure promptly without dropping or aborting that owner.
@@ -514,13 +555,16 @@ async fn await_pane_cleanup(
                 std::task::Poll::Pending => {}
             }
         }
-        if errors.is_empty()
-            && panes
-                .iter()
-                .any(|pane| pane.execution.cleanup_failed.load(Ordering::SeqCst))
-        {
-            errors.push("pane resource cleanup failed; recovery required".into());
-        }
+        // Rebuild from retained execution failures, rather than appending the
+        // same receipt on every poll. Include identity once per failed pane.
+        errors.clone_from(&prior_errors);
+        errors.extend(pane_cleanup_failure_summary(panes.iter().filter_map(
+            |pane| {
+                pane.execution
+                    .cleanup_error()
+                    .map(|error| (pane.meta.id, error))
+            },
+        )));
         if !errors.is_empty()
             && !wait_for_settlement
             && let Some(settled) = settled.take()
@@ -7865,8 +7909,8 @@ impl SessionRuntimeManager {
             let cleanup_result = cleanup_result.and_then(|()| {
                 if let Some(error) = execution_for_task.capture_failure() {
                     Err(format!("capture cleanup incomplete: {error}"))
-                } else if execution_for_task.cleanup_failed.load(Ordering::SeqCst) {
-                    Err("execution group cleanup failed; recovery required".into())
+                } else if let Some(error) = execution_for_task.cleanup_error() {
+                    Err(error)
                 } else {
                     Ok(())
                 }
@@ -16228,6 +16272,42 @@ exit 7"#
             std::fs::canonicalize(observed).unwrap(),
             std::env::current_dir().unwrap().canonicalize().unwrap()
         );
+    }
+
+    #[test]
+    fn cleanup_summary_groups_causes_and_bounds_examples() {
+        assert!(pane_cleanup_failure_summary([]).is_none());
+        let summary = pane_cleanup_failure_summary((0..64).map(|_| {
+            (
+                Uuid::new_v4(),
+                "group stop failed: supervisor disconnected".into(),
+            )
+        }))
+        .unwrap();
+        assert!(summary.contains("cleanup failed for 64 pane(s)"));
+        assert_eq!(summary.matches("supervisor disconnected").count(), 1);
+        assert_eq!(summary.matches(',').count(), 2);
+        assert!(summary.len() < 300);
+
+        let summary = pane_cleanup_failure_summary(
+            (0..20).map(|index| (Uuid::nil(), format!("failure {index}"))),
+        )
+        .unwrap();
+        assert!(summary.contains("12 additional causes; see server logs"));
+    }
+
+    #[tokio::test]
+    async fn shutdown_reports_original_cleanup_cause_once_per_pane() {
+        let id = Uuid::new_v4();
+        let pane = dummy_pane(id);
+        pane.execution.record_error("earlier reader failure".into());
+        pane.execution
+            .record_cleanup_error("group stop failed: supervisor disconnected".into());
+        let error = shutdown_panes_owned(vec![pane], true).await.unwrap_err();
+        assert!(error.contains(&id.to_string()));
+        assert!(error.contains("cleanup failed for 1 pane(s)"));
+        assert_eq!(error.matches("supervisor disconnected").count(), 1);
+        assert!(!error.contains("earlier reader failure"));
     }
 
     fn dummy_pane(id: Uuid) -> PaneRuntimeHandle {
