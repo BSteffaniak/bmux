@@ -32,12 +32,12 @@ fn main() {
     println!("cargo:rustc-env=BMUX_WEB_RELEASE_TAG={tag}");
     println!("cargo:rustc-env=BMUX_WEB_SOURCE_ROOT={}", root.display());
     println!("cargo:rustc-env=BMUX_WEB_RENDERER_SHA256={identity}");
-    let renderer = toml::from_str::<toml::Value>(
-        &std::fs::read_to_string(root.join("packages/web-renderer/Cargo.toml")).unwrap(),
-    )
-    .unwrap();
-    let bindgen = renderer["target"]["cfg(target_arch = \"wasm32\")"]["dependencies"]
-        ["wasm-bindgen"]["version"].as_str().expect("pinned wasm-bindgen version");
+    let workspace =
+        toml::from_str::<toml::Value>(&std::fs::read_to_string(root.join("Cargo.toml")).unwrap())
+            .unwrap();
+    let bindgen = workspace["workspace"]["dependencies"]["wasm-bindgen"]["version"]
+        .as_str()
+        .expect("pinned workspace wasm-bindgen version");
     let lock =
         toml::from_str::<toml::Value>(&std::fs::read_to_string(root.join("Cargo.lock")).unwrap())
             .unwrap();
@@ -52,7 +52,7 @@ fn main() {
     assert_eq!(
         bindgen.trim_start_matches('='),
         locked_bindgen,
-        "renderer manifest and lock must pin the same binding generator"
+        "workspace manifest and lock must pin the same binding generator"
     );
     println!("cargo:rustc-env=BMUX_WEB_WASM_BINDGEN_VERSION={locked_bindgen}");
 }

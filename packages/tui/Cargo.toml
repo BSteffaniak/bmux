@@ -16,7 +16,7 @@ bmux_terminal_protocol = { workspace = true }
 bmux_text_edit         = { workspace = true, features = ["keyboard"] }
 crossterm              = { workspace = true, optional = true }
 futures-util           = { workspace = true, optional = true, features = ["std"] }
-image                  = { workspace = true, features = ["png"] }
+image                  = { workspace = true, features = ["png", "jpeg", "gif", "bmp"] }
 serde                  = { workspace = true, optional = true, features = ["derive"] }
 unicode-segmentation   = { workspace = true }
 unicode-width          = { workspace = true }

@@ -85,6 +85,12 @@ EOF
     run_with_timeout "$SMOKE_TIMEOUT_SECS" bash -lc "
       set -euo pipefail
       (
+        # Input sent before the first terminal frame is echoed in canonical
+        # mode and never reaches attach. Wait for rendering, not a fixed startup
+        # delay; the enclosing watchdog bounds this readiness wait.
+        until LC_ALL=C grep -Fq \$'\\033[?2026h' \"$sandbox/pty.log\"; do
+          sleep 0.1
+        done
 ${payload}
       ) | XDG_CONFIG_HOME=\"$sandbox/config\" XDG_DATA_HOME=\"$sandbox/data\" XDG_STATE_HOME=\"$sandbox/state\" XDG_RUNTIME_DIR=\"$sandbox/runtime\" BMUX_CONFIG_DIR=\"$sandbox/config\" BMUX_DATA_DIR=\"$sandbox/data\" BMUX_RUNTIME_DIR=\"$sandbox/runtime\" BMUX_STATE_DIR=\"$sandbox/state\" BMUX_LOG_DIR=\"$sandbox/logs\" TMPDIR=\"$sandbox/tmp\" SHELL=\"$shell_bin\" $pty_command
     " >"$sandbox/pty.log" 2>&1

@@ -22,7 +22,7 @@ bmux_tui_components = { workspace = true, features = [
     "progress-bar",
 ] }
 bmux_web_renderer = { workspace = true }
-image = { version = "0.25.10", default-features = false, features = ["png"] }
+image = { workspace = true, features = ["png"] }
 pulldown-cmark = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
@@ -30,7 +30,7 @@ serde_yaml = { workspace = true }
 sha2 = { workspace = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-wasm-bindgen = { version = "0.2.129", optional = true }
+wasm-bindgen = { workspace = true, optional = true }
 
 [features]
 default = []

@@ -65,7 +65,7 @@ bmux_tui_runtime = { workspace = true, features = [
 bmux_web_host = { workspace = true, features = ["presentation"] }
 bmux_web_renderer = { workspace = true }
 crossterm = { workspace = true }
-image = { workspace = true }
+image = { workspace = true, features = ["png", "jpeg", "gif", "bmp"] }
 libc = { workspace = true }
 resvg = { workspace = true }
 rustls = { workspace = true }

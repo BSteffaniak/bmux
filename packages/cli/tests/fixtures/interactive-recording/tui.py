@@ -37,6 +37,10 @@ try:
         if byte == b'\x03':
             emit(b'CTRL_C\n')
             break
+        # A terminal Enter key is encoded as CR; this raw-mode fixture handles
+        # line termination itself rather than relying on the tty's ICRNL flag.
+        if byte == b'\r':
+            byte = b'\n'
         received += byte
         if byte == b'\n':
             emit(b'KEY:' + bytes(received))

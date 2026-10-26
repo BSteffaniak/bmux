@@ -13,7 +13,9 @@ pub struct LifecycleSnapshot {
     pub status: Response,
 }
 
-pub const MAX_FRAME: usize = 262_144;
+// A validated native environment can contain 1 MiB of arbitrary bytes. JSON
+// byte arrays need up to four bytes per source byte, plus entry/launch metadata.
+pub const MAX_FRAME: usize = 8 * 1024 * 1024;
 
 #[derive(Deserialize, Serialize)]
 pub struct Bootstrap {
@@ -107,4 +109,39 @@ pub fn write_frame<T: Serialize>(output: &mut impl Write, value: &T) -> std::io:
     )?;
     output.write_all(&bytes)?;
     output.flush()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn maximum_native_environment_fits_control_frame() {
+        let request = Request {
+            version: VERSION,
+            execution_token: "execution".into(),
+            authentication: "authentication".into(),
+            operation: Operation::Start {
+                mutation_id: "launch".into(),
+                program: "/bin/sh".into(),
+                args: Vec::new(),
+                cwd: None,
+                env: BTreeMap::new(),
+                native_env: Some(vec![(b"KEY".to_vec(), vec![255; 1024 * 1024 - 3])]),
+            },
+        };
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &request).unwrap();
+        let decoded: Request = read_frame(&mut bytes.as_slice()).unwrap();
+        assert_eq!(
+            serde_json::to_vec(&decoded).unwrap(),
+            serde_json::to_vec(&request).unwrap()
+        );
+    }
+
+    #[test]
+    fn oversized_control_frame_is_rejected_before_body_read() {
+        let length = u32::try_from(MAX_FRAME + 1).unwrap().to_be_bytes();
+        assert!(read_frame::<Request>(&mut length.as_slice()).is_err());
+    }
 }

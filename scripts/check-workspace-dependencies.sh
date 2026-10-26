@@ -20,10 +20,6 @@ manifests = {
     for path in sorted(set(paths)) if path and pathlib.Path(path).is_file()
 }
 workspace_dependencies = manifests["Cargo.toml"]["workspace"]["dependencies"]
-local_packages = {
-    manifest["package"]["name"]
-    for manifest in manifests.values() if "package" in manifest
-}
 errors = []
 
 
@@ -50,8 +46,8 @@ def check(path, table, section=()):
                 inherited = spec.get("workspace") is True
                 if "path" in spec:
                     errors.append(f"{location}: define paths in workspace.dependencies only")
-                if spec.get("package", name) in local_packages and not inherited:
-                    errors.append(f"{location}: local packages must use workspace = true")
+                if not inherited:
+                    errors.append(f"{location}: dependencies must use workspace = true")
                 if inherited and name not in owning_dependencies(path):
                     errors.append(f"{location}: missing workspace.dependencies definition")
         elif isinstance(value, dict):

@@ -14,7 +14,7 @@ version     = { workspace = true }
 bmux_mermaid_render = { workspace = true }
 bmux_presenter = { workspace = true }
 bmux_tui = { workspace = true, features = ["serde"] }
-image = { workspace = true }
+image = { workspace = true, features = ["png", "jpeg", "gif", "bmp"] }
 pulldown-cmark = { workspace = true }
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }

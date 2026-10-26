@@ -365,7 +365,7 @@ syntect = { version = "5.3.0", default-features = false, features = [
     "parsing",
 ] }
 two-face = { version = "0.5.2", default-features = false }
-url = { version = "2.5.8", default-features = false, features = ["std"] }
+url = { version = "2.5.8", default-features = false }
 
 switchy = { version = "0.5.0", package = "switchy", default-features = false }
 
@@ -392,14 +392,11 @@ flate2 = { version = "1", default-features = false, features = [
 font8x8 = { version = "0.3.1", features = ["unicode"] }
 fontdb = { version = "0.24.0" }
 futures-util = { version = "0.3.34", default-features = false }
+getrandom = "0.3.4"
 gif = { version = "0.14.2" }
-image = { version = "0.25", default-features = false, features = [
-    "png",
-    "jpeg",
-    "gif",
-    "bmp",
-] }
+image = { version = "0.25.10", default-features = false }
 iroh = { version = "1.4.1", default-features = true }
+js-sys = { version = "0.3.106" }
 libc = { version = "0.2" }
 libloading = { version = "0.9.0", default-features = false, features = ["std"] }
 log = { version = "0.4.34", default-features = false }
@@ -464,7 +461,14 @@ unicode-segmentation = { version = "1.13.3", default-features = false }
 unicode-width = { version = "0.2.2", default-features = false }
 uniffi = { version = "0.31.2" }
 uuid = { version = "1.29.0", default-features = false }
+wasm-bindgen = { version = "0.2.129" }
+wasm-bindgen-futures = { version = "0.4.79" }
+wayland-client = { version = "0.31.15", default-features = false }
+wayland-protocols = { version = "0.32.13", default-features = false }
+wayland-protocols-wlr = { version = "0.3.12", default-features = false }
+web-sys = { version = "0.3.106" }
 windows-sys = { version = "0.61.2" }
+x11rb = { version = "0.13.2", default-features = false }
 zeroize = { version = "1.9.1", default-features = false, features = ["std"] }
 zstd = { version = "0.13", default-features = false }
 

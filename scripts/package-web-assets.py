@@ -53,9 +53,8 @@ def package(root, assets, output):
     if not re.fullmatch(r"[0-9a-f]{64}", identity):
         raise ValueError("shared Rust provenance helper returned an invalid identity")
     workspace = tomllib.loads((root / "Cargo.toml").read_text(encoding="utf-8"))
-    renderer = tomllib.loads((root / "packages/web-renderer/Cargo.toml").read_text(encoding="utf-8"))
     version = workspace["workspace"]["package"]["version"]
-    bindgen = renderer["target"]['cfg(target_arch = "wasm32")']["dependencies"]["wasm-bindgen"]["version"].removeprefix("=")
+    bindgen = workspace["workspace"]["dependencies"]["wasm-bindgen"]["version"].removeprefix("=")
     if output.exists():
         raise ValueError("output must be a new directory, never overwrite a partial release")
     output.parent.mkdir(parents=True, exist_ok=True)
