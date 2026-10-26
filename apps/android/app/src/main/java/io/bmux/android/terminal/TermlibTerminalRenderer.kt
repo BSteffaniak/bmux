@@ -1,5 +1,13 @@
 package io.bmux.android.terminal
 
+import android.view.PointerIcon as AndroidPointerIcon
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.input.pointer.PointerEventType
+import androidx.compose.ui.input.pointer.PointerIcon
+import androidx.compose.ui.input.pointer.pointerHoverIcon
+import androidx.compose.ui.platform.LocalContext
 import android.os.Handler
 import android.os.Looper
 import androidx.compose.foundation.gestures.awaitEachGesture
@@ -23,6 +31,10 @@ class TermlibTerminalRenderer : TerminalRenderer {
     private var layoutWidthPx: Int = 0
     private var layoutHeightPx: Int = 0
     private val mainHandler = Handler(Looper.getMainLooper())
+    private var pointer by mutableStateOf<TerminalPointerFrame?>(null)
+    private val pointerRevisions = NativePointerRevisions()
+    @Volatile private var disposed = false
+    private var outputAccepted = true
 
     private companion object {
         const val TAP_MAX_DURATION_MS = 450L
@@ -38,10 +50,32 @@ class TermlibTerminalRenderer : TerminalRenderer {
     )
 
     override fun appendOutput(data: ByteArray) {
+        val accept = {
+            if (!disposed) {
+                outputAccepted = false
+                emulator.writeInput(data)
+                outputAccepted = true
+            }
+        }
         if (Looper.myLooper() == Looper.getMainLooper()) {
-            emulator.writeInput(data)
+            accept()
         } else {
-            mainHandler.post { emulator.writeInput(data) }
+            mainHandler.post { accept() }
+        }
+    }
+
+    override fun applyPointer(pointer: TerminalPointerFrame) {
+        // FIFO main-thread tasks: prior emulator.writeInput calls complete first.
+        mainHandler.post {
+            if (disposed || !outputAccepted || !pointerRevisions.accept(pointer)) return@post
+            this.pointer = pointer
+        }
+    }
+
+    override fun resetPointer() {
+        mainHandler.post {
+            pointer = null
+            pointerRevisions.reset()
         }
     }
 
@@ -65,9 +99,28 @@ class TermlibTerminalRenderer : TerminalRenderer {
     @Composable
     override fun Render(modifier: Modifier) {
         val touchSlop = LocalViewConfiguration.current.touchSlop
+        val context = LocalContext.current
+        val pointerIcon = PointerIcon(AndroidPointerIcon.getSystemIcon(context, nativePointerType(pointer)))
         Terminal(
             terminalEmulator = emulator,
             modifier = modifier
+                .pointerHoverIcon(pointerIcon)
+                .pointerInput(Unit) {
+                    awaitPointerEventScope {
+                        while (true) {
+                            val event = awaitPointerEvent(PointerEventPass.Initial)
+                            if (event.type == PointerEventType.Exit) {
+                                onMouseEvent?.invoke(TerminalMouseEvent(TerminalMouseEventKind.LEAVE, row = 0, col = 0))
+                            } else if (event.type == PointerEventType.Move || event.type == PointerEventType.Enter) {
+                                val change = event.changes.firstOrNull() ?: continue
+                                if (!change.pressed) {
+                                    val cell = pointerOffsetToCell(change.position) ?: continue
+                                    onMouseEvent?.invoke(TerminalMouseEvent(TerminalMouseEventKind.MOVE, row = cell.first, col = cell.second))
+                                }
+                            }
+                        }
+                    }
+                }
                 .onSizeChanged {
                     layoutWidthPx = it.width
                     layoutHeightPx = it.height
@@ -162,6 +215,9 @@ class TermlibTerminalRenderer : TerminalRenderer {
     }
 
     override fun dispose() {
+        disposed = true
+        pointer = null
+        pointerRevisions.reset()
         onInput = null
         onResize = null
         onMouseEvent = null

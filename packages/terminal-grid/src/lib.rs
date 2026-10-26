@@ -24,6 +24,9 @@ mod vt_parser;
 mod vt_parser_tests;
 
 #[cfg(test)]
+mod pointer_shape_tests;
+
+#[cfg(test)]
 mod stream_compat_tests;
 
 pub use delta::{GridDeltaApplyError, GridDeltaBatch, RowUpdateSnapshot};

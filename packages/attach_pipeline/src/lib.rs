@@ -5,6 +5,8 @@
 pub mod compositor;
 pub mod cursor;
 pub mod mouse;
+pub mod pointer_capabilities;
+pub mod pointer_shape;
 pub mod projection;
 pub mod projection_images;
 pub mod reconcile;
@@ -41,6 +43,7 @@ pub use mouse::{
     Button as AttachMouseButton, Event as AttachMouseEvent, EventKind as AttachMouseEventKind,
     Modifiers as AttachMouseModifiers, PaneProtocol as AttachPaneMouseProtocol,
 };
+pub use pointer_shape::{PointerShapeInput, ResolvedPointerShape, resolve_pointer_shape};
 pub use render::{
     AttachRenderTrace, AttachRenderTraceOp, AttachSceneRenderStats, DamageCoalescingPolicy,
     DamageRect, ExtensionRenderStats, FrameDamage, FrameDamageStats, frame_damage_overlay_rects,

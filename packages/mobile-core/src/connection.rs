@@ -115,6 +115,8 @@ pub enum TerminalMouseEventKind {
     ScrollDown,
     ScrollLeft,
     ScrollRight,
+    /// Native hover left the rendered terminal; never forwarded as application input.
+    Leave,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -467,11 +469,35 @@ impl ConnectionManager {
         Ok(runtime.last_failure.clone())
     }
 
-    /// Read pending output chunks for a terminal stream.
+    /// Poll bytes and typed pointer metadata under an explicitly selected contract.
     ///
     /// # Errors
+    /// Returns unsupported-version, lookup, and backend errors.
+    pub fn poll_terminal_presentation(
+        &mut self,
+        terminal_id: Uuid,
+        max_chunks: usize,
+        version: u32,
+    ) -> Result<crate::pointer_output::TerminalPresentation> {
+        crate::pointer_output::validate_pointer_version(version)?;
+        let chunks = self.poll_terminal_output(terminal_id, max_chunks)?;
+        let runtime = self
+            .terminals
+            .get(&terminal_id)
+            .ok_or_else(|| MobileCoreError::TerminalSessionNotFound(terminal_id.to_string()))?;
+        let pointer = if max_chunks == 0 || !runtime.chunks.is_empty() {
+            None
+        } else {
+            self.terminal_backend
+                .pointer_output(runtime.backend.id, version)?
+        };
+        Ok(crate::pointer_output::TerminalPresentation { chunks, pointer })
+    }
+
+    /// Read pending byte-only terminal output chunks.
     ///
-    /// Returns [`MobileCoreError::TerminalSessionNotFound`] when unknown.
+    /// # Errors
+    /// Returns terminal lookup or backend errors.
     pub fn poll_terminal_output(
         &mut self,
         terminal_id: Uuid,

@@ -86,6 +86,7 @@ fun TerminalSessionScreen(
 
     LaunchedEffect(endpoint.id, session) {
         connection?.close()
+        renderer.resetPointer()
         warning = null
         connection = null
         statusLines = emptyList()
@@ -97,6 +98,7 @@ fun TerminalSessionScreen(
                 endpoint = endpoint,
                 session = session,
                 sink = { bytes -> renderer.appendOutput(bytes) },
+                onPointer = { pointer -> renderer.applyPointer(pointer) },
                 onStatus = { event ->
                     if (shouldKeepStatusEvent(event)) {
                         statusLines = (statusLines + event).takeLast(MAX_STATUS_LINES)
@@ -116,6 +118,7 @@ fun TerminalSessionScreen(
                     }
                 },
                 onTerminalFailure = { message ->
+                    renderer.resetPointer()
                     warning = message
                     statusPanelVisible = true
                     statusPanelExpanded = true
@@ -294,6 +297,7 @@ private class CoreTerminalTransport(
         endpoint: TerminalEndpoint,
         session: String?,
         sink: (ByteArray) -> Unit,
+        onPointer: (TerminalPointerFrame) -> Unit,
         onStatus: (TerminalStatusEvent) -> Unit,
         onDiagnostics: (List<TerminalDiagnosticFrame>) -> Unit,
         onTerminalFailure: (String) -> Unit,
@@ -325,6 +329,7 @@ private class CoreTerminalTransport(
         return CoreTerminalTransportConnection(
             terminalId = terminalId,
             sink = sink,
+            onPointer = onPointer,
             onStatus = onStatus,
             pollTerminalOutput = pollTerminalOutput,
             writeTerminalInput = writeTerminalInput,
@@ -348,6 +353,7 @@ private class CoreTerminalTransport(
 private class CoreTerminalTransportConnection(
     private val terminalId: String,
     private val sink: (ByteArray) -> Unit,
+    private val onPointer: (TerminalPointerFrame) -> Unit,
     private val onStatus: (TerminalStatusEvent) -> Unit,
     private val pollTerminalOutput: suspend (terminalId: String, maxChunks: Int) -> Result<List<TerminalChunkFrame>>,
     private val writeTerminalInput: suspend (terminalId: String, bytes: ByteArray) -> Result<Unit>,
@@ -433,6 +439,7 @@ private class CoreTerminalTransportConnection(
                         TerminalChunkType.STDOUT,
                         TerminalChunkType.STDERR,
                         -> sink(chunk.bytes)
+                        TerminalChunkType.POINTER -> chunk.pointer?.let(onPointer)
                         TerminalChunkType.STATUS -> {
                             val message = chunk.bytes.toString(StandardCharsets.UTF_8).trim()
                             if (message.isNotEmpty()) {

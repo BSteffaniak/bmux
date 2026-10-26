@@ -29,6 +29,7 @@ capability PANE_RUNTIME_SPAWN_V1 = bmux.pane_runtime.spawn.v1;
 
 capability PANE_RUNTIME_ENVIRONMENT_V1 = bmux.pane_runtime.environment.v1;
 capability PANE_RUNTIME_LIVE_PRESENTATION_V1 = bmux.pane_runtime.live.presentation.v1;
+capability PANE_RUNTIME_POINTER_GRID_V1 = bmux.pane_runtime.pointer_grid.v1;
 capability PANE_RUNTIME_HUMAN_INPUT_V1 = bmux.pane_runtime.human.input.v1;
 
 @capability(PANE_RUNTIME_ENVIRONMENT_V1)
@@ -37,6 +38,33 @@ interface pane-runtime-environment-v1 {
     command capabilities() -> u32;
     command reserve(launch_mutation_id: uuid, options: pane-runtime-execution-v4.terminal-program-options,
         environment: list<environment-entry>) -> result<pane-runtime-execution-v4.terminal-launch-reservation, pane-runtime-execution-v4.terminal-recovery-error>;
+}
+
+// Explicit representation selection. Version 1 is JSON terminal-grid snapshots
+// and delta batches with validated OSC 22 main/alternate stacks and parser prefix.
+// Consumers must select this service before using pointer-aware recovery. Legacy
+// services reject nonempty pointer recovery state; their meaning is unchanged.
+// Read operations use command dispatch, like the existing presentation services.
+@capability(PANE_RUNTIME_POINTER_GRID_V1)
+interface pane-runtime-pointer-grid-v1 {
+    record grid-capabilities { format_versions: list<u32> }
+    command capabilities() -> grid-capabilities;
+    command snapshots(format_version: u32, session_id: uuid, pane_ids: list<uuid>, max_rows_per_pane: u32)
+        -> result<attach-runtime-state.attach-pane-grid-snapshot, attach-runtime-state.attach-state-error>;
+    command snapshot(format_version: u32, session_id: uuid, pane_id: uuid, max_rows: u32)
+        -> result<attach-runtime-state.pane-grid-snapshot, attach-runtime-state.attach-state-error>;
+    command deltas(format_version: u32, session_id: uuid, pane_ids: list<uuid>, base_revisions: list<u64>, max_batches_per_pane: u32)
+        -> result<attach-runtime-state.attach-pane-grid-delta, attach-runtime-state.attach-state-error>;
+    command windows(format_version: u32, session_id: uuid, windows: list<attach-runtime-state.pane-grid-window-request>)
+        -> result<attach-runtime-state.attach-pane-grid-window, attach-runtime-state.attach-state-error>;
+    command screen(format_version: u32, execution: pane-runtime-execution-v4.terminal-execution-ref)
+        -> result<pane-runtime-execution-v4.terminal-execution-screen, pane-runtime-execution-v4.terminal-execution-error>;
+    command wait-present(format_version: u32, execution: pane-runtime-execution-v4.terminal-execution-ref, after: bytes?, timeout_ms: u32, max_bytes: u32)
+        -> result<pane-runtime-presentation-wait-v1.presentation-frame?, pane-runtime-presentation-wait-v1.wait-error>;
+    command live-read(format_version: u32, execution: pane-runtime-execution-v4.terminal-execution-ref, after: pane-runtime-live-presentation-v1.live-cursor?, max_bytes: u32)
+        -> result<pane-runtime-live-presentation-v1.live-frame?, pane-runtime-live-presentation-v1.live-error>;
+    command live-wait-present(format_version: u32, execution: pane-runtime-execution-v4.terminal-execution-ref, after: pane-runtime-live-presentation-v1.live-cursor?, timeout_ms: u32, max_bytes: u32)
+        -> result<pane-runtime-live-presentation-v1.live-frame?, pane-runtime-live-presentation-v1.live-error>;
 }
 
 // Projection may lead persistence. These receipts are never durable v4 receipts.

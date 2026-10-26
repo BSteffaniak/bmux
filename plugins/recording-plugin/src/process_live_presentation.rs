@@ -74,9 +74,15 @@ impl ProcessService {
     ) -> Result<Option<LiveFrame>, LiveError> {
         let reference = self.live_reference(run_id)?;
         let mut client = ServiceCallerDispatchClient::new(self.caller.as_ref());
-        let frame = live::client::read(&mut client, reference.clone(), after, max_bytes)
-            .await
-            .map_err(|error| unavailable(&error))??;
+        let frame = bmux_pane_runtime_plugin_api::pane_runtime_pointer_grid_v1::client::live_read(
+            &mut client,
+            1,
+            reference.clone(),
+            after,
+            max_bytes,
+        )
+        .await
+        .map_err(|error| unavailable(&error))??;
         validate_frame(&reference, frame)
     }
 
@@ -93,15 +99,17 @@ impl ProcessService {
     ) -> Result<Option<LiveFrame>, LiveError> {
         let reference = self.live_reference(run_id)?;
         let mut client = ServiceCallerDispatchClient::new(self.caller.as_ref());
-        let frame = live::client::wait_present(
-            &mut client,
-            reference.clone(),
-            after,
-            timeout_ms,
-            max_bytes,
-        )
-        .await
-        .map_err(|error| unavailable(&error))??;
+        let frame =
+            bmux_pane_runtime_plugin_api::pane_runtime_pointer_grid_v1::client::live_wait_present(
+                &mut client,
+                1,
+                reference.clone(),
+                after,
+                timeout_ms,
+                max_bytes,
+            )
+            .await
+            .map_err(|error| unavailable(&error))??;
         validate_frame(&reference, frame)
     }
 }

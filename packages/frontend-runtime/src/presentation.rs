@@ -30,6 +30,9 @@ pub struct PresentationIdentity {
 #[derive(Debug, Clone)]
 pub struct PreparedDelivery {
     pub identity: PresentationIdentity,
+    /// Effective pointer intent resolved against this delivery's retained scene.
+    /// None means unavailable, not an instruction to inherit a hidden target.
+    pub pointer_shape: Option<bmux_attach_pipeline::pointer_shape::ResolvedPointerShape>,
     pub prepared: Arc<PreparedPresentation>,
 }
 
@@ -200,6 +203,7 @@ mod tests {
                 revision,
                 viewport_generation: generation,
             },
+            pointer_shape: None,
             prepared: Arc::new(prepared),
         }
     }

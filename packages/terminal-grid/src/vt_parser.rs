@@ -3,7 +3,8 @@
 //! The control-state organization follows Paul Williams' DEC ANSI parser
 //! (<https://vt100.net/emu/dec_ansi_parser>). UTF-8 text and raw C1 handling follow
 //! the existing byte-stream contract rather than enabling eight-bit introducers.
-//! Storage is fixed-size; string payload overflow discards only excess bytes.
+//! Storage is fixed-size. Legacy string families retain their truncation
+//! behavior; OSC 22 overflow is rejected wholesale, including after hydration.
 
 #[derive(Debug)]
 pub(crate) struct Params {
@@ -134,6 +135,7 @@ enum State {
     DcsDiscard,
     DcsData,
     Osc,
+    OscEscape,
     StringDiscard,
 }
 
@@ -148,6 +150,7 @@ pub(crate) struct Parser<const OSC_RAW_BUF_SIZE: usize = 1024> {
     osc_len: usize,
     osc_ends: [usize; 16],
     osc_args: usize,
+    osc_overflow: bool,
     utf8: [u8; 4],
     utf8_len: usize,
     utf8_expected: usize,
@@ -172,6 +175,7 @@ impl<const N: usize> Parser<N> {
             osc_len: 0,
             osc_ends: [0; 16],
             osc_args: 0,
+            osc_overflow: false,
             utf8: [0; 4],
             utf8_len: 0,
             utf8_expected: 0,
@@ -194,15 +198,15 @@ impl<const N: usize> Parser<N> {
     /// A bounded, normalized syntax prefix for semantic restoration.
     ///
     /// Feed this to a fresh decoder with a no-op performer. Completed callbacks
-    /// must not be replayed into an application. OSC/DCS payloads are deliberately
-    /// omitted: this restores syntax continuation, not a callback recording.
-    /// Numeric groups and ignore flags are retained so a later CSI dispatch has
-    /// the same meaning. The prefix is at most 208 bytes, independent of input.
+    /// must not be replayed into an application. OSC 22 payloads are retained
+    /// so a split request has identical semantics after hydration; other string
+    /// payloads remain omitted. Numeric groups and ignore flags are retained.
+    /// Storage remains bounded by the OSC capacity plus fixed header overhead.
     pub(crate) fn replay_prefix(&self) -> Vec<u8> {
         let mut prefix = Vec::with_capacity(208);
         match self.state {
             State::Text => prefix.extend_from_slice(&self.utf8[..self.utf8_len]),
-            State::Osc => prefix.extend_from_slice(b"\x1b]"),
+            State::Osc | State::OscEscape => self.write_osc_prefix(&mut prefix),
             State::StringDiscard => prefix.extend_from_slice(b"\x1b_"),
             State::DcsData => prefix.extend_from_slice(b"\x1bPq"),
             State::DcsDiscard => prefix.extend_from_slice(b"\x1bP $0"),
@@ -257,6 +261,31 @@ impl<const N: usize> Parser<N> {
             }
         }
         prefix
+    }
+
+    fn write_osc_prefix(&self, prefix: &mut Vec<u8>) {
+        prefix.extend_from_slice(b"\x1b]");
+        // Retain even the first '2': a snapshot can split the selector.
+        let pointer_prefix = self.osc_args == 0
+            && (self.osc_len == 0 || b"22".starts_with(&self.osc[..self.osc_len]));
+        if self.is_pointer_osc() || pointer_prefix {
+            if self.osc_overflow {
+                // Recreate discard state, never a valid retained prefix.
+                prefix.extend_from_slice(b"22;");
+                prefix.resize(prefix.len() + N + 1, b'x');
+            } else {
+                let mut start = 0;
+                for end in &self.osc_ends[..self.osc_args] {
+                    prefix.extend_from_slice(&self.osc[start..*end]);
+                    prefix.push(b';');
+                    start = *end;
+                }
+                prefix.extend_from_slice(&self.osc[start..self.osc_len]);
+            }
+        }
+        if self.state == State::OscEscape {
+            prefix.push(0x1b);
+        }
     }
 
     fn write_number(prefix: &mut Vec<u8>, value: u16) {
@@ -354,10 +383,17 @@ impl<const N: usize> Parser<N> {
         }
     }
 
+    fn is_pointer_osc(&self) -> bool {
+        self.osc_args != 0 && self.osc_ends[0] == 2 && self.osc[..2] == *b"22"
+    }
+
     fn end_string<P: Perform>(&mut self, performer: &mut P, bell: bool) {
         match self.state {
             State::DcsData => performer.unhook(),
-            State::Osc => {
+            State::Osc | State::OscEscape => {
+                if self.is_pointer_osc() && self.osc_overflow {
+                    return;
+                }
                 if self.osc_args < 16 {
                     self.osc_ends[self.osc_args] = self.osc_len;
                     self.osc_args += 1;
@@ -375,8 +411,35 @@ impl<const N: usize> Parser<N> {
         }
     }
 
+    // OSC 22 needs a complete ST before exposing a request. Keep legacy OSC
+    // callback timing unchanged for all other families.
+    fn pointer_string_control<P: Perform>(&mut self, performer: &mut P, byte: u8) -> bool {
+        if self.state == State::OscEscape {
+            if byte == b'\\' {
+                self.end_string(performer, false);
+                self.state = State::Text;
+                return true;
+            }
+            self.state = State::Escape;
+            self.clear_header();
+        } else if self.state == State::Osc && self.is_pointer_osc() {
+            if byte == 0x1b {
+                self.state = State::OscEscape;
+                return true;
+            }
+            if matches!(byte, 0x18 | 0x1a) {
+                self.state = State::Text;
+                return true;
+            }
+        }
+        false
+    }
+
     fn consume<P: Perform>(&mut self, performer: &mut P, byte: u8) {
         if self.state == State::Text && self.utf8_len != 0 && self.continue_utf8(performer, byte) {
+            return;
+        }
+        if self.pointer_string_control(performer, byte) {
             return;
         }
         // These interruptions run exit callbacks before the incoming action.
@@ -422,20 +485,29 @@ impl<const N: usize> Parser<N> {
                     self.end_string(performer, true);
                     self.state = State::Text;
                 }
-                0x00..=0x1f => {}
+                0x00..=0x1f => {
+                    if self.is_pointer_osc() {
+                        self.osc_overflow = true;
+                    }
+                }
                 b';' => {
                     if self.osc_args < 16 {
                         self.osc_ends[self.osc_args] = self.osc_len;
                         self.osc_args += 1;
+                    } else {
+                        self.osc_overflow = true;
                     }
                 }
                 _ => {
                     if self.osc_len < N && self.osc_args < 16 {
                         self.osc[self.osc_len] = byte;
                         self.osc_len += 1;
+                    } else {
+                        self.osc_overflow = true;
                     }
                 }
             },
+            State::OscEscape => unreachable!("handled before control dispatch"),
             State::DcsDiscard => {
                 if byte == 0x9c {
                     self.state = State::Text;
@@ -463,6 +535,7 @@ impl<const N: usize> Parser<N> {
             b']' if self.state == State::Escape => {
                 self.osc_len = 0;
                 self.osc_args = 0;
+                self.osc_overflow = false;
                 self.state = State::Osc;
             }
             b'X' | b'^' | b'_' if self.state == State::Escape => self.state = State::StringDiscard,

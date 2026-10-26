@@ -4,6 +4,9 @@ use crate::model::{
     TerminalGridError,
 };
 use crate::vt_parser::{Params, Parser, Perform};
+use bmux_terminal_protocol::pointer_shape::{
+    PointerShape, PointerShapeOperation, parse_pointer_shape,
+};
 
 /// Streaming terminal parser plus structured grid state.
 ///
@@ -78,6 +81,19 @@ impl TerminalGridStream {
 
     /// Process one chunk of PTY output.
     pub fn process(&mut self, bytes: &[u8]) {
+        self.process_with_pointer_queries(bytes, |_, _| {});
+    }
+
+    /// Process output and synchronously observe each complete OSC 22 query.
+    /// The callback receives the query list (without `?`) and the canonical
+    /// active-screen request at that exact byte position. It must not reenter
+    /// this stream. Replies and default/grabbed policy remain caller-owned.
+    /// Snapshot restoration never invokes this callback.
+    pub fn process_with_pointer_queries(
+        &mut self,
+        bytes: &[u8],
+        mut on_query: impl FnMut(&[u8], Option<PointerShape>),
+    ) {
         if bytes.is_empty() {
             return;
         }
@@ -85,6 +101,7 @@ impl TerminalGridStream {
         let previous_pending = std::mem::take(&mut self.pending_bytes);
         let mut performer = GridPerformer {
             grid: &mut self.grid,
+            on_pointer_query: &mut on_query,
         };
         self.parser.advance(&mut performer, bytes);
         self.pending_bytes = self.parser.replay_prefix();
@@ -460,7 +477,10 @@ pub enum TerminalGridStreamDeltaError {
 
 pub(crate) fn process(grid: &mut TerminalGrid, bytes: &[u8]) {
     let mut parser = Parser::new();
-    let mut performer = GridPerformer { grid };
+    let mut performer = GridPerformer {
+        grid,
+        on_pointer_query: &mut |_, _| {},
+    };
     parser.advance(&mut performer, bytes);
 }
 
@@ -512,7 +532,16 @@ impl Perform for ProtocolPerformer<'_> {
 
     fn unhook(&mut self) {}
 
-    fn osc_dispatch(&mut self, _params: &[&[u8]], _bell_terminated: bool) {}
+    fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
+        if let [selector, payload] = params
+            && *selector == b"22"
+            && let Ok(operation) = parse_pointer_shape(payload)
+        {
+            self.protocol
+                .pointer_shapes
+                .apply(*self.alternate_screen, operation);
+        }
+    }
 
     fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], ignore: bool, action: char) {
         if ignore || intermediates != *b"?" || !matches!(action, 'h' | 'l') {
@@ -554,6 +583,7 @@ impl Perform for ProtocolPerformer<'_> {
 
 struct GridPerformer<'a> {
     grid: &'a mut TerminalGrid,
+    on_pointer_query: &'a mut dyn FnMut(&[u8], Option<PointerShape>),
 }
 
 impl Perform for GridPerformer<'_> {
@@ -583,7 +613,23 @@ impl Perform for GridPerformer<'_> {
 
     fn unhook(&mut self) {}
 
-    fn osc_dispatch(&mut self, _params: &[&[u8]], _bell_terminated: bool) {}
+    fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
+        if let [selector, payload] = params
+            && *selector == b"22"
+            && let Ok(operation) = parse_pointer_shape(payload)
+        {
+            if let PointerShapeOperation::Query(query) = operation {
+                let current = self
+                    .grid
+                    .protocol_state()
+                    .pointer_shapes
+                    .current(self.grid.mode() == GridMode::Alternate);
+                (self.on_pointer_query)(query, current);
+            } else {
+                self.grid.apply_pointer_shape(operation);
+            }
+        }
+    }
 
     #[allow(
         clippy::too_many_lines,

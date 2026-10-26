@@ -94,6 +94,11 @@ pub(super) fn run_terminal_doctor(
 
     let (bracketed_paste_status, bracketed_paste_available, bracketed_paste_effective) =
         bracketed_paste_status(config.behavior.bracketed_paste);
+    let pointer_capability =
+        bmux_attach_pipeline::pointer_capabilities::PointerShapeCapability::detect();
+    let pointer_effective = config.behavior.mouse.pointer_shapes
+        && pointer_capability
+            != bmux_attach_pipeline::pointer_capabilities::PointerShapeCapability::Unsupported;
     let configured_term = config.behavior.pane_term.clone();
     let effective = resolve_pane_term(&configured_term);
     let protocol_profile = protocol_profile_for_terminal_profile(effective.profile);
@@ -119,6 +124,11 @@ pub(super) fn run_terminal_doctor(
                 "compiled": bracketed_paste_available,
                 "configured": config.behavior.bracketed_paste,
                 "effective": bracketed_paste_effective,
+            },
+            "pointer_shapes": {
+                "configured": config.behavior.mouse.pointer_shapes,
+                "host_capability": pointer_capability.as_str(),
+                "effective": pointer_effective,
             },
             "fallback_chain": effective.fallback_chain,
             "terminfo_check": {
@@ -162,6 +172,11 @@ pub(super) fn run_terminal_doctor(
     }
 
     println!("bmux terminal doctor");
+    println!(
+        "pointer shapes: configured={}, host={}, effective={pointer_effective}",
+        config.behavior.mouse.pointer_shapes,
+        pointer_capability.as_str(),
+    );
     println!("configured pane TERM: {configured_term}");
     println!("effective pane TERM: {}", effective.pane_term);
     println!(

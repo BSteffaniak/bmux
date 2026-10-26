@@ -10,12 +10,20 @@ use bmux_client::{
 use bmux_ipc::ErrorCode;
 use bmux_pane_runtime_plugin_api::{
     attach_runtime_commands as attach_commands, attach_runtime_state as attach_state,
+    pane_runtime_pointer_grid_v1 as pointer_grid,
 };
 use bmux_session_models::SessionSelector;
 use std::future::Future;
 use uuid::Uuid;
 
 type ClientResult<T> = bmux_client::Result<T>;
+
+// Explicit BPDL representation selection, not a guessed legacy JSON extension.
+const POINTER_GRID_FORMAT_VERSION: u32 = 1;
+
+#[cfg(test)]
+#[path = "pane_runtime_client_tests.rs"]
+mod tests;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PaneGridSnapshotResult {
@@ -34,14 +42,15 @@ pub struct PaneGridDeltaResult {
 }
 
 pub async fn attach_pane_grid_snapshot_state_streaming(
-    client: &mut bmux_client::StreamingBmuxClient,
+    client: &mut impl bmux_plugin_sdk::TypedDispatchClient,
     session_id: Uuid,
     pane_ids: Vec<Uuid>,
     max_rows_per_pane: usize,
 ) -> ClientResult<Vec<PaneGridSnapshotResult>> {
     let max_rows_per_pane = u32::try_from(max_rows_per_pane).unwrap_or(u32::MAX);
-    match attach_state::client::attach_pane_grid_snapshot_state(
+    match pointer_grid::client::snapshots(
         client,
+        POINTER_GRID_FORMAT_VERSION,
         session_id,
         pane_ids,
         max_rows_per_pane,
@@ -57,21 +66,22 @@ pub async fn attach_pane_grid_snapshot_state_streaming(
                 encoded: snapshot.encoded,
             })
             .collect()),
-        Ok(Err(err)) => typed_server_error("attach-pane-grid-snapshot-state", err),
-        Err(err) => typed_dispatch_error("attach-pane-grid-snapshot-state", err),
+        Ok(Err(err)) => typed_server_error("pointer-grid-v1 snapshots", err),
+        Err(err) => typed_dispatch_error("pointer-grid-v1 snapshots", err),
     }
 }
 
 pub async fn attach_pane_grid_delta_state_streaming(
-    client: &mut bmux_client::StreamingBmuxClient,
+    client: &mut impl bmux_plugin_sdk::TypedDispatchClient,
     session_id: Uuid,
     pane_ids: Vec<Uuid>,
     base_revisions: Vec<u64>,
     max_batches_per_pane: usize,
 ) -> ClientResult<Vec<PaneGridDeltaResult>> {
     let max_batches_per_pane = u32::try_from(max_batches_per_pane).unwrap_or(u32::MAX);
-    match attach_state::client::attach_pane_grid_delta_state(
+    match pointer_grid::client::deltas(
         client,
+        POINTER_GRID_FORMAT_VERSION,
         session_id,
         pane_ids,
         base_revisions,
@@ -90,8 +100,8 @@ pub async fn attach_pane_grid_delta_state_streaming(
                 encoded: delta.encoded,
             })
             .collect()),
-        Ok(Err(err)) => typed_server_error("attach-pane-grid-delta-state", err),
-        Err(err) => typed_dispatch_error("attach-pane-grid-delta-state", err),
+        Ok(Err(err)) => typed_server_error("pointer-grid-v1 deltas", err),
+        Err(err) => typed_dispatch_error("pointer-grid-v1 deltas", err),
     }
 }
 

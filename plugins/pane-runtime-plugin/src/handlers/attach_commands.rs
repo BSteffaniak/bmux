@@ -113,6 +113,10 @@ pub(crate) fn observer_operation_allowed(
     }
     match interface {
         "attach-runtime-state" | "pane-runtime-state" => true,
+        "pane-runtime-pointer-grid-v1" => matches!(
+            operation,
+            "capabilities" | "snapshots" | "snapshot" | "deltas" | "windows"
+        ),
         "attach-runtime-commands" => matches!(
             operation,
             "observer-grant" | "observer-open" | "observe-viewport" | "attach-output" | "detach"

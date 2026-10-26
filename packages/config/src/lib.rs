@@ -2385,6 +2385,9 @@ fn validate_damage_behavior_config(damage: &DamageBehaviorConfig) -> Result<()> 
 #[serde(default)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct MouseBehaviorConfig {
+    /// Enable host mouse pointer shapes when the attached terminal supports OSC 22.
+    /// Independent of mouse event capture and inner-program mouse reporting.
+    pub pointer_shapes: bool,
     /// Master toggle for mouse handling in attach mode.
     pub enabled: bool,
     /// Focus pane when clicking inside it.
@@ -2427,6 +2430,7 @@ pub struct MouseBehaviorConfig {
 impl Default for MouseBehaviorConfig {
     fn default() -> Self {
         Self {
+            pointer_shapes: true,
             enabled: true,
             focus_on_click: true,
             click_propagation: MouseClickPropagation::default(),
@@ -3864,9 +3868,10 @@ impl BmuxConfig {
 mod tests {
     use super::{
         AlternateScreenWheelBehavior, BMUX_CONFIG_ENV, BmuxConfig, ConfigLoadOverrides,
-        ConfigScopeTarget, MouseClickPropagation, MouseSelectionReleaseBehavior,
-        MouseWheelPropagation, ResolvedTimeout, SandboxCleanupSource, ScopedConfigLoadRequest,
-        ScrollbackMode, StaleBuildAction, push_process_config_overrides,
+        ConfigScopeTarget, MouseBehaviorConfig, MouseClickPropagation,
+        MouseSelectionReleaseBehavior, MouseWheelPropagation, ResolvedTimeout,
+        SandboxCleanupSource, ScopedConfigLoadRequest, ScrollbackMode, StaleBuildAction,
+        push_process_config_overrides,
     };
     use crate::ConfigPaths;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -4799,6 +4804,22 @@ timeout_profile = "missing"
         );
         assert!(mouse.resize_borders);
         assert_eq!(mouse.hover_delay_ms, 0);
+    }
+
+    #[test]
+    fn pointer_shapes_default_enabled_and_round_trip_independently_of_capture() {
+        assert!(MouseBehaviorConfig::default().pointer_shapes);
+        let mouse: MouseBehaviorConfig =
+            toml::from_str("enabled = false\n").expect("legacy mouse config");
+        assert!(mouse.pointer_shapes);
+        assert!(!mouse.enabled);
+        let disabled: MouseBehaviorConfig =
+            toml::from_str("pointer_shapes = false\n").expect("pointer shapes config");
+        assert!(!disabled.pointer_shapes);
+        assert!(disabled.enabled);
+        let encoded = toml::to_string(&disabled).expect("serialize mouse config");
+        let restored: MouseBehaviorConfig = toml::from_str(&encoded).expect("restore mouse config");
+        assert_eq!(restored, disabled);
     }
 
     #[test]

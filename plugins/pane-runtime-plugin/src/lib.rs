@@ -59,7 +59,16 @@ mod contract_tests {
         );
         let routes: Vec<bmux_plugin::stream_admission::StreamAdmittedRoute> =
             bmux_plugin_sdk::decode_service_message(payload).unwrap();
-        assert_eq!(routes.len(), 20);
+        assert_eq!(routes.len(), 23);
+        let pointer_routes: std::collections::BTreeSet<_> = routes
+            .iter()
+            .filter(|route| route.interface_id == "pane-runtime-pointer-grid-v1")
+            .map(|route| route.operation.as_str())
+            .collect();
+        assert_eq!(
+            pointer_routes,
+            std::collections::BTreeSet::from(["capabilities", "screen", "wait-present"])
+        );
         let services = super::PaneRuntimePlugin::declared_services().unwrap();
         let unique: std::collections::BTreeSet<_> = routes
             .iter()
@@ -100,6 +109,21 @@ mod contract_tests {
                 }
             );
         }
+    }
+
+    #[test]
+    fn pointer_grid_exports_generated_command_interface() {
+        use bmux_plugin_sdk::RustPlugin as _;
+        let services = super::PaneRuntimePlugin::declared_services().unwrap();
+        let manifest =
+            bmux_plugin::PluginManifest::from_toml_str(include_str!("../plugin.toml")).unwrap();
+        assert!(services.iter().any(|service| service.interface_id
+            == "pane-runtime-pointer-grid-v1"
+            && service.capability.as_str() == "bmux.pane_runtime.pointer_grid.v1"
+            && service.kind == bmux_plugin_sdk::ServiceKind::Command));
+        assert!(manifest.services.iter().any(|service| service.interface_id
+            == "pane-runtime-pointer-grid-v1"
+            && service.kind == bmux_plugin_sdk::ServiceKind::Command));
     }
 
     #[test]
@@ -184,6 +208,12 @@ impl RustPlugin for PaneRuntimePlugin {
                 ServiceKind::Command,
                 "pane-runtime-presentation-wait-v1",
                 &["capabilities", "wait-present"][..],
+            ),
+            (
+                "bmux.pane_runtime.pointer_grid.v1",
+                ServiceKind::Command,
+                "pane-runtime-pointer-grid-v1",
+                &["capabilities", "screen", "wait-present"][..],
             ),
             (
                 "bmux.pane_runtime.spawn.v1",

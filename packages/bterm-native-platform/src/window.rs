@@ -207,6 +207,15 @@ impl WindowContext<'_> {
     pub fn exit(&self) {
         self.event_loop.exit();
     }
+    /// Apply pointer intent only after the corresponding presentation succeeds.
+    /// None hides the pointer; Some restores visibility and sets its shape.
+    pub fn set_pointer_icon(&self, icon: Option<winit::window::CursorIcon>) {
+        self.window.set_cursor_visible(icon.is_some());
+        if let Some(icon) = icon {
+            self.window.set_cursor(icon);
+        }
+    }
+
     pub fn set_title(&self, title: &str) {
         self.window.set_title(title);
     }

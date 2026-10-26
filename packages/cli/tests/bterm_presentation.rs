@@ -42,6 +42,7 @@ fn delivery(revision: u64, label: &str, hit: Rect) -> PreparedDelivery {
         .expect("full retained scene");
     PreparedDelivery {
         identity: identity(revision),
+        pointer_shape: None,
         prepared: Arc::new(prepared),
     }
 }
@@ -188,6 +189,7 @@ fn direct_output_keeps_compositor_clipping_for_visible_and_offscreen_hits() {
         .unwrap();
     let candidate = PreparedDelivery {
         identity: identity(1),
+        pointer_shape: None,
         prepared: Arc::new(prepared),
     };
     authority.stage(&candidate).unwrap();
@@ -251,6 +253,7 @@ fn bterm_direct_presentation_perf() {
                 .unwrap();
             let candidate = PreparedDelivery {
                 identity: PresentationIdentity { revision, ..id },
+                pointer_shape: None,
                 prepared: Arc::new(prepared),
             };
             authority.stage(&candidate).unwrap();

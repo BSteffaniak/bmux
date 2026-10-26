@@ -25,6 +25,7 @@ pub(crate) mod live_presentation;
 pub mod padding;
 pub mod pane_commands;
 pub mod pane_state;
+mod pointer_grid;
 mod spawn;
 
 /// Route an inbound typed service call to the correct handler.
@@ -75,20 +76,55 @@ fn route_authorized(context: NativeServiceContext) -> ServiceResponse {
         "pane-runtime-environment-v1", "reserve" => |req: bmux_pane_runtime_plugin_api::pane_runtime_environment_v1::client::ReserveRequest, ctx| {
             Ok::<_, ServiceResponse>(crate::runtime::reservations::reserve_environment(req.launch_mutation_id, req.options, req.environment, |id| spawn::authorize_creation(ctx, id, "session.create").map_err(|error| bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::TerminalRecoveryError::Denied { reason: format!("{error:?}") })))
         },
+        "pane-runtime-pointer-grid-v1", "capabilities" => |_req: (), _ctx| {
+            Ok::<_, ServiceResponse>(bmux_pane_runtime_plugin_api::pane_runtime_pointer_grid_v1::GridCapabilities { format_versions: vec![1] })
+        },
+        "pane-runtime-pointer-grid-v1", "snapshots" => |req: bmux_pane_runtime_plugin_api::pane_runtime_pointer_grid_v1::client::SnapshotsRequest, ctx| {
+            pointer_grid::select(req.format_version)?;
+            Ok::<_, ServiceResponse>(attach_state::attach_pane_grid_snapshot_state(&attach_state::AttachPaneGridSnapshotArgs { session_id: req.session_id, pane_ids: req.pane_ids, max_rows_per_pane: req.max_rows_per_pane }, ctx))
+        },
+        "pane-runtime-pointer-grid-v1", "snapshot" => |req: bmux_pane_runtime_plugin_api::pane_runtime_pointer_grid_v1::client::SnapshotRequest, _ctx| {
+            pointer_grid::select(req.format_version)?;
+            Ok::<_, ServiceResponse>(attach_state::pane_grid_snapshot_state(&attach_state::PaneGridSnapshotArgs { session_id: req.session_id, pane_id: req.pane_id, max_rows: req.max_rows }))
+        },
+        "pane-runtime-pointer-grid-v1", "deltas" => |req: bmux_pane_runtime_plugin_api::pane_runtime_pointer_grid_v1::client::DeltasRequest, ctx| {
+            pointer_grid::select(req.format_version)?;
+            Ok::<_, ServiceResponse>(attach_state::attach_pane_grid_delta_state(&attach_state::AttachPaneGridDeltaArgs { session_id: req.session_id, pane_ids: req.pane_ids, base_revisions: req.base_revisions, max_batches_per_pane: req.max_batches_per_pane }, ctx))
+        },
+        "pane-runtime-pointer-grid-v1", "windows" => |req: bmux_pane_runtime_plugin_api::pane_runtime_pointer_grid_v1::client::WindowsRequest, ctx| {
+            pointer_grid::select(req.format_version)?;
+            Ok::<_, ServiceResponse>(attach_state::attach_pane_grid_window_state(&attach_state::AttachPaneGridWindowArgs { session_id: req.session_id, windows: req.windows }, ctx))
+        },
+        "pane-runtime-pointer-grid-v1", "screen" => |req: bmux_pane_runtime_plugin_api::pane_runtime_pointer_grid_v1::client::ScreenRequest, ctx| {
+            pointer_grid::select(req.format_version)?;
+            Ok::<_, ServiceResponse>(execution::authorize(ctx, &req.execution, "read").and_then(|()| crate::runtime::execution::screen(&req.execution)))
+        },
+        "pane-runtime-pointer-grid-v1", "wait-present" => |req: bmux_pane_runtime_plugin_api::pane_runtime_pointer_grid_v1::client::WaitPresentRequest, ctx| {
+            pointer_grid::select(req.format_version)?;
+            Ok::<_, ServiceResponse>(crate::runtime::execution::wait_present(&req.execution, req.after.as_deref(), req.timeout_ms, req.max_bytes, || execution::authorize(ctx, &req.execution, "read")))
+        },
+        "pane-runtime-pointer-grid-v1", "live-read" => |req: bmux_pane_runtime_plugin_api::pane_runtime_pointer_grid_v1::client::LiveReadRequest, ctx| {
+            pointer_grid::select(req.format_version)?;
+            Ok::<_, ServiceResponse>(live_presentation::read(ctx, &req.execution, req.after.as_ref(), req.max_bytes))
+        },
+        "pane-runtime-pointer-grid-v1", "live-wait-present" => |req: bmux_pane_runtime_plugin_api::pane_runtime_pointer_grid_v1::client::LiveWaitPresentRequest, ctx| {
+            pointer_grid::select(req.format_version)?;
+            Ok::<_, ServiceResponse>(live_presentation::wait_present(ctx, &req.execution, req.after.as_ref(), req.timeout_ms, req.max_bytes))
+        },
         "pane-runtime-live-presentation-v1", "capabilities" => |_req: (), _ctx| {
             Ok::<_, ServiceResponse>(live_presentation::capabilities())
         },
         "pane-runtime-live-presentation-v1", "read" => |req: bmux_pane_runtime_plugin_api::pane_runtime_live_presentation_v1::client::ReadRequest, ctx| {
-            Ok::<_, ServiceResponse>(live_presentation::read(ctx, &req.execution, req.after.as_ref(), req.max_bytes))
+            pointer_grid::legacy(live_presentation::read(ctx, &req.execution, req.after.as_ref(), req.max_bytes))
         },
         "pane-runtime-live-presentation-v1", "wait-present" => |req: bmux_pane_runtime_plugin_api::pane_runtime_live_presentation_v1::client::WaitPresentRequest, ctx| {
-            Ok::<_, ServiceResponse>(live_presentation::wait_present(ctx, &req.execution, req.after.as_ref(), req.timeout_ms, req.max_bytes))
+            pointer_grid::legacy(live_presentation::wait_present(ctx, &req.execution, req.after.as_ref(), req.timeout_ms, req.max_bytes))
         },
         "pane-runtime-presentation-wait-v1", "capabilities" => |_req: (), _ctx| {
             Ok::<_, ServiceResponse>(crate::runtime::execution::presentation_wait_capabilities())
         },
         "pane-runtime-presentation-wait-v1", "wait-present" => |req: bmux_pane_runtime_plugin_api::pane_runtime_presentation_wait_v1::client::WaitPresentRequest, ctx| {
-            Ok::<_, ServiceResponse>(crate::runtime::execution::wait_present(&req.execution, req.after.as_deref(), req.timeout_ms, req.max_bytes, || execution::authorize(ctx, &req.execution, "read")))
+            pointer_grid::legacy(crate::runtime::execution::wait_present(&req.execution, req.after.as_deref(), req.timeout_ms, req.max_bytes, || execution::authorize(ctx, &req.execution, "read")))
         },
         "pane-runtime-presentation-v1", "capabilities" => |_req: (), _ctx| {
             Ok::<_, ServiceResponse>(Ok::<_, bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::TerminalExecutionError>(bmux_pane_runtime_plugin_api::pane_runtime_presentation_v1::PresentationCapabilities { schema_version: 1, coherent_screen: true, canonical_resize: true }))
@@ -100,7 +136,7 @@ fn route_authorized(context: NativeServiceContext) -> ServiceResponse {
             Ok::<_, ServiceResponse>(spawn::authorize_session(ctx, req.execution.session_id, "read").map_err(|error| bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::TerminalRecoveryError::Denied { reason: format!("{error:?}") }).and_then(|()| crate::runtime::reservations::capture_events(&req.execution, req.format, req.offset, req.max_bytes)))
         },
         "pane-runtime-presentation-v1", "present" => |req: bmux_pane_runtime_plugin_api::pane_runtime_presentation_v1::client::PresentRequest, ctx| {
-            Ok::<_, ServiceResponse>(execution::authorize(ctx, &req.execution, "read").and_then(|()| crate::runtime::execution::screen(&req.execution)))
+            pointer_grid::legacy(execution::authorize(ctx, &req.execution, "read").and_then(|()| crate::runtime::execution::screen(&req.execution)))
         },
         "pane-runtime-execution-v4", "reserve" => |req: bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::client::ReserveRequest, ctx| {
             Ok::<_, ServiceResponse>(crate::runtime::reservations::reserve(req.launch_mutation_id, req.options, |id| spawn::authorize_creation(ctx, id, "session.create").map_err(|error| bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::TerminalRecoveryError::Denied { reason: format!("{error:?}") })))
@@ -149,7 +185,7 @@ fn route_authorized(context: NativeServiceContext) -> ServiceResponse {
             Ok::<_, ServiceResponse>(execution::authorize(ctx, &req.execution, "read").and_then(|()| crate::runtime::execution::status(&req.execution)))
         },
         "pane-runtime-execution-v4", "screen" => |req: bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::client::ScreenRequest, ctx| {
-            Ok::<_, ServiceResponse>(execution::authorize(ctx, &req.execution, "read").and_then(|()| crate::runtime::execution::screen(&req.execution)))
+            pointer_grid::legacy(execution::authorize(ctx, &req.execution, "read").and_then(|()| crate::runtime::execution::screen(&req.execution)))
         },
         "pane-runtime-execution-v4", "send" => |req: bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::client::SendRequest, ctx| {
             Ok::<_, ServiceResponse>(execution::authorize(ctx, &req.execution, "pane.direct_input").and_then(|()| crate::runtime::execution::send(&req.execution, req.data, execution::input_authority(ctx, &req.execution)?)))
@@ -394,13 +430,13 @@ fn route_authorized(context: NativeServiceContext) -> ServiceResponse {
             Ok::<_, ServiceResponse>(attach_state::pane_output_cursor_state(&req))
         },
         "attach-runtime-state", "pane-grid-snapshot-state" => |req: attach_state::PaneGridSnapshotArgs, _ctx| {
-            Ok::<_, ServiceResponse>(attach_state::pane_grid_snapshot_state(&req))
+            pointer_grid::legacy(attach_state::pane_grid_snapshot_state(&req))
         },
         "attach-runtime-state", "attach-pane-grid-snapshot-state" => |req: attach_state::AttachPaneGridSnapshotArgs, ctx| {
-            Ok::<_, ServiceResponse>(attach_state::attach_pane_grid_snapshot_state(&req, ctx))
+            pointer_grid::legacy(attach_state::attach_pane_grid_snapshot_state(&req, ctx))
         },
         "attach-runtime-state", "attach-pane-grid-window-state" => |req: attach_state::AttachPaneGridWindowArgs, ctx| {
-            Ok::<_, ServiceResponse>(attach_state::attach_pane_grid_window_state(&req, ctx))
+            pointer_grid::legacy(attach_state::attach_pane_grid_window_state(&req, ctx))
         },
         "attach-runtime-state", "attach-history-capture-v1" => |req: attach_state::AttachPaneScrollbackPinArgs, ctx| {
             Ok::<_, ServiceResponse>(attach_state::history_capture(&req, ctx))
@@ -418,7 +454,7 @@ fn route_authorized(context: NativeServiceContext) -> ServiceResponse {
             Ok::<_, ServiceResponse>(attach_state::attach_pane_scrollback_unpin(&req, ctx))
         },
         "attach-runtime-state", "attach-pane-grid-delta-state" => |req: attach_state::AttachPaneGridDeltaArgs, ctx| {
-            Ok::<_, ServiceResponse>(attach_state::attach_pane_grid_delta_state(&req, ctx))
+            pointer_grid::legacy(attach_state::attach_pane_grid_delta_state(&req, ctx))
         },
         "attach-runtime-state", "attach-history-images-v1" => |req: attach_state::HistoryImagesArgs, ctx| {
             Ok::<_, ServiceResponse>(attach_state::history_images(&req, ctx))

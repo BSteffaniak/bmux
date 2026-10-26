@@ -1489,6 +1489,88 @@ mod tests {
     }
 
     #[test]
+    fn pointer_stack_survives_structured_recovery_delta_and_raw_pop() {
+        use bmux_terminal_protocol::pointer_shape::PointerShape;
+
+        let pane_id = Uuid::new_v4();
+        let mut producer = TerminalGridStream::new(10, 2, GridLimits::default()).unwrap();
+        producer.process(b"\x1b]22;pointer\x07\x1b]22;>crosshair\x07");
+        let mut pipeline = AttachScenePipeline::new(AttachViewport {
+            cols: 10,
+            rows: 2,
+            top_inset: 0,
+            right_inset: 0,
+            bottom_inset: 0,
+            left_inset: 0,
+        });
+        pipeline
+            .hydrate_pane_grid_snapshots(vec![AttachPaneGridSnapshotState {
+                pane_id,
+                stream_end: 0,
+                snapshot: producer.snapshot(0, 2),
+            }])
+            .unwrap();
+        assert_eq!(
+            pipeline.pane_buffers[&pane_id]
+                .protocol_tracker
+                .protocol_state()
+                .pointer_shapes
+                .current(false),
+            Some(PointerShape::Crosshair)
+        );
+        let delta = producer
+            .process_delta(b"\x1b]22;<\x07\x1b]22;>wait\x07\x1b]22;")
+            .unwrap();
+        pipeline
+            .apply_pane_grid_deltas(vec![AttachPaneGridDeltaState {
+                pane_id,
+                batches: vec![delta],
+            }])
+            .unwrap();
+        let buffer = &pipeline.pane_buffers[&pane_id];
+        assert_eq!(
+            buffer.protocol_tracker.protocol_state(),
+            producer.grid().protocol_state()
+        );
+        // Raw delivery updates only the tracker, including the hydrated prefix.
+        let data = b"<\x07".to_vec();
+        pipeline.apply_chunk(&AttachPaneChunk {
+            pane_id,
+            stream_start: 0,
+            stream_end: 2,
+            data,
+            stream_gap: false,
+            sync_update_active: false,
+        });
+        assert_eq!(
+            pipeline.pane_buffers[&pane_id]
+                .protocol_tracker
+                .protocol_state()
+                .pointer_shapes
+                .current(false),
+            Some(PointerShape::Pointer)
+        );
+        // A new execution's snapshot must replace, not merge, the old stack.
+        let replacement = TerminalGridStream::new(10, 2, GridLimits::default()).unwrap();
+        pipeline
+            .hydrate_pane_grid_snapshots(vec![AttachPaneGridSnapshotState {
+                pane_id,
+                stream_end: 0,
+                snapshot: replacement.snapshot(0, 2),
+            }])
+            .unwrap();
+        let buffer = &pipeline.pane_buffers[&pane_id];
+        assert_eq!(
+            buffer.protocol_tracker.protocol_state(),
+            replacement.grid().protocol_state()
+        );
+        assert_eq!(
+            buffer.terminal_grid.grid().protocol_state(),
+            replacement.grid().protocol_state()
+        );
+    }
+
+    #[test]
     fn raw_chunk_updates_continuity_and_protocol_without_mutating_grid() {
         let pane_id = Uuid::new_v4();
         let mut pipeline = AttachScenePipeline::new(AttachViewport {

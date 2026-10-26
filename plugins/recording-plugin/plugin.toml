@@ -10,6 +10,7 @@ optional_capabilities = [
     "bmux.pane_runtime.human.input.v1",
     "bmux.pane_runtime.presentation.v1",
     "bmux.pane_runtime.presentation.wait.v1",
+    "bmux.pane_runtime.pointer_grid.v1",
 ]
 provided_capabilities = [
     "bmux.recording.process.environment.v1",

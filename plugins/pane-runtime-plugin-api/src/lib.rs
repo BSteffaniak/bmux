@@ -1,7 +1,7 @@
 //! Typed public API of the bmux pane-runtime plugin.
 //!
 //! This crate is the stable contract core + other plugins depend on
-//! for the pane-runtime domain. Five modules are generated from
+//! for the pane-runtime domain. Modules are generated from
 //! `bpdl/pane-runtime-plugin.bpdl` at compile time via the
 //! [`bmux_plugin_schema_macros::schema!`] macro:
 //! - [`pane_runtime_state`] — queries over pane/session runtime.
@@ -9,6 +9,8 @@
 //! - [`attach_runtime_commands`] — per-client attach lifecycle.
 //! - [`attach_runtime_state`] — attach-view queries.
 //! - [`pane_runtime_events`] — lifecycle event stream.
+//! - [`pane_runtime_pointer_grid_v1`] — explicitly selected pointer-aware
+//!   snapshot/delta/window and execution presentation representation.
 
 #![cfg_attr(feature = "fail-on-warnings", deny(warnings))]
 #![warn(clippy::all, clippy::pedantic)]
@@ -105,6 +107,54 @@ mod tests {
         assert_eq!(bmux_codec::to_vec(&execution).unwrap(), expected);
         let decoded: TerminalExecutionRef = bmux_codec::from_bytes(&expected).unwrap();
         assert_eq!(decoded, execution);
+    }
+
+    #[test]
+    fn pointer_grid_selection_is_a_distinct_generated_contract() {
+        use super::pane_runtime_execution_v4::TerminalExecutionRef;
+        use super::pane_runtime_pointer_grid_v1::{
+            GridCapabilities,
+            client::{DeltasRequest, ScreenRequest, SnapshotsRequest},
+        };
+        let session_id = uuid::Uuid::new_v4();
+        let pane_id = uuid::Uuid::new_v4();
+        let snapshots = SnapshotsRequest {
+            format_version: 1,
+            session_id,
+            pane_ids: vec![pane_id],
+            max_rows_per_pane: 24,
+        };
+        let encoded = bmux_codec::to_vec(&snapshots).unwrap();
+        let decoded: SnapshotsRequest = bmux_codec::from_bytes(&encoded).unwrap();
+        assert_eq!(decoded.format_version, 1);
+        assert_eq!(decoded.pane_ids, vec![pane_id]);
+        let deltas = DeltasRequest {
+            format_version: 1,
+            session_id,
+            pane_ids: vec![pane_id],
+            base_revisions: vec![7],
+            max_batches_per_pane: 16,
+        };
+        let encoded = bmux_codec::to_vec(&deltas).unwrap();
+        let decoded: DeltasRequest = bmux_codec::from_bytes(&encoded).unwrap();
+        assert_eq!(decoded.base_revisions, vec![7]);
+        let screen = ScreenRequest {
+            format_version: 1,
+            execution: TerminalExecutionRef {
+                session_id,
+                pane_id,
+                execution_token: uuid::Uuid::new_v4(),
+            },
+        };
+        let encoded = bmux_codec::to_vec(&screen).unwrap();
+        let decoded: ScreenRequest = bmux_codec::from_bytes(&encoded).unwrap();
+        assert_eq!(decoded.execution, screen.execution);
+        let capabilities = GridCapabilities {
+            format_versions: vec![1],
+        };
+        let encoded = bmux_codec::to_vec(&capabilities).unwrap();
+        let decoded: GridCapabilities = bmux_codec::from_bytes(&encoded).unwrap();
+        assert_eq!(decoded.format_versions, vec![1]);
     }
 
     #[test]

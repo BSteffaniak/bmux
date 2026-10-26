@@ -1,5 +1,7 @@
 #![cfg_attr(feature = "fail-on-warnings", deny(warnings))]
 
+pub mod pointer_shape;
+
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};

@@ -28,6 +28,13 @@ impl RetainedOpacity {
     }
 }
 
+/// Pointer intent selected from the retained scene, before protocol mapping.
+pub(crate) enum RetainedPointerTarget {
+    Cursor(bmux_plugin::surface::PluginSurfaceCursor),
+    Content(Uuid),
+    Blocked,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RetainedSurfacePayload {
     RenderOps(Vec<RenderOp>),
@@ -64,6 +71,12 @@ pub struct RetainedSurface {
     pub owner: Option<bmux_plugin::surface::PluginSurfaceId>,
     pub metadata: Option<bmux_plugin::surface::PluginSurfaceMetadata>,
     pub rect: DamageRect,
+    /// Absolute content bounds, independent of paint and interaction geometry.
+    /// None means the whole surface; an empty rectangle means no content area.
+    pub content_rect: Option<DamageRect>,
+    /// Whether retained pointer intent may target this surface. Noninteractive
+    /// surfaces still paint and occlude lower surfaces.
+    pub accepts_input: bool,
     pub layer: i16,
     pub z: i32,
     pub opaque: bool,
@@ -114,6 +127,8 @@ impl RetainedSurface {
             owner: None,
             metadata: None,
             rect,
+            content_rect: None,
+            accepts_input: true,
             layer,
             z,
             opaque: opacity.is_opaque(),
@@ -124,6 +139,19 @@ impl RetainedSurface {
             interactive_regions: Vec::new(),
             payload,
         }
+    }
+
+    /// Set authoritative absolute content bounds without clipping paint or input.
+    #[must_use]
+    pub const fn with_content_rect(mut self, content_rect: DamageRect) -> Self {
+        self.content_rect = Some(content_rect);
+        self
+    }
+
+    #[must_use]
+    pub const fn with_accepts_input(mut self, accepts_input: bool) -> Self {
+        self.accepts_input = accepts_input;
+        self
     }
 
     #[must_use]
@@ -237,6 +265,7 @@ pub fn retained_surfaces_from_plugin_surfaces(
             };
             let mut retained = builder.build();
             retained.owner = Some(surface.id.clone());
+            retained.accepts_input = surface.accepts_input;
             retained.metadata.clone_from(&surface.metadata);
             Some(retained)
         })
@@ -596,6 +625,46 @@ impl RetainedPointerRouter {
         self.captured.take()
     }
 
+    /// Resolve capture metadata using the same revision and identity retargeting
+    /// as drag/up delivery. Capture intentionally survives leaving its rectangle.
+    pub(crate) fn captured_cursor(
+        &self,
+        compositor: &RetainedCompositor,
+    ) -> Option<bmux_plugin::surface::PluginSurfaceCursor> {
+        let captured = self.captured.as_ref()?;
+        let hit = retarget_hit(
+            compositor,
+            captured,
+            captured.absolute_x,
+            captured.absolute_y,
+            self.preserve_capture_across_revisions,
+        )?;
+        let surface = compositor.surfaces.get(&hit.surface_id)?;
+        if !surface.accepts_input {
+            return None;
+        }
+        let region = surface.interactive_regions.get(hit.region_index)?;
+        region.id.as_ref()?;
+        let visible = intersect_rects(surface.paint_rect()?, region.rect)?;
+        if compositor.surfaces.values().any(|other| {
+            other.z_key() > surface.z_key() && other.modal && other.paint_rect().is_some()
+        }) {
+            return None;
+        }
+        let occluders = compositor
+            .surfaces
+            .values()
+            .filter(|other| {
+                other.z_key() > surface.z_key() && other.opacity != RetainedOpacity::Transparent
+            })
+            .filter_map(|other| intersect_rects(visible, other.paint_rect()?))
+            .collect::<Vec<_>>();
+        if !rect_has_uncovered_area(visible, &occluders) {
+            return None;
+        }
+        compositor.cursor_for_hit(&hit)
+    }
+
     #[must_use]
     pub fn route_terminal_mouse(
         &mut self,
@@ -941,6 +1010,44 @@ impl RetainedCompositor {
         let mut surfaces = self.surfaces.values().collect::<Vec<_>>();
         surfaces.sort_by_key(|surface| surface.z_key());
         surfaces
+    }
+
+    /// Resolve presentation intent in paint order. Unlike input hit testing,
+    /// opaque padding must stop lookup even when it has no input region.
+    pub(crate) fn pointer_target(&self, x: u16, y: u16) -> Option<RetainedPointerTarget> {
+        for surface in self.ordered_surfaces().into_iter().rev() {
+            let Some(rect) = surface.paint_rect() else {
+                continue;
+            };
+            if !rect_contains_point(rect, x, y) {
+                continue;
+            }
+            // Anonymous runtime regions describe content interaction, not an
+            // explicit chrome cursor. Do not replace content intent with their
+            // default-initialized metadata.
+            if let Some(region) = surface.interactive_regions.iter().rev().find(|region| {
+                surface.accepts_input
+                    && (region.id.is_some()
+                        || !matches!(surface.payload, RetainedSurfacePayload::Content { .. }))
+                    && rect_contains_point(region.rect, x, y)
+            }) {
+                return Some(RetainedPointerTarget::Cursor(region.cursor));
+            }
+            if let RetainedSurfacePayload::Content { content_id } = &surface.payload {
+                if surface.accepts_input
+                    && rect_contains_point(surface.content_rect.unwrap_or(surface.rect), x, y)
+                {
+                    return Some(RetainedPointerTarget::Content(*content_id));
+                }
+                // Decoration and disabled content must not borrow an underlying
+                // execution's shape, even when this surface is transparent.
+                return Some(RetainedPointerTarget::Blocked);
+            }
+            if surface.modal || surface.opacity != RetainedOpacity::Transparent {
+                return Some(RetainedPointerTarget::Blocked);
+            }
+        }
+        None
     }
 
     #[must_use]
@@ -1405,6 +1512,8 @@ pub fn retained_surfaces_from_attach_scene(scene: &AttachScene) -> Vec<RetainedS
                 RetainedOpacity::from_opaque(surface.opaque),
                 payload,
             )
+            .with_content_rect(damage_rect_from_attach_rect(surface.content_rect))
+            .with_accepts_input(surface.accepts_input)
             .with_interactive_regions(
                 surface
                     .interactive_regions
@@ -1526,6 +1635,8 @@ fn retained_surface_metadata_equal(previous: &RetainedSurface, next: &RetainedSu
         && previous.opaque == next.opaque
         && previous.opacity == next.opacity
         && previous.clip_rect == next.clip_rect
+        && previous.content_rect == next.content_rect
+        && previous.accepts_input == next.accepts_input
         && previous.interactive_regions == next.interactive_regions
 }
 
@@ -1642,6 +1753,36 @@ fn coalesce_absolute_damage(
     } else {
         RetainedDamage::Regions(merged)
     }
+}
+
+/// Sweep rectangle edges rather than terminal cells. Memory is linear in the
+/// retained occluder count and independent of terminal dimensions.
+fn rect_has_uncovered_area(rect: DamageRect, occluders: &[DamageRect]) -> bool {
+    let mut edges = vec![rect.x, rect.right()];
+    for cover in occluders {
+        edges.extend([cover.x, cover.right()]);
+    }
+    edges.sort_unstable();
+    edges.dedup();
+    for slab in edges.windows(2) {
+        let mut intervals = occluders
+            .iter()
+            .filter(|cover| cover.x <= slab[0] && cover.right() >= slab[1])
+            .map(|cover| (cover.y, cover.bottom()))
+            .collect::<Vec<_>>();
+        intervals.sort_unstable();
+        let mut bottom = rect.y;
+        for (start, end) in intervals {
+            if start > bottom {
+                return true;
+            }
+            bottom = bottom.max(end);
+        }
+        if bottom < rect.bottom() {
+            return true;
+        }
+    }
+    false
 }
 
 const fn rect_contains_point(rect: DamageRect, x: u16, y: u16) -> bool {

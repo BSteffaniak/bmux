@@ -12,7 +12,159 @@ use bmux_tui::selection::{SelectionFragment, SelectionScene, SelectionScope};
 use bmux_tui::semantic::{SemanticRegion, SemanticScene};
 use std::sync::atomic::{AtomicBool, Ordering};
 
+#[test]
+fn stationary_pointer_follows_only_successfully_delivered_native_scene() {
+    use bmux_attach_pipeline::pointer_shape::ResolvedPointerShape;
+    use bmux_terminal_protocol::pointer_shape::PointerShape;
+    let fixture = attach_view_state_with_scrollback_fixture();
+    let layout = fixture.cached_layout_state.clone().unwrap();
+    let mut view = AttachViewState::with_private_presentation(AttachOpenInfo {
+        context_id: None,
+        session_id: layout.session_id,
+        can_write: true,
+    });
+    view.pane_buffers = fixture.pane_buffers;
+    view.presentation_only = true;
+    view.mouse.config.pointer_shapes = true;
+    view.mouse.last_position = Some((1, 0));
+    let rejected = Arc::new(AtomicBool::new(false));
+    let reject = Arc::clone(&rejected);
+    let pointers = Arc::new(Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&pointers);
+    let publisher = super::super::observer::AttachObserverPublisher::for_prepared_delivery(
+        1,
+        move |delivery| {
+            anyhow::ensure!(!reject.load(Ordering::SeqCst), "injected failure");
+            recorded.lock().unwrap().push(delivery.pointer_shape);
+            Ok(())
+        },
+    );
+    view.set_observer(publisher);
+    publish(&view, 1, 1);
+    render(&mut view, &layout);
+    let text = Some(ResolvedPointerShape::Shape(PointerShape::Text));
+    assert_eq!(view.last_pointer_shape, text);
+    assert_eq!(pointers.lock().unwrap().last(), Some(&text));
+    let graph = view.retained_compositor.clone();
+    rejected.store(true, Ordering::SeqCst);
+    publish_with_cursor(
+        &view,
+        2,
+        1,
+        bmux_plugin::surface::PluginSurfaceCursor::Pointer,
+    );
+    view.dirty
+        .mark_retained_surfaces_dirty(AttachDirtySource::SceneChanged);
+    render(&mut view, &layout);
+    assert_eq!(view.retained_compositor, graph);
+    assert_eq!(view.last_pointer_shape, text);
+    assert_eq!(pointers.lock().unwrap().last(), Some(&text));
+    rejected.store(false, Ordering::SeqCst);
+    // Rejected output deliberately suppresses automatic repaint. Model the
+    // generation-matched native retry event rather than calling an idle render.
+    request_native_presentation_retry(&mut view, Some(1), 1);
+    render(&mut view, &layout);
+    assert_eq!(
+        view.last_pointer_shape,
+        Some(ResolvedPointerShape::Shape(PointerShape::Pointer))
+    );
+    assert_eq!(
+        pointers.lock().unwrap().last(),
+        Some(&view.last_pointer_shape)
+    );
+}
+
+#[test]
+fn failed_pointer_only_delivery_retries_the_committed_scene_without_false_cache_commit() {
+    use bmux_attach_pipeline::pointer_shape::ResolvedPointerShape;
+    use bmux_terminal_protocol::pointer_shape::PointerShape;
+    let fixture = attach_view_state_with_scrollback_fixture();
+    let layout = fixture.cached_layout_state.clone().unwrap();
+    let mut view = AttachViewState::with_private_presentation(AttachOpenInfo {
+        context_id: None,
+        session_id: layout.session_id,
+        can_write: true,
+    });
+    view.pane_buffers = fixture.pane_buffers;
+    view.presentation_only = true;
+    view.mouse.config.pointer_shapes = true;
+    view.mouse.last_position = Some((1, 0));
+    let pointer = Some(ResolvedPointerShape::Shape(PointerShape::Pointer));
+    let text = Some(ResolvedPointerShape::Shape(PointerShape::Text));
+    let rejected = Arc::new(AtomicBool::new(true));
+    let reject = Arc::clone(&rejected);
+    let deliveries = Arc::new(Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&deliveries);
+    view.set_observer(
+        super::super::observer::AttachObserverPublisher::for_prepared_delivery(
+            1,
+            move |delivery| {
+                anyhow::ensure!(
+                    delivery.pointer_shape != pointer || !reject.load(Ordering::SeqCst),
+                    "injected pointer-only failure"
+                );
+                recorded.lock().unwrap().push(delivery);
+                Ok(())
+            },
+        ),
+    );
+    publish(&view, 1, 1);
+    render(&mut view, &layout);
+    publish_with_cursor(
+        &view,
+        2,
+        1,
+        bmux_plugin::surface::PluginSurfaceCursor::Pointer,
+    );
+    view.dirty
+        .mark_retained_surfaces_dirty(AttachDirtySource::SceneChanged);
+    assert!(
+        render_attach_frame_to_output(
+            None,
+            &mut view,
+            &layout,
+            &RuntimeAppearance::default(),
+            &[],
+            0,
+            &bmux_config::DamageBehaviorConfig::default(),
+            u64::MAX,
+            &mut DisplayCaptureFanout::default(),
+            TerminalGeometry { cols: 80, rows: 24 },
+            None,
+        )
+        .is_err()
+    );
+    assert_eq!(view.pointer_shape, pointer);
+    assert_eq!(view.last_pointer_shape, text);
+    let graph = view.retained_compositor.clone();
+    let committed = deliveries.lock().unwrap().last().unwrap().clone();
+    rejected.store(false, Ordering::SeqCst);
+    present_committed_pointer_shape(&mut view).unwrap();
+    assert_eq!(view.last_pointer_shape, pointer);
+    assert_eq!(view.retained_compositor, graph);
+    let retried = deliveries.lock().unwrap().last().unwrap().clone();
+    assert_eq!(retried.pointer_shape, pointer);
+    assert_eq!(retried.prepared.buffer(), committed.prepared.buffer());
+    assert_eq!(retried.prepared.selection(), committed.prepared.selection());
+    assert_eq!(retried.prepared.semantics(), committed.prepared.semantics());
+    assert!(retried.identity.revision > committed.identity.revision);
+}
+
 fn publish(view: &AttachViewState, revision: u64, x: u16) {
+    publish_with_cursor(
+        view,
+        revision,
+        x,
+        bmux_plugin::surface::PluginSurfaceCursor::Text,
+    );
+}
+
+fn publish_with_cursor(
+    view: &AttachViewState,
+    revision: u64,
+    x: u16,
+    cursor: bmux_plugin::surface::PluginSurfaceCursor,
+) {
     let area = Rect::new(0, 0, 4, 1);
     let mut selection = SelectionScene::new();
     selection.push_scope(SelectionScope::new("scope", area).revision(revision));
@@ -33,7 +185,7 @@ fn publish(view: &AttachViewState, revision: u64, x: u16) {
                 interface_id: "input".into(),
                 operation: "handle".into(),
             })
-            .focusable(bmux_plugin::surface::PluginSurfaceCursor::Text),
+            .focusable(cursor),
     );
     surface.layer = 100;
     surface.target = PluginSurfaceTarget::Explicit(ExtensionRect::new(x, 0, 4, 1));

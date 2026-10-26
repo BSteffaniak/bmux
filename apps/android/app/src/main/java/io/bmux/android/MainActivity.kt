@@ -40,6 +40,8 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import io.bmux.android.terminal.TerminalEndpoint
+import io.bmux.android.terminal.TerminalPointerFrame
+import uniffi.bmux_mobile_ffi.TerminalPointerShapeFfi
 import io.bmux.android.terminal.TerminalChunkFrame
 import io.bmux.android.terminal.TerminalChunkType
 import io.bmux.android.terminal.TerminalDiagnosticFrame
@@ -449,7 +451,8 @@ private class MobileGateway(application: Application) {
             IllegalStateException("FFI terminal stream unavailable"),
         )
         return runGatewayCall {
-            client.pollTerminalOutput(terminalId, maxChunks.toUInt()).map { chunk ->
+            val presentation = client.pollTerminalPresentation(terminalId, maxChunks.toUInt(), 1u)
+            val chunks = presentation.chunks.map { chunk ->
                 TerminalChunkFrame(
                     kind = when (chunk.kind) {
                         TerminalChunkKindFfi.STDOUT -> TerminalChunkType.STDOUT
@@ -465,6 +468,20 @@ private class MobileGateway(application: Application) {
                     },
                 )
             }
+            val pointer = presentation.pointer
+            if (pointer == null) chunks else chunks + TerminalChunkFrame(
+                kind = TerminalChunkType.POINTER,
+                bytes = byteArrayOf(),
+                pointer = TerminalPointerFrame(
+                    version = pointer.version.toInt(),
+                    generation = pointer.generation,
+                    revision = pointer.revision,
+                    name = when (val shape = pointer.shape) {
+                        is TerminalPointerShapeFfi.Hidden -> null
+                        is TerminalPointerShapeFfi.Shape -> shape.name
+                    },
+                ),
+            )
         }
     }
 
@@ -490,6 +507,7 @@ private class MobileGateway(application: Application) {
                         TerminalMouseEventKind.UP -> TerminalMouseEventKindFfi.UP
                         TerminalMouseEventKind.DRAG -> TerminalMouseEventKindFfi.DRAG
                         TerminalMouseEventKind.MOVE -> TerminalMouseEventKindFfi.MOVE
+                        TerminalMouseEventKind.LEAVE -> TerminalMouseEventKindFfi.LEAVE
                         TerminalMouseEventKind.SCROLL_UP -> TerminalMouseEventKindFfi.SCROLL_UP
                         TerminalMouseEventKind.SCROLL_DOWN -> TerminalMouseEventKindFfi.SCROLL_DOWN
                         TerminalMouseEventKind.SCROLL_LEFT -> TerminalMouseEventKindFfi.SCROLL_LEFT

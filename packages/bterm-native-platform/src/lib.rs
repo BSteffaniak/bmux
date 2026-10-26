@@ -8,6 +8,8 @@ pub mod ime;
 pub mod input;
 mod window;
 
+pub use winit::window::CursorIcon;
+
 pub use geometry::{LogicalSize, PhysicalRect, PhysicalSize, WindowMetrics};
 pub use window::{
     PlatformError, PlatformEvent, PlatformProxy, SurfaceTarget, WindowApplication, WindowContext,

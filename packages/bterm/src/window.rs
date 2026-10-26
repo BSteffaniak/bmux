@@ -329,6 +329,7 @@ mod tests {
                 revision: 1,
                 viewport_generation: 1,
             },
+            pointer_shape: None,
             prepared: Arc::new(
                 PresentationState::new(Rect::new(0, 0, 1, 1))
                     .prepare(Damage::Full, |_| {})

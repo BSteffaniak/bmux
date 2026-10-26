@@ -32,6 +32,9 @@ pub(crate) fn migrated_route(interface: &str, operation: &str) -> bool {
             "pane-runtime-presentation-wait-v1",
             "capabilities" | "wait-present"
         ) | (
+            "pane-runtime-pointer-grid-v1",
+            "capabilities" | "screen" | "wait-present"
+        ) | (
             "pane-runtime-spawn-commands-v1",
             "new-session" | "split-shell"
         ) | (

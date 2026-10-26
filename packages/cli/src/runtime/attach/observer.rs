@@ -331,6 +331,7 @@ impl AttachObserverPublisher {
         prepared: PreparedPresentation,
         graph: &RetainedCompositor,
         stream_ends: &std::collections::BTreeMap<Uuid, Option<u64>>,
+        pointer_shape: Option<bmux_attach_pipeline::pointer_shape::ResolvedPointerShape>,
     ) -> anyhow::Result<()> {
         let Some(revision) = self.revision.checked_add(1) else {
             anyhow::bail!("attach presentation revision exhausted");
@@ -352,6 +353,7 @@ impl AttachObserverPublisher {
                     viewport_generation: *viewport_generation,
                 },
                 prepared: Arc::new(prepared.clone()),
+                pointer_shape,
             };
             // These bindings come from the serialized attach owner, not an
             // incoming transport frame. The UI independently validates its live
@@ -485,6 +487,31 @@ fn unsupported_metadata(graph: &RetainedCompositor) -> &'static [&'static str] {
     }
 }
 
+/// Reuse the accepted prepared scene for a pointer-only transition. There is no
+/// second composition authority and no terminal byte output on this path.
+pub(super) fn deliver_pointer_shape(
+    view: &mut super::state::AttachViewState,
+) -> anyhow::Result<()> {
+    let Some(publisher) = view.observer.as_mut() else {
+        anyhow::bail!("pointer delivery requires a committed presentation publisher");
+    };
+    let Some(snapshot) = publisher.latest_committed() else {
+        anyhow::bail!("pointer delivery requires a successfully presented scene");
+    };
+    let stream_ends = view
+        .pane_buffers
+        .iter()
+        .map(|(id, buffer)| (*id, buffer.expected_stream_start))
+        .collect();
+    publisher.publish(
+        view.attached_id,
+        snapshot.prepared.clone(),
+        &view.retained_compositor,
+        &stream_ends,
+        view.pointer_shape,
+    )
+}
+
 pub(super) fn deliver_prepared(
     view: &mut super::state::AttachViewState,
     layout: &bmux_client::AttachLayoutState,
@@ -606,10 +633,11 @@ fn deliver_prepared_inner(
         .collect();
     let attached = view.attached_id;
     let graph = &view.retained_compositor;
+    let pointer_shape = view.pointer_shape;
     view.presentation
         .present_prepared(Some(prepared), |frame, _| {
             output()?;
-            publisher.publish(attached, frame.clone(), graph, &stream_ends)
+            publisher.publish(attached, frame.clone(), graph, &stream_ends, pointer_shape)
         })?;
     Ok(())
 }
@@ -873,17 +901,19 @@ mod tests {
         let target = Uuid::new_v4();
         let ends = std::collections::BTreeMap::new();
         publisher
-            .publish(target, prepared.clone(), &graph, &ends)
+            .publish(target, prepared.clone(), &graph, &ends, None)
             .unwrap();
         let committed = observer.latest().unwrap();
         assert!(
             publisher
-                .publish(target, prepared.clone(), &graph, &ends)
+                .publish(target, prepared.clone(), &graph, &ends, None)
                 .is_err()
         );
         assert!(Arc::ptr_eq(&committed, &observer.latest().unwrap()));
         assert_eq!(publisher.committed_prepared_identity().unwrap().revision, 1);
-        publisher.publish(target, prepared, &graph, &ends).unwrap();
+        publisher
+            .publish(target, prepared, &graph, &ends, None)
+            .unwrap();
         assert_eq!(publisher.committed_prepared_identity().unwrap().revision, 3);
         let seen = seen.lock().unwrap();
         assert_eq!(
@@ -897,6 +927,57 @@ mod tests {
         assert_eq!(observer.latest().unwrap().revision, 2);
         publisher.set_prepared_viewport_generation(8).unwrap();
         assert!(publisher.set_prepared_viewport_generation(7).is_err());
+    }
+
+    #[test]
+    fn prepared_pointer_intent_is_typed_and_failed_delivery_is_not_committed() {
+        use bmux_attach_pipeline::pointer_shape::ResolvedPointerShape;
+        use bmux_terminal_protocol::pointer_shape::PointerShape;
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&seen);
+        let mut publisher = AttachObserverPublisher::for_prepared_delivery(1, move |delivery| {
+            recorded.lock().unwrap().push(delivery.pointer_shape);
+            anyhow::ensure!(
+                delivery.pointer_shape != Some(ResolvedPointerShape::Hidden),
+                "rejected pointer"
+            );
+            Ok(())
+        });
+        let prepared = PresentationState::new(Rect::new(0, 0, 1, 1))
+            .prepare(Damage::Full, |_| {})
+            .unwrap();
+        let graph = RetainedCompositor::new();
+        let ends = std::collections::BTreeMap::new();
+        let explicit_default = Some(ResolvedPointerShape::Shape(PointerShape::Default));
+        publisher
+            .publish(
+                Uuid::nil(),
+                prepared.clone(),
+                &graph,
+                &ends,
+                explicit_default,
+            )
+            .unwrap();
+        let committed = publisher.committed_prepared_identity().unwrap();
+        assert!(
+            publisher
+                .publish(
+                    Uuid::nil(),
+                    prepared.clone(),
+                    &graph,
+                    &ends,
+                    Some(ResolvedPointerShape::Hidden)
+                )
+                .is_err()
+        );
+        assert_eq!(publisher.committed_prepared_identity().unwrap(), committed);
+        publisher
+            .publish(Uuid::nil(), prepared, &graph, &ends, None)
+            .unwrap();
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![explicit_default, Some(ResolvedPointerShape::Hidden), None]
+        );
     }
 
     #[test]
@@ -914,6 +995,7 @@ mod tests {
                 prepared,
                 &RetainedCompositor::new(),
                 &std::collections::BTreeMap::new(),
+                None,
             )
             .unwrap();
         assert_eq!(publisher.revision, 1);
@@ -1072,6 +1154,7 @@ mod tests {
                     state.prepare(Damage::Full, |_| {}).unwrap(),
                     &RetainedCompositor::new(),
                     &std::collections::BTreeMap::new(),
+                    None,
                 )
                 .unwrap();
         }

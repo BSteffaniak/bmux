@@ -317,6 +317,7 @@ pub struct AttachViewState {
     pub pane_mouse_protocol_hints: BTreeMap<Uuid, AttachMouseProtocolState>,
     pub pane_input_mode_hints: BTreeMap<Uuid, AttachInputModeState>,
     pub cached_layout_state: Option<AttachLayoutState>,
+    pub(super) pointer_layout: Option<AttachLayoutState>,
     pub last_attach_view_revision: Option<(Uuid, u64)>,
     pub retained_compositor: RetainedCompositor,
     /// IDs of owner-scoped plugin surfaces committed into the retained graph.
@@ -331,6 +332,10 @@ pub struct AttachViewState {
     pub last_prompt_overlay_surface: Option<AttachSurface>,
     pub last_cursor_state: Option<AttachCursorState>,
     pub force_cursor_move_next_frame: bool,
+    /// Pointer intent resolved from committed interaction metadata.
+    pub(super) pointer_shape: Option<bmux_attach_pipeline::pointer_shape::ResolvedPointerShape>,
+    pub(super) last_pointer_shape:
+        Option<bmux_attach_pipeline::pointer_shape::ResolvedPointerShape>,
     pub mouse: AttachMouseState,
     /// Active inline tab rename editor, when a tab label is being edited.
     /// Open tab context menu, when one has been summoned.
@@ -691,6 +696,7 @@ impl AttachViewState {
             pane_mouse_protocol_hints: BTreeMap::new(),
             pane_input_mode_hints: BTreeMap::new(),
             cached_layout_state: None,
+            pointer_layout: None,
             last_attach_view_revision: None,
             retained_compositor: RetainedCompositor::new(),
             retained_plugin_surface_ids: BTreeSet::new(),
@@ -701,6 +707,8 @@ impl AttachViewState {
             last_prompt_overlay_surface: None,
             last_cursor_state: None,
             force_cursor_move_next_frame: false,
+            pointer_shape: None,
+            last_pointer_shape: None,
             mouse: AttachMouseState {
                 config: MouseBehaviorConfig::default(),
                 ..AttachMouseState::default()

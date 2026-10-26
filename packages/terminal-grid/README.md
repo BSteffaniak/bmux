@@ -5,6 +5,34 @@ terminal rows, style runs, cursor state, alternate-screen state, and soft-wrap
 metadata so retained scrollback can be reflowed on resize without replaying raw
 PTY bytes.
 
+## OSC 22 state and queries
+
+`ProtocolState.pointer_shapes` retains independent main/alternate 16-entry
+stacks
+as `Copy` state. Screen transitions preserve both stacks; terminal reset clears
+both. Empty setters replace only the active top with unset. Stack-only mutations
+advance `revision`, not `content_revision`; queries do not mutate terminal
+state.
+
+`TerminalGridStream::process_with_pointer_queries(bytes, |query, current| ...)`
+invokes its callback synchronously for each completed query in parse order.
+`query` excludes `22;?`; `current` is the active canonical requested shape (or
+unset), not host hover state. Ordinary `process` ignores query notifications.
+The caller supplies default/grabbed policy and routes encoded replies only to
+the originating execution. The separate protocol engine must not answer from
+another pointer stack.
+
+Snapshots/deltas carry complete stacks, including inactive/unset entries, in
+`protocol`; `pending_bytes` preserves incomplete OSC 22 syntax and overflow
+state.
+Hydration reconstructs parser continuity without applying operations or emitting
+replies. Oversized OSC 22 strings are ignored wholesale. Legacy non-OSC-22
+string
+decoder behavior is unchanged. Pointer state is version 1 with validated fixed
+storage; a missing legacy field defaults empty, while corrupt or unsupported
+explicit state fails decoding. Transport owners must negotiate pointer-aware
+snapshot support rather than assume an older consumer preserves unknown fields.
+
 ## Embedding a transcript
 
 Keep the `TerminalGridStream` at the execution dimensions. Feed recorded output

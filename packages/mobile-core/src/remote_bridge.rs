@@ -189,12 +189,21 @@ pub trait TerminalBackend: Send + Sync {
     /// call fails.
     fn poll_output(&self, handle_id: Uuid, max_bytes: usize) -> Result<Vec<u8>>;
 
-    /// Writes terminal input bytes for an open session.
+    /// Return complete native pointer metadata after queued bytes are drained.
     ///
     /// # Errors
-    ///
-    /// Returns an error if the session handle is unknown or the remote input
-    /// call fails.
+    /// Returns unsupported-version or backend errors.
+    fn pointer_output(
+        &self,
+        _handle_id: Uuid,
+        version: u32,
+    ) -> Result<Option<crate::pointer_output::TerminalPointerOutput>> {
+        crate::pointer_output::validate_pointer_version(version)?;
+        Ok(None)
+    }
+
+    /// # Errors
+    /// Returns backend lookup or input errors.
     fn write_input(&self, handle_id: Uuid, bytes: &[u8]) -> Result<()>;
 
     /// Sends a terminal mouse event for an open session.
@@ -235,6 +244,10 @@ enum SessionCommand {
     PollOutput {
         max_bytes: usize,
         response: oneshot::Sender<Result<Vec<u8>>>,
+    },
+    PointerOutput {
+        version: u32,
+        response: oneshot::Sender<Result<Option<crate::pointer_output::TerminalPointerOutput>>>,
     },
     WriteInput {
         bytes: Vec<u8>,
@@ -1101,6 +1114,18 @@ impl TerminalBackend for RemoteTerminalBackend {
         })
     }
 
+    fn pointer_output(
+        &self,
+        handle_id: Uuid,
+        version: u32,
+    ) -> Result<Option<crate::pointer_output::TerminalPointerOutput>> {
+        crate::pointer_output::validate_pointer_version(version)?;
+        self.call_session(handle_id, |response| SessionCommand::PointerOutput {
+            version,
+            response,
+        })
+    }
+
     fn write_input(&self, handle_id: Uuid, bytes: &[u8]) -> Result<()> {
         self.call_session(handle_id, |response| SessionCommand::WriteInput {
             bytes: bytes.to_vec(),
@@ -1174,8 +1199,14 @@ async fn run_remote_terminal_session(
     let mut state = StreamOutputState::new(viewport);
     if let Some(snapshot) = initial_snapshot {
         state.hydrate_snapshot(snapshot);
-        let _ = hydrate_visible_grid_snapshots(&mut client, &mut state, session_id).await;
-        let _ = state.render_if_dirty();
+        if let Err(error) =
+            hydrate_visible_grid_snapshots(&mut client, &mut state, session_id).await
+        {
+            set_session_terminated_reason(&actor_state, error.to_string());
+        }
+        if let Err(error) = state.render_if_dirty() {
+            set_session_terminated_reason(&actor_state, error.to_string());
+        }
     }
 
     let mut event_stream_open = true;
@@ -1211,7 +1242,9 @@ async fn run_remote_terminal_session(
                     );
                     continue;
                 };
-                handle_session_event(&mut client, &mut state, session_id, event).await;
+                if let Err(error) = handle_session_event(&mut client, &mut state, session_id, event).await {
+                    set_session_terminated_reason(&actor_state, error.to_string());
+                }
             }
             _ = keepalive.tick(), if event_stream_open => {
                 if let Err(error) = client.ping().await {
@@ -1228,6 +1261,38 @@ async fn run_remote_terminal_session(
     let _ = client.detach().await;
 }
 
+/// Reject work after terminal failure while still allowing the attachment to close.
+fn reject_terminated_session_command(command: SessionCommand, reason: String) -> bool {
+    match command {
+        SessionCommand::PollOutput { response, .. } => {
+            let _ = response.send(Err(MobileCoreError::TerminalBackendFailure(reason)));
+        }
+        SessionCommand::PointerOutput { response, .. } => {
+            let _ = response.send(Err(MobileCoreError::TerminalBackendFailure(reason)));
+        }
+        SessionCommand::WriteInput { response, .. } => {
+            let _ = response.send(Err(MobileCoreError::TerminalBackendFailure(format!(
+                "{reason}; input rejected"
+            ))));
+        }
+        SessionCommand::MouseEvent { response, .. } => {
+            let _ = response.send(Err(MobileCoreError::TerminalBackendFailure(format!(
+                "{reason}; mouse event rejected"
+            ))));
+        }
+        SessionCommand::Resize { response, .. } => {
+            let _ = response.send(Err(MobileCoreError::TerminalBackendFailure(format!(
+                "{reason}; resize rejected"
+            ))));
+        }
+        SessionCommand::Close { response } => {
+            let _ = response.send(Ok(()));
+            return false;
+        }
+    }
+    true
+}
+
 async fn handle_session_command(
     client: &mut StreamingBmuxClient,
     state: &mut StreamOutputState,
@@ -1236,34 +1301,7 @@ async fn handle_session_command(
     actor_state: &Arc<Mutex<SessionActorState>>,
 ) -> bool {
     if let Some(reason) = session_terminated_reason(actor_state) {
-        match command {
-            SessionCommand::PollOutput { response, .. } => {
-                let _ = response.send(Err(MobileCoreError::TerminalBackendFailure(reason)));
-                return true;
-            }
-            SessionCommand::WriteInput { response, .. } => {
-                let _ = response.send(Err(MobileCoreError::TerminalBackendFailure(format!(
-                    "{reason}; input rejected"
-                ))));
-                return true;
-            }
-            SessionCommand::MouseEvent { response, .. } => {
-                let _ = response.send(Err(MobileCoreError::TerminalBackendFailure(format!(
-                    "{reason}; mouse event rejected"
-                ))));
-                return true;
-            }
-            SessionCommand::Resize { response, .. } => {
-                let _ = response.send(Err(MobileCoreError::TerminalBackendFailure(format!(
-                    "{reason}; resize rejected"
-                ))));
-                return true;
-            }
-            SessionCommand::Close { response } => {
-                let _ = response.send(Ok(()));
-                return false;
-            }
-        }
+        return reject_terminated_session_command(command, reason);
     }
 
     match command {
@@ -1272,10 +1310,17 @@ async fn handle_session_command(
             response,
         } => {
             let render_result = state.render_if_dirty();
+            if let Err(error) = &render_result {
+                set_session_terminated_reason(actor_state, error.to_string());
+            }
             let _ = match render_result {
                 Ok(()) => response.send(Ok(state.drain_output(max_bytes))),
                 Err(error) => response.send(Err(error)),
             };
+            true
+        }
+        SessionCommand::PointerOutput { version, response } => {
+            let _ = response.send(state.take_pointer_output(version));
             true
         }
         SessionCommand::WriteInput { bytes, response } => {
@@ -1340,6 +1385,14 @@ async fn handle_session_mouse_event(
     session_id: Uuid,
     event: TerminalMouseEvent,
 ) -> Result<()> {
+    state.pointer_position = if event.kind == TerminalMouseEventKind::Leave {
+        None
+    } else {
+        Some((event.col, event.row))
+    };
+    if matches!(event.kind, TerminalMouseEventKind::Leave) {
+        return Ok(());
+    }
     let Some((target_pane, pane_content_rect)) =
         state.target_pane_and_rect_at(event.col, event.row)
     else {
@@ -1440,6 +1493,7 @@ fn terminal_mouse_event_to_attach_mouse_event(
         TerminalMouseEventKind::Drag => {
             attach_mouse::EventKind::Drag(terminal_mouse_button_to_attach(event.button?))
         }
+        TerminalMouseEventKind::Leave => return None,
         TerminalMouseEventKind::Move => attach_mouse::EventKind::Moved,
         TerminalMouseEventKind::ScrollUp => attach_mouse::EventKind::ScrollUp,
         TerminalMouseEventKind::ScrollDown => attach_mouse::EventKind::ScrollDown,
@@ -1464,17 +1518,18 @@ async fn handle_session_event(
     state: &mut StreamOutputState,
     session_id: Uuid,
     event: ServerEvent,
-) {
+) -> Result<()> {
     match event {
         ServerEvent::PluginBusEvent { kind, payload }
             if kind == pane_runtime_events::EVENT_KIND.as_str() =>
         {
             if let Ok(event) = serde_json::from_slice::<pane_runtime_events::PaneEvent>(&payload) {
-                handle_pane_runtime_event(client, state, session_id, event).await;
+                handle_pane_runtime_event(client, state, session_id, event).await?;
             }
         }
         _ => {}
     }
+    Ok(())
 }
 
 async fn handle_pane_runtime_event(
@@ -1482,36 +1537,36 @@ async fn handle_pane_runtime_event(
     state: &mut StreamOutputState,
     session_id: Uuid,
     event: pane_runtime_events::PaneEvent,
-) {
+) -> Result<()> {
     match event {
         pane_runtime_events::PaneEvent::OutputAvailable {
             session_id: event_session_id,
             ..
         } if event_session_id == session_id => {
             let pane_ids = state.visible_pane_ids();
-            if !pane_ids.is_empty()
-                && let Ok(batch) = client
+            if !pane_ids.is_empty() {
+                let batch = client
                     .attach_pane_output_batch(
                         session_id,
                         pane_ids.clone(),
                         EVENT_TRIGGER_FETCH_MAX_BYTES,
                     )
                     .await
-            {
+                    .map_err(|error| MobileCoreError::TerminalBackendFailure(error.to_string()))?;
                 let mut desynced = false;
                 for chunk in batch.chunks {
                     let pane_id = chunk.pane_id;
                     let outcome = state.apply_chunk(&chunk);
                     if matches!(outcome, AttachChunkApplyOutcome::Desync) {
                         desynced = true;
-                        let _ = recover_desynced_pane(client, state, session_id, pane_id).await;
+                        recover_desynced_pane(client, state, session_id, pane_id).await?;
                     }
                 }
                 if !desynced {
                     match apply_visible_grid_deltas(client, state, session_id, pane_ids).await {
                         Ok(true) => {}
                         Ok(false) | Err(_) => {
-                            let _ = hydrate_full_scene_snapshot(client, state, session_id).await;
+                            hydrate_full_scene_snapshot(client, state, session_id).await?;
                         }
                     }
                 }
@@ -1531,14 +1586,15 @@ async fn handle_pane_runtime_event(
             if let Ok(layout) = client.attach_layout(session_id).await {
                 let layout_hydration_requested = state.apply_layout_state(layout);
                 if component_hydration_requested || layout_hydration_requested {
-                    let _ = hydrate_full_scene_snapshot(client, state, session_id).await;
+                    hydrate_full_scene_snapshot(client, state, session_id).await?;
                 }
             } else if component_hydration_requested {
-                let _ = hydrate_full_scene_snapshot(client, state, session_id).await;
+                hydrate_full_scene_snapshot(client, state, session_id).await?;
             }
         }
         _ => {}
     }
+    Ok(())
 }
 
 const fn plugin_attach_view_component(
@@ -1658,6 +1714,12 @@ async fn recover_desynced_pane(
 struct StreamOutputState {
     output_queue: OutputQueue,
     pipeline: AttachScenePipeline,
+    pointer_position: Option<(u16, u16)>,
+    viewport: AttachViewport,
+    pointer_generation: Uuid,
+    pointer_revision: u64,
+    delivered_pointer_revision: u64,
+    pointer_output: Option<crate::pointer_output::TerminalPointerOutput>,
 }
 
 impl StreamOutputState {
@@ -1665,10 +1727,17 @@ impl StreamOutputState {
         Self {
             output_queue: OutputQueue::new(OUTPUT_QUEUE_MAX_BYTES),
             pipeline: AttachScenePipeline::new(viewport),
+            pointer_position: None,
+            viewport,
+            pointer_generation: Uuid::new_v4(),
+            pointer_revision: 0,
+            delivered_pointer_revision: 0,
+            pointer_output: None,
         }
     }
 
     fn set_viewport(&mut self, viewport: AttachViewport) {
+        self.viewport = viewport;
         self.pipeline.set_viewport(viewport);
     }
 
@@ -1750,9 +1819,81 @@ impl StreamOutputState {
             .render_frame()
             .map_err(|error| MobileCoreError::TerminalBackendFailure(error.to_string()))?
         {
-            self.output_queue.push_bytes(frame);
+            self.output_queue.push_bytes(frame)?;
         }
+        self.resolve_pointer();
         Ok(())
+    }
+
+    fn resolve_pointer(&mut self) {
+        use crate::pointer_output::{
+            NATIVE_POINTER_VERSION, TerminalPointerOutput, TerminalPointerShape,
+        };
+        use bmux_attach_pipeline::compositor::retained_surfaces_from_attach_scene;
+        use bmux_attach_pipeline::pointer_shape::{
+            PointerShapeInput, ResolvedPointerShape, resolve_pointer_shape,
+        };
+        use bmux_attach_pipeline::render::{DamageCoalescingPolicy, DamageRect};
+        use bmux_attach_pipeline::{RetainedCompositor, RetainedPointerRouter};
+        use bmux_terminal_protocol::pointer_shape::PointerShape;
+
+        let mut compositor = RetainedCompositor::new();
+        if let Some(layout) = &self.pipeline.layout_state {
+            compositor.replace_surfaces(
+                retained_surfaces_from_attach_scene(&layout.scene),
+                DamageRect::new(0, 0, self.viewport.cols, self.viewport.rows),
+                DamageCoalescingPolicy::default(),
+            );
+        }
+        let router = RetainedPointerRouter::default();
+        let resolved = resolve_pointer_shape(
+            PointerShapeInput {
+                compositor: &compositor,
+                router: &router,
+                position: self.pointer_position,
+                // Existing mobile surfaces have no resize/floating gesture ownership.
+                gesture: None,
+                fallback: PointerShape::Default,
+            },
+            |content_id| {
+                let buffer = self.pipeline.pane_buffers.get(&content_id)?;
+                let grid = buffer.terminal_grid.grid();
+                grid.protocol_state()
+                    .pointer_shapes
+                    .current(grid.mode() == bmux_terminal_grid::GridMode::Alternate)
+            },
+        );
+        let shape = match resolved {
+            ResolvedPointerShape::Hidden => TerminalPointerShape::Hidden,
+            ResolvedPointerShape::Shape(shape) => TerminalPointerShape::Shape(shape),
+        };
+        if self
+            .pointer_output
+            .as_ref()
+            .is_none_or(|previous| previous.shape != shape)
+        {
+            self.pointer_revision = self.pointer_revision.saturating_add(1);
+            self.pointer_output = Some(TerminalPointerOutput {
+                version: NATIVE_POINTER_VERSION,
+                generation: self.pointer_generation,
+                revision: self.pointer_revision,
+                shape,
+            });
+        }
+    }
+
+    fn take_pointer_output(
+        &mut self,
+        version: u32,
+    ) -> Result<Option<crate::pointer_output::TerminalPointerOutput>> {
+        crate::pointer_output::validate_pointer_version(version)?;
+        if !self.output_queue.bytes.is_empty()
+            || self.pointer_revision <= self.delivered_pointer_revision
+        {
+            return Ok(None);
+        }
+        self.delivered_pointer_revision = self.pointer_revision;
+        Ok(self.pointer_output.clone())
     }
 
     fn drain_output(&mut self, max_bytes: usize) -> Vec<u8> {
@@ -1774,11 +1915,15 @@ impl OutputQueue {
         }
     }
 
-    fn push_bytes(&mut self, data: Vec<u8>) {
-        self.bytes.extend(data);
-        while self.bytes.len() > self.max_bytes {
-            let _ = self.bytes.pop_front();
+    fn push_bytes(&mut self, data: Vec<u8>) -> Result<()> {
+        if data.len() > self.max_bytes.saturating_sub(self.bytes.len()) {
+            return Err(MobileCoreError::TerminalBackendFailure(
+                "terminal output queue overflow; reconnect for complete presentation repair"
+                    .to_string(),
+            ));
         }
+        self.bytes.extend(data);
+        Ok(())
     }
 
     fn drain(&mut self, max_bytes: usize) -> Vec<u8> {
@@ -1925,6 +2070,199 @@ fn build_tls_connector(target: &TlsTarget) -> Result<TlsConnector> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminated_session_rejects_pointer_output_but_allows_close() {
+        let (response, mut received) = oneshot::channel();
+        assert!(reject_terminated_session_command(
+            SessionCommand::PointerOutput {
+                version: 1,
+                response
+            },
+            "disconnected".to_string(),
+        ));
+        assert!(
+            received
+                .try_recv()
+                .unwrap()
+                .unwrap_err()
+                .to_string()
+                .contains("disconnected")
+        );
+
+        let (response, mut received) = oneshot::channel();
+        assert!(!reject_terminated_session_command(
+            SessionCommand::Close { response },
+            "disconnected".to_string(),
+        ));
+        assert!(received.try_recv().unwrap().is_ok());
+    }
+
+    fn pointer_test_state(pane_id: Uuid) -> StreamOutputState {
+        use bmux_attach_layout_protocol::{
+            AttachFocusTarget, AttachLayer, AttachScene, AttachSurface, AttachSurfaceKind,
+            PaneLayoutNode,
+        };
+        let viewport = AttachViewport {
+            cols: 10,
+            rows: 2,
+            top_inset: 0,
+            right_inset: 0,
+            bottom_inset: 0,
+            left_inset: 0,
+        };
+        let mut state = StreamOutputState::new(viewport);
+        let rect = AttachRect {
+            x: 0,
+            y: 0,
+            w: 10,
+            h: 2,
+        };
+        state.pipeline.layout_state = Some(bmux_client::AttachLayoutState {
+            context_id: None,
+            session_id: Uuid::nil(),
+            focused_pane_id: pane_id,
+            panes: Vec::new(),
+            layout_root: PaneLayoutNode::Leaf { pane_id },
+            scene: AttachScene {
+                session_id: Uuid::nil(),
+                focus: AttachFocusTarget::Pane { pane_id },
+                surfaces: vec![AttachSurface {
+                    id: pane_id,
+                    kind: AttachSurfaceKind::Pane,
+                    layer: AttachLayer::Pane,
+                    z: 0,
+                    rect,
+                    content_rect: rect,
+                    interactive_regions: Vec::new(),
+                    opaque: true,
+                    visible: true,
+                    accepts_input: true,
+                    cursor_owner: true,
+                    pane_id: Some(pane_id),
+                }],
+            },
+            zoomed: false,
+        });
+        state.pointer_position = Some((3, 1));
+        state
+    }
+
+    #[test]
+    fn native_pointer_snapshot_delta_and_repair_share_retained_resolution() {
+        use crate::pointer_output::TerminalPointerShape;
+        use bmux_terminal_grid::{GridLimits, TerminalGridStream};
+        use bmux_terminal_protocol::pointer_shape::PointerShape;
+        let pane_id = Uuid::new_v4();
+        let mut state = pointer_test_state(pane_id);
+        let mut producer = TerminalGridStream::new(10, 2, GridLimits::default()).unwrap();
+        producer.process(b"\x1b]22;pointer\x07");
+        let hydrate = |state: &mut StreamOutputState, producer: &TerminalGridStream| {
+            state
+                .hydrate_grid_snapshots(vec![AttachPaneGridSnapshotState {
+                    pane_id,
+                    stream_end: 100,
+                    snapshot: producer.snapshot(0, 2),
+                }])
+                .unwrap();
+            state.resolve_pointer();
+        };
+        hydrate(&mut state, &producer);
+        assert_eq!(
+            state.take_pointer_output(1).unwrap().unwrap().shape,
+            TerminalPointerShape::Shape(PointerShape::Pointer)
+        );
+        let delta = producer.process_delta(b"\x1b]22;crosshair\x07").unwrap();
+        state
+            .apply_grid_deltas(vec![AttachPaneGridDeltaState {
+                pane_id,
+                batches: vec![delta],
+            }])
+            .unwrap();
+        state.resolve_pointer(); // stationary pointer, protocol-only delta
+        assert_eq!(
+            state.take_pointer_output(1).unwrap().unwrap().shape,
+            TerminalPointerShape::Shape(PointerShape::Crosshair)
+        );
+        let mut repaired = pointer_test_state(pane_id);
+        hydrate(&mut repaired, &producer);
+        assert_eq!(
+            state.pointer_output.as_ref().unwrap().shape,
+            repaired.pointer_output.as_ref().unwrap().shape
+        );
+        state.pointer_position = None;
+        state.resolve_pointer();
+        assert_eq!(
+            state.take_pointer_output(1).unwrap().unwrap().shape,
+            TerminalPointerShape::Shape(PointerShape::Default)
+        );
+    }
+
+    #[test]
+    fn native_pointer_waits_for_all_bytes_and_unknown_version_does_not_consume() {
+        let mut state = pointer_test_state(Uuid::new_v4());
+        state.resolve_pointer();
+        state.output_queue.push_bytes(vec![1, 2, 3]).unwrap();
+        assert!(state.take_pointer_output(1).unwrap().is_none());
+        assert_eq!(state.drain_output(2), vec![1, 2]);
+        assert!(state.take_pointer_output(1).unwrap().is_none());
+        assert_eq!(state.drain_output(2), vec![3]);
+        assert!(state.take_pointer_output(2).is_err());
+        assert!(state.take_pointer_output(1).unwrap().is_some());
+        assert!(state.take_pointer_output(1).unwrap().is_none());
+    }
+
+    #[test]
+    fn native_queue_overflow_is_explicit_and_preserves_queued_bytes() {
+        let mut queue = OutputQueue::new(4);
+        queue.push_bytes(vec![1, 2, 3]).unwrap();
+        assert!(queue.push_bytes(vec![4, 5]).is_err());
+        assert_eq!(queue.drain(10), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn native_leave_is_not_application_mouse_input() {
+        assert!(
+            terminal_mouse_event_to_attach_mouse_event(TerminalMouseEvent {
+                kind: TerminalMouseEventKind::Leave,
+                button: None,
+                row: 0,
+                col: 0,
+                shift: false,
+                alt: false,
+                control: false,
+            })
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn native_pointer_lifetimes_do_not_reuse_generations() {
+        let viewport = AttachViewport {
+            cols: 10,
+            rows: 2,
+            top_inset: 0,
+            right_inset: 0,
+            bottom_inset: 0,
+            left_inset: 0,
+        };
+        let mut first = StreamOutputState::new(viewport);
+        let second = StreamOutputState::new(viewport);
+        assert_ne!(first.pointer_generation, second.pointer_generation);
+        first.resolve_pointer();
+        assert_eq!(first.pointer_revision, 1);
+        first.resolve_pointer();
+        assert_eq!(
+            first.pointer_revision, 1,
+            "unchanged hover must not spin output polling"
+        );
+        assert_eq!(
+            first.pointer_output.unwrap().shape,
+            crate::pointer_output::TerminalPointerShape::Shape(
+                bmux_terminal_protocol::pointer_shape::PointerShape::Default
+            )
+        );
+    }
 
     #[test]
     fn parse_iroh_target_extracts_auth_and_relay_query() {

@@ -13,12 +13,22 @@ enum class TerminalChunkType {
     STDOUT,
     STDERR,
     STATUS,
+    POINTER,
 }
 
 data class TerminalChunkFrame(
     val kind: TerminalChunkType,
     val bytes: ByteArray,
     val statusSeverity: TerminalStatusSeverity? = null,
+    val pointer: TerminalPointerFrame? = null,
+)
+
+// Shape names come from the versioned Rust CSS vocabulary, never terminal bytes.
+data class TerminalPointerFrame(
+    val version: Int,
+    val generation: String,
+    val revision: ULong,
+    val name: String?, // null means Hidden, not Default
 )
 
 data class TerminalDiagnosticFrame(
@@ -52,6 +62,7 @@ enum class TerminalMouseEventKind {
     UP,
     DRAG,
     MOVE,
+    LEAVE,
     SCROLL_UP,
     SCROLL_DOWN,
     SCROLL_LEFT,
@@ -80,6 +91,7 @@ interface TerminalTransport {
         endpoint: TerminalEndpoint,
         session: String?,
         sink: (ByteArray) -> Unit,
+        onPointer: (TerminalPointerFrame) -> Unit,
         onStatus: (TerminalStatusEvent) -> Unit,
         onDiagnostics: (List<TerminalDiagnosticFrame>) -> Unit,
         onTerminalFailure: (String) -> Unit,
@@ -88,6 +100,8 @@ interface TerminalTransport {
 
 interface TerminalRenderer {
     fun appendOutput(data: ByteArray)
+    fun applyPointer(pointer: TerminalPointerFrame) {}
+    fun resetPointer() {}
     fun setOnInput(handler: (ByteArray) -> Unit)
     fun setOnResize(handler: (rows: Int, cols: Int) -> Unit)
     fun setOnMouseEvent(handler: (TerminalMouseEvent) -> Unit)

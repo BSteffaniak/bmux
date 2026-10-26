@@ -9,6 +9,7 @@ pub mod layout;
 mod local_presentation;
 mod metadata;
 pub mod observer;
+mod pointer_shape;
 pub mod prompt_ui;
 pub mod provider;
 pub mod render;

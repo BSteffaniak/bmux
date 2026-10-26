@@ -146,6 +146,13 @@ pub trait AttachTerminal: Write {
         None
     }
 
+    fn present_pointer_shape(
+        &mut self,
+        _shape: Option<bmux_attach_pipeline::pointer_shape::ResolvedPointerShape>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
     fn restore_after_attach_ui(&mut self) -> Result<()>;
 
     fn set_attached_session_id(&self, _session_id: Uuid) {}
@@ -215,6 +222,13 @@ trait AttachHost {
         None
     }
 
+    fn present_pointer_shape(
+        &mut self,
+        _shape: Option<bmux_attach_pipeline::pointer_shape::ResolvedPointerShape>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
     fn restore_after_attach_ui(&mut self) -> Result<()>;
 
     fn set_attached_session_id(&self, _session_id: Uuid) {}
@@ -271,6 +285,12 @@ impl<T: AttachTerminal + ?Sized> AttachHost for TerminalAttachHost<'_, T> {
     }
     fn take_owned_action(&mut self) -> Option<String> {
         self.0.take_owned_action()
+    }
+    fn present_pointer_shape(
+        &mut self,
+        shape: Option<bmux_attach_pipeline::pointer_shape::ResolvedPointerShape>,
+    ) -> Result<()> {
+        self.0.present_pointer_shape(shape)
     }
     fn restore_after_attach_ui(&mut self) -> Result<()> {
         self.0.restore_after_attach_ui()
@@ -1082,9 +1102,24 @@ impl RealAttachTerminal {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            terminal: bmux_attach_pipeline::terminal::TerminalIo::new(io::stdout()),
+            terminal: bmux_attach_pipeline::terminal::TerminalIo::new_with_pointer_tmux_passthrough(
+                io::stdout(),
+                pointer_tmux_passthrough_enabled(
+                    std::env::var("TMUX").ok().as_deref(),
+                    std::env::var("BMUX_POINTER_SHAPE_TMUX_PASSTHROUGH")
+                        .ok()
+                        .as_deref(),
+                ),
+            ),
         }
     }
+}
+
+/// This is a transport opt-in, not capability evidence. The host must still
+/// pass conservative capability detection. Users must enable tmux's
+/// `allow-passthrough`; BMUX never rewrites tmux configuration.
+fn pointer_tmux_passthrough_enabled(tmux: Option<&str>, opt_in: Option<&str>) -> bool {
+    tmux.is_some_and(|value| !value.is_empty()) && opt_in == Some("1")
 }
 
 impl Default for RealAttachTerminal {
@@ -1212,7 +1247,32 @@ impl HeadlessAttachTerminalHandle {
     }
 }
 
+struct HeadlessPointerWriter {
+    output: Arc<Mutex<HeadlessTerminalOutput>>,
+    pending_output_chunks: Arc<Mutex<Vec<Vec<u8>>>>,
+}
+
+impl Write for HeadlessPointerWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.output
+            .lock()
+            .map_err(|_| io::Error::other("headless pointer output lock poisoned"))?
+            .bytes
+            .extend_from_slice(bytes);
+        self.pending_output_chunks
+            .lock()
+            .map_err(|_| io::Error::other("headless pointer chunks lock poisoned"))?
+            .push(bytes.to_vec());
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 pub struct HeadlessAttachTerminal {
+    pointer_terminal: bmux_attach_pipeline::terminal::TerminalIo<HeadlessPointerWriter>,
     #[cfg(test)]
     scrollback: Arc<Mutex<bool>>,
     #[cfg(test)]
@@ -1254,6 +1314,12 @@ impl HeadlessAttachTerminal {
                 screen: Arc::clone(&screen),
                 geometry: Arc::clone(&geometry),
                 event_rx,
+                pointer_terminal: bmux_attach_pipeline::terminal::TerminalIo::new(
+                    HeadlessPointerWriter {
+                        output: Arc::clone(&output),
+                        pending_output_chunks: Arc::clone(&pending_output_chunks),
+                    },
+                ),
                 output: Arc::clone(&output),
                 pending_output_chunks: Arc::clone(&pending_output_chunks),
                 attached_session_id: Arc::clone(&attached_session_id),
@@ -1298,6 +1364,37 @@ impl Write for HeadlessAttachTerminal {
 }
 
 impl AttachTerminal for HeadlessAttachTerminal {
+    fn present_pointer_shape(
+        &mut self,
+        shape: Option<bmux_attach_pipeline::pointer_shape::ResolvedPointerShape>,
+    ) -> Result<()> {
+        use bmux_attach_pipeline::pointer_capabilities::PointerShapeCapability;
+        use bmux_attach_pipeline::pointer_shape::ResolvedPointerShape;
+        use bmux_terminal_protocol::pointer_shape::PointerShape;
+        let Some(shape) = shape else {
+            return self
+                .pointer_terminal
+                .restore_pointer_shape()
+                .map_err(Into::into);
+        };
+        // Headless support must be selected explicitly, never inherited from
+        // the coordinator's terminal environment.
+        let capability = PointerShapeCapability::from_environment(
+            "",
+            "",
+            std::env::var("BMUX_PLAYBOOK_HEADLESS_POINTER_SHAPES")
+                .ok()
+                .as_deref(),
+        );
+        let shape = match shape {
+            ResolvedPointerShape::Shape(shape) => shape,
+            ResolvedPointerShape::Hidden => PointerShape::Default,
+        };
+        self.pointer_terminal
+            .present_pointer_shape(capability, shape)
+            .map_err(Into::into)
+    }
+
     #[cfg(test)]
     fn observe_scrollback(&self, active: bool) {
         *self
@@ -1328,7 +1425,7 @@ impl AttachTerminal for HeadlessAttachTerminal {
     }
 
     fn restore_after_attach_ui(&mut self) -> Result<()> {
-        Ok(())
+        self.pointer_terminal.restore().map_err(Into::into)
     }
 
     fn set_attached_session_id(&self, session_id: Uuid) {
@@ -1394,6 +1491,28 @@ impl AttachTerminal for RealAttachTerminal {
     fn resume_private_input(&mut self, generation: u64) -> Result<()> {
         // Discard input that arrived while the producer was paused as well.
         Ok(self.terminal.resume_input(generation)?)
+    }
+
+    fn present_pointer_shape(
+        &mut self,
+        shape: Option<bmux_attach_pipeline::pointer_shape::ResolvedPointerShape>,
+    ) -> Result<()> {
+        use bmux_attach_pipeline::pointer_shape::ResolvedPointerShape;
+        use bmux_terminal_protocol::pointer_shape::PointerShape;
+        let Some(shape) = shape else {
+            return self.terminal.restore_pointer_shape().map_err(Into::into);
+        };
+        // OSC 22 has no hidden shape. Preserve a truthful visible fallback.
+        let shape = match shape {
+            ResolvedPointerShape::Shape(shape) => shape,
+            ResolvedPointerShape::Hidden => PointerShape::Default,
+        };
+        self.terminal
+            .present_pointer_shape(
+                bmux_attach_pipeline::pointer_capabilities::PointerShapeCapability::detect(),
+                shape,
+            )
+            .context("failed presenting host pointer shape")
     }
 
     fn geometry(&self) -> TerminalGeometry {
@@ -4436,8 +4555,63 @@ pub async fn run_session_attach_with_terminal_config_observer<T: AttachTerminal 
     .await
 }
 
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // One existing BMUX reducer, shared by output backends.
+struct AttachRestoreGuard<'a, T: AttachHost + ?Sized> {
+    terminal: &'a mut T,
+    armed: bool,
+}
+
+impl<T: AttachHost + ?Sized> Drop for AttachRestoreGuard<'_, T> {
+    fn drop(&mut self) {
+        if self.armed {
+            // Cancellation has no return channel. TerminalIo also retains any
+            // ambiguous pointer-stack state, so this cannot blindly replay it.
+            if let Err(error) = self.terminal.restore_after_attach_ui() {
+                tracing::error!(%error, "attach cancellation terminal restoration failed");
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)] // Preserve the existing attach entry contract.
 async fn run_session_attach_with_host<T: AttachHost + ?Sized>(
+    client: BmuxClient,
+    target: Option<&str>,
+    follow: Option<&str>,
+    global: bool,
+    kernel_client_factory: Option<KernelClientFactory>,
+    terminal: &mut T,
+    config: Option<BmuxConfig>,
+    observer: Option<super::observer::AttachObserverPublisher>,
+) -> Result<AttachRunOutcome> {
+    let mut guard = AttachRestoreGuard {
+        terminal,
+        armed: true,
+    };
+    let result = run_session_attach_with_host_inner(
+        client,
+        target,
+        follow,
+        global,
+        kernel_client_factory,
+        guard.terminal,
+        config,
+        observer,
+    )
+    .await;
+    if let Err(error) = result {
+        let restored = guard.terminal.restore_after_attach_ui();
+        guard.armed = false;
+        return match restored {
+            Ok(()) => Err(error),
+            Err(restore) => Err(error.context(format!("attach restoration failed: {restore}"))),
+        };
+    }
+    guard.armed = false;
+    result
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // One existing BMUX reducer, shared by output backends.
+async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
     mut client: BmuxClient,
     target: Option<&str>,
     follow: Option<&str>,
@@ -5060,6 +5234,11 @@ async fn run_session_attach_with_host<T: AttachHost + ?Sized>(
                             break 'host_input;
                         }
                         clear_native_preedit(&mut view_state);
+                        view_state.mouse.last_position = None;
+                        view_state.mouse.clear_pointer_gestures();
+                        let _ = view_state.plugin_pointer_router.release_capture();
+                        view_state.pointer_shape = None;
+                        view_state.last_pointer_shape = None;
                         if let Some(observer) = &mut view_state.observer {
                             observer.set_prepared_viewport_generation(viewport_generation)?;
                         }
@@ -5489,6 +5668,12 @@ async fn run_session_attach_with_host<T: AttachHost + ?Sized>(
 
         let dirty_layout_frame =
             view_state.dirty.layout_needs_refresh || view_state.cached_layout_state.is_none();
+        // Hover, capture release and protocol-only updates can change pointer
+        // presentation without cell damage (including while stationary).
+        let pointer_shape = super::pointer_shape::resolve(&view_state);
+        if pointer_shape != view_state.last_pointer_shape {
+            view_state.dirty.mark_full_frame(AttachDirtySource::PluginCommand);
+        }
         let mut frame_needs_render = view_state.dirty.needs_render();
 
         let mut scene_hydrated = false;
@@ -5688,6 +5873,7 @@ async fn run_session_attach_with_host<T: AttachHost + ?Sized>(
                 render_geometry,
                 None,
             )?;
+            terminal.present_pointer_shape(view_state.pointer_shape)?;
             flush_visual_projection_updates(&mut client, &mut view_state).await;
 
             let render_ms = duration_millis_u64(render_started_at.elapsed());
@@ -5979,6 +6165,7 @@ async fn run_session_attach_with_host<T: AttachHost + ?Sized>(
             render_geometry,
             None,
         )?;
+        terminal.present_pointer_shape(view_state.pointer_shape)?;
         flush_visual_projection_updates(&mut client, &mut view_state).await;
 
         let render_ms = duration_millis_u64(render_started_at.elapsed());
@@ -10148,6 +10335,7 @@ fn render_attach_frame_to_output(
     // Explicit producer phase: current reduced UI geometry, before capture or
     // composition. All native/headless/test callers use this preparation entry.
     refresh_retained_extensions(view_state, layout_state, geometry, help_lines)?;
+    view_state.pointer_shape = super::pointer_shape::resolve(view_state);
     let previous = view_state.retained_compositor.clone();
     let previous_focus = view_state.plugin_focus.clone();
     let observing = view_state.observer.is_some();
@@ -10212,6 +10400,18 @@ fn render_attach_frame_to_output(
         }
         return result;
     }
+    reconcile_presented_interaction(view_state, &previous);
+    view_state.pointer_layout = Some(layout_state.clone());
+    present_committed_pointer_shape(view_state)?;
+    result
+}
+
+/// Reconcile interaction ownership only after successful output. The previous
+/// committed graph supplies the endpoint receiving any lost-focus notification.
+fn reconcile_presented_interaction(
+    view_state: &mut AttachViewState,
+    previous: &bmux_attach_pipeline::RetainedCompositor,
+) {
     finish_presented_scroll_tracking(view_state);
     let old_focus = view_state.plugin_focus.focused().and_then(|target| {
         previous.endpoint_for_region(target).map(|endpoint| {
@@ -10240,7 +10440,24 @@ fn render_attach_frame_to_output(
         .plugin_pointer_router
         .reconcile(&view_state.retained_compositor);
     acknowledge_plugin_surface_output(view_state);
-    result
+}
+
+/// Resolve only after frame delivery has committed the retained graph and
+/// reconciled capture. A pointer-only native delivery reuses that exact scene;
+/// failure leaves the successful-output cache unchanged for the next retry.
+fn present_committed_pointer_shape(view_state: &mut AttachViewState) -> Result<()> {
+    let pointer_shape = super::pointer_shape::resolve(view_state);
+    view_state.pointer_shape = pointer_shape;
+    if view_state.presentation_only && pointer_shape != view_state.last_pointer_shape {
+        if let Err(error) = super::observer::deliver_pointer_shape(view_state) {
+            view_state
+                .dirty
+                .mark_full_frame(AttachDirtySource::PluginCommand);
+            return Err(error);
+        }
+        view_state.last_pointer_shape = pointer_shape;
+    }
+    Ok(())
 }
 
 fn acknowledge_plugin_surface_output(view_state: &AttachViewState) {
@@ -10733,7 +10950,8 @@ fn render_attach_frame_inner(
             .is_some_and(super::observer::AttachObserverPublisher::has_published)
         && !frame_plan.retained.damage.merged_damaged()
         && !frame_plan.retained.graph_damaged()
-        && pending_cursor_state == view_state.last_cursor_state;
+        && pending_cursor_state == view_state.last_cursor_state
+        && view_state.pointer_shape == view_state.last_pointer_shape;
     let write_result = if observer_unchanged {
         Ok(())
     } else if view_state.observer.is_some() || view_state.presentation_only {
@@ -10791,6 +11009,7 @@ fn render_attach_frame_inner(
     }
     let terminal_write_ms = duration_millis_u64(terminal_write_started_at.elapsed());
     view_state.last_cursor_state = pending_cursor_state;
+    view_state.last_pointer_shape = view_state.pointer_shape;
     view_state.terminal_graphics_cache = pending_graphics_cache;
     #[cfg(any(
         feature = "image-sixel",
@@ -16453,7 +16672,14 @@ fn attach_scene_floating_drag_surface_at(
     column: u16,
     row: u16,
 ) -> Option<AttachSurface> {
-    let layout_state = view_state.cached_layout_state.as_ref()?;
+    floating_drag_surface_at(view_state.cached_layout_state.as_ref()?, column, row)
+}
+
+fn floating_drag_surface_at(
+    layout_state: &AttachLayoutState,
+    column: u16,
+    row: u16,
+) -> Option<AttachSurface> {
     layout_state
         .scene
         .surfaces
@@ -16468,6 +16694,45 @@ fn attach_scene_floating_drag_surface_at(
         .enumerate()
         .max_by_key(|(index, surface)| (surface.layer, surface.z, *index))
         .map(|(_, surface)| surface.clone())
+}
+
+/// Hover intent reuses acquisition geometry, but only from successfully
+/// displayed layout. Plugin/capture eligibility is handled by the caller.
+pub(super) fn committed_pointer_border_intent(
+    view: &AttachViewState,
+    column: u16,
+    row: u16,
+) -> Option<bmux_terminal_protocol::pointer_shape::PointerShape> {
+    use bmux_terminal_protocol::pointer_shape::PointerShape;
+    if !view.can_write
+        || !view.mouse.config.enabled
+        || view.help_overlay_open
+        || view.prompt.is_active()
+    {
+        return None;
+    }
+    let layout = view.pointer_layout.as_ref()?;
+    if !layout.scene.surfaces.iter().any(|surface| {
+        attach_rect_contains(surface.rect, column, row)
+            && view
+                .retained_compositor
+                .point_visible_from(surface.id, column, row)
+    }) {
+        return None;
+    }
+    if view.mouse.config.resize_borders
+        && let Some(resize) = resize_separator_at(layout, column, row, Instant::now())
+    {
+        return Some(
+            match (resize.horizontal.is_some(), resize.vertical.is_some()) {
+                (true, true) => PointerShape::NwseResize,
+                (true, false) => PointerShape::EwResize,
+                (false, true) => PointerShape::NsResize,
+                (false, false) => return None,
+            },
+        );
+    }
+    floating_drag_surface_at(layout, column, row).map(|_| PointerShape::Grab)
 }
 
 fn floating_drag_position(drag: AttachMouseFloatingDrag, column: u16, row: u16) -> (u16, u16) {
@@ -16514,7 +16779,20 @@ pub fn attach_scene_resize_separator_at(
     row: u16,
     last_applied_at: Instant,
 ) -> Option<AttachMouseResizeDrag> {
-    let layout_state = view_state.cached_layout_state.as_ref()?;
+    resize_separator_at(
+        view_state.cached_layout_state.as_ref()?,
+        column,
+        row,
+        last_applied_at,
+    )
+}
+
+fn resize_separator_at(
+    layout_state: &AttachLayoutState,
+    column: u16,
+    row: u16,
+    last_applied_at: Instant,
+) -> Option<AttachMouseResizeDrag> {
     let pane_surfaces = layout_state
         .scene
         .surfaces
@@ -21985,6 +22263,51 @@ mod tests {
     }
 
     #[test]
+    fn pointer_tmux_route_requires_exact_opt_in_and_live_tmux_environment() {
+        assert!(pointer_tmux_passthrough_enabled(
+            Some("/tmp/tmux,1,0"),
+            Some("1")
+        ));
+        for (tmux, opt_in) in [
+            (None, Some("1")),
+            (Some(""), Some("1")),
+            (Some("/tmp/tmux,1,0"), None),
+            (Some("/tmp/tmux,1,0"), Some("true")),
+            (Some("/tmp/tmux,1,0"), Some("0")),
+        ] {
+            assert!(!pointer_tmux_passthrough_enabled(tmux, opt_in));
+        }
+    }
+
+    #[test]
+    fn cancelled_attach_guard_releases_one_pointer_lease_without_dropping_terminal() {
+        use bmux_attach_pipeline::pointer_capabilities::PointerShapeCapability;
+        use bmux_terminal_protocol::pointer_shape::PointerShape;
+        let (mut terminal, handle) = HeadlessAttachTerminal::new(10, 5);
+        terminal
+            .pointer_terminal
+            .present_pointer_shape(PointerShapeCapability::Stack, PointerShape::Text)
+            .unwrap();
+        {
+            let mut host = TerminalAttachHost(&mut terminal);
+            let _guard = AttachRestoreGuard {
+                terminal: &mut host,
+                armed: true,
+            };
+        }
+        assert_eq!(handle.output_bytes(), b"\x1b]22;>text\x1b\\\x1b]22;<\x1b\\");
+        terminal
+            .pointer_terminal
+            .present_pointer_shape(PointerShapeCapability::Stack, PointerShape::Pointer)
+            .unwrap();
+        terminal.restore_after_attach_ui().unwrap();
+        assert_eq!(
+            handle.output_bytes(),
+            b"\x1b]22;>text\x1b\\\x1b]22;<\x1b\\\x1b]22;>pointer\x1b\\\x1b]22;<\x1b\\"
+        );
+    }
+
+    #[test]
     fn record_attach_mouse_event_tracks_position_and_timestamp() {
         let mut view_state = AttachViewState::new(AttachOpenInfo {
             context_id: None,
@@ -23167,6 +23490,12 @@ mod tests {
             attach_scene_floating_drag_surface_at(&view_state, 4, 4),
             None
         );
+        assert_committed_border_hover(
+            &mut view_state,
+            (2, 2),
+            (4, 4),
+            bmux_terminal_protocol::pointer_shape::PointerShape::Grab,
+        );
     }
 
     #[test]
@@ -23302,6 +23631,116 @@ mod tests {
         assert!(attach_scene_resize_separator_at(&view_state, 9, 10, Instant::now()).is_none());
     }
 
+    fn assert_border_capture_precedence(
+        view: &mut AttachViewState,
+        border: (u16, u16),
+        hover: Option<bmux_attach_pipeline::pointer_shape::ResolvedPointerShape>,
+    ) {
+        use bmux_attach_pipeline::compositor::{RetainedInteractiveRegion, RetainedSurface};
+        use bmux_attach_pipeline::pointer_shape::ResolvedPointerShape;
+        use bmux_attach_pipeline::render::{DamageCoalescingPolicy, DamageRect};
+        use bmux_terminal_protocol::pointer_shape::PointerShape;
+        let previous = view.retained_compositor.clone();
+        let owner = bmux_plugin::surface::PluginSurfaceId::new(
+            "test.capture",
+            "pointer",
+            Uuid::from_u128(992),
+        );
+        let mut surface =
+            RetainedSurface::builder(Uuid::from_u128(992), DamageRect::new(40, 10, 2, 2))
+                .opaque()
+                .build();
+        surface.interactive_regions.push(RetainedInteractiveRegion {
+            id: Some(bmux_plugin::surface::PluginSurfaceRegionId::new(
+                &owner, "drag",
+            )),
+            rect: DamageRect::new(40, 10, 2, 2),
+            focusable: false,
+            cursor: bmux_plugin::surface::PluginSurfaceCursor::Crosshair,
+            endpoint: None,
+        });
+        let mut surfaces = previous.surfaces().values().cloned().collect::<Vec<_>>();
+        surfaces.push(surface);
+        view.retained_compositor.replace_surfaces(
+            surfaces,
+            DamageRect::new(0, 0, 80, 24),
+            DamageCoalescingPolicy::default(),
+        );
+        let hit = view.retained_compositor.hit_test(40, 10).unwrap();
+        view.plugin_pointer_router.capture(hit);
+        view.mouse.last_position = Some(border);
+        assert_eq!(
+            super::super::pointer_shape::resolve(view),
+            Some(ResolvedPointerShape::Shape(PointerShape::Crosshair))
+        );
+        if let Some(drag) =
+            attach_scene_resize_separator_at(view, border.0, border.1, Instant::now())
+        {
+            view.mouse.resize_drag = Some(drag);
+            assert_eq!(super::super::pointer_shape::resolve(view), hover);
+            view.mouse.resize_drag = None;
+        }
+        let _ = view.plugin_pointer_router.release_capture();
+        assert_eq!(super::super::pointer_shape::resolve(view), hover);
+        view.retained_compositor = previous;
+    }
+
+    fn assert_committed_border_hover(
+        view: &mut AttachViewState,
+        border: (u16, u16),
+        content: (u16, u16),
+        shape: bmux_terminal_protocol::pointer_shape::PointerShape,
+    ) {
+        use bmux_attach_pipeline::compositor::retained_surfaces_from_attach_scene;
+        use bmux_attach_pipeline::pointer_shape::ResolvedPointerShape;
+        let layout = view.cached_layout_state.clone().unwrap();
+        view.retained_compositor.replace_surfaces(
+            retained_surfaces_from_attach_scene(&layout.scene),
+            bmux_attach_pipeline::render::DamageRect::new(0, 0, 80, 24),
+            bmux_attach_pipeline::render::DamageCoalescingPolicy::default(),
+        );
+        view.mouse.config.pointer_shapes = true;
+        view.mouse.config.enabled = true;
+        view.mouse.last_position = Some(border);
+        assert_eq!(
+            committed_pointer_border_intent(view, border.0, border.1),
+            None
+        );
+        view.pointer_layout = Some(layout.clone());
+        let expected = Some(ResolvedPointerShape::Shape(shape));
+        assert_eq!(super::super::pointer_shape::resolve(view), expected);
+        assert_border_capture_precedence(view, border, expected);
+        view.mouse.last_position = Some(content);
+        assert_ne!(super::super::pointer_shape::resolve(view), expected);
+        view.mouse.last_position = Some(border);
+        view.can_write = false;
+        assert_ne!(super::super::pointer_shape::resolve(view), expected);
+        view.can_write = true;
+        view.mouse.config.enabled = false;
+        assert_ne!(super::super::pointer_shape::resolve(view), expected);
+        view.mouse.config.enabled = true;
+        view.help_overlay_open = true;
+        assert_ne!(super::super::pointer_shape::resolve(view), expected);
+        view.help_overlay_open = false;
+        if shape != bmux_terminal_protocol::pointer_shape::PointerShape::Grab {
+            view.mouse.config.resize_borders = false;
+            assert_ne!(super::super::pointer_shape::resolve(view), expected);
+            view.mouse.config.resize_borders = true;
+        }
+        // A candidate layout change must not change a stationary pointer.
+        view.cached_layout_state
+            .as_mut()
+            .unwrap()
+            .scene
+            .surfaces
+            .clear();
+        assert_eq!(super::super::pointer_shape::resolve(view), expected);
+        view.pointer_layout = view.cached_layout_state.clone();
+        assert_ne!(super::super::pointer_shape::resolve(view), expected);
+        view.pointer_layout = Some(layout.clone());
+        view.cached_layout_state = Some(layout);
+    }
+
     #[test]
     fn attach_scene_resize_separator_detects_vertical_boundary() {
         let session_id = Uuid::new_v4();
@@ -23361,6 +23800,12 @@ mod tests {
             bmux_tabs_plugin_api::tabs_commands::PaneResizeDirection::Left
         );
         assert!(attach_scene_resize_separator_at(&view_state, 4, 3, now).is_none());
+        assert_committed_border_hover(
+            &mut view_state,
+            (9, 3),
+            (4, 3),
+            bmux_terminal_protocol::pointer_shape::PointerShape::EwResize,
+        );
 
         let reduction = reduce_attach_mouse_resize_acquisition_before_uncaptured_hook(
             &mut view_state,

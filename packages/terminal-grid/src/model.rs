@@ -331,6 +331,9 @@ pub enum MouseProtocolEncoding {
     reason = "protocol modes mirror independent DEC/private terminal toggles for stable snapshot encoding"
 )]
 pub struct ProtocolState {
+    /// Independent main/alternate OSC 22 stacks, including unset top entries.
+    #[serde(default)]
+    pub pointer_shapes: bmux_terminal_protocol::pointer_shape::PointerShapeState,
     #[serde(default)]
     pub mouse_x10: bool,
     #[serde(default)]
@@ -1033,6 +1036,19 @@ impl TerminalGrid {
     pub(crate) fn set_autowrap(&mut self, enabled: bool) {
         self.autowrap = enabled;
         self.bump_revision();
+    }
+
+    pub(crate) fn apply_pointer_shape(
+        &mut self,
+        operation: bmux_terminal_protocol::pointer_shape::PointerShapeOperation<'_>,
+    ) {
+        if self
+            .protocol
+            .pointer_shapes
+            .apply(self.mode == GridMode::Alternate, operation)
+        {
+            self.bump_revision();
+        }
     }
 
     pub(crate) fn set_mouse_tracking_mode(&mut self, mode: MouseProtocolMode, enabled: bool) {

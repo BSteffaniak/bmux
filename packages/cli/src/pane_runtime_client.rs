@@ -12,13 +12,80 @@ use bmux_context_state::ContextSelector;
 use bmux_ipc::ErrorCode;
 use bmux_pane_runtime_plugin_api::{
     attach_runtime_commands as AttachCommands, attach_runtime_state as AttachState,
-    pane_runtime_commands as PaneCommands, pane_runtime_state as PaneState,
+    pane_runtime_commands as PaneCommands, pane_runtime_pointer_grid_v1 as PointerGrid,
+    pane_runtime_state as PaneState,
 };
 use bmux_session_models::SessionSelector;
 use std::future::Future;
 use uuid::Uuid;
 
 type ClientResult<T> = bmux_client::Result<T>;
+
+// No downgrade on authorization, malformed response, or transport failure. Only
+// the server's exact absent-provider diagnostic permits a legacy selection.
+async fn pointer_grid_available(
+    client: &mut impl bmux_plugin_sdk::TypedDispatchClient,
+) -> ClientResult<bool> {
+    match PointerGrid::client::capabilities(client).await {
+        Ok(capabilities) if capabilities.format_versions.contains(&1) => Ok(true),
+        Ok(_) => Err(ClientError::ServerError {
+            code: ErrorCode::UnsupportedRepresentation,
+            message: "pointer-grid provider does not support format_version=1".into(),
+        }),
+        Err(bmux_plugin_sdk::TypedServiceClientError::Dispatch(
+            bmux_plugin_sdk::TypedDispatchClientError::Server { details, .. },
+        ))
+            if details.contains("no provider for service capability='bmux.pane_runtime.pointer_grid.v1' kind='Command' interface='pane-runtime-pointer-grid-v1' operation='capabilities'") => Ok(false),
+        Err(error) => typed_dispatch_error("pointer-grid capabilities", error),
+    }
+}
+
+#[cfg(test)]
+mod pointer_grid_negotiation_tests {
+    use super::*;
+
+    struct Probe(u8);
+    impl bmux_plugin_sdk::TypedDispatchClient for Probe {
+        async fn invoke_service_raw(
+            &mut self,
+            capability: &str,
+            _kind: bmux_ipc::InvokeServiceKind,
+            interface: &str,
+            operation: &str,
+            _payload: Vec<u8>,
+        ) -> bmux_plugin_sdk::TypedDispatchClientResult<Vec<u8>> {
+            assert_eq!(capability, "bmux.pane_runtime.pointer_grid.v1");
+            assert_eq!(interface, "pane-runtime-pointer-grid-v1");
+            assert_eq!(operation, "capabilities");
+            match self.0 {
+                0 | 1 => Ok(bmux_plugin_sdk::encode_service_message(
+                    &PointerGrid::GridCapabilities {
+                        format_versions: if self.0 == 1 { vec![1] } else { vec![2] },
+                    },
+                )
+                .unwrap()),
+                2 => Err(bmux_plugin_sdk::TypedDispatchClientError::server(
+                    interface,
+                    operation,
+                    "no provider for service capability='bmux.pane_runtime.pointer_grid.v1' kind='Command' interface='pane-runtime-pointer-grid-v1' operation='capabilities'",
+                )),
+                _ => Err(bmux_plugin_sdk::TypedDispatchClientError::transport(
+                    interface,
+                    operation,
+                    "connection reset",
+                )),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn selection_is_explicit_and_only_absent_provider_downgrades() {
+        assert!(pointer_grid_available(&mut Probe(1)).await.unwrap());
+        assert!(!pointer_grid_available(&mut Probe(2)).await.unwrap());
+        assert!(pointer_grid_available(&mut Probe(0)).await.is_err());
+        assert!(pointer_grid_available(&mut Probe(3)).await.is_err());
+    }
+}
 
 #[allow(
     dead_code,
@@ -89,14 +156,18 @@ pub async fn attach_pane_grid_snapshot_state(
     max_rows_per_pane: usize,
 ) -> ClientResult<Vec<PaneGridSnapshotResult>> {
     let max_rows_per_pane = u32::try_from(max_rows_per_pane).unwrap_or(u32::MAX);
-    match AttachState::client::attach_pane_grid_snapshot_state(
-        client,
-        session_id,
-        pane_ids,
-        max_rows_per_pane,
-    )
-    .await
-    {
+    let response = if pointer_grid_available(client).await? {
+        PointerGrid::client::snapshots(client, 1, session_id, pane_ids, max_rows_per_pane).await
+    } else {
+        AttachState::client::attach_pane_grid_snapshot_state(
+            client,
+            session_id,
+            pane_ids,
+            max_rows_per_pane,
+        )
+        .await
+    };
+    match response {
         Ok(Ok(state)) => Ok(state
             .snapshots
             .into_iter()
@@ -122,14 +193,18 @@ pub async fn attach_pane_grid_snapshot_state_streaming(
     max_rows_per_pane: usize,
 ) -> ClientResult<Vec<PaneGridSnapshotResult>> {
     let max_rows_per_pane = u32::try_from(max_rows_per_pane).unwrap_or(u32::MAX);
-    match AttachState::client::attach_pane_grid_snapshot_state(
-        client,
-        session_id,
-        pane_ids,
-        max_rows_per_pane,
-    )
-    .await
-    {
+    let response = if pointer_grid_available(client).await? {
+        PointerGrid::client::snapshots(client, 1, session_id, pane_ids, max_rows_per_pane).await
+    } else {
+        AttachState::client::attach_pane_grid_snapshot_state(
+            client,
+            session_id,
+            pane_ids,
+            max_rows_per_pane,
+        )
+        .await
+    };
+    match response {
         Ok(Ok(state)) => Ok(state
             .snapshots
             .into_iter()
@@ -159,7 +234,12 @@ pub async fn attach_pane_grid_window_state_streaming(
             pin_id: window.pin_id,
         })
         .collect::<Vec<_>>();
-    match AttachState::client::attach_pane_grid_window_state(client, session_id, windows).await {
+    let response = if pointer_grid_available(client).await? {
+        PointerGrid::client::windows(client, 1, session_id, windows).await
+    } else {
+        AttachState::client::attach_pane_grid_window_state(client, session_id, windows).await
+    };
+    match response {
         Ok(Ok(state)) => Ok(state
             .windows
             .into_iter()
@@ -3854,15 +3934,27 @@ pub async fn attach_pane_grid_delta_state_streaming(
     max_batches_per_pane: usize,
 ) -> ClientResult<Vec<PaneGridDeltaResult>> {
     let max_batches_per_pane = u32::try_from(max_batches_per_pane).unwrap_or(u32::MAX);
-    match AttachState::client::attach_pane_grid_delta_state(
-        client,
-        session_id,
-        pane_ids,
-        base_revisions,
-        max_batches_per_pane,
-    )
-    .await
-    {
+    let response = if pointer_grid_available(client).await? {
+        PointerGrid::client::deltas(
+            client,
+            1,
+            session_id,
+            pane_ids,
+            base_revisions,
+            max_batches_per_pane,
+        )
+        .await
+    } else {
+        AttachState::client::attach_pane_grid_delta_state(
+            client,
+            session_id,
+            pane_ids,
+            base_revisions,
+            max_batches_per_pane,
+        )
+        .await
+    };
+    match response {
         Ok(Ok(state)) => Ok(state
             .deltas
             .into_iter()

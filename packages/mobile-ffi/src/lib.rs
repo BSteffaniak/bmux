@@ -124,6 +124,7 @@ pub enum TerminalMouseEventKindFfi {
     ScrollDown,
     ScrollLeft,
     ScrollRight,
+    Leave,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -186,6 +187,30 @@ pub struct TerminalChunkFfi {
     pub kind: TerminalChunkKindFfi,
     pub bytes: Vec<u8>,
     pub status_severity: Option<TerminalStatusSeverityFfi>,
+}
+
+/// Native pointer metadata v1, never bytes sent into a terminal emulator.
+#[derive(Debug, Clone, uniffi::Enum)]
+pub enum TerminalPointerShapeFfi {
+    Hidden,
+    /// A validated CSS pointer vocabulary name, not an arbitrary escape payload.
+    Shape {
+        name: String,
+    },
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct TerminalPointerOutputFfi {
+    pub version: u32,
+    pub generation: String,
+    pub revision: u64,
+    pub shape: TerminalPointerShapeFfi,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct TerminalPresentationFfi {
+    pub chunks: Vec<TerminalChunkFfi>,
+    pub pointer: Option<TerminalPointerOutputFfi>,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -269,6 +294,7 @@ const fn map_terminal_mouse_event_kind(value: TerminalMouseEventKindFfi) -> Term
         TerminalMouseEventKindFfi::Up => TerminalMouseEventKind::Up,
         TerminalMouseEventKindFfi::Drag => TerminalMouseEventKind::Drag,
         TerminalMouseEventKindFfi::Move => TerminalMouseEventKind::Move,
+        TerminalMouseEventKindFfi::Leave => TerminalMouseEventKind::Leave,
         TerminalMouseEventKindFfi::ScrollUp => TerminalMouseEventKind::ScrollUp,
         TerminalMouseEventKindFfi::ScrollDown => TerminalMouseEventKind::ScrollDown,
         TerminalMouseEventKindFfi::ScrollLeft => TerminalMouseEventKind::ScrollLeft,
@@ -503,11 +529,29 @@ impl MobileApi {
         manager.terminal_state(terminal_id)
     }
 
-    /// Read pending output chunks from a terminal stream.
+    /// Read a versioned native presentation with pointer metadata ordered after its bytes.
     ///
     /// # Errors
+    /// Rejects unsupported versions before draining output; returns lookup/backend errors.
+    pub fn poll_terminal_presentation(
+        &self,
+        terminal_id: &str,
+        max_chunks: u32,
+        version: u32,
+    ) -> Result<bmux_mobile_core::pointer_output::TerminalPresentation> {
+        bmux_mobile_core::pointer_output::validate_pointer_version(version)?;
+        let terminal_id = Uuid::parse_str(terminal_id)
+            .map_err(|_| MobileCoreError::TerminalSessionNotFound(terminal_id.to_string()))?;
+        let max_chunks = usize::try_from(max_chunks)
+            .map_err(|_| MobileCoreError::InvalidTarget("max_chunks out of range".to_string()))?;
+        self.lock_manager()?
+            .poll_terminal_presentation(terminal_id, max_chunks, version)
+    }
+
+    /// Read byte-only terminal chunks without pointer metadata.
     ///
-    /// Returns UUID parsing or terminal lookup errors.
+    /// # Errors
+    /// Returns UUID parsing, lookup, or backend errors.
     pub fn poll_terminal_output(
         &self,
         terminal_id: &str,
@@ -803,11 +847,49 @@ impl MobileApiFfi {
             .map_err(MobileFfiError::from)
     }
 
-    /// Poll pending terminal output chunks.
+    /// Select native pointer output v1. Existing byte-only polling is unchanged.
     ///
     /// # Errors
+    /// Returns explicit unsupported-version, lookup, or backend errors.
+    pub fn poll_terminal_presentation(
+        &self,
+        terminal_id: String,
+        max_chunks: u32,
+        version: u32,
+    ) -> std::result::Result<TerminalPresentationFfi, MobileFfiError> {
+        self.inner
+            .poll_terminal_presentation(&terminal_id, max_chunks, version)
+            .map(|presentation| TerminalPresentationFfi {
+                chunks: presentation
+                    .chunks
+                    .into_iter()
+                    .map(map_terminal_chunk)
+                    .collect(),
+                pointer: presentation
+                    .pointer
+                    .map(|pointer| TerminalPointerOutputFfi {
+                        version: pointer.version,
+                        generation: pointer.generation.to_string(),
+                        revision: pointer.revision,
+                        shape: match pointer.shape {
+                            bmux_mobile_core::pointer_output::TerminalPointerShape::Hidden => {
+                                TerminalPointerShapeFfi::Hidden
+                            }
+                            bmux_mobile_core::pointer_output::TerminalPointerShape::Shape(
+                                shape,
+                            ) => TerminalPointerShapeFfi::Shape {
+                                name: shape.as_str().to_string(),
+                            },
+                        },
+                    }),
+            })
+            .map_err(MobileFfiError::from)
+    }
+
+    /// Read byte-only terminal chunks without pointer metadata.
     ///
-    /// Returns mapped UUID parsing and terminal lookup errors.
+    /// # Errors
+    /// Returns UUID parsing, lookup, or backend errors.
     pub fn poll_terminal_output(
         &self,
         terminal_id: String,
@@ -993,6 +1075,27 @@ pub type Result<T> = std::result::Result<T, MobileCoreError>;
 mod tests {
     use super::*;
     use bmux_mobile_core::ConnectionManager;
+
+    #[test]
+    fn native_presentation_rejects_unknown_version_before_terminal_lookup() {
+        let api = MobileApi::new();
+        let error = api
+            .poll_terminal_presentation("invalid-uuid", 8, 2)
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported native pointer output version")
+        );
+    }
+
+    #[test]
+    fn terminal_mouse_leave_has_a_typed_mapping() {
+        assert_eq!(
+            map_terminal_mouse_event_kind(TerminalMouseEventKindFfi::Leave),
+            TerminalMouseEventKind::Leave
+        );
+    }
     use bmux_mobile_core::remote_bridge::{BackendSessionHandle, TerminalBackend};
     use std::collections::BTreeMap;
     use std::sync::{Arc, Mutex};

@@ -648,6 +648,8 @@ through `behavior.mouse.gesture_actions`.
 ```toml
 [behavior.mouse]
 enabled = true
+# OSC 22 pointer feedback on supported hosts, independent of mouse capture.
+pointer_shapes = true
 focus_on_click = true
 click_propagation = "focus_and_forward"
 focus_on_hover = false

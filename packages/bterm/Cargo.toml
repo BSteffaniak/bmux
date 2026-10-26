@@ -16,6 +16,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = { workspace = true }
+bmux_attach_pipeline = { workspace = true }
 bmux_cli = { workspace = true }
 bmux_client = { workspace = true }
 bmux_config = { workspace = true }
@@ -23,6 +24,7 @@ bmux_frontend_runtime = { workspace = true }
 bmux_ipc = { workspace = true }
 bmux_pane_runtime_plugin_api = { workspace = true }
 bmux_plugin_sdk = { workspace = true }
+bmux_terminal_protocol = { workspace = true }
 bterm_native_platform = { workspace = true }
 bterm_native_renderer = { workspace = true }
 clap = { workspace = true, features = [

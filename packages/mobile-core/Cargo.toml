@@ -24,6 +24,7 @@ bmux_session_models = { workspace = true, features = ["serde"] }
 bmux_sessions_plugin_api = { workspace = true }
 bmux_tabs_plugin_api = { workspace = true }
 bmux_terminal_grid = { workspace = true }
+bmux_terminal_protocol = { workspace = true }
 iroh = { workspace = true }
 rustls = { workspace = true }
 rustls-native-certs = { workspace = true }

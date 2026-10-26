@@ -717,17 +717,230 @@ fn process_pane_output(
     output_buffer: &std::sync::Mutex<OutputFanoutBuffer>,
     bytes: &[u8],
 ) -> Result<(), SessionRuntimeError> {
+    process_pane_output_with_pointer_queries(
+        terminal_grid,
+        output_buffer,
+        bytes,
+        ProtocolProfile::Conservative,
+    )
+    .map(|_| ())
+}
+
+fn process_pane_output_with_pointer_queries(
+    terminal_grid: &std::sync::Mutex<TerminalGridStream>,
+    output_buffer: &std::sync::Mutex<OutputFanoutBuffer>,
+    bytes: &[u8],
+    profile: ProtocolProfile,
+) -> Result<Vec<u8>, SessionRuntimeError> {
+    use bmux_terminal_protocol::pointer_shape::{
+        PointerShape, PointerShapeQueryContext, encode_pointer_shape_query_reply,
+    };
+
     // All combined captures and writes acquire grid before output. Holding both
     // guards prevents snapshots from pairing parsed state with another chunk's offset.
+    // Only collect replies here: PTY writes must happen after capture locks release.
     let mut grid = terminal_grid
         .lock()
         .map_err(|_| SessionRuntimeError::Closed)?;
     let mut output = output_buffer
         .lock()
         .map_err(|_| SessionRuntimeError::Closed)?;
-    grid.process(bytes);
+    let mut replies = Vec::new();
+    grid.process_with_pointer_queries(bytes, |query, current| {
+        if matches!(profile, ProtocolProfile::Bmux) {
+            // The grid has already bounded and validated the complete OSC payload.
+            let _ = encode_pointer_shape_query_reply(
+                query,
+                PointerShapeQueryContext {
+                    current,
+                    default: PointerShape::Text,
+                    grabbed: PointerShape::Default,
+                },
+                &mut replies,
+            );
+        }
+    });
     output.push_chunk(bytes);
-    Ok(())
+    Ok(replies)
+}
+
+#[cfg(test)]
+mod pointer_query_tests {
+    use super::{
+        GridLimits, OutputFanoutBuffer, ProtocolProfile, TerminalGridStream,
+        process_pane_output_with_pointer_queries,
+    };
+    use std::sync::Mutex;
+
+    fn grid() -> Mutex<TerminalGridStream> {
+        Mutex::new(TerminalGridStream::new(80, 24, GridLimits::default()).unwrap())
+    }
+
+    fn process(grid: &Mutex<TerminalGridStream>, bytes: &[u8]) -> Vec<u8> {
+        let output = Mutex::new(OutputFanoutBuffer::new(4096));
+        let reply =
+            process_pane_output_with_pointer_queries(grid, &output, bytes, ProtocolProfile::Bmux)
+                .unwrap();
+        // Collection returns without retaining either capture lock.
+        assert!(grid.try_lock().is_ok());
+        assert!(output.try_lock().is_ok());
+        reply
+    }
+
+    #[test]
+    fn same_chunk_queries_observe_canonical_parser_order() {
+        let grid = grid();
+        assert_eq!(
+            process(
+                &grid,
+                b"\x1b]22;pointer\x07\x1b]22;?__current__\x07\x1b]22;crosshair\x07\x1b]22;?__current__\x07",
+            ),
+            b"\x1b]22;pointer\x1b\\\x1b]22;crosshair\x1b\\",
+        );
+    }
+
+    #[test]
+    fn split_queries_and_setters_preserve_order() {
+        let grid = grid();
+        assert!(process(&grid, b"\x1b]22;poi").is_empty());
+        assert!(process(&grid, b"nter\x1b\\\x1b]22;?__cur").is_empty());
+        assert_eq!(process(&grid, b"rent__\x1b\\"), b"\x1b]22;pointer\x1b\\");
+    }
+
+    #[test]
+    fn screens_reset_and_executions_are_isolated() {
+        let first = grid();
+        let second = grid();
+        process(
+            &first,
+            b"\x1b]22;pointer\x07\x1b[?1049h\x1b]22;crosshair\x07",
+        );
+        assert_eq!(
+            process(&first, b"\x1b]22;?__current__\x07"),
+            b"\x1b]22;crosshair\x1b\\"
+        );
+        assert_eq!(
+            process(&second, b"\x1b]22;?__current__\x07"),
+            b"\x1b]22;0\x1b\\"
+        );
+        assert_eq!(
+            process(&first, b"\x1b[?1049l\x1b]22;?__current__\x07"),
+            b"\x1b]22;pointer\x1b\\"
+        );
+        assert_eq!(
+            process(&first, b"\x1bc\x1b]22;?__current__\x07"),
+            b"\x1b]22;0\x1b\\"
+        );
+        // A replacement starts with a fresh execution-scoped grid, not the old stack.
+        let replacement = grid();
+        assert_eq!(
+            process(&replacement, b"\x1b]22;<\x07\x1b]22;?__current__\x07"),
+            b"\x1b]22;0\x1b\\"
+        );
+    }
+
+    #[test]
+    fn snapshot_recovery_keeps_stack_and_partial_query_without_replying() {
+        let original = grid();
+        process(
+            &original,
+            b"\x1b]22;pointer\x07\x1b]22;>crosshair\x07\x1b]22;?__cur",
+        );
+        let snapshot = original.lock().unwrap().snapshot(0, 24);
+        let restored = Mutex::new(
+            TerminalGridStream::from_snapshot(&snapshot, GridLimits::default()).unwrap(),
+        );
+        assert_eq!(
+            process(
+                &restored,
+                b"rent__\x07\x1b]22;<\x07\x1b]22;?__current__\x07"
+            ),
+            b"\x1b]22;crosshair\x1b\\\x1b]22;pointer\x1b\\"
+        );
+    }
+
+    #[cfg(not(feature = "image-registry"))]
+    #[test]
+    fn pointer_queries_do_not_replace_cpr_or_color_replies() {
+        use super::{PaneCursorTracker, TerminalProtocolEngine, protocol_reply_for_chunk};
+
+        let chunk = b"\x1b[4;7H\x1b[6n\x1b]10;?\x07\x1b]22;pointer\x07\x1b]22;?__current__\x07";
+        let grid = grid();
+        let pointer = process(&grid, chunk);
+        let mut tracker = PaneCursorTracker::new(24, 80);
+        let mut engine = TerminalProtocolEngine::new(ProtocolProfile::Bmux);
+        let mut replies = protocol_reply_for_chunk(&mut engine, &mut tracker, chunk);
+        assert!(replies.starts_with(b"\x1b[4;7R"));
+        assert!(replies.windows(5).any(|bytes| bytes == b"\x1b]10;"));
+        replies.extend(pointer);
+        assert!(replies.ends_with(b"\x1b]22;pointer\x1b\\"));
+    }
+
+    #[cfg(feature = "image-registry")]
+    #[test]
+    fn image_filtered_path_preserves_cpr_color_and_pointer_queries() {
+        use super::{PaneCursorTracker, TerminalProtocolEngine, ordered_image_output};
+
+        let mut interceptor = bmux_image::ImageInterceptor::new();
+        let mut output = interceptor.process(
+            b"\x1bPq\"1;1;1;6#1;2;100;0;0~\x1b\\\x1b[4;7H\x1b[6n\x1b]10;?\x07\x1b]22;pointer\x07\x1b]22;?__current__\x07",
+        );
+        assert!(!output.events.is_empty());
+        let mut tracker = PaneCursorTracker::new(24, 80);
+        let mut engine = TerminalProtocolEngine::new(ProtocolProfile::Bmux);
+        let mut registry = bmux_image::ImageRegistry::default();
+        let mut replies = Vec::new();
+        ordered_image_output(
+            &mut tracker,
+            &mut engine,
+            &mut registry,
+            &mut output,
+            (8, 16),
+            &mut replies,
+        )
+        .unwrap();
+        let grid = grid();
+        let pointer = process(&grid, &output.filtered);
+        assert!(replies.starts_with(b"\x1b[4;7R"));
+        assert!(replies.windows(5).any(|bytes| bytes == b"\x1b]10;"));
+        replies.extend(pointer);
+        assert!(replies.ends_with(b"\x1b]22;pointer\x1b\\"));
+    }
+
+    #[test]
+    fn support_and_policy_queries_are_bmux_profile_only() {
+        use bmux_terminal_protocol::pointer_shape::PointerShape;
+
+        for profile in [
+            ProtocolProfile::Bmux,
+            ProtocolProfile::Xterm,
+            ProtocolProfile::Screen,
+            ProtocolProfile::Conservative,
+        ] {
+            let grid = grid();
+            let reply = process_pane_output_with_pointer_queries(
+                &grid,
+                &Mutex::new(OutputFanoutBuffer::new(4096)),
+                b"\x1b]22;pointer\x07\x1b]22;?pointer,unknown,__default__,__grabbed__\x07",
+                profile,
+            )
+            .unwrap();
+            if profile == ProtocolProfile::Bmux {
+                assert_eq!(reply, b"\x1b]22;1,0,text,default\x1b\\");
+            } else {
+                assert!(reply.is_empty());
+            }
+            assert_eq!(
+                grid.lock()
+                    .unwrap()
+                    .grid()
+                    .protocol_state()
+                    .pointer_shapes
+                    .current(false),
+                Some(PointerShape::Pointer)
+            );
+        }
+    }
 }
 
 fn push_pane_runtime_notice(
@@ -7246,17 +7459,16 @@ impl SessionRuntimeManager {
                                 sync_update_for_reader
                                     .store(terminal_mode_tracker.sync_update, Ordering::SeqCst);
 
-                                if process_pane_output(
+                                let Ok(pointer_reply) = process_pane_output_with_pointer_queries(
                                     &terminal_grid_for_reader,
                                     &reader_output,
                                     chunk,
-                                )
-                                .is_err()
-                                {
+                                    protocol_profile,
+                                ) else {
                                     break;
-                                }
+                                };
                                 #[cfg(not(feature = "image-registry"))]
-                                let reply = protocol_reply_for_chunk(
+                                let mut reply = protocol_reply_for_chunk(
                                     &mut protocol_engine,
                                     &mut cursor_tracker,
                                     chunk,
@@ -7343,7 +7555,8 @@ impl SessionRuntimeManager {
                                     });
                                 }
                                 #[cfg(feature = "image-registry")]
-                                let reply = image_protocol_reply;
+                                let mut reply = image_protocol_reply;
+                                reply.extend_from_slice(&pointer_reply);
                                 if !reply.is_empty() {
                                     record_to_all_runtimes(
                                         RecordingEventKind::ProtocolReplyRaw,

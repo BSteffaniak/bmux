@@ -44,6 +44,49 @@ impl Arguments {
     }
 }
 
+fn native_pointer_icon(
+    pointer: bmux_attach_pipeline::pointer_shape::ResolvedPointerShape,
+) -> Option<bterm_native_platform::CursorIcon> {
+    use bmux_attach_pipeline::pointer_shape::ResolvedPointerShape;
+    use bmux_terminal_protocol::pointer_shape::PointerShape;
+    use bterm_native_platform::CursorIcon;
+    let ResolvedPointerShape::Shape(shape) = pointer else {
+        return None;
+    };
+    Some(match shape {
+        PointerShape::Alias => CursorIcon::Alias,
+        PointerShape::Cell => CursorIcon::Cell,
+        PointerShape::Copy => CursorIcon::Copy,
+        PointerShape::Crosshair => CursorIcon::Crosshair,
+        PointerShape::Default => CursorIcon::Default,
+        PointerShape::EResize => CursorIcon::EResize,
+        PointerShape::EwResize => CursorIcon::EwResize,
+        PointerShape::Grab => CursorIcon::Grab,
+        PointerShape::Grabbing => CursorIcon::Grabbing,
+        PointerShape::Help => CursorIcon::Help,
+        PointerShape::Move => CursorIcon::Move,
+        PointerShape::NResize => CursorIcon::NResize,
+        PointerShape::NeResize => CursorIcon::NeResize,
+        PointerShape::NeswResize => CursorIcon::NeswResize,
+        PointerShape::NoDrop => CursorIcon::NoDrop,
+        PointerShape::NotAllowed => CursorIcon::NotAllowed,
+        PointerShape::NsResize => CursorIcon::NsResize,
+        PointerShape::NwResize => CursorIcon::NwResize,
+        PointerShape::NwseResize => CursorIcon::NwseResize,
+        PointerShape::Pointer => CursorIcon::Pointer,
+        PointerShape::Progress => CursorIcon::Progress,
+        PointerShape::SResize => CursorIcon::SResize,
+        PointerShape::SeResize => CursorIcon::SeResize,
+        PointerShape::SwResize => CursorIcon::SwResize,
+        PointerShape::Text => CursorIcon::Text,
+        PointerShape::VerticalText => CursorIcon::VerticalText,
+        PointerShape::WResize => CursorIcon::WResize,
+        PointerShape::Wait => CursorIcon::Wait,
+        PointerShape::ZoomIn => CursorIcon::ZoomIn,
+        PointerShape::ZoomOut => CursorIcon::ZoomOut,
+    })
+}
+
 fn default_managed_root() -> Result<PathBuf> {
     let base = if cfg!(windows) {
         std::env::var_os("LOCALAPPDATA")
@@ -375,6 +418,9 @@ impl<W: AttachWorker> Application<W> {
                                     .present(&delivery.prepared)
                                     .map_err(|error| error.to_string())?;
                                 *last_output = Some(delivery.identity);
+                                if let Some(pointer) = delivery.pointer_shape {
+                                    context.set_pointer_icon(native_pointer_icon(pointer));
+                                }
                                 *retained_output = Some(delivery.clone());
                                 let cell = renderer.cell_size();
                                 worker.presented(delivery.identity, viewport, cell);
@@ -1123,6 +1169,25 @@ fn projection_cells(pixels: u32, cell: f32) -> Result<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_pointer_mapping_covers_css_and_keeps_hidden_distinct() {
+        use bmux_attach_pipeline::pointer_shape::ResolvedPointerShape;
+        use bmux_terminal_protocol::pointer_shape::PointerShape;
+        use bterm_native_platform::CursorIcon;
+        for shape in PointerShape::ALL {
+            assert!(native_pointer_icon(ResolvedPointerShape::Shape(shape)).is_some());
+        }
+        assert_eq!(native_pointer_icon(ResolvedPointerShape::Hidden), None);
+        assert_eq!(
+            native_pointer_icon(ResolvedPointerShape::Shape(PointerShape::Grabbing)),
+            Some(CursorIcon::Grabbing)
+        );
+        assert_eq!(
+            native_pointer_icon(ResolvedPointerShape::Shape(PointerShape::Default)),
+            Some(CursorIcon::Default)
+        );
+    }
 
     #[test]
     fn external_selection_conflicts_with_launch_authority() {
