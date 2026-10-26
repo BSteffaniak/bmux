@@ -37,7 +37,11 @@ fn key_event_to_input_event(
 
     let stroke = crossterm_key_event_to_stroke(key)?;
     let raw = key_event_to_bytes(key, enhanced, modes)?;
-    Some(InputEvent::Key(DecodedStroke { stroke, raw }))
+    Some(InputEvent::Key(DecodedStroke {
+        kind: key.kind,
+        stroke,
+        raw,
+    }))
 }
 
 /// Encode a crossterm `KeyEvent` to raw bytes for PTY forwarding.

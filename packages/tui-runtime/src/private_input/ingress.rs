@@ -1,9 +1,8 @@
 //! Single raw reader with synchronous capture barriers and generation-fenced admission.
 use super::{CaptureSuppression, PrivateInputError, PrivateInputGate, PrivateInputRoute};
-use bmux_tui::crossterm::input::{LinuxInputPacket, RawInput};
+use bmux_tui::crossterm::input::RawInput;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use zeroize::Zeroize;
 
 #[cfg(test)]
 mod tests;
@@ -157,12 +156,8 @@ impl PrivateIngress {
         let Some(packet) = packet else {
             return Ok(None);
         };
-        let event = match packet {
-            LinuxInputPacket::Event(event) => event,
-            LinuxInputPacket::Opaque(mut bytes) => {
-                bytes.zeroize();
-                return Ok(None);
-            }
+        let Some(event) = packet.into_event() else {
+            return Ok(None);
         };
         let route = self
             .gate

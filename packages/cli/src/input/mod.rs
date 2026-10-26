@@ -75,6 +75,7 @@ pub struct KeymapDoctorReport {
 
 #[derive(Debug, Clone)]
 pub struct DecodedStroke {
+    kind: crossterm::event::KeyEventKind,
     stroke: KeyStroke,
     raw: Vec<u8>,
 }

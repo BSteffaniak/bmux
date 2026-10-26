@@ -70,12 +70,11 @@ impl FencedTerminalInput for RawFencedInput {
         }
         loop {
             match self.reader.read_ready(std::time::Instant::now()) {
-                Ok(Some(bmux_tui::crossterm::input::LinuxInputPacket::Event(event))) => {
-                    if let Some(event) = bmux_tui::crossterm::event_to_crossterm(event) {
+                Ok(Some(packet)) => {
+                    if let Some(event) = packet.into_crossterm() {
                         return std::task::Poll::Ready(Ok(Some(event)));
                     }
                 }
-                Ok(Some(bmux_tui::crossterm::input::LinuxInputPacket::Opaque(_))) => {}
                 Err(error) => {
                     self.paused = true;
                     return std::task::Poll::Ready(Err(error));

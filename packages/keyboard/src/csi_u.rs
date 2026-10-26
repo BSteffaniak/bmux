@@ -185,12 +185,24 @@ fn encode_modified_fkey(n: u8, modifier: u8) -> Option<Vec<u8>> {
     ))
 }
 
+/// Kind of keyboard event reported by the Kitty keyboard protocol.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyEventKind {
+    /// Initial key depression (also the default for legacy input).
+    Press,
+    /// Auto-repeat while a key is held.
+    Repeat,
+    /// Key release, not another typing action.
+    Release,
+}
+
 /// Decode result from [`decode`].
 ///
-/// Contains the decoded key stroke and the number of bytes consumed.
+/// Contains the decoded key stroke, event kind and number of bytes consumed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecodeResult {
     pub stroke: KeyStroke,
+    pub kind: KeyEventKind,
     pub consumed: usize,
 }
 
@@ -250,6 +262,25 @@ pub fn decode(bytes: &[u8]) -> Option<DecodeResult> {
         return None;
     }
     let params = parse_params(params_bytes);
+    // The second semicolon field is modifiers[:event_type]. Do not confuse
+    // alternate key codepoints in the first field with the event kind.
+    let kind = match params_bytes.split(|byte| *byte == b';').nth(1) {
+        Some(field) => match field.split(|byte| *byte == b':').nth(1) {
+            None | Some(b"" | b"1") => KeyEventKind::Press,
+            Some(b"2") => KeyEventKind::Repeat,
+            Some(b"3") => KeyEventKind::Release,
+            _ => return None,
+        },
+        None => KeyEventKind::Press,
+    };
+    // Unknown event kinds must not be reinterpreted by a legacy fallback.
+    if params_bytes
+        .split(|byte| *byte == b';')
+        .nth(1)
+        .is_some_and(|field| field.split(|byte| *byte == b':').count() > 2)
+    {
+        return None;
+    }
 
     if final_byte == b'u' {
         // CSI u format: codepoint [; modifier] u
@@ -259,6 +290,7 @@ pub fn decode(bytes: &[u8]) -> Option<DecodeResult> {
         let key = codepoint_to_keycode(codepoint)?;
         return Some(DecodeResult {
             stroke: KeyStroke::with_modifiers(key, modifiers),
+            kind,
             consumed,
         });
     }
@@ -271,6 +303,7 @@ pub fn decode(bytes: &[u8]) -> Option<DecodeResult> {
         let key = tilde_number_to_keycode(number)?;
         return Some(DecodeResult {
             stroke: KeyStroke::with_modifiers(key, modifiers),
+            kind,
             consumed,
         });
     }
@@ -303,6 +336,7 @@ pub fn decode(bytes: &[u8]) -> Option<DecodeResult> {
 
         return Some(DecodeResult {
             stroke: KeyStroke::with_modifiers(key, modifiers),
+            kind,
             consumed,
         });
     }
@@ -350,6 +384,32 @@ fn parse_params(bytes: &[u8]) -> Vec<u32> {
 mod tests {
     use super::*;
     use crate::types::{KeyCode, KeyStroke, Modifiers};
+
+    #[test]
+    fn event_kinds_are_preserved_for_all_enhanced_key_forms() {
+        for (suffix, kind) in [
+            ("", KeyEventKind::Press),
+            (":1", KeyEventKind::Press),
+            (":2", KeyEventKind::Repeat),
+            (":3", KeyEventKind::Release),
+        ] {
+            for (code, final_byte) in [("97", 'u'), ("1", 'A'), ("3", '~')] {
+                let sequence = format!("\x1b[{code};5{suffix}{final_byte}");
+                let decoded = decode(sequence.as_bytes()).unwrap();
+                assert_eq!(decoded.kind, kind, "{sequence:?}");
+                assert!(decoded.stroke.modifiers.ctrl);
+                assert_eq!(decoded.consumed, sequence.len());
+            }
+        }
+        assert_eq!(decode(b"\x1b[97u").unwrap().kind, KeyEventKind::Press);
+        assert_eq!(
+            decode(b"\x1b[97:65;2:3u").unwrap().kind,
+            KeyEventKind::Release
+        );
+        for sequence in [b"\x1b[97;1:0u", b"\x1b[97;1:4u"] {
+            assert!(decode(sequence).is_none());
+        }
+    }
 
     #[test]
     fn decode_colon_event_and_alternate_key_fields() {

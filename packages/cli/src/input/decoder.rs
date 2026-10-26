@@ -9,6 +9,8 @@ use bmux_keyboard::csi_u;
 use bmux_keyboard::legacy;
 use bmux_keyboard::{KeyCode, KeyStroke};
 
+use crossterm::event::KeyEventKind;
+
 use super::{DecodedStroke, InputEvent};
 
 /// Streaming byte decoder that accumulates incomplete sequences.
@@ -25,7 +27,11 @@ impl ByteDecoder {
 
         while let Some((stroke, consumed)) = decode_one(&self.pending) {
             self.pending.drain(0..consumed);
-            events.push(InputEvent::Key(stroke));
+            // This decoder produces typing/keybinding actions, like the
+            // Crossterm adapter: releases are consumed but never type again.
+            if stroke.kind != KeyEventKind::Release {
+                events.push(InputEvent::Key(stroke));
+            }
         }
 
         events
@@ -43,12 +49,20 @@ fn decode_one(bytes: &[u8]) -> Option<(DecodedStroke, usize)> {
     let first = bytes[0];
     if first != 0x1b {
         let (stroke, raw) = legacy::decode_single(first);
-        return Some((DecodedStroke { stroke, raw }, 1));
+        return Some((
+            DecodedStroke {
+                kind: KeyEventKind::Press,
+                stroke,
+                raw,
+            },
+            1,
+        ));
     }
 
     if bytes.len() == 1 {
         return Some((
             DecodedStroke {
+                kind: KeyEventKind::Press,
                 stroke: KeyStroke::simple(KeyCode::Escape),
                 raw: vec![0x1b],
             },
@@ -61,6 +75,11 @@ fn decode_one(bytes: &[u8]) -> Option<(DecodedStroke, usize)> {
     if let Some(result) = csi_u::decode(bytes) {
         return Some((
             DecodedStroke {
+                kind: match result.kind {
+                    csi_u::KeyEventKind::Press => KeyEventKind::Press,
+                    csi_u::KeyEventKind::Repeat => KeyEventKind::Repeat,
+                    csi_u::KeyEventKind::Release => KeyEventKind::Release,
+                },
                 stroke: result.stroke,
                 raw: bytes[..result.consumed].to_vec(),
             },
@@ -72,6 +91,7 @@ fn decode_one(bytes: &[u8]) -> Option<(DecodedStroke, usize)> {
     if let Some(result) = legacy::decode_escape(bytes) {
         return Some((
             DecodedStroke {
+                kind: KeyEventKind::Press,
                 stroke: result.stroke,
                 raw: result.raw,
             },
@@ -92,9 +112,38 @@ fn decode_one(bytes: &[u8]) -> Option<(DecodedStroke, usize)> {
     let raw = vec![0x1b, second];
     Some((
         DecodedStroke {
+            kind: KeyEventKind::Press,
             stroke: decoded_stroke,
             raw,
         },
         2,
     ))
+}
+
+#[cfg(all(test, feature = "kitty-keyboard"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stream_typing_consumes_releases_and_preserves_repeats() {
+        let mut decoder = ByteDecoder::default();
+        let wire = b"\x1b[97;1:1u\x1b[97;1:2u\x1b[97;1:3ub";
+        let events = decoder.feed_events(wire);
+        assert_eq!(events.len(), 3);
+        let kinds: Vec<_> = events
+            .iter()
+            .map(|event| match event {
+                InputEvent::Key(key) => key.kind,
+                InputEvent::RawBytes(_) => panic!("unexpected raw bytes"),
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                KeyEventKind::Press,
+                KeyEventKind::Repeat,
+                KeyEventKind::Press
+            ]
+        );
+    }
 }

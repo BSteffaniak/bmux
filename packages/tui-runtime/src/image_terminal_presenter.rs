@@ -1252,7 +1252,7 @@ mod async_tests {
                         key = true;
                     }
                     LinuxInputPacket::Event(bmux_tui::event::Event::Resize(_)) => {}
-                    other @ LinuxInputPacket::Event(_) => panic!("unexpected packet: {other:?}"),
+                    other => panic!("unexpected packet: {other:?}"),
                 }
             }
         })

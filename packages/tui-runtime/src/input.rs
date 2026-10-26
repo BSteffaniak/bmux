@@ -174,15 +174,11 @@ impl ManagedTerminalInput {
                         break;
                     }
                     match reader.read_ready(std::time::Instant::now()) {
-                        Ok(Some(bmux_tui::crossterm::input::LinuxInputPacket::Event(event))) => {
-                            tokio::select! { biased; _ = stopped.changed() => break,
-                            result = sender.send(Ok(event)) => if result.is_err() { break; } }
-                        }
-                        Ok(Some(bmux_tui::crossterm::input::LinuxInputPacket::Opaque(
-                            mut bytes,
-                        ))) => {
-                            use zeroize::Zeroize;
-                            bytes.zeroize();
+                        Ok(Some(packet)) => {
+                            if let Some(event) = packet.into_event() {
+                                tokio::select! { biased; _ = stopped.changed() => break,
+                                result = sender.send(Ok(event)) => if result.is_err() { break; } }
+                            }
                         }
                         Ok(None) => {
                             tokio::select! { biased; _ = stopped.changed() => break,
@@ -352,14 +348,10 @@ impl TerminalInput {
                     };
                     loop {
                         match reader.read_ready(std::time::Instant::now()) {
-                            Ok(Some(bmux_tui::crossterm::input::LinuxInputPacket::Event(
-                                event,
-                            ))) => return Some((Ok(event), Some(Ok(reader)))),
-                            Ok(Some(bmux_tui::crossterm::input::LinuxInputPacket::Opaque(
-                                mut bytes,
-                            ))) => {
-                                use zeroize::Zeroize;
-                                bytes.zeroize();
+                            Ok(Some(packet)) => {
+                                if let Some(event) = packet.into_event() {
+                                    return Some((Ok(event), Some(Ok(reader))));
+                                }
                             }
                             Ok(None) => {
                                 tokio::time::sleep(std::time::Duration::from_millis(2)).await;

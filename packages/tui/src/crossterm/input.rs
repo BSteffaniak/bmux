@@ -19,8 +19,62 @@ const ESC_WAIT: Duration = Duration::from_millis(30);
 pub enum LinuxInputPacket {
     /// Decoded ordinary terminal input.
     Event(Event),
+    /// A repeat or release, retaining metadata absent from the TUI action model.
+    Key {
+        /// Decoded key and modifiers.
+        stroke: KeyStroke,
+        /// Protocol event kind.
+        kind: bmux_keyboard::csi_u::KeyEventKind,
+    },
     /// Unmatched protocol frame or undecodable bytes, unchanged.
     Opaque(Vec<u8>),
+}
+
+impl LinuxInputPacket {
+    /// Convert to a TUI action: repeats type, releases do not. Opaque input is wiped.
+    #[must_use]
+    pub fn into_event(self) -> Option<Event> {
+        match self {
+            Self::Event(event) => Some(event),
+            Self::Key {
+                kind: bmux_keyboard::csi_u::KeyEventKind::Release,
+                ..
+            } => None,
+            Self::Key { stroke, .. } => Some(Event::Key(stroke)),
+            Self::Opaque(mut bytes) => {
+                use zeroize::Zeroize;
+                bytes.zeroize();
+                None
+            }
+        }
+    }
+
+    /// Convert to an attach event without losing press/repeat/release identity.
+    #[must_use]
+    pub fn into_crossterm(self) -> Option<crossterm::event::Event> {
+        match self {
+            Self::Key { stroke, kind } => {
+                let crossterm::event::Event::Key(mut key) =
+                    super::event_to_crossterm(Event::Key(stroke))?
+                else {
+                    return None;
+                };
+                key.kind = match kind {
+                    bmux_keyboard::csi_u::KeyEventKind::Press => {
+                        crossterm::event::KeyEventKind::Press
+                    }
+                    bmux_keyboard::csi_u::KeyEventKind::Repeat => {
+                        crossterm::event::KeyEventKind::Repeat
+                    }
+                    bmux_keyboard::csi_u::KeyEventKind::Release => {
+                        crossterm::event::KeyEventKind::Release
+                    }
+                };
+                Some(crossterm::event::Event::Key(key))
+            }
+            other => other.into_event().and_then(super::event_to_crossterm),
+        }
+    }
 }
 
 struct Decoder {
@@ -239,16 +293,26 @@ impl Decoder {
                     return Ok(self.opaque(end, now));
                 }
                 let decoded = bmux_keyboard::csi_u::decode(sequence)
-                    .map(|result| (result.stroke, result.consumed))
+                    .map(|result| (result.stroke, result.consumed, result.kind))
                     .or_else(|| {
-                        bmux_keyboard::legacy::decode_escape(sequence)
-                            .map(|result| (result.stroke, result.consumed))
+                        bmux_keyboard::legacy::decode_escape(sequence).map(|result| {
+                            (
+                                result.stroke,
+                                result.consumed,
+                                bmux_keyboard::csi_u::KeyEventKind::Press,
+                            )
+                        })
                     });
-                if let Some((key, consumed)) = decoded
+                if let Some((key, consumed, kind)) = decoded
                     && consumed == end
                     && key.key != KeyCode::Escape
                 {
-                    return Ok(self.take(end, LinuxInputPacket::Event(Event::Key(key)), now));
+                    let packet = if kind == bmux_keyboard::csi_u::KeyEventKind::Press {
+                        LinuxInputPacket::Event(Event::Key(key))
+                    } else {
+                        LinuxInputPacket::Key { stroke: key, kind }
+                    };
+                    return Ok(self.take(end, packet, now));
                 }
                 return Ok(self.opaque(end, now));
             }
@@ -479,6 +543,57 @@ mod tests {
     use std::time::{Duration, Instant};
 
     #[test]
+    fn fragmented_key_kinds_survive_attach_and_filter_tui_actions() {
+        use crossterm::event::{Event as CEvent, KeyEventKind as CKind};
+        let now = Instant::now();
+        for (code, final_byte) in [("97", 'u'), ("1", 'A'), ("3", '~')] {
+            for (suffix, expected) in [
+                (":1", CKind::Press),
+                (":2", CKind::Repeat),
+                (":3", CKind::Release),
+            ] {
+                let sequence = format!("\x1b[{code};5{suffix}{final_byte}");
+                for split in 1..sequence.len() {
+                    let mut decoder = Decoder::default();
+                    decoder.feed(&sequence.as_bytes()[..split], now).unwrap();
+                    assert!(decoder.next(now).unwrap().is_none());
+                    decoder.feed(&sequence.as_bytes()[split..], now).unwrap();
+                    let packet = decoder.next(now).unwrap().unwrap();
+                    let Some(CEvent::Key(key)) = packet.clone().into_crossterm() else {
+                        panic!("missing key");
+                    };
+                    assert_eq!(key.kind, expected);
+                    assert!(
+                        key.modifiers
+                            .contains(crossterm::event::KeyModifiers::CONTROL)
+                    );
+                    assert_eq!(packet.into_event().is_some(), expected != CKind::Release);
+                    assert!(decoder.next(now).unwrap().is_none());
+                }
+            }
+        }
+        for (sequence, count) in [
+            (b"\x1b[97;1:1u\x1b[97;1:3u".as_slice(), 1),
+            (
+                b"\x1b[97;1:1u\x1b[97;1:2u\x1b[97;1:2u\x1b[97;1:3u".as_slice(),
+                3,
+            ),
+        ] {
+            let mut decoder = Decoder::default();
+            decoder.feed(sequence, now).unwrap();
+            let mut typed = 0;
+            while let Some(packet) = decoder.next(now).unwrap() {
+                if let Some(CEvent::Key(key)) = packet.into_crossterm()
+                    && key.kind != CKind::Release
+                {
+                    typed += 1;
+                }
+            }
+            assert_eq!(typed, count);
+        }
+    }
+
+    #[test]
     fn colon_keys_delayed_paste_and_bel_osc_regressions() {
         let now = Instant::now();
         for sequence in [b"\x1b[97;5:1u".as_slice(), b"\x1b[97:65;2u".as_slice()] {
@@ -544,6 +659,26 @@ mod tests {
         decoder.feed(&bytes, now).unwrap();
         assert!(decoder.next(now).is_err());
         assert!(decoder.next(now).is_err());
+    }
+
+    fn assert_pty_key_kinds(master: &mut std::fs::File, reader: &mut RawInput) {
+        use crossterm::event::{Event as CEvent, KeyCode as CCode, KeyEventKind as Kind};
+        use std::io::Write;
+        master
+            .write_all(b"\x1b[97;1:1u\x1b[97;1:2u\x1b[97;1:3u")
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut kinds = Vec::new();
+        while kinds.len() < 3 {
+            if let Some(packet) = reader.read_ready(Instant::now()).unwrap()
+                && let Some(CEvent::Key(key)) = packet.into_crossterm()
+            {
+                assert_eq!(key.code, CCode::Char('a'));
+                kinds.push(key.kind);
+            }
+            assert!(Instant::now() < deadline);
+        }
+        assert_eq!(kinds, vec![Kind::Press, Kind::Repeat, Kind::Release]);
     }
 
     #[test]
@@ -642,6 +777,7 @@ mod tests {
             }
             assert!(Instant::now() < deadline);
         }
+        assert_pty_key_kinds(&mut master, &mut reader);
         let size = libc::winsize {
             ws_row: 41,
             ws_col: 93,
