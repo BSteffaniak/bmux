@@ -143,6 +143,9 @@ pub struct Arguments {
     pub config_profile: Option<String>,
     #[command(subcommand)]
     pub command: Option<ConfigurationCommand>,
+    /// Select an active local Linux graphical login when display settings are absent.
+    #[arg(long)]
+    pub desktop_session: Option<String>,
     /// Existing BMUX attachment target; omission uses BMUX's normal selection.
     #[arg(long)]
     pub session: Option<String>,
@@ -568,6 +571,10 @@ pub fn run() -> Result<()> {
             }
         }
     }
+    #[cfg(target_os = "linux")]
+    if arguments.command.is_none() {
+        crate::desktop::prepare(arguments.desktop_session.as_deref(), sandbox.is_some())?;
+    }
     let selection = if let Some(context) = &sandbox {
         RuntimeSelection::External {
             roots: sandbox_roots(context),
@@ -623,6 +630,8 @@ pub fn run() -> Result<()> {
         println!("{}", serde_json::to_string(&report)?);
         return Ok(());
     }
+    let event_loop = bterm_native_platform::NativeEventLoop::prepare()
+        .context("connect native desktop before companion startup")?;
     let decorations = configuration.native.window.decorations;
     // Complete compatibility/readiness admission before creating even a hidden
     // native surface. Keep the executor that owns the client's transport tasks.
@@ -633,7 +642,8 @@ pub fn run() -> Result<()> {
     let (client, preparation) = runtime.block_on(
         crate::runtime_launch::prepare_native_configured(&selection, &configuration),
     )?;
-    run_window_with_options(
+    run_window_prepared(
+        event_loop,
         BmuxWorker {
             preparation,
             prepared: Some(PreparedConnection { client, runtime }),
@@ -1121,6 +1131,16 @@ impl AttachWorker for BmuxWorker {
 /// Open the real platform host with an existing BMUX frontend integration.
 pub fn run_window(worker: impl AttachWorker) -> Result<()> {
     run_window_with_options(worker, WindowOptions::default())
+}
+
+fn run_window_prepared(
+    event_loop: bterm_native_platform::NativeEventLoop,
+    worker: impl AttachWorker,
+    options: WindowOptions,
+) -> Result<()> {
+    event_loop
+        .run(options, Application::new(worker)?)
+        .context("run native window")
 }
 
 fn run_window_with_options(worker: impl AttachWorker, options: WindowOptions) -> Result<()> {

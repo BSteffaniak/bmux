@@ -6,6 +6,8 @@
 pub mod app;
 pub mod compatibility;
 pub mod configuration;
+#[cfg(target_os = "linux")]
+mod desktop;
 pub mod headless;
 mod managed_storage;
 mod reconciliation;

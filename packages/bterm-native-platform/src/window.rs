@@ -411,7 +411,35 @@ impl<A: WindowApplication> ApplicationHandler<()> for Host<A> {
 /// Run one native window on the calling (main) thread. Window close is delivered
 /// to the consumer; it must call `context.exit()` after its shutdown bookkeeping.
 /// Linux and macOS are supported; Windows explicitly rejects this initial backend.
+/// A verified native display connection, prepared before runtime side effects.
+pub struct NativeEventLoop(EventLoop<()>);
+
+impl NativeEventLoop {
+    pub fn prepare() -> Result<Self, PlatformError> {
+        EventLoop::<()>::with_user_event()
+            .build()
+            .map(Self)
+            .map_err(|err| PlatformError::EventLoop(err.to_string()))
+    }
+
+    pub fn run(
+        self,
+        options: WindowOptions,
+        application: impl WindowApplication,
+    ) -> Result<(), PlatformError> {
+        run_prepared(self.0, options, application)
+    }
+}
+
 pub fn run(
+    options: WindowOptions,
+    application: impl WindowApplication,
+) -> Result<(), PlatformError> {
+    NativeEventLoop::prepare()?.run(options, application)
+}
+
+fn run_prepared(
+    event_loop: EventLoop<()>,
     options: WindowOptions,
     application: impl WindowApplication,
 ) -> Result<(), PlatformError> {
@@ -421,9 +449,6 @@ pub fn run(
     if !valid_initial_size(options.initial_size) {
         return Err(PlatformError::InvalidSize);
     }
-    let event_loop = EventLoop::<()>::with_user_event()
-        .build()
-        .map_err(|err| PlatformError::EventLoop(err.to_string()))?;
     event_loop.set_control_flow(ControlFlow::Wait);
     let proxy = PlatformProxy {
         proxy: event_loop.create_proxy(),

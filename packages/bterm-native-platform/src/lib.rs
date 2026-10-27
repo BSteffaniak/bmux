@@ -12,6 +12,6 @@ pub use winit::window::CursorIcon;
 
 pub use geometry::{LogicalSize, PhysicalRect, PhysicalSize, WindowMetrics};
 pub use window::{
-    PlatformError, PlatformEvent, PlatformProxy, SurfaceTarget, WindowApplication, WindowContext,
-    WindowOptions, run,
+    NativeEventLoop, PlatformError, PlatformEvent, PlatformProxy, SurfaceTarget, WindowApplication,
+    WindowContext, WindowOptions, run,
 };
