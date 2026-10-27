@@ -372,6 +372,13 @@ impl<W: AttachWorker> Application<W> {
                 self.renderer = None;
             }
             PlatformEvent::Resized(metrics) => {
+                // Resume already installed these metrics before starting the
+                // attachment. Winit may repeat them immediately (and later).
+                // Do not revoke a valid presentation or resend its generation.
+                if !projection_resize_needed(self.metrics, metrics, self.active) {
+                    context.request_redraw();
+                    return Ok(());
+                }
                 self.worker.invalidate_presentation();
                 context.invalidate_accessibility();
                 if self.renderer.is_some() {
@@ -1147,6 +1154,14 @@ fn run_window_with_options(worker: impl AttachWorker, options: WindowOptions) ->
     bterm_native_platform::run(options, Application::new(worker)?).context("run native window")
 }
 
+fn projection_resize_needed(
+    previous: Option<WindowMetrics>,
+    next: WindowMetrics,
+    active: bool,
+) -> bool {
+    !active || previous != Some(next)
+}
+
 fn accumulate_scroll(remainder: &mut [f64; 2], x: f64, y: f64) -> (i16, i16) {
     let mut steps = [0_i16; 2];
     for (axis, delta) in [x, y].into_iter().enumerate() {
@@ -1197,6 +1212,31 @@ fn projection_cells(pixels: u32, cell: f32) -> Result<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resumed_geometry_does_not_resend_the_initial_viewport_generation() {
+        let metrics = WindowMetrics {
+            physical_size: bterm_native_platform::PhysicalSize {
+                width: 800,
+                height: 600,
+            },
+            scale_factor: 1.0,
+        };
+        // Resume initializes the attachment at generation 1. Both the synthetic
+        // post-resume resize and repeated compositor notifications are no-ops.
+        assert!(!projection_resize_needed(Some(metrics), metrics, true));
+        let mut resized = metrics;
+        resized.physical_size.width = 900;
+        assert!(projection_resize_needed(Some(metrics), resized, true));
+        let mut scaled = metrics;
+        scaled.scale_factor = 2.0;
+        assert!(projection_resize_needed(Some(metrics), scaled, true));
+        assert!(projection_resize_needed(None, metrics, true));
+        assert!(projection_resize_needed(Some(metrics), metrics, false));
+        let mut empty = metrics;
+        empty.physical_size.width = 0;
+        assert!(projection_resize_needed(Some(metrics), empty, true));
+    }
 
     #[test]
     fn native_pointer_mapping_covers_css_and_keeps_hidden_distinct() {
