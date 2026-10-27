@@ -584,6 +584,12 @@ fn shell_spec(root: &Root, script: &str) -> RuntimeLaunchSpec {
     let mut spec = root.spec();
     spec.executable = "/bin/sh".into();
     spec.arguments = vec!["-c".into(), script.into()];
+    // Production launches deliberately clear the environment. These shell
+    // fixtures still need the toolchain's utilities rather than /bin paths.
+    spec.environment.insert(
+        "PATH".into(),
+        std::env::var_os("PATH").expect("test shell utilities on PATH"),
+    );
     spec
 }
 
@@ -604,7 +610,7 @@ async fn concurrent_launchers_spawn_once_and_companion_outlives_result() {
     let root = Root::new();
     let spec = shell_spec(
         &root,
-        "printf 'launch\\n' >> launched; : > ready; while [ ! -f release ]; do /bin/sleep 0.01; done; : > done",
+        "printf 'launch\\n' >> launched; : > ready; while [ ! -f release ]; do sleep 0.01; done; : > done",
     );
     let probe = || async {
         Ok(if root.0.join("ready").exists() {
@@ -655,7 +661,7 @@ async fn cancelled_startup_retains_ownership_until_child_exits() {
     let root = Root::new();
     let spec = shell_spec(
         &root,
-        ": > launched; while [ ! -f release ]; do /bin/sleep 0.01; done; : > done",
+        ": > launched; while [ ! -f release ]; do sleep 0.01; done; : > done",
     );
     let mut launch = Box::pin(ensure_runtime(&spec, || async { Ok(RuntimeProbe::Absent) }));
     tokio::select! {
@@ -688,7 +694,7 @@ async fn timeout_keeps_startup_owned_until_child_exits_without_killing_it() {
     let root = Root::new();
     let mut spec = shell_spec(
         &root,
-        ": > launched; while [ ! -f release ]; do /bin/sleep 0.01; done; : > done",
+        ": > launched; while [ ! -f release ]; do sleep 0.01; done; : > done",
     );
     spec.timeout = Duration::from_millis(80);
     let error = ensure_runtime(&spec, || async { Ok(RuntimeProbe::Absent) })

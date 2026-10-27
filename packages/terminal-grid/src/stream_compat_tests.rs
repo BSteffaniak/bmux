@@ -267,7 +267,10 @@ fn prefix_only_delta_advances_revision_without_dirty_rows() {
         assert_eq!(capture(&hydrated), capture(&source));
     }
     let delta = source.process_delta(b"mR").unwrap();
-    assert!(!delta.row_updates.is_empty());
+    assert_ne!(
+        delta.row_updates,
+        [] as [crate::delta::RowUpdateSnapshot; 0]
+    );
     assert!(delta.content_revision > before.content_revision);
     replica.apply_delta(&delta, GridLimits::default()).unwrap();
     assert_eq!(capture(&replica), capture(&source));
@@ -452,7 +455,7 @@ fn bounded_long_prefix_case(introducer: &[u8], fill: u8, suffix: &[u8]) {
     assert_protocol(&source, &tracker);
     assert_protocol(&source, &restored);
     assert!(source.grid().protocol_state().bracketed_paste);
-    assert!(capture(&source).pending_bytes.is_empty());
+    assert_eq!(capture(&source).pending_bytes, [] as [u8; 0]);
     assert_eq!(
         crate::row_text(&source.grid().viewport_rows()[0], usize::from(WIDTH))
             .trim_end_matches(' '),

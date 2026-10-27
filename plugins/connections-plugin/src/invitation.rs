@@ -41,7 +41,9 @@ impl InvitationLink {
             }
             let bytes: Option<Vec<u8>> = encoded
                 .as_bytes()
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|pair| {
                     let text = std::str::from_utf8(pair).ok()?;
                     u8::from_str_radix(text, 16).ok()
@@ -177,7 +179,9 @@ fn phrase(transcript: &[u8]) -> String {
     let hash = digest(transcript);
     // 64 authenticated transcript bits, grouped for comparison; not a password.
     hash[..8]
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| format!("{:02x}{:02x}", pair[0], pair[1]))
         .collect::<Vec<_>>()
         .join("-")

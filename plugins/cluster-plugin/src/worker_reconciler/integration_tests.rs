@@ -394,7 +394,10 @@ async fn leader_failover_recovers_committed_launch_without_duplicate_execution()
     .unwrap();
     assert_eq!(*launches.lock().unwrap(), 1);
     let view = replacement_node.read_linearizable_view().await.unwrap();
-    assert!(view.pending_workflows.is_empty());
+    assert_eq!(
+        view.pending_workflows,
+        [] as [bmux_cluster_plugin_api::cluster_types::PendingWorkflow; 0]
+    );
     assert_eq!(view.panes[0].availability, PaneAvailability::Ready);
     assert_eq!(view.panes[0].execution, Some(assignment));
     for node in nodes {

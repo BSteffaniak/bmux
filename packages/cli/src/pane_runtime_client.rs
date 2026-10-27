@@ -46,35 +46,38 @@ mod pointer_grid_negotiation_tests {
 
     struct Probe(u8);
     impl bmux_plugin_sdk::TypedDispatchClient for Probe {
-        async fn invoke_service_raw(
+        fn invoke_service_raw(
             &mut self,
             capability: &str,
             _kind: bmux_ipc::InvokeServiceKind,
             interface: &str,
             operation: &str,
             _payload: Vec<u8>,
-        ) -> bmux_plugin_sdk::TypedDispatchClientResult<Vec<u8>> {
-            assert_eq!(capability, "bmux.pane_runtime.pointer_grid.v1");
-            assert_eq!(interface, "pane-runtime-pointer-grid-v1");
-            assert_eq!(operation, "capabilities");
-            match self.0 {
-                0 | 1 => Ok(bmux_plugin_sdk::encode_service_message(
-                    &PointerGrid::GridCapabilities {
-                        format_versions: if self.0 == 1 { vec![1] } else { vec![2] },
-                    },
-                )
-                .unwrap()),
-                2 => Err(bmux_plugin_sdk::TypedDispatchClientError::server(
-                    interface,
-                    operation,
-                    "no provider for service capability='bmux.pane_runtime.pointer_grid.v1' kind='Command' interface='pane-runtime-pointer-grid-v1' operation='capabilities'",
-                )),
-                _ => Err(bmux_plugin_sdk::TypedDispatchClientError::transport(
-                    interface,
-                    operation,
-                    "connection reset",
-                )),
-            }
+        ) -> impl std::future::Future<Output = bmux_plugin_sdk::TypedDispatchClientResult<Vec<u8>>>
+        {
+            futures_util::future::lazy(move |_| {
+                assert_eq!(capability, "bmux.pane_runtime.pointer_grid.v1");
+                assert_eq!(interface, "pane-runtime-pointer-grid-v1");
+                assert_eq!(operation, "capabilities");
+                match self.0 {
+                    0 | 1 => Ok(bmux_plugin_sdk::encode_service_message(
+                        &PointerGrid::GridCapabilities {
+                            format_versions: if self.0 == 1 { vec![1] } else { vec![2] },
+                        },
+                    )
+                    .unwrap()),
+                    2 => Err(bmux_plugin_sdk::TypedDispatchClientError::server(
+                        interface,
+                        operation,
+                        "no provider for service capability='bmux.pane_runtime.pointer_grid.v1' kind='Command' interface='pane-runtime-pointer-grid-v1' operation='capabilities'",
+                    )),
+                    _ => Err(bmux_plugin_sdk::TypedDispatchClientError::transport(
+                        interface,
+                        operation,
+                        "connection reset",
+                    )),
+                }
+            })
         }
     }
 
@@ -377,19 +380,20 @@ mod history_tests {
 
     struct TailClient(usize);
     impl bmux_plugin_sdk::TypedDispatchClient for TailClient {
-        async fn invoke_service_raw(
+        fn invoke_service_raw(
             &mut self,
             _capability: &str,
             _kind: bmux_ipc::InvokeServiceKind,
             _interface: &str,
             operation: &str,
             _payload: Vec<u8>,
-        ) -> bmux_plugin_sdk::TypedDispatchClientResult<Vec<u8>> {
-            use super::AttachState::{HistoryEnd, HistoryFetchError, HistorySliceV1};
-            if operation == "attach-history-slice-v1" {
-                return Ok(
-                    bmux_plugin_sdk::encode_service_message(&Ok::<_, HistoryFetchError>(
-                        HistorySliceV1 {
+        ) -> impl std::future::Future<Output = bmux_plugin_sdk::TypedDispatchClientResult<Vec<u8>>>
+        {
+            futures_util::future::lazy(move |_| {
+                use super::AttachState::{HistoryEnd, HistoryFetchError, HistorySliceV1};
+                if operation == "attach-history-slice-v1" {
+                    return Ok(bmux_plugin_sdk::encode_service_message(
+                        &Ok::<_, HistoryFetchError>(HistorySliceV1 {
                             encoded: serde_json::to_vec(&[(
                                 "P",
                                 1_u8,
@@ -398,35 +402,35 @@ mod history_tests {
                             .unwrap(),
                             next_cell_offset: 1,
                             end_kind: HistoryEnd::Open,
+                        }),
+                    )
+                    .unwrap());
+                }
+                assert_eq!(operation, "attach-main-row-slice-v1");
+                let (text, next, end) = match self.0 {
+                    0 => ("X", 1, HistoryEnd::HardBreak),
+                    1 => ("A", 1, HistoryEnd::Continue),
+                    2 => ("B", 2, HistoryEnd::Open),
+                    3 => ("C", 1, HistoryEnd::HardBreak),
+                    _ => panic!("unexpected fetch"),
+                };
+                self.0 += 1;
+                Ok(
+                    bmux_plugin_sdk::encode_service_message(&Ok::<_, HistoryFetchError>(
+                        HistorySliceV1 {
+                            encoded: serde_json::to_vec(&[(
+                                text,
+                                1_u8,
+                                bmux_terminal_grid::Style::default(),
+                            )])
+                            .unwrap(),
+                            next_cell_offset: next,
+                            end_kind: end,
                         },
                     ))
                     .unwrap(),
-                );
-            }
-            assert_eq!(operation, "attach-main-row-slice-v1");
-            let (text, next, end) = match self.0 {
-                0 => ("X", 1, HistoryEnd::HardBreak),
-                1 => ("A", 1, HistoryEnd::Continue),
-                2 => ("B", 2, HistoryEnd::Open),
-                3 => ("C", 1, HistoryEnd::HardBreak),
-                _ => panic!("unexpected fetch"),
-            };
-            self.0 += 1;
-            Ok(
-                bmux_plugin_sdk::encode_service_message(&Ok::<_, HistoryFetchError>(
-                    HistorySliceV1 {
-                        encoded: serde_json::to_vec(&[(
-                            text,
-                            1_u8,
-                            bmux_terminal_grid::Style::default(),
-                        )])
-                        .unwrap(),
-                        next_cell_offset: next,
-                        end_kind: end,
-                    },
-                ))
-                .unwrap(),
-            )
+                )
+            })
         }
     }
 
@@ -563,58 +567,62 @@ mod history_tests {
 
     struct EmptySuffixClient(usize);
     impl bmux_plugin_sdk::TypedDispatchClient for EmptySuffixClient {
-        async fn invoke_service_raw(
+        fn invoke_service_raw(
             &mut self,
             _capability: &str,
             _kind: bmux_ipc::InvokeServiceKind,
             _interface: &str,
             operation: &str,
             payload: Vec<u8>,
-        ) -> bmux_plugin_sdk::TypedDispatchClientResult<Vec<u8>> {
-            use super::AttachState::{HistoryEnd, HistoryFetchError, HistorySliceV1};
-            #[derive(serde::Deserialize)]
-            struct RowRequest {
-                session_id: uuid::Uuid,
-                pane_id: uuid::Uuid,
-                pin_id: u64,
-                capture_id: uuid::Uuid,
-                line_index: u32,
-                cell_offset: u32,
-                max_columns: u32,
-                max_text_bytes: u32,
-            }
-            assert_eq!(operation, "attach-main-row-slice-v1");
-            let request: RowRequest = bmux_plugin_sdk::decode_service_message(&payload).unwrap();
-            let _ = (
-                request.session_id,
-                request.pane_id,
-                request.pin_id,
-                request.capture_id,
-                request.cell_offset,
-                request.max_columns,
-                request.max_text_bytes,
-            );
-            let empty = request.line_index == 1;
-            self.0 += 1;
-            let cells = if empty {
-                vec![]
-            } else {
-                vec![("A", 1_u8, bmux_terminal_grid::Style::default())]
-            };
-            Ok(
-                bmux_plugin_sdk::encode_service_message(&Ok::<_, HistoryFetchError>(
-                    HistorySliceV1 {
-                        encoded: serde_json::to_vec(&cells).unwrap(),
-                        next_cell_offset: u64::from(!empty),
-                        end_kind: if empty {
-                            HistoryEnd::HardBreak
-                        } else {
-                            HistoryEnd::Open
+        ) -> impl std::future::Future<Output = bmux_plugin_sdk::TypedDispatchClientResult<Vec<u8>>>
+        {
+            futures_util::future::lazy(move |_| {
+                use super::AttachState::{HistoryEnd, HistoryFetchError, HistorySliceV1};
+                #[derive(serde::Deserialize)]
+                struct RowRequest {
+                    session_id: uuid::Uuid,
+                    pane_id: uuid::Uuid,
+                    pin_id: u64,
+                    capture_id: uuid::Uuid,
+                    line_index: u32,
+                    cell_offset: u32,
+                    max_columns: u32,
+                    max_text_bytes: u32,
+                }
+                assert_eq!(operation, "attach-main-row-slice-v1");
+                let request: RowRequest =
+                    bmux_plugin_sdk::decode_service_message(&payload).unwrap();
+                let _ = (
+                    request.session_id,
+                    request.pane_id,
+                    request.pin_id,
+                    request.capture_id,
+                    request.cell_offset,
+                    request.max_columns,
+                    request.max_text_bytes,
+                );
+                let empty = request.line_index == 1;
+                self.0 += 1;
+                let cells = if empty {
+                    vec![]
+                } else {
+                    vec![("A", 1_u8, bmux_terminal_grid::Style::default())]
+                };
+                Ok(
+                    bmux_plugin_sdk::encode_service_message(&Ok::<_, HistoryFetchError>(
+                        HistorySliceV1 {
+                            encoded: serde_json::to_vec(&cells).unwrap(),
+                            next_cell_offset: u64::from(!empty),
+                            end_kind: if empty {
+                                HistoryEnd::HardBreak
+                            } else {
+                                HistoryEnd::Open
+                            },
                         },
-                    },
-                ))
-                .unwrap(),
-            )
+                    ))
+                    .unwrap(),
+                )
+            })
         }
     }
 
@@ -1264,11 +1272,11 @@ mod history_tests {
         let mut cache = super::CapturedHistoryCache::default();
         cache.retain_images(80, &anchors, &[]);
         for start in 0..30 {
-            assert!(
+            assert_eq!(
                 cache
                     .cached_images(80, &anchors[start..start + 20])
-                    .unwrap()
-                    .is_empty()
+                    .unwrap(),
+                [] as [bmux_attach_image_protocol::AttachPaneImage; 0]
             );
         }
         assert!(cache.cached_images(40, &anchors[..20]).is_none());
@@ -1697,7 +1705,10 @@ mod history_tests {
         assert_eq!(projected.len(), 1);
         assert_eq!(projected[0].position_row, 1);
         assert_eq!(projected[0].raw_data, image.raw_data);
-        assert!(cache.cached_images(80, &anchors[..1]).unwrap().is_empty());
+        assert_eq!(
+            cache.cached_images(80, &anchors[..1]).unwrap(),
+            [] as [bmux_attach_image_protocol::AttachPaneImage; 0]
+        );
         assert_eq!(
             cache.cached_images(80, &anchors).unwrap()[0].position_row,
             2
@@ -1885,32 +1896,35 @@ mod history_tests {
 
     struct HistoryClient;
     impl bmux_plugin_sdk::TypedDispatchClient for HistoryClient {
-        async fn invoke_service_raw(
+        fn invoke_service_raw(
             &mut self,
             _capability: &str,
             _kind: bmux_ipc::InvokeServiceKind,
             _interface: &str,
             operation: &str,
             _payload: Vec<u8>,
-        ) -> bmux_plugin_sdk::TypedDispatchClientResult<Vec<u8>> {
-            assert!(matches!(
-                operation,
-                "attach-history-slice-v1" | "attach-main-row-slice-v1"
-            ));
-            let reply = super::AttachState::HistorySliceV1 {
-                encoded: serde_json::to_vec(&vec![
-                    ("A", 1_u8, bmux_terminal_grid::Style::default()),
-                    ("B", 1_u8, bmux_terminal_grid::Style::default()),
-                ])
-                .unwrap(),
-                next_cell_offset: 2,
-                end_kind: super::AttachState::HistoryEnd::HardBreak,
-            };
-            Ok(bmux_plugin_sdk::encode_service_message(&Ok::<
-                _,
-                super::AttachState::HistoryFetchError,
-            >(reply))
-            .unwrap())
+        ) -> impl std::future::Future<Output = bmux_plugin_sdk::TypedDispatchClientResult<Vec<u8>>>
+        {
+            futures_util::future::lazy(move |_| {
+                assert!(matches!(
+                    operation,
+                    "attach-history-slice-v1" | "attach-main-row-slice-v1"
+                ));
+                let reply = super::AttachState::HistorySliceV1 {
+                    encoded: serde_json::to_vec(&vec![
+                        ("A", 1_u8, bmux_terminal_grid::Style::default()),
+                        ("B", 1_u8, bmux_terminal_grid::Style::default()),
+                    ])
+                    .unwrap(),
+                    next_cell_offset: 2,
+                    end_kind: super::AttachState::HistoryEnd::HardBreak,
+                };
+                Ok(bmux_plugin_sdk::encode_service_message(&Ok::<
+                    _,
+                    super::AttachState::HistoryFetchError,
+                >(reply))
+                .unwrap())
+            })
         }
     }
 

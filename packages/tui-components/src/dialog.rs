@@ -342,7 +342,7 @@ mod tests {
             let mut frame = Frame::new(&mut buffer);
             content.paint(&layout, &mut PaintCx::new(&mut frame));
             if height == 0 {
-                assert!(frame.hits().regions().is_empty());
+                assert_eq!(frame.hits().regions(), []);
                 assert_eq!(
                     frame.buffer().row_symbols(0).as_deref(),
                     Some("            ")

@@ -312,10 +312,7 @@ const fn command_enters_raw_mode(command: Option<&bmux_cli_schema::Command>) -> 
 /// - stderr is a TTY.
 fn maybe_print_slot_startup_banner(command: Option<&bmux_cli_schema::Command>) {
     use std::io::IsTerminal as _;
-    if std::env::var("BMUX_SLOT_BANNER")
-        .ok()
-        .is_some_and(|v| v.trim().eq_ignore_ascii_case("off"))
-    {
+    if std::env::var("BMUX_SLOT_BANNER").is_ok_and(|v| v.trim().eq_ignore_ascii_case("off")) {
         return;
     }
     if !command_enters_raw_mode(command) {

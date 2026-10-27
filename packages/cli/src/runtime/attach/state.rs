@@ -1047,7 +1047,7 @@ mod tests {
                 pin: None,
             },
         );
-        assert!(state.presented_images(pane).is_empty());
+        assert_eq!(state.presented_images(pane), []);
         assert_eq!(state.pane_images[&pane].len(), 1);
         assert!(state.exit_scrollback_for(pane));
         assert_eq!(state.presented_images(pane).len(), 1);
@@ -1091,7 +1091,7 @@ mod tests {
             .images
             .clear();
         assert!(!state.has_presented_images());
-        assert!(state.presented_images(pane).is_empty());
+        assert_eq!(state.presented_images(pane), []);
     }
 
     fn test_floating_drag() -> AttachMouseFloatingDrag {

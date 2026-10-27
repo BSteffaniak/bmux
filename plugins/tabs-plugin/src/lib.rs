@@ -5588,10 +5588,9 @@ mod tests {
             resolve_tab_order_ids(&host, &runtime, &contexts[..1]).unwrap(),
             vec![contexts[0].id]
         );
-        assert!(
-            resolve_tab_order_ids(&host, &runtime, &[])
-                .unwrap()
-                .is_empty()
+        assert_eq!(
+            resolve_tab_order_ids(&host, &runtime, &[]).unwrap(),
+            [] as [uuid::Uuid; 0]
         );
         assert_eq!(*host.storage.lock().unwrap(), storage_before);
         assert_eq!(
@@ -5659,10 +5658,9 @@ mod tests {
         let orders = BTreeMap::from([(workspace, vec![absent]), (Uuid::nil(), vec![])]);
         arrangements::write(&host, &orders).unwrap();
         set_stored_tab_order_ids(&host, &[Uuid::from_u128(1)]).unwrap();
-        assert!(
-            get_stored_tab_order_ids_for_workspace(&host, Uuid::nil())
-                .unwrap()
-                .is_empty()
+        assert_eq!(
+            get_stored_tab_order_ids_for_workspace(&host, Uuid::nil()).unwrap(),
+            [] as [uuid::Uuid; 0]
         );
         assert_eq!(arrangements::read(&host).unwrap(), Some(orders));
         let replacement = BTreeMap::from([(workspace, vec![Uuid::from_u128(1000), absent])]);

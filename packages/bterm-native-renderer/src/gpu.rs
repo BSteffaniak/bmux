@@ -17,6 +17,8 @@ struct Vertex {
 
 pub(crate) struct Gpu {
     surface: wgpu::Surface<'static>,
+    instance: wgpu::Instance,
+    target: SurfaceTarget,
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
@@ -31,9 +33,9 @@ pub(crate) struct Gpu {
 
 impl Gpu {
     pub async fn new(target: SurfaceTarget, size: PhysicalSize) -> Result<Self, RenderError> {
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let surface = instance
-            .create_surface(target)
+            .create_surface(target.clone())
             .map_err(|e| RenderError::Device(e.to_string()))?;
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
@@ -139,20 +141,22 @@ impl Gpu {
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: None,
-            bind_group_layouts: &[&layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&layout)],
+            immediate_size: 0,
         });
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("terminal cells and images"), layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState { module: &shader, entry_point: Some("vs"), compilation_options: Default::default(), buffers: &[
-                wgpu::VertexBufferLayout { array_stride: std::mem::size_of::<Vertex>() as u64, step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Float32x4] }
+                Some(wgpu::VertexBufferLayout { array_stride: std::mem::size_of::<Vertex>() as u64, step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Float32x4] })
             ]},
             fragment: Some(wgpu::FragmentState { module: &shader, entry_point: Some("fs"), compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format: config.format, blend: Some(wgpu::BlendState::ALPHA_BLENDING), write_mask: wgpu::ColorWrites::ALL })] }),
-            primitive: Default::default(), depth_stencil: None, multisample: Default::default(), multiview: None, cache: None,
+            primitive: Default::default(), depth_stencil: None, multisample: Default::default(), multiview_mask: None, cache: None,
         });
         Ok(Self {
             surface,
+            instance,
+            target,
             device,
             queue,
             config,
@@ -300,16 +304,30 @@ impl Gpu {
         if self.size.is_empty() {
             return Err(RenderError::Suspended);
         }
-        let frame = self.surface.get_current_texture().map_err(|error| {
-            if matches!(
-                error,
-                wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated
-            ) {
+        let (frame, suboptimal) = match self.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(frame) => (frame, false),
+            wgpu::CurrentSurfaceTexture::Suboptimal(frame) => (frame, true),
+            wgpu::CurrentSurfaceTexture::Outdated => {
                 self.surface.configure(&self.device, &self.config);
+                return Err(RenderError::Surface(
+                    "surface outdated; reconfigured".into(),
+                ));
             }
-            RenderError::Surface(error.to_string())
-        })?;
-        self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+            wgpu::CurrentSurfaceTexture::Lost => {
+                self.surface = self
+                    .instance
+                    .create_surface(self.target.clone())
+                    .map_err(|error| RenderError::Surface(error.to_string()))?;
+                self.surface.configure(&self.device, &self.config);
+                return Err(RenderError::Surface("surface lost; recreated".into()));
+            }
+            status => {
+                return Err(RenderError::Surface(format!(
+                    "surface acquisition: {status:?}"
+                )));
+            }
+        };
+        let validation_scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
         let buffer = self
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -334,6 +352,7 @@ impl Gpu {
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
                 occlusion_query_set: None,
+                multiview_mask: None,
             });
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &self.bind, &[]);
@@ -341,7 +360,7 @@ impl Gpu {
             pass.draw(0..self.vertices.len() as u32, 0..1);
         }
         let submission = self.queue.submit([encoder.finish()]);
-        let validation = self.device.pop_error_scope();
+        let validation = validation_scope.pop();
         self.device
             .poll(wgpu::PollType::Wait {
                 submission_index: Some(submission),
@@ -352,7 +371,10 @@ impl Gpu {
             return Err(RenderError::Device(error.to_string()));
         }
         self.check_failure()?;
-        frame.present();
+        self.queue.present(frame);
+        if suboptimal {
+            self.surface.configure(&self.device, &self.config);
+        }
         Ok(())
     }
 }

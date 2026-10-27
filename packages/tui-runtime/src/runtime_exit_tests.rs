@@ -55,13 +55,15 @@ impl Presenter<App> for Output {
         self.log.lock().unwrap().push("cancel");
     }
 
-    async fn restore(&mut self) -> Result<(), Self::Error> {
-        self.log.lock().unwrap().push("restore");
-        if self.fail_restore {
-            Err("restore")
-        } else {
-            Ok(())
-        }
+    fn restore(&mut self) -> impl std::future::Future<Output = Result<(), Self::Error>> {
+        futures_util::future::lazy(move |_| {
+            self.log.lock().unwrap().push("restore");
+            if self.fail_restore {
+                Err("restore")
+            } else {
+                Ok(())
+            }
+        })
     }
 }
 
@@ -107,7 +109,7 @@ async fn finalization_preserves_original_and_cleanup_errors_and_ownership() {
                 assert!(program_error);
                 assert_eq!(error, "program");
                 assert_eq!(cleanup_error, restore_error.then_some("restore"));
-                output
+                *output
             }
             Err(RuntimeError::Presenter {
                 error,
@@ -127,7 +129,7 @@ async fn finalization_preserves_original_and_cleanup_errors_and_ownership() {
                     cleanup_error,
                     (presentation_error && restore_error).then_some("restore")
                 );
-                output
+                *output
             }
         };
         assert_eq!(

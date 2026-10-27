@@ -1189,59 +1189,77 @@ mod tests {
     }
 
     impl bmux_plugin_sdk::TypedDispatchClient for HumanClient {
-        async fn invoke_service_raw(
+        fn invoke_service_raw(
             &mut self,
             _capability: &str,
             _kind: bmux_ipc::InvokeServiceKind,
             _interface: &str,
             operation: &str,
             payload: Vec<u8>,
-        ) -> bmux_plugin_sdk::TypedDispatchClientResult<Vec<u8>> {
-            use bmux_pane_runtime_plugin_api::pane_runtime_human_input_v1 as human;
-            use bmux_recording_plugin_api::recording_process_human_input_v1::client;
-            self.calls.push(operation.into());
-            let bytes = match operation {
-                "capabilities" => {
-                    bmux_plugin_sdk::encode_service_message(&human::HumanInputCapabilities {
-                        protocol_version: 1,
-                        max_payload_bytes: 16_384,
-                        max_active_streams: 32,
-                        dedup_window: 32,
-                    })
-                }
-                "open" => bmux_plugin_sdk::encode_service_message(
-                    &Ok::<_, human::HumanInputError>(self.stream.clone()),
-                ),
-                "push" => {
-                    let request =
-                        bmux_plugin_sdk::decode_service_message::<client::PushRequest>(&payload)
+        ) -> impl std::future::Future<Output = bmux_plugin_sdk::TypedDispatchClientResult<Vec<u8>>>
+        {
+            let mut payload = Some(payload);
+            std::future::poll_fn(move |_| {
+                let payload = payload.take().expect("transport polled after completion");
+                std::task::Poll::Ready({
+                    use bmux_pane_runtime_plugin_api::pane_runtime_human_input_v1 as human;
+                    use bmux_recording_plugin_api::recording_process_human_input_v1::client;
+                    self.calls.push(operation.into());
+                    let bytes = match operation {
+                        "capabilities" => bmux_plugin_sdk::encode_service_message(
+                            &human::HumanInputCapabilities {
+                                protocol_version: 1,
+                                max_payload_bytes: 16_384,
+                                max_active_streams: 32,
+                                dedup_window: 32,
+                            },
+                        ),
+                        "open" => {
+                            bmux_plugin_sdk::encode_service_message(
+                                &Ok::<_, human::HumanInputError>(self.stream.clone()),
+                            )
+                        }
+                        "push" => {
+                            let request = bmux_plugin_sdk::decode_service_message::<
+                                client::PushRequest,
+                            >(&payload)
                             .unwrap();
-                    assert_eq!(request.stream, self.stream);
-                    assert_eq!(request.sequence, 1);
-                    if self.fail_push {
-                        bmux_plugin_sdk::encode_service_message(&Err::<human::HumanInputAck, _>(
-                            human::HumanInputError::Uncertain {
-                                reason: "PTY acknowledgment lost".into(),
-                            },
-                        ))
-                    } else {
-                        bmux_plugin_sdk::encode_service_message(&Ok::<_, human::HumanInputError>(
-                            human::HumanInputAck {
-                                stream: self.stream.clone(),
-                                sequence: if self.bad_ack { 2 } else { request.sequence },
-                                written_bytes: u64::try_from(request.data.len()).unwrap(),
-                            },
-                        ))
-                    }
-                }
-                "close" => {
-                    bmux_plugin_sdk::encode_service_message(&Ok::<_, human::HumanInputError>(()))
-                }
-                unexpected => panic!(
-                    "unexpected operation: {unexpected}; no durable fallback or retry allowed"
-                ),
-            };
-            Ok(bytes.unwrap())
+                            assert_eq!(request.stream, self.stream);
+                            assert_eq!(request.sequence, 1);
+                            if self.fail_push {
+                                bmux_plugin_sdk::encode_service_message(&Err::<
+                                    human::HumanInputAck,
+                                    _,
+                                >(
+                                    human::HumanInputError::Uncertain {
+                                        reason: "PTY acknowledgment lost".into(),
+                                    },
+                                ))
+                            } else {
+                                bmux_plugin_sdk::encode_service_message(&Ok::<
+                                    _,
+                                    human::HumanInputError,
+                                >(
+                                    human::HumanInputAck {
+                                        stream: self.stream.clone(),
+                                        sequence: if self.bad_ack { 2 } else { request.sequence },
+                                        written_bytes: u64::try_from(request.data.len()).unwrap(),
+                                    },
+                                ))
+                            }
+                        }
+                        "close" => {
+                            bmux_plugin_sdk::encode_service_message(
+                                &Ok::<_, human::HumanInputError>(()),
+                            )
+                        }
+                        unexpected => panic!(
+                            "unexpected operation: {unexpected}; no durable fallback or retry allowed"
+                        ),
+                    };
+                    Ok(bytes.unwrap())
+                })
+            })
         }
     }
 

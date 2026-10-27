@@ -373,8 +373,10 @@ mod tests {
         let words_per_row = u16::from_le_bytes(payload[8..10].try_into().expect("words_per_row"));
         let grid_revision = u64::from_le_bytes(payload[12..20].try_into().expect("revision"));
         let words = payload[PRESENCE_WORDS_OFFSET..]
-            .chunks_exact(4)
-            .map(|chunk| u32::from_le_bytes(chunk.try_into().expect("word")))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|chunk| u32::from_le_bytes(*chunk))
             .collect();
         DecodedPresence {
             width,

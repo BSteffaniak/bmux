@@ -85,6 +85,6 @@ mod tests {
         assert_eq!(snapshot.mode_label, "NORMAL");
         assert_eq!(snapshot.role_label, "write");
         assert!(snapshot.follow_label.is_none());
-        assert!(snapshot.hint.is_empty());
+        assert_eq!(snapshot.hint, "");
     }
 }

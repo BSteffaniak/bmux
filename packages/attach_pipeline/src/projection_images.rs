@@ -277,7 +277,7 @@ mod tests {
                 .iter()
                 .all(|p| p.destination == destination && p.payload == payload)
         );
-        assert!(
+        assert_eq!(
             visible_image_strips(
                 "owned",
                 &payload,
@@ -285,13 +285,12 @@ mod tests {
                 Rect::new(30, 30, 2, 2),
                 |_, _| true
             )
-            .unwrap()
-            .is_empty()
+            .unwrap(),
+            [] as [bmux_tui::image::ImagePlacement; 0]
         );
-        assert!(
-            visible_image_strips("owned", &payload, destination, viewport, |_, _| false)
-                .unwrap()
-                .is_empty()
+        assert_eq!(
+            visible_image_strips("owned", &payload, destination, viewport, |_, _| false).unwrap(),
+            [] as [bmux_tui::image::ImagePlacement; 0]
         );
     }
 

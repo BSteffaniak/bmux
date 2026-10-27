@@ -11,7 +11,7 @@ fn launcher_exit_helper() {
     let root = Root(PathBuf::from(root));
     let spec = shell_spec(
         &root,
-        ": > inherited; while [ ! -f release ]; do /bin/sleep 0.01; done; : > done",
+        ": > inherited; while [ ! -f release ]; do sleep 0.01; done; : > done",
     );
     let ownership = OpenOptions::new()
         .create_new(true)
@@ -104,6 +104,11 @@ async fn inherited_claim_is_a_regular_file_and_child_is_detached() {
         Err(std::fs::TryLockError::WouldBlock)
     ));
     std::fs::write(root.0.join("release"), b"").unwrap();
-    assert!(child.wait().unwrap().success());
+    let status = child.wait().unwrap();
+    assert!(
+        status.success(),
+        "detached fixture failed: {status}; diagnostics: {}",
+        std::fs::read_to_string(&spec.diagnostic_file).unwrap()
+    );
     contender.try_lock().unwrap();
 }

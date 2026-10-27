@@ -227,7 +227,9 @@ impl PairingClient {
         let phrase = {
             let hash = crate::pairing::digest(&transcript);
             hash[..8]
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|pair| format!("{:02x}{:02x}", pair[0], pair[1]))
                 .collect::<Vec<_>>()
                 .join("-")
@@ -1533,11 +1535,11 @@ mod tests {
         .await
         .unwrap();
         assert!(rejected.is_err());
-        assert!(
+        assert_eq!(
             pairing
                 .list_devices(&LocalOwner::from_trusted_local_owner())
-                .unwrap()
-                .is_empty()
+                .unwrap(),
+            [] as [bmux_connections_plugin_api::pairing_types::Device; 0]
         );
         // The valid peer can still redeem that same invitation after rejection.
         let valid = pairing

@@ -882,7 +882,7 @@ fn emit_client_forwarder(
         .collect::<Vec<_>>()
         .join(", ");
     out.push_str("\n        /// Forward to the provider's trait method.\n");
-    out.push_str("        #[must_use]\n");
+    out.push_str("        #[must_use = \"futures do nothing unless awaited or polled\"]\n");
     if op.params.len() >= 7 {
         out.push_str("        #[allow(clippy::too_many_arguments)]\n");
     }
@@ -1108,13 +1108,9 @@ mod tests {
         assert!(generated.contains("debug.field(\"credential\", &\"[REDACTED]\")"));
         assert!(generated.contains("debug.field(\"public\", &self.public)"));
         assert!(!generated.contains("&self.credential"));
-        assert!(
-            !crate::canonical::interface_contract(
-                &schema,
-                &schema.interfaces[0],
-                &ImportMap::new()
-            )
-            .is_empty()
+        assert_ne!(
+            crate::canonical::interface_contract(&schema, &schema.interfaces[0], &ImportMap::new()),
+            [] as [u8; 0]
         );
         assert_eq!(
             crate::canonical::interface_contract(&schema, &schema.interfaces[0], &ImportMap::new()),
@@ -1150,7 +1146,9 @@ mod tests {
         assert!(rust.contains("/// # Errors\n        ///\n        /// Returns encoding, transport, compatibility, or response-decoding failures."));
         assert!(rust.contains("#[must_use]\n        pub fn new("));
         assert!(rust.contains("#[must_use]\n        pub fn as_service("));
-        assert!(rust.contains("#[must_use]\n        pub fn get<'a>("));
+        assert!(rust.contains(
+            "#[must_use = \"futures do nothing unless awaited or polled\"]\n        pub fn get<'a>("
+        ));
     }
 
     #[test]

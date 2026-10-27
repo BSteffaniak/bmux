@@ -245,7 +245,10 @@ fn selection_bytes_survive_unicode_reflow_and_export_complete_cells() {
         projection.export_text(99, 0, 0..3, budget()),
         Err(HistorySliceError::StaleRevision)
     );
-    assert!(rows[3].cells.is_empty());
+    assert_eq!(
+        rows[3].cells,
+        [] as [crate::model::content::SelectionCell; 0]
+    );
     assert_eq!(rows[3].bytes, 0..0);
     projection.prepare(20, budget()).unwrap();
     let wide = projection.selection_window(0..1, budget()).unwrap();
@@ -345,7 +348,10 @@ fn truncation_empty_windows_and_wide_anchors_are_explicit() {
     let window = projection.tail(1, budget().bytes).unwrap();
     assert!(window.history_truncated);
     assert!(window.has_more_above);
-    assert!(projection.tail(0, 0).unwrap().rows.is_empty());
+    assert_eq!(
+        projection.tail(0, 0).unwrap().rows,
+        [] as [crate::model::PhysicalRow; 0]
+    );
     let (_, mut wide) = capture("界z", 8, 2);
     wide.prepare(8, budget()).unwrap();
     assert_eq!(
@@ -471,7 +477,10 @@ fn bounded_tail_matches_existing_full_content_without_materializing_history() {
         expected[expected.len() - 2..]
     );
     assert!(crate::reflow::projection_stats().physical_rows_projected <= 4);
-    assert!(stream.grid().main_content_tail_rows(0).is_empty());
+    assert_eq!(
+        stream.grid().main_content_tail_rows(0),
+        [] as [crate::model::PhysicalRow; 0]
+    );
 }
 
 #[test]

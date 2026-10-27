@@ -561,7 +561,6 @@ impl PresentationState {
         &self.focus
     }
     /// Committed caller-owned modal identities, in outer-to-inner order.
-    #[must_use]
     pub fn modal_scopes(&self) -> impl ExactSizeIterator<Item = &FocusScopeId> {
         self.modal_focus.iter().map(|modal| &modal.scope)
     }
@@ -1064,7 +1063,7 @@ mod tests {
             state.present_prepared(Some(prepared), |_, _| Err::<(), _>("failed")),
             Err("failed")
         );
-        assert!(state.metadata_availability().is_empty());
+        assert_eq!(state.metadata_availability(), []);
         state
             .present(Damage::Full, render, |_, _| Ok::<_, ()>(()))
             .unwrap();
@@ -1075,7 +1074,7 @@ mod tests {
                 cx.occlude(LocalRect::new(2, 1, 3, 2));
             })
             .unwrap();
-        assert!(hidden.metadata_availability().is_empty());
+        assert_eq!(hidden.metadata_availability(), []);
         assert_eq!(
             state.present_prepared(Some(hidden), |_, _| Err::<(), _>("failed hide")),
             Err("failed hide")
@@ -1091,7 +1090,7 @@ mod tests {
                 |_, _| Ok::<_, ()>(()),
             )
             .unwrap();
-        assert!(state.metadata_availability().is_empty());
+        assert_eq!(state.metadata_availability(), []);
     }
 
     #[test]
@@ -1312,7 +1311,7 @@ mod tests {
             .unwrap();
         assert_eq!(staged.buffer().cells()[0].symbol, "A");
         assert_eq!(staged.buffer().cells()[1].symbol, "B");
-        assert!(staged.hits().regions().is_empty());
+        assert_eq!(staged.hits().regions(), []);
         assert_eq!(
             state.present_prepared(Some(staged), |_, _| Err::<(), _>("host rejected")),
             Err("host rejected")
@@ -1364,7 +1363,7 @@ mod tests {
         let prepared = state
             .prepare(Damage::Full, |cx| paint(cx, "staged", "A"))
             .unwrap();
-        assert!(state.hits().regions().is_empty());
+        assert_eq!(state.hits().regions(), []);
         assert!(state.retained_buffer().is_none());
         drop(state);
         assert_eq!(prepared.buffer().cells()[0].symbol, "A");

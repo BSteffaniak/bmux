@@ -874,7 +874,7 @@ mod tests {
         ));
         assert!(sim.prompt_overlay_dirty());
         assert!(!sim.send_paste("must not reach pane"));
-        assert!(sim.forwarded_mouse_bytes().is_empty());
+        assert_eq!(sim.forwarded_mouse_bytes(), [] as [Vec<u8>; 0]);
     }
 
     #[test]
@@ -973,7 +973,7 @@ mod tests {
 
         sim.send_mouse(left_mouse(TerminalMousePhase::Down, 10, 5));
 
-        assert!(sim.effects().is_empty());
+        assert_eq!(sim.effects(), []);
     }
 
     #[test]
@@ -1081,7 +1081,7 @@ mod tests {
                 }
             )
         }));
-        assert!(sim.forwarded_mouse_bytes().is_empty());
+        assert_eq!(sim.forwarded_mouse_bytes(), [] as [Vec<u8>; 0]);
         assert_eq!(sim.pointer_owner(), None);
     }
 
@@ -1113,7 +1113,7 @@ mod tests {
         assert!(sim.effects().iter().any(|effect| {
             matches!(effect, AttachUiEffect::MoveFloating { pane_id, .. } if *pane_id == Uuid::from_u128(32))
         }));
-        assert!(sim.forwarded_mouse_bytes().is_empty());
+        assert_eq!(sim.forwarded_mouse_bytes(), [] as [Vec<u8>; 0]);
         assert_eq!(sim.pointer_owner(), None);
     }
 

@@ -91,7 +91,7 @@ mod tests {
             let (authority, bytes) = rx.recv().unwrap();
             let mut output = Vec::new();
             assert!(authority.write(&mut output, &bytes).is_err());
-            assert!(output.is_empty());
+            assert_eq!(output, [] as [u8; 0]);
         }
     }
 

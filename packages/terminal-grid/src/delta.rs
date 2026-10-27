@@ -459,7 +459,10 @@ mod tests {
         let after = grid.snapshot(0, 2_003);
         let delta = GridDeltaBatch::between(&replica, &after).unwrap();
         assert!(!delta.reset_rows);
-        assert!(delta.row_updates.is_empty());
+        assert_eq!(
+            delta.row_updates,
+            [] as [crate::delta::RowUpdateSnapshot; 0]
+        );
         assert!(delta.main_rows.is_none());
         assert_eq!(delta.content_revision, replica.content_revision);
         delta.apply_to_snapshot(&mut replica).unwrap();
@@ -691,7 +694,10 @@ mod tests {
         let after = grid.snapshot(0, 2);
         let delta = GridDeltaBatch::between(&before, &after).unwrap();
         assert!(!delta.reset_rows);
-        assert!(!delta.row_updates.is_empty());
+        assert_ne!(
+            delta.row_updates,
+            [] as [crate::delta::RowUpdateSnapshot; 0]
+        );
         let mut malformed = delta.clone();
         malformed.row_updates.push(RowUpdateSnapshot {
             row_index: u32::MAX,

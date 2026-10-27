@@ -3710,7 +3710,7 @@ mod tests {
         let mut grid = TerminalGrid::new(8, 2, GridLimits::default()).unwrap();
         grid.process(b"x\r\nabcdefghijklmnopqrst");
         assert_eq!(grid.main_history.len(), 1);
-        assert!(!grid.pending_history_cells.is_empty());
+        assert_ne!(grid.pending_history_cells, [] as [crate::model::Cell; 0]);
         assert_eq!(
             grid.captured_anchor_at_width(0, 0, 4, &mut 100_000)
                 .unwrap(),
@@ -4159,7 +4159,7 @@ mod tests {
     fn height_resize_shift_tracks_pending_rows_and_eviction() {
         let mut wrapped = TerminalGrid::new(5, 2, GridLimits::default()).unwrap();
         wrapped.process(b"abcdefghijklmnop");
-        assert!(!wrapped.pending_history_cells.is_empty());
+        assert_ne!(wrapped.pending_history_cells, [] as [crate::model::Cell; 0]);
         let before = wrapped.cursor().row;
         let shift = wrapped.resize_with_main_row_shift(5, 4).unwrap().unwrap();
         assert_eq!(shift, -2);

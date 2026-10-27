@@ -2660,7 +2660,7 @@ mod tests {
                 .expect(
                     "missing decoration must select an empty retained scene, not imperative output",
                 );
-            assert!(scene.items.is_empty());
+            assert_eq!(scene.items, [] as [bmux_plugin::RenderSceneItem; 0]);
         }
     }
 
@@ -2685,7 +2685,7 @@ mod tests {
                     &RenderExtensionContext::default(),
                 )
                 .expect("empty decoration must remain a supported retained representation");
-            assert!(scene.items.is_empty());
+            assert_eq!(scene.items, [] as [bmux_plugin::RenderSceneItem; 0]);
             assert!(scene.revision.is_some());
         }
         assert!(
@@ -3545,7 +3545,7 @@ mod tests {
                 &RenderExtensionContext::default(),
             )
             .expect("semantic borders should remain declarative");
-        assert!(no_graphics.is_empty());
+        assert_eq!(no_graphics, [] as [bmux_plugin::RenderOp; 0]);
 
         let kitty_capabilities = TerminalRenderCapabilities {
             kitty_graphics: true,

@@ -12237,7 +12237,7 @@ async fn handle_attach_mouse_scrollback_with_window(
     Ok(true)
 }
 
-fn wildcard_matches(pattern: &str, value: &str) -> bool {
+const fn wildcard_matches(pattern: &str, value: &str) -> bool {
     let pattern = pattern.as_bytes();
     let value = value.as_bytes();
     let (mut pattern_index, mut value_index) = (0_usize, 0_usize);
@@ -17197,15 +17197,16 @@ mod tests {
             fn requires_service_contracts(&self) -> bool {
                 self.0
             }
-            async fn invoke_service_raw(
+            fn invoke_service_raw(
                 &mut self,
                 _: &str,
                 _: bmux_ipc::InvokeServiceKind,
                 _: &str,
                 _: &str,
                 _: Vec<u8>,
-            ) -> bmux_plugin_sdk::TypedDispatchClientResult<Vec<u8>> {
-                unreachable!()
+            ) -> impl std::future::Future<Output = bmux_plugin_sdk::TypedDispatchClientResult<Vec<u8>>>
+            {
+                futures_util::future::lazy(move |_| unreachable!())
             }
         }
         for checked in [false, true] {
@@ -17461,7 +17462,10 @@ mod tests {
         for label in ["Switch", "Rename", "Close"] {
             assert!(rendered.contains(label), "missing menu label: {label}");
         }
-        assert!(!resources.surfaces.surfaces().is_empty());
+        assert_ne!(
+            resources.surfaces.surfaces(),
+            [] as [bmux_plugin::surface::PluginSurface; 0]
+        );
         let popup_snapshot = resources.surfaces.owner_snapshot("bmux.tab_bar").unwrap();
         for surface in &popup_snapshot.surfaces {
             for region in &surface.interactive_regions {
@@ -17668,7 +17672,10 @@ mod tests {
                 .contains("transport action rejected")
         );
         drop(installation);
-        assert!(resources.surfaces.surfaces().is_empty());
+        assert_eq!(
+            resources.surfaces.surfaces(),
+            [] as [bmux_plugin::surface::PluginSurface; 0]
+        );
         assert_eq!(survivor_resources.surfaces.surfaces(), before);
         dispatch_installed_menu(&mut client, &mut survivor, &survivor_resources).await;
         assert!(survivor.transient_status.is_none());
@@ -19152,7 +19159,7 @@ mod tests {
         .expect("extension render");
 
         assert!(wrote);
-        assert!(!output.is_empty());
+        assert_ne!(output, [] as [u8; 0]);
     }
 
     #[test]
@@ -19411,7 +19418,7 @@ mod tests {
 
         let mut disabled = Vec::new();
         queue_attach_input_modes(&mut disabled, false, false).expect("leave modes disabled");
-        assert!(disabled.is_empty());
+        assert_eq!(disabled, [] as [u8; 0]);
 
         let mut active_restored = Vec::new();
         queue_active_attach_input_mode_restore(&mut active_restored, false, true)
@@ -19421,7 +19428,7 @@ mod tests {
         let mut inactive_restored = Vec::new();
         queue_active_attach_input_mode_restore(&mut inactive_restored, false, false)
             .expect("skip inactive mode restoration");
-        assert!(inactive_restored.is_empty());
+        assert_eq!(inactive_restored, [] as [u8; 0]);
 
         let mut restored = Vec::new();
         queue_attach_input_mode_restore(&mut restored).expect("restore input modes");
@@ -20089,7 +20096,10 @@ mod tests {
                 revision: 7,
             },
         );
-        assert!(preferred.tabs.is_empty());
+        assert_eq!(
+            preferred.tabs,
+            [] as [bmux_tabs_plugin_api::tabs_list::TabListEntry; 0]
+        );
     }
 
     #[test]
@@ -20416,7 +20426,10 @@ mod tests {
             24,
         );
         assert_eq!(retained_plugin_surfaces(&first, viewport).len(), 1);
-        assert!(retained_plugin_surfaces(&second, viewport).is_empty());
+        assert_eq!(
+            retained_plugin_surfaces(&second, viewport),
+            [] as [bmux_attach_pipeline::RetainedSurface; 0]
+        );
         super::super::local_presentation::publish_notification(
             &second.presentation_layouts,
             &second.presentation_surfaces,
@@ -20426,7 +20439,10 @@ mod tests {
         );
         first.presentation_surfaces.clear();
         first.presentation_layouts.clear();
-        assert!(retained_plugin_surfaces(&first, viewport).is_empty());
+        assert_eq!(
+            retained_plugin_surfaces(&first, viewport),
+            [] as [bmux_attach_pipeline::RetainedSurface; 0]
+        );
         assert_eq!(retained_plugin_surfaces(&second, viewport).len(), 1);
         assert!(!std::sync::Arc::ptr_eq(
             &first.presentation_input,
@@ -24448,7 +24464,10 @@ mod tests {
                 created_epoch_secs: now - 2,
             });
         }
-        assert!(expired_scrollback_pins(&view_state, now, 0).is_empty());
+        assert_eq!(
+            expired_scrollback_pins(&view_state, now, 0),
+            [] as [(uuid::Uuid, bmux_attach_pipeline::ScrollbackPin); 0]
+        );
         assert_eq!(
             expired_scrollback_pins(&view_state, now, 5)
                 .into_iter()

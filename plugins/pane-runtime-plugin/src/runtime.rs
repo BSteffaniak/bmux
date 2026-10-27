@@ -846,8 +846,8 @@ mod pointer_query_tests {
     #[test]
     fn split_queries_and_setters_preserve_order() {
         let grid = grid();
-        assert!(process(&grid, b"\x1b]22;poi").is_empty());
-        assert!(process(&grid, b"nter\x1b\\\x1b]22;?__cur").is_empty());
+        assert_eq!(process(&grid, b"\x1b]22;poi"), [] as [u8; 0]);
+        assert_eq!(process(&grid, b"nter\x1b\\\x1b]22;?__cur"), [] as [u8; 0]);
         assert_eq!(process(&grid, b"rent__\x1b\\"), b"\x1b]22;pointer\x1b\\");
     }
 
@@ -972,7 +972,7 @@ mod pointer_query_tests {
             if profile == ProtocolProfile::Bmux {
                 assert_eq!(reply, b"\x1b]22;1,0,text,default\x1b\\");
             } else {
-                assert!(reply.is_empty());
+                assert_eq!(reply, [] as [u8; 0]);
             }
             assert_eq!(
                 grid.lock()
@@ -1503,7 +1503,7 @@ impl PinReservation {
     }
 
     fn acquire(used: &Arc<AtomicUsize>, bytes: usize) -> Result<Self, SessionRuntimeError> {
-        used.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+        used.try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
             current
                 .checked_add(bytes)
                 .filter(|&next| next <= RETAINED_PIN_BUDGET)
@@ -2440,7 +2440,7 @@ mod image_lifecycle_tests {
             serde_json::from_slice(&encoded).unwrap();
         assert_eq!(images.len(), 1);
         assert_eq!(images[0].position_row, 0);
-        assert!(!images[0].raw_data.is_empty());
+        assert_ne!(images[0].raw_data, [] as [u8; 0]);
         request.scrollback_offset = 0;
         assert_eq!(encode_captured_image_window(&pin, &request).unwrap(), b"[]");
         request.width = 40;
@@ -2512,7 +2512,7 @@ mod image_lifecycle_tests {
             assert_eq!(images.len(), 1);
             assert_eq!(images[0].position_row, 0);
             assert_eq!(images[0].position_col, 0);
-            assert!(!images[0].raw_data.is_empty());
+            assert_ne!(images[0].raw_data, [] as [u8; 0]);
         }
     }
 
@@ -2552,7 +2552,7 @@ mod image_lifecycle_tests {
                 )
                 .unwrap();
             }
-            assert!(registry.images().is_empty());
+            assert_eq!(registry.images(), []);
             let historical = registry.project_viewport(3, 3).unwrap();
             assert_eq!(historical.len(), 1, "split {split}");
             assert_eq!(historical[0].position.row, 2);
@@ -2637,8 +2637,11 @@ mod image_lifecycle_tests {
         .unwrap();
         assert!(tracker.terminal_grid.grid().main_row_count() > 3);
         assert_eq!(tracker.terminal_grid.grid().max_scrollback_offset(), 0);
-        assert!(registry.images().is_empty());
-        assert!(registry.project_viewport(1, 3).unwrap().is_empty());
+        assert_eq!(registry.images(), []);
+        assert_eq!(
+            registry.project_viewport(1, 3).unwrap(),
+            [] as [bmux_image::PaneImage; 0]
+        );
     }
 
     #[test]
@@ -2713,7 +2716,7 @@ mod image_lifecycle_tests {
                 &mut Vec::new(),
             )
             .unwrap();
-            assert!(registry.images().is_empty());
+            assert_eq!(registry.images(), []);
         }
     }
 }
@@ -3676,8 +3679,7 @@ impl PaneRuntimeHandle {
                 .execution
                 .durable_capture
                 .lock()
-                .ok()
-                .is_some_and(|capture| capture.is_some());
+                .is_ok_and(|capture| capture.is_some());
         if !captured {
             let _ = self.input_tx.send(command);
         }
@@ -3786,7 +3788,7 @@ impl PaneRuntimeHandle {
         rows: u16,
         cols: u16,
     ) -> Option<capture_writer::Ticket> {
-        let resized = self.execution.master.lock().ok().is_some_and(|master| {
+        let resized = self.execution.master.lock().is_ok_and(|master| {
             master.as_ref().is_some_and(|master| {
                 master
                     .resize(PtySize {
@@ -5830,7 +5832,7 @@ async fn bounded_start_identity_probe(
         }
     }
     PROCESS_IDENTITY_PROBES
-        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+        .try_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
             (count < 4).then_some(count + 1)
         })
         .ok()?;
@@ -7843,8 +7845,7 @@ impl SessionRuntimeManager {
                         && execution_for_task
                             .outcome
                             .lock()
-                            .ok()
-                            .is_some_and(|outcome| outcome.2.is_some())
+                            .is_ok_and(|outcome| outcome.2.is_some())
                     {
                         if let Err(error) =
                             execution_for_task.signal_owned_group(execution::GROUP_KILL)
@@ -12163,7 +12164,7 @@ fn bounded_directory_probe<T: Send + 'static>(
         }
     }
     active
-        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+        .try_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
             (count < MAX_DIRECTORY_PROBES).then_some(count + 1)
         })
         .map_err(|_| SpawnError::Busy)?;
@@ -17101,7 +17102,7 @@ exit 7"#
             estimate_terminal_grid_delta_bytes(&delta),
             baseline + delta.pending_bytes.capacity() - original_capacity
         );
-        assert!(delta.pending_bytes.is_empty());
+        assert_eq!(delta.pending_bytes, [] as [u8; 0]);
         let mut log = TerminalGridDeltaLog::default();
         log.push(test_delta(0, 1, 8));
         log.push(delta);
@@ -17177,7 +17178,10 @@ exit 7"#
         let mut log = TerminalGridDeltaLog::default();
         log.push(delta);
         assert_eq!(log.estimated_bytes, total);
-        assert!(select_terminal_grid_deltas(&log, 0, 1, total - 1).is_empty());
+        assert_eq!(
+            select_terminal_grid_deltas(&log, 0, 1, total - 1),
+            [] as [&bmux_terminal_grid::GridDeltaBatch; 0]
+        );
         let encoded = serde_json::to_vec(&log.batches.iter().collect::<Vec<_>>())
             .unwrap()
             .len();
@@ -17207,7 +17211,10 @@ exit 7"#
         assert!(encoded > estimate_terminal_grid_delta_bytes(&delta));
         let mut log = TerminalGridDeltaLog::default();
         log.push(delta);
-        assert!(select_terminal_grid_deltas(&log, 0, 1, encoded - 1).is_empty());
+        assert_eq!(
+            select_terminal_grid_deltas(&log, 0, 1, encoded - 1),
+            [] as [&bmux_terminal_grid::GridDeltaBatch; 0]
+        );
         let selected = select_terminal_grid_deltas(&log, 0, 1, encoded);
         assert_eq!(selected.len(), 1);
         assert_eq!(serde_json::to_vec(&selected).unwrap().len(), encoded);
@@ -17242,7 +17249,10 @@ exit 7"#
         log.push(oversized);
         assert_eq!(log.batches.len(), 2);
         for remaining in [0, RESPONSE_OUTPUT_BUDGET / 2, RESPONSE_OUTPUT_BUDGET] {
-            assert!(select_terminal_grid_deltas(&log, 1, 1, remaining).is_empty());
+            assert_eq!(
+                select_terminal_grid_deltas(&log, 1, 1, remaining),
+                [] as [&bmux_terminal_grid::GridDeltaBatch; 0]
+            );
             assert_eq!(
                 terminal_grid_delta_recovery_position(&log, 1, remaining, 4, 5),
                 (5, true)
@@ -18162,61 +18172,69 @@ exit 7"#
 
     struct HistoryDispatch(Uuid);
     impl bmux_plugin_sdk::TypedDispatchClient for HistoryDispatch {
-        async fn invoke_service_raw(
+        fn invoke_service_raw(
             &mut self,
             capability: &str,
             kind: bmux_ipc::InvokeServiceKind,
             interface_id: &str,
             operation: &str,
             payload: Vec<u8>,
-        ) -> bmux_plugin_sdk::TypedDispatchClientResult<Vec<u8>> {
-            use bmux_plugin_sdk::{
-                ApiVersion, HostConnectionInfo, HostMetadata, HostScope, NativeServiceContext,
-                ProviderId, RegisteredService, ServiceKind, ServiceRequest,
-            };
-            assert_eq!(kind, bmux_ipc::InvokeServiceKind::Query);
-            let response = crate::handlers::route(NativeServiceContext {
-                plugin_id: "bmux.pane-runtime".into(),
-                request: ServiceRequest {
-                    caller_plugin_id: String::new(),
-                    service: RegisteredService {
-                        capability: HostScope::new(capability).unwrap(),
-                        kind: ServiceKind::Query,
-                        interface_id: interface_id.into(),
-                        provider: ProviderId::Plugin("bmux.pane-runtime".into()),
-                    },
-                    operation: operation.into(),
-                    payload,
-                },
-                required_capabilities: vec![],
-                provided_capabilities: vec![],
-                services: vec![],
-                available_capabilities: vec![],
-                enabled_plugins: vec![],
-                plugin_search_roots: vec![],
-                host: HostMetadata {
-                    product_name: "bmux".into(),
-                    product_version: env!("CARGO_PKG_VERSION").into(),
-                    plugin_api_version: ApiVersion::new(1, 0),
-                    plugin_abi_version: ApiVersion::new(1, 0),
-                },
-                connection: HostConnectionInfo {
-                    config_dir: String::new(),
-                    config_dir_candidates: vec![],
-                    runtime_dir: String::new(),
-                    data_dir: String::new(),
-                    state_dir: String::new(),
-                },
-                settings: None,
-                plugin_settings_map: std::collections::BTreeMap::new(),
-                caller_client_id: Some(self.0),
-                cancellation: bmux_plugin_sdk::CancellationToken::default(),
-                host_kernel_bridge: Some(bmux_plugin_sdk::HostKernelBridge::from_fn(
-                    history_fixture_origin,
-                )),
-            });
-            assert_eq!(response.error, None);
-            Ok(response.payload)
+        ) -> impl std::future::Future<Output = bmux_plugin_sdk::TypedDispatchClientResult<Vec<u8>>>
+        {
+            let mut payload = Some(payload);
+            std::future::poll_fn(move |_| {
+                let payload = payload.take().expect("transport polled after completion");
+                std::task::Poll::Ready({
+                    use bmux_plugin_sdk::{
+                        ApiVersion, HostConnectionInfo, HostMetadata, HostScope,
+                        NativeServiceContext, ProviderId, RegisteredService, ServiceKind,
+                        ServiceRequest,
+                    };
+                    assert_eq!(kind, bmux_ipc::InvokeServiceKind::Query);
+                    let response = crate::handlers::route(NativeServiceContext {
+                        plugin_id: "bmux.pane-runtime".into(),
+                        request: ServiceRequest {
+                            caller_plugin_id: String::new(),
+                            service: RegisteredService {
+                                capability: HostScope::new(capability).unwrap(),
+                                kind: ServiceKind::Query,
+                                interface_id: interface_id.into(),
+                                provider: ProviderId::Plugin("bmux.pane-runtime".into()),
+                            },
+                            operation: operation.into(),
+                            payload,
+                        },
+                        required_capabilities: vec![],
+                        provided_capabilities: vec![],
+                        services: vec![],
+                        available_capabilities: vec![],
+                        enabled_plugins: vec![],
+                        plugin_search_roots: vec![],
+                        host: HostMetadata {
+                            product_name: "bmux".into(),
+                            product_version: env!("CARGO_PKG_VERSION").into(),
+                            plugin_api_version: ApiVersion::new(1, 0),
+                            plugin_abi_version: ApiVersion::new(1, 0),
+                        },
+                        connection: HostConnectionInfo {
+                            config_dir: String::new(),
+                            config_dir_candidates: vec![],
+                            runtime_dir: String::new(),
+                            data_dir: String::new(),
+                            state_dir: String::new(),
+                        },
+                        settings: None,
+                        plugin_settings_map: std::collections::BTreeMap::new(),
+                        caller_client_id: Some(self.0),
+                        cancellation: bmux_plugin_sdk::CancellationToken::default(),
+                        host_kernel_bridge: Some(bmux_plugin_sdk::HostKernelBridge::from_fn(
+                            history_fixture_origin,
+                        )),
+                    });
+                    assert_eq!(response.error, None);
+                    Ok(response.payload)
+                })
+            })
         }
     }
 
@@ -18296,7 +18314,7 @@ exit 7"#
             serde_json::from_slice(&response.encoded).unwrap();
         assert_eq!(recovered.len(), 1);
         assert_eq!(recovered[0].position_row, 0);
-        assert!(!recovered[0].raw_data.is_empty());
+        assert_ne!(recovered[0].raw_data, [] as [u8; 0]);
         assert_anchored_history_image_recovery(&mut dispatch, session, pane, &capture).await;
         assert_history_image_window_replacement(
             &mut dispatch,
@@ -18353,7 +18371,7 @@ exit 7"#
                 if line == 0 {
                     assert_eq!(images.len(), 1);
                     assert_eq!((images[0].position_row, images[0].position_col), (0, 0));
-                    assert!(!images[0].raw_data.is_empty());
+                    assert_ne!(images[0].raw_data, [] as [u8; 0]);
                 } else {
                     assert!(
                         images.is_empty(),
@@ -18408,7 +18426,10 @@ exit 7"#
             let projected: Vec<bmux_attach_image_protocol::AttachPaneImage> =
                 serde_json::from_slice(&window.encoded).unwrap();
             if offset == 0 {
-                assert!(projected.is_empty());
+                assert_eq!(
+                    projected,
+                    [] as [bmux_attach_image_protocol::AttachPaneImage; 0]
+                );
             } else {
                 assert_eq!(window.encoded, expected);
             }
@@ -18625,7 +18646,7 @@ exit 7"#
                 (2, 100),
             )
             .unwrap();
-        assert!(!encoded.is_empty());
+        assert_ne!(encoded, [] as [u8; 0]);
         assert_eq!(next, 2);
         assert_eq!(end, bmux_pane_runtime_state::HistoryEnd::Continue);
         assert!(
@@ -18947,10 +18968,10 @@ exit 7"#
         .unwrap();
         assert_eq!(response.deltas.len(), 2);
         assert!(!response.deltas[0].desynced);
-        assert!(!response.deltas[0].encoded.is_empty());
+        assert_ne!(response.deltas[0].encoded, [] as [u8; 0]);
         assert!(!response.deltas[1].desynced);
         assert_eq!(response.deltas[1].revision, 0);
-        assert!(response.deltas[1].encoded.is_empty());
+        assert_eq!(response.deltas[1].encoded, [] as [u8; 0]);
         assert!(
             response
                 .deltas
@@ -18969,9 +18990,9 @@ exit 7"#
             1,
         )
         .unwrap();
-        assert!(retry.deltas[0].encoded.is_empty());
+        assert_eq!(retry.deltas[0].encoded, [] as [u8; 0]);
         assert!(!retry.deltas[1].desynced);
-        assert!(!retry.deltas[1].encoded.is_empty());
+        assert_ne!(retry.deltas[1].encoded, [] as [u8; 0]);
     }
 
     #[tokio::test]
@@ -19009,7 +19030,7 @@ exit 7"#
         assert_eq!(response.deltas.len(), 1);
         assert!(response.deltas[0].desynced);
         assert_eq!(response.deltas[0].revision, expected.revision);
-        assert!(response.deltas[0].encoded.is_empty());
+        assert_eq!(response.deltas[0].encoded, [] as [u8; 0]);
         let snapshots =
             bmux_pane_runtime_state::SessionRuntimeManagerApi::attach_grid_snapshot_state(
                 &adapter,
@@ -19033,7 +19054,7 @@ exit 7"#
         .unwrap();
         assert!(!caught_up.deltas[0].desynced);
         assert_eq!(caught_up.deltas[0].revision, snapshot.revision);
-        assert!(caught_up.deltas[0].encoded.is_empty());
+        assert_eq!(caught_up.deltas[0].encoded, [] as [u8; 0]);
     }
 
     #[tokio::test]
@@ -19075,7 +19096,7 @@ exit 7"#
         )
         .unwrap();
         assert!(recovery.deltas[0].desynced);
-        assert!(recovery.deltas[0].encoded.is_empty());
+        assert_eq!(recovery.deltas[0].encoded, [] as [u8; 0]);
         assert_eq!(recovery.deltas[0].revision, expected.revision);
         while consumer.grid().revision() < expected.revision {
             let state = bmux_pane_runtime_state::SessionRuntimeManagerApi::attach_grid_delta_state(
@@ -19090,7 +19111,7 @@ exit 7"#
             let response = &state.deltas[0];
             assert!(!response.desynced);
             let batches: Vec<GridDeltaBatch> = serde_json::from_slice(&response.encoded).unwrap();
-            assert!(!batches.is_empty());
+            assert_ne!(batches, [] as [bmux_terminal_grid::GridDeltaBatch; 0]);
             for batch in batches {
                 consumer.apply_delta(&batch, GridLimits::default()).unwrap();
             }
@@ -19154,7 +19175,7 @@ exit 7"#
         )
         .unwrap();
         assert!(state.deltas[0].desynced);
-        assert!(state.deltas[0].encoded.is_empty());
+        assert_eq!(state.deltas[0].encoded, [] as [u8; 0]);
         assert_eq!(state.deltas[0].revision, expected.revision);
         // Even a strictly advancing chain must end at the authoritative revision.
         for tail in [expected.revision - 1, expected.revision + 1] {
@@ -19173,7 +19194,7 @@ exit 7"#
             )
             .unwrap();
             assert!(state.deltas[0].desynced);
-            assert!(state.deltas[0].encoded.is_empty());
+            assert_eq!(state.deltas[0].encoded, [] as [u8; 0]);
             assert_eq!(state.deltas[0].revision, expected.revision);
         }
         // Matching links and a correct tail do not make a non-advancing
@@ -19200,7 +19221,7 @@ exit 7"#
             )
             .unwrap();
             assert!(state.deltas[0].desynced);
-            assert!(state.deltas[0].encoded.is_empty());
+            assert_eq!(state.deltas[0].encoded, [] as [u8; 0]);
             assert_eq!(state.deltas[0].revision, expected.revision);
         }
     }
@@ -19430,7 +19451,7 @@ exit 7"#
         let original = pane.image_registry.lock().unwrap().images()[0].clone();
         pane.resize_pty(3, 80);
         let images = pane.image_registry.lock().unwrap();
-        assert!(images.images().is_empty());
+        assert_eq!(images.images(), []);
         assert_eq!(images.project_viewport(2, 3).unwrap(), vec![original]);
     }
 
@@ -19468,13 +19489,13 @@ exit 7"#
                 .scrollback_rows_hint(),
             0
         );
-        assert!(
+        assert_eq!(
             pane.image_registry
                 .lock()
                 .unwrap()
                 .project_viewport(2, 3)
-                .unwrap()
-                .is_empty()
+                .unwrap(),
+            [] as [bmux_image::PaneImage; 0]
         );
     }
 
@@ -19509,7 +19530,7 @@ exit 7"#
         assert_eq!(pane.image_registry.lock().unwrap().images(), original);
         pane.resize_pty(2, 4);
         let images = pane.image_registry.lock().unwrap();
-        assert!(images.images().is_empty());
+        assert_eq!(images.images(), []);
         assert_eq!(images.project_viewport(1, 2).unwrap(), original);
     }
 
@@ -19536,7 +19557,7 @@ exit 7"#
         pane.terminal_grid.lock().unwrap().process(&output.filtered);
         pane.resize_pty(2, 8);
         assert_eq!(*pane.last_requested_size.lock().unwrap(), (2, 8));
-        assert!(pane.image_registry.lock().unwrap().images().is_empty());
+        assert_eq!(pane.image_registry.lock().unwrap().images(), []);
         let mut output = interceptor.process(b"\x1b[?1049l");
         ordered_image_output(
             &mut pane.cursor_tracker.lock().unwrap(),
@@ -19580,12 +19601,12 @@ exit 7"#
             .project_viewport(2, 2)
             .unwrap();
         assert_eq!(original.len(), 1);
-        assert!(pane.image_registry.lock().unwrap().images().is_empty());
+        assert_eq!(pane.image_registry.lock().unwrap().images(), []);
         pane.resize_pty(4, 5);
         assert_eq!(pane.image_registry.lock().unwrap().images(), original);
         pane.resize_pty(2, 5);
         let images = pane.image_registry.lock().unwrap();
-        assert!(images.images().is_empty());
+        assert_eq!(images.images(), []);
         assert_eq!(images.project_viewport(2, 2).unwrap(), original);
     }
 
@@ -19688,7 +19709,7 @@ exit 7"#
         assert_eq!(original.len(), 1);
         assert!(!pane.image_registry.lock().unwrap().has_main_images());
         pane.resize_pty(3, 80);
-        assert!(pane.image_registry.lock().unwrap().images().is_empty());
+        assert_eq!(pane.image_registry.lock().unwrap().images(), []);
         pane.resize_pty(5, 80);
         assert_eq!(pane.image_registry.lock().unwrap().images(), original);
     }
@@ -19777,7 +19798,7 @@ exit 7"#
         .expect("delta state should be available");
 
         assert!(state.deltas[0].desynced);
-        assert!(state.deltas[0].encoded.is_empty());
+        assert_eq!(state.deltas[0].encoded, [] as [u8; 0]);
     }
 
     #[tokio::test]
@@ -20392,7 +20413,7 @@ exit 7"#
                 PaneShellMetadataEvent::CommandStart { command, cwd },
             ]
         );
-        assert!(metadata.filtered.is_empty());
+        assert_eq!(metadata.filtered, [] as [u8; 0]);
     }
 
     #[test]
@@ -20419,7 +20440,10 @@ exit 7"#
                 ..Default::default()
             };
             let result = parser.process_chunk(marker);
-            assert!(result.events.is_empty());
+            assert_eq!(
+                result.events,
+                [] as [crate::runtime::PaneShellMetadataEvent; 0]
+            );
             assert_eq!(result.filtered, marker);
         }
     }
@@ -22179,7 +22203,7 @@ exit 7"#
         output.register_client_at_tail(client_id);
         output.acknowledge_snapshot(client_id, snapshot_end);
         assert_eq!(output.cursors.get(&client_id), Some(&output.end_offset()));
-        assert!(output.read_for_client(client_id, 1024).bytes.is_empty());
+        assert_eq!(output.read_for_client(client_id, 1024).bytes, [] as [u8; 0]);
     }
 
     #[test]
@@ -22195,7 +22219,7 @@ exit 7"#
             b"firstsecond"
         );
         output.acknowledge_snapshot(client_id, snapshot_end);
-        assert!(output.read_for_client(client_id, 1024).bytes.is_empty());
+        assert_eq!(output.read_for_client(client_id, 1024).bytes, [] as [u8; 0]);
         output.push_chunk(b"third");
         assert_eq!(output.read_for_client(client_id, 1024).bytes, b"third");
         // Explicit reset remains available for intentional replay.

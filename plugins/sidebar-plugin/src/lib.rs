@@ -1674,7 +1674,10 @@ mod tests {
         drop(first);
         first_allocations.notify(&id, ExtensionRect::new(0, 0, 40, 10));
         assert!(first_surfaces.owner_snapshot(OWNER).is_none());
-        assert!(first_layouts.requests().is_empty());
+        assert_eq!(
+            first_layouts.requests(),
+            [] as [bmux_plugin::layout::PluginLayoutRequest; 0]
+        );
         assert_eq!(
             second_surfaces.owner_snapshot(OWNER).unwrap().surfaces,
             saved.surfaces
@@ -1974,7 +1977,10 @@ mod tests {
         assert_eq!(state.scroll.vertical_offset(), 4);
         assert!(!state.resize(ExtensionRect::new(0, 0, 12, 5)));
         assert!(state.resize(ExtensionRect::new(0, 0, 12, 1)));
-        assert!(build_surface(&state, 3).interactive_regions.is_empty());
+        assert_eq!(
+            build_surface(&state, 3).interactive_regions,
+            [] as [bmux_plugin::surface::PluginSurfaceRegion; 0]
+        );
     }
 
     #[test]
@@ -2149,9 +2155,9 @@ mod tests {
             .as_ref()
             .expect("real sidebar producer metadata");
         assert!(metadata.selection.as_ref().unwrap().validate().is_ok());
-        assert!(!metadata.selection.as_ref().unwrap().fragments().is_empty());
+        assert_ne!(metadata.selection.as_ref().unwrap().fragments(), []);
         assert!(metadata.text.values().any(|text| text.contains("one")));
-        assert!(!metadata.semantics.as_ref().unwrap().regions().is_empty());
+        assert_ne!(metadata.semantics.as_ref().unwrap().regions(), []);
         assert!(matches!(
             surface.ops[0],
             RenderOp::FillRect {

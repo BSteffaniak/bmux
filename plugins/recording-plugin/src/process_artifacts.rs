@@ -971,7 +971,7 @@ mod tests {
         }
         transcript.feed(b"\x07x", &mut text)?;
         assert_eq!(transcript.line.len(), 1);
-        assert!(transcript.utf8.is_empty());
+        assert_eq!(transcript.utf8, [] as [u8; 0]);
         transcript.finish(&mut text)?;
         assert_eq!(text, b"x");
         Ok(())

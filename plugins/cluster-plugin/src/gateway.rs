@@ -2311,7 +2311,6 @@ fn run_cluster_gateway_reset_command(
         GatewayResetScope::All => {
             let removed = clear_gateway_runtime_state_all()?;
             println!("cluster gateway reset: scope=all removed={removed}");
-            Ok(0)
         }
         GatewayResetScope::Cluster(cluster_name) => {
             if !settings.clusters.contains_key(cluster_name.as_str()) {
@@ -2321,9 +2320,9 @@ fn run_cluster_gateway_reset_command(
             println!(
                 "cluster gateway reset: scope=cluster cluster='{cluster_name}' removed={removed}"
             );
-            Ok(0)
         }
     }
+    Ok(0)
 }
 
 fn run_cluster_gateway_history_command(

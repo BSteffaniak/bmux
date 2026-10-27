@@ -440,7 +440,10 @@ mod tests {
                 )
                 .is_err()
         );
-        assert!(authority.list_devices(&owner).unwrap().is_empty());
+        assert_eq!(
+            authority.list_devices(&owner).unwrap(),
+            [] as [bmux_connections_plugin_api::pairing_types::Device; 0]
+        );
         authority
             .update(|state| {
                 assert!(

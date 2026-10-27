@@ -270,7 +270,7 @@ impl ThemeView {
         }
         let token = self
             .preview_sequence
-            .fetch_update(
+            .try_update(
                 std::sync::atomic::Ordering::SeqCst,
                 std::sync::atomic::Ordering::SeqCst,
                 |value| value.checked_add(1),
@@ -2933,7 +2933,7 @@ mod tests {
             ),
             Some(SERVICE_CONTRACT),
         );
-        assert!(!SERVICE_CONTRACT.is_empty());
+        assert_ne!(SERVICE_CONTRACT, [] as [u8; 0]);
         assert!(bmux_plugin_sdk::service_contract::encode("theme-state", &[], b"request").is_err());
         assert!(bmux_plugin_sdk::service_contract::decode_response(b"legacy response").is_err());
         for (contract, expected_status, expected_calls) in

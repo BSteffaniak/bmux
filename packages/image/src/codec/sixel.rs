@@ -527,7 +527,7 @@ mod tests {
         let allocation = scratch.columns[180].as_ptr();
 
         // An empty intervening band must clear old bits without quantization.
-        for pixel in pixels.data.chunks_exact_mut(4) {
+        for pixel in pixels.data.as_chunks_mut::<4>().0 {
             pixel[3] = 127;
         }
         scratch

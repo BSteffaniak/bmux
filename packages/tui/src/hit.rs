@@ -454,8 +454,11 @@ mod tests {
                 .is_none()
             );
         }
-        assert!(map.focus_targets(Some(&scope)).is_empty());
-        assert!(map.focus_targets(None).is_empty());
+        assert_eq!(
+            map.focus_targets(Some(&scope)),
+            [] as [crate::hit::HitId; 0]
+        );
+        assert_eq!(map.focus_targets(None), [] as [crate::hit::HitId; 0]);
     }
 
     #[test]

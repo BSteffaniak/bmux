@@ -129,14 +129,18 @@ impl CommandRunner for NativeCommandRunner {
 fn decode_command_output(bytes: &[u8]) -> String {
     if bytes.starts_with(&[0xff, 0xfe]) {
         let units = bytes[2..]
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
             .collect::<Vec<_>>();
         return String::from_utf16_lossy(&units).trim().to_string();
     }
     if bytes.starts_with(&[0xfe, 0xff]) {
         let units = bytes[2..]
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]]))
             .collect::<Vec<_>>();
         return String::from_utf16_lossy(&units).trim().to_string();

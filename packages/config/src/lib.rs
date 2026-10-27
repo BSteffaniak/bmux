@@ -781,12 +781,10 @@ fn merged_raw_config_value_for_scope(
 }
 
 fn base_config_disabled() -> bool {
-    std::env::var(bmux_slots::NO_BASE_CONFIG_ENV)
-        .ok()
-        .is_some_and(|v| {
-            let t = v.trim().to_ascii_lowercase();
-            matches!(t.as_str(), "1" | "true" | "yes" | "on")
-        })
+    std::env::var(bmux_slots::NO_BASE_CONFIG_ENV).is_ok_and(|v| {
+        let t = v.trim().to_ascii_lowercase();
+        matches!(t.as_str(), "1" | "true" | "yes" | "on")
+    })
 }
 
 fn apply_forced_profile(
@@ -3958,8 +3956,8 @@ mod tests {
         assert!(!config.server.gateway.quick);
         assert!(config.server.gateway.cert_file.is_none());
         assert!(config.server.gateway.key_file.is_none());
-        assert!(config.plugins.enabled.is_empty());
-        assert!(config.plugins.disabled.is_empty());
+        assert_eq!(config.plugins.enabled, [] as [std::string::String; 0]);
+        assert_eq!(config.plugins.disabled, [] as [std::string::String; 0]);
         assert!(config.plugins.routing.required_namespaces.is_empty());
         assert!(config.plugins.routing.required_paths.is_empty());
         assert_eq!(
@@ -4070,7 +4068,7 @@ key_file = "/tmp/gateway-key.pem"
             config.keybindings.timeout_profile,
             defaults.keybindings.timeout_profile
         );
-        assert!(config.plugins.disabled.is_empty());
+        assert_eq!(config.plugins.disabled, [] as [std::string::String; 0]);
 
         std::fs::remove_dir_all(&dir).expect("failed cleaning temp test directory");
     }
@@ -4994,7 +4992,7 @@ timeout_profile = "missing"
             BmuxConfig::interpolate_path_tokens(std::path::Path::new("$$HOME/cache"), "field");
 
         assert_eq!(expanded, std::path::PathBuf::from("$HOME/cache"));
-        assert!(warnings.is_empty());
+        assert_eq!(warnings, [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -5132,7 +5130,10 @@ timeout_profile = "missing"
         );
         assert_eq!(config.recording.export.palette_foreground, None);
         assert_eq!(config.recording.export.palette_background, None);
-        assert!(config.recording.export.palette_colors.is_empty());
+        assert_eq!(
+            config.recording.export.palette_colors,
+            [] as [std::string::String; 0]
+        );
     }
 
     #[test]
@@ -5598,7 +5599,10 @@ timeout_profile = "missing"
         assert_eq!(config.behavior.scrollback.max_frozen_panes, 0);
         assert_eq!(config.behavior.scrollback.auto_unfreeze_after, 0);
         assert!(config.behavior.scrollback.persist_pane_modes);
-        assert!(config.behavior.scrollback.pane_rules.is_empty());
+        assert_eq!(
+            config.behavior.scrollback.pane_rules,
+            [] as [crate::ScrollbackPaneRule; 0]
+        );
     }
 
     #[test]

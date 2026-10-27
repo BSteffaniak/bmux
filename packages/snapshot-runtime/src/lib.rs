@@ -557,20 +557,22 @@ impl SnapshotOrchestrator for NoopSnapshotOrchestrator {
     fn finalize(&self) -> SnapshotOrchestratorResult<Option<PathBuf>> {
         Ok(None)
     }
-    async fn restore_if_present(&self) -> SnapshotOrchestratorResult<Option<RestoreSummary>> {
-        Ok(None)
+    fn restore_if_present(
+        &self,
+    ) -> impl Future<Output = SnapshotOrchestratorResult<Option<RestoreSummary>>> {
+        std::future::ready(Ok(None))
     }
 
-    async fn save_now(&self) -> SnapshotOrchestratorResult<Option<PathBuf>> {
-        Ok(None)
+    fn save_now(&self) -> impl Future<Output = SnapshotOrchestratorResult<Option<PathBuf>>> {
+        std::future::ready(Ok(None))
     }
 
-    async fn dry_run(&self) -> SnapshotOrchestratorResult<DryRunReport> {
-        Err(SnapshotOrchestratorError::Disabled)
+    fn dry_run(&self) -> impl Future<Output = SnapshotOrchestratorResult<DryRunReport>> {
+        std::future::ready(Err(SnapshotOrchestratorError::Disabled))
     }
 
-    async fn restore_apply(&self) -> SnapshotOrchestratorResult<RestoreSummary> {
-        Err(SnapshotOrchestratorError::Disabled)
+    fn restore_apply(&self) -> impl Future<Output = SnapshotOrchestratorResult<RestoreSummary>> {
+        std::future::ready(Err(SnapshotOrchestratorError::Disabled))
     }
 
     fn status(&self) -> SnapshotStatusReport {

@@ -1948,7 +1948,7 @@ fn immediate_output_is_replayed_into_gif_without_screen_polling() {
     let mut has_red_output = false;
     let mut frames = 0;
     while let Some(frame) = decoder.read_next_frame().expect("decode immediate frame") {
-        has_red_output |= frame.buffer.chunks_exact(4).any(|pixel| {
+        has_red_output |= frame.buffer.as_chunks::<4>().0.iter().any(|pixel| {
             pixel[3] != 0
                 && pixel[0] > 80
                 && u16::from(pixel[0]) > u16::from(pixel[1]) * 2
@@ -2018,7 +2018,13 @@ fn gif_dominant_colors(path: &Path) -> Vec<usize> {
         frames += 1;
         assert!(frames <= 1000, "unbounded animation");
         let mut counts = [0_usize; 3];
-        for pixel in frame.buffer.chunks_exact(4).filter(|pixel| pixel[3] != 0) {
+        for pixel in frame
+            .buffer
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|pixel| pixel[3] != 0)
+        {
             for channel in 0..3 {
                 if pixel[channel] > 80
                     && u16::from(pixel[channel]) > u16::from(pixel[(channel + 1) % 3]) * 2

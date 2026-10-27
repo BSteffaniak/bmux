@@ -709,7 +709,7 @@ mod tests {
             Rect::new(0, 0, 1, 1),
             &mut frame,
         );
-        assert!(frame.hits().regions().is_empty());
+        assert_eq!(frame.hits().regions(), []);
         assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("█"));
         assert_eq!(state.get().offset, 40);
     }
@@ -788,7 +788,10 @@ mod tests {
         assert_eq!(regions[0].area, Rect::new(9, 3, 1, 6));
         assert_eq!(regions[0].role, HitRole::Scroll);
         assert!(!regions[0].focusable);
-        assert!(frame.hits().focus_targets(None).is_empty());
+        assert_eq!(
+            frame.hits().focus_targets(None),
+            [] as [bmux_tui::hit::HitId; 0]
+        );
     }
 
     #[test]
@@ -811,7 +814,7 @@ mod tests {
             &mut frame,
         );
 
-        assert!(frame.hits().regions().is_empty());
+        assert_eq!(frame.hits().regions(), []);
     }
 
     #[test]

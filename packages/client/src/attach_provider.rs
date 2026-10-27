@@ -552,7 +552,7 @@ mod tests {
             Err(AttachProviderRegistrationError::DuplicateId { .. })
         ));
         drop(registration);
-        assert!(registry.provider_ids().is_empty());
+        assert_eq!(registry.provider_ids(), [] as [String; 0]);
     }
 
     #[test]

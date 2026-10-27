@@ -661,8 +661,8 @@ mod tests {
         let schema = must_parse("plugin bmux.tabs version 1;");
         assert_eq!(schema.plugin.plugin_id, "bmux.tabs");
         assert_eq!(schema.plugin.version, 1);
-        assert!(schema.interfaces.is_empty());
-        assert!(schema.imports.is_empty());
+        assert_eq!(schema.interfaces, [] as [crate::ast::Interface; 0]);
+        assert_eq!(schema.imports, [] as [crate::ast::Import; 0]);
     }
 
     #[test]

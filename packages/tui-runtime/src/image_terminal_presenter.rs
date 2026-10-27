@@ -292,8 +292,8 @@ where
     fn set_pointer_context(&mut self, context: bmux_tui::terminal::PointerContext) {
         self.terminal.set_pointer_context(context);
     }
-    async fn restore(&mut self) -> Result<(), Self::Error> {
-        self.cleanup_presentation()
+    fn restore(&mut self) -> impl std::future::Future<Output = Result<(), Self::Error>> {
+        futures_util::future::lazy(move |_| self.cleanup_presentation())
     }
 
     fn resize(&mut self, size: Size) {
@@ -335,8 +335,8 @@ where
     fn set_pointer_context(&mut self, context: bmux_tui::terminal::PointerContext) {
         self.terminal.set_pointer_context(context);
     }
-    async fn restore(&mut self) -> Result<(), Self::Error> {
-        self.cleanup_presentation()
+    fn restore(&mut self) -> impl std::future::Future<Output = Result<(), Self::Error>> {
+        futures_util::future::lazy(move |_| self.cleanup_presentation())
     }
 
     fn resize(&mut self, size: Size) {
@@ -1728,7 +1728,7 @@ mod prepared_tests {
         assert_eq!(focus.active_scope(), program.scopes.last());
         if let Some(scope) = program.scopes.last() {
             assert_eq!(focus.active(), Some(scope));
-            assert!(hits.focus_targets(None).is_empty());
+            assert_eq!(hits.focus_targets(None), []);
         }
     }
     #[test]

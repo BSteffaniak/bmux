@@ -172,7 +172,7 @@ mod tests {
     fn suggest_top_matches_limits_and_filters_results() {
         let candidates = ["bmux.plugin_cli", "bmux.permissions", "bmux.tabs"];
         let matches = suggest_top_matches("bmux.plugin", candidates.iter().copied(), 2);
-        assert!(!matches.is_empty());
+        assert_ne!(matches, [] as [std::string::String; 0]);
         assert_eq!(matches[0], "bmux.plugin_cli");
     }
 

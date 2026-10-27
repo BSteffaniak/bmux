@@ -359,7 +359,10 @@ mod tests {
                 resolve_pointer_intent(frame.hits(), Some(Point::new(0, 0)), None, None),
                 PointerIntent::Shape(PointerShape::Default)
             );
-            assert!(frame.hits().focus_targets(None).is_empty());
+            assert_eq!(
+                frame.hits().focus_targets(None),
+                [] as [bmux_tui::hit::HitId; 0]
+            );
         }
     }
 }

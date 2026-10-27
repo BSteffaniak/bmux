@@ -45,7 +45,6 @@ impl Eq for ImageScene {}
 
 impl ImageScene {
     /// Return active image placements in stable key order.
-    #[must_use]
     pub fn placements(&self) -> impl ExactSizeIterator<Item = &ImagePlacement> {
         self.active.values()
     }
@@ -57,7 +56,6 @@ impl ImageScene {
     }
 
     /// Retained original placements, including hidden persistent images.
-    #[must_use]
     pub fn source_placements(&self) -> impl ExactSizeIterator<Item = &ImagePlacement> {
         self.sources.values()
     }
@@ -557,15 +555,15 @@ mod tests {
         let initial = placement("diagram", 1, ImageLifecycle::Frame);
         let delta = scene.reconcile(&[ImageContribution::Present(initial.clone())]);
         assert_eq!(delta.upserted, [initial]);
-        assert!(delta.removed.is_empty());
+        assert_eq!(delta.removed, [] as [crate::image::ImageKey; 0]);
 
         let updated = placement("diagram", 2, ImageLifecycle::Frame);
         let delta = scene.reconcile(&[ImageContribution::Present(updated.clone())]);
         assert_eq!(delta.upserted, [updated]);
-        assert!(delta.removed.is_empty());
+        assert_eq!(delta.removed, [] as [crate::image::ImageKey; 0]);
 
         let delta = scene.reconcile(&[]);
-        assert!(delta.upserted.is_empty());
+        assert_eq!(delta.upserted, [] as [crate::image::ImagePlacement; 0]);
         assert_eq!(delta.removed, [ImageKey::new("diagram")]);
         assert_eq!(scene.placements().len(), 0);
     }

@@ -255,7 +255,7 @@ pub enum RuntimeError<PE, RE, P, R> {
         /// Cleanup failure, if protocol ownership could not be restored.
         cleanup_error: Option<RE>,
         /// Final state and measurements.
-        output: RuntimeOutput<P, R>,
+        output: Box<RuntimeOutput<P, R>>,
     },
     /// Presentation failed.
     Presenter {
@@ -264,7 +264,7 @@ pub enum RuntimeError<PE, RE, P, R> {
         /// Additional cleanup failure after the original presentation error.
         cleanup_error: Option<RE>,
         /// Final state and measurements.
-        output: RuntimeOutput<P, R>,
+        output: Box<RuntimeOutput<P, R>>,
     },
 }
 
@@ -429,18 +429,18 @@ where
                 Err(error) => Err(RuntimeError::Presenter {
                     error,
                     cleanup_error: None,
-                    output,
+                    output: Box::new(output),
                 }),
             },
             Err(LoopError::Program(error)) => Err(RuntimeError::Program {
                 error,
                 cleanup_error: restoration.err(),
-                output,
+                output: Box::new(output),
             }),
             Err(LoopError::Presenter(error)) => Err(RuntimeError::Presenter {
                 error,
                 cleanup_error: restoration.err(),
-                output,
+                output: Box::new(output),
             }),
         }
     }

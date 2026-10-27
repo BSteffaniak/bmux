@@ -1563,7 +1563,7 @@ mod tests {
             &mut frame,
         );
 
-        assert!(frame.hits().regions().is_empty());
+        assert_eq!(frame.hits().regions(), []);
     }
 
     #[test]

@@ -1631,7 +1631,10 @@ mod tests {
             .expect("valid keymap");
         let mut processor = new_processor(keymap);
 
-        assert!(processor.process_chunk(&[0x01, b'w']).is_empty());
+        assert_eq!(
+            processor.process_chunk(&[0x01, b'w']),
+            [] as [bmux_keybind::RuntimeAction; 0]
+        );
         assert_eq!(processor.process_chunk(b"o"), vec![focus_action("next")]);
     }
 
@@ -1645,7 +1648,10 @@ mod tests {
             .expect("valid keymap");
         let mut processor = new_processor(keymap);
 
-        assert!(processor.process_chunk(&[0x01, b'w']).is_empty());
+        assert_eq!(
+            processor.process_chunk(&[0x01, b'w']),
+            [] as [bmux_keybind::RuntimeAction; 0]
+        );
         thread::sleep(Duration::from_millis(70));
         assert_eq!(processor.process_chunk(&[]), vec![RuntimeAction::ShowHelp]);
     }
@@ -1660,9 +1666,15 @@ mod tests {
             Keymap::from_parts("ctrl+a", None, &runtime, &BTreeMap::new()).expect("valid keymap");
         let mut processor = new_processor(keymap);
 
-        assert!(processor.process_chunk(&[0x01, b'w']).is_empty());
+        assert_eq!(
+            processor.process_chunk(&[0x01, b'w']),
+            [] as [bmux_keybind::RuntimeAction; 0]
+        );
         thread::sleep(Duration::from_millis(70));
-        assert!(processor.process_chunk(&[]).is_empty());
+        assert_eq!(
+            processor.process_chunk(&[]),
+            [] as [bmux_keybind::RuntimeAction; 0]
+        );
         assert_eq!(processor.process_chunk(b"o"), vec![focus_action("next")]);
     }
 
@@ -1676,7 +1688,10 @@ mod tests {
             Keymap::from_parts("ctrl+a", None, &runtime, &BTreeMap::new()).expect("valid keymap");
         let mut processor = new_processor(keymap);
 
-        assert!(processor.process_chunk(&[0x01, b'w']).is_empty());
+        assert_eq!(
+            processor.process_chunk(&[0x01, b'w']),
+            [] as [bmux_keybind::RuntimeAction; 0]
+        );
         assert_eq!(
             processor.process_chunk(b"x"),
             vec![

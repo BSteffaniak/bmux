@@ -1242,7 +1242,7 @@ mod tests {
             let rows = super::word_rows_with_mode(segments, TextWrapGeometry::uniform(3), true);
             let mut count = 0;
             for row in rows.take(limit) {
-                assert!(row.spans.is_empty());
+                assert_eq!(row.spans, [] as [crate::text::Span; 0]);
                 count += 1;
             }
             assert_eq!(count, limit);
@@ -1633,7 +1633,7 @@ mod tests {
                         TextWrapGeometry::with_continuation(first_width, continuation_width),
                         wrap,
                     );
-                    assert!(!rows.is_empty());
+                    assert_ne!(rows, [] as [crate::text::Line; 0]);
                     for (index, row) in rows.iter().enumerate() {
                         let width = if index == 0 {
                             first_width

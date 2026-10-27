@@ -1166,7 +1166,7 @@ impl TerminalBackend for RemoteTerminalBackend {
             {
                 return Ok(());
             }
-            response_rx.await.ok().map_or(Ok(()), |result| result)
+            response_rx.await.unwrap_or(Ok(()))
         })
     }
 }

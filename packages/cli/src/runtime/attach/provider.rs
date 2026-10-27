@@ -560,14 +560,17 @@ mod tests {
             "rendered provider output did not contain expected bytes"
         );
         let state = state.lock().unwrap();
-        assert!(!state.viewports.is_empty());
+        assert_ne!(
+            state.viewports,
+            [] as [bmux_client::AttachProviderViewport; 0]
+        );
         assert!(
             state
                 .viewports
                 .iter()
                 .all(|viewport| viewport.columns == 80)
         );
-        assert!(!state.inputs.is_empty());
+        assert_ne!(state.inputs, [] as [bmux_client::AttachProviderInput; 0]);
         assert!(state.inputs.iter().all(|input| input.generation == 1));
         assert_eq!(
             state.inputs.last().map(|input| &input.payload),

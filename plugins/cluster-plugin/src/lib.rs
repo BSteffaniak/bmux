@@ -2976,7 +2976,7 @@ mod tests {
         .expect("arguments should parse");
 
         assert_eq!(parsed.cluster, "prod");
-        assert!(parsed.hosts.is_empty());
+        assert_eq!(parsed.hosts, [] as [std::string::String; 0]);
         assert_eq!(parsed.on_failure, RetryFailurePolicy::Prompt);
         assert_eq!(parsed.retries, 2);
     }

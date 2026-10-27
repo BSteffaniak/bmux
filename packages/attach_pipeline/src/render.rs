@@ -7306,7 +7306,7 @@ mod tests {
         );
 
         assert!(damage.extension_surface_damaged(surface_id, Uuid::nil()));
-        assert!(damage.extension_surface_rects(surface_id).is_empty());
+        assert_eq!(damage.extension_surface_rects(surface_id), []);
     }
 
     #[test]
@@ -7446,7 +7446,7 @@ mod tests {
             )
             .expect("empty damage overlay should queue")
         );
-        assert!(bytes.is_empty());
+        assert_eq!(bytes, [] as [u8; 0]);
     }
 
     #[test]
@@ -8021,7 +8021,7 @@ mod tests {
             )
             .expect("unchanged cached kitty graphic should not queue")
         );
-        assert!(second.is_empty());
+        assert_eq!(second, [] as [u8; 0]);
 
         let moved_items = [RenderLayerItem::Graphic(test_graphic_overlay(4))];
         let mut third = Vec::new();
@@ -9417,7 +9417,7 @@ mod tests {
         let toggled = append_pane_output(&mut buffer, b"\x1b[?1049h");
         assert!(toggled);
         assert!(buffer.protocol_tracker.alternate_screen());
-        assert!(buffer.prev_rows.is_empty());
+        assert_eq!(buffer.prev_rows, [] as [std::string::String; 0]);
     }
 
     #[test]

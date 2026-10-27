@@ -161,7 +161,10 @@ fn deltas_preserve_stack_only_changes_and_pending_payloads() {
         let delta = producer
             .process_delta(chunk)
             .expect("replicated state changed");
-        assert!(delta.row_updates.is_empty());
+        assert_eq!(
+            delta.row_updates,
+            [] as [crate::delta::RowUpdateSnapshot; 0]
+        );
         assert_eq!(delta.content_revision, content_revision);
         let wire = serde_json::to_vec(&delta).unwrap();
         let decoded = serde_json::from_slice(&wire).unwrap();

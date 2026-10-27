@@ -377,7 +377,10 @@ mod tests {
         } else {
             panic!("expected reachable row record");
         }
-        assert!(interface_contract(&schema, &schema.interfaces[0], &ImportMap::new()).is_empty());
+        assert_eq!(
+            interface_contract(&schema, &schema.interfaces[0], &ImportMap::new()),
+            [] as [u8; 0]
+        );
     }
 
     #[test]
@@ -427,7 +430,10 @@ mod tests {
             interface_contract(&schema, &schema.interfaces[0], &imports)
         );
         imports.get_mut("data").unwrap().schema = crate::compile("plugin example.data version 2; import nested = example.nested; interface types { record value { n: nested.number } }").unwrap();
-        assert!(interface_contract(&schema, &schema.interfaces[0], &imports).is_empty());
+        assert_eq!(
+            interface_contract(&schema, &schema.interfaces[0], &imports),
+            [] as [u8; 0]
+        );
         imports.insert(
             "nested".into(),
             crate::codegen_rust::ImportInfo {
@@ -448,7 +454,10 @@ mod tests {
             transitive,
             interface_contract(&schema, &schema.interfaces[0], &imports)
         );
-        assert!(interface_contract(&schema, &schema.interfaces[0], &ImportMap::new()).is_empty());
+        assert_eq!(
+            interface_contract(&schema, &schema.interfaces[0], &ImportMap::new()),
+            [] as [u8; 0]
+        );
     }
 
     #[test]

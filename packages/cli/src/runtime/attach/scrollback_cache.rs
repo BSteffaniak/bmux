@@ -334,7 +334,10 @@ mod tests {
             let shifted = cache.get(pane, None, 11, 80, 38).unwrap();
             assert_eq!(shifted.images[0].position_row, 1);
             assert_eq!(shifted.images[0].raw_data, source.images[0].raw_data);
-            assert!(cache.get(pane, None, 10, 80, 20).unwrap().images.is_empty());
+            assert_eq!(
+                cache.get(pane, None, 10, 80, 20).unwrap().images,
+                [] as [bmux_attach_image_protocol::AttachPaneImage; 0]
+            );
             // Projection never mutates the retained source on direction reversal.
             assert_eq!(
                 cache.get(pane, None, 10, 80, 40).unwrap().images,

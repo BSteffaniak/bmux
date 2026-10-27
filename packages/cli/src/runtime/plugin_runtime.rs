@@ -673,7 +673,7 @@ pub(super) fn resolve_plugin_search_paths(
 /// / command is unknown — the conservative choice matches the default
 /// behavior of filtering mutating commands out of repeat.
 pub(super) fn command_accepts_repeat(plugin_id: &str, command_name: &str) -> bool {
-    runtime_command_state().ok().is_some_and(|state| {
+    runtime_command_state().is_ok_and(|state| {
         state
             .registry
             .command_accepts_repeat(plugin_id, command_name)
@@ -2556,7 +2556,10 @@ mod tests {
             assert_eq!(state.paths.runtime_dir, paths.runtime_dir);
             assert_eq!(state.paths.data_dir, paths.data_dir);
             assert_eq!(state.paths.state_dir, paths.state_dir);
-            assert!(state.config.plugins.search_paths.is_empty());
+            assert_eq!(
+                state.config.plugins.search_paths,
+                [] as [std::path::PathBuf; 0]
+            );
             let callback_paths = paths;
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -3139,7 +3142,7 @@ enabled_by_default = false
             } => {
                 assert_eq!(plugin_id, "bmux.plugin_cli");
                 assert_eq!(command_name, "list");
-                assert!(arguments.is_empty());
+                assert_eq!(arguments, [] as [std::string::String; 0]);
             }
             other => panic!("expected plugin runtime parse, got {other:?}"),
         }

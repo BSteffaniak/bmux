@@ -664,7 +664,10 @@ mod tests {
     #[test]
     fn default_snapshot_is_empty() {
         let snap = PaneRuntimeSnapshotV1::default();
-        assert!(snap.sessions.is_empty());
+        assert_eq!(
+            snap.sessions,
+            [] as [crate::snapshot::PaneRuntimeSessionSnapshotV1; 0]
+        );
     }
 
     #[test]

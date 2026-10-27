@@ -353,7 +353,7 @@ mod upstream {
         match &dispatcher.dispatched[0] {
             Sequence::Csi(params, intermediates, ignore, _) => {
                 assert_eq!(params, &[vec![38, 2, 255, 0, 255], vec![1]]);
-                assert!(intermediates.is_empty());
+                assert_eq!(intermediates.as_slice(), [] as [u8; 0]);
                 assert!(!ignore);
             }
             _ => panic!("expected csi sequence"),
@@ -484,7 +484,7 @@ mod upstream {
         assert_eq!(dispatcher.dispatched.len(), 1);
         match &dispatcher.dispatched[0] {
             Sequence::Csi(params, intermediates, ignore, c) => {
-                assert!(intermediates.is_empty());
+                assert_eq!(intermediates.as_slice(), [] as [u8; 0]);
                 assert_eq!(params, &[[0; 32]]);
                 assert_eq!(c, &'x');
                 assert!(ignore);

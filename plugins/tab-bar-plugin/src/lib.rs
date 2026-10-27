@@ -2852,7 +2852,7 @@ mod tests {
             assert!(cancel_rename(&mut companion));
             assert!(companion.editing_tab_id.is_none());
             assert!(companion.editing_workspace_id.is_none());
-            assert!(companion.edit_buffer.text().is_empty());
+            assert_eq!(companion.edit_buffer.text(), "");
             assert!(companion.edit_buffer.selection().is_none());
             assert!(companion.last_left_click.is_none());
             assert!(companion.last_workspace_click.is_none());
@@ -3052,11 +3052,11 @@ mod tests {
             .unwrap()
             .local_presentation
             .double_click_ms = 500;
-        assert!(
+        assert_eq!(
             handle_local_input(state(), &event)
                 .unwrap()
-                .capture_keyboard
-                .is_empty()
+                .capture_keyboard,
+            [] as [std::string::String; 0]
         );
         assert_eq!(
             handle_local_input(state(), &event)
@@ -3669,9 +3669,9 @@ bar_bg = "#112233"
             .as_ref()
             .expect("real tab-label producer metadata");
         assert!(metadata.selection.as_ref().unwrap().validate().is_ok());
-        assert!(!metadata.selection.as_ref().unwrap().fragments().is_empty());
+        assert_ne!(metadata.selection.as_ref().unwrap().fragments(), []);
         assert!(metadata.text.values().any(|text| text.contains("w2")));
-        assert!(!metadata.semantics.as_ref().unwrap().regions().is_empty());
+        assert_ne!(metadata.semantics.as_ref().unwrap().regions(), []);
         // Registry admission checks fragment containment/source bounds, not just
         // the selection scene's hierarchy. Exercise the actual producer output.
         let registry = bmux_plugin::surface::PluginSurfaceRegistry::new(2);

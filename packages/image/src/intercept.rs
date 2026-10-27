@@ -446,7 +446,7 @@ mod tests {
     #[cfg(feature = "sixel")]
     #[test]
     fn oversized_dcs_header_is_bounded_and_recovers() {
-        for final_byte in [b'q', b'p'] {
+        for final_byte in *b"qp" {
             let mut wire = b"before\x1bP12345".to_vec();
             wire.push(final_byte);
             wire.extend_from_slice(b"payload\x1b\\after\x1bPq~\x1b\\");

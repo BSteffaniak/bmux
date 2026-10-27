@@ -389,9 +389,12 @@ mod lua_backend {
         pub fn new(access: ScriptHostAccess) -> Self {
             // Build the sandboxed standard library: disable `io`,
             // `os`, `package`, `debug`, `ffi`. Keep `string`,
-            // `math`, `table`, `utf8`, `coroutine`.
-            let std_libs =
-                StdLib::STRING | StdLib::MATH | StdLib::TABLE | StdLib::UTF8 | StdLib::COROUTINE;
+            // `math`, `table`, and the backend's supported Unicode/coroutine
+            // libraries. LuaJIT provides coroutine support in its base library
+            // and has no standard utf8 library.
+            let std_libs = StdLib::STRING | StdLib::MATH | StdLib::TABLE;
+            #[cfg(not(feature = "scripting-luajit"))]
+            let std_libs = std_libs | StdLib::UTF8 | StdLib::COROUTINE;
             let lua = Lua::new_with(std_libs, LuaOptions::new())
                 .expect("constructing sandboxed mlua Lua state must succeed");
             // Remove the standard `print` function; scripts can log

@@ -634,7 +634,10 @@ mod tests {
             ResolvedPointerShape::Shape(PointerShape::Default)
         );
         scene_input.surfaces[0].visible = false;
-        assert!(retained_surfaces_from_attach_scene(&scene_input).is_empty());
+        assert_eq!(
+            retained_surfaces_from_attach_scene(&scene_input),
+            [] as [crate::compositor::RetainedSurface; 0]
+        );
     }
 
     #[test]

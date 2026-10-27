@@ -271,10 +271,12 @@ impl ConsensusNode {
         &self,
         node_id: NodeId,
         endpoint: impl Into<String>,
-    ) -> Result<(), RaftError<NodeId, openraft::error::InitializeError<NodeId, BasicNode>>> {
+    ) -> Result<(), Box<RaftError<NodeId, openraft::error::InitializeError<NodeId, BasicNode>>>>
+    {
         self.raft
             .initialize(BTreeMap::from([(node_id, BasicNode::new(endpoint.into()))]))
             .await
+            .map_err(Box::new)
     }
 
     /// Executes learner-first catch-up followed by `OpenRaft`'s joint and uniform
@@ -957,12 +959,16 @@ pub(crate) mod tests {
     impl RaftNetworkFactory<ControlRaftConfig> for InMemoryNetworkFactory {
         type Network = InMemoryNetwork;
 
-        async fn new_client(&mut self, target: NodeId, node: &BasicNode) -> Self::Network {
-            InMemoryNetwork {
+        fn new_client(
+            &mut self,
+            target: NodeId,
+            node: &BasicNode,
+        ) -> impl std::future::Future<Output = Self::Network> {
+            std::future::ready(InMemoryNetwork {
                 target,
                 expected: node.clone(),
                 nodes: self.nodes.clone(),
-            }
+            })
         }
     }
 
@@ -1753,7 +1759,10 @@ pub(crate) mod tests {
         .expect("publication failure should be bounded")
         .expect_err("minority must reject membership publication");
         assert!(failed.contains("QuorumUnavailable"));
-        assert!(nodes[0].read_stale_view().unwrap().members.is_empty());
+        assert_eq!(
+            nodes[0].read_stale_view().unwrap().members,
+            [] as [bmux_cluster_plugin_api::cluster_types::ClusterMember; 0]
+        );
 
         for index in 1..3 {
             network.register(

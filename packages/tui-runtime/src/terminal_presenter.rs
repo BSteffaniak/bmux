@@ -109,8 +109,8 @@ where
     fn set_pointer_context(&mut self, context: bmux_tui::terminal::PointerContext) {
         self.terminal.set_pointer_context(context);
     }
-    async fn restore(&mut self) -> io::Result<()> {
-        self.terminal.restore_pointer()
+    fn restore(&mut self) -> impl std::future::Future<Output = io::Result<()>> {
+        futures_util::future::lazy(move |_| self.terminal.restore_pointer())
     }
 
     fn resize(&mut self, size: Size) {
@@ -145,8 +145,8 @@ where
     fn set_pointer_context(&mut self, context: bmux_tui::terminal::PointerContext) {
         self.terminal.set_pointer_context(context);
     }
-    async fn restore(&mut self) -> io::Result<()> {
-        self.terminal.restore_pointer()
+    fn restore(&mut self) -> impl std::future::Future<Output = io::Result<()>> {
+        futures_util::future::lazy(move |_| self.terminal.restore_pointer())
     }
 
     fn resize(&mut self, size: Size) {
@@ -514,7 +514,7 @@ mod tests {
         assert!(presenter.start_present(&mut ()).unwrap().is_none());
         wait_started(&started).await;
         assert_eq!(commits.load(Ordering::SeqCst), 0);
-        assert!(presenter.terminal().hits().regions().is_empty());
+        assert_eq!(presenter.terminal().hits().regions(), []);
         presenter.observe_terminal_event(&Event::Mouse(MouseEvent::new(
             MouseEventKind::Move,
             Point::new(3, 0),

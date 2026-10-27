@@ -668,8 +668,14 @@ mod diff_tests {
             .find(|line| line.kind == DiffLineKind::Added)
             .expect("added line");
 
-        assert!(!removed.changed_ranges.is_empty());
-        assert!(!added.changed_ranges.is_empty());
+        assert_ne!(
+            removed.changed_ranges,
+            [] as [crate::diff_viewer::ChangedRange; 0]
+        );
+        assert_ne!(
+            added.changed_ranges,
+            [] as [crate::diff_viewer::ChangedRange; 0]
+        );
     }
 
     #[test]
@@ -2450,7 +2456,7 @@ mod tests {
             .map(line_width)
             .collect::<Vec<_>>();
 
-        assert!(!card_widths.is_empty());
+        assert_ne!(card_widths, [] as [usize; 0]);
         let first_width = card_widths[0];
         for width in card_widths {
             assert_eq!(width, first_width);
@@ -2537,7 +2543,10 @@ mod tests {
                     width,
                     DiffViewerStyle::default(),
                 );
-                assert!(projection.source_lines.is_empty());
+                assert_eq!(
+                    projection.source_lines,
+                    [] as [crate::diff_viewer::DiffSourceLine; 0]
+                );
                 assert!(projection.rows.last().unwrap().width() <= usize::from(width));
                 assert!(!projection.rows.iter().any(is_card_row));
             }
@@ -2571,7 +2580,7 @@ mod tests {
                 &mut PaintCx::new(&mut frame),
             );
             let fragments = frame.selection().fragments();
-            assert!(!fragments.is_empty());
+            assert_ne!(fragments, []);
             for fragment in fragments {
                 let painted = rows[usize::from(fragment.area.y)].viewport(
                     usize::from(fragment.area.x),
@@ -2683,7 +2692,7 @@ mod tests {
         );
 
         assert_eq!(outcome, ComponentSelectionOutcome::ScopeRegistered);
-        assert!(frame.selection().fragments().is_empty());
+        assert_eq!(frame.selection().fragments(), []);
     }
 
     fn line_width(line: &Line) -> usize {

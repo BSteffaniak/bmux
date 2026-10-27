@@ -668,7 +668,7 @@ fn stop_owned(root: &Path) -> Result<()> {
     if !status.success() {
         let runtime = paths(root).runtime_dir;
         let has_endpoint = std::fs::read_dir(&runtime)?.any(|entry| {
-            entry.ok().is_some_and(|entry| {
+            entry.is_ok_and(|entry| {
                 let name = entry.file_name();
                 let name = name.to_string_lossy();
                 name.ends_with(".sock") || name.contains("server.pid")

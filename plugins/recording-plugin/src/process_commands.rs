@@ -987,50 +987,55 @@ mod tests {
         operations: Vec<String>,
     }
     impl bmux_plugin_sdk::TypedDispatchClient for RunRetryClient {
-        async fn invoke_service_raw(
+        fn invoke_service_raw(
             &mut self,
             _capability: &str,
             _kind: bmux_ipc::InvokeServiceKind,
             _interface: &str,
             operation: &str,
             payload: Vec<u8>,
-        ) -> bmux_plugin_sdk::TypedDispatchClientResult<Vec<u8>> {
-            let run_id = match operation {
-                "wait" => {
-                    bmux_plugin_sdk::decode_service_message::<process::client::WaitRequest>(
-                        &payload,
+        ) -> impl std::future::Future<Output = bmux_plugin_sdk::TypedDispatchClientResult<Vec<u8>>>
+        {
+            let mut payload = Some(payload);
+            std::future::poll_fn(move |_| {
+                let payload = payload.take().expect("transport polled after completion");
+                std::task::Poll::Ready({
+                    let run_id = match operation {
+                        "wait" => {
+                            bmux_plugin_sdk::decode_service_message::<process::client::WaitRequest>(
+                                &payload,
+                            )
+                            .unwrap()
+                            .run_id
+                        }
+                        "finish" => bmux_plugin_sdk::decode_service_message::<
+                            process::client::FinishRequest,
+                        >(&payload)
+                        .unwrap()
+                        .run_id,
+                        _ => panic!("retry must not launch: {operation}"),
+                    };
+                    assert_eq!(run_id, self.status.run_id);
+                    self.operations.push(operation.into());
+                    match operation {
+                        "wait" => {
+                            self.status.phase = process::RunPhase::Exited;
+                            self.status.output_drained = true;
+                        }
+                        "finish" => {
+                            self.status.phase = process::RunPhase::Finalized;
+                            self.status.capture_finalized = true;
+                        }
+                        _ => panic!("retry must not launch: {operation}"),
+                    }
+                    Ok(
+                        bmux_plugin_sdk::encode_service_message(&Ok::<_, process::ProcessError>(
+                            self.status.clone(),
+                        ))
+                        .unwrap(),
                     )
-                    .unwrap()
-                    .run_id
-                }
-                "finish" => {
-                    bmux_plugin_sdk::decode_service_message::<process::client::FinishRequest>(
-                        &payload,
-                    )
-                    .unwrap()
-                    .run_id
-                }
-                _ => panic!("retry must not launch: {operation}"),
-            };
-            assert_eq!(run_id, self.status.run_id);
-            self.operations.push(operation.into());
-            match operation {
-                "wait" => {
-                    self.status.phase = process::RunPhase::Exited;
-                    self.status.output_drained = true;
-                }
-                "finish" => {
-                    self.status.phase = process::RunPhase::Finalized;
-                    self.status.capture_finalized = true;
-                }
-                _ => panic!("retry must not launch: {operation}"),
-            }
-            Ok(
-                bmux_plugin_sdk::encode_service_message(&Ok::<_, process::ProcessError>(
-                    self.status.clone(),
-                ))
-                .unwrap(),
-            )
+                })
+            })
         }
     }
 

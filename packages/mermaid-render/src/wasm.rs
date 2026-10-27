@@ -440,7 +440,7 @@ struct AsyncAdmission;
 impl AsyncAdmission {
     fn acquire() -> Result<Self, MermaidRenderError> {
         ASYNC_JOBS
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |active| {
                 (active < MAX_ASYNC_JOBS).then_some(active + 1)
             })
             .map_err(|_| unavailable("Mermaid WASM async job capacity exhausted"))?;

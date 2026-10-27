@@ -224,7 +224,7 @@ mod tests {
             .with_region(HitRegion::new("return", Rect::new(0, 0, 1, 1)).focusable(true))
             .with_region(HitRegion::new("first", Rect::new(1, 0, 1, 1)).focusable(true));
         let (saved, restored) = super::modal_transition(&saved, &modal, &reordered, &[]);
-        assert!(saved.is_empty());
+        assert_eq!(saved, [] as [crate::focus::ModalFocus; 0]);
         assert_eq!(restored.active(), Some(&FocusId::new("return")));
     }
 

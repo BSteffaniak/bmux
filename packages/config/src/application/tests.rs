@@ -54,7 +54,10 @@ fn sparse_families_apply_defaults_once_and_preserve_explicit_values() {
     assert_eq!(result.application["enabled"].as_bool(), Some(false));
     assert_eq!(result.application["count"].as_integer(), Some(0));
     assert_eq!(result.application["label"].as_str(), Some(""));
-    assert!(result.application["list"].as_array().unwrap().is_empty());
+    assert_eq!(
+        result.application["list"].as_array().unwrap().as_slice(),
+        []
+    );
     assert!(result.bmux_raw.get("bterm").is_none());
     assert!(result.bmux_raw.get("appearance").is_none());
     let snapshot = toml::to_string(&result.bmux_raw).unwrap();
@@ -99,7 +102,10 @@ fn bmux_profile_effects_win_without_overwriting_other_application_values() {
     );
     assert_eq!(result.bmux.general.scrollback_limit, 2222);
     assert_eq!(result.application["keep"].as_bool(), Some(true));
-    assert!(result.application["values"].as_array().unwrap().is_empty());
+    assert_eq!(
+        result.application["values"].as_array().unwrap().as_slice(),
+        []
+    );
     assert_eq!(
         result
             .application_family
@@ -315,7 +321,10 @@ fn multiple_sources_deep_merge_and_replace_arrays_without_defaults() {
     );
     let result =
         resolve_application_configuration(&app, &ConfigFamily::default(), None, None).unwrap();
-    assert!(result.application["items"].as_array().unwrap().is_empty());
+    assert_eq!(
+        result.application["items"].as_array().unwrap().as_slice(),
+        []
+    );
     assert_eq!(result.application["nested"]["keep"].as_bool(), Some(true));
     assert_eq!(
         result.application["nested"]["replaced"].as_bool(),

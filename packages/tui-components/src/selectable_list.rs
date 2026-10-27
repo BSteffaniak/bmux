@@ -1980,9 +1980,9 @@ mod tests {
         let reordered = [items[1].clone(), items[0].clone()];
         let next = SelectableList::new(&reordered);
         let state = SelectableListState::new(None);
-        assert!(
-            next.visible_semantic_regions_with_layout(&layout, area, &state)
-                .is_empty()
+        assert_eq!(
+            next.visible_semantic_regions_with_layout(&layout, area, &state),
+            [] as [crate::hit_test::HitRegion<&str>; 0]
         );
         let mut buffer = Buffer::empty(area);
         let mut frame = Frame::new(&mut buffer);

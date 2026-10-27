@@ -1046,8 +1046,8 @@ mod tests {
             let mut buffer = Buffer::empty(Rect::new(0, 0, 10, 1));
             let mut frame = Frame::new(&mut buffer);
             checkbox.paint(&layout, &mut PaintCx::new(&mut frame));
-            assert!(frame.hits().regions().is_empty());
-            assert!(frame.semantics().regions().is_empty());
+            assert_eq!(frame.hits().regions(), []);
+            assert_eq!(frame.semantics().regions(), []);
             assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("          "));
             assert!(
                 !checkbox

@@ -445,12 +445,12 @@ mod tests {
             badge.paint(&layout, &mut PaintCx::new(&mut frame));
             assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("        "));
             assert_eq!(frame.buffer().row_symbols(1).as_deref(), Some("        "));
-            assert!(frame.semantics().regions().is_empty());
-            assert!(
+            assert_eq!(frame.semantics().regions(), []);
+            assert_eq!(
                 frame
                     .damage(bmux_tui::damage::DamagePolicy::default())
-                    .retained_regions()
-                    .is_empty()
+                    .retained_regions(),
+                []
             );
         }
     }

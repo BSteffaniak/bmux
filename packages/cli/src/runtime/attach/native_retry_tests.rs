@@ -236,8 +236,8 @@ fn committed_fixture(view: &mut AttachViewState, layout: &AttachLayoutState) {
             .hit_test(Point::new(1, 0))
             .is_some()
     );
-    assert!(!view.presentation.selection().fragments().is_empty());
-    assert!(!view.presentation.semantics().regions().is_empty());
+    assert_ne!(view.presentation.selection().fragments(), []);
+    assert_ne!(view.presentation.semantics().regions(), []);
 }
 
 fn assert_attempts(

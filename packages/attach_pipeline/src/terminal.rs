@@ -469,7 +469,7 @@ mod tests {
             .present_pointer_shape(PointerShapeCapability::Unsupported, PointerShape::Text)
             .unwrap();
         terminal.restore().unwrap();
-        assert!(terminal.writer.is_empty());
+        assert_eq!(terminal.writer, [] as [u8; 0]);
         terminal
             .present_pointer_shape(PointerShapeCapability::Set, PointerShape::Text)
             .unwrap();
@@ -699,7 +699,7 @@ mod tests {
             .present_pointer_shape(PointerShapeCapability::Unsupported, PointerShape::Text)
             .unwrap();
         terminal.restore().unwrap();
-        assert!(terminal.writer.is_empty());
+        assert_eq!(terminal.writer, [] as [u8; 0]);
         terminal
             .present_pointer_shape(PointerShapeCapability::Set, PointerShape::Text)
             .unwrap();
@@ -719,7 +719,7 @@ mod tests {
         assert_eq!(bytes, b"\x1b[?2004h\x1b[?2004l");
         bytes.clear();
         queue_restore(&mut bytes, TerminalOptions::default()).unwrap();
-        assert!(bytes.is_empty());
+        assert_eq!(bytes, [] as [u8; 0]);
     }
 
     #[test]

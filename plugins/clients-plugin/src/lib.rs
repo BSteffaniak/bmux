@@ -1177,7 +1177,7 @@ impl ClientsStateService for ClientsStateHandle {
                     "current-client",
                     &(),
                 )
-                .map_or(Err(ClientQueryError::NoCurrentClient), |result| result)
+                .unwrap_or(Err(ClientQueryError::NoCurrentClient))
         })
     }
 }

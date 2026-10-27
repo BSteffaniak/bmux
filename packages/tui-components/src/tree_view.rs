@@ -938,7 +938,7 @@ mod tests {
             let mut buffer = Buffer::empty(area);
             let mut frame = Frame::new(&mut buffer);
             render_component(&component, area, &mut frame);
-            assert!(frame.hits().regions().is_empty());
+            assert_eq!(frame.hits().regions(), []);
             assert!(
                 frame
                     .semantics()
@@ -1115,7 +1115,7 @@ mod tests {
                 .tree
                 .row_line(&items[0], &state.borrow(), 0, width);
             assert_eq!(line.width(), usize::from(width));
-            assert!(line.spans.last().unwrap().content.is_empty());
+            assert_eq!(line.spans.last().unwrap().content, "");
         }
     }
 
@@ -1792,7 +1792,7 @@ mod tests {
             &mut frame,
         );
 
-        assert!(frame.hits().regions().is_empty());
+        assert_eq!(frame.hits().regions(), []);
     }
 
     #[test]

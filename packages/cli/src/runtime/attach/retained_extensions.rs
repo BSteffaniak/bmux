@@ -384,11 +384,11 @@ mod tests {
         let scene = snapshot(Representation::EmptyScene)
             .render_layer_scene_with_context(id, &rect, layer, &context)
             .expect("empty scene is a supported representation");
-        assert!(scene.items.is_empty());
+        assert_eq!(scene.items, [] as [bmux_plugin::RenderSceneItem; 0]);
         let ops = snapshot(Representation::EmptyOps)
             .render_layer_ops_with_context(id, &rect, &RenderDamage::FullSurface, layer, &context)
             .expect("empty operations are a supported no-op");
-        assert!(ops.is_empty());
+        assert_eq!(ops, [] as [bmux_plugin::RenderOp; 0]);
     }
 
     #[test]

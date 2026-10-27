@@ -1140,7 +1140,10 @@ mod tests {
         );
         native_focus.reconcile(&graph);
         assert!(native_focus.focused().is_none());
-        assert!(projected_interactions(&graph, area).unwrap().is_empty());
+        assert_eq!(
+            projected_interactions(&graph, area).unwrap(),
+            [] as [bmux_tui::hit::HitRegion; 0]
+        );
     }
 
     #[test]

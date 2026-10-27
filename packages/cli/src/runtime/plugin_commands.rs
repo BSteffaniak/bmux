@@ -711,7 +711,10 @@ minimum = "1.0"
             .expect("parse second leaf");
         let (_, leaf) = selected_subcommand_path(&matches);
 
-        assert!(PluginCommandRegistry::normalize_arguments_from_matches(&command, leaf).is_empty());
+        assert_eq!(
+            PluginCommandRegistry::normalize_arguments_from_matches(&command, leaf),
+            [] as [std::string::String; 0]
+        );
     }
 
     #[test]

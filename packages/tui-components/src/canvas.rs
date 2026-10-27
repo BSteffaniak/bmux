@@ -491,8 +491,8 @@ impl<'a> CanvasRaster<'a> {
             f64::from(y) / f64::from(self.dot_height.saturating_sub(1))
         };
         (
-            self.bounds.x_min + x_ratio * (self.bounds.x_max - self.bounds.x_min),
-            self.bounds.y_max - y_ratio * (self.bounds.y_max - self.bounds.y_min),
+            x_ratio.mul_add(self.bounds.x_max - self.bounds.x_min, self.bounds.x_min),
+            y_ratio.mul_add(-(self.bounds.y_max - self.bounds.y_min), self.bounds.y_max),
         )
     }
 

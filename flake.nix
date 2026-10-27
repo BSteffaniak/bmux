@@ -127,7 +127,7 @@
               hcloud
               liveOpenTofu
             ]
-            ++ pkgs.lib.optionals pkgs.stdenv.isLinux (
+            ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux (
               with pkgs;
               [
                 libxkbcommon
@@ -142,7 +142,7 @@
             );
 
           # Native dependencies remain development-shell inputs, never server crates.
-          LD_LIBRARY_PATH = pkgs.lib.optionalString pkgs.stdenv.isLinux (
+          LD_LIBRARY_PATH = pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isLinux (
             pkgs.lib.makeLibraryPath (
               with pkgs;
               [

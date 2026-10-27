@@ -252,7 +252,10 @@ mod tests {
             .unwrap()
             .join("preferences.json");
         assert!(!destination.exists());
-        assert!(hosts(&state, "isolated").unwrap().is_empty());
+        assert_eq!(
+            hosts(&state, "isolated").unwrap(),
+            [] as [crate::remote_preferences::HostAlias; 0]
+        );
         let records = PairingStore::legacy_records(&state, c"remote.json").unwrap();
         std::fs::write(state.join(&records[0].0).join("remote.json"), b"{invalid").unwrap();
         assert!(hosts(&state, "default").is_err());
@@ -264,12 +267,18 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let state = root.path().join("state");
         remember_host(&state, "work", "host", "device://secret-target").unwrap();
-        assert!(hosts(&state, "default").unwrap().is_empty());
+        assert_eq!(
+            hosts(&state, "default").unwrap(),
+            [] as [crate::remote_preferences::HostAlias; 0]
+        );
         assert!(!format!("{:?}", hosts(&state, "work").unwrap()).contains("secret-target"));
         rename_host(&state, "work", "host", "renamed").unwrap();
         assert_eq!(hosts(&state, "work").unwrap()[0].name, "renamed");
         assert!(forget_host(&state, "work", "renamed").unwrap());
-        assert!(hosts(&state, "work").unwrap().is_empty());
+        assert_eq!(
+            hosts(&state, "work").unwrap(),
+            [] as [crate::remote_preferences::HostAlias; 0]
+        );
         let path = crate::storage::client_directory(&state, "work")
             .unwrap()
             .join("preferences.json");

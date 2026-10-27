@@ -302,29 +302,36 @@ mod tests {
 
     struct CaptureLimitClient;
     impl bmux_plugin_sdk::TypedDispatchClient for CaptureLimitClient {
-        async fn invoke_service_raw(
+        fn invoke_service_raw(
             &mut self,
             _capability: &str,
             _kind: bmux_ipc::InvokeServiceKind,
             interface: &str,
             operation: &str,
             payload: Vec<u8>,
-        ) -> bmux_plugin_sdk::TypedDispatchClientResult<Vec<u8>> {
-            assert_eq!(interface, pane::INTERFACE_ID.as_str());
-            assert_eq!(operation, "capture-resume");
-            let request: pane::client::CaptureResumeRequest =
-                bmux_plugin_sdk::decode_service_message(&payload).unwrap();
-            assert_eq!(request.max_bytes, 262_144);
-            let result: Result<pane::TerminalCaptureResponse, pane::TerminalRecoveryError> =
-                Ok(pane::TerminalCaptureResponse::Batch {
-                    value: pane::TerminalCaptureBatch {
-                        cursor: request.cursor.clone(),
-                        continuation: request.cursor,
-                        data: vec![],
-                        complete: true,
-                    },
-                });
-            Ok(bmux_plugin_sdk::encode_service_message(&result).unwrap())
+        ) -> impl std::future::Future<Output = bmux_plugin_sdk::TypedDispatchClientResult<Vec<u8>>>
+        {
+            let mut payload = Some(payload);
+            std::future::poll_fn(move |_| {
+                let payload = payload.take().expect("transport polled after completion");
+                std::task::Poll::Ready({
+                    assert_eq!(interface, pane::INTERFACE_ID.as_str());
+                    assert_eq!(operation, "capture-resume");
+                    let request: pane::client::CaptureResumeRequest =
+                        bmux_plugin_sdk::decode_service_message(&payload).unwrap();
+                    assert_eq!(request.max_bytes, 262_144);
+                    let result: Result<pane::TerminalCaptureResponse, pane::TerminalRecoveryError> =
+                        Ok(pane::TerminalCaptureResponse::Batch {
+                            value: pane::TerminalCaptureBatch {
+                                cursor: request.cursor.clone(),
+                                continuation: request.cursor,
+                                data: vec![],
+                                complete: true,
+                            },
+                        });
+                    Ok(bmux_plugin_sdk::encode_service_message(&result).unwrap())
+                })
+            })
         }
     }
     #[test]

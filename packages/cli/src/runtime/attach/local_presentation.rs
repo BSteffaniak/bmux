@@ -109,7 +109,10 @@ mod tests {
         let removed = surfaces
             .owner_snapshot(OWNER)
             .expect("empty replacement snapshot");
-        assert!(removed.surfaces.is_empty());
+        assert_eq!(
+            removed.surfaces,
+            [] as [bmux_plugin::surface::PluginSurface; 0]
+        );
         uninstall(&surfaces);
     }
 

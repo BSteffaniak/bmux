@@ -312,24 +312,29 @@ struct HostBridgeTypedClient {
 }
 
 impl TypedDispatchClient for HostBridgeTypedClient {
-    async fn invoke_service_raw(
+    fn invoke_service_raw(
         &mut self,
         capability: &str,
         kind: InvokeServiceKind,
         interface_id: &str,
         operation: &str,
         payload: Vec<u8>,
-    ) -> TypedDispatchClientResult<Vec<u8>> {
-        invoke_service_raw_bridge(
-            self.bridge.clone(),
-            capability,
-            kind,
-            interface_id,
-            operation,
-            payload,
-        )
-        .map_err(|error| {
-            TypedDispatchClientError::transport(interface_id, operation, error.to_string())
+    ) -> impl std::future::Future<Output = TypedDispatchClientResult<Vec<u8>>> {
+        let mut payload = Some(payload);
+        std::future::poll_fn(move |_| {
+            std::task::Poll::Ready(
+                invoke_service_raw_bridge(
+                    self.bridge.clone(),
+                    capability,
+                    kind,
+                    interface_id,
+                    operation,
+                    payload.take().expect("transport polled after completion"),
+                )
+                .map_err(|error| {
+                    TypedDispatchClientError::transport(interface_id, operation, error.to_string())
+                }),
+            )
         })
     }
 }

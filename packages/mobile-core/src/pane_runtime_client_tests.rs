@@ -10,45 +10,51 @@ struct GridDispatch {
 }
 
 impl TypedDispatchClient for GridDispatch {
-    async fn invoke_service_raw(
+    fn invoke_service_raw(
         &mut self,
         capability: &str,
         kind: bmux_ipc::InvokeServiceKind,
         interface: &str,
         operation: &str,
         payload: Vec<u8>,
-    ) -> TypedDispatchClientResult<Vec<u8>> {
-        self.calls += 1;
-        assert_eq!(capability, "bmux.pane_runtime.pointer_grid.v1");
-        assert_eq!(interface, "pane-runtime-pointer-grid-v1");
-        assert!(matches!(kind, bmux_ipc::InvokeServiceKind::Command));
-        match operation {
-            "snapshots" => {
-                let request: pointer_grid::client::SnapshotsRequest =
-                    bmux_plugin_sdk::decode_service_message(&payload).unwrap();
-                assert_eq!(request.format_version, 1);
-                assert_eq!(request.pane_ids, vec![self.pane_id]);
-                assert_eq!(request.max_rows_per_pane, 2);
-            }
-            "deltas" => {
-                let request: pointer_grid::client::DeltasRequest =
-                    bmux_plugin_sdk::decode_service_message(&payload).unwrap();
-                assert_eq!(request.format_version, 1);
-                assert_eq!(request.pane_ids, vec![self.pane_id]);
-                assert_eq!(request.base_revisions, vec![7]);
-                assert_eq!(request.max_batches_per_pane, 4);
-            }
-            _ => panic!("unexpected legacy fallback: {operation}"),
-        }
-        if self.reject {
-            Err(TypedDispatchClientError::server(
-                interface,
-                operation,
-                "unsupported_representation",
-            ))
-        } else {
-            Ok(self.reply.clone())
-        }
+    ) -> impl std::future::Future<Output = TypedDispatchClientResult<Vec<u8>>> {
+        let mut payload = Some(payload);
+        std::future::poll_fn(move |_| {
+            std::task::Poll::Ready({
+                let payload = payload.take().expect("transport polled after completion");
+                self.calls += 1;
+                assert_eq!(capability, "bmux.pane_runtime.pointer_grid.v1");
+                assert_eq!(interface, "pane-runtime-pointer-grid-v1");
+                assert!(matches!(kind, bmux_ipc::InvokeServiceKind::Command));
+                match operation {
+                    "snapshots" => {
+                        let request: pointer_grid::client::SnapshotsRequest =
+                            bmux_plugin_sdk::decode_service_message(&payload).unwrap();
+                        assert_eq!(request.format_version, 1);
+                        assert_eq!(request.pane_ids, vec![self.pane_id]);
+                        assert_eq!(request.max_rows_per_pane, 2);
+                    }
+                    "deltas" => {
+                        let request: pointer_grid::client::DeltasRequest =
+                            bmux_plugin_sdk::decode_service_message(&payload).unwrap();
+                        assert_eq!(request.format_version, 1);
+                        assert_eq!(request.pane_ids, vec![self.pane_id]);
+                        assert_eq!(request.base_revisions, vec![7]);
+                        assert_eq!(request.max_batches_per_pane, 4);
+                    }
+                    _ => panic!("unexpected legacy fallback: {operation}"),
+                }
+                if self.reject {
+                    Err(TypedDispatchClientError::server(
+                        interface,
+                        operation,
+                        "unsupported_representation",
+                    ))
+                } else {
+                    Ok(self.reply.clone())
+                }
+            })
+        })
     }
 }
 

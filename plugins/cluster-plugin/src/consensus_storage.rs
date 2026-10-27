@@ -353,8 +353,8 @@ impl RaftLogStorage<ControlRaftConfig> for ConsensusLogStore {
         run_storage_blocking(move || store.log_state()).await
     }
 
-    async fn get_log_reader(&mut self) -> Self::LogReader {
-        self.clone()
+    fn get_log_reader(&mut self) -> impl std::future::Future<Output = Self::LogReader> {
+        std::future::ready(self.clone())
     }
 
     async fn save_vote(&mut self, vote: &Vote<NodeId>) -> Result<(), StorageError<NodeId>> {
@@ -735,11 +735,15 @@ impl ConsensusStateMachine {
 impl RaftStateMachine<ControlRaftConfig> for ConsensusStateMachine {
     type SnapshotBuilder = Self;
 
-    async fn applied_state(
+    fn applied_state(
         &mut self,
-    ) -> Result<(Option<LogId<NodeId>>, StoredMembership<NodeId, BasicNode>), StorageError<NodeId>>
-    {
-        Ok((self.last_applied, self.last_membership.clone()))
+    ) -> impl std::future::Future<
+        Output = Result<
+            (Option<LogId<NodeId>>, StoredMembership<NodeId, BasicNode>),
+            StorageError<NodeId>,
+        >,
+    > {
+        std::future::ready(Ok((self.last_applied, self.last_membership.clone())))
     }
 
     async fn apply<I>(&mut self, entries: I) -> Result<Vec<ControlReply>, StorageError<NodeId>>
@@ -774,14 +778,14 @@ impl RaftStateMachine<ControlRaftConfig> for ConsensusStateMachine {
         Ok(replies)
     }
 
-    async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
-        self.clone()
+    fn get_snapshot_builder(&mut self) -> impl std::future::Future<Output = Self::SnapshotBuilder> {
+        std::future::ready(self.clone())
     }
 
-    async fn begin_receiving_snapshot(
+    fn begin_receiving_snapshot(
         &mut self,
-    ) -> Result<Box<Cursor<Vec<u8>>>, StorageError<NodeId>> {
-        Ok(Box::new(Cursor::new(Vec::new())))
+    ) -> impl std::future::Future<Output = Result<Box<Cursor<Vec<u8>>>, StorageError<NodeId>>> {
+        std::future::ready(Ok(Box::new(Cursor::new(Vec::new()))))
     }
 
     async fn install_snapshot(
@@ -1818,14 +1822,22 @@ mod tests {
             TempDir,
         > for SuiteBuilder
     {
-        async fn build(
+        fn build(
             &self,
-        ) -> Result<(TempDir, ConsensusLogStore, ConsensusStateMachine), StorageError<NodeId>>
-        {
-            let root = TempDir::new().map_err(storage_write_error)?;
-            let (store, state_machine) =
-                ConsensusLogStore::open_for_suite(root.path()).map_err(storage_write_error)?;
-            Ok((root, store, state_machine))
+        ) -> impl std::future::Future<
+            Output = Result<
+                (TempDir, ConsensusLogStore, ConsensusStateMachine),
+                StorageError<NodeId>,
+            >,
+        > {
+            std::future::poll_fn(|_| {
+                std::task::Poll::Ready((|| {
+                    let root = TempDir::new().map_err(storage_write_error)?;
+                    let (store, state_machine) = ConsensusLogStore::open_for_suite(root.path())
+                        .map_err(storage_write_error)?;
+                    Ok((root, store, state_machine))
+                })())
+            })
         }
     }
 
@@ -2114,11 +2126,9 @@ mod tests {
                             .unwrap()
                             .is_none()
                     ),
-                    "append" => assert!(
-                        runtime
-                            .block_on(reopened.try_get_log_entries(..))
-                            .unwrap()
-                            .is_empty()
+                    "append" => assert_eq!(
+                        runtime.block_on(reopened.try_get_log_entries(..)).unwrap(),
+                        [] as [openraft::Entry<crate::consensus_storage::ControlRaftConfig>; 0]
                     ),
                     "truncate" => assert_eq!(
                         runtime.block_on(reopened.try_get_log_entries(..)).unwrap(),
@@ -2170,11 +2180,9 @@ mod tests {
                         .unwrap()
                         .is_none()
                 ),
-                "append" => assert!(
-                    runtime
-                        .block_on(reopened.try_get_log_entries(..))
-                        .unwrap()
-                        .is_empty()
+                "append" => assert_eq!(
+                    runtime.block_on(reopened.try_get_log_entries(..)).unwrap(),
+                    [] as [openraft::Entry<crate::consensus_storage::ControlRaftConfig>; 0]
                 ),
                 "truncate" => assert_eq!(
                     runtime.block_on(reopened.try_get_log_entries(..)).unwrap(),
@@ -2764,7 +2772,10 @@ mod tests {
                 .await
                 .unwrap()
         );
-        assert!(log_store.try_get_log_entries(..).await.unwrap().is_empty());
+        assert_eq!(
+            log_store.try_get_log_entries(..).await.unwrap(),
+            [] as [openraft::Entry<crate::consensus_storage::ControlRaftConfig>; 0]
+        );
         assert_eq!(
             log_store.get_log_state().await.unwrap().last_purged_log_id,
             Some(log_id(9, SNAPSHOT_LOG_THRESHOLD - 1))
@@ -2938,7 +2949,10 @@ mod tests {
             .await
             .unwrap();
         log_store.purge(snapshot_log_id).await.unwrap();
-        assert!(log_store.try_get_log_entries(..).await.unwrap().is_empty());
+        assert_eq!(
+            log_store.try_get_log_entries(..).await.unwrap(),
+            [] as [openraft::Entry<crate::consensus_storage::ControlRaftConfig>; 0]
+        );
         let mut restored_machine = store.state_machine().unwrap();
         let current = restored_machine
             .get_current_snapshot()

@@ -1315,7 +1315,7 @@ mod tests {
         let chunks = api
             .poll_terminal_output(&terminal.id.to_string(), 8)
             .expect("terminal poll should work");
-        assert!(!chunks.is_empty());
+        assert_ne!(chunks, [] as [bmux_mobile_core::TerminalChunk; 0]);
         assert!(
             chunks
                 .iter()

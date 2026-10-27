@@ -23,7 +23,9 @@ fn fixture_selector_is_fixed_and_validated() {
         assert!(
             transparent
                 .data
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .any(|pixel| pixel[3] == alpha)
         );
     }
@@ -59,7 +61,14 @@ fn base64_exact_lengths_and_roundtrip_at_chunk_boundaries() {
 fn fixture_has_fixed_dimensions_and_opaque_pixels() {
     let pixels = support::pixels(17, 13);
     assert_eq!(pixels.data.len(), 17 * 13 * 4);
-    assert!(pixels.data.chunks_exact(4).all(|pixel| pixel[3] == 255));
+    assert!(
+        pixels
+            .data
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|pixel| pixel[3] == 255)
+    );
     assert_eq!(support::count_marker(b"abcabc", b"abc"), 2);
 }
 

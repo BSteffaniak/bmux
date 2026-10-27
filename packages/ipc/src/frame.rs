@@ -140,7 +140,7 @@ pub fn try_decode_frame(buffer: &mut Vec<u8>) -> Result<Option<Envelope>, FrameD
     decode_envelope_payload(&payload).map(Some)
 }
 
-fn frame_payload_len(bytes: &[u8]) -> Result<Option<usize>, FrameDecodeError> {
+const fn frame_payload_len(bytes: &[u8]) -> Result<Option<usize>, FrameDecodeError> {
     if bytes.len() < FRAME_LEN_BYTES {
         return Ok(None);
     }

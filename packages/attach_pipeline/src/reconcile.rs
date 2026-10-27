@@ -470,7 +470,10 @@ mod tests {
 
         resize_attach_grids_for_scene_with_size(&mut pane_buffers, &test_scene, 10, 3);
 
-        assert!(pane_buffers[&pane_id].prev_rows.is_empty());
+        assert_eq!(
+            pane_buffers[&pane_id].prev_rows,
+            [] as [std::string::String; 0]
+        );
     }
 
     #[test]

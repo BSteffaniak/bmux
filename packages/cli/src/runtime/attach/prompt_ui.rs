@@ -4493,7 +4493,10 @@ mod tests {
                 filtered_option_indices(&options, "e", mode(matching, false)),
                 vec![0, 1, 2]
             );
-            assert!(filtered_option_indices(&options, "missing", mode(matching, false)).is_empty());
+            assert_eq!(
+                filtered_option_indices(&options, "missing", mode(matching, false)),
+                [] as [usize; 0]
+            );
         }
     }
 
@@ -4592,8 +4595,9 @@ mod tests {
             filtered_option_indices(&options, "project", PromptSearchMatchMode::Prefix),
             vec![0]
         );
-        assert!(
-            filtered_option_indices(&options, "editor", PromptSearchMatchMode::Prefix).is_empty()
+        assert_eq!(
+            filtered_option_indices(&options, "editor", PromptSearchMatchMode::Prefix),
+            [] as [usize; 0]
         );
         assert_eq!(
             filtered_option_indices(&options, "editor", PromptSearchMatchMode::Substring),

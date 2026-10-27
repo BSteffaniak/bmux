@@ -874,7 +874,10 @@ mod tests {
         let viewport = ExtensionRect::new(3, 4, 80, 24);
         let resolved = resolve_plugin_layout(viewport, (1, 1), &[]).unwrap();
 
-        assert!(resolved.allocations.is_empty());
+        assert_eq!(
+            resolved.allocations,
+            [] as [crate::layout::PluginLayoutAllocation; 0]
+        );
         assert_eq!(resolved.remaining, viewport);
     }
 
@@ -1143,14 +1146,20 @@ mod tests {
         .unwrap();
         assert_eq!(resolved_before_remove.allocations.len(), 1);
         assert!(registry.remove_owner("owner"));
-        assert!(registry.requests().is_empty());
+        assert_eq!(
+            registry.requests(),
+            [] as [crate::layout::PluginLayoutRequest; 0]
+        );
         let resolved_after_remove = resolve_plugin_layout(
             ExtensionRect::new(0, 0, 80, 24),
             (1, 1),
             &registry.requests(),
         )
         .unwrap();
-        assert!(resolved_after_remove.allocations.is_empty());
+        assert_eq!(
+            resolved_after_remove.allocations,
+            [] as [crate::layout::PluginLayoutAllocation; 0]
+        );
         assert_eq!(
             resolved_after_remove.remaining,
             ExtensionRect::new(0, 0, 80, 24)
@@ -1219,7 +1228,10 @@ mod tests {
         }
 
         assert_eq!(registry.owner_count(), 0);
-        assert!(registry.requests().is_empty());
+        assert_eq!(
+            registry.requests(),
+            [] as [crate::layout::PluginLayoutRequest; 0]
+        );
         assert!(revisions.has_changed().unwrap());
     }
 

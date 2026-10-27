@@ -284,19 +284,23 @@ mod tests {
     }
 
     impl TypedDispatchClient for RecordingDispatch {
-        async fn invoke_service_raw(
+        fn invoke_service_raw(
             &mut self,
             capability: &str,
             kind: InvokeServiceKind,
             interface_id: &str,
             operation: &str,
             _payload: Vec<u8>,
-        ) -> TypedDispatchClientResult<Vec<u8>> {
-            self.last_capability = Some(capability.to_string());
-            self.last_kind = Some(kind);
-            self.last_interface = Some(interface_id.to_string());
-            self.last_operation = Some(operation.to_string());
-            Ok(self.reply.clone())
+        ) -> impl std::future::Future<Output = TypedDispatchClientResult<Vec<u8>>> {
+            std::future::poll_fn(move |_| {
+                std::task::Poll::Ready({
+                    self.last_capability = Some(capability.to_string());
+                    self.last_kind = Some(kind);
+                    self.last_interface = Some(interface_id.to_string());
+                    self.last_operation = Some(operation.to_string());
+                    Ok(self.reply.clone())
+                })
+            })
         }
     }
 
@@ -345,24 +349,28 @@ mod tests {
             true
         }
 
-        async fn invoke_service_raw(
+        fn invoke_service_raw(
             &mut self,
             _capability: &str,
             _kind: InvokeServiceKind,
             _interface_id: &str,
             _operation: &str,
             payload: Vec<u8>,
-        ) -> TypedDispatchClientResult<Vec<u8>> {
-            let request = crate::service_contract::decode_for(
-                CheckedEndpoint::INTERFACE_ID.as_str(),
-                CheckedEndpoint::SERVICE_CONTRACT,
-                &payload,
-            )
-            .unwrap();
-            let number: u32 = crate::decode_service_message(request).unwrap();
-            Ok(crate::service_contract::encode_response(
-                &crate::encode_service_message(&(number + 1)).unwrap(),
-            ))
+        ) -> impl std::future::Future<Output = TypedDispatchClientResult<Vec<u8>>> {
+            std::future::poll_fn(move |_| {
+                std::task::Poll::Ready({
+                    let request = crate::service_contract::decode_for(
+                        CheckedEndpoint::INTERFACE_ID.as_str(),
+                        CheckedEndpoint::SERVICE_CONTRACT,
+                        &payload,
+                    )
+                    .unwrap();
+                    let number: u32 = crate::decode_service_message(request).unwrap();
+                    Ok(crate::service_contract::encode_response(
+                        &crate::encode_service_message(&(number + 1)).unwrap(),
+                    ))
+                })
+            })
         }
     }
 

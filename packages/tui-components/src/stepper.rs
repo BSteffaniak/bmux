@@ -586,12 +586,12 @@ mod tests {
                 bmux_tui::paint::LocalRect::new(0, 0, 20, 8),
                 |cx| component.paint(&layout, cx),
             );
-            assert!(frame.semantics().regions().is_empty());
-            assert!(
+            assert_eq!(frame.semantics().regions(), []);
+            assert_eq!(
                 frame
                     .damage(bmux_tui::damage::DamagePolicy::default())
-                    .retained_regions()
-                    .is_empty()
+                    .retained_regions(),
+                []
             );
             assert_eq!(
                 frame.buffer().row_symbols(0).as_deref(),

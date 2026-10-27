@@ -1901,12 +1901,10 @@ struct ExportProfiler {
 
 impl ExportProfiler {
     fn new() -> Self {
-        let enabled = std::env::var("BMUX_RECORDING_EXPORT_PROFILE")
-            .ok()
-            .is_some_and(|value| {
-                let normalized = value.trim().to_ascii_lowercase();
-                matches!(normalized.as_str(), "1" | "true" | "yes" | "on")
-            });
+        let enabled = std::env::var("BMUX_RECORDING_EXPORT_PROFILE").is_ok_and(|value| {
+            let normalized = value.trim().to_ascii_lowercase();
+            matches!(normalized.as_str(), "1" | "true" | "yes" | "on")
+        });
         Self {
             enabled,
             started_at: Instant::now(),
@@ -2398,12 +2396,12 @@ impl ResvgFrameRenderer {
                 let first = pixmap
                     .data()
                     .chunks_exact(stride)
-                    .position(|row| row.chunks_exact(4).any(|pixel| pixel[3] != 0))
+                    .position(|row| row.as_chunks::<4>().0.iter().any(|pixel| pixel[3] != 0))
                     .unwrap_or(0);
                 let last = pixmap
                     .data()
                     .chunks_exact(stride)
-                    .rposition(|row| row.chunks_exact(4).any(|pixel| pixel[3] != 0))
+                    .rposition(|row| row.as_chunks::<4>().0.iter().any(|pixel| pixel[3] != 0))
                     .unwrap_or(first);
                 let top = u32::try_from(first)?;
                 let pixels = pixmap.data()[first * stride..(last + 1) * stride].to_vec();
@@ -3903,7 +3901,9 @@ mod tests {
         assert!(
             frames[1]
                 .1
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .any(|pixel| pixel[0] > 80 && u16::from(pixel[0]) > u16::from(pixel[1]) * 2)
         );
     }
@@ -3994,7 +3994,13 @@ mod tests {
         let mut duration_cs = 0_u64;
         while let Some(frame) = decoder.read_next_frame().unwrap() {
             duration_cs += u64::from(frame.delay);
-            for pixel in frame.buffer.chunks_exact(4).filter(|pixel| pixel[3] != 0) {
+            for pixel in frame
+                .buffer
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .filter(|pixel| pixel[3] != 0)
+            {
                 red |= pixel[0] > 80 && u16::from(pixel[0]) > u16::from(pixel[1]) * 2;
                 green |= pixel[1] > 80 && u16::from(pixel[1]) > u16::from(pixel[0]) * 2;
             }

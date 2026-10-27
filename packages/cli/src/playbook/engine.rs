@@ -1379,7 +1379,7 @@ mod tests {
                         let expected_column = 50 % width;
                         assert_eq!(usize::from(window.images[0].position_col), expected_column);
                         assert_eq!(window.rows[0].cells()[expected_column].text(), "M");
-                        assert!(!window.images[0].raw_data.is_empty());
+                        assert_ne!(window.images[0].raw_data, [] as [u8; 0]);
                         #[cfg(feature = "image-sixel")]
                         assert_recovered_image_emits_at_viewport_origin(&window);
                         #[cfg(feature = "image-sixel")]

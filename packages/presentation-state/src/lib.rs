@@ -888,7 +888,10 @@ mod tests {
             .consumer()
             .project_entities([entity_a.clone(), entity_b.clone()]);
         assert_eq!(projection[0].entity, entity_a);
-        assert!(projection[0].facts.is_empty());
+        assert_eq!(
+            projection[0].facts,
+            [] as [(std::string::String, PresentationFact); 0]
+        );
         assert_eq!(projection[1].entity, entity_b);
         assert_eq!(projection[1].facts.len(), 1);
     }
@@ -923,7 +926,10 @@ mod tests {
             )
             .unwrap();
         assert!(consumer.revision() > acknowledged);
-        assert!(consumer.facts_for_entity(&entity).is_empty());
+        assert_eq!(
+            consumer.facts_for_entity(&entity),
+            [] as [(std::string::String, PresentationFact); 0]
+        );
     }
 
     #[test]
@@ -1049,9 +1055,15 @@ mod tests {
         assert_eq!(registry.facts_for_entity(&other).len(), 1);
 
         assert!(registry.remove_producer("producer.b"));
-        assert!(registry.facts_for_entity(&entity).is_empty());
+        assert_eq!(
+            registry.facts_for_entity(&entity),
+            [] as [(std::string::String, PresentationFact); 0]
+        );
         drop(publisher_a);
-        assert!(registry.facts_for_entity(&other).is_empty());
+        assert_eq!(
+            registry.facts_for_entity(&other),
+            [] as [(std::string::String, PresentationFact); 0]
+        );
     }
 
     #[test]
@@ -1068,7 +1080,10 @@ mod tests {
                 .unwrap();
             assert_eq!(registry.facts_for_entity(&entity).len(), 1);
         }
-        assert!(registry.facts_for_entity(&entity).is_empty());
+        assert_eq!(
+            registry.facts_for_entity(&entity),
+            [] as [(std::string::String, PresentationFact); 0]
+        );
     }
 
     #[test]
@@ -1211,7 +1226,10 @@ mod tests {
             bmux_codec::from_typed_bytes::<PresentationFactPublishAck>(&response).unwrap(),
             PresentationFactPublishAck::Removed
         );
-        assert!(registry.facts_for_entity(&entity).is_empty());
+        assert_eq!(
+            registry.facts_for_entity(&entity),
+            [] as [(std::string::String, PresentationFact); 0]
+        );
     }
 
     #[test]
@@ -1266,7 +1284,10 @@ mod tests {
         );
         assert_eq!(registry.facts_for_entity(&entity).len(), 1);
         assert!(registry.remove_producer("producer.a"));
-        assert!(registry.facts_for_entity(&entity).is_empty());
+        assert_eq!(
+            registry.facts_for_entity(&entity),
+            [] as [(std::string::String, PresentationFact); 0]
+        );
     }
 
     #[test]

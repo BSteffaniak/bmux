@@ -849,7 +849,7 @@ mod tests {
         let mut stream = TerminalGridStream::new(10, 2, GridLimits::default()).unwrap();
         stream.process(b"hello\x1b[31");
         let expected = stream.snapshot(0, 2);
-        assert!(!expected.pending_bytes.is_empty());
+        assert_ne!(expected.pending_bytes, [] as [u8; 0]);
         assert!(
             stream
                 .try_snapshot(0, 2, expected.pending_bytes.len() - 1)
@@ -876,7 +876,7 @@ mod tests {
             expected
         );
         stream.process(b"mred");
-        assert!(stream.snapshot(0, 2).pending_bytes.is_empty());
+        assert_eq!(stream.snapshot(0, 2).pending_bytes, [] as [u8; 0]);
     }
 
     #[test]
@@ -1050,7 +1050,7 @@ mod tests {
         let mut grid = TerminalGrid::new(10, 2, GridLimits::default()).unwrap();
         grid.process(b"abcdef\r\x1b[K");
         let rows = grid.viewport_rows();
-        assert!(rows[0].cells().is_empty());
+        assert_eq!(rows[0].cells(), []);
     }
 
     fn row_backgrounds(grid: &TerminalGrid, row: usize) -> Vec<Option<crate::style::Color>> {
@@ -1113,7 +1113,7 @@ mod tests {
         // cells, so the row stays compact and default-styled.
         grid.process(b"\x1b[1;4mabc\x1b[2K");
 
-        assert!(grid.viewport_rows()[0].cells().is_empty());
+        assert_eq!(grid.viewport_rows()[0].cells(), []);
     }
 
     #[test]
@@ -1176,7 +1176,10 @@ mod tests {
                 13 => malformed.total_scrolled_rows = Some(before.total_scrolled_rows.unwrap() + 1),
                 _ => {
                     malformed.reset_rows = true;
-                    assert!(!malformed.row_updates.is_empty());
+                    assert_ne!(
+                        malformed.row_updates,
+                        [] as [crate::delta::RowUpdateSnapshot; 0]
+                    );
                     malformed.row_updates[0].row_index = 1;
                 }
             }
@@ -1661,7 +1664,7 @@ mod tests {
             producer.snapshot(0, producer.grid().main_row_count())
         );
         let recovery = producer.snapshot(0, producer.grid().main_row_count());
-        assert!(!recovery.pending_bytes.is_empty());
+        assert_ne!(recovery.pending_bytes, [] as [u8; 0]);
         let wire = serde_json::to_vec(&recovery).unwrap();
         let decoded = serde_json::from_slice(&wire).unwrap();
         replica = TerminalGridStream::from_snapshot(&decoded, limits).unwrap();
@@ -1758,7 +1761,7 @@ mod tests {
             producer.process(suffix);
             consumer.process(suffix);
             assert_eq!(consumer.snapshot(0, 3), producer.snapshot(0, 3));
-            assert!(producer.snapshot(0, 3).pending_bytes.is_empty());
+            assert_eq!(producer.snapshot(0, 3).pending_bytes, [] as [u8; 0]);
         }
         for invalid in [
             &b"\xc0"[..],
@@ -1769,7 +1772,7 @@ mod tests {
             &b"\xf4\x90"[..],
             &b"\xf5"[..],
         ] {
-            assert!(super::trailing_incomplete_sequence(invalid).is_empty());
+            assert_eq!(super::trailing_incomplete_sequence(invalid), [] as [u8; 0]);
             let mut producer = TerminalGridStream::new(20, 3, limits).unwrap();
             producer.process(invalid);
             let snapshot = producer.snapshot(0, 3);
@@ -1788,7 +1791,7 @@ mod tests {
             for count in [4, 8, 4096] {
                 let mut bytes = vec![leading];
                 bytes.extend(std::iter::repeat_n(0x80, count));
-                assert!(super::trailing_incomplete_sequence(&bytes).is_empty());
+                assert_eq!(super::trailing_incomplete_sequence(&bytes), [] as [u8; 0]);
                 bytes.extend_from_slice(b"\xf0\x9f\x98");
                 assert_eq!(super::trailing_incomplete_sequence(&bytes), b"\xf0\x9f\x98");
             }
@@ -2543,7 +2546,10 @@ mod tests {
                 .process_delta(save)
                 .expect("saving cursor changes replicated state");
             assert_eq!(delta.content_revision, before.content_revision);
-            assert!(delta.row_updates.is_empty());
+            assert_eq!(
+                delta.row_updates,
+                [] as [crate::delta::RowUpdateSnapshot; 0]
+            );
             consumer.apply_delta(&delta, limits).unwrap();
             assert_eq!(consumer.snapshot(0, 3), producer.snapshot(0, 3));
             for stream in [&mut producer, &mut consumer] {

@@ -1617,28 +1617,36 @@ mod lifecycle_consumer_tests {
     }
 
     impl bmux_plugin_sdk::TypedDispatchClient for CleanupClient {
-        async fn invoke_service_raw(
+        fn invoke_service_raw(
             &mut self,
             _capability: &str,
             _kind: bmux_ipc::InvokeServiceKind,
             _interface: &str,
             operation: &str,
             payload: Vec<u8>,
-        ) -> bmux_plugin_sdk::TypedDispatchClientResult<Vec<u8>> {
-            assert_eq!(operation, "status", "must not reopen capture or launch");
-            let request =
-                bmux_plugin_sdk::decode_service_message::<pane::client::StatusRequest>(&payload)
+        ) -> impl std::future::Future<Output = bmux_plugin_sdk::TypedDispatchClientResult<Vec<u8>>>
+        {
+            let mut payload = Some(payload);
+            std::future::poll_fn(move |_| {
+                let payload = payload.take().expect("transport polled after completion");
+                std::task::Poll::Ready((|| {
+                    assert_eq!(operation, "status", "must not reopen capture or launch");
+                    let request = bmux_plugin_sdk::decode_service_message::<
+                        pane::client::StatusRequest,
+                    >(&payload)
                     .unwrap();
-            assert_eq!(request.execution, self.expected);
-            self.calls += 1;
-            let Some(response) = &self.response else {
-                return Err(bmux_plugin_sdk::TypedDispatchClientError::transport(
-                    "pane-runtime-execution-v4",
-                    operation,
-                    "owned endpoint absent",
-                ));
-            };
-            Ok(bmux_plugin_sdk::encode_service_message(response).unwrap())
+                    assert_eq!(request.execution, self.expected);
+                    self.calls += 1;
+                    let Some(response) = &self.response else {
+                        return Err(bmux_plugin_sdk::TypedDispatchClientError::transport(
+                            "pane-runtime-execution-v4",
+                            operation,
+                            "owned endpoint absent",
+                        ));
+                    };
+                    Ok(bmux_plugin_sdk::encode_service_message(response).unwrap())
+                })())
+            })
         }
     }
 

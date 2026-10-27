@@ -1141,7 +1141,7 @@ fn emit_pixels(
                     let mut data = Vec::with_capacity(pixels.data.len() / 3 * 4);
                     for row in pixels.data.chunks(pixels.width as usize * 3) {
                         kitty_state.check_cancelled()?;
-                        for pixel in row.chunks_exact(3) {
+                        for pixel in row.as_chunks::<3>().0 {
                             data.extend_from_slice(&[pixel[0], pixel[1], pixel[2], 255]);
                         }
                     }

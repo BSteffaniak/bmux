@@ -535,7 +535,7 @@ mod tests {
         let _ = surface2; // silence unused warning
         let mut empty_out = Vec::new();
         apply_paint_commands(&mut empty_out, &surface).expect("empty paints");
-        assert!(empty_out.is_empty());
+        assert_eq!(empty_out, [] as [u8; 0]);
     }
 
     #[test]

@@ -600,7 +600,7 @@ font-family = "Jet#Brains Mono" # inline comment
         };
         let profile = detect_render_profile_for_env(&env).expect("profile should be detected");
         assert_eq!(profile.terminal_id, "ghostty");
-        assert!(!profile.font_families.is_empty());
+        assert_ne!(profile.font_families, [] as [std::string::String; 0]);
         assert_eq!(
             profile.cursor_defaults.profile,
             Some(CursorDefaultProfile::Ghostty)

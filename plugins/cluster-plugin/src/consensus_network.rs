@@ -165,13 +165,17 @@ where
 {
     type Network = EndpointRaftNetwork<C>;
 
-    async fn new_client(&mut self, target: NodeId, node: &BasicNode) -> Self::Network {
-        EndpointRaftNetwork {
+    fn new_client(
+        &mut self,
+        target: NodeId,
+        node: &BasicNode,
+    ) -> impl std::future::Future<Output = Self::Network> {
+        std::future::ready(EndpointRaftNetwork {
             caller: self.caller.clone(),
             identity: self.identity.clone(),
             target,
             endpoint: node.addr.clone(),
-        }
+        })
     }
 }
 

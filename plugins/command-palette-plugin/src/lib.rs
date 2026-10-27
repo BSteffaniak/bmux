@@ -527,7 +527,10 @@ mod tests {
                 panic!("expected normal plugin command path");
             };
             assert_eq!(command_name, name);
-            assert!(schema.arguments.is_empty());
+            assert_eq!(
+                schema.arguments,
+                [] as [bmux_plugin_sdk::PluginCommandArgument; 0]
+            );
             assert_eq!(
                 plugin_action_string(plugin_id, command_name, &[]),
                 format!("plugin:bmux.broadcast:{name}")

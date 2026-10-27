@@ -673,7 +673,7 @@ mod tests {
         );
 
         let healthy = doctor_next_steps(true, false, 0, 0);
-        assert!(healthy.is_empty());
+        assert_eq!(healthy, [] as [std::string::String; 0]);
     }
 
     #[test]

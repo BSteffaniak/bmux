@@ -1079,8 +1079,8 @@ mod tests {
             let mut buffer = Buffer::empty(Rect::new(0, 0, 8, 2));
             let mut frame = Frame::new(&mut buffer);
             component.paint(&layout, &mut PaintCx::new(&mut frame));
-            assert!(frame.hits().regions().is_empty());
-            assert!(frame.semantics().regions().is_empty());
+            assert_eq!(frame.hits().regions(), []);
+            assert_eq!(frame.semantics().regions(), []);
             assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("        "));
             let mut cx = EventCx::new(&layout);
             for key in [KeyCode::Down, KeyCode::Enter] {
@@ -1397,8 +1397,8 @@ mod tests {
             bmux_tui::paint::LocalRect::new(0, 1, 10, 2),
             |cx| component.paint(&layout, cx),
         );
-        assert!(frame.hits().regions().is_empty());
-        assert!(frame.semantics().regions().is_empty());
+        assert_eq!(frame.hits().regions(), []);
+        assert_eq!(frame.semantics().regions(), []);
     }
 
     #[test]

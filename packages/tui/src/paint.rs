@@ -865,15 +865,15 @@ mod tests {
         });
 
         assert!(frame.cursor().is_none());
-        assert!(frame.hits().regions().is_empty());
+        assert_eq!(frame.hits().regions(), []);
         assert!(
             frame
                 .damage(crate::damage::DamagePolicy::default())
                 .is_none()
         );
-        assert!(frame.selection().scopes().is_empty());
-        assert!(frame.semantics().regions().is_empty());
-        assert!(frame.images().is_empty());
+        assert_eq!(frame.selection().scopes(), []);
+        assert_eq!(frame.semantics().regions(), []);
+        assert_eq!(frame.images(), []);
     }
 
     #[test]

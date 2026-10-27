@@ -1423,7 +1423,7 @@ mod tests {
         let output = manager
             .poll_terminal_output(terminal.id, 64)
             .expect("poll should recover instead of failing");
-        assert!(!output.is_empty());
+        assert_ne!(output, [] as [TerminalChunk; 0]);
 
         let diagnostics = manager
             .terminal_diagnostics(terminal.id, None, 256)

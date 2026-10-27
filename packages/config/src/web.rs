@@ -241,10 +241,10 @@ mod tests {
             .unwrap(),
             cli
         );
-        assert!(
+        assert_eq!(
             select_allowed_hosts(Some(&[]), Ok("env.example:8080".into()), configured.clone())
-                .unwrap()
-                .is_empty()
+                .unwrap(),
+            [] as [std::string::String; 0]
         );
         assert_eq!(
             select_allowed_hosts(
@@ -255,10 +255,9 @@ mod tests {
             .unwrap(),
             vec!["a.example:8080", "b.example:8080"]
         );
-        assert!(
-            select_allowed_hosts(None, Ok(String::new()), configured.clone())
-                .unwrap()
-                .is_empty()
+        assert_eq!(
+            select_allowed_hosts(None, Ok(String::new()), configured.clone()).unwrap(),
+            [] as [std::string::String; 0]
         );
         assert_eq!(
             select_allowed_hosts(

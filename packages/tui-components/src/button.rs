@@ -833,8 +833,8 @@ mod tests {
             let mut frame = Frame::new(&mut buffer);
             button.paint(&layout, &mut PaintCx::new(&mut frame));
             assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("        "));
-            assert!(frame.hits().regions().is_empty());
-            assert!(frame.semantics().regions().is_empty());
+            assert_eq!(frame.hits().regions(), []);
+            assert_eq!(frame.semantics().regions(), []);
             assert!(
                 !button
                     .event(

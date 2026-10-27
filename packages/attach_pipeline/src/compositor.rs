@@ -589,7 +589,7 @@ impl RetainedInputQueue {
 
     #[must_use]
     pub fn drain(&mut self) -> Vec<RetainedInputEvent> {
-        self.events.drain(..).collect()
+        std::mem::take(&mut self.events)
     }
 }
 
@@ -1999,7 +1999,10 @@ mod tests {
             DamageRect::new(0, 0, 80, 24),
             DamageCoalescingPolicy::default(),
         );
-        assert!(queue.drain_for_dispatch(&compositor).is_empty());
+        assert_eq!(
+            queue.drain_for_dispatch(&compositor),
+            [] as [crate::compositor::RetainedInputDispatch; 0]
+        );
     }
 
     #[test]
@@ -2155,7 +2158,10 @@ mod tests {
             RetainedInputEvent::Pointer(_),
             RetainedInputEvent::Keyboard(RetainedKeyboardEvent { key, pressed: true, .. })
         ] if key == "enter"));
-        assert!(queue.drain().is_empty());
+        assert_eq!(
+            queue.drain(),
+            [] as [crate::compositor::RetainedInputEvent; 0]
+        );
     }
 
     #[test]
@@ -2302,7 +2308,10 @@ mod tests {
 
         router.capture(compositor.hit_test(4, 3).unwrap());
         compositor.replace_surfaces([], viewport, DamageCoalescingPolicy::default());
-        assert!(router.reconcile(&compositor).is_empty());
+        assert_eq!(
+            router.reconcile(&compositor),
+            [] as [crate::compositor::RetainedPointerEvent; 0]
+        );
         assert!(router.captured().is_none());
     }
 
@@ -2963,13 +2972,13 @@ mod tests {
             },
         ];
 
-        assert!(
+        assert_eq!(
             retained_surfaces_from_plugin_surfaces(
                 &surfaces,
                 &BTreeMap::new(),
                 DamageRect::new(0, 0, 80, 24),
-            )
-            .is_empty()
+            ),
+            [] as [crate::compositor::RetainedSurface; 0]
         );
     }
 
@@ -3248,7 +3257,10 @@ mod tests {
         let damage =
             compositor.replace_surfaces([surface], viewport, DamageCoalescingPolicy::default());
         assert_eq!(damage, RetainedDamage::None);
-        assert!(compositor.repaint_plan(&damage).is_empty());
+        assert_eq!(
+            compositor.repaint_plan(&damage),
+            [] as [crate::compositor::RetainedRepaintSurface; 0]
+        );
     }
 
     #[test]
@@ -3265,7 +3277,10 @@ mod tests {
 
         assert_eq!(removed.rects(), &[DamageRect::new(7, 4, 4, 2)]);
         assert!(compositor.surfaces().is_empty());
-        assert!(compositor.repaint_plan(&removed).is_empty());
+        assert_eq!(
+            compositor.repaint_plan(&removed),
+            [] as [crate::compositor::RetainedRepaintSurface; 0]
+        );
     }
 
     #[test]
@@ -3435,7 +3450,10 @@ mod tests {
 
         let outside =
             compositor.repaint_plan(&RetainedDamage::Regions(vec![DamageRect::new(0, 0, 1, 1)]));
-        assert!(outside.is_empty());
+        assert_eq!(
+            outside,
+            [] as [crate::compositor::RetainedRepaintSurface; 0]
+        );
 
         let inside =
             compositor.repaint_plan(&RetainedDamage::Regions(vec![DamageRect::new(3, 1, 1, 1)]));

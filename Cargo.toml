@@ -176,17 +176,17 @@ repository = "https://github.com/BSteffaniak/bmux"
 version    = "0.0.1-alpha.4"
 
 [workspace.dependencies]
-accesskit = { version = "0.21.1", default-features = false }
-accesskit_winit = { version = "0.29.2", default-features = false }
+accesskit = { version = "0.25.2", default-features = false }
+accesskit_winit = { version = "0.34.2", default-features = false }
 arc-swap = { version = "1.9", default-features = false }
 bmux_frontend_runtime = { version = "0.0.1-alpha.4", default-features = false, path = "packages/frontend-runtime" }
 bterm_native_platform = { version = "0.0.1-alpha.4", default-features = false, path = "packages/bterm-native-platform" }
 bterm_native_renderer = { version = "0.0.1-alpha.4", default-features = false, path = "packages/bterm-native-renderer" }
 bytemuck = { version = "1.25", default-features = false }
-cranelift-codegen = { version = "0.136.4", default-features = false, features = [
+cranelift-codegen = { version = "0.137.0", default-features = false, features = [
     "all-native-arch",
 ] }
-pollster = { version = "0.4", default-features = false }
+pollster = { version = "1.0", default-features = false }
 raw-window-handle = { version = "0.6.2", default-features = false, features = [
     "std",
 ] }
@@ -195,13 +195,13 @@ swash = { version = "0.2", default-features = false, features = [
     "render",
     "std",
 ] }
-wasmtime = { version = "49.0.4", default-features = false, features = [
+wasmtime = { version = "50.0.0", default-features = false, features = [
     "cranelift",
     "runtime",
     "std",
 ] }
 wat = "1"
-wgpu = { version = "27.0.1", default-features = false, features = [
+wgpu = { version = "30.0.1", default-features = false, features = [
     "std",
     "wgsl",
     "vulkan",
@@ -392,7 +392,7 @@ flate2 = { version = "1", default-features = false, features = [
 font8x8 = { version = "0.3.1", features = ["unicode"] }
 fontdb = { version = "0.24.0" }
 futures-util = { version = "0.3.34", default-features = false }
-getrandom = "0.3.4"
+getrandom = "0.4.3"
 gif = { version = "0.14.2" }
 image = { version = "0.25.10", default-features = false }
 iroh = { version = "1.4.1", default-features = true }
@@ -400,7 +400,7 @@ js-sys = { version = "0.3.106" }
 libc = { version = "0.2" }
 libloading = { version = "0.9.0", default-features = false, features = ["std"] }
 log = { version = "0.4.34", default-features = false }
-lz4_flex = { version = "0.13", default-features = false }
+lz4_flex = { version = "0.14", default-features = false }
 png = { version = "0.18.1", default-features = false }
 portable-pty = { version = "0.9.0" }
 proc-macro2 = { version = "1.0.107", default-features = false }
@@ -416,7 +416,7 @@ reqwest = { version = "0.13.5", default-features = false, features = [
     "json",
     "rustls-no-provider",
 ] }
-resvg = { version = "0.48.1", default-features = true }
+resvg = { version = "0.49.0", default-features = true }
 roxmltree = "0.21.2"
 rustls = { version = "0.23.46", default-features = false, features = [
     "std",
@@ -432,17 +432,17 @@ serde_json = { version = "1.0.154", default-features = false, features = [
     "std",
 ] }
 sha2 = { version = "0.11.1", default-features = false }
-sha2_010 = { package = "sha2", version = "0.10.9", default-features = false }
+sha2_010 = { package = "sha2", version = "0.11.1", default-features = false }
 ssh2 = { version = "0.9.6" }
 sshenv_vault = { version = "0.0.1-alpha.6", features = ["macos-keychain"] }
-syn = { version = "2.0.119", default-features = false }
-sysinfo = { version = "0.38.4" }
+syn = { version = "3.0.9", default-features = false }
+sysinfo = { version = "0.39.6" }
 tempfile = { version = "3.27.0", default-features = false }
 thiserror = { version = "2.0.21", default-features = false }
 time = { version = "0.3.55", default-features = false }
 tokio = { version = "1.54.1", default-features = false }
 tokio-rustls = { version = "0.26.6", default-features = false }
-tokio-tungstenite = { version = "0.29.0", default-features = false }
+tokio-tungstenite = { version = "0.30.0", default-features = false }
 toml = { version = "1.1.8", default-features = false, features = [
     "display",
     "serde",
@@ -459,7 +459,7 @@ trybuild = { version = "1.0.122" }
 ttf-parser = { version = "0.25.1", default-features = true }
 unicode-segmentation = { version = "1.13.3", default-features = false }
 unicode-width = { version = "0.2.2", default-features = false }
-uniffi = { version = "0.31.2" }
+uniffi = { version = "0.32.2" }
 uuid = { version = "1.29.0", default-features = false }
 wasm-bindgen = { version = "0.2.129" }
 wasm-bindgen-futures = { version = "0.4.79" }
@@ -468,9 +468,9 @@ wayland-protocols = { version = "0.32.13", default-features = false }
 wayland-protocols-wlr = { version = "0.3.12", default-features = false }
 web-sys = { version = "0.3.106" }
 windows-sys = { version = "0.61.2" }
-x11rb = { version = "0.13.2", default-features = false }
+x11rb = { version = "0.14.0", default-features = false }
 zeroize = { version = "1.9.1", default-features = false, features = ["std"] }
-zstd = { version = "0.13", default-features = false }
+zstd = { version = "0.14", default-features = false }
 
 # File-system watcher for config / theme / decoration-script hot-reload.
 notify = { version = "8", default-features = false, features = [
@@ -485,10 +485,10 @@ redb = { version = "=4.1.0", default-features = false }
 # Lua scripting runtime for the decoration plugin. Mutually-exclusive
 # features select the Lua ABI; see the decoration plugin's
 # `scripting-*` cargo features for the exposed matrix.
-mlua = { version = "0.11", default-features = false }
+mlua = { version = "0.12", default-features = false }
 
 # Dev/test dependencies
-serial_test = { version = "3.5.0" }
+serial_test = { version = "4.0.1" }
 
 # Keep identity checks bounded in debug native acceptance runs with large binaries.
 [profile.dev.package.sha2]

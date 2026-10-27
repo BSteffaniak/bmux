@@ -2874,7 +2874,7 @@ mod tests {
             assert_eq!(suffix.len(), expected.len());
             for (actual, expected) in suffix.iter().zip(expected) {
                 if actual.line.plain_text().is_empty() {
-                    assert!(expected.line.plain_text().is_empty());
+                    assert_eq!(expected.line.plain_text(), "");
                 } else {
                     assert_eq!(actual.line, expected.line);
                 }
@@ -3260,7 +3260,10 @@ mod tests {
         let hidden = Visibility::new(TextBlock::new("hidden"), false);
         let hidden_layout = hidden.layout(Constraints::new(0, 8, 0, None), &mut LayoutCx::new());
         assert_eq!(hidden_layout.size.height, 0);
-        assert!(hidden_layout.children.is_empty());
+        assert_eq!(
+            hidden_layout.children,
+            [] as [crate::component::ChildLayout; 0]
+        );
     }
 
     #[test]

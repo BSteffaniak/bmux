@@ -1267,7 +1267,10 @@ mod tests {
         let mut changes = registry.subscribe();
         changes.borrow_and_update();
         assert_eq!(registry.clear(), 2);
-        assert!(registry.surfaces().is_empty());
+        assert_eq!(
+            registry.surfaces(),
+            [] as [crate::surface::PluginSurface; 0]
+        );
         assert!(changes.has_changed().unwrap());
         changes.borrow_and_update();
         assert_eq!(registry.clear(), 0);
@@ -1312,7 +1315,10 @@ mod tests {
             changes.borrow_and_update();
             assert_eq!(registry.surfaces().len(), 1);
         }
-        assert!(registry.surfaces().is_empty());
+        assert_eq!(
+            registry.surfaces(),
+            [] as [crate::surface::PluginSurface; 0]
+        );
         assert!(changes.has_changed().unwrap());
     }
 
@@ -1363,7 +1369,10 @@ mod tests {
         );
         assert!(!changes.has_changed().unwrap());
         assert!(registry.remove_owner("owner"));
-        assert!(registry.surfaces().is_empty());
+        assert_eq!(
+            registry.surfaces(),
+            [] as [crate::surface::PluginSurface; 0]
+        );
         assert!(changes.has_changed().unwrap());
     }
 

@@ -1881,7 +1881,7 @@ mod tests {
             // Invalid bytes must never be decoded as v4 or routed to an alias.
             context.request.payload = vec![255];
             let response = plugin.invoke_service(context);
-            assert!(response.payload.is_empty());
+            assert_eq!(response.payload, [] as [u8; 0]);
             let error = response
                 .error
                 .expect("retired interface must explicitly reject");

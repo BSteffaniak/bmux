@@ -397,37 +397,8 @@ fn restore_order(
     Ok(ordered)
 }
 
-impl SnapshotOrchestrator for BmuxSnapshotOrchestrator {
-    fn finalize(&self) -> SnapshotOrchestratorResult<Option<PathBuf>> {
-        let mut finalized = self.finalized.lock().map_err(|_| {
-            SnapshotOrchestratorError::Other("snapshot lifecycle lock poisoned".into())
-        })?;
-        if *finalized {
-            return Ok(None);
-        }
-        // Seal even on failure: teardown must never replace the last good file.
-        *finalized = true;
-        {
-            let registry = self.stateful_registry.read().map_err(|_| {
-                SnapshotOrchestratorError::Other("stateful registry lock poisoned".into())
-            })?;
-            for handle in registry.as_slice() {
-                handle.as_dyn().prepare_final_snapshot().map_err(|error| {
-                    SnapshotOrchestratorError::Participant {
-                        plugin: handle.as_dyn().id().as_str().to_string(),
-                        details: StatefulErrorDisplay(&error).to_string(),
-                    }
-                })?;
-                if let Err(error) =
-                    bmux_plugin::shutdown_progress().advance("snapshot participant prepared")
-                {
-                    warn!(%error, "shutdown progress publication failed");
-                }
-            }
-        }
-        self.save_locked()
-    }
-    async fn restore_if_present(&self) -> SnapshotOrchestratorResult<Option<RestoreSummary>> {
+impl BmuxSnapshotOrchestrator {
+    fn restore_if_present_blocking(&self) -> SnapshotOrchestratorResult<Option<RestoreSummary>> {
         if self.path.is_none() {
             return Ok(None);
         }
@@ -458,12 +429,7 @@ impl SnapshotOrchestrator for BmuxSnapshotOrchestrator {
         self.record_restore_result(summary)?;
         Ok(Some(summary))
     }
-
-    async fn save_now(&self) -> SnapshotOrchestratorResult<Option<PathBuf>> {
-        self.save_now_blocking()
-    }
-
-    async fn dry_run(&self) -> SnapshotOrchestratorResult<DryRunReport> {
+    fn dry_run_blocking(&self) -> SnapshotOrchestratorResult<DryRunReport> {
         if self.path.is_none() {
             return Err(SnapshotOrchestratorError::Disabled);
         }
@@ -526,8 +492,7 @@ impl SnapshotOrchestrator for BmuxSnapshotOrchestrator {
             }),
         }
     }
-
-    async fn restore_apply(&self) -> SnapshotOrchestratorResult<RestoreSummary> {
+    fn restore_apply_blocking(&self) -> SnapshotOrchestratorResult<RestoreSummary> {
         if self.path.is_none() {
             return Err(SnapshotOrchestratorError::Disabled);
         }
@@ -553,6 +518,61 @@ impl SnapshotOrchestrator for BmuxSnapshotOrchestrator {
         };
         self.record_restore_result(summary)?;
         Ok(summary)
+    }
+}
+
+impl SnapshotOrchestrator for BmuxSnapshotOrchestrator {
+    fn finalize(&self) -> SnapshotOrchestratorResult<Option<PathBuf>> {
+        let mut finalized = self.finalized.lock().map_err(|_| {
+            SnapshotOrchestratorError::Other("snapshot lifecycle lock poisoned".into())
+        })?;
+        if *finalized {
+            return Ok(None);
+        }
+        // Seal even on failure: teardown must never replace the last good file.
+        *finalized = true;
+        {
+            let registry = self.stateful_registry.read().map_err(|_| {
+                SnapshotOrchestratorError::Other("stateful registry lock poisoned".into())
+            })?;
+            for handle in registry.as_slice() {
+                handle.as_dyn().prepare_final_snapshot().map_err(|error| {
+                    SnapshotOrchestratorError::Participant {
+                        plugin: handle.as_dyn().id().as_str().to_string(),
+                        details: StatefulErrorDisplay(&error).to_string(),
+                    }
+                })?;
+                if let Err(error) =
+                    bmux_plugin::shutdown_progress().advance("snapshot participant prepared")
+                {
+                    warn!(%error, "shutdown progress publication failed");
+                }
+            }
+        }
+        self.save_locked()
+    }
+    fn restore_if_present(
+        &self,
+    ) -> impl std::future::Future<Output = SnapshotOrchestratorResult<Option<RestoreSummary>>> {
+        std::future::poll_fn(move |_| std::task::Poll::Ready(self.restore_if_present_blocking()))
+    }
+
+    fn save_now(
+        &self,
+    ) -> impl std::future::Future<Output = SnapshotOrchestratorResult<Option<PathBuf>>> {
+        std::future::poll_fn(move |_| std::task::Poll::Ready(self.save_now_blocking()))
+    }
+
+    fn dry_run(
+        &self,
+    ) -> impl std::future::Future<Output = SnapshotOrchestratorResult<DryRunReport>> {
+        std::future::poll_fn(move |_| std::task::Poll::Ready(self.dry_run_blocking()))
+    }
+
+    fn restore_apply(
+        &self,
+    ) -> impl std::future::Future<Output = SnapshotOrchestratorResult<RestoreSummary>> {
+        std::future::poll_fn(move |_| std::task::Poll::Ready(self.restore_apply_blocking()))
     }
 
     fn status(&self) -> SnapshotStatusReport {

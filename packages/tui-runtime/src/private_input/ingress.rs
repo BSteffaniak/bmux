@@ -18,7 +18,7 @@ impl Generation {
     fn fence(&self) -> Result<(), PrivateInputError> {
         self.paused.store(true, Ordering::SeqCst);
         self.value
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |g| g.checked_add(1))
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |g| g.checked_add(1))
             .map(|_| ())
             .map_err(|_| PrivateInputError::BarrierFailed)
     }

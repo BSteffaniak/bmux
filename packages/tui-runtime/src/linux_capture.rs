@@ -206,6 +206,6 @@ mod tests {
             Err(PrivateInputError::BarrierFailed)
         );
         assert!(raw.paused);
-        assert!(boundary.calls.is_empty());
+        assert_eq!(boundary.calls, [] as [&str; 0]);
     }
 }

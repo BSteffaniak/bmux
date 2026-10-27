@@ -5446,7 +5446,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        assert!(!emphasized.is_empty());
+        assert_ne!(emphasized, [] as [&crate::MarkdownSelectionProvenance; 0]);
         assert!(
             emphasized
                 .iter()
@@ -5687,7 +5687,7 @@ mod tests {
 
         let ordinary_indent = "paragraph\n    continuation\n";
         let rendered = render_markdown(ordinary_indent, &MarkdownRenderOptions::new(80));
-        assert!(rendered.code_block_selections().is_empty());
+        assert_eq!(rendered.code_block_selections(), []);
     }
 
     #[test]
@@ -5864,7 +5864,7 @@ mod tests {
         let markdown = "# *hello* [world](https://example.com)\n\n`code`  \nnext";
         let result = render_markdown(markdown, &MarkdownRenderOptions::new(40));
 
-        assert!(!result.selection_provenance().is_empty());
+        assert_ne!(result.selection_provenance(), []);
         assert!(result.selection_provenance().iter().all(|entry| {
             entry
                 .rects
@@ -6292,7 +6292,7 @@ mod tests {
             &MarkdownRenderOptions::new(80),
         );
 
-        assert!(!result.lines.is_empty());
+        assert_ne!(result.lines, [] as [bmux_tui::text::Line; 0]);
         assert_eq!(markdown_work_counts(), (1, 1));
     }
 
@@ -6341,7 +6341,7 @@ mod tests {
                     .with_document_id("matrix")
                     .with_mermaid_contributions(1600, 1200),
             );
-            assert!(!result.lines.is_empty());
+            assert_ne!(result.lines, [] as [bmux_tui::text::Line; 0]);
             assert!(result.geometry.iter().all(|geometry| {
                 !geometry.rects.is_empty()
                     && geometry.rects.iter().all(|rect| {

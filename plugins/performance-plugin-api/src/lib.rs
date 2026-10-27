@@ -334,7 +334,7 @@ mod tests {
 
         let payload =
             bmux_plugin_sdk::encode_service_message(&request).expect("encode performance request");
-        assert!(!payload.is_empty());
+        assert_ne!(payload, [] as [u8; 0]);
     }
 
     #[test]

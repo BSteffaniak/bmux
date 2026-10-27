@@ -120,7 +120,7 @@ mod tests {
             output.extend(public);
             replies.extend(reply);
         }
-        assert!(output.is_empty());
+        assert_eq!(output, [] as [u8; 0]);
         let json = replies
             .strip_prefix(b"\x1b[200~bmux-input-capture-v1:")
             .unwrap()
@@ -144,7 +144,7 @@ mod tests {
         ] {
             let (output, replies) = CaptureHandshake::default().process(&bytes, pane);
             assert_eq!(output, bytes);
-            assert!(replies.is_empty());
+            assert_eq!(replies, [] as [u8; 0]);
         }
         assert_eq!(
             super::super::private_input::with_capture_barrier(pane, |capture| capture),

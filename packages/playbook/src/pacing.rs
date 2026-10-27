@@ -80,7 +80,7 @@ pub(crate) async fn wait(
         // Credit only intentional pacing, before sleeping so a deadline landing
         // inside this slice cannot truncate typing. Pauses earn no credit.
         let millis = u64::try_from(slice.as_millis()).unwrap_or(25);
-        let _ = credit.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+        let _ = credit.try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
             Some(value.saturating_add(millis).min(3_600_000))
         });
         tokio::time::sleep(slice).await;

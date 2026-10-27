@@ -1374,7 +1374,7 @@ mod tests {
 
         terminal.draw(|_| {}).unwrap();
 
-        assert!(terminal.images().is_empty());
+        assert_eq!(terminal.images(), []);
     }
 
     #[test]
@@ -1398,11 +1398,17 @@ mod tests {
             .draw(|frame| frame.push_image(ImageContribution::Present(placement.clone())))
             .unwrap();
         assert_eq!(terminal.image_delta().upserted, [placement]);
-        assert!(terminal.image_delta().removed.is_empty());
+        assert_eq!(
+            terminal.image_delta().removed,
+            [] as [crate::image::ImageKey; 0]
+        );
         assert_eq!(terminal.image_scene().placements().len(), 1);
 
         terminal.draw(|_| {}).unwrap();
-        assert!(terminal.image_delta().upserted.is_empty());
+        assert_eq!(
+            terminal.image_delta().upserted,
+            [] as [crate::image::ImagePlacement; 0]
+        );
         assert_eq!(terminal.image_delta().removed, [ImageKey::new("diagram")]);
         assert_eq!(terminal.image_scene().placements().len(), 0);
     }
@@ -1630,7 +1636,7 @@ mod pointer_output_tests {
         terminal
             .draw_damage(crate::damage::Damage::None, |_| panic!("no paint"))
             .unwrap();
-        assert!(terminal.writer().bytes.is_empty());
+        assert_eq!(terminal.writer().bytes, [] as [u8; 0]);
     }
 
     #[test]

@@ -827,7 +827,7 @@ mod tests {
         }
         master.write_all(b"kernel-private-canary").unwrap();
         reader.drain_and_reset().unwrap();
-        assert!(reader.decoder.pending.is_empty());
+        assert_eq!(reader.decoder.pending, [] as [u8; 0]);
         master.write_all(b"z").unwrap();
         let deadline = Instant::now() + Duration::from_secs(1);
         loop {

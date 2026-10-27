@@ -1356,7 +1356,10 @@ mod tests {
             );
         }
         drop(open_server_startup_log(&runtime_dir).expect("reopen startup log"));
-        assert!(std::fs::read(&path).expect("read truncated log").is_empty());
+        assert_eq!(
+            std::fs::read(&path).expect("read truncated log"),
+            [] as [u8; 0]
+        );
     }
 
     #[cfg(unix)]

@@ -837,7 +837,7 @@ mod tests {
             &mut frame,
         );
 
-        assert!(frame.hits().regions().is_empty());
+        assert_eq!(frame.hits().regions(), []);
         assert_eq!(frame.buffer().row_symbols(3).as_deref(), Some("Nothing he"));
     }
 

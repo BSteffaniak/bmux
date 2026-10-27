@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 
 use accesskit::{
     Action, ActionHandler, ActionRequest, ActivationHandler, DeactivationHandler, Node, NodeId,
-    Role, Tree, TreeUpdate,
+    Role, TreeId, TreeInfo, TreeUpdate,
 };
 use bmux_tui::geometry::Rect;
 use bmux_tui::semantic::{SemanticAction, SemanticScene};
@@ -65,7 +65,8 @@ struct State {
 fn empty_tree() -> TreeUpdate {
     TreeUpdate {
         nodes: vec![(ROOT, Node::new(Role::Window))],
-        tree: Some(Tree::new(ROOT)),
+        tree: Some(TreeInfo::new(ROOT)),
+        tree_id: TreeId::ROOT,
         focus: ROOT,
     }
 }
@@ -203,7 +204,8 @@ impl State {
         nodes.push((ROOT, root));
         self.tree = TreeUpdate {
             nodes,
-            tree: Some(Tree::new(ROOT)),
+            tree: Some(TreeInfo::new(ROOT)),
+            tree_id: TreeId::ROOT,
             focus,
         };
         self.generation = generation;
@@ -222,13 +224,16 @@ impl State {
     }
 
     fn action(&mut self, request: ActionRequest) {
+        if request.target_tree != TreeId::ROOT {
+            return;
+        }
         let action = match request.action {
             Action::Focus => SemanticAction::Focus,
             Action::Click => SemanticAction::Activate,
             Action::ShowContextMenu => SemanticAction::ShowContextMenu,
             _ => return,
         };
-        let Some(target) = self.targets.get(&request.target) else {
+        let Some(target) = self.targets.get(&request.target_node) else {
             return;
         };
         if !target.actions.contains(&action) {
@@ -397,9 +402,24 @@ mod tests {
     fn click(id: NodeId) -> ActionRequest {
         ActionRequest {
             action: Action::Click,
-            target: id,
+            target_tree: TreeId::ROOT,
+            target_node: id,
             data: None,
         }
+    }
+
+    #[test]
+    fn actions_for_another_tree_do_not_target_root_nodes() {
+        let mut state = State::new();
+        state.commit(1, &scene(false), geometry()).unwrap();
+        assert_eq!(state.tree.tree_id, TreeId::ROOT);
+        let id = state.tree.nodes[0].0;
+        let mut request = click(id);
+        request.target_tree = TreeId(accesskit::Uuid::from_u128(1));
+        state.action(request);
+        assert_eq!(state.queue.len(), 0);
+        state.action(click(id));
+        assert_eq!(state.queue.len(), 1);
     }
 
     #[test]
@@ -509,7 +529,8 @@ mod tests {
         state.action(click(disabled));
         state.action(ActionRequest {
             action: Action::Focus,
-            target: enabled,
+            target_tree: TreeId::ROOT,
+            target_node: enabled,
             data: None,
         });
         assert!(state.queue.is_empty());

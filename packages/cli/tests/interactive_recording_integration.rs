@@ -572,7 +572,7 @@ fn interactive_record_retained_renderer_burst_fairness_and_idle() {
     assert_eq!(result["status"]["exit_code"], 0);
     assert_eq!(result["status"]["durable_recording_complete"], true);
     let raw = fs::read(fixture.root.join("exports/output.pty")).expect("canonical raw export");
-    for key in [b'x', b'y'] {
+    for key in *b"xy" {
         let echo = [key; 64];
         assert!(
             raw.windows(echo.len()).any(|window| window == echo),
@@ -822,7 +822,13 @@ fn interactive_gif_preserves_output_and_resize() {
     while let Some(frame) = decoder.read_next_frame().expect("GIF frame") {
         frames += 1;
         assert!(frames <= 1000);
-        for pixel in frame.buffer.chunks_exact(4).filter(|pixel| pixel[3] != 0) {
+        for pixel in frame
+            .buffer
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|pixel| pixel[3] != 0)
+        {
             red |= pixel[0] > 80 && u16::from(pixel[0]) > u16::from(pixel[1]) * 2;
             green |= pixel[1] > 80 && u16::from(pixel[1]) > u16::from(pixel[0]) * 2;
         }

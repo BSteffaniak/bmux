@@ -5551,7 +5551,7 @@ mod tests {
         assert_eq!(validate_theme_extension_toml(text), ValidationResult::Ok);
         let parsed = parse_decoration_extension(text).expect("partial theme");
         assert_eq!(parsed.unfocused.fg, "#1a4d1a");
-        assert!(parsed.unfocused.bg.is_empty());
+        assert_eq!(parsed.unfocused.bg, "");
     }
 
     #[test]

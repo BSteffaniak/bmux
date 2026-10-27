@@ -92,7 +92,7 @@ impl ReadyTracker {
     /// Returns `false` if the signal is unknown or still pending.
     #[must_use]
     pub fn is_ready(&self, plugin_id: &str, signal_name: &str) -> bool {
-        self.inner.read().ok().is_some_and(|map| {
+        self.inner.read().is_ok_and(|map| {
             map.get(&(plugin_id.to_string(), signal_name.to_string()))
                 .copied()
                 .is_some_and(|status| status == ReadyStatus::Ready)

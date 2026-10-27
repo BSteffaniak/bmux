@@ -269,7 +269,7 @@ impl FenwickTree {
             } else {
                 self.tree[cursor].saturating_sub(difference)
             };
-            cursor = cursor.saturating_add(cursor & cursor.wrapping_neg());
+            cursor = cursor.saturating_add(cursor.isolate_lowest_one());
         }
     }
 

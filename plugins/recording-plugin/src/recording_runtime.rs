@@ -182,7 +182,7 @@ impl RecordingRuntime {
             event_count: 0,
             payload_bytes: 0,
             path: dir.to_string_lossy().to_string(),
-            segments: vec![format!("events_0.bin")],
+            segments: vec!["events_0.bin".to_string()],
             total_segment_bytes: 0,
         };
         write_manifest(&manifest_path, &summary)?;
@@ -1630,7 +1630,10 @@ mod tests {
     #[test]
     fn cut_empty_input_returns_empty() {
         let result = super::cut_display_track_frames(&[], 10_000_000_000);
-        assert!(result.is_empty());
+        assert_eq!(
+            result,
+            [] as [bmux_recording_protocol::DisplayTrackEnvelope; 0]
+        );
     }
 
     #[test]
@@ -2138,7 +2141,10 @@ mod tests {
         let deleted_count = runtime.delete_all().expect("delete all should succeed");
         assert_eq!(deleted_count, 2);
         assert!(runtime.status().active.is_none());
-        assert!(runtime.list().expect("list should succeed").is_empty());
+        assert_eq!(
+            runtime.list().expect("list should succeed"),
+            [] as [bmux_recording_protocol::RecordingSummary; 0]
+        );
     }
 
     #[test]
@@ -2174,7 +2180,7 @@ mod tests {
 
         let stopped = runtime.stop(None).expect("stop recording");
         assert!(stopped.event_count >= 1);
-        assert!(!stopped.segments.is_empty());
+        assert_ne!(stopped.segments, [] as [std::string::String; 0]);
         // Verify the first segment file exists on disk.
         let seg_path = root.join(stopped.id.to_string()).join(&stopped.segments[0]);
         assert!(

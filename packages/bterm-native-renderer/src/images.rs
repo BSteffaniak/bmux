@@ -40,7 +40,7 @@ pub(crate) fn decode(payload: &ImagePayload) -> Result<(u32, u32, Vec<u8>), Rend
                 return Err(RenderError::Image("invalid RGB payload length".into()));
             }
             let mut rgba = Vec::with_capacity(length);
-            for pixel in bytes.chunks_exact(3) {
+            for pixel in bytes.as_chunks::<3>().0 {
                 rgba.extend_from_slice(&[pixel[0], pixel[1], pixel[2], 255]);
             }
             rgba
