@@ -139,7 +139,9 @@ impl raw_window_handle::HasDisplayHandle for SurfaceTarget {
 /// Application callbacks execute serially on the event-loop thread. Consumers own
 /// retained presentation, redraw scheduling, and successful-output acknowledgement.
 pub trait WindowApplication {
-    /// Keep the main window hidden until startup has produced usable output.
+    /// Keep the main window hidden until native initialization is ready.
+    /// Do not require successful presentation: hidden surfaces may not acquire
+    /// drawables. Visibility does not acknowledge output or grant scene authority.
     /// The default preserves immediate visibility for other native consumers.
     fn ready_to_show(&self) -> bool {
         true

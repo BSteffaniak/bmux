@@ -543,7 +543,10 @@ impl<W: AttachWorker> Application<W> {
 
 impl<W: AttachWorker> WindowApplication for Application<W> {
     fn ready_to_show(&self) -> bool {
-        self.last_output.is_some()
+        // A hidden Metal surface cannot acquire a drawable. Show after successful
+        // native initialization, not after the first GPU presentation. Visibility
+        // grants no interaction authority: only successful output sets last_output.
+        self.active
     }
 
     fn event(
@@ -1311,18 +1314,16 @@ mod tests {
     }
 
     #[test]
-    fn main_window_waits_for_committed_output_not_worker_start() {
+    fn initialized_window_can_show_before_first_displayed_frame() {
         let mut application = Application::new(worker_without_runtime()).unwrap();
         assert!(!application.ready_to_show());
         application.active = true;
-        assert!(!application.ready_to_show());
-        application.last_output = Some(PresentationIdentity {
-            epoch: "11111111-1111-1111-1111-111111111111".parse().unwrap(),
-            attached_id: "22222222-2222-2222-2222-222222222222".parse().unwrap(),
-            revision: 1,
-            viewport_generation: 1,
-        });
         assert!(application.ready_to_show());
+        assert!(application.last_output.is_none());
+        assert!(application.retained_output.is_none());
+        assert_eq!(application.semantic_generation, 0);
+        application.active = false;
+        assert!(!application.ready_to_show());
     }
 
     #[test]
