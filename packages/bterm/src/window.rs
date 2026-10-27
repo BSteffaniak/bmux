@@ -26,9 +26,18 @@ impl Transaction {
         deadline: Instant,
         output: impl FnOnce() -> Result<(), String>,
     ) -> Result<(), String> {
-        if closed || self.cancelled || Instant::now() >= deadline {
+        let blocker = if closed {
+            Some("native output receiver is closed")
+        } else if self.cancelled {
+            Some("native presentation transaction was cancelled")
+        } else if Instant::now() >= deadline {
+            Some("native presentation deadline expired before output")
+        } else {
+            None
+        };
+        if let Some(blocker) = blocker {
             self.cancelled = true;
-            Err("native presentation expired or detached".into())
+            Err(blocker.into())
         } else {
             let result = output();
             self.completed = true;
@@ -50,16 +59,24 @@ pub struct PendingOutput {
 impl PendingOutput {
     /// Serialize cancellation/closure with actual output. Holds the transaction
     /// gate through presentation, so a timeout cannot race a late GPU submit.
-    pub fn present(self, output: impl FnOnce(&PreparedDelivery) -> Result<(), String>) -> bool {
+    pub fn present(
+        self,
+        output: impl FnOnce(&PreparedDelivery) -> Result<(), String>,
+    ) -> Result<(), String> {
         let result = match (self.lifecycle.lock(), self.transaction.lock()) {
             (Ok(lifecycle), Ok(mut transaction)) => {
                 transaction.output(lifecycle.closed, self.deadline, || output(&self.delivery))
             }
             _ => Err("native presentation synchronization failed".into()),
         };
-        let accepted = result.is_ok();
-        let _ = self.receipt.send(result);
-        accepted
+        let result = result.map_err(|error| {
+            format!(
+                "presentation {:?} rejected: {error}",
+                self.delivery.identity
+            )
+        });
+        let _ = self.receipt.send(result.clone());
+        result
     }
 }
 
@@ -348,6 +365,45 @@ mod tests {
     }
 
     #[test]
+    fn backend_failure_reaches_both_sides_with_frame_identity() {
+        let (output, receiver, notification) = queued();
+        let worker = std::thread::spawn(move || output.present(delivery()));
+        notification.recv_timeout(Duration::from_secs(1)).unwrap();
+        let error = receiver
+            .try_recv()
+            .unwrap()
+            .present(|_| Err("GPU device lost: test backend failure".into()))
+            .unwrap_err();
+        assert!(error.contains("GPU device lost: test backend failure"));
+        assert!(error.contains("viewport_generation"));
+        assert!(error.contains("revision"));
+        assert_eq!(worker.join().unwrap().unwrap_err().to_string(), error);
+    }
+
+    #[test]
+    fn transaction_blockers_are_distinct_and_never_reach_backend() {
+        let future = Instant::now() + Duration::from_secs(1);
+        let mut closed = Transaction::default();
+        assert_eq!(
+            closed.output(true, future, || panic!("closed output")),
+            Err("native output receiver is closed".into())
+        );
+        let mut cancelled = Transaction {
+            cancelled: true,
+            completed: false,
+        };
+        assert_eq!(
+            cancelled.output(false, future, || panic!("cancelled output")),
+            Err("native presentation transaction was cancelled".into())
+        );
+        let mut expired = Transaction::default();
+        assert_eq!(
+            expired.output(false, Instant::now(), || panic!("expired output")),
+            Err("native presentation deadline expired before output".into())
+        );
+    }
+
+    #[test]
     fn dropping_pending_rejects_publication_without_waiting_for_timeout() {
         let (output, receiver, notification) = queued();
         let thread = std::thread::spawn(move || output.present(delivery()));
@@ -363,10 +419,11 @@ mod tests {
         notification.recv_timeout(Duration::from_secs(1)).unwrap();
         receiver.close();
         assert!(
-            !receiver
+            receiver
                 .try_recv()
                 .unwrap()
                 .present(|_| panic!("closed output reached backend"))
+                .is_err()
         );
         assert!(thread.join().unwrap().is_err());
     }
@@ -380,10 +437,11 @@ mod tests {
         notification.recv_timeout(Duration::from_secs(1)).unwrap();
         assert!(thread.join().unwrap().is_err());
         assert!(
-            !receiver
+            receiver
                 .try_recv()
                 .unwrap()
                 .present(|_| panic!("timed-out output reached backend"))
+                .is_err()
         );
     }
 
@@ -393,14 +451,20 @@ mod tests {
         let producer = output.clone();
         let thread = std::thread::spawn(move || producer.present(delivery()));
         notification.recv_timeout(Duration::from_secs(1)).unwrap();
-        assert!(!receiver.try_recv().unwrap().present(|delivery| {
-            assert_ne!(delivery.identity.viewport_generation, 2);
-            Err("stale viewport".into())
-        }));
-        assert!(thread.join().unwrap().is_err());
+        let rejected = receiver
+            .try_recv()
+            .unwrap()
+            .present(|delivery| {
+                assert_ne!(delivery.identity.viewport_generation, 2);
+                Err("stale viewport".into())
+            })
+            .unwrap_err();
+        assert!(rejected.contains("stale viewport"));
+        assert!(rejected.contains("viewport_generation"));
+        assert_eq!(thread.join().unwrap().unwrap_err().to_string(), rejected);
         let thread = std::thread::spawn(move || output.present(delivery()));
         notification.recv_timeout(Duration::from_secs(1)).unwrap();
-        assert!(receiver.try_recv().unwrap().present(|_| Ok(())));
+        assert!(receiver.try_recv().unwrap().present(|_| Ok(())).is_ok());
         assert!(thread.join().unwrap().is_ok());
     }
 
@@ -425,7 +489,7 @@ mod tests {
             std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
             Ok(())
         });
-        assert!(accepted);
+        assert!(accepted.is_ok());
         release.send(()).unwrap();
         assert!(worker.join().unwrap().is_ok());
     }
@@ -442,7 +506,7 @@ mod tests {
         }));
         let worker = std::thread::spawn(move || output.present(delivery()));
         notification.recv_timeout(Duration::from_secs(1)).unwrap();
-        assert!(receiver.try_recv().unwrap().present(|_| Ok(())));
+        assert!(receiver.try_recv().unwrap().present(|_| Ok(())).is_ok());
         receiver.close();
         release.send(()).unwrap();
         assert!(worker.join().unwrap().is_ok());
@@ -472,7 +536,7 @@ mod tests {
         });
         assert!(second.join().unwrap().is_err());
         assert!(receiver.try_recv().is_none());
-        assert!(pending.present(|_| Ok(())));
+        assert!(pending.present(|_| Ok(())).is_ok());
         assert!(first.join().unwrap().is_ok());
     }
 

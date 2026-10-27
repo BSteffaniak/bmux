@@ -422,12 +422,18 @@ impl<W: AttachWorker> Application<W> {
                             if !active || metrics.physical_size.is_empty() {
                                 Err("native surface is not drawable".into())
                             } else if delivery.identity.viewport_generation != viewport.generation {
-                                Err("native presentation viewport is stale".into())
+                                Err(format!(
+                                    "native presentation viewport is stale: received {}, current {}",
+                                    delivery.identity.viewport_generation, viewport.generation,
+                                ))
                             } else if last_output.is_some_and(|last| {
                                 last.epoch != delivery.identity.epoch
                                     || last.revision >= delivery.identity.revision
                             }) {
-                                Err("native presentation revision is stale".into())
+                                Err(format!(
+                                    "native presentation revision is stale: received {:?}, last displayed {:?}",
+                                    delivery.identity, last_output,
+                                ))
                             } else {
                                 let renderer = renderer
                                     .as_mut()
@@ -474,18 +480,30 @@ impl<W: AttachWorker> Application<W> {
                                 Ok(())
                             }
                         });
-                        if accepted {
-                            self.retry = RetryBudget::default();
-                        } else if self.active && !context.metrics().physical_size.is_empty() {
-                            if let Some(delay) = self.retry.schedule(std::time::Instant::now()) {
-                                let proxy = context.proxy();
-                                let _retry_wake = self.runtime.spawn(async move {
-                                    tokio::time::sleep(delay).await;
-                                    let _ = proxy.wake();
-                                });
-                            } else {
-                                bail!("native presentation recovery exhausted");
+                        if let Err(error) = accepted {
+                            if self.active && !context.metrics().physical_size.is_empty() {
+                                if let Some(delay) = self.retry.schedule(std::time::Instant::now())
+                                {
+                                    eprintln!(
+                                        "bterm: {error}; retry {}/3 in {}ms (viewport={}, surface={:?})",
+                                        self.retry.attempts,
+                                        delay.as_millis(),
+                                        self.viewport.generation,
+                                        context.metrics().physical_size,
+                                    );
+                                    let proxy = context.proxy();
+                                    let _retry_wake = self.runtime.spawn(async move {
+                                        tokio::time::sleep(delay).await;
+                                        let _ = proxy.wake();
+                                    });
+                                } else {
+                                    bail!(
+                                        "native presentation recovery exhausted after 3 retries: {error}"
+                                    );
+                                }
                             }
+                        } else {
+                            self.retry = RetryBudget::default();
                         }
                     } else if self.active
                         && !context.metrics().physical_size.is_empty()
@@ -517,7 +535,7 @@ impl<W: AttachWorker> Application<W> {
     fn reject_pending(&self, reason: &str) {
         if let Some(output) = &self.output {
             while let Some(pending) = output.try_recv() {
-                pending.present(|_| Err(reason.into()));
+                let _ = pending.present(|_| Err(reason.into()));
             }
         }
     }
