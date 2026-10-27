@@ -59,6 +59,17 @@ pub(super) fn authorize_route(ctx: &NativeServiceContext) -> Result<(), ServiceR
             "authorization_denied",
             "remote route is not migrated to authoritative resource checks",
         )),
+        StreamProvenance::HostInternal
+            if ctx.caller_client_id.is_none()
+                && ctx.request.caller_plugin_id == "bmux.pane_runtime"
+                && ctx.request.service.interface_id == "pane-runtime-readiness-v1"
+                && matches!(
+                    ctx.request.operation.as_str(),
+                    "runtime-readiness" | "configure-managed-idle" | "fence-managed-idle"
+                ) =>
+        {
+            Ok(())
+        }
         StreamProvenance::Invalid | StreamProvenance::HostInternal => Err(ServiceResponse::error(
             "authorization_denied",
             "trusted caller provenance invalid or revoked",
@@ -222,6 +233,35 @@ mod tests {
             cancellation: bmux_plugin_sdk::CancellationToken::default(),
             host_kernel_bridge: Some(bmux_plugin_sdk::HostKernelBridge::from_fn(origin_bridge)),
         }
+    }
+
+    #[test]
+    fn host_lifecycle_origin_is_limited_to_own_retirement_operations() {
+        let origin = Arc::new(Mutex::new(StreamProvenance::HostInternal));
+        TEST_ORIGIN.with(|current| *current.borrow_mut() = origin.clone());
+        let mut ctx = context("pane-runtime-readiness-v1", "runtime-readiness", Vec::new());
+        ctx.caller_client_id = None;
+        assert!(authorize_route(&ctx).is_err());
+        ctx.request.caller_plugin_id = "bmux.pane_runtime".into();
+        for operation in [
+            "runtime-readiness",
+            "configure-managed-idle",
+            "fence-managed-idle",
+        ] {
+            ctx.request.operation = operation.into();
+            assert!(authorize_route(&ctx).is_ok());
+        }
+        for operation in ["fence-unhealthy", "acquire-managed-preparation"] {
+            ctx.request.operation = operation.into();
+            assert!(authorize_route(&ctx).is_err());
+        }
+        ctx.request.service.interface_id = "pane-runtime-execution-v4".into();
+        ctx.request.operation = "send".into();
+        assert!(authorize_route(&ctx).is_err());
+        *origin.lock().unwrap() = StreamProvenance::Invalid;
+        ctx.request.service.interface_id = "pane-runtime-readiness-v1".into();
+        ctx.request.operation = "runtime-readiness".into();
+        assert!(authorize_route(&ctx).is_err());
     }
 
     #[test]

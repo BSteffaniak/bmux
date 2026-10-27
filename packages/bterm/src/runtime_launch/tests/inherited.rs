@@ -64,10 +64,14 @@ async fn launcher_exit_does_not_release_the_child_startup_claim() {
 async fn inherited_claim_is_a_regular_file_and_child_is_detached() {
     use std::os::unix::fs::MetadataExt as _;
     let root = Root::new();
-    let spec = shell_spec(
+    let mut spec = shell_spec(
         &root,
-        "printf '%s\\n%s\\n' \"$BMUX_COMPANION_STARTUP_LOCK_PROTOCOL\" \"$BMUX_COMPANION_STARTUP_LOCK\" > handoff; : > ready; while [ ! -f release ]; do /bin/sleep 0.01; done",
+        "printf '%s\\n%s\\n' \"$BMUX_COMPANION_STARTUP_LOCK_PROTOCOL\" \"$BMUX_COMPANION_STARTUP_LOCK\" > handoff; : > ready; while [ ! -f release ]; do sleep 0.01; done",
     );
+    // The Nix toolchain provides sleep through PATH, not /bin/sleep. Pin that
+    // test tool path explicitly because detached launch clears the environment.
+    spec.environment
+        .insert("PATH".into(), std::env::var_os("PATH").unwrap());
     let owner = OpenOptions::new()
         .create_new(true)
         .read(true)

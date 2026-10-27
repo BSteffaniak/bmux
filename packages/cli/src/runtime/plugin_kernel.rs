@@ -62,6 +62,12 @@ fn retained_kernel_contexts() -> &'static Mutex<RetainedInvocationRegistry> {
     CONTEXTS.get_or_init(Mutex::default)
 }
 
+pub(super) fn managed_host_bridge(
+    context: ServiceInvokeContext,
+) -> Result<bmux_plugin_sdk::HostKernelBridge> {
+    Ok(RetainedKernelContext::register(context)?.bridge())
+}
+
 struct RetainedKernelContext(uuid::Uuid);
 impl RetainedKernelContext {
     fn register(context: ServiceInvokeContext) -> Result<Self> {

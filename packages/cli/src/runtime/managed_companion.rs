@@ -141,7 +141,7 @@ impl ManagedIdlePolicy {
 /// the server and surface the error (or disable this watcher), never translate a
 /// failed inspection into `request_shutdown`. Dropping this future is safe: it
 /// never stops a server, removes ownership evidence, or terminates executions.
-pub(super) async fn watch<C: ServiceCaller + Sync>(
+pub(super) async fn watch<C: ServiceCaller + Clone + Send + Sync + 'static>(
     policy: Option<ManagedIdlePolicy>,
     caller: Option<&C>,
 ) -> Result<()> {
@@ -150,16 +150,25 @@ pub(super) async fn watch<C: ServiceCaller + Sync>(
     };
     let caller = caller.context("managed idle watcher has no activated execution caller")?;
     ensure_local_provider()?;
-    let mut dispatch = ServiceCallerDispatchClient::new(caller);
-    let readiness = client::runtime_readiness(&mut dispatch)
-        .await
-        .context("inspect managed companion execution readiness")?;
+    let readiness = inspect(caller.clone(), |caller| {
+        bmux_plugin::block_on_typed_dispatch(client::runtime_readiness(
+            &mut ServiceCallerDispatchClient::new(&caller),
+        ))
+    })
+    .await?
+    .context("inspect managed companion execution readiness")?;
     policy.verify_readiness(&readiness)?;
     let instance = readiness.instance;
-    let configured = client::configure_managed_idle(&mut dispatch, instance, policy.grace_seconds)
-        .await
-        .context("configure managed companion idle policy")?
-        .map_err(anyhow::Error::msg)?;
+    let configured = inspect(caller.clone(), move |caller| {
+        bmux_plugin::block_on_typed_dispatch(client::configure_managed_idle(
+            &mut ServiceCallerDispatchClient::new(&caller),
+            instance,
+            policy.grace_seconds,
+        ))
+    })
+    .await?
+    .context("configure managed companion idle policy")?
+    .map_err(anyhow::Error::msg)?;
     // Configuration is not the atomic retirement operation. It must never be
     // accepted as shutdown authority, even if a provider unexpectedly fences.
     ensure!(
@@ -175,7 +184,14 @@ pub(super) async fn watch<C: ServiceCaller + Sync>(
         ensure_local_provider()?;
         // fence-managed-idle starts/advances the plugin-owned idle observation;
         // diagnostic managed-idle-status intentionally does not alter that clock.
-        match client::fence_managed_idle(&mut dispatch, instance).await {
+        match inspect(caller.clone(), move |caller| {
+            bmux_plugin::block_on_typed_dispatch(client::fence_managed_idle(
+                &mut ServiceCallerDispatchClient::new(&caller),
+                instance,
+            ))
+        })
+        .await?
+        {
             Ok(Ok(status)) => {
                 consecutive_failures = 0;
                 if policy.verify_status(instance, &status)? {
@@ -199,6 +215,18 @@ pub(super) async fn watch<C: ServiceCaller + Sync>(
         // Client attachment/activity is never sampled as a synthetic keepalive.
         tokio::time::sleep(POLL_INTERVAL).await;
     }
+}
+
+// Synchronous plugin calls must not block the sibling server accept loop.
+async fn inspect<C, R, F>(caller: C, call: F) -> Result<R>
+where
+    C: Send + 'static,
+    R: Send + 'static,
+    F: FnOnce(C) -> R + Send + 'static,
+{
+    tokio::task::spawn_blocking(move || call(caller))
+        .await
+        .context("join managed idle inspection")
 }
 
 fn ensure_local_provider() -> Result<()> {
@@ -354,6 +382,7 @@ mod tests {
         assert!(disabled.verify_status(instance, &observed).is_err());
     }
 
+    #[derive(Clone)]
     struct NoCalls;
     impl ServiceCaller for NoCalls {
         fn call_service_raw(
@@ -373,6 +402,19 @@ mod tests {
         ) -> bmux_plugin_sdk::Result<bmux_ipc::ResponsePayload> {
             panic!("idle watcher must not open a kernel connection")
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn inspection_does_not_block_sibling_server_future() {
+        let (send, receive) = std::sync::mpsc::sync_channel(1);
+        let inspection = inspect((), move |()| receive.recv_timeout(Duration::from_secs(2)));
+        let server = async move {
+            send.send(()).unwrap();
+        };
+        let (result, ()) = tokio::join!(inspection, server);
+        result
+            .unwrap()
+            .expect("synchronous inspection starved server polling");
     }
 
     #[tokio::test]

@@ -1300,6 +1300,18 @@ impl BmuxServer {
             .insert(route);
         Ok(())
     }
+    /// Bind an in-process host caller without inventing a local transport identity.
+    #[must_use]
+    pub fn host_service_context(&self) -> ServiceInvokeContext {
+        ServiceInvokeContext {
+            host_internal: true,
+            state: Arc::clone(&self.state),
+            shutdown_tx: self.shutdown_tx.clone(),
+            client_id: ClientId::new(),
+            client_principal_id: Uuid::nil(),
+        }
+    }
+
     /// Actual host-owned generic state context for in-process provider wiring.
     /// Pass this context explicitly; a plugin library's own global registry is
     /// not shared across dynamic-library or process boundaries.

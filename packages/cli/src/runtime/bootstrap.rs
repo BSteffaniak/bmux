@@ -695,7 +695,14 @@ async fn run_server_start_inner(
         .context("foreground startup has no lifetime claim")?;
     let managed_idle_caller = managed_idle_policy
         .as_ref()
-        .map(|_| super::plugin_runtime::managed_companion_caller(&loaded_plugins, &config, &paths))
+        .map(|_| {
+            super::plugin_runtime::managed_companion_caller(
+                &server,
+                &loaded_plugins,
+                &config,
+                &paths,
+            )
+        })
         .transpose()?;
     let (server_ready_tx, server_ready_rx) = tokio::sync::oneshot::channel();
     let managed_idle = async {
