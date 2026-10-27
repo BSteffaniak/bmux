@@ -1,5 +1,6 @@
 //! Owner-private control client for the installed supervisor artifact.
 use crate::supervisor_protocol::{self as protocol, Bootstrap, Operation, Request, Response};
+use anyhow::Context as _;
 use sha2::{Digest, Sha256};
 use std::fmt::Write as FmtWrite;
 use std::io::Write;
@@ -263,16 +264,23 @@ impl SupervisorControl {
             "supervisor helper path must be absolute"
         );
         let mut digest = String::with_capacity(64);
-        for byte in Sha256::digest(std::fs::read(&installation.path)?) {
+        for byte in Sha256::digest(std::fs::read(&installation.path).with_context(|| {
+            format!(
+                "cannot read retained execution supervisor {}",
+                installation.path.display()
+            )
+        })?) {
             write!(&mut digest, "{byte:02x}")?;
         }
         anyhow::ensure!(
             digest == installation.hash,
-            "supervisor helper artifact hash mismatch"
+            "supervisor helper artifact hash mismatch: {}",
+            installation.path.display()
         );
         // Match the existing resurrection host's short, owner-private endpoint
         // mechanism. Persist the generated locator; never reconstruct by hashing.
-        let endpoint_directory = short_endpoint_directory()?;
+        let endpoint_directory = short_endpoint_directory()
+            .context("cannot create supervisor endpoint directory in /tmp")?;
         let directory = endpoint_directory.path().to_path_buf();
         anyhow::ensure!(
             directory.join("control.sock").as_os_str().len() < 104,
@@ -297,9 +305,13 @@ impl SupervisorControl {
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600);
         }
-        let mut file = options.open(&path)?;
-        file.write_all(&serde_json::to_vec(&bootstrap)?)?;
-        file.sync_all()?;
+        let mut file = options
+            .open(&path)
+            .with_context(|| format!("cannot create supervisor bootstrap {}", path.display()))?;
+        file.write_all(&serde_json::to_vec(&bootstrap)?)
+            .with_context(|| format!("cannot write supervisor bootstrap {}", path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("cannot sync supervisor bootstrap {}", path.display()))?;
         std::fs::File::open(&directory)?.sync_all()?;
         let locator = installation.root.join(format!("supervisor-{token}.json"));
         crate::atomic_state::commit(
@@ -309,7 +321,8 @@ impl SupervisorControl {
                 "endpoint": directory.join("control.sock"), "bootstrap": path,
                 "artifact_sha256": installation.hash,
             }),
-        )?;
+        )
+        .with_context(|| format!("cannot commit supervisor locator {}", locator.display()))?;
         // Keep the locator until explicit retirement. The execution itself is
         // bounded by the server-owned lifetime socket, not this directory.
         let _retained_directory = endpoint_directory.keep();

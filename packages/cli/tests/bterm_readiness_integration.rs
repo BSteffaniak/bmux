@@ -1,4 +1,7 @@
 //! Fresh-server readiness registration must work before any terminal is spawned.
+#[cfg(target_os = "macos")]
+#[path = "support/managed_image.rs"]
+mod managed_image;
 #[allow(dead_code)] // Shared fixture also supports gateway and log-inspection tests.
 mod support;
 
@@ -7,6 +10,7 @@ async fn managed_companion_idle_watch_does_not_block_handshake_or_lose_host_orig
     use bmux_pane_runtime_plugin_api::pane_runtime_readiness_v1::client;
     use std::time::{Duration, Instant};
     let server = support::ServerEnv::new("bterm-managed-readiness");
+    #[cfg(not(target_os = "macos"))]
     let marker = r#"{"selected":"managed-readiness-test"}"#;
     let log = server.root().join("managed-startup.log");
     let output = std::fs::File::create(&log).unwrap();
@@ -18,10 +22,24 @@ async fn managed_companion_idle_watch_does_not_block_handshake_or_lose_host_orig
             let _ = self.0.wait();
         }
     }
+    // Managed macOS admission attests the actual immutable mapped image.
+    #[cfg(target_os = "macos")]
+    let image = managed_image::Image::new(server.root());
+    #[cfg(target_os = "macos")]
+    let marker = image.identity.as_str();
+    #[cfg(not(target_os = "macos"))]
+    let mut command = server.command(&["server", "start", "--foreground-internal"]);
+    #[cfg(target_os = "macos")]
+    let mut command =
+        server.command_with_binary(image.path(), &["server", "start", "--foreground-internal"]);
+    #[cfg(target_os = "macos")]
+    command
+        .env("BMUX_MANAGED_TARGET_IDENTITY", &image.identity)
+        .env("BMUX_MANAGED_EXECUTABLE_SHA256", &image.sha256);
+    #[cfg(not(target_os = "macos"))]
+    command.env("BMUX_MANAGED_TARGET_IDENTITY", marker);
     let mut child = OwnedChild(
-        server
-            .command(&["server", "start", "--foreground-internal"])
-            .env("BMUX_MANAGED_TARGET_IDENTITY", marker)
+        command
             .env("BMUX_MANAGED_TARGET_ID", "a".repeat(64))
             .env("BMUX_MANAGED_IDLE_GRACE_SECONDS", "0")
             .stdin(std::process::Stdio::null())

@@ -5,7 +5,40 @@ use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 
+#[path = "auxiliary/retained.rs"]
+mod retained;
+
 use crate::manifest::{AuxiliaryExecutableDeclaration, safe_auxiliary_name};
+
+/// Resolve only the declared package, then pin its verified bytes for this runtime.
+/// The wire contract stays unchanged; consumers never need the mutable source path.
+pub(super) fn resolve_retained(
+    base: &Path,
+    declaration: &AuxiliaryExecutableDeclaration,
+    owner: &str,
+    connection: &bmux_plugin_sdk::HostConnectionInfo,
+) -> Result<ResolvedAuxiliaryExecutable, String> {
+    if !Path::new(&connection.state_dir).is_absolute()
+        || !Path::new(&connection.runtime_dir).is_absolute()
+    {
+        return Err(
+            "auxiliary retention requires absolute selected state and runtime roots".into(),
+        );
+    }
+    let mut artifact = resolve(base, declaration, owner)?;
+    let scope = format!("{}\0{owner}", connection.runtime_dir);
+    let path = retained::retain(
+        Path::new(&artifact.path),
+        &Path::new(&connection.state_dir).join("auxiliary-images"),
+        &scope,
+        &artifact.artifact_sha256,
+    )?;
+    artifact.path = path
+        .to_str()
+        .ok_or("retained auxiliary path is not UTF-8")?
+        .into();
+    Ok(artifact)
+}
 
 pub(super) fn resolve(
     base: &Path,
@@ -434,6 +467,38 @@ mod windows_tests {
 mod tests {
     use super::*;
     use std::os::unix::fs::{PermissionsExt, symlink};
+
+    #[test]
+    fn retained_resolution_preserves_inventory_checks_and_selected_scope() {
+        let root = tempfile::tempdir().unwrap();
+        let package = root.path().join("package");
+        let state = root.path().join("state");
+        std::fs::create_dir(&package).unwrap();
+        std::fs::create_dir(&state).unwrap();
+        let worker = package.join("worker");
+        std::fs::write(&worker, b"original").unwrap();
+        std::fs::set_permissions(&worker, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut connection = bmux_plugin_sdk::HostConnectionInfo {
+            config_dir: String::new(),
+            config_dir_candidates: Vec::new(),
+            data_dir: String::new(),
+            state_dir: state.to_str().unwrap().into(),
+            runtime_dir: root.path().join("runtime-a").to_str().unwrap().into(),
+        };
+        let spec = declaration();
+        let first = resolve_retained(&package, &spec, "owner", &connection).unwrap();
+        connection.runtime_dir = root.path().join("runtime-b").to_str().unwrap().into();
+        let second = resolve_retained(&package, &spec, "owner", &connection).unwrap();
+        assert_ne!(first.path, second.path);
+        assert_eq!(first.artifact_sha256, second.artifact_sha256);
+        // Invalid authoritative metadata must not be bypassed using a cached image.
+        std::fs::write(package.join("artifacts.json"), br#"{"schema_version":99}"#).unwrap();
+        assert!(resolve_retained(&package, &spec, "owner", &connection).is_err());
+        std::fs::remove_dir_all(&package).unwrap();
+        assert_eq!(std::fs::read(&first.path).unwrap(), b"original");
+        assert_eq!(std::fs::read(&second.path).unwrap(), b"original");
+        assert!(resolve_retained(&package, &spec, "owner", &connection).is_err());
+    }
 
     #[test]
     fn installed_inventory_rejects_tampering_wrong_owner_and_unknown_schema() {

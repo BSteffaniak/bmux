@@ -108,7 +108,11 @@ impl ServerEnv {
 
     #[must_use]
     pub fn command(&self, args: &[&str]) -> Command {
-        let mut command = Command::new(bmux_binary());
+        self.command_with_binary(&bmux_binary(), args)
+    }
+
+    pub fn command_with_binary(&self, binary: &Path, args: &[&str]) -> Command {
+        let mut command = Command::new(binary);
         command
             .args(args)
             .env("BMUX_RUNTIME_DIR", &self.runtime_dir)

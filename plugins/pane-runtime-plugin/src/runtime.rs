@@ -6676,7 +6676,7 @@ impl SessionRuntimeManager {
                 {
                     Ok(control) => control.map(Arc::new),
                     Err(error) => {
-                        fail_startup!(format!("durable supervision unavailable: {error}"));
+                        fail_startup!(format!("durable supervision unavailable: {error:#}"));
                         return;
                     }
                 };

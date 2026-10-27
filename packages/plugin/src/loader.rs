@@ -1784,10 +1784,9 @@ impl LoadedPlugin {
                 })
         };
         for declaration in &manifest.auxiliary_executables {
-            let resolved = base
-                .as_ref()
-                .map_err(Clone::clone)
-                .and_then(|base| auxiliary::resolve(base, declaration, &manifest.id));
+            let resolved = base.as_ref().map_err(Clone::clone).and_then(|base| {
+                auxiliary::resolve_retained(base, declaration, &manifest.id, &context.connection)
+            });
             match resolved {
                 Ok(value) => {
                     context
