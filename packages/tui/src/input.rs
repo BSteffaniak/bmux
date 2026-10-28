@@ -22,6 +22,7 @@ pub struct TextInput<'buffer> {
     selection_style: Style,
     placeholder: Option<Line>,
     placeholder_style: Style,
+    trailing_exclusion: u16,
     cursor_visible: bool,
     vertical_scroll: usize,
     wrapped: Option<&'buffer bmux_text_edit::WrapLayout>,
@@ -38,6 +39,7 @@ impl<'buffer> TextInput<'buffer> {
             selection_style: Style::new().add_modifier(crate::style::Modifier::REVERSED),
             placeholder: None,
             placeholder_style: Style::new(),
+            trailing_exclusion: 0,
             cursor_visible: true,
             vertical_scroll: 0,
             wrapped: None,
@@ -100,6 +102,14 @@ impl<'buffer> TextInput<'buffer> {
         self
     }
 
+    /// Reserve right-edge display cells on the bottom allocated row.
+    /// Wrapping must be supplied through `wrapped_layout` with the same region.
+    #[must_use]
+    pub const fn trailing_exclusion(mut self, columns: u16) -> Self {
+        self.trailing_exclusion = columns;
+        self
+    }
+
     fn paint_scoped(&self, size: LogicalSize, cx: &mut PaintCx<'_, '_>) {
         let clip = cx.area();
         let left = u64::try_from(clip.x.max(0)).unwrap_or(0).min(size.width);
@@ -121,15 +131,20 @@ impl<'buffer> TextInput<'buffer> {
         }
 
         if self.buffer.is_empty() {
+            let width = if size.height == 1 {
+                area.width.saturating_sub(self.trailing_exclusion)
+            } else {
+                area.width
+            };
             if let Some(placeholder) = &self.placeholder {
                 let styled = placeholder
                     .with_fallback_style(self.placeholder_style)
                     .viewport(
                         usize::try_from(left).unwrap_or(usize::MAX),
-                        usize::from(area.width),
+                        usize::from(width),
                     );
                 cx.write_line_with_fallback_style(
-                    LocalRect::new(area.x, 0, area.width, 1),
+                    LocalRect::new(area.x, 0, width, 1),
                     &styled,
                     self.placeholder_style,
                 );
@@ -167,11 +182,21 @@ impl<'buffer> TextInput<'buffer> {
             let Ok(row) = i64::try_from(row) else {
                 return;
             };
+            let y = area.y.saturating_add(row);
+            let row_right = if u64::try_from(y).ok() == size.height.checked_sub(1) {
+                right.min(
+                    size.width
+                        .saturating_sub(u64::from(self.trailing_exclusion)),
+                )
+            } else {
+                right
+            };
+            let row_width = u16::try_from(row_right.saturating_sub(left)).unwrap_or(u16::MAX);
             cx.write_line_with_fallback_style(
-                LocalRect::new(area.x, area.y.saturating_add(row), area.width, 1),
+                LocalRect::new(area.x, y, row_width, 1),
                 &line.viewport(
                     usize::try_from(left).unwrap_or(usize::MAX),
-                    usize::from(area.width),
+                    usize::from(row_width),
                 ),
                 self.style,
             );
@@ -192,6 +217,7 @@ impl<'buffer> TextInput<'buffer> {
     fn layout_revision(&self) -> u64 {
         let mut state = std::collections::hash_map::DefaultHasher::new();
         self.buffer.text().hash(&mut state);
+        self.trailing_exclusion.hash(&mut state);
         self.vertical_scroll.hash(&mut state);
         self.placeholder
             .as_ref()

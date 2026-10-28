@@ -26,6 +26,19 @@ pub struct VisualCursor {
     pub col: usize,
 }
 
+/// A right-edge exclusion on one visual row of a wrapped projection.
+///
+/// Rows before and after this region retain their full width. An indivisible
+/// grapheme that cannot fit beside the region moves to the next row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct WrapExclusion {
+    /// Zero-based visual row occupied by the region.
+    pub row: usize,
+    /// Display columns reserved at the right edge.
+    pub columns: usize,
+}
+
 /// A soft-wrapped text projection and the projected cursor position.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -36,6 +49,9 @@ pub struct WrapLayout {
     pub line_ranges: Vec<Range<usize>>,
     /// Cursor position in the visual line grid.
     pub cursor: VisualCursor,
+    /// Optional row and first excluded column, used for cursor affinity at wraps.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub exclusion: Option<(usize, usize)>,
 }
 
 impl WrapLayout {
@@ -60,6 +76,9 @@ impl WrapLayout {
         if row > 0
             && self.line_ranges[row].start == cursor
             && !text[..cursor].ends_with('\n')
+            && self
+                .exclusion
+                .is_none_or(|(excluded_row, _)| excluded_row != row - 1)
             && self.line_ranges[row - 1].start < cursor
         {
             row -= 1;
@@ -764,75 +783,103 @@ impl TextEditBuffer {
     /// Return a soft-wrapped projection for `width` terminal columns.
     #[must_use]
     pub fn wrapped_layout(&self, width: usize) -> WrapLayout {
-        let projection = self.wrapped_projection(width);
+        self.wrapped_layout_with_exclusion(width, None)
+    }
+
+    /// Return source-mapped wrapping with an optional right-edge exclusion.
+    ///
+    /// The exclusion is applied only on its designated visual row; it does not
+    /// narrow subsequent rows. Width zero degrades to one display column.
+    #[must_use]
+    pub fn wrapped_layout_with_exclusion(
+        &self,
+        width: usize,
+        exclusion: Option<WrapExclusion>,
+    ) -> WrapLayout {
+        let projection = self.wrapped_projection_with_exclusion(width, exclusion);
         let line_ranges = projection
             .lines
             .iter()
             .zip(projection.line_starts.iter().copied())
             .map(|(line, start)| start..start.saturating_add(line.len()))
             .collect();
-        WrapLayout {
+        let mut layout = WrapLayout {
             lines: projection.lines,
             line_ranges,
             cursor: projection.cursor,
-        }
+            exclusion: exclusion
+                .map(|region| (region.row, width.max(1).saturating_sub(region.columns))),
+        };
+        layout.cursor = layout.cursor_for_byte_index(&self.text, self.cursor);
+        layout
     }
 
     fn wrapped_projection(&self, width: usize) -> WrappedProjection {
+        self.wrapped_projection_with_exclusion(width, None)
+    }
+
+    fn wrapped_projection_with_exclusion(
+        &self,
+        width: usize,
+        exclusion: Option<WrapExclusion>,
+    ) -> WrappedProjection {
         let width = width.max(1);
         let mut lines = vec![String::new()];
         let mut line_starts = vec![0usize];
         let mut row = 0usize;
         let mut col = 0usize;
-        let mut break_after_whitespace: Option<usize> = None;
-
-        for span in grapheme_spans(&self.text) {
+        let mut break_after_whitespace: Option<(usize, usize)> = None;
+        let spans = grapheme_spans(&self.text);
+        let mut index = 0;
+        while let Some(span) = spans.get(index) {
             let grapheme = &self.text[span.start..span.end];
             if grapheme == "\n" {
                 lines.push(String::new());
                 line_starts.push(span.end);
-                row = row.saturating_add(1);
+                row += 1;
+                col = 0;
+                break_after_whitespace = None;
+                index += 1;
+                continue;
+            }
+            let excluded = exclusion.filter(|region| region.row == row);
+            let available = excluded.map_or(width, |region| width.saturating_sub(region.columns));
+            if col.saturating_add(span.width) > available && (col > 0 || excluded.is_some()) {
+                let next_start = if col > 0 && is_wrapping_whitespace(grapheme) {
+                    index += 1;
+                    span.end
+                } else if let Some((next_index, split)) = break_after_whitespace
+                    && split > line_starts[row]
+                    && split < span.start
+                {
+                    lines[row].truncate(split.saturating_sub(line_starts[row]));
+                    index = next_index;
+                    split
+                } else {
+                    span.start
+                };
+                lines.push(String::new());
+                line_starts.push(next_start);
+                row += 1;
                 col = 0;
                 break_after_whitespace = None;
                 continue;
             }
-
-            if col > 0 && col.saturating_add(span.width) > width {
-                if is_wrapping_whitespace(grapheme) {
-                    lines.push(String::new());
-                    line_starts.push(span.end);
-                    row = row.saturating_add(1);
-                    col = 0;
-                    break_after_whitespace = None;
-                    continue;
-                }
-                if let Some(break_start) = break_after_whitespace
-                    && break_start > line_starts[row]
-                    && break_start < span.start
-                {
-                    let split_at = break_start.saturating_sub(line_starts[row]);
-                    let moved = lines[row].split_off(split_at);
-                    lines.push(moved);
-                    line_starts.push(break_start);
-                    row = row.saturating_add(1);
-                    col = UnicodeWidthStr::width(lines[row].as_str());
-                    break_after_whitespace = last_whitespace_break(&lines[row], line_starts[row]);
-                } else {
-                    lines.push(String::new());
-                    line_starts.push(span.start);
-                    row = row.saturating_add(1);
-                    col = 0;
-                    break_after_whitespace = None;
-                }
-            }
-
             lines[row].push_str(grapheme);
             col = col.saturating_add(span.width);
+            index += 1;
             if is_wrapping_whitespace(grapheme) {
-                break_after_whitespace = Some(span.end);
+                break_after_whitespace = Some((index, span.end));
             }
         }
 
+        if let Some(region) = exclusion
+            && row == region.row
+            && col >= width.saturating_sub(region.columns)
+        {
+            lines.push(String::new());
+            line_starts.push(self.text.len());
+        }
         let cursor = visual_cursor_for_wrapped_lines(&self.text, self.cursor, &lines, &line_starts);
         WrappedProjection {
             lines,
@@ -881,18 +928,6 @@ fn visual_cursor_for_wrapped_lines(
 
 fn is_wrapping_whitespace(grapheme: &str) -> bool {
     grapheme != "\n" && grapheme.chars().all(char::is_whitespace)
-}
-
-fn last_whitespace_break(line: &str, line_start: usize) -> Option<usize> {
-    line.grapheme_indices(true)
-        .rev()
-        .find_map(|(index, grapheme)| {
-            is_wrapping_whitespace(grapheme).then_some(
-                line_start
-                    .saturating_add(index)
-                    .saturating_add(grapheme.len()),
-            )
-        })
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1028,6 +1063,58 @@ mod tests {
         assert_eq!(buffer.cursor_byte_index(), 7);
         buffer.move_cursor(TextMotion::WordRight);
         assert_eq!(buffer.cursor_byte_index(), buffer.text().len());
+    }
+
+    #[test]
+    fn exclusion_keeps_cursor_out_of_reserved_cells_at_exact_boundary() {
+        let buffer = TextEditBuffer::from_text("abcdefg");
+        let layout =
+            buffer.wrapped_layout_with_exclusion(12, Some(WrapExclusion { row: 0, columns: 5 }));
+        assert_eq!(layout.cursor, VisualCursor { row: 1, col: 0 });
+        assert_eq!(
+            layout.cursor_for_byte_index(buffer.text(), 7),
+            layout.cursor
+        );
+    }
+
+    #[test]
+    fn right_exclusion_reflows_only_its_row_and_preserves_source() {
+        let buffer = TextEditBuffer::from_text("abcdefghijklmno");
+        let layout =
+            buffer.wrapped_layout_with_exclusion(6, Some(WrapExclusion { row: 1, columns: 3 }));
+        assert_eq!(layout.lines, ["abcdef", "ghi", "jklmno"]);
+        assert_eq!(layout.line_ranges, [0..6, 6..9, 9..15]);
+        for cursor in 0..=15 {
+            let mut moved = buffer.clone();
+            moved.cursor = cursor;
+            assert_eq!(
+                moved
+                    .wrapped_layout_with_exclusion(6, Some(WrapExclusion { row: 1, columns: 3 }))
+                    .cursor,
+                layout.cursor_for_byte_index(buffer.text(), cursor)
+            );
+        }
+    }
+
+    #[test]
+    fn excluded_rows_never_split_or_overlap_wide_graphemes() {
+        for text in ["世界👩‍💻e\u{301}", "hello world again", "a\nb\n", ""] {
+            let buffer = TextEditBuffer::from_text(text);
+            for width in 1..12 {
+                for columns in 0..=width {
+                    let layout = buffer.wrapped_layout_with_exclusion(
+                        width,
+                        Some(WrapExclusion { row: 0, columns }),
+                    );
+                    if let Some(line) = layout.lines.first() {
+                        assert!(UnicodeWidthStr::width(line.as_str()) <= width - columns);
+                    }
+                    for range in layout.line_ranges {
+                        assert!(text.get(range).is_some());
+                    }
+                }
+            }
+        }
     }
 
     #[test]

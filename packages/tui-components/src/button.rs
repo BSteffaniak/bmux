@@ -178,6 +178,7 @@ pub struct Button<'a> {
     policy: ButtonPolicy,
     styles: ButtonStyles,
     filled: bool,
+    padding: Option<(u16, u16)>,
 }
 
 /// Canonical component-lifecycle button leaf.
@@ -217,6 +218,14 @@ impl<'a, 'state> ButtonComponent<'a, 'state> {
         self
     }
 
+    /// Override left and right display-cell padding. Filled buttons default to
+    /// two cells per side; bracketed buttons retain their bracket decoration.
+    #[must_use]
+    pub const fn padding(mut self, left: u16, right: u16) -> Self {
+        self.button.padding = Some((left, right));
+        self
+    }
+
     /// Set behavior policy.
     #[must_use]
     pub const fn policy(mut self, policy: ButtonPolicy) -> Self {
@@ -238,6 +247,7 @@ impl Component for ButtonComponent<'_, '_> {
         self.id.as_str().hash(&mut layout);
         self.button.label.hash(&mut layout);
         self.button.filled.hash(&mut layout);
+        self.button.padding.hash(&mut layout);
 
         let mut paint = std::collections::hash_map::DefaultHasher::new();
         format!("{:?}", self.pointer_intent).hash(&mut paint);
@@ -271,7 +281,13 @@ impl Component for ButtonComponent<'_, '_> {
         let state = self.state.get();
         let line = Line::from_spans(vec![Span::styled(
             if self.button.filled {
-                format!("  {}  ", self.button.label)
+                let (left, right) = self.button.padding.unwrap_or((2, 2));
+                format!(
+                    "{}{}{}",
+                    " ".repeat(usize::from(left)),
+                    self.button.label,
+                    " ".repeat(usize::from(right))
+                )
             } else {
                 format!("[ {} ]", self.button.label)
             },
@@ -342,6 +358,7 @@ impl<'a> Button<'a> {
         Self {
             label,
             filled: false,
+            padding: None,
             policy: ButtonPolicy::interactive(),
             styles: ButtonStyles {
                 normal: Style::new(),
@@ -369,12 +386,27 @@ impl<'a> Button<'a> {
         self
     }
 
+    /// Configure filled chrome and its left and right display-cell padding.
+    /// The same padding determines rendering and pointer geometry.
+    #[must_use]
+    pub const fn filled_padding(mut self, left: u16, right: u16) -> Self {
+        self.filled = true;
+        self.padding = Some((left, right));
+        self
+    }
+
     /// Return rendered button width.
     #[must_use]
     pub fn width(&self) -> u16 {
+        let (left, right) = if self.filled {
+            self.padding.unwrap_or((2, 2))
+        } else {
+            (2, 2)
+        };
         u16::try_from(bmux_tui::text_width::display_width(self.label))
             .unwrap_or(u16::MAX)
-            .saturating_add(4)
+            .saturating_add(left)
+            .saturating_add(right)
     }
 
     /// Handle one input event.
@@ -997,6 +1029,28 @@ mod tests {
         button.paint(&layout, &mut PaintCx::new(&mut frame));
 
         assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("[ Save ]  "));
+    }
+
+    #[test]
+    fn compact_padding_measures_and_paints_the_same_pointer_region() {
+        let state = Cell::new(ButtonState::new());
+        for (label, left, right, width) in [("Send", 1, 0, 5), ("▾", 1, 1, 3), ("界", 0, 0, 2)] {
+            let button = Button::new(label).filled_padding(left, right);
+            assert_eq!(button.width(), width);
+            let component = ButtonComponent::new("compact", label, &state)
+                .filled()
+                .padding(left, right);
+            let layout = component.layout(
+                Constraints::loose(bmux_tui::geometry::Size::new(40, 1)),
+                &mut LayoutCx::new(),
+            );
+            assert_eq!(layout.size.width, u64::from(width));
+            let mut buffer = bmux_tui::buffer::Buffer::empty(Rect::new(0, 0, 40, 1));
+            let mut frame = bmux_tui::frame::Frame::new(&mut buffer);
+            component.paint(&layout, &mut PaintCx::new(&mut frame));
+            assert_eq!(frame.hits().regions()[0].area.width, width);
+            assert!(frame.buffer().row_symbols(0).unwrap().contains(label));
+        }
     }
 
     #[test]

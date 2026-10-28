@@ -1,6 +1,6 @@
 //! Higher-level text-input control with opt-in behavior policies.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
 
@@ -36,6 +36,8 @@ pub struct TextInputState {
     scroll: ScrollViewState,
     mouse_selection: MouseSelectionState,
     wrapped: RefCell<Option<(u64, usize, bmux_text_edit::WrapLayout)>>,
+    exclusion_columns: u16,
+    exclusion_key: Cell<Option<bmux_text_edit::WrapExclusion>>,
 }
 
 // Derived measurement state must not change the meaning of editor equality.
@@ -47,6 +49,7 @@ impl PartialEq for TextInputState {
             && self.logical_width == other.logical_width
             && self.pointer_offset == other.pointer_offset
             && self.scroll == other.scroll
+            && self.exclusion_columns == other.exclusion_columns
             && self.mouse_selection == other.mouse_selection
     }
 }
@@ -151,6 +154,8 @@ impl TextInputState {
                 active: restored.active,
             },
             wrapped: RefCell::new(None),
+            exclusion_columns: 0,
+            exclusion_key: Cell::new(None),
         };
         Ok(())
     }
@@ -167,10 +172,63 @@ impl TextInputState {
             scroll: ScrollViewState::new(),
             mouse_selection: MouseSelectionState::default(),
             wrapped: RefCell::new(None),
+            exclusion_columns: 0,
+            exclusion_key: Cell::new(None),
         }
     }
 
+    /// Reserve right-edge cells on the last visible editor row. All other rows
+    /// retain full width; cursor, selection and mouse routing share this layout.
+    pub fn set_trailing_exclusion(&mut self, columns: u16, policy: &TextInputPolicy) {
+        self.exclusion_columns = columns;
+        self.sync_scroll_to_cursor(policy);
+    }
+
+    /// Measure the minimum content height beside a bottom-right region.
+    ///
+    /// At most two projections are needed: full-width wrapping, then wrapping
+    /// with the final row shortened. The result is clamped to `maximum`.
+    #[must_use]
+    pub fn rows_with_trailing_exclusion(&self, width: u16, columns: u16, maximum: u16) -> u16 {
+        let maximum = maximum.max(1);
+        let base = self
+            .buffer
+            .wrapped_layout(usize::from(width))
+            .lines
+            .len()
+            .max(1);
+        let rows = base.min(usize::from(maximum));
+        if base > usize::from(maximum) || columns == 0 {
+            return u16::try_from(rows).unwrap_or(maximum);
+        }
+        let layout = self.buffer.wrapped_layout_with_exclusion(
+            usize::from(width),
+            Some(bmux_text_edit::WrapExclusion {
+                row: rows - 1,
+                columns: usize::from(columns),
+            }),
+        );
+        u16::try_from(layout.lines.len().max(rows))
+            .unwrap_or(maximum)
+            .min(maximum)
+    }
+
     fn wrapped_layout(&self, width: u64) -> std::cell::Ref<'_, bmux_text_edit::WrapLayout> {
+        let exclusion = (self.exclusion_columns > 0 && self.viewport_height > 0).then(|| {
+            bmux_text_edit::WrapExclusion {
+                row: usize::try_from(
+                    self.scroll
+                        .vertical_offset()
+                        .saturating_add(self.viewport_height)
+                        .saturating_sub(1),
+                )
+                .unwrap_or(usize::MAX),
+                columns: usize::from(self.exclusion_columns),
+            }
+        });
+        if self.exclusion_key.replace(exclusion) != exclusion {
+            *self.wrapped.borrow_mut() = None;
+        }
         let stale = self
             .wrapped
             .borrow()
@@ -180,8 +238,10 @@ impl TextInputState {
             *self.wrapped.borrow_mut() = Some((
                 width,
                 self.buffer.cursor_byte_index(),
-                self.buffer
-                    .wrapped_layout(usize::try_from(width.max(1)).unwrap_or(usize::MAX)),
+                self.buffer.wrapped_layout_with_exclusion(
+                    usize::try_from(width.max(1)).unwrap_or(usize::MAX),
+                    exclusion,
+                ),
             ));
         } else if let Some((_, cursor, layout)) = self.wrapped.borrow_mut().as_mut()
             && *cursor != self.buffer.cursor_byte_index()
@@ -253,6 +313,11 @@ impl TextInputState {
             return;
         };
         self.scroll.set_vertical_offset(offset);
+        if self.exclusion_columns > 0
+            && let Some(offset) = self.cursor_scroll_offset(policy)
+        {
+            self.scroll.set_vertical_offset(offset);
+        }
     }
 
     /// Return the scroll offset that keeps the cursor visible.
@@ -267,7 +332,11 @@ impl TextInputState {
             layout.lines.len().max(layout.cursor.row.saturating_add(1)),
         );
         // Preserve the editor's cursor-at-bottom policy while sharing reveal/clamping.
-        let mut scroll = ScrollViewState::new();
+        let mut scroll = if self.exclusion_columns == 0 {
+            ScrollViewState::new()
+        } else {
+            self.scroll
+        };
         ScrollView::new().ensure_visible(
             &viewport,
             &mut scroll,
@@ -300,9 +369,18 @@ pub struct TextInputComponent<'policy, 'state> {
     placeholder_style: Style,
     focused: bool,
     disabled: bool,
+    trailing_exclusion: u16,
 }
 
 impl<'policy, 'state> TextInputComponent<'policy, 'state> {
+    /// Reserve cells at the right edge of the bottom visible row. The caller
+    /// places its floating child in this region using the same measured width.
+    #[must_use]
+    pub const fn trailing_exclusion(mut self, columns: u16) -> Self {
+        self.trailing_exclusion = columns;
+        self
+    }
+
     /// Override pointer presentation without changing input routing or mouse policy.
     #[must_use]
     pub const fn pointer_intent(mut self, intent: bmux_tui::pointer::PointerIntent) -> Self {
@@ -329,6 +407,7 @@ impl<'policy, 'state> TextInputComponent<'policy, 'state> {
             placeholder_style: Style::new(),
             focused: false,
             disabled: false,
+            trailing_exclusion: 0,
         }
     }
 
@@ -388,6 +467,7 @@ impl Component for TextInputComponent<'_, '_> {
         self.policy.viewport.min_rows.hash(&mut layout);
         self.policy.viewport.max_rows.hash(&mut layout);
 
+        self.trailing_exclusion.hash(&mut layout);
         let mut paint = std::collections::hash_map::DefaultHasher::new();
         format!("{:?}", self.pointer_intent).hash(&mut paint);
         state.buffer().cursor_grapheme_index().hash(&mut paint);
@@ -409,8 +489,22 @@ impl Component for TextInputComponent<'_, '_> {
         cx.record_measurement();
         let width = constraints.max_width();
         let state = self.state.borrow();
-        let rows = TextInputControl::new(self.policy)
-            .visible_rows_for_width(&state, width.try_into().unwrap_or(u16::MAX));
+        let rows = if self.trailing_exclusion == 0 {
+            TextInputControl::new(self.policy)
+                .visible_rows_for_width(&state, width.try_into().unwrap_or(u16::MAX))
+        } else {
+            let maximum = constraints
+                .max_height()
+                .unwrap_or_else(|| u64::from(u16::MAX))
+                .min(u64::from(self.policy.viewport.max_rows.unwrap_or(u16::MAX)));
+            state
+                .rows_with_trailing_exclusion(
+                    width.try_into().unwrap_or(u16::MAX),
+                    self.trailing_exclusion,
+                    maximum.try_into().unwrap_or(u16::MAX),
+                )
+                .max(self.policy.viewport.min_rows.max(1))
+        };
         LayoutNode::leaf(
             self.id.clone(),
             constraints.constrain(LogicalSize::new(
@@ -437,10 +531,12 @@ impl Component for TextInputComponent<'_, '_> {
         );
         let mut state = self.state.borrow_mut();
         state.viewport_height = layout.size.height;
+        state.exclusion_columns = self.trailing_exclusion;
         state.set_geometry(area, layout.size.width, (0, 0), self.policy);
         let wrapped = state.wrapped_layout(state.logical_width);
         let mut input = TextInput::new(state.buffer())
             .wrapped_layout(&wrapped)
+            .trailing_exclusion(self.trailing_exclusion)
             .id(self.id.clone())
             .style(self.style)
             .selection_style(self.selection_style)
@@ -451,20 +547,59 @@ impl Component for TextInputComponent<'_, '_> {
             input = input.placeholder(placeholder);
         }
         input.paint(layout, cx);
+        let regions = if self.trailing_exclusion > 0 {
+            vec![
+                Rect::new(0, 0, area.width, height.saturating_sub(1)),
+                Rect::new(
+                    0,
+                    height.saturating_sub(1),
+                    area.width.saturating_sub(self.trailing_exclusion),
+                    height.min(1),
+                ),
+            ]
+        } else {
+            vec![area]
+        };
         let clip = cx.area();
         cx.with_child(
             clip.x,
             clip.y,
             LocalRect::new(0, 0, clip.width, clip.height),
             |cx| {
-                cx.push_hit(
-                    HitRegion::new(self.id.as_str(), Rect::new(0, 0, clip.width, clip.height))
-                        .role(HitRole::TextInput)
-                        .pointer_intent(self.pointer_intent)
-                        .hoverable(true)
-                        .focusable(true)
-                        .enabled(!self.disabled),
-                );
+                let visible = Rect::new(0, 0, clip.width, clip.height);
+                let visible_regions = if self.trailing_exclusion == 0 {
+                    vec![visible]
+                } else {
+                    regions
+                        .into_iter()
+                        .filter_map(|region| {
+                            let left = i64::from(region.x).max(i64::from(clip.x));
+                            let top = i64::from(region.y).max(clip.y);
+                            let right = i64::from(region.right())
+                                .min(i64::from(clip.x) + i64::from(clip.width));
+                            let bottom =
+                                i64::from(region.bottom()).min(clip.y + i64::from(clip.height));
+                            (right > left && bottom > top).then(|| {
+                                Rect::new(
+                                    u16::try_from(left - i64::from(clip.x)).unwrap_or(u16::MAX),
+                                    u16::try_from(top - clip.y).unwrap_or(u16::MAX),
+                                    u16::try_from(right - left).unwrap_or(u16::MAX),
+                                    u16::try_from(bottom - top).unwrap_or(u16::MAX),
+                                )
+                            })
+                        })
+                        .collect()
+                };
+                for region in visible_regions {
+                    cx.push_hit(
+                        HitRegion::new(self.id.as_str(), region)
+                            .role(HitRole::TextInput)
+                            .pointer_intent(self.pointer_intent)
+                            .hoverable(true)
+                            .focusable(true)
+                            .enabled(!self.disabled),
+                    );
+                }
                 cx.push_semantic(SemanticRegion::new(
                     self.id.as_str(),
                     Rect::new(0, 0, clip.width, clip.height),
@@ -485,6 +620,7 @@ impl Component for TextInputComponent<'_, '_> {
         let mut state = self.state.borrow_mut();
         state.viewport_height = layout.size.height;
         let (x, y) = cx.local_point(bmux_tui::geometry::Point::new(area.x, area.y));
+        state.exclusion_columns = self.trailing_exclusion;
         state.set_geometry(
             area,
             layout.size.width,
@@ -1281,6 +1417,12 @@ fn mouse_wrapped_position(state: &TextInputState, mouse: MouseEvent) -> Option<(
     if mouse.position.x < area.x || mouse.position.x >= area.right() {
         return None;
     }
+    if state.exclusion_columns > 0
+        && mouse.position.y == area.bottom().saturating_sub(1)
+        && mouse.position.x >= area.right().saturating_sub(state.exclusion_columns)
+    {
+        return None;
+    }
     Some((
         pointer_source_row(state, usize::from(mouse.position.y.saturating_sub(area.y))),
         usize::from(mouse.position.x.saturating_sub(area.x)).saturating_add(state.pointer_offset.0),
@@ -2027,6 +2169,86 @@ mod tests {
                 fresh.borrow().vertical_scroll()
             );
         }
+    }
+
+    #[test]
+    fn trailing_exclusion_reclaims_full_rows_and_keeps_scroll_stable() {
+        let policy = TextInputPolicy::chat_composer();
+        let mut state =
+            TextInputState::new(TextEditBuffer::from_text("abcdefghijklmnopqrstuvwxyz"));
+        state.viewport_height = 2;
+        state.exclusion_columns = 5;
+        state.set_content_area(Rect::new(0, 0, 12, 2), &policy);
+        let scroll = state.vertical_scroll();
+        for _ in 0..8 {
+            state.sync_scroll_to_cursor(&policy);
+            assert_eq!(state.vertical_scroll(), scroll);
+            let projection = state.wrapped_layout(12);
+            let row = projection
+                .cursor
+                .row
+                .saturating_sub(usize::try_from(scroll).unwrap());
+            assert!(row < 2);
+            if row == 1 {
+                assert!(projection.cursor.col < 7);
+            }
+        }
+        state.buffer_mut().clear();
+        state.buffer_mut().insert_str("abc");
+        state.sync_scroll_to_cursor(&policy);
+        assert_eq!(state.vertical_scroll(), 0);
+        assert_eq!(state.rows_with_trailing_exclusion(12, 5, 8), 1);
+        state.set_content_area(Rect::new(0, 0, 20, 1), &policy);
+        assert_eq!(state.wrapped_layout(20).lines, ["abc"]);
+    }
+
+    #[test]
+    fn trailing_exclusion_uses_one_row_until_text_needs_another() {
+        let short = TextInputState::new(TextEditBuffer::from_text("hello"));
+        assert_eq!(short.rows_with_trailing_exclusion(12, 5, 8), 1);
+        let long = TextInputState::new(TextEditBuffer::from_text("abcdefghijk"));
+        assert_eq!(long.rows_with_trailing_exclusion(12, 5, 8), 2);
+        assert_eq!(long.rows_with_trailing_exclusion(20, 5, 8), 1);
+        assert_eq!(long.rows_with_trailing_exclusion(12, 5, 1), 1);
+    }
+
+    #[test]
+    fn trailing_exclusion_shares_paint_cursor_and_pointer_projection() {
+        let policy = TextInputPolicy::chat_composer();
+        let state = RefCell::new(TextInputState::new(TextEditBuffer::from_text(
+            "abcdefghijklmn",
+        )));
+        let component = TextInputComponent::new("editor", &state, &policy)
+            .trailing_exclusion(5)
+            .focused(true);
+        let layout = component.layout(Constraints::tight(Size::new(12, 2)), &mut LayoutCx::new());
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 12, 2));
+        let mut frame = Frame::new(&mut buffer);
+        component.paint(&layout, &mut PaintCx::new(&mut frame));
+        assert_eq!(
+            frame.buffer().row_symbols(0).as_deref(),
+            Some("abcdefghijkl")
+        );
+        assert_eq!(
+            frame.buffer().row_symbols(1).as_deref(),
+            Some("mn          ")
+        );
+        let mut cx = EventCx::with_clip(&layout, Rect::new(0, 0, 12, 2));
+        component.event(
+            &Event::Mouse(MouseEvent::new(
+                MouseEventKind::Down(MouseButton::Left),
+                Point::new(1, 1),
+            )),
+            &layout,
+            &mut cx,
+        );
+        assert_eq!(state.borrow().buffer().cursor_byte_index(), 13);
+        let retained = state.borrow();
+        let wrapped = retained.wrapped_layout(12);
+        assert_eq!(
+            wrapped.cursor,
+            wrapped.cursor_for_byte_index(retained.buffer().text(), 13)
+        );
     }
 
     #[test]
