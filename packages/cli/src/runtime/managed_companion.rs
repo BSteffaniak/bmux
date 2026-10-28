@@ -13,7 +13,7 @@ use anyhow::{Context, Result, ensure};
 use bmux_pane_runtime_plugin_api::pane_runtime_readiness_v1::{
     ManagedIdleStatus, RuntimeReadiness, client,
 };
-use bmux_plugin::{ServiceCaller, ServiceCallerDispatchClient};
+use bmux_plugin::{ServiceCaller, ServiceCallerDispatchClient, block_on_typed_dispatch};
 
 const DEFAULT_GRACE_SECONDS: u64 = 900;
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
@@ -141,32 +141,31 @@ impl ManagedIdlePolicy {
 /// the server and surface the error (or disable this watcher), never translate a
 /// failed inspection into `request_shutdown`. Dropping this future is safe: it
 /// never stops a server, removes ownership evidence, or terminates executions.
-pub(super) async fn watch<C: ServiceCaller + Clone + Send + Sync + 'static>(
-    policy: Option<ManagedIdlePolicy>,
-    caller: Option<&C>,
-) -> Result<()> {
+pub(super) async fn watch<C>(policy: Option<ManagedIdlePolicy>, caller: Option<&C>) -> Result<()>
+where
+    C: ServiceCaller + Clone + Send + Sync + 'static,
+{
     let Some(policy) = policy else {
         return std::future::pending().await;
     };
     let caller = caller.context("managed idle watcher has no activated execution caller")?;
     ensure_local_provider()?;
-    let readiness = inspect(caller.clone(), |caller| {
-        bmux_plugin::block_on_typed_dispatch(client::runtime_readiness(
-            &mut ServiceCallerDispatchClient::new(&caller),
-        ))
+    let readiness = dispatch(caller, |dispatch| {
+        block_on_typed_dispatch(client::runtime_readiness(dispatch))
     })
-    .await?
+    .await
     .context("inspect managed companion execution readiness")?;
     policy.verify_readiness(&readiness)?;
     let instance = readiness.instance;
-    let configured = inspect(caller.clone(), move |caller| {
-        bmux_plugin::block_on_typed_dispatch(client::configure_managed_idle(
-            &mut ServiceCallerDispatchClient::new(&caller),
+    let grace_seconds = policy.grace_seconds;
+    let configured = dispatch(caller, move |dispatch| {
+        block_on_typed_dispatch(client::configure_managed_idle(
+            dispatch,
             instance,
-            policy.grace_seconds,
+            grace_seconds,
         ))
     })
-    .await?
+    .await
     .context("configure managed companion idle policy")?
     .map_err(anyhow::Error::msg)?;
     // Configuration is not the atomic retirement operation. It must never be
@@ -184,13 +183,10 @@ pub(super) async fn watch<C: ServiceCaller + Clone + Send + Sync + 'static>(
         ensure_local_provider()?;
         // fence-managed-idle starts/advances the plugin-owned idle observation;
         // diagnostic managed-idle-status intentionally does not alter that clock.
-        match inspect(caller.clone(), move |caller| {
-            bmux_plugin::block_on_typed_dispatch(client::fence_managed_idle(
-                &mut ServiceCallerDispatchClient::new(&caller),
-                instance,
-            ))
+        match dispatch(caller, move |dispatch| {
+            block_on_typed_dispatch(client::fence_managed_idle(dispatch, instance))
         })
-        .await?
+        .await
         {
             Ok(Ok(status)) => {
                 consecutive_failures = 0;
@@ -217,16 +213,27 @@ pub(super) async fn watch<C: ServiceCaller + Clone + Send + Sync + 'static>(
     }
 }
 
-// Synchronous plugin calls must not block the sibling server accept loop.
-async fn inspect<C, R, F>(caller: C, call: F) -> Result<R>
+// Generated helpers backed by ServiceCaller are synchronous, including nested
+// kernel checks and artifact verification. Never poll them on the listener task.
+// One awaited operation at a time; cancellation cannot undo an in-flight fence.
+async fn dispatch<C, T>(
+    caller: &C,
+    operation: impl FnOnce(
+        &mut ServiceCallerDispatchClient<'_, C>,
+    ) -> std::result::Result<T, bmux_plugin_sdk::TypedServiceClientError>
+    + Send
+    + 'static,
+) -> Result<T>
 where
-    C: Send + 'static,
-    R: Send + 'static,
-    F: FnOnce(C) -> R + Send + 'static,
+    C: ServiceCaller + Clone + Send + Sync + 'static,
+    T: Send + 'static,
 {
-    tokio::task::spawn_blocking(move || call(caller))
-        .await
-        .context("join managed idle inspection")
+    let caller = caller.clone();
+    tokio::task::spawn_blocking(move || {
+        operation(&mut ServiceCallerDispatchClient::new(&caller)).map_err(anyhow::Error::from)
+    })
+    .await
+    .context("managed idle service task failed")?
 }
 
 fn ensure_local_provider() -> Result<()> {
@@ -404,17 +411,37 @@ mod tests {
         }
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn inspection_does_not_block_sibling_server_future() {
-        let (send, receive) = std::sync::mpsc::sync_channel(1);
-        let inspection = inspect((), move |()| receive.recv_timeout(Duration::from_secs(2)));
-        let server = async move {
-            send.send(()).unwrap();
+    #[tokio::test]
+    async fn synchronous_dispatch_does_not_block_listener_polling() {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let operation = dispatch(&NoCalls, move |_| {
+            started_tx.send(()).unwrap();
+            // A bounded wait makes a scheduling regression fail rather than hang.
+            release_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            Ok(())
+        });
+        let listener = async {
+            started_rx.await.unwrap();
+            release_tx.send(()).unwrap();
         };
-        let (result, ()) = tokio::join!(inspection, server);
-        result
-            .unwrap()
-            .expect("synchronous inspection starved server polling");
+        let (result, ()) = tokio::join!(operation, listener);
+        result.unwrap();
+        assert!(
+            dispatch(&NoCalls, |_| {
+                Err::<(), _>(
+                    bmux_plugin_sdk::TypedDispatchClientError::transport(
+                        "pane-runtime-readiness-v1",
+                        "runtime-readiness",
+                        "inspection failed",
+                    )
+                    .into(),
+                )
+            })
+            .await
+            .is_err(),
+            "inspection failure must not become shutdown permission"
+        );
     }
 
     #[tokio::test]

@@ -62,10 +62,28 @@ fn retained_kernel_contexts() -> &'static Mutex<RetainedInvocationRegistry> {
     CONTEXTS.get_or_init(Mutex::default)
 }
 
-pub(super) fn managed_host_bridge(
-    context: ServiceInvokeContext,
-) -> Result<bmux_plugin_sdk::HostKernelBridge> {
-    Ok(RetainedKernelContext::register(context)?.bridge())
+/// A host-owned registration whose authority ends with its owner, even when
+/// blocking work still retains a bridge clone. Bound calls never reconnect.
+pub(super) struct OwnedKernelContext(RetainedKernelContext);
+
+impl OwnedKernelContext {
+    pub(super) fn new(context: ServiceInvokeContext) -> Result<Self> {
+        Ok(Self(RetainedKernelContext::register(context)?))
+    }
+
+    pub(super) fn bridge(&self) -> bmux_plugin_sdk::HostKernelBridge {
+        self.0.bridge()
+    }
+}
+
+impl Drop for OwnedKernelContext {
+    fn drop(&mut self) {
+        if let Ok(mut contexts) = retained_kernel_contexts().lock()
+            && let Some(entry) = contexts.get_mut(&self.0.0)
+        {
+            entry.cancellation.cancel();
+        }
+    }
 }
 
 struct RetainedKernelContext(uuid::Uuid);
@@ -1169,6 +1187,59 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         bmux_ipc::transport::prepare_private_directory(directory.path(), true).unwrap();
         directory
+    }
+
+    #[tokio::test]
+    async fn owned_host_bridge_is_in_process_isolated_and_revoked_on_drop() {
+        let directory = private_scope_directory();
+        // Neither server is started: any attempt to use transport would fail.
+        let first = BmuxServer::new(bmux_ipc::IpcEndpoint::unix_socket(
+            directory.path().join("a"),
+        ));
+        let second = BmuxServer::new(bmux_ipc::IpcEndpoint::unix_socket(
+            directory.path().join("b"),
+        ));
+        for (server, value) in [(&first, 1_u8), (&second, 2_u8)] {
+            server
+                .register_service_handler(
+                    "test.owner",
+                    bmux_ipc::InvokeServiceKind::Query,
+                    "owner/v1",
+                    "read",
+                    move |_, _, _| async move { Ok(vec![value]) },
+                )
+                .unwrap();
+        }
+        let first = OwnedKernelContext::new(first.host_service_context()).unwrap();
+        let second = OwnedKernelContext::new(second.host_service_context()).unwrap();
+        let first_bridge = first.bridge();
+        let second_bridge = second.bridge();
+        tokio::task::spawn_blocking(move || {
+            // A bound bridge must ignore a different ambient owner.
+            let second_context = retained_kernel_contexts().lock().unwrap()
+                .get(&second_bridge.token().unwrap()).unwrap().context.clone();
+            let _ambient = enter_service_kernel_context(second_context);
+            for (bridge, value) in [(&first_bridge, 1), (&second_bridge, 2)] {
+                assert!(matches!(
+                    invoke_test_bridge(Some(bridge.clone()), &bmux_ipc::Request::CurrentStreamProvenance).unwrap(),
+                    bmux_ipc::ResponsePayload::CurrentStreamProvenance {
+                        provenance: bmux_ipc::StreamProvenance::HostInternal
+                    }
+                ));
+                let response = invoke_test_bridge(Some(bridge.clone()), &bmux_ipc::Request::InvokeService {
+                    capability: "test.owner".into(),
+                    kind: bmux_ipc::InvokeServiceKind::Query,
+                    interface_id: "owner/v1".into(),
+                    operation: "read".into(),
+                    payload: Vec::new(),
+                }).unwrap();
+                assert!(matches!(response, bmux_ipc::ResponsePayload::ServiceInvoked { payload } if payload == vec![value]));
+            }
+            drop(first);
+            assert!(invoke_test_bridge(Some(first_bridge), &bmux_ipc::Request::CurrentStreamProvenance).is_err());
+            assert!(invoke_test_bridge(Some(second_bridge), &bmux_ipc::Request::CurrentStreamProvenance).is_ok());
+            drop(second);
+        }).await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -1128,10 +1128,10 @@ pub(super) fn registered_plugin_infos_from_registry(
 /// Capture an in-process caller for the existing execution service, without a
 /// transport client that could itself affect companion idleness.
 pub(super) fn managed_companion_caller(
-    server: &bmux_server::BmuxServer,
     loaded_plugins: &[bmux_plugin::LoadedPlugin],
     config: &BmuxConfig,
     paths: &ConfigPaths,
+    bridge: bmux_plugin_sdk::HostKernelBridge,
 ) -> Result<bmux_plugin::TypedServiceCaller> {
     let plugin = loaded_plugins
         .iter()
@@ -1169,9 +1169,7 @@ pub(super) fn managed_companion_caller(
             registered_plugins: registered_plugin_infos_from_loaded(loaded_plugins),
         },
     );
-    context.host_kernel_bridge = Some(super::plugin_kernel::managed_host_bridge(
-        server.host_service_context(),
-    )?);
+    context.host_kernel_bridge = Some(bridge);
     Ok(bmux_plugin::TypedServiceCaller::from_lifecycle_context(
         &context,
     ))

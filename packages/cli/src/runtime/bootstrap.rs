@@ -693,14 +693,18 @@ async fn run_server_start_inner(
     let ownership = startup_ownership
         .as_ref()
         .context("foreground startup has no lifetime claim")?;
-    let managed_idle_caller = managed_idle_policy
+    let managed_idle_context = managed_idle_policy
         .as_ref()
-        .map(|_| {
+        .map(|_| super::plugin_kernel::OwnedKernelContext::new(server.host_service_context()))
+        .transpose()?;
+    let managed_idle_caller = managed_idle_context
+        .as_ref()
+        .map(|context| {
             super::plugin_runtime::managed_companion_caller(
-                &server,
                 &loaded_plugins,
                 &config,
                 &paths,
+                context.bridge(),
             )
         })
         .transpose()?;
@@ -715,7 +719,7 @@ async fn run_server_start_inner(
         match super::managed_companion::watch(managed_idle_policy, Some(caller)).await {
             Ok(()) => server.request_shutdown(),
             Err(error) => {
-                tracing::error!(%error, "managed companion idle watcher disabled; shutdown not authorized");
+                tracing::error!(error = %format!("{error:#}"), "managed companion idle watcher disabled; shutdown not authorized");
             }
         }
         std::future::pending::<()>().await;
@@ -768,6 +772,7 @@ async fn run_server_start_inner(
     };
     // Cancellation must release gateway listeners before plugin teardown, which
     // can take time. A pinned reference would keep the underlying future alive.
+    drop(managed_idle_context);
     drop(owned_server_loop);
     drop(server_loop);
     drop(gateway_loop);

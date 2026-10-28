@@ -236,32 +236,45 @@ mod tests {
     }
 
     #[test]
-    fn host_lifecycle_origin_is_limited_to_own_retirement_operations() {
+    fn host_internal_authority_is_limited_to_owned_lifecycle_operations() {
         let origin = Arc::new(Mutex::new(StreamProvenance::HostInternal));
-        TEST_ORIGIN.with(|current| *current.borrow_mut() = origin.clone());
-        let mut ctx = context("pane-runtime-readiness-v1", "runtime-readiness", Vec::new());
-        ctx.caller_client_id = None;
-        assert!(authorize_route(&ctx).is_err());
-        ctx.request.caller_plugin_id = "bmux.pane_runtime".into();
+        TEST_ORIGIN.with(|current| *current.borrow_mut() = Arc::clone(&origin));
         for operation in [
             "runtime-readiness",
             "configure-managed-idle",
             "fence-managed-idle",
         ] {
-            ctx.request.operation = operation.into();
+            let mut ctx = context("pane-runtime-readiness-v1", operation, Vec::new());
+            // An absent external identity is necessary, but not authority itself.
+            assert!(authorize_route(&ctx).is_err());
+            ctx.caller_client_id = None;
+            // Host provenance alone must not authorize another plugin's request.
+            assert!(authorize_route(&ctx).is_err());
+            ctx.request.caller_plugin_id = "bmux.pane_runtime".into();
             assert!(authorize_route(&ctx).is_ok());
-        }
-        for operation in ["fence-unhealthy", "acquire-managed-preparation"] {
-            ctx.request.operation = operation.into();
+            *origin.lock().unwrap() = StreamProvenance::Invalid;
+            assert!(authorize_route(&ctx).is_err());
+            *origin.lock().unwrap() = StreamProvenance::Admitted {
+                subject_id: Uuid::new_v4(),
+                lease_id: Uuid::new_v4(),
+            };
+            assert!(authorize_route(&ctx).is_err());
+            *origin.lock().unwrap() = StreamProvenance::HostInternal;
+            ctx.host_kernel_bridge = None;
             assert!(authorize_route(&ctx).is_err());
         }
-        ctx.request.service.interface_id = "pane-runtime-execution-v4".into();
-        ctx.request.operation = "send".into();
-        assert!(authorize_route(&ctx).is_err());
-        *origin.lock().unwrap() = StreamProvenance::Invalid;
-        ctx.request.service.interface_id = "pane-runtime-readiness-v1".into();
-        ctx.request.operation = "runtime-readiness".into();
-        assert!(authorize_route(&ctx).is_err());
+        for (interface, operation) in [
+            ("pane-runtime-readiness-v1", "fence-unhealthy"),
+            ("pane-runtime-readiness-v1", "future-operation"),
+            ("pane-runtime-execution-v4", "send"),
+            ("pane-runtime-execution-v4", "launch"),
+            ("other-interface", "configure-managed-idle"),
+        ] {
+            let mut ctx = context(interface, operation, Vec::new());
+            ctx.caller_client_id = None;
+            ctx.request.caller_plugin_id = "bmux.pane_runtime".into();
+            assert!(authorize_route(&ctx).is_err(), "{interface}/{operation}");
+        }
     }
 
     #[test]
