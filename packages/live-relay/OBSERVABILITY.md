@@ -74,3 +74,13 @@ builds
 or test execution performed in this lane, per coordinator instruction.
 Coordinator
 must run compilation, clippy, focused relay tests and required workspace checks.
+
+## Log backpressure
+
+Relay records use a dedicated best-effort writer thread, a 64-record queue,
+1024-byte record limit, and process-wide admission cap of eight records per
+second. Producers use nonblocking admission: slow, failed, or contended sinks
+drop logs rather than block runtime workers. `bmux_relay_log_dropped_total`
+exposes suppression. Metrics and bounded diagnostic history remain independent
+of log delivery; critical persistence failure still exits fail-closed even when
+the final log is dropped. External log retention remains operator-managed.

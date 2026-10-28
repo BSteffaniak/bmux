@@ -155,7 +155,10 @@ impl Observability {
     }
     pub fn metrics(&self) -> String {
         let data = self.lock();
-        let mut result = String::from("# TYPE bmux_relay_events_total counter\n");
+        let mut result = format!(
+            "# TYPE bmux_relay_log_dropped_total counter\nbmux_relay_log_dropped_total {}\n# TYPE bmux_relay_events_total counter\n",
+            crate::logging::dropped()
+        );
         for ((event, reason), count) in &data.reasons {
             result.push_str(&format!(
                 "bmux_relay_events_total{{event=\"{event}\",reason=\"{reason}\"}} {count}\n"
@@ -211,10 +214,7 @@ impl Observability {
                 ack_revision: None,
             },
         );
-        eprintln!(
-            "{}",
-            json!({"event":"relay_connected", "role":role, "connection_id":id})
-        );
+        crate::logging::emit(json!({"event":"relay_connected", "role":role, "connection_id":id}));
         Connection {
             telemetry: self.clone(),
             id,
@@ -247,10 +247,9 @@ impl Connection {
         // One structured warning per bounded cause per connection, not per frame.
         if self.seen_rejections & bit == 0 {
             self.seen_rejections |= bit;
-            eprintln!(
-                "{}",
+            crate::logging::emit(
                 json!({"event":"relay_repair_required", "connection_id":self.id,
-                "role":self.role, "reason":reason})
+                "role":self.role, "reason":reason}),
             );
         }
     }
@@ -301,11 +300,8 @@ impl Drop for Connection {
             .history(self.id, self.role, "disconnected", self.reason.label());
         self.telemetry
             .reason(self.role.label(), self.reason.label());
-        eprintln!(
-            "{}",
-            json!({"event":"relay_disconnected", "role":self.role,
-            "connection_id":self.id, "reason":self.reason})
-        );
+        crate::logging::emit(json!({"event":"relay_disconnected", "role":self.role,
+            "connection_id":self.id, "reason":self.reason}));
     }
 }
 
@@ -392,7 +388,7 @@ mod tests {
         assert_eq!(
             metrics
                 .lines()
-                .filter(|line| !line.starts_with('#'))
+                .filter(|line| line.starts_with("bmux_relay_events_total{"))
                 .count(),
             IngestReason::ALL.len()
         );

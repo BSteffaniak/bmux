@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Offline guards for private monitoring; no containers, credentials or cloud IO."""
+import importlib.util
 import json
 import re
 from pathlib import Path
@@ -18,7 +19,7 @@ class MonitoringTests(unittest.TestCase):
         compose = load("compose.json")
         self.assertEqual(set(compose["services"]), {"prometheus", "alertmanager", "grafana"})
         for service in compose["services"].values():
-            self.assertNotIn(":latest", service["image"])
+            self.assertIn(":?Run scripts/check-live-monitoring-images.py", service["image"])
             self.assertEqual(service["restart"], "unless-stopped")
             self.assertTrue(all(p.startswith("127.0.0.1:") for p in service["ports"]))
             self.assertTrue(any(not v.startswith(".") for v in service["volumes"]))
@@ -30,6 +31,35 @@ class MonitoringTests(unittest.TestCase):
         for secret in compose["secrets"].values():
             self.assertTrue(secret["file"].startswith("${MONITORING_"))
             self.assertIn(":?", secret["file"])
+
+    def test_images_are_digest_pinned_and_scanner_fails_closed(self):
+        images = load("images.json")
+        spec = importlib.util.spec_from_file_location("scan", ROOT / "scripts/check-live-monitoring-images.py")
+        scan = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(scan)
+        calls = []
+        class Result:
+            returncode = 0
+        def passing(args, **kwargs):
+            calls.append(args)
+            self.assertIn("--exit-code", args)
+            self.assertIn("HIGH,CRITICAL", args)
+            self.assertNotIn("--ignore-unfixed", args)
+            self.assertFalse(any(k.startswith("TRIVY_") for k in kwargs["env"]))
+            return Result()
+        env = scan.checked_images(images, passing)
+        self.assertEqual(len(calls), 3)
+        for name, image in images.items():
+            self.assertRegex(image, r"@sha256:[0-9a-f]{64}$")
+            self.assertEqual(env["MONITORING_" + name.upper() + "_IMAGE"], image)
+        def failing(*args, **kwargs):
+            result = Result()
+            result.returncode = 1
+            return result
+        with self.assertRaises(RuntimeError):
+            scan.checked_images(images, failing)
+        with self.assertRaises(ValueError):
+            scan.checked_images({**images, "grafana": "grafana/grafana:latest"}, passing)
 
     def test_scrape_uses_separate_file_credential_without_redirects(self):
         config = load("prometheus.json")

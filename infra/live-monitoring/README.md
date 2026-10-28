@@ -9,8 +9,13 @@ labels.
 
 ## Start on a deliberately selected monitoring host
 
-Use Docker Compose v2. Review and pin the three versioned images to registry
-SHA-256 digests under your image-update policy before production deployment.
+Use Docker Compose v2 and Trivy. Exact versioned registry digests are recorded
+in `images.json`. Startup is blocked until every image passes a fresh
+HIGH/CRITICAL scan; scanner errors also block startup. As of 2026-10-28, the
+selected Grafana 13.3.0 and Alertmanager 0.34.1 images still have upstream
+dependency findings. **Do not deploy this stack until patched images pass.**
+Prometheus 3.15.1 passed this severity gate. A passing scan is not a security
+guarantee. Do not override Compose image variables to bypass the gate.
 Create three private, absolute-path regular files outside the checkout:
 
 - The independent **metrics bearer credential**, not the publisher credential.
@@ -25,8 +30,9 @@ commands, tracked files, or support bundles. Validate URL/credential rotation
 against your receiver and relay before relying on alerts.
 
 ```sh
-docker compose -f infra/live-monitoring/compose.json config --quiet
-docker compose -f infra/live-monitoring/compose.json up -d
+python3 scripts/check-live-monitoring-images.py
+# Only after successful scans, explicitly start:
+python3 scripts/check-live-monitoring-images.py --up
 ```
 
 All UI ports bind to loopback. Access Grafana on port 3000 through an SSH
@@ -73,9 +79,15 @@ Run `python3 scripts/test-live-monitoring.py`. With reviewed images available,
 validate native configuration too:
 
 ```sh
-docker run --rm --network none --entrypoint /bin/promtool -v "$PWD/infra/live-monitoring:/etc/prometheus:ro" prom/prometheus:v3.5.0 check rules /etc/prometheus/alerts.json
-docker run --rm --network none --entrypoint /bin/amtool -v "$PWD/infra/live-monitoring:/etc/alertmanager:ro" prom/alertmanager:v0.28.1 check-config /etc/alertmanager/alertmanager.json
+docker run --rm --network none --entrypoint /bin/promtool -v "$PWD/infra/live-monitoring:/etc/prometheus:ro" "$(python3 -c 'import json; print(json.load(open("infra/live-monitoring/images.json"))["prometheus"])')" check rules /etc/prometheus/alerts.json
+docker run --rm --network none --entrypoint /bin/amtool -v "$PWD/infra/live-monitoring:/etc/alertmanager:ro" "$(python3 -c 'import json; print(json.load(open("infra/live-monitoring/images.json"))["alertmanager"])')" check-config /etc/alertmanager/alertmanager.json
 ```
 
 Full Prometheus config validation additionally needs the private credential file
 mounted at `/run/secrets/relay_metrics_key`; do not bake it into a test image.
+
+Image updates must change `images.json`, re-run the scanner gate, and verify
+native configuration compatibility. The gate uses immutable references and
+does not accept ignore files or ignore unfixed findings. Trivy must be available
+on PATH; for a temporary Nix shell use `nix shell nixpkgs#trivy`. No scan result
+is persisted as permission to deploy later.

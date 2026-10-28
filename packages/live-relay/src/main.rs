@@ -30,6 +30,7 @@ use tokio::{
 use uuid::Uuid;
 
 use observability::{Disconnect, Observability, Role};
+mod logging;
 mod observability;
 
 type Result<T> = std::result::Result<T, StatusCode>;
@@ -584,6 +585,7 @@ mod startup;
 
 fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     startup::prepare()?;
+    logging::initialize();
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
@@ -672,7 +674,7 @@ async fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
                 }
                 Ok(false) => {}
                 Err(_) => {
-                    eprintln!("authority persistence failed; terminating fail-closed");
+                    logging::emit(json!({"event":"authority_persistence_failed"}));
                     std::process::exit(1);
                 }
             }
