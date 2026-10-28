@@ -46,7 +46,7 @@ pub struct PromptOption {
     pub value: String,
     pub label: String,
     /// Optional caller-defined text used by searchable prompts. When absent,
-    /// hosts search the label, detail, and key hint.
+    /// hosts search only the label. Details and key hints are presentation metadata.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub search_text: Option<String>,
     /// Primary searchable value for ordered relevance; independent of display labels.
@@ -263,6 +263,10 @@ pub enum PromptSearchMatchMode {
     Prefix,
     Substring,
     /// Explicit v1 ordered matching. Older readers reject this enum variant.
+    /// Groups precede relevance. With relevance enabled, exact primary/text matches,
+    /// whole words or phrases, word prefixes, and substrings outrank fuzzy-only
+    /// matches, in that order. Equal literal quality uses caller-provided order;
+    /// fuzzy-only ties use fuzzy score first. Empty queries use initial order.
     OrderedV1 {
         matching: PromptOrderedMatchMode,
         relevance: bool,

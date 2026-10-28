@@ -1,12 +1,13 @@
 use std::cell::RefCell;
 
 use super::input::{TerminalGeometry, TerminalKeyEvent, TerminalMouseEvent};
+use super::prompt_search::filtered_option_indices;
 use super::render::opaque_row_text;
 use super::state::AttachCursorState;
 use super::tui_surface::{buffer_render_ops, component_theme, surface_buffer};
 use crate::runtime::prompt::{
     PromptField, PromptFormField, PromptFormFieldKind, PromptFormValue, PromptHostRequest,
-    PromptOption, PromptPolicy, PromptRequest, PromptResponse, PromptSearchMatchMode, PromptValue,
+    PromptPolicy, PromptRequest, PromptResponse, PromptValue,
 };
 use anyhow::Result;
 use bmux_appearance::RuntimeAppearance;
@@ -2943,170 +2944,6 @@ fn step_search_selection(selected: usize, len: usize, forward: bool, wrap: bool)
     }
 }
 
-fn filtered_option_indices(
-    options: &[PromptOption],
-    query: &str,
-    match_mode: PromptSearchMatchMode,
-) -> Vec<usize> {
-    let mut scored = options
-        .iter()
-        .enumerate()
-        .filter_map(|(index, option)| {
-            let search_text = option
-                .search_text
-                .as_deref()
-                .unwrap_or(option.label.as_str());
-            if let PromptSearchMatchMode::OrderedV1 {
-                relevance: true, ..
-            } = match_mode
-            {
-                let quality = match_quality(query, search_text).max(
-                    option
-                        .search_primary
-                        .as_deref()
-                        .map_or(0, |primary| match_quality(query, primary)),
-                );
-                search_score(query, search_text, match_mode)
-                    .map(|score| (index, score, option.label.as_str(), quality))
-            } else {
-                search_score(query, search_text, match_mode)
-                    .map(|score| (index, score, option.label.as_str(), 0))
-            }
-        })
-        .collect::<Vec<_>>();
-    scored.sort_by(|left, right| {
-        if let PromptSearchMatchMode::OrderedV1 { relevance, .. } = match_mode {
-            let key = |index: usize| {
-                options[index].search_order.map_or((0, index), |order| {
-                    (
-                        order.group,
-                        if query.trim().is_empty() {
-                            order.initial
-                        } else {
-                            order.filtered
-                        },
-                    )
-                })
-            };
-            let left_key = key(left.0);
-            let right_key = key(right.0);
-            return left_key
-                .0
-                .cmp(&right_key.0)
-                .then_with(|| {
-                    if relevance && !query.trim().is_empty() {
-                        right.3.cmp(&left.3).then_with(|| {
-                            if left.3 == 0 {
-                                right.1.cmp(&left.1)
-                            } else {
-                                std::cmp::Ordering::Equal
-                            }
-                        })
-                    } else {
-                        std::cmp::Ordering::Equal
-                    }
-                })
-                .then_with(|| left_key.1.cmp(&right_key.1))
-                .then_with(|| left.0.cmp(&right.0));
-        }
-        right
-            .1
-            .cmp(&left.1)
-            .then_with(|| left.2.cmp(right.2))
-            .then_with(|| left.0.cmp(&right.0))
-    });
-    scored.into_iter().map(|(index, _, _, _)| index).collect()
-}
-
-// Classify generic searchable values, never product-specific label syntax.
-fn match_quality(query: &str, candidate: &str) -> u8 {
-    let query = query.trim().to_ascii_lowercase();
-    if query.is_empty() {
-        return 0;
-    }
-    let candidate = candidate.to_ascii_lowercase();
-    if candidate == query {
-        4
-    } else if candidate.starts_with(&query) {
-        3
-    } else if candidate.match_indices(&query).any(|(offset, _)| {
-        candidate[..offset]
-            .chars()
-            .next_back()
-            .is_some_and(|ch| !ch.is_alphanumeric())
-    }) {
-        2
-    } else {
-        u8::from(candidate.contains(&query))
-    }
-}
-
-fn search_score(query: &str, candidate: &str, match_mode: PromptSearchMatchMode) -> Option<i64> {
-    let query = query.trim();
-    if query.is_empty() {
-        return Some(0);
-    }
-    match match_mode {
-        PromptSearchMatchMode::OrderedV1 { matching, .. } => {
-            use bmux_plugin_sdk::prompt::PromptOrderedMatchMode;
-            search_score(
-                query,
-                candidate,
-                match matching {
-                    PromptOrderedMatchMode::Fuzzy => PromptSearchMatchMode::Fuzzy,
-                    PromptOrderedMatchMode::Prefix => PromptSearchMatchMode::Prefix,
-                    PromptOrderedMatchMode::Substring => PromptSearchMatchMode::Substring,
-                },
-            )
-        }
-        PromptSearchMatchMode::Fuzzy => fuzzy_score(query, candidate),
-        PromptSearchMatchMode::Prefix => candidate
-            .to_ascii_lowercase()
-            .starts_with(&query.trim().to_ascii_lowercase())
-            .then_some(0),
-        PromptSearchMatchMode::Substring => candidate
-            .to_ascii_lowercase()
-            .contains(&query.trim().to_ascii_lowercase())
-            .then_some(0),
-    }
-}
-
-fn fuzzy_score(query: &str, candidate: &str) -> Option<i64> {
-    let query = query.trim().to_ascii_lowercase();
-    if query.is_empty() {
-        return Some(0);
-    }
-    let candidate_lower = candidate.to_ascii_lowercase();
-    let mut last_match: Option<usize> = None;
-    let mut score = 0_i64;
-    let mut search_from = 0_usize;
-    for needle in query.chars() {
-        let haystack = &candidate_lower[search_from..];
-        let found = haystack.find(needle)?;
-        let absolute = search_from.saturating_add(found);
-        if absolute == 0 {
-            score += 100;
-        } else if candidate_lower
-            .as_bytes()
-            .get(absolute.saturating_sub(1))
-            .is_some_and(|byte| matches!(*byte, b' ' | b'-' | b'_' | b':' | b'/'))
-        {
-            score += 50;
-        }
-        if let Some(previous) = last_match {
-            let gap = absolute.saturating_sub(previous).saturating_sub(1);
-            score -= i64::try_from(gap).unwrap_or(i64::MAX / 4);
-        }
-        score += 10;
-        last_match = Some(absolute);
-        search_from = absolute.saturating_add(needle.len_utf8());
-    }
-    if candidate_lower.starts_with(&query) {
-        score += 200;
-    }
-    Some(score)
-}
-
 fn wrap_lines(input: &str, width: usize) -> Vec<String> {
     if width == 0 {
         return vec![String::new()];
@@ -4532,84 +4369,6 @@ mod tests {
     }
 
     #[test]
-    fn relevance_prefers_exact_primary_prefix_boundary_and_substring_over_fuzzy() {
-        use bmux_plugin_sdk::prompt::{PromptOrderedMatchMode, PromptSearchOrder};
-        let values = ["d-e-p-s", "mydeps", "update-deps", "deps-cleanup", "deps"];
-        let options: Vec<_> = values
-            .iter()
-            .enumerate()
-            .map(|(rank, value)| {
-                let mut option = PromptOption::new(*value, format!("workspace/{value}"))
-                    .search_text(format!("workspace/{value}"));
-                option.search_primary = Some((*value).to_string());
-                option.search_order = Some(PromptSearchOrder {
-                    group: 0,
-                    initial: rank,
-                    filtered: rank,
-                });
-                option
-            })
-            .collect();
-        let mode = PromptSearchMatchMode::OrderedV1 {
-            matching: PromptOrderedMatchMode::Fuzzy,
-            relevance: true,
-        };
-        assert_eq!(
-            filtered_option_indices(&options, "deps", mode),
-            vec![4, 3, 2, 1, 0]
-        );
-        assert_eq!(
-            filtered_option_indices(&options, " DEPS ", mode),
-            vec![4, 3, 2, 1, 0]
-        );
-        assert_eq!(
-            filtered_option_indices(&options, "  ", mode),
-            vec![0, 1, 2, 3, 4]
-        );
-        assert_eq!(
-            filtered_option_indices(&options, "workspace/deps", mode)[..2],
-            [4, 3]
-        );
-        let inherit = PromptSearchMatchMode::OrderedV1 {
-            matching: PromptOrderedMatchMode::Fuzzy,
-            relevance: false,
-        };
-        assert_eq!(
-            filtered_option_indices(&options, "deps", inherit),
-            vec![0, 1, 2, 3, 4]
-        );
-    }
-
-    #[test]
-    fn search_match_modes_filter_against_custom_search_text() {
-        let options = vec![
-            PromptOption::new("editor", "project/editor").search_text("project editor"),
-            PromptOption::new("shell", "other/shell").search_text("other shell"),
-        ];
-
-        assert_eq!(
-            filtered_option_indices(&options, "pro ed", PromptSearchMatchMode::Fuzzy),
-            vec![0]
-        );
-        assert_eq!(
-            filtered_option_indices(&options, "project", PromptSearchMatchMode::Prefix),
-            vec![0]
-        );
-        assert_eq!(
-            filtered_option_indices(&options, "editor", PromptSearchMatchMode::Prefix),
-            [] as [usize; 0]
-        );
-        assert_eq!(
-            filtered_option_indices(&options, "editor", PromptSearchMatchMode::Substring),
-            vec![0]
-        );
-        assert_eq!(
-            filtered_option_indices(&options, "", PromptSearchMatchMode::Prefix),
-            vec![1, 0]
-        );
-    }
-
-    #[test]
     fn command_palette_page_navigation_uses_rendered_virtual_viewport() {
         let mut state = AttachPromptState::default();
         state.enqueue_internal(
@@ -4835,6 +4594,39 @@ mod tests {
         assert!(
             list.item_height(&0).is_some(),
             "reintroduced option measured before repaint"
+        );
+    }
+
+    #[test]
+    fn command_palette_enter_submits_literal_pause_not_scattered_letters() {
+        let mut state = AttachPromptState::default();
+        state.enqueue_internal(
+            PromptRequest::search_select(
+                "Command Palette",
+                vec![
+                    PromptOption::new("wrong", "p-a-u-s-e"),
+                    PromptOption::new("prefix", "pauser"),
+                    PromptOption::new("pause-action", "Output: pause"),
+                ],
+            )
+            .modal_id("command-palette")
+            .search_match_mode(PromptSearchMatchMode::OrderedV1 {
+                matching: bmux_plugin_sdk::prompt::PromptOrderedMatchMode::Fuzzy,
+                relevance: true,
+            }),
+            AttachInternalPromptAction::QuitSession,
+        );
+        for ch in "pause".chars() {
+            let _ = state.handle_key_event(&key_event(KeyCode::Char(ch)));
+        }
+        let PromptKeyDisposition::Completed(completion) =
+            state.handle_key_event(&key_event(KeyCode::Enter))
+        else {
+            panic!("expected prompt completion");
+        };
+        assert_eq!(
+            completion.response,
+            PromptResponse::Submitted(PromptValue::Single("pause-action".into()))
         );
     }
 

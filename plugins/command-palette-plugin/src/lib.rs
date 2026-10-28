@@ -9,10 +9,11 @@ use bmux_keybind::{
 };
 use bmux_plugin::{action_dispatch, prompt};
 use bmux_plugin_sdk::prelude::*;
+use bmux_plugin_sdk::prompt::PromptOrderedMatchMode;
 use bmux_plugin_sdk::{
     ActiveKeybinding, PluginCommand, PluginCommandArgument, PluginCommandArgumentKind,
-    PromptOption, PromptRequest, PromptResponse, PromptValidation, PromptValue,
-    RegisteredPluginInfo,
+    PromptOption, PromptRequest, PromptResponse, PromptSearchMatchMode, PromptValidation,
+    PromptValue, RegisteredPluginInfo,
 };
 use tracing::{debug, warn};
 
@@ -38,21 +39,17 @@ fn show_command_palette(context: &NativeCommandContext) -> Result<i32, PluginCom
     let options = entries
         .iter()
         .enumerate()
-        .map(|(index, entry)| {
-            let option = PromptOption::new(index.to_string(), entry.label.clone())
-                .detail(entry.detail.clone());
-            if let Some(key_hint) = &entry.key_hint {
-                option.key_hint(key_hint.clone())
-            } else {
-                option
-            }
-        })
+        .map(|(index, entry)| palette_option(index, entry))
         .collect::<Vec<_>>();
     let request = PromptRequest::search_select("Command Palette", options)
         .message("Type to fuzzy-search actions and commands")
         .modal_id("command-palette")
         .owner_plugin_id("bmux.command_palette")
         .width_range(64, 120)
+        .search_match_mode(PromptSearchMatchMode::OrderedV1 {
+            matching: PromptOrderedMatchMode::Fuzzy,
+            relevance: true,
+        })
         .search_placeholder("Search commands");
     let response = prompt::submit(request).map_err(|error| {
         PluginCommandError::unavailable(format!("command palette prompt unavailable: {error}"))
@@ -64,6 +61,30 @@ fn show_command_palette(context: &NativeCommandContext) -> Result<i32, PluginCom
     })?;
     handle.spawn(handle_command_palette_response(entries, response));
     Ok(EXIT_OK)
+}
+
+fn palette_option(index: usize, entry: &PaletteEntry) -> PromptOption {
+    let (primary, identifier) = match &entry.kind {
+        PaletteEntryKind::BindableAction { action, .. } => (entry.label.as_str(), action.clone()),
+        PaletteEntryKind::PluginCommand {
+            plugin_id,
+            command_name,
+            schema,
+        } => (
+            if schema.summary.is_empty() {
+                command_name.as_str()
+            } else {
+                schema.summary.as_str()
+            },
+            format!("plugin:{plugin_id}:{command_name}"),
+        ),
+    };
+    let mut option = PromptOption::new(index.to_string(), entry.label.clone())
+        .detail(entry.detail.clone())
+        .search_text(format!("{} {identifier}", entry.label));
+    option.search_primary = Some(primary.to_string());
+    option.key_hint.clone_from(&entry.key_hint);
+    option
 }
 
 #[derive(Debug, Clone)]
@@ -492,6 +513,43 @@ mod tests {
         uses_default_palette_arguments,
     };
     use bmux_plugin_sdk::{ActiveKeybinding, PluginCommand, PromptOption};
+
+    #[test]
+    fn palette_searches_primary_names_and_identifiers_not_shortcuts() {
+        let mut entry = PaletteEntry {
+            label: "Output: Pause output".into(),
+            detail: "bmux.output:pause".into(),
+            key_hint: Some("Ctrl+P".into()),
+            kind: PaletteEntryKind::PluginCommand {
+                plugin_id: "bmux.output".into(),
+                command_name: "pause".into(),
+                schema: PluginCommand::new("pause", "Pause output"),
+            },
+        };
+        let option = super::palette_option(7, &entry);
+        assert_eq!(option.value, "7");
+        assert_eq!(option.search_primary.as_deref(), Some("Pause output"));
+        assert_eq!(
+            option.search_text.as_deref(),
+            Some("Output: Pause output plugin:bmux.output:pause")
+        );
+        assert_eq!(option.key_hint.as_deref(), Some("Ctrl+P"));
+        if let PaletteEntryKind::PluginCommand { schema, .. } = &mut entry.kind {
+            schema.summary.clear();
+        }
+        assert_eq!(
+            super::palette_option(0, &entry).search_primary.as_deref(),
+            Some("pause")
+        );
+        entry.kind = PaletteEntryKind::BindableAction {
+            action: "pause-output".into(),
+            argument: None,
+        };
+        assert_eq!(
+            super::palette_option(0, &entry).search_text.as_deref(),
+            Some("Output: Pause output pause-output")
+        );
+    }
 
     #[test]
     fn named_broadcast_commands_are_discovered_only_when_enabled() {

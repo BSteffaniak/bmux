@@ -10,6 +10,7 @@ mod local_presentation;
 mod metadata;
 pub mod observer;
 mod pointer_shape;
+mod prompt_search;
 pub mod prompt_ui;
 pub mod provider;
 pub mod render;
