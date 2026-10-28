@@ -1,0 +1,193 @@
+{
+  "uid": "bmux-live",
+  "title": "BMUX live delivery",
+  "schemaVersion": 40,
+  "version": 1,
+  "refresh": "15s",
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "tags": [
+    "bmux"
+  ],
+  "panels": [
+    {
+      "id": 1,
+      "title": "Scrape availability",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "bmux-relay"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 0
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "up{job=\"bmux-relay\"}",
+          "legendFormat": "{{__name__}} {{instance}}"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Accepted frames / second",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "bmux-relay"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 0
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "rate(bmux_relay_frames_total{job=\"bmux-relay\"}[5m])",
+          "legendFormat": "{{__name__}} {{instance}}"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Repairs / second",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "bmux-relay"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "rate(bmux_relay_repairs_total{job=\"bmux-relay\"}[5m])",
+          "legendFormat": "{{__name__}} {{instance}}"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Viewers",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "bmux-relay"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "bmux_relay_viewers{job=\"bmux-relay\"}",
+          "legendFormat": "{{__name__}} {{instance}}"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Upload and delivery bytes / second",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "bmux-relay"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 16
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "rate({__name__=~\"bmux_relay_(upload|delivery)_bytes_total\",job=\"bmux-relay\"}[5m])",
+          "legendFormat": "{{__name__}} {{instance}}"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Egress throttling / second",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "bmux-relay"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 16
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "rate({__name__=~\"bmux_relay_(viewer|aggregate)_egress_throttled_total\",job=\"bmux-relay\"}[5m])",
+          "legendFormat": "{{__name__}} {{instance}}"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Frame rejection reasons",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "bmux-relay"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 24
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (reason) (rate(bmux_relay_events_total{job=\"bmux-relay\",event=\"ingest_rejected\"}[5m]))",
+          "legendFormat": "{{event}} {{reason}}"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "title": "Disconnect causes",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "bmux-relay"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 24
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (event, reason) (rate(bmux_relay_events_total{job=\"bmux-relay\",event=~\"publisher|viewer\"}[5m]))",
+          "legendFormat": "{{event}} {{reason}}"
+        }
+      ]
+    }
+  ],
+  "description": "Frame rate zero can mean healthy idle. A retained frame or healthy scrape does not establish ongoing delivery. Use publisher/browser diagnostics to inspect pending progress."
+}

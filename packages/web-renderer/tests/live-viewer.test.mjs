@@ -18,11 +18,12 @@ async function fixture(options = {}) {
   }
   const viewer = {
     clear() { clears++; identity = null; },
-    async present(data, current) {
+    async present(data, current, decoded) {
       paints++;
       if (options.present) await options.present();
       if (options.paintDuration) clock += options.paintDuration(paints);
       if (!current()) return false;
+      decoded();
       identity = { generation: 'scene', revision: String(paints) };
       return true;
     },
@@ -37,7 +38,7 @@ async function fixture(options = {}) {
     setTimer: (callback, delay) => { timers.set(++id, { callback, delay }); return id; },
     clearTimer: key => timers.delete(key), now: () => clock, ...options,
   });
-  return { handle, sockets, frames, timers, get paints() { return paints; }, get clears() { return clears; },
+  return { handle, sockets, frames, timers, advance(ms) { clock += ms; }, get paints() { return paints; }, get clears() { return clears; },
     async raf(now, actual = now) { clock = actual; const work = [...frames.values()]; frames.clear(); await Promise.all(work.map(fn => fn(now))); },
     timer() { const [key, timer] = [...timers.entries()].sort((a, b) => a[1].delay - b[1].delay)[0]; timers.delete(key); timer.callback(); },
   };
@@ -135,6 +136,112 @@ test('lease uses remaining authority, expires closed, and renewal does not draw'
   assert.equal(f.paints, 1); assert.equal(f.frames.size, 0);
   assert.equal([...f.timers.values()][0].delay, 100);
   f.timer(); assert.equal(s.readyState, 3); assert.ok(f.clears > 1); f.handle.dispose();
+});
+
+test('diagnostics separate retained idle from known pending stall without false stale alerts', async () => {
+  const f = await fixture(); const s = f.sockets[0]; s.state();
+  assert.equal(f.handle.diagnostics.progress, 'idle');
+  assert.equal(f.handle.diagnostics.agesMs.submitted, null);
+  s.frame(); f.advance(6000);
+  assert.equal(f.handle.diagnostics.progress, 'pending-stalled');
+  await f.raf(6000);
+  const d = f.handle.diagnostics;
+  assert.equal(d.progress, 'idle'); assert.equal(d.retained, true);
+  assert.equal(d.counts.decoded, 1); assert.equal(d.counts.submitted, 1); assert.equal(d.counts.ackSent, 1);
+  assert.deepEqual(d.submitted, { generation: 1, revision: '1' });
+  f.advance(60000);
+  assert.equal(f.handle.diagnostics.progress, 'idle');
+  assert.equal(f.handle.diagnostics.agesMs.submitted, 60000);
+  f.handle.dispose(); assert.equal(f.handle.diagnostics.progress, 'disposed');
+});
+
+test('stalled decoder and obsolete completion do not fabricate submission or ACK progress', async () => {
+  let finish;
+  const f = await fixture({ present: () => new Promise(resolve => { finish = resolve; }) });
+  const s = f.sockets[0]; s.state(); s.frame(); const painting = f.raf(0);
+  f.advance(6000); assert.equal(f.handle.diagnostics.progress, 'pending-stalled');
+  assert.equal(f.handle.diagnostics.counts.submitted, 0);
+  s.close(); finish(); await painting;
+  assert.equal(f.handle.diagnostics.counts.submitted, 0);
+  assert.equal(f.handle.diagnostics.counts.ackSent, 0);
+  assert.equal(f.handle.diagnostics.retained, false); f.handle.dispose();
+});
+
+test('fault diagnostics retain only safe reasons and expose repair and reconnect', async () => {
+  const f = await fixture({ present() { throw Error('secret payload and key'); } });
+  const s = f.sockets[0]; s.state(); s.frame(); await f.raf(0);
+  assert.equal(f.handle.diagnostics.progress, 'repair-pending');
+  f.advance(6000); assert.equal(f.handle.diagnostics.progress, 'repair-stalled');
+  assert.equal(f.handle.diagnostics.counts.repairs, 1);
+  s.onerror({ message: 'secret payload and key' });
+  const d = f.handle.diagnostics;
+  assert.equal(d.progress, 'unknown'); assert.equal(d.counts.reconnects, 1);
+  assert.ok(d.history.some(e => e.event === 'socket-error'));
+  assert.ok(!f.handle.exportDiagnostics().includes('secret'));
+  f.timer(); const next = f.sockets[1]; next.state();
+  assert.equal(f.handle.diagnostics.progress, 'idle');
+  // Malformed control text is never exported, nor are close reasons.
+  next.onmessage({ data: 'secret payload and key' });
+  next.onclose({ reason: 'untrusted peer text' });
+  const exported = f.handle.exportDiagnostics();
+  for (const text of ['secret', 'untrusted', epoch, 'fence', 'scene']) assert.ok(!exported.includes(text));
+  assert.ok(JSON.parse(exported).history.some(e => e.event === 'invalid-stream'));
+  f.handle.dispose();
+});
+
+test('ACK diagnostics do not confuse a closed send path with acknowledged progress', async () => {
+  const f = await fixture(); const s = f.sockets[0]; s.state(); s.frame();
+  // Model a transport that is no longer writable before its close callback.
+  s.readyState = 3; await f.raf(0);
+  assert.equal(f.handle.diagnostics.counts.submitted, 1);
+  assert.equal(f.handle.diagnostics.counts.ackSent, 0);
+  assert.equal(f.handle.diagnostics.ackSent, null);
+  assert.equal(f.handle.diagnostics.progress, 'ack-pending');
+  f.advance(6000); assert.equal(f.handle.diagnostics.progress, 'ack-stalled');
+  assert.equal(f.handle.diagnostics.reason, 'ack-send-failed');
+  f.handle.dispose();
+});
+
+test('throwing ACK send records no ACK, clears retained output and requests repair safely', async () => {
+  const f = await fixture(); const s = f.sockets[0]; s.state();
+  const send = s.send.bind(s);
+  s.send = value => { if (JSON.parse(value).type === 'ack') throw Error('secret transport text'); send(value); };
+  s.frame(); await f.raf(0);
+  assert.equal(f.handle.diagnostics.counts.submitted, 1);
+  assert.equal(f.handle.diagnostics.counts.ackSent, 0);
+  assert.equal(f.handle.diagnostics.retained, false);
+  assert.equal(f.handle.diagnostics.progress, 'repair-pending');
+  assert.ok(f.handle.diagnostics.history.some(e => e.event === 'ack-send-failed'));
+  assert.ok(!f.handle.exportDiagnostics().includes('secret'));
+  assert.deepEqual(s.sent, [{ type: 'repair' }]); f.handle.dispose();
+});
+
+test('repair send failure stays sanitized and schedules reconnect instead of leaking a rejection', async () => {
+  const f = await fixture({ present() { throw Error('secret decode'); } });
+  const s = f.sockets[0]; s.state(); s.send = () => { throw Error('secret transport'); };
+  s.frame(); await f.raf(0);
+  assert.equal(f.handle.diagnostics.progress, 'unknown');
+  assert.equal(f.handle.diagnostics.counts.reconnects, 1);
+  assert.ok(f.handle.diagnostics.history.some(e => e.event === 'socket-error'));
+  assert.ok(!f.handle.exportDiagnostics().includes('secret'));
+  f.handle.dispose();
+});
+
+test('sustained changing source traverses receive/decode/submission/ACK with bounded history', async () => {
+  const f = await fixture(); const s = f.sockets[0]; s.state();
+  for (let i = 1; i <= 1000; i++) {
+    s.frame(); await f.raf(i * 20);
+    const d = f.handle.diagnostics;
+    assert.equal(d.submitted.revision, String(i));
+    assert.equal(d.ackSent.revision, String(i));
+    assert.equal(s.sent.at(-1).revision, String(i));
+    assert.ok(d.history.length <= 64);
+  }
+  assert.equal(f.handle.diagnostics.counts.decoded, 1000);
+  assert.equal(f.handle.diagnostics.counts.submitted, 1000);
+  assert.equal(f.handle.diagnostics.counts.ackSent, 1000);
+  assert.ok(f.handle.diagnostics.history.some(e => e.cursor?.revision === '1000'));
+  f.handle.dispose();
 });
 
 test('invalid FPS rejected', async () => {

@@ -8,6 +8,7 @@ provided_capabilities = [
     "bmux.broadcast.output.v1",
     "bmux.broadcast.turnkey.v1",
     "bmux.broadcast.presentation.v1",
+    "bmux.broadcast.diagnostics.v1",
 ]
 provided_features = ["bmux.broadcast"]
 version = "0.0.1-alpha.0"
@@ -84,3 +85,8 @@ expose_in_cli = false
 name          = "broadcast-doctor"
 path          = ["broadcast", "doctor"]
 summary       = "Broadcast doctor"
+
+[[services]]
+capability   = "bmux.broadcast.diagnostics.v1"
+interface_id = "broadcast-diagnostics-v1"
+kind         = "command"

@@ -98,3 +98,25 @@ requiring a scene change. Lease loss closes the gate and invalidates content.
 
 See [the shared HTTP protocol](../../docs/live-broadcast-protocol.md) for relay
 lease, epoch, revision, and renderer compatibility requirements.
+
+## Diagnostics contract
+
+`broadcast-diagnostics-v1` (`bmux.broadcast.diagnostics.v1`) adds generated
+`status()` and `events(last: u32)` clients without modifying existing status
+records or error meanings. It requires the same authenticated local proof as
+control services. All state is plugin-owned and process-local; history is
+bounded to 256 events. Ages are monotonic milliseconds, not wall-clock times.
+Frame revisions belong to the selected source refresh; attempt/event IDs and
+counters span that plugin controller lifetime. A frame ACK is relay acceptance,
+not viewer receipt. Missing values mean not yet observed in the current refresh.
+
+`current_failures` is the authoritative per-operation active set;
+`current_failure`
+is its newest member, and successful unrelated operations cannot erase entries.
+Refresh invalidation retires old-context current entries but not historical
+ones.
+Generation fields contain SHA-256 fingerprints, not raw generation strings.
+`ack_latency_ms` measures the successful attempt including reconnect and repair,
+not pure RTT. Process/controller instance IDs scope otherwise monotonic IDs.
+Observer heartbeat/lease/exit fields describe local evidence only. Remote cause
+attribution and relay diagnostics negotiation are not part of this interface.

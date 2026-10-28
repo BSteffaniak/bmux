@@ -1,0 +1,9 @@
+{
+  "groups": [{"name": "bmux-live", "rules": [
+    {"alert": "BmuxRelayScrapeUnavailable", "expr": "up{job=\"bmux-relay\"} == 0", "for": "2m", "labels": {"severity": "critical"}, "annotations": {"summary": "Authenticated relay scrape unavailable", "description": "Check relay availability, TLS, and the independent metrics credential; a scrape failure alone does not identify the cause."}},
+    {"alert": "BmuxRelayRepairLoop", "expr": "increase(bmux_relay_repairs_total{job=\"bmux-relay\"}[5m]) > 10", "for": "1m", "labels": {"severity": "warning"}, "annotations": {"summary": "Repeated frame repair requests", "description": "Inspect publisher and relay diagnostic histories for the failed baseline or full-frame admission reason."}},
+    {"alert": "BmuxRelayFrameRejections", "expr": "sum by (job, instance, reason) (increase(bmux_relay_events_total{job=\"bmux-relay\",event=\"ingest_rejected\"}[5m])) > 10", "for": "1m", "labels": {"severity": "warning"}, "annotations": {"summary": "Repeated relay admission failures", "description": "Inspect the bounded reason label and private diagnostic snapshot; no frame contents are included."}},
+    {"alert": "BmuxRelayConnectionChurn", "expr": "sum by (job, instance) (increase(bmux_relay_events_total{job=\"bmux-relay\",event=\"publisher\",reason!=\"peer_closed\",reason!=\"authority_changed\"}[5m])) > 5", "for": "1m", "labels": {"severity": "warning"}, "annotations": {"summary": "Publisher connection failures recurring", "description": "Inspect relay disconnect reasons and publisher ACK/repair history."}},
+    {"alert": "BmuxRelayEgressThrottled", "expr": "increase(bmux_relay_viewer_egress_throttled_total{job=\"bmux-relay\"}[5m]) + increase(bmux_relay_aggregate_egress_throttled_total{job=\"bmux-relay\"}[5m]) > 0", "labels": {"severity": "warning"}, "annotations": {"summary": "Viewer delivery throttled", "description": "Inspect bounded per-viewer and aggregate capacity before increasing limits."}}
+  ]}]
+}

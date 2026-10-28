@@ -9,6 +9,9 @@ OUTPUT="${1:?New output directory required}"
 [[ ! -e "$OUTPUT" ]] || { echo 'Output already exists' >&2; exit 2; }
 mkdir -p "$OUTPUT"
 OUTPUT="$(cd "$OUTPUT" && pwd)"
+# Embed the immutable candidate revision in native/plugin and relay diagnostics.
+# This is build metadata, not a claim that the working tree is clean.
+export BMUX_BUILD_REVISION="$(git rev-parse HEAD)"
 cargo build --locked --release -p bmux_cli
 # Rebuild plugin bundles through the explicitly built test version, isolated state.
 ISOLATED="$(mktemp -d "${TMPDIR:-/tmp}/bmux-live-build.XXXXXXXX")"

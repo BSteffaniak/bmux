@@ -167,6 +167,8 @@ fn websocket_repair_and_acknowledged_delta_baseline() {
         .build()
         .unwrap();
     let mut relay = server.relay.take().unwrap();
+    let observations = crate::diagnostics::Shared::default();
+    relay.observe(observations.clone());
     runtime.block_on(async {
         relay.start().await.unwrap();
         server.event("start");
@@ -193,5 +195,11 @@ fn websocket_repair_and_acknowledged_delta_baseline() {
         server.event("frame"); // Explicit repair on each newly admitted socket.
         relay.mutation("stop", None).await.unwrap();
         server.event("stop");
+        let observations = observations.lock().unwrap();
+        let snapshot = observations.snapshot("running", "live", 1, 0, 0);
+        assert_eq!(snapshot.repairs, 2);
+        assert_eq!(snapshot.acknowledgements, 3);
+        assert_eq!(snapshot.progress, "idle");
+        assert!(snapshot.current_failure.is_none());
     });
 }

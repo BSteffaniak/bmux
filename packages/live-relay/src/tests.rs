@@ -1,4 +1,5 @@
 use super::*;
+include!("observability_tests.rs");
 use bmux_tui::{damage::Damage, geometry::Rect, presentation::PresentationState};
 use bmux_web_renderer::{BrowserFrame, decode_binary, encode_binary, encode_delta};
 use futures_util::SinkExt;
@@ -67,6 +68,7 @@ impl Fixture {
         relay.start(Uuid::new_v4(), now()).unwrap();
         let (updates, _) = watch::channel(relay.view());
         let app = App {
+            telemetry: Arc::new(Observability::default()),
             relay: Arc::new(Mutex::new(relay)),
             updates,
             publisher_key: Sha256::digest(b"publisher-test-key").into(),
@@ -511,6 +513,13 @@ async fn tiny_viewer_budget_bounds_repair_snapshots() {
     expect_throttled_disconnect(&mut viewer).await;
     assert_eq!(fixture.app.viewer_throttled.load(Ordering::Relaxed), 1);
     assert_eq!(fixture.app.aggregate_throttled.load(Ordering::Relaxed), 0);
+    assert!(
+        fixture
+            .app
+            .telemetry
+            .metrics()
+            .contains("event=\"viewer\",reason=\"viewer_throttled\"} 1")
+    );
 }
 
 #[tokio::test]
@@ -530,6 +539,13 @@ async fn aggregate_budget_survives_snapshot_reconnect() {
     expect_throttled_disconnect(&mut reconnected).await;
     assert_eq!(fixture.app.aggregate_throttled.load(Ordering::Relaxed), 1);
     assert_eq!(fixture.app.viewer_throttled.load(Ordering::Relaxed), 0);
+    assert!(
+        fixture
+            .app
+            .telemetry
+            .metrics()
+            .contains("event=\"viewer\",reason=\"aggregate_throttled\"} 1")
+    );
 }
 
 #[tokio::test]

@@ -9,6 +9,7 @@ mod committed_output;
 pub use committed_output::authorize_committed_output;
 mod controller;
 mod deploy;
+mod diagnostics;
 mod indicator;
 mod mirror;
 mod presentation;
@@ -115,6 +116,8 @@ impl RustPlugin for BroadcastPlugin {
     }
     fn invoke_service(&self, context: NativeServiceContext) -> ServiceResponse {
         bmux_plugin_sdk::route_service!(context, {
+            "broadcast-diagnostics-v1", "status" => |_r: (), ctx| { authenticated(ctx)?; controller()?.diagnostics().map_err(error) },
+            "broadcast-diagnostics-v1", "events" => |r: bmux_broadcast_plugin_api::broadcast_diagnostics_v1::client::EventsRequest, ctx| { authenticated(ctx)?; controller()?.events(r.last).map_err(error) },
             "broadcast-presentation-v1", "status" => |_r: (), _ctx| { Ok::<_, ServiceResponse>(indicator::status()) },
             "broadcast-turnkey-v1", "register" => |r: turnkey::client::RegisterRequest, ctx| { let owner = authenticated(ctx)?; controller()?.register_label(owner, &r.source_id, &r.label).map_err(error) },
             "broadcast-turnkey-v1", "sources" => |_r: (), ctx| { authenticated(ctx)?; controller()?.sources().map_err(error) },

@@ -17,6 +17,7 @@ struct Source {
     last: Option<(u64, String, u64)>,
     content: Option<[u8; 32]>,
     terminal_stop: Option<tokio::sync::watch::Sender<bool>>,
+    observer_seen: Option<Instant>,
     label: String,
 }
 struct Pending {
@@ -31,6 +32,7 @@ struct Owned {
     profile: Option<String>,
 }
 struct State {
+    observations: crate::diagnostics::Shared,
     sources: BTreeMap<String, Source>,
     selected: Option<String>,
     // Retained even after lease loss/unregister: a selected ID must not rebind
@@ -50,6 +52,7 @@ struct State {
 impl Default for State {
     fn default() -> Self {
         Self {
+            observations: crate::diagnostics::Shared::default(),
             sources: BTreeMap::new(),
             selected: None,
             selected_owner: None,
@@ -76,6 +79,9 @@ impl State {
         }
     }
     fn invalidate(&mut self) {
+        if let Ok(mut observations) = self.observations.lock() {
+            observations.invalidate();
+        }
         self.refresh = self.refresh.saturating_add(1);
         self.pending = None;
     }
@@ -143,6 +149,66 @@ impl Controller {
             terminals: Mutex::new(Vec::new()),
             dirty,
         })
+    }
+    pub fn diagnostics(
+        &self,
+    ) -> Result<bmux_broadcast_plugin_api::broadcast_diagnostics_v1::Snapshot, &'static str> {
+        let state = self.state.lock().map_err(|_| "controller_unavailable")?;
+        let observations = state
+            .observations
+            .lock()
+            .map_err(|_| "controller_unavailable")?;
+        let mut snapshot = observations.snapshot(
+            state.local,
+            state.remote,
+            state.refresh,
+            state.suppressed,
+            state.coalesced,
+        );
+        snapshot.local_error_code = state.error.map(str::to_owned);
+        snapshot.source_lease_remaining_ms = state
+            .selected
+            .as_ref()
+            .and_then(|id| state.sources.get(id))
+            .map(|source| {
+                u64::try_from(
+                    source
+                        .expires
+                        .saturating_duration_since(Instant::now())
+                        .as_millis(),
+                )
+                .unwrap_or(u64::MAX)
+            });
+        if let Some(source) = state.selected.as_ref().and_then(|id| state.sources.get(id)) {
+            snapshot.observer_state = Some(
+                if source.terminal_stop.is_some() {
+                    if source.expires <= Instant::now() {
+                        "lease_expired"
+                    } else {
+                        "registered"
+                    }
+                } else {
+                    "external_producer"
+                }
+                .into(),
+            );
+            snapshot.observer_age_ms = source
+                .observer_seen
+                .map(|at| u64::try_from(at.elapsed().as_millis()).unwrap_or(u64::MAX));
+            snapshot.observer_exit = None;
+        }
+        Ok(snapshot)
+    }
+    pub fn events(
+        &self,
+        last: u32,
+    ) -> Result<Vec<bmux_broadcast_plugin_api::broadcast_diagnostics_v1::Event>, &'static str> {
+        let state = self.state.lock().map_err(|_| "controller_unavailable")?;
+        let observations = state
+            .observations
+            .lock()
+            .map_err(|_| "controller_unavailable")?;
+        Ok(observations.events(last))
     }
     pub fn status(&self) -> Result<Status, &'static str> {
         Ok(self
@@ -520,6 +586,9 @@ impl Controller {
         }
         if let Some(source) = state.sources.get_mut(id) {
             source.expires = now + SOURCE_LEASE;
+            if source.terminal_stop.is_some() {
+                source.observer_seen = Some(now);
+            }
         } else {
             state.sources.retain(|_, source| source.expires > now);
             if state.sources.len() >= MAX_SOURCES {
@@ -533,9 +602,15 @@ impl Controller {
                     last: None,
                     content: None,
                     terminal_stop: None,
+                    observer_seen: None,
                     label: "Source".into(),
                 },
             );
+        }
+        if state.selected.as_deref() == Some(id)
+            && let Ok(mut observations) = state.observations.lock()
+        {
+            observations.poll();
         }
         Ok(state.source_state(id))
     }
@@ -553,11 +628,11 @@ impl Controller {
         if state.sources.get(id).is_none_or(|s| s.owner != owner) {
             return Err("source_not_owned");
         }
-        if let Some(stop) = state
-            .sources
-            .remove(id)
-            .and_then(|source| source.terminal_stop)
-        {
+        let removed = state.sources.remove(id);
+        let terminal_observer = removed
+            .as_ref()
+            .is_some_and(|source| source.terminal_stop.is_some());
+        if let Some(stop) = removed.and_then(|source| source.terminal_stop) {
             stop.send_replace(true);
         }
         if state.selected.as_deref() == Some(id) && state.local != "stopped" {
@@ -565,6 +640,16 @@ impl Controller {
             state.local = "unavailable";
             if let Some(code) = observer_error {
                 state.error = Some(code);
+            }
+            if let Ok(mut observations) = state.observations.lock() {
+                observations.observer(
+                    if terminal_observer {
+                        "exited"
+                    } else {
+                        "unregistered"
+                    },
+                    observer_error,
+                );
             }
             self.gate.send_replace(state.refresh);
         }
@@ -598,6 +683,10 @@ impl Controller {
                 return Err("terminal_already_registered");
             }
             source.terminal_stop = Some(stop);
+            source.observer_seen = Some(Instant::now());
+            if let Ok(mut observations) = state.observations.lock() {
+                observations.observer("running", None);
+            }
         }
         let controller = self.clone();
         let handle = std::thread::Builder::new()
@@ -716,6 +805,10 @@ impl Controller {
             && source.content == Some(key);
         source.last = Some((refresh, frame.generation().into(), frame.revision()));
         source.content = Some(key);
+        if let Ok(mut observations) = state.observations.lock() {
+            observations.generation(frame.generation());
+            observations.source(frame.revision(), duplicate);
+        }
         if duplicate {
             state.suppressed = state.suppressed.saturating_add(1);
             return Ok(true);
@@ -824,7 +917,7 @@ async fn worker(
                 let Some(request) = request else { break; };
                 let shutdown = matches!(&request.control, Control::Shutdown);
                 let result = match request.control {
-                    Control::Start(mut next, _) => { let result = next.start().await; relay = Some(next); if result.is_ok() { revision = 0; source_paused = false; } result }
+                    Control::Start(mut next, _) => { if let Ok(state) = state.lock() { next.observe(state.observations.clone()); } let result = next.start().await; relay = Some(next); if result.is_ok() { revision = 0; source_paused = false; } result }
                     Control::Pause => match &relay { Some(relay) => relay.mutation("pause", None).await, None => Err("not_started") },
                     Control::Stop | Control::Shutdown => match &relay { Some(relay) => relay.mutation("stop", None).await, None => Ok(()) },
                     Control::Resume | Control::Source(_) => match &relay {
@@ -940,6 +1033,9 @@ async fn worker(
             }
         }
         if let Ok(state) = state.lock() {
+            if let Ok(mut observations) = state.observations.lock() {
+                observations.transition(state.local, state.remote);
+            }
             crate::indicator::update(state.local, state.remote);
         }
     }

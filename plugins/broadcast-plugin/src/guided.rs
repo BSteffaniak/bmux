@@ -269,7 +269,7 @@ pub(crate) async fn local(context: &NativeCommandContext) -> Result<bool, Plugin
             connectivity(&p.endpoint, &p.channel).await?;
             output(
                 context,
-                "Profile, private credential permissions and relay health: OK. No configuration changed.",
+                "Local profile and credential-file permissions, and unauthenticated relay health: OK. This does not test publisher authentication, WebSocket upgrade, frame ACKs or viewer delivery. Use broadcast diagnose --json for publisher progress. No configuration changed.",
             ).await;
             Ok(true)
         }
@@ -654,7 +654,7 @@ pub(crate) async fn connected(
             .await
             .map_err(|_| {
                 failed(
-                    "broadcast start rejected; run broadcast setup and register an explicit source",
+                    "broadcast start request rejected; inspect broadcast diagnose --json and broadcast doctor --profile NAME to distinguish source, local authorization, profile and relay failures",
                 )
             })?;
             let live = crate::startup_ui::wait(client, &id, context.invocation_source.is_cli())
@@ -674,6 +674,42 @@ pub(crate) async fn connected(
                 result.viewer_url.as_deref().unwrap_or("")
             );
         }
+        return Ok(true);
+    }
+    if args.as_slice() == ["status", "--verbose"] || args.as_slice() == ["diagnose", "--json"] {
+        let diagnostic =
+            bmux_broadcast_plugin_api::broadcast_diagnostics_v1::client::status(client)
+                .await
+                .map_err(|_| {
+                    failed("publisher diagnostics unavailable (requires diagnostics-v1 support)")
+                })?;
+        output(
+            context,
+            &serde_json::to_string_pretty(&diagnostic)
+                .map_err(|_| failed("diagnostic encoding failed"))?,
+        )
+        .await;
+        return Ok(true);
+    }
+    if args.first().is_some_and(|arg| arg == "events") {
+        let last = match args.as_slice() {
+            [_] => 50,
+            [_, flag, count] if flag == "--last" => count
+                .parse::<u32>()
+                .map_err(|_| failed("events --last requires an unsigned count"))?,
+            _ => return Err(failed("usage: broadcast events --last 50")),
+        };
+        let events =
+            bmux_broadcast_plugin_api::broadcast_diagnostics_v1::client::events(client, last)
+                .await
+                .map_err(|_| {
+                    failed("publisher events unavailable (requires diagnostics-v1 support)")
+                })?;
+        output(
+            context,
+            &serde_json::to_string_pretty(&events).map_err(|_| failed("event encoding failed"))?,
+        )
+        .await;
         return Ok(true);
     }
     if args.first().is_some_and(|arg| arg == "status") && args.len() == 1 {

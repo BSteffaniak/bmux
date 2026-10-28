@@ -76,6 +76,31 @@ mod tests {
                 "{operation} must require local proof before mutation"
             );
         }
+        for operation in ["status", "events"] {
+            let mut diagnostic = context.clone();
+            diagnostic.request.service.capability =
+                HostScope::new("bmux.broadcast.diagnostics.v1").unwrap();
+            diagnostic.request.service.interface_id = "broadcast-diagnostics-v1".into();
+            diagnostic.request.operation = operation.into();
+            diagnostic.request.payload = if operation == "events" {
+                bmux_codec::to_typed_vec(
+                    &bmux_broadcast_plugin_api::broadcast_diagnostics_v1::client::EventsRequest {
+                        last: 50,
+                    },
+                )
+                .unwrap()
+            } else {
+                bmux_codec::to_typed_vec(&()).unwrap()
+            };
+            assert_eq!(
+                BroadcastPlugin
+                    .invoke_service(diagnostic)
+                    .error
+                    .unwrap()
+                    .code,
+                "local_authorization_required"
+            );
+        }
         let mut explicit = context.clone();
         explicit.request.operation = "start-publication".into();
         explicit.request.payload =

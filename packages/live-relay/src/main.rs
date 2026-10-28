@@ -29,10 +29,14 @@ use tokio::{
 };
 use uuid::Uuid;
 
+use observability::{Disconnect, Observability, Role};
+mod observability;
+
 type Result<T> = std::result::Result<T, StatusCode>;
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
 #[derive(Clone)]
 struct App {
+    telemetry: Arc<Observability>,
     relay: Arc<Mutex<Relay>>,
     updates: watch::Sender<View>,
     publisher_key: [u8; 32],
@@ -140,11 +144,15 @@ fn authorize(headers: &HeaderMap, expected: &[u8; 32]) -> Result<()> {
     Ok(())
 }
 fn publisher_auth(app: &App, headers: &HeaderMap) -> Result<()> {
-    authorize(headers, &app.publisher_key)?;
+    authorize(headers, &app.publisher_key)
+        .inspect_err(|_| app.telemetry.publisher_auth_denied())?;
     if headers.contains_key("origin") {
         return Err(StatusCode::FORBIDDEN);
     }
     Ok(())
+}
+fn metrics_auth(app: &App, headers: &HeaderMap) -> Result<()> {
+    authorize(headers, &app.metrics_key).inspect_err(|_| app.telemetry.metrics_auth_denied())
 }
 fn owner(headers: &HeaderMap) -> Result<(Uuid, u64)> {
     let epoch = headers
@@ -177,7 +185,7 @@ async fn start(
     State(app): State<App>,
     headers: HeaderMap,
     Json(body): Json<Start>,
-) -> Result<Json<Value>> {
+) -> Result<Response> {
     let _request = permit(&app.requests)?;
     publisher_auth(&app, &headers)?;
     let mut relay = app.relay.lock().await;
@@ -188,7 +196,11 @@ async fn start(
         return Err(StatusCode::CONFLICT);
     }
     app.updates.send_replace(relay.view());
-    Ok(Json(status(&relay.authority)))
+    Ok((
+        [("x-bmux-publisher-observability", "1")],
+        Json(status(&relay.authority)),
+    )
+        .into_response())
 }
 async fn control(
     State(app): State<App>,
@@ -225,7 +237,7 @@ async fn publisher_status(State(app): State<App>, headers: HeaderMap) -> Result<
     Ok(Json(status(&relay.authority)))
 }
 async fn metrics(State(app): State<App>, headers: HeaderMap) -> Result<Response> {
-    authorize(&headers, &app.metrics_key)?;
+    metrics_auth(&app, &headers)?;
     let body = format!(
         "# TYPE bmux_relay_frames_total counter\nbmux_relay_frames_total {}\n# TYPE bmux_relay_repairs_total counter\nbmux_relay_repairs_total {}\n# TYPE bmux_relay_viewers gauge\nbmux_relay_viewers {}\n",
         app.frames.load(Ordering::Relaxed),
@@ -242,7 +254,31 @@ async fn metrics(State(app): State<App>, headers: HeaderMap) -> Result<Response>
         app.viewer_throttled.load(Ordering::Relaxed),
         app.aggregate_throttled.load(Ordering::Relaxed)
     ) + &body;
+    let body = app.telemetry.metrics() + &body;
     Ok(([("content-type", "text/plain; version=0.0.4")], body).into_response())
+}
+/// Explicitly selected v1 read-only diagnostics; never shares publisher authority.
+async fn diagnostics(State(app): State<App>, headers: HeaderMap) -> Result<Response> {
+    metrics_auth(&app, &headers)?;
+    if headers
+        .get("x-bmux-diagnostics-version")
+        .and_then(|v| v.to_str().ok())
+        != Some("1")
+    {
+        return Err(StatusCode::NOT_ACCEPTABLE);
+    }
+    let body = json!({"version":1, "build":{"package_version":env!("CARGO_PKG_VERSION"),
+        "revision":option_env!("BMUX_BUILD_REVISION"),
+        "binary_wire_version":bmux_web_renderer::BINARY_WIRE_VERSION},
+        "progress":app.telemetry.diagnostics()});
+    Ok((
+        [
+            ("cache-control", "no-store"),
+            ("vary", "authorization, x-bmux-diagnostics-version"),
+        ],
+        Json(body),
+    )
+        .into_response())
 }
 async fn publisher_ws(
     State(app): State<App>,
@@ -259,12 +295,33 @@ async fn publisher_ws(
         }
     }
     Ok(ws
+        .protocols(["bmux-observe-v1"])
         .max_message_size(app.limits.message_bytes)
         .max_frame_size(app.limits.message_bytes)
         .on_upgrade(move |socket| publisher_loop(app, socket, epoch, fence, permit)))
 }
-async fn send(socket: &mut WebSocket, message: Message) -> bool {
-    matches!(timeout(IO_TIMEOUT, socket.send(message)).await, Ok(Ok(())))
+async fn bounded_send<E>(
+    budget: Duration,
+    operation: impl std::future::Future<Output = std::result::Result<(), E>>,
+) -> std::result::Result<(), Disconnect> {
+    match timeout(budget, operation).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(_)) => Err(Disconnect::SendFailed),
+        Err(_) => Err(Disconnect::SendTimeout),
+    }
+}
+async fn send(socket: &mut WebSocket, message: Message) -> std::result::Result<(), Disconnect> {
+    bounded_send(IO_TIMEOUT, socket.send(message)).await
+}
+async fn send_observed(
+    socket: &mut WebSocket,
+    message: Message,
+    connection: &observability::Connection,
+) -> std::result::Result<(), Disconnect> {
+    connection.sending(true);
+    let result = send(socket, message).await;
+    connection.sending(false);
+    result
 }
 fn text(value: Value) -> Message {
     Message::Text(value.to_string().into())
@@ -276,6 +333,8 @@ async fn publisher_loop(
     fence: u64,
     _permit: OwnedSemaphorePermit,
 ) {
+    let observe = socket.protocol().is_some_and(|p| p == "bmux-observe-v1");
+    let mut connection = app.telemetry.connection(Role::Publisher);
     let mut fresh = true;
     let mut updates = app.updates.subscribe();
     let mut ping = interval(Duration::from_secs(5));
@@ -284,40 +343,48 @@ async fn publisher_loop(
         tokio::select! {
             _ = ping.tick() => {
                 let valid = app.relay.lock().await.authority.owns(epoch, fence, now());
-                if !valid || last_pong.elapsed() > Duration::from_secs(15) || !send(&mut socket, Message::Ping(Default::default())).await { break; }
+                if !valid { connection.exit(Disconnect::AuthorityChanged); break; }
+                if last_pong.elapsed() > Duration::from_secs(15) { connection.exit(Disconnect::PongTimeout); break; }
+                if let Err(reason) = send_observed(&mut socket, Message::Ping(Default::default()), &connection).await { connection.exit(reason); break; }
             }
             changed = updates.changed() => {
-                if changed.is_err() { break; }
+                if changed.is_err() { connection.exit(Disconnect::UpdatesClosed); break; }
                 let a = updates.borrow().authority.clone();
-                if !a.owns(epoch, fence, now()) || a.state == Phase::Paused { break; }
+                if !a.owns(epoch, fence, now()) || a.state == Phase::Paused { connection.exit(Disconnect::AuthorityChanged); break; }
             }
             message = socket.next() => {
                 match message {
                     Some(Ok(Message::Binary(bytes))) => {
-                        if !app.ingress.lock().await.admit(bytes.len(), app.limits.frames_sec, app.limits.bytes_sec) { break; }
+                        if !app.ingress.lock().await.admit(bytes.len(), app.limits.frames_sec, app.limits.bytes_sec) { connection.exit(Disconnect::IngressThrottled); break; }
                         app.uploaded_bytes.fetch_add(bytes.len() as u64, Ordering::Relaxed);
                         let response = {
                             let mut relay = app.relay.lock().await;
-                            if !relay.authority.owns(epoch, fence, now()) || relay.authority.state == Phase::Paused { break; }
-                            match relay.ingest(bytes, fresh) {
+                            if !relay.authority.owns(epoch, fence, now()) || relay.authority.state == Phase::Paused { connection.exit(Disconnect::AuthorityChanged); break; }
+                            match relay.ingest_detailed(bytes, fresh) {
                                 Ok(()) => {
                                     fresh = false; app.frames.fetch_add(1, Ordering::Relaxed);
                                     let frame = &relay.delivery.as_ref().expect("admitted frame").frame;
+                                    app.telemetry.admitted(frame.revision());
+                                    connection.publisher_received(Some(frame.revision()), false);
                                     let ack = json!({"type":"ack", "generation":frame.generation(), "revision":frame.revision().to_string()});
                                     app.updates.send_replace(relay.view()); ack
                                 }
-                                Err(_) => { fresh = true; app.repairs.fetch_add(1, Ordering::Relaxed); json!({"type":"repair"}) }
+                                Err(reason) => { connection.publisher_received(None, true); connection.rejected(reason); fresh = true; app.repairs.fetch_add(1, Ordering::Relaxed); if observe { json!({"type":"repair", "reason":reason, "observability_version":1}) } else { json!({"type":"repair"}) } }
                             }
                         };
-                        if !send(&mut socket, text(response)).await { break; }
+                        if let Err(reason) = send_observed(&mut socket, text(response), &connection).await { connection.exit(reason); break; }
+                        connection.publisher_reply_sent();
                     }
                     Some(Ok(Message::Pong(_))) => last_pong = Instant::now(),
-                    Some(Ok(Message::Ping(bytes))) => { if !send(&mut socket, Message::Pong(bytes)).await { break; } }
-                    _ => break,
+                    Some(Ok(Message::Ping(bytes))) => { if let Err(reason) = send_observed(&mut socket, Message::Pong(bytes), &connection).await { connection.exit(reason); break; } }
+                    Some(Ok(Message::Close(_))) | None => { connection.exit(Disconnect::PeerClosed); break; },
+                    Some(Err(_)) => { connection.exit(Disconnect::TransportError); break; }
+                    _ => { connection.exit(Disconnect::UnexpectedMessage); break; },
                 }
             }
         }
     }
+    drop(connection);
     let _ = send(&mut socket, Message::Close(None)).await;
 }
 async fn viewer_ws(
@@ -347,10 +414,18 @@ enum ViewerControl {
     },
     Repair,
 }
+#[cfg(test)]
 async fn admit_egress(app: &App, viewer: &mut Rate, bytes: usize) -> bool {
+    admit_egress_detailed(app, viewer, bytes).await.is_ok()
+}
+async fn admit_egress_detailed(
+    app: &App,
+    viewer: &mut Rate,
+    bytes: usize,
+) -> std::result::Result<(), Disconnect> {
     if !viewer.admit(bytes, u64::MAX, app.limits.viewer_egress_sec) {
         app.viewer_throttled.fetch_add(1, Ordering::Relaxed);
-        return false;
+        return Err(Disconnect::ViewerThrottled);
     }
     // Process-wide admission is serialized and survives connection churn. Charge
     // before writes; failed writes are conservatively not refunded.
@@ -361,11 +436,12 @@ async fn admit_egress(app: &App, viewer: &mut Rate, bytes: usize) -> bool {
         .admit(bytes, u64::MAX, app.limits.aggregate_egress_sec)
     {
         app.aggregate_throttled.fetch_add(1, Ordering::Relaxed);
-        return false;
+        return Err(Disconnect::AggregateThrottled);
     }
-    true
+    Ok(())
 }
 async fn viewer_loop(app: App, mut socket: WebSocket, _permit: OwnedSemaphorePermit) {
+    let mut connection = app.telemetry.connection(Role::Viewer);
     let mut updates = app.updates.subscribe();
     let mut cursor: Option<(String, u64)> = None;
     let mut pending: Option<(String, u64)> = None;
@@ -383,7 +459,10 @@ async fn viewer_loop(app: App, mut socket: WebSocket, _permit: OwnedSemaphorePer
             view.authority.expires_ms,
         );
         if last_authority.as_ref() != Some(&authority_identity) {
-            if !send(&mut socket, text(status(&view.authority))).await {
+            if let Err(reason) =
+                send_observed(&mut socket, text(status(&view.authority)), &connection).await
+            {
+                connection.exit(reason);
                 break;
             }
             if last_authority
@@ -392,6 +471,7 @@ async fn viewer_loop(app: App, mut socket: WebSocket, _permit: OwnedSemaphorePer
             {
                 cursor = None;
                 pending = None;
+                connection.reset();
             }
             last_authority = Some(authority_identity);
         }
@@ -410,45 +490,58 @@ async fn viewer_loop(app: App, mut socket: WebSocket, _permit: OwnedSemaphorePer
                 } else {
                     match delivery.snapshot() {
                         Ok(bytes) => bytes,
-                        Err(_) => break,
+                        Err(_) => {
+                            connection.exit(Disconnect::SnapshotFailed);
+                            break;
+                        }
                     }
                 };
                 let sent_bytes = bytes.len() as u64;
-                if !admit_egress(&app, &mut egress, bytes.len()).await {
+                if let Err(reason) = admit_egress_detailed(&app, &mut egress, bytes.len()).await {
+                    connection.exit(reason);
                     break;
                 }
-                if !send(&mut socket, Message::Binary(bytes)).await {
+                if let Err(reason) =
+                    send_observed(&mut socket, Message::Binary(bytes), &connection).await
+                {
+                    connection.exit(reason);
                     break;
                 }
                 app.delivered_bytes.fetch_add(sent_bytes, Ordering::Relaxed);
+                connection.sent(next.1);
                 pending = Some(next);
                 deadline = Instant::now() + IO_TIMEOUT;
             }
         }
         tokio::select! {
-            _ = tokio::time::sleep_until(deadline), if pending.is_some() => break,
+            _ = tokio::time::sleep_until(deadline), if pending.is_some() => { connection.exit(Disconnect::AckTimeout); break; },
             _ = ping.tick() => {
-                if last_pong.elapsed() > Duration::from_secs(15) || !send(&mut socket, Message::Ping(Default::default())).await { break; }
+                if last_pong.elapsed() > Duration::from_secs(15) { connection.exit(Disconnect::PongTimeout); break; }
+                if let Err(reason) = send_observed(&mut socket, Message::Ping(Default::default()), &connection).await { connection.exit(reason); break; }
             }
-            changed = updates.changed() => { if changed.is_err() { break; } }
+            changed = updates.changed() => { if changed.is_err() { connection.exit(Disconnect::UpdatesClosed); break; } }
             message = socket.next() => match message {
                 Some(Ok(Message::Text(value))) => {
-                    if !rate.admit(value.len(), 120, 64 * 1024) { break; }
+                    if !rate.admit(value.len(), 120, 64 * 1024) { connection.exit(Disconnect::ControlThrottled); break; }
                     match serde_json::from_str::<ViewerControl>(&value) {
                     Ok(ViewerControl::Ack { generation, revision }) => {
                         let received = revision.parse::<u64>().ok().map(|r| (generation, r));
-                        if pending.is_none() || received != pending { break; }
+                        if pending.is_none() || received != pending { connection.exit(Disconnect::InvalidAck); break; }
+                        connection.ack(pending.as_ref().expect("checked pending").1);
                         cursor = pending.take();
                     }
-                    Ok(ViewerControl::Repair) => { cursor = None; pending = None; app.repairs.fetch_add(1, Ordering::Relaxed); }
-                    Err(_) => break,
+                    Ok(ViewerControl::Repair) => { connection.repair(); connection.reset(); cursor = None; pending = None; app.repairs.fetch_add(1, Ordering::Relaxed); }
+                    Err(_) => { connection.exit(Disconnect::InvalidControl); break; },
                 } },
                 Some(Ok(Message::Pong(_))) => last_pong = Instant::now(),
-                Some(Ok(Message::Ping(bytes))) => { if !send(&mut socket, Message::Pong(bytes)).await { break; } }
-                _ => break,
+                Some(Ok(Message::Ping(bytes))) => { if let Err(reason) = send_observed(&mut socket, Message::Pong(bytes), &connection).await { connection.exit(reason); break; } }
+                Some(Ok(Message::Close(_))) | None => { connection.exit(Disconnect::PeerClosed); break; },
+                Some(Err(_)) => { connection.exit(Disconnect::TransportError); break; }
+                _ => { connection.exit(Disconnect::UnexpectedMessage); break; },
             }
         }
     }
+    drop(connection);
     let _ = send(&mut socket, Message::Close(None)).await;
 }
 async fn request_budget(
@@ -457,19 +550,25 @@ async fn request_budget(
     next: axum::middleware::Next,
 ) -> Response {
     if request.uri().path() != "/health" && !app.http_rate.lock().await.admit(0, 32, u64::MAX) {
+        app.telemetry.http_throttled();
         return StatusCode::TOO_MANY_REQUESTS.into_response();
     }
     let Ok(_permit) = permit(&app.requests) else {
+        app.telemetry.http_throttled();
         return StatusCode::TOO_MANY_REQUESTS.into_response();
     };
     match timeout(IO_TIMEOUT, next.run(request)).await {
         Ok(response) => response,
-        Err(_) => StatusCode::REQUEST_TIMEOUT.into_response(),
+        Err(_) => {
+            app.telemetry.http_timeout();
+            StatusCode::REQUEST_TIMEOUT.into_response()
+        }
     }
 }
 fn router(app: App) -> Router {
     Router::new().route("/health", get(|| async { Json(json!({"status":"ok", "renderer":format!("bmwp-{}", bmux_web_renderer::BINARY_WIRE_VERSION)})) }))
         .route("/metrics", get(metrics))
+        .route("/v1/diagnostics", get(diagnostics))
         .route("/v1/publisher/start", post(start))
         .route("/v1/publisher/status", get(publisher_status))
         .route("/v1/publisher/ws", get(publisher_ws))
@@ -541,6 +640,7 @@ async fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let relay = Relay::open(path, now())?;
     let (updates, _) = watch::channel(relay.view());
     let app = App {
+        telemetry: Arc::new(Observability::default()),
         relay: Arc::new(Mutex::new(relay)),
         updates,
         publisher_key,

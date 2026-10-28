@@ -45,7 +45,7 @@ export async function mountCanvasViewer({ container, assetBase, loadModule = url
     capabilities: ['bmwp-delta-v1'],
     get identity() { return identity && { ...identity }; },
     clear,
-    async present(bytes, admitted) {
+    async present(bytes, admitted, onDecoded = () => {}) {
       if (disposed || pending) return false;
       pending = true;
       const ticket = generation;
@@ -58,6 +58,7 @@ export async function mountCanvasViewer({ container, assetBase, loadModule = url
         const inspection = JSON.parse(state.renderer.inspect_binary(bytes));
         if (!inspection.supported) throw new Error('unsupported presentation');
         await state.renderer.present_binary(bytes);
+        onDecoded();
         if (disposed || ticket !== generation || !admitted()) return false;
         // Retain the decoder/delta base on a hidden canvas. Only expose a copy
         // after admission; a pending update must never alter visible output.

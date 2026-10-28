@@ -87,7 +87,7 @@ async fn poll(
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
-            return Err("No first-frame acknowledgement within 15s; inspect broadcast status. Broadcast may continue.".into());
+            return Err("No first-frame acknowledgement within 15s; use broadcast diagnose --json and broadcast events --last 50 to inspect source progress, transport and ACK failures. Broadcast may continue.".into());
         }
         let status = tokio::time::timeout(remaining, turnkey::client::status(client))
             .await
@@ -100,7 +100,7 @@ async fn poll(
         }
         if let Some(code) = status.error_code {
             return Err(format!(
-                "Broadcast startup failed: {code} (local={}, remote={})",
+                "Broadcast has not acknowledged its first frame: {code} (local={}, remote={}). Use broadcast diagnose --json and broadcast events --last 50. This alone does not imply a bad profile or credential.",
                 status.local, status.remote
             ));
         }

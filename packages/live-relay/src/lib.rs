@@ -9,6 +9,9 @@ use std::{
 };
 use uuid::Uuid;
 
+pub mod ingest_reason;
+pub use ingest_reason::IngestReason;
+
 pub const MAX_BYTES: usize = 8 * 1024 * 1024;
 pub const LEASE_MS: u64 = 15_000;
 
@@ -238,8 +241,28 @@ impl Relay {
         Ok(true)
     }
     pub fn ingest(&mut self, bytes: axum::body::Bytes, fresh: bool) -> Result<(), &'static str> {
-        if bytes.len() > MAX_BYTES || self.poisoned {
-            return Err("size or poisoned authority");
+        self.ingest_detailed(bytes, fresh)
+            .map_err(|reason| match reason {
+                IngestReason::Oversize | IngestReason::PoisonedAuthority => {
+                    "size or poisoned authority"
+                }
+                IngestReason::Resources => "resources",
+                IngestReason::ZeroRevision => "zero revision",
+                IngestReason::StaleRevision => "revision",
+                _ => "repair",
+            })
+    }
+    /// Typed local diagnostics; publisher ACK/repair wire envelopes remain unchanged.
+    pub fn ingest_detailed(
+        &mut self,
+        bytes: axum::body::Bytes,
+        fresh: bool,
+    ) -> Result<(), IngestReason> {
+        if bytes.len() > MAX_BYTES {
+            return Err(IngestReason::Oversize);
+        }
+        if self.poisoned {
+            return Err(IngestReason::PoisonedAuthority);
         }
         let base = if fresh {
             None
@@ -249,18 +272,18 @@ impl Relay {
         let resources = base
             .map(bmux_web_renderer::extract_resources)
             .transpose()
-            .map_err(|_| "resources")?
+            .map_err(|_| IngestReason::Resources)?
             .unwrap_or_default();
         let frame = bmux_web_renderer::decode_binary_with_resources(&bytes, base, &resources)
-            .map_err(|_| "repair")?;
+            .map_err(IngestReason::decode)?;
         if frame.revision() == 0 {
-            return Err("zero revision");
+            return Err(IngestReason::ZeroRevision);
         }
         if let Some(old) = &self.delivery
             && old.frame.generation() == frame.generation()
             && frame.revision() <= old.frame.revision()
         {
-            return Err("revision");
+            return Err(IngestReason::StaleRevision);
         }
         // Detect full versus delta through the canonical decoder, not a parallel wire parser.
         let is_full = decode_binary(&bytes, None).is_ok();

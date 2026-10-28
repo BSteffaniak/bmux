@@ -202,3 +202,79 @@ not confirmed; the relay lease bounds exposure when unreachable.
 
 See [the streaming contract](../../docs/live-stream-protocol.md) and the
 [local broadcasting guide](../../docs/live-broadcasting.md) for integration.
+
+## Publisher observability
+
+- `bmux broadcast status --verbose` or `bmux broadcast diagnose --json` reads
+  the authenticated, generated `broadcast-diagnostics-v1.status` service.
+- `bmux broadcast events --last 50` reads the latest process-local events,
+  oldest first. History is capped at 256 entries; zero requests none. Sequence
+  and attempt IDs correlate HTTP responses, sends, repairs and outcomes.
+- These commands observe the publisher, not browser rendering or viewer receipt.
+  They do not publish, reconnect, change profiles or probe the relay.
+
+Progress is `awaiting_source` before the first admitted frame, `pending` while
+admitted content lacks an ACK, and `stalled` after six seconds without clearing
+that backlog. Once acknowledged, unchanged content is `idle` regardless of ACK
+age: old output is not a stalled stream. Non-running local states take
+precedence. Revisions are renderer frame revisions, scoped by `refresh`; the
+internal relay mutation sequence is not a source revision. Source poll age,
+source frame age, send age and ACK age are independent monotonic durations.
+Counters are saturating process-lifetime observations; invalidation clears
+current progress but retains history and the last failure. HTTP heartbeat
+success does not clear an outstanding frame failure. Existing control/turnkey
+error classes remain unchanged; detailed diagnostics classify HTTP rejection,
+transport, WebSocket upgrade/protocol, ACK mismatch/timeout and repair failures.
+
+Diagnostics retain only local fixed reason names, numeric HTTP statuses, ages,
+counters and revisions. They exclude credentials, publisher fences, endpoints,
+source labels, generation strings, frames, close reasons and peer error text.
+Doctor checks local configuration/file permissions and public health only; it
+cannot establish publisher authentication, upgrade, ACK or viewer health.
+
+### Correlation and evidence limits
+
+Snapshots and events include a random `process_instance` and
+`controller_instance`;
+combine these with attempt/event IDs across restarts or plugin reactivation.
+`current_failures` retains independent operation stages (frame, heartbeat,
+keepalive, start, pause/resume/stop, observer). Success resolves only its
+matching
+stage; refresh invalidation explicitly retires previous-context current
+failures.
+`current_failure` is just the most recent member for compact displays, not the
+complete current error set. `last_failure` remains historical.
+
+Source/send/ACK generations are `sha256:` fingerprints of the opaque generation
+value, never raw source-controlled strings. Revisions must be paired with that
+fingerprint and refresh. `ack_latency_ms` is the successful frame attempt's
+total
+monotonic duration, including reconnect/send and any full repair; it is not pure
+network RTT and excludes previous retry attempts. Observer age is its last local
+lease-renewal heartbeat, not evidence that the terminal produced changed output.
+`registered`, `lease_expired`, `external_producer`, `exited`, and `unregistered`
+distinguish known local lifecycle evidence; absence of an exit reason does not
+establish clean shutdown. Source lease remaining is reported separately.
+
+Plugin-owned structured `tracing` events emit state/observer transitions,
+failures and matching-stage recovery under `bmux.broadcast.diagnostics`, using
+only safe fixed names and numeric/correlation fields. Retention beyond the ring
+depends on the host logging subscriber/sink and its configured filter/rotation;
+this plugin does not create an independent durable log or guarantee retention.
+
+The publisher does not fetch independent metrics-key-protected relay
+diagnostics.
+New relays advertise `X-Bmux-Publisher-Observability: 1` on authenticated start;
+only then does the publisher offer `bmux-observe-v1`. If selected, repair
+messages
+carry a version and closed allowlisted reason, retained in publisher history.
+Legacy start responses keep the original handshake and repair interpretation.
+No arbitrary peer text is retained, including unknown reason strings.
+HTTP status and transport observations alone cannot distinguish relay restart,
+proxy interference, throttling, rejected content or network loss. In particular,
+a missing ACK is not proof that the relay rejected the frame, and a socket close
+does not identify the relay's disconnect reason. Viewer rendering/receipt
+remains
+outside publisher evidence. Inspect independently authenticated relay
+diagnostics
+when available; publisher diagnostics never claim that remote evidence exists.

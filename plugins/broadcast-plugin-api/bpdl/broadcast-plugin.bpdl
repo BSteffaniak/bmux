@@ -3,6 +3,7 @@ capability BROADCAST_CONTROL = bmux.broadcast.control.v1;
 capability BROADCAST_OUTPUT = bmux.broadcast.output.v1;
 capability BROADCAST_TURNKEY = bmux.broadcast.turnkey.v1;
 capability BROADCAST_PRESENTATION = bmux.broadcast.presentation.v1;
+capability BROADCAST_DIAGNOSTICS = bmux.broadcast.diagnostics.v1;
 
 @capability(BROADCAST_PRESENTATION)
 interface broadcast-presentation-v1 {
@@ -69,4 +70,28 @@ interface broadcast-output-v1 {
     command poll(source_id: string) -> source-state;
     command publish(source_id: string, refresh: u64, frame: bytes) -> bool;
     command unregister(source_id: string) -> bool;
+}
+
+// Process-local, bounded, allowlisted diagnostics. No credentials, fences, URLs,
+// frame payloads or peer-supplied text. Ages use a monotonic clock in milliseconds.
+@capability(BROADCAST_DIAGNOSTICS)
+interface broadcast-diagnostics-v1 {
+    record failure { attempt_id: u64, operation: string, reason: string, age_ms: u64 }
+    record event { process_instance: string, controller_instance: string, sequence: u64, attempt_id: u64, operation: string, kind: string, reason: string?, generation: string?, revision: u64?, http_status: u32?, refresh: u64, age_ms: u64 }
+    record snapshot {
+        process_instance: string, controller_instance: string,
+        current_failures: list<failure>,
+        source_generation: string?, send_generation: string?, ack_generation: string?, ack_latency_ms: u64?,
+        observer_state: string?, observer_exit: string?, observer_age_ms: u64?,
+        local: string, remote: string, progress: string, refresh: u64,
+        current_failure: failure?, last_failure: failure?, local_error_code: string?,
+        source_poll_age_ms: u64?, source_polls: u64, source_lease_remaining_ms: u64?,
+        source_age_ms: u64?, source_revision: u64?, ack_age_ms: u64?, ack_revision: u64?, pending_age_ms: u64?,
+        send_age_ms: u64?, send_revision: u64?, frames_sent: u64, full_frames: u64, delta_frames: u64, bytes_sent: u64,
+        source_frames: u64, attempts: u64, acknowledgements: u64, repairs: u64, failures: u64,
+        suppressed: u64, coalesced: u64, latest_event: u64, history_capacity: u32, stall_after_ms: u64
+    }
+    command status() -> snapshot;
+    // Oldest to newest, clamped to 256 entries. Zero returns no entries.
+    command events(last: u32) -> list<event>;
 }

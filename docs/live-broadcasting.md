@@ -104,6 +104,40 @@ the local smoke alone does not prove all interactive or visual privacy races.
 
 ## Production checks and observability limits
 
+### Diagnose a frozen broadcast
+
+On builds supporting `broadcast-diagnostics-v1`, use the same selected runtime:
+
+```sh
+bmux broadcast status --verbose
+bmux broadcast diagnose --json
+bmux broadcast events --last 50
+```
+
+These commands are local read-only observations: they do not restart a stream,
+renew a lease, publish a test frame, or grant authority. Histories are bounded
+and process-local. Capture them before restarting the process. Older loaded
+plugins may not support the service even when the CLI is newer.
+
+`doctor` checks local profile/credential-file permissions and public relay
+health; it does not test publisher authentication, frame acknowledgments or
+viewer rendering. A retained frame and a healthy relay are not proof of ongoing
+updates. `idle` means there is no observed pending work; old content alone does
+not make an unchanged terminal stalled. Inspect pending/send/ACK ages and the
+current versus last failure. Correlate revisions only within their generation
+and use monotonic elapsed ages, not subtraction of clocks on different hosts.
+
+The viewer's **Delivery diagnostics** panel exposes a sanitized local export.
+Receive, decode, renderer submission and ACK-send are separate milestones;
+renderer submission is not proof of physical screen display, and ACK-send is
+not proof the relay received that ACK. No terminal content is included.
+
+Operators can query `/v1/diagnostics` with the separate metrics credential and
+`X-Bmux-Diagnostics-Version: 1` for relay connection, repair and admission
+observations. Keep the credential in a private client configuration rather than
+command text. See `packages/live-relay/OBSERVABILITY.md` for the diagnostic
+contract. Missing diagnostic support is unknown, not a passing check.
+
 Public smoke is read-only and keeps site and relay origins separate:
 
 ```sh
@@ -119,12 +153,13 @@ credentials, print remote bodies, or follow redirects. This is not visual or
 volume-persistence acceptance.
 
 `/metrics` requires an independent metrics bearer key and exposes content-free
-Prometheus data. **No authenticated scraper, durable metrics retention,
-dashboard,
-or alerting service is provisioned by this infrastructure.** The endpoint alone
+Prometheus data. No authenticated scraper, durable metrics retention,
+dashboard, or alerting service is provisioned by the relay deployment itself.
+An optional operator-managed [private monitoring stack](../infra/live-monitoring/README.md)
+provides Prometheus retention, Grafana provisioning and Alertmanager webhook
+configuration; it must be deployed and verified separately. The endpoint alone
 is not persistent observability; counters lost on process restart are not an
-incident history. Configure and review a private collector separately before
-claiming operational monitoring. Never store terminal payloads, bearer keys or
+incident history. Never store terminal payloads, bearer keys or
 publisher identity in metric labels or diagnostic artifacts.
 
 Offline infrastructure checks (no builds or deployment):

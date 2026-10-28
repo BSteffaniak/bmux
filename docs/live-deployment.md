@@ -177,6 +177,9 @@ This checks protocol identity and immutable site bundle integrity. It does not
 prove visual rendering, historical error-free operation or volume durability.
 `live-smoke.yml` remains the public smoke workflow. Private `/metrics` requires
 its separate bearer credential; monitoring is not provisioned by deployment.
+The optional operator-managed configuration in `infra/live-monitoring/` adds
+persistent scraping, dashboards and webhook alerts after separate deployment
+and acceptance. It never starts automatically or modifies relay authority.
 
 ## Deployment verification
 
