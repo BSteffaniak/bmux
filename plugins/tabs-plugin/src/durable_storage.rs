@@ -1,6 +1,5 @@
 //! Tabs arrangement transactions span read/modify/write, not just file publication.
 use std::fs::{File, OpenOptions};
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
@@ -109,17 +108,7 @@ fn acquire_named(root: &Path, name: &str, timeout: Duration) -> Result<File, Str
         Ok(bytes) if bytes == CONTRACT => {}
         Ok(_) => return Err("unsupported or corrupt tabs arrangement writer contract".into()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let mut output = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&contract)
-                .map_err(|error| error.to_string())?;
-            output
-                .write_all(CONTRACT)
-                .map_err(|error| error.to_string())?;
-            output.sync_all().map_err(|error| error.to_string())?;
-            File::open(root)
-                .and_then(|directory| directory.sync_all())
+            bmux_plugin::filesystem::publish_new(&contract, CONTRACT)
                 .map_err(|error| error.to_string())?;
         }
         Err(error) => return Err(error.to_string()),

@@ -1687,31 +1687,9 @@ fn invoke_host_kernel_bridge(bridge: &HostKernelBridge, payload: Vec<u8>) -> Res
     Ok(response.payload)
 }
 
-/// Commit a complete value before publishing it to the process cache.
+/// Commit a complete value with atomic, platform-specific durable publication.
 fn write_storage_value(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    static NEXT_WRITE: AtomicU64 = AtomicU64::new(0);
-    let parent = path
-        .parent()
-        .ok_or_else(|| std::io::Error::other("storage path has no parent"))?;
-    let temporary = path.with_extension(format!(
-        "pending-{}-{}",
-        std::process::id(),
-        NEXT_WRITE.fetch_add(1, Ordering::Relaxed)
-    ));
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temporary)?;
-    let result = (|| {
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        fs::rename(&temporary, path)?;
-        fs::File::open(parent)?.sync_all()
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary);
-    }
-    result
+    crate::filesystem::replace(path, bytes)
 }
 
 fn storage_file_path(connection: &HostConnectionInfo, plugin_id: &str, key: &str) -> PathBuf {
@@ -2202,11 +2180,21 @@ impl LoadedPlugin {
             let tasks = bmux_plugin_runtime::background::BackgroundTasks::new();
             *scope = Some(tasks.clone());
             drop(scope);
+            let _ = bmux_plugin_sdk::take_last_command_error();
             let status =
                 (vtable.activate_with_async)(context, async_handle.with_background_tasks(tasks));
+            let error = bmux_plugin_sdk::take_last_command_error();
             if status != 0 {
                 return Err(PluginError::ServiceProtocol {
-                    details: format!("plugin activation failed with status {status}"),
+                    details: error.map_or_else(
+                        || format!("plugin activation failed with status {status}"),
+                        |error| {
+                            format!(
+                                "plugin activation failed with status {status}: {}",
+                                error.message
+                            )
+                        },
+                    ),
                 });
             }
             Ok(status)

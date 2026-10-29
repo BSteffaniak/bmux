@@ -25,6 +25,7 @@ pub mod component_viewport;
 mod declaration;
 mod discovery;
 mod event_bus;
+pub mod filesystem;
 mod host_runtime;
 pub mod layout;
 mod loader;

@@ -615,9 +615,24 @@ pub fn activate_with_async_bundled<P: RustPlugin>(
     context: NativeLifecycleContext,
     async_handle: HostAsyncHandle,
 ) -> i32 {
+    let _ = take_last_command_error();
     instance.write().map_or(EXIT_UNAVAILABLE, |mut plugin| {
-        result_to_exit_code(plugin.activate_with_async(context, async_handle))
+        capture_lifecycle_result(plugin.activate_with_async(context, async_handle))
     })
+}
+
+// Use the same thread-local transport as command errors; no stderr writes from
+// in-process plugins, and no domain-specific error handling in the host.
+fn capture_lifecycle_result(result: Result<i32, PluginCommandError>) -> i32 {
+    let _ = take_last_command_error();
+    match result {
+        Ok(code) => code,
+        Err(error) => {
+            let code = error.code;
+            store_last_command_error(error);
+            code
+        }
+    }
 }
 
 /// Collect BPDL-generated service declarations from a bundled plugin instance.
@@ -1158,6 +1173,24 @@ pub fn invoke_streaming_service_export<P: RustPlugin>(
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod concurrent_tests {
+    #[test]
+    fn lifecycle_error_capture_preserves_details_and_clears_stale_errors() {
+        let code = super::capture_lifecycle_result(Err(super::PluginCommandError::failed(
+            "storage publication failed",
+        )));
+        assert_eq!(code, crate::EXIT_ERROR);
+        let error = super::take_last_command_error().expect("activation failure detail");
+        assert_eq!(error.message, "storage publication failed");
+        assert!(super::take_last_command_error().is_none());
+        super::capture_lifecycle_result(Err(super::PluginCommandError::failed("old failure")));
+        assert_eq!(
+            super::capture_lifecycle_result(Ok(crate::EXIT_OK)),
+            crate::EXIT_OK
+        );
+        assert!(super::take_last_command_error().is_none());
+        assert_eq!(super::capture_lifecycle_result(Ok(17)), 17);
+        assert!(super::take_last_command_error().is_none());
+    }
     #[derive(Default)]
     struct NoEventPlugin;
     impl super::RustPlugin for NoEventPlugin {

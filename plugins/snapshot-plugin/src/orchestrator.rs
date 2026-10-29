@@ -6,7 +6,6 @@
 //! the `status()` method returns.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -624,29 +623,12 @@ fn write_envelope_atomic(
 }
 
 pub(crate) fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> SnapshotOrchestratorResult<()> {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static NEXT_WRITE: AtomicU64 = AtomicU64::new(0);
     let parent = path
         .parent()
         .ok_or_else(|| SnapshotOrchestratorError::Other("snapshot path has no parent".into()))?;
     std::fs::create_dir_all(parent)
         .map_err(|error| SnapshotOrchestratorError::Io(error.to_string()))?;
-    let sequence = NEXT_WRITE.fetch_add(1, Ordering::Relaxed);
-    let temp_path = path.with_extension(format!("pending-{}-{sequence}", std::process::id()));
-    let mut file = std::fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&temp_path)
-        .map_err(|error| SnapshotOrchestratorError::Io(error.to_string()))?;
-    // Failed publication leaves explicit recovery evidence; never truncate or
-    // remove another writer's temporary file.
-    file.write_all(bytes)
-        .and_then(|()| file.sync_all())
-        .map_err(|error| SnapshotOrchestratorError::Io(error.to_string()))?;
-    std::fs::rename(&temp_path, path)
-        .map_err(|error| SnapshotOrchestratorError::Io(error.to_string()))?;
-    std::fs::File::open(parent)
-        .and_then(|directory| directory.sync_all())
+    bmux_plugin::filesystem::replace(path, bytes)
         .map_err(|error| SnapshotOrchestratorError::Io(error.to_string()))
 }
 

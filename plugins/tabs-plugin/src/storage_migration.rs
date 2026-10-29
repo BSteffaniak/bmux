@@ -16,8 +16,7 @@ fn migrate_inner(data_dir: &Path) -> std::io::Result<()> {
                 "both bmux.windows and bmux.tabs storage exist; stop all runtimes and explicitly reconcile them before restarting",
             ));
         }
-        std::fs::rename(&old, &new)?;
-        sync_directory(&root)?;
+        bmux_plugin::filesystem::rename_new(&old, &new)?;
     }
     if !new.try_exists()? {
         return Ok(());
@@ -36,24 +35,17 @@ fn migrate_inner(data_dir: &Path) -> std::io::Result<()> {
                 destination.display()
             )));
         }
-        std::fs::rename(entry.path(), destination)?;
-        sync_directory(&new)?;
+        bmux_plugin::filesystem::rename_new(&entry.path(), &destination)?;
     }
-    // Also complete durability after an interruption between rename and sync.
-    sync_directory(&new)?;
-    sync_directory(&root)
-}
-
-#[cfg(unix)]
-fn sync_directory(path: &Path) -> std::io::Result<()> {
-    std::fs::File::open(path)?.sync_all()
-}
-
-#[cfg(not(unix))]
-fn sync_directory(_path: &Path) -> std::io::Result<()> {
-    Err(std::io::Error::other(
-        "automatic tab storage migration requires directory synchronization; migrate offline on a supported filesystem",
-    ))
+    // Unix rename and parent flush are separate operations. Complete a flush
+    // interrupted on a prior activation even if no legacy names remain.
+    // Windows publication uses write-through moves instead of directory fsync.
+    #[cfg(unix)]
+    {
+        std::fs::File::open(&new)?.sync_all()?;
+        std::fs::File::open(&root)?.sync_all()?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -84,6 +76,23 @@ mod tests {
         assert_eq!(
             std::fs::read(new.join("tabs.order.workspace.bin")).unwrap(),
             b"workspace bytes"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn current_storage_and_empty_installation_activate_repeatedly() {
+        let root =
+            std::env::temp_dir().join(format!("bmux-tab-migration-{}", uuid::Uuid::new_v4()));
+        migrate(&root).unwrap();
+        let new = root.join("plugin-storage/bmux.tabs");
+        std::fs::create_dir_all(&new).unwrap();
+        std::fs::write(new.join("tabs.arrangements.v2.bin"), b"canonical state").unwrap();
+        migrate(&root).unwrap();
+        migrate(&root).unwrap();
+        assert_eq!(
+            std::fs::read(new.join("tabs.arrangements.v2.bin")).unwrap(),
+            b"canonical state"
         );
         std::fs::remove_dir_all(root).unwrap();
     }

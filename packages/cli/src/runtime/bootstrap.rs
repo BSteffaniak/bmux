@@ -849,13 +849,7 @@ async fn run_server_start_inner(
         "error": result.as_ref().err().map(|error| format!("{error:#}")),
     });
     let receipt_path = paths.runtime_dir.join("shutdown-result.json");
-    let staged_receipt = paths
-        .runtime_dir
-        .join(format!("shutdown-result.{}.next", std::process::id()));
-    std::fs::write(&staged_receipt, serde_json::to_vec(&receipt)?)?;
-    std::fs::File::open(&staged_receipt)?.sync_all()?;
-    std::fs::rename(&staged_receipt, &receipt_path)?;
-    std::fs::File::open(&paths.runtime_dir)?.sync_all()?;
+    bmux_plugin::filesystem::replace(&receipt_path, &serde_json::to_vec(&receipt)?)?;
     // Do not erase ownership metadata published by a replacement instance.
     if crate::connection::read_server_runtime_metadata()?.as_ref() == Some(&server_identity) {
         remove_server_pid_file()?;
