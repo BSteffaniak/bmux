@@ -17,7 +17,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow = { workspace = true }
 bmux_attach_pipeline = { workspace = true }
-bmux_cli = { workspace = true }
+bmux_cli = { workspace = true, features = ["kitty-keyboard"] }
 bmux_client = { workspace = true }
 bmux_config = { workspace = true }
 bmux_frontend_runtime = { workspace = true }

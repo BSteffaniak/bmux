@@ -686,8 +686,10 @@ impl AttachHost for NativeAttachHost {
     fn geometry(&self) -> TerminalGeometry {
         self.geometry
     }
-    fn enter_attach_mode(&mut self, _keyboard: bool, _mouse: bool, _paste: bool) -> Result<bool> {
-        Ok(false)
+    fn enter_attach_mode(&mut self, keyboard: bool, _mouse: bool, _paste: bool) -> Result<bool> {
+        // Native events already carry modifiers; no outer-terminal negotiation
+        // is needed, but the shared reducer still needs the encoding capability.
+        Ok(keyboard && cfg!(feature = "kitty-keyboard"))
     }
     fn next_event(&mut self) -> AttachHostEventFuture<'_> {
         Box::pin(async {
@@ -19231,6 +19233,49 @@ mod tests {
 
         assert!(wrote);
         assert_ne!(output, [] as [u8; 0]);
+    }
+
+    #[test]
+    fn native_host_preserves_modified_enter_through_input_reducer() {
+        use bmux_frontend_runtime::input::{
+            KeyEvent as NativeKeyEvent, KeyPhase, LogicalKey, Modifiers, NamedKey, PhysicalKey,
+        };
+
+        let (_handle, mut host) = NativeAttachHost::channel(80, 24, 1, |_| {
+            panic!("encoding input must not present output")
+        })
+        .unwrap();
+        for enabled in [true, false] {
+            let enhanced = host.enter_attach_mode(enabled, true, true).unwrap();
+            assert_eq!(enhanced, enabled && cfg!(feature = "kitty-keyboard"));
+            let mut processor =
+                InputProcessor::new(attach_keymap_from_config(&BmuxConfig::default()), enhanced);
+            for control in [true, false] {
+                let key = NativeKeyEvent {
+                    physical: PhysicalKey::Code("Enter".to_string()),
+                    logical: LogicalKey::Named(NamedKey::Enter),
+                    phase: KeyPhase::Press,
+                    modifiers: Modifiers {
+                        control,
+                        ..Modifiers::default()
+                    },
+                    text: Some("\r".to_string()),
+                };
+                let key = TerminalKeyEvent::from_native(&key)
+                    .and_then(|key| key.to_crossterm())
+                    .unwrap();
+                let actions =
+                    attach_key_event_actions(&key, &mut processor, AttachUiMode::Normal).unwrap();
+                let expected = if enhanced && control {
+                    b"\x1b[13;5u".as_slice()
+                } else {
+                    b"\r".as_slice()
+                };
+                assert!(
+                    matches!(actions.as_slice(), [AttachEventAction::Send(bytes)] if bytes == expected)
+                );
+            }
+        }
     }
 
     #[test]
