@@ -76,6 +76,62 @@ pub struct Frame<'buffer> {
     metadata_availability: Vec<SurfaceMetadataAvailability>,
 }
 
+/// Apply opaque coverage to metadata preceding an overlay, whether staged or retained.
+pub(crate) fn occlude_metadata(
+    area: Rect,
+    cursor: &mut Option<Cursor>,
+    hits: &mut HitMap,
+    selection: &mut SelectionScene,
+    semantics: &mut SemanticScene,
+    availability: &mut Vec<SurfaceMetadataAvailability>,
+) {
+    *availability = availability
+        .iter()
+        .flat_map(|declaration| {
+            crate::image_scene::subtract_rect(declaration.area, area)
+                .into_iter()
+                .map(|visible| SurfaceMetadataAvailability {
+                    area: visible,
+                    ..*declaration
+                })
+        })
+        .collect();
+    *cursor = cursor.filter(|cursor| !area.contains(cursor.position));
+    let mut visible_hits = HitMap::new();
+    for hit in hits.regions() {
+        for visible in crate::image_scene::subtract_rect(hit.area, area) {
+            let mut fragment = hit.clone();
+            fragment.area = visible;
+            visible_hits.push(fragment);
+        }
+    }
+    *hits = visible_hits;
+    let mut visible_selection = SelectionScene::new();
+    for scope in selection.scopes() {
+        let mut scope = scope.clone();
+        if !scope.initiation_area.intersection(area).is_empty() {
+            // One rectangular initiation area cannot represent a cutout safely.
+            scope.initiation_area = Rect::new(0, 0, 0, 0);
+        }
+        visible_selection.push_scope(scope);
+    }
+    for fragment in selection.fragments() {
+        if fragment.area.intersection(area).is_empty() {
+            visible_selection.push_fragment(fragment.clone());
+        }
+    }
+    *selection = visible_selection;
+    let mut visible_semantics = SemanticScene::new();
+    for region in semantics.regions() {
+        for visible in crate::image_scene::subtract_rect(region.area, area) {
+            let mut fragment = region.clone();
+            fragment.area = visible;
+            visible_semantics.push(fragment);
+        }
+    }
+    *semantics = visible_semantics;
+}
+
 impl<'buffer> Frame<'buffer> {
     /// Create a frame that stages painting into `buffer`.
     pub const fn new(buffer: &'buffer mut Buffer) -> Self {
@@ -180,54 +236,15 @@ impl<'buffer> Frame<'buffer> {
             return;
         }
         self.occlusions.push((self.images.len(), area));
-        self.metadata_availability = self
-            .metadata_availability
-            .iter()
-            .flat_map(|declaration| {
-                crate::image_scene::subtract_rect(declaration.area, area)
-                    .into_iter()
-                    .map(|visible| SurfaceMetadataAvailability {
-                        area: visible,
-                        ..*declaration
-                    })
-            })
-            .collect();
         self.buffer.fill(area, " ", Style::new());
-        self.cursor = self.cursor.filter(|cursor| !area.contains(cursor.position));
-        let mut hits = HitMap::new();
-        for hit in self.hits.regions() {
-            for visible in crate::image_scene::subtract_rect(hit.area, area) {
-                let mut fragment = hit.clone();
-                fragment.area = visible;
-                hits.push(fragment);
-            }
-        }
-        self.hits = hits;
-        let mut selection = SelectionScene::new();
-        for scope in self.selection.scopes() {
-            let mut scope = scope.clone();
-            if !scope.initiation_area.intersection(area).is_empty() {
-                // A scope has one rectangular initiation area. Conservatively
-                // disable initiation rather than invent a competing shape model.
-                scope.initiation_area = Rect::new(0, 0, 0, 0);
-            }
-            selection.push_scope(scope);
-        }
-        for fragment in self.selection.fragments() {
-            if fragment.area.intersection(area).is_empty() {
-                selection.push_fragment(fragment.clone());
-            }
-        }
-        self.selection = selection;
-        let mut semantics = SemanticScene::new();
-        for region in self.semantics.regions() {
-            for visible in crate::image_scene::subtract_rect(region.area, area) {
-                let mut fragment = region.clone();
-                fragment.area = visible;
-                semantics.push(fragment);
-            }
-        }
-        self.semantics = semantics;
+        occlude_metadata(
+            area,
+            &mut self.cursor,
+            &mut self.hits,
+            &mut self.selection,
+            &mut self.semantics,
+            &mut self.metadata_availability,
+        );
     }
 
     pub(crate) const fn buffer_mut(&mut self) -> &mut Buffer {

@@ -66,7 +66,8 @@ impl ImageScene {
         self.visibility_sources.get(visible)
     }
 
-    /// Clone retained placements that do not intersect any damaged region.
+    /// Clone retained sources with visible area outside the damaged regions.
+    /// Partially replaced sources remain available for regional visibility clipping.
     #[must_use]
     pub fn contributions_outside(
         &self,
@@ -75,9 +76,14 @@ impl ImageScene {
         self.sources
             .values()
             .filter(|placement| {
-                !regions
-                    .iter()
-                    .any(|region| !placement.destination.intersection(*region).is_empty())
+                let mut pieces = vec![placement.clip.intersection(placement.destination)];
+                for region in regions {
+                    pieces = pieces
+                        .into_iter()
+                        .flat_map(|piece| subtract_rect(piece, *region))
+                        .collect();
+                }
+                !pieces.is_empty()
             })
             .cloned()
             .map(ImageContribution::Present)
@@ -161,10 +167,30 @@ impl ImageScene {
         contributions: &[ImageContribution],
         occlusions: &[(usize, crate::geometry::Rect)],
     ) -> ImageSceneDelta {
+        self.reconcile_occluded_regions(contributions, occlusions, None)
+    }
+
+    /// Retain the already-occluded visibility of sources outside a regional patch.
+    pub(crate) fn reconcile_occluded_regions(
+        &mut self,
+        contributions: &[ImageContribution],
+        occlusions: &[(usize, crate::geometry::Rect)],
+        regional: Option<(&[crate::geometry::Rect], usize)>,
+    ) -> ImageSceneDelta {
         #[cfg(test)]
         RECONCILE_WORK.with(|work| work.set((work.get().0 + 1, work.get().1)));
         let previous = self.snapshot_active();
         let previous_sources = self.visibility_sources.clone();
+        let mut retained_pieces: BTreeMap<_, Vec<_>> = BTreeMap::new();
+        if regional.is_some() {
+            for (key, placement) in &previous {
+                let original = previous_sources.get(key).unwrap_or(key);
+                retained_pieces
+                    .entry(original.clone())
+                    .or_default()
+                    .push(placement.clip.intersection(placement.destination));
+            }
+        }
         self.apply_contributions(contributions);
         let mut painted_at = BTreeMap::new();
         for (index, contribution) in contributions.iter().enumerate() {
@@ -174,7 +200,22 @@ impl ImageScene {
         }
         self.active.clear();
         for (key, source) in &self.sources {
-            let mut pieces = vec![source.clip.intersection(source.destination)];
+            let mut pieces = if let Some((regions, retained_count)) = regional
+                && painted_at
+                    .get(key)
+                    .is_none_or(|index| *index < retained_count)
+            {
+                let mut pieces = retained_pieces.remove(key).unwrap_or_default();
+                for region in regions {
+                    pieces = pieces
+                        .into_iter()
+                        .flat_map(|piece| subtract_rect(piece, *region))
+                        .collect();
+                }
+                pieces
+            } else {
+                vec![source.clip.intersection(source.destination)]
+            };
             for (boundary, area) in occlusions {
                 if painted_at.get(key).is_none_or(|index| index < boundary) {
                     pieces = pieces

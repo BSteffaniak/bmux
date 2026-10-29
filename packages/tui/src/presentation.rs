@@ -640,9 +640,11 @@ impl PresentationState {
     /// Prepare an owned snapshot without committing it.
     ///
     /// No damage skips rendering after an initial successful presentation.
-    /// Render callbacks must paint the complete tree when using occlusion or
-    /// modal scopes: these replace full interaction geometry, not a local patch.
-    /// Regional rendering preserves committed content outside replaced regions.
+    /// Render callbacks must paint the complete tree when using modal scopes.
+    /// Regional rendering preserves committed content and metadata outside
+    /// replaced regions. Opaque overlays may be repainted regionally: coverage
+    /// removes underlying metadata without promoting the update to full damage.
+    /// When an overlay moves or closes, callers must repaint its exposed old area.
     /// The caller must bound viewport size and render contributions; preparation
     /// retains one previous grid and stages one new grid, never a frame queue.
     #[must_use]
@@ -680,12 +682,12 @@ impl PresentationState {
     }
 
     fn reconcile_metadata_availability(
-        &self,
+        retained: &[SurfaceMetadataAvailability],
         frame: &Frame<'_>,
         damage: &Damage,
     ) -> Vec<SurfaceMetadataAvailability> {
         let mut declarations = if let Damage::Regions(regions) = damage {
-            let mut retained = self.metadata_availability.clone();
+            let mut retained = retained.to_vec();
             for region in regions {
                 retained = retained
                     .into_iter()
@@ -708,11 +710,10 @@ impl PresentationState {
     }
 
     /// Replace staged hit geometry only in the requested damage regions.
-    fn reconcile_staged_hits(&self, staged: &HitMap, damage: &Damage) -> HitMap {
+    fn reconcile_staged_hits(mut hits: HitMap, staged: &HitMap, damage: &Damage) -> HitMap {
         let Damage::Regions(regions) = damage else {
             return staged.clone();
         };
-        let mut hits = self.hits.clone();
         for region in regions {
             hits.retain_outside(*region);
         }
@@ -782,20 +783,54 @@ impl PresentationState {
             |_| true,
         );
         let metadata_availability;
-        let (cursor, hits, focus_scope, images, selection, semantics, occlusions) = {
+        let (
+            cursor,
+            hits,
+            focus_scope,
+            images,
+            selection,
+            semantics,
+            occlusions,
+            retained_image_count,
+        ) = {
             let mut frame = Frame::new(&mut buffer);
             PresentationPhase::Paint.measure(|| render(&mut PaintCx::new(&mut frame)), |()| true);
             let metadata = PresentationPhase::MetadataExtract.measure(
                 || {
-                    // Occlusion replaces scene geometry globally. A producer invoking
-                    // it must paint the complete tree, not a regional-only patch.
-                    if !frame.occlusions().is_empty() || !self.modal_focus.is_empty() {
+                    // Modal transitions still replace the complete interaction tree.
+                    if !self.modal_focus.is_empty() {
                         damage = Damage::Full;
                         requested_regions.clear();
                     }
-                    let metadata_availability =
-                        self.reconcile_metadata_availability(&frame, &damage);
-                    let hits = self.reconcile_staged_hits(frame.hits(), &damage);
+                    let mut retained_cursor = self.cursor;
+                    let mut retained_hits = self.hits.clone();
+                    let mut retained_selection = self.selection.clone();
+                    let mut retained_semantics = self.semantics.clone();
+                    let mut retained_availability = self.metadata_availability.clone();
+                    if matches!(damage, Damage::Regions(_)) {
+                        for (_, area) in frame.occlusions() {
+                            // Coverage is painted in full, even if the caller only
+                            // requested a smaller changed portion of the overlay.
+                            if !requested_regions.contains(area) {
+                                requested_regions.push(*area);
+                            }
+                            crate::frame::occlude_metadata(
+                                *area,
+                                &mut retained_cursor,
+                                &mut retained_hits,
+                                &mut retained_selection,
+                                &mut retained_semantics,
+                                &mut retained_availability,
+                            );
+                        }
+                        damage = Damage::Regions(requested_regions.clone());
+                    }
+                    let metadata_availability = Self::reconcile_metadata_availability(
+                        &retained_availability,
+                        &frame,
+                        &damage,
+                    );
+                    let hits = Self::reconcile_staged_hits(retained_hits, frame.hits(), &damage);
                     let mut images = if matches!(damage, Damage::Regions(_)) {
                         self.image_scene.contributions_outside(&requested_regions)
                     } else {
@@ -805,7 +840,7 @@ impl PresentationState {
                     images.extend_from_slice(frame.images());
                     let cursor = frame.cursor().or_else(|| {
                         matches!(damage, Damage::Regions(_))
-                            .then_some(self.cursor)
+                            .then_some(retained_cursor)
                             .flatten()
                     });
                     let focus_scope = frame.focus_scope().cloned().or_else(|| {
@@ -814,14 +849,12 @@ impl PresentationState {
                             .flatten()
                     });
                     let selection = if matches!(damage, Damage::Regions(_)) {
-                        self.selection
-                            .merge_regions(frame.selection(), &requested_regions)
+                        retained_selection.merge_regions(frame.selection(), &requested_regions)
                     } else {
                         frame.selection().clone()
                     };
                     let semantics = if matches!(damage, Damage::Regions(_)) {
-                        self.semantics
-                            .merge_regions(frame.semantics(), &requested_regions)
+                        retained_semantics.merge_regions(frame.semantics(), &requested_regions)
                     } else {
                         frame.semantics().clone()
                     };
@@ -840,14 +873,16 @@ impl PresentationState {
                         selection,
                         semantics,
                         occlusions,
+                        retained_image_count,
                         metadata_availability,
                     )
                 },
                 |_| true,
             );
-            metadata_availability = metadata.7;
+            metadata_availability = metadata.8;
             (
                 metadata.0, metadata.1, metadata.2, metadata.3, metadata.4, metadata.5, metadata.6,
+                metadata.7,
             )
         };
         let damage = PresentationPhase::RetainedCellRepair.measure(
@@ -857,7 +892,17 @@ impl PresentationState {
         let mut image_scene =
             PresentationPhase::ImageSceneClone.measure(|| self.image_scene.clone(), |_| true);
         let image_delta = PresentationPhase::ImageReconcile.measure(
-            || image_scene.reconcile_occluded(&images, &occlusions),
+            || {
+                if matches!(damage, Damage::Regions(_)) {
+                    image_scene.reconcile_occluded_regions(
+                        &images,
+                        &occlusions,
+                        Some((requested_regions.as_slice(), retained_image_count)),
+                    )
+                } else {
+                    image_scene.reconcile_occluded(&images, &occlusions)
+                }
+            },
             |_| true,
         );
 
@@ -1091,6 +1136,191 @@ mod tests {
             )
             .unwrap();
         assert_eq!(state.metadata_availability(), []);
+    }
+
+    #[test]
+    fn regional_coverage_filters_retained_selection_and_cursor_without_hiding_foreground() {
+        use crate::selection::{SelectionFragment, SelectionScope};
+        let area = Rect::new(0, 0, 12, 4);
+        let popup = Rect::new(4, 1, 4, 1);
+        let mut state = PresentationState::new(area);
+        state
+            .present(
+                Damage::Full,
+                |cx| {
+                    cx.push_selection_scope(SelectionScope::new("background", area));
+                    cx.push_selection_fragment(SelectionFragment::new(
+                        "background",
+                        "text",
+                        popup,
+                        0,
+                        0..4,
+                    ));
+                    cx.push_selection_fragment(SelectionFragment::new(
+                        "background",
+                        "text",
+                        Rect::new(0, 3, 4, 1),
+                        1,
+                        4..8,
+                    ));
+                    cx.set_cursor(Point::new(5, 1), true);
+                },
+                |_, _| Ok::<_, ()>(()),
+            )
+            .unwrap();
+        let prepared = state
+            .prepare(Damage::Regions(vec![popup]), |cx| {
+                cx.occlude(LocalRect::terminal(popup));
+                cx.push_selection_scope(SelectionScope::new("foreground", popup));
+                cx.push_selection_fragment(SelectionFragment::new(
+                    "foreground",
+                    "option",
+                    popup,
+                    0,
+                    0..4,
+                ));
+            })
+            .unwrap();
+        assert!(matches!(prepared.damage(), Damage::Regions(_)));
+        assert_eq!(prepared.cursor(), None);
+        let selection = prepared.selection();
+        assert_eq!(selection.fragments().len(), 2);
+        assert!(
+            selection
+                .fragments()
+                .iter()
+                .any(|fragment| fragment.content_id.as_str() == "option")
+        );
+        assert!(
+            selection
+                .fragments()
+                .iter()
+                .any(|fragment| fragment.source_range == (4..8))
+        );
+        assert!(
+            selection
+                .initiation_scope(Point::new(5, 1))
+                .is_some_and(|scope| scope.id.as_str() == "foreground")
+        );
+        assert!(selection.initiation_scope(Point::new(0, 3)).is_none());
+        // Foreground cursor requests take precedence over covered retained cursors.
+        let with_cursor = state
+            .prepare(Damage::Regions(vec![popup]), |cx| {
+                cx.occlude(LocalRect::terminal(popup));
+                cx.set_cursor(Point::new(6, 1), true);
+            })
+            .unwrap();
+        assert_eq!(
+            with_cursor.cursor(),
+            Some(Cursor::visible(Point::new(6, 1)))
+        );
+    }
+
+    #[test]
+    fn regional_occlusion_preserves_images_and_metadata_outside_coverage_transactionally() {
+        use crate::image::{ImageFit, ImageKey, ImageLifecycle, ImagePixelFormat, ImagePlacement};
+        use crate::semantic::SemanticRegion;
+        let area = Rect::new(0, 0, 12, 6);
+        let popup = Rect::new(4, 1, 4, 2);
+        let source = ImagePlacement {
+            key: ImageKey::new("background"),
+            payload: ImagePayload::Pixels {
+                bytes: vec![1, 2, 3],
+                width: 1,
+                height: 1,
+                format: ImagePixelFormat::Rgb8,
+            },
+            destination: area,
+            clip: area,
+            lifecycle: ImageLifecycle::Frame,
+            fit: ImageFit::Stretch,
+            allocation: None,
+        };
+        let background = |cx: &mut PaintCx<'_, '_>| {
+            cx.push_image(ImageContribution::Present(source.clone()));
+            cx.push_hit(HitRegion::new("background", area).focusable(true));
+            cx.push_semantic(SemanticRegion::new("background", area, "image"));
+            cx.set_cursor(Point::new(1, 5), true);
+        };
+        let overlay = |cx: &mut PaintCx<'_, '_>| {
+            cx.occlude(LocalRect::terminal(popup));
+            cx.push_hit(HitRegion::new("overlay", popup).focusable(true));
+        };
+        let mut state = PresentationState::new(area);
+        state
+            .present(Damage::Full, background, |_, _| Ok::<_, ()>(()))
+            .unwrap();
+        let initial_cursor = state.cursor();
+        let initial_scene = state.image_scene().clone();
+        let prepared = state
+            .prepare(Damage::Regions(vec![Rect::new(4, 1, 1, 1)]), overlay)
+            .unwrap();
+        assert!(matches!(prepared.damage(), Damage::Regions(_)));
+        assert_eq!(prepared.cursor(), initial_cursor);
+        assert!(
+            prepared
+                .image_scene()
+                .placements()
+                .all(|image| image.clip.intersection(popup).is_empty())
+        );
+        assert!(
+            prepared
+                .semantics()
+                .regions()
+                .iter()
+                .all(|region| region.area.intersection(popup).is_empty())
+        );
+        assert_eq!(
+            state.present_prepared(Some(prepared), |_, _| Err::<(), _>("failed")),
+            Err("failed")
+        );
+        assert_eq!(state.image_scene(), &initial_scene);
+        // Failed output invalidates the text baseline; recover with a complete frame.
+        state
+            .present(Damage::Full, background, |_, _| Ok::<_, ()>(()))
+            .unwrap();
+        state
+            .present(
+                Damage::Regions(vec![popup]),
+                overlay,
+                |_, _| Ok::<_, ()>(()),
+            )
+            .unwrap();
+        // A later unrelated regional update must not resurrect hidden image pixels.
+        state
+            .present(
+                Damage::Regions(vec![Rect::new(0, 5, 1, 1)]),
+                |_| {},
+                |_, _| Ok::<_, ()>(()),
+            )
+            .unwrap();
+        assert!(
+            state
+                .image_scene()
+                .placements()
+                .all(|image| image.clip.intersection(popup).is_empty())
+        );
+        assert_eq!(state.cursor(), initial_cursor);
+        // Moving an overlay repaints both the old exposed footprint and new coverage.
+        let moved = Rect::new(7, 2, 4, 2);
+        state
+            .present(
+                Damage::Regions(vec![popup, moved]),
+                |cx| {
+                    background(cx);
+                    cx.occlude(LocalRect::terminal(moved));
+                },
+                |_, _| Ok::<_, ()>(()),
+            )
+            .unwrap();
+        assert!(
+            state
+                .image_scene()
+                .placements()
+                .all(|image| image.clip.intersection(moved).is_empty())
+        );
+        assert!(state.hits().hit_test(Point::new(4, 1)).is_some());
+        assert!(state.hits().hit_test(Point::new(8, 2)).is_none());
     }
 
     #[test]

@@ -1088,6 +1088,77 @@ mod tests {
     }
 
     #[test]
+    fn regional_overlay_hover_retains_background_cursor_and_sparse_terminal_output() {
+        use crate::frame::Cursor;
+        use crate::hit::HitRegion;
+        use crate::semantic::SemanticRegion;
+        let area = Rect::new(0, 0, 24, 6);
+        let popup = Rect::new(12, 1, 10, 2);
+        let cursor = Cursor::visible(Point::new(4, 5));
+        let background = |cx: &mut PaintCx<'_, '_>| {
+            cx.fill(cx.area(), ".", Style::new());
+            cx.write_line(
+                LocalRect::new(0, 5, 10, 1),
+                &crate::text::Line::raw("composer"),
+            );
+            cx.set_cursor(cursor.position, true);
+            cx.push_hit(HitRegion::new("background", area).focusable(true));
+            cx.push_semantic(SemanticRegion::new("background", area, "editor"));
+        };
+        let overlay = |cx: &mut PaintCx<'_, '_>, text: &str| {
+            cx.occlude(LocalRect::terminal(popup));
+            cx.write_line(LocalRect::terminal(popup), &crate::text::Line::raw(text));
+            cx.push_hit(HitRegion::new("option", popup).focusable(true));
+        };
+        let mut terminal = Terminal::new(Vec::new(), area);
+        terminal.draw(background).unwrap();
+        terminal
+            .draw_damage(Damage::Regions(vec![popup]), |cx| overlay(cx, "Send"))
+            .unwrap();
+        assert_eq!(terminal.cursor(), Some(cursor));
+        assert!(
+            !terminal
+                .hits()
+                .regions()
+                .iter()
+                .any(|hit| hit.id.as_str() == "background"
+                    && !hit.area.intersection(popup).is_empty())
+        );
+        let before = terminal.writer().len();
+        let stats = terminal
+            .draw_damage(Damage::Regions(vec![popup]), |cx| overlay(cx, "Queue"))
+            .unwrap();
+        assert!(!stats.full_repaint);
+        assert!(stats.changed_cells <= usize::from(popup.width * popup.height));
+        assert_eq!(terminal.cursor(), Some(cursor));
+        let output = String::from_utf8_lossy(&terminal.writer()[before..]);
+        assert!(!output.contains("composer"));
+        assert!(output.contains("Queue"));
+        assert!(output.contains("\x1b[?25h"));
+        let mut fresh = Terminal::new(Vec::new(), area);
+        fresh
+            .draw(|cx| {
+                background(cx);
+                overlay(cx, "Queue");
+            })
+            .unwrap();
+        assert_eq!(terminal.retained_buffer(), fresh.retained_buffer());
+        assert_eq!(terminal.hits(), fresh.hits());
+        // Closing restores exposed background metadata, not only its cells.
+        terminal
+            .draw_damage(Damage::Regions(vec![popup]), background)
+            .unwrap();
+        assert!(
+            !terminal
+                .hits()
+                .regions()
+                .iter()
+                .any(|hit| hit.id.as_str() == "option")
+        );
+        assert_eq!(terminal.cursor(), Some(cursor));
+    }
+
+    #[test]
     fn terminal_first_draw_repaints_full_frame() {
         let mut terminal = Terminal::new(Vec::new(), Rect::new(0, 0, 2, 1));
 
