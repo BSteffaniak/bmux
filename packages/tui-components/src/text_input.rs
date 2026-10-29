@@ -2,7 +2,11 @@
 
 use std::cell::{Cell, RefCell};
 use std::hash::{Hash, Hasher};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::Instant;
+#[cfg(target_arch = "wasm32")]
+use web_time::Instant;
 
 use bmux_keyboard::{KeyCode, KeyStroke, Modifiers};
 use bmux_text_edit::keyboard::TextKeymap;
@@ -2505,7 +2509,7 @@ struct ClickSnapshot {
 mod snapshot_tests {
     use bmux_text_edit::{SelectionMode, TextEditBuffer, TextMotion};
 
-    use super::{MouseClickState, SelectionGranularity, TextInputState};
+    use super::{Instant, MouseClickState, SelectionGranularity, TextInputState};
 
     #[test]
     fn editor_snapshot_preserves_selection_scroll_and_pending_drag() {
@@ -2519,7 +2523,7 @@ mod snapshot_tests {
         state.mouse_selection.last_click = Some(MouseClickState {
             x: 2,
             y: 1,
-            at: std::time::Instant::now(),
+            at: Instant::now(),
             count: 2,
         });
         let snapshot = state.snapshot();
