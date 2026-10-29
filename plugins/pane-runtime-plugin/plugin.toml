@@ -32,11 +32,12 @@ version = "0.0.1-alpha.0"
 minimum = "1.1"
 
 [[auxiliary_executables]]
-cargo_binary     = "bmux-pane-execution-supervisor"
-cargo_package    = "bmux_pane_runtime_plugin"
-id               = "execution-supervisor"
-protocol_version = 7
-relative_path    = "bmux-pane-execution-supervisor"
+cargo_binary        = "bmux-pane-execution-supervisor"
+cargo_package       = "bmux_pane_runtime_plugin"
+id                  = "execution-supervisor"
+protocol_version    = 8
+relative_path       = "bmux-pane-execution-supervisor"
+supported_platforms = ["unix", "windows"]
 
 [[dependencies]]
 plugin_id   = "bmux.application_resurrection"

@@ -227,6 +227,7 @@ pub fn name_valid(name: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     #[test]
     fn conflicting_or_corrupt_legacy_aliases_never_publish_partial_migration() {
@@ -282,6 +283,7 @@ mod tests {
         let path = crate::storage::client_directory(&state, "work")
             .unwrap()
             .join("preferences.json");
+        #[cfg(unix)]
         assert_eq!(
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600

@@ -3,6 +3,7 @@ use crate::supervisor_protocol::{self as protocol, Bootstrap, Operation, Request
 use anyhow::Context as _;
 use sha2::{Digest, Sha256};
 use std::fmt::Write as FmtWrite;
+#[cfg(test)]
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
@@ -57,17 +58,15 @@ struct Installation {
     root: PathBuf,
 }
 
-fn short_endpoint_directory() -> anyhow::Result<tempfile::TempDir> {
-    let directory = tempfile::Builder::new()
-        .prefix("bmux-exec-")
-        .tempdir_in("/tmp")?;
-    anyhow::ensure!(
-        directory.path().join("control.sock").as_os_str().len() < 104,
-        "supervisor control endpoint exceeds platform Unix socket path limit"
-    );
-    Ok(directory)
-}
-
+#[cfg(unix)]
+#[path = "supervisor/unix.rs"]
+mod backend;
+#[cfg(windows)]
+#[path = "supervisor/windows.rs"]
+mod backend;
+use backend::Lifetime;
+#[cfg(all(test, unix))]
+use backend::{StartupChild, negotiate_guardian, short_endpoint_directory};
 pub(crate) fn activate(context: &bmux_plugin_sdk::NativeLifecycleContext) {
     let resolved = context.auxiliary_executables.get("execution-supervisor");
     let installation = resolved
@@ -99,10 +98,16 @@ pub(super) fn install_test_artifact() -> anyhow::Result<()> {
             .parent()
             .and_then(std::path::Path::parent)
             .ok_or_else(|| anyhow::anyhow!("Cargo test profile directory unavailable"))?;
-        let source = profile.join("bmux-pane-execution-supervisor");
+        let source = profile.join(format!(
+            "bmux-pane-execution-supervisor{}",
+            std::env::consts::EXE_SUFFIX
+        ));
         let bytes = std::fs::read(&source)?;
         let root = ROOT.get_or_init(|| tempfile::tempdir().expect("owned helper fixture root"));
-        let path = root.path().join("execution-supervisor");
+        let path = root.path().join(format!(
+            "execution-supervisor{}",
+            std::env::consts::EXE_SUFFIX
+        ));
         // Per-process immutable snapshot protects tests from later builds.
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create_new(true);
@@ -147,11 +152,8 @@ pub(super) fn install_test_artifact() -> anyhow::Result<()> {
 pub(super) fn select_backend(
     preparation: anyhow::Result<(SupervisorControl, portable_pty::CommandBuilder)>,
     _required: bool,
-) -> anyhow::Result<Option<SupervisorControl>> {
-    match preparation {
-        Ok((control, _)) => Ok(Some(control)),
-        Err(error) => Err(error),
-    }
+) -> anyhow::Result<Option<(SupervisorControl, portable_pty::CommandBuilder)>> {
+    preparation.map(Some)
 }
 
 pub(super) struct SupervisorControl {
@@ -161,81 +163,11 @@ pub(super) struct SupervisorControl {
     authentication: String,
     version: u32,
     artifact: PathBuf,
-    #[cfg(unix)]
+    endpoint: PathBuf,
     lifetime: Mutex<Lifetime>,
 }
-#[cfg(unix)]
-#[derive(Default)]
-struct Lifetime {
-    revoked: bool,
-    socket: Option<std::os::unix::net::UnixStream>,
-}
-#[cfg(unix)]
-impl Lifetime {
-    fn revoke(&mut self) {
-        self.revoked = true;
-        self.socket.take();
-    }
-    fn install(&mut self, socket: std::os::unix::net::UnixStream) -> anyhow::Result<()> {
-        anyhow::ensure!(!self.revoked, "execution lifetime already revoked");
-        anyhow::ensure!(
-            self.socket.is_none(),
-            "execution lifetime already installed"
-        );
-        self.socket = Some(socket);
-        Ok(())
-    }
-}
-
-/// Own the unreaped child throughout readiness negotiation. Drop never waits
-/// indefinitely on a wedged kernel process; a reaper retains Child ownership.
-#[cfg(unix)]
-struct StartupChild(Option<std::process::Child>);
-#[cfg(unix)]
-impl Drop for StartupChild {
-    fn drop(&mut self) {
-        if let Some(mut child) = self.0.take() {
-            let _ = child.kill();
-            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
-            loop {
-                match child.try_wait() {
-                    Ok(Some(_)) => return,
-                    Ok(None) if std::time::Instant::now() < deadline => {
-                        std::thread::sleep(std::time::Duration::from_millis(5));
-                    }
-                    _ => break,
-                }
-            }
-            std::thread::spawn(move || {
-                let _ = child.wait();
-            });
-        }
-    }
-}
-
-#[cfg(unix)]
-fn negotiate_guardian(
-    mut child: StartupChild,
-    mut readiness: std::os::unix::net::UnixStream,
-    lifetime: &Mutex<Lifetime>,
-) -> anyhow::Result<Box<dyn portable_pty::Child + Send + Sync>> {
-    let version: u32 = protocol::read_frame(&mut readiness)?;
-    anyhow::ensure!(
-        version == protocol::VERSION,
-        "guardian startup negotiation rejected"
-    );
-    // Install and revocation share one lock. Prior revocation is sticky even
-    // when readiness arrived after pane close; rejected sockets close here.
-    lifetime
-        .lock()
-        .map_err(|_| anyhow::anyhow!("supervisor lifetime lock poisoned"))?
-        .install(readiness)?;
-    Ok(Box::new(child.0.take().expect("negotiated guardian child")))
-}
-
 impl SupervisorControl {
     /// End pane lifetime without depending on PTY hangup or a numeric PID.
-    #[cfg(unix)]
     pub(super) fn end_lifetime(&self) -> anyhow::Result<()> {
         self.lifetime
             .lock()
@@ -277,20 +209,9 @@ impl SupervisorControl {
             "supervisor helper artifact hash mismatch: {}",
             installation.path.display()
         );
-        // Match the existing resurrection host's short, owner-private endpoint
-        // mechanism. Persist the generated locator; never reconstruct by hashing.
-        let endpoint_directory = short_endpoint_directory()
-            .context("cannot create supervisor endpoint directory in /tmp")?;
+        let endpoint_directory = backend::short_endpoint_directory()?;
         let directory = endpoint_directory.path().to_path_buf();
-        anyhow::ensure!(
-            directory.join("control.sock").as_os_str().len() < 104,
-            "supervisor control endpoint exceeds platform Unix socket path limit"
-        );
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))?;
-        }
+        let endpoint = backend::endpoint(&directory);
         let authentication = uuid::Uuid::new_v4().to_string();
         let bootstrap = Bootstrap {
             version,
@@ -298,27 +219,13 @@ impl SupervisorControl {
             authentication: authentication.clone(),
         };
         let path = directory.join("bootstrap.json");
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = options
-            .open(&path)
-            .with_context(|| format!("cannot create supervisor bootstrap {}", path.display()))?;
-        file.write_all(&serde_json::to_vec(&bootstrap)?)
-            .with_context(|| format!("cannot write supervisor bootstrap {}", path.display()))?;
-        file.sync_all()
-            .with_context(|| format!("cannot sync supervisor bootstrap {}", path.display()))?;
-        std::fs::File::open(&directory)?.sync_all()?;
+        backend::secure_bootstrap(&directory, &bootstrap)?;
         let locator = installation.root.join(format!("supervisor-{token}.json"));
         crate::atomic_state::commit(
             &locator,
             &serde_json::json!({
                 "version": version, "execution_token": token,
-                "endpoint": directory.join("control.sock"), "bootstrap": path,
+                "endpoint": endpoint, "bootstrap": path,
                 "artifact_sha256": installation.hash,
             }),
         )
@@ -327,73 +234,31 @@ impl SupervisorControl {
         // bounded by the server-owned lifetime socket, not this directory.
         let _retained_directory = endpoint_directory.keep();
         let mut command = portable_pty::CommandBuilder::new(&installation.path);
-        command.arg("--guardian-terminal-session-v4");
+        command.arg(backend::HELPER_ARGUMENT);
         command.arg(path);
-        command.arg(directory.join("control.sock"));
+        command.arg(&endpoint);
         Ok((
             Self {
                 _admission: admission,
                 directory,
+                endpoint,
                 token: token.to_string(),
                 authentication,
                 version,
                 artifact: installation.path.clone(),
-                #[cfg(unix)]
                 lifetime: Mutex::new(Lifetime::default()),
             },
             command,
         ))
     }
 
-    pub(super) fn spawn_guardian(
-        &self,
-        slave: &std::path::Path,
-    ) -> anyhow::Result<Box<dyn portable_pty::Child + Send + Sync>> {
-        use std::os::fd::AsRawFd;
-        use std::os::unix::process::CommandExt;
-
-        anyhow::ensure!(
-            self.version == protocol::VERSION,
-            "guardian requires explicit terminal-session protocol"
-        );
-        let (readiness, ready_child) = std::os::unix::net::UnixStream::pair()?;
-        readiness.set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
-        let ready_fd = ready_child.as_raw_fd();
-        let mut command = std::process::Command::new(&self.artifact);
-        command
-            .arg("--guardian-terminal-session-v4")
-            .arg(self.directory.join("bootstrap.json"))
-            .arg(self.directory.join("control.sock"))
-            .arg(slave)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-        // SAFETY: only async-signal-safe descriptor operations before exec.
-        unsafe {
-            command.pre_exec(move || {
-                if libc::dup2(ready_fd, 3) < 0 || libc::fcntl(3, libc::F_SETFD, 0) < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-        let child = StartupChild(Some(command.spawn()?));
-        drop(command);
-        drop(ready_child);
-        negotiate_guardian(child, readiness, &self.lifetime)
-    }
-
-    #[cfg(unix)]
     pub(super) fn request(&self, operation: Operation) -> anyhow::Result<Response> {
-        let mut socket =
-            std::os::unix::net::UnixStream::connect(self.directory.join("control.sock"))?;
         let timeout = if matches!(&operation, Operation::Hello | Operation::Status) {
             std::time::Duration::from_millis(500)
         } else {
             std::time::Duration::from_secs(5)
         };
-        socket.set_read_timeout(Some(timeout))?;
-        socket.set_write_timeout(Some(timeout))?;
+        let mut socket = backend::connect(&self.endpoint, timeout)?;
         protocol::write_frame(
             &mut socket,
             &Request {
@@ -404,15 +269,7 @@ impl SupervisorControl {
             },
         )?;
         let response: Response = protocol::read_frame(&mut socket)?;
-        anyhow::ensure!(
-            response.version == self.version && response.execution_token == self.token,
-            "supervisor response identity mismatch"
-        );
-        anyhow::ensure!(
-            response.error.is_none(),
-            "supervisor operation failed: {:?}",
-            response.error
-        );
+        self.validate_response(&response)?;
         if response.terminal_session_ended == Some(true)
             && response.cleanup_error.is_none()
             && response.capture_error.is_none()
@@ -423,9 +280,17 @@ impl SupervisorControl {
         Ok(response)
     }
 
-    #[cfg(not(unix))]
-    pub(super) fn request(&self, _operation: Operation) -> anyhow::Result<Response> {
-        anyhow::bail!("supervisor requires Unix")
+    fn validate_response(&self, response: &Response) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            response.version == self.version && response.execution_token == self.token,
+            "supervisor response identity mismatch"
+        );
+        anyhow::ensure!(
+            response.error.is_none(),
+            "supervisor operation failed: {:?}",
+            response.error
+        );
+        Ok(())
     }
 
     /// Blocking startup handshake; callers on an async runtime must dispatch this
@@ -438,6 +303,16 @@ impl SupervisorControl {
         >,
         authorize: impl Fn() -> anyhow::Result<()>,
     ) -> anyhow::Result<Option<u32>> {
+        if let Some(entries) = &environment {
+            for entry in entries {
+                let encoding = entry.encoding.as_deref().unwrap_or("unix-bytes");
+                anyhow::ensure!(
+                    encoding == backend::NATIVE_ENV_ENCODING,
+                    "native environment encoding {encoding:?} does not match host {}",
+                    backend::NATIVE_ENV_ENCODING
+                );
+            }
+        }
         // Startup readiness was acknowledged over inherited IPC in spawn_guardian.
         let mut watcher = self.subscribe()?;
         authorize()?;
@@ -447,6 +322,9 @@ impl SupervisorControl {
             args: launch.args.clone(),
             cwd: launch.cwd.clone(),
             env: launch.env.clone(),
+            native_env_encoding: environment
+                .as_ref()
+                .map(|_| backend::NATIVE_ENV_ENCODING.to_owned()),
             native_env: environment.map(|entries| {
                 entries
                     .into_iter()
@@ -475,12 +353,8 @@ impl SupervisorControl {
         }
     }
 
-    #[cfg(unix)]
     pub(super) fn subscribe(&self) -> anyhow::Result<LifecycleWatcher> {
-        let mut socket =
-            std::os::unix::net::UnixStream::connect(self.directory.join("control.sock"))?;
-        socket.set_write_timeout(Some(std::time::Duration::from_secs(5)))?;
-        socket.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
+        let mut socket = backend::connect(&self.endpoint, std::time::Duration::from_secs(5))?;
         protocol::write_frame(
             &mut socket,
             &Request {
@@ -518,19 +392,19 @@ fn validate_snapshot(
     Ok(())
 }
 
-#[cfg(unix)]
 pub(super) struct LifecycleWatcher {
-    socket: std::os::unix::net::UnixStream,
+    socket: backend::Stream,
     initial: protocol::LifecycleSnapshot,
     current: protocol::LifecycleSnapshot,
 }
-#[cfg(unix)]
 impl LifecycleWatcher {
     pub(super) fn initial(&self) -> &protocol::LifecycleSnapshot {
         &self.initial
     }
-    pub(super) fn interrupter(&self) -> anyhow::Result<std::os::unix::net::UnixStream> {
-        Ok(self.socket.try_clone()?)
+    pub(super) fn interrupter(&self) -> anyhow::Result<LifecycleInterrupter> {
+        Ok(LifecycleInterrupter(backend::Interrupter::new(
+            &self.socket,
+        )?))
     }
     pub(super) fn next(&mut self) -> anyhow::Result<protocol::LifecycleSnapshot> {
         let snapshot: protocol::LifecycleSnapshot = protocol::read_frame(&mut self.socket)?;
@@ -541,5 +415,13 @@ impl LifecycleWatcher {
         )?;
         self.current = snapshot.clone();
         Ok(snapshot)
+    }
+}
+
+/// Interrupt a blocking lifecycle read without exposing transport-specific handles.
+pub(super) struct LifecycleInterrupter(backend::Interrupter);
+impl LifecycleInterrupter {
+    pub(super) fn interrupt(&self) -> std::io::Result<()> {
+        self.0.interrupt()
     }
 }

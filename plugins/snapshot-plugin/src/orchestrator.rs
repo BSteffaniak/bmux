@@ -496,11 +496,7 @@ impl BmuxSnapshotOrchestrator {
         if self.path.is_none() {
             return Err(SnapshotOrchestratorError::Disabled);
         }
-        // Semantic of `restore_apply` is "replace": each participant's
-        // `restore_snapshot` is expected to fully reset its state to
-        // what the payload encodes. Stateful plugins already honor
-        // this (e.g. `FollowStateWriter::restore_snapshot` overwrites
-        // every field).
+        // Restoration replaces each participant's state rather than merging it.
         let envelope = match self.read_envelope() {
             Ok(Some(envelope)) => envelope,
             Ok(None) => return Ok(RestoreSummary::default()),

@@ -42,9 +42,12 @@ try:
         if byte == b'\r':
             byte = b'\n'
         received += byte
-        if byte == b'\n':
-            emit(b'KEY:' + bytes(received))
-            if received == 'quit héllo\n'.encode():
+        # A real Enter key is encoded as CR. Raw mode disables ICRNL, so
+        # interpret it here rather than depending on kernel line discipline.
+        # Keep the emitted application line LF-terminated for capture checks.
+        if byte in (b'\r', b'\n'):
+            emit(b'KEY:' + bytes(received[:-1]) + b'\n')
+            if received[:-1] == 'quit héllo'.encode():
                 break
             received.clear()
     emit(b'\x1b[42mFINALMARKER\x1b[0m')

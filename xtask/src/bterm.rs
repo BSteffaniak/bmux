@@ -277,6 +277,7 @@ mod tests {
             "xtask",
             "xtask.exe",
             "bmux-pane-execution-supervisor",
+            "bmux-pane-execution-supervisor.exe",
         ] {
             fs::write(source.join(name), name).unwrap();
             #[cfg(unix)]
@@ -298,8 +299,12 @@ mod tests {
                 destination.clone()
             };
             verify(&root, target).unwrap();
-            if !target.contains("windows") {
-                let helper = root.join("bmux-pane-execution-supervisor");
+            {
+                let helper = root.join(if target.contains("windows") {
+                    "bmux-pane-execution-supervisor.exe"
+                } else {
+                    "bmux-pane-execution-supervisor"
+                });
                 assert!(helper.is_file());
                 let bytes = fs::read(&helper).unwrap();
                 fs::write(&helper, "corrupt").unwrap();

@@ -1,10 +1,10 @@
 //! Domain-neutral, bounded browser hosting with configurable binding and optional authentication.
 //! Encoded snapshots are opaque: callers own presentation semantics and serialization.
-#![cfg(unix)]
 #![cfg_attr(feature = "fail-on-warnings", deny(warnings))]
 
 mod delivery;
 mod diagnostics;
+mod platform;
 pub use diagnostics::{DeliveryCounters, HostDiagnostics, HostEvent};
 
 #[cfg(test)]

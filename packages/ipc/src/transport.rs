@@ -2,6 +2,13 @@
 #[path = "unix_security.rs"]
 mod unix_security;
 
+#[cfg(unix)]
+#[path = "transport/unix.rs"]
+mod platform;
+#[cfg(windows)]
+#[path = "transport/windows.rs"]
+mod platform;
+
 #[path = "security_policy.rs"]
 mod security_policy;
 pub use security_policy::{IdentityPolicy, SymlinkPolicy, UnixSecurityPolicy};
@@ -20,9 +27,7 @@ use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 #[cfg(windows)]
-use tokio::net::windows::named_pipe::{
-    ClientOptions, NamedPipeClient, NamedPipeServer, ServerOptions,
-};
+use tokio::net::windows::named_pipe::{NamedPipeClient, NamedPipeServer, ServerOptions};
 
 /// Local IPC listener abstraction.
 ///
@@ -207,12 +212,14 @@ impl LocalIpcListener {
             },
             #[cfg(windows)]
             ListenerInner::WindowsNamedPipe { pipe_name, pending } => {
-                let mut pending = pending.lock().await;
-                pending.connect().await?;
-                // Create the successor while the connected instance still
-                // owns the name. On failure retain ownership and report it.
-                let next = ServerOptions::new().create(pipe_name)?;
-                let server = std::mem::replace(&mut *pending, next);
+                let server = {
+                    let mut pending = pending.lock().await;
+                    pending.connect().await?;
+                    // Create the successor while the connected instance still
+                    // owns the name. On failure retain ownership and report it.
+                    let next = ServerOptions::new().create(pipe_name)?;
+                    std::mem::replace(&mut *pending, next)
+                };
                 Ok(LocalIpcStream {
                     inner: StreamInner::WindowsServer(server),
                 })
@@ -491,8 +498,6 @@ impl LocalIpcStream {
     /// the connection fails.
     // The Windows named-pipe path (`ClientOptions::open`) is synchronous, so
     // this function contains no `.await` on that platform.  It must remain
-    // `async` for the cross-platform public API.
-    #[allow(clippy::unused_async)]
     pub async fn connect(endpoint: &IpcEndpoint) -> Result<Self, IpcTransportError> {
         Self::connect_with_policy(endpoint, IdentityPolicy::EffectiveUser).await
     }
@@ -505,36 +510,7 @@ impl LocalIpcStream {
         endpoint: &IpcEndpoint,
         peer: IdentityPolicy,
     ) -> Result<Self, IpcTransportError> {
-        #[cfg(not(unix))]
-        if peer != IdentityPolicy::EffectiveUser {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "Unix peer policy on non-Unix platform",
-            )
-            .into());
-        }
-        #[cfg(unix)]
-        {
-            if let IpcEndpoint::UnixSocket(path) = endpoint {
-                let stream = tokio::net::UnixStream::connect(path).await?;
-                unix_security::verify_peer_with_policy(&stream, peer)?;
-                return Ok(Self {
-                    inner: StreamInner::Unix(stream),
-                });
-            }
-        }
-
-        #[cfg(windows)]
-        {
-            if let IpcEndpoint::WindowsNamedPipe(pipe_name) = endpoint {
-                let stream = ClientOptions::new().open(pipe_name)?;
-                return Ok(Self {
-                    inner: StreamInner::WindowsClient(stream),
-                });
-            }
-        }
-
-        Err(IpcTransportError::UnsupportedEndpoint)
+        platform::connect(endpoint, peer).await
     }
 
     /// Send a single framed envelope.

@@ -5186,8 +5186,11 @@ fn cell_pixel_size_from_console() -> (u16, u16) {
         if handle == INVALID_HANDLE_VALUE || handle.is_null() {
             return (0, 0);
         }
+        let Ok(info_size) = u32::try_from(std::mem::size_of::<ConsoleFontInfoEx>()) else {
+            return (0, 0);
+        };
         let mut info = ConsoleFontInfoEx {
-            cbSize: std::mem::size_of::<ConsoleFontInfoEx>() as u32,
+            cbSize: info_size,
             nFont: 0,
             dwFontSize: Coord { X: 0, Y: 0 },
             FontFamily: 0,

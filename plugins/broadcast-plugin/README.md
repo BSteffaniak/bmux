@@ -278,3 +278,21 @@ remains
 outside publisher evidence. Inspect independently authenticated relay
 diagnostics
 when available; publisher diagnostics never claim that remote evidence exists.
+
+## Native platform boundary
+
+`src/platform` owns private storage and the raw observer rendezvous. Unix uses
+owner/mode-checked, no-follow files and a short private Unix socket. Windows
+uses
+explicit current-user protected ACLs, rejects reparse points and foreign owners,
+and uses a local-only, first-instance named pipe with an exact child-PID check.
+Credential ACLs that grant other users access are rejected rather than repaired.
+Parent directories may grant read access, but not unprivileged write access.
+
+The BMAQ/BMAO framing and retained-frame validation are shared. Windows requires
+the selected executable's `attach --observer-socket` worker to support
+named-pipe
+endpoints; no TCP listener or interactive input fallback is used. Files are
+flushed before publication; Windows replacement uses write-through `MoveFileExW`
+instead of pretending directory `fsync` is supported. Profile updates hold a
+nonblocking OS file lock on both platforms.

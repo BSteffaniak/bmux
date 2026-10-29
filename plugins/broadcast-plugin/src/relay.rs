@@ -479,23 +479,9 @@ pub(crate) fn validate_endpoint(
     Ok(base)
 }
 pub(crate) fn credential_key(path: &Path) -> Result<String, &'static str> {
-    #[cfg(unix)]
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
-    let file = options.open(path).map_err(|_| "credential_unavailable")?;
-    let metadata = file.metadata().map_err(|_| "credential_unavailable")?;
-    if !metadata.is_file() || metadata.len() > 4096 {
+    let file = crate::platform::open_private(path).map_err(|_| "private_credential_required")?;
+    if file.metadata().map_err(|_| "credential_unavailable")?.len() > 4096 {
         return Err("invalid_credential");
-    }
-    #[cfg(unix)]
-    if metadata.mode() & 0o077 != 0
-        // SAFETY: geteuid has no arguments and observes only this process's identity.
-        || metadata.uid() != unsafe { libc::geteuid() }
-    {
-        return Err("private_credential_required");
     }
     let mut key = String::new();
     file.take(4097)

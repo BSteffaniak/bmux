@@ -2382,8 +2382,13 @@ mod tests {
             use std::os::unix::fs::PermissionsExt as _;
             permissions.set_mode(0o700);
         }
-        #[cfg(not(unix))]
-        permissions.set_readonly(false);
+        #[cfg(windows)]
+        // Windows clears only FILE_ATTRIBUTE_READONLY; unlike Unix this does not
+        // change the ACL or grant write access to additional users.
+        #[allow(clippy::permissions_set_readonly_false)]
+        {
+            permissions.set_readonly(false);
+        }
         std::fs::set_permissions(&read_only, permissions).expect("restore writable");
         let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
     }

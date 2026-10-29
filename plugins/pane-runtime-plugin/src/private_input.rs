@@ -64,25 +64,51 @@ fn producers() -> &'static Mutex<BTreeMap<Uuid, ProducerState>> {
 
 /// Membership mutation invalidates any proof in flight; unknown producers cannot inherit it.
 pub(crate) fn register_producer(pane: Uuid, client: Uuid) -> bool {
+    register_producers(&[pane], client)
+}
+
+/// Admit all panes atomically: a denied pane must not leave partial membership.
+pub(crate) fn register_producers(requested: &[Uuid], client: Uuid) -> bool {
     let Ok(mut panes) = producers().lock() else {
         return false;
     };
-    if !panes.contains_key(&pane) && panes.len() >= 4096 {
+    let requested = requested.iter().copied().collect::<BTreeSet<_>>();
+    let new_panes = requested
+        .iter()
+        .filter(|pane| !panes.contains_key(pane))
+        .count();
+    if panes.len() + new_panes > 4096
+        || requested.iter().any(|pane| {
+            panes.get(pane).is_some_and(|state| {
+                !state.members.contains(&client)
+                    && (state.active_nonce.is_some() || state.members.len() >= 256)
+            })
+        })
+    {
         return false;
     }
-    let state = panes.entry(pane).or_default();
-    if state.active_nonce.is_some() && !state.members.contains(&client) {
-        return false;
+    for pane in requested {
+        let state = panes.entry(pane).or_default();
+        if state.members.insert(client)
+            && let Some(barrier) = &mut state.barrier
+        {
+            barrier.denied = true;
+        }
     }
-    if state.members.len() >= 256 && !state.members.contains(&client) {
-        return false;
-    }
-    if state.members.insert(client)
+    true
+}
+
+/// Detachment revokes admission, never execution lifetime or private suppression.
+pub(crate) fn unregister_producer(pane: Uuid, client: Uuid) {
+    let Ok(mut panes) = producers().lock() else {
+        return;
+    };
+    if let Some(state) = panes.get_mut(&pane)
+        && state.members.remove(&client)
         && let Some(barrier) = &mut state.barrier
     {
         barrier.denied = true;
     }
-    true
 }
 
 pub(crate) fn begin_barrier(pane: Uuid, nonce: Uuid, entering: bool) -> Option<u64> {
@@ -242,6 +268,38 @@ fn while_capture_allowed<T>(pane_id: Uuid, record: impl FnOnce() -> T) -> Option
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn multipane_admission_failure_does_not_register_other_panes() {
+        let open = Uuid::new_v4();
+        let private = Uuid::new_v4();
+        let owner = Uuid::new_v4();
+        let newcomer = Uuid::new_v4();
+        let nonce = Uuid::new_v4();
+        assert!(register_producer(private, owner));
+        let generation = begin_barrier(private, nonce, true).unwrap();
+        assert!(acknowledge_producer(
+            private, nonce, generation, owner, true
+        ));
+        assert!(finish_barrier(private, nonce, generation));
+        assert!(!register_producers(&[open, private], newcomer));
+        assert!(with_producer_admission(open, newcomer, || ()).is_none());
+        assert!(with_producer_admission(private, newcomer, || ()).is_none());
+    }
+
+    #[test]
+    fn detached_producer_invalidates_inflight_proof_without_releasing_suppression() {
+        let pane = Uuid::new_v4();
+        let client = Uuid::new_v4();
+        let nonce = Uuid::new_v4();
+        assert!(register_producer(pane, client));
+        let generation = begin_barrier(pane, nonce, true).unwrap();
+        assert!(acknowledge_producer(pane, nonce, generation, client, true));
+        unregister_producer(pane, client);
+        assert!(!finish_barrier(pane, nonce, generation));
+        assert!(with_producer_admission(pane, client, || ()).is_none());
+        assert!(while_capture_allowed(pane, || ()).is_none());
+    }
+
     #[test]
     fn acknowledgment_serializes_after_inflight_recording() {
         let pane = Uuid::new_v4();

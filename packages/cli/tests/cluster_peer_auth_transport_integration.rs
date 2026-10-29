@@ -177,12 +177,12 @@ fn legacy_ssh_bridge_cannot_redeem_cluster_enrollment() {
     generate_ed25519_key(&client_key);
     std::fs::copy(client_key.with_extension("pub"), &authorized_keys)
         .expect("write SSH authorized_keys");
-    let mut permissions = std::fs::metadata(&authorized_keys)
-        .expect("read authorized_keys metadata")
-        .permissions();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&authorized_keys)
+            .expect("read authorized_keys metadata")
+            .permissions();
         permissions.set_mode(0o600);
         std::fs::set_permissions(&authorized_keys, permissions)
             .expect("set authorized_keys permissions");

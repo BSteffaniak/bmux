@@ -63,3 +63,16 @@ fail-on-warnings = [
     "bmux_terminal_grid/fail-on-warnings",
 ]
 static-bundled = []
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Memory",
+    "Win32_System_Threading",
+] }
+
+[target.'cfg(windows)'.dev-dependencies]
+tempfile = { workspace = true }

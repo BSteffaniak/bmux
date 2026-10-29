@@ -7,7 +7,12 @@ use anyhow::{Context, Result, bail};
 use bmux_config::{BmuxConfig, ConfigPaths};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::io::{Read, Write};
+use std::io::Read;
+#[cfg(not(windows))]
+use std::io::Write;
+
+#[cfg(windows)]
+mod windows;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -36,6 +41,7 @@ fn digest(path: &Path) -> Result<String> {
     Ok(super::hex_encode_digest(hash.finalize()))
 }
 
+#[cfg(not(windows))]
 fn private_write(path: &Path, bytes: &[u8]) -> Result<()> {
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
@@ -134,14 +140,16 @@ pub async fn run_inherited_sandbox(
         cwd: std::env::current_dir()?,
     };
     let sandbox = development_paths(options.name);
-    let mut directory = std::fs::DirBuilder::new();
-    #[cfg(unix)]
+    #[cfg(windows)]
+    let private_tree = prepare_private_tree(&sandbox)?;
+    #[cfg(windows)]
+    let private_write =
+        |path: &Path, bytes: &[u8]| -> Result<()> { Ok(private_tree.write(path, bytes)?) };
+    #[cfg(not(windows))]
     {
-        use std::os::unix::fs::DirBuilderExt;
-        directory.mode(0o700);
+        create_private_directory(&sandbox.root_dir)?;
+        sandbox.ensure_dirs()?;
     }
-    directory.create(&sandbox.root_dir)?;
-    sandbox.ensure_dirs()?;
     private_write(
         &sandbox.config_paths.config_file(),
         toml::to_string(&config)?.as_bytes(),
@@ -163,6 +171,42 @@ pub async fn run_inherited_sandbox(
     );
     options.keep = true;
     super::run_sandbox_at(options, args, sandbox).await
+}
+
+#[cfg(unix)]
+fn create_private_directory(path: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt as _;
+    std::fs::DirBuilder::new().mode(0o700).create(path)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn create_private_directory(path: &std::path::Path) -> std::io::Result<()> {
+    std::fs::DirBuilder::new().create(path)
+}
+
+#[cfg(windows)]
+fn prepare_private_tree(sandbox: &SandboxPaths) -> std::io::Result<windows::Tree> {
+    let mut tree = windows::Tree::create(&sandbox.root_dir)?;
+    for directory in [
+        &sandbox.config_home,
+        &sandbox.config_paths.config_dir,
+        &sandbox.data_home,
+        &sandbox.config_paths.data_dir,
+        &sandbox.runtime_dir,
+        &sandbox.state_dir,
+        &sandbox.log_dir,
+        &sandbox.tmp_dir,
+        &sandbox.home_dir,
+    ] {
+        tree.directory(directory)?;
+    }
+    Ok(tree)
+}
+
+#[cfg(all(windows, test))]
+fn private_write(path: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = path.parent().context("private snapshot has no parent")?;
+    Ok(windows::Tree::existing(parent)?.write(path, bytes)?)
 }
 
 fn development_paths(name: Option<&str>) -> SandboxPaths {
@@ -300,10 +344,23 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    fn private_test_root(temp: &tempfile::TempDir) -> PathBuf {
+        let path = temp.path().join("private");
+        drop(windows::Tree::create(&path).unwrap());
+        path
+    }
+
+    #[cfg(not(windows))]
+    fn private_test_root(temp: &tempfile::TempDir) -> PathBuf {
+        temp.path().to_owned()
+    }
+
     #[test]
     fn private_snapshot_is_create_only_and_rejects_unknown_versions() {
         let temp = tempfile::tempdir().unwrap();
-        let file = temp.path().join("snapshot");
+        let root = private_test_root(&temp);
+        let file = root.join("snapshot");
         private_write(&file, b"secret").unwrap();
         assert!(private_write(&file, b"overwrite").is_err());
         #[cfg(unix)]
@@ -315,7 +372,7 @@ mod tests {
             );
         }
         let mut sandbox = SandboxPaths::new(None);
-        sandbox.root_dir = temp.path().to_path_buf();
+        sandbox.root_dir = root;
         private_write(
             &sandbox.root_dir.join(DESCRIPTOR),
             br#"{"version":99,"binary":"/bmux","binary_digest":"x","cwd":"/"}"#,
@@ -328,7 +385,7 @@ mod tests {
     fn environment_routes_owned_directories_into_sandbox() {
         let temp = tempfile::tempdir().unwrap();
         let mut sandbox = SandboxPaths::new(None);
-        sandbox.root_dir = temp.path().to_path_buf();
+        sandbox.root_dir = private_test_root(&temp);
         private_write(&sandbox.root_dir.join(DESCRIPTOR), b"{}").unwrap();
         let mut command = Command::new("bmux");
         assert!(apply_environment(&mut command, &sandbox));

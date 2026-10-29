@@ -3387,21 +3387,18 @@ fn sandbox_process_alive(root_dir: &Path) -> bool {
         .is_some_and(is_pid_alive)
 }
 
+#[cfg(unix)]
 fn sandbox_socket_alive(root_dir: &Path) -> bool {
-    #[cfg(unix)]
-    {
-        let socket_path = root_dir.join("runtime").join("server.sock");
-        if !socket_path.exists() {
-            return false;
-        }
-        std::os::unix::net::UnixStream::connect(socket_path).is_ok()
+    let socket_path = root_dir.join("runtime").join("server.sock");
+    if !socket_path.exists() {
+        return false;
     }
+    std::os::unix::net::UnixStream::connect(socket_path).is_ok()
+}
 
-    #[cfg(not(unix))]
-    {
-        let _ = root_dir;
-        false
-    }
+#[cfg(not(unix))]
+const fn sandbox_socket_alive(_root_dir: &Path) -> bool {
+    false
 }
 
 fn is_pid_alive(pid: u32) -> bool {

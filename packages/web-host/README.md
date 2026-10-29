@@ -1,11 +1,34 @@
 # bmux_web_host
 
-Reusable **Unix-native** bounded HTTP hosting for opaque immutable encoded
+Reusable **Unix and Windows native** bounded HTTP hosting for opaque immutable
+encoded
 presentation snapshots. The optional `presentation` feature provides native
 renderer integration.
 Native compilation records source provenance only: it never compiles WASM. Web
 callers
 explicitly opt into first-use asset setup; terminal-only operation never needs
+setup.
+
+## Platform boundaries
+
+HTTP, authentication, budgets, publication, and shutdown share one
+implementation.
+Unix assets retain component-wise `openat`/`O_NOFOLLOW`; Windows assets use
+retained
+local-drive directory handles and relative NT opens, rejecting reparse points
+(including junctions), UNC/device paths, and non-regular files. Paths must be
+absolute. Assets are copied into bounded immutable memory before binding.
+
+Windows resolver caches use current-user owner/private DACLs, a kernel file
+lock,
+flushed files, and a write-through non-replacing publication move. The default
+cache is `%LOCALAPPDATA%/bmux/cache`; explicit isolated-runtime cache selection
+still takes precedence. Existing public or redirected caches fail closed.
+Verified release bundles, offline cached bundles, and explicit `--web-assets`
+directories are supported on Windows. Source-first-use compilation still
+requires
+the Unix Nix/Bash driver: native Windows reports an explicit unsupported error
+rather than invoking an ambient unpinned compiler. Native builds do not run
 setup.
 
 ## Semantic document delivery

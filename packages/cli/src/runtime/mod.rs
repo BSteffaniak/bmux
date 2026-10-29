@@ -332,8 +332,13 @@ fn maybe_print_slot_startup_banner(command: Option<&bmux_cli_schema::Command>) {
     eprintln!("[bmux slot={} @ {}]", slot.name, env!("CARGO_PKG_VERSION"));
 }
 
+pub use dispatch::startup_future_marker;
+
 pub async fn run() -> Result<u8> {
-    match parse_runtime_cli()? {
+    startup_future_marker("runtime.before_parse", 0);
+    let parsed = parse_runtime_cli()?;
+    startup_future_marker("runtime.after_parse", 0);
+    match parsed {
         ParsedRuntimeCli::BuiltIn {
             cli,
             log_level,
@@ -343,7 +348,9 @@ pub async fn run() -> Result<u8> {
             let _config_override_guard = push_process_config_overrides(config_overrides);
             let file_only = command_enters_raw_mode(cli.command.as_ref()) || cli.core_builtins_only;
             let logging_scope = logging_scope_for_command(cli.command.as_ref());
+            startup_future_marker("runtime.before_logging", 0);
             let _logging_guard = init_logging(verbose, Some(log_level), file_only, logging_scope);
+            startup_future_marker("runtime.after_logging", 0);
             tracing::info!(
                 scope = ?logging_scope,
                 file_only,
@@ -358,6 +365,7 @@ pub async fn run() -> Result<u8> {
             }
 
             if let Some(command) = &cli.command {
+                startup_future_marker("runtime.before_run_command", 0);
                 return Box::pin(run_command(command, connection_context)).await;
             }
 

@@ -98,11 +98,15 @@ fn encode_input(event: Event, modes: InputModes) -> Result<Option<Vec<u8>>> {
             if key.kind == KeyEventKind::Release {
                 return Ok(None);
             }
-            ensure!(
-                !(key.modifiers.contains(KeyModifiers::CONTROL)
-                    && matches!(key.code, KeyCode::Char('z' | 'Z'))),
-                "outer terminal suspension is unsupported; execution retained for recovery"
-            );
+            if key.modifiers.contains(KeyModifiers::CONTROL)
+                && matches!(key.code, KeyCode::Char('z' | 'Z'))
+            {
+                return Err(
+                    anyhow::anyhow!(InteractiveFailureKind::Unsupported).context(
+                        "outer terminal suspension is unsupported; execution retained for recovery",
+                    ),
+                );
+            }
             let stroke = bmux_keyboard::crossterm::crossterm_key_event_to_stroke(&key)
                 .context("unsupported interactive key; input suspended")?;
             encode_key_with_modes(
@@ -226,11 +230,7 @@ pub(crate) async fn interact(
     run_id: Uuid,
     execution: process::ExecutionRef,
 ) -> Result<process::RunStatus> {
-    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
-    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-    let mut suspend =
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::from_raw(libc::SIGTSTP))?;
-    let mut hangup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
+    let mut stop_events = crate::platform::StopEvents::new()?;
     ensure!(
         std::io::stdin().is_terminal() && std::io::stdout().is_terminal(),
         "interactive recording requires terminal stdin and stdout"
@@ -257,14 +257,7 @@ pub(crate) async fn interact(
     }) {
         return combine_restore(Err(error.into()), guard.restore().map_err(Into::into));
     }
-    let stop = async {
-        tokio::select! {
-            _ = interrupt.recv() => anyhow::anyhow!("interactive frontend interrupted; execution retained; outstanding input is uncertain, no retry").context(InteractiveFailureKind::Interrupted),
-            _ = terminate.recv() => anyhow::anyhow!("interactive frontend terminated; execution retained; outstanding input is uncertain, no retry").context(InteractiveFailureKind::Interrupted),
-            _ = suspend.recv() => anyhow::anyhow!("outer terminal suspension unsupported; input suspended, no automatic resume").context(InteractiveFailureKind::Unsupported),
-            _ = hangup.recv() => anyhow::anyhow!("interactive terminal disconnected; execution retained; no automatic input resume").context(InteractiveFailureKind::Disconnect),
-        }
-    };
+    let stop = stop_events.recv();
     // Signals terminate the loop cooperatively: dropping its future would skip
     // asynchronous stream close and could strand a live epoch on every repeat.
     let operation = interact_loop(
@@ -1685,15 +1678,13 @@ mod tests {
 
     #[test]
     fn unsupported_job_control_does_not_send_or_terminate() {
-        assert!(
-            encode_input(
-                key(KeyCode::Char('z'), KeyModifiers::CONTROL),
-                InputModes::default()
-            )
-            .unwrap_err()
-            .to_string()
-            .contains("suspension is unsupported")
-        );
+        let error = encode_input(
+            key(KeyCode::Char('z'), KeyModifiers::CONTROL),
+            InputModes::default(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("suspension is unsupported"));
+        assert_eq!(failure_kind(&error), InteractiveFailureKind::Unsupported);
         let mut release = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE);
         release.kind = KeyEventKind::Release;
         assert!(

@@ -8,6 +8,131 @@
 
 use clap::{Parser, Subcommand, ValueEnum};
 
+struct SubcommandBuilder {
+    augment: fn(clap::Command) -> clap::Command,
+    update: fn(clap::Command) -> clap::Command,
+    contains: fn(&str) -> bool,
+}
+
+fn subcommand_builder<T: Subcommand>() -> SubcommandBuilder {
+    SubcommandBuilder {
+        augment: T::augment_subcommands,
+        update: T::augment_subcommands_for_update,
+        contains: T::has_subcommand,
+    }
+}
+
+// Clap's derive emits all variant builders into one synchronous stack frame.
+// Debug builds measured 654 KiB for the root plus 840 KiB for a nested enum.
+// Keep each variant's generated construction in a separate function while
+// retaining the exact public enum, decoding, attributes, and command ordering.
+macro_rules! bounded_subcommands {
+    (pub enum $name:ident {
+        $( $(#[$attr:meta])* $variant:ident $( ( $tuple:ty => $binding:ident ) )? $( {
+            $( $(#[$field_attr:meta])* $field:ident : $ty:ty ),* $(,)?
+        } )? , )*
+    }) => {
+        #[derive(Clone, Debug)]
+        pub enum $name {
+            $( $variant $( ( $tuple ) )? $( {
+                $( $field: $ty, )*
+            } )? , )*
+        }
+
+        const _: () = {
+            #[derive(clap::Subcommand)]
+            enum Decoded {
+                $( $(#[$attr])* $variant $( ( $tuple ) )? $( {
+                    $( $(#[$field_attr])* $field: $ty, )*
+                } )? , )*
+            }
+            impl From<Decoded> for $name {
+                fn from(value: Decoded) -> Self {
+                    match value {
+                        $( Decoded::$variant $( ( $binding ) )?
+                            $( { $( $field, )* } )? =>
+                            Self::$variant $( ( $binding ) )?
+                            $( { $( $field, )* } )?, )*
+                    }
+                }
+            }
+            impl From<&$name> for Decoded {
+                fn from(value: &$name) -> Self {
+                    match value {
+                        $( $name::$variant $( ( $binding ) )?
+                            $( { $( $field, )* } )? =>
+                            Self::$variant $( ( $binding.clone() ) )?
+                            $( { $( $field: $field.clone(), )* } )?, )*
+                    }
+                }
+            }
+            impl clap::FromArgMatches for $name {
+                fn from_arg_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
+                    Decoded::from_arg_matches(matches).map(Self::from)
+                }
+                fn from_arg_matches_mut(matches: &mut clap::ArgMatches) -> Result<Self, clap::Error> {
+                    Decoded::from_arg_matches_mut(matches).map(Self::from)
+                }
+                fn update_from_arg_matches(&mut self, matches: &clap::ArgMatches) -> Result<(), clap::Error> {
+                    let mut decoded = Decoded::from(&*self);
+                    decoded.update_from_arg_matches(matches)?;
+                    *self = decoded.into();
+                    Ok(())
+                }
+                fn update_from_arg_matches_mut(&mut self, matches: &mut clap::ArgMatches) -> Result<(), clap::Error> {
+                    let mut decoded = Decoded::from(&*self);
+                    decoded.update_from_arg_matches_mut(matches)?;
+                    *self = decoded.into();
+                    Ok(())
+                }
+            }
+        };
+
+        impl $name {
+            fn command_builders() -> Vec<SubcommandBuilder> {
+                vec![$({
+                    #[derive(clap::Subcommand)]
+                    enum Single {
+                        $(#[$attr])* $variant $( ( $tuple ) )? $( {
+                            $( $(#[$field_attr])* $field: $ty, )*
+                        } )? ,
+                    }
+                    fn read_fields(value: &Single) {
+                        match value {
+                            Single::$variant $( ( $binding ) )? $( { $( $field, )* } )? => {
+                                $( let _ = $binding; )?
+                                $( $( let _ = $field; )* )?
+                            }
+                        }
+                    }
+                    // Construction-only mirror: keep its fields accounted for
+                    // without adding runtime decoding or suppressing lints.
+                    let _ = read_fields as fn(&Single);
+                    subcommand_builder::<Single>()
+                }),*]
+            }
+        }
+
+        impl clap::Subcommand for $name {
+            fn augment_subcommands(mut command: clap::Command) -> clap::Command {
+                for builder in Self::command_builders() {
+                    command = (builder.augment)(command);
+                }
+                command
+            }
+            fn augment_subcommands_for_update(mut command: clap::Command) -> clap::Command {
+                for builder in Self::command_builders() {
+                    command = (builder.update)(command);
+                }
+                command
+            }
+            fn has_subcommand(name: &str) -> bool {
+                Self::command_builders().iter().any(|builder| (builder.contains)(name))
+            }
+        }
+    };
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub enum DebugRenderLogFormat {
     Text,
@@ -197,7 +322,7 @@ pub struct Cli {
     pub log_level: Option<LogLevel>,
 }
 
-#[derive(Debug, Subcommand)]
+bounded_subcommands! {
 pub enum Command {
     /// First-run setup wizard for hosted mode (p2p default)
     Setup {
@@ -472,10 +597,11 @@ pub enum Command {
     /// Internal sshenv device-seal broker used by panes.
     DeviceSealBroker,
     #[command(external_subcommand)]
-    External(Vec<String>),
+    External(Vec<String> => external),
+}
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Clone, Debug, Subcommand)]
 pub enum AuthCommand {
     /// Login and register this device for hosted mode
     Login {
@@ -493,7 +619,7 @@ pub enum AuthCommand {
 ///
 /// Both `bmux slot ...` and `bmux env ...` map to this enum; they are
 /// aliases for the same implementation.
-#[derive(Debug, Subcommand)]
+#[derive(Clone, Debug, Subcommand)]
 pub enum SlotCommand {
     /// List all declared slots and the presentational default.
     List {
@@ -626,7 +752,7 @@ pub enum SlotInstallMode {
     Copy,
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Clone, Debug, Subcommand)]
 pub enum AccessCommand {
     /// Show iroh SSH access status
     Status,
@@ -683,7 +809,7 @@ pub enum AccessCommand {
     Disable,
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Clone, Debug, Subcommand)]
 pub enum KioskCommand {
     /// Show kiosk profile status and effective defaults
     Status {
@@ -747,7 +873,7 @@ pub enum KioskCommand {
     },
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Clone, Debug, Subcommand)]
 pub enum RemoteCommand {
     /// List configured connection targets
     List {
@@ -813,7 +939,7 @@ pub enum RemoteCommand {
     },
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Clone, Debug, Subcommand)]
 pub enum RemoteTrustCommand {
     /// List effective TLS gateway trust pins
     List,
@@ -832,7 +958,7 @@ pub enum RemoteTrustCommand {
     },
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Clone, Debug, Subcommand)]
 pub enum RemoteCompleteCommand {
     /// Print target names for completion
     Targets,
@@ -843,7 +969,7 @@ pub enum RemoteCompleteCommand {
     },
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Clone, Debug, Subcommand)]
 pub enum PlaybookCommand {
     /// Run a playbook from a file or stdin
     Run {
@@ -941,7 +1067,7 @@ pub enum PlaybookCommand {
     },
 }
 
-#[derive(Debug, Subcommand)]
+bounded_subcommands! {
 pub enum SandboxCommand {
     /// Run bmux in a dev-friendly isolated sandbox using the invoked binary
     Dev {
@@ -1269,6 +1395,7 @@ pub enum SandboxCommand {
         json: bool,
     },
 }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub enum SandboxStatusArg {
@@ -1286,7 +1413,7 @@ pub enum SandboxSourceArg {
     All,
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Clone, Debug, Subcommand)]
 pub enum SessionCommand {
     /// Create a new session
     New {
@@ -1344,7 +1471,7 @@ pub enum SessionCommand {
     Unfollow,
 }
 
-#[derive(Debug, Subcommand)]
+bounded_subcommands! {
 pub enum ServerCommand {
     /// Start local bmux server
     Start {
@@ -1489,8 +1616,9 @@ pub enum ServerCommand {
         preflight: bool,
     },
 }
+}
 
-#[derive(Debug, Subcommand)]
+#[derive(Clone, Debug, Subcommand)]
 pub enum ServerAutostartCommand {
     /// Install or update native per-user login autostart
     Install {
@@ -1523,7 +1651,7 @@ pub enum GatewayHostMode {
     Ssh,
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Clone, Debug, Subcommand)]
 pub enum KeymapCommand {
     /// Print compiled keymap and overlap diagnostics
     Doctor {
@@ -1544,7 +1672,7 @@ pub enum KeymapCommand {
     },
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Clone, Debug, Subcommand)]
 pub enum DiagnosticsCommand {
     /// Interactive structured diagnostics event viewer with dynamic filters
     Watch {
@@ -1596,7 +1724,7 @@ pub enum DiagnosticsCommand {
     },
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Clone, Debug, Subcommand)]
 pub enum LogsCommand {
     /// Print effective log file path
     Path {
@@ -1653,7 +1781,7 @@ pub enum LogsCommand {
     },
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Clone, Debug, Subcommand)]
 pub enum LogsProfilesCommand {
     /// List saved watch profiles
     List {
@@ -1683,7 +1811,7 @@ pub enum LogsProfilesCommand {
     },
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Clone, Debug, Subcommand)]
 pub enum ConfigCommand {
     /// Print the config file path
     Path {
@@ -1724,7 +1852,7 @@ pub enum ConfigCommand {
     },
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Clone, Debug, Subcommand)]
 pub enum ConfigScopeCommand {
     /// Explain scoped source discovery and effective config
     Explain {
@@ -1740,7 +1868,7 @@ pub enum ConfigScopeCommand {
     },
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Clone, Debug, Subcommand)]
 pub enum ConfigProfilesCommand {
     /// List known profile ids
     List {
@@ -1814,7 +1942,7 @@ pub enum PerfProfileArg {
     Trace,
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Clone, Debug, Subcommand)]
 pub enum PerfCommand {
     /// Show current runtime performance telemetry settings
     Status {
@@ -1839,7 +1967,7 @@ pub enum PerfCommand {
     },
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Clone, Debug, Subcommand)]
 pub enum TerminalCommand {
     /// Show terminal capability profile used for panes
     Doctor {
@@ -1872,6 +2000,50 @@ pub enum TerminalCommand {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn command_construction_fits_one_megabyte_stack() {
+        const CHILD: &str = "BMUX_SCHEMA_STACK_REGRESSION_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            std::thread::Builder::new()
+                .stack_size(1024 * 1024)
+                .spawn(|| {
+                    use clap::{CommandFactory, Parser};
+                    super::Cli::command().debug_assert();
+                    let error = super::Cli::try_parse_from(["bmux", "--version"]).unwrap_err();
+                    assert_eq!(error.kind(), clap::error::ErrorKind::DisplayVersion);
+                    assert!(
+                        super::Cli::try_parse_from([
+                            "bmux",
+                            "server",
+                            "start",
+                            "--foreground-internal",
+                        ])
+                        .is_ok()
+                    );
+                })
+                .unwrap()
+                .join()
+                .unwrap();
+            return;
+        }
+        // Overflow aborts, rather than unwinds: contain a regression in its own
+        // test process so it cannot terminate the rest of the schema suite.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::command_construction_fits_one_megabyte_stack",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     use super::{
         AccessCommand, AuthCommand, Cli, Command, ConfigCommand, ConfigProfilesCommand,
         GatewayHostMode, HostedModeArg, KeymapCommand, KioskCommand, LogsCommand,

@@ -2,13 +2,12 @@
 #[path = "provenance.rs"]
 mod provenance;
 
+use crate::platform::{self, Lock, private_directory, sync_directory};
 use std::collections::BTreeSet;
-use std::fs::{self, File, OpenOptions};
+use std::fs;
 use std::io::{self, Read, Write};
-use std::os::fd::AsRawFd;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -105,6 +104,9 @@ fn cache_root() -> io::Result<PathBuf> {
             "selected runtime requires explicit isolated BMUX_CACHE_DIR for web assets",
         ));
     }
+    if let Some(path) = platform::default_cache_root() {
+        return absolute(path);
+    }
     if let Some(path) = std::env::var_os("XDG_CACHE_HOME") {
         return absolute(PathBuf::from(path)).map(|path| path.join("bmux"));
     }
@@ -120,36 +122,6 @@ fn absolute(path: PathBuf) -> io::Result<PathBuf> {
     Ok(path)
 }
 
-struct Lock(File);
-impl Lock {
-    fn acquire(path: &Path) -> io::Result<Self> {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(path)?;
-        if !file.metadata()?.is_file() {
-            return Err(io::Error::other("web setup lock is not a regular file"));
-        }
-        // SAFETY: file owns a valid descriptor for the entire lock lifetime.
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(Self(file))
-    }
-}
-impl Drop for Lock {
-    fn drop(&mut self) {
-        // SAFETY: the owned descriptor remains valid until after drop returns.
-        unsafe {
-            libc::flock(self.0.as_raw_fd(), libc::LOCK_UN);
-        }
-    }
-}
-
 fn cache_key() -> String {
     let release = if RELEASE_TAG.is_empty() {
         "source"
@@ -162,7 +134,7 @@ fn cache_key() -> String {
 fn resolve(cache: &Path) -> io::Result<PathBuf> {
     for path in cache.ancestors() {
         match fs::symlink_metadata(path) {
-            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) if platform::is_directory(path)? => {}
             Ok(_) => {
                 return Err(io::Error::other(
                     "web cache ancestor is not a regular directory",
@@ -216,39 +188,9 @@ fn publish_bundle(stage: &Path, destination: &Path, cache: &Path) -> io::Result<
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(error),
     }
-    fs::rename(stage, destination)?;
+    platform::publish(stage, destination)?;
     sync_directory(parent)?;
     sync_directory(cache)
-}
-
-fn private_directory(path: &Path) -> io::Result<()> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.is_dir() => return Ok(()),
-        Ok(_) => {
-            return Err(io::Error::other(
-                "web cache path is not a regular directory",
-            ));
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error),
-    }
-    let parent = path
-        .parent()
-        .ok_or_else(|| io::Error::other("invalid web cache root"))?;
-    private_directory(parent)?;
-    match fs::create_dir(path) {
-        Ok(()) => fs::set_permissions(path, fs::Permissions::from_mode(0o700))?,
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-            if !fs::symlink_metadata(path)?.is_dir() {
-                return Err(io::Error::other(
-                    "web cache path is not a regular directory",
-                ));
-            }
-        }
-        Err(error) => return Err(error),
-    }
-    sync_directory(path)?;
-    sync_directory(parent)
 }
 
 fn verify_source(root: &Path) -> io::Result<()> {
@@ -261,10 +203,7 @@ fn verify_source(root: &Path) -> io::Result<()> {
     Ok(())
 }
 fn read_regular(path: &Path, limit: u64) -> io::Result<Vec<u8>> {
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)?;
+    let file = platform::open_regular(path)?;
     let metadata = file.metadata()?;
     if !metadata.is_file() || metadata.len() == 0 || metadata.len() > limit {
         return Err(io::Error::other(format!(
@@ -317,7 +256,7 @@ fn parse_manifest(bytes: &[u8]) -> io::Result<Manifest> {
     Ok(manifest)
 }
 fn verify_bundle(directory: &Path) -> io::Result<()> {
-    if !fs::symlink_metadata(directory)?.is_dir() {
+    if !platform::is_directory(directory)? {
         return Err(io::Error::other("web cache is not a regular directory"));
     }
     let manifest_path = directory.join("manifest.json");
@@ -343,23 +282,12 @@ fn verify_entry(entry: &Entry, bytes: &[u8]) -> io::Result<()> {
     Ok(())
 }
 fn durable_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)?;
+    let mut file = platform::new_file(path)?;
     file.write_all(bytes)?;
     file.sync_all()
 }
 fn sync_regular(path: &Path) -> io::Result<()> {
-    OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)?
-        .sync_all()
-}
-fn sync_directory(path: &Path) -> io::Result<()> {
-    File::open(path)?.sync_all()
+    platform::sync_regular(path)
 }
 fn write_manifest(directory: &Path) -> io::Result<()> {
     let mut entries = Vec::new();
@@ -370,7 +298,7 @@ fn write_manifest(directory: &Path) -> io::Result<()> {
         if total > TOTAL_LIMIT {
             return Err(io::Error::other("built web assets exceed total budget"));
         }
-        File::open(directory.join(name))?.sync_all()?;
+        sync_regular(&directory.join(name))?;
         entries.push(Entry {
             name: name.into(),
             size: bytes.len() as u64,
@@ -434,7 +362,7 @@ fn build_source(root: &Path, output: &Path, cache: &Path) -> io::Result<()> {
     let tools_lock =
         Lock::acquire(&cache.join(format!("wasm-bindgen-{WASM_BINDGEN_VERSION}.lock")))?;
     let tools = cache.join(format!("wasm-bindgen-{WASM_BINDGEN_VERSION}"));
-    let bindgen = tools.join("bin/wasm-bindgen");
+    let bindgen = tools.join(format!("bin/wasm-bindgen{}", std::env::consts::EXE_SUFFIX));
     let tools_exist = match fs::symlink_metadata(&tools) {
         Ok(_) => true,
         Err(error) if error.kind() == io::ErrorKind::NotFound => false,
@@ -465,17 +393,19 @@ fn build_source(root: &Path, output: &Path, cache: &Path) -> io::Result<()> {
                 utf8(stage.path())?,
             ],
         )?;
-        let private_binary = stage.path().join("bin/wasm-bindgen");
+        let private_binary = stage
+            .path()
+            .join(format!("bin/wasm-bindgen{}", std::env::consts::EXE_SUFFIX));
         check_bindgen_version(&private_binary)?;
         let digest = provenance::hex(&Sha256::digest(read_regular(
             &private_binary,
             128 * 1024 * 1024,
         )?));
         durable_file(&stage.path().join("sha256"), digest.as_bytes())?;
-        File::open(&private_binary)?.sync_all()?;
+        sync_regular(&private_binary)?;
         sync_directory(&stage.path().join("bin"))?;
         sync_directory(stage.path())?;
-        fs::rename(stage.path(), &tools)?;
+        platform::publish(stage.path(), &tools)?;
         sync_directory(cache)?;
     }
     drop(tools_lock);
@@ -520,11 +450,7 @@ fn utf8(path: &Path) -> io::Result<&str> {
 }
 fn run_dev(root: &Path, args: &[&str]) -> io::Result<()> {
     verify_source(root)?;
-    let status = Command::new("nix")
-        .arg("develop")
-        .arg(root)
-        .arg("--command")
-        .args(args)
+    let status = platform::source_command(root, args)?
         .current_dir(root)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -542,8 +468,7 @@ fn check_bindgen(path: &Path) -> io::Result<()> {
         .parent()
         .and_then(Path::parent)
         .ok_or_else(|| io::Error::other("invalid private tool path"))?;
-    if !fs::symlink_metadata(tools)?.is_dir() || !fs::symlink_metadata(tools.join("bin"))?.is_dir()
-    {
+    if !platform::is_directory(tools)? || !platform::is_directory(&tools.join("bin"))? {
         return Err(io::Error::other("private tool cache must not be a symlink"));
     }
     let expected = read_regular(&tools.join("sha256"), 64)?;
@@ -562,7 +487,7 @@ fn check_bindgen_version(path: &Path) -> io::Result<()> {
             "private wasm-bindgen is not a regular file",
         ));
     }
-    let output = Command::new(path)
+    let output = std::process::Command::new(path)
         .arg("--version")
         .stdin(Stdio::null())
         .output()?;
@@ -638,6 +563,7 @@ mod tests {
     fn cache_reuse_is_offline_and_corruption_is_not_repaired() {
         let cache = tempfile::tempdir().unwrap();
         let directory = cache.path().join("web-assets").join(cache_key());
+        private_directory(directory.parent().unwrap()).unwrap();
         fs::create_dir_all(&directory).unwrap();
         fixture(&directory);
         assert_eq!(resolve(cache.path()).unwrap(), directory);
@@ -666,6 +592,7 @@ mod tests {
         }
         assert!(parse_manifest(&vec![b' '; MANIFEST_LIMIT as usize + 1]).is_err());
     }
+    #[cfg(unix)]
     #[test]
     fn symlink_assets_are_rejected() {
         let directory = tempfile::tempdir().unwrap();
@@ -826,16 +753,19 @@ mod tests {
             original,
             provenance::identity(directory.path(), &inputs).unwrap()
         );
-        use std::os::unix::fs::symlink;
-        let outside = tempfile::tempdir().unwrap();
-        symlink(outside.path(), directory.path().join("packages/escaped")).unwrap();
-        fs::write(
-            directory.path().join("packages/presenter/Cargo.toml"),
-            "[dependencies]\nescaped = {path = '../escaped'}\n",
-        )
-        .unwrap();
-        assert!(provenance::inputs(directory.path()).is_err());
-        assert!(verify_source(directory.path()).is_err());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let outside = tempfile::tempdir().unwrap();
+            symlink(outside.path(), directory.path().join("packages/escaped")).unwrap();
+            fs::write(
+                directory.path().join("packages/presenter/Cargo.toml"),
+                "[dependencies]\nescaped = {path = '../escaped'}\n",
+            )
+            .unwrap();
+            assert!(provenance::inputs(directory.path()).is_err());
+            assert!(verify_source(directory.path()).is_err());
+        }
     }
     #[test]
     fn relative_cache_root_is_rejected_without_creation() {
@@ -858,6 +788,7 @@ mod tests {
     fn concurrent_readers_reuse_one_valid_cache() {
         let cache = tempfile::tempdir().unwrap();
         let directory = cache.path().join("web-assets").join(cache_key());
+        private_directory(directory.parent().unwrap()).unwrap();
         fs::create_dir_all(&directory).unwrap();
         fixture(&directory);
         std::thread::scope(|scope| {

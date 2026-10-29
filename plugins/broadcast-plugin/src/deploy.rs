@@ -43,27 +43,12 @@ const ASSETS: &[(&str, &[u8])] = &[
 ];
 
 fn private_directory(path: &Path) -> Result<(), PluginCommandError> {
-    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(path)
-        .map_err(|_| PluginCommandError::failed("deployment cache directory unavailable"))?;
-    let metadata = std::fs::symlink_metadata(path)
-        .map_err(|_| PluginCommandError::failed("deployment cache metadata unavailable"))?;
-    // SAFETY: geteuid has no preconditions and does not change process state.
-    let owner = unsafe { libc::geteuid() };
-    if !metadata.is_dir() || metadata.uid() != owner || metadata.mode() & 0o077 != 0 {
-        return Err(PluginCommandError::failed(
-            "deployment cache must be owned, non-symlink and private",
-        ));
-    }
-    Ok(())
+    crate::platform::private_dir(path, true)
+        .map_err(|_| PluginCommandError::failed("deployment cache must be owner-private directory"))
 }
 
 fn installer(state: &Path) -> Result<PathBuf, PluginCommandError> {
     use std::io::{Read, Write};
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     let mut identity = Sha256::new();
     for (name, bytes) in ASSETS {
         identity.update(name.as_bytes());
@@ -81,43 +66,37 @@ fn installer(state: &Path) -> Result<PathBuf, PluginCommandError> {
     private_directory(&root)?;
     for (name, bytes) in ASSETS {
         let path = root.join(name);
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&path)
-        {
-            Ok(mut file) => {
-                file.write_all(bytes)
-                    .and_then(|()| file.sync_all())
-                    .map_err(|_| {
-                        PluginCommandError::failed("deployment installer extraction failed")
-                    })?;
-            }
+        let staging = root.join(format!(".extract-{}", uuid::Uuid::new_v4()));
+        let extraction = (|| -> std::io::Result<()> {
+            let mut file = crate::platform::create_new(&staging)?;
+            file.write_all(bytes)?;
+            file.sync_all()?;
+            drop(file);
+            crate::platform::publish_new(&staging, &path)
+        })();
+        // On Unix publication uses a hard link; on Windows the staging name
+        // was moved. Neither path ever rewrites an existing cached identity.
+        let _ = std::fs::remove_file(&staging);
+        match extraction {
+            Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(_) => {
                 return Err(PluginCommandError::failed(
-                    "deployment installer cache unavailable",
+                    "deployment installer extraction/publication failed",
                 ));
             }
         }
-        let mut file = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&path)
-            .map_err(|_| PluginCommandError::failed("deployment installer asset unavailable"))?;
-        let metadata = file
+        let mut file = crate::platform::open_private(&path).map_err(|_| {
+            PluginCommandError::failed("deployment installer asset ownership/type mismatch")
+        })?;
+        if file
             .metadata()
-            .map_err(|_| PluginCommandError::failed("deployment installer metadata unavailable"))?;
-        // SAFETY: geteuid has no preconditions and does not change process state.
-        let owner = unsafe { libc::geteuid() };
-        if !metadata.is_file()
-            || metadata.uid() != owner
-            || metadata.mode() & 0o077 != 0
-            || metadata.len() != bytes.len() as u64
+            .map_err(|_| PluginCommandError::failed("deployment installer metadata unavailable"))?
+            .len()
+            != bytes.len() as u64
         {
             return Err(PluginCommandError::failed(
-                "deployment installer asset ownership/type mismatch",
+                "deployment installer asset size mismatch",
             ));
         }
         let mut actual = Vec::with_capacity(bytes.len());
@@ -129,9 +108,11 @@ fn installer(state: &Path) -> Result<PathBuf, PluginCommandError> {
             ));
         }
     }
-    std::fs::File::open(&root)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|_| PluginCommandError::failed("deployment installer cache durability failed"))?;
+    crate::platform::sync_directory(&root).map_err(|error| {
+        PluginCommandError::failed(format!(
+            "deployment installer cache durability failed: {error}"
+        ))
+    })?;
     Ok(root.join("live-install.py"))
 }
 
@@ -244,9 +225,9 @@ mod tests {
     #[test]
     fn candidate_default_uses_selected_executable_not_cache_or_cwd() {
         assert_eq!(
-            installed_candidate(Path::new("/opt/bmux/slots/test/bin/bmux"))
+            installed_candidate(&std::env::temp_dir().join("slots/test/bin/bmux"))
                 .expect("absolute install"),
-            PathBuf::from("/opt/bmux/slots/test/bin/live-candidate")
+            std::env::temp_dir().join("slots/test/bin/live-candidate")
         );
         assert!(installed_candidate(Path::new("relative/bmux")).is_err());
     }
@@ -261,6 +242,7 @@ mod tests {
         assert!(installer(state.path()).is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn embedded_cache_rejects_symlink_asset_and_public_directory() {
         use std::os::unix::fs::{PermissionsExt, symlink};

@@ -9,13 +9,12 @@ pub(super) struct TestRelay {
     pub events: std::sync::mpsc::Receiver<(String, Vec<u8>)>,
     stopped: Arc<AtomicBool>,
     worker: Option<std::thread::JoinHandle<()>>,
-    _credential: tempfile::NamedTempFile,
+    _credential: tempfile::TempDir,
     pub relay: Option<Relay>,
     pub fail_pause: Arc<AtomicBool>,
 }
 impl TestRelay {
     pub fn new(repair_once: bool) -> Self {
-        use std::os::unix::fs::PermissionsExt;
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
@@ -127,11 +126,12 @@ impl TestRelay {
                 socket.join().unwrap();
             }
         });
-        let credential = tempfile::NamedTempFile::new().unwrap();
-        std::fs::set_permissions(credential.path(), std::fs::Permissions::from_mode(0o600))
-            .unwrap();
-        std::fs::write(credential.path(), "x".repeat(32)).unwrap();
-        let relay = Relay::new(&endpoint, "main", credential.path()).unwrap();
+        let credential = tempfile::tempdir().unwrap();
+        let path = credential.path().join("key");
+        let mut file = crate::platform::create_new(&path).unwrap();
+        file.write_all("x".repeat(32).as_bytes()).unwrap();
+        drop(file);
+        let relay = Relay::new(&endpoint, "main", &path).unwrap();
         Self {
             events,
             stopped,

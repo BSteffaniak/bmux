@@ -3305,9 +3305,12 @@ mod tests {
     use std::cell::{Cell, RefCell};
     use std::collections::{BTreeMap, BTreeSet};
     use std::ffi::c_char;
+    #[cfg(unix)]
     use std::process::{Command, Stdio};
     use std::ptr;
+    #[cfg(unix)]
     use std::thread;
+    #[cfg(unix)]
     use std::time::Duration;
 
     thread_local! {
@@ -4088,6 +4091,7 @@ minimum = "1.0"
         .expect("process runtime worker plugin should load")
     }
 
+    #[cfg(unix)]
     fn process_runtime_metrics_snapshot(
         loaded: &LoadedPlugin,
     ) -> super::ProcessRuntimeMetricsSnapshot {

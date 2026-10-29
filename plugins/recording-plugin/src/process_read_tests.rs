@@ -199,10 +199,10 @@ mod tests {
         let parent = std::env::temp_dir().join(format!("bmux-launch-alias-{}", Uuid::new_v4()));
         let owner = parent.join("owned");
         let other = parent.join("other");
-        let alias = parent.join("alias");
+        // A lexical alias works without Windows symlink privileges.
+        let alias = other.join("..").join("owned");
         std::fs::create_dir_all(&owner).unwrap();
         std::fs::create_dir_all(&other).unwrap();
-        std::os::unix::fs::symlink(&owner, &alias).unwrap();
         let admitted = owner.to_str().unwrap();
         let verified = verified_launch_root(alias.to_str().unwrap(), admitted).unwrap();
         assert_eq!(verified, admitted);

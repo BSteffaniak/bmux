@@ -36,14 +36,15 @@ pub(crate) fn run(context: &NativeCommandContext) -> i32 {
             code
         }
         Err(error) => {
-            eprintln!("recording process {operation}: {error}");
-            println!(
-                "{}",
-                serde_json::json!({"schema_version":4,"ok":false,"error":error.to_string()})
-            );
+            eprintln!("recording process {operation}: {error:#}");
+            println!("{}", command_error_report(&error));
             1
         }
     }
+}
+
+fn command_error_report(error: &anyhow::Error) -> serde_json::Value {
+    serde_json::json!({"schema_version":4,"ok":false,"error":format!("{error:#}")})
 }
 
 pub(crate) async fn execute_interactive_start(
@@ -58,7 +59,7 @@ pub(crate) async fn execute_interactive_start(
         .await
         .context("complete caller environment capability unavailable; target not launched")?;
     ensure!(
-        capabilities == 1,
+        capabilities == 2,
         "unsupported complete caller environment capability; target not launched"
     );
     let presentation =
@@ -886,6 +887,17 @@ fn help(operation: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn command_error_json_preserves_operation_and_cause() {
+        let error = anyhow::anyhow!("ACL rejected: foreign writer")
+            .context("creating private recording directory C:\\owned\\data\\recording-process-v4");
+        let report = command_error_report(&error);
+        let message = report["error"].as_str().unwrap();
+        assert!(message.contains("creating private recording directory"));
+        assert!(message.contains("ACL rejected: foreign writer"));
+        assert_eq!(report["ok"], false);
+    }
 
     #[test]
     fn interactive_capabilities_require_exact_supported_representation() {

@@ -43,12 +43,161 @@ use super::{
     },
 };
 
+// Inspect the concrete future type without calling the factory or constructing
+// its potentially large debug-mode stack temporary.
+pub(super) fn future_size<F: std::future::Future>(_: impl FnOnce() -> F) -> usize {
+    std::mem::size_of::<F>()
+}
+
+pub fn startup_future_marker(label: &str, bytes: usize) {
+    if std::env::var_os("BMUX_DIAG_STARTUP_FUTURES").is_some() {
+        eprintln!("startup.future {label} bytes={bytes}");
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn startup_future_size_diagnostic() {
+    // Retain poll symbols for offline prologue inspection without executing CLI
+    // parsing, opening endpoints, or starting a runtime.
+    fn retain_poll<F: std::future::Future>(_: impl FnOnce() -> F) {
+        fn poll<F: std::future::Future>(
+            future: std::pin::Pin<&mut F>,
+            context: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<F::Output> {
+            future.poll(context)
+        }
+        std::hint::black_box(
+            poll::<F>
+                as fn(
+                    std::pin::Pin<&mut F>,
+                    &mut std::task::Context<'_>,
+                ) -> std::task::Poll<F::Output>,
+        );
+    }
+    retain_poll(super::run);
+    retain_poll(crate::run_cli);
+    let command = Command::Server {
+        command: ServerCommand::Status { json: false },
+    };
+    let context = ConnectionContext::new(Some("local"));
+    eprintln!(
+        "dispatch bytes={}",
+        future_size(|| dispatch_built_in_command(&command, context))
+    );
+    let server_dispatch_bytes = future_size(|| dispatch_server_start(&command));
+    eprintln!("server_dispatch bytes={server_dispatch_bytes}");
+    assert!(
+        server_dispatch_bytes < 1024,
+        "server dispatch must not embed the general dispatcher future"
+    );
+    eprintln!("runtime.run bytes={}", future_size(super::run));
+    eprintln!(
+        "run_command bytes={}",
+        future_size(|| run_command(&command, context))
+    );
+}
+
+// The monolithic dispatcher has a >1 MiB debug poll frame even though its
+// stored future is small. Keep dedicated server startup out of that poll frame.
+async fn dispatch_server_start(command: &Command) -> Result<u8> {
+    match (BuiltInHandlerId::ServerStart, command) {
+        (
+            BuiltInHandlerId::ServerStart,
+            Command::Server {
+                command:
+                    ServerCommand::Start {
+                        daemon,
+                        foreground_internal,
+                        pane_shell_integration,
+                        no_pane_shell_integration,
+                        rolling_recording,
+                        no_rolling_recording,
+                        rolling_window_secs,
+                        rolling_event_kind_all,
+                        rolling_event_kind,
+                        rolling_capture_input,
+                        no_rolling_capture_input,
+                        rolling_capture_output,
+                        no_rolling_capture_output,
+                        rolling_capture_events,
+                        no_rolling_capture_events,
+                        rolling_capture_protocol_replies,
+                        no_rolling_capture_protocol_replies,
+                        rolling_capture_images,
+                        no_rolling_capture_images,
+                    },
+            },
+        ) => {
+            let rolling_enabled_override = if *rolling_recording {
+                Some(true)
+            } else if *no_rolling_recording {
+                Some(false)
+            } else {
+                None
+            };
+            let pane_shell_integration_override =
+                bool_override(*pane_shell_integration, *no_pane_shell_integration);
+            let rolling_options = RecordingRollingStartOptions {
+                window_secs: *rolling_window_secs,
+                name: None,
+                event_kinds: if *rolling_event_kind_all {
+                    Some(all_recording_event_kinds())
+                } else if rolling_event_kind.is_empty() {
+                    None
+                } else {
+                    Some(
+                        rolling_event_kind
+                            .iter()
+                            .copied()
+                            .map(recording_event_kind_arg_to_ipc)
+                            .collect(),
+                    )
+                },
+                capture_input: bool_override(*rolling_capture_input, *no_rolling_capture_input),
+                capture_output: bool_override(*rolling_capture_output, *no_rolling_capture_output),
+                capture_events: bool_override(*rolling_capture_events, *no_rolling_capture_events),
+                capture_protocol_replies: bool_override(
+                    *rolling_capture_protocol_replies,
+                    *no_rolling_capture_protocol_replies,
+                ),
+                capture_images: bool_override(*rolling_capture_images, *no_rolling_capture_images),
+            };
+            run_server_start(
+                *daemon,
+                *foreground_internal,
+                rolling_enabled_override,
+                rolling_options,
+                pane_shell_integration_override,
+                None,
+            )
+            .await
+        }
+        _ => anyhow::bail!("server-start dispatcher received another command"),
+    }
+}
+
 pub(super) async fn run_command(
     command: &Command,
     connection_context: ConnectionContext<'_>,
 ) -> Result<u8> {
+    startup_future_marker("run_command.first_poll", 0);
+    startup_future_marker(
+        "dispatch.before_construct",
+        future_size(|| dispatch_built_in_command(command, connection_context)),
+    );
     match command {
         Command::External(args) => run_external_plugin_command(args).await,
+        Command::Server {
+            command: ServerCommand::Start { .. },
+        } => {
+            let _descriptor = built_in_command_by_handler(BuiltInHandlerId::ServerStart);
+            startup_future_marker(
+                "server_dispatch.before_construct",
+                future_size(|| dispatch_server_start(command)),
+            );
+            Box::pin(dispatch_server_start(command)).await
+        }
         _ => Box::pin(dispatch_built_in_command(command, connection_context)).await,
     }
 }
@@ -232,6 +381,7 @@ pub(super) async fn dispatch_built_in_command(
     command: &Command,
     connection_context: ConnectionContext<'_>,
 ) -> Result<u8> {
+    startup_future_marker("dispatch.first_poll", 0);
     let handler = built_in_handler_for_command(command);
     let _descriptor = built_in_command_by_handler(handler);
     match (handler, command) {
@@ -492,7 +642,6 @@ pub(super) async fn dispatch_built_in_command(
                     connection_context,
                 )
                 .await?;
-                #[cfg(unix)]
                 return super::attach::observer::transport::run_private_worker(
                     client,
                     session_id,
@@ -501,11 +650,6 @@ pub(super) async fn dispatch_built_in_command(
                     *observer_rows,
                 )
                 .await;
-                #[cfg(not(unix))]
-                {
-                    let _ = (client, session_id, socket, observer_cols, observer_rows);
-                    anyhow::bail!("private attachment observation requires Unix sockets");
-                }
             }
             if *web || *web_only || web_assets.is_some() {
                 return Box::pin(super::web_attach::run(
@@ -718,77 +862,7 @@ pub(super) async fn dispatch_built_in_command(
                     },
             },
         ) => run_remote_complete_sessions(target).await,
-        (
-            BuiltInHandlerId::ServerStart,
-            Command::Server {
-                command:
-                    ServerCommand::Start {
-                        daemon,
-                        foreground_internal,
-                        pane_shell_integration,
-                        no_pane_shell_integration,
-                        rolling_recording,
-                        no_rolling_recording,
-                        rolling_window_secs,
-                        rolling_event_kind_all,
-                        rolling_event_kind,
-                        rolling_capture_input,
-                        no_rolling_capture_input,
-                        rolling_capture_output,
-                        no_rolling_capture_output,
-                        rolling_capture_events,
-                        no_rolling_capture_events,
-                        rolling_capture_protocol_replies,
-                        no_rolling_capture_protocol_replies,
-                        rolling_capture_images,
-                        no_rolling_capture_images,
-                    },
-            },
-        ) => {
-            let rolling_enabled_override = if *rolling_recording {
-                Some(true)
-            } else if *no_rolling_recording {
-                Some(false)
-            } else {
-                None
-            };
-            let pane_shell_integration_override =
-                bool_override(*pane_shell_integration, *no_pane_shell_integration);
-            let rolling_options = RecordingRollingStartOptions {
-                window_secs: *rolling_window_secs,
-                name: None,
-                event_kinds: if *rolling_event_kind_all {
-                    Some(all_recording_event_kinds())
-                } else if rolling_event_kind.is_empty() {
-                    None
-                } else {
-                    Some(
-                        rolling_event_kind
-                            .iter()
-                            .copied()
-                            .map(recording_event_kind_arg_to_ipc)
-                            .collect(),
-                    )
-                },
-                capture_input: bool_override(*rolling_capture_input, *no_rolling_capture_input),
-                capture_output: bool_override(*rolling_capture_output, *no_rolling_capture_output),
-                capture_events: bool_override(*rolling_capture_events, *no_rolling_capture_events),
-                capture_protocol_replies: bool_override(
-                    *rolling_capture_protocol_replies,
-                    *no_rolling_capture_protocol_replies,
-                ),
-                capture_images: bool_override(*rolling_capture_images, *no_rolling_capture_images),
-            };
-            run_server_start(
-                *daemon,
-                *foreground_internal,
-                rolling_enabled_override,
-                rolling_options,
-                pane_shell_integration_override,
-                None,
-            )
-            .await
-        }
+        (BuiltInHandlerId::ServerStart, _) => dispatch_server_start(command).await,
         (
             BuiltInHandlerId::ServerStatus,
             Command::Server {

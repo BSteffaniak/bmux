@@ -460,8 +460,8 @@ impl StartupOwnership {
 
     /// Reclaim only a refused socket previously recorded by a cooperating owner.
     /// Never infer ownership from refusal, PID liveness, executable name or mtime.
+    #[cfg(unix)]
     pub(super) async fn prepare_endpoint(&self) -> Result<()> {
-        #[cfg(unix)]
         {
             use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
             let mut receipt = String::new();
@@ -516,34 +516,55 @@ impl StartupOwnership {
             );
             std::fs::remove_file(&self.socket).context("reclaim stopped owned endpoint")?;
         }
-        #[cfg(windows)]
+        Ok(())
+    }
+
+    /// Pipes are kernel-owned: never reclaim a filesystem name for them.
+    /// Offload the synchronous pipe-open probe rather than blocking the executor.
+    #[cfg(windows)]
+    pub(super) async fn prepare_endpoint(&self) -> Result<()> {
+        self.validate_windows_claim()?;
+        let pipe_name = self.pipe_name.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            match tokio::net::windows::named_pipe::ClientOptions::new().open(&pipe_name) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => {
+                    Err(error).context("named pipe is busy or uncertain; refusing replacement")
+                }
+                Ok(_) => anyhow::bail!("selected named pipe is live; refusing replacement"),
+            }
+        })
+        .await
+        .context("join endpoint ownership probe")?
+    }
+
+    /// The OS file lock acquired above remains the startup authority; pipe
+    /// lifetime needs no on-disk bind receipt because the kernel removes the
+    /// endpoint with its final handle. Reject corrupt claims and inherited use.
+    #[cfg(windows)]
+    fn validate_windows_claim(&self) -> Result<()> {
         ensure!(
-            self.claim_file
-                .lock()
-                .map_err(|_| anyhow::anyhow!("lifetime claim poisoned"))?
-                .metadata()?
-                .len()
-                == 0,
+            self.owner_process == std::process::id(),
+            "inherited runtime lifetime claim"
+        );
+        let file = self
+            .claim_file
+            .lock()
+            .map_err(|_| anyhow::anyhow!("lifetime claim poisoned"))?;
+        let metadata = file.metadata().context("inspect runtime lifetime claim")?;
+        drop(file);
+        ensure!(
+            metadata.is_file() && metadata.len() == 0,
             "unsupported Windows lifetime claim contents"
         );
-        #[cfg(windows)]
-        match tokio::net::windows::named_pipe::ClientOptions::new().open(&self.pipe_name) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(error).context("named pipe is busy or uncertain; refusing replacement");
-            }
-            Ok(_) => anyhow::bail!("selected named pipe is live; refusing replacement"),
-        }
-        // Windows names die with the last pipe handle; first-instance bind is
-        // the final authority. Never delete files to recover a pipe name.
         Ok(())
     }
 
     /// Called immediately after each poll of the server's bind/accept future.
     /// No receipt is created for failed binds. Under the held claim, a pending
     /// first poll has performed the synchronous bind before yielding to restore.
+    #[cfg(unix)]
     pub(super) fn record_bound_endpoint(&self) -> Result<()> {
-        #[cfg(unix)]
         {
             use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
             let mut recorded = self
@@ -577,6 +598,11 @@ impl StartupOwnership {
         }
         Ok(())
     }
+
+    #[cfg(windows)]
+    pub(super) fn record_bound_endpoint(&self) -> Result<()> {
+        self.validate_windows_claim()
+    }
 }
 
 #[cfg(unix)]
@@ -602,6 +628,31 @@ fn validate_receipt(receipt: &str) -> Result<()> {
         "corrupt endpoint ownership receipt"
     );
     Ok(())
+}
+
+#[cfg(all(test, windows))]
+mod windows_claim_tests {
+    use super::*;
+
+    #[test]
+    fn bind_poll_rejects_corrupt_claim_without_releasing_exclusion() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = ConfigPaths::new(
+            root.path().join("config"),
+            root.path().join("runtime"),
+            root.path().join("data"),
+            root.path().join("state"),
+        );
+        let claim = StartupOwnership::acquire(&paths).unwrap();
+        claim.record_bound_endpoint().unwrap();
+        claim.claim_file.lock().unwrap().set_len(1).unwrap();
+        assert!(claim.record_bound_endpoint().is_err());
+        assert!(StartupOwnership::acquire(&paths).is_err());
+        claim.claim_file.lock().unwrap().set_len(0).unwrap();
+        claim.record_bound_endpoint().unwrap();
+        drop(claim);
+        assert!(StartupOwnership::acquire(&paths).is_ok());
+    }
 }
 
 #[cfg(test)]

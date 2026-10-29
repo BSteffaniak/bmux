@@ -419,12 +419,14 @@ mod tests {
     use std::sync::Arc;
 
     fn private_runtime_dir(path: &std::path::Path) {
-        let mut builder = std::fs::DirBuilder::new();
+        let builder = std::fs::DirBuilder::new();
         #[cfg(unix)]
-        {
+        let builder = {
             use std::os::unix::fs::DirBuilderExt as _;
+            let mut builder = builder;
             builder.mode(0o700);
-        }
+            builder
+        };
         builder.create(path).unwrap();
     }
 
@@ -638,7 +640,7 @@ mod tests {
                 "execution-supervisor".into(),
                 bmux_plugin_sdk::ResolvedAuxiliaryExecutable {
                     path: helper.to_string_lossy().into(),
-                    protocol_version: 7,
+                    protocol_version: 8,
                     artifact_sha256: hash,
                 },
             )]),

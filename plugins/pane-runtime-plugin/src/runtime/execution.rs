@@ -13,17 +13,13 @@ use std::sync::{
 use std::time::Duration;
 use tokio::sync::Semaphore;
 
-#[cfg(unix)]
-pub(super) const GROUP_KILL: i32 = libc::SIGKILL;
-#[cfg(not(unix))]
-pub(super) const GROUP_KILL: i32 = 9;
+use super::native_process::{self, StopAction};
 
 type SpawnAuthorization = Arc<dyn Fn() -> anyhow::Result<()> + Send + Sync>;
 
 pub(super) struct ExecutionCapture {
     pub(super) supervisor: Mutex<Option<Arc<super::supervisor::SupervisorControl>>>,
-    #[cfg(unix)]
-    pub(super) lifecycle_interrupter: Mutex<Option<std::os::unix::net::UnixStream>>,
+    pub(super) lifecycle_interrupter: Mutex<Option<super::supervisor::LifecycleInterrupter>>,
     pub(super) spawn_authorization: Mutex<Option<SpawnAuthorization>>,
     pub(super) exact_environment: Mutex<
         Option<Vec<bmux_pane_runtime_plugin_api::pane_runtime_environment_v1::EnvironmentEntry>>,
@@ -60,7 +56,6 @@ impl Default for ExecutionCapture {
     fn default() -> Self {
         Self {
             supervisor: Mutex::new(None),
-            #[cfg(unix)]
             lifecycle_interrupter: Mutex::new(None),
             spawn_authorization: Mutex::new(None),
             exact_environment: Mutex::new(None),
@@ -175,11 +170,10 @@ impl ExecutionCapture {
     }
 
     pub(super) fn interrupt_lifecycle(&self) {
-        #[cfg(unix)]
-        if let Ok(socket) = self.lifecycle_interrupter.lock()
-            && let Some(socket) = socket.as_ref()
+        if let Ok(interrupter) = self.lifecycle_interrupter.lock()
+            && let Some(interrupter) = interrupter.as_ref()
         {
-            let _ = socket.shutdown(std::net::Shutdown::Both);
+            let _ = interrupter.interrupt();
         }
     }
 
@@ -222,7 +216,22 @@ impl ExecutionCapture {
     // Keep admission, exact supervisor receipts and direct PTY authority under
     // one control fence; splitting these transitions would obscure signal safety.
     #[allow(clippy::too_many_lines)]
-    pub(super) fn signal_owned_group(&self, signal: i32) -> anyhow::Result<bool> {
+    /// Release the helper's inherited output handles only after acknowledged scope
+    /// retirement. Output capture remains pending until the reader observes EOF.
+    pub(super) fn finish_owner_retirement(
+        &self,
+        end_lifetime: impl FnOnce() -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.terminal_session_ended.load(Ordering::SeqCst),
+            "cannot retire an active terminal scope"
+        );
+        end_lifetime()?;
+        self.terminal_owner_retired.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    pub(super) fn signal_owned_group(&self, action: StopAction) -> anyhow::Result<bool> {
         // Serialize controls through their acknowledged consumption fence, so
         // concurrent cleanup callers cannot send Sweep after helper retirement.
         let supervisor_guard = self
@@ -243,19 +252,23 @@ impl ExecutionCapture {
             {
                 return Ok(false);
             }
-            let operation = if signal == GROUP_KILL {
-                crate::supervisor_protocol::Operation::Sweep {
+            let operation = match action {
+                StopAction::Force => crate::supervisor_protocol::Operation::Sweep {
                     mutation_id: "00000000-0000-4000-8000-000000000002".into(),
+                },
+                StopAction::Cooperative => {
+                    if !native_process::supports_cooperative_stop() {
+                        // Unsupported soft termination is not a cleanup failure.
+                        // Retain authority and let the bounded caller escalate.
+                        return Ok(false);
+                    }
+                    crate::supervisor_protocol::Operation::Term {
+                        mutation_id: "00000000-0000-4000-8000-000000000001".into(),
+                    }
                 }
-            } else if signal == libc::SIGTERM {
-                crate::supervisor_protocol::Operation::Term {
-                    mutation_id: "00000000-0000-4000-8000-000000000001".into(),
-                }
-            } else {
-                anyhow::bail!("unsupported supervisor signal")
             };
             let response = supervisor.request(operation)?;
-            if signal == GROUP_KILL {
+            if action == StopAction::Force {
                 anyhow::ensure!(
                     response.group_consumed || response.target_terminated,
                     "owned target termination not acknowledged"
@@ -278,7 +291,7 @@ impl ExecutionCapture {
                         retired.error.is_none(),
                         "terminal owner retirement rejected"
                     );
-                    self.terminal_owner_retired.store(true, Ordering::SeqCst);
+                    self.finish_owner_retirement(|| supervisor.end_lifetime())?;
                     self.interrupt_lifecycle();
                 }
                 // Publish stop fences only after the retirement receipt; waiter
@@ -291,55 +304,37 @@ impl ExecutionCapture {
             self.notify();
             return Ok(true);
         }
-        #[cfg(unix)]
-        {
-            if signal == GROUP_KILL && self.group_kill_issued.load(Ordering::SeqCst) {
-                return Ok(false);
-            }
-            let master = self
-                .master
-                .lock()
-                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-            let Some(master) = master.as_ref() else {
-                if self.managed_program.load(Ordering::SeqCst) {
-                    anyhow::bail!(
-                        "managed execution PTY authority released; descendant cleanup requires recovery"
-                    );
-                }
-                return Ok(false);
-            };
-            let Some(group) = master.process_group_leader().filter(|group| *group > 0) else {
-                if self.output_drained.load(Ordering::SeqCst)
-                    && !self.managed_program.load(Ordering::SeqCst)
-                {
-                    return Ok(false);
-                }
+        if action == StopAction::Force && self.group_kill_issued.load(Ordering::SeqCst) {
+            return Ok(false);
+        }
+        let master = self
+            .master
+            .lock()
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        let Some(master) = master.as_ref() else {
+            if self.managed_program.load(Ordering::SeqCst) {
                 anyhow::bail!(
-                    "PTY foreground process-group authority unavailable; descendant cleanup requires recovery"
+                    "managed execution PTY authority released; descendant cleanup requires recovery"
                 );
-            };
-            // The retained PTY, not a saved numeric PGID, supplies current group
-            // authority. Keep its ownership locked through the side effect.
-            // SAFETY: the live PTY owns this foreground group; signal numbers are
-            // selected internally and no saved/recycled PID is used.
-            let result = unsafe { libc::kill(-group, signal) };
-            if result == 0 {
-                if signal == GROUP_KILL {
-                    self.group_kill_issued.store(true, Ordering::SeqCst);
-                }
-                return Ok(true);
             }
-            let error = std::io::Error::last_os_error();
-            if error.raw_os_error() == Some(libc::ESRCH) {
+            return Ok(false);
+        };
+        // Keep the retained PTY locked through the backend side effect. A saved
+        // PID or PGID is never authority to signal a potentially recycled group.
+        let Some(signaled) = native_process::stop_foreground_group(master.as_ref(), action)? else {
+            if self.output_drained.load(Ordering::SeqCst)
+                && !self.managed_program.load(Ordering::SeqCst)
+            {
                 return Ok(false);
             }
-            Err(error.into())
+            anyhow::bail!(
+                "PTY foreground process-group authority unavailable; descendant cleanup requires recovery"
+            );
+        };
+        if signaled && action == StopAction::Force {
+            self.group_kill_issued.store(true, Ordering::SeqCst);
         }
-        #[cfg(not(unix))]
-        {
-            let _ = signal;
-            anyhow::bail!("owned PTY process-group signaling unavailable")
-        }
+        Ok(signaled)
     }
 
     pub(super) fn record_exit(&self, result: &std::io::Result<portable_pty::ExitStatus>) {
@@ -1209,7 +1204,7 @@ pub(crate) fn terminate(
                 pane.execution.signal_owned_group(signal).map_err(failed)
             })
         };
-        signal(libc::SIGTERM)?;
+        signal(StopAction::Cooperative)?;
         let deadline = tokio::time::Instant::now() + Duration::from_millis(u64::from(grace_ms));
         loop {
             authorize()?;
@@ -1225,7 +1220,7 @@ pub(crate) fn terminate(
                 .map_or(Ok(()), |result| result.map_err(failed))?;
         }
         // Failed phase is not evidence of process death.
-        signal(GROUP_KILL)?;
+        signal(StopAction::Force)?;
         await_cleanup_acknowledgement(reference, &authorize).await?;
         authorize()?;
         status(reference)
@@ -1367,6 +1362,7 @@ fn install_reserved_capture(
 
 #[cfg(test)]
 mod tests {
+    use super::StopAction;
     #[tokio::test]
     async fn execution_keeps_live_drain_and_committed_capture_distinct() {
         let root = tempfile::tempdir().unwrap();
@@ -1527,6 +1523,34 @@ mod tests {
     }
 
     #[test]
+    fn retirement_releases_lease_before_publishing_without_fabricating_eof() {
+        let capture = super::ExecutionCapture::default();
+        assert!(
+            capture
+                .finish_owner_retirement(|| panic!("active scope must retain lease"))
+                .is_err()
+        );
+        capture
+            .terminal_session_ended
+            .store(true, super::Ordering::SeqCst);
+        assert!(
+            capture
+                .finish_owner_retirement(|| anyhow::bail!("lease failure"))
+                .is_err()
+        );
+        assert!(!capture.terminal_owner_retired.load(super::Ordering::SeqCst));
+        capture
+            .finish_owner_retirement(|| {
+                assert!(!capture.terminal_owner_retired.load(super::Ordering::SeqCst));
+                assert!(!capture.output_drained.load(super::Ordering::SeqCst));
+                Ok(())
+            })
+            .unwrap();
+        assert!(capture.terminal_owner_retired.load(super::Ordering::SeqCst));
+        assert!(!capture.output_drained.load(super::Ordering::SeqCst));
+    }
+
+    #[test]
     fn natural_cleanup_completes_without_kill_or_capture_eof() {
         let capture = super::ExecutionCapture::default();
         capture
@@ -1588,8 +1612,8 @@ mod tests {
         let fence = capture.supervisor.lock().unwrap();
         let first = std::sync::Arc::clone(&capture);
         let second = std::sync::Arc::clone(&capture);
-        let a = std::thread::spawn(move || first.signal_owned_group(super::GROUP_KILL));
-        let b = std::thread::spawn(move || second.signal_owned_group(libc::SIGTERM));
+        let a = std::thread::spawn(move || first.signal_owned_group(StopAction::Force));
+        let b = std::thread::spawn(move || second.signal_owned_group(StopAction::Cooperative));
         capture
             .terminal_session_ended
             .store(true, super::Ordering::SeqCst);
@@ -1610,8 +1634,8 @@ mod tests {
         let fence = capture.supervisor.lock().unwrap();
         let first = std::sync::Arc::clone(&capture);
         let second = std::sync::Arc::clone(&capture);
-        let a = std::thread::spawn(move || first.signal_owned_group(super::GROUP_KILL));
-        let b = std::thread::spawn(move || second.signal_owned_group(libc::SIGTERM));
+        let a = std::thread::spawn(move || first.signal_owned_group(StopAction::Force));
+        let b = std::thread::spawn(move || second.signal_owned_group(StopAction::Cooperative));
         // Same fence used by natural retirement and side-effect authorization.
         capture
             .terminal_owner_retired

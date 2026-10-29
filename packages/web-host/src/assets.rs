@@ -1,12 +1,8 @@
 use std::collections::BTreeMap;
-use std::ffi::CString;
-use std::fs::File;
 use std::io::{self, Read};
-use std::os::fd::{AsRawFd, FromRawFd};
-use std::path::{Component, Path};
 use std::sync::Arc;
 
-use crate::HostConfig;
+use crate::{HostConfig, platform};
 
 #[derive(Clone, Copy, Debug)]
 pub enum ContentType {
@@ -112,39 +108,6 @@ fn safe_url(url: &str) -> bool {
     url == "/" || url.strip_prefix('/').is_some_and(safe_filename)
 }
 
-fn open_at(parent: &File, name: &str, flags: libc::c_int) -> io::Result<File> {
-    let name = CString::new(name).map_err(|_| invalid())?;
-    // SAFETY: parent is a live descriptor and name is NUL terminated. O_NOFOLLOW
-    // applies to every component separately; ownership of a successful fd is transferred.
-    let fd = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), flags, 0) };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: successful openat returned a new uniquely owned descriptor.
-    Ok(unsafe { File::from_raw_fd(fd) })
-}
-
-fn open_directory(path: &Path) -> io::Result<File> {
-    if !path.is_absolute() {
-        return Err(invalid());
-    }
-    let mut directory = File::open("/")?;
-    for component in path.components() {
-        match component {
-            Component::RootDir => {}
-            Component::Normal(name) => {
-                directory = open_at(
-                    &directory,
-                    name.to_str().ok_or_else(invalid)?,
-                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                )?;
-            }
-            _ => return Err(invalid()),
-        }
-    }
-    Ok(directory)
-}
-
 pub(crate) fn load(config: &HostConfig) -> io::Result<BTreeMap<String, LoadedAsset>> {
     if config.assets.is_empty() || config.assets.len() > 16 {
         return Err(invalid());
@@ -162,7 +125,7 @@ pub(crate) fn load(config: &HostConfig) -> io::Result<BTreeMap<String, LoadedAss
     {
         return Err(invalid());
     }
-    let directory = open_directory(&config.asset_directory)?;
+    let directory = platform::open_directory(&config.asset_directory)?;
     let mut assets = BTreeMap::new();
     let mut total = 0_usize;
     for asset in &config.assets {
@@ -173,11 +136,7 @@ pub(crate) fn load(config: &HostConfig) -> io::Result<BTreeMap<String, LoadedAss
         {
             return Err(invalid());
         }
-        let file = open_at(
-            &directory,
-            &asset.filename,
-            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
-        )?;
+        let file = platform::open_asset(&directory, &asset.filename)?;
         let metadata = file.metadata()?;
         if !metadata.is_file()
             || metadata.len() == 0
@@ -225,6 +184,8 @@ pub(crate) fn load(config: &HostConfig) -> io::Result<BTreeMap<String, LoadedAss
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::platform::open_directory;
+    use std::path::Path;
 
     #[test]
     fn defaults_include_only_explicit_bounded_stylesheet() {

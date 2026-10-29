@@ -197,6 +197,7 @@ pub fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::os::unix::fs::symlink;
 
     fn graph() -> tempfile::TempDir {
@@ -264,6 +265,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn provenance_rejects_escape_absolute_missing_and_symlink_dependencies() {
         let directory = graph();
@@ -295,6 +297,7 @@ mod tests {
         assert!(inputs(root).is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn provenance_rejects_symlink_source_resource_and_manifest() {
         let directory = graph();

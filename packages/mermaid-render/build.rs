@@ -8,6 +8,7 @@ use std::process::Command;
 
 use bmux_fonts::DIAGRAM_FONT;
 
+mod build_worker;
 mod guest_build;
 mod wasm_config;
 
@@ -25,7 +26,7 @@ fn main() {
     }
 }
 
-fn build() -> Result<(), Box<dyn std::error::Error>> {
+fn build() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let manifest_dir =
         PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").ok_or("missing manifest dir")?);
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").ok_or("missing OUT_DIR")?);
@@ -108,11 +109,18 @@ fn build() -> Result<(), Box<dyn std::error::Error>> {
     if fs::read(&destination).ok().as_deref() != Some(wasm.as_slice()) {
         fs::write(destination, &wasm)?;
     }
-    precompile(&wasm, &destination_target, &out_dir)?;
+    // Compile both variants on an owned native stack, not the build script's
+    // platform-dependent main stack. Target/configuration/artifact identity stay
+    // exactly the same; a worker or compiler failure still fails the build.
+    build_worker::run(|| precompile(&wasm, &destination_target, &out_dir))??;
     Ok(())
 }
 
-fn precompile(wasm: &[u8], target: &str, out_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
+fn precompile(
+    wasm: &[u8],
+    target: &str,
+    out_dir: &Path,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let destination = target
         .parse()
         .map_err(|error| format!("invalid Mermaid target {target}: {error}"))?;

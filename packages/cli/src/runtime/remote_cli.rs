@@ -2622,10 +2622,10 @@ fn open_browser(url: &str) -> bool {
     }
     #[cfg(target_os = "windows")]
     {
-        return std::process::Command::new("cmd")
+        std::process::Command::new("cmd")
             .args(["/C", "start", "", url])
             .status()
-            .is_ok_and(|status| status.success());
+            .is_ok_and(|status| status.success())
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {

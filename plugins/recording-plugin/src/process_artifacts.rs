@@ -1,6 +1,9 @@
 //! Derived process artifacts from canonical recording segments, never a PTY authority.
 //!
-//! `output.pty` concatenates only selected `PaneOutputRaw` bytes, without decoding.
+//! `output.pty` preserves the independently copied execution raw source for whole
+//! process exports when present; legacy/scoped exports concatenate selected
+//! `PaneOutputRaw` events. Presentation events may omit bootstrap queries.
+//! Neither path decodes or fabricates raw bytes or event envelopes.
 //! `events.jsonl` contains the unchanged protocol envelopes; serde encodes binary
 //! fields as JSON arrays of unsigned bytes (not lossy UTF-8 strings).
 //! `output.txt` is a readable transcript, not a terminal screen: ANSI CSI and
@@ -24,7 +27,7 @@ use bmux_recording_protocol::{
 };
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashSet};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use uuid::Uuid;
@@ -151,6 +154,9 @@ pub(crate) fn export_process_artifacts_selected(
         &mut events,
     )?;
     finish_writer(raw)?;
+    if let Some(count) = export_raw_source(recording_dir, &staging.path, options)? {
+        report.output_bytes = count;
+    }
     finish_writer(text)?;
     finish_writer(events)?;
     let mut names = Vec::new();
@@ -189,7 +195,10 @@ pub(crate) fn export_process_artifacts_selected(
             gif_path.to_str().context("GIF path is not UTF-8")?,
             fps,
         )?;
-        let file = File::open(&gif_path)?;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&gif_path)?;
         ensure!(
             file.metadata()?.len() <= options.max_artifact_bytes,
             "GIF artifact limit exceeded"
@@ -202,51 +211,20 @@ pub(crate) fn export_process_artifacts_selected(
         file.sync_all()?;
         names.push("output.gif");
     }
-    File::open(&staging.path)?.sync_all()?;
+    crate::platform::sync_directory(&staging.path)?;
     ensure!(
         !output_dir.try_exists()?,
         "artifact directory appeared during export"
     );
     publish_directory_noreplace(&staging.path, output_dir)?;
-    File::open(parent)?
-        .sync_all()
-        .context("syncing artifact parent after publication")?;
+    crate::platform::sync_directory(parent).context("syncing artifact parent after publication")?;
     report.artifacts = names.iter().map(|name| output_dir.join(name)).collect();
     Ok(report)
 }
 
 fn publish_directory_noreplace(source: &Path, target: &Path) -> Result<()> {
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    {
-        use std::os::unix::ffi::OsStrExt;
-        let source = std::ffi::CString::new(source.as_os_str().as_bytes())?;
-        let target = std::ffi::CString::new(target.as_os_str().as_bytes())?;
-        // Both paths point into the caller-owned export parent. The kernel
-        // atomically rejects any competing destination, including empty dirs.
-        #[cfg(target_os = "macos")]
-        let result =
-            unsafe { libc::renamex_np(source.as_ptr(), target.as_ptr(), libc::RENAME_EXCL) };
-        #[cfg(target_os = "linux")]
-        let result = unsafe {
-            libc::renameat2(
-                libc::AT_FDCWD,
-                source.as_ptr(),
-                libc::AT_FDCWD,
-                target.as_ptr(),
-                libc::RENAME_NOREPLACE,
-            )
-        };
-        if result != 0 {
-            return Err(std::io::Error::last_os_error())
-                .context("publishing artifacts without replacement");
-        }
-        Ok(())
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
-        let _ = (source, target);
-        bail!("atomic no-replace artifact publication is unsupported on this platform")
-    }
+    crate::platform::publish_noreplace(source, target)
+        .context("publishing artifacts without replacement")
 }
 
 #[cfg(test)]
@@ -357,6 +335,28 @@ pub(crate) fn verify_canonical_totals(
     Ok(())
 }
 
+fn export_raw_source(
+    recording_dir: &Path,
+    staging: &Path,
+    options: &ProcessArtifactOptions,
+) -> Result<Option<u64>> {
+    // Process recordings retain the original PTY source independently of the
+    // presentation events (which may consume bootstrap terminal queries).
+    // Never synthesize event envelopes/timestamps for these additional bytes.
+    if options.scope.session.is_none()
+        && options.scope.pane.is_none()
+        && recording_dir.join("output.raw").try_exists()?
+    {
+        fs::remove_file(staging.join("output.pty"))?;
+        let mut source = File::open(recording_dir.join("output.raw"))?;
+        let mut raw = artifact_writer(&staging.join("output.pty"), options.max_artifact_bytes)?;
+        let count = std::io::copy(&mut source, &mut raw)?;
+        finish_writer(raw)?;
+        return Ok(Some(count));
+    }
+    Ok(None)
+}
+
 fn validate_options(options: &ProcessArtifactOptions) -> Result<()> {
     ensure!(
         options.scope.execution.is_none(),
@@ -460,15 +460,8 @@ impl Write for LimitedWriter {
 }
 
 fn artifact_writer(path: &Path, limit: u64) -> Result<LimitedWriter> {
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
     Ok(LimitedWriter {
-        inner: BufWriter::new(options.open(path)?),
+        inner: BufWriter::new(crate::platform::create_new(path)?),
         remaining: limit,
     })
 }
@@ -486,14 +479,7 @@ struct Staging {
 impl Staging {
     fn create(parent: &Path) -> Result<Self> {
         let path = parent.join(format!(".bmux-artifacts-{}", Uuid::new_v4()));
-        let mut builder = fs::DirBuilder::new();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            builder.mode(0o700);
-        }
-        builder
-            .create(&path)
+        crate::platform::create_private_directory(&path)
             .context("creating private artifact staging directory")?;
         Ok(Self { path })
     }
@@ -740,6 +726,31 @@ mod tests {
             );
             assert!(!output.exists());
         }
+        Ok(())
+    }
+
+    #[test]
+    fn independent_raw_export_keeps_bootstrap_bytes_without_inventing_events() -> Result<()> {
+        let projected = b"visible target output";
+        let original = event(1, Uuid::new_v4(), Uuid::new_v4(), projected);
+        let (source, _) = fixture(std::slice::from_ref(&original))?;
+        let raw = [b"\x1b[6n".as_slice(), projected.as_slice()].concat();
+        fs::write(source.path.join("output.raw"), &raw)?;
+        fs::write(source.path.join("output.live"), projected)?;
+        let output = source.path.join("artifacts");
+        let report = export_process_artifacts(
+            &source.path,
+            &output,
+            &ProcessArtifactOptions::default(),
+            None,
+        )?;
+        assert_eq!(report.output_bytes, u64::try_from(raw.len())?);
+        assert_eq!(fs::read(output.join("output.pty"))?, raw);
+        assert_eq!(fs::read(source.path.join("output.live"))?, projected);
+        let exported: ProcessRecordingEvent =
+            serde_json::from_slice(&fs::read(output.join("events.jsonl"))?)?;
+        assert_eq!(exported, original);
+        assert_eq!(report.selected_events, 1);
         Ok(())
     }
 

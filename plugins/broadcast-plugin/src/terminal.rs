@@ -1,5 +1,5 @@
 //! Private retained terminal adapter. Never invokes PATH or creates an input surface.
-#[cfg(all(test, unix))]
+#[cfg(test)]
 #[path = "terminal_tests.rs"]
 mod tests;
 use sha2::{Digest, Sha256};
@@ -60,21 +60,8 @@ impl RuntimeSelection {
     }
 }
 
-#[cfg(unix)]
-fn observer_directory() -> Result<tempfile::TempDir, &'static str> {
-    use std::os::unix::fs::PermissionsExt;
-    let directory = tempfile::Builder::new()
-        .prefix("bmux-bo-")
-        .tempdir_in("/tmp")
-        .map_err(|_| "observer_directory")?;
-    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
-        .map_err(|_| "observer_directory")?;
-    Ok(directory)
-}
-
 /// Latest complete self-contained retained output; EOF invalidates the channel.
 /// Parent explicitly selects the target and admits exactly one worker's BMAO1 epoch.
-#[cfg(unix)]
 pub async fn observe(
     selection: RuntimeSelection,
     target: Uuid,
@@ -95,18 +82,18 @@ pub async fn observe(
     // Library/Application Support paths) plus a UUID can exceed that limit.
     // This is only a private output rendezvous; the observer still connects to
     // the explicitly selected daemon through the unchanged ConfigPaths.
-    let directory = observer_directory()?;
-    let socket = directory.path().join("out.sock");
+    let mut listener = crate::platform::ObserverListener::bind().map_err(|_| "observer_socket")?;
+    let socket = listener.endpoint().to_path_buf();
     let result = async {
-        let listener = tokio::net::UnixListener::bind(&socket).map_err(|_| "observer_socket")?;
         let mut command = tokio::process::Command::new(&selection.executable);
         command.env_clear();
-        for name in ["HOME", "USER", "SHELL", "LANG", "TERM"] {
+        for name in ["HOME", "USER", "SHELL", "LANG", "TERM", "SystemRoot", "WINDIR"] {
             if let Some(value) = std::env::var_os(name) {
                 command.env(name, value);
             }
         }
         let mut child = command
+            .env("BMUX_OBSERVER_PARENT_PID", std::process::id().to_string())
             .env("BMUX_CONFIG_DIR", &selection.paths.config_dir)
             .env("BMUX_RUNTIME_DIR", &selection.paths.runtime_dir)
             .env("BMUX_DATA_DIR", &selection.paths.data_dir)
@@ -126,8 +113,8 @@ pub async fn observe(
             .spawn()
             .map_err(|_| "observer_launch")?;
         let result = async {
-            let (stream, _) = tokio::select! {
-                accepted = tokio::time::timeout(Duration::from_secs(5), listener.accept()) => {
+            let stream = tokio::select! {
+                accepted = tokio::time::timeout(Duration::from_secs(5), listener.accept(child.id().ok_or("observer_exited")?)) => {
                     accepted.map_err(|_| "observer_timeout")?.map_err(|_| "observer_connect")?
                 }
                 status = child.wait() => {
@@ -147,14 +134,11 @@ pub async fn observe(
     }
     .await;
     sender.send_replace(None);
-    let _ = std::fs::remove_file(&socket);
-    let _ = directory.close();
     result
 }
 
-#[cfg(unix)]
 async fn read_output(
-    mut stream: tokio::net::UnixStream,
+    mut stream: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     target: Uuid,
     sender: &watch::Sender<Option<Arc<[u8]>>>,
 ) -> Result<(), &'static str> {

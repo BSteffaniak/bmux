@@ -104,33 +104,15 @@ fn resolve_program(program: &str) -> Result<PathBuf> {
         let path = std::env::var_os("PATH").context("PATH is not set")?;
         std::env::split_paths(&path)
             .map(|entry| entry.join(program))
-            .find(|candidate| executable(candidate))
+            .find(|candidate| crate::platform::executable(candidate))
             .with_context(|| format!("program not found on caller PATH: {program}"))?
     };
     ensure!(
-        executable(&candidate),
+        crate::platform::executable(&candidate),
         "program is not an executable file: {}",
         candidate.display()
     );
     std::fs::canonicalize(candidate).context("resolving executable")
-}
-
-fn executable(path: &Path) -> bool {
-    let Ok(metadata) = path.metadata() else {
-        return false;
-    };
-    if !metadata.is_file() {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        metadata.permissions().mode() & 0o111 != 0
-    }
-    #[cfg(not(unix))]
-    {
-        true
-    }
 }
 
 fn launch_options(options: &Options) -> Result<process::ProgramOptions> {
@@ -159,21 +141,6 @@ fn launch_options(options: &Options) -> Result<process::ProgramOptions> {
     })
 }
 
-fn caller_environment()
--> Vec<bmux_pane_runtime_plugin_api::pane_runtime_environment_v1::EnvironmentEntry> {
-    use std::os::unix::ffi::OsStringExt;
-    let mut entries: Vec<_> = std::env::vars_os()
-        .map(|(key, value)| {
-            bmux_pane_runtime_plugin_api::pane_runtime_environment_v1::EnvironmentEntry {
-                key: key.into_vec(),
-                value: value.into_vec(),
-            }
-        })
-        .collect();
-    entries.sort_by(|a, b| a.key.cmp(&b.key));
-    entries
-}
-
 pub(crate) fn run(context: &NativeCommandContext) -> i32 {
     if context
         .arguments
@@ -197,14 +164,14 @@ pub(crate) fn run(context: &NativeCommandContext) -> i32 {
         ensure!(std::io::stdin().is_terminal() && std::io::stdout().is_terminal(),
             "bmux record requires an interactive terminal on stdin and stdout; use bmux recording process run for headless execution");
         let launch = launch_options(&options)?;
-        let environment = caller_environment();
+        let environment = crate::platform::caller_environment();
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
         runtime.block_on(execute(&owned, options, launch, environment))
     }).join().map_err(|_| anyhow::anyhow!("record command worker panicked")).and_then(|result| result);
     let (value, code) = match result {
         Ok(result) => result,
         Err(error) => (
-            serde_json::json!({"schema_version":4,"ok":false,"error":error.to_string(),"artifacts":[]}),
+            serde_json::json!({"schema_version":4,"ok":false,"error":format!("{error:#}"),"artifacts":[]}),
             1,
         ),
     };
@@ -389,29 +356,19 @@ fn publish_gif(source: &Path, destination: &Path) -> Result<()> {
     let temporary = parent.join(format!(".bmux-gif-{}.tmp", Uuid::new_v4()));
     let result = (|| -> Result<()> {
         let mut source = std::fs::File::open(source)?;
-        let mut target = std::fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&temporary)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            target.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        }
+        let mut target = crate::platform::create_new(&temporary)?;
         std::io::copy(&mut source, &mut target)?;
         target.flush()?;
         target.sync_all()?;
-        // Link publishes only the fully committed file and fails if the requested
-        // path exists. Unlike rename, this cannot overwrite a racing destination.
-        std::fs::hard_link(&temporary, destination)?;
-        std::fs::File::open(parent)?.sync_all()?;
+        drop(target);
+        crate::platform::publish_noreplace(&temporary, destination)
+            .context("publishing GIF without replacing destination")?;
         Ok(())
     })();
-    let cleanup = std::fs::remove_file(&temporary);
-    result?;
-    cleanup.context("removing GIF publication staging file")?;
-    std::fs::File::open(parent)?.sync_all()?;
-    Ok(())
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
 }
 
 #[cfg(test)]

@@ -660,16 +660,16 @@ fn terminate_process_group(process_group_id: i32) -> bool {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+        .is_ok_and(|status| status.success());
 
     std::thread::sleep(Duration::from_millis(120));
 
     let still_alive = std::process::Command::new("tasklist")
         .args(["/FI", &format!("PID eq {pid}"), "/NH"])
         .output()
-        .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).contains(&pid))
-        .unwrap_or(false);
+        .is_ok_and(|output| {
+            output.status.success() && String::from_utf8_lossy(&output.stdout).contains(&pid)
+        });
 
     if still_alive {
         return std::process::Command::new("taskkill")
@@ -677,8 +677,7 @@ fn terminate_process_group(process_group_id: i32) -> bool {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
+            .is_ok_and(|status| status.success())
             || sent_term;
     }
     sent_term

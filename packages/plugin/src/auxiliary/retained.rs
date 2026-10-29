@@ -84,12 +84,14 @@ pub(super) fn retain(
 }
 
 fn private_directory(path: &Path) -> Result<(), String> {
-    let mut builder = std::fs::DirBuilder::new();
+    let builder = std::fs::DirBuilder::new();
     #[cfg(unix)]
-    {
+    let builder = {
         use std::os::unix::fs::DirBuilderExt as _;
+        let mut builder = builder;
         builder.mode(0o700);
-    }
+        builder
+    };
     match builder.create(path) {
         Ok(()) => {
             #[cfg(unix)]

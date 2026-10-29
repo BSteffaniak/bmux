@@ -70,13 +70,7 @@ fn create_dedicated_root(base: &Path) -> Result<PathBuf> {
         let root = base.join(dedicated_root_name());
         // Validate before creating state; never escape the selected volume.
         validate_runtime_socket(&root)?;
-        let mut builder = std::fs::DirBuilder::new();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            builder.mode(0o700);
-        }
-        match builder.create(&root) {
+        match crate::platform::create_private_directory(&root) {
             Ok(()) => return Ok(root),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(error) => return Err(error.into()),
@@ -86,35 +80,35 @@ fn create_dedicated_root(base: &Path) -> Result<PathBuf> {
 }
 
 fn validate_runtime_socket(root: &Path) -> Result<()> {
-    #[cfg(unix)]
-    {
-        let socket = paths(root).server_socket();
-        std::os::unix::net::SocketAddr::from_pathname(&socket).with_context(|| {
-            format!("dedicated Unix socket path exceeds platform bounds or is invalid: {}; select a shorter owned TMPDIR; target not launched", socket.display())
-        })?;
-    }
-    #[cfg(not(unix))]
-    let _ = root;
-    Ok(())
+    crate::platform::validate_runtime_socket(&paths(root).server_socket())
+        .context("dedicated runtime endpoint invalid; target not launched")
 }
 
 fn configure_isolated_slot(command: &mut Command, root: &Path, executable: &Path) -> Result<()> {
     let name = executable
-        .file_stem()
+        .file_name()
         .and_then(|name| name.to_str())
+        .map(|name| {
+            if cfg!(windows) {
+                name.strip_suffix(".exe").unwrap_or(name)
+            } else {
+                name
+            }
+        })
         .and_then(|name| name.strip_prefix("bmux-"));
     if let Some(name) = name {
         ensure!(
             !name.is_empty()
                 && name
                     .chars()
-                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_'),
+                    .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.')),
             "invalid installed slot name"
         );
         let quoted = |path: &Path| serde_json::to_string(&path.to_string_lossy());
         let manifest = root.join("config/slots.toml");
         let contents = format!(
-            "[slots.{name}]\nbinary = {}\ninherit_base = false\nconfig_dir = {}\nruntime_dir = {}\ndata_dir = {}\nstate_dir = {}\nlog_dir = {}\n",
+            "[slots.{}]\nbinary = {}\ninherit_base = false\nconfig_dir = {}\nruntime_dir = {}\ndata_dir = {}\nstate_dir = {}\nlog_dir = {}\n",
+            serde_json::to_string(name)?,
             quoted(executable)?,
             quoted(&root.join("config"))?,
             quoted(&root.join("runtime"))?,
@@ -198,8 +192,18 @@ fn same_hash_file(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
 fn start_owned(root: &Path, executable: &Path) -> Result<std::process::Output> {
     let paths = paths(root);
     ensure!(executable.is_absolute(), "BMUX executable is not absolute");
+    let diagnostics_path = root.join(format!("server-launch-{}.stderr", Uuid::new_v4()));
+    let diagnostics = crate::platform::create_new(&diagnostics_path)
+        .context("creating dedicated server launch diagnostics")?;
     let mut command = Command::new(executable);
     command.env_clear();
+    // Preserve OS loader context and the same endpoint namespace as the caller.
+    // These select paths/loader behavior, not authorization identity.
+    for name in ["SystemRoot", "WINDIR", "USER", "USERNAME", "USERDOMAIN"] {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
+        }
+    }
     configure_isolated_slot(&mut command, root, executable)?;
     command.env(
         "PATH",
@@ -228,7 +232,7 @@ fn start_owned(root: &Path, executable: &Path) -> Result<std::process::Output> {
         .args(["server", "start", "--daemon"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::from(diagnostics));
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -243,9 +247,39 @@ fn start_owned(root: &Path, executable: &Path) -> Result<std::process::Output> {
             });
         }
     }
-    command
-        .output()
-        .context("starting dedicated recorded-program server")
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        use windows_sys::Win32::System::Threading::{CREATE_BREAKAWAY_FROM_JOB, DETACHED_PROCESS};
+        // A dedicated recording runtime outlives its caller's console and SSH
+        // job. If the enclosing job forbids breakaway, fail rather than launch
+        // a runtime whose lifetime silently depends on the caller.
+        command.creation_flags(DETACHED_PROCESS | CREATE_BREAKAWAY_FROM_JOB);
+    }
+    // Do not capture a pipe: daemon descendants may retain its write handle,
+    // so output()/wait_with_output() can wait forever after the launcher exits.
+    let status = command
+        .status()
+        .context("starting dedicated recorded-program server")?;
+    let stderr = read_launch_diagnostics(&diagnostics_path)?;
+    Ok(std::process::Output {
+        status,
+        stdout: Vec::new(),
+        stderr,
+    })
+}
+
+fn read_launch_diagnostics(path: &Path) -> Result<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file =
+        std::fs::File::open(path).context("opening dedicated server launch diagnostics")?;
+    let length = file.metadata()?.len();
+    file.seek(SeekFrom::Start(length.saturating_sub(16_384)))?;
+    let mut bytes = Vec::new();
+    file.take(16_384)
+        .read_to_end(&mut bytes)
+        .context("reading dedicated server launch diagnostics")?;
+    Ok(bytes)
 }
 
 pub(crate) async fn bootstrap(context: &NativeCommandContext) -> Result<DedicatedRuntime> {
@@ -253,11 +287,15 @@ pub(crate) async fn bootstrap(context: &NativeCommandContext) -> Result<Dedicate
     crate::durable::private_directory(&index)?;
     let base = std::fs::canonicalize(std::env::temp_dir())
         .context("resolving dedicated platform temporary parent (TMPDIR)")?;
-    let root = create_dedicated_root(&base)?;
+    let root = create_dedicated_root(&base).context("allocating private dedicated runtime root")?;
     let paths = paths(&root);
-    paths.ensure_dirs()?;
-    std::fs::create_dir(root.join("home"))?;
-    std::fs::create_dir(root.join("tmp"))?;
+    paths
+        .ensure_dirs()
+        .context("creating dedicated runtime paths")?;
+    crate::platform::create_private_directory(&root.join("home"))
+        .context("creating dedicated home")?;
+    crate::platform::create_private_directory(&root.join("tmp"))
+        .context("creating dedicated temporary directory")?;
     let config = isolated_config(context, &paths)?;
     let config_file = paths.config_dir.join("bmux.toml");
     crate::durable::write_atomic(&config_file, config.as_bytes())?;
@@ -608,14 +646,11 @@ pub(crate) fn record_launch(
     crate::durable::private_directory(&root)?;
     if id.is_none() {
         use std::io::Write;
-        let mut claim = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(root.join(format!("launch-{key}.claim")))
+        let mut claim = crate::platform::create_new(&root.join(format!("launch-{key}.claim")))
             .context("launch identity already admitted; refusing ambiguous duplicate")?;
         claim.write_all(b"admitted")?;
         claim.sync_all()?;
-        std::fs::File::open(&root)?.sync_all()?;
+        crate::platform::sync_directory(&root).context("publishing launch admission directory")?;
     }
     crate::durable::write_atomic(
         &root.join(format!("launch-{key}.json")),
@@ -761,7 +796,11 @@ mod tests {
             .join("x".repeat(300))
             .join(format!("bmux-recorded-{}", Uuid::nil()));
         let error = validate_runtime_socket(&root).unwrap_err();
-        assert!(error.to_string().contains("shorter owned TMPDIR"));
+        // The Unix backend owns socket limits and their actionable diagnostic.
+        let diagnostic = format!("{error:#}");
+        assert!(diagnostic.contains("dedicated runtime endpoint invalid; target not launched"));
+        assert!(diagnostic.contains("Unix socket path exceeds platform bounds"));
+        assert!(diagnostic.contains("select shorter TMPDIR"));
         assert!(!root.exists());
     }
 }
@@ -774,4 +813,71 @@ fn fingerprint(args: &[String]) -> Result<String> {
         write!(&mut encoded, "{byte:02x}")?;
     }
     Ok(encoded)
+}
+
+#[cfg(test)]
+mod launch_diagnostic_tests {
+    use super::*;
+
+    #[test]
+    fn launch_diagnostic_tail_is_bounded_and_reads_without_eof() {
+        use std::io::Write;
+        let root = std::env::temp_dir().join(format!("bmux-launch-log-{}", Uuid::new_v4()));
+        crate::durable::private_directory(&root).unwrap();
+        let path = root.join("launch.stderr");
+        let mut writer = crate::platform::create_new(&path).unwrap();
+        writer.write_all(&vec![b'x'; 20_000]).unwrap();
+        writer.write_all(b"last startup failure").unwrap();
+        writer.flush().unwrap();
+        // A live descendant can retain this writer: reading the file tail must
+        // not depend on every inheriting process closing it, unlike a pipe EOF.
+        let bytes = read_launch_diagnostics(&path).unwrap();
+        assert_eq!(bytes.len(), 16_384);
+        assert!(bytes.ends_with(b"last startup failure"));
+        drop(writer);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod installed_slot_tests {
+    use super::*;
+
+    #[test]
+    fn dotted_installed_slot_is_one_quoted_manifest_key_and_stays_isolated() {
+        let root = std::env::temp_dir().join(format!("bmux-slot-test-{}", Uuid::new_v4()));
+        crate::durable::private_directory(&root.join("config")).unwrap();
+        let executable = root.join(if cfg!(windows) {
+            "bmux-release.1.exe"
+        } else {
+            "bmux-release.1"
+        });
+        let mut command = Command::new(&executable);
+        configure_isolated_slot(&mut command, &root, &executable).unwrap();
+        let manifest = root.join("config/slots.toml");
+        let contents = std::fs::read_to_string(&manifest).unwrap();
+        assert!(contents.starts_with("[slots.\"release.1\"]\n"));
+        assert!(contents.contains(&format!(
+            "binary = {}",
+            serde_json::to_string(&executable.to_string_lossy()).unwrap()
+        )));
+        let env: std::collections::BTreeMap<_, _> = command.get_envs().collect();
+        assert_eq!(
+            env.get(std::ffi::OsStr::new("BMUX_SLOT_NAME")),
+            Some(&Some(std::ffi::OsStr::new("release.1")))
+        );
+        assert_eq!(
+            env.get(std::ffi::OsStr::new("BMUX_SLOTS_MANIFEST")),
+            Some(&Some(manifest.as_os_str()))
+        );
+        configure_isolated_slot(&mut command, &root, &executable).unwrap();
+        let other = root.join(if cfg!(windows) {
+            "bmux-other.1.exe"
+        } else {
+            "bmux-other.1"
+        });
+        assert!(configure_isolated_slot(&mut command, &root, &other).is_err());
+        assert_eq!(std::fs::read_to_string(&manifest).unwrap(), contents);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

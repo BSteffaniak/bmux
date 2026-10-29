@@ -1,8 +1,10 @@
 //! Fresh-process supervisor. Never runs a post-fork Rust loop in the daemon.
+#[cfg(unix)]
 #[path = "../atomic_state.rs"]
 mod atomic_state;
 #[path = "../supervisor_protocol.rs"]
 mod protocol;
+#[cfg(unix)]
 #[path = "../supervisor_receipts.rs"]
 mod receipts;
 
@@ -13,6 +15,16 @@ mod session_guardian;
 #[cfg(unix)]
 #[path = "execution_supervisor/session_cleanup.rs"]
 mod session_cleanup;
+
+#[cfg(windows)]
+#[path = "execution_supervisor/windows.rs"]
+mod windows;
+#[cfg(windows)]
+#[path = "execution_supervisor/windows_job.rs"]
+mod windows_job;
+#[cfg(windows)]
+#[path = "execution_supervisor/windows_security.rs"]
+mod windows_security;
 
 #[cfg(unix)]
 mod unix {
@@ -83,6 +95,23 @@ fn main() {
             std::process::exit(1);
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        let args: Vec<_> = std::env::args().collect();
+        let result = match args.get(1).map(String::as_str) {
+            Some("--guardian-windows-session-v1") if args.len() == 4 => {
+                windows::run(&args[2], &args[3])
+            }
+            _ => Err(std::io::Error::other(
+                "unsupported execution supervisor invocation",
+            )),
+        };
+        if let Err(error) = result {
+            // Never print argv, bootstrap contents, or the authentication secret.
+            eprintln!("Windows execution supervisor failed: {error}");
+            std::process::exit(1);
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
     std::process::exit(1);
 }

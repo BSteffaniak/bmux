@@ -102,11 +102,15 @@ pub(super) fn owner(launch_path: &str, outcome_path: &str) -> io::Result<()> {
         cwd,
         env,
         native_env,
+        native_env_encoding,
         ..
     } = operation
     else {
         return Err(io::Error::other("terminal owner requires start operation"));
     };
+    if !matches!(native_env_encoding.as_deref(), None | Some("unix-bytes")) {
+        return Err(io::Error::other("unsupported Unix environment encoding"));
+    }
     // SAFETY: signal disposition belongs to this fresh helper only. Target resets it.
     unsafe {
         libc::signal(libc::SIGHUP, libc::SIG_IGN);
@@ -420,6 +424,11 @@ impl Guardian {
 
     fn apply(&mut self, operation: &Operation) -> io::Result<Response> {
         match operation {
+            Operation::BindLifetime => {
+                return Err(io::Error::other(
+                    "Unix guardian uses its inherited lifetime lease",
+                ));
+            }
             Operation::Hello | Operation::Status => {}
             Operation::Subscribe { .. } => {
                 return Err(io::Error::other(
@@ -578,7 +587,10 @@ impl Guardian {
             | Operation::Term { mutation_id }
             | Operation::Sweep { mutation_id }
             | Operation::RetireOwner { mutation_id } => Some(mutation_id),
-            Operation::Hello | Operation::Status | Operation::Subscribe { .. } => None,
+            Operation::Hello
+            | Operation::Status
+            | Operation::Subscribe { .. }
+            | Operation::BindLifetime => None,
         };
         let fingerprint = serde_json::to_vec(&request.operation).map_err(io::Error::other)?;
         let admitted = if let Some(mutation) = mutation {
@@ -922,6 +934,7 @@ mod tests {
             cwd: None,
             env: BTreeMap::new(),
             native_env: None,
+            native_env_encoding: None,
         }
     }
     fn disconnected_owner_fixture() -> (tempfile::TempDir, Guardian) {

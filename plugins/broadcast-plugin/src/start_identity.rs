@@ -12,16 +12,7 @@ pub(crate) fn claim(root: &Path, source: &str) -> Result<(), &'static str> {
     {
         return Err("start_identity_limit");
     }
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
-    }
-    let mut file = options.open(directory.join(id.to_string())).map_err(|e| {
+    let mut file = crate::platform::create_new(&directory.join(id.to_string())).map_err(|e| {
         if e.kind() == std::io::ErrorKind::AlreadyExists {
             "start_identity_superseded"
         } else {
@@ -30,7 +21,7 @@ pub(crate) fn claim(root: &Path, source: &str) -> Result<(), &'static str> {
     })?;
     file.write_all(b"broadcast-start-v1\n")
         .and_then(|()| file.sync_all())
-        .and_then(|()| std::fs::File::open(&directory)?.sync_all())
+        .and_then(|()| crate::platform::sync_directory(&directory))
         .map_err(|_| "start_identity_unwritable")
 }
 #[cfg(test)]

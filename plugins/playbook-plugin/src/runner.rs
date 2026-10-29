@@ -142,13 +142,7 @@ impl Owner {
             }
         }
         let root = attempts_root.join(format!("playbook-{}", uuid::Uuid::new_v4()));
-        let mut private_dir = fs::DirBuilder::new();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt as _;
-            private_dir.mode(0o700);
-        }
-        private_dir.create(&root).map_err(message)?;
+        create_private_directory(&root).map_err(message)?;
         let sandbox = root.join("sandbox");
         let mut temporary = tempfile::Builder::new();
         temporary.prefix("bpr-");
@@ -674,6 +668,17 @@ fn read_bounded(path: &Path) -> Result<Vec<u8>> {
         return Err("worker channel exceeds size limit".into());
     }
     Ok(bytes)
+}
+
+#[cfg(unix)]
+fn create_private_directory(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt as _;
+    fs::DirBuilder::new().mode(0o700).create(path)
+}
+
+#[cfg(not(unix))]
+fn create_private_directory(path: &Path) -> std::io::Result<()> {
+    fs::DirBuilder::new().create(path)
 }
 
 fn message(error: impl std::fmt::Display) -> String {

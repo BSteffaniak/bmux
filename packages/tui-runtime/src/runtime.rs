@@ -411,6 +411,9 @@ where
     ///
     /// Returns [`RuntimeError::Program`] for update errors and [`RuntimeError::Presenter`] for
     /// presentation errors. Both variants retain final program and presenter ownership.
+    // Errors intentionally return the owned program and presenter for terminal
+    // restoration and recovery. Boxing would change this public ownership API.
+    #[allow(clippy::result_large_err)]
     pub async fn run(
         mut self,
     ) -> Result<RuntimeOutput<P, R>, RuntimeError<P::Error, R::Error, P, R>> {

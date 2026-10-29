@@ -153,7 +153,7 @@ impl RecordingRuntime {
             anyhow::bail!("recording already active")
         }
 
-        std::fs::create_dir_all(&self.root_dir).with_context(|| {
+        crate::durable::private_directory(&self.root_dir).with_context(|| {
             format!(
                 "failed creating recordings root {}",
                 self.root_dir.display()
@@ -164,10 +164,10 @@ impl RecordingRuntime {
         let name = normalize_recording_name(name)?;
         let started_epoch_ms = epoch_millis_now();
         let dir = self.root_dir.join(id.to_string());
-        std::fs::create_dir_all(&dir)
+        crate::durable::private_directory(&dir)
             .with_context(|| format!("failed creating recording dir {}", dir.display()))?;
 
-        std::fs::File::open(&self.root_dir)?.sync_all()?;
+        crate::platform::sync_directory(&self.root_dir)?;
         let manifest_path = dir.join(MANIFEST_FILE_NAME);
         let summary = RecordingSummary {
             id,
@@ -595,7 +595,7 @@ pub fn execute_recording_cut(plan: RecordingCutPlan) -> Result<RecordingSummary>
         event.mono_ns = event.mono_ns.saturating_sub(first_mono_ns);
     }
 
-    std::fs::create_dir_all(&plan.output_root).with_context(|| {
+    crate::durable::private_directory(&plan.output_root).with_context(|| {
         format!(
             "failed creating recording cut output root {}",
             plan.output_root.display()
@@ -604,7 +604,7 @@ pub fn execute_recording_cut(plan: RecordingCutPlan) -> Result<RecordingSummary>
 
     let id = Uuid::new_v4();
     let cut_dir = plan.output_root.join(id.to_string());
-    std::fs::create_dir_all(&cut_dir).with_context(|| {
+    crate::durable::private_directory(&cut_dir).with_context(|| {
         format!(
             "failed creating recording cut directory {}",
             cut_dir.display()
@@ -798,10 +798,7 @@ fn open_next_recording_segment(
     segment_name: &str,
 ) -> Result<BufWriter<std::fs::File>> {
     let segment_path = recording_dir.join(segment_name);
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&segment_path)
+    let file = crate::platform::open_append(&segment_path)
         .with_context(|| format!("failed opening new segment file {}", segment_path.display()))?;
     Ok(BufWriter::new(file))
 }
@@ -924,28 +921,21 @@ fn prepare_writer_files(
     segment_path: &Path,
     ready: &mpsc::SyncSender<Result<()>>,
 ) -> Result<(std::fs::File, Option<BufWriter<std::fs::File>>)> {
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(segment_path)
-        .and_then(|file| {
-            file.sync_all()?;
-            std::fs::File::open(recording_dir)?.sync_all()?;
-            Ok(file)
-        });
+    let file = crate::platform::open_append(segment_path).and_then(|file| {
+        file.sync_all()?;
+        crate::platform::sync_directory(recording_dir)?;
+        Ok(file)
+    });
     let raw = if recording_dir.join("process-capture").try_exists()? {
-        Some(BufWriter::new(
-            std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(recording_dir.join("output.live"))?,
-        ))
+        Some(BufWriter::new(crate::platform::open_append(
+            &recording_dir.join("output.live"),
+        )?))
     } else {
         None
     };
     if let Some(raw) = &raw {
         raw.get_ref().sync_all()?;
-        std::fs::File::open(recording_dir)?.sync_all()?;
+        crate::platform::sync_directory(recording_dir)?;
     }
     let file = match file {
         Ok(file) => {
@@ -1061,16 +1051,12 @@ fn write_recording_events_with_rotation(
 
     let mut segment_name = format!("events_{segment_index}.bin");
     let mut writer = BufWriter::new(
-        std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(recording_dir.join(&segment_name))
-            .with_context(|| {
-                format!(
-                    "failed opening recording cut segment {}",
-                    recording_dir.join(&segment_name).display()
-                )
-            })?,
+        crate::platform::open_append(&recording_dir.join(&segment_name)).with_context(|| {
+            format!(
+                "failed opening recording cut segment {}",
+                recording_dir.join(&segment_name).display()
+            )
+        })?,
     );
     segment_names.push(segment_name.clone());
 
@@ -1083,16 +1069,14 @@ fn write_recording_events_with_rotation(
             segment_index = segment_index.saturating_add(1);
             segment_name = format!("events_{segment_index}.bin");
             writer = BufWriter::new(
-                std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(recording_dir.join(&segment_name))
-                    .with_context(|| {
+                crate::platform::open_append(&recording_dir.join(&segment_name)).with_context(
+                    || {
                         format!(
                             "failed opening recording cut segment {}",
                             recording_dir.join(&segment_name).display()
                         )
-                    })?,
+                    },
+                )?,
             );
             segment_names.push(segment_name.clone());
             segment_bytes = 0;

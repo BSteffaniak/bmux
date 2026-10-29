@@ -1741,6 +1741,7 @@ mod tests {
             .unwrap()
     }
 
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
     async fn local_endpoint_invokes_typed_service_end_to_end() {
         let root = tempfile::tempdir().expect("tempdir");

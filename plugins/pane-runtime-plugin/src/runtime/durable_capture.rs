@@ -20,6 +20,10 @@ pub(super) struct DurableCapture {
     origin: std::time::Instant,
     failed: bool,
 }
+fn persistence_error(stage: &'static str, error: &std::io::Error) -> std::io::Error {
+    std::io::Error::new(error.kind(), format!("{stage}: {error}"))
+}
+
 impl DurableCapture {
     pub(super) fn create(root: &Path) -> std::io::Result<Self> {
         std::fs::create_dir_all(root)?;
@@ -108,13 +112,19 @@ impl DurableCapture {
         // A failed append may leave a tail, but must never advance acknowledged
         // progress or permit later appends behind that uncertain tail.
         let result = (|| {
-            self.file.write_all(
-                &u32::try_from(frame.len())
-                    .map_err(std::io::Error::other)?
-                    .to_le_bytes(),
-            )?;
-            self.file.write_all(&frame)?;
-            self.file.sync_data()?;
+            self.file
+                .write_all(
+                    &u32::try_from(frame.len())
+                        .map_err(std::io::Error::other)?
+                        .to_le_bytes(),
+                )
+                .map_err(|error| persistence_error("write capture frame header", &error))?;
+            self.file
+                .write_all(&frame)
+                .map_err(|error| persistence_error("write capture frame payload", &error))?;
+            self.file
+                .sync_data()
+                .map_err(|error| persistence_error("flush capture append", &error))?;
             crate::atomic_state::commit(&self.root.join("capture.json"), &candidate)
         })();
         match result {
@@ -160,9 +170,13 @@ impl DurableCapture {
         let mut candidate = self.boundary.clone();
         candidate.eof = error.is_none();
         candidate.error = error;
-        let result = self.file.sync_all().and_then(|()| {
-            crate::atomic_state::commit(&self.root.join("capture.json"), &candidate)
-        });
+        let result = self
+            .file
+            .sync_all()
+            .map_err(|error| persistence_error("flush capture terminal boundary", &error))
+            .and_then(|()| {
+                crate::atomic_state::commit(&self.root.join("capture.json"), &candidate)
+            });
         match result {
             Ok(()) => {
                 self.boundary = candidate;
@@ -312,6 +326,30 @@ mod server_loss_tests {
     use super::*;
 
     #[test]
+    fn windows_capture_append_resize_and_eof_persist_with_live_projection_readers() {
+        let root = tempfile::tempdir().unwrap();
+        let mut capture = DurableCapture::create(root.path()).unwrap();
+        // A projection may retain an old metadata snapshot and event-stream
+        // handle while the sole writer publishes the next durable boundary.
+        let metadata_reader = std::fs::File::open(root.path().join("capture.json")).unwrap();
+        let stream_reader = std::fs::File::open(root.path().join("events.bin")).unwrap();
+        for _ in 0..16 {
+            capture.append(b"tail").unwrap();
+            capture.resize(73, 17).unwrap();
+            let (boundary, bytes) = DurableCapture::read(root.path(), 0, 1024).unwrap();
+            assert_eq!(boundary.bytes, capture.raw_bytes());
+            assert_eq!(u64::try_from(bytes.len()).unwrap(), boundary.bytes);
+            assert!(!boundary.eof);
+        }
+        capture.end(None).unwrap();
+        let boundary = DurableCapture::validate_recovery(root.path()).unwrap();
+        assert_eq!(boundary.bytes, 64);
+        assert!(boundary.eof);
+        assert!(boundary.error.is_none());
+        drop((metadata_reader, stream_reader));
+    }
+
+    #[test]
     fn recovery_accepts_committed_v1_and_ignores_complete_uncommitted_frames() {
         let root = tempfile::tempdir().unwrap();
         let mut capture = DurableCapture::create(root.path()).unwrap();
@@ -351,7 +389,12 @@ mod server_loss_tests {
         let boundary = root.path().join("capture.json");
         std::fs::remove_file(&boundary).unwrap();
         std::fs::create_dir(&boundary).unwrap();
-        assert!(capture.append(b"uncertain").is_err());
+        let error = capture.append(b"uncertain").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("publish durable state replacement")
+        );
         assert_eq!(capture.raw_bytes(), 4);
         assert!(capture.end(None).is_err());
         assert!(capture.append(b"retry").is_err());

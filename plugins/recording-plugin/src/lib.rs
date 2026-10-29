@@ -21,6 +21,7 @@ mod export;
 mod from_recording;
 mod interactive_command;
 mod interactive_terminal;
+mod platform;
 mod process_artifacts;
 mod process_bootstrap;
 mod process_commands;

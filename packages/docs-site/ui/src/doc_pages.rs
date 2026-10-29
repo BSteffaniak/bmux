@@ -257,6 +257,13 @@ pub static DOC_PAGES: &[DocPage] = &[
         nav_label: "Development Toolchain",
     },
     docs_markdown_page! {
+        source: "docs/windows-platform-backends.md",
+        route: "/docs/windows-platform-backends",
+        title: "Windows Platform Backends",
+        section: DEVELOPMENT,
+        nav_label: "Windows Platform Backends",
+    },
+    docs_markdown_page! {
         source: "docs/tui-framework.md",
         route: "/docs/tui-framework",
         title: "TUI Framework",

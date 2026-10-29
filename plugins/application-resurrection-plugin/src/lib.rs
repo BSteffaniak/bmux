@@ -6,6 +6,7 @@ pub mod execution;
 #[cfg(unix)]
 mod host;
 
+#[cfg(unix)]
 use bmux_application_resurrection_plugin_api::{resurrection_host_v1, resurrection_launch_v1};
 use bmux_plugin_sdk::{
     NativeLifecycleContext, NativeServiceContext, PluginCommandError, RustPlugin, ServiceResponse,
@@ -21,17 +22,20 @@ pub struct ApplicationResurrectionPlugin {
 impl RustPlugin for ApplicationResurrectionPlugin {
     type Contract = bmux_application_resurrection_plugin_api::Contract;
 
+    #[cfg(unix)]
     fn activate(&mut self, context: NativeLifecycleContext) -> Result<i32, PluginCommandError> {
-        #[cfg(unix)]
-        {
-            self.host = Some(
-                host::Host::new(
-                    std::path::PathBuf::from(&context.connection.state_dir)
-                        .join("application-resurrection"),
-                )
-                .map_err(PluginCommandError::failed)?,
-            );
-        }
+        self.host = Some(
+            host::Host::new(
+                std::path::PathBuf::from(&context.connection.state_dir)
+                    .join("application-resurrection"),
+            )
+            .map_err(PluginCommandError::failed)?,
+        );
+        Ok(bmux_plugin_sdk::EXIT_OK)
+    }
+
+    #[cfg(not(unix))]
+    fn activate(&mut self, _context: NativeLifecycleContext) -> Result<i32, PluginCommandError> {
         Ok(bmux_plugin_sdk::EXIT_OK)
     }
 
@@ -82,6 +86,7 @@ impl RustPlugin for ApplicationResurrectionPlugin {
     }
 }
 
+#[cfg(unix)]
 fn host_error(message: String) -> resurrection_launch_v1::HostError {
     resurrection_launch_v1::HostError::Failed { message }
 }

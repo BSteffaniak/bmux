@@ -12,7 +12,7 @@ impl ProcessStore {
     pub(crate) fn new(recordings_root: &Path) -> Result<Self> {
         let root = recordings_root.join("process-runs-v4");
         crate::durable::private_directory(&root)?;
-        std::fs::File::open(recordings_root)?.sync_all()?;
+        crate::platform::sync_directory(recordings_root)?;
         Ok(Self { root })
     }
 
@@ -107,15 +107,11 @@ impl ProcessStore {
     }
     fn admit(&self, path: &Path, data: &[u8]) -> Result<bool> {
         use std::io::Write;
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(path)
-        {
+        match crate::platform::create_new(path) {
             Ok(mut file) => {
                 file.write_all(data)?;
                 file.sync_all()?;
-                std::fs::File::open(&self.root)?.sync_all()?;
+                crate::platform::sync_directory(&self.root)?;
                 Ok(false)
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {

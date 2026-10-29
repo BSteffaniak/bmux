@@ -9,9 +9,16 @@ pub(crate) mod input_authority;
 pub(crate) mod live_presentation;
 pub(crate) mod managed_idle;
 mod managed_scope;
+mod native_process;
 pub(crate) mod reservations;
 mod startup_capture;
 pub(crate) mod supervisor;
+
+use native_process::send_process_signal;
+#[cfg(all(unix, test))]
+use native_process::send_process_signal_command;
+#[cfg(unix)]
+use native_process::{process_command_looks_like_shell, resolve_process_working_directory};
 
 use anyhow::{Context, Result};
 use bmux_attach_layout_protocol::{
@@ -631,7 +638,10 @@ async fn shutdown_panes_owned(
                 // Prefer the acknowledged operation so the original target
                 // outcome is retained. Lease EOF is the mandatory fallback,
                 // even when that operation failed or remained uncertain.
-                if let Err(error) = lifetime.execution.signal_owned_group(execution::GROUP_KILL) {
+                if let Err(error) = lifetime
+                    .execution
+                    .signal_owned_group(native_process::StopAction::Force)
+                {
                     lifetime
                         .execution
                         .record_cleanup_error(format!("group stop failed: {error}"));
@@ -1072,7 +1082,7 @@ impl portable_pty::ChildKiller for GuardianStartupChild {
     fn kill(&mut self) -> std::io::Result<()> {
         if self.launch_attempted.load(Ordering::SeqCst) {
             self.execution
-                .signal_owned_group(execution::GROUP_KILL)
+                .signal_owned_group(native_process::StopAction::Force)
                 .map_err(std::io::Error::other)?;
             if !self.execution.terminal_owner_retired.load(Ordering::SeqCst) {
                 return Err(std::io::Error::other(
@@ -1154,7 +1164,7 @@ impl Drop for StartupChild {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn cleanup_failed_startup_child(
     child: Box<dyn portable_pty::Child + Send + Sync>,
     failure: String,
@@ -1845,24 +1855,20 @@ impl PaneLifetime {
             ));
             warn!(%error, "failed freezing resurrection before pane lifetime end");
         }
-        #[cfg(unix)]
-        {
-            let revoked = self
-                .execution
-                .supervisor
-                .lock()
-                .map_err(|_| anyhow::anyhow!("supervisor lock poisoned"))
-                .and_then(|control| {
-                    control
-                        .as_ref()
-                        .map_or(Ok(()), |control| control.end_lifetime())
-                });
-            if let Err(error) = revoked {
-                self.execution.record_cleanup_error(format!(
-                    "failed revoking pane execution lifetime: {error}"
-                ));
-                warn!(%error, "failed revoking pane execution lifetime");
-            }
+        let revoked = self
+            .execution
+            .supervisor
+            .lock()
+            .map_err(|_| anyhow::anyhow!("supervisor lock poisoned"))
+            .and_then(|control| {
+                control
+                    .as_ref()
+                    .map_or(Ok(()), |control| control.end_lifetime())
+            });
+        if let Err(error) = revoked {
+            self.execution
+                .record_cleanup_error(format!("failed revoking pane execution lifetime: {error}"));
+            warn!(%error, "failed revoking pane execution lifetime");
         }
     }
 }
@@ -6638,7 +6644,7 @@ impl SessionRuntimeManager {
                 return;
             }
             let pty_system = native_pty_system();
-            let pty_pair = match pty_system.openpty(PtySize {
+            let mut pty_pair = match pty_system.openpty(PtySize {
                 rows: initial_rows,
                 cols: initial_cols,
                 pixel_width: 0,
@@ -6671,10 +6677,11 @@ impl SessionRuntimeManager {
             };
             #[cfg(not(test))]
             let preparation = supervisor::SupervisorControl::prepare(token);
-            let supervisor_control =
+            let (supervisor_control, guardian_command) =
                 match supervisor::select_backend(preparation, managed_program || program_execution)
                 {
-                    Ok(control) => control.map(Arc::new),
+                    Ok(Some((control, command))) => (Some(Arc::new(control)), Some(command)),
+                    Ok(None) => (None, None),
                     Err(error) => {
                         fail_startup!(format!("durable supervision unavailable: {error:#}"));
                         return;
@@ -6858,6 +6865,23 @@ impl SessionRuntimeManager {
                     return;
                 }
             };
+            // ConPTY asks for its inherited cursor before CreateProcess/helper
+            // readiness can complete. Own this PTY's writer before starting the
+            // raw drain, not after waiting for guardian startup/publication.
+            #[cfg(windows)]
+            let early_writer = match pty_pair.master.take_writer() {
+                Ok(writer) => Arc::new(std::sync::Mutex::new(writer)),
+                Err(error) => {
+                    fail_startup!(format!("failed to open startup PTY writer: {error}"));
+                    return;
+                }
+            };
+            #[cfg(windows)]
+            let raw_reader = Box::new(native_process::conpty_startup::BootstrapReader::new(
+                raw_reader,
+                Arc::clone(&early_writer),
+                pane_id,
+            )) as Box<dyn Read + Send>;
             // Reserved capture was installed before the launch permit opened.
             // Transfer the sole disk owner before starting any raw PTY reader.
             let pending_capture = execution_for_task
@@ -6971,28 +6995,72 @@ impl SessionRuntimeManager {
                 .expect("supervisor control lock")
                 .clone_from(&supervisor_control);
             let spawned = if let Some(control) = &supervisor_control {
-                match pty_pair.master.tty_name() {
-                    Some(slave) => {
-                        let control = Arc::clone(control);
-                        let runtime = tokio::runtime::Handle::current();
-                        let execution = Arc::clone(&execution_for_task);
-                        let launch_attempted = Arc::clone(&launch_attempted);
-                        tokio::task::spawn_blocking(move || {
-                            control.spawn_guardian(&slave).map(|child| StartupChild {
-                                child: Some(Box::new(GuardianStartupChild {
-                                    child,
-                                    execution,
-                                    launch_attempted,
-                                })),
-                                runtime,
-                            })
-                        })
-                        .await
-                        .map_err(anyhow::Error::from)
-                        .and_then(std::convert::identity)
+                let control = Arc::clone(control);
+                let runtime = tokio::runtime::Handle::current();
+                let execution = Arc::clone(&execution_for_task);
+                let launch_attempted = Arc::clone(&launch_attempted);
+                // Own the pair while blocking: Unix guardian readiness and
+                // Windows pipe negotiation both happen behind this boundary.
+                #[cfg(all(windows, test))]
+                eprintln!("ConPTY startup pane={pane_id} stage=guardian-spawn-enter");
+                let (returned_pair, spawned) = match tokio::task::spawn_blocking(move || {
+                    #[cfg(windows)]
+                    let observed_slave = native_process::conpty_startup::ObservedSlave {
+                        slave: pty_pair.slave.as_ref(),
+                        owner: pane_id,
+                    };
+                    #[cfg(windows)]
+                    let spawn_slave: &dyn portable_pty::SlavePty = &observed_slave;
+                    #[cfg(not(windows))]
+                    let spawn_slave = pty_pair.slave.as_ref();
+                    let spawned = control
+                        .spawn_terminal(
+                            pty_pair.master.as_ref(),
+                            spawn_slave,
+                            guardian_command
+                                .expect("supervisor preparation retains guardian command"),
+                        )
+                        .map(|child| StartupChild {
+                            child: Some(Box::new(GuardianStartupChild {
+                                child,
+                                execution,
+                                launch_attempted,
+                            })),
+                            runtime,
+                        });
+                    #[cfg(all(windows, test))]
+                    eprintln!(
+                        "ConPTY startup pane={pane_id} stage=guardian-spawn-return ok={}",
+                        spawned.is_ok()
+                    );
+                    (pty_pair, spawned)
+                })
+                .await
+                {
+                    Ok(result) => result,
+                    Err(error) => {
+                        // The blocking task owned the pair and its child cleanup.
+                        // Without its receipt, never report cleanup success.
+                        if let Some(writer) = &capture_writer {
+                            writer.fail("terminal spawn task failed before capture drain");
+                        }
+                        drop(reader);
+                        let reason = startup_capture::acknowledge_cleanup(
+                            capture_owner.take(),
+                            &cleanup_tx,
+                            Some(Err(
+                                "terminal spawn task failed without cleanup acknowledgement".into(),
+                            )),
+                            format!("terminal spawn task failed: {error}"),
+                        )
+                        .await;
+                        child_spawned = true;
+                        fail_startup!(reason);
+                        return;
                     }
-                    None => Err(anyhow::anyhow!("terminal slave path unavailable")),
-                }
+                };
+                pty_pair = returned_pair;
+                spawned
             } else {
                 match execution_for_task.authorize_spawn() {
                     Ok(()) => {
@@ -7012,7 +7080,13 @@ impl SessionRuntimeManager {
                     return;
                 }
             };
-            child_spawned = true;
+            // Only the later Unix writer-installation failure still needs
+            // this flag. Windows already owns its writer; all later failure
+            // paths supply capture cleanup explicitly in fail_captured_startup.
+            #[cfg(not(windows))]
+            {
+                child_spawned = true;
+            }
             let mut target_pid = if supervisor_control.is_none() {
                 child.process_id()
             } else {
@@ -7027,11 +7101,18 @@ impl SessionRuntimeManager {
                 // this async waiter is cancelled, the completed task result
                 // still drops through supervised cleanup, never a raw Child.
                 let started = tokio::task::spawn_blocking(move || {
+                    #[cfg(all(windows, test))]
+                    eprintln!("ConPTY startup pane={pane_id} stage=guardian-start-enter");
                     let result = startup_control.start(&launch, exact_environment, || {
                         authorization.authorize_spawn()?;
                         launch_attempted.store(true, Ordering::SeqCst);
                         Ok(())
                     });
+                    #[cfg(all(windows, test))]
+                    eprintln!(
+                        "ConPTY startup pane={pane_id} stage=guardian-start-return ok={}",
+                        result.is_ok()
+                    );
                     (child, result)
                 })
                 .await;
@@ -7120,7 +7201,7 @@ impl SessionRuntimeManager {
                 *pgid = if supervisor_control.is_some() {
                     // The helper's session-leader PID is not the owned target
                     // group. Startup acknowledged tcsetpgrp before this lookup.
-                    pty_pair.master.process_group_leader()
+                    native_process::foreground_group(pty_pair.master.as_ref())
                 } else {
                     child
                         .process_id()
@@ -7132,6 +7213,7 @@ impl SessionRuntimeManager {
 
             let master = pty_pair.master;
 
+            #[cfg(not(windows))]
             let writer = match master.take_writer() {
                 Ok(writer) => writer,
                 Err(error) => {
@@ -7158,7 +7240,10 @@ impl SessionRuntimeManager {
                     return;
                 }
             };
+            #[cfg(not(windows))]
             let writer = Arc::new(std::sync::Mutex::new(writer));
+            #[cfg(windows)]
+            let writer = early_writer;
             *execution_for_task
                 .master
                 .lock()
@@ -7352,6 +7437,8 @@ impl SessionRuntimeManager {
                     }
                     tracing::debug!(pane_id = %pane_id, "execution reader publication released");
                     let mut buffer = [0_u8; 8192];
+                    #[cfg(windows)]
+                    let mut conpty_projection = native_process::conpty_startup::PrefixQuery::default();
                     let mut protocol_engine = TerminalProtocolEngine::new(protocol_profile)
                         .with_bracketed_paste_support(bracketed_paste_supported);
                     let mut terminal_mode_tracker = PaneTerminalModeTracker::default();
@@ -7401,7 +7488,17 @@ impl SessionRuntimeManager {
                                 // entire retained parser publication, not merely read.
                                 let Ok(requested_size) = last_requested_size_for_reader.lock() else { break; };
                                 let publication_ticket = reader.publication_ticket();
-                                let (capture_output, capture_reply) = capture_handshake.process_with_fence(&buffer[..bytes_read], pane_id, || {
+                                // The raw bootstrap responder already answered this
+                                // execution's leading transport query. Keep it in
+                                // durable capture, but never replay its reply after
+                                // publication or interpret it as application input.
+                                #[cfg(windows)]
+                                let projected = conpty_projection.project(&buffer[..bytes_read]).0;
+                                #[cfg(windows)]
+                                let protocol_chunk = projected.as_ref();
+                                #[cfg(not(windows))]
+                                let protocol_chunk = &buffer[..bytes_read];
+                                let (capture_output, capture_reply) = capture_handshake.process_with_fence(protocol_chunk, pane_id, || {
                                     let (sent, received) = std::sync::mpsc::sync_channel(1);
                                     fence_input_for_reader.send(PaneRuntimeCommand::InputFence(sent)).is_ok()
                                         && received.recv_timeout(Duration::from_secs(2)).is_ok()
@@ -7646,7 +7743,9 @@ impl SessionRuntimeManager {
                 startup_tx.send_replace(Some(Err(
                     "failed to start pane I/O supervision threads".into()
                 )));
-                if let Err(error) = execution_for_task.signal_owned_group(execution::GROUP_KILL) {
+                if let Err(error) =
+                    execution_for_task.signal_owned_group(native_process::StopAction::Force)
+                {
                     execution_for_task.record_cleanup_error(format!(
                         "startup-thread group cleanup failed: {error}"
                     ));
@@ -7689,8 +7788,7 @@ impl SessionRuntimeManager {
                                     mutation_id: "00000000-0000-4000-8000-000000000003".into()
                                 })?;
                                 anyhow::ensure!(response.error.is_none(), "terminal-owner retirement rejected: {:?}", response.error);
-                                execution.terminal_owner_retired.store(true, Ordering::SeqCst);
-                                Ok::<(), anyhow::Error>(())
+                                execution.finish_owner_retirement(|| control.end_lifetime())
                             }).await;
                             let retirement_error = match retired {
                                 Ok(Ok(())) => None,
@@ -7715,7 +7813,7 @@ impl SessionRuntimeManager {
                                 resurrection: Arc::clone(&resurrection_state_for_shutdown),
                             };
                             let cleanup = tokio::task::spawn_blocking(move || {
-                                if let Err(error) = lifetime.execution.signal_owned_group(execution::GROUP_KILL) {
+                                if let Err(error) = lifetime.execution.signal_owned_group(native_process::StopAction::Force) {
                                     lifetime.execution.record_cleanup_error(format!("reader-failure group cleanup failed: {error}"));
                                 }
                                 lifetime.revoke();
@@ -7740,7 +7838,7 @@ impl SessionRuntimeManager {
                             if let Err(error) = frozen {
                                 execution.record_cleanup_error(format!("checkpoint freeze failed: {error}"));
                             }
-                            if let Err(error) = execution.signal_owned_group(execution::GROUP_KILL) {
+                            if let Err(error) = execution.signal_owned_group(native_process::StopAction::Force) {
                                 execution.record_cleanup_error(format!("group stop failed: {error}"));
                             }
                             let lifetime = PaneLifetime { execution, resurrection };
@@ -7804,7 +7902,7 @@ impl SessionRuntimeManager {
                                     // Sweep while the live PTY/supervisor still
                                     // supplies group authority; killing its leader
                                     // first can strand descendants on direct paths.
-                                    if let Err(error) = execution_for_task.signal_owned_group(execution::GROUP_KILL) {
+                                    if let Err(error) = execution_for_task.signal_owned_group(native_process::StopAction::Force) {
                                         execution_for_task.record_cleanup_error(format!("input-failure group cleanup failed: {error}"));
                                     }
                                     let _ = child_killer.kill();
@@ -7837,6 +7935,28 @@ impl SessionRuntimeManager {
                 let _ = child_killer.kill();
             }
 
+            // ConPTY owns its output pipe until ClosePseudoConsole, even after
+            // every hosted process has exited. Once the authenticated terminal
+            // owner has retired, close the console concurrently with the live
+            // raw/projection readers: ClosePseudoConsole itself may wait for
+            // their drain. Never infer EOF or an exit outcome from this close.
+            #[cfg(windows)]
+            if execution_for_task
+                .terminal_owner_retired
+                .load(Ordering::SeqCst)
+            {
+                let master = execution_for_task
+                    .master
+                    .lock()
+                    .expect("master lock")
+                    .take();
+                if let Err(error) =
+                    native_process::conpty_startup::close_retired_console(master).await
+                {
+                    execution_for_task
+                        .record_cleanup_error(format!("retired console close failed: {error}"));
+                }
+            }
             // A program's exit is not EOF: preserve the master while the
             // reader drains buffered bytes and descendants still hold the slave.
             if program_execution && startup_ready {
@@ -7848,7 +7968,7 @@ impl SessionRuntimeManager {
                             .is_ok_and(|outcome| outcome.2.is_some())
                     {
                         if let Err(error) =
-                            execution_for_task.signal_owned_group(execution::GROUP_KILL)
+                            execution_for_task.signal_owned_group(native_process::StopAction::Force)
                         {
                             execution_for_task.record_cleanup_error(format!(
                                 "failed-reader group cleanup failed: {error}"
@@ -7861,7 +7981,8 @@ impl SessionRuntimeManager {
                     }
                 }
                 if !execution_for_task.output_drained.load(Ordering::SeqCst) {
-                    if let Err(error) = execution_for_task.signal_owned_group(execution::GROUP_KILL)
+                    if let Err(error) =
+                        execution_for_task.signal_owned_group(native_process::StopAction::Force)
                     {
                         execution_for_task.record_cleanup_error(format!(
                             "reader-failure group cleanup failed: {error}"
@@ -9350,19 +9471,26 @@ impl SessionRuntimeManager {
             .get(&runtime.focused_pane_id)
             .ok_or(SessionRuntimeError::NotFound)?;
 
-        for pane in runtime.panes.values() {
-            if !crate::private_input::register_producer(pane.meta.id, client_id.0) {
-                return Err(SessionRuntimeError::Closed);
-            }
+        let pane_ids = runtime.panes.keys().copied().collect::<Vec<_>>();
+        // Lock every output before publishing any input or attachment membership.
+        // Failed admission must not leave a partially attached producer behind.
+        let mut outputs = runtime
+            .panes
+            .values()
+            .map(|pane| {
+                pane.output_buffer
+                    .lock()
+                    .map_err(|_| SessionRuntimeError::Closed)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if !crate::private_input::register_producers(&pane_ids, client_id.0) {
+            return Err(SessionRuntimeError::Closed);
         }
         runtime.attached_clients.insert(client_id);
-        for pane in runtime.panes.values_mut() {
-            let mut output = pane
-                .output_buffer
-                .lock()
-                .map_err(|_| SessionRuntimeError::Closed)?;
+        for output in &mut outputs {
             output.register_client_at_tail(client_id);
         }
+        drop(outputs);
         if runtime.attach_viewport.is_some() {
             resize_session_ptys(&self.padding_config, runtime);
         }
@@ -9413,6 +9541,7 @@ impl SessionRuntimeManager {
                     .scrollback_pins
                     .retain(|(pin_client_id, _), _| *pin_client_id != client_id);
                 for pane in runtime.panes.values_mut() {
+                    crate::private_input::unregister_producer(pane.meta.id, client_id.0);
                     if let Ok(mut output) = pane.output_buffer.lock() {
                         output.unregister_client(client_id);
                     }
@@ -12409,53 +12538,6 @@ where
     Some(ProcessInspectionResult { command, cwd })
 }
 
-fn send_process_signal_command(
-    program: &str,
-    process: &bmux_pane_runtime_state::PaneProcessIdentity,
-    signal: bmux_pane_runtime_state::PaneProcessSignal,
-) -> anyhow::Result<()> {
-    let number = match signal {
-        bmux_pane_runtime_state::PaneProcessSignal::Interrupt => "INT",
-        bmux_pane_runtime_state::PaneProcessSignal::Terminate => "TERM",
-        bmux_pane_runtime_state::PaneProcessSignal::Kill => "KILL",
-        bmux_pane_runtime_state::PaneProcessSignal::Hangup => "HUP",
-    };
-    let target = process
-        .process_group_id
-        .map(|group| format!("-{group}"))
-        .or_else(|| process.pid.map(|pid| pid.to_string()))
-        .ok_or_else(|| anyhow::anyhow!("pane process identity is not available"))?;
-    let status = std::process::Command::new(program)
-        .arg(format!("-{number}"))
-        .arg("--")
-        .arg(target)
-        .status()
-        .map_err(|error| anyhow::anyhow!("failed invoking kill: {error}"))?;
-    if status.success() {
-        Ok(())
-    } else if let Some(code) = status.code() {
-        anyhow::bail!("kill -{number} failed with exit code {code}")
-    } else {
-        anyhow::bail!("kill -{number} was terminated before completion")
-    }
-}
-
-#[cfg(unix)]
-fn send_process_signal(
-    process: &bmux_pane_runtime_state::PaneProcessIdentity,
-    signal: bmux_pane_runtime_state::PaneProcessSignal,
-) -> anyhow::Result<()> {
-    send_process_signal_command("kill", process, signal)
-}
-
-#[cfg(not(unix))]
-fn send_process_signal(
-    _process: &bmux_pane_runtime_state::PaneProcessIdentity,
-    _signal: bmux_pane_runtime_state::PaneProcessSignal,
-) -> anyhow::Result<()> {
-    anyhow::bail!("pane process signaling is unsupported on this platform")
-}
-
 #[cfg(unix)]
 struct InspectionChild {
     child: Option<std::process::Child>,
@@ -12581,106 +12663,6 @@ fn inspect_process_group_command_and_cwd(
     _shell_pid: Option<u32>,
     _shell_path: &str,
 ) -> Option<ProcessInspectionResult> {
-    None
-}
-
-fn process_command_looks_like_shell(command: &str, shell_path: &str) -> bool {
-    let Some(first) = command.split_whitespace().next() else {
-        return false;
-    };
-    let name = std::path::Path::new(first)
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or(first)
-        .trim_start_matches('-')
-        .to_ascii_lowercase();
-    let shell_name = std::path::Path::new(shell_path)
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or(shell_path)
-        .trim_start_matches('-')
-        .to_ascii_lowercase();
-    name == shell_name
-        || matches!(
-            name.as_str(),
-            "sh" | "bash"
-                | "zsh"
-                | "fish"
-                | "nu"
-                | "nushell"
-                | "dash"
-                | "ksh"
-                | "mksh"
-                | "csh"
-                | "tcsh"
-        )
-}
-
-#[cfg(target_os = "macos")]
-fn resolve_process_working_directory(pid: u32) -> Option<String> {
-    let pid = i32::try_from(pid).ok()?;
-    // SAFETY: integer-only C storage is initialized and the kernel receives its
-    // exact size. No process-table subprocess or filesystem-wide lsof scan.
-    let mut info: libc::proc_vnodepathinfo = unsafe { std::mem::zeroed() };
-    let size = i32::try_from(std::mem::size_of_val(&info)).ok()?;
-    let read = unsafe {
-        libc::proc_pidinfo(
-            pid,
-            libc::PROC_PIDVNODEPATHINFO,
-            0,
-            (&raw mut info).cast(),
-            size,
-        )
-    };
-    if read != size {
-        return None;
-    }
-    let bytes = info
-        .pvi_cdir
-        .vip_path
-        .iter()
-        .flatten()
-        .map(|byte| byte.to_ne_bytes()[0])
-        .take_while(|byte| *byte != 0)
-        .collect::<Vec<_>>();
-    let path = String::from_utf8(bytes).ok()?;
-    std::path::Path::new(&path).is_absolute().then_some(path)
-}
-
-#[cfg(all(unix, not(target_os = "macos")))]
-fn resolve_process_working_directory(pid: u32) -> Option<String> {
-    let proc_cwd = std::path::PathBuf::from(format!("/proc/{pid}/cwd"));
-    if let Ok(path) = std::fs::read_link(&proc_cwd)
-        && !path.as_os_str().is_empty()
-    {
-        return Some(path.to_string_lossy().to_string());
-    }
-
-    let lsof_output = bounded_probe_output(
-        std::process::Command::new("lsof").args(["-a", "-p", &pid.to_string(), "-d", "cwd", "-Fn"]),
-        Duration::from_millis(100),
-    );
-    if let Ok(bytes) = lsof_output {
-        for line in String::from_utf8_lossy(&bytes).lines() {
-            if let Some(path) = line.strip_prefix('n')
-                && !path.trim().is_empty()
-            {
-                return Some(path.to_string());
-            }
-        }
-    }
-
-    let bytes = bounded_probe_output(
-        std::process::Command::new("ps").args(["-o", "cwd=", "-p", &pid.to_string()]),
-        Duration::from_millis(100),
-    )
-    .ok()?;
-    let cwd = String::from_utf8_lossy(&bytes).trim().to_string();
-    (!cwd.is_empty()).then_some(cwd)
-}
-
-#[cfg(not(unix))]
-fn resolve_process_working_directory(_pid: u32) -> Option<String> {
     None
 }
 
@@ -13318,6 +13300,87 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn windows_program_startup_answers_conpty_query_then_captures_and_drains() {
+        supervisor::install_test_artifact()
+            .expect("explicit coordinator-built supervisor artifact");
+        let session_id = SessionId(Uuid::new_v4());
+        let (exit_tx, _exit_rx) = mpsc::unbounded_channel();
+        let program = std::env::var("COMSPEC").expect("Windows command interpreter");
+        let mut manager = SessionRuntimeManager::new(
+            program.clone(),
+            "xterm-256color".into(),
+            protocol_profile_for_term("xterm-256color"),
+            true,
+            None,
+            PanePaddingConfig::default(),
+            exit_tx,
+        );
+        let mut prepared = manager
+            .prepare_fresh_program_runtime(
+                session_id,
+                None,
+                Some(PaneLaunchSpec {
+                    program,
+                    args: vec!["/d".into(), "/c".into(), "echo conpty-program-tail".into()],
+                    cwd: None,
+                    env: BTreeMap::new(),
+                }),
+                (17, 73),
+            )
+            .unwrap();
+        let execution = Arc::clone(
+            &prepared
+                .runtime
+                .as_ref()
+                .unwrap()
+                .panes
+                .values()
+                .next()
+                .unwrap()
+                .execution,
+        );
+        let _cleanup = ExecutionTestCleanup(Arc::clone(&execution));
+        tokio::time::timeout(Duration::from_secs(5), prepared.wait_until_ready())
+            .await
+            .expect("ConPTY cursor negotiation must not block program startup")
+            .unwrap();
+        manager
+            .commit_fresh_runtime(session_id, &mut prepared, || Ok(()))
+            .unwrap();
+        let pane = manager.runtimes[&session_id].panes.values().next().unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !execution.output_drained.load(Ordering::SeqCst)
+                || !pane.exited.load(Ordering::SeqCst)
+                || !execution.terminal_owner_retired.load(Ordering::SeqCst)
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|error| {
+            let outcome = execution.outcome.try_lock().ok()
+                .map(|outcome| (outcome.0, outcome.1.is_some(), outcome.2.is_some()));
+            panic!("program tail must drain and owner must retire: {error}; drained={} exited={} session_ended={} retired={} cleanup_failed={} capture_complete={} outcome={outcome:?}",
+                execution.output_drained.load(Ordering::SeqCst),
+                pane.exited.load(Ordering::SeqCst),
+                execution.terminal_session_ended.load(Ordering::SeqCst),
+                execution.terminal_owner_retired.load(Ordering::SeqCst),
+                execution.cleanup_failed.load(Ordering::SeqCst),
+                execution.durable_capture_complete());
+        });
+        assert_eq!(execution.outcome.lock().unwrap().0, Some(0));
+        assert!(!execution.cleanup_failed.load(Ordering::SeqCst));
+        let output = pane
+            .output_buffer
+            .lock()
+            .unwrap()
+            .read_recent_with_offsets(8192)
+            .bytes;
+        assert!(String::from_utf8_lossy(&output).contains("conpty-program-tail"));
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn program_first_pane_captures_fast_literal_argv_and_drains() {
         supervisor::install_test_artifact()
@@ -13372,6 +13435,7 @@ mod tests {
         assert!(pane.meta.launch.is_some());
     }
 
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn initial_shell_uses_conventional_owner_preserves_cwd_and_natural_tail() {
         use std::os::unix::fs::PermissionsExt;
@@ -13619,7 +13683,7 @@ mod tests {
             if self.0.terminal_owner_retired.load(Ordering::SeqCst) {
                 return;
             }
-            if let Err(error) = self.0.signal_owned_group(execution::GROUP_KILL) {
+            if let Err(error) = self.0.signal_owned_group(native_process::StopAction::Force) {
                 eprintln!("test process cleanup requires recovery: {error}");
             }
         }
@@ -13777,8 +13841,18 @@ exit 7"#
         assert!(pane.execution.terminal_session_ended.load(Ordering::SeqCst));
         assert_eq!(pane.execution.outcome.lock().unwrap().0, Some(7));
         assert!(!pane.execution.group_kill_issued.load(Ordering::SeqCst));
-        assert!(!pane.execution.signal_owned_group(libc::SIGTERM).unwrap());
-        assert!(!pane.execution.signal_owned_group(libc::SIGKILL).unwrap());
+        assert!(
+            !pane
+                .execution
+                .signal_owned_group(native_process::StopAction::Cooperative)
+                .unwrap()
+        );
+        assert!(
+            !pane
+                .execution
+                .signal_owned_group(native_process::StopAction::Force)
+                .unwrap()
+        );
         assert_eq!(process_start_identity_for_pid(descendant), Some(identity));
         std::fs::write(witness.path().join("probe"), b"").unwrap();
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -14167,6 +14241,87 @@ exit 7"#
         assert_eq!(
             manager.runtimes[&session_id].panes[&pane_id].padding_override,
             Some(spec)
+        );
+    }
+
+    #[tokio::test]
+    async fn begin_attach_registers_input_producer_before_accepting_input() {
+        let session_id = SessionId(Uuid::new_v4());
+        let client_id = ClientId(Uuid::new_v4());
+        let pane_id = Uuid::new_v4();
+        let mut runtime = runtime_with_panes(&[pane_id]);
+        let (input_tx, mut input_rx) = mpsc::unbounded_channel();
+        runtime.panes.get_mut(&pane_id).unwrap().input_tx = input_tx;
+        let mut manager = manager_with_runtime(session_id, runtime);
+
+        manager.begin_attach(session_id, client_id).unwrap();
+        assert_eq!(
+            manager.write_input(session_id, client_id, b"attached input".to_vec()),
+            Ok((14, pane_id))
+        );
+        assert!(
+            std::iter::from_fn(|| input_rx.try_recv().ok()).any(|command| {
+                matches!(
+                    command,
+                    PaneRuntimeCommand::Input(bytes) if bytes == b"attached input"
+                )
+            })
+        );
+        manager.end_attach(session_id, client_id);
+        assert!(
+            crate::private_input::with_producer_admission(pane_id, client_id.0, || ()).is_none()
+        );
+        assert!(
+            manager
+                .write_input(session_id, client_id, b"denied".to_vec())
+                .is_err()
+        );
+        let pane = &manager.runtimes[&session_id].panes[&pane_id];
+        assert!(!pane.exited.load(Ordering::SeqCst));
+        assert!(!pane.execution.target_stop_issued.load(Ordering::SeqCst));
+        assert!(!pane.execution.group_kill_issued.load(Ordering::SeqCst));
+        manager.begin_attach(session_id, client_id).unwrap();
+        assert_eq!(
+            manager.write_input(session_id, client_id, b"again".to_vec()),
+            Ok((5, pane_id))
+        );
+    }
+
+    #[tokio::test]
+    async fn begin_attach_rejects_unregistered_producer_during_private_input() {
+        let session_id = SessionId(Uuid::new_v4());
+        let client_id = ClientId(Uuid::new_v4());
+        let existing_client = Uuid::new_v4();
+        let pane_id = Uuid::new_v4();
+        let nonce = Uuid::new_v4();
+        let runtime = runtime_with_panes(&[pane_id]);
+        let mut manager = manager_with_runtime(session_id, runtime);
+        assert!(crate::private_input::register_producer(
+            pane_id,
+            existing_client
+        ));
+        let generation = crate::private_input::begin_barrier(pane_id, nonce, true).unwrap();
+
+        // An in-flight barrier may admit membership only by invalidating its
+        // proof; a completed private interval must reject a new producer.
+        assert!(crate::private_input::acknowledge_producer(
+            pane_id,
+            nonce,
+            generation,
+            existing_client,
+            true
+        ));
+        assert!(crate::private_input::finish_barrier(
+            pane_id, nonce, generation
+        ));
+        assert_eq!(
+            manager.begin_attach(session_id, client_id),
+            Err(SessionRuntimeError::Closed)
+        );
+        assert!(
+            !manager.runtimes[&session_id]
+                .attached_clients
+                .contains(&client_id)
         );
     }
 
@@ -16993,6 +17148,13 @@ exit 7"#
             pane_exit_tx,
         };
         let adapter = adapter_for_manager(manager);
+        // This fixture inserts attached_clients directly rather than using the
+        // attach path, so establish the same authenticated producer membership
+        // before exercising its cross-session routing behavior.
+        assert!(crate::private_input::register_producer(
+            owner_pane_id,
+            client_id.0
+        ));
 
         let written = bmux_pane_runtime_state::SessionRuntimeManagerApi::write_input_to_pane(
             &adapter,
@@ -21207,6 +21369,7 @@ exit 7"#
         }
     }
 
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn preowner_launch_failure_retires_owned_guardian_without_inventing_exit() {
         supervisor::install_test_artifact()

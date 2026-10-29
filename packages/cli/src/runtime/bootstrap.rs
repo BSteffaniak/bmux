@@ -259,6 +259,31 @@ fn server_start_child_arguments(
     arguments
 }
 
+#[cfg(test)]
+#[test]
+fn server_start_future_size_diagnostic() {
+    eprintln!(
+        "server_start_inner bytes={}",
+        super::dispatch::future_size(|| {
+            run_server_start_inner(
+                false,
+                true,
+                None,
+                RecordingRollingStartOptions::default(),
+                None,
+                None,
+            )
+        })
+    );
+    eprintln!(
+        "plugin_bridge bytes={}",
+        super::dispatch::future_size(|| {
+            let (_, rx) = tokio::sync::watch::channel(false);
+            plugin_event_bridge_loop(std::sync::Arc::new(Vec::new()), rx)
+        })
+    );
+}
+
 // Keep the server lifecycle future off callers stack frames.
 pub(super) fn run_server_start(
     daemon: bool,
@@ -268,6 +293,19 @@ pub(super) fn run_server_start(
     pane_shell_integration_override: Option<bool>,
     startup_recording: Option<ManualRecordingStartOptions>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<u8>> + Send>> {
+    super::dispatch::startup_future_marker(
+        "server_start.before_construct",
+        super::dispatch::future_size(|| {
+            run_server_start_inner(
+                daemon,
+                foreground_internal,
+                rolling_enabled_override,
+                rolling_options.clone(),
+                pane_shell_integration_override,
+                startup_recording.clone(),
+            )
+        }),
+    );
     Box::pin(run_server_start_inner(
         daemon,
         foreground_internal,
@@ -287,6 +325,7 @@ async fn run_server_start_inner(
     pane_shell_integration_override: Option<bool>,
     startup_recording: Option<ManualRecordingStartOptions>,
 ) -> Result<u8> {
+    super::dispatch::startup_future_marker("server_start.first_poll", 0);
     let local_connection_context = ConnectionContext::new(Some("local"));
     let paths = ConfigPaths::default();
     // Retain the launcher's inherited startup fence before any endpoint or
@@ -403,6 +442,17 @@ async fn run_server_start_inner(
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::from(startup_output));
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            use windows_sys::Win32::System::Threading::{
+                CREATE_BREAKAWAY_FROM_JOB, DETACHED_PROCESS,
+            };
+            // Background servers must not inherit a caller-owned SSH job or
+            // console lifetime. Disallowed breakaway is an explicit launch
+            // failure; do not retry attached to the caller's job.
+            child.creation_flags(DETACHED_PROCESS | CREATE_BREAKAWAY_FROM_JOB);
+        }
         let mut child = child.spawn().context("failed to spawn background server")?;
 
         let started = std::time::Instant::now();
@@ -453,7 +503,9 @@ async fn run_server_start_inner(
     );
     register_snapshot_plugin_config(&config, &paths);
     register_pane_runtime_plugin_config(&config, &paths, pane_shell_integration_override);
+    super::dispatch::startup_future_marker("plugins.before_activate", 0);
     Box::pin(activate_loaded_plugins(&loaded_plugins, &config, &paths)).await?;
+    super::dispatch::startup_future_marker("plugins.after_activate", 0);
     dispatch_loaded_plugin_event(&loaded_plugins, &plugin_system_event("server_starting"))?;
     let server = BmuxServer::from_config_paths_with_start_options(
         &paths,

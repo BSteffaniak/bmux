@@ -34,7 +34,9 @@ capability PANE_RUNTIME_HUMAN_INPUT_V1 = bmux.pane_runtime.human.input.v1;
 
 @capability(PANE_RUNTIME_ENVIRONMENT_V1)
 interface pane-runtime-environment-v1 {
-    record environment-entry { key: bytes, value: bytes }
+    // Absent encoding is legacy unix-bytes; new callers identify the native format.
+    // Cross-platform representations are rejected, never lossily reinterpreted.
+    record environment-entry { key: bytes, value: bytes, encoding: string? }
     command capabilities() -> u32;
     command reserve(launch_mutation_id: uuid, options: pane-runtime-execution-v4.terminal-program-options,
         environment: list<environment-entry>) -> result<pane-runtime-execution-v4.terminal-launch-reservation, pane-runtime-execution-v4.terminal-recovery-error>;

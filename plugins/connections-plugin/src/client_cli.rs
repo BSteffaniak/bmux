@@ -40,16 +40,13 @@ fn local(context: &NativeCommandContext) -> Result<()> {
     }
     Ok(())
 }
-// Restore terminal echo on success and every error path. No shell subprocess or
-// command-line argument ever contains the invitation.
-struct Echo(libc::termios);
-impl Drop for Echo {
-    fn drop(&mut self) {
-        unsafe {
-            libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &raw const self.0);
-        }
-    }
-}
+#[cfg(unix)]
+#[path = "client_cli/echo_unix.rs"]
+mod echo;
+#[cfg(windows)]
+#[path = "client_cli/echo_windows.rs"]
+mod echo;
+
 fn prompt(label: &str, secret: bool) -> Result<String> {
     ensure!(
         std::io::stdin().is_terminal(),
@@ -57,23 +54,7 @@ fn prompt(label: &str, secret: bool) -> Result<String> {
     );
     eprint!("{label}: ");
     std::io::stderr().flush()?;
-    let guard = if secret {
-        let mut old = std::mem::MaybeUninit::<libc::termios>::uninit();
-        ensure!(
-            unsafe { libc::tcgetattr(libc::STDIN_FILENO, old.as_mut_ptr()) } == 0,
-            "cannot protect secret input"
-        );
-        let old = unsafe { old.assume_init() };
-        let mut hidden = old;
-        hidden.c_lflag &= !libc::ECHO;
-        ensure!(
-            unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &raw const hidden) } == 0,
-            "cannot protect secret input"
-        );
-        Some(Echo(old))
-    } else {
-        None
-    };
+    let guard = secret.then(echo::Echo::hide).transpose()?;
     // Bound input without echoing secret-bearing parser errors. Buffering also
     // avoids one syscall per byte while terminal echo is disabled.
     let mut bytes = Vec::new();

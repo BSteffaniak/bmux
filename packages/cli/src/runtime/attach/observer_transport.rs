@@ -12,7 +12,6 @@
 //! Records signify changes, never keepalives; EOF ends source liveness. Admit
 //! epochs explicitly and validate `<epoch>:<target>` and increasing revisions.
 //! A partial/rejected record must not replace the reader's last complete frame.
-#[cfg(unix)]
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -22,6 +21,9 @@ use bmux_web_renderer::{BrowserFrame, SurfaceProvenance};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::watch;
 use uuid::Uuid;
+
+#[path = "observer_transport/native/mod.rs"]
+mod native;
 
 use super::{AttachObserverPublisher, AttachSnapshot, attach_observer_channel};
 
@@ -262,8 +264,7 @@ where
 /// CLI dispatch entry for a private parent-owned channel, with no HTTP listener.
 ///
 /// # Errors
-/// Rejects non-absolute socket paths and failed bounded connect/attach/delivery.
-#[cfg(unix)]
+/// Rejects invalid native endpoints and failed bounded connect/attach/delivery.
 pub async fn run_private_worker(
     client: bmux_client::BmuxClient,
     session_id: Uuid,
@@ -271,14 +272,9 @@ pub async fn run_private_worker(
     cols: u16,
     rows: u16,
 ) -> Result<u8> {
-    anyhow::ensure!(
-        socket_path.is_absolute(),
-        "observer socket path must be absolute"
-    );
-    let stream = tokio::time::timeout(IO_DEADLINE, tokio::net::UnixStream::connect(socket_path))
+    let stream = tokio::time::timeout(IO_DEADLINE, native::connect(socket_path))
         .await
-        .context("observer socket connection timed out")?
-        .context("connect private observer socket")?;
+        .context("observer channel connection timed out")??;
     run_headless_observer(
         client,
         session_id,

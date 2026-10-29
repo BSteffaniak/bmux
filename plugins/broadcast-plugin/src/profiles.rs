@@ -79,69 +79,11 @@ pub(crate) fn name(value: &str) -> Result<(), &'static str> {
     }
     Ok(())
 }
-#[cfg(unix)]
-pub(crate) fn private_dir(path: &Path, create: bool) -> Result<(), &'static str> {
-    use std::os::unix::fs::MetadataExt;
-    if create {
-        let parent = path.parent().ok_or("private_directory_required")?;
-        let metadata =
-            std::fs::symlink_metadata(parent).map_err(|_| "private_directory_required")?;
-        // SAFETY: geteuid only observes this process's effective identity.
-        if !metadata.is_dir()
-            || metadata.file_type().is_symlink()
-            || metadata.uid() != unsafe { libc::geteuid() }
-            || metadata.mode() & 0o022 != 0
-        {
-            return Err("private_directory_required");
-        }
-        let mut builder = std::fs::DirBuilder::new();
-        use std::os::unix::fs::DirBuilderExt;
-        builder.mode(0o700);
-        match builder.create(path) {
-            Ok(()) => {
-                std::fs::File::open(parent)
-                    .and_then(|file| file.sync_all())
-                    .map_err(|_| "private_directory_required")?;
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(_) => return Err("private_directory_required"),
-        }
-    }
-    let m = std::fs::symlink_metadata(path).map_err(|_| "private_directory_required")?;
-    // SAFETY: geteuid only reads the effective process identity.
-    if !m.is_dir()
-        || m.file_type().is_symlink()
-        || m.uid() != unsafe { libc::geteuid() }
-        || m.mode() & 0o077 != 0
-    {
-        return Err("private_directory_required");
-    }
-    Ok(())
-}
-#[cfg(not(unix))]
-pub(crate) fn private_dir(_path: &Path, _create: bool) -> Result<(), &'static str> {
-    Err("private_storage_unsupported")
-}
+pub(crate) use crate::platform::private_dir;
 fn open_private(path: &Path) -> Result<std::fs::File, &'static str> {
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
-    }
-    let file = options.open(path).map_err(|_| "profiles_unavailable")?;
-    let m = file.metadata().map_err(|_| "profiles_unavailable")?;
-    if !m.is_file() || m.len() > 65536 {
+    let file = crate::platform::open_private(path).map_err(|_| "private_profiles_required")?;
+    if file.metadata().map_err(|_| "profiles_unavailable")?.len() > 65536 {
         return Err("profiles_bound");
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        // SAFETY: geteuid only reads the effective process identity.
-        if m.uid() != unsafe { libc::geteuid() } || m.mode() & 0o077 != 0 {
-            return Err("private_profiles_required");
-        }
     }
     Ok(file)
 }
@@ -206,32 +148,8 @@ pub(crate) fn update(
     profile.validate()?;
     let dir = root.join("broadcast");
     private_dir(&dir, true)?;
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true).write(true).create(true).truncate(false);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
-    }
-    let lock = options
-        .open(dir.join("profiles.lock"))
-        .map_err(|_| "profiles_locked")?;
-    #[cfg(unix)]
-    {
-        use std::os::fd::AsRawFd;
-        use std::os::unix::fs::MetadataExt;
-        let m = lock.metadata().map_err(|_| "profiles_locked")?;
-        // SAFETY: geteuid reads identity; flock operates on our owned valid descriptor.
-        if !m.is_file()
-            || m.mode() & 0o077 != 0
-            || m.uid() != unsafe { libc::geteuid() }
-            || unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0
-        {
-            return Err("profiles_locked_retry");
-        }
-    }
+    let _lock =
+        crate::platform::lock(&dir.join("profiles.lock")).map_err(|_| "profiles_locked_retry")?;
     let mut profiles = load(root)?;
     if !profiles.profiles.contains_key(key) && profiles.profiles.len() >= 32 {
         return Err("profile_limit");
@@ -248,19 +166,12 @@ fn save(dir: &Path, profiles: &Profiles) -> Result<(), &'static str> {
         return Err("profiles_bound");
     }
     let temp = dir.join(format!("profiles-{}.tmp", uuid::Uuid::new_v4()));
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options.open(&temp).map_err(|_| "profiles_unwritable")?;
+    let mut file = crate::platform::create_new(&temp).map_err(|_| "profiles_unwritable")?;
     let result = (|| {
         file.write_all(&bytes)?;
         file.sync_all()?;
-        std::fs::rename(&temp, dir.join("profiles.json"))?;
-        std::fs::File::open(dir)?.sync_all()
+        drop(file);
+        crate::platform::publish(&temp, &dir.join("profiles.json"))
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(temp);
@@ -275,19 +186,10 @@ pub(crate) fn import(root: &Path, profile: &str, source: &Path) -> Result<PathBu
     let dir = parent.join("credentials");
     private_dir(&dir, true)?;
     let path = dir.join(format!("{profile}-{}", uuid::Uuid::new_v4()));
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
-    }
-    let mut file = options.open(&path).map_err(|_| "credential_unwritable")?;
+    let mut file = crate::platform::create_new(&path).map_err(|_| "credential_unwritable")?;
     file.write_all(key.as_bytes())
         .and_then(|()| file.sync_all())
-        .and_then(|()| std::fs::File::open(&dir)?.sync_all())
+        .and_then(|()| crate::platform::sync_directory(&dir))
         .map_err(|_| "credential_unwritable")?;
     Ok(path)
 }
@@ -298,7 +200,7 @@ mod tests {
         Profile {
             endpoint: "https://example.com".into(),
             channel: channel.into(),
-            credential_file: "/private/key".into(),
+            credential_file: std::env::temp_dir().join("private-key"),
             terminal: TerminalDefaults::default(),
         }
     }

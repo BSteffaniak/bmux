@@ -17,7 +17,6 @@ struct Grants {
 static GRANTS: OnceLock<Mutex<Option<Grants>>> = OnceLock::new();
 
 pub fn initialize(runtime: &Path) -> Result<(), &'static str> {
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     let mut all = GRANTS
         .get_or_init(Mutex::default)
         .lock()
@@ -29,20 +28,14 @@ pub fn initialize(runtime: &Path) -> Result<(), &'static str> {
     proof.extend_from_slice(Uuid::new_v4().as_bytes());
     let path = runtime.join(PROOF_FILE);
     let temporary = runtime.join(format!("broadcast-proof-{}", Uuid::new_v4()));
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(&temporary)
-        .map_err(|_| "local_authorization_unavailable")?;
+    let mut file =
+        crate::platform::create_new(&temporary).map_err(|_| "local_authorization_unavailable")?;
     file.write_all(&proof)
         .map_err(|_| "local_authorization_unavailable")?;
     file.sync_all()
         .map_err(|_| "local_authorization_unavailable")?;
-    std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))
-        .map_err(|_| "local_authorization_unavailable")?;
-    std::fs::rename(&temporary, &path).map_err(|_| "local_authorization_unavailable")?;
+    drop(file);
+    crate::platform::publish(&temporary, &path).map_err(|_| "local_authorization_unavailable")?;
     *all = Some(Grants {
         proof,
         path,
@@ -106,20 +99,13 @@ pub fn revoke() {
 /// caller-chosen proof path, and tokens never enter diagnostic strings.
 pub fn local_proof(runtime: &Path) -> Result<Vec<u8>, &'static str> {
     use std::io::Read;
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-    let mut file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(runtime.join(PROOF_FILE))
-        .map_err(|_| "local_authorization_unavailable")?;
-    let metadata = file
+    let mut file = crate::platform::open_private(&runtime.join(PROOF_FILE))
+        .map_err(|_| "local_authorization_required")?;
+    if file
         .metadata()
-        .map_err(|_| "local_authorization_unavailable")?;
-    // SAFETY: geteuid observes process identity without memory access or side effects.
-    if !metadata.is_file()
-        || metadata.len() != 32
-        || metadata.mode() & 0o077 != 0
-        || metadata.uid() != unsafe { libc::geteuid() }
+        .map_err(|_| "local_authorization_unavailable")?
+        .len()
+        != 32
     {
         return Err("local_authorization_required");
     }

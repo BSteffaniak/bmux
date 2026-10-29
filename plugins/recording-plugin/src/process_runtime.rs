@@ -218,6 +218,52 @@ fn closed_original_events(
     })
 }
 
+fn validate_projected_output(directory: &Path) -> Result<()> {
+    use std::io::Read;
+    let manifest: crate::recording_runtime::Manifest =
+        serde_json::from_slice(&std::fs::read(directory.join("manifest.json"))?)?;
+    let mut projected = std::fs::File::open(directory.join("output.live"))?;
+    for name in &manifest.summary.segments {
+        ensure!(
+            Path::new(name).components().count() == 1 && !name.starts_with('.'),
+            "invalid original event segment"
+        );
+        let mut segment = std::fs::File::open(directory.join(name))?;
+        loop {
+            let mut prefix = [0; 4];
+            if segment.read(&mut prefix[..1])? == 0 {
+                break;
+            }
+            segment.read_exact(&mut prefix[1..])?;
+            let length = usize::try_from(u32::from_le_bytes(prefix))?;
+            ensure!(
+                length <= 16 * 1024 * 1024,
+                "original event frame exceeds bounded limit"
+            );
+            let mut bytes = vec![0; length];
+            segment.read_exact(&mut bytes)?;
+            let event: crate::process_artifacts::ProcessRecordingEvent =
+                bmux_codec::from_bytes(&bytes)?;
+            if event.kind == bmux_recording_protocol::RecordingEventKind::PaneOutputRaw
+                && let bmux_recording_protocol::RecordingPayload::Bytes { data } = event.payload
+            {
+                let mut actual = vec![0; data.len()];
+                projected.read_exact(&mut actual).context("recording raw boundary differs from execution authority: projected event stream truncated")?;
+                ensure!(
+                    actual == data,
+                    "recording raw boundary differs from execution authority: projected event bytes differ"
+                );
+            }
+        }
+    }
+    let mut extra = [0];
+    ensure!(
+        projected.read(&mut extra)? == 0,
+        "recording raw boundary differs from execution authority: projected stream has extra bytes"
+    );
+    Ok(())
+}
+
 fn original_writer_closed(directory: &std::path::Path, value: &process::RunStatus) -> Result<bool> {
     let path = directory.join("original-writer-closure.json");
     if !path.try_exists()? {
@@ -470,6 +516,28 @@ impl ProcessService {
         Ok(frame)
     }
 
+    fn retain_launch_outcome(
+        &self,
+        id: Uuid,
+        receipt: &pane::TerminalLaunchReceipt,
+    ) -> Result<process::RunStatus> {
+        let guard = self
+            .mutation
+            .lock()
+            .map_err(|_| anyhow::anyhow!("process authority lock poisoned"))?;
+        let store = self.store()?;
+        let mut value = store.load(id)?;
+        let previous = serde_json::to_vec(&value)?;
+        if !value.capture_finalized {
+            retain_incomplete_launch(&mut value, receipt);
+        }
+        if serde_json::to_vec(&value)? != previous {
+            store.replace(value.revision, &mut value)?;
+        }
+        drop(guard);
+        Ok(value)
+    }
+
     async fn refresh(&self, id: Uuid) -> Result<process::RunStatus> {
         let mut value = self.load(id)?;
         if value.capture_finalized {
@@ -499,6 +567,10 @@ impl ProcessService {
                 .await?
                 .map_err(|error| anyhow::anyhow!("reconcile: {error:?}"))?;
         }
+        self.store()?.write_authority(id, &authority)?;
+        if retain_incomplete_launch(&mut value, &authority.launch) {
+            return self.retain_launch_outcome(id, &authority.launch);
+        }
         let capture_active = crate::manual_handle()
             .and_then(|handle| {
                 handle.read().ok().and_then(|handle| {
@@ -518,7 +590,6 @@ impl ProcessService {
         let status = self
             .execution_status(&mut client, execution(&value)?, None)
             .await?;
-        self.store()?.write_authority(id, &authority)?;
         let guard = self
             .mutation
             .lock()
@@ -712,7 +783,7 @@ impl ProcessService {
         >,
     ) -> Result<process::RunStatus> {
         ensure!(
-            self.environment_capabilities().await? == 1,
+            self.environment_capabilities().await? == 2,
             "unsupported complete environment capability"
         );
         self.launch_environment(
@@ -792,17 +863,17 @@ impl ProcessService {
             execution_token: reservation.execution.execution_token,
         });
         store.replace(1, &mut value)?;
-        let launched = pane::client::launch(&mut client, reservation)
-            .await
-            .map(|result| result.map(|receipt| receipt.reservation.execution));
+        let launched = pane::client::launch(&mut client, reservation).await;
         match launched {
-            Ok(Ok(reference)) => {
+            Ok(Ok(receipt)) => {
+                let reference = receipt.reservation.execution.clone();
                 value.execution = Some(process::ExecutionRef {
                     session_id: reference.session_id,
                     pane_id: reference.pane_id,
                     execution_token: reference.execution_token,
                 });
                 value.phase = process::RunPhase::Running;
+                retain_incomplete_launch(&mut value, &receipt);
             }
             Err(error) => {
                 value.phase = process::RunPhase::RecoveryRequired;
@@ -928,52 +999,21 @@ impl ProcessService {
         Ok(())
     }
 
-    async fn verify_raw_source(&self, value: &process::RunStatus, watermark: u64) -> Result<()> {
-        use std::io::{Read, Seek, SeekFrom};
+    async fn persist_raw_source(&self, value: &process::RunStatus, watermark: u64) -> Result<()> {
         let reservation = self.store()?.reservation(value.run_id)?;
-        let mut cursor = reservation.initial_cursor;
-        let mut file = std::fs::File::open(
-            self.root
-                .join(value.recording_id.to_string())
-                .join("output.live"),
-        )?;
-        ensure!(
-            file.metadata()?.len() == watermark,
-            "recording raw boundary differs from execution authority"
-        );
         let mut client = ServiceCallerDispatchClient::new(self.caller.as_ref());
-        while cursor.offset < watermark {
-            let response = capture_resume(&mut client, cursor.clone()).await?;
-            match response {
-                pane::TerminalCaptureResponse::Batch { value: batch } => {
-                    ensure!(
-                        batch.cursor == cursor
-                            && batch.continuation.execution == cursor.execution
-                            && batch.continuation.spool_generation == cursor.spool_generation
-                            && batch.continuation.offset > cursor.offset
-                            && batch.continuation.offset <= watermark
-                            && batch
-                                .cursor
-                                .offset
-                                .checked_add(u64::try_from(batch.data.len())?)
-                                == Some(batch.continuation.offset),
-                        "canonical raw verification identity/boundary mismatch"
-                    );
-                    let mut recorded = vec![0; batch.data.len()];
-                    file.seek(SeekFrom::Start(cursor.offset))?;
-                    file.read_exact(&mut recorded)?;
-                    ensure!(
-                        recorded == batch.data,
-                        "event sink raw bytes differ from independently durable execution spool"
-                    );
-                    cursor = batch.continuation;
-                    tokio::task::yield_now().await;
-                }
-                pane::TerminalCaptureResponse::Gap { value: gap } => anyhow::bail!(
-                    "canonical source verification GAP: {}; cannot finalize incomplete recording",
-                    gap.reason
-                ),
-            }
+        let bytes = collect_raw_source(&mut client, reservation.initial_cursor, watermark).await?;
+        let path = self
+            .root
+            .join(value.recording_id.to_string())
+            .join("output.raw");
+        if path.try_exists()? {
+            ensure!(
+                std::fs::read(&path)? == bytes,
+                "persisted raw source differs from execution authority"
+            );
+        } else {
+            crate::durable::write_atomic(&path, &bytes)?;
         }
         Ok(())
     }
@@ -1054,7 +1094,8 @@ impl ProcessService {
         // Join the original writer before asynchronous independent spool verification;
         // never hold recording authority's mutex across a service round trip.
         self.close_original_writer(&initial, status.output_watermark)?;
-        self.verify_raw_source(&initial, status.output_watermark)
+        validate_projected_output(&self.root.join(initial.recording_id.to_string()))?;
+        self.persist_raw_source(&initial, status.output_watermark)
             .await?;
         self.persist_ordered_capture(&initial).await?;
         let guard = self
@@ -1077,10 +1118,10 @@ impl ProcessService {
             return Err(error);
         }
         // A drained PTY is not proof that canonical capture persisted every byte.
-        // Stop joins the writer; compare its committed output with runtime authority
+        // Stop joins the projected event writer; compare the independent raw copy with runtime authority
         // before acknowledging finalization, including interruption-recovery retries.
         ensure!(
-            std::fs::metadata(directory.join("output.live"))?.len() == status.output_watermark,
+            std::fs::metadata(directory.join("output.raw"))?.len() == status.output_watermark,
             "canonical capture does not match drained execution output watermark"
         );
         crate::durable::write_atomic(&directory.join("screen.txt"), final_screen.as_bytes())?;
@@ -1264,54 +1305,65 @@ impl process::RecordingProcessV4Service for ProcessService {
         Box::pin(async move {
             let value = self.refresh(run_id).await.map_err(failure)?;
             let directory = self.root.join(value.recording_id.to_string());
-            let durable_end = if let Some(acknowledgment) =
-                capture_writer_ack(value.recording_id).map_err(failure)?
-            {
-                if value.output_drained {
-                    crate::recording_runtime::writer_ack::wait_for_watermark(
-                        acknowledgment.clone(),
-                        value.output_watermark,
-                        tokio::time::Instant::now() + std::time::Duration::from_secs(1),
-                    )
-                    .await
-                    .map_err(failure)?;
-                }
-                let state = acknowledgment.borrow();
-                if let Some(error) = &state.error {
-                    return Err(failure(anyhow::anyhow!("recording writer failed: {error}")));
-                }
-                if !state.ready {
-                    return Err(failure(anyhow::anyhow!("recording writer is not ready")));
-                }
-                state.watermark
-            } else if original_writer_closed(&directory, &value).map_err(failure)? {
-                // Live sink absence is not success. A validated original closure
-                // receipt is an explicit offline authority, preserving timing.
-                value.output_watermark
-            } else if !value.timing_complete {
-                // Refresh explicitly repairs raw-only disk capture. Use its
-                // committed cursor, never infer writer health from file length.
-                let store = self.store().map_err(failure)?;
-                store
-                    .capture_cursor(run_id)
-                    .map_err(failure)?
-                    .unwrap_or(store.reservation(run_id).map_err(failure)?.initial_cursor)
-                    .offset
-            } else {
-                return Err(failure(anyhow::anyhow!(
-                    "recording writer acknowledgment unavailable"
-                )));
-            };
-            if value.output_drained && durable_end > value.output_watermark {
-                return Err(failure(anyhow::anyhow!(
-                    "capture exceeds drained execution output watermark"
-                )));
+            if value.capture_finalized {
+                return read_output_through(
+                    &directory,
+                    &value,
+                    since,
+                    max_bytes,
+                    Some(value.output_watermark),
+                )
+                .map_err(failure);
             }
-            // The execution status is the authority for this read's boundary;
-            // a concurrently advancing writer cannot enlarge that request.
-            let durable_end = durable_end.min(value.output_watermark);
-            read_output_through(&directory, &value, since, max_bytes, Some(durable_end))
-                .map_err(failure)
+            if let Some(ack) = capture_writer_ack(value.recording_id).map_err(failure)? {
+                crate::recording_runtime::writer_ack::wait_for_watermark(
+                    ack,
+                    0,
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+                )
+                .await
+                .map_err(failure)?;
+            }
+            ensure_read_limit(since, max_bytes, value.output_watermark).map_err(failure)?;
+            let mut cursor = self
+                .store()
+                .map_err(failure)?
+                .reservation(run_id)
+                .map_err(failure)?
+                .initial_cursor;
+            cursor.offset = since;
+            let mut client = ServiceCallerDispatchClient::new(self.caller.as_ref());
+            let response = pane::client::capture_resume(
+                &mut client,
+                cursor.clone(),
+                max_bytes.min(CAPTURE_READ_MAX_BYTES),
+            )
+            .await
+            .map_err(|error| failure(error.into()))?
+            .map_err(|error| failure(anyhow::anyhow!("raw capture read: {error:?}")))?;
+            match response {
+                pane::TerminalCaptureResponse::Batch { value: batch } => {
+                    validate_raw_batch(&cursor, &batch).map_err(failure)?;
+                    let mut data = batch.data;
+                    data.truncate(
+                        usize::try_from(value.output_watermark - since)
+                            .map_err(|error| failure(error.into()))?,
+                    );
+                    let next_cursor =
+                        since + u64::try_from(data.len()).map_err(|error| failure(error.into()))?;
+                    Ok(process::OutputRead {
+                        run_id,
+                        since,
+                        next_cursor,
+                        data,
+                        complete: value.output_drained && next_cursor == value.output_watermark,
+                    })
+                }
+                pane::TerminalCaptureResponse::Gap { value: gap } => Err(failure(anyhow::anyhow!(
+                    "canonical raw read GAP: {}",
+                    gap.reason
+                ))),
+            }
         })
     }
     fn screen(&self, run_id: Uuid) -> Reply<'_, String> {
@@ -1472,8 +1524,8 @@ impl process::RecordingProcessV4Service for ProcessService {
                     reason: "wait exceeds 30 seconds".into(),
                 });
             }
-            let value = self.load(run_id).map_err(failure)?;
-            if value.capture_finalized {
+            let value = self.refresh(run_id).await.map_err(failure)?;
+            if value.capture_finalized || value.recovery_required {
                 return Ok(value);
             }
             let mut client = ServiceCallerDispatchClient::new(self.caller.as_ref());
@@ -1540,7 +1592,12 @@ fn read_output_through(
         max_bytes > 0 && max_bytes <= 1024 * 1024,
         "max-bytes must be 1..1048576"
     );
-    let mut file = std::fs::File::open(directory.join("output.live"))?;
+    let source = if status.capture_finalized && directory.join("output.raw").try_exists()? {
+        directory.join("output.raw")
+    } else {
+        directory.join("output.live")
+    };
+    let mut file = std::fs::File::open(source)?;
     let length = file.metadata()?.len();
     ensure!(
         !status.output_drained || length <= status.output_watermark,
@@ -1569,9 +1626,258 @@ fn read_output_through(
     })
 }
 
+fn ensure_read_limit(since: u64, max_bytes: u32, watermark: u64) -> Result<()> {
+    ensure!(
+        max_bytes > 0 && max_bytes <= 1024 * 1024,
+        "max-bytes must be 1..1048576"
+    );
+    ensure!(since <= watermark, "cursor beyond captured output");
+    Ok(())
+}
+
+fn validate_raw_batch(
+    cursor: &pane::TerminalCaptureCursor,
+    batch: &pane::TerminalCaptureBatch,
+) -> Result<()> {
+    ensure!(
+        batch.cursor == *cursor
+            && batch.continuation.execution == cursor.execution
+            && batch.continuation.spool_generation == cursor.spool_generation
+            && cursor.offset.checked_add(u64::try_from(batch.data.len())?)
+                == Some(batch.continuation.offset),
+        "canonical raw verification identity/boundary mismatch"
+    );
+    Ok(())
+}
+
+async fn collect_raw_source(
+    client: &mut impl bmux_plugin_sdk::TypedDispatchClient,
+    mut cursor: pane::TerminalCaptureCursor,
+    watermark: u64,
+) -> Result<Vec<u8>> {
+    ensure!(
+        cursor.offset == 0 && watermark <= 64 * 1024 * 1024,
+        "invalid canonical raw boundary"
+    );
+    let mut bytes = Vec::new();
+    while cursor.offset < watermark {
+        match capture_resume(client, cursor.clone()).await? {
+            pane::TerminalCaptureResponse::Batch { value: batch } => {
+                ensure!(
+                    batch.cursor == cursor
+                        && batch.continuation.execution == cursor.execution
+                        && batch.continuation.spool_generation == cursor.spool_generation
+                        && batch.continuation.offset > cursor.offset
+                        && batch.continuation.offset <= watermark
+                        && cursor.offset.checked_add(u64::try_from(batch.data.len())?)
+                            == Some(batch.continuation.offset),
+                    "canonical raw verification identity/boundary mismatch"
+                );
+                bytes.extend_from_slice(&batch.data);
+                cursor = batch.continuation;
+                tokio::task::yield_now().await;
+            }
+            pane::TerminalCaptureResponse::Gap { value: gap } => anyhow::bail!(
+                "canonical source verification GAP: {}; cannot finalize incomplete recording",
+                gap.reason
+            ),
+        }
+    }
+    Ok(bytes)
+}
+
+/// A successful service envelope is not proof that a native target launched.
+/// Keep the execution owner's durable failure/uncertainty instead of replacing
+/// it with a secondary `NotFound` from a pane that was never published.
+fn retain_incomplete_launch(
+    value: &mut process::RunStatus,
+    receipt: &pane::TerminalLaunchReceipt,
+) -> bool {
+    if matches!(
+        receipt.phase,
+        pane::TerminalLaunchPhase::Running | pane::TerminalLaunchPhase::Exited
+    ) {
+        return false;
+    }
+    value.phase = process::RunPhase::RecoveryRequired;
+    value.recovery_required = true;
+    let error = format!(
+        "native launch {:?}; recovery required; refusing relaunch: {}",
+        receipt.phase,
+        receipt
+            .error
+            .as_deref()
+            .unwrap_or("no authoritative running execution")
+    );
+    if !value.errors.contains(&error) {
+        value.errors.push(error);
+    }
+    // Neither launch retirement nor failed startup proves capture EOF, target
+    // exit, or recording finalization. Those retain their independent authority.
+    true
+}
+
 #[cfg(test)]
 mod lifecycle_consumer_tests {
     use super::*;
+
+    #[test]
+    fn finalized_read_uses_raw_source_without_overwriting_projected_events() {
+        let root = std::env::temp_dir().join(format!("bmux-raw-read-{}", Uuid::new_v4()));
+        crate::durable::private_directory(&root).unwrap();
+        let raw = b"\x1b[6nvisible";
+        crate::durable::write_atomic(&root.join("output.raw"), raw).unwrap();
+        crate::durable::write_atomic(&root.join("output.live"), b"visible").unwrap();
+        let mut value = ProcessService::initial_status(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            "/owned".into(),
+        );
+        value.capture_finalized = true;
+        value.output_drained = true;
+        value.output_watermark = u64::try_from(raw.len()).unwrap();
+        let read = read_output(&root, &value, 0, 1024).unwrap();
+        assert_eq!(read.data, raw);
+        assert!(read.complete);
+        assert_eq!(std::fs::read(root.join("output.live")).unwrap(), b"visible");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    struct RawSourceClient(pane::TerminalCaptureBatch);
+    impl bmux_plugin_sdk::TypedDispatchClient for RawSourceClient {
+        fn invoke_service_raw(
+            &mut self,
+            _capability: &str,
+            _kind: bmux_ipc::InvokeServiceKind,
+            _interface: &str,
+            operation: &str,
+            payload: Vec<u8>,
+        ) -> impl std::future::Future<Output = bmux_plugin_sdk::TypedDispatchClientResult<Vec<u8>>>
+        {
+            std::future::poll_fn(move |_| {
+                assert_eq!(operation, "capture-resume");
+                let request: pane::client::CaptureResumeRequest =
+                    bmux_plugin_sdk::decode_service_message(&payload).unwrap();
+                assert_eq!(request.cursor, self.0.cursor);
+                let response: Result<pane::TerminalCaptureResponse, pane::TerminalRecoveryError> =
+                    Ok(pane::TerminalCaptureResponse::Batch {
+                        value: self.0.clone(),
+                    });
+                std::task::Poll::Ready(Ok(
+                    bmux_plugin_sdk::encode_service_message(&response).unwrap()
+                ))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn raw_source_preserves_bootstrap_query_separately_from_presentation() {
+        let cursor = pane::TerminalCaptureCursor {
+            execution: pane::TerminalExecutionRef {
+                session_id: Uuid::new_v4(),
+                pane_id: Uuid::new_v4(),
+                execution_token: Uuid::new_v4(),
+            },
+            spool_generation: Uuid::new_v4(),
+            offset: 0,
+        };
+        let raw = b"\x1b[6nvisible target output";
+        let batch: pane::TerminalCaptureBatch = serde_json::from_value(serde_json::json!({
+            "cursor": cursor, "continuation": {"execution": cursor.execution, "spool_generation": cursor.spool_generation, "offset": raw.len()},
+            "data": raw, "eof": true
+        })).unwrap();
+        let mut client = RawSourceClient(batch.clone());
+        assert_eq!(
+            collect_raw_source(&mut client, cursor.clone(), raw.len() as u64)
+                .await
+                .unwrap(),
+            raw
+        );
+        let mut wrong = batch.clone();
+        wrong.continuation.spool_generation = Uuid::new_v4();
+        assert!(
+            collect_raw_source(
+                &mut RawSourceClient(wrong),
+                cursor.clone(),
+                raw.len() as u64
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            collect_raw_source(&mut RawSourceClient(batch), cursor, raw.len() as u64 - 1)
+                .await
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn uncertain_native_launch_retains_startup_error_without_claiming_completion() {
+        let mut value = ProcessService::initial_status(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            "/owned/runtime".into(),
+        );
+        let receipt: pane::TerminalLaunchReceipt = serde_json::from_value(serde_json::json!({
+            "reservation": {
+                "execution": {"session_id": Uuid::new_v4(), "pane_id": Uuid::new_v4(), "execution_token": Uuid::new_v4()},
+                "launch_mutation_id": value.launch_mutation_id, "revision": 1,
+                "options": {"program": "cmd.exe", "args": [], "cwd": null, "env": {}, "cols": 80, "rows": 24},
+                "initial_cursor": {"execution": {"session_id": Uuid::new_v4(), "pane_id": Uuid::new_v4(), "execution_token": Uuid::new_v4()}, "spool_generation": Uuid::new_v4(), "offset": 0}
+            },
+            "phase": "uncertain", "revision": 3, "exit_code": null, "exit_signal": null,
+            "cleanup_complete": false,
+            "error": "program startup timed out; unpublished pane cleanup timed out"
+        })).unwrap();
+        assert!(retain_incomplete_launch(&mut value, &receipt));
+        assert!(matches!(value.phase, process::RunPhase::RecoveryRequired));
+        assert!(value.recovery_required);
+        assert!(value.errors[0].contains("program startup timed out"));
+        assert!(value.errors[0].contains("unpublished pane cleanup timed out"));
+        assert!(
+            !value.target_exited
+                && !value.capture_eof
+                && !value.capture_finalized
+                && !value.cleanup_complete
+        );
+        assert!(retain_incomplete_launch(&mut value, &receipt));
+        assert_eq!(
+            value.errors.len(),
+            1,
+            "reconciliation must not duplicate diagnostics"
+        );
+        for phase in [
+            pane::TerminalLaunchPhase::Reserved,
+            pane::TerminalLaunchPhase::Launching,
+            pane::TerminalLaunchPhase::Failed,
+            pane::TerminalLaunchPhase::Retired,
+        ] {
+            let mut receipt = receipt.clone();
+            receipt.phase = phase;
+            let mut observed = value.clone();
+            assert!(retain_incomplete_launch(&mut observed, &receipt));
+            assert!(matches!(
+                observed.phase,
+                process::RunPhase::RecoveryRequired
+            ));
+            assert!(observed.recovery_required);
+            assert!(
+                !observed.target_exited
+                    && !observed.capture_finalized
+                    && !observed.cleanup_complete
+            );
+        }
+        for phase in [
+            pane::TerminalLaunchPhase::Running,
+            pane::TerminalLaunchPhase::Exited,
+        ] {
+            let mut receipt = receipt.clone();
+            receipt.phase = phase;
+            assert!(!retain_incomplete_launch(&mut value, &receipt));
+        }
+    }
 
     fn execution_status(phase: pane::TerminalExecutionPhase) -> pane::TerminalExecutionStatus {
         pane::TerminalExecutionStatus {

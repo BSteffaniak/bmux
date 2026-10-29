@@ -68,12 +68,14 @@ impl BmuxCommandSandbox {
     fn new(label: &str) -> Self {
         let root = TempDirGuard::new(label);
         for dir in ["config", "runtime", "data", "state", "logs"] {
-            let mut builder = std::fs::DirBuilder::new();
+            let builder = std::fs::DirBuilder::new();
             #[cfg(unix)]
-            {
+            let builder = {
                 use std::os::unix::fs::DirBuilderExt as _;
+                let mut builder = builder;
                 builder.mode(0o700);
-            }
+                builder
+            };
             builder
                 .create(root.path().join(dir))
                 .expect("create private sandbox dir");

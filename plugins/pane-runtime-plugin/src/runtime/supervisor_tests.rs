@@ -7,6 +7,31 @@ fn missing_helper_fails_closed_even_for_ordinary_shells() {
     }
 }
 
+#[test]
+fn selected_backend_retains_guardian_command_not_application_argv() {
+    let artifact = std::env::temp_dir().join("bmux-test-execution-supervisor");
+    let control = super::SupervisorControl {
+        _admission: crate::runtime::managed_idle::admit().unwrap(),
+        directory: std::path::PathBuf::new(),
+        endpoint: std::path::PathBuf::new(),
+        token: "test".into(),
+        authentication: "test".into(),
+        version: crate::supervisor_protocol::VERSION,
+        artifact: artifact.clone(),
+        lifetime: std::sync::Mutex::new(super::Lifetime::default()),
+    };
+    let mut command = portable_pty::CommandBuilder::new(&artifact);
+    command.arg("--guardian-test");
+    command.arg("bootstrap.json");
+    let expected = command.get_argv().clone();
+    let selected = super::select_backend(Ok((control, command)), true)
+        .unwrap()
+        .unwrap();
+    assert_eq!(selected.0.artifact, artifact);
+    assert_eq!(selected.1.get_argv(), &expected);
+    assert_ne!(selected.1.get_argv()[0], std::ffi::OsStr::new("cmd.exe"));
+}
+
 #[cfg(unix)]
 #[test]
 fn long_runtime_parent_does_not_lengthen_control_endpoint() {
@@ -37,6 +62,7 @@ fn pane_lifetime_close_is_idempotent_and_control_drop_closes_lease() {
         super::SupervisorControl {
             _admission: crate::runtime::managed_idle::admit().unwrap(),
             directory: std::path::PathBuf::new(),
+            endpoint: std::path::PathBuf::new(),
             token: "test".into(),
             authentication: "test".into(),
             version: crate::supervisor_protocol::VERSION,
@@ -63,7 +89,6 @@ fn pane_lifetime_close_is_idempotent_and_control_drop_closes_lease() {
     }
 }
 
-#[cfg(unix)]
 fn snapshot(revision: u64) -> crate::supervisor_protocol::LifecycleSnapshot {
     use crate::supervisor_protocol::{self as protocol, Response};
     protocol::LifecycleSnapshot {
@@ -85,7 +110,6 @@ fn snapshot(revision: u64) -> crate::supervisor_protocol::LifecycleSnapshot {
         },
     }
 }
-#[cfg(unix)]
 #[test]
 fn lifecycle_rejects_stale_foreign_and_unnegotiated_snapshots() {
     let mut value = snapshot(2);
@@ -111,7 +135,7 @@ fn watcher_retains_initial_and_shutdown_is_error_not_completion() {
         assert_eq!(watcher.initial().status.terminal_session_ended, Some(false));
         watcher.next().is_err()
     });
-    interrupt.shutdown(std::net::Shutdown::Both).unwrap();
+    interrupt.interrupt().unwrap();
     assert!(waiter.join().unwrap());
     drop(peer);
 }

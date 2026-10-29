@@ -70,12 +70,14 @@ impl ServerEnv {
         let state_dir = root.path().join("state");
         let log_dir = root.path().join("logs");
         for path in [&runtime_dir, &config_dir, &data_dir, &state_dir, &log_dir] {
-            let mut builder = std::fs::DirBuilder::new();
+            let builder = std::fs::DirBuilder::new();
             #[cfg(unix)]
-            {
+            let builder = {
                 use std::os::unix::fs::DirBuilderExt as _;
+                let mut builder = builder;
                 builder.mode(0o700);
-            }
+                builder
+            };
             builder
                 .create(path)
                 .expect("create isolated private bmux directory");

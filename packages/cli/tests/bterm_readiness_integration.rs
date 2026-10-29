@@ -120,6 +120,7 @@ async fn fresh_companion_exposes_authoritative_readiness() {
     let mut server = support::ServerEnv::new("bterm-readiness");
     server.start();
     let endpoint = bmux_ipc::IpcEndpoint::UnixSocket(server.runtime_dir.join("server.sock"));
+    // Activation verifies identity before serving readiness requests.
     let mut client = bmux_client::BmuxClient::connect(
         &endpoint,
         std::time::Duration::from_secs(5),
@@ -150,6 +151,34 @@ async fn fresh_companion_exposes_authoritative_readiness() {
         readiness.executable_sha256.is_none(),
         "ordinary server has no immutable-bundle startup attestation; do not report a mutable pathname hash as mapped-image proof"
     );
+    #[cfg(target_os = "linux")]
+    {
+        let digest = readiness
+            .executable_sha256
+            .as_ref()
+            .expect("full executable identity");
+        assert_eq!(digest.len(), 64);
+        assert!(digest.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    }
     assert!(readiness.helper_ready || readiness.helper_error.is_some());
+    // Repeated readiness requests retain the same activation identity.
+    let mut warm_client = bmux_client::BmuxClient::connect(
+        &endpoint,
+        std::time::Duration::from_secs(5),
+        "bterm-readiness-cached-test",
+    )
+    .await
+    .unwrap();
+    warm_client.require_service_contracts().unwrap();
+    let cached =
+        bmux_pane_runtime_plugin_api::pane_runtime_readiness_v1::client::runtime_readiness(
+            &mut warm_client,
+        )
+        .await
+        .expect("cached readiness must not repeat cold executable hashing");
+    assert_eq!(cached.runtime_dir, readiness.runtime_dir);
+    assert_eq!(cached.instance, readiness.instance);
+    assert_eq!(cached.executable_sha256, readiness.executable_sha256);
+    assert!(!cached.fenced);
     server.stop();
 }

@@ -267,6 +267,8 @@ impl ConsensusNode {
     ///
     /// Returns a Raft initialization error when durable state is non-pristine
     /// or the node cannot commit the initial membership.
+    // Preserve OpenRaft's public initialization error without an API-breaking box.
+    #[allow(clippy::result_large_err)]
     pub async fn initialize_single(
         &self,
         node_id: NodeId,

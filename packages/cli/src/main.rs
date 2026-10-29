@@ -6,6 +6,9 @@ use std::process::ExitCode;
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    if std::env::var_os("BMUX_DIAG_STARTUP_FUTURES").is_some() {
+        eprintln!("startup.future main.first_poll");
+    }
     let exit_code = match bmux_cli::run_cli().await {
         Ok(code) => ExitCode::from(code),
         Err(error) => {

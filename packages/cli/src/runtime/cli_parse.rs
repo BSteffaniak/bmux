@@ -44,15 +44,20 @@ struct RawRuntimeOverrides {
 }
 
 pub(super) fn parse_runtime_cli() -> Result<ParsedRuntimeCli> {
+    super::startup_future_marker("parse.enter", 0);
     let total_started = Instant::now();
     let argv_started = Instant::now();
     let argv = std::env::args_os().collect::<Vec<_>>();
+    super::startup_future_marker("parse.raw_overrides.before", 0);
     let raw_overrides = apply_runtime_override_from_raw_args(&argv)?;
+    super::startup_future_marker("parse.raw_overrides.after", 0);
     let argv_us = argv_started.elapsed().as_micros();
     let slot_started = Instant::now();
     // Resolve the active slot (if any) before loading config, so that
     // slot-aware paths / env propagation apply to the rest of bootstrap.
+    super::startup_future_marker("parse.slot.before", 0);
     let slot_state = super::slot::active_slot().clone();
+    super::startup_future_marker("parse.slot.after", 0);
     if let super::slot::ActiveSlotState::Resolved { slot, .. } = &slot_state {
         // Propagate BMUX_SLOT_NAME so child processes (daemon, sandboxed
         // re-execs, etc.) inherit the active slot name.
@@ -66,6 +71,7 @@ pub(super) fn parse_runtime_cli() -> Result<ParsedRuntimeCli> {
         );
     }
     let slot_us = slot_started.elapsed().as_micros();
+    super::startup_future_marker("parse.before_config", 0);
     let config_started = Instant::now();
     let mut config_overrides = ConfigLoadOverrides::from_env_with_cli(raw_overrides.config_path);
     // When a slot is active and `inherit_base = true`, layer the shared
@@ -83,14 +89,21 @@ pub(super) fn parse_runtime_cli() -> Result<ParsedRuntimeCli> {
         let cfg = BmuxConfig::load_with_overrides(&config_overrides)?;
         (cfg, ConfigPaths::default())
     };
+    super::startup_future_marker("parse.after_config", 0);
     let config_us = config_started.elapsed().as_micros();
     let scan_started = Instant::now();
+    super::startup_future_marker("parse.scan.before", 0);
     let registry = Arc::new(scan_available_plugins(&config, &paths)?);
+    super::startup_future_marker("parse.scan.after", 0);
     let scan_us = scan_started.elapsed().as_micros();
     let state_started = Instant::now();
+    super::startup_future_marker("parse.command_state.before", 0);
     let command_state = build_runtime_command_state(config.clone(), paths, Arc::clone(&registry))?;
+    super::startup_future_marker("parse.command_state.after", 0);
     install_enabled_client_adapters(&config, &registry, &command_state.paths);
+    super::startup_future_marker("parse.after_client_adapters", 0);
     let state_us = state_started.elapsed().as_micros();
+    super::startup_future_marker("parse.before_registry_parse", 0);
     let parse_started = Instant::now();
     let parsed = parse_runtime_cli_with_registry(
         &argv,
@@ -221,15 +234,18 @@ pub(super) fn parse_runtime_cli_with_registry(
     command_state: Option<RuntimeCommandState>,
     config_overrides: ConfigLoadOverrides,
 ) -> Result<ParsedRuntimeCli> {
+    super::startup_future_marker("parse.registry.enter", 0);
     let total_started = Instant::now();
     let mut command_config = config.clone();
     command_config.plugins.enabled = command_state.as_ref().map_or_else(
         || effective_enabled_plugins(config, registry),
         |state| state.enabled_plugins.clone(),
     );
+    super::startup_future_marker("parse.registry.before_build", 0);
     let registry_started = Instant::now();
     let command_registry = PluginCommandRegistry::build(&command_config, registry)
         .context("failed building plugin CLI command registry")?;
+    super::startup_future_marker("parse.registry.after_build", 0);
     let registry_us = registry_started.elapsed().as_micros();
     let resolve_started = Instant::now();
     if let Some(raw_args) = argv
@@ -280,11 +296,15 @@ pub(super) fn parse_runtime_cli_with_registry(
         }
     }
     let resolve_us = resolve_started.elapsed().as_micros();
+    super::startup_future_marker("parse.before_clap_command", 0);
     let clap_augment_started = Instant::now();
+    let clap_command = Cli::command();
+    super::startup_future_marker("parse.after_clap_command", 0);
     let clap_command = command_registry
-        .augment_clap_command(Cli::command())
+        .augment_clap_command(clap_command)
         .context("failed augmenting CLI with plugin commands")?;
     let clap_augment_us = clap_augment_started.elapsed().as_micros();
+    super::startup_future_marker("parse.before_clap_matches", 0);
     let clap_parse_started = Instant::now();
     let matches = match clap_command.try_get_matches_from(argv.iter().cloned()) {
         Ok(matches) => matches,

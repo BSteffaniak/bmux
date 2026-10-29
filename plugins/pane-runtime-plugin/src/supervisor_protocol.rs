@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 
-pub const VERSION: u32 = 7;
+pub const VERSION: u32 = 8;
 pub const LIFECYCLE_CAPABILITY: u32 = 1;
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -36,6 +36,8 @@ pub struct Request {
 #[serde(tag = "operation", rename_all = "snake_case")]
 pub enum Operation {
     Hello,
+    /// Bind the server-owned lifetime channel on backends without inherited IPC.
+    BindLifetime,
     // Explicit private negotiation; v4 status/mutation semantics are unchanged.
     Subscribe {
         capability: u32,
@@ -48,6 +50,9 @@ pub enum Operation {
         env: BTreeMap<String, String>,
         #[serde(default)]
         native_env: Option<Vec<(Vec<u8>, Vec<u8>)>>,
+        /// Explicit native representation; absence is the legacy Unix byte format.
+        #[serde(default)]
+        native_env_encoding: Option<String>,
     },
     Status,
     Term {
@@ -127,6 +132,7 @@ mod tests {
                 args: Vec::new(),
                 cwd: None,
                 env: BTreeMap::new(),
+                native_env_encoding: Some("unix-bytes".into()),
                 native_env: Some(vec![(b"KEY".to_vec(), vec![255; 1024 * 1024 - 3])]),
             },
         };

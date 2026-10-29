@@ -7,7 +7,7 @@
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use bmux_client::BmuxClient;
@@ -89,8 +89,8 @@ impl SandboxServer {
                 root,
             )
         } else {
-            let (paths, root) = create_temp_paths();
-            create_private_directory(&root)?;
+            let (paths, root) =
+                create_temp_paths().context("failed allocating private sandbox root")?;
             create_private_directory(&paths.runtime_dir)?;
             (paths, root)
         };
@@ -283,29 +283,46 @@ impl Drop for SandboxServer {
 
 // ── Temp directory creation ──────────────────────────────────────────────────
 
+#[cfg(unix)]
 fn create_private_directory(path: &Path) -> std::io::Result<()> {
-    let mut builder = std::fs::DirBuilder::new();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt as _;
-        builder.mode(0o700);
-    }
+    use std::os::unix::fs::DirBuilderExt as _;
     // Exclusive creation: never adopt, follow or repair an existing root.
-    builder.create(path)
+    std::fs::DirBuilder::new().mode(0o700).create(path)
 }
 
-fn create_temp_paths() -> (ConfigPaths, PathBuf) {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos());
-    let root = std::env::temp_dir().join(format!("bpb-{nanos:x}-{}", std::process::id()));
+#[cfg(not(unix))]
+fn create_private_directory(path: &Path) -> std::io::Result<()> {
+    std::fs::DirBuilder::new().create(path)
+}
+
+// Candidate names are not ownership: only successful exclusive creation is.
+// Retry collisions without inspecting, repairing or deleting the occupied path.
+fn allocate_private_root(mut candidate: impl FnMut() -> PathBuf) -> std::io::Result<PathBuf> {
+    for _ in 0..32 {
+        let root = candidate();
+        match create_private_directory(&root) {
+            Ok(()) => return Ok(root),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "private sandbox root collision retry budget exhausted",
+    ))
+}
+
+fn create_temp_paths() -> std::io::Result<(ConfigPaths, PathBuf)> {
+    let parent = std::env::temp_dir();
+    let root =
+        allocate_private_root(|| parent.join(format!("bpb-{}", uuid::Uuid::new_v4().simple())))?;
     let paths = ConfigPaths::new(
         root.join("c"),
         root.join("r"),
         root.join("d"),
         root.join("s"),
     );
-    (paths, root)
+    Ok((paths, root))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -818,6 +835,105 @@ impl ServerHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn private_root_allocation_retries_collisions_without_adopting_paths() {
+        let parent = tempfile::tempdir().unwrap();
+        let occupied = parent.path().join("occupied");
+        create_private_directory(&occupied).unwrap();
+        let marker = occupied.join("marker");
+        std::fs::write(&marker, b"untouched").unwrap();
+        let file = parent.path().join("file");
+        std::fs::write(&file, b"also untouched").unwrap();
+        let fresh = parent.path().join("fresh");
+        let mut candidates = [occupied.clone(), file.clone(), fresh.clone()].into_iter();
+        let allocated = allocate_private_root(|| candidates.next().unwrap()).unwrap();
+        assert_eq!(allocated, fresh);
+        assert_eq!(std::fs::read(marker).unwrap(), b"untouched");
+        assert_eq!(std::fs::read(file).unwrap(), b"also untouched");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                std::fs::metadata(allocated).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_root_allocation_never_follows_or_removes_collision_symlinks() {
+        let parent = tempfile::tempdir().unwrap();
+        let target = parent.path().join("missing-target");
+        let alias = parent.path().join("alias");
+        std::os::unix::fs::symlink(&target, &alias).unwrap();
+        let fresh = parent.path().join("fresh");
+        let mut candidates = [alias.clone(), fresh.clone()].into_iter();
+        assert_eq!(
+            allocate_private_root(|| candidates.next().unwrap()).unwrap(),
+            fresh
+        );
+        assert_eq!(std::fs::read_link(alias).unwrap(), target);
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn private_root_allocation_bounds_collisions_and_propagates_other_errors() {
+        let parent = tempfile::tempdir().unwrap();
+        let occupied = parent.path().join("occupied");
+        std::fs::write(&occupied, b"untouched").unwrap();
+        let mut attempts = 0;
+        let error = allocate_private_root(|| {
+            attempts += 1;
+            occupied.clone()
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(attempts, 32);
+        assert_eq!(std::fs::read(occupied).unwrap(), b"untouched");
+        let mut attempts = 0;
+        let error = allocate_private_root(|| {
+            attempts += 1;
+            parent.path().join("missing-parent").join("root")
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    fn private_root_allocation_is_exclusive_under_concurrency() {
+        let parent = tempfile::tempdir().unwrap();
+        let barrier = std::sync::Barrier::new(16);
+        let roots = std::thread::scope(|scope| {
+            let workers = (0..16)
+                .map(|worker| {
+                    let parent = parent.path();
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        let mut first = true;
+                        barrier.wait();
+                        allocate_private_root(|| {
+                            if std::mem::take(&mut first) {
+                                parent.join("shared-first-candidate")
+                            } else {
+                                parent.join(format!("worker-{worker}"))
+                            }
+                        })
+                        .unwrap()
+                    })
+                })
+                .collect::<Vec<_>>();
+            workers
+                .into_iter()
+                .map(|worker| worker.join().unwrap())
+                .collect::<std::collections::HashSet<_>>()
+        });
+        assert_eq!(roots.len(), 16);
+        assert!(roots.iter().all(|root| root.is_dir()));
+    }
 
     #[cfg(unix)]
     #[test]

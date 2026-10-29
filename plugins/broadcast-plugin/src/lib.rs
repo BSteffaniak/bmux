@@ -12,6 +12,7 @@ mod deploy;
 mod diagnostics;
 mod indicator;
 mod mirror;
+mod platform;
 mod presentation;
 mod profiles;
 pub use controller::DeliveryCounters;

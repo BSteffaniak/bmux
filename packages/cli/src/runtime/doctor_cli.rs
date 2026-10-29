@@ -154,25 +154,28 @@ fn hosted_runtime_is_running(path: &PathBuf) -> bool {
         return false;
     };
 
-    #[cfg(unix)]
-    {
-        std::process::Command::new("kill")
-            .args(["-0", &pid.to_string()])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok_and(|status| status.success())
-    }
-    #[cfg(windows)]
-    {
-        return std::process::Command::new("tasklist")
-            .args(["/FI", &format!("PID eq {pid}")])
-            .output()
-            .is_ok_and(|output| {
-                output.status.success()
-                    && String::from_utf8_lossy(&output.stdout).contains(&pid.to_string())
-            });
-    }
+    hosted_process_is_running(pid)
+}
+
+#[cfg(unix)]
+fn hosted_process_is_running(pid: u32) -> bool {
+    std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+#[cfg(windows)]
+fn hosted_process_is_running(pid: u32) -> bool {
+    std::process::Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}")])
+        .output()
+        .is_ok_and(|output| {
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout).contains(&pid.to_string())
+        })
 }
 
 // ── text output ─────────────────────────────────────────────────────────

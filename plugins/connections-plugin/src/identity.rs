@@ -180,6 +180,7 @@ impl DeviceIdentity {
 mod tests {
     use super::*;
     use std::fmt::Write;
+    #[cfg(unix)]
     use std::os::unix::fs::{PermissionsExt, symlink};
 
     fn roots(root: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
@@ -350,6 +351,7 @@ mod tests {
                 .endpoint_id(),
             ids[0]
         );
+        #[cfg(unix)]
         assert_eq!(
             std::fs::metadata(record_path(&state))
                 .unwrap()
@@ -383,6 +385,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn corrupt_unknown_inconsistent_and_insecure_records_are_not_rotated() {
         for mutation in [

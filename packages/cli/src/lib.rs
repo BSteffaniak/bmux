@@ -29,5 +29,6 @@ pub(crate) fn reqwest_client() -> reqwest::Client {
 /// # Errors
 /// Returns an error when CLI parsing, command execution, or runtime startup fails.
 pub async fn run_cli() -> anyhow::Result<u8> {
+    runtime::startup_future_marker("run_cli.first_poll", 0);
     Box::pin(runtime::run()).await
 }
