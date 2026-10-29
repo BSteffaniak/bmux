@@ -6,6 +6,42 @@ use std::{
     process::Command,
 };
 
+/// Select a Cargo build profile, never an arbitrary artifact path. Cargo remains
+/// responsible for checking that custom profiles exist in the workspace manifest.
+pub(crate) fn profile(requested: Option<&str>) -> Result<&str> {
+    let profile = requested.unwrap_or("dev");
+    if profile.is_empty()
+        || profile.starts_with('-')
+        || !profile
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        || matches!(
+            profile,
+            "debug" | "build" | "check" | "doc" | "test" | "bench"
+        )
+    {
+        return Err(error(
+            "invalid bterm build profile: use dev, release, profiling, or a named Cargo build profile (not a path or test/bench profile)",
+        ));
+    }
+    Ok(profile)
+}
+
+fn profile_directory(profile: &str) -> &str {
+    if profile == "dev" { "debug" } else { profile }
+}
+
+fn build_arguments(
+    target: &str,
+    profile: &str,
+    declarations: &[serde_json::Value],
+) -> Result<Vec<String>> {
+    let profile = self::profile(Some(profile))?;
+    let mut arguments = crate::build::arguments(target, profile, declarations)?;
+    arguments.extend(["-p".into(), "bterm".into(), "--bin".into(), "bterm".into()]);
+    Ok(arguments)
+}
+
 fn cargo() -> Command {
     Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
 }
@@ -162,7 +198,8 @@ pub(crate) struct BuiltBundle {
 }
 
 /// Build, replace and verify the bundle without consulting or starting a runtime.
-pub(crate) fn build(workspace: &Path) -> Result<BuiltBundle> {
+pub(crate) fn build(workspace: &Path, profile: &str) -> Result<BuiltBundle> {
+    let profile = self::profile(Some(profile))?;
     let target = crate::build::host_target(workspace)?;
     if !target.contains("apple-darwin") && !target.contains("linux") {
         return Err(error(
@@ -192,9 +229,11 @@ pub(crate) fn build(workspace: &Path) -> Result<BuiltBundle> {
         .open(owned.join("run.lock"))?;
     lock.try_lock()
         .map_err(|err| error(format!("another bterm build/run may be active: {err}")))?;
-    let mut arguments =
-        crate::build::arguments(&target, "dev", &crate::artifacts::declarations(workspace)?)?;
-    arguments.extend(["-p".into(), "bterm".into(), "--bin".into(), "bterm".into()]);
+    let arguments = build_arguments(
+        &target,
+        profile,
+        &crate::artifacts::declarations(workspace)?,
+    )?;
     let status = cargo().args(arguments).current_dir(workspace).status()?;
     if !status.success() {
         return Err(error(format!("bterm build failed: {status}")));
@@ -206,7 +245,7 @@ pub(crate) fn build(workspace: &Path) -> Result<BuiltBundle> {
     });
     let bundle = refresh(
         workspace,
-        &target_dir.join(&target).join("debug"),
+        &target_dir.join(&target).join(profile_directory(profile)),
         &bundle,
         &target,
     )?;
@@ -216,8 +255,8 @@ pub(crate) fn build(workspace: &Path) -> Result<BuiltBundle> {
     })
 }
 
-pub(crate) fn run(workspace: &Path) -> Result<()> {
-    let built = build(workspace)?;
+pub(crate) fn run(workspace: &Path, profile: &str) -> Result<()> {
+    let built = build(workspace, profile)?;
     let state = managed_root(workspace)?;
     eprintln!(
         "Launching {}\nManaged runtime root: {}",
@@ -238,6 +277,95 @@ pub(crate) fn run(workspace: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn build_profiles_default_map_and_reject_unsafe_or_reserved_names() {
+        assert_eq!(profile(None).unwrap(), "dev");
+        for (selected, directory) in [
+            ("dev", "debug"),
+            ("release", "release"),
+            ("profiling", "profiling"),
+            ("custom-fast_2", "custom-fast_2"),
+        ] {
+            assert_eq!(profile(Some(selected)).unwrap(), selected);
+            assert_eq!(profile_directory(selected), directory);
+        }
+        for selected in [
+            "",
+            "debug",
+            "test",
+            "bench",
+            "build",
+            "check",
+            "doc",
+            "../release",
+            "/tmp/release",
+            "a/b",
+            "a\\b",
+            "--release",
+            "release ",
+            ".",
+            "..",
+        ] {
+            assert!(profile(Some(selected)).is_err(), "accepted {selected:?}");
+        }
+    }
+
+    #[test]
+    fn every_product_artifact_uses_the_exact_selected_profile() {
+        let declarations = vec![serde_json::json!({
+            "cargo_package": "worker_plugin", "cargo_binary": "worker"
+        })];
+        for profile in ["dev", "release", "profiling", "custom-fast_2"] {
+            let arguments =
+                build_arguments("aarch64-apple-darwin", profile, &declarations).unwrap();
+            assert_eq!(
+                arguments.iter().filter(|arg| *arg == "--profile").count(),
+                1
+            );
+            assert!(
+                arguments
+                    .windows(2)
+                    .any(|pair| pair == ["--profile", profile])
+            );
+            for binary in ["bmux", "xtask", "worker", "bterm"] {
+                assert!(arguments.windows(2).any(|pair| pair == ["--bin", binary]));
+            }
+            assert!(!arguments.iter().any(|arg| arg == "--release"));
+        }
+    }
+
+    #[test]
+    fn cli_rejects_invalid_profiles_before_build_or_launch() {
+        for operation in ["build", "run"] {
+            for profile in ["../release", "debug", "test", "bench"] {
+                let error = crate::run(vec![
+                    "bterm".into(),
+                    operation.into(),
+                    "--profile".into(),
+                    profile.into(),
+                ])
+                .err()
+                .unwrap();
+                assert!(error.to_string().contains("invalid bterm build profile"));
+            }
+        }
+        for operation in ["stage", "verify"] {
+            let error = crate::run(vec![
+                "bterm".into(),
+                operation.into(),
+                "--profile".into(),
+                "release".into(),
+            ])
+            .err()
+            .unwrap();
+            assert!(
+                error
+                    .to_string()
+                    .contains("only supported for bterm build/run")
+            );
+        }
+    }
 
     #[test]
     fn repeated_refresh_replaces_bundle_and_preserves_state_and_failed_build() {

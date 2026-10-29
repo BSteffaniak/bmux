@@ -296,6 +296,77 @@ mod tests {
     }
 
     #[test]
+    fn baseline_workload_cells_rasterize_at_scale_two() {
+        // Match 16 logical pixels at scale 2, but keep each retained cell's
+        // cluster intact. Separate bundled/system passes identify host fallback
+        // involvement without retrying failed glyphs in the presentation path.
+        for (font_set, mut raster) in [
+            ("bundled", TextRasterizer::bundled().unwrap()),
+            ("system", TextRasterizer::with_system_fonts().unwrap()),
+        ] {
+            for text in [
+                "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "r", "e", "v", "=", "f", "n",
+                "d", "(", ")", "{", "t", "a", "i", "x", "}", "c", "é", "e\u{301}", "界",
+            ] {
+                let columns = if text == "界" { 2 } else { 1 };
+                let face = raster.fonts.select(text, TextStyle::default());
+                let font = raster.fonts.get(face).font();
+                let table = |tag| font.table(swash::tag_from_bytes(tag));
+                let metric_count = |tag| {
+                    table(tag)
+                        .and_then(|data| data.get(34..36))
+                        .map(|bytes| u16::from_be_bytes([bytes[0], bytes[1]]))
+                };
+                eprintln!(
+                    "baseline {font_set} cell={text:?} face={face} offset={} bytes={} hhea={:?} hmtx={:?} vhea={:?} vmtx={:?}",
+                    font.offset,
+                    font.data.len(),
+                    metric_count(b"hhea"),
+                    table(b"hmtx").map(<[u8]>::len),
+                    metric_count(b"vhea"),
+                    table(b"vmtx").map(<[u8]>::len),
+                );
+                assert!(
+                    metric_count(b"hhea").is_some_and(|count| count > 0),
+                    "{font_set} cell {text:?} selected face {face} without valid horizontal metrics"
+                );
+                if table(b"vmtx").is_some() {
+                    assert!(
+                        metric_count(b"vhea").is_some_and(|count| count > 0),
+                        "{font_set} cell {text:?} selected face {face} without valid vertical metrics"
+                    );
+                }
+                let has_coverage = text.chars().all(|ch| font.charmap().map(ch) != 0);
+                let cell = raster
+                    .rasterize_cell(text, columns, TextStyle::default(), 32.0)
+                    .unwrap_or_else(|error| {
+                        panic!("{font_set} baseline cell {text:?} at 32px: {error}")
+                    });
+                assert_eq!(cell.columns, columns);
+                assert_eq!(cell.source_bytes, text.len());
+                // Font installations without CJK are still valid test hosts.
+                // When the selected face covers the cell, require a real glyph.
+                if has_coverage {
+                    assert!(
+                        cell.glyphs.iter().all(|glyph| !glyph.missing),
+                        "system CJK fallback must paint the supported glyph, not .notdef"
+                    );
+                }
+                assert!(
+                    cell.glyphs
+                        .iter()
+                        .any(|glyph| glyph.pixels.iter().any(|&p| p != 0)),
+                    "{font_set} baseline cell {text:?} produced no visible bitmap"
+                );
+                let cached = raster
+                    .rasterize_cell(text, columns, TextStyle::default(), 32.0)
+                    .unwrap();
+                assert!(Arc::ptr_eq(&cell, &cached));
+            }
+        }
+    }
+
+    #[test]
     fn bundled_emoji_fallback_is_not_a_missing_glyph() {
         let mut raster = TextRasterizer::bundled().unwrap();
         let cell = raster

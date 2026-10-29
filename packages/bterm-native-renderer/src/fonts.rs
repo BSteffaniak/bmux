@@ -9,6 +9,44 @@ use crate::text::TextStyle;
 const MAX_FONTS: usize = 64;
 const MAX_FONT_BYTES: usize = 64 * 1024 * 1024;
 
+/// Validate the tables consumed by the configured Swash shape/raster path before
+/// retaining a face. No byte slicing/rebasing: collection table offsets remain
+/// relative to the complete file. This is not a replacement for raster errors.
+fn supports_renderer(font: FontRef<'_>) -> bool {
+    let table = |tag| font.table(swash::tag_from_bytes(tag));
+    let glyphs = table(b"maxp")
+        .and_then(|bytes| bytes.get(4..6))
+        .map(|bytes| u16::from_be_bytes([bytes[0], bytes[1]]));
+    let Some(glyphs) = glyphs.filter(|&count| count > 0) else {
+        return false;
+    };
+    let metrics_valid = |header, metrics| {
+        let count = table(header)
+            .and_then(|bytes| bytes.get(34..36))
+            .map(|bytes| u16::from_be_bytes([bytes[0], bytes[1]]));
+        count.is_some_and(|count| {
+            count > 0
+                && count <= glyphs
+                && table(metrics).is_some_and(|bytes| {
+                    bytes.len() >= usize::from(count) * 4 + usize::from(glyphs - count) * 2
+                })
+        })
+    };
+    if !metrics_valid(b"hhea", b"hmtx")
+        || (table(b"vhea").is_some() && !metrics_valid(b"vhea", b"vmtx"))
+    {
+        return false;
+    }
+    // These are exactly the source families requested by text.rs (no legacy
+    // Apple bdat/bloc and no monochrome bitmap source in that render list).
+    (table(b"glyf").is_some() && table(b"loca").is_some())
+        || table(b"CFF ").is_some()
+        || table(b"CFF2").is_some()
+        || (table(b"COLR").is_some() && table(b"CPAL").is_some())
+        || table(b"sbix").is_some()
+        || (table(b"CBDT").is_some() && table(b"CBLC").is_some())
+}
+
 pub(crate) struct Face {
     data: Arc<[u8]>,
     offset: u32,
@@ -66,6 +104,15 @@ impl Fonts {
             return;
         }
         if let Some(font) = FontRef::from_index(data, index as usize) {
+            // Character coverage alone does not establish renderer compatibility.
+            // For example, macOS NISC18030 has cmap + legacy bdat/bloc/bhed,
+            // but no horizontal metrics or a source understood by Swash. Passing
+            // it to the shaper underflows Swash's zero long-metric count in debug
+            // builds and fails rasterization in release builds. Do not let such a
+            // face shadow a usable fallback for the same character.
+            if !supports_renderer(font) {
+                return;
+            }
             let offset = font.offset;
             self.faces.push(Face {
                 data: Arc::from(data),
@@ -142,5 +189,84 @@ impl Fonts {
                 )
             })
             .map_or(0, |(index, _)| index)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn primary_data() -> Vec<u8> {
+        bmux_fonts::bundled_fonts_for_preset(bmux_fonts::FontPreset::GhosttyNerd)[0]
+            .data
+            .to_vec()
+    }
+
+    fn table_record(data: &[u8], tag: &[u8; 4]) -> usize {
+        let count = usize::from(u16::from_be_bytes([data[4], data[5]]));
+        (0..count)
+            .map(|index| 12 + index * 16)
+            .find(|&offset| &data[offset..offset + 4] == tag)
+            .unwrap()
+    }
+
+    #[test]
+    fn admission_rejects_missing_and_zero_metrics_before_shaping() {
+        let original = primary_data();
+        assert!(supports_renderer(
+            FontRef::from_index(&original, 0).unwrap()
+        ));
+        let mut data = original.clone();
+        let record = table_record(&data, b"hhea");
+        let offset = u32::from_be_bytes(data[record + 8..record + 12].try_into().unwrap()) as usize;
+        data[offset + 34..offset + 36].fill(0);
+        assert!(!supports_renderer(FontRef::from_index(&data, 0).unwrap()));
+        // Removing the complete directory entry preserves the sorted directory,
+        // modelling the absent hhea in the legacy Apple bitmap-only face.
+        let mut data = original;
+        let record = table_record(&data, b"hhea");
+        let count = u16::from_be_bytes([data[4], data[5]]);
+        data.copy_within(record + 16..12 + usize::from(count) * 16, record);
+        data[4..6].copy_from_slice(&(count - 1).to_be_bytes());
+        assert!(!supports_renderer(FontRef::from_index(&data, 0).unwrap()));
+        let mut fonts = Fonts {
+            faces: Vec::new(),
+            bytes: 0,
+        };
+        fonts.add(&data, 0, TextStyle::default());
+        assert!(fonts.is_empty());
+        assert_eq!(fonts.bytes, 0);
+    }
+
+    #[test]
+    fn collection_face_keeps_full_file_and_directory_offset() {
+        let data = primary_data();
+        // A minimal one-face TTC built from the existing real bundled font.
+        // All SFNT table offsets must be rebased by the TTC header length.
+        const HEADER: u32 = 16;
+        let mut collection = b"ttcf\x00\x01\x00\x00\x00\x00\x00\x01\x00\x00\x00\x10".to_vec();
+        collection.extend_from_slice(&data);
+        let count = usize::from(u16::from_be_bytes([data[4], data[5]]));
+        for index in 0..count {
+            let offset = HEADER as usize + 12 + index * 16 + 8;
+            let value = u32::from_be_bytes(collection[offset..offset + 4].try_into().unwrap());
+            collection[offset..offset + 4].copy_from_slice(&(value + HEADER).to_be_bytes());
+        }
+        let mut fonts = Fonts {
+            faces: Vec::new(),
+            bytes: 0,
+        };
+        fonts.add(&collection, 0, TextStyle::default());
+        assert_eq!(fonts.faces.len(), 1);
+        let font = fonts.get(0).font();
+        assert_eq!(font.offset, HEADER);
+        assert_eq!(font.data.len(), collection.len());
+        assert!(supports_renderer(font));
+        assert_ne!(font.charmap().map('M'), 0);
+        assert!(
+            font.glyph_metrics(&[])
+                .advance_width(font.charmap().map('M'))
+                > 0.0
+        );
     }
 }

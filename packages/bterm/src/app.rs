@@ -340,7 +340,7 @@ impl<W: AttachWorker> Application<W> {
             PlatformEvent::Resumed => {
                 context.set_ime_enabled(true);
                 let metrics = context.metrics();
-                let renderer = self
+                let mut renderer = self
                     .runtime
                     .block_on(NativeRenderer::new(
                         context.surface_target(),
@@ -351,6 +351,9 @@ impl<W: AttachWorker> Application<W> {
                         },
                     ))
                     .context("initialize native renderer")?;
+                renderer.set_telemetry_enabled(
+                    std::env::var_os("BTERM_RENDER_TELEMETRY").is_some_and(|value| value == "1"),
+                );
                 self.renderer = Some(renderer);
                 self.resize(metrics)?;
                 self.active = true;
@@ -480,6 +483,24 @@ impl<W: AttachWorker> Application<W> {
                                 Ok(())
                             }
                         });
+                        // Receipt has been delivered before optional diagnostic IO.
+                        if let Some(summary) = self
+                            .renderer
+                            .as_ref()
+                            .and_then(NativeRenderer::telemetry_summary)
+                            && summary.attempts.is_multiple_of(120)
+                        {
+                            eprintln!(
+                                "bterm: renderer attempts={} failures={} window={} p50_ns={} p95_ns={} p99_ns={} totals={:?}",
+                                summary.attempts,
+                                summary.failures,
+                                summary.window_samples,
+                                summary.p50.total_ns,
+                                summary.p95.total_ns,
+                                summary.p99.total_ns,
+                                summary.totals,
+                            );
+                        }
                         if let Err(error) = accepted {
                             if self.active && !context.metrics().physical_size.is_empty() {
                                 if let Some(delay) = self.retry.schedule(std::time::Instant::now())

@@ -12,6 +12,14 @@ use bmux_tui::{
 use bterm_native_platform::{PhysicalSize, SurfaceTarget};
 use std::collections::HashMap;
 
+#[path = "raster_cache.rs"]
+pub(crate) mod raster_cache;
+
+#[path = "telemetry.rs"]
+pub(crate) mod telemetry;
+pub use telemetry::{FrameTelemetry, TelemetrySummary};
+use telemetry::{Measurement, Stage, Telemetry};
+
 /// Window-local raster and framebuffer configuration. Sizes are physical except font_size.
 #[derive(Clone, Copy, Debug)]
 pub struct RendererOptions {
@@ -36,6 +44,8 @@ impl Default for RendererOptions {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PresentReport {
     pub generation: u64,
+    /// Successful attempt diagnostics only; not scene-commit authority.
+    pub telemetry: Option<FrameTelemetry>,
 }
 /// Explicit failures never produce a successful output report.
 #[derive(Debug, thiserror::Error)]
@@ -57,10 +67,13 @@ pub enum RenderError {
 pub struct NativeRenderer {
     gpu: Gpu,
     text: TextRasterizer,
+    images: images::ImageCache,
+    masks: raster_cache::MaskCache,
     options: RendererOptions,
     cell: [f32; 2],
     ascent: f32,
     damage: DamageTracker,
+    telemetry: Option<Box<Telemetry>>,
 }
 impl NativeRenderer {
     pub async fn new(target: SurfaceTarget, options: RendererOptions) -> Result<Self, RenderError> {
@@ -70,10 +83,13 @@ impl NativeRenderer {
         Ok(Self {
             gpu,
             text,
+            images: images::ImageCache::default(),
+            masks: raster_cache::MaskCache::default(),
             options,
             cell,
             ascent,
             damage: DamageTracker::default(),
+            telemetry: None,
         })
     }
     /// Fixed physical cell metrics; execution dimensions are caller-owned.
@@ -97,11 +113,43 @@ impl NativeRenderer {
         self.damage.invalidate();
         Ok(())
     }
+    /// Enable bounded diagnostics explicitly. Disabled by default; disabling drops
+    /// all samples. Re-enabling starts a fresh window. Nothing is logged automatically.
+    pub fn set_telemetry_enabled(&mut self, enabled: bool) {
+        if enabled && self.telemetry.is_none() {
+            self.telemetry = Some(Box::default());
+        } else if !enabled {
+            self.telemetry = None;
+        }
+    }
+    /// Poll lifetime counters and last-128-attempt percentiles, including failures.
+    /// Summary calculation is bounded and happens only when requested by the caller.
+    pub fn telemetry_summary(&self) -> Option<TelemetrySummary> {
+        self.telemetry.as_ref().map(|telemetry| telemetry.summary())
+    }
     /// Render complete retained output. Caller must reject stale provenance before entry
     /// and commit interaction metadata only if this method succeeds.
     pub fn present(
         &mut self,
         prepared: &PreparedPresentation,
+    ) -> Result<PresentReport, RenderError> {
+        let enabled = self.telemetry.is_some();
+        let mut measurement = Measurement::new(enabled);
+        self.gpu.begin_telemetry(enabled);
+        let mut result = self.present_inner(prepared, &mut measurement);
+        if let Some(telemetry) = &mut self.telemetry {
+            let sample = measurement.finish(self.gpu.frame_telemetry());
+            telemetry.record(sample, result.is_err());
+            if let Ok(report) = &mut result {
+                report.telemetry = Some(sample);
+            }
+        }
+        result
+    }
+    fn present_inner(
+        &mut self,
+        prepared: &PreparedPresentation,
+        measurement: &mut Measurement,
     ) -> Result<PresentReport, RenderError> {
         if self.options.size.is_empty() {
             return Err(RenderError::Suspended);
@@ -128,7 +176,8 @@ impl NativeRenderer {
             let (_, bg) = colors(cell.style.fg, cell.style.bg, cell.style.modifiers);
             self.gpu.quad([x * cw, y * ch, cw, ch], None, bg, screen)?;
         }
-        // Deduplicate repeated cells within the fixed atlas; next frame reclaims it all.
+        // Deduplicate repeated cells within the frame; GPU retention owns atlas lifetime.
+        measurement.stage(Some(Stage::Text));
         let mut uploaded = HashMap::new();
         for (index, cell) in prepared.buffer().cells().iter().enumerate() {
             if cell.is_wide_continuation() || cell.style.modifiers.contains(Modifier::HIDDEN) {
@@ -162,15 +211,25 @@ impl NativeRenderer {
                 let uv = if let Some(uv) = uploaded.get(&key) {
                     *uv
                 } else {
-                    let rgba = match glyph.format {
-                        BitmapFormat::Rgba => glyph.pixels.clone(),
-                        BitmapFormat::Mask => glyph
-                            .pixels
-                            .iter()
-                            .flat_map(|alpha| [255, 255, 255, *alpha])
-                            .collect(),
+                    let uv = match glyph.format {
+                        BitmapFormat::Rgba => {
+                            self.gpu
+                                .upload_cached(glyph.width, glyph.height, &glyph.pixels)?
+                        }
+                        BitmapFormat::Mask => {
+                            let (rgba, cache_hit) = self.masks.get_with_status(
+                                glyph.width,
+                                glyph.height,
+                                &glyph.pixels,
+                            )?;
+                            if cache_hit {
+                                measurement.sample.glyph_rgba_cache_hits += 1;
+                            } else {
+                                measurement.sample.glyph_rgba_cache_misses += 1;
+                            }
+                            self.gpu.upload_cached(glyph.width, glyph.height, &rgba)?
+                        }
                     };
-                    let uv = self.gpu.upload(glyph.width, glyph.height, &rgba)?;
                     uploaded.insert(key, uv);
                     uv
                 };
@@ -200,9 +259,29 @@ impl NativeRenderer {
                     .quad([x, y + ch * 0.5, clip[2], 1.0], None, fg, clip)?;
             }
         }
+        measurement.stage(Some(Stage::Image));
+        // Borrowed full-content keys deduplicate placements even when a decoded image
+        // exceeds the retention budget. No payload or decoded pixels are retained here.
+        let mut uploaded_images = HashMap::new();
         for placement in prepared.image_scene().placements() {
-            let (w, h, rgba) = images::decode(&placement.payload)?;
-            let uv = self.gpu.upload(w, h, &rgba)?;
+            let key = images::cache_key(&placement.payload)?;
+            let uv = match uploaded_images.entry(key) {
+                std::collections::hash_map::Entry::Occupied(entry) => *entry.get(),
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    let (image, cache_hit) = self.images.get_with_status(key)?;
+                    if cache_hit {
+                        measurement.sample.image_cache_hits += 1;
+                    } else {
+                        measurement.sample.image_cache_misses += 1;
+                        measurement.sample.image_decode_count += 1;
+                    }
+                    let uv = self
+                        .gpu
+                        .upload_cached(image.width, image.height, &image.rgba)?;
+                    entry.insert(uv);
+                    uv
+                }
+            };
             let rect = placement.pixel_rect(f64::from(cw), f64::from(ch));
             let clip = placement.clip.intersection(placement.destination);
             self.gpu.quad(
@@ -222,6 +301,7 @@ impl NativeRenderer {
                 ],
             )?;
         }
+        measurement.stage(None);
         if let Some(cursor) = prepared.cursor().filter(|cursor| cursor.visible) {
             self.gpu.quad(
                 [
@@ -238,6 +318,7 @@ impl NativeRenderer {
         self.gpu.present()?;
         Ok(PresentReport {
             generation: self.damage.committed(),
+            telemetry: None,
         })
     }
 }

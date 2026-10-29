@@ -10,4 +10,6 @@ mod renderer;
 pub mod text;
 mod text_cache;
 
-pub use renderer::{NativeRenderer, PresentReport, RenderError, RendererOptions};
+pub use renderer::{
+    FrameTelemetry, NativeRenderer, PresentReport, RenderError, RendererOptions, TelemetrySummary,
+};

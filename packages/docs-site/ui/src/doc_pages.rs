@@ -500,6 +500,10 @@ mod tests {
             "Historical presentation migration inventory",
         ),
         (
+            "docs/bterm-performance.md",
+            "Developer renderer measurement protocol and optimization evidence",
+        ),
+        (
             "docs/mermaid-wasm-performance.md",
             "Historical measurements of a removed renderer",
         ),

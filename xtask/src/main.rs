@@ -29,7 +29,7 @@ fn invocation_args(executable: Option<&str>, mut args: Vec<String>) -> Vec<Strin
 fn run(args: Vec<String>) -> Result<()> {
     let Some(command) = args.first() else {
         return Err(error(
-            "usage: cargo xtask build [--target TARGET] [--profile PROFILE] | auxiliary {build,stage,nfpm} --target TARGET | bterm {build,run,stage,verify} --target TARGET | install SOURCE DESTINATION [--binary-name NAME | --activate-version VERSION]",
+            "usage: cargo xtask build [--target TARGET] [--profile PROFILE] | auxiliary {build,stage,nfpm} --target TARGET | bterm {build,run} [--profile PROFILE] | bterm {stage,verify} --target TARGET | install SOURCE DESTINATION [--binary-name NAME | --activate-version VERSION]",
         ));
     };
     let mut positional = Vec::new();
@@ -53,6 +53,7 @@ fn run(args: Vec<String>) -> Result<()> {
     }
     let allowed: &[&str] = match command.as_str() {
         "bterm" => &[
+            "--profile",
             "--workspace",
             "--target",
             "--artifact-dir",
@@ -87,20 +88,27 @@ fn run(args: Vec<String>) -> Result<()> {
         };
         if matches!(positional.as_slice(), [operation] if operation == "build" || operation == "run")
         {
-            if options.keys().any(|key| key != "--workspace") {
+            if options
+                .keys()
+                .any(|key| key != "--workspace" && key != "--profile")
+            {
                 return Err(error(
-                    "bterm build/run detects its host and paths; only --workspace is accepted",
+                    "bterm build/run detects its host and paths; only --workspace and --profile are accepted",
                 ));
             }
             let workspace = options
                 .get("--workspace")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".."));
+            let profile = bterm_run::profile(options.get("--profile").map(String::as_str))?;
             return if positional[0] == "build" {
-                bterm_run::build(&workspace).map(|_| ())
+                bterm_run::build(&workspace, profile).map(|_| ())
             } else {
-                bterm_run::run(&workspace)
+                bterm_run::run(&workspace, profile)
             };
+        }
+        if options.contains_key("--profile") {
+            return Err(error("--profile is only supported for bterm build/run"));
         }
         let target = options
             .get("--target")
