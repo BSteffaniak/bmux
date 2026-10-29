@@ -29,6 +29,8 @@ mod runtime;
 mod snapshot;
 mod snapshot_v1_migration;
 mod supervisor_protocol;
+#[cfg(windows)]
+mod windows_environment;
 
 #[cfg(test)]
 mod retired_execution_tests;

@@ -361,15 +361,78 @@ impl Fixture {
         lease
     }
     fn start(&self, script: &str) -> Response {
+        self.start_with_environment(script, std::env::vars().collect(), None)
+    }
+    fn start_with_environment(
+        &self,
+        script: &str,
+        env: BTreeMap<String, String>,
+        native_env: Option<Vec<(Vec<u8>, Vec<u8>)>>,
+    ) -> Response {
+        let native_env_encoding = native_env.as_ref().map(|_| "windows-utf16le".into());
         self.call(Operation::Start {
             mutation_id: uuid::Uuid::new_v4().to_string(),
             program: std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".into()),
             args: vec!["/D".into(), "/C".into(), script.into()],
             cwd: None,
-            env: std::env::vars().collect(),
-            native_env: None,
-            native_env_encoding: None,
+            env,
+            native_env,
+            native_env_encoding,
         })
+    }
+}
+
+#[test]
+#[ignore = "requires built helper path and real Windows ConPTY"]
+fn conpty_cmd_pseudo_environment_launches_in_both_transports() {
+    for native in [false, true] {
+        let fixture = Fixture::new();
+        let lease = fixture.bind();
+        let mut env: BTreeMap<String, String> = std::env::vars().collect();
+        env.insert("=C:".into(), "C:\\".into());
+        env.insert("=ExitCode".into(), "00000000".into());
+        env.insert("=ExitCodeAscii".into(), "A".into());
+        let entries = native.then(|| {
+            env.iter()
+                .map(|(key, value)| {
+                    (
+                        key.encode_utf16().flat_map(u16::to_le_bytes).collect(),
+                        value.encode_utf16().flat_map(u16::to_le_bytes).collect(),
+                    )
+                })
+                .collect()
+        });
+        let response = fixture.start_with_environment(
+            "echo BMUX_CMD_PSEUDO_ENV_OK & exit /b 37",
+            env,
+            entries,
+        );
+        assert!(
+            response.error.is_none(),
+            "native={native}: {:?}",
+            response.error
+        );
+        let deadline = Instant::now() + TIMEOUT;
+        let mut output = Vec::new();
+        loop {
+            if let Ok(bytes) = fixture.output.recv_timeout(Duration::from_millis(20)) {
+                assert!(output.len() + bytes.len() <= 65_536);
+                output.extend(bytes);
+            }
+            let status = fixture.call(Operation::Status);
+            if status.terminal_session_ended == Some(true)
+                && String::from_utf8_lossy(&output).contains("BMUX_CMD_PSEUDO_ENV_OK")
+            {
+                assert_eq!(status.exit_code, Some(37));
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "native={native}: shell did not complete: {:?}",
+                String::from_utf8_lossy(&output)
+            );
+        }
+        drop(lease);
     }
 }
 

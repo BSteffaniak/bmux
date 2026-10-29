@@ -17,6 +17,10 @@ mod session_guardian;
 mod session_cleanup;
 
 #[cfg(windows)]
+#[path = "../windows_environment.rs"]
+mod windows_environment;
+
+#[cfg(windows)]
 #[path = "execution_supervisor/windows.rs"]
 mod windows;
 #[cfg(windows)]

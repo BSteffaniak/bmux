@@ -309,15 +309,7 @@ fn environment(
     let mut sorted: Vec<(Vec<u16>, Vec<u16>)> = Vec::new();
     for (key, value) in entries {
         let key = wide(&key)?;
-        // Windows preserves per-drive working directories as hidden =X:
-        // variables. Accept exactly that ASCII drive-key form, not arbitrary
-        // leading/interior '=' names, and retain the original UTF-16 verbatim.
-        let drive_key = key.len() == 4
-            && key[0] == u16::from(b'=')
-            && ((u16::from(b'A')..=u16::from(b'Z')).contains(&key[1])
-                || (u16::from(b'a')..=u16::from(b'z')).contains(&key[1]))
-            && key[2] == u16::from(b':');
-        if key.len() == 1 || (!drive_key && key[..key.len() - 1].contains(&u16::from(b'='))) {
+        if !crate::windows_environment::valid_key(&key[..key.len() - 1]) {
             return Err(io::Error::other("invalid Windows environment key"));
         }
         let value = wide(&value)?;
@@ -521,11 +513,43 @@ mod tests {
         let duplicates =
             BTreeMap::from([("=C:".into(), "one".into()), ("=c:".into(), "two".into())]);
         assert!(environment(&duplicates, None, None).is_err());
-        for key in ["", "=", "=C", "=1:", "=CC:", "=C:=", "A=B", "=é:"] {
+        for key in ["", "=", "==", "=C:=", "A=B", "=ExitCode=Value"] {
             let env = BTreeMap::from([(key.into(), "value".into())]);
             assert!(environment(&env, None, None).is_err(), "accepted {key:?}");
         }
     }
+    #[test]
+    fn cmd_pseudo_environment_survives_both_transports() {
+        let env = BTreeMap::from([
+            ("=ExitCode".into(), "00000000".into()),
+            ("=ExitCodeAscii".into(), "\u{20ac}".into()),
+            ("=C:".into(), "C:\\work".into()),
+            ("Path".into(), "C:\\Windows".into()),
+        ]);
+        let native: Vec<_> = env
+            .iter()
+            .map(|(key, value): (&String, &String)| {
+                (
+                    key.encode_utf16().flat_map(u16::to_le_bytes).collect(),
+                    value.encode_utf16().flat_map(u16::to_le_bytes).collect(),
+                )
+            })
+            .collect();
+        let block = environment(&env, None, None).unwrap();
+        assert_eq!(
+            environment(&BTreeMap::new(), Some(&native), Some("windows-utf16le")).unwrap(),
+            block
+        );
+        let text = String::from_utf16(&block).unwrap();
+        assert!(text.contains("=ExitCode=00000000\0"));
+        assert!(text.contains("=ExitCodeAscii=\u{20ac}\0"));
+        let duplicates = BTreeMap::from([
+            ("=ExitCode".into(), "0".into()),
+            ("=exitcode".into(), "1".into()),
+        ]);
+        assert!(environment(&duplicates, None, None).is_err());
+    }
+
     #[test]
     fn environment_rejects_wrong_platform_and_duplicates() {
         let native = vec![(vec![65, 0], vec![66, 0])];

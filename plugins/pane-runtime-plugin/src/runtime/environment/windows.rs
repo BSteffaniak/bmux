@@ -37,15 +37,7 @@ pub(super) fn valid(entry: &EnvironmentEntry) -> bool {
     let (Some(key), Some(value)) = (units(&entry.key), units(&entry.value)) else {
         return false;
     };
-    // Windows also retains per-drive working directories as the special =X: keys.
-    let drive_key = key.len() == 3
-        && key[0] == u16::from(b'=')
-        && u8::try_from(key[1]).is_ok_and(|letter| letter.is_ascii_alphabetic())
-        && key[2] == u16::from(b':');
-    !key.is_empty()
-        && !key.contains(&0)
-        && !value.contains(&0)
-        && (drive_key || !key.contains(&u16::from(b'=')))
+    crate::windows_environment::valid_key(&key) && !value.contains(&0)
 }
 
 #[cfg(test)]

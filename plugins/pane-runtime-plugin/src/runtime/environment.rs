@@ -105,6 +105,33 @@ mod tests {
         assert!(validate(&overlaid).is_ok());
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn cmd_pseudo_environment_survives_validation_and_overlay() {
+        let entries = vec![
+            entry("=C:", "C:\\work"),
+            entry("=ExitCode", "00000000"),
+            entry("=ExitCodeAscii", "A"),
+        ];
+        assert!(validate(&entries).is_ok());
+        let overlaid = terminal_environment(
+            entries.clone(),
+            &portable_pty::CommandBuilder::new("cmd.exe"),
+        );
+        for expected in entries {
+            assert!(
+                overlaid
+                    .iter()
+                    .any(|entry| entry.key == expected.key && entry.value == expected.value)
+            );
+        }
+        assert!(validate(&overlaid).is_ok());
+        assert!(validate(&[entry("=ExitCode", "0"), entry("=exitcode", "1")]).is_err());
+        for key in ["=", "==", "=ExitCode=Value"] {
+            assert!(validate(&[entry(key, "0")]).is_err());
+        }
+    }
+
     #[test]
     fn invalid_duplicate_and_foreign_encoding_are_rejected() {
         for entries in [
