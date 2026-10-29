@@ -90,7 +90,7 @@ async fn same_connection_publisher_resends_full_committed_frame_only_on_refresh(
         epoch: uuid::Uuid::new_v4(),
         revision: 7,
         attached_id: uuid::Uuid::new_v4(),
-        prepared,
+        prepared: prepared.into(),
         surfaces: vec![],
         selection_text: std::collections::BTreeMap::new(),
         unsupported_metadata: &[],

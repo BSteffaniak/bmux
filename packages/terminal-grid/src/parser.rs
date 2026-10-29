@@ -452,7 +452,7 @@ impl TerminalProtocolTracker {
             toggled_alternate: false,
         };
         self.parser.advance(&mut performer, bytes);
-        self.pending_bytes = self.parser.replay_prefix();
+        self.parser.write_replay_prefix(&mut self.pending_bytes);
         ProtocolProcessOutcome {
             toggled_alternate: performer.toggled_alternate,
         }
@@ -836,13 +836,103 @@ fn default_zero(value: Option<&i64>) -> usize {
 fn trailing_incomplete_sequence(bytes: &[u8]) -> Vec<u8> {
     let mut parser = Parser::new();
     parser.advance(&mut ParserRestore, bytes);
-    parser.replay_prefix()
+    let mut prefix = Vec::new();
+    parser.write_replay_prefix(&mut prefix);
+    prefix
 }
 
 #[cfg(test)]
 mod tests {
     use crate::model::{GridLimits, TerminalGrid};
     use crate::parser::TerminalGridStream;
+
+    #[test]
+    fn normal_text_keeps_protocol_prefix_storage_unallocated() {
+        let bytes = [b'x'; 8192];
+        for chunk_size in [1, 32, 8192] {
+            let mut stream =
+                TerminalGridStream::new(80, 2, GridLimits { scrollback_rows: 0 }).unwrap();
+            let mut tracker = super::TerminalProtocolTracker::new();
+            for chunk in bytes.chunks(chunk_size) {
+                stream.process(chunk);
+                tracker.process(chunk);
+                assert_eq!(stream.pending_bytes.len(), 0);
+                assert_eq!(tracker.pending_bytes.len(), 0);
+                // Protocol prefix capacity only, not allocator-wide counts.
+                assert_eq!(tracker.pending_bytes.capacity(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn repeated_grid_prefixes_preserve_pending_bytes() {
+        let mut stream = TerminalGridStream::new(10, 2, GridLimits::default()).unwrap();
+        for _ in 0..32 {
+            stream.process(b"\x1b[3");
+            assert_eq!(stream.pending_bytes, b"\x1b[3");
+            stream.process(b"1");
+            assert_eq!(stream.pending_bytes, b"\x1b[31");
+            stream.process(b"m");
+            assert_eq!(stream.pending_bytes.len(), 0);
+        }
+    }
+
+    #[test]
+    fn prefix_only_changes_preserve_revision_and_hydration_semantics() {
+        let limits = GridLimits::default();
+        let mut stream = TerminalGridStream::new(10, 2, limits).unwrap();
+        let revision = stream.grid().revision();
+        let content_revision = stream.grid().content_revision();
+        stream.process(b"\x1b[");
+        assert_eq!(stream.grid().revision(), revision + 1);
+        assert_eq!(stream.grid().content_revision(), content_revision);
+        // NUL executes no grid operation and does not change the CSI prefix.
+        stream.process(b"\0");
+        assert_eq!(stream.grid().revision(), revision + 1);
+        stream.process(b"3");
+        assert_eq!(stream.grid().revision(), revision + 2);
+        assert_eq!(stream.grid().content_revision(), content_revision);
+        let snapshot = stream.snapshot(0, 2);
+        assert_eq!(snapshot.pending_bytes, b"\x1b[3");
+        let mut hydrated = TerminalGridStream::from_snapshot(&snapshot, limits).unwrap();
+        for chunk in [&b"1m"[..], &b"X"[..]] {
+            stream.process(chunk);
+            hydrated.process(chunk);
+            assert_eq!(hydrated.snapshot(0, 2), stream.snapshot(0, 2));
+        }
+        assert_eq!(stream.pending_bytes.len(), 0);
+    }
+
+    #[test]
+    fn clearing_prefix_without_visible_work_advances_only_replication() {
+        let mut stream = TerminalGridStream::new(10, 2, GridLimits::default()).unwrap();
+        stream.process(b"\x1b[3");
+        let revision = stream.grid().revision();
+        let content_revision = stream.grid().content_revision();
+        // CAN discards the pending sequence without changing visible cells.
+        stream.process(b"\x18");
+        assert_eq!(stream.pending_bytes.len(), 0);
+        assert_eq!(stream.grid().revision(), revision + 1);
+        assert_eq!(stream.grid().content_revision(), content_revision);
+        stream.process(b"");
+        assert_eq!(stream.grid().revision(), revision + 1);
+    }
+
+    #[test]
+    fn protocol_tracker_reuses_prefix_storage() {
+        let mut tracker = super::TerminalProtocolTracker::new();
+        tracker.process(b"\x1b[?100");
+        let pointer = tracker.pending_bytes.as_ptr();
+        let capacity = tracker.pending_bytes.capacity();
+        for _ in 0..32 {
+            tracker.process(b"0h");
+            assert_eq!(tracker.pending_bytes.len(), 0);
+            tracker.process(b"\x1b[?100");
+            assert_eq!(tracker.pending_bytes, b"\x1b[?100");
+            assert_eq!(tracker.pending_bytes.as_ptr(), pointer);
+            assert_eq!(tracker.pending_bytes.capacity(), capacity);
+        }
+    }
 
     #[test]
     fn budgeted_prefix_capture_preserves_pending_sequence_on_rejection() {

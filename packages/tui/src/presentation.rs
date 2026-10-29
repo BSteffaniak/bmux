@@ -802,12 +802,31 @@ impl PresentationState {
                         damage = Damage::Full;
                         requested_regions.clear();
                     }
+                    let regional = matches!(damage, Damage::Regions(_));
                     let mut retained_cursor = self.cursor;
-                    let mut retained_hits = self.hits.clone();
-                    let mut retained_selection = self.selection.clone();
-                    let mut retained_semantics = self.semantics.clone();
-                    let mut retained_availability = self.metadata_availability.clone();
-                    if matches!(damage, Damage::Regions(_)) {
+                    // Full replacement never reads committed metadata. In particular,
+                    // repaired observer snapshots retain cells, not the old interaction tree.
+                    let mut retained_hits = if regional {
+                        self.hits.clone()
+                    } else {
+                        HitMap::default()
+                    };
+                    let mut retained_selection = if regional {
+                        self.selection.clone()
+                    } else {
+                        SelectionScene::default()
+                    };
+                    let mut retained_semantics = if regional {
+                        self.semantics.clone()
+                    } else {
+                        SemanticScene::default()
+                    };
+                    let mut retained_availability = if regional {
+                        self.metadata_availability.clone()
+                    } else {
+                        Vec::new()
+                    };
+                    if regional {
                         for (_, area) in frame.occlusions() {
                             // Coverage is painted in full, even if the caller only
                             // requested a smaller changed portion of the overlay.
@@ -1547,6 +1566,53 @@ mod tests {
             Err("host rejected")
         );
         assert_eq!(state.hits().regions()[0].id.as_str(), "old");
+    }
+
+    #[test]
+    fn full_replacement_discards_old_metadata_only_after_success() {
+        use crate::selection::{SelectionScope, plain_text_fragments};
+        use crate::semantic::SemanticRegion;
+        let area = Rect::new(0, 0, 2, 1);
+        let mut state = PresentationState::new(area);
+        state
+            .present(
+                Damage::Full,
+                |cx| {
+                    paint(cx, "old", "A");
+                    cx.push_selection_scope(SelectionScope::new("scope", area));
+                    for fragment in plain_text_fragments("scope", "source", area, 0, "AA", 0, 2) {
+                        cx.push_selection_fragment(fragment);
+                    }
+                    cx.push_semantic(SemanticRegion::new("old", area, "text"));
+                    cx.declare_metadata_availability(LocalRect::new(0, 0, 2, 1), true, true);
+                },
+                |_, _| Ok::<_, ()>(()),
+            )
+            .unwrap();
+        assert_ne!(state.selection.scopes().len(), 0);
+        assert_ne!(state.semantics.regions().len(), 0);
+        assert_ne!(state.metadata_availability().len(), 0);
+        let empty = state.prepare(Damage::Full, |_| {}).unwrap();
+        assert_eq!(empty.hits().regions().len(), 0);
+        assert_eq!(empty.selection().scopes().len(), 0);
+        assert_eq!(empty.semantics().regions().len(), 0);
+        assert_eq!(empty.metadata_availability().len(), 0);
+        assert!(
+            state
+                .present_prepared(Some(empty), |_, _| Err::<(), _>("rejected"))
+                .is_err()
+        );
+        assert_eq!(state.hits().regions()[0].id.as_str(), "old");
+        assert_ne!(state.selection.scopes().len(), 0);
+        assert_ne!(state.semantics.regions().len(), 0);
+        assert_ne!(state.metadata_availability().len(), 0);
+        state
+            .present(Damage::Full, |_| {}, |_, _| Ok::<_, ()>(()))
+            .unwrap();
+        assert_eq!(state.hits().regions().len(), 0);
+        assert_eq!(state.selection.scopes().len(), 0);
+        assert_eq!(state.semantics.regions().len(), 0);
+        assert_eq!(state.metadata_availability().len(), 0);
     }
 
     #[test]

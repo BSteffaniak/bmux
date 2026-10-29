@@ -40,7 +40,9 @@ pub struct AttachSnapshot {
     pub revision: u64,
     /// Authoritative attached target identity (may change during retarget).
     pub attached_id: Uuid,
-    pub prepared: PreparedPresentation,
+    /// Immutable output shared with direct delivery; commitment still belongs
+    /// to the consuming `PresentationState::present_prepared` transaction.
+    pub prepared: Arc<PreparedPresentation>,
     pub surfaces: Vec<AttachSurfaceProvenance>,
     /// Native producers expose compositor hits/focus, but not logical selection
     /// or semantic region snapshots. Empty metadata must not imply support.
@@ -328,7 +330,7 @@ impl AttachObserverPublisher {
     pub(super) fn publish(
         &mut self,
         attached_id: Uuid,
-        prepared: PreparedPresentation,
+        prepared: impl Into<Arc<PreparedPresentation>>,
         graph: &RetainedCompositor,
         stream_ends: &std::collections::BTreeMap<Uuid, Option<u64>>,
         pointer_shape: Option<bmux_attach_pipeline::pointer_shape::ResolvedPointerShape>,
@@ -336,6 +338,7 @@ impl AttachObserverPublisher {
         let Some(revision) = self.revision.checked_add(1) else {
             anyhow::bail!("attach presentation revision exhausted");
         };
+        let prepared = prepared.into();
         let surfaces = surface_provenance(graph, stream_ends);
         if let Some((viewport_generation, delivery)) = &mut self.prepared_delivery {
             use bmux_frontend_runtime::presentation::{
@@ -352,7 +355,7 @@ impl AttachObserverPublisher {
                     attached_id,
                     viewport_generation: *viewport_generation,
                 },
-                prepared: Arc::new(prepared.clone()),
+                prepared: Arc::clone(&prepared),
                 pointer_shape,
             };
             // These bindings come from the serialized attach owner, not an
@@ -505,7 +508,7 @@ pub(super) fn deliver_pointer_shape(
         .collect();
     publisher.publish(
         view.attached_id,
-        snapshot.prepared.clone(),
+        Arc::clone(&snapshot.prepared),
         &view.retained_compositor,
         &stream_ends,
         view.pointer_shape,
@@ -877,6 +880,176 @@ fn observed_image_payload(
 mod tests {
     use super::*;
     use bmux_tui::{damage::Damage, presentation::PresentationState};
+
+    #[test]
+    fn native_and_observer_share_prepared_payload_through_pointer_republication() {
+        use bmux_attach_pipeline::pointer_shape::ResolvedPointerShape;
+        use bmux_tui::{geometry::Point, hit::HitRegion, style::Style};
+        use std::sync::Mutex;
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let collected = Arc::clone(&seen);
+        let (mut publisher, observer) = attach_observer_channel();
+        publisher.set_prepared_delivery(1, move |delivery| {
+            let mut seen = collected.lock().unwrap();
+            seen.push(Arc::clone(&delivery.prepared));
+            let rejected = seen.len() == 3;
+            drop(seen);
+            if rejected {
+                anyhow::bail!("output rejected");
+            }
+            Ok(())
+        });
+        let area = Rect::new(0, 0, 2, 1);
+        let mut state = PresentationState::new(area);
+        let prepared = state
+            .prepare(Damage::Full, |cx| {
+                cx.set_cell(0, 0, "A", Style::default());
+                cx.push_hit(HitRegion::new("committed", area));
+            })
+            .unwrap();
+        let graph = RetainedCompositor::new();
+        let ends = std::collections::BTreeMap::new();
+        state
+            .present_prepared(Some(prepared), |frame, _| {
+                publisher.publish(Uuid::nil(), frame.clone(), &graph, &ends, None)
+            })
+            .unwrap();
+        let first = observer.latest().unwrap();
+        assert!(Arc::ptr_eq(&first.prepared, &seen.lock().unwrap()[0]));
+        publisher
+            .publish(
+                Uuid::nil(),
+                Arc::clone(&first.prepared),
+                &graph,
+                &ends,
+                Some(ResolvedPointerShape::Hidden),
+            )
+            .unwrap();
+        let pointer_update = observer.latest().unwrap();
+        assert!(Arc::ptr_eq(&first.prepared, &pointer_update.prepared));
+        assert!(Arc::ptr_eq(
+            &pointer_update.prepared,
+            &seen.lock().unwrap()[1]
+        ));
+        let rejected = state.prepare(Damage::Full, |_| {}).unwrap();
+        assert!(
+            state
+                .present_prepared(Some(rejected), |frame, _| {
+                    publisher.publish(Uuid::nil(), frame.clone(), &graph, &ends, None)
+                })
+                .is_err()
+        );
+        assert!(Arc::ptr_eq(&pointer_update, &observer.latest().unwrap()));
+        assert!(state.hits().hit_test(Point::new(0, 0)).is_some());
+        assert_eq!(pointer_update.prepared.buffer().cells()[0].symbol, "A");
+        assert!(Arc::ptr_eq(
+            &publisher
+                .prepared_authority
+                .as_ref()
+                .unwrap()
+                .committed()
+                .unwrap()
+                .prepared,
+            &pointer_update.prepared
+        ));
+    }
+
+    /// CPU-only warmed retained preparation, publication, and clone costs.
+    /// Does not measure native queues, GPU output, or terminal encoding.
+    #[test]
+    #[ignore = "display-free performance measurements; run explicitly with --nocapture"]
+    fn warmed_prepare_and_observer_clone_perf() {
+        use bmux_tui::{hit::HitRegion, style::Style};
+        use std::{hint::black_box, time::Instant};
+        for (scenario, width, height) in [("small", 80, 24), ("large", 240, 80)] {
+            for repair in [false, true] {
+                let area = Rect::new(0, 0, width, height);
+                let mut state = PresentationState::new(area);
+                let (mut publisher, observer) = attach_observer_channel();
+                publisher.set_prepared_delivery(1, |delivery| {
+                    black_box(delivery.prepared.buffer().cells().len());
+                    Ok(())
+                });
+                let graph = RetainedCompositor::new();
+                let ends = std::collections::BTreeMap::new();
+                let mut samples = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+                for iteration in 0..120 {
+                    let start = Instant::now();
+                    let render = |cx: &mut bmux_tui::paint::PaintCx<'_, '_>| {
+                        // Full metadata replacement even when cell operations are sparse.
+                        for y in 0..height {
+                            cx.push_hit(HitRegion::new(
+                                format!("row-{y}"),
+                                Rect::new(0, y, width, 1),
+                            ));
+                            if !repair || iteration == 0 || y == 0 {
+                                cx.set_cell(0, i64::from(y), "界", Style::default());
+                            }
+                        }
+                    };
+                    let prepared = if repair {
+                        state
+                            .prepare_repaired_bounded(
+                                bmux_tui::presentation::PresentationLimits {
+                                    max_cells: 262_144,
+                                    max_entries: 262_144,
+                                    max_bytes: 32 * 1024 * 1024,
+                                },
+                                render,
+                            )
+                            .unwrap()
+                    } else {
+                        state.prepare(Damage::Full, render).unwrap()
+                    };
+                    let prepare_ns = start.elapsed().as_nanos();
+                    let start = Instant::now();
+                    let copied = black_box(prepared.clone());
+                    let deep_clone_ns = start.elapsed().as_nanos();
+                    drop(copied);
+                    let start = Instant::now();
+                    state
+                        .present_prepared(Some(prepared), |frame, _| {
+                            publisher.publish(Uuid::nil(), frame.clone(), &graph, &ends, None)
+                        })
+                        .unwrap();
+                    let publish_commit_ns = start.elapsed().as_nanos();
+                    let snapshot = observer.latest().unwrap();
+                    let start = Instant::now();
+                    let shared = black_box(Arc::clone(&snapshot.prepared));
+                    let arc_clone_ns = start.elapsed().as_nanos();
+                    assert!(Arc::ptr_eq(&shared, &snapshot.prepared));
+                    assert!(state.retained_buffer().is_some());
+                    assert_eq!(
+                        snapshot.prepared.hits().regions().len(),
+                        usize::from(height)
+                    );
+                    if iteration >= 20 {
+                        for (samples, elapsed) in samples.iter_mut().zip([
+                            prepare_ns,
+                            deep_clone_ns,
+                            publish_commit_ns,
+                            arc_clone_ns,
+                        ]) {
+                            samples.push(elapsed);
+                        }
+                    }
+                }
+                for (phase, mut samples) in
+                    ["prepare", "deep_clone", "publish_and_commit", "arc_clone"]
+                        .into_iter()
+                        .zip(samples)
+                {
+                    samples.sort_unstable();
+                    println!(
+                        "scenario={scenario} repair={repair} phase={phase} samples={} p50_ns={} p99_ns={}",
+                        samples.len(),
+                        samples[samples.len() / 2],
+                        samples[samples.len() * 99 / 100],
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn direct_delivery_failure_preserves_observer_and_uses_fresh_attempt_identity() {

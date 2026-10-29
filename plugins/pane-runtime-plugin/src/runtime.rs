@@ -4823,14 +4823,45 @@ impl OutputFanoutBuffer {
             }
         }
 
-        while self.data.len() > self.max_bytes
-            || self.retained_output_bytes.load(Ordering::SeqCst) > node_max_bytes
-        {
-            if self.data.pop_front().is_none() {
+        let mut contention_retries = 0;
+        loop {
+            // Evict a batch, not one atomic accounting operation per byte. Other
+            // buffers may grow concurrently, so recheck the shared budget after
+            // each batch just as the byte-wise implementation did.
+            let local_excess = self.data.len().saturating_sub(self.max_bytes);
+            let retained = self.retained_output_bytes.load(Ordering::SeqCst);
+            let node_excess = retained.saturating_sub(node_max_bytes);
+            let remove = local_excess.max(node_excess).min(self.data.len());
+            if remove == 0 {
                 break;
             }
-            self.retained_output_bytes.fetch_sub(1, Ordering::SeqCst);
-            self.start_offset = self.start_offset.saturating_add(1);
+            // Reserve the accounting decrement before draining. Competing buffers
+            // must not all evict the same stale node excess as one large batch.
+            if self
+                .retained_output_bytes
+                .compare_exchange(
+                    retained,
+                    retained - remove,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                )
+                .is_err()
+            {
+                contention_retries += 1;
+                if contention_retries < 8 {
+                    continue;
+                }
+                // Bound retry-only work under adversarial contention. The old
+                // byte-wise eviction guarantees progress and explicit gap repair.
+                self.data.pop_front();
+                self.retained_output_bytes.fetch_sub(1, Ordering::SeqCst);
+                self.start_offset = self.start_offset.saturating_add(1);
+                contention_retries = 0;
+                continue;
+            }
+            contention_retries = 0;
+            self.data.drain(..remove);
+            self.start_offset = self.start_offset.saturating_add(remove as u64);
         }
 
         // Prune spans that are entirely before start_offset.
@@ -22473,6 +22504,71 @@ exit 7"#
         assert_eq!(second.start_offset, 2);
         drop(first);
         assert_eq!(retained.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn batched_output_eviction_preserves_wrapped_tail_and_accounting() {
+        let retained = Arc::new(AtomicUsize::new(0));
+        let mut output = OutputFanoutBuffer::with_accounting(8, Arc::clone(&retained));
+        for chunk in [b"abcdefgh".as_slice(), b"ijkl", b"mnopqrstuvwxyz"] {
+            output.push_chunk_with_node_cap(chunk, 8);
+            assert_eq!(retained.load(Ordering::SeqCst), output.data.len());
+            assert!(output.data.len() <= 8);
+        }
+        assert_eq!(output.start_offset, 18);
+        assert_eq!(output.end_offset(), 26);
+        let read = output.read_at(0, 100);
+        assert!(read.stream_gap);
+        assert_eq!(read.bytes, b"stuvwxyz");
+        drop(output);
+        assert_eq!(retained.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn batched_output_eviction_handles_concurrent_node_pressure() {
+        let retained = Arc::new(AtomicUsize::new(0));
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                let retained = Arc::clone(&retained);
+                scope.spawn(move || {
+                    let mut output = OutputFanoutBuffer::with_accounting(1024, retained);
+                    for _ in 0..100 {
+                        output.push_chunk_with_node_cap(&[b'x'; 4096], 2048);
+                        assert!(output.data.len() <= 1024);
+                    }
+                });
+            }
+        });
+        assert_eq!(retained.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn competing_output_batches_retain_node_budget_without_duplicate_eviction() {
+        for _ in 0..64 {
+            let retained = Arc::new(AtomicUsize::new(0));
+            let barrier = std::sync::Barrier::new(2);
+            let (first, second) = std::thread::scope(|scope| {
+                let build = |byte| {
+                    let mut output =
+                        OutputFanoutBuffer::with_accounting(2048, Arc::clone(&retained));
+                    output.push_chunk_with_node_cap(&[byte; 512], usize::MAX);
+                    barrier.wait();
+                    output.push_chunk_with_node_cap(&[byte; 512], 1536);
+                    output
+                };
+                let first = scope.spawn(move || build(b'a'));
+                let second = scope.spawn(move || build(b'b'));
+                (first.join().unwrap(), second.join().unwrap())
+            });
+            assert_eq!(retained.load(Ordering::SeqCst), 1536);
+            assert_eq!(first.data.len() + second.data.len(), 1536);
+            assert_eq!(first.end_offset(), 1024);
+            assert_eq!(second.end_offset(), 1024);
+            assert!(first.data.iter().all(|&byte| byte == b'a'));
+            assert!(second.data.iter().all(|&byte| byte == b'b'));
+            drop((first, second));
+            assert_eq!(retained.load(Ordering::SeqCst), 0);
+        }
     }
 
     #[test]

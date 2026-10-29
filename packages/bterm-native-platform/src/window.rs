@@ -186,6 +186,13 @@ impl WindowContext<'_> {
         self.accessibility.take_actions()
     }
 
+    /// Current monitor's nominal refresh in millihertz, if the platform reports it.
+    /// This is not measured presentation feedback and may differ under variable refresh.
+    #[must_use]
+    pub fn nominal_refresh_millihertz(&self) -> Option<u32> {
+        self.window.current_monitor()?.refresh_rate_millihertz()
+    }
+
     #[must_use]
     pub fn metrics(&self) -> WindowMetrics {
         metrics(self.window)

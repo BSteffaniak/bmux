@@ -2,12 +2,50 @@
 //! only an actual, timely main-thread output, never admission into a queue.
 
 use anyhow::{Result, anyhow, bail};
-use bmux_frontend_runtime::presentation::PreparedDelivery;
+use bmux_frontend_runtime::presentation::{PreparedDelivery, PresentationIdentity};
 use bterm_native_platform::PlatformProxy;
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 const OUTPUT_TIMEOUT: Duration = Duration::from_secs(10);
+const TELEMETRY_WINDOW: usize = 128;
+
+/// One UI-serviced output attempt, not an input-to-display latency measurement.
+/// Retained only with `BTERM_RENDER_TELEMETRY=1`; the history is capped at 128.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OutputTelemetrySample {
+    pub identity: PresentationIdentity,
+    /// Producer gate contention before construction of the queued transaction.
+    pub producer_gate_ns: u64,
+    /// From just before queue admission until UI service begins, including wake delay.
+    pub queue_ns: u64,
+    /// UI synchronization and complete output callback, before receipt transmission.
+    pub output_ns: u64,
+    pub renderer: Option<bterm_native_renderer::FrameTelemetry>,
+    pub succeeded: bool,
+}
+
+#[derive(Default)]
+struct OutputTelemetry {
+    attempts: u64,
+    samples: std::collections::VecDeque<OutputTelemetrySample>,
+}
+impl OutputTelemetry {
+    fn record(&mut self, sample: OutputTelemetrySample) {
+        self.attempts = self.attempts.saturating_add(1);
+        if self.samples.len() == TELEMETRY_WINDOW {
+            self.samples.pop_front();
+        }
+        self.samples.push_back(sample);
+    }
+}
+type SharedTelemetry = Option<Arc<Mutex<OutputTelemetry>>>;
+
+fn elapsed_ns(start: Option<Instant>) -> u64 {
+    start.map_or(0, |start| {
+        u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX)
+    })
+}
 
 #[derive(Default)]
 struct Lifecycle {
@@ -54,6 +92,9 @@ pub struct PendingOutput {
     transaction: Arc<Mutex<Transaction>>,
     lifecycle: Arc<Mutex<Lifecycle>>,
     deadline: Instant,
+    telemetry: SharedTelemetry,
+    producer_gate_ns: u64,
+    queued_at: Option<Instant>,
 }
 
 impl PendingOutput {
@@ -63,9 +104,26 @@ impl PendingOutput {
         self,
         output: impl FnOnce(&PreparedDelivery) -> Result<(), String>,
     ) -> Result<(), String> {
+        self.present_with_telemetry(|delivery, _| output(delivery))
+    }
+
+    /// Associate an optional renderer attempt with this exact transaction. Diagnostics
+    /// never affect acceptance; callers must still return actual synchronous output.
+    pub fn present_with_telemetry(
+        self,
+        output: impl FnOnce(
+            &PreparedDelivery,
+            &mut Option<bterm_native_renderer::FrameTelemetry>,
+        ) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let mut renderer = None;
+        let queue_ns = elapsed_ns(self.queued_at);
+        let output_start = self.telemetry.as_ref().map(|_| Instant::now());
         let result = match (self.lifecycle.lock(), self.transaction.lock()) {
             (Ok(lifecycle), Ok(mut transaction)) => {
-                transaction.output(lifecycle.closed, self.deadline, || output(&self.delivery))
+                transaction.output(lifecycle.closed, self.deadline, || {
+                    output(&self.delivery, &mut renderer)
+                })
             }
             _ => Err("native presentation synchronization failed".into()),
         };
@@ -75,7 +133,21 @@ impl PendingOutput {
                 self.delivery.identity
             )
         });
+        let sample = OutputTelemetrySample {
+            identity: self.delivery.identity,
+            producer_gate_ns: self.producer_gate_ns,
+            queue_ns,
+            output_ns: elapsed_ns(output_start),
+            renderer,
+            succeeded: result.is_ok(),
+        };
         let _ = self.receipt.send(result.clone());
+        // Receipt/authority are independent of diagnostic retention or export.
+        if let Some(telemetry) = &self.telemetry
+            && let Ok(mut telemetry) = telemetry.lock()
+        {
+            telemetry.record(sample);
+        }
         result
     }
 }
@@ -95,6 +167,7 @@ pub struct NativeOutput {
     clipboard: mpsc::SyncSender<PendingClipboard>,
     lifecycle: Arc<Mutex<Lifecycle>>,
     producer: Arc<Mutex<()>>,
+    telemetry: SharedTelemetry,
     wake: Arc<dyn Fn() -> Result<()> + Send + Sync>,
 }
 
@@ -104,6 +177,7 @@ pub struct NativeOutputReceiver {
     receiver: mpsc::Receiver<PendingOutput>,
     clipboard: mpsc::Receiver<PendingClipboard>,
     lifecycle: Arc<Mutex<Lifecycle>>,
+    telemetry: SharedTelemetry,
 }
 
 #[must_use]
@@ -119,18 +193,23 @@ fn output_channel_with_wake(
     let (sender, receiver) = mpsc::sync_channel(1);
     let (clipboard_tx, clipboard_rx) = mpsc::sync_channel(1);
     let lifecycle = Arc::new(Mutex::new(Lifecycle::default()));
+    let telemetry = std::env::var_os("BTERM_RENDER_TELEMETRY")
+        .is_some_and(|value| value == "1")
+        .then(|| Arc::new(Mutex::new(OutputTelemetry::default())));
     (
         NativeOutput {
             sender,
             clipboard: clipboard_tx,
             lifecycle: Arc::clone(&lifecycle),
             producer: Arc::new(Mutex::new(())),
+            telemetry: telemetry.clone(),
             wake,
         },
         NativeOutputReceiver {
             receiver,
             clipboard: clipboard_rx,
             lifecycle,
+            telemetry,
         },
     )
 }
@@ -147,6 +226,7 @@ impl NativeOutput {
     }
 
     fn present_until(&self, delivery: PreparedDelivery, deadline: Instant) -> Result<()> {
+        let gate_start = self.telemetry.as_ref().map(|_| Instant::now());
         let _producer = loop {
             self.check(deadline)?;
             match self.producer.try_lock() {
@@ -157,6 +237,7 @@ impl NativeOutput {
                 Err(std::sync::TryLockError::Poisoned(_)) => bail!("native output producer failed"),
             }
         };
+        let producer_gate_ns = elapsed_ns(gate_start);
         let (receipt, response) = mpsc::sync_channel(1);
         let transaction = Arc::new(Mutex::new(Transaction::default()));
         let pending = PendingOutput {
@@ -165,13 +246,23 @@ impl NativeOutput {
             transaction: Arc::clone(&transaction),
             lifecycle: Arc::clone(&self.lifecycle),
             deadline,
+            telemetry: self.telemetry.clone(),
+            producer_gate_ns,
+            queued_at: self.telemetry.as_ref().map(|_| Instant::now()),
         };
         self.sender
             .try_send(pending)
             .map_err(|_| anyhow!("native output queue is unavailable"))?;
         if let Err(error) = (self.wake)() {
-            cancel(&transaction);
-            return Err(anyhow!(error));
+            if cancel(&transaction) {
+                return Err(anyhow!(error));
+            }
+            // An existing redraw may have completed output before wake failed.
+            // As with timeout, completed authority is decided by its receipt.
+            return response
+                .recv()
+                .map_err(|_| anyhow!("native presentation receipt lost"))?
+                .map_err(|error| anyhow!(error));
         }
         loop {
             if let Err(error) = self.check(deadline) {
@@ -218,8 +309,15 @@ impl NativeOutput {
             })
             .map_err(|_| anyhow!("native clipboard request queue is unavailable"))?;
         if let Err(error) = self.wake() {
-            cancel(&transaction);
-            return Err(error);
+            if cancel(&transaction) {
+                return Err(error);
+            }
+            // Clipboard service may complete through an already-dispatched UI
+            // event; a subsequent wake failure cannot replace its actual result.
+            return response
+                .recv()
+                .map_err(|_| anyhow!("native clipboard receipt lost"))?
+                .map_err(|error| anyhow!(error));
         }
         loop {
             if let Err(error) = self.check(deadline) {
@@ -275,6 +373,25 @@ fn cancel(transaction: &Mutex<Transaction>) -> bool {
 }
 
 impl NativeOutputReceiver {
+    /// Bounded, oldest-first UI-serviced attempts. Disabled diagnostics return empty.
+    /// Admission failures and dropped/unserviced deliveries are not output attempts.
+    pub fn telemetry_samples(&self) -> Vec<OutputTelemetrySample> {
+        self.telemetry
+            .as_ref()
+            .and_then(|telemetry| {
+                telemetry
+                    .lock()
+                    .ok()
+                    .map(|telemetry| telemetry.samples.iter().copied().collect())
+            })
+            .unwrap_or_default()
+    }
+
+    /// Lifetime count and latest UI-serviced attempt, without allocating an export.
+    pub fn latest_telemetry(&self) -> Option<(u64, OutputTelemetrySample)> {
+        let telemetry = self.telemetry.as_ref()?.lock().ok()?;
+        Some((telemetry.attempts, *telemetry.samples.back()?))
+    }
     /// Service explicit reducer clipboard requests on the event-loop thread.
     /// Cancellation is checked before OS IO; clipboard text is never logged.
     pub(crate) fn service_clipboard(
@@ -362,6 +479,104 @@ mod tests {
             Ok(())
         }));
         (output, receiver, notification)
+    }
+
+    #[test]
+    fn output_telemetry_is_bounded_and_preserves_exact_identity_and_outcome() {
+        let mut telemetry = OutputTelemetry::default();
+        let mut identity = delivery().identity;
+        for revision in 1..=256 {
+            identity.revision = revision;
+            identity.viewport_generation = revision + 1;
+            telemetry.record(OutputTelemetrySample {
+                identity,
+                producer_gate_ns: 2,
+                queue_ns: 3,
+                output_ns: 5,
+                renderer: None,
+                succeeded: revision % 2 == 0,
+            });
+        }
+        assert_eq!(telemetry.attempts, 256);
+        assert_eq!(telemetry.samples.len(), TELEMETRY_WINDOW);
+        assert_eq!(telemetry.samples.front().unwrap().identity.revision, 129);
+        let last = telemetry.samples.back().unwrap();
+        assert_eq!(last.identity.revision, 256);
+        assert_eq!(last.identity.viewport_generation, 257);
+        assert!(last.succeeded);
+        assert_eq!(
+            (last.producer_gate_ns, last.queue_ns, last.output_ns),
+            (2, 3, 5),
+        );
+    }
+
+    #[test]
+    fn renderer_failure_is_correlated_without_changing_receipt() {
+        let (mut output, mut receiver, notification) = queued();
+        let telemetry = Arc::new(Mutex::new(OutputTelemetry::default()));
+        output.telemetry = Some(Arc::clone(&telemetry));
+        receiver.telemetry = Some(telemetry);
+        let identity = delivery().identity;
+        let worker = std::thread::spawn(move || output.present(delivery()));
+        notification.recv_timeout(Duration::from_secs(1)).unwrap();
+        let frame = bterm_native_renderer::FrameTelemetry {
+            surface_acquire_ns: 17,
+            gpu_wait_ns: 23,
+            ..Default::default()
+        };
+        let mut pending = receiver.try_recv().unwrap();
+        pending.queued_at = Some(Instant::now() - Duration::from_millis(2));
+        let result = pending.present_with_telemetry(|_, sample| {
+            *sample = Some(frame);
+            Err("test failure".into())
+        });
+        assert_eq!(
+            worker.join().unwrap().unwrap_err().to_string(),
+            result.unwrap_err(),
+        );
+        let samples = receiver.telemetry_samples();
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0].identity, identity);
+        assert_eq!(samples[0].renderer, Some(frame));
+        assert!(samples[0].queue_ns >= 2_000_000);
+        assert!(!samples[0].succeeded);
+        assert_eq!(receiver.latest_telemetry(), Some((1, samples[0])));
+    }
+
+    #[test]
+    fn rejected_transaction_never_inherits_renderer_sample() {
+        let (mut output, mut receiver, notification) = queued();
+        let telemetry = Arc::new(Mutex::new(OutputTelemetry::default()));
+        output.telemetry = Some(Arc::clone(&telemetry));
+        receiver.telemetry = Some(telemetry);
+        let worker = std::thread::spawn(move || output.present(delivery()));
+        notification.recv_timeout(Duration::from_secs(1)).unwrap();
+        let pending = receiver.try_recv().unwrap();
+        pending.transaction.lock().unwrap().cancelled = true;
+        assert!(
+            pending
+                .present_with_telemetry(|_, _| panic!("cancelled backend"))
+                .is_err()
+        );
+        assert!(worker.join().unwrap().is_err());
+        let samples = receiver.telemetry_samples();
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0].renderer, None);
+        assert!(!samples[0].succeeded);
+    }
+
+    #[test]
+    fn disabled_diagnostics_do_not_retain_output_samples() {
+        let (mut output, mut receiver, notification) = queued();
+        output.telemetry = None;
+        receiver.telemetry = None;
+        let worker = std::thread::spawn(move || output.present(delivery()));
+        notification.recv_timeout(Duration::from_secs(1)).unwrap();
+        receiver.try_recv().unwrap().present(|_| Ok(())).unwrap();
+        worker.join().unwrap().unwrap();
+        assert_eq!(receiver.telemetry_samples().len(), 0);
+        assert_eq!(receiver.latest_telemetry(), None);
+        assert_eq!(elapsed_ns(None), 0);
     }
 
     #[test]
@@ -538,6 +753,90 @@ mod tests {
         assert!(receiver.try_recv().is_none());
         assert!(pending.present(|_| Ok(())).is_ok());
         assert!(first.join().unwrap().is_ok());
+    }
+
+    #[test]
+    fn wake_failure_after_output_completion_preserves_actual_receipt() {
+        for backend in [Ok(()), Err("completed backend failure".to_string())] {
+            let receiver_slot = Arc::new(Mutex::new(None::<NativeOutputReceiver>));
+            let observed = Arc::new(Mutex::new(None));
+            let wake_receiver = Arc::clone(&receiver_slot);
+            let wake_observed = Arc::clone(&observed);
+            let (output, receiver) = output_channel_with_wake(Arc::new(move || {
+                // Deterministically complete through the existing receiver before
+                // returning the wake failure; no scheduling delays or sleeps.
+                let guard = wake_receiver.lock().unwrap();
+                let pending = guard.as_ref().unwrap().try_recv().unwrap();
+                *wake_observed.lock().unwrap() = Some(pending.present(|_| backend.clone()));
+                bail!("wake failed after output");
+            }));
+            *receiver_slot.lock().unwrap() = Some(receiver);
+            let actual = output
+                .present(delivery())
+                .map_err(|error| error.to_string());
+            assert_eq!(actual, observed.lock().unwrap().take().unwrap());
+        }
+    }
+
+    #[test]
+    fn wake_failure_after_clipboard_completion_preserves_actual_receipt() {
+        for backend in [
+            Ok(Some("read result".to_string())),
+            Err("clipboard failure".to_string()),
+        ] {
+            let receiver_slot = Arc::new(Mutex::new(None::<NativeOutputReceiver>));
+            let wake_receiver = Arc::clone(&receiver_slot);
+            let expected = backend.clone();
+            let (output, receiver) = output_channel_with_wake(Arc::new(move || {
+                let guard = wake_receiver.lock().unwrap();
+                let receiver = guard.as_ref().unwrap();
+                let pending = receiver.clipboard.try_recv().unwrap();
+                // Mock only OS clipboard IO, not queueing or the completion gate.
+                // Service and send the actual result before wake reports failure.
+                let result = {
+                    let lifecycle = receiver.lifecycle.lock().unwrap();
+                    let mut transaction = pending.transaction.lock().unwrap();
+                    transaction
+                        .output(lifecycle.closed, pending.deadline, || {
+                            backend.clone().map(|_| ())
+                        })
+                        .map(|()| backend.clone().unwrap())
+                };
+                pending.receipt.send(result).unwrap();
+                bail!("wake failed after clipboard service");
+            }));
+            *receiver_slot.lock().unwrap() = Some(receiver);
+            let actual = output
+                .clipboard_request(bmux_cli::attach::NativeClipboardRequest::ReadText)
+                .map_err(|error| error.to_string());
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn wake_failure_before_service_cancels_output_and_clipboard() {
+        let (output, receiver) = output_channel_with_wake(Arc::new(|| bail!("wake failed")));
+        assert_eq!(
+            output.present(delivery()).unwrap_err().to_string(),
+            "wake failed",
+        );
+        assert!(
+            receiver
+                .try_recv()
+                .unwrap()
+                .present(|_| panic!("cancelled output"))
+                .is_err()
+        );
+        assert_eq!(
+            output
+                .clipboard_request(bmux_cli::attach::NativeClipboardRequest::ReadText)
+                .unwrap_err()
+                .to_string(),
+            "wake failed",
+        );
+        let pending = receiver.clipboard.try_recv().unwrap();
+        assert!(pending.transaction.lock().unwrap().cancelled);
+        assert!(!pending.transaction.lock().unwrap().completed);
     }
 
     #[test]

@@ -8,6 +8,9 @@ macro_rules! measurements {
     ($($field:ident),+ $(,)?) => {
         /// CPU wall times in nanoseconds and resource counters for one presentation attempt.
         /// Text/image times include projection and upload enqueue work, not GPU execution.
+        /// Acquisition measures only get_current_texture. Encode/submit includes vertex
+        /// allocation/upload and CPU command encoding/submission, not GPU execution.
+        /// Present-call time is not scanout or display visibility feedback.
         /// GPU wait measures device polling; validation measures subsequent error-scope
         /// resolution. Vertex byte counters are logical/requested sizes, not resident
         /// memory; allocation bytes sum requested capacities, including reallocations.
@@ -27,6 +30,9 @@ macro_rules! measurements {
 measurements!(
     text_cpu_ns,
     image_cpu_ns,
+    surface_acquire_ns,
+    gpu_encode_submit_ns,
+    present_call_ns,
     gpu_wait_ns,
     gpu_validation_ns,
     total_ns,
@@ -99,6 +105,9 @@ impl Telemetry {
         self.summary.window_samples = (self.summary.window_samples + 1).min(WINDOW);
         self.summary.totals.add(sample);
     }
+    pub fn latest(&self) -> Option<FrameTelemetry> {
+        (self.summary.attempts != 0).then(|| self.samples[(self.next + WINDOW - 1) % WINDOW])
+    }
     pub fn summary(&self) -> TelemetrySummary {
         let samples = &self.samples[..self.summary.window_samples];
         TelemetrySummary {
@@ -159,6 +168,31 @@ pub(crate) fn elapsed_ns(start: Option<Instant>) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stage_timings_remain_separate_and_latest_includes_failures() {
+        let mut telemetry = Telemetry::default();
+        assert_eq!(telemetry.latest(), None);
+        let sample = FrameTelemetry {
+            surface_acquire_ns: 2,
+            gpu_encode_submit_ns: 3,
+            gpu_wait_ns: 5,
+            gpu_validation_ns: 7,
+            present_call_ns: 11,
+            ..FrameTelemetry::default()
+        };
+        for _ in 0..=WINDOW {
+            telemetry.record(sample, true);
+        }
+        assert_eq!(telemetry.latest(), Some(sample));
+        let summary = telemetry.summary();
+        assert_eq!(summary.p99, sample);
+        assert_eq!(summary.totals.surface_acquire_ns, 2 * 129);
+        assert_eq!(summary.totals.gpu_encode_submit_ns, 3 * 129);
+        assert_eq!(summary.totals.gpu_wait_ns, 5 * 129);
+        assert_eq!(summary.totals.gpu_validation_ns, 7 * 129);
+        assert_eq!(summary.totals.present_call_ns, 11 * 129);
+    }
 
     #[test]
     fn empty_and_disabled_measurements_are_zero() {

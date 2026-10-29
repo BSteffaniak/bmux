@@ -8,6 +8,7 @@ pub mod input;
 pub mod layout;
 mod local_presentation;
 mod metadata;
+mod native_input_metrics;
 pub mod observer;
 mod pointer_shape;
 mod prompt_search;

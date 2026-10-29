@@ -375,13 +375,40 @@ pub enum NativeAttachEvent {
     Close,
 }
 
+pub use super::native_input_metrics::{QueueLatencySnapshot, QueueMetricsSnapshot};
+
 /// Bounded command sender. Closing all senders explicitly detaches the view.
 #[derive(Clone)]
 pub struct NativeAttachHandle(
-    tokio::sync::mpsc::Sender<NativeAttachEvent>,
+    tokio::sync::mpsc::Sender<QueuedNativeEvent>,
     Arc<std::sync::atomic::AtomicU64>,
+    super::native_input_metrics::QueueMetrics,
 );
+struct QueuedNativeEvent {
+    event: NativeAttachEvent,
+    ticket: super::native_input_metrics::QueueTicket,
+}
+
+fn native_event_payload_bytes(event: &NativeAttachEvent) -> usize {
+    use bmux_frontend_runtime::input::InputEvent;
+    match event {
+        NativeAttachEvent::Input(InputEvent::Ime(
+            bmux_frontend_runtime::input::ImeEvent::Commit(text)
+            | bmux_frontend_runtime::input::ImeEvent::Preedit { text, .. },
+        )) => text.len(),
+        NativeAttachEvent::Input(InputEvent::Key(key)) => key.text.as_ref().map_or(0, String::len),
+        NativeAttachEvent::Accessibility { semantic_id, .. } => semantic_id.len(),
+        _ => 0,
+    }
+}
+
 impl NativeAttachHandle {
+    /// Bounded numeric diagnostics; no input contents or acknowledgement authority.
+    #[must_use]
+    pub fn input_queue_metrics(&self) -> super::native_input_metrics::QueueMetricsSnapshot {
+        self.2.snapshot()
+    }
+
     fn invalidate_pointer_authority(&self, event: &NativeAttachEvent) {
         if let NativeAttachEvent::Resize {
             viewport_generation,
@@ -402,9 +429,26 @@ impl NativeAttachHandle {
     /// Returns an error if the bounded queue is full or closed.
     pub fn try_send(&self, event: NativeAttachEvent) -> Result<()> {
         self.invalidate_pointer_authority(&event);
-        self.0
-            .try_send(event)
-            .map_err(|error| anyhow::anyhow!("native attach input queue: {error}"))
+        let attempt = self.2.begin_attempt();
+        match self.0.try_reserve() {
+            Ok(permit) => {
+                let ticket = attempt.admit(native_event_payload_bytes(&event));
+                permit.send(QueuedNativeEvent { event, ticket });
+                Ok(())
+            }
+            Err(error) => {
+                let reason = match error {
+                    tokio::sync::mpsc::error::TrySendError::Full(()) => {
+                        super::native_input_metrics::Rejection::Full
+                    }
+                    tokio::sync::mpsc::error::TrySendError::Closed(()) => {
+                        super::native_input_metrics::Rejection::Closed
+                    }
+                };
+                attempt.reject(reason);
+                Err(anyhow::anyhow!("native attach input queue: {error}"))
+            }
+        }
     }
     /// Wait for input queue capacity.
     ///
@@ -412,10 +456,18 @@ impl NativeAttachHandle {
     /// Returns an error if the host has closed its input queue.
     pub async fn send(&self, event: NativeAttachEvent) -> Result<()> {
         self.invalidate_pointer_authority(&event);
-        self.0
-            .send(event)
-            .await
-            .map_err(|error| anyhow::anyhow!("native attach input queue: {error}"))
+        let attempt = self.2.begin_attempt();
+        match self.0.reserve().await {
+            Ok(permit) => {
+                let ticket = attempt.admit(native_event_payload_bytes(&event));
+                permit.send(QueuedNativeEvent { event, ticket });
+                Ok(())
+            }
+            Err(error) => {
+                attempt.reject(super::native_input_metrics::Rejection::Closed);
+                Err(anyhow::anyhow!("native attach input queue: {error}"))
+            }
+        }
     }
 }
 
@@ -490,7 +542,7 @@ pub struct NativeAttachHost {
     geometry: TerminalGeometry,
     viewport_generation: u64,
     live_viewport_generation: Arc<std::sync::atomic::AtomicU64>,
-    events: tokio::sync::mpsc::Receiver<NativeAttachEvent>,
+    events: tokio::sync::mpsc::Receiver<QueuedNativeEvent>,
     observer: Option<super::observer::AttachObserverPublisher>,
     accepted_revision: Arc<std::sync::atomic::AtomicU64>,
     pending: std::collections::VecDeque<NativeAttachEvent>,
@@ -552,7 +604,11 @@ impl NativeAttachHost {
         let live_viewport_generation =
             Arc::new(std::sync::atomic::AtomicU64::new(viewport_generation));
         Ok((
-            NativeAttachHandle(sender, live_viewport_generation.clone()),
+            NativeAttachHandle(
+                sender,
+                live_viewport_generation.clone(),
+                super::native_input_metrics::QueueMetrics::from_env(),
+            ),
             Self {
                 geometry: TerminalGeometry {
                     cols: columns,
@@ -638,9 +694,10 @@ impl AttachHost for NativeAttachHost {
             if let Some(event) = self.pending.pop_front() {
                 return Ok(Some(AttachHostEvent::Native(event)));
             }
-            let Some(event) = self.events.recv().await else {
+            let Some(QueuedNativeEvent { event, ticket }) = self.events.recv().await else {
                 return Ok(None);
             };
+            ticket.dequeued();
             if let NativeAttachEvent::Scroll {
                 identity,
                 column,
@@ -2256,6 +2313,10 @@ async fn recover_attach_output_desync_for_pane(
 pub struct AttachFrameRenderStats {
     pub frame_bytes: usize,
     pub terminal_write_ms: u64,
+    /// Shared composition/projection before output handoff (not application latency).
+    pub composition_ns: u64,
+    /// Observer preparation plus backend acceptance, or terminal write/flush.
+    pub output_acceptance_ns: u64,
     pub damage_rects: usize,
     pub damage_area_cells: u64,
     pub full_surface_fallbacks: usize,
@@ -3623,6 +3684,8 @@ fn attach_frame_trace_payload(
         "scene_hydrated": scene_hydrated,
         "frame_bytes": frame_stats.frame_bytes,
         "terminal_write_ms": frame_stats.terminal_write_ms,
+        "composition_ns": frame_stats.composition_ns,
+        "output_acceptance_ns": frame_stats.output_acceptance_ns,
         "damage_rects": frame_stats.damage_rects,
         "damage_area_cells": frame_stats.damage_area_cells,
         "full_surface_fallbacks": frame_stats.full_surface_fallbacks,
@@ -10490,6 +10553,7 @@ fn render_attach_frame_inner(
     geometry: TerminalGeometry,
     mut render_trace: Option<&mut AttachRenderTrace>,
 ) -> Result<AttachFrameRenderStats> {
+    let frame_started_at = PhaseChannel::Attach.enabled().then(Instant::now);
     let damage_policy = DamageCoalescingPolicy {
         max_rects: damage_config.max_rects,
         max_area_percent: damage_config.max_area_percent,
@@ -10939,6 +11003,9 @@ fn render_attach_frame_inner(
             .context("failed queuing end synchronized update")?;
     }
 
+    let composition_ns = frame_started_at.map_or(0, |start| {
+        u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX)
+    });
     let terminal_write_started_at = Instant::now();
     // The retained damage plan and resolved cursor are the change authority.
     // Do not repair/copy/serialize an unchanged observer frame merely because
@@ -11007,7 +11074,9 @@ fn render_attach_frame_inner(
             .mark_full_frame(AttachDirtySource::ManualRedraw);
         return Err(error);
     }
-    let terminal_write_ms = duration_millis_u64(terminal_write_started_at.elapsed());
+    let output_elapsed = terminal_write_started_at.elapsed();
+    let terminal_write_ms = duration_millis_u64(output_elapsed);
+    let output_acceptance_ns = u64::try_from(output_elapsed.as_nanos()).unwrap_or(u64::MAX);
     view_state.last_cursor_state = pending_cursor_state;
     view_state.last_pointer_shape = view_state.pointer_shape;
     view_state.terminal_graphics_cache = pending_graphics_cache;
@@ -11072,6 +11141,8 @@ fn render_attach_frame_inner(
     let stats = AttachFrameRenderStats {
         frame_bytes: frame_bytes.len(),
         terminal_write_ms,
+        composition_ns,
+        output_acceptance_ns,
         damage_rects: frame_plan.damage_stats.rect_count,
         damage_area_cells: frame_plan.damage_stats.rect_area_cells,
         full_surface_fallbacks: frame_plan.damage_stats.full_surface_count,
@@ -20200,6 +20271,8 @@ mod tests {
         AttachFrameRenderStats {
             frame_bytes: 0,
             terminal_write_ms: 0,
+            composition_ns: 0,
+            output_acceptance_ns: 0,
             damage_rects: 0,
             damage_area_cells: 0,
             full_surface_fallbacks: 0,

@@ -302,7 +302,7 @@ mod tests {
             epoch,
             revision,
             attached_id: target,
-            prepared,
+            prepared: prepared.into(),
             surfaces: Vec::new(),
             selection_text: std::collections::BTreeMap::new(),
             unsupported_metadata: &["selection", "semantics"],

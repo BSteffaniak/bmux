@@ -345,6 +345,12 @@ impl Gpu {
             self.surface.configure(&self.device, &self.config);
         }
     }
+    pub fn presentation_config(&self) -> (u32, u32) {
+        (
+            self.config.present_mode as u32,
+            self.config.desired_maximum_frame_latency,
+        )
+    }
     pub fn begin_telemetry(&mut self, enabled: bool) {
         self.telemetry = enabled.then(FrameTelemetry::default);
     }
@@ -490,7 +496,12 @@ impl Gpu {
         if self.size.is_empty() {
             return Err(RenderError::Suspended);
         }
-        let (frame, suboptimal) = match self.surface.get_current_texture() {
+        let acquire_start = self.telemetry.as_ref().map(|_| std::time::Instant::now());
+        let acquired = self.surface.get_current_texture();
+        if let Some(telemetry) = &mut self.telemetry {
+            telemetry.surface_acquire_ns = elapsed_ns(acquire_start);
+        }
+        let (frame, suboptimal) = match acquired {
             wgpu::CurrentSurfaceTexture::Success(frame) => (frame, false),
             wgpu::CurrentSurfaceTexture::Suboptimal(frame) => (frame, true),
             wgpu::CurrentSurfaceTexture::Outdated => {
@@ -513,6 +524,7 @@ impl Gpu {
                 )));
             }
         };
+        let encode_start = self.telemetry.as_ref().map(|_| std::time::Instant::now());
         let validation_scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
         let capacity = vertex_capacity(self.vertices.len().max(1), self.vertex_capacity)?;
         let buffer_bytes = (capacity * std::mem::size_of::<Vertex>()) as u64;
@@ -565,6 +577,9 @@ impl Gpu {
             pass.draw(0..self.vertices.len() as u32, 0..1);
         }
         let submission = self.queue.submit([encoder.finish()]);
+        if let Some(telemetry) = &mut self.telemetry {
+            telemetry.gpu_encode_submit_ns = elapsed_ns(encode_start);
+        }
         let validation = validation_scope.pop();
         let wait_start = self.telemetry.as_ref().map(|_| std::time::Instant::now());
         let waited = self.device.poll(wgpu::PollType::Wait {
@@ -590,7 +605,11 @@ impl Gpu {
             self.check_failure()?;
         }
         self.check_failure()?;
+        let present_start = self.telemetry.as_ref().map(|_| std::time::Instant::now());
         self.queue.present(frame);
+        if let Some(telemetry) = &mut self.telemetry {
+            telemetry.present_call_ns = elapsed_ns(present_start);
+        }
         if suboptimal {
             self.surface.configure(&self.device, &self.config);
         }

@@ -229,7 +229,11 @@ fn lifecycle_backpressure_fails_closed_for_already_queued_pointer() {
     );
     assert_eq!(host.viewport_generation(), Some(8));
     let queued = host.events.try_recv().unwrap();
-    assert!(!native_pointer_event_is_current(&queued, &view, &host));
+    assert!(!native_pointer_event_is_current(
+        &queued.event,
+        &view,
+        &host
+    ));
 }
 
 #[tokio::test]

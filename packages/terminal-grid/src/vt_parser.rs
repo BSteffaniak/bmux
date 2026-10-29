@@ -204,9 +204,17 @@ impl<const N: usize> Parser<N> {
     /// Storage remains bounded by the OSC capacity plus fixed header overhead.
     pub(crate) fn replay_prefix(&self) -> Vec<u8> {
         let mut prefix = Vec::with_capacity(208);
+        self.write_replay_prefix(&mut prefix);
+        prefix
+    }
+
+    /// Replaces caller-owned storage, retaining its capacity for reuse. Normal
+    /// text without partial UTF-8 writes nothing and never reserves storage.
+    pub(crate) fn write_replay_prefix(&self, prefix: &mut Vec<u8>) {
+        prefix.clear();
         match self.state {
             State::Text => prefix.extend_from_slice(&self.utf8[..self.utf8_len]),
-            State::Osc | State::OscEscape => self.write_osc_prefix(&mut prefix),
+            State::Osc | State::OscEscape => self.write_osc_prefix(prefix),
             State::StringDiscard => prefix.extend_from_slice(b"\x1b_"),
             State::DcsData => prefix.extend_from_slice(b"\x1bPq"),
             State::DcsDiscard => prefix.extend_from_slice(b"\x1bP $0"),
@@ -236,7 +244,7 @@ impl<const N: usize> Parser<N> {
                 prefix.extend_from_slice(&intermediates[..private]);
                 let mut group = 0;
                 for index in 0..self.params.used {
-                    Self::write_number(&mut prefix, self.params.values[index]);
+                    Self::write_number(prefix, self.params.values[index]);
                     let closed = group < self.params.groups && self.params.ends[group] == index + 1;
                     prefix.push(if closed { b';' } else { b':' });
                     if closed {
@@ -247,7 +255,7 @@ impl<const N: usize> Parser<N> {
                     || self.number != 0
                     || matches!(self.state, State::CsiNumbers | State::DcsNumbers)
                 {
-                    Self::write_number(&mut prefix, self.number);
+                    Self::write_number(prefix, self.number);
                 }
                 if self.ignored && self.params.used == 32 {
                     prefix.push(b'0');
@@ -260,7 +268,6 @@ impl<const N: usize> Parser<N> {
                 }
             }
         }
-        prefix
     }
 
     fn write_osc_prefix(&self, prefix: &mut Vec<u8>) {

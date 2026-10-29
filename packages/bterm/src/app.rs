@@ -173,6 +173,10 @@ pub enum ConfigurationAction {
 /// must run publication off the window thread and route native input through
 /// the canonical bindings and committed retained scene.
 pub trait AttachWorker: 'static {
+    /// Optional diagnostics; never used for input/output authority.
+    fn input_queue_metrics(&self) -> Option<bmux_cli::attach::QueueMetricsSnapshot> {
+        None
+    }
     fn start(&mut self, output: NativeOutput, viewport: PresentationViewport) -> Result<()>;
     fn event(&mut self, event: PlatformEvent, viewport: PresentationViewport) -> Result<()>;
     fn retry_presentation(&mut self, viewport_generation: u64) -> Result<()>;
@@ -403,7 +407,7 @@ impl<W: AttachWorker> Application<W> {
                 self.worker.detach();
                 context.exit();
             }
-            PlatformEvent::Wake | PlatformEvent::RedrawRequested => {
+            event @ (PlatformEvent::Wake | PlatformEvent::RedrawRequested) => {
                 if self.worker.check()? {
                     context.exit();
                     return Ok(());
@@ -421,7 +425,7 @@ impl<W: AttachWorker> Application<W> {
                         let semantic_generation = &mut self.semantic_generation;
                         let last_output = &mut self.last_output;
                         let retained_output = &mut self.retained_output;
-                        let accepted = pending.present(|delivery| {
+                        let accepted = pending.present_with_telemetry(|delivery, frame_telemetry| {
                             if !active || metrics.physical_size.is_empty() {
                                 Err("native surface is not drawable".into())
                             } else if delivery.identity.viewport_generation != viewport.generation {
@@ -441,9 +445,9 @@ impl<W: AttachWorker> Application<W> {
                                 let renderer = renderer
                                     .as_mut()
                                     .ok_or_else(|| "native renderer unavailable".to_string())?;
-                                renderer
-                                    .present(&delivery.prepared)
-                                    .map_err(|error| error.to_string())?;
+                                let rendered = renderer.present(&delivery.prepared);
+                                *frame_telemetry = renderer.last_frame_telemetry();
+                                rendered.map_err(|error| error.to_string())?;
                                 *last_output = Some(delivery.identity);
                                 if let Some(pointer) = delivery.pointer_shape {
                                     context.set_pointer_icon(native_pointer_icon(pointer));
@@ -484,21 +488,63 @@ impl<W: AttachWorker> Application<W> {
                             }
                         });
                         // Receipt has been delivered before optional diagnostic IO.
-                        if let Some(summary) = self
-                            .renderer
-                            .as_ref()
-                            .and_then(NativeRenderer::telemetry_summary)
-                            && summary.attempts.is_multiple_of(120)
+                        // Numeric values only: UUIDs are exact decimal u128 identities.
+                        if let Some((attempts, sample)) = output.latest_telemetry()
+                            && attempts.is_multiple_of(120)
                         {
+                            let frame = sample.renderer.unwrap_or_default();
+                            let (mode, latency) = self
+                                .renderer
+                                .as_ref()
+                                .map_or((0, 0), NativeRenderer::presentation_config);
+                            let refresh = context.nominal_refresh_millihertz();
+                            if let Some(queue) = self
+                                .worker
+                                .input_queue_metrics()
+                                .filter(|queue| queue.enabled)
+                            {
+                                eprintln!(
+                                    "bterm_input_queue admitted={} dequeued={} full={} closed={} cancelled={} discarded={} pending={} high_water={} payload_bytes={} payload_high_water={} admission_p99_ns={} residence_p50_ns={} residence_p95_ns={} residence_p99_ns={}",
+                                    queue.admitted,
+                                    queue.dequeued,
+                                    queue.rejected_full,
+                                    queue.rejected_closed,
+                                    queue.rejected_cancelled,
+                                    queue.discarded,
+                                    queue.pending,
+                                    queue.pending_high_water,
+                                    queue.payload_bytes,
+                                    queue.payload_bytes_high_water,
+                                    queue.admission_wait.p99_ns,
+                                    queue.queue_residence.p50_ns,
+                                    queue.queue_residence.p95_ns,
+                                    queue.queue_residence.p99_ns
+                                );
+                            }
                             eprintln!(
-                                "bterm: renderer attempts={} failures={} window={} p50_ns={} p95_ns={} p99_ns={} totals={:?}",
-                                summary.attempts,
-                                summary.failures,
-                                summary.window_samples,
-                                summary.p50.total_ns,
-                                summary.p95.total_ns,
-                                summary.p99.total_ns,
-                                summary.totals,
+                                "bterm_presentation attempts={} epoch={} revision={} attached={} viewport={} success={} gate_ns={} queue_ns={} output_ns={} renderer_sample={} renderer_ns={} text_ns={} image_ns={} acquire_ns={} encode_submit_ns={} gpu_wait_ns={} validation_ns={} present_call_ns={} present_mode={} max_frame_latency={} refresh_known={} nominal_refresh_millihertz={}",
+                                attempts,
+                                sample.identity.epoch.as_u128(),
+                                sample.identity.revision,
+                                sample.identity.attached_id.as_u128(),
+                                sample.identity.viewport_generation,
+                                u8::from(sample.succeeded),
+                                sample.producer_gate_ns,
+                                sample.queue_ns,
+                                sample.output_ns,
+                                u8::from(sample.renderer.is_some()),
+                                frame.total_ns,
+                                frame.text_cpu_ns,
+                                frame.image_cpu_ns,
+                                frame.surface_acquire_ns,
+                                frame.gpu_encode_submit_ns,
+                                frame.gpu_wait_ns,
+                                frame.gpu_validation_ns,
+                                frame.present_call_ns,
+                                mode,
+                                latency,
+                                u8::from(refresh.is_some()),
+                                refresh.unwrap_or(0),
                             );
                         }
                         if let Err(error) = accepted {
@@ -526,11 +572,16 @@ impl<W: AttachWorker> Application<W> {
                         } else {
                             self.retry = RetryBudget::default();
                         }
-                    } else if self.active
-                        && !context.metrics().physical_size.is_empty()
-                        && let (Some(renderer), Some(retained)) =
-                            (&mut self.renderer, &self.retained_output)
-                        && retained.identity.viewport_generation == self.viewport.generation
+                    } else if replay_retained(
+                        &event,
+                        self.active,
+                        !context.metrics().physical_size.is_empty(),
+                        self.retained_output
+                            .as_ref()
+                            .map(|output| output.identity.viewport_generation),
+                        self.viewport.generation,
+                    ) && let (Some(renderer), Some(retained)) =
+                        (&mut self.renderer, &self.retained_output)
                     {
                         // Exposure redraws replay the actual retained output;
                         // they never acknowledge a new interaction revision.
@@ -887,6 +938,12 @@ struct BmuxWorker {
 }
 
 impl AttachWorker for BmuxWorker {
+    fn input_queue_metrics(&self) -> Option<bmux_cli::attach::QueueMetricsSnapshot> {
+        self.handle
+            .as_ref()
+            .map(bmux_cli::attach::NativeAttachHandle::input_queue_metrics)
+    }
+
     fn start(&mut self, output: NativeOutput, viewport: PresentationViewport) -> Result<()> {
         let delivery = output.clone();
         let (handle, mut host) = bmux_cli::attach::NativeAttachHost::channel(
@@ -1204,6 +1261,21 @@ fn projection_resize_needed(
     !active || previous != Some(next)
 }
 
+// A wake services queued work and retries, never an exposure. Resize/resume
+// request an actual redraw after invalidating their viewport as before.
+fn replay_retained(
+    event: &PlatformEvent,
+    active: bool,
+    drawable: bool,
+    retained_generation: Option<u64>,
+    viewport_generation: u64,
+) -> bool {
+    matches!(event, PlatformEvent::RedrawRequested)
+        && active
+        && drawable
+        && retained_generation == Some(viewport_generation)
+}
+
 fn accumulate_scroll(remainder: &mut [f64; 2], x: f64, y: f64) -> (i16, i16) {
     let mut steps = [0_i16; 2];
     for (axis, delta) in [x, y].into_iter().enumerate() {
@@ -1254,6 +1326,21 @@ fn projection_cells(pixels: u32, cell: f32) -> Result<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wake_never_replays_but_exposure_requires_current_drawable_output() {
+        let redraw = &PlatformEvent::RedrawRequested;
+        let wake = &PlatformEvent::Wake;
+        assert!(!replay_retained(wake, true, true, Some(4), 4));
+        assert!(replay_retained(redraw, true, true, Some(4), 4));
+        assert!(!replay_retained(redraw, false, true, Some(4), 4));
+        assert!(!replay_retained(redraw, true, false, Some(4), 4));
+        assert!(!replay_retained(redraw, true, true, None, 4));
+        // Resize invalidates the old output; its requested redraw must wait for
+        // queued new-viewport delivery rather than replay stale retained pixels.
+        assert!(!replay_retained(redraw, true, true, Some(4), 5));
+        assert!(replay_retained(redraw, true, true, Some(5), 5));
+    }
 
     #[test]
     fn resumed_geometry_does_not_resend_the_initial_viewport_generation() {

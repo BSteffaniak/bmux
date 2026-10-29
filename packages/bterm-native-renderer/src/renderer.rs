@@ -122,6 +122,18 @@ impl NativeRenderer {
             self.telemetry = None;
         }
     }
+    /// Last renderer attempt, including failures; absent when diagnostics are disabled
+    /// or no attempt has run. This is CPU wall-time evidence, never display feedback.
+    pub fn last_frame_telemetry(&self) -> Option<FrameTelemetry> {
+        self.telemetry
+            .as_ref()
+            .and_then(|telemetry| telemetry.latest())
+    }
+    /// Configured `(wgpu PresentMode discriminant, desired maximum frame latency)`.
+    /// This reports selected configuration, not measured display refresh or scanout.
+    pub fn presentation_config(&self) -> (u32, u32) {
+        self.gpu.presentation_config()
+    }
     /// Poll lifetime counters and last-128-attempt percentiles, including failures.
     /// Summary calculation is bounded and happens only when requested by the caller.
     pub fn telemetry_summary(&self) -> Option<TelemetrySummary> {

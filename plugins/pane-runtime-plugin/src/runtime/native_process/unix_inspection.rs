@@ -1,5 +1,7 @@
 //! Unix process observation and legacy user-directed signaling.
+#[cfg(not(target_os = "macos"))]
 use super::super::bounded_probe_output;
+#[cfg(not(target_os = "macos"))]
 use std::time::Duration;
 
 pub(in super::super) fn send_process_signal_command(

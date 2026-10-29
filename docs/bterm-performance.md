@@ -174,6 +174,72 @@ fixed-duration
 no-input isolated process observation; the `idle` case is only a transaction
 micro-workload.
 
+## Shared pipeline diagnostics and measurement boundaries
+
+With `BTERM_RENDER_TELEMETRY=1`, Bterm also reports identity-correlated producer
+contention, UI queue residence, output callback time, input admission/residence,
+composition, and output acceptance. Output histories retain 128 scalar samples;
+input histories retain 256. Disabled input metrics avoid diagnostic clocks,
+locks, and sample storage. No terminal text, image payload, or key contents are
+recorded by these summaries. Logical payload counters are not allocator or RSS
+measurements.
+
+Surface acquisition, encode/submit, GPU wait/validation, and present-call time
+are separate stages. Present-call return and nominal monitor refresh do not
+prove physical visibility or input-to-photon latency. Failed output never gains
+interaction authority; neither enqueue nor telemetry acknowledges output.
+Wake events service new output without replaying an unchanged retained frame;
+actual exposure redraws and viewport fencing remain intact.
+
+Display-free measurement entry points:
+
+```sh
+nix develop --command cargo run --release -p bmux_terminal_grid \
+  --example replay_prefix_benchmark
+nix develop --command cargo test -p bmux_cli --test native_echo_integration
+nix develop --command cargo test -p bmux_cli --test native_echo_integration \
+  -- --ignored --nocapture
+python3 scripts/test-perf-owned-process.py
+```
+
+The echo fixture launches an isolated real daemon and native key input, then
+matches complete retained-output acceptance. Its timer starts before input
+admission. It does not exercise native GPU output or the display. A debug-build
+96-sample run measured p50 16.92 ms, p95 21.47 ms, p99 21.82 ms; without an
+identical baseline echo fixture this establishes a diagnostic baseline, not a
+speedup.
+
+For owned process-tree observations, use an explicit executable and isolated
+configuration/state (never attach the sampler to an existing runtime):
+
+```sh
+python3 scripts/perf-owned-process.py --seconds 30 --interval 0.2 \
+  --output /tmp/owned-resource-run.json -- /absolute/path/to/test-executable
+```
+
+The sampler records executable SHA-256 and bounded-duration numeric samples,
+discards workload stdin/stdout/stderr, and cleans up its owned process group.
+Children escaping that group are not contained. Summed RSS can double-count
+shared pages, excludes GPU memory, and is not physical footprint; `ps` CPU is a
+gauge, not CPU time or energy. Compare identical sampling configurations.
+
+### Preliminary shared-path comparison
+
+Against baseline `f9aebbe8`, an optimized 200-iteration/20-warmup
+`sample-tui-runtime-render` pair measured p50 8.02 → 4.48 ms and p99
+9.57 → 4.60 ms with identical structural counts and no runtime faults.
+This synthetic shared TUI workload is not full-product responsiveness evidence.
+
+Interleaved parser runs retained protocol prefix-buffer reuse but dropped the
+grid double-buffer optimization after larger-chunk grid regressions. The
+smaller isolation measured plain one-byte protocol parsing 3.25 → 1.20 ms,
+32-byte protocol parsing 0.359 → 0.292 ms, and 8192-byte protocol parsing
+0.226 → 0.226 ms. Grid timings remained mixed (one-byte 19.51 → 20.54 ms;
+32-byte 15.03 → 14.83 ms; 8192-byte 14.89 → 15.01 ms). These are local
+microbenchmark observations, not proof of universal improvement. No accepted
+ordinary-bmux/Bterm end-to-end, idle CPU, or process-tree memory improvement is
+established by these results; further optimization remains measurement-gated.
+
 ## Validation commands
 
 Run the required Nix clippy before full nextest, then machete. Also explicitly
