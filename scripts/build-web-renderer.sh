@@ -9,19 +9,29 @@ cd "$ROOT"
 OUTPUT="${BMUX_WEB_ASSET_OUTPUT:-$ROOT/target/web-assets}"
 mkdir -p "$OUTPUT"
 OUTPUT="$(cd "$OUTPUT" && pwd)"
-TOOLS="${BMUX_WEB_TOOLS_ROOT:-$ROOT/target/web-tools}"
+# The CLI consumes the schema emitted by the resolved Rust dependency. Keep
+# Cargo.lock as the single source of truth, not a second independently pinned
+# tool version. Cargo rejects ambiguous package selections rather than guessing.
+BINDGEN_VERSION="$(cargo tree --locked --target wasm32-unknown-unknown \
+  -p wasm-bindgen --depth 0 --prefix none | python3 -c '
+import re, sys
+line = sys.stdin.read().strip()
+match = re.fullmatch(r"wasm-bindgen v([0-9]+\.[0-9]+\.[0-9]+)", line)
+if not match:
+    sys.exit("Could not determine the resolved wasm-bindgen dependency: " + line)
+print(match[1])
+')"
+TOOLS="${BMUX_WEB_TOOLS_ROOT:-$ROOT/target/web-tools}/wasm-bindgen-$BINDGEN_VERSION"
 BINDGEN="${BMUX_WASM_BINDGEN:-$TOOLS/bin/wasm-bindgen}"
-if [[ ! -x "$BINDGEN" ]]; then
-  if [[ -n "${BMUX_WASM_BINDGEN:-}" ]]; then
-    echo "Explicit BMUX_WASM_BINDGEN is not executable: $BINDGEN" >&2
-    exit 1
-  fi
-  cargo install wasm-bindgen-cli --version 0.2.126 --locked --root "$TOOLS"
+if [[ -z "${BMUX_WASM_BINDGEN:-}" && \
+      (! -x "$BINDGEN" || "$("$BINDGEN" --version)" != "wasm-bindgen $BINDGEN_VERSION") ]]; then
+  cargo install wasm-bindgen-cli --version "$BINDGEN_VERSION" --locked --root "$TOOLS" --force
 fi
-if [[ "$("$BINDGEN" --version)" != "wasm-bindgen 0.2.126" ]]; then
-  echo "wasm-bindgen must match the workspace's 0.2.126 crate version" >&2
+if [[ ! -x "$BINDGEN" ]]; then
+  echo "Explicit BMUX_WASM_BINDGEN is not executable: $BINDGEN" >&2
   exit 1
 fi
+# An explicit override is allowed; conversion below decides compatibility.
 # Browser consumers must not link the native Wasmtime host runtime. Build-time
 # dependencies are deliberately excluded: they execute on the build host.
 BROWSER_DEPS="$(cargo tree --locked -p bmux_presenter --target wasm32-unknown-unknown --edges normal --prefix none)"
