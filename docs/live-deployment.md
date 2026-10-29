@@ -183,6 +183,18 @@ and acceptance. It never starts automatically or modifies relay authority.
 
 ## Deployment verification
 
+Failed OpenTofu operations report bounded, sanitized diagnostics. Fly Machines
+errors retain the HTTP status and request ID; recognized error fields are
+translated into fixed **heuristic classifications**, not printed verbatim.
+Unknown or malformed bodies remain withheld. Classification is a troubleshooting
+hint, not proof of root cause or permission to change infrastructure. Use the
+request ID with Fly support if the reason remains unclassified. Never enable raw
+provider debug logs or upload apply logs to public artifacts: errors can echo
+machine environment configuration. A failed apply may have partially changed
+resources; inspect existing machine and volume state before planning a retry.
+The diagnostics patch does not recover bodies discarded by earlier runs, and
+retrying an old workflow SHA still uses its old sanitizer.
+
 Protected configuration run `39168519882` completed backend deployment and
 public
 read-only smoke successfully. Configuration mode intentionally skips the static

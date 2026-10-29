@@ -218,6 +218,25 @@ elif args[0]=='apply':
         self.assertIn('HTTP 403', result.stderr)
         self.assertNotIn('private-secret', result.stderr)
 
+    def test_fly_apply_error_retains_actionable_classification_not_config(self):
+        self.tool('tofu', '''import json,os,sys
+args=sys.argv[1:]
+if args[0]=='version': print('{"terraform_version":"1.10.9"}')
+elif args[0]=='show': print(os.environ['TEST_PLAN'])
+elif args[0]=='apply':
+ body=json.dumps({'error':'volume is attached to another host',
+                  'config':{'env':{'UNKNOWN_SECRET':'private-machine-config'}}})
+ print(json.dumps({'diagnostic':{'severity':'error','summary':'Update Machine Error',
+       'detail':'fly machines: 400 Bad Request (request_id: test-request-123, body: '+body+')'}}))
+ sys.exit(1)
+''')
+        result, effects = self.run_deploy()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('volume placement rejected', result.stderr)
+        self.assertIn('test-request-123', result.stderr)
+        self.assertNotIn('private-machine-config', result.stderr)
+        self.assertNotIn('pages upload', effects)
+
     def test_apply_failure_never_uploads_and_diagnostics_are_redacted(self):
         self.env['TEST_FAIL'] = 'apply'
         result, effects = self.run_deploy()
