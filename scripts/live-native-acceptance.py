@@ -269,12 +269,24 @@ class Harness:
         sessions = json.loads(self.run('list-sessions', '--json').stdout)
         if isinstance(sessions, dict): sessions = sessions['sessions']
         require(len(sessions) == 1, 'unexpected session outside owned runtime')
+        # A broadcast observer is read-only: it must not resize the PTY. Give
+        # this terminal a normal local owner before asserting audience content.
+        # Re-emit after attachment because output produced at detached startup
+        # geometry may already have scrolled out of the visible terminal grid.
+        self.producer_mode.write_text('stream')
+        local = PRESENTER.Mirror(self.command + ['attach', sessions[0]['id']], self.env)
+        self.terminals.append(local)
+        wait('terminal fixture locally visible', lambda: b'NATIVE_TERMINAL_PUBLIC_5831' in local.bytes())
         terminal_source = str(uuid.uuid4())
         self.control('terminal', terminal_source, sessions[0]['id'], str(self.args.binary), self.args.sha256,
                      version, '80', '24')
         self.control('source', terminal_source)
         wait('terminal controller live', self.live)
         wait('terminal observer audience', lambda: self.inspect_terminal())
+        self.producer_mode.write_text('idle')
+        time.sleep(.5)  # settle already-written PTY output before measuring idle
+        local.stop()
+        self.terminals.remove(local)
         self.frame()
         self.timer_and_idle()
         self.producer_mode.write_text('stream')
@@ -446,16 +458,39 @@ class Harness:
         require(self.stack.metrics()['bmux_relay_upload_bytes_total'] == before, 'idle native source uploaded frames')
         require(self.cdp.evaluate('__wire.length') == wire, 'idle browser received binary frames')
         require(self.cdp.evaluate("document.querySelector('#live-broadcast canvas:not([hidden])').toDataURL()") == canvas, 'idle pixels changed')
+        # Observe the actual audience, not a particular status-label spelling.
+        # Terminal semantic/selection metadata can change on every PTY write;
+        # total packet size alone does not identify a full visual repaint.
+        self.cdp.evaluate("""(() => { window.__timerPixels = (() => {
+          const c=document.querySelector('#live-broadcast canvas:not([hidden])');
+          return {width:c.width,height:c.height,data:c.getContext('2d').getImageData(0,0,c.width,c.height).data};
+        })(); return true; })()""")
+        full_bytes = len(self.frame()[0])
         self.producer_mode.write_text('timer')
         wait('native timer frame', lambda: self.cdp.evaluate('__wire.length') >= wire + 4)
         time.sleep(.4)
         records = self.cdp.evaluate('__wire.slice(' + str(wire + 1) + ')')
-        require(len(records) >= 3 and all(row['bytes'] < 1024 for row in records), 'timer emitted a full-row/full-image bundle')
+        require(len(records) >= 3 and all(row['bytes'] < full_bytes for row in records),
+                'timer updates did not stay below a complete source snapshot')
+        pixels = self.cdp.evaluate("""(() => {
+          const c=document.querySelector('#live-broadcast canvas:not([hidden])');
+          const old=window.__timerPixels;
+          if(c.width!==old.width||c.height!==old.height) return {resized:true};
+          const now=c.getContext('2d').getImageData(0,0,c.width,c.height).data;
+          let minX=c.width,minY=c.height,maxX=-1,maxY=-1,count=0;
+          for(let i=0;i<now.length;i+=4) if(now[i]!==old.data[i]||now[i+1]!==old.data[i+1]||now[i+2]!==old.data[i+2]||now[i+3]!==old.data[i+3]) {
+            const x=(i/4)%c.width,y=Math.floor(i/4/c.width);
+            minX=Math.min(minX,x);maxX=Math.max(maxX,x);minY=Math.min(minY,y);maxY=Math.max(maxY,y);count++;
+          }
+          return {count,width:maxX-minX+1,height:maxY-minY+1};
+        })()""")
+        require(not pixels.get('resized') and 0 < pixels['count'] and pixels['width'] <= 128
+                and pixels['height'] <= 32, 'timer changed more than a localized text run')
         require(all(b['time'] - a['time'] >= 15 for a, b in zip(records, records[1:])), 'native timer exceeded 60 FPS')
-        require(self.cdp.evaluate("document.querySelector('#live-broadcast canvas:not([hidden])').toDataURL()") != canvas, 'native timer did not change pixels')
         after = self.stack.metrics()['bmux_relay_upload_bytes_total']
-        require(0 < after - before < 12000, 'native timer source-to-relay upload not localized')
-        self.cases.append('native-idle-zero-frame-traffic-timer-tiny-both-hops-60FPS-ceiling')
+        require(0 < after - before < full_bytes * (len(records) + 2),
+                'native timer upload exceeded complete-snapshot traffic bound')
+        self.cases.append('native-idle-zero-frame-traffic-timer-localized-pixels-bounded-both-hops-60FPS-ceiling')
 
     def verify_observed_resizing(self, target):
         """Normal attach sizes the PTY; observation follows without competing."""
@@ -522,7 +557,7 @@ class Harness:
             # Validate the mounted audience viewer, not just the independent
             # diagnostic decoder. A continuously advancing producer previously
             # decoded fine in isolation while the page rejected every frame.
-            if not self.cdp.evaluate("document.getElementById('live-status')?.textContent === 'Live · read-only' && Array.from(document.querySelectorAll('#live-broadcast canvas')).some(c => !c.hidden && c.width > 0 && c.height > 0)"):
+            if not self.cdp.evaluate("Array.from(document.querySelectorAll('#live-broadcast canvas')).some(c => !c.hidden && c.width > 0 && c.height > 0)"):
                 return False
             self.inspect('NATIVE_TERMINAL_PUBLIC_5831', ['NATIVE_AUDIENCE_PUBLIC_5831', 'NATIVE_SPEAKER_PRIVATE_5831'])
             return True

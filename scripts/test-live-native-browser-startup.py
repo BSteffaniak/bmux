@@ -15,6 +15,24 @@ BROWSER = None
 
 
 class BrowserStartupTests(unittest.TestCase):
+    def test_terminal_acceptance_checks_visibility_not_status_wording(self):
+        harness = object.__new__(NATIVE.Harness)
+        harness.cdp = Mock()
+        harness.cdp.evaluate.return_value = True
+        harness.inspect = Mock()
+        self.assertTrue(harness.inspect_terminal())
+        expression = harness.cdp.evaluate.call_args.args[0]
+        self.assertNotIn('textContent', expression)
+        harness.inspect.assert_called_once_with('NATIVE_TERMINAL_PUBLIC_5831',
+                                               ['NATIVE_AUDIENCE_PUBLIC_5831', 'NATIVE_SPEAKER_PRIVATE_5831'])
+        harness.cdp.evaluate.return_value = False
+        harness.inspect.reset_mock()
+        self.assertFalse(harness.inspect_terminal())
+        harness.inspect.assert_not_called()
+        harness.cdp.evaluate.return_value = True
+        harness.inspect.side_effect = AssertionError('missing audience text')
+        self.assertFalse(harness.inspect_terminal())
+
     def test_early_exit_is_not_reported_as_timeout_or_ready(self):
         child = Mock()
         child.poll.return_value = -6
