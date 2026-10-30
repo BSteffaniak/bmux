@@ -19,8 +19,19 @@ use crate::{
     text_cache::{Key, TextCache},
 };
 
+#[path = "typography.rs"]
+mod typography;
+pub use typography::{RendererGeometry, RendererTypography};
+
+/// Inclusive physical-pixel raster size bounds. Frontends must clamp effective
+/// typography against DPI before calling the renderer; configuration is unchanged.
+pub const MIN_RASTER_PIXEL_SIZE: f32 = 1.0;
+pub const MAX_RASTER_PIXEL_SIZE: f32 = 256.0;
+/// Inclusive logical font size ceiling, independent of the physical raster bound.
+pub const MAX_LOGICAL_FONT_SIZE: f32 = 256.0;
+
 /// Font face selection; colors remain caller-owned paint properties.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct TextStyle {
     pub bold: bool,
     pub italic: bool,
@@ -41,7 +52,8 @@ pub struct GlyphBitmap {
     pub source: Range<usize>,
     pub glyph_id: u16,
     pub missing: bool,
-    /// Shaped baseline offset, physical pixels, y down.
+    /// Bitmap baseline offset, physical pixels, y down. Fractional shaped
+    /// offsets are incorporated into antialiased coverage at raster time.
     pub x: f32,
     pub y: f32,
     /// Bitmap left bearing and top distance above the glyph baseline.
@@ -74,6 +86,7 @@ pub struct CellMetrics {
 pub enum TextError {
     NoFonts,
     InvalidPixelSize,
+    InvalidTypography,
     ClusterTooLarge,
     RasterizationFailed,
 }
@@ -116,6 +129,21 @@ impl TextRasterizer {
         Ok(rasterizer)
     }
 
+    /// Resolve requested families once; missing names use the bundled safety net.
+    pub fn with_typography(typography: &RendererTypography) -> Result<Self, TextError> {
+        typography.validate()?;
+        let fonts = Fonts::configured(typography.family.as_deref(), &typography.fallback);
+        if fonts.is_empty() {
+            return Err(TextError::NoFonts);
+        }
+        Ok(Self {
+            fonts,
+            shape: ShapeContext::with_max_entries(8),
+            scale: ScaleContext::with_max_entries(8),
+            cache: TextCache::new(8 * 1024 * 1024, 2048),
+        })
+    }
+
     pub fn metrics(&self, pixel_size: f32) -> Result<CellMetrics, TextError> {
         validate_size(pixel_size)?;
         let font = self.fonts.get(0).font();
@@ -144,7 +172,22 @@ impl TextRasterizer {
         style: TextStyle,
         pixel_size: f32,
     ) -> Result<Arc<RasterizedCell>, TextError> {
+        self.rasterize_cell_phased(text, columns, style, pixel_size, [0; 2])
+    }
+
+    /// Offsets are relative to the baseline snapped by `raster_origin`.
+    pub(crate) fn rasterize_cell_phased(
+        &mut self,
+        text: &str,
+        columns: u16,
+        style: TextStyle,
+        pixel_size: f32,
+        phase: [u8; 2],
+    ) -> Result<Arc<RasterizedCell>, TextError> {
         validate_size(pixel_size)?;
+        // Shape and raster share 1/64 physical-pixel size identities. Layout
+        // remains continuous; bitmaps are rasterized at size, never rescaled.
+        let pixel_size = (pixel_size * 64.0).round() / 64.0;
         // Bound transient shape/raster work too, not just retained entries.
         if text.len() > 1024 {
             return Err(TextError::ClusterTooLarge);
@@ -154,6 +197,7 @@ impl TextRasterizer {
             columns,
             style,
             size: pixel_size.to_bits(),
+            phase,
         };
         if let Some(value) = self.cache.get(&key) {
             return Ok(value);
@@ -177,16 +221,30 @@ impl TextRasterizer {
                 shaped.push((cluster.source.to_range(), *glyph));
             }
         });
-        let mut scaler = self.scale.builder(font).size(pixel_size).hint(true).build();
+        let mut scaler = self
+            .scale
+            .builder(font)
+            .size(pixel_size)
+            .hint(false)
+            .build();
         let mut glyphs = Vec::new();
         let mut pen = 0.0;
         let mut bytes = 0;
+        let phase = phase.map(|value| f32::from(value) / 8.0);
         for (source, glyph) in shaped {
+            let x = pen + glyph.x + phase[0];
+            let y = -glyph.y + phase[1];
             let image = Render::new(&[
                 Source::ColorOutline(0),
                 Source::ColorBitmap(StrikeWith::BestFit),
                 Source::Outline,
             ])
+            // Bake subpixel coverage into the outline instead of shifting a
+            // pre-rasterized bitmap through nearest-neighbor texture sampling.
+            .offset(swash::zeno::Vector::new(
+                x.rem_euclid(1.0),
+                -y.rem_euclid(1.0),
+            ))
             .render(&mut scaler, glyph.id);
             if let Some(image) = image {
                 bytes += image.data.len();
@@ -202,8 +260,8 @@ impl TextRasterizer {
                     source,
                     glyph_id: glyph.id,
                     missing: glyph.id == 0,
-                    x: pen + glyph.x,
-                    y: -glyph.y,
+                    x: x.floor() - phase[0],
+                    y: y.floor() - phase[1],
                     left: image.placement.left,
                     top: image.placement.top,
                     width: image.placement.width,
@@ -231,13 +289,25 @@ impl TextRasterizer {
     }
 }
 
+/// Quantize coverage phase only (1/8 pixel); terminal allocation never snaps.
+/// Together with phased outline rendering this yields integer bitmap quads.
+pub(crate) fn raster_origin(origin: [f32; 2]) -> ([f32; 2], [u8; 2]) {
+    let snapped = origin.map(|value| (value * 8.0).round() / 8.0);
+    let phase = snapped.map(|value| (value.rem_euclid(1.0) * 8.0) as u8);
+    (snapped, phase)
+}
+
 fn validate_size(size: f32) -> Result<(), TextError> {
-    if size.is_finite() && (1.0..=256.0).contains(&size) {
+    if size.is_finite() && (MIN_RASTER_PIXEL_SIZE..=MAX_RASTER_PIXEL_SIZE).contains(&size) {
         Ok(())
     } else {
         Err(TextError::InvalidPixelSize)
     }
 }
+
+#[cfg(test)]
+#[path = "typography_tests.rs"]
+mod typography_tests;
 
 #[cfg(test)]
 mod tests {

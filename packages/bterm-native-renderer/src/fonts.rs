@@ -52,6 +52,8 @@ pub(crate) struct Face {
     offset: u32,
     key: CacheKey,
     style: TextStyle,
+    families: Vec<String>,
+    priority: usize,
 }
 
 impl Face {
@@ -91,11 +93,19 @@ impl Fonts {
                     italic: true,
                 },
             };
+            let before = fonts.faces.len();
             fonts.add(face.data, 0, style);
+            if fonts.faces.len() > before {
+                fonts.faces[before].families = vec![face.family.to_owned()];
+            }
         }
         // The existing OFL diagram derivative supplies deterministic monochrome emoji
         // fallback without requiring a host font installation.
+        let before = fonts.faces.len();
         fonts.add(bmux_fonts::DIAGRAM_FONT, 0, TextStyle::default());
+        if fonts.faces.len() > before {
+            fonts.faces[before].families = vec![bmux_fonts::DIAGRAM_FONT_FAMILY.to_owned()];
+        }
         fonts
     }
 
@@ -119,12 +129,34 @@ impl Fonts {
                 offset,
                 key: CacheKey::new(),
                 style,
+                families: Vec::new(),
+                priority: 0,
             });
             self.bytes += data.len();
         }
     }
 
     pub(crate) fn load_system(&mut self) {
+        self.load_selected_system(None, &[]);
+    }
+
+    pub(crate) fn configured(family: Option<&str>, fallback: &[String]) -> Self {
+        let mut fonts = Self::bundled();
+        let rank = |names: &[String]| family_rank(names, family, fallback, true);
+        for face in &mut fonts.faces {
+            face.priority = rank(&face.families);
+        }
+        fonts.load_selected_system(family, fallback);
+        fonts.faces.sort_by_key(|face| {
+            (
+                face.priority,
+                u8::from(face.style.bold) + u8::from(face.style.italic),
+            )
+        });
+        fonts
+    }
+
+    fn load_selected_system(&mut self, family: Option<&str>, fallback: &[String]) {
         let mut db = fontdb::Database::new();
         db.load_system_fonts();
         // Prefer color emoji and monospace fallbacks before other installed faces.
@@ -136,7 +168,31 @@ impl Fonts {
                     .iter()
                     .any(|(name, _)| name.to_lowercase().contains("emoji"));
                 (
-                    (!emoji, !f.monospaced),
+                    (
+                        family_rank(
+                            &f.families
+                                .iter()
+                                .map(|(name, _)| name.clone())
+                                .collect::<Vec<_>>(),
+                            family,
+                            fallback,
+                            false,
+                        ),
+                        !emoji,
+                        !f.monospaced,
+                    ),
+                    f.families
+                        .iter()
+                        .map(|(name, _)| name.clone())
+                        .collect::<Vec<_>>(),
+                    f.post_script_name.clone(),
+                    match &f.source {
+                        fontdb::Source::File(path) | fontdb::Source::SharedFile(path, _) => {
+                            path.clone()
+                        }
+                        fontdb::Source::Binary(_) => std::path::PathBuf::new(),
+                    },
+                    f.index,
                     f.id,
                     TextStyle {
                         bold: f.weight.0 >= 600,
@@ -145,12 +201,18 @@ impl Fonts {
                 )
             })
             .collect();
-        ids.sort_by_key(|entry| entry.0);
-        for (_, id, style) in ids {
+        ids.sort_by(|a, b| (&a.0, &a.1, &a.2, &a.3, a.4).cmp(&(&b.0, &b.1, &b.2, &b.3, b.4)));
+        for (priority, families, _, _, _, id, style) in ids {
             if self.faces.len() >= MAX_FONTS || self.bytes >= MAX_FONT_BYTES {
                 break;
             }
+            let before = self.faces.len();
             db.with_face_data(id, |data, index| self.add(data, index, style));
+            if self.faces.len() > before {
+                let face = &mut self.faces[before];
+                face.families = families;
+                face.priority = priority.0;
+            }
         }
     }
 
@@ -184,6 +246,7 @@ impl Fonts {
                     || font.table(swash::tag_from_bytes(b"sbix")).is_some();
                 (
                     wants_color && !color,
+                    face.priority,
                     u8::from(face.style.bold != style.bold)
                         + u8::from(face.style.italic != style.italic),
                 )
@@ -192,9 +255,75 @@ impl Fonts {
     }
 }
 
+/// Requested families precede the bundled safety net. Unknown names are ignored;
+/// installed-font enumeration order never decides equal-priority fallback.
+fn family_rank(
+    names: &[String],
+    family: Option<&str>,
+    fallback: &[String],
+    bundled: bool,
+) -> usize {
+    let matches = |requested: &str| {
+        names
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case(requested))
+    };
+    if family.is_some_and(matches) {
+        return 0;
+    }
+    if family.is_none() && bundled {
+        return 0;
+    }
+    if let Some(index) = fallback.iter().position(|name| matches(name)) {
+        return index + 1;
+    }
+    fallback.len() + if bundled { 1 } else { 2 }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_families_have_ordered_case_insensitive_priority() {
+        let names = vec!["Chosen Mono".to_owned()];
+        let fallback = vec!["Other Mono".to_owned(), "chosen mono".to_owned()];
+        assert_eq!(
+            family_rank(&names, Some("CHOSEN MONO"), &fallback, false),
+            0
+        );
+        assert_eq!(
+            family_rank(&names, Some("Unavailable"), &fallback, false),
+            2
+        );
+        assert_eq!(family_rank(&names, None, &fallback, true), 0);
+        assert_eq!(family_rank(&names, Some("Unavailable"), &[], true), 1);
+        assert_eq!(family_rank(&names, Some("Unavailable"), &[], false), 2);
+    }
+
+    #[test]
+    fn selected_bundled_family_controls_metrics_and_style_order() {
+        // Exercise selection without depending on installed family names.
+        let mut fonts = Fonts::bundled();
+        let requested = Some(bmux_fonts::DIAGRAM_FONT_FAMILY);
+        for face in &mut fonts.faces {
+            face.priority = family_rank(&face.families, requested, &[], true);
+        }
+        fonts.faces.sort_by_key(|face| {
+            (
+                face.priority,
+                u8::from(face.style.bold) + u8::from(face.style.italic),
+            )
+        });
+        assert!(
+            fonts
+                .get(0)
+                .families
+                .iter()
+                .any(|name| name == bmux_fonts::DIAGRAM_FONT_FAMILY)
+        );
+        assert_eq!(fonts.select("ABC", TextStyle::default()), 0);
+    }
 
     fn primary_data() -> Vec<u8> {
         bmux_fonts::bundled_fonts_for_preset(bmux_fonts::FontPreset::GhosttyNerd)[0]

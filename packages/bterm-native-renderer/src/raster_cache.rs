@@ -40,6 +40,10 @@ impl<K, V> Cache<K, V> {
         Some(value)
     }
 
+    pub(crate) fn usage(&self) -> (usize, usize) {
+        (self.entries.len(), self.bytes)
+    }
+
     pub(crate) fn entry_bytes(heap_bytes: usize) -> Option<usize> {
         // Index allocation is charged at construction; charge the Arc allocation here.
         heap_bytes.checked_add(std::mem::size_of::<V>() + 2 * std::mem::size_of::<usize>())

@@ -3,7 +3,7 @@ use crate::{
     damage::DamageTracker,
     gpu::Gpu,
     images,
-    text::{BitmapFormat, TextRasterizer, TextStyle},
+    text::{BitmapFormat, RendererGeometry, RendererTypography, TextRasterizer, TextStyle},
 };
 use bmux_tui::{
     presentation::PreparedPresentation,
@@ -70,6 +70,7 @@ pub struct NativeRenderer {
     images: images::ImageCache,
     masks: raster_cache::MaskCache,
     options: RendererOptions,
+    typography: RendererTypography,
     cell: [f32; 2],
     ascent: f32,
     damage: DamageTracker,
@@ -77,8 +78,14 @@ pub struct NativeRenderer {
 }
 impl NativeRenderer {
     pub async fn new(target: SurfaceTarget, options: RendererOptions) -> Result<Self, RenderError> {
-        let text = TextRasterizer::with_system_fonts()?;
-        let (cell, ascent) = metrics(&text, options)?;
+        let typography = RendererTypography {
+            font_size: options.font_size,
+            ..Default::default()
+        };
+        let text = TextRasterizer::with_typography(&typography)?;
+        let geometry = RendererGeometry::resolve(&text, &typography, options.scale_factor)?;
+        let cell = geometry.cell_size;
+        let ascent = geometry.baseline;
         let gpu = Gpu::new(target, options.size).await?;
         Ok(Self {
             gpu,
@@ -86,6 +93,7 @@ impl NativeRenderer {
             images: images::ImageCache::default(),
             masks: raster_cache::MaskCache::default(),
             options,
+            typography,
             cell,
             ascent,
             damage: DamageTracker::default(),
@@ -96,22 +104,63 @@ impl NativeRenderer {
     pub const fn cell_size(&self) -> [f32; 2] {
         self.cell
     }
+    /// Pending geometry, not interaction authority. Snapshot alongside committed output.
+    pub const fn geometry(&self) -> RendererGeometry {
+        RendererGeometry {
+            cell_size: self.cell,
+            baseline: self.ascent,
+        }
+    }
+    pub const fn typography(&self) -> &RendererTypography {
+        &self.typography
+    }
+    /// Transactional font/metric replacement. Size animation reuses faces and bounded caches.
+    pub fn set_typography(&mut self, typography: RendererTypography) -> Result<(), RenderError> {
+        self.set_typography_and_scale(typography, self.options.scale_factor)
+    }
+    /// Atomically resolve typography and DPI against the requested pair, never an
+    /// intermediate combination. On error, faces, options, geometry, caches and
+    /// damage remain unchanged. Success updates pending rendering geometry only;
+    /// interaction authority still follows successfully committed output.
+    pub fn set_typography_and_scale(
+        &mut self,
+        typography: RendererTypography,
+        scale: f32,
+    ) -> Result<(), RenderError> {
+        typography.validate()?;
+        if !scale.is_finite() || scale <= 0.0 {
+            return Err(crate::text::TextError::InvalidPixelSize.into());
+        }
+        if typography == self.typography && scale == self.options.scale_factor {
+            return Ok(());
+        }
+        let replacement = if typography.family != self.typography.family
+            || typography.fallback != self.typography.fallback
+        {
+            Some(TextRasterizer::with_typography(&typography)?)
+        } else {
+            None
+        };
+        let text = replacement.as_ref().unwrap_or(&self.text);
+        let geometry = RendererGeometry::resolve(text, &typography, scale)?;
+        if let Some(text) = replacement {
+            self.text = text;
+        }
+        self.options.font_size = typography.font_size;
+        self.options.scale_factor = scale;
+        self.typography = typography;
+        self.cell = geometry.cell_size;
+        self.ascent = geometry.baseline;
+        self.damage.invalidate();
+        Ok(())
+    }
     pub fn resize(&mut self, size: PhysicalSize) {
         self.options.size = size;
         self.gpu.resize(size);
         self.damage.invalidate();
     }
     pub fn set_scale_factor(&mut self, scale: f32) -> Result<(), RenderError> {
-        let options = RendererOptions {
-            scale_factor: scale,
-            ..self.options
-        };
-        let (cell, ascent) = metrics(&self.text, options)?;
-        self.options = options;
-        self.cell = cell;
-        self.ascent = ascent;
-        self.damage.invalidate();
-        Ok(())
+        self.set_typography_and_scale(self.typography.clone(), scale)
     }
     /// Enable bounded diagnostics explicitly. Disabled by default; disabling drops
     /// all samples. Re-enabling starts a fresh window. Nothing is logged automatically.
@@ -203,11 +252,13 @@ impl NativeRenderer {
                 bold: cell.style.modifiers.contains(Modifier::BOLD),
                 italic: cell.style.modifiers.contains(Modifier::ITALIC),
             };
-            let raster = self.text.rasterize_cell(
+            let (baseline, phase) = crate::text::raster_origin([x, y + self.ascent]);
+            let raster = self.text.rasterize_cell_phased(
                 &cell.symbol,
                 u16::from(cell.width()),
                 style,
                 self.options.font_size * self.options.scale_factor,
+                phase,
             )?;
             for (glyph_index, glyph) in raster.glyphs.iter().enumerate() {
                 if glyph.width == 0 || glyph.height == 0 {
@@ -218,6 +269,7 @@ impl NativeRenderer {
                     cell.width(),
                     style.bold,
                     style.italic,
+                    phase,
                     glyph_index,
                 );
                 let uv = if let Some(uv) = uploaded.get(&key) {
@@ -252,8 +304,8 @@ impl NativeRenderer {
                 };
                 self.gpu.quad(
                     [
-                        x + glyph.x + glyph.left as f32,
-                        y + self.ascent + glyph.y - glyph.top as f32,
+                        baseline[0] + glyph.x + glyph.left as f32,
+                        baseline[1] + glyph.y - glyph.top as f32,
                         glyph.width as f32,
                         glyph.height as f32,
                     ],
@@ -333,24 +385,6 @@ impl NativeRenderer {
             telemetry: None,
         })
     }
-}
-fn metrics(
-    text: &TextRasterizer,
-    options: RendererOptions,
-) -> Result<([f32; 2], f32), RenderError> {
-    if !options.scale_factor.is_finite() || options.scale_factor <= 0.0 {
-        return Err(RenderError::Text(crate::text::TextError::InvalidPixelSize));
-    }
-    let metrics = text.metrics(options.font_size * options.scale_factor)?;
-    Ok((
-        [
-            metrics.advance.ceil().max(1.0),
-            (metrics.ascent + metrics.descent + metrics.leading)
-                .ceil()
-                .max(1.0),
-        ],
-        metrics.ascent,
-    ))
 }
 fn colors(fg: Option<Color>, bg: Option<Color>, modifiers: Modifier) -> ([f32; 4], [f32; 4]) {
     let mut fg = color(fg.unwrap_or_default(), [220, 220, 220]);

@@ -1,9 +1,11 @@
 //! Winit is an implementation detail of this module. Window lifetime is main-thread owned.
 
+use std::cell::Cell;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
+use std::time::Instant;
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
@@ -160,6 +162,7 @@ pub struct WindowContext<'a> {
     event_loop: &'a ActiveEventLoop,
     proxy: &'a PlatformProxy,
     accessibility: &'a mut crate::accessibility::AccessibilityAdapter,
+    redraw_deadline: &'a Cell<Option<Instant>>,
 }
 
 impl WindowContext<'_> {
@@ -208,6 +211,13 @@ impl WindowContext<'_> {
     #[must_use]
     pub fn proxy(&self) -> PlatformProxy {
         self.proxy.clone()
+    }
+
+    /// Schedule at most one future redraw, retaining the earliest outstanding
+    /// deadline so animation cannot postpone surface-retry work. This does not
+    /// acknowledge output; an immediate redraw does not cancel the deadline.
+    pub fn request_redraw_at(&self, deadline: Instant) {
+        schedule_redraw(self.redraw_deadline, deadline);
     }
 
     pub fn request_redraw(&self) {
@@ -260,6 +270,7 @@ struct Host<A> {
     active: bool,
     shown: bool,
     input: crate::input::InputAdapter,
+    redraw_deadline: Cell<Option<Instant>>,
     error: Option<PlatformError>,
 }
 
@@ -279,6 +290,7 @@ impl<A: WindowApplication> Host<A> {
             event_loop,
             proxy: &self.proxy,
             accessibility,
+            redraw_deadline: &self.redraw_deadline,
         };
         if let Err(err) = self.application.event(&mut context, event) {
             self.error = Some(err);
@@ -295,6 +307,24 @@ impl<A: WindowApplication> Host<A> {
 }
 
 impl<A: WindowApplication> ApplicationHandler<()> for Host<A> {
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if self.active
+            && self.error.is_none()
+            && let Some(deadline) = self.redraw_deadline.get()
+        {
+            if deadline <= Instant::now() {
+                self.redraw_deadline.set(None);
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
+            } else {
+                event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
+                return;
+            }
+        }
+        event_loop.set_control_flow(ControlFlow::Wait);
+    }
+
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.active {
             return;
@@ -334,6 +364,7 @@ impl<A: WindowApplication> ApplicationHandler<()> for Host<A> {
     fn suspended(&mut self, event_loop: &ActiveEventLoop) {
         if self.active {
             self.active = false;
+            self.redraw_deadline.set(None);
             self.input = crate::input::InputAdapter::default();
             if let Some(adapter) = self.accessibility.as_mut() {
                 adapter.invalidate();
@@ -474,6 +505,7 @@ fn run_prepared(
         active: false,
         shown: false,
         input: crate::input::InputAdapter::default(),
+        redraw_deadline: Cell::new(None),
         accessibility: None,
         error: None,
     };
@@ -483,6 +515,14 @@ fn run_prepared(
     host.error.map_or(Ok(()), Err)
 }
 
+fn schedule_redraw(deadline: &Cell<Option<Instant>>, requested: Instant) {
+    deadline.set(Some(
+        deadline
+            .get()
+            .map_or(requested, |existing| existing.min(requested)),
+    ));
+}
+
 fn valid_initial_size(size: LogicalSize) -> bool {
     size.width.is_finite() && size.height.is_finite() && size.width > 0.0 && size.height > 0.0
 }
@@ -490,6 +530,20 @@ fn valid_initial_size(size: LogicalSize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scheduled_redraw_retains_earliest_deadline() {
+        let deadline = Cell::new(None);
+        let now = Instant::now();
+        schedule_redraw(&deadline, now);
+        schedule_redraw(&deadline, now + std::time::Duration::from_millis(120));
+        assert_eq!(deadline.get(), Some(now));
+        let earlier = now - std::time::Duration::from_millis(1);
+        schedule_redraw(&deadline, earlier);
+        assert_eq!(deadline.get(), Some(earlier));
+        deadline.set(None);
+        assert_eq!(deadline.get(), None);
+    }
 
     #[test]
     fn native_decorations_are_enabled_by_default() {

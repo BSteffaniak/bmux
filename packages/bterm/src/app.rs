@@ -173,6 +173,10 @@ pub enum ConfigurationAction {
 /// must run publication off the window thread and route native input through
 /// the canonical bindings and committed retained scene.
 pub trait AttachWorker: 'static {
+    /// A coalesced native-only reload from the captured configuration path.
+    fn take_native_configuration(&mut self) -> Option<crate::configuration::NativeConfiguration> {
+        None
+    }
     /// Optional diagnostics; never used for input/output authority.
     fn input_queue_metrics(&self) -> Option<bmux_cli::attach::QueueMetricsSnapshot> {
         None
@@ -250,6 +254,8 @@ impl RetryBudget {
 /// Window lifecycle driver. The worker can publish only while a live surface is
 /// available; minimized and suspended windows reject output without a receipt.
 pub struct Application<W: AttachWorker> {
+    typography: crate::window_typography::WindowTypography,
+    applied_typography: Option<bterm_native_renderer::text::RendererTypography>,
     worker: W,
     runtime: tokio::runtime::Runtime,
     renderer: Option<NativeRenderer>,
@@ -271,6 +277,8 @@ impl<W: AttachWorker> Application<W> {
     /// Construct without opening a window or starting a companion.
     pub fn new(worker: W) -> Result<Self> {
         Ok(Self {
+            applied_typography: None,
+            typography: crate::window_typography::WindowTypography::new(Default::default(), None)?,
             worker,
             runtime: tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
@@ -293,6 +301,17 @@ impl<W: AttachWorker> Application<W> {
         })
     }
 
+    /// Construct with captured native policy. Does not open a window or write preferences.
+    pub fn configured(
+        worker: W,
+        native: crate::configuration::NativeConfiguration,
+        store: Option<crate::zoom_preferences::PreferenceStore>,
+    ) -> Result<Self> {
+        let mut application = Self::new(worker)?;
+        application.typography = crate::window_typography::WindowTypography::new(native, store)?;
+        Ok(application)
+    }
+
     fn resize(&mut self, metrics: WindowMetrics) -> Result<()> {
         if self.metrics == Some(metrics) {
             return Ok(());
@@ -303,8 +322,17 @@ impl<W: AttachWorker> Application<W> {
             .renderer
             .as_mut()
             .context("native renderer is unavailable")?;
+        let requested = self
+            .typography
+            .resolved(std::time::Instant::now(), metrics.scale_factor as f32);
+        apply_window_typography(
+            renderer,
+            requested.clone(),
+            metrics.scale_factor as f32,
+            metrics.physical_size,
+        )?;
+        self.applied_typography = Some(requested);
         renderer.resize(metrics.physical_size);
-        renderer.set_scale_factor(metrics.scale_factor as f32)?;
         let [width, height] = renderer.cell_size();
         let columns = projection_cells(metrics.physical_size.width, width)?;
         let rows = projection_cells(metrics.physical_size.height, height)?;
@@ -312,6 +340,48 @@ impl<W: AttachWorker> Application<W> {
         self.viewport.columns = columns;
         self.viewport.rows = rows;
         self.viewport.advance_generation()?;
+        Ok(())
+    }
+
+    fn update_typography(
+        &mut self,
+        context: &mut WindowContext<'_>,
+        now: std::time::Instant,
+    ) -> Result<()> {
+        let next = self
+            .typography
+            .resolved(now, context.metrics().scale_factor as f32);
+        if self.active
+            && !context.metrics().physical_size.is_empty()
+            && let Some(renderer) = &mut self.renderer
+            && self.applied_typography.as_ref() != Some(&next)
+        {
+            // Even a size change that leaves rows/columns unchanged supersedes
+            // queued output and its interaction geometry.
+            apply_window_typography(
+                renderer,
+                next.clone(),
+                context.metrics().scale_factor as f32,
+                context.metrics().physical_size,
+            )?;
+            self.applied_typography = Some(next);
+            let cell = renderer.cell_size();
+            let metrics = context.metrics();
+            self.viewport.columns = projection_cells(metrics.physical_size.width, cell[0])?;
+            self.viewport.rows = projection_cells(metrics.physical_size.height, cell[1])?;
+            self.viewport.advance_generation()?;
+            self.worker.invalidate_presentation();
+            context.invalidate_accessibility();
+            self.last_output = None;
+            self.retained_output = None;
+            self.retry = RetryBudget::default();
+            self.worker
+                .event(PlatformEvent::Resized(metrics), self.viewport)?;
+            context.request_redraw();
+        }
+        if self.active && self.typography.animating(now) {
+            context.request_redraw_at(now + std::time::Duration::from_millis(16));
+        }
         Ok(())
     }
 
@@ -340,6 +410,69 @@ impl<W: AttachWorker> Application<W> {
         {
             output.service_clipboard(&mut self.clipboard);
         }
+        let now = std::time::Instant::now();
+        let consumed = match &event {
+            PlatformEvent::Input(input) => self.typography.input(input, now)?,
+            PlatformEvent::Focused(false) | PlatformEvent::Suspended => {
+                self.typography.reset_input();
+                false
+            }
+            _ => false,
+        };
+        self.typography.poll_save(now);
+        if let Some(native) = self.worker.take_native_configuration() {
+            let dpi = context.metrics().scale_factor as f32;
+            let renderer = &mut self.renderer;
+            if let Err(error) = self.typography.reconfigure(native, now, dpi, |typography| {
+                if let Some(renderer) = renderer {
+                    apply_window_typography(
+                        renderer,
+                        typography.clone(),
+                        dpi,
+                        context.metrics().physical_size,
+                    )?;
+                }
+                Ok(())
+            }) {
+                eprintln!("bterm: native typography reload rejected: {error}");
+            } else if self.renderer.is_some() {
+                // Renderer validation above is transactional. Force the same
+                // generation transition even if the candidate has equal metrics.
+                self.metrics = None;
+                self.resize(context.metrics())?;
+                self.worker.invalidate_presentation();
+                context.invalidate_accessibility();
+                self.last_output = None;
+                self.retained_output = None;
+                self.worker
+                    .event(PlatformEvent::Resized(context.metrics()), self.viewport)?;
+            }
+            context.request_redraw();
+        }
+        let visual_pending = self.renderer.is_some() && {
+            self.applied_typography.as_ref()
+                != Some(
+                    &self
+                        .typography
+                        .resolved(now, context.metrics().scale_factor as f32),
+                )
+        };
+        let geometry_committed = self
+            .last_output
+            .is_some_and(|identity| identity.viewport_generation == self.viewport.generation);
+        if (consumed || matches!(event, PlatformEvent::RedrawRequested)) && geometry_committed {
+            self.update_typography(context, now)?;
+        } else if self.active && (visual_pending || self.typography.animating(now)) {
+            // Coalesce target changes while one generation is being prepared.
+            // Do not continuously supersede a slow compositor's pending output.
+            context.request_redraw_at(now + std::time::Duration::from_millis(16));
+        }
+        if self.typography.save_pending() {
+            context.request_redraw_at(now + std::time::Duration::from_millis(50));
+        }
+        if consumed {
+            return Ok(());
+        }
         match event {
             PlatformEvent::Resumed => {
                 context.set_ime_enabled(true);
@@ -351,10 +484,17 @@ impl<W: AttachWorker> Application<W> {
                         RendererOptions {
                             size: metrics.physical_size,
                             scale_factor: metrics.scale_factor as f32,
-                            ..RendererOptions::default()
+                            font_size: self
+                                .typography
+                                .resolved(std::time::Instant::now(), metrics.scale_factor as f32)
+                                .font_size,
                         },
                     ))
                     .context("initialize native renderer")?;
+                renderer.set_typography(
+                    self.typography
+                        .resolved(std::time::Instant::now(), metrics.scale_factor as f32),
+                )?;
                 renderer.set_telemetry_enabled(
                     std::env::var_os("BTERM_RENDER_TELEMETRY").is_some_and(|value| value == "1"),
                 );
@@ -401,6 +541,7 @@ impl<W: AttachWorker> Application<W> {
                 context.request_redraw();
             }
             PlatformEvent::CloseRequested => {
+                self.typography.flush();
                 if let Some(output) = &self.output {
                     output.close();
                 }
@@ -409,6 +550,7 @@ impl<W: AttachWorker> Application<W> {
             }
             event @ (PlatformEvent::Wake | PlatformEvent::RedrawRequested) => {
                 if self.worker.check()? {
+                    self.typography.flush();
                     context.exit();
                     return Ok(());
                 }
@@ -435,6 +577,14 @@ impl<W: AttachWorker> Application<W> {
                                     "native presentation viewport is stale: received {}, current {}",
                                     delivery.identity.viewport_generation, viewport.generation,
                                 ))
+                            } else if !allocation_matches_viewport(
+                                delivery.prepared.buffer().area().x,
+                                delivery.prepared.buffer().area().y,
+                                delivery.prepared.buffer().area().width,
+                                delivery.prepared.buffer().area().height,
+                                viewport,
+                            ) {
+                                Err("native presentation cell allocation does not match the viewport".into())
                             } else if last_output.is_some_and(|last| {
                                 last.epoch != delivery.identity.epoch
                                     || last.revision >= delivery.identity.revision
@@ -479,10 +629,12 @@ impl<W: AttachWorker> Application<W> {
                                 {
                                     context.set_ime_cursor_area(
                                         bterm_native_platform::PhysicalRect {
-                                            x: (f32::from(cursor.position.x) * cell[0]) as i32,
-                                            y: (f32::from(cursor.position.y) * cell[1]) as i32,
-                                            width: cell[0].ceil() as u32,
-                                            height: cell[1].ceil() as u32,
+                                            x: (f32::from(cursor.position.x) * cell[0]).floor() as i32,
+                                            y: (f32::from(cursor.position.y) * cell[1]).floor() as i32,
+                                            width: ((f32::from(cursor.position.x) + 1.0) * cell[0]).ceil() as u32
+                                                - (f32::from(cursor.position.x) * cell[0]).floor() as u32,
+                                            height: ((f32::from(cursor.position.y) + 1.0) * cell[1]).ceil() as u32
+                                                - (f32::from(cursor.position.y) * cell[1]).floor() as u32,
                                         },
                                     );
                                 }
@@ -741,6 +893,19 @@ pub fn run() -> Result<()> {
     let event_loop = bterm_native_platform::NativeEventLoop::prepare()
         .context("connect native desktop before companion startup")?;
     let decorations = configuration.native.window.decorations;
+    let native = configuration.native.clone();
+    let preference_target = match &selection {
+        RuntimeSelection::Managed { identity, .. } => format!(
+            "managed:{}:{}",
+            identity.durable_roots.state_dir.display(),
+            identity.scope_id,
+        ),
+        RuntimeSelection::External { roots } => format!("external:{}", roots.runtime_dir.display()),
+    };
+    let preferences = crate::zoom_preferences::PreferenceStore::for_configuration(
+        &configuration,
+        &preference_target,
+    )?;
     // Complete compatibility/readiness admission before creating even a hidden
     // native surface. Keep the executor that owns the client's transport tasks.
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -758,6 +923,7 @@ pub fn run() -> Result<()> {
             selection,
             config: Some(configuration.bmux.clone()),
             configuration: Some(configuration),
+            native_reload: Default::default(),
             frozen_configuration: sandbox.is_some(),
             target: arguments.session.unwrap_or_default(),
             handle: None,
@@ -773,6 +939,8 @@ pub fn run() -> Result<()> {
             decorations,
             ..WindowOptions::default()
         },
+        native,
+        preferences,
     )
 }
 
@@ -932,6 +1100,8 @@ struct BmuxWorker {
     prepared: Option<PreparedConnection<bmux_client::BmuxClient>>,
     selection: RuntimeSelection,
     configuration: Option<crate::configuration::ResolvedConfiguration>,
+    native_reload:
+        std::sync::Arc<std::sync::Mutex<Option<crate::configuration::NativeConfiguration>>>,
     frozen_configuration: bool,
     config: Option<bmux_config::BmuxConfig>,
     target: String,
@@ -946,6 +1116,10 @@ struct BmuxWorker {
 }
 
 impl AttachWorker for BmuxWorker {
+    fn take_native_configuration(&mut self) -> Option<crate::configuration::NativeConfiguration> {
+        self.native_reload.lock().ok()?.take()
+    }
+
     fn input_queue_metrics(&self) -> Option<bmux_cli::attach::QueueMetricsSnapshot> {
         self.handle
             .as_ref()
@@ -965,6 +1139,8 @@ impl AttachWorker for BmuxWorker {
         let configuration = self.configuration.clone();
         if let Some(configuration) = &configuration {
             let captured = configuration.clone();
+            let native_reload = std::sync::Arc::clone(&self.native_reload);
+            let last_native = std::sync::Mutex::new(captured.native.clone());
             let frozen = self.frozen_configuration
                 || matches!(self.selection, RuntimeSelection::External { .. });
             host.set_config_loader(move || {
@@ -972,8 +1148,15 @@ impl AttachWorker for BmuxWorker {
                     return Ok(captured.bmux.clone());
                 }
                 let next = captured.reload().map_err(|error| bmux_config::ConfigError::ReadError { error: error.to_string() })?;
-                if next.bmux_toml != captured.bmux_toml || next.native != captured.native {
-                    return Err(bmux_config::ConfigError::ReadError { error: "configuration changed; reopen with the newly selected configuration generation".into() });
+                if next.bmux_toml != captured.bmux_toml
+                    || next.native.window != captured.native.window
+                    || next.native.companion != captured.native.companion {
+                    return Err(bmux_config::ConfigError::ReadError { error: "BMUX/runtime or window creation policy changed; reopen with the newly selected configuration generation".into() });
+                }
+                let mut previous = last_native.lock().map_err(|_| bmux_config::ConfigError::ReadError { error: "native configuration history unavailable".into() })?;
+                if *previous != next.native {
+                    *native_reload.lock().map_err(|_| bmux_config::ConfigError::ReadError { error: "native reload handoff unavailable".into() })? = Some(next.native.clone());
+                    *previous = next.native;
                 }
                 Ok(next.bmux)
             });
@@ -1251,9 +1434,14 @@ fn run_window_prepared(
     event_loop: bterm_native_platform::NativeEventLoop,
     worker: impl AttachWorker,
     options: WindowOptions,
+    native: crate::configuration::NativeConfiguration,
+    preferences: crate::zoom_preferences::PreferenceStore,
 ) -> Result<()> {
     event_loop
-        .run(options, Application::new(worker)?)
+        .run(
+            options,
+            Application::configured(worker, native, Some(preferences))?,
+        )
         .context("run native window")
 }
 
@@ -1321,6 +1509,55 @@ fn pointer_cell(
     Some((column as u16, row as u16))
 }
 
+fn apply_window_typography(
+    renderer: &mut NativeRenderer,
+    mut typography: bterm_native_renderer::text::RendererTypography,
+    dpi: f32,
+    size: bterm_native_platform::PhysicalSize,
+) -> Result<()> {
+    // Reserve headroom beneath the renderer's cell/vertex budgets. Tiny valid
+    // user targets must not publish millions of cells and fail every retry.
+    let previous = renderer.typography().clone();
+    let result = (|| -> Result<()> {
+        for _ in 0..8 {
+            renderer.set_typography_and_scale(typography.clone(), dpi)?;
+            let cell = renderer.cell_size();
+            let columns = projection_cells(size.width, cell[0])?;
+            let rows = projection_cells(size.height, cell[1])?;
+            let count = u64::from(columns) * u64::from(rows);
+            if count <= 100_000 {
+                return Ok(());
+            }
+            let factor = ((count as f64 / 100_000.0).sqrt() * 1.01) as f32;
+            let next = (typography.font_size * factor).min(256.0_f32.min(256.0 / dpi));
+            anyhow::ensure!(
+                next > typography.font_size,
+                "native surface exceeds bounded typography capacity"
+            );
+            typography.letter_spacing =
+                (typography.letter_spacing * (next / typography.font_size)).min(128.0);
+            typography.font_size = next;
+        }
+        bail!("native surface exceeds bounded typography capacity")
+    })();
+    if result.is_err() {
+        // Restore last validated font policy; the failed candidate was never
+        // published as output or interaction authority.
+        renderer.set_typography_and_scale(previous, dpi)?;
+    }
+    result
+}
+
+fn allocation_matches_viewport(
+    x: u16,
+    y: u16,
+    width: u16,
+    height: u16,
+    viewport: PresentationViewport,
+) -> bool {
+    x == 0 && y == 0 && width == viewport.columns && height == viewport.rows
+}
+
 fn projection_cells(pixels: u32, cell: f32) -> Result<u16> {
     if !cell.is_finite() || cell <= 0.0 {
         bail!("invalid native font cell metrics");
@@ -1348,6 +1585,20 @@ mod tests {
         // queued new-viewport delivery rather than replay stale retained pixels.
         assert!(!replay_retained(redraw, true, true, Some(4), 5));
         assert!(replay_retained(redraw, true, true, Some(5), 5));
+    }
+
+    #[test]
+    fn displayed_allocation_must_match_complete_native_grid() {
+        let viewport = PresentationViewport {
+            columns: 80,
+            rows: 24,
+            generation: 1,
+        };
+        assert!(allocation_matches_viewport(0, 0, 80, 24, viewport));
+        assert!(!allocation_matches_viewport(0, 0, 1, 1, viewport));
+        assert!(!allocation_matches_viewport(1, 0, 80, 24, viewport));
+        assert!(!allocation_matches_viewport(0, 1, 80, 24, viewport));
+        assert!(!allocation_matches_viewport(0, 0, 80, 25, viewport));
     }
 
     #[test]
@@ -1416,6 +1667,7 @@ mod tests {
             },
             config: None,
             configuration: None,
+            native_reload: Default::default(),
             frozen_configuration: false,
             target: String::new(),
             handle: None,

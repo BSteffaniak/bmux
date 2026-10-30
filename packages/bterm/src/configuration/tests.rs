@@ -535,3 +535,46 @@ fn default_source_location_is_not_managed_config_root() {
     );
     assert!(captured.bmux.documents.is_empty());
 }
+
+#[test]
+fn fractional_typography_is_deterministic_and_not_runtime_identity() {
+    let mut input = inputs();
+    let first = input.resolve().unwrap();
+    input.bterm = family(
+        "/native.toml",
+        "[bterm.typography]\nsize = 17.25\nfamily = 'Mono'\nfallback = ['Emoji']\nline_height = 1.125\nletter_spacing = 0.25\n",
+    );
+    let second = input.resolve().unwrap();
+    assert_eq!(second.native.typography.size, 17.25);
+    assert_eq!(second.native.typography.fallback, vec!["Emoji"]);
+    assert_eq!(second.native.typography.line_height, 1.125);
+    assert_eq!(second.native.typography.letter_spacing, 0.25);
+    assert_eq!(
+        first.runtime_configuration_id,
+        second.runtime_configuration_id
+    );
+    assert_ne!(first.generation, second.generation);
+    let repeated = input.resolve().unwrap();
+    assert_eq!(second.native, repeated.native);
+    assert_eq!(second.generation, repeated.generation);
+    assert!(first.native.zoom.remember);
+    assert!(first.native.zoom.animation.enabled);
+}
+
+#[test]
+fn native_metric_and_zoom_validation_runs_during_resolution() {
+    for document in [
+        "[bterm.typography]\nsize = 0.0\n",
+        "[bterm.typography]\nsize = nan\n",
+        "[bterm.typography]\nline_height = 0.5\n",
+        "[bterm.typography]\nletter_spacing = -1.0\n",
+        "[bterm.typography]\nfamily = ' '\n",
+        "[bterm.zoom]\nstep = 1.0\n",
+        "[bterm.zoom]\nmin_scale = 0.0\n",
+        "[bterm.zoom]\nmax_scale = inf\n",
+    ] {
+        let mut input = inputs();
+        input.bterm = family("/invalid-native.toml", document);
+        assert!(input.resolve().is_err(), "accepted {document}");
+    }
+}

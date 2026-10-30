@@ -151,13 +151,16 @@ Inspection reports these roots without creating state or contacting the server.
 
 ## Reload behavior
 
-Configuration reload rereads the captured source selection rather than
-discovering
-new host sources. If effective BMUX configuration or native settings differ from
-the startup snapshot, reload refuses the change and requires an explicit restart
-of the selected runtime before applying it. Bterm does not automatically restart
-the runtime or hot-apply a changed configuration generation. A provenance-only
-change with identical effective settings does not require that restart.
+An explicit reload through the existing attach path rereads the captured source
+selection rather than discovering new host sources. It can apply native
+typography
+and zoom settings to the existing window, retaining its current zoom target
+under
+the new bounds. BMUX/runtime configuration, companion policy, and creation-time
+window changes are refused and require an explicit restart. There is no
+automatic
+file watcher or live reload merely from editing TOML. Frozen sandbox/effective
+snapshots remain frozen; reload does not rediscover their source configuration.
 
 ## Sandbox handoff and state isolation
 
@@ -191,6 +194,162 @@ security sandbox.** It is not a filesystem access-control boundary and does not
 protect the host from arbitrary shell commands. Handoff consistency checks do
 not authenticate a malicious owner of the sandbox directory. OS confinement,
 where needed, requires a separate security mechanism.
+
+## Typography and whole-window zoom
+
+Typography and zoom are Bterm presentation policy, not BMUX resource or
+companion
+configuration. They do not create panes, resize an individual pane
+independently,
+or write federated arrangements. Pinch gestures and pane-local zoom are not part
+of this interface.
+
+```toml
+[bterm.typography]
+size = 16.0
+# family = "Your installed monospace family"
+fallback = []
+line_height = 1.0
+letter_spacing = 0.0
+
+[bterm.zoom]
+step = 1.1
+min_scale = 0.5
+max_scale = 3.0
+remember = true
+
+[bterm.zoom.animation]
+enabled = true
+reduced_motion = false
+duration_ms = 120
+easing = "ease_out"
+
+[bterm.zoom.wheel]
+enabled = true
+modifiers = ["primary"]
+sensitivity = 0.1
+```
+
+Bterm captures these settings at startup and does not watch files. An explicit
+reload through the existing attach path can update typography, bindings, wheel
+policy, and animation in the existing window; it is not an automatic reload on
+file edits. See [Reload behavior](#reload-behavior) for refused runtime/window
+changes and frozen-snapshot behavior. Zoom shortcuts change window-local target
+state independently of declarative configuration.
+
+`size` is a logical-pixel font size, including fractional values such as
+`15.25`;
+it is not a point size or framebuffer-pixel size. Zoom multiplies the logical
+size; monitor DPI is applied separately. Fractional sizes are rerasterized, not
+rounded to integer font sizes or implemented by stretching an old glyph bitmap.
+`line_height` multiplies natural line metrics, and `letter_spacing` adds logical
+pixels per terminal column, not per glyph. Both participate in the same scaled
+geometry used for text, cursor placement, images, and pointer mapping. Raster
+cache sizes may use subpixel buckets (currently 1/64 physical pixel); that is
+not
+integer font-size stepping, and layout geometry remains continuous.
+
+Logical letter spacing scales with the effective zoomed font-size ratio,
+including
+DPI-induced font caps; line height remains a dimensionless multiplier.
+
+An omitted `family` uses bundled primary faces. `fallback` specifies ordered
+installed families before remaining platform fallback. Missing installed
+families
+must not make a configuration depend on another machine's font availability;
+exact glyph coverage and appearance still depend on the selected fonts. Family
+names cannot be blank, contain control characters, or exceed 256 bytes; at most
+16 fallback names are accepted. Configuration accepts size `4..128`, line height
+`1..4`, and letter spacing `0..32`, all finite. Renderer raster-size limits also
+apply after zoom and DPI: the window integration clamps effective logical font
+size so both logical and physical raster sizes stay within `1..256`. The
+requested
+zoom target is retained, so extreme settings can display a capped size rather
+than the exact requested size. Moving to another DPI can change that cap.
+A separate capacity guard keeps the projected window grid at or below 100,000
+cells. If a tiny zoom would exceed that budget, effective font size and spacing
+are enlarged proportionally while the requested zoom target remains unchanged.
+The applied policy is cached so a settled capacity-clamped window does not
+continuously invalidate output. Reset returns to the configured base size,
+subject to the same raster and capacity limits.
+
+### Keyboard, wheel, and exact sizes
+
+`primary` means Command on macOS and Control elsewhere. Default shortcuts are
+primary-plus (`=` or `+`, including primary-Shift-`+`), primary-minus, and
+primary-`0` to reset. Reset means scale `1.0`, returning to the configured base
+size, not a hard-coded 16-pixel font. Steps multiply the target by `step` rather
+than adding an integer to the font size. Scales are clamped to the configured
+bounds, which must include `1.0`.
+
+Replace the binding list to customize shortcuts. Actions use a tagged table;
+`set_size` takes an exact logical size, while `set_scale` takes a ratio:
+
+```toml
+[bterm.zoom]
+bindings = [
+  { key = "=", modifiers = ["primary"], action = { action = "in" } },
+  { key = "-", modifiers = ["primary"], action = { action = "out" } },
+  { key = "0", modifiers = ["primary"], action = { action = "reset" } },
+  { key = "s", modifiers = ["primary"], action = { action = "set_size", value = 17.75 } },
+  { key = "z", modifiers = ["primary"], action = { action = "set_scale", value = 1.25 } },
+]
+```
+
+Keys are single logical characters; modifier lists match exactly. Supported
+modifiers are `primary`, `control`, `alt`, `shift`, and `super`. At most 64
+bindings are accepted; duplicate effective key/modifier combinations are errors.
+An empty binding list disables keyboard zoom. A matched press, its repeats, and
+its release belong to zoom and must not also reach terminal input, even if the
+modifier is released before the key. Focus loss clears held shortcut state.
+Unmatched input retains its ordinary BMUX route.
+
+Wheel zoom requires the configured modifiers and defaults to enabled. One wheel
+line equals 40 pixels; normalization clamps each event to 32 lines in either
+direction. The normalized amount times `sensitivity` is a fractional step count.
+Horizontal-only or non-finite vertical deltas do not change scale. Set
+`wheel.enabled = false` to leave wheel input on its ordinary route. No pinch
+recognition is implied by pixel-wheel support.
+
+### Animation, remembered targets, and presentation authority
+
+Animation defaults to 120 ms with `ease_out`; `linear` and `ease_in_out` are
+also
+available. Interpolation is logarithmic in scale. Retargeting starts from the
+current animated sample, avoiding a jump back to the previous target. Animation
+stops requesting frames at completion. Set `enabled = false`, `duration_ms = 0`,
+or `reduced_motion = true` for immediate changes. Reduced motion is an explicit
+configuration choice, not a claim of automatic OS accessibility detection.
+
+`remember = true` restores the last requested target, not a mid-animation
+sample.
+Preferences are separate from declarative TOML, under the selected Bterm state
+root in `window-zoom-preferences.json`. Their identity includes ordered selected
+configuration source locators, profile/scope selectors, and the selected stable
+runtime target. Native typography edits do not themselves change that identity
+or the companion's runtime configuration identity. Different selected runtime
+targets do not share a preference entry. Windows sharing an entry use the last
+successfully saved target; in-flight animation and held keys remain
+window-local.
+Restored targets are clamped to current limits; `remember = false` starts at
+`1.0`.
+The preference format accepts any positive finite target; current zoom bounds
+are applied by the controller, not encoded as a preference-format size limit.
+Corrupt or unsupported preference data is reported; the window starts from the
+default target with saving disabled for that window, preserving the original
+file. Native-config identity stability does not imply automatic live reload;
+use the explicit attach reload path for native-only changes. Saves are debounced
+by 250 ms and performed on a bounded worker, with up to three retries after
+failure. Close waits at most 200 ms for the worker/final target and reports a
+missed deadline; last-target persistence is not guaranteed after that deadline.
+
+A target or animation sample is not proof of output. Painting and interaction
+must use the geometry from the same successfully presented output; failed or
+pending changes cannot advance hit testing independently. Configuration
+inspection and headless acceptance tests do not establish native GPU output,
+OS shortcut delivery, persistence-worker scheduling, or visible animation
+smoothness. See [the performance protocol](bterm-performance.md) for measurement
+boundaries and native acceptance checks.
 
 ## Native decorations
 

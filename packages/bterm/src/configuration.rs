@@ -149,11 +149,13 @@ pub struct ConfigOptions {
 }
 
 /// Native settings are additive to the complete BMUX root schema.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct NativeConfiguration {
     pub window: WindowConfiguration,
     pub companion: CompanionConfiguration,
+    pub typography: crate::typography::TypographyConfiguration,
+    pub zoom: crate::zoom::ZoomConfiguration,
 }
 
 /// Managed server policy, not native window presentation. This policy is part
@@ -374,6 +376,8 @@ impl ConfigInputs {
             resolved.application.clone().try_into().map_err(|_| {
                 anyhow::anyhow!("invalid [bterm] configuration (source values redacted)")
             })?;
+        native.typography.validate()?;
+        native.zoom.validate()?;
         // Match CLI startup precedence, but use only the captured environment.
         // Pin before snapshotting and hashing so a later ambient SHELL cannot
         // change server behavior while retaining the same managed target ID.

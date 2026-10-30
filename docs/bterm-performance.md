@@ -1,5 +1,158 @@
 # Bterm native rendering performance
 
+## Fractional zoom acceptance and measurement
+
+Whole-window zoom changes logical typography, then rerasterizes at the current
+monitor scale; it must not stretch previously rasterized glyph textures. Font
+size, line height, letter spacing, and DPI must produce one geometry for paint
+and pointer inversion. A requested target is not a committed frame, and a
+renderer geometry setter is not evidence of successful presentation.
+
+The public-API acceptance suite is
+`packages/bterm/tests/zoom_acceptance.rs`. It uses captured explicit
+configuration, private temporary preference roots, deterministic bundled fonts,
+and caller-supplied animation times. It requires neither a native window nor a
+running companion and does not read host font installations for raster tests.
+Run it with the repository toolchain when build capacity is available:
+
+```sh
+nix develop --command cargo test -p bterm --test zoom_acceptance
+```
+
+The tests cover fractional config resolution, unchanged companion identity,
+exact-size/reset/step actions, animation retargeting and completion, reduced
+motion, remembered targets and runtime isolation, corrupt preference handling,
+keyboard press/repeat/release ownership, normalized wheel input, window-local
+state, and size-distinct raster-cache entries. They do not measure frame time,
+input-to-photon latency, visible fallback quality, or live application wiring.
+A passing matcher test proves returned ownership, not that every application
+caller obeys it. Native acceptance must establish those separate boundaries.
+
+For a finite, opt-in check of the real native application/GPU path, use the
+standalone example (it never starts a daemon or attaches to a user session):
+
+```sh
+nix develop --command cargo run -p bterm --example zoom_window_acceptance -- --window
+```
+
+`--window` is required. The example opens one owned window, wraps the real
+`Application<AttachWorker>`, and injects synthetic input directly into its event
+path. A separate producer prepares canonical full retained deliveries, delays
+40 ms per attempt, and calls synchronous `NativeOutput::present`. Its mailbox
+retains one coalesced pending viewport, not a growing frame queue. Fifteen
+stages
+check zoom in/out (including repeats), reset from a non-default size,
+modifier-wheel fractions, exact sizes, rapid final-target retargeting, and
+native
+reload at non-unit zoom. Reload changes base size and letter spacing, must
+advance committed geometry generation, and must preserve the zoom ratio. An
+invalid reload must retain the last usable geometry and bindings. A single
+wrong-viewport delivery (generation `u64::MAX`, never a neighboring generation
+that animation could make current) then exercises rejection without a commit and
+application-scheduled retry to another successfully committed frame. Final
+stages
+reload a `0.01` minimum, request exact scale `0.01`, require actual new
+committed
+tiny geometry with at most 100,000 cells, observe convergence without idle
+commit churn, and reset to verify normal-size recovery.
+Successful application `presented` callbacks provide committed viewport/cell
+metrics; the worker must receive only the deliberately unmatched control key,
+never the zoom shortcuts. Nonzero letter spacing checks proportional scaling.
+The example reports counters and exits on success, fails after a 60-second
+execution budget, and has a 65-second process watchdog for stalled
+callbacks/shutdown. Exit before completing every stage is failure.
+
+This is actual GPU/application output evidence only when run successfully. It is
+not a screenshot, OS event-injection test, display-completion measurement, or
+claim about visible glyph quality. Empty damage after a successful commit must
+produce no preparation, and `present_prepared(None, ...)` must return `Ok(None)`
+without invoking its output callback. Rejected deliveries are counted and must
+recover;
+the harness injects provenance failure, not GPU/device failure, and does not
+suspend the real OS window or exercise persistence. Its reload handoff tests
+application consumption, not file-source discovery or attach command transport.
+Those remain separate checks below.
+Keep the test window on one display without resizing it during the run; DPI
+changes fail the controlled comparison.
+
+### Reported release fractional-zoom observation
+
+The coordinator measured a finite 60-sample release `fractional-zoom` workload
+at
+1920×1280 physical pixels and DPI scale 2:
+
+| CPU wall-time field |       Median | p95 (sorted index 57) |
+| ------------------- | -----------: | --------------------: |
+| `total_ns`          | 16.283021 ms |          21.461916 ms |
+| GPU wait            |  1.501333 ms |           9.802958 ms |
+
+These are CPU-side durations, including time spent waiting for the GPU, not GPU
+execution timestamps, display latency, refresh completion, or input-to-photon
+measurements. They are not a baseline comparison or evidence of a speedup.
+Artifact identity and full run metadata remain coordinator-owned evidence.
+
+The coordinator reported the fifteen-stage native application harness passing
+with 24 committed outputs and two rejections. Tiny zoom committed 97,580 cells,
+settled without commit churn, and recovered after reset. An earlier debug run
+exceeded the original 15-second budget at reset; the budget is now 60 seconds
+with unchanged behavioral assertions, allowing bounded 100,000-cell debug work.
+
+For an isolated full-product native acceptance run:
+
+1. Select an owned runtime and private config/state roots. Record artifact hash,
+   effective typography, zoom settings, fonts, display DPI, and renderer backend.
+   Do not attach to or inject input into a user's existing terminal.
+2. Render a fixed terminal workload containing narrow/wide cells, combining
+   marks, fallback glyphs, a cursor, selection, images, and pointer targets. Use
+   exact sizes such as `15.25`, `16.0`, and `17.75`; repeat at non-integer DPI.
+   Check that glyphs rerasterize and all presentation elements remain aligned.
+   Include nonzero letter spacing to verify proportional whole-window scaling,
+   including when the effective font size reaches a DPI-dependent cap.
+3. Exercise primary-plus/minus/reset, repeats, modifier-before-key release,
+   ordinary unmodified input, and fractional modifier-wheel input. Confirm zoom
+   shortcuts do not also type or scroll the terminal and unmatched input follows
+   its ordinary route. Verify focus loss and window isolation. Pinch and
+   pane-local zoom are out of scope.
+4. Rapidly reverse an animation mid-transition; check continuity, final exact
+   size, and no animation-only wakeups after settling. Repeat with reduced
+   motion and animation disabled. Check that pending/failed output does not
+   install a different hit-test geometry from the last successful paint.
+5. Close and reopen the owned window after persistence settles. Confirm the
+   final target is restored, reset persists `1.0`, `remember = false` ignores
+   saved targets, and another runtime/config selection does not borrow it.
+   Use unchanged configuration for ordinary reopen/restore checks. There is no
+   file watcher: exercise the explicit existing attach reload path to apply
+   native typography/zoom edits while retaining the selected source locators.
+   Verify BMUX/runtime, companion, and window-creation changes are refused; frozen
+   snapshots must remain frozen. Confirm malformed preferences are reported and
+   saving is disabled for that window without overwriting the corrupt file.
+6. Exercise the configured minimum and maximum at each tested DPI. The current
+   window integration caps effective font size to keep logical and physical raster
+   sizes within `1..256`, while retaining the requested target. Verify capped
+   behavior and restoration on a lower-DPI display separately from exact sizes.
+   Treat clipped/misaligned output, stale hit targets, or input duplication as
+   failures, not benchmark samples.
+7. Delay output across multiple animation samples and inject presentation failure;
+   verify eventual successful output after settling, no stale pointer delivery,
+   coherent accessibility/IME geometry, and recovery without exhausting retries
+   on superseded frames. Test suspend/resume and zero-sized windows mid-animation.
+8. Contend the preference lock and inject save failure, both during debounce and
+   close. Saves use a bounded worker and up to three retries; close waits at most
+   200 ms and reports an unretained target on timeout. Check these bounds and
+   latest-target ordering separately from the store's isolated round-trip tests.
+
+For timing comparisons, keep fonts, profile, DPI, telemetry, workload and input
+sequence fixed. Separate cold font selection/cache fill, steady exact-size
+rendering, animated transitions, rapid retargeting, and settled idle. Fractional
+animation can generate many distinct raster sizes: inspect bounded cache usage,
+CPU rasterization time, upload bytes and GPU atlas churn rather than assuming a
+cache hit at every sample. Repeated use of one exact size should be measured
+separately from a sweep through unique sizes. Preference file IO must remain off
+the rendering/input hot path and be debounced rather than run per animation
+sample. Telemetry stage timings do not establish actual display completion.
+Report distributions and failures with the evidence requirements below; do not
+claim a zoom performance improvement from headless correctness tests.
+
 ## Build selection and optimized baseline
 
 `cargo xtask bterm build/run` defaults to the development profile. Select an

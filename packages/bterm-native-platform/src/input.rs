@@ -9,6 +9,22 @@ pub use bmux_frontend_runtime::input::{
 use winit::event::{ElementState, Ime, MouseScrollDelta, WindowEvent};
 use winit::keyboard::{Key, ModifiersState};
 
+/// Normalize high-resolution wheel input for semantic shortcuts, not terminal
+/// scrolling. One line is 40 pixels; pathological deltas are bounded per event.
+/// Non-finite and horizontal-only input has no vertical zoom effect.
+#[must_use]
+pub fn normalized_scroll_lines(delta: ScrollDelta) -> f64 {
+    let value = match delta {
+        ScrollDelta::Lines { y, .. } => y,
+        ScrollDelta::Pixels { y, .. } => y / 40.0,
+    };
+    if value.is_finite() {
+        value.clamp(-32.0, 32.0)
+    } else {
+        0.0
+    }
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct InputAdapter {
     modifiers: Modifiers,
@@ -259,6 +275,32 @@ fn named_key(value: winit::keyboard::NamedKey) -> Option<NamedKey> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shortcut_wheel_normalization_is_fractional_finite_and_bounded() {
+        assert_eq!(
+            normalized_scroll_lines(ScrollDelta::Pixels { x: 50.0, y: 20.0 }),
+            0.5
+        );
+        assert_eq!(
+            normalized_scroll_lines(ScrollDelta::Lines { x: 0.0, y: -0.25 }),
+            -0.25
+        );
+        assert_eq!(
+            normalized_scroll_lines(ScrollDelta::Lines {
+                x: 0.0,
+                y: f64::NAN
+            }),
+            0.0
+        );
+        assert_eq!(
+            normalized_scroll_lines(ScrollDelta::Lines {
+                x: 0.0,
+                y: f64::MAX
+            }),
+            32.0
+        );
+    }
 
     #[test]
     fn paste_shortcuts_are_platform_specific_and_not_terminal_ctrl_v() {

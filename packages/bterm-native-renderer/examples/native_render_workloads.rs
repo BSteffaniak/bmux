@@ -15,7 +15,9 @@ use bterm_native_platform::{
     PhysicalSize, PlatformError, PlatformEvent, WindowApplication, WindowContext, WindowMetrics,
     WindowOptions,
 };
-use bterm_native_renderer::{FrameTelemetry, NativeRenderer, RenderError, RendererOptions};
+use bterm_native_renderer::{
+    FrameTelemetry, NativeRenderer, RenderError, RendererOptions, text::RendererTypography,
+};
 use std::{
     error::Error,
     time::{Duration, Instant},
@@ -30,13 +32,14 @@ const LIMITS: PresentationLimits = PresentationLimits {
     max_entries: 128,
     max_bytes: 2 * 1024 * 1024,
 };
-const CASES: [&str; 9] = [
+const CASES: [&str; 10] = [
     "cold-text",
     "warm-text",
     "changing-text",
     "scroll",
     "resize",
     "scale",
+    "fractional-zoom",
     "static-image",
     "static-png",
     "changing-image",
@@ -261,6 +264,20 @@ impl Workload {
             };
             renderer
                 .set_scale_factor(metrics.scale_factor as f32 * factor)
+                .map_err(application_error)?;
+        }
+        if self.case == "fractional-zoom" {
+            // Finite ascending/descending sweep, with stable text and bounded
+            // frame count. Measures animated raster churn rather than bitmap scaling.
+            let phase = self.iteration as f32 / (FRAMES + WARMUP) as f32;
+            let wave = (phase * std::f32::consts::PI).sin();
+            renderer
+                .set_typography(RendererTypography {
+                    font_size: 12.25 + wave * 11.5,
+                    line_height: 1.15,
+                    letter_spacing: 0.25,
+                    ..Default::default()
+                })
                 .map_err(application_error)?;
         }
         let [cw, ch] = renderer.cell_size();

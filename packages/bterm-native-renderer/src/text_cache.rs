@@ -1,66 +1,56 @@
 //! Derived raster retention, bounded by both payload bytes and entry count.
 
-use std::{collections::VecDeque, sync::Arc};
+use std::{
+    hash::{DefaultHasher, Hash, Hasher},
+    sync::Arc,
+};
 
-use crate::text::{RasterizedCell, TextStyle};
+use crate::{
+    renderer::raster_cache::Cache,
+    text::{RasterizedCell, TextStyle},
+};
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub(crate) struct Key {
     pub text: String,
     pub columns: u16,
     pub style: TextStyle,
     pub size: u32,
+    pub phase: [u8; 2],
 }
 
-pub(crate) struct TextCache {
-    entries: VecDeque<(Key, Arc<RasterizedCell>, usize)>,
-    bytes: usize,
-    limit: usize,
-    capacity: usize,
+pub(crate) struct TextCache(Cache<Key, RasterizedCell>);
+
+fn fingerprint(key: &Key) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    key.hash(&mut hasher);
+    hasher.finish()
 }
 
 impl TextCache {
     pub(crate) fn new(limit: usize, capacity: usize) -> Self {
-        Self {
-            entries: VecDeque::new(),
-            bytes: 0,
-            limit,
-            capacity,
-        }
+        Self(Cache::new(limit, capacity))
     }
 
     pub(crate) fn get(&mut self, key: &Key) -> Option<Arc<RasterizedCell>> {
-        let index = self.entries.iter().position(|(k, _, _)| k == key)?;
-        let entry = self.entries.remove(index)?;
-        let value = Arc::clone(&entry.1);
-        self.entries.push_back(entry);
-        Some(value)
+        self.0.get(fingerprint(key), |candidate| candidate == key)
     }
 
     pub(crate) fn insert(&mut self, key: Key, value: Arc<RasterizedCell>) {
-        let bytes = key.text.len()
-            + std::mem::size_of::<RasterizedCell>()
+        // Charge allocation capacities, not lengths: keys, glyph storage, source
+        // ranges, Arc headers and the fixed index are all part of the bound.
+        let bytes = key.text.capacity()
+            + value.glyphs.capacity() * std::mem::size_of::<crate::text::GlyphBitmap>()
             + value
                 .glyphs
                 .iter()
-                .map(|g| std::mem::size_of_val(g) + g.pixels.len())
+                .map(|glyph| glyph.pixels.capacity())
                 .sum::<usize>();
-        if bytes > self.limit || self.capacity == 0 {
-            return;
-        }
-        while self.bytes + bytes > self.limit || self.entries.len() >= self.capacity {
-            if let Some((_, _, size)) = self.entries.pop_front() {
-                self.bytes -= size;
-            } else {
-                break;
-            }
-        }
-        self.bytes += bytes;
-        self.entries.push_back((key, value, bytes));
+        self.0.insert(fingerprint(&key), key, value, bytes);
     }
 
     pub(crate) fn usage(&self) -> (usize, usize) {
-        (self.entries.len(), self.bytes)
+        self.0.usage()
     }
 }
 
@@ -74,6 +64,7 @@ mod tests {
             columns: 1,
             style: TextStyle::default(),
             size: 16.0_f32.to_bits(),
+            phase: [0; 2],
         }
     }
 
