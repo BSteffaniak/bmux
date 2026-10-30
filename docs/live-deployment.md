@@ -195,6 +195,43 @@ resources; inspect existing machine and volume state before planning a retry.
 The diagnostics patch does not recover bodies discarded by earlier runs, and
 retrying an old workflow SHA still uses its old sanitizer.
 
+### Inspect ownership without changing it
+
+When preview rejects a volume identity change, do not keep retrying deployment.
+Dispatch **Live production release** on `master` with **inspect_only = true**
+(or `gh workflow run live-promote.yml --ref master -f inspect_only=true`).
+This still builds and validates the same-revision candidate, then runs a
+dedicated
+inspection branch in the credentialed preview job. Approval, production and site
+publication are skipped. No image upload, apply, import, refresh-only apply,
+state push/removal, or machine/volume mutation is performed. The plan uses
+`-lock=false` to avoid backend lock writes; its refresh exists only in the
+private
+runner files. Use this mode when no infrastructure apply is in progress; the
+workflow shares the existing infrastructure concurrency group.
+
+The report contains only validated resource IDs and fixed booleans:
+
+- Persisted state, transient refreshed state, and proposed ownership separately.
+- The Fly machine's actual `/data` volume and which snapshots match it.
+- Whether each referenced volume exists and which machine it is attached to.
+- Reconciliation flags plus fixed name/region equality results.
+
+The report is **evidence, not recovery authorization or canonical state**. Raw
+state/plans/API bodies never become artifacts or logs. Unknown IDs, ambiguous
+mounts, unsupported JSON schema, and failed API reads stop inspection rather
+than
+invent a valid identity. Redirects are disabled for credentialed Fly requests.
+Transient private files are removed on exit.
+
+Once the report identifies the exact discrepancy, review a state-only recovery
+against the encrypted state history and live attachment. Preserve both machine
+and authority volume, then create a fresh release preview. Do not import over an
+existing resource, `state rm`, or substitute the current live mount as config
+without verifying its durable ownership. This inspection mode does not itself
+perform reconciliation, and a successful inspection does not mean deployment is
+fixed.
+
 ### Volume-placement rejections
 
 A volume-placement classification is not an exact API error. Compare the live

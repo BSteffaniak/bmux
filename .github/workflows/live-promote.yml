@@ -2,6 +2,9 @@ name: Live production release
 on:
   workflow_call:
     inputs:
+      inspect_only:
+        type: boolean
+        default: false
       configure:
         type: boolean
         default: false
@@ -20,6 +23,11 @@ on:
   push:
     branches: [master]
   workflow_dispatch:
+    inputs:
+      inspect_only:
+        description: 'Read-only mount ownership inspection; no approval, apply, upload or deployment'
+        type: boolean
+        default: false
   pull_request:
     paths: ['infra/live-**', 'scripts/*live*', '.github/workflows/live-*.yml']
 permissions:
@@ -175,16 +183,21 @@ jobs:
           LIVE_PAGES_PROJECT: ${{ secrets.LIVE_PAGES_PROJECT }}
           LIVE_PUBLISHER_KEY_SHA256: ${{ secrets.LIVE_PUBLISHER_KEY_SHA256 }}
           LIVE_STATE_BUCKET: ${{ secrets.LIVE_STATE_BUCKET }}
+          INSPECT_ONLY: ${{ inputs.inspect_only }}
         run: |
           cd "$RUNNER_TEMP/live-download"
           sha256sum -c live-candidate.tar.gz.sha256
           mkdir "$RUNNER_TEMP/live-candidate"
           tar -xzf live-candidate.tar.gz -C "$RUNNER_TEMP/live-candidate"
           test "$(cat "$RUNNER_TEMP/live-candidate/REVISION")" = "$GITHUB_SHA"
-          bash "$GITHUB_WORKSPACE/scripts/live-deploy.sh" production "$RUNNER_TEMP/live-candidate" preview
+          if [[ "$INSPECT_ONLY" == true ]]; then
+            bash "$GITHUB_WORKSPACE/scripts/live-deploy.sh" production "$RUNNER_TEMP/live-candidate" inspect
+          else
+            bash "$GITHUB_WORKSPACE/scripts/live-deploy.sh" production "$RUNNER_TEMP/live-candidate" preview
+          fi
   approve:
     if: >-
-      always() && github.event_name != 'pull_request' && github.ref == 'refs/heads/master' &&
+      always() && !inputs.inspect_only && github.event_name != 'pull_request' && github.ref == 'refs/heads/master' &&
       github.repository == 'BSteffaniak/bmux' && needs.build.result == 'success' && needs.validation.result == 'success' &&
       (inputs.configure || (needs.site-build.result == 'success' && needs.preview.result == 'success'))
     needs: [build, validation, site-build, preview]
@@ -195,7 +208,7 @@ jobs:
   production:
     needs: [build, approve, validation, preview]
     if: >-
-      always() && github.event_name != 'pull_request' && github.ref == 'refs/heads/master' &&
+      always() && !inputs.inspect_only && github.event_name != 'pull_request' && github.ref == 'refs/heads/master' &&
       github.repository == 'BSteffaniak/bmux' && needs.build.result == 'success' && needs.approve.result == 'success' &&
       needs.validation.result == 'success'
     environment: Production

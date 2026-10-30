@@ -200,6 +200,32 @@ done
         self.assertLess(effects.index('imports checked'), effects.index('tofu plan'))
         self.assertFalse((self.artifact / 'infrastructure/approved-imports.tf.json').exists())
 
+    def test_inspect_mode_reads_state_and_plan_without_mutations(self):
+        self.tool('tofu', '''import json,os,sys
+from pathlib import Path
+args=sys.argv[1:]
+with Path(os.environ['TEST_EFFECTS']).open('a') as log: log.write('tofu '+args[0]+'\\n')
+if args[0]=='version': print('{"terraform_version":"1.10.9"}')
+elif args[0]=='plan':
+ assert '-lock=false' in args
+ assert not any(arg.startswith('-target=') for arg in args)
+elif args[0]=='show':
+ assert '-json' in args
+ print(os.environ['TEST_PLAN'])
+elif args[0]!='init': sys.exit('unexpected mutating operation')
+''')
+        # Extend the existing fake Python dispatch, retaining archive check stubs.
+        wrapper = self.bin / 'python3'
+        source = wrapper.read_text()
+        source = source.replace("else:\n os.execv", "elif args and args[0].endswith('inspect-live-mounts.py'):\n assert all(Path(p).is_file() for p in args[1:])\n with open(os.environ['TEST_EFFECTS'],'a') as f: f.write('ownership inspected\\n')\n print('{\"operation\":\"read_only_no_recovery_performed\"}')\nelse:\n os.execv")
+        wrapper.write_text(source)
+        result, effects = self.run_deploy('inspect')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('ownership inspected', effects)
+        self.assertEqual(effects.count('tofu show'), 2)
+        for forbidden in ('tofu apply', 'tofu import', 'skopeo', 'pages upload', 'state archived', 'plan checked'):
+            self.assertNotIn(forbidden, effects)
+
     def test_apply_errors_use_structured_diagnostics(self):
         self.tool('tofu', '''import json,os,sys
 args=sys.argv[1:]
