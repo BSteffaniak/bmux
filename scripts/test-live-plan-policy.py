@@ -37,6 +37,37 @@ class PolicyTests(unittest.TestCase):
                 m.validate(plan('fly_machine.live', ['update'], before=before, after=before,
                                 after_unknown={'mount': True}), **flags)
 
+    def test_known_nested_unknown_masks_do_not_block_image_release(self):
+        before = {'image': 'old', 'mount': [{'path': '/data', 'volume': 'vol-existing'}],
+                  'guest': {'cpus': 1}, 'service': [{'port': [{'port': 443}]}]}
+        unknown = {'image': False, 'mount': [{'path': False, 'volume': False}],
+                   'guest': {'cpus': False}, 'service': [{'port': [{'port': False}]}],
+                   'id': True, 'instance_id': True}
+        candidate = plan('fly_machine.live', ['update'], before=before,
+                         after=dict(before, image='new'), after_unknown=unknown)
+        for flags in ({}, {'configure': True}, {'infrastructure': True}):
+            self.assertTrue(m.validate(candidate, **flags))
+        for mask in (True, [{'volume': True}], [{'path': True}],
+                     [{'volume': 'false'}], [{'volume': None}], [{'volume': 0}]):
+            for flags in ({}, {'configure': True}, {'infrastructure': True}):
+                with self.subTest(mask=mask, flags=flags):
+                    candidate['resource_changes'][0]['change']['after_unknown']['mount'] = mask
+                    with self.assertRaisesRegex(ValueError, 'In-place authority mount change rejected'):
+                        m.validate(candidate, **flags)
+
+    def test_nested_unknown_configuration_and_known_mount_swap_still_block(self):
+        before = {'image': 'old', 'mount': [{'path': '/data', 'volume': 'vol-existing'}]}
+        for unknown in ({'guest': {'cpus': True}}, {'env': {'key': True}},
+                        {'service': [{'port': [{'port': True}]}]}):
+            with self.assertRaisesRegex(ValueError, 'Unknown machine configuration'):
+                m.validate(plan('fly_machine.live', ['update'], before=before,
+                                after=dict(before, image='new'), after_unknown=unknown))
+        for flags in ({}, {'configure': True}, {'infrastructure': True}):
+            with self.assertRaisesRegex(ValueError, 'In-place authority mount change rejected'):
+                m.validate(plan('fly_machine.live', ['update'], before=before,
+                                after={'mount': [{'path': '/data', 'volume': 'vol-other'}]},
+                                after_unknown={'mount': [{'volume': False, 'path': False}]}), **flags)
+
     def test_image_only_update(self):
         before = {'image': 'old', 'region': 'iad', 'env': {'key': 'digest'}}
         after = dict(before, image='new')

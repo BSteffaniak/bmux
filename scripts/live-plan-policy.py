@@ -23,6 +23,19 @@ class PolicyRejection(ValueError):
     """A fixed, public policy reason; never include provider-controlled values."""
 
 
+def has_unknown(value):
+    """OpenTofu after_unknown is a tree of booleans, not container presence.
+
+    False leaves mean known, including inside nonempty list/block structures.
+    Unexpected leaf types fail closed instead of silently counting as known.
+    """
+    if isinstance(value, dict):
+        return any(has_unknown(child) for child in value.values())
+    if isinstance(value, list):
+        return any(has_unknown(child) for child in value)
+    return value is not False
+
+
 def validate(plan, configure=False, infrastructure=False):
     if not isinstance(plan, dict) or not isinstance(plan.get('resource_changes', []), list):
         raise PolicyRejection('Invalid infrastructure plan')
@@ -56,7 +69,9 @@ def validate(plan, configure=False, infrastructure=False):
                     raise PolicyRejection('Invalid machine mount configuration')
                 return [(block.get('path'), block.get('volume')) for block in blocks]
             unknown = change.get('after_unknown', {})
-            if unknown.get('mount') or mounts(before) != mounts(after):
+            if not isinstance(unknown, dict):
+                raise PolicyRejection('Invalid machine unknown configuration')
+            if has_unknown(unknown.get('mount', False)) or mounts(before) != mounts(after):
                 raise PolicyRejection('In-place authority mount change rejected; inspect host-migration reconciliation')
         if configure or infrastructure:
             continue
@@ -68,7 +83,8 @@ def validate(plan, configure=False, infrastructure=False):
         if not isinstance(before, dict) or not isinstance(after, dict):
             raise PolicyRejection('Missing machine configuration')
         unknown = change.get('after_unknown', {})
-        if any(value for key, value in unknown.items() if key not in ('id', 'instance_id', 'private_ip', 'state')):
+        if not isinstance(unknown, dict) or any(has_unknown(value) for key, value in unknown.items()
+                                               if key not in ('id', 'instance_id', 'private_ip', 'state')):
             raise PolicyRejection('Unknown machine configuration')
         ignored = {'image', 'id', 'instance_id', 'private_ip', 'state'}
         if {k: v for k, v in before.items() if k not in ignored} != {
