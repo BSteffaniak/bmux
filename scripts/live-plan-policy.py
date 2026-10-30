@@ -71,8 +71,15 @@ def validate(plan, configure=False, infrastructure=False):
             unknown = change.get('after_unknown', {})
             if not isinstance(unknown, dict):
                 raise PolicyRejection('Invalid machine unknown configuration')
-            if has_unknown(unknown.get('mount', False)) or mounts(before) != mounts(after):
-                raise PolicyRejection('In-place authority mount change rejected; inspect host-migration reconciliation')
+            if has_unknown(unknown.get('mount', False)):
+                raise PolicyRejection('In-place authority mount change rejected: mount fields unknown; inspect host-migration reconciliation')
+            old_mounts, new_mounts = mounts(before), mounts(after)
+            if len(old_mounts) != len(new_mounts):
+                raise PolicyRejection('In-place authority mount change rejected: mount count differs; inspect host-migration reconciliation')
+            if [path for path, _ in old_mounts] != [path for path, _ in new_mounts]:
+                raise PolicyRejection('In-place authority mount change rejected: mount paths differ; inspect host-migration reconciliation')
+            if old_mounts != new_mounts:
+                raise PolicyRejection('In-place authority mount change rejected: volume identities differ; inspect host-migration reconciliation')
         if configure or infrastructure:
             continue
         if address not in RELEASE_RESOURCES or actions != ['update'] or change.get('importing'):

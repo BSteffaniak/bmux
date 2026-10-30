@@ -68,6 +68,30 @@ class PolicyTests(unittest.TestCase):
                                 after={'mount': [{'path': '/data', 'volume': 'vol-other'}]},
                                 after_unknown={'mount': [{'volume': False, 'path': False}]}), **flags)
 
+    def test_mount_rejection_reports_fixed_cause_without_provider_values(self):
+        before = {'mount': [{'path': '/data', 'volume': 'PRIVATE_OLD_VOLUME'}]}
+        cases = [
+            ({'mount': [{'path': '/data', 'volume': None}]}, {'mount': [{'volume': True}]}, 'mount fields unknown'),
+            ({'mount': []}, {}, 'mount count differs'),
+            ({'mount': [{'path': '/PRIVATE_PATH', 'volume': 'PRIVATE_OLD_VOLUME'}]}, {}, 'mount paths differ'),
+            ({'mount': [{'path': '/data', 'volume': 'PRIVATE_NEW_VOLUME'}]}, {}, 'volume identities differ'),
+        ]
+        for after, unknown, cause in cases:
+            with self.subTest(cause=cause):
+                candidate = plan('fly_machine.live', ['update'], before=before, after=after,
+                                 after_unknown=unknown)
+                with self.assertRaisesRegex(ValueError, cause) as caught:
+                    m.validate(candidate, infrastructure=True)
+                self.assertNotIn('PRIVATE_', str(caught.exception))
+                with tempfile.TemporaryDirectory() as directory:
+                    path = Path(directory) / 'plan.json'
+                    path.write_text(json.dumps(candidate))
+                    result = subprocess.run([sys.executable, str(Path(m.__file__)), str(path), '--infrastructure'],
+                                            capture_output=True, text=True, check=False)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn(cause, result.stderr)
+                self.assertNotIn('PRIVATE_', result.stdout + result.stderr)
+
     def test_image_only_update(self):
         before = {'image': 'old', 'region': 'iad', 'env': {'key': 'digest'}}
         after = dict(before, image='new')
