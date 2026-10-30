@@ -52,6 +52,10 @@ class DeployTests(unittest.TestCase):
         self.tool('tofu', '''import json,os,sys
 from pathlib import Path
 args=sys.argv[1:]
+# All non-inspection deployment modes must retain OpenTofu's state lock.
+assert '-lock=false' not in args
+if args[0] in ('plan', 'apply'):
+ assert '-lock-timeout=5m' in args
 if args[0]=='version': print('{"terraform_version":"1.10.9"}')
 elif args[0]=='state':
  with open(os.environ['TEST_EFFECTS'],'a') as f: f.write('tofu state\\n')

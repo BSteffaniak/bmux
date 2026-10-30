@@ -27,7 +27,20 @@ class StateTests(unittest.TestCase):
 
     def test_recovery_never_disables_lock(self):
         source = Path(__file__).with_name('live-deploy.sh').read_text()
-        self.assertNotIn(' -lock=false', source)
+        # Inspection alone avoids backend writes, including lock acquisition.
+        # Keep the exception bounded to its exact branch and require it to exit
+        # before any deployment/recovery code can execute without locking.
+        before, marker, remainder = source.partition('if [[ "$MODE" == inspect ]]; then\n')
+        self.assertTrue(marker)
+        inspection, end, after = remainder.partition('\nfi\n')
+        self.assertTrue(end)
+        self.assertEqual(inspection.count(' -lock=false'), 1)
+        self.assertIn('tofu plan -json -input=false -lock=false ', inspection)
+        self.assertTrue(inspection.endswith('  exit 0'))
+        self.assertNotIn('tofu apply', inspection)
+        self.assertNotIn('tofu state', inspection)
+        self.assertNotIn('tofu import', inspection)
+        self.assertNotIn(' -lock=false', before + after)
         self.assertNotIn('tofu force-unlock', source)
         self.assertIn('-lock-timeout=5m', source)
         self.assertIn('-lockfile=readonly', source)
