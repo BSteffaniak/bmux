@@ -61,7 +61,13 @@ mod contract_tests {
         );
         let routes: Vec<bmux_plugin::stream_admission::StreamAdmittedRoute> =
             bmux_plugin_sdk::decode_service_message(payload).unwrap();
-        assert_eq!(routes.len(), 23);
+        assert_eq!(routes.len(), 24);
+        assert!(routes.iter().any(|route| {
+            route.interface_id == "pane-runtime-view-size-v1"
+                && route.operation == "resize-alternate"
+                && route.capability == "bmux.pane_runtime.view.size.v1"
+                && route.kind == bmux_plugin_sdk::ServiceKind::Command
+        }));
         let pointer_routes: std::collections::BTreeSet<_> = routes
             .iter()
             .filter(|route| route.interface_id == "pane-runtime-pointer-grid-v1")
@@ -198,6 +204,12 @@ impl RustPlugin for PaneRuntimePlugin {
                     "terminate",
                     "wait",
                 ][..],
+            ),
+            (
+                "bmux.pane_runtime.view.size.v1",
+                ServiceKind::Command,
+                "pane-runtime-view-size-v1",
+                &["resize-alternate"][..],
             ),
             (
                 "bmux.pane_runtime.presentation.v1",

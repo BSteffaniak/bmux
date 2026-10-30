@@ -326,8 +326,37 @@ enum AttachHostEvent {
 
 /// Native host commands. Pointer coordinates must be converted using only the
 /// successfully displayed presentation, never an enqueued frame's hit map.
+pub use super::pane_zoom_native::{NativePaneZoomRefresh, NativePaneZoomTarget};
+
+#[derive(Clone, Copy, Debug)]
+pub enum NativePanePointer {
+    Mouse {
+        button: bmux_frontend_runtime::input::PointerButton,
+        phase: bmux_frontend_runtime::input::KeyPhase,
+        modifiers: bmux_frontend_runtime::input::Modifiers,
+    },
+    Motion {
+        drag: Option<bmux_frontend_runtime::input::PointerButton>,
+        modifiers: bmux_frontend_runtime::input::Modifiers,
+    },
+    Scroll {
+        delta_x: i16,
+        delta_y: i16,
+        modifiers: bmux_frontend_runtime::input::Modifiers,
+    },
+}
+
 #[derive(Clone, Debug)]
 pub enum NativeAttachEvent {
+    PointerAt {
+        identity: bmux_frontend_runtime::presentation::PresentationIdentity,
+        point: [f64; 2],
+        event: NativePanePointer,
+    },
+    SetPaneZoom {
+        target: NativePaneZoomTarget,
+        scale_millis: u16,
+    },
     Input(bmux_frontend_runtime::input::InputEvent),
     /// Explicit execution-cell resize; physical pixels are not cell dimensions.
     Resize {
@@ -388,6 +417,7 @@ pub struct NativeAttachHandle(
     tokio::sync::mpsc::Sender<QueuedNativeEvent>,
     Arc<std::sync::atomic::AtomicU64>,
     super::native_input_metrics::QueueMetrics,
+    super::pane_zoom_native::SharedZoom,
 );
 struct QueuedNativeEvent {
     event: NativeAttachEvent,
@@ -408,6 +438,79 @@ fn native_event_payload_bytes(event: &NativeAttachEvent) -> usize {
 }
 
 impl NativeAttachHandle {
+    /// Lookup through the last successfully delivered retained compositor.
+    #[must_use]
+    pub fn pane_zoom_target(&self, point: Option<[f64; 2]>) -> Option<NativePaneZoomTarget> {
+        let state = self.3.lock().ok()?;
+        let target = state.target(point)?;
+        drop(state);
+        (target.identity.viewport_generation >= self.1.load(std::sync::atomic::Ordering::Acquire))
+            .then_some(target)
+    }
+    /// Compatibility lookup; callers needing retry semantics use the typed status.
+    #[must_use]
+    pub fn refresh_pane_zoom_target(
+        &self,
+        bound: &NativePaneZoomTarget,
+    ) -> Option<NativePaneZoomTarget> {
+        match self.refresh_pane_zoom_status(bound) {
+            NativePaneZoomRefresh::Ready { target, .. } => Some(target),
+            NativePaneZoomRefresh::Pending | NativePaneZoomRefresh::Gone => None,
+        }
+    }
+
+    /// Observe progress without conflating lock contention with source removal.
+    #[must_use]
+    pub fn refresh_pane_zoom_status(&self, bound: &NativePaneZoomTarget) -> NativePaneZoomRefresh {
+        let state = match self.3.try_lock() {
+            Ok(state) => state,
+            Err(std::sync::TryLockError::WouldBlock) => return NativePaneZoomRefresh::Pending,
+            Err(std::sync::TryLockError::Poisoned(_)) => return NativePaneZoomRefresh::Gone,
+        };
+        let Some(current) = state.targets.get(&bound.view_id).copied() else {
+            return NativePaneZoomRefresh::Gone;
+        };
+        let identity = state.identity;
+        let progress_revision = state.progress_revision;
+        drop(state);
+        if Some(current.identity) != identity
+            || current.identity.epoch != bound.identity.epoch
+            || current.identity.attached_id != bound.identity.attached_id
+            || current.identity.viewport_generation != bound.identity.viewport_generation
+            || current.identity.viewport_generation
+                < self.1.load(std::sync::atomic::Ordering::Acquire)
+            || current.pane_id != bound.pane_id
+            || current.execution_id != bound.execution_id
+        {
+            return NativePaneZoomRefresh::Gone;
+        }
+        NativePaneZoomRefresh::Ready {
+            target: current,
+            progress_revision,
+        }
+    }
+
+    /// Publish a host-calculated raster cap before accepting animation intent.
+    ///
+    /// # Errors
+    /// Returns explicit backpressure on contention or invalid bounds.
+    pub fn set_pane_zoom_max_scale(&self, max_scale_millis: u16) -> Result<()> {
+        anyhow::ensure!(
+            (125..=8000).contains(&max_scale_millis),
+            "invalid pane zoom raster cap"
+        );
+        let mut state = self
+            .3
+            .try_lock()
+            .map_err(|_| anyhow::anyhow!("pane zoom cap busy"))?;
+        state.max_scale_millis = Some(max_scale_millis);
+        for target in state.targets.values_mut() {
+            target.max_scale_millis = max_scale_millis;
+        }
+        drop(state);
+        Ok(())
+    }
+
     /// Bounded numeric diagnostics; no input contents or acknowledgement authority.
     #[must_use]
     pub fn input_queue_metrics(&self) -> super::native_input_metrics::QueueMetricsSnapshot {
@@ -608,11 +711,14 @@ impl NativeAttachHost {
         let receipt = accepted_revision.clone();
         let live_viewport_generation =
             Arc::new(std::sync::atomic::AtomicU64::new(viewport_generation));
+        let zoom = Arc::new(Mutex::new(super::pane_zoom_native::CommittedZoom::default()));
+        let zoom_delivery = zoom.clone();
         Ok((
             NativeAttachHandle(
                 sender,
                 live_viewport_generation.clone(),
                 super::native_input_metrics::QueueMetrics::from_env(),
+                zoom,
             ),
             Self {
                 geometry: TerminalGeometry {
@@ -622,21 +728,24 @@ impl NativeAttachHost {
                 viewport_generation,
                 live_viewport_generation,
                 events,
-                observer: Some(
-                    super::observer::AttachObserverPublisher::for_prepared_delivery(
-                        viewport_generation,
-                        move |prepared| {
-                            let revision = prepared.identity.revision;
-                            delivery(prepared).map_err(|error| {
-                                anyhow::Error::new(super::observer::PresentationRejected(
-                                    error.to_string(),
-                                ))
-                            })?;
-                            receipt.store(revision, std::sync::atomic::Ordering::Release);
-                            Ok(())
-                        },
-                    ),
-                ),
+                observer: Some({
+                    let mut publisher =
+                        super::observer::AttachObserverPublisher::for_prepared_delivery(
+                            viewport_generation,
+                            move |prepared| {
+                                let revision = prepared.identity.revision;
+                                delivery(prepared).map_err(|error| {
+                                    anyhow::Error::new(super::observer::PresentationRejected(
+                                        error.to_string(),
+                                    ))
+                                })?;
+                                receipt.store(revision, std::sync::atomic::Ordering::Release);
+                                Ok(())
+                            },
+                        );
+                    publisher.pane_zoom_shared = Some(zoom_delivery);
+                    publisher
+                }),
                 accepted_revision,
                 pending: std::collections::VecDeque::new(),
                 attach_committed: None,
@@ -708,6 +817,39 @@ impl AttachHost for NativeAttachHost {
                 return Ok(None);
             };
             ticket.dequeued();
+            if let NativeAttachEvent::PointerAt {
+                identity,
+                point,
+                event:
+                    NativePanePointer::Scroll {
+                        delta_x,
+                        delta_y,
+                        modifiers,
+                    },
+            } = &event
+            {
+                anyhow::ensure!(
+                    delta_x.unsigned_abs() <= 256 && delta_y.unsigned_abs() <= 256,
+                    "native scroll batch exceeds admission bound"
+                );
+                for (x, y, count) in [
+                    (0, delta_y.signum(), delta_y.unsigned_abs()),
+                    (delta_x.signum(), 0, delta_x.unsigned_abs()),
+                ] {
+                    for _ in 0..count {
+                        self.pending.push_back(NativeAttachEvent::PointerAt {
+                            identity: *identity,
+                            point: *point,
+                            event: NativePanePointer::Scroll {
+                                delta_x: x,
+                                delta_y: y,
+                                modifiers: *modifiers,
+                            },
+                        });
+                    }
+                }
+                return Ok(self.pending.pop_front().map(AttachHostEvent::Native));
+            }
             if let NativeAttachEvent::Scroll {
                 identity,
                 column,
@@ -948,6 +1090,8 @@ async fn native_attach_input(
         // be mapped using a successful presentation before entering the reducer.
         NativeAttachEvent::Input(_)
         | NativeAttachEvent::Suspend { .. }
+        | NativeAttachEvent::PointerAt { .. }
+        | NativeAttachEvent::SetPaneZoom { .. }
         | NativeAttachEvent::Close
         | NativeAttachEvent::Resize { .. }
         | NativeAttachEvent::Accessibility { .. }
@@ -4936,6 +5080,10 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
             .render_provider()
             .is_none_or(|provider| provider.allows_retarget());
     if let Some(publisher) = observer {
+        view_state
+            .pane_zoom
+            .shared
+            .clone_from(&publisher.pane_zoom_shared);
         view_state.set_observer(publisher);
     }
     // Read once at attachment admission, not during frame composition. Optional
@@ -5300,6 +5448,16 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
                     };
                     break 'attach_loop;
                 };
+                view_state.pane_zoom.shared_pointer_root = None;
+                let result = match result {
+                    AttachHostEvent::Native(NativeAttachEvent::PointerAt { identity, point, event }) => {
+                        if !native_identity_is_current(&view_state, terminal, identity) { break 'host_input; }
+                        let Some(event) = super::pane_zoom_native::expand_pointer(identity, point, event) else { break 'host_input; };
+                        view_state.pane_zoom.shared_pointer_root = Some(point);
+                        AttachHostEvent::Native(event)
+                    }
+                    event => event,
+                };
                 let result = match result {
                     AttachHostEvent::Terminal(event) => event,
                     AttachHostEvent::Native(NativeAttachEvent::PasteFromClipboard) => {
@@ -5339,6 +5497,16 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
                             observer.set_prepared_viewport_generation(viewport_generation)?;
                         }
                         Event::Resize(columns, rows)
+                    }
+                    AttachHostEvent::Native(NativeAttachEvent::SetPaneZoom { target, scale_millis }) => {
+                        let accepted = if native_identity_is_current(&view_state, terminal, target.identity) {
+                            match super::pane_zoom_native::set_target(&mut view_state, &mut client, target, scale_millis).await {
+                                Ok(accepted) => accepted,
+                                Err(error) => { tracing::warn!(%error, "local pane zoom request rejected"); false }
+                            }
+                        } else { false };
+                        if !accepted { super::pane_zoom_native::settle_dequeue(&view_state); }
+                        break 'host_input;
                     }
                     AttachHostEvent::Native(NativeAttachEvent::Accessibility { epoch, attached_id, viewport_generation, revision, semantic_id, action }) => {
                         let expected = bmux_frontend_runtime::presentation::PresentationIdentity { epoch, revision, attached_id, viewport_generation };
@@ -6998,6 +7166,7 @@ fn handle_pane_runtime_plugin_event(
             session_id,
             pane_id,
         } if session_id == view_state.attached_id => {
+            view_state.pane_zoom.execution_tokens.remove(&pane_id);
             view_state
                 .image_execution_incarnations
                 .insert(pane_id, Uuid::new_v4());
@@ -8875,6 +9044,9 @@ pub fn format_clipboard_service_error(error: &anyhow::Error) -> String {
 }
 
 pub fn selected_attach_text(view_state: &mut AttachViewState) -> Option<String> {
+    if view_state.pane_zoom.selection.is_some() {
+        return super::pane_zoom_native::selected_text(view_state);
+    }
     let (start, end) = attach_selection_bounds(view_state)?;
     extract_attach_text(view_state, start, end)
 }
@@ -10149,6 +10321,7 @@ fn build_retained_frame_plan(
     }
     retained_surfaces.extend(help_surface.iter().cloned());
     retained_surfaces.extend(prompt_surface.iter().cloned());
+    super::pane_zoom_native::prepare_frame(view_state, layout_state, &mut retained_surfaces);
     let graph_damage = replace_retained_surfaces(
         view_state,
         retained_surfaces.clone(),
@@ -10489,6 +10662,14 @@ fn render_attach_frame_to_output(
         )
     };
     if let Err(error) = &result {
+        view_state.pane_zoom.prepared = view_state.pane_zoom.committed.clone();
+        for (pane, buffer) in &mut view_state.pane_buffers {
+            buffer.local_zoom.projected = view_state
+                .pane_zoom
+                .committed
+                .values()
+                .any(|projection| projection.source.pane == *pane);
+        }
         view_state.retained_compositor = previous;
         view_state.plugin_focus = previous_focus;
         view_state
@@ -10501,6 +10682,7 @@ fn render_attach_frame_to_output(
     }
     reconcile_presented_interaction(view_state, &previous);
     view_state.pointer_layout = Some(layout_state.clone());
+    super::pane_zoom_native::commit(view_state, layout_state);
     present_committed_pointer_shape(view_state)?;
     result
 }
@@ -11938,13 +12120,28 @@ fn attach_grid_snapshot_max_rows_for_panes(
         .unwrap_or(ATTACH_GRID_SNAPSHOT_FALLBACK_ROWS_PER_PANE)
 }
 
-async fn hydrate_attach_structured_grid_snapshots(
+pub(super) async fn hydrate_attach_structured_grid_snapshots(
     client: &mut StreamingBmuxClient,
     view_state: &mut AttachViewState,
     pane_ids: Vec<Uuid>,
 ) -> std::result::Result<BTreeSet<Uuid>, ClientError> {
     if pane_ids.is_empty() {
         return Ok(BTreeSet::new());
+    }
+    let mut zoom_execution_tokens = BTreeMap::new();
+    if view_state.pane_zoom.shared.is_some() {
+        for pane in pane_ids.iter().take(256) {
+            if let Ok(Ok(source)) =
+                bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::client::capture_source(
+                    client,
+                    view_state.attached_id,
+                    *pane,
+                )
+                .await
+            {
+                zoom_execution_tokens.insert(*pane, source.execution_token);
+            }
+        }
     }
     let max_rows_per_pane = attach_grid_snapshot_max_rows_for_panes(view_state, &pane_ids);
     let snapshots = match attach_pane_grid_snapshot_state_streaming(
@@ -11985,6 +12182,31 @@ async fn hydrate_attach_structured_grid_snapshots(
         };
         let protocol = stream.grid().protocol_state();
         let alternate_screen = stream.grid().mode() == bmux_terminal_grid::GridMode::Alternate;
+        if view_state.pane_zoom.shared.is_some()
+            && let Ok(Ok(source)) =
+                bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::client::capture_source(
+                    client,
+                    view_state.attached_id,
+                    snapshot.pane_id,
+                )
+                .await
+            && zoom_execution_tokens.get(&snapshot.pane_id) == Some(&source.execution_token)
+        {
+            let old = view_state
+                .pane_zoom
+                .execution_tokens
+                .insert(snapshot.pane_id, source.execution_token);
+            if old.is_some_and(|old| old != source.execution_token) {
+                view_state
+                    .image_execution_incarnations
+                    .insert(snapshot.pane_id, Uuid::new_v4());
+            }
+        } else {
+            view_state
+                .pane_zoom
+                .execution_tokens
+                .remove(&snapshot.pane_id);
+        }
         let buffer = view_state.pane_buffers.entry(snapshot.pane_id).or_default();
         buffer.terminal_grid = stream;
         buffer.protocol_tracker.set_protocol_state(protocol);
@@ -16129,8 +16351,24 @@ pub fn attach_mouse_forward_bytes_for_target(
     // content cell encode to SGR `(1, 1)` regardless of how thick or thin
     // the surrounding decoration is.
     let pane_content_rect = attach_scene_pane_content_rect(view_state, focus_target)?;
-    let shared_event = mouse_event_to_shared(mouse_event);
-    let local_event = attach_mouse::translate_event_to_pane_local(shared_event, pane_content_rect)?;
+    let mut shared_event = mouse_event_to_shared(mouse_event);
+    let zoomed = view_state
+        .pane_zoom
+        .committed
+        .values()
+        .any(|projection| projection.source.pane == focus_target);
+    let local_event = if zoomed {
+        let position = super::pane_zoom_native::execution_at(
+            view_state,
+            super::pane_zoom_native::root_point(view_state, mouse_event.column, mouse_event.row),
+            focus_target,
+        )?;
+        shared_event.column = u16::try_from(position.column).ok()?;
+        shared_event.row = u16::try_from(position.row).ok()?;
+        shared_event
+    } else {
+        attach_mouse::translate_event_to_pane_local(shared_event, pane_content_rect)?
+    };
     attach_mouse::encode_for_protocol(
         local_event,
         attach_mouse::PaneProtocol {
@@ -16453,6 +16691,9 @@ pub fn maybe_begin_attach_mouse_selection_drag(
         return false;
     }
 
+    if super::pane_zoom_native::begin_selection(view_state, focus_target, mouse_event) {
+        return true;
+    }
     let Some(anchor) = attach_mouse_scrollback_position_for_event(
         view_state,
         focus_target,
@@ -16477,6 +16718,15 @@ pub fn handle_attach_mouse_selection_drag_at(
     mouse_event: MouseEvent,
     now: Instant,
 ) -> bool {
+    if super::pane_zoom_native::drag_selection(view_state, mouse_event) {
+        if matches!(mouse_event.kind, MouseEventKind::Up(MouseButton::Left))
+            && view_state.mouse.config.selection_release
+                != bmux_config::MouseSelectionReleaseBehavior::Select
+        {
+            copy_attach_selection_at(view_state, false, now);
+        }
+        return true;
+    }
     match mouse_event.kind {
         MouseEventKind::Drag(MouseButton::Left) => update_attach_mouse_selection_drag_at(
             view_state,
@@ -16807,6 +17057,13 @@ async fn move_attach_floating_pane(
 }
 
 pub fn attach_scene_pane_at(view_state: &AttachViewState, column: u16, row: u16) -> Option<Uuid> {
+    let pane = view_state
+        .retained_compositor
+        .content_cell_at(super::pane_zoom_native::root_point(view_state, column, row))
+        .map(|(pane, _)| pane);
+    if !view_state.pane_zoom.committed.is_empty() {
+        return pane;
+    }
     let layout_state = view_state.cached_layout_state.as_ref()?;
     attach_mouse::pane_at(&layout_state.scene, column, row)
 }

@@ -115,6 +115,7 @@ impl ImagePayloadCache {
 
 /// Single publisher, owned and dropped by one attach view.
 pub struct AttachObserverPublisher {
+    pub(super) pane_zoom_shared: Option<super::pane_zoom_native::SharedZoom>,
     epoch: Uuid,
     revision: u64,
     sender: watch::Sender<Option<Arc<AttachSnapshot>>>,
@@ -157,6 +158,7 @@ pub fn attach_observer_channel() -> (AttachObserverPublisher, AttachObserver) {
     let (sender, receiver) = watch::channel(None);
     (
         AttachObserverPublisher {
+            pane_zoom_shared: None,
             epoch,
             revision: 0,
             sender,
@@ -209,6 +211,11 @@ impl AttachObserver {
 
 impl Drop for AttachObserverPublisher {
     fn drop(&mut self) {
+        if let Some(shared) = &self.pane_zoom_shared
+            && let Ok(mut shared) = shared.lock()
+        {
+            *shared = super::pane_zoom_native::CommittedZoom::default();
+        }
         self.sender.send_replace(None);
     }
 }
@@ -377,7 +384,7 @@ impl AttachObserverPublisher {
             );
             authority.stage(&candidate)?;
             authority
-                .present(candidate, |accepted| delivery(accepted.clone()))
+                .present_with_grid_fragments(candidate, |accepted| delivery(accepted.clone()))
                 .map_err(|error| match error {
                     bmux_frontend_runtime::presentation::DeliveryError::Rejected(reason) => {
                         anyhow::Error::new(reason)
@@ -512,7 +519,11 @@ pub(super) fn deliver_pointer_shape(
         &view.retained_compositor,
         &stream_ends,
         view.pointer_shape,
-    )
+    )?;
+    if let Some(layout) = view.pointer_layout.clone() {
+        super::pane_zoom_native::commit(view, &layout);
+    }
+    Ok(())
 }
 
 pub(super) fn deliver_prepared(
@@ -585,10 +596,26 @@ fn deliver_prepared_inner(
         max_bytes: 32 * 1024 * 1024,
     };
     let metadata = super::metadata::project(&view.retained_compositor, area)?;
+    let zoom_grids = super::pane_zoom_native::fragments(view)?;
+    let mut projected_grids = None;
     let mut prepared = view
         .presentation
         .prepare_repaired_bounded(limits, |cx| {
-            bmux_attach_pipeline::projection::paint(cx, operations);
+            projected_grids = Some(bmux_attach_pipeline::projection::paint_with_grid_fragments(cx, operations));
+            // Root output owns chrome only in winning local-grid clips. Clear
+            // retained uniform text there so scale reset/removal cannot expose
+            // a second, stale copy of the source below the fragment.
+            for grid in &zoom_grids {
+                for clip in grid.visible_clips() {
+                    let area = bmux_tui::paint::LocalRect::new(i32::from(clip.x),i64::from(clip.y),clip.width,clip.height);
+                    cx.occlude(area);
+                    cx.fill(area, " ", bmux_tui::style::Style::new());
+                    // The native attach controller owns source-aware selection;
+                    // flattened root metadata must not pretend to describe this
+                    // fractional local grid. Accessibility remains unavailable.
+                    cx.declare_metadata_availability(area, false, false);
+                }
+            }
             for image in images {
                 cx.push_image(ImageContribution::Present(image));
             }
@@ -599,9 +626,11 @@ fn deliver_prepared_inner(
                 cx.push_selection_scope(scope.clone());
             }
             for fragment in metadata.selection.fragments() {
+                if zoom_grids.iter().flat_map(bmux_tui::grid_fragment::PreparedGridFragment::visible_clips).any(|clip| !clip.intersection(fragment.area).is_empty()) { continue; }
                 cx.push_selection_fragment(fragment.clone());
             }
             for region in metadata.semantics.regions() {
+                if zoom_grids.iter().flat_map(bmux_tui::grid_fragment::PreparedGridFragment::visible_clips).any(|clip| !clip.intersection(region.area).is_empty()) { continue; }
                 cx.push_semantic(region.clone());
             }
             if let Some(cursor) = view.last_cursor_state {
@@ -609,6 +638,13 @@ fn deliver_prepared_inner(
             }
         })
         .map_err(|error| anyhow::anyhow!("presentation admission failed: resource={error:?}, cells={}, cell_limit={}, entry_limit={}, byte_limit={}", usize::from(area.width) * usize::from(area.height), limits.max_cells, limits.max_entries, limits.max_bytes))?;
+    let mut grids = projected_grids
+        .ok_or_else(|| anyhow::anyhow!("root projection missing"))?
+        .map_err(|error| anyhow::anyhow!("root projection rejected: {error}"))?;
+    grids.extend(zoom_grids);
+    prepared
+        .set_grid_fragments(grids, limits)
+        .map_err(|error| anyhow::anyhow!("zoom fragment admission failed: {error:?}"))?;
     prepared
         .set_selection_text(metadata.text)
         .map_err(|error| anyhow::anyhow!("logical source admission failed: {error:?}"))?;
@@ -743,7 +779,7 @@ fn observed_images(
         let Some(content_id) = surface.pane_id else {
             continue;
         };
-        if !surface.visible {
+        if !surface.visible || view.pane_zoom.prepared.contains_key(&surface.id) {
             continue;
         }
         let content = Rect::new(
@@ -805,7 +841,7 @@ fn observed_images(
     feature = "image-kitty",
     feature = "image-iterm2"
 ))]
-fn observed_image_payload(
+pub(super) fn observed_image_payload(
     image: &bmux_attach_image_protocol::AttachPaneImage,
 ) -> Result<bmux_tui::image::ImagePayload, String> {
     use bmux_tui::image::ImagePayload;

@@ -13,7 +13,7 @@ use bmux_tui::{
 use bterm::app::{Application, AttachWorker, PresentationViewport};
 use bterm::configuration::NativeConfiguration;
 use bterm::window::NativeOutput;
-use bterm::zoom::{ZoomAction, ZoomBinding, ZoomModifier};
+use bterm::zoom::{ZoomAction, ZoomBinding, ZoomModifier, ZoomScope};
 use bterm_native_platform::input::{
     InputEvent, KeyEvent, KeyPhase, LogicalKey, Modifiers, PhysicalKey, ScrollDelta,
 };
@@ -495,6 +495,7 @@ impl Harness {
                 native.typography.letter_spacing = 0.5;
                 native.zoom.min_scale = 0.01;
                 native.zoom.bindings.push(ZoomBinding {
+                    scope: ZoomScope::Window,
                     key: "t".into(),
                     modifiers: vec![ZoomModifier::Primary],
                     action: ZoomAction::SetScale(0.01),
@@ -597,6 +598,7 @@ fn main() -> Result<()> {
     native.typography.letter_spacing = 0.5;
     for (key, size) in [("s", 17.75), ("f", 20.25)] {
         native.zoom.bindings.push(ZoomBinding {
+            scope: ZoomScope::Window,
             key: key.into(),
             modifiers: vec![ZoomModifier::Primary],
             action: ZoomAction::SetSize(size),

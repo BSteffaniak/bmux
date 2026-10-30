@@ -15,6 +15,7 @@ pub enum PaintOperation {
     Unsupported,
     /// Specific, content-free rejection or transient deferral.
     Rejected(ProjectionFailure),
+    Grid(std::sync::Arc<bmux_tui::presentation::PreparedGridFragment>),
     Image(std::sync::Arc<bmux_tui::image::ImagePlacement>),
     Text {
         x: u16,
@@ -161,6 +162,33 @@ pub fn record_borrowed(operation: &PaintOperation) {
 
 fn operation_bytes(operation: &PaintOperation) -> usize {
     match operation {
+        PaintOperation::Grid(fragment) => fragment.buffer().cells().iter().fold(
+            fragment
+                .images()
+                .iter()
+                .fold(0_usize, |bytes, image| {
+                    bytes
+                        .saturating_add(operation_bytes(&PaintOperation::Image(
+                            std::sync::Arc::clone(image),
+                        )))
+                        .saturating_add(image.key.as_str().len())
+                })
+                .saturating_add(
+                    fragment
+                        .buffer()
+                        .cells()
+                        .len()
+                        .saturating_mul(std::mem::size_of::<bmux_tui::buffer::Cell>())
+                        .saturating_add(fragment.id().len())
+                        .saturating_add(
+                            fragment
+                                .visible_clips()
+                                .len()
+                                .saturating_mul(std::mem::size_of::<Rect>()),
+                        ),
+                ),
+            |bytes, cell| bytes.saturating_add(cell.symbol.len()),
+        ),
         PaintOperation::Text { text, .. } => text.len(),
         PaintOperation::Image(image) => match &image.payload {
             bmux_tui::image::ImagePayload::Png { bytes, .. }
@@ -259,10 +287,49 @@ pub fn capturing() -> bool {
     CAPTURE.with(|slot| slot.borrow().is_some())
 }
 
-/// Replay output operations through the authoritative clipped paint context.
-pub fn paint(cx: &mut PaintCx<'_, '_>, operations: &[PaintOperation]) {
+/// Replay uniform output, rejecting local grids before painting anything.
+/// # Errors
+/// Returns unsupported for local-grid output; use `paint_with_grid_fragments`.
+pub fn paint(
+    cx: &mut PaintCx<'_, '_>,
+    operations: &[PaintOperation],
+) -> Result<(), ProjectionFailure> {
+    if operations
+        .iter()
+        .any(|operation| matches!(operation, PaintOperation::Grid(_)))
+    {
+        return Err(ProjectionFailure::Unsupported {
+            reason: "backend requires uniform grid",
+        });
+    }
+    paint_with_grid_fragments(cx, operations).map(|_| ())
+}
+
+/// Replay root operations and return retained grids for bounded frame admission.
+///
+/// The caller must install the returned grids with `set_grid_fragments` before
+/// output; silently discarding them is not a supported backend fallback.
+/// # Errors
+/// Returns captured rejection before painting anything.
+pub fn paint_with_grid_fragments(
+    cx: &mut PaintCx<'_, '_>,
+    operations: &[PaintOperation],
+) -> Result<Vec<bmux_tui::presentation::PreparedGridFragment>, ProjectionFailure> {
     for operation in operations {
         match operation {
+            PaintOperation::Rejected(reason) => return Err(reason.clone()),
+            PaintOperation::Unsupported => {
+                return Err(ProjectionFailure::Unsupported {
+                    reason: "legacy imperative capture",
+                });
+            }
+            _ => {}
+        }
+    }
+    let mut fragments = Vec::new();
+    for operation in operations {
+        match operation {
+            PaintOperation::Grid(fragment) => fragments.push(fragment.as_ref().clone()),
             PaintOperation::Unsupported | PaintOperation::Rejected(_) => {}
             PaintOperation::Image(image) => {
                 cx.push_image(bmux_tui::image::ImageContribution::Present(
@@ -281,6 +348,239 @@ pub fn paint(cx: &mut PaintCx<'_, '_>, operations: &[PaintOperation]) {
             }
         }
     }
+    Ok(fragments)
+}
+
+/// Lower only original retained paint, never flattened root cells.
+///
+/// Each span is sparse and retains its optional background. Clips are applied again against
+/// the fragment's final winning clips by the backend.
+///
+/// # Errors
+/// Rejects unsupported glyph geometry and exhausted output budgets before output.
+// This is one ordered lowering pass; keeping the RenderOp match next to the
+// shared budgeted row emitter makes sparse paint semantics auditable.
+#[allow(clippy::too_many_lines)]
+pub fn prepare_content_overlays(
+    plan: &crate::compositor::ContentPaintPlan,
+) -> Result<Vec<bmux_tui::presentation::PreparedGridOverlay>, ProjectionFailure> {
+    use bmux_plugin::RenderOp;
+    use bmux_tui::{buffer::Buffer, presentation::PreparedGridOverlay};
+    if plan.overlays.len() > 4096 {
+        return Err(ProjectionFailure::Budget {
+            resource: "overlay operations",
+            used: plan.overlays.len(),
+            limit: 4096,
+        });
+    }
+    let mut input_work = 0_usize;
+    for overlay in &plan.overlays {
+        let count = match &overlay.operation {
+            RenderOp::StyledText { spans, .. } => spans.len(),
+            RenderOp::CellGrid { rows, .. } => {
+                if rows.len() > 1_000_000 {
+                    return Err(ProjectionFailure::Budget {
+                        resource: "overlay input rows",
+                        used: rows.len(),
+                        limit: 1_000_000,
+                    });
+                }
+                rows.iter()
+                    .fold(rows.len(), |n, row| n.saturating_add(row.len()))
+            }
+            _ => 1,
+        };
+        input_work = input_work.saturating_add(count);
+        if input_work > 1_000_000 {
+            return Err(ProjectionFailure::Budget {
+                resource: "overlay input work",
+                used: input_work,
+                limit: 1_000_000,
+            });
+        }
+    }
+    let mut output = Vec::new();
+    let mut cells = 0_usize;
+    let mut bytes = 0_usize;
+    let mut work = 0_usize;
+    for overlay in &plan.overlays {
+        let clip = Rect::new(
+            overlay.clip.x,
+            overlay.clip.y,
+            overlay.clip.w,
+            overlay.clip.h,
+        );
+        let mut row =
+            |x: u16, y: u16, text: &str, value: RenderStyle| -> Result<(), ProjectionFailure> {
+                if text.len() > 16 * 1024 * 1024 {
+                    return Err(ProjectionFailure::Budget {
+                        resource: "overlay text bytes",
+                        used: text.len(),
+                        limit: 16 * 1024 * 1024,
+                    });
+                }
+                bytes = bytes.saturating_add(text.len());
+                if bytes > 16 * 1024 * 1024 {
+                    return Err(ProjectionFailure::Budget {
+                        resource: "overlay text bytes",
+                        used: bytes,
+                        limit: 16 * 1024 * 1024,
+                    });
+                }
+                if text.chars().any(char::is_control) {
+                    return Err(ProjectionFailure::Unsupported {
+                        reason: "control character in original overlay paint",
+                    });
+                }
+                work = work.saturating_add(1);
+                let width = bmux_plugin::render_text_width_u16(text);
+                let area = Rect::new(x, y, width.min(u16::MAX - x), 1);
+                let effective = area.intersection(clip);
+                if work > 1_000_000 {
+                    return Err(ProjectionFailure::Budget {
+                        resource: "overlay work",
+                        used: work,
+                        limit: 1_000_000,
+                    });
+                }
+                if effective.is_empty() {
+                    return Ok(());
+                }
+                cells = cells.saturating_add(usize::from(area.width));
+                if cells > 1_000_000 || bytes > 16 * 1024 * 1024 || output.len() >= 4096 {
+                    return Err(ProjectionFailure::Budget {
+                        resource: "overlay cells/bytes/spans",
+                        used: cells.max(bytes).max(output.len()),
+                        limit: 1_000_000,
+                    });
+                }
+                let mut buffer = Buffer::empty(area);
+                buffer.write_line(
+                    area,
+                    &Line::from_spans(vec![Span::styled(text, style(value))]),
+                );
+                let prepared = PreparedGridOverlay::new(
+                    std::sync::Arc::new(buffer),
+                    effective,
+                    value.bg.is_some() || value.reverse,
+                )
+                .ok_or(ProjectionFailure::Unsupported {
+                    reason: "overlay geometry",
+                })?;
+                output.push(prepared);
+                Ok(())
+            };
+        match &overlay.operation {
+            RenderOp::TextRun { x, y, text, style } => row(*x, *y, text, *style)?,
+            RenderOp::StyledText { x, y, spans } => {
+                let mut x = *x;
+                for span in spans {
+                    row(x, *y, &span.text, span.style)?;
+                    x = x.saturating_add(bmux_plugin::render_text_width_u16(&span.text));
+                }
+            }
+            RenderOp::ClearRect { rect, style }
+            | RenderOp::FillRect {
+                rect,
+                ch: ' ',
+                style,
+            } => {
+                let text = " ".repeat(usize::from(rect.w));
+                for y in rect.y..rect.bottom() {
+                    row(rect.x, y, &text, *style)?;
+                }
+            }
+            RenderOp::EraseRowSegment { x, y, width, style } => {
+                row(*x, *y, &" ".repeat(usize::from(*width)), *style)?;
+            }
+            RenderOp::FillRect { rect, ch, style } => {
+                if bmux_plugin::render_text_width_u16(&ch.to_string()) != 1 {
+                    return Err(ProjectionFailure::Unsupported {
+                        reason: "non-single-cell overlay fill",
+                    });
+                }
+                let text = ch.to_string().repeat(usize::from(rect.w));
+                for y in rect.y..rect.bottom() {
+                    row(rect.x, y, &text, *style)?;
+                }
+            }
+            RenderOp::Border {
+                rect,
+                glyphs,
+                style,
+            } => {
+                let glyph = [
+                    glyphs.horizontal,
+                    glyphs.vertical,
+                    glyphs.top_left,
+                    glyphs.top_right,
+                    glyphs.bottom_left,
+                    glyphs.bottom_right,
+                ];
+                if glyph
+                    .iter()
+                    .any(|ch| bmux_plugin::render_text_width_u16(&ch.to_string()) != 1)
+                {
+                    return Err(ProjectionFailure::Unsupported {
+                        reason: "non-single-cell overlay border",
+                    });
+                }
+                if rect.w == 0 || rect.h == 0 {
+                    continue;
+                }
+                for y in rect.y..rect.bottom() {
+                    if rect.h == 1 {
+                        row(
+                            rect.x,
+                            y,
+                            &glyphs.horizontal.to_string().repeat(usize::from(rect.w)),
+                            *style,
+                        )?;
+                    } else if rect.w == 1 {
+                        row(rect.x, y, &glyphs.vertical.to_string(), *style)?;
+                    } else if y == rect.y || y == rect.bottom() - 1 {
+                        let (left, right) = if y == rect.y {
+                            (glyphs.top_left, glyphs.top_right)
+                        } else {
+                            (glyphs.bottom_left, glyphs.bottom_right)
+                        };
+                        row(
+                            rect.x,
+                            y,
+                            &format!(
+                                "{left}{}{right}",
+                                glyphs
+                                    .horizontal
+                                    .to_string()
+                                    .repeat(usize::from(rect.w - 2))
+                            ),
+                            *style,
+                        )?;
+                    } else {
+                        row(rect.x, y, &glyphs.vertical.to_string(), *style)?;
+                        row(rect.right() - 1, y, &glyphs.vertical.to_string(), *style)?;
+                    }
+                }
+            }
+            RenderOp::CellGrid { x, y, rows } => {
+                for (dy, cells) in rows.iter().enumerate() {
+                    let Some(y) = u16::try_from(dy).ok().and_then(|dy| y.checked_add(dy)) else {
+                        break;
+                    };
+                    for (dx, cell) in cells.iter().enumerate() {
+                        let Some(x) = u16::try_from(dx).ok().and_then(|dx| x.checked_add(dx))
+                        else {
+                            break;
+                        };
+                        if let Some(ch) = cell.ch {
+                            row(x, y, &ch.to_string(), cell.style)?;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(output)
 }
 
 /// Preserve all declarative terminal style attributes without terminal encoding.
@@ -338,6 +638,199 @@ const fn render_color(value: RenderColor) -> Color {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn original_overlay_spans_are_sparse_clipped_and_reverse_is_explicit() {
+        use crate::{
+            compositor::{ContentPaintOverlay, ContentPaintPlan},
+            render::DamageRect,
+        };
+        let make = |operation| ContentPaintOverlay {
+            surface_id: uuid::Uuid::nil(),
+            owner: None,
+            revision: Some(7),
+            operation_index: 0,
+            operation,
+            clip: DamageRect::new(2, 0, 2, 1),
+        };
+        let plan = ContentPaintPlan {
+            clips: vec![DamageRect::new(0, 0, 6, 2)],
+            overlays: vec![
+                make(bmux_plugin::RenderOp::text_run(
+                    1,
+                    0,
+                    "界x",
+                    RenderStyle::new(),
+                )),
+                make(bmux_plugin::RenderOp::text_run(
+                    2,
+                    0,
+                    "r",
+                    RenderStyle {
+                        reverse: true,
+                        ..RenderStyle::new()
+                    },
+                )),
+            ],
+        };
+        let spans = prepare_content_overlays(&plan).unwrap();
+        assert_eq!(spans.len(), 2);
+        assert_eq!(spans[0].buffer().area(), Rect::new(1, 0, 3, 1));
+        assert_eq!(spans[0].clip(), Rect::new(2, 0, 2, 1));
+        assert_eq!(
+            spans[0]
+                .buffer()
+                .get(bmux_tui::geometry::Point::new(1, 0))
+                .unwrap()
+                .symbol,
+            "界"
+        );
+        assert!(!spans[0].paint_background());
+        assert!(spans[1].paint_background());
+        assert!(
+            spans[1].buffer().cells()[0]
+                .style
+                .modifiers
+                .contains(Modifier::REVERSED)
+        );
+    }
+
+    #[test]
+    fn sparse_cell_grid_does_not_paint_holes_and_budgets_reject() {
+        use crate::{
+            compositor::{ContentPaintOverlay, ContentPaintPlan},
+            render::DamageRect,
+        };
+        let mut plan = ContentPaintPlan {
+            clips: vec![],
+            overlays: vec![ContentPaintOverlay {
+                surface_id: uuid::Uuid::nil(),
+                owner: None,
+                revision: None,
+                operation_index: 0,
+                operation: bmux_plugin::RenderOp::CellGrid {
+                    x: 0,
+                    y: 0,
+                    rows: vec![vec![
+                        bmux_plugin::RenderCell::sparse(RenderStyle::new()),
+                        bmux_plugin::RenderCell::new('x', RenderStyle::new()),
+                    ]],
+                },
+                clip: DamageRect::new(0, 0, 2, 1),
+            }],
+        };
+        let spans = prepare_content_overlays(&plan).unwrap();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].buffer().area(), Rect::new(1, 0, 1, 1));
+        plan.overlays[0].operation = bmux_plugin::RenderOp::text_run(
+            0,
+            0,
+            "x".repeat(16 * 1024 * 1024 + 1),
+            RenderStyle::new(),
+        );
+        assert!(matches!(
+            prepare_content_overlays(&plan),
+            Err(ProjectionFailure::Budget { .. })
+        ));
+    }
+
+    #[test]
+    fn fill_and_border_preserve_original_sparse_interior() {
+        use crate::{
+            compositor::{ContentPaintOverlay, ContentPaintPlan},
+            render::DamageRect,
+        };
+        let plan = ContentPaintPlan {
+            clips: vec![DamageRect::new(0, 0, 4, 3)],
+            overlays: vec![ContentPaintOverlay {
+                surface_id: uuid::Uuid::nil(),
+                owner: None,
+                revision: None,
+                operation_index: 0,
+                operation: bmux_plugin::RenderOp::Border {
+                    rect: bmux_plugin::ExtensionRect {
+                        x: 0,
+                        y: 0,
+                        w: 4,
+                        h: 3,
+                    },
+                    glyphs: bmux_plugin::BorderGlyphs::ascii(),
+                    style: RenderStyle::new(),
+                },
+                clip: DamageRect::new(0, 0, 4, 3),
+            }],
+        };
+        let spans = prepare_content_overlays(&plan).unwrap();
+        assert_eq!(spans.len(), 4);
+        assert_eq!(spans[0].buffer().row_symbols(0).unwrap(), "+--+");
+        assert_eq!(spans[1].buffer().area(), Rect::new(0, 1, 1, 1));
+        assert_eq!(spans[2].buffer().area(), Rect::new(3, 1, 1, 1));
+        assert!(spans.iter().all(|span| !span.paint_background()));
+        let mut fill = plan;
+        fill.overlays[0].operation = bmux_plugin::RenderOp::FillRect {
+            rect: bmux_plugin::ExtensionRect {
+                x: 0,
+                y: 0,
+                w: 4,
+                h: 3,
+            },
+            ch: ' ',
+            style: RenderStyle::new().rgb_background(12, 34, 56),
+        };
+        let spans = prepare_content_overlays(&fill).unwrap();
+        assert_eq!(spans.len(), 3);
+        assert!(
+            spans
+                .iter()
+                .all(bmux_tui::presentation::PreparedGridOverlay::paint_background)
+        );
+        fill.overlays[0].operation = bmux_plugin::RenderOp::FillRect {
+            rect: bmux_plugin::ExtensionRect {
+                x: 0,
+                y: 0,
+                w: 4,
+                h: 3,
+            },
+            ch: '界',
+            style: RenderStyle::new(),
+        };
+        assert!(matches!(
+            prepare_content_overlays(&fill),
+            Err(ProjectionFailure::Unsupported { .. })
+        ));
+    }
+
+    #[test]
+    fn capture_grids_require_explicit_retained_admission() {
+        use bmux_tui::{
+            buffer::Buffer,
+            damage::Damage,
+            geometry::Point,
+            presentation::{GridTransform, PreparedGridFragment, PresentationState},
+        };
+        let fragment = PreparedGridFragment::new(
+            "content",
+            std::sync::Arc::new(Buffer::empty(Rect::new(0, 0, 2, 1))),
+            GridTransform::new(Point::new(0, 0), 500).unwrap(),
+            vec![Rect::new(0, 0, 1, 1)],
+        )
+        .unwrap();
+        let ((), operations) =
+            capture_neutral(|| record(PaintOperation::Grid(std::sync::Arc::new(fragment.clone()))));
+        let state = PresentationState::new(Rect::new(0, 0, 2, 1));
+        state
+            .prepare(Damage::Full, |cx| {
+                assert!(matches!(
+                    paint(cx, &operations),
+                    Err(ProjectionFailure::Unsupported { .. })
+                ));
+                assert_eq!(
+                    paint_with_grid_fragments(cx, &operations).unwrap(),
+                    vec![fragment]
+                );
+            })
+            .unwrap();
+    }
 
     #[test]
     fn dense_capture_coalesces_runs_and_shared_images_are_admitted_once() {

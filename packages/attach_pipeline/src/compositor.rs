@@ -64,6 +64,24 @@ impl PartialEq<DamageRect> for RetainedInteractiveRegion {
     }
 }
 
+/// Original retained paint above one local content grid. This is output data,
+/// not a second scene: ordering and clipping come exclusively from the compositor.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContentPaintOverlay {
+    pub surface_id: Uuid,
+    pub owner: Option<bmux_plugin::surface::PluginSurfaceId>,
+    pub revision: Option<u64>,
+    pub operation_index: usize,
+    pub operation: RenderOp,
+    pub clip: DamageRect,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContentPaintPlan {
+    pub clips: Vec<DamageRect>,
+    pub overlays: Vec<ContentPaintOverlay>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RetainedSurface {
     pub id: Uuid,
@@ -74,6 +92,8 @@ pub struct RetainedSurface {
     /// Absolute content bounds, independent of paint and interaction geometry.
     /// None means the whole surface; an empty rectangle means no content area.
     pub content_rect: Option<DamageRect>,
+    /// Local cell geometry for content only; allocation and chrome remain unchanged.
+    pub content_transform: Option<bmux_tui::grid_fragment::GridTransform>,
     /// Whether retained pointer intent may target this surface. Noninteractive
     /// surfaces still paint and occlude lower surfaces.
     pub accepts_input: bool,
@@ -128,6 +148,7 @@ impl RetainedSurface {
             metadata: None,
             rect,
             content_rect: None,
+            content_transform: None,
             accepts_input: true,
             layer,
             z,
@@ -145,6 +166,16 @@ impl RetainedSurface {
     #[must_use]
     pub const fn with_content_rect(mut self, content_rect: DamageRect) -> Self {
         self.content_rect = Some(content_rect);
+        self
+    }
+
+    /// Set content-only geometry without changing this surface's allocation.
+    #[must_use]
+    pub const fn with_content_transform(
+        mut self,
+        transform: bmux_tui::grid_fragment::GridTransform,
+    ) -> Self {
+        self.content_transform = Some(transform);
         self
     }
 
@@ -1050,6 +1081,261 @@ impl RetainedCompositor {
         None
     }
 
+    /// Resolve content through retained clipping and z-order before inverting its
+    /// transform. Fractional root coordinates must not be floored first: at zoom
+    /// below one, several local cells can occupy a single root cell.
+    #[must_use]
+    pub fn content_cell_at(&self, point: [f64; 2]) -> Option<(Uuid, [f64; 2])> {
+        if !point.iter().all(|value| value.is_finite() && *value >= 0.0) {
+            return None;
+        }
+        let contains = |rect: DamageRect| {
+            point[0] >= f64::from(rect.x)
+                && point[1] >= f64::from(rect.y)
+                && point[0] < f64::from(rect.x) + f64::from(rect.w)
+                && point[1] < f64::from(rect.y) + f64::from(rect.h)
+        };
+        let ordered = self.ordered_surfaces();
+        let modal_floor = ordered
+            .iter()
+            .rev()
+            .find(|surface| surface.modal && surface.paint_rect().is_some())
+            .map(|surface| surface.z_key());
+        for surface in ordered.into_iter().rev() {
+            if modal_floor.is_some_and(|floor| surface.z_key() < floor) {
+                return None;
+            }
+            let Some(bounds) = surface.paint_rect() else {
+                continue;
+            };
+            if !contains(bounds) {
+                continue;
+            }
+            if let RetainedSurfacePayload::Content { content_id } = surface.payload
+                && surface.accepts_input
+                && contains(surface.content_rect.unwrap_or(surface.rect))
+            {
+                let local = if let Some(transform) = surface.content_transform {
+                    transform.unproject(point)?
+                } else {
+                    let content = surface.content_rect.unwrap_or(surface.rect);
+                    [
+                        point[0] - f64::from(content.x),
+                        point[1] - f64::from(content.y),
+                    ]
+                };
+                return Some((content_id, local));
+            }
+            if surface.opaque
+                || surface.modal
+                || !surface.interactive_regions.is_empty()
+                || matches!(&surface.payload, RetainedSurfacePayload::RenderOps(operations)
+                    if operations.iter().any(|operation| contains(render_op_damage_bounds(operation))))
+            {
+                return None;
+            }
+        }
+        None
+    }
+
+    /// Original ordered paint above local content, with bounded subtraction and
+    /// payload work. Unknown intersecting paint is explicitly unsupported.
+    // Keep ordered admission and subtraction together: separating the payload
+    // charge from its clone makes this resource boundary harder to audit.
+    #[allow(clippy::too_many_lines)]
+    #[must_use]
+    pub fn content_paint_plan(&self, id: Uuid, limit: usize) -> Option<ContentPaintPlan> {
+        if self.surfaces.len() > 4096 {
+            return None;
+        }
+        let limit = limit.min(4096);
+        let source = self.surfaces.get(&id)?;
+        if !matches!(source.payload, RetainedSurfacePayload::Content { .. }) || limit == 0 {
+            return None;
+        }
+        let content = source.content_rect.unwrap_or(source.rect);
+        let content_clip = intersect_rects(content, source.paint_rect()?)?;
+        let mut clips = vec![content_clip];
+        let mut overlays = Vec::new();
+        let mut work = 0_usize;
+        let mut bytes = 0_usize;
+        for surface in self.ordered_surfaces() {
+            if surface.z_key() <= source.z_key() {
+                continue;
+            }
+            let Some(bounds) = surface.paint_rect() else {
+                continue;
+            };
+            if surface.opaque {
+                let mut next = Vec::new();
+                for clip in clips {
+                    work = work.checked_add(1)?;
+                    if work > 1_000_000 {
+                        return None;
+                    }
+                    next.extend(
+                        crate::reconcile::subtract_damage_rect(clip, bounds)
+                            .into_iter()
+                            .flatten(),
+                    );
+                    if next.len() > limit {
+                        return None;
+                    }
+                }
+                clips = next;
+                continue;
+            }
+            if !clips
+                .iter()
+                .any(|clip| intersect_rects(*clip, bounds).is_some())
+            {
+                continue;
+            }
+            let RetainedSurfacePayload::RenderOps(operations) = &surface.payload else {
+                return None;
+            };
+            if operations.len() > 4096 {
+                return None;
+            }
+            for (operation_index, operation) in operations.iter().enumerate() {
+                match operation {
+                    RenderOp::StyledText { spans, .. } if spans.len() > 4096 => return None,
+                    RenderOp::CellGrid { rows, .. } => {
+                        if rows.len() > 4096 {
+                            return None;
+                        }
+                        let count = rows
+                            .iter()
+                            .try_fold(0_usize, |n, row| n.checked_add(row.len()))?;
+                        work = work.checked_add(count)?;
+                        if work > 1_000_000 {
+                            return None;
+                        }
+                    }
+                    _ => {}
+                }
+                work = work.checked_add(clips.len().max(1))?;
+                if work > 1_000_000 {
+                    return None;
+                }
+                // Charge original payload before cloning; geometric bounds alone
+                // do not bound combining sequences or empty grid rows.
+                let payload = match operation {
+                    RenderOp::TextRun { text, .. } => text.len(),
+                    RenderOp::StyledText { spans, .. } => {
+                        spans.iter().try_fold(0_usize, |n, span| {
+                            n.checked_add(span.text.len())
+                                .and_then(|n| n.checked_add(std::mem::size_of_val(span)))
+                        })?
+                    }
+                    RenderOp::CellGrid { rows, .. } => {
+                        rows.iter().try_fold(0_usize, |n, row| {
+                            row.iter()
+                                .try_fold(n.checked_add(std::mem::size_of_val(row))?, |n, cell| {
+                                    n.checked_add(std::mem::size_of_val(cell))
+                                })
+                        })?
+                    }
+                    _ => std::mem::size_of_val(operation),
+                };
+                bytes = bytes.checked_add(payload)?;
+                if bytes > 16 * 1024 * 1024 || overlays.len() >= limit.min(4096) {
+                    return None;
+                }
+                let paint_bounds = match operation {
+                    // A grid's final character can be wide; retain its original
+                    // advance rather than clipping it to the row's entry count.
+                    RenderOp::CellGrid { .. } => bounds,
+                    _ => render_op_damage_bounds(operation),
+                };
+                let Some(clip) = intersect_rects(paint_bounds, bounds)
+                    .and_then(|clip| intersect_rects(clip, content_clip))
+                else {
+                    continue;
+                };
+                if !clips
+                    .iter()
+                    .any(|visible| intersect_rects(*visible, clip).is_some())
+                {
+                    continue;
+                }
+                overlays.push(ContentPaintOverlay {
+                    surface_id: surface.id,
+                    owner: surface.owner.clone(),
+                    revision: surface.revision,
+                    operation_index,
+                    operation: operation.clone(),
+                    clip,
+                });
+            }
+        }
+        Some(ContentPaintPlan { clips, overlays })
+    }
+
+    /// Winning content clips from this compositor, suitable for local-grid paint.
+    /// A bounded caller can reject fragmentation instead of losing occlusion.
+    #[must_use]
+    pub fn visible_content_clips(&self, id: Uuid, limit: usize) -> Option<Vec<DamageRect>> {
+        let source = self.surfaces.get(&id)?;
+        let content = source.content_rect.unwrap_or(source.rect);
+        let mut clips = vec![intersect_rects(content, source.paint_rect()?)?];
+        let mut work = 0_usize;
+        for surface in self.ordered_surfaces() {
+            if surface.z_key() <= source.z_key() {
+                continue;
+            }
+            let Some(bounds) = surface.paint_rect() else {
+                continue;
+            };
+            let occluders = if surface.opaque {
+                vec![bounds]
+            } else if let RetainedSurfacePayload::RenderOps(operations) = &surface.payload {
+                // Flattened root cells have lost transparent-paint provenance.
+                // Reject overlap rather than cover locally reflowed content with
+                // root cells containing the old underlying source presentation.
+                if operations.len() > 4096
+                    || operations.iter().any(|operation| {
+                        intersect_rects(render_op_damage_bounds(operation), bounds).is_some_and(
+                            |paint| {
+                                clips
+                                    .iter()
+                                    .any(|clip| intersect_rects(*clip, paint).is_some())
+                            },
+                        )
+                    })
+                {
+                    return None;
+                }
+                continue;
+            } else {
+                // Unknown paint cannot be safely placed below a local grid.
+                if intersect_rects(content, bounds).is_some() {
+                    return None;
+                }
+                continue;
+            };
+            for occluder in occluders {
+                let mut next = Vec::new();
+                for rect in clips {
+                    work = work.checked_add(1)?;
+                    if work > 1_000_000 {
+                        return None;
+                    }
+                    next.extend(
+                        crate::reconcile::subtract_damage_rect(rect, occluder)
+                            .into_iter()
+                            .flatten(),
+                    );
+                    if next.len() > limit {
+                        return None;
+                    }
+                }
+                clips = next;
+            }
+        }
+        (clips.len() <= limit).then_some(clips)
+    }
+
     #[must_use]
     pub fn hit_test(&self, x: u16, y: u16) -> Option<RetainedSurfaceHit> {
         let ordered = self.ordered_surfaces();
@@ -1636,6 +1922,7 @@ fn retained_surface_metadata_equal(previous: &RetainedSurface, next: &RetainedSu
         && previous.opacity == next.opacity
         && previous.clip_rect == next.clip_rect
         && previous.content_rect == next.content_rect
+        && previous.content_transform == next.content_transform
         && previous.accepts_input == next.accepts_input
         && previous.interactive_regions == next.interactive_regions
 }
@@ -1821,6 +2108,199 @@ const fn intersect_rects(a: DamageRect, b: DamageRect) -> Option<DamageRect> {
             x2.saturating_sub(x1),
             y2.saturating_sub(y1),
         ))
+    }
+}
+
+#[cfg(test)]
+mod content_transform_tests {
+    use super::*;
+    use bmux_tui::{geometry::Point, grid_fragment::GridTransform};
+
+    fn scene() -> (RetainedCompositor, Uuid) {
+        let id = Uuid::from_u128(42);
+        let surface = RetainedSurface::with_payload(
+            id,
+            DamageRect::new(2, 2, 10, 8),
+            0,
+            0,
+            RetainedOpacity::Opaque,
+            RetainedSurfacePayload::Content { content_id: id },
+        )
+        .with_content_rect(DamageRect::new(3, 3, 8, 6))
+        .with_content_transform(GridTransform::new(Point::new(3, 3), 500).unwrap());
+        let mut compositor = RetainedCompositor::new();
+        compositor.replace_surfaces(
+            vec![surface],
+            DamageRect::new(0, 0, 20, 20),
+            DamageCoalescingPolicy::default(),
+        );
+        (compositor, id)
+    }
+
+    #[test]
+    fn fractional_content_mapping_preserves_subcell_precision() {
+        let (compositor, id) = scene();
+        assert_eq!(
+            compositor.content_cell_at([3.75, 3.25]),
+            Some((id, [1.5, 0.5]))
+        );
+        assert_eq!(compositor.content_cell_at([2.5, 3.0]), None);
+        assert_eq!(compositor.content_cell_at([11.0, 3.0]), None);
+        assert_eq!(compositor.content_cell_at([f64::NAN, 3.0]), None);
+    }
+
+    #[test]
+    fn modal_excludes_background_zoom_even_outside_its_rectangle() {
+        let (mut compositor, _) = scene();
+        let mut surfaces = compositor
+            .ordered_surfaces()
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut modal = RetainedSurface::new(
+            Uuid::from_u128(44),
+            DamageRect::new(15, 15, 2, 2),
+            2,
+            0,
+            true,
+            Vec::new(),
+        );
+        modal.modal = true;
+        surfaces.push(modal);
+        compositor.replace_surfaces(
+            surfaces,
+            DamageRect::new(0, 0, 20, 20),
+            DamageCoalescingPolicy::default(),
+        );
+        assert_eq!(compositor.content_cell_at([3.5, 3.5]), None);
+    }
+
+    #[test]
+    fn transparent_overlay_plan_keeps_original_order_and_provenance() {
+        let (mut compositor, id) = scene();
+        let mut surfaces = compositor
+            .ordered_surfaces()
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        let first = RenderOp::text_run(4, 4, "first", bmux_plugin::RenderStyle::new());
+        let second = RenderOp::text_run(5, 4, "界", bmux_plugin::RenderStyle::new());
+        surfaces.push(
+            RetainedSurface::new(
+                Uuid::from_u128(46),
+                DamageRect::new(3, 3, 8, 6),
+                2,
+                0,
+                false,
+                vec![second.clone()],
+            )
+            .with_revision(Some(9)),
+        );
+        surfaces.push(RetainedSurface::new(
+            Uuid::from_u128(45),
+            DamageRect::new(3, 3, 8, 6),
+            1,
+            0,
+            false,
+            vec![first.clone()],
+        ));
+        compositor.replace_surfaces(
+            surfaces,
+            DamageRect::new(0, 0, 20, 20),
+            DamageCoalescingPolicy::default(),
+        );
+        let plan = compositor.content_paint_plan(id, 8).unwrap();
+        assert_eq!(plan.overlays.len(), 2);
+        assert_eq!(plan.overlays[0].operation, first);
+        assert_eq!(plan.overlays[1].operation, second);
+        assert_eq!(plan.overlays[1].revision, Some(9));
+        assert_eq!(plan.overlays[1].surface_id, Uuid::from_u128(46));
+        assert_eq!(plan.overlays[1].operation_index, 0);
+        assert_eq!(plan.clips, vec![DamageRect::new(3, 3, 8, 6)]);
+        assert!(compositor.content_paint_plan(id, 1).is_none());
+    }
+
+    #[test]
+    fn unknown_intersecting_paint_has_no_local_plan() {
+        let (mut compositor, id) = scene();
+        let mut surfaces = compositor
+            .ordered_surfaces()
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        surfaces.push(RetainedSurface::with_payload(
+            Uuid::from_u128(47),
+            DamageRect::new(3, 3, 8, 6),
+            1,
+            0,
+            RetainedOpacity::Transparent,
+            RetainedSurfacePayload::Unknown,
+        ));
+        compositor.replace_surfaces(
+            surfaces,
+            DamageRect::new(0, 0, 20, 20),
+            DamageCoalescingPolicy::default(),
+        );
+        assert!(compositor.content_paint_plan(id, 8).is_none());
+        assert!(compositor.content_paint_plan(id, 0).is_none());
+    }
+
+    #[test]
+    fn transparent_overlay_rejects_lost_root_paint_provenance() {
+        let (mut compositor, id) = scene();
+        let mut surfaces = compositor
+            .ordered_surfaces()
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        surfaces.push(RetainedSurface::new(
+            Uuid::from_u128(45),
+            DamageRect::new(3, 3, 8, 6),
+            1,
+            0,
+            false,
+            vec![RenderOp::text_run(
+                5,
+                4,
+                "hi",
+                bmux_plugin::RenderStyle::new(),
+            )],
+        ));
+        compositor.replace_surfaces(
+            surfaces,
+            DamageRect::new(0, 0, 20, 20),
+            DamageCoalescingPolicy::default(),
+        );
+        assert_eq!(compositor.visible_content_clips(id, 8), None);
+    }
+
+    #[test]
+    fn content_paint_and_inverse_mapping_obey_same_occlusion() {
+        let (mut compositor, id) = scene();
+        let mut surfaces = compositor
+            .ordered_surfaces()
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        surfaces.push(RetainedSurface::new(
+            Uuid::from_u128(43),
+            DamageRect::new(6, 3, 5, 6),
+            1,
+            0,
+            true,
+            Vec::new(),
+        ));
+        compositor.replace_surfaces(
+            surfaces,
+            DamageRect::new(0, 0, 20, 20),
+            DamageCoalescingPolicy::default(),
+        );
+        assert_eq!(compositor.content_cell_at([6.25, 3.25]), None);
+        assert_eq!(
+            compositor.visible_content_clips(id, 4),
+            Some(vec![DamageRect::new(3, 3, 3, 6)])
+        );
+        assert_eq!(compositor.visible_content_clips(id, 0), None);
     }
 }
 

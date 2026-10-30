@@ -390,6 +390,7 @@ impl<W: Write> Terminal<W> {
         let writer = &mut self.writer;
         self.state
             .present_prepared(prepared, |prepared, previous| {
+                prepared.require_uniform_grid().map_err(io::Error::other)?;
                 let intent = resolve_pointer_intent(
                     prepared.hits(),
                     position,
@@ -611,6 +612,43 @@ mod tests {
     use crate::semantic::SemanticRegion;
     use crate::style::Style;
     use std::io::{self, Write};
+
+    #[test]
+    fn uniform_terminal_rejects_fragments_before_output_or_hooks() {
+        use crate::buffer::Buffer;
+        use crate::presentation::{GridTransform, PreparedGridFragment, PresentationLimits};
+        use std::sync::Arc;
+        let mut terminal = Terminal::new(Vec::new(), Rect::new(0, 0, 2, 1));
+        let mut prepared = terminal.prepare_frame(Damage::Full, |_| {}).unwrap();
+        prepared
+            .set_grid_fragments(
+                vec![
+                    PreparedGridFragment::new(
+                        "grid",
+                        Arc::new(Buffer::empty(Rect::new(0, 0, 1, 1))),
+                        GridTransform::new(Point::new(0, 0), 1000).unwrap(),
+                        vec![Rect::new(0, 0, 1, 1)],
+                    )
+                    .unwrap(),
+                ],
+                PresentationLimits {
+                    max_cells: 10,
+                    max_entries: 10,
+                    max_bytes: 1024,
+                },
+            )
+            .unwrap();
+        assert!(
+            terminal
+                .draw_prepared_with_output_hooks(
+                    Some(prepared),
+                    |_| panic!("before hook must not run"),
+                    |_, _, _| panic!("overlay must not run")
+                )
+                .is_err()
+        );
+        assert_eq!(terminal.writer().as_slice(), []);
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

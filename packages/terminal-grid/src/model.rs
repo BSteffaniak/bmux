@@ -3,8 +3,9 @@ mod content;
 use crate::snapshot::{GridSnapshot, RowSnapshot};
 use crate::style::{Color, Style, StyleId, StylePalette};
 pub use content::{
-    ContentAnchor, ContentBudget, ContentProjection, ContentRowSource, ContentRows,
-    ContentSelectionRow, ScreenRowSource, ScreenRows, ScreenSelectionRow, SelectionCell,
+    ContentAnchor, ContentBudget, ContentCursor, ContentPosition, ContentProjection,
+    ContentRowSource, ContentRows, ContentSelectionRow, ScreenRowSource, ScreenRows,
+    ScreenSelectionRow, SelectionCell,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;

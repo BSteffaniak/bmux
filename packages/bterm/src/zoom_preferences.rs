@@ -1,4 +1,6 @@
-//! Remembered window targets, separate from declarative config and runtime state.
+//! Remembered local targets, separate from declarative config and runtime state.
+//! Version two preserves pane-view overrides on window-only updates; version one
+//! remains readable. Pane records require explicit verified caller bindings.
 //!
 //! The key uses ordered selected source locators (not file contents/presence),
 //! profile/scope selectors and a caller-supplied stable runtime target. Callers
@@ -16,13 +18,15 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use crate::configuration::ResolvedConfiguration;
+use crate::pane_zoom::PaneViewRestoreToken;
 
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
+const MAX_PANE_ENTRIES: usize = 64;
 const MAX_BYTES: u64 = 64 * 1024;
 const MAX_ENTRIES: usize = 64;
 
-/// Last requested target, never an intermediate animation sample. The zoom
-/// controller applies the current configured limits when restoring this value.
+/// Last requested window or pane-view target, never an intermediate animation sample.
+/// The zoom controller applies current configured limits when restoring this value.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ZoomPreferences {
@@ -58,6 +62,15 @@ struct Document {
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Entry {
+    key: String,
+    preferences: ZoomPreferences,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    panes: Vec<PaneEntry>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PaneEntry {
     key: String,
     preferences: ZoomPreferences,
 }
@@ -143,6 +156,43 @@ impl PreferenceStore {
     /// Call from a debounced persistence worker, not the presentation hot path.
     pub fn save(&self, preferences: ZoomPreferences) -> Result<()> {
         preferences.validate()?;
+        self.update_entry(|entry| entry.preferences = preferences)
+    }
+
+    /// Restore only for an explicitly verified durable local-view/pane binding.
+    /// Absence is normal; corrupt or unsupported documents remain errors.
+    pub fn load_pane(&self, token: &PaneViewRestoreToken) -> Result<Option<ZoomPreferences>> {
+        let key = token.binding().preference_key();
+        Ok(self
+            .read_document()?
+            .entries
+            .into_iter()
+            .find(|entry| entry.key == self.key)
+            .and_then(|entry| entry.panes.into_iter().find(|pane| pane.key == key))
+            .map(|pane| pane.preferences))
+    }
+
+    /// Save a target, never an animation sample. Call from the caller's debounced
+    /// IO worker. The lock covers read/modify/replace across window and pane saves.
+    /// Bounded least-recently-saved pane retention (64 per runtime/config namespace)
+    /// is separate from live state. The entire document remains capped at 64 KiB.
+    pub fn save_pane(
+        &self,
+        token: &PaneViewRestoreToken,
+        preferences: ZoomPreferences,
+    ) -> Result<()> {
+        preferences.validate()?;
+        let key = token.binding().preference_key();
+        self.update_entry(|entry| {
+            entry.panes.retain(|pane| pane.key != key);
+            if entry.panes.len() == MAX_PANE_ENTRIES {
+                entry.panes.remove(0);
+            }
+            entry.panes.push(PaneEntry { key, preferences });
+        })
+    }
+
+    fn update_entry(&self, update: impl FnOnce(&mut Entry)) -> Result<()> {
         let parent = self
             .path
             .parent()
@@ -169,14 +219,25 @@ impl PreferenceStore {
         lock.try_lock()
             .context("zoom preferences are being saved by another window")?;
         let mut document = self.read_document()?;
-        document.entries.retain(|entry| entry.key != self.key);
+        let mut entry = if let Some(index) = document
+            .entries
+            .iter()
+            .position(|entry| entry.key == self.key)
+        {
+            document.entries.remove(index)
+        } else {
+            Entry {
+                key: self.key.clone(),
+                preferences: ZoomPreferences { target_scale: 1.0 },
+                panes: Vec::new(),
+            }
+        };
+        update(&mut entry);
         if document.entries.len() == MAX_ENTRIES {
             document.entries.remove(0);
         }
-        document.entries.push(Entry {
-            key: self.key.clone(),
-            preferences,
-        });
+        document.entries.push(entry);
+        document.version = VERSION;
         let bytes = serde_json::to_vec(&document)?;
         ensure!(
             u64::try_from(bytes.len())? <= MAX_BYTES,
@@ -249,7 +310,7 @@ impl PreferenceStore {
         let document: Document =
             serde_json::from_slice(&bytes).context("corrupt zoom preferences")?;
         ensure!(
-            document.version == VERSION,
+            document.version == 1 || document.version == VERSION,
             "unsupported zoom preference version"
         );
         ensure!(
@@ -267,6 +328,26 @@ impl PreferenceStore {
                 "duplicate zoom preference identity"
             );
             entry.preferences.validate()?;
+            ensure!(
+                entry.panes.len() <= MAX_PANE_ENTRIES,
+                "too many pane zoom preferences"
+            );
+            ensure!(
+                document.version != 1 || entry.panes.is_empty(),
+                "pane preferences require version two"
+            );
+            let mut panes = BTreeSet::new();
+            for pane in &entry.panes {
+                ensure!(
+                    pane.key.len() == 64 && pane.key.bytes().all(|byte| byte.is_ascii_hexdigit()),
+                    "invalid pane zoom preference identity"
+                );
+                ensure!(
+                    panes.insert(&pane.key),
+                    "duplicate pane zoom preference identity"
+                );
+                pane.preferences.validate()?;
+            }
         }
         Ok(document)
     }
@@ -413,7 +494,7 @@ mod tests {
         std::fs::create_dir_all(store.path.parent().unwrap()).unwrap();
         for bytes in [
             b"bad".as_slice(),
-            br#"{"version":2,"entries":[]}"#.as_slice(),
+            br#"{"version":3,"entries":[]}"#.as_slice(),
             br#"{"version":1,"entries":[],"extra":true}"#.as_slice(),
         ] {
             std::fs::write(store.path(), bytes).unwrap();
@@ -478,6 +559,70 @@ mod tests {
     }
 
     #[test]
+    fn window_and_pane_updates_preserve_each_other_and_migrate_legacy() {
+        use crate::pane_zoom::PaneViewBinding;
+        let temp = tempfile::tempdir().unwrap();
+        let store =
+            PreferenceStore::for_configuration(&configuration(temp.path()), "runtime").unwrap();
+        std::fs::create_dir_all(store.path.parent().unwrap()).unwrap();
+        let legacy = serde_json::json!({
+            "version": 1,
+            "entries": [{ "key": store.key, "preferences": { "target_scale": 1.25 } }]
+        });
+        std::fs::write(store.path(), serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert_eq!(store.load().unwrap().unwrap().target_scale, 1.25);
+        let binding = PaneViewBinding::new("verified/view-a", "authority/pane").unwrap();
+        let token = binding.verify_restore(&binding).unwrap();
+        assert!(store.load_pane(&token).unwrap().is_none());
+        store
+            .save_pane(&token, ZoomPreferences { target_scale: 2.0 })
+            .unwrap();
+        assert_eq!(store.load().unwrap().unwrap().target_scale, 1.25);
+        store.save(ZoomPreferences { target_scale: 1.75 }).unwrap();
+        assert_eq!(store.load_pane(&token).unwrap().unwrap().target_scale, 2.0);
+        let second = PaneViewBinding::new("verified/view-b", "authority/pane").unwrap();
+        let second_token = second.verify_restore(&second).unwrap();
+        assert!(store.load_pane(&second_token).unwrap().is_none());
+        store
+            .save_pane(&second_token, ZoomPreferences { target_scale: 0.75 })
+            .unwrap();
+        assert_eq!(store.load().unwrap().unwrap().target_scale, 1.75);
+        assert_eq!(store.load_pane(&token).unwrap().unwrap().target_scale, 2.0);
+        assert_eq!(store.read_document().unwrap().version, VERSION);
+        let other =
+            PreferenceStore::for_configuration(&configuration(temp.path()), "other-runtime")
+                .unwrap();
+        assert!(other.load_pane(&token).unwrap().is_none());
+    }
+
+    #[test]
+    fn pane_preference_retention_is_bounded_and_corruption_is_not_overwritten() {
+        use crate::pane_zoom::PaneViewBinding;
+        let temp = tempfile::tempdir().unwrap();
+        let store =
+            PreferenceStore::for_configuration(&configuration(temp.path()), "runtime").unwrap();
+        let token = |index| {
+            let binding =
+                PaneViewBinding::new(&format!("verified/view-{index}"), "authority/pane").unwrap();
+            binding.verify_restore(&binding).unwrap()
+        };
+        for index in 0..=MAX_PANE_ENTRIES {
+            store
+                .save_pane(&token(index), ZoomPreferences { target_scale: 1.5 })
+                .unwrap();
+        }
+        assert!(store.load_pane(&token(0)).unwrap().is_none());
+        assert!(store.load_pane(&token(MAX_PANE_ENTRIES)).unwrap().is_some());
+        let mut document = store.read_document().unwrap();
+        document.entries[0].panes[0].preferences.target_scale = -1.0;
+        let corrupt = serde_json::to_vec(&document).unwrap();
+        std::fs::write(store.path(), &corrupt).unwrap();
+        assert!(store.load_pane(&token(1)).is_err());
+        assert!(store.save(ZoomPreferences { target_scale: 2.0 }).is_err());
+        assert_eq!(std::fs::read(store.path()).unwrap(), corrupt);
+    }
+
+    #[test]
     fn malformed_entry_shapes_are_rejected() {
         let temp = tempfile::tempdir().unwrap();
         let store =
@@ -486,6 +631,7 @@ mod tests {
         let entry = || Entry {
             key: store.key.clone(),
             preferences: ZoomPreferences { target_scale: 1.0 },
+            panes: Vec::new(),
         };
         let mut invalid_scale = entry();
         invalid_scale.preferences.target_scale = 0.0;

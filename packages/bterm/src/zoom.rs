@@ -1,4 +1,4 @@
-//! Whole-window scale policy. This module never commits presentation geometry.
+//! Scoped zoom policy. This module never commits presentation geometry.
 //! The application must paint and hit-test using the same successfully presented sample.
 
 use std::time::{Duration, Instant};
@@ -32,6 +32,7 @@ impl Default for ZoomConfiguration {
                 ZoomBinding::primary("=", ZoomAction::In),
                 ZoomBinding::primary("+", ZoomAction::In),
                 ZoomBinding {
+                    scope: ZoomScope::Window,
                     key: "+".into(),
                     modifiers: vec![ZoomModifier::Primary, ZoomModifier::Shift],
                     action: ZoomAction::In,
@@ -104,6 +105,21 @@ pub enum ZoomAction {
     Consume,
 }
 
+/// Routing intent only; targets must be resolved from committed state.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ZoomScope {
+    #[default]
+    Window,
+    Pane,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ScopedZoomAction {
+    pub scope: ZoomScope,
+    pub action: ZoomAction,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ZoomModifier {
@@ -137,6 +153,9 @@ fn matches_modifiers(expected: &[ZoomModifier], actual: Modifiers) -> bool {
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ZoomBinding {
+    /// Omitted scopes retain whole-window behavior.
+    #[serde(default)]
+    pub scope: ZoomScope,
     /// One logical character (not backend physical key codes).
     pub key: String,
     pub modifiers: Vec<ZoomModifier>,
@@ -146,6 +165,7 @@ pub struct ZoomBinding {
 impl ZoomBinding {
     fn primary(key: &str, action: ZoomAction) -> Self {
         Self {
+            scope: ZoomScope::Window,
             key: key.into(),
             modifiers: vec![ZoomModifier::Primary],
             action,
@@ -156,6 +176,7 @@ impl ZoomBinding {
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ZoomWheelConfiguration {
+    pub scope: ZoomScope,
     pub enabled: bool,
     pub modifiers: Vec<ZoomModifier>,
     /// Multiplicative zoom steps per normalized wheel line.
@@ -165,6 +186,7 @@ pub struct ZoomWheelConfiguration {
 impl Default for ZoomWheelConfiguration {
     fn default() -> Self {
         Self {
+            scope: ZoomScope::Window,
             enabled: true,
             modifiers: vec![ZoomModifier::Primary],
             sensitivity: 0.1,
@@ -248,7 +270,7 @@ fn validate_action(action: ZoomAction) -> Result<()> {
 /// Never forward an event for which `input` returns `Some`, including Consume.
 pub struct ZoomInputMatcher {
     configuration: ZoomConfiguration,
-    held: Vec<(PhysicalKey, ZoomAction)>,
+    held: Vec<(PhysicalKey, ScopedZoomAction)>,
 }
 
 impl ZoomInputMatcher {
@@ -283,7 +305,7 @@ impl ZoomInputMatcher {
         self.held.clear();
     }
 
-    pub fn input(&mut self, event: &InputEvent) -> Option<ZoomAction> {
+    pub fn input(&mut self, event: &InputEvent) -> Option<ScopedZoomAction> {
         match event {
             InputEvent::Focus(false) => {
                 self.reset();
@@ -298,7 +320,10 @@ impl ZoomInputMatcher {
                     let action = self.held[index].1;
                     if key.phase == KeyPhase::Release {
                         self.held.swap_remove(index);
-                        return Some(ZoomAction::Consume);
+                        return Some(ScopedZoomAction {
+                            scope: action.scope,
+                            action: ZoomAction::Consume,
+                        });
                     }
                     return Some(action);
                 }
@@ -317,18 +342,25 @@ impl ZoomInputMatcher {
                 if self.held.len() >= 64 {
                     return None;
                 }
-                self.held.push((key.physical.clone(), binding.action));
-                Some(binding.action)
+                let action = ScopedZoomAction {
+                    scope: binding.scope,
+                    action: binding.action,
+                };
+                self.held.push((key.physical.clone(), action));
+                Some(action)
             }
             InputEvent::Scroll { delta, modifiers }
                 if self.configuration.wheel.enabled
                     && matches_modifiers(&self.configuration.wheel.modifiers, *modifiers) =>
             {
                 let lines = bterm_native_platform::input::normalized_scroll_lines(*delta);
-                Some(if lines == 0.0 {
-                    ZoomAction::Consume
-                } else {
-                    ZoomAction::Steps(lines * self.configuration.wheel.sensitivity)
+                Some(ScopedZoomAction {
+                    scope: self.configuration.wheel.scope,
+                    action: if lines == 0.0 {
+                        ZoomAction::Consume
+                    } else {
+                        ZoomAction::Steps(lines * self.configuration.wheel.sensitivity)
+                    },
                 })
             }
             _ => None,
@@ -513,18 +545,27 @@ mod tests {
         let mut matcher = ZoomInputMatcher::new(&configuration).unwrap();
         assert_eq!(
             matcher.input(&key(KeyPhase::Press, primary())),
-            Some(ZoomAction::In)
+            Some(ScopedZoomAction {
+                scope: ZoomScope::Window,
+                action: ZoomAction::In
+            })
         );
         configuration.bindings.clear();
         matcher.reconfigure(&configuration).unwrap();
         assert_eq!(matcher.configuration, configuration);
         assert_eq!(
             matcher.input(&key(KeyPhase::Repeat, Modifiers::default())),
-            Some(ZoomAction::In)
+            Some(ScopedZoomAction {
+                scope: ZoomScope::Window,
+                action: ZoomAction::In
+            })
         );
         assert_eq!(
             matcher.input(&key(KeyPhase::Release, Modifiers::default())),
-            Some(ZoomAction::Consume)
+            Some(ScopedZoomAction {
+                scope: ZoomScope::Window,
+                action: ZoomAction::Consume
+            })
         );
         assert_eq!(matcher.input(&key(KeyPhase::Press, primary())), None);
     }
@@ -535,7 +576,10 @@ mod tests {
         let mut matcher = ZoomInputMatcher::new(&configuration).unwrap();
         assert_eq!(
             matcher.input(&key(KeyPhase::Press, primary())),
-            Some(ZoomAction::In)
+            Some(ScopedZoomAction {
+                scope: ZoomScope::Window,
+                action: ZoomAction::In
+            })
         );
         let invalid = ZoomConfiguration {
             step: 1.0,
@@ -546,15 +590,24 @@ mod tests {
         assert_eq!(matcher.configuration, configuration);
         assert_eq!(
             matcher.input(&key(KeyPhase::Repeat, Modifiers::default())),
-            Some(ZoomAction::In)
+            Some(ScopedZoomAction {
+                scope: ZoomScope::Window,
+                action: ZoomAction::In
+            })
         );
         assert_eq!(
             matcher.input(&key(KeyPhase::Release, Modifiers::default())),
-            Some(ZoomAction::Consume)
+            Some(ScopedZoomAction {
+                scope: ZoomScope::Window,
+                action: ZoomAction::Consume
+            })
         );
         assert_eq!(
             matcher.input(&key(KeyPhase::Press, primary())),
-            Some(ZoomAction::In)
+            Some(ScopedZoomAction {
+                scope: ZoomScope::Window,
+                action: ZoomAction::In
+            })
         );
     }
 
@@ -744,15 +797,24 @@ mod tests {
         let mut matcher = ZoomInputMatcher::new(&ZoomConfiguration::default()).unwrap();
         assert_eq!(
             matcher.input(&key(KeyPhase::Press, primary())),
-            Some(ZoomAction::In)
+            Some(ScopedZoomAction {
+                scope: ZoomScope::Window,
+                action: ZoomAction::In
+            })
         );
         assert_eq!(
             matcher.input(&key(KeyPhase::Repeat, Modifiers::default())),
-            Some(ZoomAction::In)
+            Some(ScopedZoomAction {
+                scope: ZoomScope::Window,
+                action: ZoomAction::In
+            })
         );
         assert_eq!(
             matcher.input(&key(KeyPhase::Release, Modifiers::default())),
-            Some(ZoomAction::Consume)
+            Some(ScopedZoomAction {
+                scope: ZoomScope::Window,
+                action: ZoomAction::Consume
+            })
         );
         assert_eq!(matcher.input(&key(KeyPhase::Repeat, primary())), None);
         matcher.input(&key(KeyPhase::Press, primary()));
@@ -768,7 +830,10 @@ mod tests {
                 delta: ScrollDelta::Pixels { x: 0.0, y: 20.0 },
                 modifiers: primary()
             }),
-            Some(ZoomAction::Steps(0.05))
+            Some(ScopedZoomAction {
+                scope: ZoomScope::Window,
+                action: ZoomAction::Steps(0.05)
+            })
         );
         assert_eq!(
             matcher.input(&InputEvent::Scroll {
@@ -802,8 +867,79 @@ mod tests {
     }
 
     #[test]
+    fn scoped_bindings_keep_original_scope_until_release() {
+        let mut policy = ZoomConfiguration::default();
+        policy.bindings[0].scope = ZoomScope::Pane;
+        let mut matcher = ZoomInputMatcher::new(&policy).unwrap();
+        let expected = ScopedZoomAction {
+            scope: ZoomScope::Pane,
+            action: ZoomAction::In,
+        };
+        assert_eq!(
+            matcher.input(&key(KeyPhase::Press, primary())),
+            Some(expected)
+        );
+        policy.bindings[0].scope = ZoomScope::Window;
+        policy.bindings[0].action = ZoomAction::Out;
+        matcher.reconfigure(&policy).unwrap();
+        assert_eq!(
+            matcher.input(&key(KeyPhase::Repeat, Modifiers::default())),
+            Some(expected)
+        );
+        assert_eq!(
+            matcher.input(&key(KeyPhase::Release, Modifiers::default())),
+            Some(ScopedZoomAction {
+                scope: ZoomScope::Pane,
+                action: ZoomAction::Consume
+            })
+        );
+        assert_eq!(
+            matcher.input(&key(KeyPhase::Press, primary())),
+            Some(ScopedZoomAction {
+                scope: ZoomScope::Window,
+                action: ZoomAction::Out
+            })
+        );
+    }
+
+    #[test]
+    fn legacy_scopes_default_to_window_and_cross_scope_collisions_are_rejected() {
+        let binding: ZoomBinding =
+            serde_json::from_str(r#"{"key":"=","modifiers":["primary"],"action":{"action":"in"}}"#)
+                .unwrap();
+        assert_eq!(binding.scope, ZoomScope::Window);
+        let wheel: ZoomWheelConfiguration = serde_json::from_str("{}").unwrap();
+        assert_eq!(wheel.scope, ZoomScope::Window);
+        let mut policy = ZoomConfiguration::default();
+        let mut duplicate = policy.bindings[0].clone();
+        duplicate.scope = ZoomScope::Pane;
+        policy.bindings.push(duplicate);
+        assert!(policy.validate().is_err());
+    }
+
+    #[test]
+    fn pane_wheel_uses_scope_even_when_only_consuming() {
+        let mut policy = ZoomConfiguration::default();
+        policy.wheel.scope = ZoomScope::Pane;
+        let mut matcher = ZoomInputMatcher::new(&policy).unwrap();
+        for (y, action) in [(20.0, ZoomAction::Steps(0.05)), (0.0, ZoomAction::Consume)] {
+            assert_eq!(
+                matcher.input(&InputEvent::Scroll {
+                    delta: ScrollDelta::Pixels { x: 1.0, y },
+                    modifiers: primary(),
+                }),
+                Some(ScopedZoomAction {
+                    scope: ZoomScope::Pane,
+                    action
+                })
+            );
+        }
+    }
+
+    #[test]
     fn binding_action_wire_format_round_trips() {
         let binding = ZoomBinding {
+            scope: ZoomScope::Pane,
             key: "1".into(),
             modifiers: vec![ZoomModifier::Primary],
             action: ZoomAction::SetScale(1.25),
@@ -813,6 +949,7 @@ mod tests {
         assert_eq!(json["action"]["value"], 1.25);
         let decoded: ZoomBinding = serde_json::from_value(json).unwrap();
         assert_eq!(decoded.action, binding.action);
+        assert_eq!(decoded.scope, ZoomScope::Pane);
     }
 
     #[test]

@@ -20,6 +20,7 @@ plugin bmux.pane_runtime version 1;
 
 capability PANE_RUNTIME_PRESENTATION_WAIT_V1 = bmux.pane_runtime.presentation.wait.v1;
 capability PANE_RUNTIME_PRESENTATION_V1 = bmux.pane_runtime.presentation.v1;
+capability PANE_RUNTIME_VIEW_SIZE_V1 = bmux.pane_runtime.view.size.v1;
 capability PANE_RUNTIME_EXECUTION_V4 = bmux.pane_runtime.execution.v4;
 capability PANE_RUNTIME_READ = bmux.pane_runtime.read;
 capability PANE_RUNTIME_WRITE = bmux.pane_runtime.write;
@@ -389,6 +390,28 @@ interface pane-runtime-presentation-v1 {
         -> result<terminal-event-batch, pane-runtime-execution-v4.terminal-recovery-error>;
     command present(execution: pane-runtime-execution-v4.terminal-execution-ref)
         -> result<pane-runtime-execution-v4.terminal-execution-screen, pane-runtime-execution-v4.terminal-execution-error>;
+}
+
+// Local views do not own execution sizing. Alternate-screen requests preserve
+// native last-writer policy, conditional on the exact observed source revision.
+// Normal-screen reflow is local and MUST NOT invoke this service.
+@capability(PANE_RUNTIME_VIEW_SIZE_V1)
+interface pane-runtime-view-size-v1 {
+    // Revision is GridSnapshot.revision from execution's encoded_grid, not a
+    // presentation revision. It is checked with mode under the geometry lock,
+    // after draining the ordered capture prefix. Even same-size calls validate.
+    // Dimensions are 1..=1000, with at most 262144 cells. Ordinary local
+    // panes synchronously commit PTY/source geometry; captured executions also
+    // preserve the ordered capture barrier and durable acknowledgement.
+    // Success acknowledges execution geometry/capture, not presentation or
+    // interaction output. Stale revision returns operation-failed; wrong mode
+    // or invalid dimensions return invalid-options. Refresh source before retry.
+    command resize-alternate(
+        execution: pane-runtime-execution-v4.terminal-execution-ref,
+        expected_grid_revision: u64,
+        cols: u16,
+        rows: u16,
+    ) -> result<unit, pane-runtime-execution-v4.terminal-execution-error>;
 }
 
 @capability(PANE_RUNTIME_SPAWN_V1)

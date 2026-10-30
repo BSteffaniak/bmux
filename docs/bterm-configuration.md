@@ -195,14 +195,13 @@ protect the host from arbitrary shell commands. Handoff consistency checks do
 not authenticate a malicious owner of the sandbox directory. OS confinement,
 where needed, requires a separate security mechanism.
 
-## Typography and whole-window zoom
+## Typography and zoom
 
 Typography and zoom are Bterm presentation policy, not BMUX resource or
-companion
-configuration. They do not create panes, resize an individual pane
-independently,
-or write federated arrangements. Pinch gestures and pane-local zoom are not part
-of this interface.
+companion configuration. Whole-window zoom remains the default. Pane-scoped
+controls change content typography inside the existing pane allocation; they
+do not change split ratios, decorations, or federated arrangements. Pinch
+gestures are not supported.
 
 ```toml
 [bterm.typography]
@@ -272,6 +271,53 @@ are enlarged proportionally while the requested zoom target remains unchanged.
 The applied policy is cached so a settled capacity-clamped window does not
 continuously invalidate output. Reset returns to the configured base size,
 subject to the same raster and capacity limits.
+
+### Pane-scoped controls
+
+This implementation is not yet end-to-end accepted. Captured-scrollback zoom
+is unsupported and rejects presentation rather than showing a mismatched source.
+Transformed accessibility and IME metadata are currently withheld rather than
+publishing stale root coordinates. Real-application visual acceptance, mixed-DPI
+validation, and Linux native validation remain outstanding.
+
+Set `scope = "pane"` on a keyboard binding or wheel policy to select pane
+content rather than the whole window. Existing bindings remain window-scoped
+when `scope` is omitted. For example:
+
+```toml
+[bterm.zoom]
+bindings = [
+  { key = "=", modifiers = ["primary"], action = { action = "in" } },
+  { key = "-", modifiers = ["primary"], action = { action = "out" } },
+  { key = "=", modifiers = ["primary", "alt"], scope = "pane", action = { action = "in" } },
+  { key = "-", modifiers = ["primary", "alt"], scope = "pane", action = { action = "out" } },
+  { key = "0", modifiers = ["primary", "alt"], scope = "pane", action = { action = "reset" } },
+]
+
+[bterm.zoom.wheel]
+scope = "pane"
+modifiers = ["primary", "alt"]
+```
+
+Keyboard actions select the committed focused pane. Wheel actions select the
+pane under the pointer without changing focus. Reset removes that pane's extra
+scale, preserving whole-window zoom. The effective content size is the base
+logical size multiplied by window and pane scales; display DPI remains separate.
+Duplicate key/modifier combinations are invalid even when their scopes differ.
+
+Normal-screen content reflows from structured source rows in the local view.
+Zoom does not resize the shared application's PTY or make the application format
+its output for the local width. Alternate-screen applications instead use the
+existing authorized execution-resize path. Native alternate-screen sizing keeps
+its existing last-writer policy: simultaneous views can resize the same
+application; pane zoom does not create exclusive resize ownership.
+
+For deliberate restoration, `bterm --view-binding work-left` names a local
+preference namespace. Restoration still requires a matching currently committed
+pane/source binding under the selected runtime and configuration. This label is
+not an execution capability. Windows without a view binding retain independent,
+ephemeral pane preferences. Reusing a label deliberately shares the saved
+namespace, not live zoom state or input authority.
 
 ### Keyboard, wheel, and exact sizes
 

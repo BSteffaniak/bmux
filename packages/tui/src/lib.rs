@@ -22,6 +22,7 @@ pub mod event;
 pub mod focus;
 pub mod frame;
 pub mod geometry;
+pub mod grid_fragment;
 pub mod hit;
 pub mod image;
 pub mod image_scene;

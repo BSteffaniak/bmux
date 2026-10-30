@@ -224,7 +224,16 @@ pub struct ExtensionRetainedLayerCacheEntry {
     pub items: Vec<ExtensionRetainedItemCacheEntry>,
 }
 
+#[derive(Default)]
+pub struct PaneLocalZoom {
+    /// Keep the authoritative execution replica independent of scene allocation.
+    pub preserve_execution_geometry: bool,
+    /// A prepared local fragment replaces uniform content paint this frame.
+    pub projected: bool,
+}
+
 pub struct PaneRenderBuffer {
+    pub local_zoom: PaneLocalZoom,
     pub terminal_grid: TerminalGridStream,
     /// Neutral declarative output retained alongside extension byte caches.
     pub extension_projection_cache:
@@ -629,6 +638,7 @@ impl PaneRenderBuffer {
 impl Default for PaneRenderBuffer {
     fn default() -> Self {
         Self {
+            local_zoom: PaneLocalZoom::default(),
             terminal_grid: TerminalGridStream::new(80, 24, GridLimits::default())
                 .expect("default pane render grid dimensions are valid"),
             protocol_tracker: TerminalProtocolTracker::new(),

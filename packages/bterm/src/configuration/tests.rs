@@ -562,6 +562,43 @@ fn fractional_typography_is_deterministic_and_not_runtime_identity() {
 }
 
 #[test]
+fn zoom_scope_resolution_preserves_legacy_defaults_and_accepts_explicit_pane_scope() {
+    use crate::zoom::ZoomScope;
+    let legacy = inputs().resolve().unwrap();
+    assert!(
+        legacy
+            .native
+            .zoom
+            .bindings
+            .iter()
+            .all(|binding| binding.scope == ZoomScope::Window)
+    );
+    assert_eq!(legacy.native.zoom.wheel.scope, ZoomScope::Window);
+    let mut input = inputs();
+    input.bterm = family(
+        "/scoped-native.toml",
+        r#"
+[bterm.zoom.wheel]
+scope = "pane"
+[[bterm.zoom.bindings]]
+key = "="
+modifiers = ["primary"]
+scope = "pane"
+action = { action = "in" }
+"#,
+    );
+    let resolved = input.resolve().unwrap();
+    assert_eq!(resolved.native.zoom.wheel.scope, ZoomScope::Pane);
+    assert_eq!(resolved.native.zoom.bindings.len(), 1);
+    assert_eq!(resolved.native.zoom.bindings[0].scope, ZoomScope::Pane);
+    input.bterm = family(
+        "/invalid-native.toml",
+        "[bterm.zoom.wheel]\nscope = 'focused'\n",
+    );
+    assert!(input.resolve().is_err());
+}
+
+#[test]
 fn native_metric_and_zoom_validation_runs_during_resolution() {
     for document in [
         "[bterm.typography]\nsize = 0.0\n",

@@ -9,12 +9,22 @@ use std::time::{Duration, Instant};
 use bterm::configuration::{ConfigOptions, ResolvedConfiguration, SourcePolicy};
 use bterm::runtime_paths::BtermPaths;
 use bterm::typography::TypographyConfiguration;
-use bterm::zoom::{ZoomAction, ZoomConfiguration, ZoomController, ZoomEasing, ZoomInputMatcher};
+use bterm::zoom::{
+    ScopedZoomAction, ZoomAction, ZoomConfiguration, ZoomController, ZoomEasing, ZoomInputMatcher,
+    ZoomScope,
+};
 use bterm::zoom_preferences::{PreferenceStore, ZoomPreferences};
 use bterm_native_platform::input::{
     InputEvent, KeyEvent, KeyPhase, LogicalKey, Modifiers, PhysicalKey, ScrollDelta,
 };
 use bterm_native_renderer::text::{TextRasterizer, TextStyle};
+
+fn window_action(action: ZoomAction) -> Option<ScopedZoomAction> {
+    Some(ScopedZoomAction {
+        scope: ZoomScope::Window,
+        action,
+    })
+}
 
 fn primary() -> Modifiers {
     Modifiers {
@@ -242,15 +252,15 @@ fn shortcut_owns_repeat_and_release_even_when_modifiers_are_released_first() {
     assert_eq!(matcher.input(&key("=", KeyPhase::Repeat, primary())), None);
     assert_eq!(
         matcher.input(&key("=", KeyPhase::Press, primary())),
-        Some(ZoomAction::In)
+        window_action(ZoomAction::In)
     );
     assert_eq!(
         matcher.input(&key("=", KeyPhase::Repeat, Modifiers::default())),
-        Some(ZoomAction::In)
+        window_action(ZoomAction::In)
     );
     assert_eq!(
         matcher.input(&key("=", KeyPhase::Release, Modifiers::default())),
-        Some(ZoomAction::Consume)
+        window_action(ZoomAction::Consume)
     );
     assert_eq!(
         matcher.input(&key("=", KeyPhase::Press, Modifiers::default())),
@@ -258,7 +268,7 @@ fn shortcut_owns_repeat_and_release_even_when_modifiers_are_released_first() {
     );
     assert_eq!(
         matcher.input(&key("0", KeyPhase::Press, primary())),
-        Some(ZoomAction::Reset)
+        window_action(ZoomAction::Reset)
     );
     assert_eq!(matcher.input(&InputEvent::Focus(false)), None);
     assert_eq!(matcher.input(&key("0", KeyPhase::Repeat, primary())), None);
@@ -286,11 +296,12 @@ bindings = [
         let action = matcher
             .input(&key(text, KeyPhase::Press, primary()))
             .unwrap();
-        controller.apply(action, 16.0, now).unwrap();
+        assert_eq!(action.scope, ZoomScope::Window);
+        controller.apply(action.action, 16.0, now).unwrap();
         close(controller.target_scale(), expected);
         assert_eq!(
             matcher.input(&key(text, KeyPhase::Release, primary())),
-            Some(ZoomAction::Consume)
+            window_action(ZoomAction::Consume)
         );
     }
 }
@@ -302,7 +313,7 @@ fn window_local_matchers_and_controllers_do_not_share_transient_state() {
     let mut second = ZoomInputMatcher::new(&configuration).unwrap();
     assert_eq!(
         first.input(&key("=", KeyPhase::Press, primary())),
-        Some(ZoomAction::In)
+        window_action(ZoomAction::In)
     );
     assert_eq!(second.input(&key("=", KeyPhase::Release, primary())), None);
     let now = Instant::now();
@@ -322,15 +333,15 @@ fn wheel_is_fractional_modifier_gated_and_bounded() {
     assert_eq!(matcher.input(&scroll(pixels, Modifiers::default())), None);
     assert_eq!(
         matcher.input(&scroll(pixels, primary())),
-        Some(ZoomAction::Steps(0.025))
+        window_action(ZoomAction::Steps(0.025))
     );
     assert_eq!(
         matcher.input(&scroll(ScrollDelta::Lines { x: 0.0, y: 0.25 }, primary())),
-        Some(ZoomAction::Steps(0.025))
+        window_action(ZoomAction::Steps(0.025))
     );
     assert_eq!(
         matcher.input(&scroll(ScrollDelta::Pixels { x: 5.0, y: 0.0 }, primary())),
-        Some(ZoomAction::Consume)
+        window_action(ZoomAction::Consume)
     );
     assert_eq!(
         matcher.input(&scroll(
@@ -340,7 +351,7 @@ fn wheel_is_fractional_modifier_gated_and_bounded() {
             },
             primary()
         )),
-        Some(ZoomAction::Consume)
+        window_action(ZoomAction::Consume)
     );
     assert_eq!(
         matcher.input(&scroll(
@@ -350,7 +361,7 @@ fn wheel_is_fractional_modifier_gated_and_bounded() {
             },
             primary()
         )),
-        Some(ZoomAction::Steps(3.2))
+        window_action(ZoomAction::Steps(3.2))
     );
     let mut configuration = ZoomConfiguration::default();
     configuration.wheel.enabled = false;

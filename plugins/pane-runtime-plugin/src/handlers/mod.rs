@@ -126,6 +126,9 @@ fn route_authorized(context: NativeServiceContext) -> ServiceResponse {
         "pane-runtime-presentation-wait-v1", "wait-present" => |req: bmux_pane_runtime_plugin_api::pane_runtime_presentation_wait_v1::client::WaitPresentRequest, ctx| {
             pointer_grid::legacy(crate::runtime::execution::wait_present(&req.execution, req.after.as_deref(), req.timeout_ms, req.max_bytes, || execution::authorize(ctx, &req.execution, "read")))
         },
+        "pane-runtime-view-size-v1", "resize-alternate" => |req: bmux_pane_runtime_plugin_api::pane_runtime_view_size_v1::client::ResizeAlternateRequest, ctx| {
+            Ok::<_, ServiceResponse>(crate::runtime::execution::resize_alternate(&req.execution, req.expected_grid_revision, req.cols, req.rows, || execution::authorize(ctx, &req.execution, "pane.resize")))
+        },
         "pane-runtime-presentation-v1", "capabilities" => |_req: (), _ctx| {
             Ok::<_, ServiceResponse>(Ok::<_, bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::TerminalExecutionError>(bmux_pane_runtime_plugin_api::pane_runtime_presentation_v1::PresentationCapabilities { schema_version: 1, coherent_screen: true, canonical_resize: true }))
         },

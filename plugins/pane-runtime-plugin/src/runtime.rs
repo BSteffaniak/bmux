@@ -3721,6 +3721,27 @@ impl PaneRuntimeHandle {
             .map_err(|_| SessionRuntimeError::Closed)
     }
 
+    // Called with last_requested_size/grid held. The legacy resize consumer
+    // takes the same size lock before touching the master.
+    fn resize_uncaptured_master(
+        &self,
+        rows: u16,
+        cols: u16,
+    ) -> Result<(), bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::TerminalExecutionError>
+    {
+        let master = self.execution.master.lock().map_err(execution::failed)?;
+        master
+            .as_ref()
+            .ok_or_else(|| execution::failed("PTY master is unavailable"))?
+            .resize(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .map_err(execution::failed)
+    }
+
     fn resize_pty(&self, rows: u16, cols: u16) {
         self.resize_pty_admitted(rows, cols, None);
     }
@@ -3843,7 +3864,7 @@ impl PaneRuntimeHandle {
             return;
         };
         let mut ticket = None;
-        self.resize_pty_under_order(rows, cols, permit, None, &mut ticket);
+        let _ = self.resize_pty_under_order(rows, cols, permit, None, &mut ticket, None);
     }
 
     fn publish_ordered_resize(
@@ -3900,37 +3921,61 @@ impl PaneRuntimeHandle {
         permit: Option<tokio::sync::OwnedSemaphorePermit>,
         reservation: Option<capture_writer::Reservation>,
         ticket: &mut Option<capture_writer::Ticket>,
-    ) {
+        expected_grid_revision: Option<u64>,
+    ) -> Result<(), bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::TerminalExecutionError>
+    {
         // Serialize geometry publication with the reader's entire output chunk.
         // The reader acquires size before image state, grid, and output.
         let Ok(mut last) = self.last_requested_size.lock() else {
-            return;
+            return Err(execution::failed("geometry lock poisoned"));
         };
         let Ok(mut tracker) = self.cursor_tracker.lock() else {
-            return;
+            return Err(execution::failed("cursor lock poisoned"));
         };
         // Pinned captures hold image state before grid/output. Participate in
         // that ordering so a resize cannot bisect a combined capture.
         #[cfg(feature = "image-registry")]
         let Ok(mut images) = self.image_registry.lock() else {
-            return;
+            return Err(execution::failed("image lock poisoned"));
         };
         #[cfg(feature = "image-registry")]
         let mut images_changed = false;
         if let Ok(mut grid) = self.terminal_grid.lock() {
+            if let Some(revision) = expected_grid_revision {
+                execution::validate_alternate_source(grid.grid(), revision)?;
+                if *last == (rows, cols) {
+                    if self
+                        .execution
+                        .writer()
+                        .map_err(execution::failed)?
+                        .is_none()
+                        && self
+                            .execution
+                            .durable_capture
+                            .lock()
+                            .map_err(execution::failed)?
+                            .is_none()
+                    {
+                        // A legacy same-size request may still be queued. Ack
+                        // only after the actual PTY has accepted this geometry.
+                        self.resize_uncaptured_master(rows, cols)?;
+                    }
+                    return Ok(());
+                }
+            }
             // The retained parser and output watermark must have consumed all
             // capture-ahead bytes before geometry can enter the same stream.
             // Hold grid -> output -> capture, matching output publication.
             let Ok(_output) = self.output_buffer.lock() else {
-                return;
+                return Err(execution::failed("output lock poisoned"));
             };
             let Ok(mut capture) = self.execution.durable_capture.lock() else {
-                return;
+                return Err(execution::failed("capture lock poisoned"));
             };
             if capture.as_ref().is_some_and(|capture| {
                 capture.raw_bytes() != self.execution.output_watermark.load(Ordering::SeqCst)
             }) {
-                return;
+                return Err(execution::failed("capture prefix is not projected"));
             }
             #[cfg(feature = "image-registry")]
             if (cols != tracker.cols || rows != tracker.rows)
@@ -3942,10 +3987,10 @@ impl PaneRuntimeHandle {
                 let mut budget = RESPONSE_OUTPUT_BUDGET;
                 let Some(mut resized) = tracker.terminal_grid.grid().try_clone_charged(&mut budget)
                 else {
-                    return;
+                    return Err(execution::failed("image reflow exceeds response budget"));
                 };
                 let Ok(shift) = resized.resize_with_main_row_shift(cols, rows) else {
-                    return;
+                    return Err(execution::failed("image reflow geometry rejected"));
                 };
                 if let Err(error) = images.remap_positions(rows, |row, column| {
                     if let Some(shift) = shift {
@@ -3970,7 +4015,7 @@ impl PaneRuntimeHandle {
                     Ok((row, u16::try_from(column).map_err(std::io::Error::other)?))
                 }) {
                     warn!(%error, "image resize failed; retaining previous geometry");
-                    return;
+                    return Err(execution::failed(error));
                 }
                 images
                     .evict_main_history(resized.main_row_count().saturating_sub(resized.height()));
@@ -3981,7 +4026,7 @@ impl PaneRuntimeHandle {
                 let revision = images.sequence();
                 if let Err(error) = images.resize_alternate_viewport(rows) {
                     warn!(%error, "alternate image resize failed; retaining previous geometry");
-                    return;
+                    return Err(execution::failed(error));
                 }
                 images_changed = images.sequence() != revision;
             }
@@ -3989,14 +4034,27 @@ impl PaneRuntimeHandle {
                 let Some(admitted) =
                     self.publish_ordered_resize(reservation, &mut grid, rows, cols)
                 else {
-                    return;
+                    return Err(execution::failed("ordered geometry could not commit"));
                 };
                 *ticket = Some(admitted);
+            } else if expected_grid_revision.is_some() && capture.is_none() {
+                // Ordinary local panes have no capture writer. Commit PTY and
+                // source geometry synchronously under the reader's size/grid
+                // locks; queue admission alone cannot acknowledge a resize.
+                self.resize_uncaptured_master(rows, cols)?;
+                if let Err(error) = grid.resize(cols, rows) {
+                    self.execution.record_error(format!(
+                        "source geometry failed after PTY resize: {error:?}"
+                    ));
+                    return Err(execution::failed(
+                        "source geometry could not commit after PTY resize",
+                    ));
+                }
             } else if !self.commit_captured_resize(&mut capture, &mut grid, rows, cols) {
-                return;
+                return Err(execution::failed("terminal geometry could not commit"));
             }
         } else {
-            return;
+            return Err(execution::failed("grid lock poisoned"));
         }
         tracker.resize(rows, cols);
         *last = (rows, cols);
@@ -4004,7 +4062,9 @@ impl PaneRuntimeHandle {
             .geometry_revision
             .fetch_add(1, Ordering::SeqCst);
         self.execution.notify();
-        self.dispatch_uncaptured_resize(rows, cols, permit);
+        if expected_grid_revision.is_none() {
+            self.dispatch_uncaptured_resize(rows, cols, permit);
+        }
         #[cfg(feature = "image-registry")]
         drop(images);
         drop(tracker);
@@ -4013,6 +4073,7 @@ impl PaneRuntimeHandle {
         if images_changed {
             self.publish_resized_images();
         }
+        Ok(())
     }
 }
 
@@ -6644,6 +6705,7 @@ impl SessionRuntimeManager {
         let output_dirty = Arc::new(AtomicBool::new(false));
         let output_dirty_for_reader = Arc::clone(&output_dirty);
         let last_requested_size_for_reader = Arc::clone(&last_requested_size);
+        let last_requested_size_for_input = Arc::clone(&last_requested_size);
         let sync_update_in_progress = Arc::new(AtomicBool::new(false));
         let sync_update_for_reader = Arc::clone(&sync_update_in_progress);
         let mouse_protocol_state =
@@ -8031,9 +8093,11 @@ impl SessionRuntimeManager {
                                 }
                             }
                             Some(PaneRuntimeCommand::Resize { rows, cols }) => {
-                                let resize = execution_for_task.master.lock().ok().and_then(|master| master.as_ref().map(|master| master.resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })));
-                                if !matches!(resize, Some(Ok(()))) {
-                                    execution_for_task.record_error("PTY resize failed".into());
+                                // Serialize with synchronous guarded sizing. A queued
+                                // legacy request superseded by newer published geometry
+                                // must not restore stale PTY dimensions after its ack.
+                                if let Err(error) = execution_for_task.resize_if_current(&last_requested_size_for_input, rows, cols) {
+                                    execution_for_task.record_error(format!("PTY resize failed: {error}"));
                                 }
                             }
                             Some(PaneRuntimeCommand::GuardedInput(..) | PaneRuntimeCommand::GuardedResize { .. }) => unreachable!("guarded command normalized"),
@@ -19551,6 +19615,207 @@ exit 7"#
             .apply_delta(&batches[0], GridLimits::default())
             .expect("delta should apply to matching revision");
         assert_eq!(row_text(&consumer.grid().viewport_rows()[0]), "hello");
+    }
+
+    #[tokio::test]
+    async fn alternate_resize_guard_is_atomic_and_preserves_last_writer_policy() {
+        let pane = dummy_pane(Uuid::new_v4());
+        let pty = portable_pty::native_pty_system()
+            .openpty(PtySize {
+                rows: 1,
+                cols: 1,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .unwrap();
+        *pane.execution.master.lock().unwrap() = Some(pty.master);
+        let original = pane.terminal_grid.lock().unwrap().grid().revision();
+        let mut ticket = None;
+        // Even a no-op size cannot authorize execution resizing in normal mode.
+        assert!(
+            pane.resize_pty_under_order(1, 1, None, None, &mut ticket, Some(original))
+                .is_err()
+        );
+        assert_eq!(*pane.last_requested_size.lock().unwrap(), (1, 1));
+        pane.terminal_grid.lock().unwrap().process(b"\x1b[?1049h");
+        let observed = pane.terminal_grid.lock().unwrap().grid().revision();
+        assert!(
+            pane.resize_pty_under_order(3, 8, None, None, &mut ticket, Some(original))
+                .is_err()
+        );
+        assert_eq!(*pane.last_requested_size.lock().unwrap(), (1, 1));
+        pane.resize_pty_under_order(3, 8, None, None, &mut ticket, Some(observed))
+            .unwrap();
+        assert_eq!(*pane.last_requested_size.lock().unwrap(), (3, 8));
+        // A later writer is allowed with a fresh source, without owner election.
+        let next = pane.terminal_grid.lock().unwrap().grid().revision();
+        pane.resize_pty_under_order(4, 9, None, None, &mut ticket, Some(next))
+            .unwrap();
+        assert_eq!(*pane.last_requested_size.lock().unwrap(), (4, 9));
+        assert!(
+            pane.resize_pty_under_order(2, 6, None, None, &mut ticket, Some(observed))
+                .is_err()
+        );
+        assert_eq!(*pane.last_requested_size.lock().unwrap(), (4, 9));
+    }
+
+    #[tokio::test]
+    async fn uncaptured_alternate_resize_acknowledges_master_without_queueing() {
+        let mut pane = dummy_pane(Uuid::new_v4());
+        let (input, mut queued) = mpsc::unbounded_channel();
+        pane.input_tx = input;
+        let pty = portable_pty::native_pty_system()
+            .openpty(PtySize {
+                rows: 1,
+                cols: 1,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .unwrap();
+        *pane.execution.master.lock().unwrap() = Some(pty.master);
+        pane.terminal_grid.lock().unwrap().process(b"\x1b[?1049h");
+        let revision = pane.terminal_grid.lock().unwrap().grid().revision();
+        let mut ticket = None;
+        pane.resize_pty_under_order(7, 19, None, None, &mut ticket, Some(revision))
+            .unwrap();
+        let actual = pane
+            .execution
+            .master
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .get_size()
+            .unwrap();
+        assert_eq!((actual.rows, actual.cols), (7, 19));
+        assert_eq!(*pane.last_requested_size.lock().unwrap(), (7, 19));
+        assert!(ticket.is_none());
+        assert!(matches!(
+            queued.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        // A legacy request queued before this acknowledgement cannot restore
+        // its superseded PTY dimensions. A current request remains permitted.
+        assert!(
+            !pane
+                .execution
+                .resize_if_current(&pane.last_requested_size, 1, 1)
+                .unwrap()
+        );
+        assert!(
+            pane.execution
+                .resize_if_current(&pane.last_requested_size, 7, 19)
+                .unwrap()
+        );
+        let actual = pane
+            .execution
+            .master
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .get_size()
+            .unwrap();
+        assert_eq!((actual.rows, actual.cols), (7, 19));
+    }
+
+    #[tokio::test]
+    async fn uncaptured_alternate_resize_never_acknowledges_missing_master() {
+        let pane = dummy_pane(Uuid::new_v4());
+        pane.terminal_grid.lock().unwrap().process(b"\x1b[?1049h");
+        let revision = pane.terminal_grid.lock().unwrap().grid().revision();
+        let mut ticket = None;
+        for (rows, cols) in [(1, 1), (7, 19)] {
+            assert!(
+                pane.resize_pty_under_order(rows, cols, None, None, &mut ticket, Some(revision))
+                    .is_err()
+            );
+            assert_eq!(*pane.last_requested_size.lock().unwrap(), (1, 1));
+            assert_eq!(
+                pane.terminal_grid.lock().unwrap().grid().revision(),
+                revision
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn alternate_resize_commits_geometry_in_ordered_capture() {
+        let pane = dummy_pane(Uuid::new_v4());
+        let pty = portable_pty::native_pty_system()
+            .openpty(PtySize {
+                rows: 1,
+                cols: 1,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .unwrap();
+        *pane.execution.master.lock().unwrap() = Some(pty.master);
+        let root = tempfile::tempdir().unwrap();
+        let capture = durable_capture::DurableCapture::create(root.path()).unwrap();
+        let (writer, mut owner) = capture_writer::CaptureWriter::start(capture).unwrap();
+        *pane.execution.capture_writer.lock().unwrap() = Some(writer.clone());
+        let output = writer
+            .reserve_output()
+            .unwrap()
+            .output(b"\x1b[?1049h".to_vec())
+            .unwrap();
+        pane.terminal_grid.lock().unwrap().process(b"\x1b[?1049h");
+        writer.projected(output).unwrap();
+        let revision = pane.terminal_grid.lock().unwrap().grid().revision();
+        let reservation = writer.reserve_resize().unwrap();
+        let order = pane.execution.capture_order.lock().unwrap();
+        writer
+            .wait_projected_raw(output.raw_end, Duration::from_secs(2))
+            .unwrap();
+        let mut ticket = None;
+        pane.resize_pty_under_order(3, 8, None, Some(reservation), &mut ticket, Some(revision))
+            .unwrap();
+        drop(order);
+        let ticket = ticket.expect("resize must publish an ordered event");
+        writer.wait_committed(ticket).unwrap();
+        assert!(ticket.sequence > output.sequence);
+        assert_eq!(ticket.raw_end, output.raw_end);
+        assert_eq!(writer.progress().unwrap().projected, ticket);
+        assert_eq!(*pane.last_requested_size.lock().unwrap(), (3, 8));
+        assert_eq!(pane.terminal_grid.lock().unwrap().grid().width(), 8);
+        assert_eq!(
+            pane.execution
+                .master
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .get_size()
+                .unwrap()
+                .cols,
+            8
+        );
+        let end = writer.reserve_end().unwrap().end(None).unwrap();
+        writer.wait_committed(end).unwrap();
+        owner.take().join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejected_alternate_resize_does_not_publish_reserved_capture_event() {
+        let pane = dummy_pane(Uuid::new_v4());
+        let root = tempfile::tempdir().unwrap();
+        let capture = durable_capture::DurableCapture::create(root.path()).unwrap();
+        let (writer, mut owner) = capture_writer::CaptureWriter::start(capture).unwrap();
+        *pane.execution.capture_writer.lock().unwrap() = Some(writer.clone());
+        let before = writer.progress().unwrap().admitted;
+        let reservation = writer.reserve_resize().unwrap();
+        let revision = pane.terminal_grid.lock().unwrap().grid().revision();
+        let mut ticket = None;
+        assert!(
+            pane.resize_pty_under_order(3, 8, None, Some(reservation), &mut ticket, Some(revision))
+                .is_err()
+        );
+        assert!(ticket.is_none());
+        assert_eq!(writer.progress().unwrap().admitted, before);
+        assert_eq!(*pane.last_requested_size.lock().unwrap(), (1, 1));
+        let end = writer.reserve_end().unwrap().end(None).unwrap();
+        writer.wait_committed(end).unwrap();
+        owner.take().join().unwrap();
     }
 
     #[tokio::test]

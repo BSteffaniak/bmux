@@ -27,6 +27,25 @@ pub struct ContentAnchor {
     pub column: usize,
 }
 
+/// A position in the complete prepared projection (not a window-relative row).
+/// A column equal to the prepared width is an insertion edge at a full line's
+/// end, not a cell or an extra projected row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContentPosition {
+    pub row: usize,
+    pub column: usize,
+}
+
+/// Cursor state captured atomically with a viewport's source cells.
+/// The anchor is an insertion boundary, after the final glyph for pending wrap.
+/// A positioned cursor inside a wide glyph is normalized to that glyph's start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContentCursor {
+    pub anchor: ContentAnchor,
+    pub visible: bool,
+    pub pending_wrap: bool,
+}
+
 /// Source extent of one projected row. Both anchors address the same logical
 /// line; `end` is exclusive, including when a wide glyph occupies one display
 /// column. An empty line has equal start/end anchors but is still a visible row.
@@ -120,6 +139,7 @@ pub struct ContentProjection {
     more_above: bool,
     history_truncated: bool,
     viewport_prefix_continues: bool,
+    cursor: Option<ContentCursor>,
     index: Option<WidthIndex>,
 }
 
@@ -236,6 +256,7 @@ impl TerminalGrid {
                 || history_used < self.main_history.len(),
             history_truncated: self.history_truncated,
             viewport_prefix_continues: false,
+            cursor: None,
             index: None,
         })
     }
@@ -246,8 +267,10 @@ impl TerminalGrid {
     /// history starts a capture-local logical fragment at column zero: hidden
     /// progress/history cells are neither copied nor revealed when widening.
     /// [`ContentProjection::viewport_prefix_continues`] reports that boundary.
-    /// The final blank cursor row is retained, unlike completed content capture.
-    /// Alternate screens are positioned output; use [`Self::screen_window`].
+    /// The final blank cursor row and blanks up to its insertion boundary are
+    /// retained, unlike completed content capture. Explicit trailing cells are
+    /// preserved. Cursor anchors are local to this viewport capture, never to
+    /// hidden history. Alternate screens are positioned output; use [`Self::screen_window`].
     ///
     /// # Errors
     /// Returns `Unavailable` in alternate mode and `BudgetExhausted` when the
@@ -271,15 +294,61 @@ impl TerminalGrid {
         }
         let mut lines = Vec::new();
         let mut cells = Vec::new();
+        let mut cursor = None;
+        let mut logical_column = 0;
         for (index, row) in self.main_rows.range(..end).enumerate() {
+            let cursor_column = if index == self.cursor.row {
+                let column = if self.pending_wrap {
+                    self.width
+                } else if row
+                    .cells()
+                    .get(self.cursor.col)
+                    .is_some_and(Cell::is_wide_continuation)
+                {
+                    // Positioned terminal cursors may address a continuation
+                    // slot; source anchors must name the complete glyph.
+                    self.cursor.col.saturating_sub(1)
+                } else {
+                    self.cursor.col
+                };
+                cursor = Some(ContentCursor {
+                    anchor: ContentAnchor {
+                        capture,
+                        line: lines.len(),
+                        column: logical_column + column,
+                    },
+                    visible: self.cursor.visible,
+                    pending_wrap: self.pending_wrap,
+                });
+                column
+            } else {
+                0
+            };
             copy_physical_row(&mut cells, row, self.width, &mut budget)?;
+            // Preserve implicit blanks up to the insertion boundary. They are
+            // source cells, not unbudgeted display padding or hidden history.
+            let row_columns = if row.wrapped() {
+                self.width
+            } else {
+                row.cells().len()
+            };
+            for _ in row_columns..cursor_column {
+                budget.charge(1, 0)?;
+                copy_cell(
+                    &mut cells,
+                    &Cell::blank(crate::StyleId::DEFAULT),
+                    &mut budget,
+                )?;
+            }
+            logical_column += row_columns.max(cursor_column);
             if !row.wrapped() || index + 1 == end {
-                push_line(
+                push_retained_line(
                     &mut lines,
                     std::mem::take(&mut cells),
                     row.wrapped(),
                     &mut budget,
                 )?;
+                logical_column = 0;
             }
         }
         Ok(ContentProjection {
@@ -289,6 +358,7 @@ impl TerminalGrid {
             more_above: !self.main_history.is_empty() || !self.pending_history_cells.is_empty(),
             history_truncated: self.history_truncated,
             viewport_prefix_continues: !self.pending_history_cells.is_empty(),
+            cursor,
             index: None,
         })
     }
@@ -668,6 +738,7 @@ impl ContentProjection {
             more_above,
             history_truncated,
             viewport_prefix_continues: false,
+            cursor: None,
             index: None,
         })
     }
@@ -820,6 +891,104 @@ impl ContentProjection {
             text.push_str(cell.text());
         }
         Ok(text)
+    }
+
+    /// Cursor captured with a live viewport; transcript/from-lines captures have
+    /// no execution cursor. Visibility does not affect source correspondence.
+    #[must_use]
+    pub const fn captured_cursor(&self) -> Option<ContentCursor> {
+        self.cursor
+    }
+
+    /// Resolve a source cell boundary or final insertion edge at the prepared
+    /// width. Internal soft-wrap boundaries belong to the following row. A full
+    /// final row returns `column == width`, without inventing a new row. Wide
+    /// source-cell interiors are invalid, even when a glyph is squeezed to one
+    /// display column. Work is bounded by the selected indexed row, not history.
+    ///
+    /// # Errors
+    /// Rejects foreign captures, unprepared/missing content, non-boundaries, and
+    /// exhausted work allowances. This method neither allocates nor mutates.
+    pub fn resolve_position(
+        &self,
+        anchor: ContentAnchor,
+        mut budget: ContentBudget,
+    ) -> Result<ContentPosition, HistorySliceError> {
+        if anchor.capture != self.capture {
+            return Err(HistorySliceError::StaleRevision);
+        }
+        let index = self.index.as_ref().ok_or(HistorySliceError::Unavailable)?;
+        let end = index
+            .rows
+            .partition_point(|row| (row.line, row.column) <= (anchor.line, anchor.column));
+        let row_index = end.checked_sub(1).ok_or(HistorySliceError::InvalidOffset)?;
+        let row = &index.rows[row_index];
+        if row.line != anchor.line {
+            return Err(HistorySliceError::InvalidOffset);
+        }
+        let line = &self.lines[row.line];
+        let mut logical = row.column;
+        let mut column = 0;
+        budget.charge(1, 0)?;
+        for cell in &line.cells[row.cells.clone()] {
+            budget.charge(1, 0)?;
+            if logical == anchor.column {
+                return Ok(ContentPosition {
+                    row: row_index,
+                    column,
+                });
+            }
+            let width = usize::from(cell.width()).max(1);
+            logical += width;
+            column = (column + width).min(index.width);
+        }
+        if logical == anchor.column {
+            Ok(ContentPosition {
+                row: row_index,
+                column,
+            })
+        } else {
+            Err(HistorySliceError::InvalidOffset)
+        }
+    }
+
+    /// Map a displayed cell to its complete owning source cell. Both columns of
+    /// a wide glyph map to its start; unused padding and insertion edges are not
+    /// cells and are rejected. Rows are relative to the complete projection.
+    ///
+    /// # Errors
+    /// Rejects unavailable rows, padding, and exhausted work allowances.
+    pub fn source_at(
+        &self,
+        position: ContentPosition,
+        mut budget: ContentBudget,
+    ) -> Result<ContentAnchor, HistorySliceError> {
+        let index = self.index.as_ref().ok_or(HistorySliceError::Unavailable)?;
+        let row = index
+            .rows
+            .get(position.row)
+            .ok_or(HistorySliceError::InvalidOffset)?;
+        if position.column >= index.width {
+            return Err(HistorySliceError::InvalidOffset);
+        }
+        let mut logical = row.column;
+        let mut column = 0;
+        budget.charge(1, 0)?;
+        for cell in &self.lines[row.line].cells[row.cells.clone()] {
+            budget.charge(1, 0)?;
+            let width = usize::from(cell.width()).max(1);
+            let end = (column + width).min(index.width);
+            if (column..end).contains(&position.column) {
+                return Ok(ContentAnchor {
+                    capture: self.capture,
+                    line: row.line,
+                    column: logical,
+                });
+            }
+            logical += width;
+            column = end;
+        }
+        Err(HistorySliceError::InvalidOffset)
     }
 
     /// Number of rows at the prepared width; unavailable before `prepare`.

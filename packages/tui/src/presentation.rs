@@ -4,6 +4,10 @@
 //! A prepared value is inspectable, but cannot commit itself. Only
 //! successful output through [`PresentationState::present`] advances authority.
 
+pub use crate::grid_fragment::{
+    GridTransform, PreparedGridFragment, PreparedGridOverlay, UnsupportedGridFragments,
+};
+
 use crate::buffer::Buffer;
 use crate::damage::Damage;
 use crate::focus::{FocusScopeId, FocusTrap, ModalFocus, modal_transition};
@@ -135,6 +139,7 @@ impl PresentationPhase {
 /// Transport envelopes project its primitives; this authority has no serde API.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreparedPresentation {
+    grid_fragments: Vec<PreparedGridFragment>,
     buffer: Buffer,
     cursor: Option<Cursor>,
     hits: HitMap,
@@ -153,6 +158,79 @@ pub struct PreparedPresentation {
 }
 
 impl PreparedPresentation {
+    /// Local grids in canonical compositor visibility; no independent hit scene.
+    #[must_use]
+    pub fn grid_fragments(&self) -> &[PreparedGridFragment] {
+        &self.grid_fragments
+    }
+
+    /// Explicit guard for backends implementing only the uniform root grid.
+    /// # Errors
+    /// Returns unsupported before any backend output when fragments are present.
+    pub const fn require_uniform_grid(&self) -> Result<(), UnsupportedGridFragments> {
+        if self.grid_fragments.is_empty() {
+            Ok(())
+        } else {
+            Err(UnsupportedGridFragments)
+        }
+    }
+
+    /// Stage a complete replacement fragment set, atomically and within limits.
+    /// Clips must be compositor-winning regions, not raw surface bounds. Higher
+    /// transparent paint must be supplied as original ordered sparse overlays,
+    /// never reconstructed from flattened root cells or removed with clip holes.
+    /// Metadata remains in this enclosing snapshot and must use these transforms.
+    /// This does not infer logical source text or repair stale root metadata.
+    /// # Errors
+    /// Rejects duplicate identities, overlapping/out-of-root clips, non-full
+    /// replacements, excessive clip work, or exceeded aggregate budgets.
+    pub fn set_grid_fragments(
+        &mut self,
+        fragments: Vec<PreparedGridFragment>,
+        limits: PresentationLimits,
+    ) -> Result<(), PresentationLimitError> {
+        if !matches!(self.damage, Damage::Full) || fragments.len() > 4096 {
+            return Err(PresentationLimitError::Entries);
+        }
+        let area = self.buffer.area();
+        let mut clips: Vec<Rect> = Vec::new();
+        let mut work = 0_usize;
+        for (index, fragment) in fragments.iter().enumerate() {
+            work = work.saturating_add(index);
+            if work > 1_000_000 {
+                return Err(PresentationLimitError::Entries);
+            }
+            if fragments[..index]
+                .iter()
+                .any(|old| old.id() == fragment.id())
+            {
+                return Err(PresentationLimitError::Entries);
+            }
+            for overlay in fragment.overlays() {
+                work = work.saturating_add(fragment.visible_clips().len().max(1));
+                if work > 1_000_000 || overlay.clip().intersection(area) != overlay.clip() {
+                    return Err(PresentationLimitError::Entries);
+                }
+            }
+            for clip in fragment.visible_clips() {
+                work = work.saturating_add(clips.len());
+                if work > 1_000_000
+                    || clip.intersection(area) != *clip
+                    || clips.iter().any(|old| !old.intersection(*clip).is_empty())
+                {
+                    return Err(PresentationLimitError::Entries);
+                }
+                clips.push(*clip);
+            }
+        }
+        let previous = std::mem::replace(&mut self.grid_fragments, fragments);
+        if let Err(error) = self.validate_limits(limits) {
+            self.grid_fragments = previous;
+            return Err(error);
+        }
+        Ok(())
+    }
+
     /// Stage caller-owned modal scopes in outer-to-inner order.
     ///
     /// Returns false for repeated identities or non-full damage. Modal lifecycle
@@ -327,6 +405,72 @@ impl PreparedPresentation {
         Ok(())
     }
 
+    fn validate_grid_limits(
+        &self,
+        limits: PresentationLimits,
+        add: &mut impl FnMut(usize, usize) -> Result<(), PresentationLimitError>,
+    ) -> Result<(), PresentationLimitError> {
+        let cells =
+            self.grid_fragments
+                .iter()
+                .try_fold(self.buffer.cells().len(), |total, fragment| {
+                    total
+                        .checked_add(fragment.buffer().cells().len())
+                        .and_then(|total| {
+                            fragment.overlays().iter().try_fold(total, |n, overlay| {
+                                n.checked_add(overlay.buffer().cells().len())
+                            })
+                        })
+                        .ok_or(PresentationLimitError::Cells)
+                })?;
+        if cells > limits.max_cells {
+            return Err(PresentationLimitError::Cells);
+        }
+        for fragment in &self.grid_fragments {
+            add(1 + fragment.visible_clips().len(), fragment.id().len())?;
+            add(
+                0,
+                fragment
+                    .visible_clips()
+                    .len()
+                    .checked_mul(std::mem::size_of::<Rect>())
+                    .ok_or(PresentationLimitError::Bytes)?,
+            )?;
+            add(
+                0,
+                fragment
+                    .buffer()
+                    .cells()
+                    .len()
+                    .checked_mul(std::mem::size_of::<crate::buffer::Cell>())
+                    .ok_or(PresentationLimitError::Bytes)?,
+            )?;
+            for overlay in fragment.overlays() {
+                add(1, std::mem::size_of_val(overlay))?;
+                add(
+                    0,
+                    overlay
+                        .buffer()
+                        .cells()
+                        .len()
+                        .checked_mul(std::mem::size_of::<crate::buffer::Cell>())
+                        .ok_or(PresentationLimitError::Bytes)?,
+                )?;
+                for cell in overlay.buffer().cells() {
+                    add(0, cell.symbol.len())?;
+                }
+            }
+            for image in fragment.images() {
+                add(1, image.key.as_str().len())?;
+                add(0, crate::grid_fragment::image_payload_bytes(&image.payload))?;
+            }
+            for cell in fragment.buffer().cells() {
+                add(0, cell.symbol.len())?;
+            }
+        }
+        Ok(())
+    }
+
     /// Recheck the complete snapshot after caller-owned metadata staging.
     ///
     /// # Errors
@@ -336,11 +480,6 @@ impl PreparedPresentation {
         &self,
         limits: PresentationLimits,
     ) -> Result<(), PresentationLimitError> {
-        if usize::from(self.buffer.area().width) * usize::from(self.buffer.area().height)
-            > limits.max_cells
-        {
-            return Err(PresentationLimitError::Cells);
-        }
         let mut entries = 0_usize;
         let mut bytes = 0_usize;
         let mut add = |count: usize, size: usize| -> Result<(), PresentationLimitError> {
@@ -358,6 +497,7 @@ impl PreparedPresentation {
             }
             Ok(())
         };
+        self.validate_grid_limits(limits, &mut add)?;
         for cell in self.buffer.cells() {
             add(0, cell.symbol.len())?;
         }
@@ -498,6 +638,7 @@ impl<E: std::error::Error + 'static> std::error::Error for PresentationError<E> 
 /// interactions and invalidates cell history so a retry must repaint fully.
 #[derive(Debug, Clone)]
 pub struct PresentationState {
+    grid_fragments: Vec<PreparedGridFragment>,
     area: Rect,
     previous: Option<Buffer>,
     hits: HitMap,
@@ -519,6 +660,7 @@ impl PresentationState {
     #[must_use]
     pub fn new(area: Rect) -> Self {
         Self {
+            grid_fragments: Vec::new(),
             area,
             previous: None,
             hits: HitMap::new(),
@@ -545,6 +687,12 @@ impl PresentationState {
     pub const fn retained_buffer(&self) -> Option<&Buffer> {
         self.previous.as_ref()
     }
+    /// Last successfully delivered local grids, including their transforms/clips.
+    #[must_use]
+    pub fn grid_fragments(&self) -> &[PreparedGridFragment] {
+        &self.grid_fragments
+    }
+
     /// Last committed cursor.
     #[must_use]
     pub const fn cursor(&self) -> Option<Cursor> {
@@ -645,6 +793,9 @@ impl PresentationState {
     /// replaced regions. Opaque overlays may be repainted regionally: coverage
     /// removes underlying metadata without promoting the update to full damage.
     /// When an overlay moves or closes, callers must repaint its exposed old area.
+    /// Regional callbacks must paint the complete root while local grids are
+    /// committed; such updates are promoted to full replacement and the caller
+    /// must reinstall current fragments before delivery.
     /// The caller must bound viewport size and render contributions; preparation
     /// retains one previous grid and stages one new grid, never a frame queue.
     #[must_use]
@@ -761,6 +912,13 @@ impl PresentationState {
         repair: bool,
         render: impl FnOnce(&mut PaintCx<'_, '_>),
     ) -> Option<PreparedPresentation> {
+        // Local-grid contributions are full replacements. A regional caller must
+        // repaint the complete root and explicitly reinstall winning fragments.
+        let damage = if !self.grid_fragments.is_empty() && !damage.is_none() {
+            Damage::Full
+        } else {
+            damage
+        };
         let mut damage = if self.previous.is_none() {
             Damage::Full
         } else {
@@ -929,6 +1087,7 @@ impl PresentationState {
             || {
                 let focus = FocusTrap::from_hits(&hits, focus_scope.as_ref(), self.focus.active());
                 Some(PreparedPresentation {
+                    grid_fragments: Vec::new(),
                     buffer,
                     cursor,
                     hits,
@@ -1039,6 +1198,7 @@ impl PresentationState {
         };
         PresentationPhase::TerminalCommit.measure(
             || {
+                self.grid_fragments = prepared.grid_fragments;
                 self.previous = Some(prepared.buffer);
                 self.hits = prepared.hits;
                 self.focus = prepared.focus;
@@ -1066,6 +1226,137 @@ mod tests {
     use crate::hit::HitRegion;
     use crate::paint::LocalRect;
     use crate::style::Style;
+
+    #[test]
+    fn sparse_overlays_charge_cells_bytes_and_preserve_previous_frame() {
+        use std::sync::Arc;
+        let state = PresentationState::new(Rect::new(0, 0, 4, 2));
+        let mut prepared = state.prepare(Damage::Full, |_| {}).unwrap();
+        let fragment = PreparedGridFragment::new(
+            "content",
+            Arc::new(Buffer::empty(Rect::new(0, 0, 1, 1))),
+            GridTransform::new(Point::new(0, 0), 1000).unwrap(),
+            vec![Rect::new(0, 0, 2, 1)],
+        )
+        .unwrap()
+        .with_overlays(vec![
+            PreparedGridOverlay::new(
+                Arc::new(Buffer::empty(Rect::new(0, 0, 2, 1))),
+                Rect::new(0, 0, 2, 1),
+                false,
+            )
+            .unwrap(),
+        ])
+        .unwrap();
+        let limits = PresentationLimits {
+            max_cells: 100,
+            max_entries: 100,
+            max_bytes: 10_000,
+        };
+        prepared
+            .set_grid_fragments(vec![fragment.clone()], limits)
+            .unwrap();
+        assert!(
+            prepared
+                .set_grid_fragments(
+                    vec![fragment.clone()],
+                    PresentationLimits {
+                        max_cells: 10,
+                        ..limits
+                    }
+                )
+                .is_err()
+        );
+        assert!(
+            prepared
+                .set_grid_fragments(
+                    vec![fragment],
+                    PresentationLimits {
+                        max_bytes: 1,
+                        ..limits
+                    }
+                )
+                .is_err()
+        );
+        assert_eq!(prepared.grid_fragments()[0].overlays().len(), 1);
+        assert_eq!(
+            prepared.grid_fragments()[0].overlays()[0].clip(),
+            Rect::new(0, 0, 2, 1)
+        );
+    }
+
+    #[test]
+    fn local_grids_admit_atomically_and_commit_only_with_output() {
+        use std::sync::Arc;
+        let limits = PresentationLimits {
+            max_cells: 100,
+            max_entries: 100,
+            max_bytes: 10_000,
+        };
+        let mut state = PresentationState::new(Rect::new(0, 0, 4, 2));
+        let mut prepared = state.prepare(Damage::Full, |_| {}).unwrap();
+        let fragment = PreparedGridFragment::new(
+            "content",
+            Arc::new(Buffer::empty(Rect::new(0, 0, 2, 1))),
+            GridTransform::new(Point::new(1, 0), 500).unwrap(),
+            vec![Rect::new(1, 0, 1, 1)],
+        )
+        .unwrap();
+        prepared
+            .set_grid_fragments(vec![fragment.clone()], limits)
+            .unwrap();
+        assert!(prepared.require_uniform_grid().is_err());
+        assert!(
+            prepared
+                .set_grid_fragments(vec![fragment.clone(), fragment.clone()], limits)
+                .is_err()
+        );
+        assert_eq!(prepared.grid_fragments().len(), 1);
+        let outside = PreparedGridFragment::new(
+            "outside",
+            Arc::new(Buffer::empty(Rect::new(0, 0, 1, 1))),
+            GridTransform::new(Point::new(0, 0), 1000).unwrap(),
+            vec![Rect::new(4, 0, 1, 1)],
+        )
+        .unwrap();
+        assert!(prepared.set_grid_fragments(vec![outside], limits).is_err());
+        let overlap = PreparedGridFragment::new(
+            "overlap",
+            Arc::new(Buffer::empty(Rect::new(0, 0, 1, 1))),
+            GridTransform::new(Point::new(0, 0), 1000).unwrap(),
+            vec![Rect::new(1, 0, 1, 1)],
+        )
+        .unwrap();
+        assert!(
+            prepared
+                .set_grid_fragments(vec![fragment.clone(), overlap], limits)
+                .is_err()
+        );
+        let tiny = PresentationLimits {
+            max_cells: 8,
+            ..limits
+        };
+        assert!(prepared.set_grid_fragments(vec![fragment], tiny).is_err());
+        assert_eq!(prepared.grid_fragments().len(), 1);
+        assert!(
+            state
+                .present_prepared(Some(prepared.clone()), |_, _| Err::<(), _>("failed"))
+                .is_err()
+        );
+        assert_eq!(state.grid_fragments(), []);
+        state
+            .present_prepared(Some(prepared), |_, _| Ok::<_, ()>(()))
+            .unwrap();
+        assert_eq!(state.grid_fragments().len(), 1);
+        let replacement = state.prepare(Damage::Full, |_| {}).unwrap();
+        assert!(replacement.require_uniform_grid().is_ok());
+        assert!(
+            state
+                .present_prepared(Some(replacement), |_, _| Err::<(), _>("failed replacement"))
+                .is_err()
+        );
+        assert_eq!(state.grid_fragments().len(), 1);
+    }
 
     #[test]
     fn diagnostic_scope_restores_after_nested_unwind_and_disabled_skips_predicate() {

@@ -310,6 +310,7 @@ pub struct AttachViewState {
     pub image_execution_incarnations: BTreeMap<Uuid, Uuid>,
     /// Viewport selected by the attach driver, never inferred from outer stdout.
     pub driver_geometry: Option<super::input::TerminalGeometry>,
+    pub(super) pane_zoom: super::pane_zoom_native::PaneZoomState,
     pub pane_buffers: BTreeMap<Uuid, PaneRenderBuffer>,
     pub scoped_pane_appearances: BTreeMap<Uuid, RuntimeAppearance>,
     pub terminal_graphics_cache: TerminalGraphicsCache,
@@ -615,6 +616,9 @@ pub struct AttachMouseResizeAxisDrag {
 impl AttachViewState {
     /// Bind the explicitly authorized observer to this view, never a global registry.
     pub fn set_observer(&mut self, publisher: super::observer::AttachObserverPublisher) {
+        self.pane_zoom
+            .shared
+            .clone_from(&publisher.pane_zoom_shared);
         self.observer = Some(publisher);
         self.dirty.mark_full_frame(AttachDirtySource::ManualRedraw);
     }
@@ -689,6 +693,7 @@ impl AttachViewState {
             cached_context_session_bindings: Vec::new(),
             image_execution_incarnations: BTreeMap::new(),
             driver_geometry: None,
+            pane_zoom: super::pane_zoom_native::PaneZoomState::default(),
             pane_buffers: BTreeMap::new(),
             scoped_pane_appearances: BTreeMap::new(),
             terminal_graphics_cache: TerminalGraphicsCache::new(),

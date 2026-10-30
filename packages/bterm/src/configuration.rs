@@ -155,6 +155,8 @@ pub struct NativeConfiguration {
     pub window: WindowConfiguration,
     pub companion: CompanionConfiguration,
     pub typography: crate::typography::TypographyConfiguration,
+    /// Shared zoom policy and explicitly scoped bindings; omitted scopes are window-local.
+    /// Pane targets are resolved from committed local-view state, never server arrangements.
     pub zoom: crate::zoom::ZoomConfiguration,
 }
 

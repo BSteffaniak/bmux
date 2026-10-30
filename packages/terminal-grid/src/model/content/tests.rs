@@ -484,6 +484,212 @@ fn bounded_tail_matches_existing_full_content_without_materializing_history() {
 }
 
 #[test]
+fn projection_positions_map_complete_cells_and_insertion_edges() {
+    let (_, mut content) = capture("a界e\u{301}z", 10, 2);
+    content.prepare(3, budget()).unwrap();
+    let anchor = |column| ContentAnchor {
+        capture: 42,
+        line: 0,
+        column,
+    };
+    assert_eq!(
+        content.resolve_position(anchor(3), budget()).unwrap(),
+        ContentPosition { row: 1, column: 0 }
+    );
+    assert_eq!(
+        content.resolve_position(anchor(5), budget()).unwrap(),
+        ContentPosition { row: 1, column: 2 }
+    );
+    assert_eq!(
+        content.resolve_position(anchor(2), budget()),
+        Err(HistorySliceError::InvalidOffset)
+    );
+    for column in [1, 2] {
+        assert_eq!(
+            content
+                .source_at(ContentPosition { row: 0, column }, budget())
+                .unwrap(),
+            anchor(1)
+        );
+    }
+    assert_eq!(
+        content.source_at(ContentPosition { row: 1, column: 2 }, budget()),
+        Err(HistorySliceError::InvalidOffset)
+    );
+    content.prepare(1, budget()).unwrap();
+    assert_eq!(
+        content.resolve_position(anchor(1), budget()).unwrap(),
+        ContentPosition { row: 1, column: 0 }
+    );
+    assert_eq!(
+        content
+            .source_at(ContentPosition { row: 1, column: 0 }, budget())
+            .unwrap(),
+        anchor(1)
+    );
+    assert_eq!(
+        content.resolve_position(anchor(3), budget()).unwrap(),
+        ContentPosition { row: 2, column: 0 }
+    );
+    assert_eq!(
+        content.resolve_position(anchor(5), budget()).unwrap(),
+        ContentPosition { row: 3, column: 1 }
+    );
+    assert_eq!(content.row_count(), Some(4));
+    assert_eq!(content.resolve(anchor(5)), None); // Existing cell-only API stays unchanged.
+    assert_eq!(
+        content.resolve_position(anchor(6), budget()),
+        Err(HistorySliceError::InvalidOffset)
+    );
+}
+
+#[test]
+fn viewport_cursor_preserves_blank_columns_wrap_and_local_prefix() {
+    for (text, width, expected, pending) in [
+        ("hello\r\n", 8, (1, 0), false),
+        ("\x1b[1;7H", 8, (0, 6), false),
+        ("abcd", 4, (0, 4), true),
+        ("ab界", 4, (0, 4), true),
+        ("abcdefghij", 4, (0, 6), false),
+        ("界\x1b[1;2H", 4, (0, 0), false),
+    ] {
+        let (stream, _) = capture(text, width, 2);
+        let before = stream.grid().snapshot(0, 2);
+        let mut content = stream.grid().capture_viewport(71, budget()).unwrap();
+        let cursor = content.captured_cursor().unwrap();
+        assert_eq!(
+            (cursor.anchor.line, cursor.anchor.column),
+            expected,
+            "{text:?}"
+        );
+        assert_eq!(cursor.pending_wrap, pending);
+        for columns in [1, 3, 8] {
+            content.prepare(columns, budget()).unwrap();
+            let position = content.resolve_position(cursor.anchor, budget()).unwrap();
+            assert!(position.row < content.row_count().unwrap());
+            assert!(position.column <= columns);
+        }
+        assert_eq!(stream.grid().snapshot(0, 2), before);
+    }
+    let (stream, _) = capture("abcd", 4, 2);
+    let mut content = stream.grid().capture_viewport(72, budget()).unwrap();
+    content.prepare(2, budget()).unwrap();
+    assert_eq!(
+        content
+            .resolve_position(content.captured_cursor().unwrap().anchor, budget())
+            .unwrap(),
+        ContentPosition { row: 1, column: 2 }
+    );
+    content.prepare(8, budget()).unwrap();
+    assert_eq!(
+        content
+            .resolve_position(content.captured_cursor().unwrap().anchor, budget())
+            .unwrap(),
+        ContentPosition { row: 0, column: 4 }
+    );
+}
+
+#[test]
+fn position_mapping_rejects_stale_unprepared_and_exhausted_work() {
+    let (stream, mut content) = capture("界abc", 8, 2);
+    let anchor = ContentAnchor {
+        capture: 42,
+        line: 0,
+        column: 2,
+    };
+    assert!(content.captured_cursor().is_none());
+    assert_eq!(
+        content.resolve_position(anchor, budget()),
+        Err(HistorySliceError::Unavailable)
+    );
+    content.prepare(3, budget()).unwrap();
+    assert_eq!(
+        content.resolve_position(
+            ContentAnchor {
+                capture: 43,
+                ..anchor
+            },
+            budget()
+        ),
+        Err(HistorySliceError::StaleRevision)
+    );
+    let exhausted = ContentBudget { cells: 0, bytes: 0 };
+    assert_eq!(
+        content.resolve_position(anchor, exhausted),
+        Err(HistorySliceError::BudgetExhausted)
+    );
+    assert_eq!(
+        content.source_at(ContentPosition { row: 0, column: 0 }, exhausted),
+        Err(HistorySliceError::BudgetExhausted)
+    );
+    assert_eq!(
+        content.prepare(1, exhausted),
+        Err(HistorySliceError::BudgetExhausted)
+    );
+    assert_eq!(
+        content.resolve_position(anchor, budget()).unwrap(),
+        ContentPosition { row: 0, column: 2 }
+    );
+    let mut other = stream.grid().capture_viewport(99, budget()).unwrap();
+    other.prepare(3, budget()).unwrap();
+    assert_eq!(
+        other.resolve_position(anchor, budget()),
+        Err(HistorySliceError::StaleRevision)
+    );
+    let mut limited = budget();
+    limited.cells = 1;
+    assert!(matches!(
+        stream.grid().capture_viewport(100, limited),
+        Err(HistorySliceError::BudgetExhausted)
+    ));
+}
+
+#[test]
+fn viewport_projections_are_independent_and_cursor_visibility_is_captured() {
+    let (mut stream, _) = capture("ab界cd\x1b[?25l", 10, 3);
+    let before = stream.grid().snapshot(0, 3);
+    let mut narrow = stream.grid().capture_viewport(10, budget()).unwrap();
+    let mut wide = stream.grid().capture_viewport(10, budget()).unwrap();
+    narrow.prepare(3, budget()).unwrap();
+    wide.prepare(10, budget()).unwrap();
+    let cursor = narrow.captured_cursor().unwrap();
+    assert!(!cursor.visible);
+    assert_eq!(cursor, wide.captured_cursor().unwrap());
+    assert_eq!(
+        narrow.resolve_position(cursor.anchor, budget()).unwrap(),
+        ContentPosition { row: 2, column: 1 }
+    );
+    assert_eq!(
+        wide.resolve_position(cursor.anchor, budget()).unwrap(),
+        ContentPosition { row: 0, column: 6 }
+    );
+    // A short row before a wide glyph has padding, not another source cell.
+    assert_eq!(
+        narrow.source_at(ContentPosition { row: 0, column: 2 }, budget()),
+        Err(HistorySliceError::InvalidOffset)
+    );
+    assert_eq!(stream.grid().snapshot(0, 3), before);
+    stream.process(b"z");
+    let mut changed = stream.grid().capture_viewport(11, budget()).unwrap();
+    changed.prepare(3, budget()).unwrap();
+    assert_eq!(
+        changed.resolve_position(cursor.anchor, budget()),
+        Err(HistorySliceError::StaleRevision)
+    );
+    assert!(narrow.resolve_position(cursor.anchor, budget()).is_ok());
+    assert!(matches!(
+        stream.grid().capture_viewport(
+            12,
+            ContentBudget {
+                cells: 1_000,
+                bytes: 0
+            }
+        ),
+        Err(HistorySliceError::BudgetExhausted)
+    ));
+}
+
+#[test]
 fn positioned_crop_is_reversible_and_does_not_break_wide_cells() {
     let (stream, _) = capture("main\x1b[?1049h\x1b[Habcdef界", 10, 3);
     let grid = stream.grid();

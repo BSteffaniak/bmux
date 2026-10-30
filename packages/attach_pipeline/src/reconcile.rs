@@ -81,7 +81,10 @@ pub fn attach_layout_requires_snapshot_hydration(
     attach_layout_pane_id_set(previous) != attach_layout_pane_id_set(next)
 }
 
-fn subtract_damage_rect(previous: DamageRect, next: DamageRect) -> [Option<DamageRect>; 4] {
+pub(crate) fn subtract_damage_rect(
+    previous: DamageRect,
+    next: DamageRect,
+) -> [Option<DamageRect>; 4] {
     let horizontal_start = previous.x.max(next.x);
     let vertical_start = previous.y.max(next.y);
     let horizontal_end = previous.right().min(next.right());
@@ -345,6 +348,27 @@ pub fn resize_attach_grids_for_scene_with_size(
     cols: u16,
     rows: u16,
 ) {
+    resize_attach_grids_for_scene_with_size_preserving(
+        pane_buffers,
+        scene,
+        cols,
+        rows,
+        &BTreeSet::new(),
+    );
+}
+
+/// Preserve execution replicas independently of local presentation geometry.
+///
+/// Local zoom views retain replicas (including alternate screens) until an
+/// authoritative snapshot/delta supplies the execution size. Callers must retain
+/// membership while zoom is active, not merely on frames where zoom changes.
+pub fn resize_attach_grids_for_scene_with_size_preserving(
+    pane_buffers: &mut BTreeMap<Uuid, PaneRenderBuffer>,
+    scene: &AttachScene,
+    cols: u16,
+    rows: u16,
+    preserved_panes: &BTreeSet<Uuid>,
+) {
     if cols == 0 || rows <= 1 {
         return;
     }
@@ -353,7 +377,7 @@ pub fn resize_attach_grids_for_scene_with_size(
         let Some(pane_id) = surface.pane_id else {
             continue;
         };
-        if !surface.visible {
+        if !surface.visible || preserved_panes.contains(&pane_id) {
             continue;
         }
         // Size the structured grid to the scene's authoritative content_rect
@@ -376,6 +400,9 @@ pub fn resize_attach_grids_for_scene_with_size(
             h: inner_h,
         };
         let buffer = pane_buffers.entry(pane_id).or_default();
+        if buffer.local_zoom.preserve_execution_geometry {
+            continue;
+        }
         let previous_grid_size = (
             buffer.terminal_grid.grid().width(),
             buffer.terminal_grid.grid().height(),
@@ -474,6 +501,43 @@ mod tests {
             pane_buffers[&pane_id].prev_rows,
             [] as [std::string::String; 0]
         );
+    }
+
+    #[test]
+    fn zoom_preserves_replica_geometry_and_uniform_path_still_resizes() {
+        let pane = Uuid::from_u128(1);
+        let uniform = Uuid::from_u128(2);
+        let test_scene = scene(vec![
+            pane_surface(Uuid::from_u128(10), pane, 0, 0, 10, 3, 0),
+            pane_surface(Uuid::from_u128(20), uniform, 0, 0, 10, 3, 0),
+        ]);
+        for alternate in [false, true] {
+            let mut buffers = BTreeMap::<Uuid, PaneRenderBuffer>::new();
+            for id in [pane, uniform] {
+                let buffer = buffers.entry(id).or_default();
+                buffer.terminal_grid.resize(20, 5).unwrap();
+                buffer.terminal_grid.process(b"execution content");
+                if alternate {
+                    buffer.terminal_grid.process(b"\x1b[?1049halt");
+                }
+                buffer.prev_rows.push("cached".into());
+            }
+            let before = buffers[&pane].terminal_grid.grid().snapshot(0, 5);
+            resize_attach_grids_for_scene_with_size_preserving(
+                &mut buffers,
+                &test_scene,
+                10,
+                3,
+                &BTreeSet::from([pane]),
+            );
+            assert_eq!(buffers[&pane].terminal_grid.grid().snapshot(0, 5), before);
+            assert_eq!(buffers[&pane].prev_rows, ["cached"]);
+            assert_ne!(buffers[&uniform].terminal_grid.grid().width(), 20);
+            assert_eq!(buffers[&uniform].prev_rows, Vec::<String>::new());
+            resize_attach_grids_for_scene_with_size(&mut buffers, &test_scene, 10, 3);
+            assert_ne!(buffers[&pane].terminal_grid.grid().width(), 20);
+            assert_eq!(buffers[&pane].prev_rows, Vec::<String>::new());
+        }
     }
 
     #[test]

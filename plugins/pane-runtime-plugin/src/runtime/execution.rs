@@ -88,6 +88,36 @@ impl Default for ExecutionCapture {
 }
 
 impl ExecutionCapture {
+    /// Apply only the currently published legacy request. Hold the geometry
+    /// lock through the ioctl so synchronous view sizing cannot be overwritten
+    /// by an older queued command after it has acknowledged success.
+    pub(super) fn resize_if_current(
+        &self,
+        size: &Mutex<(u16, u16)>,
+        rows: u16,
+        cols: u16,
+    ) -> std::io::Result<bool> {
+        let current = size
+            .lock()
+            .map_err(|_| std::io::Error::other("geometry lock poisoned"))?;
+        if *current != (rows, cols) {
+            return Ok(false);
+        }
+        self.master
+            .lock()
+            .map_err(|_| std::io::Error::other("PTY master lock poisoned"))?
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("PTY master unavailable"))?
+            .resize(portable_pty::PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .map_err(std::io::Error::other)?;
+        Ok(true)
+    }
+
     pub(super) fn writer(&self) -> std::io::Result<Option<super::capture_writer::CaptureWriter>> {
         self.capture_writer
             .lock()
@@ -397,7 +427,7 @@ pub(crate) fn managed_program_ids() -> anyhow::Result<std::collections::BTreeSet
         .collect())
 }
 
-fn failed(error: impl std::fmt::Display) -> ExecutionError {
+pub(super) fn failed(error: impl std::fmt::Display) -> ExecutionError {
     ExecutionError::OperationFailed {
         reason: error.to_string(),
     }
@@ -959,6 +989,109 @@ pub(crate) fn send(
     })
 }
 
+pub(super) fn validate_alternate_source(
+    grid: &bmux_terminal_grid::TerminalGrid,
+    expected_grid_revision: u64,
+) -> Result<(), ExecutionError> {
+    if grid.mode() != bmux_terminal_grid::GridMode::Alternate {
+        return Err(ExecutionError::InvalidOptions {
+            reason: "execution sizing requires the alternate screen; normal-screen zoom is local"
+                .into(),
+        });
+    }
+    if grid.revision() != expected_grid_revision {
+        return Err(failed(
+            "stale source grid revision; refresh the structured source",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_view_size(cols: u16, rows: u16) -> Result<(), ExecutionError> {
+    validate_size(cols, rows)?;
+    if usize::from(cols) * usize::from(rows) > 262_144 {
+        return Err(ExecutionError::InvalidOptions {
+            reason: "PTY dimensions exceed 262144 cells".into(),
+        });
+    }
+    Ok(())
+}
+
+/// Conditional last-writer execution sizing, never view state or layout mutation.
+/// Reserve and drain outside the manager, then revalidate identity and mode in
+/// the same geometry transaction that commits the resize.
+pub(crate) fn resize_alternate(
+    reference: &ExecutionRef,
+    expected_grid_revision: u64,
+    cols: u16,
+    rows: u16,
+    authorize: impl Fn() -> Result<(), ExecutionError>,
+) -> Result<(), ExecutionError> {
+    authorize()?;
+    validate_view_size(cols, rows)?;
+    let execution = with_pane(reference, |pane| Ok(Arc::clone(&pane.execution)))?;
+    let writer = execution.writer().map_err(failed)?;
+    let reservation = writer
+        .as_ref()
+        .map(super::capture_writer::CaptureWriter::reserve_resize)
+        .transpose()
+        .map_err(failed)?;
+    let order = execution.capture_order.lock().map_err(failed)?;
+    if let Some(writer) = &writer {
+        writer.check_open().map_err(failed)?;
+        let boundary = writer.progress().map_err(failed)?.admitted.raw_end;
+        writer
+            .wait_projected_raw(boundary, Duration::from_secs(2))
+            .map_err(failed)?;
+    }
+    let boundary = execution
+        .durable_capture
+        .lock()
+        .map_err(failed)?
+        .as_ref()
+        .map(super::durable_capture::DurableCapture::raw_bytes);
+    if let Some(boundary) = boundary {
+        execution.wait_for_projection(boundary).map_err(failed)?;
+    }
+    authorize()?;
+    let mut ticket = None;
+    let result = with_pane(reference, |pane| {
+        if !Arc::ptr_eq(&execution, &pane.execution) {
+            return Err(ExecutionError::StaleExecution);
+        }
+        if pane.exited.load(Ordering::SeqCst)
+            || execution.terminal_session_ended.load(Ordering::SeqCst)
+            || execution.terminal_owner_retired.load(Ordering::SeqCst)
+            || execution.capture_failure().is_some()
+        {
+            return Err(failed("execution is not available for sizing"));
+        }
+        let permit = Arc::clone(&execution.admission)
+            .try_acquire_owned()
+            .map_err(failed)?;
+        pane.resize_pty_under_order(
+            rows,
+            cols,
+            Some(permit),
+            reservation,
+            &mut ticket,
+            Some(expected_grid_revision),
+        )?;
+        if ticket.is_none()
+            && let Some(writer) = &writer
+        {
+            ticket = Some(writer.progress().map_err(failed)?.projected);
+        }
+        Ok(())
+    });
+    drop(order);
+    result?;
+    if let (Some(writer), Some(ticket)) = (writer, ticket) {
+        writer.wait_committed(ticket).map_err(failed)?;
+    }
+    Ok(())
+}
+
 pub(crate) fn resize_ordered(
     reference: &ExecutionRef,
     cols: u16,
@@ -1034,7 +1167,7 @@ pub(crate) fn resize(reference: &ExecutionRef, cols: u16, rows: u16) -> Result<(
             return Ok(());
         }
         let geometry_revision = pane.execution.geometry_revision.load(Ordering::SeqCst);
-        pane.resize_pty_under_order(rows, cols, Some(permit), reservation, &mut ticket);
+        pane.resize_pty_under_order(rows, cols, Some(permit), reservation, &mut ticket, None)?;
         if pane.execution.geometry_revision.load(Ordering::SeqCst) == geometry_revision
             || *pane.last_requested_size.lock().map_err(failed)? != (rows, cols)
         {
@@ -1363,6 +1496,55 @@ fn install_reserved_capture(
 #[cfg(test)]
 mod tests {
     use super::StopAction;
+
+    #[test]
+    fn alternate_view_size_is_bounded_before_runtime_lookup() {
+        for (cols, rows) in [(0, 1), (1, 0), (1001, 1), (1, 1001), (513, 512)] {
+            assert!(matches!(
+                super::validate_view_size(cols, rows),
+                Err(super::ExecutionError::InvalidOptions { .. })
+            ));
+        }
+        for (cols, rows) in [(1, 1), (1000, 1), (1, 1000), (512, 512)] {
+            assert!(super::validate_view_size(cols, rows).is_ok());
+        }
+    }
+
+    #[test]
+    fn alternate_source_rejects_normal_stale_and_reentered_screen() {
+        let mut source = bmux_terminal_grid::TerminalGridStream::new(
+            10,
+            2,
+            bmux_terminal_grid::GridLimits::default(),
+        )
+        .unwrap();
+        let normal = source.grid().revision();
+        assert!(super::validate_alternate_source(source.grid(), normal).is_err());
+        source.process(b"\x1b[?1049h");
+        let alternate = source.grid().revision();
+        assert!(super::validate_alternate_source(source.grid(), alternate).is_ok());
+        assert!(super::validate_alternate_source(source.grid(), normal).is_err());
+        source.process(b"\x1b[?1049l\x1b[?1049h");
+        assert!(super::validate_alternate_source(source.grid(), alternate).is_err());
+    }
+
+    #[test]
+    fn alternate_resize_authorization_precedes_runtime_access() {
+        let execution = super::ExecutionRef {
+            session_id: uuid::Uuid::new_v4(),
+            pane_id: uuid::Uuid::new_v4(),
+            execution_token: uuid::Uuid::new_v4(),
+        };
+        assert!(matches!(
+            super::resize_alternate(&execution, 0, 80, 24, || {
+                Err(super::ExecutionError::Denied {
+                    reason: "revoked".into(),
+                })
+            }),
+            Err(super::ExecutionError::Denied { .. })
+        ));
+    }
+
     #[tokio::test]
     async fn execution_keeps_live_drain_and_committed_capture_distinct() {
         let root = tempfile::tempdir().unwrap();

@@ -278,6 +278,29 @@ mod tests {
         assert_eq!(decoded, capture);
     }
 
+    #[test]
+    fn alternate_view_size_generated_request_preserves_source_precondition() {
+        use crate::pane_runtime_execution_v4::TerminalExecutionRef;
+        use crate::pane_runtime_view_size_v1::client::ResizeAlternateRequest;
+
+        let request = ResizeAlternateRequest {
+            execution: TerminalExecutionRef {
+                session_id: uuid::Uuid::new_v4(),
+                pane_id: uuid::Uuid::new_v4(),
+                execution_token: uuid::Uuid::new_v4(),
+            },
+            expected_grid_revision: 42,
+            cols: 91,
+            rows: 31,
+        };
+        let encoded = bmux_codec::to_vec(&request).unwrap();
+        let decoded: ResizeAlternateRequest = bmux_codec::from_bytes(&encoded).unwrap();
+        assert_eq!(decoded.execution, request.execution);
+        assert_eq!(decoded.expected_grid_revision, 42);
+        assert_eq!((decoded.cols, decoded.rows), (91, 31));
+        assert!(!format!("{request:?}").contains(&request.execution.execution_token.to_string()));
+    }
+
     use pane_runtime_commands::client::SetPanePaddingRequest;
 
     #[test]

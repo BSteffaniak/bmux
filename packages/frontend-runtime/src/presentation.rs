@@ -39,6 +39,7 @@ pub struct PreparedDelivery {
 /// Failed provenance admission; no backend output or interaction commit occurred.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeliveryRejection {
+    UnsupportedGridFragments,
     Identity,
     Viewport,
     Stale,
@@ -159,6 +160,22 @@ impl PresentationAuthority {
         delivery: PreparedDelivery,
         output: impl FnOnce(&PreparedDelivery) -> Result<T, E>,
     ) -> Result<T, DeliveryError<E>> {
+        delivery
+            .prepared
+            .require_uniform_grid()
+            .map_err(|_| DeliveryError::Rejected(DeliveryRejection::UnsupportedGridFragments))?;
+        self.present_with_grid_fragments(delivery, output)
+    }
+
+    /// Accept a backend explicitly supporting retained grids and winning clips.
+    /// The same complete-output and provenance transaction as `present` applies.
+    /// # Errors
+    /// Returns rejection or backend failure without advancing interaction state.
+    pub fn present_with_grid_fragments<T, E>(
+        &mut self,
+        delivery: PreparedDelivery,
+        output: impl FnOnce(&PreparedDelivery) -> Result<T, E>,
+    ) -> Result<T, DeliveryError<E>> {
         self.validate(&delivery).map_err(DeliveryError::Rejected)?;
         if !self.latest.as_ref().is_some_and(|latest| {
             latest.identity == delivery.identity
@@ -206,6 +223,75 @@ mod tests {
             pointer_shape: None,
             prepared: Arc::new(prepared),
         }
+    }
+
+    #[test]
+    fn fragments_require_opt_in_and_failed_output_preserves_commit() {
+        use bmux_tui::{
+            buffer::Buffer,
+            geometry::Point,
+            presentation::{GridTransform, PreparedGridFragment, PresentationLimits},
+        };
+        let epoch = Uuid::nil();
+        let target = Uuid::from_u128(1);
+        let mut authority = PresentationAuthority::new(epoch, target, 1, Rect::new(0, 0, 2, 1));
+        let first = candidate(epoch, target, 1, 1);
+        authority.stage(&first).unwrap();
+        authority.present(first, |_| Ok::<_, ()>(())).unwrap();
+        let mut next = candidate(epoch, target, 2, 1);
+        Arc::make_mut(&mut next.prepared)
+            .set_grid_fragments(
+                vec![
+                    PreparedGridFragment::new(
+                        "content",
+                        Arc::new(Buffer::empty(Rect::new(0, 0, 1, 1))),
+                        GridTransform::new(Point::new(0, 0), 2000).unwrap(),
+                        vec![Rect::new(0, 0, 2, 1)],
+                    )
+                    .unwrap()
+                    .with_overlays(vec![
+                        bmux_tui::presentation::PreparedGridOverlay::new(
+                            Arc::new(Buffer::empty(Rect::new(1, 0, 1, 1))),
+                            Rect::new(1, 0, 1, 1),
+                            false,
+                        )
+                        .unwrap(),
+                    ])
+                    .unwrap(),
+                ],
+                PresentationLimits {
+                    max_cells: 10,
+                    max_entries: 10,
+                    max_bytes: 1024,
+                },
+            )
+            .unwrap();
+        authority.stage(&next).unwrap();
+        assert!(matches!(
+            authority
+                .present::<(), ()>(next.clone(), |_| panic!("unsupported output must not run")),
+            Err(DeliveryError::<()>::Rejected(
+                DeliveryRejection::UnsupportedGridFragments
+            ))
+        ));
+        assert!(
+            authority
+                .present_with_grid_fragments(next.clone(), |_| Err::<(), _>("failed"))
+                .is_err()
+        );
+        assert_eq!(authority.committed().unwrap().identity.revision, 1);
+        authority
+            .present_with_grid_fragments(next, |_| Ok::<_, ()>(()))
+            .unwrap();
+        assert_eq!(
+            authority
+                .committed()
+                .unwrap()
+                .prepared
+                .grid_fragments()
+                .len(),
+            1
+        );
     }
 
     #[test]

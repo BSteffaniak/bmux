@@ -10,6 +10,8 @@ mod local_presentation;
 mod metadata;
 mod native_input_metrics;
 pub mod observer;
+mod pane_zoom;
+mod pane_zoom_native;
 mod pointer_shape;
 mod prompt_search;
 pub mod prompt_ui;

@@ -5344,6 +5344,12 @@ fn execute_surface_output_plan<W: io::Write>(
                 .context("failed clearing stale after-content decoration cells")?;
             }
             SurfaceOutputStage::PaneContent => {
+                if pane_buffers
+                    .get(&plan.pane_id)
+                    .is_some_and(|buffer| buffer.local_zoom.projected)
+                {
+                    continue;
+                }
                 cursor_state = queue_pane_content_for_surface(
                     stdout,
                     pane_buffers,
@@ -7533,7 +7539,8 @@ mod tests {
         assert!(result.unwrap());
         let mut projected = Buffer::empty(area);
         let mut frame = Frame::new(&mut projected);
-        crate::projection::paint(&mut PaintCx::new(&mut frame), &operations);
+        crate::projection::paint(&mut PaintCx::new(&mut frame), &operations)
+            .expect("paint projected fixture");
         for y in area.y..area.bottom() {
             assert_eq!(projected.row_symbols(y), source.row_symbols(y), "row {y}");
         }

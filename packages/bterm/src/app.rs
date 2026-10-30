@@ -146,9 +146,20 @@ pub struct Arguments {
     /// Select an active local Linux graphical login when display settings are absent.
     #[arg(long)]
     pub desktop_session: Option<String>,
+    /// Reuse local pane zoom preferences in this explicit presentation namespace.
+    /// Not server identity or permission. Duplicate names share saved preferences,
+    /// not live state. Without this option each window's pane zoom is ephemeral.
+    #[arg(long, value_parser = validate_view_binding)]
+    pub view_binding: Option<String>,
     /// Existing BMUX attachment target; omission uses BMUX's normal selection.
     #[arg(long)]
     pub session: Option<String>,
+}
+
+fn validate_view_binding(value: &str) -> std::result::Result<String, String> {
+    crate::pane_zoom::PaneViewBinding::new(value, "validation")
+        .map(|_| value.to_owned())
+        .map_err(|error| error.to_string())
 }
 
 #[derive(Debug, Subcommand)]
@@ -173,6 +184,31 @@ pub enum ConfigurationAction {
 /// must run publication off the window thread and route native input through
 /// the canonical bindings and committed retained scene.
 pub trait AttachWorker: 'static {
+    /// Optional pane action hook. Implementations resolve targets only through
+    /// the CLI's committed retained query; unhandled actions remain consumed.
+    fn pane_zoom_action(
+        &mut self,
+        _action: crate::zoom::ZoomAction,
+        _hovered: bool,
+        _base_size: f64,
+        _now: std::time::Instant,
+    ) -> Result<()> {
+        Ok(())
+    }
+    fn pane_zoom_raster_cap(&mut self, _cap: u16, _now: std::time::Instant) -> Result<()> {
+        Ok(())
+    }
+    fn tick_pane_zoom(&mut self, _now: std::time::Instant) -> Result<bool> {
+        Ok(false)
+    }
+    fn reconfigure_pane_zoom(
+        &mut self,
+        _policy: crate::zoom::ZoomConfiguration,
+        _now: std::time::Instant,
+    ) -> Result<()> {
+        Ok(())
+    }
+    fn flush_pane_zoom(&mut self) {}
     /// A coalesced native-only reload from the captured configuration path.
     fn take_native_configuration(&mut self) -> Option<crate::configuration::NativeConfiguration> {
         None
@@ -411,8 +447,39 @@ impl<W: AttachWorker> Application<W> {
             output.service_clipboard(&mut self.clipboard);
         }
         let now = std::time::Instant::now();
+        let physical_font = f64::from(
+            self.typography
+                .resolved(now, context.metrics().scale_factor as f32)
+                .font_size,
+        ) * context.metrics().scale_factor;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        // Finite resolved font metrics and the explicit milli-scale bounds fit u16.
+        let pane_cap = (256_000.0 / physical_font).floor().clamp(125.0, 8000.0) as u16;
+        self.worker.pane_zoom_raster_cap(pane_cap, now)?;
         let consumed = match &event {
-            PlatformEvent::Input(input) => self.typography.input(input, now)?,
+            PlatformEvent::Input(input) => {
+                if let Some(action) = self.typography.scoped_input(input, now)? {
+                    if action.scope == crate::zoom::ZoomScope::Pane {
+                        let hovered = matches!(
+                            input,
+                            bmux_frontend_runtime::input::InputEvent::Scroll { .. }
+                        );
+                        let base = self
+                            .typography
+                            .resolved(now, context.metrics().scale_factor as f32)
+                            .font_size;
+                        self.worker.pane_zoom_action(
+                            action.action,
+                            hovered,
+                            f64::from(base),
+                            now,
+                        )?;
+                    }
+                    true
+                } else {
+                    false
+                }
+            }
             PlatformEvent::Focused(false) | PlatformEvent::Suspended => {
                 self.typography.reset_input();
                 false
@@ -421,6 +488,7 @@ impl<W: AttachWorker> Application<W> {
         };
         self.typography.poll_save(now);
         if let Some(native) = self.worker.take_native_configuration() {
+            let pane_policy = native.zoom.clone();
             let dpi = context.metrics().scale_factor as f32;
             let renderer = &mut self.renderer;
             if let Err(error) = self.typography.reconfigure(native, now, dpi, |typography| {
@@ -435,19 +503,25 @@ impl<W: AttachWorker> Application<W> {
                 Ok(())
             }) {
                 eprintln!("bterm: native typography reload rejected: {error}");
-            } else if self.renderer.is_some() {
-                // Renderer validation above is transactional. Force the same
-                // generation transition even if the candidate has equal metrics.
-                self.metrics = None;
-                self.resize(context.metrics())?;
-                self.worker.invalidate_presentation();
-                context.invalidate_accessibility();
-                self.last_output = None;
-                self.retained_output = None;
-                self.worker
-                    .event(PlatformEvent::Resized(context.metrics()), self.viewport)?;
+            } else {
+                self.worker.reconfigure_pane_zoom(pane_policy, now)?;
+                if self.renderer.is_some() {
+                    // Renderer validation above is transactional. Force the same
+                    // generation transition even if the candidate has equal metrics.
+                    self.metrics = None;
+                    self.resize(context.metrics())?;
+                    self.worker.invalidate_presentation();
+                    context.invalidate_accessibility();
+                    self.last_output = None;
+                    self.retained_output = None;
+                    self.worker
+                        .event(PlatformEvent::Resized(context.metrics()), self.viewport)?;
+                }
             }
             context.request_redraw();
+        }
+        if self.active && self.worker.tick_pane_zoom(now)? {
+            context.request_redraw_at(now + std::time::Duration::from_millis(16));
         }
         let visual_pending = self.renderer.is_some() && {
             self.applied_typography.as_ref()
@@ -542,6 +616,7 @@ impl<W: AttachWorker> Application<W> {
             }
             PlatformEvent::CloseRequested => {
                 self.typography.flush();
+                self.worker.flush_pane_zoom();
                 if let Some(output) = &self.output {
                     output.close();
                 }
@@ -551,6 +626,7 @@ impl<W: AttachWorker> Application<W> {
             event @ (PlatformEvent::Wake | PlatformEvent::RedrawRequested) => {
                 if self.worker.check()? {
                     self.typography.flush();
+                    self.worker.flush_pane_zoom();
                     context.exit();
                     return Ok(());
                 }
@@ -607,6 +683,9 @@ impl<W: AttachWorker> Application<W> {
                                 *retained_output = Some(delivery.clone());
                                 let cell = renderer.cell_size();
                                 worker.presented(delivery.identity, viewport, cell);
+                                // The receipt lets CLI publish its committed target after
+                                // this callback returns. Poll restoration on a later turn.
+                                context.request_redraw_at(std::time::Instant::now() + std::time::Duration::from_millis(16));
                                 *semantic_generation = semantic_generation.saturating_add(1);
                                 if let Err(error) = context.commit_accessibility(
                                     *semantic_generation,
@@ -918,6 +997,11 @@ pub fn run() -> Result<()> {
     run_window_prepared(
         event_loop,
         BmuxWorker {
+            view_binding: arguments.view_binding,
+            pane_zoom: Some(crate::pane_zoom::session::PaneZoomSession::new(
+                native.zoom.clone(),
+                Some(preferences.clone()),
+            )?),
             preparation,
             prepared: Some(PreparedConnection { client, runtime }),
             selection,
@@ -1095,7 +1179,45 @@ struct PreparedConnection<C> {
     runtime: tokio::runtime::Runtime,
 }
 
+fn live_pane_binding(
+    event: &bmux_cli::attach::NativeAttachEvent,
+) -> Result<crate::pane_zoom::PaneViewBinding> {
+    let bmux_cli::attach::NativeAttachEvent::SetPaneZoom { target, .. } = event else {
+        anyhow::bail!("not a pane zoom target");
+    };
+    crate::pane_zoom::PaneViewBinding::new(
+        &format!(
+            "{}/{}/{}",
+            target.identity.epoch, target.identity.attached_id, target.view_id
+        ),
+        &format!("{}/{}", target.pane_id, target.execution_id),
+    )
+}
+
+fn same_live_pane(
+    previous: &bmux_cli::attach::NativeAttachEvent,
+    current: &bmux_cli::attach::NativeAttachEvent,
+) -> bool {
+    let (
+        bmux_cli::attach::NativeAttachEvent::SetPaneZoom {
+            target: previous, ..
+        },
+        bmux_cli::attach::NativeAttachEvent::SetPaneZoom {
+            target: current, ..
+        },
+    ) = (previous, current)
+    else {
+        return false;
+    };
+    previous.identity.epoch == current.identity.epoch
+        && previous.identity.attached_id == current.identity.attached_id
+        && previous.pane_id == current.pane_id
+        && previous.view_id == current.view_id
+        && previous.execution_id == current.execution_id
+}
+
 struct BmuxWorker {
+    view_binding: Option<String>,
     preparation: Option<crate::runtime_launch::NativePreparation>,
     prepared: Option<PreparedConnection<bmux_client::BmuxClient>>,
     selection: RuntimeSelection,
@@ -1108,6 +1230,8 @@ struct BmuxWorker {
     handle: Option<bmux_cli::attach::NativeAttachHandle>,
     thread: Option<std::thread::JoinHandle<()>>,
     result: Option<std::sync::mpsc::Receiver<Result<()>>>,
+    pane_zoom:
+        Option<crate::pane_zoom::session::PaneZoomSession<bmux_cli::attach::NativeAttachEvent>>,
     committed_geometry: Option<(PresentationIdentity, PresentationViewport, [f32; 2])>,
     pointer: Option<bmux_frontend_runtime::input::PhysicalPoint>,
     drag: Option<bmux_frontend_runtime::input::PointerButton>,
@@ -1116,6 +1240,226 @@ struct BmuxWorker {
 }
 
 impl AttachWorker for BmuxWorker {
+    fn pane_zoom_action(
+        &mut self,
+        action: crate::zoom::ZoomAction,
+        hovered: bool,
+        base_size: f64,
+        now: std::time::Instant,
+    ) -> Result<()> {
+        if action == crate::zoom::ZoomAction::Consume {
+            return Ok(());
+        }
+        let Some((identity, viewport, cell)) = self.committed_geometry else {
+            return Ok(());
+        };
+        let point = if hovered {
+            let Some(point) = self
+                .pointer
+                .and_then(|point| pointer_position(point, viewport, cell))
+            else {
+                return Ok(());
+            };
+            Some(point)
+        } else {
+            None
+        };
+        let Some(target) = self
+            .handle
+            .as_ref()
+            .and_then(|handle| handle.pane_zoom_target(point))
+        else {
+            return Ok(());
+        };
+        if target.identity != identity {
+            return Ok(());
+        }
+        // Attach-local identity only: not eligible for durable restore. Include
+        // execution incarnation so a replacement source never inherits local intent.
+        let binding = crate::pane_zoom::PaneViewBinding::new(
+            &format!(
+                "{}/{}/{}",
+                target.identity.epoch, target.identity.attached_id, target.view_id
+            ),
+            &format!("{}/{}", target.pane_id, target.execution_id),
+        )?;
+        if let Some(session) = &mut self.pane_zoom {
+            let scale = f64::from(target.scale_millis) / 1000.0;
+            session.action(
+                crate::pane_zoom::session::PaneZoomRequest {
+                    binding,
+                    target: bmux_cli::attach::NativeAttachEvent::SetPaneZoom {
+                        target,
+                        scale_millis: target.scale_millis,
+                    },
+                    current_scale: scale,
+                    restore: self
+                        .view_binding
+                        .as_deref()
+                        .map(|namespace| {
+                            crate::pane_zoom::PaneViewRestoreToken::for_committed_pane(
+                                namespace,
+                                &target.pane_id.to_string(),
+                            )
+                        })
+                        .transpose()?,
+                    action,
+                    base_size,
+                },
+                now,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn pane_zoom_raster_cap(&mut self, cap: u16, now: std::time::Instant) -> Result<()> {
+        if let Some(handle) = &self.handle {
+            // Contention is retryable; do not enqueue intent against an unpublished cap.
+            if handle.set_pane_zoom_max_scale(cap).is_err() {
+                return Ok(());
+            }
+        }
+        if let Some(session) = &mut self.pane_zoom {
+            session.set_raster_cap(cap, now)?;
+        }
+        Ok(())
+    }
+
+    fn tick_pane_zoom(&mut self, now: std::time::Instant) -> Result<bool> {
+        if self.committed_geometry.is_none() {
+            return Ok(false);
+        }
+        let (Some(session), Some(handle)) = (&mut self.pane_zoom, &self.handle) else {
+            return Ok(false);
+        };
+        if let Some(namespace) = &self.view_binding {
+            if let Some(target) = handle.pane_zoom_target(None)
+                && self
+                    .committed_geometry
+                    .is_some_and(|(identity, _, _)| identity == target.identity)
+            {
+                let event = bmux_cli::attach::NativeAttachEvent::SetPaneZoom {
+                    target,
+                    scale_millis: target.scale_millis,
+                };
+                let binding = live_pane_binding(&event)?;
+                let token = crate::pane_zoom::PaneViewRestoreToken::for_committed_pane(
+                    namespace,
+                    &target.pane_id.to_string(),
+                )?;
+                session.observe(
+                    binding,
+                    event,
+                    f64::from(target.scale_millis) / 1000.0,
+                    token,
+                )?;
+            }
+            session.poll_restore(|previous| {
+                use crate::pane_zoom::session::TargetRefresh;
+                use bmux_cli::attach::NativePaneZoomRefresh;
+                let bmux_cli::attach::NativeAttachEvent::SetPaneZoom {
+                    target: previous_target,
+                    ..
+                } = previous
+                else {
+                    return TargetRefresh::Gone;
+                };
+                let (target, revision) = match handle.refresh_pane_zoom_status(previous_target) {
+                    NativePaneZoomRefresh::Pending => return TargetRefresh::Pending,
+                    NativePaneZoomRefresh::Gone => return TargetRefresh::Gone,
+                    NativePaneZoomRefresh::Ready {
+                        target,
+                        progress_revision,
+                    } => (target, progress_revision),
+                };
+                if !self
+                    .committed_geometry
+                    .is_some_and(|(identity, _, _)| identity == target.identity)
+                {
+                    return TargetRefresh::Pending;
+                }
+                let current = bmux_cli::attach::NativeAttachEvent::SetPaneZoom {
+                    target,
+                    scale_millis: target.scale_millis,
+                };
+                if !same_live_pane(previous, &current) {
+                    return TargetRefresh::Gone;
+                }
+                TargetRefresh::Ready {
+                    target: current,
+                    revision,
+                    scale: f64::from(target.scale_millis) / 1000.0,
+                }
+            })?;
+        }
+        // The CLI token is retained, never re-resolved from focus or hover.
+        // Its reducer is the final source/commit validation authority.
+        if let Err(error) = session.tick_bound(
+            now,
+            |event| {
+                use crate::pane_zoom::session::TargetRefresh;
+                let bmux_cli::attach::NativeAttachEvent::SetPaneZoom { target, .. } = event else {
+                    return TargetRefresh::Gone;
+                };
+                use bmux_cli::attach::NativePaneZoomRefresh;
+                let (current, progress_revision) = match handle.refresh_pane_zoom_status(target) {
+                    NativePaneZoomRefresh::Pending => return TargetRefresh::Pending,
+                    NativePaneZoomRefresh::Gone => return TargetRefresh::Gone,
+                    NativePaneZoomRefresh::Ready {
+                        target,
+                        progress_revision,
+                    } => (target, progress_revision),
+                };
+                if !self
+                    .committed_geometry
+                    .is_some_and(|(identity, _, _)| identity == current.identity)
+                {
+                    return TargetRefresh::Pending;
+                }
+                TargetRefresh::Ready {
+                    revision: progress_revision,
+                    scale: f64::from(current.scale_millis) / 1000.0,
+                    target: bmux_cli::attach::NativeAttachEvent::SetPaneZoom {
+                        target: current,
+                        scale_millis: current.scale_millis,
+                    },
+                }
+            },
+            |event, scale| {
+                let bmux_cli::attach::NativeAttachEvent::SetPaneZoom { target, .. } = event else {
+                    anyhow::bail!("not a pane zoom request");
+                };
+                let scale_millis = (scale * 1000.0).round().clamp(125.0, 8000.0) as u16;
+                handle.try_send(bmux_cli::attach::NativeAttachEvent::SetPaneZoom {
+                    target: *target,
+                    scale_millis,
+                })
+            },
+        ) {
+            // A full queue is not a presentation commit or a reason to lose the
+            // final sample. Retain local intent and retry on the next wake.
+            eprintln!("bterm: pane zoom publication deferred: {error}");
+        }
+        Ok(session.needs_tick(now) || session.save_pending())
+    }
+
+    fn reconfigure_pane_zoom(
+        &mut self,
+        policy: crate::zoom::ZoomConfiguration,
+        now: std::time::Instant,
+    ) -> Result<()> {
+        if let Some(session) = &mut self.pane_zoom {
+            session.reconfigure(policy, now)?;
+        }
+        Ok(())
+    }
+
+    fn flush_pane_zoom(&mut self) {
+        if let Some(session) = &mut self.pane_zoom {
+            session.flush();
+        }
+    }
+
     fn take_native_configuration(&mut self) -> Option<crate::configuration::NativeConfiguration> {
         self.native_reload.lock().ok()?.take()
     }
@@ -1247,13 +1591,14 @@ impl AttachWorker for BmuxWorker {
                     Some((identity, committed, cell))
                         if committed.generation == viewport.generation =>
                     {
-                        pointer_cell(position, committed, cell).map(|(column, row)| {
-                            NativeAttachEvent::Motion {
+                        pointer_position(position, committed, cell).map(|point| {
+                            NativeAttachEvent::PointerAt {
                                 identity,
-                                column,
-                                row,
-                                drag: self.drag,
-                                modifiers: self.modifiers,
+                                point,
+                                event: bmux_cli::attach::NativePanePointer::Motion {
+                                    drag: self.drag,
+                                    modifiers: self.modifiers,
+                                },
                             }
                         })
                     }
@@ -1279,14 +1624,15 @@ impl AttachWorker for BmuxWorker {
                     (Some((identity, committed, cell)), Some(pointer))
                         if committed.generation == viewport.generation =>
                     {
-                        pointer_cell(pointer, committed, cell).map(|(column, row)| {
-                            NativeAttachEvent::Mouse {
+                        pointer_position(pointer, committed, cell).map(|point| {
+                            NativeAttachEvent::PointerAt {
                                 identity,
-                                column,
-                                row,
-                                button,
-                                phase,
-                                modifiers,
+                                point,
+                                event: bmux_cli::attach::NativePanePointer::Mouse {
+                                    button,
+                                    phase,
+                                    modifiers,
+                                },
                             }
                         })
                     }
@@ -1302,7 +1648,7 @@ impl AttachWorker for BmuxWorker {
                     (Some((identity, committed, cell)), Some(pointer))
                         if committed.generation == viewport.generation =>
                     {
-                        pointer_cell(pointer, committed, cell).and_then(|(column, row)| {
+                        pointer_position(pointer, committed, cell).and_then(|point| {
                             let (x, y) = match delta {
                                 bmux_frontend_runtime::input::ScrollDelta::Lines { x, y } => (x, y),
                                 bmux_frontend_runtime::input::ScrollDelta::Pixels { x, y } => {
@@ -1311,13 +1657,14 @@ impl AttachWorker for BmuxWorker {
                             };
                             let (delta_x, delta_y) =
                                 accumulate_scroll(&mut self.scroll_remainder, x, y);
-                            (delta_x != 0 || delta_y != 0).then_some(NativeAttachEvent::Scroll {
+                            (delta_x != 0 || delta_y != 0).then_some(NativeAttachEvent::PointerAt {
                                 identity,
-                                column,
-                                row,
-                                delta_x,
-                                delta_y,
-                                modifiers,
+                                point,
+                                event: bmux_cli::attach::NativePanePointer::Scroll {
+                                    delta_x,
+                                    delta_y,
+                                    modifiers,
+                                },
                             })
                         })
                     }
@@ -1379,6 +1726,12 @@ impl AttachWorker for BmuxWorker {
             self.invalidate_presentation();
             return;
         }
+        if self.committed_geometry.is_some_and(|(previous, _, _)| {
+            previous.epoch != identity.epoch || previous.attached_id != identity.attached_id
+        }) && let Some(session) = &mut self.pane_zoom
+        {
+            session.clear();
+        }
         self.committed_geometry = Some((identity, viewport, cell));
     }
 
@@ -1398,6 +1751,9 @@ impl AttachWorker for BmuxWorker {
     }
 
     fn detach(&mut self) {
+        if let Some(session) = &mut self.pane_zoom {
+            session.clear();
+        }
         self.committed_geometry = None;
         if let Some(handle) = self.handle.take() {
             let _ = handle.try_send(bmux_cli::attach::NativeAttachEvent::Close);
@@ -1488,11 +1844,13 @@ fn accumulate_scroll(remainder: &mut [f64; 2], x: f64, y: f64) -> (i16, i16) {
     (steps[0], steps[1])
 }
 
-fn pointer_cell(
+/// Convert framebuffer pixels to fractional presentation coordinates. Content
+/// cell mapping belongs to the committed CLI compositor, not this adapter.
+fn pointer_position(
     point: bmux_frontend_runtime::input::PhysicalPoint,
     viewport: PresentationViewport,
     cell: [f32; 2],
-) -> Option<(u16, u16)> {
+) -> Option<[f64; 2]> {
     if !point.x.is_finite()
         || !point.y.is_finite()
         || point.x < 0.0
@@ -1501,12 +1859,19 @@ fn pointer_cell(
     {
         return None;
     }
-    let column = (point.x / f64::from(cell[0])).floor();
-    let row = (point.y / f64::from(cell[1])).floor();
-    if column >= f64::from(viewport.columns) || row >= f64::from(viewport.rows) {
-        return None;
-    }
-    Some((column as u16, row as u16))
+    let position = [point.x / f64::from(cell[0]), point.y / f64::from(cell[1])];
+    (position[0] < f64::from(viewport.columns) && position[1] < f64::from(viewport.rows))
+        .then_some(position)
+}
+
+#[cfg(test)]
+fn pointer_cell(
+    point: bmux_frontend_runtime::input::PhysicalPoint,
+    viewport: PresentationViewport,
+    cell: [f32; 2],
+) -> Option<(u16, u16)> {
+    let [column, row] = pointer_position(point, viewport, cell)?;
+    Some((column.floor() as u16, row.floor() as u16))
 }
 
 fn apply_window_typography(
@@ -1660,6 +2025,8 @@ mod tests {
 
     fn worker_without_runtime() -> BmuxWorker {
         BmuxWorker {
+            view_binding: None,
+            pane_zoom: None,
             preparation: None,
             prepared: None,
             selection: RuntimeSelection::External {
@@ -1825,6 +2192,53 @@ mod tests {
         assert_eq!(
             accumulate_scroll(&mut remainder, f64::NAN, f64::INFINITY),
             (0, 0)
+        );
+    }
+
+    #[test]
+    fn explicit_view_binding_is_optional_and_not_an_attachment_target() {
+        let default = Arguments::try_parse_from(["bterm"]).unwrap();
+        assert!(default.view_binding.is_none());
+        let named = Arguments::try_parse_from([
+            "bterm",
+            "--view-binding",
+            "work-left",
+            "--session",
+            "actual-session",
+        ])
+        .unwrap();
+        assert_eq!(named.view_binding.as_deref(), Some("work-left"));
+        assert_eq!(named.session.as_deref(), Some("actual-session"));
+        assert!(Arguments::try_parse_from(["bterm", "--view-binding", ""]).is_err());
+        assert!(Arguments::try_parse_from(["bterm", "--view-binding", "bad\nlabel"]).is_err());
+    }
+
+    #[test]
+    fn native_pointer_projection_preserves_fractional_positions() {
+        use bmux_frontend_runtime::input::PhysicalPoint;
+        let viewport = PresentationViewport {
+            columns: 80,
+            rows: 24,
+            generation: 1,
+        };
+        assert_eq!(
+            pointer_position(PhysicalPoint { x: 15.0, y: 31.0 }, viewport, [10.0, 20.0]),
+            Some([1.5, 1.55])
+        );
+        assert_eq!(
+            pointer_position(PhysicalPoint { x: 800.0, y: 1.0 }, viewport, [10.0, 20.0]),
+            None
+        );
+        assert_eq!(
+            pointer_position(
+                PhysicalPoint {
+                    x: f64::NAN,
+                    y: 1.0
+                },
+                viewport,
+                [10.0, 20.0]
+            ),
+            None
         );
     }
 

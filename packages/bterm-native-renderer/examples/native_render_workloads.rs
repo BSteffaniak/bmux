@@ -28,11 +28,12 @@ const WARMUP: usize = 5;
 const MAX_STARTUP_DEFERRALS: usize = 40;
 const STARTUP_YIELD: Duration = Duration::from_millis(50);
 const LIMITS: PresentationLimits = PresentationLimits {
-    max_cells: 80 * 24,
+    max_cells: 80 * 24 + 2 * 24 * 12,
     max_entries: 128,
     max_bytes: 2 * 1024 * 1024,
 };
-const CASES: [&str; 10] = [
+const CASES: [&str; 11] = [
+    "local-grids",
     "cold-text",
     "warm-text",
     "changing-text",
@@ -66,6 +67,65 @@ fn prepare_png() -> Result<(), image::ImageError> {
 
 fn valid_case(case: &str) -> bool {
     CASES.contains(&case) || case == "idle"
+}
+
+fn install_local_grids(
+    prepared: &mut bmux_tui::presentation::PreparedPresentation,
+) -> Result<(), Box<dyn Error>> {
+    use bmux_tui::{
+        frame::Cursor,
+        geometry::Point,
+        presentation::{GridTransform, PreparedGridFragment},
+    };
+    use std::sync::Arc;
+    let area = prepared.buffer().area();
+    let mut fragments = Vec::new();
+    for (id, x, scale) in [("small", 1, 875), ("large", 30, 1375)] {
+        let local = PresentationState::new(Rect::new(0, 0, 24, 12))
+            .prepare(Damage::Full, |cx| {
+                cx.write_line(
+                    LocalRect::new(0, 0, 24, 1),
+                    &Line::raw("fractional grid 界"),
+                );
+            })
+            .ok_or("missing local frame")?;
+        // Two strips leave root row 4 visible as an overlay across both grids.
+        let clips = [Rect::new(x, 1, 28, 3), Rect::new(x, 5, 28, 15)]
+            .into_iter()
+            .map(|clip| clip.intersection(area))
+            .filter(|clip| !clip.is_empty())
+            .collect();
+        let destination = Rect::new(2, 2, 10, 7);
+        let image = Arc::new(ImagePlacement {
+            key: ImageKey::new(id),
+            payload: ImagePayload::Pixels {
+                bytes: [32, 180, 240, 255].repeat(16 * 16),
+                width: 16,
+                height: 16,
+                format: ImagePixelFormat::Rgba8,
+            },
+            destination,
+            allocation: None,
+            clip: destination,
+            fit: ImageFit::Contain,
+            lifecycle: ImageLifecycle::Frame,
+        });
+        fragments.push(
+            PreparedGridFragment::new(
+                id,
+                Arc::new(local.buffer().clone()),
+                GridTransform::new(Point::new(x, 1), scale).ok_or("transform")?,
+                clips,
+            )
+            .ok_or("fragment")?
+            .with_cursor(Cursor::visible(Point::new(1, 1)))
+            .ok_or("cursor")?
+            .with_images(vec![image])
+            .ok_or("image")?,
+        );
+    }
+    prepared.set_grid_fragments(fragments, LIMITS)?;
+    Ok(())
 }
 
 fn paint(cx: &mut PaintCx<'_, '_>, case: &str, frame: usize) {
@@ -292,12 +352,17 @@ impl Workload {
             Damage::Full
         };
         let start = Instant::now();
-        let prepared = self
+        let mut prepared = self
             .presentation
             .prepare_bounded(LIMITS, damage, |cx| {
                 paint(cx, &self.case, self.iteration);
             })
             .map_err(application_error)?;
+        if self.case == "local-grids"
+            && let Some(prepared) = &mut prepared
+        {
+            install_local_grids(prepared).map_err(application_error)?;
+        }
         sample.prepare_ns = start.elapsed().as_nanos();
         let start = Instant::now();
         // Sole commit point: output error propagates, and no sample is recorded as success.
@@ -453,6 +518,28 @@ fn main() -> Result<(), Box<dyn Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fractional_local_grid_workload_has_images_cursors_and_overlay_gap() {
+        let mut frame = PresentationState::new(Rect::new(0, 0, 80, 24))
+            .prepare(Damage::Full, |cx| paint(cx, "local-grids", 0))
+            .unwrap();
+        install_local_grids(&mut frame).unwrap();
+        assert_eq!(frame.grid_fragments().len(), 2);
+        assert_eq!(frame.grid_fragments()[0].transform().scale(), 0.875);
+        assert_eq!(frame.grid_fragments()[1].transform().scale(), 1.375);
+        for fragment in frame.grid_fragments() {
+            assert_eq!(fragment.images().len(), 1);
+            assert!(fragment.cursor().unwrap().visible);
+            assert!(
+                fragment
+                    .visible_clips()
+                    .iter()
+                    .all(|clip| !clip.contains(bmux_tui::geometry::Point::new(clip.x, 4)))
+            );
+        }
+        frame.validate_limits(LIMITS).unwrap();
+    }
 
     #[test]
     fn only_explicit_occlusion_is_a_startup_retry() {

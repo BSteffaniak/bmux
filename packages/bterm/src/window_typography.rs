@@ -9,7 +9,7 @@ use bterm_native_renderer::text::RendererTypography;
 use crate::{
     configuration::NativeConfiguration,
     typography::TypographyConfiguration,
-    zoom::{ZoomController, ZoomInputMatcher},
+    zoom::{ScopedZoomAction, ZoomController, ZoomInputMatcher, ZoomScope},
     zoom_preferences::{PreferenceStore, ZoomPreferences},
 };
 
@@ -51,13 +51,27 @@ impl WindowTypography {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn input(&mut self, input: &InputEvent, now: Instant) -> Result<bool> {
+        Ok(self.scoped_input(input, now)?.is_some())
+    }
+
+    /// Apply window actions here; return pane actions unchanged to the local-view
+    /// controller. Matching (including held-key ownership) happens exactly once.
+    pub(crate) fn scoped_input(
+        &mut self,
+        input: &InputEvent,
+        now: Instant,
+    ) -> Result<Option<ScopedZoomAction>> {
         let Some(action) = self.matcher.input(input) else {
-            return Ok(false);
+            return Ok(None);
         };
+        if action.scope == ZoomScope::Pane {
+            return Ok(Some(action));
+        }
         if self
             .controller
-            .apply(action, f64::from(self.settings.size), now)?
+            .apply(action.action, f64::from(self.settings.size), now)?
             && self.remember
             && self.store.is_some()
         {
@@ -67,7 +81,7 @@ impl WindowTypography {
                 self.controller.target_scale(),
             ));
         }
-        Ok(true)
+        Ok(Some(action))
     }
 
     pub(crate) fn reconfigure(
@@ -262,6 +276,34 @@ mod tests {
             .apply(ZoomAction::SetScale(0.5), 16.0, now)
             .unwrap();
         assert_eq!(window.resolved(now, 2.0).font_size, 8.0);
+    }
+
+    #[test]
+    fn pane_scoped_input_is_consumed_without_changing_window_scale() {
+        use crate::zoom::{ScopedZoomAction, ZoomScope};
+        use bterm_native_platform::input::{InputEvent, Modifiers, ScrollDelta};
+        let mut policy = native();
+        policy.zoom.wheel.scope = ZoomScope::Pane;
+        let mut window = WindowTypography::new(policy, None).unwrap();
+        let now = Instant::now();
+        let before = window.resolved(now, 1.0);
+        let event = InputEvent::Scroll {
+            delta: ScrollDelta::Lines { x: 0.0, y: 1.0 },
+            modifiers: Modifiers {
+                super_key: cfg!(target_os = "macos"),
+                control: !cfg!(target_os = "macos"),
+                ..Modifiers::default()
+            },
+        };
+        assert_eq!(
+            window.scoped_input(&event, now).unwrap(),
+            Some(ScopedZoomAction {
+                scope: ZoomScope::Pane,
+                action: ZoomAction::Steps(0.1),
+            })
+        );
+        assert_eq!(window.resolved(now, 1.0), before);
+        assert!(!window.save_pending());
     }
 
     #[test]

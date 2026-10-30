@@ -7,6 +7,9 @@ use bmux_plugin_sdk::{NativeServiceContext, ServiceResponse};
 // Explicit service/operation pairs only. Unmigrated routes require positive
 // Local provenance even when invoked directly via generated service clients.
 pub(crate) fn migrated_route(interface: &str, operation: &str) -> bool {
+    if interface == "pane-runtime-view-size-v1" {
+        return operation == "resize-alternate";
+    }
     matches!(
         (interface, operation),
         (
@@ -139,6 +142,16 @@ pub(crate) fn authorize(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn view_size_admits_only_the_guarded_operation() {
+        assert!(migrated_route(
+            "pane-runtime-view-size-v1",
+            "resize-alternate"
+        ));
+        assert!(!migrated_route("pane-runtime-view-size-v1", "resize"));
+        assert!(!migrated_route("pane-runtime-view-size-v1", "set-owner"));
+    }
     use bmux_plugin::StreamOrigin as StreamProvenance;
     use bmux_plugin_sdk::{
         ApiVersion, HostConnectionInfo, HostMetadata, HostScope, ProviderId, RegisteredService,

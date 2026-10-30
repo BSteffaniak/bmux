@@ -51,6 +51,12 @@ pub(super) fn project(
     let mut work = 0_usize;
     let mut text_bytes = 0_usize;
     for surface in graph.ordered_surfaces() {
+        // Plugin metadata is expressed in untransformed root cells. Until it
+        // carries source anchors, it cannot describe a locally reflowed grid.
+        // Omit it explicitly rather than expose stale selection/accessibility.
+        if surface.content_transform.is_some() {
+            continue;
+        }
         let Some(metadata) = &surface.metadata else {
             continue;
         };
@@ -215,6 +221,42 @@ mod tests {
     use bmux_tui::selection::{SelectionScope, plain_text_fragments};
     use bmux_tui::semantic::SemanticRegion;
     use uuid::Uuid;
+
+    #[test]
+    fn transformed_metadata_is_explicitly_unavailable() {
+        let area = Rect::new(0, 0, 8, 2);
+        let mut selection = SelectionScene::new();
+        selection.push_scope(SelectionScope::new("label", area));
+        let mut semantics = SemanticScene::new();
+        semantics.push(SemanticRegion::new("label", area, "label"));
+        let mut surface = RetainedSurface::new(
+            Uuid::new_v4(),
+            DamageRect::new(0, 0, 8, 2),
+            0,
+            0,
+            false,
+            Vec::new(),
+        );
+        surface.metadata = Some(PluginSurfaceMetadata {
+            selection: Some(selection),
+            semantics: Some(semantics),
+            text: BTreeMap::new(),
+        });
+        surface = surface.with_content_transform(
+            bmux_tui::grid_fragment::GridTransform::new(bmux_tui::geometry::Point::new(0, 0), 1500)
+                .unwrap(),
+        );
+        let mut graph = RetainedCompositor::new();
+        graph.replace_surfaces(
+            vec![surface],
+            DamageRect::new(0, 0, 8, 2),
+            DamageCoalescingPolicy::default(),
+        );
+        let metadata = project(&graph, area).unwrap();
+        assert_eq!(metadata.selection.scopes(), []);
+        assert_eq!(metadata.semantics.regions(), []);
+        assert!(metadata.text.is_empty());
+    }
 
     #[test]
     fn real_source_identity_survives_translation_occlusion_and_owner_removal() {
