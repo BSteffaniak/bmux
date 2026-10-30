@@ -299,6 +299,18 @@ pub(super) fn parse_runtime_cli_with_registry(
     super::startup_future_marker("parse.before_clap_command", 0);
     let clap_augment_started = Instant::now();
     let clap_command = Cli::command();
+    #[cfg(feature = "bench")]
+    let clap_command = clap_command.subcommand(
+        clap::Command::new("bench")
+            .about("Portable terminal benchmarks (also available as bmux-bench)")
+            .disable_help_flag(true)
+            .arg(
+                clap::Arg::new("arguments")
+                    .num_args(0..)
+                    .trailing_var_arg(true)
+                    .allow_hyphen_values(true),
+            ),
+    );
     super::startup_future_marker("parse.after_clap_command", 0);
     let clap_command = command_registry
         .augment_clap_command(clap_command)

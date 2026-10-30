@@ -1639,6 +1639,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "bmux_bench"
+version = "0.0.1-alpha.4"
+dependencies = [
+ "bmux_terminal_grid",
+ "bmux_tui 0.0.1-alpha.4",
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "toml 1.1.8+spec-1.1.0",
+]
+
+[[package]]
+name = "bmux_bench_cli"
+version = "0.0.1-alpha.4"
+dependencies = [
+ "bmux_bench",
+ "bmux_tui 0.0.1-alpha.4",
+ "bmux_tui_components 0.0.1-alpha.4",
+ "clap",
+ "crossterm",
+ "libc",
+ "serde_json",
+]
+
+[[package]]
 name = "bmux_broadcast_plugin"
 version = "0.0.1-alpha.4"
 dependencies = [
@@ -1698,6 +1724,7 @@ dependencies = [
  "bmux_attach_pipeline",
  "bmux_attach_token_state",
  "bmux_attach_view_protocol",
+ "bmux_bench_cli",
  "bmux_broadcast_plugin",
  "bmux_broadcast_plugin_api",
  "bmux_cli_schema",

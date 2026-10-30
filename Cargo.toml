@@ -16,6 +16,8 @@ members = [
     "packages/attach-view-protocol",
     "packages/attach_pipeline",
     "packages/attach_pipeline/models",
+    "packages/bench",
+    "packages/bench-cli",
     "packages/bmux",
     "packages/bterm",
     "packages/frontend-runtime",
@@ -179,6 +181,8 @@ version    = "0.0.1-alpha.4"
 accesskit = { version = "0.25.2", default-features = false }
 accesskit_winit = { version = "0.34.2", default-features = false }
 arc-swap = { version = "1.9", default-features = false }
+bmux_bench = { version = "0.0.1-alpha.4", default-features = false, path = "packages/bench" }
+bmux_bench_cli = { version = "0.0.1-alpha.4", default-features = false, path = "packages/bench-cli" }
 bmux_frontend_runtime = { version = "0.0.1-alpha.4", default-features = false, path = "packages/frontend-runtime" }
 bterm_native_platform = { version = "0.0.1-alpha.4", default-features = false, path = "packages/bterm-native-platform" }
 bterm_native_renderer = { version = "0.0.1-alpha.4", default-features = false, path = "packages/bterm-native-renderer" }

@@ -1,0 +1,41 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools", "command-line-utilities"]
+description = "Portable terminal benchmark frontend for BMUX"
+edition     = { workspace = true }
+keywords    = ["bmux", "terminal", "benchmark"]
+license     = { workspace = true }
+name        = "bmux_bench_cli"
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[[bin]]
+name = "bmux-bench"
+path = "src/main.rs"
+
+[dependencies]
+bmux_bench = { workspace = true }
+bmux_tui = { workspace = true, features = ["crossterm"] }
+bmux_tui_components = { workspace = true, features = ["badge"] }
+clap = { workspace = true, features = [
+    "derive",
+    "std",
+    "help",
+    "usage",
+    "error-context",
+] }
+crossterm = { workspace = true, features = ["events"] }
+serde_json = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[features]
+default = ["internal"]
+fail-on-warnings = [
+    "bmux_bench/fail-on-warnings",
+    "bmux_tui/fail-on-warnings",
+    "bmux_tui_components/fail-on-warnings",
+]
+internal = ["bmux_bench/internal"]

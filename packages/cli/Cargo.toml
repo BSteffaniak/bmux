@@ -15,6 +15,7 @@ name = "bmux"
 path = "src/main.rs"
 
 [dependencies]
+bmux_bench_cli              = { workspace = true, optional = true }
 bmux_connections_plugin_api = { workspace = true }
 bmux_frontend_runtime       = { workspace = true }
 bmux_plugin_runtime         = { workspace = true }
@@ -229,6 +230,8 @@ windows-sys = { workspace = true, features = [
 ] }
 
 [features]
+# Optional portable benchmark frontend; not part of normal terminal startup.
+bench = ["dep:bmux_bench_cli", "bmux_bench_cli/internal"]
 # Default features
 default = [
     "bundled-fonts",

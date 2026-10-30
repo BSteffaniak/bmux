@@ -1,0 +1,33 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "BMUX-owned portable terminal benchmark library"
+edition     = { workspace = true }
+keywords    = ["bmux", "terminal", "benchmark"]
+license     = { workspace = true }
+name        = "bmux_bench"
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+bmux_terminal_grid = { workspace = true, optional = true }
+bmux_tui           = { workspace = true, optional = true }
+serde              = { workspace = true, features = ["derive"] }
+serde_json         = { workspace = true }
+sha2               = { workspace = true }
+toml               = { workspace = true, features = ["parse"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[build-dependencies]
+sha2 = { workspace = true }
+
+[features]
+default = []
+fail-on-warnings = [
+    "bmux_terminal_grid?/fail-on-warnings",
+    "bmux_tui?/fail-on-warnings",
+]
+internal = ["dep:bmux_terminal_grid", "dep:bmux_tui"]

@@ -65,6 +65,23 @@ Inside an attached session, `bmux detach` disconnects the client without intenti
 
 Read the [TUI framework guide](docs/tui-framework.md) for reusable APIs and ownership boundaries. Sessions surviving client disconnects do not imply that arbitrary foreground processes survive a machine restart.
 
+## Terminal benchmarks
+
+BMUX owns a portable Rust benchmark library and executable, with configurable
+profiles, raw samples, uncertainty-aware comparisons, and an inline terminal UI.
+
+```sh
+cargo run --release -p bmux_bench_cli -- run --profile quick
+cargo run --release -p bmux_bench_cli -- run --internal --case plain-logs
+cargo run --release -p bmux_cli --features bench -- bench list
+```
+
+Run the portable suite inside each terminal you want to compare. Artifacts are
+retained by default. Accepted bytes and protocol replies are **not** completed
+visible rendering; results keep those measurement boundaries explicit. See the
+[benchmark guide](packages/bench-cli/README.md) and
+[library API](packages/bench/README.md).
+
 ## Record an interactive terminal
 
 ```sh
