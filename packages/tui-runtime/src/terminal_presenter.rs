@@ -1,6 +1,6 @@
 //! [`bmux_tui::terminal::Terminal`] presenter adapter.
 //!
-//! The render callback receives the application and a root
+//! Paint-callback presenters receive the application and a root
 //! [`bmux_tui::paint::PaintCx`] covering the terminal area. Applications resolve
 //! their component tree under the terminal constraints and paint it through
 //! that scoped context; the raw frame and buffer are never exposed.
@@ -22,6 +22,65 @@ use bmux_tui::selection::SelectionScene;
 use bmux_tui::terminal::Terminal;
 
 use crate::presenter::{PresentReport, Presenter, ResetReason};
+
+/// Synchronous presenter composing caller-owned frame policy with terminal lifecycle.
+///
+/// The callback draws through the same borrowed terminal and owns damage, image
+/// composition, and application commit policy. It must publish interaction state
+/// only after successful delivery. This adapter adds no output owner or input
+/// router, and does not draw, flush, or commit a second time.
+///
+/// Restoration releases the terminal's pointer ownership only. Application-owned
+/// image resources still require application-owned cleanup.
+pub struct BorrowedTerminalPresenter<'a, W, F> {
+    terminal: &'a mut Terminal<W>,
+    present: F,
+}
+
+impl<'a, W, F> BorrowedTerminalPresenter<'a, W, F> {
+    /// Compose an application frame callback with a caller-owned terminal.
+    ///
+    /// Construction performs no terminal I/O. The terminal remains caller-owned
+    /// and becomes available again when this adapter's borrow ends.
+    #[must_use]
+    pub const fn new(terminal: &'a mut Terminal<W>, present: F) -> Self {
+        Self { terminal, present }
+    }
+}
+
+impl<P, W, F, E> Presenter<P> for BorrowedTerminalPresenter<'_, W, F>
+where
+    W: Write,
+    F: FnMut(&mut P, &mut Terminal<W>) -> Result<PresentReport, E>,
+    E: From<io::Error>,
+{
+    type Error = E;
+
+    fn observe_terminal_event(&mut self, event: &bmux_tui::event::Event) -> bool {
+        self.terminal.observe_event(event)
+    }
+
+    fn set_pointer_context(&mut self, context: bmux_tui::terminal::PointerContext) {
+        self.terminal.set_pointer_context(context);
+    }
+
+    fn resize(&mut self, size: Size) {
+        self.terminal
+            .resize(Rect::new(0, 0, size.width, size.height));
+    }
+
+    fn reset(&mut self, _reason: ResetReason) {
+        self.terminal.reset();
+    }
+
+    fn present(&mut self, program: &mut P) -> Result<PresentReport, Self::Error> {
+        (self.present)(program, self.terminal)
+    }
+
+    fn restore(&mut self) -> impl std::future::Future<Output = Result<(), Self::Error>> {
+        futures_util::future::lazy(move |_| self.terminal.restore_pointer().map_err(E::from))
+    }
+}
 
 /// No-op committed-presentation observer.
 #[derive(Debug, Clone, Copy, Default)]
@@ -348,6 +407,269 @@ impl<O: crate::presenter::CancellableOutput, R, C> Drop for AsyncTerminalPresent
             };
         self.terminal
             .complete_pointer_restore(transaction, succeeded);
+    }
+}
+
+#[cfg(test)]
+mod borrowed_tests {
+    use std::io::{self, Write};
+
+    use bmux_terminal_protocol::pointer_output::PointerShapeCapability;
+    use bmux_tui::damage::Damage;
+    use bmux_tui::event::{Event, MouseEvent, MouseEventKind};
+    use bmux_tui::geometry::{Point, Rect, Size};
+    use bmux_tui::hit::{HitRegion, HitRole};
+    use bmux_tui::pointer::{PointerIntent, PointerShape};
+    use bmux_tui::terminal::{PointerContext, Terminal};
+
+    use super::BorrowedTerminalPresenter;
+    use crate::presenter::{PointerContextPresenter, PresentReport, Presenter, ResetReason};
+
+    #[derive(Default)]
+    struct Output {
+        bytes: Vec<u8>,
+        flushes: usize,
+        fail_flush: bool,
+    }
+
+    impl Write for Output {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.flushes += 1;
+            if self.fail_flush {
+                Err(io::Error::other("injected borrowed flush failure"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    enum FrameError {
+        Io(io::Error),
+        Rejected,
+    }
+
+    impl From<io::Error> for FrameError {
+        fn from(error: io::Error) -> Self {
+            Self::Io(error)
+        }
+    }
+
+    struct Model {
+        id: &'static str,
+        intent: PointerIntent,
+        damage: Damage,
+        calls: usize,
+        paints: usize,
+        commits: usize,
+        reject: bool,
+        capture: bool,
+    }
+
+    impl Default for Model {
+        fn default() -> Self {
+            Self {
+                id: "target",
+                intent: PointerIntent::Shape(PointerShape::Pointer),
+                damage: Damage::Full,
+                calls: 0,
+                paints: 0,
+                commits: 0,
+                reject: false,
+                capture: false,
+            }
+        }
+    }
+
+    fn frame<W: Write>(
+        model: &mut Model,
+        terminal: &mut Terminal<W>,
+    ) -> Result<PresentReport, FrameError> {
+        model.calls += 1;
+        if model.reject {
+            return Err(FrameError::Rejected);
+        }
+        let stats = terminal.draw_damage(model.damage.clone(), |cx| {
+            model.paints += 1;
+            cx.push_hit(
+                HitRegion::new(model.id, Rect::new(0, 0, 2, 1)).pointer_intent(model.intent),
+            );
+            cx.push_hit(HitRegion::new("drag", Rect::new(2, 0, 2, 1)).role(HitRole::DragHandle));
+        })?;
+        model.commits += 1;
+        Ok(PresentReport {
+            changed_cells: stats.changed_cells,
+            full_repaint: stats.full_repaint,
+        })
+    }
+
+    fn motion() -> Event {
+        Event::Mouse(MouseEvent::new(MouseEventKind::Move, Point::new(0, 0)))
+    }
+
+    fn contains(bytes: &[u8], value: &[u8]) -> bool {
+        bytes.windows(value.len()).any(|window| window == value)
+    }
+
+    #[test]
+    fn borrowed_frame_preserves_damage_errors_and_caller_ownership() {
+        let mut output = Output::default();
+        let mut terminal = Terminal::new(&mut output, Rect::new(0, 0, 4, 1));
+        let mut model = Model::default();
+        {
+            let mut presenter = BorrowedTerminalPresenter::new(&mut terminal, frame::<&mut Output>);
+            assert_eq!(presenter.terminal.writer().flushes, 0);
+            let report = presenter.start_present(&mut model).unwrap().unwrap();
+            assert!(report.full_repaint);
+            assert_eq!(model.calls, 1);
+            assert_eq!(model.commits, 1);
+            assert_eq!(presenter.terminal.writer().flushes, 1);
+
+            model.damage = Damage::None;
+            model.id = "not-painted";
+            presenter.present(&mut model).unwrap();
+            assert_eq!(model.calls, 2);
+            assert_eq!(model.paints, 1);
+            assert_eq!(presenter.terminal.hits().regions()[0].id.as_str(), "target");
+
+            model.reject = true;
+            let flushes = presenter.terminal.writer().flushes;
+            assert!(matches!(
+                presenter.present(&mut model),
+                Err(FrameError::Rejected)
+            ));
+            assert_eq!(model.calls, 3);
+            assert_eq!(model.commits, 2);
+            assert_eq!(presenter.terminal.writer().flushes, flushes);
+        }
+        terminal.draw(|_| {}).unwrap();
+        assert!(output.flushes >= 2);
+    }
+
+    #[test]
+    fn borrowed_pointer_intent_and_stationary_context_use_existing_router() {
+        let mut terminal = Terminal::new(Output::default(), Rect::new(0, 0, 4, 1));
+        terminal.set_pointer_capability(PointerShapeCapability::Set);
+        let mut model = Model::default();
+        {
+            let inner = BorrowedTerminalPresenter::new(&mut terminal, frame::<Output>);
+            let mut presenter =
+                PointerContextPresenter::new(inner, |model: &Model| PointerContext {
+                    scope: None,
+                    capture: model.capture.then(|| "drag".into()),
+                });
+            assert!(presenter.observe_terminal_event(&motion()));
+            assert!(!presenter.observe_terminal_event(&motion()));
+            presenter.present(&mut model).unwrap();
+            assert!(contains(
+                &presenter.inner_mut().terminal.writer().bytes,
+                b"\x1b]22;pointer\x1b\\",
+            ));
+            presenter.inner_mut().terminal.writer_mut().bytes.clear();
+            model.capture = true;
+            // No motion or repaint: only the existing router's capture changed.
+            model.damage = Damage::None;
+            presenter.present(&mut model).unwrap();
+            assert_eq!(model.paints, 1);
+            assert!(contains(
+                &presenter.inner_mut().terminal.writer().bytes,
+                b"\x1b]22;grabbing\x1b\\",
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn borrowed_unsupported_host_emits_no_pointer_protocol() {
+        let mut terminal = Terminal::new(Output::default(), Rect::new(0, 0, 4, 1));
+        terminal.set_pointer_capability(PointerShapeCapability::Unsupported);
+        let mut presenter = BorrowedTerminalPresenter::new(&mut terminal, frame::<Output>);
+        let mut model = Model::default();
+        assert!(presenter.observe_terminal_event(&motion()));
+        presenter.present(&mut model).unwrap();
+        presenter.restore().await.unwrap();
+        assert!(!contains(&presenter.terminal.writer().bytes, b"\x1b]22;"));
+        assert_eq!(model.commits, 1);
+    }
+
+    #[test]
+    fn borrowed_failed_flush_preserves_scene_and_retries_pointer_intent() {
+        let mut terminal = Terminal::new(Output::default(), Rect::new(0, 0, 4, 1));
+        terminal.set_pointer_capability(PointerShapeCapability::Set);
+        let mut presenter = BorrowedTerminalPresenter::new(&mut terminal, frame::<Output>);
+        let mut model = Model::default();
+        presenter.observe_terminal_event(&motion());
+        presenter.present(&mut model).unwrap();
+        model.id = "replacement";
+        model.intent = PointerIntent::Shape(PointerShape::Text);
+        presenter.terminal.writer_mut().fail_flush = true;
+        assert!(matches!(
+            presenter.present(&mut model),
+            Err(FrameError::Io(_))
+        ));
+        assert_eq!(model.commits, 1);
+        assert_eq!(presenter.terminal.hits().regions()[0].id.as_str(), "target");
+        presenter.terminal.writer_mut().fail_flush = false;
+        presenter.terminal.writer_mut().bytes.clear();
+        presenter.present(&mut model).unwrap();
+        assert_eq!(model.commits, 2);
+        assert_eq!(
+            presenter.terminal.hits().regions()[0].id.as_str(),
+            "replacement"
+        );
+        assert!(contains(
+            &presenter.terminal.writer().bytes,
+            b"\x1b]22;text\x1b\\"
+        ));
+    }
+
+    #[test]
+    fn borrowed_resize_and_reset_delegate_without_drawing() {
+        let mut terminal = Terminal::new(Output::default(), Rect::new(0, 0, 4, 1));
+        let mut presenter = BorrowedTerminalPresenter::new(&mut terminal, frame::<Output>);
+        let mut model = Model::default();
+        presenter.present(&mut model).unwrap();
+        let flushes = presenter.terminal.writer().flushes;
+        presenter.resize(Size::new(6, 2));
+        assert_eq!(presenter.terminal.area(), Rect::new(0, 0, 6, 2));
+        assert!(presenter.terminal.retained_buffer().is_none());
+        assert_eq!(presenter.terminal.writer().flushes, flushes);
+        assert!(presenter.present(&mut model).unwrap().full_repaint);
+        presenter.reset(ResetReason::Application);
+        assert!(presenter.terminal.retained_buffer().is_none());
+        assert_eq!(model.calls, 2);
+        assert!(presenter.present(&mut model).unwrap().full_repaint);
+    }
+
+    #[tokio::test]
+    async fn borrowed_restore_is_lazy_and_converts_cleanup_failure() {
+        let mut terminal = Terminal::new(Output::default(), Rect::new(0, 0, 4, 1));
+        terminal.set_pointer_capability(PointerShapeCapability::Set);
+        let mut presenter = BorrowedTerminalPresenter::new(&mut terminal, frame::<Output>);
+        let mut model = Model::default();
+        presenter.observe_terminal_event(&motion());
+        presenter.present(&mut model).unwrap();
+        presenter.terminal.writer_mut().bytes.clear();
+        let flushes = presenter.terminal.writer().flushes;
+        drop(presenter.restore());
+        assert_eq!(presenter.terminal.writer().flushes, flushes);
+        assert_eq!(presenter.terminal.writer().bytes, [] as [u8; 0]);
+        presenter.terminal.writer_mut().fail_flush = true;
+        match presenter.restore().await {
+            Err(FrameError::Io(error)) => {
+                assert_eq!(error.to_string(), "injected borrowed flush failure");
+            }
+            result => panic!("expected converted restoration failure, got {result:?}"),
+        }
+        assert_eq!(model.commits, 1);
+        assert!(contains(
+            &presenter.terminal.writer().bytes,
+            b"\x1b]22;\x1b\\"
+        ));
     }
 }
 
