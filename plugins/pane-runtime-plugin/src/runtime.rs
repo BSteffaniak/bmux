@@ -1782,7 +1782,10 @@ impl PaneResurrectionRuntime {
         self.metadata_revision = self.metadata_revision.wrapping_add(1);
         // Shell-marker authentication already scopes these events to this PTY.
         let (PaneShellMetadataEvent::CommandStart { cwd, .. }
-        | PaneShellMetadataEvent::Prompt { cwd }) = &event;
+        | PaneShellMetadataEvent::Prompt { cwd }) = &event
+        else {
+            return;
+        };
         self.observed_cwd = Some(cwd.clone());
         trace!(execution = %self.observation_execution, "observed current execution directory");
         match event {
@@ -1796,6 +1799,7 @@ impl PaneResurrectionRuntime {
                 self.active_command = None;
                 self.active_command_source = None;
             }
+            PaneShellMetadataEvent::NestedReplay => {}
         }
     }
 }
@@ -1804,6 +1808,7 @@ impl PaneResurrectionRuntime {
 enum PaneShellMetadataEvent {
     CommandStart { command: String, cwd: String },
     Prompt { cwd: String },
+    NestedReplay,
 }
 
 fn apply_shell_metadata_events_and_take_prompt_replay(
@@ -1813,6 +1818,18 @@ fn apply_shell_metadata_events_and_take_prompt_replay(
 ) -> Option<String> {
     let mut replay_command = None;
     for event in events {
+        if matches!(event, PaneShellMetadataEvent::NestedReplay) {
+            if !state.frozen
+                && replay_command.is_none()
+                && let Some(launch) = &state.launch
+            {
+                match launch.take_replay() {
+                    Ok(command) => replay_command = command,
+                    Err(error) => warn!(%error, "nested replay unavailable"),
+                }
+            }
+            continue;
+        }
         let is_prompt = matches!(event, PaneShellMetadataEvent::Prompt { .. });
         state.apply_event(event);
         if is_prompt
@@ -2961,6 +2978,9 @@ fn decode_bound_shell_metadata(
     let text = std::str::from_utf8(payload).ok()?;
     let rest = text.strip_prefix(BMUX_SHELL_METADATA_PREFIX)?;
     let rest = rest.strip_prefix(token)?.strip_prefix(';')?;
+    if rest == "nested-ready" {
+        return Some(PaneShellMetadataEvent::NestedReplay);
+    }
     decode_shell_metadata_payload(format!("{BMUX_SHELL_METADATA_PREFIX}{rest}").as_bytes())
 }
 
@@ -3218,6 +3238,12 @@ const fn shell_integration_bash_rcfile() -> &'static str {
   source "${HOME}/.bashrc"
 fi
 
+if [[ -n "${BMUX_ROOT_SHELL_PID:-}" && "$BMUX_ROOT_SHELL_PID" != "$$" && -n "${BMUX_SHELL_CALLBACK:-}" ]]; then
+  eval "$("$BMUX_SHELL_CALLBACK" __shell-integration bash)"
+  return
+fi
+export BMUX_ROOT_SHELL_PID=$$
+
 if [[ -z "${__BMUX_RESURRECTION_HOOK_INSTALLED:-}" ]]; then
   __BMUX_RESURRECTION_HOOK_INSTALLED=1
 
@@ -3249,7 +3275,7 @@ if [[ -z "${__BMUX_RESURRECTION_HOOK_INSTALLED:-}" ]]; then
 
     local hist_line cmd
     hist_line="$(HISTTIMEFORMAT= builtin history 1 2>/dev/null)"
-    cmd="$hist_line"
+    cmd="${1:-$hist_line}"
     if [[ "$hist_line" =~ ^[[:space:]]*[0-9]+[[:space:]]+(.*)$ ]]; then
       cmd="${BASH_REMATCH[1]}"
     fi
@@ -3276,6 +3302,14 @@ if [[ -z "${__BMUX_RESURRECTION_HOOK_INSTALLED:-}" ]]; then
     __BMUX_EMIT_GUARD=
   }
 
+  # bash-preexec may install its dispatcher lazily at the first prompt and
+  # replace DEBUG. Participate in its public hook array as well as the native
+  # fallback; READY_FOR_CMD makes the two paths idempotent per command.
+  __bmux_bp_preexec() {
+    __BMUX_READY_FOR_CMD=1
+    __bmux_preexec_trap "$1"
+  }
+  preexec_functions+=(__bmux_bp_preexec)
   trap '__bmux_preexec_trap' DEBUG
   PROMPT_COMMAND="__bmux_precmd_hook"
 fi
@@ -3307,6 +3341,12 @@ fi
 if [[ -f "${__bmux_orig_zdotdir}/.zshrc" ]]; then
   source "${__bmux_orig_zdotdir}/.zshrc"
 fi
+
+if [[ -n "${BMUX_ROOT_SHELL_PID:-}" && "$BMUX_ROOT_SHELL_PID" != "$$" && -n "${BMUX_SHELL_CALLBACK:-}" ]]; then
+  eval "$("$BMUX_SHELL_CALLBACK" __shell-integration zsh)"
+  return
+fi
+export BMUX_ROOT_SHELL_PID=$$
 
 if [[ -z "${__BMUX_RESURRECTION_HOOK_INSTALLED:-}" ]]; then
   __BMUX_RESURRECTION_HOOK_INSTALLED=1
@@ -3403,6 +3443,25 @@ if not set -q __bmux_resurrection_hook_installed
   end
 end
 "#
+}
+
+#[allow(clippy::literal_string_with_formatting_args)]
+const fn shell_integration_nested_nu() -> &'static str {
+    r"if (($env.APPLICATION_RESURRECTION_HOST? | default '') != '') and (($env.BMUX_SHELL_CALLBACK? | default '') != '') {
+  $env.config = ($env.config
+    | upsert hooks.pre_prompt (($env.config.hooks.pre_prompt? | default []) | append {||
+        let cwd = (^$env.BMUX_SHELL_CALLBACK __shell-invocation location $nu.current-exe ($nu.pid | into string) '' ($env.PWD | into string))
+        if (($cwd | str length) > 0) { cd $cwd }
+        ^$env.BMUX_SHELL_CALLBACK __shell-invocation prompt $nu.current-exe ($nu.pid | into string) '' ($env.PWD | into string)
+      })
+    | upsert hooks.pre_execution (($env.config.hooks.pre_execution? | default []) | append {||
+        let text = (commandline)
+        if (($text | str trim | str length) > 0) {
+          ^$env.BMUX_SHELL_CALLBACK __shell-invocation start $nu.current-exe ($nu.pid | into string) $text ($env.PWD | into string)
+        }
+      }))
+}
+"
 }
 
 #[allow(clippy::literal_string_with_formatting_args)]
@@ -6816,6 +6875,36 @@ impl SessionRuntimeManager {
             };
             clear_managed_launch_env(&mut command);
             command.env_remove("APPLICATION_RESURRECTION_HOST");
+            command.env_remove("BMUX_ROOT_SHELL_PID");
+            command.env_remove("__BMUX_NESTED_PID");
+            command.env("BMUX_SHELL_MARKER", &shell_marker_token);
+            if let Some(root) = &shell_integration_root {
+                let share = root.join("nested-share");
+                let config = share.join("nushell/vendor/autoload/bmux.nu");
+                if let Err(error) =
+                    write_shell_integration_file(&config, shell_integration_nested_nu())
+                {
+                    warn!(%error, "nested shell integration unavailable");
+                }
+                let fish_config = share.join("fish/vendor_conf.d/bmux.fish");
+                if let Err(error) = write_shell_integration_file(
+                    &fish_config,
+                    "if status is-interactive; and set -q BMUX_SHELL_CALLBACK; and set -q APPLICATION_RESURRECTION_HOST\n  $BMUX_SHELL_CALLBACK __shell-integration fish | source\nend\n",
+                ) {
+                    warn!(%error, "nested Fish integration unavailable");
+                }
+                if let Ok(executable) = std::env::current_exe() {
+                    command.env("BMUX_SHELL_CALLBACK", executable);
+                }
+                let mut dirs = vec![share];
+                dirs.extend(std::env::split_paths(
+                    &std::env::var_os("XDG_DATA_DIRS")
+                        .unwrap_or_else(|| std::ffi::OsString::from("/usr/local/share:/usr/share")),
+                ));
+                if let Ok(value) = std::env::join_paths(dirs) {
+                    command.env("XDG_DATA_DIRS", value);
+                }
+            }
             if let Some(resume) = &application_resume {
                 command.env("APPLICATION_RESURRECTION_HOST", &resume.endpoint);
             }
@@ -7673,6 +7762,7 @@ impl SessionRuntimeManager {
                                             && !resurrection_state.frozen
                                         {
                                             for event in &metadata.events {
+                                                if matches!(event, PaneShellMetadataEvent::NestedReplay) { continue; }
                                                 match resume.boundary(matches!(event, PaneShellMetadataEvent::Prompt { .. })) {
                                                     Ok(identity) => resurrection_state.execution_token = Some(identity),
                                                     Err(error) => {

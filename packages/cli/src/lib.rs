@@ -29,6 +29,12 @@ pub(crate) fn reqwest_client() -> reqwest::Client {
 /// # Errors
 /// Returns an error when CLI parsing, command execution, or runtime startup fails.
 pub async fn run_cli() -> anyhow::Result<u8> {
+    #[cfg(all(unix, feature = "bundled-plugin-application-resurrection"))]
+    if let Some(code) =
+        bmux_application_resurrection_plugin::shell::try_run().map_err(anyhow::Error::msg)?
+    {
+        return Ok(code);
+    }
     runtime::startup_future_marker("run_cli.first_poll", 0);
     Box::pin(runtime::run()).await
 }

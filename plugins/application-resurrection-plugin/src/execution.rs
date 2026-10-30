@@ -14,6 +14,8 @@ pub struct Checkpoint {
     pub(crate) generation: u64,
     pub(crate) revision: u64,
     pub(crate) descriptor: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) commands: Vec<crate::recovery::Command>,
 }
 
 impl Checkpoint {
@@ -22,8 +24,17 @@ impl Checkpoint {
     /// # Errors
     /// Rejects unknown versions, invalid generations, or malformed descriptors.
     pub fn validate(&self) -> Result<(), &'static str> {
-        if self.version != 1 || self.generation == 0 {
+        self.validate_header()?;
+        let mut identities = std::collections::BTreeSet::new();
+        crate::recovery::validate(self, 0, &mut identities)
+    }
+
+    pub(crate) fn validate_header(&self) -> Result<(), &'static str> {
+        if !matches!(self.version, 1 | 2) || self.generation == 0 {
             return Err("unsupported or invalid checkpoint");
+        }
+        if self.version == 1 && !self.commands.is_empty() {
+            return Err("nested recovery requires checkpoint version two");
         }
         validate_descriptor(self.descriptor.as_deref())
     }
@@ -56,6 +67,7 @@ impl Execution {
                 generation: 1,
                 revision: 0,
                 descriptor: None,
+                commands: Vec::new(),
             },
             owner: None,
             restoration: false,
@@ -83,6 +95,10 @@ impl Execution {
             restoration: true,
             ended: false,
         })
+    }
+
+    pub(crate) fn restoring(&self) -> bool {
+        self.restoration
     }
 
     /// Caller identity must already have been authenticated and bound to this execution.

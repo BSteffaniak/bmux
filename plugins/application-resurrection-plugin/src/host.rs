@@ -10,6 +10,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+mod scopes;
+use scopes::NestedShell;
+
 #[cfg(test)]
 mod tests;
 
@@ -32,6 +35,7 @@ struct Entry {
     file: PathBuf,
     stopped: AtomicBool,
     state: Mutex<State>,
+    connections: std::sync::atomic::AtomicUsize,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -43,15 +47,31 @@ enum CommandPhase {
 struct State {
     execution: Execution,
     pid: Option<u32>,
+    identity: Option<crate::process::Identity>,
+    executable: Option<PathBuf>,
     shell: bool,
     initial_prompt: bool,
     replay_start: bool,
     command_phase: CommandPhase,
     epoch: u64,
     claim: Option<u32>,
+    nested: Vec<NestedShell>,
+    pending_replay: Option<(crate::process::Identity, uuid::Uuid, String)>,
 }
 
 impl State {
+    fn install_checkpoint(&mut self, checkpoint: Checkpoint) {
+        for scope in &mut self.nested {
+            if let Some(execution) = &mut scope.execution
+                && let Some(saved) =
+                    crate::recovery::find(&checkpoint, execution.committed.invocation)
+            {
+                execution.committed = saved.clone();
+            }
+        }
+        self.execution.committed = checkpoint;
+    }
+
     fn registration_ready(&self) -> bool {
         self.pid.is_some() && self.command_phase == CommandPhase::Active
     }
@@ -150,9 +170,12 @@ impl Host {
             endpoint: endpoint.clone(),
             file,
             stopped: AtomicBool::new(false),
+            connections: std::sync::atomic::AtomicUsize::new(0),
             state: Mutex::new(State {
                 execution,
                 pid: None,
+                identity: None,
+                executable: None,
                 shell,
                 initial_prompt: shell,
                 replay_start: shell && replay,
@@ -163,25 +186,12 @@ impl Host {
                 },
                 epoch: 0,
                 claim: None,
+                nested: Vec::new(),
+                pending_replay: None,
             }),
         });
         entries.insert(key.to_owned(), Arc::clone(&entry));
-        std::thread::spawn(move || {
-            let _directory = directory;
-            while !entry.stopped.load(Ordering::SeqCst) {
-                match listener.accept() {
-                    Ok((stream, _)) => {
-                        if let Err(error) = serve(&entry, stream) {
-                            tracing::debug!(%error, "resurrection connection rejected");
-                        }
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(std::time::Duration::from_millis(20));
-                    }
-                    Err(_) => break,
-                }
-            }
-        });
+        listen(entry, listener, directory);
         Ok(
             bmux_application_resurrection_plugin_api::resurrection_launch_v2::PreparedLaunch {
                 endpoint,
@@ -202,11 +212,15 @@ impl Host {
 
     pub fn bind(&self, key: &str, endpoint: &str, pid: u32) -> Result<bool, String> {
         let entry = self.entry(key, endpoint)?;
+        let identity = crate::process::inspect(pid)?.identity;
+        let executable = crate::process::executable(pid).ok();
         let mut state = entry.state.lock().map_err(|e| e.to_string())?;
         if entry.stopped.load(Ordering::SeqCst) || state.pid.is_some() || pid == 0 {
             return Err("launch already bound or invalid PID".into());
         }
         state.pid = Some(pid);
+        state.identity = Some(identity);
+        state.executable = executable;
         Ok(true)
     }
 
@@ -271,7 +285,26 @@ impl Host {
             .checked_add(1)
             .ok_or("execution epoch exhausted")?;
         state.claim = None;
+        state.nested.clear();
+        state.pending_replay = None;
         Ok((true, state.execution.committed.invocation.to_string()))
+    }
+
+    pub fn take_replay(&self, key: &str, endpoint: &str) -> Result<Option<String>, String> {
+        let entry = self.entry(key, endpoint)?;
+        let mut state = entry.state.lock().map_err(|error| error.to_string())?;
+        let Some((identity, invocation, command)) = state.pending_replay.take() else {
+            return Ok(None);
+        };
+        if !crate::process::current(identity)
+            || !state
+                .nested
+                .iter()
+                .any(|scope| scope.owns_replay(identity, invocation))
+        {
+            return Err("nested replay owner is stale".into());
+        }
+        Ok(Some(command))
     }
 
     pub fn close(&self, key: &str, endpoint: &str) -> Result<bool, String> {
@@ -296,6 +329,39 @@ impl Drop for Host {
             }
         }
     }
+}
+
+fn listen(entry: Arc<Entry>, listener: UnixListener, directory: tempfile::TempDir) {
+    std::thread::spawn(move || {
+        let _directory = directory;
+        while !entry.stopped.load(Ordering::SeqCst) {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    if entry
+                        .connections
+                        .try_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+                            (count < 8).then_some(count + 1)
+                        })
+                        .is_err()
+                    {
+                        drop(stream);
+                        continue;
+                    }
+                    let connection = Arc::clone(&entry);
+                    std::thread::spawn(move || {
+                        if let Err(error) = serve(&connection, stream) {
+                            tracing::debug!(%error, "resurrection connection rejected");
+                        }
+                        connection.connections.fetch_sub(1, Ordering::SeqCst);
+                    });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Err(_) => break,
+            }
+        }
+    });
 }
 
 fn stop_and_drain(entry: &Entry) -> Result<(), String> {
@@ -327,9 +393,14 @@ fn load_checkpoint(path: &Path) -> Result<Option<Checkpoint>, String> {
 }
 
 fn save(path: &Path, checkpoint: &Checkpoint) -> Result<(), String> {
+    checkpoint.validate().map_err(str::to_owned)?;
+    let bytes = serde_json::to_vec(checkpoint).map_err(|error| error.to_string())?;
+    if bytes.len() > 65_536 {
+        return Err("oversized checkpoint".into());
+    }
     let parent = path.parent().ok_or("missing checkpoint directory")?;
     let mut temp = tempfile::NamedTempFile::new_in(parent).map_err(|e| e.to_string())?;
-    serde_json::to_writer(&mut temp, checkpoint).map_err(|e| e.to_string())?;
+    temp.write_all(&bytes).map_err(|e| e.to_string())?;
     temp.as_file().sync_all().map_err(|e| e.to_string())?;
     temp.persist(path).map_err(|e| e.to_string())?;
     std::fs::File::open(parent)
@@ -392,6 +463,7 @@ fn configure_stream(stream: &UnixStream) -> Result<u32, String> {
     peer_pid(stream)
 }
 
+#[cfg(test)]
 fn receive_hello(reader: &mut BufReader<UnixStream>, peer: u32) -> Result<Hello, String> {
     let hello: Hello = receive(reader)?;
     if hello.protocol != PROTOCOL
@@ -414,70 +486,96 @@ fn wait_for_command_boundary(entry: &Entry) -> Result<(), String> {
             state.registration_ready()
         };
         if ready {
-            break;
+            return Ok(());
         }
         if entry.stopped.load(Ordering::SeqCst) {
             return Err("launch stopped before command boundary".into());
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
-    Ok(())
+    Err("command boundary was not established before the deadline".into())
 }
 
 struct Rejection(&'static str);
 
 struct Accepted {
     peer: u32,
+    peer_identity: crate::process::Identity,
+    root: crate::process::Identity,
+    invocation: uuid::Uuid,
     hello: Hello,
     registration: crate::execution::Registration,
     epoch: u64,
     offer: Option<String>,
 }
 
-fn accept(entry: &Entry, reader: &mut BufReader<UnixStream>) -> Result<Accepted, Rejection> {
-    accept_with_inspector(entry, reader, belongs)
-}
-
+#[cfg(test)]
 fn accept_with_inspector(
     entry: &Entry,
     reader: &mut BufReader<UnixStream>,
-    inspect: impl FnOnce(u32, u32, bool) -> Result<bool, String>,
+    inspect: impl FnOnce(u32, crate::process::Identity, bool) -> Result<bool, String>,
 ) -> Result<Accepted, Rejection> {
     let peer = configure_stream(reader.get_ref()).map_err(|_| Rejection("invalid_handshake"))?;
     let hello = receive_hello(reader, peer).map_err(|_| Rejection("invalid_handshake"))?;
+    accept_hello(entry, peer, hello, inspect)
+}
+
+fn accept_hello(
+    entry: &Entry,
+    peer: u32,
+    hello: Hello,
+    inspect: impl FnOnce(u32, crate::process::Identity, bool) -> Result<bool, String>,
+) -> Result<Accepted, Rejection> {
+    if hello.protocol != PROTOCOL
+        || hello.application.is_empty()
+        || hello.application.len() > 128
+        || hello.pid != peer
+    {
+        return Err(Rejection("invalid_handshake"));
+    }
     wait_for_command_boundary(entry).map_err(|_| Rejection("launch_unavailable"))?;
+    let peer_identity = crate::process::inspect(peer)
+        .map_err(|_| Rejection("ownership_verification_unavailable"))?
+        .identity;
+    let (invocation, root, shell, observed_epoch) = registration_target(entry, peer)?;
+    // Native inspection must not prevent a command boundary or final snapshot from
+    // fencing this invocation. Revalidate the epoch after the probe completes.
+    if !inspect(peer, root, shell).map_err(|_| Rejection("ownership_verification_unavailable"))? {
+        return Err(Rejection("ownership_rejected"));
+    }
     let (registration, epoch, offer) = {
         let mut state = entry
             .state
             .lock()
             .map_err(|_| Rejection("launch_unavailable"))?;
-        let root = state.pid.ok_or(Rejection("launch_unavailable"))?;
         if entry.stopped.load(Ordering::SeqCst)
+            || state.epoch != observed_epoch
             || state.command_phase != CommandPhase::Active
-            || state.claim.is_some()
-            || !inspect(peer, root, state.shell)
-                .map_err(|_| Rejection("ownership_verification_unavailable"))?
         {
             return Err(Rejection("ownership_rejected"));
         }
-        let registration = state
-            .execution
+        let execution = scopes::execution_mut(&mut state, invocation)
+            .map_err(|_| Rejection("launch_unavailable"))?;
+        let registration = execution
             .register(uuid::Uuid::new_v4())
             .map_err(|_| Rejection("launch_unavailable"))?;
         let offer = if hello.accept_restore {
-            state
-                .execution
+            execution
                 .offer(registration)
                 .map_err(|_| Rejection("launch_unavailable"))?
                 .map(str::to_owned)
         } else {
             None
         };
-        state.claim = Some(peer);
+        scopes::claim(&mut state, invocation, peer_identity)
+            .map_err(|_| Rejection("ownership_rejected"))?;
         (registration, state.epoch, offer)
     };
     Ok(Accepted {
         peer,
+        peer_identity,
+        root,
+        invocation,
         hello,
         registration,
         epoch,
@@ -485,15 +583,75 @@ fn accept_with_inspector(
     })
 }
 
+fn registration_target(
+    entry: &Entry,
+    peer: u32,
+) -> Result<(uuid::Uuid, crate::process::Identity, bool, u64), Rejection> {
+    // Some shells start a command while its pre-exec callback is still finishing.
+    // Wait for the authoritative boundary instead of assigning the outer command.
+    for _ in 0..100 {
+        {
+            let state = entry
+                .state
+                .lock()
+                .map_err(|_| Rejection("launch_unavailable"))?;
+            if entry.stopped.load(Ordering::SeqCst) {
+                return Err(Rejection("launch_unavailable"));
+            }
+            if state.command_phase == CommandPhase::Active
+                && let Ok((invocation, root)) = scopes::target(&state, peer)
+            {
+                return Ok((invocation, root, state.shell, state.epoch));
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    Err(Rejection("ownership_rejected"))
+}
+
 fn serve(entry: &Entry, stream: UnixStream) -> Result<(), String> {
+    let peer = configure_stream(&stream)?;
     let mut reader = BufReader::new(stream);
+    // Peek one bounded frame to dispatch shell callbacks on the same socket.
+    // Re-chain it for the existing application decoder without relaxing its schema.
+    let frame: serde_json::Value = receive(&mut reader)?;
+    if frame["protocol"] == scopes::PROTOCOL {
+        let boundary = serde_json::from_value(frame).map_err(|error| error.to_string())?;
+        let result = scopes::handle(entry, peer, boundary);
+        if let Err(error) = &result {
+            tracing::warn!(%error, "shell callback rejected");
+        }
+        send(
+            reader.get_mut(),
+            &serde_json::json!({
+                "protocol": scopes::PROTOCOL, "ok": result.is_ok(),
+                "replay": result.as_ref().ok().and_then(|command| command.as_deref()),
+            }),
+        )?;
+        return result.map(|_| ());
+    }
+    serve_application(entry, reader, frame)
+}
+
+fn serve_application(
+    entry: &Entry,
+    mut reader: BufReader<UnixStream>,
+    frame: serde_json::Value,
+) -> Result<(), String> {
+    // The first frame has already been authenticated by the accepted socket.
+    let hello: Hello = serde_json::from_value(frame).map_err(|error| error.to_string())?;
+    let peer = peer_pid(reader.get_ref())?;
+    let accepted = accept_hello(entry, peer, hello, crate::process::foreground_child);
     let Accepted {
         peer,
+        peer_identity,
+        root,
+        invocation,
         hello,
         registration,
         epoch,
         offer,
-    } = match accept(entry, &mut reader) {
+    } = match accepted {
         Ok(accepted) => accepted,
         Err(Rejection(code)) => {
             // Send a bounded, public reason rather than private paths or raw OS errors.
@@ -544,67 +702,41 @@ fn serve(entry: &Entry, stream: UnixStream) -> Result<(), String> {
             .map(|value| serde_json::to_string(&value))
             .transpose()
             .map_err(|e| e.to_string())?;
-        let mut state = entry.state.lock().map_err(|e| e.to_string())?;
-        if state.epoch != epoch
-            || entry.stopped.load(Ordering::SeqCst)
-            || !belongs(peer, state.pid.ok_or("unbound")?, state.shell)?
+        let (root, shell) = {
+            let state = entry.state.lock().map_err(|e| e.to_string())?;
+            if state.epoch != epoch || entry.stopped.load(Ordering::SeqCst) {
+                return Err("stale execution".into());
+            }
+            (root, state.shell)
+        };
+        if !crate::process::current(peer_identity)
+            || !crate::process::foreground_child(peer, root, shell)?
         {
             return Err("stale execution".into());
         }
-        let candidate = state
-            .execution
+        let mut state = entry.state.lock().map_err(|e| e.to_string())?;
+        if state.epoch != epoch || entry.stopped.load(Ordering::SeqCst) {
+            return Err("stale execution".into());
+        }
+        let candidate = scopes::execution_mut(&mut state, invocation)?
             .update(registration, update.revision, descriptor)
             .map_err(str::to_owned)?;
-        if let Err(error) = save(&entry.file, &candidate) {
+        let mut durable = state.execution.committed.clone();
+        *crate::recovery::find_mut(&mut durable, invocation).ok_or("stale nested invocation")? =
+            candidate.clone();
+        if let Err(error) = save(&entry.file, &durable) {
             entry.stopped.store(true, Ordering::SeqCst);
             return Err(error);
         }
-        state
-            .execution
+        scopes::execution_mut(&mut state, invocation)?
             .committed(candidate)
             .map_err(str::to_owned)?;
+        state.install_checkpoint(durable);
         send(
             reader.get_mut(),
             &serde_json::json!({"revision": update.revision}),
         )?;
     }
-}
-
-fn belongs(peer: u32, root: u32, shell: bool) -> Result<bool, String> {
-    if !shell {
-        return Ok(peer == root);
-    }
-    // NixOS provides ps through PATH rather than /bin. macOS retains its system tool.
-    let program = if cfg!(target_os = "macos") {
-        "/bin/ps"
-    } else {
-        "ps"
-    };
-    foreground_owner(peer, root, program)
-}
-
-fn foreground_owner(peer: u32, root: u32, program: &str) -> Result<bool, String> {
-    // Parentage alone would allow an unrelated background job to claim recovery.
-    let output = std::process::Command::new(program)
-        .args(["-o", "ppid=,pgid=,tpgid=", "-p", &peer.to_string()])
-        .output()
-        .map_err(|error| format!("foreground ownership inspection unavailable: {error}"))?;
-    if !output.status.success() {
-        return Err("foreground ownership inspection failed".into());
-    }
-    let identity = String::from_utf8(output.stdout)
-        .map_err(|_| "invalid foreground ownership inspection output".to_owned())?;
-    Ok(foreground_child(&identity, root))
-}
-
-fn foreground_child(identity: &str, root: u32) -> bool {
-    let mut fields = identity.split_whitespace();
-    let parent = fields.next().and_then(|value| value.parse::<u32>().ok());
-    let group = fields.next().and_then(|value| value.parse::<u32>().ok());
-    let foreground = fields.next().and_then(|value| value.parse::<u32>().ok());
-    parent == Some(root)
-        && group.is_some_and(|group| group > 0 && Some(group) == foreground)
-        && fields.next().is_none()
 }
 
 fn peer_pid(stream: &UnixStream) -> Result<u32, String> {

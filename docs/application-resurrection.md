@@ -8,18 +8,58 @@ BMUX plugin authenticates local peers, persists acknowledged descriptors, and
 uses
 v2 invocation identities to validate pane snapshot association. Shell markers
 are
-bound to each launch. Real-daemon tests cover direct launch, Bash replay, and
-manual
-launch isolation. The real Bcode TUI restart test passed with a freshly built
+bound to each launch. Nested integrated shells use distinct command invocations
+and a bounded checkpoint-v2 recovery path. Direct launch, Bash/Fish/Nushell
+replay,
+nested Bash/Zsh/Fish/Nushell, repeated restarts and manual-launch isolation have
+real-daemon regression coverage. See the adapter README for startup integration;
+BMUX never edits user startup files. The real Bcode TUI restart test passed with
+a freshly built
 Bcode
 binary and isolated state; the replayed launch omitted the original session ID.
 
 The cross-repository test is opt-in because it requires a Bcode binary. See
 `plugins/application-resurrection-plugin/README.md` for its command, supported
 scope,
-and explicit recovery behavior. Nested/non-exec wrappers and remote applications
-are not automatically adopted. Same-user code with access to private integration
+and explicit recovery behavior. Unintegrated nested shells, non-exec wrappers
+and remote applications are not automatically adopted. Same-user code with
+access to private integration
 files remains within the local trust boundary.
+
+## Nested invocation recovery
+
+The pane owner retains the outer command and invocation identity. The
+application
+resurrection plugin owns a bounded foreground command path beneath that root.
+Each integrated shell reports its PID, executable and command boundaries through
+short-lived callbacks using the ordinary BMUX executable. The host authenticates
+the socket peer and verifies bounded native ancestry to the reporting shell;
+client-supplied PIDs and inherited endpoints are not authority. Process births,
+sessions, controlling terminals and foreground groups are checked. A bounded
+job-control handoff grace period handles fork-before-`tcsetpgrp` races.
+
+A shell command boundary atomically persists its new invocation before the
+callback returns. Successive commands receive distinct identities and invalidate
+old application registrations. One foreground child path is supported per
+invocation; competing shell branches or application owners are rejected. The
+entire nested descriptor path is committed atomically before application updates
+are acknowledged. Checkpoint v2 is explicitly versioned; v1 remains readable.
+
+On replay, each recreated shell registers, restores its saved cwd and signals
+readiness. Terminal metadata carries only readiness, never executable commands.
+The pane owner takes the host's pending command through the typed lifecycle
+service and sends it to that shell. An offer is bound to a live shell
+incarnation
+and one invocation, and cannot be taken twice. Each recreated application
+receives
+only its own saved descriptor. A subsequent manual launch receives none.
+
+This is command replay, not shell memory checkpointing. Shell-local environment,
+functions and arbitrary wrapper side effects are not reconstructed. The existing
+command replay policy applies. Bash and Zsh require startup integration for
+ordinary nested launches; Fish and Nushell use inherited vendor autoload paths.
+Callbacks add no separate executable artifact or long-running helper. Existing
+pane execution supervision is unchanged by this integration.
 
 ## Product outcome
 
@@ -248,5 +288,6 @@ against daemon loss.
 - `../bcode/packages/tui/src/session_flow.rs`: central Draft/Opening/Attached/Detached
   view lifecycle and stale asynchronous open-result handling.
 
-These are implementation entry points, not permission to extend existing domain
-leakage in infrastructure. No production implementation is complete yet.
+These are implementation entry points; production behavior is summarized at the
+start of this document. They do not authorize extending domain behavior into
+core infrastructure.

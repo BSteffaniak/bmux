@@ -89,6 +89,19 @@ impl Launch {
         .map_err(|e| e.to_string())?
         .map_err(|e| format!("{e:?}"))
     }
+    pub fn take_replay(&self) -> Result<Option<String>, String> {
+        let mut dispatch = ServiceCallerDispatchClient::new(self.caller.as_ref());
+        block_on_typed_dispatch(
+            bmux_application_resurrection_plugin_api::resurrection_launch_v2::client::take_replay(
+                &mut dispatch,
+                self.key.clone(),
+                self.endpoint.clone(),
+            ),
+        )
+        .map_err(|error| error.to_string())?
+        .map_err(|error| format!("{error:?}"))
+    }
+
     pub fn close_checked(&self) -> Result<(), String> {
         let mut dispatch = ServiceCallerDispatchClient::new(self.caller.as_ref());
         block_on_typed_dispatch(client::close(

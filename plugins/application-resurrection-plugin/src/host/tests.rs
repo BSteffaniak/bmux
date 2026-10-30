@@ -410,22 +410,6 @@ fn corrupt_checkpoint_does_not_become_empty_installation() {
 }
 
 #[test]
-fn shell_ownership_requires_current_foreground_child() {
-    assert!(foreground_child("100 200 200\n", 100));
-    for identity in [
-        "100 200 300",
-        "101 200 200",
-        "100 200 -1",
-        "100 0 0",
-        "100 200",
-        "100 200 200 extra",
-        "corrupt",
-    ] {
-        assert!(!foreground_child(identity, 100), "accepted {identity}");
-    }
-}
-
-#[test]
 fn kernel_peer_credentials_identify_the_connecting_process() {
     let (client, server) = UnixStream::pair().unwrap();
     assert_eq!(peer_pid(&client).unwrap(), std::process::id());
@@ -449,15 +433,6 @@ fn actual_peer_identity_rejects_forged_pid() {
     assert_eq!(rejection["protocol"], PROTOCOL);
     assert_eq!(rejection["error"]["code"], "invalid_handshake");
     assert!(receive::<serde_json::Value>(&mut reader).is_err());
-}
-
-#[test]
-fn unavailable_process_inspector_is_distinct_from_rejected_ownership() {
-    assert!(foreground_owner(std::process::id(), 1, "/nonexistent/resurrection-ps").is_err());
-    assert!(!belongs(std::process::id(), 1, false).unwrap());
-    assert!(belongs(std::process::id(), std::process::id(), false).unwrap());
-    // Exercise the actual platform tool, including PATH resolution on NixOS.
-    assert!(belongs(std::process::id(), 1, true).is_ok());
 }
 
 #[test]

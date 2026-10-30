@@ -158,7 +158,71 @@ async fn restart_round_trip(
     pane_count: usize,
     restarts: usize,
 ) {
+    nested_round_trip(shell, shell_program, abrupt, pane_count, restarts, &[]).await;
+}
+
+#[tokio::test]
+async fn nested_nushell_session_survives_repeated_restarts_and_manual_launch() {
+    nested_round_trip(true, &bash_path(), false, 1, 2, &["nu"]).await;
+}
+
+#[tokio::test]
+async fn deeply_nested_shells_survive_restart() {
+    nested_round_trip(true, &bash_path(), false, 1, 2, &["nu", "nu"]).await;
+}
+
+#[tokio::test]
+async fn nested_fish_survives_restart() {
+    nested_round_trip(true, &bash_path(), false, 1, 1, &["fish"]).await;
+}
+
+#[tokio::test]
+async fn nested_bash_survives_restart() {
+    nested_round_trip(true, &bash_path(), false, 1, 1, &["bash"]).await;
+}
+
+#[tokio::test]
+async fn nested_zsh_survives_restart() {
+    if !std::process::Command::new("which")
+        .arg("zsh")
+        .status()
+        .unwrap()
+        .success()
+    {
+        return;
+    }
+    nested_round_trip(true, &bash_path(), false, 1, 1, &["zsh"]).await;
+}
+
+#[tokio::test]
+async fn nested_shell_survives_repeated_sigkill() {
+    nested_round_trip(true, &bash_path(), true, 1, 2, &["nu"]).await;
+}
+
+async fn nested_round_trip(
+    shell: bool,
+    shell_program: &str,
+    abrupt: bool,
+    pane_count: usize,
+    restarts: usize,
+    nested: &[&str],
+) {
     let mut server = support::ServerEnv::new("application-resurrection");
+    server.isolate_shell_config();
+    // Supported startup integration for shells without an inherited vendor
+    // autoload directory. No user startup files are modified by the product.
+    std::fs::write(server.root().join("home/.bashrc"), r#"if [[ -n ${BMUX_ROOT_SHELL_PID:-} && $BMUX_ROOT_SHELL_PID != $$ && -n ${BMUX_SHELL_CALLBACK:-} ]]; then
+  eval "$("$BMUX_SHELL_CALLBACK" __shell-integration bash)"
+fi
+"#).unwrap();
+    std::fs::write(
+        server.root().join("home/.zshrc"),
+        r#"if [[ -n ${BMUX_SHELL_CALLBACK:-} ]]; then
+  eval "$("$BMUX_SHELL_CALLBACK" __shell-integration zsh)"
+fi
+"#,
+    )
+    .unwrap();
     server.write_config(&format!(
         "[general]\ndefault_shell = '{shell_program}'\n[behavior]\nrestore_last_layout = true\n",
     ));
@@ -226,13 +290,27 @@ while True: time.sleep(1)
         let pane = panes.panes[0].id;
         // Wait for shell startup before injecting a command through the public input service.
         tokio::time::sleep(Duration::from_secs(1)).await;
+        for nested_shell in nested {
+            client::pane_direct_input(
+                &mut connection,
+                session.session_id,
+                pane,
+                format!("{nested_shell}\n").into_bytes(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
         client::pane_direct_input(
             &mut connection,
             session.session_id,
             pane,
             format!(
                 "{}'{}' '{}' '{}'\n",
-                if shell_program.ends_with("/nu") {
+                if nested.last() == Some(&"nu")
+                    || (nested.is_empty() && shell_program.ends_with("/nu"))
+                {
                     "^"
                 } else {
                     ""
@@ -297,9 +375,13 @@ while True: time.sleep(1)
             .unwrap()
             .unwrap();
             if panes.panes.iter().any(|pane| {
-                pane.active_command
-                    .as_deref()
-                    .is_some_and(|command| command.contains(&script.to_string_lossy().to_string()))
+                pane.active_command.as_deref().is_some_and(|command| {
+                    if !nested.is_empty() {
+                        command == nested[0]
+                    } else {
+                        command.contains(&script.to_string_lossy().to_string())
+                    }
+                })
             }) {
                 break;
             }
@@ -367,7 +449,11 @@ while True: time.sleep(1)
             &script,
             &result,
             &server,
-            shell_program.ends_with("/nu"),
+            (
+                nested.last() == Some(&"nu")
+                    || (nested.is_empty() && shell_program.ends_with("/nu")),
+                nested.first().copied(),
+            ),
         )
         .await;
     }
@@ -381,8 +467,9 @@ async fn manual_launch_after_restore(
     script: &std::path::Path,
     result: &std::path::Path,
     server: &support::ServerEnv,
-    nushell: bool,
+    shell: (bool, Option<&str>),
 ) {
+    let (nushell, outer) = shell;
     use bmux_pane_runtime_plugin_api::attach_runtime_commands::{self, client as attach};
     use bmux_pane_runtime_plugin_api::pane_runtime_state::client as state;
     let mut connection =
@@ -420,7 +507,29 @@ async fn manual_launch_after_restore(
             .await
             .unwrap()
             .unwrap();
-        if panes.panes[0].active_command.is_none() {
+        let outer_command = panes.panes[0].active_command.as_deref();
+        let nested_prompt = if outer.is_some() {
+            let path = server
+                .state_dir
+                .join("application-resurrection")
+                .join(format!("{pane}.json"));
+            std::fs::read(path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                .is_some_and(|mut checkpoint| {
+                    while let Some(child) = checkpoint["commands"]
+                        .as_array()
+                        .and_then(|items| items.first())
+                    {
+                        checkpoint = child["checkpoint"].clone();
+                    }
+                    checkpoint["descriptor"].is_null()
+                })
+        } else {
+            outer_command.is_none()
+        };
+        if nested_prompt && (outer_command.is_none() || (outer.is_some() && outer_command == outer))
+        {
             break;
         }
         assert!(

@@ -5,6 +5,12 @@
 pub mod execution;
 #[cfg(unix)]
 mod host;
+#[cfg(unix)]
+mod process;
+mod recovery;
+/// Local shell lifecycle callbacks using the ordinary BMUX executable.
+#[cfg(unix)]
+pub mod shell;
 
 #[cfg(unix)]
 use bmux_application_resurrection_plugin_api::{resurrection_host_v1, resurrection_launch_v1};
@@ -66,6 +72,9 @@ impl RustPlugin for ApplicationResurrectionPlugin {
                 },
                 bmux_application_resurrection_plugin_api::resurrection_launch_v2::client::BoundaryEndpoint => |request, _context| {
                     Ok(host.ok_or_else(unavailable).and_then(|host| host.boundary_identity(&request.key, &request.endpoint, request.prompt).map_err(host_error)))
+                },
+                bmux_application_resurrection_plugin_api::resurrection_launch_v2::client::TakeReplayEndpoint => |request, _context| {
+                    Ok(host.ok_or_else(unavailable).and_then(|host| host.take_replay(&request.key, &request.endpoint).map_err(host_error)))
                 },
                 resurrection_launch_v1::client::BindEndpoint => |request, _context| {
                     Ok(host.ok_or_else(unavailable).and_then(|host| host.bind(&request.key, &request.endpoint, request.pid).map_err(host_error)))

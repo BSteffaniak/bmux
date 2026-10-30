@@ -29,6 +29,7 @@ interface resurrection-launch-v2 {
         endpoint: string,
         invocation: string,
     }
+    command take-replay(key: string, endpoint: string) -> result<string?, resurrection-launch-v1.host-error>;
     command boundary(key: string, endpoint: string, prompt: bool)
         -> result<string, resurrection-launch-v1.host-error>;
     command prepare(key: string, restored: bool, shell: bool, replay: bool, expected-invocation: string?)

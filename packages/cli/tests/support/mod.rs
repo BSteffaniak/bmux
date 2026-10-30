@@ -57,6 +57,7 @@ pub struct ServerEnv {
     server_stdout: PathBuf,
     server_stderr: PathBuf,
     server_child: Option<Child>,
+    shell_home: Option<PathBuf>,
     gateway_child: Option<Child>,
 }
 
@@ -94,6 +95,7 @@ impl ServerEnv {
             server_stdout,
             server_stderr,
             server_child: None,
+            shell_home: None,
             gateway_child: None,
         }
     }
@@ -113,8 +115,20 @@ impl ServerEnv {
         self.command_with_binary(&bmux_binary(), args)
     }
 
+    #[allow(dead_code)] // This shared fixture module is compiled separately by each integration target.
+    pub fn isolate_shell_config(&mut self) {
+        let home = self.root().join("home");
+        std::fs::create_dir_all(home.join(".config")).unwrap();
+        self.shell_home = Some(home);
+    }
+
     pub fn command_with_binary(&self, binary: &Path, args: &[&str]) -> Command {
         let mut command = Command::new(binary);
+        if let Some(home) = &self.shell_home {
+            command
+                .env("HOME", home)
+                .env("XDG_CONFIG_HOME", home.join(".config"));
+        }
         command
             .args(args)
             .env("BMUX_RUNTIME_DIR", &self.runtime_dir)
