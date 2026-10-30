@@ -15,8 +15,9 @@ name = "bmux"
 path = "src/main.rs"
 
 [dependencies]
-bmux_frontend_runtime = { workspace = true }
-bmux_plugin_runtime   = { workspace = true }
+bmux_connections_plugin_api = { workspace = true }
+bmux_frontend_runtime       = { workspace = true }
+bmux_plugin_runtime         = { workspace = true }
 # Internal bmux packages
 bmux_appearance = { workspace = true }
 bmux_attach_image_protocol = { workspace = true }
@@ -443,10 +444,9 @@ image-sixel = [
 ]
 
 [dev-dependencies]
-bmux_cluster_plugin_api     = { workspace = true }
-bmux_connections_plugin_api = { workspace = true }
-bmux_workspaces_plugin_api  = { workspace = true }
-gif                         = { workspace = true }
-serde_json                  = { workspace = true }
-serial_test                 = { workspace = true }
-tempfile                    = { workspace = true }
+bmux_cluster_plugin_api    = { workspace = true }
+bmux_workspaces_plugin_api = { workspace = true }
+gif                        = { workspace = true }
+serde_json                 = { workspace = true }
+serial_test                = { workspace = true }
+tempfile                   = { workspace = true }

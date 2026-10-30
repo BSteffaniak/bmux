@@ -75,6 +75,8 @@ interface pairing-types {
         endpoint_address: string?,
         // Pinned device endpoint URIs, one per advertised direct address/relay.
         endpoint_targets: list<string>,
+        // Optional ingress failed; local terminal operation remains available.
+        warning: string?,
     }
     record device {
         device_id: string,

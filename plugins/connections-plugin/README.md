@@ -62,6 +62,15 @@ mode = "disabled"
 ```
 
 `auto_start` requires explicit ingress permission and a nonzero fixed UDP port.
+If binding that listener fails (for example, another server owns the port),
+local
+startup continues without remote ingress. Listener status retains a warning,
+shown on local attach and by `bmux remote status`. After resolving the conflict,
+retry with `bmux remote enable --yes`. Explicit retries still report failures;
+BMUX never switches ports or stops the process occupying the configured address.
+Configuration, identity, and admission failures remain fatal rather than
+silently
+disabling security checks.
 Without auto-start, a local owner uses `start-listener`; that command also
 checks
 same-instance backend admission registration. Configuration-enabled auto-start

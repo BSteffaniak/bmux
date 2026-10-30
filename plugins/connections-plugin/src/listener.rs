@@ -13,6 +13,21 @@ pub const ALPN: &[u8] = b"bmux/connections/admission/1";
 const PREAUTH_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_PREAUTH_FRAME: usize = 64 * 1024;
 
+#[derive(Debug)]
+pub struct BindFailure(anyhow::Error);
+
+impl std::fmt::Display for BindFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("remote listener bind failed")
+    }
+}
+
+impl std::error::Error for BindFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.0.as_ref())
+    }
+}
+
 pub struct Listener {
     endpoint: iroh::Endpoint,
     task: JoinHandle<()>,
@@ -27,7 +42,11 @@ impl Listener {
         admission: Arc<AdmissionAuthority>,
         backend: IpcEndpoint,
     ) -> Result<Self> {
-        let endpoint = builder.alpns(vec![ALPN.to_vec()]).bind().await?;
+        let endpoint = builder
+            .alpns(vec![ALPN.to_vec()])
+            .bind()
+            .await
+            .map_err(|error| BindFailure(anyhow::Error::new(error)))?;
         ensure!(
             endpoint.id().to_string() == pairing.endpoint(),
             "pairing listener identity mismatch"

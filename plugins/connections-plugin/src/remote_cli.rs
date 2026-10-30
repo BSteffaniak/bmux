@@ -307,6 +307,9 @@ pub fn run(context: &NativeCommandContext) -> Result<i32> {
                 } else {
                     let status = state::listener_status(&mut client).await?;
                     println!("enabled={} endpoint={}", status.enabled, status.endpoint_id);
+                    if let Some(warning) = status.warning {
+                        println!("warning: {warning}");
+                    }
                     for target in status.endpoint_targets {
                         println!("{target}");
                     }

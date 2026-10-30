@@ -4932,6 +4932,15 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
     if let Some(publisher) = observer {
         view_state.set_observer(publisher);
     }
+    // Read once at attachment admission, not during frame composition. Optional
+    // ingress health never prevents local attachment or changes its target.
+    if let Ok(status) =
+        bmux_connections_plugin_api::pairing_state::client::listener_status(&mut client).await
+        && let Some(warning) = status.warning
+    {
+        eprintln!("bmux: warning: {warning}");
+        view_state.set_transient_status(warning, Instant::now(), Duration::from_secs(30));
+    }
     view_state.presentation_events = presentation_events;
     install_bundled_render_extensions(&mut view_state);
     terminal.set_attached_session_id(view_state.attached_id);

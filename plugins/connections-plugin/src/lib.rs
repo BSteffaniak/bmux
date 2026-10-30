@@ -43,6 +43,22 @@ pub struct ConnectionsPlugin {
     admission: Option<Arc<admission::AdmissionAuthority>>,
     admission_handle: Option<StreamAdmissionAuthorityHandle>,
     listener: tokio::sync::Mutex<Option<listener::Listener>>,
+    listener_warning: std::sync::Mutex<Option<String>>,
+}
+
+fn listener_start_warning(error: &anyhow::Error) -> String {
+    let reason = if error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::AddrInUse)
+    }) {
+        "configured address is already in use"
+    } else {
+        "could not bind the configured remote endpoint"
+    };
+    format!(
+        "Remote access unavailable: {reason}. Local terminals remain available. Use `bmux remote enable --yes` to retry."
+    )
 }
 
 impl ConnectionsPlugin {
@@ -79,6 +95,11 @@ impl ConnectionsPlugin {
         Ok(bmux_connections_plugin_api::pairing_types::ListenerStatus {
             endpoint_id: runtime.status().endpoint_id,
             enabled: listener.is_some(),
+            warning: self
+                .listener_warning
+                .lock()
+                .expect("listener warning lock poisoned")
+                .clone(),
             endpoint_address: listener
                 .as_ref()
                 .and_then(|listener| listener.targets().into_iter().next()),
@@ -161,6 +182,10 @@ impl ConnectionsPlugin {
                     .map_err(pairing_error)?,
                 );
             }
+            *self
+                .listener_warning
+                .lock()
+                .expect("listener warning lock poisoned") = None;
             drop(listener);
             Ok::<_, ServiceResponse>(())
         })?;
@@ -177,6 +202,11 @@ impl ConnectionsPlugin {
             if let Some(mut active) = listener.take() {
                 active.stop().await;
             }
+            drop(listener);
+            *self
+                .listener_warning
+                .lock()
+                .expect("listener warning lock poisoned") = None;
         });
         self.listener_status()
     }
@@ -380,6 +410,10 @@ impl ConnectionsPlugin {
 impl RustPlugin for ConnectionsPlugin {
     type Contract = bmux_connections_plugin_api::Contract;
 
+    // No event handler: avoid queuing an exclusive no-op borrow while a
+    // listener-start service awaits the host's cross-thread admission probe.
+    const HANDLES_EVENTS: bool = false;
+
     fn register_contributions(
         &self,
         registrar: &mut bmux_plugin_sdk::ContributionRegistrar,
@@ -471,6 +505,10 @@ impl RustPlugin for ConnectionsPlugin {
     }
 
     fn activate(&mut self, context: NativeLifecycleContext) -> Result<i32, PluginCommandError> {
+        *self
+            .listener_warning
+            .get_mut()
+            .expect("listener warning lock poisoned") = None;
         *self.listener.get_mut() = None;
         self.local_runtime = None;
         self.pairing = None;
@@ -526,19 +564,33 @@ impl RustPlugin for ConnectionsPlugin {
             let builder = runtime
                 .endpoint_builder()
                 .map_err(|error| PluginCommandError::failed(error.to_string()))?;
-            *self.listener.get_mut() = Some(
-                block_on_connection(listener::Listener::start(
-                    builder, pairing, admission, backend,
-                ))
-                .map_err(|error| {
-                    PluginCommandError::failed(format!("listener startup failed: {error}"))
-                })?,
-            );
+            match block_on_connection(listener::Listener::start(
+                builder, pairing, admission, backend,
+            )) {
+                Ok(listener) => *self.listener.get_mut() = Some(listener),
+                Err(error) => {
+                    // Only unavailable network ingress is optional. Identity,
+                    // admission and configuration failures still fail closed.
+                    if error.downcast_ref::<listener::BindFailure>().is_none() {
+                        return Err(PluginCommandError::failed("listener initialization failed"));
+                    }
+                    let warning = listener_start_warning(&error);
+                    eprintln!("bmux: warning: {warning}");
+                    *self
+                        .listener_warning
+                        .get_mut()
+                        .expect("listener warning lock poisoned") = Some(warning);
+                }
+            }
         }
         Ok(EXIT_OK)
     }
 
     fn deactivate(&mut self, _context: NativeLifecycleContext) -> Result<i32, PluginCommandError> {
+        *self
+            .listener_warning
+            .get_mut()
+            .expect("listener warning lock poisoned") = None;
         *self.listener.get_mut() = None;
         self.local_runtime = None;
         self.pairing = None;
@@ -1067,6 +1119,74 @@ mod tests {
         assert!(plugin.local_status().is_none());
         plugin.activate(context).unwrap();
         assert_eq!(plugin.local_status().unwrap(), first);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn occupied_remote_port_keeps_local_activation_and_recovers_on_retry() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = test_paths(root.path());
+        std::fs::create_dir_all(&paths.state_dir).unwrap();
+        std::fs::create_dir_all(&paths.runtime_dir).unwrap();
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let address = socket.local_addr().unwrap();
+        let settings = format!(
+            "[remote]\nallow_full_runtime_ingress=true\nauto_start=true\nbind_addr='{address}'\n[remote.relay]\nmode='disabled'"
+        );
+        let context: NativeLifecycleContext = serde_json::from_value(serde_json::json!({
+            "plugin_id": "bmux.connections",
+            "host": { "product_name": "bmux", "product_version": "test", "plugin_api_version": bmux_plugin_sdk::CURRENT_PLUGIN_API_VERSION, "plugin_abi_version": bmux_plugin_sdk::CURRENT_PLUGIN_ABI_VERSION },
+            "connection": { "config_dir": paths.config_dir, "runtime_dir": paths.runtime_dir, "data_dir": paths.data_dir, "state_dir": paths.state_dir },
+            "settings": serde_json::to_string(&toml::from_str::<toml::Value>(&settings).unwrap()).unwrap()
+        })).unwrap();
+        let mut plugin = ConnectionsPlugin::default();
+        assert_eq!(plugin.activate(context.clone()).unwrap(), EXIT_OK);
+        assert!(plugin.admission_handle().is_some());
+        assert!(plugin.local_status().is_some());
+        let status = plugin.listener_status().unwrap();
+        assert!(!status.enabled);
+        assert_eq!(status.endpoint_targets, Vec::<String>::new());
+        assert!(
+            status
+                .warning
+                .unwrap()
+                .contains("Local terminals remain available")
+        );
+        assert_eq!(socket.local_addr().unwrap(), address);
+        drop(socket);
+        let instance = plugin.admission().unwrap().instance();
+        let _router = bmux_plugin::test_support::install_test_service_router(Arc::new(
+            // Test router's fixed signature returns PluginError by value.
+            #[allow(clippy::result_large_err)]
+            move |_, _, _, _, _, operation, _| {
+                let response = match operation {
+                    "current-stream-provenance" => encode_service_message(&Ok::<
+                        _,
+                        bmux_clients_plugin_api::clients_identity::IdentityError,
+                    >(
+                        bmux_clients_plugin_api::clients_identity::StreamProvenance::Local,
+                    )),
+                    "stream-admission-backend" => {
+                        encode_service_message(&Ok::<
+                            _,
+                            bmux_clients_plugin_api::clients_identity::IdentityError,
+                        >(Some(instance)))
+                    }
+                    _ => panic!("unexpected operation {operation}"),
+                }?;
+                Ok(bmux_plugin_sdk::service_contract::encode_response(
+                    &response,
+                ))
+            },
+        ));
+        let owner = service_context(&paths, "start-listener", Vec::new());
+        let recovered = plugin.start_listener(&owner).unwrap();
+        assert!(recovered.enabled);
+        assert!(recovered.warning.is_none());
+        assert!(recovered.endpoint_targets.contains(&format!(
+            "device://{}?addr={address}",
+            recovered.endpoint_id
+        )));
+        plugin.deactivate(context).unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
