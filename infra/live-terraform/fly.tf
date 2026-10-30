@@ -48,6 +48,10 @@ resource "fly_volume" "authority" {
   region    = var.fly_region
   size_gb   = 1
   encrypted = true
+  # Fly may fork this volume during host migration. Reconcile only the
+  # provider's unambiguous, same-name/region volume attached to the live machine.
+  # Keep this paired with the mount flag below; never swap an attached volume.
+  readopt_on_host_migration = true
   lifecycle { prevent_destroy = true }
 }
 resource "fly_machine" "live" {
@@ -67,8 +71,9 @@ resource "fly_machine" "live" {
     AUTHORITY_PATH       = "/data/relay/authority.json"
   }
   mount {
-    volume = fly_volume.authority.id
-    path   = "/data"
+    volume                    = fly_volume.authority.id
+    path                      = "/data"
+    readopt_on_host_migration = true
   }
   restart { policy = "always" }
   # /metrics is authenticated by METRICS_KEY_SHA256. Do not configure Fly's

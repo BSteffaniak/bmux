@@ -20,6 +20,23 @@ def plan(address, actions, **values):
 
 
 class PolicyTests(unittest.TestCase):
+    def test_mounted_volume_swaps_rejected_even_after_infrastructure_review(self):
+        before = {'image': 'old', 'mount': [{'path': '/data', 'volume': 'vol-existing'}]}
+        for flags in ({}, {'configure': True}, {'infrastructure': True}):
+            for blocks in ([], [{'path': '/data', 'volume': 'vol-other'}],
+                           [{'path': '/other', 'volume': 'vol-existing'}]):
+                with self.subTest(flags=flags, blocks=blocks):
+                    with self.assertRaisesRegex(ValueError, 'In-place authority mount change rejected'):
+                        m.validate(plan('fly_machine.live', ['update'], before=before,
+                                        after={'image': 'new', 'mount': blocks}), **flags)
+            after = {'image': 'new', 'mount': [{'path': '/data', 'volume': 'vol-existing',
+                                               'readopt_on_host_migration': True}]}
+            self.assertTrue(m.validate(plan('fly_machine.live', ['update'], before=before,
+                                            after=after), infrastructure=True))
+            with self.assertRaisesRegex(ValueError, 'In-place authority mount change rejected'):
+                m.validate(plan('fly_machine.live', ['update'], before=before, after=before,
+                                after_unknown={'mount': True}), **flags)
+
     def test_image_only_update(self):
         before = {'image': 'old', 'region': 'iad', 'env': {'key': 'digest'}}
         after = dict(before, image='new')

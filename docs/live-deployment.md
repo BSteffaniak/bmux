@@ -195,6 +195,28 @@ resources; inspect existing machine and volume state before planning a retry.
 The diagnostics patch does not recover bodies discarded by earlier runs, and
 retrying an old workflow SHA still uses its old sanitizer.
 
+### Volume-placement rejections
+
+A volume-placement classification is not an exact API error. Compare the live
+machine's `/data` volume with the reviewed OpenTofu plan; a passing public
+health
+check does not establish that they agree. Fly can migrate a machine and fork its
+volume without updating Terraform's references. The authority volume and mount
+therefore both enable the pinned provider's `readopt_on_host_migration` option.
+The provider only reanchors an unambiguous same-name, same-region volume
+attached
+to a machine; ambiguous recovery must remain blocked for explicit review.
+
+The plan policy now rejects any in-place mount identity/path change, including
+configure and approved infrastructure modes. Enabling reconciliation may require
+an initial reviewed configuration update and then a fresh refresh/plan; do not
+force through a mount swap, ignore mount drift, replace the machine, or delete
+an
+old volume as part of a routine image release. If reconciliation still proposes
+a different mounted ID, stop and inspect private state with the live machine
+before approving another deployment. These guards address migration drift; they
+do not establish that migration was the cause of a particular API rejection.
+
 Protected configuration run `39168519882` completed backend deployment and
 public
 read-only smoke successfully. Configuration mode intentionally skips the static

@@ -45,6 +45,19 @@ def validate(plan, configure=False, infrastructure=False):
             continue
         if address not in CONFIGURE_RESOURCES or 'delete' in actions:
             raise PolicyRejection('Unexpected resource or destructive change requires separate review')
+        if address == 'fly_machine.live' and actions == ['update']:
+            before, after = change.get('before'), change.get('after')
+            # Fly forbids swapping a mounted volume on an existing machine.
+            # Enforce this even for reviewed infrastructure/configure plans.
+            # Compare identity/path only: reconciliation flags are not mounts.
+            def mounts(value):
+                blocks = value.get('mount', []) if isinstance(value, dict) else []
+                if not isinstance(blocks, list) or any(not isinstance(block, dict) for block in blocks):
+                    raise PolicyRejection('Invalid machine mount configuration')
+                return [(block.get('path'), block.get('volume')) for block in blocks]
+            unknown = change.get('after_unknown', {})
+            if unknown.get('mount') or mounts(before) != mounts(after):
+                raise PolicyRejection('In-place authority mount change rejected; inspect host-migration reconciliation')
         if configure or infrastructure:
             continue
         if address not in RELEASE_RESOURCES or actions != ['update'] or change.get('importing'):

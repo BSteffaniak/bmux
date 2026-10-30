@@ -44,12 +44,24 @@ class FlyTests(unittest.TestCase):
                     text=True, capture_output=True, timeout=30, check=True)
                 self.assertEqual(json.loads(result.stdout), 'target.example.net')
 
+    def test_volume_reconciliation_is_paired_and_nondestructive(self):
+        text = (ROOT / 'infra/live-terraform/fly.tf').read_text()
+        # Both flags are required by the pinned provider: one updates volume
+        # ownership and the other refreshes the machine's mounted reference.
+        volume = text.split('resource "fly_volume" "authority" {', 1)[1].split('resource "fly_machine"', 1)[0]
+        mount = text.split('  mount {', 1)[1].split('  }', 1)[0]
+        self.assertIn('readopt_on_host_migration = true', volume)
+        self.assertIn('readopt_on_host_migration = true', mount)
+        self.assertIn('prevent_destroy = true', volume)
+        self.assertIn('fly_volume.authority.id', mount)
+        self.assertNotIn('ignore_changes', text)
+
     def test_required_private_volume(self):
         text = (ROOT / 'infra/live-terraform/fly.tf').read_text()
         for value in ['resource "fly_volume" "authority"', 'size_gb', 'encrypted',
                       'volume = fly_volume.authority.id', 'path   = "/data"',
                       'prevent_destroy = true', 'autostop      = "off"', 'memory_mb = 1024']:
-            self.assertIn(value, text)
+            self.assertIn(' '.join(value.split()), ' '.join(text.split()))
         self.assertNotIn('local-exec', text)
         self.assertNotIn('create_before_destroy', text.replace('# Exactly one authority process; no autoscaler and no create-before-destroy.', ''))
 
