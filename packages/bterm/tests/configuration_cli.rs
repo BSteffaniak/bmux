@@ -208,6 +208,48 @@ fn superset_false_zero_and_secrets_are_inspected_without_writes() {
 }
 
 #[test]
+fn inline_environment_override_is_captured_and_isolated() {
+    let inspection = Inspection::new();
+    inspection.write("c/bmux/bmux.toml", "[bterm.window]\ndecorations=true\n[plugins.settings.\"bmux.connections\".remote]\nauto_start=true");
+    let text = "[bterm.window]\ndecorations=false\n[plugins.settings.\"bmux.connections\".remote]\nauto_start=false\n[private]\ntoken='inline-secret-canary'";
+    let output = inspection.inspect(
+        &[OsStr::new("config"), OsStr::new("explain")],
+        &[("BTERM_CONFIG_TOML", OsStr::new(text))],
+    );
+    let value = explanation(&output);
+    assert_eq!(value["bterm"]["window"]["decorations"], false);
+    assert!(
+        value["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|source| source["inline_origin"] == "environment-inline")
+    );
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("inline-secret-canary"));
+    let root = inspection.root.join("isolated");
+    let isolated = inspection.inspect(
+        &[
+            OsStr::new("--managed-root"),
+            root.as_os_str(),
+            OsStr::new("config"),
+            OsStr::new("explain"),
+        ],
+        &[("BMUX_CONFIG_TOML", OsStr::new("private invalid ["))],
+    );
+    assert!(isolated.status.success());
+    assert_eq!(
+        explanation(&isolated)["bterm"]["window"]["decorations"],
+        true
+    );
+    let invalid = inspection.inspect(
+        &[OsStr::new("config"), OsStr::new("explain")],
+        &[("BMUX_CONFIG_TOML", OsStr::new("private-canary = [invalid"))],
+    );
+    assert!(!invalid.status.success());
+    assert!(!String::from_utf8_lossy(&invalid.stderr).contains("private-canary"));
+}
+
+#[test]
 fn external_inspection_has_no_companion_dependency() {
     let inspection = Inspection::new();
     let external = inspection.root.join("external");

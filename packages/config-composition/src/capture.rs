@@ -153,6 +153,21 @@ pub enum Layer {
     },
     /// An owned typed value at this exact position in the ordered layer sequence.
     Inline(ConfigValue),
+    /// Owned document text parsed by the selected codec during pure resolution.
+    Text(String),
+    /// Optional path selected by the captured environment, never process state.
+    EnvironmentFile {
+        /// Application-selected environment variable name.
+        variable: String,
+        /// Missing-file policy when the variable is present.
+        requirement: Requirement,
+    },
+    /// Optional document text selected by the captured environment.
+    /// Empty text is admitted as an empty document, not treated as absence.
+    EnvironmentText {
+        /// Application-selected environment variable name.
+        variable: String,
+    },
     /// Capture this exact caller-selected path.
     File {
         /// Explicit path; file layers anchor relative paths to LoadContext cwd.
@@ -247,6 +262,77 @@ impl LoaderBuilder {
     pub fn layer(mut self, name: impl Into<String>, layer: Layer) -> Self {
         self.layers.push((name.into(), layer));
         self
+    }
+    /// Append an ordered family of layers under one namespace. Names remain
+    /// inspectable and collisions are validated by build, just like single layers.
+    pub fn layers(
+        mut self,
+        namespace: &str,
+        layers: impl IntoIterator<Item = (String, Layer)>,
+    ) -> Self {
+        self.layers.extend(
+            layers
+                .into_iter()
+                .map(|(name, layer)| (format!("{namespace}/{name}"), layer)),
+        );
+        self
+    }
+    /// Append a selected file when present; None contributes no layer.
+    pub fn file(
+        self,
+        name: impl Into<String>,
+        path: Option<&Path>,
+        requirement: Requirement,
+    ) -> Self {
+        match path {
+            Some(path) => self.layer(
+                name,
+                Layer::File {
+                    path: path.to_owned(),
+                    requirement,
+                },
+            ),
+            None => self,
+        }
+    }
+    /// Append selected inline document text when present, without logging its contents.
+    pub fn text(self, name: impl Into<String>, text: Option<&str>) -> Self {
+        match text {
+            Some(text) => self.layer(name, Layer::Text(text.to_owned())),
+            None => self,
+        }
+    }
+    /// Append a caller-selected ordered file family, with stable namespaced origins.
+    pub fn files(
+        self,
+        namespace: &str,
+        paths: impl IntoIterator<Item = PathBuf>,
+        requirement: Requirement,
+    ) -> Self {
+        self.layers(
+            namespace,
+            paths
+                .into_iter()
+                .enumerate()
+                .map(|(index, path)| (index.to_string(), Layer::File { path, requirement })),
+        )
+    }
+    /// Add a conventional file-path and inline-text environment pair at this position.
+    /// Names and prefix are application-owned. Exclusive mode excludes both sources.
+    pub fn environment(self, prefix: &str) -> Self {
+        self.layer(
+            format!("{prefix}_CONFIG"),
+            Layer::EnvironmentFile {
+                variable: format!("{prefix}_CONFIG"),
+                requirement: Requirement::Required,
+            },
+        )
+        .layer(
+            format!("{prefix}_CONFIG_TOML"),
+            Layer::EnvironmentText {
+                variable: format!("{prefix}_CONFIG_TOML"),
+            },
+        )
     }
     /// Set the last-applied explicit file and its missing-file/authority policy.
     pub fn explicit_file(
@@ -414,6 +500,67 @@ impl Captured {
     pub fn sources(&self) -> &[Source] {
         &self.sources
     }
+    /// Parse individual captured documents for application-owned transforms before
+    /// composition. Sources retain their capture identities; no ambient reads occur.
+    pub fn documents(&self, codec: &impl Codec) -> Result<Vec<Document>> {
+        self.documents
+            .iter()
+            .map(|captured| {
+                let value = match &captured.content {
+                    CapturedContent::Inline(value) => value.clone(),
+                    CapturedContent::Bytes(bytes) => {
+                        let text = std::str::from_utf8(bytes)
+                            .map_err(|_| Error::new(ErrorKind::Parse).at(captured.source))?;
+                        codec
+                            .parse(text)
+                            .map_err(|error| error.at(captured.source))?
+                    }
+                };
+                if let Err(error) = crate::value::validate_value(
+                    &value,
+                    self.limits.max_value_depth,
+                    self.limits.max_value_nodes,
+                ) {
+                    crate::discard_value(value);
+                    return Err(error.at(captured.source));
+                }
+                Ok(Document::new(value, captured.source))
+            })
+            .collect()
+    }
+    /// Apply a product-owned transform to each captured document without reopening
+    /// files, rereading the environment, or losing source identities.
+    pub fn try_map_documents<E>(
+        &self,
+        codec: &impl Codec,
+        mut transform: impl FnMut(&Source, ConfigValue) -> std::result::Result<ConfigValue, E>,
+    ) -> std::result::Result<Self, E>
+    where
+        E: From<Error>,
+    {
+        let mut mapped = self.clone();
+        mapped.documents = self
+            .documents(codec)?
+            .into_iter()
+            .map(|document| {
+                let source = document.provenance[&Vec::new()];
+                let value = transform(&self.sources[source.0], document.value)?;
+                if let Err(error) = crate::value::validate_value(
+                    &value,
+                    self.limits.max_value_depth,
+                    self.limits.max_value_nodes,
+                ) {
+                    crate::discard_value(value);
+                    return Err(error.at(source).into());
+                }
+                Ok(CapturedDocument {
+                    source,
+                    content: CapturedContent::Inline(value),
+                })
+            })
+            .collect::<std::result::Result<_, E>>()?;
+        Ok(mapped)
+    }
     /// No filesystem, environment, or working-directory access occurs here.
     pub fn resolve(&self, codec: &impl Codec) -> Result<Resolved> {
         let mut document = Document::new(
@@ -422,34 +569,17 @@ impl Captured {
                 .unwrap_or_else(|| ConfigValue::Table(BTreeMap::new())),
             SourceId(0),
         );
-        for captured in &self.documents {
-            let value = match &captured.content {
-                CapturedContent::Inline(value) => value.clone(),
-                CapturedContent::Bytes(bytes) => {
-                    let text = std::str::from_utf8(bytes)
-                        .map_err(|_| Error::new(ErrorKind::Parse).at(captured.source))?;
-                    codec
-                        .parse(text)
-                        .map_err(|error| error.at(captured.source))?
-                }
-            };
-            if let Err(error) = crate::value::validate_value(
-                &value,
-                self.limits.max_value_depth,
-                self.limits.max_value_nodes,
-            ) {
-                crate::discard_value(value);
-                return Err(error.at(captured.source));
-            }
+        for incoming in self.documents(codec)? {
+            let source = incoming.provenance[&Vec::new()];
             document
-                .merge(Document::new(value, captured.source), &self.policy)
-                .map_err(|error| error.at(captured.source))?;
+                .merge(incoming, &self.policy)
+                .map_err(|error| error.at(source))?;
             crate::value::validate_value(
                 &document.value,
                 self.limits.max_value_depth,
                 self.limits.max_value_nodes,
             )
-            .map_err(|error| error.at(captured.source))?;
+            .map_err(|error| error.at(source))?;
         }
         Ok(Resolved {
             document,
@@ -497,7 +627,7 @@ impl Loader {
             }],
         };
         for (name, layer) in &self.0.layers {
-            if matches!(layer, Layer::Inline(_) | Layer::Value(_))
+            if matches!(layer, Layer::Inline(_) | Layer::Value(_) | Layer::Text(_))
                 || !matches!(self.0.explicit, Some((_, _, ExplicitMode::Exclusive)))
             {
                 state.layer(name, layer)?;
@@ -526,6 +656,30 @@ struct CaptureState<'a> {
     sources: Vec<Source>,
 }
 impl CaptureState<'_> {
+    fn text(&mut self, name: &str, text: &str) -> Result<()> {
+        let id = SourceId(self.sources.len());
+        let limits = self.loader.limits;
+        self.total = self
+            .total
+            .checked_add(text.len())
+            .ok_or(Error::new(ErrorKind::Limit).at(id))?;
+        if text.len() > limits.max_file_bytes
+            || self.total > limits.max_total_bytes
+            || self.documents.len() >= limits.max_files
+        {
+            return Err(Error::new(ErrorKind::Limit).at(id));
+        }
+        self.sources.push(Source {
+            id,
+            layer: name.to_owned(),
+            path: None,
+        });
+        self.documents.push(CapturedDocument {
+            source: id,
+            content: CapturedContent::Bytes(text.as_bytes().to_vec()),
+        });
+        Ok(())
+    }
     fn check_boundary(&self, path: &Path) -> Result<()> {
         if self
             .boundary
@@ -717,6 +871,20 @@ impl CaptureState<'_> {
                     source: id,
                     content: CapturedContent::Inline(value.clone()),
                 });
+            }
+            Layer::Text(text) => self.text(name, text)?,
+            Layer::EnvironmentText { variable } => {
+                if let Some(text) = self.context.environment.get(variable) {
+                    self.text(name, text)?;
+                }
+            }
+            Layer::EnvironmentFile {
+                variable,
+                requirement,
+            } => {
+                if let Some(path) = self.context.environment.get(variable) {
+                    self.file(name, Path::new(path), *requirement)?;
+                }
             }
             Layer::File { path, requirement } => self.file(name, path, *requirement)?,
             Layer::UserXdg {

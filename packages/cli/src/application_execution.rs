@@ -239,6 +239,8 @@ struct FrozenDocument {
     origin: PathBuf,
     required: bool,
     value: Option<toml::Value>,
+    #[serde(default)]
+    inline_origin: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -435,7 +437,11 @@ fn is_execution_selector(key: &str) -> bool {
 fn is_config_preference(key: &str) -> bool {
     matches!(
         key,
-        "BMUX_CONFIG" | "BMUX_CONFIG_DIR" | "BMUX_BASE_CONFIG" | "BMUX_NO_BASE_CONFIG"
+        "BMUX_CONFIG"
+            | "BMUX_CONFIG_TOML"
+            | "BMUX_CONFIG_DIR"
+            | "BMUX_BASE_CONFIG"
+            | "BMUX_NO_BASE_CONFIG"
     )
 }
 
@@ -517,7 +523,21 @@ pub(crate) fn capture_bterm_snapshot(
             source.path = cwd.join(&source.path);
         }
     }
-    let family = ConfigFamily::capture(&sources)?;
+    let mut family = ConfigFamily::capture(&sources)?;
+    if let Some(text) = get("BTERM_CONFIG_TOML") {
+        let text = text.to_str().context("BTERM_CONFIG_TOML must be UTF-8")?;
+        family.documents.extend(
+            ConfigFamily::capture_layers(
+                vec![(
+                    "BTERM_CONFIG_TOML".into(),
+                    bmux_config::ConfigLayer::Text(text.to_owned()),
+                )],
+                cwd.to_owned(),
+                BTreeMap::new(),
+            )?
+            .documents,
+        );
+    }
     let documents: Vec<_> = family
         .documents
         .into_iter()
@@ -525,6 +545,7 @@ pub(crate) fn capture_bterm_snapshot(
             origin: document.source.path,
             required: document.source.required,
             value: document.value,
+            inline_origin: document.inline_origin,
         })
         .collect();
     Ok(serde_json::to_vec(&documents)?)
@@ -547,6 +568,7 @@ pub(crate) fn inherited_application_configuration(
                 },
                 value: document.value,
                 local: false,
+                inline_origin: document.inline_origin,
             })
             .collect(),
     };
@@ -606,6 +628,7 @@ fn read_bterm_snapshot(
                 },
                 value: document.value,
                 local: false,
+                inline_origin: document.inline_origin,
             })
             .collect(),
     }))

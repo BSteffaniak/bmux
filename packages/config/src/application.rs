@@ -6,10 +6,8 @@
 
 use super::{
     BmuxConfig, CompositionResolution, ConfigError, ConfigLoadOverrides, ConfigPaths,
-    ConfigScopeTarget, Result, ScopedConfigLoadRequest, apply_forced_profile, base_config_disabled,
-    discover_local_config_paths, merge_toml_value, reject_removed_presentation_settings,
-    resolve_composed_config_value_with_context, resolve_config_override_path,
-    scoped_local_overlay_for_target,
+    ConfigScopeTarget, Result, ScopedConfigLoadRequest, base_config_disabled, merge_toml_value,
+    reject_removed_presentation_settings, scoped_local_overlay_for_target,
 };
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -20,6 +18,8 @@ mod context_tests;
 mod snapshot_tests;
 #[cfg(test)]
 mod tests;
+
+pub use bmux_config_composition::{Layer as ConfigLayer, Requirement as ConfigRequirement};
 
 /// Captured evaluation inputs. Missing keys never fall back to process state.
 ///
@@ -81,6 +81,8 @@ pub struct ConfigDocument {
     pub value: Option<toml::Value>,
     /// Local sources use the existing scoped-local policy; ordinary sources do not.
     pub local: bool,
+    /// Named memory/environment source; its path anchors relative values only.
+    pub inline_origin: Option<String>,
 }
 
 /// A source family, before profile resolution or default insertion.
@@ -95,23 +97,209 @@ impl ConfigFamily {
     /// # Errors
     /// Fails for missing required files, unreadable files, or malformed TOML.
     pub fn capture(sources: &[ConfigSource]) -> Result<Self> {
-        let mut documents = Vec::with_capacity(sources.len());
-        for source in sources {
-            let source = ConfigSource {
-                path: resolve_config_override_path(source.path.as_os_str()),
+        let cwd = std::env::current_dir().map_err(|error| ConfigError::ReadError {
+            error: error.to_string(),
+        })?;
+        Self::capture_at(sources, &cwd)
+    }
+
+    /// Capture explicit paths relative to the supplied working directory.
+    ///
+    /// # Errors
+    /// Returns an error for invalid context or unreadable/invalid required sources.
+    pub fn capture_at(sources: &[ConfigSource], cwd: &std::path::Path) -> Result<Self> {
+        use bmux_config_composition::{Layer, Requirement};
+        let selected: Vec<_> = sources
+            .iter()
+            .map(|source| ConfigSource {
+                path: if source.path.is_absolute() {
+                    source.path.clone()
+                } else {
+                    cwd.join(&source.path)
+                },
                 required: source.required,
-            };
-            let value = super::engine::capture(&source.path)?;
-            if value.is_none() && source.required {
-                return Err(ConfigError::FileNotFound { path: source.path });
-            }
-            documents.push(ConfigDocument {
-                source,
-                value,
-                local: false,
-            });
-        }
+            })
+            .collect();
+        let layers = selected
+            .iter()
+            .enumerate()
+            .map(|(index, source)| {
+                (
+                    format!("file:{index}"),
+                    Layer::File {
+                        path: source.path.clone(),
+                        requirement: if source.required {
+                            Requirement::Required
+                        } else {
+                            Requirement::Optional
+                        },
+                    },
+                )
+            })
+            .collect();
+        let mut captured = Self::capture_named_layers(layers, cwd.to_owned(), BTreeMap::new())?;
+        let documents = selected
+            .into_iter()
+            .enumerate()
+            .map(|(index, source)| {
+                let value = captured
+                    .iter_mut()
+                    .find(|(name, _)| name == &format!("file:{index}"))
+                    .and_then(|(_, document)| document.value.take());
+                ConfigDocument {
+                    source,
+                    value,
+                    local: false,
+                    inline_origin: None,
+                }
+            })
+            .collect();
         Ok(Self { documents })
+    }
+    /// Capture scoped ancestor documents once through the shared discovery engine.
+    ///
+    /// # Errors
+    /// Returns an error for invalid discovery policy or unreadable/invalid documents.
+    pub fn capture_ancestors(
+        cwd: &std::path::Path,
+        filename: &str,
+        excluded: &std::path::Path,
+    ) -> Result<Self> {
+        let mut family = Self::capture_layers(
+            vec![(
+                "local".into(),
+                ConfigLayer::Ancestors {
+                    start: Some(cwd.to_owned()),
+                    file_name: filename.to_owned(),
+                    boundary: None,
+                    max_depth: 128,
+                },
+            )],
+            cwd.to_owned(),
+            BTreeMap::new(),
+        )?;
+        family
+            .documents
+            .retain(|document| document.source.path != excluded);
+        for document in &mut family.documents {
+            document.local = true;
+        }
+        Ok(family)
+    }
+
+    /// Decode captured documents individually, with no process reads or discovery.
+    ///
+    /// # Errors
+    /// Returns an error for invalid layers or unreadable/invalid documents.
+    pub fn capture_layers(
+        layers: Vec<(String, bmux_config_composition::Layer)>,
+        cwd: PathBuf,
+        environment: BTreeMap<String, String>,
+    ) -> Result<Self> {
+        Self::capture_named_layers(layers, cwd, environment).map(|documents| Self {
+            documents: documents
+                .into_iter()
+                .map(|(_, document)| document)
+                .collect(),
+        })
+    }
+
+    fn capture_named_layers(
+        layers: Vec<(String, bmux_config_composition::Layer)>,
+        cwd: PathBuf,
+        environment: BTreeMap<String, String>,
+    ) -> Result<Vec<(String, ConfigDocument)>> {
+        use bmux_config_composition::{LoadContext, Loader, TomlCodec};
+        let mut builder =
+            Loader::builder().duplicates(bmux_config_composition::DuplicatePolicy::Allow);
+        let selected = layers.clone();
+        for (name, layer) in layers {
+            builder = builder.layer(name, layer);
+        }
+        let anchor = cwd.join(".inline-config");
+        let context =
+            LoadContext::new(cwd, environment).map_err(|error| ConfigError::ParseError {
+                error: error.to_string(),
+            })?;
+        let captured = builder
+            .build()
+            .and_then(|loader| loader.capture(&context))
+            .map_err(|error| ConfigError::ParseError {
+                error: error.to_string(),
+            })?;
+        let documents = captured.documents(&TomlCodec).map_err(|error| {
+            let path = error
+                .source
+                .and_then(|id| captured.sources().get(id.0))
+                .and_then(|source| source.path.as_ref());
+            ConfigError::ParseError {
+                error: path.map_or_else(
+                    || error.to_string(),
+                    |path| format!("{error} ({})", path.display()),
+                ),
+            }
+        })?;
+        let mut documents = documents
+            .into_iter()
+            .map(|document| {
+                let id = document.provenance[&Vec::new()];
+                let source = &captured.sources()[id.0];
+                Ok((
+                    source.layer.clone(),
+                    ConfigDocument {
+                        source: ConfigSource {
+                            path: source.path.clone().unwrap_or_else(|| anchor.clone()),
+                            required: true,
+                        },
+                        value: Some(TomlCodec::to_toml(&document.value).map_err(|error| {
+                            ConfigError::ParseError {
+                                error: error.to_string(),
+                            }
+                        })?),
+                        local: false,
+                        inline_origin: source.path.is_none().then(|| source.layer.clone()),
+                    },
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        // Missing optional files still belong to the selected source family.
+        // Preserve their position without reopening or rediscovering any source.
+        let mut ordered = Vec::new();
+        for (name, layer) in selected {
+            let mut matching = Vec::new();
+            let mut index = 0;
+            while index < documents.len() {
+                if documents[index].0 == name {
+                    matching.push(documents.remove(index));
+                } else {
+                    index += 1;
+                }
+            }
+            if matching.is_empty() {
+                if let bmux_config_composition::Layer::File { path, requirement } = layer {
+                    ordered.push((
+                        name,
+                        ConfigDocument {
+                            source: ConfigSource {
+                                path: if path.is_absolute() {
+                                    path
+                                } else {
+                                    context.cwd().join(path)
+                                },
+                                required: requirement
+                                    == bmux_config_composition::Requirement::Required,
+                            },
+                            value: None,
+                            local: false,
+                            inline_origin: None,
+                        },
+                    ));
+                }
+            } else {
+                ordered.extend(matching);
+            }
+        }
+        Ok(ordered)
     }
 }
 
@@ -156,22 +344,27 @@ pub fn capture_host_configuration(
         });
     }
     let mut family = ConfigFamily::capture(&sources)?;
+    if let Some(text) = &overrides.env_config_toml {
+        let cwd = std::env::current_dir().map_err(|error| ConfigError::ReadError {
+            error: error.to_string(),
+        })?;
+        let inline = ConfigFamily::capture_layers(
+            vec![("environment-inline".into(), ConfigLayer::Text(text.clone()))],
+            cwd,
+            BTreeMap::new(),
+        )?;
+        let position = family.documents.len() - usize::from(overrides.cli_config_path.is_some());
+        family
+            .documents
+            .splice(position..position, inline.documents);
+    }
     if let Some(request) = scope
         && let Some(cwd) = request.target.cwd_path()
     {
-        let local_sources =
-            discover_local_config_paths(&cwd, &request.local_config_filename, &primary)
-                .into_iter()
-                .map(|path| ConfigSource {
-                    path,
-                    required: true,
-                })
-                .collect::<Vec<_>>();
-        let mut local = ConfigFamily::capture(&local_sources)?;
-        for document in &mut local.documents {
-            document.local = true;
-        }
-        family.documents.extend(local.documents);
+        family.documents.extend(
+            ConfigFamily::capture_ancestors(&cwd, &request.local_config_filename, &primary)?
+                .documents,
+        );
     }
     Ok(family)
 }
@@ -277,75 +470,16 @@ fn empty_table() -> toml::Value {
     toml::Value::Table(toml::Table::new())
 }
 
-// Retain composition control data but replace ordinary leaves with origin IDs.
-// The same merge/profile resolver then computes origin precedence, including
-// inheritance, explicit empty arrays, and arbitrary application extension keys.
-fn mark_origins(value: &mut toml::Value, marker: &str) {
-    if let Some(table) = value.as_table_mut() {
-        for (_, child) in table.iter_mut() {
-            mark_origins(child, marker);
-        }
-    } else {
-        *value = toml::Value::String(marker.to_owned());
-    }
-}
-
-fn origin_document(value: &toml::Value, marker: &str) -> toml::Value {
-    let mut value = value.clone();
-    if let Some(root) = value.as_table_mut() {
-        for (key, child) in root {
-            if key == super::STARTUP_SNAPSHOT_MARKER {
-                continue;
-            }
-            if key == "composition" {
-                if let Some(profiles) = child
-                    .get_mut("profiles")
-                    .and_then(toml::Value::as_table_mut)
-                {
-                    for (_, profile) in profiles.iter_mut() {
-                        if let Some(patch) = profile.get_mut("patch") {
-                            mark_origins(patch, marker);
-                        }
-                    }
-                }
-            } else {
-                mark_origins(child, marker);
-            }
-        }
-    }
-    value
-}
-
-fn collect_origins(
-    value: &toml::Value,
-    path: &mut Vec<String>,
-    documents: &[ConfigDocument],
-    origins: &mut BTreeMap<Vec<String>, PathBuf>,
-) {
-    if let Some(table) = value.as_table() {
-        for (key, child) in table {
-            path.push(key.clone());
-            collect_origins(child, path, documents, origins);
-            path.pop();
-        }
-    } else if let Some(index) = value
-        .as_str()
-        .and_then(|value| value.strip_prefix("source:"))
-        .and_then(|value| value.parse::<usize>().ok())
-        && let Some(document) = documents.get(index)
-    {
-        origins.insert(path.clone(), document.source.path.clone());
-    }
-}
-
 fn resolve_family(
     family: &ConfigFamily,
     forced_profile: Option<&str>,
     target: Option<&ConfigScopeTarget>,
     context: &ConfigEvaluationContext,
 ) -> Result<(toml::Value, ConfigFamilyResolution)> {
-    let mut merged = empty_table();
-    let mut marked = empty_table();
+    use bmux_config_composition::{
+        ConfigValue, Document, MergePolicy, PathSegment, SourceId, TomlCodec,
+    };
+    let mut merged_document = Document::new(ConfigValue::Table(BTreeMap::new()), SourceId(0));
     for (index, document) in family.documents.iter().enumerate() {
         let Some(mut value) = document.value.clone() else {
             if document.source.required {
@@ -369,22 +503,41 @@ fn resolve_family(
                 error: "config root must be a table".to_owned(),
             });
         }
-        merge_toml_value(
-            &mut marked,
-            origin_document(&value, &format!("source:{index}")),
-        );
-        merge_toml_value(&mut merged, value);
+        let value = TomlCodec::from_toml(value).map_err(|error| ConfigError::ParseError {
+            error: error.to_string(),
+        })?;
+        merged_document
+            .merge(
+                Document::new(value, SourceId(index + 1)),
+                &MergePolicy::default(),
+            )
+            .map_err(|error| ConfigError::ParseError {
+                error: error.to_string(),
+            })?;
     }
-    apply_forced_profile(&mut merged, forced_profile)?;
-    apply_forced_profile(&mut marked, forced_profile)?;
-    let (resolved, resolution, _) =
-        resolve_composed_config_value_with_context(&merged, empty_table(), context)?;
-    // Pin auto-selection to the actual resolution for the parallel origin pass.
-    apply_forced_profile(&mut marked, resolution.selected_profile.as_deref())?;
-    let (marked, _, _) =
-        resolve_composed_config_value_with_context(&marked, empty_table(), context)?;
-    let mut origins = BTreeMap::new();
-    collect_origins(&marked, &mut Vec::new(), &family.documents, &mut origins);
+    let (document, resolution, _) = super::resolve_composed_document_with_context(
+        merged_document,
+        Document::new(ConfigValue::Table(BTreeMap::new()), SourceId(0)),
+        context,
+        forced_profile,
+    )?;
+    let resolved =
+        TomlCodec::to_toml(&document.value).map_err(super::document_composition::error)?;
+    let origins = document
+        .provenance
+        .into_iter()
+        .filter_map(|(path, source)| {
+            let origin = family.documents.get(source.0.checked_sub(1)?)?;
+            let path = path
+                .into_iter()
+                .map(|segment| match segment {
+                    PathSegment::Key(key) => Some(key),
+                    PathSegment::Index(_) => None,
+                })
+                .collect::<Option<Vec<_>>>()?;
+            Some((path, origin.source.path.clone()))
+        })
+        .collect();
     Ok((
         resolved,
         ConfigFamilyResolution {

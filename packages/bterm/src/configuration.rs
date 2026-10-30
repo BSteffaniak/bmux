@@ -27,18 +27,36 @@ pub enum SourcePolicy {
 }
 
 /// An ordered source family: base < primary < mutable state < environment < CLI.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct SourcePaths {
     pub base: Option<PathBuf>,
     pub primary: Option<PathBuf>,
     pub state: Option<PathBuf>,
     pub environment: Option<PathBuf>,
     pub cli: Option<PathBuf>,
+    /// Captured inline environment document, below CLI files.
+    pub inline: Option<String>,
     /// Root-to-leaf scoped local files, following the ordinary family sources.
     pub local: Vec<PathBuf>,
 }
 
+impl std::fmt::Debug for SourcePaths {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SourcePaths")
+            .field("base", &self.base)
+            .field("primary", &self.primary)
+            .field("state", &self.state)
+            .field("environment", &self.environment)
+            .field("inline", &self.inline.as_ref().map(|_| "<redacted>"))
+            .field("cli", &self.cli)
+            .field("local", &self.local)
+            .finish()
+    }
+}
+
 impl SourcePaths {
+    #[cfg(test)]
     fn sources(&self, cwd: &Path) -> Vec<ConfigSource> {
         [
             (&self.base, false),
@@ -61,9 +79,58 @@ impl SourcePaths {
         .collect()
     }
 
-    fn capture(&self, cwd: &Path) -> Result<ConfigFamily> {
-        let mut family = ConfigFamily::capture(&self.sources(cwd))?;
-        let ordinary = family.documents.len() - self.local.len();
+    fn capture(&self, cwd: &Path, local: Option<ConfigFamily>) -> Result<ConfigFamily> {
+        use bmux_config::{ConfigLayer, ConfigRequirement};
+        let mut layers = Vec::new();
+        for (name, path, required) in [
+            ("base", &self.base, false),
+            ("primary", &self.primary, false),
+            ("state", &self.state, false),
+            ("environment", &self.environment, true),
+        ] {
+            if let Some(path) = path {
+                layers.push((
+                    name.to_owned(),
+                    ConfigLayer::File {
+                        path: absolute(cwd, path),
+                        requirement: if required {
+                            ConfigRequirement::Required
+                        } else {
+                            ConfigRequirement::Optional
+                        },
+                    },
+                ));
+            }
+        }
+        if let Some(text) = &self.inline {
+            layers.push(("environment-inline".into(), ConfigLayer::Text(text.clone())));
+        }
+        if let Some(path) = &self.cli {
+            layers.push((
+                "cli".into(),
+                ConfigLayer::File {
+                    path: absolute(cwd, path),
+                    requirement: ConfigRequirement::Required,
+                },
+            ));
+        }
+        let mut family = ConfigFamily::capture_layers(layers, cwd.to_owned(), BTreeMap::new())?;
+        let ordinary = family.documents.len();
+        if let Some(local) = local {
+            family.documents.extend(local.documents);
+        } else {
+            let sources: Vec<_> = self
+                .local
+                .iter()
+                .map(|path| ConfigSource {
+                    path: absolute(cwd, path),
+                    required: false,
+                })
+                .collect();
+            family
+                .documents
+                .extend(ConfigFamily::capture_at(&sources, cwd)?.documents);
+        }
         for document in &mut family.documents[ordinary..] {
             document.local = true;
         }
@@ -136,6 +203,7 @@ pub struct ConfigInputs {
 pub struct SourceProvenance {
     pub family: String,
     pub path: PathBuf,
+    pub inline_origin: Option<String>,
     pub required: bool,
     pub present: bool,
     /// SHA-256 of the parsed TOML representation, not an unstable file reread.
@@ -221,13 +289,15 @@ impl ConfigOptions {
                 fill_environment_sources(&mut self.bmux, "BMUX", &environment);
             }
         }
+        let mut bterm_local = None;
+        let mut bmux_local = None;
         if self.policy != SourcePolicy::Explicit && self.scope.is_some() {
-            discover_local_sources(&mut self.bterm, &cwd, "bterm.toml");
+            bterm_local = discover_local_sources(&mut self.bterm, &cwd, "bterm.toml")?;
             if self.policy == SourcePolicy::Inherit {
-                discover_local_sources(&mut self.bmux, &cwd, "bmux.toml");
+                bmux_local = discover_local_sources(&mut self.bmux, &cwd, "bmux.toml")?;
             }
         }
-        self.capture_selected_with_environment(paths, cwd, environment)
+        self.capture_selected_with_locals(paths, cwd, environment, bterm_local, bmux_local)
     }
 
     /// Capture already-selected sandbox paths. No ambient source discovery or
@@ -242,6 +312,17 @@ impl ConfigOptions {
         cwd: PathBuf,
         environment: BTreeMap<String, OsString>,
     ) -> Result<ConfigInputs> {
+        self.capture_selected_with_locals(paths, cwd, environment, None, None)
+    }
+
+    fn capture_selected_with_locals(
+        self,
+        paths: BtermPaths,
+        cwd: PathBuf,
+        environment: BTreeMap<String, OsString>,
+        bterm_local: Option<ConfigFamily>,
+        bmux_local: Option<ConfigFamily>,
+    ) -> Result<ConfigInputs> {
         ensure!(cwd.is_absolute(), "captured cwd must be absolute");
         for path in [
             &paths.config_dir,
@@ -252,8 +333,8 @@ impl ConfigOptions {
         ] {
             crate::runtime_paths::validate_absolute(path)?;
         }
-        let bterm = self.bterm.capture(&cwd)?;
-        let bmux = self.bmux.capture(&cwd)?;
+        let bterm = self.bterm.capture(&cwd, bterm_local)?;
+        let bmux = self.bmux.capture(&cwd, bmux_local)?;
         Ok(ConfigInputs {
             paths,
             options: self,
@@ -322,6 +403,7 @@ impl ConfigInputs {
                 sources.push(SourceProvenance {
                     family: name.to_owned(),
                     path: document.source.path.clone(),
+                    inline_origin: document.inline_origin.clone(),
                     required: document.source.required,
                     present: document.value.is_some(),
                     sha256: document
@@ -390,6 +472,11 @@ fn fill_environment_sources(
     prefix: &str,
     env: &BTreeMap<String, OsString>,
 ) {
+    if paths.inline.is_none() {
+        paths.inline = env
+            .get(&format!("{prefix}_CONFIG_TOML"))
+            .map(|value| value.to_string_lossy().into_owned());
+    }
     if paths.environment.is_none() {
         paths.environment = env.get(&format!("{prefix}_CONFIG")).map(PathBuf::from);
     }
@@ -408,17 +495,25 @@ fn fill_environment_sources(
     }
 }
 
-fn discover_local_sources(paths: &mut SourcePaths, cwd: &Path, filename: &str) {
+fn discover_local_sources(
+    paths: &mut SourcePaths,
+    cwd: &Path,
+    filename: &str,
+) -> Result<Option<ConfigFamily>> {
     if !paths.local.is_empty() {
-        return;
+        return Ok(None);
     }
-    let mut ancestors = cwd.ancestors().collect::<Vec<_>>();
-    ancestors.reverse();
-    paths.local = ancestors
-        .into_iter()
-        .map(|path| path.join(filename))
-        .filter(|path| Some(path) != paths.primary.as_ref() && path.exists())
+    let family = ConfigFamily::capture_ancestors(
+        cwd,
+        filename,
+        paths.primary.as_deref().unwrap_or(Path::new("")),
+    )?;
+    paths.local = family
+        .documents
+        .iter()
+        .map(|document| document.source.path.clone())
         .collect();
+    Ok(Some(family))
 }
 
 fn absolute(cwd: &Path, path: &Path) -> PathBuf {

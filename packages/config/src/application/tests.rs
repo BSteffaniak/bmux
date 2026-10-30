@@ -9,6 +9,7 @@ fn family(input: &str, path: &str) -> ConfigFamily {
             },
             value: Some(toml::from_str(input).unwrap()),
             local: false,
+            inline_origin: None,
         }],
     }
 }
@@ -401,6 +402,7 @@ fn capture_freezes_documents_and_host_discovery_keeps_layer_order() {
         &paths,
         &ConfigLoadOverrides {
             env_config_path: Some(env),
+            env_config_toml: None,
             cli_config_path: Some(cli.clone()),
             ..ConfigLoadOverrides::default()
         },

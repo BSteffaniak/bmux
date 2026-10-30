@@ -139,6 +139,38 @@ impl std::fmt::Debug for Document {
     }
 }
 impl Document {
+    /// Select a subtree and rebase its node origins without synthesizing values.
+    /// Missing paths return None; keys containing dots remain unambiguous.
+    pub fn select(&self, path: &[PathSegment]) -> Option<Self> {
+        let mut value = &self.value;
+        for segment in path {
+            value = match (segment, value) {
+                (PathSegment::Key(key), ConfigValue::Table(table)) => table.get(key)?,
+                (PathSegment::Index(index), ConfigValue::Array(array)) => array.get(*index)?,
+                _ => return None,
+            };
+        }
+        Some(Self {
+            value: value.clone(),
+            provenance: self
+                .provenance
+                .iter()
+                .filter_map(|(key, source)| {
+                    key.strip_prefix(path)
+                        .map(|relative| (relative.to_vec(), *source))
+                })
+                .collect(),
+        })
+    }
+    /// Remove a root table entry and all its origins. Other values are unchanged.
+    pub fn remove_key(&mut self, key: &str) {
+        if let ConfigValue::Table(table) = &mut self.value {
+            table.remove(key);
+        }
+        self.provenance.retain(
+            |path, _| !matches!(path.first(), Some(PathSegment::Key(first)) if first == key),
+        );
+    }
     /// Construct a trusted in-memory document. Provenance recording is iterative,
     /// but callers must bound depth before recursive Clone/merge/drop operations.
     /// Prefer `try_new` for externally constructed or otherwise untrusted values.
@@ -291,6 +323,14 @@ pub trait Codec {
 /// TOML codec and direct serde adapters with redacted errors.
 pub struct TomlCodec;
 impl TomlCodec {
+    /// Convert a TOML value directly, preserving datetime identity.
+    pub fn from_toml(value: toml::Value) -> Result<ConfigValue> {
+        checked_from_toml(value)
+    }
+    /// Convert directly to TOML, preserving datetime identity and validating bounds.
+    pub fn to_toml(value: &ConfigValue) -> Result<toml::Value> {
+        to_toml(value)
+    }
     /// Convert serde data without encoding/parsing text. TOML's data model applies:
     /// unsupported values (for example None or out-of-range integers) return Decode.
     /// Raw serializer diagnostics are discarded, including custom error messages.

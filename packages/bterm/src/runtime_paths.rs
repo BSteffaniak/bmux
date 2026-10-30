@@ -546,6 +546,7 @@ mod tests {
         let mut overrides = ConfigLoadOverrides {
             base_config_path: Some(base),
             env_config_path: Some(env),
+            env_config_toml: None,
             cli_config_path: Some(cli),
         };
         assert_eq!(

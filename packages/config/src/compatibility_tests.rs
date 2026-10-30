@@ -1,6 +1,68 @@
 //! Compatibility characterization for the shared-engine migration.
 use super::*;
 
+#[test]
+fn inline_environment_merges_without_files_and_is_secret_safe() {
+    let family = ConfigFamily::capture_layers(vec![
+        ("defaults".into(), ConfigLayer::Text("[general]\nscrollback_limit=11\nserver_timeout=7".into())),
+        ("environment".into(), ConfigLayer::EnvironmentText { variable: "INLINE".into() }),
+        ("cli".into(), ConfigLayer::Text("[general]\nserver_timeout=99".into())),
+    ], std::env::temp_dir(), std::collections::BTreeMap::from([
+        ("INLINE".into(), "[general]\nscrollback_limit=42\nserver_timeout=8\n[plugins.settings.\"bmux.connections\".remote]\nauto_start=false".into()),
+    ])).unwrap();
+    let resolved = resolve_application_configuration_with_context(
+        &ConfigFamily::default(),
+        &family,
+        None,
+        None,
+        &ConfigEvaluationContext::default(),
+    )
+    .unwrap();
+    assert_eq!(resolved.bmux.general.scrollback_limit, 42);
+    assert_eq!(resolved.bmux.general.server_timeout, 99);
+    assert_eq!(
+        resolved.bmux.plugins.settings["bmux.connections"]["remote"]["auto_start"].as_bool(),
+        Some(false)
+    );
+    assert_eq!(
+        family.documents[1].inline_origin.as_deref(),
+        Some("environment")
+    );
+    let overrides = ConfigLoadOverrides {
+        env_config_toml: Some("private-canary".into()),
+        ..ConfigLoadOverrides::default()
+    };
+    assert!(!format!("{overrides:?}").contains("private-canary"));
+}
+
+#[test]
+fn repeated_selected_file_paths_preserve_every_document() {
+    let root = std::env::temp_dir().join(format!("bmux-config-repeat-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("config.toml");
+    std::fs::write(&path, "[general]\nscrollback_limit=42").unwrap();
+    let family = ConfigFamily::capture(&[
+        ConfigSource {
+            path: path.clone(),
+            required: false,
+        },
+        ConfigSource {
+            path: path.clone(),
+            required: true,
+        },
+    ])
+    .unwrap();
+    assert_eq!(family.documents.len(), 2);
+    assert!(
+        family
+            .documents
+            .iter()
+            .all(|document| document.value.is_some())
+    );
+    std::fs::remove_file(path).unwrap();
+    std::fs::remove_dir(root).unwrap();
+}
+
 fn value(text: &str) -> toml::Value {
     toml::from_str(text).unwrap()
 }

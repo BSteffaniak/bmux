@@ -11,7 +11,7 @@ fn parent_components_are_resolved_after_symlinks_not_lexically_folded() {
     fs::write(root.path().join("config"), "answer=1").unwrap();
     fs::write(root.path().join("target/config"), "answer=2").unwrap();
     symlink("target/child", root.path().join("link")).unwrap();
-    let context = LoadContext::new(root.path().to_owned(), BTreeMap::new()).unwrap();
+    let context = LoadContext::new(root.path().canonicalize().unwrap(), BTreeMap::new()).unwrap();
     let make = || {
         Loader::builder().layer(
             "exact",

@@ -1,85 +1,107 @@
 //! TOML compatibility adapters. Selection and scope policy remain BMUX-owned;
 //! recursive merge and ordered inheritance are shared engine operations.
-use bmux_config_composition::{ConfigValue, ErrorKind, Profile, ProfileLimits, TomlCodec};
+use bmux_config_composition::{ConfigValue, TomlCodec};
+#[cfg(test)]
+use bmux_config_composition::{ErrorKind, Profile, ProfileLimits};
 use std::collections::BTreeMap;
 
-use crate::{CompositionProfile, ConfigError, Result, canonical_profile_id};
+#[cfg(test)]
+use crate::{CompositionProfile, canonical_profile_id};
+use crate::{ConfigError, Result};
 
 fn into_engine(value: toml::Value) -> ConfigValue {
-    match value {
-        toml::Value::String(value) => ConfigValue::String(value),
-        toml::Value::Integer(value) => ConfigValue::Integer(value),
-        toml::Value::Float(value) => ConfigValue::Float(value),
-        toml::Value::Boolean(value) => ConfigValue::Boolean(value),
-        toml::Value::Datetime(value) => ConfigValue::Datetime(value.to_string()),
-        toml::Value::Array(value) => {
-            ConfigValue::Array(value.into_iter().map(into_engine).collect())
-        }
-        toml::Value::Table(value) => ConfigValue::Table(
-            value
-                .into_iter()
-                .map(|(key, value)| (key, into_engine(value)))
-                .collect(),
-        ),
-    }
+    TomlCodec::from_toml(value).expect("configuration TOML respects codec depth bounds")
 }
 
-fn from_engine(value: ConfigValue) -> toml::Value {
-    match value {
-        ConfigValue::String(value) => toml::Value::String(value),
-        ConfigValue::Integer(value) => toml::Value::Integer(value),
-        ConfigValue::Float(value) => toml::Value::Float(value),
-        ConfigValue::Boolean(value) => toml::Value::Boolean(value),
-        // These strings were produced only by into_engine from valid datetimes.
-        ConfigValue::Datetime(value) => {
-            toml::Value::Datetime(value.parse().expect("TOML datetime round trip is valid"))
-        }
-        ConfigValue::Array(value) => {
-            toml::Value::Array(value.into_iter().map(from_engine).collect())
-        }
-        ConfigValue::Table(value) => toml::Value::Table(
-            value
-                .into_iter()
-                .map(|(key, value)| (key, from_engine(value)))
-                .collect(),
-        ),
-    }
+fn from_engine(value: &ConfigValue) -> toml::Value {
+    TomlCodec::to_toml(value).expect("engine values originated from valid TOML")
 }
 
 pub fn merge(base: &mut toml::Value, overlay: toml::Value) {
     let mut merged = into_engine(base.clone());
     bmux_config_composition::merge_recursive_replace(&mut merged, into_engine(overlay));
-    *base = from_engine(merged);
+    *base = from_engine(&merged);
 }
 
 pub fn capture(path: &std::path::Path) -> Result<Option<toml::Value>> {
-    let bytes = match bmux_config_composition::capture_file(path, usize::MAX) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind == ErrorKind::Missing => return Ok(None),
-        Err(error) => {
-            return Err(ConfigError::ReadError {
-                error: format!("{error} ({})", path.display()),
-            });
-        }
-    };
-    let invalid = || ConfigError::ParseError {
-        error: format!(
-            "invalid TOML in {} (source values redacted)",
-            path.display()
-        ),
-    };
-    let text = std::str::from_utf8(&bytes).map_err(|_| ConfigError::ReadError {
-        error: format!(
-            "invalid UTF-8 in {} (source values redacted)",
-            path.display()
-        ),
+    use bmux_config_composition::{Layer, LoadContext, Loader, Requirement};
+    let cwd = path.parent().ok_or_else(|| ConfigError::ReadError {
+        error: "configuration path has no parent".into(),
     })?;
-    TomlCodec::parse(text)
-        .map(from_engine)
+    let captured = Loader::builder()
+        .layer(
+            "file",
+            Layer::File {
+                path: path.to_owned(),
+                requirement: Requirement::Optional,
+            },
+        )
+        .build()
+        .and_then(|loader| loader.capture(&LoadContext::new(cwd.to_owned(), BTreeMap::new())?))
+        .map_err(|error| ConfigError::ReadError {
+            error: format!("{error} ({})", path.display()),
+        })?;
+    if captured.sources().len() == 1 {
+        return Ok(None);
+    }
+    captured
+        .resolve(&TomlCodec)
+        .and_then(|resolved| TomlCodec::to_toml(&resolved.document.value))
         .map(Some)
-        .map_err(|_| invalid())
+        .map_err(|_| ConfigError::ParseError {
+            error: format!(
+                "invalid TOML in {} (source values redacted)",
+                path.display()
+            ),
+        })
 }
 
+/// Compose already selected documents through the canonical ordered layer engine.
+pub fn compose(
+    layers: Vec<(String, bmux_config_composition::Layer)>,
+) -> Result<Option<toml::Value>> {
+    use bmux_config_composition::{LoadContext, Loader};
+    let cwd = std::env::current_dir()
+        .or_else(|error| {
+            layers
+                .iter()
+                .find_map(|(_, layer)| match layer {
+                    bmux_config_composition::Layer::File { path, .. } if path.is_absolute() => {
+                        path.parent().map(std::path::Path::to_owned)
+                    }
+                    _ => None,
+                })
+                .ok_or(error)
+        })
+        .map_err(|error| ConfigError::ReadError {
+            error: error.to_string(),
+        })?;
+    let mut builder = Loader::builder().duplicates(bmux_config_composition::DuplicatePolicy::Allow);
+    for (name, layer) in layers {
+        builder = builder.layer(name, layer);
+    }
+    let captured = builder
+        .build()
+        .and_then(|loader| loader.capture(&LoadContext::new(cwd, BTreeMap::new())?))
+        .map_err(|error| ConfigError::ParseError {
+            error: error.to_string(),
+        })?;
+    if captured.sources().len() == 1 {
+        return Ok(None);
+    }
+    let resolved = captured
+        .resolve(&TomlCodec)
+        .map_err(|error| ConfigError::ParseError {
+            error: error.to_string(),
+        })?;
+    TomlCodec::to_toml(&resolved.document.value)
+        .map(Some)
+        .map_err(|error| ConfigError::ParseError {
+            error: error.to_string(),
+        })
+}
+
+#[cfg(test)]
 pub fn profile(
     requested: &str,
     profiles: &BTreeMap<String, CompositionProfile>,
@@ -128,7 +150,7 @@ pub fn profile(
             error.to_string()
         },
     })?;
-    let toml::Value::Table(table) = from_engine(resolved) else {
+    let toml::Value::Table(table) = from_engine(&resolved) else {
         unreachable!("profile patches are tables and recursive merges preserve tables")
     };
     Ok(table)

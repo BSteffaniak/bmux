@@ -10,6 +10,7 @@ fn family(path: &str, value: &str) -> ConfigFamily {
             },
             value: Some(toml::from_str(value).unwrap()),
             local: false,
+            inline_origin: None,
         }],
     }
 }
@@ -369,6 +370,7 @@ fn family_sources_order_and_relative_paths_are_captured() {
         primary: Some("primary.toml".into()),
         state: Some("state.toml".into()),
         environment: Some("env.toml".into()),
+        inline: None,
         cli: Some("cli.toml".into()),
         local: vec!["local.toml".into()],
     };

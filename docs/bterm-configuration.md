@@ -19,14 +19,23 @@ prerequisite for a self-contained Bterm configuration.
 
 There are two source families:
 
-- **BMUX:** host `BMUX_CONFIG_DIR/bmux.toml`, then the `BMUX_CONFIG` overlay,
-  then the explicit `--bmux-config PATH` overlay.
-- **Bterm:** host `BTERM_CONFIG_DIR/bterm.toml`, then the `BTERM_CONFIG` overlay,
-  then the explicit `--config PATH` overlay.
+- **BMUX:** host `BMUX_CONFIG_DIR/bmux.toml`, then the `BMUX_CONFIG` file overlay,
+  then `BMUX_CONFIG_TOML` inline TOML, then `--bmux-config PATH`.
+- **Bterm:** host `BTERM_CONFIG_DIR/bterm.toml`, then the `BTERM_CONFIG` file overlay,
+  then `BTERM_CONFIG_TOML` inline TOML, then `--config PATH`.
 
 Within each family, the implemented source order is base, primary, mutable
 state,
-environment overlay, CLI overlay, then explicitly selected scoped-local files.
+environment file, environment inline TOML, CLI overlay, then explicitly selected
+scoped-local files.
+Inline text is captured once under the same byte/document bounds as files. Empty
+text is a present empty document, not an absent source. Diagnostics never echo
+its contents; inspection identifies its named origin instead of inventing a
+file.
+Relative paths in inline documents use the captured working directory. Explicit
+managed roots, slots, and clean sandbox captures do not import ambient inline
+variables. A private effective snapshot can retain already-selected values; that
+is not authority to rediscover the original host environment on reload.
 Later supplied fields replace earlier fields; absent fields remain inherited.
 Bterm's mutable state file is `config-overlay.toml` in its selected state
 directory.

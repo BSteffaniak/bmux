@@ -2533,21 +2533,12 @@ fn apply_theme_settings_layer(
 }
 
 fn merge_toml_value(base: &mut toml::Value, overlay: &toml::Value) {
-    match (base, overlay) {
-        (toml::Value::Table(base_table), toml::Value::Table(overlay_table)) => {
-            for (key, value) in overlay_table {
-                match base_table.get_mut(key) {
-                    Some(existing) => merge_toml_value(existing, value),
-                    None => {
-                        base_table.insert(key.clone(), value.clone());
-                    }
-                }
-            }
-        }
-        (base_value, overlay_value) => {
-            *base_value = overlay_value.clone();
-        }
-    }
+    use bmux_config_composition::TomlCodec;
+    let mut value = TomlCodec::from_toml(base.clone()).expect("theme values respect TOML bounds");
+    value.overlay_replace(
+        TomlCodec::from_toml(overlay.clone()).expect("theme overlay respects TOML bounds"),
+    );
+    *base = TomlCodec::to_toml(&value).expect("theme composition preserves TOML values");
 }
 
 fn read_persisted_theme_name(
@@ -3957,6 +3948,7 @@ mod tests {
         let _overrides = bmux_config::push_process_config_overrides(ConfigLoadOverrides {
             base_config_path: None,
             env_config_path: None,
+            env_config_toml: None,
             cli_config_path: Some(overlay),
         });
         let mut context = service_context(None);

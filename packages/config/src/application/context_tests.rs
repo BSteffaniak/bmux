@@ -9,6 +9,7 @@ fn document(value: &str) -> ConfigFamily {
             },
             value: Some(toml::from_str(value).unwrap()),
             local: false,
+            inline_origin: None,
         }],
     }
 }

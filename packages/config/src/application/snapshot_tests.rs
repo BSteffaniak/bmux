@@ -21,6 +21,7 @@ fn snapshot_family() -> ConfigFamily {
                 .unwrap(),
             ),
             local: false,
+            inline_origin: None,
         }],
     }
 }

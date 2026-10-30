@@ -15,6 +15,7 @@ use std::path::PathBuf;
 use thiserror::Error;
 
 pub mod application;
+mod document_composition;
 mod engine;
 
 #[cfg(test)]
@@ -22,8 +23,9 @@ mod compatibility_tests;
 
 pub use application::{
     ApplicationConfiguration, ConfigDocument, ConfigEvaluationContext, ConfigFamily,
-    ConfigFamilyResolution, ConfigSource, capture_host_configuration,
-    resolve_application_configuration, resolve_application_configuration_with_context,
+    ConfigFamilyResolution, ConfigLayer, ConfigRequirement, ConfigSource,
+    capture_host_configuration, resolve_application_configuration,
+    resolve_application_configuration_with_context,
 };
 
 const STARTUP_SNAPSHOT_MARKER: &str = "_bmux_startup_snapshot";
@@ -129,7 +131,7 @@ impl ScopedConfigLoadRequest {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct ConfigLoadOverrides {
     /// Optional base layer merged BELOW the primary config (lowest precedence
     /// of all layers). Typically populated by the CLI bootstrap when a slot
@@ -137,8 +139,26 @@ pub struct ConfigLoadOverrides {
     pub base_config_path: Option<PathBuf>,
     /// Overlay from the `BMUX_CONFIG` env var. Merged between primary and CLI.
     pub env_config_path: Option<PathBuf>,
+    /// Inline TOML environment overlay, above the environment file and below CLI.
+    /// Contents are intentionally excluded from Debug output.
+    pub env_config_toml: Option<String>,
     /// Overlay from the `--config` CLI flag. Highest precedence.
     pub cli_config_path: Option<PathBuf>,
+}
+
+impl std::fmt::Debug for ConfigLoadOverrides {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ConfigLoadOverrides")
+            .field("base_config_path", &self.base_config_path)
+            .field("env_config_path", &self.env_config_path)
+            .field(
+                "env_config_toml",
+                &self.env_config_toml.as_ref().map(|_| "<redacted>"),
+            )
+            .field("cli_config_path", &self.cli_config_path)
+            .finish()
+    }
 }
 
 impl ConfigLoadOverrides {
@@ -147,6 +167,7 @@ impl ConfigLoadOverrides {
         Self {
             base_config_path: None,
             env_config_path: std::env::var_os(BMUX_CONFIG_ENV).map(PathBuf::from),
+            env_config_toml: std::env::var("BMUX_CONFIG_TOML").ok(),
             cli_config_path,
         }
     }
@@ -166,6 +187,7 @@ impl ConfigLoadOverrides {
     pub const fn is_empty(&self) -> bool {
         self.base_config_path.is_none()
             && self.env_config_path.is_none()
+            && self.env_config_toml.is_none()
             && self.cli_config_path.is_none()
     }
 
@@ -469,25 +491,6 @@ fn scoped_local_overlay_for_target_with_scopes(
     Ok((loaded_any.then_some(merged), matched_scopes))
 }
 
-fn discover_local_config_paths(
-    cwd: &std::path::Path,
-    filename: &str,
-    global_config_path: &std::path::Path,
-) -> Vec<PathBuf> {
-    let mut paths = Vec::new();
-    for ancestor in cwd.ancestors() {
-        let candidate = ancestor.join(filename);
-        if candidate == global_config_path {
-            continue;
-        }
-        if candidate.exists() {
-            paths.push(candidate);
-        }
-    }
-    paths.reverse();
-    paths
-}
-
 fn built_in_composition_profiles() -> BTreeMap<String, CompositionProfile> {
     fn parse_builtin_patch(profile_id: &str, source: &str) -> toml::Table {
         match toml::from_str::<toml::Table>(source) {
@@ -695,14 +698,25 @@ fn merged_raw_config_value_with_overrides(
     let include_override_layers = has_explicit_overrides || matches_default_config_file;
 
     if !include_override_layers {
-        let mut merged = toml::Value::Table(toml::Table::new());
-        let mut loaded_any = false;
-        for path in source_paths {
-            let value = load_toml_file(&path)?;
-            merge_toml_value(&mut merged, value);
-            loaded_any = true;
+        let value = engine::compose(
+            source_paths
+                .into_iter()
+                .enumerate()
+                .map(|(index, path)| {
+                    (
+                        format!("file:{index}"),
+                        bmux_config_composition::Layer::File {
+                            path,
+                            requirement: bmux_config_composition::Requirement::Required,
+                        },
+                    )
+                })
+                .collect(),
+        )?;
+        if let Some(value) = &value {
+            reject_removed_presentation_settings(value, "")?;
         }
-        return Ok(loaded_any.then_some(merged));
+        return Ok(value);
     }
 
     let resolved_overrides = explicit_overrides
@@ -739,23 +753,43 @@ fn merged_raw_config_value_with_overrides(
         source_paths.push(path);
     }
 
+    let mut layers: Vec<_> = source_paths
+        .into_iter()
+        .enumerate()
+        .map(|(index, path)| {
+            (
+                format!("file:{index}"),
+                bmux_config_composition::Layer::File {
+                    path,
+                    requirement: bmux_config_composition::Requirement::Required,
+                },
+            )
+        })
+        .collect();
+    if let Some(text) = resolved_overrides.env_config_toml {
+        layers.push((
+            "environment-inline".into(),
+            bmux_config_composition::Layer::Text(text),
+        ));
+    }
     if let Some(value) = resolved_overrides.cli_config_path {
         let path = resolve_config_override_path(value.as_os_str());
         if !path.exists() {
             return Err(ConfigError::FileNotFound { path });
         }
-        source_paths.push(path);
+        layers.push((
+            "cli".into(),
+            bmux_config_composition::Layer::File {
+                path,
+                requirement: bmux_config_composition::Requirement::Required,
+            },
+        ));
     }
-
-    let mut merged = toml::Value::Table(toml::Table::new());
-    let mut loaded_any = false;
-    for path in source_paths {
-        let value = load_toml_file(&path)?;
-        merge_toml_value(&mut merged, value);
-        loaded_any = true;
+    let merged = engine::compose(layers)?;
+    if let Some(value) = &merged {
+        reject_removed_presentation_settings(value, "")?;
     }
-
-    Ok(loaded_any.then_some(merged))
+    Ok(merged)
 }
 
 fn merged_raw_config_value_for_scope(
@@ -768,8 +802,13 @@ fn merged_raw_config_value_for_scope(
     let mut loaded_any = !matches!(&merged, toml::Value::Table(table) if table.is_empty());
 
     if let Some(cwd) = request.target.cwd_path() {
-        for path in discover_local_config_paths(&cwd, &request.local_config_filename, base_path) {
-            let local_value = load_toml_file(&path)?;
+        for document in
+            ConfigFamily::capture_ancestors(&cwd, &request.local_config_filename, base_path)?
+                .documents
+        {
+            let Some(local_value) = document.value else {
+                continue;
+            };
             if let Some(overlay) = scoped_local_overlay_for_target(local_value, &request.target)? {
                 merge_toml_value(&mut merged, overlay);
                 loaded_any = true;
@@ -827,6 +866,7 @@ fn parse_composition_config(
     Ok(parsed)
 }
 
+#[cfg(test)]
 fn resolve_profile_patch(
     requested_profile_id: &str,
     profiles: &BTreeMap<String, CompositionProfile>,
@@ -876,38 +916,61 @@ fn resolve_composed_config_value_with_initial(
     resolve_composed_config_value_with_context(raw, resolved, &ConfigEvaluationContext::capture())
 }
 
-#[allow(clippy::too_many_lines)]
-// Keep the shared composition state machine together for precedence auditing.
 fn resolve_composed_config_value_with_context(
     raw: &toml::Value,
-    mut resolved: toml::Value,
+    resolved: toml::Value,
     context: &ConfigEvaluationContext,
 ) -> Result<(
     toml::Value,
     CompositionResolution,
     Vec<CompositionLayerChange>,
 )> {
-    is_startup_snapshot(raw)?;
+    use bmux_config_composition::{Document, SourceId, TomlCodec};
+    let raw = Document::new(
+        TomlCodec::from_toml(raw.clone()).map_err(document_composition::error)?,
+        SourceId(0),
+    );
+    let initial = Document::new(
+        TomlCodec::from_toml(resolved).map_err(document_composition::error)?,
+        SourceId(0),
+    );
+    let (resolved, resolution, layers) =
+        resolve_composed_document_with_context(raw, initial, context, None)?;
+    Ok((
+        TomlCodec::to_toml(&resolved.value).map_err(document_composition::error)?,
+        resolution,
+        layers,
+    ))
+}
+
+// Keep product layer selection together; all value/provenance composition uses the engine.
+#[allow(clippy::too_many_lines)]
+fn resolve_composed_document_with_context(
+    mut raw_document: bmux_config_composition::Document,
+    mut resolved: bmux_config_composition::Document,
+    context: &ConfigEvaluationContext,
+    forced_profile: Option<&str>,
+) -> Result<(
+    bmux_config_composition::Document,
+    CompositionResolution,
+    Vec<CompositionLayerChange>,
+)> {
+    use bmux_config_composition::{MergePolicy, TomlCodec};
+    let raw = TomlCodec::to_toml(&raw_document.value).map_err(document_composition::error)?;
+    is_startup_snapshot(&raw)?;
     let mut raw_table = raw
         .as_table()
         .cloned()
         .ok_or_else(|| ConfigError::ParseError {
             error: "config root must be a table".to_string(),
         })?;
-    let composition = parse_composition_config(&raw_table)?;
-    raw_table.remove("composition");
-
-    let mut profiles = built_in_composition_profiles();
-    for (profile_id, profile) in composition.profiles {
-        let canonical_id = canonical_profile_id(&profile_id);
-        if canonical_id.is_empty() {
-            return Err(ConfigError::InvalidValue {
-                field: "composition.profiles".to_string(),
-                value: "profile id must not be empty".to_string(),
-            });
-        }
-        profiles.insert(canonical_id, profile);
+    let mut composition = parse_composition_config(&raw_table)?;
+    if let Some(profile) = forced_profile {
+        composition.active_profile = Some(profile.to_owned());
     }
+    raw_table.remove("composition");
+    let profiles = document_composition::profiles(&raw_document)?;
+    raw_document.remove_key("composition");
 
     let auto_selected_profile = composition
         .auto_select
@@ -947,11 +1010,13 @@ fn resolve_composed_config_value_with_context(
     let mut applied_layers = Vec::new();
 
     for layer in &layer_order {
-        let before = resolved.clone();
+        let before = TomlCodec::to_toml(&resolved.value).map_err(document_composition::error)?;
         match layer.as_str() {
             "defaults" => {}
             "config" => {
-                merge_toml_value(&mut resolved, toml::Value::Table(raw_table.clone()));
+                resolved
+                    .merge(raw_document.clone(), &MergePolicy::default())
+                    .map_err(document_composition::error)?;
             }
             "profile:active" => {
                 let Some(active_profile) = active_profile.as_deref() else {
@@ -961,13 +1026,17 @@ fn resolve_composed_config_value_with_context(
                             .to_string(),
                     });
                 };
-                let patch = resolve_profile_patch(active_profile, &profiles)?;
-                merge_toml_value(&mut resolved, toml::Value::Table(patch));
+                let patch = document_composition::profile(active_profile, &profiles)?;
+                resolved
+                    .merge(patch, &MergePolicy::default())
+                    .map_err(document_composition::error)?;
             }
             _ if layer.starts_with("profile:") => {
                 let profile_id = layer.trim_start_matches("profile:");
-                let patch = resolve_profile_patch(profile_id, &profiles)?;
-                merge_toml_value(&mut resolved, toml::Value::Table(patch));
+                let patch = document_composition::profile(profile_id, &profiles)?;
+                resolved
+                    .merge(patch, &MergePolicy::default())
+                    .map_err(document_composition::error)?;
             }
             unknown => {
                 return Err(ConfigError::InvalidValue {
@@ -979,7 +1048,10 @@ fn resolve_composed_config_value_with_context(
 
         applied_layers.push(CompositionLayerChange {
             layer: layer.clone(),
-            changed_paths: changed_paths(&before, &resolved),
+            changed_paths: changed_paths(
+                &before,
+                &TomlCodec::to_toml(&resolved.value).map_err(document_composition::error)?,
+            ),
         });
     }
 
@@ -3306,14 +3378,17 @@ impl BmuxConfig {
             });
         }
         if let Some(cwd) = request.target.cwd_path() {
-            for local_path in
-                discover_local_config_paths(&cwd, &request.local_config_filename, path)
+            for document in
+                ConfigFamily::capture_ancestors(&cwd, &request.local_config_filename, path)?
+                    .documents
             {
-                let local_value = load_toml_file(&local_path)?;
+                let Some(local_value) = document.value else {
+                    continue;
+                };
                 let (overlay, scopes) =
                     scoped_local_overlay_for_target_with_scopes(local_value, &request.target)?;
                 sources.push(ScopedConfigSource {
-                    path: local_path,
+                    path: document.source.path,
                     applied: overlay.is_some(),
                     scopes,
                 });
@@ -5326,6 +5401,7 @@ timeout_profile = "missing"
         let _override_guard = push_process_config_overrides(ConfigLoadOverrides {
             base_config_path: None,
             env_config_path: Some(env_path),
+            env_config_toml: None,
             cli_config_path: Some(cli_path),
         });
 
@@ -5359,6 +5435,7 @@ timeout_profile = "missing"
         let _override_guard = push_process_config_overrides(ConfigLoadOverrides {
             base_config_path: None,
             env_config_path: Some(std::path::PathBuf::from("relative-env.toml")),
+            env_config_toml: None,
             cli_config_path: Some(std::path::PathBuf::from("relative-cli.toml")),
         });
 
@@ -5384,6 +5461,7 @@ timeout_profile = "missing"
         let _override_guard = push_process_config_overrides(ConfigLoadOverrides {
             base_config_path: None,
             env_config_path: Some(missing),
+            env_config_toml: None,
             cli_config_path: None,
         });
 
@@ -5425,6 +5503,7 @@ timeout_profile = "missing"
         let overrides = ConfigLoadOverrides {
             base_config_path: Some(base_path),
             env_config_path: None,
+            env_config_toml: None,
             cli_config_path: None,
         };
         let config = BmuxConfig::load_from_path_with_overrides(&primary_path, &overrides)
