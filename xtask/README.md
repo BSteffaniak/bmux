@@ -1,5 +1,24 @@
 # Release tasks
 
+## Product build feature selection
+
+```sh
+cargo xtask build --profile release --features bmux_cli/bench
+cargo xtask build --features 'bmux_cli/bench,bmux_cli/fail-on-warnings'
+cargo xtask build --features bmux_cli/bench --features bmux_cli/fail-on-warnings
+```
+
+`build` forwards repeatable `--features FEATURES` (also `--features=FEATURES`),
+`--all-features`, and `--no-default-features` to the product Cargo build.
+Feature lists retain Cargo's comma/space-separated and package-qualified syntax.
+Prefer `package/feature` because the product build selects the CLI, installer,
+and platform-supported helper packages together. Cargo validates feature names;
+xtask does not add packages or silently map features to the CLI.
+`--all-features` and `--no-default-features` apply to the selected packages,
+using Cargo's normal semantics. Without these options, existing defaults are
+unchanged. These options are scoped to `xtask build`, not auxiliary or Bterm
+packaging commands.
+
 These are explicit repository tasks, not Cargo build-script hooks. The task uses
 `bmux_plugin::PluginManifest` for the same declaration/ABI validation as the
 host;

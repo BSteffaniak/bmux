@@ -37,7 +37,12 @@ fn build_arguments(
     declarations: &[serde_json::Value],
 ) -> Result<Vec<String>> {
     let profile = self::profile(Some(profile))?;
-    let mut arguments = crate::build::arguments(target, profile, declarations)?;
+    let mut arguments = crate::build::arguments(
+        target,
+        profile,
+        declarations,
+        &crate::build::Features::default(),
+    )?;
     arguments.extend(["-p".into(), "bterm".into(), "--bin".into(), "bterm".into()]);
     Ok(arguments)
 }

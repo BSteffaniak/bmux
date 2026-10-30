@@ -29,13 +29,45 @@ fn invocation_args(executable: Option<&str>, mut args: Vec<String>) -> Vec<Strin
 fn run(args: Vec<String>) -> Result<()> {
     let Some(command) = args.first() else {
         return Err(error(
-            "usage: cargo xtask build [--target TARGET] [--profile PROFILE] | auxiliary {build,stage,nfpm} --target TARGET | bterm {build,run} [--profile PROFILE] | bterm {stage,verify} --target TARGET | install SOURCE DESTINATION [--binary-name NAME | --activate-version VERSION]",
+            "usage: cargo xtask build [--target TARGET] [--profile PROFILE] [--features FEATURES] [--all-features] [--no-default-features] | auxiliary {build,stage,nfpm} --target TARGET | bterm {build,run} [--profile PROFILE] | bterm {stage,verify} --target TARGET | install SOURCE DESTINATION [--binary-name NAME | --activate-version VERSION]",
         ));
     };
     let mut positional = Vec::new();
     let mut options = BTreeMap::new();
+    let mut features = build::Features::default();
     let mut index = 1;
     while index < args.len() {
+        if command == "build" && args[index].starts_with("--") {
+            let (flag, inline_value) = args[index]
+                .split_once('=')
+                .map_or((args[index].as_str(), None), |(flag, value)| {
+                    (flag, Some(value))
+                });
+            match flag {
+                "--features" => {
+                    let value = inline_value
+                        .or_else(|| args.get(index + 1).map(String::as_str))
+                        .filter(|value| !value.starts_with('-') && !value.trim().is_empty())
+                        .ok_or_else(|| error("--features requires a nonempty value"))?;
+                    features.selected.push(value.to_owned());
+                    index += if inline_value.is_some() { 1 } else { 2 };
+                    continue;
+                }
+                "--all-features" | "--no-default-features" => {
+                    if inline_value.is_some() {
+                        return Err(error(format!("{flag} takes no value")));
+                    }
+                    if flag == "--all-features" {
+                        features.all = true;
+                    } else {
+                        features.no_default = true;
+                    }
+                    index += 1;
+                    continue;
+                }
+                _ => {}
+            }
+        }
         if args[index].starts_with("--") {
             let key = args[index].clone();
             let value = args
@@ -145,6 +177,7 @@ fn run(args: Vec<String>) -> Result<()> {
             &target,
             profile,
             &artifacts::declarations(&workspace)?,
+            &features,
         );
     }
     if command == "install" {
@@ -193,7 +226,13 @@ fn run(args: Vec<String>) -> Result<()> {
                 .ok_or_else(|| error(format!("{name} is required")))
         };
         match positional[0].as_str() {
-            "build" => build::run(&workspace, target, "release", &declarations),
+            "build" => build::run(
+                &workspace,
+                target,
+                "release",
+                &declarations,
+                &build::Features::default(),
+            ),
             "stage" => artifacts::stage(
                 &required("--artifact-dir")?,
                 &required("--destination")?,

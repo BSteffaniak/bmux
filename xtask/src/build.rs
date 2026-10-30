@@ -3,10 +3,32 @@ use crate::artifacts::{self, Result, error};
 use serde_json::Value;
 use std::{path::Path, process::Command};
 
+#[derive(Debug, Default)]
+pub(crate) struct Features {
+    pub(crate) selected: Vec<String>,
+    pub(crate) all: bool,
+    pub(crate) no_default: bool,
+}
+
+impl Features {
+    fn append_arguments(&self, args: &mut Vec<String>) {
+        for selection in &self.selected {
+            args.extend(["--features".into(), selection.clone()]);
+        }
+        if self.all {
+            args.push("--all-features".into());
+        }
+        if self.no_default {
+            args.push("--no-default-features".into());
+        }
+    }
+}
+
 pub(crate) fn arguments(
     target: &str,
     profile: &str,
     declarations: &[Value],
+    features: &Features,
 ) -> Result<Vec<String>> {
     artifacts::unix_target(target)?;
     let mut args: Vec<String> = [
@@ -38,6 +60,7 @@ pub(crate) fn arguments(
             ]);
         }
     }
+    features.append_arguments(&mut args);
     Ok(args)
 }
 
@@ -60,9 +83,10 @@ pub(crate) fn run(
     target: &str,
     profile: &str,
     declarations: &[Value],
+    features: &Features,
 ) -> Result<()> {
     let status = Command::new("cargo")
-        .args(arguments(target, profile, declarations)?)
+        .args(arguments(target, profile, declarations, features)?)
         .current_dir(workspace)
         .status()?;
     if !status.success() {
@@ -81,7 +105,13 @@ mod tests {
     fn product_build_selects_cli_installer_and_every_helper_with_one_target_profile() {
         let declarations =
             vec![serde_json::json!({"cargo_package": "worker_plugin", "cargo_binary": "worker"})];
-        let args = arguments("x86_64-unknown-linux-gnu", "dev", &declarations).unwrap();
+        let args = arguments(
+            "x86_64-unknown-linux-gnu",
+            "dev",
+            &declarations,
+            &Features::default(),
+        )
+        .unwrap();
         for name in ["bmux_cli", "bmux", "xtask", "worker_plugin", "worker"] {
             assert!(args.iter().any(|arg| arg == name));
         }
@@ -89,10 +119,15 @@ mod tests {
         assert_eq!(args.iter().filter(|arg| *arg == "--profile").count(), 1);
         assert!(args.windows(2).any(|pair| pair == ["--profile", "dev"]));
         assert!(
-            arguments("x86_64-unknown-linux-gnu", "release", &declarations)
-                .unwrap()
-                .windows(2)
-                .any(|pair| pair == ["--profile", "release"])
+            arguments(
+                "x86_64-unknown-linux-gnu",
+                "release",
+                &declarations,
+                &Features::default()
+            )
+            .unwrap()
+            .windows(2)
+            .any(|pair| pair == ["--profile", "release"])
         );
     }
 
@@ -102,11 +137,23 @@ mod tests {
             serde_json::json!({"cargo_package": "fixture_helper", "cargo_binary": "fixture-helper", "supported_platforms": ["unix", "windows"]}),
             serde_json::json!({"cargo_package": "unix_plugin", "cargo_binary": "unix-helper"}),
         ];
-        let args = arguments("x86_64-pc-windows-msvc", "release", &declarations).unwrap();
+        let args = arguments(
+            "x86_64-pc-windows-msvc",
+            "release",
+            &declarations,
+            &Features::default(),
+        )
+        .unwrap();
         assert!(args.iter().any(|arg| arg == "fixture-helper"));
         assert!(args.iter().any(|arg| arg == "fixture_helper"));
         assert!(!args.iter().any(|arg| arg == "unix-helper"));
-        let unix = arguments("x86_64-apple-darwin", "release", &declarations).unwrap();
+        let unix = arguments(
+            "x86_64-apple-darwin",
+            "release",
+            &declarations,
+            &Features::default(),
+        )
+        .unwrap();
         assert!(unix.iter().any(|arg| arg == "unix-helper"));
         assert!(unix.iter().any(|arg| arg == "fixture-helper"));
     }
@@ -115,7 +162,13 @@ mod tests {
     fn unsupported_helpers_are_not_built_on_windows() {
         let declarations =
             vec![serde_json::json!({"cargo_package": "worker_plugin", "cargo_binary": "worker"})];
-        let args = arguments("x86_64-pc-windows-msvc", "release", &declarations).unwrap();
+        let args = arguments(
+            "x86_64-pc-windows-msvc",
+            "release",
+            &declarations,
+            &Features::default(),
+        )
+        .unwrap();
         assert!(!args.iter().any(|arg| arg == "worker"));
         assert!(args.iter().any(|arg| arg == "bmux"));
     }
