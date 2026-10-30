@@ -173,6 +173,9 @@ trait AttachHost {
     fn viewport_generation(&self) -> Option<u64> {
         None
     }
+    fn viewport_update_pending(&self) -> bool {
+        false
+    }
     fn accepted_revision(&self) -> u64 {
         0
     }
@@ -656,6 +659,9 @@ impl AttachHost for NativeAttachHost {
             self.live_viewport_generation
                 .load(std::sync::atomic::Ordering::Acquire),
         )
+    }
+    fn viewport_update_pending(&self) -> bool {
+        Some(self.viewport_generation) != self.viewport_generation()
     }
     fn accepted_revision(&self) -> u64 {
         self.accepted_revision
@@ -5665,6 +5671,18 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
         perf_window.record_event_burst(burst_drained_events);
         if burst_requested_exit {
             break;
+        }
+
+        // Admission has already revoked old pointer/output authority. Do not
+        // fetch, compose, or synchronously deliver more old-geometry frames
+        // while the queued resize is waiting to update the producer. In
+        // particular, unrelated server damage must not delay resize recovery
+        // with repeated expensive rejected presentations.
+        if terminal.viewport_update_pending() {
+            // A deferred-capture deadline may already be due. Disarm it while
+            // waiting for geometry so it cannot turn this gate into a busy loop.
+            observer_capture_pending = false;
+            continue;
         }
 
         if view_state

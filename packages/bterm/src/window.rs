@@ -98,6 +98,12 @@ pub struct PendingOutput {
 }
 
 impl PendingOutput {
+    /// Identity of the queued candidate; inspecting it does not accept output.
+    #[must_use]
+    pub fn identity(&self) -> PresentationIdentity {
+        self.delivery.identity
+    }
+
     /// Serialize cancellation/closure with actual output. Holds the transaction
     /// gate through presentation, so a timeout cannot race a late GPU submit.
     pub fn present(

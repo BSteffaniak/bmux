@@ -417,6 +417,8 @@ impl<W: AttachWorker> Application<W> {
                 }
                 if let Some(output) = &self.output {
                     if let Some(pending) = output.try_recv() {
+                        let superseded =
+                            pending.identity().viewport_generation < self.viewport.generation;
                         let active = self.active;
                         let metrics = context.metrics();
                         let viewport = self.viewport;
@@ -548,7 +550,13 @@ impl<W: AttachWorker> Application<W> {
                             );
                         }
                         if let Err(error) = accepted {
-                            if self.active && !context.metrics().physical_size.is_empty() {
+                            // A resize supersedes queued output without indicating a
+                            // renderer failure. Reject its receipt, but let the queued
+                            // geometry update converge without spending recovery retries.
+                            if !superseded
+                                && self.active
+                                && !context.metrics().physical_size.is_empty()
+                            {
                                 if let Some(delay) = self.retry.schedule(std::time::Instant::now())
                                 {
                                     eprintln!(

@@ -22,6 +22,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+static NATIVE_RUNTIME: Mutex<()> = Mutex::new(());
+
 const DEADLINE: Duration = Duration::from_secs(10);
 const WORKLOAD: &str = r#"#!/bin/sh
 exec 2> "$0.stderr"
@@ -244,6 +246,7 @@ struct SinkEvidence {
 
 struct RetainedSink {
     expected_session: uuid::Uuid,
+    viewport_generation: u64,
     expected: Arc<Mutex<Option<Expected>>>,
     accepted: tokio::sync::mpsc::Sender<Acceptance>,
     retained: Option<PreparedDelivery>,
@@ -289,7 +292,10 @@ impl RetainedSink {
             self.expected_session,
             delivery.identity
         );
-        ensure!(delivery.identity.viewport_generation == 1, "wrong viewport");
+        ensure!(
+            delivery.identity.viewport_generation == self.viewport_generation,
+            "wrong viewport"
+        );
         if let Some(last) = self.retained.as_ref().map(|delivery| delivery.identity) {
             ensure!(
                 delivery.identity.epoch == last.epoch,
@@ -382,7 +388,7 @@ async fn echo_controller(
     Ok(timings)
 }
 
-async fn exercise(samples: usize, warmup: usize) -> Result<Vec<u64>> {
+async fn exercise(samples: usize, warmup: usize, resize_at_startup: bool) -> Result<Vec<u64>> {
     ensure!(
         samples > 0 && samples + warmup < 128,
         "workload sample budget exceeded",
@@ -394,7 +400,14 @@ async fn exercise(samples: usize, warmup: usize) -> Result<Vec<u64>> {
         last_rows: Vec::new(),
         last_rejection: None,
     }));
-    let result = exercise_attached(&mut daemon, Arc::clone(&evidence), samples, warmup).await;
+    let result = exercise_attached(
+        &mut daemon,
+        Arc::clone(&evidence),
+        samples,
+        warmup,
+        resize_at_startup,
+    )
+    .await;
     // Always observe real stop/exit even when the ready/ACK controller failed.
     let teardown = daemon.stop();
     if result.is_err() || teardown.is_err() {
@@ -441,6 +454,7 @@ async fn exercise_attached(
     evidence: Arc<Mutex<SinkEvidence>>,
     samples: usize,
     warmup: usize,
+    resize_at_startup: bool,
 ) -> Result<Vec<u64>> {
     let paths = daemon.paths();
     let config = BmuxConfig::load_isolated_with_paths_and_overrides(
@@ -498,6 +512,7 @@ async fn exercise_attached(
     let (accepted_tx, mut accepted_rx) = tokio::sync::mpsc::channel(1);
     let mut sink = RetainedSink {
         expected_session: session,
+        viewport_generation: if resize_at_startup { 3 } else { 1 },
         expected: Arc::clone(&expected),
         accepted: accepted_tx,
         retained: None,
@@ -505,6 +520,15 @@ async fn exercise_attached(
     };
     let (handle, mut host) =
         NativeAttachHost::channel(80, 24, 1, move |delivery| sink.accept(delivery))?;
+    if resize_at_startup {
+        for viewport_generation in [2, 3] {
+            handle.try_send(NativeAttachEvent::Resize {
+                columns: 80,
+                rows: 24,
+                viewport_generation,
+            })?;
+        }
+    }
     host.set_config_paths(paths.clone());
     let reload_paths = paths.clone();
     host.set_config_loader(move || {
@@ -562,11 +586,14 @@ async fn exercise_attached(
 fn run(samples: usize, warmup: usize) -> Result<Vec<u64>> {
     // Native configuration/plugin state is thread-local. Poll attach and controller
     // together here, never spawn the attach future onto a migrating executor worker.
+    let _guard = NATIVE_RUNTIME.lock().unwrap();
+    // Native plugin initialization uses process-global registries. These real
+    // runtime exercises must not initialize them concurrently in cargo test.
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
         .build()?
-        .block_on(exercise(samples, warmup))
+        .block_on(exercise(samples, warmup, false))
 }
 
 #[test]
@@ -581,6 +608,18 @@ fn retained_markers_match_borders_but_not_other_sequences() {
     ));
     assert!(!contains_exact_marker("ACK:000002:a", "ACK:000001:a"));
     assert!(!contains_exact_marker("ACK:000001:ab", "ACK:000001:a"));
+}
+
+#[test]
+fn startup_resize_catches_up_before_native_key_echo() -> Result<()> {
+    let _guard = NATIVE_RUNTIME.lock().unwrap();
+    let samples = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()?
+        .block_on(exercise(2, 0, true))?;
+    ensure!(samples.len() == 2, "missing resized echo samples");
+    Ok(())
 }
 
 #[test]

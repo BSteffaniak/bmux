@@ -80,6 +80,37 @@ async fn pop(host: &mut NativeAttachHost) -> NativeAttachEvent {
 }
 
 #[tokio::test]
+async fn queued_resize_blocks_projection_until_latest_geometry_is_applied() {
+    let (_view, handle, mut host, _) = fixture();
+    assert!(!host.viewport_update_pending());
+    for (generation, columns) in [(8, 100), (9, 120)] {
+        handle
+            .try_send(NativeAttachEvent::Resize {
+                columns,
+                rows: 30,
+                viewport_generation: generation,
+            })
+            .unwrap();
+    }
+    assert!(host.viewport_update_pending());
+    let _superseded = pop(&mut host).await;
+    assert!(host.viewport_update_pending());
+    let NativeAttachEvent::Resize {
+        columns,
+        rows,
+        viewport_generation,
+    } = pop(&mut host).await
+    else {
+        panic!("expected latest resize");
+    };
+    host.native_resize(columns, rows, viewport_generation)
+        .unwrap();
+    assert!(!host.viewport_update_pending());
+    assert_eq!(host.geometry().cols, 120);
+    assert_eq!(host.viewport_generation(), Some(9));
+}
+
+#[tokio::test]
 async fn queued_pointer_is_rejected_after_resize_admission_before_resize_dequeue() {
     let (mut view, handle, mut host, _) = fixture();
     let id = identity(&view);
