@@ -230,6 +230,39 @@ elif args[0]!='init': sys.exit('unexpected mutating operation')
         for forbidden in ('tofu apply', 'tofu import', 'skopeo', 'pages upload', 'state archived', 'plan checked'):
             self.assertNotIn(forbidden, effects)
 
+    def test_reconcile_mode_only_pushes_locked_state_and_archives(self):
+        self.tool('tofu', '''import os,sys
+from pathlib import Path
+args=sys.argv[1:]
+if args[0]=='version': print('{"terraform_version":"1.10.9"}')
+elif args==['init','-json','-input=false','-lockfile=readonly',next((a for a in args if a.startswith('-backend-config=')), '')]: pass
+elif args[:2]==['state','pull']:
+ with open(os.environ['TEST_EFFECTS'],'a') as f: f.write('state pulled\\n')
+ print('{}')
+elif args[:2]==['state','push']:
+ assert args[2]=='-lock-timeout=5m' and len(args)==4
+ assert Path(args[3]).is_file()
+ with open(os.environ['TEST_EFFECTS'],'a') as f: f.write('locked state pushed\\n')
+else: sys.exit('Unexpected infrastructure command')
+''')
+        wrapper = self.bin / 'python3'
+        source = wrapper.read_text()
+        source = source.replace("else:\n os.execv", "elif args and args[0].endswith('reconcile-live-mounts.py'):\n if '--verify' not in args: Path(args[2]).write_text('{}')\n with open(os.environ['TEST_EFFECTS'],'a') as f: f.write('ownership '+('verified' if '--verify' in args else 'prepared')+'\\n')\nelse:\n os.execv")
+        wrapper.write_text(source)
+        result, effects = self.run_deploy('reconcile-mount')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('ownership prepared\nlocked state pushed\nstate archive\nstate pulled\nownership verified', effects)
+        self.assertEqual(effects.count('state archive'), 2)
+        for forbidden in ('tofu plan', 'tofu apply', 'image ', 'pages upload', 'imports checked'):
+            self.assertNotIn(forbidden, effects)
+        self.assertLess(effects.index('state archive'), effects.index('locked state pushed'))
+        self.log.write_text('')
+        self.env['TEST_FAIL'] = 'archive'
+        result, effects = self.run_deploy('reconcile-mount')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn('locked state pushed', effects)
+        self.assertNotIn('ownership prepared', effects)
+
     def test_apply_errors_use_structured_diagnostics(self):
         self.tool('tofu', '''import json,os,sys
 args=sys.argv[1:]

@@ -232,6 +232,50 @@ without verifying its durable ownership. This inspection mode does not itself
 perform reconciliation, and a successful inspection does not mean deployment is
 fixed.
 
+### Incident-scoped ownership reconciliation
+
+Inspection run `41094527560` confirmed that machine `8d99733c27d018` mounts
+`vol_vjy7qdp90wqoy7ov`, while persisted state still references the absent
+`vol_vxmzq7dl9yw1x1z4`. Provider v0.3.2 reads the mount reconciliation opt-in
+from prior state, not the newly proposed configuration. Thus a normal refresh
+cannot activate that opt-in before the mount-swap guard evaluates the plan.
+
+After reviewing this evidence, dispatch **Live production release** on `master`
+with `reconcile_mount=true` (never combine it with `inspect_only`). This is a
+state mutation, **not** an inspection or deployment:
+
+```sh
+gh workflow run live-promote.yml --ref master -f reconcile_mount=true
+```
+
+The operation validates the exact incident app/machine/old/new volume
+identities,
+known state and provider schemas, the live encrypted 1-GB authority attachment,
+and absence of the old volume. It archives encrypted state, pulls it privately,
+changes only the two ownership identities, attached-machine field and paired
+reconciliation flags, then pushes with backend locking and normal lineage/serial
+checks. Its serial advances by exactly one; an intervening writer's equal-serial
+but different content (or a newer serial) is rejected, not overwritten. It never
+uses `-force`, removes resources, or calls provider mutation
+APIs. Every other resource, output, and private provider field is preserved.
+Approval, deployment, image upload and site publication remain disabled. The
+normal release plan guard is unchanged.
+
+After the push, encrypted state is archived again and pulled back for full-value
+verification (apart from OpenTofu's serial advancement), followed by fresh Fly
+GET checks. Private files are removed on exit. If interrupted or verification
+fails, do not auto-restore: rerun read-only inspection and review the encrypted
+archives to determine whether the push completed. Repeating this scoped
+operation
+is safe only while its original live-identity preconditions still hold; changed
+or unknown ownership blocks it. A concurrent newer serial or different lineage
+is rejected, not overwritten. All cooperating infrastructure jobs share the
+production concurrency group; do not run external state writers during recovery.
+
+Once reconciliation succeeds, dispatch a normal release for a fresh guarded
+preview. Recovery does not itself approve a release or establish deployment
+success.
+
 ### Volume-placement rejections
 
 A volume-placement classification is not an exact API error. Compare the live
