@@ -334,6 +334,71 @@ fn epoch_target_generation_revision_and_receipt_must_all_match() {
     assert!(!native_pointer_event_is_current(&mouse(id), &view, &host));
 }
 
+async fn reduce_paste(
+    view: &mut AttachViewState,
+    client: &mut StreamingBmuxClient,
+    text: &str,
+    normalized: bool,
+) -> Result<AttachLoopControl> {
+    let raw = Event::Paste(text.into());
+    let mut event = AttachTerminalEvent::from_crossterm(
+        raw,
+        Instant::now(),
+        TerminalGeometry { cols: 80, rows: 24 },
+    );
+    if !normalized {
+        event.normalized = None;
+    }
+    let mut processor =
+        InputProcessor::new(attach_keymap_from_config(&BmuxConfig::default()), false);
+    handle_attach_terminal_event(
+        client,
+        event,
+        &mut processor,
+        &[],
+        view,
+        &mut DisplayCaptureFanout::default(),
+        None,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn native_paste_reaches_shared_reducer_without_outer_capture() {
+    for requested in [false, true] {
+        let mut view = attach_view_state_with_scrollback_fixture();
+        view.outer_paste_capture_enabled = false;
+        view.can_write = true;
+        let pane = focused_attach_pane_id(&view).unwrap();
+        view.pane_input_mode_hints.insert(
+            pane,
+            bmux_attach_layout_protocol::AttachInputModeState {
+                bracketed_paste: requested,
+                ..Default::default()
+            },
+        );
+        let text = "native\n世界";
+        assert_eq!(
+            pane_paste_bytes(&view, text).unwrap(),
+            encode_bracketed_paste(text, requested)
+        );
+        let mut client = disconnected_focus_test_client().await;
+        // A disconnected sink must report the attempted send, not silently drop
+        // an event because capture is disabled. The same path enforces read-only.
+        assert!(
+            reduce_paste(&mut view, &mut client, text, true)
+                .await
+                .is_err()
+        );
+        view.can_write = false;
+        assert!(
+            reduce_paste(&mut view, &mut client, text, true)
+                .await
+                .is_ok()
+        );
+    }
+}
+
 #[tokio::test]
 async fn native_text_plugin_capture_has_one_owner_and_never_falls_through_to_pty() {
     use bmux_plugin::surface::{
@@ -404,6 +469,13 @@ async fn native_text_plugin_capture_has_one_owner_and_never_falls_through_to_pty
             "日本語".to_owned()
         )]
     );
+    view.outer_paste_capture_enabled = false;
+    for normalized in [false, true] {
+        reduce_paste(&mut view, &mut client, "clipboard\n世界", normalized)
+            .await
+            .unwrap();
+    }
+    assert_eq!(received.lock().unwrap().len(), 3);
     // An unconsumed edit in a modal scope cannot fall through to a pane.
     view.presentation_input.register_paste(
         endpoint,
@@ -412,7 +484,12 @@ async fn native_text_plugin_capture_has_one_owner_and_never_falls_through_to_pty
     native_committed_text(&mut client, &mut view, "modal-blocked", true)
         .await
         .unwrap();
+    for normalized in [false, true] {
+        reduce_paste(&mut view, &mut client, "modal-paste-blocked", normalized)
+            .await
+            .unwrap();
+    }
     view.help_overlay_open = true;
     assert!(native_capture_committed_text(&mut view, "blocked"));
-    assert_eq!(received.lock().unwrap().len(), 1);
+    assert_eq!(received.lock().unwrap().len(), 3);
 }

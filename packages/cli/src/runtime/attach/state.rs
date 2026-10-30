@@ -263,7 +263,7 @@ pub struct AttachViewState {
     pub attached_id: Uuid,
     pub attached_context_id: Option<Uuid>,
     pub can_write: bool,
-    pub bracketed_paste_enabled: bool,
+    pub outer_paste_capture_enabled: bool,
     pub ui_mode: AttachUiMode,
     /// Last client-local presentation snapshot published by this attach. The
     /// revision advances only when semantic presentation state changes.
@@ -663,7 +663,7 @@ impl AttachViewState {
             attached_id: attach_info.session_id,
             attached_context_id: attach_info.context_id,
             can_write: attach_info.can_write,
-            bracketed_paste_enabled: false,
+            outer_paste_capture_enabled: false,
             ui_mode: AttachUiMode::Normal,
             local_presentation: None,
             active_mode_id: "normal".to_string(),
@@ -1015,6 +1015,11 @@ mod tests {
         assert!(state.decoded_history.is_empty());
     }
 
+    #[cfg(any(
+        feature = "image-sixel",
+        feature = "image-kitty",
+        feature = "image-iterm2"
+    ))]
     #[test]
     fn historical_text_never_uses_live_images_and_exit_restores_them() {
         let mut state = AttachViewState::new(bmux_client::AttachOpenInfo {

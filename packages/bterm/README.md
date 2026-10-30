@@ -45,6 +45,19 @@ success. The observer receives success only after actual renderer presentation.
 Closing/dropping the receiver rejects blocked publication. Pixel metrics project
 presentation cells independently of execution geometry.
 
+## Clipboard paste
+
+Bterm owns native clipboard IO. Cmd+V on macOS and Ctrl+Shift+V on Linux
+request one semantic paste; ordinary Ctrl+V remains terminal input. Paste is
+routed to the active prompt, plugin text control, or focused writable execution,
+never broadcast through a modal scope. Clipboard errors report a recoverable
+status without closing the attachment or exposing clipboard contents.
+
+`behavior.bracketed_paste` and the CLI `bracketed-paste` Cargo feature control
+capture from an outer terminal only. Native clipboard paste remains available
+without them. Semantic paste uses the destination execution's current mode 2004
+to select bracketed or plain encoding.
+
 ## Configuration and isolation
 
 See [Bterm configuration](../../docs/bterm-configuration.md) for superset

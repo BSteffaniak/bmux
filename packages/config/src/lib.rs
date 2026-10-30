@@ -2278,14 +2278,16 @@ pub struct BehaviorConfig {
     /// terminal, allowing modified special keys like Ctrl+Enter to be
     /// correctly forwarded to pane programs.
     pub kitty_keyboard: bool,
-    /// Enable semantic bracketed-paste handling. When enabled, bmux asks the
-    /// outer terminal to report paste events separately and forwards them to
-    /// pane applications using DEC mode 2004 when requested.
+    /// Enable semantic paste capture from an outer terminal. When enabled,
+    /// bmux asks that terminal to report paste events separately.
     ///
-    /// This defaults to true and requires a binary built with the default
-    /// `bracketed-paste` Cargo feature. Disabling it makes pasted input
-    /// indistinguishable from typed terminal input, so terminal input handling
-    /// outside bmux's semantic paste path may interpret pasted control bytes.
+    /// This defaults to true and requires the `bracketed-paste` Cargo feature.
+    /// Disabling capture makes outer-terminal paste indistinguishable from
+    /// typed terminal input, so pasted control bytes may be interpreted by
+    /// keybindings. Native clipboard paste and delivery of existing semantic
+    /// paste events remain available regardless of this setting or feature.
+    /// Semantic paste is wrapped whenever the destination application requests
+    /// DEC mode 2004, independently of outer-terminal capture.
     pub bracketed_paste: bool,
     /// How to restore pane content when hidden panes become visible again
     /// (e.g. after exiting zoom). SNAPSHOT re-fetches from the server for

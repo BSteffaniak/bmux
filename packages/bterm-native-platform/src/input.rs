@@ -13,9 +13,39 @@ use winit::keyboard::{Key, ModifiersState};
 pub(crate) struct InputAdapter {
     modifiers: Modifiers,
     ime: ImeState,
+    paste_key: Option<winit::keyboard::PhysicalKey>,
 }
 
 impl InputAdapter {
+    /// Native clipboard command recognition, separate from terminal key encoding.
+    /// Track the physical key so releasing modifiers first cannot leak a key-up.
+    pub(crate) fn paste_action(
+        &mut self,
+        physical: winit::keyboard::PhysicalKey,
+        logical: &Key,
+        state: ElementState,
+        repeat: bool,
+        synthetic: bool,
+    ) -> Option<bool> {
+        if self.paste_key == Some(physical) {
+            if state == ElementState::Released {
+                self.paste_key = None;
+            }
+            return Some(false);
+        }
+        let named = matches!(logical, Key::Named(winit::keyboard::NamedKey::Paste));
+        let shortcut = matches!(logical, Key::Character(text) if text.eq_ignore_ascii_case("v"))
+            && paste_modifiers(self.modifiers, cfg!(target_os = "macos"));
+        if !named && !shortcut {
+            return None;
+        }
+        let invoke = !synthetic && state == ElementState::Pressed && !repeat;
+        if state == ElementState::Pressed {
+            self.paste_key = Some(physical);
+        }
+        Some(invoke)
+    }
+
     // Winit's KeyEvent has private platform fields. This seam tests the exact
     // translation without fabricating platform-specific native event internals.
     fn key_event(
@@ -112,12 +142,21 @@ impl InputAdapter {
             WindowEvent::Focused(focused) => {
                 if !focused {
                     self.modifiers = Modifiers::default();
+                    self.paste_key = None;
                     self.ime.cancel();
                 }
                 Some(InputEvent::Focus(*focused))
             }
             _ => None,
         }
+    }
+}
+
+fn paste_modifiers(modifiers: Modifiers, macos: bool) -> bool {
+    if macos {
+        modifiers.super_key && !modifiers.control && !modifiers.alt && !modifiers.shift
+    } else {
+        modifiers.control && modifiers.shift && !modifiers.alt && !modifiers.super_key
     }
 }
 
@@ -220,6 +259,79 @@ fn named_key(value: winit::keyboard::NamedKey) -> Option<NamedKey> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn paste_shortcuts_are_platform_specific_and_not_terminal_ctrl_v() {
+        for macos in [false, true] {
+            let command = if macos {
+                Modifiers {
+                    super_key: true,
+                    ..Modifiers::default()
+                }
+            } else {
+                Modifiers {
+                    control: true,
+                    shift: true,
+                    ..Modifiers::default()
+                }
+            };
+            assert!(paste_modifiers(command, macos));
+            assert!(!paste_modifiers(command, !macos));
+            assert!(!paste_modifiers(
+                Modifiers {
+                    control: true,
+                    ..Modifiers::default()
+                },
+                macos
+            ));
+            assert!(!paste_modifiers(
+                Modifiers {
+                    alt: true,
+                    ..command
+                },
+                macos
+            ));
+        }
+    }
+
+    #[test]
+    fn paste_shortcut_consumes_release_after_modifiers_change() {
+        let modifiers = if cfg!(target_os = "macos") {
+            Modifiers {
+                super_key: true,
+                ..Modifiers::default()
+            }
+        } else {
+            Modifiers {
+                control: true,
+                shift: true,
+                ..Modifiers::default()
+            }
+        };
+        let mut adapter = InputAdapter {
+            modifiers,
+            ..InputAdapter::default()
+        };
+        let physical = winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::KeyV);
+        let logical = Key::Character("V".into());
+        assert_eq!(
+            adapter.paste_action(physical, &logical, ElementState::Pressed, false, false),
+            Some(true)
+        );
+        assert_eq!(
+            adapter.paste_action(physical, &logical, ElementState::Pressed, true, false),
+            Some(false)
+        );
+        adapter.modifiers = Modifiers::default();
+        assert_eq!(
+            adapter.paste_action(physical, &logical, ElementState::Released, false, false),
+            Some(false)
+        );
+        assert_eq!(
+            adapter.paste_action(physical, &logical, ElementState::Pressed, false, false),
+            None
+        );
+    }
 
     #[test]
     fn key_phases_and_ime_commit_have_one_text_authority() {

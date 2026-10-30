@@ -103,7 +103,9 @@ mod tests {
         assert!(doc.contains("bracketed_paste"));
         assert!(doc.contains("`bracketed-paste` Cargo feature"));
         assert!(doc.contains("defaults to true"));
-        assert!(doc.contains("indistinguishable from typed terminal input"));
+        assert!(doc.contains("indistinguishable from"));
+        assert!(doc.contains("Native clipboard paste"));
+        assert!(doc.contains("independently of outer-terminal capture"));
     }
 
     #[test]

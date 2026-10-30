@@ -58,7 +58,7 @@ pub enum PlatformEvent {
     RedrawRequested,
     Focused(bool),
     CloseRequested,
-    /// An OS-provided Paste action, not a synthesized shortcut binding.
+    /// A native clipboard paste command (OS action or platform shortcut).
     PasteRequested,
     Wake,
     Input(crate::input::InputEvent),
@@ -239,13 +239,6 @@ impl WindowContext<'_> {
     }
 }
 
-fn is_paste_action(key: &winit::keyboard::Key) -> bool {
-    matches!(
-        key,
-        winit::keyboard::Key::Named(winit::keyboard::NamedKey::Paste)
-    )
-}
-
 fn metrics(window: &Window) -> WindowMetrics {
     let size = window.inner_size();
     WindowMetrics {
@@ -380,10 +373,20 @@ impl<A: WindowApplication> ApplicationHandler<()> for Host<A> {
                 adapter.invalidate();
             }
         }
-        if let WindowEvent::KeyboardInput { event, .. } = &event
-            && is_paste_action(&event.logical_key)
+        if let WindowEvent::KeyboardInput {
+            event,
+            is_synthetic,
+            ..
+        } = &event
+            && let Some(invoke) = self.input.paste_action(
+                event.physical_key,
+                &event.logical_key,
+                event.state,
+                event.repeat,
+                *is_synthetic,
+            )
         {
-            if event.state == winit::event::ElementState::Pressed && !event.repeat {
+            if invoke {
                 self.dispatch(event_loop, PlatformEvent::PasteRequested);
             }
             // Consume the OS action including repeats/releases: it must not
@@ -552,12 +555,37 @@ mod tests {
     }
 
     #[test]
-    fn os_paste_action_is_not_a_shortcut_map() {
-        use winit::keyboard::{Key, NamedKey};
-        assert!(super::is_paste_action(&Key::Named(NamedKey::Paste)));
-        assert!(!super::is_paste_action(&Key::Character("v".into())));
-        assert!(!super::is_paste_action(&Key::Named(NamedKey::Copy)));
-        assert!(!super::is_paste_action(&Key::Named(NamedKey::Enter)));
+    fn native_paste_actions_are_consumed_once() {
+        use winit::event::ElementState::{Pressed, Released};
+        use winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
+        let mut input = crate::input::InputAdapter::default();
+        let key = PhysicalKey::Code(KeyCode::Paste);
+        assert_eq!(
+            input.paste_action(key, &Key::Named(NamedKey::Paste), Pressed, false, false),
+            Some(true)
+        );
+        assert_eq!(
+            input.paste_action(key, &Key::Named(NamedKey::Paste), Pressed, true, false),
+            Some(false)
+        );
+        assert_eq!(
+            input.paste_action(key, &Key::Named(NamedKey::Paste), Released, false, false),
+            Some(false)
+        );
+        assert_eq!(
+            input.paste_action(key, &Key::Named(NamedKey::Paste), Pressed, false, true),
+            Some(false)
+        );
+        assert_eq!(
+            input.paste_action(
+                PhysicalKey::Code(KeyCode::KeyV),
+                &Key::Character("v".into()),
+                Pressed,
+                false,
+                false
+            ),
+            None
+        );
     }
 
     #[test]

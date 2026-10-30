@@ -318,7 +318,7 @@ fail-on-warnings = [
     "bmux_web_renderer/fail-on-warnings",
 ]
 
-# Semantic bracketed-paste capture and pane forwarding
+# Outer-terminal semantic paste capture (not clipboard delivery or pane encoding)
 bracketed-paste = []
 
 # Kitty keyboard protocol support (CSI u encoding/decoding + inner program negotiation)

@@ -96,8 +96,10 @@ use uuid::Uuid;
 pub type AttachTerminalEventFuture<'a> =
     Pin<Box<dyn Future<Output = Result<Option<Event>>> + Send + 'a>>;
 
+/// Whether to negotiate semantic paste capture with an outer terminal.
+/// Native clipboard delivery and execution-side wrapping are unconditional.
 #[must_use]
-pub const fn bracketed_paste_enabled(config_enabled: bool) -> bool {
+pub const fn outer_paste_capture_enabled(config_enabled: bool) -> bool {
     cfg!(feature = "bracketed-paste") && config_enabled
 }
 
@@ -126,7 +128,7 @@ pub trait AttachTerminal: Write {
         &mut self,
         kitty_keyboard_enabled: bool,
         mouse_capture_enabled: bool,
-        bracketed_paste_enabled: bool,
+        outer_paste_capture_enabled: bool,
     ) -> Result<bool>;
 
     fn next_event(&mut self) -> AttachTerminalEventFuture<'_>;
@@ -207,7 +209,7 @@ trait AttachHost {
         &mut self,
         kitty_keyboard_enabled: bool,
         mouse_capture_enabled: bool,
-        bracketed_paste_enabled: bool,
+        outer_paste_capture_enabled: bool,
     ) -> Result<bool>;
 
     fn next_event(&mut self) -> AttachHostEventFuture<'_>;
@@ -1480,7 +1482,7 @@ impl AttachTerminal for HeadlessAttachTerminal {
         &mut self,
         _kitty_keyboard_enabled: bool,
         _mouse_capture_enabled: bool,
-        _bracketed_paste_enabled: bool,
+        _outer_paste_capture_enabled: bool,
     ) -> Result<bool> {
         Ok(false)
     }
@@ -1588,7 +1590,7 @@ impl AttachTerminal for RealAttachTerminal {
         &mut self,
         kitty_keyboard_enabled: bool,
         mouse_capture_enabled: bool,
-        bracketed_paste_enabled: bool,
+        outer_paste_capture_enabled: bool,
     ) -> Result<bool> {
         #[cfg(feature = "kitty-keyboard")]
         let keyboard_enhanced = kitty_keyboard_enabled;
@@ -1599,7 +1601,7 @@ impl AttachTerminal for RealAttachTerminal {
             .enter(bmux_attach_pipeline::terminal::TerminalOptions {
                 keyboard_enhanced,
                 mouse_capture: mouse_capture_enabled,
-                bracketed_paste: bracketed_paste_enabled,
+                bracketed_paste: outer_paste_capture_enabled,
                 ..bmux_attach_pipeline::terminal::TerminalOptions::default()
             })
             .context("failed to enable raw mode for attach")?;
@@ -3985,7 +3987,6 @@ pub async fn run_native_attach_session_with_terminal<T: AttachTerminal>(
         .apply_snapshot(&snapshot)
         .map_err(|error| anyhow::anyhow!("invalid attach provider snapshot: {error}"))?;
 
-    let keyboard_enhanced = terminal.enter_attach_mode(true, true, true)?;
     let native_config = match load_attach_config() {
         Ok(config) => config,
         Err(error) => {
@@ -3995,6 +3996,11 @@ pub async fn run_native_attach_session_with_terminal<T: AttachTerminal>(
             BmuxConfig::default()
         }
     };
+    let keyboard_enhanced = terminal.enter_attach_mode(
+        native_config.behavior.kitty_keyboard,
+        true,
+        outer_paste_capture_enabled(native_config.behavior.bracketed_paste),
+    )?;
     let mut input_processor =
         InputProcessor::new(attach_keymap_from_config(&native_config), keyboard_enhanced);
     let mut scene = snapshot.scene.clone();
@@ -4946,8 +4952,8 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
     terminal.set_attached_session_id(view_state.attached_id);
     view_state.self_client_id = Some(self_client_id);
     view_state.mouse.config = attach_config.attach_mouse_config();
-    view_state.bracketed_paste_enabled =
-        bracketed_paste_enabled(attach_config.behavior.bracketed_paste);
+    view_state.outer_paste_capture_enabled =
+        outer_paste_capture_enabled(attach_config.behavior.bracketed_paste);
     // Register the generic attach-layout state channel so any plugin
     // subscribing via `EventBus::subscribe_state::<AttachLayoutSnapshot>`
     // sees a valid initial payload. Subsequent layout refreshes update
@@ -5061,7 +5067,7 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
     let keyboard_enhanced = terminal.enter_attach_mode(
         attach_config.behavior.kitty_keyboard,
         attach_config.attach_mouse_config().enabled,
-        view_state.bracketed_paste_enabled,
+        view_state.outer_paste_capture_enabled,
     )?;
     let mut attach_input_processor = InputProcessor::new(attach_keymap.clone(), keyboard_enhanced);
     let async_service_slots = std::sync::Arc::new(tokio::sync::Semaphore::new(16));
@@ -5297,9 +5303,10 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
                 let result = match result {
                     AttachHostEvent::Terminal(event) => event,
                     AttachHostEvent::Native(NativeAttachEvent::PasteFromClipboard) => {
-                        let text = native_clipboard_request(NativeClipboardRequest::ReadText)
-                            .context("native clipboard is unavailable")??.context("native clipboard returned no text")?;
-                        Event::Paste(text)
+                        let Some(event) = native_clipboard_paste(&mut view_state) else {
+                            break 'host_input;
+                        };
+                        event
                     }
                     AttachHostEvent::Native(NativeAttachEvent::RetryPresentation { viewport_generation }) => {
                         request_native_presentation_retry(&mut view_state, terminal.viewport_generation(), viewport_generation);
@@ -11684,12 +11691,12 @@ pub fn describe_timeout(timeout: &ResolvedTimeout) -> String {
 fn queue_attach_input_modes<W: Write>(
     writer: &mut W,
     mouse_capture_enabled: bool,
-    bracketed_paste_enabled: bool,
+    outer_paste_capture_enabled: bool,
 ) -> io::Result<()> {
     if mouse_capture_enabled {
         queue!(writer, EnableMouseCapture)?;
     }
-    if bracketed_paste_enabled {
+    if outer_paste_capture_enabled {
         queue!(writer, EnableBracketedPaste)?;
     }
     Ok(())
@@ -11699,12 +11706,12 @@ fn queue_attach_input_modes<W: Write>(
 fn queue_active_attach_input_mode_restore<W: Write>(
     writer: &mut W,
     mouse_capture_enabled: bool,
-    bracketed_paste_enabled: bool,
+    outer_paste_capture_enabled: bool,
 ) -> io::Result<()> {
     if mouse_capture_enabled {
         queue!(writer, DisableMouseCapture)?;
     }
-    if bracketed_paste_enabled {
+    if outer_paste_capture_enabled {
         queue!(writer, DisableBracketedPaste)?;
     }
     Ok(())
@@ -13523,8 +13530,17 @@ pub async fn handle_attach_terminal_event(
         }
     }
 
-    if let Some(TerminalInputEvent::Paste(text)) = &normalized_event
-        && try_handle_plugin_surface_paste(view_state, text)
+    let paste_text = match &normalized_event {
+        Some(TerminalInputEvent::Paste(text)) => Some(text),
+        _ => match &raw_event {
+            Event::Paste(text) => Some(text),
+            _ => None,
+        },
+    };
+    if let Some(text) = paste_text
+        && (view_state.help_overlay_open
+            || try_handle_plugin_surface_paste(view_state, text)
+            || view_state.retained_compositor.has_modal_scope())
     {
         return Ok(AttachLoopControl::Continue);
     }
@@ -13580,15 +13596,9 @@ pub async fn handle_attach_terminal_event(
                 return try_detach_or_continue_at(client, view_state, now).await;
             }
             AttachEventAction::Paste(text) => {
-                if view_state.help_overlay_open
-                    || view_state.prompt.is_active()
-                    || !view_state.bracketed_paste_enabled
-                    || !view_state.can_write
-                {
+                let Some(bytes) = pane_paste_bytes(view_state, &text) else {
                     continue;
-                }
-                let mode = focused_attach_pane_input_mode(view_state);
-                let bytes = encode_bracketed_paste(&text, mode.bracketed_paste);
+                };
                 if let Err(error) = send_attach_bytes_to_focused(client, view_state, bytes).await {
                     return Err(map_attach_client_error(error));
                 }
@@ -15992,6 +16002,40 @@ pub fn attach_pane_input_mode(
     }
 }
 
+// Clipboard failures are local input failures, not attach/session failures. Never
+// expose backend error strings: a host callback may include clipboard contents.
+fn native_clipboard_paste(view: &mut AttachViewState) -> Option<Event> {
+    match native_clipboard_request(NativeClipboardRequest::ReadText) {
+        Some(Ok(Some(text))) => Some(Event::Paste(text)),
+        Some(Ok(None)) => None,
+        None | Some(Err(_)) => {
+            view.set_transient_status(
+                "Clipboard paste unavailable".to_owned(),
+                Instant::now(),
+                ATTACH_TRANSIENT_STATUS_TTL,
+            );
+            None
+        }
+    }
+}
+
+// Only routing/authority can prevent semantic paste delivery. Outer capture is
+// irrelevant once text has arrived; execution-local mode controls its encoding.
+pub(super) fn pane_paste_bytes(view: &AttachViewState, text: &str) -> Option<Vec<u8>> {
+    if !view.can_write
+        || view.help_overlay_open
+        || view.prompt.is_active()
+        || view.retained_compositor.has_modal_scope()
+        || focused_attach_pane_id(view).is_none()
+    {
+        return None;
+    }
+    Some(encode_bracketed_paste(
+        text,
+        focused_attach_pane_input_mode(view).bracketed_paste,
+    ))
+}
+
 #[must_use]
 pub fn encode_bracketed_paste(text: &str, pane_mode_enabled: bool) -> Vec<u8> {
     if !pane_mode_enabled {
@@ -17288,7 +17332,6 @@ mod native_retry_tests;
 
 #[cfg(test)]
 mod tests {
-    use bmux_plugin_sdk::TypedServiceEndpoint;
 
     #[test]
     fn native_background_route_retains_connection_contract_mode_in_clones() {
@@ -17373,6 +17416,31 @@ mod tests {
                 .unwrap()
                 .is_err()
         );
+    }
+
+    #[test]
+    fn native_clipboard_paste_failure_is_recoverable_and_redacted() {
+        let mut view = attach_view_state_with_scrollback_fixture();
+        let callback: NativeClipboardCallback = Arc::new(Mutex::new(Box::new(|_| {
+            Err(anyhow::anyhow!("secret clipboard backend content"))
+        })));
+        let _scope =
+            NativeClipboardScope(NATIVE_CLIPBOARD.with(|slot| slot.replace(Some(callback))));
+        assert!(native_clipboard_paste(&mut view).is_none());
+        assert_eq!(
+            view.transient_status.as_deref(),
+            Some("Clipboard paste unavailable")
+        );
+        let callback: NativeClipboardCallback =
+            Arc::new(Mutex::new(Box::new(|_| Ok(Some("recovered\n世界".into())))));
+        NATIVE_CLIPBOARD.with(|slot| *slot.borrow_mut() = Some(callback));
+        assert_eq!(
+            native_clipboard_paste(&mut view),
+            Some(Event::Paste("recovered\n世界".into()))
+        );
+        let callback: NativeClipboardCallback = Arc::new(Mutex::new(Box::new(|_| Ok(None))));
+        NATIVE_CLIPBOARD.with(|slot| *slot.borrow_mut() = Some(callback));
+        assert!(native_clipboard_paste(&mut view).is_none());
     }
 
     #[tokio::test]
@@ -17670,6 +17738,7 @@ mod tests {
 
     #[cfg(feature = "bundled-plugin-tab-bar")]
     fn assert_checked_switch_tab_request(request: bmux_ipc::Request) {
+        use bmux_plugin_sdk::TypedServiceEndpoint;
         use bmux_tabs_plugin_api::tabs_commands::client::{SwitchTabEndpoint, SwitchTabRequest};
         let bmux_ipc::Request::InvokeService {
             capability,
@@ -19580,9 +19649,9 @@ mod tests {
 
     #[test]
     fn bracketed_paste_capability_follows_build_feature_and_config() {
-        assert!(!bracketed_paste_enabled(false));
+        assert!(!outer_paste_capture_enabled(false));
         assert_eq!(
-            bracketed_paste_enabled(true),
+            outer_paste_capture_enabled(true),
             cfg!(feature = "bracketed-paste")
         );
     }

@@ -5,10 +5,9 @@ use super::prompt_ui::AttachInternalPromptAction;
 use super::prompt_ui::PromptKeyDisposition;
 use super::runtime::{
     AttachPointerContinuation, attach_key_event_actions, attach_mouse_forward_bytes_for_target,
-    build_attach_help_lines, continue_attach_builtin_pointer_owner, encode_bracketed_paste,
-    focused_attach_pane_input_mode, handle_attach_ui_action_at, handle_help_overlay_key_event,
-    maybe_begin_attach_mouse_selection_drag, reduce_attach_mouse_floating_drag_event,
-    reduce_attach_mouse_resize_event,
+    build_attach_help_lines, continue_attach_builtin_pointer_owner, handle_attach_ui_action_at,
+    handle_help_overlay_key_event, maybe_begin_attach_mouse_selection_drag,
+    reduce_attach_mouse_floating_drag_event, reduce_attach_mouse_resize_event,
 };
 use super::state::{AttachPointerOwner, AttachUiEffect, AttachViewState, PaneRenderBuffer};
 use crate::input::{InputProcessor, RuntimeAction};
@@ -215,8 +214,8 @@ impl AttachSimHarness {
     }
 
     #[cfg(test)]
-    pub const fn set_bracketed_paste_enabled(&mut self, enabled: bool) {
-        self.view_state.bracketed_paste_enabled = enabled;
+    pub const fn set_outer_paste_capture_enabled(&mut self, enabled: bool) {
+        self.view_state.outer_paste_capture_enabled = enabled;
     }
 
     #[cfg(test)]
@@ -237,16 +236,10 @@ impl AttachSimHarness {
 
     #[cfg(test)]
     pub fn send_paste(&mut self, text: &str) -> bool {
-        if !self.view_state.bracketed_paste_enabled
-            || !self.view_state.can_write
-            || self.view_state.help_overlay_open
-            || self.view_state.prompt.is_active()
-        {
+        let Some(bytes) = super::runtime::pane_paste_bytes(&self.view_state, text) else {
             return false;
-        }
-        let mode = focused_attach_pane_input_mode(&self.view_state);
-        self.forwarded_bytes
-            .push(encode_bracketed_paste(text, mode.bracketed_paste));
+        };
+        self.forwarded_bytes.push(bytes);
         true
     }
 
@@ -645,9 +638,9 @@ impl AttachSimHarness {
             }
             super::state::AttachEventAction::Paste(text) => {
                 emitted.push("paste".to_string());
-                let mode = focused_attach_pane_input_mode(&self.view_state);
-                self.forwarded_bytes
-                    .push(encode_bracketed_paste(&text, mode.bracketed_paste));
+                if let Some(bytes) = super::runtime::pane_paste_bytes(&self.view_state, &text) {
+                    self.forwarded_bytes.push(bytes);
+                }
             }
             super::state::AttachEventAction::Ignore => {
                 emitted.push("ignore".to_string());
@@ -865,7 +858,7 @@ mod tests {
     fn attach_sim_active_prompt_consumes_paste_and_marks_redraw() {
         let mut sim = AttachSimHarness::new(100, 24);
         sim.seed_vertical_split_panes();
-        sim.set_bracketed_paste_enabled(true);
+        sim.set_outer_paste_capture_enabled(true);
         sim.open_text_prompt();
 
         assert!(matches!(
@@ -881,7 +874,7 @@ mod tests {
     fn attach_sim_routes_paste_by_focused_pane_mode_and_transitions() {
         let mut sim = AttachSimHarness::new(100, 24);
         sim.seed_vertical_split_panes();
-        sim.set_bracketed_paste_enabled(true);
+        sim.set_outer_paste_capture_enabled(true);
         let layout = sim
             .view_state
             .cached_layout_state
@@ -912,10 +905,10 @@ mod tests {
     fn attach_sim_paste_respects_capability_permissions_and_overlays() {
         let mut sim = AttachSimHarness::new(100, 24);
         sim.seed_vertical_split_panes();
-        sim.set_bracketed_paste_enabled(false);
-        assert!(!sim.send_paste("disabled"));
+        sim.set_outer_paste_capture_enabled(false);
+        assert!(sim.send_paste("capture-disabled"));
 
-        sim.set_bracketed_paste_enabled(true);
+        sim.set_outer_paste_capture_enabled(true);
         sim.set_can_write(false);
         assert!(!sim.send_paste("read-only"));
 
@@ -923,14 +916,45 @@ mod tests {
         assert!(sim.send_paste("writable-again"));
         sim.open_help_overlay();
         assert!(!sim.send_paste("overlay"));
-        assert_eq!(sim.forwarded_mouse_bytes(), &[b"writable-again".to_vec()]);
+        assert_eq!(
+            sim.forwarded_mouse_bytes(),
+            &[b"capture-disabled".to_vec(), b"writable-again".to_vec()]
+        );
+    }
+
+    #[test]
+    fn semantic_paste_delivery_is_independent_of_outer_capture() {
+        let text = "one\ntwo\r\n世界\0\u{3}";
+        for configured in [false, true] {
+            for requested in [false, true] {
+                let mut sim = AttachSimHarness::new(100, 24);
+                sim.seed_vertical_split_panes();
+                sim.set_outer_paste_capture_enabled(
+                    super::super::runtime::outer_paste_capture_enabled(configured),
+                );
+                let AttachFocusTarget::Pane { pane_id: pane } = sim
+                    .view_state
+                    .cached_layout_state
+                    .as_ref()
+                    .unwrap()
+                    .scene
+                    .focus
+                else {
+                    panic!("expected pane focus");
+                };
+                sim.set_pane_bracketed_paste(pane, requested);
+                assert!(sim.send_paste(text));
+                let expected = super::super::runtime::encode_bracketed_paste(text, requested);
+                assert_eq!(sim.forwarded_mouse_bytes(), &[expected]);
+            }
+        }
     }
 
     #[test]
     fn attach_sim_paste_payload_is_opaque_for_edge_cases() {
         let mut sim = AttachSimHarness::new(100, 24);
         sim.seed_vertical_split_panes();
-        sim.set_bracketed_paste_enabled(true);
+        sim.set_outer_paste_capture_enabled(true);
         let pane = match sim
             .view_state
             .cached_layout_state

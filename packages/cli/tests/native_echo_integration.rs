@@ -352,6 +352,7 @@ async fn echo_controller(
     committed: tokio::sync::oneshot::Receiver<()>,
     samples: usize,
     warmup: usize,
+    paste: bool,
 ) -> Result<Vec<u64>> {
     tokio::time::timeout(DEADLINE, committed)
         .await
@@ -370,13 +371,17 @@ async fn echo_controller(
             text: format!("ACK:{:06}:{token}", index + 1),
             admitted: Instant::now(),
         });
-        // Real native character and Enter events; never paste/IME/direct PTY input.
-        handle
-            .try_send(key(LogicalKey::Character(token.clone()), Some(token)))
-            .with_context(|| format!("stage=character-admission sequence={}", index + 1))?;
-        handle
-            .try_send(key(LogicalKey::Named(NamedKey::Enter), None))
-            .with_context(|| format!("stage=enter-admission sequence={}", index + 1))?;
+        if paste {
+            handle.try_send(NativeAttachEvent::PasteFromClipboard)?;
+        } else {
+            // Real native character and Enter events, not direct PTY input.
+            handle
+                .try_send(key(LogicalKey::Character(token.clone()), Some(token)))
+                .with_context(|| format!("stage=character-admission sequence={}", index + 1))?;
+            handle
+                .try_send(key(LogicalKey::Named(NamedKey::Enter), None))
+                .with_context(|| format!("stage=enter-admission sequence={}", index + 1))?;
+        }
         let (_, elapsed) = tokio::time::timeout(DEADLINE, accepted.recv())
             .await
             .with_context(|| format!("stage=ack-retained-output timeout sequence={}", index + 1))?
@@ -388,7 +393,12 @@ async fn echo_controller(
     Ok(timings)
 }
 
-async fn exercise(samples: usize, warmup: usize, resize_at_startup: bool) -> Result<Vec<u64>> {
+async fn exercise(
+    samples: usize,
+    warmup: usize,
+    resize_at_startup: bool,
+    paste: bool,
+) -> Result<Vec<u64>> {
     ensure!(
         samples > 0 && samples + warmup < 128,
         "workload sample budget exceeded",
@@ -406,6 +416,7 @@ async fn exercise(samples: usize, warmup: usize, resize_at_startup: bool) -> Res
         samples,
         warmup,
         resize_at_startup,
+        paste,
     )
     .await;
     // Always observe real stop/exit even when the ready/ACK controller failed.
@@ -455,12 +466,16 @@ async fn exercise_attached(
     samples: usize,
     warmup: usize,
     resize_at_startup: bool,
+    paste: bool,
 ) -> Result<Vec<u64>> {
     let paths = daemon.paths();
-    let config = BmuxConfig::load_isolated_with_paths_and_overrides(
+    let mut config = BmuxConfig::load_isolated_with_paths_and_overrides(
         &paths,
         &ConfigLoadOverrides::default(),
     )?;
+    if paste {
+        config.behavior.bracketed_paste = false;
+    }
     let until = Instant::now() + Duration::from_secs(30);
     let mut client = loop {
         ensure!(
@@ -529,6 +544,15 @@ async fn exercise_attached(
             })?;
         }
     }
+    if paste {
+        host.set_clipboard(|request| {
+            ensure!(
+                matches!(request, bmux_cli::attach::NativeClipboardRequest::ReadText),
+                "unexpected clipboard write"
+            );
+            Ok(Some("a\n".into()))
+        });
+    }
     host.set_config_paths(paths.clone());
     let reload_paths = paths.clone();
     host.set_config_loader(move || {
@@ -551,6 +575,7 @@ async fn exercise_attached(
             committed_rx,
             samples,
             warmup,
+            paste,
         )
         .await;
         // Even a missing ACK must request detach before surfacing the failure.
@@ -593,7 +618,7 @@ fn run(samples: usize, warmup: usize) -> Result<Vec<u64>> {
         .worker_threads(2)
         .enable_all()
         .build()?
-        .block_on(exercise(samples, warmup, false))
+        .block_on(exercise(samples, warmup, false, false))
 }
 
 #[test]
@@ -617,8 +642,20 @@ fn startup_resize_catches_up_before_native_key_echo() -> Result<()> {
         .worker_threads(2)
         .enable_all()
         .build()?
-        .block_on(exercise(2, 0, true))?;
+        .block_on(exercise(2, 0, true, false))?;
     ensure!(samples.len() == 2, "missing resized echo samples");
+    Ok(())
+}
+
+#[test]
+fn native_clipboard_paste_reaches_pty_without_outer_capture() -> Result<()> {
+    let _guard = NATIVE_RUNTIME.lock().unwrap();
+    let samples = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()?
+        .block_on(exercise(1, 0, false, true))?;
+    ensure!(samples.len() == 1, "missing clipboard paste ACK");
     Ok(())
 }
 

@@ -32,6 +32,8 @@ pub(super) fn executable(pid: u32) -> Result<std::path::PathBuf, String> {
     }
     #[cfg(target_os = "macos")]
     {
+        use std::os::unix::ffi::OsStrExt as _;
+
         let mut bytes = [0_u8; 4096];
         let pid = i32::try_from(pid).map_err(|error| error.to_string())?;
         // SAFETY: the bounded writable buffer is valid for its advertised size.
@@ -43,7 +45,6 @@ pub(super) fn executable(pid: u32) -> Result<std::path::PathBuf, String> {
             .iter()
             .position(|byte| *byte == 0)
             .ok_or("invalid shell executable path")?;
-        use std::os::unix::ffi::OsStrExt as _;
         Ok(std::path::PathBuf::from(std::ffi::OsStr::from_bytes(
             &bytes[..length],
         )))

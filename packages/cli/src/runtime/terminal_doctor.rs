@@ -5,7 +5,7 @@ use std::io::{self, IsTerminal};
 use std::process::Command as ProcessCommand;
 
 use super::attach::runtime::{
-    bracketed_paste_enabled, describe_timeout, effective_attach_keybindings,
+    describe_timeout, effective_attach_keybindings, outer_paste_capture_enabled,
 };
 use super::{
     ProtocolDirection, ProtocolProfile, ProtocolTraceEvent, TerminalProfile,
@@ -63,7 +63,7 @@ pub(super) fn run_terminal_install_terminfo(yes: bool, check_only: bool) -> Resu
 
 pub(super) const fn bracketed_paste_status(config_enabled: bool) -> (&'static str, bool, bool) {
     let available = cfg!(feature = "bracketed-paste");
-    let effective = bracketed_paste_enabled(config_enabled);
+    let effective = outer_paste_capture_enabled(config_enabled);
     let status = if effective {
         "enabled"
     } else if available {
@@ -121,6 +121,9 @@ pub(super) fn run_terminal_doctor(
             "secondary_da_reply": String::from_utf8_lossy(secondary_da_for_profile(protocol_profile)),
             "supported_queries": supported_query_names(),
             "bracketed_paste": {
+                "scope": "outer-terminal capture",
+                "semantic_delivery": true,
+                "destination_mode_encoding": true,
                 "compiled": bracketed_paste_available,
                 "configured": config.behavior.bracketed_paste,
                 "effective": bracketed_paste_effective,
@@ -205,7 +208,7 @@ pub(super) fn run_terminal_doctor(
     }
     println!("supported queries: {}", supported_query_names().join(", "));
     println!(
-        "bracketed paste: {} (compiled: {}, configured: {})",
+        "outer-terminal paste capture: {} (compiled: {}, configured: {})",
         bracketed_paste_status,
         if bracketed_paste_available {
             "yes"
