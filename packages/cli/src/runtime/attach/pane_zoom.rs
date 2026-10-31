@@ -641,7 +641,11 @@ impl PaneZoomProjection {
             std::sync::Arc::new(buffer),
             transform,
             winning_clips,
-        )?;
+        )?
+        .with_content_layout(match self.mode {
+            GridMode::Main => bmux_tui::grid_fragment::GridContentLayout::Flow,
+            GridMode::Alternate => bmux_tui::grid_fragment::GridContentLayout::Positioned,
+        });
         if let Some((position, cursor)) = self.cursor.filter(|_| cursor_owner) {
             // A full-line insertion edge is drawn in its last cell, matching
             // the terminal's pending-wrap cursor. Keep the exact insertion

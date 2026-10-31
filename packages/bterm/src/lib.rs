@@ -11,6 +11,7 @@ mod desktop;
 pub mod headless;
 mod managed_storage;
 pub mod pane_zoom;
+mod positioned_zoom_sizing;
 mod reconciliation;
 pub mod runtime_launch;
 pub mod runtime_paths;

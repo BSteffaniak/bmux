@@ -231,6 +231,11 @@ pub trait AttachWorker: 'static {
         viewport: PresentationViewport,
         cell: [f32; 2],
     );
+    fn presented_output(
+        &mut self,
+        _delivery: &bmux_frontend_runtime::presentation::PreparedDelivery,
+    ) {
+    }
     fn invalidate_presentation(&mut self);
     fn accessibility(
         &mut self,
@@ -683,6 +688,7 @@ impl<W: AttachWorker> Application<W> {
                                 *retained_output = Some(delivery.clone());
                                 let cell = renderer.cell_size();
                                 worker.presented(delivery.identity, viewport, cell);
+                                worker.presented_output(delivery);
                                 // The receipt lets CLI publish its committed target after
                                 // this callback returns. Poll restoration on a later turn.
                                 context.request_redraw_at(std::time::Instant::now() + std::time::Duration::from_millis(16));
@@ -1013,6 +1019,7 @@ pub fn run() -> Result<()> {
             handle: None,
             thread: None,
             result: None,
+            positioned_sizing: Default::default(),
             committed_geometry: None,
             pointer: None,
             drag: None,
@@ -1232,6 +1239,7 @@ struct BmuxWorker {
     result: Option<std::sync::mpsc::Receiver<Result<()>>>,
     pane_zoom:
         Option<crate::pane_zoom::session::PaneZoomSession<bmux_cli::attach::NativeAttachEvent>>,
+    positioned_sizing: crate::positioned_zoom_sizing::PositionedZoomSizing,
     committed_geometry: Option<(PresentationIdentity, PresentationViewport, [f32; 2])>,
     pointer: Option<bmux_frontend_runtime::input::PhysicalPoint>,
     drag: Option<bmux_frontend_runtime::input::PointerButton>,
@@ -1332,6 +1340,11 @@ impl AttachWorker for BmuxWorker {
         let (Some(session), Some(handle)) = (&mut self.pane_zoom, &self.handle) else {
             return Ok(false);
         };
+        let sizing_pending = self.positioned_sizing.tick(
+            now,
+            |point| handle.pane_zoom_target(Some(point)),
+            |target| handle.try_set_pane_zoom(target, target.scale_millis),
+        );
         if let Some(namespace) = &self.view_binding {
             if let Some(target) = handle.pane_zoom_target(None)
                 && self
@@ -1439,7 +1452,7 @@ impl AttachWorker for BmuxWorker {
             // final sample. Retain local intent and retry on the next wake.
             eprintln!("bterm: pane zoom publication deferred: {error}");
         }
-        Ok(session.needs_tick(now) || session.save_pending())
+        Ok(sizing_pending || session.needs_tick(now) || session.save_pending())
     }
 
     fn reconfigure_pane_zoom(
@@ -1732,6 +1745,14 @@ impl AttachWorker for BmuxWorker {
             session.clear();
         }
         self.committed_geometry = Some((identity, viewport, cell));
+    }
+
+    fn presented_output(
+        &mut self,
+        delivery: &bmux_frontend_runtime::presentation::PreparedDelivery,
+    ) {
+        self.positioned_sizing
+            .observe(delivery.identity, &delivery.prepared);
     }
 
     fn invalidate_presentation(&mut self) {
@@ -2039,6 +2060,7 @@ mod tests {
             handle: None,
             thread: None,
             result: None,
+            positioned_sizing: Default::default(),
             committed_geometry: None,
             pointer: None,
             drag: None,

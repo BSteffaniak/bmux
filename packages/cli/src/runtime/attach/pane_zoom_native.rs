@@ -719,6 +719,11 @@ pub(super) fn fragments(view: &AttachViewState) -> anyhow::Result<Vec<PreparedGr
                         && !view.retained_compositor.has_modal_scope(),
                 )
                 .ok_or_else(|| anyhow::anyhow!("zoom fragment unsupported"))?
+                .with_viewport({
+                    let rect = surface.content_rect.unwrap_or(surface.rect);
+                    Rect::new(rect.x, rect.y, rect.w, rect.h)
+                })
+                .ok_or_else(|| anyhow::anyhow!("zoom viewport invalid"))?
                 .with_overlays(overlays)
                 .ok_or_else(|| anyhow::anyhow!("zoom overlay admission failed"))?;
             #[cfg(any(

@@ -34,6 +34,12 @@ impl GridTransform {
         self.origin
     }
 
+    /// Exact uniform scale in thousandths, without a floating-point round trip.
+    #[must_use]
+    pub const fn scale_millis(self) -> u16 {
+        self.scale_millis
+    }
+
     #[must_use]
     pub fn scale(self) -> f64 {
         f64::from(self.scale_millis) / 1000.0
@@ -100,6 +106,13 @@ impl PreparedGridOverlay {
     }
 }
 
+/// Source layout behavior; positioned content cannot be reflowed by a consumer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GridContentLayout {
+    Flow,
+    Positioned,
+}
+
 /// A local visual grid with compositor-winning disjoint root clips.
 ///
 /// Opaque higher paint is excluded by clips; transparent paint is carried as original
@@ -111,6 +124,8 @@ pub struct PreparedGridFragment {
     buffer: Arc<Buffer>,
     transform: GridTransform,
     visible_clips: Vec<Rect>,
+    viewport: Option<Rect>,
+    content_layout: GridContentLayout,
     cursor: Option<Cursor>,
     images: Vec<Arc<ImagePlacement>>,
     overlays: Vec<PreparedGridOverlay>,
@@ -143,10 +158,47 @@ impl PreparedGridFragment {
             buffer,
             transform,
             visible_clips,
+            viewport: None,
+            content_layout: GridContentLayout::Positioned,
             cursor: None,
             images: Vec::new(),
             overlays: Vec::new(),
         })
+    }
+
+    #[must_use]
+    pub const fn with_content_layout(mut self, layout: GridContentLayout) -> Self {
+        self.content_layout = layout;
+        self
+    }
+
+    #[must_use]
+    pub const fn content_layout(&self) -> GridContentLayout {
+        self.content_layout
+    }
+
+    /// Allocated root-cell viewport, independent of the current local grid extent.
+    /// This is derived layout geometry, not permission to resize a source.
+    #[must_use]
+    pub fn with_viewport(mut self, viewport: Rect) -> Option<Self> {
+        let origin = self.transform.origin();
+        if viewport.is_empty()
+            || viewport.x != origin.x
+            || viewport.y != origin.y
+            || self
+                .visible_clips
+                .iter()
+                .any(|clip| clip.intersection(viewport) != *clip)
+        {
+            return None;
+        }
+        self.viewport = Some(viewport);
+        Some(self)
+    }
+
+    #[must_use]
+    pub const fn viewport(&self) -> Option<Rect> {
+        self.viewport
     }
 
     /// Cursor is local to this grid and shares its transform and winning clips.

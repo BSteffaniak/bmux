@@ -321,7 +321,13 @@ Zoom does not resize the shared application's PTY or make the application format
 its output for the local width. Alternate-screen applications instead use the
 existing authorized execution-resize path. Native alternate-screen sizing keeps
 its existing last-writer policy: simultaneous views can resize the same
-application; pane zoom does not create exclusive resize ownership.
+application; pane zoom does not create exclusive resize ownership. Bterm also
+reconciles a saved pane scale when displayed content enters the alternate
+screen or its allocation changes, so zooming before launching a full-screen
+application uses the same sizing path as zooming inside it. Reconciliation is
+bounded and stops after convergence; it does not continuously fight another
+attachment's sizing. Rejected or timed-out requests retain zoom intent and emit
+a diagnostic rather than replaying unacknowledged resizes.
 
 For deliberate restoration, `bterm --view-binding work-left` names a local
 preference namespace. Restoration still requires a matching currently committed

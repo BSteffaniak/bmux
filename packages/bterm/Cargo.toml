@@ -25,6 +25,7 @@ bmux_ipc = { workspace = true }
 bmux_pane_runtime_plugin_api = { workspace = true }
 bmux_plugin_sdk = { workspace = true }
 bmux_terminal_protocol = { workspace = true }
+bmux_tui = { workspace = true }
 bterm_native_platform = { workspace = true }
 bterm_native_renderer = { workspace = true }
 clap = { workspace = true, features = [
@@ -44,9 +45,9 @@ tokio = { workspace = true, features = [
     "macros",
 ] }
 toml = { workspace = true }
+uuid = { workspace = true }
 
 [dev-dependencies]
-bmux_tui = { workspace = true }
 tempfile = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]

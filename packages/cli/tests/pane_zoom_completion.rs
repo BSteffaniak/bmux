@@ -5,6 +5,11 @@
 #[allow(dead_code)] // Shared process/path fixture supports other integration targets too.
 mod support;
 
+// Exercise the actual Bterm caller-owned sizing controller over a real owned
+// daemon, without introducing a production CLI dependency on Bterm.
+#[path = "../../bterm/src/positioned_zoom_sizing.rs"]
+mod positioned_zoom_sizing;
+
 use std::{
     os::unix::fs::PermissionsExt as _,
     process::{Child, Command, Stdio},
@@ -46,7 +51,7 @@ impl OwnedDaemon {
         // and graphemes enter the actual terminal parser, not a reconstructed grid.
         std::fs::write(
             &shell,
-            "#!/bin/sh\nstty -echo\nprintf 'ZOOM_SOURCE é界👩‍💻 abcdefghijklmnopqrstuvwxyz0123456789\\r\\n'\nwhile IFS= read -r line; do [ \"$line\" = quit ] && exit 0; if [ \"$line\" = history ]; then n=0; while [ \"$n\" -lt 80 ]; do printf 'HISTORY_%03d é界👩‍💻 abcdefghijklmnopqrstuvwxyz0123456789\\r\\n' \"$n\"; n=$((n+1)); done; fi; done\n",
+            "#!/bin/sh\nstty -echo\nprintf 'ZOOM_SOURCE é界👩‍💻 abcdefghijklmnopqrstuvwxyz0123456789\\r\\n'\nwhile IFS= read -r line; do [ \"$line\" = quit ] && exit 0; if [ \"$line\" = history ]; then n=0; while [ \"$n\" -lt 80 ]; do printf 'HISTORY_%03d é界👩‍💻 abcdefghijklmnopqrstuvwxyz0123456789\\r\\n' \"$n\"; n=$((n+1)); done; fi; if [ \"$line\" = alternate ]; then printf '\\033[?1049h\\033[H'; fi; if [ \"$line\" = normal ]; then printf '\\033[?1049l'; fi; if [ \"$line\" = size ]; then printf 'PTY_SIZE '; stty size; fi; done\n",
         )?;
         std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o700))?;
         env.write_config(&format!(
@@ -433,6 +438,161 @@ async fn captured_history_keyboard_zoom(
     Ok(())
 }
 
+async fn type_command(handle: &NativeAttachHandle, command: &str) -> Result<()> {
+    for character in command.chars() {
+        handle.try_send(native_key(
+            LogicalKey::Character(character.to_string()),
+            Modifiers::default(),
+            Some(character.to_string()),
+        ))?;
+    }
+    handle.try_send(native_key(
+        LogicalKey::Named(NamedKey::Enter),
+        Modifiers::default(),
+        None,
+    ))?;
+    Ok(())
+}
+
+async fn set_scale(handle: &NativeAttachHandle, scale: u16) -> Result<()> {
+    let until = Instant::now() + LIMIT;
+    loop {
+        if let Some(target) = handle.pane_zoom_target(None) {
+            if target.scale_millis == scale {
+                return Ok(());
+            }
+            let receipt = handle.try_set_pane_zoom(target, scale)?;
+            while receipt.status() == NativePaneZoomRequestStatus::Pending {
+                ensure!(Instant::now() < until, "scale request settlement timeout");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+        ensure!(Instant::now() < until, "scale convergence timeout: {scale}");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+async fn positioned_transition_sizing(
+    handle: &NativeAttachHandle,
+    sink: &Mutex<Sink>,
+) -> Result<()> {
+    use bmux_tui::grid_fragment::GridContentLayout;
+    let mut sizing = positioned_zoom_sizing::PositionedZoomSizing::default();
+    target(handle, None, 1750).await?;
+    set_scale(handle, 750).await?;
+    for _ in 0..2 {
+        type_command(handle, "alternate").await?;
+        let until = Instant::now() + LIMIT;
+        let mut sent = false;
+        loop {
+            let output = sink
+                .lock()
+                .unwrap()
+                .committed
+                .clone()
+                .context("committed output")?;
+            let positioned = output
+                .prepared
+                .grid_fragments()
+                .iter()
+                .find(|fragment| fragment.content_layout() == GridContentLayout::Positioned);
+            sizing.observe(output.identity, &output.prepared);
+            sizing.tick(
+                Instant::now(),
+                |point| handle.pane_zoom_target(Some(point)),
+                |target| {
+                    sent = true;
+                    handle.try_set_pane_zoom(target, target.scale_millis)
+                },
+            );
+            if let Some(fragment) = positioned {
+                let viewport = fragment.viewport().context("allocated viewport")?;
+                let expected = [
+                    u32::from(viewport.width) * 1000 / 750,
+                    u32::from(viewport.height) * 1000 / 750,
+                ];
+                if expected
+                    == [
+                        u32::from(fragment.buffer().area().width),
+                        u32::from(fragment.buffer().area().height),
+                    ]
+                {
+                    break;
+                }
+            }
+            ensure!(
+                Instant::now() < until,
+                "zoom-before-launch positioned geometry did not converge"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        ensure!(sent, "transition did not exercise authorized resize");
+        type_command(handle, "size").await?;
+        let until = Instant::now() + LIMIT;
+        loop {
+            let output = sink
+                .lock()
+                .unwrap()
+                .committed
+                .clone()
+                .context("committed output")?;
+            sizing.observe(output.identity, &output.prepared);
+            let mut repeated = false;
+            sizing.tick(
+                Instant::now(),
+                |point| handle.pane_zoom_target(Some(point)),
+                |_| {
+                    repeated = true;
+                    anyhow::bail!("settled sizing repeated")
+                },
+            );
+            ensure!(!repeated, "settled sizing repeated");
+            let confirmed = output.prepared.grid_fragments().iter().any(|fragment| {
+                let buffer = fragment.buffer();
+                (0..buffer.area().height).any(|row| {
+                    buffer.row_symbols(row).is_some_and(|text| {
+                        text.contains(&format!(
+                            "PTY_SIZE {} {}",
+                            buffer.area().height,
+                            buffer.area().width
+                        ))
+                    })
+                })
+            });
+            if confirmed {
+                break;
+            }
+            ensure!(Instant::now() < until, "PTY size probe absent");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        set_scale(handle, 1000).await?;
+        type_command(handle, "normal").await?;
+        let until = Instant::now() + LIMIT;
+        loop {
+            let output = sink
+                .lock()
+                .unwrap()
+                .committed
+                .clone()
+                .context("committed output")?;
+            sizing.observe(output.identity, &output.prepared);
+            if output
+                .prepared
+                .grid_fragments()
+                .iter()
+                .any(|fragment| fragment.content_layout() == GridContentLayout::Flow)
+            {
+                break;
+            }
+            ensure!(Instant::now() < until, "alternate exit timeout");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        set_scale(handle, 750).await?;
+    }
+    set_scale(handle, 1750).await?;
+    Ok(())
+}
+
 async fn exercise() -> Result<()> {
     let daemon = OwnedDaemon::start()?;
     let paths = daemon.paths();
@@ -604,6 +764,7 @@ async fn exercise() -> Result<()> {
                 canonical(&mut control, session, second).await? == before_second,
                 "retry changed second source"
             );
+            positioned_transition_sizing(&a, &sink_a).await?;
             captured_history_keyboard_zoom(&a, &b, &sink_a).await?;
             Ok(())
         }
