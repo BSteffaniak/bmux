@@ -14,6 +14,15 @@ fn fixture() -> (tempfile::TempDir, PathBuf, PathBuf, String) {
 }
 
 #[test]
+fn malformed_digest_cannot_select_a_path() {
+    let (_root, source, cache, _) = fixture();
+    for digest in ["../escape", "", &"z".repeat(64)] {
+        assert!(retain(&source, &cache, "owner", digest).is_err());
+    }
+    assert!(!cache.exists());
+}
+
+#[test]
 fn retained_image_launches_and_reexecutes_after_source_replacement_and_removal() {
     let (_root, source, cache, hash) = fixture();
     let image = retain(&source, &cache, "owner", &hash).unwrap();

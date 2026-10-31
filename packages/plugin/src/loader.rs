@@ -1,5 +1,6 @@
 #[path = "auxiliary.rs"]
 mod auxiliary;
+pub use auxiliary::{executable_sha256, retain_executable};
 
 use crate::{
     CapabilityProvider, DEFAULT_NATIVE_ACTIVATE_SYMBOL, DEFAULT_NATIVE_COMMAND_SYMBOL,

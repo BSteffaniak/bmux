@@ -8,6 +8,8 @@ use std::path::Path;
 #[path = "auxiliary/retained.rs"]
 mod retained;
 
+pub use retained::retain as retain_executable;
+
 use crate::manifest::{AuxiliaryExecutableDeclaration, safe_auxiliary_name};
 
 /// Resolve only the declared package, then pin its verified bytes for this runtime.
@@ -64,7 +66,36 @@ pub(super) fn resolve(
         .platform_filename(platform)
         .ok_or("auxiliary executable is unavailable on this platform")?;
     let path = base.join(&filename);
-    let (mut file, opened) = open_auxiliary_artifact(&path)?;
+    let (file, artifact_sha256) = executable_identity(&path)?;
+    validate_inventory(
+        &base,
+        declaration,
+        &filename,
+        owner,
+        &artifact_sha256,
+        file.metadata().map_err(|error| error.to_string())?.len(),
+    )?;
+    Ok(ResolvedAuxiliaryExecutable {
+        path: path
+            .to_str()
+            .ok_or("auxiliary executable path is not UTF-8")?
+            .into(),
+        protocol_version: declaration.protocol_version,
+        artifact_sha256,
+    })
+}
+
+/// Hash an exact executable while checking for replacement and modification.
+///
+/// # Errors
+/// Rejects noncanonical paths, non-executable or non-regular files, and changes
+/// observed while reading. The returned digest identifies bytes, not trust.
+pub fn executable_sha256(path: &Path) -> Result<String, String> {
+    executable_identity(path).map(|(_, digest)| digest)
+}
+
+fn executable_identity(path: &Path) -> Result<(File, String), String> {
+    let (mut file, opened) = open_auxiliary_artifact(path)?;
     #[cfg(windows)]
     let identity = windows_file_identity(&file)?;
     let mut hash = Sha256::new();
@@ -85,7 +116,7 @@ pub(super) fn resolve(
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        let current = std::fs::symlink_metadata(&path).map_err(|error| error.to_string())?;
+        let current = std::fs::symlink_metadata(path).map_err(|error| error.to_string())?;
         if current.dev() != opened.dev()
             || current.ino() != opened.ino()
             || after.ctime() != opened.ctime()
@@ -110,22 +141,7 @@ pub(super) fn resolve(
         use std::fmt::Write as _;
         write!(&mut artifact_sha256, "{byte:02x}").map_err(|error| error.to_string())?;
     }
-    validate_inventory(
-        &base,
-        declaration,
-        &filename,
-        owner,
-        &artifact_sha256,
-        opened.len(),
-    )?;
-    Ok(ResolvedAuxiliaryExecutable {
-        path: path
-            .to_str()
-            .ok_or("auxiliary executable path is not UTF-8")?
-            .into(),
-        protocol_version: declaration.protocol_version,
-        artifact_sha256,
-    })
+    Ok((file, artifact_sha256))
 }
 
 /// Validate the leaf and keep its verified read handle alive through checksum

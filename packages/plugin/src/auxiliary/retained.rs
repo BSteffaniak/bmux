@@ -11,13 +11,17 @@ use std::fs::File;
 use std::io::{Read, Seek};
 use std::path::{Path, PathBuf};
 
-pub(super) fn retain(
-    source: &Path,
-    root: &Path,
-    owner: &str,
-    expected: &str,
-) -> Result<PathBuf, String> {
+/// Atomically retain a verified executable under an owner-scoped digest path.
+/// Existing images are verified and never overwritten; no automatic pruning occurs.
+///
+/// # Errors
+/// Rejects unsafe directories, invalid digests, invalid executable files, and
+/// source bytes that do not match the caller-selected SHA-256 identity.
+pub fn retain(source: &Path, root: &Path, owner: &str, expected: &str) -> Result<PathBuf, String> {
     let result = (|| {
+        if expected.len() != 64 || !expected.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err("invalid executable SHA-256 identity".into());
+        }
         if !root.is_absolute() {
             return Err("auxiliary image root must be absolute".into());
         }
