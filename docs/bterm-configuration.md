@@ -284,9 +284,16 @@ zoom and failed-output authority preservation, but does not exercise a native
 Bterm window. Real-application visual acceptance, native IME/screen-reader
 checks, mixed-DPI validation, and Linux native validation remain outstanding.
 
-Set `scope = "pane"` on a keyboard binding or wheel policy to select pane
-content rather than the whole window. Existing bindings remain window-scoped
-when `scope` is omitted. For example:
+Pane zoom ships with primary-Alt-plus/minus/reset keyboard shortcuts for the
+focused pane and primary-Alt-wheel zoom for the pane under the pointer.
+`primary`
+is Command on macOS and Control elsewhere; Alt is Option on macOS. Whole-window
+primary-plus/minus/reset shortcuts remain unchanged. Plus accepts `=` and `+`,
+including the Shift-`+` variant, for both scopes.
+
+Set `scope = "pane"` on custom keyboard bindings or wheel policy to select pane
+content rather than the whole window. Omitted keyboard binding scopes remain
+window-scoped for compatibility. For example:
 
 ```toml
 [bterm.zoom]
@@ -354,7 +361,10 @@ its release belong to zoom and must not also reach terminal input, even if the
 modifier is released before the key. Focus loss clears held shortcut state.
 Unmatched input retains its ordinary BMUX route.
 
-Wheel zoom requires the configured modifiers and defaults to enabled. One wheel
+Wheel zoom requires primary-Alt by default, targets the hovered pane, and is
+enabled. Primary-only and unmodified scrolling stay on their ordinary routes.
+To restore window wheel zoom, set `wheel.scope = "window"` and
+`wheel.modifiers = ["primary"]`. One wheel
 line equals 40 pixels; normalization clamps each event to 32 lines in either
 direction. The normalized amount times `sensitivity` is a fractional step count.
 Horizontal-only or non-finite vertical deltas do not change scale. Set

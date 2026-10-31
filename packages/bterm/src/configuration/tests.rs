@@ -562,18 +562,30 @@ fn fractional_typography_is_deterministic_and_not_runtime_identity() {
 }
 
 #[test]
-fn zoom_scope_resolution_preserves_legacy_defaults_and_accepts_explicit_pane_scope() {
+fn zoom_scope_resolution_ships_both_scopes_and_accepts_explicit_overrides() {
     use crate::zoom::ZoomScope;
     let legacy = inputs().resolve().unwrap();
-    assert!(
+    assert_eq!(
         legacy
             .native
             .zoom
             .bindings
             .iter()
-            .all(|binding| binding.scope == ZoomScope::Window)
+            .filter(|binding| binding.scope == ZoomScope::Window)
+            .count(),
+        5
     );
-    assert_eq!(legacy.native.zoom.wheel.scope, ZoomScope::Window);
+    assert_eq!(
+        legacy
+            .native
+            .zoom
+            .bindings
+            .iter()
+            .filter(|binding| binding.scope == ZoomScope::Pane)
+            .count(),
+        5
+    );
+    assert_eq!(legacy.native.zoom.wheel.scope, ZoomScope::Pane);
     let mut input = inputs();
     input.bterm = family(
         "/scoped-native.toml",

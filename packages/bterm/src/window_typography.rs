@@ -292,6 +292,7 @@ mod tests {
             modifiers: Modifiers {
                 super_key: cfg!(target_os = "macos"),
                 control: !cfg!(target_os = "macos"),
+                alt: true,
                 ..Modifiers::default()
             },
         };

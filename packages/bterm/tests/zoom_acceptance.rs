@@ -329,19 +329,36 @@ fn window_local_matchers_and_controllers_do_not_share_transient_state() {
 fn wheel_is_fractional_modifier_gated_and_bounded() {
     let mut matcher = ZoomInputMatcher::new(&ZoomConfiguration::default()).unwrap();
     let scroll = |delta, modifiers| InputEvent::Scroll { delta, modifiers };
+    let pane_modifiers = Modifiers {
+        alt: true,
+        ..primary()
+    };
+    let pane_action = |action| {
+        Some(ScopedZoomAction {
+            scope: ZoomScope::Pane,
+            action,
+        })
+    };
     let pixels = ScrollDelta::Pixels { x: 0.0, y: 10.0 };
     assert_eq!(matcher.input(&scroll(pixels, Modifiers::default())), None);
+    assert_eq!(matcher.input(&scroll(pixels, primary())), None);
     assert_eq!(
-        matcher.input(&scroll(pixels, primary())),
-        window_action(ZoomAction::Steps(0.025))
+        matcher.input(&scroll(pixels, pane_modifiers)),
+        pane_action(ZoomAction::Steps(0.025))
     );
     assert_eq!(
-        matcher.input(&scroll(ScrollDelta::Lines { x: 0.0, y: 0.25 }, primary())),
-        window_action(ZoomAction::Steps(0.025))
+        matcher.input(&scroll(
+            ScrollDelta::Lines { x: 0.0, y: 0.25 },
+            pane_modifiers
+        )),
+        pane_action(ZoomAction::Steps(0.025))
     );
     assert_eq!(
-        matcher.input(&scroll(ScrollDelta::Pixels { x: 5.0, y: 0.0 }, primary())),
-        window_action(ZoomAction::Consume)
+        matcher.input(&scroll(
+            ScrollDelta::Pixels { x: 5.0, y: 0.0 },
+            pane_modifiers
+        )),
+        pane_action(ZoomAction::Consume)
     );
     assert_eq!(
         matcher.input(&scroll(
@@ -349,9 +366,9 @@ fn wheel_is_fractional_modifier_gated_and_bounded() {
                 x: 0.0,
                 y: f64::NAN
             },
-            primary()
+            pane_modifiers
         )),
-        window_action(ZoomAction::Consume)
+        pane_action(ZoomAction::Consume)
     );
     assert_eq!(
         matcher.input(&scroll(
@@ -359,14 +376,14 @@ fn wheel_is_fractional_modifier_gated_and_bounded() {
                 x: 0.0,
                 y: f64::MAX
             },
-            primary()
+            pane_modifiers
         )),
-        window_action(ZoomAction::Steps(3.2))
+        pane_action(ZoomAction::Steps(3.2))
     );
     let mut configuration = ZoomConfiguration::default();
     configuration.wheel.enabled = false;
     let mut disabled = ZoomInputMatcher::new(&configuration).unwrap();
-    assert_eq!(disabled.input(&scroll(pixels, primary())), None);
+    assert_eq!(disabled.input(&scroll(pixels, pane_modifiers)), None);
 }
 
 #[test]

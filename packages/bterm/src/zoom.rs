@@ -28,21 +28,35 @@ impl Default for ZoomConfiguration {
             max_scale: 3.0,
             remember: true,
             animation: ZoomAnimationConfiguration::default(),
-            bindings: vec![
-                ZoomBinding::primary("=", ZoomAction::In),
-                ZoomBinding::primary("+", ZoomAction::In),
-                ZoomBinding {
-                    scope: ZoomScope::Window,
-                    key: "+".into(),
-                    modifiers: vec![ZoomModifier::Primary, ZoomModifier::Shift],
-                    action: ZoomAction::In,
-                },
-                ZoomBinding::primary("-", ZoomAction::Out),
-                ZoomBinding::primary("0", ZoomAction::Reset),
-            ],
+            bindings: default_bindings(),
             wheel: ZoomWheelConfiguration::default(),
         }
     }
+}
+
+fn default_bindings() -> Vec<ZoomBinding> {
+    let window = vec![
+        ZoomBinding::primary("=", ZoomAction::In),
+        ZoomBinding::primary("+", ZoomAction::In),
+        ZoomBinding {
+            scope: ZoomScope::Window,
+            key: "+".into(),
+            modifiers: vec![ZoomModifier::Primary, ZoomModifier::Shift],
+            action: ZoomAction::In,
+        },
+        ZoomBinding::primary("-", ZoomAction::Out),
+        ZoomBinding::primary("0", ZoomAction::Reset),
+    ];
+    let pane = window
+        .iter()
+        .cloned()
+        .map(|mut binding| {
+            binding.scope = ZoomScope::Pane;
+            binding.modifiers.push(ZoomModifier::Alt);
+            binding
+        })
+        .collect::<Vec<_>>();
+    window.into_iter().chain(pane).collect()
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
@@ -186,9 +200,9 @@ pub struct ZoomWheelConfiguration {
 impl Default for ZoomWheelConfiguration {
     fn default() -> Self {
         Self {
-            scope: ZoomScope::Window,
+            scope: ZoomScope::Pane,
             enabled: true,
-            modifiers: vec![ZoomModifier::Primary],
+            modifiers: vec![ZoomModifier::Primary, ZoomModifier::Alt],
             sensitivity: 0.1,
         }
     }
@@ -864,15 +878,59 @@ mod tests {
     }
 
     #[test]
+    fn shipped_keyboard_shortcuts_distinguish_window_and_focused_pane() {
+        let policy: ZoomConfiguration = serde_json::from_str("{}").unwrap();
+        policy.validate().unwrap();
+        for (key, shift, action) in [
+            ("=", false, ZoomAction::In),
+            ("+", false, ZoomAction::In),
+            ("+", true, ZoomAction::In),
+            ("-", false, ZoomAction::Out),
+            ("0", false, ZoomAction::Reset),
+        ] {
+            for (alt, scope) in [(false, ZoomScope::Window), (true, ZoomScope::Pane)] {
+                let mut matcher = ZoomInputMatcher::new(&policy).unwrap();
+                let event = |phase| {
+                    InputEvent::Key(KeyEvent {
+                        physical: PhysicalKey::Code(format!("test-{key}")),
+                        logical: LogicalKey::Character(key.into()),
+                        phase,
+                        modifiers: Modifiers {
+                            alt,
+                            shift,
+                            ..primary()
+                        },
+                        text: None,
+                    })
+                };
+                assert_eq!(
+                    matcher.input(&event(KeyPhase::Press)),
+                    Some(ScopedZoomAction { scope, action })
+                );
+                assert_eq!(
+                    matcher.input(&event(KeyPhase::Release)),
+                    Some(ScopedZoomAction {
+                        scope,
+                        action: ZoomAction::Consume
+                    })
+                );
+            }
+        }
+    }
+
+    #[test]
     fn wheel_is_fractional_and_unmodified_wheel_is_not_captured() {
         let mut matcher = ZoomInputMatcher::new(&ZoomConfiguration::default()).unwrap();
         assert_eq!(
             matcher.input(&InputEvent::Scroll {
                 delta: ScrollDelta::Pixels { x: 0.0, y: 20.0 },
-                modifiers: primary()
+                modifiers: Modifiers {
+                    alt: true,
+                    ..primary()
+                }
             }),
             Some(ScopedZoomAction {
-                scope: ZoomScope::Window,
+                scope: ZoomScope::Pane,
                 action: ZoomAction::Steps(0.05)
             })
         );
@@ -944,13 +1002,13 @@ mod tests {
     }
 
     #[test]
-    fn legacy_scopes_default_to_window_and_cross_scope_collisions_are_rejected() {
+    fn omitted_binding_scope_stays_window_and_cross_scope_collisions_are_rejected() {
         let binding: ZoomBinding =
             serde_json::from_str(r#"{"key":"=","modifiers":["primary"],"action":{"action":"in"}}"#)
                 .unwrap();
         assert_eq!(binding.scope, ZoomScope::Window);
         let wheel: ZoomWheelConfiguration = serde_json::from_str("{}").unwrap();
-        assert_eq!(wheel.scope, ZoomScope::Window);
+        assert_eq!(wheel.scope, ZoomScope::Pane);
         let mut policy = ZoomConfiguration::default();
         let mut duplicate = policy.bindings[0].clone();
         duplicate.scope = ZoomScope::Pane;
@@ -967,7 +1025,10 @@ mod tests {
             assert_eq!(
                 matcher.input(&InputEvent::Scroll {
                     delta: ScrollDelta::Pixels { x: 1.0, y },
-                    modifiers: primary(),
+                    modifiers: Modifiers {
+                        alt: true,
+                        ..primary()
+                    },
                 }),
                 Some(ScopedZoomAction {
                     scope: ZoomScope::Pane,

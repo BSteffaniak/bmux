@@ -155,6 +155,7 @@ fn fractional_scoped_actions_preserve_distinct_local_view_state() {
         binding.scope = ZoomScope::Pane;
     }
     policy.wheel.scope = ZoomScope::Pane;
+    policy.wheel.modifiers = vec![bterm::zoom::ZoomModifier::Primary];
     let mut matcher = ZoomInputMatcher::new(&policy).unwrap();
     let mut state = PaneZoomState::new(policy).unwrap();
     let focused = binding("window/one/view-a", "authority/pane-a");
