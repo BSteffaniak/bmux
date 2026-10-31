@@ -11,6 +11,7 @@ pub(crate) mod managed_idle;
 mod managed_scope;
 mod native_process;
 pub(crate) mod reservations;
+mod shell_callback;
 mod startup_capture;
 pub(crate) mod supervisor;
 
@@ -6156,6 +6157,11 @@ impl SessionRuntimeManager {
         padding_config: PanePaddingConfig,
         pane_exit_tx: mpsc::UnboundedSender<PaneExitEvent>,
     ) -> Self {
+        if let Some(root) = &shell_integration_root
+            && let Err(error) = shell_callback::prepare(root)
+        {
+            warn!(%error, "failed retaining shell callback executable");
+        }
         Self {
             runtimes: BTreeMap::new(),
             pane_input_index: Arc::new(RwLock::new(BTreeMap::new())),
@@ -6683,6 +6689,10 @@ impl SessionRuntimeManager {
             .shell_integration_root
             .as_ref()
             .map(|root| root.join(&shell_marker_token));
+        let shell_callback = self
+            .shell_integration_root
+            .as_deref()
+            .map(|root| shell_callback::prepare(root).map_err(|error| error.to_string()));
         let output_buffer_for_reader = Arc::clone(&output_buffer);
         let process_start_identity = Arc::new(std::sync::Mutex::new(None));
         let process_start_identity_for_task = Arc::clone(&process_start_identity);
@@ -6938,6 +6948,7 @@ impl SessionRuntimeManager {
             clear_managed_launch_env(&mut command);
             command.env_remove("APPLICATION_RESURRECTION_HOST");
             command.env_remove("BMUX_ROOT_SHELL_PID");
+            command.env_remove("BMUX_SHELL_CALLBACK");
             command.env_remove("__BMUX_NESTED_PID");
             command.env("BMUX_SHELL_MARKER", &shell_marker_token);
             if let Some(root) = &shell_integration_root {
@@ -6955,8 +6966,13 @@ impl SessionRuntimeManager {
                 ) {
                     warn!(%error, "nested Fish integration unavailable");
                 }
-                if let Ok(executable) = std::env::current_exe() {
-                    command.env("BMUX_SHELL_CALLBACK", executable);
+                match &shell_callback {
+                    Some(Ok(executable)) => command.env("BMUX_SHELL_CALLBACK", executable),
+                    Some(Err(error)) => {
+                        fail_startup!(format!("shell callback executable unavailable: {error}"));
+                        return;
+                    }
+                    None => unreachable!("shell integration requires a retained callback"),
                 }
                 let mut dirs = vec![share];
                 dirs.extend(std::env::split_paths(
