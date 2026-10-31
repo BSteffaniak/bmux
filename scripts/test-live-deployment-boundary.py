@@ -163,7 +163,9 @@ class DeploymentBoundaryTests(unittest.TestCase):
             html = (output / 'site/index.html').read_text()
             self.assertTrue((output / 'site/_headers').is_file())
             # The mocked generator emits no hashed assets: no immutable rules.
-            self.assertNotIn('Cache-Control:', (output / 'site/_headers').read_text())
+            headers = (output / 'site/_headers').read_text()
+            self.assertNotIn('immutable', headers.split('\n', 1)[1])
+            self.assertIn('/live\n  Cache-Control: no-store', headers)
             self.assertIn('<title>bmux — Live broadcasts and documentation</title>', html)
             self.assertNotIn('MoosicBox', html)
             self.assertFalse((output / 'relay').exists())

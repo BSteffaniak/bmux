@@ -36,10 +36,12 @@ test('only exact hashed assets are immutable; mutable pointers and HTML are unto
   await generateHeaders(root);
   const headers = await readFile(join(root, '_headers'), 'utf8');
   const urls = headers.split('\n').filter(line => line.startsWith('/'));
-  assert.deepEqual(urls, ['/js/hyperchad-0123456789.min.js',
+  assert.deepEqual(urls, ['/live', '/live.html', '/live-assets/current-version',
+    '/live-assets/*/manifest.json', '/js/hyperchad-0123456789.min.js',
     ...names.map(name => `/live-assets/${hash}/${name}`).sort()]);
   assert.equal(headers.match(/Cache-Control: public, max-age=31536000, immutable/g).length, 6);
-  assert.ok(!headers.includes('*'));
+  assert.equal(headers.match(/Cache-Control: no-store/g).length, 4);
+  assert.ok(!headers.includes('/live-assets/*\n'));
   assert.equal(await readFile(join(root, 'index.html'), 'utf8'), 'mutable');
 });
 

@@ -51,9 +51,11 @@ def response_metadata(response):
     return {'cf_ray': ray if re.fullmatch(r'[a-fA-F0-9]{16,32}-[A-Z]{3}', ray) else None}
 
 
-def smoke(url, component='all', report=None, relay_url='https://live.bmux.dev'):
+def smoke(url, component='all', report=None, relay_url='https://live.bmux.dev', expected_bundle=None):
     opener = urllib.request.build_opener(NoRedirect())
-    opener.addheaders = [('User-Agent', 'bmux-public-smoke/1')]
+    opener.addheaders = [('User-Agent', 'bmux-public-smoke/1'), ('Cache-Control', 'no-cache')]
+    if expected_bundle is not None and not re.fullmatch(r'[a-f0-9]{64}', expected_bundle):
+        raise SmokeFailure('invalid_expected_bundle', '/live')
     def emit(**fields):
         if report:
             report(fields)
@@ -100,6 +102,8 @@ def smoke(url, component='all', report=None, relay_url='https://live.bmux.dev'):
     if len(parser.bases) != 1:
         raise SmokeFailure('missing_or_ambiguous_viewer_assets', '/live')
     base = next(iter(parser.bases))
+    if expected_bundle is not None and base != '/live-assets/' + expected_bundle + '/':
+        raise SmokeFailure('deployment_not_visible', '/live')
     manifest = get_json(base + 'manifest.json', 8192)
     if (manifest.get('schema') != 1 or manifest.get('protocol') != 1 or
             manifest.get('renderer') != 'bmwp-5' or manifest.get('bundle_sha256') != base.split('/')[2]):
@@ -133,7 +137,11 @@ def main():
     parser.add_argument('--url', required=True)
     parser.add_argument('--relay-url', default='https://live.bmux.dev')
     parser.add_argument('--component', choices=('all', 'site', 'backend'), default='all')
+    parser.add_argument('--expected-bundle', help='Exact uploaded bundle SHA-256')
+    parser.add_argument('--attempts', type=int, default=1)
     args = parser.parse_args()
+    if not 1 <= args.attempts <= 12:
+        parser.error('Use 1 through 12 attempts')
     for origin in (args.url, args.relay_url):
         parsed = urlsplit(origin)
         if (parsed.scheme != 'https' and not (parsed.scheme == 'http' and parsed.hostname in ('127.0.0.1', 'localhost'))) or parsed.username or parsed.password or parsed.query or parsed.fragment or parsed.path not in ('', '/'):
@@ -141,7 +149,16 @@ def main():
     def report(fields):
         print(json.dumps(fields, sort_keys=True), flush=True)
     try:
-        smoke(args.url.rstrip('/'), args.component, report=report, relay_url=args.relay_url.rstrip('/'))
+        for attempt in range(args.attempts):
+            try:
+                smoke(args.url.rstrip('/'), args.component, report=report,
+                      relay_url=args.relay_url.rstrip('/'), expected_bundle=args.expected_bundle)
+                break
+            except SmokeFailure as error:
+                if attempt + 1 == args.attempts:
+                    raise
+                report(dict(event='retry', attempt=attempt + 1, **error.details))
+                time.sleep(5)
     except SmokeFailure as error:
         report(dict(event='failure', component=args.component, **error.details))
         return 1

@@ -91,4 +91,5 @@ jobs:
           sha256sum -c SHA256SUMS
           node tools/node_modules/wrangler/bin/wrangler.js pages deploy site \
             --project-name="$LIVE_PAGES_PROJECT" --branch=master --commit-hash="$GITHUB_SHA"
-          python3 "$GITHUB_WORKSPACE/scripts/smoke-live-broadcast.py" --url "https://$LIVE_HOSTNAME" --component site
+          python3 "$GITHUB_WORKSPACE/scripts/smoke-live-broadcast.py" --url "https://$LIVE_HOSTNAME" --component site \
+            --expected-bundle="$(cat site/live-assets/current-version)" --attempts=12

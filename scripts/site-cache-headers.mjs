@@ -35,9 +35,13 @@ export async function generateHeaders(site) {
   }
   paths.sort();
   // Pages supports at most 100 header rules. Fail rather than silently drop any.
-  if (paths.length > 100) throw new Error('Pages header rule limit exceeded');
+  // Entry points and manifests select a deployment; they are never immutable.
+  const mutable = ['/live', '/live.html', '/live-assets/current-version',
+    '/live-assets/*/manifest.json'];
+  if (paths.length + mutable.length > 100) throw new Error('Pages header rule limit exceeded');
   await writeFile(join(site, '_headers'),
-    '# Generated: only content-addressed assets; HTML and mutable paths retain Pages defaults.\n' +
+    '# Generated: immutable content-addressed assets; deployment pointers must revalidate.\n' +
+    mutable.map(path => `${path}\n  Cache-Control: no-store\n\n`).join('') +
     paths.map(path => `${path}\n${policy}\n`).join(''), { flag: 'wx' });
 }
 

@@ -42,6 +42,52 @@ class SmokeTests(unittest.TestCase):
         opener.open.side_effect = lambda url, timeout: Response(routes[url])
         return routes, opener, base
 
+    def test_expected_deployment_rejects_old_but_valid_bundle(self):
+        _, opener, _ = self.fixture()
+        with patch.object(m.urllib.request, 'build_opener', return_value=opener):
+            with self.assertRaises(m.SmokeFailure) as caught:
+                m.smoke('https://bmux.dev', component='site', expected_bundle='a' * 64)
+        self.assertEqual(caught.exception.details['code'], 'deployment_not_visible')
+        self.assertEqual(opener.open.call_count, 1)
+        self.assertIn(('Cache-Control', 'no-cache'), opener.addheaders)
+
+    def test_expected_bundle_still_requires_exact_bytes(self):
+        routes, opener, base = self.fixture()
+        routes['https://bmux.dev' + base + 'canvas-viewer.js'] += b'changed'
+        with patch.object(m.urllib.request, 'build_opener', return_value=opener):
+            with self.assertRaises(m.SmokeFailure) as caught:
+                m.smoke('https://bmux.dev', component='site', expected_bundle=base.split('/')[2])
+        self.assertEqual(caught.exception.details['code'], 'response_out_of_bounds')
+
+    def test_cli_waits_for_exact_bundle_then_checks_all_assets(self):
+        routes, opener, base = self.fixture()
+        calls = 0
+        def open_response(url, timeout):
+            nonlocal calls
+            if url.endswith('/live'):
+                calls += 1
+                if calls == 1:
+                    return Response(('<script src="/live-assets/' + 'a' * 64 + '/live-page.js"></script>').encode())
+            return Response(routes[url])
+        opener.open.side_effect = open_response
+        argv = ['smoke', '--url', 'https://bmux.dev', '--component', 'site',
+                '--expected-bundle', base.split('/')[2], '--attempts', '2']
+        with patch('sys.argv', argv), patch.object(m.urllib.request, 'build_opener', return_value=opener), \
+                patch.object(m.time, 'sleep') as sleep, patch('sys.stdout', new_callable=io.StringIO):
+            self.assertEqual(m.main(), 0)
+        sleep.assert_called_once_with(5)
+        self.assertEqual(calls, 2)
+        self.assertEqual(opener.open.call_count, 8)
+
+    def test_cli_never_accepts_a_permanently_stale_deployment(self):
+        _, opener, _ = self.fixture()
+        argv = ['smoke', '--url', 'https://bmux.dev', '--component', 'site',
+                '--expected-bundle', 'a' * 64, '--attempts', '2']
+        with patch('sys.argv', argv), patch.object(m.urllib.request, 'build_opener', return_value=opener), \
+                patch.object(m.time, 'sleep'), patch('sys.stdout', new_callable=io.StringIO):
+            self.assertEqual(m.main(), 1)
+        self.assertEqual(opener.open.call_count, 2)
+
     def test_separate_origins_without_status_polling(self):
         _, opener, _ = self.fixture()
         with patch.object(m.urllib.request, 'build_opener', return_value=opener):
