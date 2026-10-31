@@ -3,11 +3,11 @@
 set -euo pipefail
 umask 077
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-ENVIRONMENT="${1:?Usage: live-deploy.sh production ARTIFACT_DIRECTORY [release|preview|check|configure|approved|inspect|reconcile-mount]}"
+ENVIRONMENT="${1:?Usage: live-deploy.sh production ARTIFACT_DIRECTORY [release|preview|check|configure|approved|inspect]}"
 [[ "$ENVIRONMENT" == staging || "$ENVIRONMENT" == production ]] || exit 2
 ARTIFACT="$(cd "${2:?Artifact directory required}" && pwd)"
 MODE="${3:-release}"
-[[ "$MODE" == release || "$MODE" == preview || "$MODE" == check || "$MODE" == configure || "$MODE" == approved || "$MODE" == inspect || "$MODE" == reconcile-mount ]] || exit 2
+[[ "$MODE" == release || "$MODE" == preview || "$MODE" == check || "$MODE" == configure || "$MODE" == approved || "$MODE" == inspect ]] || exit 2
 BOOTSTRAP_COMPLETION=''
 if [[ $# -gt 3 ]]; then
   [[ $# == 5 && "$MODE" == configure && "$4" == --bootstrap-completion ]] || { echo 'Bootstrap completion is only supported for explicit first configure' >&2; exit 2; }
@@ -56,7 +56,7 @@ IMPORT_FILE="$ARTIFACT/infrastructure/approved-imports.tf.json"
 PRESERVE_FILE="$ARTIFACT/infrastructure/migration-retention_override.tf.json"
 [[ ! -e "$PRESERVE_FILE" && ! -L "$PRESERVE_FILE" ]] || { echo 'Unexpected migration override in immutable candidate' >&2; exit 2; }
 [[ ! -e "$IMPORT_FILE" && ! -L "$IMPORT_FILE" ]] || { echo 'Unexpected import file in immutable candidate' >&2; exit 2; }
-trap 'rm -f "$WORK/backend.json" "$WORK/plan" "$WORK/plan.json" "$WORK/managed.json" "$WORK/imports.json" "$WORK/state-check.json" "$WORK/archive-before.json" "$WORK/archive-after.json" "$WORK/deploy.log" "$WORK/inspect-state.json" "$WORK/inspect-plan.json" "$WORK/state-before.json" "$WORK/state-candidate.json" "$WORK/state-verify.json" "$WORK/registry-auth.json" "$IMPORT_FILE" "$PRESERVE_FILE"' EXIT
+trap 'rm -f "$WORK/backend.json" "$WORK/plan" "$WORK/plan.json" "$WORK/managed.json" "$WORK/imports.json" "$WORK/state-check.json" "$WORK/archive-before.json" "$WORK/archive-after.json" "$WORK/deploy.log" "$WORK/inspect-state.json" "$WORK/inspect-plan.json" "$WORK/registry-auth.json" "$IMPORT_FILE" "$PRESERVE_FILE"' EXIT
 export TF_DATA_DIR="$WORK/tofu"
 python3 "$ROOT/scripts/live-state.py" --environment "$ENVIRONMENT" --output "$WORK/backend.json"
 export TF_VAR_environment="$ENVIRONMENT" TF_VAR_account_id="$CLOUDFLARE_ACCOUNT_ID"
@@ -81,24 +81,6 @@ if [[ -n "$BOOTSTRAP_COMPLETION" ]]; then
 fi
 python3 "$ROOT/scripts/archive-live-state.py" check "${ADMISSION_ARGS[@]}" > "$WORK/state-check.json"
 run_private tofu init -json -input=false -lockfile=readonly -backend-config="$WORK/backend.json"
-if [[ "$MODE" == reconcile-mount ]]; then
-  # Explicit incident recovery only. No plan/apply/import/image upload. Keep
-  # OpenTofu encryption, lineage, serial checks and backend locking intact.
-  python3 "$ROOT/scripts/archive-live-state.py" release-check > "$WORK/state-check.json"
-  python3 "$ROOT/scripts/archive-live-state.py" archive > "$WORK/archive-before.json"
-  run_private tofu state pull
-  mv "$WORK/deploy.log" "$WORK/state-before.json"
-  python3 "$ROOT/scripts/reconcile-live-mounts.py" "$WORK/state-before.json" "$WORK/state-candidate.json"
-  run_private tofu state push -lock-timeout=5m "$WORK/state-candidate.json"
-  # Archive immediately after the write, including if subsequent verification
-  # fails. Never auto-restore over a concurrent or ambiguously completed write.
-  python3 "$ROOT/scripts/archive-live-state.py" archive > "$WORK/archive-after.json"
-  run_private tofu state pull
-  mv "$WORK/deploy.log" "$WORK/state-verify.json"
-  python3 "$ROOT/scripts/reconcile-live-mounts.py" --verify "$WORK/state-candidate.json" "$WORK/state-verify.json"
-  echo 'Incident ownership reconciled in encrypted state only; run a fresh release preview.'
-  exit 0
-fi
 if [[ "$MODE" == inspect ]]; then
   # No state writes, lock acquisition, imports, image uploads or apply. Plan
   # refresh is transient; show reads persisted ownership separately for comparison.
