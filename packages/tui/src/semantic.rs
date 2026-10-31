@@ -1,6 +1,99 @@
 //! Protocol-neutral semantic regions committed with terminal presentation.
 
 use crate::geometry::Rect;
+use crate::grid_fragment::GridTransform;
+
+/// Fractional root-cell bounds shared by semantics, selection and IME placement.
+/// These describe geometry only; visibility and focus remain caller-owned.
+#[derive(Debug, Clone, Copy)]
+pub struct ProjectedBounds {
+    /// Left and top edges in root-cell units.
+    pub min: [f64; 2],
+    /// Exclusive right and bottom edges in root-cell units.
+    pub max: [f64; 2],
+}
+
+// Bitwise equality keeps immutable snapshots reflexive even before validation
+// rejects non-finite caller input (including NaN).
+impl PartialEq for ProjectedBounds {
+    fn eq(&self, other: &Self) -> bool {
+        self.min.map(f64::to_bits) == other.min.map(f64::to_bits)
+            && self.max.map(f64::to_bits) == other.max.map(f64::to_bits)
+    }
+}
+impl Eq for ProjectedBounds {}
+
+impl ProjectedBounds {
+    /// Project local geometry without rounding intermediate cell edges.
+    #[must_use]
+    pub fn new(area: Rect, transform: GridTransform) -> Option<Self> {
+        if area.is_empty() {
+            return None;
+        }
+        Some(Self {
+            min: transform.project([f64::from(area.x), f64::from(area.y)]),
+            max: transform.project([f64::from(area.right()), f64::from(area.bottom())]),
+        })
+    }
+
+    /// Intersect with a winning compositor clip before pixel conversion.
+    #[must_use]
+    pub fn clipped(self, clip: Rect) -> Option<Self> {
+        let bounds = Self {
+            min: [
+                self.min[0].max(f64::from(clip.x)),
+                self.min[1].max(f64::from(clip.y)),
+            ],
+            max: [
+                self.max[0].min(f64::from(clip.right())),
+                self.max[1].min(f64::from(clip.bottom())),
+            ],
+        };
+        (bounds.min[0] < bounds.max[0] && bounds.min[1] < bounds.max[1]).then_some(bounds)
+    }
+
+    /// Outward physical-pixel cover `[x, y, width, height]`, suitable for IME
+    /// candidate placement. Metrics must already include the window's DPI scale.
+    /// Values remain floating point for checked conversion by the native backend.
+    #[must_use]
+    pub fn pixel_cover(self, cell_pixels: [f64; 2]) -> Option<[f64; 4]> {
+        if !cell_pixels
+            .iter()
+            .all(|value| value.is_finite() && *value > 0.0)
+            || !self
+                .min
+                .iter()
+                .chain(self.max.iter())
+                .all(|value| value.is_finite())
+            || self.min[0] >= self.max[0]
+            || self.min[1] >= self.max[1]
+        {
+            return None;
+        }
+        let left = (self.min[0] * cell_pixels[0]).floor();
+        let top = (self.min[1] * cell_pixels[1]).floor();
+        let right = (self.max[0] * cell_pixels[0]).ceil();
+        let bottom = (self.max[1] * cell_pixels[1]).ceil();
+        let cover = [left, top, right - left, bottom - top];
+        cover.iter().all(|value| value.is_finite()).then_some(cover)
+    }
+
+    /// Conservative integer-cell envelope for cell-only metadata consumers.
+    #[must_use]
+    // Coordinates are clamped to the u16 domain before conversion.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    pub fn cell_cover(self) -> Rect {
+        let edge = |value: f64| value.clamp(0.0, f64::from(u16::MAX)) as u16;
+        let x = edge(self.min[0].floor());
+        let y = edge(self.min[1].floor());
+        Rect::new(
+            x,
+            y,
+            edge(self.max[0].ceil()).saturating_sub(x),
+            edge(self.max[1].ceil()).saturating_sub(y),
+        )
+    }
+}
 
 /// Stable semantic role exposed by a rendered component.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -150,6 +243,24 @@ impl SemanticScene {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fractional_bounds_clip_before_outward_pixel_cover() {
+        use crate::geometry::Point;
+        for (scale, expected) in [
+            (875, [30.0, 18.0, 19.0, 16.0]),
+            (1375, [35.0, 18.0, 30.0, 25.0]),
+        ] {
+            let transform = GridTransform::new(Point::new(2, 1), scale).unwrap();
+            let bounds = ProjectedBounds::new(Rect::new(1, 0, 2, 1), transform).unwrap();
+            assert_eq!(bounds.pixel_cover([10.5, 18.0]), Some(expected));
+            let clipped = bounds.clipped(Rect::new(3, 1, 1, 1)).unwrap();
+            assert!(clipped.min[0] >= 3.0 && clipped.max[0] <= 4.0);
+            assert!(bounds.clipped(Rect::new(12, 1, 1, 1)).is_none());
+            assert!(bounds.pixel_cover([f64::NAN, 18.0]).is_none());
+            assert!(bounds.pixel_cover([10.5, 0.0]).is_none());
+        }
+    }
 
     #[test]
     fn legacy_constructor_has_no_accessibility_wire_extension() {

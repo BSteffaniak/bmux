@@ -294,6 +294,36 @@ pub struct SelectionFragment {
 }
 
 impl SelectionFragment {
+    /// Check source and optional expansion ranges against complete UTF-8 graphemes.
+    /// Callers must bound source size/work before using this linear-time check.
+    #[must_use]
+    pub fn source_is_grapheme_aligned(&self, text: &str) -> bool {
+        use unicode_segmentation::UnicodeSegmentation as _;
+        let boundary = |offset| {
+            offset == text.len()
+                || text
+                    .grapheme_indices(true)
+                    .any(|(start, _)| start == offset)
+        };
+        let valid = |range: &Range<usize>| {
+            range.start <= range.end
+                && range.end <= text.len()
+                && boundary(range.start)
+                && boundary(range.end)
+        };
+        valid(&self.source_range)
+            && self.word_range.as_ref().is_none_or(|range| {
+                valid(range)
+                    && range.start <= self.source_range.start
+                    && range.end >= self.source_range.end
+            })
+            && self.line_range.as_ref().is_none_or(|range| {
+                valid(range)
+                    && range.start <= self.source_range.start
+                    && range.end >= self.source_range.end
+            })
+    }
+
     /// Create a visible selection fragment.
     #[must_use]
     pub fn new(
@@ -2049,6 +2079,21 @@ mod tests {
                 })
             }
         ));
+    }
+
+    #[test]
+    fn source_validation_rejects_partial_utf8_and_combining_graphemes() {
+        let fragment = SelectionFragment::new("scope", "text", Rect::new(0, 0, 2, 1), 0, 0..3);
+        assert!(fragment.source_is_grapheme_aligned("e\u{301}界"));
+        let mut invalid = fragment;
+        invalid.source_range = 0..1;
+        assert!(!invalid.source_is_grapheme_aligned("e\u{301}界"));
+        invalid.source_range = 3..5;
+        assert!(!invalid.source_is_grapheme_aligned("e\u{301}界"));
+        invalid.source_range = 3..6;
+        assert!(invalid.source_is_grapheme_aligned("e\u{301}界"));
+        invalid.word_range = Some(4..6);
+        assert!(!invalid.source_is_grapheme_aligned("e\u{301}界"));
     }
 
     #[test]

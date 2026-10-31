@@ -214,6 +214,7 @@ tracing-subscriber = { workspace = true, features = [
     "fmt",
     "std",
 ] }
+unicode-segmentation = { workspace = true }
 uuid = { workspace = true, features = ["std"] }
 
 [target.'cfg(unix)'.dependencies]

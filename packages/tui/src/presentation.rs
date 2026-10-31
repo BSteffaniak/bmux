@@ -133,6 +133,18 @@ impl PresentationPhase {
     }
 }
 
+/// Exact compositor-projected metadata carried with one prepared snapshot.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProjectedMetadata {
+    /// Complete visible selection units keyed by stable fragment identity.
+    pub selection: std::collections::BTreeMap<
+        crate::selection::SelectionFragmentId,
+        crate::semantic::ProjectedBounds,
+    >,
+    /// Visible semantic strips keyed by stable projected region identity.
+    pub semantics: std::collections::BTreeMap<String, crate::semantic::ProjectedBounds>,
+}
+
 /// Complete owned output of the authoritative paint/retention path.
 ///
 /// Cell coordinates and all metadata share the same clipped paint geometry.
@@ -153,11 +165,94 @@ pub struct PreparedPresentation {
     selection: SelectionScene,
     selection_text: std::collections::BTreeMap<crate::selection::SelectionContentId, String>,
     semantics: SemanticScene,
+    projected_metadata: Option<ProjectedMetadata>,
     metadata_availability: Vec<SurfaceMetadataAvailability>,
     damage: Damage,
 }
 
 impl PreparedPresentation {
+    /// Exact metadata installed with this immutable output snapshot. `None` means
+    /// no projection metadata was supplied, not an empty transformed scene.
+    #[must_use]
+    pub const fn projected_metadata(&self) -> Option<&ProjectedMetadata> {
+        self.projected_metadata.as_ref()
+    }
+
+    /// Attach complete projection bounds to their matching prepared scenes.
+    /// # Errors
+    /// Rejects partial ID sets, invalid bounds, non-full output, or excess budget.
+    pub fn set_projected_metadata(
+        &mut self,
+        metadata: ProjectedMetadata,
+        limits: PresentationLimits,
+    ) -> Result<(), PresentationLimitError> {
+        let area = self.buffer.area();
+        let valid = |bounds: &crate::semantic::ProjectedBounds| {
+            bounds.pixel_cover([1.0, 1.0]).is_some()
+                && bounds.min[0] >= f64::from(area.x)
+                && bounds.min[1] >= f64::from(area.y)
+                && bounds.max[0] <= f64::from(area.right())
+                && bounds.max[1] <= f64::from(area.bottom())
+        };
+        if !matches!(self.damage, Damage::Full)
+            || metadata.selection.len() != self.selection.fragments().len()
+            || metadata.semantics.len() != self.semantics.regions().len()
+            || self.selection.fragments().iter().any(|fragment| {
+                metadata
+                    .selection
+                    .get(&fragment.id)
+                    .is_none_or(|bounds| !valid(bounds) || bounds.cell_cover() != fragment.area)
+            })
+            || self.semantics.regions().iter().any(|region| {
+                metadata
+                    .semantics
+                    .get(&region.id)
+                    .is_none_or(|bounds| !valid(bounds) || bounds.cell_cover() != region.area)
+            })
+        {
+            return Err(PresentationLimitError::Entries);
+        }
+        let previous = self.projected_metadata.replace(metadata);
+        if let Err(error) = self.validate_limits(limits) {
+            self.projected_metadata = previous;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Fractional visible cursor bounds for IME placement. Grid cursors must have
+    /// already passed the compositor's focus/modal admission before installation.
+    /// Returns no partial cursor when an occluder cuts its visual unit.
+    #[must_use]
+    pub fn ime_cursor_bounds(&self) -> Option<crate::semantic::ProjectedBounds> {
+        use crate::semantic::ProjectedBounds;
+        if let Some(cursor) = self.cursor.filter(|cursor| cursor.visible) {
+            return ProjectedBounds::new(
+                Rect::new(cursor.position.x, cursor.position.y, 1, 1),
+                crate::grid_fragment::GridTransform::new(crate::geometry::Point::new(0, 0), 1000)?,
+            );
+        }
+        let mut cursors = self.grid_fragments.iter().filter_map(|fragment| {
+            let cursor = fragment.cursor().filter(|cursor| cursor.visible)?;
+            let bounds = ProjectedBounds::new(
+                Rect::new(cursor.position.x, cursor.position.y, 1, 1),
+                fragment.transform(),
+            )?;
+            let covered: f64 = fragment
+                .visible_clips()
+                .iter()
+                .filter_map(|clip| bounds.clipped(*clip))
+                .map(|clip| (clip.max[0] - clip.min[0]) * (clip.max[1] - clip.min[1]))
+                .sum();
+            let total = (bounds.max[0] - bounds.min[0]) * (bounds.max[1] - bounds.min[1]);
+            ((covered - total).abs() <= total * f64::EPSILON * 8.0).then_some(bounds)
+        });
+        let cursor = cursors.next()?;
+        // The compositor owns focus. Ambiguous producer cursors are not resolved
+        // here by arbitrary fragment order into a second focus policy.
+        cursors.next().is_none().then_some(cursor)
+    }
+
     /// Local grids in canonical compositor visibility; no independent hit scene.
     #[must_use]
     pub fn grid_fragments(&self) -> &[PreparedGridFragment] {
@@ -476,6 +571,7 @@ impl PreparedPresentation {
     /// # Errors
     /// Returns the exceeded entry or byte budget. Call after staging modal
     /// scopes and selection text when using a caller-selected admission budget.
+    #[allow(clippy::too_many_lines)] // One budget walk must charge every retained payload before snapshot admission.
     pub fn validate_limits(
         &self,
         limits: PresentationLimits,
@@ -498,6 +594,16 @@ impl PreparedPresentation {
             Ok(())
         };
         self.validate_grid_limits(limits, &mut add)?;
+        if let Some(metadata) = &self.projected_metadata {
+            for size in metadata
+                .selection
+                .keys()
+                .map(|id| id.as_str().len())
+                .chain(metadata.semantics.keys().map(String::len))
+            {
+                add(1, size.saturating_add(32))?;
+            }
+        }
         for cell in self.buffer.cells() {
             add(0, cell.symbol.len())?;
         }
@@ -652,6 +758,7 @@ pub struct PresentationState {
     selection: SelectionScene,
     selection_text: std::collections::BTreeMap<crate::selection::SelectionContentId, String>,
     semantics: SemanticScene,
+    projected_metadata: Option<ProjectedMetadata>,
     metadata_availability: Vec<SurfaceMetadataAvailability>,
 }
 
@@ -674,6 +781,7 @@ impl PresentationState {
             selection: SelectionScene::new(),
             selection_text: std::collections::BTreeMap::new(),
             semantics: SemanticScene::new(),
+            projected_metadata: None,
             metadata_availability: Vec::new(),
         }
     }
@@ -914,7 +1022,9 @@ impl PresentationState {
     ) -> Option<PreparedPresentation> {
         // Local-grid contributions are full replacements. A regional caller must
         // repaint the complete root and explicitly reinstall winning fragments.
-        let damage = if !self.grid_fragments.is_empty() && !damage.is_none() {
+        let damage = if (!self.grid_fragments.is_empty() || self.projected_metadata.is_some())
+            && !damage.is_none()
+        {
             Damage::Full
         } else {
             damage
@@ -1101,6 +1211,7 @@ impl PresentationState {
                     selection,
                     selection_text: std::collections::BTreeMap::new(),
                     semantics,
+                    projected_metadata: None,
                     metadata_availability,
                     damage,
                 })
@@ -1211,6 +1322,7 @@ impl PresentationState {
                 self.selection = prepared.selection;
                 self.selection_text = prepared.selection_text;
                 self.semantics = prepared.semantics;
+                self.projected_metadata = prepared.projected_metadata;
                 self.metadata_availability = prepared.metadata_availability;
             },
             |()| true,
@@ -1942,6 +2054,107 @@ mod tests {
             .present_prepared(Some(prepared), |_, _| Ok::<_, ()>(()))
             .unwrap();
         assert_eq!(state.selection_text.len(), 1);
+    }
+
+    #[test]
+    fn projected_metadata_commits_atomically_and_rejects_missing_bounds() {
+        use crate::semantic::{ProjectedBounds, SemanticRegion};
+        let limits = PresentationLimits {
+            max_cells: 4096,
+            max_entries: 4096,
+            max_bytes: 1_048_576,
+        };
+        let mut state = PresentationState::new(Rect::new(0, 0, 8, 2));
+        let bounds = ProjectedBounds::new(
+            Rect::new(0, 0, 2, 1),
+            GridTransform::new(Point::new(1, 0), 1375).unwrap(),
+        )
+        .unwrap();
+        let mut prepared = state
+            .prepare(Damage::Full, |cx| {
+                cx.push_semantic(SemanticRegion::new("label", bounds.cell_cover(), "text"));
+            })
+            .unwrap();
+        let metadata = ProjectedMetadata {
+            selection: std::collections::BTreeMap::default(),
+            semantics: [("label".into(), bounds)].into(),
+        };
+        prepared
+            .set_projected_metadata(metadata.clone(), limits)
+            .unwrap();
+        assert!(
+            prepared
+                .set_projected_metadata(ProjectedMetadata::default(), limits)
+                .is_err()
+        );
+        assert_eq!(prepared.projected_metadata(), Some(&metadata));
+        assert!(
+            state
+                .present_prepared(Some(prepared.clone()), |_, _| Err::<(), _>("failed"))
+                .is_err()
+        );
+        assert!(state.projected_metadata.is_none());
+        state
+            .present_prepared(Some(prepared), |_, _| Ok::<_, ()>(()))
+            .unwrap();
+        assert_eq!(state.projected_metadata, Some(metadata));
+        let next = state
+            .prepare(Damage::Regions(vec![Rect::new(0, 0, 1, 1)]), |_| {})
+            .unwrap();
+        assert!(matches!(next.damage(), Damage::Full));
+        assert!(next.projected_metadata().is_none());
+    }
+
+    #[test]
+    fn transformed_ime_cursor_keeps_fractional_bounds_and_rejects_occlusion() {
+        use std::sync::Arc;
+        let limits = PresentationLimits {
+            max_cells: 4096,
+            max_entries: 4096,
+            max_bytes: 1_048_576,
+        };
+        for scale in [875, 1375] {
+            let state = PresentationState::new(Rect::new(0, 0, 8, 4));
+            let mut prepared = state.prepare(Damage::Full, |_| {}).unwrap();
+            let transform = GridTransform::new(Point::new(1, 1), scale).unwrap();
+            let bounds =
+                crate::semantic::ProjectedBounds::new(Rect::new(1, 0, 1, 1), transform).unwrap();
+            let grid = PreparedGridFragment::new(
+                "text",
+                Arc::new(Buffer::empty(Rect::new(0, 0, 2, 1))),
+                transform,
+                vec![Rect::new(1, 1, 4, 2)],
+            )
+            .unwrap()
+            .with_cursor(Cursor::visible(Point::new(1, 0)))
+            .unwrap();
+            prepared
+                .set_grid_fragments(vec![grid.clone()], limits)
+                .unwrap();
+            assert_eq!(prepared.ime_cursor_bounds(), Some(bounds));
+            let unfocused = PreparedGridFragment::new(
+                "text",
+                Arc::new(Buffer::empty(Rect::new(0, 0, 2, 1))),
+                transform,
+                vec![Rect::new(1, 1, 4, 2)],
+            )
+            .unwrap();
+            prepared
+                .set_grid_fragments(vec![unfocused], limits)
+                .unwrap();
+            assert_eq!(prepared.ime_cursor_bounds(), None);
+            let hidden = PreparedGridFragment::new(
+                "text",
+                Arc::new(Buffer::empty(Rect::new(0, 0, 2, 1))),
+                transform,
+                vec![Rect::new(1, 1, 1, 1)],
+            )
+            .unwrap()
+            .with_cursor(Cursor::visible(Point::new(1, 0)))
+            .unwrap();
+            prepared.set_grid_fragments(vec![hidden], limits).unwrap();
+            assert_eq!(prepared.ime_cursor_bounds(), None);
+        }
     }
 
     #[test]

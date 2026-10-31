@@ -275,10 +275,14 @@ subject to the same raster and capacity limits.
 ### Pane-scoped controls
 
 This implementation is not yet end-to-end accepted. Captured-scrollback zoom
-is unsupported and rejects presentation rather than showing a mismatched source.
-Transformed accessibility and IME metadata are currently withheld rather than
-publishing stale root coordinates. Real-application visual acceptance, mixed-DPI
-validation, and Linux native validation remain outstanding.
+uses immutable capture-bound rows, palette and images, with source-anchored
+selection; missing or mismatched captures reject presentation rather than
+showing
+a different source. Transformed accessibility and IME geometry is prepared and
+committed with output. A real-daemon two-pane/two-view fixture verifies local
+zoom and failed-output authority preservation, but does not exercise a native
+Bterm window. Real-application visual acceptance, native IME/screen-reader
+checks, mixed-DPI validation, and Linux native validation remain outstanding.
 
 Set `scope = "pane"` on a keyboard binding or wheel policy to select pane
 content rather than the whole window. Existing bindings remain window-scoped

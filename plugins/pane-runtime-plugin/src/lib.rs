@@ -61,7 +61,7 @@ mod contract_tests {
         );
         let routes: Vec<bmux_plugin::stream_admission::StreamAdmittedRoute> =
             bmux_plugin_sdk::decode_service_message(payload).unwrap();
-        assert_eq!(routes.len(), 24);
+        assert_eq!(routes.len(), 27);
         assert!(routes.iter().any(|route| {
             route.interface_id == "pane-runtime-view-size-v1"
                 && route.operation == "resize-alternate"
@@ -99,7 +99,10 @@ mod contract_tests {
                 }),
                 "approval must match an actual owned service export"
             );
-            assert_ne!(route.capability, "bmux.pane_runtime.spawn.v1");
+            if route.capability == "bmux.pane_runtime.spawn.v1" {
+                assert_eq!(route.kind, bmux_plugin_sdk::ServiceKind::Query);
+                assert_eq!(route.interface_id, "pane-runtime-spawn-v1");
+            }
             assert!(super::handlers::execution::migrated_route(
                 &route.interface_id,
                 &route.operation
@@ -117,6 +120,46 @@ mod contract_tests {
                 }
             );
         }
+    }
+
+    #[test]
+    fn source_queries_are_discoverable_without_spawn_commands() {
+        use bmux_plugin_sdk::RustPlugin as _;
+        let services = super::PaneRuntimePlugin::declared_services().unwrap();
+        let source_services: Vec<_> = services
+            .iter()
+            .filter(|service| service.capability.as_str() == "bmux.pane_runtime.spawn.v1")
+            .collect();
+        assert_ne!(source_services.len(), 0);
+        assert!(source_services.iter().all(|service| {
+            service.kind == bmux_plugin_sdk::ServiceKind::Query
+                && service.interface_id == "pane-runtime-spawn-v1"
+        }));
+        let mut registrar = bmux_plugin_sdk::ContributionRegistrar::new();
+        super::PaneRuntimePlugin
+            .register_contributions(&mut registrar)
+            .unwrap();
+        let contributions = registrar.into_contributions();
+        let [bmux_plugin_sdk::PluginContribution::Extension { payload, .. }] =
+            contributions.as_slice()
+        else {
+            panic!("expected exact route contribution");
+        };
+        let routes: Vec<bmux_plugin::stream_admission::StreamAdmittedRoute> =
+            bmux_plugin_sdk::decode_service_message(payload).unwrap();
+        let operations: std::collections::BTreeSet<_> = routes
+            .iter()
+            .filter(|route| route.interface_id == "pane-runtime-spawn-v1")
+            .map(|route| route.operation.as_str())
+            .collect();
+        assert_eq!(
+            operations,
+            std::collections::BTreeSet::from([
+                "home-directory",
+                "capture-source",
+                "observe-directory",
+            ])
+        );
     }
 
     #[test]
@@ -278,13 +321,14 @@ impl RustPlugin for PaneRuntimePlugin {
     }
 
     fn declared_services() -> bmux_plugin_sdk::Result<Vec<bmux_plugin_sdk::PluginService>> {
-        // Modeled contracts do not imply runtime support: keep incomplete
-        // spawn-v1 and execution-v2 services out of runtime discovery.
+        // Read-only source queries are implemented and required for fenced
+        // attachment projections. Keep unsupported spawn commands undiscoverable.
         let mut services =
             <Self::Contract as bmux_plugin_sdk::PluginContract>::service_declarations()?;
         services.retain(|service| {
             let capability = service.capability.as_str();
             capability != bmux_pane_runtime_plugin_api::capabilities::PANE_RUNTIME_SPAWN_V1.as_str()
+                || service.kind == bmux_plugin_sdk::ServiceKind::Query
         });
         Ok(services)
     }

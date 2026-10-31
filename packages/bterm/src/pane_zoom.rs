@@ -190,6 +190,13 @@ impl PaneZoomState {
             .any(|controller| controller.needs_frame(now))
     }
 
+    #[must_use]
+    pub(crate) fn view_needs_frame(&self, binding: &PaneViewBinding, now: Instant) -> bool {
+        self.views
+            .get(binding)
+            .is_some_and(|view| view.needs_frame(now))
+    }
+
     /// Remove attachment-local state only; never delete resources or preferences.
     pub fn remove(&mut self, binding: &PaneViewBinding) -> bool {
         self.views.remove(binding).is_some()

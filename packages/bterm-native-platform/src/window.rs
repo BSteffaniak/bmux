@@ -176,6 +176,19 @@ impl WindowContext<'_> {
         self.accessibility.commit(generation, scene, geometry)
     }
 
+    /// Publish exact projected semantic geometry from the successfully displayed
+    /// snapshot, without reconstructing fractional bounds from root cell covers.
+    pub fn commit_projected_accessibility(
+        &mut self,
+        generation: u64,
+        scene: &bmux_tui::semantic::SemanticScene,
+        geometry: crate::accessibility::AccessibilityGeometry,
+        projected: Option<&std::collections::BTreeMap<String, bmux_tui::semantic::ProjectedBounds>>,
+    ) -> Result<(), crate::accessibility::AccessibilityError> {
+        self.accessibility
+            .commit_projected(generation, scene, geometry, projected)
+    }
+
     pub fn invalidate_accessibility(&mut self) {
         self.accessibility.invalidate();
     }

@@ -437,11 +437,26 @@ fn actual_peer_identity_rejects_forged_pid() {
 
 #[test]
 fn ownership_rejection_is_structured_and_does_not_claim_the_launch() {
+    // PID 1 is not inspectable by unprivileged processes on every platform.
+    // Use an owned live child as the different launch root, with cleanup on panic.
+    struct OwnedRoot(std::process::Child);
+    impl Drop for OwnedRoot {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
     let directory = tempfile::tempdir().unwrap();
     let host = Host::new(directory.path().to_owned()).unwrap();
     let key = uuid::Uuid::new_v4().to_string();
     let endpoint = host.prepare(&key, false, false, false).unwrap();
-    host.bind(&key, &endpoint, 1).unwrap();
+    let root = OwnedRoot(
+        std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap(),
+    );
+    host.bind(&key, &endpoint, root.0.id()).unwrap();
     let mut reader = connect(&endpoint, true);
     let rejection: serde_json::Value = receive(&mut reader).unwrap();
     assert_eq!(rejection["error"]["code"], "ownership_rejected");

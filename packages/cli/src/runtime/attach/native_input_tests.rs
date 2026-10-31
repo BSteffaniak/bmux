@@ -165,6 +165,30 @@ async fn pane_zoom_status_distinguishes_contention_and_rejected_dequeue() {
     );
 }
 
+#[test]
+fn pane_zoom_geometry_transition_refreshes_binding_without_retiring_source() {
+    let (_view, handle, _host, _layout) = fixture();
+    let bound = handle.pane_zoom_target(None).unwrap();
+    let generation = bound.identity.viewport_generation + 1;
+    handle
+        .1
+        .store(generation, std::sync::atomic::Ordering::Release);
+    assert_eq!(
+        handle.refresh_pane_zoom_status(&bound),
+        NativePaneZoomRefresh::Pending
+    );
+    {
+        let mut shared = handle.3.lock().unwrap();
+        let current = shared.targets.get_mut(&bound.view_id).unwrap();
+        current.identity.viewport_generation = generation;
+        shared.identity = Some(current.identity);
+    }
+    let refreshed = handle.refresh_pane_zoom_target(&bound).unwrap();
+    assert_eq!(refreshed.identity.viewport_generation, generation);
+    assert_eq!(refreshed.execution_id, bound.execution_id);
+    assert_eq!(refreshed.view_id, bound.view_id);
+}
+
 #[tokio::test]
 async fn pane_zoom_refresh_stays_bound_and_only_observes_commits() {
     let (mut view, handle, _host, layout) = fixture();

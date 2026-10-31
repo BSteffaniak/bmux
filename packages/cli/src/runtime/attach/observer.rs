@@ -566,6 +566,7 @@ pub(super) fn deliver_prepared(
     })
 }
 
+#[allow(clippy::too_many_lines)] // Admission and successful-output commit stay one ordered transaction.
 fn deliver_prepared_inner(
     view: &mut super::state::AttachViewState,
     layout: &bmux_client::AttachLayoutState,
@@ -595,7 +596,23 @@ fn deliver_prepared_inner(
         max_entries: 262_144,
         max_bytes: 32 * 1024 * 1024,
     };
-    let metadata = super::metadata::project(&view.retained_compositor, area)?;
+    let mut source_metadata = view
+        .pane_zoom
+        .prepared
+        .iter()
+        .map(|(id, projection)| projection.source_metadata().map(|metadata| (*id, metadata)))
+        .collect::<Result<std::collections::BTreeMap<_, _>, _>>()
+        .map_err(|error| anyhow::anyhow!("zoom metadata source rejected: {error:?}"))?;
+    for (id, projection) in &view.pane_zoom.prepared_history {
+        source_metadata.insert(
+            *id,
+            projection
+                .source_metadata()
+                .map_err(|error| anyhow::anyhow!("history metadata source rejected: {error:?}"))?,
+        );
+    }
+    let metadata =
+        super::metadata::project_with_sources(&view.retained_compositor, area, &source_metadata)?;
     let zoom_grids = super::pane_zoom_native::fragments(view)?;
     let mut projected_grids = None;
     let mut prepared = view
@@ -610,10 +627,8 @@ fn deliver_prepared_inner(
                     let area = bmux_tui::paint::LocalRect::new(i32::from(clip.x),i64::from(clip.y),clip.width,clip.height);
                     cx.occlude(area);
                     cx.fill(area, " ", bmux_tui::style::Style::new());
-                    // The native attach controller owns source-aware selection;
-                    // flattened root metadata must not pretend to describe this
-                    // fractional local grid. Accessibility remains unavailable.
-                    cx.declare_metadata_availability(area, false, false);
+                    // Root metadata was occluded above; matching projected metadata
+                    // is installed below in the same presentation transaction.
                 }
             }
             for image in images {
@@ -626,11 +641,9 @@ fn deliver_prepared_inner(
                 cx.push_selection_scope(scope.clone());
             }
             for fragment in metadata.selection.fragments() {
-                if zoom_grids.iter().flat_map(bmux_tui::grid_fragment::PreparedGridFragment::visible_clips).any(|clip| !clip.intersection(fragment.area).is_empty()) { continue; }
                 cx.push_selection_fragment(fragment.clone());
             }
             for region in metadata.semantics.regions() {
-                if zoom_grids.iter().flat_map(bmux_tui::grid_fragment::PreparedGridFragment::visible_clips).any(|clip| !clip.intersection(region.area).is_empty()) { continue; }
                 cx.push_semantic(region.clone());
             }
             if let Some(cursor) = view.last_cursor_state {
@@ -648,6 +661,15 @@ fn deliver_prepared_inner(
     prepared
         .set_selection_text(metadata.text)
         .map_err(|error| anyhow::anyhow!("logical source admission failed: {error:?}"))?;
+    prepared
+        .set_projected_metadata(
+            bmux_tui::presentation::ProjectedMetadata {
+                selection: metadata.selection_bounds,
+                semantics: metadata.semantic_bounds,
+            },
+            limits,
+        )
+        .map_err(|error| anyhow::anyhow!("projected metadata admission failed: {error:?}"))?;
     if view.retained_compositor.surfaces().len() > 4096 {
         anyhow::bail!(
             "surface budget exceeded: used={}, limit=4096",
@@ -779,7 +801,10 @@ fn observed_images(
         let Some(content_id) = surface.pane_id else {
             continue;
         };
-        if !surface.visible || view.pane_zoom.prepared.contains_key(&surface.id) {
+        if !surface.visible
+            || view.pane_zoom.prepared.contains_key(&surface.id)
+            || view.pane_zoom.prepared_history.contains_key(&surface.id)
+        {
             continue;
         }
         let content = Rect::new(

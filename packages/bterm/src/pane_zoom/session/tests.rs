@@ -1,5 +1,9 @@
 use super::*;
 
+fn receipt(status: RequestStatus) -> RequestReceipt {
+    Box::new(move || status)
+}
+
 fn request(binding: PaneViewBinding, target: u32, action: ZoomAction) -> PaneZoomRequest<u32> {
     PaneZoomRequest {
         binding,
@@ -47,7 +51,7 @@ fn wait_restore(session: &mut PaneZoomSession<u32>, current: Option<u32>) {
                     .filter(|value| value == previous)
                     .map_or(TargetRefresh::Gone, |target| TargetRefresh::Ready {
                         target,
-                        revision: 1,
+
                         scale: 1.0,
                     })
             })
@@ -240,19 +244,18 @@ fn bound_animation_coalesces_until_commit_then_uses_refreshed_token() {
             mid,
             |_| TargetRefresh::Ready {
                 target: 12,
-                revision: 1,
                 scale: 1.0,
             },
             |token, scale| {
                 sent.push((*token, scale));
-                Ok(())
+                Ok(receipt(RequestStatus::Applied))
             },
         )
         .unwrap();
     assert_eq!(sent.len(), 1);
     let first_scale = sent[0].1;
     assert_eq!(sent[0].0, 12);
-    // A new action while revision 1 is in-flight changes intent, not the queue.
+    // A new action while an exact request is in-flight changes intent, not the queue.
     state
         .action(request(binding, 12, ZoomAction::SetScale(0.75)), mid)
         .unwrap();
@@ -261,10 +264,9 @@ fn bound_animation_coalesces_until_commit_then_uses_refreshed_token() {
             mid + Duration::from_millis(100),
             |_| TargetRefresh::Ready {
                 target: 12,
-                revision: 1,
                 scale: 1.0,
             },
-            |_, _| panic!("must coalesce while the same revision is in flight"),
+            |_, _| panic!("must coalesce until sent sample is committed"),
         )
         .unwrap();
     assert!(state.needs_tick(mid + Duration::from_millis(100)));
@@ -273,12 +275,11 @@ fn bound_animation_coalesces_until_commit_then_uses_refreshed_token() {
             mid + Duration::from_millis(100),
             |_| TargetRefresh::Ready {
                 target: 13,
-                revision: 2,
                 scale: first_scale,
             },
             |token, scale| {
                 sent.push((*token, scale));
-                Ok(())
+                Ok(receipt(RequestStatus::Applied))
             },
         )
         .unwrap();
@@ -288,7 +289,6 @@ fn bound_animation_coalesces_until_commit_then_uses_refreshed_token() {
             mid + Duration::from_millis(100),
             |_| TargetRefresh::Ready {
                 target: 14,
-                revision: 3,
                 scale: 0.75,
             },
             |_, _| panic!("matching committed scale must not be resent"),
@@ -311,10 +311,9 @@ fn bound_reload_clamps_latest_intent_without_superseding_pending_output() {
             done,
             |_| TargetRefresh::Ready {
                 target: 12,
-                revision: 1,
                 scale: 1.0,
             },
-            |_, _| Ok(()),
+            |_, _| Ok(receipt(RequestStatus::Applied)),
         )
         .unwrap();
     let mut policy = ZoomConfiguration {
@@ -329,7 +328,6 @@ fn bound_reload_clamps_latest_intent_without_superseding_pending_output() {
             done,
             |_| TargetRefresh::Ready {
                 target: 12,
-                revision: 1,
                 scale: 1.0,
             },
             |_, _| panic!("reload must not supersede in-flight output"),
@@ -340,12 +338,11 @@ fn bound_reload_clamps_latest_intent_without_superseding_pending_output() {
             done,
             |_| TargetRefresh::Ready {
                 target: 13,
-                revision: 2,
                 scale: 2.0,
             },
             |token, scale| {
                 assert_eq!((*token, scale), (13, 1.5));
-                Ok(())
+                Ok(receipt(RequestStatus::Applied))
             },
         )
         .unwrap();
@@ -394,7 +391,6 @@ fn bound_final_sample_survives_queue_backpressure() {
                 done,
                 |_| TargetRefresh::Ready {
                     target: 12,
-                    revision: 1,
                     scale: 1.0
                 },
                 |_, _| Err(anyhow::anyhow!("full"))
@@ -407,12 +403,11 @@ fn bound_final_sample_survives_queue_backpressure() {
             done,
             |_| TargetRefresh::Ready {
                 target: 13,
-                revision: 1,
                 scale: 1.0,
             },
             |token, scale| {
                 assert_eq!((*token, scale), (13, 2.0));
-                Ok(())
+                Ok(receipt(RequestStatus::Applied))
             },
         )
         .unwrap();
@@ -464,7 +459,7 @@ fn stale_target_is_retired_without_retargeting_and_release_does_not_bind() {
 }
 
 #[test]
-fn raster_cap_bounds_intent_and_survives_policy_reload() {
+fn raster_cap_bounds_effective_scale_without_destroying_requested_intent() {
     let now = Instant::now();
     let mut session = session();
     let binding = PaneViewBinding::new("view", "pane/source").unwrap();
@@ -482,6 +477,319 @@ fn raster_cap_bounds_intent_and_survives_policy_reload() {
     assert_eq!(session.state.target_scale(&binding), Some(1.5));
     session.set_raster_cap(1250, now).unwrap();
     assert_eq!(session.state.target_scale(&binding), Some(1.25));
+    assert_eq!(session.requested.target_scale(&binding), Some(3.0));
+    session.set_raster_cap(8000, now).unwrap();
+    assert_eq!(session.state.target_scale(&binding), Some(3.0));
+}
+
+#[test]
+fn geometry_refresh_preserves_clamped_requested_intent_without_persistence() {
+    let now = Instant::now();
+    let mut state = session();
+    let binding = PaneViewBinding::new("view", "pane/source").unwrap();
+    state.set_raster_cap(1250, now).unwrap();
+    state
+        .action(request(binding.clone(), 11, ZoomAction::SetScale(2.5)), now)
+        .unwrap();
+    state
+        .tick_bound(
+            now,
+            |_| TargetRefresh::Pending,
+            |_, _| panic!("pending geometry must not send"),
+        )
+        .unwrap();
+    state
+        .tick_bound(
+            now + Duration::from_millis(101),
+            |_| TargetRefresh::Ready {
+                target: 12,
+                scale: 1.0,
+            },
+            |target, _| {
+                assert_eq!(*target, 12);
+                Ok(Box::new(|| RequestStatus::Pending))
+            },
+        )
+        .unwrap();
+    assert_eq!(state.requested.target_scale(&binding), Some(2.5));
+    assert_eq!(state.state.target_scale(&binding), Some(1.25));
+    state
+        .set_raster_cap(8000, now + Duration::from_millis(102))
+        .unwrap();
+    assert_eq!(state.state.target_scale(&binding), Some(2.5));
+}
+
+#[test]
+fn pending_receipt_ignores_matching_output_and_applied_waits_for_its_sample() {
+    use std::{cell::Cell, rc::Rc};
+    let now = Instant::now();
+    let done = now + Duration::from_millis(101);
+    let mut state = session();
+    let binding = PaneViewBinding::new("view", "pane/source").unwrap();
+    state
+        .action(request(binding.clone(), 11, ZoomAction::SetScale(2.0)), now)
+        .unwrap();
+    let status = Rc::new(Cell::new(RequestStatus::Pending));
+    state
+        .tick_bound(
+            done,
+            |_| TargetRefresh::Ready {
+                target: 11,
+                scale: 1.0,
+            },
+            |_, _| {
+                let status = Rc::clone(&status);
+                Ok(Box::new(move || status.get()))
+            },
+        )
+        .unwrap();
+    state
+        .action(request(binding, 11, ZoomAction::SetScale(0.75)), done)
+        .unwrap();
+    // Matching output alone cannot acknowledge a pending request.
+    state
+        .tick_bound(
+            done,
+            |_| TargetRefresh::Ready {
+                target: 12,
+                scale: 2.0,
+            },
+            |_, _| panic!("receipt pending"),
+        )
+        .unwrap();
+    status.set(RequestStatus::Applied);
+    let later = done + Duration::from_millis(101);
+    // Reducer Applied plus unrelated/new desired scale is not presentation.
+    state
+        .tick_bound(
+            later,
+            |_| TargetRefresh::Ready {
+                target: 13,
+                scale: 0.75,
+            },
+            |_, _| panic!("sent sample not committed"),
+        )
+        .unwrap();
+    let mut sent = false;
+    state
+        .tick_bound(
+            later,
+            |_| TargetRefresh::Ready {
+                target: 14,
+                scale: 2.0,
+            },
+            |target, scale| {
+                assert_eq!((*target, scale), (14, 0.75));
+                sent = true;
+                Ok(receipt(RequestStatus::Applied))
+            },
+        )
+        .unwrap();
+    assert!(sent);
+    state
+        .tick_bound(
+            later,
+            |_| TargetRefresh::Ready {
+                target: 15,
+                scale: 0.75,
+            },
+            |_, _| panic!("settled"),
+        )
+        .unwrap();
+    assert!(!state.needs_tick(later));
+}
+
+#[test]
+fn settled_bound_session_does_not_request_or_redraw() {
+    let now = Instant::now();
+    let mut state = session();
+    let binding = PaneViewBinding::new("view", "pane").unwrap();
+    state
+        .action(request(binding, 11, ZoomAction::SetScale(2.0)), now)
+        .unwrap();
+    let done = now + Duration::from_millis(101);
+    state
+        .tick_bound(
+            done,
+            |_| TargetRefresh::Ready {
+                target: 11,
+                scale: 1.0,
+            },
+            |_, _| Ok(receipt(RequestStatus::Applied)),
+        )
+        .unwrap();
+    state
+        .tick_bound(
+            done,
+            |_| TargetRefresh::Ready {
+                target: 11,
+                scale: 2.0,
+            },
+            |_, _| panic!("already committed"),
+        )
+        .unwrap();
+    assert!(!state.needs_tick(done));
+    state
+        .tick_bound(
+            done + MAX_WAIT,
+            |_| TargetRefresh::Ready {
+                target: 11,
+                scale: 2.0,
+            },
+            |_, _| panic!("unrelated output"),
+        )
+        .unwrap();
+    assert!(!state.needs_tick(done + MAX_WAIT));
+}
+
+#[test]
+fn stalled_pending_and_in_flight_stop_polling_without_retiring_intent() {
+    for pending in [true, false] {
+        let now = Instant::now();
+        let mut state = session();
+        let binding = PaneViewBinding::new("view", "pane").unwrap();
+        state
+            .action(request(binding.clone(), 11, ZoomAction::SetScale(2.0)), now)
+            .unwrap();
+        let done = now + Duration::from_millis(101);
+        state
+            .tick_bound(
+                done,
+                |_| {
+                    if pending {
+                        TargetRefresh::Pending
+                    } else {
+                        TargetRefresh::Ready {
+                            target: 11,
+                            scale: 1.0,
+                        }
+                    }
+                },
+                |_, _| Ok(receipt(RequestStatus::Applied)),
+            )
+            .unwrap();
+        assert!(!state.needs_tick(done + MAX_WAIT));
+        assert_eq!(state.requested.target_scale(&binding), Some(2.0));
+        state
+            .action(
+                request(binding, 11, ZoomAction::SetScale(0.75)),
+                done + MAX_WAIT,
+            )
+            .unwrap();
+        assert!(state.needs_tick(done + MAX_WAIT));
+    }
+}
+
+#[test]
+fn queue_and_dequeue_failures_have_a_finite_retry_budget() {
+    for queue_failure in [true, false] {
+        let now = Instant::now();
+        let mut state = session();
+        let binding = PaneViewBinding::new("view", "pane").unwrap();
+        state
+            .action(request(binding, 11, ZoomAction::SetScale(2.0)), now)
+            .unwrap();
+        let done = now + Duration::from_millis(101);
+        let mut sends = 0;
+        for revision in 1..=20 {
+            let result = state.tick_bound(
+                done,
+                |_| TargetRefresh::Ready {
+                    target: 11,
+                    scale: 1.0,
+                },
+                |_, _| {
+                    sends += 1;
+                    if queue_failure {
+                        Err(anyhow::anyhow!("full"))
+                    } else {
+                        Ok(receipt(RequestStatus::Rejected))
+                    }
+                },
+            );
+            assert_eq!(
+                result.is_err(),
+                queue_failure && revision <= u64::from(MAX_RETRIES)
+            );
+        }
+        assert_eq!(sends, MAX_RETRIES);
+        assert!(!state.needs_tick(done));
+    }
+}
+
+#[test]
+fn saved_requested_scale_survives_dpi_cap_and_independent_named_views() {
+    let root = tempfile::tempdir().unwrap();
+    let (store, mut first) = stored_session(root.path());
+    let token = PaneViewRestoreToken::for_committed_pane("same-name", "pane").unwrap();
+    let binding = PaneViewBinding::new("first-instance", "pane/source").unwrap();
+    let now = Instant::now();
+    let mut action = request(binding.clone(), 11, ZoomAction::SetScale(2.5));
+    action.restore = Some(token.clone());
+    first.action(action, now).unwrap();
+    first.set_raster_cap(1250, now).unwrap();
+    first.flush();
+    assert_eq!(store.load_pane(&token).unwrap().unwrap().target_scale, 2.5);
+    let (_, mut second) = stored_session(root.path());
+    second.set_raster_cap(1500, now).unwrap();
+    let other = PaneViewBinding::new("second-instance", "pane/source").unwrap();
+    second.observe(other.clone(), 22, 1.0, token).unwrap();
+    wait_restore(&mut second, Some(22));
+    assert_eq!(second.state.target_scale(&other), Some(1.5));
+    assert_eq!(second.requested.target_scale(&other), Some(2.5));
+    second.set_raster_cap(8000, now).unwrap();
+    assert_eq!(second.state.target_scale(&other), Some(2.5));
+    assert_eq!(first.state.target_scale(&binding), Some(1.25));
+    assert_eq!(first.requested.target_scale(&binding), Some(2.5));
+}
+
+#[test]
+fn invalidated_source_drops_queued_preferences_before_io_admission() {
+    let root = tempfile::tempdir().unwrap();
+    let (store, mut state) = stored_session(root.path());
+    let token = PaneViewRestoreToken::for_committed_pane("named", "pane").unwrap();
+    let binding = PaneViewBinding::new("instance", "pane/source-a").unwrap();
+    let now = Instant::now();
+    let mut action = request(binding.clone(), 11, ZoomAction::SetScale(2.0));
+    action.restore = Some(token.clone());
+    state.action(action, now).unwrap();
+    state
+        .tick_bound(
+            now + Duration::from_secs(1),
+            |_| TargetRefresh::Gone,
+            |_, _| panic!("stale source"),
+        )
+        .unwrap();
+    assert!(state.pending.is_empty());
+    assert!(state.active.is_empty());
+    assert_eq!(state.requested.target_scale(&binding), None);
+    assert!(store.load_pane(&token).unwrap().is_none());
+}
+
+#[test]
+fn asynchronous_io_timeouts_stop_idle_polling() {
+    let root = tempfile::tempdir().unwrap();
+    let (_, mut state) = stored_session(root.path());
+    let token = PaneViewRestoreToken::for_committed_pane("named", "pane").unwrap();
+    let binding = PaneViewBinding::new("instance", "pane/source").unwrap();
+    let (_sender, receiver) = mpsc::channel();
+    state.loading = Some(RestoreLoad {
+        binding,
+        target: 11,
+        token,
+        current_scale: 1.0,
+        started: Instant::now() - MAX_WAIT,
+        receiver,
+    });
+    state.poll_restore(|_| TargetRefresh::Pending).unwrap();
+    assert!(!state.save_pending());
+    let (_sender, receiver) = mpsc::channel();
+    let now = Instant::now();
+    state.saving = Some(receiver);
+    state.saving_started = Some(now - MAX_WAIT);
+    state.poll_save(now);
+    assert!(!state.save_pending());
+    assert_eq!(state.save_spawn_failures, MAX_RETRIES);
 }
 
 #[test]

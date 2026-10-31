@@ -4,8 +4,9 @@ use tokio::sync::oneshot;
 
 pub use crate::runtime::attach::runtime::{
     NativeAttachEvent, NativeAttachHandle, NativeAttachHost, NativeClipboardRequest,
-    NativePanePointer, NativePaneZoomRefresh, NativePaneZoomTarget, QueueLatencySnapshot,
-    QueueMetricsSnapshot, run_native_with_client,
+    NativePanePointer, NativePaneZoomRefresh, NativePaneZoomRequestReceipt,
+    NativePaneZoomRequestStatus, NativePaneZoomTarget, QueueLatencySnapshot, QueueMetricsSnapshot,
+    run_native_with_client,
 };
 
 /// Install the same configured client plugin adapters as the standalone CLI.

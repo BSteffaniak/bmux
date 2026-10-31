@@ -12,6 +12,8 @@
 mod charset;
 mod delta;
 pub use charset::CharacterState;
+mod frozen;
+pub use frozen::FrozenContentRows;
 mod model;
 mod parser;
 mod reflow;

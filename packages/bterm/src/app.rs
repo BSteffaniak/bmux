@@ -687,7 +687,7 @@ impl<W: AttachWorker> Application<W> {
                                 // this callback returns. Poll restoration on a later turn.
                                 context.request_redraw_at(std::time::Instant::now() + std::time::Duration::from_millis(16));
                                 *semantic_generation = semantic_generation.saturating_add(1);
-                                if let Err(error) = context.commit_accessibility(
+                                if let Err(error) = context.commit_projected_accessibility(
                                     *semantic_generation,
                                     delivery.prepared.semantics(),
                                     bterm_native_platform::accessibility::AccessibilityGeometry {
@@ -697,23 +697,23 @@ impl<W: AttachWorker> Application<W> {
                                         cell_width: f64::from(cell[0]),
                                         cell_height: f64::from(cell[1]),
                                     },
+                                    delivery.prepared.projected_metadata().map(|metadata| &metadata.semantics),
                                 ) {
                                     context.invalidate_accessibility();
                                     eprintln!(
                                         "bterm: accessibility projection rejected: {error:?}"
                                     );
                                 }
-                                if let Some(cursor) =
-                                    delivery.prepared.cursor().filter(|cursor| cursor.visible)
+                                if let Some(pixels) = delivery.prepared.ime_cursor_bounds()
+                                    .and_then(|bounds| bounds.pixel_cover([f64::from(cell[0]), f64::from(cell[1])]))
                                 {
+                                    // Native viewport bounds constrain these finite pixel covers.
                                     context.set_ime_cursor_area(
                                         bterm_native_platform::PhysicalRect {
-                                            x: (f32::from(cursor.position.x) * cell[0]).floor() as i32,
-                                            y: (f32::from(cursor.position.y) * cell[1]).floor() as i32,
-                                            width: ((f32::from(cursor.position.x) + 1.0) * cell[0]).ceil() as u32
-                                                - (f32::from(cursor.position.x) * cell[0]).floor() as u32,
-                                            height: ((f32::from(cursor.position.y) + 1.0) * cell[1]).ceil() as u32
-                                                - (f32::from(cursor.position.y) * cell[1]).floor() as u32,
+                                            x: pixels[0] as i32,
+                                            y: pixels[1] as i32,
+                                            width: pixels[2] as u32,
+                                            height: pixels[3] as u32,
                                         },
                                     );
                                 }
@@ -1364,13 +1364,10 @@ impl AttachWorker for BmuxWorker {
                 else {
                     return TargetRefresh::Gone;
                 };
-                let (target, revision) = match handle.refresh_pane_zoom_status(previous_target) {
+                let target = match handle.refresh_pane_zoom_status(previous_target) {
                     NativePaneZoomRefresh::Pending => return TargetRefresh::Pending,
                     NativePaneZoomRefresh::Gone => return TargetRefresh::Gone,
-                    NativePaneZoomRefresh::Ready {
-                        target,
-                        progress_revision,
-                    } => (target, progress_revision),
+                    NativePaneZoomRefresh::Ready { target, .. } => target,
                 };
                 if !self
                     .committed_geometry
@@ -1387,7 +1384,6 @@ impl AttachWorker for BmuxWorker {
                 }
                 TargetRefresh::Ready {
                     target: current,
-                    revision,
                     scale: f64::from(target.scale_millis) / 1000.0,
                 }
             })?;
@@ -1402,13 +1398,10 @@ impl AttachWorker for BmuxWorker {
                     return TargetRefresh::Gone;
                 };
                 use bmux_cli::attach::NativePaneZoomRefresh;
-                let (current, progress_revision) = match handle.refresh_pane_zoom_status(target) {
+                let current = match handle.refresh_pane_zoom_status(target) {
                     NativePaneZoomRefresh::Pending => return TargetRefresh::Pending,
                     NativePaneZoomRefresh::Gone => return TargetRefresh::Gone,
-                    NativePaneZoomRefresh::Ready {
-                        target,
-                        progress_revision,
-                    } => (target, progress_revision),
+                    NativePaneZoomRefresh::Ready { target, .. } => target,
                 };
                 if !self
                     .committed_geometry
@@ -1417,7 +1410,6 @@ impl AttachWorker for BmuxWorker {
                     return TargetRefresh::Pending;
                 }
                 TargetRefresh::Ready {
-                    revision: progress_revision,
                     scale: f64::from(current.scale_millis) / 1000.0,
                     target: bmux_cli::attach::NativeAttachEvent::SetPaneZoom {
                         target: current,
@@ -1430,10 +1422,17 @@ impl AttachWorker for BmuxWorker {
                     anyhow::bail!("not a pane zoom request");
                 };
                 let scale_millis = (scale * 1000.0).round().clamp(125.0, 8000.0) as u16;
-                handle.try_send(bmux_cli::attach::NativeAttachEvent::SetPaneZoom {
-                    target: *target,
-                    scale_millis,
-                })
+                let receipt = handle.try_set_pane_zoom(*target, scale_millis)?;
+                let observe: crate::pane_zoom::session::RequestReceipt = Box::new(move || {
+                    use crate::pane_zoom::session::RequestStatus;
+                    use bmux_cli::attach::NativePaneZoomRequestStatus as Native;
+                    match receipt.status() {
+                        Native::Pending => RequestStatus::Pending,
+                        Native::Applied => RequestStatus::Applied,
+                        Native::Rejected => RequestStatus::Rejected,
+                    }
+                });
+                Ok(observe)
             },
         ) {
             // A full queue is not a presentation commit or a reason to lose the

@@ -89,6 +89,16 @@ impl State {
         scene: &SemanticScene,
         geometry: AccessibilityGeometry,
     ) -> Result<(), AccessibilityError> {
+        self.commit_projected(generation, scene, None, geometry)
+    }
+
+    fn commit_projected(
+        &mut self,
+        generation: u64,
+        scene: &SemanticScene,
+        projected: Option<&BTreeMap<String, bmux_tui::semantic::ProjectedBounds>>,
+        geometry: AccessibilityGeometry,
+    ) -> Result<(), AccessibilityError> {
         if generation <= self.generation {
             return Err(AccessibilityError::StaleGeneration);
         }
@@ -108,6 +118,17 @@ impl State {
         }
         if scene.regions().len() > MAX_REGIONS {
             return Err(AccessibilityError::BudgetExceeded);
+        }
+        if let Some(projected) = projected
+            && (projected.len() != scene.regions().len()
+                || scene.regions().iter().any(|region| {
+                    projected.get(&region.id).is_none_or(|bounds| {
+                        bounds.pixel_cover([g.cell_width, g.cell_height]).is_none()
+                            || bounds.cell_cover() != region.area
+                    })
+                }))
+        {
+            return Err(AccessibilityError::InvalidGeometry);
         }
         let mut bytes = 0usize;
         let mut seen = BTreeMap::new();
@@ -136,10 +157,21 @@ impl State {
         let mut next_id = self.next_id;
         let mut focus = ROOT;
         for region in scene.regions() {
-            let area = region.area.intersection(g.clip);
-            if area.is_empty() {
+            let bounds = if let Some(projected) = projected {
+                projected.get(&region.id).copied()
+            } else {
+                bmux_tui::semantic::ProjectedBounds::new(
+                    region.area,
+                    bmux_tui::grid_fragment::GridTransform::new(
+                        bmux_tui::geometry::Point::new(0, 0),
+                        1000,
+                    )
+                    .ok_or(AccessibilityError::InvalidGeometry)?,
+                )
+            };
+            let Some(bounds) = bounds.and_then(|bounds| bounds.clipped(g.clip)) else {
                 continue;
-            }
+            };
             // Never recycle a platform node ID across commits: delayed OS actions
             // for an old tree must not acquire the newest frame's authority.
             let id = NodeId(next_id);
@@ -154,13 +186,17 @@ impl State {
                 "terminal" => Role::Terminal,
                 _ => Role::GenericContainer,
             });
-            let x = g.origin_x + f64::from(area.x) * g.cell_width;
-            let y = g.origin_y + f64::from(area.y) * g.cell_height;
+            let pixels = [
+                g.origin_x + bounds.min[0] * g.cell_width,
+                g.origin_y + bounds.min[1] * g.cell_height,
+                g.origin_x + bounds.max[0] * g.cell_width,
+                g.origin_y + bounds.max[1] * g.cell_height,
+            ];
+            if !pixels.iter().all(|edge| edge.is_finite()) {
+                return Err(AccessibilityError::InvalidGeometry);
+            }
             node.set_bounds(accesskit::Rect::new(
-                x,
-                y,
-                x + f64::from(area.width) * g.cell_width,
-                y + f64::from(area.height) * g.cell_height,
+                pixels[0], pixels[1], pixels[2], pixels[3],
             ));
             if let Some(a) = &region.accessibility {
                 if !a.sensitive {
@@ -332,6 +368,28 @@ impl AccessibilityAdapter {
         Ok(())
     }
 
+    pub(crate) fn commit_projected(
+        &mut self,
+        generation: u64,
+        scene: &SemanticScene,
+        geometry: AccessibilityGeometry,
+        projected: Option<&BTreeMap<String, bmux_tui::semantic::ProjectedBounds>>,
+    ) -> Result<(), AccessibilityError> {
+        let tree = {
+            let mut state = self.state.lock().expect("accessibility state poisoned");
+            if let Err(error) = state.commit_projected(generation, scene, projected, geometry) {
+                state.invalidate();
+                let tree = state.tree.clone();
+                drop(state);
+                self.adapter.update_if_active(|| tree);
+                return Err(error);
+            }
+            state.tree.clone()
+        };
+        self.adapter.update_if_active(|| tree);
+        Ok(())
+    }
+
     /// Clear authority on surface loss or uncommitted geometry change.
     pub(crate) fn invalidate(&mut self) {
         let tree = {
@@ -434,6 +492,58 @@ mod tests {
         );
         assert_eq!(node.label(), Some("private name"));
         assert_ne!(state.tree.focus, ROOT);
+    }
+
+    #[test]
+    fn projected_semantics_preserve_fractional_physical_edges_and_failure_state() {
+        use bmux_tui::{
+            geometry::Point, grid_fragment::GridTransform, presentation::ProjectedMetadata,
+            semantic::ProjectedBounds,
+        };
+        for scale in [875, 1375] {
+            let mut state = State::new();
+            let mut scene = SemanticScene::new();
+            let bounds = ProjectedBounds::new(
+                Rect::new(1, 0, 2, 1),
+                GridTransform::new(Point::new(2, 1), scale).unwrap(),
+            )
+            .unwrap();
+            scene.push(SemanticRegion::new(
+                "fractional",
+                bounds.cell_cover(),
+                "label",
+            ));
+            let metadata = ProjectedMetadata {
+                selection: BTreeMap::new(),
+                semantics: [("fractional".into(), bounds)].into(),
+            };
+            let geometry = AccessibilityGeometry {
+                clip: Rect::new(0, 0, 16, 4),
+                origin_x: 3.0,
+                origin_y: 5.0,
+                cell_width: 10.5,
+                cell_height: 18.0,
+            };
+            state
+                .commit_projected(1, &scene, Some(&metadata.semantics), geometry)
+                .unwrap();
+            assert_eq!(
+                state.tree.nodes[0].1.bounds(),
+                Some(accesskit::Rect::new(
+                    3.0 + bounds.min[0] * 10.5,
+                    5.0 + bounds.min[1] * 18.0,
+                    3.0 + bounds.max[0] * 10.5,
+                    5.0 + bounds.max[1] * 18.0,
+                ))
+            );
+            let committed_bounds = state.tree.nodes[0].1.bounds();
+            assert_eq!(
+                state.commit_projected(2, &scene, Some(&BTreeMap::new()), geometry),
+                Err(AccessibilityError::InvalidGeometry)
+            );
+            assert_eq!(state.generation, 1);
+            assert_eq!(state.tree.nodes[0].1.bounds(), committed_bounds);
+        }
     }
 
     #[test]

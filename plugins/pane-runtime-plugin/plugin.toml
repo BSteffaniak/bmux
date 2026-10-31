@@ -4,6 +4,7 @@ name = "bmux Pane Runtime"
 optional_capabilities = ["bmux.application_resurrection.host"]
 owns_namespaces = ["pane-padding"]
 provided_capabilities = [
+    "bmux.pane_runtime.spawn.v1",
     "bmux.pane_runtime.view.size.v1",
     "bmux.pane_runtime.environment.v1",
     "bmux.pane_runtime.pointer_grid.v1",

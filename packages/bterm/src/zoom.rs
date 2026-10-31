@@ -287,8 +287,8 @@ impl ZoomInputMatcher {
     }
 
     /// Replace binding policy while retaining ownership of held physical keys.
-    /// Held keys keep their original repeat action until release, even if their
-    /// binding has changed or been removed.
+    /// Held keys keep ownership until release. Only step actions repeat; one-shot
+    /// Reset/Set actions are consumed without reapplying to a newly focused view.
     ///
     /// # Errors
     /// Returns an error for invalid configuration, leaving policy and held keys unchanged.
@@ -325,7 +325,17 @@ impl ZoomInputMatcher {
                             action: ZoomAction::Consume,
                         });
                     }
-                    return Some(action);
+                    return Some(ScopedZoomAction {
+                        scope: action.scope,
+                        action: if matches!(
+                            action.action,
+                            ZoomAction::In | ZoomAction::Out | ZoomAction::Steps(_)
+                        ) {
+                            action.action
+                        } else {
+                            ZoomAction::Consume
+                        },
+                    });
                 }
                 // A repeat without an owned press must not capture a worker-owned key.
                 if key.phase != KeyPhase::Press || key.physical == PhysicalKey::Unidentified {
@@ -609,6 +619,37 @@ mod tests {
                 action: ZoomAction::In
             })
         );
+    }
+
+    #[test]
+    fn held_one_shot_actions_are_consumed_until_release() {
+        let config = ZoomConfiguration {
+            bindings: vec![ZoomBinding::primary("0", ZoomAction::Reset)],
+            ..ZoomConfiguration::default()
+        };
+        let mut matcher = ZoomInputMatcher::new(&config).unwrap();
+        let event = |phase| {
+            InputEvent::Key(KeyEvent {
+                phase,
+                physical: PhysicalKey::Code("Digit0".into()),
+                logical: LogicalKey::Character("0".into()),
+                modifiers: primary(),
+                text: None,
+            })
+        };
+        assert_eq!(
+            matcher.input(&event(KeyPhase::Press)).unwrap().action,
+            ZoomAction::Reset
+        );
+        assert_eq!(
+            matcher.input(&event(KeyPhase::Repeat)).unwrap().action,
+            ZoomAction::Consume
+        );
+        assert_eq!(
+            matcher.input(&event(KeyPhase::Release)).unwrap().action,
+            ZoomAction::Consume
+        );
+        assert!(matcher.held.is_empty());
     }
 
     #[test]

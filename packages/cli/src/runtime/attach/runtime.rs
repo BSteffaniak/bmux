@@ -327,6 +327,9 @@ enum AttachHostEvent {
 /// Native host commands. Pointer coordinates must be converted using only the
 /// successfully displayed presentation, never an enqueued frame's hit map.
 pub use super::pane_zoom_native::{NativePaneZoomRefresh, NativePaneZoomTarget};
+pub use super::pane_zoom_receipt::{
+    NativePaneZoomRequestReceipt, NativePaneZoomRequestSettlement, NativePaneZoomRequestStatus,
+};
 
 #[derive(Clone, Copy, Debug)]
 pub enum NativePanePointer {
@@ -356,6 +359,11 @@ pub enum NativeAttachEvent {
     SetPaneZoom {
         target: NativePaneZoomTarget,
         scale_millis: u16,
+    },
+    SetPaneZoomTracked {
+        target: NativePaneZoomTarget,
+        scale_millis: u16,
+        settlement: NativePaneZoomRequestSettlement,
     },
     Input(bmux_frontend_runtime::input::InputEvent),
     /// Explicit execution-cell resize; physical pixels are not cell dimensions.
@@ -438,6 +446,23 @@ fn native_event_payload_bytes(event: &NativeAttachEvent) -> usize {
 }
 
 impl NativeAttachHandle {
+    /// Admit one exact zoom request, with settlement independent of unrelated frames.
+    ///
+    /// # Errors
+    /// Returns explicit queue backpressure or closed-receiver errors.
+    pub fn try_set_pane_zoom(
+        &self,
+        target: NativePaneZoomTarget,
+        scale_millis: u16,
+    ) -> Result<NativePaneZoomRequestReceipt> {
+        let (receipt, settlement) = NativePaneZoomRequestSettlement::new();
+        self.try_send(NativeAttachEvent::SetPaneZoomTracked {
+            target,
+            scale_millis,
+            settlement,
+        })?;
+        Ok(receipt)
+    }
     /// Lookup through the last successfully delivered retained compositor.
     #[must_use]
     pub fn pane_zoom_target(&self, point: Option<[f64; 2]>) -> Option<NativePaneZoomTarget> {
@@ -476,13 +501,14 @@ impl NativeAttachHandle {
         if Some(current.identity) != identity
             || current.identity.epoch != bound.identity.epoch
             || current.identity.attached_id != bound.identity.attached_id
-            || current.identity.viewport_generation != bound.identity.viewport_generation
-            || current.identity.viewport_generation
-                < self.1.load(std::sync::atomic::Ordering::Acquire)
             || current.pane_id != bound.pane_id
             || current.execution_id != bound.execution_id
         {
             return NativePaneZoomRefresh::Gone;
+        }
+        if current.identity.viewport_generation < self.1.load(std::sync::atomic::Ordering::Acquire)
+        {
+            return NativePaneZoomRefresh::Pending;
         }
         NativePaneZoomRefresh::Ready {
             target: current,
@@ -1092,6 +1118,7 @@ async fn native_attach_input(
         | NativeAttachEvent::Suspend { .. }
         | NativeAttachEvent::PointerAt { .. }
         | NativeAttachEvent::SetPaneZoom { .. }
+        | NativeAttachEvent::SetPaneZoomTracked { .. }
         | NativeAttachEvent::Close
         | NativeAttachEvent::Resize { .. }
         | NativeAttachEvent::Accessibility { .. }
@@ -5498,6 +5525,16 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
                         }
                         Event::Resize(columns, rows)
                     }
+                    AttachHostEvent::Native(NativeAttachEvent::SetPaneZoomTracked { target, scale_millis, settlement }) => {
+                        let accepted = if native_identity_is_current(&view_state, terminal, target.identity) {
+                            match super::pane_zoom_native::set_target(&mut view_state, &mut client, target, scale_millis).await {
+                                Ok(accepted) => accepted,
+                                Err(error) => { tracing::warn!(%error, "local pane zoom request rejected"); false }
+                            }
+                        } else { false };
+                        settlement.settle(accepted);
+                        break 'host_input;
+                    }
                     AttachHostEvent::Native(NativeAttachEvent::SetPaneZoom { target, scale_millis }) => {
                         let accepted = if native_identity_is_current(&view_state, terminal, target.identity) {
                             match super::pane_zoom_native::set_target(&mut view_state, &mut client, target, scale_millis).await {
@@ -8598,9 +8635,14 @@ pub fn attach_pane_inner_size(
         .iter()
         .find(|surface| surface.visible && surface.pane_id == Some(pane_id))
         .map(|surface| {
+            let scale = view_state
+                .pane_zoom
+                .requested
+                .get(&surface.id)
+                .map_or(1000, |(_, scale)| usize::from(*scale));
             (
-                usize::from(surface.content_rect.w.max(1)),
-                usize::from(surface.content_rect.h.max(1)),
+                (usize::from(surface.content_rect.w.max(1)) * 1000 / scale).max(1),
+                (usize::from(surface.content_rect.h.max(1)) * 1000 / scale).max(1),
             )
         })
 }
@@ -9044,7 +9086,8 @@ pub fn format_clipboard_service_error(error: &anyhow::Error) -> String {
 }
 
 pub fn selected_attach_text(view_state: &mut AttachViewState) -> Option<String> {
-    if view_state.pane_zoom.selection.is_some() {
+    if view_state.pane_zoom.selection.is_some() || view_state.pane_zoom.history_selection.is_some()
+    {
         return super::pane_zoom_native::selected_text(view_state);
     }
     let (start, end) = attach_selection_bounds(view_state)?;
@@ -12232,7 +12275,7 @@ pub(super) async fn hydrate_attach_structured_grid_snapshots(
     clippy::too_many_lines,
     reason = "window selection, fallback and selection-anchor reconciliation form one ordered refresh workflow"
 )]
-fn ensure_pane_scrollback_windows(
+pub(super) fn ensure_pane_scrollback_windows(
     _client: &mut StreamingBmuxClient,
     view_state: &mut AttachViewState,
     force_refresh: bool,
@@ -12299,10 +12342,19 @@ fn ensure_pane_scrollback_windows(
             && let Some(shared) = view_state.decoded_history.get(pane)
             && let Ok(mut cache) = shared.try_lock()
         {
-            let anchor = previous.and_then(|window| window.row_anchors.last().copied());
+            let anchor = previous.and_then(|window| {
+                if window.projection_width == width {
+                    window.row_anchors.last().copied()
+                } else {
+                    window.row_anchors.first().copied()
+                }
+            });
             let delta = previous
                 .filter(|window| !window.row_anchors.is_empty())
                 .map_or(0, |window| {
+                    if window.projection_width != width {
+                        return -isize::try_from(rows.saturating_sub(1)).unwrap_or(isize::MAX);
+                    }
                     let distance = isize::try_from(offset.abs_diff(window.scrollback_offset))
                         .unwrap_or(isize::MAX);
                     if offset >= window.scrollback_offset {
@@ -12346,10 +12398,21 @@ fn ensure_pane_scrollback_windows(
                 total: previous
                     .filter(|_| view.pin.is_none())
                     .map(|window| window.total_scrolled_rows),
-                anchor: previous.and_then(|window| window.row_anchors.last().copied()),
+                anchor: previous.and_then(|window| {
+                    if window.projection_width == width {
+                        window.row_anchors.last().copied()
+                    } else {
+                        window.row_anchors.first().copied()
+                    }
+                }),
                 delta: previous
                     .filter(|window| !window.row_anchors.is_empty())
                     .map_or(0, |window| {
+                        if window.projection_width != width {
+                            // The history query addresses an inclusive bottom anchor.
+                            // Advance from the preserved top to fill the new height.
+                            return -isize::try_from(rows.saturating_sub(1)).unwrap_or(isize::MAX);
+                        }
                         let distance = isize::try_from(offset.abs_diff(window.scrollback_offset))
                             .unwrap_or(isize::MAX);
                         if offset >= window.scrollback_offset {
