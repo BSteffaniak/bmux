@@ -69,9 +69,7 @@ pub fn try_run() -> Result<Option<u8>, String> {
     }
     let value: serde_json::Value =
         serde_json::from_slice(&response).map_err(|error| error.to_string())?;
-    if value["protocol"] != PROTOCOL || value["ok"] != true {
-        return Err("shell invocation boundary rejected".into());
-    }
+    validate_response(&value)?;
     if operation == "location" {
         if let Some(cwd) = value["replay"].as_str() {
             print!("{cwd}");
@@ -85,4 +83,49 @@ pub fn try_run() -> Result<Option<u8>, String> {
         print!("\u{1b}]633;bmux;{token};nested-ready\u{7}");
     }
     Ok(Some(0))
+}
+
+fn validate_response(value: &serde_json::Value) -> Result<(), String> {
+    if value["protocol"] != PROTOCOL {
+        return Err("invalid shell callback response protocol".into());
+    }
+    if value["ok"] == true {
+        return Ok(());
+    }
+    // Old hosts omit error codes. Never print arbitrary host-provided text or
+    // control characters to the user's terminal.
+    let code = value["error"]["code"].as_str().filter(|code| {
+        !code.is_empty()
+            && code.len() <= 64
+            && code
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
+    });
+    Err(code.map_or_else(
+        || "shell invocation boundary rejected".into(),
+        |code| format!("shell invocation boundary rejected ({code})"),
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn responses_preserve_legacy_success_and_rejection() {
+        assert!(validate_response(&serde_json::json!({"protocol": PROTOCOL, "ok": true})).is_ok());
+        assert_eq!(
+            validate_response(&serde_json::json!({"protocol": PROTOCOL, "ok": false})).unwrap_err(),
+            "shell invocation boundary rejected"
+        );
+        assert_eq!(validate_response(&serde_json::json!({"protocol": PROTOCOL, "ok": false, "error": {"code": "launch_not_bound"}})).unwrap_err(), "shell invocation boundary rejected (launch_not_bound)");
+        assert_eq!(
+            validate_response(
+                &serde_json::json!({"protocol": PROTOCOL, "error": {"code": "secret\u{1b}[31m"}})
+            )
+            .unwrap_err(),
+            "shell invocation boundary rejected"
+        );
+        assert!(validate_response(&serde_json::json!({"protocol": "other", "ok": true})).is_err());
+    }
 }

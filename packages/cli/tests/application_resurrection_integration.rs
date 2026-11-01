@@ -215,12 +215,19 @@ async fn nested_round_trip(
   eval "$("$BMUX_SHELL_CALLBACK" __shell-integration bash)"
 fi
 "#).unwrap();
+    let zsh_ready = server.root().join("zsh-ready");
     std::fs::write(
         server.root().join("home/.zshrc"),
-        r#"if [[ -n ${BMUX_SHELL_CALLBACK:-} ]]; then
+        format!(
+            r#"if [[ -n ${{BMUX_SHELL_CALLBACK:-}} ]]; then
   eval "$("$BMUX_SHELL_CALLBACK" __shell-integration zsh)"
 fi
+__fixture_ready() {{ print -r -- "$$" >> '{}' }}
+autoload -Uz add-zsh-hook
+add-zsh-hook precmd __fixture_ready
 "#,
+            zsh_ready.display()
+        ),
     )
     .unwrap();
     server.write_config(&format!(
@@ -253,6 +260,12 @@ if ack != {'revision': 1}:
 with open(sys.argv[1], 'a') as out: out.write('committed\n')
 while True: time.sleep(1)
 "#).unwrap();
+    let nu_ready = server.root().join("nushell-ready");
+    std::fs::create_dir_all(server.root().join("home/.config/nushell")).unwrap();
+    std::fs::write(
+        server.root().join("home/.config/nushell/config.nu"),
+        format!("$env.config = ($env.config | upsert show_banner false | upsert hooks.pre_prompt [{{|| $'($nu.pid)(char newline)' | save --append '{}' }}])\n", nu_ready.display()),
+    ).unwrap();
     server.start();
     let endpoint = bmux_ipc::IpcEndpoint::UnixSocket(server.runtime_dir.join("server.sock"));
     let mut connection =
@@ -290,6 +303,7 @@ while True: time.sleep(1)
         let pane = panes.panes[0].id;
         // Wait for shell startup before injecting a command through the public input service.
         tokio::time::sleep(Duration::from_secs(1)).await;
+        let mut nu_count = usize::from(shell_program.ends_with("/nu"));
         for nested_shell in nested {
             client::pane_direct_input(
                 &mut connection,
@@ -300,7 +314,40 @@ while True: time.sleep(1)
             .await
             .unwrap()
             .unwrap();
-            tokio::time::sleep(Duration::from_secs(1)).await;
+            if *nested_shell == "zsh" {
+                let deadline = Instant::now() + Duration::from_secs(15);
+                while std::fs::read_to_string(&zsh_ready)
+                    .unwrap_or_default()
+                    .is_empty()
+                {
+                    assert!(
+                        Instant::now() < deadline,
+                        "nested Zsh did not reach its prompt"
+                    );
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            } else if *nested_shell == "nu" {
+                nu_count += 1;
+                let deadline = Instant::now() + Duration::from_secs(15);
+                loop {
+                    let ready = std::fs::read_to_string(&nu_ready).unwrap_or_default();
+                    if ready
+                        .lines()
+                        .collect::<std::collections::BTreeSet<_>>()
+                        .len()
+                        >= nu_count
+                    {
+                        break;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "nested Nushell did not reach its prompt; ready={ready:?}"
+                    );
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            } else {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
         }
         client::pane_direct_input(
             &mut connection,
@@ -362,6 +409,11 @@ while True: time.sleep(1)
     for result in &results {
         wait_for(result, "committed", &server).await;
     }
+    assert!(
+        !server.server_output().contains("shell callback rejected"),
+        "shell startup rejected a lifecycle callback: {}",
+        server.server_output()
+    );
     if shell {
         // Application selection commits over a different socket from shell
         // metadata. Do not snapshot until both authorities observed the launch.

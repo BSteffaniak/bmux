@@ -35,9 +35,9 @@ impl NestedShell {
 #[serde(deny_unknown_fields)]
 pub(super) struct Boundary {
     pub protocol: String,
-    operation: String,
+    pub(super) operation: String,
     shell: String,
-    shell_pid: u32,
+    pub(super) shell_pid: u32,
     text: String,
     cwd: String,
 }
@@ -45,6 +45,52 @@ pub(super) struct Boundary {
 pub(super) fn handle(
     entry: &Entry,
     peer: u32,
+    boundary: Boundary,
+) -> Result<Option<String>, super::readiness::Rejection> {
+    use super::readiness::{self, Rejection};
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    if boundary.protocol != PROTOCOL
+        || !matches!(boundary.operation.as_str(), "prompt" | "start" | "location")
+    {
+        return Err(Rejection::new(
+            "invalid_operation",
+            "invalid shell lifecycle operation",
+        ));
+    }
+    let callback = process::inspect(peer)
+        .map_err(|error| Rejection::new("callback_identity_unavailable", error))?;
+    let shell = process::ancestor(peer, boundary.shell_pid)
+        .map_err(|error| Rejection::new("shell_ancestry_rejected", error))?;
+    readiness::wait(entry, shell.identity, deadline)?;
+    if !process::current(callback.identity) {
+        return Err(Rejection::new(
+            "callback_identity_changed",
+            "callback process changed while awaiting readiness",
+        ));
+    }
+    // Waiting grants no authority: redo executable, ancestry and foreground
+    // verification against live processes after readiness is established.
+    handle_ready(entry, peer, shell.identity, boundary).map_err(|error| {
+        let code = match error.as_str() {
+            "invalid shell lifecycle operation" => "invalid_operation",
+            "shell executable identity mismatch" => "shell_executable_mismatch",
+            "callback does not belong to shell terminal" => "callback_terminal_mismatch",
+            "shell belongs to another pane terminal or session" => "owner_terminal_mismatch",
+            "shell execution stopped" => "execution_stopped",
+            "owner command boundary not active" => "command_boundary_not_ready",
+            "owner process identity changed" => "owner_identity_changed",
+            "requesting shell identity changed" => "shell_identity_changed",
+            "launch owner is not a shell" => "owner_not_shell",
+            _ => "shell_boundary_rejected",
+        };
+        Rejection::new(code, error)
+    })
+}
+
+fn handle_ready(
+    entry: &Entry,
+    peer: u32,
+    expected: Identity,
     boundary: Boundary,
 ) -> Result<Option<String>, String> {
     if boundary.protocol != PROTOCOL
@@ -54,6 +100,9 @@ pub(super) fn handle(
     }
     let callback = process::inspect(peer)?;
     let shell = process::ancestor(peer, boundary.shell_pid)?;
+    if shell.identity != expected {
+        return Err("requesting shell identity changed".into());
+    }
     let executable = process::executable(shell.identity.pid)?;
     let declared = std::fs::canonicalize(&boundary.shell).map_err(|error| error.to_string())?;
     if std::fs::canonicalize(executable).map_err(|error| error.to_string())? != declared
@@ -80,21 +129,24 @@ fn advance(
     boundary: Boundary,
 ) -> Result<Option<String>, String> {
     let mut state = entry.state.lock().map_err(|error| error.to_string())?;
+    if entry.stopped.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err("shell execution stopped".into());
+    }
+    if !process::current(shell.identity) {
+        return Err("requesting shell identity changed".into());
+    }
     if state.identity == Some(shell.identity)
-        && state.executable.as_deref() == Some(std::path::Path::new(&boundary.shell))
+        && state
+            .executable
+            .as_deref()
+            .and_then(|path| path.canonicalize().ok())
+            .zip(std::path::Path::new(&boundary.shell).canonicalize().ok())
+            .is_some_and(|(owner, declared)| owner == declared)
     {
         // The pane owner's existing authenticated OSC hooks own root boundaries.
         return Ok(None);
     }
-    if entry.stopped.load(std::sync::atomic::Ordering::SeqCst)
-        || !state.shell
-        || state.command_phase != CommandPhase::Active
-        || !state.identity.is_some_and(process::current)
-        || !process::current(shell.identity)
-    {
-        return Err("shell execution unavailable".into());
-    }
-    verify_pane(&state, shell)?;
+    verify_nested_owner(&state, shell)?;
     // Dead shells cannot retain claims on a successor process with a recycled PID.
     state
         .nested
@@ -179,6 +231,19 @@ fn advance(
         .checked_add(1)
         .ok_or("execution epoch exhausted")?;
     Ok(None)
+}
+
+fn verify_nested_owner(state: &State, shell: process::Process) -> Result<(), String> {
+    if !state.shell {
+        return Err("launch owner is not a shell".into());
+    }
+    if state.command_phase != CommandPhase::Active {
+        return Err("owner command boundary not active".into());
+    }
+    if !state.identity.is_some_and(process::current) {
+        return Err("owner process identity changed".into());
+    }
+    verify_pane(state, shell)
 }
 
 fn verify_pane(state: &State, shell: process::Process) -> Result<(), String> {
@@ -392,6 +457,63 @@ mod tests {
             text: text.into(),
             cwd: "/workspace".into(),
         }
+    }
+
+    #[test]
+    fn root_executable_alias_is_acknowledged_without_activating_command() {
+        let directory = tempfile::tempdir().unwrap();
+        let host = Host::new(directory.path().to_owned()).unwrap();
+        let key = Uuid::new_v4().to_string();
+        let endpoint = host.prepare(&key, false, true, false).unwrap();
+        host.bind(&key, &endpoint, std::process::id()).unwrap();
+        let entry = host.entry(&key, &endpoint).unwrap();
+        let alias = directory.path().join("shell-alias");
+        std::os::unix::fs::symlink(std::env::current_exe().unwrap(), &alias).unwrap();
+        let mut request = boundary("location", "");
+        request.shell = alias.to_string_lossy().into_owned();
+        let shell = process::inspect(std::process::id()).unwrap();
+        advance(&entry, shell, request).unwrap();
+        assert!(entry.state.lock().unwrap().command_phase == CommandPhase::AwaitingBoundary);
+        assert!(entry.state.lock().unwrap().nested.is_empty());
+    }
+
+    #[test]
+    fn readiness_never_bypasses_executable_terminal_or_shutdown_checks() {
+        let directory = tempfile::tempdir().unwrap();
+        let host = Host::new(directory.path().to_owned()).unwrap();
+        let key = Uuid::new_v4().to_string();
+        let endpoint = host.prepare(&key, false, true, false).unwrap();
+        host.bind(&key, &endpoint, std::process::id()).unwrap();
+        host.boundary(&key, &endpoint, true).unwrap();
+        host.boundary(&key, &endpoint, false).unwrap();
+        let entry = host.entry(&key, &endpoint).unwrap();
+        let child = child();
+        let mut shell = process::inspect(child.0.id()).unwrap();
+        let mut request = boundary("location", "");
+        request.shell_pid = child.0.id();
+        request.shell = "/bin/sh".into();
+        assert_eq!(
+            handle_ready(&entry, child.0.id(), shell.identity, request).unwrap_err(),
+            "shell executable identity mismatch"
+        );
+        let owner = process::inspect(std::process::id()).unwrap();
+        shell.session = owner.session + 1;
+        assert_eq!(
+            advance(&entry, shell, boundary("prompt", "")).unwrap_err(),
+            "shell belongs to another pane terminal or session"
+        );
+        shell.session = owner.session;
+        shell.terminal = owner.terminal + 1;
+        assert_eq!(
+            advance(&entry, shell, boundary("prompt", "")).unwrap_err(),
+            "shell belongs to another pane terminal or session"
+        );
+        host.close(&key, &endpoint).unwrap();
+        assert_eq!(
+            advance(&entry, owner, boundary("prompt", "")).unwrap_err(),
+            "shell execution stopped"
+        );
+        assert!(entry.state.lock().unwrap().nested.is_empty());
     }
 
     #[test]

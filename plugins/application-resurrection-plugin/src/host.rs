@@ -8,8 +8,9 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 
+mod readiness;
 mod scopes;
 use scopes::NestedShell;
 
@@ -35,6 +36,7 @@ struct Entry {
     file: PathBuf,
     stopped: AtomicBool,
     state: Mutex<State>,
+    changed: Condvar,
     connections: std::sync::atomic::AtomicUsize,
 }
 
@@ -170,6 +172,7 @@ impl Host {
             endpoint: endpoint.clone(),
             file,
             stopped: AtomicBool::new(false),
+            changed: Condvar::new(),
             connections: std::sync::atomic::AtomicUsize::new(0),
             state: Mutex::new(State {
                 execution,
@@ -221,6 +224,7 @@ impl Host {
         state.pid = Some(pid);
         state.identity = Some(identity);
         state.executable = executable;
+        entry.changed.notify_all();
         Ok(true)
     }
 
@@ -267,6 +271,7 @@ impl Host {
         } else {
             CommandPhase::Active
         };
+        entry.changed.notify_all();
         if !prompt && state.replay_start {
             state.replay_start = false;
             return Ok((true, state.execution.committed.invocation.to_string()));
@@ -369,6 +374,7 @@ fn stop_and_drain(entry: &Entry) -> Result<(), String> {
     // Serialize with checkpoint replacement. A writer already holding this lock
     // finishes before the successor reads durable state; later writers are fenced.
     let mut state = entry.state.lock().map_err(|e| e.to_string())?;
+    entry.changed.notify_all();
     state.execution.end();
     Ok(())
 }
@@ -616,19 +622,26 @@ fn serve(entry: &Entry, stream: UnixStream) -> Result<(), String> {
     // Re-chain it for the existing application decoder without relaxing its schema.
     let frame: serde_json::Value = receive(&mut reader)?;
     if frame["protocol"] == scopes::PROTOCOL {
-        let boundary = serde_json::from_value(frame).map_err(|error| error.to_string())?;
+        let boundary: scopes::Boundary =
+            serde_json::from_value(frame).map_err(|error| error.to_string())?;
+        let operation = boundary.operation.clone();
+        let shell_pid = boundary.shell_pid;
         let result = scopes::handle(entry, peer, boundary);
         if let Err(error) = &result {
-            tracing::warn!(%error, "shell callback rejected");
+            let state = entry.state.lock().map_err(|error| error.to_string())?;
+            tracing::warn!(code = error.code, detail = %error.detail, %operation, peer_pid = peer,
+                shell_pid, owner_pid = ?state.pid, invocation = %state.execution.committed.invocation,
+                "shell callback rejected");
         }
         send(
             reader.get_mut(),
             &serde_json::json!({
                 "protocol": scopes::PROTOCOL, "ok": result.is_ok(),
+                "error": result.as_ref().err().map(|error| serde_json::json!({"code": error.code})),
                 "replay": result.as_ref().ok().and_then(|command| command.as_deref()),
             }),
         )?;
-        return result.map(|_| ());
+        return result.map(|_| ()).map_err(|error| error.code.to_owned());
     }
     serve_application(entry, reader, frame)
 }
