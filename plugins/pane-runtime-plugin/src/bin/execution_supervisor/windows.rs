@@ -276,12 +276,14 @@ impl Server {
         Ok(LifecycleSnapshot {
             capability: protocol::LIFECYCLE_CAPABILITY,
             revision: self.revision,
+            stage: None,
             status: self.scope.status.clone(),
         })
     }
     fn operate(&mut self, operation: &Operation) -> io::Result<Response> {
         let mutation = match operation {
             Operation::Start { mutation_id, .. }
+            | Operation::RequestStop { mutation_id }
             | Operation::Sweep { mutation_id }
             | Operation::Term { mutation_id }
             | Operation::RetireOwner { mutation_id } => mutation_id,
@@ -309,6 +311,7 @@ impl Server {
                 io::ErrorKind::Unsupported,
                 "Windows graceful Term unsupported; use owned-job Sweep",
             )),
+            Operation::RequestStop { .. } => self.scope.request_stop(),
             Operation::Sweep { .. } => self.scope.sweep(),
             Operation::RetireOwner { .. }
                 if self.scope.status.terminal_session_ended != Some(true) =>

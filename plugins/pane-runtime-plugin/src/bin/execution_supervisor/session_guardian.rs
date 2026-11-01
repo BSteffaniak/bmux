@@ -18,6 +18,7 @@ use lifecycle::Lifecycle;
 
 #[derive(serde::Serialize, serde::Deserialize)]
 enum OwnerEvent {
+    Stage(String),
     Ready(u32),
     Outcome(OwnerOutcome),
 }
@@ -247,6 +248,10 @@ pub(super) fn owner(launch_path: &str, outcome_path: &str) -> io::Result<()> {
     };
     // End all ordinary job-control groups even on natural shell exit. Keep
     // target exit distinct from capture/drain and cleanup failures.
+    let _ = protocol::write_frame(
+        &mut events,
+        &OwnerEvent::Stage("target exited; session cleanup".into()),
+    );
     let cleanup_result = crate::session_cleanup::sweep(None);
     cleanup_on_error.0 = cleanup_result.is_err();
     let mut outcome = OwnerOutcome {
@@ -272,6 +277,10 @@ pub(super) fn owner(launch_path: &str, outcome_path: &str) -> io::Result<()> {
     // No tcdrain/alarm: an unread PTY can stall Darwin close/exit after
     // interrupted tcdrain. Poll queued output for a bounded capture grace,
     // then explicitly report failed capture before discarding queued bytes.
+    let _ = protocol::write_frame(
+        &mut events,
+        &OwnerEvent::Stage("draining terminal output".into()),
+    );
     if let Err(error) = drain_terminal(1, Duration::from_millis(250)) {
         outcome.drain_error.get_or_insert_with(|| error.to_string());
     }
@@ -361,6 +370,42 @@ impl Guardian {
         status.target_terminated = self.consumed;
         status.cleanup_error = self.signal_failure.clone().or(status.cleanup_error);
         Ok(status)
+    }
+
+    fn request_stop(&mut self) -> io::Result<()> {
+        let status = self.lifecycle.snapshot().status;
+        if self.preowner_failure {
+            self.consumed = true;
+            return Ok(());
+        }
+        acknowledge_cleanup(&status)?;
+        if status.terminal_session_ended == Some(true) {
+            self.consumed = true;
+            return Ok(());
+        }
+        // The private owner channel is valid before target readiness; the owner
+        // processes queued stop requests after installing its target identity.
+        // Acceptance is not retirement. The lifecycle reader retains authority
+        // while the terminal owner reaps, drains and publishes its outcome.
+        let _ = self.lifecycle.stage("stop accepted; awaiting target exit");
+        match protocol::write_frame(
+            self.owner_control
+                .as_mut()
+                .ok_or_else(|| io::Error::other("terminal owner control unavailable"))?,
+            &libc::SIGKILL,
+        ) {
+            // The exact owner observer, not this disconnected channel, decides
+            // whether retirement succeeded. Never turn this race into failure.
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset
+                ) =>
+            {
+                Ok(())
+            }
+            result => result,
+        }
     }
 
     fn signal(&mut self, signal: i32) -> io::Result<()> {
@@ -496,6 +541,9 @@ impl Guardian {
                         let result = (|| -> io::Result<()> {
                             loop {
                                 match protocol::read_frame::<OwnerEvent>(&mut events) {
+                                    Ok(OwnerEvent::Stage(stage)) => {
+                                        let _ = lifecycle.stage(&stage);
+                                    }
                                     Ok(OwnerEvent::Ready(pid)) => {
                                         lifecycle.update(|s| s.target_pid = Some(pid))?
                                     }
@@ -513,6 +561,8 @@ impl Guardian {
                             }
                             // EOF is not completion: wait for our direct owner identity.
                             wait_child_identity(owner_pid)?;
+                            let _ =
+                                lifecycle.stage("terminal owner exited; verifying session cleanup");
                             crate::session_cleanup::sweep(Some(owner_pid))?;
                             // Owner exit closed every helper-held slave descriptor.
                             // Guardian retains only control sockets, not a terminal
@@ -542,6 +592,7 @@ impl Guardian {
                 }
             }
             Operation::Term { .. } => self.signal(libc::SIGTERM)?,
+            Operation::RequestStop { .. } => self.request_stop()?,
             Operation::Sweep { .. } => self.signal(libc::SIGKILL)?,
             Operation::RetireOwner { .. } => {
                 if !self.preowner_failure {
@@ -565,7 +616,10 @@ impl Guardian {
         if self.preowner_failure
             && matches!(
                 operation,
-                Operation::Term { .. } | Operation::Sweep { .. } | Operation::RetireOwner { .. }
+                Operation::Term { .. }
+                    | Operation::Sweep { .. }
+                    | Operation::RequestStop { .. }
+                    | Operation::RetireOwner { .. }
             )
         {
             // Cleanup acknowledgment is separate from the retained launch failure.
@@ -585,6 +639,7 @@ impl Guardian {
         let mutation = match &request.operation {
             Operation::Start { mutation_id, .. }
             | Operation::Term { mutation_id }
+            | Operation::RequestStop { mutation_id }
             | Operation::Sweep { mutation_id }
             | Operation::RetireOwner { mutation_id } => Some(mutation_id),
             Operation::Hello
@@ -766,7 +821,22 @@ pub(super) fn run(bootstrap_path: &str, socket_path: &str, slave: &str) -> io::R
             .map_err(|_| io::Error::other("guardian lock poisoned"))
             .and_then(|mut guardian| {
                 if guardian.owner.is_some() {
-                    guardian.signal(libc::SIGKILL)?;
+                    guardian.request_stop()?;
+                    // Lease revocation has the same retirement obligations as
+                    // explicit shutdown; the legacy signal acknowledgment
+                    // budget must not truncate retained cleanup ownership.
+                    let cancelled = std::sync::atomic::AtomicBool::new(false);
+                    let mut snapshot = guardian.lifecycle.snapshot();
+                    loop {
+                        acknowledge_cleanup(&snapshot.status)?;
+                        if snapshot.status.terminal_session_ended == Some(true) {
+                            break;
+                        }
+                        snapshot = guardian
+                            .lifecycle
+                            .next(snapshot.revision, &cancelled)
+                            .ok_or_else(|| io::Error::other("retirement observation cancelled"))?;
+                    }
                     if let Some(owner) = guardian.owner.as_mut() {
                         owner.wait()?;
                     }
@@ -937,6 +1007,23 @@ mod tests {
             native_env_encoding: None,
         }
     }
+    #[test]
+    fn stop_acceptance_does_not_wait_for_readiness_or_invent_retirement() {
+        let (_root, mut guardian) = disconnected_owner_fixture();
+        guardian
+            .lifecycle
+            .update(|status| status.target_pid = None)
+            .unwrap();
+        guardian.request_stop().unwrap();
+        let snapshot = guardian.lifecycle.snapshot();
+        assert_eq!(
+            snapshot.stage.as_deref(),
+            Some("stop accepted; awaiting target exit")
+        );
+        assert_eq!(snapshot.status.terminal_session_ended, Some(false));
+        assert!(!guardian.consumed);
+    }
+
     fn disconnected_owner_fixture() -> (tempfile::TempDir, Guardian) {
         let root = tempfile::tempdir().unwrap();
         let lifecycle = Arc::new(

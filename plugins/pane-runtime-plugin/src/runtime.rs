@@ -16466,7 +16466,10 @@ exit 7"#
         .await
         .expect("failed Sweep retained a live slave holder");
         assert!(state.lock().unwrap().frozen);
-        assert!(execution.cleanup_failed.load(Ordering::SeqCst));
+        // Losing the control endpoint is observation uncertainty, not a
+        // permanently recorded cleanup failure. The explicit failed receipt
+        // still prevents this fixture from claiming completed cleanup.
+        assert!(!execution.cleanup_failed.load(Ordering::SeqCst));
         assert!(
             !execution.cleanup_complete(true),
             "fallback must not fabricate cleanup success"

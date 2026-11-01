@@ -180,13 +180,18 @@ impl Scope {
         result
     }
 
-    pub(super) fn sweep(&mut self) -> io::Result<()> {
+    pub(super) fn request_stop(&mut self) -> io::Result<()> {
         self.swept = true;
         if unsafe { TerminateJobObject(self.job.0, 1) } == 0 {
             let error = io::Error::last_os_error();
             self.status.cleanup_error = Some(error.to_string());
             return Err(error);
         }
+        Ok(())
+    }
+
+    pub(super) fn sweep(&mut self) -> io::Result<()> {
+        self.request_stop()?;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
         loop {
             self.refresh()?;

@@ -1,4 +1,24 @@
 #[test]
+fn stop_transport_uncertainty_is_not_a_cleanup_failure() {
+    for kind in [
+        std::io::ErrorKind::TimedOut,
+        std::io::ErrorKind::UnexpectedEof,
+        std::io::ErrorKind::ConnectionRefused,
+        std::io::ErrorKind::BrokenPipe,
+    ] {
+        assert!(super::transport_uncertain(
+            &std::io::Error::from(kind).into()
+        ));
+    }
+    assert!(!super::transport_uncertain(&anyhow::anyhow!(
+        "identity mismatch"
+    )));
+    assert!(!super::transport_uncertain(
+        &std::io::Error::from(std::io::ErrorKind::PermissionDenied).into()
+    ));
+}
+
+#[test]
 fn missing_helper_fails_closed_even_for_ordinary_shells() {
     for required in [false, true] {
         let result =
@@ -94,6 +114,7 @@ fn snapshot(revision: u64) -> crate::supervisor_protocol::LifecycleSnapshot {
     protocol::LifecycleSnapshot {
         capability: protocol::LIFECYCLE_CAPABILITY,
         revision,
+        stage: None,
         status: Response {
             version: protocol::VERSION,
             execution_token: "test".into(),

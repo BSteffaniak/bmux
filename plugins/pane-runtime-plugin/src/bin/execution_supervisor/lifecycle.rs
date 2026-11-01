@@ -24,6 +24,7 @@ impl Lifecycle {
         let snapshot = LifecycleSnapshot {
             capability: protocol::LIFECYCLE_CAPABILITY,
             revision: 1,
+            stage: None,
             status,
         };
         crate::atomic_state::commit(&path, &snapshot)?;
@@ -54,6 +55,23 @@ impl Lifecycle {
         self.changed.notify_all();
         Ok(())
     }
+    pub(super) fn stage(&self, stage: &str) -> io::Result<()> {
+        let mut retained = self.snapshot.lock().expect("lifecycle lock");
+        if retained.stage.as_deref() == Some(stage) {
+            return Ok(());
+        }
+        let mut next = retained.clone();
+        next.stage = Some(stage.into());
+        next.revision = next
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("lifecycle revision exhausted"))?;
+        crate::atomic_state::commit(&self.path, &next)?;
+        *retained = next;
+        self.changed.notify_all();
+        Ok(())
+    }
+
     pub(super) fn cancel(&self, cancelled: &std::sync::atomic::AtomicBool) {
         let _retained = self.snapshot.lock().expect("lifecycle lock");
         cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -102,6 +120,27 @@ impl Lifecycle {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn diagnostic_stage_is_durable_without_changing_settlement() {
+        let root = tempfile::tempdir().unwrap();
+        let lifecycle = Lifecycle::new(root.path().join("lifecycle.json"), status()).unwrap();
+        let before = lifecycle.snapshot();
+        lifecycle.stage("draining terminal output").unwrap();
+        let after = lifecycle.snapshot();
+        assert_eq!(after.revision, before.revision + 1);
+        assert_eq!(after.stage.as_deref(), Some("draining terminal output"));
+        assert_eq!(
+            serde_json::to_value(&after.status).unwrap(),
+            serde_json::to_value(&before.status).unwrap()
+        );
+        lifecycle.stage("draining terminal output").unwrap();
+        assert_eq!(lifecycle.snapshot().revision, after.revision);
+        let retained: LifecycleSnapshot =
+            serde_json::from_slice(&std::fs::read(root.path().join("lifecycle.json")).unwrap())
+                .unwrap();
+        assert_eq!(retained.stage, after.stage);
+    }
+
     use super::*;
     use std::sync::{Arc, atomic::AtomicBool};
     use std::time::Duration;

@@ -37,7 +37,7 @@ minimum = "1.1"
 cargo_binary        = "bmux-pane-execution-supervisor"
 cargo_package       = "bmux_pane_runtime_plugin"
 id                  = "execution-supervisor"
-protocol_version    = 8
+protocol_version    = 9
 relative_path       = "bmux-pane-execution-supervisor"
 supported_platforms = ["unix", "windows"]
 

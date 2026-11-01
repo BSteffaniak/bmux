@@ -353,6 +353,82 @@ impl SupervisorControl {
         }
     }
 
+    /// V9 stop acceptance is distinct from terminal retirement. Keep the
+    /// lifetime lease while observing; a quiet owner is not failed cleanup.
+    pub(super) fn stop_and_wait(&self, mutation_id: &str) -> anyhow::Result<Response> {
+        let mut watcher = self.observe_retained_stop()?;
+        let mut accepted = None;
+        for attempt in 0..3 {
+            match self.request(Operation::RequestStop {
+                mutation_id: mutation_id.to_owned(),
+            }) {
+                Ok(response) => {
+                    accepted = Some(response);
+                    break;
+                }
+                Err(error) if transport_uncertain(&error) => {
+                    // Replay only the same receipt identity, within a bounded
+                    // recovery budget. Afterward observation retains authority.
+                    tracing::warn!(execution_token = %self.token, %error, attempt, "stop acknowledgment uncertain; retaining cleanup authority");
+                    if attempt < 2 {
+                        std::thread::sleep(std::time::Duration::from_secs(5));
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        if let Some(accepted) = accepted
+            && accepted.target_terminated
+            && accepted.terminal_session_ended == Some(true)
+        {
+            return Ok(accepted);
+        }
+        let mut published_revision = 0;
+        loop {
+            if watcher.current.revision > published_revision {
+                if let Some(stage) = watcher.current.stage.as_deref() {
+                    tracing::debug!(execution_token = %self.token, %stage, revision = watcher.current.revision, "observing terminal retirement");
+                    if let Err(error) = bmux_plugin::shutdown_progress().advance(stage) {
+                        tracing::warn!(%error, "terminal shutdown progress publication failed");
+                    }
+                }
+                published_revision = watcher.current.revision;
+            }
+            let status = &watcher.current.status;
+            if let Some(error) = status.error.as_ref().or(status.cleanup_error.as_ref()) {
+                anyhow::bail!("terminal cleanup failed: {error}");
+            }
+            if status.terminal_session_ended == Some(true) {
+                let mut response = status.clone();
+                response.target_terminated = true;
+                return Ok(response);
+            }
+            // A stream failure is uncertain, not a reason to repeat the stop.
+            // Re-subscribe (bounded handshake) and inspect the same authority.
+            if let Err(error) = watcher.next() {
+                tracing::warn!(%error, "terminal lifecycle observation interrupted; reconnecting without repeating stop");
+                watcher = self.observe_retained_stop()?;
+            }
+        }
+    }
+
+    fn observe_retained_stop(&self) -> anyhow::Result<LifecycleWatcher> {
+        for attempt in 0..3 {
+            match self.subscribe() {
+                Ok(watcher) => return Ok(watcher),
+                Err(error) if transport_uncertain(&error) => {
+                    tracing::warn!(execution_token = %self.token, %error, "cleanup observation unavailable; retaining authority and retrying");
+                    if attempt == 2 {
+                        return Err(error);
+                    }
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        unreachable!("bounded observation attempts return on their final attempt")
+    }
+
     pub(super) fn subscribe(&self) -> anyhow::Result<LifecycleWatcher> {
         let mut socket = backend::connect(&self.endpoint, std::time::Duration::from_secs(5))?;
         protocol::write_frame(
@@ -375,6 +451,23 @@ impl SupervisorControl {
             current: initial,
         })
     }
+}
+
+pub(super) fn transport_uncertain(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<std::io::Error>().is_some_and(|error| {
+        matches!(
+            error.kind(),
+            std::io::ErrorKind::NotFound
+                | std::io::ErrorKind::ConnectionRefused
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::UnexpectedEof
+                | std::io::ErrorKind::TimedOut
+                | std::io::ErrorKind::WouldBlock
+                | std::io::ErrorKind::Interrupted
+        )
+    })
 }
 
 fn validate_snapshot(

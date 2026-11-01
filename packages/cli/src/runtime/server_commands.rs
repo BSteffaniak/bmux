@@ -496,6 +496,20 @@ fn read_shutdown_receipt(path: &std::path::Path) -> Result<Option<ShutdownReceip
     }
 }
 
+fn report_previous_shutdown(receipt: &ShutdownReceipt) -> Result<u8> {
+    // Historical evidence only: without live metadata it cannot prove the
+    // identity or outcome of a newly selected server instance.
+    eprintln!(
+        "Server is not reachable. Last recorded shutdown: PID {}, started at {} (historical result).",
+        receipt.pid, receipt.started_at_epoch_ms
+    );
+    if let Some(error) = &receipt.error {
+        anyhow::bail!("last recorded shutdown cleanup failed: {error}");
+    }
+    println!("Last recorded shutdown cleanup completed; no current server identity is available.");
+    Ok(0)
+}
+
 fn report_local_stop(proof: CleanupProof) -> Result<u8> {
     match proof {
         CleanupProof::Complete => println!("bmux server stopped; cleanup completed"),
@@ -515,8 +529,30 @@ fn report_remote_completion() -> Result<u8> {
     )
 }
 
-#[allow(clippy::too_many_lines)] // Keep the single deadline and no-signal policy visible together.
+#[allow(clippy::too_many_lines)] // Keep identity validation and the no-signal policy together.
 pub(super) async fn run_server_stop(connection_context: ConnectionContext<'_>) -> Result<u8> {
+    let mut notice = tokio::time::interval(std::time::Duration::from_secs(5));
+    notice.tick().await;
+    let started = std::time::Instant::now();
+    let stop = run_server_stop_inner(connection_context);
+    tokio::pin!(stop);
+    loop {
+        tokio::select! {
+            result = &mut stop => return result,
+            result = tokio::signal::ctrl_c() => {
+                result.context("failed waiting for shutdown cancellation")?;
+                eprintln!("Stopped waiting for shutdown; an accepted shutdown continues. Run `bmux server stop` to observe it again.");
+                return Ok(130);
+            }
+            _ = notice.tick() => {
+                eprintln!("Still waiting for bmux shutdown ({}s); cleanup may be quiet. Ctrl-C stops waiting, not an accepted shutdown.", started.elapsed().as_secs());
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_lines)] // Keep selected-instance identity checks and no-signal shutdown flow together.
+async fn run_server_stop_inner(connection_context: ConnectionContext<'_>) -> Result<u8> {
     let deadline = tokio::time::Instant::now() + OWNED_STOP_TIMEOUT;
     let target = tokio::time::timeout_at(
         deadline,
@@ -557,10 +593,28 @@ pub(super) async fn run_server_stop(connection_context: ConnectionContext<'_>) -
                     "server identity changed while connecting; retry for the selected runtime"
                 );
             }
-            tokio::time::timeout_at(deadline, client.stop_server())
-                .await
-                .context(STOP_TIMEOUT_MESSAGE)?
-                .map_err(map_cli_client_error)?;
+            match tokio::time::timeout_at(deadline, client.stop_server()).await {
+                Ok(Err(
+                    bmux_client::ClientError::Transport(_) | bmux_client::ClientError::Timeout(_),
+                )) if local && process.is_some() => {
+                    eprintln!(
+                        "Shutdown acknowledgment was lost; observing the selected server without repeating the request."
+                    );
+                }
+                Ok(result) => {
+                    result.map_err(map_cli_client_error)?;
+                }
+                Err(_) if local && process.is_some() => {
+                    // The request may have been accepted. Observe the pinned
+                    // instance rather than declaring failure or sending signals.
+                    eprintln!(
+                        "Shutdown acknowledgment is delayed; observing the selected server without repeating the request."
+                    );
+                }
+                Err(_) => anyhow::bail!(
+                    "shutdown acknowledgment unavailable; remote cleanup is unconfirmed"
+                ),
+            }
             true
         }
         Ok(Err(error)) => {
@@ -588,7 +642,14 @@ pub(super) async fn run_server_stop(connection_context: ConnectionContext<'_>) -
                 "shutdown acknowledged, but no local process identity is available; cleanup completion is unconfirmed (no signal sent)"
             );
         }
-        println!("bmux server is not reachable; no local process identity is available");
+        if let Some(receipt) =
+            read_shutdown_receipt(receipt_path.as_deref().expect("local receipt path"))?
+        {
+            return report_previous_shutdown(&receipt);
+        }
+        println!(
+            "bmux server is not reachable; no local process identity or retained shutdown result is available"
+        );
         return Ok(1);
     };
     wait_for_shutdown_progress(
@@ -611,7 +672,10 @@ async fn wait_for_shutdown_progress(
     path: &std::path::Path,
 ) -> Result<()> {
     use bmux_plugin_runtime::shutdown_progress::{ShutdownIdleTimer, ShutdownProgressSnapshot};
-    let mut idle = ShutdownIdleTimer::new(std::time::Instant::now(), OWNED_STOP_TIMEOUT);
+    // Explicit shutdown has no idle deadline. Keep validating provenance and
+    // monotonic observations; the CLI notice timer never advances this state.
+    let mut observations = ShutdownIdleTimer::new(std::time::Instant::now(), OWNED_STOP_TIMEOUT);
+    let mut reported_revision = 0;
     loop {
         if process.exited()? {
             return Ok(());
@@ -625,41 +689,27 @@ async fn wait_for_shutdown_progress(
                 let snapshot: ShutdownProgressSnapshot = serde_json::from_slice(&bytes)
                     .context("invalid shutdown progress observation")?;
                 if let Some(metadata) = metadata {
-                    idle.observe(
-                        &snapshot,
-                        metadata.pid,
-                        metadata.started_at_epoch_ms,
-                        std::time::Instant::now(),
-                    )
-                    .map_err(anyhow::Error::msg)?;
+                    observations
+                        .observe(
+                            &snapshot,
+                            metadata.pid,
+                            metadata.started_at_epoch_ms,
+                            std::time::Instant::now(),
+                        )
+                        .map_err(anyhow::Error::msg)?;
+                    if snapshot.revision > reported_revision {
+                        let step: String = observations
+                            .last_step()
+                            .chars()
+                            .map(|ch| if ch.is_control() { ' ' } else { ch })
+                            .collect();
+                        eprintln!("Shutdown: {step}");
+                        reported_revision = snapshot.revision;
+                    }
                 }
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error).context("cannot read shutdown progress observation"),
-        }
-        if idle.expired(std::time::Instant::now()) {
-            // One final observation resolves a racing exit/progress publication.
-            if process.exited()? {
-                return Ok(());
-            }
-            if let Some(metadata) = metadata
-                && let Ok(bytes) = std::fs::read(path)
-            {
-                let snapshot: ShutdownProgressSnapshot = serde_json::from_slice(&bytes)
-                    .context("invalid shutdown progress observation")?;
-                idle.observe(
-                    &snapshot,
-                    metadata.pid,
-                    metadata.started_at_epoch_ms,
-                    std::time::Instant::now(),
-                )
-                .map_err(anyhow::Error::msg)?;
-            }
-            anyhow::ensure!(
-                !idle.expired(std::time::Instant::now()),
-                "{STOP_TIMEOUT_MESSAGE}; last step: {}",
-                idle.last_step()
-            );
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }

@@ -80,6 +80,88 @@ fn stale_failure_does_not_contaminate_another_generation() {
     );
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn cancelling_shutdown_observation_keeps_process_and_allows_rejoin() {
+    use std::process::Stdio;
+    let root = tempfile::tempdir().unwrap();
+    let mut child = tokio::process::Command::new("/bin/sh")
+        .args(["-c", "read line"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let process = ProcessObservation::open(child.id().unwrap()).unwrap();
+    let path = root.path().join("shutdown-progress.json");
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(120),
+            wait_for_shutdown_progress(&process, None, &path)
+        )
+        .await
+        .is_err()
+    );
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "detaching must not signal the process"
+    );
+    drop(child.stdin.take());
+    child.wait().await.unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        wait_for_shutdown_progress(&process, None, &path),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn quiet_explicit_shutdown_waits_past_former_idle_deadline() {
+    use std::process::Stdio;
+    let root = tempfile::tempdir().unwrap();
+    let mut child = tokio::process::Command::new("/bin/sleep")
+        .arg("31")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let process = ProcessObservation::open(child.id().unwrap()).unwrap();
+    let path = root.path().join("shutdown-progress.json");
+    let (observed, exited) = tokio::join!(
+        tokio::time::timeout(
+            std::time::Duration::from_secs(35),
+            wait_for_shutdown_progress(&process, None, &path)
+        ),
+        child.wait()
+    );
+    observed.unwrap().unwrap();
+    assert!(exited.unwrap().success());
+}
+
+#[test]
+fn historical_shutdown_failures_remain_failures() {
+    let receipt = ShutdownReceipt {
+        pid: 42,
+        started_at_epoch_ms: 99,
+        error: Some("capture failed".into()),
+    };
+    assert!(
+        report_previous_shutdown(&receipt)
+            .unwrap_err()
+            .to_string()
+            .contains("capture failed")
+    );
+    assert_eq!(
+        cleanup_proof(None, Some(&receipt)),
+        CleanupProof::Unavailable
+    );
+}
+
 #[test]
 fn corrupt_receipt_is_an_error() {
     assert!(serde_json::from_slice::<ShutdownReceipt>(b"not JSON").is_err());

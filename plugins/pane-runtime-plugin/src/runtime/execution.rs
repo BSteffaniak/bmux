@@ -261,6 +261,7 @@ impl ExecutionCapture {
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)] // Keep the authority lock, effect authorization, and retirement fences in one auditable flow.
     pub(super) fn signal_owned_group(&self, action: StopAction) -> anyhow::Result<bool> {
         // Serialize controls through their acknowledged consumption fence, so
         // concurrent cleanup callers cannot send Sweep after helper retirement.
@@ -283,7 +284,7 @@ impl ExecutionCapture {
                 return Ok(false);
             }
             let operation = match action {
-                StopAction::Force => crate::supervisor_protocol::Operation::Sweep {
+                StopAction::Force => crate::supervisor_protocol::Operation::RequestStop {
                     mutation_id: "00000000-0000-4000-8000-000000000002".into(),
                 },
                 StopAction::Cooperative => {
@@ -297,7 +298,23 @@ impl ExecutionCapture {
                     }
                 }
             };
-            let response = supervisor.request(operation)?;
+            let response = match operation {
+                crate::supervisor_protocol::Operation::RequestStop { mutation_id } => {
+                    match supervisor.stop_and_wait(&mutation_id) {
+                        Ok(response) => response,
+                        Err(error) if super::supervisor::transport_uncertain(&error) => {
+                            // Revoke the owned lease, never signal a saved PID.
+                            // The child/reaper and retained evidence still own
+                            // settlement; transport loss is not cleanup failure.
+                            tracing::warn!(%error, "stop observation unavailable; using retained lifetime cleanup");
+                            supervisor.end_lifetime()?;
+                            return Ok(false);
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+                other => supervisor.request(other)?,
+            };
             if action == StopAction::Force {
                 anyhow::ensure!(
                     response.group_consumed || response.target_terminated,

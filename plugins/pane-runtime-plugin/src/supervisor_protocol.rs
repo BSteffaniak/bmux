@@ -3,13 +3,15 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 
-pub const VERSION: u32 = 8;
+pub const VERSION: u32 = 9;
 pub const LIFECYCLE_CAPABILITY: u32 = 1;
 
 #[derive(Clone, Deserialize, Serialize)]
 pub struct LifecycleSnapshot {
     pub capability: u32,
     pub revision: u64,
+    #[serde(default)]
+    pub stage: Option<String>,
     pub status: Response,
 }
 
@@ -56,6 +58,10 @@ pub enum Operation {
     },
     Status,
     Term {
+        mutation_id: String,
+    },
+    /// V9: accept one force-stop request; completion is observed separately.
+    RequestStop {
         mutation_id: String,
     },
     Sweep {
