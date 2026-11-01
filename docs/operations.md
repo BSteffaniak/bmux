@@ -10,6 +10,18 @@ bmux doctor
 bmux perf status --json
 ```
 
+## Daemon Startup
+
+`bmux server start --daemon` observes readiness for a bounded window. If restore
+or initialization is still underway, it reports the child PID and startup log,
+returns an error because readiness is unconfirmed, and leaves the server
+running.
+There is no total startup deadline that kills a slowly starting server. Check
+`bmux server status` using the same runtime, target, slot, and configuration
+selection; do not start a replacement or remove its socket or lifetime claim.
+A bound socket alone is not readiness. If the child exits during observation,
+startup reports its exit status and diagnostic log instead.
+
 ## Runtime Directory Security and Upgrades
 
 On Unix, the socket directory must be owned by the effective user and have mode

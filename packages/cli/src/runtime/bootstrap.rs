@@ -22,13 +22,13 @@ use super::plugin_kernel::RuntimeLoggingHandle;
 use super::server_commands::prepare_configured_gateway;
 use super::{
     ConnectionContext, ConnectionPolicyScope, EFFECTIVE_LOG_LEVEL, LOG_CONTROL,
-    SERVER_START_TIMEOUT, activate_loaded_plugins, active_runtime_name, cleanup_stale_pid_file,
-    connect_with_context, deactivate_loaded_plugins, dispatch_loaded_plugin_event,
-    load_enabled_plugins, map_client_connect_error, plugin_event_bridge_loop, plugin_system_event,
-    register_plugin_service_handlers, remove_server_pid_file, resolve_log_level,
-    run_session_attach_with_client, scan_available_plugins, server_is_running, tracing_level,
-    validate_enabled_plugins, wait_for_server_running, write_server_pid_file,
-    write_server_runtime_metadata,
+    SERVER_START_OBSERVATION_WINDOW, activate_loaded_plugins, active_runtime_name,
+    cleanup_stale_pid_file, connect_with_context, deactivate_loaded_plugins,
+    dispatch_loaded_plugin_event, load_enabled_plugins, map_client_connect_error,
+    plugin_event_bridge_loop, plugin_system_event, register_plugin_service_handlers,
+    remove_server_pid_file, resolve_log_level, run_session_attach_with_client,
+    scan_available_plugins, server_is_running, tracing_level, validate_enabled_plugins,
+    wait_for_server_running, write_server_pid_file, write_server_runtime_metadata,
 };
 use crate::runtime::diagnostics_layer::OperationalDiagnosticsLayer;
 
@@ -231,6 +231,44 @@ fn startup_diagnostics_tail(path: &std::path::Path) -> String {
     let mut bytes = Vec::new();
     let _ = file.take(8192).read_to_end(&mut bytes);
     String::from_utf8_lossy(&bytes).into_owned()
+}
+
+async fn observe_daemon_startup<F, Fut>(
+    child: &mut std::process::Child,
+    startup_log: &std::path::Path,
+    window: std::time::Duration,
+    mut probe: F,
+) -> Result<bool>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<bool>>,
+{
+    let deadline = tokio::time::Instant::now() + window;
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .context("failed checking background server")?
+        {
+            anyhow::bail!(
+                "background server exited with {status}; startup diagnostics: {}\n{}",
+                startup_log.display(),
+                startup_diagnostics_tail(startup_log)
+            );
+        }
+        match tokio::time::timeout_at(deadline, probe()).await {
+            Ok(Ok(true)) => return Ok(true),
+            Ok(Ok(false)) => {}
+            Ok(Err(error)) => return Err(error),
+            Err(_) => return Ok(false),
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(false);
+        }
+        tokio::time::sleep_until(
+            deadline.min(tokio::time::Instant::now() + std::time::Duration::from_millis(100)),
+        )
+        .await;
+    }
 }
 
 fn server_start_child_arguments(
@@ -455,36 +493,26 @@ async fn run_server_start_inner(
         }
         let mut child = child.spawn().context("failed to spawn background server")?;
 
-        let started = std::time::Instant::now();
-        loop {
-            if let Some(status) = child
-                .try_wait()
-                .context("failed checking background server")?
-            {
-                anyhow::bail!(
-                    "background server exited with {status}; startup diagnostics: {}\n{}",
-                    startup_log.display(),
-                    startup_diagnostics_tail(&startup_log)
-                );
-            }
-            if wait_for_server_running(
-                std::time::Duration::from_millis(100),
-                local_connection_context,
-            )
-            .await?
-            {
-                break;
-            }
-            if started.elapsed() >= SERVER_START_TIMEOUT {
-                let _ = child.kill();
-                let _ = child.wait();
-                anyhow::bail!(
-                    "background server did not become ready before timeout; startup diagnostics: {}\n{}",
-                    startup_log.display(),
-                    startup_diagnostics_tail(&startup_log)
-                );
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // This bounds the launcher's observation, not the server's lifetime.
+        // Restoration may continue for any duration under the child's lifetime claim.
+        if !observe_daemon_startup(
+            &mut child,
+            &startup_log,
+            SERVER_START_OBSERVATION_WINDOW,
+            || {
+                wait_for_server_running(
+                    std::time::Duration::from_millis(100),
+                    local_connection_context,
+                )
+            },
+        )
+        .await?
+        {
+            anyhow::bail!(
+                "background server is still starting (pid {}); readiness is unconfirmed; process left running; startup diagnostics: {}. Check `bmux server status` for the same selected runtime and target; do not launch a replacement",
+                child.id(),
+                startup_log.display(),
+            );
         }
 
         println!("bmux server started in daemon mode (pid {})", child.id());
@@ -1351,6 +1379,66 @@ mod tests {
     use bmux_client::ClientError;
     use bmux_ipc::ErrorCode;
     use bmux_ipc::transport::IpcTransportError;
+
+    #[tokio::test]
+    async fn daemon_observation_preserves_starting_owner_then_accepts_readiness_and_exit() {
+        use crate::runtime::startup_ownership::StartupOwnership;
+        use std::time::{Duration, Instant};
+
+        let root = tempfile::tempdir().unwrap();
+        let paths = ConfigPaths::new(
+            root.path().join("config"),
+            root.path().join("runtime"),
+            root.path().join("data"),
+            root.path().join("state"),
+        );
+        let mut child = ProcessCommand::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "runtime::startup_ownership::tests::lifecycle_child_before_readiness",
+            ])
+            .env("BMUX_LIFETIME_TEST_ROOT", root.path())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !root.path().join("child-claimed").exists() {
+            assert!(child.try_wait().unwrap().is_none());
+            assert!(Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let log = root.path().join("startup.log");
+        // A nonresponsive readiness probe must not hang the command or kill its child.
+        let pending = observe_daemon_startup(&mut child, &log, Duration::from_millis(20), || {
+            std::future::pending::<Result<bool>>()
+        })
+        .await
+        .unwrap();
+        assert!(!pending);
+        assert!(child.try_wait().unwrap().is_none());
+        assert!(StartupOwnership::acquire(&paths).is_err());
+        assert!(
+            observe_daemon_startup(&mut child, &log, Duration::from_millis(20), || async {
+                Ok(true)
+            })
+            .await
+            .unwrap()
+        );
+        assert!(StartupOwnership::acquire(&paths).is_err());
+        std::fs::write(root.path().join("release-child"), b"").unwrap();
+        assert!(child.wait().unwrap().success());
+        std::fs::write(&log, "fixture startup diagnostics").unwrap();
+        let error = observe_daemon_startup(&mut child, &log, Duration::from_millis(20), || async {
+            Ok(true)
+        })
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("background server exited"));
+        assert!(error.to_string().contains("fixture startup diagnostics"));
+        assert!(StartupOwnership::acquire(&paths).is_ok());
+    }
 
     #[tokio::test]
     async fn startup_log_creates_missing_runtime_directory_and_truncates_on_restart() {
