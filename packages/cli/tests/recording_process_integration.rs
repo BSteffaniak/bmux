@@ -10,6 +10,10 @@
 
 // Match nextest's recorded-processes budget under libtest too: each owned
 // fixture launches servers and/or rasterizes evidence. Keep deadlines strict.
+#[path = "support/recording_cleanup.rs"]
+mod recording_cleanup;
+use recording_cleanup::cleanup_short_tmp;
+
 use serde_json::Value;
 use serial_test::serial;
 use std::fs::{self, File};
@@ -403,6 +407,53 @@ impl RecordingEnv {
     }
 }
 
+#[test]
+fn fixture_tmp_cleanup_preserves_uncertain_and_live_runtimes() {
+    let parent = tempfile::tempdir().unwrap();
+    let root = parent.path().join("short");
+    fs::create_dir(&root).unwrap();
+    let runtime = root.join(format!("r-{}", "a".repeat(24))).join("runtime");
+    fs::create_dir_all(&runtime).unwrap();
+    let claim = File::create(runtime.join("server-lifetime.lock")).unwrap();
+    claim.lock().unwrap();
+    fs::write(
+        runtime.join("shutdown-result.json"),
+        r#"{"pid":1,"started_at_epoch_ms":1,"error":null}"#,
+    )
+    .unwrap();
+    fs::write(runtime.join("retained-executable"), b"preserve").unwrap();
+    assert!(cleanup_short_tmp(&root, Duration::ZERO).is_err());
+    assert!(runtime.join("retained-executable").exists());
+    drop(claim);
+    fs::remove_file(runtime.join("shutdown-result.json")).unwrap();
+    assert!(cleanup_short_tmp(&root, Duration::ZERO).is_err());
+    fs::write(
+        runtime.join("shutdown-result.json"),
+        r#"{"pid":1,"started_at_epoch_ms":1,"error":"teardown failed"}"#,
+    )
+    .unwrap();
+    assert!(cleanup_short_tmp(&root, Duration::ZERO).is_err());
+    fs::write(
+        runtime.join("shutdown-result.json"),
+        r#"{"pid":1,"started_at_epoch_ms":1,"error":null}"#,
+    )
+    .unwrap();
+    cleanup_short_tmp(&root, Duration::ZERO).unwrap();
+    assert!(!root.exists());
+}
+
+#[test]
+fn fixture_tmp_cleanup_removes_empty_root_and_rejects_unknown_entries() {
+    let parent = tempfile::tempdir().unwrap();
+    let root = parent.path().join("short");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("unknown"), b"preserve").unwrap();
+    assert!(cleanup_short_tmp(&root, Duration::ZERO).is_err());
+    fs::remove_file(root.join("unknown")).unwrap();
+    cleanup_short_tmp(&root, Duration::ZERO).unwrap();
+    assert!(!root.exists());
+}
+
 impl Drop for RecordingEnv {
     fn drop(&mut self) {
         let mut cleaned = true;
@@ -430,13 +481,24 @@ impl Drop for RecordingEnv {
                 .success();
         }
         if cleaned {
-            let _ = fs::remove_dir_all(&self.root);
-        } else {
-            eprintln!(
-                "retaining recording runtime after failed cleanup: {}",
-                self.root.display()
-            );
+            match cleanup_short_tmp(&self.short_tmp, Duration::from_secs(10)) {
+                Ok(()) => {
+                    if let Err(error) = fs::remove_dir_all(&self.root) {
+                        eprintln!("failed removing fixture {}: {error}", self.root.display());
+                    }
+                    return;
+                }
+                Err(error) => eprintln!(
+                    "retaining fixture TMPDIR {}: {error}",
+                    self.short_tmp.display()
+                ),
+            }
         }
+        eprintln!(
+            "retaining recording fixture {} and TMPDIR {} after unconfirmed cleanup",
+            self.root.display(),
+            self.short_tmp.display()
+        );
     }
 }
 
@@ -1381,6 +1443,11 @@ fn argv_environment_and_working_directory_are_literal() {
         !env.root.join("SHOULD_NOT_EXIST").exists(),
         "implicit shell expansion occurred"
     );
+    let root = env.root.clone();
+    let short_tmp = env.short_tmp.clone();
+    drop(env);
+    assert!(!short_tmp.exists(), "successful fixture leaked its TMPDIR");
+    assert!(!root.exists(), "successful fixture leaked its primary root");
 }
 
 #[test]

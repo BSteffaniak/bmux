@@ -2,6 +2,9 @@
 //! Coordinator runs this target against development and explicitly staged payloads.
 #![cfg(unix)]
 
+#[path = "support/recording_cleanup.rs"]
+mod recording_cleanup;
+
 use serde_json::Value;
 use serial_test::serial;
 use sha2::{Digest, Sha256};
@@ -212,6 +215,80 @@ impl Fixture {
         (report, transcript)
     }
 
+    fn cleanup_servers(&self) -> std::io::Result<()> {
+        use std::time::{Duration, Instant};
+
+        let index = self.root.join("data/recording-process-v4");
+        if !index.exists() {
+            return Ok(());
+        }
+        for entry in fs::read_dir(index)? {
+            let entry = entry?;
+            if entry
+                .path()
+                .extension()
+                .is_none_or(|extension| extension != "json")
+            {
+                continue;
+            }
+            if entry
+                .path()
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .is_none_or(|stem| uuid::Uuid::parse_str(stem).is_err())
+            {
+                continue;
+            }
+            let locator: Value = serde_json::from_slice(&fs::read(entry.path())?)?;
+            let Some(id) = locator["run_id"].as_str() else {
+                continue;
+            };
+            let id = uuid::Uuid::parse_str(id).map_err(std::io::Error::other)?;
+            let runtime = locator["root"]
+                .as_str()
+                .map(Path::new)
+                .ok_or_else(|| std::io::Error::other("invalid fixture locator"))?;
+            if runtime.parent() != Some(self.short_tmp.as_path()) {
+                return Err(std::io::Error::other(
+                    "fixture locator escaped owned TMPDIR",
+                ));
+            }
+            let mut command = Command::new(&self.binary);
+            self.isolate(&mut command);
+            let mut child = command
+                .args([
+                    "recording",
+                    "process",
+                    "finish",
+                    &id.to_string(),
+                    "--terminate",
+                    "--cleanup-server",
+                    "--json",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()?;
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                if let Some(status) = child.try_wait()? {
+                    if !status.success() {
+                        return Err(std::io::Error::other("fixture finish/cleanup failed"));
+                    }
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    // Stop only our cleanup command, never the runtime or its artifacts.
+                    child.kill()?;
+                    child.wait()?;
+                    return Err(std::io::Error::other("fixture cleanup command timed out"));
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+        Ok(())
+    }
+
     fn retain_notice(&self) {
         // Never remove uncertain live-runtime state in Drop. Coordinator can clean
         // this exact owned root after inspecting cleanup acknowledgment/result.
@@ -223,7 +300,32 @@ impl Fixture {
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
+        // The driver must have completed shutdown; merely finishing the outer
+        // terminal is not permission to remove an owned runtime's executables.
+        if !std::thread::panicking() {
+            match self.cleanup_servers().and_then(|()| {
+                recording_cleanup::cleanup_short_tmp(
+                    &self.short_tmp,
+                    std::time::Duration::from_secs(10),
+                )
+            }) {
+                Ok(()) => {
+                    if let Err(error) = fs::remove_dir_all(&self.root) {
+                        eprintln!("failed removing fixture {}: {error}", self.root.display());
+                    }
+                    return;
+                }
+                Err(error) => eprintln!(
+                    "retaining interactive TMPDIR {}: {error}",
+                    self.short_tmp.display()
+                ),
+            }
+        }
         self.retain_notice();
+        eprintln!(
+            "interactive TMPDIR retained at {}",
+            self.short_tmp.display()
+        );
     }
 }
 
@@ -767,6 +869,17 @@ fn direct_interactive_record_routes_keyboard_resize_and_finalizes() {
     assert!(
         raw.windows("KEY:quit héllo\n".len())
             .any(|window| window == "KEY:quit héllo\n".as_bytes())
+    );
+    let root = fixture.root.clone();
+    let short_tmp = fixture.short_tmp.clone();
+    drop(fixture);
+    assert!(
+        !short_tmp.exists(),
+        "successful interactive fixture leaked TMPDIR"
+    );
+    assert!(
+        !root.exists(),
+        "successful interactive fixture leaked its root"
     );
 }
 
