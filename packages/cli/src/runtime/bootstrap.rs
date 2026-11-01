@@ -22,13 +22,13 @@ use super::plugin_kernel::RuntimeLoggingHandle;
 use super::server_commands::prepare_configured_gateway;
 use super::{
     ConnectionContext, ConnectionPolicyScope, EFFECTIVE_LOG_LEVEL, LOG_CONTROL,
-    SERVER_START_OBSERVATION_WINDOW, activate_loaded_plugins, active_runtime_name,
-    cleanup_stale_pid_file, connect_with_context, deactivate_loaded_plugins,
-    dispatch_loaded_plugin_event, load_enabled_plugins, map_client_connect_error,
-    plugin_event_bridge_loop, plugin_system_event, register_plugin_service_handlers,
-    remove_server_pid_file, resolve_log_level, run_session_attach_with_client,
-    scan_available_plugins, server_is_running, tracing_level, validate_enabled_plugins,
-    wait_for_server_running, write_server_pid_file, write_server_runtime_metadata,
+    activate_loaded_plugins, active_runtime_name, cleanup_stale_pid_file, connect_with_context,
+    deactivate_loaded_plugins, dispatch_loaded_plugin_event, load_enabled_plugins,
+    map_client_connect_error, plugin_event_bridge_loop, plugin_system_event,
+    register_plugin_service_handlers, remove_server_pid_file, resolve_log_level,
+    run_session_attach_with_client, scan_available_plugins, server_is_running, tracing_level,
+    validate_enabled_plugins, wait_for_server_running, write_server_pid_file,
+    write_server_runtime_metadata,
 };
 use crate::runtime::diagnostics_layer::OperationalDiagnosticsLayer;
 
@@ -233,41 +233,71 @@ fn startup_diagnostics_tail(path: &std::path::Path) -> String {
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
-async fn observe_daemon_startup<F, Fut>(
+fn detach_daemon_process(child: &mut ProcessCommand) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        // Terminal Ctrl-C targets the foreground process group, not the daemon.
+        child.process_group(0);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        use windows_sys::Win32::System::Threading::{CREATE_BREAKAWAY_FROM_JOB, DETACHED_PROCESS};
+        // Do not inherit a caller-owned SSH job or console lifetime. Failure to
+        // detach is explicit; never retry attached to the caller's job.
+        child.creation_flags(DETACHED_PROCESS | CREATE_BREAKAWAY_FROM_JOB);
+    }
+}
+
+async fn observe_daemon_startup<F, Fut, Interrupt>(
     child: &mut std::process::Child,
     startup_log: &std::path::Path,
-    window: std::time::Duration,
     mut probe: F,
+    interrupt: Interrupt,
 ) -> Result<bool>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<bool>>,
+    Interrupt: std::future::Future<Output = std::io::Result<()>>,
 {
-    let deadline = tokio::time::Instant::now() + window;
-    loop {
-        if let Some(status) = child
-            .try_wait()
-            .context("failed checking background server")?
-        {
-            anyhow::bail!(
-                "background server exited with {status}; startup diagnostics: {}\n{}",
-                startup_log.display(),
-                startup_diagnostics_tail(startup_log)
-            );
+    let wait = async {
+        let mut last_report = tokio::time::Instant::now();
+        loop {
+            if let Some(status) = child
+                .try_wait()
+                .context("failed checking background server")?
+            {
+                anyhow::bail!(
+                    "background server exited with {status}; startup diagnostics: {}\n{}",
+                    startup_log.display(),
+                    startup_diagnostics_tail(startup_log)
+                );
+            }
+            // Only a probe is bounded. A slow or unresponsive probe cannot prevent
+            // checking child exit, printing diagnostics, or cancelling the wait.
+            if let Ok(result) = tokio::time::timeout(super::SERVER_STATUS_TIMEOUT, probe()).await
+                && result?
+            {
+                return Ok(true);
+            }
+            if last_report.elapsed() >= std::time::Duration::from_secs(5) {
+                eprintln!(
+                    "bmux server is still starting (pid {}); waiting for readiness; Ctrl-C stops waiting without stopping the daemon; startup diagnostics: {}",
+                    child.id(),
+                    startup_log.display(),
+                );
+                last_report = tokio::time::Instant::now();
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
-        match tokio::time::timeout_at(deadline, probe()).await {
-            Ok(Ok(true)) => return Ok(true),
-            Ok(Ok(false)) => {}
-            Ok(Err(error)) => return Err(error),
-            Err(_) => return Ok(false),
+    };
+    tokio::select! {
+        result = wait => result,
+        signal = interrupt => {
+            signal.context("failed listening for startup wait interruption")?;
+            Ok(false)
         }
-        if tokio::time::Instant::now() >= deadline {
-            return Ok(false);
-        }
-        tokio::time::sleep_until(
-            deadline.min(tokio::time::Instant::now() + std::time::Duration::from_millis(100)),
-        )
-        .await;
     }
 }
 
@@ -480,39 +510,29 @@ async fn run_server_start_inner(
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::from(startup_output));
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            use windows_sys::Win32::System::Threading::{
-                CREATE_BREAKAWAY_FROM_JOB, DETACHED_PROCESS,
-            };
-            // Background servers must not inherit a caller-owned SSH job or
-            // console lifetime. Disallowed breakaway is an explicit launch
-            // failure; do not retry attached to the caller's job.
-            child.creation_flags(DETACHED_PROCESS | CREATE_BREAKAWAY_FROM_JOB);
-        }
+        detach_daemon_process(&mut child);
         let mut child = child.spawn().context("failed to spawn background server")?;
 
-        // This bounds the launcher's observation, not the server's lifetime.
-        // Restoration may continue for any duration under the child's lifetime claim.
+        // Wait until verified readiness, process exit, or explicit user cancellation.
         if !observe_daemon_startup(
             &mut child,
             &startup_log,
-            SERVER_START_OBSERVATION_WINDOW,
             || {
                 wait_for_server_running(
                     std::time::Duration::from_millis(100),
                     local_connection_context,
                 )
             },
+            tokio::signal::ctrl_c(),
         )
         .await?
         {
-            anyhow::bail!(
-                "background server is still starting (pid {}); readiness is unconfirmed; process left running; startup diagnostics: {}. Check `bmux server status` for the same selected runtime and target; do not launch a replacement",
+            eprintln!(
+                "Stopped waiting for daemon startup (pid {}); readiness is unconfirmed; daemon left running; startup diagnostics: {}",
                 child.id(),
                 startup_log.display(),
             );
+            return Ok(130);
         }
 
         println!("bmux server started in daemon mode (pid {})", child.id());
@@ -1392,7 +1412,8 @@ mod tests {
             root.path().join("data"),
             root.path().join("state"),
         );
-        let mut child = ProcessCommand::new(std::env::current_exe().unwrap())
+        let mut command = ProcessCommand::new(std::env::current_exe().unwrap());
+        command
             .args([
                 "--exact",
                 "runtime::startup_ownership::tests::lifecycle_child_before_readiness",
@@ -1400,9 +1421,17 @@ mod tests {
             .env("BMUX_LIFETIME_TEST_ROOT", root.path())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
+            .stderr(Stdio::null());
+        detach_daemon_process(&mut command);
+        let mut child = command.spawn().unwrap();
+        #[cfg(unix)]
+        {
+            // The actual detachment used by production shields the child from
+            // terminal-generated SIGINT sent to the launcher's foreground group.
+            let group = unsafe { libc::getpgid(i32::try_from(child.id()).unwrap()) };
+            assert_eq!(group, i32::try_from(child.id()).unwrap());
+            assert_ne!(group, unsafe { libc::getpgrp() });
+        }
         let deadline = Instant::now() + Duration::from_secs(10);
         while !root.path().join("child-claimed").exists() {
             assert!(child.try_wait().unwrap().is_none());
@@ -1410,29 +1439,59 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         let log = root.path().join("startup.log");
-        // A nonresponsive readiness probe must not hang the command or kill its child.
-        let pending = observe_daemon_startup(&mut child, &log, Duration::from_millis(20), || {
-            std::future::pending::<Result<bool>>()
-        })
+        // No overall deadline: pending probes keep waiting until explicit cancellation.
+        let pending = observe_daemon_startup(
+            &mut child,
+            &log,
+            std::future::pending::<Result<bool>>,
+            async {
+                tokio::time::sleep(Duration::from_millis(40)).await;
+                Ok(())
+            },
+        )
         .await
         .unwrap();
         assert!(!pending);
         assert!(child.try_wait().unwrap().is_none());
         assert!(StartupOwnership::acquire(&paths).is_err());
+        let started = Instant::now();
         assert!(
-            observe_daemon_startup(&mut child, &log, Duration::from_millis(20), || async {
-                Ok(true)
-            })
+            observe_daemon_startup(
+                &mut child,
+                &log,
+                || std::future::ready(Ok(started.elapsed() >= Duration::from_secs(6))),
+                std::future::pending(),
+            )
             .await
             .unwrap()
         );
+        assert!(started.elapsed() >= Duration::from_secs(6));
+        assert!(StartupOwnership::acquire(&paths).is_err());
+        let mut attempts = 0;
+        assert!(
+            observe_daemon_startup(
+                &mut child,
+                &log,
+                || {
+                    attempts += 1;
+                    std::future::ready(Ok(attempts >= 3))
+                },
+                std::future::pending(),
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(attempts, 3);
         assert!(StartupOwnership::acquire(&paths).is_err());
         std::fs::write(root.path().join("release-child"), b"").unwrap();
         assert!(child.wait().unwrap().success());
         std::fs::write(&log, "fixture startup diagnostics").unwrap();
-        let error = observe_daemon_startup(&mut child, &log, Duration::from_millis(20), || async {
-            Ok(true)
-        })
+        let error = observe_daemon_startup(
+            &mut child,
+            &log,
+            || async { Ok(true) },
+            std::future::pending(),
+        )
         .await
         .unwrap_err();
         assert!(error.to_string().contains("background server exited"));

@@ -12,15 +12,23 @@ bmux perf status --json
 
 ## Daemon Startup
 
-`bmux server start --daemon` observes readiness for a bounded window. If restore
-or initialization is still underway, it reports the child PID and startup log,
-returns an error because readiness is unconfirmed, and leaves the server
-running.
-There is no total startup deadline that kills a slowly starting server. Check
-`bmux server status` using the same runtime, target, slot, and configuration
-selection; do not start a replacement or remove its socket or lifetime claim.
-A bound socket alone is not readiness. If the child exits during observation,
-startup reports its exit status and diagnostic log instead.
+`bmux server start --daemon` waits until verified readiness or startup failure,
+without an overall deadline. Slow startup prints periodic "still starting"
+messages and the diagnostic log path. Individual readiness probes remain bounded
+so child exit and cancellation remain observable. Ctrl-C cancels only the wait
+(exit status 130); the daemon remains running under its own lifetime claim.
+A bound socket alone is not readiness. If the child exits, startup reports its
+exit status and diagnostic log instead.
+
+This is an explicit architectural exception to bounded automated startup: the
+operator-controlled start command stays attached until a result or cancellation,
+while automated callers retain their own wait budgets. Neither elapsed time nor
+cancellation authorizes termination, replacement, or removal of ownership
+evidence.
+After cancelling, check `bmux server status` using the same runtime, target,
+slot,
+and configuration selection; do not start a replacement or remove its socket or
+lifetime claim.
 
 ## Runtime Directory Security and Upgrades
 
