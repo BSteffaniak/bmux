@@ -1848,7 +1848,6 @@ impl BmuxServer {
         self.run_impl(Some(ready)).await
     }
 
-    #[allow(clippy::too_many_lines)]
     async fn run_impl(
         &self,
         mut ready_tx: Option<oneshot::Sender<std::result::Result<(), String>>>,
@@ -1865,6 +1864,21 @@ impl BmuxServer {
             }
         };
 
+        self.run_with_listener(listener, ready_tx).await
+    }
+
+    /// Run an already-bound listener through initialization and the accept loop.
+    /// The caller can persist bind ownership before initialization begins.
+    ///
+    /// # Errors
+    ///
+    /// Returns initialization and accept-loop failures.
+    #[allow(clippy::too_many_lines)] // Initialization and shutdown share one listener lifetime.
+    pub async fn run_with_listener(
+        &self,
+        listener: LocalIpcListener,
+        mut ready_tx: Option<oneshot::Sender<std::result::Result<(), String>>>,
+    ) -> Result<()> {
         // Snapshot restore runs after plugin activation so every participant
         // is registered before the orchestrator walks the envelope.
 
@@ -4370,6 +4384,40 @@ fn is_frame_too_large_error(err: &anyhow::Error) -> bool {
 mod tests {
     use super::*;
     use serde::{Deserialize, Serialize};
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn supplied_listener_initialization_failure_does_not_rebind() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let endpoint = IpcEndpoint::UnixSocket(root.path().join("server.sock"));
+        let server = BmuxServer::new(endpoint.clone());
+        let listener =
+            LocalIpcListener::bind_with_policy(&endpoint, ConfigPaths::local_ipc_policy()).unwrap();
+        let identity = std::fs::symlink_metadata(root.path().join("server.sock"))
+            .unwrap()
+            .ino();
+        // Poison the first initialization operation to fail before any await.
+        let state = Arc::clone(&server.state);
+        assert!(
+            std::thread::spawn(move || {
+                let _guard = state.event_hub.lock().unwrap();
+                panic!("injected initialization failure");
+            })
+            .join()
+            .is_err()
+        );
+        let error = server.run_with_listener(listener, None).await.unwrap_err();
+        assert_eq!(error.to_string(), "event hub lock poisoned");
+        assert_eq!(
+            std::fs::symlink_metadata(root.path().join("server.sock"))
+                .unwrap()
+                .ino(),
+            identity
+        );
+    }
 
     #[tokio::test]
     async fn retained_transport_owner_hydration_coalescing_and_isolation() {

@@ -85,6 +85,8 @@ fn simultaneous_server_starts_have_one_lifetime_owner() {
 #[cfg(unix)]
 #[test]
 fn clean_stop_socket_owner_fixture() {
+    use std::os::unix::fs::MetadataExt as _;
+
     let Some(root) = std::env::var_os("BMUX_CLEAN_STOP_FIXTURE_ROOT") else {
         return;
     };
@@ -95,10 +97,24 @@ fn clean_stop_socket_owner_fixture() {
         root.join("data"),
         root.join("state"),
     );
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let _entered = runtime.enter();
     let claim = StartupOwnership::acquire(&paths).unwrap();
-    let socket = std::os::unix::net::UnixListener::bind(paths.server_socket()).unwrap();
-    claim.record_bound_endpoint().unwrap();
-    drop(socket);
+    let endpoint = bmux_ipc::IpcEndpoint::UnixSocket(paths.server_socket());
+    let listener = claim.bind_endpoint(&endpoint).unwrap();
+    // Even an immediately failing initialization cannot skip the persisted bind receipt.
+    let initialized: Result<()> =
+        runtime.block_on(async { anyhow::bail!("initialization failed") });
+    assert!(initialized.is_err());
+    let metadata = std::fs::symlink_metadata(paths.server_socket()).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(paths.runtime_dir.join(CLAIM_NAME)).unwrap(),
+        format!("bmux-endpoint-v1 {} {}\n", metadata.dev(), metadata.ino())
+    );
+    drop(listener);
     drop(claim);
 }
 

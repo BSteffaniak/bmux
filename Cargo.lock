@@ -3108,6 +3108,7 @@ dependencies = [
  "bmux_snapshot_runtime",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "uuid",

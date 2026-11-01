@@ -27,8 +27,6 @@ pub(super) struct StartupOwnership {
     owner_process: u32,
     #[cfg(unix)]
     socket: PathBuf,
-    #[cfg(unix)]
-    recorded: Mutex<bool>,
     #[cfg(windows)]
     pipe_name: String,
 }
@@ -451,8 +449,6 @@ impl StartupOwnership {
             owner_process: std::process::id(),
             #[cfg(unix)]
             socket: paths.server_socket(),
-            #[cfg(unix)]
-            recorded: Mutex::new(false),
             #[cfg(windows)]
             pipe_name: paths.server_named_pipe(),
         })
@@ -490,7 +486,10 @@ impl StartupOwnership {
             let expected = format!("bmux-endpoint-v1 {} {}\n", metadata.dev(), metadata.ino());
             ensure!(
                 receipt == expected,
-                "selected endpoint has no matching ownership receipt; refusing reclamation"
+                "selected endpoint {} has no matching ownership receipt (recorded: {:?}, observed: {:?}); refusing reclamation; verify the selected runtime is stopped before explicitly removing this socket",
+                self.socket.display(),
+                receipt.trim_end(),
+                expected.trim_end(),
             );
             match tokio::time::timeout(
                 std::time::Duration::from_millis(500),
@@ -560,20 +559,35 @@ impl StartupOwnership {
         Ok(())
     }
 
-    /// Called immediately after each poll of the server's bind/accept future.
-    /// No receipt is created for failed binds. Under the held claim, a pending
-    /// first poll has performed the synchronous bind before yielding to restore.
+    /// Bind and persist ownership before any server initialization can run.
+    pub(super) fn bind_endpoint(
+        &self,
+        endpoint: &bmux_ipc::IpcEndpoint,
+    ) -> Result<bmux_ipc::transport::LocalIpcListener> {
+        #[cfg(unix)]
+        ensure!(
+            endpoint == &bmux_ipc::IpcEndpoint::UnixSocket(self.socket.clone()),
+            "listener endpoint does not match startup claim"
+        );
+        #[cfg(windows)]
+        ensure!(
+            endpoint == &bmux_ipc::IpcEndpoint::WindowsNamedPipe(self.pipe_name.clone()),
+            "listener endpoint does not match startup claim"
+        );
+        let listener = bmux_ipc::transport::LocalIpcListener::bind_with_policy(
+            endpoint,
+            ConfigPaths::local_ipc_policy(),
+        )
+        .with_context(|| format!("failed binding server endpoint {endpoint:?}"))?;
+        self.record_bound_endpoint()?;
+        Ok(listener)
+    }
+
+    /// Persist the identity immediately after a successful bind.
     #[cfg(unix)]
     pub(super) fn record_bound_endpoint(&self) -> Result<()> {
         {
             use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
-            let mut recorded = self
-                .recorded
-                .lock()
-                .map_err(|_| anyhow::anyhow!("bind receipt poisoned"))?;
-            if *recorded {
-                return Ok(());
-            }
             let metadata = std::fs::symlink_metadata(&self.socket)
                 .context("capture bound endpoint receipt")?;
             ensure!(
@@ -594,7 +608,6 @@ impl StartupOwnership {
             )?;
             file.sync_data()?;
             drop(file);
-            *recorded = true;
         }
         Ok(())
     }

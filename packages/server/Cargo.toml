@@ -46,6 +46,9 @@ tokio = { workspace = true, features = [
 tracing = { workspace = true, features = ["std"] }
 uuid = { workspace = true, features = ["std", "v4"] }
 
+[dev-dependencies]
+tempfile = { workspace = true }
+
 
 [features]
 # Default features

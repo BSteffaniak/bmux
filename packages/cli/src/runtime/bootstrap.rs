@@ -777,24 +777,13 @@ async fn run_server_start_inner(
         std::future::pending::<()>().await;
     };
     tokio::pin!(managed_idle);
-    let mut server_loop = Box::pin(server.run_with_readiness(server_ready_tx));
-    // The first poll performs synchronous bind. Capture its receipt before any
-    // plugin restore await can turn a bound listener into a long startup window.
-    let mut owned_server_loop = Box::pin(std::future::poll_fn(|cx| {
-        use std::future::Future as _;
-        let result = server_loop.as_mut().poll(cx);
-        if !matches!(&result, std::task::Poll::Ready(Err(_)))
-            && let Err(error) = ownership.record_bound_endpoint()
-        {
-            return std::task::Poll::Ready(Err(error));
-        }
-        result
-    }));
+    let listener = ownership.bind_endpoint(server.endpoint())?;
+    let mut server_loop = Box::pin(server.run_with_listener(listener, Some(server_ready_tx)));
     let run_result = if loaded_plugins.is_empty() {
         tokio::select! {
             biased;
             () = &mut managed_idle => unreachable!("idle watcher remains pending after shutdown request"),
-            result = &mut owned_server_loop => result,
+            result = &mut server_loop => result,
             result = &mut gateway_loop => result,
         }
     } else {
@@ -807,7 +796,7 @@ async fn run_server_start_inner(
         tokio::pin!(plugin_bridge);
         tokio::select! {
             () = &mut managed_idle => unreachable!("idle watcher remains pending after shutdown request"),
-            result = &mut owned_server_loop => {
+            result = &mut server_loop => {
                 let _ = plugin_bridge_shutdown_tx.send(true);
                 result
             }
@@ -825,7 +814,6 @@ async fn run_server_start_inner(
     // Cancellation must release gateway listeners before plugin teardown, which
     // can take time. A pinned reference would keep the underlying future alive.
     drop(managed_idle_context);
-    drop(owned_server_loop);
     drop(server_loop);
     drop(gateway_loop);
     if let Err(error) =
