@@ -910,6 +910,7 @@ fn grid_style(style: bmux_terminal_grid::Style) -> bmux_tui::style::Style {
         (style.underline, Modifier::UNDERLINE),
         (style.inverse, Modifier::REVERSED),
         (style.strike, Modifier::CROSSED_OUT),
+        (style.hidden, Modifier::HIDDEN),
     ] {
         if enabled {
             modifiers |= modifier;
@@ -919,6 +920,33 @@ fn grid_style(style: bmux_terminal_grid::Style) -> bmux_tui::style::Style {
         fg: style.fg.map(color),
         bg: style.bg.map(color),
         modifiers,
+    }
+}
+
+#[cfg(test)]
+mod grid_style_tests {
+    #[test]
+    fn conceal_and_strike_survive_native_projection() {
+        let mut stream = bmux_terminal_grid::TerminalGridStream::new(
+            8,
+            2,
+            bmux_terminal_grid::GridLimits::default(),
+        )
+        .unwrap();
+        stream.process(b"\x1b[8;9mX");
+        let row = stream.grid().viewport_rows();
+        let source = stream.grid().palette().get(row[0].cells()[0].style());
+        let projected = super::grid_style(source);
+        assert!(
+            projected
+                .modifiers
+                .contains(bmux_tui::style::Modifier::HIDDEN)
+        );
+        assert!(
+            projected
+                .modifiers
+                .contains(bmux_tui::style::Modifier::CROSSED_OUT)
+        );
     }
 }
 

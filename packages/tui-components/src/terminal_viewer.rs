@@ -358,6 +358,9 @@ const fn terminal_grid_style(style: GridStyle) -> Style {
     if style.inverse {
         output = output.add_modifier(Modifier::REVERSED);
     }
+    if style.hidden {
+        output = output.add_modifier(Modifier::HIDDEN);
+    }
     if style.strike {
         output = output.add_modifier(Modifier::CROSSED_OUT);
     }
@@ -470,6 +473,25 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn conceal_survives_terminal_viewer_projection() {
+        let source = bmux_terminal_grid::Style {
+            hidden: true,
+            strike: true,
+            ..bmux_terminal_grid::Style::default()
+        };
+        let projected = super::terminal_grid_style(source);
+        assert!(
+            projected
+                .modifiers
+                .contains(bmux_tui::style::Modifier::HIDDEN)
+        );
+        assert!(
+            projected
+                .modifiers
+                .contains(bmux_tui::style::Modifier::CROSSED_OUT)
+        );
+    }
     use super::*;
     use bmux_tui::buffer::Buffer;
     use bmux_tui::frame::Frame;

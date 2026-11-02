@@ -30,6 +30,9 @@ pub struct Style {
     pub inverse: bool,
     pub dim: bool,
     pub strike: bool,
+    /// Conceal glyphs while retaining their occupied cells and background.
+    #[serde(default)]
+    pub hidden: bool,
 }
 
 impl Style {
@@ -62,6 +65,7 @@ impl Style {
                 underline: false,
                 dim: false,
                 strike: false,
+                hidden: false,
             };
         }
         Self {
@@ -73,6 +77,7 @@ impl Style {
             underline: false,
             dim: false,
             strike: false,
+            hidden: false,
         }
     }
 }

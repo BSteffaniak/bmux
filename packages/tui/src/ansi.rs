@@ -398,15 +398,26 @@ impl AnsiTextParser {
     }
 
     fn consume_csi(&mut self, chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
+        // Retain only bounded, ordinary SGR parameters. Private prefixes and
+        // intermediates (for example modifyOtherKeys) are not text styling.
+        const MAX_SGR_BYTES: usize = 4096;
         let mut sequence = String::new();
+        let mut valid = true;
         for ch in chars.by_ref() {
             if ('@'..='~').contains(&ch) {
-                if ch == 'm' {
+                if ch == 'm' && valid {
                     apply_sgr(&mut self.style, &sequence);
                 }
                 return;
             }
-            sequence.push(ch);
+            if valid
+                && (ch.is_ascii_digit() || matches!(ch, ';' | ':'))
+                && sequence.len() < MAX_SGR_BYTES
+            {
+                sequence.push(ch);
+            } else {
+                valid = false;
+            }
         }
     }
 }
@@ -422,14 +433,18 @@ fn consume_until_bel_or_st(chars: &mut std::iter::Peekable<std::str::Chars<'_>>)
 }
 
 fn apply_sgr(style: &mut Style, sequence: &str) {
-    let params = sgr_params(sequence);
-    if params.is_empty() {
-        *style = Style::new();
-        return;
-    }
-    let mut index = 0usize;
-    while index < params.len() {
-        match params[index] {
+    // Semicolons separate commands; colons group subparameters belonging to
+    // one command. Never reinterpret malformed operands as independent SGRs.
+    let mut params = sequence.split(';');
+    while let Some(parameter) = params.next() {
+        if parameter.contains(':') {
+            apply_sgr_subparameters(style, parameter);
+            continue;
+        }
+        let Some(code) = sgr_number(parameter, true) else {
+            continue;
+        };
+        match code {
             0 => *style = Style::new(),
             1 => style.modifiers |= Modifier::BOLD,
             2 => style.modifiers |= Modifier::DIM,
@@ -446,72 +461,96 @@ fn apply_sgr(style: &mut Style, sequence: &str) {
             27 => style.modifiers = style.modifiers.difference(Modifier::REVERSED),
             28 => style.modifiers = style.modifiers.difference(Modifier::HIDDEN),
             29 => style.modifiers = style.modifiers.difference(Modifier::CROSSED_OUT),
-            30..=37 => style.fg = Some(standard_color(params[index] - 30, false)),
+            30..=37 => style.fg = Some(standard_color(code - 30, false)),
             39 => style.fg = None,
-            40..=47 => style.bg = Some(standard_color(params[index] - 40, false)),
+            40..=47 => style.bg = Some(standard_color(code - 40, false)),
             49 => style.bg = None,
-            90..=97 => style.fg = Some(standard_color(params[index] - 90, true)),
-            100..=107 => style.bg = Some(standard_color(params[index] - 100, true)),
-            38 | 48 => {
-                index = apply_extended_color(style, &params, index);
+            90..=97 => style.fg = Some(standard_color(code - 90, true)),
+            100..=107 => style.bg = Some(standard_color(code - 100, true)),
+            38 | 48 | 58 => {
+                let color = parse_sgr_color(&mut params, false);
+                apply_sgr_color(style, code, color);
             }
             _ => {}
         }
-        index = index.saturating_add(1);
     }
 }
 
-fn sgr_params(sequence: &str) -> Vec<u16> {
-    if sequence.is_empty() {
-        return Vec::new();
-    }
-    sequence
-        .split([';', ':'])
-        .map(|part| part.parse::<u16>().unwrap_or(0))
-        .collect()
-}
-
-fn apply_extended_color(style: &mut Style, params: &[u16], index: usize) -> usize {
-    let Some(mode) = params.get(index.saturating_add(1)).copied() else {
-        return index;
-    };
-    let color_role = if params[index] == 38 {
-        ColorRole::Foreground
+fn sgr_number(parameter: &str, empty_is_zero: bool) -> Option<u16> {
+    if parameter.is_empty() && empty_is_zero {
+        Some(0)
+    } else if parameter.bytes().all(|byte| byte.is_ascii_digit()) {
+        parameter.parse().ok()
     } else {
-        ColorRole::Background
-    };
-    match mode {
-        5 => {
-            if let Some(color) = params.get(index.saturating_add(2)).copied() {
-                set_style_color(
-                    style,
-                    color_role,
-                    Color::Indexed(u8::try_from(color).unwrap_or(u8::MAX)),
-                );
-                return index.saturating_add(2);
+        None
+    }
+}
+
+fn apply_sgr_subparameters(style: &mut Style, parameter: &str) {
+    let mut parts = parameter.split(':');
+    match parts.next().and_then(|part| sgr_number(part, false)) {
+        Some(4) => {
+            let kind = parts.next().and_then(|part| sgr_number(part, false));
+            if parts.next().is_none() {
+                match kind {
+                    Some(0) => {
+                        style.modifiers = style.modifiers.difference(Modifier::UNDERLINE);
+                    }
+                    // The text model has only basic underline; preserve that
+                    // fallback for double, curly, dotted and dashed underline.
+                    Some(1..=5) => style.modifiers |= Modifier::UNDERLINE,
+                    _ => {}
+                }
             }
         }
-        2 => {
-            if let (Some(red), Some(green), Some(blue)) = (
-                params.get(index.saturating_add(2)).copied(),
-                params.get(index.saturating_add(3)).copied(),
-                params.get(index.saturating_add(4)).copied(),
-            ) {
-                set_style_color(
-                    style,
-                    color_role,
-                    Color::Rgb(
-                        u8::try_from(red).unwrap_or(u8::MAX),
-                        u8::try_from(green).unwrap_or(u8::MAX),
-                        u8::try_from(blue).unwrap_or(u8::MAX),
-                    ),
-                );
-                return index.saturating_add(4);
+        Some(code @ (38 | 48 | 58)) => {
+            let color = parse_sgr_color(&mut parts, true);
+            if parts.next().is_none() {
+                apply_sgr_color(style, code, color);
             }
         }
         _ => {}
     }
-    index
+}
+
+fn parse_sgr_color(params: &mut std::str::Split<'_, char>, colon: bool) -> Option<Color> {
+    match params.next().and_then(|part| sgr_number(part, false)) {
+        Some(5) => params.next()?.parse::<u8>().ok().map(Color::Indexed),
+        Some(2) => {
+            // ISO colon RGB may include an omitted/default color-space slot.
+            // Semicolon legacy RGB has exactly three operands, even if invalid.
+            let valid_space = if colon && params.clone().count() == 4 {
+                matches!(params.next(), Some("" | "0"))
+            } else {
+                true
+            };
+            let red = params.next().and_then(|part| part.parse::<u8>().ok());
+            let green = params.next().and_then(|part| part.parse::<u8>().ok());
+            let blue = params.next().and_then(|part| part.parse::<u8>().ok());
+            if valid_space {
+                Some(Color::Rgb(red?, green?, blue?))
+            } else {
+                None
+            }
+        }
+        _ => {
+            // Unknown color modes have unknown arity. Do not turn their
+            // remaining operands into resets or unrelated style changes.
+            for _ in params.by_ref() {}
+            None
+        }
+    }
+}
+
+const fn apply_sgr_color(style: &mut Style, code: u16, color: Option<Color>) {
+    if let Some(color) = color {
+        match code {
+            38 => set_style_color(style, ColorRole::Foreground, color),
+            48 => set_style_color(style, ColorRole::Background, color),
+            // Underline color is unsupported, but its operands are consumed.
+            _ => {}
+        }
+    }
 }
 
 const fn set_style_color(style: &mut Style, role: ColorRole, color: Color) {
@@ -790,6 +829,197 @@ mod tests {
         assert_eq!(lines[0].spans[1].style.fg, Some(Color::Red));
         assert!(lines[0].spans[1].style.modifiers.contains(Modifier::BOLD));
         assert_eq!(lines[1].spans[0].style.fg, Some(Color::Indexed(42)));
+    }
+
+    #[test]
+    fn ansi_sgr_underline_subparameters_preserve_other_styles() {
+        for kind in 1..=5 {
+            let lines = ansi_to_lines(&format!("\x1b[1;31;44m\x1b[4:{kind}mX"));
+            assert_eq!(
+                lines[0].spans[0].style,
+                Style::new()
+                    .fg(Color::Red)
+                    .bg(Color::Blue)
+                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINE)
+            );
+        }
+        for off in ["4:0", "24"] {
+            let lines = ansi_to_lines(&format!("\x1b[1;3;4;31;44m\x1b[{off}mX"));
+            assert_eq!(
+                lines[0].spans[0].style,
+                Style::new()
+                    .fg(Color::Red)
+                    .bg(Color::Blue)
+                    .add_modifier(Modifier::BOLD | Modifier::ITALIC)
+            );
+        }
+    }
+
+    #[test]
+    fn ansi_sgr_extended_colors_accept_supported_encodings() {
+        for role in [38, 48] {
+            for operands in ["2::12:34:56", "2:12:34:56", "2:0:12:34:56", "2;12;34;56"] {
+                let separator = if operands.contains(':') { ':' } else { ';' };
+                let lines = ansi_to_lines(&format!("\x1b[{role}{separator}{operands};1mX"));
+                let style = lines[0].spans[0].style;
+                assert_eq!(
+                    if role == 38 { style.fg } else { style.bg },
+                    Some(Color::Rgb(12, 34, 56))
+                );
+                assert_eq!(style.modifiers, Modifier::BOLD);
+            }
+            for operands in ["5:42", "5;42"] {
+                let separator = if operands.contains(':') { ':' } else { ';' };
+                let lines = ansi_to_lines(&format!("\x1b[{role}{separator}{operands}mX"));
+                let style = lines[0].spans[0].style;
+                assert_eq!(
+                    if role == 38 { style.fg } else { style.bg },
+                    Some(Color::Indexed(42))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ansi_sgr_unsupported_underline_color_consumes_operands() {
+        for color in [
+            "58;2;0;3;4",
+            "58:2::0:3:4",
+            "58:2:0:3:4",
+            "58;5;0",
+            "58:5:3",
+        ] {
+            let lines = ansi_to_lines(&format!("\x1b[1;31;44m\x1b[{color};4mX"));
+            assert_eq!(
+                lines[0].spans[0].style,
+                Style::new()
+                    .fg(Color::Red)
+                    .bg(Color::Blue)
+                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINE),
+                "{color}"
+            );
+        }
+    }
+
+    #[test]
+    fn ansi_sgr_invalid_color_operands_never_become_styles() {
+        for color in [
+            "38;2;999;0;3",
+            "48;2;;0;4",
+            "58;2;999;0;3",
+            "38;2;0;3",
+            "48;2;0",
+            "58;2;0;4",
+            "38;5;999",
+            "38;2;999999999999999999999999;0;3",
+            "38;9;0;3;4",
+            "38:2::999:0:3",
+            "48:2:0:3",
+            "58:5:999",
+            "38:2:1:12:34:56",
+            "38:2::12:34:56:0",
+            "38:5:42:0",
+            "38:2::12::56",
+            "48:2:12:34:999",
+            "38:2:12:34:56:0:0",
+        ] {
+            let lines = ansi_to_lines(&format!("\x1b[1;31;44m\x1b[{color}mX"));
+            assert_eq!(
+                lines[0].spans[0].style,
+                Style::new()
+                    .fg(Color::Red)
+                    .bg(Color::Blue)
+                    .add_modifier(Modifier::BOLD),
+                "{color}"
+            );
+        }
+        // A malformed but fully consumed operand group does not swallow the
+        // next independent command.
+        let lines = ansi_to_lines("\x1b[1;31m\x1b[38;2;999;0;3;4mX");
+        assert_eq!(
+            lines[0].spans[0].style.modifiers,
+            Modifier::BOLD | Modifier::UNDERLINE
+        );
+    }
+
+    #[test]
+    fn ansi_sgr_rejects_private_intermediate_and_malformed_sequences() {
+        for parameters in [
+            ">4;2",
+            "?0",
+            "=0",
+            "0 ",
+            "4:99",
+            "4:",
+            "4:0:3",
+            "1:0",
+            "999999999999999999999",
+        ] {
+            let lines = ansi_to_lines(&format!("\x1b[1;31m\x1b[{parameters}mX"));
+            assert_eq!(lines[0].plain_text(), "X");
+            assert_eq!(
+                lines[0].spans[0].style,
+                Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
+                "{parameters}"
+            );
+        }
+        let oversized = format!("\x1b[1;31m\x1b[{}0mX\x1b[mY", "0;".repeat(4096));
+        let lines = ansi_to_lines(&oversized);
+        assert_eq!(lines[0].plain_text(), "XY");
+        assert_eq!(
+            lines[0].spans[0].style,
+            Style::new().fg(Color::Red).add_modifier(Modifier::BOLD)
+        );
+        assert_eq!(lines[0].spans[1].style, Style::new());
+    }
+
+    #[test]
+    fn ansi_sgr_color_resets_preserve_other_state() {
+        for (code, fg, bg) in [(39, None, Some(Color::Blue)), (49, Some(Color::Red), None)] {
+            let lines = ansi_to_lines(&format!("\x1b[1;3;31;44m\x1b[{code}mX"));
+            let style = lines[0].spans[0].style;
+            assert_eq!(style.fg, fg);
+            assert_eq!(style.bg, bg);
+            assert_eq!(style.modifiers, Modifier::BOLD | Modifier::ITALIC);
+        }
+        let lines = ansi_to_lines("\x1b[1;3m\x1b[38:2::0:3:4;48;2;4;0;3mX");
+        assert_eq!(
+            lines[0].spans[0].style,
+            Style::new()
+                .fg(Color::Rgb(0, 3, 4))
+                .bg(Color::Rgb(4, 0, 3))
+                .add_modifier(Modifier::BOLD | Modifier::ITALIC)
+        );
+    }
+
+    #[test]
+    fn ansi_sgr_style_off_preserves_unrelated_state() {
+        let initial = Modifier::BOLD
+            | Modifier::DIM
+            | Modifier::ITALIC
+            | Modifier::UNDERLINE
+            | Modifier::SLOW_BLINK
+            | Modifier::REVERSED
+            | Modifier::HIDDEN
+            | Modifier::CROSSED_OUT;
+        for (code, removed) in [
+            (22, Modifier::BOLD | Modifier::DIM),
+            (23, Modifier::ITALIC),
+            (24, Modifier::UNDERLINE),
+            (25, Modifier::SLOW_BLINK),
+            (27, Modifier::REVERSED),
+            (28, Modifier::HIDDEN),
+            (29, Modifier::CROSSED_OUT),
+        ] {
+            let lines = ansi_to_lines(&format!("\x1b[1;2;3;4;5;7;8;9;31;44m\x1b[{code}mX"));
+            assert_eq!(
+                lines[0].spans[0].style,
+                Style::new()
+                    .fg(Color::Red)
+                    .bg(Color::Blue)
+                    .add_modifier(initial.difference(removed))
+            );
+        }
     }
 
     #[test]

@@ -17268,6 +17268,8 @@ exit 7"#
 
     fn test_delta(base_revision: u64, revision: u64, text_len: usize) -> GridDeltaBatch {
         GridDeltaBatch {
+            terminal_state: bmux_terminal_grid::TerminalStateSnapshot::default(),
+            retained_alt_rows: None,
             history_truncated: None,
             base_revision,
             revision,

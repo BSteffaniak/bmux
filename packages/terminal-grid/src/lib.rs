@@ -29,6 +29,12 @@ mod vt_parser_tests;
 mod pointer_shape_tests;
 
 #[cfg(test)]
+mod state_regression_tests;
+
+#[cfg(test)]
+mod rendition_regression_tests;
+
+#[cfg(test)]
 mod stream_compat_tests;
 
 pub use delta::{GridDeltaApplyError, GridDeltaBatch, RowUpdateSnapshot};
@@ -49,5 +55,6 @@ pub use render::{
 };
 pub use snapshot::{
     CellRunSnapshot, CursorSnapshot, GridSnapshot, RowSnapshot, ScrollRegionSnapshot,
+    TerminalStateSnapshot,
 };
 pub use style::{Color, Style, StyleId, StylePalette};

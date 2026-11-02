@@ -999,11 +999,14 @@ mod tests {
         let squeezed =
             PaneZoomProjection::capture(source(1), Uuid::from_u128(17), stream.grid(), 1, 20)
                 .unwrap();
-        assert!(
-            squeezed
-                .grid_fragment("view", transform, clips, |_| bmux_tui::style::Style::new())
-                .is_none()
-        );
+        let squeezed_fragment = squeezed
+            .grid_fragment("view", transform, clips, |_| bmux_tui::style::Style::new())
+            .unwrap();
+        // A one-column projection clips unrepresentable wide glyphs rather
+        // than publishing a dangling wide leader or rejecting the entire view.
+        assert!(squeezed_fragment.buffer().cells().iter().all(|cell| {
+            cell.width() == 1 && !cell.is_wide_continuation() && cell.symbol != "界"
+        }));
     }
 
     #[test]

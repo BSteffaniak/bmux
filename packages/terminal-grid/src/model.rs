@@ -1,6 +1,6 @@
 use crate::reflow::{project_logical_line, projected_logical_line_row_count};
 mod content;
-use crate::snapshot::{GridSnapshot, RowSnapshot};
+use crate::snapshot::{GridSnapshot, RowSnapshot, TerminalStateSnapshot};
 use crate::style::{Color, Style, StyleId, StylePalette};
 pub use content::{
     ContentAnchor, ContentBudget, ContentCursor, ContentPosition, ContentProjection,
@@ -474,6 +474,11 @@ impl PhysicalRow {
         cell: &Cell,
         width: usize,
     ) -> Option<()> {
+        // A two-column glyph cannot be represented on a one-column projection.
+        // Clip its glyph rather than publishing a dangling wide leader.
+        if cell.width == 2 && col + 1 >= width {
+            return Some(());
+        }
         let end = col.checked_add(if cell.width == 2 && col + 1 < width {
             2
         } else {
@@ -556,6 +561,20 @@ impl PhysicalRow {
         if start >= end {
             return;
         }
+        let start = if self
+            .cells
+            .get(start)
+            .is_some_and(Cell::is_wide_continuation)
+        {
+            start.saturating_sub(1)
+        } else {
+            start
+        };
+        let end = if self.cells.get(end).is_some_and(Cell::is_wide_continuation) {
+            end.saturating_add(1)
+        } else {
+            end
+        };
         if style == StyleId::DEFAULT {
             if start >= self.cells.len() {
                 return;
@@ -581,6 +600,14 @@ impl PhysicalRow {
 
     pub(crate) fn truncate(&mut self, len: usize) {
         self.cells.truncate(len);
+        if self
+            .cells
+            .last()
+            .is_some_and(|cell| cell.width() == 2 && !cell.is_wide_continuation())
+        {
+            let last = self.cells.len() - 1;
+            self.cells[last] = Cell::blank(StyleId::DEFAULT);
+        }
         self.trim_trailing_blanks();
     }
 
@@ -630,6 +657,7 @@ pub struct TerminalGrid {
     pub(crate) characters: crate::CharacterState,
     pub(crate) saved_characters: crate::CharacterState,
     current_style: Style,
+    pub(crate) terminal_state: TerminalStateSnapshot,
     palette: StylePalette,
     revision: u64,
     content_revision: u64,
@@ -738,6 +766,7 @@ impl TerminalGrid {
             saved_pending_wrap: false,
             characters: crate::CharacterState::default(),
             saved_characters: crate::CharacterState::default(),
+            terminal_state: TerminalStateSnapshot::default(),
             current_style: Style::default(),
             palette: StylePalette::default(),
             revision: 0,
@@ -778,6 +807,9 @@ impl TerminalGrid {
             "alternate" => GridMode::Alternate,
             _ => return Err(TerminalGridError::InvalidSnapshot("unknown screen mode")),
         };
+        snapshot
+            .validate_terminal_state()
+            .map_err(TerminalGridError::InvalidSnapshot)?;
         let palette = StylePalette::from_styles(snapshot.styles.clone());
         let main_snapshot_rows = match mode {
             GridMode::Main => snapshot.rows.as_slice(),
@@ -836,6 +868,7 @@ impl TerminalGrid {
             saved_pending_wrap: snapshot.saved_pending_wrap,
             characters: snapshot.characters,
             saved_characters: snapshot.saved_characters,
+            terminal_state: snapshot.terminal_state.clone(),
             current_style: snapshot.current_style,
             palette,
             revision: snapshot.revision,
@@ -849,25 +882,29 @@ impl TerminalGrid {
                 .unwrap_or(u64::from(snapshot.scrollback_rows)),
             autowrap: snapshot.autowrap,
             pending_wrap: snapshot.pending_wrap,
-            scroll_region: snapshot.scroll_region.map(|region| {
-                let top = usize::from(region.top).min(height.saturating_sub(1));
-                let bottom = usize::from(region.bottom).min(height.saturating_sub(1));
-                if top < bottom {
-                    (top, bottom)
-                } else {
-                    (0, height.saturating_sub(1))
-                }
-            }),
+            scroll_region: snapshot
+                .scroll_region
+                .map(|region| (usize::from(region.top), usize::from(region.bottom))),
             protocol: snapshot.protocol,
         };
-        grid.saved_cursor = Cursor {
+        grid.restore_snapshot_saved_state(snapshot);
+        grid.clamp_cursor();
+        grid.evict_excess_history();
+        Ok(grid)
+    }
+
+    fn restore_snapshot_saved_state(&mut self, snapshot: &GridSnapshot) {
+        if let Some(rows) = &snapshot.retained_alt_rows {
+            self.alt_rows = rows
+                .iter()
+                .map(|row| row_from_snapshot(row, self.width))
+                .collect();
+        }
+        self.saved_cursor = Cursor {
             row: usize::from(snapshot.saved_cursor.row),
             col: usize::from(snapshot.saved_cursor.col),
             visible: snapshot.saved_cursor.visible,
         };
-        grid.clamp_cursor();
-        grid.evict_excess_history();
-        Ok(grid)
     }
 
     #[must_use]
@@ -993,6 +1030,9 @@ impl TerminalGrid {
         }
         self.cursor = clamp_cursor_to_dimensions(self.cursor, width, height);
         self.saved_cursor = clamp_cursor_to_dimensions(self.saved_cursor, width, height);
+        if let Some(stops) = &mut self.terminal_state.tab_stops {
+            stops.retain(|&col| usize::from(col) < width);
+        }
         self.bump_content_revision();
         Ok(same_width.then_some(row_shift))
     }
@@ -1014,6 +1054,48 @@ impl TerminalGrid {
         self.bump_content_revision();
     }
 
+    pub(crate) fn retained_alt_rows(&self) -> &[PhysicalRow] {
+        &self.alt_rows
+    }
+
+    pub(crate) fn set_alternate_mode(&mut self, mode: i64, enabled: bool) {
+        if !matches!(mode, 47 | 1047 | 1049) {
+            return;
+        }
+        if enabled {
+            if self.mode == GridMode::Alternate {
+                return;
+            }
+            if mode == 1049 {
+                self.save_cursor();
+            }
+            // 47 retains the existing alternate viewport; 1047/1049 clear it.
+            self.mode = GridMode::Alternate;
+            if mode != 47 {
+                self.alt_rows = vec![PhysicalRow::new(); self.height];
+                self.cursor.row = 0;
+                self.cursor.col = 0;
+            }
+        } else {
+            if self.mode == GridMode::Main {
+                return;
+            }
+            self.mode = GridMode::Main;
+            self.pending_wrap = false;
+            if mode != 47 {
+                self.alt_rows = vec![PhysicalRow::new(); self.height];
+            }
+            if mode == 1049 {
+                self.restore_cursor();
+            }
+        }
+        if enabled || mode != 1049 {
+            self.pending_wrap = false;
+        }
+        self.clamp_cursor();
+        self.bump_content_revision();
+    }
+
     pub(crate) fn set_cursor_visible(&mut self, visible: bool) {
         self.cursor.visible = visible;
         self.bump_revision();
@@ -1022,6 +1104,9 @@ impl TerminalGrid {
     pub(crate) fn save_cursor(&mut self) {
         self.saved_cursor = self.cursor;
         self.saved_characters = self.characters;
+        self.terminal_state.saved_style = self.current_style;
+        self.terminal_state.saved_origin_mode = self.terminal_state.origin_mode;
+        self.terminal_state.saved_autowrap = self.autowrap;
         self.saved_pending_wrap = self.pending_wrap;
         self.bump_revision();
     }
@@ -1029,6 +1114,9 @@ impl TerminalGrid {
     pub(crate) fn restore_cursor(&mut self) {
         self.cursor = self.saved_cursor;
         self.characters = self.saved_characters;
+        self.current_style = self.terminal_state.saved_style;
+        self.terminal_state.origin_mode = self.terminal_state.saved_origin_mode;
+        self.autowrap = self.terminal_state.saved_autowrap;
         self.pending_wrap = self.saved_pending_wrap;
         self.clamp_cursor();
         self.bump_revision();
@@ -1111,21 +1199,57 @@ impl TerminalGrid {
         let top = top.unwrap_or(0).min(self.height.saturating_sub(1));
         let bottom = bottom.unwrap_or_else(|| self.height.saturating_sub(1));
         let bottom = bottom.min(self.height.saturating_sub(1));
-        self.scroll_region = (top < bottom).then_some((top, bottom));
+        if top >= bottom {
+            return;
+        }
+        self.scroll_region = Some((top, bottom));
         self.move_cursor_to(0, 0);
     }
 
-    pub(crate) fn move_cursor_to(&mut self, row: usize, col: usize) {
-        self.pending_wrap = false;
-        self.cursor.row = row.min(self.height.saturating_sub(1));
-        self.cursor.col = col.min(self.width.saturating_sub(1));
+    pub(crate) fn set_origin_mode(&mut self, enabled: bool) {
+        self.terminal_state.origin_mode = enabled;
+        self.move_cursor_to(0, 0);
+    }
+
+    pub(crate) fn set_insert_mode(&mut self, enabled: bool) {
+        self.terminal_state.insert_mode = enabled;
         self.bump_revision();
     }
 
+    fn cursor_row_bounds(&self) -> (usize, usize) {
+        if self.terminal_state.origin_mode {
+            self.effective_scroll_region()
+        } else {
+            (0, self.height - 1)
+        }
+    }
+
+    pub(crate) fn move_cursor_to(&mut self, row: usize, col: usize) {
+        let (top, bottom) = self.cursor_row_bounds();
+        self.pending_wrap = false;
+        self.cursor.row = row.saturating_add(top).min(bottom);
+        self.cursor.col = col.min(self.width - 1);
+        self.bump_revision();
+    }
+
+    pub(crate) fn move_cursor_column(&mut self, col: usize) {
+        self.cursor.col = col.min(self.width - 1);
+        self.pending_wrap = false;
+        self.bump_revision();
+    }
+
+    pub(crate) fn move_cursor_row(&mut self, row: usize) {
+        self.move_cursor_to(row, self.cursor.col);
+    }
+
     pub(crate) fn move_cursor_relative(&mut self, rows: isize, cols: isize) {
-        let row = self.cursor.row.saturating_add_signed(rows);
-        let col = self.cursor.col.saturating_add_signed(cols);
-        self.move_cursor_to(row, col);
+        let (top, bottom) = self.cursor_row_bounds();
+        self.cursor.row = self
+            .cursor
+            .row
+            .saturating_add_signed(rows)
+            .clamp(top, bottom);
+        self.move_cursor_column(self.cursor.col.saturating_add_signed(cols));
     }
 
     pub(crate) fn carriage_return(&mut self) {
@@ -1140,10 +1264,49 @@ impl TerminalGrid {
         self.bump_revision();
     }
 
+    pub(crate) fn set_tab_stop(&mut self) {
+        let mut stops = self.terminal_state.tab_stops.take().unwrap_or_else(|| {
+            (8..self.width)
+                .step_by(8)
+                .map(|col| u16::try_from(col).expect("grid width is u16"))
+                .collect()
+        });
+        let col = u16::try_from(self.cursor.col).expect("cursor column is u16");
+        if let Err(index) = stops.binary_search(&col) {
+            stops.insert(index, col);
+        }
+        self.terminal_state.tab_stops = Some(stops);
+        self.bump_revision();
+    }
+
+    pub(crate) fn clear_tab_stops(&mut self, mode: usize) {
+        match mode {
+            0 => {
+                self.set_tab_stop();
+                if let Some(stops) = &mut self.terminal_state.tab_stops {
+                    stops.retain(|&col| usize::from(col) != self.cursor.col);
+                }
+            }
+            3 => self.terminal_state.tab_stops = Some(Vec::new()),
+            _ => return,
+        }
+        self.bump_revision();
+    }
+
     pub(crate) fn tab(&mut self) {
         self.pending_wrap = false;
-        let next = ((self.cursor.col / 8) + 1) * 8;
-        self.cursor.col = next.min(self.width.saturating_sub(1));
+        let next = self.terminal_state.tab_stops.as_ref().map_or_else(
+            || ((self.cursor.col / 8) + 1) * 8,
+            |stops| {
+                stops
+                    .iter()
+                    .copied()
+                    .map(usize::from)
+                    .find(|&col| col > self.cursor.col)
+                    .unwrap_or(self.width - 1)
+            },
+        );
+        self.cursor.col = next.min(self.width - 1);
         self.bump_revision();
     }
 
@@ -1213,6 +1376,16 @@ impl TerminalGrid {
         let style = self.palette.intern(self.current_style);
         let row = self.cursor_absolute_row();
         let col = self.cursor.col;
+        if char_width > self.width - col {
+            self.active_row_mut(row).clear_range(col, col + 1, style);
+            self.bump_content_revision();
+            return;
+        }
+        if self.terminal_state.insert_mode {
+            self.insert_blank_chars(char_width);
+        }
+        self.active_row_mut(row)
+            .clear_range(col, col + char_width, style);
         let cell = Cell::new(text, style, u8::try_from(char_width).unwrap_or(1));
         self.active_row_mut(row).set_cell(col, cell);
         if char_width == 2 && col + 1 < self.width {
@@ -1263,19 +1436,19 @@ impl TerminalGrid {
                 }
                 self.erase_line(1);
             }
-            2 | 3 => {
+            2 => {
                 self.display_erase_revision = self.display_erase_revision.wrapping_add(1);
                 for row in 0..self.height {
                     self.fill_viewport_row(row, fill);
                 }
-                if mode == 3 && self.mode == GridMode::Main {
-                    self.history_erase_revision = self.history_erase_revision.wrapping_add(1);
-                    self.history_truncated |= self.history_line_count() > 0;
-                    self.history_bytes = 0;
-                    self.main_history.clear();
-                    self.main_history_projected_rows = OnceLock::from(0);
-                    self.pending_history_cells.clear();
-                }
+            }
+            3 if self.mode == GridMode::Main => {
+                self.history_erase_revision = self.history_erase_revision.wrapping_add(1);
+                self.history_truncated |= self.history_line_count() > 0;
+                self.history_bytes = 0;
+                self.main_history.clear();
+                self.main_history_projected_rows = OnceLock::from(0);
+                self.pending_history_cells.clear();
             }
             _ => {}
         }
@@ -1313,6 +1486,14 @@ impl TerminalGrid {
         let col = self.cursor.col;
         let row = self.cursor_absolute_row();
         let fill = self.erase_style();
+        if self
+            .active_row_mut(row)
+            .cells()
+            .get(col)
+            .is_some_and(Cell::is_wide_continuation)
+        {
+            self.active_row_mut(row).clear_range(col, col + 1, fill);
+        }
         let mut cells = self.active_row_mut(row).visual_cells(width);
         for index in (col..width).rev() {
             cells[index] = if index >= col.saturating_add(count) {
@@ -1331,6 +1512,7 @@ impl TerminalGrid {
         let col = self.cursor.col;
         let row = self.cursor_absolute_row();
         let fill = self.erase_style();
+        self.active_row_mut(row).clear_range(col, col + count, fill);
         let mut cells = self.active_row_mut(row).visual_cells(width);
         for index in col..width {
             cells[index] = if index + count < width {
@@ -1344,8 +1526,8 @@ impl TerminalGrid {
     }
 
     pub(crate) fn insert_blank_lines(&mut self, count: usize) {
-        let (_, bottom) = self.effective_scroll_region();
-        if self.cursor.row > bottom {
+        let (top, bottom) = self.effective_scroll_region();
+        if self.cursor.row < top || self.cursor.row > bottom {
             return;
         }
         self.scroll_region_down(self.cursor.row, bottom, count.max(1));
@@ -1353,8 +1535,8 @@ impl TerminalGrid {
     }
 
     pub(crate) fn delete_lines(&mut self, count: usize) {
-        let (_, bottom) = self.effective_scroll_region();
-        if self.cursor.row > bottom {
+        let (top, bottom) = self.effective_scroll_region();
+        if self.cursor.row < top || self.cursor.row > bottom {
             return;
         }
         self.scroll_region_up(self.cursor.row, bottom, count.max(1));
@@ -1376,6 +1558,7 @@ impl TerminalGrid {
                 3 => self.current_style.italic = true,
                 4 => self.current_style.underline = true,
                 7 => self.current_style.inverse = true,
+                8 => self.current_style.hidden = true,
                 9 => self.current_style.strike = true,
                 22 => {
                     self.current_style.bold = false;
@@ -1384,6 +1567,7 @@ impl TerminalGrid {
                 23 => self.current_style.italic = false,
                 24 => self.current_style.underline = false,
                 27 => self.current_style.inverse = false,
+                28 => self.current_style.hidden = false,
                 29 => self.current_style.strike = false,
                 30..=37 => self.current_style.fg = indexed_color(params[i] - 30),
                 39 => self.current_style.fg = None,
@@ -1614,8 +1798,10 @@ impl TerminalGrid {
     }
 
     fn replace_active_row(&mut self, absolute_row: usize, cells: Vec<Cell>) {
+        let wrapped = self.active_row_mut(absolute_row).wrapped();
         let cells = normalized_visual_cells(cells, self.width);
         let mut row = PhysicalRow::new();
+        row.set_wrapped(wrapped);
         for (col, cell) in cells.into_iter().enumerate() {
             row.set_cell(col, cell);
         }
@@ -3003,6 +3189,10 @@ impl TerminalGrid {
         charge(self.main_rows.len(), std::mem::size_of::<PhysicalRow>())?;
         charge(self.alt_rows.len(), std::mem::size_of::<PhysicalRow>())?;
         charge(self.palette.styles().len(), std::mem::size_of::<Style>())?;
+        charge(
+            self.terminal_state.tab_stops.as_ref().map_or(0, Vec::len),
+            std::mem::size_of::<u16>(),
+        )?;
         let cells = self
             .main_history
             .iter()
@@ -3040,6 +3230,13 @@ impl TerminalGrid {
         let mut styles = Vec::new();
         styles.try_reserve_exact(self.palette.styles().len()).ok()?;
         styles.extend_from_slice(self.palette.styles());
+        let mut terminal_state = self.terminal_state.clone_without_tabs();
+        if let Some(stops) = &self.terminal_state.tab_stops {
+            let mut copy = Vec::new();
+            copy.try_reserve_exact(stops.len()).ok()?;
+            copy.extend_from_slice(stops);
+            terminal_state.tab_stops = Some(copy);
+        }
         let cloned = Self {
             width: self.width,
             height: self.height,
@@ -3057,6 +3254,7 @@ impl TerminalGrid {
             saved_pending_wrap: self.saved_pending_wrap,
             characters: self.characters,
             saved_characters: self.saved_characters,
+            terminal_state,
             current_style: self.current_style,
             palette: StylePalette::from_styles(styles),
             revision: self.revision,
@@ -3096,6 +3294,13 @@ impl TerminalGrid {
         )?;
         charge(self.alt_rows.capacity(), std::mem::size_of::<PhysicalRow>())?;
         charge(self.palette.capacity(), std::mem::size_of::<Style>())?;
+        charge(
+            self.terminal_state
+                .tab_stops
+                .as_ref()
+                .map_or(0, Vec::capacity),
+            std::mem::size_of::<u16>(),
+        )?;
         let vectors = self
             .main_history
             .iter()
@@ -3213,11 +3418,13 @@ fn normalized_visual_cells(mut cells: Vec<Cell>, width: usize) -> Vec<Cell> {
         if cells[col].width() == 2 {
             if col + 1 >= width {
                 cells[col] = Cell::blank(StyleId::DEFAULT);
-            } else {
+            } else if cells[col + 1].is_wide_continuation() {
                 let style = cells[col].style();
                 cells[col + 1] = Cell::spacer(style);
                 col += 2;
                 continue;
+            } else {
+                cells[col] = Cell::blank(StyleId::DEFAULT);
             }
         }
         col += 1;

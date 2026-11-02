@@ -2853,6 +2853,8 @@ struct CellStyle {
     italic: bool,
     underline: bool,
     inverse: bool,
+    strike: bool,
+    hidden: bool,
 }
 
 const fn grid_cell_style(style: GridStyle) -> CellStyle {
@@ -2864,6 +2866,8 @@ const fn grid_cell_style(style: GridStyle) -> CellStyle {
         italic: style.italic,
         underline: style.underline,
         inverse: style.inverse,
+        strike: style.strike,
+        hidden: style.hidden,
     }
 }
 
@@ -2892,6 +2896,8 @@ const fn render_style_to_cell_style(style: RenderStyle) -> CellStyle {
         italic: style.italic,
         underline: style.underline,
         inverse: style.reverse,
+        strike: style.strikethrough,
+        hidden: false,
     }
 }
 
@@ -3019,6 +3025,12 @@ fn style_sgr(style: CellStyle) -> String {
     }
     if style.inverse {
         parts.push("7".to_string());
+    }
+    if style.hidden {
+        parts.push("8".to_string());
+    }
+    if style.strike {
+        parts.push("9".to_string());
     }
     parts.push(color_sgr(style.fg, true));
     parts.push(color_sgr(style.bg, false));
@@ -3255,7 +3267,7 @@ fn cell_style_to_tui(value: CellStyle) -> bmux_tui::style::Style {
         CellColor::Indexed(index) => Some(RenderColor::Indexed(index)),
         CellColor::Rgb(r, g, b) => Some(RenderColor::Rgb { r, g, b }),
     };
-    crate::projection::style(RenderStyle {
+    let mut style = crate::projection::style(RenderStyle {
         fg: color(value.fg),
         bg: color(value.bg),
         bold: value.bold,
@@ -3263,8 +3275,13 @@ fn cell_style_to_tui(value: CellStyle) -> bmux_tui::style::Style {
         italic: value.italic,
         underline: value.underline,
         reverse: value.inverse,
+        strikethrough: value.strike,
         ..RenderStyle::default()
-    })
+    });
+    if value.hidden {
+        style = style.add_modifier(bmux_tui::style::Modifier::HIDDEN);
+    }
+    style
 }
 
 fn before_content_row_cells(
@@ -12458,6 +12475,42 @@ mod tests {
             out.contains("\x1b[1;93m"),
             "expected bold + bright-yellow SGR; got: {out:?}"
         );
+    }
+
+    #[test]
+    fn grid_conceal_and_strike_survive_all_style_lowerings() {
+        let mut stream = bmux_terminal_grid::TerminalGridStream::new(
+            8,
+            2,
+            bmux_terminal_grid::GridLimits::default(),
+        )
+        .unwrap();
+        stream.process(b"\x1b[8;9mX");
+        let rows = stream.grid().viewport_rows();
+        let source = stream.grid().palette().get(rows[0].cells()[0].style());
+        let lowered = super::grid_cell_style(source);
+        assert!(lowered.hidden);
+        assert!(lowered.strike);
+        let tui = super::cell_style_to_tui(lowered);
+        assert!(tui.modifiers.contains(bmux_tui::style::Modifier::HIDDEN));
+        assert!(
+            tui.modifiers
+                .contains(bmux_tui::style::Modifier::CROSSED_OUT)
+        );
+        {
+            let ansi = super::style_sgr(lowered);
+            let mut restored = bmux_terminal_grid::TerminalGridStream::new(
+                8,
+                2,
+                bmux_terminal_grid::GridLimits::default(),
+            )
+            .unwrap();
+            restored.process(format!("{ansi}X").as_bytes());
+            let rows = restored.grid().viewport_rows();
+            let style = restored.grid().palette().get(rows[0].cells()[0].style());
+            assert!(style.hidden);
+            assert!(style.strike);
+        }
     }
 
     #[test]

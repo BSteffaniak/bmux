@@ -636,7 +636,14 @@ impl Perform for GridPerformer<'_> {
         reason = "single CSI dispatcher keeps terminal escape handling in one explicit state-machine branch"
     )]
     fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], ignore: bool, action: char) {
-        if ignore {
+        if ignore
+            || !(intermediates.is_empty() || matches!(action, 'h' | 'l') && intermediates == b"?")
+            || (action != 'm' && params.iter().any(|group| group.len() != 1))
+        {
+            return;
+        }
+        if action == 'm' {
+            self.grid.set_graphic_rendition(&sgr_params(params));
             return;
         }
         let values = flatten_params(params);
@@ -653,10 +660,9 @@ impl Perform for GridPerformer<'_> {
             'D' => self
                 .grid
                 .move_cursor_relative(0, -one_based(values.first()).cast_signed()),
-            'd' => self.grid.move_cursor_to(
-                one_based(values.first()).saturating_sub(1),
-                self.grid.cursor().col,
-            ),
+            'd' => self
+                .grid
+                .move_cursor_row(one_based(values.first()).saturating_sub(1)),
             'b' => {
                 if let Some(ch) = self.grid.characters.last {
                     for _ in 0..one_based(values.first()) {
@@ -664,10 +670,9 @@ impl Perform for GridPerformer<'_> {
                     }
                 }
             }
-            'G' | '`' => self.grid.move_cursor_to(
-                self.grid.cursor().row,
-                one_based(values.first()).saturating_sub(1),
-            ),
+            'G' | '`' => self
+                .grid
+                .move_cursor_column(one_based(values.first()).saturating_sub(1)),
             'H' | 'f' => {
                 let row = one_based(values.first()).saturating_sub(1);
                 let col = one_based(values.get(1)).saturating_sub(1);
@@ -706,7 +711,7 @@ impl Perform for GridPerformer<'_> {
             }
             'X' => self.grid.erase_chars(one_based(values.first())),
             '@' => self.grid.insert_blank_chars(one_based(values.first())),
-            'm' => self.grid.set_graphic_rendition(&values),
+            'g' => self.grid.clear_tab_stops(default_zero(values.first())),
             's' => self.grid.save_cursor(),
             'u' => self.grid.restore_cursor(),
             'r' => {
@@ -714,8 +719,11 @@ impl Perform for GridPerformer<'_> {
                     self.grid.set_scroll_region(None, None);
                 } else {
                     let top = one_based(values.first()).saturating_sub(1);
-                    let bottom = one_based(values.get(1)).saturating_sub(1);
-                    self.grid.set_scroll_region(Some(top), Some(bottom));
+                    let bottom = values
+                        .get(1)
+                        .filter(|&&value| value != 0)
+                        .map(|value| one_based(Some(value)).saturating_sub(1));
+                    self.grid.set_scroll_region(Some(top), bottom);
                 }
             }
             'h' | 'l' if intermediates == *b"?" => {
@@ -723,25 +731,13 @@ impl Perform for GridPerformer<'_> {
                 for value in values {
                     match value {
                         1 => self.grid.set_application_cursor(enabled),
+                        6 => self.grid.set_origin_mode(enabled),
                         7 => self.grid.set_autowrap(enabled),
                         9 => self
                             .grid
                             .set_mouse_tracking_mode(MouseProtocolMode::Press, enabled),
                         25 => self.grid.set_cursor_visible(enabled),
-                        47 | 1047 => self.grid.set_mode(if enabled {
-                            GridMode::Alternate
-                        } else {
-                            GridMode::Main
-                        }),
-                        1049 => {
-                            if enabled {
-                                self.grid.save_cursor();
-                                self.grid.set_mode(GridMode::Alternate);
-                            } else {
-                                self.grid.set_mode(GridMode::Main);
-                                self.grid.restore_cursor();
-                            }
-                        }
+                        47 | 1047 | 1049 => self.grid.set_alternate_mode(value, enabled),
                         1000 => self
                             .grid
                             .set_mouse_tracking_mode(MouseProtocolMode::PressRelease, enabled),
@@ -760,6 +756,13 @@ impl Perform for GridPerformer<'_> {
                         1015 => self.grid.set_mouse_urxvt_encoding(enabled),
                         2004 => self.grid.set_bracketed_paste(enabled),
                         _ => {}
+                    }
+                }
+            }
+            'h' | 'l' if intermediates.is_empty() => {
+                for value in values {
+                    if value == 4 {
+                        self.grid.set_insert_mode(action == 'h');
                     }
                 }
             }
@@ -787,6 +790,7 @@ impl Perform for GridPerformer<'_> {
         match byte {
             b'7' => self.grid.save_cursor(),
             b'8' => self.grid.restore_cursor(),
+            b'H' => self.grid.set_tab_stop(),
             b'D' => self.grid.linefeed(),
             b'E' => {
                 self.grid.linefeed();
@@ -799,6 +803,65 @@ impl Perform for GridPerformer<'_> {
             _ => {}
         }
     }
+}
+
+/// Normalize SGR groups without interpreting color operands as independent
+/// commands. Colons belong to a single operation; semicolons separate operations
+/// except for the legacy extended-color forms.
+fn sgr_params(params: &Params) -> Vec<i64> {
+    let groups: Vec<_> = params.iter().collect();
+    let mut output = Vec::new();
+    let mut index = 0;
+    while let Some(group) = groups.get(index) {
+        let code = group[0];
+        if matches!(code, 38 | 48 | 58) {
+            let (operands, consumed) = if group.len() > 1 {
+                (group[1..].to_vec(), 0)
+            } else {
+                let mode = groups.get(index + 1).and_then(|g| g.first()).copied();
+                let count = match mode {
+                    Some(2) => 4,
+                    Some(5) => 2,
+                    // An unknown legacy color encoding has no known operand
+                    // boundary. Ignore its remainder rather than leak styles.
+                    _ => groups.len().saturating_sub(index + 1),
+                };
+                let consumed = count.min(groups.len().saturating_sub(index + 1));
+                let operands = groups[index + 1..index + 1 + consumed]
+                    .iter()
+                    .map(|g| if g.len() == 1 { g[0] } else { u16::MAX })
+                    .collect();
+                (operands, consumed)
+            };
+            if code != 58 {
+                let normalized = match operands.as_slice() {
+                    [5, value] if *value <= 255 => Some(vec![5, *value]),
+                    [2, r, g, b] if [r, g, b].iter().all(|v| **v <= 255) => {
+                        Some(vec![2, *r, *g, *b])
+                    }
+                    [2, 0, r, g, b] if [r, g, b].iter().all(|v| **v <= 255) => {
+                        Some(vec![2, *r, *g, *b])
+                    }
+                    _ => None,
+                };
+                if let Some(normalized) = normalized {
+                    output.push(i64::from(code));
+                    output.extend(normalized.into_iter().map(i64::from));
+                }
+            }
+            index += consumed;
+        } else if group.len() == 1 {
+            output.push(i64::from(code));
+        } else if let [4, kind @ 0..=5] = **group {
+            output.push(if kind == 0 { 24 } else { 4 });
+        }
+        index += 1;
+    }
+    // An ignored operation is not SGR 0. The grid treats an empty slice as reset.
+    if output.is_empty() {
+        output.push(-1);
+    }
+    output
 }
 
 fn flatten_params(params: &Params) -> Vec<i64> {

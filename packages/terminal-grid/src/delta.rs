@@ -1,5 +1,7 @@
 use crate::model::ProtocolState;
-use crate::snapshot::{CursorSnapshot, GridSnapshot, RowSnapshot, ScrollRegionSnapshot};
+use crate::snapshot::{
+    CursorSnapshot, GridSnapshot, RowSnapshot, ScrollRegionSnapshot, TerminalStateSnapshot,
+};
 use crate::style::Style;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -19,6 +21,10 @@ pub struct RowUpdateSnapshot {
 )]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GridDeltaBatch {
+    #[serde(default)]
+    pub terminal_state: TerminalStateSnapshot,
+    #[serde(default)]
+    pub retained_alt_rows: Option<Vec<RowSnapshot>>,
     #[serde(default)]
     pub history_truncated: Option<bool>,
     /// Revision the receiver must already have before applying this delta.
@@ -111,6 +117,8 @@ impl GridDeltaBatch {
                 .collect()
         };
         Some(Self {
+            terminal_state: after.terminal_state.clone(),
+            retained_alt_rows: after.retained_alt_rows.clone(),
             base_revision: before.revision,
             revision: after.revision,
             content_revision: after.content_revision,
@@ -169,6 +177,17 @@ impl GridDeltaBatch {
 
     /// Validate dimensions and screen identity before materializing retained rows.
     pub(crate) fn validate_geometry(&self) -> Result<(), GridDeltaApplyError> {
+        self.terminal_state
+            .validate(self.width)
+            .map_err(GridDeltaApplyError::InvalidTerminalState)?;
+        crate::snapshot::validate_retained_alternate(
+            self.retained_alt_rows.as_deref(),
+            &self.mode,
+            self.width,
+            self.height,
+            self.styles.len(),
+        )
+        .map_err(GridDeltaApplyError::InvalidTerminalState)?;
         if self.width == 0 || self.height == 0 {
             return Err(GridDeltaApplyError::ZeroDimensions);
         }
@@ -298,6 +317,10 @@ impl GridDeltaBatch {
         } else if let Some(rows) = &self.main_rows {
             snapshot.main_rows = Some(rows.clone());
         }
+        snapshot.terminal_state.clone_from(&self.terminal_state);
+        snapshot
+            .retained_alt_rows
+            .clone_from(&self.retained_alt_rows);
         snapshot.revision = self.revision;
         snapshot.content_revision = self.content_revision;
         snapshot.width = self.width;
@@ -328,6 +351,8 @@ const fn default_autowrap() -> bool {
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum GridDeltaApplyError {
+    #[error("invalid terminal state: {0}")]
+    InvalidTerminalState(&'static str),
     #[error("grid delta row index {0} does not strictly increase")]
     NonIncreasingRowIndex(u32),
     #[error("grid delta dimensions must be nonzero")]

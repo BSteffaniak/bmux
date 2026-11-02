@@ -60,11 +60,17 @@ pub fn full_screen_repaint_bytes(grid: &TerminalGrid) -> Vec<u8> {
     }
 
     let mut bytes = b"\x1b[0m\x1b[2J".to_vec();
+    // Cursor positioning does not reset SGR attributes between rows.
+    let mut current_style = Style::default();
     for (row_index, row) in rows.iter().enumerate() {
         bytes.extend_from_slice(format!("\x1b[{};1H", row_index.saturating_add(1)).as_bytes());
-        let mut current_style = Style::default();
         for col in 0..grid.width() {
             let cell = row.cells().get(col);
+            // The leading glyph already advances across its continuation columns.
+            // Emitting a space here would shift later cells and can scroll at the edge.
+            if cell.is_some_and(crate::Cell::is_wide_continuation) {
+                continue;
+            }
             let style = cell
                 .map(|cell| grid.palette().get(cell.style()))
                 .unwrap_or_default();
@@ -73,7 +79,6 @@ pub fn full_screen_repaint_bytes(grid: &TerminalGrid) -> Vec<u8> {
                 current_style = style;
             }
             if let Some(cell) = cell
-                && !cell.is_wide_continuation()
                 && !cell.text().is_empty()
             {
                 bytes.extend_from_slice(cell.text().as_bytes());
@@ -117,6 +122,9 @@ fn style_sgr(style: Style) -> String {
     if style.inverse {
         parts.push("7".to_string());
     }
+    if style.hidden {
+        parts.push("8".to_string());
+    }
     if style.strike {
         parts.push("9".to_string());
     }
@@ -145,9 +153,9 @@ fn push_color_sgr(parts: &mut Vec<String>, color: Option<Color>, foreground: boo
 
 #[cfg(test)]
 mod tests {
-    use crate::{GridLimits, TerminalGridStream};
+    use crate::{GridLimits, Style, TerminalGridStream};
 
-    use super::{full_screen_repaint_bytes, visible_text, visible_text_trimmed};
+    use super::{full_screen_repaint_bytes, style_sgr, visible_text, visible_text_trimmed};
 
     fn test_grid(cols: u16, rows: u16) -> TerminalGridStream {
         TerminalGridStream::new(cols, rows, GridLimits::default())
@@ -197,6 +205,22 @@ mod tests {
     }
 
     #[test]
+    fn repaint_preserves_hidden_style() {
+        let style = Style {
+            hidden: true,
+            ..Style::default()
+        };
+        assert_eq!(style_sgr(style), "\x1b[0;8;39;49m");
+
+        let mut grid = test_grid(8, 2);
+        grid.process(b"\x1b[8msecret\x1b[0m\x1b[2;1Hvisible");
+        let rows = grid.grid().viewport_rows();
+        let cell = &rows[0].cells()[0];
+        assert!(grid.grid().palette().get(cell.style()).hidden);
+        assert_repaint_roundtrip(&grid, 8, 2);
+    }
+
+    #[test]
     fn repaint_restores_cursor_position_and_visibility() {
         let mut grid = test_grid(16, 4);
         grid.process(b"hello\x1b[3;7H\x1b[?25l");
@@ -207,6 +231,70 @@ mod tests {
         let mut replay = test_grid(16, 4);
         replay.process(&repaint);
         assert_eq!(replay.grid().cursor(), grid.grid().cursor());
+    }
+
+    fn assert_repaint_roundtrip(grid: &TerminalGridStream, cols: u16, rows: u16) {
+        let repaint = full_screen_repaint_bytes(grid.grid());
+        let mut replay = test_grid(cols, rows);
+        // A baseline must not depend on the recipient's previous attributes.
+        replay.process(b"\x1b[1;7;38;5;3;48;5;4mX");
+        replay.process(&repaint);
+
+        assert_eq!(replay.grid().cursor(), grid.grid().cursor());
+        assert_eq!(replay.grid().scrollback_rows_hint(), 0);
+        for (row_index, (expected, actual)) in grid
+            .grid()
+            .viewport_rows()
+            .iter()
+            .zip(replay.grid().viewport_rows().iter())
+            .enumerate()
+        {
+            assert!(!actual.wrapped(), "unexpected wrap at row {row_index}");
+            // Repainting materializes sparse trailing blanks; compare columns,
+            // not the source row's retained allocation length.
+            let blank = crate::Cell::blank(crate::StyleId::DEFAULT);
+            for col in 0..usize::from(cols) {
+                let expected_cell = expected.cells().get(col).unwrap_or(&blank);
+                let actual_cell = actual.cells().get(col).unwrap_or(&blank);
+                assert_eq!(
+                    (
+                        actual_cell.text(),
+                        actual_cell.width(),
+                        actual_cell.is_wide_continuation(),
+                        replay.grid().palette().get(actual_cell.style()),
+                    ),
+                    (
+                        expected_cell.text(),
+                        expected_cell.width(),
+                        expected_cell.is_wide_continuation(),
+                        grid.grid().palette().get(expected_cell.style()),
+                    ),
+                    "cell mismatch at row {row_index}, column {col}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn repaint_roundtrips_mixed_widths_colors_and_default_rows() {
+        let mut grid = test_grid(8, 4);
+        grid.process(
+            "\x1b[1;3;4;9;38;2;1;2;3;48;5;4m好bcd好e\x1b[0m\x1b[2;1Hdefault!\x1b[3;1Ha\x1b[2;7;38;5;5;48;2;6;7;8m好bcd好\x1b[0m\x1b[4;1H\x1b[?25l"
+                .as_bytes(),
+        );
+
+        assert_repaint_roundtrip(&grid, 8, 4);
+    }
+
+    #[test]
+    fn repaint_wide_glyph_at_right_and_bottom_edges_does_not_wrap_or_scroll() {
+        for cols in [2, 4, 5] {
+            let mut grid = test_grid(cols, 2);
+            let prefix = "x".repeat(usize::from(cols) - 2);
+            grid.process(format!("{prefix}好\x1b[2;1H{prefix}好").as_bytes());
+
+            assert_repaint_roundtrip(&grid, cols, 2);
+        }
     }
 
     #[test]

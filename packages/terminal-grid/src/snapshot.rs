@@ -1,6 +1,8 @@
 use crate::model::{Cursor, GridMode, PhysicalRow, ProtocolState, TerminalGrid};
 use crate::style::{Style, StyleId};
 use serde::{Deserialize, Serialize};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CellRunSnapshot {
@@ -28,8 +30,71 @@ pub struct ScrollRegionSnapshot {
     pub bottom: u16,
 }
 
+/// Versioned execution state. Missing legacy state uses documented power-on defaults.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+// These independently saved DEC/ANSI flags are not mutually exclusive states.
+#[allow(clippy::struct_excessive_bools)]
+pub struct TerminalStateSnapshot {
+    pub version: u8,
+    pub origin_mode: bool,
+    pub insert_mode: bool,
+    pub saved_style: Style,
+    pub saved_origin_mode: bool,
+    pub saved_autowrap: bool,
+    /// None is the power-on eight-column pattern; Some([]) means all cleared.
+    pub tab_stops: Option<Vec<u16>>,
+}
+
+impl TerminalStateSnapshot {
+    pub(crate) fn clone_without_tabs(&self) -> Self {
+        Self {
+            version: self.version,
+            origin_mode: self.origin_mode,
+            insert_mode: self.insert_mode,
+            saved_style: self.saved_style,
+            saved_origin_mode: self.saved_origin_mode,
+            saved_autowrap: self.saved_autowrap,
+            tab_stops: None,
+        }
+    }
+
+    pub(crate) fn validate(&self, width: u16) -> Result<(), &'static str> {
+        let state = self;
+        if state.version != 1 {
+            return Err("unsupported terminal state version");
+        }
+        if let Some(stops) = &state.tab_stops
+            && (stops.iter().any(|&col| col >= width)
+                || stops.windows(2).any(|pair| pair[0] >= pair[1]))
+        {
+            return Err("invalid terminal tab stops");
+        }
+        Ok(())
+    }
+}
+
+impl Default for TerminalStateSnapshot {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            origin_mode: false,
+            insert_mode: false,
+            saved_style: Style::default(),
+            saved_origin_mode: false,
+            saved_autowrap: true,
+            tab_stops: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GridSnapshot {
+    #[serde(default)]
+    pub terminal_state: TerminalStateSnapshot,
+    /// Hidden mode-47 screen retained while the main screen is active.
+    #[serde(default)]
+    pub retained_alt_rows: Option<Vec<RowSnapshot>>,
     /// Unknown in legacy snapshots; consumers must not infer complete history.
     #[serde(default)]
     pub history_truncated: Option<bool>,
@@ -73,7 +138,60 @@ pub struct GridSnapshot {
     pub main_rows: Option<Vec<RowSnapshot>>,
 }
 
+pub(crate) fn validate_retained_alternate(
+    rows: Option<&[RowSnapshot]>,
+    mode: &str,
+    width: u16,
+    height: u16,
+    styles: usize,
+) -> Result<(), &'static str> {
+    let Some(rows) = rows else { return Ok(()) };
+    if mode != "main" || rows.len() != usize::from(height) {
+        return Err("invalid retained alternate screen");
+    }
+    for row in rows {
+        let mut end = 0;
+        for run in &row.runs {
+            let start = usize::from(run.start_col);
+            if start < end
+                || start >= usize::from(width)
+                || run.text.is_empty()
+                || usize::try_from(run.style.0).map_or(true, |style| style >= styles)
+            {
+                return Err("invalid retained alternate run");
+            }
+            end = start;
+            for grapheme in run.text.graphemes(true) {
+                let columns = UnicodeWidthStr::width(grapheme).min(2);
+                if columns == 0 || columns > usize::from(width).saturating_sub(end) {
+                    return Err("invalid retained alternate glyph");
+                }
+                end += columns;
+            }
+        }
+    }
+    Ok(())
+}
+
 impl GridSnapshot {
+    pub(crate) fn validate_terminal_state(&self) -> Result<(), &'static str> {
+        self.terminal_state.validate(self.width)?;
+        if self
+            .scroll_region
+            .is_some_and(|region| region.top >= region.bottom || region.bottom >= self.height)
+        {
+            return Err("invalid scrolling region");
+        }
+        validate_retained_alternate(
+            self.retained_alt_rows.as_deref(),
+            &self.mode,
+            self.width,
+            self.height,
+            self.styles.len(),
+        )?;
+        Ok(())
+    }
+
     /// # Panics
     /// Panics if snapshot storage cannot be allocated. Budgeted callers should
     /// use [`Self::try_from_grid`] instead.
@@ -130,6 +248,21 @@ impl GridSnapshot {
         } else {
             None
         };
+        let retained_alt_rows = if grid.mode() == GridMode::Main {
+            Some(try_snapshot_rows(grid.retained_alt_rows(), &mut remaining)?)
+        } else {
+            None
+        };
+        let mut terminal_state = TerminalStateSnapshot {
+            tab_stops: None,
+            ..grid.terminal_state.clone_without_tabs()
+        };
+        if let Some(stops) = &grid.terminal_state.tab_stops {
+            let mut copy = Vec::new();
+            reserve_snapshot_vec(&mut copy, stops.len(), &mut remaining)?;
+            copy.extend_from_slice(stops);
+            terminal_state.tab_stops = Some(copy);
+        }
         let mut styles = Vec::new();
         reserve_snapshot_vec(&mut styles, grid.palette().styles().len(), &mut remaining)?;
         styles.extend_from_slice(grid.palette().styles());
@@ -142,6 +275,8 @@ impl GridSnapshot {
         });
         let cursor = cursor_snapshot(grid.cursor());
         Some(Self {
+            terminal_state,
+            retained_alt_rows,
             revision: grid.revision(),
             content_revision: grid.content_revision(),
             width: u16::try_from(grid.width()).unwrap_or(u16::MAX),
