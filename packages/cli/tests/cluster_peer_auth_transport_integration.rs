@@ -517,6 +517,70 @@ fn three_admitted_voters_form_membership_and_survive_one_node_restart() {
 
 #[test]
 #[serial]
+fn fixture_failure_retains_only_bounded_diagnostics_after_retirement() {
+    let mut root = None;
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut server = ServerEnv::new("intentional-failure-retirement");
+        server.start();
+        root = Some(server.root().to_path_buf());
+        panic!("intentional fixture failure");
+    }));
+    assert!(result.is_err());
+    let root = root.unwrap();
+    assert!(
+        !root.exists(),
+        "failed fixture leaked runtime {}",
+        root.display()
+    );
+    let diagnostics = root.with_file_name(format!(
+        "{}-diagnostics",
+        root.file_name().unwrap().to_string_lossy()
+    ));
+    let report = std::fs::read(diagnostics.join("README.txt")).unwrap();
+    assert!(report.len() < 4096);
+    assert_eq!(std::fs::read_dir(&diagnostics).unwrap().count(), 1);
+    std::fs::remove_dir_all(diagnostics).unwrap();
+}
+
+#[test]
+#[serial]
+fn fixture_retirement_removes_running_session_and_both_artifact_roots() {
+    let mut server = ServerEnv::new("session-retirement");
+    server.start();
+    let output = server.run(&["session", "new", "cleanup-test"]);
+    assert_success(&output, "create test session");
+    let root = server.root().to_path_buf();
+    drop(server);
+    assert!(
+        !root.exists(),
+        "session retirement leaked {}",
+        root.display()
+    );
+}
+
+#[test]
+#[serial]
+fn fixture_preserves_unresolved_recovery_artifacts_after_server_exit() {
+    let mut server = ServerEnv::new("recovery-retention");
+    server.start();
+    let recovery = server.state_dir.join("pane-executions-v4");
+    std::fs::create_dir_all(&recovery).unwrap();
+    let marker = recovery.join("test-owned-unresolved-record");
+    std::fs::write(&marker, "intentional test recovery evidence").unwrap();
+    server.stop();
+    assert!(marker.is_file());
+    assert!(server.root().exists());
+    // Remove only the record this test created, then obtain a new owned
+    // lifecycle and verify normal teardown is possible again.
+    std::fs::remove_file(marker).unwrap();
+    server.start();
+    let root = server.root().to_path_buf();
+    drop(server);
+    assert!(!root.exists());
+}
+
+#[test]
+#[serial]
 fn shared_process_harness_supports_three_isolated_lifecycles_and_log_capture() {
     let mut harness =
         support::ClusterProcessHarness::new(["lifecycle-a", "lifecycle-b", "lifecycle-c"]);

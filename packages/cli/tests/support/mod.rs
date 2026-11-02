@@ -1,3 +1,5 @@
+mod lifecycle;
+
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
@@ -29,6 +31,8 @@ fn short_unique_suffix() -> String {
 #[derive(Debug)]
 pub struct TempDirGuard {
     path: PathBuf,
+    preserve_runtime: bool,
+    retirement_fence: Option<std::fs::File>,
 }
 
 impl TempDirGuard {
@@ -36,7 +40,11 @@ impl TempDirGuard {
     pub fn new(label: &str) -> Self {
         let path = test_tmp_root().join(format!("bmux-cp-{label}-{}", short_unique_suffix()));
         std::fs::create_dir_all(&path).expect("create isolated process root");
-        Self { path }
+        Self {
+            path,
+            preserve_runtime: false,
+            retirement_fence: None,
+        }
     }
 
     #[must_use]
@@ -47,14 +55,19 @@ impl TempDirGuard {
 
 impl Drop for TempDirGuard {
     fn drop(&mut self) {
-        if std::thread::panicking() {
-            eprintln!(
-                "isolated server evidence retained at {}",
-                self.path.display()
-            );
+        if self.preserve_runtime || lifecycle::keep_artifacts() {
+            eprintln!("test runtime artifacts retained at {}", self.path.display());
             return;
         }
-        let _ = std::fs::remove_dir_all(&self.path);
+        if std::thread::panicking()
+            && let Err(error) = lifecycle::retain_diagnostics(&self.path)
+        {
+            eprintln!("failed retaining bounded diagnostics: {error}");
+            return;
+        }
+        if let Err(error) = std::fs::remove_dir_all(&self.path) {
+            eprintln!("failed removing fixture {}: {error}", self.path.display());
+        }
     }
 }
 
@@ -76,7 +89,9 @@ pub struct ServerEnv {
 impl ServerEnv {
     #[must_use]
     pub fn new(label: &str) -> Self {
-        let root = TempDirGuard::new(label);
+        let mut root = TempDirGuard::new(label);
+        // Cleared only after this fixture verifies retirement, not merely process exit.
+        root.preserve_runtime = true;
         let runtime_dir = root.path().join("runtime");
         let config_dir = root.path().join("config");
         let data_dir = root.path().join("data");
@@ -136,6 +151,11 @@ impl ServerEnv {
 
     pub fn command_with_binary(&self, binary: &Path, args: &[&str]) -> Command {
         let mut command = Command::new(binary);
+        for (key, _) in std::env::vars_os() {
+            if key.to_string_lossy().starts_with("BMUX_") {
+                command.env_remove(key);
+            }
+        }
         if let Some(home) = &self.shell_home {
             command
                 .env("HOME", home)
@@ -143,6 +163,9 @@ impl ServerEnv {
         }
         command
             .args(args)
+            .env("BMUX_NO_BASE_CONFIG", "1")
+            .env("BMUX_RUNTIME_NAME", "default")
+            .env("BMUX_TARGET", "local")
             .env("BMUX_RUNTIME_DIR", &self.runtime_dir)
             .env("BMUX_CONFIG_DIR", &self.config_dir)
             .env("BMUX_DATA_DIR", &self.data_dir)
@@ -152,12 +175,95 @@ impl ServerEnv {
     }
 
     pub fn run(&self, args: &[&str]) -> Output {
-        self.command(args)
-            .output()
-            .expect("run isolated bmux command")
+        lifecycle::run(
+            &mut self.command(args),
+            self.root(),
+            Duration::from_secs(30),
+        )
+        .expect("run isolated bmux command")
+    }
+
+    fn retire(&mut self) -> std::io::Result<()> {
+        let Some(child) = self.server_child.as_mut() else {
+            return Err(std::io::Error::other(
+                "no owned server handle; retirement unconfirmed",
+            ));
+        };
+        let pid = child.id();
+        if child.try_wait()?.is_some() {
+            return Err(std::io::Error::other(
+                "server exited before execution retirement",
+            ));
+        }
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(self.runtime_dir.join("server-meta.json"))?)?;
+        if metadata["pid"].as_u64() != Some(u64::from(pid)) {
+            return Err(std::io::Error::other(
+                "server identity does not match owned handle",
+            ));
+        }
+        // Only the isolated, still-owned server can retire its execution domain.
+        let killed = lifecycle::run(
+            &mut self.command(&["session", "kill-all", "--force-local"]),
+            self.root(),
+            SERVER_STOP_TIMEOUT,
+        )?;
+        if !killed.status.success() {
+            return Err(std::io::Error::other("execution retirement failed"));
+        }
+        let stopped = lifecycle::run(
+            &mut self.command(&["server", "stop"]),
+            self.root(),
+            SERVER_STOP_TIMEOUT,
+        )?;
+        if !stopped.status.success() {
+            return Err(std::io::Error::other("shutdown completion unverified"));
+        }
+        let child = self.server_child.as_mut().unwrap();
+        let deadline = Instant::now() + SERVER_STOP_TIMEOUT;
+        while child.try_wait()?.is_none() {
+            if Instant::now() >= deadline {
+                return Err(std::io::Error::other("server process exit unconfirmed"));
+            }
+            thread::sleep(POLL_INTERVAL);
+        }
+        self.verify_retirement(&metadata)
+    }
+
+    fn verify_retirement(&mut self, metadata: &serde_json::Value) -> std::io::Result<()> {
+        let receipt: serde_json::Value = serde_json::from_slice(&std::fs::read(
+            self.runtime_dir.join("shutdown-result.json"),
+        )?)?;
+        if receipt["pid"] != metadata["pid"]
+            || receipt["started_at_epoch_ms"] != metadata["started_at_epoch_ms"]
+            || receipt.get("error") != Some(&serde_json::Value::Null)
+        {
+            return Err(std::io::Error::other(
+                "matching successful shutdown receipt missing",
+            ));
+        }
+        match std::fs::read_dir(self.state_dir.join("pane-executions-v4")) {
+            Ok(mut entries) => {
+                if entries.next().is_some() {
+                    return Err(std::io::Error::other("execution recovery records remain"));
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        let fence = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(self.runtime_dir.join("server-lifetime.lock"))?;
+        fence.try_lock().map_err(std::io::Error::other)?;
+        self.root.retirement_fence = Some(fence);
+        self.root.preserve_runtime = false;
+        Ok(())
     }
 
     pub fn start(&mut self) {
+        self.root.retirement_fence = None;
+        self.root.preserve_runtime = true;
         assert!(
             self.server_child.is_none(),
             "isolated server already started"
@@ -175,6 +281,18 @@ impl ServerEnv {
         self.wait_until_ready(SERVER_READY_TIMEOUT);
     }
 
+    /// Final teardown, unlike stop(), retires sessions instead of preserving restart state.
+    #[allow(dead_code)] // Shared support is compiled separately by integration tests without final teardown calls.
+    pub fn finish(&mut self) {
+        self.retire().unwrap_or_else(|error| {
+            panic!(
+                "fixture retirement failed: {error}; root={}",
+                self.root().display()
+            )
+        });
+        self.server_child.take();
+    }
+
     pub fn stop(&mut self) {
         let Some(mut child) = self.server_child.take() else {
             return;
@@ -190,7 +308,21 @@ impl ServerEnv {
                 self.root().display()
             );
         }
-        wait_for_exit(&mut child, SERVER_STOP_TIMEOUT, self.root());
+        let deadline = Instant::now() + SERVER_STOP_TIMEOUT;
+        loop {
+            if child.try_wait().expect("inspect stopping server").is_some() {
+                return;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!(
+                    "isolated server exit unconfirmed; root={}",
+                    self.root().display()
+                );
+            }
+            thread::sleep(POLL_INTERVAL);
+        }
     }
 
     #[must_use]
@@ -291,17 +423,23 @@ impl ServerEnv {
 
 impl Drop for ServerEnv {
     fn drop(&mut self) {
-        if self.server_child.is_some() {
-            let _ = self.run(&["server", "stop"]);
+        if let Some(mut child) = self.gateway_child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        if self.server_child.is_some()
+            && let Err(error) = self.retire()
+        {
+            eprintln!(
+                "fixture retirement unconfirmed at {}: {error}",
+                self.root().display()
+            );
         }
         if let Some(mut child) = self.server_child.take() {
             if child.try_wait().ok().flatten().is_none() {
+                // Only our child handle, never a PID-file-selected process.
                 let _ = child.kill();
             }
-            let _ = child.wait();
-        }
-        if let Some(mut child) = self.gateway_child.take() {
-            let _ = child.kill();
             let _ = child.wait();
         }
     }
@@ -351,7 +489,7 @@ impl ClusterProcessHarness {
 
     pub fn stop_all(&mut self) {
         for node in self.nodes.iter_mut().rev() {
-            node.stop();
+            node.finish();
         }
     }
 }
@@ -408,20 +546,4 @@ pub fn generate_ed25519_key(path: &Path) {
         .output()
         .expect("run ssh-keygen");
     assert_success(&output, "generate SSH key");
-}
-
-fn wait_for_exit(child: &mut Child, timeout: Duration, root: &Path) {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if child.try_wait().expect("inspect stopping server").is_some() {
-            return;
-        }
-        thread::sleep(POLL_INTERVAL);
-    }
-    let _ = child.kill();
-    let _ = child.wait();
-    panic!(
-        "isolated server did not stop in time; root={}",
-        root.display()
-    );
 }

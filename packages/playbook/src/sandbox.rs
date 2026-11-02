@@ -20,15 +20,16 @@ use std::sync::Arc;
 
 /// Handle to a running sandbox server.
 ///
-/// Implements `Drop` as a defense-in-depth cleanup mechanism: if the struct is
-/// dropped without calling `shutdown()` (e.g. due to panic, early return, or
-/// signal), it will kill the server process and remove temp dirs.
+/// Dropping without verified shutdown preserves runtime/recovery artifacts.
+/// Only the directly owned foreground child is signalled as a fallback.
 #[derive(Debug)]
 pub struct SandboxServer {
     host: Arc<dyn HostAdapter>,
     handle: ServerHandle,
     root_dir: PathBuf,
     cleaned_up: bool,
+    identity: serde_json::Value,
+    retirement_fence: Option<std::fs::File>,
 }
 
 #[derive(Debug)]
@@ -132,12 +133,25 @@ impl SandboxServer {
         .await
         .context("failed starting sandbox server")?;
 
-        Ok(Self {
+        let mut sandbox = Self {
             host,
             handle,
             root_dir,
             cleaned_up: false,
-        })
+            identity: serde_json::Value::Null,
+            retirement_fence: None,
+        };
+        // Establish the owning Drop guard before reading fallible metadata.
+        sandbox.identity = serde_json::from_slice(&std::fs::read(
+            sandbox.paths().runtime_dir.join("server-meta.json"),
+        )?)?;
+        if let ServerHandle::Foreground { child, .. } = &sandbox.handle {
+            anyhow::ensure!(
+                sandbox.identity["pid"].as_u64() == Some(u64::from(child.id())),
+                "sandbox metadata does not match owned foreground child"
+            );
+        }
+        Ok(sandbox)
     }
 
     /// Connect a new `BmuxClient` to this sandbox server.
@@ -178,8 +192,10 @@ impl SandboxServer {
     ///
     /// Returns an error if the sandbox server fails to shut down cleanly.
     pub async fn shutdown(mut self, retain_on_failure: bool) -> Result<()> {
-        self.cleaned_up = true;
         let result = self.stop_server().await;
+        if result.is_ok() {
+            self.cleaned_up = true;
+        }
         if result.is_ok()
             && let Some(root) = std::env::var_os("BMUX_PLAYBOOK_MANAGED_ROOT")
         {
@@ -204,46 +220,90 @@ impl SandboxServer {
             keep,
         );
         let _ = self.host.clear_sandbox_lock(&self.root_dir);
-        if !keep {
-            let _ = std::fs::remove_dir_all(&self.root_dir);
+        let full_retention =
+            std::env::var_os("BMUX_TEST_KEEP_ARTIFACTS").is_some_and(|value| value == "1");
+        let managed = std::env::var_os("BMUX_PLAYBOOK_MANAGED_ROOT").is_some();
+        if result.is_ok() && !managed && !full_retention {
+            // The lifetime fence remains held. No executable/recovery artifacts
+            // survive a failed playbook whose execution domain was retired.
+            std::fs::remove_dir_all(&self.root_dir)?;
+            if retain_on_failure {
+                create_private_directory(&self.root_dir)?;
+                std::fs::write(
+                    self.root_dir.join("README.txt"),
+                    "Playbook failed; sandbox execution retirement verified. See failure_captures in the playbook report. Runtime images, credentials, databases and raw logs are not retained. Set BMUX_TEST_KEEP_ARTIFACTS=1 for full retention.\n",
+                )?;
+            }
+        } else if !keep && !full_retention {
+            std::fs::remove_dir_all(&self.root_dir)?;
         }
         result
     }
 
     async fn stop_server(&mut self) -> Result<()> {
-        // Try graceful IPC stop first.
-        if let Ok(mut client) =
-            BmuxClient::connect_with_paths(self.paths(), "bmux-playbook-sandbox-stop").await
-        {
-            let _ = client.stop_server().await;
-        }
-
-        match &mut self.handle {
-            ServerHandle::Foreground { child, .. } => {
-                if wait_for_child_exit(child, Duration::from_secs(3)).await? {
-                    return Ok(());
-                }
-                // Force kill
-                child
-                    .kill()
-                    .context("failed requesting sandbox termination")?;
-                anyhow::ensure!(
-                    wait_for_child_exit(child, Duration::from_secs(1)).await?,
-                    "sandbox termination not acknowledged"
-                );
-                Ok(())
+        use bmux_sessions_plugin_api::{sessions_commands, sessions_state};
+        let paths = self.paths().clone();
+        let identity: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(paths.runtime_dir.join("server-meta.json"))?)?;
+        anyhow::ensure!(identity == self.identity, "sandbox server identity changed");
+        let mut client =
+            BmuxClient::connect_with_paths(&paths, "bmux-playbook-sandbox-stop").await?;
+        let cleanup = async {
+            for session in sessions_state::client::list_sessions(&mut client).await? {
+                let result = sessions_commands::client::kill_session(
+                    &mut client,
+                    sessions_state::SessionSelector {
+                        id: Some(session.id),
+                        name: None,
+                    },
+                    true,
+                )
+                .await?;
+                result.map_err(|error| anyhow::anyhow!("sandbox session retirement: {error:?}"))?;
             }
-            ServerHandle::Daemon { paths, .. } => {
-                if wait_until_server_stopped(paths, Duration::from_secs(3)).await? {
-                    return Ok(());
-                }
-                // Try to kill via PID file
-                if let Some(pid) = read_pid_file(paths)? {
-                    anyhow::ensure!(try_kill_pid(pid)?, "sandbox termination request failed");
-                }
-                anyhow::bail!("daemon process termination is unacknowledged; retaining diagnostics")
-            }
+            client.stop_server().await?;
+            Ok::<(), anyhow::Error>(())
+        };
+        tokio::time::timeout(Duration::from_secs(10), cleanup).await??;
+        if let ServerHandle::Foreground { child, .. } = &mut self.handle {
+            anyhow::ensure!(
+                wait_for_child_exit(child, Duration::from_secs(3)).await?,
+                "sandbox child exit unconfirmed"
+            );
         }
+        let fence = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(paths.runtime_dir.join("server-lifetime.lock"))?;
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if fence.try_lock().is_ok() {
+                break;
+            }
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "sandbox lifetime fence remains held"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let receipt: serde_json::Value = serde_json::from_slice(&std::fs::read(
+            paths.runtime_dir.join("shutdown-result.json"),
+        )?)?;
+        anyhow::ensure!(
+            receipt["pid"] == identity["pid"]
+                && receipt["started_at_epoch_ms"] == identity["started_at_epoch_ms"]
+                && receipt.get("error") == Some(&serde_json::Value::Null),
+            "matching successful sandbox shutdown receipt missing"
+        );
+        match std::fs::read_dir(paths.state_dir.join("pane-executions-v4")) {
+            Ok(mut entries) => {
+                anyhow::ensure!(entries.next().is_none(), "sandbox recovery records remain")
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        self.retirement_fence = Some(fence);
+        Ok(())
     }
 }
 
@@ -263,16 +323,10 @@ impl Drop for SandboxServer {
                 let _ = child.kill();
                 let _ = child.wait();
             }
-            ServerHandle::Daemon { paths, .. } => {
-                if let Ok(Some(pid)) = read_pid_file(paths) {
-                    let _ = try_kill_pid(pid);
-                }
-            }
+            // No process handle: PID-file identity alone never authorizes a signal.
+            ServerHandle::Daemon { .. } => {}
         }
-        if std::env::var_os("BMUX_PLAYBOOK_MANAGED_ROOT").is_none() {
-            let _ = self.host.clear_sandbox_lock(&self.root_dir);
-            let _ = std::fs::remove_dir_all(&self.root_dir);
-        }
+        warn!(root = %self.root_dir.display(), "sandbox retirement unconfirmed; preserving runtime and recovery artifacts");
     }
 }
 
@@ -824,17 +878,6 @@ async fn wait_for_server_ready(
     }
 }
 
-async fn wait_until_server_stopped(paths: &ConfigPaths, timeout: Duration) -> Result<bool> {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        match BmuxClient::connect_with_paths(paths, "bmux-playbook-sandbox-stop-check").await {
-            Ok(_) => tokio::time::sleep(Duration::from_millis(80)).await,
-            Err(_) => return Ok(true),
-        }
-    }
-    Ok(false)
-}
-
 async fn wait_for_child_exit(child: &mut std::process::Child, timeout: Duration) -> Result<bool> {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
@@ -844,49 +887,6 @@ async fn wait_for_child_exit(child: &mut std::process::Child, timeout: Duration)
         tokio::time::sleep(Duration::from_millis(80)).await;
     }
     Ok(child.try_wait()?.is_some())
-}
-
-fn read_pid_file(paths: &ConfigPaths) -> Result<Option<u32>> {
-    let pid_file = paths.server_pid_file();
-    match std::fs::read_to_string(&pid_file) {
-        Ok(content) => Ok(content.trim().parse::<u32>().ok()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e).with_context(|| format!("failed reading {}", pid_file.display())),
-    }
-}
-
-fn try_kill_pid(pid: u32) -> Result<bool> {
-    if pid == 0 {
-        return Ok(false);
-    }
-
-    #[cfg(unix)]
-    {
-        let status = std::process::Command::new("kill")
-            .arg("-TERM")
-            .arg(pid.to_string())
-            .status()
-            .context("failed to execute kill command")?;
-        Ok(status.success())
-    }
-
-    #[cfg(windows)]
-    {
-        let status = std::process::Command::new("taskkill")
-            .arg("/PID")
-            .arg(pid.to_string())
-            .arg("/T")
-            .arg("/F")
-            .status()
-            .context("failed to execute taskkill command")?;
-        Ok(status.success())
-    }
-
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = pid;
-        Ok(false)
-    }
 }
 
 fn read_log_excerpt(path: &Path) -> String {

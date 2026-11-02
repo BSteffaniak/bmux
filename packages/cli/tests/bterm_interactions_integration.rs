@@ -266,5 +266,5 @@ async fn checked_capture_input_and_cross_client_denials_survive_streaming_upgrad
         .is_err()
     );
     drop((owner, stranger));
-    server.stop();
+    server.finish();
 }

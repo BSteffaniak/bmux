@@ -542,7 +542,7 @@ while True: time.sleep(1)
         )
         .await;
     }
-    server.stop();
+    server.finish();
 }
 
 async fn manual_launch_after_restore(

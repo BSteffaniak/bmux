@@ -180,5 +180,5 @@ async fn fresh_companion_exposes_authoritative_readiness() {
     assert_eq!(cached.instance, readiness.instance);
     assert_eq!(cached.executable_sha256, readiness.executable_sha256);
     assert!(!cached.fenced);
-    server.stop();
+    server.finish();
 }

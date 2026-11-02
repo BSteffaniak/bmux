@@ -650,6 +650,14 @@ fn playbook_failing_assert() {
         root.contains("bpb-"),
         "sandbox_root should be a bpb temp dir: {root}"
     );
+    let root = std::path::Path::new(root);
+    assert!(
+        root.join("README.txt").is_file(),
+        "failed playbook must retain bounded report, not a runtime: {}",
+        root.display()
+    );
+    assert_eq!(std::fs::read_dir(root).unwrap().count(), 1);
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 // ---------------------------------------------------------------------------
