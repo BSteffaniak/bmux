@@ -11,7 +11,7 @@
 
 use bmux_keyboard::KeyCode;
 use bmux_tui::event::{Event, MouseButton, MouseEventKind};
-use bmux_tui::geometry::Rect;
+use bmux_tui::geometry::{PopupAlign, Rect, Size};
 use bmux_tui::hit::{HitRegion, HitRole};
 use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::prelude::{Line, Span, Style};
@@ -234,17 +234,11 @@ impl<'a> SplitButton<'a> {
     #[must_use]
     pub fn menu_area(&self, area: Rect, bounds: Rect) -> Rect {
         let (width, height) = self.menu().size();
-        let width = width.saturating_add(2).min(bounds.width);
-        let height = height.saturating_add(2).min(bounds.height);
-        let right = area.right().min(bounds.right());
-        let x = right.saturating_sub(width).max(bounds.x);
-        let below = area.bottom();
-        let y = if below.saturating_add(height) <= bounds.bottom() {
-            below
-        } else {
-            area.y.saturating_sub(height).max(bounds.y)
-        };
-        Rect::new(x, y, width, height)
+        area.popup(
+            Size::new(width.saturating_add(2), height.saturating_add(2)),
+            bounds,
+            PopupAlign::End,
+        )
     }
 
     fn menu_list_area(&self, area: Rect, bounds: Rect) -> Rect {

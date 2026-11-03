@@ -166,6 +166,48 @@ impl Rect {
         let bottom = min_u16(self.bottom(), other.bottom());
         Self::new(x, y, right.saturating_sub(x), bottom.saturating_sub(y))
     }
+
+    /// Place a `size` popup next to this anchor (a control, or a text
+    /// cursor cell) within `bounds`: below the anchor, or above it when
+    /// there is no room below; its left edge on the anchor's
+    /// ([`PopupAlign::Start`]) or its right edge on the anchor's
+    /// ([`PopupAlign::End`]); shifted and shrunk to stay inside `bounds`.
+    #[must_use]
+    pub const fn popup(self, size: Size, bounds: Self, align: PopupAlign) -> Self {
+        let width = min_u16(size.width, bounds.width);
+        let height = min_u16(size.height, bounds.height);
+        let x = match align {
+            PopupAlign::Start => self.x,
+            PopupAlign::End => min_u16(self.right(), bounds.right()).saturating_sub(width),
+        };
+        let x = max_u16(min_u16(x, bounds.right().saturating_sub(width)), bounds.x);
+        let below = self.bottom();
+        let y = if below.saturating_add(height) <= bounds.bottom() {
+            below
+        } else if self.y >= bounds.y.saturating_add(height) {
+            self.y - height
+        } else {
+            // No room either side: the side with more space, clamped.
+            let room_below = bounds.bottom().saturating_sub(below);
+            let room_above = self.y.saturating_sub(bounds.y);
+            if room_below >= room_above {
+                below
+            } else {
+                bounds.y
+            }
+        };
+        let height = min_u16(height, bounds.bottom().saturating_sub(y));
+        Self::new(x, y, width, height)
+    }
+}
+
+/// Horizontal alignment of a popup to its anchor ([`Rect::popup`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PopupAlign {
+    /// Popup's left edge on the anchor's left edge.
+    Start,
+    /// Popup's right edge on the anchor's right edge.
+    End,
 }
 
 const fn min_u16(a: u16, b: u16) -> u16 {
@@ -178,7 +220,31 @@ const fn max_u16(a: u16, b: u16) -> u16 {
 
 #[cfg(test)]
 mod tests {
-    use super::{Insets, Point, Rect, Size};
+    use super::{Insets, Point, PopupAlign, Rect, Size};
+
+    #[test]
+    fn popups_open_below_or_above_and_stay_in_bounds() {
+        let bounds = Rect::new(0, 0, 40, 12);
+        let anchor = Rect::new(30, 2, 6, 1);
+        assert_eq!(
+            anchor.popup(Size::new(10, 4), bounds, PopupAlign::End),
+            Rect::new(26, 3, 10, 4)
+        );
+        assert_eq!(
+            anchor.popup(Size::new(20, 4), bounds, PopupAlign::Start),
+            Rect::new(20, 3, 20, 4),
+            "shifted left to fit"
+        );
+        let low = Rect::new(5, 10, 1, 1);
+        assert_eq!(
+            low.popup(Size::new(8, 4), bounds, PopupAlign::Start),
+            Rect::new(5, 6, 8, 4),
+            "above when there is no room below"
+        );
+        let tall = Rect::new(5, 6, 1, 1);
+        let placed = tall.popup(Size::new(8, 20), bounds, PopupAlign::Start);
+        assert!(placed.bottom() <= bounds.bottom() && placed.y >= bounds.y);
+    }
 
     #[test]
     fn rect_contains_uses_exclusive_edges() {

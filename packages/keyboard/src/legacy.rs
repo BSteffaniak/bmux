@@ -92,7 +92,8 @@ pub fn encode_with_modes(
         KeyCode::Escape => Some(vec![0x1b]),
         KeyCode::Space => {
             push_alt(&mut out);
-            out.push(b' ');
+            // Terminals send NUL for Ctrl+Space (also Ctrl+@).
+            out.push(if ctrl { 0x00 } else { b' ' });
             Some(out)
         }
         KeyCode::Up => Some(arrow_encoding(shift, application_cursor, b'A')),
@@ -143,6 +144,14 @@ pub fn decode_single(byte: u8) -> (KeyStroke, Vec<u8>) {
         b'\t' => KeyStroke::simple(KeyCode::Tab),
         0x7f => KeyStroke::simple(KeyCode::Backspace),
         b' ' => KeyStroke::simple(KeyCode::Space),
+        // Terminals send NUL for Ctrl+Space (also Ctrl+@).
+        0x00 => KeyStroke::with_modifiers(
+            KeyCode::Space,
+            Modifiers {
+                ctrl: true,
+                ..Modifiers::NONE
+            },
+        ),
         0x01..=0x1a => {
             let character = char::from((byte - 1) + b'a');
             KeyStroke::with_modifiers(
@@ -453,6 +462,19 @@ mod tests {
     fn encode_f5_returns_none() {
         let stroke = KeyStroke::simple(KeyCode::F(5));
         assert!(encode(&stroke).is_none());
+    }
+
+    #[test]
+    fn ctrl_space_round_trips_through_nul() {
+        let ctrl_space = KeyStroke::with_modifiers(
+            KeyCode::Space,
+            Modifiers {
+                ctrl: true,
+                ..Modifiers::NONE
+            },
+        );
+        assert_eq!(encode(&ctrl_space), Some(vec![0x00]));
+        assert_eq!(decode_single(0x00).0, ctrl_space);
     }
 
     #[test]
