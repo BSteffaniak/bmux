@@ -296,8 +296,32 @@ impl Buffer {
         }
     }
 
-    /// Write styled text clipped to the supplied absolute area.
+    /// Set a cell, layering `style` over the cell's current style: attributes
+    /// `style` leaves unset (`None` colors) keep the existing cell's values,
+    /// so text drawn over a filled background keeps that background. An
+    /// explicit color (including [`Color::Default`](crate::style::Color))
+    /// still replaces it. [`Self::set_cell`] replaces the whole style.
+    pub fn overlay_cell(&mut self, point: Point, symbol: impl Into<String>, style: Style) {
+        let Some(existing) = self.get(point).map(|cell| cell.style) else {
+            return;
+        };
+        self.set_cell(point, symbol, existing.patch(style));
+    }
+
+    /// Write styled text clipped to the supplied absolute area, replacing the
+    /// style of every written cell (see [`Self::overlay_line`]).
     pub fn write_line(&mut self, area: Rect, line: &Line) {
+        self.write_line_cells(area, line, false);
+    }
+
+    /// Write styled text clipped to the supplied absolute area, layering each
+    /// span's style over the cells beneath (see [`Self::overlay_cell`]).
+    /// Cells outside the written text are untouched.
+    pub fn overlay_line(&mut self, area: Rect, line: &Line) {
+        self.write_line_cells(area, line, true);
+    }
+
+    fn write_line_cells(&mut self, area: Rect, line: &Line, overlay: bool) {
         let clip = self.area.intersection(area);
         if clip.is_empty() {
             return;
@@ -319,12 +343,20 @@ impl Buffer {
                     } else {
                         grapheme
                     };
-                    self.set_cell(Point::new(x, area.y), symbol, span.style);
+                    self.put_cell(Point::new(x, area.y), symbol, span.style, overlay);
                 } else if x < clip.x && x.saturating_add(width) > clip.x {
-                    self.set_cell(Point::new(clip.x, area.y), " ", span.style);
+                    self.put_cell(Point::new(clip.x, area.y), " ", span.style, overlay);
                 }
                 x = x.saturating_add(width);
             }
+        }
+    }
+
+    fn put_cell(&mut self, point: Point, symbol: &str, style: Style, overlay: bool) {
+        if overlay {
+            self.overlay_cell(point, symbol, style);
+        } else {
+            self.set_cell(point, symbol, style);
         }
     }
 

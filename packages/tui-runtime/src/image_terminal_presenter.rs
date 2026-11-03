@@ -1115,8 +1115,15 @@ mod async_tests {
         let bytes = Arc::new(std::sync::Mutex::new(Vec::new()));
         let (observed, _) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App { value: 0, observed };
+        // Pointer output is not under test; keep it independent of the host
+        // terminal (detection would otherwise enable OSC 22 in kitty, ghostty,
+        // or bmux panes and the injected failure would strand the stack).
+        let mut terminal = Terminal::new(Vec::new(), Rect::new(0, 0, 2, 1));
+        terminal.set_pointer_capability(
+            bmux_terminal_protocol::pointer_output::PointerShapeCapability::Unsupported,
+        );
         let inner = ImageTerminalPresenter::new(
-            Terminal::new(Vec::new(), Rect::new(0, 0, 2, 1)),
+            terminal,
             paint,
             HostImageCapabilities::default(),
             ImageConfig::default(),

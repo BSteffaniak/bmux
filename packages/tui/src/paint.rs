@@ -1,4 +1,16 @@
 //! Scoped local-coordinate painting for composable components.
+//!
+//! # Painting model
+//!
+//! * [`PaintCx::fill`] sets the style of every cell in an area. It is how a
+//!   background is painted, and how one is cleared (fill with an explicit
+//!   [`Color::Default`](crate::style::Color) background).
+//! * [`PaintCx::write_line`] and [`PaintCx::set_cell`] draw *over* what is
+//!   already there: colors a style leaves unset (`None`) keep the cell's
+//!   existing values, so foreground-only text keeps the background beneath
+//!   it, and cells past the end of the text are untouched.
+//! * [`PaintCx::write_line_with_fallback_style`] fills its area first, then
+//!   writes; [`PaintCx::replace_cell`] replaces one cell's whole style.
 
 use crate::focus::FocusScopeId;
 use crate::frame::{Cursor, Frame};
@@ -229,8 +241,26 @@ impl<'frame, 'buffer> PaintCx<'frame, 'buffer> {
         paint(&mut child);
     }
 
-    /// Paint one symbol at a local coordinate after translation and clipping.
+    /// Paint one symbol at a local coordinate after translation and clipping,
+    /// layering `style` over the cell beneath: colors `style` leaves unset
+    /// keep the existing cell's (so a foreground-only border keeps the
+    /// background under it). Use an explicit color, such as
+    /// [`Color::Default`](crate::style::Color), to change the background, or
+    /// [`Self::replace_cell`] to replace the whole style.
     pub fn set_cell(&mut self, x: i32, y: i64, symbol: &str, style: Style) {
+        let Some(area) = self.project_rect(LocalRect::new(x, y, 1, 1)) else {
+            return;
+        };
+        self.frame.buffer_mut().overlay_cell(
+            Point::new(area.x, area.y),
+            symbol,
+            self.inherited_style.patch(style),
+        );
+    }
+
+    /// Paint one symbol at a local coordinate, replacing the cell's whole
+    /// style (unset colors become the terminal default).
+    pub fn replace_cell(&mut self, x: i32, y: i64, symbol: &str, style: Style) {
         let Some(area) = self.project_rect(LocalRect::new(x, y, 1, 1)) else {
             return;
         };
@@ -241,7 +271,8 @@ impl<'frame, 'buffer> PaintCx<'frame, 'buffer> {
         );
     }
 
-    /// Fill a local rectangle after translation and clipping.
+    /// Fill a local rectangle after translation and clipping, replacing each
+    /// cell's style. Filling is how a background is set or cleared.
     pub fn fill(&mut self, area: LocalRect, symbol: &str, style: Style) {
         let Some(area) = self.project_rect(area) else {
             return;
@@ -250,12 +281,30 @@ impl<'frame, 'buffer> PaintCx<'frame, 'buffer> {
             .fill(area, symbol, self.inherited_style.patch(style));
     }
 
-    /// Write a styled line after translation and clipping.
+    /// Write a styled line after translation and clipping, layering each
+    /// span over the cells beneath: colors a span leaves unset keep the
+    /// existing background/foreground, and cells past the end of the text are
+    /// untouched. To clear or set the row's background first, use
+    /// [`Self::write_line_with_fallback_style`] (which fills `area`) or
+    /// [`Self::fill`].
     pub fn write_line(&mut self, area: LocalRect, line: &Line) {
-        self.write_line_with_fallback_style(area, line, Style::new());
+        let Some(projected) = self.project_rect(area) else {
+            return;
+        };
+        let left_clip = usize::try_from(
+            i64::from(projected.x)
+                .saturating_sub(projected_unclipped_x(self.origin_x, area.x))
+                .max(0),
+        )
+        .unwrap_or(usize::MAX);
+        let line = line
+            .viewport(left_clip, usize::from(projected.width))
+            .with_fallback_style(self.inherited_style);
+        self.frame.buffer_mut().overlay_line(projected, &line);
     }
 
-    /// Fill a local row and write a line whose spans inherit the supplied style.
+    /// Fill `area` with the supplied style (replacing what was there), then
+    /// write a line whose spans inherit it.
     pub fn write_line_with_fallback_style(&mut self, area: LocalRect, line: &Line, style: Style) {
         let Some(projected) = self.project_rect(area) else {
             return;
@@ -573,6 +622,76 @@ mod tests {
     use crate::semantic::SemanticRegion;
     use crate::style::{Color, Style};
     use crate::text::Line;
+
+    fn filled(width: u16) -> Buffer {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, width, 1));
+        buffer.fill(
+            Rect::new(0, 0, width, 1),
+            " ",
+            Style::new().fg(Color::White).bg(Color::Blue),
+        );
+        buffer
+    }
+
+    fn style_at(buffer: &Buffer, x: u16) -> Style {
+        buffer.get(Point::new(x, 0)).unwrap().style
+    }
+
+    #[test]
+    fn text_keeps_the_background_beneath_it() {
+        let mut buffer = filled(6);
+        let mut frame = Frame::new(&mut buffer);
+        let mut paint = PaintCx::new(&mut frame);
+        paint.write_line(
+            LocalRect::new(0, 0, 6, 1),
+            &Line::from_spans(vec![crate::text::Span::styled(
+                "ab",
+                Style::new().fg(Color::Red),
+            )]),
+        );
+        paint.set_cell(4, 0, "│", Style::new().fg(Color::Green));
+        assert_eq!(
+            style_at(&buffer, 0),
+            Style::new().fg(Color::Red).bg(Color::Blue)
+        );
+        assert_eq!(
+            style_at(&buffer, 2),
+            Style::new().fg(Color::White).bg(Color::Blue),
+            "cells past the text are untouched"
+        );
+        assert_eq!(
+            style_at(&buffer, 4),
+            Style::new().fg(Color::Green).bg(Color::Blue)
+        );
+        assert_eq!(buffer.get(Point::new(1, 0)).unwrap().symbol, "b");
+    }
+
+    #[test]
+    fn backgrounds_can_still_be_changed_or_cleared() {
+        let mut buffer = filled(6);
+        let mut frame = Frame::new(&mut buffer);
+        let mut paint = PaintCx::new(&mut frame);
+        // An explicit color (including Default) replaces the background.
+        paint.write_line(
+            LocalRect::new(0, 0, 2, 1),
+            &Line::from_spans(vec![crate::text::Span::styled(
+                "ab",
+                Style::new().bg(Color::Default),
+            )]),
+        );
+        // replace_cell replaces the whole style.
+        paint.replace_cell(2, 0, "x", Style::new().fg(Color::Red));
+        // write_line_with_fallback_style fills its area first.
+        paint.write_line_with_fallback_style(
+            LocalRect::new(3, 0, 3, 1),
+            &Line::raw("z"),
+            Style::new(),
+        );
+        assert_eq!(style_at(&buffer, 0).bg, Some(Color::Default));
+        assert_eq!(style_at(&buffer, 2), Style::new().fg(Color::Red));
+        assert_eq!(style_at(&buffer, 3), Style::new());
+        assert_eq!(style_at(&buffer, 5), Style::new());
+    }
 
     #[test]
     fn selection_overlay_clips_terminal_coordinates_without_mutating_snapshot() {
