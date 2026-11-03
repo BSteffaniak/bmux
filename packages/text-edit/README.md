@@ -80,6 +80,28 @@ to these storage primitives. See `bmux_tui_components` text-input history
 bindings
 for remapping and independently disabling undo/redo.
 
+## Undo grouping
+
+Consecutive edits combine into undo steps according to an `UndoPolicy`
+(`set_undo_policy`, default `UndoPolicy::DEFAULT`):
+
+- `UndoGrouping::Smart` (default): bursts of typing, of backspacing, or of
+  forward deletion each undo as one step. A step ends at a pause longer than
+  `pause` (500 ms), a switch between typing and deleting, a cursor jump, or a
+  newline (which belongs to the step it ends). Pastes, clears, selection and
+  word deletions, and `replace_byte_range` transactions are always their own
+  steps. Typing over a selection starts a step that following typing joins. A
+  run lasting longer than `max_run` (3 s) splits at the next word.
+- `UndoGrouping::Word`: like `Smart`, and each new word starts a step.
+- `UndoGrouping::Keystroke` (`UndoPolicy::KEYSTROKE`): every edit is its own
+  step.
+
+`break_undo_group()` ends the open step (for example when a command runs).
+Edits are timed with the system clock; `set_input_time(now)` supplies the time
+of the next edit instead, for replayed input and deterministic tests. Merging
+only extends the newest step while nothing is redoable, so redo and the
+history bounds behave as described above.
+
 ## Named actions and rebindable keys
 
 `TextEditAction` names every bindable editing operation (moves, shift-extended

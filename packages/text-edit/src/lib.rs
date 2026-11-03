@@ -11,8 +11,10 @@ pub use action::TextEditAction;
 pub mod keyboard;
 
 pub(crate) mod history;
+use history::EditKind;
 pub use history::{
-    MAX_HISTORY_BYTES, MAX_HISTORY_ENTRIES, TextEditState, TextEditTransactionError,
+    MAX_HISTORY_BYTES, MAX_HISTORY_ENTRIES, TextEditState, TextEditTransactionError, UndoGrouping,
+    UndoPolicy,
 };
 
 pub mod pointer;
@@ -357,7 +359,7 @@ impl TextEditBuffer {
 
     /// Clear all text and reset the cursor.
     pub fn clear(&mut self) {
-        self.record_edit(Self::clear_unrecorded);
+        self.record_edit(EditKind::Other, Self::clear_unrecorded);
     }
 
     fn clear_unrecorded(&mut self) {
@@ -369,7 +371,7 @@ impl TextEditBuffer {
 
     /// Insert one character at the cursor.
     pub fn insert_char(&mut self, ch: char) {
-        self.record_edit(|editor| editor.insert_char_unrecorded(ch));
+        self.record_edit(EditKind::Insert, |editor| editor.insert_char_unrecorded(ch));
     }
 
     fn insert_char_unrecorded(&mut self, ch: char) {
@@ -381,7 +383,9 @@ impl TextEditBuffer {
 
     /// Insert a string at the cursor.
     pub fn insert_str(&mut self, value: &str) {
-        self.record_edit(|editor| editor.insert_str_unrecorded(value));
+        self.record_edit(EditKind::Insert, |editor| {
+            editor.insert_str_unrecorded(value);
+        });
     }
 
     fn insert_str_unrecorded(&mut self, value: &str) {
@@ -401,7 +405,7 @@ impl TextEditBuffer {
     /// Carriage-return line endings are canonicalized to line-feed hard line
     /// breaks because this editor stores hard line breaks as `\n` internally.
     pub fn paste(&mut self, value: &str) {
-        self.record_edit(|editor| editor.paste_unrecorded(value));
+        self.record_edit(EditKind::Other, |editor| editor.paste_unrecorded(value));
     }
 
     fn paste_unrecorded(&mut self, value: &str) {
@@ -425,7 +429,7 @@ impl TextEditBuffer {
 
     /// Delete the grapheme before the cursor.
     pub fn delete_backward(&mut self) {
-        self.record_edit(Self::delete_backward_unrecorded);
+        self.record_edit(EditKind::DeleteBackward, Self::delete_backward_unrecorded);
     }
 
     fn delete_backward_unrecorded(&mut self) {
@@ -440,7 +444,7 @@ impl TextEditBuffer {
 
     /// Delete the grapheme at the cursor.
     pub fn delete_forward(&mut self) {
-        self.record_edit(Self::delete_forward_unrecorded);
+        self.record_edit(EditKind::DeleteForward, Self::delete_forward_unrecorded);
     }
 
     fn delete_forward_unrecorded(&mut self) {
@@ -485,7 +489,7 @@ impl TextEditBuffer {
 
     /// Delete the active selection.
     pub fn delete_selection(&mut self) -> bool {
-        self.record_edit(Self::delete_selection_unrecorded)
+        self.record_edit(EditKind::Other, Self::delete_selection_unrecorded)
     }
 
     fn delete_selection_unrecorded(&mut self) -> bool {
@@ -510,7 +514,7 @@ impl TextEditBuffer {
 
     /// Delete text according to `delete`.
     pub fn delete(&mut self, delete: TextDelete) {
-        self.record_edit(|editor| editor.delete_unrecorded(delete));
+        self.record_edit(EditKind::Other, |editor| editor.delete_unrecorded(delete));
     }
 
     fn delete_unrecorded(&mut self, delete: TextDelete) {

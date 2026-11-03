@@ -3,6 +3,12 @@
 use std::collections::VecDeque;
 use std::fmt;
 use std::ops::Range;
+use std::time::Duration;
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::Instant;
+
+#[cfg(target_arch = "wasm32")]
+use web_time::Instant;
 
 use crate::TextEditBuffer;
 use unicode_segmentation::UnicodeSegmentation;
@@ -49,6 +55,78 @@ impl fmt::Display for TextEditTransactionError {
 }
 impl std::error::Error for TextEditTransactionError {}
 
+/// How consecutive edits combine into undo steps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum UndoGrouping {
+    /// Every edit is its own undo step.
+    Keystroke,
+    /// Consecutive typing groups into words: starting a new word starts a new
+    /// step. Otherwise follows [`Self::Smart`].
+    Word,
+    /// Consecutive edits of one kind (typing, deleting backward, deleting
+    /// forward) group into one step. A step ends at a pause longer than
+    /// [`UndoPolicy::pause`], a switch between typing and deleting, a cursor
+    /// jump, or a newline (which belongs to the step it ends). Pastes and
+    /// other edits are always their own steps, and a run lasting longer than
+    /// [`UndoPolicy::max_run`] splits at the next word.
+    Smart,
+}
+
+/// Undo grouping policy for a [`TextEditBuffer`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct UndoPolicy {
+    /// How edits combine.
+    pub grouping: UndoGrouping,
+    /// A longer pause between edits starts a new step.
+    pub pause: Duration,
+    /// Under [`UndoGrouping::Smart`], an uninterrupted run longer than this
+    /// splits at the next word, so long bursts stay undoable in pieces.
+    pub max_run: Duration,
+}
+
+impl UndoPolicy {
+    /// Smart grouping with a half-second pause and three-second runs.
+    pub const DEFAULT: Self = Self {
+        grouping: UndoGrouping::Smart,
+        pause: Duration::from_millis(500),
+        max_run: Duration::from_secs(3),
+    };
+
+    /// One undo step per edit.
+    pub const KEYSTROKE: Self = Self {
+        grouping: UndoGrouping::Keystroke,
+        ..Self::DEFAULT
+    };
+}
+
+impl Default for UndoPolicy {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+/// What an edit did, for undo grouping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditKind {
+    /// Typed text (characters or a newline).
+    Insert,
+    /// Deleted the grapheme before the cursor.
+    DeleteBackward,
+    /// Deleted the grapheme at the cursor.
+    DeleteForward,
+    /// Pastes, clears, selection deletes, word/line deletes, transactions:
+    /// always their own step.
+    Other,
+}
+
+/// The step currently accepting merges.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OpenGroup {
+    kind: EditKind,
+    started: Instant,
+    last: Instant,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RetainedState {
     state: TextEditState,
@@ -70,16 +148,70 @@ impl Transaction {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EditHistory {
     undo: VecDeque<Transaction>,
     redo: VecDeque<Transaction>,
+    policy: UndoPolicy,
+    open: Option<OpenGroup>,
+    input_time: Option<Instant>,
 }
+
+impl Default for EditHistory {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl EditHistory {
     pub const fn new() -> Self {
+        Self::with_policy(UndoPolicy::DEFAULT)
+    }
+
+    const fn with_policy(policy: UndoPolicy) -> Self {
         Self {
             undo: VecDeque::new(),
             redo: VecDeque::new(),
+            policy,
+            open: None,
+            input_time: None,
+        }
+    }
+
+    /// Whether an edit of `kind` at `now`, turning `before` into `after`,
+    /// continues the open step.
+    fn continues(
+        &self,
+        kind: EditKind,
+        before: &RetainedState,
+        after: &RetainedState,
+        now: Instant,
+    ) -> bool {
+        let policy = self.policy;
+        let Some(open) = self.open else {
+            return false;
+        };
+        if policy.grouping == UndoGrouping::Keystroke
+            || kind == EditKind::Other
+            || kind != open.kind
+            || !self.redo.is_empty()
+            || now.saturating_duration_since(open.last) > policy.pause
+            // The edit must continue exactly where the step ended: no cursor
+            // movement, selection change, or other edit in between.
+            || self.undo.back().is_none_or(|last| last.after.state != before.state)
+        {
+            return false;
+        }
+        if kind != EditKind::Insert {
+            return now.saturating_duration_since(open.started) <= policy.max_run;
+        }
+        let starts_word = starts_word(&before.state, &after.state);
+        match policy.grouping {
+            UndoGrouping::Word => !starts_word,
+            UndoGrouping::Smart => {
+                !starts_word || now.saturating_duration_since(open.started) <= policy.max_run
+            }
+            UndoGrouping::Keystroke => false,
         }
     }
 
@@ -124,8 +256,23 @@ impl TextEditBuffer {
         self.desired_visual_col = retained.desired_visual_col;
     }
 
-    pub(crate) fn record_edit<T>(&mut self, edit: impl FnOnce(&mut Self) -> T) -> T {
+    pub(crate) fn record_edit<T>(
+        &mut self,
+        kind: EditKind,
+        edit: impl FnOnce(&mut Self) -> T,
+    ) -> T {
+        let now = self.history.input_time.take().unwrap_or_else(Instant::now);
         let before = self.retained_state();
+        // Replacing a selection starts a step that following typing may join;
+        // deleting a selection is a step of its own.
+        let replaced = before
+            .state
+            .selection_anchor
+            .is_some_and(|anchor| anchor != before.state.cursor);
+        let kind = match kind {
+            EditKind::DeleteBackward | EditKind::DeleteForward if replaced => EditKind::Other,
+            kind => kind,
+        };
         let result = edit(self);
         if self.text == before.state.text {
             self.restore_state(&before);
@@ -134,13 +281,61 @@ impl TextEditBuffer {
             // oversized after snapshot. Never undo across an unrecorded edit.
             self.clear_history();
         } else {
-            // Prune both count and byte budgets before allocating the after-state.
-            self.history
-                .prepare(before.state.text.len() + self.text.len());
             let after = self.retained_state();
+            let merge = !replaced && self.history.continues(kind, &before, &after, now);
+            let before = if merge {
+                // Extend the open step: it keeps its original before-state.
+                self.history
+                    .undo
+                    .pop_back()
+                    .map_or(before, |step| step.before)
+            } else {
+                before
+            };
+            // Prune both count and byte budgets before retaining the step.
+            self.history
+                .prepare(before.state.text.len() + after.state.text.len());
+            let ends_line = kind == EditKind::Insert
+                && after.state.text.len() > before.state.text.len()
+                && inserted(&before.state, &after.state).contains('\n');
+            self.history.open = match (kind, self.history.open) {
+                (EditKind::Other, _) => None,
+                // A newline belongs to the step it ends.
+                _ if ends_line => None,
+                (_, Some(open)) if merge => Some(OpenGroup { last: now, ..open }),
+                _ => Some(OpenGroup {
+                    kind,
+                    started: now,
+                    last: now,
+                }),
+            };
             self.history.undo.push_back(Transaction { before, after });
         }
         result
+    }
+
+    /// Undo grouping policy.
+    #[must_use]
+    pub const fn undo_policy(&self) -> UndoPolicy {
+        self.history.policy
+    }
+
+    /// Set how consecutive edits combine into undo steps.
+    pub const fn set_undo_policy(&mut self, policy: UndoPolicy) {
+        self.history.policy = policy;
+        self.history.open = None;
+    }
+
+    /// End the current undo step: the next edit starts a new one (for example
+    /// when a command runs or the editor loses focus).
+    pub const fn break_undo_group(&mut self) {
+        self.history.open = None;
+    }
+
+    /// Use `now` as the time of the next edit instead of the clock (for
+    /// replaying input or deterministic tests). Applies to one edit.
+    pub const fn set_input_time(&mut self, now: Instant) {
+        self.history.input_time = Some(now);
     }
 
     /// Replace one UTF-8 byte range as one validated undoable transaction.
@@ -187,7 +382,7 @@ impl TextEditBuffer {
         if text == self.text {
             return Ok(false);
         }
-        self.record_edit(|editor| {
+        self.record_edit(EditKind::Other, |editor| {
             editor.text = text;
             editor.cursor = cursor;
             editor.selection_anchor = selection_anchor;
@@ -216,6 +411,7 @@ impl TextEditBuffer {
         };
         self.restore_state(&transaction.before);
         self.history.redo.push_back(transaction);
+        self.history.open = None;
         true
     }
 
@@ -226,6 +422,7 @@ impl TextEditBuffer {
         };
         self.restore_state(&transaction.after);
         self.history.undo.push_back(transaction);
+        self.history.open = None;
         true
     }
 
@@ -233,9 +430,28 @@ impl TextEditBuffer {
     /// Serialization never retains history; callers should not serialize undo text.
     /// Successful edits exceeding the history byte cap keep their content and clear
     /// both stacks, preventing undo across an unrecorded edit.
+    /// The undo grouping policy is kept.
     pub fn clear_history(&mut self) {
-        self.history = EditHistory::new();
+        self.history = EditHistory::with_policy(self.history.policy);
     }
+}
+
+/// Text inserted by an edit that only inserted at `before.cursor`.
+fn inserted<'a>(before: &TextEditState, after: &'a TextEditState) -> &'a str {
+    let added = after.text.len().saturating_sub(before.text.len());
+    after
+        .text
+        .get(before.cursor..before.cursor + added)
+        .unwrap_or_default()
+}
+
+/// Whether an insertion starts a new word: its first character is a word
+/// character typed after a non-word character (or at the start).
+fn starts_word(before: &TextEditState, after: &TextEditState) -> bool {
+    let is_word = |ch: char| ch.is_alphanumeric() || ch == '_';
+    let first = inserted(before, after).chars().next();
+    let previous = before.text[..before.cursor].chars().next_back();
+    first.is_some_and(is_word) && !previous.is_some_and(is_word)
 }
 
 #[cfg(test)]
@@ -318,6 +534,7 @@ mod tests {
     #[test]
     fn bounded_history_and_oversized_edits_break_chain_safely() {
         let mut editor = TextEditBuffer::new();
+        editor.set_undo_policy(UndoPolicy::KEYSTROKE);
         for _ in 0..MAX_HISTORY_ENTRIES + 10 {
             editor.insert_char('x');
         }
@@ -330,6 +547,119 @@ mod tests {
         assert!(!editor.can_undo());
         assert!(!editor.can_redo());
         editor.clear_history();
+    }
+
+    /// Type `text` one character at a time, `gap` apart, starting at `start`.
+    fn type_at(editor: &mut TextEditBuffer, text: &str, start: Instant, gap: Duration) -> Instant {
+        let mut now = start;
+        for ch in text.chars() {
+            editor.set_input_time(now);
+            editor.insert_char(ch);
+            now += gap;
+        }
+        now
+    }
+
+    fn undo_steps(editor: &mut TextEditBuffer) -> Vec<String> {
+        let mut steps = Vec::new();
+        while editor.undo() {
+            steps.push(editor.text().to_string());
+        }
+        steps
+    }
+
+    const FAST: Duration = Duration::from_millis(80);
+
+    #[test]
+    fn smart_grouping_merges_bursts_and_splits_at_pauses() {
+        let mut editor = TextEditBuffer::new();
+        assert_eq!(editor.undo_policy(), UndoPolicy::DEFAULT);
+        let start = Instant::now();
+        let now = type_at(&mut editor, "select 1", start, FAST);
+        type_at(&mut editor, " from t", now + Duration::from_secs(1), FAST);
+        assert_eq!(undo_steps(&mut editor), vec!["select 1", ""]);
+        // Redo replays whole steps.
+        assert!(editor.redo());
+        assert_eq!(editor.text(), "select 1");
+        assert!(editor.redo());
+        assert_eq!(editor.text(), "select 1 from t");
+    }
+
+    #[test]
+    fn smart_grouping_breaks_on_kind_changes_jumps_newlines_and_pastes() {
+        let mut editor = TextEditBuffer::new();
+        let mut now = type_at(&mut editor, "abc", Instant::now(), FAST);
+        // Switching to deleting starts a step; backspaces group.
+        for _ in 0..2 {
+            editor.set_input_time(now);
+            editor.delete_backward();
+            now += FAST;
+        }
+        // A newline ends its step.
+        now = type_at(&mut editor, "x\n", now, FAST);
+        now = type_at(&mut editor, "y", now, FAST);
+        // A cursor jump starts a step.
+        editor.move_cursor(TextMotion::Start);
+        now = type_at(&mut editor, "z", now, FAST);
+        editor.move_cursor(TextMotion::End);
+        editor.set_input_time(now);
+        editor.paste("PP");
+        assert_eq!(
+            undo_steps(&mut editor),
+            vec!["zax\ny", "ax\ny", "ax\n", "a", "abc", ""]
+        );
+    }
+
+    #[test]
+    fn long_smart_runs_split_at_words_and_word_mode_splits_every_word() {
+        let mut editor = TextEditBuffer::new();
+        // 30 characters 200ms apart: six seconds of uninterrupted typing.
+        type_at(
+            &mut editor,
+            "alpha beta gamma delta epsilon",
+            Instant::now(),
+            Duration::from_millis(200),
+        );
+        let steps = undo_steps(&mut editor);
+        assert!(steps.len() > 1 && steps.len() < 5, "{steps:?}");
+        assert!(
+            steps
+                .iter()
+                .all(|text| text.is_empty() || text.ends_with(' ')),
+            "runs split where a word starts: {steps:?}"
+        );
+
+        let mut editor = TextEditBuffer::new();
+        editor.set_undo_policy(UndoPolicy {
+            grouping: UndoGrouping::Word,
+            ..UndoPolicy::DEFAULT
+        });
+        type_at(&mut editor, "select a, b", Instant::now(), FAST);
+        assert_eq!(undo_steps(&mut editor), vec!["select a, ", "select ", ""]);
+    }
+
+    #[test]
+    fn keystroke_grouping_and_explicit_breaks() {
+        let mut editor = TextEditBuffer::new();
+        editor.set_undo_policy(UndoPolicy::KEYSTROKE);
+        type_at(&mut editor, "abc", Instant::now(), FAST);
+        assert_eq!(undo_steps(&mut editor), vec!["ab", "a", ""]);
+
+        let mut editor = TextEditBuffer::new();
+        let now = type_at(&mut editor, "ab", Instant::now(), FAST);
+        editor.break_undo_group();
+        type_at(&mut editor, "cd", now, FAST);
+        assert_eq!(undo_steps(&mut editor), vec!["ab", ""]);
+
+        // Typing over a selection starts a step that following typing joins.
+        let mut editor = TextEditBuffer::from_text("old");
+        editor.select_all();
+        type_at(&mut editor, "new", Instant::now(), FAST);
+        assert_eq!(undo_steps(&mut editor), vec!["old"]);
+        // The policy survives clearing history.
+        editor.set_undo_policy(UndoPolicy::KEYSTROKE);
+        editor.clear_history();
+        assert_eq!(editor.undo_policy(), UndoPolicy::KEYSTROKE);
     }
 
     #[test]
