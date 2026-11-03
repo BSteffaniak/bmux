@@ -181,6 +181,12 @@ impl MenuState {
     }
 }
 
+impl Default for MenuState {
+    fn default() -> Self {
+        Self::new(None)
+    }
+}
+
 /// Outcome from selectable-menu input handling.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MenuOutcome {

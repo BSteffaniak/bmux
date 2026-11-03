@@ -86,6 +86,21 @@ depth; `opaque_dark()`
 and `opaque_light()` provide neutral gallery/reference palettes rather than
 product theme policy.
 
+## Split buttons
+
+`split_button::SplitButton` (feature `split-button`) pairs a primary action
+with a `▾` toggle that opens an anchored menu of alternatives, such as a
+"Copy as CSV" action with other formats in its menu. It is immediate-mode like
+`Button` and `Menu`. The caller owns `SplitButtonState`, routes events through
+`handle_event(area, bounds, …)`, paints the buttons with `paint`, and paints
+the
+popup last with `paint_menu`. The popup occludes what lies beneath it and opens
+below the control, or above when there is no room, right-aligned and kept within
+`bounds`. Outcomes are `Primary`, `Selected { index, id }`, `Opened`, `Closed`,
+or redraw states. A click outside or Escape closes the menu, and `alt+↓` opens
+it from a focused button. `split_button::choice(id, label, checked)` builds
+check-marked items for mutually exclusive choices.
+
 ## Bordered panels
 
 Use `pane::PaneComponent` with a `pane::Pane` configuration and a content child

@@ -279,20 +279,7 @@ impl Component for ButtonComponent<'_, '_> {
             return;
         }
         let state = self.state.get();
-        let line = Line::from_spans(vec![Span::styled(
-            if self.button.filled {
-                let (left, right) = self.button.padding.unwrap_or((2, 2));
-                format!(
-                    "{}{}{}",
-                    " ".repeat(usize::from(left)),
-                    self.button.label,
-                    " ".repeat(usize::from(right))
-                )
-            } else {
-                format!("[ {} ]", self.button.label)
-            },
-            self.button.style_for(state),
-        )]);
+        let line = self.button.line(state);
         cx.write_line(
             LocalRect::new(0, 0, layout.size.width.try_into().unwrap_or(u16::MAX), 1),
             &line,
@@ -393,6 +380,25 @@ impl<'a> Button<'a> {
         self.filled = true;
         self.padding = Some((left, right));
         self
+    }
+
+    /// The rendered button content for `state`, `width()` cells wide.
+    #[must_use]
+    pub fn line(&self, state: ButtonState) -> Line {
+        Line::from_spans(vec![Span::styled(
+            if self.filled {
+                let (left, right) = self.padding.unwrap_or((2, 2));
+                format!(
+                    "{}{}{}",
+                    " ".repeat(usize::from(left)),
+                    self.label,
+                    " ".repeat(usize::from(right))
+                )
+            } else {
+                format!("[ {} ]", self.label)
+            },
+            self.style_for(state),
+        )])
     }
 
     /// Return rendered button width.

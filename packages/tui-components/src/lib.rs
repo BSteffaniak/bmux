@@ -87,6 +87,8 @@ pub mod selection;
 pub mod source_viewer;
 #[cfg(feature = "sparkline")]
 pub mod sparkline;
+#[cfg(feature = "split-button")]
+pub mod split_button;
 #[cfg(feature = "status-bar")]
 pub mod status_bar;
 #[cfg(feature = "stepper")]
