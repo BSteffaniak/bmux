@@ -1,4 +1,7 @@
-use crate::{Codec, ConfigValue, Document, Error, ErrorKind, MergePolicy, Result, SourceId};
+use crate::{
+    Codec, ConfigValue, DecodeFailure, Document, Error, ErrorKind, MergePolicy, Result, SourceId,
+    TextLocation,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::Read;
@@ -494,6 +497,13 @@ impl Resolved {
     pub fn decode<T: serde::de::DeserializeOwned>(&self) -> Result<T> {
         self.document.decode()
     }
+    /// Decode with failure path and origin; see [`Document::decode_located`].
+    /// Match the failure source id against [`Source::id`] in `sources`.
+    pub fn decode_located<T: serde::de::DeserializeOwned>(
+        &self,
+    ) -> std::result::Result<T, Box<DecodeFailure>> {
+        self.document.decode_located()
+    }
 }
 impl Captured {
     /// Ordered capture source manifest, beginning with defaults.
@@ -509,8 +519,14 @@ impl Captured {
                 let value = match &captured.content {
                     CapturedContent::Inline(value) => value.clone(),
                     CapturedContent::Bytes(bytes) => {
-                        let text = std::str::from_utf8(bytes)
-                            .map_err(|_| Error::new(ErrorKind::Parse).at(captured.source))?;
+                        let text = std::str::from_utf8(bytes).map_err(|error| {
+                            let valid = &bytes[..error.valid_up_to()];
+                            // The prefix before the first invalid byte is valid UTF-8.
+                            let prefix = std::str::from_utf8(valid).unwrap_or_default();
+                            Error::new(ErrorKind::Parse)
+                                .at(captured.source)
+                                .located(TextLocation::from_offset(prefix, valid.len()))
+                        })?;
                         codec
                             .parse(text)
                             .map_err(|error| error.at(captured.source))?

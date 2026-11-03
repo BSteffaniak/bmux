@@ -1,4 +1,4 @@
-use crate::{Error, ErrorKind, Result};
+use crate::{DecodeFailure, Error, ErrorKind, Result, TextLocation};
 use serde::de::DeserializeOwned;
 use std::collections::BTreeMap;
 
@@ -217,6 +217,23 @@ impl Document {
             .try_into()
             .map_err(|_| Error::new(ErrorKind::Decode))
     }
+    /// Decode like [`Document::decode`], additionally reporting where it failed.
+    /// Successful results match `decode`. Failures carry the best-effort path of the
+    /// rejected node, its origin, and a structural serde category; see
+    /// [`DecodeFailure`] for the secret-safety contract.
+    pub fn decode_located<T: DeserializeOwned>(
+        &self,
+    ) -> std::result::Result<T, Box<DecodeFailure>> {
+        crate::located::decode(self)
+    }
+    /// Origin of the node at `path`, or of its nearest ancestor with recorded
+    /// provenance. The path need not exist in `value`; None means no prefix,
+    /// including the root, has a recorded origin.
+    pub fn origin(&self, path: &[PathSegment]) -> Option<SourceId> {
+        (0..=path.len())
+            .rev()
+            .find_map(|len| self.provenance.get(&path[..len]).copied())
+    }
 }
 fn record(
     value: &ConfigValue,
@@ -359,7 +376,12 @@ impl TomlCodec {
 impl Codec for TomlCodec {
     fn parse(&self, text: &str) -> Result<ConfigValue> {
         toml::from_str::<toml::Value>(text)
-            .map_err(|_| Error::new(ErrorKind::Parse))
+            .map_err(|error| Error {
+                location: error
+                    .span()
+                    .map(|span| TextLocation::from_offset(text, span.start)),
+                ..Error::new(ErrorKind::Parse)
+            })
             .and_then(checked_from_toml)
     }
 }
