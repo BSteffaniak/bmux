@@ -13,6 +13,8 @@ UI or a ratatui application own painting, focus, validation, and submission.
 - Word movement for readline-style bindings
 - Terminal column width and single-line viewport projection helpers
 - Soft wrapping and visual cursor projection helpers
+- Renderer-neutral pointer gestures (`pointer`): multi-click counting and
+  anchored character/word/line/all press-and-drag selection
 
 The crate does not depend on crossterm, ratatui, BMUX runtime state, plugins, or
 prompt request/response types.

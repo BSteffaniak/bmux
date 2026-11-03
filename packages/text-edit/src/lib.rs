@@ -12,6 +12,12 @@ pub use history::{
     MAX_HISTORY_BYTES, MAX_HISTORY_ENTRIES, TextEditState, TextEditTransactionError,
 };
 
+pub mod pointer;
+pub use pointer::{
+    ClickPolicy, ClickRecord, ClickTracker, PointerSelection, SelectionGranularity, line_range_at,
+    word_range_at,
+};
+
 use std::ops::Range;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;

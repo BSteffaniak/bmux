@@ -10,6 +10,11 @@ use web_time::Instant;
 
 use bmux_keyboard::{KeyCode, KeyStroke, Modifiers};
 use bmux_text_edit::keyboard::TextKeymap;
+pub use bmux_text_edit::pointer::SelectionGranularity;
+use bmux_text_edit::pointer::{
+    ClickPolicy, ClickRecord, ClickTracker, FIELD_CLICK_GRANULARITIES, PointerSelection,
+    granularity_for_click_count,
+};
 use bmux_text_edit::{SelectionMode, TextEditBuffer, TextMotion};
 use bmux_tui::component::{
     Component, ComponentRevision, Constraints, EventCx, LayoutCx, LayoutId, LayoutMetadata,
@@ -25,9 +30,6 @@ use bmux_tui::style::Style;
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::scroll_view::{ScrollView, ScrollViewComponent, ScrollViewState};
-
-const DEFAULT_MULTI_CLICK_WINDOW: Duration = Duration::from_millis(500);
-const DEFAULT_MULTI_CLICK_DISTANCE: u16 = 2;
 
 /// Stateful text input data used by [`TextInputControl`].
 #[derive(Debug, Clone)]
@@ -83,13 +85,17 @@ impl TextInputState {
             viewport_height: self.viewport_height,
             pointer_offset: self.pointer_offset,
             scroll: self.scroll,
-            active: self.mouse_selection.active,
-            last_click: self.mouse_selection.last_click.map(|click| ClickSnapshot {
-                x: click.x,
-                y: click.y,
-                age: click.at.elapsed().min(Duration::from_secs(1)),
-                count: click.count,
-            }),
+            gesture: self.mouse_selection.gesture.clone(),
+            last_click: self
+                .mouse_selection
+                .clicks
+                .last_click()
+                .map(|click| ClickSnapshot {
+                    x: click.x,
+                    y: click.y,
+                    age: click.at.elapsed().min(Duration::from_secs(1)),
+                    count: click.count,
+                }),
         };
         crate::common::state_snapshot(&snapshot)
     }
@@ -106,6 +112,12 @@ impl TextInputState {
             .get("text")
             .and_then(serde_json::Value::as_str)
             .ok_or("missing editor text")?;
+        let is_grapheme_boundary = |index: usize| {
+            index == text.len()
+                || text
+                    .grapheme_indices(true)
+                    .any(|(offset, _)| offset == index)
+        };
         for field in ["cursor", "selection_anchor"] {
             let position = buffer.get(field).ok_or("missing editor position")?;
             if field == "selection_anchor" && position.is_null() {
@@ -115,25 +127,30 @@ impl TextInputState {
                 .as_u64()
                 .and_then(|n| usize::try_from(n).ok())
                 .ok_or("invalid editor position")?;
-            if index != text.len()
-                && !text
-                    .grapheme_indices(true)
-                    .any(|(offset, _)| offset == index)
-            {
+            if !is_grapheme_boundary(index) {
                 return Err("editor position is not a grapheme boundary".into());
             }
         }
         let restored: TextInputSnapshot = crate::common::decode_state_snapshot(snapshot)?;
+        if let Some(anchor) = restored.gesture.anchor()
+            && (anchor.start > anchor.end
+                || !is_grapheme_boundary(anchor.start)
+                || !is_grapheme_boundary(anchor.end))
+        {
+            return Err("invalid editor gesture anchor".into());
+        }
         let last_click = restored
             .last_click
             .map(|click| {
-                if !(1..=3).contains(&click.count) || click.age > Duration::from_secs(1) {
+                if !(1..=ClickPolicy::MAX_COUNT).contains(&click.count)
+                    || click.age > Duration::from_secs(1)
+                {
                     return Err("invalid editor click state".to_owned());
                 }
                 let at = Instant::now()
                     .checked_sub(click.age)
                     .ok_or("invalid editor click time")?;
-                Ok(MouseClickState {
+                Ok(ClickRecord {
                     x: click.x,
                     y: click.y,
                     at,
@@ -154,8 +171,8 @@ impl TextInputState {
             pointer_offset: restored.pointer_offset,
             scroll: restored.scroll,
             mouse_selection: MouseSelectionState {
-                last_click,
-                active: restored.active,
+                clicks: ClickTracker::from_last_click(last_click),
+                gesture: restored.gesture,
             },
             wrapped: RefCell::new(None),
             exclusion_columns: 0,
@@ -353,7 +370,7 @@ impl TextInputState {
     /// Return whether a mouse selection drag is active.
     #[must_use]
     pub const fn mouse_selection_active(&self) -> bool {
-        !matches!(self.mouse_selection.active, SelectionGranularity::Disabled)
+        self.mouse_selection.gesture.is_active()
     }
 }
 
@@ -890,7 +907,7 @@ impl<'policy> TextInputControl<'policy> {
                 self.handle_mouse_drag(state, mouse)
             }
             MouseEventKind::Up(MouseButton::Left) if state.mouse_selection_active() => {
-                state.mouse_selection.active = SelectionGranularity::Disabled;
+                state.mouse_selection.gesture.end();
                 TextInputOutcome::Redraw
             }
             MouseEventKind::Down(
@@ -971,22 +988,28 @@ impl<'policy> TextInputControl<'policy> {
 
     fn handle_mouse_down(&self, state: &mut TextInputState, mouse: MouseEvent) -> TextInputOutcome {
         let Some((row, col)) = mouse_wrapped_position(state, mouse) else {
-            state.mouse_selection.active = SelectionGranularity::Disabled;
+            state.mouse_selection.gesture.end();
             return TextInputOutcome::Ignored;
         };
-        let count = state
-            .mouse_selection
-            .click_count(mouse.position.x, mouse.position.y);
-        let granularity = self.policy.mouse.granularity_for_click_count(count);
-        state.mouse_selection.active = if self.policy.mouse.drag_selection {
-            granularity
-        } else {
-            SelectionGranularity::Disabled
-        };
+        let policy = self.policy.mouse;
+        let count = state.mouse_selection.clicks.register(
+            mouse.position.x,
+            mouse.position.y,
+            Instant::now(),
+            &policy.click,
+        );
+        let granularity = granularity_for_click_count(policy.click_granularities, count);
+        let extend = matches!(policy.shift_click, ShiftClick::Extend) && mouse.modifiers.shift;
         let byte_index = state
             .wrapped_layout(state.logical_width)
             .byte_index_for_position(row, col);
-        apply_selection_granularity(&mut state.buffer, byte_index, granularity);
+        let selection = &mut state.mouse_selection;
+        selection
+            .gesture
+            .begin(&mut state.buffer, byte_index, granularity, extend);
+        if !policy.drag_selection {
+            selection.gesture.end();
+        }
         state.sync_scroll_to_cursor(self.policy);
         TextInputOutcome::Redraw
     }
@@ -1002,11 +1025,10 @@ impl<'policy> TextInputControl<'policy> {
         let byte_index = state
             .wrapped_layout(state.logical_width)
             .byte_index_for_position(position.row, position.col);
-        extend_selection_to_granularity(
-            &mut state.buffer,
-            byte_index,
-            state.mouse_selection.active,
-        );
+        state
+            .mouse_selection
+            .gesture
+            .drag(&mut state.buffer, byte_index);
         if !position.scrolled {
             state.sync_scroll_to_cursor(self.policy);
         }
@@ -1154,10 +1176,23 @@ pub struct MousePolicy {
     pub drag_selection: bool,
     /// Whether dragging beyond the visible top/bottom scrolls the input viewport.
     pub edge_scroll: DragEdgeScroll,
-    /// Double-click selection behavior.
-    pub double_click: Option<SelectionGranularity>,
-    /// Triple-click selection behavior.
-    pub triple_click: Option<SelectionGranularity>,
+    /// Selection granularity for the 1st, 2nd, 3rd, ... consecutive click.
+    /// Counts past the end reuse the last entry; empty selects by character.
+    pub click_granularities: &'static [SelectionGranularity],
+    /// Multi-click timing/distance detection.
+    pub click: ClickPolicy,
+    /// Shift-click behavior.
+    pub shift_click: ShiftClick,
+}
+
+/// Mouse-down behavior while shift is held.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ShiftClick {
+    /// Treat shift-click like a plain click, replacing the selection.
+    #[default]
+    Replace,
+    /// Keep the selection anchor and extend the selection to the click.
+    Extend,
 }
 
 /// Drag behavior when the mouse leaves the visible top or bottom edge.
@@ -1178,12 +1213,13 @@ impl MousePolicy {
             click_to_cursor: false,
             drag_selection: false,
             edge_scroll: DragEdgeScroll::Disabled,
-            double_click: None,
-            triple_click: None,
+            click_granularities: &[],
+            click: ClickPolicy::with_max_count(1),
+            shift_click: ShiftClick::Replace,
         }
     }
 
-    /// Text-selection mouse behavior.
+    /// Text-selection mouse behavior: 1 click = character, 2 = word, 3 = all.
     #[must_use]
     pub const fn text_selection() -> Self {
         Self {
@@ -1191,17 +1227,35 @@ impl MousePolicy {
             click_to_cursor: true,
             drag_selection: true,
             edge_scroll: DragEdgeScroll::Enabled,
-            double_click: Some(SelectionGranularity::Word),
-            triple_click: Some(SelectionGranularity::All),
+            click_granularities: FIELD_CLICK_GRANULARITIES,
+            click: ClickPolicy::with_max_count(3),
+            shift_click: ShiftClick::Replace,
         }
     }
 
-    const fn granularity_for_click_count(self, count: u8) -> SelectionGranularity {
-        match count {
-            3.. => option_granularity_or(self.triple_click, SelectionGranularity::Character),
-            2 => option_granularity_or(self.double_click, SelectionGranularity::Character),
-            _ => SelectionGranularity::Character,
-        }
+    /// Use `sequence` as the click-count to granularity mapping, counting up to
+    /// its length (for example
+    /// [`EDITOR_CLICK_GRANULARITIES`](bmux_text_edit::pointer::EDITOR_CLICK_GRANULARITIES)
+    /// for 1 = character, 2 = word, 3 = line, 4 = all).
+    #[must_use]
+    pub const fn click_granularities(mut self, sequence: &'static [SelectionGranularity]) -> Self {
+        self.click_granularities = sequence;
+        self.click.max_count = if sequence.len() > u8::MAX as usize {
+            u8::MAX
+        } else {
+            #[allow(clippy::cast_possible_truncation)] // Bounded by the branch above.
+            {
+                sequence.len() as u8
+            }
+        };
+        self
+    }
+
+    /// Set shift-click behavior.
+    #[must_use]
+    pub const fn shift_click(mut self, behavior: ShiftClick) -> Self {
+        self.shift_click = behavior;
+        self
     }
 }
 
@@ -1248,19 +1302,6 @@ impl EdgePolicy {
     }
 }
 
-/// Selection granularity for mouse actions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum SelectionGranularity {
-    /// Select by character/cell hit target.
-    Character,
-    /// Select whole words.
-    Word,
-    /// Select the entire buffer.
-    All,
-    /// Disable active selection extension.
-    Disabled,
-}
-
 /// Outcome from handling input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TextInputOutcome {
@@ -1278,61 +1319,10 @@ pub enum TextInputOutcome {
     EdgeDown,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct MouseSelectionState {
-    last_click: Option<MouseClickState>,
-    active: SelectionGranularity,
-}
-
-impl Default for MouseSelectionState {
-    fn default() -> Self {
-        Self {
-            last_click: None,
-            active: SelectionGranularity::Disabled,
-        }
-    }
-}
-
-impl MouseSelectionState {
-    fn click_count(&mut self, x: u16, y: u16) -> u8 {
-        let now = Instant::now();
-        let count = self.last_click.map_or(1, |last| {
-            let near = last.x.abs_diff(x) <= DEFAULT_MULTI_CLICK_DISTANCE
-                && last.y.abs_diff(y) <= DEFAULT_MULTI_CLICK_DISTANCE;
-            let quick = now.saturating_duration_since(last.at) <= DEFAULT_MULTI_CLICK_WINDOW;
-            if near && quick {
-                last.count.saturating_add(1)
-            } else {
-                1
-            }
-        });
-        let capped = count.min(3);
-        self.last_click = Some(MouseClickState {
-            x,
-            y,
-            at: now,
-            count: capped,
-        });
-        capped
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct MouseClickState {
-    x: u16,
-    y: u16,
-    at: Instant,
-    count: u8,
-}
-
-const fn option_granularity_or(
-    value: Option<SelectionGranularity>,
-    fallback: SelectionGranularity,
-) -> SelectionGranularity {
-    match value {
-        Some(value) => value,
-        None => fallback,
-    }
+    clicks: ClickTracker,
+    gesture: PointerSelection,
 }
 
 fn apply_enter_behavior(
@@ -1508,93 +1498,6 @@ fn editor_viewport(area: LogicalSize, rows: usize) -> LayoutNode {
             LogicalSize::new(area.width, rows.try_into().unwrap_or(u64::MAX)),
         ),
     )
-}
-
-fn apply_selection_granularity(
-    buffer: &mut TextEditBuffer,
-    byte_index: usize,
-    granularity: SelectionGranularity,
-) {
-    match granularity {
-        SelectionGranularity::Character | SelectionGranularity::Disabled => {
-            buffer.move_cursor(TextMotion::Absolute(byte_index));
-        }
-        SelectionGranularity::Word => select_word_at(buffer, byte_index),
-        SelectionGranularity::All => buffer.select_all(),
-    }
-}
-
-fn extend_selection_to_granularity(
-    buffer: &mut TextEditBuffer,
-    byte_index: usize,
-    granularity: SelectionGranularity,
-) {
-    match granularity {
-        SelectionGranularity::Character => {
-            buffer.move_cursor_with_selection(
-                TextMotion::Absolute(byte_index),
-                SelectionMode::Extend,
-            );
-        }
-        SelectionGranularity::Word => {
-            let target =
-                word_range_at(buffer.text(), byte_index).map_or(byte_index, |(_, end)| end);
-            buffer.move_cursor_with_selection(TextMotion::Absolute(target), SelectionMode::Extend);
-        }
-        SelectionGranularity::All => buffer.select_all(),
-        SelectionGranularity::Disabled => {}
-    }
-}
-
-fn select_word_at(buffer: &mut TextEditBuffer, byte_index: usize) {
-    if let Some((start, end)) = word_range_at(buffer.text(), byte_index) {
-        buffer.move_cursor(TextMotion::Absolute(start));
-        buffer.move_cursor_with_selection(TextMotion::Absolute(end), SelectionMode::Extend);
-    } else {
-        buffer.move_cursor(TextMotion::Absolute(byte_index));
-    }
-}
-
-fn word_range_at(text: &str, byte_index: usize) -> Option<(usize, usize)> {
-    if text.is_empty() {
-        return None;
-    }
-    let index = byte_index.min(text.len());
-    let ranges = text
-        .grapheme_indices(true)
-        .map(|(start, grapheme)| (start, start.saturating_add(grapheme.len()), grapheme))
-        .collect::<Vec<_>>();
-    if ranges.is_empty() {
-        return None;
-    }
-    let mut position = ranges
-        .iter()
-        .position(|(start, end, _)| index >= *start && index < *end)
-        .unwrap_or_else(|| ranges.len().saturating_sub(1));
-    if ranges[position].2.chars().all(char::is_whitespace) {
-        position = ranges
-            .iter()
-            .enumerate()
-            .skip(position)
-            .find(|(_, (_, _, grapheme))| !grapheme.chars().all(char::is_whitespace))
-            .map_or(position, |(index, _)| index);
-    }
-    if ranges[position].2.chars().all(char::is_whitespace) {
-        return None;
-    }
-    let mut start_position = position;
-    while start_position > 0 && is_word_grapheme(ranges[start_position - 1].2) {
-        start_position -= 1;
-    }
-    let mut end_position = position;
-    while end_position + 1 < ranges.len() && is_word_grapheme(ranges[end_position + 1].2) {
-        end_position += 1;
-    }
-    Some((ranges[start_position].0, ranges[end_position].1))
-}
-
-fn is_word_grapheme(grapheme: &str) -> bool {
-    grapheme.chars().any(|ch| ch.is_alphanumeric() || ch == '_')
 }
 
 fn usize_to_u16_saturating(value: usize) -> u16 {
@@ -2435,6 +2338,140 @@ mod tests {
     }
 
     #[test]
+    fn word_drag_keeps_anchor_word_in_both_directions() {
+        let policy = TextInputPolicy::chat_composer();
+        let control = TextInputControl::new(&policy);
+        let mut state = TextInputState::new(TextEditBuffer::from_text("alpha beta gamma"));
+        state.set_content_area(Rect::new(0, 0, 20, 1), &policy);
+
+        for _ in 0..2 {
+            let _ = control.handle_mouse(
+                &mut state,
+                mouse(MouseEventKind::Down(MouseButton::Left), 7, 0),
+            );
+        }
+        assert_eq!(state.buffer().selected_text(), Some("beta".to_string()));
+        let _ = control.handle_mouse(
+            &mut state,
+            mouse(MouseEventKind::Drag(MouseButton::Left), 13, 0),
+        );
+        assert_eq!(
+            state.buffer().selected_text(),
+            Some("beta gamma".to_string())
+        );
+        let _ = control.handle_mouse(
+            &mut state,
+            mouse(MouseEventKind::Drag(MouseButton::Left), 1, 0),
+        );
+        assert_eq!(
+            state.buffer().selected_text(),
+            Some("alpha beta".to_string())
+        );
+        assert_eq!(state.buffer().cursor_byte_index(), 0);
+        let _ = control.handle_mouse(
+            &mut state,
+            mouse(MouseEventKind::Up(MouseButton::Left), 1, 0),
+        );
+        assert!(!state.mouse_selection_active());
+    }
+
+    #[test]
+    fn editor_click_granularities_select_line_then_all() {
+        let mut policy = TextInputPolicy::chat_composer();
+        policy.mouse = MousePolicy::text_selection()
+            .click_granularities(bmux_text_edit::pointer::EDITOR_CLICK_GRANULARITIES);
+        assert_eq!(policy.mouse.click.max_count, 4);
+        let control = TextInputControl::new(&policy);
+        let mut state = TextInputState::new(TextEditBuffer::from_text(
+            "one two
+three",
+        ));
+        state.set_content_area(Rect::new(0, 0, 20, 2), &policy);
+
+        let click = |state: &mut TextInputState| {
+            let _ =
+                control.handle_mouse(state, mouse(MouseEventKind::Down(MouseButton::Left), 5, 0));
+        };
+        click(&mut state);
+        click(&mut state);
+        assert_eq!(state.buffer().selected_text(), Some("two".to_string()));
+        click(&mut state);
+        assert_eq!(
+            state.buffer().selected_text(),
+            Some("one two\n".to_string())
+        );
+        let _ = control.handle_mouse(
+            &mut state,
+            mouse(MouseEventKind::Drag(MouseButton::Left), 2, 1),
+        );
+        assert_eq!(
+            state.buffer().selected_text(),
+            Some("one two\nthree".to_string())
+        );
+        click(&mut state);
+        assert_eq!(
+            state.buffer().selected_text(),
+            Some("one two\nthree".to_string())
+        );
+        click(&mut state);
+        assert_eq!(
+            state.buffer().selected_text(),
+            Some("one two\nthree".to_string()),
+            "counts past the sequence stay at the last granularity"
+        );
+    }
+
+    #[test]
+    fn shift_click_extends_only_when_enabled() {
+        let shift_down = |x| MouseEvent {
+            modifiers: bmux_tui::event::MouseModifiers {
+                shift: true,
+                ..bmux_tui::event::MouseModifiers::default()
+            },
+            ..mouse(MouseEventKind::Down(MouseButton::Left), x, 0)
+        };
+        let default_policy = TextInputPolicy::chat_composer();
+        let mut extending = TextInputPolicy::chat_composer();
+        extending.mouse = MousePolicy::text_selection().shift_click(ShiftClick::Extend);
+
+        for (policy, expected) in [
+            (&default_policy, None),
+            (&extending, Some("llo w".to_string())),
+        ] {
+            let control = TextInputControl::new(policy);
+            let mut state = TextInputState::new(TextEditBuffer::from_text("hello world"));
+            state.set_content_area(Rect::new(0, 0, 20, 1), policy);
+            let _ = control.handle_mouse(
+                &mut state,
+                mouse(MouseEventKind::Down(MouseButton::Left), 2, 0),
+            );
+            let _ = control.handle_mouse(
+                &mut state,
+                mouse(MouseEventKind::Up(MouseButton::Left), 2, 0),
+            );
+            let _ = control.handle_mouse(&mut state, shift_down(7));
+            assert_eq!(state.buffer().selected_text(), expected);
+        }
+    }
+
+    #[test]
+    fn click_without_drag_selection_does_not_start_gesture() {
+        let mut policy = TextInputPolicy::chat_composer();
+        policy.mouse.drag_selection = false;
+        let control = TextInputControl::new(&policy);
+        let mut state = TextInputState::new(TextEditBuffer::from_text("hello world"));
+        state.set_content_area(Rect::new(0, 0, 20, 1), &policy);
+        for _ in 0..2 {
+            let _ = control.handle_mouse(
+                &mut state,
+                mouse(MouseEventKind::Down(MouseButton::Left), 1, 0),
+            );
+        }
+        assert_eq!(state.buffer().selected_text(), Some("hello".to_string()));
+        assert!(!state.mouse_selection_active());
+    }
+
+    #[test]
     fn drag_below_input_scrolls_and_extends_selection() {
         let policy = TextInputPolicy::chat_composer();
         let control = TextInputControl::new(&policy);
@@ -2492,7 +2529,7 @@ struct TextInputSnapshot<B = TextEditBuffer> {
     viewport_height: u64,
     pointer_offset: (usize, usize),
     scroll: ScrollViewState,
-    active: SelectionGranularity,
+    gesture: PointerSelection,
     last_click: Option<ClickSnapshot>,
 }
 
@@ -2509,7 +2546,9 @@ struct ClickSnapshot {
 mod snapshot_tests {
     use bmux_text_edit::{SelectionMode, TextEditBuffer, TextMotion};
 
-    use super::{Instant, MouseClickState, SelectionGranularity, TextInputState};
+    use super::{
+        ClickPolicy, ClickTracker, Instant, PointerSelection, SelectionGranularity, TextInputState,
+    };
 
     #[test]
     fn editor_snapshot_preserves_selection_scroll_and_pending_drag() {
@@ -2519,13 +2558,13 @@ mod snapshot_tests {
             .buffer
             .move_cursor_with_selection(TextMotion::Left, SelectionMode::Extend);
         state.scroll.set_vertical_offset(7);
-        state.mouse_selection.active = SelectionGranularity::Word;
-        state.mouse_selection.last_click = Some(MouseClickState {
-            x: 2,
-            y: 1,
-            at: Instant::now(),
-            count: 2,
-        });
+        state.mouse_selection.gesture = PointerSelection::resume(SelectionGranularity::Word, 6..11);
+        let policy = ClickPolicy::default();
+        let mut clicks = ClickTracker::new();
+        let now = Instant::now();
+        clicks.register(2, 1, now, &policy);
+        clicks.register(2, 1, now, &policy);
+        state.mouse_selection.clicks = clicks;
         let snapshot = state.snapshot();
         let mut rebuilt = TextInputState::default();
         rebuilt.restore_snapshot(&snapshot).unwrap();
@@ -2536,8 +2575,15 @@ mod snapshot_tests {
         );
         assert_eq!(rebuilt.buffer.selection(), state.buffer.selection());
         assert_eq!(rebuilt.scroll, state.scroll);
-        assert_eq!(rebuilt.mouse_selection.active, SelectionGranularity::Word);
-        assert_eq!(rebuilt.mouse_selection.last_click.unwrap().count, 2);
+        assert_eq!(
+            rebuilt.mouse_selection.gesture.granularity(),
+            Some(SelectionGranularity::Word)
+        );
+        assert_eq!(rebuilt.mouse_selection.gesture.anchor(), Some(6..11));
+        assert_eq!(
+            rebuilt.mouse_selection.clicks.last_click().unwrap().count,
+            2
+        );
         let before = rebuilt.clone();
         let mut malformed = snapshot;
         malformed["buffer"]["cursor"] = serde_json::json!(99);
@@ -2555,6 +2601,10 @@ mod snapshot_tests {
         let mut snapshot = state.snapshot();
         snapshot["last_click"] =
             serde_json::json!({"x": 0, "y": 0, "age": {"secs": 0, "nanos": 0}, "count": 255});
+        assert!(rebuilt.restore_snapshot(&snapshot).is_err());
+        let mut snapshot = state.snapshot();
+        snapshot["gesture"] =
+            serde_json::json!({"granularity": "Word", "anchor": {"start": 0, "end": 1}});
         assert!(rebuilt.restore_snapshot(&snapshot).is_err());
     }
 }
