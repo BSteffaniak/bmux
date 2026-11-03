@@ -9,13 +9,15 @@ use std::time::Instant;
 use web_time::Instant;
 
 use bmux_keyboard::{KeyCode, KeyStroke, Modifiers};
-use bmux_text_edit::keyboard::TextKeymap;
+use bmux_text_edit::keyboard::{
+    DEFAULT_REDO_STROKES, DEFAULT_UNDO_STROKES, TextBindings, TextKeymap, typed_char_for_key,
+};
 pub use bmux_text_edit::pointer::SelectionGranularity;
 use bmux_text_edit::pointer::{
     ClickPolicy, ClickRecord, ClickTracker, FIELD_CLICK_GRANULARITIES, PointerSelection,
     granularity_for_click_count,
 };
-use bmux_text_edit::{SelectionMode, TextEditBuffer, TextMotion};
+use bmux_text_edit::{SelectionMode, TextEditAction, TextEditBuffer, TextMotion};
 use bmux_tui::component::{
     Component, ComponentRevision, Constraints, EventCx, LayoutCx, LayoutId, LayoutMetadata,
     LayoutNode, LogicalSize,
@@ -384,6 +386,7 @@ pub struct TextInputComponent<'policy, 'state> {
     state: &'state RefCell<TextInputState>,
     policy: &'policy TextInputPolicy,
     history_bindings: TextInputHistoryBindings<'policy>,
+    text_bindings: Option<&'policy TextBindings>,
     style: Style,
     selection_style: Style,
     placeholder: Option<&'policy str>,
@@ -422,6 +425,7 @@ impl<'policy, 'state> TextInputComponent<'policy, 'state> {
             state,
             policy,
             history_bindings: TextInputHistoryBindings::standard(),
+            text_bindings: None,
             style: Style::new(),
             selection_style: Style::new().add_modifier(bmux_tui::style::Modifier::REVERSED),
             placeholder: None,
@@ -439,6 +443,15 @@ impl<'policy, 'state> TextInputComponent<'policy, 'state> {
         bindings: TextInputHistoryBindings<'policy>,
     ) -> Self {
         self.history_bindings = bindings;
+        self
+    }
+
+    /// Route editing keys through a rebindable action table.
+    ///
+    /// See [`TextInputControl::with_text_bindings`].
+    #[must_use]
+    pub const fn with_text_bindings(mut self, bindings: &'policy TextBindings) -> Self {
+        self.text_bindings = Some(bindings);
         self
     }
 
@@ -651,10 +664,12 @@ impl Component for TextInputComponent<'_, '_> {
             ),
             self.policy,
         );
-        match TextInputControl::new(self.policy)
-            .with_history_bindings(self.history_bindings)
-            .handle_event(&mut state, event)
-        {
+        let mut control =
+            TextInputControl::new(self.policy).with_history_bindings(self.history_bindings);
+        if let Some(bindings) = self.text_bindings {
+            control = control.with_text_bindings(bindings);
+        }
+        match control.handle_event(&mut state, event) {
             TextInputOutcome::Ignored => EventOutcome::Ignored,
             TextInputOutcome::Edited
             | TextInputOutcome::Redraw
@@ -673,48 +688,6 @@ pub enum TextInputHistoryAction {
     /// Restore the most recently undone edit state.
     Redo,
 }
-
-const DEFAULT_UNDO_KEYS: &[KeyStroke] = &[
-    KeyStroke::with_modifiers(
-        KeyCode::Char('z'),
-        Modifiers {
-            ctrl: true,
-            ..Modifiers::NONE
-        },
-    ),
-    KeyStroke::with_modifiers(
-        KeyCode::Char('z'),
-        Modifiers {
-            super_key: true,
-            ..Modifiers::NONE
-        },
-    ),
-];
-const DEFAULT_REDO_KEYS: &[KeyStroke] = &[
-    KeyStroke::with_modifiers(
-        KeyCode::Char('z'),
-        Modifiers {
-            ctrl: true,
-            shift: true,
-            ..Modifiers::NONE
-        },
-    ),
-    KeyStroke::with_modifiers(
-        KeyCode::Char('z'),
-        Modifiers {
-            super_key: true,
-            shift: true,
-            ..Modifiers::NONE
-        },
-    ),
-    KeyStroke::with_modifiers(
-        KeyCode::Char('y'),
-        Modifiers {
-            ctrl: true,
-            ..Modifiers::NONE
-        },
-    ),
-];
 
 /// Authoritative history bindings supplied by the application's generic keymap.
 ///
@@ -739,8 +712,8 @@ impl TextInputHistoryBindings<'_> {
     #[must_use]
     pub const fn standard() -> Self {
         Self {
-            undo: DEFAULT_UNDO_KEYS,
-            redo: DEFAULT_REDO_KEYS,
+            undo: DEFAULT_UNDO_STROKES,
+            redo: DEFAULT_REDO_STROKES,
         }
     }
 
@@ -769,6 +742,7 @@ impl TextInputHistoryBindings<'_> {
 pub struct TextInputControl<'policy> {
     policy: &'policy TextInputPolicy,
     history_bindings: TextInputHistoryBindings<'policy>,
+    text_bindings: Option<&'policy TextBindings>,
 }
 
 impl<'policy> TextInputControl<'policy> {
@@ -778,6 +752,7 @@ impl<'policy> TextInputControl<'policy> {
         Self {
             policy,
             history_bindings: TextInputHistoryBindings::standard(),
+            text_bindings: None,
         }
     }
 
@@ -788,6 +763,23 @@ impl<'policy> TextInputControl<'policy> {
         bindings: TextInputHistoryBindings<'policy>,
     ) -> Self {
         self.history_bindings = bindings;
+        self
+    }
+
+    /// Route editing keys through a rebindable action table.
+    ///
+    /// The table becomes authoritative for every non-insert editing key,
+    /// including undo/redo: [`handle_key`](Self::handle_key) resolves
+    /// [`TextEditAction::Undo`]/[`TextEditAction::Redo`] from it instead of the
+    /// history bindings. Typed printable characters are still inserted when a
+    /// stroke is unbound, Enter keeps its [`KeyboardPolicy`] behavior, vertical
+    /// moves keep edge signals and soft-wrap-aware movement, and
+    /// [`KeyboardPolicy::selection_keys`] still gates the selection actions.
+    /// [`TextBindings::defaults`] for the policy keymap reproduces the
+    /// behavior without a table.
+    #[must_use]
+    pub const fn with_text_bindings(mut self, bindings: &'policy TextBindings) -> Self {
+        self.text_bindings = Some(bindings);
         self
     }
 
@@ -827,17 +819,22 @@ impl<'policy> TextInputControl<'policy> {
 
     /// Handle one keyboard stroke.
     pub fn handle_key(&self, state: &mut TextInputState, stroke: KeyStroke) -> TextInputOutcome {
-        self.handle_key_with_history_action(
-            state,
-            stroke,
-            self.history_bindings.action_for_key(stroke),
-        )
+        let history_action = self.text_bindings.map_or_else(
+            || self.history_bindings.action_for_key(stroke),
+            |bindings| match bindings.resolve(stroke) {
+                Some(TextEditAction::Undo) => Some(TextInputHistoryAction::Undo),
+                Some(TextEditAction::Redo) => Some(TextInputHistoryAction::Redo),
+                _ => None,
+            },
+        );
+        self.handle_key_with_history_action(state, stroke, history_action)
     }
 
     /// Handle a stroke with the authoritative history result from a semantic adapter.
     ///
-    /// `None` suppresses all default history bindings, while ordinary editing still
-    /// uses the configured text keymap. Disabled keyboard policy overrides actions.
+    /// `None` suppresses all default history bindings (including undo/redo entries
+    /// of a [`TextBindings`] table), while ordinary editing still uses the
+    /// configured text keymap or table. Disabled keyboard policy overrides actions.
     pub fn handle_key_with_history_action(
         &self,
         state: &mut TextInputState,
@@ -862,6 +859,9 @@ impl<'policy> TextInputControl<'policy> {
         }
         if let Some(outcome) = self.handle_enter(state, stroke) {
             return outcome;
+        }
+        if let Some(bindings) = self.text_bindings {
+            return self.handle_bound_key(state, stroke, bindings);
         }
         if self.policy.keyboard.selection_keys
             && let Some(motion) = selection_motion(stroke)
@@ -888,6 +888,54 @@ impl<'policy> TextInputControl<'policy> {
             }
             _ => {
                 state.buffer_mut().apply_command(command);
+            }
+        }
+        state.sync_scroll_to_cursor(self.policy);
+        TextInputOutcome::Edited
+    }
+
+    fn handle_bound_key(
+        &self,
+        state: &mut TextInputState,
+        stroke: KeyStroke,
+        bindings: &TextBindings,
+    ) -> TextInputOutcome {
+        let action = match bindings.resolve(stroke) {
+            // History is resolved by the caller before reaching this point.
+            Some(TextEditAction::Undo | TextEditAction::Redo) => {
+                return TextInputOutcome::Ignored;
+            }
+            Some(action) if action.is_selection() && !self.policy.keyboard.selection_keys => {
+                return TextInputOutcome::Ignored;
+            }
+            Some(action) => action,
+            None => {
+                let Some(ch) = typed_char_for_key(stroke) else {
+                    return TextInputOutcome::Ignored;
+                };
+                state.buffer_mut().insert_char(ch);
+                state.sync_scroll_to_cursor(self.policy);
+                return TextInputOutcome::Edited;
+            }
+        };
+        match action.motion() {
+            Some((motion @ (TextMotion::VisualUp | TextMotion::VisualDown), mode)) => {
+                let delta = if motion == TextMotion::VisualUp {
+                    -1
+                } else {
+                    1
+                };
+                if mode == SelectionMode::Move
+                    && let Some(outcome) = self.edge_outcome(state, delta)
+                {
+                    return outcome;
+                }
+                move_visual_cursor(state, delta, mode);
+            }
+            Some((motion, mode)) => state.buffer.move_cursor_with_selection(motion, mode),
+            None if action == TextEditAction::SelectAll => state.buffer.select_all(),
+            None => {
+                state.buffer_mut().apply_action(action);
             }
         }
         state.sync_scroll_to_cursor(self.policy);
@@ -955,17 +1003,9 @@ impl<'policy> TextInputControl<'policy> {
         if !stroke.modifiers.is_empty() {
             return None;
         }
-        let layout = state.wrapped_layout(state.logical_width);
         match stroke.key {
-            KeyCode::Up if layout.cursor.row == 0 && self.policy.edge.up_at_first_row => {
-                Some(TextInputOutcome::EdgeUp)
-            }
-            KeyCode::Down
-                if layout.cursor.row.saturating_add(1) >= layout.lines.len()
-                    && self.policy.edge.down_at_last_row =>
-            {
-                Some(TextInputOutcome::EdgeDown)
-            }
+            KeyCode::Up => self.edge_outcome(state, -1),
+            KeyCode::Down => self.edge_outcome(state, 1),
             KeyCode::Char(_)
             | KeyCode::Enter
             | KeyCode::Tab
@@ -973,8 +1013,6 @@ impl<'policy> TextInputControl<'policy> {
             | KeyCode::Delete
             | KeyCode::Escape
             | KeyCode::Space
-            | KeyCode::Up
-            | KeyCode::Down
             | KeyCode::Left
             | KeyCode::Right
             | KeyCode::Home
@@ -984,6 +1022,21 @@ impl<'policy> TextInputControl<'policy> {
             | KeyCode::Insert
             | KeyCode::F(_) => None,
         }
+    }
+
+    /// Return the edge signal for a vertical move of `delta` rows, if enabled.
+    fn edge_outcome(&self, state: &TextInputState, delta: isize) -> Option<TextInputOutcome> {
+        let layout = state.wrapped_layout(state.logical_width);
+        if delta < 0 && layout.cursor.row == 0 && self.policy.edge.up_at_first_row {
+            return Some(TextInputOutcome::EdgeUp);
+        }
+        if delta > 0
+            && layout.cursor.row.saturating_add(1) >= layout.lines.len()
+            && self.policy.edge.down_at_last_row
+        {
+            return Some(TextInputOutcome::EdgeDown);
+        }
+        None
     }
 
     fn handle_mouse_down(&self, state: &mut TextInputState, mouse: MouseEvent) -> TextInputOutcome {
@@ -1741,6 +1794,238 @@ mod tests {
         );
         assert_eq!(state.borrow().buffer().text(), "ab");
         assert!(state.borrow().buffer().can_undo());
+    }
+
+    fn modifier_combinations() -> impl Iterator<Item = Modifiers> {
+        (0_u8..16).map(|bits| Modifiers {
+            ctrl: bits & 1 != 0,
+            alt: bits & 2 != 0,
+            shift: bits & 4 != 0,
+            super_key: bits & 8 != 0,
+            ..Modifiers::NONE
+        })
+    }
+
+    fn parity_keys() -> Vec<KeyCode> {
+        let mut keys: Vec<KeyCode> = ('a'..='z').map(KeyCode::Char).collect();
+        keys.extend([
+            KeyCode::Char('1'),
+            KeyCode::Enter,
+            KeyCode::Tab,
+            KeyCode::Backspace,
+            KeyCode::Delete,
+            KeyCode::Escape,
+            KeyCode::Space,
+            KeyCode::Up,
+            KeyCode::Down,
+            KeyCode::Left,
+            KeyCode::Right,
+            KeyCode::Home,
+            KeyCode::End,
+            KeyCode::PageUp,
+            KeyCode::F(1),
+        ]);
+        keys
+    }
+
+    type Observed = (
+        TextInputOutcome,
+        String,
+        usize,
+        Option<bmux_text_edit::TextSelection>,
+        bool,
+        bool,
+    );
+
+    fn observe(
+        control: &TextInputControl<'_>,
+        mut state: TextInputState,
+        stroke: KeyStroke,
+    ) -> Observed {
+        let outcome = control.handle_key(&mut state, stroke);
+        let buffer = state.buffer();
+        (
+            outcome,
+            buffer.text().to_string(),
+            buffer.cursor_byte_index(),
+            buffer.selection(),
+            buffer.can_undo(),
+            buffer.can_redo(),
+        )
+    }
+
+    fn parity_states(policy: &TextInputPolicy) -> Vec<TextInputState> {
+        let mut states = Vec::new();
+        for cursor in [0, 3, 14, 31] {
+            let mut state =
+                TextInputState::new(TextEditBuffer::from_text("alpha beta\ngamma delta epsilon"));
+            state.set_content_area(Rect::new(0, 0, 8, 3), policy);
+            state.buffer_mut().insert_str("!");
+            state.buffer_mut().undo();
+            state.buffer_mut().move_cursor(TextMotion::Absolute(cursor));
+            states.push(state.clone());
+            state
+                .buffer_mut()
+                .move_cursor_with_selection(TextMotion::Left, SelectionMode::Extend);
+            states.push(state);
+        }
+        states
+    }
+
+    #[test]
+    fn default_text_bindings_match_builtin_key_handling() {
+        use bmux_text_edit::TextBoundaryPolicy;
+        use bmux_text_edit::keyboard::TextInputProfile;
+
+        for profile in [
+            TextInputProfile::Readline,
+            TextInputProfile::MacTerminal,
+            TextInputProfile::WindowsTerminal,
+        ] {
+            for boundary_policy in [TextBoundaryPolicy::Buffer, TextBoundaryPolicy::Line] {
+                for edges in [false, true] {
+                    let mut policy = TextInputPolicy::chat_composer();
+                    policy.keyboard.keymap = TextKeymap {
+                        profile,
+                        boundary_policy,
+                    };
+                    policy.edge = EdgePolicy {
+                        up_at_first_row: edges,
+                        down_at_last_row: edges,
+                    };
+                    let bindings = policy.keyboard.keymap.bindings();
+                    let builtin = TextInputControl::new(&policy);
+                    let bound = TextInputControl::new(&policy).with_text_bindings(&bindings);
+                    for state in parity_states(&policy) {
+                        for code in parity_keys() {
+                            for modifiers in modifier_combinations() {
+                                if profile == TextInputProfile::WindowsTerminal
+                                    && modifiers.ctrl
+                                    && modifiers.super_key
+                                    && !modifiers.alt
+                                {
+                                    // Lenient legacy combination outside the table.
+                                    continue;
+                                }
+                                let stroke = KeyStroke::with_modifiers(code, modifiers);
+                                assert_eq!(
+                                    observe(&bound, state.clone(), stroke),
+                                    observe(&builtin, state.clone(), stroke),
+                                    "{profile:?} {boundary_policy:?} edges={edges} {stroke:?} \
+                                     cursor={}",
+                                    state.buffer().cursor_byte_index()
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn text_bindings_rebind_unbind_and_gate_selection() {
+        let ctrl = |ch| {
+            KeyStroke::with_modifiers(
+                KeyCode::Char(ch),
+                Modifiers {
+                    ctrl: true,
+                    ..Modifiers::NONE
+                },
+            )
+        };
+        let mut bindings = TextBindings::default();
+        bindings.set(TextEditAction::MoveLeft, &[]);
+        bindings.set(TextEditAction::MoveWordLeft, &[key(KeyCode::F(5))]);
+        bindings.unbind_stroke(ctrl('a'));
+        bindings.set(TextEditAction::SelectAll, &[ctrl('a')]);
+        bindings.set(TextEditAction::Undo, &[key(KeyCode::F(7))]);
+        bindings.set(TextEditAction::Clear, &[key(KeyCode::Escape)]);
+        assert_eq!(bindings.conflicts(), Vec::new());
+
+        let policy = TextInputPolicy::chat_composer();
+        let control = TextInputControl::new(&policy).with_text_bindings(&bindings);
+        let mut state = TextInputState::new(TextEditBuffer::from_text("hello world"));
+        state.set_content_area(Rect::new(0, 0, 20, 1), &policy);
+
+        assert_eq!(
+            control.handle_key(&mut state, key(KeyCode::Left)),
+            TextInputOutcome::Ignored
+        );
+        assert_eq!(state.buffer().cursor_byte_index(), 11);
+        assert_eq!(
+            control.handle_key(&mut state, key(KeyCode::F(5))),
+            TextInputOutcome::Edited
+        );
+        assert_eq!(state.buffer().cursor_byte_index(), 6);
+        assert_eq!(
+            control.handle_key(&mut state, ctrl('a')),
+            TextInputOutcome::Edited
+        );
+        assert_eq!(
+            state.buffer().selected_text().as_deref(),
+            Some("hello world")
+        );
+
+        // Typed characters stay implicit and replace the selection.
+        control.handle_key(&mut state, key(KeyCode::Char('x')));
+        assert_eq!(state.buffer().text(), "x");
+
+        // Undo moved to F7; the default ctrl-Z no longer undoes or inserts.
+        assert_eq!(
+            control.handle_key(&mut state, ctrl('z')),
+            TextInputOutcome::Ignored
+        );
+        assert_eq!(state.buffer().text(), "x");
+        assert_eq!(
+            control.handle_key(&mut state, key(KeyCode::F(7))),
+            TextInputOutcome::Edited
+        );
+        assert_eq!(state.buffer().text(), "hello world");
+
+        assert_eq!(
+            control.handle_key(&mut state, key(KeyCode::Escape)),
+            TextInputOutcome::Edited
+        );
+        assert_eq!(state.buffer().text(), "");
+
+        // The semantic adapter stays authoritative for history.
+        state.buffer_mut().insert_str("abc");
+        assert_eq!(
+            control.handle_key_with_history_action(&mut state, key(KeyCode::F(7)), None),
+            TextInputOutcome::Ignored
+        );
+        assert_eq!(state.buffer().text(), "abc");
+
+        let mut no_selection = TextInputPolicy::chat_composer();
+        no_selection.keyboard.selection_keys = false;
+        let gated = TextInputControl::new(&no_selection).with_text_bindings(&bindings);
+        assert_eq!(
+            gated.handle_key(&mut state, ctrl('a')),
+            TextInputOutcome::Ignored
+        );
+        assert_eq!(state.buffer().selection(), None);
+    }
+
+    #[test]
+    fn component_forwards_text_bindings() {
+        let policy = TextInputPolicy::chat_composer();
+        let mut bindings = TextBindings::default();
+        bindings.set(TextEditAction::DeleteToStart, &[key(KeyCode::F(9))]);
+        let state = RefCell::new(TextInputState::new(TextEditBuffer::from_text("abc")));
+        let component = TextInputComponent::new("editor", &state, &policy)
+            .with_text_bindings(&bindings)
+            .focused(true);
+        let layout = LayoutNode::leaf("editor".into(), LogicalSize::new(8, 1));
+        assert_eq!(
+            component.event(
+                &Event::Key(key(KeyCode::F(9))),
+                &layout,
+                &mut EventCx::new(&layout)
+            ),
+            EventOutcome::Redraw
+        );
+        assert_eq!(state.borrow().buffer().text(), "");
     }
 
     fn key(key: KeyCode) -> KeyStroke {

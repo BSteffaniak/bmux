@@ -307,6 +307,16 @@ passing the semantic action; do not call the default history handler afterward.
 Undo storage bounds, oversized-edit clearing and serde omission are documented
 in the `bmux_text_edit` README.
 
+### Rebinding text-input editing keys
+
+`with_text_bindings(&bindings)` on `TextInputControl` or `TextInputComponent`
+routes every non-insert editing key through a `bmux_text_edit` `TextBindings`
+table, including undo/redo (the table then supersedes the history bindings in
+`handle_key`). Unbound printable strokes are still inserted, Enter keeps its
+`KeyboardPolicy` behavior, `selection_keys` still gates selection actions, and
+vertical moves keep edge signals and soft-wrap-aware movement.
+`policy.keyboard.keymap.bindings()` reproduces the behavior without a table.
+
 ### Ephemeral control rebuild snapshots
 
 Interactive native states expose `snapshot() -> serde_json::Value` and

@@ -79,3 +79,43 @@ Keyboard binding policy belongs to the caller or a generic control adapter, not
 to these storage primitives. See `bmux_tui_components` text-input history
 bindings
 for remapping and independently disabling undo/redo.
+
+## Named actions and rebindable keys
+
+`TextEditAction` names every bindable editing operation (moves, shift-extended
+selection, select-all, deletions, clear, undo and redo). Typed printable
+characters are not actions. Each action has a stable kebab-case `id()` such as
+`move-word-left` or `delete-to-line-end`, `from_id()` to parse it and `label()`
+for help screens; with the `serde` feature it (de)serializes as its id.
+`TextEditBuffer::apply_action` performs an action and returns whether the text
+changed. Vertical actions use hard-line `VisualUp`/`VisualDown` semantics, so
+soft-wrapping consumers should route `action.motion()` through
+`move_cursor_in_layout` instead.
+
+With the `keyboard` feature, `keyboard::TextBindings` is the stroke-to-action
+table. `TextBindings::defaults(profile, boundary_policy)` reproduces
+`command_for_key` plus shift-arrow selection and the
+`DEFAULT_UNDO_STROKES`/`DEFAULT_REDO_STROKES` history keys. Lookups are exact
+and fail closed: a stroke bound to several actions resolves to `None` and is
+reported by `conflicts()`. `typed_char_for_key` exposes the implicit insertion
+layer.
+
+```rust
+use bmux_keyboard::{KeyCode, KeyStroke, Modifiers};
+use bmux_text_edit::keyboard::TextBindings;
+use bmux_text_edit::{TextEditAction, TextEditBuffer};
+
+let ctrl_a = KeyStroke::with_modifiers(
+    KeyCode::Char('a'), Modifiers { ctrl: true, ..Modifiers::NONE },
+);
+let mut bindings = TextBindings::default();
+bindings.unbind_stroke(ctrl_a); // was move-start
+bindings.set(TextEditAction::SelectAll, &[ctrl_a]);
+assert!(bindings.conflicts().is_empty());
+
+let mut editor = TextEditBuffer::from_text("hello");
+if let Some(action) = bindings.resolve(ctrl_a) {
+    editor.apply_action(action);
+}
+assert_eq!(editor.selected_text().as_deref(), Some("hello"));
+```

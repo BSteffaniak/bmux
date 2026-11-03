@@ -4,6 +4,9 @@
 
 //! Unicode-aware terminal text editing primitives.
 
+mod action;
+pub use action::TextEditAction;
+
 #[cfg(feature = "keyboard")]
 pub mod keyboard;
 
