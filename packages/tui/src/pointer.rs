@@ -3,6 +3,7 @@
 //! Pointer shapes are separate from the text caret. `Hidden` is an intent for
 //! capable hosts, not an OSC 22 shape name or permission to hide the caret.
 
+pub use bmux_terminal_protocol::pointer_output::PointerShapeCapability;
 pub use bmux_terminal_protocol::pointer_shape::PointerShape;
 
 use crate::geometry::Point;

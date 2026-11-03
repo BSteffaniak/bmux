@@ -30,6 +30,11 @@ impl PointerShapeCapability {
     }
 
     /// Interpret explicit host evidence without I/O or environment mutation.
+    ///
+    /// `override_value` (`stack`, `set`, or anything else for unsupported)
+    /// wins. Otherwise kitty, ghostty, foot, and bmux panes (which implement
+    /// the full set/push/pop/query protocol) are `Stack`, `TERM_PROGRAM=xterm`
+    /// is `Set`, and everything else is `Unsupported`.
     #[must_use]
     pub fn from_environment(term: &str, program: &str, override_value: Option<&str>) -> Self {
         if let Some(value) = override_value {
@@ -44,7 +49,7 @@ impl PointerShapeCapability {
         if term == "dumb" {
             return Self::Unsupported;
         }
-        if matches!(program.as_str(), "kitty" | "ghostty" | "foot")
+        if matches!(program.as_str(), "kitty" | "ghostty" | "foot" | "bmux")
             || term.contains("kitty")
             || term.contains("ghostty")
             || term.starts_with("foot")
@@ -59,20 +64,30 @@ impl PointerShapeCapability {
     }
 
     /// Conservative detection. Multiplexer passthrough is never enabled implicitly.
+    ///
+    /// `BMUX_POINTER_SHAPES=stack|set|off` overrides the environment-based
+    /// guess (for hosts that support OSC 22 but are not recognized, or to
+    /// disable pointer shapes); `BMUX_PLAYBOOK_HEADLESS_POINTER_SHAPES` is
+    /// honored as a fallback for headless playbooks.
     #[must_use]
     pub fn detect() -> Self {
         if tmux_present() && !tmux_passthrough_enabled() {
             return Self::Unsupported;
         }
+        let override_value = std::env::var(POINTER_SHAPES_ENV)
+            .or_else(|_| std::env::var("BMUX_PLAYBOOK_HEADLESS_POINTER_SHAPES"))
+            .ok();
         Self::from_environment(
             &std::env::var("TERM").unwrap_or_default(),
             &std::env::var("TERM_PROGRAM").unwrap_or_default(),
-            std::env::var("BMUX_PLAYBOOK_HEADLESS_POINTER_SHAPES")
-                .ok()
-                .as_deref(),
+            override_value.as_deref(),
         )
     }
 }
+
+/// Environment variable that overrides pointer-shape capability detection:
+/// `stack`, `set`, or `off`.
+pub const POINTER_SHAPES_ENV: &str = "BMUX_POINTER_SHAPES";
 
 fn tmux_present() -> bool {
     std::env::var_os("TMUX").is_some_and(|value| !value.is_empty())
@@ -272,6 +287,43 @@ impl PointerOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn environment_detection_recognizes_known_hosts_and_overrides() {
+        let detect = PointerShapeCapability::from_environment;
+        assert_eq!(
+            detect("xterm-256color", "bmux", None),
+            PointerShapeCapability::Stack
+        );
+        assert_eq!(
+            detect("xterm-kitty", "", None),
+            PointerShapeCapability::Stack
+        );
+        assert_eq!(
+            detect("xterm-ghostty", "ghostty", None),
+            PointerShapeCapability::Stack
+        );
+        assert_eq!(
+            detect("xterm-256color", "xterm", None),
+            PointerShapeCapability::Set
+        );
+        assert_eq!(
+            detect("xterm-256color", "WezTerm", None),
+            PointerShapeCapability::Unsupported
+        );
+        assert_eq!(
+            detect("xterm-256color", "WezTerm", Some("stack")),
+            PointerShapeCapability::Stack
+        );
+        assert_eq!(
+            detect("xterm-kitty", "kitty", Some("off")),
+            PointerShapeCapability::Unsupported
+        );
+        assert_eq!(
+            detect("dumb", "bmux", None),
+            PointerShapeCapability::Unsupported
+        );
+    }
 
     #[test]
     fn stack_push_dedup_set_and_restore() {

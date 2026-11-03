@@ -39,6 +39,12 @@ unknown versions and shapes. An occupied unset entry is distinct from CSS
 they do not erase lower entries. This follows kitty's `change_pointer_shape`
 implementation as well as its published pointer-shapes protocol.
 
+`pointer_output::PointerShapeCapability::detect()` recognizes kitty, ghostty,
+foot, and bmux panes (full stack support) and `TERM_PROGRAM=xterm` (setter
+only). Set `BMUX_POINTER_SHAPES=stack|set|off` to override detection for an
+unrecognized host or to turn pointer shapes off. Inside tmux, output is
+suppressed unless `BMUX_POINTER_SHAPE_TMUX_PASSTHROUGH=1`.
+
 This engine does **not** own or answer OSC 22 state. Feed application output to
 the canonical terminal grid and use its ordered query callback. Supply the
 callback's current request plus configured default/grabbed shapes in

@@ -104,6 +104,13 @@ impl<W: Write> Terminal<W> {
         self.pointer_output = staged.pointer_output;
     }
 
+    /// Host pointer-shape capability (detected from the environment unless
+    /// set explicitly).
+    #[must_use]
+    pub const fn pointer_capability(&self) -> PointerShapeCapability {
+        self.pointer_capability
+    }
+
     /// Set explicit host capability before acquiring pointer ownership.
     pub const fn set_pointer_capability(&mut self, capability: PointerShapeCapability) {
         self.pointer_capability = capability;
