@@ -113,7 +113,8 @@ enum PromptWidgetState {
         list: VirtualListState<usize>,
     },
     SearchSelect {
-        query: TextEditBuffer,
+        // Boxed so this variant does not size the whole enum.
+        query: Box<TextEditBuffer>,
         selected: usize,
         list: VirtualListState<usize>,
         // Separate width-specific probe; released with the prompt.
@@ -183,7 +184,7 @@ impl ActivePrompt {
                     (*default_index).min(options.len().saturating_sub(1))
                 };
                 PromptWidgetState::SearchSelect {
-                    query: TextEditBuffer::new(),
+                    query: Box::new(TextEditBuffer::new()),
                     selected,
                     list: VirtualListState::new(0),
                     width_probe: Box::new(VirtualListState::new(0)),
@@ -2216,7 +2217,7 @@ fn render_command_palette(
             "Search options".to_owned()
         }
     });
-    let input_state = RefCell::new(TextInputState::new(query.clone()));
+    let input_state = RefCell::new(TextInputState::new((**query).clone()));
     let input_policy = TextInputPolicy::raw();
     let input = TextInputComponent::new("command-palette.query", &input_state, &input_policy)
         .placeholder(&placeholder, theme.muted)
