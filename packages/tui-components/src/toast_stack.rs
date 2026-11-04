@@ -14,7 +14,7 @@ use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::prelude::{Line, Span};
 use bmux_tui::semantic::SemanticRegion;
 use bmux_tui::style::{Color, Modifier, Style};
-use bmux_tui::text_width::truncate_to_display_width;
+use bmux_tui::text_width::{display_width, truncate_to_display_width, wrap_text_with_continuation};
 
 /// Generic toast severity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
@@ -112,6 +112,13 @@ pub struct ToastStackPolicy {
     pub close_button: bool,
     /// Enable mouse close handling.
     pub mouse: bool,
+    /// Most body rows per toast. Longer bodies wrap at word boundaries and
+    /// end in `…` on the last row ([`ToastStack::is_truncated`] tells).
+    pub max_body_lines: u16,
+    /// Blank columns inside each toast's left and right edges.
+    pub padding: u16,
+    /// Draw a severity-colored bar down each toast's left edge.
+    pub accent_bar: bool,
 }
 
 impl ToastStackPolicy {
@@ -125,6 +132,9 @@ impl ToastStackPolicy {
             spacing: 1,
             close_button: true,
             mouse: true,
+            max_body_lines: 1,
+            padding: 0,
+            accent_bar: false,
         }
     }
 
@@ -138,6 +148,27 @@ impl ToastStackPolicy {
             spacing: 1,
             close_button: false,
             mouse: false,
+            max_body_lines: 1,
+            padding: 0,
+            accent_bar: false,
+        }
+    }
+
+    /// Card-style stack: filled toasts (with [`ToastStackStyles::surface`])
+    /// with a severity bar, padding, and bodies wrapped over up to three
+    /// rows.
+    #[must_use]
+    pub const fn cards() -> Self {
+        Self {
+            placement: ToastPlacement::Top,
+            width: 44,
+            max_visible: 3,
+            spacing: 1,
+            close_button: false,
+            mouse: false,
+            max_body_lines: 3,
+            padding: 1,
+            accent_bar: true,
         }
     }
 }
@@ -167,6 +198,9 @@ pub struct ToastStackStyles {
     pub close: Style,
     /// Border/chrome style.
     pub border: Style,
+    /// Fill behind each toast. The default style leaves what is underneath
+    /// showing between the text.
+    pub surface: Style,
 }
 
 impl Default for ToastStackStyles {
@@ -184,6 +218,7 @@ impl Default for ToastStackStyles {
             body: Style::new().fg(Color::BrightBlack),
             close: Style::new().fg(Color::BrightBlack),
             border: Style::new().fg(Color::BrightBlack),
+            surface: Style::new(),
         }
     }
 }
@@ -245,6 +280,67 @@ impl<'a, 'state> ToastStackComponent<'a, 'state> {
     }
 }
 
+impl ToastStackComponent<'_, '_> {
+    fn paint_toast(&self, cx: &mut PaintCx<'_, '_>, rect: Rect, toast: &ToastItem<'_>) {
+        let stack = &self.stack;
+        let local = |x: u16, y: u16, width: u16, height: u16| {
+            LocalRect::new(i32::from(x), i64::from(y), width, height)
+        };
+        if stack.styles.surface != Style::new() {
+            cx.fill(
+                local(rect.x, rect.y, rect.width, rect.height),
+                " ",
+                stack.styles.surface,
+            );
+        }
+        if stack.policy.accent_bar {
+            let bar = stack.styles.surface.patch(
+                Style::new().fg(stack.title_style(toast.severity).fg.unwrap_or(Color::White)),
+            );
+            cx.fill(local(rect.x, rect.y, 1, rect.height), "▌", bar);
+        }
+        if stack.policy.close_button && stack.policy.mouse {
+            cx.push_hit(
+                HitRegion::new(
+                    format!("{}.{}.close", self.id.as_str(), toast.id),
+                    Rect::new(rect.right().saturating_sub(1), rect.y, 1, 1),
+                )
+                .role(HitRole::Action)
+                .pointer_intent(self.pointer_intent)
+                .hoverable(true)
+                .focusable(true),
+            );
+        }
+        let close = if stack.policy.close_button { " ×" } else { "" };
+        let x = rect.x.saturating_add(stack.content_offset());
+        let width = stack.content_width(rect.width);
+        let title =
+            truncate_to_display_width(toast.title, usize::from(width).saturating_sub(close.len()));
+        let title_width = u16::try_from(display_width(&title))
+            .unwrap_or(u16::MAX)
+            .saturating_add(u16::try_from(close.len()).unwrap_or(u16::MAX))
+            .min(width);
+        let surface = stack.styles.surface;
+        cx.write_line(
+            local(x, rect.y, title_width, 1),
+            &Line::from_spans([
+                Span::styled(title, surface.patch(stack.title_style(toast.severity))),
+                Span::styled(close, surface.patch(stack.styles.close)),
+            ]),
+        );
+        let (lines, _) = stack.body_lines(toast, width);
+        for (row, line) in (1..rect.height).zip(lines) {
+            let line_width = u16::try_from(display_width(&line))
+                .unwrap_or(u16::MAX)
+                .min(width);
+            cx.write_line(
+                local(x, rect.y.saturating_add(row), line_width, 1),
+                &Line::from_spans([Span::styled(line, surface.patch(stack.styles.body))]),
+            );
+        }
+    }
+}
+
 impl Component for ToastStackComponent<'_, '_> {
     fn revision(&self) -> ComponentRevision {
         let mut layout = std::collections::hash_map::DefaultHasher::new();
@@ -253,6 +349,9 @@ impl Component for ToastStackComponent<'_, '_> {
         self.stack.policy.max_visible.hash(&mut layout);
         self.stack.policy.spacing.hash(&mut layout);
         self.stack.policy.placement.hash(&mut layout);
+        self.stack.policy.max_body_lines.hash(&mut layout);
+        self.stack.policy.padding.hash(&mut layout);
+        self.stack.policy.accent_bar.hash(&mut layout);
         for toast in self.stack.toasts {
             toast.id.hash(&mut layout);
             toast.title.hash(&mut layout);
@@ -280,10 +379,11 @@ impl Component for ToastStackComponent<'_, '_> {
             .iter()
             .take(visible)
             .flat_map(|toast| std::iter::once(toast.title).chain(toast.body))
-            .map(bmux_tui::text_width::display_width)
+            .map(display_width)
             .max()
             .unwrap_or_default()
-            .saturating_add(usize::from(self.stack.policy.close_button) * 2);
+            .saturating_add(usize::from(self.stack.policy.close_button) * 2)
+            .saturating_add(usize::from(self.stack.chrome_width()));
         let width = self
             .stack
             .policy
@@ -298,7 +398,7 @@ impl Component for ToastStackComponent<'_, '_> {
             .toasts
             .iter()
             .take(visible)
-            .map(|toast| usize::from(toast.body.is_some()) + 1)
+            .map(|toast| usize::from(self.stack.toast_height(toast, width)))
             .sum::<usize>()
             .saturating_add(
                 usize::from(self.stack.policy.spacing).saturating_mul(visible.saturating_sub(1)),
@@ -333,56 +433,7 @@ impl Component for ToastStackComponent<'_, '_> {
             let Some(rect) = self.stack.toast_area(area, index, toast) else {
                 continue;
             };
-            if self.stack.policy.close_button && self.stack.policy.mouse {
-                cx.push_hit(
-                    HitRegion::new(
-                        format!("{}.{}.close", self.id.as_str(), toast.id),
-                        Rect::new(rect.right().saturating_sub(1), rect.y, 1, 1),
-                    )
-                    .role(HitRole::Action)
-                    .pointer_intent(self.pointer_intent)
-                    .hoverable(true)
-                    .focusable(true),
-                );
-            }
-            let close = if self.stack.policy.close_button {
-                " ×"
-            } else {
-                ""
-            };
-            let title = truncate_to_display_width(
-                toast.title,
-                usize::from(rect.width).saturating_sub(close.len()),
-            );
-            let title_width = u16::try_from(bmux_tui::text_width::display_width(&title))
-                .unwrap_or(u16::MAX)
-                .saturating_add(u16::try_from(close.len()).unwrap_or(u16::MAX))
-                .min(rect.width);
-            cx.write_line(
-                LocalRect::new(i32::from(rect.x), i64::from(rect.y), title_width, 1),
-                &Line::from_spans([
-                    Span::styled(title, self.stack.title_style(toast.severity)),
-                    Span::styled(close, self.stack.styles.close),
-                ]),
-            );
-            if let Some(body) = toast.body
-                && rect.height > 1
-            {
-                cx.write_line(
-                    LocalRect::new(
-                        i32::from(rect.x),
-                        i64::from(rect.y.saturating_add(1)),
-                        u16::try_from(bmux_tui::text_width::display_width(body))
-                            .unwrap_or(u16::MAX)
-                            .min(rect.width),
-                        1,
-                    ),
-                    &Line::from_spans([Span::styled(
-                        truncate_to_display_width(body, usize::from(rect.width)),
-                        self.stack.styles.body,
-                    )]),
-                );
-            }
+            self.paint_toast(cx, rect, toast);
         }
         let local = LocalRect::new(0, 0, area.width, area.height);
         cx.push_semantic(SemanticRegion::new(self.id.as_str(), area, "notifications"));
@@ -426,6 +477,9 @@ impl<'a> ToastStack<'a> {
                 spacing: 1,
                 close_button: true,
                 mouse: true,
+                max_body_lines: 1,
+                padding: 0,
+                accent_bar: false,
             },
             styles: ToastStackStyles {
                 default: Style::new(),
@@ -436,6 +490,7 @@ impl<'a> ToastStack<'a> {
                 body: Style::new(),
                 close: Style::new(),
                 border: Style::new(),
+                surface: Style::new(),
             },
         }
     }
@@ -572,19 +627,102 @@ impl<'a> ToastStack<'a> {
             })
     }
 
+    /// Columns taken by the accent bar and padding.
+    const fn chrome_width(&self) -> u16 {
+        (self.policy.accent_bar as u16).saturating_add(self.policy.padding.saturating_mul(2))
+    }
+
+    /// Column offset of text inside a toast.
+    const fn content_offset(&self) -> u16 {
+        (self.policy.accent_bar as u16).saturating_add(self.policy.padding)
+    }
+
+    /// Text width inside a toast `width` columns wide.
+    const fn content_width(&self, width: u16) -> u16 {
+        width.saturating_sub(self.chrome_width())
+    }
+
+    /// Body rows of `toast` at text width `width`, and whether text was cut.
+    fn body_lines(&self, toast: &ToastItem<'_>, width: u16) -> (Vec<String>, bool) {
+        let Some(body) = toast.body else {
+            return (Vec::new(), false);
+        };
+        let width = usize::from(width.max(1));
+        let max = usize::from(self.policy.max_body_lines.max(1));
+        let mut lines: Vec<String> = body
+            .lines()
+            .flat_map(|line| {
+                let wrapped = wrap_text_with_continuation(line, width, width);
+                if wrapped.is_empty() {
+                    vec![String::new()]
+                } else {
+                    wrapped
+                }
+            })
+            .collect();
+        if lines.len() <= max {
+            return (lines, false);
+        }
+        lines.truncate(max);
+        if let Some(last) = lines.last_mut() {
+            // Room for the ellipsis on the last row.
+            let mut cut = truncate_to_display_width(last, width.saturating_sub(1));
+            if cut.ends_with('…') {
+                cut.pop();
+            }
+            *last = format!("{}…", cut.trim_end());
+        }
+        (lines, true)
+    }
+
+    /// Rows `toast` takes in a stack `width` columns wide.
+    fn toast_height(&self, toast: &ToastItem<'_>, width: u16) -> u16 {
+        let width = self.policy.width.min(width);
+        let rows = self.body_lines(toast, self.content_width(width)).0.len();
+        u16::try_from(rows).unwrap_or(u16::MAX).saturating_add(1)
+    }
+
+    /// Whether the body of the toast at `index` was cut short in `area` (so
+    /// callers can offer the full text, for example on click).
+    #[must_use]
+    pub fn is_truncated(&self, area: Rect, index: usize) -> bool {
+        self.toasts.get(index).is_some_and(|toast| {
+            let width = self.policy.width.min(area.width);
+            self.body_lines(toast, self.content_width(width)).1
+        })
+    }
+
+    /// Rectangles of the visible toasts in `area`, by index (`None` for
+    /// toasts that do not fit).
+    #[must_use]
+    pub fn toast_rects(&self, area: Rect) -> Vec<Option<Rect>> {
+        (0..self.visible_count())
+            .map(|index| {
+                self.toasts
+                    .get(index)
+                    .and_then(|toast| self.toast_area(area, index, toast))
+            })
+            .collect()
+    }
+
     fn toast_area(&self, area: Rect, index: usize, toast: &ToastItem<'_>) -> Option<Rect> {
-        let height = u16::from(toast.body.is_some()).saturating_add(1);
-        let step = height.saturating_add(self.policy.spacing);
+        let height = self.toast_height(toast, area.width);
+        let offset = self
+            .toasts
+            .iter()
+            .take(index)
+            .map(|earlier| {
+                self.toast_height(earlier, area.width)
+                    .saturating_add(self.policy.spacing)
+            })
+            .fold(0u16, u16::saturating_add);
         let width = self.policy.width.min(area.width);
         let x = area.x.saturating_add(area.width.saturating_sub(width));
-        let index_offset = u16::try_from(index).ok()?.saturating_mul(step);
         let y = match self.policy.placement {
-            ToastPlacement::Top => area.y.saturating_add(index_offset),
-            ToastPlacement::Bottom => area.y.saturating_add(
-                area.height
-                    .saturating_sub(height)
-                    .saturating_sub(index_offset),
-            ),
+            ToastPlacement::Top => area.y.saturating_add(offset),
+            ToastPlacement::Bottom => area
+                .y
+                .saturating_add(area.height.saturating_sub(height).saturating_sub(offset)),
         };
         (y >= area.y && y.saturating_add(height) <= area.y.saturating_add(area.height))
             .then_some(Rect::new(x, y, width, height))
@@ -621,6 +759,9 @@ impl From<crate::theme::ComponentTheme> for ToastStackStyles {
             body: theme.text,
             close: theme.muted,
             border: theme.border,
+            surface: theme
+                .surfaces
+                .resolve(crate::theme::ComponentSurfaceDepth::Raised),
         }
     }
 }
@@ -773,6 +914,47 @@ mod tests {
         assert_eq!(
             frame.buffer().row_symbols(1).as_deref(),
             Some("Changes persisted       ")
+        );
+    }
+
+    #[test]
+    fn card_bodies_wrap_and_stack_by_their_height() {
+        let toasts = [
+            ToastItem::new("one", "Scan failed")
+                .body("the network has 2046 hosts, more than discovery.max-hosts (256) allows")
+                .severity(ToastSeverity::Error),
+            ToastItem::new("two", "Saved").body("ok"),
+        ];
+        let policy = ToastStackPolicy {
+            width: 24,
+            max_body_lines: 2,
+            ..ToastStackPolicy::cards()
+        };
+        let area = Rect::new(0, 0, 24, 8);
+        let stack = ToastStack::new(&toasts).policy(policy);
+        assert_eq!(
+            stack.toast_rects(area),
+            [Some(Rect::new(0, 0, 24, 3)), Some(Rect::new(0, 4, 24, 2))]
+        );
+        assert!(stack.is_truncated(area, 0));
+        assert!(!stack.is_truncated(area, 1));
+
+        let mut buffer = Buffer::empty(area);
+        let mut frame = Frame::new(&mut buffer);
+        stack.render(area, &ToastStackState::default(), &mut frame);
+        let rows: Vec<String> = (0..6)
+            .map(|y| frame.buffer().row_symbols(y).unwrap_or_default())
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                "▌ Scan failed           ",
+                "▌ the network has 2046  ",
+                "▌ hosts, more than…     ",
+                "                        ",
+                "▌ Saved                 ",
+                "▌ ok                    ",
+            ]
         );
     }
 
