@@ -41,7 +41,7 @@ use bmux_tui_components::table::{TableColumn, TableComponent, TableRow, TableSta
 use bmux_tui_components::text_input::{TextInputPolicy, TextInputState};
 use bmux_tui_components::text_input_box::{TextInputBoxComponent, TextInputBoxPolicy};
 use bmux_tui_components::toast_stack::{
-    ToastItem, ToastSeverity, ToastStackComponent, ToastStackState,
+    ToastItem, ToastSeverity, ToastStackComponent, ToastStackPolicy, ToastStackState,
 };
 
 pub const WIDTH: u16 = 72;
@@ -404,7 +404,12 @@ fn render_toasts(cx: &mut PaintCx<'_, '_>) {
     ];
     let state = Cell::new(ToastStackState::default());
     render_component(
-        &ToastStackComponent::new("gallery.toasts", &toasts, &state),
+        // Stacked without a gap, so the stack keeps to rows 20-22 and the
+        // sparkline below stays visible.
+        &ToastStackComponent::new("gallery.toasts", &toasts, &state).policy(ToastStackPolicy {
+            spacing: 0,
+            ..ToastStackPolicy::default()
+        }),
         Rect::new(1, 20, 30, 4),
         cx,
     );

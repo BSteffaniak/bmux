@@ -33,6 +33,19 @@ The shell does not intercept arbitrary commands launched outside it. Such builds
 are not the supported development entry point. A conflicting compiler wrapper
 must be explicitly unset before entering the shell.
 
+## Test temporary directories
+
+On Unix, `cargo nextest` runs a setup script
+(`scripts/nextest-test-tmpdir.sh`, configured in `.config/nextest.toml`) that
+points every test's `TMPDIR` at a private per-user directory under `/tmp`,
+resolved to its real path (`/private/tmp/bmux-test-<uid>` on macOS). Host
+temporary directories are symlinked on macOS and long under `nix develop`;
+tests then saw symlinked ancestors that private caches and retained executables
+deliberately reject, `/private/tmp` where they built `/tmp`, and Unix socket
+paths past the platform limit. Tests still create unique directories inside it,
+so concurrent runs are safe. Tests that need a path independent of nextest (for
+example under plain `cargo test`) should canonicalize their temporary root.
+
 ## CI and native platforms
 
 The reusable `rust-version.yml` workflow evaluates the exact Rust version from

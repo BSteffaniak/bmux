@@ -561,14 +561,14 @@ mod tests {
     }
     #[test]
     fn cache_reuse_is_offline_and_corruption_is_not_repaired() {
-        let cache = tempfile::tempdir().unwrap();
-        let directory = cache.path().join("web-assets").join(cache_key());
+        let (_cache, root) = cache_root();
+        let directory = root.join("web-assets").join(cache_key());
         private_directory(directory.parent().unwrap()).unwrap();
         fs::create_dir_all(&directory).unwrap();
         fixture(&directory);
-        assert_eq!(resolve(cache.path()).unwrap(), directory);
+        assert_eq!(resolve(&root).unwrap(), directory);
         fs::write(directory.join("bootstrap.js"), b"corrupt").unwrap();
-        assert!(resolve(cache.path()).is_err());
+        assert!(resolve(&root).is_err());
         assert_eq!(
             fs::read(directory.join("bootstrap.js")).unwrap(),
             b"corrupt"
@@ -786,15 +786,24 @@ mod tests {
     }
     #[test]
     fn concurrent_readers_reuse_one_valid_cache() {
-        let cache = tempfile::tempdir().unwrap();
-        let directory = cache.path().join("web-assets").join(cache_key());
+        let (_cache, root) = cache_root();
+        let directory = root.join("web-assets").join(cache_key());
         private_directory(directory.parent().unwrap()).unwrap();
         fs::create_dir_all(&directory).unwrap();
         fixture(&directory);
         std::thread::scope(|scope| {
             for _ in 0..4 {
-                scope.spawn(|| assert_eq!(resolve(cache.path()).unwrap(), directory));
+                scope.spawn(|| assert_eq!(resolve(&root).unwrap(), directory));
             }
         });
+    }
+
+    /// A temporary cache root with its symlinks resolved: the cache rejects
+    /// symlinked ancestors, and macOS keeps temporary files under `/var`, a
+    /// symlink to `/private/var`.
+    fn cache_root() -> (tempfile::TempDir, PathBuf) {
+        let cache = tempfile::tempdir().unwrap();
+        let root = cache.path().canonicalize().unwrap();
+        (cache, root)
     }
 }

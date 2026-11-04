@@ -3446,9 +3446,40 @@ end
 "#
 }
 
+/// `XDG_DATA_DIRS` for a pane: its own nested-shell share first, then the
+/// inherited directories without other bmux panes' shares. A server started
+/// inside a bmux pane inherits that pane's share, whose integration files
+/// would otherwise install a second set of shell hooks bound to the outer
+/// runtime's version of them.
+fn pane_xdg_data_dirs(
+    share: std::path::PathBuf,
+    inherited: Option<std::ffi::OsString>,
+) -> Vec<std::path::PathBuf> {
+    let inherited =
+        inherited.unwrap_or_else(|| std::ffi::OsString::from("/usr/local/share:/usr/share"));
+    let mut dirs = vec![share];
+    dirs.extend(std::env::split_paths(&inherited).filter(|dir| !is_bmux_nested_share(dir)));
+    dirs
+}
+
+/// Whether `dir` is a pane's nested-shell share
+/// (`…/shell-integration/<marker>/nested-share`).
+fn is_bmux_nested_share(dir: &std::path::Path) -> bool {
+    dir.file_name() == Some(std::ffi::OsStr::new("nested-share"))
+        && dir
+            .parent()
+            .and_then(std::path::Path::parent)
+            .and_then(std::path::Path::file_name)
+            == Some(std::ffi::OsStr::new("shell-integration"))
+}
+
 #[allow(clippy::literal_string_with_formatting_args)]
 const fn shell_integration_nested_nu() -> &'static str {
-    r"if (($env.APPLICATION_RESURRECTION_HOST? | default '') != '') and (($env.BMUX_SHELL_CALLBACK? | default '') != '') {
+    r"# Install once per Nushell process, like the Bash and Zsh integrations: an
+# inherited XDG_DATA_DIRS can list more than one bmux share directory, and
+# duplicate hooks would report every lifecycle boundary twice.
+if (($env.APPLICATION_RESURRECTION_HOST? | default '') != '') and (($env.BMUX_SHELL_CALLBACK? | default '') != '') and (($env.__BMUX_NESTED_PID? | default '') != ($nu.pid | into string)) {
+  $env.__BMUX_NESTED_PID = ($nu.pid | into string)
   $env.config = ($env.config
     | upsert hooks.pre_prompt (($env.config.hooks.pre_prompt? | default []) | append {||
         let cwd = (^$env.BMUX_SHELL_CALLBACK __shell-invocation location $nu.current-exe ($nu.pid | into string) '' ($env.PWD | into string))
@@ -6974,11 +7005,7 @@ impl SessionRuntimeManager {
                     }
                     None => unreachable!("shell integration requires a retained callback"),
                 }
-                let mut dirs = vec![share];
-                dirs.extend(std::env::split_paths(
-                    &std::env::var_os("XDG_DATA_DIRS")
-                        .unwrap_or_else(|| std::ffi::OsString::from("/usr/local/share:/usr/share")),
-                ));
+                let dirs = pane_xdg_data_dirs(share, std::env::var_os("XDG_DATA_DIRS"));
                 if let Ok(value) = std::env::join_paths(dirs) {
                     command.env("XDG_DATA_DIRS", value);
                 }
@@ -21160,6 +21187,46 @@ exit 7"#
         assert!(config.contains("upsert hooks.pre_prompt"));
         // Prompt rendering can happen repeatedly without a command boundary.
         assert!(!config.contains("$env.PROMPT_COMMAND ="));
+    }
+
+    #[test]
+    fn pane_data_dirs_drop_other_panes_nested_shares() {
+        let share = std::path::PathBuf::from("/state/runtime/shell-integration/new/nested-share");
+        let inherited = std::env::join_paths([
+            "/outer/runtime/shell-integration/old/nested-share",
+            "/usr/share",
+            "/home/user/nested-share",
+        ])
+        .unwrap();
+        assert_eq!(
+            pane_xdg_data_dirs(share.clone(), Some(inherited)),
+            vec![
+                share.clone(),
+                std::path::PathBuf::from("/usr/share"),
+                std::path::PathBuf::from("/home/user/nested-share"),
+            ]
+        );
+        assert_eq!(
+            pane_xdg_data_dirs(share.clone(), None),
+            vec![
+                share,
+                std::path::PathBuf::from("/usr/local/share"),
+                std::path::PathBuf::from("/usr/share"),
+            ]
+        );
+    }
+
+    #[test]
+    fn nested_nu_integration_installs_once_per_process() {
+        let config = shell_integration_nested_nu();
+
+        // An inherited XDG_DATA_DIRS (bmux started inside a bmux pane) can
+        // autoload this file twice; doubled hooks would report each boundary
+        // twice and replace a restored execution with a manual one.
+        assert!(
+            config.contains("($env.__BMUX_NESTED_PID? | default '') != ($nu.pid | into string)")
+        );
+        assert!(config.contains("$env.__BMUX_NESTED_PID = ($nu.pid | into string)"));
     }
 
     #[test]

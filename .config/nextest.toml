@@ -1,3 +1,6 @@
+# Setup scripts provide the per-run test TMPDIR below.
+experimental = ["setup-scripts"]
+
 # Recorded-process tests launch isolated servers and rasterize animated evidence.
 # Bound their aggregate host load without relaxing per-command deadlines.
 [test-groups.recorded-processes]
@@ -28,3 +31,14 @@ threads-required = "num-cpus"
 [[profile.default.overrides]]
 filter = 'binary(cluster_peer_auth_transport_integration)'
 threads-required = "num-cpus"
+
+# Every test sees a short, canonical, private TMPDIR, independent of the
+# host's temporary directory (symlinked on macOS, long under `nix develop`).
+# See scripts/nextest-test-tmpdir.sh.
+[scripts.setup.test-tmpdir]
+command = { command-line = "scripts/nextest-test-tmpdir.sh", relative-to = "workspace-root" }
+
+[[profile.default.scripts]]
+platform = 'cfg(unix)'
+filter = 'all()'
+setup = 'test-tmpdir'
