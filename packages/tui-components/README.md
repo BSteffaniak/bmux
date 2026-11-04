@@ -121,6 +121,22 @@ wheel over the calendar change the viewed month, and the wheel over a time
 field changes it. Outcomes are `Changed(value)`, `Submitted(value)` (Enter or
 double-click), `Cancelled` (Escape), `Redraw`, or `Ignored`.
 
+`DatePickerPolicy::interactive()` is that compact picker.
+`DatePickerPolicy::full()` adds a text field above the calendar that parses
+as you type (`2026-11-04 14:30`, `2026-11-04T14:30:05`, `14:30`, and `now`,
+`today`, `yesterday` or `tomorrow`, optionally followed by a time) and moves
+the calendar and time with it. A line under the field shows the value readably
+("We 4 Nov 2026, 14:30:05"), or why the text is not a value yet. The full
+picker also adds `«` / `»` year arrows, a month grid (click the title or press
+`m`), ▲ / ▼ buttons on each time field, and Now, Today, Cancel and OK
+buttons.
+Each policy flag can also be enabled on its own. With `offsets`, the field
+accepts a UTC offset (`+02:00`, `Z`) and `DatePickerState::offset` returns it.
+Relative words and the Now and Today buttons use the clock the caller passes
+to `DatePickerState::set_now`, so hosts choose the time zone. While typed text
+is not a value, `DatePickerState::text_pending` is true, and the picker does
+not submit it. `DatePicker::hints` lists the focused part's keys.
+
 ## Bordered panels
 
 Use `pane::PaneComponent` with a `pane::Pane` configuration and a content child

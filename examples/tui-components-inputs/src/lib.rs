@@ -234,7 +234,7 @@ fn render_inputs_with_state(cx: &mut PaintCx<'_, '_>, demo: &InputsDemo) {
     let component = SelectDropdownComponent::new("inputs.select", &options, &select_state);
     paint_component(cx, SELECT_AREA, &component);
 
-    let date_state = std::cell::Cell::new(*date);
+    let date_state = std::cell::RefCell::new(date.clone());
     let component = DatePickerComponent::new("inputs.date", date_picker(), &date_state);
     paint_component(cx, DATE_AREA, &component);
 
