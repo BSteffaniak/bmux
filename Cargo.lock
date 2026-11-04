@@ -3433,6 +3433,7 @@ dependencies = [
  "bmux_terminal_grid",
  "bmux_text_edit 0.0.1-alpha.4",
  "bmux_tui 0.0.1-alpha.4",
+ "chrono",
  "serde",
  "serde_json",
  "unicode-segmentation",
@@ -3462,6 +3463,7 @@ dependencies = [
  "bmux_text_edit 0.0.1-alpha.4",
  "bmux_tui 0.0.1-alpha.4",
  "bmux_tui_components 0.0.1-alpha.4",
+ "chrono",
 ]
 
 [[package]]

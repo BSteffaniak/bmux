@@ -43,6 +43,8 @@ pub mod common;
 pub mod compact;
 #[cfg(feature = "completion")]
 pub mod completion;
+#[cfg(feature = "date-picker")]
+pub mod date_picker;
 #[cfg(feature = "dialog")]
 pub mod dialog;
 #[cfg(feature = "diff-viewer")]

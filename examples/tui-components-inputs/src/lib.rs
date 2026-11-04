@@ -8,6 +8,10 @@ use bmux_tui::geometry::{Point, Rect};
 use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::prelude::Line;
 use bmux_tui_components::checkbox::{Checkbox, CheckboxComponent, CheckboxOutcome, CheckboxState};
+use bmux_tui_components::date_picker::{
+    DatePicker, DatePickerComponent, DatePickerMode, DatePickerOutcome, DatePickerPolicy,
+    DatePickerState,
+};
 use bmux_tui_components::form::{Form, FormFieldItem, FormOutcome, FormState};
 use bmux_tui_components::radio_group::{
     RadioGroup, RadioGroupComponent, RadioGroupOutcome, RadioGroupState, RadioOption,
@@ -28,6 +32,9 @@ const TEXT_CONTENT_AREA: Rect = Rect::new(3, 3, 30, 1);
 const CHECKBOX_AREA: Rect = Rect::new(1, 6, 30, 1);
 const RADIO_AREA: Rect = Rect::new(1, 8, 18, 2);
 const SELECT_AREA: Rect = Rect::new(38, 1, 24, 3);
+const MESSAGE_AREA: Rect = Rect::new(38, 5, 32, 1);
+const DATE_AREA: Rect = Rect::new(38, 6, 20, 10);
+const CONTROL_COUNT: usize = 5;
 
 pub struct InputsDemo {
     text_policy: TextInputPolicy,
@@ -35,6 +42,7 @@ pub struct InputsDemo {
     checkbox: CheckboxState,
     radio: RadioGroupState,
     select: SelectDropdownState,
+    date: DatePickerState,
     form: FormState,
     message: String,
 }
@@ -53,21 +61,14 @@ impl InputsDemo {
             checkbox,
             radio: RadioGroupState::new(Some(1)),
             select: SelectDropdownState::new(Some(1)),
+            date: DatePickerState::with_today(demo_date_time(), demo_date_time().date()),
             form: FormState::new(Some(0)),
             message: "Click controls or Tab through them; q quits".to_string(),
         }
     }
 
     pub fn render(&self, cx: &mut PaintCx<'_, '_>) {
-        render_inputs_with_state(
-            cx,
-            &self.text,
-            &self.checkbox,
-            &self.radio,
-            &self.select,
-            self.focused_index(),
-            &self.message,
-        );
+        render_inputs_with_state(cx, self);
     }
 
     pub fn handle_event(&mut self, event: &Event) -> bool {
@@ -75,6 +76,7 @@ impl InputsDemo {
             return true;
         }
         if matches!(event, Event::Key(stroke) if stroke.key == KeyCode::Tab && stroke.modifiers.is_empty())
+            && !(self.focused_index() == 4 && self.handle_date_event(event))
         {
             self.advance_focus();
             return false;
@@ -87,9 +89,24 @@ impl InputsDemo {
             1 => self.handle_checkbox_event(event),
             2 => self.handle_radio_event(event),
             3 => self.handle_select_event(event),
+            4 => {
+                let _ = self.handle_date_event(event);
+            }
             _ => {}
         }
         false
+    }
+
+    /// Route one event to the date picker, returning whether it was handled.
+    fn handle_date_event(&mut self, event: &Event) -> bool {
+        match date_picker().handle_event(DATE_AREA, &mut self.date, event) {
+            DatePickerOutcome::Changed(value) => self.message = format!("Date: {value}"),
+            DatePickerOutcome::Submitted(value) => self.message = format!("Submitted: {value}"),
+            DatePickerOutcome::Cancelled => self.message = "Date cancelled".to_string(),
+            DatePickerOutcome::Redraw => {}
+            DatePickerOutcome::Ignored => return false,
+        }
+        true
     }
 
     fn handle_text_event(&mut self, event: &Event) {
@@ -138,7 +155,7 @@ impl InputsDemo {
     }
 
     fn advance_focus(&mut self) {
-        let next = (self.focused_index() + 1) % 4;
+        let next = (self.focused_index() + 1) % CONTROL_COUNT;
         self.set_focus(next);
     }
 
@@ -147,6 +164,7 @@ impl InputsDemo {
         self.radio
             .set_focused((focus == 2).then_some(self.radio.selected().unwrap_or(0)));
         self.select.interaction.focused = focus == 3;
+        self.date.interaction.focused = focus == 4;
         if focus != 3 {
             self.select.set_open(false);
         }
@@ -181,15 +199,17 @@ fn paint_component(cx: &mut PaintCx<'_, '_>, area: Rect, component: &impl Compon
     );
 }
 
-fn render_inputs_with_state(
-    cx: &mut PaintCx<'_, '_>,
-    text: &TextInputState,
-    checkbox: &CheckboxState,
-    radio: &RadioGroupState,
-    select: &SelectDropdownState,
-    focused: usize,
-    message: &str,
-) {
+fn render_inputs_with_state(cx: &mut PaintCx<'_, '_>, demo: &InputsDemo) {
+    let InputsDemo {
+        text,
+        checkbox,
+        radio,
+        select,
+        date,
+        message,
+        ..
+    } = demo;
+    let focused = demo.focused_index();
     let text_state = std::cell::RefCell::new(text.clone());
     let component =
         TextInputBoxComponent::new("inputs.name", TextInputPolicy::chat_composer(), &text_state)
@@ -214,7 +234,14 @@ fn render_inputs_with_state(
     let component = SelectDropdownComponent::new("inputs.select", &options, &select_state);
     paint_component(cx, SELECT_AREA, &component);
 
-    cx.write_line(LocalRect::new(38, 6, 32, 1), &Line::from(message));
+    let date_state = std::cell::Cell::new(*date);
+    let component = DatePickerComponent::new("inputs.date", date_picker(), &date_state);
+    paint_component(cx, DATE_AREA, &component);
+
+    cx.write_line(
+        LocalRect::terminal(MESSAGE_AREA),
+        &Line::from(message.as_str()),
+    );
 }
 
 pub fn demonstrate_text_input_edit() -> String {
@@ -293,6 +320,16 @@ pub fn demonstrate_click_text_focuses() -> usize {
     demo.focused_index()
 }
 
+/// Click November 12 in the date picker, then press Right.
+pub fn demonstrate_date_picker_click_and_key() -> String {
+    let mut demo = InputsDemo::new();
+    // Grid row 2, column 3 of the Monday-first November 2026 calendar.
+    let position = Point::new(DATE_AREA.x + 9, DATE_AREA.y + 4);
+    let _ = demo.handle_event(&mouse_down(position));
+    let _ = demo.handle_event(&Event::Key(KeyStroke::simple(KeyCode::Right)));
+    demo.date.value().to_string()
+}
+
 pub fn rows(buffer: &Buffer) -> Vec<String> {
     (0..buffer.area().height)
         .filter_map(|row| buffer.row_symbols(row))
@@ -311,6 +348,22 @@ fn select_options() -> [SelectOption; 2] {
         SelectOption::new("draft", "Draft"),
         SelectOption::new("published", "Published"),
     ]
+}
+
+/// Date-time picker that leaves the last Tab to the demo's focus traversal.
+fn date_picker() -> DatePicker<'static> {
+    DatePicker::new(DatePickerMode::DateTime).policy(DatePickerPolicy {
+        tab_wraps: false,
+        ..DatePickerPolicy::interactive()
+    })
+}
+
+/// Fixed demo value so rendering stays deterministic; real applications pass
+/// the current local date as "today".
+fn demo_date_time() -> chrono::NaiveDateTime {
+    chrono::NaiveDate::from_ymd_opt(2026, 11, 4)
+        .and_then(|date| date.and_hms_opt(14, 30, 0))
+        .unwrap_or_default()
 }
 
 fn focus_for_mouse_event(event: &Event) -> Option<usize> {
@@ -332,6 +385,8 @@ fn control_at(position: Point) -> Option<usize> {
         Some(2)
     } else if SELECT_AREA.contains(position) {
         Some(3)
+    } else if DATE_AREA.contains(position) {
+        Some(4)
     } else {
         None
     }
@@ -374,6 +429,8 @@ mod tests {
         assert!(rendered.contains("Ada"));
         assert!(rendered.contains("[x] Subscribe"));
         assert!(rendered.contains("Published"));
+        assert!(rendered.contains("November 2026"));
+        assert!(rendered.contains("14 : 30"));
     }
 
     #[test]
@@ -388,6 +445,14 @@ mod tests {
         assert_eq!(
             demonstrate_form_validation_errors(),
             FormOutcome::ValidationFailed(vec![1])
+        );
+    }
+
+    #[test]
+    fn date_picker_takes_focus_and_keys() {
+        assert_eq!(
+            super::demonstrate_date_picker_click_and_key(),
+            "2026-11-13 14:30:00"
         );
     }
 

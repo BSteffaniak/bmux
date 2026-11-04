@@ -22,6 +22,7 @@ bmux_text_edit = { workspace = true, features = [
     "serde",
 ], optional = true }
 bmux_tui = { workspace = true }
+chrono = { workspace = true, features = ["serde"], optional = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 unicode-segmentation = { workspace = true, optional = true }
@@ -50,6 +51,7 @@ chart = ["dep:unicode-segmentation"]
 checkbox = ["keyboard-input"]
 compact = ["dep:unicode-segmentation", "dep:unicode-width"]
 completion = ["text-input", "selectable-list", "picker-frame"]
+date-picker = ["keyboard-input", "dep:bmux_text_edit", "dep:chrono"]
 dialog = ["action-row", "modal-frame"]
 diff-viewer = ["source-viewer", "dep:unicode-segmentation", "dep:unicode-width"]
 empty-state = []
@@ -103,6 +105,7 @@ all = [
     "chart",
     "compact",
     "checkbox",
+    "date-picker",
     "dialog",
     "diff-viewer",
     "empty-state",
@@ -155,6 +158,7 @@ forms = [
     "action-row",
     "split-button",
     "checkbox",
+    "date-picker",
     "form",
     "form-field",
     "radio-group",

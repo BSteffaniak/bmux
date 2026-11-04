@@ -101,6 +101,26 @@ or redraw states. A click outside or Escape closes the menu, and `alt+↓` opens
 it from a focused button. `split_button::choice(id, label, checked)` builds
 check-marked items for mutually exclusive choices.
 
+## Date pickers
+
+`date_picker::DatePicker` (feature `date-picker`) edits a `chrono` date,
+date-time, or time (`DatePickerMode::{Date, DateTime, Time}`), with optional
+seconds and a Monday or Sunday week start. It renders a `‹ November 2026 ›`
+header, a weekday row, a six-week grid (outside days dimmed, today marked, the
+selection highlighted), and an `HH : MM : SS` row. The caller owns
+`DatePickerState`, including the "today" reference passed to
+`DatePickerState::with_today`; painting never reads the clock.
+`DatePicker::preferred_size` returns the natural size for anchoring the picker
+as a popup with `Rect::popup`.
+
+Arrows move by day/week, PageUp/PageDown by month (with Shift, by year),
+Home/End jump to the month's ends, and `t` jumps to today. Tab/Shift+Tab move
+between the calendar and the time fields, where Up/Down wrap and digits type
+values. Clicking a day selects it, double-clicking submits, the arrows and the
+wheel over the calendar change the viewed month, and the wheel over a time
+field changes it. Outcomes are `Changed(value)`, `Submitted(value)` (Enter or
+double-click), `Cancelled` (Escape), `Redraw`, or `Ignored`.
+
 ## Bordered panels
 
 Use `pane::PaneComponent` with a `pane::Pane` configuration and a content child
