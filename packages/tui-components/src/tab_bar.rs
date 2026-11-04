@@ -29,6 +29,9 @@ pub struct TabItem<'a> {
     pub label: Line,
     /// Whether this tab is disabled.
     pub disabled: bool,
+    /// Whether this tab shows a close button after its label (see
+    /// [`TabBarPolicy::close_label`] and [`TabBar::close_rects`]).
+    pub closable: bool,
 }
 
 impl<'a> TabItem<'a> {
@@ -39,6 +42,7 @@ impl<'a> TabItem<'a> {
             id,
             label: Line::from(label),
             disabled: false,
+            closable: false,
         }
     }
 
@@ -49,6 +53,7 @@ impl<'a> TabItem<'a> {
             id,
             label,
             disabled: false,
+            closable: false,
         }
     }
 
@@ -62,6 +67,13 @@ impl<'a> TabItem<'a> {
     #[must_use]
     pub const fn disabled(mut self, disabled: bool) -> Self {
         self.disabled = disabled;
+        self
+    }
+
+    /// Return this item with a close button (or without one).
+    #[must_use]
+    pub const fn closable(mut self, closable: bool) -> Self {
+        self.closable = closable;
         self
     }
 }
@@ -129,6 +141,9 @@ pub struct TabBarPolicy {
     pub padding_left: &'static str,
     /// Right padding for each tab label.
     pub padding_right: &'static str,
+    /// Close button drawn after the label of closable tabs, before the right
+    /// padding.
+    pub close_label: &'static str,
 }
 
 impl TabBarPolicy {
@@ -142,6 +157,7 @@ impl TabBarPolicy {
             separator: " ",
             padding_left: " ",
             padding_right: " ",
+            close_label: DEFAULT_CLOSE_LABEL,
         }
     }
 
@@ -155,6 +171,7 @@ impl TabBarPolicy {
             separator: " ",
             padding_left: " ",
             padding_right: " ",
+            close_label: DEFAULT_CLOSE_LABEL,
         }
     }
     /// Return this policy with custom separator.
@@ -171,7 +188,17 @@ impl TabBarPolicy {
         self.padding_right = right;
         self
     }
+
+    /// Return this policy with a custom close button for closable tabs.
+    #[must_use]
+    pub const fn close_label(mut self, label: &'static str) -> Self {
+        self.close_label = label;
+        self
+    }
 }
+
+/// Close button drawn by default on closable tabs.
+const DEFAULT_CLOSE_LABEL: &str = " ×";
 
 impl Default for TabBarPolicy {
     fn default() -> Self {
@@ -224,6 +251,9 @@ pub struct TabBarState {
     selected: Option<usize>,
     hovered: Option<usize>,
     pressed: Option<usize>,
+    /// Whether the press began on the pressed tab's close button.
+    #[serde(default)]
+    close_pressed: bool,
     /// Generic interaction flags.
     pub interaction: InteractionState,
 }
@@ -255,6 +285,7 @@ impl TabBarState {
             selected,
             hovered: None,
             pressed: None,
+            close_pressed: false,
             interaction: InteractionState::new(),
         }
     }
@@ -291,6 +322,8 @@ pub enum TabBarOutcome {
     Redraw,
     /// Selection changed to tab index.
     Selected(usize),
+    /// The close button of the closable tab at this index was clicked.
+    Close(usize),
 }
 
 /// Canonical component-lifecycle tab bar.
@@ -346,7 +379,9 @@ impl Component for TabBarComponent<'_, '_> {
         for item in self.bar.items {
             item.id.hash(&mut layout);
             format!("{:?}", item.label).hash(&mut layout);
+            item.closable.hash(&mut layout);
         }
+        self.bar.policy.close_label.hash(&mut layout);
         self.bar.policy.separator.hash(&mut layout);
         self.bar.policy.padding_left.hash(&mut layout);
         self.bar.policy.padding_right.hash(&mut layout);
@@ -459,10 +494,31 @@ impl Component for TabBarComponent<'_, '_> {
                     ))
                     .contains(mouse.position)
                 });
+            let on_close = hit.is_some_and(|index| {
+                self.bar
+                    .close_rects(Rect::new(
+                        0,
+                        0,
+                        layout.size.width.try_into().unwrap_or(u16::MAX),
+                        1,
+                    ))
+                    .get(index)
+                    .copied()
+                    .flatten()
+                    .is_some_and(|rect| {
+                        cx.visible_rect(bmux_tui::component::LogicalRect::new(
+                            rect.x.into(),
+                            u64::try_from(usize::from(rect.y)).unwrap_or(u64::MAX),
+                            u64::try_from(usize::from(rect.width)).unwrap_or(u64::MAX),
+                            u64::try_from(usize::from(rect.height)).unwrap_or(u64::MAX),
+                        ))
+                        .contains(mouse.position)
+                    })
+            });
             let outcome = if state.interaction.disabled || !self.bar.policy.mouse.enabled {
                 TabBarOutcome::Ignored
             } else {
-                self.bar.handle_mouse_hit(&mut state, *mouse, hit)
+                self.bar.handle_mouse_hit(&mut state, *mouse, hit, on_close)
             };
             if outcome == TabBarOutcome::Ignored {
                 fallback
@@ -474,7 +530,9 @@ impl Component for TabBarComponent<'_, '_> {
         };
         match outcome {
             TabBarOutcome::Ignored => EventOutcome::Ignored,
-            TabBarOutcome::Redraw | TabBarOutcome::Selected(_) => EventOutcome::Redraw,
+            TabBarOutcome::Redraw | TabBarOutcome::Selected(_) | TabBarOutcome::Close(_) => {
+                EventOutcome::Redraw
+            }
         }
     }
 }
@@ -508,6 +566,7 @@ impl<'a> TabBar<'a> {
                 separator: " ",
                 padding_left: " ",
                 padding_right: " ",
+                close_label: DEFAULT_CLOSE_LABEL,
             },
             styles: TabBarStyles {
                 normal: Style::new(),
@@ -551,6 +610,32 @@ impl<'a> TabBar<'a> {
         rects
     }
 
+    /// Return the close button rectangle of each tab in `area` (`None` for
+    /// tabs that are not closable). A button spans its close label and the
+    /// tab's right padding, for a larger target.
+    #[must_use]
+    pub fn close_rects(&self, area: Rect) -> Vec<Option<Rect>> {
+        let width = u16_saturating(
+            display_width(self.policy.close_label)
+                .saturating_add(display_width(self.policy.padding_right)),
+        );
+        self.items
+            .iter()
+            .zip(self.hit_rects(area))
+            .map(|(item, rect)| {
+                item.closable.then(|| {
+                    let width = width.min(rect.width);
+                    Rect::new(
+                        rect.right().saturating_sub(width),
+                        rect.y,
+                        width,
+                        rect.height,
+                    )
+                })
+            })
+            .collect()
+    }
+
     /// Return unstyled rendered text.
     #[must_use]
     pub fn text(&self) -> String {
@@ -558,9 +643,14 @@ impl<'a> TabBar<'a> {
             .iter()
             .map(|item| {
                 format!(
-                    "{}{}{}",
+                    "{}{}{}{}",
                     self.policy.padding_left,
                     item.label.plain_text(),
+                    if item.closable {
+                        self.policy.close_label
+                    } else {
+                        ""
+                    },
                     self.policy.padding_right
                 )
             })
@@ -652,6 +742,9 @@ impl<'a> TabBar<'a> {
                     .iter()
                     .map(|span| Span::styled(span.content.clone(), style.patch(span.style))),
             );
+            if item.closable {
+                spans.push(Span::styled(self.policy.close_label, style));
+            }
             spans.push(Span::styled(self.policy.padding_right, style));
         }
         Line::from_spans(spans)
@@ -682,14 +775,25 @@ impl<'a> TabBar<'a> {
         mouse: MouseEvent,
     ) -> TabBarOutcome {
         let hit = self.hit_index(area, mouse.position.x, mouse.position.y);
-        self.handle_mouse_hit(state, mouse, hit)
+        let on_close = hit.is_some_and(|index| {
+            self.close_rects(area)
+                .get(index)
+                .copied()
+                .flatten()
+                .is_some_and(|rect| rect.contains(mouse.position))
+        });
+        self.handle_mouse_hit(state, mouse, hit, on_close)
     }
 
+    /// Route a mouse event that hit tab `hit`; `on_close` says whether it
+    /// was on that tab's close button. A release on the close button the
+    /// press began on closes the tab instead of selecting it.
     fn handle_mouse_hit(
         &self,
         state: &mut TabBarState,
         mouse: MouseEvent,
         hit: Option<usize>,
+        on_close: bool,
     ) -> TabBarOutcome {
         match mouse.kind {
             MouseEventKind::Move if self.policy.mouse.hover => {
@@ -705,6 +809,7 @@ impl<'a> TabBar<'a> {
                 let pressed = hit.filter(|index| !self.items[*index].disabled);
                 let previous = state.pressed;
                 state.pressed = pressed;
+                state.close_pressed = pressed.is_some() && on_close;
                 if pressed.is_some() || previous != pressed {
                     TabBarOutcome::Redraw
                 } else {
@@ -713,11 +818,19 @@ impl<'a> TabBar<'a> {
             }
             MouseEventKind::Up(MouseButton::Left) => {
                 let pressed = state.pressed.take();
+                let close_pressed = std::mem::take(&mut state.close_pressed);
                 if self.policy.mouse.click
                     && let (Some(pressed), Some(hit)) = (pressed, hit)
                     && pressed == hit
                     && !self.items[hit].disabled
                 {
+                    if close_pressed {
+                        return if on_close {
+                            TabBarOutcome::Close(hit)
+                        } else {
+                            TabBarOutcome::Redraw
+                        };
+                    }
                     state.selected = Some(hit);
                     return TabBarOutcome::Selected(hit);
                 }
@@ -817,6 +930,11 @@ fn next_enabled(
 fn tab_label_width_with_policy(item: &TabItem<'_>, policy: TabBarPolicy) -> usize {
     display_width(policy.padding_left)
         .saturating_add(display_width(&item.label.plain_text()))
+        .saturating_add(if item.closable {
+            display_width(policy.close_label)
+        } else {
+            0
+        })
         .saturating_add(display_width(policy.padding_right))
 }
 
@@ -1696,6 +1814,57 @@ mod focus_visual_tests {
         let after = component.revision();
         assert_eq!(before.layout, after.layout);
         assert_ne!(before.paint, after.paint);
+    }
+}
+
+#[cfg(test)]
+mod close_tests {
+    use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
+    use bmux_tui::geometry::{Point, Rect};
+
+    use super::{TabBar, TabBarOutcome, TabBarState, TabItem};
+
+    fn click(bar: &TabBar<'_>, state: &mut TabBarState, area: Rect, x: u16) -> TabBarOutcome {
+        let at = |kind| Event::Mouse(MouseEvent::new(kind, Point::new(x, 0)));
+        bar.handle_event(area, state, &at(MouseEventKind::Down(MouseButton::Left)));
+        bar.handle_event(area, state, &at(MouseEventKind::Up(MouseButton::Left)))
+    }
+
+    #[test]
+    fn closable_tabs_draw_and_hit_test_a_close_button() {
+        let items = [
+            TabItem::new("one", "One").closable(true),
+            TabItem::new("two", "Two"),
+        ];
+        let bar = TabBar::new(&items);
+        assert_eq!(bar.text(), " One ×   Two ");
+        let area = Rect::new(0, 0, 20, 1);
+        assert_eq!(bar.hit_rects(area)[0], Rect::new(0, 0, 7, 1));
+        assert_eq!(
+            bar.close_rects(area),
+            vec![Some(Rect::new(4, 0, 3, 1)), None]
+        );
+
+        let mut state = TabBarState::new(Some(1));
+        assert_eq!(click(&bar, &mut state, area, 5), TabBarOutcome::Close(0));
+        assert_eq!(state.selected(), Some(1), "closing does not select");
+        assert_eq!(click(&bar, &mut state, area, 1), TabBarOutcome::Selected(0));
+
+        // A press on the button released on the label does neither.
+        let at = |kind, x| Event::Mouse(MouseEvent::new(kind, Point::new(x, 0)));
+        bar.handle_event(
+            area,
+            &mut state,
+            &at(MouseEventKind::Down(MouseButton::Left), 5),
+        );
+        assert_eq!(
+            bar.handle_event(
+                area,
+                &mut state,
+                &at(MouseEventKind::Up(MouseButton::Left), 1)
+            ),
+            TabBarOutcome::Redraw
+        );
     }
 }
 
