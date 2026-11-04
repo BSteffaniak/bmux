@@ -130,7 +130,10 @@ the calendar and time with it. A line under the field shows the value readably
 picker also adds `«` / `»` year arrows, a month grid (click the title or press
 `m`), ▲ / ▼ buttons on each time field, and Now, Today, Cancel and OK
 buttons.
-Each policy flag can also be enabled on its own. With `offsets`, the field
+Each policy flag can also be enabled on its own. The full picker fills the
+width it is given (`DatePicker::size_for_width`); from `SIDE_BY_SIDE_WIDTH`
+columns a date-time picker puts the time, Now and Today beside the calendar
+rather than under it. With `offsets`, the field
 accepts a UTC offset (`+02:00`, `Z`) and `DatePickerState::offset` returns it.
 Relative words and the Now and Today buttons use the clock the caller passes
 to `DatePickerState::set_now`, so hosts choose the time zone. While typed text

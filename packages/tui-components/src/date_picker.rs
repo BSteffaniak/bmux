@@ -100,8 +100,18 @@ const MONTH_ROWS: u16 = 4;
 const MONTH_STRIDE: u16 = 7;
 /// Width of one month cell.
 const MONTH_WIDTH: u16 = 6;
-/// Column of the hour field in the full layout's time row.
+/// Column of the hour field in the full layout's time row (after the
+/// `Time` label).
 const FULL_TIME_X: u16 = 6;
+/// Columns between the calendar and the time beside it.
+const SIDE_GAP: u16 = 6;
+/// Width of the time block beside the calendar (`[ Now ] [ Today ]`).
+const SIDE_BLOCK: u16 = 17;
+/// Width from which the full date-time picker puts the time beside the
+/// calendar.
+pub const SIDE_BY_SIDE_WIDTH: u16 = CALENDAR_WIDTH + SIDE_GAP + SIDE_BLOCK;
+/// Column offsets of the time fields in the full layout's `HH:MM:SS`.
+const TIGHT_TIME_OFFSETS: [u16; 3] = [0, 3, 6];
 /// Label before the time fields in the full layout.
 const TIME_LABEL: &str = "Time";
 const NOW_LABEL: &str = "[ Now ]";
@@ -825,7 +835,17 @@ impl<'a> DatePicker<'a> {
     /// popup with [`Rect::popup`].
     #[must_use]
     pub const fn preferred_size(&self) -> Size {
-        let layout = self.layout();
+        let layout = self.layout_for(FULL_WIDTH);
+        Size::new(layout.width, layout.height)
+    }
+
+    /// Return the size the picker takes in `width` columns: the full layout
+    /// fills the width (its text field spans it) and, from
+    /// [`SIDE_BY_SIDE_WIDTH`], puts the time beside the calendar. The compact
+    /// layout keeps its natural size.
+    #[must_use]
+    pub const fn size_for_width(&self, width: u16) -> Size {
+        let layout = self.layout_for(width);
         Size::new(layout.width, layout.height)
     }
 
@@ -904,9 +924,6 @@ impl<'a> DatePicker<'a> {
                 }
             }
         }
-        if self.policy.tab_cycles && self.parts().len() > 1 {
-            hints.push(("Tab", "next part"));
-        }
         hints
     }
 
@@ -960,10 +977,28 @@ impl<'a> DatePicker<'a> {
             }
         }
         if let Some(row) = geometry.time_row() {
-            write(row, &self.time_line(state, geometry));
+            // From the time's own column: beside the calendar it shares rows.
+            let block = geometry.time_block(row);
+            write(block, &self.time_line(state, geometry));
             if geometry.layout.time_buttons {
-                write(row.shifted(-1), &self.spin_line(state, geometry, true));
-                write(row.shifted(1), &self.spin_line(state, geometry, false));
+                write(block.shifted(-1), &self.spin_line(state, geometry, true));
+                write(block.shifted(1), &self.spin_line(state, geometry, false));
+            }
+            if let Some(buttons) = geometry.layout.now_row {
+                let y = geometry.area.y.saturating_add(buttons);
+                write(
+                    Rect::new(block.x, y, block.width, 1),
+                    &self.buttons_line(state, geometry),
+                );
+            }
+            if let Some(label) = geometry.time_label() {
+                write(
+                    label,
+                    &Line::from_spans(vec![Span::styled(
+                        TIME_LABEL,
+                        self.enabled(state, self.styles.hint),
+                    )]),
+                );
             }
         }
         if let Some(row) = geometry.footer_row() {
@@ -1712,16 +1747,23 @@ impl<'a> DatePicker<'a> {
 
     // ---- rendering helpers ---------------------------------------------
 
-    const fn time_width(&self) -> u16 {
-        if self.show_seconds {
-            TIME_FIELD_OFFSETS[2] + DAY_WIDTH
+    const fn time_width(&self, tight: bool) -> u16 {
+        let offsets = if tight {
+            TIGHT_TIME_OFFSETS
         } else {
-            TIME_FIELD_OFFSETS[1] + DAY_WIDTH
+            TIME_FIELD_OFFSETS
+        };
+        if self.show_seconds {
+            offsets[2] + DAY_WIDTH
+        } else {
+            offsets[1] + DAY_WIDTH
         }
     }
 
-    /// Row offsets of each section, from the policy and mode.
-    const fn layout(&self) -> Layout {
+    /// Row and column offsets of each section in `width` columns, from the
+    /// policy and mode.
+    #[allow(clippy::too_many_lines)] // One branch per arrangement.
+    const fn layout_for(&self, width: u16) -> Layout {
         let has_date = self.mode.has_date();
         let has_time = self.mode.has_time();
         if !self.policy.wide() {
@@ -1729,7 +1771,7 @@ impl<'a> DatePicker<'a> {
                 width: if has_date {
                     CALENDAR_WIDTH
                 } else {
-                    self.time_width()
+                    self.time_width(false)
                 },
                 height: match self.mode {
                     DatePickerMode::Date => CALENDAR_HEIGHT,
@@ -1746,59 +1788,95 @@ impl<'a> DatePicker<'a> {
                     DatePickerMode::Time => Some(0),
                 },
                 time_x: None,
+                time_label: None,
+                tight_time: false,
                 time_buttons: false,
                 year_arrows: false,
+                now_row: None,
                 footer: None,
-                today: false,
+                today: TodayPlace::None,
                 buttons: false,
             };
         }
+        let width = if width > FULL_WIDTH {
+            width
+        } else {
+            FULL_WIDTH
+        };
+        let side = has_date && has_time && width >= SIDE_BY_SIDE_WIDTH;
+        let spin = self.policy.time_buttons;
         let mut y = 0;
         let text = if self.policy.text_input {
-            // Field, status line, blank.
+            // Field, readable value, blank.
             y += 3;
             Some(0)
         } else {
             None
         };
-        let calendar = if has_date {
-            let row = y;
-            y += CALENDAR_HEIGHT;
-            Some(row)
+        // Left-aligned with the field once there is room; centered under it in
+        // the narrow layout.
+        let calendar_x = if width >= SIDE_BY_SIDE_WIDTH {
+            0
         } else {
-            None
+            (width - CALENDAR_WIDTH) / 2
         };
-        let time = if has_time {
+        let calendar = if has_date { Some(y) } else { None };
+        // The time and its buttons: beside the calendar, or under it.
+        let (time, time_x, time_label, now_row) = if !has_time {
+            (None, None, None, None)
+        } else if side {
+            let x = CALENDAR_WIDTH + SIDE_GAP;
+            let value = if spin { y + 2 } else { y + 1 };
+            let buttons = if spin { Some(y + 5) } else { None };
+            (Some(value), Some(x), Some((x, y)), buttons)
+        } else {
             if has_date {
-                y += 1;
+                y += CALENDAR_HEIGHT + 1;
             }
-            if self.policy.time_buttons {
-                y += 3;
-                Some(y - 2)
+            let x = if calendar_x > FULL_TIME_X {
+                calendar_x
             } else {
-                y += 1;
-                Some(y - 1)
-            }
-        } else {
-            None
+                FULL_TIME_X
+            };
+            let value = if spin { y + 1 } else { y };
+            let buttons = if spin { Some(y + 3) } else { None };
+            y += if spin { 4 } else { 1 };
+            (
+                Some(value),
+                Some(x),
+                Some((x - FULL_TIME_X, value)),
+                buttons,
+            )
         };
-        let today = self.policy.today_button && has_date;
-        let footer = if self.policy.footer || today {
+        if side || (has_date && !has_time) {
+            y += CALENDAR_HEIGHT;
+        }
+        let today = if !(self.policy.today_button && has_date) {
+            TodayPlace::None
+        } else if now_row.is_some() {
+            TodayPlace::Buttons
+        } else {
+            TodayPlace::Footer
+        };
+        let footer = if self.policy.footer || matches!(today, TodayPlace::Footer) {
             y += 2;
             Some(y - 1)
         } else {
             None
         };
         Layout {
-            width: FULL_WIDTH,
+            width,
             height: if y == 0 { 1 } else { y },
             text,
             calendar,
-            calendar_x: (FULL_WIDTH - CALENDAR_WIDTH) / 2,
+            calendar_x,
             time,
-            time_x: Some(FULL_TIME_X),
-            time_buttons: self.policy.time_buttons,
+            time_x,
+            time_label,
+            tight_time: true,
+            time_buttons: spin,
             year_arrows: self.policy.year_arrows,
+            now_row,
             footer,
             today,
             buttons: self.policy.footer,
@@ -1806,7 +1884,7 @@ impl<'a> DatePicker<'a> {
     }
 
     const fn geometry(&self, area: Rect) -> Geometry {
-        let layout = self.layout();
+        let layout = self.layout_for(area.width);
         let content_width = if layout.width < area.width {
             layout.width
         } else {
@@ -1816,7 +1894,7 @@ impl<'a> DatePicker<'a> {
             area,
             layout,
             content_width,
-            time_width: self.time_width(),
+            time_width: self.time_width(layout.tight_time),
             show_seconds: self.show_seconds,
         }
     }
@@ -1928,7 +2006,7 @@ impl<'a> DatePicker<'a> {
             )
         };
         let title_rect = geometry.title();
-        let available = usize::from(title_rect.width);
+        let available = usize::from(title_rect.width.saturating_sub(2));
         let title = Line::from_spans(vec![Span::styled(
             title,
             self.hovered(state, Target::Title, header),
@@ -1936,17 +2014,17 @@ impl<'a> DatePicker<'a> {
         .truncate(available);
         let padding = available.saturating_sub(title.width());
         let left = padding / 2;
-        let mut line = Line::new();
-        let lead = usize::from(geometry.prev_month().x - geometry.area.x);
-        if geometry.layout.year_arrows {
-            line.push_span(Span::styled(
-                "«",
-                self.hovered(state, Target::PrevYear, arrow),
-            ));
-            line.push_span(Span::raw(" ".repeat(lead.saturating_sub(1))));
+        let mut line = if geometry.layout.year_arrows {
+            // `«‹` and `›»` at the grid's edges.
+            Line::from_spans(vec![
+                Span::raw(" ".repeat(usize::from(geometry.layout.calendar_x))),
+                Span::styled("«", self.hovered(state, Target::PrevYear, arrow)),
+            ])
         } else {
-            line.push_span(Span::raw(" ".repeat(lead)));
-        }
+            Line::from_spans(vec![Span::raw(" ".repeat(usize::from(
+                geometry.prev_month().x.saturating_sub(geometry.area.x),
+            )))])
+        };
         line.push_span(Span::styled(
             "‹",
             self.hovered(state, Target::PrevMonth, arrow),
@@ -1961,9 +2039,6 @@ impl<'a> DatePicker<'a> {
             self.hovered(state, Target::NextMonth, arrow),
         ));
         if geometry.layout.year_arrows {
-            let gap =
-                usize::from(geometry.next_year().x - geometry.next_month().x).saturating_sub(1);
-            line.push_span(Span::raw(" ".repeat(gap)));
             line.push_span(Span::styled(
                 "»",
                 self.hovered(state, Target::NextYear, arrow),
@@ -2087,19 +2162,10 @@ impl<'a> DatePicker<'a> {
             .focused
             .then(|| self.effective_part(state));
         let separator = self.enabled(state, self.styles.separator);
-        let lead = usize::from(geometry.time_x());
-        let mut line = if geometry.layout.time_x.is_some() && lead > TIME_LABEL.len() {
-            Line::from_spans(vec![
-                Span::styled(TIME_LABEL, self.enabled(state, self.styles.hint)),
-                Span::raw(" ".repeat(lead - TIME_LABEL.len())),
-            ])
-        } else {
-            Line::from_spans(vec![Span::raw(" ".repeat(lead))])
-        };
-        let parts = self.time_parts();
-        for (index, part) in parts.iter().enumerate() {
+        let mut line = Line::new();
+        for (index, part) in self.time_parts().iter().enumerate() {
             if index > 0 {
-                line.push_span(Span::styled(TIME_SEPARATOR, separator));
+                line.push_span(Span::styled(geometry.time_separator(), separator));
             }
             let style = if disabled {
                 self.styles.disabled
@@ -2113,34 +2179,53 @@ impl<'a> DatePicker<'a> {
                 style,
             ));
         }
-        if geometry.layout.time_buttons {
-            line.push_span(Span::raw("  "));
-            line.push_span(Span::styled(
-                NOW_LABEL,
-                self.hovered(state, Target::Now, self.enabled(state, self.styles.button)),
-            ));
+        line
+    }
+
+    /// The Now (and Today) buttons under the time.
+    fn buttons_line(&self, state: &DatePickerState, geometry: Geometry) -> Line {
+        let button = self.enabled(state, self.styles.button);
+        let mut line = Line::new();
+        let mut x = geometry.area.x.saturating_add(geometry.time_x());
+        for (rect, label, target) in [
+            (geometry.now_button(), NOW_LABEL, Target::Now),
+            (
+                geometry
+                    .today_button()
+                    .filter(|_| matches!(geometry.layout.today, TodayPlace::Buttons)),
+                TODAY_LABEL,
+                Target::Today,
+            ),
+        ] {
+            let Some(rect) = rect else { continue };
+            line.push_span(Span::raw(" ".repeat(usize::from(rect.x.saturating_sub(x)))));
+            line.push_span(Span::styled(label, self.hovered(state, target, button)));
+            x = rect.right();
         }
         line
     }
 
-    /// The ▲ row above (or ▼ row below) the time fields.
     fn spin_line(&self, state: &DatePickerState, geometry: Geometry, up: bool) -> Line {
         let arrow = self.enabled(state, self.styles.arrow);
-        let mut line =
-            Line::from_spans(vec![Span::raw(" ".repeat(usize::from(geometry.time_x())))]);
-        for (index, part) in self.time_parts().iter().enumerate() {
-            if index > 0 {
-                line.push_span(Span::raw(" ".repeat(TIME_SEPARATOR.len())));
-            }
+        let mut line = Line::new();
+        let mut x = geometry.area.x.saturating_add(geometry.time_x());
+        for part in self.time_parts() {
+            let Some(field) = geometry.time_field_rect(*part) else {
+                continue;
+            };
             let target = if up {
                 Target::Up(*part)
             } else {
                 Target::Down(*part)
             };
+            line.push_span(Span::raw(
+                " ".repeat(usize::from(field.x.saturating_sub(x))),
+            ));
             line.push_span(Span::styled(
                 if up { "▲ " } else { "▼ " },
                 self.hovered(state, target, arrow),
             ));
+            x = field.right();
         }
         line
     }
@@ -2154,7 +2239,10 @@ impl<'a> DatePicker<'a> {
             line.push_span(Span::styled(label, self.hovered(state, target, button)));
             x = rect.right();
         };
-        if let Some(rect) = geometry.today_button() {
+        if let Some(rect) = geometry
+            .today_button()
+            .filter(|_| matches!(geometry.layout.today, TodayPlace::Footer))
+        {
             push(&mut line, rect, TODAY_LABEL, Target::Today);
         }
         if let Some((cancel, ok)) = geometry.footer_buttons() {
@@ -2208,29 +2296,46 @@ const fn text_scroll(cursor: usize, len: usize, inner: usize, typed: bool) -> us
     }
 }
 
-/// Row offsets of the picker's sections, relative to its top-left corner.
+/// Row and column offsets of the picker's sections, relative to its
+/// top-left corner.
 #[derive(Debug, Clone, Copy)]
 #[allow(clippy::struct_excessive_bools)] // Independent sections of one layout.
 struct Layout {
     width: u16,
     height: u16,
-    /// Row of the text field (the status line is the next row).
+    /// Row of the text field (the readable value is the next row).
     text: Option<u16>,
     /// Row of the month header.
     calendar: Option<u16>,
-    /// Column of the calendar's first day cell.
+    /// Column of the calendar's first day cell (and of its header).
     calendar_x: u16,
     /// Row of the time values.
     time: Option<u16>,
     /// Column of the hour field; `None` centers the fields.
     time_x: Option<u16>,
-    /// ▲ / ▼ rows around the time row, and the Now button.
+    /// Where the `Time` label goes, as `(column, row)`.
+    time_label: Option<(u16, u16)>,
+    /// `HH:MM:SS` rather than `HH : MM : SS`.
+    tight_time: bool,
+    /// ▲ / ▼ rows around the time row.
     time_buttons: bool,
     year_arrows: bool,
+    /// Row of the Now (and Today) buttons, under the time.
+    now_row: Option<u16>,
     /// Row of the Today / Cancel / OK buttons.
     footer: Option<u16>,
-    today: bool,
+    today: TodayPlace,
     buttons: bool,
+}
+
+/// Where the Today button goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TodayPlace {
+    None,
+    /// Beside Now, under the time.
+    Buttons,
+    /// On the footer row (no time buttons to share).
+    Footer,
 }
 
 /// Resolved picker geometry for one area.
@@ -2293,7 +2398,7 @@ impl Geometry {
 
     const fn prev_year(self) -> Rect {
         if self.layout.calendar.is_some() && self.layout.year_arrows {
-            cell(self.area.x, self.header_y(), 2)
+            cell(self.calendar_x(), self.header_y(), 1)
         } else {
             Rect::new(0, 0, 0, 0)
         }
@@ -2302,11 +2407,9 @@ impl Geometry {
     const fn next_year(self) -> Rect {
         if self.layout.calendar.is_some() && self.layout.year_arrows {
             cell(
-                self.area
-                    .x
-                    .saturating_add(self.content_width.saturating_sub(2)),
+                self.calendar_x().saturating_add(CALENDAR_WIDTH - 1),
                 self.header_y(),
-                2,
+                1,
             )
         } else {
             Rect::new(0, 0, 0, 0)
@@ -2317,32 +2420,47 @@ impl Geometry {
         if self.layout.calendar.is_none() {
             return Rect::new(0, 0, 0, 0);
         }
-        let x = if self.layout.year_arrows { 3 } else { 0 };
-        cell(self.area.x.saturating_add(x), self.header_y(), 2)
+        if self.layout.year_arrows {
+            // `«‹` at the grid's left edge.
+            cell(self.calendar_x().saturating_add(1), self.header_y(), 1)
+        } else {
+            cell(self.area.x, self.header_y(), 2)
+        }
     }
 
     const fn next_month(self) -> Rect {
         if self.layout.calendar.is_none() {
             return Rect::new(0, 0, 0, 0);
         }
-        let inset = if self.layout.year_arrows { 5 } else { 2 };
-        cell(
-            self.area
-                .x
-                .saturating_add(self.content_width.saturating_sub(inset)),
-            self.header_y(),
-            2,
-        )
+        if self.layout.year_arrows {
+            // `›»` at the grid's right edge.
+            cell(
+                self.calendar_x().saturating_add(CALENDAR_WIDTH - 2),
+                self.header_y(),
+                1,
+            )
+        } else {
+            cell(
+                self.area
+                    .x
+                    .saturating_add(self.content_width.saturating_sub(2)),
+                self.header_y(),
+                2,
+            )
+        }
     }
 
-    /// The month title between the month arrows.
+    /// The month title between the month arrows, with a column of padding on
+    /// each side.
     const fn title(self) -> Rect {
-        let start = self.prev_month().x.saturating_add(2);
-        cell(
-            start,
-            self.header_y(),
-            self.next_month().x.saturating_sub(start),
-        )
+        let start = self.prev_month().x.saturating_add(1);
+        let end = if self.layout.year_arrows {
+            self.next_month().x
+        } else {
+            // The compact arrows are two columns wide, glyph on the outside.
+            self.next_month().x.saturating_add(1)
+        };
+        cell(start, self.header_y(), end.saturating_sub(start))
     }
 
     const fn calendar(self) -> Rect {
@@ -2430,9 +2548,41 @@ impl Geometry {
         Some(cell(
             row.x
                 .saturating_add(self.time_x())
-                .saturating_add(TIME_FIELD_OFFSETS[index]),
+                .saturating_add(self.time_offsets()[index]),
             row.y,
             DAY_WIDTH,
+        ))
+    }
+
+    const fn time_offsets(self) -> [u16; 3] {
+        if self.layout.tight_time {
+            TIGHT_TIME_OFFSETS
+        } else {
+            TIME_FIELD_OFFSETS
+        }
+    }
+
+    const fn time_separator(self) -> &'static str {
+        if self.layout.tight_time {
+            ":"
+        } else {
+            TIME_SEPARATOR
+        }
+    }
+
+    /// The time block's part of `row`: from the hour field to the right edge.
+    const fn time_block(self, row: Rect) -> Rect {
+        let x = row.x.saturating_add(self.time_x());
+        Rect::new(x, row.y, row.right().saturating_sub(x), 1)
+    }
+
+    /// The `Time` label, if the layout shows one.
+    fn time_label(self) -> Option<Rect> {
+        let (x, y) = self.layout.time_label?;
+        Some(cell(
+            self.area.x.saturating_add(x),
+            self.area.y.saturating_add(y),
+            label_width(TIME_LABEL),
         ))
     }
 
@@ -2448,9 +2598,10 @@ impl Geometry {
             return None;
         }
         let dx = position.x - start;
-        Some(if dx < TIME_FIELD_OFFSETS[1] {
+        let offsets = self.time_offsets();
+        Some(if dx < offsets[1] {
             DatePickerPart::Hour
-        } else if !self.show_seconds || dx < TIME_FIELD_OFFSETS[2] {
+        } else if !self.show_seconds || dx < offsets[2] {
             DatePickerPart::Minute
         } else {
             DatePickerPart::Second
@@ -2458,16 +2609,10 @@ impl Geometry {
     }
 
     fn now_button(self) -> Option<Rect> {
-        if !self.layout.time_buttons {
-            return None;
-        }
-        let row = self.time_row()?;
+        let row = self.layout.now_row?;
         Some(cell(
-            row.x
-                .saturating_add(self.time_x())
-                .saturating_add(self.time_width)
-                .saturating_add(2),
-            row.y,
+            self.area.x.saturating_add(self.time_x()),
+            self.area.y.saturating_add(row),
             label_width(NOW_LABEL),
         ))
     }
@@ -2508,8 +2653,21 @@ impl Geometry {
     }
 
     fn today_button(self) -> Option<Rect> {
-        let row = self.footer_row().filter(|_| self.layout.today)?;
-        Some(cell(row.x, row.y, label_width(TODAY_LABEL)))
+        match self.layout.today {
+            TodayPlace::None => None,
+            TodayPlace::Buttons => {
+                let now = self.now_button()?;
+                Some(cell(
+                    now.right().saturating_add(1),
+                    now.y,
+                    label_width(TODAY_LABEL),
+                ))
+            }
+            TodayPlace::Footer => {
+                let row = self.footer_row()?;
+                Some(cell(row.x, row.y, label_width(TODAY_LABEL)))
+            }
+        }
     }
 
     /// Cancel and OK, right-aligned.
@@ -3355,26 +3513,118 @@ mod full_tests {
         let rows = render(&picker, &state());
         assert_eq!(rows[0].trim(), "2026-11-04 14:30:05", "{rows:#?}");
         assert_eq!(rows[1].trim(), "We 4 Nov 2026, 14:30:05", "{rows:#?}");
-        assert!(
-            rows[3].starts_with("«  ‹") && rows[3].ends_with("›  »"),
-            "{rows:#?}"
-        );
-        assert!(rows[3].contains("November 2026"), "{rows:#?}");
-        assert!(
-            rows[12].contains('▲') && rows[14].contains('▼'),
-            "{rows:#?}"
-        );
-        assert!(
-            rows[13].starts_with("Time  14 : 30 : 05  [ Now ]"),
-            "{rows:#?}"
-        );
-        assert!(rows[16].starts_with("[ Today ]"), "{rows:#?}");
-        assert!(rows[16].ends_with("[ Cancel ] [ OK ]"), "{rows:#?}");
+        // The arrows hug the grid's edges.
+        assert_eq!(rows[3].trim(), "«‹ November 2026  ›»", "{rows:#?}");
+        assert_eq!(&rows[4][6..26], "Mo Tu We Th Fr Sa Su", "{rows:#?}");
+        assert_eq!(rows[12].trim(), "▲  ▲  ▲", "{rows:#?}");
+        assert_eq!(rows[13].trim_end(), "Time  14:30:05", "{rows:#?}");
+        assert_eq!(rows[14].trim(), "▼  ▼  ▼", "{rows:#?}");
+        // Today shares a row with Now; no row holds a lone button.
+        assert_eq!(rows[15].trim(), "[ Now ] [ Today ]", "{rows:#?}");
+        assert!(rows[17].ends_with("[ Cancel ] [ OK ]"), "{rows:#?}");
+        assert_eq!(rows.len(), 18);
         // The compact preset keeps its size.
         assert_eq!(
             DatePicker::new(DatePickerMode::DateTime).preferred_size(),
             Size::new(CALENDAR_WIDTH, CALENDAR_HEIGHT + 2)
         );
+        assert_eq!(
+            DatePicker::new(DatePickerMode::DateTime).size_for_width(80),
+            Size::new(CALENDAR_WIDTH, CALENDAR_HEIGHT + 2)
+        );
+    }
+
+    fn render_at(picker: &DatePicker<'_>, state: &DatePickerState, width: u16) -> Vec<String> {
+        let size = picker.size_for_width(width);
+        let area = Rect::new(0, 0, size.width, size.height);
+        let mut buffer = Buffer::empty(area);
+        let mut frame = Frame::new(&mut buffer);
+        PaintCx::new(&mut frame).with_child(0, 0, LocalRect::terminal(area), |cx| {
+            picker.paint(area, state, Style::new(), cx);
+        });
+        (0..area.height)
+            .filter_map(|row| buffer.row_symbols(row))
+            .collect()
+    }
+
+    #[test]
+    fn wide_layouts_put_the_time_beside_the_calendar_and_fill_the_width() {
+        let no_footer = DatePicker::new(DatePickerMode::DateTime)
+            .show_seconds(true)
+            .policy(DatePickerPolicy {
+                footer: false,
+                ..DatePickerPolicy::full()
+            });
+        assert_eq!(
+            no_footer.size_for_width(31),
+            Size::new(FULL_WIDTH, 16),
+            "never narrower"
+        );
+        assert_eq!(no_footer.size_for_width(60), Size::new(60, 11));
+        let rows = render_at(&no_footer, &state(), 60);
+        assert_eq!(
+            rows[3].trim_end(),
+            "«‹ November 2026  ›»      Time",
+            "{rows:#?}"
+        );
+        assert_eq!(
+            rows[4].trim_end(),
+            "Mo Tu We Th Fr Sa Su      ▲  ▲  ▲",
+            "{rows:#?}"
+        );
+        assert_eq!(
+            rows[5].trim_end(),
+            "26 27 28 29 30 31  1      14:30:05",
+            "{rows:#?}"
+        );
+        assert_eq!(
+            rows[6].trim_end(),
+            " 2  3  4  5  6  7  8      ▼  ▼  ▼",
+            "{rows:#?}"
+        );
+        assert_eq!(
+            rows[8].trim_end(),
+            "16 17 18 19 20 21 22      [ Now ] [ Today ]",
+            "{rows:#?}"
+        );
+        // Every element is where it is drawn.
+        let mut state = state();
+        let area = Rect::new(0, 0, 60, 11);
+        let click = |state: &mut DatePickerState, x, y| {
+            no_footer.handle_event(
+                area,
+                state,
+                &Event::Mouse(MouseEvent::new(
+                    MouseEventKind::Down(MouseButton::Left),
+                    Point::new(x, y),
+                )),
+            )
+        };
+        assert_eq!(
+            click(&mut state, 26, 4),
+            DatePickerOutcome::Changed(at(2026, 11, 4, 15, 30, 5))
+        );
+        assert_eq!(
+            click(&mut state, 29, 6),
+            DatePickerOutcome::Changed(at(2026, 11, 4, 15, 29, 5))
+        );
+        assert_eq!(
+            click(&mut state, 30, 8),
+            DatePickerOutcome::Changed(at(2026, 11, 4, 9, 0, 0)),
+            "Now"
+        );
+        click(&mut state, 19, 3);
+        assert_eq!(state.month_view(), (2027, 11), "»");
+        assert_eq!(
+            click(&mut state, 36, 8),
+            DatePickerOutcome::Redraw,
+            "already today: the view comes back"
+        );
+        // The date and time pickers fill the width too, left-aligned.
+        let date = DatePicker::new(DatePickerMode::Date).policy(DatePickerPolicy::full());
+        let rows = render_at(&date, &state, 60);
+        assert_eq!(rows[3].trim_end(), "«‹ November 2026  ›»", "{rows:#?}");
+        assert!(rows[rows.len() - 1].starts_with("[ Today ]"), "{rows:#?}");
     }
 
     #[test]
@@ -3482,9 +3732,9 @@ mod full_tests {
                 ..DatePickerPolicy::full()
             });
         let mut state = super::full_tests::state();
-        // The Now button (row 13, after the fields) takes the clock's offset.
+        // The Now button (row 15, under the fields) takes the clock's offset.
         assert_eq!(
-            click(&zoned, &mut state, 21, 13),
+            click(&zoned, &mut state, 8, 15),
             DatePickerOutcome::Changed(at(2026, 11, 4, 9, 0, 0))
         );
         assert_eq!(state.offset(), FixedOffset::east_opt(-5 * 3600));
@@ -3495,7 +3745,7 @@ mod full_tests {
         typed(&zoned, &mut state, "2026-10-01 12:00+02:00");
         assert_eq!(state.offset(), FixedOffset::east_opt(2 * 3600));
         assert_eq!(
-            click(&zoned, &mut state, 2, 16),
+            click(&zoned, &mut state, 16, 15),
             DatePickerOutcome::Changed(at(2026, 11, 4, 12, 0, 0))
         );
         assert_eq!(state.offset(), FixedOffset::east_opt(2 * 3600));
@@ -3505,13 +3755,13 @@ mod full_tests {
     fn every_action_has_a_mouse_target() {
         let picker = picker(DatePickerMode::DateTime);
         let mut state = state();
-        click(&picker, &mut state, 30, 3);
+        click(&picker, &mut state, 25, 3);
         assert_eq!(state.month_view(), (2027, 11), "» is next year");
-        click(&picker, &mut state, 0, 3);
+        click(&picker, &mut state, 6, 3);
         assert_eq!(state.month_view(), (2026, 11), "« is the previous year");
-        click(&picker, &mut state, 28, 3);
+        click(&picker, &mut state, 24, 3);
         assert_eq!(state.month_view(), (2026, 12), "› is next month");
-        click(&picker, &mut state, 4, 3);
+        click(&picker, &mut state, 7, 3);
         assert_eq!(state.month_view(), (2026, 11), "‹ is the previous month");
         // Day 4 sits at grid index 9.
         assert_eq!(
@@ -3524,16 +3774,16 @@ mod full_tests {
             DatePickerOutcome::Changed(at(2026, 11, 5, 15, 30, 5))
         );
         assert_eq!(
-            click(&picker, &mut state, 11, 14),
+            click(&picker, &mut state, 9, 14),
             DatePickerOutcome::Changed(at(2026, 11, 5, 15, 29, 5))
         );
         assert_eq!(state.part(), DatePickerPart::Minute);
         assert_eq!(
-            click(&picker, &mut state, 27, 16),
+            click(&picker, &mut state, 27, 17),
             DatePickerOutcome::Submitted(at(2026, 11, 5, 15, 29, 5))
         );
         assert_eq!(
-            click(&picker, &mut state, 17, 16),
+            click(&picker, &mut state, 17, 17),
             DatePickerOutcome::Cancelled
         );
         // Clicking the field places the cursor.
@@ -3584,12 +3834,12 @@ mod full_tests {
         let mut state = state();
         let moved = |x, y| Event::Mouse(MouseEvent::new(MouseEventKind::Move, Point::new(x, y)));
         assert_eq!(
-            send(&picker, &mut state, &moved(2, 16)),
+            send(&picker, &mut state, &moved(15, 15)),
             DatePickerOutcome::Redraw
         );
         assert_eq!(state.hover, Some(Target::Today));
         assert_eq!(
-            send(&picker, &mut state, &moved(3, 16)),
+            send(&picker, &mut state, &moved(16, 15)),
             DatePickerOutcome::Ignored
         );
         send(&picker, &mut state, &moved(12, 6));

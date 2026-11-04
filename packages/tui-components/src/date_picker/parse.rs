@@ -483,7 +483,14 @@ pub(super) fn describe(
         .take(3)
         .collect();
     let date = format!("{weekday} {} {month} {}", value.day(), value.year());
-    let time = time_text(value.time(), seconds);
+    // Whole seconds: the field shows any fraction exactly.
+    let time = time_text(
+        value
+            .time()
+            .with_nanosecond(0)
+            .unwrap_or_else(|| value.time()),
+        seconds,
+    );
     let offset = offset
         .map(|offset| format!(" {offset}"))
         .unwrap_or_default();
