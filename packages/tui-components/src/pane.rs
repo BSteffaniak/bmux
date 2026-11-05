@@ -7,7 +7,8 @@ use std::hash::{Hash, Hasher};
 
 use bmux_tui::chrome::Border;
 use bmux_tui::component::{
-    Component, ComponentRevision, Constraints, Element, EventCx, LayoutCx, LayoutId, LayoutNode,
+    ChildLayout, Component, ComponentRevision, Constraints, Element, EventCx, LayoutCx, LayoutId,
+    LayoutNode,
 };
 use bmux_tui::composition::Surface;
 use bmux_tui::event::{Event, EventOutcome, MouseButton, MouseEvent, MouseEventKind};
@@ -373,6 +374,17 @@ impl Pane<'_> {
     /// Title-row geometry for a pane of `size` (relative to the pane).
     #[must_use]
     pub fn title_layout(&self, size: Rect) -> PaneTitleLayout {
+        let width = self
+            .title
+            .as_ref()
+            .map(|title| u16::try_from(title.width()).unwrap_or(u16::MAX));
+        self.title_layout_for(size, width)
+    }
+
+    /// Title-row geometry for a title `title_width` cells wide (or none). Actions are placed
+    /// first; the title gets what remains of the row.
+    #[must_use]
+    pub fn title_layout_for(&self, size: Rect, title_width: Option<u16>) -> PaneTitleLayout {
         if size.height == 0 || size.width < 3 {
             return PaneTitleLayout {
                 title: None,
@@ -415,10 +427,8 @@ impl Pane<'_> {
         } else {
             actions_start.saturating_sub(1)
         };
-        let title = self.title.as_ref().and_then(|title| {
-            let width = u16::try_from(title.width())
-                .unwrap_or(u16::MAX)
-                .min(title_end.saturating_sub(inner_start));
+        let title = title_width.and_then(|width| {
+            let width = width.min(title_end.saturating_sub(inner_start));
             (width > 0).then(|| Rect::new(inner_start, size.y, width, 1))
         });
         PaneTitleLayout { title, actions }
@@ -682,9 +692,20 @@ pub struct PaneComponent<'a, 'state> {
     pane: Pane<'a>,
     state: &'state Cell<PaneState>,
     child: Element<'a>,
+    title: Option<Element<'a>>,
 }
 
 impl<'a, 'state> PaneComponent<'a, 'state> {
+    /// Use a component as the title instead of the pane's text title, for example a row
+    /// holding a tab bar. It is measured and placed where a text title would be, after the
+    /// title-row actions take their room, clipped to the remaining width, and it receives
+    /// events, so its own hit regions (such as one per tab) work inside the title row.
+    #[must_use]
+    pub fn title_content(mut self, title: impl Component + 'a) -> Self {
+        self.title = Some(Element::new(title));
+        self
+    }
+
     /// Override pointer presentation without changing input routing or mouse policy.
     #[must_use]
     pub const fn pointer_intent(mut self, intent: bmux_tui::pointer::PointerIntent) -> Self {
@@ -706,6 +727,7 @@ impl<'a, 'state> PaneComponent<'a, 'state> {
             pane,
             state,
             child: Element::new(child),
+            title: None,
         }
     }
 
@@ -731,14 +753,14 @@ impl<'a, 'state> PaneComponent<'a, 'state> {
 
 impl PaneComponent<'_, '_> {
     /// Title, title-row actions and their hit regions, from one [`Pane::title_layout`].
-    fn paint_title_row(&self, size: Rect, state: PaneState, cx: &mut PaintCx<'_, '_>) {
-        let title_row = self.pane.title_layout(size);
-        if let (Some(title), Some(area)) = (&self.pane.title, title_row.title) {
-            cx.write_line(
-                LocalRect::new(i32::from(area.x), i64::from(area.y), area.width, 1),
-                title,
-            );
-        }
+    fn paint_title_row(
+        &self,
+        size: Rect,
+        state: PaneState,
+        title_node: Option<&ChildLayout>,
+        cx: &mut PaintCx<'_, '_>,
+    ) {
+        // The whole-row region goes first so the title's own regions (tabs) sit above it.
         if self.pane.title_hit && !self.pane.policy.mouse.title_bar_drag && !size.is_empty() {
             cx.push_hit(
                 SceneRegion::new(format!("{}.title", self.id.as_str()), title_bar_area(size))
@@ -749,6 +771,29 @@ impl PaneComponent<'_, '_> {
                     .enabled(!state.interaction.disabled),
             );
         }
+        let title_row = match (&self.title, title_node) {
+            (Some(title), Some(node)) => {
+                let width = u16::try_from(node.node.size.width).unwrap_or(u16::MAX);
+                cx.with_child(
+                    i32::try_from(node.x).unwrap_or(i32::MAX),
+                    0,
+                    LocalRect::new(0, 0, width, 1),
+                    |cx| title.paint(&node.node, cx),
+                );
+                self.pane.title_layout_for(size, Some(width))
+            }
+            (Some(_), None) => self.pane.title_layout_for(size, None),
+            (None, _) => {
+                let title_row = self.pane.title_layout(size);
+                if let (Some(title), Some(area)) = (&self.pane.title, title_row.title) {
+                    cx.write_line(
+                        LocalRect::new(i32::from(area.x), i64::from(area.y), area.width, 1),
+                        title,
+                    );
+                }
+                title_row
+            }
+        };
         for (index, area) in title_row.actions {
             let action = &self.pane.actions[index];
             cx.write_line(
@@ -769,7 +814,10 @@ impl PaneComponent<'_, '_> {
 
 impl Component for PaneComponent<'_, '_> {
     fn revision(&self) -> ComponentRevision {
-        let child = self.child.revision();
+        let mut child = self.child.revision();
+        if let Some(title) = &self.title {
+            child = child.combine(title.revision());
+        }
         let mut layout = std::collections::hash_map::DefaultHasher::new();
         self.id.as_str().hash(&mut layout);
         format!("{:?}", self.pane.title).hash(&mut layout);
@@ -790,12 +838,33 @@ impl Component for PaneComponent<'_, '_> {
         ComponentRevision::new(layout.finish() ^ child.layout, paint.finish() ^ child.paint)
     }
 
+    /// The pane's node holds the surface (border, padding and content) and, with a title
+    /// component, that component placed in the title row.
     fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
-        self.surface().layout(constraints, cx)
+        let surface = self.surface().layout(constraints, cx);
+        let size = surface.size;
+        let mut children = vec![ChildLayout::new(0, 0, surface)];
+        if let Some(title) = &self.title {
+            let pane = Rect::new(
+                0,
+                0,
+                size.width.try_into().unwrap_or(u16::MAX),
+                u16::try_from(size.height).unwrap_or(u16::MAX),
+            );
+            // The room a title of unbounded width would get beside the actions.
+            if let Some(space) = self.pane.title_layout_for(pane, Some(u16::MAX)).title {
+                let node = title.layout(Constraints::new(0, space.width.into(), 1, Some(1)), cx);
+                children.push(ChildLayout::new(space.x.into(), space.y.into(), node));
+            }
+        }
+        LayoutNode::with_children(self.id.clone(), size, children)
     }
 
     fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
-        self.surface().paint(layout, cx);
+        let Some(surface) = layout.children.first() else {
+            return;
+        };
+        self.surface().paint(&surface.node, cx);
         let state = self.state.get();
         let size = Rect::new(
             0,
@@ -861,7 +930,7 @@ impl Component for PaneComponent<'_, '_> {
                 );
             }
         }
-        self.paint_title_row(size, state, cx);
+        self.paint_title_row(size, state, layout.children.get(1), cx);
     }
 
     fn event(&self, event: &Event, layout: &LayoutNode, cx: &mut EventCx<'_>) -> EventOutcome {
@@ -880,7 +949,34 @@ impl Component for PaneComponent<'_, '_> {
         if outcome != PaneOutcome::Ignored {
             return EventOutcome::Handled;
         }
-        let Some(child) = layout.children.first() else {
+        if let (Some(title), Some(node)) = (&self.title, layout.children.get(1)) {
+            let x = state
+                .area
+                .x
+                .saturating_add(u16::try_from(node.x).unwrap_or(u16::MAX));
+            let clip = Rect::new(
+                x,
+                state.area.y,
+                node.node.size.width.try_into().unwrap_or(u16::MAX),
+                u16::try_from(node.node.size.height).unwrap_or(u16::MAX),
+            );
+            let outcome = cx.with_transform(
+                node.x,
+                node.y,
+                i32::from(x),
+                i64::from(state.area.y),
+                clip,
+                |cx| title.event(event, &node.node, cx),
+            );
+            if outcome != EventOutcome::Ignored {
+                return outcome;
+            }
+        }
+        let Some(child) = layout
+            .children
+            .first()
+            .and_then(|surface| surface.node.children.first())
+        else {
             return EventOutcome::Ignored;
         };
         let clip = Rect::new(
@@ -1516,5 +1612,111 @@ mod tests {
         // Too narrow for even the corners and one cell: nothing is drawn or registered.
         let (_, hits) = rendered(with_actions("Files"), 2);
         assert!(!hits.iter().any(|(id, _)| id.starts_with("pane.action")));
+    }
+
+    #[cfg(feature = "tab-bar")]
+    fn tabbed(
+        width: u16,
+        tabs: &std::cell::RefCell<crate::tab_bar::TabBarState>,
+    ) -> (Buffer, Vec<(String, Rect)>, bmux_tui::component::LayoutNode) {
+        use crate::tab_bar::{TabBarComponent, TabBarPolicy, TabItem};
+        use bmux_tui::composition::Row;
+
+        let items = [
+            TabItem::new("files", "Files"),
+            TabItem::new("trees", "Trees"),
+        ];
+        let state = Cell::new(PaneState::new(Rect::new(0, 0, width, 3)));
+        let title = Row::new().child(TextBlock::new("[2]")).child(
+            TabBarComponent::new("tabs", &items, tabs)
+                .policy(TabBarPolicy::interactive().padding("", "").separator("·")),
+        );
+        let component = PaneComponent::new(
+            "pane",
+            Pane::new()
+                .title_hit(true)
+                .action(PaneTitleAction::new("close", "✕")),
+            &state,
+            TextBlock::new("body"),
+        )
+        .title_content(title);
+        let layout = component.layout(
+            Constraints::new(width.into(), width.into(), 3, Some(3)),
+            &mut LayoutCx::new(),
+        );
+        let mut buffer = Buffer::empty(Rect::new(0, 0, width, 3));
+        let mut frame = Frame::new(&mut buffer);
+        component.paint(&layout, &mut PaintCx::new(&mut frame));
+        let hits: Vec<(String, Rect)> = frame
+            .hits()
+            .regions()
+            .iter()
+            .map(|region| (region.id.as_str().to_owned(), region.area))
+            .collect();
+        drop(frame);
+
+        // Pointer input on the second tab selects it through the pane.
+        let trees = hits_area(&hits, "tabs.trees");
+        if let Some(trees) = trees {
+            let mut cx = EventCx::new(&layout);
+            for kind in [
+                MouseEventKind::Down(MouseButton::Left),
+                MouseEventKind::Up(MouseButton::Left),
+            ] {
+                component.event(
+                    &Event::Mouse(MouseEvent::new(kind, Point::new(trees.x, trees.y))),
+                    &layout,
+                    &mut cx,
+                );
+            }
+        }
+        (buffer, hits, layout)
+    }
+
+    #[cfg(feature = "tab-bar")]
+    fn hits_area(hits: &[(String, Rect)], id: &str) -> Option<Rect> {
+        hits.iter()
+            .find(|(candidate, _)| candidate == id)
+            .map(|(_, area)| *area)
+    }
+
+    #[cfg(feature = "tab-bar")]
+    #[test]
+    fn title_components_get_their_own_hit_regions_and_events() {
+        let tabs = std::cell::RefCell::new(crate::tab_bar::TabBarState::new(Some(0)));
+        let (buffer, hits, _) = tabbed(20, &tabs);
+        assert_eq!(
+            buffer.row_symbols(0).as_deref(),
+            Some("┌[2]Files·Trees───✕┐")
+        );
+        assert_eq!(hits_area(&hits, "tabs.files"), Some(Rect::new(4, 0, 5, 1)));
+        assert_eq!(hits_area(&hits, "tabs.trees"), Some(Rect::new(10, 0, 5, 1)));
+        assert_eq!(
+            hits_area(&hits, "pane.action.close"),
+            Some(Rect::new(18, 0, 1, 1))
+        );
+        // The tab regions sit above the whole-row title region.
+        let title = hits.iter().position(|(id, _)| id == "pane.title").unwrap();
+        let files = hits.iter().position(|(id, _)| id == "tabs.files").unwrap();
+        assert!(title < files);
+        assert_eq!(tabs.borrow().selected(), Some(1));
+        // The content still renders under the title row.
+        assert_eq!(
+            buffer.row_symbols(1).as_deref(),
+            Some("│body              │")
+        );
+    }
+
+    #[cfg(feature = "tab-bar")]
+    #[test]
+    fn clipped_title_components_drop_hidden_tab_regions() {
+        let tabs = std::cell::RefCell::new(crate::tab_bar::TabBarState::new(Some(0)));
+        // Room for "[2]" and part of "Files" beside the close action.
+        let (buffer, hits, layout) = tabbed(10, &tabs);
+        assert_eq!(buffer.row_symbols(0).as_deref(), Some("┌[2]Fil─✕┐"));
+        assert_eq!(layout.children[1].node.size.width, 6);
+        assert_eq!(hits_area(&hits, "tabs.files"), Some(Rect::new(4, 0, 3, 1)));
+        assert_eq!(hits_area(&hits, "tabs.trees"), None);
+        assert_eq!(tabs.borrow().selected(), Some(0));
     }
 }

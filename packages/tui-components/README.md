@@ -188,6 +188,15 @@ let chrome = Pane::new()
     .action(PaneTitleAction::new("close", "✕"));
 ```
 
+A title can also be a component: `PaneComponent::title_content` takes, for
+example, a `Row` holding a label and a `tab_bar::TabBarComponent`. The pane
+measures it and places it where a text title would go (after the actions take
+their room, clipped to what remains), paints it there, and routes events to it,
+so each tab's own hit region (`<tab bar id>.<tab id>`) works inside the title
+row
+and tabs clipped away register nothing. The whole-row `<pane id>.title` region
+sits beneath the tabs.
+
 ## Resizable panel groups
 
 `panel_group::PanelGroupComponent` lays out children along one axis with fixed
