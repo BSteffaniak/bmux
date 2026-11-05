@@ -169,6 +169,54 @@ frames, and lay out, paint, and route events through the same component tree.
 Applications remain responsible for sanitizing untrusted text and choosing
 content wrapping/scrolling policies.
 
+Title-row buttons (collapse, maximize, close, …) are `PaneTitleAction`s. They
+are right-aligned on the top border, and each registers a hit region
+`<pane id>.action.<action id>`. When the row is too narrow, the leftmost actions
+are dropped first, then the title is clipped; widths are measured in cells.
+`Pane::title_hit(true)` also registers the whole title row as `<pane id>.title`,
+for focus or double-click handling (use `bmux_text_edit::pointer::ClickTracker`
+to count clicks). `Pane::title_layout` returns the same geometry the pane
+paints.
+
+```rust
+use bmux_tui_components::pane::{Pane, PaneTitleAction};
+
+let chrome = Pane::new()
+    .title("Files")
+    .title_hit(true)
+    .action(PaneTitleAction::new("collapse", "▾"))
+    .action(PaneTitleAction::new("close", "✕"));
+```
+
+## Resizable panel groups
+
+`panel_group::PanelGroupComponent` lays out children along one axis with fixed
+(`PanelSize::fixed`) or weighted (`PanelSize::flex`) sizes, per-panel min/max
+constraints, and draggable dividers. State (`PanelGroupState`) is caller-owned:
+keep it across frames and persist `sizes()` if layouts should be remembered.
+
+* **Divider modes.** `PanelDividerMode::Gap` reserves a one-cell divider line
+  between panels. `PanelDividerMode::Overlay { before, after }` takes no space:
+  the handle covers the adjacent panels' own edge cells (typically their
+  borders) and is highlighted in place, keeping their symbols, while hovered or
+  dragged. For stacked bordered panes, `Overlay { before: 1, after: 0 }` keeps
+  the lower pane's title row free for its own clicks.
+* **Flexible resizing.** With `PanelGroupResizePolicy::preserving_flex(true)`,
+  resizing rebases flex weights to the current cell lengths, so the resized
+  proportions survive later area changes; otherwise resized panels become fixed.
+* **Programmatic resizing.** `PanelGroup::resize_divider` moves a divider by a
+  number of cells (for keyboard resizing) with the same constraint clamping as
+  dragging.
+* **Collapsing.** `PanelGroupState::collapse(index, cells)` shrinks a panel to a
+  size that ignores its constraints and remembers the previous size;
+  `expand(index)` restores it, and `set_size` on a collapsed panel changes what it
+  restores to. Dividers next to a collapsed panel neither resize nor react to the
+  pointer.
+
+Applications that route pointer input themselves can call
+`PanelGroup::handle_event` with the group's area from the presented layout
+(`EventCx::find_visible_rect` on the group's layout id).
+
 ## Canonical composition
 
 Use `bmux_tui::composition` for child ownership, measurement, placement, and

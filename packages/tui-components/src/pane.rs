@@ -275,10 +275,42 @@ pub enum ScrollDirection {
     Right,
 }
 
+/// A labeled control drawn at the right end of a pane's title row, such as collapse,
+/// maximize or close. Its hit region id is `<pane id>.action.<id>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaneTitleAction {
+    /// Stable action id.
+    pub id: String,
+    /// Label, including any padding and styling.
+    pub label: Line,
+}
+
+impl PaneTitleAction {
+    /// Create a title action.
+    #[must_use]
+    pub fn new(id: impl Into<String>, label: impl Into<Line>) -> Self {
+        Self {
+            id: id.into(),
+            label: label.into(),
+        }
+    }
+}
+
+/// Title-row geometry shared by painting and hit registration, relative to the pane.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaneTitleLayout {
+    /// Where the title is written (clipped), if anything of it fits.
+    pub title: Option<Rect>,
+    /// Visible actions as `(index into the pane's actions, area)`, left to right.
+    pub actions: Vec<(usize, Rect)>,
+}
+
 /// Configurable pane renderer and event handler.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pane<'a> {
     title: Option<Line>,
+    actions: Vec<PaneTitleAction>,
+    title_hit: bool,
     padding: Insets,
     border: bool,
     policy: PanePolicy,
@@ -292,6 +324,8 @@ impl Pane<'_> {
     pub const fn new() -> Self {
         Self {
             title: None,
+            actions: Vec::new(),
+            title_hit: false,
             padding: Insets::all(0),
             border: true,
             policy: PanePolicy {
@@ -316,6 +350,78 @@ impl Pane<'_> {
     pub fn title(mut self, title: impl Into<Line>) -> Self {
         self.title = Some(title.into());
         self
+    }
+
+    /// Append a title-row action. Actions are right-aligned in declaration order; when
+    /// the row is too narrow the leftmost actions are dropped first, then the title is
+    /// clipped.
+    #[must_use]
+    pub fn action(mut self, action: PaneTitleAction) -> Self {
+        self.actions.push(action);
+        self
+    }
+
+    /// Register the title row as a clickable region `<pane id>.title` (for focus or
+    /// double-click handling by the caller). Panes with title-bar dragging already
+    /// register that id as their drag handle.
+    #[must_use]
+    pub const fn title_hit(mut self, enabled: bool) -> Self {
+        self.title_hit = enabled;
+        self
+    }
+
+    /// Title-row geometry for a pane of `size` (relative to the pane).
+    #[must_use]
+    pub fn title_layout(&self, size: Rect) -> PaneTitleLayout {
+        if size.height == 0 || size.width < 3 {
+            return PaneTitleLayout {
+                title: None,
+                actions: Vec::new(),
+            };
+        }
+        // Inside the corners.
+        let inner_start = size.x.saturating_add(1);
+        let inner_end = size.right().saturating_sub(1);
+        let available = inner_end.saturating_sub(inner_start);
+        let widths: Vec<u16> = self
+            .actions
+            .iter()
+            .map(|action| u16::try_from(action.label.width()).unwrap_or(u16::MAX))
+            .collect();
+        // Keep as many trailing actions as fit, with one cell between neighbours.
+        let mut first = widths.len();
+        let mut used: u16 = 0;
+        while first > 0 {
+            let width = widths[first - 1];
+            let needed = used
+                .saturating_add(width)
+                .saturating_add(u16::from(used > 0));
+            if needed > available {
+                break;
+            }
+            used = needed;
+            first -= 1;
+        }
+        let mut actions = Vec::with_capacity(widths.len() - first);
+        let mut x = inner_end.saturating_sub(used);
+        let actions_start = x;
+        for (index, width) in widths.iter().copied().enumerate().skip(first) {
+            actions.push((index, Rect::new(x, size.y, width, 1)));
+            x = x.saturating_add(width).saturating_add(1);
+        }
+        // The title ends one cell before the first action.
+        let title_end = if actions.is_empty() {
+            inner_end
+        } else {
+            actions_start.saturating_sub(1)
+        };
+        let title = self.title.as_ref().and_then(|title| {
+            let width = u16::try_from(title.width())
+                .unwrap_or(u16::MAX)
+                .min(title_end.saturating_sub(inner_start));
+            (width > 0).then(|| Rect::new(inner_start, size.y, width, 1))
+        });
+        PaneTitleLayout { title, actions }
     }
 
     /// Set pane padding.
@@ -623,6 +729,44 @@ impl<'a, 'state> PaneComponent<'a, 'state> {
     }
 }
 
+impl PaneComponent<'_, '_> {
+    /// Title, title-row actions and their hit regions, from one [`Pane::title_layout`].
+    fn paint_title_row(&self, size: Rect, state: PaneState, cx: &mut PaintCx<'_, '_>) {
+        let title_row = self.pane.title_layout(size);
+        if let (Some(title), Some(area)) = (&self.pane.title, title_row.title) {
+            cx.write_line(
+                LocalRect::new(i32::from(area.x), i64::from(area.y), area.width, 1),
+                title,
+            );
+        }
+        if self.pane.title_hit && !self.pane.policy.mouse.title_bar_drag && !size.is_empty() {
+            cx.push_hit(
+                SceneRegion::new(format!("{}.title", self.id.as_str()), title_bar_area(size))
+                    .role(HitRole::Action)
+                    .pointer_intent(self.pointer_intent)
+                    .hoverable(true)
+                    .focusable(false)
+                    .enabled(!state.interaction.disabled),
+            );
+        }
+        for (index, area) in title_row.actions {
+            let action = &self.pane.actions[index];
+            cx.write_line(
+                LocalRect::new(i32::from(area.x), i64::from(area.y), area.width, 1),
+                &action.label,
+            );
+            cx.push_hit(
+                SceneRegion::new(format!("{}.action.{}", self.id.as_str(), action.id), area)
+                    .role(HitRole::Action)
+                    .pointer_intent(self.pointer_intent)
+                    .hoverable(true)
+                    .focusable(false)
+                    .enabled(!state.interaction.disabled),
+            );
+        }
+    }
+}
+
 impl Component for PaneComponent<'_, '_> {
     fn revision(&self) -> ComponentRevision {
         let child = self.child.revision();
@@ -638,6 +782,8 @@ impl Component for PaneComponent<'_, '_> {
         let mut paint = std::collections::hash_map::DefaultHasher::new();
         format!("{:?}", self.pointer_intent).hash(&mut paint);
         format!("{:?}", self.pane.styles).hash(&mut paint);
+        format!("{:?}", self.pane.actions).hash(&mut paint);
+        self.pane.title_hit.hash(&mut paint);
         format!("{:?}", self.pane.policy).hash(&mut paint);
         format!("{:?}", state.interaction).hash(&mut paint);
         format!("{:?}", state.drag).hash(&mut paint);
@@ -715,26 +861,7 @@ impl Component for PaneComponent<'_, '_> {
                 );
             }
         }
-        if let Some(title) = &self.pane.title
-            && layout.size.height > 0
-        {
-            cx.write_line(
-                LocalRect::new(
-                    1,
-                    0,
-                    u16::try_from(title.width()).unwrap_or(u16::MAX).min(
-                        layout
-                            .size
-                            .width
-                            .saturating_sub(2)
-                            .try_into()
-                            .unwrap_or(u16::MAX),
-                    ),
-                    1,
-                ),
-                title,
-            );
-        }
+        self.paint_title_row(size, state, cx);
     }
 
     fn event(&self, event: &Event, layout: &LayoutNode, cx: &mut EventCx<'_>) -> EventOutcome {
@@ -969,7 +1096,7 @@ mod tests {
 
     use super::{
         Pane, PaneBoundsPolicy, PaneComponent, PaneMousePolicy, PaneOutcome, PanePolicy, PaneState,
-        ResizeHandles,
+        PaneTitleAction, ResizeHandles,
     };
 
     #[test]
@@ -1327,5 +1454,67 @@ mod tests {
 
     fn mouse(kind: MouseEventKind, x: u16, y: u16) -> Event {
         Event::Mouse(MouseEvent::new(kind, Point::new(x, y)))
+    }
+
+    fn rendered(pane: Pane<'_>, width: u16) -> (Buffer, Vec<(String, Rect)>) {
+        let state = Cell::new(PaneState::new(Rect::new(0, 0, width, 3)));
+        let component = PaneComponent::new("pane", pane, &state, TextBlock::new(""));
+        let layout = component.layout(
+            Constraints::new(width.into(), width.into(), 3, Some(3)),
+            &mut LayoutCx::new(),
+        );
+        let mut buffer = Buffer::empty(Rect::new(0, 0, width, 3));
+        let mut frame = Frame::new(&mut buffer);
+        component.paint(&layout, &mut PaintCx::new(&mut frame));
+        let hits = frame
+            .hits()
+            .regions()
+            .iter()
+            .map(|region| (region.id.as_str().to_owned(), region.area))
+            .collect();
+        drop(frame);
+        (buffer, hits)
+    }
+
+    fn with_actions(title: &str) -> Pane<'static> {
+        Pane::new()
+            .title(title.to_owned())
+            .action(PaneTitleAction::new("collapse", "▾"))
+            .action(PaneTitleAction::new("close", "✕"))
+    }
+
+    #[test]
+    fn title_actions_are_right_aligned_with_matching_hit_regions() {
+        let (buffer, hits) = rendered(with_actions("Files").title_hit(true), 14);
+        assert_eq!(buffer.row_symbols(0).as_deref(), Some("┌Files────▾─✕┐"));
+        assert!(hits.contains(&("pane.action.collapse".to_owned(), Rect::new(10, 0, 1, 1))));
+        assert!(hits.contains(&("pane.action.close".to_owned(), Rect::new(12, 0, 1, 1))));
+        assert!(hits.contains(&("pane.title".to_owned(), Rect::new(0, 0, 14, 1))));
+        // Without the opt-in, the title row registers nothing of its own.
+        let (_, hits) = rendered(with_actions("Files"), 14);
+        assert!(!hits.iter().any(|(id, _)| id == "pane.title"));
+    }
+
+    #[test]
+    fn narrow_title_rows_drop_leftmost_actions_then_clip_the_title() {
+        // Actions keep their room first; the title is clipped to what remains.
+        let (buffer, _) = rendered(with_actions("Files"), 7);
+        assert_eq!(buffer.row_symbols(0).as_deref(), Some("┌F─▾─✕┐"));
+        // Room for one action only: the leftmost is dropped, with its hit region.
+        let (buffer, hits) = rendered(with_actions("Files"), 4);
+        assert_eq!(buffer.row_symbols(0).as_deref(), Some("┌─✕┐"));
+        assert!(!hits.iter().any(|(id, _)| id == "pane.action.collapse"));
+        assert!(hits.contains(&("pane.action.close".to_owned(), Rect::new(2, 0, 1, 1))));
+        // Wide graphemes are measured in cells and never split.
+        let pane = Pane::new()
+            .title("変更点")
+            .action(PaneTitleAction::new("close", "✕"));
+        let (buffer, _) = rendered(pane, 9);
+        let row = buffer.row_symbols(0).unwrap_or_default();
+        assert!(row.starts_with("┌変更") && !row.contains('点'), "{row}");
+        assert!(row.ends_with("✕┐"), "{row}");
+        // Too narrow for even the corners and one cell: nothing is drawn or registered.
+        let (_, hits) = rendered(with_actions("Files"), 2);
+        assert!(!hits.iter().any(|(id, _)| id.starts_with("pane.action")));
     }
 }

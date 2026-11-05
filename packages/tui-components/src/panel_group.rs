@@ -30,6 +30,24 @@ pub enum PanelGroupAxis {
     Vertical,
 }
 
+/// How dividers occupy space between panels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum PanelDividerMode {
+    /// A one-cell divider line between adjacent panels.
+    #[default]
+    Gap,
+    /// Dividers take no layout space. Each handle overlays the `before` trailing cells of
+    /// the earlier panel and the `after` leading cells of the later one, typically their
+    /// adjacent borders, and is highlighted in place (symbols are kept) while hovered or
+    /// dragged. A zero-width handle is widened to one cell.
+    Overlay {
+        /// Trailing cells of the earlier panel covered by the handle.
+        before: u16,
+        /// Leading cells of the later panel covered by the handle.
+        after: u16,
+    },
+}
+
 /// Requested panel size along the group's primary axis.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PanelSize {
@@ -191,6 +209,10 @@ pub struct PanelGroupResizePolicy {
     pub enabled: bool,
     /// Whether resizing happens continuously during drag events.
     pub live_resize: bool,
+    /// Keep flex panels flexible when resized: their weights are rebased to the cell
+    /// lengths they had, so the resized proportions survive later area changes. Without
+    /// it, resized panels become fixed sizes.
+    pub preserve_flex: bool,
 }
 
 impl PanelGroupResizePolicy {
@@ -200,6 +222,7 @@ impl PanelGroupResizePolicy {
         Self {
             enabled: false,
             live_resize: false,
+            preserve_flex: false,
         }
     }
 
@@ -209,7 +232,15 @@ impl PanelGroupResizePolicy {
         Self {
             enabled: true,
             live_resize: true,
+            preserve_flex: false,
         }
+    }
+
+    /// Return this policy with flex preservation set; see [`Self::preserve_flex`].
+    #[must_use]
+    pub const fn preserving_flex(mut self, preserve: bool) -> Self {
+        self.preserve_flex = preserve;
+        self
     }
 }
 
@@ -293,6 +324,8 @@ impl Default for PanelGroupStyles {
 pub struct PanelGroupState {
     sizes: Vec<PanelSize>,
     constraints: Vec<PanelGroupConstraints>,
+    /// Size to restore for each collapsed panel.
+    collapsed: Vec<Option<PanelSize>>,
     focused_panel: Option<usize>,
     hovered_divider: Option<usize>,
     active_drag: Option<PanelDividerDrag>,
@@ -305,6 +338,7 @@ impl PanelGroupState {
         let sizes = sizes.into();
         Self {
             constraints: vec![PanelGroupConstraints::default(); sizes.len()],
+            collapsed: vec![None; sizes.len()],
             sizes,
             focused_panel: None,
             hovered_divider: None,
@@ -316,6 +350,91 @@ impl PanelGroupState {
     #[must_use]
     pub fn sizes(&self) -> &[PanelSize] {
         &self.sizes
+    }
+
+    /// Replace every panel size, keeping constraints and expanding collapsed panels whose
+    /// index no longer exists.
+    pub fn set_sizes(&mut self, sizes: impl Into<Vec<PanelSize>>) {
+        self.sizes = sizes.into();
+        self.collapsed.resize(self.sizes.len(), None);
+        if self
+            .active_drag
+            .is_some_and(|drag| drag.divider + 1 >= self.sizes.len())
+        {
+            self.active_drag = None;
+        }
+    }
+
+    /// Replace one panel size; a collapsed panel instead updates the size it restores to.
+    pub fn set_size(&mut self, index: usize, size: PanelSize) {
+        match self.collapsed.get_mut(index) {
+            Some(Some(restore)) => *restore = size,
+            _ => {
+                if let Some(slot) = self.sizes.get_mut(index) {
+                    *slot = size;
+                }
+            }
+        }
+    }
+
+    /// Collapse a panel to `cells` along the primary axis, ignoring its constraints, and
+    /// remember its size for [`Self::expand`]. Dividers next to a collapsed panel do not
+    /// resize. Returns whether the panel was expanded before.
+    pub fn collapse(&mut self, index: usize, cells: u16) -> bool {
+        let Some(size) = self.sizes.get(index).copied() else {
+            return false;
+        };
+        if self.collapsed.len() < self.sizes.len() {
+            self.collapsed.resize(self.sizes.len(), None);
+        }
+        if self.collapsed[index].is_some() {
+            self.sizes[index] = PanelSize::Fixed(cells);
+            return false;
+        }
+        self.collapsed[index] = Some(size);
+        self.sizes[index] = PanelSize::Fixed(cells);
+        if self
+            .active_drag
+            .is_some_and(|drag| drag.divider == index || drag.divider + 1 == index)
+        {
+            self.active_drag = None;
+        }
+        true
+    }
+
+    /// Restore a collapsed panel's previous size. Returns whether it was collapsed.
+    pub fn expand(&mut self, index: usize) -> bool {
+        match self.collapsed.get_mut(index).and_then(Option::take) {
+            Some(size) => {
+                self.sizes[index] = size;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Whether a panel is collapsed.
+    #[must_use]
+    pub fn is_collapsed(&self, index: usize) -> bool {
+        self.collapsed.get(index).is_some_and(Option::is_some)
+    }
+
+    /// The size a panel has when expanded: its current size, or the size it restores to.
+    #[must_use]
+    pub fn expanded_size(&self, index: usize) -> Option<PanelSize> {
+        self.collapsed
+            .get(index)
+            .copied()
+            .flatten()
+            .or_else(|| self.sizes.get(index).copied())
+    }
+
+    /// Whether the divider between `divider` and `divider + 1` can resize them.
+    #[must_use]
+    pub fn divider_resizable(&self, divider: usize) -> bool {
+        divider + 1 < self.sizes.len()
+            && !self.is_collapsed(divider)
+            && !self.is_collapsed(divider + 1)
     }
 
     /// Replace per-panel constraints.
@@ -396,6 +515,7 @@ pub struct PanelGroup {
     axis: PanelGroupAxis,
     policy: PanelGroupPolicy,
     styles: PanelGroupStyles,
+    divider_mode: PanelDividerMode,
 }
 
 /// Child-owning panel group on the canonical component lifecycle.
@@ -467,30 +587,25 @@ impl<'a> PanelGroupComponent<'a> {
     }
 
     fn divider_rects(&self, layout: &LayoutNode) -> Vec<Rect> {
+        let width = u16::try_from(layout.size.width).unwrap_or(u16::MAX);
+        let height = u16::try_from(layout.size.height).unwrap_or(u16::MAX);
         layout
             .children
             .windows(2)
             .map(|pair| match self.group.axis {
-                PanelGroupAxis::Horizontal => Rect::new(
-                    u16::try_from(
-                        pair[0].x.saturating_add(
-                            u64::try_from(
-                                usize::try_from(pair[0].node.size.width).unwrap_or(usize::MAX),
-                            )
-                            .unwrap_or(u64::MAX),
-                        ),
-                    )
-                    .unwrap_or(u16::MAX),
+                PanelGroupAxis::Horizontal => self.group.divider_rect(
+                    u16::try_from(pair[0].x.saturating_add(pair[0].node.size.width))
+                        .unwrap_or(u16::MAX),
                     0,
-                    1,
-                    u16::try_from(layout.size.height).unwrap_or(u16::MAX),
+                    width,
+                    (0, height),
                 ),
-                PanelGroupAxis::Vertical => Rect::new(
-                    0,
+                PanelGroupAxis::Vertical => self.group.divider_rect(
                     u16::try_from(pair[0].y.saturating_add(pair[0].node.size.height))
                         .unwrap_or(u16::MAX),
-                    layout.size.width.try_into().unwrap_or(u16::MAX),
-                    1,
+                    0,
+                    height,
+                    (0, width),
                 ),
             })
             .collect()
@@ -520,7 +635,9 @@ impl<'a> PanelGroupComponent<'a> {
             && (self.group.policy.mouse.hover_dividers
                 || (self.group.policy.mouse.drag_dividers && self.group.policy.resize.enabled));
         for (index, divider) in resolved.dividers.iter().copied().enumerate() {
-            if divider_interactive {
+            // Dividers beside a collapsed panel neither resize nor react to the pointer.
+            let resizable = state.divider_resizable(index);
+            if divider_interactive && resizable {
                 cx.push_hit(
                     SceneRegion::new(format!("{}.divider.{index}", self.id.as_str()), divider)
                         .role(HitRole::ResizeHandle)
@@ -541,27 +658,34 @@ impl<'a> PanelGroupComponent<'a> {
                         .focusable(false),
                 );
             }
-            let style = if state.active_divider() == Some(index) {
-                self.group.styles.active_divider
+            let highlight = if !resizable {
+                None
+            } else if state.active_divider() == Some(index) {
+                Some(self.group.styles.active_divider)
             } else if state.hovered_divider == Some(index) {
-                self.group.styles.hovered_divider
+                Some(self.group.styles.hovered_divider)
             } else {
-                self.group.styles.divider
+                None
             };
+            let local = LocalRect::new(
+                i32::from(divider.x),
+                i64::from(divider.y),
+                divider.width,
+                divider.height,
+            );
+            if matches!(self.group.divider_mode, PanelDividerMode::Overlay { .. }) {
+                // The handle sits on the panels' own chrome: highlight it in place.
+                if let Some(style) = highlight {
+                    cx.restyle(local, style);
+                }
+                continue;
+            }
+            let style = highlight.unwrap_or(self.group.styles.divider);
             let symbol = match self.group.axis {
                 PanelGroupAxis::Horizontal => "│",
                 PanelGroupAxis::Vertical => "─",
             };
-            cx.fill(
-                LocalRect::new(
-                    i32::from(divider.x),
-                    i64::from(divider.y),
-                    divider.width,
-                    divider.height,
-                ),
-                symbol,
-                style,
-            );
+            cx.fill(local, symbol, style);
         }
     }
 }
@@ -600,7 +724,6 @@ impl Component for PanelGroupComponent<'_> {
                 constraints.constrain(LogicalSize::new(constraints.max_width(), 0)),
             );
         }
-        let divider_count = count.saturating_sub(1);
         let primary_max = match self.group.axis {
             PanelGroupAxis::Horizontal => constraints.max_width(),
             PanelGroupAxis::Vertical => u16::try_from(
@@ -611,7 +734,9 @@ impl Component for PanelGroupComponent<'_> {
             .unwrap_or(u16::MAX)
             .into(),
         };
-        let available = primary_max.saturating_sub(u64::from(u16_saturating(divider_count)));
+        let available =
+            primary_max.saturating_sub(u64::from(self.group.reserved_divider_cells(count)));
+        let gap = usize::from(matches!(self.group.divider_mode, PanelDividerMode::Gap));
         let lengths = allocated_lengths_for_count(
             u16::try_from(available).unwrap_or(u16::MAX),
             &state,
@@ -657,7 +782,7 @@ impl Component for PanelGroupComponent<'_> {
             }
             cursor = cursor
                 .saturating_add(usize::from(primary))
-                .saturating_add(usize::from(index + 1 < count));
+                .saturating_add(if index + 1 < count { gap } else { 0 });
         }
         let proposed = match self.group.axis {
             PanelGroupAxis::Horizontal => LogicalSize::new(
@@ -736,6 +861,45 @@ impl PanelGroup {
                 hovered_divider: Style::new(),
                 active_divider: Style::new(),
             },
+            divider_mode: PanelDividerMode::Gap,
+        }
+    }
+
+    /// Set how dividers occupy space; see [`PanelDividerMode`].
+    #[must_use]
+    pub const fn divider_mode(mut self, mode: PanelDividerMode) -> Self {
+        self.divider_mode = mode;
+        self
+    }
+
+    /// Cells reserved between `count` panels for divider lines.
+    fn reserved_divider_cells(&self, count: usize) -> u16 {
+        match self.divider_mode {
+            PanelDividerMode::Gap => u16_saturating(count.saturating_sub(1)),
+            PanelDividerMode::Overlay { .. } => 0,
+        }
+    }
+
+    /// Handle rectangle for a divider whose earlier panel ends at `boundary` (exclusive),
+    /// clipped to `[start, end)` along the primary axis.
+    fn divider_rect(&self, boundary: u16, start: u16, end: u16, cross: (u16, u16)) -> Rect {
+        let (offset, length) = match self.divider_mode {
+            PanelDividerMode::Gap => (boundary, 1),
+            PanelDividerMode::Overlay { before, after } => {
+                let first = boundary.saturating_sub(before).max(start);
+                let last = boundary
+                    .saturating_add(after)
+                    .min(end)
+                    .max(first.saturating_add(1));
+                (first, last - first)
+            }
+        };
+        let length = length
+            .min(end.saturating_sub(offset))
+            .max(u16::from(end > offset));
+        match self.axis {
+            PanelGroupAxis::Horizontal => Rect::new(offset, cross.0, length, cross.1),
+            PanelGroupAxis::Vertical => Rect::new(cross.0, offset, cross.1, length),
         }
     }
 
@@ -763,8 +927,8 @@ impl PanelGroup {
                 dividers: Vec::new(),
             };
         }
-        let dividers = count.saturating_sub(1);
-        let available = primary_len(self.axis, area).saturating_sub(u16_saturating(dividers));
+        let available =
+            primary_len(self.axis, area).saturating_sub(self.reserved_divider_cells(count));
         let lengths = allocated_lengths(available, state);
         self.rects_from_lengths(area, &lengths)
     }
@@ -847,7 +1011,7 @@ impl PanelGroup {
         let layout = self.layout(area, state);
         match mouse.kind {
             MouseEventKind::Move if self.policy.mouse.hover_dividers => {
-                let hovered = divider_at(&layout, mouse.position);
+                let hovered = divider_at(&layout, state, mouse.position);
                 if state.hovered_divider == hovered {
                     PanelGroupOutcome::Ignored
                 } else {
@@ -858,7 +1022,7 @@ impl PanelGroup {
             MouseEventKind::Down(MouseButton::Left)
                 if self.policy.mouse.drag_dividers && self.policy.resize.enabled =>
             {
-                if let Some(divider) = divider_at(&layout, mouse.position) {
+                if let Some(divider) = divider_at(&layout, state, mouse.position) {
                     state.hovered_divider = Some(divider);
                     state.active_drag = Some(PanelDividerDrag {
                         divider,
@@ -946,14 +1110,36 @@ impl PanelGroup {
             divider: active.divider,
             drag: active.drag.moved_to(position),
         });
-        if delta == 0 || active.divider + 1 >= state.sizes.len() {
+        self.apply_divider_delta(area, state, active.divider, delta)
+    }
+
+    /// Move a divider by `delta` cells (positive grows the earlier panel), as a drag would,
+    /// within both panels' constraints. Ignored for dividers next to a collapsed panel.
+    pub fn resize_divider(
+        &self,
+        area: Rect,
+        state: &mut PanelGroupState,
+        divider: usize,
+        delta: i32,
+    ) -> PanelGroupOutcome {
+        self.apply_divider_delta(area, state, divider, delta)
+    }
+
+    fn apply_divider_delta(
+        &self,
+        area: Rect,
+        state: &mut PanelGroupState,
+        divider: usize,
+        delta: i32,
+    ) -> PanelGroupOutcome {
+        if delta == 0 || !state.divider_resizable(divider) {
             return PanelGroupOutcome::Ignored;
         }
-        let before_index = active.divider;
-        let after_index = active.divider + 1;
+        let before_index = divider;
+        let after_index = divider + 1;
         let current_lengths = allocated_lengths(
             primary_len(self.axis, area)
-                .saturating_sub(u16_saturating(state.sizes.len().saturating_sub(1))),
+                .saturating_sub(self.reserved_divider_cells(state.sizes.len())),
             state,
         );
         let before = current_lengths
@@ -979,10 +1165,23 @@ impl PanelGroup {
         if new_before == before && new_after == after {
             return PanelGroupOutcome::Ignored;
         }
-        state.sizes[before_index] = PanelSize::Fixed(new_before);
-        state.sizes[after_index] = PanelSize::Fixed(new_after);
+        if self.policy.resize.preserve_flex {
+            // Rebase every expanded flex weight to its current length so the panels that
+            // did not move keep their share, then size the two neighbours the same way.
+            for (index, length) in current_lengths.iter().copied().enumerate() {
+                if matches!(state.sizes[index], PanelSize::Flex(_)) && !state.is_collapsed(index) {
+                    state.sizes[index] = PanelSize::Flex(length.max(1));
+                }
+            }
+        }
+        let keep = |size: PanelSize, cells: u16| match size {
+            PanelSize::Flex(_) if self.policy.resize.preserve_flex => PanelSize::Flex(cells.max(1)),
+            _ => PanelSize::Fixed(cells),
+        };
+        state.sizes[before_index] = keep(state.sizes[before_index], new_before);
+        state.sizes[after_index] = keep(state.sizes[after_index], new_after);
         PanelGroupOutcome::Resized {
-            divider: active.divider,
+            divider,
             before: new_before,
             after: new_after,
         }
@@ -991,10 +1190,12 @@ impl PanelGroup {
     fn rects_from_lengths(&self, area: Rect, lengths: &[u16]) -> PanelGroupLayout {
         let mut panels = Vec::with_capacity(lengths.len());
         let mut dividers = Vec::with_capacity(lengths.len().saturating_sub(1));
-        let mut cursor = match self.axis {
-            PanelGroupAxis::Horizontal => area.x,
-            PanelGroupAxis::Vertical => area.y,
+        let (start, end, cross) = match self.axis {
+            PanelGroupAxis::Horizontal => (area.x, area.right(), (area.y, area.height)),
+            PanelGroupAxis::Vertical => (area.y, area.bottom(), (area.x, area.width)),
         };
+        let gap = u16::from(matches!(self.divider_mode, PanelDividerMode::Gap));
+        let mut cursor = start;
         for (index, length) in lengths.iter().copied().enumerate() {
             let panel = match self.axis {
                 PanelGroupAxis::Horizontal => Rect::new(cursor, area.y, length, area.height),
@@ -1003,16 +1204,8 @@ impl PanelGroup {
             panels.push(panel);
             cursor = cursor.saturating_add(length);
             if index + 1 < lengths.len() {
-                let divider = match self.axis {
-                    PanelGroupAxis::Horizontal => {
-                        Rect::new(cursor, area.y, u16::from(area.width > 0), area.height)
-                    }
-                    PanelGroupAxis::Vertical => {
-                        Rect::new(area.x, cursor, area.width, u16::from(area.height > 0))
-                    }
-                };
-                dividers.push(divider);
-                cursor = cursor.saturating_add(1);
+                dividers.push(self.divider_rect(cursor, start, end, cross));
+                cursor = cursor.saturating_add(gap);
             }
         }
         PanelGroupLayout { panels, dividers }
@@ -1038,7 +1231,13 @@ fn allocated_lengths_for_count(available: u16, state: &PanelGroupState, count: u
     for (index, size) in state.sizes.iter().copied().take(count).enumerate() {
         match size {
             PanelSize::Fixed(cells) => {
-                let clamped = state.constraint(index).clamp(cells).min(remaining);
+                // A collapsed panel keeps its collapsed size regardless of its constraints.
+                let wanted = if state.is_collapsed(index) {
+                    cells
+                } else {
+                    state.constraint(index).clamp(cells)
+                };
+                let clamped = wanted.min(remaining);
                 lengths[index] = clamped;
                 remaining = remaining.saturating_sub(clamped);
             }
@@ -1078,11 +1277,17 @@ fn allocated_lengths_for_count(available: u16, state: &PanelGroupState, count: u
     lengths
 }
 
-fn divider_at(layout: &PanelGroupLayout, position: Point) -> Option<usize> {
+fn divider_at(
+    layout: &PanelGroupLayout,
+    state: &PanelGroupState,
+    position: Point,
+) -> Option<usize> {
     layout
         .dividers
         .iter()
-        .position(|divider| divider.contains(position))
+        .enumerate()
+        .find(|(index, divider)| divider.contains(position) && state.divider_resizable(*index))
+        .map(|(index, _)| index)
 }
 
 const fn resolved_size(size: PanelSize) -> u16 {
@@ -1137,10 +1342,11 @@ mod tests {
     };
 
     use super::{
-        PanelGroup, PanelGroupAxis, PanelGroupComponent, PanelGroupConstraints, PanelGroupOutcome,
-        PanelGroupPolicy, PanelGroupState, PanelSize,
+        PanelDividerMode, PanelGroup, PanelGroupAxis, PanelGroupComponent, PanelGroupConstraints,
+        PanelGroupOutcome, PanelGroupPolicy, PanelGroupState, PanelGroupStyles, PanelSize,
     };
     use crate::selection::{ComponentSelectionPolicy, ComponentSelectionState};
+    use bmux_tui::style::{Color, Style};
 
     #[test]
     fn pointer_override_invalidates_paint_without_remeasuring_layout() {
@@ -1485,6 +1691,241 @@ mod tests {
         assert_eq!(layout.children[0].node.size.height, 2);
         assert_eq!(layout.children[1].y, 3);
         assert_eq!(layout.children[1].node.size.height, 3);
+    }
+
+    const BORDERS: PanelDividerMode = PanelDividerMode::Overlay {
+        before: 1,
+        after: 1,
+    };
+
+    #[test]
+    fn overlay_dividers_take_no_space_and_straddle_panel_edges() {
+        let group = PanelGroup::new(PanelGroupAxis::Horizontal).divider_mode(BORDERS);
+        let state = PanelGroupState::new([PanelSize::fixed(8), PanelSize::flex(1)]);
+        let layout = group.layout(Rect::new(0, 0, 20, 4), &state);
+        assert_eq!(
+            layout.panels,
+            vec![Rect::new(0, 0, 8, 4), Rect::new(8, 0, 12, 4)]
+        );
+        // The earlier panel's last column and the later panel's first column.
+        assert_eq!(layout.dividers, vec![Rect::new(7, 0, 2, 4)]);
+
+        let vertical =
+            PanelGroup::new(PanelGroupAxis::Vertical).divider_mode(PanelDividerMode::Overlay {
+                before: 0,
+                after: 0,
+            });
+        let layout = vertical.layout(Rect::new(0, 0, 5, 10), &state);
+        assert_eq!(layout.panels[1], Rect::new(0, 8, 5, 2));
+        // A zero-width handle still gets one cell, at the start of the later panel.
+        assert_eq!(layout.dividers, vec![Rect::new(0, 8, 5, 1)]);
+    }
+
+    #[test]
+    fn overlay_handles_drag_and_highlight_in_place() {
+        let state = RefCell::new(PanelGroupState::new([
+            PanelSize::fixed(4),
+            PanelSize::flex(1),
+        ]));
+        let hovered = Style::new().fg(Color::Cyan);
+        let component = PanelGroupComponent::new(
+            "workspace",
+            PanelGroup::new(PanelGroupAxis::Horizontal)
+                .policy(PanelGroupPolicy::resize_only())
+                .divider_mode(BORDERS)
+                .styles(PanelGroupStyles {
+                    divider: Style::new().fg(Color::Red),
+                    hovered_divider: hovered,
+                    active_divider: hovered,
+                }),
+            &state,
+        )
+        .child(TextBlock::new("abcd").id("left"))
+        .child(TextBlock::new("efghij").id("right"));
+        let layout = component.layout(Constraints::new(10, 10, 1, Some(1)), &mut LayoutCx::new());
+        assert_eq!(layout.children[1].x, 4);
+
+        let paint = |component: &PanelGroupComponent<'_>| {
+            let mut buffer = Buffer::empty(Rect::new(0, 0, 10, 1));
+            let mut frame = Frame::new(&mut buffer);
+            component.paint(&layout, &mut PaintCx::new(&mut frame));
+            let hits = frame.hits().clone();
+            drop(frame);
+            (buffer, hits)
+        };
+        let (buffer, hits) = paint(&component);
+        assert_eq!(buffer.row_symbols(0).as_deref(), Some("abcdefghij"));
+        // Idle overlay handles paint nothing, not even the divider style.
+        assert_eq!(buffer.get(Point::new(3, 0)).unwrap().style.fg, None);
+        assert!(hits.regions().iter().any(|region| {
+            region.id.as_str() == "workspace.divider.0" && region.area == Rect::new(3, 0, 2, 1)
+        }));
+
+        let mut event_cx = EventCx::new(&layout);
+        component.event(
+            &mouse_event(MouseEventKind::Move, 4, 0),
+            &layout,
+            &mut event_cx,
+        );
+        let (buffer, _) = paint(&component);
+        assert_eq!(buffer.row_symbols(0).as_deref(), Some("abcdefghij"));
+        assert_eq!(
+            buffer.get(Point::new(3, 0)).unwrap().style.fg,
+            Some(Color::Cyan)
+        );
+        assert_eq!(
+            buffer.get(Point::new(4, 0)).unwrap().style.fg,
+            Some(Color::Cyan)
+        );
+        assert_eq!(buffer.get(Point::new(5, 0)).unwrap().style.fg, None);
+
+        // Dragging the earlier panel's border cell resizes like a gap divider.
+        let group = PanelGroup::new(PanelGroupAxis::Horizontal)
+            .policy(PanelGroupPolicy::resize_only())
+            .divider_mode(BORDERS);
+        let mut state = PanelGroupState::new([PanelSize::fixed(4), PanelSize::flex(1)]);
+        let area = Rect::new(0, 0, 10, 1);
+        assert_eq!(
+            group.handle_event(
+                area,
+                &mut state,
+                &mouse_event(MouseEventKind::Down(MouseButton::Left), 3, 0)
+            ),
+            PanelGroupOutcome::DividerDragStarted { divider: 0 }
+        );
+        assert_eq!(
+            group.handle_event(
+                area,
+                &mut state,
+                &mouse_event(MouseEventKind::Drag(MouseButton::Left), 5, 0)
+            ),
+            PanelGroupOutcome::Resized {
+                divider: 0,
+                before: 6,
+                after: 4
+            }
+        );
+    }
+
+    #[test]
+    fn preserved_flex_keeps_resized_proportions_when_the_area_changes() {
+        let group = PanelGroup::new(PanelGroupAxis::Horizontal).policy(PanelGroupPolicy {
+            resize: super::PanelGroupResizePolicy::live().preserving_flex(true),
+            ..PanelGroupPolicy::resize_only()
+        });
+        let mut state =
+            PanelGroupState::new([PanelSize::flex(1), PanelSize::flex(1), PanelSize::fixed(3)]);
+        let area = Rect::new(0, 0, 25, 1);
+        assert_eq!(
+            group.resize_divider(area, &mut state, 0, 4),
+            PanelGroupOutcome::Resized {
+                divider: 0,
+                before: 14,
+                after: 6
+            }
+        );
+        assert_eq!(
+            state.sizes(),
+            [PanelSize::Flex(14), PanelSize::Flex(6), PanelSize::Fixed(3)]
+        );
+        // About twice the flexible space (42 cells): the same 7:3 ratio; fixed stays fixed.
+        let wider = group.layout(Rect::new(0, 0, 47, 1), &state);
+        assert_eq!(
+            wider
+                .panels
+                .iter()
+                .map(|panel| panel.width)
+                .collect::<Vec<_>>(),
+            [29, 13, 3]
+        );
+
+        // Without preservation the resized panels become fixed.
+        let fixed =
+            PanelGroup::new(PanelGroupAxis::Horizontal).policy(PanelGroupPolicy::resize_only());
+        let mut state = PanelGroupState::new([PanelSize::flex(1), PanelSize::flex(1)]);
+        fixed.resize_divider(Rect::new(0, 0, 21, 1), &mut state, 0, 2);
+        assert_eq!(state.sizes(), [PanelSize::Fixed(12), PanelSize::Fixed(8)]);
+    }
+
+    #[test]
+    fn programmatic_resize_respects_constraints() {
+        let group =
+            PanelGroup::new(PanelGroupAxis::Vertical).policy(PanelGroupPolicy::resize_only());
+        let mut state = PanelGroupState::new([PanelSize::fixed(5), PanelSize::fixed(5)]);
+        state.set_constraints([
+            PanelGroupConstraints::new(2, Some(7)),
+            PanelGroupConstraints::new(3, None),
+        ]);
+        let area = Rect::new(0, 0, 4, 11);
+        assert_eq!(
+            group.resize_divider(area, &mut state, 0, 10),
+            PanelGroupOutcome::Resized {
+                divider: 0,
+                before: 7,
+                after: 3
+            }
+        );
+        assert_eq!(
+            group.resize_divider(area, &mut state, 0, -10),
+            PanelGroupOutcome::Resized {
+                divider: 0,
+                before: 2,
+                after: 8
+            }
+        );
+        assert_eq!(
+            group.resize_divider(area, &mut state, 1, 1),
+            PanelGroupOutcome::Ignored
+        );
+    }
+
+    #[test]
+    fn collapsed_panels_ignore_constraints_and_freeze_their_dividers() {
+        let group = PanelGroup::new(PanelGroupAxis::Vertical)
+            .policy(PanelGroupPolicy::resize_only())
+            .divider_mode(BORDERS);
+        let mut state =
+            PanelGroupState::new([PanelSize::flex(1), PanelSize::flex(2), PanelSize::flex(1)]);
+        state.set_constraints([PanelGroupConstraints::new(3, None); 3]);
+        assert!(state.collapse(1, 1));
+        assert!(!state.collapse(1, 1));
+        assert!(state.is_collapsed(1));
+        let area = Rect::new(0, 0, 10, 21);
+        let layout = group.layout(area, &state);
+        assert_eq!(
+            layout
+                .panels
+                .iter()
+                .map(|panel| panel.height)
+                .collect::<Vec<_>>(),
+            [10, 1, 10]
+        );
+        assert!(!state.divider_resizable(0) && !state.divider_resizable(1));
+        assert_eq!(
+            group.resize_divider(area, &mut state, 0, 2),
+            PanelGroupOutcome::Ignored
+        );
+        // Pressing on the frozen handle does not start a drag.
+        let on_handle = layout.dividers[0];
+        assert_ne!(
+            group.handle_event(
+                area,
+                &mut state,
+                &mouse_event(
+                    MouseEventKind::Down(MouseButton::Left),
+                    on_handle.x,
+                    on_handle.y
+                )
+            ),
+            PanelGroupOutcome::DividerDragStarted { divider: 0 }
+        );
+        // Sizing a collapsed panel changes what it restores to.
+        state.set_size(1, PanelSize::flex(4));
+        assert_eq!(state.expanded_size(1), Some(PanelSize::flex(4)));
+        assert!(state.expand(1));
+        assert!(!state.expand(1));
+        assert_eq!(state.sizes()[1], PanelSize::flex(4));
+        assert!(state.divider_resizable(0));
     }
 
     fn mouse_event(kind: MouseEventKind, x: u16, y: u16) -> Event {

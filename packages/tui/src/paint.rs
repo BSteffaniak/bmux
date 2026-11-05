@@ -271,6 +271,24 @@ impl<'frame, 'buffer> PaintCx<'frame, 'buffer> {
         );
     }
 
+    /// Layer `style` over the cells of a local rectangle after translation and
+    /// clipping, keeping their symbols. Colors and modifiers `style` leaves unset
+    /// keep each cell's own, so already painted chrome (a border, a title) can be
+    /// highlighted in place without knowing what was drawn there.
+    pub fn restyle(&mut self, area: LocalRect, style: Style) {
+        let Some(area) = self.project_rect(area) else {
+            return;
+        };
+        let buffer = self.frame.buffer_mut();
+        for y in area.y..area.bottom() {
+            for x in area.x..area.right() {
+                if let Some(cell) = buffer.get_mut(Point::new(x, y)) {
+                    cell.style = cell.style.patch(style);
+                }
+            }
+        }
+    }
+
     /// Fill a local rectangle after translation and clipping, replacing each
     /// cell's style. Filling is how a background is set or cleared.
     pub fn fill(&mut self, area: LocalRect, symbol: &str, style: Style) {
@@ -620,7 +638,7 @@ mod tests {
     use crate::image::{ImageContribution, ImageKey, ImageLifecycle, ImagePayload, ImagePlacement};
     use crate::selection::{SelectionFragment, SelectionScope};
     use crate::semantic::SemanticRegion;
-    use crate::style::{Color, Style};
+    use crate::style::{Color, Modifier, Style};
     use crate::text::Line;
 
     fn filled(width: u16) -> Buffer {
@@ -664,6 +682,39 @@ mod tests {
             Style::new().fg(Color::Green).bg(Color::Blue)
         );
         assert_eq!(buffer.get(Point::new(1, 0)).unwrap().symbol, "b");
+    }
+
+    #[test]
+    fn restyle_keeps_symbols_and_unset_colors_and_clips() {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 4, 2));
+        buffer.fill(
+            Rect::new(0, 0, 4, 2),
+            "│",
+            Style::new().fg(Color::Blue).bg(Color::Black),
+        );
+        {
+            let mut frame = Frame::new(&mut buffer);
+            let mut paint = PaintCx::new(&mut frame);
+            paint.with_child(1, 0, LocalRect::new(0, 0, 2, 2), |paint| {
+                // Wider than the clip: only the two clipped columns change.
+                paint.restyle(
+                    LocalRect::new(0, 0, 5, 1),
+                    Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                );
+            });
+        }
+        for x in 0..4 {
+            let cell = buffer.get(Point::new(x, 0)).unwrap();
+            assert_eq!(cell.symbol, "│");
+            assert_eq!(cell.style.bg, Some(Color::Black));
+            let highlighted = (1..3).contains(&x);
+            assert_eq!(cell.style.fg == Some(Color::Cyan), highlighted, "x = {x}");
+            assert_eq!(cell.style.modifiers.contains(Modifier::BOLD), highlighted);
+        }
+        assert_eq!(
+            buffer.get(Point::new(1, 1)).unwrap().style.fg,
+            Some(Color::Blue)
+        );
     }
 
     #[test]
