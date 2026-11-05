@@ -197,6 +197,16 @@ row
 and tabs clipped away register nothing. The whole-row `<pane id>.title` region
 sits beneath the tabs.
 
+A pane can carry the scrollbar of a viewport inside its content on its right
+border: `PaneComponent::border_scrollbar(viewport, source)` takes the
+viewport's layout id (`selectable_list::list_viewport_id` for a list) and a
+`scroll_view::ScrollSource` holding its scroll state (a `Cell` of
+`ScrollViewState` or of `SelectableListState`). It takes no content width,
+appears only while the content overflows, and can be dragged or clicked through
+its `<pane id>.scrollbar` region. Its geometry is
+`Pane::border_scrollbar_track`, and `scroll_view::TrackScrollbar` paints and
+drives the same kind of scrollbar on any other track.
+
 ## Resizable panel groups
 
 `panel_group::PanelGroupComponent` lays out children along one axis with fixed
@@ -209,7 +219,9 @@ keep it across frames and persist `sizes()` if layouts should be remembered.
   the handle covers the adjacent panels' own edge cells (typically their
   borders) and is highlighted in place, keeping their symbols, while hovered or
   dragged. For stacked bordered panes, `Overlay { before: 1, after: 0 }` keeps
-  the lower pane's title row free for its own clicks.
+  the lower pane's title row free for its own clicks; side by side,
+  `Overlay { before: 0, after: 1 }` keeps the left pane's right border free for
+  a border scrollbar.
 * **Flexible resizing.** With `PanelGroupResizePolicy::preserving_flex(true)`,
   resizing rebases flex weights to the current cell lengths, so the resized
   proportions survive later area changes; otherwise resized panels become fixed.
@@ -241,7 +253,12 @@ patterns.
 For arbitrary scrolling, use the `scroll-view` feature and caller-owned
 `ScrollViewState`. It provides logical offsets, nested wheel routing,
 keyboard/page/home/end navigation, scrollbars and dragging, ensure-visible,
-selection autoscroll, and bottom follow. For large variable-height collections,
+selection autoscroll, and bottom follow.
+`ScrollbarAxisLayoutMode::OverlayOnOverflow`
+draws an integrated scrollbar over the content only while it overflows, so
+content width never depends on overflow. `ScrollExtent` captures a laid-out
+viewport's content and visible heights for callers that scroll it outside a
+component event pass. For large variable-height collections,
 use `virtual-list`: item keys and revisions retain exact current-width layouts,
 only viewport-intersecting items paint/register metadata, and keyed top or
 bottom anchors survive insertion, removal, reorder, append, and reflow.

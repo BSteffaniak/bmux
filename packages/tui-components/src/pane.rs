@@ -19,6 +19,8 @@ use bmux_tui::prelude::{Line, Style};
 use bmux_tui::style::Modifier;
 
 use crate::common::{DragState, InteractionState};
+use crate::scroll_view::{ScrollExtent, ScrollSource, ScrollViewOutcome, TrackScrollbar};
+use crate::scrollbar::{ScrollbarPolicy, ScrollbarStyles};
 use crate::selection::{
     ComponentSelectionOutcome, ComponentSelectionPolicy, ComponentSelectionState,
     paint_component_scope,
@@ -473,6 +475,21 @@ impl Pane<'_> {
         state.area.inset(border).inset(self.padding)
     }
 
+    /// Track of the border scrollbar of a pane occupying `size`: its right border column
+    /// between the corners. `None` without a border or when the pane is too small.
+    #[must_use]
+    pub const fn border_scrollbar_track(&self, size: Rect) -> Option<Rect> {
+        if !self.border || size.width < 2 || size.height < 3 {
+            return None;
+        }
+        Some(Rect::new(
+            size.x.saturating_add(size.width - 1),
+            size.y.saturating_add(1),
+            1,
+            size.height - 2,
+        ))
+    }
+
     /// Register pane selection geometry using the exact rendered outer and inner areas.
     ///
     /// The content area follows `content_capture`; pane border/title/padding remain
@@ -693,7 +710,18 @@ pub struct PaneComponent<'a, 'state> {
     state: &'state Cell<PaneState>,
     child: Element<'a>,
     title: Option<Element<'a>>,
+    scrollbar: Option<BorderScrollbar<'state>>,
 }
+
+/// A scrollbar drawn on a pane's right border for a viewport inside its content.
+struct BorderScrollbar<'state> {
+    viewport: LayoutId,
+    source: &'state dyn ScrollSource,
+    thumb: Option<Style>,
+}
+
+/// Symbols of a border scrollbar: the border line itself, with a heavy line as the thumb.
+const BORDER_SCROLLBAR: ScrollbarPolicy = ScrollbarPolicy::vertical().symbols("│", "│", "┃", "│");
 
 impl<'a, 'state> PaneComponent<'a, 'state> {
     /// Use a component as the title instead of the pane's text title, for example a row
@@ -713,6 +741,35 @@ impl<'a, 'state> PaneComponent<'a, 'state> {
         self
     }
 
+    /// Show a scrollbar on the right border for the scroll viewport laid out as
+    /// `viewport` somewhere inside the content (for a selectable list, see
+    /// [`crate::selectable_list::list_viewport_id`]), reading and changing the scroll
+    /// position held by `source`. It appears only while that content overflows, takes no
+    /// content width, and can be dragged or clicked; its hit region is `<id>.scrollbar`.
+    /// Its geometry is [`Pane::border_scrollbar_track`].
+    #[must_use]
+    pub fn border_scrollbar(
+        mut self,
+        viewport: impl Into<LayoutId>,
+        source: &'state dyn ScrollSource,
+    ) -> Self {
+        self.scrollbar = Some(BorderScrollbar {
+            viewport: viewport.into(),
+            source,
+            thumb: None,
+        });
+        self
+    }
+
+    /// Style of the border scrollbar's thumb. Defaults to the current border style.
+    #[must_use]
+    pub const fn border_scrollbar_thumb(mut self, style: Style) -> Self {
+        if let Some(scrollbar) = &mut self.scrollbar {
+            scrollbar.thumb = Some(style);
+        }
+        self
+    }
+
     /// Create a pane component with stable identity, caller-owned state, and one child.
     #[must_use]
     pub fn new(
@@ -728,16 +785,43 @@ impl<'a, 'state> PaneComponent<'a, 'state> {
             state,
             child: Element::new(child),
             title: None,
+            scrollbar: None,
         }
     }
 
-    fn surface(&self) -> Surface<'_> {
-        let state = self.state.get();
-        let border_style = if state.interaction.focused {
+    const fn border_style(&self) -> Style {
+        if self.state.get().interaction.focused {
             self.pane.styles.focused_border
         } else {
             self.pane.styles.border
+        }
+    }
+
+    /// The border scrollbar with its extent in `layout`, when configured and laid out.
+    fn track_scrollbar(
+        &self,
+        layout: &LayoutNode,
+    ) -> Option<(TrackScrollbar, ScrollExtent, &BorderScrollbar<'state>)> {
+        let scrollbar = self.scrollbar.as_ref()?;
+        let extent = ScrollExtent::of(layout.find(&scrollbar.viewport)?);
+        let border = self.border_style();
+        let styles = ScrollbarStyles {
+            begin: border,
+            track: border,
+            thumb: scrollbar.thumb.unwrap_or(border),
+            end: border,
         };
+        Some((
+            TrackScrollbar::new()
+                .policy(BORDER_SCROLLBAR)
+                .styles(styles),
+            extent,
+            scrollbar,
+        ))
+    }
+
+    fn surface(&self) -> Surface<'_> {
+        let border_style = self.border_style();
         let mut surface = Surface::new(ComponentRef(&self.child))
             .id(format!("{}.surface", self.id.as_str()))
             .padding(self.pane.padding);
@@ -835,6 +919,11 @@ impl Component for PaneComponent<'_, '_> {
         format!("{:?}", self.pane.policy).hash(&mut paint);
         format!("{:?}", state.interaction).hash(&mut paint);
         format!("{:?}", state.drag).hash(&mut paint);
+        if let Some(scrollbar) = &self.scrollbar {
+            scrollbar.viewport.as_str().hash(&mut paint);
+            scrollbar.source.scroll_state().hash(&mut paint);
+            format!("{:?}", scrollbar.thumb).hash(&mut paint);
+        }
         ComponentRevision::new(layout.finish() ^ child.layout, paint.finish() ^ child.paint)
     }
 
@@ -930,6 +1019,20 @@ impl Component for PaneComponent<'_, '_> {
                 );
             }
         }
+        if let Some(track) = self.pane.border_scrollbar_track(size)
+            && let Some((scrollbar, extent, border)) = self.track_scrollbar(layout)
+            && TrackScrollbar::visible(track, extent)
+        {
+            scrollbar.paint(track, extent, &border.source.scroll_state(), cx);
+            cx.push_hit(
+                SceneRegion::new(format!("{}.scrollbar", self.id.as_str()), track)
+                    .role(HitRole::Scroll)
+                    .pointer_intent(self.pointer_intent)
+                    .hoverable(true)
+                    .focusable(false)
+                    .enabled(!state.interaction.disabled),
+            );
+        }
         self.paint_title_row(size, state, layout.children.get(1), cx);
     }
 
@@ -944,6 +1047,21 @@ impl Component for PaneComponent<'_, '_> {
                 u16::try_from(layout.size.height).unwrap_or(u16::MAX),
             )
         });
+        self.state.set(state);
+        if let Some(track) = self.pane.border_scrollbar_track(state.area)
+            && let Some((scrollbar, extent, border)) = self.track_scrollbar(layout)
+        {
+            let mut scroll = border.source.scroll_state();
+            let dragging = scroll.dragging_scrollbar();
+            let outcome = scrollbar.handle_event(track, extent, &mut scroll, event);
+            border.source.set_scroll_state(scroll);
+            if outcome != ScrollViewOutcome::Ignored {
+                return EventOutcome::Redraw;
+            }
+            if dragging || scroll.dragging_scrollbar() {
+                return EventOutcome::Handled;
+            }
+        }
         let outcome = self.pane.handle_event(&mut state, event);
         self.state.set(state);
         if outcome != PaneOutcome::Ignored {
@@ -1194,6 +1312,123 @@ mod tests {
         Pane, PaneBoundsPolicy, PaneComponent, PaneMousePolicy, PaneOutcome, PanePolicy, PaneState,
         PaneTitleAction, ResizeHandles,
     };
+
+    /// A 10 by `height` pane over a scroll view of `lines` rows, painted; returns the right
+    /// border column's symbols, the scrollbar's hit region and the layout.
+    fn scrolled(
+        lines: usize,
+        height: u16,
+        scroll: &Cell<crate::scroll_view::ScrollViewState>,
+    ) -> (String, Option<Rect>, bmux_tui::component::LayoutNode) {
+        use bmux_tui::component::LogicalSize;
+        let pane_state = Cell::new(PaneState::new(Rect::new(0, 0, 10, height)));
+        let text = (0..lines)
+            .map(|line| format!("row {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let view = crate::scroll_view::ScrollViewComponent::new(
+            "view",
+            LogicalSize::new(8, u64::from(height - 2)),
+            scroll.get(),
+            TextBlock::new(text),
+        );
+        let component = PaneComponent::new("pane", Pane::new(), &pane_state, view)
+            .border_scrollbar("view", scroll);
+        let layout = component.layout(
+            Constraints::new(10, 10, height.into(), Some(height.into())),
+            &mut LayoutCx::new(),
+        );
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 10, height));
+        let mut frame = Frame::new(&mut buffer);
+        component.paint(&layout, &mut PaintCx::new(&mut frame));
+        let hit = frame
+            .hits()
+            .regions()
+            .iter()
+            .find(|region| region.id.as_str() == "pane.scrollbar")
+            .map(|region| region.area);
+        drop(frame);
+        let column = (0..height)
+            .filter_map(|y| buffer.get(Point::new(9, y)).map(|cell| cell.symbol.clone()))
+            .collect();
+        (column, hit, layout)
+    }
+
+    #[test]
+    fn border_scrollbar_shows_only_when_content_overflows() {
+        let scroll = Cell::new(crate::scroll_view::ScrollViewState::new());
+        let (column, hit, _) = scrolled(3, 6, &scroll);
+        assert_eq!(column, "┐││││┘");
+        assert_eq!(hit, None);
+
+        let (column, hit, _) = scrolled(16, 6, &scroll);
+        assert_eq!(column, "┐┃│││┘");
+        assert_eq!(hit, Some(Rect::new(9, 1, 1, 4)));
+
+        let mut state = scroll.get();
+        state.set_vertical_offset(u64::MAX);
+        scroll.set(state);
+        let (column, _, _) = scrolled(16, 6, &scroll);
+        assert_eq!(column, "┐│││┃┘");
+    }
+
+    #[test]
+    fn border_scrollbar_drags_the_scroll_position() {
+        let scroll = Cell::new(crate::scroll_view::ScrollViewState::new());
+        let pane_state = Cell::new(PaneState::new(Rect::new(0, 0, 10, 6)));
+        let (_, _, layout) = scrolled(16, 6, &scroll);
+        let view = TextBlock::new("unused");
+        let component = PaneComponent::new("pane", Pane::new(), &pane_state, view)
+            .border_scrollbar("view", &scroll);
+        let mut cx = EventCx::new(&layout);
+        let mut send = |kind, x, y| {
+            component.event(
+                &Event::Mouse(MouseEvent::new(kind, Point::new(x, y))),
+                &layout,
+                &mut cx,
+            )
+        };
+        assert_eq!(
+            send(MouseEventKind::Down(MouseButton::Left), 9, 4),
+            EventOutcome::Redraw
+        );
+        assert_eq!(scroll.get().vertical_offset(), 12);
+        // The drag keeps control outside the track until released.
+        assert_eq!(
+            send(MouseEventKind::Drag(MouseButton::Left), 2, 1),
+            EventOutcome::Redraw
+        );
+        assert_eq!(scroll.get().vertical_offset(), 0);
+        assert_eq!(
+            send(MouseEventKind::Up(MouseButton::Left), 2, 1),
+            EventOutcome::Handled
+        );
+        assert!(!scroll.get().dragging_scrollbar());
+        // Clicks elsewhere in the pane are not the scrollbar's.
+        assert_ne!(
+            send(MouseEventKind::Down(MouseButton::Left), 2, 2),
+            EventOutcome::Redraw
+        );
+        assert_eq!(scroll.get().vertical_offset(), 0);
+    }
+
+    #[test]
+    fn border_scrollbar_track_needs_a_border_and_room() {
+        let size = Rect::new(2, 3, 10, 6);
+        assert_eq!(
+            Pane::new().border_scrollbar_track(size),
+            Some(Rect::new(11, 4, 1, 4))
+        );
+        assert_eq!(Pane::new().border(false).border_scrollbar_track(size), None);
+        assert_eq!(
+            Pane::new().border_scrollbar_track(Rect::new(0, 0, 10, 2)),
+            None
+        );
+        assert_eq!(
+            Pane::new().border_scrollbar_track(Rect::new(0, 0, 1, 6)),
+            None
+        );
+    }
 
     #[test]
     fn pointer_override_invalidates_paint_without_remeasuring_layout() {

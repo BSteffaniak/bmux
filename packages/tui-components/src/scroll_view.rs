@@ -139,6 +139,184 @@ impl Default for ScrollViewState {
     }
 }
 
+/// Caller-owned storage holding a [`ScrollViewState`].
+///
+/// The state may sit inside a larger component state; chrome outside the scrolled
+/// component (such as a pane border scrollbar) reads and changes it through this trait.
+pub trait ScrollSource {
+    /// Current scroll state.
+    fn scroll_state(&self) -> ScrollViewState;
+    /// Replace the scroll state.
+    fn set_scroll_state(&self, state: ScrollViewState);
+}
+
+impl ScrollSource for std::cell::Cell<ScrollViewState> {
+    fn scroll_state(&self) -> ScrollViewState {
+        self.get()
+    }
+
+    fn set_scroll_state(&self, state: ScrollViewState) {
+        self.set(state);
+    }
+}
+
+/// Vertical extent of a measured viewport: the height of its content and of the visible
+/// window onto it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct ScrollExtent {
+    /// Content height in logical rows.
+    pub content: u64,
+    /// Visible height in logical rows.
+    pub viewport: u64,
+}
+
+impl ScrollExtent {
+    /// Extent of an authoritative viewport node (one whose first child is the measured
+    /// content, as built by [`ScrollViewComponent::viewport_layout`]).
+    #[must_use]
+    pub fn of(viewport: &LayoutNode) -> Self {
+        Self {
+            content: content_height(viewport),
+            viewport: viewport.size.height,
+        }
+    }
+
+    /// Largest vertical offset.
+    #[must_use]
+    pub const fn max_offset(self) -> u64 {
+        self.content.saturating_sub(self.viewport)
+    }
+
+    /// Whether the content is taller than the viewport.
+    #[must_use]
+    pub const fn overflows(self) -> bool {
+        self.max_offset() > 0
+    }
+
+    /// Move `state` vertically by a signed number of rows, clamped to this extent.
+    pub fn scroll_by(self, state: &mut ScrollViewState, delta: i64) -> ScrollViewOutcome {
+        let maximum = self.max_offset();
+        let old = state.vertical_offset.min(maximum);
+        state.vertical_offset = if delta < 0 {
+            old.saturating_sub(delta.unsigned_abs())
+        } else {
+            old.saturating_add(delta.unsigned_abs())
+        }
+        .min(maximum);
+        state.follow_bottom = state.vertical_offset == maximum && delta > 0;
+        outcome(old, state.vertical_offset)
+    }
+}
+
+/// A vertical scrollbar on a track outside the viewport it scrolls, such as a pane border.
+///
+/// It draws and responds only while the content overflows, so callers can keep it
+/// permanently configured. Painting and input use the same track rectangle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TrackScrollbar {
+    policy: ScrollbarPolicy,
+    styles: ScrollbarStyles,
+}
+
+impl TrackScrollbar {
+    /// Vertical track scrollbar with the default policy and styles.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            policy: ScrollbarPolicy::vertical(),
+            styles: ScrollbarStyles::new(),
+        }
+    }
+
+    /// Replace symbols and drag policy. The orientation is always vertical.
+    #[must_use]
+    pub const fn policy(mut self, policy: ScrollbarPolicy) -> Self {
+        self.policy = policy;
+        self.policy.orientation = ScrollbarOrientation::Vertical;
+        self
+    }
+
+    /// Replace styles.
+    #[must_use]
+    pub const fn styles(mut self, styles: ScrollbarStyles) -> Self {
+        self.styles = styles;
+        self
+    }
+
+    /// Whether the scrollbar is shown on `track` for `extent`.
+    #[must_use]
+    pub const fn visible(track: Rect, extent: ScrollExtent) -> bool {
+        !track.is_empty() && extent.overflows()
+    }
+
+    /// Paint onto `track` (local coordinates) when the content overflows.
+    pub fn paint(
+        &self,
+        track: Rect,
+        extent: ScrollExtent,
+        state: &ScrollViewState,
+        cx: &mut PaintCx<'_, '_>,
+    ) {
+        if !Self::visible(track, extent) {
+            return;
+        }
+        let scrollbar = scrollbar_state(
+            extent.content,
+            extent.viewport,
+            state.vertical_offset.min(extent.max_offset()),
+        );
+        Scrollbar::new()
+            .policy(self.policy)
+            .styles(self.styles)
+            .paint(track, &scrollbar, cx);
+    }
+
+    /// Route thumb dragging and track clicks on `track` (terminal coordinates) into
+    /// `state`. A drag keeps control until the button is released, even outside the track.
+    pub fn handle_event(
+        &self,
+        track: Rect,
+        extent: ScrollExtent,
+        state: &mut ScrollViewState,
+        event: &Event,
+    ) -> ScrollViewOutcome {
+        let dragging = state.dragging == Some(ScrollbarOrientation::Vertical);
+        if state.interaction.disabled || !Self::visible(track, extent) {
+            if dragging {
+                state.dragging = None;
+            }
+            return ScrollViewOutcome::Ignored;
+        }
+        let maximum = extent.max_offset();
+        let old = state.vertical_offset.min(maximum);
+        let mut scrollbar = scrollbar_state(extent.content, extent.viewport, old);
+        scrollbar.dragging = dragging;
+        let result =
+            Scrollbar::new()
+                .policy(self.policy)
+                .handle_event(track, &mut scrollbar, event);
+        state.dragging = scrollbar.dragging.then_some(ScrollbarOrientation::Vertical);
+        match result {
+            ScrollbarOutcome::Changed { offset } => {
+                state.vertical_offset = logical_offset_from_scrollbar(
+                    u64::from(offset),
+                    u64::from(scrollbar.max_offset()),
+                    maximum,
+                );
+                state.follow_bottom = state.vertical_offset == maximum;
+                outcome(old, state.vertical_offset)
+            }
+            ScrollbarOutcome::Redraw | ScrollbarOutcome::Ignored => ScrollViewOutcome::Ignored,
+        }
+    }
+}
+
+impl Default for TrackScrollbar {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Generic scroll behavior.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScrollViewPolicy {
@@ -622,7 +800,10 @@ impl ScrollView {
         cx: &mut PaintCx<'_, '_>,
     ) {
         let resolved = scrollbar_layout(area, self.policy.scrollbar_layout());
-        if let Some(scrollbar_area) = resolved.vertical_scrollbar {
+        if let Some(scrollbar_area) = resolved.vertical_scrollbar
+            && (self.policy.vertical_scrollbar.shown_without_overflow()
+                || Self::max_vertical_offset(layout) > 0)
+        {
             let scrollbar = scrollbar_state(
                 content_height(layout),
                 layout.size.height,
@@ -633,7 +814,10 @@ impl ScrollView {
                 .styles(self.scrollbar_styles)
                 .paint(local_rect(area, scrollbar_area), &scrollbar, cx);
         }
-        if let Some(scrollbar_area) = resolved.horizontal_scrollbar {
+        if let Some(scrollbar_area) = resolved.horizontal_scrollbar
+            && (self.policy.horizontal_scrollbar.shown_without_overflow()
+                || Self::max_horizontal_offset(layout) > 0)
+        {
             let scrollbar = scrollbar_state(
                 content_width(layout),
                 layout.size.width,
@@ -1380,8 +1564,8 @@ mod tests {
         }
     }
     use super::{
-        NestedScrollOutcome, ScrollView, ScrollViewComponent, ScrollViewOutcome, ScrollViewPolicy,
-        ScrollViewState, logical_offset_from_scrollbar, scrollbar_state,
+        NestedScrollOutcome, ScrollExtent, ScrollView, ScrollViewComponent, ScrollViewOutcome,
+        ScrollViewPolicy, ScrollViewState, logical_offset_from_scrollbar, scrollbar_state,
     };
     use crate::scrollbar_layout::ScrollbarAxisLayoutMode;
     use bmux_keyboard::{KeyCode, KeyStroke};
@@ -2178,6 +2362,47 @@ mod tests {
         assert_eq!(frame.buffer().get(Point::new(0, 1)).unwrap().symbol, "t");
         assert_eq!(layout.children.len(), 1);
         assert_eq!(layout.children[0].node.size.height, 3);
+    }
+
+    #[test]
+    fn extent_scrolls_within_its_content() {
+        let content = LayoutNode::leaf(LayoutId::new("content"), LogicalSize::new(10, 30));
+        let viewport = LayoutNode::with_children(
+            LayoutId::new("viewport"),
+            LogicalSize::new(10, 10),
+            vec![ChildLayout::new(0, 0, content)],
+        );
+        let extent = ScrollExtent::of(&viewport);
+        assert_eq!(
+            extent,
+            ScrollExtent {
+                content: 30,
+                viewport: 10
+            }
+        );
+        assert!(extent.overflows());
+        let mut state = ScrollViewState::new();
+        assert_eq!(extent.scroll_by(&mut state, -3), ScrollViewOutcome::Ignored);
+        assert_eq!(
+            extent.scroll_by(&mut state, 50),
+            ScrollViewOutcome::Scrolled {
+                vertical_offset: 20
+            }
+        );
+        assert!(state.follows_bottom());
+        assert_eq!(
+            extent.scroll_by(&mut state, -5),
+            ScrollViewOutcome::Scrolled {
+                vertical_offset: 15
+            }
+        );
+        assert!(
+            !ScrollExtent {
+                content: 4,
+                viewport: 10
+            }
+            .overflows()
+        );
     }
 
     #[test]

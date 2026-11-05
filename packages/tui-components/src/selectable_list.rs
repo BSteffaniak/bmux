@@ -1489,6 +1489,26 @@ impl Component for SelectableListComponent<'_, '_> {
     }
 }
 
+impl crate::scroll_view::ScrollSource for Cell<SelectableListState> {
+    fn scroll_state(&self) -> ScrollViewState {
+        self.get().scroll
+    }
+
+    fn set_scroll_state(&self, scroll: ScrollViewState) {
+        let mut state = self.get();
+        state.scroll = scroll;
+        self.set(state);
+    }
+}
+
+/// Layout identity of the scroll viewport inside the list laid out as `id`, for chrome
+/// that scrolls the list from outside it (see
+/// [`crate::pane::PaneComponent::border_scrollbar`]).
+#[must_use]
+pub fn list_viewport_id(id: &LayoutId) -> LayoutId {
+    viewport_id(id)
+}
+
 /// Resolve the shared scroll viewport node inside a list layout.
 fn resolved_viewport(layout: &LayoutNode) -> Option<&LayoutNode> {
     layout.children.first().map(|child| &child.node)
@@ -2067,6 +2087,32 @@ mod tests {
         list.render(Rect::new(0, 0, 6, 2), &state, &mut frame);
 
         assert_eq!(frame.buffer().row_symbols(1).as_deref(), Some("  Thr█"));
+    }
+
+    #[test]
+    fn overflow_only_scrollbar_overlays_content_only_while_it_overflows() {
+        let items = [
+            SelectableListItem::new("one", "One"),
+            SelectableListItem::new("two", "Two"),
+            SelectableListItem::new("three", "Three"),
+        ];
+        let list = SelectableList::new(&items).policy(
+            SelectableListPolicy::interactive()
+                .scrollbar(ScrollbarAxisLayoutMode::OverlayOnOverflow),
+        );
+        let state = SelectableListState::new(None);
+        let render = |height| {
+            let mut buffer = Buffer::empty(Rect::new(0, 0, 7, height));
+            let mut frame = Frame::new(&mut buffer);
+            list.render(Rect::new(0, 0, 7, height), &state, &mut frame);
+            (0..height)
+                .filter_map(|y| frame.buffer().row_symbols(y))
+                .collect::<Vec<_>>()
+        };
+        // Everything fits: the full width is content and no track is drawn.
+        assert_eq!(render(3), ["  One  ", "  Two  ", "  Three"]);
+        // Overflowing: the scrollbar overlays the last column without narrowing the rows.
+        assert_eq!(render(2), ["  One █", "  Two │"]);
     }
 
     #[test]

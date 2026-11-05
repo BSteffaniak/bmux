@@ -11,6 +11,10 @@ pub enum ScrollbarAxisLayoutMode {
     Overlay,
     /// Axis scrollbar reserves gutter space.
     Gutter,
+    /// Axis scrollbar overlays content, drawn and interactive only while the content
+    /// overflows on that axis. Reserving no space keeps the content width independent
+    /// of whether it overflows.
+    OverlayOnOverflow,
 }
 
 impl ScrollbarAxisLayoutMode {
@@ -20,6 +24,12 @@ impl ScrollbarAxisLayoutMode {
 
     const fn gutter(self) -> bool {
         matches!(self, Self::Gutter)
+    }
+
+    /// Whether the scrollbar is drawn for content that does not overflow its axis.
+    #[must_use]
+    pub const fn shown_without_overflow(self) -> bool {
+        !matches!(self, Self::OverlayOnOverflow)
     }
 }
 
