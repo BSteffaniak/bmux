@@ -77,6 +77,7 @@ status-bar = []
 stepper = []
 tab-bar = ["keyboard-input"]
 table = ["keyboard-input", "scroll-view"]
+terminal-view = ["dep:bmux_terminal_grid", "scroll-view"]
 terminal-viewer = ["dep:bmux_terminal_grid"]
 text-input = [
     "scroll-view",
@@ -133,6 +134,7 @@ all = [
     "table",
     "text-input",
     "text-input-box",
+    "terminal-view",
     "terminal-viewer",
     "text-view",
     "toast-stack",

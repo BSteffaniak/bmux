@@ -1,0 +1,18 @@
+[package]
+authors     = { workspace = true }
+categories  = ["command-line-interface", "os"]
+description = "Run a command in a pseudo-terminal and stream its output for bmux"
+edition     = { workspace = true }
+keywords    = ["bmux", "terminal", "pty", "process"]
+license     = { workspace = true }
+name        = "bmux_pty"
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[features]
+default          = []
+fail-on-warnings = []

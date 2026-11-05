@@ -99,6 +99,10 @@ pub mod stepper;
 pub mod tab_bar;
 #[cfg(feature = "table")]
 pub mod table;
+#[cfg(any(feature = "terminal-view", feature = "terminal-viewer"))]
+mod terminal_style;
+#[cfg(feature = "terminal-view")]
+pub mod terminal_view;
 #[cfg(feature = "terminal-viewer")]
 pub mod terminal_viewer;
 #[cfg(feature = "text-input")]

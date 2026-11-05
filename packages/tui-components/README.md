@@ -298,6 +298,39 @@ terminal-grid decoding and ANSI preservation; applications remain responsible
 for process, shell,
 artifact, and recording semantics.
 
+## Live terminal output
+
+The `terminal-view` feature shows a program's output as a terminal shows it,
+live.
+`terminal_view::TerminalState` is caller-owned: feed it what the program writes
+(`feed`), report its end (`finish`), and keep it across frames. It parses
+incrementally into a bounded `bmux_terminal_grid` terminal, so painting never
+re-parses output. `TerminalViewComponent` paints it in one of two modes:
+
+* `TerminalViewMode::Screen` shows the screen as the program drew it, with
+  history above it, including the alternate screen and the cursor. Resize the
+  terminal and the program to `TerminalState::requested_size`.
+* `TerminalViewMode::Reflow` shows the output as a log, rewrapped to the view's
+  width; `max_rows` shows only its end.
+
+```rust
+use bmux_tui_components::terminal_view::{TerminalState, TerminalViewComponent, TerminalViewMode};
+
+let mut terminal = TerminalState::new(120, 30, 5_000);
+terminal.feed(&bytes); // as output arrives, for example from `bmux_pty`
+let view = TerminalViewComponent::new("output", &terminal).mode(TerminalViewMode::Reflow);
+```
+
+The view follows new output while scrolled to the bottom. `TerminalState`
+implements `scroll_view::ScrollSource` and the view lays out its viewport as
+`terminal_viewport_id`, so it works with a pane's border scrollbar and with
+`ScrollExtent` wheel handling; `scrollbar` draws one inside the view instead.
+Running the program (for example with `bmux_pty`) is the caller's concern.
+
+`ScrollViewComponent::fill` makes a scroll view take whatever area layout gives
+it, measuring its content at that width, for scrolled content whose size is not
+known when the view is built.
+
 ## Component conventions
 
 Interactive components should follow the same shape as the existing text input

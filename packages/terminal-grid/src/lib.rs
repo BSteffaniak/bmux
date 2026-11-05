@@ -51,7 +51,8 @@ pub use parser::{
     TerminalProtocolTracker,
 };
 pub use render::{
-    full_screen_repaint_bytes, row_text, visible_text, visible_text_lines, visible_text_trimmed,
+    content_text, full_screen_repaint_bytes, row_text, visible_text, visible_text_lines,
+    visible_text_trimmed,
 };
 pub use snapshot::{
     CellRunSnapshot, CursorSnapshot, GridSnapshot, RowSnapshot, ScrollRegionSnapshot,

@@ -1,15 +1,13 @@
 //! Generic bounded terminal transcript viewer component.
 
 use bmux_terminal_grid::{
-    Color as GridColor, ContentBudget, GridLimits, GridMode, PhysicalRow, Style as GridStyle,
-    TerminalGrid, TerminalGridStream,
+    ContentBudget, GridLimits, GridMode, PhysicalRow, TerminalGrid, TerminalGridStream,
 };
 use bmux_tui::ansi::ansi_to_lines;
 use bmux_tui::geometry::Rect;
 use bmux_tui::paint::PaintCx;
 use bmux_tui::prelude::{Color, Line, Span, Style};
 use bmux_tui::selection::SelectionCapture;
-use bmux_tui::style::Modifier;
 
 use crate::selection::{
     ComponentSelectionOutcome, ComponentSelectionPolicy, ComponentSelectionState,
@@ -311,7 +309,7 @@ fn terminal_grid_row_to_line(grid: &TerminalGrid, row: &PhysicalRow) -> Line {
         if cell.is_wide_continuation() {
             continue;
         }
-        let style = terminal_grid_style(grid.palette().get(cell.style()));
+        let style = crate::terminal_style::terminal_grid_style(grid.palette().get(cell.style()));
         if current_style == Some(style) {
             current_text.push_str(cell.text());
             continue;
@@ -333,67 +331,6 @@ fn terminal_grid_row_to_line(grid: &TerminalGrid, row: &PhysicalRow) -> Line {
         ));
     }
     Line::from_spans(spans)
-}
-
-const fn terminal_grid_style(style: GridStyle) -> Style {
-    let mut output = Style::new();
-    if let Some(fg) = style.fg {
-        output = output.fg(terminal_grid_color(fg));
-    }
-    if let Some(bg) = style.bg {
-        output = output.bg(terminal_grid_color(bg));
-    }
-    if style.bold {
-        output = output.add_modifier(Modifier::BOLD);
-    }
-    if style.italic {
-        output = output.add_modifier(Modifier::ITALIC);
-    }
-    if style.underline {
-        output = output.add_modifier(Modifier::UNDERLINE);
-    }
-    if style.dim {
-        output = output.add_modifier(Modifier::DIM);
-    }
-    if style.inverse {
-        output = output.add_modifier(Modifier::REVERSED);
-    }
-    if style.hidden {
-        output = output.add_modifier(Modifier::HIDDEN);
-    }
-    if style.strike {
-        output = output.add_modifier(Modifier::CROSSED_OUT);
-    }
-    output
-}
-
-const fn terminal_grid_color(color: GridColor) -> Color {
-    match color {
-        GridColor::Indexed(index) => ansi_indexed_color(index),
-        GridColor::Rgb { r, g, b } => Color::Rgb(r, g, b),
-    }
-}
-
-const fn ansi_indexed_color(index: u8) -> Color {
-    match index {
-        0 => Color::Black,
-        1 => Color::Red,
-        2 => Color::Green,
-        3 => Color::Yellow,
-        4 => Color::Blue,
-        5 => Color::Magenta,
-        6 => Color::Cyan,
-        7 => Color::White,
-        8 => Color::BrightBlack,
-        9 => Color::BrightRed,
-        10 => Color::BrightGreen,
-        11 => Color::BrightYellow,
-        12 => Color::BrightBlue,
-        13 => Color::BrightMagenta,
-        14 => Color::BrightCyan,
-        15 => Color::BrightWhite,
-        other => Color::Indexed(other),
-    }
 }
 
 fn preview_lines<T>(lines: &[T], max_rows: usize) -> Vec<&T> {
@@ -480,7 +417,7 @@ mod tests {
             strike: true,
             ..bmux_terminal_grid::Style::default()
         };
-        let projected = super::terminal_grid_style(source);
+        let projected = crate::terminal_style::terminal_grid_style(source);
         assert!(
             projected
                 .modifiers

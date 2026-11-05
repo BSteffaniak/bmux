@@ -46,6 +46,32 @@ pub fn visible_text_trimmed(grid: &TerminalGrid, scrollback_offset: usize, rows:
     lines.join("\n")
 }
 
+/// Plain text of everything the terminal shows: retained history and the screen in the
+/// main screen, only the screen in the alternate screen. Soft-wrapped rows are joined back
+/// into their logical lines, trailing blanks are dropped from each line, and unused rows after
+/// the content are omitted.
+#[must_use]
+pub fn content_text(grid: &TerminalGrid) -> String {
+    let rows = match grid.mode() {
+        crate::GridMode::Main => grid.main_content_rows(),
+        crate::GridMode::Alternate => grid.display_rows(0, grid.height()),
+    };
+    let mut text = String::new();
+    let mut line = String::new();
+    for row in &rows {
+        line.push_str(&row_text(row, row.cells().len()));
+        if !row.wrapped() {
+            text.push_str(line.trim_end());
+            text.push('\n');
+            line.clear();
+        }
+    }
+    text.push_str(line.trim_end());
+    let trimmed = text.trim_end_matches('\n').len();
+    text.truncate(trimmed);
+    text
+}
+
 /// Generate a full-screen ANSI repaint for the current viewport.
 ///
 /// The repaint clears the screen, positions each viewport row explicitly, emits
@@ -303,5 +329,48 @@ mod tests {
         grid.process("好b".as_bytes());
 
         assert_eq!(visible_text_trimmed(grid.grid(), 0, 1), "好b ");
+    }
+}
+
+#[cfg(test)]
+mod content_text_tests {
+    use crate::{GridLimits, TerminalGridStream, content_text};
+
+    fn text(bytes: &[u8], width: u16, height: u16) -> String {
+        let mut stream = TerminalGridStream::new(
+            width,
+            height,
+            GridLimits {
+                scrollback_rows: 100,
+            },
+        )
+        .unwrap();
+        stream.process(bytes);
+        content_text(stream.grid())
+    }
+
+    #[test]
+    fn joins_wrapped_rows_and_applies_carriage_returns() {
+        // `\r` progress rewrites leave only the final state; colors carry no text.
+        let bytes = b"10%\r100%\r\n\x1b[31mabcdefghij\x1b[0m\r\nend   \r\n";
+        assert_eq!(text(bytes, 6, 3), "100%\nabcdefghij\nend");
+    }
+
+    #[test]
+    fn includes_history_and_omits_unused_rows() {
+        let bytes: Vec<u8> = (1..=8)
+            .flat_map(|n| format!("line {n}\r\n").into_bytes())
+            .collect();
+        let expected: Vec<String> = (1..=8).map(|n| format!("line {n}")).collect();
+        assert_eq!(text(&bytes, 20, 3), expected.join("\n"));
+        assert_eq!(text(b"", 20, 3), "");
+    }
+
+    #[test]
+    fn alternate_screen_shows_the_screen() {
+        assert_eq!(
+            text(b"main\r\n\x1b[?1049h\x1b[Hfull screen", 20, 3),
+            "full screen"
+        );
     }
 }

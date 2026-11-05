@@ -77,6 +77,7 @@ members = [
     "packages/slots",
     "packages/bmux-env",
     "packages/terminal_protocol",
+    "packages/pty",
     "packages/terminal-grid",
     "packages/keyboard",
     "packages/text-edit",
@@ -277,6 +278,7 @@ bmux_presenter = { version = "0.0.1-alpha.4", default-features = false, path = "
 bmux_presenter_plugin = { version = "0.0.1-alpha.4", default-features = false, path = "plugins/presenter-plugin" }
 bmux_presenter_plugin_api = { version = "0.0.1-alpha.4", default-features = false, path = "plugins/presenter-plugin-api" }
 bmux_presenter_runtime = { version = "0.0.1-alpha.4", default-features = false, path = "packages/presenter-runtime" }
+bmux_pty = { version = "0.0.1-alpha.4", default-features = false, path = "packages/pty" }
 bmux_recording_protocol = { version = "0.0.1-alpha.4", default-features = false, path = "packages/recording-protocol" }
 bmux_recording_runtime = { version = "0.0.1-alpha.4", default-features = false, path = "packages/recording-runtime" }
 bmux_sandbox_harness = { version = "0.0.1-alpha.4", default-features = false, path = "packages/sandbox-harness" }

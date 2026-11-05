@@ -417,6 +417,7 @@ pub struct ScrollViewComponent<'a> {
     reveal: Option<LayoutId>,
     reveal_end: bool,
     retained_state: Option<&'a std::cell::Cell<ScrollViewState>>,
+    fill: bool,
 }
 
 impl<'a> ScrollViewComponent<'a> {
@@ -447,7 +448,17 @@ impl<'a> ScrollViewComponent<'a> {
             reveal: None,
             reveal_end: false,
             retained_state: None,
+            fill: false,
         }
+    }
+
+    /// Fill the area layout gives it: the viewport takes the constraints' size (the content's
+    /// height when height is unbounded) and the content is measured at their width, instead
+    /// of the viewport size and content width given at construction.
+    #[must_use]
+    pub const fn fill(mut self) -> Self {
+        self.fill = true;
+        self
     }
 
     /// Keep a measured descendant visible on both axes in the allocated viewport.
@@ -561,6 +572,7 @@ impl Component for ScrollViewComponent<'_> {
         self.id.as_str().hash(&mut layout);
         self.viewport.hash(&mut layout);
         self.content_width.hash(&mut layout);
+        self.fill.hash(&mut layout);
         child.layout.hash(&mut layout);
 
         let mut paint = std::collections::hash_map::DefaultHasher::new();
@@ -579,6 +591,13 @@ impl Component for ScrollViewComponent<'_> {
         constraints: Constraints,
         cx: &mut bmux_tui::component::LayoutCx,
     ) -> LayoutNode {
+        if self.fill {
+            let width = constraints.max_width();
+            let child = self.child.layout(Constraints::for_width(width), cx);
+            let height = constraints.max_height().unwrap_or(child.size.height);
+            let viewport = constraints.constrain(LogicalSize::new(width, height));
+            return Self::viewport_layout(self.id.clone(), viewport, child);
+        }
         let child = self
             .child
             .layout(Constraints::for_width(self.content_width.into()), cx);
@@ -2403,6 +2422,28 @@ mod tests {
             }
             .overflows()
         );
+    }
+
+    #[test]
+    fn filling_views_take_the_constraints_and_measure_content_at_their_width() {
+        use bmux_tui::component::LayoutCx;
+        use bmux_tui::composition::TextBlock;
+
+        let view = ScrollViewComponent::new(
+            "fill",
+            LogicalSize::new(0, 0),
+            ScrollViewState::new(),
+            TextBlock::new("aaaa bbbb cccc"),
+        )
+        .fill();
+        // Bounded: the viewport fills the area; the content wraps to its width.
+        let layout = view.layout(Constraints::new(4, 4, 2, Some(2)), &mut LayoutCx::new());
+        assert_eq!(layout.size, LogicalSize::new(4, 2));
+        assert_eq!(layout.children[0].node.size.height, 3);
+        assert_eq!(ScrollExtent::of(&layout).max_offset(), 1);
+        // Unbounded height: as tall as the content.
+        let layout = view.layout(Constraints::for_width(9), &mut LayoutCx::new());
+        assert_eq!(layout.size, LogicalSize::new(9, 2));
     }
 
     #[test]
