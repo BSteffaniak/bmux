@@ -3418,6 +3418,7 @@ dependencies = [
  "image",
  "libc",
  "serde",
+ "signal-hook",
  "unicode-segmentation",
  "unicode-width",
  "zeroize",

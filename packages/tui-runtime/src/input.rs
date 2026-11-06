@@ -1,4 +1,9 @@
-//! Managed asynchronous Crossterm input sources.
+//! Managed asynchronous terminal input sources.
+//!
+//! On Unix every source shares one reader: [`RawInput`] on its own thread,
+//! blocked in event-driven waits (input, `SIGWINCH`, or a shutdown wake) and
+//! handing packets to async consumers through bounded channels. Other
+//! platforms read through Crossterm.
 
 use bmux_tui::crossterm::CrosstermEventStream;
 use bmux_tui::event::Event;
@@ -7,6 +12,145 @@ use tokio::task::JoinHandle;
 
 use crate::program::Program;
 use crate::runtime::RuntimeHandle;
+#[cfg(unix)]
+use bmux_tui::crossterm::input::{InputWaker, RawInput, RawInputPacket};
+
+/// A [`RawInput`] on its own thread, blocked in [`RawInput::wait`] and handing
+/// each packet to a delivery callback. Stopping wakes the wait, so shutdown is
+/// prompt without any polling; dropping stops and joins the thread, releasing
+/// terminal input ownership before returning.
+#[cfg(unix)]
+struct RawReader {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    waker: InputWaker,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(unix)]
+impl RawReader {
+    /// Read until `deliver` returns `false` or the reader stops. Errors are
+    /// delivered and end the reader.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the operating system cannot start a thread.
+    fn spawn(
+        mut reader: RawInput,
+        mut deliver: impl FnMut(std::io::Result<RawInputPacket>) -> bool + Send + 'static,
+    ) -> Self {
+        use std::sync::atomic::Ordering;
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let waker = reader.waker();
+        let stopped = std::sync::Arc::clone(&stop);
+        let thread = std::thread::Builder::new()
+            .name("bmux-terminal-input".to_owned())
+            .spawn(move || {
+                while !stopped.load(Ordering::Acquire) {
+                    match reader.wait() {
+                        Ok(Some(packet)) => {
+                            if !deliver(Ok(packet)) {
+                                break;
+                            }
+                        }
+                        // Woken: check whether to stop.
+                        Ok(None) => {}
+                        Err(error) => {
+                            deliver(Err(error));
+                            break;
+                        }
+                    }
+                }
+            })
+            .expect("spawn terminal input thread");
+        Self {
+            stop,
+            waker,
+            thread: Some(thread),
+        }
+    }
+
+    fn request_stop(&self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+        self.waker.wake();
+    }
+
+    /// Stop and await the thread without blocking the async runtime.
+    async fn shutdown(&mut self) {
+        self.request_stop();
+        if let Some(thread) = self.thread.take() {
+            let _ = tokio::task::spawn_blocking(move || thread.join()).await;
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for RawReader {
+    fn drop(&mut self) {
+        self.request_stop();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// Decoded terminal events from the stdout tty through a [`RawReader`].
+#[cfg(unix)]
+struct RawEventStream {
+    receiver: mpsc::Receiver<Result<Event, std::io::Error>>,
+    _reader: Option<RawReader>,
+}
+
+#[cfg(unix)]
+impl RawEventStream {
+    /// Open the stdout tty, or yield the failure as the stream's only item.
+    fn open(capacity: usize) -> Self {
+        let (sender, receiver) = mpsc::channel(capacity.max(1));
+        match RawInput::open_stdout_tty() {
+            Ok(reader) => {
+                let reader = RawReader::spawn(reader, move |packet| match packet {
+                    Ok(packet) => packet
+                        .into_event()
+                        .is_none_or(|event| sender.blocking_send(Ok(event)).is_ok()),
+                    Err(error) => {
+                        let _ = sender.blocking_send(Err(error));
+                        false
+                    }
+                });
+                Self {
+                    receiver,
+                    _reader: Some(reader),
+                }
+            }
+            Err(error) => {
+                let _ = sender.try_send(Err(error));
+                Self {
+                    receiver,
+                    _reader: None,
+                }
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+impl futures_util::Stream for RawEventStream {
+    type Item = Result<Event, std::io::Error>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        self.receiver.poll_recv(cx)
+    }
+}
+
+#[cfg(unix)]
+impl Drop for RawEventStream {
+    fn drop(&mut self) {
+        // Fail any pending delivery so the reader thread can be joined.
+        self.receiver.close();
+    }
+}
 
 type PrivateRouter<M> = (
     super::private_input::PrivateInputGate,
@@ -14,10 +158,10 @@ type PrivateRouter<M> = (
 );
 
 /// Bounded retrievable opaque packets for a single input connection.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 #[derive(Clone, Default)]
 pub struct OpaqueInputQueue(std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<Vec<u8>>>>);
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 impl OpaqueInputQueue {
     /// Retain unchanged bytes, rejecting overflow instead of dropping old packets.
     /// # Errors
@@ -63,73 +207,52 @@ impl OpaqueInputQueue {
 }
 
 /// Bounded opt-in packet reader. No Crossterm reader is constructed on this path.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub struct ManagedRawInput {
-    receiver: mpsc::Receiver<std::io::Result<bmux_tui::crossterm::input::LinuxInputPacket>>,
-    shutdown: watch::Sender<bool>,
-    task: Option<JoinHandle<()>>,
+    receiver: mpsc::Receiver<std::io::Result<RawInputPacket>>,
+    reader: Option<RawReader>,
 }
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 impl ManagedRawInput {
     fn start(capacity: usize) -> std::io::Result<Self> {
-        let reader = bmux_tui::crossterm::input::RawInput::open_stdout_tty()?;
+        let reader = RawInput::open_stdout_tty()?;
         Ok(Self::from_reader(reader, capacity))
     }
     /// Adopt an exclusive raw reader, retaining the same bounded admission contract.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the operating system cannot start the reader thread.
     #[must_use]
-    pub fn from_reader(mut reader: bmux_tui::crossterm::input::RawInput, capacity: usize) -> Self {
+    pub fn from_reader(reader: RawInput, capacity: usize) -> Self {
         // Explicit cap bounds queued opaque bytes even for untrusted capacities.
         let (sender, receiver) = mpsc::channel(capacity.clamp(1, 256));
-        let (shutdown, mut stopped) = watch::channel(false);
-        let task = tokio::spawn(async move {
-            loop {
-                if *stopped.borrow() {
-                    break;
-                }
-                let packet = match reader.read_ready(std::time::Instant::now()) {
-                    Ok(Some(packet)) => Ok(packet),
-                    Ok(None) => {
-                        tokio::select! { biased; _ = stopped.changed() => break,
-                        () = tokio::time::sleep(std::time::Duration::from_millis(2)) => {} }
-                        continue;
-                    }
-                    Err(error) => Err(error),
-                };
-                let terminal = packet.is_err();
-                tokio::select! { biased; _ = stopped.changed() => break,
-                result = sender.send(packet) => if result.is_err() { break; } }
-                if terminal {
-                    break;
-                }
-            }
+        let reader = RawReader::spawn(reader, move |packet| {
+            let terminal = packet.is_err();
+            sender.blocking_send(packet).is_ok() && !terminal
         });
         Self {
             receiver,
-            shutdown,
-            task: Some(task),
+            reader: Some(reader),
         }
     }
     /// Receive an ordinary event or unchanged opaque packet, in read order.
-    pub async fn recv(
-        &mut self,
-    ) -> Option<std::io::Result<bmux_tui::crossterm::input::LinuxInputPacket>> {
+    pub async fn recv(&mut self) -> Option<std::io::Result<RawInputPacket>> {
         self.receiver.recv().await
     }
     /// Stop admission and await reader ownership release, even under channel backpressure.
     pub async fn shutdown(&mut self) {
-        let _ = self.shutdown.send(true);
-        if let Some(task) = self.task.take() {
-            let _ = task.await;
+        self.receiver.close();
+        if let Some(mut reader) = self.reader.take() {
+            reader.shutdown().await;
         }
     }
 }
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 impl Drop for ManagedRawInput {
     fn drop(&mut self) {
-        let _ = self.shutdown.send(true);
-        if let Some(task) = self.task.take() {
-            task.abort();
-        }
+        // Fail any pending delivery; the reader then stops and joins.
+        self.receiver.close();
     }
 }
 
@@ -141,11 +264,11 @@ pub struct ManagedTerminalInput {
 }
 
 impl ManagedTerminalInput {
-    /// Open an opt-in sole Linux raw packet owner. Legacy constructors are unchanged.
+    /// Open an opt-in sole raw packet owner. Legacy constructors are unchanged.
     /// Never combine this owner with another terminal reader.
     /// # Errors
     /// Returns tty identity/open errors.
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     pub fn start_raw_packets(capacity: usize) -> std::io::Result<ManagedRawInput> {
         ManagedRawInput::start(capacity)
     }
@@ -157,53 +280,13 @@ impl ManagedTerminalInput {
     /// Panics when called outside a Tokio runtime.
     #[must_use]
     pub fn start(capacity: usize) -> Self {
-        #[cfg(target_os = "linux")]
-        {
-            let (sender, receiver) = mpsc::channel(capacity.max(1));
-            let (shutdown, mut stopped) = watch::channel(false);
-            let task = tokio::spawn(async move {
-                let mut reader = match bmux_tui::crossterm::input::RawInput::open_stdout_tty() {
-                    Ok(reader) => reader,
-                    Err(error) => {
-                        let _ = sender.send(Err(error)).await;
-                        return;
-                    }
-                };
-                loop {
-                    if *stopped.borrow() {
-                        break;
-                    }
-                    match reader.read_ready(std::time::Instant::now()) {
-                        Ok(Some(packet)) => {
-                            if let Some(event) = packet.into_event() {
-                                tokio::select! { biased; _ = stopped.changed() => break,
-                                result = sender.send(Ok(event)) => if result.is_err() { break; } }
-                            }
-                        }
-                        Ok(None) => {
-                            tokio::select! { biased; _ = stopped.changed() => break,
-                            () = tokio::time::sleep(std::time::Duration::from_millis(2)) => {} }
-                        }
-                        Err(error) => {
-                            let _ = sender.send(Err(error)).await;
-                            break;
-                        }
-                    }
-                }
-            });
-            Self {
-                receiver,
-                shutdown,
-                task: Some(task),
-            }
-        }
-        #[cfg(not(target_os = "linux"))]
-        Self::start_stream(capacity, CrosstermEventStream::new())
+        #[cfg(unix)]
+        let events = RawEventStream::open(capacity);
+        #[cfg(not(unix))]
+        let events = CrosstermEventStream::new();
+        Self::start_stream(capacity, events)
     }
 
-    /// Linux single-reader implementation is used by production; stream injection
-    /// remains available for non-Linux backends and deterministic runtime tests.
-    #[cfg(not(target_os = "linux"))]
     fn start_stream<S>(capacity: usize, mut events: S) -> Self
     where
         S: futures_util::Stream<Item = Result<Event, std::io::Error>> + Send + Unpin + 'static,
@@ -336,35 +419,12 @@ impl TerminalInput {
     where
         P: Program,
     {
-        #[cfg(target_os = "linux")]
-        {
-            let reader = bmux_tui::crossterm::input::RawInput::open_stdout_tty();
-            let events = Box::pin(futures_util::stream::unfold(
-                Some(reader),
-                |state| async move {
-                    let mut reader = match state? {
-                        Ok(reader) => reader,
-                        Err(error) => return Some((Err(error), None)),
-                    };
-                    loop {
-                        match reader.read_ready(std::time::Instant::now()) {
-                            Ok(Some(packet)) => {
-                                if let Some(event) = packet.into_event() {
-                                    return Some((Ok(event), Some(Ok(reader))));
-                                }
-                            }
-                            Ok(None) => {
-                                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-                            }
-                            Err(error) => return Some((Err(error), None)),
-                        }
-                    }
-                },
-            ));
-            Self::start_stream::<P, _>(handle, map_error, events)
-        }
-        #[cfg(not(target_os = "linux"))]
-        Self::start_stream::<P, _>(handle, map_error, CrosstermEventStream::new())
+        // Bounded like runtime admission: the reader waits rather than buffering.
+        #[cfg(unix)]
+        let events = RawEventStream::open(64);
+        #[cfg(not(unix))]
+        let events = CrosstermEventStream::new();
+        Self::start_stream::<P, _>(handle, map_error, events)
     }
 
     /// Start private-capable ingress. `gate` routes before ordinary runtime admission.

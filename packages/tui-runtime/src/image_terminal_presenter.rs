@@ -1205,7 +1205,7 @@ mod async_tests {
         reason = "fixture-local PTY writer and parsers stay beside their setup and never escape test"
     )]
     async fn pty_raw_managed_probe_ack_upload_pixels_timeout_and_cleanup() {
-        use bmux_tui::crossterm::input::{LinuxInputPacket, RawInput};
+        use bmux_tui::crossterm::input::{RawInput, RawInputPacket};
         use bmux_tui::image::*;
         use std::io::Read;
         use std::os::fd::{AsRawFd, FromRawFd};
@@ -1359,18 +1359,18 @@ mod async_tests {
         tokio::time::timeout(Duration::from_secs(2), async {
             while !accepted || !key {
                 match input.recv().await.unwrap().unwrap() {
-                    LinuxInputPacket::Opaque(frame) => {
+                    RawInputPacket::Opaque(frame) => {
                         if presenter.handle_shared_memory_reply(&frame, now) {
                             accepted = true;
                         } else {
                             unmatched.push(frame).unwrap();
                         }
                     }
-                    LinuxInputPacket::Event(bmux_tui::event::Event::Key(stroke)) => {
+                    RawInputPacket::Event(bmux_tui::event::Event::Key(stroke)) => {
                         assert_eq!(stroke.key, bmux_keyboard::KeyCode::Char('q'));
                         key = true;
                     }
-                    LinuxInputPacket::Event(bmux_tui::event::Event::Resize(_)) => {}
+                    RawInputPacket::Event(bmux_tui::event::Event::Resize(_)) => {}
                     other => panic!("unexpected packet: {other:?}"),
                 }
             }

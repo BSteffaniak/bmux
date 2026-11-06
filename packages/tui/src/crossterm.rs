@@ -209,13 +209,13 @@ fn pop_keyboard_enhancement_flags<W: Write>(writer: &mut W) -> io::Result<()> {
     writer.flush()
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub mod input;
 
 // 0: no owner, 1: exclusive raw owner, 2: permanent Crossterm global owner.
 static INPUT_OWNER: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub(super) fn claim_raw_input() -> bool {
     INPUT_OWNER
         .compare_exchange(
@@ -226,7 +226,7 @@ pub(super) fn claim_raw_input() -> bool {
         )
         .is_ok()
 }
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub(super) fn release_raw_input() {
     INPUT_OWNER.store(0, std::sync::atomic::Ordering::SeqCst);
 }

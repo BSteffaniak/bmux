@@ -1,4 +1,11 @@
-//! Single-owner Linux terminal packets, preserving opaque protocol input.
+//! Single-owner Unix terminal input, preserving opaque protocol input.
+//!
+//! Every Unix shares one reader: the stdout tty is reopened as an independent
+//! nonblocking descriptor (only how its path is found differs per platform),
+//! decoded by one [`Decoder`], and waited on with `poll(2)` alongside a wake
+//! pipe that `SIGWINCH` and shutdown requests write to. Waits are driven by
+//! readiness alone; a timeout is armed only while a lone ESC awaits the rest
+//! of a sequence, for exactly its remaining disambiguation window.
 
 use crate::{
     event::{Event, FocusEvent, MouseButton, MouseEvent, MouseEventKind, MouseModifiers},
@@ -14,9 +21,13 @@ const MAX_PENDING: usize = 64 * 1024;
 const MAX_FRAME: usize = 4096;
 const ESC_WAIT: Duration = Duration::from_millis(30);
 
-/// Lossless Linux input packet. Opaque bytes are never interpreted as application text.
+/// Former name of [`RawInputPacket`], from when raw input was Linux-only.
+#[deprecated(note = "renamed to `RawInputPacket`")]
+pub type LinuxInputPacket = RawInputPacket;
+
+/// Lossless raw input packet. Opaque bytes are never interpreted as application text.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum LinuxInputPacket {
+pub enum RawInputPacket {
     /// Decoded ordinary terminal input.
     Event(Event),
     /// A repeat or release, retaining metadata absent from the TUI action model.
@@ -30,7 +41,7 @@ pub enum LinuxInputPacket {
     Opaque(Vec<u8>),
 }
 
-impl LinuxInputPacket {
+impl RawInputPacket {
     /// Convert to a TUI action: repeats type, releases do not. Opaque input is wiped.
     #[must_use]
     pub fn into_event(self) -> Option<Event> {
@@ -121,9 +132,9 @@ impl Decoder {
     fn take(
         &mut self,
         count: usize,
-        packet: LinuxInputPacket,
+        packet: RawInputPacket,
         now: Instant,
-    ) -> Option<LinuxInputPacket> {
+    ) -> Option<RawInputPacket> {
         use zeroize::Zeroize;
         let len = self.pending.len();
         self.pending.copy_within(count.., 0);
@@ -132,15 +143,26 @@ impl Decoder {
         self.since = (!self.pending.is_empty()).then_some(now);
         Some(packet)
     }
-    fn opaque(&mut self, count: usize, now: Instant) -> Option<LinuxInputPacket> {
+    fn opaque(&mut self, count: usize, now: Instant) -> Option<RawInputPacket> {
         let bytes = self.pending[..count].to_vec();
-        self.take(count, LinuxInputPacket::Opaque(bytes), now)
+        self.take(count, RawInputPacket::Opaque(bytes), now)
     }
+    /// When pending input stops waiting for more bytes, if that is still
+    /// ahead: the only moment decoding can change without new input.
+    fn deadline(&self, now: Instant) -> Option<Instant> {
+        if self.pending.is_empty() {
+            return None;
+        }
+        self.since
+            .map(|since| since + ESC_WAIT)
+            .filter(|deadline| *deadline > now)
+    }
+
     #[expect(
         clippy::too_many_lines,
         reason = "ordered bounded wire framing keeps consumption decisions adjacent; no side effects before complete packets"
     )]
-    fn next(&mut self, now: Instant) -> io::Result<Option<LinuxInputPacket>> {
+    fn next(&mut self, now: Instant) -> io::Result<Option<RawInputPacket>> {
         if self.failed {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -162,8 +184,8 @@ impl Decoder {
             if let Some(end) = bytes[6..].windows(6).position(|part| part == b"\x1b[201~") {
                 let count = end + 12;
                 let packet = std::str::from_utf8(&bytes[6..end + 6]).map_or_else(
-                    |_| LinuxInputPacket::Opaque(bytes[..count].to_vec()),
-                    |text| LinuxInputPacket::Event(Event::Paste(text.to_owned())),
+                    |_| RawInputPacket::Opaque(bytes[..count].to_vec()),
+                    |text| RawInputPacket::Event(Event::Paste(text.to_owned())),
                 );
                 return Ok(self.take(count, packet, now));
             }
@@ -215,7 +237,7 @@ impl Decoder {
                 return Ok(if expired {
                     self.take(
                         1,
-                        LinuxInputPacket::Event(Event::Key(KeyStroke::simple(KeyCode::Escape))),
+                        RawInputPacket::Event(Event::Key(KeyStroke::simple(KeyCode::Escape))),
                         now,
                     )
                 } else {
@@ -242,7 +264,7 @@ impl Decoder {
                         if let Some(event) = event {
                             return Ok(self.take(
                                 6,
-                                LinuxInputPacket::Event(Event::Mouse(event)),
+                                RawInputPacket::Event(Event::Mouse(event)),
                                 now,
                             ));
                         }
@@ -274,7 +296,7 @@ impl Decoder {
                     } else {
                         FocusEvent::Lost
                     };
-                    return Ok(self.take(end, LinuxInputPacket::Event(Event::Focus(event)), now));
+                    return Ok(self.take(end, RawInputPacket::Event(Event::Focus(event)), now));
                 }
                 if sequence.starts_with(b"\x1b[<") && matches!(sequence.last(), Some(b'M' | b'm')) {
                     if let Ok(params) = std::str::from_utf8(&sequence[3..end - 1]) {
@@ -285,7 +307,7 @@ impl Decoder {
                         {
                             return Ok(self.take(
                                 end,
-                                LinuxInputPacket::Event(Event::Mouse(event)),
+                                RawInputPacket::Event(Event::Mouse(event)),
                                 now,
                             ));
                         }
@@ -309,9 +331,9 @@ impl Decoder {
                     && consumed == end
                 {
                     let packet = if kind == bmux_keyboard::csi_u::KeyEventKind::Press {
-                        LinuxInputPacket::Event(Event::Key(key))
+                        RawInputPacket::Event(Event::Key(key))
                     } else {
-                        LinuxInputPacket::Key { stroke: key, kind }
+                        RawInputPacket::Key { stroke: key, kind }
                     };
                     return Ok(self.take(end, packet, now));
                 }
@@ -320,7 +342,7 @@ impl Decoder {
             // Alt prefixes a complete UTF-8 character/control, never just one byte.
             if let Some((mut key, consumed)) = character(&bytes[1..]) {
                 key.modifiers.alt = true;
-                return Ok(self.take(consumed + 1, LinuxInputPacket::Event(Event::Key(key)), now));
+                return Ok(self.take(consumed + 1, RawInputPacket::Event(Event::Key(key)), now));
             }
             return Ok(if expired {
                 self.opaque(bytes.len(), now)
@@ -329,7 +351,7 @@ impl Decoder {
             });
         }
         if let Some((key, consumed)) = character(bytes) {
-            return Ok(self.take(consumed, LinuxInputPacket::Event(Event::Key(key)), now));
+            return Ok(self.take(consumed, RawInputPacket::Event(Event::Key(key)), now));
         }
         if std::str::from_utf8(bytes).is_err_and(|error| error.error_len().is_some()) {
             return Ok(self.opaque(1, now));
@@ -409,11 +431,58 @@ impl Drop for RawOwnership {
     }
 }
 
-/// Sole nonblocking Linux raw input owner. Do not combine with Crossterm readers.
+/// Wakes a [`RawInput::wait`] blocked on another thread, which then returns
+/// `Ok(None)` so its owner can check whether to stop.
+#[derive(Debug, Clone)]
+pub struct InputWaker(std::sync::Arc<std::os::unix::net::UnixStream>);
+
+impl InputWaker {
+    /// Interrupt the reader's current or next wait.
+    pub fn wake(&self) {
+        use std::io::Write;
+        // A full pipe already holds a pending wake.
+        let _ = (&*self.0).write(&[1]);
+    }
+}
+
+/// The wake pipe and the `SIGWINCH` registration writing to it.
+struct Wake {
+    receiver: std::os::unix::net::UnixStream,
+    sender: std::sync::Arc<std::os::unix::net::UnixStream>,
+    resize: signal_hook::SigId,
+}
+
+impl Wake {
+    fn new() -> io::Result<Self> {
+        let (receiver, sender) = std::os::unix::net::UnixStream::pair()?;
+        receiver.set_nonblocking(true)?;
+        sender.set_nonblocking(true)?;
+        let resize = signal_hook::low_level::pipe::register(libc::SIGWINCH, sender.try_clone()?)?;
+        Ok(Self {
+            receiver,
+            sender: std::sync::Arc::new(sender),
+            resize,
+        })
+    }
+
+    fn drain(&self) {
+        let mut bytes = [0u8; 64];
+        while matches!((&self.receiver).read(&mut bytes), Ok(count) if count > 0) {}
+    }
+}
+
+impl Drop for Wake {
+    fn drop(&mut self) {
+        signal_hook::low_level::unregister(self.resize);
+    }
+}
+
+/// Sole nonblocking raw input owner. Do not combine with Crossterm readers.
 pub struct RawInput {
     file: std::fs::File,
     decoder: Decoder,
     size: Option<Size>,
+    wake: Wake,
     // Release only after the descriptor and decoder have been dropped.
     _ownership: RawOwnership,
 }
@@ -439,10 +508,15 @@ impl RawInput {
             file,
             decoder: Decoder::default(),
             size: None,
+            wake: Wake::new()?,
         })
     }
 
     /// Open the actual stdout tty for independent nonblocking reads.
+    ///
+    /// The tty is reopened by path (never `/dev/tty`, which can differ from
+    /// redirected stdout and on macOS retains a controlling-terminal
+    /// reference) and must be the same device as stdout.
     /// # Errors
     /// Returns tty identity/open errors; redirected stdout is unsupported.
     pub fn open_stdout_tty() -> io::Result<Self> {
@@ -458,11 +532,12 @@ impl RawInput {
                 "stdout is not tty",
             ));
         }
-        let identity = std::fs::metadata("/proc/self/fd/1")?;
+        let path = stdout_tty_path()?;
+        let identity = std::fs::metadata(&path)?;
         let file = std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
-            .open("/proc/self/fd/1")?;
+            .open(&path)?;
         let actual = file.metadata()?;
         if (identity.dev(), identity.ino(), identity.rdev())
             != (actual.dev(), actual.ino(), actual.rdev())
@@ -478,7 +553,109 @@ impl RawInput {
             file,
             decoder: Decoder::default(),
             size: None,
+            wake: Wake::new()?,
         })
+    }
+
+    /// A handle that interrupts [`Self::wait`] from any thread.
+    #[must_use]
+    pub fn waker(&self) -> InputWaker {
+        InputWaker(std::sync::Arc::clone(&self.wake.sender))
+    }
+
+    /// Block until a packet is decoded or the reader is woken (`Ok(None)`:
+    /// by [`InputWaker::wake`], or a `SIGWINCH` that left the size unchanged).
+    ///
+    /// The first call reports the current size as a resize, and later size
+    /// changes arrive through `SIGWINCH`. Nothing is polled: the wait ends on
+    /// input or a wake, with a timeout only while a lone ESC is pending.
+    /// # Errors
+    /// Returns read/poll/ioctl/budget errors; no bytes are silently truncated.
+    pub fn wait(&mut self) -> io::Result<Option<RawInputPacket>> {
+        use std::os::fd::AsRawFd;
+        if self.size.is_none()
+            && let Some(resize) = self.resized()?
+        {
+            return Ok(Some(resize));
+        }
+        loop {
+            let now = Instant::now();
+            if let Some(packet) = self.decoder.next(now)? {
+                return Ok(Some(packet));
+            }
+            let timeout = self.decoder.deadline(now).map_or(-1, |deadline| {
+                // Round up: waking early would only wait again.
+                let micros = deadline.saturating_duration_since(now).as_micros();
+                i32::try_from(micros.div_ceil(1000)).unwrap_or(i32::MAX)
+            });
+            let mut fds = [
+                libc::pollfd {
+                    fd: self.file.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: self.wake.receiver.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+            ];
+            // SAFETY: both descriptors stay open for the call and `fds`
+            // holds exactly the two entries passed.
+            if unsafe { libc::poll(fds.as_mut_ptr(), 2, timeout) } < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(error);
+            }
+            if fds[0].revents != 0 && self.read_available(Instant::now())? {
+                continue;
+            }
+            if fds[1].revents != 0 {
+                self.wake.drain();
+                return self.resized();
+            }
+        }
+    }
+
+    /// Feed whatever the tty has; `false` when nothing was there.
+    fn read_available(&mut self, now: Instant) -> io::Result<bool> {
+        let mut bytes = zeroize::Zeroizing::new([0u8; 4096]);
+        match self.file.read(&mut bytes[..]) {
+            Ok(0) => Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "terminal closed",
+            )),
+            Ok(count) => {
+                self.decoder.feed(&bytes[..count], now)?;
+                Ok(true)
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                ) =>
+            {
+                Ok(false)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// A resize packet when the tty's size differs from the last reported.
+    fn resized(&mut self) -> io::Result<Option<RawInputPacket>> {
+        use std::os::fd::AsRawFd;
+        let mut size = std::mem::MaybeUninit::<libc::winsize>::zeroed();
+        // SAFETY: live descriptor and correctly sized output storage.
+        if unsafe { libc::ioctl(self.file.as_raw_fd(), libc::TIOCGWINSZ, size.as_mut_ptr()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: successful ioctl initialized winsize.
+        let size = unsafe { size.assume_init() };
+        let size = Size::new(size.ws_col, size.ws_row);
+        Ok((self.size.replace(size) != Some(size))
+            .then_some(RawInputPacket::Event(Event::Resize(size))))
     }
     /// Wipe buffered decoded input and flush pending raw tty input at an admission barrier.
     /// The caller must serialize this with reads and fence all application-pending events.
@@ -499,43 +676,37 @@ impl RawInput {
     /// Read or decode at most one bounded packet. Caller must retry after ESC deadline.
     /// # Errors
     /// Returns read/ioctl/budget errors; no bytes are silently truncated.
-    pub fn read_ready(&mut self, now: Instant) -> io::Result<Option<LinuxInputPacket>> {
-        use std::os::fd::AsRawFd;
+    pub fn read_ready(&mut self, now: Instant) -> io::Result<Option<RawInputPacket>> {
         if let Some(packet) = self.decoder.next(now)? {
             return Ok(Some(packet));
         }
-        let mut bytes = zeroize::Zeroizing::new([0u8; 4096]);
-        match self.file.read(&mut bytes[..]) {
-            Ok(0) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "terminal closed",
-                ));
-            }
-            Ok(count) => {
-                self.decoder.feed(&bytes[..count], now)?;
-                return self.decoder.next(now);
-            }
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
-                ) => {}
-            Err(error) => return Err(error),
+        if self.read_available(now)? {
+            return self.decoder.next(now);
         }
-        let mut size = std::mem::MaybeUninit::<libc::winsize>::zeroed();
-        // SAFETY: live descriptor and correctly sized output storage.
-        if unsafe { libc::ioctl(self.file.as_raw_fd(), libc::TIOCGWINSZ, size.as_mut_ptr()) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: successful ioctl initialized winsize.
-        let size = unsafe { size.assume_init() };
-        let size = Size::new(size.ws_col, size.ws_row);
-        if self.size.replace(size) != Some(size) {
-            return Ok(Some(LinuxInputPacket::Event(Event::Resize(size))));
-        }
-        Ok(None)
+        self.resized()
     }
+}
+
+/// The filesystem path of the tty on stdout.
+#[cfg(target_os = "linux")]
+fn stdout_tty_path() -> io::Result<std::path::PathBuf> {
+    Ok("/proc/self/fd/1".into())
+}
+
+/// The filesystem path of the tty on stdout.
+#[cfg(not(target_os = "linux"))]
+fn stdout_tty_path() -> io::Result<std::path::PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut name = [0u8; 256];
+    // SAFETY: `name` is writable for the length passed.
+    let result =
+        unsafe { libc::ttyname_r(libc::STDOUT_FILENO, name.as_mut_ptr().cast(), name.len()) };
+    if result != 0 {
+        return Err(io::Error::from_raw_os_error(result));
+    }
+    let name = std::ffi::CStr::from_bytes_until_nul(&name)
+        .map_err(|_| io::Error::other("tty name unterminated"))?;
+    Ok(std::ffi::OsStr::from_bytes(name.to_bytes()).into())
 }
 
 #[cfg(test)]
@@ -591,11 +762,11 @@ mod tests {
                 decoder.feed(&sequence[split..], now).unwrap();
                 decoder.feed(b"q", now).unwrap();
                 let packet = decoder.next(now).unwrap().unwrap();
-                assert_eq!(packet, LinuxInputPacket::Opaque(sequence.to_vec()));
+                assert_eq!(packet, RawInputPacket::Opaque(sequence.to_vec()));
                 assert!(packet.into_crossterm().is_none());
                 assert_eq!(
                     decoder.next(now).unwrap(),
-                    Some(LinuxInputPacket::Event(Event::Key(KeyStroke::simple(
+                    Some(RawInputPacket::Event(Event::Key(KeyStroke::simple(
                         KeyCode::Char('q')
                     ))))
                 );
@@ -663,7 +834,7 @@ mod tests {
             decoder.feed(sequence, now).unwrap();
             assert!(matches!(
                 decoder.next(now).unwrap(),
-                Some(LinuxInputPacket::Event(Event::Key(_)))
+                Some(RawInputPacket::Event(Event::Key(_)))
             ));
         }
         let mut decoder = Decoder::default();
@@ -679,7 +850,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             decoder.next(now + Duration::from_secs(1)).unwrap(),
-            Some(LinuxInputPacket::Event(Event::Paste("hello".into())))
+            Some(RawInputPacket::Event(Event::Paste("hello".into())))
         );
         let mut decoder = Decoder::default();
         let mut bytes = b"\x1b]".to_vec();
@@ -704,7 +875,7 @@ mod tests {
                 decoder.feed(&sequence[split..], now).unwrap();
                 assert!(matches!(
                     decoder.next(now).unwrap(),
-                    Some(LinuxInputPacket::Event(Event::Key(_)))
+                    Some(RawInputPacket::Event(Event::Key(_)))
                 ));
                 assert!(decoder.next(now).unwrap().is_none());
             }
@@ -743,9 +914,11 @@ mod tests {
         assert_eq!(kinds, vec![Kind::Press, Kind::Repeat, Kind::Release]);
     }
 
-    #[test]
-    fn real_pty_fragmented_packets_resize_and_flags() {
-        use std::io::Write;
+    /// Raw input has one process-wide owner: pty tests take turns.
+    static PTY_OWNER: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// A raw-mode pty: its master and a reader owning its nonblocking slave.
+    fn raw_pty() -> (std::fs::File, RawInput) {
         use std::os::fd::{AsRawFd, FromRawFd};
         let mut master = -1;
         let mut slave = -1;
@@ -756,14 +929,15 @@ mod tests {
                     &raw mut master,
                     &raw mut slave,
                     std::ptr::null_mut(),
-                    std::ptr::null(),
-                    std::ptr::null(),
+                    // `*mut` coerces where Linux declares `*const`.
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
                 )
             },
             0
         );
         // SAFETY: successful openpty yields distinct owned file descriptors.
-        let mut master = unsafe { std::fs::File::from_raw_fd(master) };
+        let master = unsafe { std::fs::File::from_raw_fd(master) };
         // SAFETY: owned slave descriptor from openpty.
         let slave = unsafe { std::fs::File::from_raw_fd(slave) };
         let mut attrs = std::mem::MaybeUninit::<libc::termios>::uninit();
@@ -787,21 +961,104 @@ mod tests {
             unsafe { libc::fcntl(slave.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) },
             0
         );
-        let mut reader = RawInput::from_owned_tty(slave).unwrap();
+        (master, RawInput::from_owned_tty(slave).unwrap())
+    }
+
+    fn set_pty_size(master: &std::fs::File, cols: u16, rows: u16) {
+        use std::os::fd::AsRawFd;
+        let size = libc::winsize {
+            ws_row: rows,
+            ws_col: cols,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        // SAFETY: correctly sized initialized winsize and live master descriptor.
+        assert_eq!(
+            unsafe { libc::ioctl(master.as_raw_fd(), libc::TIOCSWINSZ, &raw const size) },
+            0
+        );
+    }
+
+    #[test]
+    fn waits_reassemble_split_sequences_and_wake_on_events_only() {
+        use std::io::Write;
+        let _owner = PTY_OWNER
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (mut master, mut reader) = raw_pty();
+        set_pty_size(&master, 80, 24);
+        assert_eq!(
+            reader.wait().unwrap(),
+            Some(RawInputPacket::Event(Event::Resize(Size::new(80, 24)))),
+            "the first wait reports the size"
+        );
+
+        // A mouse report flushed in two writes is one event, never Esc
+        // followed by typed text.
+        let writer = std::thread::spawn(move || {
+            master.write_all(b"\x1b").unwrap();
+            std::thread::sleep(Duration::from_millis(5));
+            master.write_all(b"[<67;115;17M").unwrap();
+            master
+        });
+        let packet = reader.wait().unwrap();
+        let mut master = writer.join().unwrap();
+        assert!(
+            matches!(packet, Some(RawInputPacket::Event(Event::Mouse(mouse))) if mouse.position == Point::new(114, 16)),
+            "{packet:?}"
+        );
+
+        // A lone ESC resolves to Escape once its window passes, with no
+        // further input.
+        master.write_all(b"\x1b").unwrap();
+        let started = Instant::now();
+        assert!(matches!(
+            reader.wait().unwrap(),
+            Some(RawInputPacket::Event(Event::Key(key))) if key.key == KeyCode::Escape
+        ));
+        assert!(started.elapsed() >= ESC_WAIT);
+
+        // A waker interrupts a wait blocked with nothing to read.
+        let waker = reader.waker();
+        let wake = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            waker.wake();
+        });
+        assert_eq!(reader.wait().unwrap(), None);
+        wake.join().unwrap();
+
+        // SIGWINCH reports the new size.
+        set_pty_size(&master, 100, 30);
+        // SAFETY: raising a signal whose handler is registered by the reader.
+        assert_eq!(unsafe { libc::raise(libc::SIGWINCH) }, 0);
+        assert_eq!(
+            reader.wait().unwrap(),
+            Some(RawInputPacket::Event(Event::Resize(Size::new(100, 30))))
+        );
+    }
+
+    #[test]
+    fn real_pty_fragmented_packets_resize_and_flags() {
+        use std::io::Write;
+        use std::os::fd::AsRawFd;
+        let _owner = PTY_OWNER
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (mut master, mut reader) = raw_pty();
         assert!(RawOwnership::acquire().is_err());
         assert!(super::super::read_event().is_err());
         master.write_all(b"\x1b_Gi=42;O").unwrap();
         for _ in 0..10 {
             assert!(!matches!(
                 reader.read_ready(Instant::now()).unwrap(),
-                Some(LinuxInputPacket::Opaque(_))
+                Some(RawInputPacket::Opaque(_))
             ));
         }
         master.write_all(b"K\x1b\\q").unwrap();
         let mut packets = Vec::new();
         for _ in 0..100 {
             if let Some(packet) = reader.read_ready(Instant::now()).unwrap()
-                && !matches!(packet, LinuxInputPacket::Event(Event::Resize(_)))
+                && !matches!(packet, RawInputPacket::Event(Event::Resize(_)))
             {
                 packets.push(packet);
             }
@@ -812,10 +1069,10 @@ mod tests {
         }
         assert_eq!(
             packets[0],
-            LinuxInputPacket::Opaque(b"\x1b_Gi=42;OK\x1b\\".to_vec())
+            RawInputPacket::Opaque(b"\x1b_Gi=42;OK\x1b\\".to_vec())
         );
         assert!(
-            matches!(&packets[1], LinuxInputPacket::Event(Event::Key(key)) if key.key == KeyCode::Char('q'))
+            matches!(&packets[1], RawInputPacket::Event(Event::Key(key)) if key.key == KeyCode::Char('q'))
         );
         // Incomplete decoded paste and kernel-pending bytes are both erased by a
         // real PTY barrier. The first fresh key is not appended to either canary.
@@ -831,7 +1088,7 @@ mod tests {
         master.write_all(b"z").unwrap();
         let deadline = Instant::now() + Duration::from_secs(1);
         loop {
-            if let Some(LinuxInputPacket::Event(Event::Key(key))) =
+            if let Some(RawInputPacket::Event(Event::Key(key))) =
                 reader.read_ready(Instant::now()).unwrap()
             {
                 assert_eq!(key.key, KeyCode::Char('z'));
@@ -853,7 +1110,7 @@ mod tests {
         );
         assert_eq!(
             reader.read_ready(Instant::now()).unwrap(),
-            Some(LinuxInputPacket::Event(Event::Resize(Size::new(93, 41))))
+            Some(RawInputPacket::Event(Event::Resize(Size::new(93, 41))))
         );
     }
 
@@ -865,17 +1122,17 @@ mod tests {
             .feed("é\u{1}\u{1b}[<65;4;3M\u{1b}[I".as_bytes(), now)
             .unwrap();
         assert!(
-            matches!(decoder.next(now).unwrap(), Some(LinuxInputPacket::Event(Event::Key(key))) if key.key == KeyCode::Char('é'))
+            matches!(decoder.next(now).unwrap(), Some(RawInputPacket::Event(Event::Key(key))) if key.key == KeyCode::Char('é'))
         );
         assert!(
-            matches!(decoder.next(now).unwrap(), Some(LinuxInputPacket::Event(Event::Key(key))) if key.modifiers.ctrl)
+            matches!(decoder.next(now).unwrap(), Some(RawInputPacket::Event(Event::Key(key))) if key.modifiers.ctrl)
         );
         assert!(
-            matches!(decoder.next(now).unwrap(), Some(LinuxInputPacket::Event(Event::Mouse(event))) if event.kind == MouseEventKind::ScrollDown && event.position == Point::new(3, 2))
+            matches!(decoder.next(now).unwrap(), Some(RawInputPacket::Event(Event::Mouse(event))) if event.kind == MouseEventKind::ScrollDown && event.position == Point::new(3, 2))
         );
         assert_eq!(
             decoder.next(now).unwrap(),
-            Some(LinuxInputPacket::Event(Event::Focus(FocusEvent::Gained)))
+            Some(RawInputPacket::Event(Event::Focus(FocusEvent::Gained)))
         );
         let mut decoder = Decoder::default();
         assert!(decoder.feed(&vec![0; MAX_PENDING + 1], now).is_err());
@@ -901,8 +1158,8 @@ mod tests {
             assert_eq!(
                 packets,
                 vec![
-                    LinuxInputPacket::Opaque(osc.to_vec()),
-                    LinuxInputPacket::Opaque(ack.to_vec())
+                    RawInputPacket::Opaque(osc.to_vec()),
+                    RawInputPacket::Opaque(ack.to_vec())
                 ],
                 "split {split}"
             );
@@ -912,7 +1169,7 @@ mod tests {
         decoder.feed(apc, now).unwrap();
         assert_eq!(
             decoder.next(now).unwrap(),
-            Some(LinuxInputPacket::Opaque(apc.to_vec()))
+            Some(RawInputPacket::Opaque(apc.to_vec()))
         );
     }
 
@@ -925,10 +1182,10 @@ mod tests {
         decoder.feed(b"K\x1b\\q", now).unwrap();
         assert_eq!(
             decoder.next(now).unwrap(),
-            Some(LinuxInputPacket::Opaque(b"\x1b_Gi=7;OK\x1b\\".to_vec()))
+            Some(RawInputPacket::Opaque(b"\x1b_Gi=7;OK\x1b\\".to_vec()))
         );
         assert!(
-            matches!(decoder.next(now).unwrap(), Some(LinuxInputPacket::Event(Event::Key(key))) if key.key == bmux_keyboard::KeyCode::Char('q'))
+            matches!(decoder.next(now).unwrap(), Some(RawInputPacket::Event(Event::Key(key))) if key.key == bmux_keyboard::KeyCode::Char('q'))
         );
     }
 
@@ -941,13 +1198,13 @@ mod tests {
             .unwrap();
         assert_eq!(
             decoder.next(now).unwrap(),
-            Some(LinuxInputPacket::Event(Event::Paste(
+            Some(RawInputPacket::Event(Event::Paste(
                 "hello\x1b_Gfake\x1b\\".into()
             )))
         );
         assert!(decoder.next(now).unwrap().is_none());
         assert!(
-            matches!(decoder.next(now + Duration::from_millis(40)).unwrap(), Some(LinuxInputPacket::Event(Event::Key(key))) if key.key == bmux_keyboard::KeyCode::Escape)
+            matches!(decoder.next(now + Duration::from_millis(40)).unwrap(), Some(RawInputPacket::Event(Event::Key(key))) if key.key == bmux_keyboard::KeyCode::Escape)
         );
     }
 
@@ -958,11 +1215,11 @@ mod tests {
         decoder.feed(b"\xff\x1b[999z", now).unwrap();
         assert_eq!(
             decoder.next(now).unwrap(),
-            Some(LinuxInputPacket::Opaque(vec![255]))
+            Some(RawInputPacket::Opaque(vec![255]))
         );
         assert_eq!(
             decoder.next(now).unwrap(),
-            Some(LinuxInputPacket::Opaque(b"\x1b[999z".to_vec()))
+            Some(RawInputPacket::Opaque(b"\x1b[999z".to_vec()))
         );
     }
 }
