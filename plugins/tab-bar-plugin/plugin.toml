@@ -1,7 +1,12 @@
 execution_class = "native_fast"
 id = "bmux.tab_bar"
 name = "bmux Tab Strip"
-provided_capabilities = ["bmux.tab_bar.input"]
+provided_capabilities = [
+    "bmux.tab_bar.input",
+    "bmux.tab_bar.notify",
+    "bmux.tab_bar.status.read",
+    "bmux.tab_bar.status.write",
+]
 provided_features = ["bmux.tab_bar"]
 required_capabilities = [
     "bmux.tabs.read",
@@ -23,3 +28,34 @@ version_req = ">=0.0.1-alpha.0"
 capability   = "bmux.tab_bar.input"
 interface_id = "presentation-actions/v2"
 kind         = "command"
+
+# Plugin-contributed right-side status modules (see README). Items are
+# namespaced by the calling plugin id.
+[[services]]
+capability   = "bmux.tab_bar.status.write"
+interface_id = "status-items"
+kind         = "command"
+
+[[services]]
+capability   = "bmux.tab_bar.status.read"
+interface_id = "status-items-state"
+kind         = "query"
+
+# Plugin-raised attach toast notifications.
+[[services]]
+capability   = "bmux.tab_bar.notify"
+interface_id = "notifications"
+kind         = "command"
+
+# Retained snapshots of contributed status items and queued toasts. The
+# server forwards each replacement to streaming attach clients, where the
+# tab-bar companion renders them.
+[[event_publications]]
+delivery                     = "state"
+forward_to_streaming_clients = true
+kind                         = "bmux.tab_bar/status-items-list"
+
+[[event_publications]]
+delivery                     = "state"
+forward_to_streaming_clients = true
+kind                         = "bmux.tab_bar/notifications-list"

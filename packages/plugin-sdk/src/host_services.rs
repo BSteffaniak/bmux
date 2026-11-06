@@ -274,6 +274,17 @@ pub fn begin_command_outcome_capture() {
     });
 }
 
+/// Whether a command outcome capture is active on the current thread.
+///
+/// Statically bundled plugins share the host's capture slot; a dynamically
+/// loaded plugin links its own SDK copy and sees no active capture, so its
+/// export wrapper captures locally and hands the outcome back across the ABI.
+#[doc(hidden)]
+#[must_use]
+pub fn command_outcome_capture_active() -> bool {
+    COMMAND_OUTCOME_CAPTURE.with(|slot| slot.borrow().is_some())
+}
+
 #[doc(hidden)]
 #[must_use]
 pub fn finish_command_outcome_capture() -> PluginCommandOutcome {

@@ -206,6 +206,54 @@ pub fn parse_settings(value: Option<&toml::Value>) -> Result<Settings, PluginCom
         parse_colors(colors, &mut settings.colors)?;
     }
 
+    if let Some(status) = table.get("status_items") {
+        let status = status
+            .as_table()
+            .ok_or_else(|| invalid("status_items", "must be a table"))?;
+        let policy = &mut settings.status_items;
+        policy.show_external = parse_bool(
+            status,
+            "status_items.show_external",
+            "show_external",
+            policy.show_external,
+        )?;
+        policy.max_items = usize::from(parse_bounded_u16(
+            status,
+            "max_items",
+            u16::try_from(policy.max_items).unwrap_or(u16::MAX),
+            0,
+            32,
+        )?);
+        policy.max_item_width = usize::from(parse_bounded_u16(
+            status,
+            "max_item_width",
+            u16::try_from(policy.max_item_width).unwrap_or(u16::MAX),
+            1,
+            128,
+        )?);
+    }
+
+    if let Some(notifications) = table.get("notifications") {
+        let notifications = notifications
+            .as_table()
+            .ok_or_else(|| invalid("notifications", "must be a table"))?;
+        let policy = &mut settings.notifications;
+        policy.enabled = parse_bool(
+            notifications,
+            "notifications.enabled",
+            "enabled",
+            policy.enabled,
+        )?;
+        policy.max_visible = usize::from(parse_bounded_u16(
+            notifications,
+            "max_visible",
+            u16::try_from(policy.max_visible).unwrap_or(u16::MAX),
+            1,
+            8,
+        )?);
+        policy.width = parse_bounded_u16(notifications, "width", policy.width, 16, 120)?;
+    }
+
     Ok(settings)
 }
 
@@ -256,6 +304,19 @@ fn parse_enum<T: Copy>(
         .as_str()
         .ok_or_else(|| invalid(key, "must be a string"))?;
     parse(text).ok_or_else(|| invalid(key, &format!("has unsupported value {text:?}")))
+}
+
+fn parse_bool(
+    table: &toml::map::Map<String, toml::Value>,
+    label: &str,
+    key: &str,
+    default: bool,
+) -> Result<bool, PluginCommandError> {
+    table.get(key).map_or(Ok(default), |value| {
+        value
+            .as_bool()
+            .ok_or_else(|| invalid(label, "must be a boolean"))
+    })
 }
 
 fn parse_i32(

@@ -71,6 +71,18 @@ force_ascii = false
 dim_inactive = true
 bold_active = true
 underline_active = false
+
+# Status items contributed by other plugins (bmux.tab_bar status-items service)
+[plugins.settings."bmux.tab_bar".status_items]
+show_external = true
+max_items = 6                   # 0..=32; highest priority first
+max_item_width = 32             # 1..=128 terminal cells per item
+
+# Toasts raised by plugins (bmux.tab_bar notifications service)
+[plugins.settings."bmux.tab_bar".notifications]
+enabled = true
+max_visible = 3                 # 1..=8
+width = 44                      # 16..=120 terminal cells
 ```
 
 Tabs wrap between labels in authoritative order, left-to-right then
@@ -104,6 +116,13 @@ and `show_facts`; former aliases are rejected with an explicit error.
 Interactions include click switching, hover, drag reorder, wheel navigation,
 middle-click inline rename, and a right-click Switch/Rename/Close menu. Domain
 mutations use generated `bmux.tabs` service clients.
+
+Other plugins, including dynamically loaded native plugins, can add right-side
+status modules and raise toasts through the typed `bmux.tab_bar` services in
+`bmux_tab_bar_plugin_api`. Contributed items render to the left of the
+built-in modules in priority order, use the module colors (tinted by severity),
+take at most half the bar, and drop lowest-priority-first when space runs out.
+See `plugins/tab-bar-plugin/README.md#plugin-contributions` for the API.
 
 ## Sidebar
 

@@ -744,6 +744,20 @@ async fn run_server_start_inner(
                     >(kind)
                 }
                 (k, bmux_plugin_sdk::PluginEventDelivery::State)
+                    if k == bmux_tab_bar_plugin_api::status_items_list::STATE_KIND.as_str() =>
+                {
+                    server.spawn_plugin_bus_state_forwarder::<
+                        bmux_tab_bar_plugin_api::status_items_list::StatusItemSnapshot,
+                    >(kind)
+                }
+                (k, bmux_plugin_sdk::PluginEventDelivery::State)
+                    if k == bmux_tab_bar_plugin_api::notifications_list::STATE_KIND.as_str() =>
+                {
+                    server.spawn_plugin_bus_state_forwarder::<
+                        bmux_tab_bar_plugin_api::notifications_list::NotificationSnapshot,
+                    >(kind)
+                }
+                (k, bmux_plugin_sdk::PluginEventDelivery::State)
                     if k == bmux_appearance::RUNTIME_APPEARANCE_STATE_KIND.as_str() =>
                 {
                     server.spawn_plugin_bus_state_forwarder::<bmux_appearance::RuntimeAppearance>(

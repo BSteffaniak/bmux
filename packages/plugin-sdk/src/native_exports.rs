@@ -171,6 +171,14 @@ pub fn take_last_command_error() -> Option<PluginCommandError> {
     LAST_COMMAND_ERROR.with(|slot| slot.borrow_mut().take())
 }
 
+thread_local! {
+    /// Outcome captured by [`run_command_export`] when no host capture was
+    /// active on this thread, i.e. when this SDK copy lives in a dynamically
+    /// loaded plugin. The host drains it through
+    /// `bmux_plugin_take_command_outcome_v1` right after the command returns.
+    static LAST_COMMAND_OUTCOME: RefCell<Option<crate::PluginCommandOutcome>> = const { RefCell::new(None) };
+}
+
 /// Store a pending command error so the host can retrieve it via
 /// [`take_last_command_error`]. Overwrites any previously-stored error.
 fn store_last_command_error(error: PluginCommandError) {
@@ -739,7 +747,19 @@ pub fn run_command_export<P: RustPlugin>(
         |code| code,
         |payload| {
             instance.write().map_or(EXIT_UNAVAILABLE, |mut plugin| {
+                // A dynamically loaded plugin has its own SDK statics, so the
+                // host's capture is invisible here: capture locally and stash
+                // the outcome for `take_command_outcome_export`. Statically
+                // bundled plugins keep writing into the host's capture.
+                let owns_capture = !crate::host_services::command_outcome_capture_active();
+                if owns_capture {
+                    crate::begin_command_outcome_capture();
+                }
                 let result = plugin.run_command(payload);
+                if owns_capture {
+                    let outcome = crate::finish_command_outcome_capture();
+                    LAST_COMMAND_OUTCOME.with(|slot| *slot.borrow_mut() = Some(outcome));
+                }
                 if let Err(error) = &result {
                     store_last_command_error(error.clone());
                 }
@@ -747,6 +767,47 @@ pub fn run_command_export<P: RustPlugin>(
             })
         },
     )
+}
+
+/// Serialize and drain the outcome of the last command run on this thread.
+///
+/// Exported by dynamically loaded plugins as
+/// `bmux_plugin_take_command_outcome_v1`. The payload is JSON-encoded
+/// [`crate::PluginCommandOutcome`] (metadata values are arbitrary JSON) and
+/// includes the last command error message. On
+/// `SERVICE_STATUS_BUFFER_TOO_SMALL` the required length is written to
+/// `output_len` and the outcome is retained so the host can retry.
+#[doc(hidden)]
+pub fn take_command_outcome_export(
+    output_ptr: *mut u8,
+    output_capacity: usize,
+    output_len: *mut usize,
+) -> i32 {
+    if output_len.is_null() {
+        return SERVICE_STATUS_INVALID_ARGUMENT;
+    }
+    let mut outcome = LAST_COMMAND_OUTCOME
+        .with(|slot| slot.borrow().clone())
+        .unwrap_or_default();
+    if outcome.error_message.is_none() {
+        outcome.error_message = LAST_COMMAND_ERROR
+            .with(|slot| slot.borrow().as_ref().map(|error| error.message.clone()));
+    }
+    let Ok(encoded) = serde_json::to_vec(&outcome) else {
+        return SERVICE_STATUS_ENCODE_FAILED;
+    };
+    unsafe {
+        *output_len = encoded.len();
+    }
+    if output_ptr.is_null() || encoded.len() > output_capacity {
+        return SERVICE_STATUS_BUFFER_TOO_SMALL;
+    }
+    unsafe {
+        ptr::copy_nonoverlapping(encoded.as_ptr(), output_ptr, encoded.len());
+    }
+    LAST_COMMAND_OUTCOME.with(|slot| slot.borrow_mut().take());
+    let _ = take_last_command_error();
+    SERVICE_STATUS_OK
 }
 
 #[doc(hidden)]
@@ -1191,6 +1252,128 @@ mod concurrent_tests {
         assert_eq!(super::capture_lifecycle_result(Ok(17)), 17);
         assert!(super::take_last_command_error().is_none());
     }
+    #[derive(Default)]
+    struct OutcomePlugin;
+    impl super::RustPlugin for OutcomePlugin {
+        type Contract = crate::NoPluginContract;
+
+        fn run_command(
+            &mut self,
+            context: crate::NativeCommandContext,
+        ) -> Result<i32, super::PluginCommandError> {
+            crate::record_command_outcome_metadata(
+                crate::COMMAND_OUTCOME_STATUS_MESSAGE_KEY,
+                serde_json::Value::String(format!("ran {}", context.command)),
+            );
+            if context.command == "fail" {
+                return Err(super::PluginCommandError::failed("boom"));
+            }
+            Ok(crate::EXIT_OK)
+        }
+    }
+
+    fn command_context(command: &str) -> crate::NativeCommandContext {
+        crate::NativeCommandContext {
+            plugin_id: "test.outcome".into(),
+            command: command.into(),
+            arguments: Vec::new(),
+            required_capabilities: Vec::new(),
+            provided_capabilities: Vec::new(),
+            services: Vec::new(),
+            available_capabilities: Vec::new(),
+            enabled_plugins: Vec::new(),
+            plugin_search_roots: Vec::new(),
+            registered_plugins: Vec::new(),
+            active_keybindings: Vec::new(),
+            host: crate::HostMetadata {
+                product_name: "bmux".into(),
+                product_version: "test".into(),
+                plugin_api_version: crate::ApiVersion::new(1, 0),
+                plugin_abi_version: crate::ApiVersion::new(1, 0),
+            },
+            connection: crate::HostConnectionInfo {
+                config_dir: String::new(),
+                config_dir_candidates: Vec::new(),
+                runtime_dir: String::new(),
+                data_dir: String::new(),
+                state_dir: String::new(),
+            },
+            settings: None,
+            plugin_settings_map: std::collections::BTreeMap::new(),
+            caller_client_id: None,
+            invocation_source: crate::NativeCommandInvocationSource::Unknown,
+            host_kernel_bridge: None,
+        }
+    }
+
+    fn take_outcome() -> (i32, Option<crate::PluginCommandOutcome>) {
+        let mut length = 0_usize;
+        let status = super::take_command_outcome_export(std::ptr::null_mut(), 0, &raw mut length);
+        assert_eq!(status, super::SERVICE_STATUS_BUFFER_TOO_SMALL);
+        let mut buffer = vec![0_u8; length];
+        let status =
+            super::take_command_outcome_export(buffer.as_mut_ptr(), buffer.len(), &raw mut length);
+        (
+            status,
+            (status == super::SERVICE_STATUS_OK)
+                .then(|| serde_json::from_slice(&buffer[..length]).expect("outcome json")),
+        )
+    }
+
+    #[test]
+    fn dynamic_command_outcome_crosses_the_abi_when_host_capture_is_invisible() {
+        static INSTANCE: std::sync::OnceLock<std::sync::RwLock<OutcomePlugin>> =
+            std::sync::OnceLock::new();
+        let instance = INSTANCE.get_or_init(|| std::sync::RwLock::new(OutcomePlugin));
+        // No host capture on this thread: models a cdylib with its own SDK copy.
+        let payload = crate::encode_service_message(&command_context("ok")).unwrap();
+        assert_eq!(
+            super::run_command_export(instance, payload.as_ptr(), payload.len()),
+            crate::EXIT_OK
+        );
+        let (status, outcome) = take_outcome();
+        assert_eq!(status, super::SERVICE_STATUS_OK);
+        let outcome = outcome.unwrap();
+        assert_eq!(
+            outcome
+                .metadata
+                .get(crate::COMMAND_OUTCOME_STATUS_MESSAGE_KEY),
+            Some(&serde_json::Value::String("ran ok".into()))
+        );
+        assert!(outcome.error_message.is_none());
+        // Drained: a second take is empty.
+        let (_, drained) = take_outcome();
+        assert_eq!(drained.unwrap(), crate::PluginCommandOutcome::default());
+
+        let payload = crate::encode_service_message(&command_context("fail")).unwrap();
+        assert_eq!(
+            super::run_command_export(instance, payload.as_ptr(), payload.len()),
+            crate::EXIT_ERROR
+        );
+        let (_, outcome) = take_outcome();
+        let outcome = outcome.unwrap();
+        assert_eq!(outcome.error_message.as_deref(), Some("boom"));
+        assert!(super::take_last_command_error().is_none());
+    }
+
+    #[test]
+    fn bundled_command_outcome_still_flows_into_the_host_capture() {
+        static INSTANCE: std::sync::OnceLock<std::sync::RwLock<OutcomePlugin>> =
+            std::sync::OnceLock::new();
+        let instance = INSTANCE.get_or_init(|| std::sync::RwLock::new(OutcomePlugin));
+        // Host capture active on this thread: models a statically bundled plugin.
+        crate::begin_command_outcome_capture();
+        let payload = crate::encode_service_message(&command_context("ok")).unwrap();
+        super::run_command_export(instance, payload.as_ptr(), payload.len());
+        let host = crate::finish_command_outcome_capture();
+        assert!(
+            host.metadata
+                .contains_key(crate::COMMAND_OUTCOME_STATUS_MESSAGE_KEY)
+        );
+        let (_, stashed) = take_outcome();
+        assert_eq!(stashed.unwrap(), crate::PluginCommandOutcome::default());
+    }
+
     #[derive(Default)]
     struct NoEventPlugin;
     impl super::RustPlugin for NoEventPlugin {

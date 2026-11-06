@@ -11,6 +11,8 @@ required_capabilities = [
     "bmux.permissions.write",
     "bmux.tabs.read",
     "bmux.tabs.write",
+    "bmux.tab_bar.notify",
+    "bmux.tab_bar.status.write",
 ]
 runtime = "native"
 version = "0.0.1-alpha.0"
@@ -178,6 +180,58 @@ required   = true
 summary    = "Storage key"
 value_name = "KEY"
 
+[[commands]]
+expose_in_cli = true
+name          = "status-set"
+summary       = "Show a status item in the tab bar through the bmux.tab_bar service"
+
+[[commands.arguments]]
+kind       = "string"
+name       = "id"
+position   = 0
+required   = true
+summary    = "Item id (namespaced to this plugin)"
+value_name = "ID"
+
+[[commands.arguments]]
+allow_hyphen_values = true
+kind                = "string"
+multiple            = true
+name                = "text"
+position            = 1
+required            = true
+summary             = "Item text plus optional --severity/--priority flags"
+trailing_var_arg    = true
+value_name          = "TEXT"
+
+[[commands]]
+expose_in_cli = true
+name          = "status-clear"
+summary       = "Clear one (or every) status item this plugin owns"
+
+[[commands.arguments]]
+kind       = "string"
+name       = "id"
+position   = 0
+summary    = "Item id; omit to clear all of this plugin's items"
+value_name = "ID"
+
+[[commands]]
+expose_in_cli = true
+name          = "notify"
+summary       = "Raise an attach toast through the bmux.tab_bar service"
+
+[[commands.arguments]]
+allow_hyphen_values = true
+kind                = "string"
+multiple            = true
+name                = "title"
+position            = 0
+required            = true
+summary             = "Toast title plus optional --body/--severity/--ttl-ms flags"
+trailing_var_arg    = true
+value_name          = "TITLE"
+
 [[event_subscriptions]]
 kinds = ["bmux.core/server-started", "bmux.tabs/pane-event"]
 
@@ -187,4 +241,8 @@ version_req = "=0.0.1-alpha.0"
 
 [[dependencies]]
 plugin_id   = "bmux.tabs"
+version_req = "=0.0.1-alpha.0"
+
+[[dependencies]]
+plugin_id   = "bmux.tab_bar"
 version_req = "=0.0.1-alpha.0"

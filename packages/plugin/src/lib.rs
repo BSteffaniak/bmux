@@ -131,6 +131,12 @@ pub const DEFAULT_NATIVE_COMMAND_SYMBOL: &str = "bmux_plugin_run_command_v1";
 pub const DEFAULT_NATIVE_COMMAND_WITH_CONTEXT_SYMBOL: &str =
     "bmux_plugin_run_command_with_context_v1";
 
+/// Optional exported symbol returning a dynamic plugin's last command outcome.
+///
+/// Dynamic plugins link their own SDK copy, so the host's thread-local capture
+/// cannot see metadata or error text they record.
+pub const DEFAULT_NATIVE_TAKE_COMMAND_OUTCOME_SYMBOL: &str = "bmux_plugin_take_command_outcome_v1";
+
 /// Default exported symbol used to activate a plugin lifecycle hook.
 pub const DEFAULT_NATIVE_ACTIVATE_SYMBOL: &str = "bmux_plugin_activate_v1";
 

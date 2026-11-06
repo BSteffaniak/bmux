@@ -59,6 +59,7 @@ type NativeRunCommandWithContextFn = unsafe extern "C" fn(*const u8, usize) -> i
 type NativeLifecycleFn = unsafe extern "C" fn(*const u8, usize) -> i32;
 type NativeEventFn = unsafe extern "C" fn(*const u8, usize) -> i32;
 type NativeRegisterContributionsFn = unsafe extern "C" fn(*mut u8, usize, *mut usize) -> i32;
+type NativeTakeCommandOutcomeFn = unsafe extern "C" fn(*mut u8, usize, *mut usize) -> i32;
 type NativeInvokeServiceFn =
     unsafe extern "C" fn(*const u8, usize, *mut u8, usize, *mut usize) -> i32;
 
@@ -1562,6 +1563,53 @@ fn dispatch_remote_typed_service(
     }
 }
 
+/// Drain the outcome a dynamically loaded plugin captured for the command it
+/// just ran on this thread.
+///
+/// Returns `None` for plugins built before the export existed or when the
+/// payload cannot be decoded; callers keep their host-side outcome then.
+fn take_dynamic_command_outcome(
+    library: &Library,
+) -> Option<bmux_plugin_sdk::PluginCommandOutcome> {
+    let symbol: Symbol<'_, NativeTakeCommandOutcomeFn> =
+        unsafe { library.get(crate::DEFAULT_NATIVE_TAKE_COMMAND_OUTCOME_SYMBOL.as_bytes()) }
+            .ok()?;
+    let mut buffer = vec![0_u8; 4096];
+    for _ in 0..2 {
+        let mut length = 0_usize;
+        let status = unsafe { symbol(buffer.as_mut_ptr(), buffer.len(), &raw mut length) };
+        match status {
+            0 => {
+                buffer.truncate(length);
+                return serde_json::from_slice(&buffer)
+                    .inspect_err(|error| {
+                        tracing::warn!(%error, "dynamic plugin returned an undecodable command outcome");
+                    })
+                    .ok();
+            }
+            NATIVE_SERVICE_STATUS_BUFFER_TOO_SMALL if length > buffer.len() => {
+                buffer.resize(length, 0);
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// Merge a dynamic plugin's outcome into the host-captured one. Host-side
+/// values win; the dynamic side fills what the host could not observe.
+fn merge_command_outcome(
+    outcome: &mut bmux_plugin_sdk::PluginCommandOutcome,
+    dynamic: bmux_plugin_sdk::PluginCommandOutcome,
+) {
+    if outcome.error_message.is_none() {
+        outcome.error_message = dynamic.error_message;
+    }
+    for (key, value) in dynamic.metadata {
+        outcome.metadata.entry(key).or_insert(value);
+    }
+}
+
 #[allow(clippy::needless_pass_by_value)]
 pub fn execute_kernel_request(
     host_kernel_bridge: Option<HostKernelBridge>,
@@ -2051,6 +2099,9 @@ impl LoadedPlugin {
                         let mut outcome = bmux_plugin_sdk::finish_command_outcome_capture();
                         if let Some(error) = bmux_plugin_sdk::take_last_command_error() {
                             outcome.error_message = Some(error.message);
+                        }
+                        if let Some(dynamic) = take_dynamic_command_outcome(library) {
+                            merge_command_outcome(&mut outcome, dynamic);
                         }
                         emit_plugin_command_invoke_phase(
                             self,
@@ -4390,6 +4441,38 @@ minimum = "1.0"
                 .expect("ABI 1.1 should roundtrip"),
             modern
         );
+    }
+
+    #[test]
+    fn dynamic_command_outcome_fills_what_the_host_capture_missed() {
+        let mut host = bmux_plugin_sdk::PluginCommandOutcome::default();
+        host.metadata
+            .insert("host.only".into(), serde_json::Value::Bool(true));
+        host.metadata
+            .insert("shared".into(), serde_json::Value::String("host".into()));
+        let mut dynamic = bmux_plugin_sdk::PluginCommandOutcome {
+            error_message: Some("dynamic failure".into()),
+            ..Default::default()
+        };
+        dynamic.metadata.insert(
+            bmux_plugin_sdk::COMMAND_OUTCOME_STATUS_MESSAGE_KEY.into(),
+            serde_json::Value::String("saved".into()),
+        );
+        dynamic
+            .metadata
+            .insert("shared".into(), serde_json::Value::String("dynamic".into()));
+        super::merge_command_outcome(&mut host, dynamic);
+        assert_eq!(host.error_message.as_deref(), Some("dynamic failure"));
+        assert_eq!(
+            host.metadata
+                .get(bmux_plugin_sdk::COMMAND_OUTCOME_STATUS_MESSAGE_KEY),
+            Some(&serde_json::Value::String("saved".into()))
+        );
+        assert_eq!(
+            host.metadata.get("shared"),
+            Some(&serde_json::Value::String("host".into()))
+        );
+        assert!(host.metadata.contains_key("host.only"));
     }
 
     #[test]

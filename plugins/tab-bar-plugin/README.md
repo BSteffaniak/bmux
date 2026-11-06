@@ -41,6 +41,16 @@ force_ascii = false
 dim_inactive = true
 bold_active = true
 underline_active = false
+
+[plugins.settings."bmux.tab_bar".status_items]
+show_external = true # render items contributed by other plugins
+max_items = 6        # 0..=32
+max_item_width = 32  # 1..=128 cells per item
+
+[plugins.settings."bmux.tab_bar".notifications]
+enabled = true  # render plugin toasts
+max_visible = 3 # 1..=8
+width = 44      # 16..=120 cells
 ```
 
 Optional `[plugins.settings."bmux.tab_bar".colors]` keys are `bar_bg`,
@@ -75,3 +85,78 @@ and `show_compact_facts`. Canonical settings take precedence.
 Disable the bar with `plugins.disabled = ["bmux.tab_bar"]`. Essential attach
 notifications retain a neutral fallback when it is disabled. The sidebar is an
 independent opt-in plugin.
+
+## Plugin contributions
+
+Any plugin — bundled, process, or a dynamically loaded native (`cdylib`)
+plugin — can contribute status modules to the bar and raise attach toasts.
+Rust state cannot cross the dylib boundary, so these are typed BPDL services
+generated in the `bmux_tab_bar_plugin_api` crate (schema:
+`plugins/tab-bar-plugin-api/bpdl/tab-bar-plugin.bpdl`). Depend on that crate,
+not on this plugin.
+
+| Interface (`interface_id`) | Kind    | Capability                  | Operations                                                   |
+| -------------------------- | ------- | --------------------------- | ------------------------------------------------------------ |
+| `status-items`             | command | `bmux.tab_bar.status.write` | `set-status-item`, `clear-status-item`, `clear-status-items` |
+| `status-items-state`       | query   | `bmux.tab_bar.status.read`  | `list-status-items`                                          |
+| `notifications`            | command | `bmux.tab_bar.notify`       | `notify`, `dismiss`                                          |
+
+Declare the capabilities you use in your manifest:
+
+```toml
+required_capabilities = ["bmux.tab_bar.status.write", "bmux.tab_bar.notify"]
+```
+
+Call the generated clients from any `ServiceCaller` (command, service, or
+lifecycle context):
+
+```rust
+use bmux_plugin::{ServiceCallerDispatchClient, block_on_typed_dispatch};
+use bmux_tab_bar_plugin_api::{notifications, status_items, status_items_list::Severity};
+
+let mut client = ServiceCallerDispatchClient::new(&context);
+// Outer Result: transport/permission failure. Inner Result: validation.
+block_on_typed_dispatch(status_items::client::set_status_item(
+    &mut client,
+    "build".into(),         // id, unique per calling plugin
+    "build ok".into(),      // text
+    Severity::Success,      // normal | info | success | warning | critical
+    10,                     // priority: higher renders first, drops last
+    None,                   // optional tooltip (listed, not yet rendered)
+))??;
+block_on_typed_dispatch(notifications::client::notify(
+    &mut client,
+    "Deploy finished".into(),
+    Some("all checks green".into()),
+    Severity::Info,
+    Some(4_000),            // ttl in ms; default 5000, clamped to 500..=60000
+))??;
+```
+
+Semantics:
+
+- Items are namespaced by the host-supplied caller plugin id
+  (`ServiceRequest::caller_plugin_id`), so plugins cannot replace, clear, or
+  dismiss each other's entries. Calls relayed by the host over IPC rather than
+  dispatched in-process carry the host's `bmux.core` identity.
+- Limits: 8 items per plugin, 64 total (`limit-exceeded` beyond that); ids are
+  1..=64 bytes; text is trimmed, control characters become spaces, and text is
+  truncated to 64 graphemes (tooltips 256). Toast titles are truncated to 80
+  graphemes and bodies to 400.
+- The host has no per-plugin unload signal, and state is in memory in the
+  server process. Call `clear-status-items` from your plugin's `deactivate`.
+- Toasts expire by wall-clock time. The provider keeps the newest 16, and the
+  attach companion shows the newest `notifications.max_visible` in the top-right
+  corner (below the bar when it sits on top), using the `toast_stack` component.
+  `dismiss` removes one of your toasts early.
+- Rendering: normal-severity items use the module style. Other severities tint
+  it (info cyan, success green, warning yellow, critical bold red). Items appear
+  left of the built-in mode/role/follow/hint modules, use at most half the bar,
+  and are kept or dropped whole in priority order.
+
+Delivery: the provider publishes retained `status-items-list` and
+`notifications-list` snapshots (`bmux.tab_bar/status-items-list`,
+`bmux.tab_bar/notifications-list`) on the plugin event bus. The server forwards
+them to attach clients (`event_publications` in `plugin.toml`), and the attach
+companion registers decoding channels for them. `examples/native-plugin`
+(`status-set`, `status-clear`, `notify`) is a complete cross-dylib example.

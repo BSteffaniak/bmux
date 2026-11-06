@@ -8,7 +8,8 @@ use unicode_width::UnicodeWidthStr;
 use uuid::Uuid;
 
 use super::{
-    ActiveAlignment, Density, HintPolicy, OverflowStyle, Preset, SeparatorSet, Settings, tabs_list,
+    ActiveAlignment, Density, HintPolicy, OverflowStyle, Preset, SeparatorSet, Settings,
+    status_items_list, tabs_list,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,7 +24,19 @@ pub enum SegmentKind {
     EditingTab,
     Mode,
     Module,
+    /// A plugin-contributed status item with non-normal severity. Normal
+    /// items render as [`SegmentKind::Module`].
+    StatusModule(StatusTone),
     Overflow,
+}
+
+/// Emphasis applied on top of the module style for contributed status items.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusTone {
+    Info,
+    Success,
+    Warning,
+    Critical,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -354,6 +367,8 @@ pub struct ProjectionInteraction<'a> {
     pub(super) drag_marker_col: Option<u16>,
     pub(super) workspace_label: Option<&'a str>,
     pub(super) editing_workspace: bool,
+    /// Plugin-contributed status items rendered as right-side modules.
+    pub(super) status_items: &'a [status_items_list::StatusItem],
 }
 
 #[allow(clippy::too_many_lines)] // Projection is one ordered width-budgeting pass; splitting obscures shared constraints.
@@ -408,6 +423,21 @@ pub fn project_bar(
         &mut right,
         inner_width.saturating_sub(tab_reserve).saturating_sub(1),
     );
+    // Contributed items take what built-in modules leave, capped at half the
+    // bar so tabs keep room; lower-priority items drop first.
+    let status_budget = inner_width
+        .saturating_sub(tab_reserve)
+        .saturating_sub(1)
+        .saturating_sub(segments_width(&right))
+        .min(inner_width / 2);
+    let status = status_item_segments(
+        settings,
+        interaction.status_items,
+        &style,
+        status_budget,
+        !right.is_empty(),
+    );
+    right.splice(0..0, status);
     let right_width = segments_width(&right);
     let module_budget = inner_width
         .saturating_sub(tab_reserve)
@@ -877,6 +907,76 @@ fn right_segments(
     result
 }
 
+/// Contributed status items as module segments, highest priority first.
+///
+/// Whole items are kept or dropped so a truncated label never misrepresents
+/// state; the first item that does not fit ends the run, preserving
+/// priority order. `trailing_separator` reserves the separator before the
+/// built-in modules.
+fn status_item_segments(
+    settings: &Settings,
+    items: &[status_items_list::StatusItem],
+    style: &RenderStyle,
+    budget: usize,
+    trailing_separator: bool,
+) -> Vec<ProjectedSegment> {
+    let policy = settings.status_items;
+    if !policy.show_external || policy.max_items == 0 || policy.max_item_width == 0 {
+        return Vec::new();
+    }
+    let mut ordered = items.iter().collect::<Vec<_>>();
+    ordered.sort_by_key(|item| std::cmp::Reverse(item.priority));
+    let separator_width = UnicodeWidthStr::width(style.module_separator.as_str());
+    let mut result = Vec::new();
+    let mut used = 0_usize;
+    for item in ordered.into_iter().take(policy.max_items) {
+        let text = style.badge(&ellipsize_cells(&item.text, policy.max_item_width));
+        let width = UnicodeWidthStr::width(text.as_str());
+        let separator = if result.is_empty() && !trailing_separator {
+            0
+        } else {
+            separator_width
+        };
+        if used + width + separator > budget {
+            break;
+        }
+        if !result.is_empty() {
+            push_separator(&mut result, &style.module_separator);
+        }
+        result.push(ProjectedSegment {
+            text,
+            kind: status_kind(item.severity),
+            tab_id: None,
+            edit_cursor_offset: None,
+        });
+        used += width + separator;
+    }
+    if trailing_separator && !result.is_empty() {
+        push_separator(&mut result, &style.module_separator);
+    }
+    result
+}
+
+const fn status_kind(severity: status_items_list::Severity) -> SegmentKind {
+    match severity {
+        status_items_list::Severity::Normal => SegmentKind::Module,
+        status_items_list::Severity::Info => SegmentKind::StatusModule(StatusTone::Info),
+        status_items_list::Severity::Success => SegmentKind::StatusModule(StatusTone::Success),
+        status_items_list::Severity::Warning => SegmentKind::StatusModule(StatusTone::Warning),
+        status_items_list::Severity::Critical => SegmentKind::StatusModule(StatusTone::Critical),
+    }
+}
+
+/// Truncate to `maximum` cells, marking elision with `…`.
+fn ellipsize_cells(value: &str, maximum: usize) -> String {
+    if UnicodeWidthStr::width(value) <= maximum {
+        return value.to_string();
+    }
+    let mut output = truncate_cells(value, maximum.saturating_sub(1));
+    output.push('…');
+    output
+}
+
 fn values_to_segments(
     values: Vec<String>,
     kind: SegmentKind,
@@ -1341,6 +1441,152 @@ mod tests {
         AttachLocalPresentationSnapshot {
             viewport_cols: width,
             ..AttachLocalPresentationSnapshot::initial()
+        }
+    }
+
+    fn status_item(
+        owner: &str,
+        id: &str,
+        text: &str,
+        priority: i32,
+        severity: status_items_list::Severity,
+    ) -> status_items_list::StatusItem {
+        status_items_list::StatusItem {
+            owner: owner.into(),
+            id: id.into(),
+            text: text.into(),
+            severity,
+            priority,
+            tooltip: None,
+        }
+    }
+
+    fn classic_settings() -> Settings {
+        Settings {
+            preset: Preset::Classic,
+            separator_set: SeparatorSet::Ascii,
+            ..Settings::default()
+        }
+    }
+
+    #[test]
+    fn status_items_render_as_modules_in_priority_order_before_builtins() {
+        use status_items_list::Severity;
+        let items = [
+            status_item("b.plugin", "low", "low", 1, Severity::Normal),
+            status_item("a.plugin", "high", "deploy ok", 9, Severity::Success),
+            status_item("a.plugin", "mid", "cpu 93%", 5, Severity::Critical),
+        ];
+        let tabs = [tab(1, "one", true)];
+        let projected = project_bar(
+            &classic_settings(),
+            &tabs,
+            &local(100),
+            None,
+            &ProjectionInteraction {
+                status_items: &items,
+                ..ProjectionInteraction::default()
+            },
+        );
+        // Golden right-hand module run: contributed items, then built-ins.
+        let text = projected.plain_text();
+        assert!(
+            text.trim_end()
+                .ends_with("[deploy ok] | [cpu 93%] | [low] | [NORMAL] | [write]"),
+            "{text:?}"
+        );
+        let kinds = projected
+            .segments
+            .iter()
+            .filter(|segment| segment.text.starts_with('['))
+            .map(|segment| (segment.text.as_str(), segment.kind))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kinds,
+            [
+                (
+                    "[deploy ok]",
+                    SegmentKind::StatusModule(StatusTone::Success)
+                ),
+                ("[cpu 93%]", SegmentKind::StatusModule(StatusTone::Critical)),
+                ("[low]", SegmentKind::Module),
+                ("[NORMAL]", SegmentKind::Mode),
+                ("[write]", SegmentKind::Module),
+            ]
+        );
+        assert_eq!(projected.tab_ranges().len(), 1);
+    }
+
+    #[test]
+    fn status_items_respect_settings_limits_and_width() {
+        use status_items_list::Severity;
+        let items = [
+            status_item("a", "1", "first", 3, Severity::Normal),
+            status_item("a", "2", "a much longer second label", 2, Severity::Normal),
+            status_item("a", "3", "third", 1, Severity::Normal),
+        ];
+        let mut settings = classic_settings();
+        settings.status_items.max_items = 2;
+        settings.status_items.max_item_width = 8;
+        let projected = project_bar(
+            &settings,
+            &[tab(1, "one", true)],
+            &local(100),
+            None,
+            &ProjectionInteraction {
+                status_items: &items,
+                ..ProjectionInteraction::default()
+            },
+        );
+        let text = projected.plain_text();
+        assert!(text.contains("[first] | [a much …] | [NORMAL]"), "{text:?}");
+        assert!(!text.contains("third"));
+
+        settings.status_items.show_external = false;
+        let hidden = project_bar(
+            &settings,
+            &[tab(1, "one", true)],
+            &local(100),
+            None,
+            &ProjectionInteraction {
+                status_items: &items,
+                ..ProjectionInteraction::default()
+            },
+        );
+        assert!(!hidden.plain_text().contains("first"));
+    }
+
+    #[test]
+    fn narrow_bars_drop_low_priority_status_items_and_keep_tabs() {
+        use status_items_list::Severity;
+        let items = [
+            status_item("a", "hi", "important", 10, Severity::Warning),
+            status_item("a", "lo", "verbose detail", 0, Severity::Normal),
+        ];
+        let tabs = [tab(1, "first", true), tab(2, "second", false)];
+        for width in 4..120 {
+            let projected = project_bar(
+                &classic_settings(),
+                &tabs,
+                &local(width),
+                None,
+                &ProjectionInteraction {
+                    status_items: &items,
+                    ..ProjectionInteraction::default()
+                },
+            );
+            let text = projected.plain_text();
+            assert!(UnicodeWidthStr::width(text.as_str()) <= usize::from(width));
+            assert!(
+                !projected.tab_ranges().is_empty(),
+                "width {width}: {text:?}"
+            );
+            // Never show a lower-priority item without the higher one, and
+            // never show a partially truncated contributed label.
+            if text.contains("verbose detail") {
+                assert!(text.contains("[important]"), "width {width}: {text:?}");
+            }
+            assert!(!text.contains("[importa]"));
         }
     }
 

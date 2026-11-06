@@ -126,6 +126,7 @@ members = [
     "plugins/snapshot-plugin-api",
     "plugins/sidebar-plugin",
     "plugins/tab-bar-plugin",
+    "plugins/tab-bar-plugin-api",
     "plugins/theme-plugin",
     "plugins/visual-adapters-plugin-renderer",
     "plugins/tabs-plugin",
@@ -339,6 +340,7 @@ bmux_sidebar_plugin                      = { version = "0.0.1-alpha.4", default-
 bmux_snapshot_plugin                     = { version = "0.0.1-alpha.4", default-features = false, path = "plugins/snapshot-plugin" }
 bmux_snapshot_plugin_api                 = { version = "0.0.1-alpha.4", default-features = false, path = "plugins/snapshot-plugin-api" }
 bmux_tab_bar_plugin                      = { version = "0.0.1-alpha.4", default-features = false, path = "plugins/tab-bar-plugin" }
+bmux_tab_bar_plugin_api                  = { version = "0.0.1-alpha.4", default-features = false, path = "plugins/tab-bar-plugin-api" }
 bmux_tabs_plugin                         = { version = "0.0.1-alpha.4", default-features = false, path = "plugins/tabs-plugin" }
 bmux_tabs_plugin_api                     = { version = "0.0.1-alpha.4", default-features = false, path = "plugins/tabs-plugin-api" }
 bmux_theme_plugin                        = { version = "0.0.1-alpha.4", default-features = false, path = "plugins/theme-plugin" }

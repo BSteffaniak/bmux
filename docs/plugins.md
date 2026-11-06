@@ -605,6 +605,24 @@ This enables behavior like `ctrl-a c` to create and immediately switch
 to a newly created context without embedding windows-domain logic in
 core runtime.
 
+Plugins record outcome metadata with
+`bmux_plugin_sdk::record_command_outcome_metadata` (for example
+`COMMAND_OUTCOME_STATUS_MESSAGE_KEY` for the attach status line). Bundled
+plugins write into the host's capture directly. A dynamically loaded plugin
+links its own SDK copy, so its `export_plugin!` wrapper captures the outcome
+locally and exports `bmux_plugin_take_command_outcome_v1`. The loader calls it
+right after the command returns and merges the JSON-encoded outcome, including
+the command error text. Plugins built before this export keep working without
+outcome metadata.
+
+### Tab-bar contributions from plugins
+
+Plugins add right-side tab-bar status modules and attach toasts through the
+typed `bmux.tab_bar` services in `bmux_tab_bar_plugin_api` (`status-items`,
+`status-items-state`, `notifications`). This works across the dylib boundary
+because only serialized BPDL payloads cross it. See
+[`plugins/tab-bar-plugin/README.md`](../plugins/tab-bar-plugin/README.md#plugin-contributions).
+
 ## Scene and rendering
 
 Each surface in the scene (`bmux_ipc::AttachSurface`) carries:

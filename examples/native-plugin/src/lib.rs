@@ -21,6 +21,8 @@ use bmux_plugin_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
 
+mod tab_bar;
+
 #[derive(Default)]
 struct ExamplePlugin;
 
@@ -41,6 +43,9 @@ impl RustPlugin for ExamplePlugin {
             "storage-put" => Ok(run_storage_put(&context)),
             "storage-get" => Ok(run_storage_get(&context)),
             "prompt-showcase" => Ok(run_prompt_showcase_command()),
+            "status-set" => Ok(tab_bar::run_status_set(&context)),
+            "status-clear" => Ok(tab_bar::run_status_clear(&context)),
+            "notify" => Ok(tab_bar::run_notify(&context)),
             "hello" => {
                 if context.arguments.is_empty() {
                     println!("example.native: hello from bmux plugin");
@@ -64,6 +69,7 @@ impl RustPlugin for ExamplePlugin {
         &mut self,
         context: bmux_plugin_sdk::NativeLifecycleContext,
     ) -> Result<i32, PluginCommandError> {
+        tab_bar::clear_on_deactivate(&context);
         println!("example.native: deactivated {}", context.plugin_id);
         Ok(EXIT_OK)
     }
@@ -677,7 +683,7 @@ mod tests {
         let manifest = bmux_plugin::PluginManifest::from_toml_str(include_str!("../plugin.toml"))
             .expect("manifest should parse");
         assert_eq!(manifest.id, "example.native");
-        assert_eq!(manifest.commands.len(), 10);
+        assert_eq!(manifest.commands.len(), 13);
         let declaration = manifest.to_declaration().expect("manifest should validate");
         assert_eq!(declaration.id.as_str(), "example.native");
     }

@@ -53,6 +53,20 @@ bmux plugin run example.native hello world
 bmux plugin run example.native permissions-list my-session
 ```
 
+Tab-bar contributions (cross-dylib, through the typed `bmux.tab_bar`
+services in `bmux_tab_bar_plugin_api`; requires an attached client to see them):
+
+```bash
+bmux plugin run example.native status-set build "build ok" --severity success --priority 10
+bmux plugin run example.native notify "Deploy finished" --body "all green" --severity info --ttl-ms 4000
+bmux plugin run example.native status-clear build   # or no id to clear all
+```
+
+The `status-set` and `status-clear` commands also record a
+`COMMAND_OUTCOME_STATUS_MESSAGE_KEY` outcome, so binding them to a key shows
+the message in the attach status line. The outcome travels back from the dylib
+through `bmux_plugin_take_command_outcome_v1`.
+
 Start the server and the plugin will also log activation plus matching events
 such as `server_started` and `window_created`.
 

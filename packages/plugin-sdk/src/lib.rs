@@ -373,6 +373,7 @@ pub mod __private {
         manifest_toml_ptr, plugin_instance, register_contributions_bundled,
         register_contributions_concurrent_bundled, register_contributions_concurrent_export,
         register_contributions_export, register_typed_services_bundled, run_command_export,
+        take_command_outcome_export,
     };
 }
 
@@ -407,6 +408,22 @@ macro_rules! export_plugin {
                     __bmux_plugin_instance(),
                     input_ptr,
                     input_len,
+                )
+            }
+
+            /// Hand the last command's outcome (generic metadata and error
+            /// text) back to the host. The host's capture slot is not shared
+            /// with this dylib's SDK copy.
+            #[unsafe(no_mangle)]
+            pub extern "C" fn bmux_plugin_take_command_outcome_v1(
+                output_ptr: *mut u8,
+                output_capacity: usize,
+                output_len: *mut usize,
+            ) -> i32 {
+                $crate::__private::take_command_outcome_export(
+                    output_ptr,
+                    output_capacity,
+                    output_len,
                 )
             }
 

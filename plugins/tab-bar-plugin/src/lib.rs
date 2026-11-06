@@ -3,31 +3,22 @@
 #![allow(clippy::multiple_crate_versions)]
 #![cfg_attr(feature = "static-bundled", allow(dead_code))]
 
-mod contract {
-    bmux_plugin_schema_macros::schema! {
-        source: "bpdl/tab-bar-plugin.bpdl",
-        imports: {
-            workspaces: {
-                source: "../workspaces-plugin-api/bpdl/workspaces-plugin.bpdl",
-                crate_path: ::bmux_workspaces_plugin_api,
-            },
-        },
-    }
-}
+use bmux_tab_bar_plugin_api as contract;
 
 /// Generated versioned contract for server-side presentation workflows.
 pub use contract::presentation_actions;
 
+mod external;
 mod group_actions;
 mod live_indicator;
 mod menu;
 mod projection;
 mod rename_input;
 mod settings;
+mod toasts;
 mod workspace_rename;
 
 use bmux_attach_view_protocol::AttachLocalPresentationSnapshot;
-#[cfg(test)]
 use bmux_plugin::RenderNamedColor;
 use bmux_plugin::layout::{
     LayoutEdge, LayoutExtent, PluginLayoutId, PluginLayoutRequest, PluginLayoutSnapshot,
@@ -47,6 +38,7 @@ use bmux_presentation_state::{
     PresentationEntityRef, PresentationFact, PresentationFactRole,
     global_presentation_fact_host_service,
 };
+use bmux_tab_bar_plugin_api::{notifications_list, status_items_list};
 use bmux_tabs_plugin_api::{tabs_commands, tabs_list};
 use bmux_workspaces_plugin_api::{workspaces_commands, workspaces_state};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -137,6 +129,45 @@ struct ColorSettings {
     overflow_fg: Option<String>,
 }
 
+/// Rendering policy for plugin-contributed status items.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StatusItemSettings {
+    /// Render items contributed through the `status-items` service.
+    show_external: bool,
+    /// Most contributed items shown at once (highest priority first).
+    max_items: usize,
+    /// Per-item text limit in terminal cells.
+    max_item_width: usize,
+}
+
+impl Default for StatusItemSettings {
+    fn default() -> Self {
+        Self {
+            show_external: true,
+            max_items: 6,
+            max_item_width: 32,
+        }
+    }
+}
+
+/// Rendering policy for plugin-raised toast notifications.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NotificationSettings {
+    enabled: bool,
+    max_visible: usize,
+    width: u16,
+}
+
+impl Default for NotificationSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_visible: 3,
+            width: 44,
+        }
+    }
+}
+
 #[allow(clippy::struct_excessive_bools)] // Independent legacy-compatible visibility and emphasis settings.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Settings {
@@ -175,6 +206,8 @@ struct Settings {
     hint_policy: HintPolicy,
     show_compact_facts: bool,
     colors: ColorSettings,
+    status_items: StatusItemSettings,
+    notifications: NotificationSettings,
 }
 
 impl Default for Settings {
@@ -215,6 +248,8 @@ impl Default for Settings {
             hint_policy: HintPolicy::ScrollOnly,
             show_compact_facts: false,
             colors: ColorSettings::default(),
+            status_items: StatusItemSettings::default(),
+            notifications: NotificationSettings::default(),
         }
     }
 }
@@ -258,6 +293,10 @@ struct CompanionState {
     workspace_id: Option<Uuid>,
     editing_workspace_id: Option<Uuid>,
     last_workspace_click: Option<(Uuid, u16, u16, Instant)>,
+    /// Plugin-contributed status items, in provider render order.
+    status_items: Vec<status_items_list::StatusItem>,
+    /// Plugin-raised toasts retained by the provider, oldest first.
+    notifications: Vec<notifications_list::Notification>,
 }
 
 impl CompanionState {
@@ -313,7 +352,30 @@ impl CompanionState {
             workspace_id: None,
             editing_workspace_id: None,
             last_workspace_click: None,
+            status_items: Vec::new(),
+            notifications: Vec::new(),
         }
+    }
+
+    fn replace_status_items(&mut self, snapshot: &status_items_list::StatusItemSnapshot) -> bool {
+        if self.status_items == snapshot.items {
+            return false;
+        }
+        self.status_items.clone_from(&snapshot.items);
+        self.revision = self.revision.saturating_add(1).max(1);
+        true
+    }
+
+    fn replace_notifications(
+        &mut self,
+        snapshot: &notifications_list::NotificationSnapshot,
+    ) -> bool {
+        if self.notifications == snapshot.notifications {
+            return false;
+        }
+        self.notifications.clone_from(&snapshot.notifications);
+        self.revision = self.revision.saturating_add(1).max(1);
+        true
     }
 
     fn replace_tabs(&mut self, mut snapshot: tabs_list::TabListSnapshot) {
@@ -423,6 +485,9 @@ impl RustPlugin for TabBarPlugin {
             .lock()
             .map_err(|_| PluginCommandError::failed("tab-bar state lock poisoned"))? =
             Some(CompanionState::new(settings));
+        // Retained channels for plugin-contributed status items and toasts;
+        // the server forwards them to attach clients (see plugin.toml).
+        external::register_state_channels();
         Ok(EXIT_OK)
     }
 
@@ -440,6 +505,24 @@ impl RustPlugin for TabBarPlugin {
                 let mut client = ServiceCallerDispatchClient::new(ctx);
                 block_on_typed_dispatch(workspaces_state::client::list_workspaces(&mut client))
                     .map_err(|error| ServiceResponse::error("workspaces_unavailable", error.to_string()))
+            },
+            "status-items", "set-status-item" => |req: contract::status_items::client::SetStatusItemRequest, ctx| {
+                external::set_status_item(req, ctx)
+            },
+            "status-items", "clear-status-item" => |req: contract::status_items::client::ClearStatusItemRequest, ctx| {
+                external::clear_status_item(&req.id, ctx)
+            },
+            "status-items", "clear-status-items" => |(): (), ctx| {
+                external::clear_status_items(ctx)
+            },
+            "status-items-state", "list-status-items" => |req: contract::status_items_state::client::ListStatusItemsRequest, _ctx| {
+                external::list_status_items(req.owner.as_deref())
+            },
+            "notifications", "notify" => |req: contract::notifications::client::NotifyRequest, ctx| {
+                external::notify(req, ctx)
+            },
+            "notifications", "dismiss" => |req: contract::notifications::client::DismissRequest, ctx| {
+                external::dismiss(req.id, ctx)
             },
         })
     }
@@ -613,6 +696,7 @@ impl TabBarPresentation {
             .ok();
         let mut facts_rx = fact_registry.subscribe_changes();
         let mut companion = CompanionState::new(settings);
+        let mut external_feeds = ExternalFeeds::subscribe(&resources.events, &mut companion)?;
         companion.live_indicator = live_indicator::read(fact_registry);
         let mut workspaces_rx = workspace_subscription.map(|(snapshot, rx)| {
             companion.workspace_choices.clone_from(&snapshot.workspaces);
@@ -633,16 +717,16 @@ impl TabBarPresentation {
                 },
             )
             .map_err(|error| format!("publishing tab-bar layout: {error:?}"))?;
-        if let Err(error) = publish_companion(&mut companion) {
+        publish_companion(&mut companion).inspect_err(|_| {
             resources.layouts.remove_owner(OWNER);
-            return Err(error);
-        }
+        })?;
         let owner = std::sync::Arc::new(Mutex::new(Some(companion)));
         register_presentation_input(&resources.input, &owner);
         let task_owner = std::sync::Arc::downgrade(&owner);
         let task = handle.spawn(async move {
             loop {
                 let update = tokio::select! {
+                    update = external_feeds.next(&task_owner) => match update { Some(update) => update, None => break },
                     result = facts_rx.changed() => {
                         if result.is_err() { break; }
                         facts_rx.borrow_and_update();
@@ -657,7 +741,6 @@ impl TabBarPresentation {
                         let Some(workspaces) = result else { workspaces_rx = None; continue; };
                         PresentationUpdate::Workspaces(workspaces)
                     }
-
                     result = tabs_rx.changed() => {
                         if result.is_err() { break; }
                         PresentationUpdate::Tabs(tabs_rx.borrow_and_update().as_ref().clone())
@@ -701,7 +784,113 @@ impl Drop for TabBarPresentation {
     }
 }
 
+/// Subscribe to a tab-bar state channel forwarded from the server.
+///
+/// The server relays retained snapshots as wire bytes; registering the channel
+/// with a decoder lets the attach runtime's generic forwarded-event path
+/// publish them without knowing the payload type. An existing registration
+/// (and its retained value) is reused so reinstalling the companion keeps the
+/// current snapshot.
+fn subscribe_forwarded_state<T>(
+    events: &std::sync::Arc<bmux_plugin::EventBus>,
+    kind: &bmux_plugin_sdk::PluginEventKind,
+    initial: impl FnOnce() -> T,
+) -> Result<
+    (
+        std::sync::Arc<T>,
+        tokio::sync::watch::Receiver<std::sync::Arc<T>>,
+    ),
+    String,
+>
+where
+    T: Send + Sync + serde::de::DeserializeOwned + 'static,
+{
+    if let Ok(subscription) = events.subscribe_state::<T>(kind) {
+        return Ok(subscription);
+    }
+    events.register_state_channel_with_decoder(kind.clone(), initial());
+    events
+        .subscribe_state::<T>(kind)
+        .map_err(|error| format!("subscribing to {kind}: {error}"))
+}
+
+/// Forwarded plugin-contribution feeds (status items and toasts).
+struct ExternalFeeds {
+    status_items:
+        tokio::sync::watch::Receiver<std::sync::Arc<status_items_list::StatusItemSnapshot>>,
+    notifications:
+        tokio::sync::watch::Receiver<std::sync::Arc<notifications_list::NotificationSnapshot>>,
+}
+
+impl ExternalFeeds {
+    /// Subscribe both feeds and seed `companion` with their retained values.
+    fn subscribe(
+        events: &std::sync::Arc<bmux_plugin::EventBus>,
+        companion: &mut CompanionState,
+    ) -> Result<Self, String> {
+        let (items, status_items) =
+            subscribe_forwarded_state(events, &status_items_list::STATE_KIND, || {
+                status_items_list::StatusItemSnapshot {
+                    items: Vec::new(),
+                    revision: 0,
+                }
+            })?;
+        let (toasts, notifications) =
+            subscribe_forwarded_state(events, &notifications_list::STATE_KIND, || {
+                notifications_list::NotificationSnapshot {
+                    notifications: Vec::new(),
+                    revision: 0,
+                }
+            })?;
+        companion.replace_status_items(&items);
+        companion.replace_notifications(&toasts);
+        Ok(Self {
+            status_items,
+            notifications,
+        })
+    }
+
+    /// Next feed update, or a tick when the owner's next toast expires.
+    /// `None` means a feed closed and the presentation task should stop.
+    async fn next(
+        &mut self,
+        owner: &std::sync::Weak<Mutex<Option<CompanionState>>>,
+    ) -> Option<PresentationUpdate> {
+        let toast_wake = owner.upgrade().and_then(|owner| next_toast_wake(&owner));
+        tokio::select! {
+            () = async {
+                match toast_wake {
+                    Some(delay) => tokio::time::sleep(delay).await,
+                    None => std::future::pending().await,
+                }
+            } => Some(PresentationUpdate::ToastExpiry),
+            result = self.status_items.changed() => result.ok().map(|()| {
+                PresentationUpdate::StatusItems(self.status_items.borrow_and_update().as_ref().clone())
+            }),
+            result = self.notifications.changed() => result.ok().map(|()| {
+                PresentationUpdate::Notifications(self.notifications.borrow_and_update().as_ref().clone())
+            }),
+        }
+    }
+}
+
+/// Delay until the next visible toast expires, if any.
+fn next_toast_wake(owner: &CompanionHandle) -> Option<Duration> {
+    let guard = owner.lock().ok()?;
+    let companion = guard.as_ref()?;
+    if !companion.settings.notifications.enabled {
+        return None;
+    }
+    let now = external::now_unix_ms();
+    let expiry = toasts::next_expiry_ms(&companion.notifications, now)?;
+    drop(guard);
+    Some(Duration::from_millis(expiry.saturating_sub(now).max(1)))
+}
+
 enum PresentationUpdate {
+    ToastExpiry,
+    StatusItems(status_items_list::StatusItemSnapshot),
+    Notifications(notifications_list::NotificationSnapshot),
     Indicator(Option<live_indicator::LiveIndicator>),
     Workspaces(Vec<workspaces_state::WorkspaceSummary>),
     Tabs(tabs_list::TabListSnapshot),
@@ -720,6 +909,19 @@ fn apply_presentation_update(
         return Ok(());
     };
     match update {
+        PresentationUpdate::ToastExpiry => {
+            companion.revision = companion.revision.saturating_add(1).max(1);
+        }
+        PresentationUpdate::StatusItems(snapshot) => {
+            if !companion.replace_status_items(&snapshot) {
+                return Ok(());
+            }
+        }
+        PresentationUpdate::Notifications(snapshot) => {
+            if !companion.replace_notifications(&snapshot) {
+                return Ok(());
+            }
+        }
         PresentationUpdate::Indicator(indicator) => {
             if companion.live_indicator == indicator {
                 return Ok(());
@@ -945,6 +1147,11 @@ fn publish_companion(companion: &mut CompanionState) -> Result<(), String> {
     }
     let mut surfaces = vec![surface];
     surfaces.extend(menu::surfaces(companion, revision));
+    surfaces.extend(toasts::surface(
+        companion,
+        revision,
+        external::now_unix_ms(),
+    ));
     let revision = publish_surface(&companion.surfaces, revision, surfaces)?;
     if companion.pending_projection.len() == 32 {
         companion.pending_projection.pop_front();
@@ -962,6 +1169,11 @@ fn publish_companion(companion: &mut CompanionState) -> Result<(), String> {
 fn companion_surfaces(companion: &CompanionState, revision: u64) -> Vec<PluginSurface> {
     let mut surfaces = vec![build_surface(companion, revision)];
     surfaces.extend(menu::surfaces(companion, revision));
+    surfaces.extend(toasts::surface(
+        companion,
+        revision,
+        external::now_unix_ms(),
+    ));
     surfaces
 }
 
@@ -1163,6 +1375,21 @@ impl BarStyles {
             projection::SegmentKind::HoveredInactiveTab => self.hovered_inactive,
             projection::SegmentKind::Mode => self.mode,
             projection::SegmentKind::Module => self.module,
+            projection::SegmentKind::StatusModule(tone) => match tone {
+                projection::StatusTone::Info => {
+                    self.module.named_foreground(RenderNamedColor::BrightCyan)
+                }
+                projection::StatusTone::Success => {
+                    self.module.named_foreground(RenderNamedColor::BrightGreen)
+                }
+                projection::StatusTone::Warning => {
+                    self.module.named_foreground(RenderNamedColor::BrightYellow)
+                }
+                projection::StatusTone::Critical => self
+                    .module
+                    .named_foreground(RenderNamedColor::BrightRed)
+                    .bold(),
+            },
             projection::SegmentKind::Overflow => self.overflow,
         }
     }
@@ -1204,6 +1431,7 @@ fn projection_interaction(state: &CompanionState) -> projection::ProjectionInter
         workspace_label: state.workspace_label.as_deref(),
         drag_marker_col: state.drag_target.map(|target| target.marker_col),
         editing_workspace: state.editing_workspace_id.is_some(),
+        status_items: &state.status_items,
     }
 }
 
@@ -1572,6 +1800,7 @@ fn projection_interaction_without_marker(
         drag_marker_col: None,
         workspace_label: state.workspace_label.as_deref(),
         editing_workspace: state.editing_workspace_id.is_some(),
+        status_items: &state.status_items,
     }
 }
 
@@ -2831,6 +3060,222 @@ mod tests {
                 .mode_label,
             "SURVIVOR"
         );
+    }
+    fn owner_text_runs(
+        resources: &bmux_plugin::AttachPresentationResources,
+        local_id: &str,
+    ) -> Vec<String> {
+        resources
+            .surfaces
+            .owner_snapshot(OWNER)
+            .map(|snapshot| {
+                snapshot
+                    .surfaces
+                    .iter()
+                    .filter(|surface| surface.id.local_id == local_id)
+                    .flat_map(|surface| surface.ops.iter())
+                    .filter_map(|op| match op {
+                        RenderOp::TextRun { text, .. } => Some(text.clone()),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    async fn wait_for(mut ready: impl FnMut() -> bool) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !ready() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("condition not reached in time");
+    }
+
+    #[tokio::test]
+    async fn forwarded_status_items_and_toasts_render_then_toasts_expire() {
+        use bmux_tab_bar_plugin_api::status_items_list::Severity;
+        let resources = scoped_resources();
+        resources
+            .events
+            .publish_state(
+                &ATTACH_LOCAL_PRESENTATION_STATE_KIND,
+                AttachLocalPresentationSnapshot {
+                    revision: 1,
+                    viewport_cols: 120,
+                    viewport_rows: 30,
+                    ..AttachLocalPresentationSnapshot::initial()
+                },
+            )
+            .unwrap();
+        let installation = TabBarPresentation::install(None, &resources).unwrap();
+
+        // The server forwards retained snapshots as JSON bytes; the companion
+        // registered decoders so the attach runtime's generic path applies them.
+        let items = status_items_list::StatusItemSnapshot {
+            items: vec![status_items_list::StatusItem {
+                owner: "example.native".into(),
+                id: "build".into(),
+                text: "build ok".into(),
+                severity: Severity::Success,
+                priority: 5,
+                tooltip: None,
+            }],
+            revision: 1,
+        };
+        assert!(
+            resources
+                .events
+                .emit_from_bytes(
+                    &status_items_list::STATE_KIND,
+                    &serde_json::to_vec(&items).unwrap(),
+                )
+                .unwrap()
+        );
+        wait_for(|| {
+            owner_text_runs(&resources, SURFACE_ID)
+                .iter()
+                .any(|text| text.contains("build ok"))
+        })
+        .await;
+
+        let now = external::now_unix_ms();
+        let toasts = notifications_list::NotificationSnapshot {
+            notifications: vec![
+                notifications_list::Notification {
+                    id: Uuid::from_u128(1),
+                    owner: "example.native".into(),
+                    title: "Deploy finished".into(),
+                    body: Some("all green".into()),
+                    severity: Severity::Info,
+                    created_at_ms: now,
+                    ttl_ms: 400,
+                },
+                notifications_list::Notification {
+                    id: Uuid::from_u128(2),
+                    owner: "example.native".into(),
+                    title: "Long lived".into(),
+                    body: None,
+                    severity: Severity::Warning,
+                    created_at_ms: now,
+                    ttl_ms: 60_000,
+                },
+                notifications_list::Notification {
+                    id: Uuid::from_u128(3),
+                    owner: "example.native".into(),
+                    title: "Already expired".into(),
+                    body: None,
+                    severity: Severity::Normal,
+                    created_at_ms: now.saturating_sub(10_000),
+                    ttl_ms: 1_000,
+                },
+            ],
+            revision: 1,
+        };
+        assert!(
+            resources
+                .events
+                .emit_from_bytes(
+                    &notifications_list::STATE_KIND,
+                    &serde_json::to_vec(&toasts).unwrap(),
+                )
+                .unwrap()
+        );
+        wait_for(|| {
+            let text = owner_text_runs(&resources, "toasts").concat();
+            text.contains("Deploy finished") && text.contains("Long lived")
+        })
+        .await;
+        assert!(
+            !owner_text_runs(&resources, "toasts")
+                .concat()
+                .contains("Already expired")
+        );
+        // The companion wakes itself at the TTL boundary and republishes.
+        wait_for(|| {
+            let text = owner_text_runs(&resources, "toasts").concat();
+            !text.contains("Deploy finished") && text.contains("Long lived")
+        })
+        .await;
+        drop(installation);
+        assert!(resources.surfaces.owner_snapshot(OWNER).is_none());
+    }
+
+    #[test]
+    fn status_item_and_notification_settings_parse_and_validate() {
+        let value: toml::Value = toml::from_str(
+            r"
+[status_items]
+show_external = false
+max_items = 2
+max_item_width = 12
+
+[notifications]
+enabled = false
+max_visible = 5
+width = 60
+",
+        )
+        .unwrap();
+        let settings = Settings::parse(Some(&value)).unwrap();
+        assert!(!settings.status_items.show_external);
+        assert_eq!(settings.status_items.max_items, 2);
+        assert_eq!(settings.status_items.max_item_width, 12);
+        assert!(!settings.notifications.enabled);
+        assert_eq!(settings.notifications.max_visible, 5);
+        assert_eq!(settings.notifications.width, 60);
+        let defaults = Settings::default();
+        assert!(defaults.status_items.show_external);
+        assert!(defaults.notifications.enabled);
+        for invalid in [
+            "[status_items]\nmax_items = 99",
+            "[status_items]\nshow_external = 'yes'",
+            "[notifications]\nwidth = 4",
+            "[notifications]\nmax_visible = 0",
+            "status_items = 3",
+        ] {
+            let value: toml::Value = toml::from_str(invalid).unwrap();
+            assert!(Settings::parse(Some(&value)).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn manifest_declares_external_services_and_forwarded_state() {
+        use bmux_tab_bar_plugin_api::capabilities;
+        let manifest: toml::Value = toml::from_str(include_str!("../plugin.toml")).unwrap();
+        let provided = manifest["provided_capabilities"].as_array().unwrap();
+        for capability in [
+            capabilities::STATUS_READ,
+            capabilities::STATUS_WRITE,
+            capabilities::NOTIFY,
+        ] {
+            assert!(
+                provided
+                    .iter()
+                    .any(|value| value.as_str() == Some(capability.as_str())),
+                "missing provided capability {capability}"
+            );
+        }
+        let publications = manifest["event_publications"].as_array().unwrap();
+        for kind in [
+            status_items_list::STATE_KIND.as_str(),
+            notifications_list::STATE_KIND.as_str(),
+        ] {
+            assert!(
+                publications
+                    .iter()
+                    .any(|publication| publication["kind"].as_str() == Some(kind)
+                        && publication["forward_to_streaming_clients"].as_bool() == Some(true)),
+                "missing forwarded publication {kind}"
+            );
+        }
+        for interface in ["status-items", "status-items-state", "notifications"] {
+            assert!(
+                <TabBarPlugin as RustPlugin>::Contract::service_contract_for(interface).is_some(),
+                "contract missing {interface}"
+            );
+        }
     }
     use super::*;
 

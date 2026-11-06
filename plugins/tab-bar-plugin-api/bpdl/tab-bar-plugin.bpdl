@@ -1,0 +1,139 @@
+// Public, typed contract of the bundled tab-bar plugin. Third-party
+// plugins (including dynamically loaded cdylibs) depend on
+// `bmux_tab_bar_plugin_api` and reach these services through
+// `ServiceCaller::call_service` / the generated clients; Rust state never
+// crosses the plugin ABI.
+//
+// Interfaces:
+// - `presentation-actions` — server-side presentation workflows used by the
+//   tab bar's own attach companion (local input is not a service).
+// - `status-items` — plugin-contributed status modules shown on the right
+//   side of the tab bar. Items are namespaced by the calling plugin id.
+// - `status-items-state` — read-only listing of contributed status items.
+// - `status-items-list` — reactive state channel carrying every contributed
+//   status item, consumed by the attach companion.
+// - `notifications` — plugin-raised toast notifications.
+// - `notifications-list` — reactive state channel carrying queued toasts.
+plugin bmux.tab_bar version 1;
+import workspaces = bmux.workspaces;
+capability INPUT = bmux.tab_bar.input;
+capability STATUS_READ = bmux.tab_bar.status.read;
+capability STATUS_WRITE = bmux.tab_bar.status.write;
+capability NOTIFY = bmux.tab_bar.notify;
+
+@capability(INPUT)
+@interface-version(2)
+interface presentation-actions {
+    command move-selection(action: string, tabs: list<uuid>, workspace: uuid) -> unit;
+    command list-destinations() -> list<workspaces.workspace-summary>;
+}
+
+// Reactive snapshot of every plugin-contributed status item. The tab-bar
+// plugin publishes a fresh snapshot after each mutation; the attach
+// companion subscribes and renders items as right-side modules.
+interface status-items-list {
+    // Visual emphasis shared by status items and notifications. Rendering
+    // maps each level onto the active theme's module/toast styles.
+    enum severity {
+        @default normal,
+        info,
+        success,
+        warning,
+        critical,
+    }
+
+    record status-item {
+        // Host-assigned id of the plugin that set the item.
+        owner: string,
+        // Caller-chosen id, unique per owner.
+        id: string,
+        text: string,
+        severity: severity,
+        // Higher priorities render first and are dropped last when the bar
+        // runs out of width.
+        priority: i32,
+        // Optional longer description retained for listing and future hover UI.
+        tooltip: string?,
+    }
+
+    record status-item-snapshot {
+        // Ordered by priority (descending), then owner, then id.
+        items: list<status-item>,
+        revision: u64,
+    }
+
+    @state events status-item-snapshot;
+}
+
+@capability(STATUS_WRITE)
+interface status-items {
+    variant status-item-error {
+        invalid-argument { reason: string },
+        limit-exceeded { limit: u32 },
+    }
+
+    // Create or replace the caller's item `id`.
+    command set-status-item(
+        id: string,
+        text: string,
+        severity: status-items-list.severity,
+        priority: i32,
+        tooltip: string?,
+    ) -> result<unit, status-item-error>;
+
+    // Remove the caller's item `id`; returns whether an item was removed.
+    command clear-status-item(id: string) -> bool;
+
+    // Remove every item the caller owns; returns how many were removed.
+    // Plugins should call this from `deactivate`.
+    command clear-status-items() -> u32;
+}
+
+@capability(STATUS_READ)
+interface status-items-state {
+    // List contributed items, optionally only those of one owner plugin.
+    query list-status-items(owner: string?) -> list<status-items-list.status-item>;
+}
+
+// Reactive snapshot of queued toast notifications.
+interface notifications-list {
+    record notification {
+        id: uuid,
+        // Host-assigned id of the plugin that raised the toast.
+        owner: string,
+        title: string,
+        body: string?,
+        severity: status-items-list.severity,
+        // Unix epoch milliseconds when the toast was accepted.
+        created-at-ms: u64,
+        // Display lifetime in milliseconds.
+        ttl-ms: u64,
+    }
+
+    record notification-snapshot {
+        // Oldest first; bounded by the provider's queue limit.
+        notifications: list<notification>,
+        revision: u64,
+    }
+
+    @state events notification-snapshot;
+}
+
+@capability(NOTIFY)
+interface notifications {
+    variant notification-error {
+        invalid-argument { reason: string },
+    }
+
+    // Raise a toast; `ttl-ms` defaults to the provider's default lifetime
+    // and is clamped to its maximum. Returns the toast id.
+    command notify(
+        title: string,
+        body: string?,
+        severity: status-items-list.severity,
+        ttl-ms: u64?,
+    ) -> result<uuid, notification-error>;
+
+    // Dismiss one of the caller's toasts; returns whether it was queued.
+    command dismiss(id: uuid) -> bool;
+}
