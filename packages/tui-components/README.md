@@ -188,6 +188,11 @@ let chrome = Pane::new()
     .action(PaneTitleAction::new("close", "✕"));
 ```
 
+`Pane::footer` writes text right-aligned on the bottom border, such as a count
+or total that would compete with tabs and actions in the title row. It is
+truncated with an ellipsis when the border is too short, and its geometry is
+`Pane::footer_area`.
+
 A title can also be a component: `PaneComponent::title_content` takes, for
 example, a `Row` holding a label and a `tab_bar::TabBarComponent`. The pane
 measures it and places it where a text title would go (after the actions take
@@ -347,6 +352,26 @@ use bmux_tui_components::spinner::Spinner;
 let spinner = Spinner::braille();
 let span = spinner.span(epoch.elapsed(), style);
 let redraw_in = spinner.next_change(epoch.elapsed());
+```
+
+## Trailing list segments
+
+`SelectableListItem::trailing` attaches a segment, such as a count or status,
+after an item's first line. The list places it at the width each row is
+painted (after the highlight prefix and any scrollbar gutter) with
+`bmux_tui::text::place_trailing`, so callers never measure rows themselves.
+`TrailingPlacement` chooses `TrailingAlign::AfterContent` or
+`TrailingAlign::Right`, the gap, and `keep_visible`: when set, long content is
+shortened with an ellipsis instead of pushing the segment out of view.
+
+```rust
+use bmux_tui::prelude::{TrailingAlign, TrailingPlacement};
+use bmux_tui_components::selectable_list::SelectableListItem;
+
+let item = SelectableListItem::rich("app", "src/app.rs").trailing(
+    "+12 −3",
+    TrailingPlacement::new(TrailingAlign::Right).keep_visible(true),
+);
 ```
 
 ## Component conventions

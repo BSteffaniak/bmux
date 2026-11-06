@@ -101,7 +101,9 @@ pub mod prelude {
     };
     pub use crate::style::{Color, Modifier, Style};
     pub use crate::terminal::{DrawStats, Terminal};
-    pub use crate::text::{Line, Span, Text, TextWrap, TextWrapGeometry, wrap_text};
+    pub use crate::text::{
+        Line, Span, Text, TextWrap, TextWrapGeometry, TrailingAlign, TrailingPlacement, wrap_text,
+    };
     pub use crate::text_block::Alignment;
     pub use crate::text_width::{
         display_width, truncate_to_display_width, wrap_text_with_continuation,

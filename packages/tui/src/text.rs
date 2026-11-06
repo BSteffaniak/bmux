@@ -142,6 +142,19 @@ impl Line {
         truncate_line_to_display_width(self, width)
     }
 
+    /// Return this line with `trailing` placed after it within `width` cells.
+    ///
+    /// See [`place_trailing`].
+    #[must_use]
+    pub fn with_trailing(
+        &self,
+        trailing: &Self,
+        width: usize,
+        placement: TrailingPlacement,
+    ) -> Self {
+        place_trailing(self, trailing, width, placement)
+    }
+
     /// Return a styled viewport clipped to terminal display cells.
     ///
     /// Graphemes that would be split by the left or right viewport edge are
@@ -281,6 +294,121 @@ pub fn line_viewport(line: &Line, horizontal_offset: usize, width: usize) -> Lin
         }
     }
     Line::from_spans(spans)
+}
+
+/// Where a trailing segment sits relative to a line's content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum TrailingAlign {
+    /// Directly after the content, separated by the gap.
+    #[default]
+    AfterContent,
+    /// Against the right edge of the available width.
+    Right,
+}
+
+/// How [`place_trailing`] combines a line with a trailing segment, such as a count or
+/// status shown after a label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TrailingPlacement {
+    /// Where the segment sits.
+    pub align: TrailingAlign,
+    /// Shorten the content (with an ellipsis) rather than let the segment be clipped.
+    pub keep_visible: bool,
+    /// Minimum cells between content and segment.
+    pub gap: usize,
+}
+
+impl Default for TrailingPlacement {
+    fn default() -> Self {
+        Self::new(TrailingAlign::AfterContent)
+    }
+}
+
+impl TrailingPlacement {
+    /// A placement with a one-cell gap that lets the segment be clipped.
+    #[must_use]
+    pub const fn new(align: TrailingAlign) -> Self {
+        Self {
+            align,
+            keep_visible: false,
+            gap: 1,
+        }
+    }
+
+    /// The same placement, shortening content to keep the segment visible when `keep`.
+    #[must_use]
+    pub const fn keep_visible(mut self, keep: bool) -> Self {
+        self.keep_visible = keep;
+        self
+    }
+
+    /// The same placement with `gap` cells between content and segment.
+    #[must_use]
+    pub const fn gap(mut self, gap: usize) -> Self {
+        self.gap = gap;
+        self
+    }
+}
+
+/// Combine `content` and a `trailing` segment for a row `width` cells wide.
+///
+/// * When both fit, the segment follows the content after the gap, or sits against the
+///   right edge for [`TrailingAlign::Right`].
+/// * When they do not fit and the segment may be clipped, it follows the content after
+///   the gap and the result is wider than `width`, for the painter to clip.
+/// * When they do not fit and the segment must stay visible, the content is truncated with
+///   an ellipsis to make room. A segment at least as wide as the row takes the whole row,
+///   itself truncated; when only the gap does not fit, the content is dropped and the
+///   segment is right-aligned.
+///
+/// Padding spans are unstyled. An empty segment returns `content` unchanged.
+#[must_use]
+pub fn place_trailing(
+    content: &Line,
+    trailing: &Line,
+    width: usize,
+    placement: TrailingPlacement,
+) -> Line {
+    let trailing_width = trailing.width();
+    if trailing_width == 0 {
+        return content.clone();
+    }
+    let content_width = content.width();
+    let needed = content_width
+        .saturating_add(placement.gap)
+        .saturating_add(trailing_width);
+    let join = |content: Line, padding: usize| {
+        let mut spans = content.spans;
+        if padding > 0 {
+            spans.push(Span::raw(" ".repeat(padding)));
+        }
+        spans.extend(trailing.spans.iter().cloned());
+        Line::from_spans(spans)
+    };
+    if needed <= width {
+        let padding = match placement.align {
+            TrailingAlign::AfterContent => placement.gap,
+            TrailingAlign::Right => width - content_width - trailing_width,
+        };
+        return join(content.clone(), padding);
+    }
+    if !placement.keep_visible {
+        return join(content.clone(), placement.gap);
+    }
+    if trailing_width >= width {
+        return trailing.truncate(width);
+    }
+    let room = width - trailing_width;
+    if placement.gap >= room {
+        return join(Line::new(), room);
+    }
+    let shortened = content.truncate(room - placement.gap);
+    // A wide grapheme can leave the truncated content short of its room.
+    let padding = match placement.align {
+        TrailingAlign::AfterContent => placement.gap,
+        TrailingAlign::Right => room - shortened.width(),
+    };
+    join(shortened, padding)
 }
 
 /// Whether `line` is at most `width` cells wide, measuring graphemes only
@@ -1719,5 +1847,108 @@ mod tests {
             patched.spans[0].style,
             Style::new().fg(Color::Red).bg(Color::Blue)
         );
+    }
+
+    mod trailing {
+        use crate::style::{Color, Style};
+        use crate::text::{Line, Span, TrailingAlign, TrailingPlacement, place_trailing};
+
+        fn place(
+            content: &str,
+            trailing: &str,
+            width: usize,
+            placement: TrailingPlacement,
+        ) -> String {
+            place_trailing(
+                &Line::from(content),
+                &Line::from(trailing),
+                width,
+                placement,
+            )
+            .plain_text()
+        }
+
+        const AFTER: TrailingPlacement = TrailingPlacement::new(TrailingAlign::AfterContent);
+        const RIGHT: TrailingPlacement = TrailingPlacement::new(TrailingAlign::Right);
+
+        #[test]
+        fn fitting_segments_follow_content_or_the_right_edge() {
+            assert_eq!(place("app.rs", "+1", 12, AFTER), "app.rs +1");
+            assert_eq!(place("app.rs", "+1", 12, RIGHT), "app.rs    +1");
+            assert_eq!(place("app.rs", "+1", 9, RIGHT), "app.rs +1");
+            assert_eq!(place("app.rs", "+1", 12, RIGHT.gap(3)), "app.rs    +1");
+            assert_eq!(place("app.rs", "", 4, RIGHT.keep_visible(true)), "app.rs");
+        }
+
+        #[test]
+        fn clippable_segments_follow_overflowing_content() {
+            for placement in [AFTER, RIGHT] {
+                assert_eq!(
+                    place("long/path.rs", "+12", 8, placement),
+                    "long/path.rs +12"
+                );
+            }
+        }
+
+        #[test]
+        fn visible_segments_shorten_content_with_an_ellipsis() {
+            assert_eq!(
+                place("long/path.rs", "+12", 8, AFTER.keep_visible(true)),
+                "lon… +12"
+            );
+            assert_eq!(
+                place("long/path.rs", "+12", 8, RIGHT.keep_visible(true)),
+                "lon… +12"
+            );
+            // Content shorter than its room after a wide grapheme stays right-aligned.
+            assert_eq!(
+                place("界界界", "+1", 7, RIGHT.keep_visible(true)),
+                "界…  +1"
+            );
+            assert_eq!(place("界界界", "+1", 7, AFTER.keep_visible(true)), "界… +1");
+        }
+
+        #[test]
+        fn narrow_rows_give_the_segment_priority() {
+            let keep = RIGHT.keep_visible(true);
+            assert_eq!(place("name", "+12", 4, keep), " +12");
+            assert_eq!(place("name", "+12", 3, keep), "+12");
+            assert_eq!(place("name", "+123", 3, keep), "+1…");
+            assert_eq!(place("name", "+12", 0, keep), "");
+            assert_eq!(place("name", "+12", 5, keep), "… +12");
+        }
+
+        #[test]
+        fn widths_count_cells_not_characters() {
+            let keep = AFTER.keep_visible(true);
+            // Emoji and CJK are two cells; a combining mark adds none.
+            assert_eq!(place("🙂🙂🙂", "+1", 6, keep), "🙂… +1");
+            assert_eq!(
+                place("e\u{301}e\u{301}e\u{301}e\u{301}", "+1", 6, keep),
+                "e\u{301}e\u{301}… +1"
+            );
+            let line = place_trailing(&Line::from("界a"), &Line::from("+1"), 8, RIGHT);
+            assert_eq!(line.width(), 8);
+        }
+
+        #[test]
+        fn styles_survive_and_padding_is_unstyled() {
+            let green = Style::new().fg(Color::Green);
+            let red = Style::new().fg(Color::Red);
+            let line = place_trailing(
+                &Line::from_spans([Span::styled("name", red)]),
+                &Line::from_spans([Span::styled("+1", green)]),
+                10,
+                RIGHT,
+            );
+            assert_eq!(
+                line.spans,
+                vec![
+                    Span::styled("name", red),
+                    Span::raw("    "),
+                    Span::styled("+1", green),
+                ]
+            );
+        }
     }
 }

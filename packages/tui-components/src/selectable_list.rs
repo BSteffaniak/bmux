@@ -17,7 +17,7 @@ use bmux_tui::event::{Event, EventOutcome, MouseButton, MouseEvent, MouseEventKi
 use bmux_tui::geometry::Rect;
 use bmux_tui::hit::{HitRegion as SceneRegion, HitRole};
 use bmux_tui::paint::{LocalRect, PaintCx};
-use bmux_tui::prelude::{Line, Span, Style};
+use bmux_tui::prelude::{Line, Span, Style, TrailingPlacement};
 use bmux_tui::semantic::SemanticRegion;
 use bmux_tui::style::Modifier;
 use bmux_tui::text_width::display_width;
@@ -39,6 +39,8 @@ pub struct SelectableListItem {
     pub lines: Vec<Line>,
     /// Whether this item is disabled independently from the whole list.
     pub disabled: bool,
+    /// Segment placed after the first line at the painted width, such as a count.
+    pub trailing: Option<(Line, TrailingPlacement)>,
 }
 
 impl SelectableListItem {
@@ -50,6 +52,7 @@ impl SelectableListItem {
             id: id.into(),
             lines: vec![Line::from(label)],
             disabled: false,
+            trailing: None,
         }
     }
 
@@ -60,6 +63,7 @@ impl SelectableListItem {
             id: id.into(),
             lines: vec![line.into()],
             disabled: false,
+            trailing: None,
         }
     }
 
@@ -70,6 +74,7 @@ impl SelectableListItem {
             id: id.into(),
             lines: lines.into(),
             disabled: false,
+            trailing: None,
         }
     }
 
@@ -77,6 +82,28 @@ impl SelectableListItem {
     #[must_use]
     pub fn height(&self) -> u64 {
         u64::try_from(self.lines.len().max(1)).unwrap_or(u64::MAX)
+    }
+
+    /// Return this item with `trailing` placed after its first line.
+    ///
+    /// The list places it with [`bmux_tui::text::place_trailing`] at the width each row
+    /// is painted, after the highlight prefix, so it can follow the content, sit against
+    /// the right edge, or stay visible by shortening the content.
+    #[must_use]
+    pub fn trailing(mut self, trailing: impl Into<Line>, placement: TrailingPlacement) -> Self {
+        self.trailing = Some((trailing.into(), placement));
+        self
+    }
+
+    /// Natural display width of line `index`, including the trailing segment and its gap.
+    fn line_width(&self, index: usize) -> usize {
+        let width = self.lines.get(index).map_or(0, Line::width);
+        match &self.trailing {
+            Some((trailing, placement)) if index == 0 && trailing.width() > 0 => width
+                .saturating_add(placement.gap)
+                .saturating_add(trailing.width()),
+            _ => width,
+        }
     }
 
     /// Return this item with disabled state set.
@@ -398,9 +425,8 @@ impl<'a> SelectableList<'a> {
             .items
             .iter()
             .map(|item| {
-                item.lines
-                    .iter()
-                    .map(Line::width)
+                (0..item.lines.len().max(1))
+                    .map(|index| item.line_width(index))
                     .max()
                     .unwrap_or(0)
                     .saturating_add(prefix_width)
@@ -731,6 +757,7 @@ impl<'a> SelectableList<'a> {
         item: &SelectableListItem,
         line_index: usize,
         state: SelectableListState,
+        width: usize,
     ) -> Line {
         let style = self.style_for(index, item, state);
         let interaction_styled = state.interaction.disabled
@@ -750,22 +777,25 @@ impl<'a> SelectableList<'a> {
         if !prefix.is_empty() || self.policy.highlight.repeat_spacing {
             spans.push(Span::styled(format!("{prefix} "), style));
         }
-        spans.extend(
-            item.lines
-                .get(line_index)
-                .into_iter()
-                .flat_map(|line| line.spans.iter())
-                .map(|span| {
-                    // Interaction colors must remain visible over rich labels; inactive
-                    // rows retain their caller-supplied accents. Modifiers compose.
-                    let style = if interaction_styled {
-                        span.style.patch(style)
-                    } else {
-                        style.patch(span.style)
-                    };
-                    Span::styled(span.content.clone(), style)
-                }),
-        );
+        let content = item.lines.get(line_index).cloned().unwrap_or_default();
+        let content = match &item.trailing {
+            Some((trailing, placement)) if line_index == 0 => content.with_trailing(
+                trailing,
+                width.saturating_sub(self.prefix_width()),
+                *placement,
+            ),
+            _ => content,
+        };
+        spans.extend(content.spans.iter().map(|span| {
+            // Interaction colors must remain visible over rich labels; inactive
+            // rows retain their caller-supplied accents. Modifiers compose.
+            let style = if interaction_styled {
+                span.style.patch(style)
+            } else {
+                style.patch(span.style)
+            };
+            Span::styled(span.content.clone(), style)
+        }));
         Line::from_spans(spans)
     }
 
@@ -1265,6 +1295,7 @@ impl Component for ItemRows<'_, '_> {
                         item,
                         usize::try_from(line_index).unwrap_or(usize::MAX),
                         self.state,
+                        usize::try_from(width).unwrap_or(usize::MAX),
                     ),
                     self.fallback,
                 );
@@ -1402,6 +1433,7 @@ impl Component for SelectableListComponent<'_, '_> {
             for line in &item.lines {
                 format!("{line:?}").hash(&mut layout);
             }
+            format!("{:?}", item.trailing).hash(&mut layout);
         }
         self.list.policy.highlight.symbol.hash(&mut layout);
         self.list.policy.highlight.repeat_spacing.hash(&mut layout);
@@ -1915,7 +1947,7 @@ mod tests {
         });
         let inactive = SelectableListState::new(None);
         assert_eq!(
-            list.line(0, &items[0], 0, inactive)
+            list.line(0, &items[0], 0, inactive, 80)
                 .spans
                 .last()
                 .unwrap()
@@ -1935,7 +1967,7 @@ mod tests {
                 _ => state.interaction.disabled = true,
             }
             assert_eq!(
-                list.line(0, &items[0], 0, state)
+                list.line(0, &items[0], 0, state, 80)
                     .spans
                     .last()
                     .unwrap()
@@ -2087,6 +2119,84 @@ mod tests {
         list.render(Rect::new(0, 0, 6, 2), &state, &mut frame);
 
         assert_eq!(frame.buffer().row_symbols(1).as_deref(), Some("  Thr█"));
+    }
+
+    #[test]
+    fn trailing_segments_are_placed_at_the_painted_row_width() {
+        use bmux_tui::prelude::{TrailingAlign, TrailingPlacement};
+
+        let rows = |placement: TrailingPlacement, width: u16, scrollbar| {
+            let items = [
+                SelectableListItem::new("short", "app.rs").trailing("+1", placement),
+                SelectableListItem::new("long", "very/long/path.rs").trailing("+12", placement),
+                SelectableListItem::new("plain", "x"),
+            ];
+            let list = SelectableList::new(&items)
+                .policy(SelectableListPolicy::interactive().scrollbar(scrollbar));
+            let state = SelectableListState::new(Some(0));
+            let mut buffer = Buffer::empty(Rect::new(0, 0, width, 3));
+            let mut frame = Frame::new(&mut buffer);
+            list.render(Rect::new(0, 0, width, 3), &state, &mut frame);
+            (0..3)
+                .filter_map(|y| frame.buffer().row_symbols(y))
+                .collect::<Vec<_>>()
+        };
+        let none = ScrollbarAxisLayoutMode::Hidden;
+        let after = TrailingPlacement::new(TrailingAlign::AfterContent);
+        let right = TrailingPlacement::new(TrailingAlign::Right);
+        // The highlight prefix (`> `) comes first; the segment is placed in the rest.
+        assert_eq!(
+            rows(after, 14, none),
+            ["> app.rs +1   ", "  very/long/pa", "  x           "]
+        );
+        assert_eq!(
+            rows(right, 14, none),
+            ["> app.rs    +1", "  very/long/pa", "  x           "]
+        );
+        assert_eq!(
+            rows(after.keep_visible(true), 14, none),
+            ["> app.rs +1   ", "  very/lo… +12", "  x           "]
+        );
+        assert_eq!(
+            rows(right.keep_visible(true), 14, none),
+            ["> app.rs    +1", "  very/lo… +12", "  x           "]
+        );
+        // A scrollbar gutter narrows the rows, and the placement follows.
+        assert_eq!(
+            rows(
+                right.keep_visible(true),
+                15,
+                ScrollbarAxisLayoutMode::Gutter
+            ),
+            ["> app.rs    +1█", "  very/lo… +12█", "  x           █"]
+        );
+        // Too narrow for anything but the segment.
+        assert_eq!(
+            rows(right.keep_visible(true), 5, none),
+            [">  +1", "  +12", "  x  "]
+        );
+    }
+
+    #[test]
+    fn trailing_segments_count_toward_natural_width_and_take_row_styles() {
+        use bmux_tui::prelude::{TrailingAlign, TrailingPlacement};
+
+        let items = [SelectableListItem::new("one", "ab")
+            .trailing("+1", TrailingPlacement::new(TrailingAlign::Right).gap(2))];
+        let list = SelectableList::new(&items).styles(SelectableListStyles {
+            selected: Style::new().bg(bmux_tui::style::Color::Blue),
+            ..SelectableListStyles::default()
+        });
+        // Prefix (2) + content (2) + gap (2) + segment (2) + margin (2).
+        assert_eq!(list.size().0, 10);
+        let row = list.line(0, &items[0], 0, SelectableListState::new(Some(0)), 10);
+        assert_eq!(row.plain_text(), "> ab    +1");
+        // The padding between content and segment carries the selected row's background.
+        assert!(
+            row.spans
+                .iter()
+                .all(|span| span.style.bg == Some(bmux_tui::style::Color::Blue))
+        );
     }
 
     #[test]
@@ -2710,7 +2820,7 @@ mod focus_visual_tests {
         let mut state = SelectableListState::new(None);
         state.focused = Some(0);
         assert_eq!(
-            list.line(0, &items[0], 0, state)
+            list.line(0, &items[0], 0, state, 80)
                 .spans
                 .last()
                 .unwrap()

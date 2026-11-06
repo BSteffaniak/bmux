@@ -623,6 +623,7 @@ impl<'a> SelectDropdown<'a> {
                 id: option.id.clone(),
                 lines: vec![Line::from(option.label.clone())],
                 disabled: option.disabled,
+                trailing: None,
             })
             .collect()
     }

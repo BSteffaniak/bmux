@@ -438,6 +438,7 @@ impl<'a> Menu<'a> {
                     id: item.id.clone(),
                     lines,
                     disabled: item.disabled || item.section,
+                    trailing: None,
                 }
             })
             .collect()

@@ -312,6 +312,7 @@ pub struct PaneTitleLayout {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pane<'a> {
     title: Option<Line>,
+    footer: Option<Line>,
     actions: Vec<PaneTitleAction>,
     title_hit: bool,
     padding: Insets,
@@ -327,6 +328,7 @@ impl Pane<'_> {
     pub const fn new() -> Self {
         Self {
             title: None,
+            footer: None,
             actions: Vec::new(),
             title_hit: false,
             padding: Insets::all(0),
@@ -353,6 +355,26 @@ impl Pane<'_> {
     pub fn title(mut self, title: impl Into<Line>) -> Self {
         self.title = Some(title.into());
         self
+    }
+
+    /// Set a footer: text right-aligned on the bottom border, inside the corners, truncated
+    /// with an ellipsis when the border is too short. Shown only on bordered panes.
+    #[must_use]
+    pub fn footer(mut self, footer: impl Into<Line>) -> Self {
+        self.footer = Some(footer.into());
+        self
+    }
+
+    /// Where the footer of a pane occupying `size` is written, if anything of it fits.
+    #[must_use]
+    pub fn footer_area(&self, size: Rect) -> Option<Rect> {
+        let footer = self.footer.as_ref()?;
+        if !self.border || size.height < 2 || size.width < 3 {
+            return None;
+        }
+        let inner = size.width - 2;
+        let width = u16::try_from(footer.width()).unwrap_or(u16::MAX).min(inner);
+        (width > 0).then(|| Rect::new(size.right() - 1 - width, size.bottom() - 1, width, 1))
     }
 
     /// Append a title-row action. Actions are right-aligned in declaration order; when
@@ -915,6 +937,7 @@ impl Component for PaneComponent<'_, '_> {
         format!("{:?}", self.pointer_intent).hash(&mut paint);
         format!("{:?}", self.pane.styles).hash(&mut paint);
         format!("{:?}", self.pane.actions).hash(&mut paint);
+        format!("{:?}", self.pane.footer).hash(&mut paint);
         self.pane.title_hit.hash(&mut paint);
         format!("{:?}", self.pane.policy).hash(&mut paint);
         format!("{:?}", state.interaction).hash(&mut paint);
@@ -1031,6 +1054,12 @@ impl Component for PaneComponent<'_, '_> {
                     .hoverable(true)
                     .focusable(false)
                     .enabled(!state.interaction.disabled),
+            );
+        }
+        if let (Some(footer), Some(area)) = (&self.pane.footer, self.pane.footer_area(size)) {
+            cx.write_line(
+                LocalRect::new(i32::from(area.x), i64::from(area.y), area.width, 1),
+                &footer.truncate(usize::from(area.width)),
             );
         }
         self.paint_title_row(size, state, layout.children.get(1), cx);
@@ -1465,6 +1494,43 @@ mod tests {
             PointerIntent::Shape(PointerShape::Crosshair)
         );
         assert_ne!(hidden.paint, component.revision().paint);
+    }
+
+    #[test]
+    fn footer_is_right_aligned_on_the_bottom_border() {
+        for (footer, border, expected) in [
+            ("+3", true, "└──────+3┘"),
+            ("界e\u{301}", true, "└─────界e\u{301}┘"),
+            ("1234567890", true, "└1234567…┘"),
+            ("", true, "└────────┘"),
+            ("+3", false, "          "),
+        ] {
+            let state = Cell::new(PaneState::new(Rect::new(0, 0, 10, 3)));
+            let component = PaneComponent::new(
+                "pane",
+                Pane::new().border(border).footer(footer),
+                &state,
+                TextBlock::new(""),
+            );
+            let layout =
+                component.layout(Constraints::tight(Size::new(10, 3)), &mut LayoutCx::new());
+            let mut buffer = Buffer::empty(Rect::new(0, 0, 10, 3));
+            component.paint(&layout, &mut PaintCx::new(&mut Frame::new(&mut buffer)));
+            assert_eq!(
+                buffer.row_symbols(2).as_deref(),
+                Some(expected),
+                "footer: {footer:?}"
+            );
+        }
+        // Too small for a bottom border inside the corners.
+        assert_eq!(
+            Pane::new().footer("+3").footer_area(Rect::new(0, 0, 2, 3)),
+            None
+        );
+        assert_eq!(
+            Pane::new().footer("+3").footer_area(Rect::new(0, 0, 9, 1)),
+            None
+        );
     }
 
     #[test]
