@@ -53,6 +53,18 @@ controls or render callbacks. The runtime's
 that path for buttons, editable text, disabled controls, a modal, capture, and
 explicit shape overrides; see its [run instructions](../tui-runtime/README.md#interactive-pointer-controls).
 
+## Clickable regions
+
+`composition::HitArea` makes any child clickable without changing its layout:
+it registers a hit region (an action by default; `role` changes it) over the
+area the child is laid out in, so painting, clipping and hit testing agree.
+
+```rust
+use bmux_tui::composition::{HitArea, TextBlock};
+
+let activity = HitArea::new("status-activity", TextBlock::new("⠹ Pushing main"));
+```
+
 ## Streaming subprocess output
 
 `ansi::AnsiLog` incrementally decodes byte chunks into a bounded styled log

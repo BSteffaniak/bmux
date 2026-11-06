@@ -896,6 +896,74 @@ impl Component for Keyed<'_> {
     }
 }
 
+/// Make one child clickable: registers a pointer hit region with `id` over the area the child
+/// is laid out in, without changing its geometry or painting.
+pub struct HitArea<'a> {
+    id: crate::hit::HitId,
+    role: crate::hit::HitRole,
+    child: Element<'a>,
+}
+
+impl<'a> HitArea<'a> {
+    /// A clickable wrapper registering `id` as an action.
+    #[must_use]
+    pub fn new(id: impl Into<crate::hit::HitId>, child: impl Component + 'a) -> Self {
+        Self {
+            id: id.into(),
+            role: crate::hit::HitRole::Action,
+            child: Element::new(child),
+        }
+    }
+
+    /// Set the region's role.
+    #[must_use]
+    pub const fn role(mut self, role: crate::hit::HitRole) -> Self {
+        self.role = role;
+        self
+    }
+}
+
+impl Component for HitArea<'_> {
+    fn revision(&self) -> ComponentRevision {
+        let own = ComponentRevision::new(stable_revision(|state| self.id.as_str().hash(state)), 0);
+        own.combine(self.child.revision())
+    }
+
+    fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
+        cx.record_measurement();
+        let child = self.child.layout(constraints, cx);
+        LayoutNode::with_children(
+            LayoutId::new(self.id.as_str().to_owned()),
+            child.size,
+            vec![ChildLayout::new(0, 0, child)],
+        )
+    }
+
+    fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
+        paint_single_child(&self.child, layout, cx);
+        let width = u16::try_from(layout.size.width).unwrap_or(u16::MAX);
+        let height = u16::try_from(layout.size.height).unwrap_or(u16::MAX);
+        if width > 0 && height > 0 {
+            cx.push_hit(
+                crate::hit::HitRegion::new(self.id.clone(), Rect::new(0, 0, width, height))
+                    .role(self.role),
+            );
+        }
+    }
+
+    fn event(
+        &self,
+        event: &crate::event::Event,
+        layout: &LayoutNode,
+        cx: &mut crate::component::EventCx<'_>,
+    ) -> crate::event::EventOutcome {
+        let Some(child) = layout.children.first() else {
+            return crate::event::EventOutcome::Ignored;
+        };
+        self.child.event(event, &child.node, cx)
+    }
+}
+
 /// Add measurable insets around one child without introducing visual chrome.
 pub struct Padding<'a> {
     surface: Surface<'a>,
@@ -2108,8 +2176,8 @@ impl Component for Column<'_> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Align, Clip, Column, Fill, Flex, HorizontalAlignment, Keyed, Padding, Row, SizeBox, Stack,
-        StyleScope, Surface, TextBlock, VerticalAlignment, Visibility,
+        Align, Clip, Column, Fill, Flex, HitArea, HorizontalAlignment, Keyed, Padding, Row,
+        SizeBox, Stack, StyleScope, Surface, TextBlock, VerticalAlignment, Visibility,
     };
     use crate::buffer::Buffer;
     use crate::chrome::Border;
@@ -3152,6 +3220,23 @@ mod tests {
                 .map(|cell| cell.style.bg),
             Some(Some(Color::Blue))
         );
+    }
+
+    #[test]
+    fn hit_area_registers_its_childs_area_without_changing_it() {
+        let component = Padding::new(
+            Insets::new(0, 0, 0, 2),
+            HitArea::new("status.activity", TextBlock::new("busy")),
+        );
+        let layout = component.layout(Constraints::new(0, 10, 0, None), &mut LayoutCx::new());
+        assert_eq!(layout.size.width, 6);
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 10, 1));
+        let mut frame = Frame::new(&mut buffer);
+        component.paint(&layout, &mut PaintCx::new(&mut frame));
+        let hit = frame.hits().hit_test(Point::new(3, 0)).unwrap();
+        assert_eq!(hit.region.id.as_str(), "status.activity");
+        assert_eq!(hit.region.area, Rect::new(2, 0, 4, 1));
+        assert!(frame.hits().hit_test(Point::new(1, 0)).is_none());
     }
 
     #[test]

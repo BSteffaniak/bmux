@@ -331,6 +331,24 @@ Running the program (for example with `bmux_pty`) is the caller's concern.
 it, measuring its content at that width, for scrolled content whose size is not
 known when the view is built.
 
+## Activity spinners
+
+The `spinner` feature's `spinner::Spinner` maps elapsed time to a frame, so a
+spinner turns at the same speed however often the application redraws. Measure
+elapsed time from one shared epoch to keep every spinner on screen in step.
+Presets are `braille`, `dot` and `ascii` (also by name with `Spinner::named`);
+`Spinner::new` takes custom frames and `Spinner::fixed` one frame for when
+motion is off. `width` is the widest frame in cells, for reserving space, and
+`next_change` says when to redraw next (`None` for a fixed spinner).
+
+```rust
+use bmux_tui_components::spinner::Spinner;
+
+let spinner = Spinner::braille();
+let span = spinner.span(epoch.elapsed(), style);
+let redraw_in = spinner.next_change(epoch.elapsed());
+```
+
 ## Component conventions
 
 Interactive components should follow the same shape as the existing text input

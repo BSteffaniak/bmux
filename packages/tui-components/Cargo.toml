@@ -72,6 +72,7 @@ select-dropdown = ["selectable-list"]
 selectable-list = ["keyboard-input", "scroll-view"]
 source-viewer = ["dep:unicode-segmentation", "dep:unicode-width"]
 sparkline = []
+spinner = []
 split-button = ["button", "menu"]
 status-bar = []
 stepper = []
@@ -127,6 +128,7 @@ all = [
     "selectable-list",
     "source-viewer",
     "sparkline",
+    "spinner",
     "split-button",
     "status-bar",
     "stepper",
@@ -151,6 +153,7 @@ data-display = [
     "labeled-details",
     "progress-bar",
     "sparkline",
+    "spinner",
     "status-bar",
     "stepper",
     "table",
