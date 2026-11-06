@@ -1,0 +1,22 @@
+[package]
+authors     = { workspace = true }
+categories  = ["graphics", "command-line-interface"]
+description = "Terminal-independent color values and perceptual color math for bmux"
+edition     = { workspace = true }
+keywords    = ["bmux", "color", "oklab", "contrast", "theme"]
+license     = { workspace = true }
+name        = "bmux_color"
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+serde = { workspace = true, optional = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+
+[features]
+default          = []
+fail-on-warnings = []
+serde            = ["dep:serde"]

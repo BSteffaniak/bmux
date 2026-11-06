@@ -4,3 +4,5 @@
 # dependencies require foldhash 0.2. These internal hashers share no public types
 # and cannot be unified without changing upstream semver requirements.
 allowed-duplicate-crates = ["embedded-io", "foldhash"]
+# Color-space names used in prose; ".." keeps Clippy's default identifiers.
+doc-valid-idents = ["OKLab", "OKLCH", ".."]
