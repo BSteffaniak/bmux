@@ -49,29 +49,35 @@ pub fn wrap_text_with_continuation_character(
 /// Truncate text to a terminal display width, appending an ellipsis when clipped.
 #[must_use]
 pub fn truncate_to_display_width(text: &str, width: usize) -> String {
-    if display_width(text) <= width {
-        return text.to_owned();
+    // Printable ASCII is one narrow grapheme per byte.
+    if text.bytes().all(|byte| matches!(byte, b' '..=b'~')) {
+        return match width {
+            _ if text.len() <= width => text.to_owned(),
+            0 => String::new(),
+            1 => "…".to_owned(),
+            _ => format!("{}…", &text[..width - 1]),
+        };
     }
-    if width == 0 {
-        return String::new();
-    }
-    if width == 1 {
-        return "…".to_owned();
-    }
-
-    let mut output = String::new();
-    let mut used = 0usize;
+    // Measure only until the text overflows, so clipping long text costs
+    // O(width) rather than O(text).
     let body_width = width.saturating_sub(1);
-    for grapheme in text.graphemes(true) {
+    let mut used = 0usize;
+    let mut body_end = None;
+    for (index, grapheme) in text.grapheme_indices(true) {
         let grapheme_width = display_width(grapheme);
-        if used.saturating_add(grapheme_width) > body_width {
-            output.push('…');
-            return output;
+        if body_end.is_none() && used.saturating_add(grapheme_width) > body_width {
+            body_end = Some(index);
         }
-        output.push_str(grapheme);
         used = used.saturating_add(grapheme_width);
+        if used > width {
+            return match (width, body_end) {
+                (0, _) => String::new(),
+                (1, _) | (_, None) => "…".to_owned(),
+                (_, Some(end)) => format!("{}…", &text[..end]),
+            };
+        }
     }
-    output
+    text.to_owned()
 }
 
 #[cfg(test)]
@@ -80,6 +86,61 @@ mod tests {
         display_width, truncate_to_display_width, wrap_text_with_continuation,
         wrap_text_with_continuation_character,
     };
+
+    /// The measure-everything implementation the early-exit one replaced.
+    fn reference_truncate(text: &str, width: usize) -> String {
+        use unicode_segmentation::UnicodeSegmentation;
+        if text.graphemes(true).map(display_width).sum::<usize>() <= width {
+            return text.to_owned();
+        }
+        if width <= 1 {
+            return "…".repeat(width);
+        }
+        let mut output = String::new();
+        let mut used = 0;
+        for grapheme in text.graphemes(true) {
+            let grapheme_width = display_width(grapheme);
+            if used + grapheme_width > width - 1 {
+                output.push('…');
+                return output;
+            }
+            output.push_str(grapheme);
+            used += grapheme_width;
+        }
+        output
+    }
+
+    #[test]
+    fn truncation_matches_full_measurement_for_ascii_and_unicode() {
+        let texts = [
+            "",
+            "a",
+            "hello world",
+            "日本語テキスト",
+            "a界b界c",
+            "e\u{301}e\u{301}e\u{301}x",
+            "👨‍👩‍👧‍👦 family",
+            "tab\there",
+            "zero\u{200b}width",
+        ];
+        for text in texts {
+            for width in 0..16 {
+                assert_eq!(
+                    truncate_to_display_width(text, width),
+                    reference_truncate(text, width),
+                    "text={text:?} width={width}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn truncating_long_text_keeps_only_the_visible_prefix() {
+        let long = "x".repeat(100_000);
+        assert_eq!(truncate_to_display_width(&long, 4), "xxx…");
+        let wide = "界".repeat(100_000);
+        assert_eq!(truncate_to_display_width(&wide, 5), "界界…");
+    }
 
     #[test]
     fn wraps_combining_graphemes_without_splitting_marks() {

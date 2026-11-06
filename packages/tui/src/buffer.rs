@@ -14,7 +14,10 @@ use crate::style::Style;
 use crate::text::Line;
 
 /// One render-buffer cell.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Setters reuse the symbol's allocation, so repainting a buffer in place does
+/// not allocate per cell.
+#[derive(Debug, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Cell {
     /// Cell symbol.
@@ -23,6 +26,38 @@ pub struct Cell {
     pub style: Style,
     width: u8,
     wide_continuation: bool,
+}
+
+// Frame diffs compare every cell: check the cheap fields first, and compare
+// single-byte symbols without a `memcmp` call.
+impl PartialEq for Cell {
+    fn eq(&self, other: &Self) -> bool {
+        self.style == other.style
+            && self.width == other.width
+            && self.wide_continuation == other.wide_continuation
+            && match (self.symbol.as_bytes(), other.symbol.as_bytes()) {
+                ([left], [right]) => left == right,
+                (left, right) => left == right,
+            }
+    }
+}
+
+impl Clone for Cell {
+    fn clone(&self) -> Self {
+        Self {
+            symbol: self.symbol.clone(),
+            style: self.style,
+            width: self.width,
+            wide_continuation: self.wide_continuation,
+        }
+    }
+
+    fn clone_from(&mut self, source: &Self) {
+        self.symbol.clone_from(&source.symbol);
+        self.style = source.style;
+        self.width = source.width;
+        self.wide_continuation = source.wide_continuation;
+    }
 }
 
 impl Default for Cell {
@@ -43,7 +78,12 @@ impl Cell {
     /// into styled text before constructing cells when terminal styling is intended.
     #[must_use]
     pub fn new(symbol: impl Into<String>, style: Style) -> Self {
-        let symbol = safe_symbol(symbol.into());
+        let symbol = symbol.into();
+        let symbol = if is_safe_symbol(&symbol) {
+            symbol
+        } else {
+            REPLACEMENT.to_owned()
+        };
         Self {
             width: u8::try_from(grapheme_width(&symbol).max(1)).unwrap_or(2),
             symbol,
@@ -53,12 +93,29 @@ impl Cell {
     }
 
     /// Set this cell's symbol and style as a standalone logical cell.
-    pub fn set(&mut self, symbol: impl Into<String>, style: Style) {
-        let symbol = safe_symbol(symbol.into());
-        self.width = u8::try_from(grapheme_width(&symbol).max(1)).unwrap_or(2);
-        self.symbol = symbol;
+    pub fn set(&mut self, symbol: impl AsRef<str>, style: Style) {
+        let symbol = safe_symbol(symbol.as_ref());
+        self.assign(
+            symbol,
+            u8::try_from(grapheme_width(symbol).max(1)).unwrap_or(2),
+            style,
+        );
+    }
+
+    /// Install an already sanitized symbol of known width, reusing the
+    /// symbol's allocation.
+    fn assign(&mut self, symbol: &str, width: u8, style: Style) {
+        if self.symbol != symbol {
+            self.symbol.clear();
+            self.symbol.push_str(symbol);
+        }
         self.style = style;
+        self.width = width;
         self.wide_continuation = false;
+    }
+
+    fn reset(&mut self) {
+        self.assign(" ", 1, Style::new());
     }
 
     /// Return this logical cell's terminal width.
@@ -88,11 +145,26 @@ impl Cell {
 }
 
 /// A two-dimensional terminal render buffer.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Buffer {
     area: Rect,
     cells: Vec<Cell>,
+}
+
+impl Clone for Buffer {
+    fn clone(&self) -> Self {
+        Self {
+            area: self.area,
+            cells: self.cells.clone(),
+        }
+    }
+
+    /// Copy `source` reusing this buffer's cell storage.
+    fn clone_from(&mut self, source: &Self) {
+        self.area = source.area;
+        self.cells.clone_from(&source.cells);
+    }
 }
 
 impl Buffer {
@@ -104,6 +176,18 @@ impl Buffer {
             area,
             cells: vec![Cell::default(); len],
         }
+    }
+
+    /// Blank this buffer and give it `area`, reusing its cell storage: a
+    /// recycled buffer repaints without allocating.
+    pub fn reset(&mut self, area: Rect) {
+        let len = usize::from(area.width) * usize::from(area.height);
+        self.area = area;
+        self.cells.truncate(len);
+        for cell in &mut self.cells {
+            cell.reset();
+        }
+        self.cells.resize_with(len, Cell::default);
     }
 
     /// Return the buffer area.
@@ -230,25 +314,32 @@ impl Buffer {
     ///
     /// Existing wide spans touching the destination are cleared first. Width-two graphemes are
     /// installed atomically with an explicit continuation cell when room remains.
-    pub fn set_cell(&mut self, point: Point, symbol: impl Into<String>, style: Style) {
-        if !self.area.contains(point) {
+    pub fn set_cell(&mut self, point: Point, symbol: impl AsRef<str>, style: Style) {
+        let symbol = safe_symbol(symbol.as_ref());
+        self.put_symbol(point, symbol, grapheme_width(symbol), style);
+    }
+
+    /// Set a cell to an already sanitized symbol of known grapheme width.
+    fn put_symbol(&mut self, point: Point, symbol: &str, width: u16, style: Style) {
+        let Some(index) = self.index(point) else {
+            return;
+        };
+        // Common case: a narrow symbol over a narrow cell touches nothing else.
+        let cell = &mut self.cells[index];
+        if width < 2 && cell.width == 1 && !cell.wide_continuation {
+            cell.assign(symbol, 1, style);
             return;
         }
         self.clear_span_at(point);
-        let symbol = safe_symbol(symbol.into());
-        let width = grapheme_width(&symbol);
         if width == 2 && point.x.saturating_add(1) < self.area.right() {
-            self.clear_span_at(Point::new(point.x.saturating_add(1), point.y));
-            if let Some(cell) = self.get_mut(point) {
-                cell.set(symbol, style);
-                cell.width = 2;
-            }
-            if let Some(cell) = self.get_mut(Point::new(point.x.saturating_add(1), point.y)) {
+            let next = Point::new(point.x.saturating_add(1), point.y);
+            self.clear_span_at(next);
+            self.cells[index].assign(symbol, 2, style);
+            if let Some(cell) = self.get_mut(next) {
                 cell.set_continuation(style);
             }
-        } else if let Some(cell) = self.get_mut(point) {
-            cell.set(if width == 2 { " ".to_owned() } else { symbol }, style);
-            cell.width = 1;
+        } else {
+            self.cells[index].assign(if width == 2 { " " } else { symbol }, 1, style);
         }
     }
 
@@ -265,7 +356,7 @@ impl Buffer {
         };
         for offset in 0..width {
             if let Some(cell) = self.get_mut(Point::new(start.x.saturating_add(offset), start.y)) {
-                *cell = Cell::default();
+                cell.reset();
             }
         }
     }
@@ -276,21 +367,22 @@ impl Buffer {
         if clip.is_empty() {
             return;
         }
-        let width = grapheme_width(symbol).max(1);
+        let symbol = safe_symbol(symbol);
+        let symbol_width = grapheme_width(symbol);
+        let width = symbol_width.max(1);
         for y in clip.y..clip.bottom() {
             let mut x = clip.x;
             let clipped_columns = clip.x.saturating_sub(area.x) % width;
             if clipped_columns != 0 {
-                self.set_cell(Point::new(x, y), " ", style);
+                self.put_symbol(Point::new(x, y), " ", 1, style);
                 x = x.saturating_add(width - clipped_columns);
             }
             while x < clip.right() {
-                let symbol = if width > clip.right().saturating_sub(x) {
-                    " "
+                if width > clip.right().saturating_sub(x) {
+                    self.put_symbol(Point::new(x, y), " ", 1, style);
                 } else {
-                    symbol
-                };
-                self.set_cell(Point::new(x, y), symbol, style);
+                    self.put_symbol(Point::new(x, y), symbol, symbol_width, style);
+                }
                 x = x.saturating_add(width);
             }
         }
@@ -301,27 +393,31 @@ impl Buffer {
     /// so text drawn over a filled background keeps that background. An
     /// explicit color (including [`Color::Default`](crate::style::Color))
     /// still replaces it. [`Self::set_cell`] replaces the whole style.
-    pub fn overlay_cell(&mut self, point: Point, symbol: impl Into<String>, style: Style) {
-        let Some(existing) = self.get(point).map(|cell| cell.style) else {
-            return;
-        };
-        self.set_cell(point, symbol, existing.patch(style));
+    pub fn overlay_cell(&mut self, point: Point, symbol: impl AsRef<str>, style: Style) {
+        let symbol = safe_symbol(symbol.as_ref());
+        self.put_cell(point, symbol, grapheme_width(symbol), style, true);
     }
 
     /// Write styled text clipped to the supplied absolute area, replacing the
     /// style of every written cell (see [`Self::overlay_line`]).
     pub fn write_line(&mut self, area: Rect, line: &Line) {
-        self.write_line_cells(area, line, false);
+        self.write_line_cells(area, line, false, Style::new());
     }
 
     /// Write styled text clipped to the supplied absolute area, layering each
     /// span's style over the cells beneath (see [`Self::overlay_cell`]).
     /// Cells outside the written text are untouched.
     pub fn overlay_line(&mut self, area: Rect, line: &Line) {
-        self.write_line_cells(area, line, true);
+        self.write_line_cells(area, line, true, Style::new());
     }
 
-    fn write_line_cells(&mut self, area: Rect, line: &Line, overlay: bool) {
+    /// [`Self::overlay_line`] with `fallback` behind every span's style, as
+    /// if written with [`Line::with_fallback_style`] but without copying it.
+    pub(crate) fn overlay_line_with_fallback(&mut self, area: Rect, line: &Line, fallback: Style) {
+        self.write_line_cells(area, line, true, fallback);
+    }
+
+    fn write_line_cells(&mut self, area: Rect, line: &Line, overlay: bool, fallback: Style) {
         let clip = self.area.intersection(area);
         if clip.is_empty() {
             return;
@@ -329,7 +425,27 @@ impl Buffer {
 
         let mut x = area.x;
         for span in &line.spans {
-            for grapheme in span.content.graphemes(true) {
+            let style = fallback.patch(span.style);
+            let content = span.content.as_str();
+            // Printable ASCII is one narrow grapheme per byte: skip segmentation.
+            let ascii = content
+                .bytes()
+                .all(|byte| byte.is_ascii() && !byte.is_ascii_control());
+            let mut graphemes = content.graphemes(true);
+            let mut offset = 0;
+            loop {
+                let grapheme = if ascii {
+                    let Some(grapheme) = content.get(offset..offset + 1) else {
+                        break;
+                    };
+                    offset += 1;
+                    grapheme
+                } else {
+                    let Some(grapheme) = graphemes.next() else {
+                        break;
+                    };
+                    grapheme
+                };
                 let width = grapheme_width(grapheme);
                 if width == 0 {
                     continue;
@@ -338,33 +454,38 @@ impl Buffer {
                     return;
                 }
                 if x >= clip.x && x < clip.right() {
-                    let symbol = if width > clip.right().saturating_sub(x) {
-                        " "
+                    let point = Point::new(x, area.y);
+                    if width > clip.right().saturating_sub(x) {
+                        self.put_cell(point, " ", 1, style, overlay);
                     } else {
-                        grapheme
-                    };
-                    self.put_cell(Point::new(x, area.y), symbol, span.style, overlay);
+                        // Control-containing graphemes measure 1, like their replacement.
+                        self.put_cell(point, safe_symbol(grapheme), width, style, overlay);
+                    }
                 } else if x < clip.x && x.saturating_add(width) > clip.x {
-                    self.put_cell(Point::new(clip.x, area.y), " ", span.style, overlay);
+                    self.put_cell(Point::new(clip.x, area.y), " ", 1, style, overlay);
                 }
                 x = x.saturating_add(width);
             }
         }
     }
 
-    fn put_cell(&mut self, point: Point, symbol: &str, style: Style, overlay: bool) {
-        if overlay {
-            self.overlay_cell(point, symbol, style);
+    fn put_cell(&mut self, point: Point, symbol: &str, width: u16, style: Style, overlay: bool) {
+        let style = if overlay {
+            let Some(existing) = self.get(point) else {
+                return;
+            };
+            existing.style.patch(style)
         } else {
-            self.set_cell(point, symbol, style);
-        }
+            style
+        };
+        self.put_symbol(point, symbol, width, style);
     }
 
     /// Fill `area` with `style`, then write `line` with that style applied as
     /// a fallback behind every span.
     pub fn write_line_with_fallback_style(&mut self, area: Rect, line: &Line, style: Style) {
         self.fill(area, " ", style);
-        self.write_line(area, &line.with_fallback_style(style));
+        self.write_line_cells(area, line, false, style);
     }
 
     /// Return plain symbols for one absolute row in this buffer.
@@ -394,16 +515,27 @@ impl Buffer {
 
 // Ordinary cells are text, not terminal protocol. Replace a control-containing
 // symbol with one visible cell; callers wanting ANSI styles must parse first.
-fn safe_symbol(symbol: String) -> String {
-    if symbol.chars().any(char::is_control) {
-        "\u{fffd}".to_owned()
-    } else {
+const REPLACEMENT: &str = "\u{fffd}";
+
+fn is_safe_symbol(symbol: &str) -> bool {
+    match symbol.as_bytes() {
+        [byte] => !byte.is_ascii_control(),
+        _ => !symbol.chars().any(char::is_control),
+    }
+}
+
+fn safe_symbol(symbol: &str) -> &str {
+    if is_safe_symbol(symbol) {
         symbol
+    } else {
+        REPLACEMENT
     }
 }
 
 fn grapheme_width(grapheme: &str) -> u16 {
-    if grapheme.chars().any(char::is_control) {
+    // One byte is one ASCII character: printable ones are narrow, and
+    // controls measure like their replacement character.
+    if grapheme.len() == 1 || grapheme.chars().any(char::is_control) {
         return 1;
     }
     match UnicodeWidthStr::width(grapheme) {
@@ -419,6 +551,52 @@ mod tests {
     use crate::geometry::{Point, Rect};
     use crate::style::{Color, Style};
     use crate::text::{Line, Span};
+
+    #[test]
+    fn reset_recycles_a_painted_buffer_into_a_blank_one() {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 6, 2));
+        buffer.fill(buffer.area(), "界", Style::new().bg(Color::Red));
+        buffer.set_cell(Point::new(5, 1), "x", Style::new());
+        for area in [
+            Rect::new(0, 0, 6, 2),
+            Rect::new(2, 1, 3, 4),
+            Rect::new(0, 0, 1, 1),
+        ] {
+            let mut recycled = buffer.clone();
+            recycled.reset(area);
+            assert_eq!(recycled, Buffer::empty(area), "{area:?}");
+        }
+    }
+
+    #[test]
+    fn clone_from_copies_into_existing_storage() {
+        let mut source = Buffer::empty(Rect::new(0, 0, 4, 1));
+        source.write_line(source.area(), &Line::raw("a界b"));
+        let mut target = Buffer::empty(Rect::new(1, 1, 8, 3));
+        target.fill(target.area(), "z", Style::new());
+        target.clone_from(&source);
+        assert_eq!(target, source);
+    }
+
+    #[test]
+    fn repainting_in_place_matches_a_fresh_buffer() {
+        let style = Style::new().fg(Color::Blue);
+        let paint = |buffer: &mut Buffer, text: &str| {
+            buffer.fill(buffer.area(), " ", Style::new());
+            buffer.write_line(
+                buffer.area(),
+                &Line::from_spans([Span::styled(text, style)]),
+            );
+        };
+        let mut reused = Buffer::empty(Rect::new(0, 0, 8, 1));
+        for text in ["界界界界", "plain", "e\u{301}x界", "\x1b!", ""] {
+            paint(&mut reused, text);
+            let mut fresh = Buffer::empty(reused.area());
+            paint(&mut fresh, text);
+            assert_eq!(reused, fresh, "{text:?}");
+            reused.debug_assert_valid_wide_spans();
+        }
+    }
 
     #[test]
     fn cell_controls_are_replaced_before_width_accounting() {

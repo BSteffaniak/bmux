@@ -154,7 +154,7 @@ impl ComponentViewport {
                 if let Some(cell) = buffer.get(source)
                     && let Some(target) = visible.get_mut(Point::new(x, y))
                 {
-                    *target = cell.clone();
+                    target.clone_from(cell);
                 }
             }
         }

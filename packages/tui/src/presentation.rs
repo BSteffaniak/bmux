@@ -738,6 +738,34 @@ impl<E: std::fmt::Display> std::fmt::Display for PresentationError<E> {
 
 impl<E: std::error::Error + 'static> std::error::Error for PresentationError<E> {}
 
+/// A retired cell grid kept for the next preparation to repaint in place, so
+/// steady-state frames allocate no cells. Clones start empty: the spare is a
+/// cache, not state.
+#[derive(Debug, Default)]
+struct SpareBuffer(std::sync::Mutex<Option<Buffer>>);
+
+impl Clone for SpareBuffer {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl SpareBuffer {
+    fn take(&self) -> Option<Buffer> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+
+    fn put(&self, buffer: Buffer) {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(buffer);
+    }
+}
+
 /// Retained presentation authority, independent of output transport.
 ///
 /// Preparation does not mutate this state. Output failure preserves committed
@@ -747,6 +775,7 @@ pub struct PresentationState {
     grid_fragments: Vec<PreparedGridFragment>,
     area: Rect,
     previous: Option<Buffer>,
+    spare: SpareBuffer,
     hits: HitMap,
     focus: FocusTrap,
     focus_scope: Option<FocusScopeId>,
@@ -770,6 +799,7 @@ impl PresentationState {
             grid_fragments: Vec::new(),
             area,
             previous: None,
+            spare: SpareBuffer::default(),
             hits: HitMap::new(),
             focus: FocusTrap::new(),
             focus_scope: None,
@@ -883,7 +913,9 @@ impl PresentationState {
     }
     /// Invalidate cells without discarding interaction authority.
     pub fn reset(&mut self) {
-        self.previous = None;
+        if let Some(previous) = self.previous.take() {
+            self.spare.put(previous);
+        }
     }
     /// Change viewport and invalidate cells when its geometry changed.
     pub fn resize(&mut self, area: Rect) {
@@ -1040,12 +1072,18 @@ impl PresentationState {
         let mut requested_regions = damage.retained_regions().to_vec();
         let mut buffer = PresentationPhase::BufferAlloc.measure(
             || {
-                if repair {
-                    self.previous
-                        .clone()
-                        .unwrap_or_else(|| Buffer::empty(self.area))
-                } else {
-                    Buffer::empty(self.area)
+                let spare = self.spare.take();
+                match (repair.then_some(self.previous.as_ref()).flatten(), spare) {
+                    (Some(previous), Some(mut spare)) => {
+                        spare.clone_from(previous);
+                        spare
+                    }
+                    (Some(previous), None) => previous.clone(),
+                    (None, Some(mut spare)) => {
+                        spare.reset(self.area);
+                        spare
+                    }
+                    (None, None) => Buffer::empty(self.area),
                 }
             },
             |_| true,
@@ -1310,7 +1348,9 @@ impl PresentationState {
         PresentationPhase::TerminalCommit.measure(
             || {
                 self.grid_fragments = prepared.grid_fragments;
-                self.previous = Some(prepared.buffer);
+                if let Some(retired) = self.previous.replace(prepared.buffer) {
+                    self.spare.put(retired);
+                }
                 self.hits = prepared.hits;
                 self.focus = prepared.focus;
                 self.focus_scope = prepared.focus_scope;
@@ -1338,6 +1378,32 @@ mod tests {
     use crate::hit::HitRegion;
     use crate::paint::LocalRect;
     use crate::style::Style;
+
+    #[test]
+    fn recycled_frames_match_freshly_allocated_ones() {
+        let area = Rect::new(0, 0, 6, 2);
+        let mut state = PresentationState::new(area);
+        let mut present = |text: &'static str, damage: Damage| {
+            let prepared = state.prepare(damage, |cx| {
+                cx.write_line(LocalRect::new(0, 0, 6, 1), &crate::text::Line::raw(text));
+            });
+            state
+                .present_prepared(prepared, |_, _| Ok::<(), ()>(()))
+                .unwrap();
+            state.retained_buffer().cloned()
+        };
+        for (text, damage) in [
+            ("abc", Damage::Full),
+            ("界x", Damage::Full),
+            ("de", Damage::Full),
+            ("界界界", Damage::Regions(vec![Rect::new(0, 0, 6, 1)])),
+        ] {
+            let retained = present(text, damage).unwrap();
+            let mut fresh = Buffer::empty(area);
+            fresh.write_line(Rect::new(0, 0, 6, 1), &crate::text::Line::raw(text));
+            assert_eq!(retained, fresh, "{text:?}");
+        }
+    }
 
     #[test]
     fn sparse_overlays_charge_cells_bytes_and_preserve_previous_frame() {

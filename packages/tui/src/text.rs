@@ -247,7 +247,7 @@ pub fn line_viewport(line: &Line, horizontal_offset: usize, width: usize) -> Lin
     if width == 0 {
         return Line::new();
     }
-    if horizontal_offset == 0 && line.width() <= width {
+    if horizontal_offset == 0 && line_fits(line, width) {
         return line.clone();
     }
 
@@ -281,6 +281,29 @@ pub fn line_viewport(line: &Line, horizontal_offset: usize, width: usize) -> Lin
         }
     }
     Line::from_spans(spans)
+}
+
+/// Whether `line` is at most `width` cells wide, measuring graphemes only
+/// until it overflows (so long lines cost O(width)).
+pub(crate) fn line_fits(line: &Line, width: usize) -> bool {
+    let mut used = 0usize;
+    for span in &line.spans {
+        if span.content.len() <= width {
+            // Short spans are cheap to measure outright.
+            used = used.saturating_add(display_width(&span.content));
+        } else {
+            for grapheme in span.content.graphemes(true) {
+                used = used.saturating_add(display_width(grapheme));
+                if used > width {
+                    return false;
+                }
+            }
+        }
+        if used > width {
+            return false;
+        }
+    }
+    true
 }
 
 fn push_or_merge_span(spans: &mut Vec<Span>, content: String, style: Style) {

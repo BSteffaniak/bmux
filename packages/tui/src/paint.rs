@@ -315,10 +315,10 @@ impl<'frame, 'buffer> PaintCx<'frame, 'buffer> {
                 .max(0),
         )
         .unwrap_or(usize::MAX);
-        let line = line
-            .viewport(left_clip, usize::from(projected.width))
-            .with_fallback_style(self.inherited_style);
-        self.frame.buffer_mut().overlay_line(projected, &line);
+        let line = visible_line(line, left_clip, usize::from(projected.width));
+        self.frame
+            .buffer_mut()
+            .overlay_line_with_fallback(projected, &line, self.inherited_style);
     }
 
     /// Fill `area` with the supplied style (replacing what was there), then
@@ -333,7 +333,7 @@ impl<'frame, 'buffer> PaintCx<'frame, 'buffer> {
                 .max(0),
         )
         .unwrap_or(usize::MAX);
-        let line = line.viewport(left_clip, usize::from(projected.width));
+        let line = visible_line(line, left_clip, usize::from(projected.width));
         self.frame.write_line_with_fallback_style(
             projected,
             &line,
@@ -597,6 +597,16 @@ impl<'frame, 'buffer> PaintCx<'frame, 'buffer> {
         let y = u16::try_from(y).ok()?;
         let point = Point::new(x, y);
         self.clip.contains(point).then_some(point)
+    }
+}
+
+/// The part of `line` visible `left_clip` cells in and `width` cells wide,
+/// borrowed when that is the whole line (the common case: no copy).
+fn visible_line(line: &Line, left_clip: usize, width: usize) -> std::borrow::Cow<'_, Line> {
+    if left_clip == 0 && width > 0 && crate::text::line_fits(line, width) {
+        std::borrow::Cow::Borrowed(line)
+    } else {
+        std::borrow::Cow::Owned(line.viewport(left_clip, width))
     }
 }
 

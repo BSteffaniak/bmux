@@ -61,6 +61,10 @@ impl From<AnsiFrameDiffStats> for DrawStats {
 /// damage-aware flushing.
 pub struct Terminal<W> {
     writer: W,
+    /// Reused staging for encoded cells, so a frame reaches the writer in one
+    /// write however small its pieces (unbuffered or line-buffered writers
+    /// such as `Stdout` would otherwise make many system calls per frame).
+    encoded: Vec<u8>,
     state: PresentationState,
     pointer_output: PointerOutput,
     pointer_capability: PointerShapeCapability,
@@ -74,6 +78,7 @@ impl<W: Write> Terminal<W> {
     pub fn new(writer: W, area: Rect) -> Self {
         Self {
             writer,
+            encoded: Vec::new(),
             state: PresentationState::new(area),
             pointer_output: PointerOutput::new(
                 bmux_terminal_protocol::pointer_output::tmux_passthrough_enabled(),
@@ -90,6 +95,7 @@ impl<W: Write> Terminal<W> {
     pub fn fork<V: Write>(&self, writer: V) -> Terminal<V> {
         Terminal {
             writer,
+            encoded: Vec::new(),
             state: self.state.clone(),
             pointer_output: self.pointer_output.clone(),
             pointer_capability: self.pointer_capability,
@@ -395,6 +401,7 @@ impl<W: Write> Terminal<W> {
             });
         }
         let writer = &mut self.writer;
+        let encoded = &mut self.encoded;
         self.state
             .present_prepared(prepared, |prepared, previous| {
                 prepared.require_uniform_grid().map_err(io::Error::other)?;
@@ -416,23 +423,29 @@ impl<W: Write> Terminal<W> {
                     writer.write_all(b"\x1b[?2026h")?;
                     let output: io::Result<DrawStats> = (|| {
                         let repaint = before(writer)?;
+                        encoded.clear();
                         let stats = PresentationPhase::AnsiEncode.measure(
                             || -> io::Result<DrawStats> {
                                 Ok(if let Some(previous) = previous.filter(|_| !repaint) {
                                     write_ansi_frame_diff(
-                                        writer,
+                                        encoded,
                                         previous,
                                         prepared.buffer(),
                                         prepared.cursor(),
                                     )?
                                     .into()
                                 } else {
-                                    write_ansi_frame(writer, prepared.buffer(), prepared.cursor())?;
+                                    write_ansi_frame(
+                                        encoded,
+                                        prepared.buffer(),
+                                        prepared.cursor(),
+                                    )?;
                                     DrawStats::full(prepared.buffer().cells().len())
                                 })
                             },
                             Result::is_ok,
                         )?;
+                        writer.write_all(encoded)?;
                         overlay(writer, prepared.image_scene(), prepared.image_delta())?;
                         if let Some(transaction) = &transaction {
                             writer.write_all(transaction.bytes())?;
