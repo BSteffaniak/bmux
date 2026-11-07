@@ -120,5 +120,7 @@ pub mod theme;
 pub mod toast_stack;
 #[cfg(feature = "tree-view")]
 pub mod tree_view;
+#[cfg(feature = "uniform-list")]
+pub mod uniform_list;
 #[cfg(feature = "virtual-list")]
 pub mod virtual_list;

@@ -267,6 +267,12 @@ component event pass. For large variable-height collections,
 use `virtual-list`: item keys and revisions retain exact current-width layouts,
 only viewport-intersecting items paint/register metadata, and keyed top or
 bottom anchors survive insertion, removal, reorder, append, and reflow.
+For long lists of one-row items, use `uniform-list`: rows are painted on
+demand by index, so nothing is built or measured for rows outside the viewport.
+Callers own `UniformListState` (selection plus a `ScrollViewState`) and may
+drive it with their own key bindings or route events through
+`UniformList::handle_event` for arrows, paging, wheel, click-to-select, and
+scrollbar dragging.
 
 ## Logical content selection
 

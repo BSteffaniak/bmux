@@ -93,6 +93,7 @@ text-input-box = ["text-input", "form-field"]
 text-view = ["scroll-view"]
 toast-stack = ["keyboard-input"]
 tree-view = ["keyboard-input"]
+uniform-list = ["keyboard-input", "scroll-view"]
 virtual-list = ["scroll-view"]
 
 # Private dependency capability shared by keyboard-interactive controls.
@@ -145,6 +146,7 @@ all = [
     "text-view",
     "toast-stack",
     "tree-view",
+    "uniform-list",
     "virtual-list",
 ]
 data-display = [
@@ -174,6 +176,13 @@ forms = [
     "select-dropdown",
     "text-input-box",
 ]
-navigation = ["breadcrumbs", "menu", "selectable-list", "tab-bar", "tree-view"]
+navigation = [
+    "breadcrumbs",
+    "menu",
+    "selectable-list",
+    "tab-bar",
+    "tree-view",
+    "uniform-list",
+]
 overlays = ["dialog", "modal-frame", "picker-frame", "toast-stack"]
 text-editing = ["text-input", "text-input-box", "text-view"]
