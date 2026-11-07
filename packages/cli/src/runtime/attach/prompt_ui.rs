@@ -1256,7 +1256,7 @@ impl AttachPromptState {
             let modal_component =
                 ModalFrameComponent::new("prompt.overlay", modal.clone(), TextBlock::new(""))
                     .chrome(!extension_chrome);
-            paint_component(&modal_component, area, &mut cx);
+            cx.paint_component(&modal_component, area);
             let mut content = modal.content_area(area);
             if extension_chrome && content.height > 0 {
                 // Extensions paint border cells after prompt content. Keep the
@@ -1405,16 +1405,6 @@ fn paint_retained_scroll(
     );
 }
 
-fn paint_component(component: &impl Component, area: Rect, cx: &mut PaintCx<'_, '_>) {
-    let layout = component.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
-    cx.with_child(
-        i32::from(area.x),
-        i64::from(area.y),
-        LocalRect::new(0, 0, area.width, area.height),
-        |cx| component.paint(&layout, cx),
-    );
-}
-
 fn paint_checkbox(
     id: impl Into<bmux_tui::component::LayoutId>,
     label: &str,
@@ -1428,7 +1418,7 @@ fn paint_checkbox(
     let component = CheckboxComponent::new(id, label, &state)
         .styles(styles)
         .fallback_style(fallback);
-    paint_component(&component, area, cx);
+    cx.paint_component(&component, area);
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)] // Rendering one field keeps all concrete control projections together over canonical form state.
@@ -1499,7 +1489,7 @@ fn render_form_control(
             if let Some(error) = errors.get(&field.id) {
                 component = component.error(error);
             }
-            paint_component(&component, area, cx);
+            cx.paint_component(&component, area);
             true
         }
         (
@@ -1523,7 +1513,7 @@ fn render_form_control(
             ])]))
             .id(format!("prompt.form.{}.select", field.id))
             .style(theme.background);
-            paint_component(&component, area, cx);
+            cx.paint_component(&component, area);
             true
         }
         (PromptFormFieldKind::Integer { .. }, Some(PromptFormValue::Integer(value))) => {
@@ -1550,7 +1540,7 @@ fn render_form_control(
             if let Some(error) = errors.get(&field.id) {
                 component = component.error(error);
             }
-            paint_component(&component, area, cx);
+            cx.paint_component(&component, area);
             true
         }
         (
@@ -1774,13 +1764,7 @@ fn render_form(
                 pressed: theme.background,
                 disabled: theme.background,
             });
-        let layout = component.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
-        cx.with_child(
-            i32::from(area.x),
-            i64::from(area.y),
-            LocalRect::new(0, 0, area.width, area.height),
-            |cx| component.paint(&layout, cx),
-        );
+        cx.paint_component(&component, area);
     }
     true
 }
@@ -1891,13 +1875,7 @@ fn render_confirm(
         ))
         .padding(Insets::new(0, 1, 0, 1));
     let component = DialogComponent::new("prompt.confirm", dialog, &actions_state);
-    let layout = component.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
-    cx.with_child(
-        i32::from(area.x),
-        i64::from(area.y),
-        LocalRect::new(0, 0, area.width, area.height),
-        |cx| component.paint(&layout, cx),
-    );
+    cx.paint_component(&component, area);
     true
 }
 
@@ -1944,7 +1922,7 @@ fn render_text_input(
     if let Some(error) = error {
         component = component.error(error);
     }
-    paint_component(&component, content, cx);
+    cx.paint_component(&component, content);
     true
 }
 
@@ -2222,7 +2200,7 @@ fn render_command_palette(
     let input = TextInputComponent::new("command-palette.query", &input_state, &input_policy)
         .placeholder(&placeholder, theme.muted)
         .focused(true);
-    paint_component(&input, input_area, cx);
+    cx.paint_component(&input, input_area);
 
     let list_area = Rect::new(
         component_area.x,
@@ -2273,7 +2251,7 @@ fn render_command_palette(
                 thumb: theme.focused,
                 end: theme.muted,
             });
-        paint_component(&scrollbar, scrollbar_area, cx);
+        cx.paint_component(&scrollbar, scrollbar_area);
     }
     if footer_rows > 0 {
         let selected = if filtered.is_empty() {

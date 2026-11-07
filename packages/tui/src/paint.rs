@@ -12,6 +12,7 @@
 //! * [`PaintCx::write_line_with_fallback_style`] fills its area first, then
 //!   writes; [`PaintCx::replace_cell`] replaces one cell's whole style.
 
+use crate::component::{Component, Constraints, LayoutCx};
 use crate::focus::FocusScopeId;
 use crate::frame::{Cursor, Frame};
 use crate::geometry::{Point, Rect};
@@ -226,6 +227,26 @@ impl<'frame, 'buffer> PaintCx<'frame, 'buffer> {
             offset_y,
             LocalRect::new(left, top, width, height),
             paint,
+        );
+    }
+
+    /// Lay out `component` to exactly fill `area` and paint it there.
+    ///
+    /// `area` is in this context's local coordinates; the component paints in
+    /// its own local coordinates and is clipped to `area`. The layout is
+    /// computed fresh on every call, so components that need retained layout
+    /// caching should go through a [`crate::component::LayoutCache`] and
+    /// [`Self::with_child`] instead.
+    pub fn paint_component(&mut self, component: &(impl Component + ?Sized), area: Rect) {
+        if area.is_empty() {
+            return;
+        }
+        let layout = component.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
+        self.with_child(
+            i32::from(area.x),
+            i64::from(area.y),
+            LocalRect::new(0, 0, area.width, area.height),
+            |cx| component.paint(&layout, cx),
         );
     }
 
@@ -642,6 +663,7 @@ fn translate_and_clip(origin_x: i32, origin_y: i64, area: LocalRect, clip: Rect)
 mod tests {
     use super::{LocalRect, PaintCx};
     use crate::buffer::Buffer;
+    use crate::component::{Component, Constraints, LayoutCx, LayoutId, LayoutNode, LogicalSize};
     use crate::frame::Frame;
     use crate::geometry::{Point, Rect};
     use crate::hit::HitRegion;
@@ -1198,5 +1220,49 @@ mod tests {
         assert_eq!(frame.hits().regions()[0].area, Rect::new(0, 1, 3, 1));
         assert!(frame.hits().regions()[0].contains(Point::new(2, 1)));
         assert!(!frame.hits().regions()[0].contains(Point::new(3, 1)));
+    }
+
+    /// Fills its whole layout with `#` and records the size it was given.
+    struct Fill;
+
+    impl Component for Fill {
+        fn layout(&self, constraints: Constraints, _cx: &mut LayoutCx) -> LayoutNode {
+            LayoutNode::leaf(
+                LayoutId::new("fill"),
+                constraints.constrain(LogicalSize::new(u64::MAX, u64::MAX)),
+            )
+        }
+
+        fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
+            let width = u16::try_from(layout.size.width).unwrap_or(u16::MAX);
+            for row in 0..i64::try_from(layout.size.height).unwrap_or(0) {
+                cx.write_line(
+                    LocalRect::new(0, row, width, 1),
+                    &Line::from("#".repeat(usize::from(width))),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn paint_component_fills_exactly_the_requested_local_area() {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 6, 4));
+        let mut frame = Frame::new(&mut buffer);
+        let mut cx = PaintCx::new(&mut frame);
+        cx.with_child(1, 1, LocalRect::new(0, 0, 5, 3), |cx| {
+            cx.paint_component(&Fill, Rect::new(1, 0, 2, 2));
+        });
+        let rows: Vec<_> = (0..4)
+            .map(|y| frame.buffer().row_symbols(y).unwrap_or_default())
+            .collect();
+        assert_eq!(rows, ["      ", "  ##  ", "  ##  ", "      "]);
+    }
+
+    #[test]
+    fn paint_component_skips_empty_areas() {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 3, 1));
+        let mut frame = Frame::new(&mut buffer);
+        PaintCx::new(&mut frame).paint_component(&Fill, Rect::new(0, 0, 0, 1));
+        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("   "));
     }
 }

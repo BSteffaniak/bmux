@@ -9851,14 +9851,7 @@ fn paint_help_overlay(
 ) {
     let modal_component =
         ModalFrameComponent::new("attach.help", modal.clone(), TextBlock::new(""));
-    let modal_layout =
-        modal_component.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
-    cx.with_child(
-        i32::from(area.x),
-        i64::from(area.y),
-        LocalRect::new(0, 0, area.width, area.height),
-        |cx| modal_component.paint(&modal_layout, cx),
-    );
+    cx.paint_component(&modal_component, area);
     let content = modal.content_area(area);
     let hints_height = u16::from(content.height > 2);
     let body_area = TuiRect::new(
