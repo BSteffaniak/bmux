@@ -49,6 +49,55 @@ pub enum Color {
     Rgb(u8, u8, u8),
 }
 
+/// Timing curve for animations: maps linear progress to eased progress.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum Easing {
+    /// Constant speed.
+    #[default]
+    Linear,
+    /// Starts slow, ends fast (quadratic).
+    EaseIn,
+    /// Starts fast, ends slow (cubic).
+    EaseOut,
+    /// Slow at both ends (cubic).
+    EaseInOut,
+}
+
+impl Easing {
+    /// Eased value of `progress`, clamped to 0..=1 first; 0 maps to 0 and 1 to 1.
+    #[must_use]
+    pub fn apply(self, progress: f64) -> f64 {
+        let t = if progress.is_nan() {
+            0.0
+        } else {
+            progress.clamp(0.0, 1.0)
+        };
+        match self {
+            Self::Linear => t,
+            Self::EaseIn => t * t,
+            Self::EaseOut => 1.0 - (1.0 - t).powi(3),
+            Self::EaseInOut => {
+                if t < 0.5 {
+                    4.0 * t * t * t
+                } else {
+                    1.0 - (-2.0f64).mul_add(t, 2.0).powi(3) / 2.0
+                }
+            }
+        }
+    }
+
+    /// Eased progress after `elapsed` of an animation lasting `duration`: 0 at the start,
+    /// 1 once `duration` has passed. A zero `duration` is already complete.
+    #[must_use]
+    pub fn progress(self, elapsed: std::time::Duration, duration: std::time::Duration) -> f64 {
+        if duration.is_zero() {
+            return 1.0;
+        }
+        self.apply(elapsed.as_secs_f64() / duration.as_secs_f64())
+    }
+}
+
 /// Text style modifiers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -227,6 +276,36 @@ impl Color {
         }
     }
 
+    /// Approximate RGB value of this color: [`Color::Rgb`] as is, and ANSI and 256-color
+    /// palette entries by their xterm defaults (terminals may be configured differently).
+    /// [`Color::Default`] has no known value and returns `None`.
+    #[must_use]
+    pub fn approximate_rgb(self) -> Option<Rgb> {
+        match self {
+            Self::Default => None,
+            Self::Rgb(r, g, b) => Some(Rgb::new(r, g, b)),
+            Self::Indexed(index) => Some(bmux_color::ansi::xterm_256(index)),
+            named => Self::ANSI_16
+                .iter()
+                .position(|ansi| *ansi == named)
+                .and_then(|index| u8::try_from(index).ok())
+                .map(bmux_color::ansi::xterm_256),
+        }
+    }
+
+    /// Blend from this color toward `target` (in OKLab, see [`bmux_color::mix`]): `amount`
+    /// 0 is this color, 1 is `target`, and values outside that range are clamped.
+    ///
+    /// The result is [`Color::Rgb`], computed from [`Color::approximate_rgb`] of both
+    /// colors. Returns `None` when either has no known value ([`Color::Default`]), so
+    /// callers can choose their own fallback, such as switching colors without a blend.
+    #[must_use]
+    pub fn mix(self, target: Self, amount: f64) -> Option<Self> {
+        let (from, to) = (self.approximate_rgb()?, target.approximate_rgb()?);
+        let amount = if amount.is_nan() { 0.0 } else { amount };
+        Some(bmux_color::mix(to, from, amount).into())
+    }
+
     /// Reduce this color to what a terminal of `depth` can display.
     ///
     /// * `TrueColor` leaves every color unchanged.
@@ -272,8 +351,78 @@ impl From<Rgb> for Color {
 
 #[cfg(test)]
 mod tests {
-    use super::{Color, Modifier, Style};
+    use super::{Color, Easing, Modifier, Style};
     use crate::capabilities::TerminalColorDepth;
+    use std::time::Duration;
+
+    #[test]
+    fn colors_blend_between_endpoints_and_clamp_the_amount() {
+        let from = Color::Rgb(0, 100, 255);
+        let to = Color::Rgb(200, 0, 55);
+        assert_eq!(from.mix(to, 0.0), Some(from));
+        assert_eq!(from.mix(to, 1.0), Some(to));
+        assert_eq!(from.mix(to, -3.0), Some(from));
+        assert_eq!(from.mix(to, 7.0), Some(to));
+        assert_eq!(from.mix(to, f64::NAN), Some(from));
+        // Halfway lies strictly between the endpoints.
+        let Some(Color::Rgb(r, g, b)) = from.mix(to, 0.5) else {
+            panic!("blends are RGB");
+        };
+        assert!(
+            r > 0 && r < 200 && g < 100 && b > 55 && b < 255,
+            "{r} {g} {b}"
+        );
+        // Palette colors blend through their xterm defaults.
+        assert_eq!(
+            Color::Black.mix(Color::BrightWhite, 1.0),
+            Some(Color::Rgb(255, 255, 255))
+        );
+        assert_eq!(
+            Color::Indexed(196).mix(Color::Black, 0.0),
+            Some(Color::Rgb(255, 0, 0))
+        );
+        assert_eq!(
+            Color::Indexed(9).approximate_rgb(),
+            Color::BrightRed.approximate_rgb()
+        );
+        assert_eq!(
+            Color::Indexed(232).approximate_rgb(),
+            Some(bmux_color::Rgb::new(8, 8, 8))
+        );
+        // The terminal's default color has no known value.
+        assert_eq!(Color::Default.mix(to, 0.5), None);
+        assert_eq!(from.mix(Color::Default, 0.5), None);
+    }
+
+    #[test]
+    fn easing_curves_keep_their_endpoints_and_shapes() {
+        for easing in [
+            Easing::Linear,
+            Easing::EaseIn,
+            Easing::EaseOut,
+            Easing::EaseInOut,
+        ] {
+            assert!(easing.apply(0.0).abs() < f64::EPSILON, "{easing:?}");
+            assert!((easing.apply(1.0) - 1.0).abs() < f64::EPSILON, "{easing:?}");
+            assert!(easing.apply(-1.0).abs() < f64::EPSILON, "{easing:?}");
+            assert!((easing.apply(2.0) - 1.0).abs() < f64::EPSILON, "{easing:?}");
+        }
+        assert!(Easing::EaseIn.apply(0.5) < 0.5);
+        assert!(Easing::EaseOut.apply(0.5) > 0.5);
+        assert!((Easing::EaseInOut.apply(0.5) - 0.5).abs() < 1e-6);
+        assert!((Easing::Linear.apply(0.25) - 0.25).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn easing_progress_follows_elapsed_time() {
+        let second = Duration::from_secs(1);
+        assert!(Easing::Linear.progress(Duration::ZERO, second).abs() < f64::EPSILON);
+        assert!((Easing::Linear.progress(second / 4, second) - 0.25).abs() < 1e-6);
+        assert!((Easing::Linear.progress(second * 3, second) - 1.0).abs() < f64::EPSILON);
+        assert!(
+            (Easing::EaseOut.progress(Duration::ZERO, Duration::ZERO) - 1.0).abs() < f64::EPSILON
+        );
+    }
 
     #[test]
     fn modifier_sets_support_union_and_difference() {

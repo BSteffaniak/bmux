@@ -374,6 +374,11 @@ let item = SelectableListItem::rich("app", "src/app.rs").trailing(
 );
 ```
 
+`SelectableListItem::background` paints one row on a color across its whole
+width, in place of the background its state style would give it (span
+backgrounds still apply), for row-level highlights such as a flash that fades
+out by blending with `Color::mix` each frame.
+
 ## Component conventions
 
 Interactive components should follow the same shape as the existing text input

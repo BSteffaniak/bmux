@@ -102,7 +102,7 @@ pub mod prelude {
         SelectionScrollDirection, SelectionSlice, SelectionSnapshot, paint_selection_highlights,
         plain_text_fragments, plain_text_fragments_with_tabs,
     };
-    pub use crate::style::{Color, Modifier, Style};
+    pub use crate::style::{Color, Easing, Modifier, Style};
     pub use crate::terminal::{DrawStats, Terminal};
     pub use crate::text::{
         Line, Span, Text, TextWrap, TextWrapGeometry, TrailingAlign, TrailingPlacement, wrap_text,

@@ -53,6 +53,23 @@ controls or render callbacks. The runtime's
 that path for buttons, editable text, disabled controls, a modal, capture, and
 explicit shape overrides; see its [run instructions](../tui-runtime/README.md#interactive-pointer-controls).
 
+## Color blending and easing
+
+`Color::mix` blends one color toward another in OKLab (via `bmux_color::mix`)
+and returns `Color::Rgb`, using the xterm default palette for ANSI and 256-color
+entries (`Color::approximate_rgb`); it returns `None`
+for `Color::Default`, whose value is unknown, so callers pick their own
+fallback. `Easing` maps linear progress (or elapsed time over a duration with
+`Easing::progress`) to eased progress for fades and other transitions.
+
+```rust
+use std::time::Duration;
+use bmux_tui::style::{Color, Easing};
+
+let amount = Easing::EaseInOut.progress(Duration::from_millis(150), Duration::from_millis(600));
+let faded = Color::Rgb(30, 100, 58).mix(Color::Rgb(20, 20, 20), amount);
+```
+
 ## Clickable regions
 
 `composition::HitArea` makes any child clickable without changing its layout:

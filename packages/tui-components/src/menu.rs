@@ -439,6 +439,7 @@ impl<'a> Menu<'a> {
                     lines,
                     disabled: item.disabled || item.section,
                     trailing: None,
+                    background: None,
                 }
             })
             .collect()

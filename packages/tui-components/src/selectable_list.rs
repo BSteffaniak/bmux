@@ -19,7 +19,7 @@ use bmux_tui::hit::{HitRegion as SceneRegion, HitRole};
 use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::prelude::{Line, Span, Style, TrailingPlacement};
 use bmux_tui::semantic::SemanticRegion;
-use bmux_tui::style::Modifier;
+use bmux_tui::style::{Color, Modifier};
 use bmux_tui::text_width::display_width;
 
 use crate::common::{ComponentMousePolicy, InteractionState, local_area_of, u16_saturating};
@@ -41,6 +41,8 @@ pub struct SelectableListItem {
     pub disabled: bool,
     /// Segment placed after the first line at the painted width, such as a count.
     pub trailing: Option<(Line, TrailingPlacement)>,
+    /// Background for the whole row, replacing the background of its state style.
+    pub background: Option<Color>,
 }
 
 impl SelectableListItem {
@@ -53,6 +55,7 @@ impl SelectableListItem {
             lines: vec![Line::from(label)],
             disabled: false,
             trailing: None,
+            background: None,
         }
     }
 
@@ -64,6 +67,7 @@ impl SelectableListItem {
             lines: vec![line.into()],
             disabled: false,
             trailing: None,
+            background: None,
         }
     }
 
@@ -75,6 +79,7 @@ impl SelectableListItem {
             lines: lines.into(),
             disabled: false,
             trailing: None,
+            background: None,
         }
     }
 
@@ -92,6 +97,15 @@ impl SelectableListItem {
     #[must_use]
     pub fn trailing(mut self, trailing: impl Into<Line>, placement: TrailingPlacement) -> Self {
         self.trailing = Some((trailing.into(), placement));
+        self
+    }
+
+    /// Return this item painted on `background` across its whole row width, in place of the
+    /// background its state style (normal, selected, hovered, ...) would give it. Span
+    /// backgrounds still apply as they do over state styles, and foregrounds are unchanged.
+    #[must_use]
+    pub const fn background(mut self, background: Color) -> Self {
+        self.background = Some(background);
         self
     }
 
@@ -759,7 +773,10 @@ impl<'a> SelectableList<'a> {
         state: SelectableListState,
         width: usize,
     ) -> Line {
-        let style = self.style_for(index, item, state);
+        let mut style = self.style_for(index, item, state);
+        if let Some(background) = item.background {
+            style = style.bg(background);
+        }
         let interaction_styled = state.interaction.disabled
             || item.disabled
             || state.pressed == Some(index)
@@ -1297,7 +1314,8 @@ impl Component for ItemRows<'_, '_> {
                         self.state,
                         usize::try_from(width).unwrap_or(usize::MAX),
                     ),
-                    self.fallback,
+                    item.background
+                        .map_or(self.fallback, |background| self.fallback.bg(background)),
                 );
             }
         }
@@ -1444,6 +1462,7 @@ impl Component for SelectableListComponent<'_, '_> {
         format!("{:?}", self.list.policy.mouse).hash(&mut paint);
         for item in self.list.items {
             item.disabled.hash(&mut paint);
+            item.background.hash(&mut paint);
         }
         format!("{:?}", self.list.styles).hash(&mut paint);
         format!("{:?}", self.fallback).hash(&mut paint);
@@ -1673,17 +1692,46 @@ mod tests {
 
     trait SelectableListTestRender {
         fn render(&self, area: Rect, state: &SelectableListState, frame: &mut Frame<'_>);
+        fn render_with_fallback(
+            &self,
+            area: Rect,
+            state: &SelectableListState,
+            fallback: Style,
+            frame: &mut Frame<'_>,
+        );
     }
 
     impl SelectableListTestRender for SelectableList<'_> {
         fn render(&self, area: Rect, state: &SelectableListState, frame: &mut Frame<'_>) {
+            render_list(self, area, state, None, frame);
+        }
+
+        fn render_with_fallback(
+            &self,
+            area: Rect,
+            state: &SelectableListState,
+            fallback: Style,
+            frame: &mut Frame<'_>,
+        ) {
+            render_list(self, area, state, Some(fallback), frame);
+        }
+    }
+
+    fn render_list(
+        list: &SelectableList<'_>,
+        area: Rect,
+        state: &SelectableListState,
+        fallback: Option<Style>,
+        frame: &mut Frame<'_>,
+    ) {
+        {
             let state = Cell::new(*state);
             let component = SelectableListComponent {
                 pointer_intent: bmux_tui::pointer::PointerIntent::Auto,
                 id: "test.list".into(),
-                list: *self,
+                list: *list,
                 state: &state,
-                fallback: None,
+                fallback,
             };
             let layout = component.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
             PaintCx::new(frame).with_child(
@@ -2197,6 +2245,66 @@ mod tests {
                 .iter()
                 .all(|span| span.style.bg == Some(bmux_tui::style::Color::Blue))
         );
+    }
+
+    #[test]
+    fn row_backgrounds_fill_the_whole_row_over_state_styles() {
+        use bmux_tui::style::Color;
+
+        let flash = Color::Rgb(30, 100, 58);
+        let items = (0..4)
+            .map(|index| {
+                let item = SelectableListItem::rich(
+                    format!("item-{index}"),
+                    Line::from_spans(vec![
+                        Span::raw("a"),
+                        Span::styled("b", Style::new().bg(Color::Red)),
+                    ]),
+                );
+                if index < 2 {
+                    item.background(flash)
+                } else {
+                    item
+                }
+            })
+            .collect::<Vec<_>>();
+        let list = SelectableList::new(&items)
+            .policy(SelectableListPolicy::interactive().scrollbar(ScrollbarAxisLayoutMode::Gutter))
+            .styles(SelectableListStyles {
+                selected: Style::new().fg(Color::White).bg(Color::Blue),
+                ..SelectableListStyles::default()
+            });
+        let fallback = Style::new().bg(Color::Black);
+        let state = SelectableListState::new(Some(0));
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 6, 3));
+        let mut frame = Frame::new(&mut buffer);
+        list.render_with_fallback(Rect::new(0, 0, 6, 3), &state, fallback, &mut frame);
+        let buffer = frame.buffer();
+        let row = |y: u16| {
+            (0..6)
+                .map(|x| buffer.get(bmux_tui::geometry::Point::new(x, y)).unwrap())
+                .map(|cell| (cell.symbol.clone(), cell.style.bg, cell.style.fg))
+                .collect::<Vec<_>>()
+        };
+        // The selected row keeps its foreground on its text but takes the row background everywhere
+        // except the scrollbar column, including over its highlighted span.
+        let selected = row(0);
+        assert_eq!(selected[0].0, ">");
+        for cell in &selected[..5] {
+            assert_eq!(cell.1, Some(flash), "{selected:?}");
+        }
+        for cell in &selected[..4] {
+            assert_eq!(cell.2, Some(Color::White), "{selected:?}");
+        }
+        assert_ne!(selected[5].1, Some(flash), "{selected:?}");
+        // An unselected row keeps its span background and fills the rest, padding included.
+        let plain = row(1);
+        assert_eq!(plain[3].1, Some(Color::Red), "{plain:?}");
+        for x in [0, 1, 2, 4] {
+            assert_eq!(plain[x].1, Some(flash), "{plain:?}");
+        }
+        // Rows without one keep the list's own background.
+        assert_eq!(row(2)[4].1, Some(Color::Black));
     }
 
     #[test]
