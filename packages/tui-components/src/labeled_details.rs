@@ -1,4 +1,8 @@
 //! Reusable labeled detail list component.
+//!
+//! Labels sit on their own row above each value by default. With
+//! [`LabelPlacement::Beside`] they form a left column with values beside them,
+//! which fits roughly twice as many fields into a narrow side pane.
 
 use std::hash::{Hash, Hasher};
 
@@ -56,12 +60,32 @@ impl Default for LabeledDetailsStyles {
     }
 }
 
+/// Where each label is placed relative to its value.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum LabelPlacement {
+    /// The label on its own row, with the value indented on the rows below.
+    #[default]
+    Above,
+    /// Labels in a left column padded to the widest label, values beside
+    /// them, and wrapped value rows aligned under the value column.
+    ///
+    /// Falls back to [`Self::Above`] when the width cannot fit the label
+    /// column plus [`MIN_BESIDE_VALUE_WIDTH`] value columns.
+    Beside,
+}
+
+/// Narrowest value column [`LabelPlacement::Beside`] uses before falling back
+/// to [`LabelPlacement::Above`].
+pub const MIN_BESIDE_VALUE_WIDTH: usize = 8;
+
 /// Canonical component-lifecycle labeled detail list.
 pub struct LabeledDetailsComponent<'a> {
     id: LayoutId,
     items: &'a [DetailItem],
     styles: LabeledDetailsStyles,
     item_spacing: bool,
+    label_placement: LabelPlacement,
+    label_gap: u16,
 }
 
 impl<'a> LabeledDetailsComponent<'a> {
@@ -73,6 +97,8 @@ impl<'a> LabeledDetailsComponent<'a> {
             items,
             styles: LabeledDetailsStyles::default(),
             item_spacing: true,
+            label_placement: LabelPlacement::Above,
+            label_gap: 2,
         }
     }
 
@@ -89,6 +115,21 @@ impl<'a> LabeledDetailsComponent<'a> {
         self.item_spacing = item_spacing;
         self
     }
+
+    /// Set where labels are placed relative to their values.
+    #[must_use]
+    pub const fn label_placement(mut self, label_placement: LabelPlacement) -> Self {
+        self.label_placement = label_placement;
+        self
+    }
+
+    /// Set the columns between the label column and values in
+    /// [`LabelPlacement::Beside`] (default 2).
+    #[must_use]
+    pub const fn label_gap(mut self, label_gap: u16) -> Self {
+        self.label_gap = label_gap;
+        self
+    }
 }
 
 impl Component for LabeledDetailsComponent<'_> {
@@ -100,6 +141,8 @@ impl Component for LabeledDetailsComponent<'_> {
             item.value.hash(&mut layout);
         }
         self.item_spacing.hash(&mut layout);
+        self.label_placement.hash(&mut layout);
+        self.label_gap.hash(&mut layout);
 
         let mut paint = std::collections::hash_map::DefaultHasher::new();
         self.styles.label.hash(&mut paint);
@@ -113,18 +156,28 @@ impl Component for LabeledDetailsComponent<'_> {
         let width = if constraints.min_width() == constraints.max_width() {
             constraints.max_width()
         } else {
-            let intrinsic = self
-                .items
-                .iter()
-                .flat_map(|item| {
-                    std::iter::once(display_width(&item.label)).chain(
-                        item.value
-                            .lines()
-                            .map(|line| display_width(line).saturating_add(2)),
-                    )
-                })
-                .max()
-                .unwrap_or_default();
+            let intrinsic = match self.label_placement {
+                LabelPlacement::Above => self
+                    .items
+                    .iter()
+                    .flat_map(|item| {
+                        std::iter::once(display_width(&item.label)).chain(
+                            item.value
+                                .lines()
+                                .map(|line| display_width(line).saturating_add(2)),
+                        )
+                    })
+                    .max()
+                    .unwrap_or_default(),
+                LabelPlacement::Beside => self.label_column_width().saturating_add(
+                    self.items
+                        .iter()
+                        .flat_map(|item| item.value.lines().map(display_width))
+                        .max()
+                        .unwrap_or_default()
+                        .max(MIN_BESIDE_VALUE_WIDTH),
+                ),
+            };
             u16::try_from(intrinsic)
                 .unwrap_or(u16::MAX)
                 .clamp(
@@ -189,6 +242,12 @@ impl LabeledDetailsComponent<'_> {
     /// Build this detail list's rows for a given width.
     #[must_use]
     pub fn lines(&self, width: u16) -> Vec<Line> {
+        let label_width = self.label_column_width();
+        if self.label_placement == LabelPlacement::Beside
+            && usize::from(width) >= label_width.saturating_add(MIN_BESIDE_VALUE_WIDTH)
+        {
+            return self.beside_lines(width, label_width);
+        }
         let mut rows = Vec::new();
         for (index, item) in self.items.iter().enumerate() {
             rows.push(Line::from_spans(vec![Span::styled(
@@ -197,6 +256,51 @@ impl LabeledDetailsComponent<'_> {
             )]));
             for line in item.value.lines() {
                 push_wrapped_value(&mut rows, line, width, self.styles);
+            }
+            if self.item_spacing && index + 1 < self.items.len() {
+                rows.push(Line::default());
+            }
+        }
+        rows
+    }
+}
+
+impl LabeledDetailsComponent<'_> {
+    /// Widest label plus the gap.
+    fn label_column_width(&self) -> usize {
+        self.items
+            .iter()
+            .map(|item| display_width(&item.label))
+            .max()
+            .unwrap_or_default()
+            .saturating_add(usize::from(self.label_gap))
+    }
+
+    fn beside_lines(&self, width: u16, label_width: usize) -> Vec<Line> {
+        let value_width = usize::from(width).saturating_sub(label_width);
+        let indent = " ".repeat(label_width);
+        let mut rows = Vec::new();
+        for (index, item) in self.items.iter().enumerate() {
+            let padding = " ".repeat(label_width.saturating_sub(display_width(&item.label)));
+            let mut first = true;
+            let value_lines = item
+                .value
+                .lines()
+                .chain(item.value.is_empty().then_some(""));
+            for line in value_lines {
+                for chunk in wrap_text_with_continuation(line, value_width, value_width) {
+                    let mut spans = if first {
+                        vec![
+                            Span::styled(item.label.clone(), self.styles.label),
+                            Span::styled(padding.clone(), self.styles.continuation),
+                        ]
+                    } else {
+                        vec![Span::styled(indent.clone(), self.styles.continuation)]
+                    };
+                    first = false;
+                    spans.push(Span::styled(chunk, self.styles.value));
+                    rows.push(Line::from_spans(spans));
+                }
             }
             if self.item_spacing && index + 1 < self.items.len() {
                 rows.push(Line::default());
@@ -247,7 +351,73 @@ mod tests {
     use bmux_tui::paint::PaintCx;
     use bmux_tui::style::{Color, Style};
 
-    use super::{DetailItem, LabeledDetailsComponent, LabeledDetailsStyles};
+    use super::{DetailItem, LabelPlacement, LabeledDetailsComponent, LabeledDetailsStyles};
+
+    fn plain(lines: &[bmux_tui::prelude::Line]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|line| line.plain_text().trim_end().to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn beside_aligns_labels_and_wraps_under_the_value_column() {
+        let items = [
+            DetailItem::new("Key", "openai/gpt-6"),
+            DetailItem::new("Capabilities", "tools reasoning vision"),
+            DetailItem::new("Notes", "line one\nline two"),
+        ];
+        let lines = LabeledDetailsComponent::new("details", &items)
+            .item_spacing(false)
+            .label_placement(LabelPlacement::Beside)
+            .lines(26);
+        assert_eq!(
+            plain(&lines),
+            [
+                "Key           openai/gpt-6",
+                "Capabilities  tools",
+                "              reasoning",
+                "              vision",
+                "Notes         line one",
+                "              line two",
+            ]
+        );
+    }
+
+    #[test]
+    fn beside_keeps_rows_for_empty_values_and_honors_gap_and_spacing() {
+        let items = [DetailItem::new("a", ""), DetailItem::new("bb", "x")];
+        let lines = LabeledDetailsComponent::new("details", &items)
+            .label_placement(LabelPlacement::Beside)
+            .label_gap(1)
+            .lines(20);
+        assert_eq!(plain(&lines), ["a", "", "bb x"]);
+    }
+
+    #[test]
+    fn beside_falls_back_to_above_when_too_narrow() {
+        let items = [DetailItem::new("command", "abcdef")];
+        let beside = LabeledDetailsComponent::new("details", &items)
+            .label_placement(LabelPlacement::Beside)
+            .lines(12);
+        let above = LabeledDetailsComponent::new("details", &items).lines(12);
+        assert_eq!(beside, above);
+    }
+
+    #[test]
+    fn beside_measures_intrinsic_width_and_changes_layout_revision() {
+        use bmux_tui::component::{Component, Constraints, LayoutCx, LogicalSize};
+
+        let items = [DetailItem::new("id", "abc"), DetailItem::new("name", "x")];
+        let component = LabeledDetailsComponent::new("details", &items)
+            .item_spacing(false)
+            .label_placement(LabelPlacement::Beside);
+        let layout = component.layout(Constraints::new(0, 40, 0, None), &mut LayoutCx::new());
+        // label column (4 + gap 2) + minimum value column.
+        assert_eq!(layout.size, LogicalSize::new(14, 2));
+        let above = LabeledDetailsComponent::new("details", &items).item_spacing(false);
+        assert_ne!(component.revision().layout, above.revision().layout);
+    }
 
     #[test]
     fn wraps_detail_values() {
