@@ -14,10 +14,12 @@
 //! the line and column of a codec syntax failure, [`Document::decode_located`] reports
 //! the key path, origin and structural serde category of a decode failure, and
 //! [`Document::origin`] maps any path to its nearest recorded source.
+mod app_dirs;
 mod capture;
 mod located;
 mod profile;
 mod value;
+pub use app_dirs::*;
 pub use capture::*;
 pub use located::*;
 pub use profile::*;

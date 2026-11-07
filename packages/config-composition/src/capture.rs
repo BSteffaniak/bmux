@@ -907,23 +907,13 @@ impl CaptureState<'_> {
                 application,
                 file_name,
             } => {
-                let base = self
-                    .context
-                    .environment
-                    .get("XDG_CONFIG_HOME")
-                    .filter(|value| !value.is_empty())
-                    .map(PathBuf::from);
-                let base = if let Some(base) = base.filter(|base| base.is_absolute()) {
-                    base
-                } else {
-                    self.context
-                        .environment
-                        .get("HOME")
-                        .map(PathBuf::from)
-                        .filter(|base| base.is_absolute())
-                        .ok_or(Error::new(ErrorKind::InvalidContext))?
-                        .join(".config")
-                };
+                let environment = &self.context.environment;
+                let base = crate::app_dirs::absolute_var(environment, "XDG_CONFIG_HOME")
+                    .or_else(|| {
+                        crate::app_dirs::absolute_var(environment, "HOME")
+                            .map(|home| home.join(".config"))
+                    })
+                    .ok_or(Error::new(ErrorKind::InvalidContext))?;
                 self.file(
                     name,
                     &base.join(application).join(file_name),
@@ -1061,7 +1051,7 @@ fn read_regular(
     }
     Ok(bytes)
 }
-fn single_component(value: &str) -> Result<()> {
+pub(crate) fn single_component(value: &str) -> Result<()> {
     let mut components = Path::new(value).components();
     if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
         return Err(Error::new(ErrorKind::InvalidPolicy));
