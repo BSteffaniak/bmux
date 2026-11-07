@@ -275,6 +275,11 @@ fn store() -> &'static Mutex<ExternalPresentationStore> {
 }
 
 /// The host-authenticated caller id used to namespace contributions.
+///
+/// The host fills `caller_plugin_id` from the calling plugin's bound host
+/// context (dynamic plugins included, whose calls the host relays), never
+/// from the request payload. Host-originated calls arrive as `bmux.core`; an
+/// empty id is treated the same way.
 fn caller_owner(context: &NativeServiceContext) -> &str {
     let owner = context.request.caller_plugin_id.trim();
     if owner.is_empty() { HOST_OWNER } else { owner }

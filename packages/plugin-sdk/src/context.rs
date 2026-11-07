@@ -547,6 +547,19 @@ impl HostKernelBridge {
         }
     }
 
+    /// Unbound wire form of this bridge for plugins that predate bound
+    /// bridges (they decode the bridge as a bare pointer).
+    ///
+    /// The result carries no authority token: the host treats calls through
+    /// it exactly like the legacy host-originated bridge. Only the host uses
+    /// this, and only when a dynamic plugin did not opt into bound contexts.
+    #[must_use]
+    pub const fn unbound_compat(&self) -> Self {
+        match self {
+            Self::Legacy(pointer) | Self::Bound { pointer, .. } => Self::Legacy(*pointer),
+        }
+    }
+
     /// Invoke the kernel bridge function pointer.
     ///
     /// # Safety
@@ -635,6 +648,156 @@ pub const CORE_CLI_COMMAND_RUN_PLUGIN_OPERATION_V1: &str = "run_plugin";
 pub const CORE_CLI_BRIDGE_MAGIC_V1: &[u8] = b"BMUXCMD1";
 /// Marker prefix for host-kernel bridge plugin command payloads.
 pub const PLUGIN_CLI_BRIDGE_MAGIC_V1: &[u8] = b"BMUXPLG1";
+/// Marker prefix for host-kernel bridge plugin service relay payloads.
+pub const PLUGIN_SERVICE_RELAY_MAGIC_V1: &[u8] = b"BMUXSVC1";
+/// Version returned by a dynamic plugin's host-relay opt-in export.
+pub const PLUGIN_SERVICE_RELAY_PROTOCOL_V1: u32 = 1;
+
+/// A typed plugin service call that a dynamically loaded plugin hands to the
+/// host for dispatch.
+///
+/// A dynamic plugin links its own copy of the plugin runtime, whose provider
+/// registries are empty, so it cannot reach other plugins directly. It sends
+/// this request through its bound [`HostKernelBridge`] instead, and the host
+/// dispatches the call with its own registries.
+///
+/// The request deliberately has no caller field: the host derives the
+/// calling plugin's identity and capabilities from the bridge's bound
+/// registration, never from anything the plugin sends.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginServiceRelayRequest {
+    pub capability: String,
+    pub kind: crate::ServiceKind,
+    pub interface_id: String,
+    pub operation: String,
+    #[serde(with = "bmux_codec::serde_bytes_vec")]
+    pub payload: Vec<u8>,
+}
+
+/// Why the host could not complete a relayed plugin service call.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginServiceRelayError {
+    /// Provider that rejected the call, when the provider itself answered.
+    #[serde(default)]
+    pub provider_plugin_id: Option<String>,
+    /// Provider error code; `None` for host-side dispatch failures.
+    #[serde(default)]
+    pub code: Option<String>,
+    pub message: String,
+}
+
+/// Host answer to a [`PluginServiceRelayRequest`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginServiceRelayResponse {
+    #[serde(with = "bmux_codec::serde_bytes_vec")]
+    pub payload: Vec<u8>,
+    #[serde(default)]
+    pub error: Option<PluginServiceRelayError>,
+}
+
+impl PluginServiceRelayResponse {
+    #[must_use]
+    pub const fn ok(payload: Vec<u8>) -> Self {
+        Self {
+            payload,
+            error: None,
+        }
+    }
+
+    /// A host-side refusal that never reached a provider.
+    #[must_use]
+    pub fn refused(message: impl Into<String>) -> Self {
+        Self {
+            payload: Vec::new(),
+            error: Some(PluginServiceRelayError {
+                provider_plugin_id: None,
+                code: None,
+                message: message.into(),
+            }),
+        }
+    }
+
+    /// Encode a host-side dispatch result.
+    #[must_use]
+    pub fn from_result(request: &PluginServiceRelayRequest, result: Result<Vec<u8>>) -> Self {
+        match result {
+            Ok(payload) => Self::ok(payload),
+            Err(PluginError::ServiceInvocationFailed {
+                provider_plugin_id,
+                code,
+                message,
+                ..
+            }) => Self {
+                payload: Vec::new(),
+                error: Some(PluginServiceRelayError {
+                    provider_plugin_id: Some(provider_plugin_id),
+                    code: Some(code),
+                    message,
+                }),
+            },
+            Err(error) => Self::refused(format!(
+                "host could not dispatch '{}' {}::{}: {error}",
+                request.capability, request.interface_id, request.operation
+            )),
+        }
+    }
+
+    /// Decode back into the caller-facing result.
+    ///
+    /// # Errors
+    ///
+    /// Returns the provider or host error carried by the response.
+    pub fn into_result(self, request: &PluginServiceRelayRequest) -> Result<Vec<u8>> {
+        match self.error {
+            None => Ok(self.payload),
+            Some(PluginServiceRelayError {
+                provider_plugin_id: Some(provider_plugin_id),
+                code: Some(code),
+                message,
+            }) => Err(PluginError::ServiceInvocationFailed {
+                provider_plugin_id,
+                capability: request.capability.clone(),
+                interface_id: request.interface_id.clone(),
+                operation: request.operation.clone(),
+                code,
+                message,
+            }),
+            Some(PluginServiceRelayError { message, .. }) => {
+                Err(PluginError::ServiceProtocol { details: message })
+            }
+        }
+    }
+}
+
+/// Encode a host-kernel bridge payload relaying a plugin service call to the
+/// host.
+///
+/// # Errors
+///
+/// Returns an error when serialization fails.
+pub fn encode_host_kernel_bridge_service_relay_payload(
+    request: &PluginServiceRelayRequest,
+) -> Result<Vec<u8>> {
+    let mut payload = PLUGIN_SERVICE_RELAY_MAGIC_V1.to_vec();
+    payload.extend(encode_service_message(request)?);
+    Ok(payload)
+}
+
+/// Decode a host-kernel bridge plugin service relay payload.
+///
+/// Returns `Ok(None)` when the payload is not a relay payload.
+///
+/// # Errors
+///
+/// Returns an error when the payload has the relay prefix but cannot be decoded.
+pub fn decode_host_kernel_bridge_service_relay_payload(
+    payload: &[u8],
+) -> Result<Option<PluginServiceRelayRequest>> {
+    let Some(encoded) = payload.strip_prefix(PLUGIN_SERVICE_RELAY_MAGIC_V1) else {
+        return Ok(None);
+    };
+    decode_service_message(encoded).map(Some)
+}
 /// Protocol version for `CoreCliCommandRequest`/`CoreCliCommandResponse`.
 pub const CORE_CLI_BRIDGE_PROTOCOL_V1: u16 = 1;
 
@@ -1017,5 +1180,92 @@ mod tests {
                 .to_string()
                 .contains("unsupported plugin CLI bridge request protocol version")
         );
+    }
+
+    #[test]
+    fn service_relay_payload_round_trips_and_carries_no_caller_identity() {
+        use super::{
+            PluginServiceRelayRequest, decode_host_kernel_bridge_service_relay_payload,
+            encode_host_kernel_bridge_service_relay_payload,
+        };
+        let request = PluginServiceRelayRequest {
+            capability: "example.write".into(),
+            kind: crate::ServiceKind::Command,
+            interface_id: "example/v1".into(),
+            operation: "set".into(),
+            payload: vec![1, 2, 3],
+        };
+        let encoded = encode_host_kernel_bridge_service_relay_payload(&request).unwrap();
+        assert_eq!(
+            decode_host_kernel_bridge_service_relay_payload(&encoded).unwrap(),
+            Some(request)
+        );
+        // Other bridge payloads are not mistaken for relays.
+        let command = encode_host_kernel_bridge_plugin_command_payload(
+            &PluginCliCommandRequest::new("p".into(), "c".into(), Vec::new()),
+        )
+        .unwrap();
+        assert_eq!(
+            decode_host_kernel_bridge_service_relay_payload(&command).unwrap(),
+            None
+        );
+        assert!(decode_host_kernel_bridge_service_relay_payload(b"BMUXSVC1garbage").is_err());
+    }
+
+    #[test]
+    fn service_relay_response_preserves_provider_and_host_errors() {
+        use super::{PluginServiceRelayRequest, PluginServiceRelayResponse};
+        use crate::PluginError;
+        let request = PluginServiceRelayRequest {
+            capability: "cap".into(),
+            kind: crate::ServiceKind::Query,
+            interface_id: "iface".into(),
+            operation: "op".into(),
+            payload: Vec::new(),
+        };
+        let ok = PluginServiceRelayResponse::from_result(&request, Ok(vec![9]));
+        assert_eq!(ok.into_result(&request).unwrap(), vec![9]);
+        let provider = PluginServiceRelayResponse::from_result(
+            &request,
+            Err(PluginError::ServiceInvocationFailed {
+                provider_plugin_id: "provider".into(),
+                capability: "cap".into(),
+                interface_id: "iface".into(),
+                operation: "op".into(),
+                code: "invalid_argument".into(),
+                message: "bad".into(),
+            }),
+        );
+        assert!(matches!(
+            provider.into_result(&request),
+            Err(PluginError::ServiceInvocationFailed { provider_plugin_id, code, .. })
+                if provider_plugin_id == "provider" && code == "invalid_argument"
+        ));
+        let refused = PluginServiceRelayResponse::refused("no bound context");
+        assert!(matches!(
+            refused.into_result(&request),
+            Err(PluginError::ServiceProtocol { details }) if details == "no bound context"
+        ));
+    }
+
+    #[test]
+    fn unbound_compat_drops_authority_token() {
+        unsafe extern "C" fn bridge(
+            _: *const u8,
+            _: usize,
+            _: *mut u8,
+            _: usize,
+            _: *mut usize,
+        ) -> i32 {
+            0
+        }
+        unsafe extern "C" fn ownership(_: *const u8, _: bool) -> bool {
+            true
+        }
+        let bound = super::HostKernelBridge::bound(bridge, uuid::Uuid::from_u128(7), ownership);
+        assert!(bound.token().is_some());
+        let compat = bound.unbound_compat();
+        assert_eq!(compat.token(), None);
+        assert_eq!(compat, super::HostKernelBridge::from_fn(bridge));
     }
 }

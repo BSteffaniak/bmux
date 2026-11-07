@@ -60,6 +60,7 @@ type NativeLifecycleFn = unsafe extern "C" fn(*const u8, usize) -> i32;
 type NativeEventFn = unsafe extern "C" fn(*const u8, usize) -> i32;
 type NativeRegisterContributionsFn = unsafe extern "C" fn(*mut u8, usize, *mut usize) -> i32;
 type NativeTakeCommandOutcomeFn = unsafe extern "C" fn(*mut u8, usize, *mut usize) -> i32;
+type NativeEnableHostRelayFn = unsafe extern "C" fn() -> u32;
 type NativeInvokeServiceFn =
     unsafe extern "C" fn(*const u8, usize, *mut u8, usize, *mut usize) -> i32;
 
@@ -1130,6 +1131,31 @@ pub fn call_service_raw(
         }
     };
 
+    // Inside a dynamically loaded plugin this runtime copy owns no providers
+    // and no registries: hand the call to the host, which dispatches it with
+    // its own registries under the identity bound to the bridge. Statically
+    // bundled plugins share the host's copy, where relay is never enabled.
+    if bmux_plugin_sdk::host_relay_enabled() {
+        let Some(bridge) = host_kernel_bridge
+            .as_ref()
+            .filter(|bridge| bridge.token().is_some())
+        else {
+            return Err(PluginError::ServiceProtocol {
+                details: format!(
+                    "dynamic plugin '{caller_plugin_id}' called '{provider_plugin_id}' without a bound host context; use the context the host passed to activate, run_command, or invoke_service (or a clone of it)"
+                ),
+            });
+        };
+        return relay_service_call_to_host(
+            bridge,
+            capability.as_str(),
+            kind,
+            interface_id,
+            operation,
+            payload,
+        );
+    }
+
     // Consult the process-level `ServiceLocationMap` to decide whether
     // this process owns the provider (`Local` → continue to in-process
     // dispatch below) or must route the call to a selected endpoint.
@@ -1198,7 +1224,7 @@ pub fn call_service_raw(
             &available_capability_map,
         )?)
     };
-    let response = loaded.invoke_service(&NativeServiceContext {
+    let mut provider_context = NativeServiceContext {
         plugin_id: provider_plugin_id,
         request: ServiceRequest {
             caller_plugin_id: caller_plugin_id.to_string(),
@@ -1231,8 +1257,12 @@ pub fn call_service_raw(
         plugin_settings_map: plugin_settings_map.clone(),
         caller_client_id,
         cancellation: cancellation.cloned().unwrap_or_default(),
-        host_kernel_bridge,
-    })?;
+        host_kernel_bridge: None,
+    };
+    let (provider_bridge, _provider_lease) =
+        provider_host_bridge(&loaded, host_kernel_bridge, &provider_context);
+    provider_context.host_kernel_bridge = provider_bridge;
+    let response = loaded.invoke_service(&provider_context)?;
 
     if let Some(error) = response.error {
         return Err(PluginError::ServiceInvocationFailed {
@@ -1563,6 +1593,112 @@ fn dispatch_remote_typed_service(
     }
 }
 
+/// Owned host registration backing a bridge handed to a dynamic provider.
+/// Dropping it ends the registration's authority.
+pub type ProviderBridgeLease = Box<dyn Send>;
+
+/// Host hook that binds a dynamic provider's own identity to the bridge it
+/// receives for one in-process service invocation.
+///
+/// Arguments are the caller's bridge (if any) and the provider's invocation
+/// context (with no bridge set yet). Returning `None` falls back to an unbound
+/// bridge.
+pub type DynamicProviderBridgeBinder = Arc<
+    dyn Fn(
+            Option<&HostKernelBridge>,
+            &NativeServiceContext,
+        ) -> Option<(HostKernelBridge, ProviderBridgeLease)>
+        + Send
+        + Sync,
+>;
+
+fn dynamic_provider_bridge_binder() -> &'static OnceLock<DynamicProviderBridgeBinder> {
+    static BINDER: OnceLock<DynamicProviderBridgeBinder> = OnceLock::new();
+    &BINDER
+}
+
+/// Install the process-wide [`DynamicProviderBridgeBinder`]. The first
+/// installation wins; returns whether this call installed it.
+pub fn install_dynamic_provider_bridge_binder(binder: DynamicProviderBridgeBinder) -> bool {
+    dynamic_provider_bridge_binder().set(binder).is_ok()
+}
+
+/// Choose the host bridge an in-process provider receives.
+///
+/// Statically bundled providers are host code: they keep the caller's bridge
+/// exactly as before. A dynamic provider relays its own service calls through
+/// whatever bridge it is given, so it must never receive a bridge bound to
+/// its caller's identity; it gets one bound to itself (through the host's
+/// binder) or an unbound one.
+fn provider_host_bridge(
+    loaded: &LoadedPlugin,
+    caller_bridge: Option<HostKernelBridge>,
+    provider_context: &NativeServiceContext,
+) -> (Option<HostKernelBridge>, Option<ProviderBridgeLease>) {
+    if !matches!(loaded.backend, PluginBackend::Dynamic(_)) {
+        return (caller_bridge, None);
+    }
+    if let Some(binder) = dynamic_provider_bridge_binder().get()
+        && let Some((bridge, lease)) = binder(caller_bridge.as_ref(), provider_context)
+    {
+        return (Some(bridge), Some(lease));
+    }
+    (
+        caller_bridge.as_ref().map(HostKernelBridge::unbound_compat),
+        None,
+    )
+}
+
+/// Opt a freshly loaded dynamic library into host relay.
+///
+/// The library links its own copy of the plugin runtime, so the host cannot
+/// share its provider registries with it. Libraries built with this SDK export
+/// `bmux_plugin_enable_host_relay_v1`; calling it switches the library's copy
+/// to hand plugin service calls to the host through its bound host bridge.
+/// Older libraries lack the export and keep their previous behavior, and the
+/// host only gives them unbound bridges they can decode.
+fn enable_dynamic_host_relay(library: &Library) -> bool {
+    let Ok(symbol) = (unsafe {
+        library.get::<NativeEnableHostRelayFn>(
+            crate::DEFAULT_NATIVE_ENABLE_HOST_RELAY_SYMBOL.as_bytes(),
+        )
+    }) else {
+        return false;
+    };
+    let version = unsafe { symbol() };
+    version == bmux_plugin_sdk::PLUGIN_SERVICE_RELAY_PROTOCOL_V1
+}
+
+/// Relay a plugin service call from a dynamic plugin's runtime copy to the
+/// host through the plugin's bound bridge. The host resolves the caller's
+/// identity and capabilities from the bridge registration.
+fn relay_service_call_to_host(
+    bridge: &HostKernelBridge,
+    capability: &str,
+    kind: ServiceKind,
+    interface_id: &str,
+    operation: &str,
+    payload: Vec<u8>,
+) -> Result<Vec<u8>> {
+    let request = bmux_plugin_sdk::PluginServiceRelayRequest {
+        capability: capability.to_string(),
+        kind,
+        interface_id: interface_id.to_string(),
+        operation: operation.to_string(),
+        payload,
+    };
+    let encoded = bmux_plugin_sdk::encode_host_kernel_bridge_service_relay_payload(&request)?;
+    let response = invoke_host_kernel_bridge(bridge, encoded).map_err(|error| {
+        PluginError::ServiceProtocol {
+            details: format!(
+                "host rejected relayed service call (the host context may have ended with plugin deactivation or command completion): {error}"
+            ),
+        }
+    })?;
+    let response: bmux_plugin_sdk::PluginServiceRelayResponse = decode_service_message(&response)?;
+    response.into_result(&request)
+}
+
 /// Drain the outcome a dynamically loaded plugin captured for the command it
 /// just ran on this thread.
 ///
@@ -1765,12 +1901,33 @@ pub struct LoadedPlugin {
     pub registered: RegisteredPlugin,
     pub declaration: PluginDeclaration,
     backend: PluginBackend,
+    /// A dynamic library that answered the host-relay opt-in export: it
+    /// decodes bound host bridges and relays its plugin service calls to the
+    /// host. `false` for static and process backends and for older dylibs.
+    host_relay: bool,
     native_service_buffers: NativeServiceBufferConfig,
     background_tasks: Box<Mutex<Option<bmux_plugin_runtime::background::BackgroundTasks>>>,
     concurrency_gate: ConcurrencyGate,
 }
 
 impl LoadedPlugin {
+    /// Whether this is a dynamic library that opted into host relay: its
+    /// plugin service calls reach the host through bound host contexts.
+    #[must_use]
+    pub const fn uses_host_relay(&self) -> bool {
+        self.host_relay
+    }
+
+    /// Wire form of a host bridge for this plugin. Dynamic libraries that did
+    /// not opt into host relay predate bound bridges and decode the bridge as
+    /// a bare pointer, so they keep receiving the unbound legacy form.
+    /// Returns the replacement bridge, or `None` when it can be sent unchanged.
+    fn compat_bridge(&self, bridge: Option<&HostKernelBridge>) -> Option<HostKernelBridge> {
+        let bridge = bridge.filter(|bridge| bridge.token().is_some())?;
+        (matches!(self.backend, PluginBackend::Dynamic(_)) && !self.host_relay)
+            .then(|| bridge.unbound_compat())
+    }
+
     fn resolved_lifecycle_context(
         &self,
         context: &NativeLifecycleContext,
@@ -2048,6 +2205,13 @@ impl LoadedPlugin {
 
         if let Some(context) = context {
             let encode_started = Instant::now();
+            let compat_context =
+                self.compat_bridge(context.host_kernel_bridge.as_ref())
+                    .map(|bridge| NativeCommandContext {
+                        host_kernel_bridge: Some(bridge),
+                        ..context.clone()
+                    });
+            let context = compat_context.as_ref().unwrap_or(context);
             let payload = encode_service_message(context).map_err(|_| {
                 PluginError::InvalidNativeCommandInput {
                     plugin_id: self.declaration.id.as_str().to_string(),
@@ -2522,6 +2686,13 @@ impl LoadedPlugin {
         // identity once per dispatch, outside the buffer-growth retry loop. Do not
         // rewrite context cancellation/authority or derive identity from input.
         let invocation_id = bmux_plugin_sdk::PluginInvocationId::new();
+        let compat_context =
+            self.compat_bridge(context.host_kernel_bridge.as_ref())
+                .map(|bridge| NativeServiceContext {
+                    host_kernel_bridge: Some(bridge),
+                    ..context.clone()
+                });
+        let context = compat_context.as_ref().unwrap_or(context);
         let payload = encode_service_envelope_with_invocation_id(
             invocation_id.clone(),
             0,
@@ -2669,7 +2840,10 @@ impl LoadedPlugin {
     fn run_lifecycle_symbol(&self, symbol: &str, context: &NativeLifecycleContext) -> Result<i32> {
         let total_started = Instant::now();
         let encode_started = Instant::now();
-        let context = self.resolved_lifecycle_context(context)?;
+        let mut context = self.resolved_lifecycle_context(context)?;
+        if let Some(bridge) = self.compat_bridge(context.host_kernel_bridge.as_ref()) {
+            context.host_kernel_bridge = Some(bridge);
+        }
         let legacy = self.declaration.native_abi.minimum < bmux_plugin_sdk::ApiVersion::new(1, 1);
         let payload_result = if legacy {
             encode_service_message(&context.legacy_wire_snapshot())
@@ -2932,6 +3106,7 @@ impl NativePluginLoader {
                     metrics: Arc::new(ProcessRuntimeMetrics::default()),
                 }),
                 native_service_buffers: self.native_service_buffers,
+                host_relay: false,
                 background_tasks: Box::default(),
                 concurrency_gate: concurrency_gate_for(&registered_plugin.declaration),
             });
@@ -2966,11 +3141,13 @@ impl NativePluginLoader {
             available_capabilities,
         )?;
         compare_manifest_and_embedded(registered_plugin, &declaration)?;
+        let host_relay = enable_dynamic_host_relay(&library);
 
         Ok(LoadedPlugin {
             registered: registered_plugin.clone(),
             declaration: declaration.clone(),
             backend: PluginBackend::Dynamic(library),
+            host_relay,
             native_service_buffers: self.native_service_buffers,
             background_tasks: Box::default(),
             concurrency_gate: concurrency_gate_for(&declaration),
@@ -3079,6 +3256,7 @@ pub fn load_static_plugin_with_native_service_buffer_config(
         declaration: declaration.clone(),
         backend: PluginBackend::Static(vtable),
         native_service_buffers,
+        host_relay: false,
         background_tasks: Box::default(),
         concurrency_gate: concurrency_gate_for(&declaration),
     })
@@ -3125,6 +3303,7 @@ pub fn load_trusted_static_plugin_with_native_service_buffer_config(
         declaration: registered_plugin.declaration.clone(),
         backend: PluginBackend::Static(vtable),
         native_service_buffers,
+        host_relay: false,
         background_tasks: Box::default(),
         concurrency_gate: concurrency_gate_for(&registered_plugin.declaration),
     })
@@ -3628,6 +3807,7 @@ minimum = "1.0"
                 .expect("declaration should build"),
             backend: PluginBackend::Dynamic(library),
             native_service_buffers: NativeServiceBufferConfig::default(),
+            host_relay: false,
             background_tasks: Box::default(),
             concurrency_gate: ConcurrencyGate::new(
                 bmux_plugin_runtime::PluginConcurrencyConfig::Concurrent,
@@ -3637,6 +3817,54 @@ minimum = "1.0"
         assert_eq!(loaded.commands().len(), 1);
         assert!(loaded.supports_command("hello"));
         assert!(loaded.run_command("missing", &[]).is_err());
+
+        // A library without the host-relay export (this test binary) is not
+        // opted in, so it keeps receiving bridges it can decode: bound
+        // bridges are downgraded to the unbound legacy form.
+        let LoadedPlugin {
+            backend: PluginBackend::Dynamic(library),
+            ..
+        } = &loaded
+        else {
+            unreachable!()
+        };
+        assert!(!super::enable_dynamic_host_relay(library));
+        let bound = bmux_plugin_sdk::HostKernelBridge::bound(
+            compat_test_bridge,
+            uuid::Uuid::new_v4(),
+            compat_test_ownership,
+        );
+        assert_eq!(
+            loaded.compat_bridge(Some(&bound)),
+            Some(bmux_plugin_sdk::HostKernelBridge::from_fn(
+                compat_test_bridge
+            ))
+        );
+        assert_eq!(
+            loaded.compat_bridge(Some(&bmux_plugin_sdk::HostKernelBridge::from_fn(
+                compat_test_bridge
+            ))),
+            None
+        );
+        let opted_in = LoadedPlugin {
+            host_relay: true,
+            ..loaded
+        };
+        assert_eq!(opted_in.compat_bridge(Some(&bound)), None);
+    }
+
+    unsafe extern "C" fn compat_test_ownership(_: *const u8, _: bool) -> bool {
+        true
+    }
+
+    unsafe extern "C" fn compat_test_bridge(
+        _: *const u8,
+        _: usize,
+        _: *mut u8,
+        _: usize,
+        _: *mut usize,
+    ) -> i32 {
+        0
     }
 
     fn test_static_plugin_entry() -> *const c_char {
@@ -3745,6 +3973,7 @@ minimum = "1.0"
                 .expect("declaration should build"),
             backend: PluginBackend::Static(vtable),
             native_service_buffers: NativeServiceBufferConfig::default(),
+            host_relay: false,
             background_tasks: Box::default(),
             concurrency_gate: ConcurrencyGate::new(
                 bmux_plugin_runtime::PluginConcurrencyConfig::Concurrent,
@@ -5195,6 +5424,7 @@ minimum = "1.0"
             },
             backend: PluginBackend::Dynamic(library),
             native_service_buffers: NativeServiceBufferConfig::default(),
+            host_relay: false,
             background_tasks: Box::default(),
             concurrency_gate: ConcurrencyGate::new(
                 bmux_plugin_runtime::PluginConcurrencyConfig::Concurrent,
@@ -5459,5 +5689,92 @@ minimum = "1.0"
             msg.contains("unsupported host operation"),
             "unexpected message: {msg}"
         );
+    }
+
+    thread_local! {
+        static RELAY_SEEN: std::cell::RefCell<Option<(Option<uuid::Uuid>, Vec<u8>)>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Host stand-in: records the relay request and answers like the host.
+    unsafe extern "C" fn test_relay_bridge(
+        input_ptr: *const u8,
+        input_len: usize,
+        output_ptr: *mut u8,
+        output_capacity: usize,
+        output_len: *mut usize,
+    ) -> i32 {
+        let input = unsafe { std::slice::from_raw_parts(input_ptr, input_len) };
+        let request: bmux_plugin_sdk::HostKernelBridgeRequest =
+            bmux_plugin_sdk::decode_service_message(input).unwrap();
+        RELAY_SEEN.with(|slot| {
+            *slot.borrow_mut() = Some((request.context_token, request.payload.clone()));
+        });
+        let relay =
+            bmux_plugin_sdk::decode_host_kernel_bridge_service_relay_payload(&request.payload)
+                .unwrap()
+                .expect("relay payload");
+        let response = if relay.operation == "fail" {
+            bmux_plugin_sdk::PluginServiceRelayResponse::refused("denied by host")
+        } else {
+            bmux_plugin_sdk::PluginServiceRelayResponse::ok(
+                relay.payload.iter().rev().copied().collect(),
+            )
+        };
+        let encoded =
+            bmux_plugin_sdk::encode_service_message(&bmux_plugin_sdk::HostKernelBridgeResponse {
+                payload: bmux_plugin_sdk::encode_service_message(&response).unwrap(),
+            })
+            .unwrap();
+        unsafe { *output_len = encoded.len() };
+        if encoded.len() > output_capacity {
+            return super::KERNEL_STATUS_BUFFER_TOO_SMALL;
+        }
+        unsafe { std::ptr::copy_nonoverlapping(encoded.as_ptr(), output_ptr, encoded.len()) };
+        super::KERNEL_STATUS_OK
+    }
+
+    unsafe extern "C" fn test_relay_ownership(_: *const u8, _: bool) -> bool {
+        true
+    }
+
+    #[test]
+    fn relay_service_call_sends_token_bound_route_without_caller_identity() {
+        let token = uuid::Uuid::new_v4();
+        let bridge = bmux_plugin_sdk::HostKernelBridge::bound(
+            test_relay_bridge,
+            token,
+            test_relay_ownership,
+        );
+        let response = super::relay_service_call_to_host(
+            &bridge,
+            "example.write",
+            TestServiceKind::Command,
+            "example/v1",
+            "set",
+            vec![1, 2, 3],
+        )
+        .expect("relay succeeds");
+        assert_eq!(response, vec![3, 2, 1]);
+        let (seen_token, payload) = RELAY_SEEN.with(|slot| slot.borrow_mut().take()).unwrap();
+        // The host identifies the caller only by the opaque bound token.
+        assert_eq!(seen_token, Some(token));
+        let relay = bmux_plugin_sdk::decode_host_kernel_bridge_service_relay_payload(&payload)
+            .unwrap()
+            .unwrap();
+        assert_eq!(relay.capability, "example.write");
+        assert_eq!(relay.interface_id, "example/v1");
+        assert_eq!(relay.operation, "set");
+
+        let error = super::relay_service_call_to_host(
+            &bridge,
+            "cap",
+            TestServiceKind::Query,
+            "iface",
+            "fail",
+            Vec::new(),
+        )
+        .expect_err("host refusal propagates");
+        assert!(error.to_string().contains("denied by host"), "{error}");
     }
 }

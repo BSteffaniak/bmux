@@ -171,6 +171,29 @@ pub fn take_last_command_error() -> Option<PluginCommandError> {
     LAST_COMMAND_ERROR.with(|slot| slot.borrow_mut().take())
 }
 
+static HOST_RELAY_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Switch this SDK copy into host-relay mode. Called only through the
+/// `bmux_plugin_enable_host_relay_v1` export of a dynamically loaded plugin.
+pub fn enable_host_relay() {
+    HOST_RELAY_ENABLED.store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// Whether this SDK copy lives inside a dynamically loaded plugin whose host
+/// opted it into relaying plugin service calls.
+///
+/// A `cdylib` plugin links its own copy of the plugin runtime. That copy has
+/// no provider registries or activated providers, so plugin-to-plugin calls
+/// made inside it must be handed to the host through the plugin's bound
+/// [`crate::HostKernelBridge`]. The host enables this right after loading the
+/// library; statically bundled plugins share the host's copy, where this is
+/// always `false`, so their in-process dispatch is unchanged.
+#[must_use]
+pub fn host_relay_enabled() -> bool {
+    HOST_RELAY_ENABLED.load(std::sync::atomic::Ordering::Acquire)
+}
+
 thread_local! {
     /// Outcome captured by [`run_command_export`] when no host capture was
     /// active on this thread, i.e. when this SDK copy lives in a dynamically

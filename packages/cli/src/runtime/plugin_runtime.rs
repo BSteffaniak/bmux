@@ -18,6 +18,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, instrument, warn};
 
+use super::plugin_kernel::{
+    begin_plugin_activation_scope, bind_plugin_command_call, bind_plugin_lifecycle_call,
+    end_plugin_activation_scope, install_plugin_identity_hooks,
+};
 use super::{
     KernelClientFactory, available_capability_providers, available_service_descriptors,
     connect_raw, core_provided_capabilities, enter_host_kernel_client_factory,
@@ -603,6 +607,7 @@ pub(super) fn build_runtime_command_state(
         registered_plugin_infos,
     };
     mark_runtime_command_state_remote(&state);
+    install_plugin_identity_hooks();
     Ok(state)
 }
 
@@ -1614,6 +1619,7 @@ pub(super) async fn activate_loaded_plugins(
     // typed service observe a stable registry across the lifetime of
     // the attach session.
     install_typed_service_registry(loaded_plugins, config, paths)?;
+    install_plugin_identity_hooks();
 
     let mut activated: Vec<&bmux_plugin::LoadedPlugin> = Vec::new();
     let connection_info = HostConnectionInfo {
@@ -1655,7 +1661,7 @@ pub(super) async fn activate_loaded_plugins(
         }
 
         let activate_started = Instant::now();
-        let context = plugin_lifecycle_context(
+        let mut context = plugin_lifecycle_context(
             config,
             paths,
             &plugin.declaration,
@@ -1667,6 +1673,13 @@ pub(super) async fn activate_loaded_plugins(
                 registered_plugins: registered_plugins.clone(),
             },
         );
+        // A relaying dynamic plugin's host authority for this activation: the
+        // context and any clone the plugin keeps act as this plugin until
+        // deactivation. Bundled plugins are host code and keep the legacy
+        // host bridge.
+        if plugin.uses_host_relay() {
+            begin_plugin_activation_scope(&mut context)?;
+        }
         let activation_connection_guard = enter_host_kernel_connection(connection_info.clone());
         // `map_or_else` trips `result_large_err` here because plugin activation
         // returns the repository-wide `PluginError`; the explicit match keeps the
@@ -1678,6 +1691,7 @@ pub(super) async fn activate_loaded_plugins(
         };
         drop(activation_connection_guard);
         if let Err(error) = activate_result {
+            end_plugin_activation_scope(plugin.declaration.id.as_str());
             plugin.cancel_background_tasks()?;
             for activated_plugin in &activated {
                 activated_plugin.cancel_background_tasks()?;
@@ -1691,6 +1705,11 @@ pub(super) async fn activate_loaded_plugins(
                 activated_plugin.drain_background_tasks().await?;
             }
             {
+                let mut context = context;
+                let _deactivation = plugin
+                    .uses_host_relay()
+                    .then(|| bind_plugin_lifecycle_call(&mut context))
+                    .transpose()?;
                 let _connection = enter_host_kernel_connection(connection_info.clone());
                 plugin.deactivate(&context)?;
             }
@@ -1703,7 +1722,7 @@ pub(super) async fn activate_loaded_plugins(
                     .finish(),
             );
             for activated_plugin in activated.into_iter().rev() {
-                let context = plugin_lifecycle_context(
+                let mut context = plugin_lifecycle_context(
                     config,
                     paths,
                     &activated_plugin.declaration,
@@ -1716,6 +1735,11 @@ pub(super) async fn activate_loaded_plugins(
                     },
                 );
                 activated_plugin.drain_background_tasks().await?;
+                end_plugin_activation_scope(activated_plugin.declaration.id.as_str());
+                let _deactivation = activated_plugin
+                    .uses_host_relay()
+                    .then(|| bind_plugin_lifecycle_call(&mut context))
+                    .transpose()?;
                 let _host_kernel_connection_guard =
                     enter_host_kernel_connection(connection_info.clone());
                 let deactivate_result = activated_plugin.deactivate(&context);
@@ -1833,7 +1857,7 @@ pub(super) async fn deactivate_loaded_plugins(
             continue;
         }
 
-        let context = plugin_lifecycle_context(
+        let mut context = plugin_lifecycle_context(
             config,
             paths,
             &plugin.declaration,
@@ -1846,8 +1870,18 @@ pub(super) async fn deactivate_loaded_plugins(
             },
         );
         plugin.drain_background_tasks().await?;
+        // Deactivation revokes the activation scope first: anything the
+        // plugin kept from activation (background threads included) fails
+        // closed from here. `deactivate` itself gets a scope that ends when
+        // it returns, so it can still clean up.
+        end_plugin_activation_scope(plugin.declaration.id.as_str());
+        let deactivation_scope = plugin
+            .uses_host_relay()
+            .then(|| bind_plugin_lifecycle_call(&mut context))
+            .transpose()?;
         let _host_kernel_connection_guard = enter_host_kernel_connection(connection_info.clone());
         let deactivate_result = plugin.deactivate(&context);
+        drop(deactivation_scope);
         bmux_plugin::layout::global_plugin_layout_registry()
             .remove_owner(plugin.declaration.id.as_str());
         bmux_plugin::surface::global_plugin_surface_registry()
@@ -2277,7 +2311,7 @@ fn run_plugin_command_internal_with_state(
     let loaded = load_cached_plugin(plugin, state)?;
     let load_us = load_started.elapsed().as_micros();
     let context_started = Instant::now();
-    let context = plugin_command_context(
+    let mut context = plugin_command_context(
         config,
         paths,
         &plugin.declaration,
@@ -2292,6 +2326,13 @@ fn run_plugin_command_internal_with_state(
         caller_client_id,
         invocation_source,
     );
+    // A relaying dynamic plugin's host authority for this command ends when
+    // the invocation returns. Bundled plugins keep the legacy host bridge,
+    // which their work may outlive the command with (for example overlays).
+    let _command_scope = loaded
+        .uses_host_relay()
+        .then(|| bind_plugin_command_call(&mut context))
+        .transpose()?;
     let context_us = context_started.elapsed().as_micros();
     let _host_kernel_connection_guard = enter_host_kernel_connection(context.connection.clone());
     let _host_kernel_factory_guard =

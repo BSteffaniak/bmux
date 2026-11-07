@@ -364,6 +364,7 @@ impl SerializedAdmissionAuthority {
                             shutdown_tx: watch::channel(false).0,
                             client_id: ClientId::new(),
                             client_principal_id: Uuid::nil(),
+                            caller_plugin_id: None,
                         };
                         let invocation = state
                             .service_registry
@@ -442,6 +443,9 @@ pub struct ServiceInvokeContext {
     shutdown_tx: watch::Sender<bool>,
     client_id: ClientId,
     client_principal_id: Uuid,
+    /// Plugin a host authenticated as the originator of this invocation.
+    /// `None` for host-originated calls (CLI, attach, server internals).
+    caller_plugin_id: Option<Arc<str>>,
 }
 
 impl ServiceInvokeContext {
@@ -451,6 +455,27 @@ impl ServiceInvokeContext {
     #[must_use]
     pub const fn client_id(&self) -> ClientId {
         self.client_id
+    }
+
+    /// Plugin a host authenticated as the originator of this invocation, or
+    /// `None` when the host itself originated it.
+    ///
+    /// Set only from host-derived identity: a host's bound plugin context or
+    /// a [`Request::InvokeServiceAsPlugin`] accepted from a local stream.
+    #[must_use]
+    pub fn caller_plugin_id(&self) -> Option<&str> {
+        self.caller_plugin_id.as_deref()
+    }
+
+    /// Attribute service invocations dispatched through this context to a
+    /// plugin the host process authenticated. Host-only: the host derives
+    /// `plugin_id` from a registration it issued, never from plugin input.
+    #[must_use]
+    pub fn with_caller_plugin_id(&self, plugin_id: &str) -> Self {
+        Self {
+            caller_plugin_id: Some(Arc::from(plugin_id)),
+            ..self.clone()
+        }
     }
 }
 
@@ -525,6 +550,9 @@ impl ServiceInvokeContext {
         // per-invocation locals. We pass an empty selection local here —
         // any handler that still reads it falls back to FollowState via
         // sync_selected_target_from_follow_state.
+        if let Some(response) = self.execute_attributed_service_request(&request).await {
+            return Ok(response);
+        }
         let mut selected_session: Option<SessionId> = None;
         handle_request(
             &self.state,
@@ -535,6 +563,43 @@ impl ServiceInvokeContext {
             request,
         )
         .await
+    }
+
+    /// Dispatch an `InvokeService` request under this context's plugin
+    /// attribution. `None` when the context has no attribution or the
+    /// request is not a service invocation.
+    async fn execute_attributed_service_request(&self, request: &Request) -> Option<Response> {
+        let (
+            Some(caller_plugin_id),
+            Request::InvokeService {
+                capability,
+                kind,
+                interface_id,
+                operation,
+                payload,
+            },
+        ) = (self.caller_plugin_id.as_ref(), request)
+        else {
+            return None;
+        };
+        let route = ServiceRoute {
+            capability: capability.clone(),
+            kind: *kind,
+            interface_id: interface_id.clone(),
+            operation: operation.clone(),
+        };
+        Some(service_output_response(
+            invoke_service_output_as(
+                &self.state,
+                &self.shutdown_tx,
+                self.client_id,
+                self.client_principal_id,
+                route,
+                payload.clone(),
+                Some(Arc::clone(caller_plugin_id)),
+            )
+            .await,
+        ))
     }
 
     /// Execute a raw request payload.
@@ -584,6 +649,57 @@ async fn invoke_service_output(
     route: ServiceRoute,
     payload: Vec<u8>,
 ) -> Result<ServiceInvokeOutput> {
+    invoke_service_output_as(
+        state,
+        shutdown_tx,
+        client_id,
+        client_principal_id,
+        route,
+        payload,
+        None,
+    )
+    .await
+}
+
+fn service_output_response(result: Result<ServiceInvokeOutput>) -> Response {
+    match result {
+        Ok(output) => Response::Ok(ResponsePayload::ServiceInvoked {
+            payload: output.payload,
+        }),
+        Err(error) => Response::Err(ErrorResponse {
+            code: service_invocation_error_code(&error),
+            message: format!("service invocation failed: {error:#}"),
+        }),
+    }
+}
+
+/// Plugin attribution a stream may assert with
+/// [`Request::InvokeServiceAsPlugin`]: only same-user local streams, which
+/// are already inside the host trust boundary. Anything else is dropped so
+/// the call is dispatched exactly like a plain, host-attributed request.
+fn accepted_caller_plugin_attribution(
+    state: &ServerState,
+    client_id: ClientId,
+    caller_plugin_id: &str,
+) -> Option<Arc<str>> {
+    let caller_plugin_id = caller_plugin_id.trim();
+    (!caller_plugin_id.is_empty()
+        && matches!(
+            state.stream_provenance.lookup(client_id.0),
+            bmux_plugin::stream_admission::StreamProvenance::Local
+        ))
+    .then(|| Arc::from(caller_plugin_id))
+}
+
+async fn invoke_service_output_as(
+    state: &Arc<ServerState>,
+    shutdown_tx: &watch::Sender<bool>,
+    client_id: ClientId,
+    client_principal_id: Uuid,
+    route: ServiceRoute,
+    payload: Vec<u8>,
+    caller_plugin_id: Option<Arc<str>>,
+) -> Result<ServiceInvokeOutput> {
     check_stream_route(state, client_id.0, &route)?;
     let total_timer = PhaseTimer::start();
     let capability = route.capability.clone();
@@ -596,6 +712,7 @@ async fn invoke_service_output(
         shutdown_tx: shutdown_tx.clone(),
         client_id,
         client_principal_id,
+        caller_plugin_id,
     };
     let registry_timer = PhaseTimer::start();
     let dispatch = {
@@ -1309,6 +1426,7 @@ impl BmuxServer {
             shutdown_tx: self.shutdown_tx.clone(),
             client_id: ClientId::new(),
             client_principal_id: Uuid::nil(),
+            caller_plugin_id: None,
         }
     }
 
@@ -2148,6 +2266,7 @@ mod admission_tests {
             shutdown_tx: server.shutdown_tx.clone(),
             client_id,
             client_principal_id: claimed,
+            caller_plugin_id: None,
         };
         let query = encode(&Request::CurrentStreamProvenance).unwrap();
         let read = |bytes: Vec<u8>| decode::<Response>(&bytes).unwrap();
@@ -2378,6 +2497,7 @@ mod admission_tests {
             shutdown_tx: server.shutdown_tx.clone(),
             client_id: ClientId::new(),
             client_principal_id: Uuid::nil(),
+            caller_plugin_id: None,
         };
         assert_eq!(
             decode::<Response>(
@@ -2839,8 +2959,12 @@ async fn handle_connection(
             }
         };
         let request_decode_us = request_decode_started.elapsed().as_micros();
+        // Admitted streams may send `InvokeServiceAsPlugin`, but their plugin
+        // attribution is dropped (see `accepted_caller_plugin_attribution`).
         if admitted_stream.is_some() && !matches!(request,
-            Request::InvokeService { .. } | Request::InvokeServicePipeline { .. })
+            Request::InvokeService { .. }
+                | Request::InvokeServiceAsPlugin { .. }
+                | Request::InvokeServicePipeline { .. })
         {
             break;
         }
@@ -3524,6 +3648,35 @@ async fn handle_request(
             flush_phase_timing();
             Response::Ok(ResponsePayload::ServerStopping)
         }
+        Request::InvokeServiceAsPlugin {
+            caller_plugin_id,
+            capability,
+            kind,
+            interface_id,
+            operation,
+            payload,
+        } => {
+            let caller_plugin_id =
+                accepted_caller_plugin_attribution(state, client_id, &caller_plugin_id);
+            let route = ServiceRoute {
+                capability,
+                kind,
+                interface_id,
+                operation,
+            };
+            service_output_response(
+                invoke_service_output_as(
+                    state,
+                    shutdown_tx,
+                    client_id,
+                    client_principal_id,
+                    route,
+                    payload,
+                    caller_plugin_id,
+                )
+                .await,
+            )
+        }
         Request::InvokeService {
             capability,
             kind,
@@ -3598,6 +3751,7 @@ async fn handle_request(
                 shutdown_tx: shutdown_tx.clone(),
                 client_id,
                 client_principal_id,
+                caller_plugin_id: None,
             };
             let registry_started = std::time::Instant::now();
             let dispatch = {
@@ -3898,6 +4052,7 @@ const fn request_kind_name(request: &Request) -> &'static str {
         Request::ServerStatus => "server_status",
         Request::ServerStop => "server_stop",
         Request::InvokeService { .. } => "invoke_service",
+        Request::InvokeServiceAsPlugin { .. } => "invoke_service_as_plugin",
         Request::InvokeServicePipeline { .. } => "invoke_service_pipeline",
         Request::EmitOnPluginBus { .. } => "emit_on_plugin_bus",
         Request::PollEvents { .. } => "poll_events",
@@ -4710,6 +4865,109 @@ mod tests {
             service_invocation_error_code(&unrelated),
             ErrorCode::Internal
         );
+    }
+
+    #[tokio::test]
+    async fn plugin_attribution_is_honored_only_from_local_streams() {
+        let endpoint =
+            IpcEndpoint::unix_socket(std::env::temp_dir().join("bmux-caller-plugin-test.sock"));
+        let server = BmuxServer::new(endpoint);
+        server
+            .register_service_handler(
+                "test.whoami",
+                bmux_ipc::InvokeServiceKind::Query,
+                "whoami/v1",
+                "read",
+                |_, context, _| async move {
+                    Ok(context
+                        .caller_plugin_id()
+                        .unwrap_or("<host>")
+                        .as_bytes()
+                        .to_vec())
+                },
+            )
+            .unwrap();
+        let attributed = |caller: &str| Request::InvokeServiceAsPlugin {
+            caller_plugin_id: caller.into(),
+            capability: "test.whoami".into(),
+            kind: bmux_ipc::InvokeServiceKind::Query,
+            interface_id: "whoami/v1".into(),
+            operation: "read".into(),
+            payload: Vec::new(),
+        };
+        let plain = Request::InvokeService {
+            capability: "test.whoami".into(),
+            kind: bmux_ipc::InvokeServiceKind::Query,
+            interface_id: "whoami/v1".into(),
+            operation: "read".into(),
+            payload: Vec::new(),
+        };
+        let call = |client_id: ClientId, request: Request| {
+            let state = Arc::clone(&server.state);
+            let shutdown_tx = server.shutdown_tx.clone();
+            async move {
+                let mut selected = None;
+                handle_request(
+                    &state,
+                    &shutdown_tx,
+                    client_id,
+                    Uuid::new_v4(),
+                    &mut selected,
+                    request,
+                )
+                .await
+                .unwrap()
+            }
+        };
+        let invoked = |caller: &str| {
+            Response::Ok(ResponsePayload::ServiceInvoked {
+                payload: caller.as_bytes().to_vec(),
+            })
+        };
+
+        let local_id = ClientId::new();
+        let _origin = server
+            .state
+            .stream_provenance
+            .record(local_id.0, None)
+            .unwrap();
+        assert_eq!(
+            call(local_id, attributed("example.native")).await,
+            invoked("example.native")
+        );
+        assert_eq!(call(local_id, plain.clone()).await, invoked("<host>"));
+        assert_eq!(call(local_id, attributed("  ")).await, invoked("<host>"));
+
+        // Streams without valid local provenance never get an attribution.
+        let unknown = ClientId::new();
+        assert!(accepted_caller_plugin_attribution(&server.state, unknown, "x").is_none());
+        assert!(!matches!(
+            call(unknown, attributed("example.native")).await,
+            Response::Ok(_)
+        ));
+
+        // Host-attributed kernel contexts carry the identity into dispatch.
+        let context = ServiceInvokeContext {
+            host_internal: false,
+            state: Arc::clone(&server.state),
+            shutdown_tx: server.shutdown_tx.clone(),
+            client_id: local_id,
+            client_principal_id: Uuid::new_v4(),
+            caller_plugin_id: None,
+        };
+        let raw = encode(&plain).unwrap();
+        for (context, expected) in [
+            (
+                context.with_caller_plugin_id("example.native"),
+                "example.native",
+            ),
+            (context, "<host>"),
+        ] {
+            assert_eq!(
+                decode::<Response>(&context.execute_raw(raw.clone()).await.unwrap()).unwrap(),
+                invoked(expected)
+            );
+        }
     }
 
     #[tokio::test]

@@ -74,6 +74,8 @@ pub const CORE_CAPABILITY_CONTROL: &str = "core.control";
 pub const CAPABILITY_SERVICE_CONTRACT_V2: &str = "core.service_contract.v2";
 
 pub const CORE_CAPABILITY_SERVICE_INVOCATION: &str = "core.service_invocation";
+/// Optional: the peer accepts [`Request::InvokeServiceAsPlugin`].
+pub const CAPABILITY_SERVICE_CALLER_PLUGIN_V1: &str = "core.service_invocation.caller_plugin.v1";
 pub const CORE_CAPABILITY_EVENT_STREAM: &str = "core.event_stream";
 pub const CORE_CAPABILITY_LIFECYCLE: &str = "core.lifecycle";
 
@@ -163,6 +165,7 @@ pub fn default_supported_capabilities() -> Vec<String> {
         CAPABILITY_SERVICE_CONTRACT_V2.to_string(),
         CORE_CAPABILITY_CONTROL.to_string(),
         CORE_CAPABILITY_SERVICE_INVOCATION.to_string(),
+        CAPABILITY_SERVICE_CALLER_PLUGIN_V1.to_string(),
         CORE_CAPABILITY_EVENT_STREAM.to_string(),
         CORE_CAPABILITY_LIFECYCLE.to_string(),
     ];
@@ -379,6 +382,24 @@ pub enum Request {
     CurrentStreamProvenance,
     /// Kernel bridge only: live registered admission provider instance.
     StreamAdmissionBackend,
+    /// [`Request::InvokeService`] made on behalf of a plugin the sending host
+    /// process loaded and authenticated (from the plugin's host-issued bound
+    /// context, never from plugin-supplied data).
+    ///
+    /// Servers honor the attribution only from same-user local streams, which
+    /// already sit inside the host trust boundary; admitted (remote) streams
+    /// may not send it. Hosts must never forward this variant on a plugin's
+    /// behalf. Appended to preserve existing binary enum discriminants; only
+    /// sent to peers that negotiated [`CAPABILITY_SERVICE_CALLER_PLUGIN_V1`].
+    InvokeServiceAsPlugin {
+        caller_plugin_id: String,
+        capability: String,
+        kind: InvokeServiceKind,
+        interface_id: String,
+        operation: String,
+        #[serde(with = "bmux_codec::serde_bytes_vec")]
+        payload: Vec<u8>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

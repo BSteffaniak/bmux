@@ -60,7 +60,23 @@ services in `bmux_tab_bar_plugin_api`; requires an attached client to see them):
 bmux plugin run example.native status-set build "build ok" --severity success --priority 10
 bmux plugin run example.native notify "Deploy finished" --body "all green" --severity info --ttl-ms 4000
 bmux plugin run example.native status-clear build   # or no id to clear all
+bmux plugin run example.native status-list          # owner/id: text for every plugin
 ```
+
+`status-list` shows the owner the host attributed each item to; this plugin's
+items are owned by `example.native` because the host derives the caller from
+the plugin's bound context, not from the request. Setting
+
+```toml
+[plugins.settings."example.native"]
+background_status = true
+```
+
+also makes the plugin set a status item from `activate` and another from a
+background thread holding a clone of the activation context. When the server
+stops, `deactivate` reports that the thread's next call was rejected: the
+activation context stops working once deactivation begins. See
+[Calling services from dynamic plugins](../../docs/plugins.md#calling-services-from-dynamic-plugins).
 
 The `status-set` and `status-clear` commands also record a
 `COMMAND_OUTCOME_STATUS_MESSAGE_KEY` outcome, so binding them to a key shows

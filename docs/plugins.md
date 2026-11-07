@@ -620,8 +620,93 @@ outcome metadata.
 Plugins add right-side tab-bar status modules and attach toasts through the
 typed `bmux.tab_bar` services in `bmux_tab_bar_plugin_api` (`status-items`,
 `status-items-state`, `notifications`). This works across the dylib boundary
-because only serialized BPDL payloads cross it. See
+because only serialized BPDL payloads cross it, and the host relays the calls
+of dynamically loaded plugins (see
+[Calling services from dynamic plugins](#calling-services-from-dynamic-plugins)).
+Items are namespaced by the caller id the host authenticated. See
 [`plugins/tab-bar-plugin/README.md`](../plugins/tab-bar-plugin/README.md#plugin-contributions).
+
+### Calling services from dynamic plugins
+
+A third-party plugin built as a `cdylib` links its own copy of
+`bmux_plugin`/`bmux_plugin_sdk`. That copy has no activated providers and no
+provider registries, so it cannot dispatch plugin-to-plugin calls itself.
+Instead the host relays them:
+
+1. **Opt-in at load.** `export_plugin!` / `export_concurrent_plugin!` export
+   `bmux_plugin_enable_host_relay_v1`. The loader calls it right after
+   `dlopen`, which switches the library's runtime copy into relay mode
+   (`bmux_plugin_sdk::host_relay_enabled()`). Statically bundled plugins share
+   the host's copy, where relay is never enabled, so their in-process fast
+   path is unchanged.
+2. **Relay.** In relay mode `call_service_raw` sends every call to a
+   plugin-provided service as a `BMUXSVC1` payload
+   (`PluginServiceRelayRequest`: capability, kind, interface, operation,
+   payload) through the context's `HostKernelBridge`. Host services
+   (storage, logging, config) keep their existing path. The host dispatches
+   the relayed call with its own registries: in-process when it owns the
+   provider (the server process), or over IPC to the server (a standalone
+   `bmux plugin run` process).
+3. **Identity comes from the host.** The relay payload has no caller field.
+   Every context the host passes to a relaying dynamic plugin carries a
+   *bound* bridge:
+   an opaque, unguessable token for a host-side registration holding the
+   plugin id and the capabilities the host computed from the plugin's
+   manifest (required plus optional). The host looks the token up, checks the
+   capability against that registration, and dispatches with
+   `ServiceRequest::caller_plugin_id` set to the registered id. When the call
+   travels over IPC, the host sends `Request::InvokeServiceAsPlugin` (offered
+   only to servers that negotiate `core.service_invocation.caller_plugin.v1`),
+   and the server's `ServiceInvokeContext::caller_plugin_id()` feeds the
+   provider. `bmux.core` is used only for calls the host itself originates
+   (the CLI, attach, server internals).
+
+Scopes and lifetimes (for relaying dynamic plugins; statically bundled
+plugins are host code and keep the legacy host bridge, so their behavior,
+including work that outlives a command, is unchanged):
+
+| Context | Bound for |
+|---------|-----------|
+| `activate`'s `NativeLifecycleContext` | from `activate` until deactivation begins |
+| `deactivate`'s `NativeLifecycleContext` | the `deactivate` call |
+| `NativeCommandContext` | the command invocation |
+| `NativeServiceContext` (provider side) | the service invocation, bound to the provider's own id |
+
+A plugin may clone its activation context into its own background threads;
+those calls are attributed to the plugin as well. When deactivation begins
+the host cancels the activation registration, so every clone fails closed
+(the bridge returns status 2) even though the plugin still holds it.
+`deactivate` gets a fresh scope so the plugin can still clean up (for
+example clear its status items). Calls during `activate` work too: in the
+server process they are dispatched in-process, so they do not depend on the
+server listening yet.
+
+Security properties:
+
+- A plugin cannot claim another identity. The host never reads a caller id
+  from plugin data, rejects any raw `InvokeServiceAsPlugin` a plugin sends
+  through its bridge, and rejects unknown or cancelled tokens. Unbound
+  (legacy) bridges cannot relay at all.
+- A provider never receives its caller's registration: a dynamic provider
+  invoked in-process gets a bridge bound to its own id, so it cannot act as
+  the plugin that called it.
+- Capability checks run on the host against the manifest-derived
+  registration, so editing the plugin's copy of its context grants nothing.
+- Servers honor `InvokeServiceAsPlugin` attribution only from same-user local
+  streams, which are already inside the host trust boundary (they can run
+  `bmux plugin run <id> ...` themselves). Admitted (remote) streams may send
+  it, but the attribution is dropped and the call is treated as a plain
+  host-attributed request.
+- These guarantees cover the plugin API. Native plugin code runs in-process
+  with the user's privileges, so they are not a sandbox against plugin code
+  that bypasses the API (for example by opening its own socket connection).
+
+Compatibility: dynamic libraries built before the opt-in export keep their
+previous behavior. Hosts send them the unbound legacy bridge form, which they
+can decode (the frozen `NativeLifecycleContextV1` snapshot for native ABI 1.0
+is unchanged; only the bridge value inside it differs between bound and
+legacy). Such libraries cannot reach plugin-provided services through the
+host relay. Rebuild against the current SDK to get relay and attribution.
 
 ## Scene and rendering
 

@@ -36,6 +36,10 @@ use super::{
     run_plugin_keybinding_command_with_state, run_terminal_install_terminfo,
 };
 
+/// Caller id the host uses for invocations it originates itself (CLI,
+/// attach, server internals) rather than on a plugin's behalf.
+const HOST_CALLER_PLUGIN_ID: &str = "bmux.core";
+
 thread_local! {
     // A caller-process command can borrow the invoking transport through a
     // bounded request pump. Never substitute a fresh connection on this route.
@@ -52,7 +56,14 @@ static HOST_KERNEL_CLIENT_FACTORY_FALLBACK: OnceLock<Mutex<Option<KernelClientFa
     OnceLock::new();
 
 struct RetainedInvocation {
-    context: ServiceInvokeContext,
+    /// Server invocation whose transport bound kernel requests reuse. `None`
+    /// for plugin scopes created outside a server invocation (activation in a
+    /// server process before it listens, standalone CLI commands); their raw
+    /// kernel requests take the same routes as the legacy bridge.
+    context: Option<ServiceInvokeContext>,
+    /// Host-authenticated plugin identity and capabilities this registration
+    /// acts for. `None` for host-originated registrations.
+    caller: Option<Arc<bmux_plugin::TypedServiceCaller>>,
     owners: usize,
     cancellation: bmux_plugin_sdk::CancellationToken,
 }
@@ -71,9 +82,124 @@ impl OwnedKernelContext {
         Ok(Self(RetainedKernelContext::register(context)?))
     }
 
+    /// Register a scope that acts for one plugin. The plugin id and its
+    /// capabilities come from `caller`, which the host builds from the
+    /// plugin's declaration; nothing the plugin later sends can change them.
+    /// Authority ends when this owner drops, even while the plugin still
+    /// holds clones of the bridge.
+    pub(super) fn for_plugin(
+        caller: bmux_plugin::TypedServiceCaller,
+        context: Option<ServiceInvokeContext>,
+    ) -> Result<Self> {
+        Ok(Self(RetainedKernelContext::register_with(
+            context,
+            Some(caller),
+        )?))
+    }
+
     pub(super) fn bridge(&self) -> bmux_plugin_sdk::HostKernelBridge {
         self.0.bridge()
     }
+}
+
+/// Activation scopes of currently active plugins, keyed by plugin id.
+fn activation_scopes() -> &'static Mutex<BTreeMap<String, OwnedKernelContext>> {
+    static SCOPES: OnceLock<Mutex<BTreeMap<String, OwnedKernelContext>>> = OnceLock::new();
+    SCOPES.get_or_init(Mutex::default)
+}
+
+/// Start `context.plugin_id`'s activation scope and bind `context` to it.
+///
+/// The scope is the plugin's host authority from `activate` until
+/// deactivation begins: the context (and every clone a plugin keeps, for
+/// example on a background thread) calls services as this plugin.
+pub(super) fn begin_plugin_activation_scope(
+    context: &mut bmux_plugin_sdk::NativeLifecycleContext,
+) -> Result<()> {
+    let scope = OwnedKernelContext::for_plugin(
+        bmux_plugin::TypedServiceCaller::from_lifecycle_context(context)
+            .with_host_kernel_bridge(None),
+        None,
+    )?;
+    context.host_kernel_bridge = Some(scope.bridge());
+    let previous = activation_scopes()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("plugin activation scopes unavailable"))?
+        .insert(context.plugin_id.clone(), scope);
+    drop(previous);
+    Ok(())
+}
+
+/// End `plugin_id`'s activation scope. Every bridge clone issued for it fails
+/// closed from here on.
+pub(super) fn end_plugin_activation_scope(plugin_id: &str) {
+    let scope = activation_scopes()
+        .lock()
+        .ok()
+        .and_then(|mut scopes| scopes.remove(plugin_id));
+    drop(scope);
+}
+
+/// Bind `context` to a scope that lives only as long as the returned owner.
+/// Used for deactivation, which runs after the activation scope has ended.
+pub(super) fn bind_plugin_lifecycle_call(
+    context: &mut bmux_plugin_sdk::NativeLifecycleContext,
+) -> Result<OwnedKernelContext> {
+    let scope = OwnedKernelContext::for_plugin(
+        bmux_plugin::TypedServiceCaller::from_lifecycle_context(context)
+            .with_host_kernel_bridge(None),
+        None,
+    )?;
+    context.host_kernel_bridge = Some(scope.bridge());
+    Ok(scope)
+}
+
+/// Bind a command context to a scope that lives as long as the returned
+/// owner (the command invocation).
+pub(super) fn bind_plugin_command_call(
+    context: &mut bmux_plugin_sdk::NativeCommandContext,
+) -> Result<OwnedKernelContext> {
+    let scope = OwnedKernelContext::for_plugin(
+        bmux_plugin::TypedServiceCaller::from_command_context(context)
+            .with_host_kernel_bridge(None),
+        None,
+    )?;
+    context.host_kernel_bridge = Some(scope.bridge());
+    Ok(scope)
+}
+
+/// Install the host hook that gives in-process dynamic providers a bridge
+/// bound to their own identity instead of their caller's.
+pub(super) fn install_plugin_identity_hooks() {
+    bmux_plugin::install_dynamic_provider_bridge_binder(Arc::new(bind_dynamic_provider_bridge));
+}
+
+/// Bridge for one in-process invocation of a dynamic provider: bound to the
+/// provider's own identity, while raw kernel requests keep the caller's
+/// server invocation route (if any).
+fn bind_dynamic_provider_bridge(
+    caller_bridge: Option<&bmux_plugin_sdk::HostKernelBridge>,
+    provider: &bmux_plugin_sdk::NativeServiceContext,
+) -> Option<(
+    bmux_plugin_sdk::HostKernelBridge,
+    bmux_plugin::ProviderBridgeLease,
+)> {
+    let context = caller_bridge
+        .and_then(bmux_plugin_sdk::HostKernelBridge::token)
+        .and_then(|token| {
+            retained_kernel_contexts()
+                .lock()
+                .ok()
+                .and_then(|contexts| contexts.get(&token).and_then(|entry| entry.context.clone()))
+        });
+    let scope = OwnedKernelContext::for_plugin(
+        bmux_plugin::TypedServiceCaller::from_service_context(provider)
+            .with_host_kernel_bridge(None),
+        context,
+    )
+    .ok()?;
+    let bridge = scope.bridge();
+    Some((bridge, Box::new(scope) as bmux_plugin::ProviderBridgeLease))
 }
 
 impl Drop for OwnedKernelContext {
@@ -89,6 +215,13 @@ impl Drop for OwnedKernelContext {
 struct RetainedKernelContext(uuid::Uuid);
 impl RetainedKernelContext {
     fn register(context: ServiceInvokeContext) -> Result<Self> {
+        Self::register_with(Some(context), None)
+    }
+
+    fn register_with(
+        context: Option<ServiceInvokeContext>,
+        caller: Option<bmux_plugin::TypedServiceCaller>,
+    ) -> Result<Self> {
         let token = uuid::Uuid::new_v4();
         let mut contexts = retained_kernel_contexts()
             .lock()
@@ -101,6 +234,7 @@ impl RetainedKernelContext {
             token,
             RetainedInvocation {
                 context,
+                caller: caller.map(Arc::new),
                 owners: 1,
                 cancellation: bmux_plugin_sdk::CancellationToken::default(),
             },
@@ -289,9 +423,46 @@ fn clear_host_kernel_fallbacks_for_test() {
 // observes context changes by comparing before/after `current-context`
 // around a plugin command invocation.
 
-pub(super) fn call_host_kernel_via_client(
+/// Attach a host-authenticated plugin attribution to a typed service request
+/// when the connected server understands it. Older servers get the plain
+/// request, which they attribute to the host as before.
+fn attribute_kernel_request(
+    client: &BmuxClient,
+    request: bmux_ipc::Request,
+    attribution: Option<&str>,
+) -> bmux_ipc::Request {
+    let supported = client.negotiated_protocol().is_some_and(|protocol| {
+        protocol
+            .capabilities
+            .iter()
+            .any(|capability| capability == bmux_ipc::CAPABILITY_SERVICE_CALLER_PLUGIN_V1)
+    });
+    match (attribution, request) {
+        (
+            Some(caller_plugin_id),
+            bmux_ipc::Request::InvokeService {
+                capability,
+                kind,
+                interface_id,
+                operation,
+                payload,
+            },
+        ) if supported => bmux_ipc::Request::InvokeServiceAsPlugin {
+            caller_plugin_id: caller_plugin_id.to_string(),
+            capability,
+            kind,
+            interface_id,
+            operation,
+            payload,
+        },
+        (_, request) => request,
+    }
+}
+
+fn call_host_kernel_via_client_as(
     connection: &HostConnectionInfo,
     payload: &[u8],
+    attribution: Option<&str>,
 ) -> Result<Vec<u8>> {
     let request: bmux_ipc::Request =
         bmux_ipc::decode(payload).context("failed decoding kernel bridge request payload")?;
@@ -302,56 +473,49 @@ pub(super) fn call_host_kernel_via_client(
         connection.state_dir.clone().into(),
     );
     let request_name = "bmux-cli-host-kernel-bridge".to_string();
+    let run = || async {
+        let mut client = BmuxClient::connect_with_paths(&paths, &request_name).await?;
+        let request = attribute_kernel_request(&client, request.clone(), attribution);
+        client.request_raw(request).await
+    };
     let response: bmux_ipc::Response = if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        tokio::task::block_in_place(|| {
-            handle.block_on(async {
-                let mut client = BmuxClient::connect_with_paths(&paths, &request_name).await?;
-                client.request_raw(request.clone()).await
-            })
-        })
+        tokio::task::block_in_place(|| handle.block_on(run()))
     } else {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .context("failed creating kernel bridge runtime")?;
-        runtime.block_on(async {
-            let mut client = BmuxClient::connect_with_paths(&paths, &request_name).await?;
-            client.request_raw(request.clone()).await
-        })
+        runtime.block_on(run())
     }?;
     bmux_ipc::encode(&response).context("failed encoding kernel bridge response payload")
 }
 
-fn call_host_kernel_via_factory(factory: &KernelClientFactory, payload: &[u8]) -> Result<Vec<u8>> {
+fn call_host_kernel_via_factory_as(
+    factory: &KernelClientFactory,
+    payload: &[u8],
+    attribution: Option<&str>,
+) -> Result<Vec<u8>> {
     let request: bmux_ipc::Request =
         bmux_ipc::decode(payload).context("failed decoding kernel bridge request payload")?;
     let factory = Arc::clone(factory);
+    let run = || async {
+        let mut client = factory()
+            .await
+            .context("remote kernel bridge client factory failed")?;
+        let request = attribute_kernel_request(&client, request.clone(), attribution);
+        client
+            .request_raw(request)
+            .await
+            .context("remote kernel bridge request failed")
+    };
     let response: bmux_ipc::Response = if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        tokio::task::block_in_place(|| {
-            handle.block_on(async {
-                let mut client = factory()
-                    .await
-                    .context("remote kernel bridge client factory failed")?;
-                client
-                    .request_raw(request.clone())
-                    .await
-                    .context("remote kernel bridge request failed")
-            })
-        })
+        tokio::task::block_in_place(|| handle.block_on(run()))
     } else {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .context("failed creating kernel bridge runtime")?;
-        runtime.block_on(async {
-            let mut client = factory()
-                .await
-                .context("remote kernel bridge client factory failed")?;
-            client
-                .request_raw(request.clone())
-                .await
-                .context("remote kernel bridge request failed")
-        })
+        runtime.block_on(run())
     }?;
     bmux_ipc::encode(&response).context("failed encoding kernel bridge response payload")
 }
@@ -376,7 +540,11 @@ pub(super) fn enter_invoking_transport(
     InvokingTransportGuard
 }
 
-fn call_host_kernel_bridge_payload(payload: &[u8]) -> Result<Vec<u8>> {
+/// Route a raw kernel request. `attribution` names the plugin a bound
+/// registration authenticated for an `InvokeService` request; routes that can
+/// carry it do so, the borrowed invoking transport (whose peer and provenance
+/// are unknown here) keeps sending the plain request.
+fn call_host_kernel_bridge_payload(payload: &[u8], attribution: Option<&str>) -> Result<Vec<u8>> {
     if let Some(sender) = INVOKING_TRANSPORT.with(|slot| slot.borrow().clone()) {
         let request = bmux_ipc::decode(payload).context("invalid invoking transport request")?;
         let (response, receiver) = std::sync::mpsc::sync_channel(1);
@@ -389,6 +557,10 @@ fn call_host_kernel_bridge_payload(payload: &[u8]) -> Result<Vec<u8>> {
         return bmux_ipc::encode(&response).context("invalid invoking transport response");
     }
     if let Some(context) = SERVICE_KERNEL_CONTEXT.with(|slot| slot.borrow().clone()) {
+        let context = match attribution {
+            Some(plugin_id) => context.with_caller_plugin_id(plugin_id),
+            None => context,
+        };
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread {
                 return tokio::task::block_in_place(|| {
@@ -412,13 +584,13 @@ fn call_host_kernel_bridge_payload(payload: &[u8]) -> Result<Vec<u8>> {
             .context("failed creating kernel bridge runtime")?;
         runtime.block_on(async { context.execute_raw(payload.to_vec()).await })
     } else if let Some(factory) = HOST_KERNEL_CLIENT_FACTORY.with(|slot| slot.borrow().clone()) {
-        call_host_kernel_via_factory(&factory, payload)
+        call_host_kernel_via_factory_as(&factory, payload, attribution)
     } else if let Some(connection) = HOST_KERNEL_CONNECTION.with(|slot| slot.borrow().clone()) {
-        call_host_kernel_via_client(&connection, payload)
+        call_host_kernel_via_client_as(&connection, payload, attribution)
     } else if let Some(factory) = host_kernel_client_factory_fallback() {
-        call_host_kernel_via_factory(&factory, payload)
+        call_host_kernel_via_factory_as(&factory, payload, attribution)
     } else if let Some(connection) = host_kernel_connection_fallback() {
-        call_host_kernel_via_client(&connection, payload)
+        call_host_kernel_via_client_as(&connection, payload, attribution)
     } else {
         anyhow::bail!("no host kernel route is available")
     }
@@ -456,29 +628,50 @@ fn write_host_kernel_bridge_response(
     0
 }
 
+/// Host-side state resolved from a bridge request's token.
+struct ResolvedKernelScope {
+    _service_scope: Option<ServiceKernelContextGuard>,
+    token: Option<uuid::Uuid>,
+    caller: Option<Arc<bmux_plugin::TypedServiceCaller>>,
+    cancellation: bmux_plugin_sdk::CancellationToken,
+}
+
 fn enter_retained_kernel_context(
     token: Option<uuid::Uuid>,
-) -> std::result::Result<Option<ServiceKernelContextGuard>, ()> {
+) -> std::result::Result<ResolvedKernelScope, ()> {
     // Resolve before replay as well: stale registrations must not obtain cached
-    // output. Never consult thread-local/fallback state for a bound request.
-    let retained = if let Some(token) = token {
-        match retained_kernel_contexts().lock().ok().and_then(|contexts| {
+    // output. Never consult thread-local/fallback state for a bound request
+    // that carries a server invocation.
+    let Some(token) = token else {
+        return Ok(ResolvedKernelScope {
+            _service_scope: None,
+            token: None,
+            caller: None,
+            cancellation: bmux_plugin_sdk::CancellationToken::default(),
+        });
+    };
+    let Some((context, caller, cancellation)) =
+        retained_kernel_contexts().lock().ok().and_then(|contexts| {
             contexts
                 .get(&token)
                 .filter(|entry| !entry.cancellation.is_cancelled())
-                .map(|entry| entry.context.clone())
-        }) {
-            Some(context) => Some(context),
-            None => return Err(()),
-        }
-    } else {
-        None
+                .map(|entry| {
+                    (
+                        entry.context.clone(),
+                        entry.caller.clone(),
+                        entry.cancellation.clone(),
+                    )
+                })
+        })
+    else {
+        return Err(());
     };
-    let scope = retained.map(enter_service_kernel_context);
-    if token.is_some() {
+    let has_context = context.is_some();
+    let scope = context.map(enter_service_kernel_context);
+    if has_context {
         let valid = bmux_ipc::encode(&bmux_ipc::Request::CurrentStreamProvenance)
             .ok()
-            .and_then(|payload| call_host_kernel_bridge_payload(&payload).ok())
+            .and_then(|payload| call_host_kernel_bridge_payload(&payload, None).ok())
             .and_then(|bytes| bmux_ipc::decode::<bmux_ipc::Response>(&bytes).ok());
         if !matches!(
             valid,
@@ -494,7 +687,53 @@ fn enter_retained_kernel_context(
         }
     }
 
-    Ok(scope)
+    Ok(ResolvedKernelScope {
+        _service_scope: scope,
+        token: Some(token),
+        caller,
+        cancellation,
+    })
+}
+
+/// Dispatch a dynamic plugin's relayed service call with the host's own
+/// registries, as the plugin bound to the request's registration.
+///
+/// Identity, capabilities, and cancellation come from the registration; the
+/// relay request carries only the target route and payload.
+fn dispatch_plugin_service_relay(
+    scope: &ResolvedKernelScope,
+    request: &bmux_plugin_sdk::PluginServiceRelayRequest,
+) -> bmux_plugin_sdk::PluginServiceRelayResponse {
+    let (Some(token), Some(caller)) = (scope.token, scope.caller.as_ref()) else {
+        return bmux_plugin_sdk::PluginServiceRelayResponse::refused(
+            "plugin service relay requires a plugin-bound host context",
+        );
+    };
+    // Nested remote dispatch reuses this registration, so the remote side
+    // sees the same authenticated plugin.
+    let bridge = bmux_plugin_sdk::HostKernelBridge::bound(
+        host_kernel_bridge,
+        token,
+        retained_kernel_ownership,
+    );
+    let caller = bmux_plugin::TypedServiceCaller::clone(caller)
+        .with_host_kernel_bridge(Some(bridge))
+        .with_cancellation(scope.cancellation.clone());
+    let result = bmux_plugin::ServiceCaller::call_service_raw(
+        &caller,
+        &request.capability,
+        request.kind,
+        &request.interface_id,
+        &request.operation,
+        request.payload.clone(),
+    );
+    bmux_plugin_sdk::PluginServiceRelayResponse::from_result(request, result)
+}
+
+/// Kernel requests a plugin may never send through its bridge: identity
+/// assertions are constructed only by host code after resolving a token.
+const fn plugin_forbidden_kernel_request(request: &bmux_ipc::Request) -> bool {
+    matches!(request, bmux_ipc::Request::InvokeServiceAsPlugin { .. })
 }
 
 pub(super) unsafe extern "C" fn host_kernel_bridge(
@@ -515,7 +754,7 @@ pub(super) unsafe extern "C" fn host_kernel_bridge(
             Err(_) => return 3,
         };
 
-    let Ok(_retained_scope) = enter_retained_kernel_context(request.context_token) else {
+    let Ok(retained_scope) = enter_retained_kernel_context(request.context_token) else {
         return 2;
     };
 
@@ -535,59 +774,11 @@ pub(super) unsafe extern "C" fn host_kernel_bridge(
         );
     }
 
-    if let Ok(Some(command_request)) =
-        bmux_plugin_sdk::decode_host_kernel_bridge_cli_command_payload(&request.payload)
-    {
-        let response = match run_core_built_in_command(&command_request) {
-            Ok(exit_code) => bmux_plugin_sdk::CoreCliCommandResponse::new(exit_code),
-            Err(error) => bmux_plugin_sdk::CoreCliCommandResponse::failed(1, error.to_string()),
-        };
-        let Ok(payload) = bmux_plugin_sdk::encode_service_message(&response) else {
-            return 5;
-        };
-        let response = bmux_plugin_sdk::HostKernelBridgeResponse { payload };
-        let Ok(encoded) = bmux_plugin_sdk::encode_service_message(&response) else {
-            return 5;
-        };
-
-        return write_host_kernel_bridge_response(
-            request.invocation_id,
-            encoded,
-            output_ptr,
-            output_capacity,
-            output_len,
-        );
-    }
-
-    if let Ok(Some(command_request)) =
-        bmux_plugin_sdk::decode_host_kernel_bridge_plugin_command_payload(&request.payload)
-    {
-        let response = match run_plugin_bridge_command(&command_request) {
-            Ok(exit_code) => PluginCliCommandResponse::new(exit_code),
-            Err(error) => PluginCliCommandResponse::failed(1, error.to_string()),
-        };
-        let Ok(payload) = bmux_plugin_sdk::encode_service_message(&response) else {
-            return 5;
-        };
-        let response = bmux_plugin_sdk::HostKernelBridgeResponse { payload };
-        let Ok(encoded) = bmux_plugin_sdk::encode_service_message(&response) else {
-            return 5;
-        };
-
-        return write_host_kernel_bridge_response(
-            request.invocation_id,
-            encoded,
-            output_ptr,
-            output_capacity,
-            output_len,
-        );
-    }
-
-    let response = match call_host_kernel_bridge_payload(&request.payload) {
-        Ok(payload) => bmux_plugin_sdk::HostKernelBridgeResponse { payload },
-        Err(_) => return 5,
+    let payload = match bridge_response_payload(&request.payload, &retained_scope) {
+        Ok(payload) => payload,
+        Err(status) => return status,
     };
-
+    let response = bmux_plugin_sdk::HostKernelBridgeResponse { payload };
     let Ok(encoded) = bmux_plugin_sdk::encode_service_message(&response) else {
         return 5;
     };
@@ -599,6 +790,61 @@ pub(super) unsafe extern "C" fn host_kernel_bridge(
         output_capacity,
         output_len,
     )
+}
+
+/// Execute one bridge payload and return the response payload, or the bridge
+/// status to fail with.
+fn bridge_response_payload(
+    payload: &[u8],
+    scope: &ResolvedKernelScope,
+) -> std::result::Result<Vec<u8>, i32> {
+    if let Ok(Some(command_request)) =
+        bmux_plugin_sdk::decode_host_kernel_bridge_cli_command_payload(payload)
+    {
+        let response = match run_core_built_in_command(&command_request) {
+            Ok(exit_code) => bmux_plugin_sdk::CoreCliCommandResponse::new(exit_code),
+            Err(error) => bmux_plugin_sdk::CoreCliCommandResponse::failed(1, error.to_string()),
+        };
+        return bmux_plugin_sdk::encode_service_message(&response).map_err(|_| 5);
+    }
+
+    if let Ok(Some(command_request)) =
+        bmux_plugin_sdk::decode_host_kernel_bridge_plugin_command_payload(payload)
+    {
+        let response = match run_plugin_bridge_command(&command_request) {
+            Ok(exit_code) => PluginCliCommandResponse::new(exit_code),
+            Err(error) => PluginCliCommandResponse::failed(1, error.to_string()),
+        };
+        return bmux_plugin_sdk::encode_service_message(&response).map_err(|_| 5);
+    }
+
+    if let Ok(Some(relay_request)) =
+        bmux_plugin_sdk::decode_host_kernel_bridge_service_relay_payload(payload)
+    {
+        let response = dispatch_plugin_service_relay(scope, &relay_request);
+        return bmux_plugin_sdk::encode_service_message(&response).map_err(|_| 5);
+    }
+
+    let kernel_request = bmux_ipc::decode::<bmux_ipc::Request>(payload).ok();
+    if kernel_request
+        .as_ref()
+        .is_some_and(plugin_forbidden_kernel_request)
+    {
+        return Err(2);
+    }
+    // Typed service calls made through a plugin-bound registration are
+    // attributed to that plugin on whichever route carries them.
+    let attribution = scope
+        .caller
+        .as_ref()
+        .filter(|_| {
+            matches!(
+                kernel_request,
+                Some(bmux_ipc::Request::InvokeService { .. })
+            )
+        })
+        .map(|caller| caller.plugin_id().to_string());
+    call_host_kernel_bridge_payload(payload, attribution.as_deref()).map_err(|_| 5)
 }
 
 fn run_core_built_in_command(request: &bmux_plugin_sdk::CoreCliCommandRequest) -> Result<i32> {
@@ -996,53 +1242,69 @@ pub(super) fn register_plugin_service_handlers(
                         enter_service_kernel_context(invoke_context.clone());
                     let _host_kernel_connection_guard =
                         enter_host_kernel_connection(connection.clone());
-                    let retained = RetainedKernelContext::register(invoke_context.clone())?;
-                    let response =
-                        loaded_provider.invoke_service(&bmux_plugin_sdk::NativeServiceContext {
-                            plugin_id: provider_declaration.id.as_str().to_string(),
-                            request: ServiceRequest {
-                                caller_plugin_id: "bmux.core".to_string(),
-                                service: RegisteredService {
-                                    capability: HostScope::new(route.capability.as_str())?,
-                                    kind: match route.kind {
-                                        InvokeServiceKind::Query => ServiceKind::Query,
-                                        InvokeServiceKind::Command => ServiceKind::Command,
-                                    },
-                                    interface_id: route.interface_id,
-                                    provider: bmux_plugin_sdk::ProviderId::Plugin(
-                                        provider_declaration.id.as_str().to_string(),
-                                    ),
+                    // The caller is the plugin the host authenticated for
+                    // this invocation, or the host itself.
+                    let caller_plugin_id = invoke_context
+                        .caller_plugin_id()
+                        .unwrap_or(HOST_CALLER_PLUGIN_ID)
+                        .to_string();
+                    let mut service_context = bmux_plugin_sdk::NativeServiceContext {
+                        plugin_id: provider_declaration.id.as_str().to_string(),
+                        request: ServiceRequest {
+                            caller_plugin_id,
+                            service: RegisteredService {
+                                capability: HostScope::new(route.capability.as_str())?,
+                                kind: match route.kind {
+                                    InvokeServiceKind::Query => ServiceKind::Query,
+                                    InvokeServiceKind::Command => ServiceKind::Command,
                                 },
-                                operation: route.operation,
-                                payload,
+                                interface_id: route.interface_id,
+                                provider: bmux_plugin_sdk::ProviderId::Plugin(
+                                    provider_declaration.id.as_str().to_string(),
+                                ),
                             },
-                            required_capabilities: provider_declaration
-                                .required_capabilities
-                                .iter()
-                                .chain(provider_declaration.optional_capabilities.iter())
-                                .map(ToString::to_string)
-                                .collect(),
-                            provided_capabilities: provider_declaration
-                                .provided_capabilities
-                                .iter()
-                                .map(ToString::to_string)
-                                .collect(),
-                            services,
-                            available_capabilities: capability_names,
-                            enabled_plugins,
-                            plugin_search_roots,
-                            host,
-                            connection,
-                            settings: config
-                                .plugins
-                                .settings
-                                .get(provider_declaration.id.as_str())
-                                .cloned(),
-                            plugin_settings_map: config.plugins.settings.clone(),
-                            caller_client_id: Some(invoke_context.client_id().0),
-                            cancellation: retained.cancellation(),
-                            host_kernel_bridge: Some(retained.bridge()),
-                        })?;
+                            operation: route.operation,
+                            payload,
+                        },
+                        required_capabilities: provider_declaration
+                            .required_capabilities
+                            .iter()
+                            .chain(provider_declaration.optional_capabilities.iter())
+                            .map(ToString::to_string)
+                            .collect(),
+                        provided_capabilities: provider_declaration
+                            .provided_capabilities
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect(),
+                        services,
+                        available_capabilities: capability_names,
+                        enabled_plugins,
+                        plugin_search_roots,
+                        host,
+                        connection,
+                        settings: config
+                            .plugins
+                            .settings
+                            .get(provider_declaration.id.as_str())
+                            .cloned(),
+                        plugin_settings_map: config.plugins.settings.clone(),
+                        caller_client_id: Some(invoke_context.client_id().0),
+                        cancellation: bmux_plugin_sdk::CancellationToken::default(),
+                        host_kernel_bridge: None,
+                    };
+                    // A relaying dynamic provider's nested calls act as the
+                    // provider, never as its caller. Bundled providers keep the
+                    // host-attributed registration.
+                    let retained = RetainedKernelContext::register_with(
+                        Some(invoke_context.clone()),
+                        loaded_provider.uses_host_relay().then(|| {
+                            bmux_plugin::TypedServiceCaller::from_service_context(&service_context)
+                        }),
+                    )?;
+                    service_context.cancellation = retained.cancellation();
+                    service_context.host_kernel_bridge = Some(retained.bridge());
+                    let response = loaded_provider.invoke_service(&service_context)?;
                     let elapsed_us = started_at.elapsed().as_micros();
                     tracing::trace!(
                         target: "bmux_cli::plugin_service",
@@ -1217,7 +1479,7 @@ mod tests {
         tokio::task::spawn_blocking(move || {
             // A bound bridge must ignore a different ambient owner.
             let second_context = retained_kernel_contexts().lock().unwrap()
-                .get(&second_bridge.token().unwrap()).unwrap().context.clone();
+                .get(&second_bridge.token().unwrap()).unwrap().context.clone().unwrap();
             let _ambient = enter_service_kernel_context(second_context);
             for (bridge, value) in [(&first_bridge, 1), (&second_bridge, 2)] {
                 assert!(matches!(
@@ -1242,6 +1504,8 @@ mod tests {
         }).await.unwrap();
     }
 
+    // One end-to-end scenario; splitting it would scatter the scope setup.
+    #[allow(clippy::too_many_lines)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn nested_service_kernel_scope_restores_bound_parent() {
         // Nix's TMPDIR can be long; keep the socket name short enough for
@@ -1281,9 +1545,10 @@ mod tests {
                             .client_id()),
                         id
                     );
-                    let response = call_host_kernel_bridge_payload(&bmux_ipc::encode(
-                        &bmux_ipc::Request::CurrentStreamProvenance,
-                    )?)?;
+                    let response = call_host_kernel_bridge_payload(
+                        &bmux_ipc::encode(&bmux_ipc::Request::CurrentStreamProvenance)?,
+                        None,
+                    )?;
                     assert!(matches!(
                         bmux_ipc::decode::<bmux_ipc::Response>(&response)?,
                         bmux_ipc::Response::Ok(
@@ -1699,5 +1964,424 @@ mod tests {
         assert!(HOST_KERNEL_CLIENT_FACTORY.with(|slot| slot.borrow().is_none()));
         let fallback = host_kernel_client_factory_fallback().expect("fallback factory is retained");
         assert!(std::ptr::addr_eq(Arc::as_ptr(&fallback), expected));
+    }
+
+    // ── Plugin identity: relay, forgery, and revocation ─────────────────
+
+    const STATUS_WRITE: &str = "test.status.write";
+    const STATUS_INTERFACE: &str = "status/v1";
+
+    fn plugin_lifecycle_context(
+        plugin_id: &str,
+        required: &[&str],
+    ) -> bmux_plugin_sdk::NativeLifecycleContext {
+        bmux_plugin_sdk::NativeLifecycleContext {
+            plugin_id: plugin_id.to_string(),
+            required_capabilities: required.iter().map(ToString::to_string).collect(),
+            provided_capabilities: Vec::new(),
+            services: vec![RegisteredService {
+                capability: HostScope::new(STATUS_WRITE).unwrap(),
+                kind: ServiceKind::Command,
+                interface_id: STATUS_INTERFACE.to_string(),
+                provider: bmux_plugin_sdk::ProviderId::Plugin("test.provider".into()),
+            }],
+            available_capabilities: vec![STATUS_WRITE.to_string()],
+            enabled_plugins: vec![plugin_id.to_string(), "test.provider".to_string()],
+            plugin_search_roots: Vec::new(),
+            registered_plugins: Vec::new(),
+            host: plugin_host_metadata(),
+            connection: connection("identity"),
+            settings: None,
+            plugin_settings_map: BTreeMap::new(),
+            host_kernel_bridge: None,
+            auxiliary_executables: BTreeMap::new(),
+            auxiliary_executable_errors: BTreeMap::new(),
+        }
+    }
+
+    /// Send raw bridge payload bytes the way a dynamic plugin does. Returns
+    /// the bridge status and, on success, the response payload.
+    fn invoke_bridge_payload(
+        bridge: &bmux_plugin_sdk::HostKernelBridge,
+        token: Option<uuid::Uuid>,
+        payload: Vec<u8>,
+    ) -> std::result::Result<Vec<u8>, i32> {
+        let mut envelope = bmux_plugin_sdk::HostKernelBridgeRequest::new(payload);
+        envelope.context_token = token;
+        let bytes = bmux_plugin_sdk::encode_service_message(&envelope).unwrap();
+        let mut output = vec![0; 65536];
+        let mut len = 0;
+        let status = bridge.invoke(
+            bytes.as_ptr(),
+            bytes.len(),
+            output.as_mut_ptr(),
+            output.len(),
+            &raw mut len,
+        );
+        if status != 0 {
+            return Err(status);
+        }
+        let response: bmux_plugin_sdk::HostKernelBridgeResponse =
+            bmux_plugin_sdk::decode_service_message(&output[..len]).unwrap();
+        Ok(response.payload)
+    }
+
+    fn relay_request(capability: &str) -> bmux_plugin_sdk::PluginServiceRelayRequest {
+        bmux_plugin_sdk::PluginServiceRelayRequest {
+            capability: capability.to_string(),
+            kind: ServiceKind::Command,
+            interface_id: STATUS_INTERFACE.to_string(),
+            operation: "set".to_string(),
+            payload: b"item".to_vec(),
+        }
+    }
+
+    fn relay(
+        bridge: &bmux_plugin_sdk::HostKernelBridge,
+        token: Option<uuid::Uuid>,
+        request: &bmux_plugin_sdk::PluginServiceRelayRequest,
+    ) -> std::result::Result<std::result::Result<Vec<u8>, String>, i32> {
+        let payload =
+            bmux_plugin_sdk::encode_host_kernel_bridge_service_relay_payload(request).unwrap();
+        invoke_bridge_payload(bridge, token, payload).map(|bytes| {
+            let response: bmux_plugin_sdk::PluginServiceRelayResponse =
+                bmux_plugin_sdk::decode_service_message(&bytes).unwrap();
+            response
+                .into_result(request)
+                .map_err(|error| error.to_string())
+        })
+    }
+
+    /// Record which caller the host dispatched each relayed call as.
+    // The router signature is fixed by `TestServiceRouter`'s `PluginError`.
+    #[allow(clippy::result_large_err)]
+    fn record_callers() -> (
+        bmux_plugin::test_support::TestServiceRouterGuard,
+        Arc<Mutex<Vec<String>>>,
+    ) {
+        let callers = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&callers);
+        let guard = bmux_plugin::test_support::install_test_service_router(Arc::new(
+            move |caller, _client, _capability, _kind, _interface, _operation, payload| {
+                seen.lock().unwrap().push(caller.to_string());
+                Ok(payload)
+            },
+        ));
+        (guard, callers)
+    }
+
+    #[test]
+    fn relayed_calls_are_attributed_to_the_bound_plugin_from_any_thread() {
+        let mut context = plugin_lifecycle_context("example.dynamic", &[STATUS_WRITE]);
+        begin_plugin_activation_scope(&mut context).unwrap();
+        let bridge = context.host_kernel_bridge.clone().unwrap();
+        let token = bridge.token();
+        let (_router, callers) = record_callers();
+        assert_eq!(
+            relay(&bridge, token, &relay_request(STATUS_WRITE)).unwrap(),
+            Ok(b"item".to_vec())
+        );
+        // A clone kept by a plugin-owned thread acts for the same plugin.
+        let background = bridge;
+        let (thread_caller, thread_result) = std::thread::spawn(move || {
+            let (_router, callers) = record_callers();
+            let result = relay(
+                &background,
+                background.token(),
+                &relay_request(STATUS_WRITE),
+            );
+            (callers.lock().unwrap().clone(), result)
+        })
+        .join()
+        .unwrap();
+        assert_eq!(thread_result.unwrap(), Ok(b"item".to_vec()));
+        assert_eq!(thread_caller, vec!["example.dynamic".to_string()]);
+        assert_eq!(
+            *callers.lock().unwrap(),
+            vec!["example.dynamic".to_string()]
+        );
+        end_plugin_activation_scope("example.dynamic");
+    }
+
+    #[test]
+    fn plugins_cannot_forge_identity_through_the_bridge() {
+        let mut victim = plugin_lifecycle_context("plugin.victim", &[STATUS_WRITE]);
+        begin_plugin_activation_scope(&mut victim).unwrap();
+        let mut attacker = plugin_lifecycle_context("plugin.attacker", &[STATUS_WRITE]);
+        begin_plugin_activation_scope(&mut attacker).unwrap();
+        let attacker_bridge = attacker.host_kernel_bridge.clone().unwrap();
+        let (_router, callers) = record_callers();
+
+        // A claimed identity in a raw kernel request is refused outright,
+        // through bound and legacy bridges alike.
+        let forged = bmux_ipc::encode(&bmux_ipc::Request::InvokeServiceAsPlugin {
+            caller_plugin_id: "plugin.victim".into(),
+            capability: STATUS_WRITE.into(),
+            kind: bmux_ipc::InvokeServiceKind::Command,
+            interface_id: STATUS_INTERFACE.into(),
+            operation: "set".into(),
+            payload: Vec::new(),
+        })
+        .unwrap();
+        assert_eq!(
+            invoke_bridge_payload(&attacker_bridge, attacker_bridge.token(), forged.clone()),
+            Err(2)
+        );
+        let legacy = bmux_plugin_sdk::HostKernelBridge::from_fn(host_kernel_bridge);
+        assert_eq!(invoke_bridge_payload(&legacy, None, forged), Err(2));
+
+        // A guessed token is not a registration.
+        assert_eq!(
+            relay(
+                &attacker_bridge,
+                Some(uuid::Uuid::new_v4()),
+                &relay_request(STATUS_WRITE)
+            ),
+            Err(2)
+        );
+
+        // Relay needs a plugin-bound registration: unbound and host-only
+        // registrations cannot borrow any plugin identity.
+        let unbound = relay(&legacy, None, &relay_request(STATUS_WRITE)).unwrap();
+        assert!(unbound.unwrap_err().contains("plugin-bound host context"));
+        let host_only = RetainedKernelContext::register_with(None, None).unwrap();
+        let host_bridge = host_only.bridge();
+        let host_only_result = relay(
+            &host_bridge,
+            host_bridge.token(),
+            &relay_request(STATUS_WRITE),
+        )
+        .unwrap();
+        assert!(
+            host_only_result
+                .unwrap_err()
+                .contains("plugin-bound host context")
+        );
+
+        // The attacker's own relay is attributed to the attacker only.
+        relay(
+            &attacker_bridge,
+            attacker_bridge.token(),
+            &relay_request(STATUS_WRITE),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            *callers.lock().unwrap(),
+            vec!["plugin.attacker".to_string()]
+        );
+
+        end_plugin_activation_scope("plugin.victim");
+        end_plugin_activation_scope("plugin.attacker");
+    }
+
+    #[test]
+    fn dynamic_providers_never_inherit_their_callers_identity() {
+        let mut victim = plugin_lifecycle_context("plugin.caller", &[STATUS_WRITE]);
+        begin_plugin_activation_scope(&mut victim).unwrap();
+        let (_router, callers) = record_callers();
+        // A dynamic provider receives a bridge bound to itself, never the
+        // caller's: it cannot act as the plugin that called it.
+        let victim_bridge = victim.host_kernel_bridge.clone().unwrap();
+        let provider = bmux_plugin_sdk::NativeServiceContext {
+            plugin_id: "plugin.attacker".into(),
+            request: ServiceRequest {
+                caller_plugin_id: "plugin.caller".into(),
+                service: victim.services[0].clone(),
+                operation: "set".into(),
+                payload: Vec::new(),
+            },
+            required_capabilities: vec![STATUS_WRITE.into()],
+            provided_capabilities: Vec::new(),
+            services: victim.services.clone(),
+            available_capabilities: victim.available_capabilities.clone(),
+            enabled_plugins: victim.enabled_plugins.clone(),
+            plugin_search_roots: Vec::new(),
+            host: plugin_host_metadata(),
+            connection: connection("identity"),
+            settings: None,
+            plugin_settings_map: BTreeMap::new(),
+            caller_client_id: None,
+            cancellation: bmux_plugin_sdk::CancellationToken::default(),
+            host_kernel_bridge: None,
+        };
+        let (provider_bridge, lease) =
+            bind_dynamic_provider_bridge(Some(&victim_bridge), &provider).unwrap();
+        assert_ne!(provider_bridge.token(), victim_bridge.token());
+        relay(
+            &provider_bridge,
+            provider_bridge.token(),
+            &relay_request(STATUS_WRITE),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            *callers.lock().unwrap(),
+            vec!["plugin.attacker".to_string()]
+        );
+        drop(lease);
+        assert_eq!(
+            relay(
+                &provider_bridge,
+                provider_bridge.token(),
+                &relay_request(STATUS_WRITE)
+            ),
+            Err(2)
+        );
+
+        end_plugin_activation_scope("plugin.caller");
+    }
+
+    #[test]
+    fn relayed_calls_respect_host_declared_capabilities() {
+        // The host checks the capabilities it recorded for the plugin, not
+        // anything in the plugin's copy of its context.
+        let mut context = plugin_lifecycle_context("example.limited", &[]);
+        begin_plugin_activation_scope(&mut context).unwrap();
+        let bridge = context.host_kernel_bridge.clone().unwrap();
+        let denied = relay(&bridge, bridge.token(), &relay_request(STATUS_WRITE)).unwrap();
+        let denied = denied.unwrap_err();
+        assert!(denied.contains(STATUS_WRITE), "{denied}");
+        assert!(denied.contains("capability"), "{denied}");
+        end_plugin_activation_scope("example.limited");
+    }
+
+    #[test]
+    fn plugin_scopes_fail_closed_after_deactivation_and_command_completion() {
+        let mut context = plugin_lifecycle_context("example.ended", &[STATUS_WRITE]);
+        begin_plugin_activation_scope(&mut context).unwrap();
+        let kept = context.host_kernel_bridge.clone().unwrap();
+        let (_router, callers) = record_callers();
+        relay(&kept, kept.token(), &relay_request(STATUS_WRITE))
+            .unwrap()
+            .unwrap();
+
+        end_plugin_activation_scope("example.ended");
+        // Clones kept from activation (e.g. by a background thread) are dead,
+        // and so is any clone made from them afterwards.
+        assert_eq!(
+            relay(&kept, kept.token(), &relay_request(STATUS_WRITE)),
+            Err(2)
+        );
+        let recloned = kept.clone();
+        assert_eq!(
+            relay(&recloned, recloned.token(), &relay_request(STATUS_WRITE)),
+            Err(2)
+        );
+        let raw_kernel = bmux_ipc::encode(&bmux_ipc::Request::Ping).unwrap();
+        assert_eq!(
+            invoke_bridge_payload(&kept, kept.token(), raw_kernel),
+            Err(2)
+        );
+
+        // Deactivation gets its own scope that ends when it returns.
+        let mut deactivate = plugin_lifecycle_context("example.ended", &[STATUS_WRITE]);
+        let deactivation = bind_plugin_lifecycle_call(&mut deactivate).unwrap();
+        let during = deactivate.host_kernel_bridge.clone().unwrap();
+        relay(&during, during.token(), &relay_request(STATUS_WRITE))
+            .unwrap()
+            .unwrap();
+        drop(deactivation);
+        assert_eq!(
+            relay(&during, during.token(), &relay_request(STATUS_WRITE)),
+            Err(2)
+        );
+
+        // Command scopes end with the invocation.
+        let mut command = bmux_plugin_sdk::NativeCommandContext {
+            plugin_id: "example.ended".into(),
+            command: "status-set".into(),
+            arguments: Vec::new(),
+            required_capabilities: vec![STATUS_WRITE.into()],
+            provided_capabilities: Vec::new(),
+            services: context.services.clone(),
+            available_capabilities: context.available_capabilities.clone(),
+            enabled_plugins: context.enabled_plugins.clone(),
+            plugin_search_roots: Vec::new(),
+            registered_plugins: Vec::new(),
+            active_keybindings: Vec::new(),
+            host: plugin_host_metadata(),
+            connection: connection("identity"),
+            settings: None,
+            plugin_settings_map: BTreeMap::new(),
+            caller_client_id: None,
+            invocation_source: bmux_plugin_sdk::NativeCommandInvocationSource::Cli,
+            host_kernel_bridge: None,
+        };
+        let command_scope = bind_plugin_command_call(&mut command).unwrap();
+        let command_bridge = command.host_kernel_bridge.clone().unwrap();
+        relay(
+            &command_bridge,
+            command_bridge.token(),
+            &relay_request(STATUS_WRITE),
+        )
+        .unwrap()
+        .unwrap();
+        drop(command_scope);
+        assert_eq!(
+            relay(
+                &command_bridge,
+                command_bridge.token(),
+                &relay_request(STATUS_WRITE)
+            ),
+            Err(2)
+        );
+        assert_eq!(
+            *callers.lock().unwrap(),
+            vec!["example.ended".to_string(); 3]
+        );
+    }
+
+    #[tokio::test]
+    async fn raw_service_requests_through_a_plugin_scope_carry_its_identity() {
+        let directory = private_scope_directory();
+        let server = BmuxServer::new(bmux_ipc::IpcEndpoint::unix_socket(
+            directory.path().join("s"),
+        ));
+        server
+            .register_service_handler(
+                "test.whoami",
+                bmux_ipc::InvokeServiceKind::Query,
+                "whoami/v1",
+                "read",
+                |_, context, _| async move {
+                    Ok(context
+                        .caller_plugin_id()
+                        .unwrap_or("<host>")
+                        .as_bytes()
+                        .to_vec())
+                },
+            )
+            .unwrap();
+        let context = plugin_lifecycle_context("example.raw", &[]);
+        let scope = OwnedKernelContext::for_plugin(
+            bmux_plugin::TypedServiceCaller::from_lifecycle_context(&context),
+            Some(server.host_service_context()),
+        )
+        .unwrap();
+        let plugin_bridge = scope.bridge();
+        let host = OwnedKernelContext::new(server.host_service_context()).unwrap();
+        let host_bridge = host.bridge();
+        tokio::task::spawn_blocking(move || {
+            let request = bmux_ipc::Request::InvokeService {
+                capability: "test.whoami".into(),
+                kind: bmux_ipc::InvokeServiceKind::Query,
+                interface_id: "whoami/v1".into(),
+                operation: "read".into(),
+                payload: Vec::new(),
+            };
+            for (bridge, expected) in [(&plugin_bridge, "example.raw"), (&host_bridge, "<host>")] {
+                let response = invoke_test_bridge(Some(bridge.clone()), &request).unwrap();
+                assert!(
+                    matches!(&response, bmux_ipc::ResponsePayload::ServiceInvoked { payload } if payload == expected.as_bytes()),
+                    "{response:?}"
+                );
+            }
+            drop(scope);
+            assert!(invoke_test_bridge(Some(plugin_bridge), &request).is_err());
+            drop(host);
+        })
+        .await
+        .unwrap();
     }
 }

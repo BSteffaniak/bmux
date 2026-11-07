@@ -12,7 +12,12 @@ use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::{
     COMMAND_OUTCOME_STATUS_MESSAGE_KEY, EXIT_USAGE, record_command_outcome_metadata,
 };
-use bmux_tab_bar_plugin_api::{notifications, status_items, status_items_list::Severity};
+use bmux_tab_bar_plugin_api::{
+    notifications, status_items, status_items_list::Severity, status_items_state,
+};
+use std::sync::Mutex;
+use std::sync::mpsc;
+use std::thread::JoinHandle;
 
 fn parse_severity(value: &str) -> Option<Severity> {
     match value {
@@ -178,6 +183,122 @@ pub fn run_notify(context: &NativeCommandContext) -> i32 {
         Err(error) => {
             eprintln!("example.native: notifications service unavailable: {error}");
             EXIT_ERROR
+        }
+    }
+}
+
+/// `status-list` — list every plugin's status items as `owner/id: text`.
+///
+/// The owner column is assigned by the host, so it shows which plugin the
+/// tab bar attributed each item to (this plugin's items show
+/// `example.native`).
+pub fn run_status_list(context: &NativeCommandContext) -> i32 {
+    let mut client = ServiceCallerDispatchClient::new(context);
+    match block_on_typed_dispatch(status_items_state::client::list_status_items(
+        &mut client,
+        context.arguments.first().cloned(),
+    )) {
+        Ok(items) => {
+            if items.is_empty() {
+                println!("no status items");
+            }
+            for item in items {
+                println!("{}/{}: {}", item.owner, item.id, item.text);
+            }
+            EXIT_OK
+        }
+        Err(error) => {
+            eprintln!("example.native: status-items-state service unavailable: {error}");
+            EXIT_ERROR
+        }
+    }
+}
+
+fn set_item(caller: &NativeLifecycleContext, id: &str, text: &str) -> Result<(), String> {
+    let mut client = ServiceCallerDispatchClient::new(caller);
+    match block_on_typed_dispatch(status_items::client::set_status_item(
+        &mut client,
+        id.to_string(),
+        text.to_string(),
+        Severity::Info,
+        0,
+        None,
+    )) {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(format!("{error:?}")),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+/// Background thread started from `activate` that keeps a clone of the
+/// activation context, the pattern a plugin uses for periodic status
+/// updates.
+struct BackgroundStatus {
+    stop: mpsc::Sender<()>,
+    thread: JoinHandle<String>,
+}
+
+fn background_status() -> &'static Mutex<Option<BackgroundStatus>> {
+    static SLOT: Mutex<Option<BackgroundStatus>> = Mutex::new(None);
+    &SLOT
+}
+
+/// Opt-in demo (`[plugins.settings."example.native"] background_status =
+/// true`): publish a status item from `activate` itself and another from a
+/// background thread holding a clone of the activation context.
+///
+/// Both calls are attributed to this plugin by the host. The activation
+/// context stops working once deactivation begins, which the thread reports
+/// when `deactivate` stops it.
+pub fn start_background_status(context: &NativeLifecycleContext) {
+    // Compare the rendered value so this example need not depend on `toml`.
+    let enabled = context
+        .settings
+        .as_ref()
+        .and_then(|settings| settings.get("background_status"))
+        .is_some_and(|value| value.to_string() == "true");
+    if !enabled {
+        return;
+    }
+    match set_item(context, "activate", "set during activate") {
+        Ok(()) => println!("example.native: status item set during activate"),
+        Err(error) => println!("example.native: status item during activate failed: {error}"),
+    }
+    let (stop, stopped) = mpsc::channel::<()>();
+    let caller = context.clone();
+    let thread = std::thread::spawn(move || {
+        match set_item(&caller, "background", "set from a background thread") {
+            Ok(()) => println!("example.native: status item set from background thread"),
+            Err(error) => {
+                println!("example.native: background status item failed: {error}");
+            }
+        }
+        let _ = stopped.recv();
+        match set_item(&caller, "background", "set after deactivation") {
+            Ok(()) => "was accepted".to_string(),
+            Err(error) => format!("was rejected: {error}"),
+        }
+    });
+    if let Ok(mut slot) = background_status().lock() {
+        *slot = Some(BackgroundStatus { stop, thread });
+    }
+}
+
+/// Stop the background thread and report whether its post-deactivation call
+/// went through. Runs from `deactivate`, after the host ended the activation
+/// scope.
+pub fn stop_background_status() {
+    let background = background_status()
+        .lock()
+        .ok()
+        .and_then(|mut slot| slot.take());
+    if let Some(BackgroundStatus { stop, thread }) = background {
+        let _ = stop.send(());
+        match thread.join() {
+            Ok(outcome) => {
+                println!("example.native: background call after deactivation {outcome}");
+            }
+            Err(_) => println!("example.native: background status thread panicked"),
         }
     }
 }

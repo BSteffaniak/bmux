@@ -144,6 +144,20 @@ impl TypedServiceCaller {
     pub fn plugin_id(&self) -> &str {
         &self.plugin_id
     }
+
+    /// Replace the host bridge used for remote dispatch and kernel requests.
+    #[must_use]
+    pub fn with_host_kernel_bridge(mut self, bridge: Option<HostKernelBridge>) -> Self {
+        self.host_kernel_bridge = bridge;
+        self
+    }
+
+    /// Replace the cancellation scope checked before each dispatch.
+    #[must_use]
+    pub fn with_cancellation(mut self, cancellation: bmux_plugin_sdk::CancellationToken) -> Self {
+        self.cancellation = Some(cancellation);
+        self
+    }
 }
 
 impl ServiceCaller for TypedServiceCaller {

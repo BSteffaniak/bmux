@@ -12,13 +12,18 @@ required_capabilities = [
     "bmux.tabs.read",
     "bmux.tabs.write",
     "bmux.tab_bar.notify",
+    "bmux.tab_bar.status.read",
     "bmux.tab_bar.status.write",
 ]
 runtime = "native"
 version = "0.0.1-alpha.0"
 
+# Commands are reached through `bmux plugin run example.native <command>`.
+# They are not exposed as top-level CLI paths: that would require claiming
+# them with `owns_paths`/`owns_namespaces`.
+
 [[commands]]
-expose_in_cli = true
+expose_in_cli = false
 name          = "hello"
 summary       = "Print a hello message"
 
@@ -33,12 +38,12 @@ trailing_var_arg    = true
 value_name          = "MESSAGE"
 
 [[commands]]
-expose_in_cli = true
+expose_in_cli = false
 name          = "prompt-showcase"
 summary       = "Queue plugin-provided attach prompts (requires active attach host)"
 
 [[commands]]
-expose_in_cli = true
+expose_in_cli = false
 name          = "permissions-list"
 summary       = "List session permissions through bmux provider service"
 
@@ -51,7 +56,7 @@ summary    = "Session name or UUID"
 value_name = "SESSION"
 
 [[commands]]
-expose_in_cli = true
+expose_in_cli = false
 name          = "permissions-grant"
 summary       = "Grant a role through bmux provider service"
 
@@ -83,7 +88,7 @@ value_name = "ROLE"
 values     = ["owner", "writer", "observer"]
 
 [[commands]]
-expose_in_cli = true
+expose_in_cli = false
 name          = "permissions-revoke"
 summary       = "Revoke a role through bmux provider service"
 
@@ -105,7 +110,7 @@ summary    = "Client UUID"
 value_name = "CLIENT"
 
 [[commands]]
-expose_in_cli = true
+expose_in_cli = false
 name          = "tabs-list"
 summary       = "List session windows through bmux provider service"
 
@@ -118,7 +123,7 @@ summary    = "Session name or UUID"
 value_name = "SESSION"
 
 [[commands]]
-expose_in_cli = true
+expose_in_cli = false
 name          = "windows-new"
 summary       = "Create a session window through bmux provider service"
 
@@ -139,12 +144,12 @@ summary    = "Optional window name"
 value_name = "NAME"
 
 [[commands]]
-expose_in_cli = true
+expose_in_cli = false
 name          = "settings-show"
 summary       = "Show plugin settings through bmux config service"
 
 [[commands]]
-expose_in_cli = true
+expose_in_cli = false
 name          = "storage-put"
 summary       = "Store a key/value through bmux storage service"
 
@@ -168,7 +173,7 @@ trailing_var_arg    = true
 value_name          = "VALUE"
 
 [[commands]]
-expose_in_cli = true
+expose_in_cli = false
 name          = "storage-get"
 summary       = "Read a key through bmux storage service"
 
@@ -181,7 +186,7 @@ summary    = "Storage key"
 value_name = "KEY"
 
 [[commands]]
-expose_in_cli = true
+expose_in_cli = false
 name          = "status-set"
 summary       = "Show a status item in the tab bar through the bmux.tab_bar service"
 
@@ -205,7 +210,7 @@ trailing_var_arg    = true
 value_name          = "TEXT"
 
 [[commands]]
-expose_in_cli = true
+expose_in_cli = false
 name          = "status-clear"
 summary       = "Clear one (or every) status item this plugin owns"
 
@@ -217,7 +222,19 @@ summary    = "Item id; omit to clear all of this plugin's items"
 value_name = "ID"
 
 [[commands]]
-expose_in_cli = true
+expose_in_cli = false
+name          = "status-list"
+summary       = "List every plugin's tab-bar status items as owner/id: text"
+
+[[commands.arguments]]
+kind       = "string"
+name       = "owner"
+position   = 0
+summary    = "Only list items owned by this plugin id"
+value_name = "OWNER"
+
+[[commands]]
+expose_in_cli = false
 name          = "notify"
 summary       = "Raise an attach toast through the bmux.tab_bar service"
 

@@ -45,6 +45,7 @@ impl RustPlugin for ExamplePlugin {
             "prompt-showcase" => Ok(run_prompt_showcase_command()),
             "status-set" => Ok(tab_bar::run_status_set(&context)),
             "status-clear" => Ok(tab_bar::run_status_clear(&context)),
+            "status-list" => Ok(tab_bar::run_status_list(&context)),
             "notify" => Ok(tab_bar::run_notify(&context)),
             "hello" => {
                 if context.arguments.is_empty() {
@@ -62,6 +63,7 @@ impl RustPlugin for ExamplePlugin {
         context: bmux_plugin_sdk::NativeLifecycleContext,
     ) -> Result<i32, PluginCommandError> {
         println!("example.native: activated {}", context.plugin_id);
+        tab_bar::start_background_status(&context);
         Ok(EXIT_OK)
     }
 
@@ -69,6 +71,7 @@ impl RustPlugin for ExamplePlugin {
         &mut self,
         context: bmux_plugin_sdk::NativeLifecycleContext,
     ) -> Result<i32, PluginCommandError> {
+        tab_bar::stop_background_status();
         tab_bar::clear_on_deactivate(&context);
         println!("example.native: deactivated {}", context.plugin_id);
         Ok(EXIT_OK)
@@ -683,7 +686,7 @@ mod tests {
         let manifest = bmux_plugin::PluginManifest::from_toml_str(include_str!("../plugin.toml"))
             .expect("manifest should parse");
         assert_eq!(manifest.id, "example.native");
-        assert_eq!(manifest.commands.len(), 13);
+        assert_eq!(manifest.commands.len(), 14);
         let declaration = manifest.to_declaration().expect("manifest should validate");
         assert_eq!(declaration.id.as_str(), "example.native");
     }

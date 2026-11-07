@@ -1603,6 +1603,7 @@ const fn request_kind_name(request: &Request) -> &'static str {
         Request::ServerStatus => "server_status",
         Request::ServerStop => "server_stop",
         Request::InvokeService { .. } => "invoke_service",
+        Request::InvokeServiceAsPlugin { .. } => "invoke_service_as_plugin",
         Request::InvokeServicePipeline { .. } => "invoke_service_pipeline",
         Request::EmitOnPluginBus { .. } => "emit_on_plugin_bus",
         Request::SubscribeEvents => "subscribe_events",
