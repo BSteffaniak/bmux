@@ -1319,8 +1319,8 @@ impl From<crate::theme::ComponentTheme> for PanelGroupStyles {
         let theme = theme.for_surface(crate::theme::ComponentSurfaceDepth::Normal);
         Self {
             divider: theme.border,
-            hovered_divider: theme.info,
-            active_divider: theme.focused,
+            hovered_divider: theme.hover,
+            active_divider: theme.border_focused,
         }
     }
 }

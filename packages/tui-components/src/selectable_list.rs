@@ -1594,7 +1594,7 @@ impl From<crate::theme::ComponentTheme> for SelectableListStyles {
             normal: theme.text,
             focused: theme.focused,
             selected: theme.selected,
-            hovered: theme.info,
+            hovered: theme.hover,
             pressed: theme.selected.add_modifier(bmux_tui::style::Modifier::BOLD),
             disabled: theme.disabled,
         }

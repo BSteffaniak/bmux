@@ -43,7 +43,7 @@ pub use image_terminal_presenter::{
     AsyncImageTerminalPresenter, ImagePresentationError, ImageTerminalPresenter,
 };
 #[cfg(feature = "crossterm")]
-pub use input::{ManagedTerminalInput, TerminalInput};
+pub use input::{ManagedTerminalInput, TERMINAL_COLORS_EVENT, TerminalColorsHandle, TerminalInput};
 pub use invalidation::InvalidationSignal;
 pub use mailbox::{LatestSendError, LatestSendOutcome, LatestSender, SendError, TrySendError};
 pub use presenter::{

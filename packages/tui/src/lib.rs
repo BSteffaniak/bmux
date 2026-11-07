@@ -22,6 +22,7 @@ pub mod event;
 pub mod focus;
 pub mod frame;
 pub mod geometry;
+pub mod gradient;
 pub mod grid_fragment;
 pub mod hit;
 pub mod image;
@@ -53,7 +54,9 @@ pub mod prelude {
         AnsiFrameDiffStats, ansi_to_lines, write_ansi_frame, write_ansi_frame_diff,
     };
     pub use crate::buffer::{Buffer, Cell};
-    pub use crate::capabilities::{TerminalBackground, TerminalCapabilities, TerminalColorDepth};
+    pub use crate::capabilities::{
+        TerminalBackground, TerminalCapabilities, TerminalColorDepth, TerminalColorReport,
+    };
     pub use crate::chrome::{Border, BorderSet, BorderSides};
     pub use crate::component::{
         ChildLayout, Component, ComponentRevision, Constraints, Element, EventCx, LayoutCache,

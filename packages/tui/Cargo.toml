@@ -11,6 +11,7 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
+bmux_color             = { workspace = true }
 bmux_keyboard          = { workspace = true, features = ["csi-u"] }
 bmux_terminal_protocol = { workspace = true }
 bmux_text_edit         = { workspace = true, features = ["keyboard"] }
@@ -38,6 +39,7 @@ crossterm = [
 ]
 default = []
 fail-on-warnings = [
+    "bmux_color/fail-on-warnings",
     "bmux_keyboard/fail-on-warnings",
     "bmux_text_edit/fail-on-warnings",
 ]

@@ -567,7 +567,7 @@ impl From<crate::theme::ComponentTheme> for ButtonStyles {
         Self {
             normal: theme.text,
             focused: theme.focused,
-            hovered: theme.info,
+            hovered: theme.hover,
             pressed: theme.selected,
             disabled: theme.disabled,
         }

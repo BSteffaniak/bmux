@@ -670,8 +670,8 @@ impl From<crate::theme::ComponentTheme> for BreadcrumbsStyles {
         let theme = theme.for_surface(crate::theme::ComponentSurfaceDepth::Normal);
         Self {
             normal: theme.text,
-            current: theme.info.add_modifier(bmux_tui::style::Modifier::BOLD),
-            hovered: theme.info,
+            current: theme.accent.add_modifier(bmux_tui::style::Modifier::BOLD),
+            hovered: theme.hover,
             pressed: theme.selected,
             disabled: theme.disabled,
             separator: theme.muted,

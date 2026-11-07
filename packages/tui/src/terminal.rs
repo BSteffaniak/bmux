@@ -2,8 +2,11 @@
 
 use std::io::{self, Write};
 
-use crate::ansi::{AnsiFrameDiffStats, write_ansi_frame, write_ansi_frame_diff};
+use crate::ansi::{
+    AnsiFrameDiffStats, write_ansi_frame_diff_with_color_depth, write_ansi_frame_with_color_depth,
+};
 use crate::buffer::Buffer;
+use crate::capabilities::TerminalColorDepth;
 use crate::damage::Damage;
 use crate::event::{Event, FocusEvent};
 use crate::focus::{FocusId, FocusTrap};
@@ -70,6 +73,7 @@ pub struct Terminal<W> {
     pointer_capability: PointerShapeCapability,
     pointer_position: Option<Point>,
     pointer_context: PointerContext,
+    color_depth: TerminalColorDepth,
 }
 
 impl<W: Write> Terminal<W> {
@@ -86,6 +90,7 @@ impl<W: Write> Terminal<W> {
             pointer_capability: PointerShapeCapability::detect(),
             pointer_position: None,
             pointer_context: PointerContext::default(),
+            color_depth: TerminalColorDepth::TrueColor,
         }
     }
 
@@ -101,6 +106,7 @@ impl<W: Write> Terminal<W> {
             pointer_capability: self.pointer_capability,
             pointer_position: self.pointer_position,
             pointer_context: self.pointer_context.clone(),
+            color_depth: self.color_depth,
         }
     }
 
@@ -108,6 +114,34 @@ impl<W: Write> Terminal<W> {
     pub fn acknowledge<V>(&mut self, staged: Terminal<V>) {
         self.state = staged.state;
         self.pointer_output = staged.pointer_output;
+    }
+
+    /// Write raw control bytes (for example terminal capability queries)
+    /// outside of frame presentation and flush them.
+    ///
+    /// # Errors
+    ///
+    /// Returns any writer error.
+    pub fn write_control(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.writer.write_all(bytes)?;
+        self.writer.flush()
+    }
+
+    /// Color depth frames are reduced to when encoded.
+    ///
+    /// Defaults to [`TerminalColorDepth::TrueColor`], which emits colors unchanged.
+    #[must_use]
+    pub const fn color_depth(&self) -> TerminalColorDepth {
+        self.color_depth
+    }
+
+    /// Reduce colors in subsequently encoded frames to `depth`.
+    ///
+    /// Applications typically pass [`crate::capabilities::TerminalCapabilities`]
+    /// detection or an explicit user override. Changing depth does not repaint
+    /// cells already on screen; request a full repaint to apply it everywhere.
+    pub const fn set_color_depth(&mut self, depth: TerminalColorDepth) {
+        self.color_depth = depth;
     }
 
     /// Host pointer-shape capability (detected from the environment unless
@@ -402,6 +436,7 @@ impl<W: Write> Terminal<W> {
         }
         let writer = &mut self.writer;
         let encoded = &mut self.encoded;
+        let depth = self.color_depth;
         self.state
             .present_prepared(prepared, |prepared, previous| {
                 prepared.require_uniform_grid().map_err(io::Error::other)?;
@@ -427,18 +462,20 @@ impl<W: Write> Terminal<W> {
                         let stats = PresentationPhase::AnsiEncode.measure(
                             || -> io::Result<DrawStats> {
                                 Ok(if let Some(previous) = previous.filter(|_| !repaint) {
-                                    write_ansi_frame_diff(
+                                    write_ansi_frame_diff_with_color_depth(
                                         encoded,
                                         previous,
                                         prepared.buffer(),
                                         prepared.cursor(),
+                                        depth,
                                     )?
                                     .into()
                                 } else {
-                                    write_ansi_frame(
+                                    write_ansi_frame_with_color_depth(
                                         encoded,
                                         prepared.buffer(),
                                         prepared.cursor(),
+                                        depth,
                                     )?;
                                     DrawStats::full(prepared.buffer().cells().len())
                                 })

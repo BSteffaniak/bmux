@@ -6,6 +6,7 @@ pub use log::AnsiLog;
 use std::io::{self, Write};
 
 use crate::buffer::Buffer;
+use crate::capabilities::TerminalColorDepth;
 use crate::frame::Cursor;
 use crate::geometry::Point;
 use crate::style::{Color, Modifier, Style};
@@ -15,7 +16,8 @@ use crate::text_width::display_width;
 /// Write a full buffer frame using ANSI escape sequences.
 ///
 /// This renderer is intentionally simple: it paints every row in the buffer and
-/// leaves damage-aware flushing for a later backend layer.
+/// leaves damage-aware flushing for a later backend layer. Colors are emitted
+/// exactly as stored; see [`write_ansi_frame_with_color_depth`] to reduce them.
 ///
 /// # Errors
 ///
@@ -25,22 +27,38 @@ pub fn write_ansi_frame(
     buffer: &Buffer,
     cursor: Option<Cursor>,
 ) -> io::Result<()> {
+    write_ansi_frame_with_color_depth(writer, buffer, cursor, TerminalColorDepth::TrueColor)
+}
+
+/// Write a full buffer frame, reducing colors to `depth`.
+///
+/// See [`Style::quantized`] for the reduction rules.
+///
+/// # Errors
+///
+/// Returns any I/O error reported by `writer`.
+pub fn write_ansi_frame_with_color_depth(
+    writer: &mut impl Write,
+    buffer: &Buffer,
+    cursor: Option<Cursor>,
+    depth: TerminalColorDepth,
+) -> io::Result<()> {
     let area = buffer.area();
     let mut active_style = Style::new();
     write!(writer, "\x1b[?25l")?;
     for y in area.y..area.bottom() {
-        emit_row_span(writer, buffer, y, area.x, area.right(), &mut active_style)?;
+        emit_row_span(
+            writer,
+            buffer,
+            y,
+            area.x,
+            area.right(),
+            &mut active_style,
+            depth,
+        )?;
     }
-    write_ansi_style(writer, Style::new())?;
-    if let Some(cursor) = cursor {
-        write_ansi_move_to(writer, cursor.position)?;
-        if cursor.visible {
-            write!(writer, "\x1b[?25h")?;
-        } else {
-            write!(writer, "\x1b[?25l")?;
-        }
-    }
-    Ok(())
+    write_ansi_style(writer, Style::new(), depth)?;
+    write_ansi_cursor(writer, cursor)
 }
 
 /// Paint a buffer at the current cursor row without absolute positioning.
@@ -52,15 +70,27 @@ pub fn write_ansi_frame(
 /// # Errors
 /// Returns any writer error.
 pub fn write_ansi_inline_frame(writer: &mut impl Write, buffer: &Buffer) -> io::Result<()> {
+    write_ansi_inline_frame_with_color_depth(writer, buffer, TerminalColorDepth::TrueColor)
+}
+
+/// Paint an inline buffer like [`write_ansi_inline_frame`], reducing colors to `depth`.
+///
+/// # Errors
+/// Returns any writer error.
+pub fn write_ansi_inline_frame_with_color_depth(
+    writer: &mut impl Write,
+    buffer: &Buffer,
+    depth: TerminalColorDepth,
+) -> io::Result<()> {
     let area = buffer.area();
     let mut style = Style::new();
-    write_ansi_style(writer, style)?;
+    write_ansi_style(writer, style, depth)?;
     for y in area.y..area.bottom() {
         writer.write_all(b"\r\x1b[2K")?;
-        emit_row_cells(writer, buffer, y, area.x, area.right(), &mut style)?;
+        emit_row_cells(writer, buffer, y, area.x, area.right(), &mut style, depth)?;
         writer.write_all(b"\r\n")?;
     }
-    write_ansi_style(writer, Style::new())
+    write_ansi_style(writer, Style::new(), depth)
 }
 
 /// Update a same-sized inline buffer from the cursor row immediately below it.
@@ -75,6 +105,24 @@ pub fn write_ansi_inline_frame_diff(
     previous: &Buffer,
     current: &Buffer,
 ) -> io::Result<()> {
+    write_ansi_inline_frame_diff_with_color_depth(
+        writer,
+        previous,
+        current,
+        TerminalColorDepth::TrueColor,
+    )
+}
+
+/// Update an inline buffer like [`write_ansi_inline_frame_diff`], reducing colors to `depth`.
+///
+/// # Errors
+/// Returns a writer error or invalid input for differently sized buffers.
+pub fn write_ansi_inline_frame_diff_with_color_depth(
+    writer: &mut impl Write,
+    previous: &Buffer,
+    current: &Buffer,
+    depth: TerminalColorDepth,
+) -> io::Result<()> {
     if previous.area() != current.area() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -87,7 +135,7 @@ pub fn write_ansi_inline_frame_diff(
     for y in area.y..area.bottom() {
         if let Some((start, end)) = changed_row_suffix(previous, current, y) {
             if !started {
-                write_ansi_style(writer, style)?;
+                write_ansi_style(writer, style, depth)?;
                 started = true;
             }
             let distance = area.bottom() - y;
@@ -96,12 +144,12 @@ pub fn write_ansi_inline_frame_diff(
             if column > 0 {
                 write!(writer, "\x1b[{column}C")?;
             }
-            emit_row_cells(writer, current, y, start, end, &mut style)?;
+            emit_row_cells(writer, current, y, start, end, &mut style, depth)?;
             write!(writer, "\r\x1b[{distance}B")?;
         }
     }
     if started {
-        write_ansi_style(writer, Style::new())?;
+        write_ansi_style(writer, Style::new(), depth)?;
     }
     Ok(())
 }
@@ -129,8 +177,29 @@ pub fn write_ansi_frame_diff(
     current: &Buffer,
     cursor: Option<Cursor>,
 ) -> io::Result<AnsiFrameDiffStats> {
+    write_ansi_frame_diff_with_color_depth(
+        writer,
+        previous,
+        current,
+        cursor,
+        TerminalColorDepth::TrueColor,
+    )
+}
+
+/// Write only changed cells like [`write_ansi_frame_diff`], reducing colors to `depth`.
+///
+/// # Errors
+///
+/// Returns any I/O error reported by `writer`.
+pub fn write_ansi_frame_diff_with_color_depth(
+    writer: &mut impl Write,
+    previous: &Buffer,
+    current: &Buffer,
+    cursor: Option<Cursor>,
+    depth: TerminalColorDepth,
+) -> io::Result<AnsiFrameDiffStats> {
     if previous.area() != current.area() {
-        write_ansi_frame(writer, current, cursor)?;
+        write_ansi_frame_with_color_depth(writer, current, cursor, depth)?;
         return Ok(AnsiFrameDiffStats {
             changed_cells: current.cells().len(),
             full_repaint: true,
@@ -150,10 +219,19 @@ pub fn write_ansi_frame_diff(
                 y,
                 start..end,
                 &mut active_style,
+                depth,
             )?);
         }
     }
-    write_ansi_style(writer, Style::new())?;
+    write_ansi_style(writer, Style::new(), depth)?;
+    write_ansi_cursor(writer, cursor)?;
+    Ok(AnsiFrameDiffStats {
+        changed_cells,
+        full_repaint: false,
+    })
+}
+
+fn write_ansi_cursor(writer: &mut impl Write, cursor: Option<Cursor>) -> io::Result<()> {
     if let Some(cursor) = cursor {
         write_ansi_move_to(writer, cursor.position)?;
         if cursor.visible {
@@ -162,10 +240,7 @@ pub fn write_ansi_frame_diff(
             write!(writer, "\x1b[?25l")?;
         }
     }
-    Ok(AnsiFrameDiffStats {
-        changed_cells,
-        full_repaint: false,
-    })
+    Ok(())
 }
 
 // Only skip gaps whose omitted output is exactly one byte per cell and cannot
@@ -178,6 +253,7 @@ fn emit_sparse_row_span(
     y: u16,
     span: std::ops::Range<u16>,
     active_style: &mut Style,
+    depth: TerminalColorDepth,
 ) -> io::Result<usize> {
     let mut start = span.start;
     let mut x = start;
@@ -211,7 +287,7 @@ fn emit_sparse_row_span(
                 .get(Point::new(x, y))
                 .is_some_and(|cell| Some(cell.style) == style && !cell.is_wide_continuation())
         {
-            emit_row_span(writer, current, y, start, gap_start, active_style)?;
+            emit_row_span(writer, current, y, start, gap_start, active_style, depth)?;
             written += usize::from(gap_start - start);
             start = x;
         }
@@ -220,7 +296,7 @@ fn emit_sparse_row_span(
             x += 1;
         }
     }
-    emit_row_span(writer, current, y, start, span.end, active_style)?;
+    emit_row_span(writer, current, y, start, span.end, active_style, depth)?;
     Ok(written + usize::from(span.end - start))
 }
 
@@ -268,12 +344,13 @@ fn emit_row_span(
     start: u16,
     end: u16,
     active_style: &mut Style,
+    depth: TerminalColorDepth,
 ) -> io::Result<()> {
     if start >= end {
         return Ok(());
     }
     write_ansi_move_to(writer, Point::new(start, y))?;
-    emit_row_cells(writer, buffer, y, start, end, active_style)
+    emit_row_cells(writer, buffer, y, start, end, active_style, depth)
 }
 
 fn emit_row_cells(
@@ -283,6 +360,7 @@ fn emit_row_cells(
     start: u16,
     end: u16,
     active_style: &mut Style,
+    depth: TerminalColorDepth,
 ) -> io::Result<()> {
     let mut x = start;
     while x < end {
@@ -297,7 +375,7 @@ fn emit_row_cells(
             continue;
         }
         if cell.style != *active_style {
-            write_ansi_style(writer, cell.style)?;
+            write_ansi_style(writer, cell.style, depth)?;
             *active_style = cell.style;
         }
         if cell.symbol.is_empty() {
@@ -591,7 +669,12 @@ fn write_ansi_move_to(writer: &mut impl Write, point: Point) -> io::Result<()> {
     )
 }
 
-fn write_ansi_style(writer: &mut impl Write, style: Style) -> io::Result<()> {
+fn write_ansi_style(
+    writer: &mut impl Write,
+    style: Style,
+    depth: TerminalColorDepth,
+) -> io::Result<()> {
+    let style = style.quantized(depth);
     writer.write_all(b"\x1b[0")?;
     write_ansi_modifier(writer, style.modifiers)?;
     if let Some(fg) = style.fg {
@@ -691,6 +774,44 @@ mod tests {
     use crate::text::Line;
 
     #[test]
+    fn color_depth_reduces_emitted_colors_without_changing_defaults() {
+        use crate::capabilities::TerminalColorDepth;
+
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 1, 1));
+        buffer.set_cell(
+            Point::new(0, 0),
+            "x",
+            Style::new()
+                .fg(Color::Rgb(0xff, 0, 0))
+                .bg(Color::Rgb(0, 0, 0xff)),
+        );
+        let encode = |depth| {
+            let mut bytes = Vec::new();
+            super::write_ansi_frame_with_color_depth(&mut bytes, &buffer, None, depth).unwrap();
+            String::from_utf8(bytes).unwrap()
+        };
+        let mut unchanged = Vec::new();
+        write_ansi_frame(&mut unchanged, &buffer, None).unwrap();
+        assert_eq!(
+            String::from_utf8(unchanged).unwrap(),
+            encode(TerminalColorDepth::TrueColor)
+        );
+        assert!(encode(TerminalColorDepth::TrueColor).contains("38;2;255;0;0"));
+        let indexed = encode(TerminalColorDepth::Ansi256);
+        assert!(
+            indexed.contains(";38;5;196") && indexed.contains(";48;5;21"),
+            "{indexed}"
+        );
+        let named = encode(TerminalColorDepth::Ansi16);
+        assert!(named.contains(";91") && !named.contains("38;"), "{named}");
+        let mono = encode(TerminalColorDepth::Monochrome);
+        assert!(
+            !mono.contains(";38") && !mono.contains(";48") && !mono.contains(";9"),
+            "{mono}"
+        );
+    }
+
+    #[test]
     fn distant_changes_bound_gap_bytes() {
         for width in [80, 800, 8_000] {
             let previous = Buffer::empty(Rect::new(0, 0, width, 1));
@@ -757,10 +878,24 @@ mod tests {
         let mut style = Style::new();
         for y in current.area().y..current.area().bottom() {
             if let Some((start, end)) = super::changed_row_suffix(previous, current, y) {
-                super::emit_row_span(&mut wire, current, y, start, end, &mut style).unwrap();
+                super::emit_row_span(
+                    &mut wire,
+                    current,
+                    y,
+                    start,
+                    end,
+                    &mut style,
+                    super::TerminalColorDepth::TrueColor,
+                )
+                .unwrap();
             }
         }
-        super::write_ansi_style(&mut wire, Style::new()).unwrap();
+        super::write_ansi_style(
+            &mut wire,
+            Style::new(),
+            super::TerminalColorDepth::TrueColor,
+        )
+        .unwrap();
         wire
     }
 
@@ -799,7 +934,16 @@ mod tests {
             current.set_cell(Point::new(1, 0), "X", Style::new());
             let mut output = Vec::new();
             let mut style = Style::new();
-            super::emit_row_cells(&mut output, &current, 0, 0, 8, &mut style).unwrap();
+            super::emit_row_cells(
+                &mut output,
+                &current,
+                0,
+                0,
+                8,
+                &mut style,
+                super::TerminalColorDepth::TrueColor,
+            )
+            .unwrap();
             assert_eq!(output, b" X      ");
             let mut expected = current.clone();
             expected.set_cell(Point::new(0, 0), " ", Style::new());

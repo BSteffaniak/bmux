@@ -869,7 +869,7 @@ impl From<crate::theme::ComponentTheme> for TreeViewStyles {
         Self {
             normal: theme.text,
             selected: theme.selected.add_modifier(bmux_tui::style::Modifier::BOLD),
-            hovered: theme.info,
+            hovered: theme.hover,
             pressed: theme.selected,
             disabled: theme.disabled,
             marker: theme.muted,

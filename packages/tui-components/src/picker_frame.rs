@@ -2,7 +2,7 @@
 
 use std::hash::{Hash, Hasher};
 
-use bmux_tui::chrome::Border;
+use bmux_tui::chrome::BorderSet;
 use bmux_tui::component::{
     ChildLayout, Component, ComponentRevision, Constraints, Element, EventCx, LayoutCx, LayoutId,
     LayoutNode, LogicalSize, combine_child_revisions,
@@ -171,6 +171,7 @@ pub struct PickerFrame<'a> {
     footer: Option<Line>,
     policy: PickerFramePolicy,
     styles: PickerFrameStyles,
+    chrome: crate::theme::ComponentChrome,
 }
 
 impl<'a> PickerFrame<'a> {
@@ -190,7 +191,16 @@ impl<'a> PickerFrame<'a> {
                 list: Style::new(),
                 footer: Style::new(),
             },
+            chrome: crate::theme::ComponentChrome::DEFAULT,
         }
+    }
+
+    /// Set border glyphs and focus effects. Picker frames are always treated
+    /// as focused, so a focus gradient applies whenever chrome is shown.
+    #[must_use]
+    pub const fn chrome(mut self, chrome: crate::theme::ComponentChrome) -> Self {
+        self.chrome = chrome;
+        self
     }
 
     /// Set title.
@@ -426,7 +436,11 @@ impl<'a> PickerFrameComponent<'a> {
             surface = surface.background(self.frame.styles.background);
         }
         if self.frame.policy.chrome {
-            surface = surface.border(Border::single().style(self.frame.styles.border));
+            surface = surface.border(self.frame.chrome.border(
+                BorderSet::SINGLE,
+                self.frame.styles.border,
+                true,
+            ));
         }
         surface
     }
@@ -819,9 +833,9 @@ impl From<crate::theme::ComponentTheme> for PickerFrameStyles {
     fn from(theme: crate::theme::ComponentTheme) -> Self {
         let theme = theme.for_surface(crate::theme::ComponentSurfaceDepth::Raised);
         Self {
-            border: theme.focused,
+            border: theme.border_focused,
             background: theme.surfaces.raised,
-            header: theme.text.add_modifier(bmux_tui::style::Modifier::BOLD),
+            header: theme.title,
             input: theme.text,
             list: theme.text,
             footer: theme.muted,

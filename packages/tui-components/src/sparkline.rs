@@ -410,8 +410,8 @@ impl From<crate::theme::ComponentTheme> for SparklineStyles {
     fn from(theme: crate::theme::ComponentTheme) -> Self {
         let theme = theme.for_surface(crate::theme::ComponentSurfaceDepth::Normal);
         Self {
-            normal: theme.info,
-            latest: theme.info.add_modifier(bmux_tui::style::Modifier::BOLD),
+            normal: theme.accent,
+            latest: theme.accent.add_modifier(bmux_tui::style::Modifier::BOLD),
             first: theme.text,
             high: theme.success.add_modifier(bmux_tui::style::Modifier::BOLD),
             low: theme.error,

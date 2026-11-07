@@ -1,6 +1,7 @@
 //! Panel, border, and modal chrome primitives.
 
 use crate::geometry::Insets;
+use crate::gradient::ColorGradient;
 use crate::style::Style;
 
 /// Border glyph set.
@@ -151,6 +152,9 @@ pub struct Border {
     pub style: Style,
     /// Border sides to render.
     pub sides: BorderSides,
+    /// Optional foreground gradient running diagonally from the top-left to
+    /// the bottom-right corner. Replaces only the style's foreground.
+    pub gradient: Option<ColorGradient>,
 }
 
 impl Border {
@@ -161,6 +165,7 @@ impl Border {
             set,
             style,
             sides: BorderSides::ALL,
+            gradient: None,
         }
     }
 
@@ -205,6 +210,13 @@ impl Border {
     #[must_use]
     pub const fn style(mut self, style: Style) -> Self {
         self.style = style;
+        self
+    }
+
+    /// Paint the border foreground with `gradient`.
+    #[must_use]
+    pub const fn gradient(mut self, gradient: ColorGradient) -> Self {
+        self.gradient = Some(gradient);
         self
     }
 }

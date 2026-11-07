@@ -394,7 +394,7 @@ impl From<crate::theme::ComponentTheme> for EmptyStateStyles {
             icon: theme.muted,
             title: theme.text.add_modifier(bmux_tui::style::Modifier::BOLD),
             body: theme.muted,
-            action: theme.info,
+            action: theme.accent,
             background: theme.surfaces.normal,
         }
     }

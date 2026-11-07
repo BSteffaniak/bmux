@@ -6,7 +6,9 @@ use bmux_tui::buffer::Buffer;
 use bmux_tui::geometry::Point;
 use bmux_tui::geometry::Rect;
 use bmux_tui::style::{Color, Modifier, Style};
-use bmux_tui_components::theme::{ComponentSurfaces, ComponentTheme};
+use bmux_tui_components::theme::{
+    ComponentChrome, ComponentStateSurfaces, ComponentSurfaces, ComponentTheme,
+};
 
 pub use bmux_plugin::component_render::buffer_render_ops;
 #[cfg(test)]
@@ -18,6 +20,13 @@ pub fn component_theme(appearance: &RuntimeAppearance) -> ComponentTheme {
     let background = parse_tui_color(&appearance.background).unwrap_or(Color::Black);
     let selection = parse_tui_color(&appearance.selection_background).unwrap_or(Color::Cyan);
     let cursor = parse_tui_color(&appearance.cursor).unwrap_or(Color::BrightCyan);
+    // Cursor and foreground colors may be identical (including in the
+    // default appearance). Focus must not depend on color contrast alone.
+    let focused = Style::new()
+        .fg(cursor)
+        .add_modifier(Modifier::BOLD | Modifier::UNDERLINE);
+    let selected = Style::new().fg(background).bg(selection);
+    let accent = Style::new().fg(cursor);
     ComponentTheme {
         canvas: Style::new().fg(foreground).bg(background),
         surfaces: ComponentSurfaces {
@@ -27,21 +36,25 @@ pub fn component_theme(appearance: &RuntimeAppearance) -> ComponentTheme {
             scrim: None,
         },
         text: Style::new().fg(foreground),
-        // Cursor and foreground colors may be identical (including in the
-        // default appearance). Focus must not depend on color contrast alone.
-        focused: Style::new()
-            .fg(cursor)
-            .add_modifier(Modifier::BOLD | Modifier::UNDERLINE),
-        selected: Style::new().fg(background).bg(selection),
+        accent,
+        title: accent.add_modifier(Modifier::BOLD),
+        focused,
+        hover: accent,
+        selected,
+        selected_inactive: selected,
         disabled: Style::new()
             .fg(Color::BrightBlack)
             .add_modifier(Modifier::DIM),
         muted: Style::new().fg(Color::BrightBlack),
-        info: Style::new().fg(cursor),
+        link: accent.add_modifier(Modifier::UNDERLINE),
+        info: accent,
         success: Style::new().fg(Color::Green),
         warning: Style::new().fg(Color::Yellow),
         error: Style::new().fg(Color::Red),
+        state_surfaces: ComponentStateSurfaces::NONE,
         border: Style::new().fg(cursor),
+        border_focused: focused,
+        chrome: ComponentChrome::DEFAULT,
     }
 }
 

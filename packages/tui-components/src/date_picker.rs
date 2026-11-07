@@ -299,7 +299,7 @@ impl DatePickerStyles {
         Self {
             normal: theme.text,
             header: theme.text.patch(Style::new().add_modifier(Modifier::BOLD)),
-            arrow: theme.info,
+            arrow: theme.accent,
             weekday: theme.muted,
             outside: theme.muted,
             today: theme
@@ -315,7 +315,9 @@ impl DatePickerStyles {
                 .patch(Style::new().add_modifier(Modifier::UNDERLINE)),
             hint: theme.muted,
             error: theme.error,
-            button: theme.info.patch(Style::new().add_modifier(Modifier::BOLD)),
+            button: theme
+                .accent
+                .patch(Style::new().add_modifier(Modifier::BOLD)),
         }
     }
 }

@@ -15,6 +15,7 @@ name              = "virtual_list_benchmark"
 required-features = ["virtual-list"]
 
 [dependencies]
+bmux_color = { workspace = true }
 bmux_keyboard = { workspace = true, optional = true }
 bmux_terminal_grid = { workspace = true, optional = true }
 bmux_text_edit = { workspace = true, features = [
@@ -34,6 +35,7 @@ web-time = { workspace = true }
 [features]
 default = []
 fail-on-warnings = [
+    "bmux_color/fail-on-warnings",
     "bmux_keyboard?/fail-on-warnings",
     "bmux_terminal_grid?/fail-on-warnings",
     "bmux_text_edit?/fail-on-warnings",
@@ -54,6 +56,7 @@ completion = ["text-input", "selectable-list", "picker-frame"]
 date-picker = ["keyboard-input", "dep:bmux_text_edit", "dep:chrono"]
 dialog = ["action-row", "modal-frame"]
 diff-viewer = ["source-viewer", "dep:unicode-segmentation", "dep:unicode-width"]
+disclosure = []
 empty-state = []
 form = ["keyboard-input"]
 form-field = []
@@ -110,6 +113,7 @@ all = [
     "date-picker",
     "dialog",
     "diff-viewer",
+    "disclosure",
     "empty-state",
     "form",
     "form-field",

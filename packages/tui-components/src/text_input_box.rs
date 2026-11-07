@@ -2,7 +2,7 @@
 
 use std::cell::RefCell;
 
-use bmux_tui::chrome::Border;
+use bmux_tui::chrome::BorderSet;
 use bmux_tui::component::{
     Component, ComponentRevision, Constraints, EventCx, LayoutCx, LayoutId, LayoutNode,
 };
@@ -165,6 +165,7 @@ struct TextInputBoxConfig<'a> {
     policy: TextInputBoxPolicy,
     text_policy: TextInputPolicy,
     styles: TextInputBoxStyles,
+    chrome: crate::theme::ComponentChrome,
 }
 
 /// Canonical component-lifecycle text input box.
@@ -202,6 +203,13 @@ impl<'a, 'state> TextInputBoxComponent<'a, 'state> {
     #[must_use]
     pub const fn label(mut self, label: &'a str) -> Self {
         self.box_control.label = Some(label);
+        self
+    }
+
+    /// Set panel border glyphs and focus effects.
+    #[must_use]
+    pub const fn chrome(mut self, chrome: crate::theme::ComponentChrome) -> Self {
+        self.box_control.chrome = chrome;
         self
     }
 
@@ -281,11 +289,16 @@ impl<'a, 'state> TextInputBoxComponent<'a, 'state> {
             if self.box_control.policy.background {
                 surface = surface.background(self.box_control.background_style());
             }
-            surface = surface.border(Border::single().style(if self.box_control.policy.focused {
-                self.box_control.styles.focused_border
-            } else {
-                self.box_control.styles.border
-            }));
+            let focused = self.box_control.policy.focused;
+            surface = surface.border(self.box_control.chrome.border(
+                BorderSet::SINGLE,
+                if focused {
+                    self.box_control.styles.focused_border
+                } else {
+                    self.box_control.styles.border
+                },
+                focused,
+            ));
             bmux_tui::component::Element::new(surface)
         } else {
             bmux_tui::component::Element::new(bounded)
@@ -341,6 +354,7 @@ impl TextInputBoxConfig<'_> {
             policy: TextInputBoxPolicy::default(),
             text_policy,
             styles: TextInputBoxStyles::default(),
+            chrome: crate::theme::ComponentChrome::DEFAULT,
         }
     }
 
@@ -383,7 +397,7 @@ impl From<crate::theme::ComponentTheme> for TextInputBoxStyles {
             placeholder: theme.muted,
             selection: theme.selected,
             border: theme.border,
-            focused_border: theme.focused,
+            focused_border: theme.border_focused,
             background: theme.surfaces.normal,
             focused_background: theme.surfaces.normal,
             disabled_background: theme.surfaces.normal,

@@ -9836,7 +9836,7 @@ fn help_overlay_render_ops(
         &modal,
         lines,
         scroll,
-        component_theme,
+        &component_theme,
     );
     buffer_render_ops(&buffer)
 }
@@ -9847,7 +9847,7 @@ fn paint_help_overlay(
     modal: &ModalFrame,
     lines: &[String],
     scroll: usize,
-    component_theme: ComponentTheme,
+    component_theme: &ComponentTheme,
 ) {
     let modal_component =
         ModalFrameComponent::new("attach.help", modal.clone(), TextBlock::new(""));

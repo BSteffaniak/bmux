@@ -181,6 +181,17 @@ impl ModalFrame {
         self
     }
 
+    /// Apply border glyphs and focus effects, keeping the current border style.
+    /// Modals are always focused, so a focus gradient always applies.
+    #[must_use]
+    pub fn chrome(mut self, chrome: crate::theme::ComponentChrome) -> Self {
+        let sides = self.border.sides;
+        self.border = chrome
+            .border(self.border.set, self.border.style, true)
+            .sides(sides);
+        self
+    }
+
     /// Set the modal panel padding.
     #[must_use]
     pub const fn padding(mut self, padding: Insets) -> Self {
@@ -571,8 +582,8 @@ impl From<crate::theme::ComponentTheme> for ModalTheme {
         let theme = theme.for_surface(crate::theme::ComponentSurfaceDepth::Overlay);
         Self {
             background: theme.surfaces.overlay,
-            border: theme.focused,
-            title: theme.info.add_modifier(bmux_tui::style::Modifier::BOLD),
+            border: theme.border_focused,
+            title: theme.title,
             text: theme.text,
             muted: theme.muted,
             focused: theme.focused,

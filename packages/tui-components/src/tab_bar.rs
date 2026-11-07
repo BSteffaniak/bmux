@@ -953,7 +953,7 @@ impl From<crate::theme::ComponentTheme> for TabBarStyles {
             normal: theme.muted,
             selected: theme.selected.add_modifier(bmux_tui::style::Modifier::BOLD),
             focused: theme.focused,
-            hovered: theme.info,
+            hovered: theme.hover,
             pressed: theme.selected,
             disabled: theme.disabled,
             separator: theme.border,

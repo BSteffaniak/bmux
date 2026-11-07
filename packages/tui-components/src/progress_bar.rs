@@ -564,7 +564,7 @@ impl From<crate::theme::ComponentTheme> for ProgressBarStyles {
             empty: theme.muted,
             label: theme.text.add_modifier(bmux_tui::style::Modifier::BOLD),
             complete: theme.success.add_modifier(bmux_tui::style::Modifier::BOLD),
-            indeterminate: theme.info,
+            indeterminate: theme.accent,
             background: theme.surfaces.normal,
         }
     }

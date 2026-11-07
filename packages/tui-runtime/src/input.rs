@@ -15,6 +15,33 @@ use crate::runtime::RuntimeHandle;
 #[cfg(unix)]
 use bmux_tui::crossterm::input::{InputWaker, RawInput, RawInputPacket};
 
+/// Event tag delivered as [`Event::User`] when [`ManagedTerminalInput::terminal_colors`]
+/// changes after the terminal answers [`bmux_tui::capabilities::TerminalColorReport::QUERY`].
+pub const TERMINAL_COLORS_EVENT: &str = "bmux.terminal-colors";
+
+/// Latest terminal color replies observed by a reader.
+type TerminalColorState =
+    std::sync::Arc<std::sync::Mutex<bmux_tui::capabilities::TerminalColorReport>>;
+
+/// Shared, read-only view of a reader's terminal color replies.
+///
+/// Programs keep a clone and read it when a [`TERMINAL_COLORS_EVENT`]
+/// notification arrives. It stays empty until the application writes
+/// [`bmux_tui::capabilities::TerminalColorReport::QUERY`] and the terminal answers.
+#[derive(Debug, Clone, Default)]
+pub struct TerminalColorsHandle(TerminalColorState);
+
+impl TerminalColorsHandle {
+    /// Latest terminal-reported colors.
+    #[must_use]
+    pub fn get(&self) -> bmux_tui::capabilities::TerminalColorReport {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
 /// A [`RawInput`] on its own thread, blocked in [`RawInput::wait`] and handing
 /// each packet to a delivery callback. Stopping wakes the wait, so shutdown is
 /// prompt without any polling; dropping stops and joins the thread, releasing
@@ -103,11 +130,24 @@ struct RawEventStream {
 #[cfg(unix)]
 impl RawEventStream {
     /// Open the stdout tty, or yield the failure as the stream's only item.
-    fn open(capacity: usize) -> Self {
+    ///
+    /// With `colors`, terminal color replies update that state and surface as a
+    /// [`TERMINAL_COLORS_EVENT`] notification; without it they are discarded
+    /// like other opaque input.
+    fn open(capacity: usize, colors: Option<TerminalColorState>) -> Self {
         let (sender, receiver) = mpsc::channel(capacity.max(1));
         match RawInput::open_stdout_tty() {
             Ok(reader) => {
                 let reader = RawReader::spawn(reader, move |packet| match packet {
+                    Ok(RawInputPacket::Opaque(frame))
+                        if colors
+                            .as_ref()
+                            .is_some_and(|colors| observe_colors(colors, &frame)) =>
+                    {
+                        sender
+                            .blocking_send(Ok(Event::User(TERMINAL_COLORS_EVENT.to_owned())))
+                            .is_ok()
+                    }
                     Ok(packet) => packet
                         .into_event()
                         .is_none_or(|event| sender.blocking_send(Ok(event)).is_ok()),
@@ -130,6 +170,19 @@ impl RawEventStream {
             }
         }
     }
+}
+
+/// Record a color reply; `true` only when the frame was a reply that changed the report.
+///
+/// Recognized replies that leave the report unchanged are still consumed (never
+/// treated as input) but suppress the redundant notification.
+#[cfg(unix)]
+fn observe_colors(colors: &TerminalColorState, frame: &[u8]) -> bool {
+    let mut report = colors
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let before = *report;
+    report.observe(frame) && *report != before
 }
 
 #[cfg(unix)]
@@ -261,6 +314,7 @@ pub struct ManagedTerminalInput {
     receiver: mpsc::Receiver<Result<Event, std::io::Error>>,
     shutdown: watch::Sender<bool>,
     task: Option<JoinHandle<()>>,
+    colors: TerminalColorState,
 }
 
 impl ManagedTerminalInput {
@@ -280,14 +334,30 @@ impl ManagedTerminalInput {
     /// Panics when called outside a Tokio runtime.
     #[must_use]
     pub fn start(capacity: usize) -> Self {
+        let colors = TerminalColorState::default();
         #[cfg(unix)]
-        let events = RawEventStream::open(capacity);
+        let events = RawEventStream::open(capacity, Some(std::sync::Arc::clone(&colors)));
         #[cfg(not(unix))]
         let events = CrosstermEventStream::new();
-        Self::start_stream(capacity, events)
+        Self::start_stream(capacity, events, colors)
     }
 
-    fn start_stream<S>(capacity: usize, mut events: S) -> Self
+    /// Latest terminal-reported colors.
+    ///
+    /// Empty until the application writes
+    /// [`bmux_tui::capabilities::TerminalColorReport::QUERY`] and the terminal
+    /// answers; each change is announced by an [`Event::User`] carrying
+    /// [`TERMINAL_COLORS_EVENT`]. Terminals that ignore the query leave every
+    /// field `None`.
+    #[must_use]
+    pub fn terminal_colors(&self) -> bmux_tui::capabilities::TerminalColorReport {
+        *self
+            .colors
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn start_stream<S>(capacity: usize, mut events: S, colors: TerminalColorState) -> Self
     where
         S: futures_util::Stream<Item = Result<Event, std::io::Error>> + Send + Unpin + 'static,
     {
@@ -329,6 +399,7 @@ impl ManagedTerminalInput {
             receiver,
             shutdown,
             task: Some(task),
+            colors,
         }
     }
 
@@ -359,6 +430,7 @@ impl ManagedTerminalInput {
             receiver,
             shutdown,
             task: None,
+            colors: TerminalColorState::default(),
         }
     }
 
@@ -402,6 +474,7 @@ impl Drop for ManagedTerminalInput {
 pub struct TerminalInput {
     shutdown: watch::Sender<bool>,
     task: Option<JoinHandle<()>>,
+    colors: TerminalColorsHandle,
 }
 
 impl TerminalInput {
@@ -419,12 +492,40 @@ impl TerminalInput {
     where
         P: Program,
     {
+        Self::start_with_colors::<P>(handle, map_error, TerminalColorsHandle::default())
+    }
+
+    /// Start like [`Self::start`], recording terminal color replies into `colors`.
+    ///
+    /// Lets applications create the shared handle before the runtime owns their
+    /// program state.
+    ///
+    /// # Panics
+    ///
+    /// Panics when called outside a Tokio runtime.
+    #[must_use]
+    pub fn start_with_colors<P>(
+        handle: RuntimeHandle<P::Message>,
+        map_error: impl Fn(std::io::Error) -> P::Message + Send + 'static,
+        colors: TerminalColorsHandle,
+    ) -> Self
+    where
+        P: Program,
+    {
         // Bounded like runtime admission: the reader waits rather than buffering.
         #[cfg(unix)]
-        let events = RawEventStream::open(64);
+        let events = RawEventStream::open(64, Some(std::sync::Arc::clone(&colors.0)));
         #[cfg(not(unix))]
         let events = CrosstermEventStream::new();
-        Self::start_stream::<P, _>(handle, map_error, events)
+        let mut input = Self::start_stream::<P, _>(handle, map_error, events);
+        input.colors = colors;
+        input
+    }
+
+    /// Shared view of terminal color replies, announced by [`TERMINAL_COLORS_EVENT`].
+    #[must_use]
+    pub fn terminal_colors(&self) -> TerminalColorsHandle {
+        self.colors.clone()
     }
 
     /// Start private-capable ingress. `gate` routes before ordinary runtime admission.
@@ -536,6 +637,7 @@ impl TerminalInput {
         Self {
             shutdown,
             task: Some(task),
+            colors: TerminalColorsHandle::default(),
         }
     }
 
@@ -565,6 +667,25 @@ impl Drop for TerminalInput {
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
+
+    #[cfg(unix)]
+    #[test]
+    fn color_replies_notify_only_when_the_report_changes() {
+        let colors = super::TerminalColorState::default();
+        let reply = b"\x1b]11;rgb:0000/0000/0000\x1b\\";
+        assert!(super::observe_colors(&colors, reply));
+        assert!(!super::observe_colors(&colors, reply), "unchanged reply");
+        assert!(!super::observe_colors(&colors, b"\x1b]52;c;aGk=\x07"));
+        assert!(super::observe_colors(
+            &colors,
+            b"\x1b]11;rgb:ffff/ffff/ffff\x07"
+        ));
+        let report = *colors.lock().unwrap();
+        assert_eq!(
+            report.background.map(|color| [color.r, color.g, color.b]),
+            Some([255; 3])
+        );
+    }
 
     use bmux_keyboard::{KeyCode, KeyStroke};
     use bmux_tui::event::Event;

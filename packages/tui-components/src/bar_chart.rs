@@ -503,7 +503,7 @@ impl From<crate::theme::ComponentTheme> for BarChartStyles {
         let theme = theme.for_surface(crate::theme::ComponentSurfaceDepth::Normal);
         Self {
             label: theme.text,
-            bar: theme.info.add_modifier(bmux_tui::style::Modifier::BOLD),
+            bar: theme.accent.add_modifier(bmux_tui::style::Modifier::BOLD),
             empty: theme.muted,
             value: theme.muted,
             empty_message: theme.muted,

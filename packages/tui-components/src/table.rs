@@ -1575,12 +1575,12 @@ impl From<crate::theme::ComponentTheme> for TableStyles {
     fn from(theme: crate::theme::ComponentTheme) -> Self {
         let theme = theme.for_surface(crate::theme::ComponentSurfaceDepth::Normal);
         Self {
-            header: theme.info.add_modifier(bmux_tui::style::Modifier::BOLD),
+            header: theme.title,
             row: theme.text,
             selected: theme.selected,
             selected_column: theme.selected,
             selected_cell: theme.warning,
-            hovered: theme.info,
+            hovered: theme.hover,
             disabled: theme.disabled,
             separator: theme.border,
             empty: theme.muted,

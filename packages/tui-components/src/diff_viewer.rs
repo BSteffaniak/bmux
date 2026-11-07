@@ -821,13 +821,21 @@ impl From<crate::theme::ComponentTheme> for DiffViewerStyle {
         Self {
             text: theme.text,
             muted: theme.muted,
-            title: theme.focused,
+            title: theme.title,
             label: theme.text.add_modifier(Modifier::BOLD),
             added: theme.success,
             removed: theme.error,
-            hunk: theme.focused,
-            added_row: defaults.added_row,
-            removed_row: defaults.removed_row,
+            hunk: theme.info,
+            added_row: theme
+                .state_surfaces
+                .success
+                .bg
+                .map_or(defaults.added_row, |_| theme.state_surfaces.success),
+            removed_row: theme
+                .state_surfaces
+                .error
+                .bg
+                .map_or(defaults.removed_row, |_| theme.state_surfaces.error),
             added_emphasis: defaults.added_emphasis,
             removed_emphasis: defaults.removed_emphasis,
         }

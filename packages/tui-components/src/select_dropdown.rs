@@ -838,7 +838,7 @@ impl From<crate::theme::ComponentTheme> for SelectDropdownStyles {
         Self {
             normal: theme.text,
             focused: theme.focused,
-            hovered: theme.info,
+            hovered: theme.hover,
             pressed: theme.selected,
             disabled: theme.disabled,
         }

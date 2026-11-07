@@ -77,6 +77,7 @@ fn hash_border(border: Option<&Border>, state: &mut impl Hasher) {
     border.sides.right.hash(state);
     border.sides.bottom.hash(state);
     border.sides.left.hash(state);
+    border.gradient.hash(state);
 }
 
 /// Horizontal placement inside an assigned component rectangle.
@@ -796,6 +797,17 @@ fn paint_border(
         return;
     }
     let style = background.patch(border.style);
+    let diagonal = width
+        .saturating_sub(1)
+        .saturating_add(height.saturating_sub(1));
+    let style_at = |x: i32, y: i64| {
+        border.gradient.map_or(style, |gradient| {
+            let position = u64::try_from(x)
+                .unwrap_or(0)
+                .saturating_add(u64::try_from(y).unwrap_or(0));
+            gradient.style_at(style, position, diagonal)
+        })
+    };
     let right = i32::try_from(width.saturating_sub(1)).unwrap_or(i32::MAX);
     let bottom = i64::try_from(height.saturating_sub(1)).unwrap_or(i64::MAX);
     let visible = cx.area();
@@ -810,38 +822,55 @@ fn paint_border(
         .x
         .saturating_add(i32::from(visible.width))
         .min(i32::try_from(width).unwrap_or(i32::MAX));
+    let horizontal = border.set.horizontal.to_string();
+    let vertical = border.set.vertical.to_string();
     if sides.top {
         for x in first_column..end_column {
-            cx.set_cell(x, 0, &border.set.horizontal.to_string(), style);
+            cx.set_cell(x, 0, &horizontal, style_at(x, 0));
         }
     }
     if sides.bottom && bottom != 0 {
         for x in first_column..end_column {
-            cx.set_cell(x, bottom, &border.set.horizontal.to_string(), style);
+            cx.set_cell(x, bottom, &horizontal, style_at(x, bottom));
         }
     }
     if sides.left {
         for y in first_row..end_row {
-            cx.set_cell(0, y, &border.set.vertical.to_string(), style);
+            cx.set_cell(0, y, &vertical, style_at(0, y));
         }
     }
     if sides.right && right != 0 {
         for y in first_row..end_row {
-            cx.set_cell(right, y, &border.set.vertical.to_string(), style);
+            cx.set_cell(right, y, &vertical, style_at(right, y));
         }
     }
     if width > 1 && height > 1 {
         if sides.top && sides.left {
-            cx.set_cell(0, 0, &border.set.top_left.to_string(), style);
+            cx.set_cell(0, 0, &border.set.top_left.to_string(), style_at(0, 0));
         }
         if sides.top && sides.right {
-            cx.set_cell(right, 0, &border.set.top_right.to_string(), style);
+            cx.set_cell(
+                right,
+                0,
+                &border.set.top_right.to_string(),
+                style_at(right, 0),
+            );
         }
         if sides.bottom && sides.left {
-            cx.set_cell(0, bottom, &border.set.bottom_left.to_string(), style);
+            cx.set_cell(
+                0,
+                bottom,
+                &border.set.bottom_left.to_string(),
+                style_at(0, bottom),
+            );
         }
         if sides.bottom && sides.right {
-            cx.set_cell(right, bottom, &border.set.bottom_right.to_string(), style);
+            cx.set_cell(
+                right,
+                bottom,
+                &border.set.bottom_right.to_string(),
+                style_at(right, bottom),
+            );
         }
     }
 }
@@ -2190,6 +2219,31 @@ mod tests {
     use crate::geometry::{Insets, Point, Rect};
     use crate::paint::PaintCx;
     use crate::style::{Color, Style};
+
+    #[test]
+    fn gradient_border_runs_corner_to_corner_and_keeps_background() {
+        use crate::gradient::ColorGradient;
+        use bmux_color::Rgb;
+
+        let from = Rgb::new(0xff, 0x00, 0xaa);
+        let to = Rgb::new(0x00, 0xff, 0xff);
+        let card = Surface::new(TextBlock::new("hi"))
+            .background(Style::new().bg(Color::Blue))
+            .border(Border::rounded().gradient(ColorGradient::new(from, to)));
+        let layout = card.layout(Constraints::for_width(10), &mut LayoutCx::new());
+        let width = u16::try_from(layout.size.width).unwrap();
+        let height = u16::try_from(layout.size.height).unwrap();
+        let mut buffer = Buffer::empty(Rect::new(0, 0, width, height));
+        let mut frame = Frame::new(&mut buffer);
+        card.paint(&layout, &mut PaintCx::new(&mut frame));
+
+        let cell = |x, y| frame.buffer().get(Point::new(x, y)).unwrap().clone();
+        assert_eq!(cell(0, 0).symbol, "╭");
+        assert_eq!(cell(0, 0).style.fg, Some(Color::from(from)));
+        assert_eq!(cell(width - 1, height - 1).style.fg, Some(Color::from(to)));
+        assert_ne!(cell(width - 1, 0).style.fg, cell(0, 0).style.fg);
+        assert_eq!(cell(width - 1, 0).style.bg, Some(Color::Blue));
+    }
 
     #[test]
     fn overlay_clips_wide_cells_images_and_invisible_modal_targets() {

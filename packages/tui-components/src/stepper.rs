@@ -411,7 +411,7 @@ impl From<crate::theme::ComponentTheme> for StepperStyles {
         let theme = theme.for_surface(crate::theme::ComponentSurfaceDepth::Normal);
         Self {
             pending: theme.muted,
-            current: theme.info.add_modifier(bmux_tui::style::Modifier::BOLD),
+            current: theme.accent.add_modifier(bmux_tui::style::Modifier::BOLD),
             complete: theme.success,
             warning: theme.warning.add_modifier(bmux_tui::style::Modifier::BOLD),
             error: theme.error.add_modifier(bmux_tui::style::Modifier::BOLD),

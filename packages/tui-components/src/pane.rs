@@ -5,7 +5,7 @@
 use std::cell::Cell;
 use std::hash::{Hash, Hasher};
 
-use bmux_tui::chrome::Border;
+use bmux_tui::chrome::BorderSet;
 use bmux_tui::component::{
     ChildLayout, Component, ComponentRevision, Constraints, Element, EventCx, LayoutCx, LayoutId,
     LayoutNode,
@@ -319,6 +319,7 @@ pub struct Pane<'a> {
     border: bool,
     policy: PanePolicy,
     styles: PaneStyles,
+    chrome: crate::theme::ComponentChrome,
     _marker: std::marker::PhantomData<&'a ()>,
 }
 
@@ -346,8 +347,16 @@ impl Pane<'_> {
                 border: Style::new(),
                 focused_border: Style::new().add_modifier(Modifier::REVERSED),
             },
+            chrome: crate::theme::ComponentChrome::DEFAULT,
             _marker: std::marker::PhantomData,
         }
+    }
+
+    /// Set border glyphs and focus effects.
+    #[must_use]
+    pub const fn chrome(mut self, chrome: crate::theme::ComponentChrome) -> Self {
+        self.chrome = chrome;
+        self
     }
 
     /// Set pane title.
@@ -848,7 +857,11 @@ impl<'a, 'state> PaneComponent<'a, 'state> {
             .id(format!("{}.surface", self.id.as_str()))
             .padding(self.pane.padding);
         if self.pane.border {
-            surface = surface.border(Border::single().style(border_style));
+            surface = surface.border(self.pane.chrome.border(
+                BorderSet::SINGLE,
+                border_style,
+                self.state.get().interaction.focused,
+            ));
         }
         if let Some(background) = self.pane.styles.background {
             surface = surface.background(background);
@@ -1320,7 +1333,7 @@ impl From<crate::theme::ComponentTheme> for PaneStyles {
         Self {
             background: Some(theme.surfaces.raised),
             border: theme.border,
-            focused_border: theme.focused,
+            focused_border: theme.border_focused,
         }
     }
 }

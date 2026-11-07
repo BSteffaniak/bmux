@@ -49,6 +49,8 @@ pub mod date_picker;
 pub mod dialog;
 #[cfg(feature = "diff-viewer")]
 pub mod diff_viewer;
+#[cfg(feature = "disclosure")]
+pub mod disclosure;
 #[cfg(feature = "empty-state")]
 pub mod empty_state;
 #[cfg(feature = "form")]

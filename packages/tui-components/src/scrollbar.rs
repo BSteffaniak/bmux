@@ -547,7 +547,7 @@ impl From<crate::theme::ComponentTheme> for ScrollbarStyles {
         Self {
             begin: theme.border,
             track: theme.border,
-            thumb: theme.info,
+            thumb: theme.accent,
             end: theme.border,
         }
     }

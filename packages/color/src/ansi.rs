@@ -4,6 +4,8 @@
 //! the xterm defaults. Callers that know the terminal's actual palette (for
 //! example, from an OSC 4 query) should use [`nearest_in`] with that palette.
 
+use std::sync::OnceLock;
+
 use crate::{Oklab, Rgb};
 
 /// Default xterm RGB values for ANSI indices 0–15.
@@ -56,15 +58,26 @@ pub const fn xterm_256(index: u8) -> Rgb {
 /// matching against their defaults would produce unpredictable output.
 #[must_use]
 pub fn nearest_256(color: Rgb) -> u8 {
+    static EXTENDED: OnceLock<[Oklab; 240]> = OnceLock::new();
+    let palette = EXTENDED.get_or_init(|| {
+        std::array::from_fn(|offset| {
+            #[allow(clippy::cast_possible_truncation)] // offset < 240, so 16 + offset <= 255.
+            let index = 16 + offset as u8;
+            Oklab::from_rgb(xterm_256(index))
+        })
+    });
     let target = Oklab::from_rgb(color);
-    let mut best = (16_u8, f64::INFINITY);
-    for index in 16..=255_u8 {
-        let distance = Oklab::from_rgb(xterm_256(index)).distance_squared(target);
-        if distance < best.1 {
-            best = (index, distance);
-        }
-    }
-    best.0
+    let offset = palette
+        .iter()
+        .enumerate()
+        .min_by(|a, b| {
+            a.1.distance_squared(target)
+                .total_cmp(&b.1.distance_squared(target))
+        })
+        .map_or(0, |(offset, _)| offset);
+    #[allow(clippy::cast_possible_truncation)] // offset < 240.
+    let index = 16 + offset as u8;
+    index
 }
 
 /// Return the perceptually nearest ANSI 16-color index using xterm defaults.
