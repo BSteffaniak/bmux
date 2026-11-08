@@ -15,7 +15,47 @@ struct RuntimePin {
 /// Root owner joins actual primary-runtime destruction. Never detaches cleanup.
 pub struct RuntimeDriver {
     owner: Option<RuntimeOwner>,
-    driver: Option<std::thread::JoinHandle<()>>,
+    driver: Option<DriverThread>,
+}
+struct DriverThread {
+    join: std::thread::JoinHandle<()>,
+    // Disconnected only after the driver destroyed the runtime (or panicked).
+    finished: std::sync::mpsc::Receiver<()>,
+    pins: std::sync::Weak<RuntimePin>,
+}
+/// First notice while shutdown waits for retained execution pins.
+const RELEASE_NOTICE_AFTER: std::time::Duration = std::time::Duration::from_secs(5);
+/// Repeat interval for subsequent notices.
+const RELEASE_NOTICE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+impl DriverThread {
+    /// Wait for actual runtime destruction, never detaching it. A wait that
+    /// outlives the notice threshold is reported (with the number of retained
+    /// owner pins) so an unresolved retained execution is diagnosable instead
+    /// of an unexplained hang.
+    fn join(self) -> std::thread::Result<()> {
+        let started = std::time::Instant::now();
+        let mut notice_at = RELEASE_NOTICE_AFTER;
+        loop {
+            let remaining = notice_at.saturating_sub(started.elapsed());
+            match self.finished.recv_timeout(remaining) {
+                Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    let retained = self.pins.strong_count();
+                    let waited = started.elapsed().as_secs();
+                    tracing::warn!(
+                        retained_pins = retained,
+                        waited_secs = waited,
+                        "primary runtime shutdown waiting for retained execution owners"
+                    );
+                    eprintln!(
+                        "bmux: shutdown has waited {waited}s for {retained} retained runtime owner pin(s); unresolved plugin cleanup keeps the primary runtime alive"
+                    );
+                    notice_at = started.elapsed() + RELEASE_NOTICE_INTERVAL;
+                }
+            }
+        }
+        self.join.join()
+    }
 }
 impl RuntimeDriver {
     /// Transfer an already configured primary runtime to its lifetime driver.
@@ -30,20 +70,28 @@ impl RuntimeDriver {
         }
         let handle = runtime.handle().clone();
         let (keepalive, released) = std::sync::mpsc::channel();
-        let driver = std::thread::Builder::new()
+        let (finished_tx, finished) = std::sync::mpsc::channel::<()>();
+        let join = std::thread::Builder::new()
             .name("bmux-runtime-owner".into())
             .spawn(move || {
                 // Multi-thread runtime workers continue driving all accepted
                 // work while this non-runtime thread waits for owner release.
                 let _ = released.recv();
                 drop(runtime);
+                drop(finished_tx);
             })?;
+        let owner = RuntimeOwner(Arc::new(RuntimePin {
+            handle,
+            _keepalive: keepalive,
+        }));
+        let pins = Arc::downgrade(&owner.0);
         Ok(Self {
-            owner: Some(RuntimeOwner(Arc::new(RuntimePin {
-                handle,
-                _keepalive: keepalive,
-            }))),
-            driver: Some(driver),
+            owner: Some(owner),
+            driver: Some(DriverThread {
+                join,
+                finished,
+                pins,
+            }),
         })
     }
     /// Clone the actual runtime owner while this driver is open.

@@ -30,12 +30,17 @@ fn workspace_root() -> PathBuf {
 }
 
 /// Generate the thin dynamic wrapper for the example with the shared
-/// packaging generator, build it into the same target directory and profile
-/// as the `bmux` binary under test, and return the library Cargo reported.
+/// packaging generator, build it with the same profile as the `bmux` binary
+/// under test, and return the library Cargo reported.
 ///
 /// The implementation crate stays an export-free rlib; only the generated
 /// wrapper is a `cdylib`. The wrapper reuses the workspace lockfile so it
-/// links exactly the dependency versions the host was built with.
+/// links exactly the dependency versions the host was built with. It builds
+/// into a target directory dedicated to generated wrappers, never the
+/// workspace's own: the out-of-tree wrapper workspace spells path crates'
+/// sources absolutely while the workspace spells its members relatively, so
+/// sharing one directory lets either build reuse or overwrite the other's
+/// artifacts and mixes two copies of one crate (e.g. `bmux_tui`) in a graph.
 fn build_example_cdylib() -> PathBuf {
     let root = workspace_root();
     let profile_dir = support::bmux_binary()
@@ -47,6 +52,9 @@ fn build_example_cdylib() -> PathBuf {
         .file_name()
         .is_some_and(|name| name == "release");
     let wrapper = target_dir.join("plugin-packaging/native-plugin-identity/backend");
+    // Shared with other generated wrappers (same source spelling), kept across
+    // runs for incremental builds, and outside the regenerated wrapper.
+    let wrapper_target_dir = target_dir.join("plugin-packaging/wrapper-target");
     // Regenerate from scratch: the generator refuses to overwrite a
     // directory it does not own, and stale sources must never be reused.
     if wrapper.exists() {
@@ -91,7 +99,7 @@ fn build_example_cdylib() -> PathBuf {
         ])
         .arg(wrapper.join("Cargo.toml"))
         .arg("--target-dir")
-        .arg(target_dir)
+        .arg(&wrapper_target_dir)
         .stderr(Stdio::inherit());
     if release {
         build.arg("--release");

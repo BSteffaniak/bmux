@@ -66,7 +66,13 @@ pub fn authorize(context: &NativeServiceContext) -> Result<(), ServiceResponse> 
     let origin = block_on_typed_dispatch(clients_identity::client::current_stream_provenance(
         &mut client,
     ))
-    .map_err(|_| denied("provenance_dispatch_unavailable"))?
+    .map_err(|error| {
+        // Keep the wire denial generic, but retain the transport cause for
+        // operators: a nested-dispatch rejection is otherwise indistinguishable
+        // from a missing provider.
+        tracing::warn!(%error, "cluster admission provenance dispatch failed");
+        denied("provenance_dispatch_unavailable")
+    })?
     .map_err(|_| denied("provenance_unavailable"))?;
     match origin {
         StreamProvenance::Local | StreamProvenance::HostInternal => Ok(()),

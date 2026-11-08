@@ -709,7 +709,7 @@ impl ProductionPlugin {
         args: &[String],
         context: Option<&NativeCommandContext>,
     ) -> bmux_plugin_sdk::Result<(i32, PluginCommandOutcome)> {
-        self.run_command_with_dispatch(command, args, context, None)
+        self.run_command_with_dispatch(command, args, context, None, None)
     }
 
     /// Activate a command-only scoped instance before its first command.
@@ -776,17 +776,33 @@ impl ProductionPlugin {
         Ok(())
     }
 
+    /// Run one command on its explicitly selected authority.
+    ///
+    /// `command_route` is the issuing CLI's selected transport; `authority` is
+    /// the authenticated server invocation that requested the command (for
+    /// example the core CLI bridge service). At most one may be supplied: a
+    /// command never merges two callers' authority, and without either it only
+    /// has this instance's lifecycle authority.
     pub(in crate::runtime) fn run_command_with_dispatch(
         &self,
         command: &str,
         args: &[String],
         context: Option<&NativeCommandContext>,
         command_route: Option<&crate::runtime::plugin_kernel::CommandDispatch>,
+        authority: Option<crate::runtime::plugin_kernel::AuthenticatedServiceInvocation>,
     ) -> bmux_plugin_sdk::Result<(i32, PluginCommandOutcome)> {
+        if command_route.is_some() && authority.is_some() {
+            return Err(failure(
+                "plugin command has both a selected transport and a server authority",
+            ));
+        }
         match &self.backend {
-            Backend::Process(plugin) => {
-                plugin.run_command_with_context_and_outcome(command, args, context)
-            }
+            Backend::Process(plugin) => match &authority {
+                Some(authority) => authority.with_legacy_process_context(|| {
+                    plugin.run_command_with_context_and_outcome(command, args, context)
+                }),
+                None => plugin.run_command_with_context_and_outcome(command, args, context),
+            },
             Backend::Scoped(execution) => {
                 let mut context = context
                     .cloned()
@@ -800,18 +816,33 @@ impl ProductionPlugin {
                 if !self.active.load(std::sync::atomic::Ordering::Acquire) {
                     self.activate_scoped_command(execution, &context, command_route)?;
                 }
+                // A server-authenticated command inherits that invocation's
+                // cancellation and callback ancestry, exactly like a provider
+                // dispatched on the same authority; a CLI route supplies its own.
+                let callback_parent = match command_route {
+                    Some(route) => route.parent(),
+                    None => authority
+                        .as_ref()
+                        .map(crate::runtime::plugin_kernel::AuthenticatedServiceInvocation::callback_parent)
+                        .transpose()?
+                        .flatten(),
+                };
+                let cancellation = authority.as_ref().map_or_else(
+                    bmux_plugin_sdk::ServiceCancellation::new,
+                    crate::runtime::plugin_kernel::AuthenticatedServiceInvocation::cancellation,
+                );
+                let kernel = authority
+                    .clone()
+                    .and_then(|authority| self.granted_kernel_dispatch(authority));
                 let invocation = execution.begin_invocation_scope()?;
                 let dispatch = Arc::new(KernelServices {
                     declaration: self.declaration.clone(),
                     instance: execution.scope().id(),
-                    authority: self.lifecycle_authority.get().cloned(),
+                    authority: authority.or_else(|| self.lifecycle_authority.get().cloned()),
                     services: context.services.clone(),
                     builtins: Arc::clone(&self.builtins),
                     command_route: command_route.cloned(),
                 });
-                let cancellation = bmux_plugin_sdk::ServiceCancellation::new();
-                let callback_parent =
-                    command_route.and_then(crate::runtime::plugin_kernel::CommandDispatch::parent);
                 let binding = if let Some(parent) = callback_parent {
                     execution.bind_child_callback(&parent, invocation.clone(), cancellation)?
                 } else {
@@ -827,7 +858,7 @@ impl ProductionPlugin {
                     },
                     binding,
                     Some(dispatch),
-                    None,
+                    kernel,
                 );
                 let id = match started {
                     Ok(id) => id,

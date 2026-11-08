@@ -128,9 +128,27 @@ bmux_plugin_sdk::export_plugin_entrypoint!(packaged_definition);
     return output / "Cargo.toml"
 
 
-def build(manifest: Path, release: bool, target: str | None) -> Path:
+def wrapper_target_dir(manifest: Path, cargo_target_dir: Path | None) -> Path:
+    """Select a Cargo target directory owned by generated wrappers only.
+
+    A wrapper is its own out-of-tree workspace, so Cargo spells every path
+    dependency's sources absolutely, while the implementation's workspace
+    spells its members relative to that workspace root. Both builds can emit
+    the same artifact file names for the same path crates, so sharing one
+    target directory (for example the inherited ``CARGO_TARGET_DIR`` of a
+    development shell) lets one build silently reuse or overwrite the other's
+    rlibs and mixes distinct copies of one crate in a single dependency graph.
+    Never inherit the ambient target directory; wrappers may share a
+    dedicated one with each other because they all spell sources the same way.
+    """
+    return (cargo_target_dir or manifest.parent / "target").resolve()
+
+
+def build(manifest: Path, release: bool, target: str | None,
+          cargo_target_dir: Path | None = None) -> Path:
     """Return the actual cdylib emitted for the wrapper, not a dependency artifact."""
     command = ["cargo", "build", "--manifest-path", str(manifest),
+               "--target-dir", str(wrapper_target_dir(manifest, cargo_target_dir)),
                "--message-format=json-render-diagnostics"]
     if release:
         command.append("--release")
@@ -368,6 +386,8 @@ def main() -> None:
     parser.add_argument("--build", action="store_true")
     parser.add_argument("--release", action="store_true")
     parser.add_argument("--target")
+    parser.add_argument("--cargo-target-dir", type=Path,
+                        help="target directory dedicated to generated wrappers; defaults to <output>/target, never the inherited CARGO_TARGET_DIR")
     parser.add_argument("--install-root", type=Path)
     parser.add_argument("--declaration", type=Path)
     args = parser.parse_args()
@@ -378,6 +398,8 @@ def main() -> None:
         return
     if not all((args.implementation_manifest, args.sdk_manifest, args.output)):
         parser.error("generation requires --implementation-manifest, --sdk-manifest and --output")
+    if args.cargo_target_dir and not args.build:
+        parser.error("--cargo-target-dir requires --build")
     if args.install_root and (not args.build or not args.declaration):
         parser.error("--install-root requires --build and --declaration")
     output = args.output.resolve()
@@ -387,7 +409,7 @@ def main() -> None:
                             output, args.component, args.feature, artifact_id)
         print(manifest)
         if args.build:
-            library = build(manifest, args.release, args.target)
+            library = build(manifest, args.release, args.target, args.cargo_target_dir)
             print(library)
             if args.install_root:
                 print(install(library, args.declaration.resolve(), args.install_root.resolve(),

@@ -539,6 +539,7 @@ impl DefinitionArtifact {
             lifecycle_callback_factory: Mutex::new(None),
             callback_runtime: std::sync::OnceLock::new(),
             callback_runtime_owner: Mutex::new(None),
+            callback_runtime_pin: Mutex::new(None),
             callback_owner: Arc::new(callbacks::CallbackOwner::default()),
             retained_factory: Mutex::new(None),
             retained_dispatch: Mutex::new(None),
@@ -576,6 +577,23 @@ impl DefinitionArtifact {
     }
 }
 
+/// The actual selected reactor owner, shared by an instance and the callback
+/// bindings derived from it. Bindings may be retained by host or author state
+/// after their scopes retire; they must not keep the reactor alive forever.
+/// Revocation happens only after successful instance destruction, which has
+/// drained every admission, child, task and resource, so no admitted callback
+/// entry (the only user of the selected runtime) can exist or be created.
+struct RevocableRuntimePin(Mutex<Option<Arc<dyn std::any::Any + Send + Sync>>>);
+impl RevocableRuntimePin {
+    fn revoke(&self) -> Result<Option<Arc<dyn std::any::Any + Send + Sync>>> {
+        Ok(self
+            .0
+            .lock()
+            .map_err(|_| failure("callback runtime pin poisoned"))?
+            .take())
+    }
+}
+
 enum ExecutionBackend {
     Static(Arc<dyn PluginInstance>),
     Dynamic {
@@ -587,7 +605,11 @@ enum ExecutionBackend {
 pub struct LoadedExecution {
     lifecycle_callback_factory: Mutex<Option<Arc<callbacks::LifecycleCallbackFactory>>>,
     callback_runtime: std::sync::OnceLock<tokio::runtime::Handle>,
+    /// Code-pin view snapshotted by callback bindings. It wraps
+    /// `callback_runtime_pin`, so successful destruction revokes the actual
+    /// runtime owner for the instance and every binding derived from it.
     callback_runtime_owner: Mutex<Option<Arc<dyn std::any::Any + Send + Sync>>>,
+    callback_runtime_pin: Mutex<Option<Arc<RevocableRuntimePin>>>,
     callback_owner: Arc<callbacks::CallbackOwner>,
     retained_factory: Mutex<Option<Arc<RetainedHostFactory>>>,
     retained_dispatch: Mutex<Option<Arc<dyn bmux_plugin_sdk::abi::retained::RetainedHostDispatch>>>,
@@ -1167,7 +1189,9 @@ impl LoadedExecution {
 
     /// Retain the actual selected reactor owner independently of observer lifetime.
     /// Existing callback bindings must not precede this selection. Each later
-    /// binding snapshots the pin; destruction releases only the instance's copy.
+    /// binding shares the instance's pin; successful destruction (which proves
+    /// no admitted entry remains) revokes it for the instance and all bindings,
+    /// so retained bindings cannot keep the reactor alive past retirement.
     /// The host supplies the actual owner, never an identifier or placeholder.
     ///
     /// # Errors
@@ -1198,7 +1222,12 @@ impl LoadedExecution {
                 .set(runtime)
                 .map_err(|_| failure("callback runtime already selected"))?;
         }
-        *owner = Some(pin);
+        let revocable = Arc::new(RevocableRuntimePin(Mutex::new(Some(pin))));
+        *self
+            .callback_runtime_pin
+            .lock()
+            .map_err(|_| failure("callback runtime pin poisoned"))? = Some(revocable.clone());
+        *owner = Some(revocable as Arc<dyn std::any::Any + Send + Sync>);
         drop(owner);
         Ok(())
     }
@@ -2768,8 +2797,17 @@ impl LoadedExecution {
             .lock()
             .map_err(|_| failure("callback runtime owner poisoned"))?
             .take();
-        // Drop outside all loader locks. Accepted bindings own independent pins.
+        let revocable = self
+            .callback_runtime_pin
+            .lock()
+            .map_err(|_| failure("callback runtime pin poisoned"))?
+            .take();
+        // The drained, finished instance scope admits no callback entry, so
+        // retained bindings no longer need the reactor. Revoke the shared pin
+        // and drop the actual owner outside all loader locks.
+        let released = revocable.map(|pin| pin.revoke()).transpose()?;
         drop(owner);
+        drop(released);
         Ok(())
     }
 }
@@ -4855,18 +4893,15 @@ mod tests {
             execution.acknowledge(cleanup).await.unwrap();
             execution.destroy().await.unwrap();
             assert!(execution.callback_runtime_owner.lock().unwrap().is_none());
-            // The retired binding retains its own runtime pin, not the
-            // instance's now-released slot. The external owner is the other pin.
-            assert!(Arc::strong_count(&runtime) >= 2);
+            // A retired binding retained by host/author state can no longer
+            // admit an entry, so it must not keep the reactor alive: successful
+            // destruction revoked the shared pin. The external owner is the
+            // only remaining pin even while the binding and context live on.
+            assert_eq!(Arc::strong_count(&runtime), 1);
+            assert!(binding.enter().is_err());
             drop(context);
             drop(binding);
-            tokio::time::timeout(Duration::from_secs(5), async {
-                while Arc::strong_count(&runtime) != 1 {
-                    tokio::time::sleep(Duration::from_millis(1)).await;
-                }
-            })
-            .await
-            .unwrap();
+            assert_eq!(Arc::strong_count(&runtime), 1);
         });
         drop(runtime);
         assert!(weak.upgrade().is_none());

@@ -2479,6 +2479,7 @@ async fn run_command_on_selected_target(
             Vec::new(),
             bmux_plugin_sdk::NativeCommandInvocationSource::Cli,
             Some(dispatch),
+            None,
         )
     });
     let pump = tokio::spawn(async move {
@@ -2584,6 +2585,7 @@ pub(super) fn run_plugin_keybinding_command_with_dispatch(
         active_keybindings,
         bmux_plugin_sdk::NativeCommandInvocationSource::AttachKeybinding,
         Some(dispatch),
+        None,
     )
 }
 
@@ -2602,6 +2604,32 @@ pub(super) fn run_plugin_command_with_selected_dispatch(
         Vec::new(),
         bmux_plugin_sdk::NativeCommandInvocationSource::Cli,
         Some(dispatch),
+        None,
+    )
+}
+
+/// Run a plugin command requested by an authenticated server caller, such as
+/// the core CLI bridge service. The command's host services dispatch through
+/// this exact server invocation context, so they observe the requesting
+/// client and stream; no cached lifecycle authority, ambient kernel context or
+/// CLI transport stands in for it.
+pub(super) fn run_plugin_command_with_service_authority(
+    state: &RuntimeCommandState,
+    request: &bmux_plugin_sdk::PluginCliCommandRequest,
+    caller_client_id: Option<uuid::Uuid>,
+    authority: super::plugin_kernel::AuthenticatedServiceInvocation,
+) -> Result<PluginCommandExecution> {
+    run_plugin_command_internal_with_state(
+        Some(state),
+        &request.plugin_id,
+        &request.command_name,
+        &request.arguments,
+        None,
+        caller_client_id,
+        Vec::new(),
+        bmux_plugin_sdk::NativeCommandInvocationSource::AttachKeybinding,
+        None,
+        Some(authority),
     )
 }
 
@@ -2622,6 +2650,7 @@ pub(super) fn run_plugin_keybinding_command_with_state(
         caller_client_id,
         Vec::new(),
         bmux_plugin_sdk::NativeCommandInvocationSource::AttachKeybinding,
+        None,
         None,
     )
 }
@@ -2709,6 +2738,7 @@ pub(super) fn run_plugin_command_internal(
         active_keybindings,
         invocation_source,
         None,
+        None,
     )
 }
 
@@ -2767,6 +2797,7 @@ fn run_plugin_command_internal_with_state(
     active_keybindings: Vec<bmux_plugin_sdk::ActiveKeybinding>,
     invocation_source: bmux_plugin_sdk::NativeCommandInvocationSource,
     command_dispatch: Option<super::plugin_kernel::CommandDispatch>,
+    command_authority: Option<super::plugin_kernel::AuthenticatedServiceInvocation>,
 ) -> Result<PluginCommandExecution> {
     let total_started = Instant::now();
     let runtime_state_started = Instant::now();
@@ -2829,6 +2860,7 @@ fn run_plugin_command_internal_with_state(
         args,
         Some(&context),
         command_dispatch.as_ref(),
+        command_authority,
     );
     // The issuing route (and its callback parent lease) ends with the command
     // invocation; deactivation below binds its own lifecycle route.
@@ -3723,28 +3755,50 @@ enabled_by_default = false
         };
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        struct DispatchProbe(Arc<AtomicUsize>);
+        struct DispatchProbe(
+            Arc<AtomicUsize>,
+            bmux_plugin_sdk::definition::LoadedInstanceId,
+        );
         impl PluginInstance for DispatchProbe {
             fn command(
                 &self,
                 call: PluginCallContext,
                 context: NativeCommandContext,
             ) -> PluginFuture<'_, CommandOutcome> {
+                let probe = |port: &bmux_plugin_sdk::definition::PluginHostServices| {
+                    port.invoke(bmux_plugin_sdk::HostServiceRequest {
+                        capability: "example.undeclared",
+                        kind: bmux_plugin_sdk::ServiceKind::Query,
+                        interface: "example.undeclared/v1",
+                        operation: "probe",
+                        payload: &[],
+                    })
+                    .unwrap_err()
+                    .to_string()
+                };
+                let execution = call
+                    .callback_execution
+                    .clone()
+                    .expect("selected command must carry callback authority");
+                let ports = [call.host_services, context.host_service_port]
+                    .map(|port| port.expect("selected command must have owned host services"));
+                // Host services are bound to the actual live author entry: a
+                // direct instance that has not entered its selected callback
+                // authority gets no host effect, never an ambient fallback.
+                for port in &ports {
+                    let error = probe(port);
+                    assert!(error.contains("no live author entry"), "{error}");
+                }
+                let entry = execution
+                    .enter_adapter_entry(self.1)
+                    .expect("selected command should enter its callback authority");
                 // Both surfaces must carry the selected command's owned port,
                 // not an unbound loader port or ambient host-service fallback.
-                for port in [call.host_services, context.host_service_port] {
-                    let error = port
-                        .expect("selected command must have owned host services")
-                        .invoke(bmux_plugin_sdk::HostServiceRequest {
-                            capability: "example.undeclared",
-                            kind: bmux_plugin_sdk::ServiceKind::Query,
-                            interface: "example.undeclared/v1",
-                            operation: "probe",
-                            payload: &[],
-                        })
-                        .unwrap_err();
-                    assert!(error.to_string().contains("not declared by caller"));
+                for port in &ports {
+                    let error = probe(port);
+                    assert!(error.contains("not declared by caller"), "{error}");
                 }
+                drop(entry);
                 self.0.fetch_add(1, Ordering::SeqCst);
                 Box::pin(async {
                     CommandOutcome {
@@ -3767,8 +3821,11 @@ enabled_by_default = false
                 contracts: Vec::new(),
                 manifest_toml: Some(manifest.to_owned()),
             },
-            move |_scope| {
-                Ok(Arc::new(DispatchProbe(Arc::clone(&factory_calls))) as Arc<dyn PluginInstance>)
+            move |scope: bmux_plugin_sdk::definition::PluginCreateContext| {
+                Ok(
+                    Arc::new(DispatchProbe(Arc::clone(&factory_calls), scope.instance))
+                        as Arc<dyn PluginInstance>,
+                )
             },
         );
         (definition, calls)
