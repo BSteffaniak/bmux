@@ -2002,7 +2002,11 @@ pub(super) fn register_plugin_service_handlers(
                             .get(provider_declaration.id.as_str())
                             .cloned(),
                         plugin_settings_map: config.plugins.settings.clone(),
-                        caller_client_id: Some(invoke_context.client_id().0),
+                        // A host-issued context acts for no connected client;
+                        // providers must not mistake its synthetic id for one.
+                        caller_client_id: invoke_context
+                            .connected_client_id()
+                            .map(|client| client.0),
                         cancellation: bmux_plugin_sdk::CancellationToken::default(),
                         host_kernel_bridge: None,
                     };

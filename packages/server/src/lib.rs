@@ -485,6 +485,18 @@ impl ServiceInvokeContext {
         self.client_id
     }
 
+    /// Connected client this invocation acts for, or `None` when the host
+    /// issued the context itself. A host-internal context's client id is a
+    /// synthetic per-context identity, never a connected client.
+    #[must_use]
+    pub const fn connected_client_id(&self) -> Option<ClientId> {
+        if self.host_internal {
+            None
+        } else {
+            Some(self.client_id)
+        }
+    }
+
     /// Plugin a host authenticated as the originator of this invocation, or
     /// `None` when the host itself originated it.
     ///
