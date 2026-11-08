@@ -1,6 +1,6 @@
 //! Transport admission only exposes independently authenticated protocols.
 //! A paired device is neither a cluster member nor a cluster principal.
-use bmux_plugin::{ServiceCallerDispatchClient, TypedServiceCaller, block_on_typed_dispatch};
+use bmux_plugin::{ServiceCaller, StreamOrigin, TypedServiceCaller};
 use bmux_plugin_sdk::{NativeServiceContext, ServiceKind, ServiceResponse};
 
 const REMOTE_PROTOCOLS: &[(&str, &str, &[&str])] = &[
@@ -57,26 +57,21 @@ fn denied(reason: &'static str) -> ServiceResponse {
 }
 
 pub fn authorize(context: &NativeServiceContext) -> Result<(), ServiceResponse> {
-    use bmux_clients_plugin_api::clients_identity::{self, StreamProvenance};
     if context.cancellation.is_cancelled() {
         return Err(denied("cancelled"));
     }
+    // Origin is a host-intrinsic fact of this invocation (its authenticated
+    // context or command route), never a domain-service answer: asking the
+    // clients plugin re-entered dispatch and is not an admitted route.
     let caller = TypedServiceCaller::from_service_context(context);
-    let mut client = ServiceCallerDispatchClient::new(&caller);
-    let origin = block_on_typed_dispatch(clients_identity::client::current_stream_provenance(
-        &mut client,
-    ))
-    .map_err(|error| {
-        // Keep the wire denial generic, but retain the transport cause for
-        // operators: a nested-dispatch rejection is otherwise indistinguishable
-        // from a missing provider.
-        tracing::warn!(%error, "cluster admission provenance dispatch failed");
-        denied("provenance_dispatch_unavailable")
-    })?
-    .map_err(|_| denied("provenance_unavailable"))?;
+    let origin = caller.current_stream_origin().map_err(|error| {
+        // Keep the wire denial generic, but retain the cause for operators.
+        tracing::warn!(%error, "cluster admission provenance unavailable");
+        denied("provenance_unavailable")
+    })?;
     match origin {
-        StreamProvenance::Local | StreamProvenance::HostInternal => Ok(()),
-        StreamProvenance::Admitted { .. } => {
+        StreamOrigin::Local | StreamOrigin::HostInternal => Ok(()),
+        StreamOrigin::Admitted { .. } => {
             let service = &context.request.service;
             if !routes().iter().any(|route| {
                 route.capability == service.capability.as_str()
@@ -96,6 +91,6 @@ pub fn authorize(context: &NativeServiceContext) -> Result<(), ServiceResponse> 
             // verify request-bound signatures, credentials and transitions.
             Ok(())
         }
-        StreamProvenance::Invalid => Err(denied("invalid_lease")),
+        StreamOrigin::Invalid => Err(denied("invalid_lease")),
     }
 }

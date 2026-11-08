@@ -1650,9 +1650,7 @@ mod tests {
             operation: &str,
             request: &T,
         ) -> ServiceResponse {
-            let _origin = provenance_router(
-                bmux_clients_plugin_api::clients_identity::StreamProvenance::Local,
-            );
+            let _origin = provenance_router(bmux_plugin::StreamOrigin::Local);
             let context = service_test_context(
                 self.fixture
                     .dir
@@ -2787,48 +2785,39 @@ mod tests {
     }
 
     fn provenance_router(
-        origin: bmux_clients_plugin_api::clients_identity::StreamProvenance,
+        origin: bmux_plugin::StreamOrigin,
     ) -> bmux_plugin::test_support::TestServiceRouterGuard {
         provenance_router_with(move || origin.clone())
     }
 
     fn provenance_router_with(
-        origin: impl Fn() -> bmux_clients_plugin_api::clients_identity::StreamProvenance
-        + Send
-        + Sync
-        + 'static,
+        origin: impl Fn() -> bmux_plugin::StreamOrigin + Send + Sync + 'static,
     ) -> bmux_plugin::test_support::TestServiceRouterGuard {
         bmux_plugin::test_support::install_test_service_router(Arc::new(
             // Test router has a fixed by-value PluginError signature.
             #[allow(clippy::result_large_err)]
-            move |_, _, _, _, interface, operation, payload| {
-                use bmux_clients_plugin_api::clients_identity;
-                if (interface, operation) != ("clients-identity/v1", "current-stream-provenance") {
+            move |_, _, _, _, interface, operation, _payload| {
+                // Admission must ask the host invocation intrinsic, never a
+                // domain service such as clients-identity.
+                if (interface, operation)
+                    != (
+                        bmux_plugin_sdk::CORE_INVOCATION_INTERFACE_V1,
+                        bmux_plugin_sdk::CORE_INVOCATION_STREAM_ORIGIN_OPERATION_V1,
+                    )
+                {
                     return Err(bmux_plugin_sdk::PluginError::UnsupportedHostOperation {
                         operation: "test_router",
                     });
                 }
-                bmux_plugin_sdk::service_contract::decode_for(
-                    interface,
-                    clients_identity::SERVICE_CONTRACT,
-                    &payload,
-                )?;
-                let response =
-                    bmux_plugin_sdk::encode_service_message(&Ok::<
-                        _,
-                        clients_identity::IdentityError,
-                    >(origin()))?;
-                Ok(bmux_plugin_sdk::service_contract::encode_response(
-                    &response,
-                ))
+                bmux_plugin_sdk::encode_service_message(&origin())
             },
         ))
     }
 
     #[test]
     fn admitted_origin_cannot_invoke_admin_signing_or_control_services() {
-        use bmux_clients_plugin_api::clients_identity::StreamProvenance;
-        let _origin = provenance_router(StreamProvenance::Admitted {
+        use bmux_plugin::StreamOrigin;
+        let _origin = provenance_router(StreamOrigin::Admitted {
             subject_id: Uuid::new_v4(),
             lease_id: Uuid::new_v4(),
         });
@@ -2856,7 +2845,7 @@ mod tests {
 
     #[test]
     fn invalid_revoked_and_cancelled_origins_fail_closed() {
-        use bmux_clients_plugin_api::clients_identity::StreamProvenance;
+        use bmux_plugin::StreamOrigin;
         use std::sync::atomic::{AtomicBool, Ordering};
         let revoked = Arc::new(AtomicBool::new(false));
         let current_revoked = revoked.clone();
@@ -2864,9 +2853,9 @@ mod tests {
             // Models the host registry's live validate result, not cached
             // admitted metadata: revocation changes provenance to Invalid.
             if current_revoked.load(Ordering::SeqCst) {
-                StreamProvenance::Invalid
+                StreamOrigin::Invalid
             } else {
-                StreamProvenance::Admitted {
+                StreamOrigin::Admitted {
                     subject_id: Uuid::nil(),
                     lease_id: Uuid::nil(),
                 }
@@ -2883,7 +2872,7 @@ mod tests {
         revoked.store(true, Ordering::SeqCst);
         assert!(admission::authorize(&context).is_err());
         drop(origin_guard);
-        let _origin = provenance_router(StreamProvenance::HostInternal);
+        let _origin = provenance_router(StreamOrigin::HostInternal);
         let mut context = service_test_context("/unused", "cluster-command/v1", "init", &(), None);
         context.cancellation.cancel();
         assert!(admission::authorize(&context).is_err());
@@ -2891,8 +2880,8 @@ mod tests {
 
     #[test]
     fn local_and_host_internal_preserve_lifecycle_access() {
-        use bmux_clients_plugin_api::clients_identity::StreamProvenance;
-        for origin in [StreamProvenance::Local, StreamProvenance::HostInternal] {
+        use bmux_plugin::StreamOrigin;
+        for origin in [StreamOrigin::Local, StreamOrigin::HostInternal] {
             let _origin = provenance_router(origin);
             let context = service_test_context("/unused", "cluster-command/v1", "init", &(), None);
             assert!(admission::authorize(&context).is_ok());
@@ -2901,8 +2890,8 @@ mod tests {
 
     #[test]
     fn admitted_protocol_routes_require_independent_cluster_proofs() {
-        use bmux_clients_plugin_api::clients_identity::StreamProvenance;
-        let _origin = provenance_router(StreamProvenance::Admitted {
+        use bmux_plugin::StreamOrigin;
+        let _origin = provenance_router(StreamOrigin::Admitted {
             subject_id: Uuid::new_v4(),
             lease_id: Uuid::new_v4(),
         });
