@@ -157,6 +157,39 @@ impl RustPlugin for PermissionsPlugin {
         Ok(EXIT_OK)
     }
 
+    /// Admit exactly the session policy check to admitted streams. Providers
+    /// serving an admitted caller (pane execution for a paired terminal) ask
+    /// it on that caller's stream; the check derives the subject from the
+    /// host-recorded origin and the device grant, never from request fields.
+    /// Every other permissions route stays local-only.
+    fn register_contributions(
+        &self,
+        registrar: &mut bmux_plugin_sdk::ContributionRegistrar,
+    ) -> bmux_plugin_sdk::Result<()> {
+        use bmux_permissions_plugin_api::session_policy_state;
+        use bmux_plugin::stream_admission::{
+            STREAM_ADMITTED_ROUTES_EXTENSION, StreamAdmittedRoute,
+        };
+        let routes = vec![StreamAdmittedRoute {
+            capability: "bmux.sessions.policy".into(),
+            kind: ServiceKind::Query,
+            interface_id: session_policy_state::INTERFACE_ID.to_string(),
+            operation: session_policy_state::OP_CHECK.to_string(),
+        }];
+        registrar
+            .register(bmux_plugin_sdk::PluginContribution::Extension {
+                id: "permissions.admitted-policy-check-route".into(),
+                extension_point: STREAM_ADMITTED_ROUTES_EXTENSION.into(),
+                payload: bmux_plugin_sdk::encode_service_message(&routes)?,
+            })
+            .map_err(
+                |details| bmux_plugin_sdk::PluginError::InvalidNativeServiceOutput {
+                    plugin_id: "bmux.permissions".into(),
+                    details,
+                },
+            )
+    }
+
     fn invoke_service(&self, context: NativeServiceContext) -> ServiceResponse {
         bmux_plugin_sdk::route_service!(context, {
             "permissions-state", "list-permissions" => |req: ListPermissionsRequest, ctx| {
