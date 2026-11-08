@@ -963,9 +963,10 @@ impl AuthenticatedServiceInvocation {
             })
     }
 
-    /// Exercise selected transport dispatch without a plugin scope in host tests.
-    #[cfg(test)]
-    fn execute_response(
+    /// Selected transport dispatch for host-owned work outside any plugin
+    /// invocation scope (e.g. a host watcher acting for its own plugin). The
+    /// placement, cancellation and server authority checks are unchanged.
+    pub(in crate::runtime) fn execute_response(
         &self,
         request: &[u8],
     ) -> bmux_plugin_sdk::Result<bmux_ipc::ResponsePayload> {

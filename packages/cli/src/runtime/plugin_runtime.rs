@@ -1489,6 +1489,7 @@ pub(super) fn managed_companion_caller(
     config: &BmuxConfig,
     paths: &ConfigPaths,
     bridge: bmux_plugin_sdk::HostKernelBridge,
+    host_context: bmux_server::ServiceInvokeContext,
 ) -> Result<bmux_plugin::TypedServiceCaller> {
     let plugin = loaded_plugins
         .iter()
@@ -1527,6 +1528,31 @@ pub(super) fn managed_companion_caller(
         },
     );
     context.host_kernel_bridge = Some(bridge);
+    // Typed calls go through the server's own service dispatch on the host
+    // context, attributed to the execution plugin this watcher acts for. The
+    // legacy in-process resolver cannot reach scoped startup instances (it
+    // tries to load the provider natively and fails), so it is never the route.
+    let authority = super::plugin_kernel::AuthenticatedServiceInvocation::new(host_context)
+        .with_plugin_caller(&plugin.declaration.id);
+    context.host_service_port = Some(bmux_plugin_sdk::PluginHostServices::new(move |request| {
+        let protocol = |details: String| bmux_plugin_sdk::PluginError::ServiceProtocol { details };
+        let kind = super::plugin_kernel::invoke_kind_from_service_kind(request.kind)
+            .ok_or_else(|| protocol("managed watcher cannot invoke event services".into()))?;
+        let encoded = bmux_ipc::encode(&bmux_ipc::Request::InvokeService {
+            capability: request.capability.to_owned(),
+            kind,
+            interface_id: request.interface.to_owned(),
+            operation: request.operation.to_owned(),
+            payload: request.payload.to_vec(),
+        })
+        .map_err(|error| protocol(error.to_string()))?;
+        match authority.execute_response(&encoded)? {
+            bmux_ipc::ResponsePayload::ServiceInvoked { payload } => Ok(payload),
+            _ => Err(protocol(
+                "unexpected response to managed watcher service call".into(),
+            )),
+        }
+    }));
     Ok(bmux_plugin::TypedServiceCaller::from_lifecycle_context(
         &context,
     ))

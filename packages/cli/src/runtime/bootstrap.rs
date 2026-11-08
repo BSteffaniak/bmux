@@ -899,6 +899,7 @@ async fn run_server_start_inner(
                 &config,
                 &paths,
                 context.bridge(),
+                server.host_service_context(),
             )
         })
         .transpose()?;
