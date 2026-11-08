@@ -122,7 +122,7 @@ impl KernelServices {
             command_route: self
                 .command_route
                 .clone()
-                .map(|route| route.with_parent(entry.clone())),
+                .map(|route| route.with_parent(entry)),
             runtime: self.runtime.clone(),
         }
     }

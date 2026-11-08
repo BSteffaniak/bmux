@@ -402,7 +402,10 @@ pub(in crate::runtime) struct CommandDispatch {
     slots: Arc<tokio::sync::Semaphore>,
     scopes: CommandScopes,
     state: Option<Arc<super::plugin_runtime::RuntimeCommandState>>,
-    parent: Option<bmux_plugin::CallbackEntryLease>,
+    // Weak: the nested command that receives this route may retain it after
+    // its call ends. A strong lease would keep the issuing command's
+    // invocation admitted forever, so the outer command could never settle.
+    parent: Option<bmux_plugin::WeakCallbackEntryLease>,
     cancellation: bmux_plugin_sdk::ServiceCancellation,
 }
 pub(in crate::runtime) struct CommandDispatchOwner {
@@ -580,14 +583,17 @@ impl CommandDispatch {
         self.state = Some(Arc::new(state));
         self
     }
+    /// The issuing callback entry while it is still running.
     pub(in crate::runtime) fn parent(&self) -> Option<bmux_plugin::CallbackEntryLease> {
-        self.parent.clone()
+        self.parent
+            .as_ref()
+            .and_then(bmux_plugin::WeakCallbackEntryLease::upgrade)
     }
     pub(in crate::runtime) fn with_parent(
         mut self,
-        parent: bmux_plugin::CallbackEntryLease,
+        parent: &bmux_plugin::CallbackEntryLease,
     ) -> Self {
-        self.parent = Some(parent);
+        self.parent = Some(parent.downgrade());
         self
     }
     /// Dispatch one typed service request on the issuing connection.
@@ -659,7 +665,7 @@ impl CommandDispatch {
             _admission: admission,
             invocation: invocation.clone(),
             scopes: self.scopes.clone(),
-            _parent: self.parent.clone(),
+            _parent: self.parent(),
             _slot: self.slots.clone().try_acquire_owned().map_err(|_| {
                 command_dispatch_error(
                     "selected command capacity exhausted; request not dispatched".into(),

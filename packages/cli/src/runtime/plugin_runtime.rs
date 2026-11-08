@@ -48,10 +48,18 @@ pub(super) struct RuntimeCommandState {
 thread_local! {
     static RUNTIME_COMMAND_STATE_CACHE: RefCell<Option<RuntimeCommandState>> = const { RefCell::new(None) };
     static LOADED_PLUGIN_CACHE: RefCell<BTreeMap<String, Rc<ProductionPlugin>>> = const { RefCell::new(BTreeMap::new()) };
-    static EXECUTION_LOADER: bmux_plugin::NativePluginLoader = bmux_plugin::NativePluginLoader::new();
-    static EXECUTION_SCOPE: bmux_plugin_runtime::PluginRuntimeScopeId = bmux_plugin_runtime::PluginRuntimeScopeId::new();
-    static HOST_STATE: Arc<bmux_plugin::PluginStateRegistry> = Arc::new(bmux_plugin::PluginStateRegistry::new());
 }
+
+// One plugin runtime scope, loader and host state per process, never per OS
+// thread: nested plugin commands run on callback threads, and a thread-local
+// scope made their instances a "different runtime" from their parent entry,
+// so child callback binding was rejected.
+static EXECUTION_LOADER: std::sync::LazyLock<bmux_plugin::NativePluginLoader> =
+    std::sync::LazyLock::new(bmux_plugin::NativePluginLoader::new);
+static EXECUTION_SCOPE: std::sync::LazyLock<bmux_plugin_runtime::PluginRuntimeScopeId> =
+    std::sync::LazyLock::new(bmux_plugin_runtime::PluginRuntimeScopeId::new);
+static HOST_STATE: std::sync::LazyLock<Arc<bmux_plugin::PluginStateRegistry>> =
+    std::sync::LazyLock::new(|| Arc::new(bmux_plugin::PluginStateRegistry::new()));
 
 pub(super) fn plugin_host_metadata() -> HostMetadata {
     HostMetadata {
@@ -470,29 +478,23 @@ fn load_plugin_with_definitions(
         })?
         .paths;
     let approvals = kernel_policy::load_native_approvals(&paths)?;
-    EXECUTION_SCOPE.with(|scope| {
-        HOST_STATE.with(|state| {
-            EXECUTION_LOADER.with(|loader| {
-                ProductionPlugin::load(
-                    plugin,
-                    host,
-                    available_capabilities,
-                    config,
-                    selected::ExecutionOwner {
-                        runtime_owner: selected_command_state().ok().and_then(|state| {
-                            state.runtime_owner.and_then(|owner| owner.upgrade())
-                        }),
-                        runtime: *scope,
-                        host_state: Arc::clone(state),
-                        loader,
-                        definitions,
-                        approval_store: approvals.as_ref(),
-                        runtime_dir: &paths.runtime_dir,
-                    },
-                )
-            })
-        })
-    })
+    ProductionPlugin::load(
+        plugin,
+        host,
+        available_capabilities,
+        config,
+        selected::ExecutionOwner {
+            runtime_owner: selected_command_state()
+                .ok()
+                .and_then(|state| state.runtime_owner.and_then(|owner| owner.upgrade())),
+            runtime: *EXECUTION_SCOPE,
+            host_state: Arc::clone(&HOST_STATE),
+            loader: &EXECUTION_LOADER,
+            definitions,
+            approval_store: approvals.as_ref(),
+            runtime_dir: &paths.runtime_dir,
+        },
+    )
 }
 
 const fn native_service_buffer_config(config: &BmuxConfig) -> NativeServiceBufferConfig {
@@ -2981,13 +2983,11 @@ fn standalone_provider_definitions(
     {
         BTreeMap::from([(
             "bmux.recording".to_string(),
-            HOST_STATE.with(|host| {
-                recording_binding::definition(
-                    recording_binding::configuration(&state.config, &state.paths),
-                    Arc::clone(host),
-                    Arc::new(bmux_plugin::EventBus::new()),
-                )
-            }),
+            recording_binding::definition(
+                recording_binding::configuration(&state.config, &state.paths),
+                Arc::clone(&HOST_STATE),
+                Arc::new(bmux_plugin::EventBus::new()),
+            ),
         )])
     }
     #[cfg(not(feature = "bundled-plugin-recording"))]

@@ -36,7 +36,7 @@ threads-required = "num-cpus"
 # it, and drive nested shells through it. Run concurrently, their servers miss
 # fixed readiness deadlines, so reserve host capacity like the fixtures above.
 [[profile.default.overrides]]
-filter = 'binary(application_resurrection_integration)'
+filter = 'binary(application_resurrection_integration) | binary(group_move_integration)'
 threads-required = "num-cpus"
 
 # Mutual-authentication fixtures run multiple real servers and Raft voters.

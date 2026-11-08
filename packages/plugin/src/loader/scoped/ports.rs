@@ -397,6 +397,11 @@ impl HostPorts {
         Ok(())
     }
 }
+/// The ABI carries only a status code, so record why a host callback failed
+/// on the host side; otherwise a failed native host call leaves no trace.
+fn log_callback_failure(error: &bmux_plugin_sdk::PluginError) {
+    tracing::warn!(target: "bmux_plugin::native_ports", %error, "native host callback failed");
+}
 fn lookup(handle: u64) -> Result<Arc<HostPorts>> {
     registry()
         .lock()
@@ -408,7 +413,10 @@ fn lookup(handle: u64) -> Result<Arc<HostPorts>> {
 fn guarded(work: impl FnOnce() -> Result<()>) -> AbiStatus {
     match catch_unwind(AssertUnwindSafe(work)) {
         Ok(Ok(())) => abi::OK,
-        Ok(Err(_)) => abi::FAILED,
+        Ok(Err(error)) => {
+            log_callback_failure(&error);
+            abi::FAILED
+        }
         Err(_) => abi::PANICKED,
     }
 }
@@ -663,8 +671,8 @@ unsafe extern "C" fn host_begin(
                 drop(state);
                 // The native caller only sees a status code; keep the cause.
                 match other {
-                    Err(error) => tracing::debug!(%error, "native host invocation failed"),
-                    Ok(bytes) => tracing::debug!(
+                    Err(error) => tracing::warn!(%error, "native host invocation failed"),
+                    Ok(bytes) => tracing::warn!(
                         len = bytes.len(),
                         "native host invocation exceeded its response budget"
                     ),
@@ -850,7 +858,10 @@ fn lookup_availability(
     match outcome {
         Ok(Ok(bytes)) if bytes.len() <= abi::MAX_BUFFER_BYTES => ChildOutcome::Bytes(bytes),
         Ok(Ok(_)) => ChildOutcome::Failed(abi::LIMIT_EXCEEDED),
-        Ok(Err(_)) => ChildOutcome::Failed(abi::FAILED),
+        Ok(Err(error)) => {
+            log_callback_failure(&error);
+            ChildOutcome::Failed(abi::FAILED)
+        }
         Err(_) => ChildOutcome::Failed(abi::PANICKED),
     }
 }
@@ -994,7 +1005,10 @@ unsafe extern "C" fn kernel_begin(
         })) {
             Ok(Ok(bytes)) if bytes.len() <= abi::MAX_BUFFER_BYTES => ChildOutcome::Bytes(bytes),
             Ok(Ok(_)) => ChildOutcome::Failed(abi::LIMIT_EXCEEDED),
-            Ok(Err(_)) => ChildOutcome::Failed(abi::FAILED),
+            Ok(Err(error)) => {
+                log_callback_failure(&error);
+                ChildOutcome::Failed(abi::FAILED)
+            }
             Err(_) => ChildOutcome::Failed(abi::PANICKED),
         };
         port.state
