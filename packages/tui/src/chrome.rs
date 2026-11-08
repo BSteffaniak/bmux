@@ -143,6 +143,46 @@ impl Default for BorderSides {
     }
 }
 
+/// Optional per-side border style overrides.
+///
+/// Each override is patched over [`Border::style`] for the cells of that side.
+/// Corner cells join two sides and take the vertical (left or right) side's
+/// style, so a left-accent border keeps its accent through both corners.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct BorderSideStyles {
+    /// Top edge override.
+    pub top: Option<Style>,
+    /// Right edge and right corner override.
+    pub right: Option<Style>,
+    /// Bottom edge override.
+    pub bottom: Option<Style>,
+    /// Left edge and left corner override.
+    pub left: Option<Style>,
+}
+
+impl BorderSideStyles {
+    /// No per-side overrides.
+    pub const NONE: Self = Self {
+        top: None,
+        right: None,
+        bottom: None,
+        left: None,
+    };
+}
+
+/// One border side, used to resolve per-side styles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BorderSide {
+    /// Top edge.
+    Top,
+    /// Right edge.
+    Right,
+    /// Bottom edge.
+    Bottom,
+    /// Left edge.
+    Left,
+}
+
 /// Border configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Border {
@@ -152,6 +192,8 @@ pub struct Border {
     pub style: Style,
     /// Border sides to render.
     pub sides: BorderSides,
+    /// Per-side style overrides patched over [`Self::style`].
+    pub side_styles: BorderSideStyles,
     /// Optional foreground gradient running diagonally from the top-left to
     /// the bottom-right corner. Replaces only the style's foreground.
     pub gradient: Option<ColorGradient>,
@@ -165,6 +207,7 @@ impl Border {
             set,
             style,
             sides: BorderSides::ALL,
+            side_styles: BorderSideStyles::NONE,
             gradient: None,
         }
     }
@@ -211,6 +254,29 @@ impl Border {
     pub const fn style(mut self, style: Style) -> Self {
         self.style = style;
         self
+    }
+
+    /// Set per-side style overrides.
+    #[must_use]
+    pub const fn side_styles(mut self, side_styles: BorderSideStyles) -> Self {
+        self.side_styles = side_styles;
+        self
+    }
+
+    /// Resolve the style of one side: [`Self::style`] patched with that
+    /// side's override, if any.
+    #[must_use]
+    pub const fn side_style(&self, side: BorderSide) -> Style {
+        let side_override = match side {
+            BorderSide::Top => self.side_styles.top,
+            BorderSide::Right => self.side_styles.right,
+            BorderSide::Bottom => self.side_styles.bottom,
+            BorderSide::Left => self.side_styles.left,
+        };
+        match side_override {
+            Some(style) => self.style.patch(style),
+            None => self.style,
+        }
     }
 
     /// Paint the border foreground with `gradient`.

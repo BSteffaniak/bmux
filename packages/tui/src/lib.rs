@@ -33,6 +33,7 @@ pub mod inline_output;
 pub mod input;
 pub mod interaction;
 pub mod layout;
+pub mod line_frame;
 #[cfg(target_os = "linux")]
 pub mod linux_input;
 pub mod measured_list;
@@ -57,7 +58,7 @@ pub mod prelude {
     pub use crate::capabilities::{
         TerminalBackground, TerminalCapabilities, TerminalColorDepth, TerminalColorReport,
     };
-    pub use crate::chrome::{Border, BorderSet, BorderSides};
+    pub use crate::chrome::{Border, BorderSet, BorderSide, BorderSideStyles, BorderSides};
     pub use crate::component::{
         ChildLayout, Component, ComponentRevision, Constraints, Element, EventCx, LayoutCache,
         LayoutCacheStats, LayoutCx, LayoutEnvironment, LayoutId, LayoutMetadata, LayoutNode,
@@ -90,6 +91,9 @@ pub mod prelude {
     pub use crate::layout::{
         Breakpoint, Breakpoints, Constraint, Direction, DockAreas, DockLayout, Layout, Responsive,
         Split, split,
+    };
+    pub use crate::line_frame::{
+        FramedLines, LineFrame, LineFrameGeometry, LineFrameOverflow, LineFrameWidth,
     };
     pub use crate::measured_list::{MeasuredListIndex, MeasuredListItem, VisibleItemRange};
     pub use crate::paint::{LocalRect, PaintCx};

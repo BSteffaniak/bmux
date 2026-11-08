@@ -3,7 +3,7 @@
 use std::hash::{Hash, Hasher};
 use std::ops::Range;
 
-use crate::chrome::Border;
+use crate::chrome::{Border, BorderSide};
 use crate::component::LogicalInsets;
 use crate::component::{
     ChildLayout, Component, ComponentRevision, Constraints, Element, LayoutCx, LayoutId,
@@ -77,6 +77,7 @@ fn hash_border(border: Option<&Border>, state: &mut impl Hasher) {
     border.sides.right.hash(state);
     border.sides.bottom.hash(state);
     border.sides.left.hash(state);
+    border.side_styles.hash(state);
     border.gradient.hash(state);
 }
 
@@ -796,11 +797,11 @@ fn paint_border(
     if width == 0 || height == 0 {
         return;
     }
-    let style = background.patch(border.style);
+    let side_style = |side: BorderSide| background.patch(border.side_style(side));
     let diagonal = width
         .saturating_sub(1)
         .saturating_add(height.saturating_sub(1));
-    let style_at = |x: i32, y: i64| {
+    let style_at = |style: Style, x: i32, y: i64| {
         border.gradient.map_or(style, |gradient| {
             let position = u64::try_from(x)
                 .unwrap_or(0)
@@ -808,6 +809,10 @@ fn paint_border(
             gradient.style_at(style, position, diagonal)
         })
     };
+    let top_style = side_style(BorderSide::Top);
+    let right_style = side_style(BorderSide::Right);
+    let bottom_style = side_style(BorderSide::Bottom);
+    let left_style = side_style(BorderSide::Left);
     let right = i32::try_from(width.saturating_sub(1)).unwrap_or(i32::MAX);
     let bottom = i64::try_from(height.saturating_sub(1)).unwrap_or(i64::MAX);
     let visible = cx.area();
@@ -826,34 +831,39 @@ fn paint_border(
     let vertical = border.set.vertical.to_string();
     if sides.top {
         for x in first_column..end_column {
-            cx.set_cell(x, 0, &horizontal, style_at(x, 0));
+            cx.set_cell(x, 0, &horizontal, style_at(top_style, x, 0));
         }
     }
     if sides.bottom && bottom != 0 {
         for x in first_column..end_column {
-            cx.set_cell(x, bottom, &horizontal, style_at(x, bottom));
+            cx.set_cell(x, bottom, &horizontal, style_at(bottom_style, x, bottom));
         }
     }
     if sides.left {
         for y in first_row..end_row {
-            cx.set_cell(0, y, &vertical, style_at(0, y));
+            cx.set_cell(0, y, &vertical, style_at(left_style, 0, y));
         }
     }
     if sides.right && right != 0 {
         for y in first_row..end_row {
-            cx.set_cell(right, y, &vertical, style_at(right, y));
+            cx.set_cell(right, y, &vertical, style_at(right_style, right, y));
         }
     }
     if width > 1 && height > 1 {
         if sides.top && sides.left {
-            cx.set_cell(0, 0, &border.set.top_left.to_string(), style_at(0, 0));
+            cx.set_cell(
+                0,
+                0,
+                &border.set.top_left.to_string(),
+                style_at(left_style, 0, 0),
+            );
         }
         if sides.top && sides.right {
             cx.set_cell(
                 right,
                 0,
                 &border.set.top_right.to_string(),
-                style_at(right, 0),
+                style_at(right_style, right, 0),
             );
         }
         if sides.bottom && sides.left {
@@ -861,7 +871,7 @@ fn paint_border(
                 0,
                 bottom,
                 &border.set.bottom_left.to_string(),
-                style_at(0, bottom),
+                style_at(left_style, 0, bottom),
             );
         }
         if sides.bottom && sides.right {
@@ -869,7 +879,7 @@ fn paint_border(
                 right,
                 bottom,
                 &border.set.bottom_right.to_string(),
-                style_at(right, bottom),
+                style_at(right_style, right, bottom),
             );
         }
     }
@@ -2243,6 +2253,36 @@ mod tests {
         assert_eq!(cell(width - 1, height - 1).style.fg, Some(Color::from(to)));
         assert_ne!(cell(width - 1, 0).style.fg, cell(0, 0).style.fg);
         assert_eq!(cell(width - 1, 0).style.bg, Some(Color::Blue));
+    }
+
+    #[test]
+    fn per_side_border_styles_color_edges_and_corners_by_vertical_side() {
+        use crate::chrome::{BorderSideStyles, BorderSides};
+
+        let card = Surface::new(TextBlock::new("hi")).border(
+            Border::single()
+                .style(Style::new().fg(Color::White))
+                .sides(BorderSides::new(true, false, true, true))
+                .side_styles(BorderSideStyles {
+                    left: Some(Style::new().fg(Color::Green)),
+                    top: Some(Style::new().fg(Color::Blue)),
+                    ..BorderSideStyles::NONE
+                }),
+        );
+        let layout = card.layout(Constraints::for_width(10), &mut LayoutCx::new());
+        let width = u16::try_from(layout.size.width).unwrap();
+        let height = u16::try_from(layout.size.height).unwrap();
+        let mut buffer = Buffer::empty(Rect::new(0, 0, width, height));
+        let mut frame = Frame::new(&mut buffer);
+        card.paint(&layout, &mut PaintCx::new(&mut frame));
+
+        let cell = |x, y| frame.buffer().get(Point::new(x, y)).unwrap().clone();
+        assert_eq!(cell(0, 0).symbol, "┌");
+        assert_eq!(cell(0, 0).style.fg, Some(Color::Green));
+        assert_eq!(cell(0, 1).style.fg, Some(Color::Green));
+        assert_eq!(cell(1, 0).symbol, "─");
+        assert_eq!(cell(1, 0).style.fg, Some(Color::Blue));
+        assert_eq!(cell(1, height - 1).style.fg, Some(Color::White));
     }
 
     #[test]
