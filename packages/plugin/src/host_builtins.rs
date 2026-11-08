@@ -125,7 +125,15 @@ impl InvocationHostBuiltins {
                     && service.kind == request.kind
                     && service.interface_id == request.interface
             })
-            .ok_or_else(|| protocol("host service was not advertised by selected configuration"))?;
+            .ok_or_else(|| {
+                // Same explanation as the legacy registry: a modeled interface
+                // the selected configuration does not export is an explicit,
+                // undispatched failure the caller can surface verbatim.
+                protocol(format!(
+                    "no advertised {:?} service for capability '{}' and interface '{}' in the selected configuration; requested operation '{}' was not dispatched",
+                    request.kind, request.capability, request.interface, request.operation
+                ))
+            })?;
         let _admission = invocation
             .try_admit()
             .map_err(|error| protocol(error.to_string()))?;
