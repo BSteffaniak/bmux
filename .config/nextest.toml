@@ -32,6 +32,13 @@ threads-required = "num-cpus"
 filter = 'binary(playbook_integration)'
 threads-required = "num-cpus"
 
+# Application-resurrection fixtures boot a full plugin-loaded server, restart
+# it, and drive nested shells through it. Run concurrently, their servers miss
+# fixed readiness deadlines, so reserve host capacity like the fixtures above.
+[[profile.default.overrides]]
+filter = 'binary(application_resurrection_integration)'
+threads-required = "num-cpus"
+
 # Mutual-authentication fixtures run multiple real servers and Raft voters.
 # Reserve host capacity just as for PTY fixtures; libtest serializes these in
 # the integration binary, while nextest runs each test in a separate process.
