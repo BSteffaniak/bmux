@@ -31,6 +31,9 @@ pub(crate) fn reqwest_client() -> reqwest::Client {
 /// Returns CLI startup/execution errors. Plugin admission requires this owner;
 /// a borrowed runtime handle alone cannot establish lifetime authority.
 pub async fn run_cli_with_runtime(owner: runtime_owner::RuntimeOwner) -> anyhow::Result<u8> {
+    if let Some(code) = run_pre_runtime_mode()? {
+        return Ok(code);
+    }
     owner.run(Box::pin(runtime::run())).await
 }
 
@@ -41,18 +44,31 @@ pub async fn run_cli_with_runtime(owner: runtime_owner::RuntimeOwner) -> anyhow:
 /// # Errors
 /// Returns parsing, execution, startup, or missing runtime-ownership errors.
 pub async fn run_cli() -> anyhow::Result<u8> {
+    if let Some(code) = run_pre_runtime_mode()? {
+        return Ok(code);
+    }
+    runtime::startup_future_marker("run_cli.first_poll", 0);
+    Box::pin(runtime::run()).await
+}
+
+/// Private executable modes that must bypass config loading, plugin admission
+/// and daemon startup. Every public entrypoint dispatches them identically:
+/// nested-shell lifecycle callbacks re-execute this binary and fail closed if
+/// ordinary CLI parsing receives their private arguments.
+fn run_pre_runtime_mode() -> anyhow::Result<Option<u8>> {
     #[cfg(feature = "bench")]
     if let Some(arguments) = benchmark_arguments(std::env::args_os()) {
-        return bmux_bench_cli::run_from(arguments).map_err(anyhow::Error::msg);
+        return bmux_bench_cli::run_from(arguments)
+            .map(Some)
+            .map_err(anyhow::Error::msg);
     }
     #[cfg(all(unix, feature = "bundled-plugin-application-resurrection"))]
     if let Some(code) =
         bmux_application_resurrection_plugin::shell::try_run().map_err(anyhow::Error::msg)?
     {
-        return Ok(code);
+        return Ok(Some(code));
     }
-    runtime::startup_future_marker("run_cli.first_poll", 0);
-    Box::pin(runtime::run()).await
+    Ok(None)
 }
 
 // Keep the optional benchmark path independent of config loading, plugin scanning,

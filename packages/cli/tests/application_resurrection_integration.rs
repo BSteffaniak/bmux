@@ -99,6 +99,39 @@ fn bash_path() -> String {
         .to_owned()
 }
 
+/// Nested shells re-execute the shipped `bmux` binary as their lifecycle
+/// callback. The private modes must bypass ordinary CLI startup on the real
+/// executable entrypoint, or nested shell scopes silently never register.
+#[test]
+fn shipped_executable_serves_private_shell_callback_modes() {
+    for (kind, marker) in [
+        ("bash", "__shell-invocation"),
+        ("zsh", "__shell-invocation"),
+        ("fish", "__shell-invocation"),
+    ] {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_bmux"))
+            .args(["__shell-integration", kind])
+            .env_remove("APPLICATION_RESURRECTION_HOST")
+            .output()
+            .expect("run shipped bmux executable");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains(marker),
+            "{kind} integration unavailable from shipped executable: {output:?}"
+        );
+    }
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_bmux"))
+        .args(["__shell-invocation", "prompt", "/bin/sh", "1", "", "/"])
+        .env_remove("APPLICATION_RESURRECTION_HOST")
+        .output()
+        .expect("run shipped bmux executable");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success() && stderr.contains("application host unavailable"),
+        "shell callback must fail closed in its private mode, not CLI parsing: {output:?}"
+    );
+}
+
 #[tokio::test]
 async fn application_session_survives_real_daemon_restart() {
     round_trip(false, &bash_path()).await;
