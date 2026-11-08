@@ -802,6 +802,7 @@ impl ProductionPlugin {
             command_route: command_route.cloned(),
             runtime: host_runtime(execution)?,
         });
+        execution.bind_host_dispatch(lifecycle_host.clone())?;
         let lifecycle_execution = Arc::downgrade(execution);
         execution.bind_lifecycle_callback_factory(Arc::new(move |root| {
             let callback = if let Some(parent) = lifecycle_host
