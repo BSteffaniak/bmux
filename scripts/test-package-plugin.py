@@ -197,6 +197,33 @@ class PublicationTests(unittest.TestCase):
 
 
 class GenerationTests(unittest.TestCase):
+    def test_component_features_come_from_implementation_metadata(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            implementation = root / "impl/Cargo.toml"
+            implementation.parent.mkdir()
+            implementation.write_text(
+                '[package]\nname = "demo_plugin"\nversion = "0.0.0"\n\n'
+                '[package.metadata.bmux-plugin.components.backend]\nfeatures = ["native"]\n'
+                '[package.metadata.bmux-plugin.components.frontend]\nfeatures = ["native", "presentation"]\n')
+            sdk = ROOT / "packages/plugin-sdk/Cargo.toml"
+            backend = tomllib.loads(pack.generate(
+                implementation, sdk, root / "backend", "backend", [], "b").read_text())
+            self.assertEqual(backend["dependencies"]["implementation"]["features"], ["native"])
+            self.assertFalse(backend["dependencies"]["implementation"]["default-features"])
+            frontend = tomllib.loads(pack.generate(
+                implementation, sdk, root / "frontend", "frontend", ["native", "tui"], "f").read_text())
+            # Declared features come first; explicit ones extend without duplicates.
+            self.assertEqual(frontend["dependencies"]["implementation"]["features"],
+                             ["native", "presentation", "tui"])
+            self.assertEqual(json.loads((root / "frontend/packaging.json").read_text())["features"],
+                             ["native", "presentation", "tui"])
+            implementation.write_text(
+                '[package]\nname = "demo_plugin"\nversion = "0.0.0"\n\n'
+                '[package.metadata.bmux-plugin.components.backend]\nfeatures = "native"\n')
+            with self.assertRaises(ValueError):
+                pack.generate(implementation, sdk, root / "invalid", "backend", [], "x")
+
     def test_exact_fixture_entry_and_sibling_with_declared_dependencies(self):
         with tempfile.TemporaryDirectory() as temporary:
             output = Path(temporary) / "fixture"

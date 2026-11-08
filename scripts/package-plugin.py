@@ -69,6 +69,22 @@ def workspace_patches(implementation: Path) -> str:
     return "\n".join(lines) + "\n"
 
 
+def component_features(manifest: dict, role: str, extra: list[str]) -> list[str]:
+    """Features that make up one component, declared by the implementation itself.
+
+    `[package.metadata.bmux-plugin.components.<role>] features = [...]` is the
+    single source of truth, so every packager caller builds the same component;
+    explicit --feature values extend it. Wrappers disable default features, so
+    an implementation that gates its plugin definition behind a feature must
+    declare it here.
+    """
+    declared = (manifest.get("package", {}).get("metadata", {}).get("bmux-plugin", {})
+                .get("components", {}).get(role, {}).get("features", []))
+    if not isinstance(declared, list) or not all(isinstance(item, str) for item in declared):
+        raise ValueError(f"package.metadata.bmux-plugin.components.{role}.features must be a list of strings")
+    return list(dict.fromkeys([*declared, *extra]))
+
+
 def generate(implementation: Path, sdk: Path, output: Path, role: str,
              features: list[str], artifact_id: str) -> Path:
     """Materialize an isolated cdylib package depending on one implementation."""
@@ -78,6 +94,7 @@ def generate(implementation: Path, sdk: Path, output: Path, role: str,
     if manifest.get("lib", {}).get("crate-type", ["rlib"]) != ["rlib"]:
         raise ValueError("implementation must be an export-free rlib; cdylib belongs only in generated packaging")
     package = manifest["package"]["name"]
+    features = component_features(manifest, role, features)
     if not all(c.isascii() and (c.isalnum() or c in "_-") for c in package):
         raise ValueError("unsupported Cargo package name")
     sdk_name = tomllib.loads(sdk.read_text())["package"]["name"]
