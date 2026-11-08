@@ -2761,6 +2761,32 @@ mod tests {
         Ok(())
     }
 
+    /// Synchronous dispatch from a current-thread runtime must be rejected
+    /// before dispatch: it cannot block in place without stalling its reactor.
+    fn assert_current_thread_dispatch_rejected(
+        authority: &AuthenticatedServiceInvocation,
+        invocation: &bmux_plugin_runtime::InvocationScope,
+        request: &[u8],
+    ) {
+        use bmux_plugin::InvocationKernelDispatch;
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let current_thread = tokio::runtime::Builder::new_current_thread()
+                        .build()
+                        .unwrap();
+                    let rejected =
+                        current_thread.block_on(async { authority.execute(invocation, request) });
+                    assert!(
+                        rejected.is_err(),
+                        "current-thread executor must not perform synchronous dispatch"
+                    );
+                })
+                .join()
+                .unwrap();
+        });
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn explicit_worker_kernel_dispatch_retains_server_context_without_tls() {
         use bmux_plugin::InvocationKernelDispatch;
@@ -2817,10 +2843,15 @@ mod tests {
             assert!(
                 matches!(nested, bmux_ipc::ResponsePayload::ServiceInvoked { payload } if payload == vec![expected])
             );
+            // Placement contract of dispatch_selected_request: a multi-thread
+            // executor thread dispatches through block_in_place, while a
+            // current-thread runtime cannot and must reject before dispatch.
+            let in_place = authority.execute(&invocation, &request).unwrap();
             assert!(
-                authority.execute(&invocation, &request).is_err(),
-                "async executor must not perform synchronous dispatch"
+                matches!(bmux_ipc::decode::<bmux_ipc::ResponsePayload>(&in_place).unwrap(),
+                bmux_ipc::ResponsePayload::ServiceInvoked { payload } if payload == vec![expected])
             );
+            assert_current_thread_dispatch_rejected(&authority, &invocation, &request);
             let request = request.clone();
             let cancelled_authority = authority.clone();
             let cancelled_request = request.clone();
