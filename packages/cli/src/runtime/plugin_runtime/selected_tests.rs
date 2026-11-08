@@ -3,6 +3,24 @@ mod tests {
     use super::super::*;
     use bmux_plugin_sdk::HostServiceDispatch;
 
+    /// The selected host reactor for fixtures: the test's own runtime when
+    /// there is one, otherwise a shared self-driving runtime.
+    fn test_runtime() -> tokio::runtime::Handle {
+        static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+        tokio::runtime::Handle::try_current().unwrap_or_else(|_| {
+            RUNTIME
+                .get_or_init(|| {
+                    tokio::runtime::Builder::new_multi_thread()
+                        .worker_threads(1)
+                        .enable_all()
+                        .build()
+                        .expect("fixture runtime")
+                })
+                .handle()
+                .clone()
+        })
+    }
+
     fn declaration() -> bmux_plugin::PluginDeclaration {
         bmux_plugin::PluginManifest::from_toml_str(
             "id='example.owner'\nname='Owner'\nversion='1.0.0'\n",
@@ -59,6 +77,11 @@ mod tests {
         let execution = artifact
             .create(PluginRuntimeScopeId::new(), ComponentRole::Backend, &[])
             .unwrap();
+        // Production selects the host reactor before activation; observation
+        // fails closed without it rather than borrowing the polling thread's.
+        execution
+            .bind_callback_runtime(tokio::runtime::Handle::current())
+            .unwrap();
         let native: NativeLifecycleContext = serde_json::from_value(serde_json::json!({
             "plugin_id": "example.owner", "host": crate::runtime::plugin_runtime::plugin_host_metadata(),
             "connection": { "config_dir": "/selected/config", "runtime_dir": "/selected/runtime",
@@ -89,6 +112,7 @@ mod tests {
     async fn trusted_async_executor_moves_callback_off_observer_thread() {
         let result =
             crate::runtime::plugin_kernel::AuthenticatedServiceInvocation::dispatch_host_callback(
+                tokio::runtime::Handle::current(),
                 || {
                     // The callback is executed by the trusted host, not by a caller
                     // declaring a marker in operation metadata.
@@ -117,6 +141,7 @@ mod tests {
                 services: Vec::new(),
                 builtins: Arc::new(std::sync::OnceLock::new()),
                 command_route: None,
+                runtime: test_runtime(),
             };
             port.invoke_owned(
                 invocation.clone(),
@@ -165,6 +190,7 @@ mod tests {
             services: Vec::new(),
             builtins: Arc::new(std::sync::OnceLock::new()),
             command_route: None,
+            runtime: test_runtime(),
         };
         let error = port
             .invoke(
@@ -303,6 +329,7 @@ mod tests {
             services,
             builtins,
             command_route: None,
+            runtime: test_runtime(),
         };
         let key = bmux_plugin_sdk::StorageKey::new("owned-value").unwrap();
         let set = bmux_plugin_sdk::encode_service_message(
@@ -365,6 +392,7 @@ mod tests {
             services: Vec::new(),
             builtins: Arc::new(std::sync::OnceLock::new()),
             command_route: Some(route),
+            runtime: test_runtime(),
         };
         let result = port.invoke(
             &invocation,
@@ -416,6 +444,7 @@ mod tests {
             services: Vec::new(),
             builtins: Arc::new(std::sync::OnceLock::new()),
             command_route: Some(route),
+            runtime: test_runtime(),
         };
         let scope = invocation.clone();
         let worker = tokio::task::spawn_blocking(move || {
@@ -478,6 +507,7 @@ mod tests {
             services: Vec::new(),
             builtins: Arc::new(std::sync::OnceLock::new()),
             command_route: None,
+            runtime: test_runtime(),
         };
         let error = port
             .invoke(

@@ -9,7 +9,7 @@ mod activation_ports;
 pub mod callbacks;
 pub use callbacks::{
     CallbackBinding, CallbackEntryLease, LifecycleCallbackDispatch, LifecycleCallbackFactory,
-    LoaderCallbackHost,
+    LoaderCallbackHost, WeakCallbackEntryLease,
 };
 #[path = "scoped/ports.rs"]
 mod ports;
@@ -1199,6 +1199,14 @@ impl LoadedExecution {
         self.callback_runtime
             .set(runtime)
             .map_err(|_| failure("callback runtime already selected"))
+    }
+
+    /// The host reactor selected for this instance's callbacks, if bound.
+    /// Host dispatch uses this explicitly instead of whatever runtime the
+    /// polling thread happens to have entered.
+    #[must_use]
+    pub fn callback_runtime(&self) -> Option<tokio::runtime::Handle> {
+        self.callback_runtime.get().cloned()
     }
 
     /// Retain the actual selected reactor owner independently of observer lifetime.

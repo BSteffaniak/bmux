@@ -71,7 +71,19 @@ struct KernelServices {
     services: Vec<bmux_plugin_sdk::RegisteredService>,
     builtins: Arc<std::sync::OnceLock<Arc<bmux_plugin::InvocationHostBuiltins>>>,
     command_route: Option<crate::runtime::plugin_kernel::CommandDispatch>,
+    /// The instance's selected host reactor, never the polling thread's.
+    runtime: tokio::runtime::Handle,
 }
+
+/// The host reactor explicitly selected for a scoped instance's callbacks.
+fn host_runtime(
+    execution: &bmux_plugin::LoadedExecution,
+) -> bmux_plugin_sdk::Result<tokio::runtime::Handle> {
+    execution
+        .callback_runtime()
+        .ok_or_else(|| failure("selected callback runtime is not bound"))
+}
+
 impl KernelServices {
     fn with_callback_parent(&self, entry: &bmux_plugin::CallbackEntryLease) -> Self {
         Self {
@@ -80,15 +92,43 @@ impl KernelServices {
             authority: self
                 .authority
                 .clone()
-                .map(|authority| authority.with_callback_parent(entry.clone())),
+                .map(|authority| authority.with_callback_parent(entry)),
             services: self.services.clone(),
             builtins: self.builtins.clone(),
             command_route: self
                 .command_route
                 .clone()
                 .map(|route| route.with_parent(entry.clone())),
+            runtime: self.runtime.clone(),
         }
     }
+    /// Answer host-intrinsic facts about this exact admitted invocation. No
+    /// declaration or kernel grant is involved: the answer comes only from the
+    /// invocation's authenticated server context or its issuing command route.
+    fn invocation_intrinsic(
+        &self,
+        invocation: &bmux_plugin_runtime::InvocationScope,
+        request: &bmux_plugin_sdk::HostServiceRequest<'_>,
+    ) -> bmux_plugin_sdk::Result<Vec<u8>> {
+        if request.kind != bmux_plugin_sdk::ServiceKind::Query
+            || request.interface != bmux_plugin_sdk::CORE_INVOCATION_INTERFACE_V1
+            || request.operation != bmux_plugin_sdk::CORE_INVOCATION_STREAM_ORIGIN_OPERATION_V1
+            || !request.payload.is_empty()
+        {
+            return Err(failure("unsupported host invocation intrinsic"));
+        }
+        let origin = if let Some(authority) = &self.authority {
+            authority.stream_origin(invocation)?
+        } else if let Some(route) = &self.command_route {
+            route.stream_origin(invocation)?
+        } else {
+            return Err(failure(
+                "invocation origin requires an authenticated selected context",
+            ));
+        };
+        bmux_plugin_sdk::encode_service_message(&origin)
+    }
+
     async fn invoke_owned(
         self,
         invocation: bmux_plugin_runtime::InvocationScope,
@@ -104,7 +144,9 @@ impl KernelServices {
         // Keep scope ownership and authoritative server context through the
         // blocking callback. No request metadata creates authority, no result
         // failure triggers replay, and drop never claims to undo an effect.
+        let runtime = self.runtime.clone();
         crate::runtime::plugin_kernel::AuthenticatedServiceInvocation::dispatch_host_callback(
+            runtime,
             move || {
                 let _admission = admission;
                 bmux_plugin_sdk::HostServiceDispatch::invoke(
@@ -176,6 +218,9 @@ impl bmux_plugin_sdk::HostServiceDispatch for KernelServices {
         let _admission = invocation
             .try_admit()
             .map_err(|error| failure(error.to_string()))?;
+        if request.capability == bmux_plugin_sdk::CORE_INVOCATION_CAPABILITY {
+            return self.invocation_intrinsic(invocation, &request);
+        }
         if !self
             .declaration
             .required_capabilities
@@ -408,6 +453,7 @@ impl ProductionPlugin {
             // hosts while being polled. Poll them on the bounded callback
             // executor, never a Tokio worker; keep the actual observer waker.
             let polled = crate::runtime::plugin_kernel::AuthenticatedServiceInvocation::dispatch_host_callback(
+                host_runtime(execution)?,
                 move || owned.poll(id, &mut std::task::Context::from_waker(&waker)),
             ).await?;
             if let std::task::Poll::Ready(outcome) = polled {
@@ -562,6 +608,7 @@ impl ProductionPlugin {
                     services: context.services.clone(),
                     builtins: Arc::clone(&self.builtins),
                     command_route: None,
+                    runtime: host_runtime(execution)?,
                 });
                 execution.bind_host_dispatch(lifecycle_host.clone())?;
                 let lifecycle_execution = Arc::downgrade(execution);
@@ -729,6 +776,7 @@ impl ProductionPlugin {
             services: context.services.clone(),
             builtins: Arc::clone(&self.builtins),
             command_route: command_route.cloned(),
+            runtime: host_runtime(execution)?,
         });
         let lifecycle_execution = Arc::downgrade(execution);
         execution.bind_lifecycle_callback_factory(Arc::new(move |root| {
@@ -847,6 +895,7 @@ impl ProductionPlugin {
                     services: context.services.clone(),
                     builtins: Arc::clone(&self.builtins),
                     command_route: command_route.cloned(),
+                    runtime: host_runtime(execution)?,
                 });
                 let binding = if let Some(parent) = callback_parent {
                     execution.bind_child_callback(&parent, invocation.clone(), cancellation)?
@@ -940,6 +989,7 @@ impl ProductionPlugin {
             services: context.services.clone(),
             builtins: Arc::clone(&self.builtins),
             command_route: None,
+            runtime: host_runtime(execution)?,
         });
         let mut context = context.clone();
         context.host_kernel_bridge = None;

@@ -40,7 +40,27 @@ impl Default for CallbackOwner {
 /// Opaque host-owned callback dependency. It cannot be built from resource IDs.
 #[derive(Clone)]
 pub struct CallbackEntryLease(Arc<Entry>);
+
+/// Non-owning view of a callback entry. A nested call keeps only this to its
+/// parent, so anything the callee retains after the call cannot keep the
+/// parent invocation admitted.
+#[derive(Clone)]
+pub struct WeakCallbackEntryLease(std::sync::Weak<Entry>);
+impl WeakCallbackEntryLease {
+    /// The parent entry while it is still running; `None` once it has ended.
+    #[must_use]
+    pub fn upgrade(&self) -> Option<CallbackEntryLease> {
+        self.0.upgrade().map(CallbackEntryLease)
+    }
+}
+
 impl CallbackEntryLease {
+    /// Observe this entry without extending its admission.
+    #[must_use]
+    pub fn downgrade(&self) -> WeakCallbackEntryLease {
+        WeakCallbackEntryLease(Arc::downgrade(&self.0))
+    }
+
     #[cfg(test)]
     pub(super) fn same_dependency(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
@@ -75,7 +95,9 @@ impl CallbackEntryLease {
 }
 struct Entry {
     binding: CallbackBinding,
-    parent: Option<CallbackEntryLease>,
+    // Ancestry for re-entry detection only; weak so a retained child never
+    // keeps its parent invocation admitted after the parent call ends.
+    parent: Option<WeakCallbackEntryLease>,
     _admission: AdmissionGuard,
 }
 
@@ -134,23 +156,32 @@ impl LoaderCallbackHost {
                 "callback ancestry belongs to a different runtime",
             ));
         }
-        let mut ancestor = Some(parent);
+        let mut ancestor = Some(parent.clone());
         let mut depth = 0;
         while let Some(entry) = ancestor {
             depth += 1;
             if depth > MAX_ANCESTORS {
                 return Err(super::failure("callback ancestry limit exceeded"));
             }
-            ancestor = entry.0.parent.as_ref();
+            ancestor = entry
+                .0
+                .parent
+                .as_ref()
+                .and_then(WeakCallbackEntryLease::upgrade);
         }
-        self.bind(activation, invocation, cancellation, Some(parent.clone()))
+        self.bind(
+            activation,
+            invocation,
+            cancellation,
+            Some(parent.downgrade()),
+        )
     }
     fn bind(
         &self,
         activation: &super::ActivationScope,
         invocation: InvocationScope,
         cancellation: ServiceCancellation,
-        parent: Option<CallbackEntryLease>,
+        parent: Option<WeakCallbackEntryLease>,
     ) -> super::Result<CallbackBinding> {
         if self.0.instance.id() != invocation.instance_id()
             || self.0.instance.runtime_id() != invocation.runtime_id()
@@ -186,7 +217,7 @@ struct Binding {
     host: LoaderCallbackHost,
     invocation: InvocationScope,
     cancellation: ServiceCancellation,
-    parent: Option<CallbackEntryLease>,
+    parent: Option<WeakCallbackEntryLease>,
     entry: Mutex<Weak<Entry>>,
 }
 
@@ -263,16 +294,25 @@ impl LoadedExecution {
                 "callback ancestry belongs to a different runtime",
             ));
         }
-        let mut ancestor = Some(parent);
+        let mut ancestor = Some(parent.clone());
         let mut depth = 0;
         while let Some(entry) = ancestor {
             depth += 1;
             if depth > MAX_ANCESTORS {
                 return Err(super::failure("callback ancestry limit exceeded"));
             }
-            ancestor = entry.0.parent.as_ref();
+            ancestor = entry
+                .0
+                .parent
+                .as_ref()
+                .and_then(WeakCallbackEntryLease::upgrade);
         }
-        CallbackBinding::bind(self.clone(), invocation, cancellation, Some(parent.clone()))
+        CallbackBinding::bind(
+            self.clone(),
+            invocation,
+            cancellation,
+            Some(parent.downgrade()),
+        )
     }
 }
 /// A host-authenticated dispatcher selector supplied by the owning runtime.
@@ -464,7 +504,7 @@ impl CallbackBinding {
         execution: Arc<LoadedExecution>,
         invocation: InvocationScope,
         cancellation: ServiceCancellation,
-        parent: Option<CallbackEntryLease>,
+        parent: Option<WeakCallbackEntryLease>,
     ) -> super::Result<Self> {
         let host = LoaderCallbackHost(Arc::new(CallbackHostState {
             instance: execution.scope.clone(),
@@ -554,12 +594,20 @@ impl CallbackBinding {
     }
     pub(super) fn enter(&self) -> PluginResult<CallbackEntryLease> {
         self.check()?;
-        let mut ancestor = self.0.parent.as_ref();
+        let mut ancestor = self
+            .0
+            .parent
+            .as_ref()
+            .and_then(WeakCallbackEntryLease::upgrade);
         while let Some(entry) = ancestor {
             if entry.0.binding.0.invocation.instance_id() == self.0.invocation.instance_id() {
                 return Err(rejected("recursive callback dependency rejected"));
             }
-            ancestor = entry.0.parent.as_ref();
+            ancestor = entry
+                .0
+                .parent
+                .as_ref()
+                .and_then(WeakCallbackEntryLease::upgrade);
         }
         let admission = self
             .0

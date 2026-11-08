@@ -123,16 +123,21 @@ pub trait ServiceCaller {
     /// Resolve the current invocation's host-authenticated neutral origin.
     /// This is a host-context primitive, independent of domain plugin presence.
     /// No supplied identity or missing-provider fallback can establish locality.
+    /// Answered by the host-intrinsic invocation capability, not a kernel
+    /// grant, so non-foundational plugins can check their caller's origin
+    /// without a service round trip through a domain plugin.
     ///
     /// # Errors
     /// Fails closed when the bound bridge or representation is unavailable.
     fn current_stream_origin(&self) -> Result<crate::StreamOrigin> {
-        match self.execute_kernel_request(bmux_ipc::Request::CurrentStreamProvenance)? {
-            bmux_ipc::ResponsePayload::CurrentStreamProvenance { provenance } => Ok(provenance),
-            _ => Err(bmux_plugin_sdk::PluginError::ServiceProtocol {
-                details: "host stream origin unavailable".into(),
-            }),
-        }
+        let payload = self.call_service_raw(
+            bmux_plugin_sdk::CORE_INVOCATION_CAPABILITY,
+            ServiceKind::Query,
+            bmux_plugin_sdk::CORE_INVOCATION_INTERFACE_V1,
+            bmux_plugin_sdk::CORE_INVOCATION_STREAM_ORIGIN_OPERATION_V1,
+            Vec::new(),
+        )?;
+        bmux_plugin_sdk::decode_service_message(&payload)
     }
     /// Dispatch a raw service call with a binary payload.
     ///

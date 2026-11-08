@@ -22,10 +22,12 @@ fn callback_entry_rejects_foreign_scope_and_preserves_actual_cross_instance_ance
     let back = first
         .bind_child_callback(&child_entry, back, ServiceCancellation::new())
         .unwrap();
+    // While the parent entry runs, re-entering its instance is rejected.
     assert!(back.enter().is_err());
     drop(entry);
-    // The actual nested dependency still retains the parent author entry.
-    assert!(root.active_entry().is_ok());
+    // A child that outlives its parent call (e.g. retained by the callee) no
+    // longer pins the parent: otherwise the parent invocation could never drain.
+    assert!(root.active_entry().is_err());
     drop(back);
     drop(child_entry);
     drop(child);

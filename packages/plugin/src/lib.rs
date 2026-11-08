@@ -81,6 +81,7 @@ pub use host_runtime::{
 pub use loader::scoped::{
     CallbackBinding, CallbackEntryLease, DefinitionArtifact, LifecycleCallbackDispatch,
     LifecycleCallbackFactory, LoadedExecution, LoaderCallbackHost, VerifiedArtifact,
+    WeakCallbackEntryLease,
 };
 pub use loader::{
     LoadedPlugin, NativePluginLoader, NativeServiceBufferConfig, executable_sha256,

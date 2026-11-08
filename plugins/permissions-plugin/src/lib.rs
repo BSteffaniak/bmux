@@ -441,29 +441,14 @@ struct ResourceGrant {
     role: String,
 }
 
-// Host-bound origin is independent of optional domain services.
+// Host-bound origin comes from the invocation itself, never from a domain
+// service: asking the clients plugin here re-entered it during selection.
 fn caller_provenance(
     caller: &(impl ServiceCaller + Sync),
 ) -> Result<bmux_plugin::StreamOrigin, String> {
-    use bmux_clients_plugin_api::clients_identity::{self, StreamProvenance};
-    let mut client = bmux_plugin::ServiceCallerDispatchClient::new(caller);
-    let provenance = bmux_plugin::block_on_typed_dispatch(
-        clients_identity::client::current_stream_provenance(&mut client),
-    )
-    .map_err(|error| format!("trusted provenance unavailable: {error}"))?
-    .map_err(|error| format!("trusted provenance unavailable: {error:?}"))?;
-    Ok(match provenance {
-        StreamProvenance::HostInternal => bmux_plugin::StreamOrigin::HostInternal,
-        StreamProvenance::Local => bmux_plugin::StreamOrigin::Local,
-        StreamProvenance::Admitted {
-            subject_id,
-            lease_id,
-        } => bmux_plugin::StreamOrigin::Admitted {
-            subject_id,
-            lease_id,
-        },
-        StreamProvenance::Invalid => bmux_plugin::StreamOrigin::Invalid,
-    })
+    caller
+        .current_stream_origin()
+        .map_err(|error| format!("trusted provenance unavailable: {error}"))
 }
 
 fn require_local_owner(caller: &(impl ServiceCaller + Sync)) -> Result<(), String> {
@@ -1746,27 +1731,10 @@ mod tests {
                   operation,
                   payload| {
                 match (interface_id, operation) {
-                    ("clients-identity/v1", "current-stream-provenance") => {
-                        use bmux_clients_plugin_api::clients_identity::{
-                            IdentityError, StreamProvenance,
-                        };
-                        let origin = provenance.lock().unwrap().clone();
-                        let value = match origin {
-                            bmux_plugin::StreamOrigin::HostInternal => {
-                                StreamProvenance::HostInternal
-                            }
-                            bmux_plugin::StreamOrigin::Local => StreamProvenance::Local,
-                            bmux_plugin::StreamOrigin::Admitted {
-                                subject_id,
-                                lease_id,
-                            } => StreamProvenance::Admitted {
-                                subject_id,
-                                lease_id,
-                            },
-                            bmux_plugin::StreamOrigin::Invalid => StreamProvenance::Invalid,
-                        };
-                        encode_service_message(&Ok::<_, IdentityError>(value))
-                    }
+                    (
+                        bmux_plugin_sdk::CORE_INVOCATION_INTERFACE_V1,
+                        bmux_plugin_sdk::CORE_INVOCATION_STREAM_ORIGIN_OPERATION_V1,
+                    ) => encode_service_message(&provenance.lock().unwrap().clone()),
                     ("pairing-state", "check-device-access") => encode_service_message(
                         &bmux_connections_plugin_api::pairing_types::DeviceAccessCheck {
                             access: *device_access.lock().unwrap(),

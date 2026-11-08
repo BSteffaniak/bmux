@@ -667,6 +667,15 @@ pub const CORE_CLI_COMMAND_INTERFACE_V1: &str = "cli-command/v1";
 pub const CORE_CLI_COMMAND_RUN_PATH_OPERATION_V1: &str = "run_path";
 /// Service operation for executing a plugin command.
 pub const CORE_CLI_COMMAND_RUN_PLUGIN_OPERATION_V1: &str = "run_plugin";
+/// Host-intrinsic capability for facts about the caller's own current invocation.
+///
+/// Every plugin may query it without declaring it: the host answers from the
+/// invocation's authenticated context, and requests carry no payload authority.
+pub const CORE_INVOCATION_CAPABILITY: &str = "bmux.invocation";
+/// Service interface for host-intrinsic invocation facts.
+pub const CORE_INVOCATION_INTERFACE_V1: &str = "invocation/v1";
+/// Query returning the current invocation's host-authenticated stream origin.
+pub const CORE_INVOCATION_STREAM_ORIGIN_OPERATION_V1: &str = "stream-origin";
 /// Marker prefix for host-kernel bridge CLI command payloads.
 pub const CORE_CLI_BRIDGE_MAGIC_V1: &[u8] = b"BMUXCMD1";
 /// Marker prefix for host-kernel bridge plugin command payloads.

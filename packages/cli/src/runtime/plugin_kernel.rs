@@ -529,6 +529,9 @@ impl CommandDispatchRequest {
                 bmux_ipc::Response::Ok(bmux_ipc::ResponsePayload::ServiceInvoked { payload }) => {
                     Ok(payload)
                 }
+                bmux_ipc::Response::Ok(bmux_ipc::ResponsePayload::CurrentStreamProvenance {
+                    provenance,
+                }) => bmux_plugin_sdk::encode_service_message(&provenance),
                 bmux_ipc::Response::Err(error) => Err(command_dispatch_error(format!(
                     "selected command request denied: {error:?}"
                 ))),
@@ -610,18 +613,46 @@ impl CommandDispatch {
         }
         let kind = invoke_kind_from_service_kind(request.kind)
             .ok_or_else(|| command_dispatch_error("unsupported command service kind".into()))?;
-        let admission = invocation
-            .try_admit()
-            .map_err(|error| command_dispatch_error(error.to_string()))?;
-        let (response, receiver) = std::sync::mpsc::sync_channel(1);
-        CommandDispatchRequest {
-            request: bmux_ipc::Request::InvokeService {
+        self.send(
+            invocation,
+            caller,
+            bmux_ipc::Request::InvokeService {
                 capability: request.capability.into(),
                 kind,
                 interface_id: request.interface.into(),
                 operation: request.operation.into(),
                 payload: request.payload.to_vec(),
             },
+        )
+    }
+
+    /// Origin of the issuing command connection, answered by the server for
+    /// that connection. The host builds the request; plugins cannot alter it.
+    pub(in crate::runtime) fn stream_origin(
+        &self,
+        invocation: &bmux_plugin_runtime::InvocationScope,
+    ) -> bmux_plugin_sdk::Result<bmux_ipc::StreamProvenance> {
+        if self.cancellation.is_cancelled() {
+            return Err(command_dispatch_error(
+                "selected command lifetime ended".into(),
+            ));
+        }
+        let encoded = self.send(invocation, None, bmux_ipc::Request::CurrentStreamProvenance)?;
+        bmux_plugin_sdk::decode_service_message(&encoded)
+    }
+
+    fn send(
+        &self,
+        invocation: &bmux_plugin_runtime::InvocationScope,
+        caller: Option<&bmux_plugin::PluginId>,
+        request: bmux_ipc::Request,
+    ) -> bmux_plugin_sdk::Result<Vec<u8>> {
+        let admission = invocation
+            .try_admit()
+            .map_err(|error| command_dispatch_error(error.to_string()))?;
+        let (response, receiver) = std::sync::mpsc::sync_channel(1);
+        CommandDispatchRequest {
+            request,
             caller_plugin_id: caller.map(|caller| caller.as_str().to_owned()),
             response,
             registered: false,
@@ -676,7 +707,11 @@ tokio::task_local! {
 /// the original internal/client principal and stream-provenance semantics.
 #[derive(Clone)]
 pub(in crate::runtime) struct CallbackDependency {
-    pub entry: bmux_plugin::CallbackEntryLease,
+    // Weak on purpose: the server context of a nested call can be retained by
+    // the callee (e.g. for a launched pane). A strong lease there would keep
+    // the caller's invocation admitted until the callee let go, so the
+    // caller's call could never finish draining.
+    pub entry: bmux_plugin::WeakCallbackEntryLease,
 }
 
 #[derive(Clone)]
@@ -878,11 +913,13 @@ impl bmux_plugin::InvocationKernelDispatch for AuthenticatedServiceInvocation {
 impl AuthenticatedServiceInvocation {
     pub(in crate::runtime) fn with_callback_parent(
         mut self,
-        entry: bmux_plugin::CallbackEntryLease,
+        entry: &bmux_plugin::CallbackEntryLease,
     ) -> Self {
         self.context = self
             .context
-            .with_host_dispatch_context(Arc::new(CallbackDependency { entry }));
+            .with_host_dispatch_context(Arc::new(CallbackDependency {
+                entry: entry.downgrade(),
+            }));
         self
     }
     pub(in crate::runtime) fn callback_parent(
@@ -890,7 +927,7 @@ impl AuthenticatedServiceInvocation {
     ) -> bmux_plugin_sdk::Result<Option<bmux_plugin::CallbackEntryLease>> {
         self.context
             .host_dispatch_context::<CallbackDependency>()
-            .map(|context| context.map(|context| context.entry.clone()))
+            .map(|context| context.and_then(|context| context.entry.upgrade()))
             .map_err(|error| command_dispatch_error(error.to_string()))
     }
 
@@ -937,6 +974,23 @@ impl AuthenticatedServiceInvocation {
         request: &[u8],
     ) -> bmux_plugin_sdk::Result<bmux_ipc::ResponsePayload> {
         self.execute_response_with_scope(request, Some(invocation))
+    }
+
+    /// Host-authenticated origin of this invocation's stream. The host builds
+    /// the fixed request itself, so this is an invocation fact, never a kernel
+    /// grant to the plugin asking.
+    pub(in crate::runtime) fn stream_origin(
+        &self,
+        invocation: &bmux_plugin_runtime::InvocationScope,
+    ) -> bmux_plugin_sdk::Result<bmux_ipc::StreamProvenance> {
+        let request = bmux_ipc::encode(&bmux_ipc::Request::CurrentStreamProvenance)
+            .map_err(|error| command_dispatch_error(error.to_string()))?;
+        match self.execute_response_scoped(invocation, &request)? {
+            bmux_ipc::ResponsePayload::CurrentStreamProvenance { provenance } => Ok(provenance),
+            _ => Err(command_dispatch_error(
+                "unexpected stream origin response".into(),
+            )),
+        }
     }
 
     fn execute_response_with_scope(
@@ -1068,7 +1122,12 @@ impl AuthenticatedServiceInvocation {
     /// Trusted asynchronous host entry. This changes execution location only;
     /// the closure must still validate its captured invocation and selected
     /// authority on the blocking worker before performing any effect.
+    ///
+    /// `runtime` is the explicitly selected host reactor. It must never be
+    /// taken from the polling thread: a plugin may poll host calls from its
+    /// own short-lived runtime, and work scheduled there dies with it.
     pub(in crate::runtime) async fn dispatch_host_callback<T, F>(
+        runtime: tokio::runtime::Handle,
         callback: F,
     ) -> bmux_plugin_sdk::Result<T>
     where
@@ -1076,8 +1135,6 @@ impl AuthenticatedServiceInvocation {
         F: FnOnce() -> bmux_plugin_sdk::Result<T> + Send + 'static,
     {
         let protocol = |details| bmux_plugin_sdk::PluginError::ServiceProtocol { details };
-        let runtime = tokio::runtime::Handle::try_current()
-            .map_err(|error| protocol(format!("selected callback runtime unavailable: {error}")))?;
         let executor = HostCallbackExecutor::get()?;
         let permit = executor.slots.clone().try_acquire_owned().map_err(|_| {
             protocol("host callback executor saturated; callback not dispatched".into())
@@ -1117,7 +1174,8 @@ impl AuthenticatedServiceInvocation {
         context: bmux_plugin_sdk::NativeServiceContext,
     ) -> Result<bmux_plugin_sdk::ServiceResponse> {
         let _cancel_on_observer_drop = CancelProviderOnDrop(self.cancellation.clone());
-        Self::dispatch_host_callback(move || {
+        let runtime = self.runtime.clone();
+        Self::dispatch_host_callback(runtime, move || {
             let kernel = provider.granted_kernel_dispatch(self.clone());
             provider.invoke_service_authenticated_sync(&context, self.clone(), kernel)
         })
@@ -2509,9 +2567,10 @@ mod tests {
             payload: vec![],
         })
         .unwrap();
-        let response = AuthenticatedServiceInvocation::dispatch_host_callback(move || {
-            authority.execute_response(&request)
-        })
+        let response = AuthenticatedServiceInvocation::dispatch_host_callback(
+            tokio::runtime::Handle::current(),
+            move || authority.execute_response(&request),
+        )
         .await
         .unwrap();
         assert!(
@@ -2595,15 +2654,18 @@ mod tests {
         ));
         let authority = AuthenticatedServiceInvocation::new(server.host_service_context());
         let request = bmux_ipc::encode(&bmux_ipc::Request::CurrentStreamProvenance).unwrap();
-        let response = AuthenticatedServiceInvocation::dispatch_host_callback(move || {
-            assert!(ON_HOST_CALLBACK_THREAD.with(std::cell::Cell::get));
-            assert!(IN_BLOCKING_PLUGIN_WORKER.with(std::cell::Cell::get));
-            assert_eq!(
-                tokio::runtime::Handle::current().runtime_flavor(),
-                tokio::runtime::RuntimeFlavor::CurrentThread
-            );
-            authority.execute_response(&request)
-        })
+        let response = AuthenticatedServiceInvocation::dispatch_host_callback(
+            tokio::runtime::Handle::current(),
+            move || {
+                assert!(ON_HOST_CALLBACK_THREAD.with(std::cell::Cell::get));
+                assert!(IN_BLOCKING_PLUGIN_WORKER.with(std::cell::Cell::get));
+                assert_eq!(
+                    tokio::runtime::Handle::current().runtime_flavor(),
+                    tokio::runtime::RuntimeFlavor::CurrentThread
+                );
+                authority.execute_response(&request)
+            },
+        )
         .await
         .unwrap();
         assert!(matches!(
