@@ -287,6 +287,11 @@ kind         = "command"
 # syntax: retain legacy names and negotiate their major separately.
 
 [[contracts]]
+interface_id = "pane-runtime-view-size-v1"
+major        = 1
+minor        = 0
+
+[[contracts]]
 interface_id = "pane-runtime-pointer-grid-v1"
 major        = 1
 minor        = 0
