@@ -278,10 +278,9 @@ capability   = "bmux.pane_runtime.spawn.v1"
 interface_id = "pane-runtime-spawn-v1"
 kind         = "query"
 
-[[services]]
-capability   = "bmux.pane_runtime.spawn.v1"
-interface_id = "pane-runtime-spawn-commands-v1"
-kind         = "command"
+# pane-runtime-spawn-commands-v1 is modeled but deliberately not advertised:
+# directory-aware creation must fail explicitly until the runtime declares
+# safe spawn support (see PaneRuntimePlugin::declared_services).
 
 # Explicit immutable v1 contracts. Route IDs are wire identities, not version
 # syntax: retain legacy names and negotiate their major separately.
@@ -358,10 +357,5 @@ minor        = 0
 
 [[contracts]]
 interface_id = "pane-runtime-spawn-v1"
-major        = 1
-minor        = 0
-
-[[contracts]]
-interface_id = "pane-runtime-spawn-commands-v1"
 major        = 1
 minor        = 0
