@@ -93,6 +93,10 @@ pub struct ClusterPlugin {
     cluster_id: Option<ClusterId>,
     nodes: consensus_network::ConsensusNodeRegistry,
     bootstrap: Arc<tokio::sync::Mutex<()>>,
+    /// A one-command CLI instance never hosts the node's consensus runtime:
+    /// the server owns the retained Raft history and endpoint, and a second
+    /// node in the command process would contend for that exclusive store.
+    command_scoped: bool,
 }
 
 async fn ensure_persistent_consensus_runtime(
@@ -242,6 +246,9 @@ impl RustPlugin for ClusterPlugin {
         async_handle: bmux_plugin_sdk::HostAsyncHandle,
     ) -> Result<i32, PluginCommandError> {
         let result = self.activate(context.clone())?;
+        if self.command_scoped {
+            return Ok(result);
+        }
         let caller = Arc::new(bmux_plugin::TypedServiceCaller::from_lifecycle_context(
             &context,
         ));
@@ -988,6 +995,42 @@ fn invoke_cluster_lifecycle_service(
                 .map_err(|error| ServiceResponse::error("peer_authentication_failed", error))
         },
     })
+}
+
+/// Definition for a one-command instance.
+///
+/// It serves the command and its activation like the bundled definition, but
+/// never starts the persistent consensus runtime, which only the server's
+/// long-lived instance owns.
+///
+/// # Errors
+/// Returns an error if the embedded declaration is invalid.
+pub fn command_scoped_plugin_definition()
+-> bmux_plugin_sdk::Result<bmux_plugin_sdk::definition::PluginDefinition> {
+    use bmux_plugin_sdk::definition::{
+        ComponentRole, PluginCreateContext, PluginDefinition, PluginInstance, RustPluginAdapter,
+    };
+    let metadata = PluginDefinition::from_rust_plugin::<ClusterPlugin>(
+        include_str!("../plugin.toml"),
+        // Mirrors `component_roles` in plugin.toml.
+        vec![ComponentRole::Backend, ComponentRole::Frontend],
+    )
+    .map_err(|error| bmux_plugin_sdk::PluginError::ServiceProtocol {
+        details: error.message,
+    })?
+    .metadata;
+    Ok(PluginDefinition::new(
+        metadata,
+        |scope: PluginCreateContext| {
+            Ok(Arc::new(RustPluginAdapter::for_instance(
+                ClusterPlugin {
+                    command_scoped: true,
+                    ..ClusterPlugin::default()
+                },
+                scope.instance,
+            )) as Arc<dyn PluginInstance>)
+        },
+    ))
 }
 
 /// Constructor-injected consensus authority. The supplied registry must belong

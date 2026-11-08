@@ -2910,7 +2910,7 @@ fn load_command_plugin(
     command_local: bool,
 ) -> Result<Rc<ProductionPlugin>> {
     if command_local {
-        let definitions = standalone_provider_definitions(state);
+        let definitions = standalone_provider_definitions(state)?;
         Ok(Rc::new(load_plugin_with_definitions(
             plugin,
             &plugin_host_metadata(),
@@ -2974,27 +2974,33 @@ fn emit_plugin_phase_timing(
     emit_phase_timing(PhaseChannel::Plugin, &payload);
 }
 
+/// Definitions for one-command instances (CLI command-local or server-side
+/// command bridging), which never own server-lifetime runtime work.
 fn standalone_provider_definitions(
     state: &RuntimeCommandState,
-) -> BTreeMap<String, bmux_plugin_sdk::definition::PluginDefinition> {
+) -> Result<BTreeMap<String, bmux_plugin_sdk::definition::PluginDefinition>> {
+    #[allow(unused_mut)] // Every entry is feature-gated.
+    let mut definitions = BTreeMap::new();
     // Capture the selected invocation's configuration now. Lifecycle polling may
     // run on another thread; factories must not consult command-state TLS.
     #[cfg(feature = "bundled-plugin-recording")]
-    {
-        BTreeMap::from([(
-            "bmux.recording".to_string(),
-            recording_binding::definition(
-                recording_binding::configuration(&state.config, &state.paths),
-                Arc::clone(&HOST_STATE),
-                Arc::new(bmux_plugin::EventBus::new()),
-            ),
-        )])
-    }
-    #[cfg(not(feature = "bundled-plugin-recording"))]
-    {
-        let _ = state;
-        BTreeMap::new()
-    }
+    definitions.insert(
+        "bmux.recording".to_string(),
+        recording_binding::definition(
+            recording_binding::configuration(&state.config, &state.paths),
+            Arc::clone(&HOST_STATE),
+            Arc::new(bmux_plugin::EventBus::new()),
+        ),
+    );
+    // The server's lifecycle instance owns the node's consensus runtime.
+    #[cfg(feature = "bundled-plugin-cluster")]
+    definitions.insert(
+        "bmux.cluster".to_string(),
+        bmux_cluster_plugin::command_scoped_plugin_definition()
+            .map_err(|error| anyhow::anyhow!("cluster command definition invalid: {error}"))?,
+    );
+    let _ = state;
+    Ok(definitions)
 }
 
 fn load_cached_plugin(
@@ -3007,7 +3013,7 @@ fn load_cached_plugin(
             return Ok(Rc::clone(existing));
         }
 
-        let definitions = standalone_provider_definitions(state);
+        let definitions = standalone_provider_definitions(state)?;
         let loaded = load_plugin_with_definitions(
             plugin,
             &plugin_host_metadata(),
