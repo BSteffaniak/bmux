@@ -174,38 +174,28 @@ mod tests {
             // The SDK callback contract returns PluginError by value.
             #[allow(clippy::result_large_err)]
             move |request| {
-                use bmux_clients_plugin_api::clients_identity::{
-                    self, IdentityError, StreamProvenance as WireOrigin,
-                };
                 if cancellation.is_cancelled() {
                     return Err(bmux_plugin_sdk::PluginError::ServiceProtocol {
                         details: "fixture invocation cancelled".into(),
                     });
                 }
-                assert_eq!(request.capability, "bmux.clients.read");
+                // Origin is the host invocation intrinsic, never a domain service.
+                assert_eq!(
+                    request.capability,
+                    bmux_plugin_sdk::CORE_INVOCATION_CAPABILITY
+                );
                 assert_eq!(request.kind, ServiceKind::Query);
-                assert_eq!(request.interface, clients_identity::INTERFACE_ID.as_str());
-                assert_eq!(request.operation, "current-stream-provenance");
-                bmux_plugin_sdk::service_contract::decode_for(
+                assert_eq!(
                     request.interface,
-                    clients_identity::SERVICE_CONTRACT,
-                    request.payload,
-                )?;
+                    bmux_plugin_sdk::CORE_INVOCATION_INTERFACE_V1
+                );
+                assert_eq!(
+                    request.operation,
+                    bmux_plugin_sdk::CORE_INVOCATION_STREAM_ORIGIN_OPERATION_V1
+                );
+                assert_eq!(request.payload, &[] as &[u8]);
                 let current = origin.lock().unwrap().clone();
-                let value = match current {
-                    StreamProvenance::HostInternal => WireOrigin::HostInternal,
-                    StreamProvenance::Local => WireOrigin::Local,
-                    StreamProvenance::Admitted {
-                        subject_id,
-                        lease_id,
-                    } => WireOrigin::Admitted {
-                        subject_id,
-                        lease_id,
-                    },
-                    StreamProvenance::Invalid => WireOrigin::Invalid,
-                };
-                let payload = encode_service_message(&Ok::<_, IdentityError>(value))?;
-                Ok(bmux_plugin_sdk::service_contract::encode_response(&payload))
+                encode_service_message(&current)
             },
         )
     }
@@ -269,18 +259,18 @@ mod tests {
 
     #[test]
     fn provenance_query_failure_never_becomes_local_authority() {
-        use bmux_clients_plugin_api::clients_identity::IdentityError;
         let mut ctx = context("pane-runtime-execution-v4", "send", Vec::new());
         ctx.host_service_port = None;
         assert!(super::super::spawn::caller_provenance(&ctx).is_err());
-        let payload = encode_service_message(&Err::<
-            bmux_clients_plugin_api::clients_identity::StreamProvenance,
-            _,
-        >(IdentityError::UnsupportedContext))
-        .unwrap();
-        ctx.host_service_port = Some(bmux_plugin_sdk::PluginHostServices::new(move |_| {
-            Ok(bmux_plugin_sdk::service_contract::encode_response(&payload))
-        }));
+        ctx.host_service_port = Some(bmux_plugin_sdk::PluginHostServices::new(
+            // The SDK callback contract returns PluginError by value.
+            #[allow(clippy::result_large_err)]
+            |_| {
+                Err(bmux_plugin_sdk::PluginError::ServiceProtocol {
+                    details: "invocation origin requires an authenticated selected context".into(),
+                })
+            },
+        ));
         assert!(super::super::spawn::caller_provenance(&ctx).is_err());
         ctx.host_service_port = Some(bmux_plugin_sdk::PluginHostServices::new(|_| {
             Ok(b"invalid checked response".to_vec())

@@ -18490,22 +18490,20 @@ exit 7"#
             // The SDK callback contract returns PluginError by value.
             #[allow(clippy::result_large_err)]
             |request| {
-                use bmux_clients_plugin_api::clients_identity::{
-                    self, IdentityError, StreamProvenance,
-                };
-                assert_eq!(request.capability, "bmux.clients.read");
+                assert_eq!(
+                    request.capability,
+                    bmux_plugin_sdk::CORE_INVOCATION_CAPABILITY
+                );
                 assert_eq!(request.kind, bmux_plugin_sdk::ServiceKind::Query);
-                assert_eq!(request.interface, clients_identity::INTERFACE_ID.as_str());
-                assert_eq!(request.operation, "current-stream-provenance");
-                bmux_plugin_sdk::service_contract::decode_for(
+                assert_eq!(
                     request.interface,
-                    clients_identity::SERVICE_CONTRACT,
-                    request.payload,
-                )?;
-                let payload = bmux_plugin_sdk::encode_service_message(&Ok::<_, IdentityError>(
-                    StreamProvenance::Local,
-                ))?;
-                Ok(bmux_plugin_sdk::service_contract::encode_response(&payload))
+                    bmux_plugin_sdk::CORE_INVOCATION_INTERFACE_V1
+                );
+                assert_eq!(
+                    request.operation,
+                    bmux_plugin_sdk::CORE_INVOCATION_STREAM_ORIGIN_OPERATION_V1
+                );
+                bmux_plugin_sdk::encode_service_message(&bmux_plugin::StreamOrigin::Local)
             },
         )
     }

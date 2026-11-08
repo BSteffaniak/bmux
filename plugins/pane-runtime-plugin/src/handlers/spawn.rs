@@ -113,32 +113,17 @@ pub(super) fn authorize_session(
     enforce_read_policy(response.map(|response| (response.allowed, response.reason)))
 }
 
-// No process-local global: the foundational service queries the actual host.
+// Host-bound origin comes from the invocation itself, never from a domain
+// service: asking clients-identity is not an admitted route, so admitted
+// streams (paired terminals) could never reach pane execution.
 pub(super) fn caller_provenance(
     ctx: &NativeServiceContext,
 ) -> Result<bmux_plugin::StreamOrigin, SpawnError> {
-    use bmux_clients_plugin_api::clients_identity::{self, StreamProvenance};
-    let denied = |error| SpawnError::Denied {
-        reason: format!("trusted provenance unavailable: {error}"),
-    };
-    let mut client = bmux_plugin::ServiceCallerDispatchClient::new(ctx);
-    let provenance = bmux_plugin::block_on_typed_dispatch(
-        clients_identity::client::current_stream_provenance(&mut client),
-    )
-    .map_err(|error| denied(error.to_string()))?
-    .map_err(|error| denied(format!("{error:?}")))?;
-    Ok(match provenance {
-        StreamProvenance::HostInternal => bmux_plugin::StreamOrigin::HostInternal,
-        StreamProvenance::Local => bmux_plugin::StreamOrigin::Local,
-        StreamProvenance::Admitted {
-            subject_id,
-            lease_id,
-        } => bmux_plugin::StreamOrigin::Admitted {
-            subject_id,
-            lease_id,
-        },
-        StreamProvenance::Invalid => bmux_plugin::StreamOrigin::Invalid,
-    })
+    use bmux_plugin::ServiceCaller as _;
+    ctx.current_stream_origin()
+        .map_err(|error| SpawnError::Denied {
+            reason: format!("trusted provenance unavailable: {error}"),
+        })
 }
 
 fn enforce_read_policy(response: Result<(bool, Option<String>), String>) -> Result<(), SpawnError> {
