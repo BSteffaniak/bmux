@@ -1053,6 +1053,21 @@ mod tests {
         .with_async(move |request| dispatch(request))
     }
 
+    /// Query the actual admitted server context. Pairing payloads and
+    /// caller-provided subject IDs cannot establish provenance.
+    fn fixture_stream_origin(
+        host: &bmux_server::ServiceInvokeContext,
+    ) -> anyhow::Result<bmux_ipc::StreamProvenance> {
+        let bytes = tokio::runtime::Handle::current()
+            .block_on(host.execute_raw(bmux_ipc::encode(&Request::CurrentStreamProvenance)?))?;
+        let Response::Ok(ResponsePayload::CurrentStreamProvenance { provenance }) =
+            bmux_ipc::decode(&bytes)?
+        else {
+            anyhow::bail!("authenticated fixture provenance unavailable");
+        };
+        Ok(provenance)
+    }
+
     fn fixture_nested_call(
         host: &bmux_server::ServiceInvokeContext,
         pairing: &PairingAuthority,
@@ -1084,6 +1099,20 @@ mod tests {
                     .insert(format!("{caller}:{}", request.key.as_str()), request.value);
                 Ok(encode_service_message(&())?)
             }
+            (
+                bmux_plugin_sdk::CORE_INVOCATION_INTERFACE_V1,
+                bmux_plugin_sdk::CORE_INVOCATION_STREAM_ORIGIN_OPERATION_V1,
+            ) => {
+                // Mirror the selected host's invocation intrinsic: an empty
+                // query answered from the admitted server context only.
+                anyhow::ensure!(
+                    capability == bmux_plugin_sdk::CORE_INVOCATION_CAPABILITY
+                        && kind == bmux_plugin_sdk::ServiceKind::Query
+                        && payload.is_empty(),
+                    "unsupported fixture invocation intrinsic"
+                );
+                Ok(encode_service_message(&fixture_stream_origin(host)?)?)
+            }
             ("clients-identity/v1", "current-stream-provenance") => {
                 use bmux_clients_plugin_api::clients_identity::{self, StreamProvenance};
                 use bmux_plugin_sdk::PluginContract;
@@ -1095,17 +1124,7 @@ mod tests {
                 decode_service_message::<()>(bmux_plugin_sdk::service_contract::decode_for(
                     interface, contract, payload,
                 )?)?;
-                // Query the actual admitted server context. Pairing payloads and
-                // caller-provided subject IDs cannot establish provenance.
-                let bytes = tokio::runtime::Handle::current().block_on(
-                    host.execute_raw(bmux_ipc::encode(&Request::CurrentStreamProvenance)?),
-                )?;
-                let Response::Ok(ResponsePayload::CurrentStreamProvenance { provenance }) =
-                    bmux_ipc::decode(&bytes)?
-                else {
-                    anyhow::bail!("authenticated fixture provenance unavailable");
-                };
-                let value = match provenance {
+                let value = match fixture_stream_origin(host)? {
                     bmux_plugin::StreamOrigin::HostInternal => StreamProvenance::HostInternal,
                     bmux_plugin::StreamOrigin::Local => StreamProvenance::Local,
                     bmux_plugin::StreamOrigin::Admitted {
