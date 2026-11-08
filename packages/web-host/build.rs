@@ -16,8 +16,14 @@ fn main() {
         println!("cargo:rerun-if-changed={}", root.join(file).display());
     }
     // Watch directories too: adding/removing an input must invalidate the identity.
+    // Top-level inputs are a fixed list, and their parent is the workspace root,
+    // whose mtime changes constantly; watching it re-ran this script (and
+    // relinked every dependent binary) on nearly every build.
     for file in &inputs {
-        if let Some(parent) = file.parent() {
+        if let Some(parent) = file
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
             println!("cargo:rerun-if-changed={}", root.join(parent).display());
         }
     }
