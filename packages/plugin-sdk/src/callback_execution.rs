@@ -53,6 +53,7 @@ pub trait PluginCallbackAuthoritySource: Send + Sync {
 pub struct PluginCallbackEntryGuard {
     _owner: Box<dyn Any + Send>,
     binding: Option<(Arc<dyn PluginCallbackAuthoritySource>, PluginInstanceId)>,
+    reentrant: bool,
 }
 
 impl PluginCallbackEntryGuard {
@@ -61,7 +62,23 @@ impl PluginCallbackEntryGuard {
         Self {
             _owner: Box::new(guard),
             binding: None,
+            reentrant: false,
         }
+    }
+    /// Mark this entry as a contract-approved re-entry of an instance that
+    /// already has a live entry on the same call chain.
+    ///
+    /// This grants nothing: it only tells instance-local adapters that waiting
+    /// on instance-exclusive admission could deadlock against the caller's own
+    /// ancestor, so they must try admission once and fail instead of queueing.
+    pub const fn into_reentrant(mut self) -> Self {
+        self.reentrant = true;
+        self
+    }
+    /// Whether the host admitted this entry as a same-instance re-entry.
+    #[must_use]
+    pub const fn is_reentrant(&self) -> bool {
+        self.reentrant
     }
     /// Validate this exact privately stamped dependency without entering again.
     ///

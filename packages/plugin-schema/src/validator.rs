@@ -314,6 +314,16 @@ fn collect_and_validate_names(iface: &Interface) -> Result<BTreeSet<String>, Err
                         ),
                     });
                 }
+                // The parser enforces this; re-check for programmatic ASTs.
+                if op.reentrant && (matches!(item, InterfaceItem::Command(_)) || op.emits.is_some())
+                {
+                    return Err(Error::Validate {
+                        message: format!(
+                            "`@reentrant` on operation `{}` in interface `{}` is only allowed on non-streaming queries",
+                            op.name, iface.name
+                        ),
+                    });
+                }
             }
             InterfaceItem::Events(_) => {
                 if events_declared {

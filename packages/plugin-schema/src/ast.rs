@@ -176,6 +176,13 @@ pub struct Operation {
     /// the operation and must produce zero or more typed event frames followed
     /// by exactly one final response frame.
     pub emits: Option<TypeRef>,
+    /// `@reentrant` contract opt-in: the provider promises this query may be
+    /// entered while another callback entry of the same plugin instance is
+    /// still active on the same call chain (stateless/read-only, takes no
+    /// instance-exclusive locks, never blocks on outbound calls). Only legal on
+    /// non-streaming `query` operations. It changes concurrency semantics, so
+    /// it is part of the canonical contract identity when set.
+    pub reentrant: bool,
     pub span: Span,
 }
 

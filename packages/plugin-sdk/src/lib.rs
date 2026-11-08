@@ -171,7 +171,7 @@ pub use service::{
     decode_service_envelope, decode_service_envelope_with_invocation_id, decode_service_message,
     decode_service_stream_envelopes, encode_service_envelope,
     encode_service_envelope_with_invocation_id, encode_service_message,
-    encode_service_stream_envelopes,
+    encode_service_stream_envelopes, merge_service_declaration,
 };
 pub use stateful_plugin::{
     StatefulPlugin, StatefulPluginError, StatefulPluginHandle, StatefulPluginResult,

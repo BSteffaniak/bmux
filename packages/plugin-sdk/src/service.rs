@@ -2,6 +2,7 @@ use crate::{CapabilityId, HostScope, InterfaceId, PluginError, PluginInvocationI
 use bmux_perf_telemetry::{PhaseChannel, PhasePayload, emit as emit_phase_timing};
 pub use bmux_plugin_runtime::PluginConcurrencyConfig;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use std::collections::BTreeSet;
 use std::fmt;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -23,6 +24,13 @@ pub struct PluginService {
     pub interface_id: String,
     #[serde(default)]
     pub concurrency: Option<PluginConcurrencyConfig>,
+    /// Query operations the provider's BPDL contract marks `@reentrant`.
+    ///
+    /// Only meaningful for [`ServiceKind::Query`] services. Empty (the
+    /// default, and omitted from serialized manifests) keeps the host's
+    /// same-instance callback re-entry rejection for every operation.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub reentrant_operations: BTreeSet<String>,
 }
 
 /// BPDL-generated descriptor for an interface-level service endpoint.
@@ -37,6 +45,8 @@ pub struct ServiceInterfaceDescriptor {
     pub interface_id: InterfaceId,
     /// Canonical interface SHA-256 identity (32 bytes); empty means unavailable evidence.
     pub contract: &'static [u8],
+    /// BPDL `@reentrant` query operations of this interface.
+    pub reentrant_operations: &'static [&'static str],
 }
 
 /// Type-level plugin contract exported by BPDL-generated API crates.
@@ -91,6 +101,11 @@ impl ServiceInterfaceDescriptor {
             kind: self.kind,
             interface_id: self.interface_id.as_str().to_string(),
             concurrency: None,
+            reentrant_operations: self
+                .reentrant_operations
+                .iter()
+                .map(|operation| (*operation).to_string())
+                .collect(),
         })
     }
 }
@@ -110,7 +125,51 @@ impl PluginService {
                 kind: self.kind,
             });
         }
+        if !self.reentrant_operations.is_empty() && self.kind != ServiceKind::Query {
+            return Err(PluginError::InvalidReentrantService {
+                plugin_id: plugin_id.to_string(),
+                interface_id: self.interface_id.clone(),
+                kind: self.kind,
+            });
+        }
         Ok(())
+    }
+
+    /// Whether `other` declares the same routed endpoint, ignoring metadata
+    /// such as concurrency overrides and the reentrant operation set.
+    #[must_use]
+    pub fn same_endpoint(&self, other: &Self) -> bool {
+        self.capability == other.capability
+            && self.kind == other.kind
+            && self.interface_id == other.interface_id
+    }
+
+    /// Whether this declaration admits same-instance re-entry for `operation`.
+    ///
+    /// Only query services can be re-entrant; the operation must be listed in
+    /// the BPDL-generated reentrant set.
+    #[must_use]
+    pub fn is_reentrant_query(&self, operation: &str) -> bool {
+        self.kind == ServiceKind::Query && self.reentrant_operations.contains(operation)
+    }
+}
+
+/// Merge one service declaration into `services`.
+///
+/// A new endpoint is appended. An endpoint already declared (for example by an
+/// explicit manifest `[[services]]` entry that predates generated evidence)
+/// keeps its existing fields and gains the incoming reentrant operations, so
+/// generated BPDL metadata is never dropped or duplicated by routing aliases.
+pub fn merge_service_declaration(services: &mut Vec<PluginService>, service: PluginService) {
+    if let Some(existing) = services
+        .iter_mut()
+        .find(|existing| existing.same_endpoint(&service))
+    {
+        existing
+            .reentrant_operations
+            .extend(service.reentrant_operations);
+    } else {
+        services.push(service);
     }
 }
 
@@ -826,6 +885,40 @@ mod tests {
         encode_service_envelope, encode_service_message, encode_service_stream_envelopes,
     };
     use crate::HostScope;
+
+    fn declared(kind: ServiceKind, reentrant: &[&str]) -> super::PluginService {
+        super::PluginService {
+            capability: HostScope::new("example.read").unwrap(),
+            kind,
+            interface_id: "identity/v1".into(),
+            concurrency: None,
+            reentrant_operations: reentrant.iter().map(|op| (*op).to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn reentrant_set_merges_into_existing_route_and_validates_query_only() {
+        let mut services = vec![declared(ServiceKind::Query, &[])];
+        super::merge_service_declaration(&mut services, declared(ServiceKind::Query, &["get"]));
+        assert_eq!(services.len(), 1);
+        assert!(services[0].is_reentrant_query("get"));
+        assert!(!services[0].is_reentrant_query("other"));
+        super::merge_service_declaration(&mut services, declared(ServiceKind::Command, &[]));
+        assert_eq!(services.len(), 2);
+        assert!(services[0].validate("example").is_ok());
+        assert!(matches!(
+            declared(ServiceKind::Command, &["get"]).validate("example"),
+            Err(crate::PluginError::InvalidReentrantService { .. })
+        ));
+        // Absent from serialized manifests unless set; old manifests parse.
+        let plain = toml::to_string(&declared(ServiceKind::Query, &[])).unwrap();
+        assert!(!plain.contains("reentrant_operations"));
+        let parsed: super::PluginService = toml::from_str(&plain).unwrap();
+        assert!(parsed.reentrant_operations.is_empty());
+        let marked = toml::to_string(&declared(ServiceKind::Query, &["get"])).unwrap();
+        let parsed: super::PluginService = toml::from_str(&marked).unwrap();
+        assert!(parsed.is_reentrant_query("get"));
+    }
 
     #[test]
     fn service_message_roundtrip() {

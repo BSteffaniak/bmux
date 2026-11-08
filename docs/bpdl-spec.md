@@ -39,7 +39,7 @@ interface_annotation
             | "@interface-version" "(" integer ")"
 
 interface_item
-           := record | variant | enum | query | command | events
+           := record | variant | enum | ( "@reentrant" )? query | command | events
 
 record     := "record" ident "{" field_list? "}"
 variant    := "variant" ident "{" variant_case_list? "}"
@@ -200,6 +200,49 @@ from the generated service trait.
 query pane-state(id: uuid) -> pane-state?;
 ```
 
+#### `@reentrant`
+
+By default the host rejects a callback that would re-enter a plugin
+instance which already has a live entry on the same call chain (for
+example plugin A → plugin B → plugin A). This prevents deadlocks when
+the outer entry holds instance locks. A query that is genuinely safe to
+re-enter can opt in at the contract level:
+
+```bpdl
+@reentrant query current-stream-provenance() -> result<stream-provenance, identity-error>;
+```
+
+Only mark a query `@reentrant` when it is stateless or read-only, takes
+no instance-exclusive locks, and never blocks on outbound calls.
+
+- `@reentrant` is accepted only directly before `query`. It is a parse
+  error on `command` operations, on operations with `emits`
+  (streaming), and on any other item.
+- An unmarked query keeps its exact canonical contract bytes, so
+  existing interface identities and digests do not change. A marked
+  query is encoded with a distinct item tag, because the marker changes
+  concurrency semantics and so changes the interface identity.
+- Codegen emits `REENTRANT_OPERATIONS: &[&str]` in each service
+  interface module and carries it in `SERVICE_DESCRIPTOR`
+  (`ServiceInterfaceDescriptor::reentrant_operations`). The generated
+  `service_declarations()` copies it into
+  `PluginService::reentrant_operations`, which is how the host sees it
+  without running plugin code. Manifests may omit the field, and it is
+  left out of serialized manifests when empty.
+- The host marks a nested provider binding re-entrant only when the
+  request kind is `query` and the provider's declaration lists that
+  operation for the interface. That binding skips only the same-instance
+  ancestor rejection. The ancestry depth limit, liveness, admission and
+  the one-author-entry-per-invocation checks all still apply.
+- A re-entrant entry never waits on instance-local admission (the
+  adapter's instance gate or the callback slots). If its ancestor holds
+  the gate, or a writer is queued ahead of it, the call fails immediately
+  with an `unavailable` error ("reentrant call would deadlock on
+  exclusive instance gate") instead of hanging.
+- Native dynamic components on callback authority v1 cannot be told an
+  entry is a re-entry, so the host rejects re-entrant entries over that
+  ABI.
+
 ### `command`
 
 Operations that may mutate state. May be fallible via `result<_, _>`.
@@ -293,6 +336,7 @@ Only the single-schema form is supported; imports require `schema!`.
 - Operation names (queries + commands) share a namespace and must be
   unique within an interface.
 - An interface declares at most one `events` item.
+- `@reentrant` may only annotate a non-streaming `query`.
 - `map<K, _>` keys must be one of `string`, `uuid`, or an integer
   primitive (`u8`…`u64`, `i8`…`i64`).
 - `record`/`variant` types must be acyclic in their required fields.

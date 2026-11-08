@@ -1713,6 +1713,7 @@ minimum = "1.0"
             kind: ServiceKind::Command,
             interface_id: "recording-commands".to_string(),
             concurrency: None,
+            reentrant_operations: std::collections::BTreeSet::new(),
         };
         let mut registry = PluginRegistry::new();
         registry

@@ -443,9 +443,7 @@ impl PluginDefinition {
             .map_err(|error| PluginCommandError::failed(error.to_string()))?
             .unwrap_or_default();
         for service in services {
-            if !declared.contains(&service) {
-                declared.push(service);
-            }
+            crate::merge_service_declaration(&mut declared, service);
         }
         value
             .as_table_mut()
@@ -786,6 +784,7 @@ payload = [1, 2]
                     kind: crate::ServiceKind::Query,
                     interface_id: interface.into(),
                     concurrency: None,
+                    reentrant_operations: std::collections::BTreeSet::new(),
                 })
             })
             .collect()

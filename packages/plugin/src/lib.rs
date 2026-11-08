@@ -79,9 +79,9 @@ pub use host_runtime::{
     HostRuntimeApi, InvocationKernelDispatch, InvocationKernelPort, ServiceCaller,
 };
 pub use loader::scoped::{
-    CallbackBinding, CallbackEntryLease, DefinitionArtifact, LifecycleCallbackDispatch,
-    LifecycleCallbackFactory, LoadedExecution, LoaderCallbackHost, VerifiedArtifact,
-    WeakCallbackEntryLease,
+    CallbackBinding, CallbackEntryLease, CallbackReentry, DefinitionArtifact,
+    LifecycleCallbackDispatch, LifecycleCallbackFactory, LoadedExecution, LoaderCallbackHost,
+    VerifiedArtifact, WeakCallbackEntryLease,
 };
 pub use loader::{
     LoadedPlugin, NativePluginLoader, NativeServiceBufferConfig, executable_sha256,

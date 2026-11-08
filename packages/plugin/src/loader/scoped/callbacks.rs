@@ -92,13 +92,34 @@ impl CallbackEntryLease {
     pub(super) fn has_dependents(&self) -> bool {
         Arc::strong_count(&self.0) > 1
     }
+    /// Whether this entry was admitted as a same-instance re-entry.
+    #[must_use]
+    pub fn is_reentrant(&self) -> bool {
+        self.0.reentered
+    }
 }
 struct Entry {
     binding: CallbackBinding,
     // Ancestry for re-entry detection only; weak so a retained child never
     // keeps its parent invocation admitted after the parent call ends.
     parent: Option<WeakCallbackEntryLease>,
+    // A contract-approved same-instance re-entry: a live ancestor entry of
+    // this instance exists, so instance-local admission must not wait.
+    reentered: bool,
     _admission: AdmissionGuard,
+}
+
+/// Whether a child binding may enter an instance that already has a live
+/// entry on its call chain. Selected by the host from provider declarations,
+/// never from caller payload.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CallbackReentry {
+    /// Default: any live same-instance ancestor rejects entry.
+    #[default]
+    Reject,
+    /// The provider's BPDL contract marks this query `@reentrant`; the
+    /// same-instance ancestor rejection alone is skipped.
+    AllowQuery,
 }
 
 /// One actual instance's callback mechanism, reusable by static host adapters.
@@ -138,7 +159,13 @@ impl LoaderCallbackHost {
         invocation: InvocationScope,
         cancellation: ServiceCancellation,
     ) -> super::Result<CallbackBinding> {
-        self.bind(activation, invocation, cancellation, None)
+        self.bind(
+            activation,
+            invocation,
+            cancellation,
+            None,
+            CallbackReentry::Reject,
+        )
     }
     /// Derive a nested dependency from its actual admitted parent lease.
     /// # Errors
@@ -174,6 +201,7 @@ impl LoaderCallbackHost {
             invocation,
             cancellation,
             Some(parent.downgrade()),
+            CallbackReentry::Reject,
         )
     }
     fn bind(
@@ -182,6 +210,7 @@ impl LoaderCallbackHost {
         invocation: InvocationScope,
         cancellation: ServiceCancellation,
         parent: Option<WeakCallbackEntryLease>,
+        reentry: CallbackReentry,
     ) -> super::Result<CallbackBinding> {
         if self.0.instance.id() != invocation.instance_id()
             || self.0.instance.runtime_id() != invocation.runtime_id()
@@ -204,6 +233,7 @@ impl LoaderCallbackHost {
             invocation,
             cancellation,
             parent,
+            reentry,
             entry: Mutex::new(Weak::new()),
         })))
     }
@@ -218,6 +248,7 @@ struct Binding {
     invocation: InvocationScope,
     cancellation: ServiceCancellation,
     parent: Option<WeakCallbackEntryLease>,
+    reentry: CallbackReentry,
     entry: Mutex<Weak<Entry>>,
 }
 
@@ -272,7 +303,13 @@ impl LoadedExecution {
         invocation: InvocationScope,
         cancellation: ServiceCancellation,
     ) -> super::Result<CallbackBinding> {
-        CallbackBinding::bind(self.clone(), invocation, cancellation, None)
+        CallbackBinding::bind(
+            self.clone(),
+            invocation,
+            cancellation,
+            None,
+            CallbackReentry::Reject,
+        )
     }
 
     /// Derive a nested callback only from an actual live host entry dependency.
@@ -283,6 +320,23 @@ impl LoadedExecution {
         parent: &CallbackEntryLease,
         invocation: InvocationScope,
         cancellation: ServiceCancellation,
+    ) -> super::Result<CallbackBinding> {
+        self.bind_child_callback_with(parent, invocation, cancellation, CallbackReentry::Reject)
+    }
+
+    /// Derive a nested callback with an explicit host-selected re-entry policy.
+    ///
+    /// [`CallbackReentry::AllowQuery`] must only be chosen for a query whose
+    /// provider declaration marks the operation `@reentrant`; it skips the
+    /// same-instance ancestor rejection and nothing else.
+    /// # Errors
+    /// Rejects foreign runtime ancestry, closed parents and exhausted depth.
+    pub fn bind_child_callback_with(
+        self: &Arc<Self>,
+        parent: &CallbackEntryLease,
+        invocation: InvocationScope,
+        cancellation: ServiceCancellation,
+        reentry: CallbackReentry,
     ) -> super::Result<CallbackBinding> {
         parent
             .0
@@ -312,6 +366,7 @@ impl LoadedExecution {
             invocation,
             cancellation,
             Some(parent.downgrade()),
+            reentry,
         )
     }
 }
@@ -505,6 +560,7 @@ impl CallbackBinding {
         invocation: InvocationScope,
         cancellation: ServiceCancellation,
         parent: Option<WeakCallbackEntryLease>,
+        reentry: CallbackReentry,
     ) -> super::Result<Self> {
         let host = LoaderCallbackHost(Arc::new(CallbackHostState {
             instance: execution.scope.clone(),
@@ -519,7 +575,13 @@ impl CallbackBinding {
                     .clone(),
             )),
         }));
-        let mut binding = host.bind(&execution.activation()?, invocation, cancellation, parent)?;
+        let mut binding = host.bind(
+            &execution.activation()?,
+            invocation,
+            cancellation,
+            parent,
+            reentry,
+        )?;
         Arc::get_mut(&mut binding.0)
             .expect("fresh callback binding has one owner")
             .execution = Some(execution);
@@ -599,9 +661,16 @@ impl CallbackBinding {
             .parent
             .as_ref()
             .and_then(WeakCallbackEntryLease::upgrade);
+        let mut reentered = false;
         while let Some(entry) = ancestor {
             if entry.0.binding.0.invocation.instance_id() == self.0.invocation.instance_id() {
-                return Err(rejected("recursive callback dependency rejected"));
+                // Only a host-selected `@reentrant` query binding may enter
+                // an instance with a live ancestor entry; every other check
+                // (liveness, admission, single author entry) still applies.
+                if self.0.reentry != CallbackReentry::AllowQuery {
+                    return Err(rejected("recursive callback dependency rejected"));
+                }
+                reentered = true;
             }
             ancestor = entry
                 .0
@@ -625,6 +694,7 @@ impl CallbackBinding {
         let entry = Arc::new(Entry {
             binding: self.clone(),
             parent: self.0.parent.clone(),
+            reentered,
             _admission: admission,
         });
         *active = Arc::downgrade(&entry);
@@ -643,7 +713,15 @@ impl PluginCallbackAuthoritySource for CallbackBinding {
         if instance != self.0.invocation.instance_id() {
             return Err(rejected("callback target is not the selected instance"));
         }
-        self.enter().map(PluginCallbackEntryGuard::from_host)
+        self.enter().map(|entry| {
+            let reentrant = entry.is_reentrant();
+            let guard = PluginCallbackEntryGuard::from_host(entry);
+            if reentrant {
+                guard.into_reentrant()
+            } else {
+                guard
+            }
+        })
     }
     fn cancelled(&self) -> PluginCallbackSettlement {
         let binding = self.clone();
@@ -717,21 +795,30 @@ impl PluginCallbackExecution for SelectedExecutor {
                 return Err(rejected("callback queue limit exceeded"));
             }
             let waiting = Waiting(owner.clone());
-            let mut acquire = std::pin::pin!(owner.slots.clone().acquire_owned());
-            let mut cancelled = authority.cancelled();
-            let permit = std::future::poll_fn(|cx| {
-                use std::future::Future;
-                if cancelled.as_mut().poll(cx).is_ready() {
-                    return std::task::Poll::Ready(Err(rejected(
-                        "callback cancelled before acceptance",
-                    )));
-                }
-                acquire
-                    .as_mut()
-                    .poll(cx)
-                    .map(|result| result.map_err(|e| rejected(e.to_string())))
-            })
-            .await?;
+            let permit = if entry.is_reentrant() {
+                // A re-entrant entry's own ancestor occupies one of these
+                // instance-local slots; waiting for capacity could block on
+                // that ancestor forever, so admit now or fail explicitly.
+                owner.slots.clone().try_acquire_owned().map_err(|_| {
+                    rejected("reentrant call would deadlock on exhausted instance callback slots")
+                })?
+            } else {
+                let mut acquire = std::pin::pin!(owner.slots.clone().acquire_owned());
+                let mut cancelled = authority.cancelled();
+                std::future::poll_fn(|cx| {
+                    use std::future::Future;
+                    if cancelled.as_mut().poll(cx).is_ready() {
+                        return std::task::Poll::Ready(Err(rejected(
+                            "callback cancelled before acceptance",
+                        )));
+                    }
+                    acquire
+                        .as_mut()
+                        .poll(cx)
+                        .map(|result| result.map_err(|e| rejected(e.to_string())))
+                })
+                .await?
+            };
             drop(waiting);
             // Both the caller-supplied selected source and the executor's actual
             // scope must be live. Only this binding mints dependency ownership.

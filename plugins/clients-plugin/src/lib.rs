@@ -1350,4 +1350,28 @@ mod definition_contract_tests {
             assert_eq!((contract.major, contract.minor), (1, 0));
         }
     }
+
+    #[test]
+    fn embedded_declaration_carries_generated_reentrant_query_without_duplicate_route() {
+        let definition = super::plugin_definition();
+        let manifest = bmux_plugin::PluginManifest::from_toml_str(
+            definition
+                .metadata
+                .manifest_toml
+                .as_deref()
+                .expect("definition embeds its manifest"),
+        )
+        .unwrap();
+        let declaration = manifest.to_declaration().unwrap();
+        let identity: Vec<_> = declaration
+            .services
+            .iter()
+            .filter(|service| service.interface_id == "clients-identity/v1")
+            .collect();
+        // The explicit manifest route and the generated declaration merge
+        // into one endpoint that keeps the BPDL reentrant set.
+        assert_eq!(identity.len(), 1);
+        assert!(identity[0].is_reentrant_query("current-stream-provenance"));
+        assert!(!identity[0].is_reentrant_query("current-principal"));
+    }
 }

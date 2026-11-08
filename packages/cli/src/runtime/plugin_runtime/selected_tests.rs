@@ -524,4 +524,62 @@ mod tests {
         drop(port);
         assert!(error.to_string().contains("not declared by caller"));
     }
+
+    #[test]
+    fn provider_reentry_requires_declared_reentrant_query_operation() {
+        let manifest = "id='example.owner'\nname='Owner'\nversion='1.0.0'\n\
+            provided_capabilities=['example.read','example.write']\n\
+            [[services]]\ncapability='example.read'\nkind='query'\ninterface_id='identity/v1'\n\
+            reentrant_operations=['provenance']\n\
+            [[services]]\ncapability='example.write'\nkind='command'\ninterface_id='commands/v1'\n";
+        let declaration = bmux_plugin::PluginManifest::from_toml_str(manifest)
+            .unwrap()
+            .to_declaration()
+            .unwrap();
+        let request = |capability: &str, kind, interface: &str, operation: &str| {
+            bmux_plugin_sdk::ServiceRequest {
+                caller_plugin_id: "example.caller".into(),
+                service: bmux_plugin_sdk::RegisteredService {
+                    capability: bmux_plugin_sdk::HostScope::new(capability).unwrap(),
+                    kind,
+                    interface_id: interface.into(),
+                    provider: bmux_plugin_sdk::ProviderId::Plugin("example.owner".into()),
+                },
+                operation: operation.into(),
+                payload: Vec::new(),
+            }
+        };
+        let query = bmux_plugin_sdk::ServiceKind::Query;
+        assert_eq!(
+            provider_reentry(
+                &declaration,
+                &request("example.read", query, "identity/v1", "provenance")
+            ),
+            bmux_plugin::CallbackReentry::AllowQuery
+        );
+        for denied in [
+            request("example.read", query, "identity/v1", "principal"),
+            request("example.read", query, "other/v1", "provenance"),
+            request("example.write", query, "identity/v1", "provenance"),
+            request(
+                "example.read",
+                bmux_plugin_sdk::ServiceKind::Command,
+                "identity/v1",
+                "provenance",
+            ),
+        ] {
+            assert_eq!(
+                provider_reentry(&declaration, &denied),
+                bmux_plugin::CallbackReentry::Reject
+            );
+        }
+        // Manifests that never mention the marker keep default rejection.
+        assert_eq!(
+            provider_reentry(
+                &self::declaration(),
+                &request("example.read", query, "identity/v1", "provenance")
+            ),
+            bmux_plugin::CallbackReentry::Reject
+        );
+    }
 }

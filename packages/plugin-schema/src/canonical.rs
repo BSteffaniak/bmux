@@ -119,7 +119,10 @@ fn schema_bytes(out: &mut Vec<u8>, schema: &Schema) {
                     }
                 }
                 InterfaceItem::Query(query) => {
-                    out.push(3);
+                    // `@reentrant` changes concurrency semantics, so it is
+                    // identity-bearing when set. It uses a distinct item tag
+                    // so unmarked queries keep their exact pre-existing bytes.
+                    out.push(if query.reentrant { 6 } else { 3 });
                     operation(out, query);
                 }
                 InterfaceItem::Command(command) => {
@@ -458,6 +461,33 @@ mod tests {
             interface_contract(&schema, &schema.interfaces[0], &ImportMap::new()),
             [] as [u8; 0]
         );
+    }
+
+    #[test]
+    fn reentrant_marker_is_identity_bearing_only_when_set() {
+        let unmarked = "plugin example.api version 1; capability READ = example.read; @capability(READ) @interface-version(1) interface read { enum value { a, b } query get() -> value; query other(n: u32) -> u32; }";
+        let first = identity(unmarked);
+        // Pinned digest of the unmarked interface: adding the `@reentrant`
+        // grammar must not perturb any existing contract identity.
+        assert_eq!(
+            hex(&first),
+            "685926e8a746fabdf1a81b7a36993435f307395b012fc840a040b2cf10cb2d52"
+        );
+        let marked = identity(&unmarked.replace("query get()", "@reentrant query get()"));
+        assert_eq!(marked.len(), 32);
+        assert_ne!(first, marked);
+        assert_ne!(
+            marked,
+            identity(&unmarked.replace("query other(", "@reentrant query other("))
+        );
+    }
+
+    fn hex(bytes: &[u8]) -> String {
+        use std::fmt::Write as _;
+        bytes.iter().fold(String::new(), |mut out, byte| {
+            let _ = write!(out, "{byte:02x}");
+            out
+        })
     }
 
     #[test]

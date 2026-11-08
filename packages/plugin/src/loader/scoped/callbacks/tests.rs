@@ -562,3 +562,99 @@ fn activation_dispatch_routes_by_admitted_invocation_and_live_entry() {
     assert!(unbound.invoke(&fresh, request()).is_err());
     assert!(unbound.invoke(&own, request()).is_err());
 }
+#[test]
+fn reentrant_query_binding_enters_same_instance_while_default_binding_is_rejected() {
+    let first = crate::loader::scoped::tests::fixture();
+    let other = crate::loader::scoped::tests::fixture();
+    let root = binding(&first);
+    let entry = root.enter().unwrap();
+    assert!(!entry.is_reentrant());
+    let hop = other.activation().unwrap().begin_invocation().unwrap();
+    let hop = other
+        .bind_child_callback(&entry, hop, ServiceCancellation::new())
+        .unwrap();
+    let hop_entry = hop.enter().unwrap();
+    // Cross-instance hops never count as re-entry.
+    assert!(!hop_entry.is_reentrant());
+
+    let rejected = first.activation().unwrap().begin_invocation().unwrap();
+    let rejected = first
+        .bind_child_callback(&hop_entry, rejected, ServiceCancellation::new())
+        .unwrap();
+    let Err(error) = rejected.enter() else {
+        panic!("default binding must reject same-instance re-entry");
+    };
+    assert!(
+        error
+            .message
+            .contains("recursive callback dependency rejected")
+    );
+
+    let allowed = first.activation().unwrap().begin_invocation().unwrap();
+    let allowed = first
+        .bind_child_callback_with(
+            &hop_entry,
+            allowed,
+            ServiceCancellation::new(),
+            CallbackReentry::AllowQuery,
+        )
+        .unwrap();
+    let reentered = allowed.enter().expect("reentrant query binding may enter");
+    assert!(reentered.is_reentrant());
+    // The opt-in skips only the ancestor rejection: one author entry per
+    // invocation still holds, and the adapter guard carries the marker.
+    assert!(allowed.enter().is_err());
+    drop(reentered);
+    let guard = allowed.enter_adapter_entry(first.scope.id()).unwrap();
+    assert!(guard.is_reentrant());
+    drop(guard);
+
+    // Without a live same-instance ancestor an allowed binding is ordinary.
+    drop(hop_entry);
+    drop(entry);
+    let fresh_parent = binding(&other);
+    let fresh_parent_entry = fresh_parent.enter().unwrap();
+    let ordinary = first.activation().unwrap().begin_invocation().unwrap();
+    let ordinary = first
+        .bind_child_callback_with(
+            &fresh_parent_entry,
+            ordinary,
+            ServiceCancellation::new(),
+            CallbackReentry::AllowQuery,
+        )
+        .unwrap();
+    assert!(!ordinary.enter().unwrap().is_reentrant());
+}
+#[test]
+fn reentrant_binding_keeps_ancestry_depth_limit() {
+    let first = crate::loader::scoped::tests::fixture();
+    let other = crate::loader::scoped::tests::fixture();
+    let mut bindings = vec![binding(&first)];
+    let mut entries = vec![bindings[0].enter().unwrap()];
+    for depth in 0..MAX_ANCESTORS {
+        let execution = if depth % 2 == 0 { &other } else { &first };
+        let invocation = execution.activation().unwrap().begin_invocation().unwrap();
+        let child = execution
+            .bind_child_callback_with(
+                entries.last().unwrap(),
+                invocation,
+                ServiceCancellation::new(),
+                CallbackReentry::AllowQuery,
+            )
+            .unwrap();
+        entries.push(child.enter().unwrap());
+        bindings.push(child);
+    }
+    let invocation = first.activation().unwrap().begin_invocation().unwrap();
+    assert!(
+        first
+            .bind_child_callback_with(
+                entries.last().unwrap(),
+                invocation,
+                ServiceCancellation::new(),
+                CallbackReentry::AllowQuery,
+            )
+            .is_err(),
+        "re-entry opt-in must not lift the ancestry depth limit"
+    );
+}

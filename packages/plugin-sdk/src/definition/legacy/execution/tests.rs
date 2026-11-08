@@ -17,6 +17,7 @@ struct Source {
     releases: Arc<AtomicUsize>,
     released: Arc<tokio::sync::Notify>,
     recursive: AtomicBool,
+    reentrant: AtomicBool,
     cancel: tokio::sync::Notify,
     cancelled: AtomicBool,
 }
@@ -42,10 +43,15 @@ impl PluginCallbackAuthoritySource for Arc<Source> {
             ));
         }
         self.entries.fetch_add(1, Ordering::SeqCst);
-        Ok(PluginCallbackEntryGuard::from_host(Lease(
+        let guard = PluginCallbackEntryGuard::from_host(Lease(
             Arc::clone(&self.releases),
             Arc::clone(&self.released),
-        )))
+        ));
+        Ok(if self.reentrant.load(Ordering::SeqCst) {
+            guard.into_reentrant()
+        } else {
+            guard
+        })
     }
     fn cancelled(&self) -> PluginCallbackSettlement {
         let source = Self::clone(self);
@@ -195,4 +201,42 @@ async fn accepted_job_retains_entry_and_permit_after_observer_loss() {
     drop(permit);
     source.released.notified().await;
     assert_eq!(source.releases.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn reentrant_entry_fails_fast_on_held_gate_instead_of_waiting() {
+    let adapter = RustPluginAdapter::for_instance((), target());
+    let source = Arc::new(Source::default());
+    source.reentrant.store(true, Ordering::SeqCst);
+    // The outer entry of this same instance holds the gate exclusively (a
+    // command or event body that called out and is now being re-entered).
+    let outer = adapter.1.acquire(true).await.unwrap();
+    let reentered = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        adapter.schedule(Some(context(&source)), false, |_| -> PluginResult<()> {
+            panic!("re-entrant query must not run while the gate is held")
+        }),
+    )
+    .await
+    .expect("re-entrant admission must not wait on the instance gate");
+    let error = reentered.expect_err("held gate must reject re-entry");
+    assert!(
+        error
+            .message
+            .contains("reentrant call would deadlock on exclusive instance gate"),
+        "unexpected error: {}",
+        error.message
+    );
+    assert_eq!(error.code, PluginCommandError::unavailable("").code);
+    // The rejected entry was released without reaching the author and the
+    // gate never recorded a waiter for it.
+    assert_eq!(source.entries.load(Ordering::SeqCst), 1);
+    assert_eq!(source.releases.load(Ordering::SeqCst), 1);
+    drop(outer);
+    // With the gate free, the same re-entrant entry is admitted and runs.
+    adapter
+        .schedule(Some(context(&source)), false, |_| Ok(()))
+        .await
+        .expect("free gate admits re-entrant query");
+    assert_eq!(source.entries.load(Ordering::SeqCst), 2);
 }

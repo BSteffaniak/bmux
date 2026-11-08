@@ -38,7 +38,10 @@ interface clients-identity {
     }
 
     query stream-admission-backend() -> result<uuid?, identity-error>;
-    query current-stream-provenance() -> result<stream-provenance, identity-error>;
+    // Stateless facade over a kernel request: takes no instance-exclusive
+    // locks and never blocks on outbound plugin calls, so a call chain that
+    // already holds a clients entry may safely query it again.
+    @reentrant query current-stream-provenance() -> result<stream-provenance, identity-error>;
 
     // Resolves only the host-supplied caller; never accepts a chosen owner.
     query current-principal() -> result<local-principal, identity-error>;

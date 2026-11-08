@@ -69,6 +69,27 @@ impl CallbackGate {
             id: None,
         }
     }
+    /// Admit only if the gate is free right now and no waiter is queued.
+    ///
+    /// Never enqueues: queued waiters precede newcomers, so a caller that must
+    /// not wait (a re-entrant entry whose own ancestor may hold the gate or be
+    /// ahead of a queued writer) gets `Ok(None)` instead of a deadlock.
+    pub(super) fn try_acquire(self: &Arc<Self>, exclusive: bool) -> PluginResult<Option<Permit>> {
+        let mut state = self.0.lock().map_err(|_| poisoned())?;
+        if state.writer || (exclusive && state.readers > 0) || !state.waiters.is_empty() {
+            return Ok(None);
+        }
+        if exclusive {
+            state.writer = true;
+        } else {
+            state.readers += 1;
+        }
+        drop(state);
+        Ok(Some(Permit {
+            gate: Arc::clone(self),
+            exclusive,
+        }))
+    }
 }
 impl Future for Admission {
     type Output = PluginResult<Permit>;
@@ -189,6 +210,29 @@ mod tests {
         assert!(poll(&mut reader).is_pending());
         drop(writing);
         drop(ready(&mut reader));
+    }
+    #[test]
+    fn try_acquire_never_queues_or_overtakes() {
+        let gate = Arc::new(CallbackGate::default());
+        let writer = gate.try_acquire(true).unwrap().expect("free gate admits");
+        assert!(gate.try_acquire(false).unwrap().is_none());
+        assert!(gate.try_acquire(true).unwrap().is_none());
+        assert!(gate.0.lock().unwrap().waiters.is_empty());
+        drop(writer);
+        let reader = gate.try_acquire(false).unwrap().expect("readers share");
+        let second = gate.try_acquire(false).unwrap().expect("readers share");
+        assert!(gate.try_acquire(true).unwrap().is_none());
+        let mut queued = gate.acquire(true);
+        assert!(poll(&mut queued).is_pending());
+        // A queued writer precedes newcomers, so a reader must not overtake it.
+        assert!(gate.try_acquire(false).unwrap().is_none());
+        drop((reader, second));
+        drop(ready(&mut queued));
+        drop(
+            gate.try_acquire(true)
+                .unwrap()
+                .expect("released gate admits"),
+        );
     }
     #[test]
     fn queued_drop_removes_writer_without_entry() {

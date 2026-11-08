@@ -8,6 +8,15 @@ use std::{
     sync::{Arc, RwLock},
 };
 
+/// Typed failure for a re-entrant entry that cannot be admitted immediately.
+fn reentrant_gate_conflict() -> PluginCommandError {
+    PluginCommandError::unavailable(
+        "reentrant call would deadlock on exclusive instance gate: an ancestor entry of this \
+         plugin instance holds or is queued ahead of the adapter gate, so the re-entrant \
+         query is rejected instead of waiting",
+    )
+}
+
 impl<P: Send + Sync + 'static> RustPluginAdapter<P> {
     pub(super) fn schedule<T: Send + 'static>(
         &self,
@@ -26,20 +35,30 @@ impl<P: Send + Sync + 'static> RustPluginAdapter<P> {
                 PluginCommandError::unavailable("callback instance binding missing")
             })?;
             let entry = execution.enter_adapter_entry(instance)?;
-            let mut admission = Box::pin(gate.acquire(exclusive));
-            let mut cancelled = execution.cancelled();
-            let permit = std::future::poll_fn(|cx| {
-                if let std::task::Poll::Ready(result) = cancelled.as_mut().poll(cx) {
-                    return std::task::Poll::Ready(Err(result.err().unwrap_or_else(|| {
-                        PluginCommandError::unavailable("callback cancelled before entry")
-                    })));
-                }
-                admission.as_mut().poll(cx)
-            })
-            .await?;
-            // Fence queue-time notification before handing ownership to the
-            // selected executor. A failed fence makes native authority non-live.
-            drop(cancelled);
+            let permit = if entry.is_reentrant() {
+                // The host admitted a contract-approved re-entry while an
+                // ancestor entry of this same instance is live. That ancestor
+                // may hold this gate (or be ahead of a queued writer), so
+                // waiting could never complete. Admit now or fail explicitly.
+                gate.try_acquire(exclusive)?
+                    .ok_or_else(reentrant_gate_conflict)?
+            } else {
+                let mut admission = Box::pin(gate.acquire(exclusive));
+                let mut cancelled = execution.cancelled();
+                let permit = std::future::poll_fn(|cx| {
+                    if let std::task::Poll::Ready(result) = cancelled.as_mut().poll(cx) {
+                        return std::task::Poll::Ready(Err(result.err().unwrap_or_else(|| {
+                            PluginCommandError::unavailable("callback cancelled before entry")
+                        })));
+                    }
+                    admission.as_mut().poll(cx)
+                })
+                .await?;
+                // Fence queue-time notification before handing ownership to the
+                // selected executor. A failed fence makes native authority non-live.
+                drop(cancelled);
+                permit
+            };
             execution.check_live()?;
             let output = Arc::new(std::sync::Mutex::new(None));
             let writer = Arc::clone(&output);

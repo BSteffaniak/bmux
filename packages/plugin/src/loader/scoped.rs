@@ -8,8 +8,8 @@ mod activation_ports;
 #[path = "scoped/callbacks.rs"]
 pub mod callbacks;
 pub use callbacks::{
-    CallbackBinding, CallbackEntryLease, LifecycleCallbackDispatch, LifecycleCallbackFactory,
-    LoaderCallbackHost, WeakCallbackEntryLease,
+    CallbackBinding, CallbackEntryLease, CallbackReentry, LifecycleCallbackDispatch,
+    LifecycleCallbackFactory, LoaderCallbackHost, WeakCallbackEntryLease,
 };
 #[path = "scoped/ports.rs"]
 mod ports;

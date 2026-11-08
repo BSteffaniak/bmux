@@ -197,6 +197,15 @@ unsafe extern "C" fn enter(handle: u64, output: *mut u64) -> AbiStatus {
     guarded(|| {
         let owner = owner(handle)?;
         let entry = owner.binding.enter().map_err(|e| failure(e.message))?;
+        // Native authority v1 has no way to tell the component's adapter that
+        // this lease is a same-instance re-entry, so its instance gate would
+        // queue behind the live ancestor. Reject instead of risking deadlock.
+        if entry.is_reentrant() {
+            return Err(failure(
+                "reentrant entry unsupported over native callback authority v1: the component \
+                 adapter cannot be told to skip its instance gate wait",
+            ));
+        }
         let mut state = owner
             .state
             .lock()

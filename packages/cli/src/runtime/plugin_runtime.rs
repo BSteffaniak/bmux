@@ -4509,6 +4509,7 @@ allow_hyphen_values=true
                 kind: bmux_plugin_sdk::ServiceKind::Command,
                 interface_id: "provider-command/v1".to_string(),
                 concurrency: None,
+                reentrant_operations: std::collections::BTreeSet::new(),
             }],
             commands: Vec::new(),
             event_subscriptions: Vec::new(),
@@ -4647,6 +4648,7 @@ allow_hyphen_values=true
                     kind: bmux_plugin_sdk::ServiceKind::Query,
                     interface_id: "provider-query/v1".to_string(),
                     concurrency: None,
+                    reentrant_operations: std::collections::BTreeSet::new(),
                 },
                 bmux_plugin_sdk::PluginService {
                     capability: bmux_plugin_sdk::HostScope::new("example.provider.write")
@@ -4654,6 +4656,7 @@ allow_hyphen_values=true
                     kind: bmux_plugin_sdk::ServiceKind::Command,
                     interface_id: "provider-command/v1".to_string(),
                     concurrency: None,
+                    reentrant_operations: std::collections::BTreeSet::new(),
                 },
             ],
             commands: Vec::new(),

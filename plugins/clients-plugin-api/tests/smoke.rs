@@ -84,6 +84,29 @@ fn current_stream_provenance_contract_has_no_caller_selected_identity() {
 }
 
 #[test]
+fn only_current_stream_provenance_is_reentrant_in_generated_declarations() {
+    use bmux_clients_plugin_api::clients_identity;
+    assert_eq!(
+        clients_identity::REENTRANT_OPERATIONS,
+        ["current-stream-provenance"]
+    );
+    assert!(clients_state::REENTRANT_OPERATIONS.is_empty());
+    let services = bmux_clients_plugin_api::service_declarations().unwrap();
+    let identity = services
+        .iter()
+        .find(|service| service.interface_id == "clients-identity/v1")
+        .expect("clients-identity is declared");
+    assert!(identity.is_reentrant_query("current-stream-provenance"));
+    assert!(!identity.is_reentrant_query("current-principal"));
+    assert!(
+        services
+            .iter()
+            .filter(|service| service.interface_id != "clients-identity/v1")
+            .all(|service| service.reentrant_operations.is_empty())
+    );
+}
+
+#[test]
 fn interface_ids_match_bpdl_source() {
     assert_eq!(clients_state::INTERFACE_ID, "clients-state");
     assert_eq!(clients_events::INTERFACE_ID, "clients-events");

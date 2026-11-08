@@ -146,10 +146,11 @@ impl Parser<'_> {
                 self.parse_events(DeliveryMode::Broadcast)?,
             )),
             TokenKind::At => {
-                // Annotation prefix. Currently only `@state events T;` is
-                // recognised; future annotations (e.g. `@durable`)
-                // extend this arm. The annotation may only precede an
-                // `events` declaration.
+                // Annotation prefix. `@reentrant` precedes a `query`
+                // operation; `@state` precedes an `events` declaration.
+                if self.peek_annotation_name() == Some("reentrant") {
+                    return self.parse_reentrant_operation();
+                }
                 let delivery = self.consume_events_delivery_annotation()?;
                 Ok(InterfaceItem::Events(self.parse_events(delivery)?))
             }
@@ -234,6 +235,60 @@ impl Parser<'_> {
         Ok(EnumDef { name, cases, span })
     }
 
+    /// The identifier following an `@` at the cursor, without consuming it.
+    fn peek_annotation_name(&self) -> Option<&str> {
+        if !self.check(&TokenKind::At) {
+            return None;
+        }
+        match self.tokens.get(self.index + 1).map(|token| &token.kind) {
+            Some(TokenKind::Identifier(name)) => Some(name.as_str()),
+            _ => None,
+        }
+    }
+
+    /// Parse `@reentrant query ...;`. The marker is a concurrency contract for
+    /// stateless queries only: commands may mutate instance state and
+    /// streaming operations hold their invocation open while emitting, so
+    /// neither can be safely entered from their own call chain.
+    fn parse_reentrant_operation(&mut self) -> Result<InterfaceItem, Error> {
+        let at_span = self.expect(&TokenKind::At, "expected `@`")?;
+        self.expect_contextual_keyword("reentrant", "expected `reentrant` after `@`")?;
+        if self.check(&TokenKind::At) {
+            return Err(Error::Parse {
+                span: at_span,
+                message: "`@reentrant` must directly precede a `query` operation".to_string(),
+            });
+        }
+        let tok = self.peek().cloned().ok_or_else(|| Error::Parse {
+            span: at_span,
+            message: "expected `query` after `@reentrant` (unexpected end of input)".to_string(),
+        })?;
+        match tok.kind {
+            TokenKind::Query => {
+                let mut operation = self.parse_operation(OpKind::Query)?;
+                if operation.emits.is_some() {
+                    return Err(Error::Parse {
+                        span: operation.span,
+                        message: format!(
+                            "`@reentrant` is not allowed on streaming operation `{}`; operations with `emits` cannot be re-entered",
+                            operation.name,
+                        ),
+                    });
+                }
+                operation.reentrant = true;
+                Ok(InterfaceItem::Query(operation))
+            }
+            TokenKind::Command => Err(Error::Parse {
+                span: tok.span,
+                message: "`@reentrant` is only allowed on `query` operations; commands may mutate instance state and are never re-entrant".to_string(),
+            }),
+            other => Err(Error::Parse {
+                span: tok.span,
+                message: format!("`@reentrant` must precede a `query` operation (got {other:?})"),
+            }),
+        }
+    }
+
     fn parse_operation(&mut self, kind: OpKind) -> Result<Operation, Error> {
         let span = self.expect(
             match kind {
@@ -278,6 +333,7 @@ impl Parser<'_> {
             params,
             returns,
             emits,
+            reentrant: false,
             span,
         })
     }
@@ -808,6 +864,60 @@ mod tests {
             }
             other => panic!("expected parse error, got {other:?}"),
         }
+    }
+
+    fn parse_error(source: &str) -> String {
+        let tokens = tokenize(source).expect("lex");
+        match parse(&tokens).expect_err("must be rejected") {
+            Error::Parse { message, .. } => message,
+            other => panic!("expected parse error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_reentrant_query_marker() {
+        let schema = must_parse(
+            "plugin p version 1;\n\
+             interface i {\n\
+               @reentrant query provenance() -> u32;\n\
+               query plain() -> u32;\n\
+             }",
+        );
+        let InterfaceItem::Query(marked) = &schema.interfaces[0].items[0] else {
+            panic!("expected query");
+        };
+        assert_eq!(marked.name, "provenance");
+        assert!(marked.reentrant);
+        let InterfaceItem::Query(plain) = &schema.interfaces[0].items[1] else {
+            panic!("expected query");
+        };
+        assert!(!plain.reentrant);
+    }
+
+    #[test]
+    fn rejects_reentrant_on_commands_streams_and_other_items() {
+        let command = parse_error(
+            "plugin p version 1; interface i { @reentrant command set(n: u32) -> unit; }",
+        );
+        assert!(
+            command.contains("only allowed on `query`"),
+            "command rejection must explain the restriction; got: {command}"
+        );
+        let streaming = parse_error(
+            "plugin p version 1; interface i { record e { n: u32 } @reentrant query watch() -> unit emits e; }",
+        );
+        assert!(
+            streaming.contains("streaming operation `watch`"),
+            "streaming rejection must name the operation; got: {streaming}"
+        );
+        let events = parse_error(
+            "plugin p version 1; interface i { record e { n: u32 } @reentrant events e; }",
+        );
+        assert!(events.contains("must precede a `query`"), "got: {events}");
+        let doubled = parse_error(
+            "plugin p version 1; interface i { @reentrant @reentrant query get() -> u32; }",
+        );
+        assert!(doubled.contains("directly precede"), "got: {doubled}");
     }
 
     #[test]

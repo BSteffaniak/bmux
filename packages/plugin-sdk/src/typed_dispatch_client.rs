@@ -149,6 +149,9 @@ pub trait TypedServiceEndpoint {
             kind,
             interface_id: Self::INTERFACE_ID,
             contract: Self::SERVICE_CONTRACT,
+            // Endpoint descriptors address one caller-side operation; the
+            // provider's reentrant set travels in its generated declaration.
+            reentrant_operations: &[],
         }
     }
 }

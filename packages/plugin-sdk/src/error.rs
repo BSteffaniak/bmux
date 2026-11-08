@@ -85,6 +85,15 @@ pub enum PluginError {
     },
 
     #[error(
+        "plugin '{plugin_id}' declared reentrant operations on non-query service '{interface_id}' ({kind:?}); only query operations may be reentrant"
+    )]
+    InvalidReentrantService {
+        plugin_id: String,
+        interface_id: String,
+        kind: ServiceKind,
+    },
+
+    #[error(
         "plugin '{plugin_id}' registered service '{interface_id}' for unowned capability '{capability}'"
     )]
     UnownedServiceCapability {

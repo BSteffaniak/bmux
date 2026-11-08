@@ -63,6 +63,30 @@ fn observation_ack_error(id: u64, outcome: &NativeOutcome, error: &PluginError) 
     }
 }
 
+/// Same-instance re-entry policy for one provider invocation.
+///
+/// Only a query whose operation the provider's declaration marks `@reentrant`
+/// (BPDL-generated evidence) may enter while an ancestor entry of the same
+/// instance is live; everything else keeps the default rejection.
+fn provider_reentry(
+    declaration: &bmux_plugin::PluginDeclaration,
+    request: &bmux_plugin_sdk::ServiceRequest,
+) -> bmux_plugin::CallbackReentry {
+    let service = &request.service;
+    let declared = service.kind == bmux_plugin_sdk::ServiceKind::Query
+        && declaration.services.iter().any(|declared| {
+            declared.capability == service.capability
+                && declared.kind == service.kind
+                && declared.interface_id == service.interface_id
+                && declared.is_reentrant_query(&request.operation)
+        });
+    if declared {
+        bmux_plugin::CallbackReentry::AllowQuery
+    } else {
+        bmux_plugin::CallbackReentry::Reject
+    }
+}
+
 #[derive(Clone)]
 struct KernelServices {
     declaration: bmux_plugin::PluginDeclaration,
@@ -991,11 +1015,17 @@ impl ProductionPlugin {
             command_route: None,
             runtime: host_runtime(execution)?,
         });
+        let reentry = provider_reentry(&self.declaration, &context.request);
         let mut context = context.clone();
         context.host_kernel_bridge = None;
         context.host_service_port = None;
         let binding = if let Some(parent) = callback_parent {
-            execution.bind_child_callback(&parent, invocation.clone(), cancellation)?
+            execution.bind_child_callback_with(
+                &parent,
+                invocation.clone(),
+                cancellation,
+                reentry,
+            )?
         } else {
             execution.bind_root_callback(invocation.clone(), cancellation)?
         };

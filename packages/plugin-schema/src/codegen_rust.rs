@@ -507,9 +507,25 @@ fn emit_interface_service_descriptor(iface: &Interface, out: &mut String) {
     let Some(kind) = interface_service_kind(iface) else {
         return;
     };
+    let reentrant = iface
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            InterfaceItem::Query(op) if op.reentrant => Some(format!("{:?}", op.name)),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    out.push_str(
+        "    /// Query operations this interface declares `@reentrant` in BPDL.\n    ///\n    /// The host may admit these while another callback entry of the same\n    /// provider instance is active on the call chain; every other operation\n    /// keeps the default same-instance re-entry rejection.\n",
+    );
     let _ = writeln!(
         out,
-        "    /// BPDL-generated service descriptor for this interface.\n    pub const SERVICE_DESCRIPTOR: ::bmux_plugin_sdk::ServiceInterfaceDescriptor = ::bmux_plugin_sdk::ServiceInterfaceDescriptor {{\n        capability: super::capabilities::{capability},\n        kind: ::bmux_plugin_sdk::ServiceKind::{kind},\n        interface_id: INTERFACE_ID,\n        contract: SERVICE_CONTRACT,\n    }};\n"
+        "    pub const REENTRANT_OPERATIONS: &[&str] = &[{reentrant}];\n"
+    );
+    let _ = writeln!(
+        out,
+        "    /// BPDL-generated service descriptor for this interface.\n    pub const SERVICE_DESCRIPTOR: ::bmux_plugin_sdk::ServiceInterfaceDescriptor = ::bmux_plugin_sdk::ServiceInterfaceDescriptor {{\n        capability: super::capabilities::{capability},\n        kind: ::bmux_plugin_sdk::ServiceKind::{kind},\n        interface_id: INTERFACE_ID,\n        contract: SERVICE_CONTRACT,\n        reentrant_operations: REENTRANT_OPERATIONS,\n    }};\n"
     );
     out.push_str(
         "    /// Convert this BPDL interface descriptor into a plugin service declaration.\n",
@@ -1507,6 +1523,32 @@ mod tests {
         assert!(rust.contains("::std::result::Result<(), String>"));
         assert!(rust.contains("pub const SERVICE_DESCRIPTOR"));
         assert!(rust.contains("pub fn service_declarations()"));
+    }
+
+    #[test]
+    fn service_descriptor_exposes_reentrant_query_set() {
+        let src = "plugin p version 1;\n\
+                   capability READ = bmux.p.read;\n\
+                   @capability(READ)\n\
+                   interface state {\n\
+                      @reentrant query provenance() -> u32;\n\
+                      query plain() -> u32;\n\
+                      @reentrant query other-thing(id: uuid) -> bool;\n\
+                   }\n\
+                   @capability(READ)\n\
+                   interface unmarked {\n\
+                      query get() -> u32;\n\
+                   }";
+        let schema = compile(src).expect("valid");
+        let rust = emit(&schema);
+        assert!(
+            rust.contains(
+                "pub const REENTRANT_OPERATIONS: &[&str] = &[\"provenance\", \"other-thing\"];"
+            ),
+            "reentrant set must list exactly the marked queries; got: {rust}"
+        );
+        assert!(rust.contains("pub const REENTRANT_OPERATIONS: &[&str] = &[];"));
+        assert!(rust.contains("reentrant_operations: REENTRANT_OPERATIONS,"));
     }
 
     #[test]

@@ -176,9 +176,7 @@ impl PluginDeclaration {
                     interface_id: service.interface_id,
                 });
             }
-            if !self.services.contains(&service) {
-                self.services.push(service);
-            }
+            bmux_plugin_sdk::merge_service_declaration(&mut self.services, service);
         }
         self.validate()
     }
