@@ -2620,7 +2620,14 @@ pub(super) fn run_plugin_command_with_service_authority(
     request: &bmux_plugin_sdk::PluginCliCommandRequest,
     caller_client_id: Option<uuid::Uuid>,
     authority: super::plugin_kernel::AuthenticatedServiceInvocation,
+    startup_instances: &[ProductionPlugin],
 ) -> Result<PluginCommandExecution> {
+    // A backend plugin runs on the very instance the server started: its state,
+    // host registry and runtime identity are the ones its providers use. Only
+    // a plugin this host never started (no Backend role) is loaded per command.
+    let instance = startup_instances
+        .iter()
+        .find(|loaded| loaded.declaration.id.as_str() == request.plugin_id);
     run_plugin_command_internal_with_state(
         Some(state),
         &request.plugin_id,
@@ -2631,8 +2638,18 @@ pub(super) fn run_plugin_command_with_service_authority(
         Vec::new(),
         bmux_plugin_sdk::NativeCommandInvocationSource::AttachKeybinding,
         None,
-        Some(authority),
+        Some(ServerCommandAuthority {
+            authority,
+            instance,
+        }),
     )
+}
+
+/// A server-authenticated command request and the startup instance (if this
+/// host started the plugin) that must execute it.
+pub(super) struct ServerCommandAuthority<'a> {
+    authority: super::plugin_kernel::AuthenticatedServiceInvocation,
+    instance: Option<&'a ProductionPlugin>,
 }
 
 pub(super) fn run_plugin_keybinding_command_with_state(
@@ -2799,8 +2816,11 @@ fn run_plugin_command_internal_with_state(
     active_keybindings: Vec<bmux_plugin_sdk::ActiveKeybinding>,
     invocation_source: bmux_plugin_sdk::NativeCommandInvocationSource,
     command_dispatch: Option<super::plugin_kernel::CommandDispatch>,
-    command_authority: Option<super::plugin_kernel::AuthenticatedServiceInvocation>,
+    server_command: Option<ServerCommandAuthority<'_>>,
 ) -> Result<PluginCommandExecution> {
+    let (command_authority, startup_instance) = server_command.map_or((None, None), |command| {
+        (Some(command.authority), command.instance)
+    });
     let total_started = Instant::now();
     let runtime_state_started = Instant::now();
     let cached_state;
@@ -2832,7 +2852,10 @@ fn run_plugin_command_internal_with_state(
     let lookup_us = lookup_started.elapsed().as_micros();
 
     let load_started = Instant::now();
-    let loaded = load_command_plugin(plugin, state, command_dispatch.is_some())?;
+    let loaded = match startup_instance {
+        Some(instance) => Rc::new(instance.clone()),
+        None => load_command_plugin(plugin, state, command_dispatch.is_some())?,
+    };
     let load_us = load_started.elapsed().as_micros();
     let context_started = Instant::now();
     let context = plugin_command_context(

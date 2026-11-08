@@ -1834,6 +1834,7 @@ pub(super) fn register_plugin_service_handlers(
     let command_state =
         build_runtime_command_state(config.clone(), paths.clone(), Arc::new(registry.clone()))?;
     let command_connection_info = connection_info.clone();
+    let command_instances = Arc::clone(loaded_plugins);
 
     server.register_checked_service_handler_with_metadata(
         CORE_CLI_COMMAND_CAPABILITY,
@@ -1843,6 +1844,7 @@ pub(super) fn register_plugin_service_handlers(
         move |_route, invoke_context, payload| {
             let command_state = command_state.clone();
             let connection = command_connection_info.clone();
+            let command_instances = Arc::clone(&command_instances);
             async move {
                 let _kernel_context_guard = enter_service_kernel_context(invoke_context.clone());
                 let _host_kernel_connection_guard = enter_host_kernel_connection(connection);
@@ -1871,6 +1873,7 @@ pub(super) fn register_plugin_service_handlers(
                     &request,
                     Some(invoke_context.client_id().0),
                     AuthenticatedServiceInvocation::new(invoke_context.clone()),
+                    &command_instances,
                 )?;
                 let response = if execution.status == 0 {
                     PluginCliCommandResponse::new(execution.status)
