@@ -69,14 +69,26 @@ impl CallbackGate {
             id: None,
         }
     }
-    /// Admit only if the gate is free right now and no waiter is queued.
+    /// Admit a re-entrant entry immediately or not at all. Never enqueues.
     ///
-    /// Never enqueues: queued waiters precede newcomers, so a caller that must
-    /// not wait (a re-entrant entry whose own ancestor may hold the gate or be
-    /// ahead of a queued writer) gets `Ok(None)` instead of a deadlock.
-    pub(super) fn try_acquire(self: &Arc<Self>, exclusive: bool) -> PluginResult<Option<Permit>> {
+    /// The caller's own ancestor entry of this instance is running and holds a
+    /// permit here. If no writer holds the gate, that permit is shared, so a
+    /// shared re-entrant read is admitted even past queued writers: the
+    /// ancestor cannot finish until this read does, so making it wait behind
+    /// a writer would deadlock, while admitting it only delays the writer.
+    /// A held writer (an exclusive ancestor) or an exclusive request that
+    /// would contend returns `Ok(None)` for an explicit, immediate failure.
+    pub(super) fn try_acquire_reentrant(
+        self: &Arc<Self>,
+        exclusive: bool,
+    ) -> PluginResult<Option<Permit>> {
         let mut state = self.0.lock().map_err(|_| poisoned())?;
-        if state.writer || (exclusive && state.readers > 0) || !state.waiters.is_empty() {
+        let contended = if exclusive {
+            state.writer || state.readers > 0 || !state.waiters.is_empty()
+        } else {
+            state.writer
+        };
+        if contended {
             return Ok(None);
         }
         if exclusive {
@@ -212,27 +224,34 @@ mod tests {
         drop(ready(&mut reader));
     }
     #[test]
-    fn try_acquire_never_queues_or_overtakes() {
+    fn reentrant_admission_never_queues_and_reads_bypass_queued_writers() {
         let gate = Arc::new(CallbackGate::default());
-        let writer = gate.try_acquire(true).unwrap().expect("free gate admits");
-        assert!(gate.try_acquire(false).unwrap().is_none());
-        assert!(gate.try_acquire(true).unwrap().is_none());
+        // An exclusive ancestor holds the gate: every re-entry fails at once.
+        let writer = gate
+            .try_acquire_reentrant(true)
+            .unwrap()
+            .expect("free gate admits");
+        assert!(gate.try_acquire_reentrant(false).unwrap().is_none());
+        assert!(gate.try_acquire_reentrant(true).unwrap().is_none());
         assert!(gate.0.lock().unwrap().waiters.is_empty());
         drop(writer);
-        let reader = gate.try_acquire(false).unwrap().expect("readers share");
-        let second = gate.try_acquire(false).unwrap().expect("readers share");
-        assert!(gate.try_acquire(true).unwrap().is_none());
+        // A shared ancestor holds the gate and a writer is queued behind it.
+        let ancestor = ready(&mut gate.acquire(false));
         let mut queued = gate.acquire(true);
         assert!(poll(&mut queued).is_pending());
-        // A queued writer precedes newcomers, so a reader must not overtake it.
-        assert!(gate.try_acquire(false).unwrap().is_none());
-        drop((reader, second));
+        // The re-entrant read must not wait behind the writer (the ancestor
+        // cannot finish without it), so it is admitted immediately...
+        let reentrant = gate
+            .try_acquire_reentrant(false)
+            .unwrap()
+            .expect("re-entrant read bypasses the queued writer");
+        // ...while an exclusive re-entry still refuses rather than queueing.
+        assert!(gate.try_acquire_reentrant(true).unwrap().is_none());
+        assert_eq!(gate.0.lock().unwrap().waiters.len(), 1);
+        drop(reentrant);
+        assert!(poll(&mut queued).is_pending());
+        drop(ancestor);
         drop(ready(&mut queued));
-        drop(
-            gate.try_acquire(true)
-                .unwrap()
-                .expect("released gate admits"),
-        );
     }
     #[test]
     fn queued_drop_removes_writer_without_entry() {

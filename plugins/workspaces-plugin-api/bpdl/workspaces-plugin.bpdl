@@ -23,10 +23,12 @@ interface workspaces-state {
         invalid-selector { reason: string },
     }
 
-    query list-workspaces() -> list<workspace-summary>;
-    query get-workspace(selector: workspace-selector)
+    // Read-only snapshots: the state lock is never held across an outbound
+    // call, so tabs/contexts may query back while a workspace command runs.
+    @reentrant query list-workspaces() -> list<workspace-summary>;
+    @reentrant query get-workspace(selector: workspace-selector)
         -> result<workspace-summary, workspace-query-error>;
-    query current-workspace() -> workspace-summary?;
+    @reentrant query current-workspace() -> workspace-summary?;
 }
 
 @capability(WORKSPACES_WRITE)

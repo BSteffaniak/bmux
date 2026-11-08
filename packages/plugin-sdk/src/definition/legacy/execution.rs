@@ -12,8 +12,8 @@ use std::{
 fn reentrant_gate_conflict() -> PluginCommandError {
     PluginCommandError::unavailable(
         "reentrant call would deadlock on exclusive instance gate: an ancestor entry of this \
-         plugin instance holds or is queued ahead of the adapter gate, so the re-entrant \
-         query is rejected instead of waiting",
+         plugin instance holds the adapter gate exclusively, so the re-entrant query is \
+         rejected instead of waiting",
     )
 }
 
@@ -37,10 +37,10 @@ impl<P: Send + Sync + 'static> RustPluginAdapter<P> {
             let entry = execution.enter_adapter_entry(instance)?;
             let permit = if entry.is_reentrant() {
                 // The host admitted a contract-approved re-entry while an
-                // ancestor entry of this same instance is live. That ancestor
-                // may hold this gate (or be ahead of a queued writer), so
-                // waiting could never complete. Admit now or fail explicitly.
-                gate.try_acquire(exclusive)?
+                // ancestor entry of this same instance is live and holds this
+                // gate. Waiting could never complete, so admit now (shared
+                // reads may pass queued writers) or fail explicitly.
+                gate.try_acquire_reentrant(exclusive)?
                     .ok_or_else(reentrant_gate_conflict)?
             } else {
                 let mut admission = Box::pin(gate.acquire(exclusive));
