@@ -1,6 +1,13 @@
 # Setup scripts provide the per-run test TMPDIR below.
 experimental = ["setup-scripts"]
 
+[profile.default]
+# Flag a test as slow after a minute and terminate it after 15 minutes.
+# Deliberately generous: integration fixtures boot real servers and can be
+# slow under concurrent load, but a hung test must fail on its own instead of
+# stalling every test queued behind it.
+slow-timeout = { period = "60s", terminate-after = 15, grace-period = "10s" }
+
 # Recorded-process tests launch isolated servers and rasterize animated evidence.
 # Bound their aggregate host load without relaxing per-command deadlines.
 [test-groups.recorded-processes]
