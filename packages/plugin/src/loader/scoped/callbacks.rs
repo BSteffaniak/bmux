@@ -357,7 +357,97 @@ impl bmux_plugin_sdk::HostServiceDispatch for EntryDispatch {
     }
 }
 
+/// Host dispatch behind an activation's retained services.
+///
+/// A call on the activation's own lifecycle invocation made while the author
+/// holds that invocation's callback entry goes through the entry-bound
+/// dispatch, so it keeps the entry's ancestry exactly like any entered call.
+/// Every other call (one outside the author entry, or on a fresh invocation
+/// the activation services minted after setup) goes through the selected
+/// instance dispatch for that invocation. Selection depends only on which
+/// admitted invocation the call carries and whether its entry is live; a
+/// failed call is never retried on the other route.
+struct ActivationDispatch {
+    binding: CallbackBinding,
+    entered: Arc<dyn bmux_plugin_sdk::HostServiceDispatch>,
+    instance: Option<Arc<dyn bmux_plugin_sdk::HostServiceDispatch>>,
+}
+impl ActivationDispatch {
+    fn route(
+        &self,
+        invocation: &InvocationScope,
+    ) -> super::Result<&Arc<dyn bmux_plugin_sdk::HostServiceDispatch>> {
+        let own = invocation.id() == self.binding.invocation().id()
+            && invocation.runtime_id() == self.binding.invocation().runtime_id();
+        if own && self.binding.active_entry().is_ok() {
+            return Ok(&self.entered);
+        }
+        self.instance
+            .as_ref()
+            .ok_or_else(|| super::failure("activation host dispatch not bound"))
+    }
+}
+impl bmux_plugin_sdk::HostServiceDispatch for ActivationDispatch {
+    fn invoke(
+        &self,
+        invocation: &InvocationScope,
+        request: bmux_plugin_sdk::HostServiceRequest<'_>,
+    ) -> super::Result<Vec<u8>> {
+        self.route(invocation)?.invoke(invocation, request)
+    }
+    fn open_retained_host(
+        &self,
+        invocation: &InvocationScope,
+    ) -> super::Result<bmux_plugin_sdk::abi::retained::RetainedHostPort> {
+        self.route(invocation)?.open_retained_host(invocation)
+    }
+    fn open_retained_host_v2(
+        &self,
+        invocation: &InvocationScope,
+    ) -> super::Result<bmux_plugin_sdk::abi::retained::RetainedHostPort> {
+        self.route(invocation)?.open_retained_host_v2(invocation)
+    }
+    fn invoke_async(
+        &self,
+        invocation: &InvocationScope,
+        request: bmux_plugin_sdk::HostServiceOwnedRequest,
+    ) -> bmux_plugin_sdk::definition::PluginFuture<'static, super::Result<Vec<u8>>> {
+        match self.route(invocation) {
+            Ok(dispatch) => dispatch.invoke_async(invocation, request),
+            Err(error) => Box::pin(async move { Err(error) }),
+        }
+    }
+    fn selected_service_availability(
+        &self,
+        invocation: &InvocationScope,
+        key: bmux_plugin_sdk::typed_dispatch::ServiceAvailabilityKey,
+    ) -> bmux_plugin_sdk::definition::PluginFuture<
+        'static,
+        super::Result<bmux_plugin_sdk::typed_dispatch::SelectedServiceAvailability>,
+    > {
+        match self.route(invocation) {
+            Ok(dispatch) => dispatch.selected_service_availability(invocation, key),
+            Err(error) => Box::pin(async move { Err(error) }),
+        }
+    }
+}
+
 impl CallbackBinding {
+    /// Dispatch for an activation's retained services: entry-bound while the
+    /// author holds this lifecycle invocation's entry, the selected instance
+    /// dispatch otherwise (see [`ActivationDispatch`]).
+    pub(super) fn activation_dispatch(
+        &self,
+        entered: Arc<dyn bmux_plugin_sdk::HostServiceDispatch>,
+        instance: Option<Arc<dyn bmux_plugin_sdk::HostServiceDispatch>>,
+    ) -> Arc<dyn bmux_plugin_sdk::HostServiceDispatch> {
+        Arc::new(ActivationDispatch {
+            binding: self.clone(),
+            entered,
+            instance,
+        })
+    }
+
     /// Bind dispatch to the actual live author entry, including native callbacks.
     /// The selector preserves authenticated runtime caller/origin semantics.
     #[must_use]

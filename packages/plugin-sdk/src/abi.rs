@@ -1066,6 +1066,23 @@ fn ordinary_host_services(
         .map(ports::InvocationPorts::host_port)
 }
 
+/// Services handed to `activate`.
+///
+/// A retained activation table carries the host's activation services, which
+/// stay valid from `activate` until deactivation begins, so background work may
+/// retain them. Projected callback services reach the host only through a live
+/// author entry, so they are never the activation's handle.
+fn activation_host_services(
+    ports: Option<&Arc<ports::InvocationPorts>>,
+    invocation_services: impl FnOnce() -> Option<crate::PluginHostServices>,
+) -> Option<crate::PluginHostServices> {
+    if ports.is_some_and(|ports| ports.capabilities() & CAP_RETAINED_LIFECYCLE != 0) {
+        ordinary_host_services(ports)
+    } else {
+        invocation_services()
+    }
+}
+
 fn selected_callback(
     executor: &Arc<callback_projection::Executor>,
     ports: Option<&Arc<ports::InvocationPorts>>,
@@ -1117,9 +1134,9 @@ fn operation_future(
         match request {
             NativeOperation::Activate(mut context) => {
                 context.callback_execution = callback.clone();
+                let services = activation_host_services(ports.as_ref(), host_services);
                 let result =
-                    activate_author(instance.as_ref(), context, host_services(), tasks.as_ref())
-                        .await;
+                    activate_author(instance.as_ref(), context, services, tasks.as_ref()).await;
                 NativeOutcome::result(result, |()| NativeOutcome::Unit)
             }
             NativeOperation::Deactivate(mut context) => {
@@ -1310,9 +1327,10 @@ macro_rules! export_plugin_entrypoint {
                     base: $crate::abi::NativePluginDescriptor {
                         size: $crate::abi::NATIVE_DESCRIPTOR_SIZE,
                         version: $crate::abi::ABI_VERSION,
-                        // Callback authority remains unadvertised until integrated
-                        // native projection/lifecycle acceptance is complete.
-                        capabilities: $crate::abi::SCOPED_CAPABILITIES_V3_RECOVERY_V2,
+                        // Callback authority is advertised: the host binds a
+                        // lifecycle callback root for every selected activation and
+                        // fails closed when an artifact cannot project it.
+                        capabilities: $crate::abi::SCOPED_CAPABILITIES,
                         start_scoped,
                         metadata,
                         create,

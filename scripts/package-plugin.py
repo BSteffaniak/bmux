@@ -22,8 +22,9 @@ import uuid
 ABI_VERSION = 3
 CAPABILITIES_BY_ABI = {2: 15, 3: 31}
 # Explicit supported packaging profiles, not the SDK's broader subset validator.
-# Callback-authority profiles remain excluded pending production acceptance.
-SUPPORTED_CAPABILITIES_BY_ABI = {2: frozenset({15}), 3: frozenset({31, 127, 255, 511, 1023})}
+# 2047 adds callback authority, which the SDK descriptor advertises and the
+# host requires for selected lifecycle activation.
+SUPPORTED_CAPABILITIES_BY_ABI = {2: frozenset({15}), 3: frozenset({31, 127, 255, 511, 1023, 2047})}
 REQUIRED_CAPABILITIES = CAPABILITIES_BY_ABI[ABI_VERSION]
 
 

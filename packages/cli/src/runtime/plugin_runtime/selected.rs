@@ -797,12 +797,17 @@ impl ProductionPlugin {
             ));
         }
         match &self.backend {
-            Backend::Process(plugin) => match &authority {
-                Some(authority) => authority.with_legacy_process_context(|| {
-                    plugin.run_command_with_context_and_outcome(command, args, context)
-                }),
-                None => plugin.run_command_with_context_and_outcome(command, args, context),
-            },
+            Backend::Process(plugin) => {
+                // A manifest-selected out-of-process plugin receives host
+                // calls through its process bridge, which forwards on the
+                // service context it is run within; the authenticated server
+                // invocation is that context. This is the selected backend,
+                // not a fallback after a selected artifact failed.
+                let run = || plugin.run_command_with_context_and_outcome(command, args, context);
+                authority
+                    .as_ref()
+                    .map_or_else(run, |authority| authority.with_legacy_process_context(run))
+            }
             Backend::Scoped(execution) => {
                 let mut context = context
                     .cloned()

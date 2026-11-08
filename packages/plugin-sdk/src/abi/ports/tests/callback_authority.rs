@@ -87,3 +87,20 @@ fn callback_selected_rejection_and_bad_header_never_downgrade() {
         Err(INVALID_ARGUMENT)
     ));
 }
+#[test]
+fn adopted_entry_ports_take_the_transferred_reference_without_retaining() {
+    let counts = FixtureCounts::default();
+    let table = extended(&counts, reject);
+    let ports = unsafe { InvocationPorts::adopt((&raw const table).cast()) }.unwrap();
+    // The host already transferred the only reference.
+    assert_eq!(counts.retains.load(Ordering::SeqCst), 0);
+    ports.close_and_drain().unwrap();
+    drop(ports);
+    // Closing releases exactly that reference, once.
+    assert_eq!(counts.releases.load(Ordering::SeqCst), 1);
+    // Ordinary acquisition still takes its own reference.
+    let acquired = unsafe { InvocationPorts::acquire((&raw const table).cast()) }.unwrap();
+    assert_eq!(counts.retains.load(Ordering::SeqCst), 1);
+    drop(acquired);
+    assert_eq!(counts.releases.load(Ordering::SeqCst), 2);
+}

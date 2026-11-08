@@ -5,6 +5,9 @@ This crate is an in-repo example native bmux plugin.
 It demonstrates shared-definition native plugin surfaces:
 
 - inert export-free definition (descriptor exports live in generated wrappers)
+- the standard `RustPlugin` author surface wrapped in `RustPluginAdapter`,
+  which runs each command and lifecycle hook inside the invocation's admitted
+  callback entry, identically for static bundling and dynamic packaging
 - activation and deactivation hooks
 - plugin commands
 - event subscriptions
@@ -90,9 +93,10 @@ remove the items the server's long-lived activation published. Use
 
 The `status-set` and `status-clear` commands also record a
 `COMMAND_OUTCOME_STATUS_MESSAGE_KEY` outcome, so binding them to a key shows
-the message in the attach status line. The command body runs inside
-`CommandOutcome::capture`, so the metadata comes back as part of the returned
-command outcome on both static and dynamic packaging.
+the message in the attach status line. `RustPluginAdapter` runs the command
+body inside `CommandOutcome::capture`, so the metadata comes back as part of the
+returned command outcome on both static and dynamic packaging (there is no
+exported outcome slot).
 
 Start the server and the plugin will also log activation plus matching events
 such as `server_started` and `window_created`.

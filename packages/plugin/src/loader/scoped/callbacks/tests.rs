@@ -521,3 +521,42 @@ fn callback_without_selected_reactor_rejects_before_author_effects() {
     );
     assert!(binding.active_entry().is_err());
 }
+#[test]
+fn activation_dispatch_routes_by_admitted_invocation_and_live_entry() {
+    struct Tagged(u8);
+    impl bmux_plugin_sdk::HostServiceDispatch for Tagged {
+        fn invoke(
+            &self,
+            _: &InvocationScope,
+            _: bmux_plugin_sdk::HostServiceRequest<'_>,
+        ) -> super::super::Result<Vec<u8>> {
+            Ok(vec![self.0])
+        }
+    }
+    let request = || bmux_plugin_sdk::HostServiceRequest {
+        capability: "test",
+        kind: bmux_plugin_sdk::ServiceKind::Query,
+        interface: "test/v1",
+        operation: "read",
+        payload: &[],
+    };
+    let execution = crate::loader::scoped::tests::fixture();
+    let root = binding(&execution);
+    let own = root.invocation().clone();
+    let fresh = execution.activation().unwrap().begin_invocation().unwrap();
+    let dispatch = root.activation_dispatch(Arc::new(Tagged(1)), Some(Arc::new(Tagged(2))));
+    // Outside the author entry, even the lifecycle invocation uses the
+    // selected instance dispatch.
+    assert_eq!(dispatch.invoke(&own, request()).unwrap(), vec![2]);
+    let entry = root.enter().unwrap();
+    // Inside the entry, the lifecycle invocation keeps its entry ancestry...
+    assert_eq!(dispatch.invoke(&own, request()).unwrap(), vec![1]);
+    // ...while a freshly minted activation invocation never borrows it.
+    assert_eq!(dispatch.invoke(&fresh, request()).unwrap(), vec![2]);
+    drop(entry);
+    assert_eq!(dispatch.invoke(&own, request()).unwrap(), vec![2]);
+    // Without a selected instance dispatch nothing outside the entry is routed.
+    let unbound = root.activation_dispatch(Arc::new(Tagged(1)), None);
+    assert!(unbound.invoke(&fresh, request()).is_err());
+    assert!(unbound.invoke(&own, request()).is_err());
+}

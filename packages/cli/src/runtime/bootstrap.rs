@@ -635,10 +635,14 @@ async fn run_server_start_inner(
     for plugin in loaded_plugins.iter() {
         plugin.bind_lifecycle_authority(server.host_service_context())?;
     }
+    // Route every declared provider before activation so a plugin's
+    // `activate` (and work it starts there) reaches providers that are
+    // already active through the host's own dispatch. A provider that is
+    // not active yet rejects the invocation; nothing is queued or replayed.
+    register_plugin_service_handlers(&server, &config, &paths, &registry, &loaded_plugins)?;
     Box::pin(activate_loaded_plugins(&loaded_plugins, &config, &paths)).await?;
     super::dispatch::startup_future_marker("plugins.after_activate", 0);
     dispatch_loaded_plugin_event(&loaded_plugins, &plugin_system_event("server_starting"))?;
-    register_plugin_service_handlers(&server, &config, &paths, &registry, &loaded_plugins)?;
     {
         use bmux_plugin::stream_admission::{
             STREAM_ADMISSION_PROVIDER_EXTENSION, STREAM_ADMITTED_ROUTES_EXTENSION,

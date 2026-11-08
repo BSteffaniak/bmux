@@ -194,6 +194,27 @@ impl InvocationPorts {
     pub(crate) unsafe fn acquire(
         pointer: *const NativeInvocationPorts,
     ) -> Result<Arc<Self>, AbiStatus> {
+        unsafe { Self::from_native(pointer, true) }
+    }
+
+    /// Take ownership of a table whose single reference the host already
+    /// transferred (callback entry ports): no further retain is issued, and
+    /// closing these ports releases exactly that reference. On error nothing
+    /// was taken and the caller still owns the transferred reference.
+    ///
+    /// # Safety
+    /// Same requirements as [`Self::acquire`], and the table must carry one
+    /// host-transferred reference.
+    pub(crate) unsafe fn adopt(
+        pointer: *const NativeInvocationPorts,
+    ) -> Result<Arc<Self>, AbiStatus> {
+        unsafe { Self::from_native(pointer, false) }
+    }
+
+    unsafe fn from_native(
+        pointer: *const NativeInvocationPorts,
+        retain: bool,
+    ) -> Result<Arc<Self>, AbiStatus> {
         if pointer.is_null() {
             return Err(INVALID_ARGUMENT);
         }
@@ -265,9 +286,11 @@ impl InvocationPorts {
         };
         let callback_authority_open =
             unsafe { Self::callback_open(pointer, header, table.capabilities) }?;
-        let status = unsafe { (table.retain)(table.handle) };
-        if status != OK {
-            return Err(status);
+        if retain {
+            let status = unsafe { (table.retain)(table.handle) };
+            if status != OK {
+                return Err(status);
+            }
         }
         Ok(Arc::new(Self {
             table,

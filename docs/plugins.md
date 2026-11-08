@@ -678,7 +678,9 @@ explicitly (see `examples/native-plugin`); those calls are attributed to the
 plugin as well. Deactivation closes the activation scope before the author's
 `deactivate` hook runs, so retained activation services fail closed from
 then on even though the plugin still holds them. Calls during `activate`
-work too.
+work too: the server routes every declared provider before activating
+plugins, so a call reaches any provider that is already active, and a provider
+that is not active yet rejects it (nothing is queued or replayed).
 
 Note that a command run in a CLI process executes in a fresh command-scoped
 instance whose `activate` and `deactivate` hooks run around the command.
@@ -708,7 +710,10 @@ Security properties:
 Compatibility: dynamic plugins are rebuilt together with the host. There is
 no backwards-compatibility path for libraries built against an older SDK:
 the former opt-in relay export, the unbound "legacy bridge" downgrade and the
-`bmux_plugin_take_command_outcome_v1` export are gone.
+`bmux_plugin_take_command_outcome_v1` export are gone. Dynamic artifacts
+advertise callback authority in their shared descriptor so the host can bind
+each lifecycle hook's services to its admitted scope; an artifact that does
+not is refused at activation instead of running with unbound services.
 
 ## Scene and rendering
 

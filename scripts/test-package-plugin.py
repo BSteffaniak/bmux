@@ -88,7 +88,7 @@ class DescriptorTests(unittest.TestCase):
                     artifact_acceptance.inspect_artifact("bcode.filesystem", Path(__file__), 2)
 
     def test_supported_v3_profiles_preserve_observed_capabilities(self):
-        for capabilities in (31, 127, 255, 511, 1023):
+        for capabilities in (31, 127, 255, 511, 1023, 2047):
             with self.subTest(capabilities=capabilities):
                 library, table, callback = self.descriptor(version=3, capabilities=capabilities)
                 with patch.object(pack.ctypes, "CDLL", return_value=library):
@@ -106,7 +106,7 @@ class DescriptorTests(unittest.TestCase):
     def test_descriptor_version_size_and_missing_or_unknown_capabilities_rejected(self):
         for arguments in ({"version": 1}, {"version": 4}, {"size": 8}, {"capabilities": 7}, {"capabilities": 31},
                           {"version": 3, "capabilities": 15}, {"version": 3, "capabilities": 63},
-                          {"version": 3, "capabilities": 1024}, {"version": 3, "capabilities": 2047},
+                          {"version": 3, "capabilities": 1024}, {"version": 3, "capabilities": 3071},
                           {"version": 3, "capabilities": 4095},
                           {"version": 3, "capabilities": 31, "size": 80}):
             with self.subTest(arguments=arguments):
@@ -136,7 +136,7 @@ class PublicationTests(unittest.TestCase):
 
     def test_current_v3_receipt_preserves_profile_and_declaration(self):
         self.observed["version"] = 3
-        self.observed["capabilities"] = 1023
+        self.observed["capabilities"] = 2047
         destination = self.publish()
         found = pack.discover(self.root / "install")
         self.assertEqual(found[0]["shared_descriptor"], self.observed)

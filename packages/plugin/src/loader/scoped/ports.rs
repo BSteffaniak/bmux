@@ -652,7 +652,7 @@ unsafe extern "C" fn host_begin(
                 code = abi::CANCELLED;
                 return Ok(());
             }
-            _ => {
+            other => {
                 let mut state = port
                     .state
                     .lock()
@@ -661,6 +661,14 @@ unsafe extern "C" fn host_begin(
                 state.admissions.remove(&id);
                 state.child_bytes -= abi::MAX_BUFFER_BYTES;
                 drop(state);
+                // The native caller only sees a status code; keep the cause.
+                match other {
+                    Err(error) => tracing::debug!(%error, "native host invocation failed"),
+                    Ok(bytes) => tracing::debug!(
+                        len = bytes.len(),
+                        "native host invocation exceeded its response budget"
+                    ),
+                }
                 return Err(failure(
                     "host invocation failed or exceeded its response budget",
                 ));

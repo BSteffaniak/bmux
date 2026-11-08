@@ -109,14 +109,18 @@ impl Authority {
                 .ok_or_else(|| failure(INVALID_ARGUMENT))?
                 .transferred = Some(base);
         }
+        // The host transferred this table's only reference; adopting it moves
+        // that reference into the ports (released when they close) instead of
+        // retaining a second one. Until adoption succeeds the entry record
+        // keeps the transferred reference for explicit release.
         let ports =
-            unsafe { InvocationPorts::acquire((&raw const output).cast()) }.map_err(failure)?;
+            unsafe { InvocationPorts::adopt((&raw const output).cast()) }.map_err(failure)?;
         {
-            let mut entry = self.entry.lock().map_err(|_| failure(PANICKED))?;
-            entry
-                .as_mut()
-                .ok_or_else(|| failure(INVALID_ARGUMENT))?
-                .ports = Some(Arc::clone(&ports));
+            let mut guard = self.entry.lock().map_err(|_| failure(PANICKED))?;
+            let entry = guard.as_mut().ok_or_else(|| failure(INVALID_ARGUMENT))?;
+            entry.ports = Some(Arc::clone(&ports));
+            entry.transferred = None;
+            drop(guard);
         }
         ports
             .bind_cancellation(self.cancellation.clone())

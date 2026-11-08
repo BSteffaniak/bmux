@@ -1799,10 +1799,14 @@ pub(super) fn register_plugin_service_handlers(
                     }
                     .into());
                 }
-                let execution = run_plugin_bridge_command_execution_with_state(
+                // The server authenticated this invocation; the command's host
+                // services dispatch through exactly this context rather than
+                // a cached lifecycle authority or ambient kernel context.
+                let execution = super::plugin_runtime::run_plugin_command_with_service_authority(
                     &command_state,
                     &request,
                     Some(invoke_context.client_id().0),
+                    AuthenticatedServiceInvocation::new(invoke_context.clone()),
                 )?;
                 let response = if execution.status == 0 {
                     PluginCliCommandResponse::new(execution.status)

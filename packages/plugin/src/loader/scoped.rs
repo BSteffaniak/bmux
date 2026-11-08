@@ -1097,8 +1097,22 @@ impl LoadedExecution {
             .lock()
             .map_err(|_| failure("kernel dispatch poisoned"))?
             .clone();
+        Ok(Self::activation_host_services_with(
+            activation, setup, dispatch, kernel,
+        ))
+    }
+
+    /// Activation services over an explicit dispatch: calls during setup use
+    /// the lifecycle invocation, later calls mint fresh activation invocations,
+    /// and nothing is admitted once deactivation closes the activation.
+    fn activation_host_services_with(
+        activation: &ActivationScope,
+        setup: Option<&InvocationScope>,
+        dispatch: Option<Arc<dyn bmux_plugin_sdk::HostServiceDispatch>>,
+        kernel: Option<Arc<dyn crate::InvocationKernelDispatch>>,
+    ) -> Option<bmux_plugin_sdk::PluginHostServices> {
         if dispatch.is_none() && kernel.is_none() {
-            return Ok(None);
+            return None;
         }
         let services = dispatch.map_or_else(
             || {
@@ -1108,7 +1122,7 @@ impl LoadedExecution {
             },
             |dispatch| Self::activation_services(activation.clone(), dispatch, setup.cloned()),
         );
-        Ok(Some(if let Some(kernel) = kernel {
+        Some(if let Some(kernel) = kernel {
             let activation = activation.clone();
             let setup = setup.cloned();
             services.with_kernel(move |request| {
@@ -1116,7 +1130,7 @@ impl LoadedExecution {
             })
         } else {
             services
-        }))
+        })
     }
 
     fn kernel_port(
@@ -1997,6 +2011,71 @@ impl LoadedExecution {
             ServiceCancellation::new(),
         )
     }
+    /// Bind the host services a lifecycle hook receives from the selected
+    /// lifecycle dispatch.
+    ///
+    /// Activation services outlive `activate` (background work retains them
+    /// until deactivation begins), so they are built over the activation, not
+    /// the lifecycle invocation; `deactivate` gets its own invocation's port.
+    fn bind_lifecycle_host(
+        &self,
+        operation: &mut NativeOperation,
+        scope: &InvocationScope,
+        binding: &callbacks::CallbackBinding,
+        host: Option<Arc<dyn bmux_plugin_sdk::HostServiceDispatch>>,
+        kernel: Option<Arc<dyn crate::InvocationKernelDispatch>>,
+        ports: &mut InvocationPorts,
+    ) -> Result<()> {
+        let activation_dispatch = if matches!(operation, NativeOperation::Activate(_)) {
+            let instance = self
+                .host_dispatch
+                .lock()
+                .map_err(|_| failure("host dispatch poisoned"))?
+                .clone();
+            host.clone()
+                .map(|entered| binding.activation_dispatch(entered, instance))
+        } else {
+            None
+        };
+        let activation_kernel = kernel.clone();
+        ports.host = self.bind_host_port(scope, host)?;
+        ports.kernel = kernel.map(|kernel| crate::InvocationKernelPort::new(scope.clone(), kernel));
+        match operation {
+            NativeOperation::Activate(context) => {
+                let services = Self::activation_host_services_with(
+                    &self.activation()?,
+                    Some(scope),
+                    activation_dispatch,
+                    activation_kernel,
+                );
+                context.native.host_service_port = match self.registration_port()? {
+                    Some(registration) => Some(
+                        services
+                            .unwrap_or_else(|| {
+                                bmux_plugin_sdk::PluginHostServices::new(|_| {
+                                    Err(failure("host services not bound"))
+                                })
+                            })
+                            .with_registrations(move |mutation| {
+                                apply_registration(&registration, mutation)
+                            }),
+                    ),
+                    None => services,
+                };
+            }
+            NativeOperation::Deactivate(context) => {
+                context.native.host_service_port =
+                    self.decorate_host_services(ports.host.clone(), ports.kernel.clone())?;
+            }
+            _ => {
+                return Err(failure(
+                    "lifecycle callback factory received ordinary operation",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn start_with_cancellation(
         &self,
         mut operation: NativeOperation,
@@ -2068,23 +2147,14 @@ impl LoadedExecution {
                         }
                         binding = nested;
                     }
-                    ports.host = self.bind_host_port(scope, selected.host)?;
-                    ports.kernel = selected
-                        .kernel
-                        .map(|kernel| crate::InvocationKernelPort::new(scope.clone(), kernel));
-                    let services =
-                        self.decorate_host_services(ports.host.clone(), ports.kernel.clone())?;
-                    match &mut operation {
-                        NativeOperation::Activate(context)
-                        | NativeOperation::Deactivate(context) => {
-                            context.native.host_service_port = services;
-                        }
-                        _ => {
-                            return Err(failure(
-                                "lifecycle callback factory received ordinary operation",
-                            ));
-                        }
-                    }
+                    self.bind_lifecycle_host(
+                        &mut operation,
+                        scope,
+                        &binding,
+                        selected.host,
+                        selected.kernel,
+                        &mut ports,
+                    )?;
                 }
                 ports.callback = Some(binding);
             }
