@@ -10,6 +10,7 @@ use bmux_tui::style::{Modifier, Style};
     feature = "menu",
     feature = "selectable-list",
     feature = "text-view",
+    feature = "virtual-list",
     test,
 ))]
 pub(crate) fn local_control_event(

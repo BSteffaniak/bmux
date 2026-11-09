@@ -53,8 +53,13 @@ unsafe impl GlobalAlloc for CountingAllocator {
 #[global_allocator]
 static ALLOCATOR: CountingAllocator = CountingAllocator;
 
+use std::cell::Cell;
+use std::collections::VecDeque;
+
 use bmux_tui::buffer::Buffer;
-use bmux_tui::component::{Component, LayoutCx};
+use bmux_tui::component::{
+    Component, Constraints, Element, LayoutCx, LayoutEnvironment, LayoutId, LayoutNode, LogicalSize,
+};
 use bmux_tui::composition::{Column, Surface, TextBlock};
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
@@ -62,7 +67,11 @@ use bmux_tui::measured_list::MeasuredListIndex;
 use bmux_tui::paint::PaintCx;
 use bmux_tui::prelude::write_ansi_frame;
 use bmux_tui::{damage::Damage, damage::DamagePolicy};
-use bmux_tui_components::virtual_list::{VirtualList, VirtualListState};
+use bmux_tui_components::virtual_list::{
+    Edge, ListPosition, MeasuredListItem, NoSourceMap, ScrollTarget, VirtualItemSource,
+    VirtualList, VirtualListAction, VirtualListComponent, VirtualListLayout, VirtualListState,
+    VirtualSourceList,
+};
 
 fn main() {
     benchmark_empty();
@@ -71,6 +80,467 @@ fn main() {
         benchmark_count(count);
         benchmark_composed_cards(count);
     }
+    for count in [1_000usize, 10_000, 100_000] {
+        benchmark_lazy_source(count);
+    }
+    for count in [10_000usize, 100_000, 1_000_000] {
+        benchmark_lazy_caller_measured(count);
+    }
+    for count in [1_000usize, 10_000, 100_000] {
+        benchmark_component(count);
+    }
+    for children in [10usize, 1_000, 10_000] {
+        benchmark_component_large_layouts(children);
+    }
+}
+
+/// Item whose retained layout has `children` leaf nodes, like a long block of
+/// wrapped output.
+struct WideItem {
+    children: usize,
+}
+
+impl Component for WideItem {
+    fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
+        cx.record_measurement();
+        let width = constraints.max_width();
+        let rows = (0..self.children)
+            .map(|row| {
+                bmux_tui::component::ChildLayout::new(
+                    0,
+                    u64::try_from(row).unwrap_or(u64::MAX),
+                    LayoutNode::leaf(LayoutId::new("row"), LogicalSize::new(width, 1)),
+                )
+            })
+            .collect();
+        LayoutNode::with_children(
+            LayoutId::new("wide"),
+            LogicalSize::new(width, u64::try_from(self.children).unwrap_or(u64::MAX)),
+            rows,
+        )
+    }
+
+    fn paint(&self, _layout: &LayoutNode, cx: &mut bmux_tui::paint::PaintCx<'_, '_>) {
+        cx.fill(cx.area(), "=", bmux_tui::style::Style::new());
+    }
+}
+
+struct WideItems {
+    children: usize,
+}
+
+impl VirtualItemSource<u64> for WideItems {
+    fn len(&self) -> usize {
+        64
+    }
+
+    fn key(&self, index: usize) -> u64 {
+        u64::try_from(index).unwrap_or(u64::MAX)
+    }
+
+    fn layout_revision(&self, _index: usize) -> u64 {
+        0
+    }
+
+    fn build(&self, _index: usize) -> Element<'_> {
+        Element::new(WideItem {
+            children: self.children,
+        })
+    }
+}
+
+/// Component frames over items with large retained layouts: steady layout
+/// cost must not scale with the size of visible items' layouts, because the
+/// layout tree holds leaf wrappers and paint borrows the retained layouts.
+fn benchmark_component_large_layouts(children: usize) {
+    let viewport = Rect::new(0, 0, 80, 40);
+    let source = WideItems { children };
+    let state = std::cell::RefCell::new(VirtualListState::new(0));
+    let component = VirtualListComponent::new("wide", &source, &state);
+    let mut cx = LayoutCx::new();
+    component.layout(Constraints::tight(viewport.size()), &mut cx);
+    let started = Instant::now();
+    let layout = component.layout(Constraints::tight(viewport.size()), &mut cx);
+    let steady_layout = started.elapsed();
+    let mut buffer = Buffer::empty(viewport);
+    let started = Instant::now();
+    component.paint(&layout, &mut PaintCx::new(&mut Frame::new(&mut buffer)));
+    let paint = started.elapsed();
+    println!(
+        "component_large_layouts children_per_item={children} steady_layout_us={} paint_us={}",
+        micros(steady_layout),
+        micros(paint),
+    );
+}
+
+/// Lazy source over a key deque. Text items wrap like `benchmark_item`;
+/// fixed items have caller-known heights so the caller can measure them.
+struct LazyItems {
+    keys: VecDeque<u64>,
+    text: bool,
+    built: Cell<usize>,
+}
+
+impl LazyItems {
+    fn new(keys: impl IntoIterator<Item = u64>, text: bool) -> Self {
+        Self {
+            keys: keys.into_iter().collect(),
+            text,
+            built: Cell::new(0),
+        }
+    }
+
+    fn take_built(&self) -> usize {
+        self.built.replace(0)
+    }
+}
+
+impl VirtualItemSource<u64> for LazyItems {
+    fn len(&self) -> usize {
+        self.keys.len()
+    }
+
+    fn key(&self, index: usize) -> u64 {
+        self.keys[index]
+    }
+
+    fn layout_revision(&self, _index: usize) -> u64 {
+        0
+    }
+
+    fn build(&self, index: usize) -> Element<'_> {
+        self.built.set(self.built.get() + 1);
+        let key = self.keys[index];
+        if self.text {
+            Element::new(benchmark_item(
+                usize::try_from(key).unwrap_or(usize::MAX),
+                0,
+            ))
+        } else {
+            Element::new(FixedItem { key })
+        }
+    }
+}
+
+/// Item whose exact height (`1 + key % 3`) the caller knows without layout.
+struct FixedItem {
+    key: u64,
+}
+
+const fn fixed_height(key: u64) -> u64 {
+    1 + key % 3
+}
+
+impl Component for FixedItem {
+    fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
+        cx.record_measurement();
+        LayoutNode::leaf(
+            LayoutId::new("fixed"),
+            LogicalSize::new(constraints.max_width(), fixed_height(self.key)),
+        )
+    }
+
+    fn paint(&self, _layout: &LayoutNode, cx: &mut bmux_tui::paint::PaintCx<'_, '_>) {
+        cx.fill(cx.area(), "#", bmux_tui::style::Style::new());
+    }
+}
+
+fn lazy_layout(
+    source: &LazyItems,
+    state: &mut VirtualListState<u64>,
+    cx: &mut LayoutCx,
+    viewport: Rect,
+) -> (VirtualListLayout, Duration) {
+    let started = Instant::now();
+    let layout = VirtualSourceList::new("lazy", source).layout(
+        u64::from(viewport.width),
+        LayoutEnvironment::default(),
+        u64::from(viewport.height),
+        &NoSourceMap,
+        state,
+        cx,
+    );
+    (layout, started.elapsed())
+}
+
+fn lazy_paint(source: &LazyItems, state: &VirtualListState<u64>, viewport: Rect) -> usize {
+    let mut buffer = Buffer::empty(viewport);
+    let mut frame = Frame::new(&mut buffer);
+    VirtualSourceList::new("lazy", source)
+        .paint(viewport, state, &mut PaintCx::new(&mut frame))
+        .painted_items
+}
+
+/// Lazy source measured by the list: the first layout constructs every item
+/// once; afterwards only noted insertions and visible items are constructed.
+fn benchmark_lazy_source(count: usize) {
+    let viewport = Rect::new(0, 0, 80, 40);
+    let count_u64 = u64::try_from(count).unwrap();
+    let mut source = LazyItems::new(0..count_u64, true);
+    let mut state = VirtualListState::new(1);
+    let mut cx = LayoutCx::new();
+    let (_, initial) = lazy_layout(&source, &mut state, &mut cx, viewport);
+    assert_eq!(
+        source.take_built(),
+        count,
+        "first layout measures each item"
+    );
+
+    let (_, steady) = lazy_layout(&source, &mut state, &mut cx, viewport);
+    assert_eq!(source.take_built(), 0, "steady layout constructs nothing");
+
+    assert!(state.apply_action(&VirtualListAction::ScrollbarDrag(0.5)));
+    let (_, scrolled) = lazy_layout(&source, &mut state, &mut cx, viewport);
+    let started = Instant::now();
+    let painted = lazy_paint(&source, &state, viewport);
+    let paint = started.elapsed();
+    assert_eq!(
+        source.take_built(),
+        painted,
+        "paint constructs only visible items"
+    );
+    assert!(painted <= usize::from(viewport.height) + 2);
+
+    let anchor = state.position();
+    let before = state.resolved().unwrap().top_offset;
+    for key in 0..16 {
+        source.keys.push_front(count_u64 + 1_000 + key);
+    }
+    state.note_splice(0..0, 16);
+    let (prepended, prepend) = lazy_layout(&source, &mut state, &mut cx, viewport);
+    assert_eq!(source.take_built(), 16, "prepend constructs only new items");
+    assert_eq!(
+        state.position(),
+        anchor,
+        "prepend preserves the keyed anchor"
+    );
+    assert!(prepended.resolved.top_offset > before);
+
+    let len = source.keys.len();
+    source
+        .keys
+        .extend((0..16).map(|key| count_u64 + 2_000 + key));
+    state.note_splice(len..len, 16);
+    let (_, append) = lazy_layout(&source, &mut state, &mut cx, viewport);
+    assert_eq!(source.take_built(), 16, "append constructs only new items");
+
+    assert!(state.apply_action(&VirtualListAction::EdgeRequested(Edge::Bottom)));
+    let len = source.keys.len();
+    source
+        .keys
+        .extend((0..16).map(|key| count_u64 + 3_000 + key));
+    state.note_splice(len..len, 16);
+    let (followed, follow_append) = lazy_layout(&source, &mut state, &mut cx, viewport);
+    assert_eq!(state.position(), ListPosition::FollowBottom);
+    assert_eq!(
+        followed.resolved.top_offset,
+        followed.resolved.max_content_top
+    );
+    // New bottom items are measured and then visible, so they are built once
+    // for measurement; painting builds the visible ones again.
+    assert_eq!(source.take_built(), 16);
+
+    source.keys.drain(..16);
+    state.note_splice(0..16, 0);
+    let (_, trim) = lazy_layout(&source, &mut state, &mut cx, viewport);
+    assert_eq!(source.take_built(), 0, "trimming constructs nothing");
+
+    // A history prepend and a live append noted in the same frame stay
+    // disjoint, so cost tracks the noted rows rather than the collection.
+    for key in 0..16 {
+        source.keys.push_front(count_u64 + 4_000 + key);
+    }
+    state.note_splice(0..0, 16);
+    let len = source.keys.len();
+    source
+        .keys
+        .extend((0..16).map(|key| count_u64 + 5_000 + key));
+    state.note_splice(len..len, 16);
+    let (_, both_ends) = lazy_layout(&source, &mut state, &mut cx, viewport);
+    assert!(source.take_built() <= 32 + usize::from(viewport.height) + 2);
+
+    println!(
+        "lazy_source items={count} initial_layout_us={} steady_layout_us={} scrolled_layout_us={} paint_us={} painted={painted} prepend16_us={} append16_us={} follow_append16_us={} trim16_us={} prepend16_append16_us={}",
+        micros(initial),
+        micros(steady),
+        micros(scrolled),
+        micros(paint),
+        micros(prepend),
+        micros(append),
+        micros(follow_append),
+        micros(trim),
+        micros(both_ends),
+    );
+}
+
+/// One `VirtualListComponent` frame: layout plus paint of the same tree.
+fn component_frame(
+    source: &LazyItems,
+    state: &std::cell::RefCell<VirtualListState<u64>>,
+    viewport: Rect,
+) -> (bmux_tui::component::LayoutNode, Duration) {
+    let started = Instant::now();
+    let component = VirtualListComponent::new("component", source, state);
+    let layout = component.layout(Constraints::tight(viewport.size()), &mut LayoutCx::new());
+    let mut buffer = Buffer::empty(viewport);
+    let mut frame = Frame::new(&mut buffer);
+    component.paint(&layout, &mut PaintCx::new(&mut frame));
+    (black_box(layout), started.elapsed())
+}
+
+/// The canonical component over a lazy source: steady frames, wheel routing,
+/// streaming appends while following, and eased motion frames.
+fn benchmark_component(count: usize) {
+    use bmux_tui::event::{Event, MouseEvent, MouseEventKind};
+    use bmux_tui::geometry::Point;
+    let viewport = Rect::new(0, 0, 80, 40);
+    let count_u64 = u64::try_from(count).unwrap();
+    let mut source = LazyItems::new(0..count_u64, true);
+    let state = std::cell::RefCell::new(VirtualListState::new(1));
+    let (_, initial) = component_frame(&source, &state, viewport);
+    let first = source.take_built();
+    assert!(first >= count, "first frame measures each item");
+
+    let (layout, steady) = component_frame(&source, &state, viewport);
+    let painted = source.take_built();
+    assert!(
+        painted <= usize::from(viewport.height) + 2,
+        "steady frames construct only visible items"
+    );
+
+    let wheel = Event::Mouse(MouseEvent::new(
+        MouseEventKind::ScrollDown,
+        Point::new(4, 4),
+    ));
+    let started = Instant::now();
+    let component = VirtualListComponent::new("component", &source, &state);
+    black_box(component.event(
+        &wheel,
+        &layout,
+        &mut bmux_tui::component::EventCx::new(&layout),
+    ));
+    let route = started.elapsed();
+    source.take_built();
+
+    state.borrow_mut().set_position(ListPosition::FollowBottom);
+    component_frame(&source, &state, viewport);
+    source.take_built();
+    let len = source.keys.len();
+    source
+        .keys
+        .extend((0..16).map(|key| count_u64 + 5_000 + key));
+    state.borrow_mut().note_splice(len..len, 16);
+    let (_, follow_append) = component_frame(&source, &state, viewport);
+    assert!(source.take_built() <= 16 + usize::from(viewport.height) + 2);
+
+    let start = Instant::now();
+    state.borrow_mut().start_motion(
+        ScrollTarget::Top,
+        bmux_tui::style::Easing::EaseInOut,
+        Duration::from_millis(160),
+        start,
+    );
+    let mut motion = Duration::ZERO;
+    let mut frames = 0u32;
+    let mut now = start;
+    while state.borrow().motion().is_some() {
+        now += Duration::from_millis(16);
+        state
+            .borrow_mut()
+            .advance_motion(now, Duration::from_millis(16), &NoSourceMap);
+        let (_, elapsed) = component_frame(&source, &state, viewport);
+        motion += elapsed;
+        frames += 1;
+    }
+    assert_eq!(state.borrow().position(), ListPosition::Top);
+
+    println!(
+        "component items={count} initial_frame_us={} steady_frame_us={} painted={painted} wheel_route_us={} follow_append16_frame_us={} motion_frames={frames} motion_frame_avg_us={}",
+        micros(initial),
+        micros(steady),
+        micros(route),
+        micros(follow_append),
+        micros(motion / frames.max(1)),
+    );
+}
+
+/// Lazy source with caller-measured heights: no item is constructed unless it
+/// is visible, so cost is independent of the collection length.
+fn benchmark_lazy_caller_measured(count: usize) {
+    let viewport = Rect::new(0, 0, 80, 40);
+    let width = u64::from(viewport.width);
+    let count_u64 = u64::try_from(count).unwrap();
+    let measured = |key: u64| MeasuredListItem::new(key, 0, width, 0, fixed_height(key));
+    let mut source = LazyItems::new(0..count_u64, false);
+    let mut state = VirtualListState::new(1);
+    let mut cx = LayoutCx::new();
+    // Establish the synchronized width on an empty source, then fill the
+    // index from caller-known heights.
+    let (_, _) = lazy_layout(&LazyItems::new([], false), &mut state, &mut cx, viewport);
+    let started = Instant::now();
+    state
+        .splice_measured(0..0, (0..count_u64).map(measured))
+        .unwrap();
+    let fill = started.elapsed();
+    let (_, first_layout) = lazy_layout(&source, &mut state, &mut cx, viewport);
+    let first_built = source.take_built();
+    assert!(first_built <= usize::from(viewport.height) + 2);
+
+    assert!(state.apply_action(&VirtualListAction::ScrollbarDrag(0.5)));
+    let (_, scrolled) = lazy_layout(&source, &mut state, &mut cx, viewport);
+    let scrolled_built = source.take_built();
+    assert!(scrolled_built <= usize::from(viewport.height) + 2);
+    let painted = lazy_paint(&source, &state, viewport);
+    assert_eq!(source.take_built(), painted);
+
+    let anchor = state.position();
+    let prepended = (0..16)
+        .map(|key| count_u64 + 1_000 + key)
+        .collect::<Vec<_>>();
+    let started = Instant::now();
+    for key in prepended.iter().rev() {
+        source.keys.push_front(*key);
+    }
+    state
+        .splice_measured(0..0, prepended.iter().copied().map(measured))
+        .unwrap();
+    let (_, prepend_layout) = lazy_layout(&source, &mut state, &mut cx, viewport);
+    let prepend = started.elapsed();
+    assert_eq!(
+        source.take_built(),
+        0,
+        "off-screen prepend constructs nothing"
+    );
+    assert_eq!(state.position(), anchor);
+
+    let started = Instant::now();
+    let len = source.keys.len();
+    let appended = (0..16)
+        .map(|key| count_u64 + 2_000 + key)
+        .collect::<Vec<_>>();
+    source.keys.extend(appended.iter().copied());
+    state
+        .splice_measured(len..len, appended.iter().copied().map(measured))
+        .unwrap();
+    let (_, append_layout) = lazy_layout(&source, &mut state, &mut cx, viewport);
+    let append = started.elapsed();
+    assert_eq!(
+        source.take_built(),
+        0,
+        "off-screen append constructs nothing"
+    );
+
+    println!(
+        "lazy_measured items={count} fill_us={} first_layout_us={} first_built={first_built} scrolled_layout_us={} scrolled_built={scrolled_built} painted={painted} prepend16_us={} prepend_layout_us={} append16_us={} append_layout_us={} total_rows={}",
+        micros(fill),
+        micros(first_layout),
+        micros(scrolled),
+        micros(prepend),
+        micros(prepend_layout),
+        micros(append),
+        micros(append_layout),
+        state.total_height(),
+    );
 }
 
 fn benchmark_empty() {

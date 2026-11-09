@@ -100,3 +100,39 @@ Run the example in release mode:
 cargo run --release -p bmux_tui_components --example virtual_list_benchmark \
   --features virtual-list
 ```
+
+The `component` lines measure `VirtualListComponent` over a lazy item source
+at 1,000, 10,000, and 100,000 items: the first frame (which measures every
+item), a steady layout-plus-paint frame (which constructs only visible items),
+routing one wheel event, a frame after 16 streamed appends while following the
+bottom, and the average frame of an eased motion to the top. Steady, append,
+and motion frame costs stay flat as the collection grows.
+
+The `lazy_source` lines include `prepend16_append16_us`: a history prepend and
+a live append noted in the same frame, which stay separate dirty regions so the
+cost tracks the 32 noted rows rather than the collection length. The
+`component_large_layouts` lines lay out and paint items whose retained layouts
+have 10 to 10,000 child nodes; steady layout cost stays flat because the layout
+tree holds leaf item wrappers and paint borrows the retained layouts.
+
+## Virtual list chat demo
+
+`virtual_list_chat` is an interactive chat log built on
+`VirtualListComponent` and the BMUX runtime. It demonstrates:
+
+- streamed appends noted with `VirtualListState::note_splice`, followed while
+  the position is `FollowBottom`;
+- history pages prepended (after a simulated fetch delay) when
+  `ResolvedPosition::edge_rows` reports fewer than one viewport of rows above
+  the viewport; the keyed position keeps the view still;
+- keyed scroll motion (`g` / `G`) advanced with `RuntimeHandle::now` and a
+  keyed runtime timer, with a reduced-motion toggle (`m`) that uses a zero
+  duration;
+- `Overscroll::ViewportMinus(1)` (toggle with `o`), the gutter scrollbar,
+  keyboard and wheel navigation, and click activation that selects a message.
+
+Run it in a terminal:
+
+```sh
+cargo run -p bmux_tui_components --example virtual_list_chat --features virtual-list
+```

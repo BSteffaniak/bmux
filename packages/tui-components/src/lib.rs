@@ -76,6 +76,8 @@ pub mod picker_frame;
 pub mod progress_bar;
 #[cfg(feature = "radio-group")]
 pub mod radio_group;
+#[cfg(feature = "resident-window")]
+pub mod resident_window;
 #[cfg(feature = "scroll-view")]
 pub mod scroll_view;
 #[cfg(feature = "scrollbar")]

@@ -553,6 +553,53 @@ impl From<crate::theme::ComponentTheme> for ScrollbarStyles {
     }
 }
 
+/// Scrollbar state for a logical axis of `total` rows, a `viewport` of rows,
+/// and a logical `offset`, scaled into the scrollbar's `u16` cell domain.
+///
+/// This is the single logical-to-cell mapping shared by every scroller
+/// (scroll views, virtual lists, and resident-window position estimates), so
+/// the same logical geometry always draws the same thumb.
+/// [`logical_offset_from_scrollbar`] is its inverse for drags.
+#[cfg(any(feature = "scroll-view", feature = "resident-window"))]
+pub(crate) fn scrollbar_state(total: u64, viewport: u64, offset: u64) -> ScrollbarState {
+    let maximum = total.saturating_sub(viewport);
+    let scaled_total = u16::try_from(total).unwrap_or(u16::MAX);
+    let scaled_viewport = if maximum == 0 {
+        scaled_total
+    } else {
+        u16::try_from((u128::from(scaled_total) * u128::from(viewport)) / u128::from(total.max(1)))
+            .unwrap_or(u16::MAX)
+            .max(1)
+    };
+    let scrollbar_maximum = scaled_total.saturating_sub(scaled_viewport);
+    let scaled_offset = if maximum == 0 {
+        0
+    } else {
+        u16::try_from((u128::from(scrollbar_maximum) * u128::from(offset)) / u128::from(maximum))
+            .unwrap_or(scrollbar_maximum)
+    };
+    ScrollbarState::new(scaled_total, scaled_viewport).offset(scaled_offset)
+}
+
+/// Logical offset for a scrollbar cell `offset` when the scrollbar maximum is
+/// `scrollbar_maximum` cells and the logical maximum is `logical_maximum`
+/// rows: the shared inverse of [`scrollbar_state`].
+#[cfg(feature = "scroll-view")]
+pub(crate) fn logical_offset_from_scrollbar(
+    offset: u64,
+    scrollbar_maximum: u64,
+    logical_maximum: u64,
+) -> u64 {
+    if logical_maximum == 0 || scrollbar_maximum == 0 {
+        return 0;
+    }
+    u64::try_from(
+        (u128::from(offset) * u128::from(logical_maximum)) / u128::from(scrollbar_maximum),
+    )
+    .unwrap_or(logical_maximum)
+    .min(logical_maximum)
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;

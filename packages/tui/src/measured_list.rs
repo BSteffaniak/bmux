@@ -1,13 +1,26 @@
 //! Keyed variable-height collection index.
 //!
-//! The index owns logical item heights and a Fenwick tree for logarithmic
-//! prefix-height, item-offset, and offset-to-item queries. Rendering policy and
-//! item component ownership remain in higher-level collection components.
+//! [`MeasuredListIndex`] owns exact logical item heights in collection order
+//! and answers prefix-height, item-offset, offset-to-item, and key-to-index
+//! queries in logarithmic time. Membership changes (insert, prepend, append,
+//! remove, splice) cost `O(k + log n)` tree work for `k` changed items plus
+//! `O(k log n)` key bookkeeping, so a long collection never needs a full
+//! rebuild for a local change.
+//!
+//! Rendering policy, item component ownership, scroll positions, and paging
+//! policy remain in higher-level collection components and their callers.
 
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
+use std::ops::Range;
+
+const NIL: usize = usize::MAX;
 
 #[cfg(test)]
-static UPPER_BOUND_STEPS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+thread_local! {
+    static DESCENT_STEPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 /// One retained variable-height item measurement.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,6 +55,20 @@ impl<K> MeasuredListItem<K> {
             height,
         }
     }
+
+    /// Whether this measurement is valid for a layout revision, width, and
+    /// capability revision.
+    #[must_use]
+    pub const fn is_valid_for(
+        &self,
+        layout_revision: u64,
+        width: u64,
+        capability_revision: u64,
+    ) -> bool {
+        self.layout_revision == layout_revision
+            && self.width == width
+            && self.capability_revision == capability_revision
+    }
 }
 
 /// Visible item range and boundary offsets for one logical viewport.
@@ -55,13 +82,74 @@ pub struct VisibleItemRange {
     pub first_item_offset: u64,
 }
 
+/// Rejected incremental [`MeasuredListIndex`] mutation. A rejected mutation
+/// leaves the index unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MeasuredListError {
+    /// A supplied item key is repeated within the batch or already indexed
+    /// outside the replaced range.
+    DuplicateKey {
+        /// Zero-based position of the offending item within the supplied batch.
+        position: usize,
+    },
+    /// The requested index range is reversed or extends past the collection.
+    OutOfBounds {
+        /// Requested range start.
+        start: usize,
+        /// Requested range end (exclusive).
+        end: usize,
+        /// Collection length at the time of the request.
+        len: usize,
+    },
+}
+
+impl fmt::Display for MeasuredListError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DuplicateKey { position } => write!(
+                f,
+                "measured-list item at batch position {position} has a duplicate key"
+            ),
+            Self::OutOfBounds { start, end, len } => write!(
+                f,
+                "measured-list range {start}..{end} is out of bounds for length {len}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for MeasuredListError {}
+
+#[derive(Debug, Clone)]
+struct Node<K> {
+    item: MeasuredListItem<K>,
+    priority: u64,
+    left: usize,
+    right: usize,
+    parent: usize,
+    /// Number of items in this subtree.
+    size: usize,
+    /// Saturating sum of item heights in this subtree (gaps excluded).
+    heights: u64,
+}
+
 /// Retained keyed index for exact variable-height item geometry.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Items are stored in an order-statistic treap ordered by position, with
+/// parent links so a stable key resolves to its current index in logarithmic
+/// time after any splice. Gaps are applied arithmetically, so changing the gap
+/// is constant time. Arena slots are compacted on removal, so memory tracks
+/// the current length.
+///
+/// Equality compares logical content (gap and items in order), not internal
+/// tree shape.
+#[derive(Clone)]
 pub struct MeasuredListIndex<K> {
-    items: Vec<MeasuredListItem<K>>,
-    key_to_index: BTreeMap<K, usize>,
-    tree: FenwickTree,
+    nodes: Vec<Node<K>>,
+    root: usize,
+    key_to_node: BTreeMap<K, usize>,
     gap: u64,
+    seed: u64,
 }
 
 impl<K> MeasuredListIndex<K>
@@ -70,19 +158,38 @@ where
 {
     /// Create an empty measured collection with a logical inter-item gap.
     #[must_use]
-    pub fn new(gap: u64) -> Self {
+    pub const fn new(gap: u64) -> Self {
         Self {
-            items: Vec::new(),
-            key_to_index: BTreeMap::new(),
-            tree: FenwickTree::default(),
+            nodes: Vec::new(),
+            root: NIL,
+            key_to_node: BTreeMap::new(),
             gap,
+            seed: 0x9e37_79b9_7f4a_7c15,
         }
     }
 
-    /// Synchronize item order while retaining exact measurements for matching
-    /// key, layout revision, and width.
+    /// Create a collection from exact measurements in order.
     ///
-    /// The callback is invoked only for new or invalidated items.
+    /// # Errors
+    ///
+    /// * [`MeasuredListError::DuplicateKey`] when two items share a key.
+    pub fn from_items(
+        gap: u64,
+        items: impl IntoIterator<Item = MeasuredListItem<K>>,
+    ) -> Result<Self, MeasuredListError> {
+        let mut index = Self::new(gap);
+        index.append(items)?;
+        Ok(index)
+    }
+
+    /// Synchronize item order while retaining exact measurements for matching
+    /// key, layout revision, width, and capability revision.
+    ///
+    /// The callback is invoked only for new or invalidated items, in collection
+    /// order. The common unchanged prefix and suffix are retained in place and
+    /// only the differing middle is spliced, so appends, prepends, and local
+    /// edits do not rebuild the index. Comparing the supplied entries is still
+    /// `O(n)`; use the incremental methods when the change is already known.
     ///
     /// # Panics
     ///
@@ -94,53 +201,244 @@ where
         capability_revision: u64,
         mut measure: impl FnMut(&K) -> u64,
     ) {
-        let mut retained = std::mem::take(&mut self.items)
+        let entries = entries.into_iter().collect::<Vec<_>>();
+        {
+            let mut seen = BTreeSet::new();
+            for (key, _) in &entries {
+                assert!(seen.insert(key), "measured-list keys must be unique");
+            }
+        }
+        let matches = |item: &MeasuredListItem<K>, (key, revision): &(K, u64)| {
+            item.key == *key && item.is_valid_for(*revision, width, capability_revision)
+        };
+        let (prefix, suffix) = {
+            let current = self.iter().collect::<Vec<_>>();
+            let prefix = current
+                .iter()
+                .zip(&entries)
+                .take_while(|(item, entry)| matches(item, entry))
+                .count();
+            let limit = current.len().min(entries.len()) - prefix;
+            let suffix = current
+                .iter()
+                .rev()
+                .zip(entries.iter().rev())
+                .take(limit)
+                .take_while(|(item, entry)| matches(item, entry))
+                .count();
+            (prefix, suffix)
+        };
+        let old_end = self.len() - suffix;
+        let new_end = entries.len() - suffix;
+        if prefix == old_end && prefix == new_end {
+            return;
+        }
+        let mut retained = self
+            .detach_range(prefix..old_end)
             .into_iter()
             .map(|item| (item.key.clone(), item))
             .collect::<BTreeMap<_, _>>();
-        let mut seen = BTreeSet::new();
-        let mut items = Vec::new();
-        for (key, layout_revision) in entries {
-            assert!(
-                seen.insert(key.clone()),
-                "measured-list keys must be unique"
-            );
-            let item = retained.remove(&key).filter(|item| {
-                item.layout_revision == layout_revision
-                    && item.width == width
-                    && item.capability_revision == capability_revision
+        let inserted = entries
+            .into_iter()
+            .take(new_end)
+            .skip(prefix)
+            .map(|(key, layout_revision)| {
+                retained
+                    .remove(&key)
+                    .filter(|item| item.is_valid_for(layout_revision, width, capability_revision))
+                    .unwrap_or_else(|| {
+                        let height = measure(&key);
+                        MeasuredListItem::new(
+                            key,
+                            layout_revision,
+                            width,
+                            capability_revision,
+                            height,
+                        )
+                    })
+            })
+            .collect::<Vec<_>>();
+        self.attach_at(prefix, inserted);
+    }
+
+    /// Insert exact measurements before index `at`.
+    ///
+    /// # Errors
+    ///
+    /// * [`MeasuredListError::OutOfBounds`] when `at > len()`.
+    /// * [`MeasuredListError::DuplicateKey`] when an inserted key repeats within
+    ///   the batch or is already indexed.
+    pub fn insert(
+        &mut self,
+        at: usize,
+        items: impl IntoIterator<Item = MeasuredListItem<K>>,
+    ) -> Result<(), MeasuredListError> {
+        self.splice(at..at, items).map(drop)
+    }
+
+    /// Insert exact measurements before the first item.
+    ///
+    /// # Errors
+    ///
+    /// * [`MeasuredListError::DuplicateKey`] when an inserted key repeats within
+    ///   the batch or is already indexed.
+    pub fn prepend(
+        &mut self,
+        items: impl IntoIterator<Item = MeasuredListItem<K>>,
+    ) -> Result<(), MeasuredListError> {
+        self.insert(0, items)
+    }
+
+    /// Insert exact measurements after the last item.
+    ///
+    /// # Errors
+    ///
+    /// * [`MeasuredListError::DuplicateKey`] when an inserted key repeats within
+    ///   the batch or is already indexed.
+    pub fn append(
+        &mut self,
+        items: impl IntoIterator<Item = MeasuredListItem<K>>,
+    ) -> Result<(), MeasuredListError> {
+        self.insert(self.len(), items)
+    }
+
+    /// Remove an index range, returning the removed measurements in order.
+    ///
+    /// # Errors
+    ///
+    /// * [`MeasuredListError::OutOfBounds`] when the range is reversed or
+    ///   extends past `len()`.
+    pub fn remove_range(
+        &mut self,
+        range: Range<usize>,
+    ) -> Result<Vec<MeasuredListItem<K>>, MeasuredListError> {
+        self.splice(range, std::iter::empty())
+    }
+
+    /// Remove one item by stable key, returning its measurement.
+    pub fn remove(&mut self, key: &K) -> Option<MeasuredListItem<K>> {
+        let index = self.index_of(key)?;
+        self.detach_range(index..index + 1).pop()
+    }
+
+    /// Replace an index range with exact measurements, returning the removed
+    /// measurements in order. Keys removed by the range may be reinserted.
+    ///
+    /// Costs `O(r + k + log n)` tree work plus `O((r + k) log n)` key
+    /// bookkeeping for `r` removed and `k` inserted items.
+    ///
+    /// # Errors
+    ///
+    /// * [`MeasuredListError::OutOfBounds`] when the range is reversed or
+    ///   extends past `len()`.
+    /// * [`MeasuredListError::DuplicateKey`] when an inserted key repeats within
+    ///   the batch or is indexed outside the replaced range.
+    pub fn splice(
+        &mut self,
+        range: Range<usize>,
+        items: impl IntoIterator<Item = MeasuredListItem<K>>,
+    ) -> Result<Vec<MeasuredListItem<K>>, MeasuredListError> {
+        let len = self.len();
+        if range.start > range.end || range.end > len {
+            return Err(MeasuredListError::OutOfBounds {
+                start: range.start,
+                end: range.end,
+                len,
             });
-            items.push(item.unwrap_or_else(|| {
-                let height = measure(&key);
-                MeasuredListItem::new(key, layout_revision, width, capability_revision, height)
-            }));
         }
-        self.items = items;
-        self.rebuild_index();
+        let items = items.into_iter().collect::<Vec<_>>();
+        {
+            let mut batch = BTreeSet::new();
+            for (position, item) in items.iter().enumerate() {
+                let outside_range = self
+                    .index_of(&item.key)
+                    .is_some_and(|index| !range.contains(&index));
+                if !batch.insert(&item.key) || outside_range {
+                    return Err(MeasuredListError::DuplicateKey { position });
+                }
+            }
+        }
+        let start = range.start;
+        let removed = self.detach_range(range);
+        self.attach_at(start, items);
+        Ok(removed)
+    }
+
+    /// Alias for [`Self::splice`] that names the replace-range operation.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::splice`].
+    pub fn replace_range(
+        &mut self,
+        range: Range<usize>,
+        items: impl IntoIterator<Item = MeasuredListItem<K>>,
+    ) -> Result<Vec<MeasuredListItem<K>>, MeasuredListError> {
+        self.splice(range, items)
     }
 
     /// Update one item's exact height in logarithmic time.
     pub fn update_height(&mut self, key: &K, height: u64) -> bool {
-        let Some(index) = self.key_to_index.get(key).copied() else {
+        let Some(node) = self.key_to_node.get(key).copied() else {
             return false;
         };
-        let old_extent = self.item_extent(index);
-        self.items[index].height = height;
-        let new_extent = self.item_extent(index);
-        self.tree.set(index, old_extent, new_extent);
+        self.nodes[node].item.height = height;
+        self.refresh_ancestors(node);
         true
     }
 
-    /// Number of indexed items.
-    #[must_use]
-    pub const fn len(&self) -> usize {
-        self.items.len()
+    /// Replace the stored measurement for `item.key` (layout revision, width,
+    /// capability revision, and height) in logarithmic time.
+    ///
+    /// Returns `false` without change when the key is not indexed.
+    pub fn update_item(&mut self, item: MeasuredListItem<K>) -> bool {
+        let Some(node) = self.key_to_node.get(&item.key).copied() else {
+            return false;
+        };
+        self.nodes[node].item = item;
+        self.refresh_ancestors(node);
+        true
+    }
+
+    /// Re-measure every item whose width or capability revision differs from
+    /// the supplied values, in collection order, and return how many were
+    /// re-measured. Layout revisions are retained.
+    ///
+    /// This is the width and environment invalidation path; it is `O(n)`
+    /// because a width change can affect every item.
+    pub fn remeasure(
+        &mut self,
+        width: u64,
+        capability_revision: u64,
+        mut measure: impl FnMut(&K) -> u64,
+    ) -> usize {
+        let order = self.inorder_nodes(self.root);
+        let mut count = 0usize;
+        for node in order {
+            let item = &mut self.nodes[node].item;
+            if item.width != width || item.capability_revision != capability_revision {
+                item.height = measure(&item.key);
+                item.width = width;
+                item.capability_revision = capability_revision;
+                count += 1;
+            }
+        }
+        if count > 0 {
+            self.pull_all(self.root);
+        }
+        count
+    }
+
+    /// Change the logical gap after each item except the final item. Constant
+    /// time.
+    pub const fn set_gap(&mut self, gap: u64) {
+        self.gap = gap;
     }
 
     /// Whether no items are indexed.
     #[must_use]
     pub const fn is_empty(&self) -> bool {
-        self.items.is_empty()
+        self.root == NIL
     }
 
     /// Logical gap after each indexed item except the final item.
@@ -149,46 +447,117 @@ where
         self.gap
     }
 
-    /// Indexed item at `index`.
+    /// Indexed item at `index`, in logarithmic time.
     #[must_use]
     pub fn item(&self, index: usize) -> Option<&MeasuredListItem<K>> {
-        self.items.get(index)
+        self.node_at(index).map(|node| &self.nodes[node].item)
     }
 
-    /// Index for a stable key.
+    /// Indexed item for a stable key.
+    #[must_use]
+    pub fn item_by_key(&self, key: &K) -> Option<&MeasuredListItem<K>> {
+        self.key_to_node
+            .get(key)
+            .map(|node| &self.nodes[*node].item)
+    }
+
+    /// Whether a stable key is indexed.
+    #[must_use]
+    pub fn contains_key(&self, key: &K) -> bool {
+        self.key_to_node.contains_key(key)
+    }
+
+    /// Current index for a stable key, in logarithmic time.
     #[must_use]
     pub fn index_of(&self, key: &K) -> Option<usize> {
-        self.key_to_index.get(key).copied()
+        self.key_to_node
+            .get(key)
+            .map(|node| self.position_of(*node).0)
+    }
+
+    /// Logical start row for a stable key, in logarithmic time.
+    #[must_use]
+    pub fn key_offset(&self, key: &K) -> Option<u64> {
+        self.key_to_node.get(key).map(|node| {
+            let (index, heights) = self.position_of(*node);
+            self.extent(index, heights)
+        })
     }
 
     /// Logical start row for one item.
     #[must_use]
     pub fn item_offset(&self, index: usize) -> Option<u64> {
-        (index < self.items.len()).then(|| self.tree.prefix_sum(index))
+        if index >= self.len() {
+            return None;
+        }
+        let mut node = self.root;
+        let mut remaining = index;
+        let mut heights = 0u64;
+        while node != NIL {
+            let current = &self.nodes[node];
+            let left_size = self.size(current.left);
+            if remaining < left_size {
+                node = current.left;
+                continue;
+            }
+            heights = heights.saturating_add(self.heights(current.left));
+            if remaining == left_size {
+                break;
+            }
+            heights = heights.saturating_add(current.item.height);
+            remaining -= left_size + 1;
+            node = current.right;
+        }
+        Some(self.extent(index, heights))
     }
 
     /// Total logical collection height, excluding a trailing gap.
     #[must_use]
     pub fn total_height(&self) -> u64 {
-        self.tree
-            .total()
-            .saturating_sub(if self.items.is_empty() { 0 } else { self.gap })
+        let len = self.len();
+        self.extent(len, self.heights(self.root))
+            .saturating_sub(if len == 0 { 0 } else { self.gap })
     }
 
     /// Find the item containing one logical row. Rows in an inter-item gap map
     /// to the preceding item so viewport projection remains monotonic.
+    /// Zero-height items without a gap occupy no rows and are never returned.
     #[must_use]
     pub fn item_at_offset(&self, offset: u64) -> Option<usize> {
-        if self.items.is_empty() || offset >= self.total_height() {
+        if self.is_empty() || offset >= self.total_height() {
             return None;
         }
-        Some(self.tree.upper_bound(offset).min(self.items.len() - 1))
+        let mut node = self.root;
+        let mut target = offset;
+        let mut index = 0usize;
+        while node != NIL {
+            #[cfg(test)]
+            DESCENT_STEPS.with(|steps| steps.set(steps.get() + 1));
+            let current = &self.nodes[node];
+            let left_size = self.size(current.left);
+            let left_extent = self.extent(left_size, self.heights(current.left));
+            if target < left_extent {
+                node = current.left;
+                continue;
+            }
+            target -= left_extent;
+            let own = current.item.height.saturating_add(self.gap);
+            if target < own {
+                return Some(index + left_size);
+            }
+            target -= own;
+            index += left_size + 1;
+            node = current.right;
+        }
+        // Unreachable for in-range offsets; keep projection monotonic anyway.
+        Some(self.len() - 1)
     }
 
     /// Find items intersecting a logical viewport.
     #[must_use]
     pub fn visible_range(&self, offset: u64, viewport_height: u64) -> VisibleItemRange {
-        if self.items.is_empty() || viewport_height == 0 || offset >= self.total_height() {
+        let total = self.total_height();
+        if self.is_empty() || viewport_height == 0 || offset >= total {
             return VisibleItemRange {
                 start: 0,
                 end: 0,
@@ -199,8 +568,8 @@ where
         let start_offset = self.item_offset(start).unwrap_or(0);
         let viewport_end = offset.saturating_add(viewport_height);
         let end = self
-            .item_at_offset(viewport_end.saturating_sub(1).min(self.total_height() - 1))
-            .map_or(self.items.len(), |index| index.saturating_add(1));
+            .item_at_offset(viewport_end.saturating_sub(1).min(total - 1))
+            .map_or(self.len(), |index| index.saturating_add(1));
         VisibleItemRange {
             start,
             end,
@@ -208,22 +577,339 @@ where
         }
     }
 
-    fn item_extent(&self, index: usize) -> u64 {
-        self.items[index].height.saturating_add(self.gap)
+    /// Iterate stable keys in collection order.
+    pub fn keys(&self) -> impl ExactSizeIterator<Item = &K> + '_ {
+        self.iter().map(|item| &item.key)
     }
 
-    fn rebuild_index(&mut self) {
-        self.key_to_index = self
-            .items
+    fn heights(&self, node: usize) -> u64 {
+        if node == NIL {
+            0
+        } else {
+            self.nodes[node].heights
+        }
+    }
+
+    /// Logical extent of `count` items whose heights sum to `heights`, each
+    /// followed by one gap.
+    fn extent(&self, count: usize, heights: u64) -> u64 {
+        heights.saturating_add(
+            self.gap
+                .saturating_mul(u64::try_from(count).unwrap_or(u64::MAX)),
+        )
+    }
+
+    fn node_at(&self, index: usize) -> Option<usize> {
+        let mut node = self.root;
+        let mut remaining = index;
+        while node != NIL {
+            let current = &self.nodes[node];
+            let left_size = self.size(current.left);
+            match remaining.cmp(&left_size) {
+                Ordering::Less => node = current.left,
+                Ordering::Equal => return Some(node),
+                Ordering::Greater => {
+                    remaining -= left_size + 1;
+                    node = current.right;
+                }
+            }
+        }
+        None
+    }
+
+    /// Index and summed heights of all preceding items for one node.
+    fn position_of(&self, node: usize) -> (usize, u64) {
+        let left = self.nodes[node].left;
+        let mut index = self.size(left);
+        let mut heights = self.heights(left);
+        let mut child = node;
+        let mut parent = self.nodes[node].parent;
+        while parent != NIL {
+            let current = &self.nodes[parent];
+            if current.right == child {
+                index += self.size(current.left) + 1;
+                heights = heights
+                    .saturating_add(self.heights(current.left))
+                    .saturating_add(current.item.height);
+            }
+            child = parent;
+            parent = current.parent;
+        }
+        (index, heights)
+    }
+
+    const fn next_priority(&mut self) -> u64 {
+        // SplitMix64: deterministic, well-distributed treap priorities.
+        self.seed = self.seed.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut value = self.seed;
+        value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        value ^ (value >> 31)
+    }
+
+    fn pull(&mut self, node: usize) {
+        let (left, right) = (self.nodes[node].left, self.nodes[node].right);
+        let size = self.size(left) + self.size(right) + 1;
+        let heights = self
+            .heights(left)
+            .saturating_add(self.heights(right))
+            .saturating_add(self.nodes[node].item.height);
+        let current = &mut self.nodes[node];
+        current.size = size;
+        current.heights = heights;
+        if left != NIL {
+            self.nodes[left].parent = node;
+        }
+        if right != NIL {
+            self.nodes[right].parent = node;
+        }
+    }
+
+    fn pull_all(&mut self, node: usize) {
+        if node == NIL {
+            return;
+        }
+        self.pull_all(self.nodes[node].left);
+        self.pull_all(self.nodes[node].right);
+        self.pull(node);
+    }
+
+    fn refresh_ancestors(&mut self, node: usize) {
+        let mut cursor = node;
+        while cursor != NIL {
+            self.pull(cursor);
+            cursor = self.nodes[cursor].parent;
+        }
+    }
+
+    fn merge(&mut self, left: usize, right: usize) -> usize {
+        if left == NIL {
+            return right;
+        }
+        if right == NIL {
+            return left;
+        }
+        if self.nodes[left].priority > self.nodes[right].priority {
+            let merged = self.merge(self.nodes[left].right, right);
+            self.nodes[left].right = merged;
+            self.pull(left);
+            left
+        } else {
+            let merged = self.merge(left, self.nodes[right].left);
+            self.nodes[right].left = merged;
+            self.pull(right);
+            right
+        }
+    }
+
+    /// Split a subtree into its first `count` items and the remainder. Both
+    /// returned roots have no parent.
+    fn split(&mut self, node: usize, count: usize) -> (usize, usize) {
+        if node == NIL {
+            return (NIL, NIL);
+        }
+        let left = self.nodes[node].left;
+        let left_size = self.size(left);
+        let (first, rest) = if count <= left_size {
+            let (first, rest) = self.split(left, count);
+            self.nodes[node].left = rest;
+            self.pull(node);
+            (first, node)
+        } else {
+            let (first, rest) = self.split(self.nodes[node].right, count - left_size - 1);
+            self.nodes[node].right = first;
+            self.pull(node);
+            (node, rest)
+        };
+        for root in [first, rest] {
+            if root != NIL {
+                self.nodes[root].parent = NIL;
+            }
+        }
+        (first, rest)
+    }
+
+    /// Build a detached subtree from items in order in linear time and register
+    /// their keys. Callers must have validated key uniqueness.
+    fn build(&mut self, items: Vec<MeasuredListItem<K>>) -> usize {
+        let mut stack: Vec<usize> = Vec::new();
+        for item in items {
+            let node = self.nodes.len();
+            let priority = self.next_priority();
+            self.key_to_node.insert(item.key.clone(), node);
+            self.nodes.push(Node {
+                item,
+                priority,
+                left: NIL,
+                right: NIL,
+                parent: NIL,
+                size: 1,
+                heights: 0,
+            });
+            let mut last = NIL;
+            while let Some(&top) = stack.last() {
+                if self.nodes[top].priority >= priority {
+                    break;
+                }
+                last = top;
+                stack.pop();
+            }
+            self.nodes[node].left = last;
+            if let Some(&top) = stack.last() {
+                self.nodes[top].right = node;
+            }
+            stack.push(node);
+        }
+        let Some(&root) = stack.first() else {
+            return NIL;
+        };
+        self.pull_all(root);
+        self.nodes[root].parent = NIL;
+        root
+    }
+
+    /// Insert validated items at `at` and register their keys.
+    fn attach_at(&mut self, at: usize, items: Vec<MeasuredListItem<K>>) {
+        if items.is_empty() {
+            return;
+        }
+        let (left, right) = self.split(self.root, at);
+        let middle = self.build(items);
+        let joined = self.merge(left, middle);
+        self.root = self.merge(joined, right);
+        self.nodes[self.root].parent = NIL;
+    }
+
+    /// Remove an in-bounds range, unregister its keys, release its arena slots,
+    /// and return its items in order.
+    fn detach_range(&mut self, range: Range<usize>) -> Vec<MeasuredListItem<K>> {
+        if range.is_empty() {
+            return Vec::new();
+        }
+        let (left, rest) = self.split(self.root, range.start);
+        let (middle, right) = self.split(rest, range.len());
+        self.root = self.merge(left, right);
+        if self.root != NIL {
+            self.nodes[self.root].parent = NIL;
+        }
+        let order = self.inorder_nodes(middle);
+        for node in &order {
+            self.key_to_node.remove(&self.nodes[*node].item.key);
+        }
+        let mut slots = order
             .iter()
             .enumerate()
-            .map(|(index, item)| (item.key.clone(), index))
-            .collect();
-        self.tree = FenwickTree::from_values(
-            self.items
-                .iter()
-                .map(|item| item.height.saturating_add(self.gap)),
-        );
+            .map(|(position, node)| (*node, position))
+            .collect::<Vec<_>>();
+        slots.sort_unstable_by_key(|slot| std::cmp::Reverse(slot.0));
+        let mut removed = std::iter::repeat_with(|| None)
+            .take(order.len())
+            .collect::<Vec<Option<MeasuredListItem<K>>>>();
+        for (node, position) in slots {
+            removed[position] = Some(self.release(node));
+        }
+        removed.into_iter().flatten().collect()
+    }
+
+    /// Remove one detached arena slot, relocating the last slot into it.
+    /// Slots must be released in descending order so the relocated slot is
+    /// always attached to the live tree.
+    fn release(&mut self, node: usize) -> MeasuredListItem<K> {
+        let last = self.nodes.len() - 1;
+        let released = self.nodes.swap_remove(node);
+        if node != last {
+            let parent = self.nodes[node].parent;
+            if parent == NIL {
+                if self.root == last {
+                    self.root = node;
+                }
+            } else if self.nodes[parent].left == last {
+                self.nodes[parent].left = node;
+            } else {
+                self.nodes[parent].right = node;
+            }
+            for child in [self.nodes[node].left, self.nodes[node].right] {
+                if child != NIL {
+                    self.nodes[child].parent = node;
+                }
+            }
+            if let Some(slot) = self.key_to_node.get_mut(&self.nodes[node].item.key) {
+                *slot = node;
+            }
+        }
+        released.item
+    }
+
+    fn inorder_nodes(&self, root: usize) -> Vec<usize> {
+        let mut order = Vec::with_capacity(self.size(root));
+        let mut stack = Vec::new();
+        let mut node = root;
+        loop {
+            while node != NIL {
+                stack.push(node);
+                node = self.nodes[node].left;
+            }
+            let Some(next) = stack.pop() else {
+                break;
+            };
+            order.push(next);
+            node = self.nodes[next].right;
+        }
+        order
+    }
+}
+
+impl<K> MeasuredListIndex<K> {
+    /// Number of indexed items.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.size(self.root)
+    }
+
+    /// Iterate indexed items in collection order.
+    #[must_use]
+    pub fn iter(&self) -> Iter<'_, K> {
+        self.iter_from(0)
+    }
+
+    /// Iterate indexed items in collection order starting at `index`. Creating
+    /// the iterator is logarithmic; each step is amortized constant time.
+    #[must_use]
+    pub fn iter_from(&self, index: usize) -> Iter<'_, K> {
+        let mut stack = Vec::new();
+        let mut node = self.root;
+        let mut remaining = index;
+        while node != NIL {
+            let current = &self.nodes[node];
+            let left_size = self.size(current.left);
+            match remaining.cmp(&left_size) {
+                Ordering::Less => {
+                    stack.push(node);
+                    node = current.left;
+                }
+                Ordering::Equal => {
+                    stack.push(node);
+                    break;
+                }
+                Ordering::Greater => {
+                    remaining -= left_size + 1;
+                    node = current.right;
+                }
+            }
+        }
+        Iter {
+            index: self,
+            stack,
+            remaining: self.len().saturating_sub(index),
+        }
+    }
+
+    fn size(&self, node: usize) -> usize {
+        if node == NIL {
+            0
+        } else {
+            self.nodes[node].size
+        }
     }
 }
 
@@ -236,304 +922,67 @@ where
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct FenwickTree {
-    values: Vec<u64>,
-    tree: Vec<u64>,
-}
-
-impl FenwickTree {
-    fn from_values(values: impl IntoIterator<Item = u64>) -> Self {
-        let values = values.into_iter().collect::<Vec<_>>();
-        let mut result = Self {
-            tree: vec![0; values.len().saturating_add(1)],
-            values: vec![0; values.len()],
-        };
-        for (index, value) in values.into_iter().enumerate() {
-            result.set(index, 0, value);
-        }
-        result
-    }
-
-    fn set(&mut self, index: usize, old: u64, new: u64) {
-        if index >= self.values.len() {
-            return;
-        }
-        self.values[index] = new;
-        let increase = new >= old;
-        let difference = new.abs_diff(old);
-        let mut cursor = index.saturating_add(1);
-        while cursor < self.tree.len() {
-            self.tree[cursor] = if increase {
-                self.tree[cursor].saturating_add(difference)
-            } else {
-                self.tree[cursor].saturating_sub(difference)
-            };
-            cursor = cursor.saturating_add(cursor.isolate_lowest_one());
-        }
-    }
-
-    fn prefix_sum(&self, end: usize) -> u64 {
-        let mut cursor = end.min(self.values.len());
-        let mut total = 0u64;
-        while cursor > 0 {
-            total = total.saturating_add(self.tree[cursor]);
-            cursor &= cursor - 1;
-        }
-        total
-    }
-
-    fn total(&self) -> u64 {
-        self.prefix_sum(self.values.len())
-    }
-
-    /// Return the first value index whose inclusive prefix exceeds `target`.
-    fn upper_bound(&self, target: u64) -> usize {
-        let mut index = 0usize;
-        let mut accumulated = 0u64;
-        let mut step = if self.values.is_empty() {
-            0
-        } else {
-            1usize << self.values.len().ilog2()
-        };
-        while step > 0 {
-            #[cfg(test)]
-            UPPER_BOUND_STEPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let next = index.saturating_add(step);
-            if next < self.tree.len() && accumulated.saturating_add(self.tree[next]) <= target {
-                index = next;
-                accumulated = accumulated.saturating_add(self.tree[next]);
-            }
-            step >>= 1;
-        }
-        index.min(self.values.len().saturating_sub(1))
+impl<K> PartialEq for MeasuredListIndex<K>
+where
+    K: PartialEq,
+{
+    fn eq(&self, other: &Self) -> bool {
+        self.gap == other.gap && self.len() == other.len() && self.iter().eq(other.iter())
     }
 }
+
+impl<K> Eq for MeasuredListIndex<K> where K: Eq {}
+
+impl<K> fmt::Debug for MeasuredListIndex<K>
+where
+    K: fmt::Debug,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MeasuredListIndex")
+            .field("gap", &self.gap)
+            .field("items", &self.iter().collect::<Vec<_>>())
+            .finish_non_exhaustive()
+    }
+}
+
+impl<'a, K> IntoIterator for &'a MeasuredListIndex<K> {
+    type Item = &'a MeasuredListItem<K>;
+    type IntoIter = Iter<'a, K>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+/// In-order iterator over [`MeasuredListIndex`] items.
+pub struct Iter<'a, K> {
+    index: &'a MeasuredListIndex<K>,
+    stack: Vec<usize>,
+    remaining: usize,
+}
+
+impl<'a, K> Iterator for Iter<'a, K> {
+    type Item = &'a MeasuredListItem<K>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let node = self.stack.pop()?;
+        self.remaining = self.remaining.saturating_sub(1);
+        let mut cursor = self.index.nodes[node].right;
+        while cursor != NIL {
+            self.stack.push(cursor);
+            cursor = self.index.nodes[cursor].left;
+        }
+        Some(&self.index.nodes[node].item)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.remaining, Some(self.remaining))
+    }
+}
+
+impl<K> ExactSizeIterator for Iter<'_, K> {}
+
+impl<K> std::iter::FusedIterator for Iter<'_, K> {}
 
 #[cfg(test)]
-mod tests {
-    use super::{MeasuredListIndex, UPPER_BOUND_STEPS, VisibleItemRange};
-    use std::sync::atomic::Ordering;
-
-    #[test]
-    fn synchronizes_by_stable_key_revision_and_width() {
-        let mut index = MeasuredListIndex::new(1);
-        let mut measured = Vec::new();
-        index.sync([("a", 1), ("b", 1)], 10, 0, |key| {
-            measured.push(*key);
-            if *key == "a" { 2 } else { 3 }
-        });
-        index.sync([("b", 1), ("a", 1)], 10, 0, |key| {
-            measured.push(*key);
-            9
-        });
-        assert_eq!(measured, ["a", "b"]);
-        assert_eq!(index.item(0).map(|item| item.height), Some(3));
-        index.sync([("b", 2), ("a", 1)], 10, 0, |key| {
-            measured.push(*key);
-            4
-        });
-        assert_eq!(measured, ["a", "b", "b"]);
-    }
-
-    #[test]
-    fn reports_offsets_total_height_and_visible_boundaries() {
-        let mut index = MeasuredListIndex::new(1);
-        index.sync([("a", 0), ("b", 0), ("c", 0)], 8, 0, |key| match *key {
-            "a" => 2,
-            "b" => 4,
-            _ => 3,
-        });
-        assert_eq!(index.item_offset(0), Some(0));
-        assert_eq!(index.item_offset(1), Some(3));
-        assert_eq!(index.item_offset(2), Some(8));
-        assert_eq!(index.total_height(), 11);
-        assert_eq!(index.item_at_offset(0), Some(0));
-        assert_eq!(index.item_at_offset(3), Some(1));
-        let visible = index.visible_range(4, 5);
-        assert_eq!(visible.start, 1);
-        assert_eq!(visible.end, 3);
-        assert_eq!(visible.first_item_offset, 1);
-    }
-
-    #[test]
-    fn randomized_mutations_match_naive_prefix_geometry() {
-        let mut seed = 0x5eed_u64;
-        let mut keys = (0_u32..20).collect::<Vec<_>>();
-        let mut heights = keys
-            .iter()
-            .map(|key| (*key, u64::from(*key % 5 + 1)))
-            .collect::<std::collections::BTreeMap<_, _>>();
-        let mut index = MeasuredListIndex::new(2);
-
-        for _ in 0..500 {
-            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
-            match seed % 4 {
-                0 if !keys.is_empty() => {
-                    let position = usize::try_from(seed >> 32).unwrap_or(0) % keys.len();
-                    keys.remove(position);
-                }
-                1 => {
-                    let key = u32::try_from(seed >> 32).unwrap_or(u32::MAX);
-                    heights.entry(key).or_insert_with(|| {
-                        let position = if keys.is_empty() {
-                            0
-                        } else {
-                            usize::try_from(seed).unwrap_or(0) % (keys.len() + 1)
-                        };
-                        keys.insert(position, key);
-                        u64::from(key % 7 + 1)
-                    });
-                }
-                2 if keys.len() > 1 => {
-                    let left = usize::try_from(seed >> 32).unwrap_or(0) % keys.len();
-                    let right = usize::try_from(seed).unwrap_or(0) % keys.len();
-                    keys.swap(left, right);
-                }
-                _ if !keys.is_empty() => {
-                    let position = usize::try_from(seed >> 32).unwrap_or(0) % keys.len();
-                    let key = keys[position];
-                    let height = seed % 9 + 1;
-                    heights.insert(key, height);
-                }
-                _ => {}
-            }
-
-            index.sync(keys.iter().map(|key| (*key, heights[key])), 20, 0, |key| {
-                heights[key]
-            });
-            let mut expected_offset = 0u64;
-            for (position, key) in keys.iter().enumerate() {
-                assert_eq!(index.index_of(key), Some(position));
-                assert_eq!(index.item_offset(position), Some(expected_offset));
-                expected_offset = expected_offset
-                    .saturating_add(heights[key])
-                    .saturating_add(2);
-            }
-            let expected_total =
-                expected_offset.saturating_sub(if keys.is_empty() { 0 } else { 2 });
-            assert_eq!(index.total_height(), expected_total);
-            for offset in 0..expected_total {
-                let expected = naive_item_at_offset(&keys, &heights, 2, offset);
-                assert_eq!(index.item_at_offset(offset), expected);
-            }
-        }
-    }
-
-    #[test]
-    fn visible_lookup_steps_are_logarithmic() {
-        let mut index = MeasuredListIndex::new(1);
-        index.sync((0..1_000_000usize).map(|key| (key, 0)), 80, 0, |_| 1);
-        UPPER_BOUND_STEPS.store(0, Ordering::Relaxed);
-
-        let range = index.visible_range(1_234_567, 40);
-        let steps = UPPER_BOUND_STEPS.load(Ordering::Relaxed);
-
-        assert!(range.start < range.end);
-        assert!(steps <= 40, "two Fenwick lookups took {steps} steps");
-    }
-
-    #[test]
-    fn randomized_viewports_match_naive_visible_ranges() {
-        let mut seed = 0x00c0_ffee_u64;
-        for _ in 0..500 {
-            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
-            let len = usize::try_from(seed % 40).unwrap_or(0);
-            let gap = (seed >> 8) % 5;
-            let viewport = (seed >> 16) % 20;
-            let mut heights = std::collections::BTreeMap::new();
-            let keys = (0..len)
-                .map(|key| {
-                    let key = u32::try_from(key).unwrap();
-                    seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
-                    heights.insert(key, seed % 12 + 1);
-                    key
-                })
-                .collect::<Vec<_>>();
-            let mut index = MeasuredListIndex::new(gap);
-            index.sync(
-                keys.iter().map(|key| (*key, heights[key])),
-                (seed >> 24) % 80 + 1,
-                0,
-                |key| heights[key],
-            );
-            let offset = if index.total_height() == 0 {
-                0
-            } else {
-                (seed >> 32) % (index.total_height() + 3)
-            };
-
-            let actual = index.visible_range(offset, viewport);
-            let expected_start = naive_item_at_offset(&keys, &heights, gap, offset);
-            let expected = match expected_start {
-                Some(start) if viewport > 0 && offset < index.total_height() => {
-                    let start_offset = keys[..start].iter().fold(0u64, |sum, key| {
-                        sum.saturating_add(heights[key]).saturating_add(gap)
-                    });
-                    let end_offset = offset
-                        .saturating_add(viewport)
-                        .saturating_sub(1)
-                        .min(index.total_height() - 1);
-                    let end = naive_item_at_offset(&keys, &heights, gap, end_offset)
-                        .map_or(keys.len(), |item| item + 1);
-                    VisibleItemRange {
-                        start,
-                        end,
-                        first_item_offset: offset.saturating_sub(start_offset),
-                    }
-                }
-                _ => VisibleItemRange {
-                    start: 0,
-                    end: 0,
-                    first_item_offset: 0,
-                },
-            };
-            assert_eq!(actual, expected);
-        }
-    }
-
-    fn naive_item_at_offset(
-        keys: &[u32],
-        heights: &std::collections::BTreeMap<u32, u64>,
-        gap: u64,
-        offset: u64,
-    ) -> Option<usize> {
-        let mut start = 0u64;
-        for (index, key) in keys.iter().enumerate() {
-            let end = start.saturating_add(heights[key]).saturating_add(gap);
-            if offset < end {
-                return Some(index);
-            }
-            start = end;
-        }
-        None
-    }
-
-    #[test]
-    fn large_logical_heights_preserve_collection_indices() {
-        let height = u64::from(u32::MAX) + 1;
-        let mut index = MeasuredListIndex::new(3);
-        index.sync([("a", 0), ("b", 0)], height, 0, |_| height);
-        assert_eq!(index.item_offset(1), Some(height + 3));
-        assert_eq!(index.total_height(), height * 2 + 3);
-        assert_eq!(index.item_at_offset(height + 3), Some(1));
-        assert_eq!(
-            index.visible_range(height + 5, 1),
-            VisibleItemRange {
-                start: 1,
-                end: 2,
-                first_item_offset: 2,
-            }
-        );
-    }
-
-    #[test]
-    fn updates_height_without_rebuilding_identity_index() {
-        let mut index = MeasuredListIndex::new(0);
-        index.sync([("a", 0), ("b", 0)], 8, 0, |_| 2);
-        assert!(index.update_height(&"a", 5));
-        assert_eq!(index.item_offset(1), Some(5));
-        assert_eq!(index.total_height(), 7);
-        assert_eq!(index.index_of(&"b"), Some(1));
-    }
-}
+mod tests;

@@ -1,52 +1,1079 @@
 //! Visible-only rendering for keyed variable-height component collections.
+//!
+//! [`VirtualListState`] stores the scroll position as a keyed
+//! [`ListPosition`] (an item key plus a row or caller source position inside
+//! it) and derives collection rows from the incremental [`MeasuredListIndex`]
+//! whenever they are needed, so positions survive insertion, removal, reorder,
+//! and width reflow. Items come from a [`VirtualItemSource`], which constructs
+//! components lazily: only items that need measurement and visible items are
+//! built. The eager [`VirtualList`] builder is one such source.
+//!
+//! See the "Virtualized scrolling" section of `docs/tui-framework.md` for the
+//! complete contract.
 
-use std::collections::BTreeSet;
+mod action;
+mod component;
+mod motion;
+mod position;
+mod source;
+
+use std::borrow::Cow;
+use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Range;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::Instant;
+#[cfg(target_arch = "wasm32")]
+use web_time::Instant;
 
 use bmux_tui::component::{
-    Component, Constraints, Element, EventCx, LayoutCache, LayoutCx, LayoutEnvironment, LayoutId,
-    LogicalRect,
+    Component, ComponentRevision, Constraints, Element, EventCx, LayoutCache, LayoutCx,
+    LayoutEnvironment, LayoutId, LayoutNode, LogicalRect,
 };
 use bmux_tui::event::{Event, EventOutcome};
 use bmux_tui::geometry::Rect;
 use bmux_tui::hit::{HitRegion, HitRole};
-use bmux_tui::measured_list::MeasuredListIndex;
 use bmux_tui::paint::{LocalRect, PaintCx};
+use bmux_tui::pointer::PointerIntent;
 use bmux_tui::semantic::SemanticRegion;
+use bmux_tui::style::Easing;
 
+pub use action::{ActionDispatch, PageStep, ScrollInputSource, VirtualListAction};
+pub use bmux_tui::measured_list::{
+    MeasuredListError, MeasuredListIndex, MeasuredListItem, VisibleItemRange,
+};
+pub use component::{VirtualListChrome, VirtualListComponent};
+pub use motion::{MotionSample, ScrollMotion, ScrollTarget};
+pub use position::{
+    AnchorOffset, AnchorPolicy, Edge, ListAnchor, ListGeometry, ListPosition, NoSourceMap,
+    Overscroll, ResolvedPosition, SourceMap, anchor_at_offset, anchor_for, position_at_offset,
+    resolve_position, target_top_offset,
+};
+pub use source::VirtualItemSource;
+
+pub use crate::resident_window::{EdgeRows, FractionTarget, PositionEstimate, WindowSplice};
 use crate::scroll_view::{ScrollViewState, scrollbar_state};
 
-/// Structural work counters for one virtual-list render.
+/// Structural work counters for virtual-list layout and rendering.
+///
+/// [`VirtualListState::render_stats`] reports the counters accumulated since
+/// the most recent synchronization: `measured_items` and `built_items` from
+/// that synchronization plus construction during later paints and events,
+/// and `painted_items` / `registered_items` from the most recent paint.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct VirtualListRenderStats {
     /// Items whose components were painted.
     pub painted_items: usize,
     /// Visible item interaction regions registered.
     pub registered_items: usize,
+    /// Item components constructed through [`VirtualItemSource::build`].
+    pub built_items: usize,
+    /// Items whose exact height was (re)determined, through either a built
+    /// component or a source-retained layout.
+    pub measured_items: usize,
 }
 
-/// Retained state for keyed variable-height collection layout.
+/// Who owns a [`VirtualListState`]'s scroll position.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum PositionControl {
+    /// The list applies its own scroll actions (the default).
+    #[default]
+    Uncontrolled,
+    /// The caller owns the position; input only queues actions.
+    Controlled,
+}
+
+/// Result of [`VirtualSourceList::layout`]: the resolved position and the
+/// items intersecting the viewport.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VirtualListLayout {
+    /// Resolved collection rows.
+    pub resolved: ResolvedPosition,
+    /// Items intersecting the viewport.
+    pub visible: VisibleItemRange,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SyncKey {
+    width: u64,
+    environment: LayoutEnvironment,
+}
+
+/// One composed region of noted splices: index rows `old_start..old_end`
+/// correspond to source rows `new_start..new_end`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct DirtyRegion {
+    old_start: usize,
+    old_end: usize,
+    new_start: usize,
+    new_end: usize,
+}
+
+impl DirtyRegion {
+    const fn old_len(self) -> usize {
+        self.old_end - self.old_start
+    }
+
+    const fn new_len(self) -> usize {
+        self.new_end - self.new_start
+    }
+
+    const fn is_identity(self) -> bool {
+        self.old_start == self.old_end && self.new_start == self.new_end
+    }
+}
+
+/// Disjoint composed regions retained before they are merged into one span,
+/// bounding note and lookup cost.
+const MAX_DIRTY_REGIONS: usize = 16;
+
+/// Noted changes not yet reconciled against the source.
+///
+/// `regions` are sorted, disjoint, and non-adjacent in both coordinate
+/// spaces; rows outside every region correspond one-to-one, shifted by the
+/// size change of the regions before them. Keeping separate regions means a
+/// prepend and an append noted in the same frame cost `O(k)`, not `O(n)`.
 #[derive(Debug)]
-pub struct VirtualListState<K> {
+struct PendingChanges<K> {
+    regions: Vec<DirtyRegion>,
+    invalidated: BTreeSet<K>,
+    full: bool,
+}
+
+impl<K> PendingChanges<K> {
+    const fn new() -> Self {
+        Self {
+            regions: Vec::new(),
+            invalidated: BTreeSet::new(),
+            full: false,
+        }
+    }
+
+    /// Net change in length, as `(inserted rows, removed rows)`.
+    fn length_change(&self) -> (usize, usize) {
+        self.regions.iter().fold((0, 0), |(new, old), region| {
+            (new + region.new_len(), old + region.old_len())
+        })
+    }
+
+    /// Compose a splice of source rows `removed` (in coordinates after all
+    /// previously noted splices) replaced by `inserted` rows.
+    fn note(&mut self, removed: &Range<usize>, inserted: usize) {
+        let regions = &mut self.regions;
+        // Regions touching or overlapping `removed` (in source coordinates)
+        // merge with it; earlier regions stay; later regions shift.
+        let first = regions.partition_point(|region| region.new_end < removed.start);
+        let last =
+            first + regions[first..].partition_point(|region| region.new_start <= removed.end);
+        let (before_new, before_old) =
+            regions[..first].iter().fold((0, 0), |(new, old), region| {
+                (new + region.new_len(), old + region.old_len())
+            });
+        let (merged_new, merged_old) = regions[first..last]
+            .iter()
+            .fold((before_new, before_old), |(new, old), region| {
+                (new + region.new_len(), old + region.old_len())
+            });
+        let merging = &regions[first..last];
+        let new_start = merging
+            .first()
+            .map_or(removed.start, |region| region.new_start.min(removed.start));
+        let old_start = match merging.first() {
+            Some(region) if region.new_start <= removed.start => region.old_start,
+            _ => removed.start + before_old - before_new,
+        };
+        let span_end = merging
+            .last()
+            .map_or(removed.end, |region| region.new_end.max(removed.end));
+        let old_end = match merging.last() {
+            Some(region) if region.new_end >= removed.end => region.old_end,
+            _ => removed.end + merged_old - merged_new,
+        };
+        let merged = DirtyRegion {
+            old_start,
+            old_end,
+            new_start,
+            new_end: span_end - removed.len() + inserted,
+        };
+        for region in &mut regions[last..] {
+            region.new_start = region.new_start + inserted - removed.len();
+            region.new_end = region.new_end + inserted - removed.len();
+        }
+        regions.splice(first..last, (!merged.is_identity()).then_some(merged));
+        if regions.len() > MAX_DIRTY_REGIONS {
+            let (first, last) = (regions[0], regions[regions.len() - 1]);
+            *regions = vec![DirtyRegion {
+                old_start: first.old_start,
+                old_end: last.old_end,
+                new_start: first.new_start,
+                new_end: last.new_end,
+            }];
+        }
+    }
+
+    /// Source row expected to hold index row `index` after the noted splices,
+    /// or `None` when a noted splice replaced that row. Callers still verify
+    /// the key there, since unnoted changes (which schedule a full
+    /// reconciliation) are not reflected.
+    fn source_row(&self, index: usize) -> Option<usize> {
+        let (mut new, mut old) = (0, 0);
+        for region in &self.regions {
+            if index < region.old_start {
+                break;
+            }
+            if index < region.old_end {
+                return None;
+            }
+            new += region.new_len();
+            old += region.old_len();
+        }
+        Some(index + new - old)
+    }
+}
+
+/// Interior-mutable work counters updated by `&self` paint and event paths.
+/// Atomics (rather than `Cell`) keep the state `Sync`.
+#[derive(Debug, Default)]
+struct StatsCell {
+    painted: AtomicUsize,
+    registered: AtomicUsize,
+    built: AtomicUsize,
+    measured: AtomicUsize,
+}
+
+impl StatsCell {
+    fn get(&self) -> VirtualListRenderStats {
+        VirtualListRenderStats {
+            painted_items: self.painted.load(Ordering::Relaxed),
+            registered_items: self.registered.load(Ordering::Relaxed),
+            built_items: self.built.load(Ordering::Relaxed),
+            measured_items: self.measured.load(Ordering::Relaxed),
+        }
+    }
+
+    fn set(&self, stats: VirtualListRenderStats) {
+        self.painted.store(stats.painted_items, Ordering::Relaxed);
+        self.registered
+            .store(stats.registered_items, Ordering::Relaxed);
+        self.built.store(stats.built_items, Ordering::Relaxed);
+        self.measured.store(stats.measured_items, Ordering::Relaxed);
+    }
+}
+
+/// Removed keys tolerated before stale retained layouts are swept.
+const LAYOUT_SWEEP_MIN: usize = 64;
+
+/// Retained state for keyed variable-height collection layout.
+///
+/// The scroll position is a keyed [`ListPosition`]. In uncontrolled mode (the
+/// default, [`Self::new`]) the list applies its own scroll actions and the
+/// legacy offset API (`scroll`, [`Self::scroll_by`], [`Self::restore_anchor`],
+/// ...) stays available: offsets written through it are adopted as a keyed
+/// position at the next position query. In controlled mode
+/// ([`Self::controlled`]) the caller owns the position and input only queues
+/// [`VirtualListAction`]s.
+#[derive(Debug)]
+pub struct VirtualListState<K, S = ()> {
     index: MeasuredListIndex<K>,
     layouts: LayoutCache,
     anchor: Option<(K, usize, u64)>,
-    /// Shared logical scroll state.
+    /// Shared logical scroll state. After each layout its vertical offset
+    /// mirrors the resolved top offset and its follow flag mirrors
+    /// [`ListPosition::FollowBottom`].
     pub scroll: ScrollViewState,
+    control: PositionControl,
+    position: ListPosition<K, S>,
+    /// Scroll offset and follow flag last written by the position model, used
+    /// to detect legacy offset writes.
+    mirror: (u64, bool),
+    overscroll: Overscroll,
+    page_step: PageStep,
+    estimate: Option<PositionEstimate>,
+    resolved: Option<ResolvedPosition>,
+    resolved_valid: bool,
+    anchor_index: Option<usize>,
+    anchor_missing: bool,
+    actions: Vec<VirtualListAction<K>>,
+    pending: PendingChanges<K>,
+    synced: Option<SyncKey>,
+    generation: u64,
+    removed_layouts: usize,
+    stats: StatsCell,
+    motion: Option<ScrollMotion<K, S>>,
+    snapshot: Option<component::LayoutSnapshot>,
+    pressed: Option<K>,
 }
 
 impl<K> VirtualListState<K>
 where
     K: Clone + Ord,
 {
-    /// Create empty retained state with one logical inter-item gap.
+    /// Create empty uncontrolled state with one logical inter-item gap.
     #[must_use]
     pub fn new(gap: u64) -> Self {
+        Self::with_control(gap, PositionControl::Uncontrolled)
+    }
+
+    /// Create empty controlled state with one logical inter-item gap.
+    #[must_use]
+    pub fn controlled(gap: u64) -> Self {
+        Self::with_control(gap, PositionControl::Controlled)
+    }
+}
+
+impl<K> Default for VirtualListState<K>
+where
+    K: Clone + Ord,
+{
+    fn default() -> Self {
+        Self::new(0)
+    }
+}
+
+impl<K, S> VirtualListState<K, S>
+where
+    K: Clone + Ord,
+    S: Clone,
+{
+    /// Create empty state with an explicit position owner and source-position
+    /// type `S`.
+    #[must_use]
+    pub fn with_control(gap: u64, control: PositionControl) -> Self {
+        let scroll = ScrollViewState::new();
         Self {
             index: MeasuredListIndex::new(gap),
             layouts: LayoutCache::new(),
             anchor: None,
-            scroll: ScrollViewState::new(),
+            mirror: (scroll.vertical_offset(), scroll.follows_bottom()),
+            scroll,
+            control,
+            position: ListPosition::Top,
+            overscroll: Overscroll::None,
+            page_step: PageStep::Viewport,
+            estimate: None,
+            resolved: None,
+            resolved_valid: false,
+            anchor_index: None,
+            anchor_missing: false,
+            actions: Vec::new(),
+            pending: PendingChanges::new(),
+            synced: None,
+            generation: 0,
+            removed_layouts: 0,
+            stats: StatsCell::default(),
+            motion: None,
+            snapshot: None,
+            pressed: None,
         }
+    }
+
+    /// Whether the caller owns the position.
+    #[must_use]
+    pub const fn is_controlled(&self) -> bool {
+        matches!(self.control, PositionControl::Controlled)
+    }
+
+    /// Who owns the position.
+    #[must_use]
+    pub const fn control(&self) -> PositionControl {
+        self.control
+    }
+
+    /// The exact measured index.
+    #[must_use]
+    pub const fn index(&self) -> &MeasuredListIndex<K> {
+        &self.index
+    }
+
+    /// Counter that changes whenever measured geometry changes.
+    #[must_use]
+    pub const fn measurement_generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Set the blank tail policy below content.
+    pub fn set_overscroll(&mut self, overscroll: Overscroll) {
+        if self.overscroll != overscroll {
+            self.adopt_scroll();
+            self.overscroll = overscroll;
+            self.resolved_valid = false;
+        }
+    }
+
+    /// The blank tail policy below content.
+    #[must_use]
+    pub const fn overscroll(&self) -> Overscroll {
+        self.overscroll
+    }
+
+    /// Set the rows moved by [`VirtualListAction::PageRequested`].
+    pub const fn set_page_step(&mut self, page_step: PageStep) {
+        self.page_step = page_step;
+    }
+
+    /// Rows moved by [`VirtualListAction::PageRequested`].
+    #[must_use]
+    pub const fn page_step(&self) -> PageStep {
+        self.page_step
+    }
+
+    /// Set the presentation-only scrollbar estimate that
+    /// [`VirtualListAction::ScrollbarDrag`] fractions are relative to. An
+    /// estimate whose `resident` rows differ from the exact total is ignored.
+    pub const fn set_position_estimate(&mut self, estimate: Option<PositionEstimate>) {
+        self.estimate = estimate;
+    }
+
+    /// The scrollbar estimate set with [`Self::set_position_estimate`].
+    #[must_use]
+    pub const fn position_estimate(&self) -> Option<PositionEstimate> {
+        self.estimate
+    }
+
+    const fn geometry(&self, viewport_height: u64) -> ListGeometry {
+        ListGeometry::new(viewport_height).overscroll(self.overscroll)
+    }
+
+    fn last_viewport(&self) -> u64 {
+        self.resolved.map_or(0, |resolved| resolved.viewport_height)
+    }
+
+    fn scroll_written_externally(&self) -> bool {
+        (self.scroll.vertical_offset(), self.scroll.follows_bottom()) != self.mirror
+    }
+
+    fn effective_position(&self) -> ListPosition<K, S> {
+        if self.is_controlled() || !self.scroll_written_externally() {
+            return self.position.clone();
+        }
+        if self.scroll.follows_bottom() {
+            ListPosition::FollowBottom
+        } else {
+            position_at_offset(
+                &self.index,
+                self.scroll.vertical_offset(),
+                self.geometry(self.last_viewport()),
+                &NoSourceMap,
+            )
+        }
+    }
+
+    /// Adopt offsets written through the legacy scroll API as the keyed
+    /// position (uncontrolled mode only).
+    fn adopt_scroll(&mut self) {
+        if !self.is_controlled() && self.scroll_written_externally() {
+            // An explicit legacy write interrupts a running motion.
+            self.motion = None;
+            self.position = self.effective_position();
+            self.anchor_index = self
+                .position
+                .anchor()
+                .and_then(|anchor| self.index.index_of(&anchor.key));
+            self.mirror = (self.scroll.vertical_offset(), self.scroll.follows_bottom());
+            self.resolved_valid = false;
+        }
+    }
+
+    /// Store a position and, in uncontrolled mode, mirror it into `scroll`.
+    fn commit_position(&mut self, position: ListPosition<K, S>, top: Option<u64>) {
+        self.anchor_index = position
+            .anchor()
+            .and_then(|anchor| self.index.index_of(&anchor.key))
+            .or(self.anchor_index);
+        self.position = position;
+        if !self.is_controlled() {
+            if let Some(top) = top {
+                self.scroll.set_vertical_offset(top);
+            }
+            self.scroll
+                .set_follow_bottom(self.position.is_follow_bottom());
+            self.mirror = (self.scroll.vertical_offset(), self.scroll.follows_bottom());
+        }
+    }
+
+    /// Replace the keyed position. Controlled lists never change it
+    /// themselves; uncontrolled lists continue from it, and a running motion
+    /// is cancelled.
+    pub fn set_position(&mut self, position: ListPosition<K, S>) {
+        self.motion = None;
+        let top = self.resolved.and_then(|resolved| {
+            resolve_position(
+                &self.index,
+                &position,
+                self.geometry(resolved.viewport_height),
+                &NoSourceMap,
+            )
+            .map(|resolved| resolved.top_offset)
+        });
+        self.commit_position(position, top);
+        self.resolved_valid = false;
+    }
+
+    /// The current keyed position. In uncontrolled mode this includes offsets
+    /// written through the legacy scroll API since the last layout.
+    #[must_use]
+    pub fn position(&self) -> ListPosition<K, S> {
+        self.effective_position()
+    }
+
+    /// Replace [`ListPosition::FollowBottom`] with a keyed position at the
+    /// current top offset. Returns whether the position was following.
+    pub fn release_follow(&mut self) -> bool {
+        self.adopt_scroll();
+        if !self.position.is_follow_bottom() {
+            return false;
+        }
+        let viewport = self.last_viewport();
+        let geometry = self.geometry(viewport);
+        let top = geometry.max_content_top(self.index.total_height());
+        let position = position_at_offset(&self.index, top, geometry, &NoSourceMap);
+        self.commit_position(position, Some(top));
+        self.resolved_valid = false;
+        true
+    }
+
+    /// Resolve the current position for a viewport without mutating anything.
+    /// Returns `None` when the anchor key is not indexed; layout then applies
+    /// the missing-anchor fallback described on [`Self::resolve_layout`].
+    #[must_use]
+    pub fn resolve(
+        &self,
+        viewport_height: u64,
+        sources: &dyn SourceMap<K, S>,
+    ) -> Option<ResolvedPosition> {
+        resolve_position(
+            &self.index,
+            &self.effective_position(),
+            self.geometry(viewport_height),
+            sources,
+        )
+    }
+
+    /// The position resolved by the most recent layout.
+    #[must_use]
+    pub const fn resolved(&self) -> Option<ResolvedPosition> {
+        self.resolved
+    }
+
+    /// Whether the most recent layout could not resolve a controlled anchor.
+    #[must_use]
+    pub const fn anchor_missing(&self) -> bool {
+        self.anchor_missing
+    }
+
+    /// Keyed position that places `key` according to `policy`, relative to
+    /// the current position. Returns `None` when `key` is not indexed.
+    #[must_use]
+    pub fn anchor_for(
+        &self,
+        key: &K,
+        policy: AnchorPolicy,
+        viewport_height: u64,
+        sources: &dyn SourceMap<K, S>,
+    ) -> Option<ListPosition<K, S>> {
+        let current_top = self
+            .resolve(viewport_height, sources)
+            .map_or(0, |resolved| resolved.top_offset);
+        anchor_for(
+            &self.index,
+            key,
+            policy,
+            current_top,
+            self.geometry(viewport_height),
+            sources,
+        )
+    }
+
+    /// Resolve the position for layout, apply the missing-anchor fallback,
+    /// and mirror the result into `scroll`.
+    ///
+    /// A missing anchor key is handled per mode:
+    ///
+    /// * controlled: the previous top offset is reused, clamped to the new
+    ///   geometry, the position is left unchanged, and
+    ///   [`Self::anchor_missing`] becomes true;
+    /// * uncontrolled: the anchor moves to the item now at its last resolved
+    ///   index (adjusted for noted splices before it; the last item when the
+    ///   collection shrank past it), keeping its row clamped to that item, or
+    ///   to [`ListPosition::Top`] when the collection is empty.
+    pub fn resolve_layout(
+        &mut self,
+        viewport_height: u64,
+        sources: &dyn SourceMap<K, S>,
+    ) -> ResolvedPosition {
+        self.adopt_scroll();
+        let geometry = self.geometry(viewport_height);
+        let resolved = if let Some(resolved) =
+            resolve_position(&self.index, &self.position, geometry, sources)
+        {
+            self.anchor_missing = false;
+            resolved
+        } else if self.is_controlled() {
+            self.anchor_missing = true;
+            let total_height = self.index.total_height();
+            let max_content_top = geometry.max_content_top(total_height);
+            let max_overscroll_top = geometry.max_overscroll_top(total_height);
+            let limit = if matches!(self.position, ListPosition::Overscrolled(_)) {
+                max_overscroll_top
+            } else {
+                max_content_top
+            };
+            ResolvedPosition {
+                top_offset: self
+                    .resolved
+                    .map_or(0, |resolved| resolved.top_offset)
+                    .min(limit),
+                viewport_height,
+                total_height,
+                max_content_top,
+                max_overscroll_top,
+            }
+        } else {
+            self.anchor_missing = false;
+            self.position = self.remapped_anchor();
+            resolve_position(&self.index, &self.position, geometry, sources).unwrap_or_else(|| {
+                let total_height = self.index.total_height();
+                ResolvedPosition {
+                    top_offset: 0,
+                    viewport_height,
+                    total_height,
+                    max_content_top: geometry.max_content_top(total_height),
+                    max_overscroll_top: geometry.max_overscroll_top(total_height),
+                }
+            })
+        };
+        if let Some(anchor) = self.position.anchor()
+            && let Some(position) = self.index.index_of(&anchor.key)
+        {
+            self.anchor_index = Some(position);
+        }
+        self.resolved = Some(resolved);
+        self.resolved_valid = true;
+        self.scroll.set_vertical_offset(resolved.top_offset);
+        self.scroll
+            .set_follow_bottom(self.position.is_follow_bottom());
+        self.mirror = (self.scroll.vertical_offset(), self.scroll.follows_bottom());
+        resolved
+    }
+
+    /// Uncontrolled fallback for an anchor whose key was removed.
+    fn remapped_anchor(&self) -> ListPosition<K, S> {
+        let Some(anchor) = self.position.anchor() else {
+            return self.position.clone();
+        };
+        let Some(last) = self.index.len().checked_sub(1) else {
+            return ListPosition::Top;
+        };
+        let position = self.anchor_index.unwrap_or(0).min(last);
+        let Some(item) = self.index.item(position) else {
+            return ListPosition::Top;
+        };
+        let row = match anchor.offset {
+            AnchorOffset::Row(row) | AnchorOffset::Source { row_delta: row, .. } => row,
+        };
+        let extent = position::item_extent(&self.index, position);
+        let row = if extent == 0 { 0 } else { row.min(extent - 1) };
+        let anchor = ListAnchor::row(item.key.clone(), row);
+        if matches!(self.position, ListPosition::Overscrolled(_)) {
+            ListPosition::Overscrolled(anchor)
+        } else {
+            ListPosition::Anchored(anchor)
+        }
+    }
+
+    /// Current resolution for applying an action: the last layout when still
+    /// valid, otherwise a fresh resolution at the last viewport height.
+    fn current_resolution(&mut self, sources: &dyn SourceMap<K, S>) -> ResolvedPosition {
+        self.adopt_scroll();
+        match self.resolved {
+            Some(resolved) if self.resolved_valid => resolved,
+            _ => self.resolve_layout(self.last_viewport(), sources),
+        }
+    }
+
+    fn move_to(
+        &mut self,
+        current: ResolvedPosition,
+        top: u64,
+        follow: bool,
+        sources: &dyn SourceMap<K, S>,
+    ) -> bool {
+        let geometry = self.geometry(current.viewport_height);
+        let position = if follow {
+            ListPosition::FollowBottom
+        } else if top == 0 && self.index.is_empty() {
+            ListPosition::Top
+        } else {
+            position_at_offset(&self.index, top, geometry, sources)
+        };
+        // Equivalent positions at the same row (`Top` and an anchor on row 0)
+        // are not a change, nor is starting to follow without moving (so an
+        // enclosing scroller can take the input); releasing a follow is.
+        let changed = top != current.top_offset
+            || (self.position.is_follow_bottom() && !position.is_follow_bottom());
+        self.commit_position(position, Some(top));
+        self.resolved = Some(ResolvedPosition {
+            top_offset: top,
+            ..current
+        });
+        self.resolved_valid = true;
+        changed
+    }
+
+    /// The position estimate when it describes the resolved content (its
+    /// resident rows equal the exact total).
+    fn active_estimate(&self, current: ResolvedPosition) -> Option<PositionEstimate> {
+        self.estimate
+            .filter(|estimate| estimate.resident == current.total_height)
+    }
+
+    /// Whether the active estimate reports content beyond `edge` of the
+    /// resident rows. Following the bottom is entered only when no content
+    /// follows, because the resident bottom is then not the true tail.
+    fn more_beyond(&self, current: ResolvedPosition, edge: Edge) -> bool {
+        self.active_estimate(current)
+            .is_some_and(|estimate| match edge {
+                Edge::Top => estimate.before > 0,
+                Edge::Bottom => estimate.after > 0,
+            })
+    }
+
+    fn scroll_rows(&mut self, rows: i64, sources: &dyn SourceMap<K, S>) -> bool {
+        if rows == 0 {
+            return false;
+        }
+        let current = self.current_resolution(sources);
+        let top = current
+            .top_offset
+            .saturating_add_signed(rows)
+            .min(current.max_overscroll_top);
+        let follow =
+            rows > 0 && top == current.max_content_top && !self.more_beyond(current, Edge::Bottom);
+        self.move_to(current, top, follow, sources)
+    }
+
+    /// Move to a scrollbar fraction. Returns whether the position changed
+    /// and whether the target lies outside the resident rows described by the
+    /// position estimate.
+    fn scroll_to_fraction(&mut self, fraction: f64, sources: &dyn SourceMap<K, S>) -> (bool, bool) {
+        let current = self.current_resolution(sources);
+        let fraction = if fraction.is_finite() {
+            fraction.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let viewport = current.viewport_height;
+        let (top, outside) = self.active_estimate(current).map_or_else(
+            || (fraction_of(current.max_content_top, fraction), false),
+            |estimate| match estimate.target_for_fraction(fraction, viewport) {
+                FractionTarget::Before { .. } => (0, true),
+                FractionTarget::Resident { offset } => (offset, false),
+                FractionTarget::After { .. } => (current.max_content_top, true),
+            },
+        );
+        let top = top.min(current.max_overscroll_top);
+        let follow = current.max_content_top > 0
+            && top == current.max_content_top
+            && !self.more_beyond(current, Edge::Bottom);
+        (self.move_to(current, top, follow, sources), outside)
+    }
+
+    /// Apply an action to an uncontrolled list's own position, resolving
+    /// source anchors without a [`SourceMap`]. See [`Self::apply_action_with`].
+    pub fn apply_action(&mut self, action: &VirtualListAction<K>) -> bool {
+        self.apply_action_with(action, &NoSourceMap)
+    }
+
+    /// Apply an action to an uncontrolled list's own position and return
+    /// whether the position changed. Controlled lists return `false` without
+    /// changing anything; `Activated` never changes the position.
+    ///
+    /// Actions move relative to the most recent layout (re-resolved at the
+    /// last viewport height when content or the position changed since):
+    ///
+    /// * a downward move ending exactly at `max_content_top` enters
+    ///   [`ListPosition::FollowBottom`]; ending beyond it enters
+    ///   [`ListPosition::Overscrolled`];
+    /// * when an active position estimate reports rows after the resident
+    ///   content, reaching `max_content_top` anchors there instead of
+    ///   following, because the resident bottom is not the true tail;
+    /// * any upward request releases `FollowBottom`;
+    /// * `EdgeRequested(Top)` moves to [`ListPosition::Top`] and
+    ///   `EdgeRequested(Bottom)` to `FollowBottom`;
+    /// * pages move by [`Self::page_step`] rows per page;
+    /// * scrollbar fractions are relative to the scrollbar estimate when one is
+    ///   set and matches the exact total, otherwise to `max_content_top`;
+    /// * a scrollbar drag whose target lies before or after the resident rows,
+    ///   or an edge request toward an edge with estimated rows beyond it,
+    ///   moves to the nearest resident edge and is also queued (see
+    ///   [`Self::drain_actions`]) so the caller can load or replace the
+    ///   window;
+    /// * every action except `Activated` cancels a running motion, keeping the
+    ///   position of its last committed frame.
+    pub fn apply_action_with(
+        &mut self,
+        action: &VirtualListAction<K>,
+        sources: &dyn SourceMap<K, S>,
+    ) -> bool {
+        if self.is_controlled() {
+            return false;
+        }
+        if !matches!(action, VirtualListAction::Activated(_)) {
+            self.motion = None;
+        }
+        match action {
+            VirtualListAction::ScrollRequested { rows, .. }
+            | VirtualListAction::SelectionAutoScroll(rows) => self.scroll_rows(*rows, sources),
+            VirtualListAction::PageRequested(pages) => {
+                let viewport = self.current_resolution(sources).viewport_height;
+                let step = i64::try_from(self.page_step.rows(viewport)).unwrap_or(i64::MAX);
+                self.scroll_rows(step.saturating_mul(i64::from(*pages)), sources)
+            }
+            VirtualListAction::EdgeRequested(edge) => {
+                let current = self.current_resolution(sources);
+                if self.more_beyond(current, *edge) {
+                    self.actions.push(action.clone());
+                }
+                match edge {
+                    Edge::Top => {
+                        let changed = current.top_offset != 0 || self.position.is_follow_bottom();
+                        self.commit_position(ListPosition::Top, Some(0));
+                        self.resolved = Some(ResolvedPosition {
+                            top_offset: 0,
+                            ..current
+                        });
+                        changed
+                    }
+                    Edge::Bottom => {
+                        let follow = !self.more_beyond(current, Edge::Bottom);
+                        self.move_to(current, current.max_content_top, follow, sources)
+                    }
+                }
+            }
+            VirtualListAction::ScrollbarDrag(fraction) => {
+                let (changed, outside) = self.scroll_to_fraction(*fraction, sources);
+                if outside {
+                    self.actions.push(action.clone());
+                }
+                changed
+            }
+            VirtualListAction::Activated(_) => false,
+        }
+    }
+
+    /// Dispatch an input action: queue it in controlled mode, apply it in
+    /// uncontrolled mode (`Activated` is always queued, and actions targeting
+    /// rows outside the resident window are also queued; see
+    /// [`Self::apply_action_with`]).
+    pub fn dispatch_action(
+        &mut self,
+        action: VirtualListAction<K>,
+        sources: &dyn SourceMap<K, S>,
+    ) -> ActionDispatch {
+        if self.is_controlled() || matches!(action, VirtualListAction::Activated(_)) {
+            self.actions.push(action);
+            return ActionDispatch::Queued;
+        }
+        if self.apply_action_with(&action, sources) {
+            ActionDispatch::Applied
+        } else {
+            ActionDispatch::Unchanged
+        }
+    }
+
+    /// Queued actions, oldest first.
+    #[must_use]
+    pub fn pending_actions(&self) -> &[VirtualListAction<K>] {
+        &self.actions
+    }
+
+    /// Take queued actions, oldest first.
+    pub fn drain_actions(&mut self) -> std::vec::Drain<'_, VirtualListAction<K>> {
+        self.actions.drain(..)
+    }
+
+    fn expected_source_len(&self) -> usize {
+        let (inserted, removed) = self.pending.length_change();
+        self.index.len() + inserted - removed
+    }
+
+    fn adjust_anchor_index(&mut self, removed: &Range<usize>, inserted: usize) {
+        if let Some(position) = self.anchor_index.as_mut() {
+            if *position >= removed.end {
+                *position = *position - removed.len() + inserted;
+            } else if *position >= removed.start {
+                *position = removed.start;
+            }
+        }
+    }
+
+    /// Note that source rows `removed` were replaced by `inserted` new rows.
+    /// The next synchronization reads keys and revisions only for the noted
+    /// rows and measures only new or changed items. Ranges are in source
+    /// coordinates after all previously noted splices; an out-of-bounds range
+    /// schedules a full reconciliation.
+    pub fn note_splice(&mut self, removed: Range<usize>, inserted: usize) {
+        let current_len = self.expected_source_len();
+        if removed.start > removed.end || removed.end > current_len {
+            self.pending.full = true;
+            return;
+        }
+        self.adjust_anchor_index(&removed, inserted);
+        self.pending.note(&removed, inserted);
+    }
+
+    /// Note a resident-window splice (see [`Self::note_splice`]).
+    pub fn note_window_splice(&mut self, splice: &WindowSplice<K>) {
+        self.note_splice(splice.removed_range(), splice.inserted.len());
+    }
+
+    /// Note that one item's layout revision may have changed. The next
+    /// synchronization re-reads its revision and re-measures it when stale.
+    pub fn invalidate(&mut self, key: &K) {
+        self.pending.invalidated.insert(key.clone());
+    }
+
+    /// Schedule a full reconciliation: every key and revision is compared at
+    /// the next synchronization (only stale items are re-measured).
+    pub const fn invalidate_all(&mut self) {
+        self.pending.full = true;
+    }
+
+    /// Replace index rows `range` with caller-measured items now, without
+    /// reading the source. Items should carry the synchronized width and
+    /// capability revision; stale items are re-measured when visible or at the
+    /// next full reconciliation. Mixing this with pending noted splices
+    /// schedules one full reconciliation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MeasuredListError::OutOfBounds`] when `range` exceeds the
+    /// index and [`MeasuredListError::DuplicateKey`] when an inserted key is
+    /// already indexed outside `range` or repeated; the index is unchanged.
+    pub fn splice_measured(
+        &mut self,
+        range: Range<usize>,
+        items: impl IntoIterator<Item = MeasuredListItem<K>>,
+    ) -> Result<Vec<MeasuredListItem<K>>, MeasuredListError> {
+        self.adopt_scroll();
+        let items = items.into_iter().collect::<Vec<_>>();
+        let inserted = items.len();
+        let removed = self.index.splice(range.clone(), items)?;
+        if !self.pending.regions.is_empty() {
+            self.pending.full = true;
+        }
+        self.adjust_anchor_index(&range, inserted);
+        self.removed_layouts = self.removed_layouts.saturating_add(removed.len());
+        self.geometry_changed();
+        Ok(removed)
+    }
+
+    /// Replace one item's caller-measured geometry. Returns whether the key
+    /// is indexed.
+    pub fn update_measured(&mut self, item: MeasuredListItem<K>) -> bool {
+        self.adopt_scroll();
+        let updated = self.index.update_item(item);
+        if updated {
+            self.geometry_changed();
+        }
+        updated
+    }
+
+    const fn geometry_changed(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        self.resolved_valid = false;
+    }
+
+    /// Work counters since the most recent synchronization.
+    #[must_use]
+    pub fn render_stats(&self) -> VirtualListRenderStats {
+        self.stats.get()
+    }
+
+    fn record(&self, update: impl FnOnce(&mut VirtualListRenderStats)) {
+        let mut stats = self.stats.get();
+        update(&mut stats);
+        self.stats.set(stats);
+    }
+
+    /// Start an eased motion from the current keyed position toward `target`
+    /// (uncontrolled lists only; controlled lists ignore it and own their
+    /// [`ScrollMotion`] directly).
+    ///
+    /// The start is the position committed by the most recent frame, so a
+    /// motion started while another runs continues from where that one is.
+    /// A zero `duration` (reduce-motion) commits the target immediately.
+    /// Otherwise drive the motion with [`Self::advance_motion`] before each
+    /// layout, using the caller's time source (for example
+    /// `RuntimeHandle::now`).
+    pub fn start_motion(
+        &mut self,
+        target: ScrollTarget<K, S>,
+        easing: Easing,
+        duration: Duration,
+        now: Instant,
+    ) {
+        if self.is_controlled() {
+            return;
+        }
+        self.adopt_scroll();
+        self.motion = Some(ScrollMotion::new(
+            self.position.clone(),
+            target,
+            easing,
+            duration,
+            now,
+        ));
+        if duration.is_zero() {
+            self.advance_motion(now, Duration::ZERO, &NoSourceMap);
+        }
+    }
+
+    /// Commit the running motion's frame at `now` as the keyed position and
+    /// return when the next frame is due (`None` once the motion completed or
+    /// when none is running).
+    ///
+    /// Both endpoints are re-resolved against the current index at the most
+    /// recent layout's viewport height, so content inserted or reflowed during
+    /// the motion never strands it. Completion commits the target's exact
+    /// keyed position ([`ScrollTarget::final_position`]); a target whose key
+    /// disappeared cancels the motion where it is. Schedule the returned
+    /// instant with a keyed runtime timer (`RuntimeHandle::schedule_timer`).
+    pub fn advance_motion(
+        &mut self,
+        now: Instant,
+        frame_interval: Duration,
+        sources: &dyn SourceMap<K, S>,
+    ) -> Option<Instant> {
+        self.adopt_scroll();
+        let motion = self.motion.take()?;
+        if self.is_controlled() {
+            return None;
+        }
+        let geometry = self.geometry(self.last_viewport());
+        let position = motion.position_at(now, &self.index, geometry, sources)?;
+        let top = resolve_position(&self.index, &position, geometry, sources)
+            .map(|resolved| resolved.top_offset);
+        self.commit_position(position, top);
+        self.resolved_valid = false;
+        let next = motion.next_frame(now, frame_interval);
+        if next.is_some() {
+            self.motion = Some(motion);
+        }
+        next
+    }
+
+    /// Stop the running motion at its last committed frame. Returns whether a
+    /// motion was running.
+    pub fn cancel_motion(&mut self) -> bool {
+        self.motion.take().is_some()
+    }
+
+    /// The running motion, if any.
+    #[must_use]
+    pub const fn motion(&self) -> Option<&ScrollMotion<K, S>> {
+        self.motion.as_ref()
     }
 
     /// Capture the current top item and row within it as a stable mutation and
@@ -83,10 +1110,17 @@ where
         let start = self.index.item_offset(index).unwrap_or(0);
         let height = self.index.item(index).map_or(0, |item| item.height);
         let row = (*row).min(height.saturating_sub(1));
-        let maximum = self.index.total_height().saturating_sub(viewport_height);
+        let maximum = self.max_scroll_top(viewport_height);
         self.scroll
             .set_vertical_offset(start.saturating_add(row).min(maximum));
         self.capture_anchor();
+    }
+
+    /// Largest legacy scroll offset: `max_overscroll_top`, which equals
+    /// `total_height - viewport_height` without overscroll.
+    fn max_scroll_top(&self, viewport_height: u64) -> u64 {
+        self.geometry(viewport_height)
+            .max_overscroll_top(self.index.total_height())
     }
 
     /// Scroll so one stable item begins at the viewport top.
@@ -95,7 +1129,7 @@ where
             return false;
         };
         let start = self.index.item_offset(index).unwrap_or(0);
-        let maximum = self.index.total_height().saturating_sub(viewport_height);
+        let maximum = self.max_scroll_top(viewport_height);
         self.scroll.set_vertical_offset(start.min(maximum));
         true
     }
@@ -111,7 +1145,7 @@ where
         let start = self.index.item_offset(index).unwrap_or(0);
         let old = self.scroll.vertical_offset();
         let offset = crate::scroll_view::reveal_offset(old, viewport_height, start, item.height);
-        let maximum = self.index.total_height().saturating_sub(viewport_height);
+        let maximum = self.max_scroll_top(viewport_height);
         let next = offset.min(maximum);
         if next == old {
             return false;
@@ -141,11 +1175,12 @@ where
         self.scroll.set_vertical_offset(0);
     }
 
-    /// Move by a signed logical row delta and clamp to the collection extent.
+    /// Move by a signed logical row delta and clamp to the collection extent
+    /// (including overscroll).
     pub fn scroll_by(&mut self, rows: i64, viewport_height: u64) -> bool {
         let old = self.scroll.vertical_offset();
         let next = old.saturating_add_signed(rows);
-        let maximum = self.index.total_height().saturating_sub(viewport_height);
+        let maximum = self.max_scroll_top(viewport_height);
         self.scroll.set_vertical_offset(next.min(maximum));
         self.scroll.vertical_offset() != old
     }
@@ -157,10 +1192,10 @@ where
         self.scroll.set_follow_bottom(true);
     }
 
-    /// Clamp logical scrolling to the current collection extent without changing
-    /// whether subsequent appends are followed.
+    /// Clamp logical scrolling to the current collection extent (including
+    /// overscroll) without changing whether subsequent appends are followed.
     pub fn clamp_scroll(&mut self, viewport_height: u64) {
-        let maximum = self.index.total_height().saturating_sub(viewport_height);
+        let maximum = self.max_scroll_top(viewport_height);
         let follow_bottom = self.scroll.follows_bottom();
         self.scroll
             .set_vertical_offset(self.scroll.vertical_offset().min(maximum));
@@ -170,18 +1205,13 @@ where
     /// Logical start row for a stable key.
     #[must_use]
     pub fn item_offset(&self, key: &K) -> Option<u64> {
-        self.index
-            .index_of(key)
-            .and_then(|index| self.index.item_offset(index))
+        self.index.key_offset(key)
     }
 
     /// Measured logical height for a stable key at the synchronized width.
     #[must_use]
     pub fn item_height(&self, key: &K) -> Option<u64> {
-        self.index
-            .index_of(key)
-            .and_then(|index| self.index.item(index))
-            .map(|item| item.height)
+        self.index.item_by_key(key).map(|item| item.height)
     }
 
     /// Stable key containing one logical collection row.
@@ -200,198 +1230,607 @@ where
     }
 }
 
-/// A keyed item supplied to [`VirtualList`].
-pub struct VirtualListItem<'a, K> {
-    key: K,
-    layout_revision: u64,
-    component: Element<'a>,
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "fraction is clamped to 0..=1, so the rounded product lies in 0..=maximum"
+)]
+fn fraction_of(maximum: u64, fraction: f64) -> u64 {
+    ((maximum as f64) * fraction).round().min(maximum as f64) as u64
 }
 
-impl<'a, K> VirtualListItem<'a, K> {
-    /// Create one keyed item component.
-    #[must_use]
-    pub fn new(key: K, layout_revision: u64, component: impl Component + 'a) -> Self {
-        Self {
-            key,
-            layout_revision,
-            component: Element::new(component),
-        }
+/// Borrowed measurement inputs shared by synchronization paths.
+struct Measure<'a, 'b, Src: ?Sized> {
+    list_id: &'a str,
+    source: &'a Src,
+    width: u64,
+    environment: LayoutEnvironment,
+    layouts: &'b mut LayoutCache,
+    stats: &'b StatsCell,
+}
+
+impl<Src: ?Sized> Measure<'_, '_, Src> {
+    /// Exact height of source item `position` at the synchronized width.
+    fn height<K>(&mut self, position: usize, key: &K, revision: u64, cx: &mut LayoutCx) -> u64
+    where
+        K: ToString,
+        Src: VirtualItemSource<K>,
+    {
+        let mut stats = self.stats.get();
+        stats.measured_items = stats.measured_items.saturating_add(1);
+        let height = if let Some(node) =
+            self.source
+                .retained_layout(position, self.width, self.environment)
+        {
+            node.size.height
+        } else {
+            stats.built_items = stats.built_items.saturating_add(1);
+            let element = self.source.build(position);
+            self.layouts
+                .layout_with_revision_and_environment(
+                    item_layout_id(self.list_id, key),
+                    element.as_component(),
+                    revision,
+                    Constraints::for_width(self.width),
+                    self.environment,
+                    cx,
+                )
+                .size
+                .height
+        };
+        self.stats.set(stats);
+        height
     }
 }
 
-/// A variable-height collection that measures by stable key and paints only
-/// viewport-intersecting items.
-pub struct VirtualList<'a, K> {
-    pointer_intent: bmux_tui::pointer::PointerIntent,
-    id: String,
-    items: Vec<VirtualListItem<'a, K>>,
-}
-
-impl<'a, K> VirtualList<'a, K>
+impl<K, S> VirtualListState<K, S>
 where
     K: Clone + Ord + ToString,
+    S: Clone,
 {
-    /// Override pointer presentation without changing input routing or mouse policy.
+    /// Reconcile measurements against a source. Full `O(n)` reconciliation
+    /// runs only after [`Self::invalidate_all`], on a width or environment
+    /// change, for [`VirtualItemSource::always_reconcile`] sources, or when
+    /// the source length disagrees with the index plus noted splices
+    /// (debug-asserted, then reconciled). Otherwise only noted splices and
+    /// invalidated keys are read.
+    fn reconcile<Src: VirtualItemSource<K> + ?Sized>(
+        &mut self,
+        list_id: &str,
+        source: &Src,
+        width: u64,
+        environment: LayoutEnvironment,
+        cx: &mut LayoutCx,
+    ) {
+        // Interpret legacy offset writes against the geometry they were made in.
+        self.adopt_scroll();
+        self.stats.set(VirtualListRenderStats::default());
+        let key = SyncKey { width, environment };
+        let mut full = self.pending.full || self.synced != Some(key) || source.always_reconcile();
+        if !full {
+            let expected = self.expected_source_len();
+            debug_assert_eq!(
+                expected,
+                source.len(),
+                "virtual list source length changed without noted splices"
+            );
+            full = expected != source.len();
+        }
+        if full || !self.reconcile_incremental(list_id, source, width, environment, cx) {
+            self.reconcile_full(list_id, source, width, environment, cx);
+        }
+        self.pending = PendingChanges::new();
+        self.synced = Some(key);
+        self.sweep_layouts(list_id, false);
+    }
+
+    fn reconcile_full<Src: VirtualItemSource<K> + ?Sized>(
+        &mut self,
+        list_id: &str,
+        source: &Src,
+        width: u64,
+        environment: LayoutEnvironment,
+        cx: &mut LayoutCx,
+    ) {
+        let entries = (0..source.len())
+            .map(|position| (source.key(position), source.layout_revision(position)))
+            .collect::<Vec<_>>();
+        let capability = environment.capability_revision;
+        let unchanged = entries.len() == self.index.len()
+            && entries
+                .iter()
+                .zip(self.index.iter())
+                .all(|((key, revision), item)| {
+                    item.key == *key && item.is_valid_for(*revision, width, capability)
+                });
+        if unchanged {
+            return;
+        }
+        let Self {
+            index,
+            layouts,
+            stats,
+            ..
+        } = self;
+        let mut measure = Measure {
+            list_id,
+            source,
+            width,
+            environment,
+            layouts,
+            stats,
+        };
+        let mut lookup: Option<BTreeMap<K, (usize, u64)>> = None;
+        index.sync(entries.iter().cloned(), width, capability, |key| {
+            let lookup = lookup.get_or_insert_with(|| {
+                entries
+                    .iter()
+                    .enumerate()
+                    .map(|(position, (key, revision))| (key.clone(), (position, *revision)))
+                    .collect()
+            });
+            let (position, revision) = lookup[key];
+            measure.height(position, key, revision, cx)
+        });
+        self.geometry_changed();
+        self.sweep_layouts(list_id, true);
+    }
+
+    /// Apply noted splices and invalidations. Returns `false` when the source
+    /// disagrees with the noted changes and a full reconciliation is needed.
+    fn reconcile_incremental<Src: VirtualItemSource<K> + ?Sized>(
+        &mut self,
+        list_id: &str,
+        source: &Src,
+        width: u64,
+        environment: LayoutEnvironment,
+        cx: &mut LayoutCx,
+    ) -> bool {
+        let capability = environment.capability_revision;
+        let regions = std::mem::take(&mut self.pending.regions);
+        let invalidated = std::mem::take(&mut self.pending.invalidated);
+        let Self {
+            index,
+            layouts,
+            stats,
+            removed_layouts,
+            generation,
+            resolved_valid,
+            ..
+        } = self;
+        let mut measure = Measure {
+            list_id,
+            source,
+            width,
+            environment,
+            layouts,
+            stats,
+        };
+        // Detach every replaced range (back to front, so earlier index rows
+        // keep their positions), then insert each region's source rows front
+        // to back: after the removals plus earlier insertions, index row
+        // `new_start` is exactly source row `new_start`. Measurements of
+        // removed keys reinserted anywhere are reused.
+        let mut removed = BTreeMap::new();
+        for region in regions.iter().rev() {
+            let Ok(items) = index.remove_range(region.old_start..region.old_end) else {
+                return false;
+            };
+            removed.extend(items.into_iter().map(|item| (item.key.clone(), item)));
+        }
+        let mut reinserted = 0;
+        for region in &regions {
+            let mut items = Vec::with_capacity(region.new_len());
+            for position in region.new_start..region.new_end {
+                let key = source.key(position);
+                let revision = source.layout_revision(position);
+                let height = match removed.get(&key) {
+                    Some(item) if item.is_valid_for(revision, width, capability) => item.height,
+                    _ => measure.height(position, &key, revision, cx),
+                };
+                if removed.contains_key(&key) {
+                    reinserted += 1;
+                }
+                items.push(MeasuredListItem::new(
+                    key, revision, width, capability, height,
+                ));
+            }
+            if index.insert(region.new_start, items).is_err() {
+                return false;
+            }
+        }
+        *removed_layouts = removed_layouts.saturating_add(removed.len().saturating_sub(reinserted));
+        let mut changed = !regions.is_empty();
+        for key in invalidated {
+            let Some(position) = index.index_of(&key) else {
+                continue;
+            };
+            if regions
+                .iter()
+                .any(|region| (region.new_start..region.new_end).contains(&position))
+            {
+                continue;
+            }
+            if source.key(position) != key {
+                return false;
+            }
+            let revision = source.layout_revision(position);
+            let valid = index
+                .item(position)
+                .is_some_and(|item| item.is_valid_for(revision, width, capability));
+            if !valid {
+                let height = measure.height(position, &key, revision, cx);
+                index.update_item(MeasuredListItem::new(
+                    key, revision, width, capability, height,
+                ));
+                changed = true;
+            }
+        }
+        if changed {
+            *generation = generation.wrapping_add(1);
+            *resolved_valid = false;
+        }
+        true
+    }
+
+    /// Release retained layouts of removed keys once enough accumulate, so
+    /// retained memory tracks the current collection with amortized cost.
+    fn sweep_layouts(&mut self, list_id: &str, force: bool) {
+        if !force && self.removed_layouts <= LAYOUT_SWEEP_MIN.max(self.index.len()) {
+            return;
+        }
+        let active = self
+            .index
+            .keys()
+            .map(|key| item_layout_id(list_id, key))
+            .collect::<BTreeSet<_>>();
+        self.layouts.retain_ids(&active);
+        self.removed_layouts = 0;
+    }
+
+    /// Make sure every visible item has an exact retained layout and current
+    /// revision. Positions in `measured` were already measured during this
+    /// layout and are skipped; newly measured positions are added. Returns
+    /// whether any measured height changed.
+    fn prepare_visible<Src: VirtualItemSource<K> + ?Sized>(
+        &mut self,
+        list_id: &str,
+        source: &Src,
+        range: Range<usize>,
+        measured: &mut BTreeSet<usize>,
+        cx: &mut LayoutCx,
+    ) -> bool {
+        let Some(SyncKey { width, environment }) = self.synced else {
+            return false;
+        };
+        let capability = environment.capability_revision;
+        let mut changed = false;
+        for position in range.start..range.end.min(source.len()) {
+            if measured.contains(&position) {
+                continue;
+            }
+            let Some(item) = self.index.item(position) else {
+                continue;
+            };
+            let key = source.key(position);
+            if key != item.key {
+                // The source disagrees with the index; the caller reconciles.
+                self.pending.full = true;
+                continue;
+            }
+            let revision = source.layout_revision(position);
+            let retained = source
+                .retained_layout(position, width, environment)
+                .map(|node| node.size.height);
+            let current = item.is_valid_for(revision, width, capability)
+                && (retained.is_some()
+                    || self
+                        .layouts
+                        .get_with_environment(
+                            &item_layout_id(list_id, &key),
+                            revision,
+                            Constraints::for_width(width),
+                            environment,
+                        )
+                        .is_some());
+            let previous = item.height;
+            if current && retained.is_none_or(|height| height == previous) {
+                continue;
+            }
+            let height = Measure {
+                list_id,
+                source,
+                width,
+                environment,
+                layouts: &mut self.layouts,
+                stats: &self.stats,
+            }
+            .height(position, &key, revision, cx);
+            measured.insert(position);
+            self.index.update_item(MeasuredListItem::new(
+                key, revision, width, capability, height,
+            ));
+            if height != previous {
+                changed = true;
+                self.geometry_changed();
+            }
+        }
+        changed
+    }
+
+    /// Source position of the item at index row `index` when the source still
+    /// holds that same item (same key and layout revision) there, accounting
+    /// for splices noted since the last synchronization. Paint and event use
+    /// only such items, so a node is never painted or routed with another
+    /// item's retained layout.
+    fn placed_source_position<Src: VirtualItemSource<K> + ?Sized>(
+        &self,
+        source: &Src,
+        index: usize,
+    ) -> Option<usize> {
+        let item = self.index.item(index)?;
+        let position = self.pending.source_row(index)?;
+        (position < source.len()
+            && source.key(position) == item.key
+            && source.layout_revision(position) == item.layout_revision)
+            .then_some(position)
+    }
+}
+
+/// Erases a borrowed component so eager items can be lent as [`Element`]s.
+struct BorrowedComponent<'a>(&'a dyn Component);
+
+impl Component for BorrowedComponent<'_> {
+    fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
+        self.0.layout(constraints, cx)
+    }
+
+    fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
+        self.0.paint(layout, cx);
+    }
+
+    fn event(&self, event: &Event, layout: &LayoutNode, cx: &mut EventCx<'_>) -> EventOutcome {
+        self.0.event(event, layout, cx)
+    }
+
+    fn revision(&self) -> ComponentRevision {
+        self.0.revision()
+    }
+}
+
+/// A virtualized list over a lazy [`VirtualItemSource`].
+///
+/// This is the shared measurement, painting, and event implementation; the
+/// eager [`VirtualList`] builder delegates to it.
+pub struct VirtualSourceList<'a, Src: ?Sized> {
+    id: Cow<'a, str>,
+    source: &'a Src,
+    pointer_intent: PointerIntent,
+}
+
+impl<'a, Src: ?Sized> VirtualSourceList<'a, Src> {
+    /// Create a list over `source` with a stable semantic identifier prefix.
     #[must_use]
-    pub const fn pointer_intent(mut self, intent: bmux_tui::pointer::PointerIntent) -> Self {
+    pub fn new(id: impl Into<Cow<'a, str>>, source: &'a Src) -> Self {
+        Self {
+            id: id.into(),
+            source,
+            pointer_intent: PointerIntent::Auto,
+        }
+    }
+
+    /// Override pointer presentation without changing input routing.
+    #[must_use]
+    pub const fn pointer_intent(mut self, intent: PointerIntent) -> Self {
         self.pointer_intent = intent;
         self
     }
 
-    /// Create an empty collection with a stable semantic identifier prefix.
-    #[must_use]
-    pub fn new(id: impl Into<String>) -> Self {
-        Self {
-            id: id.into(),
-            pointer_intent: bmux_tui::pointer::PointerIntent::Auto,
-            items: Vec::new(),
-        }
-    }
-
-    /// Append one keyed item using the component's declared layout revision.
-    #[must_use]
-    pub fn component(mut self, key: K, component: impl Component + 'a) -> Self {
-        let revision = component.revision();
-        self.items
-            .push(VirtualListItem::new(key, revision.layout, component));
-        self
-    }
-
-    /// Append one keyed item with an externally managed layout revision.
-    #[must_use]
-    pub fn item(mut self, key: K, layout_revision: u64, component: impl Component + 'a) -> Self {
-        self.items
-            .push(VirtualListItem::new(key, layout_revision, component));
-        self
-    }
-
-    /// Synchronize exact current-width measurements, retaining unchanged keyed
-    /// layouts across reorder. This checks the collection's keys and revisions;
-    /// reuse retained state for pure scrolling without calling this again. Sync
-    /// before painting after item, layout revision, width, or environment changes.
-    ///
-    /// # Panics
-    ///
-    /// Panics if stable item keys or their string representations are duplicated.
-    pub fn sync(&self, width: u64, state: &mut VirtualListState<K>, cx: &mut LayoutCx) {
+    /// Reconcile exact measurements at `width` in the default environment.
+    /// See [`Self::sync_with_environment`].
+    pub fn sync<K, S>(&self, width: u64, state: &mut VirtualListState<K, S>, cx: &mut LayoutCx)
+    where
+        K: Clone + Ord + ToString,
+        S: Clone,
+        Src: VirtualItemSource<K>,
+    {
         self.sync_with_environment(width, LayoutEnvironment::default(), state, cx);
     }
 
-    /// Synchronize exact measurements with geometry-affecting terminal
-    /// capability inputs included in both retained cache layers.
+    /// Reconcile exact measurements at `width` and `environment`.
+    ///
+    /// Only noted splices ([`VirtualListState::note_splice`]) and invalidated
+    /// keys are read, and only new or changed items are built for measurement.
+    /// A full `O(n)` comparison (still measuring only stale items) runs after
+    /// [`VirtualListState::invalidate_all`], on a width or environment change,
+    /// for [`VirtualItemSource::always_reconcile`] sources, or when the source
+    /// length disagrees with the noted changes.
     ///
     /// # Panics
     ///
-    /// Panics if stable item keys or their string representations are duplicated.
-    pub fn sync_with_environment(
+    /// Panics in debug builds when the source length changed without noted
+    /// splices (release builds reconcile fully instead).
+    pub fn sync_with_environment<K, S>(
         &self,
         width: u64,
         environment: LayoutEnvironment,
-        state: &mut VirtualListState<K>,
+        state: &mut VirtualListState<K, S>,
         cx: &mut LayoutCx,
-    ) {
-        let active = self
-            .items
-            .iter()
-            .map(|item| item_layout_id(&self.id, &item.key))
-            .collect::<BTreeSet<_>>();
-        assert_eq!(
-            active.len(),
-            self.items.len(),
-            "virtual list keys must have unique string representations"
-        );
-        let by_key = self
-            .items
-            .iter()
-            .map(|item| (&item.key, item))
-            .collect::<std::collections::BTreeMap<_, _>>();
-        state.index.sync(
-            self.items
-                .iter()
-                .map(|item| (item.key.clone(), item.layout_revision)),
-            width,
-            environment.capability_revision,
-            |key| {
-                let item = by_key.get(key).expect("synchronized key must exist");
-                state
-                    .layouts
-                    .layout_with_revision_and_environment(
-                        item_layout_id(&self.id, key),
-                        item.component.as_component(),
-                        item.layout_revision,
-                        Constraints::for_width(width),
-                        environment,
-                        cx,
-                    )
-                    .size
-                    .height
-            },
-        );
-        state.layouts.retain_ids(&active);
+    ) where
+        K: Clone + Ord + ToString,
+        S: Clone,
+        Src: VirtualItemSource<K>,
+    {
+        state.reconcile(&self.id, self.source, width, environment, cx);
     }
 
-    /// Paint only visible items and register full visible item hit rectangles.
+    /// Synchronize, resolve the position for a viewport, and make sure every
+    /// visible item has an exact retained layout.
+    ///
+    /// Visible items' keys and revisions are re-read, so a visible item whose
+    /// revision changed without [`VirtualListState::invalidate`] is still
+    /// re-measured. When that changes a height, the position is re-resolved
+    /// and the newly visible range prepared again until it is stable; each
+    /// item is measured at most once per layout, so this terminates after at
+    /// most one pass per newly measured item. A visible key that disagrees
+    /// with the index triggers one full reconciliation within the same
+    /// layout.
     ///
     /// # Panics
     ///
-    /// Panics if called before synchronizing the list at `area.width`.
-    pub fn paint(
+    /// See [`Self::sync_with_environment`].
+    pub fn layout<K, S>(
+        &self,
+        width: u64,
+        environment: LayoutEnvironment,
+        viewport_height: u64,
+        sources: &dyn SourceMap<K, S>,
+        state: &mut VirtualListState<K, S>,
+        cx: &mut LayoutCx,
+    ) -> VirtualListLayout
+    where
+        K: Clone + Ord + ToString,
+        S: Clone,
+        Src: VirtualItemSource<K>,
+    {
+        self.sync_with_environment(width, environment, state, cx);
+        let mut resolved = state.resolve_layout(viewport_height, sources);
+        let mut measured = BTreeSet::new();
+        let mut reconciled = false;
+        loop {
+            let visible = state
+                .index
+                .visible_range(resolved.top_offset, viewport_height);
+            let changed = state.prepare_visible(
+                &self.id,
+                self.source,
+                visible.start..visible.end,
+                &mut measured,
+                cx,
+            );
+            if state.pending.full && !reconciled {
+                // A visible key disagreed with the index: reconcile now
+                // rather than placing a mismatched item for this frame.
+                reconciled = true;
+                measured.clear();
+                self.sync_with_environment(width, environment, state, cx);
+            } else if !changed {
+                break;
+            }
+            resolved = state.resolve_layout(viewport_height, sources);
+        }
+        VirtualListLayout {
+            resolved,
+            visible: state
+                .index
+                .visible_range(resolved.top_offset, viewport_height),
+        }
+    }
+
+    /// Paint only visible items at the state's current top offset and
+    /// register their visible hit, focus, semantic, and damage regions.
+    ///
+    /// Only items the source still holds unchanged (same key and layout
+    /// revision, after noted splices) and that have a retained layout at
+    /// `area.width` are painted; synchronize at that width first.
+    pub fn paint<K, S>(
         &self,
         area: Rect,
-        state: &VirtualListState<K>,
+        state: &VirtualListState<K, S>,
         cx: &mut PaintCx<'_, '_>,
-    ) -> VirtualListRenderStats {
+    ) -> VirtualListRenderStats
+    where
+        K: Clone + Ord + ToString,
+        S: Clone,
+        Src: VirtualItemSource<K>,
+    {
         let offset = state.scroll.vertical_offset();
-        let clip = cx.area();
-        let first = u64::try_from(clip.y.max(0))
-            .unwrap_or(u64::MAX)
-            .min(u64::from(area.height));
-        let end = u64::try_from(clip.y.saturating_add(i64::from(clip.height)).max(0))
-            .unwrap_or(u64::MAX)
-            .min(u64::from(area.height));
-        let mut report = VirtualListRenderStats::default();
-        if end <= first
-            || clip.width == 0
-            || clip.x >= i32::from(area.width)
-            || clip.x.saturating_add(i32::from(clip.width)) <= 0
-        {
-            return report;
-        }
+        let Some(rows) = clip_rows(area, cx) else {
+            state.record(|stats| {
+                stats.painted_items = 0;
+                stats.registered_items = 0;
+            });
+            return VirtualListRenderStats::default();
+        };
         let range = state
             .index
-            .visible_range(offset.saturating_add(first), end - first);
-        for index in range.start..range.end {
-            let Some(item) = self.items.get(index) else {
-                continue;
-            };
-            let Some(measured) = state.index.item(index) else {
-                continue;
-            };
-            let Some(start) = state.index.item_offset(index) else {
-                continue;
-            };
-            let layout_id = item_layout_id(&self.id, &item.key);
-            let constraints = Constraints::for_width(area.width.into());
-            let layout = state
-                .layouts
-                .get(&layout_id, item.layout_revision, constraints)
-                .expect("visible synchronized item must have retained layout");
-            debug_assert_eq!(layout.size.height, measured.height);
-            let local_y = i64::try_from(start)
-                .unwrap_or(i64::MAX)
-                .saturating_sub(i64::try_from(offset).unwrap_or(i64::MAX));
+            .visible_range(offset.saturating_add(rows.start), rows.end - rows.start);
+        let environment = state.synced.map(|key| key.environment).unwrap_or_default();
+        let items = (range.start..range.end).filter_map(|index| {
+            let item = self.placed_item(state, index)?;
+            let layout = find_item_layout(
+                self.source,
+                &state.layouts,
+                item.position,
+                &item.id,
+                item.layout_revision,
+                area.width.into(),
+                environment,
+            )?;
+            debug_assert_eq!(layout.size.height, item.height);
+            Some((item, layout))
+        });
+        let report = self.paint_items(area, offset, items, cx);
+        state.record(|stats| {
+            stats.painted_items = report.painted_items;
+            stats.registered_items = report.registered_items;
+            stats.built_items = stats.built_items.saturating_add(report.built_items);
+        });
+        report
+    }
+
+    /// The item at index row `index` placed at its measured row, when the
+    /// source still holds it unchanged (see
+    /// [`VirtualListState::placed_source_position`]).
+    fn placed_item<K, S>(&self, state: &VirtualListState<K, S>, index: usize) -> Option<PlacedItem>
+    where
+        K: Clone + Ord + ToString,
+        S: Clone,
+        Src: VirtualItemSource<K>,
+    {
+        let position = state.placed_source_position(self.source, index)?;
+        let measured = state.index.item(index)?;
+        Some(PlacedItem {
+            index,
+            position,
+            start: state.index.item_offset(index)?,
+            height: measured.height,
+            layout_revision: measured.layout_revision,
+            id: item_layout_id(&self.id, &measured.key),
+        })
+    }
+
+    /// Paint placed items with the viewport's first row at collection row
+    /// `top`, registering each item's visible hit, focus, semantic, and damage
+    /// regions. Returns painted, registered, and built counts.
+    fn paint_items<'n, K>(
+        &self,
+        area: Rect,
+        top: u64,
+        items: impl IntoIterator<Item = (PlacedItem, &'n LayoutNode)>,
+        cx: &mut PaintCx<'_, '_>,
+    ) -> VirtualListRenderStats
+    where
+        Src: VirtualItemSource<K>,
+    {
+        let mut report = VirtualListRenderStats::default();
+        for (item, layout) in items {
+            let element = self.source.build(item.position);
+            report.built_items = report.built_items.saturating_add(1);
+            let local_y = signed_row(item.start).saturating_sub(signed_row(top));
             let visible = translated_item_area(
                 Rect::new(0, 0, area.width, area.height),
                 local_y,
-                measured.height,
+                item.height,
             );
             cx.with_child(
                 0,
                 local_y,
                 LocalRect::new(0, -local_y, area.width, area.height),
-                |cx| cx.with_child_size(0, 0, layout.size, |cx| item.component.paint(layout, cx)),
+                |cx| cx.with_child_size(0, 0, layout.size, |cx| element.paint(layout, cx)),
             );
-            let semantic_id = format!("{}.item.{}", self.id, item.key.to_string());
+            let semantic_id = item.id.as_str().to_owned();
             cx.push_hit(
                 HitRegion::new(semantic_id.clone(), visible)
                     .role(HitRole::ListItem)
@@ -417,90 +1856,388 @@ where
     ///
     /// Mouse events are offered only to the visible item under the pointer.
     /// Non-positional events traverse visible items from bottom to top until
-    /// handled.
-    ///
-    /// # Panics
-    ///
-    /// Panics if called before synchronizing the list at `area.width`.
-    pub fn event(
+    /// handled. Items changed or replaced since the last synchronization
+    /// (including through splices noted since) are skipped, so an event never
+    /// reaches a different item than the one laid out at its position.
+    pub fn event<K, S>(
         &self,
         area: Rect,
-        state: &VirtualListState<K>,
+        state: &VirtualListState<K, S>,
         event: &Event,
         cx: &mut EventCx<'_>,
-    ) -> EventOutcome {
+    ) -> EventOutcome
+    where
+        K: Clone + Ord + ToString,
+        S: Clone,
+        Src: VirtualItemSource<K>,
+    {
         let offset = state.scroll.vertical_offset();
         let range = state.index.visible_range(offset, u64::from(area.height));
-        let viewport = cx.visible_rect(LogicalRect::new(
-            area.x.into(),
-            u64::try_from(usize::from(area.y)).unwrap_or(u64::MAX),
-            u64::try_from(usize::from(area.width)).unwrap_or(u64::MAX),
-            u64::from(area.height),
-        ));
+        let environment = state.synced.map(|key| key.environment).unwrap_or_default();
+        let items = (range.start..range.end)
+            .filter_map(|index| self.placed_item(state, index))
+            .collect::<Vec<_>>();
+        let width = u64::from(area.width);
+        let routed = self.route_items(area, offset, items, event, cx, |item| {
+            find_item_layout(
+                self.source,
+                &state.layouts,
+                item.position,
+                &item.id,
+                item.layout_revision,
+                width,
+                environment,
+            )
+            .map(Cow::Borrowed)
+        });
+        state.record(|stats| {
+            stats.built_items = stats.built_items.saturating_add(routed.built);
+        });
+        routed.outcome
+    }
+
+    /// Route an event through placed items (topmost first) with the
+    /// viewport's first row at collection row `top`. `layout_of` supplies an
+    /// item's retained layout, and is called only for items the event is
+    /// actually offered to.
+    fn route_items<'n, K>(
+        &self,
+        area: Rect,
+        top: u64,
+        items: impl IntoIterator<Item = PlacedItem, IntoIter: DoubleEndedIterator>,
+        event: &Event,
+        cx: &mut EventCx<'_>,
+        mut layout_of: impl FnMut(&PlacedItem) -> Option<Cow<'n, LayoutNode>>,
+    ) -> RoutedEvent
+    where
+        Src: VirtualItemSource<K>,
+    {
+        let mut routed = RoutedEvent {
+            outcome: EventOutcome::Ignored,
+            target: None,
+            built: 0,
+        };
+        let viewport = cx.visible_rect(logical_rect(area));
         if viewport.is_empty() {
-            return EventOutcome::Ignored;
+            return routed;
         }
         let pointer = match event {
-            Event::Mouse(mouse) if !viewport.contains(mouse.position) => {
-                return EventOutcome::Ignored;
-            }
+            Event::Mouse(mouse) if !viewport.contains(mouse.position) => return routed,
             Event::Mouse(mouse) => Some(mouse.position),
             _ => None,
         };
-        for index in (range.start..range.end).rev() {
-            let Some(item) = self.items.get(index) else {
-                continue;
-            };
-            let Some(measured) = state.index.item(index) else {
-                continue;
-            };
-            let Some(start) = state.index.item_offset(index) else {
-                continue;
-            };
-            let layout_id = item_layout_id(&self.id, &item.key);
-            let constraints = Constraints::for_width(area.width.into());
-            let layout = state
-                .layouts
-                .get(&layout_id, item.layout_revision, constraints)
-                .expect("visible synchronized item must have retained layout");
-            debug_assert_eq!(layout.size.height, measured.height);
-            let local_y = i64::try_from(start)
-                .unwrap_or(i64::MAX)
-                .saturating_sub(i64::try_from(offset).unwrap_or(i64::MAX));
-            let local_area = translated_item_area(area, local_y, measured.height);
-            let item_area = cx.visible_rect(LogicalRect::new(
-                local_area.x.into(),
-                u64::try_from(usize::from(local_area.y)).unwrap_or(u64::MAX),
-                u64::try_from(usize::from(local_area.width)).unwrap_or(u64::MAX),
-                u64::try_from(usize::from(local_area.height)).unwrap_or(u64::MAX),
-            ));
+        for item in items.into_iter().rev() {
+            let local_y = signed_row(item.start).saturating_sub(signed_row(top));
+            let local_area = translated_item_area(area, local_y, item.height);
+            let item_area = cx.visible_rect(logical_rect(local_area));
             if item_area.is_empty() || pointer.is_some_and(|point| !item_area.contains(point)) {
                 continue;
             }
+            let Some(layout) = layout_of(&item) else {
+                continue;
+            };
+            let layout = layout.as_ref();
+            let element = self.source.build(item.position);
+            routed.built = routed.built.saturating_add(1);
             let outcome = cx.with_transform(
                 0,
-                start,
+                item.start,
                 i32::from(area.x),
                 i64::from(area.y).saturating_add(local_y),
                 item_area,
-                |cx| cx.with_root(layout, |cx| item.component.event(event, layout, cx)),
+                |cx| cx.with_root(layout, |cx| element.event(event, layout, cx)),
             );
-            if outcome.is_handled() {
-                return outcome;
-            }
-            if pointer.is_some() {
-                return EventOutcome::Ignored;
+            if outcome.is_handled() || pointer.is_some() {
+                routed.outcome = outcome;
+                routed.target = pointer.map(|_| item.index);
+                return routed;
             }
         }
-        EventOutcome::Ignored
+        routed
+    }
+}
+
+/// One visible item placed for painting or event routing.
+struct PlacedItem {
+    /// Index row (as of the last synchronization).
+    index: usize,
+    /// Current source position of the same item.
+    position: usize,
+    /// Collection row of the item's first row.
+    start: u64,
+    /// Exact measured height.
+    height: u64,
+    /// Layout revision the retained layout was measured at.
+    layout_revision: u64,
+    /// Stable item identity, also its semantic and hit identifier.
+    id: LayoutId,
+}
+
+/// Result of routing one event through placed items.
+struct RoutedEvent {
+    outcome: EventOutcome,
+    /// Index row of the item under the pointer, for mouse events that
+    /// reached an item.
+    target: Option<usize>,
+    /// Items constructed to route the event.
+    built: usize,
+}
+
+/// Viewport rows of `area` visible through the paint clip.
+fn clip_rows(area: Rect, cx: &PaintCx<'_, '_>) -> Option<Range<u64>> {
+    let clip = cx.area();
+    let first = u64::try_from(clip.y.max(0))
+        .unwrap_or(u64::MAX)
+        .min(u64::from(area.height));
+    let end = u64::try_from(clip.y.saturating_add(i64::from(clip.height)).max(0))
+        .unwrap_or(u64::MAX)
+        .min(u64::from(area.height));
+    let hidden = end <= first
+        || clip.width == 0
+        || clip.x >= i32::from(area.width)
+        || clip.x.saturating_add(i32::from(clip.width)) <= 0;
+    (!hidden).then_some(first..end)
+}
+
+fn signed_row(row: u64) -> i64 {
+    i64::try_from(row).unwrap_or(i64::MAX)
+}
+
+fn logical_rect(area: Rect) -> LogicalRect {
+    LogicalRect::new(
+        area.x.into(),
+        u64::from(area.y),
+        u64::from(area.width),
+        u64::from(area.height),
+    )
+}
+
+fn find_item_layout<'s, K, Src: VirtualItemSource<K> + ?Sized>(
+    source: &'s Src,
+    layouts: &'s LayoutCache,
+    position: usize,
+    layout_id: &LayoutId,
+    layout_revision: u64,
+    width: u64,
+    environment: LayoutEnvironment,
+) -> Option<&'s LayoutNode> {
+    source
+        .retained_layout(position, width, environment)
+        .or_else(|| {
+            layouts.get_with_environment(
+                layout_id,
+                layout_revision,
+                Constraints::for_width(width),
+                environment,
+            )
+        })
+}
+
+/// A keyed item supplied to [`VirtualList`].
+pub struct VirtualListItem<'a, K> {
+    key: K,
+    layout_revision: u64,
+    component: Element<'a>,
+}
+
+impl<'a, K> VirtualListItem<'a, K> {
+    /// Create one keyed item component.
+    #[must_use]
+    pub fn new(key: K, layout_revision: u64, component: impl Component + 'a) -> Self {
+        Self {
+            key,
+            layout_revision,
+            component: Element::new(component),
+        }
+    }
+}
+
+/// A variable-height collection that measures by stable key and paints only
+/// viewport-intersecting items.
+///
+/// This eager builder holds every item component and implements
+/// [`VirtualItemSource`]; each synchronization compares every key and
+/// revision. Prefer a lazy [`VirtualItemSource`] with [`VirtualSourceList`]
+/// for large collections.
+pub struct VirtualList<'a, K> {
+    pointer_intent: PointerIntent,
+    id: String,
+    items: Vec<VirtualListItem<'a, K>>,
+}
+
+impl<K: Clone> VirtualItemSource<K> for VirtualList<'_, K> {
+    fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    fn key(&self, index: usize) -> K {
+        self.items[index].key.clone()
+    }
+
+    fn layout_revision(&self, index: usize) -> u64 {
+        self.items[index].layout_revision
+    }
+
+    fn paint_revision(&self, index: usize) -> u64 {
+        self.items[index].component.revision().paint
+    }
+
+    fn build(&self, index: usize) -> Element<'_> {
+        Element::new(BorrowedComponent(
+            self.items[index].component.as_component(),
+        ))
+    }
+
+    fn always_reconcile(&self) -> bool {
+        true
+    }
+}
+
+impl<'a, K> VirtualList<'a, K>
+where
+    K: Clone + Ord + ToString,
+{
+    /// Override pointer presentation without changing input routing or mouse policy.
+    #[must_use]
+    pub const fn pointer_intent(mut self, intent: PointerIntent) -> Self {
+        self.pointer_intent = intent;
+        self
+    }
+
+    /// Create an empty collection with a stable semantic identifier prefix.
+    #[must_use]
+    pub fn new(id: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            pointer_intent: PointerIntent::Auto,
+            items: Vec::new(),
+        }
+    }
+
+    /// Append one keyed item using the component's declared layout revision.
+    #[must_use]
+    pub fn component(mut self, key: K, component: impl Component + 'a) -> Self {
+        let revision = component.revision();
+        self.items
+            .push(VirtualListItem::new(key, revision.layout, component));
+        self
+    }
+
+    /// Append one keyed item with an externally managed layout revision.
+    #[must_use]
+    pub fn item(mut self, key: K, layout_revision: u64, component: impl Component + 'a) -> Self {
+        self.items
+            .push(VirtualListItem::new(key, layout_revision, component));
+        self
+    }
+
+    fn as_source(&self) -> VirtualSourceList<'_, Self> {
+        VirtualSourceList::new(self.id.as_str(), self).pointer_intent(self.pointer_intent)
+    }
+
+    /// Synchronize exact current-width measurements, retaining unchanged keyed
+    /// layouts across reorder. This checks the collection's keys and revisions;
+    /// reuse retained state for pure scrolling without calling this again. Sync
+    /// before painting after item, layout revision, width, or environment changes.
+    ///
+    /// # Panics
+    ///
+    /// Panics if stable item keys or their string representations are duplicated.
+    pub fn sync<S: Clone>(
+        &self,
+        width: u64,
+        state: &mut VirtualListState<K, S>,
+        cx: &mut LayoutCx,
+    ) {
+        self.sync_with_environment(width, LayoutEnvironment::default(), state, cx);
+    }
+
+    /// Synchronize exact measurements with geometry-affecting terminal
+    /// capability inputs included in both retained cache layers.
+    ///
+    /// # Panics
+    ///
+    /// Panics if stable item keys or their string representations are duplicated.
+    pub fn sync_with_environment<S: Clone>(
+        &self,
+        width: u64,
+        environment: LayoutEnvironment,
+        state: &mut VirtualListState<K, S>,
+        cx: &mut LayoutCx,
+    ) {
+        self.assert_unique_ids();
+        self.as_source()
+            .sync_with_environment(width, environment, state, cx);
+    }
+
+    fn assert_unique_ids(&self) {
+        let active = self
+            .items
+            .iter()
+            .map(|item| item_layout_id(&self.id, &item.key))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            active.len(),
+            self.items.len(),
+            "virtual list keys must have unique string representations"
+        );
+    }
+
+    /// Synchronize, resolve the keyed position for a viewport, and make sure
+    /// visible items have retained layouts. See [`VirtualSourceList::layout`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if stable item keys or their string representations are duplicated.
+    pub fn layout<S: Clone>(
+        &self,
+        width: u64,
+        environment: LayoutEnvironment,
+        viewport_height: u64,
+        sources: &dyn SourceMap<K, S>,
+        state: &mut VirtualListState<K, S>,
+        cx: &mut LayoutCx,
+    ) -> VirtualListLayout {
+        self.assert_unique_ids();
+        self.as_source()
+            .layout(width, environment, viewport_height, sources, state, cx)
+    }
+
+    /// Paint only visible items and register full visible item hit rectangles.
+    ///
+    /// Synchronize the list at `area.width` first; items without a retained
+    /// layout at that width are skipped.
+    pub fn paint<S: Clone>(
+        &self,
+        area: Rect,
+        state: &VirtualListState<K, S>,
+        cx: &mut PaintCx<'_, '_>,
+    ) -> VirtualListRenderStats {
+        self.as_source().paint(area, state, cx)
+    }
+
+    /// Route an event only through viewport-intersecting items, using the same
+    /// retained layout, translation, clipping, and topmost-first order as paint.
+    ///
+    /// Mouse events are offered only to the visible item under the pointer.
+    /// Non-positional events traverse visible items from bottom to top until
+    /// handled. Items without a retained layout at `area.width` are skipped.
+    pub fn event<S: Clone>(
+        &self,
+        area: Rect,
+        state: &VirtualListState<K, S>,
+        event: &Event,
+        cx: &mut EventCx<'_>,
+    ) -> EventOutcome {
+        self.as_source().event(area, state, event, cx)
     }
 
     /// Scroll so the keyed item is visible with the minimum movement.
     ///
     /// Returns whether the key exists, even if its viewport offset is unchanged.
-    pub fn ensure_item_visible(
+    pub fn ensure_item_visible<S: Clone>(
         &self,
-        state: &mut VirtualListState<K>,
+        state: &mut VirtualListState<K, S>,
         key: &K,
         viewport_height: u64,
     ) -> bool {
@@ -513,17 +2250,8 @@ where
 
     /// Logical start row for a stable key.
     #[must_use]
-    pub fn item_offset(&self, state: &VirtualListState<K>, key: &K) -> Option<u64> {
+    pub fn item_offset<S: Clone>(&self, state: &VirtualListState<K, S>, key: &K) -> Option<u64> {
         state.item_offset(key)
-    }
-}
-
-impl<K> Default for VirtualListState<K>
-where
-    K: Clone + Ord,
-{
-    fn default() -> Self {
-        Self::new(0)
     }
 }
 
@@ -543,6 +2271,9 @@ fn translated_item_area(area: Rect, local_y: i64, item_height: u64) -> Rect {
         u16::try_from(visible_bottom.saturating_sub(visible_top)).unwrap_or(u16::MAX),
     )
 }
+
+#[cfg(test)]
+mod state_tests;
 
 #[cfg(test)]
 mod tests {

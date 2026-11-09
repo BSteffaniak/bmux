@@ -24,6 +24,7 @@ use crate::scrollbar::{
     Scrollbar, ScrollbarOrientation, ScrollbarOutcome, ScrollbarPolicy, ScrollbarState,
     ScrollbarStyles,
 };
+pub(crate) use crate::scrollbar::{logical_offset_from_scrollbar, scrollbar_state};
 use crate::scrollbar_layout::{ScrollbarAxisLayoutMode, ScrollbarLayoutPolicy, scrollbar_layout};
 
 /// Admission policy for a viewport that preserves whole measured items.
@@ -130,6 +131,12 @@ impl ScrollViewState {
     #[must_use]
     pub const fn dragging_scrollbar(self) -> bool {
         self.dragging.is_some()
+    }
+
+    /// Release any integrated scrollbar drag capture.
+    #[cfg(feature = "virtual-list")]
+    pub(crate) const fn release_scrollbar(&mut self) {
+        self.dragging = None;
     }
 }
 
@@ -289,18 +296,12 @@ impl TrackScrollbar {
         }
         let maximum = extent.max_offset();
         let old = state.vertical_offset.min(maximum);
-        let mut scrollbar = scrollbar_state(extent.content, extent.viewport, old);
-        scrollbar.dragging = dragging;
-        let result =
-            Scrollbar::new()
-                .policy(self.policy)
-                .handle_event(track, &mut scrollbar, event);
-        state.dragging = scrollbar.dragging.then_some(ScrollbarOrientation::Vertical);
-        match result {
+        let model = scrollbar_state(extent.content, extent.viewport, old);
+        match route_vertical_track(self.policy, track, model, state, event) {
             ScrollbarOutcome::Changed { offset } => {
                 state.vertical_offset = logical_offset_from_scrollbar(
                     u64::from(offset),
-                    u64::from(scrollbar.max_offset()),
+                    u64::from(model.max_offset()),
                     maximum,
                 );
                 state.follow_bottom = state.vertical_offset == maximum;
@@ -899,23 +900,24 @@ impl ScrollView {
         if let Some(scrollbar_area) = resolved.vertical_scrollbar
             && state.dragging != Some(ScrollbarOrientation::Horizontal)
         {
-            let mut scrollbar = scrollbar_state(
+            let model = scrollbar_state(
                 content_height(layout),
                 layout.size.height,
                 state.vertical_offset,
             );
-            scrollbar.dragging = state.dragging == Some(ScrollbarOrientation::Vertical);
-            let result = Scrollbar::new()
-                .policy(self.vertical_scrollbar_policy)
-                .handle_event(scrollbar_area, &mut scrollbar, event);
-            state.dragging = scrollbar.dragging.then_some(ScrollbarOrientation::Vertical);
-            match result {
+            match route_vertical_track(
+                self.vertical_scrollbar_policy,
+                scrollbar_area,
+                model,
+                state,
+                event,
+            ) {
                 ScrollbarOutcome::Changed { offset } => {
                     let old = state.vertical_offset;
                     let maximum = Self::max_vertical_offset(layout);
                     state.vertical_offset = logical_offset_from_scrollbar(
                         u64::from(offset),
-                        u64::from(scrollbar.max_offset()),
+                        u64::from(model.max_offset()),
                         maximum,
                     );
                     state.follow_bottom = state.vertical_offset == maximum;
@@ -1132,11 +1134,7 @@ impl ScrollView {
         if state.interaction.disabled {
             return ScrollViewOutcome::Ignored;
         }
-        let amount = i64::from(request.intensity.max(1));
-        let delta = match request.direction {
-            SelectionScrollDirection::Backward => -amount,
-            SelectionScrollDirection::Forward => amount,
-        };
+        let delta = selection_auto_scroll_delta(request);
         match request.axis {
             SelectionScrollAxis::Vertical => Self::scroll_vertical_by(layout, state, delta),
             SelectionScrollAxis::Horizontal => Self::scroll_horizontal_by(layout, state, delta),
@@ -1413,24 +1411,33 @@ impl Default for ScrollView {
     }
 }
 
-pub(crate) fn scrollbar_state(total: u64, viewport: u64, offset: u64) -> ScrollbarState {
-    let maximum = total.saturating_sub(viewport);
-    let scaled_total = u16::try_from(total).unwrap_or(u16::MAX);
-    let scaled_viewport = if maximum == 0 {
-        scaled_total
-    } else {
-        u16::try_from((u128::from(scaled_total) * u128::from(viewport)) / u128::from(total.max(1)))
-            .unwrap_or(u16::MAX)
-            .max(1)
-    };
-    let scrollbar_maximum = scaled_total.saturating_sub(scaled_viewport);
-    let scaled_offset = if maximum == 0 {
-        0
-    } else {
-        u16::try_from((u128::from(scrollbar_maximum) * u128::from(offset)) / u128::from(maximum))
-            .unwrap_or(scrollbar_maximum)
-    };
-    ScrollbarState::new(scaled_total, scaled_viewport).offset(scaled_offset)
+/// Route one event through a vertical scrollbar on `track` (terminal
+/// coordinates) whose thumb geometry is `model`, keeping drag capture in
+/// `state`. Shared by every integrated vertical scrollbar so capture, track
+/// clicks, and thumb dragging behave identically.
+pub(crate) fn route_vertical_track(
+    policy: ScrollbarPolicy,
+    track: Rect,
+    mut model: ScrollbarState,
+    state: &mut ScrollViewState,
+    event: &Event,
+) -> ScrollbarOutcome {
+    model.dragging = state.dragging == Some(ScrollbarOrientation::Vertical);
+    let result = Scrollbar::new()
+        .policy(policy)
+        .handle_event(track, &mut model, event);
+    state.dragging = model.dragging.then_some(ScrollbarOrientation::Vertical);
+    result
+}
+
+/// Signed rows requested by one selection edge-autoscroll request: its
+/// intensity (at least one) toward its direction, on its own axis.
+pub(crate) fn selection_auto_scroll_delta(request: &SelectionAutoScrollRequest) -> i64 {
+    let amount = i64::from(request.intensity.max(1));
+    match request.direction {
+        SelectionScrollDirection::Backward => -amount,
+        SelectionScrollDirection::Forward => amount,
+    }
 }
 
 fn content_height(layout: &LayoutNode) -> u64 {
@@ -1445,17 +1452,6 @@ fn content_width(layout: &LayoutNode) -> u64 {
         .children
         .first()
         .map_or(0, |child| child.node.size.width)
-}
-
-fn logical_offset_from_scrollbar(offset: u64, scrollbar_maximum: u64, logical_maximum: u64) -> u64 {
-    if logical_maximum == 0 || scrollbar_maximum == 0 {
-        return 0;
-    }
-    u64::try_from(
-        (u128::from(offset) * u128::from(logical_maximum)) / u128::from(scrollbar_maximum),
-    )
-    .unwrap_or(logical_maximum)
-    .min(logical_maximum)
 }
 
 fn signed_difference(value: u64, base: u64) -> i64 {

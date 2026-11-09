@@ -14,6 +14,14 @@ version     = { workspace = true }
 name              = "virtual_list_benchmark"
 required-features = ["virtual-list"]
 
+[[example]]
+name              = "virtual_list_chat"
+required-features = ["virtual-list"]
+
+[[test]]
+name              = "virtual_list_motion"
+required-features = ["virtual-list"]
+
 [dependencies]
 bmux_color = { workspace = true }
 bmux_keyboard = { workspace = true, optional = true }
@@ -28,6 +36,12 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 unicode-segmentation = { workspace = true, optional = true }
 unicode-width = { workspace = true, optional = true }
+
+[dev-dependencies]
+bmux_keyboard = { workspace = true }
+# `crossterm` serves the standalone `virtual_list_chat` example's terminal input.
+bmux_tui_runtime = { workspace = true, features = ["crossterm", "testing"] }
+tokio = { workspace = true, features = ["rt", "time"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 web-time = { workspace = true }
@@ -69,6 +83,7 @@ panel-group = []
 picker-frame = []
 progress-bar = []
 radio-group = ["keyboard-input"]
+resident-window = []
 scroll-view = ["keyboard-input", "scrollbar"]
 scrollbar = []
 select-dropdown = ["selectable-list"]
@@ -94,7 +109,7 @@ text-view = ["scroll-view"]
 toast-stack = ["keyboard-input"]
 tree-view = ["keyboard-input"]
 uniform-list = ["keyboard-input", "scroll-view"]
-virtual-list = ["scroll-view"]
+virtual-list = ["scroll-view", "resident-window"]
 
 # Private dependency capability shared by keyboard-interactive controls.
 keyboard-input = ["dep:bmux_keyboard"]
@@ -127,6 +142,7 @@ all = [
     "picker-frame",
     "progress-bar",
     "radio-group",
+    "resident-window",
     "scroll-view",
     "scrollbar",
     "select-dropdown",
