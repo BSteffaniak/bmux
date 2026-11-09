@@ -338,6 +338,12 @@ pub enum PluginError {
     #[error("invocation cancelled before dispatch")]
     InvocationCancelled,
 
+    /// The same typed classification as [`Self::InvocationCancelled`] (no
+    /// dispatch effect began; native v3 maps it to `abi::CANCELLED`), carrying
+    /// the host's reason, e.g. its selected connection being unavailable.
+    #[error("rejected before dispatch: {details}")]
+    RejectedBeforeDispatch { details: String },
+
     #[error("unsupported host operation: {operation}")]
     UnsupportedHostOperation { operation: &'static str },
 

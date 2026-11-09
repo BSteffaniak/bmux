@@ -138,6 +138,108 @@ fn retained_activation_settlement_keeps_clones_live_until_explicit_cleanup() {
     assert_eq!(counts.releases.load(Ordering::SeqCst), 1);
 }
 
+#[test]
+fn settled_activation_port_reaches_host_and_late_rejection_never_poisons_cleanup() {
+    use std::sync::atomic::AtomicBool;
+    #[derive(Default)]
+    struct Host {
+        counts: FixtureCounts,
+        closed: AtomicBool,
+        kernels: AtomicUsize,
+    }
+    fn host(handle: u64) -> &'static Host {
+        unsafe { &*(handle as *const Host) }
+    }
+    unsafe extern "C" fn own(handle: u64) -> AbiStatus {
+        host(handle).counts.retains.fetch_add(1, Ordering::SeqCst);
+        OK
+    }
+    unsafe extern "C" fn done(handle: u64) -> AbiStatus {
+        host(handle).counts.releases.fetch_add(1, Ordering::SeqCst);
+        OK
+    }
+    unsafe extern "C" fn begin(
+        handle: u64,
+        _: *const NativeHostRequest,
+        child: *mut u64,
+    ) -> AbiStatus {
+        let host = host(handle);
+        if host.closed.load(Ordering::SeqCst) {
+            unsafe { child.write(0) };
+            return crate::abi::CANCELLED;
+        }
+        host.counts.begins.fetch_add(1, Ordering::SeqCst);
+        unsafe { child.write(1) };
+        OK
+    }
+    unsafe extern "C" fn kernel(handle: u64, _: *const u8, _: usize, child: *mut u64) -> AbiStatus {
+        let host = host(handle);
+        if host.closed.load(Ordering::SeqCst) {
+            unsafe { child.write(0) };
+            return crate::abi::CANCELLED;
+        }
+        host.kernels.fetch_add(1, Ordering::SeqCst);
+        unsafe { child.write(2) };
+        OK
+    }
+    unsafe extern "C" fn acknowledge(handle: u64, _: u64) -> AbiStatus {
+        host(handle).counts.acks.fetch_add(1, Ordering::SeqCst);
+        OK
+    }
+    let state = Box::new(Host::default());
+    let mut base = table(&state.counts);
+    base.version = PORTS_VERSION_V3;
+    base.size = u32::try_from(std::mem::size_of::<NativeInvocationPortsV3>()).unwrap();
+    base.capabilities = CAP_HOST_SERVICES | CAP_KERNEL_REQUESTS | CAP_RETAINED_LIFECYCLE;
+    base.handle = (&raw const *state) as u64;
+    base.retain = own;
+    base.release = done;
+    base.host_begin = begin;
+    base.host_ack = acknowledge;
+    let table = NativeInvocationPortsV3 {
+        base,
+        kernel_begin: kernel,
+    };
+    let port = unsafe { InvocationPorts::acquire(&raw const table.base) }.unwrap();
+    port.bind_cancellation(crate::ServiceCancellation::new())
+        .unwrap();
+    let services = port.host_port();
+    // Activation returned: its setup token is gone, the retained port is not.
+    port.settle_activation().unwrap();
+    let request = || HostServiceRequest {
+        capability: "example",
+        kind: crate::ServiceKind::Query,
+        interface: "example/v1",
+        operation: "query",
+        payload: b"request",
+    };
+    assert_eq!(services.invoke(request()).unwrap(), b"response");
+    assert_eq!(
+        services.execute_kernel_encoded(b"kernel").unwrap(),
+        b"response"
+    );
+    assert_eq!(state.counts.begins.load(Ordering::SeqCst), 1);
+    assert_eq!(state.kernels.load(Ordering::SeqCst), 1);
+    // Deactivation began: the host rejects before effects. The author sees an
+    // explicit rejection and the retained port's cleanup stays clean.
+    state.closed.store(true, Ordering::SeqCst);
+    assert!(matches!(
+        services.invoke(request()),
+        Err(PluginError::InvocationCancelled)
+    ));
+    assert!(matches!(
+        services.execute_kernel_encoded(b"kernel"),
+        Err(PluginError::InvocationCancelled)
+    ));
+    assert_eq!(port.close_and_drain(), Ok(()));
+    assert_eq!(state.counts.releases.load(Ordering::SeqCst), 1);
+    assert_eq!(state.counts.acks.load(Ordering::SeqCst), 2);
+    assert!(services.invoke(request()).is_err());
+    drop(services);
+    drop(port);
+    assert_eq!(state.counts.releases.load(Ordering::SeqCst), 1);
+}
+
 // One test owns these counters; it exercises all lifetime phases sequentially.
 #[test]
 fn scoped_ports_close_drain_retain_and_never_replay_mutation_on_growth() {

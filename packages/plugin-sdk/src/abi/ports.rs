@@ -157,6 +157,9 @@ struct Gate {
     admitted: usize,
     releasing: bool,
     released: bool,
+    /// The retained activation settled: its setup token is gone, and every
+    /// later call is admitted by the host against the activation itself.
+    settled: bool,
     failure: Option<AbiStatus>,
 }
 pub struct InvocationPorts {
@@ -442,13 +445,14 @@ impl InvocationPorts {
         }
     }
     pub(crate) fn settle_activation(&self) -> Result<(), AbiStatus> {
-        let gate = self.gate.lock().map_err(|_| PANICKED)?;
+        let mut gate = self.gate.lock().map_err(|_| PANICKED)?;
         if gate.admitted != 0 {
             return Err(BUSY);
         }
         if let Some(status) = gate.failure {
             return Err(status);
         }
+        gate.settled = true;
         drop(gate);
         *self.cancellation.lock().map_err(|_| PANICKED)? = None;
         Ok(())
@@ -569,14 +573,18 @@ impl InvocationPorts {
     }
     fn kernel(self: &Arc<Self>, request: &[u8]) -> crate::Result<Vec<u8>> {
         let _admitted = self.admit(CAP_KERNEL_REQUESTS)?;
+        let settled = self.gate.lock().map_err(|_| protocol(PANICKED))?.settled;
         let bound = self.cancellation.lock().map_err(|_| protocol(PANICKED))?;
-        if bound
+        // A settled retained activation port has no setup token: the host
+        // mints fresh admission against its activation and rejects once
+        // deactivation begins. Any other port requires a live bound token.
+        let live = bound
             .as_ref()
-            .is_none_or(crate::ServiceCancellation::is_cancelled)
-        {
+            .map_or(settled, |cancellation| !cancellation.is_cancelled());
+        drop(bound);
+        if !live {
             return Err(protocol(FAILED));
         }
-        drop(bound);
         if request.len() > MAX_BUFFER_BYTES {
             return Err(protocol(INVALID_ARGUMENT));
         }
@@ -590,6 +598,10 @@ impl InvocationPorts {
                 &raw mut child,
             )
         };
+        if self.table.version == PORTS_VERSION_V3 && status == super::CANCELLED && child == 0 {
+            // Explicit host rejection before effects with no retained child.
+            return Err(PluginError::InvocationCancelled);
+        }
         if status != OK {
             self.begin_failed(status, child);
             return Err(protocol(status));
@@ -618,6 +630,11 @@ impl InvocationPorts {
                 &raw mut child,
             )
         };
+        if self.table.version == PORTS_VERSION_V3 && status == super::CANCELLED && child == 0 {
+            // Setup-only registration on a settled activation port: rejected
+            // by the host before effects, with no retained child.
+            return Err(PluginError::InvocationCancelled);
+        }
         if status != OK {
             self.begin_failed(status, child);
             return Err(protocol(status));

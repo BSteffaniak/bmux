@@ -208,6 +208,74 @@ async fn activation_callbacks_preserve_async_and_retained_routes_after_setup_ret
     assert_eq!(calls.lock().unwrap().len(), 2);
 }
 
+/// The callee's admitted work (e.g. a provider's nested entry) may settle
+/// just after the call returns. The fresh caller drains it before finishing:
+/// the call succeeds and no unfinished child strands the activation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn activation_call_drains_settling_callee_work_before_retiring_its_caller() {
+    struct Lingering;
+    impl Lingering {
+        fn linger(scope: &InvocationScope) {
+            let admission = scope.try_admit().unwrap();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                drop(admission);
+            });
+        }
+    }
+    impl HostServiceDispatch for Lingering {
+        fn invoke(
+            &self,
+            scope: &InvocationScope,
+            request: HostServiceRequest<'_>,
+        ) -> Result<Vec<u8>> {
+            Self::linger(scope);
+            Ok(request.payload.to_vec())
+        }
+        fn invoke_async(
+            &self,
+            scope: &InvocationScope,
+            request: bmux_plugin_sdk::HostServiceOwnedRequest,
+        ) -> bmux_plugin_sdk::definition::PluginFuture<'static, Result<Vec<u8>>> {
+            Self::linger(scope);
+            Box::pin(async move { Ok(request.payload) })
+        }
+    }
+    let instance =
+        bmux_plugin_runtime::InstanceScope::new(bmux_plugin_runtime::PluginRuntimeScopeId::new());
+    let activation = instance
+        .begin_activation(bmux_plugin_runtime::PluginConcurrencyConfig::Concurrent)
+        .unwrap();
+    activation.mark_active().unwrap();
+    let port = services(activation.clone(), Arc::new(Lingering), None);
+    let request = bmux_plugin_sdk::HostServiceOwnedRequest {
+        capability: "example.read".into(),
+        kind: bmux_plugin_sdk::ServiceKind::Query,
+        interface: "example/v1".into(),
+        operation: "read".into(),
+        payload: vec![7],
+    };
+    assert_eq!(
+        port.call_service_async(request.clone()).await.unwrap(),
+        vec![7]
+    );
+    let synchronous = port.clone();
+    let blocking = tokio::task::spawn_blocking(move || {
+        synchronous.invoke(HostServiceRequest {
+            capability: "example.read",
+            kind: bmux_plugin_sdk::ServiceKind::Query,
+            interface: "example/v1",
+            operation: "read",
+            payload: &[8],
+        })
+    });
+    assert_eq!(blocking.await.unwrap().unwrap(), vec![8]);
+    // Every fresh caller finished: the activation drains and finishes.
+    activation.close().unwrap();
+    activation.drain().await.unwrap();
+    activation.finish().unwrap();
+}
+
 #[tokio::test]
 async fn unsupported_activation_lookup_never_becomes_absent() {
     struct Unsupported;

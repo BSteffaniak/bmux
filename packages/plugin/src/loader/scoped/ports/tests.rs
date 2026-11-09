@@ -558,13 +558,101 @@ fn retained_lifecycle_port_outlives_setup_but_not_activation_and_holds_child_adm
         std::future::Future::poll(drain.as_mut(), &mut std::task::Context::from_waker(waker)),
         std::task::Poll::Ready(Ok(()))
     ));
-    assert_ne!(
+    // Fail closed once deactivation begins, as an explicit pre-dispatch
+    // rejection with no retained child, never a transport failure: the guest
+    // must not record it as port failure that would block lifecycle cleanup.
+    child = 99;
+    assert_eq!(
         unsafe { (table.host_begin)(table.handle, &raw const request, &raw mut child) },
-        abi::OK
+        abi::CANCELLED
     );
+    assert_eq!(child, 0);
     assert_eq!(effects.load(Ordering::SeqCst), 1);
     assert_eq!(unsafe { (table.release)(table.handle) }, abi::OK);
     HostPorts::retire(&table).unwrap();
+}
+
+#[test]
+fn typed_pre_dispatch_rejection_with_reason_is_explicit_not_a_transport_failure() {
+    let instance = InstanceScope::new(PluginRuntimeScopeId::from_uuid(uuid::Uuid::from_u128(394)));
+    let activation = instance
+        .begin_activation(PluginConcurrencyConfig::Concurrent)
+        .unwrap();
+    let setup = activation
+        .begin_lifecycle_invocation(bmux_plugin_runtime::LifecycleInvocationKind::Activation)
+        .unwrap();
+    // E.g. the issuing command's selected connection was never established.
+    let host = bmux_plugin_sdk::PluginHostServices::new(|_| {
+        Err(bmux_plugin_sdk::PluginError::RejectedBeforeDispatch {
+            details: "selected connection unavailable".into(),
+        })
+    });
+    let table = HostPorts::for_activation(setup.clone(), activation.clone(), host)
+        .install_for(abi::ABI_VERSION, None)
+        .unwrap();
+    assert_eq!(unsafe { (table.retain)(table.handle) }, abi::OK);
+    let request = abi::NativeHostRequest {
+        size: u32::try_from(std::mem::size_of::<abi::NativeHostRequest>()).unwrap(),
+        kind: 0,
+        capability: abi::NativeSlice {
+            pointer: b"test".as_ptr(),
+            length: 4,
+        },
+        interface: abi::NativeSlice {
+            pointer: b"test/v1".as_ptr(),
+            length: 7,
+        },
+        operation: abi::NativeSlice {
+            pointer: b"read".as_ptr(),
+            length: 4,
+        },
+        payload: abi::NativeSlice {
+            pointer: b"".as_ptr(),
+            length: 0,
+        },
+    };
+    let mut child = 99;
+    assert_eq!(
+        unsafe { (table.host_begin)(table.handle, &raw const request, &raw mut child) },
+        abi::CANCELLED
+    );
+    assert_eq!(child, 0);
+    // No child or admission remains: the port releases cleanly.
+    assert_eq!(unsafe { (table.release)(table.handle) }, abi::OK);
+    HostPorts::retire(&table).unwrap();
+    setup.close().unwrap();
+    setup.finish().unwrap();
+    activation.close().unwrap();
+}
+
+#[test]
+fn retained_lifecycle_port_rejects_late_registration_before_effects() {
+    let instance = InstanceScope::new(PluginRuntimeScopeId::from_uuid(uuid::Uuid::from_u128(393)));
+    let activation = instance
+        .begin_activation(PluginConcurrencyConfig::Concurrent)
+        .unwrap();
+    let setup = activation
+        .begin_lifecycle_invocation(bmux_plugin_runtime::LifecycleInvocationKind::Activation)
+        .unwrap();
+    let host = bmux_plugin_sdk::PluginHostServices::new(|_| Ok(Vec::new()));
+    let table = HostPorts::for_activation(setup.clone(), activation.clone(), host)
+        .install_for(abi::ABI_VERSION, None)
+        .unwrap();
+    assert_eq!(unsafe { (table.retain)(table.handle) }, abi::OK);
+    setup.close().unwrap();
+    setup.finish().unwrap();
+    activation.mark_active().unwrap();
+    // Registration is setup-only: after the lifecycle invocation retires it is
+    // rejected before decoding or applying the mutation, with no child.
+    let mut child = 99;
+    assert_eq!(
+        unsafe { (table.registration_begin)(table.handle, b"{}".as_ptr(), 2, &raw mut child) },
+        abi::CANCELLED
+    );
+    assert_eq!(child, 0);
+    assert_eq!(unsafe { (table.release)(table.handle) }, abi::OK);
+    HostPorts::retire(&table).unwrap();
+    activation.close().unwrap();
 }
 
 #[test]

@@ -525,10 +525,20 @@ fn host_start_admission(
         }
     };
     if let Some(activation) = &port.activation
-        && activation.state().map_err(scope_error)?
-            != bmux_plugin_runtime::LifecycleState::Activating
+        && !matches!(
+            activation.state(),
+            Ok(bmux_plugin_runtime::LifecycleState::Activating)
+        )
     {
-        return activation.try_admit().map(Ok).map_err(scope_error);
+        // Retained activation services fail closed once deactivation begins.
+        // That rejection precedes any effect and retains no child, so it is
+        // reported as the explicit pre-dispatch rejection, never a transport
+        // failure that would poison the retained lifecycle port's cleanup.
+        return match activation.try_admit() {
+            Ok(admission) => Ok(Ok(admission)),
+            Err(bmux_plugin_runtime::ScopeError::Closed) => Ok(Err(cancelled())),
+            Err(error) => Err(scope_error(error)),
+        };
     }
     if port.invocation.is_cancelled().map_err(scope_error)? {
         return Ok(Err(cancelled()));
@@ -578,6 +588,20 @@ unsafe fn decode_host_request(request: &NativeHostRequest) -> Result<HostService
         operation: unsafe { text(request.operation) }?,
         payload: unsafe { borrowed(request.payload.pointer, request.payload.length) }?,
     })
+}
+
+/// Withdraw a reserved child that never published an outcome, releasing its
+/// admission and byte reservation.
+fn withdraw_child(port: &HostPorts, id: u64) -> Result<()> {
+    let mut state = port
+        .state
+        .lock()
+        .map_err(|_| failure("native port state poisoned"))?;
+    state.children.remove(&id);
+    state.admissions.remove(&id);
+    state.child_bytes -= abi::MAX_BUFFER_BYTES;
+    drop(state);
+    Ok(())
 }
 
 unsafe extern "C" fn host_begin(
@@ -641,19 +665,15 @@ unsafe extern "C" fn host_begin(
         let result = host.invoke(request);
         let bytes = match result {
             Ok(bytes) if bytes.len() <= abi::MAX_BUFFER_BYTES => bytes,
-            Err(bmux_plugin_sdk::PluginError::InvocationCancelled)
-                if port.native_v3.load(Ordering::Acquire) =>
-            {
+            Err(
+                ref error @ (bmux_plugin_sdk::PluginError::InvocationCancelled
+                | bmux_plugin_sdk::PluginError::RejectedBeforeDispatch { .. }),
+            ) if port.native_v3.load(Ordering::Acquire) => {
                 // The selected dispatcher guarantees this typed rejection was
                 // before effects. Never infer it from text or a later token.
-                let mut state = port
-                    .state
-                    .lock()
-                    .map_err(|_| failure("native port state poisoned"))?;
-                state.children.remove(&id);
-                state.admissions.remove(&id);
-                state.child_bytes -= abi::MAX_BUFFER_BYTES;
-                drop(state);
+                // Only the status crosses the ABI; keep the host's reason.
+                tracing::debug!(%error, "native host invocation rejected before dispatch");
+                withdraw_child(&port, id)?;
                 unsafe {
                     child.write(0);
                 }
@@ -661,14 +681,7 @@ unsafe extern "C" fn host_begin(
                 return Ok(());
             }
             other => {
-                let mut state = port
-                    .state
-                    .lock()
-                    .map_err(|_| failure("native port state poisoned"))?;
-                state.children.remove(&id);
-                state.admissions.remove(&id);
-                state.child_bytes -= abi::MAX_BUFFER_BYTES;
-                drop(state);
+                withdraw_child(&port, id)?;
                 // The native caller only sees a status code; keep the cause.
                 match other {
                     Err(error) => tracing::warn!(%error, "native host invocation failed"),
@@ -1027,12 +1040,27 @@ unsafe extern "C" fn registration_begin(
     length: usize,
     child: *mut u64,
 ) -> AbiStatus {
-    guarded(|| {
+    let mut code = abi::OK;
+    let result = guarded(|| {
         if child.is_null() {
             return Err(failure("missing registration child output"));
         }
         let port = lookup(handle)?;
-        let admission = port.invocation.try_admit().map_err(scope_error)?;
+        let admission = match port.invocation.try_admit() {
+            Ok(admission) => admission,
+            // Registration is setup-only. A retained activation port used after
+            // its setup invocation retired is rejected before any effect.
+            Err(bmux_plugin_runtime::ScopeError::Closed)
+                if port.activation.is_some() && port.native_v3.load(Ordering::Acquire) =>
+            {
+                code = abi::CANCELLED;
+                unsafe {
+                    child.write(0);
+                }
+                return Ok(());
+            }
+            Err(error) => return Err(scope_error(error)),
+        };
         let registration = port
             .registration
             .lock()
@@ -1082,7 +1110,8 @@ unsafe extern "C" fn registration_begin(
                 Err(error)
             }
         }
-    })
+    });
+    if result == abi::OK { code } else { result }
 }
 
 unsafe extern "C" fn host_ack(handle: u64, child: u64) -> AbiStatus {

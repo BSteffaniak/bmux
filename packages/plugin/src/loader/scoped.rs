@@ -3,6 +3,9 @@
 //! Operations remain owned by the instance until explicit acknowledgement. A
 //! dropped observer does not drop an author future or unload executable code.
 //! Native v2 is periodically polled (it does not advertise wake-driven I/O).
+#[cfg(all(test, unix))]
+#[path = "scoped/activation_parity_tests.rs"]
+mod activation_parity_tests;
 #[path = "scoped/activation_ports.rs"]
 mod activation_ports;
 #[path = "scoped/callbacks.rs"]
@@ -276,6 +279,27 @@ impl DefinitionArtifact {
                 .map_err(|e| failure(e.to_string()))?;
             unsafe { entry() }
         };
+        unsafe { Self::from_descriptor(library, pointer) }
+    }
+
+    /// Adopt this test process's own in-process adapter descriptor as a
+    /// dynamic artifact, exercising the exact native ABI path without a
+    /// separately built library. The process handle owns the descriptor.
+    ///
+    /// # Safety
+    /// `pointer` must be a static descriptor implemented in this process.
+    #[cfg(all(test, unix))]
+    pub(super) unsafe fn from_process_descriptor(
+        pointer: *const NativePluginDescriptor,
+    ) -> Result<Self> {
+        let library = Library::from(libloading::os::unix::Library::this());
+        unsafe { Self::from_descriptor(library, pointer) }
+    }
+
+    unsafe fn from_descriptor(
+        library: Library,
+        pointer: *const NativePluginDescriptor,
+    ) -> Result<Self> {
         if pointer.is_null()
             || !(pointer as usize).is_multiple_of(std::mem::align_of::<NativePluginDescriptor>())
         {
@@ -1306,6 +1330,7 @@ impl LoadedExecution {
         let native = self.resolved_lifecycle_context(native)?;
         let _control = self.control()?;
         self.ensure_capacity()?;
+        self.ensure_activation_port_negotiated()?;
         let activation = self.scope.begin_activation(policy).map_err(scope_error)?;
         let mut context = PluginLifecycleContext {
             callback_execution: None,
@@ -1346,6 +1371,35 @@ impl LoadedExecution {
             Some(true),
             Some(admission),
         )
+    }
+
+    /// A dynamic guest receives host services at activation only through the
+    /// retained activation port. A guest that did not negotiate it is refused
+    /// before any activation scope exists, never degraded to the activate
+    /// call's own invocation ports, which close when `activate` returns.
+    fn ensure_activation_port_negotiated(&self) -> Result<()> {
+        let ExecutionBackend::Dynamic { artifact, .. } = &self.backend else {
+            return Ok(());
+        };
+        if artifact.descriptor.version == abi::ABI_VERSION
+            && artifact.descriptor.capabilities & abi::CAP_RETAINED_LIFECYCLE != 0
+        {
+            return Ok(());
+        }
+        let grants_host = self
+            .host_dispatch
+            .lock()
+            .map_err(|_| failure("host dispatch poisoned"))?
+            .is_some()
+            || self
+                .kernel_dispatch
+                .lock()
+                .map_err(|_| failure("kernel dispatch poisoned"))?
+                .is_some();
+        if grants_host {
+            return Err(failure("retained lifecycle host services not negotiated"));
+        }
+        Ok(())
     }
 
     fn ensure_previous_lifecycle_settled(&self) -> Result<()> {
