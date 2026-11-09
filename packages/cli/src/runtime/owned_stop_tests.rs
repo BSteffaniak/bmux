@@ -98,7 +98,7 @@ async fn cancelling_shutdown_observation_keeps_process_and_allows_rejoin() {
     assert!(
         tokio::time::timeout(
             std::time::Duration::from_millis(120),
-            wait_for_shutdown_progress(&process, None, &path)
+            wait_for_shutdown_progress(&process, None, &path, OWNED_STOP_EXIT_BOUND)
         )
         .await
         .is_err()
@@ -111,7 +111,7 @@ async fn cancelling_shutdown_observation_keeps_process_and_allows_rejoin() {
     child.wait().await.unwrap();
     tokio::time::timeout(
         std::time::Duration::from_secs(2),
-        wait_for_shutdown_progress(&process, None, &path),
+        wait_for_shutdown_progress(&process, None, &path, OWNED_STOP_EXIT_BOUND),
     )
     .await
     .unwrap()
@@ -135,12 +135,44 @@ async fn quiet_explicit_shutdown_waits_past_former_idle_deadline() {
     let (observed, exited) = tokio::join!(
         tokio::time::timeout(
             std::time::Duration::from_secs(35),
-            wait_for_shutdown_progress(&process, None, &path)
+            wait_for_shutdown_progress(&process, None, &path, OWNED_STOP_EXIT_BOUND)
         ),
         child.wait()
     );
     observed.unwrap().unwrap();
     assert!(exited.unwrap().success());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn stuck_server_exit_is_bounded_and_unsignalled() {
+    use std::process::Stdio;
+    let root = tempfile::tempdir().unwrap();
+    let mut child = tokio::process::Command::new("/bin/sh")
+        .args(["-c", "read line"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let process = ProcessObservation::open(child.id().unwrap()).unwrap();
+    let path = root.path().join("shutdown-progress.json");
+    let started = std::time::Instant::now();
+    let error =
+        wait_for_shutdown_progress(&process, None, &path, std::time::Duration::from_millis(200))
+            .await
+            .unwrap_err()
+            .to_string();
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    assert!(error.contains("did not exit"), "{error}");
+    assert!(error.contains("no termination signal was sent"), "{error}");
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "a bounded observation must not signal the process"
+    );
+    drop(child.stdin.take());
+    child.wait().await.unwrap();
 }
 
 #[test]

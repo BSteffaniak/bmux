@@ -446,6 +446,21 @@ mod owned_stop_tests;
 
 const OWNED_STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const STOP_TIMEOUT_MESSAGE: &str = "no observable shutdown progress for 30 seconds; no termination signal was sent. Cleanup may still be running. Inspect the selected runtime's server logs and retry `server stop`; do not kill a numeric PID from a stale PID file";
+/// Default bound on observing an accepted local shutdown until process exit.
+/// The server bounds its own plugin teardown and runtime release (see
+/// `bmux_plugin_runtime::teardown_timeout`), so this only trips when the
+/// server is stuck outside those bounded paths.
+const OWNED_STOP_EXIT_BOUND: std::time::Duration = std::time::Duration::from_secs(120);
+/// Environment override (whole seconds) for [`OWNED_STOP_EXIT_BOUND`].
+const OWNED_STOP_EXIT_BOUND_ENV: &str = "BMUX_SERVER_STOP_TIMEOUT_SECS";
+
+fn owned_stop_exit_bound() -> std::time::Duration {
+    std::env::var(OWNED_STOP_EXIT_BOUND_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .map_or(OWNED_STOP_EXIT_BOUND, std::time::Duration::from_secs)
+}
 
 #[derive(Debug, serde::Deserialize)]
 struct ShutdownReceipt {
@@ -658,6 +673,7 @@ async fn run_server_stop_inner(connection_context: ConnectionContext<'_>) -> Res
         &ConfigPaths::default()
             .runtime_dir
             .join("shutdown-progress.json"),
+        owned_stop_exit_bound(),
     )
     .await?;
     // Bootstrap publishes the receipt before process exit. A missing receipt
@@ -670,15 +686,30 @@ async fn wait_for_shutdown_progress(
     process: &super::server_runtime::ProcessObservation,
     metadata: Option<&ServerRuntimeMetadata>,
     path: &std::path::Path,
+    bound: std::time::Duration,
 ) -> Result<()> {
     use bmux_plugin_runtime::shutdown_progress::{ShutdownIdleTimer, ShutdownProgressSnapshot};
-    // Explicit shutdown has no idle deadline. Keep validating provenance and
-    // monotonic observations; the CLI notice timer never advances this state.
-    let mut observations = ShutdownIdleTimer::new(std::time::Instant::now(), OWNED_STOP_TIMEOUT);
+    // Explicit shutdown has no idle deadline, but it has a total bound: quiet
+    // cleanup may take a while, yet a stuck server is reported, never awaited
+    // forever. Keep validating provenance and monotonic observations; the CLI
+    // notice timer never advances this state.
+    let started = std::time::Instant::now();
+    let mut observations = ShutdownIdleTimer::new(started, OWNED_STOP_TIMEOUT);
     let mut reported_revision = 0;
     loop {
         if process.exited()? {
             return Ok(());
+        }
+        if started.elapsed() >= bound {
+            let step: String = observations
+                .last_step()
+                .chars()
+                .map(|ch| if ch.is_control() { ' ' } else { ch })
+                .collect();
+            anyhow::bail!(
+                "server did not exit within {}s of accepting shutdown (last progress: {step}); no termination signal was sent and cleanup is unconfirmed. The server log names any plugin scope holders that blocked teardown; retry `server stop` or raise {OWNED_STOP_EXIT_BOUND_ENV}",
+                bound.as_secs()
+            );
         }
         match std::fs::read(path) {
             Ok(bytes) => {
