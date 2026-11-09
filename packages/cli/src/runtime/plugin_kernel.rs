@@ -482,7 +482,7 @@ impl CommandDispatchRequest {
                 .lock()
                 .map_err(|_| command_dispatch_error("command scope registry poisoned".into()))?;
             if self.cancellation.is_cancelled() {
-                return Err(command_dispatch_error(
+                return Err(command_not_dispatched(
                     "selected command lifetime ended".into(),
                 ));
             }
@@ -494,7 +494,7 @@ impl CommandDispatchRequest {
             drop(scopes);
         }
         sender.try_send(self).map_err(|_| {
-            command_dispatch_error(
+            command_not_dispatched(
                 "selected command queue unavailable; request not dispatched".into(),
             )
         })
@@ -503,8 +503,11 @@ impl CommandDispatchRequest {
     pub(in crate::runtime) fn is_cancelled(&self) -> bool {
         self.cancellation.is_cancelled()
     }
+    // Both rejections are definitive: the request never reached the issuing
+    // connection, so no effect began. The typed classification lets callers
+    // (including native ports) report them without an uncertain outcome.
     pub(in crate::runtime) fn reject(self) {
-        let _ = self.response.clone().send(Err(command_dispatch_error(
+        let _ = self.response.clone().send(Err(command_not_dispatched(
             "command ended or cancelled before dispatch".into(),
         )));
         drop(self);
@@ -513,7 +516,7 @@ impl CommandDispatchRequest {
         let _ = self
             .response
             .clone()
-            .send(Err(command_dispatch_error(reason.to_owned())));
+            .send(Err(command_not_dispatched(reason.to_owned())));
         drop(self);
     }
     pub(in crate::runtime) fn respond(self, result: Result<bmux_ipc::Response>) {
@@ -550,6 +553,10 @@ impl CommandDispatchRequest {
 }
 const fn command_dispatch_error(details: String) -> bmux_plugin_sdk::PluginError {
     bmux_plugin_sdk::PluginError::ServiceProtocol { details }
+}
+/// Definitive rejection before the request reached the issuing connection.
+const fn command_not_dispatched(details: String) -> bmux_plugin_sdk::PluginError {
+    bmux_plugin_sdk::PluginError::RejectedBeforeDispatch { details }
 }
 impl CommandDispatch {
     pub(in crate::runtime) fn channel() -> (
@@ -608,7 +615,7 @@ impl CommandDispatch {
         request: &bmux_plugin_sdk::HostServiceRequest<'_>,
     ) -> bmux_plugin_sdk::Result<Vec<u8>> {
         if self.cancellation.is_cancelled() {
-            return Err(command_dispatch_error(
+            return Err(command_not_dispatched(
                 "selected command lifetime ended".into(),
             ));
         }
@@ -639,7 +646,7 @@ impl CommandDispatch {
         invocation: &bmux_plugin_runtime::InvocationScope,
     ) -> bmux_plugin_sdk::Result<bmux_ipc::StreamProvenance> {
         if self.cancellation.is_cancelled() {
-            return Err(command_dispatch_error(
+            return Err(command_not_dispatched(
                 "selected command lifetime ended".into(),
             ));
         }
@@ -667,7 +674,7 @@ impl CommandDispatch {
             scopes: self.scopes.clone(),
             _parent: self.parent(),
             _slot: self.slots.clone().try_acquire_owned().map_err(|_| {
-                command_dispatch_error(
+                command_not_dispatched(
                     "selected command capacity exhausted; request not dispatched".into(),
                 )
             })?,
