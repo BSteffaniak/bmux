@@ -63,6 +63,14 @@ fn failure(details: impl Into<String>) -> PluginError {
         details: details.into(),
     }
 }
+/// Bounded teardown drain of an activation: stragglers are reported by owner
+/// and abandoned (retained, never unloaded) instead of being awaited forever.
+async fn drain_activation(
+    activation: &bmux_plugin_runtime::ActivationScope,
+    deadline: tokio::time::Instant,
+) -> Result<()> {
+    activation.drain_until(deadline).await.map_err(scope_error)
+}
 fn scope_error(error: bmux_plugin_runtime::ScopeError) -> PluginError {
     match error {
         bmux_plugin_runtime::ScopeError::Cleanup(details) => {
@@ -873,10 +881,7 @@ impl LoadedExecution {
             .activation
             .clone();
         if let Some(activation) = activation {
-            activation
-                .drain_until(deadline)
-                .await
-                .map_err(scope_error)?;
+            drain_activation(&activation, deadline).await?;
         }
         Ok(())
     }
@@ -1393,10 +1398,7 @@ impl LoadedExecution {
         for call in calls {
             self.cancel(call)?;
         }
-        activation
-            .drain_until(bmux_plugin_runtime::teardown_deadline())
-            .await
-            .map_err(scope_error)?;
+        drain_activation(&activation, bmux_plugin_runtime::teardown_deadline()).await?;
         let calls = self
             .state
             .lock()
@@ -2763,10 +2765,7 @@ impl LoadedExecution {
                     .map_err(|e| failure(e.to_string()))?;
             }
             activation.close().map_err(scope_error)?;
-            activation
-                .drain_until(deadline)
-                .await
-                .map_err(scope_error)?;
+            drain_activation(&activation, deadline).await?;
             activation.finish().map_err(scope_error)?;
             self.state
                 .lock()
