@@ -97,6 +97,21 @@ pub struct ClusterPlugin {
     /// the server owns the retained Raft history and endpoint, and a second
     /// node in the command process would contend for that exclusive store.
     command_scoped: bool,
+    /// Host services of the current activation. They mint a fresh invocation
+    /// per call and fail closed once deactivation begins, so the persistent
+    /// consensus runtime (peer RPCs, reconciler) may outlive the request that
+    /// started it. Never a request-scoped caller.
+    activation_caller: Option<Arc<bmux_plugin::TypedServiceCaller>>,
+}
+
+const NO_ACTIVATION: &str = "cluster consensus requires an active plugin activation";
+
+impl ClusterPlugin {
+    fn activation_caller(&self) -> Result<Arc<bmux_plugin::TypedServiceCaller>, String> {
+        self.activation_caller
+            .clone()
+            .ok_or_else(|| NO_ACTIVATION.to_string())
+    }
 }
 
 async fn ensure_persistent_consensus_runtime(
@@ -227,6 +242,9 @@ impl RustPlugin for ClusterPlugin {
         );
         self.node_identity = Some(node_identity);
         self.cluster_id = cluster_id;
+        self.activation_caller = Some(Arc::new(
+            bmux_plugin::TypedServiceCaller::from_lifecycle_context(&context),
+        ));
         let configured_endpoint = configured_consensus_endpoint(context.settings.as_ref())
             .map_err(PluginCommandError::failed)?;
         if let Err(error) =
@@ -249,9 +267,9 @@ impl RustPlugin for ClusterPlugin {
         if self.command_scoped {
             return Ok(result);
         }
-        let caller = Arc::new(bmux_plugin::TypedServiceCaller::from_lifecycle_context(
-            &context,
-        ));
+        let caller = self
+            .activation_caller()
+            .map_err(PluginCommandError::failed)?;
         let state_dir = PathBuf::from(&context.connection.state_dir);
         let nodes = self.nodes.clone();
         let bootstrap = Arc::clone(&self.bootstrap);
@@ -266,6 +284,7 @@ impl RustPlugin for ClusterPlugin {
     }
 
     fn deactivate(&mut self, _context: NativeLifecycleContext) -> Result<i32, PluginCommandError> {
+        self.activation_caller = None;
         if let Some(identity) = self.node_identity.as_ref() {
             let node_id = *identity.node_id();
             if let Ok(node) = self.nodes.get(node_id) {
@@ -511,7 +530,12 @@ impl RustPlugin for ClusterPlugin {
             return response;
         }
         if is_cluster_lifecycle_service(&context) {
-            return invoke_cluster_lifecycle_service(&context, &self.nodes, &self.bootstrap);
+            return invoke_cluster_lifecycle_service(
+                &context,
+                &self.nodes,
+                &self.bootstrap,
+                self.activation_caller.as_ref(),
+            );
         }
         bmux_plugin_sdk::route_service!(context, {
             "cluster-query/v1", "list_clusters" => |(): (), ctx| {
@@ -736,13 +760,17 @@ fn invoke_cluster_lifecycle_service(
     context: &NativeServiceContext,
     nodes: &consensus_network::ConsensusNodeRegistry,
     bootstrap: &Arc<tokio::sync::Mutex<()>>,
+    activation_caller: Option<&Arc<bmux_plugin::TypedServiceCaller>>,
 ) -> ServiceResponse {
     bmux_plugin_sdk::route_service!(context, {
         "cluster-command/v1", "join" => |req: ClusterCommandJoinRequest, ctx| {
             let result = adopt_join_result(ctx, &req)
                 .map_err(|error| ServiceResponse::error("join_failed", error))?;
             if result.member.capabilities.consensus_role == ClusterConsensusRole::Voter {
-                let caller = Arc::new(bmux_plugin::TypedServiceCaller::from_service_context(ctx));
+                // The node outlives this request: it holds activation services.
+                let caller = activation_caller
+                    .cloned()
+                    .ok_or_else(|| ServiceResponse::error("join_failed", NO_ACTIVATION))?;
                 let state_dir = PathBuf::from(&ctx.connection.state_dir);
                 let handle = tokio::runtime::Handle::try_current()
                     .map_err(|error| ServiceResponse::error("join_failed", error.to_string()))?;
@@ -949,7 +977,10 @@ fn invoke_cluster_lifecycle_service(
             if let Some(endpoint) = endpoint {
                 configure_local_consensus_endpoint(ctx, Some(&endpoint))
                     .map_err(|error| ServiceResponse::error("cluster_init_failed", error))?;
-                let caller = Arc::new(bmux_plugin::TypedServiceCaller::from_service_context(ctx));
+                // The node outlives this request: it holds activation services.
+                let caller = activation_caller
+                    .cloned()
+                    .ok_or_else(|| ServiceResponse::error("cluster_init_failed", NO_ACTIVATION))?;
                 let state_dir = PathBuf::from(&ctx.connection.state_dir);
                 let handle = tokio::runtime::Handle::try_current()
                     .map_err(|error| ServiceResponse::error("cluster_init_failed", error.to_string()))?;
@@ -1077,17 +1108,20 @@ impl bmux_plugin_sdk::definition::PluginInstance for ClusterInstance {
     ) -> bmux_plugin_sdk::definition::PluginFuture<'_, bmux_plugin_sdk::definition::PluginResult<()>>
     {
         Box::pin(async move {
-            let (nodes, bootstrap) = {
+            let (nodes, bootstrap, caller) = {
                 let mut plugin = self
                     .plugin
                     .try_write()
                     .map_err(|_| PluginCommandError::unavailable("cluster lifecycle busy"))?;
                 RustPlugin::activate(&mut *plugin, context.native.clone())?;
-                (plugin.nodes.clone(), Arc::clone(&plugin.bootstrap))
+                (
+                    plugin.nodes.clone(),
+                    Arc::clone(&plugin.bootstrap),
+                    plugin
+                        .activation_caller()
+                        .map_err(PluginCommandError::failed)?,
+                )
             };
-            let caller = Arc::new(bmux_plugin::TypedServiceCaller::from_lifecycle_context(
-                &context.native,
-            ));
             ensure_persistent_consensus_runtime(
                 caller,
                 PathBuf::from(&context.native.connection.state_dir),
@@ -1105,10 +1139,11 @@ impl bmux_plugin_sdk::definition::PluginInstance for ClusterInstance {
     {
         Box::pin(async move {
             let (nodes, identity, bootstrap) = {
-                let plugin = self
+                let mut plugin = self
                     .plugin
-                    .try_read()
+                    .try_write()
                     .map_err(|_| PluginCommandError::unavailable("cluster lifecycle busy"))?;
+                plugin.activation_caller = None;
                 (
                     plugin.nodes.clone(),
                     plugin
