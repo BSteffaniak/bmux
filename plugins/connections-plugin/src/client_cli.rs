@@ -71,9 +71,14 @@ fn prompt(label: &str, secret: bool) -> Result<String> {
     Ok(line.trim().to_owned())
 }
 fn forward(context: &NativeCommandContext, path: &str, arguments: Vec<String>) -> Result<i32> {
-    Ok(TypedServiceCaller::from_command_context(context)
-        .core_cli_command_run_path(&CoreCliCommandRequest::new(vec![path.into()], arguments))?
-        .exit_code)
+    let response = TypedServiceCaller::from_command_context(context)
+        .core_cli_command_run_path(&CoreCliCommandRequest::new(vec![path.into()], arguments))?;
+    // The bridge reports executor failures as a message with a non-zero exit
+    // code; surface it instead of exiting with a bare status.
+    if let Some(error) = response.error {
+        bail!("bmux {path} failed: {error}");
+    }
+    Ok(response.exit_code)
 }
 fn positional(args: &[String]) -> Vec<String> {
     let mut result = Vec::new();

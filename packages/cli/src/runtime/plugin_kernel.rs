@@ -1456,6 +1456,10 @@ fn run_selected_core_command(
         command @ bmux_cli_schema::Command::Playbook { .. } => {
             super::playbook_cli::run_selected(state, &command)
         }
+        command @ (bmux_cli_schema::Command::Attach { .. }
+        | bmux_cli_schema::Command::Connect { .. }) => {
+            super::attach_selected::run_selected(state, &command)
+        }
         _ => anyhow::bail!(
             "core command '{}' has no pinned runtime executor; ambient routing refused",
             request.command_path.join(" ")

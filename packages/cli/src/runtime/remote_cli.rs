@@ -542,8 +542,54 @@ const fn command_requires_remote_server(command: Option<&Command>) -> bool {
     )
 }
 
-#[allow(clippy::too_many_lines)]
 pub(super) async fn run_connect(
+    target: Option<&str>,
+    session: Option<&str>,
+    follow: Option<&str>,
+    global: bool,
+    reconnect_forever: bool,
+) -> Result<u8> {
+    let config = BmuxConfig::load()?;
+    Box::pin(run_connect_with(
+        &config,
+        None,
+        target,
+        session,
+        follow,
+        global,
+        reconnect_forever,
+    ))
+    .await
+}
+
+/// `connect` pinned to an explicitly selected runtime's config and paths.
+pub(super) async fn run_connect_selected(
+    state: &super::plugin_runtime::RuntimeCommandState,
+    target: Option<&str>,
+    session: Option<&str>,
+    follow: Option<&str>,
+    global: bool,
+    reconnect_forever: bool,
+) -> Result<u8> {
+    Box::pin(run_connect_with(
+        &state.config,
+        Some(state),
+        target,
+        session,
+        follow,
+        global,
+        reconnect_forever,
+    ))
+    .await
+}
+
+/// `selected` pins local attachment and recent-selection persistence to one
+/// runtime's paths; `None` uses this process's ambient runtime.
+// One target-kind dispatch keeps per-transport attach and recency handling aligned.
+#[allow(clippy::too_many_lines)]
+async fn run_connect_with(
+    config: &BmuxConfig,
+    selected: Option<&super::plugin_runtime::RuntimeCommandState>,
     target: Option<&str>,
     session: Option<&str>,
     follow: Option<&str>,
@@ -554,13 +600,12 @@ pub(super) async fn run_connect(
         anyhow::bail!("--follow cannot be used with an explicit session argument");
     }
 
-    let config = BmuxConfig::load()?;
     let selected_target = if let Some(target) = target {
         target.to_string()
     } else {
-        choose_default_target_interactively(&config)?
+        choose_default_target_interactively(config)?
     };
-    let resolved = resolve_target_reference(&config, &selected_target)
+    let resolved = resolve_target_reference(config, &selected_target)
         .await
         .map_err(|error| map_connect_target_resolution_error(&selected_target, error))?;
     match resolved {
@@ -568,17 +613,32 @@ pub(super) async fn run_connect(
             let target_session = if let Some(session) = session {
                 Some(session.to_string())
             } else {
-                resolve_local_attach_session().await?
+                resolve_local_attach_session(config, selected.map(|state| &state.paths)).await?
             };
-            let status = Box::pin(run_session_attach(
-                target_session.as_deref(),
-                follow,
-                global,
-                ConnectionContext::new(Some("local")),
-            ))
-            .await?;
+            let status = if let Some(state) = selected {
+                Box::pin(super::attach_selected::run_attach(
+                    config,
+                    &state.paths,
+                    target_session.as_deref(),
+                    follow,
+                    global,
+                ))
+                .await?
+            } else {
+                Box::pin(run_session_attach(
+                    target_session.as_deref(),
+                    follow,
+                    global,
+                    ConnectionContext::new(Some("local")),
+                ))
+                .await?
+            };
             if status == 0
-                && let Err(error) = remember_recent_selection("local", target_session.as_deref())
+                && let Err(error) = remember_recent_selection(
+                    selected.map(|state| &state.paths),
+                    "local",
+                    target_session.as_deref(),
+                )
             {
                 tracing::warn!("failed to save recent selection: {error}");
             }
@@ -610,8 +670,11 @@ pub(super) async fn run_connect(
             )
             .await?;
             if status == 0
-                && let Err(error) =
-                    remember_recent_selection(&ssh_target.label, target_session.as_deref())
+                && let Err(error) = remember_recent_selection(
+                    selected.map(|state| &state.paths),
+                    &ssh_target.label,
+                    target_session.as_deref(),
+                )
             {
                 tracing::warn!("failed to save recent selection: {error}");
             }
@@ -636,8 +699,11 @@ pub(super) async fn run_connect(
             )
             .await?;
             if status == 0
-                && let Err(error) =
-                    remember_recent_selection(&tls_target.label, target_session.as_deref())
+                && let Err(error) = remember_recent_selection(
+                    selected.map(|state| &state.paths),
+                    &tls_target.label,
+                    target_session.as_deref(),
+                )
             {
                 tracing::warn!("failed to save recent selection: {error}");
             }
@@ -645,7 +711,7 @@ pub(super) async fn run_connect(
         }
         ResolvedTarget::Iroh(iroh_target) => {
             let mut perf_emitter = perf_telemetry::PerfEventEmitter::new(
-                perf_telemetry::PerfCaptureSettings::from_config(&config),
+                perf_telemetry::PerfCaptureSettings::from_config(config),
             );
             let mut connect_perf = IrohConnectPerfSummary::default();
             let (mut client, iroh_connection) = connect_iroh_bridge(
@@ -682,8 +748,11 @@ pub(super) async fn run_connect(
             )
             .await?;
             if status == 0
-                && let Err(error) =
-                    remember_recent_selection(&iroh_target.label, target_session.as_deref())
+                && let Err(error) = remember_recent_selection(
+                    selected.map(|state| &state.paths),
+                    &iroh_target.label,
+                    target_session.as_deref(),
+                )
             {
                 tracing::warn!("failed to save recent selection: {error}");
             }
@@ -3581,18 +3650,26 @@ fn print_doctor_step_warn(step: &str, message: &str) {
     println!("[WARN] {step}: {message}");
 }
 
-async fn resolve_local_attach_session() -> Result<Option<String>> {
+async fn resolve_local_attach_session(
+    config: &BmuxConfig,
+    selected: Option<&ConfigPaths>,
+) -> Result<Option<String>> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         anyhow::bail!(
             "session argument is required in non-interactive mode.\nList sessions: bmux list-sessions"
         );
     }
-    let mut client = connect_with_context(
-        ConnectionPolicyScope::Normal,
-        "bmux-cli-connect-local-picker",
-        ConnectionContext::new(Some("local")),
-    )
-    .await?;
+    let mut client = if let Some(paths) = selected {
+        super::attach_selected::connect_local(config, paths, "bmux-cli-connect-local-picker")
+            .await?
+    } else {
+        connect_with_context(
+            ConnectionPolicyScope::Normal,
+            "bmux-cli-connect-local-picker",
+            ConnectionContext::new(Some("local")),
+        )
+        .await?
+    };
     let sessions = typed_list_sessions_remote(&mut client).await?;
     select_session_interactively("local", &sessions)
 }
@@ -3692,8 +3769,15 @@ fn sessions_ordered_by_recent(
     Ok(ordered)
 }
 
-fn remember_recent_selection(target: &str, session: Option<&str>) -> Result<()> {
-    let mut config = BmuxConfig::load()?;
+fn remember_recent_selection(
+    selected: Option<&ConfigPaths>,
+    target: &str,
+    session: Option<&str>,
+) -> Result<()> {
+    let mut config = match selected {
+        Some(paths) => BmuxConfig::load_from_path(&paths.config_file())?,
+        None => BmuxConfig::load()?,
+    };
     push_recent(&mut config.connections.recent_targets, target.to_string());
     if let Some(session) = session {
         let list = config
@@ -3703,7 +3787,10 @@ fn remember_recent_selection(target: &str, session: Option<&str>) -> Result<()> 
             .or_default();
         push_recent(list, session.to_string());
     }
-    config.save()?;
+    match selected {
+        Some(paths) => config.save_to_path(&paths.config_file())?,
+        None => config.save()?,
+    }
     Ok(())
 }
 

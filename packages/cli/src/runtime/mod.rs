@@ -17,6 +17,7 @@ use uuid::Uuid;
 mod access_cli;
 mod action_dispatch;
 pub mod attach;
+mod attach_selected;
 mod bootstrap;
 mod built_in_commands;
 mod cli_parse;

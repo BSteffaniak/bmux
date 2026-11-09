@@ -4157,21 +4157,57 @@ pub async fn run_session_attach_with_provider_session(
     global: bool,
     kernel_client_factory: Option<KernelClientFactory>,
 ) -> Result<AttachRunOutcome> {
+    Box::pin(run_session_attach_with_provider_session_config(
+        session,
+        original_target,
+        follow,
+        global,
+        kernel_client_factory,
+        None,
+    ))
+    .await
+}
+
+/// Attach an opened provider session using an explicitly selected config.
+///
+/// `None` loads the process attach config; `Some` pins both legacy and
+/// provider-owned attachments to that config.
+///
+/// # Errors
+/// Returns attachment, input, or presentation failures.
+pub async fn run_session_attach_with_provider_session_config(
+    session: bmux_client::AttachProviderSession,
+    original_target: Option<&str>,
+    follow: Option<&str>,
+    global: bool,
+    kernel_client_factory: Option<KernelClientFactory>,
+    config: Option<BmuxConfig>,
+) -> Result<AttachRunOutcome> {
     let effective_target = session.target.as_deref().or(original_target);
     match session.backend {
         AttachProviderBackend::Legacy(client) => {
             let mut terminal = RealAttachTerminal::new();
-            Box::pin(run_session_attach_with_terminal(
+            Box::pin(run_session_attach_with_terminal_config_observer(
                 client,
                 effective_target,
                 follow,
                 global,
                 kernel_client_factory,
                 &mut terminal,
+                config,
+                None,
             ))
             .await
         }
         AttachProviderBackend::Session(provider_session) => {
+            // The provider loop reads its config through the scoped loader on
+            // this task's thread; a selected config replaces it for this run.
+            let _loader_scope = config.map(|config| {
+                let loader: NativeConfigLoader = Arc::new(move || Ok(config.clone()));
+                NativeConfigLoaderScope(
+                    NATIVE_CONFIG_LOADER.with(|slot| slot.replace(Some(loader))),
+                )
+            });
             let mut terminal = RealAttachTerminal::new();
             run_native_attach_session_with_terminal(provider_session, &mut terminal).await
         }
@@ -4769,49 +4805,6 @@ const fn provider_modifier_bits(modifiers: KeyModifiers) -> u8 {
         | ((modifiers.contains(KeyModifiers::SUPER) as u8) << 3)
         | ((modifiers.contains(KeyModifiers::HYPER) as u8) << 4)
         | ((modifiers.contains(KeyModifiers::META) as u8) << 5)
-}
-
-pub async fn run_session_attach_with_terminal<T: AttachTerminal + ?Sized>(
-    client: BmuxClient,
-    target: Option<&str>,
-    follow: Option<&str>,
-    global: bool,
-    kernel_client_factory: Option<KernelClientFactory>,
-    terminal: &mut T,
-) -> Result<AttachRunOutcome> {
-    run_session_attach_with_terminal_config(
-        client,
-        target,
-        follow,
-        global,
-        kernel_client_factory,
-        terminal,
-        None,
-    )
-    .await
-}
-
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // Core attach loop -- splitting would fragment state management
-pub async fn run_session_attach_with_terminal_config<T: AttachTerminal + ?Sized>(
-    client: BmuxClient,
-    target: Option<&str>,
-    follow: Option<&str>,
-    global: bool,
-    kernel_client_factory: Option<KernelClientFactory>,
-    terminal: &mut T,
-    config: Option<BmuxConfig>,
-) -> Result<AttachRunOutcome> {
-    run_session_attach_with_terminal_config_observer(
-        client,
-        target,
-        follow,
-        global,
-        kernel_client_factory,
-        terminal,
-        config,
-        None,
-    )
-    .await
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)] // Preserve legacy wrappers while threading an explicitly scoped observer through attach lifetime.
