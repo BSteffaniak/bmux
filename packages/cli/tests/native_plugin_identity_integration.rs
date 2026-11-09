@@ -363,7 +363,9 @@ fn native_plugin_identity_dynamic_service_calls_are_attributed_to_the_plugin() {
     );
 
     sandbox.stop();
-    let stdout = sandbox.server_log("server.stdout");
+    // Lifecycle diagnostics are stderr: command-local activations run in the
+    // issuing CLI, whose stdout carries only command output (checked above).
+    let stderr = sandbox.server_log("server.stderr");
     for expected in [
         "example.native: status item set during activate",
         "example.native: status item set from background thread",
@@ -371,7 +373,7 @@ fn native_plugin_identity_dynamic_service_calls_are_attributed_to_the_plugin() {
         "example.native: deactivated example.native",
     ] {
         assert!(
-            stdout.contains(expected),
+            stderr.contains(expected),
             "missing {expected:?}:\n{}",
             sandbox.evidence()
         );

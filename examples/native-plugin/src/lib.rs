@@ -26,7 +26,10 @@ use std::time::{Duration, Instant};
 mod tab_bar;
 
 #[derive(Default)]
-struct ExamplePlugin;
+struct ExamplePlugin {
+    /// Background work started by the current activation, if any.
+    background: Option<tab_bar::BackgroundStatus>,
+}
 
 const PROMPT_HOST_WAIT_TIMEOUT: Duration = Duration::from_secs(8);
 const PROMPT_HOST_WAIT_POLL: Duration = Duration::from_millis(75);
@@ -63,19 +66,21 @@ impl RustPlugin for ExamplePlugin {
         })
     }
 
+    // Lifecycle diagnostics go to stderr: a command-local activation runs
+    // in the issuing CLI process, whose stdout is the command's output.
     fn activate(&mut self, context: NativeLifecycleContext) -> Result<i32, PluginCommandError> {
-        println!("example.native: activated {}", context.plugin_id);
+        eprintln!("example.native: activated {}", context.plugin_id);
         // Hand the activation's own host services to background work
         // explicitly. They mint a fresh invocation per call and fail closed
         // once deactivation begins; nothing is ambient.
         let services = context.host_service_port.clone();
-        tab_bar::start_background_status(&context, services);
+        self.background = tab_bar::start_background_status(&context, services);
         Ok(EXIT_OK)
     }
 
     fn deactivate(&mut self, context: NativeLifecycleContext) -> Result<i32, PluginCommandError> {
-        tab_bar::stop_background_status();
-        println!("example.native: deactivated {}", context.plugin_id);
+        tab_bar::stop_background_status(self.background.take());
+        eprintln!("example.native: deactivated {}", context.plugin_id);
         Ok(EXIT_OK)
     }
 
@@ -87,7 +92,10 @@ impl RustPlugin for ExamplePlugin {
 
 bmux_plugin_sdk::define_plugin!(
     factory = |scope: bmux_plugin_sdk::definition::PluginCreateContext| Ok(std::sync::Arc::new(
-        bmux_plugin_sdk::definition::RustPluginAdapter::for_instance(ExamplePlugin, scope.instance)
+        bmux_plugin_sdk::definition::RustPluginAdapter::for_instance(
+            ExamplePlugin::default(),
+            scope.instance
+        )
     )
         as std::sync::Arc<dyn bmux_plugin_sdk::PluginInstance>),
     metadata = bmux_plugin_sdk::PluginMetadata {

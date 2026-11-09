@@ -16,7 +16,6 @@ use bmux_plugin_sdk::{
 use bmux_tab_bar_plugin_api::{
     notifications, status_items, status_items_list::Severity, status_items_state,
 };
-use std::sync::Mutex;
 use std::sync::mpsc;
 use std::thread::JoinHandle;
 
@@ -234,14 +233,10 @@ fn set_item<C: ServiceCaller + Sync>(caller: &C, id: &str, text: &str) -> Result
 
 /// Background thread started from `activate` that owns the activation's
 /// host services, the pattern a plugin uses for periodic status updates.
-struct BackgroundStatus {
+/// The plugin instance owns it; nothing is process-global.
+pub struct BackgroundStatus {
     stop: mpsc::Sender<()>,
     thread: JoinHandle<String>,
-}
-
-fn background_status() -> &'static Mutex<Option<BackgroundStatus>> {
-    static SLOT: Mutex<Option<BackgroundStatus>> = Mutex::new(None);
-    &SLOT
 }
 
 /// Opt-in demo (`[plugins.settings."example.native"] background_status =
@@ -256,7 +251,7 @@ fn background_status() -> &'static Mutex<Option<BackgroundStatus>> {
 pub fn start_background_status(
     context: &NativeLifecycleContext,
     services: Option<bmux_plugin_sdk::PluginHostServices>,
-) {
+) -> Option<BackgroundStatus> {
     // Compare the rendered value so this example need not depend on `toml`.
     let enabled = context
         .settings
@@ -264,22 +259,22 @@ pub fn start_background_status(
         .and_then(|settings| settings.get("background_status"))
         .is_some_and(|value| value.to_string() == "true");
     if !enabled {
-        return;
+        return None;
     }
     let Some(services) = services else {
-        println!("example.native: no activation host services bound; background demo disabled");
-        return;
+        eprintln!("example.native: no activation host services bound; background demo disabled");
+        return None;
     };
     match set_item(&services, "activate", "set during activate") {
-        Ok(()) => println!("example.native: status item set during activate"),
-        Err(error) => println!("example.native: status item during activate failed: {error}"),
+        Ok(()) => eprintln!("example.native: status item set during activate"),
+        Err(error) => eprintln!("example.native: status item during activate failed: {error}"),
     }
     let (stop, stopped) = mpsc::channel::<()>();
     let thread = std::thread::spawn(move || {
         match set_item(&services, "background", "set from a background thread") {
-            Ok(()) => println!("example.native: status item set from background thread"),
+            Ok(()) => eprintln!("example.native: status item set from background thread"),
             Err(error) => {
-                println!("example.native: background status item failed: {error}");
+                eprintln!("example.native: background status item failed: {error}");
             }
         }
         let _ = stopped.recv();
@@ -288,26 +283,20 @@ pub fn start_background_status(
             Err(error) => format!("was rejected: {error}"),
         }
     });
-    if let Ok(mut slot) = background_status().lock() {
-        *slot = Some(BackgroundStatus { stop, thread });
-    }
+    Some(BackgroundStatus { stop, thread })
 }
 
 /// Stop the background thread and report whether its post-deactivation call
 /// went through. Runs from `deactivate`, after the host closed the
 /// activation scope, so the thread's retained handle must be rejected.
-pub fn stop_background_status() {
-    let background = background_status()
-        .lock()
-        .ok()
-        .and_then(|mut slot| slot.take());
+pub fn stop_background_status(background: Option<BackgroundStatus>) {
     if let Some(BackgroundStatus { stop, thread }) = background {
         let _ = stop.send(());
         match thread.join() {
             Ok(outcome) => {
-                println!("example.native: background call after deactivation {outcome}");
+                eprintln!("example.native: background call after deactivation {outcome}");
             }
-            Err(_) => println!("example.native: background status thread panicked"),
+            Err(_) => eprintln!("example.native: background status thread panicked"),
         }
     }
 }
