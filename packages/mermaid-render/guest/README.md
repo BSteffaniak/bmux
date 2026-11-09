@@ -13,6 +13,28 @@ or renderer is installed by the build script. Cargo retains its normal
 network/offline/cache behavior; offline builds require locked dependencies
 cached.
 
+## Packager-supplied artifact
+
+Set `BMUX_MERMAID_WASM_PATH` to a portable WebAssembly v1 module built from
+this revision's guest inputs and diagram font. The host build reads it without
+modification, skips guest staging and nested Cargo entirely, and still validates
+and precompiles both destination-specific AOT variants. An unreadable or invalid
+artifact fails the build; it never silently falls back to a network build.
+Cargo tracks the variable and artifact path for rebuilds. Browser targets still
+skip the host build step.
+
+For Nix and similar offline builders, build the guest as a separate dependency:
+materialize `Cargo.toml.in` and `Cargo.lock.in`, copy `src/lib.rs`, and copy
+`packages/fonts/assets/diagram/BmuxDiagram-Regular.ttf` to the guest root.
+Fetch the guest lockfile's dependencies in the package manager's hash-verified
+fetch phase, then run `cargo build --frozen --release --target
+wasm32-unknown-unknown` with that target installed in the selected toolchain.
+Supply `target/wasm32-unknown-unknown/release/bmux_mermaid_guest.wasm` to the
+host.
+Downloaded dependency sources belong in the package manager's store, not Git.
+Without the variable, ordinary Cargo builds retain the nested build described
+above and require both the target standard library and available dependencies.
+
 ## Isolation exception
 
 A standalone workspace and its own workspace dependency table avoid recursively

@@ -30,10 +30,6 @@ fn build() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let manifest_dir =
         PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").ok_or("missing manifest dir")?);
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").ok_or("missing OUT_DIR")?);
-    let guest_inputs = manifest_dir.join("guest");
-    watch_tree(&guest_inputs)?;
-    let guest = out_dir.join("guest");
-    guest_build::prepare(&guest_inputs, &guest, DIAGRAM_FONT)?;
     watch_tree(&manifest_dir.join("wasm_config.rs"))?;
     let destination_target = env::var("TARGET")?;
     println!("cargo:rustc-env=BMUX_MERMAID_WASM_TARGET={destination_target}");
@@ -41,6 +37,33 @@ fn build() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         println!("cargo:rerun-if-env-changed={name}");
     }
 
+    println!("cargo:rerun-if-env-changed=BMUX_MERMAID_WASM_PATH");
+    let source = if let Some(path) = env::var_os("BMUX_MERMAID_WASM_PATH") {
+        let path = PathBuf::from(path);
+        watch_tree(&path)?;
+        path
+    } else {
+        build_guest(&manifest_dir, &out_dir)?
+    };
+    let wasm = guest_build::read_wasm(&source)?;
+    let destination = out_dir.join("mermaid.wasm");
+    // Each outer Cargo build owns its OUT_DIR. Supplied artifacts are read-only.
+    if fs::read(&destination).ok().as_deref() != Some(wasm.as_slice()) {
+        fs::write(destination, &wasm)?;
+    }
+    // Keep destination-specific AOT compilation in the host build.
+    build_worker::run(|| precompile(&wasm, &destination_target, &out_dir))??;
+    Ok(())
+}
+
+fn build_guest(
+    manifest_dir: &Path,
+    out_dir: &Path,
+) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
+    let guest_inputs = manifest_dir.join("guest");
+    watch_tree(&guest_inputs)?;
+    let guest = out_dir.join("guest");
+    guest_build::prepare(&guest_inputs, &guest, DIAGRAM_FONT)?;
     let cargo = env::var_os("CARGO").ok_or("Cargo did not supply its executable")?;
     let mut command = Command::new(cargo);
     command.current_dir(&guest).args([
@@ -87,33 +110,18 @@ fn build() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let output = command.output()?;
     if !output.status.success() {
         return Err(format!(
-            "guest Cargo failed ({}). Ensure the selected Rust compiler has the {TARGET} standard library installed.\n{}\n{}",
+            "guest Cargo failed ({}). See the Cargo diagnostics below; offline builds need the guest's locked dependencies, and the selected compiler needs the {TARGET} standard library. Packagers may supply BMUX_MERMAID_WASM_PATH.\n{}\n{}",
             output.status,
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         )
         .into());
     }
-    let source = out_dir
+    Ok(out_dir
         .join("guest-target")
         .join(TARGET)
         .join("release")
-        .join(ARTIFACT);
-    let wasm = fs::read(source)?;
-    if !wasm.starts_with(b"\0asm\x01\0\0\0") {
-        return Err("guest build did not produce a WebAssembly v1 module".into());
-    }
-    let destination = out_dir.join("mermaid.wasm");
-    // Cargo serializes this package's build script for a given OUT_DIR. Other
-    // builds have their own OUT_DIR; no shared temp filename or global cache.
-    if fs::read(&destination).ok().as_deref() != Some(wasm.as_slice()) {
-        fs::write(destination, &wasm)?;
-    }
-    // Compile both variants on an owned native stack, not the build script's
-    // platform-dependent main stack. Target/configuration/artifact identity stay
-    // exactly the same; a worker or compiler failure still fails the build.
-    build_worker::run(|| precompile(&wasm, &destination_target, &out_dir))??;
-    Ok(())
+        .join(ARTIFACT))
 }
 
 fn precompile(
