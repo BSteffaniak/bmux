@@ -173,6 +173,67 @@ impl PluginCommand {
 
         paths
     }
+
+    /// Normalize inline option values (`--long=value`, `-s=value`) against
+    /// this command's declared argument schema into the separated form
+    /// (`--long value`) that every plugin command receives.
+    ///
+    /// Only options declared with a value (non-boolean kinds) are split, so
+    /// the value keeps any further `=` characters. Undeclared options,
+    /// boolean flags, values consumed by a preceding option, and everything
+    /// after a `--` separator are forwarded unchanged; when the command has a
+    /// trailing variadic argument, normalization also stops at the first
+    /// positional token so caller-owned trailing argv is never rewritten.
+    /// Returns `None` when no argument needed normalization.
+    #[must_use]
+    pub fn normalize_inline_option_values(&self, arguments: &[String]) -> Option<Vec<String>> {
+        let has_trailing = self
+            .arguments
+            .iter()
+            .any(|argument| argument.trailing_var_arg);
+        let mut normalized: Option<Vec<String>> = None;
+        let mut expects_value = false;
+        let mut rest = arguments.len();
+        for (index, token) in arguments.iter().enumerate() {
+            if expects_value {
+                expects_value = false;
+            } else if token == "--" || (has_trailing && !token.starts_with('-')) {
+                rest = index;
+                break;
+            } else if let Some((option, value)) = token.split_once('=')
+                && self.value_option(option).is_some()
+            {
+                let out = normalized.get_or_insert_with(|| arguments[..index].to_vec());
+                out.push(option.to_string());
+                out.push(value.to_string());
+                continue;
+            } else {
+                expects_value = self.value_option(token).is_some();
+            }
+            if let Some(out) = normalized.as_mut() {
+                out.push(token.clone());
+            }
+        }
+        if let Some(out) = normalized.as_mut() {
+            out.extend(arguments[rest..].iter().cloned());
+        }
+        normalized
+    }
+
+    /// Declared option taking a value that `token` names exactly
+    /// (`--long` or `-s`).
+    fn value_option(&self, token: &str) -> Option<&PluginCommandArgument> {
+        self.arguments.iter().find(|argument| {
+            if matches!(argument.kind, PluginCommandArgumentKind::Boolean) {
+                return false;
+            }
+            if let Some(long) = token.strip_prefix("--") {
+                return argument.long.as_deref() == Some(long);
+            }
+            let mut chars = token.strip_prefix('-').unwrap_or_default().chars();
+            matches!((chars.next(), chars.next()), (Some(short), None) if argument.short == Some(short))
+        })
+    }
 }
 
 impl PluginCommandArgument {
@@ -290,7 +351,111 @@ impl PluginCommandArgument {
 
 #[cfg(test)]
 mod tests {
-    use super::{CommandExecutionKind, PluginCommand};
+    use super::{
+        CommandExecutionKind, PluginCommand, PluginCommandArgument, PluginCommandArgumentKind,
+    };
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(ToString::to_string).collect()
+    }
+
+    fn new_tab() -> PluginCommand {
+        PluginCommand::new("new-tab", "Create a tab")
+            .argument(
+                PluginCommandArgument::option("name", PluginCommandArgumentKind::String).short('n'),
+            )
+            .argument(PluginCommandArgument::option(
+                "count",
+                PluginCommandArgumentKind::Integer,
+            ))
+            .argument(PluginCommandArgument::flag("force"))
+            .argument(PluginCommandArgument::positional(
+                "target",
+                PluginCommandArgumentKind::String,
+            ))
+    }
+
+    #[test]
+    fn inline_option_value_is_split_into_separated_form() {
+        assert_eq!(
+            new_tab().normalize_inline_option_values(&args(&["--name=deps"])),
+            Some(args(&["--name", "deps"]))
+        );
+        assert_eq!(
+            new_tab().normalize_inline_option_values(&args(&["-n=deps", "--count=2", "x"])),
+            Some(args(&["-n", "deps", "--count", "2", "x"]))
+        );
+    }
+
+    #[test]
+    fn separated_option_value_is_left_unchanged() {
+        assert_eq!(
+            new_tab().normalize_inline_option_values(&args(&["--name", "deps", "--force"])),
+            None
+        );
+    }
+
+    #[test]
+    fn inline_option_value_keeps_embedded_equals_signs() {
+        assert_eq!(
+            new_tab().normalize_inline_option_values(&args(&["--name=a=b=c"])),
+            Some(args(&["--name", "a=b=c"]))
+        );
+        assert_eq!(
+            new_tab().normalize_inline_option_values(&args(&["--name="])),
+            Some(args(&["--name", ""]))
+        );
+    }
+
+    #[test]
+    fn unknown_options_and_boolean_flags_are_forwarded_verbatim() {
+        assert_eq!(
+            new_tab().normalize_inline_option_values(&args(&[
+                "--unknown=value",
+                "--force=true",
+                "--names=x",
+            ])),
+            None
+        );
+        assert_eq!(
+            new_tab().normalize_inline_option_values(&args(&["--unknown=value", "--name=deps"])),
+            Some(args(&["--unknown=value", "--name", "deps"]))
+        );
+    }
+
+    #[test]
+    fn option_values_and_separator_tail_are_never_split() {
+        assert_eq!(
+            new_tab().normalize_inline_option_values(&args(&["--name", "--count=2"])),
+            None
+        );
+        assert_eq!(
+            new_tab().normalize_inline_option_values(&args(&["--", "--name=deps"])),
+            None
+        );
+        assert_eq!(
+            new_tab().normalize_inline_option_values(&args(&["--count=1", "--", "--name=deps"])),
+            Some(args(&["--count", "1", "--", "--name=deps"]))
+        );
+    }
+
+    #[test]
+    fn trailing_variadic_argv_after_first_positional_is_caller_owned() {
+        let command = PluginCommand::new("run", "Run")
+            .argument(PluginCommandArgument::option(
+                "name",
+                PluginCommandArgumentKind::String,
+            ))
+            .argument(
+                PluginCommandArgument::positional("argv", PluginCommandArgumentKind::String)
+                    .multiple(true)
+                    .trailing_var_arg(true),
+            );
+        assert_eq!(
+            command.normalize_inline_option_values(&args(&["--name=a", "cmd", "--name=b"])),
+            Some(args(&["--name", "a", "cmd", "--name=b"]))
+        );
+    }
 
     #[test]
     fn caller_process_execution_deserializes_from_manifest_value() {

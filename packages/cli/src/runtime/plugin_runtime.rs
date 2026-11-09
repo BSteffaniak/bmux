@@ -2870,6 +2870,16 @@ fn run_plugin_command_internal_with_state(
     if !enabled_plugins.iter().any(|enabled| enabled == plugin_id) {
         anyhow::bail!(format_plugin_not_enabled_message(plugin_id));
     }
+    // Every entry point (CLI, keybinding, bridge, server) reaches the plugin
+    // through this one place, so inline `--option=value` forms are accepted
+    // for all plugin commands against their declared argument schema.
+    let normalized_args = plugin
+        .declaration
+        .commands
+        .iter()
+        .find(|command| command.name == command_name)
+        .and_then(|command| command.normalize_inline_option_values(args));
+    let args = normalized_args.as_deref().unwrap_or(args);
     let lookup_us = lookup_started.elapsed().as_micros();
 
     let load_started = Instant::now();
