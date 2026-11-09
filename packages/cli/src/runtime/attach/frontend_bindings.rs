@@ -187,6 +187,30 @@ impl FrontendBindingRegistrar {
         })
     }
 
+    /// The loader activation binder this attachment registers on the frontend
+    /// instances it owns. The loader calls it with each actual activation
+    /// scope; the minted ports are offered to that activation only, and their
+    /// inboxes close when it deactivates.
+    #[must_use]
+    pub fn activation_binder(self) -> std::sync::Arc<bmux_plugin::ActivationBinder> {
+        std::sync::Arc::new(
+            move |scope: &ActivationScope,
+                  capabilities: &bmux_plugin_sdk::definition::ActivationCapabilities| {
+                let failure =
+                    |details: String| bmux_plugin_sdk::PluginError::ServiceProtocol { details };
+                let (prompt, actions) = self
+                    .bind(scope.clone(), scope.instance_id())
+                    .map_err(|error| failure(format!("{error:#}")))?;
+                capabilities
+                    .insert(prompt)
+                    .map_err(|error| failure(error.message))?;
+                capabilities
+                    .insert(actions)
+                    .map_err(|error| failure(error.message))
+            },
+        )
+    }
+
     /// The caller supplies the actual loader-owned activation, never decoded IDs.
     ///
     /// # Errors

@@ -266,6 +266,10 @@ pub struct AttachViewState {
     /// entry and moved explicitly to every command worker.
     pub(in crate::runtime) command_state:
         Option<crate::runtime::plugin_runtime::RuntimeCommandState>,
+    /// Frontend plugin instances this attachment owns for its lifetime,
+    /// activated with the attachment's own prompt/action channels.
+    pub(in crate::runtime) owned_frontends:
+        Option<std::sync::Arc<crate::runtime::plugin_runtime::OwnedFrontends>>,
     pub attached_id: Uuid,
     pub attached_context_id: Option<Uuid>,
     pub can_write: bool,
@@ -672,6 +676,7 @@ impl AttachViewState {
             presentation_input: bmux_plugin::global_attach_presentation_input_registry_handle(),
             self_client_id: None,
             command_state: None,
+            owned_frontends: None,
             attached_id: attach_info.session_id,
             attached_context_id: attach_info.context_id,
             can_write: attach_info.can_write,

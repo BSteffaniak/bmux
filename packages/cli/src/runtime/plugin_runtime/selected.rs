@@ -584,6 +584,42 @@ impl ProductionPlugin {
             .map_err(|_| failure("lifecycle authority already bound"))
     }
 
+    /// Register a trusted host activation binder before this instance activates.
+    pub(in crate::runtime) fn bind_activation_binder(
+        &self,
+        binder: Arc<bmux_plugin::ActivationBinder>,
+    ) -> bmux_plugin_sdk::Result<()> {
+        match &self.backend {
+            Backend::Scoped(execution) => execution.bind_activation_binder(binder),
+            Backend::Process(_) => Err(failure(
+                "host activation capabilities cannot reach a process-packaged plugin",
+            )),
+        }
+    }
+
+    /// Activate a host-owned instance once for its owner's lifetime. No
+    /// per-command transport is captured as the activation's host route: each
+    /// later command binds its own dispatch.
+    pub(in crate::runtime) fn activate_owned(
+        &self,
+        context: &NativeCommandContext,
+    ) -> bmux_plugin_sdk::Result<()> {
+        let Backend::Scoped(execution) = &self.backend else {
+            return Err(failure("host-owned activation requires a scoped instance"));
+        };
+        if self.active.load(std::sync::atomic::Ordering::Acquire) {
+            return Ok(());
+        }
+        let mut context = context.clone();
+        context.host_kernel_bridge = None;
+        self.bind_host_builtins(
+            &context.connection,
+            &context.services,
+            &context.plugin_settings_map,
+        )?;
+        self.activate_scoped_command(execution, &context, None)
+    }
+
     pub(in crate::runtime) async fn activate_async(
         &self,
         context: &NativeLifecycleContext,

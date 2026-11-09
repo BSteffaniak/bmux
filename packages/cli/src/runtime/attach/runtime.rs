@@ -5136,7 +5136,17 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
 
     let mut view_state = AttachViewState::with_private_presentation(attach_info);
     view_state.frontend_presentations = terminal.take_frontend_presentations();
-    let mut frontend_bindings = terminal.take_frontend_bindings();
+    // An embedder may supply its own scoped frontend host; otherwise this
+    // attachment owns one, plus the frontend instances bound to it.
+    let embedder_frontend_bindings = terminal.take_frontend_bindings();
+    let compatibility_hosts = embedder_frontend_bindings.is_none();
+    let mut frontend_bindings = embedder_frontend_bindings.or_else(|| {
+        let (registrar, bindings) = super::frontend_bindings::FrontendBindings::channel();
+        view_state.owned_frontends = Some(std::sync::Arc::new(
+            crate::runtime::plugin_runtime::OwnedFrontends::new(registrar.activation_binder()),
+        ));
+        Some(bindings)
+    });
     view_state.presentation_only = terminal.presentation_only();
     view_state.observation_only = terminal.observation_only();
     if view_state.observation_only {
@@ -5296,23 +5306,25 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
     let (async_service_tx, mut async_service_rx) = tokio::sync::mpsc::channel(16);
     view_state.async_services = Some(attach_async_service_route(&client, async_service_tx)?);
     let (prompt_host_tx, mut prompt_host_rx) = tokio::sync::mpsc::unbounded_channel();
-    let _prompt_host_guard = if frontend_bindings.is_none() {
+    // This attachment's own scoped host serves activation-bound frontends; the
+    // process-global compatibility channel still serves plugins that submit
+    // through it. An embedder-supplied scoped host never replaces or consults
+    // the global channel; unrelated legacy attachments keep their owner.
+    let _prompt_host_guard = if compatibility_hosts {
         Some(prompt::register_host(prompt_host_tx))
     } else {
-        // A scoped frontend host never replaces or consults the process-global
-        // compatibility channel; unrelated legacy attachments keep their owner.
         drop(prompt_host_tx);
         None
     };
-    let mut prompt_host_open = frontend_bindings.is_none();
+    let mut prompt_host_open = compatibility_hosts;
     let (action_dispatch_tx, mut action_dispatch_rx) = tokio::sync::mpsc::unbounded_channel();
-    let _action_dispatch_guard = if frontend_bindings.is_none() {
+    let _action_dispatch_guard = if compatibility_hosts {
         Some(action_dispatch::register_host(action_dispatch_tx))
     } else {
         drop(action_dispatch_tx);
         None
     };
-    let mut action_dispatch_open = frontend_bindings.is_none();
+    let mut action_dispatch_open = compatibility_hosts;
     // Default exit reason; always overwritten before the loop breaks, but the
     // compiler cannot prove this through the tokio::select! macro expansion.
     #[allow(unused_assignments)]
@@ -6701,6 +6713,13 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
         resume: None,
     })
     }.await;
+    // Release every activation-bound frontend channel with this attachment.
+    if let Some(frontends) = view_state.owned_frontends.take()
+        && let Some(state) = view_state.command_state.as_ref()
+        && let Err(error) = frontends.deactivate_all(state).await
+    {
+        warn!(%error, "attach.frontends.deactivate_failed");
+    }
     if let Some(source) = view_state.committed_source.take() {
         source.unregister(&mut client).await;
     }
@@ -8058,6 +8077,7 @@ pub async fn handle_attach_plugin_command_action(
             // The blocking worker has no task or thread context of its own:
             // the attachment's selected command runtime moves to it explicitly.
             let command_state = view_state.command_state.clone();
+            let owned_frontends = view_state.owned_frontends.clone();
             let command = tokio::task::spawn_blocking(move || {
                 let _transport = super::super::plugin_kernel::enter_invoking_transport(sender);
                 let command_state = command_state.ok_or_else(|| ClientError::ServerError {
@@ -8073,6 +8093,7 @@ pub async fn handle_attach_plugin_command_action(
                     caller,
                     active_keybindings,
                     dispatch,
+                    owned_frontends.as_deref(),
                 )
                 .map(|execution| AttachPluginCommandPipelineExecution {
                     status: execution.status,

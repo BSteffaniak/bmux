@@ -1,4 +1,6 @@
 mod kernel_policy;
+mod owned_frontends;
+pub(super) use owned_frontends::OwnedFrontends;
 #[cfg(feature = "bundled-plugin-recording")]
 pub(super) mod recording_binding;
 mod selected;
@@ -2607,6 +2609,7 @@ pub(super) fn run_plugin_keybinding_command_with_active_bindings(
     )
 }
 
+#[allow(clippy::too_many_arguments)] // The attach worker's selected route, caller and frontend owner are independent inputs.
 pub(super) fn run_plugin_keybinding_command_with_dispatch(
     state: &RuntimeCommandState,
     plugin_id: &str,
@@ -2615,6 +2618,7 @@ pub(super) fn run_plugin_keybinding_command_with_dispatch(
     caller_client_id: Option<uuid::Uuid>,
     active_keybindings: Vec<bmux_plugin_sdk::ActiveKeybinding>,
     dispatch: super::plugin_kernel::CommandDispatch,
+    frontends: Option<&OwnedFrontends>,
 ) -> Result<PluginCommandExecution> {
     run_plugin_command_internal_with_state(
         Some(state),
@@ -2626,7 +2630,7 @@ pub(super) fn run_plugin_keybinding_command_with_dispatch(
         active_keybindings,
         bmux_plugin_sdk::NativeCommandInvocationSource::AttachKeybinding,
         Some(dispatch),
-        None,
+        frontends.map(CommandOwner::Frontends),
     )
 }
 
@@ -2677,11 +2681,34 @@ pub(super) fn run_plugin_command_with_service_authority(
         Vec::new(),
         bmux_plugin_sdk::NativeCommandInvocationSource::AttachKeybinding,
         None,
-        Some(ServerCommandAuthority {
+        Some(CommandOwner::Server(ServerCommandAuthority {
             authority,
             instance,
-        }),
+        })),
     )
+}
+
+/// Who owns the instance a command runs on, when not a fresh command-local one.
+pub(super) enum CommandOwner<'a> {
+    Server(ServerCommandAuthority<'a>),
+    /// A host's owned frontends (e.g. one attachment's), activated with that
+    /// host's activation binder for the host's lifetime.
+    Frontends(&'a OwnedFrontends),
+}
+impl<'a> CommandOwner<'a> {
+    fn split(
+        owner: Option<Self>,
+    ) -> (
+        Option<super::plugin_kernel::AuthenticatedServiceInvocation>,
+        Option<&'a ProductionPlugin>,
+        Option<&'a OwnedFrontends>,
+    ) {
+        match owner {
+            None => (None, None, None),
+            Some(Self::Server(command)) => (Some(command.authority), command.instance, None),
+            Some(Self::Frontends(frontends)) => (None, None, Some(frontends)),
+        }
+    }
 }
 
 /// A server-authenticated command request and the startup instance (if this
@@ -2855,11 +2882,9 @@ fn run_plugin_command_internal_with_state(
     active_keybindings: Vec<bmux_plugin_sdk::ActiveKeybinding>,
     invocation_source: bmux_plugin_sdk::NativeCommandInvocationSource,
     command_dispatch: Option<super::plugin_kernel::CommandDispatch>,
-    server_command: Option<ServerCommandAuthority<'_>>,
+    instance_owner: Option<CommandOwner<'_>>,
 ) -> Result<PluginCommandExecution> {
-    let (command_authority, startup_instance) = server_command.map_or((None, None), |command| {
-        (Some(command.authority), command.instance)
-    });
+    let (command_authority, startup_instance, frontends) = CommandOwner::split(instance_owner);
     let total_started = Instant::now();
     let runtime_state_started = Instant::now();
     let cached_state;
@@ -2900,12 +2925,6 @@ fn run_plugin_command_internal_with_state(
     let args = normalized_args.as_deref().unwrap_or(args);
     let lookup_us = lookup_started.elapsed().as_micros();
 
-    let load_started = Instant::now();
-    let loaded = match startup_instance {
-        Some(instance) => Rc::new(instance.clone()),
-        None => load_command_plugin(plugin, state, command_dispatch.is_some())?,
-    };
-    let load_us = load_started.elapsed().as_micros();
     let context_started = Instant::now();
     let context = plugin_command_context(
         config,
@@ -2923,13 +2942,20 @@ fn run_plugin_command_internal_with_state(
         invocation_source,
     );
     let context_us = context_started.elapsed().as_micros();
+    let instance = command_instance(
+        plugin,
+        state,
+        &context,
+        startup_instance,
+        frontends,
+        command_dispatch.is_some(),
+    )?;
     let _host_kernel_connection_guard = enter_host_kernel_connection(context.connection.clone());
     let _host_kernel_factory_guard =
         kernel_client_factory.map(|f| enter_host_kernel_client_factory(Arc::clone(f)));
     let _async_route = bind_captured_command_route(&context)?;
     let run_started = Instant::now();
-    let command_local = command_dispatch.is_some();
-    let run_result = loaded.run_command_with_dispatch(
+    let run_result = instance.loaded.run_command_with_dispatch(
         command_name,
         args,
         Some(&context),
@@ -2939,8 +2965,8 @@ fn run_plugin_command_internal_with_state(
     // The issuing route (and its callback parent lease) ends with the command
     // invocation; deactivation below binds its own lifecycle route.
     drop(command_dispatch);
-    if command_local && run_result.is_ok() {
-        retire_command_local_plugin(state, plugin, &loaded)?;
+    if instance.retire && run_result.is_ok() {
+        retire_command_local_plugin(state, plugin, &instance.loaded)?;
     }
     let run_us = run_started.elapsed().as_micros();
     let (status, outcome) = run_result.map_err(|error| {
@@ -2964,12 +2990,53 @@ fn run_plugin_command_internal_with_state(
         invocation_source,
         runtime_state_us,
         lookup_us,
-        load_us,
+        instance.load_us,
         context_us,
         run_us,
         total_started.elapsed().as_micros(),
     );
     Ok(PluginCommandExecution { status, outcome })
+}
+
+/// The instance one command runs on.
+struct CommandInstance {
+    loaded: Rc<ProductionPlugin>,
+    /// Whether this command retires its fresh command-local instance after
+    /// success. Startup and host-owned instances are retired by their owners.
+    retire: bool,
+    load_us: u128,
+}
+
+/// Select the instance for one command. A host-owned frontend keeps one
+/// activation for its owner's lifetime; only its owner retires it.
+fn command_instance(
+    plugin: &bmux_plugin::RegisteredPlugin,
+    state: &RuntimeCommandState,
+    context: &NativeCommandContext,
+    startup_instance: Option<&ProductionPlugin>,
+    frontends: Option<&OwnedFrontends>,
+    command_local: bool,
+) -> Result<CommandInstance> {
+    let started = Instant::now();
+    let (loaded, retire) = if let Some(instance) = startup_instance {
+        (Rc::new(instance.clone()), command_local)
+    } else if let Some(hosted) = frontends
+        .map(|frontends| frontends.instance(plugin, state, context))
+        .transpose()?
+        .flatten()
+    {
+        (Rc::new(hosted), false)
+    } else {
+        (
+            load_command_plugin(plugin, state, command_local)?,
+            command_local,
+        )
+    };
+    Ok(CommandInstance {
+        loaded,
+        retire,
+        load_us: started.elapsed().as_micros(),
+    })
 }
 
 /// Load the plugin implementation for one command. A command-local activation
@@ -2996,16 +3063,15 @@ fn load_command_plugin(
     }
 }
 
-/// Retire a fresh command-local instance after its command succeeded.
-fn retire_command_local_plugin(
+/// Lifecycle context for an instance owned by this selected command runtime.
+fn command_lifecycle_context(
     state: &RuntimeCommandState,
-    plugin: &bmux_plugin::RegisteredPlugin,
-    loaded: &ProductionPlugin,
-) -> Result<()> {
-    let lifecycle = plugin_lifecycle_context(
+    declaration: &bmux_plugin::PluginDeclaration,
+) -> NativeLifecycleContext {
+    plugin_lifecycle_context(
         &state.config,
         &state.paths,
-        &plugin.declaration,
+        declaration,
         PluginLifecycleAvailability {
             services: state.available_services.clone(),
             capabilities: state.available_capability_names.clone(),
@@ -3013,7 +3079,16 @@ fn retire_command_local_plugin(
             search_roots: state.plugin_search_roots.clone(),
             registered_plugins: state.registered_plugin_infos.clone(),
         },
-    );
+    )
+}
+
+/// Retire a fresh command-local instance after its command succeeded.
+fn retire_command_local_plugin(
+    state: &RuntimeCommandState,
+    plugin: &bmux_plugin::RegisteredPlugin,
+    loaded: &ProductionPlugin,
+) -> Result<()> {
+    let lifecycle = command_lifecycle_context(state, &plugin.declaration);
     // On this blocking command worker the connection owner remains pumping.
     // Never destroy an uncertain/error operation or substitute timeout for
     // settlement. Successful terminal work retires its fresh instance.
