@@ -6,8 +6,8 @@ use std::ops::Range;
 use crate::chrome::{Border, BorderSide};
 use crate::component::LogicalInsets;
 use crate::component::{
-    ChildLayout, Component, ComponentRevision, Constraints, Element, LayoutCx, LayoutId,
-    LayoutNode, LogicalSize, combine_child_revisions,
+    ChildLayout, Component, ComponentRevision, Constraints, Element, ElementObject,
+    IntoElementObject, LayoutCx, LayoutId, LayoutNode, LogicalSize, combine_child_revisions,
 };
 use crate::geometry::Rect;
 use crate::paint::{LocalRect, PaintCx};
@@ -24,7 +24,7 @@ fn stable_revision(hash: impl FnOnce(&mut std::collections::hash_map::DefaultHas
 }
 
 fn event_single_child(
-    child: &Element<'_>,
+    child: &(impl Component + ?Sized),
     event: &crate::event::Event,
     layout: &LayoutNode,
     cx: &mut crate::component::EventCx<'_>,
@@ -38,7 +38,7 @@ fn event_single_child(
 }
 
 fn event_children(
-    children: &[Element<'_>],
+    children: &[impl Component],
     event: &crate::event::Event,
     layout: &LayoutNode,
     cx: &mut crate::component::EventCx<'_>,
@@ -804,9 +804,9 @@ impl Component for TextBlock {
 }
 
 /// A child-owning rectangular style, border, and padding container.
-pub struct Surface<'a> {
+pub struct Surface<'a, C: ?Sized = dyn Component + 'a> {
     id: LayoutId,
-    child: Element<'a>,
+    child: Element<'a, C>,
     background: Style,
     content_style: Style,
     border: Option<Border>,
@@ -818,9 +818,17 @@ impl<'a> Surface<'a> {
     /// Create a surface containing one child.
     #[must_use]
     pub fn new(child: impl Component + 'a) -> Self {
+        Self::from_element(Element::new(child))
+    }
+}
+
+impl<'a, C: ?Sized + ElementObject> Surface<'a, C> {
+    /// Create a surface containing one already erased child.
+    #[must_use]
+    pub fn from_element(child: Element<'a, C>) -> Self {
         Self {
             id: LayoutId::new("surface"),
-            child: Element::new(child),
+            child,
             background: Style::new(),
             content_style: Style::new(),
             border: None,
@@ -899,7 +907,7 @@ impl<'a> Surface<'a> {
     }
 }
 
-impl Component for Surface<'_> {
+impl<C: ?Sized + ElementObject> Component for Surface<'_, C> {
     fn revision(&self) -> ComponentRevision {
         self.own_revision().combine(self.child.revision())
     }
@@ -1059,23 +1067,31 @@ fn paint_border(
 }
 
 /// Assign stable keyed identity to one child without changing its geometry.
-pub struct Keyed<'a> {
+pub struct Keyed<'a, C: ?Sized = dyn Component + 'a> {
     id: LayoutId,
-    child: Element<'a>,
+    child: Element<'a, C>,
 }
 
 impl<'a> Keyed<'a> {
     /// Create a keyed identity wrapper.
     #[must_use]
     pub fn new(id: impl Into<LayoutId>, child: impl Component + 'a) -> Self {
+        Self::from_element(id, Element::new(child))
+    }
+}
+
+impl<'a, C: ?Sized + ElementObject> Keyed<'a, C> {
+    /// Create a keyed identity wrapper around an already erased child.
+    #[must_use]
+    pub fn from_element(id: impl Into<LayoutId>, child: Element<'a, C>) -> Self {
         Self {
             id: id.into(),
-            child: Element::new(child),
+            child,
         }
     }
 }
 
-impl Component for Keyed<'_> {
+impl<C: ?Sized + ElementObject> Component for Keyed<'_, C> {
     fn revision(&self) -> ComponentRevision {
         let own = ComponentRevision::new(stable_revision(|state| self.id.as_str().hash(state)), 0);
         own.combine(self.child.revision())
@@ -1110,20 +1126,28 @@ impl Component for Keyed<'_> {
 
 /// Make one child clickable: registers a pointer hit region with `id` over the area the child
 /// is laid out in, without changing its geometry or painting.
-pub struct HitArea<'a> {
+pub struct HitArea<'a, C: ?Sized = dyn Component + 'a> {
     id: crate::hit::HitId,
     role: crate::hit::HitRole,
-    child: Element<'a>,
+    child: Element<'a, C>,
 }
 
 impl<'a> HitArea<'a> {
     /// A clickable wrapper registering `id` as an action.
     #[must_use]
     pub fn new(id: impl Into<crate::hit::HitId>, child: impl Component + 'a) -> Self {
+        Self::from_element(id, Element::new(child))
+    }
+}
+
+impl<'a, C: ?Sized + ElementObject> HitArea<'a, C> {
+    /// A clickable wrapper registering `id` as an action around an already erased child.
+    #[must_use]
+    pub fn from_element(id: impl Into<crate::hit::HitId>, child: Element<'a, C>) -> Self {
         Self {
             id: id.into(),
             role: crate::hit::HitRole::Action,
-            child: Element::new(child),
+            child,
         }
     }
 
@@ -1135,7 +1159,7 @@ impl<'a> HitArea<'a> {
     }
 }
 
-impl Component for HitArea<'_> {
+impl<C: ?Sized + ElementObject> Component for HitArea<'_, C> {
     fn revision(&self) -> ComponentRevision {
         let own = ComponentRevision::new(stable_revision(|state| self.id.as_str().hash(state)), 0);
         own.combine(self.child.revision())
@@ -1177,16 +1201,24 @@ impl Component for HitArea<'_> {
 }
 
 /// Add measurable insets around one child without introducing visual chrome.
-pub struct Padding<'a> {
-    surface: Surface<'a>,
+pub struct Padding<'a, C: ?Sized = dyn Component + 'a> {
+    surface: Surface<'a, C>,
 }
 
 impl<'a> Padding<'a> {
     /// Create a padding wrapper.
     #[must_use]
     pub fn new(insets: impl Into<LogicalInsets>, child: impl Component + 'a) -> Self {
+        Self::from_element(insets, Element::new(child))
+    }
+}
+
+impl<'a, C: ?Sized + ElementObject> Padding<'a, C> {
+    /// Create a padding wrapper around an already erased child.
+    #[must_use]
+    pub fn from_element(insets: impl Into<LogicalInsets>, child: Element<'a, C>) -> Self {
         Self {
-            surface: Surface::new(child).id("padding").padding(insets),
+            surface: Surface::from_element(child).id("padding").padding(insets),
         }
     }
 
@@ -1198,7 +1230,7 @@ impl<'a> Padding<'a> {
     }
 }
 
-impl Component for Padding<'_> {
+impl<C: ?Sized + ElementObject> Component for Padding<'_, C> {
     fn revision(&self) -> ComponentRevision {
         self.surface.revision()
     }
@@ -1222,16 +1254,24 @@ impl Component for Padding<'_> {
 }
 
 /// Fill one complete measured rectangle behind a child.
-pub struct Fill<'a> {
-    surface: Surface<'a>,
+pub struct Fill<'a, C: ?Sized = dyn Component + 'a> {
+    surface: Surface<'a, C>,
 }
 
 impl<'a> Fill<'a> {
     /// Create a complete rectangular fill wrapper.
     #[must_use]
     pub fn new(style: Style, child: impl Component + 'a) -> Self {
+        Self::from_element(style, Element::new(child))
+    }
+}
+
+impl<'a, C: ?Sized + ElementObject> Fill<'a, C> {
+    /// Create a complete rectangular fill wrapper around an already erased child.
+    #[must_use]
+    pub fn from_element(style: Style, child: Element<'a, C>) -> Self {
         Self {
-            surface: Surface::new(child).id("fill").background(style),
+            surface: Surface::from_element(child).id("fill").background(style),
         }
     }
 
@@ -1243,7 +1283,7 @@ impl<'a> Fill<'a> {
     }
 }
 
-impl Component for Fill<'_> {
+impl<C: ?Sized + ElementObject> Component for Fill<'_, C> {
     fn revision(&self) -> ComponentRevision {
         self.surface.revision()
     }
@@ -1267,9 +1307,9 @@ impl Component for Fill<'_> {
 }
 
 /// Constrain one child with optional fixed/minimum/maximum dimensions.
-pub struct SizeBox<'a> {
+pub struct SizeBox<'a, C: ?Sized = dyn Component + 'a> {
     id: LayoutId,
-    child: Element<'a>,
+    child: Element<'a, C>,
     width: Option<u64>,
     height: Option<u64>,
     min_width: u64,
@@ -1282,9 +1322,17 @@ impl<'a> SizeBox<'a> {
     /// Create a size-constraining wrapper.
     #[must_use]
     pub fn new(child: impl Component + 'a) -> Self {
+        Self::from_element(Element::new(child))
+    }
+}
+
+impl<'a, C: ?Sized + ElementObject> SizeBox<'a, C> {
+    /// Create a size-constraining wrapper around an already erased child.
+    #[must_use]
+    pub fn from_element(child: Element<'a, C>) -> Self {
         Self {
             id: LayoutId::new("size"),
-            child: Element::new(child),
+            child,
             width: None,
             height: None,
             min_width: 0,
@@ -1344,7 +1392,7 @@ impl<'a> SizeBox<'a> {
     }
 }
 
-impl Component for SizeBox<'_> {
+impl<C: ?Sized + ElementObject> Component for SizeBox<'_, C> {
     fn revision(&self) -> ComponentRevision {
         ComponentRevision::new(
             stable_revision(|state| {
@@ -1421,9 +1469,9 @@ impl Component for SizeBox<'_> {
 }
 
 /// Align one intrinsically measured child inside the parent-assigned rectangle.
-pub struct Align<'a> {
+pub struct Align<'a, C: ?Sized = dyn Component + 'a> {
     id: LayoutId,
-    child: Element<'a>,
+    child: Element<'a, C>,
     horizontal: HorizontalAlignment,
     vertical: VerticalAlignment,
 }
@@ -1432,9 +1480,17 @@ impl<'a> Align<'a> {
     /// Create an alignment wrapper.
     #[must_use]
     pub fn new(child: impl Component + 'a) -> Self {
+        Self::from_element(Element::new(child))
+    }
+}
+
+impl<'a, C: ?Sized + ElementObject> Align<'a, C> {
+    /// Create an alignment wrapper around an already erased child.
+    #[must_use]
+    pub fn from_element(child: Element<'a, C>) -> Self {
         Self {
             id: LayoutId::new("align"),
-            child: Element::new(child),
+            child,
             horizontal: HorizontalAlignment::Start,
             vertical: VerticalAlignment::Start,
         }
@@ -1462,7 +1518,7 @@ impl<'a> Align<'a> {
     }
 }
 
-impl Component for Align<'_> {
+impl<C: ?Sized + ElementObject> Component for Align<'_, C> {
     fn revision(&self) -> ComponentRevision {
         ComponentRevision::new(
             stable_revision(|state| {
@@ -1538,18 +1594,26 @@ impl Component for Align<'_> {
 }
 
 /// Paint one child through an explicit local clip.
-pub struct Clip<'a> {
+pub struct Clip<'a, C: ?Sized = dyn Component + 'a> {
     id: LayoutId,
-    child: Element<'a>,
+    child: Element<'a, C>,
 }
 
 impl<'a> Clip<'a> {
     /// Create a clipping wrapper.
     #[must_use]
     pub fn new(child: impl Component + 'a) -> Self {
+        Self::from_element(Element::new(child))
+    }
+}
+
+impl<'a, C: ?Sized + ElementObject> Clip<'a, C> {
+    /// Create a clipping wrapper around an already erased child.
+    #[must_use]
+    pub fn from_element(child: Element<'a, C>) -> Self {
         Self {
             id: LayoutId::new("clip"),
-            child: Element::new(child),
+            child,
         }
     }
 
@@ -1561,7 +1625,7 @@ impl<'a> Clip<'a> {
     }
 }
 
-impl Component for Clip<'_> {
+impl<C: ?Sized + ElementObject> Component for Clip<'_, C> {
     fn revision(&self) -> ComponentRevision {
         ComponentRevision::new(stable_revision(|state| self.id.as_str().hash(state)), 0)
             .combine(self.child.revision())
@@ -1592,9 +1656,9 @@ impl Component for Clip<'_> {
 }
 
 /// Apply inherited style to one child without changing geometry.
-pub struct StyleScope<'a> {
+pub struct StyleScope<'a, C: ?Sized = dyn Component + 'a> {
     id: LayoutId,
-    child: Element<'a>,
+    child: Element<'a, C>,
     style: Style,
 }
 
@@ -1602,9 +1666,17 @@ impl<'a> StyleScope<'a> {
     /// Create an inherited-style wrapper.
     #[must_use]
     pub fn new(child: impl Component + 'a, style: Style) -> Self {
+        Self::from_element(Element::new(child), style)
+    }
+}
+
+impl<'a, C: ?Sized + ElementObject> StyleScope<'a, C> {
+    /// Create an inherited-style wrapper around an already erased child.
+    #[must_use]
+    pub fn from_element(child: Element<'a, C>, style: Style) -> Self {
         Self {
             id: LayoutId::new("style"),
-            child: Element::new(child),
+            child,
             style,
         }
     }
@@ -1617,7 +1689,7 @@ impl<'a> StyleScope<'a> {
     }
 }
 
-impl Component for StyleScope<'_> {
+impl<C: ?Sized + ElementObject> Component for StyleScope<'_, C> {
     fn revision(&self) -> ComponentRevision {
         ComponentRevision::new(
             stable_revision(|state| self.id.as_str().hash(state)),
@@ -1651,9 +1723,9 @@ impl Component for StyleScope<'_> {
 }
 
 /// Include or omit a child while retaining ordinary composition semantics.
-pub struct Visibility<'a> {
+pub struct Visibility<'a, C: ?Sized = dyn Component + 'a> {
     id: LayoutId,
-    child: Element<'a>,
+    child: Element<'a, C>,
     visible: bool,
 }
 
@@ -1661,9 +1733,17 @@ impl<'a> Visibility<'a> {
     /// Create a visibility wrapper.
     #[must_use]
     pub fn new(child: impl Component + 'a, visible: bool) -> Self {
+        Self::from_element(Element::new(child), visible)
+    }
+}
+
+impl<'a, C: ?Sized + ElementObject> Visibility<'a, C> {
+    /// Create a visibility wrapper around an already erased child.
+    #[must_use]
+    pub fn from_element(child: Element<'a, C>, visible: bool) -> Self {
         Self {
             id: LayoutId::new("visibility"),
-            child: Element::new(child),
+            child,
             visible,
         }
     }
@@ -1676,7 +1756,7 @@ impl<'a> Visibility<'a> {
     }
 }
 
-impl Component for Visibility<'_> {
+impl<C: ?Sized + ElementObject> Component for Visibility<'_, C> {
     fn revision(&self) -> ComponentRevision {
         ComponentRevision::new(
             stable_revision(|state| {
@@ -1725,15 +1805,27 @@ impl Component for Visibility<'_> {
 }
 
 /// Overlay children in deterministic insertion/paint order.
-pub struct Stack<'a> {
+pub struct Stack<'a, C: ?Sized = dyn Component + 'a> {
     id: LayoutId,
-    children: Vec<Element<'a>>,
+    children: Vec<Element<'a, C>>,
 }
 
-impl<'a> Stack<'a> {
+impl Stack<'_> {
     /// Create an empty overlay stack.
     #[must_use]
     pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl<'a, C: ?Sized + ElementObject> Stack<'a, C> {
+    /// Create an empty overlay stack for any child object type.
+    ///
+    /// Unlike `new`/`Default`, which use the default object type, the object
+    /// type is chosen by annotation or inference, for example
+    /// `Stack::<dyn Component + Send>::empty()`.
+    #[must_use]
+    pub fn empty() -> Self {
         Self {
             id: LayoutId::new("stack"),
             children: Vec::new(),
@@ -1749,19 +1841,25 @@ impl<'a> Stack<'a> {
 
     /// Append one overlay child.
     #[must_use]
-    pub fn child(mut self, child: impl Component + 'a) -> Self {
-        self.children.push(Element::new(child));
+    pub fn child(self, child: impl IntoElementObject<C>) -> Self {
+        self.child_element(Element::erase(child))
+    }
+
+    /// Append one already erased overlay child.
+    #[must_use]
+    pub fn child_element(mut self, child: Element<'a, C>) -> Self {
+        self.children.push(child);
         self
     }
 }
 
 impl Default for Stack<'_> {
     fn default() -> Self {
-        Self::new()
+        Self::empty()
     }
 }
 
-impl Component for Stack<'_> {
+impl<C: ?Sized + ElementObject> Component for Stack<'_, C> {
     fn revision(&self) -> ComponentRevision {
         combine_child_revisions(
             ComponentRevision::new(stable_revision(|state| self.id.as_str().hash(state)), 0),
@@ -1812,10 +1910,10 @@ impl Component for Stack<'_> {
 /// image placements. Visibility never starts, suspends, or stops owned resources.
 /// Applications stage modal scope lifecycles on `PreparedPresentation` and route
 /// input against the last successfully presented tree, not a proposed tree.
-pub struct Overlay<'a> {
+pub struct Overlay<'a, C: ?Sized = dyn Component + 'a> {
     id: LayoutId,
-    background: Element<'a>,
-    foreground: Element<'a>,
+    background: Element<'a, C>,
+    foreground: Element<'a, C>,
     scope: Option<crate::focus::FocusScopeId>,
 }
 
@@ -1823,10 +1921,18 @@ impl<'a> Overlay<'a> {
     /// Compose a background and an opaque foreground, centered in its allocation.
     #[must_use]
     pub fn new(background: impl Component + 'a, foreground: impl Component + 'a) -> Self {
+        Self::from_element(Element::new(background), Element::new(foreground))
+    }
+}
+
+impl<'a, C: ?Sized + ElementObject> Overlay<'a, C> {
+    /// Compose already erased background and foreground elements.
+    #[must_use]
+    pub fn from_element(background: Element<'a, C>, foreground: Element<'a, C>) -> Self {
         Self {
             id: LayoutId::new("overlay"),
-            background: Element::new(background),
-            foreground: Element::new(foreground),
+            background,
+            foreground,
             scope: None,
         }
     }
@@ -1849,7 +1955,7 @@ impl<'a> Overlay<'a> {
     }
 }
 
-impl Component for Overlay<'_> {
+impl<C: ?Sized + ElementObject> Component for Overlay<'_, C> {
     fn revision(&self) -> ComponentRevision {
         combine_child_revisions(
             ComponentRevision::new(
@@ -1968,13 +2074,21 @@ impl Component for Overlay<'_> {
     }
 }
 
-fn paint_single_child(child: &Element<'_>, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
+fn paint_single_child(
+    child: &(impl Component + ?Sized),
+    layout: &LayoutNode,
+    cx: &mut PaintCx<'_, '_>,
+) {
     if let Some(resolved) = layout.children.first() {
         paint_child(child, resolved, cx);
     }
 }
 
-fn paint_child(child: &Element<'_>, resolved: &ChildLayout, cx: &mut PaintCx<'_, '_>) {
+fn paint_child(
+    child: &(impl Component + ?Sized),
+    resolved: &ChildLayout,
+    cx: &mut PaintCx<'_, '_>,
+) {
     cx.with_child_size(
         i32::try_from(resolved.x).unwrap_or(i32::MAX),
         i64::try_from(resolved.y).unwrap_or(i64::MAX),
@@ -1984,8 +2098,8 @@ fn paint_child(child: &Element<'_>, resolved: &ChildLayout, cx: &mut PaintCx<'_,
 }
 
 /// One child in a horizontal row.
-struct RowChild<'a> {
-    component: Element<'a>,
+struct RowChild<'a, C: ?Sized> {
+    component: Element<'a, C>,
     flex: u16,
 }
 
@@ -1993,8 +2107,8 @@ struct RowChild<'a> {
 ///
 /// `Flex` is a composition descriptor rather than an independent layout node,
 /// so it does not introduce identity or geometry between the row and child.
-pub struct Flex<'a> {
-    component: Element<'a>,
+pub struct Flex<'a, C: ?Sized = dyn Component + 'a> {
+    component: Element<'a, C>,
     weight: u16,
 }
 
@@ -2002,8 +2116,16 @@ impl<'a> Flex<'a> {
     /// Wrap a child with a positive flex weight. Zero is normalized to one.
     #[must_use]
     pub fn new(weight: u16, child: impl Component + 'a) -> Self {
+        Self::from_element(weight, Element::new(child))
+    }
+}
+
+impl<'a, C: ?Sized + ElementObject> Flex<'a, C> {
+    /// Wrap an already erased child with a positive flex weight. Zero is normalized to one.
+    #[must_use]
+    pub fn from_element(weight: u16, child: Element<'a, C>) -> Self {
         Self {
-            component: Element::new(child),
+            component: child,
             weight: weight.max(1),
         }
     }
@@ -2016,17 +2138,29 @@ impl<'a> Flex<'a> {
 }
 
 /// Horizontal composition supporting intrinsic and proportionally flexible children.
-pub struct Row<'a> {
+pub struct Row<'a, C: ?Sized = dyn Component + 'a> {
     id: LayoutId,
-    children: Vec<RowChild<'a>>,
+    children: Vec<RowChild<'a, C>>,
     gap: u64,
     alignment: VerticalAlignment,
 }
 
-impl<'a> Row<'a> {
+impl Row<'_> {
     /// Create an empty row.
     #[must_use]
     pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl<'a, C: ?Sized + ElementObject> Row<'a, C> {
+    /// Create an empty row for any child object type.
+    ///
+    /// Unlike `new`/`Default`, which use the default object type, the object
+    /// type is chosen by annotation or inference, for example
+    /// `Row::<dyn Component + Send>::empty()`.
+    #[must_use]
+    pub fn empty() -> Self {
         Self {
             id: LayoutId::new("row"),
             children: Vec::new(),
@@ -2058,9 +2192,15 @@ impl<'a> Row<'a> {
 
     /// Append an intrinsically sized child.
     #[must_use]
-    pub fn child(mut self, child: impl Component + 'a) -> Self {
+    pub fn child(self, child: impl IntoElementObject<C>) -> Self {
+        self.child_element(Element::erase(child))
+    }
+
+    /// Append an already erased intrinsically sized child.
+    #[must_use]
+    pub fn child_element(mut self, child: Element<'a, C>) -> Self {
         self.children.push(RowChild {
-            component: Element::new(child),
+            component: child,
             flex: 0,
         });
         self
@@ -2068,7 +2208,7 @@ impl<'a> Row<'a> {
 
     /// Append a child receiving a proportional share of remaining width.
     #[must_use]
-    pub fn flex(mut self, child: Flex<'a>) -> Self {
+    pub fn flex(mut self, child: Flex<'a, C>) -> Self {
         self.children.push(RowChild {
             component: child.component,
             flex: child.weight,
@@ -2078,18 +2218,18 @@ impl<'a> Row<'a> {
 
     /// Append a child receiving a proportional share of remaining width.
     #[must_use]
-    pub fn flex_child(self, weight: u16, child: impl Component + 'a) -> Self {
-        self.flex(Flex::new(weight, child))
+    pub fn flex_child(self, weight: u16, child: impl IntoElementObject<C>) -> Self {
+        self.flex(Flex::from_element(weight, Element::erase(child)))
     }
 }
 
 impl Default for Row<'_> {
     fn default() -> Self {
-        Self::new()
+        Self::empty()
     }
 }
 
-impl Component for Row<'_> {
+impl<C: ?Sized + ElementObject> Component for Row<'_, C> {
     fn revision(&self) -> ComponentRevision {
         let own = ComponentRevision::new(
             stable_revision(|state| {
@@ -2214,18 +2354,30 @@ impl Component for Row<'_> {
 }
 
 /// Vertical composition of variable-height children.
-pub struct Column<'a> {
+pub struct Column<'a, C: ?Sized = dyn Component + 'a> {
     id: LayoutId,
-    children: Vec<Element<'a>>,
+    children: Vec<Element<'a, C>>,
     weights: Vec<u16>,
     gap: u64,
     alignment: HorizontalAlignment,
 }
 
-impl<'a> Column<'a> {
+impl Column<'_> {
     /// Create an empty column.
     #[must_use]
     pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl<'a, C: ?Sized + ElementObject> Column<'a, C> {
+    /// Create an empty column for any child object type.
+    ///
+    /// Unlike `new`/`Default`, which use the default object type, the object
+    /// type is chosen by annotation or inference, for example
+    /// `Column::<dyn Component + Send>::empty()`.
+    #[must_use]
+    pub fn empty() -> Self {
         Self {
             id: LayoutId::new("column"),
             children: Vec::new(),
@@ -2258,8 +2410,14 @@ impl<'a> Column<'a> {
 
     /// Append a child.
     #[must_use]
-    pub fn child(mut self, child: impl Component + 'a) -> Self {
-        self.children.push(Element::new(child));
+    pub fn child(self, child: impl IntoElementObject<C>) -> Self {
+        self.child_element(Element::erase(child))
+    }
+
+    /// Append an already erased child.
+    #[must_use]
+    pub fn child_element(mut self, child: Element<'a, C>) -> Self {
+        self.children.push(child);
         self.weights.push(0);
         self
     }
@@ -2267,7 +2425,7 @@ impl<'a> Column<'a> {
     /// Append a child receiving a weighted share of remaining bounded height.
     /// With unbounded height, flexible children retain their intrinsic height.
     #[must_use]
-    pub fn flex(mut self, child: Flex<'a>) -> Self {
+    pub fn flex(mut self, child: Flex<'a, C>) -> Self {
         self.children.push(child.component);
         self.weights.push(child.weight);
         self
@@ -2276,11 +2434,11 @@ impl<'a> Column<'a> {
 
 impl Default for Column<'_> {
     fn default() -> Self {
-        Self::new()
+        Self::empty()
     }
 }
 
-impl Component for Column<'_> {
+impl<C: ?Sized + ElementObject> Component for Column<'_, C> {
     fn revision(&self) -> ComponentRevision {
         let own = ComponentRevision::new(
             stable_revision(|state| {
@@ -3855,5 +4013,350 @@ mod tests {
         assert_eq!(layout.children[0].y, 0);
         assert_eq!(layout.children[1].y, 2);
         assert_eq!(layout.size.height, 5);
+    }
+}
+
+#[cfg(test)]
+mod send_element_tests {
+    use super::{
+        Align, Clip, Column, Fill, Flex, HitArea, HorizontalAlignment, Keyed, Overlay, Padding,
+        Row, SizeBox, Stack, StyleScope, Surface, TextBlock, VerticalAlignment, Visibility,
+    };
+    use crate::buffer::Buffer;
+    use crate::chrome::Border;
+    use crate::component::{
+        Component, Constraints, Element, LayoutCx, LayoutNode, SendElement, SyncElement,
+    };
+    use crate::frame::Frame;
+    use crate::geometry::{Insets, Point, Rect};
+    use crate::hit::HitMap;
+    use crate::paint::PaintCx;
+    use crate::style::{Color, Style};
+
+    type SendObject = dyn Component + Send;
+    type SyncObject = dyn Component + Send + Sync;
+
+    const fn assert_send<T: Send + ?Sized>() {}
+    const fn assert_send_sync<T: Send + Sync + ?Sized>() {}
+
+    #[test]
+    fn send_element_trees_are_send_by_construction() {
+        assert_send::<SendElement<'static>>();
+        assert_send::<Surface<'static, SendObject>>();
+        assert_send::<Keyed<'static, SendObject>>();
+        assert_send::<HitArea<'static, SendObject>>();
+        assert_send::<Padding<'static, SendObject>>();
+        assert_send::<Fill<'static, SendObject>>();
+        assert_send::<SizeBox<'static, SendObject>>();
+        assert_send::<Align<'static, SendObject>>();
+        assert_send::<Clip<'static, SendObject>>();
+        assert_send::<StyleScope<'static, SendObject>>();
+        assert_send::<Visibility<'static, SendObject>>();
+        assert_send::<Stack<'static, SendObject>>();
+        assert_send::<Overlay<'static, SendObject>>();
+        assert_send::<Flex<'static, SendObject>>();
+        assert_send::<Row<'static, SendObject>>();
+        assert_send::<Column<'static, SendObject>>();
+    }
+
+    #[test]
+    fn sync_element_trees_are_send_and_sync_by_construction() {
+        assert_send_sync::<SyncElement<'static>>();
+        assert_send_sync::<Surface<'static, SyncObject>>();
+        assert_send_sync::<Keyed<'static, SyncObject>>();
+        assert_send_sync::<HitArea<'static, SyncObject>>();
+        assert_send_sync::<Padding<'static, SyncObject>>();
+        assert_send_sync::<Fill<'static, SyncObject>>();
+        assert_send_sync::<SizeBox<'static, SyncObject>>();
+        assert_send_sync::<Align<'static, SyncObject>>();
+        assert_send_sync::<Clip<'static, SyncObject>>();
+        assert_send_sync::<StyleScope<'static, SyncObject>>();
+        assert_send_sync::<Visibility<'static, SyncObject>>();
+        assert_send_sync::<Stack<'static, SyncObject>>();
+        assert_send_sync::<Overlay<'static, SyncObject>>();
+        assert_send_sync::<Flex<'static, SyncObject>>();
+        assert_send_sync::<Row<'static, SyncObject>>();
+        assert_send_sync::<Column<'static, SyncObject>>();
+    }
+
+    fn card_style() -> Style {
+        Style::new().bg(Color::Blue)
+    }
+
+    /// The reference tree, built through the default `Element` constructors.
+    fn default_tree() -> Column<'static> {
+        Column::new()
+            .id("root")
+            .gap(1)
+            .child(
+                Surface::new(TextBlock::new("framed text that wraps across rows"))
+                    .id("card")
+                    .background(card_style())
+                    .border(Border::single())
+                    .padding(Insets::all(1)),
+            )
+            .child(
+                Row::new()
+                    .id("row")
+                    .gap(1)
+                    .alignment(VerticalAlignment::Center)
+                    .child(Keyed::new("key", TextBlock::new("k")))
+                    .flex_child(2, Fill::new(card_style(), TextBlock::new("fill")))
+                    .flex(Flex::new(
+                        1,
+                        Padding::new(Insets::all(1), TextBlock::new("pad")),
+                    )),
+            )
+            .child(
+                Stack::new()
+                    .child(SizeBox::new(TextBlock::new("sized")).width(8).height(2))
+                    .child(
+                        Align::new(TextBlock::new("end"))
+                            .horizontal(HorizontalAlignment::End)
+                            .vertical(VerticalAlignment::End),
+                    ),
+            )
+            .child(Overlay::new(
+                Clip::new(TextBlock::new("background row")),
+                StyleScope::new(
+                    HitArea::new("fg", TextBlock::new("fg")),
+                    Style::new().fg(Color::Red),
+                ),
+            ))
+            .child(Visibility::new(TextBlock::new("hidden"), false))
+            .flex(Flex::new(1, TextBlock::new("tail")))
+    }
+
+    /// The reference tree built entirely from `$element` parts over `$object`.
+    macro_rules! erased_tree {
+        ($element:ident, $object:ty) => {
+            Column::<$object>::empty()
+                .id("root")
+                .gap(1)
+                .child(
+                    Surface::from_element($element::erase(TextBlock::new(
+                        "framed text that wraps across rows",
+                    )))
+                    .id("card")
+                    .background(card_style())
+                    .border(Border::single())
+                    .padding(Insets::all(1)),
+                )
+                .child(
+                    Row::<$object>::empty()
+                        .id("row")
+                        .gap(1)
+                        .alignment(VerticalAlignment::Center)
+                        .child_element($element::erase(Keyed::from_element(
+                            "key",
+                            $element::erase(TextBlock::new("k")),
+                        )))
+                        .flex_child(
+                            2,
+                            Fill::from_element(
+                                card_style(),
+                                $element::erase(TextBlock::new("fill")),
+                            ),
+                        )
+                        .flex(Flex::from_element(
+                            1,
+                            $element::erase(Padding::from_element(
+                                Insets::all(1),
+                                $element::erase(TextBlock::new("pad")),
+                            )),
+                        )),
+                )
+                .child(
+                    Stack::<$object>::empty()
+                        .child(
+                            SizeBox::from_element($element::erase(TextBlock::new("sized")))
+                                .width(8)
+                                .height(2),
+                        )
+                        .child(
+                            Align::from_element($element::erase(TextBlock::new("end")))
+                                .horizontal(HorizontalAlignment::End)
+                                .vertical(VerticalAlignment::End),
+                        ),
+                )
+                .child(Overlay::from_element(
+                    $element::erase(Clip::from_element($element::erase(TextBlock::new(
+                        "background row",
+                    )))),
+                    $element::erase(StyleScope::from_element(
+                        $element::erase(HitArea::from_element(
+                            "fg",
+                            $element::erase(TextBlock::new("fg")),
+                        )),
+                        Style::new().fg(Color::Red),
+                    )),
+                ))
+                .child(Visibility::from_element(
+                    $element::erase(TextBlock::new("hidden")),
+                    false,
+                ))
+                .flex(Flex::from_element(
+                    1,
+                    $element::erase(TextBlock::new("tail")),
+                ))
+        };
+    }
+
+    /// The same tree built entirely from `Send` elements.
+    fn send_tree() -> Column<'static, SendObject> {
+        erased_tree!(SendElement, SendObject)
+    }
+
+    /// The same tree built entirely from `Send + Sync` elements.
+    fn sync_tree() -> Column<'static, SyncObject> {
+        erased_tree!(SyncElement, SyncObject)
+    }
+
+    fn render(component: &dyn Component, width: u16) -> (LayoutNode, Buffer, HitMap) {
+        let layout = component.layout(
+            Constraints::for_width(u64::from(width)),
+            &mut LayoutCx::new(),
+        );
+        let height = u16::try_from(layout.size.height).unwrap();
+        let mut buffer = Buffer::empty(Rect::new(0, 0, width, height));
+        let mut frame = Frame::new(&mut buffer);
+        component.paint(&layout, &mut PaintCx::new(&mut frame));
+        let hits = frame.hits().clone();
+        drop(frame);
+        (layout, buffer, hits)
+    }
+
+    #[test]
+    fn send_element_trees_lay_out_and_paint_identically() {
+        let reference = default_tree();
+        let send = send_tree();
+        assert_eq!(send.revision(), reference.revision());
+        for width in [0, 1, 3, 12, 40] {
+            let (reference_layout, reference_buffer, reference_hits) = render(&reference, width);
+            let (send_layout, send_buffer, send_hits) = render(&send, width);
+            assert_eq!(send_layout, reference_layout, "layout at width {width}");
+            assert_eq!(send_buffer, reference_buffer, "paint at width {width}");
+            assert_eq!(send_hits, reference_hits, "hits at width {width}");
+        }
+        let (_, _, hits) = render(&send, 40);
+        assert!(
+            hits.regions()
+                .iter()
+                .any(|region| region.id.as_str() == "fg")
+        );
+    }
+
+    #[test]
+    fn send_element_tree_moves_to_another_thread() {
+        let tree = send_tree();
+        let (layout, buffer, _) = std::thread::spawn(move || render(&tree, 20))
+            .join()
+            .unwrap();
+        let (reference_layout, reference_buffer, _) = render(&default_tree(), 20);
+        assert_eq!(layout, reference_layout);
+        assert_eq!(buffer, reference_buffer);
+        assert_eq!(
+            buffer.get(Point::new(0, 0)).unwrap().style.bg,
+            Some(Color::Blue)
+        );
+    }
+
+    #[test]
+    fn sync_element_trees_lay_out_and_paint_identically() {
+        let reference = default_tree();
+        let sync = sync_tree();
+        assert_eq!(sync.revision(), reference.revision());
+        for width in [0, 1, 3, 12, 40] {
+            let (reference_layout, reference_buffer, reference_hits) = render(&reference, width);
+            let (sync_layout, sync_buffer, sync_hits) = render(&sync, width);
+            assert_eq!(sync_layout, reference_layout, "layout at width {width}");
+            assert_eq!(sync_buffer, reference_buffer, "paint at width {width}");
+            assert_eq!(sync_hits, reference_hits, "hits at width {width}");
+        }
+    }
+
+    #[test]
+    fn sync_element_tree_is_shared_across_threads() {
+        let tree = std::sync::Arc::new(sync_tree());
+        let shared = std::sync::Arc::clone(&tree);
+        let (layout, buffer, hits) = std::thread::spawn(move || render(&*shared, 20))
+            .join()
+            .unwrap();
+        let (reference_layout, reference_buffer, reference_hits) = render(&*tree, 20);
+        assert_eq!(layout, reference_layout);
+        assert_eq!(buffer, reference_buffer);
+        assert_eq!(hits, reference_hits);
+    }
+
+    #[test]
+    fn sync_element_converts_into_send_and_default_elements() {
+        let revision = SyncElement::erase(TextBlock::new("converted")).revision();
+        let send: SendElement<'static> = SyncElement::erase(TextBlock::new("converted")).into();
+        let element: Element<'static> = SyncElement::erase(TextBlock::new("more")).into();
+        assert_eq!(send.revision(), revision);
+        let column = Column::<SendObject>::empty()
+            .child_element(send)
+            .child_element(SendElement::from(SyncElement::erase(TextBlock::new("x"))));
+        let (layout, buffer, _) = render(&column, 12);
+        assert_eq!(layout.size.height, 2);
+        assert_eq!(buffer.get(Point::new(0, 0)).unwrap().symbol, "c");
+        let column = Column::new().child_element(element);
+        let (_, buffer, _) = render(&column, 12);
+        assert_eq!(buffer.get(Point::new(0, 0)).unwrap().symbol, "m");
+    }
+
+    #[test]
+    fn unannotated_default_containers_use_the_default_object_type() {
+        // `Default` infers the default object type without annotations,
+        // matching `new()` exactly.
+        let defaulted = Column::default()
+            .child(
+                Row::default()
+                    .child(TextBlock::new("ab"))
+                    .child(TextBlock::new("cd")),
+            )
+            .child(Stack::default().child(TextBlock::new("stack")));
+        let constructed = Column::new()
+            .child(
+                Row::new()
+                    .child(TextBlock::new("ab"))
+                    .child(TextBlock::new("cd")),
+            )
+            .child(Stack::new().child(TextBlock::new("stack")));
+        assert_eq!(defaulted.revision(), constructed.revision());
+        for width in [0, 1, 4, 12] {
+            assert_eq!(render(&defaulted, width), render(&constructed, width));
+        }
+        let (_, buffer, _) = render(&defaulted, 12);
+        assert_eq!(buffer.get(Point::new(2, 0)).unwrap().symbol, "c");
+        assert_eq!(buffer.get(Point::new(0, 1)).unwrap().symbol, "s");
+    }
+
+    #[test]
+    fn empty_containers_match_default_for_any_object_type() {
+        let send = Column::<SendObject>::empty()
+            .child(Row::<SendObject>::empty().child(TextBlock::new("ab")))
+            .child(Stack::<SendObject>::empty().child(TextBlock::new("stack")));
+        let reference = Column::default()
+            .child(Row::default().child(TextBlock::new("ab")))
+            .child(Stack::default().child(TextBlock::new("stack")));
+        assert_eq!(send.revision(), reference.revision());
+        for width in [0, 1, 4, 12] {
+            assert_eq!(render(&send, width), render(&reference, width));
+        }
+    }
+
+    #[test]
+    fn send_element_converts_into_default_element() {
+        let send = SendElement::erase(TextBlock::new("converted"));
+        let revision = send.revision();
+        let element: Element<'static> = send.into();
+        assert_eq!(element.revision(), revision);
+        let column = Column::new()
+            .child_element(element)
+            .child_element(Element::from(SendElement::erase(TextBlock::new("more"))));
+        let (layout, buffer, _) = render(&column, 12);
+        assert_eq!(layout.size.height, 2);
+        assert_eq!(buffer.get(Point::new(0, 1)).unwrap().symbol, "m");
     }
 }

@@ -11,6 +11,7 @@
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
+use std::marker::PhantomData;
 
 use crate::event::{Event, EventOutcome};
 use crate::geometry::{Rect, Size};
@@ -927,24 +928,137 @@ impl LayoutCache {
     }
 }
 
-/// Borrow-friendly type erasure for heterogeneous component trees.
-pub struct Element<'a> {
-    component: Box<dyn Component + 'a>,
+mod element_object_sealed {
+    pub trait Sealed {}
+
+    impl Sealed for dyn super::Component + '_ {}
+    impl Sealed for dyn super::Component + Send + '_ {}
+    impl Sealed for dyn super::Component + Send + Sync + '_ {}
 }
+
+/// Trait-object type an [`Element`] erases its component into.
+///
+/// Implemented for `dyn Component` (the default, which accepts any component),
+/// `dyn Component + Send` (which accepts only `Send` components and therefore
+/// keeps retained trees `Send`) and `dyn Component + Send + Sync` (which
+/// accepts only `Send + Sync` components and therefore keeps retained trees
+/// `Send + Sync`, so they can be shared through `Arc`), for any object
+/// lifetime. The trait is sealed.
+pub trait ElementObject: Component + element_object_sealed::Sealed {
+    /// Borrow the erased component through the unrestricted protocol object.
+    fn as_dyn_component(&self) -> &dyn Component;
+}
+
+impl ElementObject for dyn Component + '_ {
+    fn as_dyn_component(&self) -> &dyn Component {
+        self
+    }
+}
+
+impl ElementObject for dyn Component + Send + '_ {
+    fn as_dyn_component(&self) -> &dyn Component {
+        self
+    }
+}
+
+impl ElementObject for dyn Component + Send + Sync + '_ {
+    fn as_dyn_component(&self) -> &dyn Component {
+        self
+    }
+}
+
+/// Values that can be erased into the element trait object `C`.
+///
+/// Every [`Component`] erases into `dyn Component`; every `Send` component
+/// additionally erases into `dyn Component + Send`, and every `Send + Sync`
+/// component into `dyn Component + Send + Sync`. Generic containers accept
+/// `impl IntoElementObject<C>` children, so the container's child element type
+/// decides which components are admissible.
+pub trait IntoElementObject<C: ?Sized + ElementObject> {
+    /// Box `self` as the erased trait object.
+    fn into_element_object(self) -> Box<C>;
+}
+
+impl<'o, T: Component + 'o> IntoElementObject<dyn Component + 'o> for T {
+    fn into_element_object(self) -> Box<dyn Component + 'o> {
+        Box::new(self)
+    }
+}
+
+impl<'o, T: Component + Send + 'o> IntoElementObject<dyn Component + Send + 'o> for T {
+    fn into_element_object(self) -> Box<dyn Component + Send + 'o> {
+        Box::new(self)
+    }
+}
+
+impl<'o, T: Component + Send + Sync + 'o> IntoElementObject<dyn Component + Send + Sync + 'o>
+    for T
+{
+    fn into_element_object(self) -> Box<dyn Component + Send + Sync + 'o> {
+        Box::new(self)
+    }
+}
+
+/// Borrow-friendly type erasure for heterogeneous component trees.
+///
+/// The second parameter selects the erased trait object. The default,
+/// `dyn Component + 'a`, accepts any component (including per-frame
+/// components borrowing `Cell`/`RefCell` state) and is therefore not `Send`.
+/// [`SendElement`] erases into `dyn Component + Send + 'a`, so an element, and
+/// any composition container whose children are `SendElement`s, is `Send`
+/// whenever its other fields are. [`SyncElement`] erases into
+/// `dyn Component + Send + Sync + 'a` and keeps trees `Send + Sync` in the same
+/// way. A [`SyncElement`] converts into a [`SendElement`] or an [`Element`],
+/// and a [`SendElement`] into an [`Element`], with [`From`].
+pub struct Element<'a, C: ?Sized = dyn Component + 'a> {
+    component: Box<C>,
+    lifetime: PhantomData<&'a ()>,
+}
+
+/// An [`Element`] that only admits `Send` components and is itself `Send`.
+pub type SendElement<'a> = Element<'a, dyn Component + Send + 'a>;
+
+/// An [`Element`] that only admits `Send + Sync` components and is itself
+/// `Send + Sync`.
+pub type SyncElement<'a> = Element<'a, dyn Component + Send + Sync + 'a>;
 
 impl<'a> Element<'a> {
     /// Erase a concrete component.
     #[must_use]
     pub fn new(component: impl Component + 'a) -> Self {
+        Self::erase(component)
+    }
+}
+
+impl<C: ?Sized + ElementObject> Element<'_, C> {
+    /// Erase a component into this element's trait object type.
+    ///
+    /// Use this to build non-default elements, for example
+    /// `SendElement::erase(TextBlock::new("row"))`.
+    #[must_use]
+    pub fn erase(component: impl IntoElementObject<C>) -> Self {
+        Self::from_box(component.into_element_object())
+    }
+
+    /// Wrap an already boxed trait object.
+    #[must_use]
+    pub const fn from_box(component: Box<C>) -> Self {
         Self {
-            component: Box::new(component),
+            component,
+            lifetime: PhantomData,
         }
+    }
+
+    /// Unwrap the boxed trait object.
+    #[must_use]
+    pub fn into_box(self) -> Box<C> {
+        self.component
     }
 
     /// Borrow the erased component protocol.
     #[must_use]
     pub fn as_component(&self) -> &dyn Component {
-        self.component.as_ref()
+        self.component.as_dyn_component()
     }
 
     /// Resolve this component under explicit constraints.
@@ -969,7 +1083,28 @@ impl<'a> Element<'a> {
     }
 }
 
-impl Component for Element<'_> {
+impl<'a> From<SendElement<'a>> for Element<'a> {
+    fn from(element: SendElement<'a>) -> Self {
+        let component: Box<dyn Component + 'a> = element.component;
+        Self::from_box(component)
+    }
+}
+
+impl<'a> From<SyncElement<'a>> for SendElement<'a> {
+    fn from(element: SyncElement<'a>) -> Self {
+        let component: Box<dyn Component + Send + 'a> = element.component;
+        Self::from_box(component)
+    }
+}
+
+impl<'a> From<SyncElement<'a>> for Element<'a> {
+    fn from(element: SyncElement<'a>) -> Self {
+        let component: Box<dyn Component + 'a> = element.component;
+        Self::from_box(component)
+    }
+}
+
+impl<C: ?Sized + ElementObject> Component for Element<'_, C> {
     fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
         Element::layout(self, constraints, cx)
     }

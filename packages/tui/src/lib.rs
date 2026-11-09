@@ -63,9 +63,10 @@ pub mod prelude {
     pub use crate::chrome::{Border, BorderSet, BorderSide, BorderSideStyles, BorderSides};
     pub use crate::clock::PresentationClock;
     pub use crate::component::{
-        ChildLayout, Component, ComponentRevision, Constraints, Element, EventCx, LayoutCache,
-        LayoutCacheStats, LayoutCx, LayoutEnvironment, LayoutId, LayoutMetadata, LayoutNode,
-        LogicalRect, LogicalSize, combine_child_revisions,
+        ChildLayout, Component, ComponentRevision, Constraints, Element, ElementObject, EventCx,
+        IntoElementObject, LayoutCache, LayoutCacheStats, LayoutCx, LayoutEnvironment, LayoutId,
+        LayoutMetadata, LayoutNode, LogicalRect, LogicalSize, SendElement, SyncElement,
+        combine_child_revisions,
     };
     pub use crate::composition::{
         Align, Clip, Column, Fill, Flex, HitArea, HorizontalAlignment, Keyed, Padding, Row,

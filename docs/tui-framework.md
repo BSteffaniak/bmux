@@ -111,6 +111,73 @@ an application-facing/prelude API.
 New child-owning surfaces should prefer `Surface`; duplicate panel, modal,
 clear, overlay, or content-layout engines must not be introduced.
 
+## Element type erasure and `Send` trees
+
+`Element<'a, C = dyn Component + 'a>` boxes a heterogeneous child behind the
+trait object `C`. Three object types are supported (the sealed
+`ElementObject` trait):
+
+- `dyn Component` (the default) admits every component, including per-frame
+  components that borrow `Cell`/`RefCell` state (`Button`, `Menu`, `Table`,
+  `VirtualListComponent`, ...). Such trees are deliberately not `Send`.
+- `dyn Component + Send`, aliased as `SendElement<'a>`, admits only `Send`
+  components. Retained trees built from it are `Send` by construction, so they
+  can live in `Send` application state or move to another thread without an
+  unsafe wrapper.
+- `dyn Component + Send + Sync`, aliased as `SyncElement<'a>`, admits only
+  `Send + Sync` components. Retained trees built from it are `Send + Sync`, so
+  a subtree can be shared through `Arc` (for example between a container that
+  paints it and a pass that reads its retained geometry) while the owner stays
+  `Send`.
+
+Every composition container (`Surface`, `Keyed`, `HitArea`, `Padding`, `Fill`,
+`SizeBox`, `Align`, `Clip`, `StyleScope`, `Visibility`, `Stack`, `Overlay`,
+`Flex`, `Row`, `Column`) and `bmux_tui_components::Disclosure` take the same
+child object type as a defaulted parameter, for example
+`Column<'a, C = dyn Component + 'a>`. A container is `Send` whenever its
+children are, and `Sync` whenever its children are `Sync`. The parameter is additive: unannotated code keeps the default
+object type, and `new()` and `Default` stay on that type so unannotated
+`Column::default()` still infers it. Other object types use the generic
+`empty()` or `from_element` constructors.
+
+```rust,ignore
+type SendObject = dyn Component + Send;
+
+// Default trees: `new` constructors, any component.
+let local = Column::new().child(Surface::new(TextBlock::new("row")));
+
+// Send trees: choose the object type, then erase children into it.
+let retained = Column::<SendObject>::empty()
+    .child(TextBlock::new("row")) // `child` takes `impl IntoElementObject<C>`
+    .child(Surface::from_element(SendElement::erase(TextBlock::new("card"))))
+    .child_element(SendElement::erase(TextBlock::new("pre-erased")));
+
+// A SyncElement converts into a SendElement or an Element, and a SendElement
+// into a default Element, where one is expected.
+let element: Element<'static> = SendElement::erase(retained).into();
+
+// Disclosures choose the object type through the generic builder.
+let section = DisclosureBuilder::<SendObject>::new("tool.1", "header")
+    .body(TextBlock::new("body"))
+    .build();
+```
+
+Constructor conventions:
+
+- `new(..)` stays on the default object type and accepts any component.
+- `from_element(.., Element<'a, C>)` builds a container for any object type;
+  the argument fixes `C`.
+- `Stack`, `Row`, and `Column` implement `Default` (like `new()`) for the
+  default object type only, and provide a generic `empty()` for any `C`; their
+  `child`/`flex_child` builders accept `impl IntoElementObject<C>`, and
+  `child_element` appends an already erased element without boxing it again.
+- `Element::erase` (and `SendElement::erase`, `SyncElement::erase`) erase into the selected object
+  type; `Element::from_box`/`into_box` move the boxed object in and out.
+
+Thread-safety is the only behavioral difference: layout, paint, hit regions,
+events, and revisions of a `SendElement` or `SyncElement` tree are identical to the same tree
+built from default elements.
+
 ## Text and selection
 
 Rich text preserves span styles, Unicode display width, wrapping, alignment,

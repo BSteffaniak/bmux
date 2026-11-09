@@ -12,8 +12,8 @@
 use std::borrow::Cow;
 
 use bmux_tui::component::{
-    Component, ComponentRevision, Constraints, Element, EventCx, LayoutCx, LayoutNode,
-    LogicalInsets,
+    Component, ComponentRevision, Constraints, Element, ElementObject, EventCx, IntoElementObject,
+    LayoutCx, LayoutNode, LogicalInsets,
 };
 use bmux_tui::composition::{Column, HitArea, Padding, Row, TextBlock};
 use bmux_tui::event::{Event, EventOutcome};
@@ -124,18 +124,39 @@ impl From<crate::theme::ComponentTheme> for DisclosureStyles {
 }
 
 /// Builder for a [`Disclosure`].
-pub struct DisclosureBuilder<'a> {
+///
+/// `C` is the erased child object type, as for [`Element`]. The default admits
+/// any body; `DisclosureBuilder<'a, dyn Component + Send>` (started with
+/// [`DisclosureBuilder::new`]) admits only `Send` bodies and builds a `Send`
+/// disclosure.
+pub struct DisclosureBuilder<'a, C: ?Sized = dyn Component + 'a> {
     id: HitId,
     header: Line,
     summary: Option<Line>,
-    body: Option<Element<'a>>,
+    body: Option<Element<'a, C>>,
     mode: DisclosureMode,
     glyphs: DisclosureGlyphs,
     styles: DisclosureStyles,
     gap: u64,
 }
 
-impl<'a> DisclosureBuilder<'a> {
+impl<'a, C: ?Sized + ElementObject> DisclosureBuilder<'a, C> {
+    /// Start a disclosure whose header activates `id`, for any child element
+    /// type. [`Disclosure::builder`] is the shorthand for the default type.
+    #[must_use]
+    pub fn new(id: impl Into<HitId>, header: impl Into<Line>) -> Self {
+        Self {
+            id: id.into(),
+            header: header.into(),
+            summary: None,
+            body: None,
+            mode: DisclosureMode::default(),
+            glyphs: DisclosureGlyphs::default(),
+            styles: DisclosureStyles::default(),
+            gap: 1,
+        }
+    }
+
     /// Set how much is shown.
     #[must_use]
     pub const fn mode(mut self, mode: DisclosureMode) -> Self {
@@ -152,8 +173,14 @@ impl<'a> DisclosureBuilder<'a> {
 
     /// Set the body shown in [`DisclosureMode::Expanded`].
     #[must_use]
-    pub fn body(mut self, body: impl Component + 'a) -> Self {
-        self.body = Some(Element::new(body));
+    pub fn body(self, body: impl IntoElementObject<C>) -> Self {
+        self.body_element(Element::erase(body))
+    }
+
+    /// Set an already erased body shown in [`DisclosureMode::Expanded`].
+    #[must_use]
+    pub fn body_element(mut self, body: Element<'a, C>) -> Self {
+        self.body = Some(body);
         self
     }
 
@@ -184,7 +211,13 @@ impl<'a> DisclosureBuilder<'a> {
     /// up under the header text. A body or summary that the mode hides is
     /// dropped rather than laid out.
     #[must_use]
-    pub fn build(self) -> Disclosure<'a> {
+    pub fn build(self) -> Disclosure<'a, C>
+    where
+        TextBlock: IntoElementObject<C>,
+        Row<'a, C>: IntoElementObject<C>,
+        HitArea<'a, C>: IntoElementObject<C>,
+        Padding<'a, C>: IntoElementObject<C>,
+    {
         let marker_width = self.glyphs.width();
         let indent = if marker_width == 0 {
             0
@@ -193,7 +226,7 @@ impl<'a> DisclosureBuilder<'a> {
                 .unwrap_or(u64::MAX)
                 .saturating_add(self.gap)
         };
-        let mut header = Row::new().gap(if marker_width == 0 { 0 } else { self.gap });
+        let mut header = Row::<'a, C>::empty().gap(if marker_width == 0 { 0 } else { self.gap });
         if marker_width > 0 {
             // Reserve the wider marker so the header does not shift on toggle.
             let marker = self.glyphs.marker(self.mode);
@@ -212,7 +245,10 @@ impl<'a> DisclosureBuilder<'a> {
                 lines: vec![self.header],
             }),
         );
-        let mut column = Column::new().child(HitArea::new(self.id.clone(), header));
+        let mut column = Column::<'a, C>::empty().child(HitArea::from_element(
+            self.id.clone(),
+            Element::erase(header),
+        ));
         let insets = LogicalInsets {
             left: indent,
             ..LogicalInsets::default()
@@ -230,15 +266,15 @@ impl<'a> DisclosureBuilder<'a> {
                         })
                         .collect::<Vec<_>>(),
                 );
-                column = column.child(Padding::new(
+                column = column.child(Padding::from_element(
                     insets,
-                    TextBlock::new(Text {
+                    Element::erase(TextBlock::new(Text {
                         lines: vec![summary],
-                    }),
+                    })),
                 ));
             }
             (DisclosureMode::Expanded, _, Some(body)) => {
-                column = column.child(Padding::new(insets, body));
+                column = column.child(Padding::from_element(insets, body));
             }
             _ => {}
         }
@@ -251,28 +287,24 @@ impl<'a> DisclosureBuilder<'a> {
 }
 
 /// Composed expandable section. Create one with [`Disclosure::builder`].
-pub struct Disclosure<'a> {
+///
+/// A disclosure built from `Send` elements (see [`DisclosureBuilder`]) is
+/// itself `Send`.
+pub struct Disclosure<'a, C: ?Sized = dyn Component + 'a> {
     id: HitId,
     mode: DisclosureMode,
-    inner: Column<'a>,
+    inner: Column<'a, C>,
 }
 
 impl<'a> Disclosure<'a> {
     /// Start a disclosure whose header activates `id`.
     #[must_use]
     pub fn builder(id: impl Into<HitId>, header: impl Into<Line>) -> DisclosureBuilder<'a> {
-        DisclosureBuilder {
-            id: id.into(),
-            header: header.into(),
-            summary: None,
-            body: None,
-            mode: DisclosureMode::default(),
-            glyphs: DisclosureGlyphs::default(),
-            styles: DisclosureStyles::default(),
-            gap: 1,
-        }
+        DisclosureBuilder::new(id, header)
     }
+}
 
+impl<C: ?Sized + ElementObject> Disclosure<'_, C> {
     /// Hit id registered by the header.
     #[must_use]
     pub const fn id(&self) -> &HitId {
@@ -286,7 +318,7 @@ impl<'a> Disclosure<'a> {
     }
 }
 
-impl Component for Disclosure<'_> {
+impl<C: ?Sized + ElementObject> Component for Disclosure<'_, C> {
     fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
         self.inner.layout(constraints, cx)
     }
@@ -312,7 +344,7 @@ mod tests {
 
     use super::*;
 
-    fn render(component: &Disclosure<'_>, width: u16) -> (Vec<String>, Frame<'static>) {
+    fn render(component: &dyn Component, width: u16) -> (Vec<String>, Frame<'static>) {
         let layout = component.layout(
             Constraints::for_width(u64::from(width)),
             &mut LayoutCx::new(),
@@ -412,5 +444,39 @@ mod tests {
             .mode(DisclosureMode::Summary)
             .build();
         assert_eq!(render(&disclosure, 10).0, ["plain", "sum"]);
+    }
+
+    type SendObject = dyn Component + Send;
+
+    const fn assert_send<T: Send>() {}
+
+    #[test]
+    fn send_disclosures_are_send_and_render_identically() {
+        assert_send::<Disclosure<'static, SendObject>>();
+        assert_send::<DisclosureBuilder<'static, SendObject>>();
+        for mode in [
+            DisclosureMode::Expanded,
+            DisclosureMode::Summary,
+            DisclosureMode::Collapsed,
+        ] {
+            let reference = Disclosure::builder("tool.1", "read 界面.rs")
+                .summary("120 lines")
+                .body(TextBlock::new("fn main() {}"))
+                .mode(mode)
+                .build();
+            let send = DisclosureBuilder::<SendObject>::new("tool.1", "read 界面.rs")
+                .summary("120 lines")
+                .body(TextBlock::new("fn main() {}"))
+                .mode(mode)
+                .build();
+            assert_eq!(send.revision(), reference.revision());
+            for width in [0, 1, 4, 24] {
+                let (reference_rows, reference_frame) = render(&reference, width);
+                let (send_rows, send_frame) = render(&send, width);
+                assert_eq!(send_rows, reference_rows, "{mode:?} at width {width}");
+                assert_eq!(send_frame.buffer(), reference_frame.buffer());
+                assert_eq!(send_frame.hits(), reference_frame.hits());
+            }
+        }
     }
 }
