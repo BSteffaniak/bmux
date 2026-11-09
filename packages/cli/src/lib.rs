@@ -34,7 +34,9 @@ pub async fn run_cli_with_runtime(owner: runtime_owner::RuntimeOwner) -> anyhow:
     if let Some(code) = run_pre_runtime_mode()? {
         return Ok(code);
     }
-    owner.run(Box::pin(runtime::run())).await
+    // The owner is carried explicitly into every selected command state;
+    // nothing rediscovers it from task-local or thread-local context.
+    Box::pin(runtime::run(Some(owner))).await
 }
 
 /// Run under an externally owned runtime without asserting ownership of it.
@@ -48,7 +50,7 @@ pub async fn run_cli() -> anyhow::Result<u8> {
         return Ok(code);
     }
     runtime::startup_future_marker("run_cli.first_poll", 0);
-    Box::pin(runtime::run()).await
+    Box::pin(runtime::run(None)).await
 }
 
 /// Private executable modes that must bypass config loading, plugin admission

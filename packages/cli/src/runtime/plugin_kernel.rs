@@ -1578,6 +1578,7 @@ fn run_core_built_in_command(request: &bmux_plugin_sdk::CoreCliCommandRequest) -
                 Box::pin(dispatch_built_in_command(
                     &command,
                     ConnectionContext::new(cli.target.as_deref()),
+                    None,
                 ))
                 .await
             })
@@ -1593,6 +1594,7 @@ fn run_core_built_in_command(request: &bmux_plugin_sdk::CoreCliCommandRequest) -
                 Box::pin(dispatch_built_in_command(
                     &command,
                     ConnectionContext::new(cli.target.as_deref()),
+                    None,
                 ))
                 .await
             })
@@ -1807,6 +1809,7 @@ pub(super) fn register_plugin_service_handlers(
     paths: &ConfigPaths,
     registry: &PluginRegistry,
     loaded_plugins: &Arc<Vec<super::plugin_runtime::ProductionPlugin>>,
+    runtime_owner: Option<&crate::runtime_owner::RuntimeOwner>,
 ) -> Result<()> {
     let enabled_plugins = super::plugin_runtime::backend_enabled_plugins(config, registry)?;
     let available_capabilities = available_capability_providers(config, registry)?;
@@ -1836,8 +1839,12 @@ pub(super) fn register_plugin_service_handlers(
         .keys()
         .map(ToString::to_string)
         .collect::<Vec<_>>();
-    let command_state =
-        build_runtime_command_state(config.clone(), paths.clone(), Arc::new(registry.clone()))?;
+    let command_state = build_runtime_command_state(
+        config.clone(),
+        paths.clone(),
+        Arc::new(registry.clone()),
+        runtime_owner,
+    )?;
     let command_connection_info = connection_info.clone();
     let command_instances = Arc::clone(loaded_plugins);
 

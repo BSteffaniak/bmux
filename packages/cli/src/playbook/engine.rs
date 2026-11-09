@@ -46,14 +46,24 @@ use bmux_playbook::engine::{reconcile_real_attach_target, typed_new_session_play
 #[derive(Debug)]
 pub struct CliHost {
     selected: Option<(BmuxConfig, ConfigPaths)>,
+    /// Command runtime of the invoking CLI (registry, roots, runtime owner).
+    /// Real attachments run caller-process plugin commands with it; it is
+    /// handed over explicitly because they run on spawned tasks.
+    command_state: Option<crate::runtime::RuntimeCommandState>,
 }
+/// Host without a selected command runtime: caller-process plugin commands in
+/// real attachments fail explicitly rather than discovering one.
 #[must_use]
 pub fn host() -> Arc<dyn HostAdapter> {
-    Arc::new(CliHost { selected: None })
+    command_host(None, None)
 }
-pub(crate) fn selected_host(config: BmuxConfig, paths: ConfigPaths) -> Arc<dyn HostAdapter> {
+pub(crate) fn command_host(
+    selected: Option<(BmuxConfig, ConfigPaths)>,
+    command_state: Option<crate::runtime::RuntimeCommandState>,
+) -> Arc<dyn HostAdapter> {
     Arc::new(CliHost {
-        selected: Some((config, paths)),
+        selected,
+        command_state,
     })
 }
 
@@ -238,6 +248,7 @@ impl HostAdapter for CliHost {
     fn pane_transport(&self) -> Arc<dyn PaneTransport> {
         Arc::new(Self {
             selected: self.selected.clone(),
+            command_state: self.command_state.clone(),
         })
     }
     fn parse_key_chord(&self, chord: &str) -> Result<Vec<KeyStroke>> {
@@ -298,7 +309,15 @@ impl HostAdapter for CliHost {
     ) -> HostFuture<'_, Box<dyn RealAttach>> {
         Box::pin(async move {
             Ok(Box::new(
-                start_cli_attach_runtime(client, session_id, config, paths, viewport).await?,
+                start_cli_attach_runtime(
+                    client,
+                    session_id,
+                    config,
+                    paths,
+                    self.command_state.clone(),
+                    viewport,
+                )
+                .await?,
             ) as Box<dyn RealAttach>)
         })
     }
@@ -673,6 +692,7 @@ async fn start_cli_attach_runtime(
     session_id: Uuid,
     attach_config: Option<BmuxConfig>,
     paths: Option<ConfigPaths>,
+    command_state: Option<crate::runtime::RuntimeCommandState>,
     viewport: (u16, u16),
 ) -> Result<RealAttachPlaybookRuntime> {
     let prefix = attach_config.as_ref().map_or_else(
@@ -726,6 +746,7 @@ async fn start_cli_attach_runtime(
                     kernel_client_factory,
                     &mut terminal,
                     attach_config,
+                    command_state,
                     managed.then_some(publisher),
                 );
             let output = async move {
@@ -956,7 +977,7 @@ mod tests {
         );
         let mut config = BmuxConfig::default();
         config.general.server_timeout = 4321;
-        let host = selected_host(config, paths.clone());
+        let host = command_host(Some((config, paths.clone())), None);
         let (config, actual) = host.selected_runtime().unwrap();
         assert_eq!(config.general.server_timeout, 4321);
         assert_eq!(actual.config_dir, paths.config_dir);
@@ -985,6 +1006,7 @@ mod tests {
             session,
             config,
             sandbox.map(|sandbox| sandbox.paths().clone()),
+            None,
             viewport,
         )
         .await

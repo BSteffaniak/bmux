@@ -31,8 +31,10 @@ use super::{
     plugin_host, server_event_name, service_descriptors_from_declarations,
 };
 
+/// One explicitly resolved command runtime. Its runtime owner is supplied by
+/// whoever built it, never rediscovered from task-local or thread context.
 #[derive(Debug, Clone)]
-pub(super) struct RuntimeCommandState {
+pub struct RuntimeCommandState {
     pub(super) runtime_owner: Option<crate::runtime_owner::WeakRuntimeOwner>,
     pub(super) config: BmuxConfig,
     pub(super) paths: ConfigPaths,
@@ -450,12 +452,18 @@ pub(super) fn load_plugin(
     available_capabilities: &std::collections::BTreeMap<HostScope, bmux_plugin::CapabilityProvider>,
     config: &BmuxConfig,
 ) -> bmux_plugin_sdk::Result<ProductionPlugin> {
+    let state = selected_command_state().map_err(|error| {
+        bmux_plugin_sdk::PluginError::ServiceProtocol {
+            details: format!("selected loader requires resolved runtime paths: {error:#}"),
+        }
+    })?;
     load_plugin_with_definitions(
         plugin,
         host,
         available_capabilities,
         config,
         &BTreeMap::new(),
+        &state,
     )
 }
 
@@ -466,22 +474,20 @@ fn load_plugin_with_definitions(
     available_capabilities: &BTreeMap<HostScope, bmux_plugin::CapabilityProvider>,
     config: &BmuxConfig,
     definitions: &BTreeMap<String, bmux_plugin_sdk::definition::PluginDefinition>,
+    state: &RuntimeCommandState,
 ) -> bmux_plugin_sdk::Result<ProductionPlugin> {
-    let paths = selected_command_state()
-        .map_err(|error| bmux_plugin_sdk::PluginError::ServiceProtocol {
-            details: format!("selected loader requires resolved runtime paths: {error:#}"),
-        })?
-        .paths;
-    let approvals = kernel_policy::load_native_approvals(&paths)?;
+    let paths = &state.paths;
+    let approvals = kernel_policy::load_native_approvals(paths)?;
     ProductionPlugin::load(
         plugin,
         host,
         available_capabilities,
         config,
         selected::ExecutionOwner {
-            runtime_owner: selected_command_state()
-                .ok()
-                .and_then(|state| state.runtime_owner.and_then(|owner| owner.upgrade())),
+            runtime_owner: state
+                .runtime_owner
+                .as_ref()
+                .and_then(crate::runtime_owner::WeakRuntimeOwner::upgrade),
             runtime: *EXECUTION_SCOPE,
             host_state: Arc::clone(&HOST_STATE),
             loader: &EXECUTION_LOADER,
@@ -799,7 +805,9 @@ pub(super) fn initialize_native_runtime_state(
 ) -> Result<()> {
     let registry = Arc::new(scan_available_plugins(&config, &paths)?);
     install_enabled_client_adapters(&config, &registry, &paths);
-    let state = build_runtime_command_state(config, paths, registry)?;
+    // Embedding hosts do not hand over a primary runtime owner, so selected
+    // plugin execution from this state fails explicitly instead of guessing one.
+    let state = build_runtime_command_state(config, paths, registry, None)?;
     RUNTIME_COMMAND_STATE_CACHE.with(|slot| *slot.borrow_mut() = Some(state));
     Ok(())
 }
@@ -808,17 +816,22 @@ pub(super) fn initialize_server_command_state(
     config: &BmuxConfig,
     paths: &ConfigPaths,
     registry: &PluginRegistry,
+    runtime_owner: Option<&crate::runtime_owner::RuntimeOwner>,
 ) -> Result<()> {
-    let state =
-        build_runtime_command_state(config.clone(), paths.clone(), Arc::new(registry.clone()))?;
+    let state = build_runtime_command_state(
+        config.clone(),
+        paths.clone(),
+        Arc::new(registry.clone()),
+        runtime_owner,
+    )?;
     RUNTIME_COMMAND_STATE_CACHE.with(|slot| *slot.borrow_mut() = Some(state));
     Ok(())
 }
 
-struct SelectedCommandStateGuard(Option<RuntimeCommandState>);
+pub(super) struct SelectedCommandStateGuard(Option<RuntimeCommandState>);
 
 impl SelectedCommandStateGuard {
-    fn enter(state: &RuntimeCommandState) -> Self {
+    pub(super) fn enter(state: &RuntimeCommandState) -> Self {
         Self(RUNTIME_COMMAND_STATE_CACHE.with(|slot| slot.replace(Some(state.clone()))))
     }
 }
@@ -851,7 +864,9 @@ fn runtime_command_state() -> Result<RuntimeCommandState> {
         let registry = Arc::new(scan_available_plugins(&config, &paths)?);
         let scan_us = scan_started.elapsed().as_micros();
         let build_started = Instant::now();
-        let state = build_runtime_command_state(config, paths, registry)?;
+        // A lazily rebuilt state has no runtime owner: only an entry point that
+        // owns the primary runtime can select plugin execution, explicitly.
+        let state = build_runtime_command_state(config, paths, registry, None)?;
         emit_runtime_state_phase_timing(config_us, scan_us, build_started.elapsed().as_micros());
         *slot.borrow_mut() = Some(state.clone());
         Ok(state)
@@ -862,6 +877,7 @@ pub(super) fn build_runtime_command_state(
     config: BmuxConfig,
     paths: ConfigPaths,
     registry: Arc<PluginRegistry>,
+    runtime_owner: Option<&crate::runtime_owner::RuntimeOwner>,
 ) -> Result<RuntimeCommandState> {
     let enabled_plugins = effective_enabled_plugins(&config, &registry);
     let available_capability_providers = available_capability_providers(&config, &registry)?;
@@ -876,7 +892,7 @@ pub(super) fn build_runtime_command_state(
         .collect::<Vec<_>>();
     let registered_plugin_infos = registered_plugin_infos_from_registry(&registry);
     let state = RuntimeCommandState {
-        runtime_owner: crate::runtime_owner::selected().map(|owner| owner.downgrade()),
+        runtime_owner: runtime_owner.map(crate::runtime_owner::RuntimeOwner::downgrade),
         config,
         paths,
         registry,
@@ -1283,6 +1299,7 @@ pub(super) fn load_enabled_plugins(
     registry: &PluginRegistry,
     host_state: &Arc<bmux_plugin::PluginStateRegistry>,
     definitions: &BTreeMap<String, bmux_plugin_sdk::definition::PluginDefinition>,
+    runtime_owner: Option<&crate::runtime_owner::RuntimeOwner>,
 ) -> Result<Vec<ProductionPlugin>> {
     let total_started = Instant::now();
     let approvals = kernel_policy::load_native_approvals(paths)?;
@@ -1330,7 +1347,7 @@ pub(super) fn load_enabled_plugins(
         .context("enabled plugin dependency graph is invalid")?;
     let mut loaded_plugins = Vec::with_capacity(ordered_plugins.len());
     // One authority per startup, not per OS thread or logical plugin name.
-    let runtime_owner = crate::runtime_owner::selected();
+    let runtime_owner = runtime_owner.cloned();
     let runtime = bmux_plugin_runtime::PluginRuntimeScopeId::new();
     let artifact_loader = bmux_plugin::NativePluginLoader::new();
     LOADED_PLUGIN_CACHE.with(|cache| cache.borrow_mut().clear());
@@ -2591,6 +2608,7 @@ pub(super) fn run_plugin_keybinding_command_with_active_bindings(
 }
 
 pub(super) fn run_plugin_keybinding_command_with_dispatch(
+    state: &RuntimeCommandState,
     plugin_id: &str,
     command_name: &str,
     args: &[String],
@@ -2599,7 +2617,7 @@ pub(super) fn run_plugin_keybinding_command_with_dispatch(
     dispatch: super::plugin_kernel::CommandDispatch,
 ) -> Result<PluginCommandExecution> {
     run_plugin_command_internal_with_state(
-        None,
+        Some(state),
         plugin_id,
         command_name,
         args,
@@ -2703,10 +2721,10 @@ pub(super) struct PluginCommandPolicyHints {
 }
 
 pub(super) fn plugin_command_policy_hints(
+    state: &RuntimeCommandState,
     plugin_id: &str,
     command_name: &str,
 ) -> Result<PluginCommandPolicyHints> {
-    let state = runtime_command_state()?;
     let registry = &state.registry;
     let available = registry.plugin_ids();
     let plugin = registry
@@ -2971,6 +2989,7 @@ fn load_command_plugin(
             &state.available_capability_providers,
             &state.config,
             &definitions,
+            state,
         )?))
     } else {
         load_cached_plugin(plugin, state)
@@ -3074,6 +3093,7 @@ fn load_cached_plugin(
             &state.available_capability_providers,
             &state.config,
             &definitions,
+            state,
         )
         .with_context(|| format!("failed loading enabled plugin '{plugin_id}'"))?;
         let loaded = Rc::new(loaded);
@@ -3900,7 +3920,7 @@ enabled_by_default = false
             .unwrap();
         let driver = crate::runtime_owner::RuntimeDriver::new(runtime).unwrap();
         let owner = driver.owner();
-        owner.handle().block_on(owner.run(async {
+        owner.handle().block_on(async {
         use std::sync::atomic::Ordering;
         let plugin_id = format!("example.selected-{}", Uuid::new_v4());
         let manifest = format!(
@@ -3930,10 +3950,12 @@ enabled_by_default = false
             root.join("data"),
             root.join("state"),
         );
+        // The owner is carried explicitly in the state, not entered as context.
         let command_state = build_runtime_command_state(
             config.clone(),
             paths.clone(),
             Arc::new(registry.clone()),
+            Some(&owner),
         )
         .expect("isolated selected command runtime should resolve");
         let _selected_runtime = SelectedCommandStateGuard::enter(&command_state);
@@ -3989,7 +4011,7 @@ enabled_by_default = false
         assert_eq!(calls.load(Ordering::SeqCst), 2,
             "actual standalone worker must execute the selected author exactly once");
         fs::remove_dir_all(root).expect("remove owned test directory");
-        }));
+        });
         drop(owner);
         driver.shutdown().unwrap();
     }

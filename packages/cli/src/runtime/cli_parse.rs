@@ -22,6 +22,9 @@ pub(super) enum ParsedRuntimeCli {
         log_level: LogLevel,
         verbose: bool,
         config_overrides: ConfigLoadOverrides,
+        /// Explicitly resolved command state (and runtime owner) for this
+        /// process; built-in commands carry it instead of rediscovering it.
+        command_state: Option<RuntimeCommandState>,
     },
     ImmediateExit {
         code: u8,
@@ -43,7 +46,9 @@ struct RawRuntimeOverrides {
     config_path: Option<std::path::PathBuf>,
 }
 
-pub(super) fn parse_runtime_cli() -> Result<ParsedRuntimeCli> {
+pub(super) fn parse_runtime_cli(
+    runtime_owner: Option<&crate::runtime_owner::RuntimeOwner>,
+) -> Result<ParsedRuntimeCli> {
     super::startup_future_marker("parse.enter", 0);
     let total_started = Instant::now();
     let argv_started = Instant::now();
@@ -98,7 +103,8 @@ pub(super) fn parse_runtime_cli() -> Result<ParsedRuntimeCli> {
     let scan_us = scan_started.elapsed().as_micros();
     let state_started = Instant::now();
     super::startup_future_marker("parse.command_state.before", 0);
-    let command_state = build_runtime_command_state(config.clone(), paths, Arc::clone(&registry))?;
+    let command_state =
+        build_runtime_command_state(config.clone(), paths, Arc::clone(&registry), runtime_owner)?;
     super::startup_future_marker("parse.command_state.after", 0);
     install_enabled_client_adapters(&config, &registry, &command_state.paths);
     super::startup_future_marker("parse.after_client_adapters", 0);
@@ -397,6 +403,7 @@ pub(super) fn parse_runtime_cli_with_registry(
         log_level,
         verbose,
         config_overrides,
+        command_state,
     })
 }
 

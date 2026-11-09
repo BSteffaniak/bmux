@@ -36,8 +36,7 @@ pub(super) fn run_selected(
                     "attach observer and browser mirroring are not available on the selected command path; run `bmux attach` directly"
                 );
                 Box::pin(run_attach(
-                    &state.config,
-                    &state.paths,
+                    state,
                     target.as_deref(),
                     follow.as_deref(),
                     *global,
@@ -82,12 +81,12 @@ pub(super) fn run_selected(
 /// Provider-owned targets open without a local server; every other target
 /// connects to the selected runtime's local server.
 pub(super) async fn run_attach(
-    config: &BmuxConfig,
-    paths: &ConfigPaths,
+    state: &RuntimeCommandState,
     target: Option<&str>,
     follow: Option<&str>,
     global: bool,
 ) -> Result<u8> {
+    let (config, paths) = (&state.config, &state.paths);
     let provider = super::attach::provider::resolve(target)?;
     let fallback_client = if provider.requires_fallback_client() {
         Some(connect_local(config, paths, "bmux-cli-attach").await?)
@@ -113,6 +112,9 @@ pub(super) async fn run_attach(
             global,
             None,
             Some(config.clone()),
+            // Caller-process plugin commands run with this selected runtime
+            // (and its owner), carried explicitly into the attachment.
+            Some(state.clone()),
         ),
     )
     .await

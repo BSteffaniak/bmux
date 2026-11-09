@@ -617,8 +617,7 @@ async fn run_connect_with(
             };
             let status = if let Some(state) = selected {
                 Box::pin(super::attach_selected::run_attach(
-                    config,
-                    &state.paths,
+                    state,
                     target_session.as_deref(),
                     follow,
                     global,
@@ -2226,11 +2225,13 @@ async fn ensure_local_ipc_backend_ready(paths: &ConfigPaths, mode: HostedMode) -
             "local IPC backend unavailable for runtime '{}'; attempting to start bmux server...",
             active_runtime_name()
         );
+        // Daemon mode spawns the server process; it loads no plugins here.
         let _ = run_server_start(
             true,
             false,
             None,
             RecordingRollingStartOptions::default(),
+            None,
             None,
             None,
         )

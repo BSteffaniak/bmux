@@ -39,6 +39,7 @@ mod plugin_commands;
 mod plugin_host;
 mod plugin_kernel;
 mod plugin_runtime;
+pub use plugin_runtime::RuntimeCommandState;
 mod prompt;
 mod remote_cli;
 mod sandbox_cli;
@@ -333,9 +334,9 @@ fn maybe_print_slot_startup_banner(command: Option<&bmux_cli_schema::Command>) {
 
 pub use dispatch::startup_future_marker;
 
-pub async fn run() -> Result<u8> {
+pub async fn run(runtime_owner: Option<crate::runtime_owner::RuntimeOwner>) -> Result<u8> {
     startup_future_marker("runtime.before_parse", 0);
-    let parsed = parse_runtime_cli()?;
+    let parsed = parse_runtime_cli(runtime_owner.as_ref())?;
     startup_future_marker("runtime.after_parse", 0);
     match parsed {
         ParsedRuntimeCli::BuiltIn {
@@ -343,8 +344,15 @@ pub async fn run() -> Result<u8> {
             log_level,
             verbose,
             config_overrides,
+            command_state,
         } => {
             let _config_override_guard = push_process_config_overrides(config_overrides);
+            // The command executes with the state this process resolved at
+            // parse time (including its runtime owner); legacy readers on this
+            // thread observe that explicit selection, never a lazily rebuilt one.
+            let _selected_command_state = command_state
+                .as_ref()
+                .map(plugin_runtime::SelectedCommandStateGuard::enter);
             let file_only = command_enters_raw_mode(cli.command.as_ref()) || cli.core_builtins_only;
             let logging_scope = logging_scope_for_command(cli.command.as_ref());
             startup_future_marker("runtime.before_logging", 0);
@@ -365,7 +373,12 @@ pub async fn run() -> Result<u8> {
 
             if let Some(command) = &cli.command {
                 startup_future_marker("runtime.before_run_command", 0);
-                return Box::pin(run_command(command, connection_context)).await;
+                return Box::pin(run_command(
+                    command,
+                    connection_context,
+                    command_state.as_ref(),
+                ))
+                .await;
             }
 
             run_default_server_attach(DefaultAttachOptions, connection_context).await

@@ -44,12 +44,14 @@ pub(super) fn run_selected(
                 vars,
                 *verbose,
                 Some(state),
+                Some(state),
             )
             .await;
         }
         Box::pin(super::dispatch::dispatch_built_in_command(
             command,
             super::ConnectionContext::new(None),
+            Some(state),
         ))
         .await
     };
@@ -87,6 +89,7 @@ pub(super) async fn run_playbook_run(
     cli_vars: &[String],
     verbose: bool,
     selected: Option<&super::plugin_runtime::RuntimeCommandState>,
+    invoking: Option<&super::plugin_runtime::RuntimeCommandState>,
 ) -> Result<u8> {
     if let Some(probe) = std::env::var_os("BMUX_PLAYBOOK_PROTOCOL_PROBE") {
         let probe = std::path::PathBuf::from(probe);
@@ -149,9 +152,12 @@ pub(super) async fn run_playbook_run(
 
     let speed =
         bmux_playbook::PlaybackSpeed::parse(playback_speed).context("invalid playback speed")?;
-    let host = selected.map_or_else(crate::playbook::engine::host, |state| {
-        crate::playbook::engine::selected_host(state.config.clone(), state.paths.clone())
-    });
+    // Real attachments run caller-process plugin commands with the invoking
+    // command runtime, handed to the host explicitly (never rediscovered).
+    let host = crate::playbook::engine::command_host(
+        selected.map(|state| (state.config.clone(), state.paths.clone())),
+        selected.or(invoking).cloned(),
+    );
     let result = crate::playbook::engine::run_playbook_with_host(
         playbook,
         target_server,

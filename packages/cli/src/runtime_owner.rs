@@ -220,17 +220,6 @@ impl RuntimeOwner {
     pub fn pin(&self) -> Arc<dyn std::any::Any + Send + Sync> {
         Arc::new(self.clone())
     }
-    /// Correlate with the selected runtime before entering the CLI future.
-    pub(crate) async fn run<T>(&self, work: impl std::future::Future<Output = T>) -> T {
-        SELECTED_RUNTIME.scope(self.clone(), work).await
-    }
-}
-tokio::task_local! {
-    static SELECTED_RUNTIME: RuntimeOwner;
 }
 #[cfg(test)]
 mod tests;
-
-pub(crate) fn selected() -> Option<RuntimeOwner> {
-    SELECTED_RUNTIME.try_with(Clone::clone).ok()
-}

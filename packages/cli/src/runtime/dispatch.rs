@@ -75,7 +75,7 @@ fn startup_future_size_diagnostic() {
                 ) -> std::task::Poll<F::Output>,
         );
     }
-    retain_poll(super::run);
+    retain_poll(|| super::run(None));
     retain_poll(crate::run_cli);
     let command = Command::Server {
         command: ServerCommand::Status { json: false },
@@ -83,24 +83,27 @@ fn startup_future_size_diagnostic() {
     let context = ConnectionContext::new(Some("local"));
     eprintln!(
         "dispatch bytes={}",
-        future_size(|| dispatch_built_in_command(&command, context))
+        future_size(|| dispatch_built_in_command(&command, context, None))
     );
-    let server_dispatch_bytes = future_size(|| dispatch_server_start(&command));
+    let server_dispatch_bytes = future_size(|| dispatch_server_start(&command, None));
     eprintln!("server_dispatch bytes={server_dispatch_bytes}");
     assert!(
         server_dispatch_bytes < 1024,
         "server dispatch must not embed the general dispatcher future"
     );
-    eprintln!("runtime.run bytes={}", future_size(super::run));
+    eprintln!("runtime.run bytes={}", future_size(|| super::run(None)));
     eprintln!(
         "run_command bytes={}",
-        future_size(|| run_command(&command, context))
+        future_size(|| run_command(&command, context, None))
     );
 }
 
 // The monolithic dispatcher has a >1 MiB debug poll frame even though its
 // stored future is small. Keep dedicated server startup out of that poll frame.
-async fn dispatch_server_start(command: &Command) -> Result<u8> {
+async fn dispatch_server_start(
+    command: &Command,
+    runtime_owner: Option<crate::runtime_owner::RuntimeOwner>,
+) -> Result<u8> {
     match (BuiltInHandlerId::ServerStart, command) {
         (
             BuiltInHandlerId::ServerStart,
@@ -170,6 +173,7 @@ async fn dispatch_server_start(command: &Command) -> Result<u8> {
                 rolling_options,
                 pane_shell_integration_override,
                 None,
+                runtime_owner,
             )
             .await
         }
@@ -177,14 +181,25 @@ async fn dispatch_server_start(command: &Command) -> Result<u8> {
     }
 }
 
+/// A foreground server loads plugins under this process's explicitly selected
+/// runtime owner; nothing rediscovers it from task-local or thread context.
+fn selected_runtime_owner(
+    command_state: Option<&super::plugin_runtime::RuntimeCommandState>,
+) -> Option<crate::runtime_owner::RuntimeOwner> {
+    command_state
+        .and_then(|state| state.runtime_owner.as_ref())
+        .and_then(crate::runtime_owner::WeakRuntimeOwner::upgrade)
+}
+
 pub(super) async fn run_command(
     command: &Command,
     connection_context: ConnectionContext<'_>,
+    command_state: Option<&super::plugin_runtime::RuntimeCommandState>,
 ) -> Result<u8> {
     startup_future_marker("run_command.first_poll", 0);
     startup_future_marker(
         "dispatch.before_construct",
-        future_size(|| dispatch_built_in_command(command, connection_context)),
+        future_size(|| dispatch_built_in_command(command, connection_context, command_state)),
     );
     match command {
         Command::External(args) => run_external_plugin_command(args).await,
@@ -192,13 +207,21 @@ pub(super) async fn run_command(
             command: ServerCommand::Start { .. },
         } => {
             let _descriptor = built_in_command_by_handler(BuiltInHandlerId::ServerStart);
+            let runtime_owner = selected_runtime_owner(command_state);
             startup_future_marker(
                 "server_dispatch.before_construct",
-                future_size(|| dispatch_server_start(command)),
+                future_size(|| dispatch_server_start(command, runtime_owner.clone())),
             );
-            Box::pin(dispatch_server_start(command)).await
+            Box::pin(dispatch_server_start(command, runtime_owner)).await
         }
-        _ => Box::pin(dispatch_built_in_command(command, connection_context)).await,
+        _ => {
+            Box::pin(dispatch_built_in_command(
+                command,
+                connection_context,
+                command_state,
+            ))
+            .await
+        }
     }
 }
 
@@ -380,6 +403,7 @@ pub(super) fn built_in_handler_for_command(command: &Command) -> BuiltInHandlerI
 pub(super) async fn dispatch_built_in_command(
     command: &Command,
     connection_context: ConnectionContext<'_>,
+    command_state: Option<&super::plugin_runtime::RuntimeCommandState>,
 ) -> Result<u8> {
     startup_future_marker("dispatch.first_poll", 0);
     let handler = built_in_handler_for_command(command);
@@ -862,7 +886,9 @@ pub(super) async fn dispatch_built_in_command(
                     },
             },
         ) => run_remote_complete_sessions(target).await,
-        (BuiltInHandlerId::ServerStart, _) => dispatch_server_start(command).await,
+        (BuiltInHandlerId::ServerStart, _) => {
+            dispatch_server_start(command, selected_runtime_owner(command_state)).await
+        }
         (
             BuiltInHandlerId::ServerStatus,
             Command::Server {
@@ -1277,6 +1303,7 @@ pub(super) async fn dispatch_built_in_command(
                 vars,
                 *verbose,
                 None,
+                command_state,
             )
             .await
         }

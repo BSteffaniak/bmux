@@ -75,6 +75,7 @@ pub(super) async fn ensure_server_running_for_default_attach(
     }
 
     tracing::info!("attach.bootstrap.server_start_required");
+    // Daemon mode spawns the server process; it loads no plugins here.
     let _ = run_server_start(
         true,
         false,
@@ -82,6 +83,7 @@ pub(super) async fn ensure_server_running_for_default_attach(
         RecordingRollingStartOptions::default(),
         None,
         startup_recording,
+        None,
     )
     .await?;
     if !server_is_running(connection_context).await? {
@@ -340,6 +342,7 @@ fn server_start_future_size_diagnostic() {
                 RecordingRollingStartOptions::default(),
                 None,
                 None,
+                None,
             )
         })
     );
@@ -360,6 +363,7 @@ pub(super) fn run_server_start(
     rolling_options: RecordingRollingStartOptions,
     pane_shell_integration_override: Option<bool>,
     startup_recording: Option<ManualRecordingStartOptions>,
+    runtime_owner: Option<crate::runtime_owner::RuntimeOwner>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<u8>> + Send>> {
     super::dispatch::startup_future_marker(
         "server_start.before_construct",
@@ -371,6 +375,7 @@ pub(super) fn run_server_start(
                 rolling_options.clone(),
                 pane_shell_integration_override,
                 startup_recording.clone(),
+                runtime_owner.clone(),
             )
         }),
     );
@@ -381,6 +386,7 @@ pub(super) fn run_server_start(
         rolling_options,
         pane_shell_integration_override,
         startup_recording,
+        runtime_owner,
     ))
 }
 
@@ -392,6 +398,7 @@ async fn run_server_start_inner(
     rolling_options: RecordingRollingStartOptions,
     pane_shell_integration_override: Option<bool>,
     startup_recording: Option<ManualRecordingStartOptions>,
+    runtime_owner: Option<crate::runtime_owner::RuntimeOwner>,
 ) -> Result<u8> {
     super::dispatch::startup_future_marker("server_start.first_poll", 0);
     let local_connection_context = ConnectionContext::new(Some("local"));
@@ -546,7 +553,12 @@ async fn run_server_start_inner(
         "server.startup.plugins.scan.complete"
     );
     validate_enabled_plugins(&config, &registry)?;
-    super::plugin_runtime::initialize_server_command_state(&config, &paths, &registry)?;
+    super::plugin_runtime::initialize_server_command_state(
+        &config,
+        &paths,
+        &registry,
+        runtime_owner.as_ref(),
+    )?;
     // Construct the actual runtime authority before provider factories. Besides
     // supplying explicit ports, this prevents constructor fallback handles from
     // overwriting authoritative handles published by activated providers.
@@ -617,6 +629,7 @@ async fn run_server_start_inner(
         &registry,
         &server.plugin_state_registry(),
         &provider_definitions,
+        runtime_owner.as_ref(),
     )?);
     tracing::info!(
         plugin_count = loaded_plugins.len(),
@@ -639,7 +652,14 @@ async fn run_server_start_inner(
     // `activate` (and work it starts there) reaches providers that are
     // already active through the host's own dispatch. A provider that is
     // not active yet rejects the invocation; nothing is queued or replayed.
-    register_plugin_service_handlers(&server, &config, &paths, &registry, &loaded_plugins)?;
+    register_plugin_service_handlers(
+        &server,
+        &config,
+        &paths,
+        &registry,
+        &loaded_plugins,
+        runtime_owner.as_ref(),
+    )?;
     Box::pin(activate_loaded_plugins(&loaded_plugins, &config, &paths)).await?;
     super::dispatch::startup_future_marker("plugins.after_activate", 0);
     dispatch_loaded_plugin_event(&loaded_plugins, &plugin_system_event("server_starting"))?;

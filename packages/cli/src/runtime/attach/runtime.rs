@@ -1013,6 +1013,7 @@ pub async fn run_native_with_client(
         None,
         &mut host,
         Some(config),
+        None,
         observer,
     ))
     .await
@@ -4098,6 +4099,7 @@ pub async fn run_session_attach_with_client_headless(
                 kernel_client_factory,
                 &mut driver,
                 None,
+                None,
                 Some(observer),
             ))
             .await
@@ -4140,6 +4142,7 @@ pub async fn run_session_attach_with_client_observer(
                 kernel_client_factory,
                 &mut terminal,
                 None,
+                None,
                 Some(observer),
             ))
             .await
@@ -4164,6 +4167,7 @@ pub async fn run_session_attach_with_provider_session(
         global,
         kernel_client_factory,
         None,
+        None,
     ))
     .await
 }
@@ -4182,6 +4186,7 @@ pub async fn run_session_attach_with_provider_session_config(
     global: bool,
     kernel_client_factory: Option<KernelClientFactory>,
     config: Option<BmuxConfig>,
+    command_state: Option<crate::runtime::plugin_runtime::RuntimeCommandState>,
 ) -> Result<AttachRunOutcome> {
     let effective_target = session.target.as_deref().or(original_target);
     match session.backend {
@@ -4195,6 +4200,7 @@ pub async fn run_session_attach_with_provider_session_config(
                 kernel_client_factory,
                 &mut terminal,
                 config,
+                command_state,
                 None,
             ))
             .await
@@ -4816,6 +4822,7 @@ pub async fn run_session_attach_with_terminal_config_observer<T: AttachTerminal 
     kernel_client_factory: Option<KernelClientFactory>,
     terminal: &mut T,
     config: Option<BmuxConfig>,
+    command_state: Option<crate::runtime::plugin_runtime::RuntimeCommandState>,
     observer: Option<super::observer::AttachObserverPublisher>,
 ) -> Result<AttachRunOutcome> {
     Box::pin(run_session_attach_with_host(
@@ -4826,6 +4833,7 @@ pub async fn run_session_attach_with_terminal_config_observer<T: AttachTerminal 
         kernel_client_factory,
         &mut TerminalAttachHost(terminal),
         config,
+        command_state,
         observer,
     ))
     .await
@@ -4857,6 +4865,7 @@ async fn run_session_attach_with_host<T: AttachHost + ?Sized>(
     kernel_client_factory: Option<KernelClientFactory>,
     terminal: &mut T,
     config: Option<BmuxConfig>,
+    command_state: Option<crate::runtime::plugin_runtime::RuntimeCommandState>,
     observer: Option<super::observer::AttachObserverPublisher>,
 ) -> Result<AttachRunOutcome> {
     let mut guard = AttachRestoreGuard {
@@ -4871,6 +4880,7 @@ async fn run_session_attach_with_host<T: AttachHost + ?Sized>(
         kernel_client_factory,
         guard.terminal,
         config,
+        command_state,
         observer,
     )
     .await;
@@ -4895,6 +4905,7 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
     kernel_client_factory: Option<KernelClientFactory>,
     terminal: &mut T,
     config: Option<BmuxConfig>,
+    command_state: Option<crate::runtime::plugin_runtime::RuntimeCommandState>,
     observer: Option<super::observer::AttachObserverPublisher>,
 ) -> Result<AttachRunOutcome> {
     if target.is_none() && follow.is_none() {
@@ -5156,6 +5167,11 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
     install_bundled_render_extensions(&mut view_state);
     terminal.set_attached_session_id(view_state.attached_id);
     view_state.self_client_id = Some(self_client_id);
+    // Select the command runtime once, on the entry thread: an explicit
+    // caller selection, else the state this thread's entry point installed.
+    // It then travels with the attachment to every command worker.
+    view_state.command_state =
+        command_state.or_else(|| super::super::plugin_runtime::selected_command_state().ok());
     view_state.mouse.config = attach_config.attach_mouse_config();
     view_state.outer_paste_capture_enabled =
         outer_paste_capture_enabled(attach_config.behavior.bracketed_paste);
@@ -7741,17 +7757,23 @@ async fn run_attach_plugin_command_pipeline(
 
 async fn enforce_hot_path_plugin_policy(
     client: &mut StreamingBmuxClient,
+    command_state: Option<&crate::runtime::plugin_runtime::RuntimeCommandState>,
     plugin_id: &str,
     command_name: &str,
     attached_session_id: Uuid,
     attached_context_id: Option<Uuid>,
 ) -> anyhow::Result<bmux_plugin_sdk::CommandExecutionKind> {
-    let hints = plugin_command_policy_hints(plugin_id, command_name).map_err(|error| {
-        ClientError::ServerError {
-            code: bmux_ipc::ErrorCode::InvalidRequest,
-            message: error.to_string(),
-        }
+    let command_state = command_state.ok_or_else(|| ClientError::ServerError {
+        code: bmux_ipc::ErrorCode::InvalidRequest,
+        message: "attach has no selected command runtime for plugin commands".to_string(),
     })?;
+    let hints =
+        plugin_command_policy_hints(command_state, plugin_id, command_name).map_err(|error| {
+            ClientError::ServerError {
+                code: bmux_ipc::ErrorCode::InvalidRequest,
+                message: error.to_string(),
+            }
+        })?;
     let execution = hints.execution.clone();
 
     if !matches!(
@@ -7974,6 +7996,7 @@ pub async fn handle_attach_plugin_command_action(
     let policy_started = Instant::now();
     let execution_kind = match enforce_hot_path_plugin_policy(
         client,
+        view_state.command_state.as_ref(),
         plugin_id,
         command_name,
         view_state.attached_id,
@@ -8032,9 +8055,18 @@ pub async fn handle_attach_plugin_command_action(
             let caller = view_state.self_client_id;
             let (dispatch, _command_owner, mut selected_requests) =
                 super::super::plugin_kernel::CommandDispatch::channel();
+            // The blocking worker has no task or thread context of its own:
+            // the attachment's selected command runtime moves to it explicitly.
+            let command_state = view_state.command_state.clone();
             let command = tokio::task::spawn_blocking(move || {
                 let _transport = super::super::plugin_kernel::enter_invoking_transport(sender);
+                let command_state = command_state.ok_or_else(|| ClientError::ServerError {
+                    code: bmux_ipc::ErrorCode::Internal,
+                    message: "attach has no selected command runtime for plugin commands"
+                        .to_string(),
+                })?;
                 super::super::plugin_runtime::run_plugin_keybinding_command_with_dispatch(
+                    &command_state,
                     &plugin_id,
                     &command_name,
                     &args,
