@@ -37,6 +37,7 @@ bmux_tui_components = { workspace = true, features = [
     "text-input",
     "modal-frame",
 ] }
+tokio = { workspace = true, features = ["test-util"] }
 
 [dependencies]
 bmux_image             = { workspace = true, optional = true }
@@ -61,3 +62,5 @@ image-iterm2 = ["images", "bmux_image/iterm2"]
 image-kitty = ["images", "bmux_image/kitty"]
 image-sixel = ["images", "bmux_image/sixel"]
 images = ["dep:bmux_image"]
+# Deterministic `testing::ProgramHarness` for downstream test builds. Not for production.
+testing = ["tokio/test-util"]

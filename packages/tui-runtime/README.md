@@ -8,6 +8,13 @@ coalescing, render cadence, terminal input lifecycle, shutdown, and neutral
 runtime statistics. Application state and product behavior remain with the
 consumer.
 
+## Deterministic testing
+
+Enable the non-default `testing` feature in dev-dependencies to drive any
+`Program` with `testing::ProgramHarness`: a manual clock, scripted events,
+explicit presentation between any number of updates, and inspection of the
+committed frame. See `docs/tui-runtime.md` ("Deterministic testing").
+
 ## Committed interaction and pointer presentation
 
 Use `TerminalPresenter::with_commit` to copy the successfully flushed hit scene

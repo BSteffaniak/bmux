@@ -232,6 +232,24 @@ impl<M: Send + 'static> CommandScheduler<M> {
         self.tasks.is_empty()
     }
 
+    /// Keys of active keyed commands, including finished work not yet collected.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn active_keys(&self) -> Vec<CommandKey> {
+        self.active_keyed.keys().cloned().collect()
+    }
+
+    /// Keys of keyed commands waiting for capacity or for active work to finish.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn queued_keys(&self) -> Vec<CommandKey> {
+        self.queued_latest.keys().cloned().collect()
+    }
+
+    /// Number of spawned command tasks that have not been collected.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn task_count(&self) -> usize {
+        self.tasks.len()
+    }
+
     fn start_queued_work(&mut self) {
         while self.active_count < self.max_active {
             let Some((key, queued)) = self.queued_latest.pop_first() else {

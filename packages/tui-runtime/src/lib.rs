@@ -11,6 +11,7 @@
 //! callback is scheduled through the same bounded cadence and lifecycle machinery as an ordinary
 //! event update.
 
+mod clock;
 pub mod command;
 mod command_scheduler;
 pub mod config;
@@ -34,6 +35,8 @@ pub mod stats;
 pub mod subscription;
 mod subscription_scheduler;
 pub mod terminal_presenter;
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
 
 pub use command::{Command, CommandPolicy};
 pub use config::RuntimeConfig;

@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use bmux_tui::event::Event;
 use tokio::sync::{Notify, mpsc};
 
+use crate::clock::RuntimeClock;
 use crate::command_scheduler::CommandScheduler;
 use crate::config::RuntimeConfig;
 use crate::ids::{MessageKey, TimerId};
@@ -40,6 +41,7 @@ struct ControlState {
 struct SharedControl {
     state: Mutex<ControlState>,
     notify: Notify,
+    clock: RuntimeClock,
 }
 
 /// Cloneable bounded sender supplied to one long-lived subscription.
@@ -193,6 +195,24 @@ impl<M> RuntimeHandle<M> {
         self.control.notify.notify_one();
     }
 
+    /// Schedule or replace one keyed one-shot timer due `delay` after [`Self::now`].
+    ///
+    /// Prefer this over computing a deadline from [`Instant::now`]: it reads the runtime's own
+    /// time source, so deterministic test clocks control when the timer becomes due.
+    pub fn schedule_timer_after(&self, id: TimerId, delay: Duration) {
+        let deadline = self.now() + delay;
+        self.schedule_timer(id, deadline);
+    }
+
+    /// Return the current instant of the runtime's time source.
+    ///
+    /// Production runtimes read the monotonic system clock. Deterministic test harnesses return
+    /// their manually advanced time, so deadlines derived from this value stay reproducible.
+    #[must_use]
+    pub fn now(&self) -> Instant {
+        self.control.clock.now()
+    }
+
     /// Cancel one keyed timer, returning whether it was pending.
     #[must_use]
     pub fn cancel_timer(&self, id: &TimerId) -> bool {
@@ -313,6 +333,16 @@ where
         presenter: R,
         config: RuntimeConfig,
     ) -> (Self, RuntimeHandle<P::Message>) {
+        Self::new_with(config, RuntimeClock::System, |_handle| (program, presenter))
+    }
+
+    /// Create a runtime with an explicit time source, building the program and presenter after
+    /// the admission handle exists so they may retain it.
+    pub(crate) fn new_with(
+        config: RuntimeConfig,
+        clock: RuntimeClock,
+        build: impl FnOnce(&RuntimeHandle<P::Message>) -> (P, R),
+    ) -> (Self, RuntimeHandle<P::Message>) {
         let config = config.normalized();
         let stats = Arc::new(Mutex::new(RuntimeStats::new(
             config.collect_detailed_telemetry,
@@ -341,6 +371,7 @@ where
                 closed: false,
             }),
             notify: Notify::new(),
+            clock,
         });
         let handle = RuntimeHandle {
             reliable: ReliableSender::new(
@@ -375,6 +406,10 @@ where
             },
             Arc::clone(&stats),
         );
+        let (program, presenter) = build(&handle);
+        let constructed_at = config
+            .collect_detailed_telemetry
+            .then(|| control.clock.now());
         (
             Self {
                 program,
@@ -395,7 +430,7 @@ where
                 next_ready_source: 0,
                 next_application_source: 0,
                 exiting: false,
-                constructed_at: config.collect_detailed_telemetry.then(Instant::now),
+                constructed_at,
                 terminal_ordinal: Some(0),
                 dispatch_window: TerminalDispatchRange::Empty,
                 presentation_attempt: 0,
@@ -616,7 +651,7 @@ where
                 });
                 RuntimeEvent::Terminal(event)
             }),
-            2 => self.take_due_timer(Instant::now()).map(|timer| {
+            2 => self.take_due_timer(self.control.clock.now()).map(|timer| {
                 with_stats(&self.stats, |stats| {
                     stats.timers_delivered = stats.timers_delivered.saturating_add(1);
                 });
@@ -862,7 +897,7 @@ where
             return true;
         };
         self.last_presented
-            .is_none_or(|last| Instant::now() >= last + interval)
+            .is_none_or(|last| self.control.clock.now() >= last + interval)
     }
 
     fn present(&mut self) -> Result<(), R::Error> {
@@ -871,7 +906,7 @@ where
             let scheduled_at = state
                 .frame_interval
                 .and_then(|interval| self.last_presented.map(|last| last + interval))
-                .unwrap_or_else(Instant::now);
+                .unwrap_or_else(|| self.control.clock.now());
             let reset = state.reset;
             // Consume only the invalidation represented by this frame. Requests made while the
             // presenter or successful-commit hook runs remain pending for a later frame.
@@ -887,7 +922,7 @@ where
         if reset {
             self.presenter.reset(ResetReason::Application);
         }
-        let presentation_started = Instant::now();
+        let presentation_started = self.control.clock.now();
         match self.presenter.start_present(&mut self.program) {
             Ok(None) => {
                 self.pending_presentation = Some((presentation_started, scheduled_at));
@@ -907,7 +942,7 @@ where
         presentation_started: Instant,
         scheduled_at: Instant,
     ) -> Result<(), R::Error> {
-        let presented_at = Instant::now();
+        let presented_at = self.control.clock.now();
         self.record_presentation(
             presentation_started,
             presented_at,
@@ -960,7 +995,7 @@ where
                 state
                     .frame_interval
                     .and_then(|interval| self.last_presented.map(|last| last + interval))
-                    .unwrap_or_else(Instant::now),
+                    .unwrap_or_else(|| self.control.clock.now()),
             )
         } else {
             None
@@ -981,6 +1016,100 @@ where
         self.subscription_rx.close();
         self.commands.shutdown().await;
         self.subscriptions.shutdown().await;
+    }
+}
+
+/// Crate-private stepping surface used by the deterministic [`crate::testing`] harness.
+///
+/// Each method reuses the production scheduling path; none duplicates delivery, presentation, or
+/// commit semantics.
+#[cfg(any(test, feature = "testing"))]
+impl<P, R> Runtime<P, R>
+where
+    P: Program,
+    R: Presenter<P>,
+{
+    pub(crate) const fn harness_program(&self) -> &P {
+        &self.program
+    }
+
+    pub(crate) const fn harness_program_mut(&mut self) -> &mut P {
+        &mut self.program
+    }
+
+    pub(crate) const fn harness_presenter(&self) -> &R {
+        &self.presenter
+    }
+
+    pub(crate) const fn harness_exiting(&self) -> bool {
+        self.exiting
+    }
+
+    /// Apply one externally scripted event through the production update path.
+    pub(crate) fn harness_apply(
+        &mut self,
+        event: RuntimeEvent<P::Message>,
+    ) -> Result<(), P::Error> {
+        self.apply_event(event)
+    }
+
+    /// Deliver at most one event from the runtime's own fair ready-source rotation.
+    pub(crate) fn harness_step_ready(&mut self) -> Result<bool, P::Error> {
+        let delivered = self.process_next_ready()?;
+        self.subscriptions.try_next_completion();
+        Ok(delivered)
+    }
+
+    /// Return the pending redraw and reset latches.
+    pub(crate) fn harness_invalidation(&self) -> (bool, bool) {
+        let state = lock_unpoisoned(&self.control.state);
+        (state.dirty, state.reset)
+    }
+
+    /// Latch a redraw exactly as an update returning [`Invalidation::Redraw`] would.
+    pub(crate) fn harness_request_redraw(&self) {
+        self.mark_dirty(false);
+    }
+
+    /// Present when dirty, ignoring cadence. Returns whether a presentation was attempted.
+    pub(crate) fn harness_present_dirty(&mut self) -> Result<bool, R::Error> {
+        if self.pending_presentation.is_some() || !self.harness_invalidation().0 {
+            return Ok(false);
+        }
+        self.present()?;
+        Ok(true)
+    }
+
+    /// Present only when the production cadence rule says a frame is due.
+    pub(crate) fn harness_present_due(&mut self) -> Result<bool, R::Error> {
+        if !self.presentation_due() {
+            return Ok(false);
+        }
+        self.present()?;
+        Ok(true)
+    }
+
+    /// Return pending timer deadlines.
+    pub(crate) fn harness_timers(&self) -> BTreeMap<TimerId, Instant> {
+        lock_unpoisoned(&self.control.state).timers.clone()
+    }
+
+    pub(crate) fn harness_command_keys(
+        &self,
+    ) -> (
+        Vec<crate::ids::CommandKey>,
+        Vec<crate::ids::CommandKey>,
+        usize,
+    ) {
+        (
+            self.commands.active_keys(),
+            self.commands.queued_keys(),
+            self.commands.task_count(),
+        )
+    }
+
+    pub(crate) fn harness_stats(&self) -> RuntimeStats {
+        stats_snapshot(&self.stats)
     }
 }
 

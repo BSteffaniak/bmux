@@ -246,6 +246,12 @@ pending deadline. A delivered timer is removed before `Program::update`;
 periodic behavior reschedules itself explicitly. This avoids an implicit global
 tick and allows idle runtimes to sleep until actual work is due.
 
+Deadlines are measured on the runtime's time source. `RuntimeHandle::now`
+returns it and `RuntimeHandle::schedule_timer_after` schedules relative to it;
+prefer these over deriving deadlines from `Instant::now` so deterministic test
+clocks control when timers become due. Production runtimes use the monotonic
+system clock.
+
 ## Commands and cancellation
 
 Commands are application-supplied futures that return zero or one application
@@ -324,6 +330,29 @@ and before a runtime terminal reader starts. Applications must retain presenter
 ownership long enough to call `cleanup_images` before graceful exit,
 suspension, or application-error recovery; `reset_presentation` combines image
 cleanup with retained-frame invalidation.
+
+## Deterministic testing
+
+The non-default `testing` feature provides
+`bmux_tui_runtime::testing::ProgramHarness`, a synchronously stepped driver for
+any `Program`. Enable it only from test builds:
+
+```toml
+[dev-dependencies]
+bmux_tui_runtime = { workspace = true, features = ["testing"] }
+```
+
+The harness owns a real `Runtime` and calls its production update, presentation,
+and commit paths; it substitutes only time and task execution:
+
+- **Time.** A `ManualClock` replaces the system clock for timer deadlines and frame cadence. It captures one anchor instant and afterwards moves only on `advance`. Commands and subscriptions run on a harness-owned current-thread Tokio runtime with a paused clock that advances together with the manual clock, so `tokio::time::sleep` in a command completes exactly when the test advances past it.
+- **Delivery.** `push_terminal`, `push_key`, `push_mouse`, `push_resize`, `push_paste`, `push_message`, and `push_timer` script events in order. `step`, `deliver(n)`, and `settle` deliver scripted events first, then runtime-owned sources through the production fair rotation: due timers, command completions, subscription messages, and messages or terminal events admitted through `handle()`. `settle` is bounded and reports programs that never go idle.
+- **Presentation.** Delivery never presents in the default `PresentMode::Manual`, so any number of events and effect results can be applied between frames. `present` commits one frame when a redraw is pending (ignoring cadence), `force_present` requests one first, and `present_if_due` applies the configured cadence on the manual clock. `PresentMode::AfterEachEvent` and `PresentMode::Cadence` present automatically. Each presentation draws into an in-memory `Terminal`, runs the optional `on_commit` hit-map/focus observer, then `Program::presentation_committed`, and applies its update, exactly as the running runtime does.
+- **Inspection.** `frame()` exposes the committed buffer, row text, cell-accurate `find`, style runs, cursor, hit map, selection scene, semantics, focus, and the `PresentReport`; `FrameView::text` is suitable for snapshot assertions. The harness also exposes pending timers and deadlines, keyed command state, pending redraw/reset latches, reset history, all reports, the last output bytes, and runtime statistics.
+
+Programs that retain a `RuntimeHandle` receive the harness handle through
+`HarnessBuilder::build_with`. The harness is a test surface: it is excluded from
+production builds and is not a second runtime implementation.
 
 ## Shutdown and errors
 
