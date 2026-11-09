@@ -27,7 +27,7 @@ async fn activation_callback_authority_is_explicit_and_retired_before_publicatio
     assert_eq!(activation.state().unwrap(), LifecycleState::Activating);
     assert!(matches!(
         activation.mark_active(),
-        Err(ScopeError::Outstanding)
+        Err(ScopeError::Outstanding(_))
     ));
     let child = lifecycle.begin_child().unwrap();
     let nested = child.try_admit().unwrap();
@@ -61,7 +61,7 @@ async fn cleanup_callbacks_do_not_reopen_normal_input_and_parent_close_fences_th
     activation.close().unwrap();
     assert!(matches!(
         activation.begin_lifecycle_invocation(LifecycleInvocationKind::Cleanup),
-        Err(ScopeError::Outstanding)
+        Err(ScopeError::Outstanding(_))
     ));
     drop(ordinary_guard);
     ordinary.drain().await.unwrap();
@@ -84,7 +84,7 @@ async fn cleanup_callbacks_do_not_reopen_normal_input_and_parent_close_fences_th
     assert!(child.is_cancelled().unwrap());
     assert!(matches!(cleanup.try_admit(), Err(ScopeError::Closed)));
     assert!(matches!(child.try_admit(), Err(ScopeError::Closed)));
-    assert!(matches!(cleanup.finish(), Err(ScopeError::Outstanding)));
+    assert!(matches!(cleanup.finish(), Err(ScopeError::Outstanding(_))));
     drop(nested);
     drop(callback);
     child.drain().await.unwrap();
@@ -119,7 +119,7 @@ async fn cleanup_required_parent_preserves_failure_and_owned_tasks() {
         .unwrap();
     assert!(matches!(
         activation.resolve_cleanup(),
-        Err(ScopeError::Outstanding)
+        Err(ScopeError::Outstanding(_))
     ));
     cleanup.close().unwrap();
     cancelled_rx.await.unwrap();

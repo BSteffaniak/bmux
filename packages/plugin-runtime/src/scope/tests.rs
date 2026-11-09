@@ -117,9 +117,15 @@ async fn admitted_callback_keeps_every_ancestor_outstanding() {
     let guard = invocation.try_admit().unwrap();
     instance.close().unwrap();
     assert!(matches!(invocation.try_admit(), Err(ScopeError::Closed)));
-    assert!(matches!(invocation.finish(), Err(ScopeError::Outstanding)));
-    assert!(matches!(activation.finish(), Err(ScopeError::Outstanding)));
-    assert!(matches!(instance.finish(), Err(ScopeError::Outstanding)));
+    assert!(matches!(
+        invocation.finish(),
+        Err(ScopeError::Outstanding(_))
+    ));
+    assert!(matches!(
+        activation.finish(),
+        Err(ScopeError::Outstanding(_))
+    ));
+    assert!(matches!(instance.finish(), Err(ScopeError::Outstanding(_))));
     drop(guard);
     retire(instance, activation, invocation).await;
 }
@@ -179,7 +185,10 @@ async fn cancelled_drain_observer_retains_task_and_owner() {
     assert!(matches!(observer.as_mut().poll(&mut cx), Poll::Pending));
     drop(observer);
     cancelled_rx.await.unwrap();
-    assert!(matches!(invocation.finish(), Err(ScopeError::Outstanding)));
+    assert!(matches!(
+        invocation.finish(),
+        Err(ScopeError::Outstanding(_))
+    ));
     assert!(matches!(
         invocation.spawn("late", |_| async { Ok(()) }),
         Err(ScopeError::Closed)
@@ -196,7 +205,7 @@ async fn resources_and_failures_require_explicit_cleanup_acknowledgement() {
         .unwrap();
     assert!(matches!(
         activation.release_resource(resource),
-        Err(ScopeError::Outstanding)
+        Err(ScopeError::Outstanding(_))
     ));
     invocation
         .fail_cleanup("unsubscribe failed".into())
@@ -207,7 +216,7 @@ async fn resources_and_failures_require_explicit_cleanup_acknowledgement() {
     ));
     assert!(matches!(
         invocation.resolve_cleanup(),
-        Err(ScopeError::Outstanding)
+        Err(ScopeError::Outstanding(_))
     ));
     drop(invocation.release_resource(resource).unwrap());
     invocation.resolve_cleanup().unwrap();

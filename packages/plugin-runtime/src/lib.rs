@@ -12,8 +12,10 @@ pub use identity::{
     RuntimeInvocationId,
 };
 pub use scope::{
-    ActivationScope, AdmissionGuard, CallbackAdmission, CallbackCapability, InstanceScope,
-    InvocationScope, LifecycleInvocationKind, LifecycleState, ScopeError,
+    ActivationScope, AdmissionGuard, CallbackAdmission, CallbackCapability, HolderKind, HolderSite,
+    InstanceScope, InvocationScope, LifecycleInvocationKind, LifecycleState, OutstandingHolder,
+    OutstandingHolders, ScopeError, ScopeKey, teardown_deadline, teardown_timeout,
+    unfinished_instances,
 };
 pub mod shutdown;
 pub mod shutdown_progress;

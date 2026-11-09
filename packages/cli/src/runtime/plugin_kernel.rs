@@ -2166,7 +2166,7 @@ mod tests {
         activation.close().unwrap();
         assert!(matches!(
             activation.finish(),
-            Err(bmux_plugin_runtime::ScopeError::Outstanding)
+            Err(bmux_plugin_runtime::ScopeError::Outstanding(_))
         ));
         release.send(()).unwrap();
         retire_selected_effect_scope(instance, activation, invocation).await;

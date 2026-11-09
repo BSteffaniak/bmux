@@ -4,13 +4,27 @@
 //! and admission linearize under that lock; an admission increments every ancestor
 //! before releasing it. Drain uses a watch revision subscribed before inspecting
 //! the predicate, so completion between inspection and suspension cannot be lost.
+//!
+//! Every admission, child scope and resource is attributable (creating call
+//! site plus optional label). Attribution bookkeeping is kept inside the same
+//! tree lock as the counts it describes, so it introduces no new lock ordering.
+//! Host teardown uses deadline-bounded drains that report stragglers by owner
+//! instead of waiting forever.
 use std::{
     any::Any,
     collections::BTreeMap,
     future::Future,
-    sync::{Arc, Mutex, MutexGuard},
+    panic::Location,
+    sync::{
+        Arc, Mutex, MutexGuard, OnceLock, Weak,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
 };
 use tokio::sync::watch;
+
+mod holders;
+pub use holders::{HolderKind, HolderSite, OutstandingHolder, OutstandingHolders, ScopeKey};
 
 use crate::{
     PluginActivationId, PluginConcurrencyConfig, PluginInstanceId, PluginResourceId,
@@ -47,8 +61,10 @@ pub enum ScopeError {
     Busy,
     #[error("scope capacity reached")]
     Capacity,
-    #[error("scope has outstanding admissions, children, tasks, or resources")]
-    Outstanding,
+    #[error("scope has outstanding admissions, children, tasks, or resources: {0}")]
+    Outstanding(Box<OutstandingHolders>),
+    #[error("scope teardown deadline exceeded; abandoning retained owners: {0}")]
+    DeadlineExceeded(Box<OutstandingHolders>),
     #[error("scope state lock poisoned; cleanup authority retained")]
     Poisoned,
     #[error("scope cleanup failed: {0}")]
@@ -57,15 +73,51 @@ pub enum ScopeError {
     UnknownResource,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum Key {
-    Instance,
-    Activation(PluginActivationId),
-    Invocation(RuntimeInvocationId),
+type Key = ScopeKey;
+
+/// Default bound for host teardown drains and process shutdown waits.
+pub const DEFAULT_TEARDOWN_TIMEOUT: Duration = Duration::from_secs(30);
+/// Environment override (whole seconds) for [`teardown_timeout`].
+pub const TEARDOWN_TIMEOUT_ENV: &str = "BMUX_TEARDOWN_TIMEOUT_SECS";
+/// Grace after aborting remaining tasks at a teardown deadline.
+const ABORT_GRACE: Duration = Duration::from_millis(250);
+
+/// Host teardown bound: [`TEARDOWN_TIMEOUT_ENV`] seconds when set to a positive
+/// integer, otherwise [`DEFAULT_TEARDOWN_TIMEOUT`].
+#[must_use]
+pub fn teardown_timeout() -> Duration {
+    std::env::var(TEARDOWN_TIMEOUT_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .map_or(DEFAULT_TEARDOWN_TIMEOUT, Duration::from_secs)
+}
+
+/// Deadline `teardown_timeout()` from now on the tokio clock.
+#[must_use]
+pub fn teardown_deadline() -> tokio::time::Instant {
+    tokio::time::Instant::now() + teardown_timeout()
+}
+
+/// Attribution of one live admission.
+#[derive(Debug, Clone)]
+struct Holder {
+    site: HolderSite,
+    label: Option<Arc<str>>,
+}
+
+struct ResourceEntry {
+    value: Arc<dyn Any + Send + Sync>,
+    site: HolderSite,
+    type_name: &'static str,
 }
 
 struct Node {
     parent: Option<Key>,
+    site: HolderSite,
+    label: Option<Arc<str>>,
+    /// Live admissions on this node, bounded by `direct` (at most 1024).
+    holders: Vec<(u64, Holder)>,
     phase: LifecycleState,
     admitted: usize,
     direct: usize,
@@ -73,15 +125,23 @@ struct Node {
     cancellation: watch::Sender<bool>,
     tasks: BackgroundTasks,
     tasks_drained: bool,
-    resources: BTreeMap<PluginResourceId, Arc<dyn Any + Send + Sync>>,
+    resources: BTreeMap<PluginResourceId, ResourceEntry>,
     failure: Option<String>,
     lifecycle_authority: Option<LifecycleInvocationKind>,
 }
 
 impl Node {
-    fn new(parent: Option<Key>, phase: LifecycleState, policy: PluginConcurrencyConfig) -> Self {
+    fn new(
+        parent: Option<Key>,
+        phase: LifecycleState,
+        policy: PluginConcurrencyConfig,
+        site: HolderSite,
+    ) -> Self {
         Self {
             parent,
+            site,
+            label: None,
+            holders: Vec::new(),
             phase,
             admitted: 0,
             direct: 0,
@@ -107,6 +167,7 @@ struct Tree {
     runtime: PluginRuntimeScopeId,
     instance: PluginInstanceId,
     nodes: Mutex<BTreeMap<Key, Node>>,
+    next_holder: AtomicU64,
     changed: watch::Sender<()>,
     // Deliberate retention until explicit successful instance finish. Losing all
     // observers must leak safely rather than unload code needed by detached work.
@@ -117,6 +178,109 @@ impl Tree {
     fn lock(&self) -> Result<MutexGuard<'_, BTreeMap<Key, Node>>, ScopeError> {
         self.nodes.lock().map_err(|_| ScopeError::Poisoned)
     }
+
+    /// Snapshot the holders of `root`'s subtree. Runs under the tree lock the
+    /// caller already holds; never takes task locks.
+    fn report(&self, nodes: &BTreeMap<Key, Node>, root: Key) -> OutstandingHolders {
+        let mut holders = Vec::new();
+        for key in subtree(nodes, root) {
+            let node = &nodes[&key];
+            if key != root {
+                holders.push(OutstandingHolder {
+                    kind: HolderKind::ChildScope,
+                    scope: key,
+                    scope_label: node.label.clone(),
+                    site: Some(node.site),
+                    label: None,
+                });
+            }
+            holders.extend(node.holders.iter().map(|(_, holder)| OutstandingHolder {
+                kind: HolderKind::Admission,
+                scope: key,
+                scope_label: node.label.clone(),
+                site: Some(holder.site),
+                label: holder.label.clone(),
+            }));
+            holders.extend(node.resources.values().map(|entry| OutstandingHolder {
+                kind: HolderKind::Resource,
+                scope: key,
+                scope_label: node.label.clone(),
+                site: Some(entry.site),
+                label: Some(Arc::from(entry.type_name)),
+            }));
+            if !node.tasks_drained {
+                holders.push(OutstandingHolder {
+                    kind: HolderKind::UndrainedTasks,
+                    scope: key,
+                    scope_label: node.label.clone(),
+                    site: None,
+                    label: None,
+                });
+            }
+        }
+        OutstandingHolders {
+            runtime: self.runtime,
+            instance: self.instance,
+            instance_label: nodes
+                .get(&Key::Instance)
+                .and_then(|node| node.label.clone()),
+            scope: root,
+            phase: nodes
+                .get(&root)
+                .map_or(LifecycleState::Destroyed, |node| node.phase),
+            holders,
+        }
+    }
+
+    fn outstanding(&self, nodes: &BTreeMap<Key, Node>, root: Key) -> ScopeError {
+        ScopeError::Outstanding(Box::new(self.report(nodes, root)))
+    }
+}
+
+/// Keys of `root` and all of its descendants, root first.
+fn subtree(nodes: &BTreeMap<Key, Node>, root: Key) -> Vec<Key> {
+    let mut keys = vec![root];
+    keys.extend(
+        nodes
+            .keys()
+            .copied()
+            .filter(|key| *key != root)
+            .filter(|key| ancestry(nodes, *key).is_ok_and(|path| path.contains(&root))),
+    );
+    keys
+}
+
+/// Weak registry of every instance tree, for process-shutdown diagnostics.
+/// Only instance creation and reporting take this lock, never while holding a
+/// tree lock.
+fn live_trees() -> &'static Mutex<Vec<Weak<Tree>>> {
+    static LIVE: OnceLock<Mutex<Vec<Weak<Tree>>>> = OnceLock::new();
+    LIVE.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Every unfinished instance in this process with its outstanding holders.
+/// Used to name what blocks process shutdown; it never releases anything.
+#[must_use]
+pub fn unfinished_instances() -> Vec<OutstandingHolders> {
+    let trees: Vec<Arc<Tree>> = live_trees()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .filter_map(Weak::upgrade)
+        .collect();
+    trees
+        .into_iter()
+        .filter_map(|tree| {
+            let scope = Scope {
+                tree,
+                key: Key::Instance,
+            };
+            scope
+                .outstanding()
+                .ok()
+                .filter(|report| report.phase != LifecycleState::Destroyed)
+        })
+        .collect()
 }
 
 #[derive(Clone)]
@@ -193,7 +357,11 @@ impl Scope {
             .phase)
     }
 
-    fn admit(&self) -> Result<AdmissionGuard, ScopeError> {
+    fn admit(
+        &self,
+        label: Option<Arc<str>>,
+        site: HolderSite,
+    ) -> Result<AdmissionGuard, ScopeError> {
         let mut nodes = self.tree.lock()?;
         let keys = ancestry(&nodes, self.key)?;
         if !accepts_path(&nodes, &keys) {
@@ -212,10 +380,103 @@ impl Scope {
         for key in keys {
             nodes.get_mut(&key).ok_or(ScopeError::Closed)?.admitted += 1;
         }
-        nodes.get_mut(&self.key).ok_or(ScopeError::Closed)?.direct += 1;
+        let holder = self.tree.next_holder.fetch_add(1, Ordering::Relaxed);
+        let node = nodes.get_mut(&self.key).ok_or(ScopeError::Closed)?;
+        node.direct += 1;
+        node.holders.push((holder, Holder { site, label }));
         Ok(AdmissionGuard {
             scope: self.clone(),
+            holder,
         })
+    }
+
+    fn set_label(&self, label: Arc<str>) -> Result<(), ScopeError> {
+        self.tree
+            .lock()?
+            .get_mut(&self.key)
+            .ok_or(ScopeError::Closed)?
+            .label = Some(label);
+        Ok(())
+    }
+
+    /// Snapshot this subtree's holders, including unreaped task names. Task
+    /// locks are only taken after the tree lock is released.
+    fn outstanding(&self) -> Result<OutstandingHolders, ScopeError> {
+        let (mut report, tasks) = {
+            let nodes = self.tree.lock()?;
+            if !nodes.contains_key(&self.key) {
+                return Err(ScopeError::Closed);
+            }
+            let tasks: Vec<_> = subtree(&nodes, self.key)
+                .into_iter()
+                .map(|key| (key, nodes[&key].label.clone(), nodes[&key].tasks.clone()))
+                .collect();
+            (self.tree.report(&nodes, self.key), tasks)
+        };
+        for (key, scope_label, tasks) in tasks {
+            for name in tasks.pending_names() {
+                report.holders.push(OutstandingHolder {
+                    kind: HolderKind::Task,
+                    scope: key,
+                    scope_label: scope_label.clone(),
+                    site: None,
+                    label: Some(Arc::from(name)),
+                });
+            }
+        }
+        Ok(report)
+    }
+
+    /// Deadline expiry: report who blocked, then abandon. Retained owners are
+    /// never released here; remaining tasks are aborted best-effort and the
+    /// scope is marked as failed cleanup so it can never report success.
+    async fn expire(&self) -> ScopeError {
+        let report = match self.outstanding() {
+            Ok(report) => report,
+            Err(error) => return error,
+        };
+        let tasks = {
+            let mut nodes = match self.tree.lock() {
+                Ok(nodes) => nodes,
+                Err(error) => return error,
+            };
+            let tasks: Vec<_> = subtree(&nodes, self.key)
+                .into_iter()
+                .map(|key| nodes[&key].tasks.clone())
+                .collect();
+            if let Some(node) = nodes.get_mut(&self.key) {
+                node.phase = LifecycleState::CleanupRequired;
+                node.failure = Some(format!("teardown deadline exceeded: {report}"));
+            }
+            tasks
+        };
+        self.tree.changed.send_replace(());
+        // Never nest task and tree locks (see close).
+        for task_scope in &tasks {
+            task_scope.abort();
+        }
+        // Give aborted futures a moment to drop their admissions so the host
+        // retains as little as possible; the result never becomes success.
+        let mut changed = self.tree.changed.subscribe();
+        let _ = tokio::time::timeout(ABORT_GRACE, async {
+            loop {
+                let settled = self
+                    .tree
+                    .lock()
+                    .ok()
+                    .and_then(|nodes| nodes.get(&self.key).map(|node| node.admitted == 0))
+                    .unwrap_or(true);
+                if settled || changed.changed().await.is_err() {
+                    return;
+                }
+            }
+        })
+        .await;
+        tracing::warn!(
+            report = %report,
+            "plugin scope teardown deadline exceeded; owners abandoned (code is never unloaded)"
+        );
+        ScopeError::DeadlineExceeded(Box::new(report))
     }
 
     fn close(&self) -> Result<(), ScopeError> {
@@ -250,7 +511,7 @@ impl Scope {
         Ok(())
     }
 
-    async fn drain(&self) -> Result<(), ScopeError> {
+    async fn drain(&self, deadline: Option<tokio::time::Instant>) -> Result<(), ScopeError> {
         self.close()?;
         let tasks = self
             .tree
@@ -259,7 +520,18 @@ impl Scope {
             .ok_or(ScopeError::Closed)?
             .tasks
             .clone();
-        let outcome = tasks.shutdown_retained(None).await;
+        let outcome = match deadline {
+            None => tasks.shutdown_retained(None).await,
+            Some(deadline) => {
+                if let Ok(outcome) =
+                    tokio::time::timeout_at(deadline, tasks.shutdown_retained(None)).await
+                {
+                    outcome
+                } else {
+                    return Err(self.expire().await);
+                }
+            }
+        };
         {
             let mut nodes = self.tree.lock()?;
             let node = nodes.get_mut(&self.key).ok_or(ScopeError::Closed)?;
@@ -282,16 +554,24 @@ impl Scope {
                         .map_or(Ok(()), |failure| Err(ScopeError::Cleanup(failure)));
                 }
             }
-            changed.changed().await.map_err(|_| ScopeError::Closed)?;
+            match deadline {
+                None => changed.changed().await.map_err(|_| ScopeError::Closed)?,
+                Some(deadline) => {
+                    match tokio::time::timeout_at(deadline, changed.changed()).await {
+                        Ok(changed) => changed.map_err(|_| ScopeError::Closed)?,
+                        Err(_) => return Err(self.expire().await),
+                    }
+                }
+            }
         }
     }
 
-    fn spawn<F, Fut>(&self, name: &str, work: F) -> Result<(), ScopeError>
+    fn spawn<F, Fut>(&self, name: &str, work: F, site: HolderSite) -> Result<(), ScopeError>
     where
         F: FnOnce(TaskCancellation) -> Fut + Send + 'static,
         Fut: Future<Output = Result<(), String>> + Send + 'static,
     {
-        let admission = self.admit()?;
+        let admission = self.admit(Some(Arc::from(name)), site)?;
         let tasks = {
             let mut nodes = self.tree.lock()?;
             let node = nodes.get_mut(&self.key).ok_or(ScopeError::Closed)?;
@@ -310,6 +590,7 @@ impl Scope {
     fn register<T: Any + Send + Sync>(
         &self,
         resource: Arc<T>,
+        site: HolderSite,
     ) -> Result<PluginResourceId, ScopeError> {
         let mut nodes = self.tree.lock()?;
         let keys = ancestry(&nodes, self.key)?;
@@ -323,7 +604,14 @@ impl Scope {
             return Err(ScopeError::Capacity);
         }
         let id = PluginResourceId::fresh();
-        node.resources.insert(id, resource);
+        node.resources.insert(
+            id,
+            ResourceEntry {
+                value: resource,
+                site,
+                type_name: std::any::type_name::<T>(),
+            },
+        );
         Ok(id)
     }
 
@@ -332,16 +620,16 @@ impl Scope {
         resource: PluginResourceId,
     ) -> Result<Arc<dyn Any + Send + Sync>, ScopeError> {
         let mut nodes = self.tree.lock()?;
-        if nodes.values().any(|child| child.parent == Some(self.key)) {
-            return Err(ScopeError::Outstanding);
+        if nodes.values().any(|child| child.parent == Some(self.key))
+            || nodes.get(&self.key).ok_or(ScopeError::Closed)?.admitted != 0
+        {
+            return Err(self.tree.outstanding(&nodes, self.key));
         }
         let node = nodes.get_mut(&self.key).ok_or(ScopeError::Closed)?;
-        if node.admitted != 0 {
-            return Err(ScopeError::Outstanding);
-        }
         // Return ownership, so a plugin-owned destructor never runs under lock.
         node.resources
             .remove(&resource)
+            .map(|entry| entry.value)
             .ok_or(ScopeError::UnknownResource)
     }
 
@@ -359,7 +647,7 @@ impl Scope {
             || !node.resources.is_empty()
             || nodes.values().any(|child| child.parent == Some(self.key))
         {
-            return Err(ScopeError::Outstanding);
+            return Err(self.tree.outstanding(&nodes, self.key));
         }
         match self.key {
             Key::Instance => {
@@ -395,15 +683,16 @@ impl Scope {
     fn resolve_cleanup(&self) -> Result<(), ScopeError> {
         let mut nodes = self.tree.lock()?;
         if nodes.values().any(|child| child.parent == Some(self.key)) {
-            return Err(ScopeError::Outstanding);
+            return Err(self.tree.outstanding(&nodes, self.key));
         }
-        let node = nodes.get_mut(&self.key).ok_or(ScopeError::Closed)?;
+        let node = nodes.get(&self.key).ok_or(ScopeError::Closed)?;
         if node.phase != LifecycleState::CleanupRequired {
             return Err(ScopeError::InvalidTransition);
         }
         if node.admitted != 0 || !node.tasks_drained || !node.resources.is_empty() {
-            return Err(ScopeError::Outstanding);
+            return Err(self.tree.outstanding(&nodes, self.key));
         }
+        let node = nodes.get_mut(&self.key).ok_or(ScopeError::Closed)?;
         // Explicit host acknowledgement, never an automatic retry/reset. The
         // zero-admission predicate proves no task factory/admission destructor
         // can need the tree lock, so this empty-task acknowledgement is safe to
@@ -431,6 +720,7 @@ impl Scope {
 #[derive(Debug)]
 pub struct AdmissionGuard {
     scope: Scope,
+    holder: u64,
 }
 
 impl Drop for AdmissionGuard {
@@ -451,6 +741,10 @@ impl Drop for AdmissionGuard {
             }
             if let Some(node) = nodes.get_mut(&self.scope.key) {
                 node.direct -= 1;
+                // Capacity is retained, so steady-state admission allocates nothing.
+                if let Some(index) = node.holders.iter().position(|(id, _)| *id == self.holder) {
+                    node.holders.swap_remove(index);
+                }
             }
         }
         self.scope.tree.changed.send_replace(());
@@ -471,6 +765,7 @@ impl InstanceScope {
     /// Create a retained host instance. The host must eventually close, drain,
     /// release resources, and finish it; dropping observers alone never unloads.
     #[must_use]
+    #[track_caller]
     pub fn new(runtime: PluginRuntimeScopeId) -> Self {
         let mut nodes = BTreeMap::new();
         nodes.insert(
@@ -479,6 +774,7 @@ impl InstanceScope {
                 None,
                 LifecycleState::Created,
                 PluginConcurrencyConfig::Concurrent,
+                Location::caller(),
             ),
         );
         let tree = Arc::new(Tree {
@@ -487,10 +783,18 @@ impl InstanceScope {
             nodes: Mutex::new(nodes),
             changed: watch::channel(()).0,
             retained: Mutex::new(None),
+            next_holder: AtomicU64::new(0),
         });
         // Fresh mutex cannot be poisoned. Explicit lifecycle finish breaks this
         // cycle only after every owned child, task and resource was released.
         *tree.retained.lock().expect("fresh instance retention") = Some(tree.clone());
+        {
+            let mut live = live_trees()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            live.retain(|tree| tree.strong_count() > 0);
+            live.push(Arc::downgrade(&tree));
+        }
         Self(Scope {
             tree,
             key: Key::Instance,
@@ -504,6 +808,7 @@ impl InstanceScope {
 
     /// The concurrency policy bounds simultaneously retained invocations, not
     /// nested callbacks. Nested callback admission is deliberately reentrant.
+    #[track_caller]
     pub fn begin_activation(
         &self,
         policy: PluginConcurrencyConfig,
@@ -520,7 +825,12 @@ impl InstanceScope {
         let key = Key::Activation(PluginActivationId::fresh());
         nodes.insert(
             key,
-            Node::new(Some(Key::Instance), LifecycleState::Activating, policy),
+            Node::new(
+                Some(Key::Instance),
+                LifecycleState::Activating,
+                policy,
+                Location::caller(),
+            ),
         );
         Ok(ActivationScope(Scope {
             tree: self.0.tree.clone(),
@@ -554,7 +864,7 @@ impl ActivationScope {
             .values()
             .any(|node| node.parent == Some(self.0.key) && node.lifecycle_authority.is_some())
         {
-            return Err(ScopeError::Outstanding);
+            return Err(self.0.tree.outstanding(&nodes, self.0.key));
         }
         nodes
             .get_mut(&Key::Instance)
@@ -570,6 +880,7 @@ impl ActivationScope {
     /// Cleanup requires zero admitted activation work but does not clear retained
     /// failures. Its fresh cancellation channel is not the already-cancelled
     /// activation channel: later explicit close still cancels the entire subtree.
+    #[track_caller]
     pub fn begin_lifecycle_invocation(
         &self,
         kind: LifecycleInvocationKind,
@@ -599,7 +910,7 @@ impl ActivationScope {
             return Err(ScopeError::InvalidTransition);
         }
         if kind == LifecycleInvocationKind::Cleanup && activation.admitted != 0 {
-            return Err(ScopeError::Outstanding);
+            return Err(self.0.tree.outstanding(&nodes, self.0.key));
         }
         if nodes
             .values()
@@ -615,6 +926,7 @@ impl ActivationScope {
             Some(self.0.key),
             LifecycleState::Active,
             PluginConcurrencyConfig::Concurrent,
+            Location::caller(),
         );
         node.lifecycle_authority = Some(kind);
         nodes.insert(key, node);
@@ -624,6 +936,7 @@ impl ActivationScope {
         }))
     }
 
+    #[track_caller]
     pub fn begin_invocation(&self) -> Result<InvocationScope, ScopeError> {
         let mut nodes = self.0.tree.lock()?;
         for key in ancestry(&nodes, self.0.key)? {
@@ -648,6 +961,7 @@ impl ActivationScope {
                 Some(self.0.key),
                 LifecycleState::Active,
                 PluginConcurrencyConfig::Concurrent,
+                Location::caller(),
             ),
         );
         Ok(InvocationScope(Scope {
@@ -661,6 +975,7 @@ impl InvocationScope {
     /// A nested operation owns a distinct identity without reacquiring the
     /// activation's exclusive top-level invocation slot. Closing either ancestor
     /// fences this child. Parent finish requires explicit child retirement.
+    #[track_caller]
     pub fn begin_child(&self) -> Result<Self, ScopeError> {
         let mut nodes = self.0.tree.lock()?;
         let ancestors = ancestry(&nodes, self.0.key)?;
@@ -677,6 +992,7 @@ impl InvocationScope {
                 Some(self.0.key),
                 LifecycleState::Active,
                 PluginConcurrencyConfig::Concurrent,
+                Location::caller(),
             ),
         );
         Ok(Self(Scope {
@@ -709,11 +1025,12 @@ impl InvocationScope {
 
     /// Create an owned callback capability, never a raw state pointer. The
     /// capability retains its state even if its originating caller disappears.
+    #[track_caller]
     pub fn callback<T: Any + Send + Sync>(
         &self,
         state: Arc<T>,
     ) -> Result<CallbackCapability<T>, ScopeError> {
-        let resource = self.0.register(state)?;
+        let resource = self.0.register(state, Location::caller())?;
         Ok(CallbackCapability {
             scope: self.clone(),
             resource,
@@ -736,6 +1053,7 @@ impl<T: Any + Send + Sync> CallbackCapability<T> {
         self.resource
     }
 
+    #[track_caller]
     pub fn try_admit(&self) -> Result<CallbackAdmission<T>, ScopeError> {
         let guard = self.scope.try_admit()?;
         let nodes = self.scope.0.tree.lock()?;
@@ -743,6 +1061,7 @@ impl<T: Any + Send + Sync> CallbackCapability<T> {
             .get(&self.scope.0.key)
             .and_then(|node| node.resources.get(&self.resource))
             .ok_or(ScopeError::UnknownResource)?
+            .value
             .clone()
             .downcast::<T>()
             .map_err(|_| ScopeError::UnknownResource)?;
@@ -783,16 +1102,48 @@ macro_rules! scope_api {
             pub fn state(&self) -> Result<LifecycleState, ScopeError> {
                 self.0.phase()
             }
+            /// Admit one operation, attributed to the caller's source location.
+            #[track_caller]
             pub fn try_admit(&self) -> Result<AdmissionGuard, ScopeError> {
-                self.0.admit()
+                self.0.admit(None, Location::caller())
+            }
+            /// Admit one operation with a diagnostic label (e.g. an operation
+            /// name) in addition to the caller's source location.
+            #[track_caller]
+            pub fn try_admit_labeled(
+                &self,
+                label: impl Into<Arc<str>>,
+            ) -> Result<AdmissionGuard, ScopeError> {
+                self.0.admit(Some(label.into()), Location::caller())
+            }
+            /// Attach a diagnostic label (e.g. plugin id or operation) to this
+            /// scope; it is reported with every holder the scope owns.
+            pub fn set_label(&self, label: impl Into<Arc<str>>) -> Result<(), ScopeError> {
+                self.0.set_label(label.into())
+            }
+            /// Every outstanding admission, child scope, resource and task of
+            /// this subtree, attributed by creating site and label.
+            pub fn outstanding(&self) -> Result<OutstandingHolders, ScopeError> {
+                self.0.outstanding()
             }
             /// Close this subtree and cancel its producers. Does not drain or unload.
             pub fn close(&self) -> Result<(), ScopeError> {
                 self.0.close()
             }
             /// Cancellation-safe observation; dropping this future retains owners.
+            /// Waits without bound; host teardown must use [`Self::drain_until`].
             pub async fn drain(&self) -> Result<(), ScopeError> {
-                self.0.drain().await
+                self.0.drain(None).await
+            }
+            /// Close and drain until `deadline`. On expiry, remaining tasks are
+            /// aborted best-effort, the scope is marked failed cleanup, and
+            /// [`ScopeError::DeadlineExceeded`] names the outstanding holders.
+            /// Owners are abandoned (retained), never released or unloaded.
+            pub async fn drain_until(
+                &self,
+                deadline: tokio::time::Instant,
+            ) -> Result<(), ScopeError> {
+                self.0.drain(Some(deadline)).await
             }
             /// Finish only after all children, tasks, admissions and resources settle.
             pub fn finish(&self) -> Result<(), ScopeError> {
@@ -807,11 +1158,12 @@ macro_rules! scope_api {
                 self.0.resolve_cleanup()
             }
             /// Register an owner before publication. The tree retains it until explicit release.
+            #[track_caller]
             pub fn register_resource<T: Any + Send + Sync>(
                 &self,
                 value: Arc<T>,
             ) -> Result<PluginResourceId, ScopeError> {
-                self.0.register(value)
+                self.0.register(value, Location::caller())
             }
             /// Confirm external cleanup before release. Rejected while work is admitted.
             /// Drop the returned owner outside all loader/runtime locks.
@@ -821,12 +1173,13 @@ macro_rules! scope_api {
             ) -> Result<Arc<dyn Any + Send + Sync>, ScopeError> {
                 self.0.release(id)
             }
+            #[track_caller]
             pub fn spawn<F, Fut>(&self, name: &str, work: F) -> Result<(), ScopeError>
             where
                 F: FnOnce(TaskCancellation) -> Fut + Send + 'static,
                 Fut: Future<Output = Result<(), String>> + Send + 'static,
             {
-                self.0.spawn(name, work)
+                self.0.spawn(name, work, Location::caller())
             }
             /// Live nonblocking cancellation observation for synchronous adapters.
             pub fn is_cancelled(&self) -> Result<bool, ScopeError> {
@@ -861,6 +1214,8 @@ scope_api!(InstanceScope);
 scope_api!(ActivationScope);
 scope_api!(InvocationScope);
 
+#[cfg(test)]
+mod holder_tests;
 #[cfg(test)]
 mod lifecycle_tests;
 #[cfg(test)]

@@ -96,6 +96,61 @@ impl BackgroundTasks {
         Ok(())
     }
 
+    /// Abort every retained task at a teardown deadline. Handles stay retained
+    /// until drained, and an aborted task is recorded as a failure, so aborting
+    /// can never turn incomplete cleanup into success. Code is never unloaded.
+    pub fn abort(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.closing = true;
+        self.cancel.send_replace(true);
+        for (_, task) in &state.tasks {
+            task.abort();
+        }
+    }
+
+    /// Names of task handles that have not been reaped by a drain yet.
+    #[must_use]
+    pub fn pending_names(&self) -> Vec<String> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .tasks
+            .iter()
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+
+    /// Drain until `deadline`. On expiry the remaining tasks are aborted and
+    /// the error names them; their handles remain retained.
+    ///
+    /// # Errors
+    /// Reports deadline expiry (with pending task names), task failures, or
+    /// poisoned state.
+    pub async fn shutdown_until(
+        &self,
+        deadline: tokio::time::Instant,
+        progress: Option<crate::shutdown_progress::ShutdownProgress>,
+    ) -> Result<(), String> {
+        if let Ok(outcome) =
+            tokio::time::timeout_at(deadline, self.shutdown_retained(progress)).await
+        {
+            return outcome;
+        }
+        let pending = self.pending_names();
+        self.abort();
+        tracing::warn!(
+            ?pending,
+            "background tasks missed the teardown deadline; aborted and abandoned"
+        );
+        Err(format!(
+            "background tasks did not drain before the teardown deadline; aborted: {}",
+            pending.join(", ")
+        ))
+    }
+
     /// Explicitly acknowledge repaired task failures after all handles settled.
     /// This never cancels, detaches, or discards unfinished work.
     pub(crate) fn acknowledge_failures(&self) -> Result<(), String> {

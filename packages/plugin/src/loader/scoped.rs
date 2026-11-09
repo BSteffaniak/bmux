@@ -5240,7 +5240,7 @@ mod tests {
             assert!(self.scope.try_admit().is_err());
             assert!(matches!(
                 self.scope.finish(),
-                Err(bmux_plugin_runtime::ScopeError::Outstanding)
+                Err(bmux_plugin_runtime::ScopeError::Outstanding(_))
             ));
             self.observed.store(true, Ordering::Release);
             assert!(
