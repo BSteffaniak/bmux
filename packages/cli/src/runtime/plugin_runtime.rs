@@ -161,13 +161,12 @@ macro_rules! declare_bundled_plugins {
         #[allow(unused_variables, clippy::missing_const_for_fn)]
         fn install_static_bundled_client_adapters(
             enabled: &[String],
-            settings: &std::collections::BTreeMap<String, toml::Value>,
             paths: &ConfigPaths,
         ) {
             $(
                 #[cfg(feature = $feature)]
                 if enabled.iter().any(|plugin_id| plugin_id == $plugin_id) {
-                    install_bundled_client_adapter($plugin_id, settings.get($plugin_id), paths);
+                    install_bundled_client_adapter($plugin_id, paths);
                 }
             )*
         }
@@ -231,11 +230,7 @@ fn register_bundled_definition(
     feature = "bundled-plugin-pane-runtime"
 ))]
 #[allow(unused_variables, clippy::missing_const_for_fn)]
-fn install_bundled_client_adapter(
-    plugin_id: &str,
-    settings: Option<&toml::Value>,
-    paths: &ConfigPaths,
-) {
+fn install_bundled_client_adapter(plugin_id: &str, paths: &ConfigPaths) {
     #[cfg(feature = "bundled-plugin-connections")]
     if plugin_id == "bmux.connections" {
         bmux_connections_plugin::install_client_adapter(paths);
@@ -262,12 +257,13 @@ fn install_bundled_client_adapter(
     }
     #[cfg(feature = "bundled-plugin-tab-bar")]
     if plugin_id == "bmux.tab_bar" {
-        let settings = settings.cloned();
+        // Settings come from the invoking attach runtime's config, not the
+        // config this process registered companions with.
         bmux_plugin::register_attach_companion(bmux_plugin::AttachCompanion::from_factory(
             plugin_id,
-            std::sync::Arc::new(move |resources| {
+            std::sync::Arc::new(|resources| {
                 Ok(Box::new(bmux_tab_bar_plugin::TabBarPresentation::install(
-                    settings.as_ref(),
+                    resources.settings_for("bmux.tab_bar"),
                     resources,
                 )?))
             }),
@@ -275,12 +271,11 @@ fn install_bundled_client_adapter(
     }
     #[cfg(feature = "bundled-plugin-sidebar")]
     if plugin_id == "bmux.sidebar" {
-        let settings = settings.cloned();
         bmux_plugin::register_attach_companion(bmux_plugin::AttachCompanion::from_factory(
             plugin_id,
-            std::sync::Arc::new(move |resources| {
+            std::sync::Arc::new(|resources| {
                 let presentation = bmux_sidebar_plugin::SidebarPresentation::install(
-                    settings.as_ref(),
+                    resources.settings_for("bmux.sidebar"),
                     resources.layouts.clone(),
                     resources.allocations.clone(),
                     resources.input.clone(),
@@ -1124,7 +1119,7 @@ pub(super) fn install_enabled_client_adapters(
         .into_iter()
         .filter(|id| registry.get(id).is_some_and(|plugin| plugin.bundled_static))
         .collect::<Vec<_>>();
-    install_static_bundled_client_adapters(&bundled_enabled, &config.plugins.settings, paths);
+    install_static_bundled_client_adapters(&bundled_enabled, paths);
 }
 
 pub(super) fn validate_enabled_plugins(

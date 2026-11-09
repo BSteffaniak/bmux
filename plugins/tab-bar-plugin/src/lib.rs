@@ -2562,6 +2562,7 @@ mod tests {
             surfaces: std::sync::Arc::new(bmux_plugin::surface::PluginSurfaceRegistry::new(64)),
             input: std::sync::Arc::new(bmux_plugin::AttachPresentationInputRegistry::new()),
             events,
+            plugin_settings: std::sync::Arc::default(),
         }
     }
 

@@ -5218,6 +5218,7 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
         surfaces: view_state.presentation_surfaces.clone(),
         input: view_state.presentation_input.clone(),
         events: view_state.presentation_events.clone(),
+        plugin_settings: std::sync::Arc::new(attach_config.plugins.settings.clone()),
     };
     let mut started_companions = Vec::new();
     for companion in bmux_plugin::registered_attach_companions() {
@@ -17979,6 +17980,7 @@ mod tests {
             allocations: std::sync::Arc::new(bmux_plugin::layout::AllocationRegistry::default()),
             surfaces: std::sync::Arc::new(bmux_plugin::surface::PluginSurfaceRegistry::new(64)),
             input: std::sync::Arc::new(bmux_plugin::AttachPresentationInputRegistry::new()),
+            plugin_settings: std::sync::Arc::default(),
         };
         let installation =
             bmux_tab_bar_plugin::TabBarPresentation::install(None, &resources).unwrap();

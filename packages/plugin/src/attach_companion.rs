@@ -4,6 +4,7 @@
 //! installation. The attach runtime starts the current registry snapshot on
 //! entry and stops it on exit without knowing plugin IDs or product domains.
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock, RwLock};
 
 pub type AttachCompanionCallback = Arc<dyn Fn() -> Result<(), String> + Send + Sync>;
@@ -15,6 +16,11 @@ pub struct AttachPresentationResources {
     pub surfaces: Arc<crate::surface::PluginSurfaceRegistry>,
     pub input: Arc<crate::AttachPresentationInputRegistry>,
     pub events: Arc<crate::EventBus>,
+    /// Per-plugin settings from the invoking runtime's effective config,
+    /// keyed by plugin id. Companions read their settings here at start so
+    /// a runtime with its own config (for example a sandbox) is honored
+    /// instead of whatever config the process registered companions with.
+    pub plugin_settings: Arc<BTreeMap<String, toml::Value>>,
 }
 
 impl AttachPresentationResources {
@@ -32,7 +38,14 @@ impl AttachPresentationResources {
             )),
             input: Arc::new(crate::AttachPresentationInputRegistry::new()),
             events: Arc::new(crate::EventBus::new()),
+            plugin_settings: Arc::new(BTreeMap::new()),
         }
+    }
+
+    /// Settings the invoking runtime's config supplies for `plugin_id`.
+    #[must_use]
+    pub fn settings_for(&self, plugin_id: &str) -> Option<&toml::Value> {
+        self.plugin_settings.get(plugin_id)
     }
 }
 

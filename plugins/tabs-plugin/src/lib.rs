@@ -6926,6 +6926,7 @@ mod tests {
                 allocations: Arc::new(bmux_plugin::layout::AllocationRegistry::default()),
                 surfaces: Arc::new(bmux_plugin::surface::PluginSurfaceRegistry::new(64)),
                 input: Arc::new(bmux_plugin::AttachPresentationInputRegistry::new()),
+                plugin_settings: Arc::default(),
             };
             let settings: toml::Value = toml::from_str("preset = 'classic'\ntab_template = '{name}'").unwrap();
             let _installation =
