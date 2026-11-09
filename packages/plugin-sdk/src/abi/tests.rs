@@ -333,6 +333,7 @@ fn negotiated_native_async_activation_polls_timer_on_owned_runtime_and_retires()
         scope: scope(),
         activation: ActivationId::from_uuid(uuid::Uuid::new_v4()),
         native,
+        capabilities: crate::definition::ActivationCapabilities::default(),
     };
     let table = async_activation_table();
     let bytes = serde_json::to_vec(&NativeOperation::Activate(context.clone())).unwrap();

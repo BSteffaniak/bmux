@@ -79,7 +79,7 @@ pub use host_runtime::{
     HostRuntimeApi, InvocationKernelDispatch, InvocationKernelPort, ServiceCaller,
 };
 pub use loader::scoped::{
-    CallbackBinding, CallbackEntryLease, CallbackReentry, DefinitionArtifact,
+    ActivationBinder, CallbackBinding, CallbackEntryLease, CallbackReentry, DefinitionArtifact,
     LifecycleCallbackDispatch, LifecycleCallbackFactory, LoadedExecution, LoaderCallbackHost,
     OperationSignal, VerifiedArtifact, WeakCallbackEntryLease,
 };

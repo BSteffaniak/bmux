@@ -212,6 +212,7 @@ mod tests {
     fn lifecycle(scope: PluginCreateContext, activation: ActivationId) -> PluginLifecycleContext {
         PluginLifecycleContext {
             callback_execution: None,
+            capabilities: bmux_plugin_sdk::definition::ActivationCapabilities::default(),
             scope,
             activation,
             native: NativeLifecycleContext {

@@ -90,6 +90,7 @@ fn lifecycle(scope: PluginCreateContext) -> PluginLifecycleContext {
         scope,
         activation: ActivationId::from_uuid(uuid::Uuid::from_u128(1)),
         native,
+        capabilities: bmux_plugin_sdk::definition::ActivationCapabilities::default(),
     }
 }
 fn submit(adapter: &NativeAdapter, handle: u64, operation: u64, request: &NativeOperation) -> i32 {

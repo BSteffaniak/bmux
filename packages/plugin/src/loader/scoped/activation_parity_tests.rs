@@ -49,7 +49,7 @@ fn definition(captured: Captured) -> PluginDefinition {
 
 /// Dynamic adapter for the in-process descriptor. One adapter per test binary
 /// mirrors `export_plugin_entrypoint!`, which owns one adapter per library.
-mod native {
+pub(super) mod native {
     use super::{Captured, Mutex, abi};
     use std::sync::{Arc, OnceLock};
 
@@ -112,7 +112,7 @@ mod native {
             declarations,
         }
     }
-    pub(super) static DESCRIPTOR: abi::NativePluginDescriptorV3 =
+    pub(in super::super) static DESCRIPTOR: abi::NativePluginDescriptorV3 =
         descriptor(abi::SCOPED_CAPABILITIES);
     /// An older guest that never negotiated the retained activation port.
     pub(super) static WITHOUT_ACTIVATION_PORT: abi::NativePluginDescriptorV3 =

@@ -4,10 +4,12 @@
 //! scope. The host owns admission, activation identity, draining and destruction;
 //! dropping an observer is not permission to destroy a running implementation.
 
+mod activation_capabilities;
 mod callback_gate;
 mod legacy;
 #[cfg(test)]
 mod retained_opener_tests;
+pub use activation_capabilities::ActivationCapabilities;
 pub use legacy::RustPluginAdapter;
 
 use crate::{
@@ -452,6 +454,11 @@ pub struct PluginLifecycleContext {
     pub scope: PluginCreateContext,
     pub activation: ActivationId,
     pub native: NativeLifecycleContext,
+    /// Host-supplied in-process values for this exact activation, filled by a
+    /// host-registered activation binder from the loader's actual scope.
+    /// Never serialized: dynamic artifacts cannot receive them.
+    #[serde(skip)]
+    pub capabilities: ActivationCapabilities,
 }
 
 /// A command's exit code, error text and generic metadata, returned as data.

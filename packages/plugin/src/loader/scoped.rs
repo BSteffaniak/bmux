@@ -6,6 +6,9 @@
 //! by the observer's real waker; only legacy native guests without that bit are
 //! repolled periodically, as their ABI requires.
 #[cfg(all(test, unix))]
+#[path = "scoped/activation_binder_tests.rs"]
+mod activation_binder_tests;
+#[cfg(all(test, unix))]
 #[path = "scoped/activation_parity_tests.rs"]
 mod activation_parity_tests;
 #[path = "scoped/activation_ports.rs"]
@@ -29,6 +32,17 @@ pub use wake::OperationSignal;
 
 /// Trusted host factory invoked with this execution's actual activation.
 pub type RetainedHostFactory = dyn Fn(&ActivationScope) -> Result<Arc<dyn bmux_plugin_sdk::abi::retained::RetainedHostDispatch>>
+    + Send
+    + Sync;
+
+/// Trusted host binder invoked with this execution's actual activation scope.
+///
+/// It runs before the component's `activate` hook. It may mint activation-owned
+/// in-process values from that scope (and retain their host-side halves) and
+/// offers them to the component through `PluginLifecycleContext::capabilities`.
+/// The loader holds no capability itself: it only hands the binder the real
+/// scope, so everything the binder mints is revoked when that scope closes.
+pub type ActivationBinder = dyn Fn(&ActivationScope, &bmux_plugin_sdk::definition::ActivationCapabilities) -> Result<()>
     + Send
     + Sync;
 
@@ -587,6 +601,7 @@ impl DefinitionArtifact {
         };
         let verified_artifact = self.verified_for_context(&context);
         let execution = Arc::new(LoadedExecution {
+            activation_binders: Mutex::new(Vec::new()),
             lifecycle_callback_factory: Mutex::new(None),
             callback_runtime: std::sync::OnceLock::new(),
             callback_runtime_owner: Mutex::new(None),
@@ -654,6 +669,7 @@ enum ExecutionBackend {
 }
 /// Host-owned scoped execution. IDs are local lookup keys, never wire credentials.
 pub struct LoadedExecution {
+    activation_binders: Mutex<Vec<Arc<ActivationBinder>>>,
     lifecycle_callback_factory: Mutex<Option<Arc<callbacks::LifecycleCallbackFactory>>>,
     callback_runtime: std::sync::OnceLock<tokio::runtime::Handle>,
     /// Code-pin view snapshotted by callback bindings. It wraps
@@ -870,6 +886,54 @@ impl LoadedExecution {
             .clone()
             .ok_or_else(|| failure("execution no longer retained"))?;
         retained::open(execution, dispatch)
+    }
+
+    /// Register a trusted host activation binder before activation begins.
+    ///
+    /// Activation capabilities are live in-process values; they cannot cross
+    /// the native ABI. A dynamic artifact is therefore refused here, explicitly,
+    /// rather than activated without the capability its host meant to supply.
+    ///
+    /// # Errors
+    /// Rejects dynamic artifacts and binding after activation has begun.
+    pub fn bind_activation_binder(&self, binder: Arc<ActivationBinder>) -> Result<()> {
+        let _control = self.control()?;
+        if matches!(self.backend, ExecutionBackend::Dynamic { .. }) {
+            return Err(failure(
+                "host activation capabilities are in-process values and cannot cross the native ABI; \
+                 a dynamic artifact cannot be bound to this host's activation binder",
+            ));
+        }
+        if self
+            .state
+            .lock()
+            .map_err(|_| failure("execution state poisoned"))?
+            .activation
+            .is_some()
+        {
+            return Err(failure("activation binder must bind before activation"));
+        }
+        self.activation_binders
+            .lock()
+            .map_err(|_| failure("activation binders poisoned"))?
+            .push(binder);
+        Ok(())
+    }
+
+    fn bind_activation_capabilities(
+        &self,
+        activation: &ActivationScope,
+    ) -> Result<bmux_plugin_sdk::definition::ActivationCapabilities> {
+        let binders = self
+            .activation_binders
+            .lock()
+            .map_err(|_| failure("activation binders poisoned"))?
+            .clone();
+        let capabilities = bmux_plugin_sdk::definition::ActivationCapabilities::default();
+        for binder in binders {
+            binder(activation, &capabilities)?;
+        }
+        Ok(capabilities)
     }
 
     fn bind_retained_activation(&self, activation: &ActivationScope) -> Result<()> {
@@ -1399,6 +1463,7 @@ impl LoadedExecution {
             scope: self.context.clone(),
             activation: ActivationId::from_uuid(activation.id().as_uuid()),
             native,
+            capabilities: bmux_plugin_sdk::definition::ActivationCapabilities::default(),
         };
         let registration = self
             .host_state
@@ -1421,6 +1486,7 @@ impl LoadedExecution {
             state.registration = registration;
         }
         self.bind_retained_activation(&activation)?;
+        context.capabilities = self.bind_activation_capabilities(&activation)?;
         let invocation = activation
             .begin_lifecycle_invocation(LifecycleInvocationKind::Activation)
             .map_err(scope_error)?;
@@ -1580,6 +1646,7 @@ impl LoadedExecution {
                 scope: self.context.clone(),
                 activation: ActivationId::from_uuid(activation.id().as_uuid()),
                 native,
+                capabilities: bmux_plugin_sdk::definition::ActivationCapabilities::default(),
             }),
             Some(invocation),
             Some(false),
@@ -3785,6 +3852,7 @@ mod tests {
             scope: execution.context.clone(),
             activation: ActivationId::from_uuid(activation.id().as_uuid()),
             native: auxiliary_lifecycle_fixture(),
+            capabilities: bmux_plugin_sdk::definition::ActivationCapabilities::default(),
         };
         let outcome = static_operation_with_tasks(
             implementation,
