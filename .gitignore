@@ -40,3 +40,5 @@ infra/live-github/crash*.log
 infra/wrangler/.wrangler/
 
 __pycache__/
+
+.claude/
