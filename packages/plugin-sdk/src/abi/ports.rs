@@ -181,8 +181,9 @@ impl Drop for Admission {
         if let Ok(mut gate) = self.0.gate.lock() {
             gate.admitted -= 1;
         }
-        // Release is observed by close_and_drain on the next host poll. No
-        // wakeup protocol exists: the descriptor explicitly remains poll driven.
+        // A terminal drain may now succeed: wake host-wake readers that are
+        // waiting on admission release. Legacy hosts observe it on next poll.
+        super::host_wake::notify_progress();
     }
 }
 fn protocol(status: AbiStatus) -> PluginError {

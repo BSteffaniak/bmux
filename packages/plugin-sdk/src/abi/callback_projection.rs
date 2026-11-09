@@ -184,6 +184,8 @@ impl Drop for Entry {
         } else {
             self.owner.uncertain.store(true, Ordering::Release);
         }
+        // The retired lease may unblock a pending terminal drain.
+        super::host_wake::notify_progress();
     }
 }
 impl PluginCallbackAuthoritySource for Arc<Authority> {
@@ -332,6 +334,7 @@ impl Drop for Subscription {
         } else {
             self.owner.uncertain.store(true, Ordering::Release);
         }
+        super::host_wake::notify_progress();
     }
 }
 

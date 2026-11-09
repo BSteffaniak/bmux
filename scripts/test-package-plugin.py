@@ -48,11 +48,14 @@ class DescriptorTests(unittest.TestCase):
                 ("start_scoped", "metadata", "create", "destroy", "start", "read", "cancel", "ack")]
             if version == 3:
                 _fields_ += [("declarations", ctypes.c_void_p)]
+            if version == 3 and capabilities & 2048:
+                _fields_ += [("read_wake", ctypes.c_void_p)]
 
         callback = callback_type(metadata)
         table = Descriptor(ctypes.sizeof(Descriptor) if size is None else size,
                            version, capabilities, 1, ctypes.cast(callback, ctypes.c_void_p),
-                           1, 1, 1, 1, 1, 1, *([1] if version == 3 else []))
+                           1, 1, 1, 1, 1, 1, *([1] if version == 3 else []),
+                           *([1] if version == 3 and capabilities & 2048 else []))
 
         class Entry:
             def __call__(self):
@@ -88,13 +91,21 @@ class DescriptorTests(unittest.TestCase):
                     artifact_acceptance.inspect_artifact("bcode.filesystem", Path(__file__), 2)
 
     def test_supported_v3_profiles_preserve_observed_capabilities(self):
-        for capabilities in (31, 127, 255, 511, 1023, 2047):
+        for capabilities in (31, 127, 255, 511, 1023, 2047, 4095):
             with self.subTest(capabilities=capabilities):
                 library, table, callback = self.descriptor(version=3, capabilities=capabilities)
                 with patch.object(pack.ctypes, "CDLL", return_value=library):
                     observed = pack.artifact_metadata(Path(__file__))
                 self.assertEqual(observed["capabilities"], capabilities)
                 self.assertEqual(observed["version"], 3)
+
+    def test_host_wake_profile_requires_read_wake_tail(self):
+        library, table, callback = self.descriptor(version=3, capabilities=4095)
+        with patch.object(pack.ctypes, "CDLL", return_value=library):
+            self.assertEqual(pack.artifact_metadata(Path(__file__))["capabilities"], 4095)
+            table.read_wake = None
+            with self.assertRaisesRegex(RuntimeError, "read_wake"):
+                pack.artifact_metadata(Path(__file__))
 
     def test_missing_scoped_operation_rejected(self):
         library, table, callback = self.descriptor()
@@ -107,7 +118,9 @@ class DescriptorTests(unittest.TestCase):
         for arguments in ({"version": 1}, {"version": 4}, {"size": 8}, {"capabilities": 7}, {"capabilities": 31},
                           {"version": 3, "capabilities": 15}, {"version": 3, "capabilities": 63},
                           {"version": 3, "capabilities": 1024}, {"version": 3, "capabilities": 3071},
-                          {"version": 3, "capabilities": 4095},
+                          {"version": 3, "capabilities": 2048}, {"version": 3, "capabilities": 6143},
+                          {"version": 3, "capabilities": 8191}, {"version": 2, "capabilities": 2063},
+                          {"version": 3, "capabilities": 4095, "size": 88},
                           {"version": 3, "capabilities": 31, "size": 80}):
             with self.subTest(arguments=arguments):
                 library, table, callback = self.descriptor(**arguments)

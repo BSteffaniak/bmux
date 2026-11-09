@@ -62,6 +62,32 @@ impl PluginInstance for Echo {
                 assert!(matches!(error, crate::PluginError::InvocationCancelled));
                 return Ok(payload);
             }
+            if contract == "delayed" {
+                // Completes on another thread and wakes only the registered waker.
+                let state = Arc::new(Mutex::new((false, None::<Waker>)));
+                let worker = Arc::clone(&state);
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    let waker = {
+                        let mut state = worker.lock().unwrap();
+                        state.0 = true;
+                        state.1.take()
+                    };
+                    if let Some(waker) = waker {
+                        waker.wake();
+                    }
+                });
+                std::future::poll_fn(|cx| {
+                    let mut state = state.lock().unwrap();
+                    if state.0 {
+                        Poll::Ready(())
+                    } else {
+                        state.1 = Some(cx.waker().clone());
+                        Poll::Pending
+                    }
+                })
+                .await;
+            }
             if contract == "oversized" {
                 return Ok(vec![0; MAX_BUFFER_BYTES]);
             }
@@ -647,4 +673,161 @@ fn packaging_descriptor_is_explicit_and_versioned() {
         author_declaration::plugin_definition().metadata.plugin_id,
         "example.declaration"
     );
+}
+
+#[test]
+fn exported_descriptor_negotiates_host_wake_tail() {
+    unsafe extern "C" {
+        fn bmux_plugin_entry_v2() -> *const NativePluginDescriptor;
+    }
+    let descriptor = unsafe { bmux_plugin_entry_v2() };
+    let selected = unsafe { validate_descriptor(descriptor) }.unwrap();
+    assert_eq!(selected.capabilities, DESCRIPTOR_CAPABILITIES);
+    assert_eq!(selected.size, NATIVE_DESCRIPTOR_SIZE_HOST_WAKE_V1);
+    assert!(
+        unsafe { validate_descriptor_host_wake(descriptor) }
+            .unwrap()
+            .is_some()
+    );
+    let v3 = unsafe { validate_descriptor_v3(descriptor) }.unwrap();
+    // A v3 guest without the bit is an explicit legacy (periodically polled) guest.
+    let mut legacy = NativePluginDescriptorV3 {
+        base: NativePluginDescriptor {
+            size: NATIVE_DESCRIPTOR_SIZE,
+            version: ABI_VERSION,
+            capabilities: SCOPED_CAPABILITIES,
+            start_scoped: selected.start_scoped,
+            metadata: selected.metadata,
+            create: selected.create,
+            destroy: selected.destroy,
+            start: selected.start,
+            read: selected.read,
+            cancel: selected.cancel,
+            ack: selected.ack,
+        },
+        declarations: v3.declarations,
+    };
+    assert!(
+        unsafe { validate_descriptor_host_wake(&raw const legacy.base) }
+            .unwrap()
+            .is_none()
+    );
+    // The bit without its complete tail fails closed.
+    legacy.base.capabilities |= CAP_HOST_WAKE_V1;
+    assert_eq!(
+        unsafe { validate_descriptor(&raw const legacy.base) }.err(),
+        Some(UNSUPPORTED)
+    );
+    // Unknown bits beyond host wake remain rejected.
+    legacy.base.capabilities = SCOPED_CAPABILITIES | (CAP_HOST_WAKE_V1 << 1);
+    assert_eq!(
+        unsafe { validate_descriptor(&raw const legacy.base) }.err(),
+        Some(UNSUPPORTED)
+    );
+    // Host wake is a v3 contract only.
+    let v2 = NativePluginDescriptor {
+        size: u32::try_from(std::mem::size_of::<NativePluginDescriptorV3HostWakeV1>()).unwrap(),
+        version: ABI_VERSION_V2,
+        capabilities: SCOPED_CAPABILITIES_V2 | CAP_HOST_WAKE_V1,
+        ..legacy.base
+    };
+    assert_eq!(
+        unsafe { validate_descriptor(&raw const v2) }.err(),
+        Some(UNSUPPORTED)
+    );
+}
+
+struct WakeCount {
+    wakes: Mutex<usize>,
+    changed: std::sync::Condvar,
+}
+impl std::task::Wake for WakeCount {
+    fn wake(self: Arc<Self>) {
+        *self.wakes.lock().unwrap() += 1;
+        self.changed.notify_all();
+    }
+}
+impl WakeCount {
+    fn wait_beyond(&self, seen: usize) -> usize {
+        // Test guard only: a lost wake fails instead of hanging the suite.
+        let (wakes, timeout) = self
+            .changed
+            .wait_timeout_while(
+                self.wakes.lock().unwrap(),
+                std::time::Duration::from_secs(10),
+                |wakes| *wakes <= seen,
+            )
+            .unwrap();
+        assert!(!timeout.timed_out(), "host waker was never woken");
+        *wakes
+    }
+}
+
+#[test]
+fn host_wake_read_completes_from_guest_wake_without_periodic_polls() {
+    let (adapter, effects) = adapter();
+    let id = create(&adapter);
+    active(&adapter, id);
+    let count = Arc::new(WakeCount {
+        wakes: Mutex::new(0),
+        changed: std::sync::Condvar::new(),
+    });
+    let host = HostWaker::new(&Waker::from(Arc::clone(&count)));
+    let status = start(&adapter, id, 1, "delayed", b"woken".to_vec());
+    assert!(status == OK || status == PENDING);
+    let mut buffer = vec![0; 4096];
+    let mut reads = 0;
+    let mut seen = 0;
+    let status = loop {
+        reads += 1;
+        let mut length = 0;
+        let status = unsafe {
+            adapter.read_wake(
+                id,
+                1,
+                buffer.as_mut_ptr(),
+                buffer.len(),
+                &raw mut length,
+                host.as_ptr(),
+            )
+        };
+        if status != PENDING {
+            buffer.truncate(length);
+            break status;
+        }
+        seen = count.wait_beyond(seen);
+    };
+    assert_eq!(status, OK);
+    // One read before the guest wake, one after: no timer-driven re-polls.
+    assert!(reads <= 2, "observed {reads} reads");
+    let outcome: NativeOutcome = serde_json::from_slice(&buffer).unwrap();
+    assert!(matches!(outcome, NativeOutcome::Bytes(bytes) if bytes == b"woken"));
+    assert_eq!(effects.load(Ordering::SeqCst), 1);
+    assert_eq!(adapter.ack(id, 1), OK);
+}
+
+#[test]
+fn host_wake_read_rejects_malformed_waker_without_polling() {
+    let (adapter, effects) = adapter();
+    let id = create(&adapter);
+    active(&adapter, id);
+    assert_eq!(start(&adapter, id, 1, "cancel", vec![]), PENDING);
+    let mut length = 0;
+    let mut buffer = vec![0; 16];
+    assert_eq!(
+        unsafe {
+            adapter.read_wake(
+                id,
+                1,
+                buffer.as_mut_ptr(),
+                buffer.len(),
+                &raw mut length,
+                std::ptr::null(),
+            )
+        },
+        INVALID_ARGUMENT
+    );
+    assert_eq!(adapter.cancel(id, 1), OK);
+    assert_eq!(read(&adapter, id, 1).0, OK);
+    assert_eq!(effects.load(Ordering::SeqCst), 1);
 }

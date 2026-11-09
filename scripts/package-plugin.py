@@ -23,8 +23,10 @@ ABI_VERSION = 3
 CAPABILITIES_BY_ABI = {2: 15, 3: 31}
 # Explicit supported packaging profiles, not the SDK's broader subset validator.
 # 2047 adds callback authority, which the SDK descriptor advertises and the
-# host requires for selected lifecycle activation.
-SUPPORTED_CAPABILITIES_BY_ABI = {2: frozenset({15}), 3: frozenset({31, 127, 255, 511, 1023, 2047})}
+# host requires for selected lifecycle activation. 4095 adds host wake v1
+# (bit 2048), which requires the size-checked `read_wake` descriptor tail.
+SUPPORTED_CAPABILITIES_BY_ABI = {2: frozenset({15}), 3: frozenset({31, 127, 255, 511, 1023, 2047, 4095})}
+CAP_HOST_WAKE_V1 = 2048
 REQUIRED_CAPABILITIES = CAPABILITIES_BY_ABI[ABI_VERSION]
 
 
@@ -223,6 +225,9 @@ def artifact_metadata(library: Path) -> dict:
     class DescriptorV3(ctypes.Structure):
         _fields_ = [("base", Descriptor), ("declarations", ctypes.c_void_p)]
 
+    class DescriptorV3HostWake(ctypes.Structure):
+        _fields_ = [("base", DescriptorV3), ("read_wake", ctypes.c_void_p)]
+
     native = ctypes.CDLL(str(library.resolve(strict=True)))
     entry = native.bmux_plugin_entry_v2
     entry.argtypes = []
@@ -238,6 +243,10 @@ def artifact_metadata(library: Path) -> dict:
     descriptor = ctypes.cast(pointer, ctypes.POINTER(Descriptor)).contents
     if descriptor.capabilities not in SUPPORTED_CAPABILITIES_BY_ABI[header.version]:
         raise RuntimeError("shared descriptor capabilities do not match the negotiated ABI")
+    if descriptor.capabilities & CAP_HOST_WAKE_V1 and (
+            header.size < ctypes.sizeof(DescriptorV3HostWake)
+            or not ctypes.cast(pointer, ctypes.POINTER(DescriptorV3HostWake)).contents.read_wake):
+        raise RuntimeError("host wake capability requires the complete read_wake descriptor tail")
     if header.version == 3 and not ctypes.cast(pointer, ctypes.POINTER(DescriptorV3)).contents.declarations:
         raise RuntimeError("incomplete shared ABI declarations operation")
     if not all(getattr(descriptor, field) for field in

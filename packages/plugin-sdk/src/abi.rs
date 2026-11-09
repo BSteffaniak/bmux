@@ -9,9 +9,12 @@
 //!
 //! Calls may be concurrent and reentrant. No adapter mutex is held while calling
 //! author code or polling a future. `BUSY` means another poll owns that operation.
-//! Pending operations are retained until final read and acknowledgement. Polling
-//! uses a no-op waker: hosts MUST periodically poll; no wake-driven capability is
-//! advertised. Cancellation is cooperative and never implies destruction.
+//! Pending operations are retained until final read and acknowledgement. Guests
+//! advertising `CAP_HOST_WAKE_V1` export `read_wake`, which polls with a
+//! host-provided waker and guarantees a wake once progress is possible (see
+//! `host_wake`). Legacy guests without that bit poll with a no-op waker through
+//! `read`; hosts MUST periodically poll those guests. Cancellation is cooperative
+//! and never implies destruction.
 //! Unwinding panics become `PANICKED`; aborts/native faults cannot be contained.
 //! A panicked instance is retained as cleanup-required and cannot be destroyed
 //! through this ABI. New host ports enter only through a separately retained
@@ -24,6 +27,11 @@ pub use callback_authority::{
     NativeInvocationPortsV3CallbackAuthorityV1,
 };
 mod callback_projection;
+pub mod host_wake;
+pub use host_wake::{
+    CAP_HOST_WAKE_V1, HOST_WAKE_VERSION, HostWaker, NATIVE_DESCRIPTOR_SIZE_HOST_WAKE_V1,
+    NativeHostWakerV1, NativePluginDescriptorV3HostWakeV1, NativeReadWakeV1,
+};
 mod ports;
 pub mod retained;
 pub use ports::{
@@ -66,6 +74,9 @@ pub const NATIVE_DESCRIPTOR_SIZE: u32 = {
     let bytes = size.to_le_bytes();
     u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
 };
+/// Descriptor-level capabilities: every scoped invocation capability plus
+/// operation-level contracts that never appear in an invocation ports table.
+pub const DESCRIPTOR_CAPABILITIES: u64 = SCOPED_CAPABILITIES | CAP_HOST_WAKE_V1;
 pub const ENTRY_SYMBOL: &str = "bmux_plugin_entry_v2";
 pub const MAX_BUFFER_BYTES: usize = 1024 * 1024;
 pub const MAX_INSTANCES: usize = 256;
@@ -161,12 +172,40 @@ pub const unsafe fn validate_descriptor<'library>(
     let supported = if header.version == ABI_VERSION_V2 {
         SCOPED_CAPABILITIES_V2
     } else {
-        SCOPED_CAPABILITIES
+        DESCRIPTOR_CAPABILITIES
     };
     if descriptor.capabilities & !supported != 0 {
         return Err(UNSUPPORTED);
     }
+    // The wake bit is only meaningful with its complete descriptor tail.
+    if descriptor.capabilities & CAP_HOST_WAKE_V1 != 0
+        && (header.size as usize) < std::mem::size_of::<NativePluginDescriptorV3HostWakeV1>()
+    {
+        return Err(UNSUPPORTED);
+    }
     Ok(descriptor)
+}
+
+/// Read the host-wake tail when, and only when, `CAP_HOST_WAKE_V1` is advertised.
+/// `None` is an explicit legacy guest that hosts must poll periodically.
+///
+/// # Safety
+/// Same truthful allocation and retained-library requirements as `validate_descriptor`.
+/// # Errors
+/// Rejects unsupported/malformed descriptors.
+pub const unsafe fn validate_descriptor_host_wake<'library>(
+    pointer: *const NativePluginDescriptor,
+) -> Result<Option<&'library NativePluginDescriptorV3HostWakeV1>, AbiStatus> {
+    let descriptor = match unsafe { validate_descriptor(pointer) } {
+        Ok(descriptor) => descriptor,
+        Err(status) => return Err(status),
+    };
+    if descriptor.capabilities & CAP_HOST_WAKE_V1 == 0 {
+        return Ok(None);
+    }
+    Ok(Some(unsafe {
+        &*pointer.cast::<NativePluginDescriptorV3HostWakeV1>()
+    }))
 }
 
 /// Read the v3 extension only after validating its complete header and size.
@@ -695,9 +734,12 @@ impl NativeAdapter {
         }
     }
 
+    /// Legacy no-op-waker read for hosts or guests without `CAP_HOST_WAKE_V1`.
+    ///
     /// # Safety
     /// Same output requirements as `metadata`. The caller must continue polling
-    /// pending operations, including after cancellation, until a final outcome.
+    /// pending operations, including after cancellation, until a final outcome;
+    /// no wake is promised, so that polling must be periodic.
     pub unsafe fn read(
         &self,
         id: u64,
@@ -706,22 +748,75 @@ impl NativeAdapter {
         capacity: usize,
         length: *mut usize,
     ) -> AbiStatus {
+        let (status, _) =
+            unsafe { self.read_polled(id, operation_id, output, capacity, length, Waker::noop()) };
+        // Wake-capable readers of the same slot may be waiting on this poll.
+        host_wake::notify_progress();
+        status
+    }
+
+    /// `CAP_HOST_WAKE_V1` read: polls with the host's waker and guarantees a
+    /// later wake through it after `PENDING`/`BUSY` once progress is possible.
+    ///
+    /// # Safety
+    /// Same output requirements as `read`; `waker` must satisfy the
+    /// `NativeHostWakerV1` contract for the duration of this call.
+    pub unsafe fn read_wake(
+        &self,
+        id: u64,
+        operation_id: u64,
+        output: *mut u8,
+        capacity: usize,
+        length: *mut usize,
+        waker: *const NativeHostWakerV1,
+    ) -> AbiStatus {
+        let waker = match unsafe { host_wake::guest_waker(waker) } {
+            Ok(waker) => waker,
+            Err(status) => return status,
+        };
+        // Register before inspecting state so a concurrent release cannot be
+        // missed between a BUSY/drain observation and this registration.
+        let registration = host_wake::ProgressRegistration::new(&waker);
+        let (status, awaits_progress) =
+            unsafe { self.read_polled(id, operation_id, output, capacity, length, &waker) };
+        if !awaits_progress {
+            registration.withdraw();
+        }
+        // This poll may have released the operation or drained callbacks that
+        // other readers observed as BUSY. Never wake our own registration.
+        host_wake::notify_progress_except(registration.token());
+        status
+    }
+
+    /// Returns the status and whether a PENDING/BUSY result awaits guest-side
+    /// progress (callback drain or concurrent poll) rather than the author
+    /// future, whose own waker registration covers the latter.
+    #[allow(clippy::too_many_lines)] // One linear state machine over the operation slot.
+    unsafe fn read_polled(
+        &self,
+        id: u64,
+        operation_id: u64,
+        output: *mut u8,
+        capacity: usize,
+        length: *mut usize,
+        waker: &Waker,
+    ) -> (AbiStatus, bool) {
         if length.is_null() || capacity > MAX_BUFFER_BYTES || (capacity > 0 && output.is_null()) {
-            return INVALID_ARGUMENT;
+            return (INVALID_ARGUMENT, false);
         }
         unsafe {
             length.write(0);
         }
         let (instance, operation) = match self.operation(id, operation_id) {
             Ok(value) => value,
-            Err(status) => return status,
+            Err(status) => return (status, false),
         };
         let _ = instance.callback_executor.drain();
         // Claim terminal drain without holding the state mutex across release
         // callbacks. Reentrant polls observe Polling/BUSY instead of deadlocking.
         let draining = match claim_draining(&operation) {
             Ok(value) => value,
-            Err(status) => return status,
+            Err(status) => return (status, false),
         };
         if let Some(terminal) = draining {
             let terminal = drain_terminal(&instance, &operation, terminal);
@@ -729,27 +824,36 @@ impl NativeAdapter {
                 instance.cleanup_required.store(true, Ordering::Release);
             }
             let Ok(mut state) = operation.state.lock() else {
-                return PANICKED;
+                return (PANICKED, false);
             };
             *state = terminal;
-            return match &*state {
-                OperationState::Ready(bytes) => unsafe {
-                    copy_output(bytes, output, capacity, length)
-                },
-                OperationState::Failed(status) => *status,
-                _ => PENDING,
-            };
+            match &*state {
+                OperationState::Ready(bytes) => {
+                    return (
+                        unsafe { copy_output(bytes, output, capacity, length) },
+                        false,
+                    );
+                }
+                OperationState::Failed(status) => return (*status, false),
+                OperationState::Draining(_) => return (PENDING, true),
+                // A drained non-terminal future may have been woken while the
+                // slot was draining; poll it now instead of losing that wake.
+                OperationState::Pending(_) | OperationState::Polling => {}
+            }
         }
         let mut future = {
             let Ok(mut state) = operation.state.lock() else {
-                return PANICKED;
+                return (PANICKED, false);
             };
             match &*state {
                 OperationState::Ready(bytes) => {
-                    return unsafe { copy_output(bytes, output, capacity, length) };
+                    return (
+                        unsafe { copy_output(bytes, output, capacity, length) },
+                        false,
+                    );
                 }
-                OperationState::Failed(status) => return *status,
-                OperationState::Polling | OperationState::Draining(_) => return BUSY,
+                OperationState::Failed(status) => return (*status, false),
+                OperationState::Polling | OperationState::Draining(_) => return (BUSY, true),
                 OperationState::Pending(_) => {}
             }
             match std::mem::replace(&mut *state, OperationState::Polling) {
@@ -759,10 +863,9 @@ impl NativeAdapter {
         };
         let runtime = match instance.runtime.lock() {
             Ok(runtime) => runtime.clone(),
-            Err(_) => return PANICKED,
+            Err(_) => return (PANICKED, false),
         };
         let _entered = runtime.as_ref().map(|runtime| runtime.handle.enter());
-        let waker = Waker::noop();
         let polled = catch_unwind(AssertUnwindSafe(|| {
             future.as_mut().poll(&mut Context::from_waker(waker))
         }));
@@ -772,7 +875,7 @@ impl NativeAdapter {
                 if let Some(activating) = operation.lifecycle
                     && let Err(status) = settle_lifecycle(&instance, activating, &outcome)
                 {
-                    return status;
+                    return (status, false);
                 }
                 if catch_unwind(AssertUnwindSafe(|| drop(future))).is_err() {
                     instance.cleanup_required.store(true, Ordering::Release);
@@ -799,13 +902,17 @@ impl NativeAdapter {
             instance.cleanup_required.store(true, Ordering::Release);
         }
         let Ok(mut state) = operation.state.lock() else {
-            return PANICKED;
+            return (PANICKED, false);
         };
         *state = next;
         match &*state {
-            OperationState::Ready(bytes) => unsafe { copy_output(bytes, output, capacity, length) },
-            OperationState::Failed(status) => *status,
-            _ => PENDING,
+            OperationState::Ready(bytes) => (
+                unsafe { copy_output(bytes, output, capacity, length) },
+                false,
+            ),
+            OperationState::Failed(status) => (*status, false),
+            OperationState::Draining(_) => (PENDING, true),
+            _ => (PENDING, false),
         }
     }
     pub fn cancel(&self, id: u64, operation_id: u64) -> AbiStatus {
@@ -1316,35 +1423,51 @@ macro_rules! export_plugin_entrypoint {
             ) -> i32 {
                 $crate::abi::ffi_guard(|| unsafe { adapter().read(id, op, out, cap, len) })
             }
+            unsafe extern "C" fn read_wake(
+                id: u64,
+                op: u64,
+                out: *mut u8,
+                cap: usize,
+                len: *mut usize,
+                waker: *const $crate::abi::NativeHostWakerV1,
+            ) -> i32 {
+                $crate::abi::ffi_guard(|| unsafe {
+                    adapter().read_wake(id, op, out, cap, len, waker)
+                })
+            }
             unsafe extern "C" fn cancel(id: u64, op: u64) -> i32 {
                 $crate::abi::ffi_guard(|| adapter().cancel(id, op))
             }
             unsafe extern "C" fn ack(id: u64, op: u64) -> i32 {
                 $crate::abi::ffi_guard(|| adapter().ack(id, op))
             }
-            static DESCRIPTOR: $crate::abi::NativePluginDescriptorV3 =
-                $crate::abi::NativePluginDescriptorV3 {
-                    base: $crate::abi::NativePluginDescriptor {
-                        size: $crate::abi::NATIVE_DESCRIPTOR_SIZE,
-                        version: $crate::abi::ABI_VERSION,
-                        // Callback authority is advertised: the host binds a
-                        // lifecycle callback root for every selected activation and
-                        // fails closed when an artifact cannot project it.
-                        capabilities: $crate::abi::SCOPED_CAPABILITIES,
-                        start_scoped,
-                        metadata,
-                        create,
-                        destroy,
-                        start,
-                        read,
-                        cancel,
-                        ack,
+            static DESCRIPTOR: $crate::abi::NativePluginDescriptorV3HostWakeV1 =
+                $crate::abi::NativePluginDescriptorV3HostWakeV1 {
+                    base: $crate::abi::NativePluginDescriptorV3 {
+                        base: $crate::abi::NativePluginDescriptor {
+                            size: $crate::abi::NATIVE_DESCRIPTOR_SIZE_HOST_WAKE_V1,
+                            version: $crate::abi::ABI_VERSION,
+                            // Callback authority is advertised: the host binds a
+                            // lifecycle callback root for every selected activation
+                            // and fails closed when an artifact cannot project it.
+                            // Host wake v1 lets hosts drive operations by waker.
+                            capabilities: $crate::abi::DESCRIPTOR_CAPABILITIES,
+                            start_scoped,
+                            metadata,
+                            create,
+                            destroy,
+                            start,
+                            read,
+                            cancel,
+                            ack,
+                        },
+                        declarations,
                     },
-                    declarations,
+                    read_wake,
                 };
             #[unsafe(no_mangle)]
             pub extern "C" fn bmux_plugin_entry_v2() -> *const $crate::abi::NativePluginDescriptor {
-                &DESCRIPTOR.base
+                &DESCRIPTOR.base.base
             }
         };
     };
