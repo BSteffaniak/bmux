@@ -57,6 +57,29 @@ fn settle(receipts: Vec<Result<WriteReceipt, String>>) -> Result<(), String> {
     failure.map_or(Ok(()), Err)
 }
 
+/// Register one queued PTY write with the invocation's settlement collector.
+/// The returned sender must receive the write's actual completion; the
+/// invocation that authorizes the write stays retained until it does.
+///
+/// # Errors
+/// Fails outside a settled invocation or beyond the admission bound: an
+/// unsettled write would be re-authorized after its invocation closed.
+pub(crate) fn settlement_receipt() -> Result<std::sync::mpsc::SyncSender<Result<(), String>>, String>
+{
+    WRITE_RECEIPTS.with(|slot| {
+        let mut receipts = slot.borrow_mut();
+        let receipts = receipts
+            .as_mut()
+            .ok_or_else(|| "PTY input settlement scope missing".to_string())?;
+        if receipts.len() >= MAX_PENDING_WRITES - 1 {
+            return Err("PTY input admission bound exceeded".to_string());
+        }
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        receipts.push(Ok(receiver));
+        Ok(sender)
+    })
+}
+
 pub(crate) fn settled_local_command(
     bytes: Vec<u8>,
     session: bmux_session_models::SessionId,
@@ -252,6 +275,22 @@ mod tests {
         };
         assert!(authority.write(&mut writer, b"abc").is_err());
         assert_eq!(writer.output, b"a");
+    }
+
+    #[test]
+    fn execution_write_receipts_require_and_join_invocation_settlement() {
+        // Outside a settled invocation the write would be re-authorized after
+        // its invocation closed, so it is refused rather than queued unsettled.
+        assert!(settlement_receipt().is_err());
+        WRITE_RECEIPTS.with(|slot| slot.replace(Some(Vec::new())));
+        let completion = settlement_receipt().unwrap();
+        let receipts = WRITE_RECEIPTS.with(|slot| slot.borrow_mut().take().unwrap());
+        assert_eq!(receipts.len(), 1);
+        completion
+            .send(Err("authority denied at write".into()))
+            .unwrap();
+        // The write's actual failure reaches the invocation's response.
+        assert_eq!(settle(receipts).unwrap_err(), "authority denied at write");
     }
 
     #[test]

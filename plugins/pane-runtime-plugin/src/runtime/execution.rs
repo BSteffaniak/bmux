@@ -982,9 +982,15 @@ pub(crate) fn send(
             .try_acquire_owned()
             .map_err(failed)?;
         let authority = queued_input_authority(pane, authority, None);
+        // The write's authority recheck runs on the PTY writer, but the host
+        // answers it only while this invocation is retained: settle the write
+        // before the invocation closes instead of re-authorizing afterwards.
+        let receipt = super::input_authority::settlement_receipt().map_err(failed)?;
         let recording = super::pane_input_recording_data(&data);
         pane.input_tx
-            .send(PaneRuntimeCommand::GuardedInput(data, permit, authority))
+            .send(PaneRuntimeCommand::AdmittedInput(
+                data, receipt, permit, authority,
+            ))
             .map_err(failed)?;
         if let Some((sink, bytes)) = recording {
             sink.0.record(

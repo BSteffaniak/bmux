@@ -1948,11 +1948,6 @@ pub(crate) enum PaneRuntimeCommand {
         tokio::sync::OwnedSemaphorePermit,
         input_authority::InputAuthority,
     ),
-    GuardedInput(
-        Vec<u8>,
-        tokio::sync::OwnedSemaphorePermit,
-        input_authority::InputAuthority,
-    ),
     GuardedResize {
         rows: u16,
         cols: u16,
@@ -8076,15 +8071,6 @@ impl SessionRuntimeManager {
                     }
                     input = input_rx.recv() => {
                         let (input, _permit) = match input {
-                            Some(PaneRuntimeCommand::GuardedInput(bytes, permit, authority)) => {
-                                // Keep the bounded admission permit through the actual write.
-                                let _permit = permit;
-                                if let Ok(mut writer) = writer.lock() {
-                                    // Denial drops this chunk; never replay uncertain input.
-                                    let _ = authority.write(&mut *writer, &bytes);
-                                }
-                                continue;
-                            }
                             Some(PaneRuntimeCommand::GuardedResize { rows, cols, _permit: permit }) =>
                                 (Some(PaneRuntimeCommand::Resize { rows, cols }), Some(permit)),
                             other => (other, None),
@@ -8138,7 +8124,7 @@ impl SessionRuntimeManager {
                                     execution_for_task.record_error(format!("PTY resize failed: {error}"));
                                 }
                             }
-                            Some(PaneRuntimeCommand::GuardedInput(..) | PaneRuntimeCommand::GuardedResize { .. }) => unreachable!("guarded command normalized"),
+                            Some(PaneRuntimeCommand::GuardedResize { .. }) => unreachable!("guarded command normalized"),
                             None => break,
                         }
                     }
