@@ -27,34 +27,91 @@ struct DriverThread {
 const RELEASE_NOTICE_AFTER: std::time::Duration = std::time::Duration::from_secs(5);
 /// Repeat interval for subsequent notices.
 const RELEASE_NOTICE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Primary runtime shutdown did not complete.
+#[derive(Debug)]
+pub enum RuntimeShutdownError {
+    /// The lifetime driver thread panicked.
+    Panicked,
+    /// Retained execution owners outlived the shutdown bound. The runtime was
+    /// abandoned, not destroyed: no code is unloaded and no referenced memory
+    /// is freed; it is reclaimed only by process exit.
+    Abandoned {
+        waited: std::time::Duration,
+        retained_pins: usize,
+        /// Every unfinished plugin instance and its attributed holders.
+        unfinished: Vec<bmux_plugin_runtime::OutstandingHolders>,
+    },
+}
+
+impl std::fmt::Display for RuntimeShutdownError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Panicked => formatter.write_str("primary runtime driver panicked"),
+            Self::Abandoned {
+                waited,
+                retained_pins,
+                unfinished,
+            } => {
+                write!(
+                    formatter,
+                    "primary runtime abandoned after {}s with {retained_pins} retained runtime owner pin(s); {} unfinished plugin instance(s)",
+                    waited.as_secs(),
+                    unfinished.len()
+                )?;
+                for report in unfinished {
+                    write!(formatter, "\n  blocked by {report}")?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+impl std::error::Error for RuntimeShutdownError {}
+
 impl DriverThread {
-    /// Wait for actual runtime destruction, never detaching it. A wait that
-    /// outlives the notice threshold is reported (with the number of retained
-    /// owner pins) so an unresolved retained execution is diagnosable instead
-    /// of an unexplained hang.
-    fn join(self) -> std::thread::Result<()> {
+    /// Wait for actual runtime destruction for at most `bound`, never detaching
+    /// cleanup early. Waits past the notice threshold are reported. When the
+    /// bound expires, the retained owners are named (plugin instance, scope,
+    /// creating site, label) and the runtime is abandoned rather than awaited
+    /// forever; it is never destroyed while still referenced.
+    fn join(self, bound: std::time::Duration) -> Result<(), RuntimeShutdownError> {
         let started = std::time::Instant::now();
         let mut notice_at = RELEASE_NOTICE_AFTER;
         loop {
-            let remaining = notice_at.saturating_sub(started.elapsed());
+            let remaining = notice_at.min(bound).saturating_sub(started.elapsed());
             match self.finished.recv_timeout(remaining) {
                 Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) if started.elapsed() >= bound => {
+                    let error = RuntimeShutdownError::Abandoned {
+                        waited: started.elapsed(),
+                        retained_pins: self.pins.strong_count(),
+                        unfinished: bmux_plugin_runtime::unfinished_instances(),
+                    };
+                    tracing::error!(%error, "primary runtime shutdown bound exceeded");
+                    // Dropping the join handle detaches the driver thread, which
+                    // keeps owning the runtime until process exit.
+                    return Err(error);
+                }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                     let retained = self.pins.strong_count();
                     let waited = started.elapsed().as_secs();
                     tracing::warn!(
                         retained_pins = retained,
                         waited_secs = waited,
+                        bound_secs = bound.as_secs(),
                         "primary runtime shutdown waiting for retained execution owners"
                     );
                     eprintln!(
-                        "bmux: shutdown has waited {waited}s for {retained} retained runtime owner pin(s); unresolved plugin cleanup keeps the primary runtime alive"
+                        "bmux: shutdown has waited {waited}s (bound {}s) for {retained} retained runtime owner pin(s); unresolved plugin cleanup keeps the primary runtime alive",
+                        bound.as_secs()
                     );
                     notice_at = started.elapsed() + RELEASE_NOTICE_INTERVAL;
                 }
             }
         }
-        self.join.join()
+        self.join.join().map_err(|_| RuntimeShutdownError::Panicked)
     }
 }
 impl RuntimeDriver {
@@ -104,16 +161,32 @@ impl RuntimeDriver {
         self.owner.as_ref().expect("runtime driver is open").clone()
     }
     /// Release the root and wait for every retained execution pin, then actual
-    /// reactor shutdown. Outstanding cleanup cannot be reported as shutdown.
+    /// reactor shutdown, bounded by [`bmux_plugin_runtime::teardown_timeout`].
+    /// Outstanding cleanup cannot be reported as shutdown.
     /// # Errors
-    /// Returns an error if the lifetime driver panicked.
+    /// Returns an error if the lifetime driver panicked or retained owners
+    /// outlived the bound (the error names them).
+    pub fn shutdown(self) -> Result<(), RuntimeShutdownError> {
+        self.shutdown_within(bmux_plugin_runtime::teardown_timeout())
+    }
+
+    /// [`Self::shutdown`] with an explicit bound.
+    /// # Errors
+    /// Returns an error if the lifetime driver panicked or retained owners
+    /// outlived `bound` (the error names them).
     ///
     /// # Panics
     /// Panics if the driver's private thread invariant is broken. Shutdown
     /// consumes the driver, so it cannot be called twice through the public API.
-    pub fn shutdown(mut self) -> std::thread::Result<()> {
+    pub fn shutdown_within(
+        mut self,
+        bound: std::time::Duration,
+    ) -> Result<(), RuntimeShutdownError> {
         self.owner.take();
-        self.driver.take().expect("runtime driver is open").join()
+        self.driver
+            .take()
+            .expect("runtime driver is open")
+            .join(bound)
     }
 }
 impl Drop for RuntimeDriver {
@@ -121,8 +194,10 @@ impl Drop for RuntimeDriver {
         self.owner.take();
         if let Some(driver) = self.driver.take() {
             // The root must be dropped outside async execution. An unresolved
-            // retained execution deliberately blocks shutdown, never unloads.
-            let _ = driver.join();
+            // retained execution blocks shutdown up to the bound, never unloads.
+            if let Err(error) = driver.join(bmux_plugin_runtime::teardown_timeout()) {
+                eprintln!("bmux: {error}");
+            }
         }
     }
 }

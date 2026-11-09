@@ -40,8 +40,10 @@ fn main() -> ExitCode {
         }
     };
     bmux_plugin_sdk::perf_telemetry::flush();
-    if driver.shutdown().is_err() {
-        eprintln!("bmux primary runtime shutdown failed");
+    if let Err(error) = driver.shutdown() {
+        // Bounded: retained owners are named and abandoned (never unloaded);
+        // the process exits non-zero instead of hanging.
+        eprintln!("bmux primary runtime shutdown failed: {error}");
         return ExitCode::from(1);
     }
     exit_code
