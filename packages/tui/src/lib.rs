@@ -12,6 +12,7 @@ pub mod ansi;
 pub mod buffer;
 pub mod capabilities;
 pub mod chrome;
+pub mod clock;
 pub mod component;
 pub mod composition;
 #[cfg(feature = "crossterm")]
@@ -43,6 +44,7 @@ pub mod presentation;
 pub mod selection;
 pub mod semantic;
 pub mod sensitive_input;
+pub mod source_map;
 pub mod style;
 pub mod terminal;
 pub mod text;
@@ -59,6 +61,7 @@ pub mod prelude {
         TerminalBackground, TerminalCapabilities, TerminalColorDepth, TerminalColorReport,
     };
     pub use crate::chrome::{Border, BorderSet, BorderSide, BorderSideStyles, BorderSides};
+    pub use crate::clock::PresentationClock;
     pub use crate::component::{
         ChildLayout, Component, ComponentRevision, Constraints, Element, EventCx, LayoutCache,
         LayoutCacheStats, LayoutCx, LayoutEnvironment, LayoutId, LayoutMetadata, LayoutNode,
@@ -66,8 +69,8 @@ pub mod prelude {
     };
     pub use crate::composition::{
         Align, Clip, Column, Fill, Flex, HitArea, HorizontalAlignment, Keyed, Padding, Row,
-        SizeBox, Stack, StyleScope, Surface, TextBlock, TextProjectionRow, VerticalAlignment,
-        Visibility,
+        SizeBox, Stack, StyleScope, Surface, TextBlock, TextProjectionRow, TextProjectionWindow,
+        TextSourceRows, VerticalAlignment, Visibility,
     };
     #[cfg(feature = "crossterm")]
     pub use crate::crossterm::{
@@ -106,6 +109,7 @@ pub mod prelude {
         SelectionScrollDirection, SelectionSlice, SelectionSnapshot, paint_selection_highlights,
         plain_text_fragments, plain_text_fragments_with_tabs,
     };
+    pub use crate::source_map::{OffsetSourceRows, SourceMapped};
     pub use crate::style::{Color, Easing, Modifier, Style};
     pub use crate::terminal::{DrawStats, Terminal};
     pub use crate::text::{

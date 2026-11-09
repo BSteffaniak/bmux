@@ -70,6 +70,16 @@ pub trait Presenter<P> {
     /// Supply caller-owned scope/capture from the application's existing router.
     fn set_pointer_context(&mut self, _context: bmux_tui::terminal::PointerContext) {}
 
+    /// Supply the presentation clock for the next prepared frame.
+    ///
+    /// The runtime samples its clock once per presentation and calls this
+    /// immediately before [`Self::start_present`] (or [`Self::present`]).
+    /// Presenters backed by a [`bmux_tui::terminal::Terminal`] forward it to
+    /// [`bmux_tui::terminal::Terminal::set_presentation_clock`], so every
+    /// layout and paint context of the frame reads the same instant through
+    /// [`bmux_tui::paint::PaintCx::clock`]. The default ignores it.
+    fn set_presentation_clock(&mut self, _clock: bmux_tui::clock::PresentationClock) {}
+
     /// Restore protocol ownership on exit, suspend, and recoverable error.
     /// # Errors
     /// Reports incomplete cleanup; cancellation alone is not restoration.
@@ -133,6 +143,9 @@ impl<P, R: Presenter<P>, F: FnMut(&P) -> bmux_tui::terminal::PointerContext> Pre
     }
     fn set_pointer_context(&mut self, context: bmux_tui::terminal::PointerContext) {
         self.inner.set_pointer_context(context);
+    }
+    fn set_presentation_clock(&mut self, clock: bmux_tui::clock::PresentationClock) {
+        self.inner.set_presentation_clock(clock);
     }
     async fn restore(&mut self) -> Result<(), Self::Error> {
         self.inner.restore().await

@@ -287,6 +287,20 @@ impl<W: Write> Terminal<W> {
         self.state.reset();
     }
 
+    /// Set the presentation clock given to subsequent frames.
+    ///
+    /// See [`crate::presentation::PresentationState::set_presentation_clock`]. Staging terminals
+    /// created by [`Self::fork`] inherit the current value.
+    pub const fn set_presentation_clock(&mut self, clock: Option<crate::clock::PresentationClock>) {
+        self.state.set_presentation_clock(clock);
+    }
+
+    /// The presentation clock given to subsequent frames.
+    #[must_use]
+    pub const fn presentation_clock(&self) -> Option<crate::clock::PresentationClock> {
+        self.state.presentation_clock()
+    }
+
     /// Resize the terminal area and force the next draw to repaint fully.
     pub fn resize(&mut self, area: Rect) {
         self.state.resize(area);

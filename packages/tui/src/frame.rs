@@ -74,6 +74,7 @@ pub struct Frame<'buffer> {
     semantics: SemanticScene,
     damage: Vec<Rect>,
     metadata_availability: Vec<SurfaceMetadataAvailability>,
+    clock: Option<crate::clock::PresentationClock>,
 }
 
 /// Apply opaque coverage to metadata preceding an overlay, whether staged or retained.
@@ -146,7 +147,19 @@ impl<'buffer> Frame<'buffer> {
             semantics: SemanticScene::new(),
             damage: Vec::new(),
             metadata_availability: Vec::new(),
+            clock: None,
         }
+    }
+
+    /// Set the presentation clock shared by every context painting this frame.
+    pub const fn set_clock(&mut self, clock: Option<crate::clock::PresentationClock>) {
+        self.clock = clock;
+    }
+
+    /// The presentation clock of this frame, when its driver supplied one.
+    #[must_use]
+    pub const fn clock(&self) -> Option<crate::clock::PresentationClock> {
+        self.clock
     }
 
     /// Return the frame area.

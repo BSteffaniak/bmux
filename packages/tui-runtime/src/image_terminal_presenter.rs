@@ -292,6 +292,9 @@ where
     fn set_pointer_context(&mut self, context: bmux_tui::terminal::PointerContext) {
         self.terminal.set_pointer_context(context);
     }
+    fn set_presentation_clock(&mut self, clock: bmux_tui::clock::PresentationClock) {
+        self.terminal.set_presentation_clock(Some(clock));
+    }
     fn restore(&mut self) -> impl std::future::Future<Output = Result<(), Self::Error>> {
         futures_util::future::lazy(move |_| self.cleanup_presentation())
     }
@@ -334,6 +337,9 @@ where
     }
     fn set_pointer_context(&mut self, context: bmux_tui::terminal::PointerContext) {
         self.terminal.set_pointer_context(context);
+    }
+    fn set_presentation_clock(&mut self, clock: bmux_tui::clock::PresentationClock) {
+        self.terminal.set_presentation_clock(Some(clock));
     }
     fn restore(&mut self) -> impl std::future::Future<Output = Result<(), Self::Error>> {
         futures_util::future::lazy(move |_| self.cleanup_presentation())
@@ -714,6 +720,9 @@ where
     }
     fn set_pointer_context(&mut self, context: bmux_tui::terminal::PointerContext) {
         self.inner.terminal.set_pointer_context(context);
+    }
+    fn set_presentation_clock(&mut self, clock: bmux_tui::clock::PresentationClock) {
+        self.inner.terminal.set_presentation_clock(Some(clock));
     }
     async fn restore(&mut self) -> Result<(), Self::Error> {
         self.cleanup_images(std::time::Duration::from_millis(250))

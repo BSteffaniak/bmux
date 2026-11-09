@@ -127,38 +127,69 @@ selection snapshot rather than scraping the terminal buffer.
 
 ## Text projection cost
 
-`TextBlock` measures wrapped height without constructing rendered text.
-Character
-measurement does not allocate output rows; word measurement still retains
-segment
-metadata but tracks row boundaries numerically without allocating row storage.
-Both measurement and rendering use the same
-wrapping rules, including distinct first/continuation widths in the underlying
-text helpers.
+`TextBlock` layout measures the whole block once at the constrained width,
+using the same wrapping rules as rendering (including distinct
+first/continuation widths in the underlying text helpers). It retains, in the
+layout node, one compact geometry record per measured row: the source line and
+the UTF-8 byte range it renders. It does not retain rendered rows or styles.
 
-Painting and selection construct output lazily. They skip complete offscreen
-source lines before rendering and stop after the visible row range. Locating the
-first visible row counts only enough rows to determine which source line
-contains
-it, and does not measure the retained line at an exact source-line boundary.
-Selection preserves original UTF-8 source offsets when starting at a later line.
+Everything after layout reads that retained geometry and is bounded by the
+rows it touches, not by the block:
 
-These properties do **not** make arbitrary text projection viewport-bounded:
+- painting and selection registration locate the first visible row in constant
+  time (including deep scroll positions) and materialize only visible rows;
+- `TextBlock::projection_window(layout, rows)` returns a
+  `TextProjectionWindow` with the styled rows and source ranges of one row
+  range, materializing only those rows;
+- `TextBlock::row_for_source_offset`, `TextBlock::source_range_for_row`, and
+  `TextBlock::source_rows` (a `SourceMapped<usize>`, see
+  [Source anchoring](#source-anchoring)) map between source offsets and rows by
+  binary search over retained geometry.
 
-- locating a deep scroll position still measures preceding source lines;
-- reaching a wrapped row inside the retained source line still traverses preceding
-  wrapped rows;
-- word segmentation reads an entire whitespace or non-whitespace segment before
-  wrapping it, so a single very long word can require substantial lookahead;
-- word selection projection searches source bytes for rendered row content;
-- the public `projection(width)` method explicitly collects every projected row.
+Remaining costs, all paid once per layout revision and width rather than per
+frame:
+
+- layout itself is linear in the source text, and word segmentation reads an
+  entire whitespace or non-whitespace segment before wrapping it, so a single
+  very long word can require substantial lookahead;
+- word-wrapped source ranges are located by matching rendered row content
+  against source bytes during layout;
+- retained row geometry is linear in the measured row count;
+- `projection(layout)` explicitly materializes every row and is meant for
+  callers that need the complete projection.
 
 Use `VirtualList` for independent variable-height items rather than flattening a
-large document into one text block. This bounds item construction and painting,
-not the work inside an individual oversized item. Applications must not
-compensate
-with a second wrapping or source-coordinate engine; further projection indexing
+large document into one text block, so layout work stays per item and only
+invalidated items are measured again. Applications must not compensate with a
+second wrapping or source-coordinate engine; further projection indexing
 belongs in the framework and must retain the same authoritative wrapping rules.
+
+## Presentation clock
+
+Each frame has one `bmux_tui::clock::PresentationClock`, an instant sampled
+once by the presentation driver. Components read it through
+`LayoutCx::clock()` and `PaintCx::clock()` (both `Option`; `None` when the
+driver supplied no clock) instead of a wall clock, so time-derived layout,
+cells, hit regions, and selection fragments of one frame describe the same
+moment. `PresentationClock::step(start, period)` and `since(start)` derive
+animation phases; a zero period stays on the first step (reduced motion).
+
+- `Frame::set_clock` carries the clock to every nested `PaintCx`.
+  `PaintCx::layout_cx()` returns a `LayoutCx` with the same clock for resolving
+  layout inside a render callback; `PaintCx::paint_component` uses it.
+- `PresentationState::set_presentation_clock` and
+  `Terminal::set_presentation_clock` give the clock to subsequently prepared
+  frames; forked staging terminals inherit it.
+- `bmux_tui_runtime` samples its runtime clock once per presentation and passes
+  it to `Presenter::set_presentation_clock` immediately before
+  `start_present`. The standard terminal, image, pointer-context, and harness
+  presenters forward it to their terminal. Under
+  `bmux_tui_runtime::testing::ProgramHarness` the runtime clock is the
+  harness `ManualClock`, so every committed frame is deterministic.
+- Retained layouts are keyed by revision, not time. A component whose layout
+  depends on the clock must fold the time-derived value (for example the
+  animation step) into its layout revision; paint-only animation needs no
+  revision change because painting always reads the current frame clock.
 
 ## Interaction and committed scenes
 
@@ -212,6 +243,52 @@ selection edge-autoscroll requests instead of adding parallel ones.
 from the caller-owned edit buffer's cursor and wrap layout, which the shared
 viewport does not own; it is cursor-following text-edit state, not content
 scrolling.
+
+## Source anchoring
+
+A reading position survives reflow only when it is stored as a position in the
+source and mapped back to a row after the new layout. BMUX provides the
+mechanics; the position type `S` is opaque and caller-defined.
+
+```rust,ignore
+// bmux_tui::source_map
+pub trait SourceMapped<S> {
+    fn row_for_source(&self, position: &S) -> Option<u64>;   // row where position begins
+    fn source_for_row(&self, row: u64) -> Option<(S, u64)>;  // covering position + its start row (<= row)
+}
+pub struct OffsetSourceRows<M>;   // OffsetSourceRows::new(inner, origin): rows shifted by origin
+
+// bmux_tui::composition
+impl TextBlock {
+    pub fn source_rows<'a>(&self, layout: &'a LayoutNode) -> TextSourceRows<'a>; // SourceMapped<usize>
+}
+
+// bmux_tui_components::scroll_view
+pub struct ScrollSourceAnchor<S>;  // position(), row_delta(), viewport_row()
+impl ScrollView {
+    pub fn capture_source_anchor<S>(state: &ScrollViewState, rows: &dyn SourceMapped<S>,
+                                    viewport_row: u64) -> Option<ScrollSourceAnchor<S>>;
+    pub fn restore_source_anchor<S>(&self, layout: &LayoutNode, state: &mut ScrollViewState,
+                                    anchor: &ScrollSourceAnchor<S>,
+                                    rows: &dyn SourceMapped<S>) -> ScrollViewOutcome;
+}
+```
+
+- `SourceMapped` maps one content block at its current layout. Implementations
+  are consistent: `source_for_row(row) == Some((p, start))` implies
+  `start <= row` and `row_for_source(&p) == Some(start)`.
+- `TextSourceRows` uses UTF-8 byte offsets into the block's newline-separated
+  source. An offset inside a row's range maps to that row; offsets that are
+  consumed without being rendered (separators, wrapped or trimmed whitespace)
+  map to the preceding row; offsets past the source end are unmapped.
+- `ScrollView` source anchors complement layout-identity `ScrollAnchor`s for
+  positions inside one large content, such as a wrapped document in a
+  `TextViewComponent`. Restoration clamps to the new extent and leaves the
+  horizontal offset and bottom-follow policy unchanged.
+- Keyed collections use the keyed `virtual_list::SourceMap<K, S>` consulted by
+  `AnchorOffset::Source` resolution (see [Position model](#position-model));
+  its implementations usually delegate to one `SourceMapped` per retained item
+  layout.
 
 ## Variable-height virtualization
 

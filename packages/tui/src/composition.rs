@@ -12,6 +12,7 @@ use crate::component::{
 use crate::geometry::Rect;
 use crate::paint::{LocalRect, PaintCx};
 use crate::selection::{SelectionContentId, SelectionScopeId, plain_text_fragments};
+use crate::source_map::SourceMapped;
 use crate::style::Style;
 use crate::text::{Line, Text, TextWrap, TextWrapGeometry};
 use crate::text_block::Alignment;
@@ -120,6 +121,107 @@ pub struct TextProjectionRow {
     pub source_range: Range<usize>,
 }
 
+/// Measured rows of a [`TextBlock`] inside one row range.
+///
+/// Produced by [`TextBlock::projection_window`] from retained layout geometry
+/// without materializing rows outside the range.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextProjectionWindow {
+    first_row: u64,
+    total_rows: u64,
+    rows: Vec<TextProjectionRow>,
+}
+
+impl TextProjectionWindow {
+    /// Measured row index of the first projected row.
+    #[must_use]
+    pub const fn first_row(&self) -> u64 {
+        self.first_row
+    }
+
+    /// Measured height of the whole block.
+    #[must_use]
+    pub const fn total_rows(&self) -> u64 {
+        self.total_rows
+    }
+
+    /// Measured rows covered by this window, after clamping.
+    #[must_use]
+    pub fn row_range(&self) -> Range<u64> {
+        let len = u64::try_from(self.rows.len()).unwrap_or(u64::MAX);
+        self.first_row..self.first_row.saturating_add(len)
+    }
+
+    /// Projected rows in order, starting at [`Self::first_row`].
+    #[must_use]
+    pub fn rows(&self) -> &[TextProjectionRow] {
+        &self.rows
+    }
+
+    /// Projected rows paired with their measured row index.
+    pub fn indexed_rows(&self) -> impl Iterator<Item = (u64, &TextProjectionRow)> {
+        (self.first_row..).zip(self.rows.iter())
+    }
+
+    /// Take ownership of the projected rows.
+    #[must_use]
+    pub fn into_rows(self) -> Vec<TextProjectionRow> {
+        self.rows
+    }
+}
+
+/// UTF-8 source offsets mapped to measured rows of one retained
+/// [`TextBlock`] layout. See [`TextBlock::source_rows`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TextSourceRows<'a> {
+    rows: &'a [crate::component::TextRowGeometry],
+    source_len: usize,
+}
+
+impl TextSourceRows<'_> {
+    /// Measured row count.
+    #[must_use]
+    pub fn len(&self) -> u64 {
+        u64::try_from(self.rows.len()).unwrap_or(u64::MAX)
+    }
+
+    /// Whether no rows are retained.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    fn first_row_starting_at(&self, start: usize) -> u64 {
+        let row = self
+            .rows
+            .partition_point(|row| row.source_range.start < start);
+        u64::try_from(row).unwrap_or(u64::MAX)
+    }
+}
+
+impl SourceMapped<usize> for TextSourceRows<'_> {
+    fn row_for_source(&self, position: &usize) -> Option<u64> {
+        if self.rows.is_empty() || *position > self.source_len {
+            return None;
+        }
+        // Row starts are non-decreasing in measured order.
+        let covering = self
+            .rows
+            .partition_point(|row| row.source_range.start <= *position)
+            .saturating_sub(1);
+        Some(self.first_row_starting_at(self.rows[covering].source_range.start))
+    }
+
+    fn source_for_row(&self, row: u64) -> Option<(usize, u64)> {
+        let start = self
+            .rows
+            .get(usize::try_from(row).ok()?)?
+            .source_range
+            .start;
+        Some((start, self.first_row_starting_at(start)))
+    }
+}
+
 /// A measurable rich-text component.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TextBlock {
@@ -127,6 +229,8 @@ pub struct TextBlock {
     text: Text,
     /// Byte offsets into the immutable newline-separated source text.
     source_line_offsets: Vec<usize>,
+    /// Byte length of the newline-separated source text.
+    source_len: usize,
     text_revision: ComponentRevision,
     intrinsic_width: usize,
     style: Style,
@@ -159,6 +263,7 @@ impl TextBlock {
                 start
             })
             .collect();
+        let source_len = offset.saturating_sub(1);
         let text_revision = ComponentRevision::new(
             stable_revision(|state| {
                 text.lines.len().hash(state);
@@ -181,6 +286,7 @@ impl TextBlock {
             id: LayoutId::new("text"),
             text,
             source_line_offsets,
+            source_len,
             text_revision,
             intrinsic_width,
             style: Style::new(),
@@ -271,9 +377,77 @@ impl TextBlock {
     /// Paint-only style changes may reuse it. Source lines are newline-separated;
     /// ranges exclude separators and whitespace consumed by word wrapping.
     /// This returns the complete measured content, before viewport scrolling.
+    /// Prefer [`Self::projection_window`] when only some rows are needed.
     #[must_use]
     pub fn projection(&self, layout: &LayoutNode) -> Vec<TextProjectionRow> {
         self.measured_rows(layout, 0).collect()
+    }
+
+    /// Project only the measured rows in `rows`, with their source ranges.
+    ///
+    /// Pass this component's resolved layout, as for [`Self::projection`].
+    /// Rows are measured-content rows before viewport scrolling; the range is
+    /// clamped to the measured height. Locating the first row reads retained
+    /// row geometry in constant time, and only rows inside the range are
+    /// materialized, so the cost is bounded by the window rather than by the
+    /// block. A layout without retained text geometry projects no rows.
+    #[must_use]
+    pub fn projection_window(&self, layout: &LayoutNode, rows: Range<u64>) -> TextProjectionWindow {
+        let retained = Self::retained_rows(layout);
+        let total = retained.len();
+        let start = usize::try_from(rows.start).unwrap_or(usize::MAX).min(total);
+        let end = usize::try_from(rows.end)
+            .unwrap_or(usize::MAX)
+            .clamp(start, total);
+        TextProjectionWindow {
+            first_row: u64::try_from(start).unwrap_or(u64::MAX),
+            total_rows: u64::try_from(total).unwrap_or(u64::MAX),
+            rows: retained[start..end]
+                .iter()
+                .map(|row| self.materialize_row(row))
+                .collect(),
+        }
+    }
+
+    /// Measured row where the source byte `offset` is rendered.
+    ///
+    /// Offsets inside a row's source range map to that row. Offsets consumed
+    /// without being rendered (line separators, whitespace removed by word
+    /// wrapping or trimming) map to the preceding row; when several rows begin
+    /// at the same offset, the first of them is returned. Returns `None` when
+    /// the layout retains no text geometry or `offset` is past the end of the
+    /// source text. Lookup is logarithmic in the measured row count.
+    #[must_use]
+    pub fn row_for_source_offset(&self, layout: &LayoutNode, offset: usize) -> Option<u64> {
+        self.source_rows(layout).row_for_source(&offset)
+    }
+
+    /// UTF-8 source byte range rendered on measured `row`, or `None` when the
+    /// row is outside the measured height.
+    #[must_use]
+    pub fn source_range_for_row(&self, layout: &LayoutNode, row: u64) -> Option<Range<usize>> {
+        let row = usize::try_from(row).ok()?;
+        Self::retained_rows(layout)
+            .get(row)
+            .map(|row| row.source_range.clone())
+    }
+
+    /// Source-offset mapping over this block's retained layout.
+    ///
+    /// The returned value implements
+    /// [`SourceMapped<usize>`](crate::source_map::SourceMapped) with UTF-8 byte
+    /// offsets into the newline-separated source text, for anchoring a reading
+    /// position across reflow.
+    #[must_use]
+    pub fn source_rows<'a>(&self, layout: &'a LayoutNode) -> TextSourceRows<'a> {
+        TextSourceRows {
+            rows: Self::retained_rows(layout),
+            source_len: self.source_len,
+        }
+    }
+
+    fn retained_rows(layout: &LayoutNode) -> &[crate::component::TextRowGeometry] {
+        layout.metadata.text_rows.as_deref().unwrap_or(&[])
     }
 
     fn raw_line_rows<'a>(&'a self, line: &'a Line, width: u64) -> impl Iterator<Item = Line> + 'a {
@@ -408,35 +582,34 @@ impl TextBlock {
         layout: &'a LayoutNode,
         first: usize,
     ) -> impl Iterator<Item = TextProjectionRow> + 'a {
-        layout
-            .metadata
-            .text_rows
+        Self::retained_rows(layout)
+            .get(first..)
+            .unwrap_or(&[])
             .iter()
-            .flat_map(|rows| rows.iter())
-            .skip(first)
-            .map(|row| {
-                let base = self.source_line_offsets[row.source_line];
-                let range = row.source_range.start.saturating_sub(base)
-                    ..row.source_range.end.saturating_sub(base);
-                let mut offset = 0usize;
-                let spans = self.text.lines[row.source_line]
-                    .spans
-                    .iter()
-                    .filter_map(|span| {
-                        let start = range.start.saturating_sub(offset).min(span.content.len());
-                        let end = range.end.saturating_sub(offset).min(span.content.len());
-                        offset = offset.saturating_add(span.content.len());
-                        (start < end).then(|| {
-                            crate::text::Span::styled(&span.content[start..end], span.style)
-                        })
-                    })
-                    .collect::<Vec<_>>();
-                TextProjectionRow {
-                    source_line: row.source_line,
-                    source_range: row.source_range.clone(),
-                    line: Line::from_spans(spans),
-                }
+            .map(|row| self.materialize_row(row))
+    }
+
+    fn materialize_row(&self, row: &crate::component::TextRowGeometry) -> TextProjectionRow {
+        let base = self.source_line_offsets[row.source_line];
+        let range =
+            row.source_range.start.saturating_sub(base)..row.source_range.end.saturating_sub(base);
+        let mut offset = 0usize;
+        let spans = self.text.lines[row.source_line]
+            .spans
+            .iter()
+            .filter_map(|span| {
+                let start = range.start.saturating_sub(offset).min(span.content.len());
+                let end = range.end.saturating_sub(offset).min(span.content.len());
+                offset = offset.saturating_add(span.content.len());
+                (start < end)
+                    .then(|| crate::text::Span::styled(&span.content[start..end], span.style))
             })
+            .collect::<Vec<_>>();
+        TextProjectionRow {
+            source_line: row.source_line,
+            source_range: row.source_range.clone(),
+            line: Line::from_spans(spans),
+        }
     }
 
     fn row_alignment_offset(&self, line: &Line, width: u64) -> u64 {

@@ -633,3 +633,66 @@ fn mouse_events_and_injected_timers_keep_script_order() {
     assert!(entries[0].starts_with("terminal Mouse"));
     assert_eq!(entries[1], "timer direct");
 }
+
+/// Program whose frame content depends only on the presentation clock.
+struct ClockedSpinner {
+    start: Instant,
+}
+
+impl Program for ClockedSpinner {
+    type Message = ();
+    type Error = Infallible;
+
+    fn update(&mut self, _: RuntimeEvent<()>) -> Result<Update<()>, Infallible> {
+        Ok(Update::redraw())
+    }
+}
+
+fn paint_clocked_spinner(spinner: &mut ClockedSpinner, cx: &mut PaintCx<'_, '_>) {
+    const FRAMES: [&str; 4] = ["|", "/", "-", "\\"];
+    let layout_clock = cx.layout_cx().clock();
+    let Some(clock) = cx.clock() else {
+        cx.write_line(LocalRect::new(0, 0, 8, 1), &Line::raw("no clock"));
+        return;
+    };
+    assert_eq!(layout_clock, Some(clock));
+    let step = clock.step(spinner.start, Duration::from_millis(100));
+    let glyph = FRAMES[usize::try_from(step % 4).unwrap()];
+    cx.write_line(
+        LocalRect::new(0, 0, 8, 1),
+        &Line::raw(format!("{glyph} {step}")),
+    );
+    cx.push_hit(HitRegion::new(
+        format!("step-{step}"),
+        Rect::new(0, 0, 1, 1),
+    ));
+}
+
+#[test]
+fn presentation_clock_follows_the_manual_clock_once_per_frame() {
+    let mut harness = ProgramHarness::builder(Size::new(8, 1)).build_with(
+        |handle| ClockedSpinner {
+            start: handle.now(),
+        },
+        paint_clocked_spinner,
+    );
+    for (advance_ms, text, hit) in [
+        (0, "| 0", "step-0"),
+        (120, "/ 1", "step-1"),
+        (100, "- 2", "step-2"),
+        (179, "\\ 3", "step-3"),
+        (1, "| 4", "step-4"),
+    ] {
+        harness.advance(Duration::from_millis(advance_ms));
+        harness.force_present().unwrap();
+        let frame = harness.frame();
+        assert_eq!(frame.row_text(0).as_deref(), Some(text));
+        let hits = frame
+            .hits()
+            .regions()
+            .iter()
+            .map(|region| region.id.as_str().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(hits, vec![hit.to_owned()]);
+    }
+}

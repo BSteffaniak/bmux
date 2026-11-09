@@ -789,6 +789,7 @@ pub struct PresentationState {
     semantics: SemanticScene,
     projected_metadata: Option<ProjectedMetadata>,
     metadata_availability: Vec<SurfaceMetadataAvailability>,
+    clock: Option<crate::clock::PresentationClock>,
 }
 
 impl PresentationState {
@@ -813,8 +814,27 @@ impl PresentationState {
             semantics: SemanticScene::new(),
             projected_metadata: None,
             metadata_availability: Vec::new(),
+            clock: None,
         }
     }
+
+    /// Set the presentation clock given to the next prepared frames.
+    ///
+    /// Presentation drivers sample their clock once per frame and call this
+    /// before preparing it; every layout and paint context of that frame then
+    /// observes the same instant through
+    /// [`PaintCx::clock`](crate::paint::PaintCx::clock). The value persists
+    /// until replaced, and `None` prepares frames without a clock.
+    pub const fn set_presentation_clock(&mut self, clock: Option<crate::clock::PresentationClock>) {
+        self.clock = clock;
+    }
+
+    /// The presentation clock given to prepared frames.
+    #[must_use]
+    pub const fn presentation_clock(&self) -> Option<crate::clock::PresentationClock> {
+        self.clock
+    }
+
     /// Viewport being prepared.
     #[must_use]
     pub const fn area(&self) -> Rect {
@@ -1100,6 +1120,7 @@ impl PresentationState {
             retained_image_count,
         ) = {
             let mut frame = Frame::new(&mut buffer);
+            frame.set_clock(self.clock);
             PresentationPhase::Paint.measure(|| render(&mut PaintCx::new(&mut frame)), |()| true);
             let metadata = PresentationPhase::MetadataExtract.measure(
                 || {

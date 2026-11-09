@@ -466,13 +466,40 @@ impl LayoutNode {
 #[derive(Debug, Default)]
 pub struct LayoutCx {
     measured_nodes: usize,
+    clock: Option<crate::clock::PresentationClock>,
 }
 
 impl LayoutCx {
-    /// Create a layout context.
+    /// Create a layout context without a presentation clock.
     #[must_use]
     pub const fn new() -> Self {
-        Self { measured_nodes: 0 }
+        Self {
+            measured_nodes: 0,
+            clock: None,
+        }
+    }
+
+    /// Create a layout context for a frame presented at `clock`.
+    ///
+    /// Use [`PaintCx::layout_cx`](crate::paint::PaintCx::layout_cx) to resolve
+    /// layout inside a render callback with the frame's own clock.
+    #[must_use]
+    pub const fn with_clock(clock: crate::clock::PresentationClock) -> Self {
+        Self {
+            measured_nodes: 0,
+            clock: Some(clock),
+        }
+    }
+
+    /// The presentation clock of the frame being laid out, when the caller
+    /// supplied one.
+    ///
+    /// Layout that depends on time must read this instead of a wall clock and
+    /// must fold any time-derived value into its layout revision, so retained
+    /// layouts are never reused across an animation step they depend on.
+    #[must_use]
+    pub const fn clock(&self) -> Option<crate::clock::PresentationClock> {
+        self.clock
     }
 
     /// Record one component measurement.

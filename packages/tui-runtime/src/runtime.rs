@@ -923,6 +923,11 @@ where
             self.presenter.reset(ResetReason::Application);
         }
         let presentation_started = self.control.clock.now();
+        // One sample per frame: layout, paint, hits, and selection share it.
+        self.presenter
+            .set_presentation_clock(bmux_tui::clock::PresentationClock::new(
+                presentation_started,
+            ));
         match self.presenter.start_present(&mut self.program) {
             Ok(None) => {
                 self.pending_presentation = Some((presentation_started, scheduled_at));

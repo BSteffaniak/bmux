@@ -15,6 +15,7 @@ use bmux_tui::selection::{
     SelectionAutoScrollRequest, SelectionScrollAxis, SelectionScrollDirection,
 };
 use bmux_tui::semantic::SemanticRegion;
+use bmux_tui::source_map::SourceMapped;
 use bmux_tui::style::Style;
 
 use crate::common::{local_area_of, local_rect};
@@ -64,6 +65,41 @@ impl ScrollAnchor {
     /// Signed target row relative to the viewport top.
     #[must_use]
     pub const fn viewport_row(&self) -> i64 {
+        self.viewport_row
+    }
+}
+
+/// A reading position stored as an opaque caller source position.
+///
+/// Unlike [`ScrollAnchor`], which follows a stable layout identity, a source
+/// anchor follows a position *inside* content (for example a byte offset in a
+/// wrapped text block), so the same source stays at the same viewport row when
+/// a width change or other reflow moves it to a different content row. Capture
+/// it with [`ScrollView::capture_source_anchor`] before reflow and restore it
+/// with [`ScrollView::restore_source_anchor`] against the new layout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScrollSourceAnchor<S> {
+    position: S,
+    row_delta: u64,
+    viewport_row: u64,
+}
+
+impl<S> ScrollSourceAnchor<S> {
+    /// Caller source position the anchor follows.
+    #[must_use]
+    pub const fn position(&self) -> &S {
+        &self.position
+    }
+
+    /// Rows below the row where [`Self::position`] begins.
+    #[must_use]
+    pub const fn row_delta(&self) -> u64 {
+        self.row_delta
+    }
+
+    /// Viewport row (from the viewport top) the anchored row is kept on.
+    #[must_use]
+    pub const fn viewport_row(&self) -> u64 {
         self.viewport_row
     }
 }
@@ -1274,6 +1310,52 @@ impl ScrollView {
         }
     }
 
+    /// Capture the source position shown on `viewport_row` (rows from the
+    /// viewport top) as a reflow-stable anchor.
+    ///
+    /// `rows` maps caller source positions to rows of the scrolled content at
+    /// its current layout, in content coordinates (wrap a nested block in
+    /// [`bmux_tui::source_map::OffsetSourceRows`] to place it). Returns `None`
+    /// when that content row is not mapped.
+    #[must_use]
+    pub fn capture_source_anchor<S>(
+        state: &ScrollViewState,
+        rows: &dyn SourceMapped<S>,
+        viewport_row: u64,
+    ) -> Option<ScrollSourceAnchor<S>> {
+        let row = state.vertical_offset.saturating_add(viewport_row);
+        let (position, start) = rows.source_for_row(row)?;
+        Some(ScrollSourceAnchor {
+            position,
+            row_delta: row.saturating_sub(start),
+            viewport_row,
+        })
+    }
+
+    /// Scroll so a captured source anchor is back on its viewport row after
+    /// relayout, clamped to the new content extent.
+    ///
+    /// `layout` is the new authoritative viewport layout and `rows` the source
+    /// mapping of its content. The horizontal offset and bottom-follow policy
+    /// are unchanged. An anchor whose position is no longer mapped is ignored.
+    pub fn restore_source_anchor<S>(
+        &self,
+        layout: &LayoutNode,
+        state: &mut ScrollViewState,
+        anchor: &ScrollSourceAnchor<S>,
+        rows: &dyn SourceMapped<S>,
+    ) -> ScrollViewOutcome {
+        let Some(start) = rows.row_for_source(&anchor.position) else {
+            return ScrollViewOutcome::Ignored;
+        };
+        let old = state.vertical_offset;
+        state.vertical_offset = start
+            .saturating_add(anchor.row_delta)
+            .saturating_sub(anchor.viewport_row)
+            .min(Self::max_vertical_offset(layout));
+        outcome(old, state.vertical_offset)
+    }
+
     /// Route one event to the innermost viewport first, handing an unconsumed
     /// edge event to the enclosing viewport.
     #[allow(clippy::too_many_arguments)]
@@ -1579,8 +1661,9 @@ mod tests {
         }
     }
     use super::{
-        NestedScrollOutcome, ScrollExtent, ScrollView, ScrollViewComponent, ScrollViewOutcome,
-        ScrollViewPolicy, ScrollViewState, logical_offset_from_scrollbar, scrollbar_state,
+        NestedScrollOutcome, ScrollExtent, ScrollSourceAnchor, ScrollView, ScrollViewComponent,
+        ScrollViewOutcome, ScrollViewPolicy, ScrollViewState, logical_offset_from_scrollbar,
+        scrollbar_state,
     };
     use crate::scrollbar_layout::ScrollbarAxisLayoutMode;
     use bmux_keyboard::{KeyCode, KeyStroke};
@@ -1597,6 +1680,7 @@ mod tests {
     use bmux_tui::selection::{
         SelectionAutoScrollRequest, SelectionScopeId, SelectionScrollAxis, SelectionScrollDirection,
     };
+    use bmux_tui::source_map::SourceMapped;
 
     struct EventProbe;
 
@@ -3512,5 +3596,101 @@ mod tests {
             view.handle_event(Rect::new(0, 0, 10, 5), &layout, &mut state, &outside),
             ScrollViewOutcome::Ignored
         );
+    }
+
+    #[test]
+    fn source_anchor_keeps_reading_position_across_width_reflow() {
+        use bmux_tui::source_map::OffsetSourceRows;
+        let text = TextBlock::new(
+            (0..40)
+                .map(|index| format!("para {index} 日本語 e\u{301}moji 🎉 words wrap here"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        let view = ScrollView::new();
+        let viewport = LogicalSize::new(30, 5);
+        // A one-row header sits above the text inside the scrolled content.
+        let content_layout = |width: u64| {
+            let text_layout = text.layout(Constraints::for_width(width), &mut LayoutCx::new());
+            let height = text_layout.size.height + 1;
+            let content = LayoutNode::with_children(
+                "content".into(),
+                LogicalSize::new(width, height),
+                vec![ChildLayout::new(0, 1, text_layout.clone())],
+            );
+            (
+                ScrollViewComponent::viewport_layout(
+                    "scroll".into(),
+                    LogicalSize::new(width, viewport.height),
+                    content,
+                ),
+                text_layout,
+            )
+        };
+        let (_, wide_text) = content_layout(30);
+        let mut state = ScrollViewState::new();
+        state.set_vertical_offset(17);
+        let rows = OffsetSourceRows::new(text.source_rows(&wide_text), 1);
+        let anchor = ScrollView::capture_source_anchor(&state, &rows, 2).expect("mapped row");
+        let offset = *anchor.position();
+        assert_eq!(anchor.viewport_row(), 2);
+        assert_eq!(rows.row_for_source(&offset), Some(19 - anchor.row_delta()));
+
+        for width in [7, 12, 30, 3] {
+            let (layout, text_layout) = content_layout(width);
+            let rows = OffsetSourceRows::new(text.source_rows(&text_layout), 1);
+            view.restore_source_anchor(&layout, &mut state, &anchor, &rows);
+            let anchored = state.vertical_offset() + anchor.viewport_row();
+            let range = text
+                .source_range_for_row(&text_layout, anchored - 1)
+                .expect("anchored row is text");
+            assert!(
+                range.contains(&offset),
+                "width {width}: {range:?} lacks {offset}"
+            );
+        }
+        let (layout, text_layout) = content_layout(30);
+        let rows = OffsetSourceRows::new(text.source_rows(&text_layout), 1);
+        view.restore_source_anchor(&layout, &mut state, &anchor, &rows);
+        assert_eq!(state.vertical_offset(), 17);
+    }
+
+    #[test]
+    fn source_anchor_clamps_to_extent_and_ignores_unmapped_positions() {
+        let text = TextBlock::new("a\nb\nc\nd\ne\nf");
+        let layout_text = text.layout(Constraints::for_width(4), &mut LayoutCx::new());
+        let layout = ScrollViewComponent::viewport_layout(
+            "scroll".into(),
+            LogicalSize::new(4, 4),
+            layout_text.clone(),
+        );
+        let rows = text.source_rows(&layout_text);
+        let view = ScrollView::new();
+        let mut state = ScrollViewState::new();
+        state.set_vertical_offset(1);
+        let anchor = ScrollView::capture_source_anchor(&state, &rows, 0).unwrap();
+        state.set_vertical_offset(0);
+        // Row "f" begins at row 5, beyond the largest offset of 2.
+        let last = ScrollSourceAnchor {
+            position: 10usize,
+            row_delta: 0,
+            viewport_row: 0,
+        };
+        view.restore_source_anchor(&layout, &mut state, &last, &rows);
+        assert_eq!(state.vertical_offset(), 2);
+        assert_eq!(
+            view.restore_source_anchor(&layout, &mut state, &anchor, &rows),
+            ScrollViewOutcome::Scrolled { vertical_offset: 1 }
+        );
+        let missing = ScrollSourceAnchor {
+            position: 99usize,
+            row_delta: 0,
+            viewport_row: 0,
+        };
+        assert_eq!(
+            view.restore_source_anchor(&layout, &mut state, &missing, &rows),
+            ScrollViewOutcome::Ignored
+        );
+        assert_eq!(ScrollView::capture_source_anchor(&state, &rows, 20), None);
     }
 }

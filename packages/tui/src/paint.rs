@@ -77,6 +77,29 @@ impl<'frame, 'buffer> PaintCx<'frame, 'buffer> {
         }
     }
 
+    /// The presentation clock of the frame being painted, when its driver
+    /// supplied one.
+    ///
+    /// Every context of one frame returns the same value, so time-derived
+    /// cells, hit regions, and selection fragments agree. Components must read
+    /// this instead of a wall clock.
+    #[must_use]
+    pub const fn clock(&self) -> Option<crate::clock::PresentationClock> {
+        self.frame.clock()
+    }
+
+    /// A fresh layout context carrying this frame's presentation clock.
+    ///
+    /// Use it to resolve layout inside a render callback so layout and paint
+    /// observe the same instant.
+    #[must_use]
+    pub const fn layout_cx(&self) -> LayoutCx {
+        match self.frame.clock() {
+            Some(clock) => LayoutCx::with_clock(clock),
+            None => LayoutCx::new(),
+        }
+    }
+
     /// Effective terminal-space clip.
     #[must_use]
     pub const fn clip(&self) -> Rect {
@@ -241,7 +264,7 @@ impl<'frame, 'buffer> PaintCx<'frame, 'buffer> {
         if area.is_empty() {
             return;
         }
-        let layout = component.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
+        let layout = component.layout(Constraints::tight(area.size()), &mut self.layout_cx());
         self.with_child(
             i32::from(area.x),
             i64::from(area.y),

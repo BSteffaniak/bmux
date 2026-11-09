@@ -338,6 +338,10 @@ impl<P> Presenter<P> for HarnessPresenter<P> {
     fn set_pointer_context(&mut self, context: bmux_tui::terminal::PointerContext) {
         Presenter::<P>::set_pointer_context(&mut self.inner, context);
     }
+
+    fn set_presentation_clock(&mut self, clock: bmux_tui::clock::PresentationClock) {
+        Presenter::<P>::set_presentation_clock(&mut self.inner, clock);
+    }
 }
 
 /// Deterministic, synchronously stepped driver for one [`Program`].
