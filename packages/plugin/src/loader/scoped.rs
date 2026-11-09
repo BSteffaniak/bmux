@@ -487,6 +487,10 @@ impl DefinitionArtifact {
             return Err(failure("component role or required capability unavailable"));
         }
         let scope = InstanceScope::new(runtime);
+        // Attribute every holder of this instance to its plugin in diagnostics.
+        scope
+            .set_label(self.metadata.plugin_id.as_str())
+            .map_err(scope_error)?;
         let context = PluginCreateContext {
             runtime_scope: RuntimeScopeId::from_uuid(runtime.as_uuid()),
             instance: LoadedInstanceId::from_uuid(scope.id().as_uuid()),
@@ -855,8 +859,11 @@ impl LoadedExecution {
     /// Cancellation or activation draining fails.
     pub async fn drain_background_tasks(&self) -> Result<()> {
         self.cancel_background_tasks()?;
+        // Teardown is bounded: stragglers are reported by owner and abandoned
+        // (retained, never unloaded) instead of being awaited forever.
+        let deadline = bmux_plugin_runtime::teardown_deadline();
         self.background
-            .shutdown_retained(None)
+            .shutdown_until(deadline, None)
             .await
             .map_err(failure)?;
         let activation = self
@@ -866,7 +873,10 @@ impl LoadedExecution {
             .activation
             .clone();
         if let Some(activation) = activation {
-            activation.drain().await.map_err(scope_error)?;
+            activation
+                .drain_until(deadline)
+                .await
+                .map_err(scope_error)?;
         }
         Ok(())
     }
@@ -1383,7 +1393,10 @@ impl LoadedExecution {
         for call in calls {
             self.cancel(call)?;
         }
-        activation.drain().await.map_err(scope_error)?;
+        activation
+            .drain_until(bmux_plugin_runtime::teardown_deadline())
+            .await
+            .map_err(scope_error)?;
         let calls = self
             .state
             .lock()
@@ -2742,6 +2755,7 @@ impl LoadedExecution {
             .map_err(|_| failure("execution state poisoned"))?
             .activation
             .clone();
+        let deadline = bmux_plugin_runtime::teardown_deadline();
         if let Some(activation) = activation {
             if let Some(port) = self.registration_port()? {
                 port.withdraw_and_drain()
@@ -2749,7 +2763,10 @@ impl LoadedExecution {
                     .map_err(|e| failure(e.to_string()))?;
             }
             activation.close().map_err(scope_error)?;
-            activation.drain().await.map_err(scope_error)?;
+            activation
+                .drain_until(deadline)
+                .await
+                .map_err(scope_error)?;
             activation.finish().map_err(scope_error)?;
             self.state
                 .lock()
@@ -2758,7 +2775,7 @@ impl LoadedExecution {
         }
         // Drain records settled task ownership even while reporting the retained
         // lifecycle failure. Only explicit resolve_cleanup clears that failure.
-        if let Err(error) = self.scope.drain().await
+        if let Err(error) = self.scope.drain_until(deadline).await
             && !matches!(error, bmux_plugin_runtime::ScopeError::Cleanup(_))
         {
             return Err(scope_error(error));
@@ -2845,7 +2862,10 @@ impl LoadedExecution {
                 .take();
         }
         self.scope.close().map_err(scope_error)?;
-        self.scope.drain().await.map_err(scope_error)?;
+        self.scope
+            .drain_until(bmux_plugin_runtime::teardown_deadline())
+            .await
+            .map_err(scope_error)?;
         if let ExecutionBackend::Dynamic { artifact, handle } = &self.backend {
             let deadline = std::time::Instant::now() + Duration::from_secs(30);
             loop {

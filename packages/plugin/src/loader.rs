@@ -2135,7 +2135,10 @@ impl LoadedPlugin {
             .clone();
         if let Some(tasks) = tasks {
             tasks
-                .shutdown_retained(Some(crate::shutdown_progress()))
+                .shutdown_until(
+                    bmux_plugin_runtime::teardown_deadline(),
+                    Some(crate::shutdown_progress()),
+                )
                 .await
                 .map_err(|details| PluginError::ServiceProtocol { details })?;
             *self
