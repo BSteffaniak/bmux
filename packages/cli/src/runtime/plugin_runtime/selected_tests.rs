@@ -48,7 +48,7 @@ mod tests {
                 Box::pin(async move {
                     assert_ne!(std::thread::current().id(), self.observer);
                     self.polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    tokio::time::sleep(Duration::from_millis(2)).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
                     assert_ne!(std::thread::current().id(), self.observer);
                     self.polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     Ok(())

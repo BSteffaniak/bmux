@@ -13,12 +13,7 @@ use bmux_plugin_sdk::{
     NativeCommandContext, NativeLifecycleContext, PluginCommandOutcome, PluginEvent,
 };
 use bmux_plugin_sdk::{PluginError, TypedServiceRegistrationContext, TypedServiceRegistry};
-use std::{
-    collections::BTreeMap,
-    future::Future,
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{collections::BTreeMap, future::Future, sync::Arc};
 
 pub(in crate::runtime) struct ExecutionOwner<'a> {
     pub runtime_owner: Option<crate::runtime_owner::RuntimeOwner>,
@@ -465,13 +460,12 @@ impl ProductionPlugin {
         id: u64,
         deactivation: bool,
     ) -> bmux_plugin_sdk::Result<NativeOutcome> {
-        // Native v2 permits pending without a wake callback. The bounded timer
-        // drives it without spinning; timeout retains the original operation.
-        let deadline = Instant::now() + Duration::from_secs(30);
+        // Waker-driven: the operation (or its loader-side settlement,
+        // cancellation, deadline, or legacy-guest repoll) wakes this signal.
+        // No observer-imposed deadline: timeouts are explicit caller policy.
+        let signal = bmux_plugin::OperationSignal::new();
         let outcome = loop {
-            let waker =
-                futures_util::future::poll_fn(|cx| std::task::Poll::Ready(cx.waker().clone()))
-                    .await;
+            let waker = signal.waker();
             let owned = Arc::clone(execution);
             // Legacy author hooks and services may synchronously call typed
             // hosts while being polled. Poll them on the bounded callback
@@ -483,13 +477,7 @@ impl ProductionPlugin {
             if let std::task::Poll::Ready(outcome) = polled {
                 break outcome;
             }
-            if Instant::now() >= deadline {
-                execution.cancel(id)?;
-                return Err(failure(
-                    "scoped operation timed out; retained for cleanup, not retried",
-                ));
-            }
-            tokio::time::sleep(Duration::from_millis(2)).await;
+            signal.wait().await?;
         };
         let acknowledgement = if deactivation
             && matches!(outcome, NativeOutcome::Unit)
@@ -518,28 +506,16 @@ impl ProductionPlugin {
         execution: &bmux_plugin::LoadedExecution,
         id: u64,
     ) -> bmux_plugin_sdk::Result<NativeOutcome> {
-        // Synchronous CLI callbacks cannot enter a second async runtime. Use a
-        // real wakeable parker and periodic native polling, never noop-waker spin.
-        struct Wake(std::thread::Thread);
-        impl std::task::Wake for Wake {
-            fn wake(self: Arc<Self>) {
-                self.0.unpark();
-            }
-        }
-        let waker = std::task::Waker::from(Arc::new(Wake(std::thread::current())));
+        // Synchronous CLI callbacks cannot enter a second async runtime. Block
+        // on a waker-driven signal: no periodic polling and no hidden deadline.
+        let signal = bmux_plugin::OperationSignal::new();
+        let waker = signal.waker();
         let mut cx = std::task::Context::from_waker(&waker);
-        let deadline = Instant::now() + Duration::from_secs(30);
         let outcome = loop {
             if let std::task::Poll::Ready(outcome) = execution.poll(id, &mut cx)? {
                 break outcome;
             }
-            if Instant::now() >= deadline {
-                execution.cancel(id)?;
-                return Err(failure(
-                    "synchronous scoped operation timed out; retained for cleanup",
-                ));
-            }
-            std::thread::park_timeout(Duration::from_millis(2));
+            signal.wait_blocking()?;
         };
         let mut ack = Box::pin(execution.acknowledge(id));
         loop {
@@ -547,12 +523,7 @@ impl ProductionPlugin {
                 result.map_err(|error| observation_ack_error(id, &outcome, &error))?;
                 break;
             }
-            if Instant::now() >= deadline {
-                return Err(failure(
-                    "scoped acknowledgement timed out; retained for cleanup",
-                ));
-            }
-            std::thread::park_timeout(Duration::from_millis(2));
+            signal.wait_blocking()?;
         }
         match outcome {
             NativeOutcome::Error { code, message } => {
