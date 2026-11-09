@@ -49,12 +49,22 @@ fn unavailable(message: &str) -> PluginCommandError {
 }
 
 impl Binding {
-    pub fn unbound(scope: PluginCreateContext) -> Self {
-        Self {
-            expected: Some(scope),
-            binder: None,
-            phase: Mutex::default(),
-        }
+    /// Bind the ports the host supplies to this exact activation. The trusted
+    /// host's loader-registered activation binder mints them from the actual
+    /// activation scope; a host that supplies none fails activation explicitly.
+    pub fn from_activation(scope: PluginCreateContext) -> Self {
+        Self::deferred(
+            scope,
+            Arc::new(|context| {
+                let missing = |_| unavailable("activation-bound frontend ports not supplied");
+                let prompt = context.capabilities.take::<PromptPort>().map_err(missing)?;
+                let actions = context
+                    .capabilities
+                    .take::<ActionDispatchPort>()
+                    .map_err(missing)?;
+                Ok((prompt, actions))
+            }),
+        )
     }
 
     pub fn deferred(scope: PluginCreateContext, binder: Binder) -> Self {
@@ -136,6 +146,23 @@ impl Binding {
         };
         drop(phase);
         result
+    }
+
+    /// Enter this instance's selected callback authority for one command.
+    /// Host services the command calls require this live author entry; the
+    /// guard is held for the command's synchronous work.
+    pub fn enter(
+        &self,
+        execution: Option<&bmux_plugin_sdk::PluginCallbackContext>,
+    ) -> Result<bmux_plugin_sdk::PluginCallbackEntryGuard, PluginCommandError> {
+        let instance = self
+            .expected
+            .as_ref()
+            .map(|scope| scope.instance)
+            .ok_or_else(|| unavailable("frontend command has no created instance"))?;
+        execution
+            .ok_or_else(|| unavailable("frontend command callback authority missing"))?
+            .enter_adapter_entry(instance)
     }
 
     pub fn ports(&self) -> Result<Ports, PluginCommandError> {
@@ -332,6 +359,49 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         assert!(plugin.activate(lifecycle(scope, owner.id())).await.is_err());
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn default_definition_binds_host_supplied_activation_capabilities() {
+        let instance = InstanceScope::new(PluginRuntimeScopeId::default());
+        let owner = instance
+            .begin_activation(PluginConcurrencyConfig::Concurrent)
+            .unwrap();
+        owner.mark_active().unwrap();
+        let scope = PluginCreateContext {
+            runtime_scope: owner.runtime_id(),
+            instance: owner.instance_id(),
+            role: ComponentRole::Frontend,
+        };
+        let binding = Binding::from_activation(scope.clone());
+        // No host binder: activation fails explicitly, never a global channel.
+        let context = lifecycle(scope.clone(), owner.id());
+        let error = binding.activate(&context).err().unwrap();
+        assert!(error.message.contains("not supplied"), "{}", error.message);
+        assert!(binding.ports().is_err());
+
+        let binding = Binding::from_activation(scope.clone());
+        let context = lifecycle(scope, owner.id());
+        let (prompt, mut prompts) = PromptPort::channel(owner.clone(), 1).unwrap();
+        let (actions, mut action_inbox) = ActionDispatchPort::channel(owner.clone(), 1).unwrap();
+        context.capabilities.insert(prompt).unwrap();
+        context.capabilities.insert(actions).unwrap();
+        binding.activate(&context).unwrap();
+        assert!(context.capabilities.is_empty());
+        let (prompt, actions) = binding.ports().unwrap();
+        let _response = prompt
+            .submit(bmux_plugin_sdk::PromptRequest::confirm("host"))
+            .unwrap();
+        assert!(prompts.recv().await.is_ok());
+        actions.dispatch("focus_next_pane").unwrap();
+        assert_eq!(action_inbox.recv().await.unwrap().action, "focus_next_pane");
+        drop((prompt, actions));
+        // Deactivation releases the activation's ports.
+        binding.close(&context).unwrap();
+        assert!(binding.ports().is_err());
+        binding.drained(&context).unwrap();
+        assert!(prompts.recv().await.is_err());
+        assert!(action_inbox.recv().await.is_err());
     }
 
     #[test]

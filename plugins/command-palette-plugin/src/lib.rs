@@ -595,7 +595,13 @@ impl bmux_plugin_sdk::definition::PluginInstance for CommandPalettePlugin {
             if context.command != "show" {
                 return Err(PluginCommandError::unknown_command(&context.command)).into();
             }
-            self.show(&context).into()
+            let entry = match self.binding.enter(call.callback_execution.as_ref()) {
+                Ok(entry) => entry,
+                Err(error) => return Err(error).into(),
+            };
+            let outcome: bmux_plugin_sdk::definition::CommandOutcome = self.show(&context).into();
+            drop(entry);
+            outcome
         })
     }
 
@@ -676,7 +682,7 @@ pub fn plugin_definition_with_ports(
 
 bmux_plugin_sdk::define_plugin!(
     factory = |scope| Ok(std::sync::Arc::new(CommandPalettePlugin {
-        binding: activation_ports::Binding::unbound(scope),
+        binding: activation_ports::Binding::from_activation(scope),
         task: std::sync::Mutex::default(),
     })
         as std::sync::Arc<dyn bmux_plugin_sdk::definition::PluginInstance>),
