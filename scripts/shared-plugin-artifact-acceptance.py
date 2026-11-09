@@ -28,7 +28,11 @@ OK = 0
 BUFFER_TOO_SMALL = 3
 # ABI-v2 scoped ports: events=1, host services=2, live cancellation=4,
 # activation registrations=8. These bits describe support, not authorization.
-SCOPED_CAPABILITIES = {2: 15, 3: 31}
+# Keep in sync with SUPPORTED_CAPABILITIES_BY_ABI in package-plugin.py: v3 adds
+# profiles up to callback authority (2047) and host wake v1 (4095, bit 2048),
+# which requires the size-checked `read_wake` descriptor tail.
+SCOPED_CAPABILITIES = {2: frozenset({15}), 3: frozenset({31, 127, 255, 511, 1023, 2047, 4095})}
+CAP_HOST_WAKE_V1 = 2048
 
 MetadataFn = ctypes.CFUNCTYPE(ctypes.c_int32, ctypes.c_void_p, ctypes.c_size_t,
                              ctypes.POINTER(ctypes.c_size_t))
@@ -63,6 +67,10 @@ class Descriptor(ctypes.Structure):
 
 class DescriptorV3(ctypes.Structure):
     _fields_ = [("base", Descriptor), ("declarations", ctypes.c_void_p)]
+
+
+class DescriptorV3HostWake(ctypes.Structure):
+    _fields_ = [("base", DescriptorV3), ("read_wake", ctypes.c_void_p)]
 
 
 def read_metadata(descriptor):
@@ -102,8 +110,12 @@ def inspect_artifact(expected, path, samples):
     descriptor = ctypes.cast(pointer, ctypes.POINTER(Descriptor)).contents
     if not descriptor.metadata:
         raise ValueError("descriptor has no metadata callback")
-    if descriptor.capabilities != expected_capabilities:
+    if descriptor.capabilities not in expected_capabilities:
         raise ValueError("native capabilities do not match the negotiated ABI")
+    if descriptor.capabilities & CAP_HOST_WAKE_V1 and (
+            header.size < ctypes.sizeof(DescriptorV3HostWake)
+            or not ctypes.cast(pointer, ctypes.POINTER(DescriptorV3HostWake)).contents.read_wake):
+        raise ValueError("host wake capability requires the complete read_wake descriptor tail")
     if header.version == 3 and not ctypes.cast(pointer, ctypes.POINTER(DescriptorV3)).contents.declarations:
         raise ValueError("v3 descriptor has no declarations callback")
     if not all(getattr(descriptor, field) for field in
