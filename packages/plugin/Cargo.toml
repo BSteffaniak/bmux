@@ -46,7 +46,13 @@ windows-sys = { workspace = true, features = [
 
 [dev-dependencies]
 serial_test = { workspace = true }
-tokio       = { workspace = true, features = ["sync", "macros", "rt", "time"] }
+tokio = { workspace = true, features = [
+    "sync",
+    "macros",
+    "rt",
+    "test-util",
+    "time",
+] }
 
 
 [features]

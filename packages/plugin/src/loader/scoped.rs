@@ -2,7 +2,9 @@
 //!
 //! Operations remain owned by the instance until explicit acknowledgement. A
 //! dropped observer does not drop an author future or unload executable code.
-//! Native v2 is periodically polled (it does not advertise wake-driven I/O).
+//! Static operations and native guests negotiating `CAP_HOST_WAKE_V1` are driven
+//! by the observer's real waker; only legacy native guests without that bit are
+//! repolled periodically, as their ABI requires.
 #[cfg(all(test, unix))]
 #[path = "scoped/activation_parity_tests.rs"]
 mod activation_parity_tests;
@@ -10,6 +12,9 @@ mod activation_parity_tests;
 mod activation_ports;
 #[path = "scoped/callbacks.rs"]
 pub mod callbacks;
+#[cfg(all(test, unix))]
+#[path = "scoped/host_wake_tests.rs"]
+mod host_wake_tests;
 pub use callbacks::{
     CallbackBinding, CallbackEntryLease, CallbackReentry, LifecycleCallbackDispatch,
     LifecycleCallbackFactory, LoaderCallbackHost, WeakCallbackEntryLease,
@@ -18,6 +23,9 @@ pub use callbacks::{
 mod ports;
 #[path = "scoped/retained.rs"]
 mod retained;
+#[path = "scoped/wake.rs"]
+mod wake;
+pub use wake::OperationSignal;
 
 /// Trusted host factory invoked with this execution's actual activation.
 pub type RetainedHostFactory = dyn Fn(&ActivationScope) -> Result<Arc<dyn bmux_plugin_sdk::abi::retained::RetainedHostDispatch>>
@@ -47,7 +55,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
-    task::{Context, Poll},
+    task::{Context, Poll, Wake, Waker},
     time::Duration,
 };
 
@@ -245,6 +253,9 @@ struct DynamicArtifact {
     _library: Library,
     artifact_copy: Option<tempfile::TempDir>,
     descriptor: &'static NativePluginDescriptor,
+    // Present only when the guest negotiated `CAP_HOST_WAKE_V1`. `None` is an
+    // explicit legacy guest, which the ABI requires hosts to repoll periodically.
+    read_wake: Option<abi::NativeReadWakeV1>,
     // Copied once from this retained library's validated v3 declaration export.
     // Never substitute discovery metadata or another implementation's contracts.
     service_contracts: Vec<bmux_plugin_sdk::definition::DeclaredServiceContract>,
@@ -322,6 +333,9 @@ impl DefinitionArtifact {
         })?
         .ok_or_else(|| failure("metadata discovery cannot be pending"))?;
         let metadata = serde_json::from_slice(&bytes).map_err(|e| failure(e.to_string()))?;
+        let read_wake = unsafe { abi::validate_descriptor_host_wake(pointer) }
+            .map_err(|code| failure(format!("unsupported native host-wake descriptor: {code}")))?
+            .map(|extension| extension.read_wake);
         let service_contracts = if descriptor.version == abi::ABI_VERSION {
             let extension = unsafe { abi::validate_descriptor_v3(pointer) }
                 .map_err(|code| failure(format!("unsupported native v3 descriptor: {code}")))?;
@@ -343,6 +357,7 @@ impl DefinitionArtifact {
                 _library: library,
                 artifact_copy: None,
                 descriptor,
+                read_wake,
                 service_contracts,
             })),
             bundled_executable: None,
@@ -716,6 +731,53 @@ struct Call {
     ports: Option<ports::InvocationTable>,
     native_acknowledged: AtomicBool,
     invocation_retired: Arc<AtomicBool>,
+    /// Latest observer waker: woken on host-side progress (cancellation,
+    /// deadline expiry) that the operation itself may not signal.
+    observer: Mutex<Option<Waker>>,
+    /// Observers that found the operation mid-poll; woken once it is released.
+    contended: Mutex<Vec<Waker>>,
+    deadline_armed: AtomicBool,
+}
+impl Call {
+    fn observe(&self, waker: &Waker) {
+        if let Ok(mut observer) = self.observer.lock()
+            && !observer
+                .as_ref()
+                .is_some_and(|known| known.will_wake(waker))
+        {
+            *observer = Some(waker.clone());
+        }
+    }
+    fn wake_observer(&self) {
+        let observer = self.observer.lock().ok().and_then(|slot| slot.clone());
+        if let Some(observer) = observer {
+            observer.wake();
+        }
+    }
+}
+/// Timer target for a call deadline; never extends the call's lifetime.
+struct DeadlineWake(std::sync::Weak<Call>);
+impl Wake for DeadlineWake {
+    fn wake(self: Arc<Self>) {
+        if let Some(call) = self.0.upgrade() {
+            call.wake_observer();
+        }
+    }
+}
+/// Releases observers that raced a poll, whatever path the poll exits by.
+struct ReleaseContended<'a>(&'a Call);
+impl Drop for ReleaseContended<'_> {
+    fn drop(&mut self) {
+        let contended = self
+            .0
+            .contended
+            .lock()
+            .map(|mut waiting| std::mem::take(&mut *waiting))
+            .unwrap_or_default();
+        for waker in contended {
+            waker.wake();
+        }
+    }
 }
 enum CallState {
     Pending {
@@ -2407,6 +2469,9 @@ impl LoadedExecution {
             ports: table,
             native_acknowledged: AtomicBool::new(false),
             invocation_retired: Arc::new(AtomicBool::new(false)),
+            observer: Mutex::new(None),
+            contended: Mutex::new(Vec::new()),
+            deadline_armed: AtomicBool::new(false),
             deadline: deadline_ms.and_then(|milliseconds| {
                 std::time::Instant::now()
                     .checked_add(std::time::Duration::from_millis(milliseconds))
@@ -2457,12 +2522,51 @@ impl LoadedExecution {
     }
 
     /// Polls one admitted operation, without holding a mutex across author code.
-    /// Native `PENDING`/`BUSY` requires a later periodic poll; it does not promise a wake.
+    ///
+    /// `Pending` always arranges a wake of `context`'s waker: by the operation
+    /// itself (static futures, `CAP_HOST_WAKE_V1` guests), by release of a
+    /// concurrent poll, by cancellation or an explicit call deadline, or (for
+    /// legacy native guests only) by the ABI-mandated periodic repoll.
     ///
     /// # Errors
     /// The operation is unknown, author execution fails, or cleanup cannot complete.
     pub fn poll(&self, id: u64, context: &mut Context<'_>) -> Result<Poll<NativeOutcome>> {
         let call = self.call(id)?;
+        call.observe(context.waker());
+        let polled = self.poll_call(&call, id, context);
+        if matches!(polled, Ok(Poll::Pending)) {
+            self.arm_pending_wakes(&call, context.waker())?;
+        }
+        polled
+    }
+
+    fn arm_pending_wakes(&self, call: &Arc<Call>, waker: &Waker) -> Result<()> {
+        if let Some(deadline) = call.deadline
+            && !call.deadline_armed.swap(true, Ordering::AcqRel)
+        {
+            wake::wake_at(
+                deadline,
+                Waker::from(Arc::new(DeadlineWake(Arc::downgrade(call)))),
+            )?;
+        }
+        if let ExecutionBackend::Dynamic { artifact, .. } = &self.backend
+            && artifact.read_wake.is_none()
+        {
+            // Legacy guest: it polls with a no-op waker and promises no wake.
+            wake::wake_at(
+                std::time::Instant::now() + wake::LEGACY_NATIVE_REPOLL,
+                waker.clone(),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn poll_call(
+        &self,
+        call: &Arc<Call>,
+        id: u64,
+        context: &mut Context<'_>,
+    ) -> Result<Poll<NativeOutcome>> {
         let (future, admission) = {
             let mut state = call
                 .state
@@ -2471,7 +2575,15 @@ impl LoadedExecution {
             match &*state {
                 CallState::Ready(outcome) => return Ok(Poll::Ready(outcome.clone())),
                 CallState::Failed(error) => return Err(failure(error.clone())),
-                CallState::Polling => return Ok(Poll::Pending),
+                CallState::Polling => {
+                    // Registered under the state lock: the poller releases the
+                    // slot under the same lock before waking contenders.
+                    call.contended
+                        .lock()
+                        .map_err(|_| failure("operation contention poisoned"))?
+                        .push(context.waker().clone());
+                    return Ok(Poll::Pending);
+                }
                 CallState::Pending { .. } => {}
             }
             match std::mem::replace(&mut *state, CallState::Polling) {
@@ -2479,6 +2591,7 @@ impl LoadedExecution {
                 _ => return Err(failure("invalid operation state")),
             }
         };
+        let _release = ReleaseContended(call);
         let mut future = future;
         if call
             .deadline
@@ -2496,9 +2609,24 @@ impl LoadedExecution {
             if call.cancellation.is_cancelled() {
                 status(unsafe { (artifact.descriptor.cancel)(*handle, id) })?;
             }
-            let bytes = read_bounded(|out, length| unsafe {
-                (artifact.descriptor.read)(*handle, id, out.as_mut_ptr(), out.len(), length)
-            })?;
+            let bytes = if let Some(read_wake) = artifact.read_wake {
+                // The guest retains its own references; ours ends with this read.
+                let waker = abi::HostWaker::new(context.waker());
+                read_bounded(|out, length| unsafe {
+                    read_wake(
+                        *handle,
+                        id,
+                        out.as_mut_ptr(),
+                        out.len(),
+                        length,
+                        waker.as_ptr(),
+                    )
+                })?
+            } else {
+                read_bounded(|out, length| unsafe {
+                    (artifact.descriptor.read)(*handle, id, out.as_mut_ptr(), out.len(), length)
+                })?
+            };
             bytes.map_or(Ok(Poll::Pending), |bytes| {
                 serde_json::from_slice(&bytes)
                     .map(Poll::Ready)
@@ -2538,7 +2666,7 @@ impl LoadedExecution {
                 return Err(failure(error));
             }
         }
-        self.settle_poll(&call, result, future, admission, context)
+        self.settle_poll(call, result, future, admission, context)
     }
 
     fn settle_poll(
@@ -2657,6 +2785,9 @@ impl LoadedExecution {
         if let ExecutionBackend::Dynamic { artifact, handle } = &self.backend {
             status(unsafe { (artifact.descriptor.cancel)(*handle, id) })?;
         }
+        // Cooperative authors may only check the flag when polled: cancellation
+        // is host-side progress, so re-poll the operation through its observer.
+        call.wake_observer();
         Ok(())
     }
     /// Final outcomes remain retrievable until this explicit acknowledgement.
@@ -2920,14 +3051,17 @@ impl LoadedExecution {
             .await
             .map_err(scope_error)?;
         if let ExecutionBackend::Dynamic { artifact, handle } = &self.backend {
-            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            // Native runtime retirement has no wake protocol (it joins the
+            // guest runtime thread), so it is retried within the host's
+            // explicit teardown budget rather than a hidden fixed cap.
+            let deadline = bmux_plugin_runtime::teardown_deadline();
             loop {
                 let retired = unsafe { (artifact.descriptor.destroy)(*handle) };
                 if retired != abi::BUSY {
                     status(retired)?;
                     break;
                 }
-                if std::time::Instant::now() >= deadline {
+                if tokio::time::Instant::now() >= deadline {
                     return Err(failure(
                         "native runtime retirement pending; artifact retained",
                     ));

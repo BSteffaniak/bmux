@@ -22,7 +22,7 @@ impl PluginInstance for Retainer {
 }
 
 #[derive(Default)]
-struct Recorder(Mutex<Vec<InvocationScope>>);
+pub(super) struct Recorder(Mutex<Vec<InvocationScope>>);
 impl HostServiceDispatch for Recorder {
     fn invoke(&self, scope: &InvocationScope, request: HostServiceRequest<'_>) -> Result<Vec<u8>> {
         self.0.lock().unwrap().push(scope.clone());
@@ -30,7 +30,7 @@ impl HostServiceDispatch for Recorder {
     }
 }
 
-fn metadata() -> PluginMetadata {
+pub(super) fn metadata() -> PluginMetadata {
     PluginMetadata {
         plugin_id: "test.activation-parity".into(),
         version: "1".into(),
@@ -138,7 +138,7 @@ async fn settle(execution: &LoadedExecution, id: u64) -> NativeOutcome {
     .expect("lifecycle operation settles within the fixture budget")
 }
 
-fn lifecycle_context() -> bmux_plugin_sdk::NativeLifecycleContext {
+pub(super) fn lifecycle_context() -> bmux_plugin_sdk::NativeLifecycleContext {
     let service = super::super::tests::native_test_service_context(vec![]);
     bmux_plugin_sdk::NativeLifecycleContext {
         plugin_id: "test.activation-parity".into(),
@@ -176,7 +176,7 @@ fn call(services: &PluginHostServices) -> Result<Vec<u8>> {
     .unwrap()
 }
 
-fn selected_execution(
+pub(super) fn selected_execution(
     artifact: &DefinitionArtifact,
     recorder: &Arc<Recorder>,
 ) -> Arc<LoadedExecution> {
