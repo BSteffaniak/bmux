@@ -76,6 +76,7 @@ use std::time::{Duration, Instant};
 use bmux_keyboard::KeyStroke;
 use bmux_terminal_protocol::pointer_output::PointerShapeCapability;
 use bmux_tui::buffer::{Buffer, Cell};
+use bmux_tui::damage::Damage;
 use bmux_tui::event::{Event, MouseEvent};
 use bmux_tui::focus::{FocusId, FocusTrap};
 use bmux_tui::frame::Cursor;
@@ -85,7 +86,7 @@ use bmux_tui::paint::PaintCx;
 use bmux_tui::selection::SelectionScene;
 use bmux_tui::semantic::SemanticScene;
 use bmux_tui::style::Style;
-use bmux_tui::terminal::Terminal;
+use bmux_tui::terminal::{AppliedScroll, ScrollRegionAcceleration, Terminal};
 
 pub use crate::clock::ManualClock;
 use crate::clock::RuntimeClock;
@@ -111,6 +112,7 @@ pub const DEFAULT_SETTLE_LIMIT: usize = 10_000;
 
 type RenderFn<P> = Box<dyn FnMut(&mut P, &mut PaintCx<'_, '_>)>;
 type CommitFn<P> = Box<dyn FnMut(&mut P, &HitMap, &FocusTrap)>;
+type DamageFn<P> = Box<dyn FnMut(&mut P) -> Damage>;
 
 /// When the harness presents frames without an explicit request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -198,6 +200,8 @@ pub struct HarnessBuilder<P: Program> {
     mode: PresentMode,
     settle_limit: usize,
     commit: Option<CommitFn<P>>,
+    damage: Option<DamageFn<P>>,
+    scroll_acceleration: ScrollRegionAcceleration,
 }
 
 impl<P: Program> HarnessBuilder<P> {
@@ -233,6 +237,28 @@ impl<P: Program> HarnessBuilder<P> {
     #[must_use]
     pub fn on_commit(mut self, commit: impl FnMut(&mut P, &HitMap, &FocusTrap) + 'static) -> Self {
         self.commit = Some(Box::new(commit));
+        self
+    }
+
+    /// Declare the damage of each presentation, as a production presenter
+    /// that draws with [`bmux_tui::terminal::Terminal::draw_damage`] does.
+    ///
+    /// The callback runs once per presentation, before painting, and its
+    /// result is what [`FrameView::declared_damage`] reports. Without it every
+    /// presentation is a full repaint. Regional and scroll damage then retain
+    /// committed cells and metadata outside their regions, so tests observe
+    /// exactly what a regional production frame would leave on screen.
+    #[must_use]
+    pub fn damage(mut self, damage: impl FnMut(&mut P) -> Damage + 'static) -> Self {
+        self.damage = Some(Box::new(damage));
+        self
+    }
+
+    /// Select whether scroll damage may use terminal scroll regions in the
+    /// in-memory terminal (default [`ScrollRegionAcceleration::Off`]).
+    #[must_use]
+    pub const fn scroll_region_acceleration(mut self, mode: ScrollRegionAcceleration) -> Self {
+        self.scroll_acceleration = mode;
         self
     }
 
@@ -277,12 +303,15 @@ impl<P: Program> HarnessBuilder<P> {
         );
         // Environment-detected pointer support would make output bytes host-dependent.
         terminal.set_pointer_capability(PointerShapeCapability::Unsupported);
+        terminal.set_scroll_region_acceleration(self.scroll_acceleration);
         let commit: CommitFn<P> = self
             .commit
             .unwrap_or_else(|| Box::new(|_: &mut P, _: &HitMap, _: &FocusTrap| {}));
         let render: RenderFn<P> = Box::new(render);
         let presenter = HarnessPresenter {
             inner: TerminalPresenter::with_commit(terminal, render, commit),
+            damage: self.damage,
+            declared: Vec::new(),
             reports: Vec::new(),
             resets: Vec::new(),
         };
@@ -308,6 +337,9 @@ impl<P: Program> HarnessBuilder<P> {
 /// In-memory presenter recording each committed report.
 struct HarnessPresenter<P> {
     inner: TerminalPresenter<Vec<u8>, RenderFn<P>, CommitFn<P>>,
+    damage: Option<DamageFn<P>>,
+    /// Damage declared for each committed report, index-aligned with `reports`.
+    declared: Vec<Damage>,
     reports: Vec<PresentReport>,
     resets: Vec<ResetReason>,
 }
@@ -326,8 +358,20 @@ impl<P> Presenter<P> for HarnessPresenter<P> {
 
     fn present(&mut self, program: &mut P) -> Result<PresentReport, Self::Error> {
         self.inner.terminal_mut().writer_mut().clear();
-        let report = Presenter::<P>::present(&mut self.inner, program)?;
+        let (report, declared) = if let Some(damage) = &mut self.damage {
+            let declared = damage(program);
+            (
+                self.inner.present_damage(program, declared.clone())?,
+                declared,
+            )
+        } else {
+            (
+                Presenter::<P>::present(&mut self.inner, program)?,
+                Damage::Full,
+            )
+        };
         self.reports.push(report);
+        self.declared.push(declared);
         Ok(report)
     }
 
@@ -373,6 +417,8 @@ impl<P: Program> ProgramHarness<P> {
             mode: PresentMode::Manual,
             settle_limit: DEFAULT_SETTLE_LIMIT,
             commit: None,
+            damage: None,
+            scroll_acceleration: ScrollRegionAcceleration::Off,
         }
     }
 
@@ -761,9 +807,11 @@ impl<P: Program> ProgramHarness<P> {
     /// Return a view of the last committed frame.
     #[must_use]
     pub fn frame(&self) -> FrameView<'_> {
+        let presenter = self.presenter();
         FrameView {
-            terminal: self.presenter().inner.terminal(),
+            terminal: presenter.inner.terminal(),
             report: self.last_report(),
+            declared: presenter.declared.last(),
         }
     }
 
@@ -781,6 +829,7 @@ impl<P: Program> ProgramHarness<P> {
 pub struct FrameView<'a> {
     terminal: &'a Terminal<Vec<u8>>,
     report: Option<PresentReport>,
+    declared: Option<&'a Damage>,
 }
 
 impl<'a> FrameView<'a> {
@@ -795,6 +844,37 @@ impl<'a> FrameView<'a> {
     #[must_use]
     pub const fn report(&self) -> Option<PresentReport> {
         self.report
+    }
+
+    /// Return the damage regions the committed frame was prepared with.
+    ///
+    /// This is the effective damage after preparation: what the program
+    /// declared (see [`HarnessBuilder::damage`]), promoted to
+    /// [`Damage::Full`] where presentation requires it (the first frame,
+    /// after a reset or resize, or with modal scopes), with regions expanded
+    /// to whole wide-cell spans and to painted overlay coverage. Unlike
+    /// [`PresentReport::full_repaint`], it distinguishes regional and scroll
+    /// damage from a full repaint even when most cells changed. `None` before
+    /// the first presentation; [`Damage::None`] when the last presentation had
+    /// nothing to draw.
+    #[must_use]
+    pub fn damage(&self) -> Option<&'a Damage> {
+        self.report.map(|_| self.terminal.committed_damage())
+    }
+
+    /// Return the damage the program declared for the committed frame, before
+    /// any promotion; [`Damage::Full`] when no [`HarnessBuilder::damage`]
+    /// callback is installed. `None` before the first presentation.
+    #[must_use]
+    pub const fn declared_damage(&self) -> Option<&'a Damage> {
+        self.declared
+    }
+
+    /// Return the terminal scroll the committed frame's output used, if
+    /// scroll acceleration was enabled and safe for its scroll damage.
+    #[must_use]
+    pub const fn applied_scroll(&self) -> Option<AppliedScroll> {
+        self.terminal.applied_scroll()
     }
 
     /// Return the committed cell buffer, absent before the first presentation

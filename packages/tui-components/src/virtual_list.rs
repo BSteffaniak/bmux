@@ -13,8 +13,10 @@
 
 mod action;
 mod component;
+mod focus;
 mod motion;
 mod position;
+mod selection;
 mod source;
 
 use std::borrow::Cow;
@@ -44,11 +46,15 @@ pub use bmux_tui::measured_list::{
     MeasuredListError, MeasuredListIndex, MeasuredListItem, VisibleItemRange,
 };
 pub use component::{VirtualListChrome, VirtualListComponent};
+pub use focus::{FocusTraversal, ItemFocusTarget, reveal_for_focus, reveal_top_offset};
 pub use motion::{MotionSample, ScrollMotion, ScrollTarget};
 pub use position::{
     AnchorOffset, AnchorPolicy, Edge, ListAnchor, ListGeometry, ListPosition, NoSourceMap,
     Overscroll, ResolvedPosition, SourceMap, anchor_at_offset, anchor_for, position_at_offset,
     resolve_position, target_top_offset,
+};
+pub use selection::{
+    ItemOrder, KeyOrder, LogicalSelection, LogicalSelectionEndpoint, LogicalSelectionFragment,
 };
 pub use source::VirtualItemSource;
 

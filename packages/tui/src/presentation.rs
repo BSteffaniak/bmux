@@ -997,7 +997,8 @@ impl PresentationState {
         frame: &Frame<'_>,
         damage: &Damage,
     ) -> Vec<SurfaceMetadataAvailability> {
-        let mut declarations = if let Damage::Regions(regions) = damage {
+        let mut declarations = if damage.is_regional() {
+            let regions = damage.retained_regions();
             let mut retained = retained.to_vec();
             for region in regions {
                 retained = retained
@@ -1022,9 +1023,10 @@ impl PresentationState {
 
     /// Replace staged hit geometry only in the requested damage regions.
     fn reconcile_staged_hits(mut hits: HitMap, staged: &HitMap, damage: &Damage) -> HitMap {
-        let Damage::Regions(regions) = damage else {
+        if !damage.is_regional() {
             return staged.clone();
-        };
+        }
+        let regions = damage.retained_regions();
         for region in regions {
             hits.retain_outside(*region);
         }
@@ -1046,21 +1048,16 @@ impl PresentationState {
         damage: Damage,
         regions: &[Rect],
     ) -> Damage {
-        let retained_regions =
-            if let (Some(previous), Damage::Regions(_)) = (&self.previous, &damage) {
-                buffer.expand_regions_to_cell_spans(previous, regions)
-            } else {
-                regions.to_vec()
-            };
-        if let (Some(previous), Damage::Regions(_)) = (&self.previous, &damage) {
+        let previous = self.previous.as_ref().filter(|_| damage.is_regional());
+        let retained_regions = previous.map_or_else(
+            || regions.to_vec(),
+            |previous| buffer.expand_regions_to_cell_spans(previous, regions),
+        );
+        if let Some(previous) = previous {
             buffer.restore_outside(previous, &retained_regions);
         }
         buffer.debug_assert_valid_wide_spans();
-        if matches!(damage, Damage::Regions(_)) {
-            Damage::Regions(retained_regions)
-        } else {
-            damage
-        }
+        damage.with_regions(retained_regions)
     }
 
     // Keep the ordered staged transaction together; timers add boundary syntax,
@@ -1129,7 +1126,7 @@ impl PresentationState {
                         damage = Damage::Full;
                         requested_regions.clear();
                     }
-                    let regional = matches!(damage, Damage::Regions(_));
+                    let regional = damage.is_regional();
                     let mut retained_cursor = self.cursor;
                     // Full replacement never reads committed metadata. In particular,
                     // repaired observer snapshots retain cells, not the old interaction tree.
@@ -1169,7 +1166,8 @@ impl PresentationState {
                                 &mut retained_availability,
                             );
                         }
-                        damage = Damage::Regions(requested_regions.clone());
+                        damage = std::mem::replace(&mut damage, Damage::None)
+                            .with_regions(requested_regions.clone());
                     }
                     let metadata_availability = Self::reconcile_metadata_availability(
                         &retained_availability,
@@ -1177,29 +1175,28 @@ impl PresentationState {
                         &damage,
                     );
                     let hits = Self::reconcile_staged_hits(retained_hits, frame.hits(), &damage);
-                    let mut images = if matches!(damage, Damage::Regions(_)) {
+                    let mut images = if damage.is_regional() {
                         self.image_scene.contributions_outside(&requested_regions)
                     } else {
                         Vec::new()
                     };
                     let retained_image_count = images.len();
                     images.extend_from_slice(frame.images());
-                    let cursor = frame.cursor().or_else(|| {
-                        matches!(damage, Damage::Regions(_))
-                            .then_some(retained_cursor)
-                            .flatten()
-                    });
+                    let cursor = frame
+                        .cursor()
+                        .or_else(|| damage.is_regional().then_some(retained_cursor).flatten());
                     let focus_scope = frame.focus_scope().cloned().or_else(|| {
-                        matches!(damage, Damage::Regions(_))
+                        damage
+                            .is_regional()
                             .then(|| self.focus_scope.clone())
                             .flatten()
                     });
-                    let selection = if matches!(damage, Damage::Regions(_)) {
+                    let selection = if damage.is_regional() {
                         retained_selection.merge_regions(frame.selection(), &requested_regions)
                     } else {
                         frame.selection().clone()
                     };
-                    let semantics = if matches!(damage, Damage::Regions(_)) {
+                    let semantics = if damage.is_regional() {
                         retained_semantics.merge_regions(frame.semantics(), &requested_regions)
                     } else {
                         frame.semantics().clone()
@@ -1239,7 +1236,7 @@ impl PresentationState {
             PresentationPhase::ImageSceneClone.measure(|| self.image_scene.clone(), |_| true);
         let image_delta = PresentationPhase::ImageReconcile.measure(
             || {
-                if matches!(damage, Damage::Regions(_)) {
+                if damage.is_regional() {
                     image_scene.reconcile_occluded_regions(
                         &images,
                         &occlusions,

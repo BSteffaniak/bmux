@@ -169,7 +169,17 @@ impl<'frame, 'buffer> PaintCx<'frame, 'buffer> {
     /// rectangles produced from committed selection geometry, so they are
     /// intersected with the effective clip rather than translated.
     pub fn paint_selection(&mut self, snapshot: &SelectionSnapshot, style: Style) {
-        for highlight in &snapshot.visible_highlights {
+        self.paint_selection_highlights(&snapshot.visible_highlights, style);
+    }
+
+    /// Paint terminal-space selection highlight rectangles over content
+    /// already rendered, clipped to the effective clip.
+    ///
+    /// Use it for highlights derived from a selection scene by other means
+    /// than a [`SelectionSnapshot`], for example logical selections spanning
+    /// virtualized items whose endpoints are not in the scene.
+    pub fn paint_selection_highlights(&mut self, highlights: &[Rect], style: Style) {
+        for highlight in highlights {
             let clipped = highlight.intersection(self.clip);
             if !clipped.is_empty() {
                 self.frame

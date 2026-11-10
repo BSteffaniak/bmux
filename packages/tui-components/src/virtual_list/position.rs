@@ -439,7 +439,19 @@ pub fn target_top_offset<K: Clone + Ord>(
     let position = index.index_of(key)?;
     let start = index.item_offset(position)?;
     let height = index.item(position)?.height;
-    let viewport = geometry.viewport_height;
+    let target = place_rows(start, height, policy, current_top, geometry.viewport_height);
+    Some(target.min(geometry.max_overscroll_top(index.total_height())))
+}
+
+/// Unclamped top offset placing the `height` rows starting at collection row
+/// `start` according to `policy` (see [`AnchorPolicy`]).
+pub(super) fn place_rows(
+    start: u64,
+    height: u64,
+    policy: AnchorPolicy,
+    current_top: u64,
+    viewport: u64,
+) -> u64 {
     let bottom_at_bottom = || {
         if height > viewport {
             start
@@ -447,7 +459,7 @@ pub fn target_top_offset<K: Clone + Ord>(
             start.saturating_add(height).saturating_sub(viewport)
         }
     };
-    let target = match policy {
+    match policy {
         AnchorPolicy::ItemTopAtTop => start,
         AnchorPolicy::ItemBottomAtBottom => bottom_at_bottom(),
         AnchorPolicy::Center => {
@@ -471,8 +483,7 @@ pub fn target_top_offset<K: Clone + Ord>(
                 }
             }
         }
-    };
-    Some(target.min(geometry.max_overscroll_top(index.total_height())))
+    }
 }
 
 /// Keyed position that places `key` according to `policy`:

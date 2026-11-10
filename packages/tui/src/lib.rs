@@ -23,6 +23,7 @@ pub mod event;
 pub mod focus;
 pub mod frame;
 pub mod geometry;
+pub mod gesture;
 pub mod gradient;
 pub mod grid_fragment;
 pub mod hit;
@@ -86,6 +87,7 @@ pub mod prelude {
     pub use crate::focus::{FocusId, FocusKeyOutcome, FocusTrap};
     pub use crate::frame::{Cursor, Frame};
     pub use crate::geometry::{Insets, Point, Rect, Size};
+    pub use crate::gesture::{ClickSlop, GestureRoute, PointerGesture, PointerGestureRecognizer};
     pub use crate::hit::{Hit, HitId, HitMap, HitRegion, HitRole};
     pub use crate::image::{
         ImageContribution, ImageKey, ImageLifecycle, ImagePayload, ImagePixelFormat, ImagePlacement,
@@ -108,11 +110,11 @@ pub mod prelude {
         SelectionFragmentId, SelectionGesturePhase, SelectionOutcome, SelectionScene,
         SelectionSceneError, SelectionScope, SelectionScopeId, SelectionScrollAxis,
         SelectionScrollDirection, SelectionSlice, SelectionSnapshot, paint_selection_highlights,
-        plain_text_fragments, plain_text_fragments_with_tabs,
+        painted_text_fragments, plain_text_fragments, plain_text_fragments_with_tabs,
     };
     pub use crate::source_map::{OffsetSourceRows, SourceMapped};
     pub use crate::style::{Color, Easing, Modifier, Style};
-    pub use crate::terminal::{DrawStats, Terminal};
+    pub use crate::terminal::{AppliedScroll, DrawStats, ScrollRegionAcceleration, Terminal};
     pub use crate::text::{
         Line, Span, Text, TextWrap, TextWrapGeometry, TrailingAlign, TrailingPlacement, wrap_text,
     };

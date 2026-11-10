@@ -1117,7 +1117,7 @@ where
 fn damage_counts(damage: Damage, viewport: Rect) -> (usize, usize) {
     match damage {
         Damage::None => (0, 0),
-        Damage::Regions(regions) => (
+        Damage::Regions(regions) | Damage::Scroll { regions, .. } => (
             regions.len(),
             regions
                 .iter()

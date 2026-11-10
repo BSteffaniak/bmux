@@ -14,7 +14,7 @@ use bmux_tui::geometry::Rect;
 use bmux_tui::hit::{HitRegion, HitRole};
 use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::pointer::PointerIntent;
-use bmux_tui::selection::{SelectionAutoScrollRequest, SelectionScrollAxis};
+use bmux_tui::selection::SelectionAutoScrollRequest;
 use bmux_tui::semantic::SemanticRegion;
 
 use super::{
@@ -24,10 +24,7 @@ use super::{
     find_item_layout, item_layout_id,
 };
 use crate::common::{local_area_of, local_control_event};
-use crate::scroll_view::{
-    logical_offset_from_scrollbar, route_vertical_track, scrollbar_state,
-    selection_auto_scroll_delta,
-};
+use crate::scroll_view::{logical_offset_from_scrollbar, route_vertical_track, scrollbar_state};
 use crate::scrollbar::{
     Scrollbar, ScrollbarOutcome, ScrollbarPolicy, ScrollbarState, ScrollbarStyles,
 };
@@ -179,12 +176,14 @@ impl<K: Clone + Ord, S: Clone> VirtualListState<K, S> {
     /// Returns whether the request was queued or moved the list; horizontal
     /// requests and disabled lists return `false`.
     pub fn handle_selection_auto_scroll(&mut self, request: &SelectionAutoScrollRequest) -> bool {
-        if self.scroll.interaction.disabled || request.axis != SelectionScrollAxis::Vertical {
+        if self.scroll.interaction.disabled {
             return false;
         }
-        let rows = selection_auto_scroll_delta(request);
+        let Some(action) = VirtualListAction::selection_auto_scroll(request) else {
+            return false;
+        };
         matches!(
-            self.dispatch_action(VirtualListAction::SelectionAutoScroll(rows), &NoSourceMap),
+            self.dispatch_action(action, &NoSourceMap),
             ActionDispatch::Queued | ActionDispatch::Applied
         )
     }

@@ -73,6 +73,12 @@ Selection scopes and fragments are generic renderer metadata. Runtime code must
 not interpret source
 identities, ranges, selection meaning, or autoscroll requests.
 
+Pointer gestures that may either activate a control or select text go through
+`bmux_tui::gesture::PointerGestureRecognizer::route_selection`, which reports a
+click when press and release stay within a `ClickSlop` over the same
+interactive region, even while the selection is armed, and starts selection
+only once the pointer travels beyond the slop.
+
 ## Automatic interaction contract
 
 Interactive geometry is frame metadata, not application state. A standard
@@ -348,7 +354,8 @@ and commit paths; it substitutes only time and task execution:
 - **Time.** A `ManualClock` replaces the system clock for timer deadlines and frame cadence. It captures one anchor instant and afterwards moves only on `advance`. Commands and subscriptions run on a harness-owned current-thread Tokio runtime with a paused clock that advances together with the manual clock, so `tokio::time::sleep` in a command completes exactly when the test advances past it.
 - **Delivery.** `push_terminal`, `push_key`, `push_mouse`, `push_resize`, `push_paste`, `push_message`, and `push_timer` script events in order. `step`, `deliver(n)`, and `settle` deliver scripted events first, then runtime-owned sources through the production fair rotation: due timers, command completions, subscription messages, and messages or terminal events admitted through `handle()`. `settle` is bounded and reports programs that never go idle.
 - **Presentation.** Delivery never presents in the default `PresentMode::Manual`, so any number of events and effect results can be applied between frames. `present` commits one frame when a redraw is pending (ignoring cadence), `force_present` requests one first, and `present_if_due` applies the configured cadence on the manual clock. `PresentMode::AfterEachEvent` and `PresentMode::Cadence` present automatically. Each presentation draws into an in-memory `Terminal`, runs the optional `on_commit` hit-map/focus observer, then `Program::presentation_committed`, and applies its update, exactly as the running runtime does.
-- **Inspection.** `frame()` exposes the committed buffer, row text, cell-accurate `find`, style runs, cursor, hit map, selection scene, semantics, focus, and the `PresentReport`; `FrameView::text` is suitable for snapshot assertions. The harness also exposes pending timers and deadlines, keyed command state, pending redraw/reset latches, reset history, all reports, the last output bytes, and runtime statistics.
+- **Damage.** Without configuration every presentation is a full repaint. `HarnessBuilder::damage` installs a callback that declares each presentation's `Damage`, which the harness draws with `Terminal::draw_damage`, so regional and scroll damage retain committed cells and metadata exactly as a regional production frame does. `HarnessBuilder::scroll_region_acceleration` selects `ScrollRegionAcceleration` for the in-memory terminal.
+- **Inspection.** `frame()` exposes the committed buffer, row text, cell-accurate `find`, style runs, cursor, hit map, selection scene, semantics, focus, and the `PresentReport`; `FrameView::text` is suitable for snapshot assertions. `FrameView::damage` returns the effective damage regions of the committed frame (the declared damage after promotion, for example to `Full` on the first frame or after a reset), `FrameView::declared_damage` what the program declared, and `FrameView::applied_scroll` any terminal scroll the output used. Unlike `PresentReport::full_repaint`, these distinguish regional and scroll damage from a full repaint. The harness also exposes pending timers and deadlines, keyed command state, pending redraw/reset latches, reset history, all reports, the last output bytes, and runtime statistics.
 
 Programs that retain a `RuntimeHandle` receive the harness handle through
 `HarnessBuilder::build_with`. The harness is a test surface: it is excluded from

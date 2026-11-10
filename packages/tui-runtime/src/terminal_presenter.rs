@@ -196,6 +196,41 @@ where
     }
 }
 
+impl<W: Write, R, C> TerminalPresenter<W, R, C> {
+    /// Present one frame prepared with caller-declared `damage` instead of
+    /// the full repaint [`Presenter::present`] uses, then publish the
+    /// committed scene to the commit observer exactly as `present` does.
+    ///
+    /// Regional damage retains committed cells and metadata outside its
+    /// regions (see [`bmux_tui::terminal::Terminal::draw_damage`]); the
+    /// effective damage is available afterwards from
+    /// [`bmux_tui::terminal::Terminal::committed_damage`].
+    ///
+    /// # Errors
+    ///
+    /// Returns terminal output errors without committing the frame.
+    pub fn present_damage<P>(
+        &mut self,
+        program: &mut P,
+        damage: bmux_tui::damage::Damage,
+    ) -> io::Result<PresentReport>
+    where
+        R: FnMut(&mut P, &mut PaintCx<'_, '_>),
+        C: FnMut(&mut P, &HitMap, &FocusTrap),
+    {
+        let stats = self
+            .terminal
+            .draw_damage(damage, |cx| (self.render)(program, cx))?;
+        let interactions = self.terminal.hits().clone();
+        let focus = self.terminal.focus().clone();
+        (self.commit)(program, &interactions, &focus);
+        Ok(PresentReport {
+            changed_cells: stats.changed_cells,
+            full_repaint: stats.full_repaint,
+        })
+    }
+}
+
 impl<P, W, R, C> Presenter<P> for TerminalPresenter<W, R, C>
 where
     W: Write,

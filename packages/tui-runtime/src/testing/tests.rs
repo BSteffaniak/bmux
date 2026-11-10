@@ -3,6 +3,7 @@ use std::convert::Infallible;
 use std::rc::Rc;
 
 use bmux_keyboard::KeyCode;
+use bmux_tui::damage::DamagePolicy;
 use bmux_tui::event::MouseEventKind;
 use bmux_tui::hit::HitRegion;
 use bmux_tui::paint::LocalRect;
@@ -695,4 +696,143 @@ fn presentation_clock_follows_the_manual_clock_once_per_frame() {
             .collect::<Vec<_>>();
         assert_eq!(hits, vec![hit.to_owned()]);
     }
+}
+
+/// A list whose first row scrolls with a message while the last row is a status line.
+struct Scroller {
+    top: u16,
+    status: &'static str,
+    pending: Damage,
+}
+
+const SCROLLER: Size = Size::new(10, 4);
+
+impl Program for Scroller {
+    type Message = (u16, &'static str);
+    type Error = Infallible;
+
+    fn update(
+        &mut self,
+        event: RuntimeEvent<(u16, &'static str)>,
+    ) -> Result<Update<(u16, &'static str)>, Infallible> {
+        if let RuntimeEvent::Message((top, status)) = event {
+            let viewport = Rect::new(0, 0, SCROLLER.width, SCROLLER.height);
+            let body = Rect::new(0, 0, SCROLLER.width, SCROLLER.height - 1);
+            let status_row = Rect::new(0, SCROLLER.height - 1, SCROLLER.width, 1);
+            let rows = i64::from(top) - i64::from(self.top);
+            let changed_status = status != self.status;
+            let damage = if rows == 0 {
+                Damage::regions(
+                    changed_status.then_some(status_row),
+                    viewport,
+                    DamagePolicy::default(),
+                )
+            } else {
+                Damage::scroll(
+                    body,
+                    rows,
+                    changed_status.then_some(status_row),
+                    viewport,
+                    DamagePolicy::default(),
+                )
+            };
+            self.pending = std::mem::replace(&mut self.pending, Damage::None).merge(
+                damage,
+                viewport,
+                DamagePolicy::default(),
+            );
+            self.top = top;
+            self.status = status;
+        }
+        Ok(Update::redraw())
+    }
+}
+
+fn scroller_harness() -> ProgramHarness<Scroller> {
+    ProgramHarness::builder(SCROLLER)
+        .damage(|program: &mut Scroller| std::mem::replace(&mut program.pending, Damage::None))
+        .scroll_region_acceleration(ScrollRegionAcceleration::Auto)
+        .build(
+            Scroller {
+                top: 0,
+                status: "idle",
+                pending: Damage::Full,
+            },
+            |program: &mut Scroller, cx: &mut PaintCx<'_, '_>| {
+                for row in 0..SCROLLER.height - 1 {
+                    cx.write_line(
+                        LocalRect::new(0, i64::from(row), SCROLLER.width, 1),
+                        &Line::raw(format!("row {}", program.top + row)),
+                    );
+                }
+                cx.write_line(
+                    LocalRect::new(0, i64::from(SCROLLER.height - 1), SCROLLER.width, 1),
+                    &Line::raw(program.status),
+                );
+            },
+        )
+}
+
+#[test]
+fn frame_view_reports_declared_and_effective_damage() {
+    let mut harness = scroller_harness();
+    assert_eq!(harness.frame().damage(), None);
+    harness.force_present().unwrap();
+    assert!(harness.frame().damage().is_some_and(Damage::is_full));
+
+    // Two scrolls between frames coalesce into one shift.
+    harness.push_message((1, "idle")).push_message((2, "idle"));
+    harness.deliver(2).unwrap();
+    harness.present().unwrap();
+    let frame = harness.frame();
+    let body = Rect::new(0, 0, SCROLLER.width, SCROLLER.height - 1);
+    assert_eq!(
+        frame.damage().and_then(Damage::scroll_shift),
+        Some((body, 2))
+    );
+    assert_eq!(frame.declared_damage(), frame.damage());
+    assert_eq!(
+        frame.applied_scroll(),
+        Some(AppliedScroll {
+            region: body,
+            rows: 2
+        })
+    );
+    assert!(!frame.report().unwrap().full_repaint);
+    assert_eq!(frame.row_text(0).as_deref(), Some("row 2"));
+    assert_eq!(frame.row_text(3).as_deref(), Some("idle"));
+
+    // A status-only change is regional and leaves the body untouched.
+    harness.push_message((2, "busy"));
+    harness.deliver(1).unwrap();
+    harness.present().unwrap();
+    let frame = harness.frame();
+    assert_eq!(
+        frame.damage().map(Damage::retained_regions),
+        Some(&[Rect::new(0, SCROLLER.height - 1, SCROLLER.width, 1)][..])
+    );
+    assert_eq!(frame.applied_scroll(), None);
+    assert_eq!(frame.row_text(0).as_deref(), Some("row 2"));
+    assert_eq!(frame.row_text(3).as_deref(), Some("busy"));
+}
+
+#[test]
+fn frame_view_damage_is_full_without_a_damage_callback() {
+    let mut harness = ProgramHarness::builder(SCROLLER).build(
+        Scroller {
+            top: 0,
+            status: "idle",
+            pending: Damage::None,
+        },
+        |_: &mut Scroller, cx: &mut PaintCx<'_, '_>| {
+            cx.write_line(LocalRect::new(0, 0, 4, 1), &Line::raw("text"));
+        },
+    );
+    harness.force_present().unwrap();
+    harness.push_message((1, "idle"));
+    harness.deliver(1).unwrap();
+    harness.present().unwrap();
+    let frame = harness.frame();
+    assert_eq!(frame.declared_damage(), Some(&Damage::Full));
+    assert!(frame.damage().is_some_and(Damage::is_full));
 }

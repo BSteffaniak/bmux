@@ -190,7 +190,34 @@ logical selection.
 during scene construction. `PaintCx::paint_selection` is the deterministic
 visual
 overlay stage after ordinary content painting. Copying reads the logical
-selection snapshot rather than scraping the terminal buffer.
+selection snapshot rather than scraping the terminal buffer. Selections that
+must survive their rows leaving the scene use the keyed logical selection of
+[Selection across virtualized items](#selection-across-virtualized-items).
+
+Grapheme fragments for one painted row come from two helpers.
+`selection::painted_text_fragments` advances exactly as `Buffer::write_line`
+paints: zero-width graphemes (U+200B, U+FEFF) occupy no cell and their bytes
+join the neighbouring fragment, and a tab or other control-containing grapheme
+occupies the one replacement cell the buffer paints. Use it for text painted
+through `Line`/`TextBlock`, so hit testing, highlights and copied ranges agree
+with the painted cells. `plain_text_fragments` expands tabs to tab stops and
+gives every grapheme at least one cell; use it only for content painted with
+that same tab expansion.
+
+Clicks and drags over selectable content are separated by
+`bmux_tui::gesture::PointerGestureRecognizer`. A left press and release is a
+`PointerGesture::Click { region, .. }` when the pointer never travelled beyond
+a `ClickSlop` (per-axis cells; default one column, no rows) and both ends hit
+the same interactive region (an enabled, visible pointer region with role
+`Action`, `ListItem` or `Custom`); a release within the slop elsewhere is a
+`Tap`, and travel beyond the slop is a drag (`DragStarted`, `Dragged`,
+`DragEnded`) even if the pointer returns. `route_selection` composes this with
+a `SelectionController`: drag events within the slop are withheld, so a
+selection armed by the press stays empty and the release reports both a click
+and `SelectionOutcome::Click`; the first drag beyond the slop reaches the
+controller and selection starts from the press position, without activating
+the region. The recognizer reads committed scenes only and never changes
+focus or hover.
 
 ## Text projection cost
 
@@ -1274,6 +1301,98 @@ loaded. The estimate is not an estimated item height. It is presentation-only
 scrollbar and fraction-jump geometry and must not drive navigation, anchoring,
 or hit testing.
 
+### Focus targets inside items
+
+Keyboard focus inside a list is caller-owned. Each item may expose focus
+targets as row ranges of its own retained layout, so painting, hit regions and
+focus geometry come from the same layout:
+
+```rust,ignore
+pub struct ItemFocusTarget<K, I> { pub key: K, pub id: I, pub rows: Range<u64>, pub parent: Option<I> }
+
+impl<K: Clone + Ord, I: Clone + Ord> FocusTraversal<K, I> {
+    pub fn new(targets: impl IntoIterator<Item = ItemFocusTarget<K, I>>, index: &MeasuredListIndex<K>) -> Self;
+    pub fn next(&self, id: &I) -> Option<&ItemFocusTarget<K, I>>;
+    pub fn previous(&self, id: &I) -> Option<&ItemFocusTarget<K, I>>;
+    pub fn parent(&self, id: &I) -> Option<&ItemFocusTarget<K, I>>;
+    pub fn visible(&self, index: &MeasuredListIndex<K>, rows: Range<u64>) -> impl Iterator<Item = &ItemFocusTarget<K, I>>;
+    pub fn last_starting_at_or_before(&self, index: &MeasuredListIndex<K>, row: u64) -> Option<&ItemFocusTarget<K, I>>;
+    pub fn surviving(&self, previous: &Self, id: &I) -> Option<&ItemFocusTarget<K, I>>;
+}
+
+impl<K: Clone + Ord, S: Clone> VirtualListState<K, S> {
+    pub fn reveal_for_focus<I>(&self, target: &ItemFocusTarget<K, I>, edge: Edge,
+                               viewport_height: u64, sources: &dyn SourceMap<K, S>) -> Option<ListPosition<K, S>>;
+}
+```
+
+- `FocusTraversal` orders the targets of indexed items by item position, then
+  first row, with an enclosing target before the targets it contains. Targets
+  of items that are not indexed (evicted or not yet loaded) are dropped, and
+  repeated identities keep their first occurrence.
+- `surviving` keeps focus stable across index changes: the same target when it
+  survived, otherwise the nearest survivor in the previous order (earlier on a
+  tie). Focus never requires the list to load or keep items.
+- `reveal_for_focus` places the target with
+  `AnchorPolicy::EnsureVisibleFrom(edge)` applied to the target's rows rather
+  than the whole item: focus moving toward the end approaches from
+  `Edge::Bottom` and lands on the bottom rows, focus moving toward the start
+  lands on the top rows, a visible target never moves the list (the current
+  position, including `FollowBottom`, is returned unchanged), and a target
+  taller than the viewport keeps its first row visible. The free functions
+  `reveal_top_offset` and `reveal_for_focus` compute the same placement from an
+  index and a top offset. The list never moves itself to follow focus;
+  callers apply the returned position.
+
+### Selection across virtualized items
+
+`SelectionController` endpoints resolve only against the committed scene,
+which contains visible fragments only. For selections that must outlive
+scrolling, reflow, eviction and reloading, `virtual_list` provides logical
+endpoints keyed by item:
+
+```rust,ignore
+pub struct LogicalSelectionEndpoint<K> { pub key: K, pub source_offset: usize }
+pub trait ItemOrder<K> { fn compare_items(&self, left: &K, right: &K) -> Option<Ordering>; }
+pub struct KeyOrder; // K: Ord in list order; orders evicted keys too
+// MeasuredListIndex<K> implements ItemOrder for indexed keys only.
+
+impl<K: Clone + PartialEq> LogicalSelection<K> {
+    pub fn new(anchor: LogicalSelectionEndpoint<K>, focus: LogicalSelectionEndpoint<K>) -> Self;
+    pub fn range_in(&self, key: &K, len: usize, order: &dyn ItemOrder<K>) -> Option<Range<usize>>;
+    pub fn fragments<'k>(&self, items: impl IntoIterator<Item = (&'k K, usize)>,
+                         order: &dyn ItemOrder<K>) -> Vec<LogicalSelectionFragment<K>>;
+    pub fn highlights(&self, scene: &SelectionScene, key_for: impl FnMut(&SelectionContentId) -> Option<K>,
+                      order: &dyn ItemOrder<K>) -> Vec<Rect>;
+    pub fn spans(&self, key: &K, order: &dyn ItemOrder<K>) -> bool;
+}
+
+impl<K> VirtualListAction<K> {
+    pub fn selection_auto_scroll(request: &SelectionAutoScrollRequest) -> Option<Self>;
+}
+```
+
+- Endpoints are an item key plus a caller-defined source offset, never rows.
+  Endpoint items select from or to the offset, items between them are
+  selected completely, and offsets past an item's length are clamped.
+- Pointer gestures still resolve through the committed scene:
+  `LogicalSelectionEndpoint::from_scene` converts a `SelectionEndpoint` by
+  mapping its content identity to an item key.
+- Each frame derives highlights from the selection again. `highlights` reads
+  the scene being painted (`PaintCx::selection`) and returns the rectangles of
+  covered fragments, painted with `PaintCx::paint_selection_highlights`; a
+  zero-width fragment (an empty line) is covered when its offset is selected.
+  Copy uses `range_in`/`fragments` over caller-owned source, including items
+  that are no longer visible.
+- `spans` reports whether an item lies within the selection, so callers can
+  defer evicting selected items.
+- Edge autoscroll stays caller policy: `VirtualListAction::selection_auto_scroll`
+  turns a vertical `SelectionAutoScrollRequest` into
+  `VirtualListAction::SelectionAutoScroll` (negative toward row 0), which a
+  controlled list queues and an uncontrolled list applies through
+  `dispatch_action`; `VirtualListState::handle_selection_auto_scroll` does both
+  steps.
+
 ### Typical compositions
 
 The mechanics above combine into common list shapes without product-specific
@@ -1287,6 +1406,8 @@ code in BMUX:
 | Animated reveal or jump | `ScrollMotion` / `ScrollTarget` driven by runtime timers |
 | Very long or mutable collections | `MeasuredListIndex` splices, `VirtualItemSource` with `retained_layout` or `splice_measured` |
 | History larger than memory | `resident_window` paging and eviction replayed through `note_window_splice`, with `PositionEstimate` for the scrollbar |
+| Keyboard focus inside items | `FocusTraversal` over `ItemFocusTarget`s, `reveal_for_focus` for placement |
+| Selection that survives scrolling and eviction | `LogicalSelection` with `KeyOrder`, `highlights` per frame, `selection_auto_scroll` routing |
 
 ## Images and damage
 
@@ -1298,6 +1419,39 @@ handled consistently with terminal output.
 Damage is registered through scoped paint contexts. Full and regional damage
 must agree with visual output and all metadata channels. Wide glyphs and image
 placements are clipped atomically at visible boundaries.
+
+### Scroll damage
+
+`Damage::Scroll { region, rows, regions }` declares that the content of
+`region` moved by `rows` since the committed frame (positive toward row 0) and
+that `regions`, which always cover `region`, are repainted. Preparation treats
+it exactly like `Damage::Regions(regions)`: the producer repaints every cell of
+`regions` and committed cells and metadata outside them are retained. The
+shift is only an output hint.
+
+- `Damage::scroll(region, rows, also, viewport, policy)` clips and bounds it.
+  A shift of zero or of at least the region height becomes region damage;
+  more merged regions than `DamagePolicy::max_regions`, or exposed rows plus
+  repainted area outside the region reaching `max_area_percent`, become
+  `Damage::Full`. Rows that only moved do not count toward the area bound.
+- `Damage::merge(other, viewport, policy)` coalesces damage accumulated for
+  one presentation: shifts of the same region add (cancelling shifts become
+  region damage), region damage joins a scroll without losing its shift, and
+  scrolls of different regions degrade to region damage. Any order is safe
+  because scroll damage repaints its whole region.
+- `Terminal::set_scroll_region_acceleration(ScrollRegionAcceleration::Auto)`
+  lets the terminal move the committed rows with a scroll region (DECSTBM plus
+  SU/SD, after resetting attributes) and then write only the cells that differ
+  from a model of the scrolled screen, so the visible result equals the plain
+  cell diff. It applies only when safe: a retained, non-repainted frame
+  without local grid fragments, a region spanning the full presentation width,
+  a shift smaller than the region, and no image placements in the committed
+  or new frame. Otherwise it falls back to the cell diff. `Auto` assumes the
+  presentation area spans the terminal's full width (full-screen presenters);
+  narrower surfaces keep the default `Off`.
+- `Terminal::committed_damage` reports the effective damage of the last draw
+  (after promotion to `Full` for the first frame, resets and resizes) and
+  `Terminal::applied_scroll` the scroll it emitted, if any.
 
 ## Reusable controls
 

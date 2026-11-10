@@ -503,6 +503,37 @@ impl Buffer {
         Some(row)
     }
 
+    /// Model a terminal scroll region: move the full-width rows of `rows`
+    /// (`rows.y..rows.bottom()`) by `shift` rows toward row 0 (negative moves
+    /// them away from row 0) and blank the rows exposed at the other end.
+    ///
+    /// Rows outside the band are unchanged. A shift of at least the band
+    /// height blanks the whole band. Columns of `rows` are ignored: terminal
+    /// scroll regions always move complete rows.
+    pub(crate) fn shift_rows(&mut self, rows: Rect, shift: i64) {
+        let top = rows.y.max(self.area.y);
+        let bottom = rows.bottom().min(self.area.bottom());
+        if top >= bottom || shift == 0 {
+            return;
+        }
+        let width = usize::from(self.area.width);
+        let start = usize::from(top - self.area.y) * width;
+        let end = usize::from(bottom - self.area.y) * width;
+        let band = &mut self.cells[start..end];
+        let moved = usize::try_from(shift.unsigned_abs())
+            .unwrap_or(usize::MAX)
+            .saturating_mul(width)
+            .min(band.len());
+        if shift > 0 {
+            band.rotate_left(moved);
+            let blank = band.len() - moved;
+            band[blank..].fill(Cell::default());
+        } else {
+            band.rotate_right(moved);
+            band[..moved].fill(Cell::default());
+        }
+    }
+
     fn index(&self, point: Point) -> Option<usize> {
         if !self.area.contains(point) {
             return None;
@@ -532,7 +563,10 @@ fn safe_symbol(symbol: &str) -> &str {
     }
 }
 
-fn grapheme_width(grapheme: &str) -> u16 {
+/// Cells [`Buffer::write_line`] advances for one grapheme: 0 for zero-width
+/// graphemes (which paint nothing), 1 for narrow and control-containing ones
+/// (painted as their replacement), 2 for wide ones.
+pub(crate) fn grapheme_width(grapheme: &str) -> u16 {
     // One byte is one ASCII character: printable ones are narrow, and
     // controls measure like their replacement character.
     if grapheme.len() == 1 || grapheme.chars().any(char::is_control) {

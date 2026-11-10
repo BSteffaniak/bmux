@@ -1343,6 +1343,88 @@ pub fn plain_text_fragments(
     )
 }
 
+/// Produce visible grapheme fragments occupying exactly the cells that
+/// [`crate::buffer::Buffer::write_line`] paints for one unwrapped source row.
+///
+/// Unlike [`plain_text_fragments`], which expands tabs to tab stops and gives
+/// every grapheme at least one cell, this follows the buffer's own advance:
+/// zero-width graphemes (such as U+200B or U+FEFF) paint no cell, and a tab or
+/// any other control-containing grapheme paints one replacement cell. A
+/// zero-width grapheme's bytes join the preceding fragment (or the following
+/// one at the start of the row), so every source byte stays selectable and
+/// fragments, hits and highlights agree with the painted cells.
+///
+/// `source` is the row's plain text as painted, written as one
+/// grapheme-aligned line (as [`crate::composition::TextBlock`] rows are).
+/// `area.x` and `area.y` identify the first painted cell; fragments are
+/// clipped to `area.width`, and a wide grapheme that does not fit ends the row
+/// (the buffer paints a blank there). An empty or all-zero-width row
+/// contributes one boundary fragment over the available row, like
+/// [`plain_text_fragments`].
+#[must_use]
+pub fn painted_text_fragments(
+    scope_id: impl Into<SelectionScopeId>,
+    content_id: impl Into<SelectionContentId>,
+    area: Rect,
+    order: u64,
+    source: &str,
+    source_offset: usize,
+    revision: u64,
+) -> Vec<SelectionFragment> {
+    use unicode_segmentation::UnicodeSegmentation;
+
+    let scope_id = scope_id.into();
+    let content_id = content_id.into();
+    let mut x = area.x;
+    let mut output: Vec<SelectionFragment> = Vec::new();
+    // Start of leading zero-width bytes not yet attached to a fragment.
+    let mut leading: Option<usize> = None;
+    for (byte_offset, grapheme) in source.grapheme_indices(true) {
+        let start = source_offset.saturating_add(byte_offset);
+        let end = start.saturating_add(grapheme.len());
+        let width = crate::buffer::grapheme_width(grapheme);
+        if width == 0 {
+            match output.last_mut() {
+                Some(previous) => previous.source_range.end = end,
+                None => {
+                    leading.get_or_insert(start);
+                }
+            }
+            continue;
+        }
+        if x >= area.right() || x.saturating_add(width) > area.right() {
+            break;
+        }
+        output.push(
+            SelectionFragment::new(
+                scope_id.clone(),
+                content_id.clone(),
+                Rect::new(x, area.y, width, 1),
+                order,
+                leading.take().unwrap_or(start)..end,
+            )
+            .revision(revision),
+        );
+        x = x.saturating_add(width);
+    }
+    // No painted grapheme: an empty row, or one of zero-width graphemes only.
+    let unpainted = source.is_empty() || leading.is_some();
+    if output.is_empty() && unpainted && !area.is_empty() {
+        let start = leading.unwrap_or(source_offset);
+        output.push(
+            SelectionFragment::new(
+                scope_id,
+                content_id,
+                Rect::new(area.x, area.y, area.width.max(1), 1),
+                order,
+                start..source_offset.saturating_add(source.len()),
+            )
+            .revision(revision),
+        );
+    }
+    output
+}
+
 /// Patch a style over every cell intersecting visible selection highlights.
 pub fn paint_selection_highlights(
     buffer: &mut crate::buffer::Buffer,
@@ -2286,6 +2368,109 @@ mod tests {
                 .find(|scope| scope.id.as_str() == "left")
                 .map(|scope| scope.revision),
             Some(2)
+        );
+    }
+
+    /// Painted cells of `source` written by the buffer, as (x, symbol) for every
+    /// non-continuation cell that is not blank padding.
+    fn painted_cells(source: &str, width: u16) -> Vec<(u16, String)> {
+        let mut buffer = crate::buffer::Buffer::empty(Rect::new(0, 0, width, 1));
+        buffer.write_line(Rect::new(0, 0, width, 1), &crate::text::Line::raw(source));
+        (0..width)
+            .filter_map(|x| {
+                let cell = buffer.get(Point::new(x, 0))?;
+                (!cell.is_wide_continuation()).then(|| (x, cell.symbol.clone()))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn painted_fragments_occupy_the_cells_the_buffer_paints() {
+        for source in [
+            "plain ascii",
+            "\u{FEFF}abc\tdef\u{200B}ghi 界x",
+            "a\u{200B}bc",
+            "e\u{301}t\u{e9} 👍🏽 ok",
+            "界界界",
+            "\r\u{85}x",
+        ] {
+            let width = 40;
+            let fragments =
+                painted_text_fragments("s", "c", Rect::new(0, 0, width, 1), 0, source, 10, 0);
+            let cells = painted_cells(source, width);
+            let mut covered = 0;
+            for fragment in &fragments {
+                let range = fragment.source_range.start - 10..fragment.source_range.end - 10;
+                assert_eq!(range.start, covered, "{source:?}: contiguous source");
+                covered = range.end;
+                let (_, symbol) = cells
+                    .iter()
+                    .find(|(x, _)| *x == fragment.area.x)
+                    .expect("a painted cell at the fragment");
+                let text = &source[range];
+                let painted = text.trim_matches(|c: char| {
+                    unicode_width::UnicodeWidthChar::width(c) == Some(0) && !c.is_control()
+                });
+                if !painted.chars().any(char::is_control) {
+                    assert!(
+                        text.contains(symbol.as_str()),
+                        "{source:?}: fragment {text:?} at {} paints {symbol:?}",
+                        fragment.area.x
+                    );
+                }
+                let wide = buffer_width(painted);
+                assert_eq!(fragment.area.width, wide, "{source:?}: width of {text:?}");
+            }
+            assert_eq!(
+                covered,
+                source.len(),
+                "{source:?}: every byte is selectable"
+            );
+            let painted_right = fragments.last().map_or(0, |f| f.area.right());
+            let text_right = cells
+                .iter()
+                .filter(|(_, symbol)| symbol != " ")
+                .map(|(x, symbol)| x + buffer_width(symbol))
+                .max()
+                .unwrap_or(0);
+            assert!(
+                painted_right >= text_right,
+                "{source:?}: no painted cell is left out"
+            );
+        }
+    }
+
+    fn buffer_width(text: &str) -> u16 {
+        use unicode_segmentation::UnicodeSegmentation;
+        text.graphemes(true)
+            .map(crate::buffer::grapheme_width)
+            .sum()
+    }
+
+    #[test]
+    fn painted_fragments_attach_zero_width_bytes_and_clip_wide_graphemes() {
+        let fragments =
+            painted_text_fragments("s", "c", Rect::new(2, 3, 3, 1), 0, "\u{200B}a\tb界", 0, 0);
+        let spans = fragments
+            .iter()
+            .map(|fragment| {
+                (
+                    fragment.area.x,
+                    fragment.area.width,
+                    fragment.source_range.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        // The leading ZWSP joins 'a'; the tab paints one cell; the wide grapheme does not fit.
+        assert_eq!(spans, vec![(2, 1, 0..4), (3, 1, 4..5), (4, 1, 5..6)]);
+
+        let only_zero_width =
+            painted_text_fragments("s", "c", Rect::new(0, 0, 4, 1), 0, "\u{200B}", 5, 0);
+        assert_eq!(only_zero_width.len(), 1);
+        assert_eq!(only_zero_width[0].source_range, 5..8);
+        assert_eq!(
+            painted_text_fragments("s", "c", Rect::new(0, 0, 4, 1), 0, "", 5, 0)[0].source_range,
+            5..5
         );
     }
 }

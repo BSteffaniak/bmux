@@ -3,7 +3,8 @@
 use std::io::{self, Write};
 
 use crate::ansi::{
-    AnsiFrameDiffStats, write_ansi_frame_diff_with_color_depth, write_ansi_frame_with_color_depth,
+    AnsiFrameDiffStats, write_ansi_frame_diff_with_color_depth,
+    write_ansi_frame_scroll_diff_with_color_depth, write_ansi_frame_with_color_depth,
 };
 use crate::buffer::Buffer;
 use crate::capabilities::TerminalColorDepth;
@@ -58,6 +59,75 @@ impl From<AnsiFrameDiffStats> for DrawStats {
     }
 }
 
+/// Whether presentation may move rows with terminal scroll regions.
+///
+/// Scroll acceleration applies to frames prepared with
+/// [`Damage::Scroll`]. It changes only the bytes written, never the visible
+/// result: the remaining cells are diffed against a model of the scrolled
+/// screen.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum ScrollRegionAcceleration {
+    /// Always repaint changed cells; never emit scroll regions.
+    #[default]
+    Off,
+    /// Emit a scroll region (DECSTBM with SU/SD) for scroll damage when it is
+    /// safe, and fall back to the cell diff otherwise.
+    ///
+    /// It is safe when a committed frame is retained and is not being
+    /// repainted, the frame has no local grid fragments, the scrolled region
+    /// spans the full presentation width, the shift is smaller than the
+    /// region, and neither the committed nor the new frame has image
+    /// placements (graphics protocols do not scroll with text consistently).
+    /// The presentation area must span the terminal's full width, as it does
+    /// for full-screen presenters; surfaces narrower than the terminal must
+    /// keep this `Off`.
+    Auto,
+}
+
+/// A terminal scroll that moved committed rows during the last draw.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AppliedScroll {
+    /// Full-width rows that moved.
+    pub region: Rect,
+    /// Signed rows moved; positive moves content toward row 0.
+    pub rows: i64,
+}
+
+/// Encode `prepared` as a diff against `previous` (moving rows first when
+/// `scroll` is planned), or as a full frame without a retained frame.
+fn encode_frame(
+    encoded: &mut Vec<u8>,
+    previous: Option<&Buffer>,
+    prepared: &PreparedPresentation,
+    depth: TerminalColorDepth,
+    scroll: Option<AppliedScroll>,
+) -> io::Result<(DrawStats, Option<AppliedScroll>)> {
+    let Some(previous) = previous else {
+        write_ansi_frame_with_color_depth(encoded, prepared.buffer(), prepared.cursor(), depth)?;
+        return Ok((DrawStats::full(prepared.buffer().cells().len()), None));
+    };
+    let Some(scroll) = scroll else {
+        let stats = write_ansi_frame_diff_with_color_depth(
+            encoded,
+            previous,
+            prepared.buffer(),
+            prepared.cursor(),
+            depth,
+        )?;
+        return Ok((stats.into(), None));
+    };
+    let stats = write_ansi_frame_scroll_diff_with_color_depth(
+        encoded,
+        previous,
+        prepared.buffer(),
+        prepared.cursor(),
+        depth,
+        scroll.region,
+        scroll.rows,
+    )?;
+    Ok((stats.diff.into(), stats.scrolled.then_some(scroll)))
+}
+
 /// A simple ANSI terminal runtime backed by an arbitrary writer.
 ///
 /// `Terminal` owns the previous frame buffer so repeated draws can use
@@ -74,6 +144,9 @@ pub struct Terminal<W> {
     pointer_position: Option<Point>,
     pointer_context: PointerContext,
     color_depth: TerminalColorDepth,
+    scroll_acceleration: ScrollRegionAcceleration,
+    committed_damage: Damage,
+    applied_scroll: Option<AppliedScroll>,
 }
 
 impl<W: Write> Terminal<W> {
@@ -91,6 +164,9 @@ impl<W: Write> Terminal<W> {
             pointer_position: None,
             pointer_context: PointerContext::default(),
             color_depth: TerminalColorDepth::TrueColor,
+            scroll_acceleration: ScrollRegionAcceleration::Off,
+            committed_damage: Damage::None,
+            applied_scroll: None,
         }
     }
 
@@ -107,6 +183,9 @@ impl<W: Write> Terminal<W> {
             pointer_position: self.pointer_position,
             pointer_context: self.pointer_context.clone(),
             color_depth: self.color_depth,
+            scroll_acceleration: self.scroll_acceleration,
+            committed_damage: self.committed_damage.clone(),
+            applied_scroll: self.applied_scroll,
         }
     }
 
@@ -114,6 +193,8 @@ impl<W: Write> Terminal<W> {
     pub fn acknowledge<V>(&mut self, staged: Terminal<V>) {
         self.state = staged.state;
         self.pointer_output = staged.pointer_output;
+        self.committed_damage = staged.committed_damage;
+        self.applied_scroll = staged.applied_scroll;
     }
 
     /// Write raw control bytes (for example terminal capability queries)
@@ -125,6 +206,35 @@ impl<W: Write> Terminal<W> {
     pub fn write_control(&mut self, bytes: &[u8]) -> io::Result<()> {
         self.writer.write_all(bytes)?;
         self.writer.flush()
+    }
+
+    /// Whether scroll damage may be presented with terminal scroll regions.
+    ///
+    /// Defaults to [`ScrollRegionAcceleration::Off`]. Staging terminals
+    /// created by [`Self::fork`] inherit the current value.
+    #[must_use]
+    pub const fn scroll_region_acceleration(&self) -> ScrollRegionAcceleration {
+        self.scroll_acceleration
+    }
+
+    /// Select whether scroll damage may use terminal scroll regions.
+    pub const fn set_scroll_region_acceleration(&mut self, mode: ScrollRegionAcceleration) {
+        self.scroll_acceleration = mode;
+    }
+
+    /// Effective damage of the most recent successful draw: the damage the
+    /// frame was prepared with after promotion (for example, `Full` for the
+    /// first frame or after a reset), or [`Damage::None`] when that draw had
+    /// nothing to present. `None` before the first draw.
+    #[must_use]
+    pub const fn committed_damage(&self) -> &Damage {
+        &self.committed_damage
+    }
+
+    /// The terminal scroll the most recent successful draw emitted, if any.
+    #[must_use]
+    pub const fn applied_scroll(&self) -> Option<AppliedScroll> {
+        self.applied_scroll
     }
 
     /// Color depth frames are reduced to when encoded.
@@ -427,11 +537,19 @@ impl<W: Write> Terminal<W> {
         before: impl FnOnce(&mut W) -> io::Result<bool>,
         overlay: impl FnOnce(&mut W, &ImageScene, &ImageSceneDelta) -> io::Result<()>,
     ) -> io::Result<DrawStats> {
+        let damage = prepared
+            .as_ref()
+            .map_or(Damage::None, |prepared| prepared.damage().clone());
+        let scroll = prepared
+            .as_ref()
+            .and_then(|prepared| self.scroll_plan(prepared));
         let position = self.pointer_position;
         let context = &self.pointer_context;
         let pointer_output = &mut self.pointer_output;
         let capability = self.pointer_capability;
         if prepared.is_none() {
+            self.committed_damage = Damage::None;
+            self.applied_scroll = None;
             let intent = resolve_pointer_intent(
                 self.state.hits(),
                 position,
@@ -451,7 +569,9 @@ impl<W: Write> Terminal<W> {
         let writer = &mut self.writer;
         let encoded = &mut self.encoded;
         let depth = self.color_depth;
-        self.state
+        let mut applied = None;
+        let result = self
+            .state
             .present_prepared(prepared, |prepared, previous| {
                 prepared.require_uniform_grid().map_err(io::Error::other)?;
                 let intent = resolve_pointer_intent(
@@ -475,24 +595,15 @@ impl<W: Write> Terminal<W> {
                         encoded.clear();
                         let stats = PresentationPhase::AnsiEncode.measure(
                             || -> io::Result<DrawStats> {
-                                Ok(if let Some(previous) = previous.filter(|_| !repaint) {
-                                    write_ansi_frame_diff_with_color_depth(
-                                        encoded,
-                                        previous,
-                                        prepared.buffer(),
-                                        prepared.cursor(),
-                                        depth,
-                                    )?
-                                    .into()
-                                } else {
-                                    write_ansi_frame_with_color_depth(
-                                        encoded,
-                                        prepared.buffer(),
-                                        prepared.cursor(),
-                                        depth,
-                                    )?;
-                                    DrawStats::full(prepared.buffer().cells().len())
-                                })
+                                let (stats, scrolled) = encode_frame(
+                                    encoded,
+                                    previous.filter(|_| !repaint),
+                                    prepared,
+                                    depth,
+                                    scroll,
+                                )?;
+                                applied = scrolled;
+                                Ok(stats)
                             },
                             Result::is_ok,
                         )?;
@@ -519,7 +630,31 @@ impl<W: Write> Terminal<W> {
                     changed_cells: 0,
                     full_repaint: false,
                 })
-            })
+            });
+        if result.is_ok() {
+            self.committed_damage = damage;
+            self.applied_scroll = applied;
+        }
+        result
+    }
+
+    /// The scroll to emit for `prepared` under the selected acceleration, when
+    /// every safety condition holds (see [`ScrollRegionAcceleration::Auto`]).
+    fn scroll_plan(&self, prepared: &PreparedPresentation) -> Option<AppliedScroll> {
+        if self.scroll_acceleration != ScrollRegionAcceleration::Auto {
+            return None;
+        }
+        let (region, rows) = prepared.damage().scroll_shift()?;
+        let area = prepared.buffer().area();
+        let safe = self.state.retained_buffer().is_some()
+            && prepared.grid_fragments().is_empty()
+            && region.x == area.x
+            && region.width == area.width
+            && rows != 0
+            && rows.unsigned_abs() < u64::from(region.height)
+            && prepared.image_scene().placements().len() == 0
+            && self.state.image_scene().placements().len() == 0;
+        safe.then_some(AppliedScroll { region, rows })
     }
 
     /// Return a reference to the backend writer.
