@@ -2131,6 +2131,9 @@ fn assign_projected_contribution_ids(
     }
 }
 
+/// Heading of the projected footnote section that follows the document.
+const FOOTNOTES_HEADING: &str = "Footnotes";
+
 fn projected_contribution_geometry(
     markdown: &str,
     lines: &[Line],
@@ -2139,6 +2142,7 @@ fn projected_contribution_geometry(
     let display = DisplayedMarkdown::new(lines);
     let mut search_from = 0;
     let mut details_from = 0;
+    let mut in_footnotes = false;
     projected
         .iter()
         .filter_map(|item| {
@@ -2174,6 +2178,16 @@ fn projected_contribution_geometry(
                     .replace("**", "")
                     .replace('`', ""),
             };
+            if item.kind == ProjectedContributionKind::FootnoteDefinition && !in_footnotes {
+                // Definitions are projected after the whole document under the section
+                // heading; their visible text (the footnote number) must not match the same
+                // digits in the body.
+                in_footnotes = true;
+                if let Some(section) = display.text.rfind(&format!("{FOOTNOTES_HEADING}{visible}"))
+                {
+                    search_from = search_from.max(section.saturating_add(FOOTNOTES_HEADING.len()));
+                }
+            }
             let (range, rects) = display.find_geometry(&visible, search_from)?;
             search_from = range.end;
             Some(MarkdownContributionGeometry {
@@ -2592,7 +2606,9 @@ fn project_semantic_fallbacks<'a>(
     }
     projected_contributions.sort_by_key(|item| item.range.start);
     if !footnotes.definitions.is_empty() {
-        projected.push_str("\n\n---\n\nFootnotes\n\n");
+        projected.push_str("\n\n---\n\n");
+        projected.push_str(FOOTNOTES_HEADING);
+        projected.push_str("\n\n");
         for definition in footnotes.definitions.values() {
             let start = projected.len();
             let _ = write!(

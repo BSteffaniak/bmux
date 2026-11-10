@@ -826,6 +826,40 @@ fn footnote_contributions_have_bidirectional_navigation_targets() {
 }
 
 #[test]
+fn footnote_definition_geometry_is_in_the_footnote_section_when_the_body_repeats_its_number() {
+    let source = "Claim[^n] here.\n\nfiller 1 and 1.\n\nmore 1\n\n[^n]: NOTEBODY";
+    let options = MarkdownRenderOptions::new(40).with_document_id("doc");
+    let rendered = render_markdown(source, &options);
+    let definition = rendered
+        .contributions
+        .iter()
+        .find(|item| {
+            matches!(
+                item.kind,
+                MarkdownContributionKind::FootnoteDefinition { .. }
+            )
+        })
+        .expect("definition");
+    let rects = &rendered
+        .geometry
+        .iter()
+        .find(|geometry| geometry.contribution_id == definition.id)
+        .expect("definition geometry")
+        .rects;
+    let row = usize::from(rects[0].y);
+    let text: String = rendered.lines[row]
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect::<Vec<&str>>()
+        .concat();
+    assert!(
+        text.contains("NOTEBODY"),
+        "the definition's geometry is on its own row, got row {row}: {text:?}"
+    );
+}
+
+#[test]
 fn snapshots_footnote_block_content() {
     insta::assert_snapshot!(
         "footnotes_blocks_width_50",
