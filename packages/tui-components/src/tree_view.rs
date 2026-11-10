@@ -636,6 +636,14 @@ impl<'a, 'state> TreeViewComponent<'a, 'state> {
         self
     }
 
+    /// Return source-item indices in the component's current visible row order.
+    ///
+    /// Uses the same expansion state and projection as layout, painting, and input.
+    #[must_use]
+    pub fn visible_indices(&self) -> Vec<usize> {
+        self.tree.visible_indices(&self.state.borrow())
+    }
+
     /// Create a tree view with stable identity and caller-owned state.
     #[must_use]
     pub fn new(
@@ -900,6 +908,40 @@ mod tests {
             LocalRect::new(0, 0, area.width, area.height),
             |cx| component.paint(&layout, cx),
         );
+    }
+
+    #[test]
+    fn visible_projection_tracks_nested_expansion_and_painted_rows() {
+        let items = [
+            TreeViewItem::new("root", "Root", 0).expandable(true),
+            TreeViewItem::new("nested", "Nested", 1).expandable(true),
+            TreeViewItem::new("leaf", "葉🙂", 2),
+            TreeViewItem::new("sibling", "Sibling", 0),
+        ];
+        let state = RefCell::new(TreeViewState::new(None));
+        let component = TreeViewComponent::new("tree", &items, &state);
+        assert_eq!(component.visible_indices(), vec![0, 3]);
+        state.borrow_mut().set_expanded("root", true);
+        assert_eq!(component.visible_indices(), vec![0, 1, 3]);
+        state.borrow_mut().set_expanded("nested", true);
+        assert_eq!(component.visible_indices(), vec![0, 1, 2, 3]);
+        let area = Rect::new(0, 0, 30, 4);
+        let mut buffer = Buffer::empty(area);
+        let mut frame = Frame::new(&mut buffer);
+        render_component(&component, area, &mut frame);
+        assert_eq!(
+            frame
+                .semantics()
+                .regions()
+                .iter()
+                .filter(|region| region.role == "tree-item")
+                .count(),
+            component.visible_indices().len()
+        );
+        state.borrow_mut().set_expanded("root", false);
+        assert_eq!(component.visible_indices(), vec![0, 3]);
+        let empty = TreeViewComponent::new("empty", &[], &state);
+        assert_eq!(empty.visible_indices(), Vec::<usize>::new());
     }
 
     #[test]
