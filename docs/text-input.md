@@ -27,3 +27,4 @@ projection. Rendering and prompt submission remain owned by BMUX attach UI.
 - Word movement uses the current `bmux_text_edit` word-boundary policy.
 - Modifier reporting varies by terminal; if a terminal does not send distinct `alt`/`ctrl` arrow events, BMUX cannot apply the matching word movement binding.
 - Direct OS clipboard access is intentionally outside `bmux_text_edit`; future selection/cut/copy/paste support should expose editor primitives for app-owned clipboard integration.
+- Secret entry (API keys, passwords) uses `bmux_tui_components::text_input::TextInputMask` on `TextInputState`: masked or hidden rendering, no selection or copy-out, redacted `Debug`/snapshots, and zeroization on `wipe()` and drop. `TextEditBuffer::wipe()` zeroizes the text and its undo history.

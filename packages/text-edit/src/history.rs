@@ -133,6 +133,15 @@ struct RetainedState {
     desired_visual_col: Option<usize>,
 }
 
+// Retained snapshots are copies of editor text that may be secret (for example
+// a masked password field). Wipe each copy when the history releases it, whether
+// by eviction, merging, redo invalidation, `clear_history` or buffer drop.
+impl Drop for RetainedState {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.state.text);
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Transaction {
     before: RetainedState,
@@ -434,6 +443,20 @@ impl TextEditBuffer {
     pub fn clear_history(&mut self) {
         self.history = EditHistory::with_policy(self.history.policy);
     }
+
+    /// Overwrite the text and every retained undo/redo snapshot with zeros, then
+    /// leave the buffer empty with no selection or history.
+    ///
+    /// Use this for secrets such as passwords. Only the current allocations are
+    /// wiped: bytes left behind by earlier `String` reallocations while the text
+    /// grew are outside the buffer's control. The undo grouping policy is kept.
+    pub fn wipe(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.text);
+        self.cursor = 0;
+        self.selection_anchor = None;
+        self.desired_visual_col = None;
+        self.clear_history();
+    }
 }
 
 /// Text inserted by an edit that only inserted at `before.cursor`.
@@ -458,6 +481,22 @@ fn starts_word(before: &TextEditState, after: &TextEditState) -> bool {
 mod tests {
     use super::*;
     use crate::{SelectionMode, TextMotion};
+
+    #[test]
+    fn wipe_clears_text_selection_and_history() {
+        let mut editor = TextEditBuffer::from_text("hunter");
+        editor.insert_str("2");
+        editor.move_cursor_with_selection(TextMotion::Left, SelectionMode::Extend);
+        assert!(editor.can_undo());
+        editor.wipe();
+        assert_eq!(editor.text(), "");
+        assert_eq!(editor.cursor_byte_index(), 0);
+        assert_eq!(editor.selection(), None);
+        assert!(!editor.can_undo());
+        assert!(!editor.can_redo());
+        editor.insert_str("new");
+        assert_eq!(editor.text(), "new");
+    }
 
     #[test]
     fn atomic_unicode_replacement_restores_selection_direction() {

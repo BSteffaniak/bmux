@@ -75,6 +75,12 @@ boundaries. History is skipped by the optional serde representation and is empty
 after decoding; it is not a durable audit log. Cloning an editor does clone its
 transient history.
 
+Retained undo/redo snapshots are zeroized whenever the history releases them.
+`wipe()` zeroizes the live text and every snapshot and leaves the editor empty;
+use it for secrets. Bytes left by earlier `String` reallocations are not
+reachable
+and cannot be wiped.
+
 Keyboard binding policy belongs to the caller or a generic control adapter, not
 to these storage primitives. See `bmux_tui_components` text-input history
 bindings

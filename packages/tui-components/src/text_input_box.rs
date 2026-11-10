@@ -602,6 +602,48 @@ mod tests {
     }
 
     #[test]
+    fn masked_state_renders_glyphs_through_labeled_field_chrome() {
+        use crate::text_input::TextInputMask;
+
+        let state = RefCell::new(
+            TextInputState::new(TextEditBuffer::from_text("sk-123"))
+                .with_mask(TextInputMask::bullets()),
+        );
+        let component =
+            TextInputBoxComponent::new("api-key", TextInputPolicy::secret_field(), &state)
+                .label("API key")
+                .placeholder("paste key")
+                .policy(TextInputBoxPolicy::labeled_field().focused(true));
+        let (buffer, layout, cursor, _, _) = paint(&component, 14, 5);
+        let rows: Vec<String> = (0..5)
+            .map(|row| buffer.row_symbols(row).unwrap_or_default())
+            .collect();
+        assert!(rows.iter().any(|row| row.contains("API key")), "{rows:?}");
+        assert!(
+            rows.iter().any(|row| row.contains("│ ••••••     │")),
+            "{rows:?}"
+        );
+        assert!(!rows.iter().any(|row| row.contains("sk-")), "{rows:?}");
+
+        assert_eq!(
+            component.event(
+                &Event::Paste("456".to_owned()),
+                &layout,
+                &mut EventCx::new(&layout),
+            ),
+            EventOutcome::Redraw
+        );
+        assert_eq!(state.borrow().buffer().text(), "sk-123456");
+        let (buffer, _, _, _, _) = paint(&component, 14, 5);
+        assert!((0..5).any(|row| {
+            buffer
+                .row_symbols(row)
+                .is_some_and(|row| row.contains("│ •••••••••  │"))
+        }));
+        assert!(cursor.is_some());
+    }
+
+    #[test]
     fn disabled_component_ignores_events() {
         let state = RefCell::new(TextInputState::default());
         let component =

@@ -1,6 +1,8 @@
 //! Higher-level text-input control with opt-in behavior policies.
 
+use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
+use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::time::Duration;
 #[cfg(not(target_arch = "wasm32"))]
@@ -17,7 +19,7 @@ use bmux_text_edit::pointer::{
     ClickPolicy, ClickRecord, ClickTracker, FIELD_CLICK_GRANULARITIES, PointerSelection,
     granularity_for_click_count,
 };
-use bmux_text_edit::{SelectionMode, TextEditAction, TextEditBuffer, TextMotion};
+use bmux_text_edit::{SelectionMode, TextDelete, TextEditAction, TextEditBuffer, TextMotion};
 use bmux_tui::component::{
     Component, ComponentRevision, Constraints, EventCx, LayoutCx, LayoutId, LayoutMetadata,
     LayoutNode, LogicalSize,
@@ -33,10 +35,75 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use crate::scroll_view::{ScrollView, ScrollViewComponent, ScrollViewState};
 
+/// How a [`TextInputState`] presents its text, for collecting secrets such as
+/// API keys and passwords.
+///
+/// Masking is opt-in through [`TextInputState::with_mask`] or
+/// [`TextInputState::set_mask`]. While masked:
+///
+/// * Rendering, wrapping, cursor placement, layout height and pointer hit
+///   mapping use the mask projection, never the secret's own glyphs or widths.
+///   Newlines are masked like any other grapheme.
+/// * Selection is disabled (keyboard, mouse drag and multi-click), so nothing
+///   can be copied out of the field. Word and hard-line motions/deletions act on
+///   the whole buffer so the cursor does not reveal word or line structure.
+/// * `Debug` output and [`TextInputState::snapshot`] omit the text.
+/// * The text and its undo history are zeroized on [`TextInputState::wipe`] and
+///   when the state is dropped.
+///
+/// The application still reads the value through [`TextInputState::buffer`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum TextInputMask {
+    /// Render the text as typed.
+    #[default]
+    None,
+    /// Render one glyph per grapheme. Control characters and combining marks
+    /// fall back to [`TextInputMask::DEFAULT_GLYPH`].
+    Mask(char),
+    /// Render nothing; a focused input shows only its cursor, at the start.
+    Hidden,
+}
+
+impl TextInputMask {
+    /// Default mask glyph.
+    pub const DEFAULT_GLYPH: char = '\u{2022}';
+
+    /// Mask each grapheme with [`TextInputMask::DEFAULT_GLYPH`] (`•`).
+    #[must_use]
+    pub const fn bullets() -> Self {
+        Self::Mask(Self::DEFAULT_GLYPH)
+    }
+
+    /// Return whether this mode hides the real text.
+    #[must_use]
+    pub const fn is_masked(self) -> bool {
+        !matches!(self, Self::None)
+    }
+
+    /// Return the glyph painted per grapheme, or `None` when unmasked or hidden.
+    #[must_use]
+    pub fn glyph(self) -> Option<char> {
+        let Self::Mask(glyph) = self else {
+            return None;
+        };
+        // A glyph must stay one grapheme per source grapheme: two copies must not
+        // combine, and control characters must not alter the line layout.
+        let pair: String = [glyph, glyph].iter().collect();
+        Some(if glyph.is_control() || pair.graphemes(true).count() != 2 {
+            Self::DEFAULT_GLYPH
+        } else {
+            glyph
+        })
+    }
+}
+
 /// Stateful text input data used by [`TextInputControl`].
-#[derive(Debug, Clone)]
+///
+/// `Debug` omits the text while [`masked`](TextInputMask).
+#[derive(Clone)]
 pub struct TextInputState {
     buffer: TextEditBuffer,
+    mask: TextInputMask,
     content_area: Rect,
     logical_width: u64,
     viewport_height: u64,
@@ -48,10 +115,40 @@ pub struct TextInputState {
     exclusion_key: Cell<Option<bmux_text_edit::WrapExclusion>>,
 }
 
+impl fmt::Debug for TextInputState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut debug = f.debug_struct("TextInputState");
+        if self.mask.is_masked() {
+            debug.field("buffer", &format_args!("<redacted>"));
+        } else {
+            debug.field("buffer", &self.buffer);
+        }
+        debug
+            .field("mask", &self.mask)
+            .field("content_area", &self.content_area)
+            .field("logical_width", &self.logical_width)
+            .field("viewport_height", &self.viewport_height)
+            .field("pointer_offset", &self.pointer_offset)
+            .field("scroll", &self.scroll)
+            .field("mouse_selection", &self.mouse_selection)
+            .field("exclusion_columns", &self.exclusion_columns)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for TextInputState {
+    fn drop(&mut self) {
+        if self.mask.is_masked() {
+            self.buffer.wipe();
+        }
+    }
+}
+
 // Derived measurement state must not change the meaning of editor equality.
 impl PartialEq for TextInputState {
     fn eq(&self, other: &Self) -> bool {
         self.buffer == other.buffer
+            && self.mask == other.mask
             && self.content_area == other.content_area
             && self.viewport_height == other.viewport_height
             && self.logical_width == other.logical_width
@@ -73,10 +170,13 @@ impl Default for TextInputState {
 impl TextInputState {
     /// Capture ephemeral rebuild state, not a stable wire/storage contract.
     /// Derived wrap geometry is rebuilt; editor undo history is not serialized.
+    /// A masked state records no text, cursor or pointer state.
     #[must_use]
     pub fn snapshot(&self) -> serde_json::Value {
+        let redacted = TextEditBuffer::new();
+        let masked = self.mask.is_masked();
         let snapshot = TextInputSnapshot {
-            buffer: &self.buffer,
+            buffer: if masked { &redacted } else { &self.buffer },
             content_area: (
                 self.content_area.x,
                 self.content_area.y,
@@ -87,11 +187,16 @@ impl TextInputState {
             viewport_height: self.viewport_height,
             pointer_offset: self.pointer_offset,
             scroll: self.scroll,
-            gesture: self.mouse_selection.gesture.clone(),
+            gesture: if masked {
+                PointerSelection::default()
+            } else {
+                self.mouse_selection.gesture.clone()
+            },
             last_click: self
                 .mouse_selection
                 .clicks
                 .last_click()
+                .filter(|_| !masked)
                 .map(|click| ClickSnapshot {
                     x: click.x,
                     y: click.y,
@@ -104,6 +209,8 @@ impl TextInputState {
 
     /// Restore bounded ephemeral native state atomically. Reapply canonical text
     /// afterwards if needed. Cached wrapping and undo history are reconstructed.
+    /// The mask is kept; a masked state keeps its current text and cursor and
+    /// restores only viewport geometry and scroll.
     ///
     /// # Errors
     /// Rejects malformed, oversized snapshots or invalid UTF-8/grapheme positions.
@@ -133,7 +240,7 @@ impl TextInputState {
                 return Err("editor position is not a grapheme boundary".into());
             }
         }
-        let restored: TextInputSnapshot = crate::common::decode_state_snapshot(snapshot)?;
+        let mut restored: TextInputSnapshot = crate::common::decode_state_snapshot(snapshot)?;
         if let Some(anchor) = restored.gesture.anchor()
             && (anchor.start > anchor.end
                 || !is_grapheme_boundary(anchor.start)
@@ -160,8 +267,24 @@ impl TextInputState {
                 })
             })
             .transpose()?;
+        let mask = self.mask;
+        let (buffer, gesture, last_click) = if mask.is_masked() {
+            restored.buffer.wipe();
+            (
+                std::mem::take(&mut self.buffer),
+                PointerSelection::default(),
+                None,
+            )
+        } else {
+            (
+                std::mem::take(&mut restored.buffer),
+                std::mem::take(&mut restored.gesture),
+                last_click,
+            )
+        };
         *self = Self {
-            buffer: restored.buffer,
+            buffer,
+            mask,
             content_area: Rect::new(
                 restored.content_area.0,
                 restored.content_area.1,
@@ -174,7 +297,7 @@ impl TextInputState {
             scroll: restored.scroll,
             mouse_selection: MouseSelectionState {
                 clicks: ClickTracker::from_last_click(last_click),
-                gesture: restored.gesture,
+                gesture,
             },
             wrapped: RefCell::new(None),
             exclusion_columns: 0,
@@ -188,6 +311,7 @@ impl TextInputState {
     pub fn new(buffer: TextEditBuffer) -> Self {
         Self {
             buffer,
+            mask: TextInputMask::None,
             content_area: Rect::new(0, 0, 1, 1),
             logical_width: 1,
             viewport_height: 1,
@@ -197,6 +321,94 @@ impl TextInputState {
             wrapped: RefCell::new(None),
             exclusion_columns: 0,
             exclusion_key: Cell::new(None),
+        }
+    }
+
+    /// Return this state with a presentation mask, for secret entry.
+    ///
+    /// ```
+    /// use bmux_text_edit::TextEditBuffer;
+    /// use bmux_tui_components::text_input::{TextInputMask, TextInputState};
+    ///
+    /// let state = TextInputState::new(TextEditBuffer::new()).with_mask(TextInputMask::bullets());
+    /// assert!(state.is_masked());
+    /// ```
+    #[must_use]
+    pub fn with_mask(mut self, mask: TextInputMask) -> Self {
+        self.set_mask(mask);
+        self
+    }
+
+    /// Change the presentation mask. Masking clears any selection and pointer
+    /// gesture; see [`TextInputMask`] for the masked behavior.
+    pub fn set_mask(&mut self, mask: TextInputMask) {
+        if mask.is_masked() {
+            self.buffer.clear_selection();
+            self.mouse_selection = MouseSelectionState::default();
+        }
+        self.mask = mask;
+        self.buffer.reset_preferred_visual_column();
+        *self.wrapped.get_mut() = None;
+    }
+
+    /// Return the presentation mask.
+    #[must_use]
+    pub const fn mask(&self) -> TextInputMask {
+        self.mask
+    }
+
+    /// Return whether the text is masked.
+    #[must_use]
+    pub const fn is_masked(&self) -> bool {
+        self.mask.is_masked()
+    }
+
+    /// Clear the text, selection, pointer gesture and undo history, overwriting
+    /// the previous text and its history snapshots with zeros. The mask is kept.
+    pub fn wipe(&mut self) {
+        self.buffer.wipe();
+        self.mouse_selection = MouseSelectionState::default();
+        *self.wrapped.get_mut() = None;
+        self.scroll = ScrollViewState::new();
+    }
+
+    /// The buffer that wrapping, painting and pointer geometry are measured on:
+    /// the real buffer, or a glyph projection with the cursor at the same grapheme.
+    fn projection(&self) -> Cow<'_, TextEditBuffer> {
+        match self.mask {
+            TextInputMask::None => Cow::Borrowed(&self.buffer),
+            TextInputMask::Hidden => Cow::Owned(TextEditBuffer::new()),
+            TextInputMask::Mask(_) => {
+                let glyph = self.mask.glyph().unwrap_or(TextInputMask::DEFAULT_GLYPH);
+                let count = self.buffer.text().graphemes(true).count();
+                let mut projection = TextEditBuffer::from_text(
+                    std::iter::repeat_n(glyph, count).collect::<String>(),
+                );
+                projection.move_cursor(TextMotion::Absolute(
+                    self.buffer
+                        .cursor_grapheme_index()
+                        .saturating_mul(glyph.len_utf8()),
+                ));
+                Cow::Owned(projection)
+            }
+        }
+    }
+
+    /// Map a byte index in [`Self::projection`] back to the real buffer. Hidden
+    /// text has no geometry to map from.
+    fn source_byte_index(&self, projected: usize) -> Option<usize> {
+        match self.mask {
+            TextInputMask::None => Some(projected),
+            TextInputMask::Hidden => None,
+            TextInputMask::Mask(_) => {
+                let glyph = self.mask.glyph().unwrap_or(TextInputMask::DEFAULT_GLYPH);
+                let text = self.buffer.text();
+                Some(
+                    text.grapheme_indices(true)
+                        .nth(projected / glyph.len_utf8())
+                        .map_or(text.len(), |(offset, _)| offset),
+                )
+            }
         }
     }
 
@@ -214,8 +426,8 @@ impl TextInputState {
     #[must_use]
     pub fn rows_with_trailing_exclusion(&self, width: u16, columns: u16, maximum: u16) -> u16 {
         let maximum = maximum.max(1);
-        let base = self
-            .buffer
+        let projection = self.projection();
+        let base = projection
             .wrapped_layout(usize::from(width))
             .lines
             .len()
@@ -224,7 +436,7 @@ impl TextInputState {
         if base > usize::from(maximum) || columns == 0 {
             return u16::try_from(rows).unwrap_or(maximum);
         }
-        let layout = self.buffer.wrapped_layout_with_exclusion(
+        let layout = projection.wrapped_layout_with_exclusion(
             usize::from(width),
             Some(bmux_text_edit::WrapExclusion {
                 row: rows - 1,
@@ -257,11 +469,13 @@ impl TextInputState {
             .borrow()
             .as_ref()
             .is_none_or(|(cached_width, _, _)| *cached_width != width);
+        // The cache is keyed by the real cursor; masked layouts are measured on
+        // the projection, whose cursor sits at the same grapheme.
         if stale {
             *self.wrapped.borrow_mut() = Some((
                 width,
                 self.buffer.cursor_byte_index(),
-                self.buffer.wrapped_layout_with_exclusion(
+                self.projection().wrapped_layout_with_exclusion(
                     usize::try_from(width.max(1)).unwrap_or(usize::MAX),
                     exclusion,
                 ),
@@ -270,7 +484,9 @@ impl TextInputState {
             && *cursor != self.buffer.cursor_byte_index()
         {
             *cursor = self.buffer.cursor_byte_index();
-            layout.cursor = layout.cursor_for_byte_index(self.buffer.text(), *cursor);
+            let projection = self.projection();
+            layout.cursor =
+                layout.cursor_for_byte_index(projection.text(), projection.cursor_byte_index());
         }
         std::cell::Ref::map(self.wrapped.borrow(), |cached| {
             &cached.as_ref().expect("measured projection").2
@@ -497,7 +713,9 @@ impl Component for TextInputComponent<'_, '_> {
         let state = self.state.borrow();
         let mut layout = std::collections::hash_map::DefaultHasher::new();
         self.id.as_str().hash(&mut layout);
-        state.buffer().text().hash(&mut layout);
+        // Masked layouts depend only on the projection; never hash the secret.
+        state.mask().hash(&mut layout);
+        state.projection().text().hash(&mut layout);
         self.policy.viewport.min_rows.hash(&mut layout);
         self.policy.viewport.max_rows.hash(&mut layout);
 
@@ -510,6 +728,7 @@ impl Component for TextInputComponent<'_, '_> {
             selection.end.hash(&mut paint);
         }
         state.vertical_scroll().hash(&mut paint);
+        state.buffer().is_empty().hash(&mut paint);
         self.style.hash(&mut paint);
         self.selection_style.hash(&mut paint);
         self.placeholder.hash(&mut paint);
@@ -568,7 +787,8 @@ impl Component for TextInputComponent<'_, '_> {
         state.exclusion_columns = self.trailing_exclusion;
         state.set_geometry(area, layout.size.width, (0, 0), self.policy);
         let wrapped = state.wrapped_layout(state.logical_width);
-        let mut input = TextInput::new(state.buffer())
+        let projection = state.projection();
+        let mut input = TextInput::new(&projection)
             .wrapped_layout(&wrapped)
             .trailing_exclusion(self.trailing_exclusion)
             .id(self.id.clone())
@@ -577,10 +797,16 @@ impl Component for TextInputComponent<'_, '_> {
             .placeholder_style(self.placeholder_style)
             .cursor_visible(self.focused && !self.disabled)
             .vertical_scroll(usize::try_from(state.vertical_scroll()).unwrap_or(usize::MAX));
-        if let Some(placeholder) = self.placeholder {
+        // A hidden projection is empty even when text exists; the placeholder
+        // follows the real buffer.
+        if let Some(placeholder) = self.placeholder
+            && state.buffer().is_empty()
+        {
             input = input.placeholder(placeholder);
         }
         input.paint(layout, cx);
+        drop(projection);
+        drop(wrapped);
         let regions = if self.trailing_exclusion > 0 {
             vec![
                 Rect::new(0, 0, area.width, height.saturating_sub(1)),
@@ -863,7 +1089,7 @@ impl<'policy> TextInputControl<'policy> {
         if let Some(bindings) = self.text_bindings {
             return self.handle_bound_key(state, stroke, bindings);
         }
-        if self.policy.keyboard.selection_keys
+        if self.selection_keys(state)
             && let Some(motion) = selection_motion(stroke)
         {
             extend_selection(state, motion);
@@ -875,6 +1101,11 @@ impl<'policy> TextInputControl<'policy> {
         }
         let Some(command) = self.policy.keyboard.keymap.command_for_key(stroke) else {
             return TextInputOutcome::Ignored;
+        };
+        let command = if state.is_masked() {
+            masked_command(command)
+        } else {
+            command
         };
         match command {
             bmux_text_edit::TextEditCommand::Move(TextMotion::VisualUp) => {
@@ -905,7 +1136,7 @@ impl<'policy> TextInputControl<'policy> {
             Some(TextEditAction::Undo | TextEditAction::Redo) => {
                 return TextInputOutcome::Ignored;
             }
-            Some(action) if action.is_selection() && !self.policy.keyboard.selection_keys => {
+            Some(action) if action.is_selection() && !self.selection_keys(state) => {
                 return TextInputOutcome::Ignored;
             }
             Some(action) => action,
@@ -932,20 +1163,38 @@ impl<'policy> TextInputControl<'policy> {
                 }
                 move_visual_cursor(state, delta, mode);
             }
+            Some((motion, mode)) if state.is_masked() => {
+                state
+                    .buffer
+                    .move_cursor_with_selection(masked_motion(motion), mode);
+            }
             Some((motion, mode)) => state.buffer.move_cursor_with_selection(motion, mode),
             None if action == TextEditAction::SelectAll => state.buffer.select_all(),
-            None => {
-                state.buffer_mut().apply_action(action);
-            }
+            None => match action.deletion() {
+                Some(deletion) if state.is_masked() => {
+                    state.buffer_mut().delete(masked_delete(deletion));
+                }
+                _ => {
+                    state.buffer_mut().apply_action(action);
+                }
+            },
         }
         state.sync_scroll_to_cursor(self.policy);
         TextInputOutcome::Edited
+    }
+
+    /// Whether selection keys apply; masked text never selects.
+    const fn selection_keys(&self, state: &TextInputState) -> bool {
+        self.policy.keyboard.selection_keys && !state.is_masked()
     }
 
     /// Handle one mouse event.
     pub fn handle_mouse(&self, state: &mut TextInputState, mouse: MouseEvent) -> TextInputOutcome {
         if !self.policy.mouse.enabled {
             return TextInputOutcome::Ignored;
+        }
+        if state.is_masked() {
+            return self.handle_masked_mouse(state, mouse);
         }
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) if self.policy.mouse.click_to_cursor => {
@@ -1037,6 +1286,31 @@ impl<'policy> TextInputControl<'policy> {
             return Some(TextInputOutcome::EdgeDown);
         }
         None
+    }
+
+    /// Masked text supports click-to-cursor only: no drag, word or line selection.
+    fn handle_masked_mouse(
+        &self,
+        state: &mut TextInputState,
+        mouse: MouseEvent,
+    ) -> TextInputOutcome {
+        state.mouse_selection.gesture.end();
+        if mouse.kind != MouseEventKind::Down(MouseButton::Left)
+            || !self.policy.mouse.click_to_cursor
+        {
+            return TextInputOutcome::Ignored;
+        }
+        let Some((row, col)) = mouse_wrapped_position(state, mouse) else {
+            return TextInputOutcome::Ignored;
+        };
+        let projected = state
+            .wrapped_layout(state.logical_width)
+            .byte_index_for_position(row, col);
+        if let Some(source) = state.source_byte_index(projected) {
+            state.buffer.move_cursor(TextMotion::Absolute(source));
+        }
+        state.sync_scroll_to_cursor(self.policy);
+        TextInputOutcome::Redraw
     }
 
     fn handle_mouse_down(&self, state: &mut TextInputState, mouse: MouseEvent) -> TextInputOutcome {
@@ -1138,6 +1412,33 @@ impl TextInputPolicy {
     pub const fn outer_selection(mut self, policy: TextInputOuterSelectionPolicy) -> Self {
         self.outer_selection = policy;
         self
+    }
+
+    /// Single-row secret field (API key, password): Enter submits, typing,
+    /// paste and click-to-cursor work, and nothing can be selected or copied.
+    /// Pair it with a [`TextInputMask`] on the state.
+    #[must_use]
+    pub const fn secret_field() -> Self {
+        Self {
+            outer_selection: TextInputOuterSelectionPolicy::Isolated,
+            keyboard: KeyboardPolicy {
+                shift_enter: None,
+                selection_keys: false,
+                ..KeyboardPolicy::chat_composer()
+            },
+            mouse: MousePolicy {
+                drag_selection: false,
+                edge_scroll: DragEdgeScroll::Disabled,
+                ..MousePolicy::text_selection()
+            }
+            .click_granularities(&[]),
+            viewport: ViewportPolicy {
+                auto_scroll_to_cursor: true,
+                min_rows: 1,
+                max_rows: Some(1),
+            },
+            edge: EdgePolicy::disabled(),
+        }
     }
 
     /// Common chat-composer policy.
@@ -1444,10 +1745,58 @@ fn extend_visual_selection(state: &mut TextInputState, delta: isize) {
 }
 
 fn move_visual_cursor(state: &mut TextInputState, delta: isize, selection: SelectionMode) {
+    if state.is_masked() {
+        // Masked rows hold one glyph per grapheme; move on the projection and
+        // map the target grapheme back to the real buffer.
+        let projected = {
+            let layout = state.wrapped_layout(state.logical_width);
+            let row = layout
+                .cursor
+                .row
+                .saturating_add_signed(delta)
+                .min(layout.lines.len().saturating_sub(1));
+            layout.byte_index_for_position(row, layout.cursor.col)
+        };
+        if let Some(source) = state.source_byte_index(projected) {
+            state.buffer.move_cursor(TextMotion::Absolute(source));
+        }
+        return;
+    }
     drop(state.wrapped_layout(state.logical_width));
     let cached = state.wrapped.borrow();
     let layout = &cached.as_ref().expect("measured projection").2;
     state.buffer.move_cursor_in_layout(layout, delta, selection);
+}
+
+/// Masked word and hard-line motions span the whole buffer so the cursor does
+/// not reveal where spaces, punctuation or newlines are.
+const fn masked_motion(motion: TextMotion) -> TextMotion {
+    match motion {
+        TextMotion::WordLeft | TextMotion::LineStart => TextMotion::Start,
+        TextMotion::WordRight | TextMotion::LineEnd => TextMotion::End,
+        motion => motion,
+    }
+}
+
+/// Masked word and hard-line deletions span the whole buffer, like motions.
+const fn masked_delete(delete: TextDelete) -> TextDelete {
+    match delete {
+        TextDelete::WordBackward | TextDelete::ToLineStart => TextDelete::ToStart,
+        TextDelete::WordForward | TextDelete::ToLineEnd => TextDelete::ToEnd,
+        delete => delete,
+    }
+}
+
+fn masked_command(command: bmux_text_edit::TextEditCommand) -> bmux_text_edit::TextEditCommand {
+    match command {
+        bmux_text_edit::TextEditCommand::Move(motion) => {
+            bmux_text_edit::TextEditCommand::Move(masked_motion(motion))
+        }
+        bmux_text_edit::TextEditCommand::Delete(delete) => {
+            bmux_text_edit::TextEditCommand::Delete(masked_delete(delete))
+        }
+        command => command,
+    }
 }
 
 fn pointer_source_row(state: &TextInputState, visible_row: usize) -> usize {
@@ -2891,5 +3240,306 @@ mod snapshot_tests {
         snapshot["gesture"] =
             serde_json::json!({"granularity": "Word", "anchor": {"start": 0, "end": 1}});
         assert!(rebuilt.restore_snapshot(&snapshot).is_err());
+    }
+}
+
+#[cfg(test)]
+mod mask_tests {
+    use std::cell::RefCell;
+
+    use bmux_keyboard::{KeyCode, KeyStroke, Modifiers};
+    use bmux_text_edit::TextEditBuffer;
+    use bmux_text_edit::keyboard::TextBindings;
+    use bmux_tui::buffer::Buffer;
+    use bmux_tui::component::{Component, Constraints, LayoutCx};
+    use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
+    use bmux_tui::frame::{Cursor, Frame};
+    use bmux_tui::geometry::{Point, Rect, Size};
+    use bmux_tui::paint::PaintCx;
+    use bmux_tui::style::Style;
+
+    use super::{
+        TextEditAction, TextInputComponent, TextInputControl, TextInputMask, TextInputOutcome,
+        TextInputPolicy, TextInputState,
+    };
+
+    fn masked(text: &str, mask: TextInputMask) -> TextInputState {
+        TextInputState::new(TextEditBuffer::from_text(text)).with_mask(mask)
+    }
+
+    fn render(
+        state: &RefCell<TextInputState>,
+        policy: &TextInputPolicy,
+        placeholder: Option<&str>,
+        width: u16,
+        height: u16,
+    ) -> (Vec<String>, Option<Cursor>, u64) {
+        let mut component = TextInputComponent::new("secret", state, policy).focused(true);
+        if let Some(placeholder) = placeholder {
+            component = component.placeholder(placeholder, Style::new());
+        }
+        let layout = component.layout(
+            Constraints::loose(Size::new(width, height)),
+            &mut LayoutCx::new(),
+        );
+        let mut buffer = Buffer::empty(Rect::new(0, 0, width, height));
+        let mut frame = Frame::new(&mut buffer);
+        component.paint(&layout, &mut PaintCx::new(&mut frame));
+        let cursor = frame.cursor();
+        drop(frame);
+        let rows = (0..height)
+            .map(|row| buffer.row_symbols(row).unwrap_or_default())
+            .collect();
+        (rows, cursor, layout.size.height)
+    }
+
+    fn key(code: KeyCode) -> KeyStroke {
+        KeyStroke::simple(code)
+    }
+
+    fn with(code: KeyCode, modifiers: Modifiers) -> KeyStroke {
+        KeyStroke::with_modifiers(code, modifiers)
+    }
+
+    const SHIFT: Modifiers = Modifiers {
+        shift: true,
+        ..Modifiers::NONE
+    };
+    const CTRL: Modifiers = Modifiers {
+        ctrl: true,
+        ..Modifiers::NONE
+    };
+
+    #[test]
+    fn mask_renders_one_glyph_per_grapheme_and_never_the_secret() {
+        let secret = "sk-秘密🙂 x";
+        let policy = TextInputPolicy::chat_composer();
+        let state = RefCell::new(masked(secret, TextInputMask::bullets()));
+        let (rows, cursor, height) = render(&state, &policy, None, 12, 1);
+
+        // Eight graphemes, including two wide CJK and an emoji, become eight cells.
+        assert_eq!(rows[0], "••••••••    ");
+        assert!(!secret.chars().any(|ch| ch != ' ' && rows[0].contains(ch)));
+        assert_eq!(height, 1);
+        assert_eq!(cursor, Some(Cursor::visible(Point::new(8, 0))));
+
+        let state = RefCell::new(masked("pass", TextInputMask::Mask('*')));
+        assert_eq!(render(&state, &policy, None, 6, 1).0[0], "****  ");
+    }
+
+    #[test]
+    fn mask_width_and_wrapping_use_glyph_count_not_secret_width() {
+        let policy = TextInputPolicy::chat_composer();
+        // Six wide graphemes need two six-column rows unmasked; masked they need one.
+        let plain = RefCell::new(TextInputState::new(TextEditBuffer::from_text(
+            "秘密秘密秘密",
+        )));
+        assert_eq!(render(&plain, &policy, None, 6, 3).2, 2);
+        let state = RefCell::new(masked("秘密秘密秘密", TextInputMask::bullets()));
+        let (rows, cursor, height) = render(&state, &policy, None, 6, 3);
+        assert_eq!(height, 1);
+        assert_eq!(rows[0], "••••••");
+        // The cursor follows the sixth glyph, not the twelfth display column.
+        assert_eq!(cursor, Some(Cursor::visible(Point::new(6, 0))));
+    }
+
+    #[test]
+    fn unusable_mask_glyphs_fall_back_to_default() {
+        assert_eq!(TextInputMask::Mask('\n').glyph(), Some('•'));
+        assert_eq!(TextInputMask::Mask('\u{301}').glyph(), Some('•'));
+        assert_eq!(TextInputMask::Mask('#').glyph(), Some('#'));
+        assert_eq!(TextInputMask::Hidden.glyph(), None);
+        assert_eq!(TextInputMask::None.glyph(), None);
+        let policy = TextInputPolicy::chat_composer();
+        let state = RefCell::new(masked("a\nb", TextInputMask::Mask('\n')));
+        // Newlines are masked too, so line structure is not revealed.
+        let (rows, _, height) = render(&state, &policy, None, 5, 2);
+        assert_eq!((rows[0].as_str(), height), ("•••  ", 1));
+    }
+
+    #[test]
+    fn hidden_renders_nothing_but_the_cursor() {
+        let policy = TextInputPolicy::chat_composer();
+        let state = RefCell::new(masked("hunter2", TextInputMask::Hidden));
+        let (rows, cursor, height) = render(&state, &policy, Some("API key"), 10, 1);
+        assert_eq!(rows[0], " ".repeat(10));
+        assert_eq!(height, 1);
+        assert_eq!(cursor, Some(Cursor::visible(Point::new(0, 0))));
+
+        // The placeholder follows the real (empty) buffer, not the empty projection.
+        state.borrow_mut().wipe();
+        let (rows, _, _) = render(&state, &policy, Some("API key"), 10, 1);
+        assert_eq!(rows[0], "API key   ");
+    }
+
+    #[test]
+    fn masked_editing_inserts_deletes_moves_and_pastes() {
+        let policy = TextInputPolicy::secret_field();
+        let control = TextInputControl::new(&policy);
+        let mut state = TextInputState::default().with_mask(TextInputMask::bullets());
+        state.set_content_area(Rect::new(0, 0, 20, 1), &policy);
+        for ch in "abc".chars() {
+            assert_eq!(
+                control.handle_key(&mut state, key(KeyCode::Char(ch))),
+                TextInputOutcome::Edited
+            );
+        }
+        control.handle_key(&mut state, key(KeyCode::Left));
+        control.handle_key(&mut state, key(KeyCode::Backspace));
+        assert_eq!(state.buffer().text(), "ac");
+        assert_eq!(state.buffer().cursor_grapheme_index(), 1);
+        control.handle_key(&mut state, key(KeyCode::Home));
+        control.handle_key(&mut state, key(KeyCode::Char('x')));
+        control.handle_key(&mut state, key(KeyCode::End));
+        assert_eq!(
+            control.handle_event(&mut state, &Event::Paste("1 2-🙂".to_owned())),
+            TextInputOutcome::Edited
+        );
+        assert_eq!(state.buffer().text(), "xac1 2-🙂");
+        control.handle_key(&mut state, key(KeyCode::Delete));
+        control.handle_key(&mut state, key(KeyCode::Left));
+        control.handle_key(&mut state, key(KeyCode::Delete));
+        assert_eq!(state.buffer().text(), "xac1 2-");
+        assert_eq!(
+            control.handle_key(&mut state, key(KeyCode::Enter)),
+            TextInputOutcome::Submitted
+        );
+    }
+
+    #[test]
+    fn masked_word_motion_and_deletion_span_the_whole_secret() {
+        let policy = TextInputPolicy::chat_composer();
+        let control = TextInputControl::new(&policy);
+        let mut state = masked("two words-here", TextInputMask::bullets());
+        state.set_content_area(Rect::new(0, 0, 30, 1), &policy);
+        control.handle_key(&mut state, with(KeyCode::Left, CTRL));
+        assert_eq!(state.buffer().cursor_byte_index(), 0);
+        control.handle_key(&mut state, with(KeyCode::Right, CTRL));
+        assert_eq!(state.buffer().cursor_byte_index(), 14);
+        control.handle_key(&mut state, with(KeyCode::Char('w'), CTRL));
+        assert_eq!(state.buffer().text(), "");
+    }
+
+    #[test]
+    fn masked_input_never_selects() {
+        let policy = TextInputPolicy::chat_composer();
+        let mut bindings = TextBindings::default();
+        bindings.unbind_stroke(with(KeyCode::Char('a'), CTRL));
+        bindings.set(TextEditAction::SelectAll, &[with(KeyCode::Char('a'), CTRL)]);
+        let mut state = masked("secret", TextInputMask::bullets());
+        state.set_content_area(Rect::new(0, 0, 20, 1), &policy);
+
+        let control = TextInputControl::new(&policy);
+        control.handle_key(&mut state, with(KeyCode::Left, SHIFT));
+        assert_eq!(state.buffer().selection(), None);
+        let bound = TextInputControl::new(&policy).with_text_bindings(&bindings);
+        assert_eq!(
+            bound.handle_key(&mut state, with(KeyCode::Char('a'), CTRL)),
+            TextInputOutcome::Ignored
+        );
+        assert_eq!(
+            bound.handle_key(&mut state, with(KeyCode::Left, SHIFT)),
+            TextInputOutcome::Ignored
+        );
+        assert_eq!(state.buffer().selection(), None);
+
+        // Double-click and drag do not select; a click only places the cursor.
+        let down = MouseEvent::new(MouseEventKind::Down(MouseButton::Left), Point::new(2, 0));
+        for _ in 0..3 {
+            control.handle_mouse(&mut state, down);
+        }
+        assert_eq!(state.buffer().selection(), None);
+        assert_eq!(state.buffer().cursor_byte_index(), 2);
+        let drag = MouseEvent::new(MouseEventKind::Drag(MouseButton::Left), Point::new(5, 0));
+        assert_eq!(
+            control.handle_mouse(&mut state, drag),
+            TextInputOutcome::Ignored
+        );
+        assert_eq!(state.buffer().selected_text(), None);
+        assert!(!state.mouse_selection_active());
+    }
+
+    #[test]
+    fn masking_clears_an_existing_selection() {
+        let mut buffer = TextEditBuffer::from_text("secret");
+        buffer.select_all();
+        let state = TextInputState::new(buffer).with_mask(TextInputMask::Hidden);
+        assert_eq!(state.buffer().selected_text(), None);
+    }
+
+    #[test]
+    fn masked_pointer_and_vertical_motion_map_glyphs_to_graphemes() {
+        let policy = TextInputPolicy::chat_composer();
+        let control = TextInputControl::new(&policy);
+        // Wide graphemes: glyph column 1 is the second grapheme at byte 3.
+        let mut state = masked("秘密ab", TextInputMask::bullets());
+        state.set_content_area(Rect::new(0, 0, 10, 1), &policy);
+        let click = MouseEvent::new(MouseEventKind::Down(MouseButton::Left), Point::new(1, 0));
+        assert_eq!(
+            control.handle_mouse(&mut state, click),
+            TextInputOutcome::Redraw
+        );
+        assert_eq!(state.buffer().cursor_byte_index(), 3);
+
+        // Ten graphemes at width 4 wrap into rows of 4/4/2 glyphs.
+        let mut state = masked("ab秘密efghij", TextInputMask::bullets());
+        state.set_content_area(Rect::new(0, 0, 4, 3), &policy);
+        assert_eq!(state.buffer().cursor_grapheme_index(), 10);
+        control.handle_key(&mut state, key(KeyCode::Up));
+        assert_eq!(state.buffer().cursor_grapheme_index(), 6);
+        control.handle_key(&mut state, key(KeyCode::Up));
+        assert_eq!(state.buffer().cursor_grapheme_index(), 2);
+        assert_eq!(state.buffer().cursor_byte_index(), 2);
+
+        // Hidden text has no geometry: clicks do not move the cursor.
+        let mut state = masked("abc", TextInputMask::Hidden);
+        state.set_content_area(Rect::new(0, 0, 10, 1), &policy);
+        control.handle_mouse(&mut state, click);
+        assert_eq!(state.buffer().cursor_byte_index(), 3);
+    }
+
+    #[test]
+    fn debug_and_snapshot_redact_masked_text() {
+        let plain = TextInputState::new(TextEditBuffer::from_text("hunter2"));
+        assert!(format!("{plain:?}").contains("hunter2"));
+        for mask in [TextInputMask::bullets(), TextInputMask::Hidden] {
+            let state = TextInputState::new(TextEditBuffer::from_text("hunter2")).with_mask(mask);
+            let debug = format!("{state:?}");
+            assert!(!debug.contains("hunter2"), "{debug}");
+            assert!(debug.contains("<redacted>"));
+            let alternate = format!("{state:#?}");
+            assert!(!alternate.contains("hunter2"));
+
+            let snapshot = state.snapshot();
+            assert!(!snapshot.to_string().contains("hunter2"));
+            let mut restored = state.clone();
+            restored.restore_snapshot(&snapshot).expect("restore");
+            assert_eq!(restored.buffer().text(), "hunter2");
+            assert_eq!(restored.mask(), mask);
+        }
+    }
+
+    #[test]
+    fn wipe_clears_text_and_history_but_keeps_mask() {
+        let policy = TextInputPolicy::chat_composer();
+        let control = TextInputControl::new(&policy);
+        let mut state = TextInputState::default().with_mask(TextInputMask::bullets());
+        control.handle_paste(&mut state, "hunter2");
+        assert!(state.buffer().can_undo());
+        state.wipe();
+        assert_eq!(state.buffer().text(), "");
+        assert!(!state.buffer().can_undo());
+        assert!(state.is_masked());
+    }
+
+    #[test]
+    fn masked_revision_does_not_depend_on_secret_content() {
+        let policy = TextInputPolicy::chat_composer();
+        let first = RefCell::new(masked("aaaa", TextInputMask::bullets()));
+        let second = RefCell::new(masked("zzzz", TextInputMask::bullets()));
+        assert_eq!(
+            TextInputComponent::new("secret", &first, &policy).revision(),
+            TextInputComponent::new("secret", &second, &policy).revision()
+        );
     }
 }

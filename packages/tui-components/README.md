@@ -532,6 +532,41 @@ table, including undo/redo (the table then supersedes the history bindings in
 vertical moves keep edge signals and soft-wrap-aware movement.
 `policy.keyboard.keymap.bindings()` reproduces the behavior without a table.
 
+### Masked (secret) text input
+
+`TextInputState::with_mask(TextInputMask)` (or `set_mask`) turns any text input,
+including one inside `TextInputBoxComponent` and its form-field chrome, into a
+secret field for API keys and passwords:
+
+- `TextInputMask::bullets()` / `Mask(char)` paints one glyph per grapheme
+  (default `•`); wrapping, layout height, cursor and click mapping use the glyph
+  count, never the secret's own display width. Newlines are masked too.
+- `TextInputMask::Hidden` paints nothing; a focused field shows only its cursor.
+- Selection is disabled (shift keys, select-all bindings, drag and multi-click),
+  so nothing can be copied out. Word and hard-line motions and deletions span
+  the whole secret so the cursor does not reveal its structure.
+- `Debug` prints `<redacted>` and `snapshot()` records no text or cursor.
+- `wipe()` and dropping a masked state zeroize the text and its undo snapshots.
+
+`TextInputPolicy::secret_field()` is a single-row preset where Enter submits and
+only click-to-cursor is enabled. Read the value with `state.buffer().text()`,
+then call `wipe()`.
+
+```rust
+use std::cell::RefCell;
+
+use bmux_text_edit::TextEditBuffer;
+use bmux_tui_components::text_input::{TextInputMask, TextInputPolicy, TextInputState};
+use bmux_tui_components::text_input_box::{TextInputBoxComponent, TextInputBoxPolicy};
+
+let state = RefCell::new(
+    TextInputState::new(TextEditBuffer::new()).with_mask(TextInputMask::bullets()),
+);
+let field = TextInputBoxComponent::new("api-key", TextInputPolicy::secret_field(), &state)
+    .label("API key")
+    .policy(TextInputBoxPolicy::labeled_field().focused(true));
+```
+
 ### Ephemeral control rebuild snapshots
 
 Interactive native states expose `snapshot() -> serde_json::Value` and
