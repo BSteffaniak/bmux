@@ -1234,19 +1234,46 @@ fn pop_selection_container(
     false
 }
 
+/// Display text the renderer adds after a source range: a readable link destination
+/// fallback (` (destination)`) shown after the link it follows. It has no source, so
+/// provenance must step over it rather than map later source graphemes onto its cells.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DisplayInsertion {
+    /// Source byte offset the inserted text follows.
+    after: usize,
+    /// The inserted display text, without the separating whitespace a wrap may consume.
+    text: String,
+}
+
 fn assign_selection_geometry(
     provenance: Vec<MarkdownSelectionProvenance>,
     document: &MarkdownDocument,
     source: &str,
     lines: &[Line],
+    insertions: &[DisplayInsertion],
 ) -> Vec<MarkdownSelectionProvenance> {
     let display = DisplayedMarkdown::new(lines);
     let mut search_from = 0;
+    let mut insertions = insertions.iter().peekable();
     // Text events expand to one unit per grapheme, so the projected vector is
     // far larger than the incoming event count. Reserve from the display cell
     // count to avoid repeated growth reallocation.
     let mut projected = Vec::with_capacity(display.cells.len().max(provenance.len()));
     for (unit, event) in provenance.into_iter().zip(&document.events) {
+        // Source past an insertion: its display text precedes the search position.
+        while let Some(insertion) =
+            insertions.next_if(|insertion| event.source_range.start >= insertion.after)
+        {
+            if let Some(offset) = display
+                .text
+                .get(search_from..)
+                .and_then(|suffix| suffix.find(&insertion.text))
+            {
+                search_from = search_from
+                    .saturating_add(offset)
+                    .saturating_add(insertion.text.len());
+            }
+        }
         let (MarkdownSemanticEventKind::Text(visible) | MarkdownSemanticEventKind::Code(visible)) =
             &event.kind
         else {
@@ -1450,11 +1477,13 @@ impl MarkdownRenderResult {
                 return Vec::new();
             };
             let document = inputs.document();
+            // Retained inputs exist only for projections that inserted no display text.
             assign_selection_geometry(
                 markdown_selection_provenance(&document),
                 &document,
                 &inputs.source,
                 &self.lines,
+                &[],
             )
         })
     }
@@ -1866,8 +1895,14 @@ pub fn render_markdown(markdown: &str, options: &MarkdownRenderOptions) -> Markd
     };
     let (lines, mut geometry, heading_rows) =
         render_markdown_projection(&projected_markdown, options);
-    selection_provenance =
-        assign_selection_geometry(selection_provenance, &document, markdown, &lines);
+    let insertions = link_destination_fallback_insertions(markdown, &contributions, options);
+    selection_provenance = assign_selection_geometry(
+        selection_provenance,
+        &document,
+        markdown,
+        &lines,
+        &insertions,
+    );
     #[cfg(test)]
     record_markdown_stage(
         |diagnostics, elapsed| {
@@ -2083,6 +2118,39 @@ fn project_link_destination_fallbacks<'a>(
     } else {
         Cow::Owned(replace_source_ranges(markdown, replacements))
     }
+}
+
+/// The display text [`project_link_destination_fallbacks`] inserts, in source order.
+fn link_destination_fallback_insertions(
+    markdown: &str,
+    contributions: &[MarkdownContribution],
+    options: &MarkdownRenderOptions,
+) -> Vec<DisplayInsertion> {
+    if options.link_destination_presentation
+        != MarkdownLinkDestinationPresentation::ReadableFallback
+    {
+        return Vec::new();
+    }
+    let mut insertions = contributions
+        .iter()
+        .filter_map(|contribution| match &contribution.kind {
+            MarkdownContributionKind::Link {
+                link,
+                label,
+                destination,
+            } if markdown.get(contribution.source_range.clone()).is_some() => {
+                readable_destination_fallback(link, label, destination).map(|fallback| {
+                    DisplayInsertion {
+                        after: contribution.source_range.end,
+                        text: format!("({fallback})"),
+                    }
+                })
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    insertions.sort_by_key(|insertion| insertion.after);
+    insertions
 }
 
 fn readable_destination_fallback(
@@ -5343,6 +5411,62 @@ mod tests {
         );
         assert!(unsafe_visible.contains("Secret"));
         assert!(!unsafe_visible.contains("javascript"));
+    }
+
+    #[test]
+    fn selection_provenance_steps_over_link_destination_fallbacks() {
+        let markdown = "[safe](https://example.com)\n\n```\nlet x = 1;\n```";
+        let rendered = render_markdown(
+            markdown,
+            &MarkdownRenderOptions::new(80).with_link_destination_fallbacks(true),
+        );
+        let rows = rendered
+            .lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_str())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        let code_row = rows
+            .iter()
+            .position(|row| row.contains("let x = 1;"))
+            .expect("code row");
+        let code_column =
+            text_display_width(&rows[code_row][..rows[code_row].find("let").unwrap()]);
+        let code = rendered
+            .selection_provenance()
+            .iter()
+            .filter(|unit| {
+                unit.source_ranges
+                    .iter()
+                    .any(|range| markdown[..range.start].contains("```\n") && !range.is_empty())
+                    && !unit.rects.is_empty()
+            })
+            .collect::<Vec<_>>();
+        // Every code grapheme maps onto the code row, in order from its first cell; none
+        // lands on the inserted ` (https://example.com/)` cells of the link row.
+        assert_eq!(code.len(), "let x = 1;".len());
+        for (index, unit) in code.iter().enumerate() {
+            let rect = unit.rects[0];
+            assert_eq!(usize::from(rect.y), code_row, "{unit:?}");
+            assert_eq!(usize::from(rect.x), code_column + index, "{unit:?}");
+        }
+        // The link label still maps onto its own cells.
+        let label = rendered
+            .selection_provenance()
+            .iter()
+            .filter(|unit| {
+                unit.source_ranges
+                    .iter()
+                    .any(|range| range.start >= 1 && range.end <= 5)
+                    && !unit.rects.is_empty()
+            })
+            .map(|unit| (unit.rects[0].y, unit.rects[0].x))
+            .collect::<Vec<_>>();
+        assert_eq!(label, [(0, 0), (0, 1), (0, 2), (0, 3)]);
     }
 
     #[test]
