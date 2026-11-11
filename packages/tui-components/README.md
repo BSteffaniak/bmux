@@ -512,6 +512,10 @@ makes narrow rows explicit:
   while the row keeps its width and hit region.
 * The intrinsic width includes the gap and every decoration.
 
+A click selects a row; with `.toggle_on_click(true)` a click on an expandable
+row also toggles its expansion and reports `TreeViewOutcome::Toggled`, as file
+trees usually do. Leaf rows still only select.
+
 Scale: the tree is one leaf whose height is its visible row count, placed in a
 `ScrollViewComponent` (or another clipping parent). Painting, row hit regions,
 and semantic regions cover only rows inside the paint clip, and a pointer

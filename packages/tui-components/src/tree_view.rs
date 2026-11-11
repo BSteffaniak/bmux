@@ -590,6 +590,7 @@ struct TreeView<'a> {
     styles: TreeViewStyles,
     trailing_layout: TreeViewTrailingLayout,
     focus_style: Style,
+    toggle_on_click: bool,
 }
 
 impl<'a> TreeView<'a> {
@@ -622,6 +623,7 @@ impl<'a> TreeView<'a> {
                 marker: Style::new(),
             },
             trailing_layout: TreeViewTrailingLayout::new(),
+            toggle_on_click: false,
         }
     }
 
@@ -960,7 +962,16 @@ impl<'a> TreeView<'a> {
                     if self.items[source].disabled {
                         return TreeViewOutcome::Redraw;
                     }
-                    select(state, hit, &self.items[source]);
+                    let item = &self.items[source];
+                    select(state, hit, item);
+                    if self.toggle_on_click && item.expandable {
+                        state.toggle_expanded(&item.id);
+                        return TreeViewOutcome::Toggled {
+                            visible: hit,
+                            source,
+                            expanded: state.is_expanded(&item.id),
+                        };
+                    }
                     return TreeViewOutcome::Selected {
                         visible: hit,
                         source,
@@ -1236,6 +1247,15 @@ impl<'a, 'state> TreeViewComponent<'a, 'state> {
         self
     }
 
+    /// Make a completed click on an expandable row toggle its expansion as well as select
+    /// it, reporting [`TreeViewOutcome::Toggled`] instead of [`TreeViewOutcome::Selected`].
+    /// Off by default: clicks only select, and expansion changes come from the keyboard.
+    #[must_use]
+    pub const fn toggle_on_click(mut self, toggle: bool) -> Self {
+        self.tree.toggle_on_click = toggle;
+        self
+    }
+
     fn projection(&self) -> Arc<TreeViewProjection> {
         self.tree.projection(&mut self.state.borrow_mut())
     }
@@ -1374,6 +1394,7 @@ impl Component for TreeViewComponent<'_, '_> {
         self.tree.policy.mouse.enabled.hash(&mut paint);
         self.tree.policy.mouse.hover.hash(&mut paint);
         self.tree.policy.mouse.click.hash(&mut paint);
+        self.tree.toggle_on_click.hash(&mut paint);
         state.selected_visible.hash(&mut paint);
         state.selected_id.hash(&mut paint);
         state.expanded.hash(&mut paint);
@@ -2611,6 +2632,67 @@ mod tests {
         );
         assert_eq!(state.borrow().selected_visible(), Some(2));
         assert_eq!(state.borrow().pressed_visible, None);
+    }
+
+    #[test]
+    fn toggle_on_click_expands_and_collapses_expandable_rows_only() {
+        let items = sample_items();
+        let state = RefCell::new(TreeViewState::new(None));
+        let component = TreeViewComponent::new("tree", &items, &state).toggle_on_click(true);
+        let click = |row: u16| {
+            let layout = component.layout(Constraints::for_width(20), &mut LayoutCx::new());
+            let mut cx = EventCx::new(&layout);
+            let mut outcome = TreeViewOutcome::Ignored;
+            for kind in [
+                MouseEventKind::Down(MouseButton::Left),
+                MouseEventKind::Up(MouseButton::Left),
+            ] {
+                outcome = component.handle_event(
+                    &Event::Mouse(MouseEvent::new(kind, Point::new(1, row))),
+                    &layout,
+                    &mut cx,
+                );
+            }
+            outcome
+        };
+        let collapsed = component.visible_count();
+        let source = component.visible_source(0).unwrap();
+        assert!(items[source].expandable);
+        assert_eq!(
+            click(0),
+            TreeViewOutcome::Toggled {
+                visible: 0,
+                source,
+                expanded: true
+            }
+        );
+        assert!(component.visible_count() > collapsed);
+        assert_eq!(
+            state.borrow().selected_id(),
+            Some(items[source].id.as_str())
+        );
+        assert_eq!(
+            click(0),
+            TreeViewOutcome::Toggled {
+                visible: 0,
+                source,
+                expanded: false
+            }
+        );
+        assert_eq!(component.visible_count(), collapsed);
+        // Leaf rows still only select.
+        let leaf = (0..component.visible_count())
+            .find(|row| !items[component.visible_source(*row).unwrap()].expandable)
+            .unwrap();
+        let row = u16::try_from(leaf).unwrap();
+        assert_eq!(
+            click(row),
+            TreeViewOutcome::Selected {
+                visible: leaf,
+                source: component.visible_source(leaf).unwrap()
+            }
+        );
+        assert_eq!(component.visible_count(), collapsed);
     }
 
     #[test]

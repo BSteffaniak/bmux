@@ -1629,6 +1629,8 @@ height is its visible row count, placed inside a `ScrollViewComponent`:
   of every item; a tight width never measures labels;
 - expansion is keyed by item id, and selection made by the component is keyed
   by item id, so it follows its item when rows above it appear or disappear.
+- `toggle_on_click(true)` makes a click on an expandable row toggle it as well
+  as select it.
 
 Rows may carry styled labels and right-aligned trailing decorations laid out
 by display width with an explicit narrow-row policy
