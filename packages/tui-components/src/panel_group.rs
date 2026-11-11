@@ -824,23 +824,9 @@ impl Component for PanelGroupComponent<'_> {
         if outcome != PanelGroupOutcome::Ignored {
             return EventOutcome::Handled;
         }
+        // Children are offset from this group, wherever the group itself is placed.
         for (child, component) in layout.children.iter().zip(&self.children).rev() {
-            let clip = Rect::new(
-                area.x
-                    .saturating_add(u16::try_from(child.x).unwrap_or(u16::MAX)),
-                area.y
-                    .saturating_add(u16::try_from(child.y).unwrap_or(u16::MAX)),
-                child.node.size.width.try_into().unwrap_or(u16::MAX),
-                u16::try_from(child.node.size.height).unwrap_or(u16::MAX),
-            );
-            let outcome = cx.with_transform(
-                child.x,
-                child.y,
-                i32::from(clip.x),
-                i64::from(clip.y),
-                clip,
-                |cx| component.event(event, &child.node, cx),
-            );
+            let outcome = cx.with_child(child, |cx| component.event(event, &child.node, cx));
             if outcome != EventOutcome::Ignored {
                 return outcome;
             }
@@ -1347,6 +1333,118 @@ mod tests {
     };
     use crate::selection::{ComponentSelectionPolicy, ComponentSelectionState};
     use bmux_tui::style::{Color, Style};
+
+    /// A leaf filling its constraints that records where pointer events land, in its own
+    /// local coordinates.
+    struct PointProbe<'a> {
+        id: &'static str,
+        seen: &'a std::cell::Cell<Option<(i64, i64)>>,
+    }
+
+    impl Component for PointProbe<'_> {
+        fn layout(
+            &self,
+            constraints: Constraints,
+            _cx: &mut LayoutCx,
+        ) -> bmux_tui::component::LayoutNode {
+            bmux_tui::component::LayoutNode::leaf(
+                bmux_tui::component::LayoutId::new(self.id),
+                constraints.constrain(bmux_tui::component::LogicalSize::new(
+                    constraints.max_width(),
+                    constraints.max_height().unwrap_or(1),
+                )),
+            )
+        }
+
+        fn paint(&self, _layout: &bmux_tui::component::LayoutNode, _cx: &mut PaintCx<'_, '_>) {}
+
+        fn event(
+            &self,
+            event: &Event,
+            layout: &bmux_tui::component::LayoutNode,
+            cx: &mut EventCx<'_>,
+        ) -> EventOutcome {
+            let Event::Mouse(mouse) = event else {
+                return EventOutcome::Ignored;
+            };
+            let area = cx.visible_rect(bmux_tui::component::LogicalRect::new(
+                0,
+                0,
+                layout.size.width,
+                layout.size.height,
+            ));
+            if !area.contains(mouse.position) {
+                return EventOutcome::Ignored;
+            }
+            self.seen.set(Some(cx.local_point(mouse.position)));
+            EventOutcome::Handled
+        }
+    }
+
+    #[test]
+    fn children_receive_events_in_local_coordinates_wherever_the_group_is_placed() {
+        let left = std::cell::Cell::new(None);
+        let right = std::cell::Cell::new(None);
+        let inner_state = RefCell::new(PanelGroupState::new([
+            PanelSize::fixed(4),
+            PanelSize::flex(1),
+        ]));
+        let outer_state = RefCell::new(PanelGroupState::new([
+            PanelSize::fixed(3),
+            PanelSize::flex(1),
+        ]));
+        let filler = std::cell::Cell::new(None);
+        // The inner group is the outer group's second panel, at x = 4 (3 cells and a divider).
+        let component = PanelGroupComponent::new(
+            "outer",
+            PanelGroup::new(PanelGroupAxis::Horizontal),
+            &outer_state,
+        )
+        .child(PointProbe {
+            id: "filler",
+            seen: &filler,
+        })
+        .child(
+            PanelGroupComponent::new(
+                "inner",
+                PanelGroup::new(PanelGroupAxis::Horizontal),
+                &inner_state,
+            )
+            .child(PointProbe {
+                id: "left",
+                seen: &left,
+            })
+            .child(PointProbe {
+                id: "right",
+                seen: &right,
+            }),
+        );
+        let layout = component.layout(
+            Constraints::tight(bmux_tui::geometry::Size::new(24, 3)),
+            &mut LayoutCx::new(),
+        );
+        // Placed at (10, 5) on the terminal.
+        for (point, probe, expected) in [
+            (Point::new(11, 6), &filler, (1, 1)),
+            (Point::new(15, 5), &left, (1, 0)),
+            // Inner right panel starts at 4 + 4 + 1 = 9.
+            (Point::new(21, 7), &right, (2, 2)),
+        ] {
+            let mut cx = EventCx::new(&layout);
+            let outcome = cx.with_transform(0, 0, 10, 5, Rect::new(10, 5, 24, 3), |cx| {
+                component.event(
+                    &Event::Mouse(MouseEvent::new(
+                        MouseEventKind::Down(MouseButton::Left),
+                        point,
+                    )),
+                    &layout,
+                    cx,
+                )
+            });
+            assert_eq!(outcome, EventOutcome::Handled, "{point:?}");
+            assert_eq!(probe.take(), Some(expected), "{point:?}");
+        }
+    }
 
     #[test]
     fn pointer_override_invalidates_paint_without_remeasuring_layout() {

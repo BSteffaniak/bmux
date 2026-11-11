@@ -52,6 +52,13 @@ Painting and event routing consume that exact tree; they do not independently
 recompute placement. A parent assigns each child's local placement, and scoped
 contexts translate it to terminal coordinates.
 
+Event routing translates relative to the parent: a container routes a child
+with `EventCx::with_child(child, ..)` (or `with_transform` with the child's
+offset from the container), never with the child's absolute terminal position.
+Containers such as `PanelGroupComponent` and `PaneComponent` therefore deliver
+events correctly wherever they are placed, including nested in other
+containers or routed under an `EventCx` that already carries a translation.
+
 `ComponentRevision` has independent layout and paint channels. Callers advance
 the layout revision when measurement or child placement can change and the
 paint revision when visual output changes without changing geometry. Stable

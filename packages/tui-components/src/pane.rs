@@ -1109,25 +1109,9 @@ impl Component for PaneComponent<'_, '_> {
         if outcome != PaneOutcome::Ignored {
             return EventOutcome::Handled;
         }
+        // The title and the content are offset from this pane, wherever the pane is placed.
         if let (Some(title), Some(node)) = (&self.title, layout.children.get(1)) {
-            let x = state
-                .area
-                .x
-                .saturating_add(u16::try_from(node.x).unwrap_or(u16::MAX));
-            let clip = Rect::new(
-                x,
-                state.area.y,
-                node.node.size.width.try_into().unwrap_or(u16::MAX),
-                u16::try_from(node.node.size.height).unwrap_or(u16::MAX),
-            );
-            let outcome = cx.with_transform(
-                node.x,
-                node.y,
-                i32::from(x),
-                i64::from(state.area.y),
-                clip,
-                |cx| title.event(event, &node.node, cx),
-            );
+            let outcome = cx.with_child(node, |cx| title.event(event, &node.node, cx));
             if outcome != EventOutcome::Ignored {
                 return outcome;
             }
@@ -1139,31 +1123,9 @@ impl Component for PaneComponent<'_, '_> {
         else {
             return EventOutcome::Ignored;
         };
-        let clip = Rect::new(
-            state
-                .area
-                .x
-                .saturating_add(u16::try_from(child.x).unwrap_or(u16::MAX)),
-            state
-                .area
-                .y
-                .saturating_add(u16::try_from(child.y).unwrap_or(u16::MAX)),
-            child.node.size.width.try_into().unwrap_or(u16::MAX),
-            u16::try_from(child.node.size.height).unwrap_or(u16::MAX),
-        );
-        cx.with_transform(
-            child.x,
-            child.y,
-            i32::from(
-                state
-                    .area
-                    .x
-                    .saturating_add(u16::try_from(child.x).unwrap_or(u16::MAX)),
-            ),
-            i64::from(state.area.y).saturating_add(i64::try_from(child.y).unwrap_or(i64::MAX)),
-            clip,
-            |cx| self.child.event(event, &child.node, cx),
-        )
+        // The surface sits at the pane's origin, so the content's offset in the surface is
+        // its offset in the pane.
+        cx.with_child(child, |cx| self.child.event(event, &child.node, cx))
     }
 }
 
@@ -1354,6 +1316,95 @@ mod tests {
         Pane, PaneBoundsPolicy, PaneComponent, PaneMousePolicy, PaneOutcome, PanePolicy, PaneState,
         PaneTitleAction, ResizeHandles,
     };
+
+    /// A leaf filling its constraints that records where pointer events land, in its own
+    /// local coordinates.
+    struct PointProbe<'a> {
+        id: &'static str,
+        seen: &'a std::cell::Cell<Option<(i64, i64)>>,
+    }
+
+    impl Component for PointProbe<'_> {
+        fn layout(
+            &self,
+            constraints: Constraints,
+            _cx: &mut LayoutCx,
+        ) -> bmux_tui::component::LayoutNode {
+            bmux_tui::component::LayoutNode::leaf(
+                bmux_tui::component::LayoutId::new(self.id),
+                constraints.constrain(bmux_tui::component::LogicalSize::new(
+                    constraints.max_width(),
+                    constraints.max_height().unwrap_or(1),
+                )),
+            )
+        }
+
+        fn paint(&self, _layout: &bmux_tui::component::LayoutNode, _cx: &mut PaintCx<'_, '_>) {}
+
+        fn event(
+            &self,
+            event: &Event,
+            layout: &bmux_tui::component::LayoutNode,
+            cx: &mut EventCx<'_>,
+        ) -> EventOutcome {
+            let Event::Mouse(mouse) = event else {
+                return EventOutcome::Ignored;
+            };
+            let area = cx.visible_rect(bmux_tui::component::LogicalRect::new(
+                0,
+                0,
+                layout.size.width,
+                layout.size.height,
+            ));
+            if !area.contains(mouse.position) {
+                return EventOutcome::Ignored;
+            }
+            self.seen.set(Some(cx.local_point(mouse.position)));
+            EventOutcome::Handled
+        }
+    }
+
+    #[test]
+    fn content_receives_events_in_local_coordinates_wherever_the_pane_is_placed() {
+        let seen = Cell::new(None);
+        let state = Cell::new(PaneState::new(Rect::new(0, 0, 12, 5)));
+        let component = PaneComponent::new(
+            "pane",
+            Pane::new().padding(Insets::new(0, 1, 0, 1)),
+            &state,
+            PointProbe {
+                id: "content",
+                seen: &seen,
+            },
+        );
+        let layout = component.layout(Constraints::tight(Size::new(12, 5)), &mut LayoutCx::new());
+        for (origin, point) in [
+            ((0_u16, 0_u16), Point::new(3, 2)),
+            ((10, 5), Point::new(13, 7)),
+        ] {
+            let mut cx = EventCx::new(&layout);
+            let outcome = cx.with_transform(
+                0,
+                0,
+                i32::from(origin.0),
+                i64::from(origin.1),
+                Rect::new(origin.0, origin.1, 12, 5),
+                |cx| {
+                    component.event(
+                        &Event::Mouse(MouseEvent::new(
+                            MouseEventKind::Down(MouseButton::Left),
+                            point,
+                        )),
+                        &layout,
+                        cx,
+                    )
+                },
+            );
+            assert_eq!(outcome, EventOutcome::Handled, "{origin:?}");
+            // Border and one cell of left padding put the content at (2, 1) in the pane.
+            assert_eq!(seen.take(), Some((1, 1)), "{origin:?}");
+        }
+    }
 
     /// A 10 by `height` pane over a scroll view of `lines` rows, painted; returns the right
     /// border column's symbols, the scrollbar's hit region and the layout.
