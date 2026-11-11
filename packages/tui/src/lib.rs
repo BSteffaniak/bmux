@@ -106,11 +106,12 @@ pub mod prelude {
     pub use crate::pointer::{PointerIntent, PointerShape, resolve_pointer_intent};
     pub use crate::selection::{
         SelectionAffinity, SelectionAutoScrollPolicy, SelectionAutoScrollRequest, SelectionCapture,
-        SelectionContentId, SelectionController, SelectionEndpoint, SelectionFragment,
-        SelectionFragmentId, SelectionGesturePhase, SelectionOutcome, SelectionScene,
-        SelectionSceneError, SelectionScope, SelectionScopeId, SelectionScrollAxis,
-        SelectionScrollDirection, SelectionSlice, SelectionSnapshot, paint_selection_highlights,
-        painted_text_fragments, plain_text_fragments, plain_text_fragments_with_tabs,
+        SelectionCell, SelectionContentId, SelectionController, SelectionEndpoint,
+        SelectionFragment, SelectionFragmentId, SelectionGesturePhase, SelectionOutcome,
+        SelectionScene, SelectionSceneError, SelectionScope, SelectionScopeId, SelectionScrollAxis,
+        SelectionScrollDirection, SelectionSlice, SelectionSnapshot, SelectionTextRun,
+        paint_selection_highlights, painted_text_cells, painted_text_fragments,
+        plain_text_fragments, plain_text_fragments_with_tabs,
     };
     pub use crate::source_map::{OffsetSourceRows, SourceMapped};
     pub use crate::style::{Color, Easing, Modifier, Style};

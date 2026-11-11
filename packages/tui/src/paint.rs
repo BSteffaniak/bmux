@@ -18,7 +18,7 @@ use crate::frame::{Cursor, Frame};
 use crate::geometry::{Point, Rect};
 use crate::hit::HitRegion;
 use crate::image::ImageContribution;
-use crate::selection::{SelectionFragment, SelectionScope, SelectionSnapshot};
+use crate::selection::{SelectionFragment, SelectionScope, SelectionSnapshot, SelectionTextRun};
 use crate::semantic::SemanticRegion;
 use crate::style::Style;
 use crate::text::Line;
@@ -551,6 +551,17 @@ impl<'frame, 'buffer> PaintCx<'frame, 'buffer> {
         }
         fragment.area = area;
         self.frame.push_selection_fragment(fragment);
+    }
+
+    /// Register a local text run after translation and clipping. Its units
+    /// are materialized as fragments only when the frame's selection scene is
+    /// queried, and, like [`Self::push_selection_fragment`], units partially
+    /// outside this context's clip are omitted. A run whose row is clipped
+    /// away registers nothing.
+    pub fn push_selection_text_run(&mut self, run: SelectionTextRun) {
+        if let Some(run) = run.translate_and_clip(self.origin_x, self.origin_y, self.clip) {
+            self.frame.push_selection_text_run(run);
+        }
     }
 
     /// Register an image contribution, translating its destination and

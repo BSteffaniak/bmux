@@ -211,6 +211,20 @@ with the painted cells. `plain_text_fragments` expands tabs to tab stops and
 gives every grapheme at least one cell; use it only for content painted with
 that same tab expansion.
 
+Rows can also be registered whole. A `selection::SelectionTextRun` carries one
+row's units (`SelectionCell`: column offset, cells, source bytes) in a shared
+table and is registered with `PaintCx::push_selection_text_run`; the scene
+stores the run and materializes its fragments only when it is first queried
+(`SelectionScene::fragments`, gestures, snapshots, serialization). A run
+yields exactly the fragments that per-grapheme registration of the same units
+would, including clipping (units partly outside the context's clip are
+omitted), occlusion, and regional merges, so painting large selectable views
+costs one value per visible row instead of one fragment per grapheme, whether
+or not a selection controller reads the scene. `painted_text_cells` (behind
+`painted_text_fragments` and `SelectionTextRun::painted_text`) builds the units
+of a row painted through `Line`; layouts that place graphemes themselves can
+build the units from their own placements.
+
 Clicks and drags over selectable content are separated by
 `bmux_tui::gesture::PointerGestureRecognizer`. A left press and release is a
 `PointerGesture::Click { region, .. }` when the pointer never travelled beyond

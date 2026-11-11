@@ -382,6 +382,199 @@ impl SelectionFragment {
     }
 }
 
+/// One visual unit of a [`SelectionTextRun`]: cells at a column offset from
+/// the run's origin, mapped to the source bytes they paint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct SelectionCell {
+    /// Column of the unit's first cell, relative to the run's origin.
+    pub x: u16,
+    /// Cells occupied by the unit.
+    pub width: u16,
+    /// First source byte represented by the complete unit.
+    pub start: usize,
+    /// Byte after the last source byte represented by the unit.
+    pub end: usize,
+}
+
+impl SelectionCell {
+    /// Create a unit of `width` cells at column `x` representing `source`.
+    #[must_use]
+    pub const fn new(x: u16, width: u16, source: Range<usize>) -> Self {
+        Self {
+            x,
+            width,
+            start: source.start,
+            end: source.end,
+        }
+    }
+
+    /// Source byte range represented by the unit.
+    #[must_use]
+    pub const fn source_range(&self) -> Range<usize> {
+        self.start..self.end
+    }
+}
+
+/// One row of selectable text registered as a whole and materialized into
+/// per-unit [`SelectionFragment`]s only when the scene is queried.
+///
+/// Registering a run costs one value per row instead of one fragment per
+/// grapheme, so painting stays cheap whether or not a selection controller
+/// reads the scene, and a scene that is queried materializes its fragments
+/// once. The cell table is shared (`Arc`), so callers can build it once per
+/// laid-out row and register clones of the run on every frame.
+///
+/// A run materializes exactly the fragments that registering one fragment per
+/// cell would: cells partially outside the registering context's clip are
+/// omitted, cells of zero width contribute nothing, and fragment identities,
+/// order, and revision are those of [`SelectionFragment::new`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectionTextRun {
+    /// Scope directly owning the run's fragments.
+    pub scope_id: SelectionScopeId,
+    /// Stable logical content identity.
+    pub content_id: SelectionContentId,
+    /// Deterministic content order within an ancestor selection scope.
+    pub order: u64,
+    /// Caller-owned content revision.
+    pub revision: u64,
+    /// Column of the run's origin: local before registration through a paint
+    /// context, terminal afterwards.
+    x: i32,
+    /// Row of the run.
+    y: u16,
+    /// Cell offsets, relative to `x`, within which units are materialized.
+    visible: Range<i32>,
+    cells: std::sync::Arc<[SelectionCell]>,
+}
+
+impl SelectionTextRun {
+    /// Create a run whose cells are placed relative to `origin`.
+    #[must_use]
+    pub fn new(
+        scope_id: impl Into<SelectionScopeId>,
+        content_id: impl Into<SelectionContentId>,
+        origin: Point,
+        order: u64,
+        cells: std::sync::Arc<[SelectionCell]>,
+    ) -> Self {
+        Self {
+            scope_id: scope_id.into(),
+            content_id: content_id.into(),
+            order,
+            revision: 0,
+            x: i32::from(origin.x),
+            y: origin.y,
+            visible: 0..i32::from(u16::MAX),
+            cells,
+        }
+    }
+
+    /// Create a run for one unwrapped row of painted text, with the units
+    /// produced by [`painted_text_cells`] for `area.width` cells.
+    #[must_use]
+    pub fn painted_text(
+        scope_id: impl Into<SelectionScopeId>,
+        content_id: impl Into<SelectionContentId>,
+        area: Rect,
+        order: u64,
+        source: &str,
+        source_offset: usize,
+    ) -> Self {
+        Self::new(
+            scope_id,
+            content_id,
+            Point::new(area.x, area.y),
+            order,
+            painted_text_cells(source, source_offset, area.width).into(),
+        )
+    }
+
+    /// Set the content revision.
+    #[must_use]
+    pub const fn revision(mut self, revision: u64) -> Self {
+        self.revision = revision;
+        self
+    }
+
+    /// The run's units.
+    #[must_use]
+    pub fn cells(&self) -> &[SelectionCell] {
+        &self.cells
+    }
+
+    /// Visible fragments this run represents, in cell order.
+    pub fn fragments(&self) -> impl Iterator<Item = SelectionFragment> + '_ {
+        self.visible_cells().filter_map(move |(x, cell)| {
+            Some(
+                SelectionFragment::new(
+                    self.scope_id.clone(),
+                    self.content_id.clone(),
+                    Rect::new(u16::try_from(x).ok()?, self.y, cell.width, 1),
+                    self.order,
+                    cell.source_range(),
+                )
+                .revision(self.revision),
+            )
+        })
+    }
+
+    /// Visible units with their absolute column.
+    fn visible_cells(&self) -> impl Iterator<Item = (i32, &SelectionCell)> + '_ {
+        self.cells.iter().filter_map(move |cell| {
+            let start = i32::from(cell.x);
+            let end = start + i32::from(cell.width);
+            let x = self.x.checked_add(start)?;
+            (cell.width > 0
+                && start >= self.visible.start
+                && end <= self.visible.end
+                && x >= 0
+                && x.checked_add(i32::from(cell.width))? <= i32::from(u16::MAX))
+            .then_some((x, cell))
+        })
+    }
+
+    /// Smallest rectangle covering every visible unit.
+    #[must_use]
+    pub fn visible_area(&self) -> Option<Rect> {
+        let mut cells = self.visible_cells();
+        let (first, cell) = cells.next()?;
+        let mut left = first;
+        let mut right = first + i32::from(cell.width);
+        for (x, cell) in cells {
+            left = left.min(x);
+            right = right.max(x + i32::from(cell.width));
+        }
+        Some(Rect::new(
+            u16::try_from(left).ok()?,
+            self.y,
+            u16::try_from(right - left).ok()?,
+            1,
+        ))
+    }
+
+    /// Translate a locally placed run by `origin` and restrict it to `clip`
+    /// (terminal coordinates). Returns `None` when its row is clipped away.
+    pub(crate) fn translate_and_clip(
+        mut self,
+        origin_x: i32,
+        origin_y: i64,
+        clip: Rect,
+    ) -> Option<Self> {
+        let y = origin_y.checked_add(i64::from(self.y))?;
+        if y < i64::from(clip.y) || y >= i64::from(clip.bottom()) {
+            return None;
+        }
+        self.y = u16::try_from(y).ok()?;
+        self.x = self.x.checked_add(origin_x)?;
+        let left = i32::from(clip.x).saturating_sub(self.x);
+        let right = i32::from(clip.right()).saturating_sub(self.x);
+        self.visible = self.visible.start.max(left)..self.visible.end.min(right);
+        (self.visible.start < self.visible.end).then_some(self)
+    }
+}
+
 /// Logical affinity at a visual-unit boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SelectionAffinity {
@@ -598,11 +791,74 @@ impl std::fmt::Display for SelectionSceneError {
 impl std::error::Error for SelectionSceneError {}
 
 /// Hierarchical selectable geometry belonging to one rendered frame.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+///
+/// Content is registered as individual [`SelectionFragment`]s or as whole
+/// [`SelectionTextRun`]s; [`Self::fragments`] presents both as fragments in
+/// registration order, materializing runs once on first access.
+#[derive(Debug, Clone, Default)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(into = "SelectionSceneWire", from = "SelectionSceneWire")
+)]
 pub struct SelectionScene {
     scopes: Vec<SelectionScope>,
     fragments: Vec<SelectionFragment>,
+    /// Runs with the number of `fragments` registered before each.
+    runs: Vec<(usize, SelectionTextRun)>,
+    /// `fragments` and materialized `runs` in registration order, when runs exist.
+    materialized: std::sync::OnceLock<Vec<SelectionFragment>>,
+}
+
+/// Serialized form of a [`SelectionScene`]: runs travel as their fragments.
+#[cfg(feature = "serde")]
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SelectionSceneWire {
+    scopes: Vec<SelectionScope>,
+    fragments: Vec<SelectionFragment>,
+}
+
+#[cfg(feature = "serde")]
+impl From<SelectionScene> for SelectionSceneWire {
+    fn from(scene: SelectionScene) -> Self {
+        let fragments = scene.fragments().to_vec();
+        Self {
+            scopes: scene.scopes,
+            fragments,
+        }
+    }
+}
+
+#[cfg(feature = "serde")]
+impl From<SelectionSceneWire> for SelectionScene {
+    fn from(wire: SelectionSceneWire) -> Self {
+        Self {
+            scopes: wire.scopes,
+            fragments: wire.fragments,
+            runs: Vec::new(),
+            materialized: std::sync::OnceLock::new(),
+        }
+    }
+}
+
+/// Scenes are equal when they present the same scopes and fragments, however
+/// their content was registered.
+impl PartialEq for SelectionScene {
+    fn eq(&self, other: &Self) -> bool {
+        self.scopes == other.scopes && self.fragments() == other.fragments()
+    }
+}
+
+impl Eq for SelectionScene {}
+
+/// How [`SelectionScene::extend_filtered`] treats a run.
+enum RunFilter {
+    /// Keep the run whole.
+    Keep,
+    /// Drop the run.
+    Drop,
+    /// Keep the run's fragments that pass the fragment filter.
+    Split,
 }
 
 impl SelectionScene {
@@ -612,6 +868,8 @@ impl SelectionScene {
         Self {
             scopes: Vec::new(),
             fragments: Vec::new(),
+            runs: Vec::new(),
+            materialized: std::sync::OnceLock::new(),
         }
     }
 
@@ -621,10 +879,24 @@ impl SelectionScene {
         &self.scopes
     }
 
-    /// Return registered visible fragments in render order.
+    /// Return registered visible fragments in render order, including the
+    /// fragments of registered text runs.
     #[must_use]
     pub fn fragments(&self) -> &[SelectionFragment] {
-        &self.fragments
+        if self.runs.is_empty() {
+            return &self.fragments;
+        }
+        self.materialized.get_or_init(|| {
+            let mut output = Vec::with_capacity(self.fragments.len());
+            let mut next = 0;
+            for (position, run) in &self.runs {
+                output.extend_from_slice(&self.fragments[next..*position]);
+                next = *position;
+                output.extend(run.fragments());
+            }
+            output.extend_from_slice(&self.fragments[next..]);
+            output
+        })
     }
 
     /// Add or replace a scope with the same stable ID.
@@ -639,6 +911,64 @@ impl SelectionScene {
     /// Add one visible fragment.
     pub fn push_fragment(&mut self, fragment: SelectionFragment) {
         self.fragments.push(fragment);
+        self.materialized.take();
+    }
+
+    /// Add one text run in terminal coordinates; its fragments are
+    /// materialized when the scene is first queried.
+    pub fn push_text_run(&mut self, run: SelectionTextRun) {
+        self.runs.push((self.fragments.len(), run));
+        self.materialized.take();
+    }
+
+    /// Mutable access to the registered scopes (identities must stay unique).
+    pub(crate) fn scopes_mut(&mut self) -> &mut [SelectionScope] {
+        &mut self.scopes
+    }
+
+    /// Append `source`'s content that passes the filters, keeping
+    /// registration order. Runs marked [`RunFilter::Split`] contribute their
+    /// fragments that pass `keep`.
+    fn extend_filtered(
+        &mut self,
+        source: &Self,
+        keep: impl Fn(&SelectionFragment) -> bool,
+        run_filter: impl Fn(&SelectionTextRun) -> RunFilter,
+    ) {
+        self.materialized.take();
+        let mut next = 0;
+        let eager = |fragments: &[SelectionFragment], output: &mut Vec<SelectionFragment>| {
+            output.extend(fragments.iter().filter(|fragment| keep(fragment)).cloned());
+        };
+        for (position, run) in &source.runs {
+            eager(&source.fragments[next..*position], &mut self.fragments);
+            next = *position;
+            match run_filter(run) {
+                RunFilter::Keep => self.runs.push((self.fragments.len(), run.clone())),
+                RunFilter::Drop => {}
+                RunFilter::Split => {
+                    let fragments = run.fragments().collect::<Vec<_>>();
+                    eager(&fragments, &mut self.fragments);
+                }
+            }
+        }
+        eager(&source.fragments[next..], &mut self.fragments);
+    }
+
+    /// Remove content intersecting `area`. Runs crossing it are split into
+    /// their fragments that do not.
+    pub(crate) fn remove_content_in(&mut self, area: Rect) {
+        let mut source = std::mem::take(self);
+        self.scopes = std::mem::take(&mut source.scopes);
+        self.extend_filtered(
+            &source,
+            |fragment| fragment.area.intersection(area).is_empty(),
+            |run| match run.visible_area() {
+                None => RunFilter::Drop,
+                Some(visible) if visible.intersection(area).is_empty() => RunFilter::Keep,
+                Some(_) => RunFilter::Split,
+            },
+        );
     }
 
     /// Validate hierarchy and fragment references.
@@ -665,7 +995,7 @@ impl SelectionScene {
                 cursor = self.scope(id).and_then(|item| item.parent.as_ref());
             }
         }
-        for fragment in &self.fragments {
+        for fragment in self.fragments() {
             if self.scope(&fragment.scope_id).is_none() {
                 return Err(SelectionSceneError::MissingFragmentScope {
                     content_id: fragment.content_id.clone(),
@@ -694,6 +1024,11 @@ impl SelectionScene {
             .iter()
             .map(|scope| scope.id.clone())
             .collect::<BTreeSet<_>>();
+        let touches = |area: Rect| {
+            regions
+                .iter()
+                .any(|region| !area.intersection(*region).is_empty())
+        };
         let mut merged = Self {
             scopes: self
                 .scopes
@@ -701,30 +1036,45 @@ impl SelectionScene {
                 .filter(|scope| !emitted_scope_ids.contains(&scope.id))
                 .cloned()
                 .collect(),
-            fragments: self
-                .fragments
-                .iter()
-                .filter(|fragment| {
-                    !regions
-                        .iter()
-                        .any(|region| !fragment.area.intersection(*region).is_empty())
-                })
-                .cloned()
-                .collect(),
+            ..Self::new()
         };
+        merged.extend_filtered(
+            self,
+            |fragment| !touches(fragment.area),
+            |run| match run.visible_area() {
+                None => RunFilter::Drop,
+                Some(visible) if !touches(visible) => RunFilter::Keep,
+                Some(_) => RunFilter::Split,
+            },
+        );
         merged.scopes.extend(emitted.scopes.iter().cloned());
-        merged.fragments.extend(
-            emitted
-                .fragments
-                .iter()
-                .filter(|fragment| {
-                    regions
+        merged.extend_filtered(
+            emitted,
+            |fragment| touches(fragment.area),
+            |run| match run.visible_area() {
+                Some(visible)
+                    if regions
                         .iter()
-                        .any(|region| !fragment.area.intersection(*region).is_empty())
-                })
-                .cloned(),
+                        .any(|region| region.intersection(visible) == visible) =>
+                {
+                    RunFilter::Keep
+                }
+                Some(visible) if touches(visible) => RunFilter::Split,
+                _ => RunFilter::Drop,
+            },
         );
         merged
+    }
+
+    /// Whether any registered content belongs to `scope_id` or a descendant,
+    /// without materializing runs.
+    fn has_content_in(&self, scope_id: &SelectionScopeId) -> bool {
+        self.fragments
+            .iter()
+            .any(|fragment| self.scope_belongs_to(&fragment.scope_id, scope_id))
+            || self.runs.iter().any(|(_, run)| {
+                run.visible_area().is_some() && self.scope_belongs_to(&run.scope_id, scope_id)
+            })
     }
 
     /// Resolve the deepest capturing scope under `point`.
@@ -737,10 +1087,7 @@ impl SelectionScene {
             .filter(|(_, scope)| {
                 scope.capture != SelectionCapture::Disabled
                     && scope.initiation_area.contains(point)
-                    && self
-                        .fragments
-                        .iter()
-                        .any(|fragment| self.fragment_belongs_to(fragment, &scope.id))
+                    && self.has_content_in(&scope.id)
             })
             .collect::<Vec<_>>();
         candidates.sort_by_key(|(index, scope)| (self.scope_depth(&scope.id), *index));
@@ -904,17 +1251,11 @@ impl SelectionScene {
         None
     }
 
-    fn fragment_belongs_to(
-        &self,
-        fragment: &SelectionFragment,
-        ancestor: &SelectionScopeId,
-    ) -> bool {
-        if &fragment.scope_id == ancestor {
+    fn scope_belongs_to(&self, scope_id: &SelectionScopeId, ancestor: &SelectionScopeId) -> bool {
+        if scope_id == ancestor {
             return true;
         }
-        let mut parent = self
-            .scope(&fragment.scope_id)
-            .and_then(|scope| scope.parent.as_ref());
+        let mut parent = self.scope(scope_id).and_then(|scope| scope.parent.as_ref());
         while let Some(parent_id) = parent {
             if parent_id == ancestor {
                 return true;
@@ -928,10 +1269,10 @@ impl SelectionScene {
 
     fn ordered_fragments(&self, scope_id: &SelectionScopeId) -> Vec<&SelectionFragment> {
         let mut fragments = self
-            .fragments
+            .fragments()
             .iter()
             .enumerate()
-            .filter(|(_, fragment)| self.fragment_belongs_to(fragment, scope_id))
+            .filter(|(_, fragment)| self.scope_belongs_to(&fragment.scope_id, scope_id))
             .collect::<Vec<_>>();
         fragments.sort_by(|(left_index, left), (right_index, right)| {
             left.order
@@ -1371,56 +1712,72 @@ pub fn painted_text_fragments(
     source_offset: usize,
     revision: u64,
 ) -> Vec<SelectionFragment> {
-    use unicode_segmentation::UnicodeSegmentation;
-
     let scope_id = scope_id.into();
     let content_id = content_id.into();
-    let mut x = area.x;
-    let mut output: Vec<SelectionFragment> = Vec::new();
-    // Start of leading zero-width bytes not yet attached to a fragment.
+    painted_text_cells(source, source_offset, area.width)
+        .into_iter()
+        .map(|cell| {
+            SelectionFragment::new(
+                scope_id.clone(),
+                content_id.clone(),
+                Rect::new(area.x.saturating_add(cell.x), area.y, cell.width, 1),
+                order,
+                cell.source_range(),
+            )
+            .revision(revision)
+        })
+        .collect()
+}
+
+/// Units occupying exactly the cells that [`crate::buffer::Buffer::write_line`]
+/// paints for one unwrapped source row within `width` cells, with columns
+/// relative to the row's first painted cell.
+///
+/// These are the units of [`painted_text_fragments`] (which places them at
+/// its `area`) and of [`SelectionTextRun::painted_text`]: zero-width
+/// graphemes join the preceding unit (or the following one at the start of
+/// the row), a wide grapheme that does not fit ends the row, and an empty or
+/// all-zero-width row contributes one boundary unit over the available row.
+#[must_use]
+pub fn painted_text_cells(source: &str, source_offset: usize, width: u16) -> Vec<SelectionCell> {
+    use unicode_segmentation::UnicodeSegmentation;
+
+    let mut x = 0_u16;
+    let mut output: Vec<SelectionCell> = Vec::new();
+    // Start of leading zero-width bytes not yet attached to a unit.
     let mut leading: Option<usize> = None;
     for (byte_offset, grapheme) in source.grapheme_indices(true) {
         let start = source_offset.saturating_add(byte_offset);
         let end = start.saturating_add(grapheme.len());
-        let width = crate::buffer::grapheme_width(grapheme);
-        if width == 0 {
+        let cells = crate::buffer::grapheme_width(grapheme);
+        if cells == 0 {
             match output.last_mut() {
-                Some(previous) => previous.source_range.end = end,
+                Some(previous) => previous.end = end,
                 None => {
                     leading.get_or_insert(start);
                 }
             }
             continue;
         }
-        if x >= area.right() || x.saturating_add(width) > area.right() {
+        if x >= width || x.saturating_add(cells) > width {
             break;
         }
-        output.push(
-            SelectionFragment::new(
-                scope_id.clone(),
-                content_id.clone(),
-                Rect::new(x, area.y, width, 1),
-                order,
-                leading.take().unwrap_or(start)..end,
-            )
-            .revision(revision),
-        );
-        x = x.saturating_add(width);
+        output.push(SelectionCell::new(
+            x,
+            cells,
+            leading.take().unwrap_or(start)..end,
+        ));
+        x = x.saturating_add(cells);
     }
     // No painted grapheme: an empty row, or one of zero-width graphemes only.
     let unpainted = source.is_empty() || leading.is_some();
-    if output.is_empty() && unpainted && !area.is_empty() {
+    if output.is_empty() && unpainted && width > 0 {
         let start = leading.unwrap_or(source_offset);
-        output.push(
-            SelectionFragment::new(
-                scope_id,
-                content_id,
-                Rect::new(area.x, area.y, area.width.max(1), 1),
-                order,
-                start..source_offset.saturating_add(source.len()),
-            )
-            .revision(revision),
-        );
+        output.push(SelectionCell::new(
+            0,
+            width,
+            start..source_offset.saturating_add(source.len()),
+        ));
     }
     output
 }
@@ -2474,3 +2831,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod text_run_tests;

@@ -7,7 +7,7 @@ use crate::geometry::{Point, Rect};
 use crate::hit::{HitMap, HitRegion};
 use crate::image::ImageContribution;
 use crate::selection::{
-    SelectionFragment, SelectionScene, SelectionScope, paint_selection_highlights,
+    SelectionFragment, SelectionScene, SelectionScope, SelectionTextRun, paint_selection_highlights,
 };
 use crate::semantic::{SemanticRegion, SemanticScene};
 use crate::style::Style;
@@ -107,21 +107,13 @@ pub(crate) fn occlude_metadata(
         }
     }
     *hits = visible_hits;
-    let mut visible_selection = SelectionScene::new();
-    for scope in selection.scopes() {
-        let mut scope = scope.clone();
+    for scope in selection.scopes_mut() {
         if !scope.initiation_area.intersection(area).is_empty() {
             // One rectangular initiation area cannot represent a cutout safely.
             scope.initiation_area = Rect::new(0, 0, 0, 0);
         }
-        visible_selection.push_scope(scope);
     }
-    for fragment in selection.fragments() {
-        if fragment.area.intersection(area).is_empty() {
-            visible_selection.push_fragment(fragment.clone());
-        }
-    }
-    *selection = visible_selection;
+    selection.remove_content_in(area);
     let mut visible_semantics = SemanticScene::new();
     for region in semantics.regions() {
         for visible in crate::image_scene::subtract_rect(region.area, area) {
@@ -283,17 +275,10 @@ impl<'buffer> Frame<'buffer> {
             // Selection also obeys scope exclusion. Previously painted scopes
             // remain logical metadata but cannot initiate or autoscroll behind
             // the foreground. Newly painted foreground scopes remain eligible.
-            let mut selection = SelectionScene::new();
-            for prior in self.selection.scopes() {
-                let mut prior = prior.clone();
+            for prior in self.selection.scopes_mut() {
                 prior.capture = crate::selection::SelectionCapture::Disabled;
                 prior.auto_scroll = crate::selection::SelectionAutoScrollPolicy::disabled();
-                selection.push_scope(prior);
             }
-            for fragment in self.selection.fragments() {
-                selection.push_fragment(fragment.clone());
-            }
-            self.selection = selection;
         }
         self.focus_scope = scope;
     }
@@ -318,6 +303,10 @@ impl<'buffer> Frame<'buffer> {
 
     pub(crate) fn push_selection_fragment(&mut self, fragment: SelectionFragment) {
         self.selection.push_fragment(fragment);
+    }
+
+    pub(crate) fn push_selection_text_run(&mut self, run: SelectionTextRun) {
+        self.selection.push_text_run(run);
     }
 
     pub(crate) fn paint_selection(&mut self, highlights: &[Rect], style: Style) {
