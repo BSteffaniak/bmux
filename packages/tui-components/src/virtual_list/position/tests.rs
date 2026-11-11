@@ -6,8 +6,8 @@ use bmux_tui::measured_list::{MeasuredListIndex, MeasuredListItem};
 
 use super::{
     AnchorOffset, AnchorPolicy, Edge, ListAnchor, ListGeometry, ListPosition, NoSourceMap,
-    Overscroll, ResolvedPosition, SourceMap, anchor_at_offset, anchor_for, position_at_offset,
-    resolve_position, target_top_offset,
+    Overscroll, ResolvedPosition, SourceMap, anchor_at_offset, anchor_for, anchor_for_below,
+    position_at_offset, resolve_position, target_top_offset, target_top_offset_below,
 };
 use crate::resident_window::EdgeRows;
 
@@ -432,4 +432,55 @@ fn list_position_defaults_to_top_for_any_key() {
     assert!(matches!(position, ListPosition::Top));
     assert!(position.anchor().is_none());
     assert!(ListPosition::<u8>::FollowBottom.is_follow_bottom());
+}
+
+#[test]
+fn covered_top_rows_shift_every_policy_into_the_uncovered_rows() {
+    // Thirty one-row items; a ten-row viewport whose first three rows are
+    // covered.
+    let index = index(0, &[1; 30]);
+    let geometry = ListGeometry::new(10);
+    let below = |key, policy, current, inset| {
+        target_top_offset_below(&index, &key, policy, current, geometry, inset)
+    };
+    // The item lands on the first uncovered row.
+    assert_eq!(below(15, AnchorPolicy::ItemTopAtTop, 0, 3), Some(12));
+    // Bottom alignment is unaffected by covered rows at the top.
+    assert_eq!(below(15, AnchorPolicy::ItemBottomAtBottom, 0, 3), Some(6));
+    // Centered within the seven uncovered rows (15 - 3 above it).
+    assert_eq!(below(15, AnchorPolicy::Center, 0, 3), Some(9));
+    // An item under the covered rows is not visible; one below them is.
+    let ensure_top = AnchorPolicy::EnsureVisibleFrom(Edge::Top);
+    assert_eq!(below(11, ensure_top, 10, 3), Some(8));
+    assert_eq!(below(13, ensure_top, 10, 3), Some(10));
+    assert_eq!(
+        target_top_offset(&index, &11, ensure_top, 10, geometry),
+        Some(10)
+    );
+    // A zero inset is the uncovered placement, and an inset of at least the
+    // viewport leaves one uncovered row.
+    for policy in [AnchorPolicy::ItemTopAtTop, AnchorPolicy::Center, ensure_top] {
+        assert_eq!(
+            below(15, policy, 4, 0),
+            target_top_offset(&index, &15, policy, 4, geometry)
+        );
+    }
+    assert_eq!(below(15, AnchorPolicy::ItemTopAtTop, 0, 50), Some(6));
+    assert_eq!(below(15, AnchorPolicy::ItemTopAtTop, 0, 9), Some(6));
+    // Clamped like any target, and unindexed keys have no offset.
+    assert_eq!(below(1, AnchorPolicy::ItemTopAtTop, 0, 3), Some(0));
+    assert_eq!(below(29, AnchorPolicy::ItemTopAtTop, 0, 3), Some(20));
+    assert_eq!(below(99, AnchorPolicy::ItemTopAtTop, 0, 3), None);
+    assert_eq!(
+        anchor_for_below::<u32, ()>(
+            &index,
+            &15,
+            AnchorPolicy::ItemTopAtTop,
+            0,
+            geometry,
+            3,
+            &NoSourceMap
+        ),
+        Some(ListPosition::Anchored(ListAnchor::top(12)))
+    );
 }

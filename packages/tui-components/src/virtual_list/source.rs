@@ -64,6 +64,39 @@ pub trait VirtualItemSource<K> {
     fn always_reconcile(&self) -> bool {
         false
     }
+
+    /// Nesting level of the item at `index` when it is a sticky section
+    /// header, or `None` for ordinary items (the default).
+    ///
+    /// A header at level `L` opens a section containing every following item
+    /// up to, but not including, the next header whose level is at most `L`.
+    /// Lower levels enclose higher ones (for example level 0 for an outer
+    /// group and level 1 for its subgroups). While any item of a section is
+    /// visible, a `VirtualListComponent` pins the section's header at the
+    /// viewport top, below the pinned headers of enclosing sections. A source
+    /// that reports header levels must also implement [`Self::section_parent`].
+    ///
+    /// Read only for items on or near the viewport and for the enclosing
+    /// headers of the item at the viewport top. Change an item's layout
+    /// revision, note a splice, or invalidate it when its header level
+    /// changes.
+    fn section_header_level(&self, _index: usize) -> Option<u16> {
+        None
+    }
+
+    /// Source position of the innermost section header whose section contains
+    /// the item at `index`, excluding the item itself, or `None` when no
+    /// section encloses it (the default).
+    ///
+    /// The returned position must be before `index`, must be a header
+    /// ([`Self::section_header_level`] is `Some`), and, when the item at
+    /// `index` is itself a header, must have a strictly lower level. A parent
+    /// chain that violates these rules is cut at the first violation. Sources
+    /// usually answer this from their own structure in constant or
+    /// logarithmic time; the list never scans the collection for it.
+    fn section_parent(&self, _index: usize) -> Option<usize> {
+        None
+    }
 }
 
 impl<K, T: VirtualItemSource<K> + ?Sized> VirtualItemSource<K> for &T {
@@ -102,5 +135,13 @@ impl<K, T: VirtualItemSource<K> + ?Sized> VirtualItemSource<K> for &T {
 
     fn always_reconcile(&self) -> bool {
         (**self).always_reconcile()
+    }
+
+    fn section_header_level(&self, index: usize) -> Option<u16> {
+        (**self).section_header_level(index)
+    }
+
+    fn section_parent(&self, index: usize) -> Option<usize> {
+        (**self).section_parent(index)
     }
 }

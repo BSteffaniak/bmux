@@ -433,7 +433,7 @@ impl Scrollbar {
         }
     }
 
-    const fn cell_style(
+    pub(crate) const fn cell_style(
         &self,
         position: u16,
         length: u16,

@@ -436,11 +436,63 @@ pub fn target_top_offset<K: Clone + Ord>(
     current_top: u64,
     geometry: ListGeometry,
 ) -> Option<u64> {
+    target_top_offset_below(index, key, policy, current_top, geometry, 0)
+}
+
+/// [`target_top_offset`] below `inset` covered viewport rows.
+///
+/// Only the rows below the covered rows (for example, pinned section
+/// headers) count as visible. Clamped to `0..=max_overscroll_top`; returns
+/// `None` when `key` is not indexed.
+///
+/// The policy applies to the uncovered rows: `ItemTopAtTop` puts the item's
+/// first row directly below the covered rows, `Center` centers it in the
+/// uncovered rows, and `EnsureVisibleFrom` treats an item under the covered
+/// rows as not visible. `inset` is limited to `viewport_height - 1`, so at
+/// least one uncovered row remains. An `inset` of zero is
+/// [`target_top_offset`].
+pub fn target_top_offset_below<K: Clone + Ord>(
+    index: &MeasuredListIndex<K>,
+    key: &K,
+    policy: AnchorPolicy,
+    current_top: u64,
+    geometry: ListGeometry,
+    inset: u64,
+) -> Option<u64> {
     let position = index.index_of(key)?;
     let start = index.item_offset(position)?;
     let height = index.item(position)?.height;
-    let target = place_rows(start, height, policy, current_top, geometry.viewport_height);
+    let target = place_rows_below(
+        start,
+        height,
+        policy,
+        current_top,
+        geometry.viewport_height,
+        inset,
+    );
     Some(target.min(geometry.max_overscroll_top(index.total_height())))
+}
+
+/// Unclamped top offset placing the `height` rows starting at collection row
+/// `start` according to `policy` in the viewport rows below the first
+/// `inset` (limited to `viewport - 1`).
+pub(super) fn place_rows_below(
+    start: u64,
+    height: u64,
+    policy: AnchorPolicy,
+    current_top: u64,
+    viewport: u64,
+    inset: u64,
+) -> u64 {
+    let inset = inset.min(viewport.saturating_sub(1));
+    place_rows(
+        start,
+        height,
+        policy,
+        current_top.saturating_add(inset),
+        viewport - inset,
+    )
+    .saturating_sub(inset)
 }
 
 /// Unclamped top offset placing the `height` rows starting at collection row
@@ -497,6 +549,23 @@ pub fn anchor_for<K: Clone + Ord, S>(
     sources: &dyn SourceMap<K, S>,
 ) -> Option<ListPosition<K, S>> {
     let top = target_top_offset(index, key, policy, current_top, geometry)?;
+    Some(position_at_offset(index, top, geometry, sources))
+}
+
+/// Keyed position that places `key` according to `policy` below `inset`
+/// covered viewport rows:
+/// `position_at_offset(target_top_offset_below(..))` (see
+/// [`target_top_offset_below`]).
+pub fn anchor_for_below<K: Clone + Ord, S>(
+    index: &MeasuredListIndex<K>,
+    key: &K,
+    policy: AnchorPolicy,
+    current_top: u64,
+    geometry: ListGeometry,
+    inset: u64,
+    sources: &dyn SourceMap<K, S>,
+) -> Option<ListPosition<K, S>> {
+    let top = target_top_offset_below(index, key, policy, current_top, geometry, inset)?;
     Some(position_at_offset(index, top, geometry, sources))
 }
 

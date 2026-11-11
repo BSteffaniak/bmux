@@ -16,7 +16,7 @@ use bmux_tui::measured_list::MeasuredListIndex;
 
 use super::VirtualListState;
 use super::position::{
-    AnchorPolicy, Edge, ListGeometry, ListPosition, SourceMap, place_rows, position_at_offset,
+    AnchorPolicy, Edge, ListGeometry, ListPosition, SourceMap, place_rows_below, position_at_offset,
 };
 
 /// One focus target inside a list item.
@@ -260,13 +260,33 @@ pub fn reveal_top_offset<K: Clone + Ord, I>(
     current_top: u64,
     geometry: ListGeometry,
 ) -> Option<u64> {
+    reveal_top_offset_below(index, target, edge, current_top, geometry, 0)
+}
+
+/// [`reveal_top_offset`] below `inset` covered viewport rows.
+///
+/// The covered rows (for example, pinned section headers) do not count as
+/// visible: a target under them is revealed, and `Edge::Top` (or a target
+/// taller than the uncovered rows) puts its first row directly below them.
+/// `inset` is limited to `viewport_height - 1`. Returns `None` when the
+/// target's item is not indexed.
+#[must_use]
+pub fn reveal_top_offset_below<K: Clone + Ord, I>(
+    index: &MeasuredListIndex<K>,
+    target: &ItemFocusTarget<K, I>,
+    edge: Edge,
+    current_top: u64,
+    geometry: ListGeometry,
+    inset: u64,
+) -> Option<u64> {
     let rows = target.list_rows(index)?;
-    let top = place_rows(
+    let top = place_rows_below(
         rows.start,
         rows.end - rows.start,
         AnchorPolicy::EnsureVisibleFrom(edge),
         current_top,
         geometry.viewport_height,
+        inset,
     );
     Some(top.min(geometry.max_overscroll_top(index.total_height())))
 }

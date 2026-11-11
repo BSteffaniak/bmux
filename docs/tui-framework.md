@@ -434,6 +434,7 @@ interprets.
 | Lazy item source | `bmux_tui_components::virtual_list` | `virtual-list` |
 | Scroll motion | `bmux_tui_components::virtual_list` | `virtual-list` |
 | `VirtualListComponent`, chrome, actions | `bmux_tui_components::virtual_list` | `virtual-list` |
+| Sticky section headers, scrollbar marks | `bmux_tui_components::virtual_list` | `virtual-list` |
 | Resident windows, `PositionEstimate` | `bmux_tui_components::resident_window` | `resident-window` |
 
 `virtual-list` enables `scroll-view` (and through it `scrollbar` and
@@ -844,6 +845,12 @@ pub trait VirtualItemSource<K> {
     /// Whether every synchronization must compare all keys and revisions
     /// (sources rebuilt per frame that do not note changes). Default false.
     fn always_reconcile(&self) -> bool { false }
+    /// Nesting level when the item is a sticky section header (see
+    /// "Sticky section headers"). Default `None`.
+    fn section_header_level(&self, index: usize) -> Option<u16> { None }
+    /// Position of the innermost header whose section contains the item,
+    /// excluding the item itself. Default `None`.
+    fn section_parent(&self, index: usize) -> Option<usize> { None }
 }
 impl<K, T: VirtualItemSource<K> + ?Sized> VirtualItemSource<K> for &T { /* delegates */ }
 
@@ -916,7 +923,9 @@ Source order equals index order. The construction contract is:
 `VirtualSourceList` is the shared measurement, painting, and event
 implementation. The eager `VirtualList` builder implements `VirtualItemSource`
 (with `always_reconcile`) and delegates to it, so the builder and lazy paths
-share one implementation; `VirtualList::layout` mirrors
+share one implementation; its `section_header(key, level, layout_revision,
+component)` and `component_section_header(key, level, component)` append
+section headers and derive every item's `section_parent` while building; `VirtualList::layout` mirrors
 `VirtualSourceList::layout`. `bmux_tui_components::virtual_list` also
 re-exports `MeasuredListIndex`, `MeasuredListItem`, `MeasuredListError`,
 `VisibleItemRange`, and the `resident_window` types its signatures use
@@ -979,10 +988,15 @@ where
     pub const fn position_estimate(self, estimate: resident_window::PositionEstimate) -> Self;
     pub const fn environment(self, environment: LayoutEnvironment) -> Self;
     pub const fn pointer_intent(self, intent: PointerIntent) -> Self;
+    pub const fn sticky_headers(self, sticky: StickyHeaders) -> Self;     // default enabled
+    pub const fn scrollbar_marks(self, marks: &'a [ScrollbarMark<K>]) -> Self;
     pub fn content_id(&self) -> LayoutId;      // "{id}.content"
     pub fn window_id(&self) -> LayoutId;       // "{id}.window"
     pub fn scrollbar_id(&self) -> LayoutId;    // "{id}.scrollbar"
     pub fn item_id(&self, key: &K) -> LayoutId; // "{id}.item.{key}"
+    pub fn sticky_id(&self) -> LayoutId;       // "{id}.sticky"
+    pub fn sticky_item_id(&self, key: &K) -> LayoutId; // "{id}.sticky.{key}"
+    pub fn scrollbar_mark_cells(&self, layout: &LayoutNode) -> Vec<ScrollbarMarkCells>;
 }
 impl<K, Src, S> Component for VirtualListComponent<'_, K, Src, S> { /* layout, paint, event, revision */ }
 
@@ -1016,7 +1030,11 @@ is accepted while the caller sets `state.scroll.interaction.focused`;
     measured size, followed by the window node `"{id}.window"`
     whose row is the resolved top offset and whose height is the viewport, so
     the visible region is part of the authoritative geometry;
-  - the scrollbar node `"{id}.scrollbar"` at its track rectangle, when enabled.
+  - the scrollbar node `"{id}.scrollbar"` at its track rectangle, when enabled;
+  - while any section header is pinned, a last root child `"{id}.sticky"` at
+    the content origin whose height is the pinned rows, holding one leaf
+    `"{id}.sticky.{key}"` per pinned header at the viewport rows it covers
+    (see [Sticky section headers](#sticky-section-headers)).
 
   Item layouts are not copied into the tree: the retained layout stays in the
   source (`retained_layout`) or the state's layout cache, is borrowed at paint,
@@ -1120,6 +1138,173 @@ on the BMUX runtime: streaming appends that stay followed, history pages
 prepended as `ResolvedPosition::edge_rows` reports the top edge approaching
 (the viewport stays still because positions are keyed), keyed motion driven
 by runtime timers, overscroll, and activation.
+
+### Sticky section headers
+
+Sources declare sections; `VirtualListComponent` pins their headers. Nothing
+here knows what a section means: callers choose levels (for example 0 for an
+outer group and 1 for its subgroups).
+
+```rust,ignore
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct StickyHeaders { pub enabled: bool, pub max_rows: u64 }
+impl StickyHeaders {
+    pub const fn enabled() -> Self;                 // Default; bounded only by the viewport
+    pub const fn disabled() -> Self;
+    pub const fn max_rows(self, rows: u64) -> Self;
+    pub const fn row_limit(self, viewport_height: u64) -> u64; // min(max_rows, viewport - 1), 0 when disabled
+}
+
+impl<K: Clone + Ord, S: Clone> VirtualListState<K, S> {
+    pub fn pinned_header_keys(&self) -> Vec<K>;     // last component layout, outermost first
+    pub fn sticky_header_rows(&self) -> u64;        // content rows covered by pinned headers
+    pub fn sticky_inset<Src: VirtualItemSource<K> + ?Sized>(&self, source: &Src, key: &K,
+        viewport_height: u64, sticky: StickyHeaders) -> Option<u64>;
+    pub fn sticky_reveal_position<Src: VirtualItemSource<K> + ?Sized>(&self, source: &Src,
+        key: &K, viewport_height: u64, sticky: StickyHeaders,
+        sources: &dyn SourceMap<K, S>) -> Option<ListPosition<K, S>>;
+    pub fn sticky_anchor_for<Src: VirtualItemSource<K> + ?Sized>(&self, source: &Src,
+        key: &K, policy: AnchorPolicy, viewport_height: u64, sticky: StickyHeaders,
+        sources: &dyn SourceMap<K, S>) -> Option<ListPosition<K, S>>;
+    pub fn sticky_reveal_for_focus<Src: VirtualItemSource<K> + ?Sized, I>(&self, source: &Src,
+        target: &ItemFocusTarget<K, I>, edge: Edge, viewport_height: u64,
+        sticky: StickyHeaders, sources: &dyn SourceMap<K, S>) -> Option<ListPosition<K, S>>;
+}
+
+impl<'a, K, Src, S> VirtualListComponent<'a, K, Src, S> {
+    // The state methods above with this component's source, sticky policy,
+    // and source map.
+    pub fn anchor_for(&self, key: &K, policy: AnchorPolicy, viewport_height: u64)
+        -> Option<ListPosition<K, S>>;
+    pub fn reveal_for_focus<I>(&self, target: &ItemFocusTarget<K, I>, edge: Edge,
+        viewport_height: u64) -> Option<ListPosition<K, S>>;
+}
+
+// Placement below `inset` covered viewport rows (limited to viewport - 1).
+pub fn target_top_offset_below<K: Clone + Ord>(index: &MeasuredListIndex<K>, key: &K,
+    policy: AnchorPolicy, current_top: u64, geometry: ListGeometry, inset: u64) -> Option<u64>;
+pub fn anchor_for_below<K: Clone + Ord, S>(index: &MeasuredListIndex<K>, key: &K,
+    policy: AnchorPolicy, current_top: u64, geometry: ListGeometry, inset: u64,
+    sources: &dyn SourceMap<K, S>) -> Option<ListPosition<K, S>>;
+pub fn reveal_top_offset_below<K: Clone + Ord, I>(index: &MeasuredListIndex<K>,
+    target: &ItemFocusTarget<K, I>, edge: Edge, current_top: u64, geometry: ListGeometry,
+    inset: u64) -> Option<u64>;
+```
+
+- **Sections.** `section_header_level(i)` marks item `i` as a header at a
+  level. A header at level `L` opens a section containing every following
+  item up to, but not including, the next header whose level is at most `L`.
+  `section_parent(i)` names the innermost header whose section contains item
+  `i` (excluding `i`). The list only follows parents (bounded nesting depth),
+  never scans the collection, so sources answer from their own structure; a
+  parent that is not an earlier header with a strictly lower level than the
+  previous chain entry cuts the chain. Levels and parents are read for the
+  item at each pinned boundary, its parent chain, and items on the viewport.
+  Change a layout revision, note a splice, or invalidate when they change.
+- **Pinning.** For the resolved top offset, level by level: the item at the
+  first viewport row not yet covered selects its next enclosing header deeper
+  than the last pinned one. That header pins when it starts above that row and
+  the pinned rows including it stay within `row_limit`; otherwise pinning
+  stops (narrow viewports pin fewer headers and always keep at least one
+  content row). The first following header at the same or an outer level that
+  starts within the pinned header's rows pushes it up, so it slides under its
+  parent (rows above the parent's bottom are hidden) or off the viewport top.
+  A header already at its natural row is never duplicated.
+- **Measurement.** Pinned headers can start far above the viewport, so layout
+  prepares them like visible items (exact retained layout, re-measured when
+  their revision, width, or environment is stale) and re-resolves the
+  position when that changes a height. The keyed position and the window node
+  are unaffected: pinning is presentation over the scrolled rows.
+- **Paint and events.** Scrolled items are clipped to the rows below the
+  pinned region: rows under pinned headers are neither painted nor registered
+  and receive no events, and items entirely under them are not built. Pinned
+  headers paint over the content area with their retained layouts, clipped to
+  the rows they cover, and register hit (`HitRole::ListItem`), focus,
+  semantic (`"list-item"`), and damage regions under the item's usual id
+  `"{id}.item.{key}"`. Pointer events over a pinned header reach that item
+  (and a click reports `Activated(key)`); non-positional events are offered
+  to scrolled items bottom to top, then to pinned headers bottom to top.
+  Paint and event apply the same source-identity check as for scrolled items.
+- **Revealing items.** `sticky_inset(key)` is the summed height of the
+  headers enclosing `key` (excluding it) that fit the row limit: with the
+  viewport top that many rows above the item, the item appears on the first
+  row below its pinned headers. `sticky_reveal_position` returns that
+  position; both return `None` for unindexed keys and while noted splices are
+  pending. Jumping to a header this way leaves only its parents pinned above
+  it.
+- **Keyed jumps and focus.** `anchor_for` and `reveal_for_focus` on
+  `VirtualListState` ignore pinned headers, so a jump can leave its item
+  under them (for example, `EnsureVisibleFrom` treats an item under a pinned
+  header as visible). `VirtualListComponent::anchor_for` and
+  `VirtualListComponent::reveal_for_focus` (and the state's
+  `sticky_anchor_for` / `sticky_reveal_for_focus`, which take the source and
+  policy explicitly) apply every policy to the viewport rows below the item's
+  `sticky_inset`: `ItemTopAtTop` and `Edge::Top` land on the first row below
+  the headers, `Center` centers in the uncovered rows, bottom alignment is
+  unchanged, and an item under the headers counts as not visible. A visible
+  target still returns the current position unchanged. With sticky headers
+  disabled, a source without sections, or a viewport too short to pin, they
+  equal the unsticky placement; they return `None` while noted splices are
+  pending. The free functions `target_top_offset_below`, `anchor_for_below`,
+  and `reveal_top_offset_below` compute the same placements for any number of
+  covered top rows.
+- **Revision.** The sticky policy and the pinned headers' keys and layout
+  revisions join the layout channel; their paint revisions join the paint
+  channel.
+
+`VirtualSourceList::paint`/`event` and `VirtualList::paint`/`event` do not
+pin; use `VirtualListComponent` (which accepts any source, including a
+`VirtualList`) for sticky headers.
+
+### Scrollbar marks
+
+```rust,ignore
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ScrollbarMarkPosition<K> {
+    Row(u64),                    // one collection row
+    Rows(Range<u64>),            // an empty range marks `start`
+    Item(K),                     // every row of an item (first row when zero-height)
+    Items { first: K, last: K }, // first row of one through last row of the other
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ScrollbarMark<K> {
+    pub position: ScrollbarMarkPosition<K>,
+    pub style: Style,
+    pub symbol: Option<&'static str>,   // None keeps the scrollbar's symbol per cell
+    pub over_thumb: bool,               // default false: the thumb hides the mark
+}
+impl<K> ScrollbarMark<K> {
+    pub const fn new(position: ScrollbarMarkPosition<K>, style: Style) -> Self;
+    pub const fn row(row: u64, style: Style) -> Self;
+    pub const fn item(key: K, style: Style) -> Self;
+    pub const fn symbol(self, symbol: &'static str) -> Self;
+    pub const fn over_thumb(self, over_thumb: bool) -> Self;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScrollbarMarkCells { pub mark: usize, pub area: Rect }
+```
+
+- Rows are exact (resident) collection rows; keys resolve through the index,
+  so marks follow their items across mutation and reflow, and an unindexed
+  key draws nothing. Rows past the end clamp to the last row.
+- The whole collection is scaled onto the track: row `r` maps to cell
+  `floor((before + r) * track_height / total)`, clamped to the last cell,
+  where `before` and `total` come from the active position estimate (one
+  whose `resident` equals the exact total) and are `0` and the exact total
+  otherwise. A mark covers the cells from its first row's cell through its
+  last row's cell, at least one.
+- Marks draw only while the scrollbar draws, after it, in slice order (a
+  later mark wins a shared cell), with the mark's style and either its symbol
+  or the scrollbar's own symbol for that cell. A symbol that is not exactly
+  one terminal cell wide (measured with `text_width::display_width`) is
+  ignored. Marks under the thumb are hidden unless `over_thumb`.
+- `scrollbar_mark_cells(layout)` returns exactly the cells paint draws (one
+  column, root-local coordinates) for the committed layout node, empty for a
+  stale node, so callers can register their own interactions on marks. Marks
+  are presentation only; scrollbar input is unchanged.
+- Marks' resolved rows and presentation join the paint revision.
 
 ### Scroll motion
 

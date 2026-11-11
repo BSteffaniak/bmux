@@ -14,10 +14,12 @@
 mod action;
 mod component;
 mod focus;
+mod marks;
 mod motion;
 mod position;
 mod selection;
 mod source;
+mod sticky;
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
@@ -46,17 +48,21 @@ pub use bmux_tui::measured_list::{
     MeasuredListError, MeasuredListIndex, MeasuredListItem, VisibleItemRange,
 };
 pub use component::{VirtualListChrome, VirtualListComponent};
-pub use focus::{FocusTraversal, ItemFocusTarget, reveal_for_focus, reveal_top_offset};
+pub use focus::{
+    FocusTraversal, ItemFocusTarget, reveal_for_focus, reveal_top_offset, reveal_top_offset_below,
+};
+pub use marks::{ScrollbarMark, ScrollbarMarkCells, ScrollbarMarkPosition};
 pub use motion::{MotionSample, ScrollMotion, ScrollTarget};
 pub use position::{
     AnchorOffset, AnchorPolicy, Edge, ListAnchor, ListGeometry, ListPosition, NoSourceMap,
-    Overscroll, ResolvedPosition, SourceMap, anchor_at_offset, anchor_for, position_at_offset,
-    resolve_position, target_top_offset,
+    Overscroll, ResolvedPosition, SourceMap, anchor_at_offset, anchor_for, anchor_for_below,
+    position_at_offset, resolve_position, target_top_offset, target_top_offset_below,
 };
 pub use selection::{
     ItemOrder, KeyOrder, LogicalSelection, LogicalSelectionEndpoint, LogicalSelectionFragment,
 };
 pub use source::VirtualItemSource;
+pub use sticky::StickyHeaders;
 
 pub use crate::resident_window::{EdgeRows, FractionTarget, PositionEstimate, WindowSplice};
 use crate::scroll_view::{ScrollViewState, scrollbar_state};
@@ -1700,38 +1706,95 @@ impl<'a, Src: ?Sized> VirtualSourceList<'a, Src> {
         S: Clone,
         Src: VirtualItemSource<K>,
     {
+        self.layout_pinned(
+            width,
+            environment,
+            viewport_height,
+            sources,
+            StickyHeaders::disabled(),
+            state,
+            cx,
+        )
+        .0
+    }
+
+    /// [`Self::layout`] that also determines the section headers pinned
+    /// under `sticky` and gives each an exact retained layout. Pinned headers
+    /// can start far above the viewport, so they are prepared like visible
+    /// items, and a height change re-resolves the position.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "mirrors the public layout signature plus the sticky policy"
+    )]
+    fn layout_pinned<K, S>(
+        &self,
+        width: u64,
+        environment: LayoutEnvironment,
+        viewport_height: u64,
+        sources: &dyn SourceMap<K, S>,
+        sticky: StickyHeaders,
+        state: &mut VirtualListState<K, S>,
+        cx: &mut LayoutCx,
+    ) -> (VirtualListLayout, Vec<sticky::PinnedHeader>)
+    where
+        K: Clone + Ord + ToString,
+        S: Clone,
+        Src: VirtualItemSource<K>,
+    {
         self.sync_with_environment(width, environment, state, cx);
         let mut resolved = state.resolve_layout(viewport_height, sources);
         let mut measured = BTreeSet::new();
         let mut reconciled = false;
-        loop {
+        let pinned = loop {
             let visible = state
                 .index
                 .visible_range(resolved.top_offset, viewport_height);
-            let changed = state.prepare_visible(
+            let mut changed = state.prepare_visible(
                 &self.id,
                 self.source,
                 visible.start..visible.end,
                 &mut measured,
                 cx,
             );
+            let mut pinned = Vec::new();
+            if !changed && !state.pending.full {
+                pinned = sticky::pinned_headers(
+                    &state.index,
+                    self.source,
+                    resolved.top_offset,
+                    viewport_height,
+                    sticky,
+                );
+                for header in &pinned {
+                    changed |= state.prepare_visible(
+                        &self.id,
+                        self.source,
+                        header.index..header.index + 1,
+                        &mut measured,
+                        cx,
+                    );
+                }
+            }
             if state.pending.full && !reconciled {
-                // A visible key disagreed with the index: reconcile now
-                // rather than placing a mismatched item for this frame.
+                // A visible or pinned key disagreed with the index: reconcile
+                // now rather than placing a mismatched item for this frame.
                 reconciled = true;
                 measured.clear();
                 self.sync_with_environment(width, environment, state, cx);
             } else if !changed {
-                break;
+                break pinned;
             }
             resolved = state.resolve_layout(viewport_height, sources);
-        }
-        VirtualListLayout {
-            resolved,
-            visible: state
-                .index
-                .visible_range(resolved.top_offset, viewport_height),
-        }
+        };
+        (
+            VirtualListLayout {
+                resolved,
+                visible: state
+                    .index
+                    .visible_range(resolved.top_offset, viewport_height),
+            },
+            pinned,
+        )
     }
 
     /// Paint only visible items at the state's current top offset and
@@ -1763,6 +1826,7 @@ impl<'a, Src: ?Sized> VirtualSourceList<'a, Src> {
             .index
             .visible_range(offset.saturating_add(rows.start), rows.end - rows.start);
         let environment = state.synced.map(|key| key.environment).unwrap_or_default();
+        let base = Rect::new(0, 0, area.width, area.height);
         let items = (range.start..range.end).filter_map(|index| {
             let item = self.placed_item(state, index)?;
             let layout = find_item_layout(
@@ -1775,9 +1839,9 @@ impl<'a, Src: ?Sized> VirtualSourceList<'a, Src> {
                 environment,
             )?;
             debug_assert_eq!(layout.size.height, item.height);
-            Some((item, layout))
+            Some((ItemSlot::scrolled(item, base, offset, 0), layout))
         });
-        let report = self.paint_items(area, offset, items, cx);
+        let report = self.paint_items(area.width, items, cx);
         state.record(|stats| {
             stats.painted_items = report.painted_items;
             stats.registered_items = report.registered_items;
@@ -1807,33 +1871,40 @@ impl<'a, Src: ?Sized> VirtualSourceList<'a, Src> {
         })
     }
 
-    /// Paint placed items with the viewport's first row at collection row
-    /// `top`, registering each item's visible hit, focus, semantic, and damage
-    /// regions. Returns painted, registered, and built counts.
+    /// Paint placed item slots (placed in an area `width` cells wide at the
+    /// paint origin), each clipped to its visible rows, registering each
+    /// item's visible hit, focus, semantic, and damage regions. Returns
+    /// painted, registered, and built counts.
     fn paint_items<'n, K>(
         &self,
-        area: Rect,
-        top: u64,
-        items: impl IntoIterator<Item = (PlacedItem, &'n LayoutNode)>,
+        width: u16,
+        items: impl IntoIterator<Item = (ItemSlot, &'n LayoutNode)>,
         cx: &mut PaintCx<'_, '_>,
     ) -> VirtualListRenderStats
     where
         Src: VirtualItemSource<K>,
     {
         let mut report = VirtualListRenderStats::default();
-        for (item, layout) in items {
+        for (
+            ItemSlot {
+                item,
+                local_y,
+                visible,
+            },
+            layout,
+        ) in items
+        {
             let element = self.source.build(item.position);
             report.built_items = report.built_items.saturating_add(1);
-            let local_y = signed_row(item.start).saturating_sub(signed_row(top));
-            let visible = translated_item_area(
-                Rect::new(0, 0, area.width, area.height),
-                local_y,
-                item.height,
-            );
             cx.with_child(
                 0,
                 local_y,
-                LocalRect::new(0, -local_y, area.width, area.height),
+                LocalRect::new(
+                    0,
+                    i64::from(visible.y).saturating_sub(local_y),
+                    width,
+                    visible.height,
+                ),
                 |cx| cx.with_child_size(0, 0, layout.size, |cx| element.paint(layout, cx)),
             );
             let semantic_id = item.id.as_str().to_owned();
@@ -1881,10 +1952,13 @@ impl<'a, Src: ?Sized> VirtualSourceList<'a, Src> {
         let range = state.index.visible_range(offset, u64::from(area.height));
         let environment = state.synced.map(|key| key.environment).unwrap_or_default();
         let items = (range.start..range.end)
-            .filter_map(|index| self.placed_item(state, index))
+            .filter_map(|index| {
+                let item = self.placed_item(state, index)?;
+                Some(ItemSlot::scrolled(item, area, offset, 0))
+            })
             .collect::<Vec<_>>();
         let width = u64::from(area.width);
-        let routed = self.route_items(area, offset, items, event, cx, |item| {
+        let routed = self.route_items(area, items, event, cx, |item| {
             find_item_layout(
                 self.source,
                 &state.layouts,
@@ -1902,15 +1976,13 @@ impl<'a, Src: ?Sized> VirtualSourceList<'a, Src> {
         routed.outcome
     }
 
-    /// Route an event through placed items (topmost first) with the
-    /// viewport's first row at collection row `top`. `layout_of` supplies an
-    /// item's retained layout, and is called only for items the event is
-    /// actually offered to.
+    /// Route an event through placed item slots of `area` (last slot first).
+    /// `layout_of` supplies an item's retained layout, and is called only for
+    /// items the event is actually offered to.
     fn route_items<'n, K>(
         &self,
         area: Rect,
-        top: u64,
-        items: impl IntoIterator<Item = PlacedItem, IntoIter: DoubleEndedIterator>,
+        items: impl IntoIterator<Item = ItemSlot, IntoIter: DoubleEndedIterator>,
         event: &Event,
         cx: &mut EventCx<'_>,
         mut layout_of: impl FnMut(&PlacedItem) -> Option<Cow<'n, LayoutNode>>,
@@ -1932,10 +2004,13 @@ impl<'a, Src: ?Sized> VirtualSourceList<'a, Src> {
             Event::Mouse(mouse) => Some(mouse.position),
             _ => None,
         };
-        for item in items.into_iter().rev() {
-            let local_y = signed_row(item.start).saturating_sub(signed_row(top));
-            let local_area = translated_item_area(area, local_y, item.height);
-            let item_area = cx.visible_rect(logical_rect(local_area));
+        for ItemSlot {
+            item,
+            local_y,
+            visible,
+        } in items.into_iter().rev()
+        {
+            let item_area = cx.visible_rect(logical_rect(visible));
             if item_area.is_empty() || pointer.is_some_and(|point| !item_area.contains(point)) {
                 continue;
             }
@@ -1960,6 +2035,49 @@ impl<'a, Src: ?Sized> VirtualSourceList<'a, Src> {
             }
         }
         routed
+    }
+}
+
+/// A placed item with its viewport placement and the rows it may use.
+struct ItemSlot {
+    item: PlacedItem,
+    /// Viewport row of the item's first row (negative above the viewport).
+    local_y: i64,
+    /// Visible part of the item, in the coordinates of the area it is placed
+    /// in. Painting, interaction regions, and routing use exactly this.
+    visible: Rect,
+}
+
+impl ItemSlot {
+    /// An item scrolled with the viewport's first row (the top of `area`) at
+    /// collection row `top`, restricted to rows of `area` at or below its
+    /// first `occluded` rows.
+    fn scrolled(item: PlacedItem, area: Rect, top: u64, occluded: u16) -> Self {
+        let local_y = signed_row(item.start).saturating_sub(signed_row(top));
+        let visible = translated_item_area(area, local_y, item.height);
+        let first = visible.y.max(area.y.saturating_add(occluded));
+        let bottom = visible.bottom().max(first);
+        Self {
+            item,
+            local_y,
+            visible: Rect::new(visible.x, first, visible.width, bottom - first),
+        }
+    }
+
+    /// A header pinned in `area` at its sticky placement.
+    fn pinned(item: PlacedItem, area: Rect, header: &sticky::PinnedHeader) -> Self {
+        let row = |row: u64| {
+            u16::try_from(row)
+                .unwrap_or(u16::MAX)
+                .min(area.height)
+                .saturating_add(area.y)
+        };
+        let (first, bottom) = (row(header.visible.start), row(header.visible.end));
+        Self {
+            item,
+            local_y: header.local_y,
+            visible: Rect::new(area.x, first, area.width, bottom.saturating_sub(first)),
+        }
     }
 }
 
@@ -2044,6 +2162,8 @@ pub struct VirtualListItem<'a, K> {
     key: K,
     layout_revision: u64,
     component: Element<'a>,
+    header_level: Option<u16>,
+    section_parent: Option<usize>,
 }
 
 impl<'a, K> VirtualListItem<'a, K> {
@@ -2054,6 +2174,8 @@ impl<'a, K> VirtualListItem<'a, K> {
             key,
             layout_revision,
             component: Element::new(component),
+            header_level: None,
+            section_parent: None,
         }
     }
 }
@@ -2069,6 +2191,9 @@ pub struct VirtualList<'a, K> {
     pointer_intent: PointerIntent,
     id: String,
     items: Vec<VirtualListItem<'a, K>>,
+    /// Headers whose sections are still open, outermost first, as
+    /// `(position, level)`.
+    open_sections: Vec<(usize, u16)>,
 }
 
 impl<K: Clone> VirtualItemSource<K> for VirtualList<'_, K> {
@@ -2097,6 +2222,14 @@ impl<K: Clone> VirtualItemSource<K> for VirtualList<'_, K> {
     fn always_reconcile(&self) -> bool {
         true
     }
+
+    fn section_header_level(&self, index: usize) -> Option<u16> {
+        self.items[index].header_level
+    }
+
+    fn section_parent(&self, index: usize) -> Option<usize> {
+        self.items[index].section_parent
+    }
 }
 
 impl<'a, K> VirtualList<'a, K>
@@ -2117,23 +2250,65 @@ where
             id: id.into(),
             pointer_intent: PointerIntent::Auto,
             items: Vec::new(),
+            open_sections: Vec::new(),
         }
     }
 
     /// Append one keyed item using the component's declared layout revision.
     #[must_use]
-    pub fn component(mut self, key: K, component: impl Component + 'a) -> Self {
+    pub fn component(self, key: K, component: impl Component + 'a) -> Self {
         let revision = component.revision();
-        self.items
-            .push(VirtualListItem::new(key, revision.layout, component));
-        self
+        self.push(VirtualListItem::new(key, revision.layout, component))
     }
 
     /// Append one keyed item with an externally managed layout revision.
     #[must_use]
-    pub fn item(mut self, key: K, layout_revision: u64, component: impl Component + 'a) -> Self {
-        self.items
-            .push(VirtualListItem::new(key, layout_revision, component));
+    pub fn item(self, key: K, layout_revision: u64, component: impl Component + 'a) -> Self {
+        self.push(VirtualListItem::new(key, layout_revision, component))
+    }
+
+    /// Append one keyed sticky section header at nesting `level` with an
+    /// externally managed layout revision.
+    ///
+    /// The header's section holds every following item up to the next header
+    /// whose level is at most `level`; lower levels enclose higher ones. A
+    /// `VirtualListComponent` over this list pins the header at the viewport
+    /// top while any item of its section is visible (see
+    /// [`VirtualItemSource::section_header_level`]).
+    #[must_use]
+    pub fn section_header(
+        mut self,
+        key: K,
+        level: u16,
+        layout_revision: u64,
+        component: impl Component + 'a,
+    ) -> Self {
+        let mut item = VirtualListItem::new(key, layout_revision, component);
+        item.header_level = Some(level);
+        self.open_sections
+            .retain(|&(_, open_level)| open_level < level);
+        self = self.push(item);
+        let position = self.items.len() - 1;
+        self.open_sections.push((position, level));
+        self
+    }
+
+    /// Append one keyed sticky section header at nesting `level` using the
+    /// component's declared layout revision. See [`Self::section_header`].
+    #[must_use]
+    pub fn component_section_header(
+        self,
+        key: K,
+        level: u16,
+        component: impl Component + 'a,
+    ) -> Self {
+        let revision = component.revision();
+        self.section_header(key, level, revision.layout, component)
+    }
+
+    fn push(mut self, mut item: VirtualListItem<'a, K>) -> Self {
+        item.section_parent = self.open_sections.last().map(|&(position, _)| position);
+        self.items.push(item);
         self
     }
 

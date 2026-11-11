@@ -17,11 +17,14 @@ use bmux_tui::pointer::PointerIntent;
 use bmux_tui::selection::SelectionAutoScrollRequest;
 use bmux_tui::semantic::SemanticRegion;
 
+use super::marks::{ScrollbarMark, ScrollbarMarkCells, mark_cells};
+use super::sticky::{PinnedHeader, StickyHeaders, inset_for};
 use super::{
-    ActionDispatch, Edge, NoSourceMap, PageStep, PlacedItem, PositionEstimate, ResolvedPosition,
-    RoutedEvent, ScrollInputSource, SourceMap, VirtualItemSource, VirtualListAction,
-    VirtualListRenderStats, VirtualListState, VirtualSourceList, VisibleItemRange, clip_rows,
-    find_item_layout, item_layout_id,
+    ActionDispatch, AnchorPolicy, Edge, ItemFocusTarget, ItemSlot, ListPosition, NoSourceMap,
+    PageStep, PlacedItem, PositionEstimate, ResolvedPosition, RoutedEvent, ScrollInputSource,
+    SourceMap, VirtualItemSource, VirtualListAction, VirtualListRenderStats, VirtualListState,
+    VirtualSourceList, VisibleItemRange, anchor_for_below, clip_rows, find_item_layout,
+    item_layout_id, position_at_offset, reveal_top_offset_below,
 };
 use crate::common::{local_area_of, local_control_event};
 use crate::scroll_view::{logical_offset_from_scrollbar, route_vertical_track, scrollbar_state};
@@ -152,7 +155,7 @@ impl Default for VirtualListChrome {
 
 /// Geometry recorded by the most recent component layout. Paint and event
 /// use it only for the layout node it describes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct LayoutSnapshot {
     /// Root (viewport) size.
     size: LogicalSize,
@@ -166,6 +169,18 @@ pub(super) struct LayoutSnapshot {
     visible: VisibleItemRange,
     /// Index measurement generation the placement was computed from.
     measurement_generation: u64,
+    /// Section headers pinned at the viewport top, outermost first.
+    pinned: Vec<PinnedHeader>,
+    /// Content viewport rows covered by the pinned headers; scrolled items
+    /// neither paint nor register interactions there.
+    sticky_rows: u64,
+}
+
+impl LayoutSnapshot {
+    /// Rows of the content viewport hidden from scrolled items.
+    fn occluded(&self) -> u16 {
+        u16::try_from(self.sticky_rows).unwrap_or(u16::MAX)
+    }
 }
 
 impl<K: Clone + Ord, S: Clone> VirtualListState<K, S> {
@@ -232,16 +247,170 @@ impl<K: Clone + Ord, S: Clone> VirtualListState<K, S> {
     /// The recorded snapshot when it describes `layout` and the index has not
     /// changed since.
     fn snapshot_for(&self, layout: &LayoutNode) -> Option<LayoutSnapshot> {
-        let snapshot = self.snapshot?;
+        let snapshot = self.snapshot.as_ref()?;
         let content = &layout.children.first()?.node;
         let window = content.children.last()?;
         let placed = snapshot.visible.end - snapshot.visible.start;
+        let pinned_matches = if snapshot.pinned.is_empty() {
+            layout.children.len() == 1 + usize::from(snapshot.scrollbar.is_some())
+        } else {
+            layout.children.len() == 2 + usize::from(snapshot.scrollbar.is_some())
+                && layout.children.last().is_some_and(|sticky| {
+                    sticky.node.children.len() == snapshot.pinned.len()
+                        && sticky.node.size.height == snapshot.sticky_rows
+                })
+        };
         (layout.size == snapshot.size
             && content.size.height == snapshot.resolved.total_height
             && window.y == snapshot.resolved.top_offset
             && content.children.len() == placed + 1
+            && pinned_matches
             && self.generation == snapshot.measurement_generation)
-            .then_some(snapshot)
+            .then(|| snapshot.clone())
+    }
+
+    /// Keys of the section headers pinned by the most recent
+    /// `VirtualListComponent` layout, outermost first.
+    #[must_use]
+    pub fn pinned_header_keys(&self) -> Vec<K> {
+        self.snapshot.as_ref().map_or_else(Vec::new, |snapshot| {
+            snapshot
+                .pinned
+                .iter()
+                .filter_map(|header| self.index.item(header.index))
+                .map(|item| item.key.clone())
+                .collect()
+        })
+    }
+
+    /// Content viewport rows covered by pinned section headers at the most
+    /// recent `VirtualListComponent` layout (zero when none are pinned).
+    #[must_use]
+    pub fn sticky_header_rows(&self) -> u64 {
+        self.snapshot
+            .as_ref()
+            .map_or(0, |snapshot| snapshot.sticky_rows)
+    }
+
+    /// Viewport rows that the section headers enclosing `key` (excluding the
+    /// item itself) cover when the item is revealed directly below them, in
+    /// a viewport of `viewport_height` rows under `sticky`.
+    ///
+    /// Placing the viewport top `inset` rows above the item's first row shows
+    /// the item on the first row not covered by pinned headers.
+    ///
+    /// Returns `None` when `key` is not indexed or when membership changes
+    /// noted since the last synchronization are pending (the index and the
+    /// source disagree until the next layout).
+    pub fn sticky_inset<Src: VirtualItemSource<K> + ?Sized>(
+        &self,
+        source: &Src,
+        key: &K,
+        viewport_height: u64,
+        sticky: StickyHeaders,
+    ) -> Option<u64> {
+        if !self.pending.regions.is_empty() || self.pending.full {
+            return None;
+        }
+        let position = self.index.index_of(key)?;
+        Some(inset_for(
+            &self.index,
+            source,
+            position,
+            viewport_height,
+            sticky,
+        ))
+    }
+
+    /// A position showing item `key` on the first viewport row below the
+    /// section headers that pin above it (see [`Self::sticky_inset`]),
+    /// clamped like any other position at that offset. Equivalent to
+    /// [`Self::sticky_anchor_for`] with [`AnchorPolicy::ItemTopAtTop`].
+    ///
+    /// Returns `None` under the same conditions as [`Self::sticky_inset`].
+    pub fn sticky_reveal_position<Src: VirtualItemSource<K> + ?Sized>(
+        &self,
+        source: &Src,
+        key: &K,
+        viewport_height: u64,
+        sticky: StickyHeaders,
+        sources: &dyn SourceMap<K, S>,
+    ) -> Option<ListPosition<K, S>> {
+        self.sticky_anchor_for(
+            source,
+            key,
+            AnchorPolicy::ItemTopAtTop,
+            viewport_height,
+            sticky,
+            sources,
+        )
+    }
+
+    /// [`Self::anchor_for`] that keeps item `key` clear of the section
+    /// headers that pin above it: the policy places the item in the viewport
+    /// rows below [`Self::sticky_inset`] rows, relative to the current
+    /// position at `viewport_height` (see [`target_top_offset_below`](super::target_top_offset_below)).
+    ///
+    /// `VirtualListComponent::anchor_for` calls this with the component's
+    /// source, sticky policy, and source map.
+    ///
+    /// Returns `None` under the same conditions as [`Self::sticky_inset`].
+    pub fn sticky_anchor_for<Src: VirtualItemSource<K> + ?Sized>(
+        &self,
+        source: &Src,
+        key: &K,
+        policy: AnchorPolicy,
+        viewport_height: u64,
+        sticky: StickyHeaders,
+        sources: &dyn SourceMap<K, S>,
+    ) -> Option<ListPosition<K, S>> {
+        let inset = self.sticky_inset(source, key, viewport_height, sticky)?;
+        let current_top = self
+            .resolve(viewport_height, sources)
+            .map_or(0, |resolved| resolved.top_offset);
+        anchor_for_below(
+            &self.index,
+            key,
+            policy,
+            current_top,
+            self.geometry(viewport_height),
+            inset,
+            sources,
+        )
+    }
+
+    /// [`Self::reveal_for_focus`] that keeps `target` clear of the section
+    /// headers that pin above its item: rows under those headers
+    /// ([`Self::sticky_inset`] of the target's item) do not count as
+    /// visible, and a target revealed from [`Edge::Top`] lands on the first
+    /// row below them (see [`reveal_top_offset_below`]).
+    ///
+    /// Returns the current position unchanged when the target is already
+    /// visible below the headers. `VirtualListComponent::reveal_for_focus`
+    /// calls this with the component's source, sticky policy, and source map.
+    ///
+    /// Returns `None` under the same conditions as [`Self::sticky_inset`]
+    /// for the target's item.
+    pub fn sticky_reveal_for_focus<Src: VirtualItemSource<K> + ?Sized, I>(
+        &self,
+        source: &Src,
+        target: &ItemFocusTarget<K, I>,
+        edge: Edge,
+        viewport_height: u64,
+        sticky: StickyHeaders,
+        sources: &dyn SourceMap<K, S>,
+    ) -> Option<ListPosition<K, S>> {
+        let inset = self.sticky_inset(source, &target.key, viewport_height, sticky)?;
+        let geometry = self.geometry(viewport_height);
+        let current = self
+            .resolve(viewport_height, sources)
+            .map_or(0, |resolved| resolved.top_offset);
+        let top = reveal_top_offset_below(&self.index, target, edge, current, geometry, inset)?;
+        Some(if top == current {
+            self.position.clone()
+        } else {
+            position_at_offset(&self.index, top, geometry, sources)
+        })
     }
 
     fn release_pointer(&mut self) {
@@ -270,6 +439,8 @@ pub struct VirtualListComponent<'a, K, Src: ?Sized, S = ()> {
     estimate: Option<PositionEstimate>,
     environment: LayoutEnvironment,
     pointer_intent: PointerIntent,
+    sticky: StickyHeaders,
+    marks: &'a [ScrollbarMark<K>],
 }
 
 impl<'a, K, Src, S> VirtualListComponent<'a, K, Src, S>
@@ -295,7 +466,34 @@ where
             estimate: None,
             environment: LayoutEnvironment::default(),
             pointer_intent: PointerIntent::Auto,
+            sticky: StickyHeaders::enabled(),
+            marks: &[],
         }
+    }
+
+    /// Set the sticky section-header policy (enabled by default; it has no
+    /// effect unless the source reports section headers through
+    /// [`VirtualItemSource::section_header_level`]).
+    ///
+    /// While any item of a section is visible, its header item paints pinned
+    /// at the top of the content viewport, below the pinned headers of
+    /// enclosing sections, and the next section's header pushes it up as it
+    /// arrives. Pinned headers own their hit, focus, and semantic regions
+    /// (under the item's usual identity), and scrolled items neither paint
+    /// nor register interactions under them.
+    #[must_use]
+    pub const fn sticky_headers(mut self, sticky: StickyHeaders) -> Self {
+        self.sticky = sticky;
+        self
+    }
+
+    /// Draw `marks` on the integrated scrollbar track, scaled to the whole
+    /// collection (including an active position estimate's rows before and
+    /// after the resident content). Marks draw only while the scrollbar does.
+    #[must_use]
+    pub const fn scrollbar_marks(mut self, marks: &'a [ScrollbarMark<K>]) -> Self {
+        self.marks = marks;
+        self
     }
 
     /// Set scroll chrome and input policy.
@@ -354,11 +552,117 @@ where
         LayoutId::new(format!("{}.scrollbar", self.id.as_str()))
     }
 
+    /// Keyed position that places `key` according to `policy`, relative to
+    /// the current position, in a content viewport of `viewport_height`
+    /// rows. Rows covered by the section headers that pin above `key` under
+    /// this component's sticky policy do not count as viewport rows, so a
+    /// jump never leaves the item under them (see
+    /// [`VirtualListState::sticky_anchor_for`]); with sticky headers
+    /// disabled or a source without sections this equals
+    /// [`VirtualListState::anchor_for`].
+    ///
+    /// The list does not move; apply the result with
+    /// [`VirtualListState::set_position`] or controlled navigation.
+    ///
+    /// Returns `None` when `key` is not indexed or when membership changes
+    /// noted since the last synchronization are pending.
+    pub fn anchor_for(
+        &self,
+        key: &K,
+        policy: AnchorPolicy,
+        viewport_height: u64,
+    ) -> Option<ListPosition<K, S>> {
+        self.state.borrow().sticky_anchor_for(
+            self.source,
+            key,
+            policy,
+            viewport_height,
+            self.sticky,
+            self.sources,
+        )
+    }
+
+    /// Position that reveals `target` approaching from `edge`, relative to
+    /// the current position, in a content viewport of `viewport_height`
+    /// rows, keeping it clear of the section headers that pin above its item
+    /// under this component's sticky policy (see
+    /// [`VirtualListState::sticky_reveal_for_focus`]); with sticky headers
+    /// disabled or a source without sections this equals
+    /// [`VirtualListState::reveal_for_focus`].
+    ///
+    /// Returns the current position unchanged when the target is already
+    /// visible. The list does not move.
+    ///
+    /// Returns `None` when the target's item is not indexed or when
+    /// membership changes noted since the last synchronization are pending.
+    pub fn reveal_for_focus<I>(
+        &self,
+        target: &ItemFocusTarget<K, I>,
+        edge: Edge,
+        viewport_height: u64,
+    ) -> Option<ListPosition<K, S>> {
+        self.state.borrow().sticky_reveal_for_focus(
+            self.source,
+            target,
+            edge,
+            viewport_height,
+            self.sticky,
+            self.sources,
+        )
+    }
+
     /// Stable identity of one item's wrapper node (also its hit, focus, and
-    /// semantic identifier).
+    /// semantic identifier, including while the item is a pinned header).
     #[must_use]
     pub fn item_id(&self, key: &K) -> LayoutId {
         item_layout_id(self.id.as_str(), key)
+    }
+
+    /// Stable identity of the sticky node: a child of the root, over the top
+    /// of the content viewport, present while any section header is pinned.
+    #[must_use]
+    pub fn sticky_id(&self) -> LayoutId {
+        LayoutId::new(format!("{}.sticky", self.id.as_str()))
+    }
+
+    /// Stable identity of a pinned header's node inside the sticky node. Its
+    /// rectangle is the part of the content viewport the pinned header
+    /// covers; hit, focus, and semantic regions still use [`Self::item_id`].
+    #[must_use]
+    pub fn sticky_item_id(&self, key: &K) -> LayoutId {
+        LayoutId::new(format!("{}.sticky.{}", self.id.as_str(), key.to_string()))
+    }
+
+    /// Track cells covered by each scrollbar mark for `layout` (the node the
+    /// most recent layout returned), in root-local coordinates. Empty when
+    /// the node is stale, no scrollbar is drawn, or no mark resolves. Paint
+    /// draws exactly these cells.
+    #[must_use]
+    pub fn scrollbar_mark_cells(&self, layout: &LayoutNode) -> Vec<ScrollbarMarkCells> {
+        let state = self.state.borrow();
+        state
+            .snapshot_for(layout)
+            .map_or_else(Vec::new, |snapshot| self.mark_cells(&state, &snapshot))
+    }
+
+    fn mark_cells(
+        &self,
+        state: &VirtualListState<K, S>,
+        snapshot: &LayoutSnapshot,
+    ) -> Vec<ScrollbarMarkCells> {
+        let Some(track) = snapshot.scrollbar else {
+            return Vec::new();
+        };
+        if self.marks.is_empty() || !self.scrollbar_drawn(state, snapshot) {
+            return Vec::new();
+        }
+        mark_cells(&state.index, self.estimate, self.marks, track)
+    }
+
+    fn scrollbar_drawn(&self, state: &VirtualListState<K, S>, snapshot: &LayoutSnapshot) -> bool {
+        snapshot.scrollbar.is_some()
+            && (self.chrome.scrollbar.shown_without_overflow()
+                || state.scrollbar_model(snapshot.resolved).max_offset() > 0)
     }
 
     fn list(&self) -> VirtualSourceList<'_, Src> {
@@ -403,6 +707,36 @@ where
                     height: child.node.size.height,
                     layout_revision: measured.layout_revision,
                     id: child.node.id.clone(),
+                })
+            })
+            .collect()
+    }
+
+    /// Pinned headers of `snapshot` the source still holds unchanged, with
+    /// their placement.
+    fn placed_pinned<'p>(
+        &self,
+        state: &VirtualListState<K, S>,
+        snapshot: &'p LayoutSnapshot,
+    ) -> Vec<(&'p PinnedHeader, PlacedItem)> {
+        snapshot
+            .pinned
+            .iter()
+            .filter_map(|header| {
+                let position = state.placed_source_position(self.source, header.index)?;
+                let measured = state.index.item(header.index)?;
+                (measured.height == header.height).then(|| {
+                    (
+                        header,
+                        PlacedItem {
+                            index: header.index,
+                            position,
+                            start: header.start,
+                            height: header.height,
+                            layout_revision: measured.layout_revision,
+                            id: item_layout_id(self.id.as_str(), &measured.key),
+                        },
+                    )
                 })
             })
             .collect()
@@ -476,24 +810,37 @@ where
         event: &Event,
         cx: &mut EventCx<'_>,
     ) -> RoutedEvent {
+        let area = snapshot.content;
         let items = {
             let state = self.state.borrow();
-            self.placed(&state, layout, snapshot, 0..usize::MAX)
+            // Pinned headers come first so that routing (last slot first)
+            // offers non-positional events to scrolled items bottom to top
+            // and then to the pinned headers above them. Visible rows of
+            // pinned headers and scrolled items never overlap.
+            let pinned = self
+                .placed_pinned(&state, snapshot)
+                .into_iter()
+                .map(|(header, item)| ItemSlot::pinned(item, area, header));
+            let scrolled = self
+                .placed(&state, layout, snapshot, 0..usize::MAX)
+                .into_iter()
+                .map(|item| {
+                    ItemSlot::scrolled(
+                        item,
+                        area,
+                        snapshot.resolved.top_offset,
+                        snapshot.occluded(),
+                    )
+                });
+            pinned.chain(scrolled).collect::<Vec<_>>()
         };
         let width = u64::from(snapshot.content.width);
-        let routed = self.list().route_items(
-            snapshot.content,
-            snapshot.resolved.top_offset,
-            items,
-            event,
-            cx,
-            |item| {
-                let state = self.state.borrow();
-                self.item_layout(&state, item, width)
-                    .cloned()
-                    .map(std::borrow::Cow::Owned)
-            },
-        );
+        let routed = self.list().route_items(area, items, event, cx, |item| {
+            let state = self.state.borrow();
+            self.item_layout(&state, item, width)
+                .cloned()
+                .map(std::borrow::Cow::Owned)
+        });
         self.state
             .borrow()
             .record(|stats| stats.built_items = stats.built_items.saturating_add(routed.built));
@@ -517,6 +864,66 @@ where
             ActionDispatch::Applied => EventOutcome::Redraw,
             ActionDispatch::Unchanged => EventOutcome::Ignored,
         }
+    }
+
+    /// Paint the integrated scrollbar, when drawn, and its marks over it.
+    fn paint_scrollbar(
+        &self,
+        state: &VirtualListState<K, S>,
+        snapshot: &LayoutSnapshot,
+        cx: &mut PaintCx<'_, '_>,
+    ) {
+        let Some(track) = snapshot.scrollbar else {
+            return;
+        };
+        if !self.scrollbar_drawn(state, snapshot) {
+            return;
+        }
+        let model = state.scrollbar_model(snapshot.resolved);
+        let scrollbar = Scrollbar::new()
+            .policy(self.chrome.vertical_policy())
+            .styles(self.chrome.scrollbar_styles);
+        scrollbar.paint(track, &model, cx);
+        let geometry = scrollbar.layout(track, &model);
+        for cells in self.mark_cells(state, snapshot) {
+            let mark = &self.marks[cells.mark];
+            for y in cells.area.y..cells.area.bottom() {
+                let position = y - track.y;
+                let on_thumb = position >= geometry.thumb_start
+                    && position < geometry.thumb_start.saturating_add(geometry.thumb_len);
+                if on_thumb && !mark.over_thumb {
+                    continue;
+                }
+                let (symbol, _) = scrollbar.cell_style(position, track.height, geometry);
+                cx.set_cell(
+                    i32::from(track.x),
+                    i64::from(y),
+                    mark.cell_symbol().unwrap_or(symbol),
+                    mark.style,
+                );
+            }
+        }
+    }
+
+    /// Hash a scrollbar mark's resolved rows and presentation.
+    fn hash_mark(
+        state: &VirtualListState<K, S>,
+        mark: &ScrollbarMark<K>,
+        hasher: &mut impl Hasher,
+    ) {
+        use super::ScrollbarMarkPosition;
+        let row = |key: &K| state.index.key_offset(key);
+        match &mark.position {
+            ScrollbarMarkPosition::Row(row) => (0_u8, *row).hash(hasher),
+            ScrollbarMarkPosition::Rows(rows) => (1_u8, rows.start, rows.end).hash(hasher),
+            ScrollbarMarkPosition::Item(key) => (2_u8, row(key)).hash(hasher),
+            ScrollbarMarkPosition::Items { first, last } => {
+                (3_u8, row(first), row(last)).hash(hasher);
+            }
+        }
+        mark.style.hash(hasher);
+        mark.symbol.hash(hasher);
+        mark.over_thumb.hash(hasher);
     }
 
     /// Route integrated scrollbar input. Returns `None` when the scrollbar
@@ -679,13 +1086,14 @@ where
         self.id.as_str().hash(&mut layout);
         self.chrome.scrollbar.hash(&mut layout);
         self.environment.hash(&mut layout);
+        self.sticky.hash(&mut layout);
         state.generation.hash(&mut layout);
         state.overscroll.hash(&mut layout);
         state.pending.regions.hash(&mut layout);
         state.pending.invalidated.len().hash(&mut layout);
         state.pending.full.hash(&mut layout);
         len.hash(&mut layout);
-        let viewport = state.snapshot.map_or_else(
+        let viewport = state.snapshot.as_ref().map_or_else(
             || state.last_viewport(),
             |snapshot| snapshot.resolved.viewport_height,
         );
@@ -700,7 +1108,7 @@ where
         let keyed = if self.source.always_reconcile() {
             0..len
         } else {
-            state.snapshot.map_or(0..0, |snapshot| {
+            state.snapshot.as_ref().map_or(0..0, |snapshot| {
                 snapshot.visible.start..snapshot.visible.end.min(len)
             })
         };
@@ -708,15 +1116,29 @@ where
             self.source.key(position).to_string().hash(&mut layout);
             self.source.layout_revision(position).hash(&mut layout);
         }
+        let pinned = state
+            .snapshot
+            .as_ref()
+            .map_or(&[][..], |snapshot| snapshot.pinned.as_slice());
+        for header in pinned.iter().filter(|header| header.index < len) {
+            self.source.key(header.index).to_string().hash(&mut layout);
+            self.source.layout_revision(header.index).hash(&mut layout);
+        }
 
         let mut paint = DefaultHasher::new();
         format!("{:?}", self.pointer_intent).hash(&mut paint);
         format!("{:?}", self.chrome).hash(&mut paint);
         state.scroll.hash(&mut paint);
-        for position in state.snapshot.map_or(0..0, |snapshot| {
+        for position in state.snapshot.as_ref().map_or(0..0, |snapshot| {
             snapshot.visible.start..snapshot.visible.end.min(len)
         }) {
             self.source.paint_revision(position).hash(&mut paint);
+        }
+        for header in pinned.iter().filter(|header| header.index < len) {
+            self.source.paint_revision(header.index).hash(&mut paint);
+        }
+        for mark in self.marks {
+            Self::hash_mark(&state, mark, &mut paint);
         }
         ComponentRevision::new(layout.finish(), paint.finish())
     }
@@ -746,11 +1168,12 @@ where
         let chrome = scrollbar_layout(local_area_of(size), self.chrome.layout_policy());
         let content_width = u64::from(chrome.content.width);
         let viewport_height = size.height;
-        let placed = list.layout(
+        let (placed, pinned) = list.layout_pinned(
             content_width,
             self.environment,
             viewport_height,
             self.sources,
+            self.sticky,
             &mut state,
             cx,
         );
@@ -779,6 +1202,35 @@ where
                 ),
             ));
         }
+        let sticky_rows = pinned.last().map_or(0, |header| header.visible.end);
+        if !pinned.is_empty() {
+            let headers = pinned
+                .iter()
+                .filter_map(|header| {
+                    let key = &state.index.item(header.index)?.key;
+                    Some(ChildLayout::new(
+                        0,
+                        header.visible.start,
+                        LayoutNode::leaf(
+                            self.sticky_item_id(key),
+                            LogicalSize::new(
+                                content_width,
+                                header.visible.end - header.visible.start,
+                            ),
+                        ),
+                    ))
+                })
+                .collect();
+            root.push(ChildLayout::new(
+                chrome.content.x.into(),
+                chrome.content.y.into(),
+                LayoutNode::with_children(
+                    self.sticky_id(),
+                    LogicalSize::new(content_width, sticky_rows),
+                    headers,
+                ),
+            ));
+        }
         state.snapshot = Some(LayoutSnapshot {
             size,
             content: chrome.content,
@@ -786,25 +1238,34 @@ where
             resolved: placed.resolved,
             visible,
             measurement_generation: state.generation,
+            pinned,
+            sticky_rows,
         });
         LayoutNode::with_children(self.id.clone(), size, root)
             .with_metadata(LayoutMetadata::new().semantic("list"))
     }
 
     fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
-        let (snapshot, positions, disabled) = {
+        let (snapshot, clip, positions, disabled) = {
             let state = self.state.borrow();
             let Some(snapshot) = state.snapshot_for(layout) else {
                 return;
             };
-            let positions = clip_rows(snapshot.content, cx).map(|rows| {
-                let range = state.index.visible_range(
-                    snapshot.resolved.top_offset.saturating_add(rows.start),
-                    rows.end - rows.start,
-                );
-                range.start..range.end
-            });
-            (snapshot, positions, state.scroll.interaction.disabled)
+            let clip = clip_rows(snapshot.content, cx);
+            // Scrolled items under the pinned headers are neither painted nor
+            // registered, so only rows below them select items.
+            let positions = clip
+                .clone()
+                .map(|rows| rows.start.max(snapshot.sticky_rows)..rows.end)
+                .filter(|rows| !rows.is_empty())
+                .map(|rows| {
+                    let range = state.index.visible_range(
+                        snapshot.resolved.top_offset.saturating_add(rows.start),
+                        rows.end - rows.start,
+                    );
+                    range.start..range.end
+                });
+            (snapshot, clip, positions, state.scroll.interaction.disabled)
         };
         let area = local_area_of(layout.size);
         if area.is_empty() {
@@ -831,45 +1292,51 @@ where
         // Items paint while the state is borrowed immutably, so their retained
         // layouts are borrowed rather than copied.
         let state = self.state.borrow();
-        let report = positions.map_or_else(VirtualListRenderStats::default, |positions| {
-            let content = snapshot.content;
-            let width = u64::from(content.width);
-            let items = self.placed(&state, layout, &snapshot, positions);
-            let items = items.into_iter().filter_map(|item| {
-                let node = self.item_layout(&state, &item, width)?;
-                debug_assert_eq!(node.size.height, item.height);
-                Some((item, node))
-            });
-            let mut report = VirtualListRenderStats::default();
-            cx.with_child(
-                i32::from(content.x),
-                i64::from(content.y),
-                LocalRect::new(0, 0, content.width, content.height),
-                |cx| {
-                    report = self.list().paint_items(
-                        Rect::new(0, 0, content.width, content.height),
-                        snapshot.resolved.top_offset,
-                        items,
-                        cx,
-                    );
-                },
-            );
-            report
+        let content = snapshot.content;
+        let base = Rect::new(0, 0, content.width, content.height);
+        let width = u64::from(content.width);
+        let scrolled = positions.map_or_else(Vec::new, |positions| {
+            self.placed(&state, layout, &snapshot, positions)
         });
+        let scrolled = scrolled.into_iter().map(|item| {
+            ItemSlot::scrolled(
+                item,
+                base,
+                snapshot.resolved.top_offset,
+                snapshot.occluded(),
+            )
+        });
+        // Pinned headers paint after (over) scrolled items; only those
+        // intersecting the paint clip are built.
+        let pinned = clip.map_or_else(Vec::new, |rows| {
+            self.placed_pinned(&state, &snapshot)
+                .into_iter()
+                .filter(|(header, _)| {
+                    header.visible.start < rows.end && rows.start < header.visible.end
+                })
+                .map(|(header, item)| ItemSlot::pinned(item, base, header))
+                .collect()
+        });
+        let items = scrolled.chain(pinned).filter_map(|slot| {
+            let node = self.item_layout(&state, &slot.item, width)?;
+            debug_assert_eq!(node.size.height, slot.item.height);
+            Some((slot, node))
+        });
+        let mut report = VirtualListRenderStats::default();
+        cx.with_child(
+            i32::from(content.x),
+            i64::from(content.y),
+            LocalRect::new(0, 0, content.width, content.height),
+            |cx| {
+                report = self.list().paint_items(content.width, items, cx);
+            },
+        );
         state.record(|stats| {
             stats.painted_items = report.painted_items;
             stats.registered_items = report.registered_items;
             stats.built_items = stats.built_items.saturating_add(report.built_items);
         });
-        if let Some(track) = snapshot.scrollbar {
-            let model = state.scrollbar_model(snapshot.resolved);
-            if self.chrome.scrollbar.shown_without_overflow() || model.max_offset() > 0 {
-                Scrollbar::new()
-                    .policy(self.chrome.vertical_policy())
-                    .styles(self.chrome.scrollbar_styles)
-                    .paint(track, &model, cx);
-            }
-        }
+        self.paint_scrollbar(&state, &snapshot, cx);
         cx.push_damage(LocalRect::new(0, 0, area.width, area.height));
     }
 
