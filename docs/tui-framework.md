@@ -1594,6 +1594,28 @@ code in BMUX:
 | Keyboard focus inside items | `FocusTraversal` over `ItemFocusTarget`s, `reveal_for_focus` for placement |
 | Selection that survives scrolling and eviction | `LogicalSelection` with `KeyOrder`, `highlights` per frame, `selection_auto_scroll` routing |
 
+### Large hierarchical trees
+
+Fixed-height hierarchical rows do not need `VirtualList`.
+`bmux_tui_components::tree_view::TreeViewComponent` is one leaf whose logical
+height is its visible row count, placed inside a `ScrollViewComponent`:
+
+- painting, row hit regions, and semantic regions cover only the rows inside
+  the paint clip;
+- a pointer position maps to its logical row through the event transform
+  (`EventCx::local_point`), not by scanning rows, so hits stay correct at any
+  scroll offset;
+- with a caller-owned `items_revision`, the visible-row projection and
+  intrinsic width are retained in `TreeViewState` until the items revision or
+  the expansion changes, and the component revision hashes the token instead
+  of every item; a tight width never measures labels;
+- expansion is keyed by item id, and selection made by the component is keyed
+  by item id, so it follows its item when rows above it appear or disappear.
+
+Rows may carry styled labels and right-aligned trailing decorations laid out
+by display width with an explicit narrow-row policy
+(`TreeViewTrailingLayout`); see the `bmux_tui_components` README.
+
 ## Images and damage
 
 Images are scene contributions with stable keys, logical placement, payload,

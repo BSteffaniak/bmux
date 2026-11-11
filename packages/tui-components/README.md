@@ -463,6 +463,70 @@ per side; lines over 2,000 graphemes return `None`.
 The whole-document APIs (`diff_viewer_rows*`, `diff_viewer_document_*`) render
 their card rows through `layout_diff_row` with unchanged output.
 
+## Rich and large tree views
+
+The `tree-view` feature's `TreeViewItem` carries a plain `label` or a styled
+`rich_label` (`TreeViewItem::rich`, `.rich_label(line)`), plus right-aligned
+`trailing` decorations such as counts or badges (`.trailing(lines)`,
+`.trailing_decoration(line)`). Span styles are patched over the row's state
+style; disabled rows patch the disabled style over them.
+
+```rust,ignore
+use bmux_tui::prelude::{Line, Span};
+use bmux_tui_components::tree_view::{
+    TreeViewComponent, TreeViewItem, TreeViewLabelOverflow, TreeViewTrailingLayout,
+};
+
+let item = TreeViewItem::rich("src/lib.rs", Line::from_spans([Span::styled("lib.rs", file)]), 1)
+    .trailing_decoration(Line::from_spans([Span::styled("M", modified)]))
+    .trailing_decoration(Line::from_spans([Span::styled("+12", added)]));
+
+let tree = TreeViewComponent::new("files", &items, &state)
+    .items_revision(items_generation)
+    .trailing_layout(
+        TreeViewTrailingLayout::new()
+            .min_label_width(6)
+            .label_overflow(TreeViewLabelOverflow::Ellipsis),
+    );
+```
+
+Row geometry, in order: indentation, disclosure marker, one separator cell,
+then the room holding the label and decorations. `TreeViewTrailingLayout`
+makes narrow rows explicit:
+
+* Decorations sit against the row's right edge, `gap` cells after the label
+  and `spacing` cells apart, measured by display width.
+* They are shown only while `min(label width, min_label_width) + gap +
+  decorations` fits the room. Otherwise whole decorations are hidden starting
+  with the first (leftmost), so put the most important decoration last. A
+  decoration is never cut and never overlaps the label.
+* The label takes the remaining room and is shortened by `label_overflow`:
+  `Clip` (the default; a wide grapheme that would straddle the edge is
+  omitted) or `Ellipsis`. A spare cell becomes padding, so decorations stay
+  flush right.
+* An indentation wider than the row hides the marker, label, and decorations
+  while the row keeps its width and hit region.
+* The intrinsic width includes the gap and every decoration.
+
+Scale: the tree is one leaf whose height is its visible row count, placed in a
+`ScrollViewComponent` (or another clipping parent). Painting, row hit regions,
+and semantic regions cover only rows inside the paint clip, and a pointer
+position maps to its logical row through the event transform, so hits stay
+correct at any scroll offset. Pass `items_revision` (changed whenever any item
+changes) to retain the visible-row projection and intrinsic width in
+`TreeViewState` across frames until the expansion changes; the revision then
+hashes the token instead of every item. A tight layout width never measures
+labels. `visible_count`, `visible_source`, `visible_row_of`, and `row_rect`
+read the same projection (for example to ensure the selected row is visible).
+
+State is keyed: expansion is a set of item ids (`set_expanded`,
+`set_expanded_ids`), and keyboard and pointer selection record the selected
+item's id, so the selection follows its item when rows above it appear or
+disappear. `set_selected_id` selects by id; while that item is hidden or
+absent no row is selected and the id is kept. `set_selected_visible` selects a
+row position and clears the id. `TreeViewComponent::selected_visible` resolves
+the keyed row against the current items.
+
 ## Component conventions
 
 Interactive components should follow the same shape as the existing text input

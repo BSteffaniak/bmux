@@ -1,12 +1,25 @@
 //! Generic hierarchical tree-view component.
+//!
+//! Items are caller-owned preorder rows. Each row has a plain label or a
+//! styled [`Line`] label, and optional right-aligned trailing decorations
+//! (counts, badges) laid out by display width with an explicit narrow-width
+//! policy ([`TreeViewTrailingLayout`]).
+//!
+//! The component scales to very large trees: painting and interaction
+//! registration visit only the rows inside the paint clip, pointer hits map a
+//! position to its logical row directly, and a caller-supplied
+//! [`TreeViewComponent::items_revision`] lets the visible-row projection and
+//! intrinsic width be reused across frames instead of being recomputed.
 
 use std::cell::RefCell;
+use std::collections::BTreeSet;
 use std::hash::{Hash, Hasher};
+use std::sync::Arc;
 
 use bmux_keyboard::KeyCode;
 use bmux_tui::component::{
     Component, ComponentRevision, Constraints, EventCx, LayoutCx, LayoutId, LayoutMetadata,
-    LayoutNode, LogicalSize,
+    LayoutNode, LogicalRect, LogicalSize,
 };
 use bmux_tui::event::{Event, EventOutcome, MouseButton, MouseEvent, MouseEventKind};
 use bmux_tui::geometry::Rect;
@@ -15,6 +28,7 @@ use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::prelude::{Line, Span};
 use bmux_tui::semantic::SemanticRegion;
 use bmux_tui::style::{Color, Modifier, Style};
+use bmux_tui::text::{TrailingAlign, TrailingPlacement, place_trailing};
 
 use crate::common::{ComponentMousePolicy, InteractionState, u16_saturating};
 
@@ -23,8 +37,21 @@ use crate::common::{ComponentMousePolicy, InteractionState, u16_saturating};
 pub struct TreeViewItem {
     /// Stable item id.
     pub id: String,
-    /// Visible label.
+    /// Visible plain label. Items built with a styled label keep its plain
+    /// text here.
     pub label: String,
+    /// Optional styled label, painted and measured instead of `label`.
+    ///
+    /// Span styles are patched over the row's state style (normal, selected,
+    /// hovered, pressed). Disabled rows patch the disabled style over them.
+    pub rich_label: Option<Line>,
+    /// Right-aligned trailing decorations, such as counts or badges, in
+    /// display order.
+    ///
+    /// Decorations are never cut: when a row is too narrow for all of them
+    /// and its minimum label width, whole decorations are hidden starting
+    /// with the first (leftmost). See [`TreeViewTrailingLayout`].
+    pub trailing: Vec<Line>,
     /// Nesting depth, where zero is root level.
     pub depth: u16,
     /// Whether this item can be expanded/collapsed.
@@ -34,16 +61,47 @@ pub struct TreeViewItem {
 }
 
 impl TreeViewItem {
-    /// Create a tree item.
+    /// Create a tree item with a plain label.
     #[must_use]
     pub fn new(id: impl Into<String>, label: impl Into<String>, depth: u16) -> Self {
         Self {
             id: id.into(),
             label: label.into(),
+            rich_label: None,
+            trailing: Vec::new(),
             depth,
             expandable: false,
             disabled: false,
         }
+    }
+
+    /// Create a tree item with a styled label.
+    #[must_use]
+    pub fn rich(id: impl Into<String>, label: impl Into<Line>, depth: u16) -> Self {
+        Self::new(id, String::new(), depth).rich_label(label)
+    }
+
+    /// Return this item with a styled label. `label` is set to its plain text.
+    #[must_use]
+    pub fn rich_label(mut self, label: impl Into<Line>) -> Self {
+        let label = label.into();
+        self.label = label.plain_text();
+        self.rich_label = Some(label);
+        self
+    }
+
+    /// Return this item with `decorations` as its trailing decorations.
+    #[must_use]
+    pub fn trailing(mut self, decorations: impl IntoIterator<Item = Line>) -> Self {
+        self.trailing = decorations.into_iter().collect();
+        self
+    }
+
+    /// Return this item with one more trailing decoration after the existing ones.
+    #[must_use]
+    pub fn trailing_decoration(mut self, decoration: impl Into<Line>) -> Self {
+        self.trailing.push(decoration.into());
+        self
     }
 
     /// Return this item marked expandable.
@@ -58,6 +116,93 @@ impl TreeViewItem {
     pub const fn disabled(mut self, disabled: bool) -> Self {
         self.disabled = disabled;
         self
+    }
+
+    fn label_width(&self) -> usize {
+        self.rich_label.as_ref().map_or_else(
+            || bmux_tui::text_width::display_width(&self.label),
+            Line::width,
+        )
+    }
+}
+
+/// How a label that does not fit its row is shortened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum TreeViewLabelOverflow {
+    /// Cut the label at the row edge, or before the trailing decorations,
+    /// without a marker. A wide grapheme that would straddle the cut is
+    /// omitted.
+    #[default]
+    Clip,
+    /// Truncate the label with an ellipsis.
+    Ellipsis,
+}
+
+/// Placement of right-aligned trailing decorations and label overflow.
+///
+/// For each row, the room after the indentation, disclosure marker, and
+/// separator holds the label and the decorations. Decorations are shown only
+/// while `min(label width, min_label_width) + gap + decorations width` fits
+/// the room; otherwise whole decorations are hidden starting with the first
+/// one, so the label never overlaps a decoration and no decoration is cut.
+/// The label then takes the remaining room, shortened by `label_overflow`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TreeViewTrailingLayout {
+    /// Minimum cells between the label and the first shown decoration.
+    pub gap: u16,
+    /// Cells between consecutive decorations.
+    pub spacing: u16,
+    /// Label cells kept visible before decorations are hidden. A label
+    /// narrower than this only needs its own width.
+    pub min_label_width: u16,
+    /// How the label is shortened when it does not fit.
+    pub label_overflow: TreeViewLabelOverflow,
+}
+
+impl TreeViewTrailingLayout {
+    /// One-cell gap and spacing, a four-cell minimum label, and clipped labels.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            gap: 1,
+            spacing: 1,
+            min_label_width: 4,
+            label_overflow: TreeViewLabelOverflow::Clip,
+        }
+    }
+
+    /// Return this layout with `gap` cells between label and decorations.
+    #[must_use]
+    pub const fn gap(mut self, gap: u16) -> Self {
+        self.gap = gap;
+        self
+    }
+
+    /// Return this layout with `spacing` cells between decorations.
+    #[must_use]
+    pub const fn spacing(mut self, spacing: u16) -> Self {
+        self.spacing = spacing;
+        self
+    }
+
+    /// Return this layout keeping `width` label cells before hiding decorations.
+    #[must_use]
+    pub const fn min_label_width(mut self, width: u16) -> Self {
+        self.min_label_width = width;
+        self
+    }
+
+    /// Return this layout with the given label overflow behavior.
+    #[must_use]
+    pub const fn label_overflow(mut self, overflow: TreeViewLabelOverflow) -> Self {
+        self.label_overflow = overflow;
+        self
+    }
+}
+
+impl Default for TreeViewTrailingLayout {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -172,16 +317,71 @@ impl Default for TreeViewStyles {
     }
 }
 
+/// Visible-row projection of one item slice under one expansion state.
+#[derive(Debug)]
+struct TreeViewProjection {
+    items_revision: Option<u64>,
+    items_len: usize,
+    expansion_generation: u64,
+    /// Source indices in visible row order.
+    visible: Vec<usize>,
+    /// Whether any visible row is enabled.
+    any_enabled: bool,
+}
+
+/// Width-cache key: everything besides the projection that affects width.
+type TreeViewWidthKey = (u16, TreeViewTrailingLayout);
+
+/// Disposable derived data kept beside [`TreeViewState`]. It never takes part
+/// in equality, serialization, or snapshots.
+#[derive(Clone, Default)]
+struct TreeViewCache {
+    /// Advanced on every expansion change, keying cached projections.
+    expansion_generation: u64,
+    /// Lookup index over the expanded ids, built on first keyed mutation.
+    expanded_index: Option<BTreeSet<String>>,
+    /// Projection retained for a caller-supplied items revision.
+    projection: Option<Arc<TreeViewProjection>>,
+    /// Intrinsic content width of the retained projection.
+    width: Option<(TreeViewWidthKey, usize)>,
+    /// A keyed selection known to be absent from the retained projection.
+    hidden_selection: Option<String>,
+}
+
+impl PartialEq for TreeViewCache {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for TreeViewCache {}
+
+impl std::fmt::Debug for TreeViewCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TreeViewCache").finish_non_exhaustive()
+    }
+}
+
 /// Runtime state for [`TreeViewComponent`].
+///
+/// Expansion is keyed by item id. Selection is either a visible row
+/// ([`Self::set_selected_visible`]) or keyed by item id
+/// ([`Self::set_selected_id`]); keyboard and pointer selection made by the
+/// component are keyed, so the selected item keeps its selection when rows
+/// above it appear or disappear.
 #[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TreeViewState {
     selected_visible: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    selected_id: Option<String>,
     expanded: Vec<String>,
     hovered_visible: Option<usize>,
     pressed_visible: Option<usize>,
     /// Generic interaction flags.
     pub interaction: InteractionState,
+    #[serde(skip)]
+    cache: TreeViewCache,
 }
 
 impl TreeViewState {
@@ -209,10 +409,18 @@ impl TreeViewState {
     pub const fn new(selected_visible: Option<usize>) -> Self {
         Self {
             selected_visible,
+            selected_id: None,
             expanded: Vec::new(),
             hovered_visible: None,
             pressed_visible: None,
             interaction: InteractionState::new(),
+            cache: TreeViewCache {
+                expansion_generation: 0,
+                expanded_index: None,
+                projection: None,
+                width: None,
+                hidden_selection: None,
+            },
         }
     }
 
@@ -230,10 +438,20 @@ impl TreeViewState {
         }
     }
 
-    /// Return selected visible row.
+    /// Return the selected visible row.
+    ///
+    /// For a keyed selection this is the row resolved the last time a
+    /// component projected this state; [`TreeViewComponent::selected_visible`]
+    /// resolves it against the current items.
     #[must_use]
     pub const fn selected_visible(&self) -> Option<usize> {
         self.selected_visible
+    }
+
+    /// Return the selected item id when the selection is keyed.
+    #[must_use]
+    pub fn selected_id(&self) -> Option<&str> {
+        self.selected_id.as_deref()
     }
 
     /// Return expanded ids.
@@ -242,30 +460,77 @@ impl TreeViewState {
         &self.expanded
     }
 
-    /// Set selected visible row.
-    pub const fn set_selected_visible(&mut self, selected_visible: Option<usize>) {
+    /// Select a visible row by position. This clears any keyed selection, so
+    /// the selection stays on the row position when rows change.
+    pub fn set_selected_visible(&mut self, selected_visible: Option<usize>) {
         self.selected_visible = selected_visible;
+        self.selected_id = None;
+        self.cache.hidden_selection = None;
+    }
+
+    /// Select the item with stable `id`.
+    ///
+    /// The component resolves the visible row whenever it projects this
+    /// state, so the selection follows the item across expansion and item
+    /// changes. While the item is hidden under a collapsed ancestor or absent,
+    /// no row is selected and the id is kept, so the row is selected again
+    /// when it reappears.
+    pub fn set_selected_id(&mut self, id: impl Into<String>) {
+        self.selected_id = Some(id.into());
+        self.selected_visible = None;
+        self.cache.hidden_selection = None;
+    }
+
+    /// Clear both positional and keyed selection.
+    pub fn clear_selection(&mut self) {
+        self.set_selected_visible(None);
     }
 
     /// Return whether `id` is expanded.
     #[must_use]
     pub fn is_expanded(&self, id: &str) -> bool {
-        self.expanded.iter().any(|expanded| expanded == id)
+        self.valid_expanded_index().map_or_else(
+            || self.expanded.iter().any(|expanded| expanded == id),
+            |index| index.contains(id),
+        )
     }
 
     /// Set expansion for an id.
+    ///
+    /// Expanding is logarithmic in the number of expanded ids after the first
+    /// keyed mutation builds a lookup index; collapsing is linear.
     pub fn set_expanded(&mut self, id: &str, expanded: bool) {
-        if self.is_expanded(id) == expanded {
+        let index = self.expanded_index_mut();
+        if index.contains(id) == expanded {
             return;
         }
         if expanded {
+            index.insert(id.to_owned());
             self.expanded.push(id.to_owned());
         } else {
+            index.remove(id);
             self.expanded.retain(|expanded| expanded != id);
         }
-        // Visible row indices can now identify different items.
-        self.hovered_visible = None;
-        self.pressed_visible = None;
+        self.expansion_changed();
+    }
+
+    /// Replace the expanded ids in one step. Duplicates are ignored and the
+    /// first occurrence keeps its order.
+    pub fn set_expanded_ids(&mut self, ids: impl IntoIterator<Item = String>) {
+        let mut index = BTreeSet::new();
+        let mut expanded = Vec::new();
+        for id in ids {
+            if index.insert(id.clone()) {
+                expanded.push(id);
+            }
+        }
+        if expanded == self.expanded {
+            self.cache.expanded_index = Some(index);
+            return;
+        }
+        self.expanded = expanded;
+        self.cache.expanded_index = Some(index);
+        self.expansion_changed();
     }
 
     /// Toggle expansion for an id and return true when the state changed.
@@ -273,6 +538,27 @@ impl TreeViewState {
         let expanded = self.is_expanded(id);
         self.set_expanded(id, !expanded);
         true
+    }
+
+    fn valid_expanded_index(&self) -> Option<&BTreeSet<String>> {
+        self.cache
+            .expanded_index
+            .as_ref()
+            .filter(|index| index.len() == self.expanded.len())
+    }
+
+    fn expanded_index_mut(&mut self) -> &mut BTreeSet<String> {
+        if self.valid_expanded_index().is_none() {
+            self.cache.expanded_index = Some(self.expanded.iter().cloned().collect());
+        }
+        self.cache.expanded_index.get_or_insert_with(BTreeSet::new)
+    }
+
+    const fn expansion_changed(&mut self) {
+        self.cache.expansion_generation = self.cache.expansion_generation.wrapping_add(1);
+        // Visible row indices can now identify different items.
+        self.hovered_visible = None;
+        self.pressed_visible = None;
     }
 }
 
@@ -299,8 +585,10 @@ pub enum TreeViewOutcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TreeView<'a> {
     items: &'a [TreeViewItem],
+    items_revision: Option<u64>,
     policy: TreeViewPolicy,
     styles: TreeViewStyles,
+    trailing_layout: TreeViewTrailingLayout,
     focus_style: Style,
 }
 
@@ -310,6 +598,7 @@ impl<'a> TreeView<'a> {
     pub const fn new(items: &'a [TreeViewItem]) -> Self {
         Self {
             items,
+            items_revision: None,
             policy: TreeViewPolicy {
                 keyboard: TreeViewKeyboardPolicy {
                     enabled: true,
@@ -332,30 +621,117 @@ impl<'a> TreeView<'a> {
                 disabled: Style::new(),
                 marker: Style::new(),
             },
+            trailing_layout: TreeViewTrailingLayout::new(),
         }
     }
 
-    /// Return source indices visible under the current expansion state.
-    #[must_use]
-    pub fn visible_indices(&self, state: &TreeViewState) -> Vec<usize> {
-        visible_indices(self.items, state)
+    /// Resolve the visible-row projection, reusing the retained one when the
+    /// caller-supplied items revision and the expansion state are unchanged,
+    /// and reconcile a keyed selection against it.
+    fn projection(&self, state: &mut TreeViewState) -> Arc<TreeViewProjection> {
+        let generation = state.cache.expansion_generation;
+        let retained = self.items_revision.and_then(|revision| {
+            state
+                .cache
+                .projection
+                .as_ref()
+                .filter(|projection| {
+                    projection.items_revision == Some(revision)
+                        && projection.items_len == self.items.len()
+                        && projection.expansion_generation == generation
+                })
+                .map(Arc::clone)
+        });
+        let projection = retained.unwrap_or_else(|| {
+            let visible = visible_indices(self.items, state);
+            let any_enabled = visible.iter().any(|&source| !self.items[source].disabled);
+            let projection = Arc::new(TreeViewProjection {
+                items_revision: self.items_revision,
+                items_len: self.items.len(),
+                expansion_generation: generation,
+                visible,
+                any_enabled,
+            });
+            state.cache.projection = self
+                .items_revision
+                .is_some()
+                .then(|| Arc::clone(&projection));
+            state.cache.width = None;
+            state.cache.hidden_selection = None;
+            projection
+        });
+        self.reconcile_selection(state, &projection);
+        projection
     }
 
-    fn logical_size(&self, state: &TreeViewState) -> LogicalSize {
-        let visible = self.visible_indices(state);
-        let width = visible
+    fn reconcile_selection(&self, state: &mut TreeViewState, projection: &TreeViewProjection) {
+        let Some(key) = state.selected_id.as_deref() else {
+            return;
+        };
+        let current = state
+            .selected_visible
+            .and_then(|row| projection.visible.get(row))
+            .is_some_and(|&source| self.items[source].id == key);
+        if current {
+            return;
+        }
+        if state.cache.hidden_selection.as_deref() == Some(key) {
+            state.selected_visible = None;
+            return;
+        }
+        let row = projection
+            .visible
             .iter()
-            .map(|source| {
-                let item = &self.items[*source];
-                usize::from(item.depth.saturating_mul(self.policy.indent_width))
-                    .saturating_add(2) // disclosure marker and separating space
-                    .saturating_add(bmux_tui::text_width::display_width(&item.label))
-            })
+            .position(|&source| self.items[source].id == key);
+        if row.is_none() && self.items_revision.is_some() {
+            state.cache.hidden_selection = Some(key.to_owned());
+        }
+        state.selected_visible = row;
+    }
+
+    fn content_width(&self, state: &mut TreeViewState, projection: &TreeViewProjection) -> usize {
+        let key = (self.policy.indent_width, self.trailing_layout);
+        if self.items_revision.is_some()
+            && let Some((cached, width)) = state.cache.width
+            && cached == key
+        {
+            return width;
+        }
+        let width = projection
+            .visible
+            .iter()
+            .map(|&source| self.intrinsic_row_width(&self.items[source]))
             .max()
             .unwrap_or(0);
+        if self.items_revision.is_some() {
+            state.cache.width = Some((key, width));
+        }
+        width
+    }
+
+    fn intrinsic_row_width(&self, item: &TreeViewItem) -> usize {
+        let trailing = decorations_width(&item.trailing, usize::from(self.trailing_layout.spacing));
+        usize::from(item.depth.saturating_mul(self.policy.indent_width))
+            .saturating_add(2) // disclosure marker and separating space
+            .saturating_add(item.label_width())
+            .saturating_add(if trailing == 0 {
+                0
+            } else {
+                usize::from(self.trailing_layout.gap).saturating_add(trailing)
+            })
+    }
+
+    fn logical_size(&self, state: &mut TreeViewState, constraints: Constraints) -> LogicalSize {
+        let projection = self.projection(state);
+        // A tight width does not depend on content, so labels are not measured.
+        let width = if constraints.min_width() == constraints.max_width() {
+            constraints.max_width()
+        } else {
+            u16_saturating(self.content_width(state, &projection)).into()
+        };
         LogicalSize::new(
-            u16_saturating(width).into(),
-            visible.len().try_into().unwrap_or(u64::MAX),
+            width,
+            projection.visible.len().try_into().unwrap_or(u64::MAX),
         )
     }
 
@@ -365,16 +741,18 @@ impl<'a> TreeView<'a> {
         }
         match event {
             Event::Key(stroke) if self.policy.keyboard.enabled && stroke.modifiers.is_empty() => {
+                let projection = self.projection(state);
+                let visible = projection.visible.as_slice();
                 match stroke.key {
-                    KeyCode::Up => self.move_selection(state, -1),
-                    KeyCode::Down => self.move_selection(state, 1),
-                    KeyCode::Left => self.collapse_selected(state),
-                    KeyCode::Right => self.expand_selected(state),
+                    KeyCode::Up => self.move_selection(state, visible, -1),
+                    KeyCode::Down => self.move_selection(state, visible, 1),
+                    KeyCode::Left => self.collapse_selected(state, visible),
+                    KeyCode::Right => self.expand_selected(state, visible),
                     KeyCode::Enter if self.policy.keyboard.enter_selects => {
-                        self.select_selected(state)
+                        self.select_selected(state, visible)
                     }
                     KeyCode::Char(' ') if self.policy.keyboard.space_toggles => {
-                        self.toggle_selected(state)
+                        self.toggle_selected(state, visible)
                     }
                     _ => TreeViewOutcome::Ignored,
                 }
@@ -414,23 +792,117 @@ impl<'a> TreeView<'a> {
         } else {
             " "
         };
-        let marker_style = if item.disabled || state.interaction.disabled {
+        let disabled = item.disabled || state.interaction.disabled;
+        let marker_style = if disabled {
             self.styles.disabled
         } else {
             self.styles.marker
         };
-        let label = if width - indent_width > 2 {
-            item.label.clone()
-        } else {
-            String::new()
-        };
-        let separator = if width - indent_width > 1 { " " } else { "" };
-        Line::from_spans([
+        let remaining = width - indent_width;
+        let separator = if remaining > 1 { " " } else { "" };
+        let mut spans = vec![
             Span::styled(indent, style),
             Span::styled(marker, marker_style),
             Span::styled(separator, style),
-            Span::styled(label, style),
-        ])
+        ];
+        if remaining > 2 {
+            spans.extend(self.row_content(
+                item,
+                style,
+                disabled.then_some(self.styles.disabled),
+                usize::from(remaining - 2),
+            ));
+        } else {
+            spans.push(Span::styled(String::new(), style));
+        }
+        Line::from_spans(spans)
+    }
+
+    /// Lay out the label and trailing decorations inside `room` cells.
+    fn row_content(
+        &self,
+        item: &TreeViewItem,
+        style: Style,
+        disabled: Option<Style>,
+        room: usize,
+    ) -> Vec<Span> {
+        let layout = self.trailing_layout;
+        let decorations = self.shown_decorations(item, room);
+        if decorations.is_empty()
+            && item.rich_label.is_none()
+            && layout.label_overflow == TreeViewLabelOverflow::Clip
+        {
+            // The painter clips the plain label at the row edge.
+            return vec![Span::styled(item.label.clone(), style)];
+        }
+        let label = item
+            .rich_label
+            .clone()
+            .unwrap_or_else(|| Line::from_spans([Span::styled(item.label.clone(), style)]));
+        let gap = usize::from(layout.gap);
+        let spacing = usize::from(layout.spacing);
+        let trailing_width = decorations_width(decorations, spacing);
+        let label_room = if decorations.is_empty() {
+            room
+        } else {
+            room.saturating_sub(gap.saturating_add(trailing_width))
+        };
+        let label = match layout.label_overflow {
+            TreeViewLabelOverflow::Clip => label.viewport(0, label_room),
+            TreeViewLabelOverflow::Ellipsis => label.truncate(label_room),
+        };
+        let mut line = if decorations.is_empty() {
+            label
+        } else {
+            let mut trailing = Vec::new();
+            for (index, decoration) in decorations.iter().enumerate() {
+                if index > 0 && spacing > 0 {
+                    trailing.push(Span::raw(" ".repeat(spacing)));
+                }
+                trailing.extend(decoration.spans.iter().cloned());
+            }
+            place_trailing(
+                &label,
+                &Line::from_spans(trailing),
+                room,
+                TrailingPlacement::new(TrailingAlign::Right)
+                    .keep_visible(true)
+                    .gap(gap),
+            )
+        };
+        if let Some(disabled) = disabled {
+            line = line.patch_style(disabled);
+        }
+        line.spans
+    }
+
+    /// Return the trailing decorations shown in `room` cells: the longest
+    /// suffix of the item's decorations that leaves the minimum label width.
+    fn shown_decorations<'item>(&self, item: &'item TreeViewItem, room: usize) -> &'item [Line] {
+        if item.trailing.is_empty() {
+            return &[];
+        }
+        let layout = self.trailing_layout;
+        let label_need = item
+            .label_width()
+            .min(usize::from(layout.min_label_width))
+            .saturating_add(usize::from(layout.gap));
+        let spacing = usize::from(layout.spacing);
+        let mut width = 0_usize;
+        let mut first = item.trailing.len();
+        for (index, decoration) in item.trailing.iter().enumerate().rev() {
+            let added = if index + 1 == item.trailing.len() {
+                decoration.width()
+            } else {
+                decoration.width().saturating_add(spacing)
+            };
+            if label_need.saturating_add(width).saturating_add(added) > room {
+                break;
+            }
+            width = width.saturating_add(added);
+            first = index;
+        }
+        &item.trailing[first..]
     }
 
     fn row_style(&self, item: &TreeViewItem, state: &TreeViewState, visible: usize) -> Style {
@@ -483,12 +955,12 @@ impl<'a> TreeView<'a> {
                 if self.policy.mouse.click
                     && let Some(hit) = hit
                     && pressed == hit
-                    && let Some(source) = self.visible_indices(state).get(hit).copied()
+                    && let Some(source) = self.projection(state).visible.get(hit).copied()
                 {
                     if self.items[source].disabled {
                         return TreeViewOutcome::Redraw;
                     }
-                    state.selected_visible = Some(hit);
+                    select(state, hit, &self.items[source]);
                     return TreeViewOutcome::Selected {
                         visible: hit,
                         source,
@@ -507,8 +979,12 @@ impl<'a> TreeView<'a> {
         }
     }
 
-    fn move_selection(&self, state: &mut TreeViewState, delta: i32) -> TreeViewOutcome {
-        let visible = self.visible_indices(state);
+    fn move_selection(
+        &self,
+        state: &mut TreeViewState,
+        visible: &[usize],
+        delta: i32,
+    ) -> TreeViewOutcome {
         if visible.is_empty() {
             return TreeViewOutcome::Ignored;
         }
@@ -523,21 +999,21 @@ impl<'a> TreeView<'a> {
         if current == Some(next) {
             return TreeViewOutcome::Ignored;
         }
-        state.selected_visible = Some(next);
+        select(state, next, &self.items[visible[next]]);
         TreeViewOutcome::Focused {
             visible: next,
             source: visible[next],
         }
     }
 
-    fn selected_source(&self, state: &TreeViewState) -> Option<(usize, usize)> {
-        let visible = state.selected_visible?;
-        let source = self.visible_indices(state).get(visible).copied()?;
-        Some((visible, source))
+    fn selected_source(state: &TreeViewState, visible: &[usize]) -> Option<(usize, usize)> {
+        let row = state.selected_visible?;
+        let source = visible.get(row).copied()?;
+        Some((row, source))
     }
 
-    fn expand_selected(&self, state: &mut TreeViewState) -> TreeViewOutcome {
-        let Some((visible, source)) = self.selected_source(state) else {
+    fn expand_selected(&self, state: &mut TreeViewState, visible: &[usize]) -> TreeViewOutcome {
+        let Some((visible, source)) = Self::selected_source(state, visible) else {
             return TreeViewOutcome::Ignored;
         };
         let item = &self.items[source];
@@ -552,8 +1028,8 @@ impl<'a> TreeView<'a> {
         }
     }
 
-    fn collapse_selected(&self, state: &mut TreeViewState) -> TreeViewOutcome {
-        let Some((visible, source)) = self.selected_source(state) else {
+    fn collapse_selected(&self, state: &mut TreeViewState, visible: &[usize]) -> TreeViewOutcome {
+        let Some((visible, source)) = Self::selected_source(state, visible) else {
             return TreeViewOutcome::Ignored;
         };
         let item = &self.items[source];
@@ -568,8 +1044,8 @@ impl<'a> TreeView<'a> {
         }
     }
 
-    fn toggle_selected(&self, state: &mut TreeViewState) -> TreeViewOutcome {
-        let Some((visible, source)) = self.selected_source(state) else {
+    fn toggle_selected(&self, state: &mut TreeViewState, visible: &[usize]) -> TreeViewOutcome {
+        let Some((visible, source)) = Self::selected_source(state, visible) else {
             return TreeViewOutcome::Ignored;
         };
         let item = &self.items[source];
@@ -584,8 +1060,8 @@ impl<'a> TreeView<'a> {
         }
     }
 
-    fn select_selected(&self, state: &TreeViewState) -> TreeViewOutcome {
-        let Some((visible, source)) = self.selected_source(state) else {
+    fn select_selected(&self, state: &TreeViewState, visible: &[usize]) -> TreeViewOutcome {
+        let Some((visible, source)) = Self::selected_source(state, visible) else {
             return TreeViewOutcome::Ignored;
         };
         if self.items[source].disabled {
@@ -596,7 +1072,30 @@ impl<'a> TreeView<'a> {
     }
 }
 
+/// Record a component-made selection, keyed by the item's id.
+fn select(state: &mut TreeViewState, row: usize, item: &TreeViewItem) {
+    state.selected_visible = Some(row);
+    if state.selected_id.as_deref() != Some(item.id.as_str()) {
+        state.selected_id = Some(item.id.clone());
+    }
+    state.cache.hidden_selection = None;
+}
+
+/// Total width of `decorations` separated by `spacing` cells.
+fn decorations_width(decorations: &[Line], spacing: usize) -> usize {
+    decorations
+        .iter()
+        .map(Line::width)
+        .sum::<usize>()
+        .saturating_add(spacing.saturating_mul(decorations.len().saturating_sub(1)))
+}
+
 fn visible_indices(items: &[TreeViewItem], state: &TreeViewState) -> Vec<usize> {
+    let expanded = state
+        .expanded
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
     let mut visible = Vec::new();
     let mut ancestor_visible = Vec::<bool>::new();
     for (index, item) in items.iter().enumerate() {
@@ -606,12 +1105,21 @@ fn visible_indices(items: &[TreeViewItem], state: &TreeViewState) -> Vec<usize> 
         if parents_visible {
             visible.push(index);
         }
-        let children_visible = parents_visible && (!item.expandable || state.is_expanded(&item.id));
+        let children_visible =
+            parents_visible && (!item.expandable || expanded.contains(item.id.as_str()));
         if ancestor_visible.len() == usize::from(item.depth) {
             ancestor_visible.push(children_visible);
         }
     }
     visible
+}
+
+fn hash_line(line: &Line, hasher: &mut impl Hasher) {
+    line.spans.len().hash(hasher);
+    for span in &line.spans {
+        span.content.hash(hasher);
+        span.style.hash(hasher);
+    }
 }
 
 /// Canonical component-lifecycle hierarchical tree view.
@@ -621,6 +1129,12 @@ fn visible_indices(items: &[TreeViewItem], state: &TreeViewState) -> Vec<usize> 
 /// one composite roving-focus region plus one visible row region per stable
 /// item id, and routes events through the same resolved layout. Tree state
 /// remains caller-owned through an interior-mutable `RefCell`.
+///
+/// Painting, hit registration, and semantic regions cover only the rows in
+/// the paint clip, and a pointer position maps to its logical row directly,
+/// so a scrolled tree with tens of thousands of rows does per-frame work
+/// proportional to its visible rows once the projection is retained through
+/// [`Self::items_revision`].
 pub struct TreeViewComponent<'a, 'state> {
     pointer_intent: bmux_tui::pointer::PointerIntent,
     id: LayoutId,
@@ -641,7 +1155,48 @@ impl<'a, 'state> TreeViewComponent<'a, 'state> {
     /// Uses the same expansion state and projection as layout, painting, and input.
     #[must_use]
     pub fn visible_indices(&self) -> Vec<usize> {
-        self.tree.visible_indices(&self.state.borrow())
+        self.projection().visible.clone()
+    }
+
+    /// Return the number of visible rows.
+    #[must_use]
+    pub fn visible_count(&self) -> usize {
+        self.projection().visible.len()
+    }
+
+    /// Return the source-item index painted at visible `row`.
+    #[must_use]
+    pub fn visible_source(&self, row: usize) -> Option<usize> {
+        self.projection().visible.get(row).copied()
+    }
+
+    /// Return the visible row of the item with stable `id`, or `None` when it
+    /// is hidden or absent. Linear in the visible rows.
+    #[must_use]
+    pub fn visible_row_of(&self, id: &str) -> Option<usize> {
+        let projection = self.projection();
+        projection
+            .visible
+            .iter()
+            .position(|&source| self.tree.items[source].id == id)
+    }
+
+    /// Return the selected visible row, resolving a keyed selection against
+    /// the current items and expansion state.
+    #[must_use]
+    pub fn selected_visible(&self) -> Option<usize> {
+        let _ = self.projection();
+        self.state.borrow().selected_visible
+    }
+
+    /// Return the local logical rectangle of visible `row` in `layout`, for
+    /// ensure-visible requests to an enclosing scroll view. Returns `None`
+    /// for rows outside the visible projection or the resolved height.
+    #[must_use]
+    pub fn row_rect(&self, layout: &LayoutNode, row: usize) -> Option<LogicalRect> {
+        let row_y = u64::try_from(row).ok()?;
+        (row < self.visible_count() && row_y < layout.size.height)
+            .then(|| LogicalRect::new(0, row_y, layout.size.width, 1))
     }
 
     /// Create a tree view with stable identity and caller-owned state.
@@ -657,6 +1212,32 @@ impl<'a, 'state> TreeViewComponent<'a, 'state> {
             tree: TreeView::new(items),
             state,
         }
+    }
+
+    /// Declare a caller-owned revision of the item slice.
+    ///
+    /// The caller must change `revision` whenever any item changes (ids,
+    /// labels, decorations, depth, expandability, or disabled state). While
+    /// it is unchanged, the component reuses the visible-row projection and
+    /// intrinsic width retained in [`TreeViewState`] across frames until the
+    /// expansion state changes, and its revision hashes `revision` instead of
+    /// every item. Without a revision every projection is recomputed, which
+    /// is linear in the item count.
+    #[must_use]
+    pub const fn items_revision(mut self, revision: u64) -> Self {
+        self.tree.items_revision = Some(revision);
+        self
+    }
+
+    /// Set the trailing-decoration and label-overflow layout.
+    #[must_use]
+    pub const fn trailing_layout(mut self, layout: TreeViewTrailingLayout) -> Self {
+        self.tree.trailing_layout = layout;
+        self
+    }
+
+    fn projection(&self) -> Arc<TreeViewProjection> {
+        self.tree.projection(&mut self.state.borrow_mut())
     }
 
     /// Handle an event using resolved geometry while preserving the typed action.
@@ -681,24 +1262,39 @@ impl<'a, 'state> TreeViewComponent<'a, 'state> {
             if state.interaction.disabled || !self.tree.policy.mouse.enabled || !handles_mouse {
                 return TreeViewOutcome::Ignored;
             }
-            let hit = area
-                .contains(mouse.position)
-                .then(|| {
-                    (0..self.tree.visible_indices(&state).len()).find(|&row| {
-                        cx.visible_rect(bmux_tui::component::LogicalRect::new(
-                            0,
-                            row.try_into().unwrap_or(u64::MAX),
-                            layout.size.width,
-                            1,
-                        ))
-                        .contains(mouse.position)
-                    })
-                })
-                .flatten();
+            let rows = self.tree.projection(&mut state).visible.len();
+            let hit = Self::hit_row(layout, cx, area, rows, mouse.position);
             self.tree.handle_mouse_hit(&mut state, *mouse, hit)
         } else {
             self.tree.handle_key_event(&mut state, event)
         }
+    }
+
+    /// Map a terminal point to the logical row under it, using the same
+    /// translation and clip as painting.
+    fn hit_row(
+        layout: &LayoutNode,
+        cx: &EventCx<'_>,
+        area: Rect,
+        rows: usize,
+        position: bmux_tui::geometry::Point,
+    ) -> Option<usize> {
+        let bounds = cx.visible_rect(LogicalRect::new(
+            0,
+            0,
+            layout.size.width,
+            layout.size.height,
+        ));
+        if !area.contains(position) || !bounds.contains(position) {
+            return None;
+        }
+        let (x, y) = cx.local_point(position);
+        let column = u64::try_from(x).ok()?;
+        let row = u64::try_from(y).ok()?;
+        if column >= layout.size.width || row >= layout.size.height {
+            return None;
+        }
+        usize::try_from(row).ok().filter(|&row| row < rows)
     }
 
     /// Set behavior policy.
@@ -726,22 +1322,44 @@ impl<'a, 'state> TreeViewComponent<'a, 'state> {
 
 impl Component for TreeViewComponent<'_, '_> {
     fn revision(&self) -> ComponentRevision {
+        if self.tree.items_revision.is_some() || self.state.borrow().selected_id.is_some() {
+            // Resolve a keyed selection so the paint revision reflects it.
+            let _ = self.projection();
+        }
         let state = self.state.borrow();
         let mut layout = std::collections::hash_map::DefaultHasher::new();
         self.id.as_str().hash(&mut layout);
-        for item in self.tree.items {
-            item.id.hash(&mut layout);
-            item.label.hash(&mut layout);
-            item.depth.hash(&mut layout);
-            item.expandable.hash(&mut layout);
+        if let Some(revision) = self.tree.items_revision {
+            revision.hash(&mut layout);
+            self.tree.items.len().hash(&mut layout);
+        } else {
+            for item in self.tree.items {
+                item.id.hash(&mut layout);
+                item.label.hash(&mut layout);
+                item.rich_label.is_some().hash(&mut layout);
+                if let Some(label) = &item.rich_label {
+                    hash_line(label, &mut layout);
+                }
+                item.trailing.len().hash(&mut layout);
+                for decoration in &item.trailing {
+                    hash_line(decoration, &mut layout);
+                }
+                item.depth.hash(&mut layout);
+                item.expandable.hash(&mut layout);
+            }
         }
         self.tree.policy.indent_width.hash(&mut layout);
+        self.tree.trailing_layout.hash(&mut layout);
         state.expanded_ids().hash(&mut layout);
 
         let mut paint = std::collections::hash_map::DefaultHasher::new();
         format!("{:?}", self.pointer_intent).hash(&mut paint);
-        for item in self.tree.items {
-            item.disabled.hash(&mut paint);
+        if let Some(revision) = self.tree.items_revision {
+            revision.hash(&mut paint);
+        } else {
+            for item in self.tree.items {
+                item.disabled.hash(&mut paint);
+            }
         }
         self.tree.focus_style.hash(&mut paint);
         self.tree.styles.normal.hash(&mut paint);
@@ -757,6 +1375,7 @@ impl Component for TreeViewComponent<'_, '_> {
         self.tree.policy.mouse.hover.hash(&mut paint);
         self.tree.policy.mouse.click.hash(&mut paint);
         state.selected_visible.hash(&mut paint);
+        state.selected_id.hash(&mut paint);
         state.expanded.hash(&mut paint);
         state.hovered_visible.hash(&mut paint);
         state.pressed_visible.hash(&mut paint);
@@ -769,11 +1388,11 @@ impl Component for TreeViewComponent<'_, '_> {
 
     fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
         cx.record_measurement();
-        LayoutNode::leaf(
-            self.id.clone(),
-            constraints.constrain(self.tree.logical_size(&self.state.borrow())),
-        )
-        .with_metadata(LayoutMetadata::new().semantic("tree"))
+        let size = self
+            .tree
+            .logical_size(&mut self.state.borrow_mut(), constraints);
+        LayoutNode::leaf(self.id.clone(), constraints.constrain(size))
+            .with_metadata(LayoutMetadata::new().semantic("tree"))
     }
 
     fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
@@ -793,18 +1412,16 @@ impl Component for TreeViewComponent<'_, '_> {
             layout.size.width.try_into().unwrap_or(u16::MAX),
             u16_saturating(end - start),
         );
+        let projection = self.projection();
         let state = self.state.borrow();
         cx.with_child(
             0,
             i64::try_from(start).unwrap_or(i64::MAX),
             LocalRect::new(clip.x, 0, clip.width, area.height),
             |cx| {
-                let visible_rows = self.tree.visible_indices(&state);
                 let interactive = (self.tree.policy.keyboard.enabled
                     || self.tree.policy.mouse.enabled)
-                    && visible_rows
-                        .iter()
-                        .any(|&source| !self.tree.items[source].disabled);
+                    && projection.any_enabled;
                 if interactive {
                     cx.push_hit(
                         SceneRegion::new(self.id.as_str(), area)
@@ -818,14 +1435,14 @@ impl Component for TreeViewComponent<'_, '_> {
                             .enabled(!state.interaction.disabled),
                     );
                 }
-                for (visible, source) in visible_rows
-                    .into_iter()
-                    .enumerate()
-                    .skip(start)
-                    .take(end - start)
-                {
+                let painted = projection
+                    .visible
+                    .get(start..end.min(projection.visible.len()))
+                    .unwrap_or_default();
+                for (offset, &source) in painted.iter().enumerate() {
+                    let visible = start + offset;
                     let item = &self.tree.items[source];
-                    let row = Rect::new(0, u16_saturating(visible - start), area.width, 1);
+                    let row = Rect::new(0, u16_saturating(offset), area.width, 1);
                     let item_id = format!("{}.{}", self.id.as_str(), item.id);
                     if interactive {
                         cx.push_hit(
@@ -2118,5 +2735,542 @@ mod snapshot_tests {
         assert_eq!(rebuilt, state);
         assert!(rebuilt.restore_snapshot(&serde_json::Value::Null).is_err());
         assert_eq!(rebuilt, state);
+    }
+}
+
+#[cfg(test)]
+mod rich_and_scale_tests {
+    use std::cell::RefCell;
+
+    use bmux_keyboard::{KeyCode, KeyStroke};
+    use bmux_tui::buffer::Buffer;
+    use bmux_tui::component::{Component, Constraints, EventCx, LayoutCx, LayoutNode};
+    use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
+    use bmux_tui::frame::Frame;
+    use bmux_tui::geometry::{Point, Rect};
+    use bmux_tui::paint::{LocalRect, PaintCx};
+    use bmux_tui::prelude::{Line, Span};
+    use bmux_tui::style::{Color, Style};
+
+    use super::{
+        TreeViewComponent, TreeViewItem, TreeViewLabelOverflow, TreeViewOutcome, TreeViewState,
+        TreeViewStyles, TreeViewTrailingLayout,
+    };
+
+    fn red() -> Style {
+        Style::new().fg(Color::Red)
+    }
+
+    fn blue() -> Style {
+        Style::new().fg(Color::Blue)
+    }
+
+    /// Region ids and areas registered by one paint.
+    type Regions = Vec<(String, Rect)>;
+
+    /// Lay out at a tight width and paint `height` rows starting at logical
+    /// row `top`, as an enclosing scroll view would.
+    fn paint_window(
+        component: &TreeViewComponent<'_, '_>,
+        width: u16,
+        top: u64,
+        height: u16,
+    ) -> (LayoutNode, Buffer, Regions, Regions) {
+        let layout = component.layout(Constraints::for_width(width.into()), &mut LayoutCx::new());
+        let mut buffer = Buffer::empty(Rect::new(0, 0, width, height));
+        let mut frame = Frame::new(&mut buffer);
+        let offset = i64::try_from(top).unwrap();
+        PaintCx::new(&mut frame).with_child(
+            0,
+            -offset,
+            LocalRect::new(0, offset, width, height),
+            |cx| {
+                component.paint(&layout, cx);
+            },
+        );
+        let hits = frame
+            .hits()
+            .regions()
+            .iter()
+            .map(|region| (region.id.as_str().to_owned(), region.area))
+            .collect();
+        let semantics = frame
+            .semantics()
+            .regions()
+            .iter()
+            .filter(|region| region.role == "tree-item")
+            .map(|region| (region.id.clone(), region.area))
+            .collect();
+        drop(frame);
+        (layout, buffer, hits, semantics)
+    }
+
+    fn row(buffer: &Buffer, y: u16) -> String {
+        buffer.row_symbols(y).unwrap()
+    }
+
+    fn decorated(label: &str) -> TreeViewItem {
+        TreeViewItem::new("file", label, 0)
+            .trailing_decoration(Line::from_spans([Span::styled("M", red())]))
+            .trailing_decoration(Line::from_spans([Span::styled("+12", blue())]))
+    }
+
+    #[test]
+    fn rich_label_spans_paint_over_row_state_and_yield_to_disabled() {
+        let label = Line::from_spans([Span::styled("ab", red()), Span::styled("cd", blue())]);
+        let items = [
+            TreeViewItem::rich("one", label.clone(), 0),
+            TreeViewItem::rich("two", label, 0).disabled(true),
+        ];
+        assert_eq!(items[0].label, "abcd");
+        let state = RefCell::new(TreeViewState::new(Some(0)));
+        let styles = TreeViewStyles {
+            selected: Style::new().bg(Color::Yellow),
+            disabled: Style::new().fg(Color::BrightBlack),
+            ..TreeViewStyles::default()
+        };
+        let component = TreeViewComponent::new("tree", &items, &state).styles(styles);
+        let (_, buffer, _, _) = paint_window(&component, 10, 0, 2);
+        assert_eq!(row(&buffer, 0), "  abcd    ");
+        let cell = |x, y| buffer.get(Point::new(x, y)).unwrap().style;
+        assert_eq!(cell(2, 0).fg, Some(Color::Red));
+        assert_eq!(cell(4, 0).fg, Some(Color::Blue));
+        for x in 0..10 {
+            assert_eq!(cell(x, 0).bg, Some(Color::Yellow), "column {x}");
+        }
+        for x in 2..6 {
+            assert_eq!(cell(x, 1).fg, Some(Color::BrightBlack));
+        }
+    }
+
+    #[test]
+    fn trailing_decorations_align_to_the_row_edge_with_their_styles() {
+        let items = [decorated("lib.rs")];
+        let state = RefCell::new(TreeViewState::new(None));
+        let component = TreeViewComponent::new("tree", &items, &state);
+        let (_, buffer, hits, _) = paint_window(&component, 20, 0, 1);
+        assert_eq!(row(&buffer, 0), "  lib.rs       M +12");
+        assert_eq!(
+            buffer.get(Point::new(15, 0)).unwrap().style.fg,
+            Some(Color::Red)
+        );
+        for x in 17..20 {
+            assert_eq!(
+                buffer.get(Point::new(x, 0)).unwrap().style.fg,
+                Some(Color::Blue)
+            );
+        }
+        // The row hit region spans the whole row, decorations included.
+        assert!(hits.contains(&("tree.file".to_owned(), Rect::new(0, 0, 20, 1))));
+    }
+
+    #[test]
+    fn intrinsic_width_includes_gap_and_decorations() {
+        let items = [decorated("lib.rs")];
+        let state = RefCell::new(TreeViewState::new(None));
+        for (layout, expected) in [
+            (TreeViewTrailingLayout::new(), 2 + 6 + 1 + 1 + 1 + 3),
+            (
+                TreeViewTrailingLayout::new().gap(3).spacing(0),
+                2 + 6 + 3 + 1 + 3,
+            ),
+        ] {
+            let component = TreeViewComponent::new("tree", &items, &state).trailing_layout(layout);
+            let node = component.layout(Constraints::new(0, 200, 0, None), &mut LayoutCx::new());
+            assert_eq!(node.size.width, expected);
+        }
+    }
+
+    #[test]
+    fn narrow_rows_hide_whole_leading_decorations_before_the_label_minimum() {
+        let items = [decorated("lib.rs")];
+        let state = RefCell::new(TreeViewState::new(None));
+        let component = TreeViewComponent::new("tree", &items, &state);
+        // Room is width - 2; the label keeps at least four cells plus the gap.
+        for (width, expected) in [
+            (14, "  lib.rs M +12"),
+            (13, "  lib.r M +12"),
+            (12, "  lib. M +12"),
+            (11, "  lib.r +12"),
+            (10, "  lib. +12"),
+            (9, "  lib.rs"),
+            (8, "  lib.rs"),
+            (6, "  lib."),
+            (3, "  l"),
+            (2, "  "),
+            (1, " "),
+        ] {
+            let (_, buffer, _, _) = paint_window(&component, width, 0, 1);
+            assert_eq!(
+                row(&buffer, 0).trim_end(),
+                expected.trim_end(),
+                "width {width}"
+            );
+        }
+        for width in 0..=30_u16 {
+            let (_, buffer, _, _) = paint_window(&component, width, 0, 1);
+            if width == 0 {
+                continue;
+            }
+            let painted = row(&buffer, 0);
+            let content = painted.get(2..).unwrap_or_default();
+            // Decorations appear whole or not at all, and never overlap the label.
+            let label_end = content.find(' ').unwrap_or(content.len());
+            assert!(
+                "lib.rs".starts_with(&content[..label_end]),
+                "width {width}: {painted}"
+            );
+            let trailing = content[label_end..].trim();
+            assert!(
+                ["", "+12", "M +12"].contains(&trailing),
+                "width {width}: {painted}"
+            );
+        }
+    }
+
+    #[test]
+    fn ellipsis_overflow_marks_shortened_labels() {
+        let items = [
+            decorated("main_module.rs"),
+            TreeViewItem::new("plain", "README.markdown", 0),
+        ];
+        let state = RefCell::new(TreeViewState::new(None));
+        let component = TreeViewComponent::new("tree", &items, &state).trailing_layout(
+            TreeViewTrailingLayout::new().label_overflow(TreeViewLabelOverflow::Ellipsis),
+        );
+        let (_, buffer, _, _) = paint_window(&component, 16, 0, 2);
+        assert_eq!(row(&buffer, 0), "  main_mo… M +12");
+        assert_eq!(row(&buffer, 1), "  README.markdo…");
+    }
+
+    #[test]
+    fn wide_graphemes_keep_decorations_flush_right_without_overlap() {
+        let badge = Line::from_spans([Span::styled("🙂3", red())]);
+        let items = [
+            TreeViewItem::new("cjk", "界界界界界", 0).trailing_decoration(badge.clone()),
+            TreeViewItem::new("combining", "e\u{301}e\u{301}e\u{301}e\u{301}e\u{301}", 0)
+                .trailing_decoration(badge),
+        ];
+        let state = RefCell::new(TreeViewState::new(None));
+        let component = TreeViewComponent::new("tree", &items, &state);
+        for width in 0..=16_u16 {
+            let (_, buffer, _, _) = paint_window(&component, width, 0, 2);
+            for y in 0..2 {
+                let shown = row(&buffer, y).contains('🙂');
+                // Room = width - 2; label minimum 4 (cells) + gap 1 + badge 3.
+                assert_eq!(shown, width >= 10, "width {width} row {y}");
+                if shown {
+                    // The badge always ends at the last column.
+                    assert_eq!(buffer.get(Point::new(width - 1, y)).unwrap().symbol, "3");
+                    assert_eq!(buffer.get(Point::new(width - 3, y)).unwrap().symbol, "🙂");
+                    assert_eq!(buffer.get(Point::new(width - 4, y)).unwrap().symbol, " ");
+                }
+            }
+        }
+        // An odd label room omits the straddling wide grapheme instead of
+        // overlapping the gap: room 9 leaves 5 label cells for "界界" (4),
+        // and the spare cell becomes padding before the badge.
+        let (_, buffer, _, _) = paint_window(&component, 11, 0, 2);
+        assert_eq!(row(&buffer, 0), "  界界  🙂3");
+        assert_eq!(
+            row(&buffer, 1),
+            "  e\u{301}e\u{301}e\u{301}e\u{301}e\u{301} 🙂3"
+        );
+    }
+
+    #[test]
+    fn oversized_prefix_hides_label_and_decorations_inside_the_row() {
+        let items = [decorated("lib.rs")];
+        let deep = [TreeViewItem {
+            depth: 40,
+            ..items[0].clone()
+        }];
+        let state = RefCell::new(TreeViewState::new(None));
+        let component = TreeViewComponent::new("tree", &deep, &state);
+        for width in [1_u16, 10, 80, 82, 90] {
+            let (_, buffer, hits, _) = paint_window(&component, width, 0, 1);
+            let painted = row(&buffer, 0);
+            assert_eq!(
+                bmux_tui::text_width::display_width(&painted),
+                usize::from(width)
+            );
+            if width <= 82 {
+                assert!(painted.trim().is_empty(), "width {width}: {painted}");
+            } else {
+                assert!(painted.contains('l'));
+            }
+            assert!(hits.iter().all(|(_, area)| area.width <= width));
+        }
+    }
+
+    #[test]
+    fn zero_width_registers_nothing() {
+        let items = [decorated("lib.rs")];
+        let state = RefCell::new(TreeViewState::new(None));
+        let component = TreeViewComponent::new("tree", &items, &state);
+        let (layout, _, hits, semantics) = paint_window(&component, 0, 0, 1);
+        assert_eq!(layout.size.width, 0);
+        assert_eq!(hits, []);
+        assert_eq!(semantics, []);
+    }
+
+    #[test]
+    fn resize_restores_hidden_decorations_and_hits_follow_painted_rows() {
+        let items = [decorated("lib.rs"), decorated("main.rs")];
+        let state = RefCell::new(TreeViewState::new(None));
+        let component = TreeViewComponent::new("tree", &items, &state);
+        for (width, shown) in [(30, true), (8, false), (30, true)] {
+            let (_, buffer, hits, semantics) = paint_window(&component, width, 0, 2);
+            for y in 0..2 {
+                assert_eq!(row(&buffer, y).contains("+12"), shown, "width {width}");
+            }
+            let rows = hits
+                .iter()
+                .filter(|(id, _)| id != "tree")
+                .map(|(_, area)| *area)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                rows,
+                vec![Rect::new(0, 0, width, 1), Rect::new(0, 1, width, 1)]
+            );
+            assert_eq!(
+                semantics.iter().map(|(_, area)| *area).collect::<Vec<_>>(),
+                rows
+            );
+        }
+    }
+
+    fn large_tree() -> Vec<TreeViewItem> {
+        // 500 directories of 100 files each, plus a root-level file.
+        let mut items = Vec::new();
+        for directory in 0..500 {
+            items.push(
+                TreeViewItem::new(format!("d{directory}"), format!("dir{directory}"), 0)
+                    .expandable(true),
+            );
+            for file in 0..100 {
+                items.push(
+                    TreeViewItem::new(
+                        format!("d{directory}/f{file}"),
+                        format!("file{directory}-{file}"),
+                        1,
+                    )
+                    .trailing_decoration(Line::raw(format!("+{file}"))),
+                );
+            }
+        }
+        items.push(TreeViewItem::new("tail", "tail", 0));
+        items
+    }
+
+    fn click(
+        component: &TreeViewComponent<'_, '_>,
+        layout: &LayoutNode,
+        top: u64,
+        height: u16,
+        point: Point,
+    ) -> TreeViewOutcome {
+        let mut cx = EventCx::new(layout);
+        let width = u16::try_from(layout.size.width).unwrap();
+        let offset = i64::try_from(top).unwrap();
+        cx.with_transform(0, 0, 0, -offset, Rect::new(0, 0, width, height), |cx| {
+            let mut outcome = TreeViewOutcome::Ignored;
+            for kind in [
+                MouseEventKind::Move,
+                MouseEventKind::Down(MouseButton::Left),
+                MouseEventKind::Up(MouseButton::Left),
+            ] {
+                outcome =
+                    component.handle_event(&Event::Mouse(MouseEvent::new(kind, point)), layout, cx);
+            }
+            outcome
+        })
+    }
+
+    #[test]
+    fn large_scrolled_tree_paints_and_hits_only_visible_rows_in_agreement() {
+        let items = large_tree();
+        let state = RefCell::new(TreeViewState::new(None));
+        state
+            .borrow_mut()
+            .set_expanded_ids((0..500).map(|directory| format!("d{directory}")));
+        let component = TreeViewComponent::new("files", &items, &state).items_revision(1);
+        assert_eq!(component.visible_count(), items.len());
+        for top in [0_u64, 1, 25_000, 50_490] {
+            let (layout, buffer, hits, semantics) = paint_window(&component, 24, top, 10);
+            assert_eq!(layout.size.height, 50_501);
+            // One composite plus one region per painted row; nothing offscreen.
+            assert_eq!(hits.len(), 11);
+            assert_eq!(semantics.len(), 10);
+            for y in 0..10_u16 {
+                let logical = usize::try_from(top).unwrap() + usize::from(y);
+                let source = component.visible_source(logical).unwrap();
+                let item = &items[source];
+                assert!(row(&buffer, y).contains(&item.label), "row {logical}");
+                assert_eq!(
+                    semantics[usize::from(y)],
+                    (format!("files.{}", item.id), Rect::new(0, y, 24, 1))
+                );
+                // The pointer selects exactly the painted item.
+                let outcome = click(&component, &layout, top, 10, Point::new(3, y));
+                assert_eq!(
+                    outcome,
+                    TreeViewOutcome::Selected {
+                        visible: logical,
+                        source
+                    }
+                );
+                assert_eq!(state.borrow().selected_id(), Some(item.id.as_str()));
+            }
+            // Below the viewport clip nothing is hit and the selection stays.
+            let selected = state.borrow().selected_id().map(str::to_owned);
+            assert_eq!(
+                click(&component, &layout, top, 10, Point::new(3, 10)),
+                TreeViewOutcome::Ignored
+            );
+            assert_eq!(state.borrow().selected_id(), selected.as_deref());
+        }
+    }
+
+    #[test]
+    fn keyed_selection_follows_its_item_across_expansion_above_it() {
+        let items = large_tree();
+        let state = RefCell::new(TreeViewState::new(None));
+        let component = TreeViewComponent::new("files", &items, &state).items_revision(7);
+        assert_eq!(component.visible_count(), 501);
+        state.borrow_mut().set_selected_id("tail");
+        assert_eq!(component.selected_visible(), Some(500));
+        state.borrow_mut().set_expanded("d3", true);
+        assert_eq!(component.selected_visible(), Some(600));
+        state.borrow_mut().set_expanded("d3", false);
+        assert_eq!(component.selected_visible(), Some(500));
+        // Keyboard selection is keyed too.
+        let layout = component.layout(Constraints::for_width(20), &mut LayoutCx::new());
+        let key = |code| {
+            component.handle_event(
+                &Event::Key(KeyStroke::simple(code)),
+                &layout,
+                &mut EventCx::new(&layout),
+            )
+        };
+        state.borrow_mut().set_selected_visible(Some(2));
+        assert_eq!(state.borrow().selected_id(), None);
+        assert_eq!(
+            key(KeyCode::Down),
+            TreeViewOutcome::Focused {
+                visible: 3,
+                source: 303
+            }
+        );
+        assert_eq!(state.borrow().selected_id(), Some("d3"));
+        state.borrow_mut().set_expanded("d0", true);
+        assert_eq!(component.selected_visible(), Some(103));
+        // A hidden selection selects no row, keeps its id, and returns with it.
+        state.borrow_mut().set_expanded("d1", true);
+        state.borrow_mut().set_selected_id("d1/f5");
+        assert_eq!(component.selected_visible(), Some(107));
+        state.borrow_mut().set_expanded("d1", false);
+        assert_eq!(component.selected_visible(), None);
+        assert_eq!(state.borrow().selected_id(), Some("d1/f5"));
+        state.borrow_mut().set_expanded("d1", true);
+        assert_eq!(component.selected_visible(), Some(107));
+        // Painting reflects the resolved keyed row.
+        let styles = TreeViewStyles {
+            selected: Style::new().bg(Color::Yellow),
+            ..TreeViewStyles::default()
+        };
+        let component = component.styles(styles);
+        let (_, buffer, _, _) = paint_window(&component, 20, 100, 10);
+        assert_eq!(
+            buffer.get(Point::new(0, 7)).unwrap().style.bg,
+            Some(Color::Yellow)
+        );
+        assert_ne!(
+            buffer.get(Point::new(0, 6)).unwrap().style.bg,
+            Some(Color::Yellow)
+        );
+    }
+
+    #[test]
+    fn items_revision_replaces_item_hashing_and_expansion_invalidates_projection() {
+        let items = large_tree();
+        let mut relabeled = items.clone();
+        relabeled[1].label = "renamed".to_owned();
+        let state = RefCell::new(TreeViewState::new(None));
+        let original = TreeViewComponent::new("files", &items, &state).items_revision(1);
+        let changed = TreeViewComponent::new("files", &relabeled, &state).items_revision(1);
+        assert_eq!(original.revision(), changed.revision());
+        let bumped = TreeViewComponent::new("files", &relabeled, &state).items_revision(2);
+        assert_ne!(original.revision().layout, bumped.revision().layout);
+        // Without a revision, item content is hashed.
+        assert_ne!(
+            TreeViewComponent::new("files", &items, &state).revision(),
+            TreeViewComponent::new("files", &relabeled, &state).revision()
+        );
+        // Decoration changes count as layout changes when hashed.
+        let mut decorated = items.clone();
+        decorated[1].trailing.push(Line::raw("!"));
+        assert_ne!(
+            TreeViewComponent::new("files", &items, &state)
+                .revision()
+                .layout,
+            TreeViewComponent::new("files", &decorated, &state)
+                .revision()
+                .layout
+        );
+        // The retained projection never outlives an expansion change.
+        assert_eq!(original.visible_count(), 501);
+        state.borrow_mut().set_expanded("d0", true);
+        assert_eq!(original.visible_count(), 601);
+        assert_eq!(original.visible_source(1), Some(1));
+        state.borrow_mut().set_expanded_ids(Vec::new());
+        assert_eq!(original.visible_count(), 501);
+        assert_eq!(original.visible_row_of("tail"), Some(500));
+        assert_eq!(original.visible_row_of("d0/f0"), None);
+    }
+
+    #[test]
+    fn items_revision_retains_one_projection_across_frame_phases() {
+        let items = large_tree();
+        let state = RefCell::new(TreeViewState::new(None));
+        state.borrow_mut().set_selected_id("tail");
+        let component = TreeViewComponent::new("files", &items, &state).items_revision(3);
+        let _ = component.revision();
+        let retained = std::sync::Arc::clone(state.borrow().cache.projection.as_ref().unwrap());
+        let (layout, _, _, _) = paint_window(&component, 20, 400, 5);
+        let _ = component.revision();
+        let _ = click(&component, &layout, 400, 5, Point::new(1, 2));
+        let current = std::sync::Arc::clone(state.borrow().cache.projection.as_ref().unwrap());
+        assert!(std::sync::Arc::ptr_eq(&retained, &current));
+        // Without a revision nothing is retained.
+        let state = RefCell::new(TreeViewState::new(None));
+        let component = TreeViewComponent::new("files", &items, &state);
+        let _ = component.visible_count();
+        assert!(state.borrow().cache.projection.is_none());
+    }
+
+    #[test]
+    fn bulk_expansion_deduplicates_and_snapshots_keep_keyed_selection() {
+        let mut state = TreeViewState::new(None);
+        state.set_expanded_ids(["b", "a", "b"].map(str::to_owned));
+        assert_eq!(state.expanded_ids(), ["b", "a"]);
+        assert!(state.is_expanded("a") && state.is_expanded("b") && !state.is_expanded("c"));
+        state.set_expanded("c", true);
+        state.set_expanded("b", false);
+        assert_eq!(state.expanded_ids(), ["a", "c"]);
+        state.set_selected_id("c/x");
+        let snapshot = state.snapshot();
+        let mut restored = TreeViewState::new(None);
+        restored.restore_snapshot(&snapshot).unwrap();
+        assert_eq!(restored, state);
+        assert_eq!(restored.selected_id(), Some("c/x"));
+        assert!(restored.is_expanded("c"));
+        // Snapshots written before keyed selection existed still restore.
+        let mut legacy = snapshot;
+        legacy.as_object_mut().unwrap().remove("selected_id");
+        restored.restore_snapshot(&legacy).unwrap();
+        assert_eq!(restored.selected_id(), None);
+        restored.clear_selection();
+        assert_eq!(restored.selected_visible(), None);
     }
 }
