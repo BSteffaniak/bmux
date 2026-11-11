@@ -16,6 +16,9 @@ use bmux_tui::semantic::SemanticRegion;
 use bmux_tui::style::{Color, Modifier, Style};
 use bmux_tui::text_width::{display_width, truncate_to_display_width, wrap_text_with_continuation};
 
+/// Glyph of the close button, painted on a toast's last column.
+const CLOSE_GLYPH: &str = "×";
+
 /// Generic toast severity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
 pub enum ToastSeverity {
@@ -311,23 +314,34 @@ impl ToastStackComponent<'_, '_> {
                 .focusable(true),
             );
         }
-        let close = if stack.policy.close_button { " ×" } else { "" };
         let x = rect.x.saturating_add(stack.content_offset());
         let width = stack.content_width(rect.width);
+        // The close glyph sits on the toast's last column, the cell its hit region and
+        // `close_at` use; the title keeps a gap before it. Both are measured in cells.
+        let reserved = if stack.policy.close_button {
+            display_width(CLOSE_GLYPH).saturating_add(1)
+        } else {
+            0
+        };
         let title =
-            truncate_to_display_width(toast.title, usize::from(width).saturating_sub(close.len()));
+            truncate_to_display_width(toast.title, usize::from(width).saturating_sub(reserved));
         let title_width = u16::try_from(display_width(&title))
             .unwrap_or(u16::MAX)
-            .saturating_add(u16::try_from(close.len()).unwrap_or(u16::MAX))
             .min(width);
         let surface = stack.styles.surface;
         cx.write_line(
             local(x, rect.y, title_width, 1),
-            &Line::from_spans([
-                Span::styled(title, surface.patch(stack.title_style(toast.severity))),
-                Span::styled(close, surface.patch(stack.styles.close)),
-            ]),
+            &Line::from_spans([Span::styled(
+                title,
+                surface.patch(stack.title_style(toast.severity)),
+            )]),
         );
+        if stack.policy.close_button && rect.width > 0 {
+            cx.write_line(
+                local(rect.right() - 1, rect.y, 1, 1),
+                &Line::from_spans([Span::styled(CLOSE_GLYPH, surface.patch(stack.styles.close))]),
+            );
+        }
         let (lines, _) = stack.body_lines(toast, width);
         for (row, line) in (1..rect.height).zip(lines) {
             let line_width = u16::try_from(display_width(&line))
@@ -382,7 +396,11 @@ impl Component for ToastStackComponent<'_, '_> {
             .map(display_width)
             .max()
             .unwrap_or_default()
-            .saturating_add(usize::from(self.stack.policy.close_button) * 2)
+            .saturating_add(if self.stack.policy.close_button {
+                display_width(CLOSE_GLYPH) + 1
+            } else {
+                0
+            })
             .saturating_add(usize::from(self.stack.chrome_width()));
         let width = self
             .stack
@@ -854,6 +872,64 @@ mod tests {
     }
 
     #[test]
+    fn close_glyph_is_painted_on_its_hit_cell_and_titles_are_measured_in_cells() {
+        // Wide titles are truncated by display width and never cover the close glyph.
+        for (title, width) in [
+            ("Saved", 24_u16),
+            ("保存しました保存しました", 14),
+            ("e\u{301}🦀 done", 9),
+            ("x", 3),
+        ] {
+            let toasts = [ToastItem::new("one", title)];
+            let stack = ToastStack::new(&toasts);
+            let area = Rect::new(3, 2, width, 1);
+            let mut buffer = Buffer::empty(Rect::new(0, 0, 40, 4));
+            let mut frame = Frame::new(&mut buffer);
+            stack.render(area, &ToastStackState::default(), &mut frame);
+            let hit = frame.hits().regions()[0].area;
+            assert_eq!(hit, Rect::new(area.right() - 1, area.y, 1, 1), "{title}");
+            let row = frame.buffer().row_symbols(area.y).unwrap_or_default();
+            let cells: Vec<String> = (area.x..area.right())
+                .map(|x| {
+                    frame
+                        .buffer()
+                        .get(Point::new(x, area.y))
+                        .map(|cell| cell.symbol.clone())
+                        .unwrap_or_default()
+                })
+                .collect();
+            assert_eq!(
+                cells.last().map(String::as_str),
+                Some("×"),
+                "{title}: {row:?}"
+            );
+            // The cell before the glyph is the gap.
+            assert_eq!(cells[cells.len() - 2], " ", "{title}: {row:?}");
+            // A click on the painted glyph closes that toast.
+            let mut state = ToastStackState::default();
+            let mut outcome = ToastStackOutcome::Ignored;
+            for kind in [
+                MouseEventKind::Down(MouseButton::Left),
+                MouseEventKind::Up(MouseButton::Left),
+            ] {
+                outcome = stack.handle_event(
+                    area,
+                    &mut state,
+                    &Event::Mouse(MouseEvent::new(kind, Point::new(hit.x, hit.y))),
+                );
+            }
+            assert_eq!(
+                outcome,
+                ToastStackOutcome::CloseRequested {
+                    index: 0,
+                    id: "one"
+                },
+                "{title}"
+            );
+        }
+    }
+
+    #[test]
     fn component_measures_paints_and_registers_close_controls() {
         let toasts = [ToastItem::new("one", "Saved").body("Changes persisted")];
         let state = std::cell::Cell::new(ToastStackState::default());
@@ -885,7 +961,7 @@ mod tests {
 
         assert_eq!(
             frame.buffer().row_symbols(0).as_deref(),
-            Some("Saved ×                 ")
+            Some("Saved                  ×")
         );
     }
 
@@ -921,7 +997,7 @@ mod tests {
 
         assert_eq!(
             frame.buffer().row_symbols(0).as_deref(),
-            Some("Saved ×                 ")
+            Some("Saved                  ×")
         );
         assert_eq!(
             frame.buffer().row_symbols(1).as_deref(),
