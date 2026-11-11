@@ -1260,6 +1260,9 @@ struct Measure<'a, 'b, Src: ?Sized> {
     environment: LayoutEnvironment,
     layouts: &'b mut LayoutCache,
     stats: &'b StatsCell,
+    /// Whether a source measure hint may stand in for a built layout. Items about to be
+    /// painted (visible and pinned items) need a real retained layout.
+    hints: bool,
 }
 
 impl<Src: ?Sized> Measure<'_, '_, Src> {
@@ -1276,6 +1279,15 @@ impl<Src: ?Sized> Measure<'_, '_, Src> {
                 .retained_layout(position, self.width, self.environment)
         {
             node.size.height
+        } else if let Some(height) = self
+            .hints
+            .then(|| {
+                self.source
+                    .measure_hint(position, self.width, self.environment)
+            })
+            .flatten()
+        {
+            height
         } else {
             stats.built_items = stats.built_items.saturating_add(1);
             let element = self.source.build(position);
@@ -1372,6 +1384,7 @@ where
             environment,
             layouts,
             stats,
+            hints: true,
         };
         let mut lookup: Option<BTreeMap<K, (usize, u64)>> = None;
         index.sync(entries.iter().cloned(), width, capability, |key| {
@@ -1418,6 +1431,7 @@ where
             environment,
             layouts,
             stats,
+            hints: true,
         };
         // Detach every replaced range (back to front, so earlier index rows
         // keep their positions), then insert each region's source rows front
@@ -1557,6 +1571,7 @@ where
                 environment,
                 layouts: &mut self.layouts,
                 stats: &self.stats,
+                hints: false,
             }
             .height(position, &key, revision, cx);
             measured.insert(position);

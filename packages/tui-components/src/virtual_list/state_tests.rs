@@ -122,8 +122,8 @@ fn keys(range: std::ops::Range<u64>) -> Vec<Spec> {
 const WIDTH: u64 = 8;
 const NONE: [u64; 0] = [];
 
-fn layout(
-    source: &Lazy,
+fn layout<Src: VirtualItemSource<u64>>(
+    source: &Src,
     state: &mut VirtualListState<u64>,
     viewport: u64,
 ) -> super::VirtualListLayout {
@@ -153,7 +153,11 @@ fn expected_index(source: &Lazy, width: u64, gap: u64) -> MeasuredListIndex<u64>
     .unwrap()
 }
 
-fn paint_rows(source: &Lazy, state: &VirtualListState<u64>, height: u16) -> Vec<String> {
+fn paint_rows<Src: VirtualItemSource<u64>>(
+    source: &Src,
+    state: &VirtualListState<u64>,
+    height: u16,
+) -> Vec<String> {
     let area = Rect::new(0, 0, 8, height);
     let mut buffer = Buffer::empty(area);
     VirtualSourceList::new("lazy", source).paint(
@@ -201,6 +205,68 @@ fn lazy_source_builds_only_items_needing_measurement_and_visible_items() {
     assert_eq!(counters.painted_items, 5);
     assert_eq!(counters.registered_items, 5);
     assert_eq!(counters.built_items, 5);
+}
+
+/// Source whose items report their exact height without construction.
+struct Hinted(Lazy);
+
+impl VirtualItemSource<u64> for Hinted {
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    fn key(&self, index: usize) -> u64 {
+        self.0.key(index)
+    }
+
+    fn layout_revision(&self, index: usize) -> u64 {
+        self.0.layout_revision(index)
+    }
+
+    fn build(&self, index: usize) -> Element<'_> {
+        self.0.build(index)
+    }
+
+    fn measure_hint(
+        &self,
+        index: usize,
+        width: u64,
+        _environment: LayoutEnvironment,
+    ) -> Option<u64> {
+        Some(self.0.items[index].units.div_ceil(width.max(1)))
+    }
+}
+
+#[test]
+fn measure_hints_skip_construction_except_for_visible_items() {
+    let source = Hinted(Lazy::new((0..1_000).map(|key| spec(key, 16))));
+    let mut state = VirtualListState::new(0);
+    layout(&source, &mut state, 5);
+    // Every item is measured from its hint; only the visible ones are built (to be laid out).
+    assert_eq!(state.render_stats().measured_items, 1_000 + 3);
+    assert_eq!(source.0.take_built(), vec![0, 1, 2]);
+    assert_eq!(state.total_height(), 2_000);
+
+    // A width change re-measures from hints, building only what becomes visible.
+    let mut wide = VirtualListState::new(0);
+    layout(&source, &mut wide, 5);
+    source.0.take_built();
+    let mut cx = LayoutCx::new();
+    VirtualSourceList::new("list", &source).layout(
+        16,
+        LayoutEnvironment::default(),
+        5,
+        &NoSourceMap,
+        &mut wide,
+        &mut cx,
+    );
+    assert_eq!(wide.total_height(), 1_000);
+    assert_eq!(source.0.take_built(), vec![0, 1, 2, 3, 4]);
+
+    // Painting uses the visible items' exact layouts.
+    let rows = paint_rows(&source, &state, 5);
+    assert_eq!(rows[0], "00000000");
+    assert_eq!(rows[2], "11111111");
 }
 
 #[test]

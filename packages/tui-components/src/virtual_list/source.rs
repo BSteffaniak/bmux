@@ -7,9 +7,11 @@ use bmux_tui::component::{Element, LayoutEnvironment, LayoutNode};
 ///
 /// Source order equals index order. The list calls [`Self::build`] only to
 /// measure an item that is new, has a changed layout revision, or is stale for
-/// the current width or environment and has no [`Self::retained_layout`]; and
-/// once per paint or event dispatch for each visible item (construction only,
-/// the retained layout is reused). It is never called for other items.
+/// the current width or environment and has neither a
+/// [`Self::retained_layout`] nor a [`Self::measure_hint`]; to lay out a
+/// visible item that has no retained layout yet; and once per paint or event
+/// dispatch for each visible item (construction only, the retained layout is
+/// reused). It is never called for other items.
 ///
 /// [`Self::key`] and [`Self::layout_revision`] are read for items covered by
 /// noted splices and invalidations, for visible items, and during a full
@@ -50,6 +52,28 @@ pub trait VirtualItemSource<K> {
         _width: u64,
         _environment: LayoutEnvironment,
     ) -> Option<&LayoutNode> {
+        None
+    }
+
+    /// Exact height of the item at `index` at `width` and `environment` when
+    /// it is known without constructing the item, or `None` (the default) to
+    /// measure a built component.
+    ///
+    /// Synchronization uses it, after [`Self::retained_layout`], to measure
+    /// new and stale items without calling [`Self::build`], so measuring a
+    /// large collection costs no construction for items whose height is
+    /// cheap to know (fixed-height rows, estimated placeholders). The value
+    /// must equal the height the built component lays out to under
+    /// `Constraints::for_width(width)`. Visible and pinned items are still
+    /// built and laid out before they are painted or receive events; a hint
+    /// that disagrees with that layout is corrected then, and the position
+    /// re-resolved.
+    fn measure_hint(
+        &self,
+        _index: usize,
+        _width: u64,
+        _environment: LayoutEnvironment,
+    ) -> Option<u64> {
         None
     }
 
@@ -131,6 +155,15 @@ impl<K, T: VirtualItemSource<K> + ?Sized> VirtualItemSource<K> for &T {
         environment: LayoutEnvironment,
     ) -> Option<&LayoutNode> {
         (**self).retained_layout(index, width, environment)
+    }
+
+    fn measure_hint(
+        &self,
+        index: usize,
+        width: u64,
+        environment: LayoutEnvironment,
+    ) -> Option<u64> {
+        (**self).measure_hint(index, width, environment)
     }
 
     fn always_reconcile(&self) -> bool {

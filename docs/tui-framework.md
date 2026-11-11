@@ -842,6 +842,10 @@ pub trait VirtualItemSource<K> {
     /// and events, and never calls `build` to measure this item.
     fn retained_layout(&self, index: usize, width: u64, environment: LayoutEnvironment)
         -> Option<&LayoutNode> { None }
+    /// Exact height at `width` and `environment` when known without building
+    /// the item (fixed-height rows, estimated placeholders). Default `None`.
+    fn measure_hint(&self, index: usize, width: u64, environment: LayoutEnvironment)
+        -> Option<u64> { None }
     /// Whether every synchronization must compare all keys and revisions
     /// (sources rebuilt per frame that do not note changes). Default false.
     fn always_reconcile(&self) -> bool { false }
@@ -875,12 +879,19 @@ impl<'a, Src: ?Sized> VirtualSourceList<'a, Src> {
 Source order equals index order. The construction contract is:
 
 - `build(i)` is called only to measure an item that is new, has a changed
-  layout revision, or is stale for the current width or environment and has no
-  `retained_layout`; to give a visible item that has no retained layout one
-  (for example after `splice_measured`); and once per paint or event dispatch
+  layout revision, or is stale for the current width or environment and has
+  neither a `retained_layout` nor a `measure_hint`; to give a visible item that
+  has no retained layout one (for example after `splice_measured` or a
+  hint-measured synchronization); and once per paint or event dispatch
   for each visible item (construction only, the retained layout is reused). It
   is never called for other items. There is no construction overscan: every
   item is measured exactly, and only visible items are built for painting.
+- `measure_hint(i, width, environment)` lets synchronization measure items
+  without constructing them, so measuring a large collection (initially, after a
+  width change, or for a large splice) costs no construction for items whose
+  height is cheap to know. The hint must equal the built layout's height;
+  visible and pinned items are still built and laid out before painting, and a
+  disagreeing hint is corrected then (re-resolving the position).
 - `key(i)` and `layout_revision(i)` are read for items covered by noted splices
   and invalidations, for visible items, and during a full reconciliation.
   `paint_revision(i)` is read only for visible items and feeds the component's
