@@ -8,6 +8,7 @@
 use std::ops::Range;
 
 use bmux_tui::prelude::{Line, Modifier, Span, Style};
+use bmux_tui::selection::SelectionCell;
 use bmux_tui::text_width::painted_grapheme_width;
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -228,6 +229,9 @@ pub enum DiffSplitColumns {
     OldWidth(usize),
 }
 
+/// Tab stop interval used by [`DiffRowOptions::new`].
+pub const DEFAULT_DIFF_TAB_WIDTH: u16 = 8;
+
 /// Options for [`layout_diff_row`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DiffRowOptions {
@@ -237,17 +241,34 @@ pub struct DiffRowOptions {
     pub overflow: DiffRowOverflow,
     /// Side-by-side column split.
     pub columns: DiffSplitColumns,
+    /// Tab stop interval in cells (zero is treated as one).
+    ///
+    /// A tab expands to the next multiple of this width, counted in display
+    /// columns of the whole line (as if unwrapped), and paints as spaces. It
+    /// stays one indivisible unit mapped to its source byte: wrapping moves it
+    /// to the next row whole, and it never occupies more cells than the
+    /// content area.
+    pub tab_width: u16,
 }
 
 impl DiffRowOptions {
-    /// Wrapping, evenly split options with the given gutter.
+    /// Wrapping, evenly split options with the given gutter and
+    /// [`DEFAULT_DIFF_TAB_WIDTH`] tab stops.
     #[must_use]
     pub const fn new(gutter: DiffRowGutter) -> Self {
         Self {
             gutter,
             overflow: DiffRowOverflow::Wrap,
             columns: DiffSplitColumns::Even,
+            tab_width: DEFAULT_DIFF_TAB_WIDTH,
         }
+    }
+
+    /// Return these options with a tab stop interval.
+    #[must_use]
+    pub const fn with_tab_width(mut self, tab_width: u16) -> Self {
+        self.tab_width = tab_width;
+        self
     }
 
     /// Return these options with an overflow policy.
@@ -488,6 +509,30 @@ impl DiffRowLayout {
         }
         output
     }
+
+    /// Selection units of `segment`'s painted graphemes, at item columns.
+    ///
+    /// Each unit covers exactly the cells a grapheme was painted in (a tab's
+    /// whole expansion, a wide grapheme's two cells) and the source bytes it
+    /// represents, zero-width graphemes included. Register them as a
+    /// `bmux_tui::selection::SelectionTextRun` whose origin is column zero of
+    /// the segment's row. `segment` must come from this layout's
+    /// [`Self::segments`].
+    #[must_use]
+    pub fn selection_cells(&self, segment: &DiffRowSegment) -> Vec<SelectionCell> {
+        self.placements
+            .get(segment.placements.clone())
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|placement| {
+                Some(SelectionCell::new(
+                    u16::try_from(placement.column).ok()?,
+                    u16::try_from(placement.width).ok()?,
+                    placement.start..placement.end,
+                ))
+            })
+            .collect()
+    }
 }
 
 /// Lay out one logical diff item at `width` cells.
@@ -574,7 +619,7 @@ fn cell_height(text: &str, width: usize, gutter_width: usize, options: DiffRowOp
     match options.overflow {
         DiffRowOverflow::Wrap if content_width > 0 => {
             let mut rows = 1;
-            wrap_walk(text, content_width, |step| {
+            wrap_walk(text, content_width, options.tab_width, |step| {
                 if matches!(step, WrapStep::Break { .. }) {
                     rows += 1;
                 }
@@ -604,9 +649,18 @@ enum WrapStep {
 
 /// Wrap `text` into rows of `width` cells, reporting each step. The single source of wrap
 /// geometry for both [`layout_diff_row`] and [`diff_row_height`].
-fn wrap_walk(text: &str, width: usize, mut step: impl FnMut(WrapStep)) {
+fn wrap_walk(text: &str, width: usize, tab_width: u16, mut step: impl FnMut(WrapStep)) {
     let mut column = 0;
-    for (index, start, end, cells) in graphemes(text) {
+    for Grapheme {
+        index,
+        start,
+        end,
+        cells,
+        tab,
+    } in graphemes(text, tab_width)
+    {
+        // A tab never needs a row of its own: it fills at most the whole row.
+        let cells = if tab { cells.min(width) } else { cells };
         if cells > 0 && column > 0 && column + cells > width {
             step(WrapStep::Break { index, start });
             column = 0;
@@ -655,6 +709,7 @@ fn layout_unified(
         gutter: options.gutter,
         unified: true,
         overflow: options.overflow,
+        tab_width: options.tab_width,
         pad: style.row(kind),
     };
     let laid = layout_cell(&cell, 0, style, &mut builder.placements);
@@ -753,6 +808,7 @@ fn side_cell(
         gutter: options.gutter,
         unified: false,
         overflow: options.overflow,
+        tab_width: options.tab_width,
         pad: style.row(cell.kind).patch(style.line(cell.kind).2),
     };
     layout_cell(&spec, x, style, &mut builder.placements)
@@ -805,6 +861,7 @@ struct CellSpec<'a> {
     gutter: DiffRowGutter,
     unified: bool,
     overflow: DiffRowOverflow,
+    tab_width: u16,
     pad: Style,
 }
 
@@ -911,7 +968,7 @@ fn layout_cell(
             },
         };
     }
-    let content_rows = place_content(spec.text.text, content_width, spec.overflow);
+    let content_rows = place_content(spec.text.text, content_width, spec.overflow, spec.tab_width);
     let styles = ContentStyles::new(spec, style);
     let mut rows = Vec::with_capacity(content_rows.len());
     for (index, content_row) in content_rows.iter().enumerate() {
@@ -1088,7 +1145,12 @@ impl ContentRow {
     }
 }
 
-fn place_content(text: &str, width: usize, overflow: DiffRowOverflow) -> Vec<ContentRow> {
+fn place_content(
+    text: &str,
+    width: usize,
+    overflow: DiffRowOverflow,
+    tab_width: u16,
+) -> Vec<ContentRow> {
     if width == 0 {
         let mut row = ContentRow::new(0, 0);
         row.bytes.end = text.len();
@@ -1096,31 +1158,56 @@ fn place_content(text: &str, width: usize, overflow: DiffRowOverflow) -> Vec<Con
         return vec![row];
     }
     match overflow {
-        DiffRowOverflow::Wrap => place_wrapped(text, width),
-        DiffRowOverflow::Truncate => vec![place_truncated(text, width)],
-        DiffRowOverflow::Scroll { offset } => vec![place_scrolled(text, width, offset)],
+        DiffRowOverflow::Wrap => place_wrapped(text, width, tab_width),
+        DiffRowOverflow::Truncate => vec![place_truncated(text, width, tab_width)],
+        DiffRowOverflow::Scroll { offset } => {
+            vec![place_scrolled(text, width, offset, tab_width)]
+        }
     }
 }
 
-fn graphemes(text: &str) -> impl Iterator<Item = (usize, usize, usize, usize)> + '_ {
+/// One grapheme of a line with the cells it occupies.
+#[derive(Clone, Copy)]
+struct Grapheme {
+    index: usize,
+    start: usize,
+    end: usize,
+    cells: usize,
+    /// Whether the grapheme is a tab, expanded to the next tab stop.
+    tab: bool,
+}
+
+/// The graphemes of `text` with their cells: painted widths, and tabs expanded to the next
+/// multiple of `tab_width` display columns of the whole line.
+fn graphemes(text: &str, tab_width: u16) -> impl Iterator<Item = Grapheme> + '_ {
+    let tab_width = usize::from(tab_width.max(1));
+    let mut column = 0_usize;
     text.grapheme_indices(true)
         .enumerate()
-        .map(|(index, (start, grapheme))| {
-            (
+        .map(move |(index, (start, grapheme))| {
+            let tab = grapheme == "\t";
+            let cells = if tab {
+                tab_width - column % tab_width
+            } else {
+                usize::from(painted_grapheme_width(grapheme))
+            };
+            column += cells;
+            Grapheme {
                 index,
                 start,
-                start + grapheme.len(),
-                usize::from(painted_grapheme_width(grapheme)),
-            )
+                end: start + grapheme.len(),
+                cells,
+                tab,
+            }
         })
 }
 
-fn place_wrapped(text: &str, width: usize) -> Vec<ContentRow> {
+fn place_wrapped(text: &str, width: usize, tab_width: u16) -> Vec<ContentRow> {
     let mut rows = Vec::new();
     let mut row = ContentRow::new(0, 0);
     // Start of zero-width bytes that precede the row's first placement.
     let mut leading: Option<usize> = None;
-    wrap_walk(text, width, |step| match step {
+    wrap_walk(text, width, tab_width, |step| match step {
         WrapStep::Break { index, start } => {
             rows.push(std::mem::replace(&mut row, ContentRow::new(start, index)));
             leading = None;
@@ -1160,17 +1247,26 @@ fn place_wrapped(text: &str, width: usize) -> Vec<ContentRow> {
     rows
 }
 
-fn place_truncated(text: &str, width: usize) -> ContentRow {
-    let total = graphemes(text).map(|(_, _, _, cells)| cells).sum::<usize>();
+fn place_truncated(text: &str, width: usize, tab_width: u16) -> ContentRow {
+    let total = graphemes(text, tab_width)
+        .map(|grapheme| grapheme.cells)
+        .sum::<usize>();
     if total <= width {
-        let mut rows = place_wrapped(text, width);
+        let mut rows = place_wrapped(text, width, tab_width);
         return rows.swap_remove(0);
     }
     let body = width - 1;
     let mut row = ContentRow::new(0, 0);
     let mut column = 0;
     let mut leading: Option<usize> = None;
-    for (index, start, end, cells) in graphemes(text) {
+    for Grapheme {
+        index,
+        start,
+        end,
+        cells,
+        ..
+    } in graphemes(text, tab_width)
+    {
         if cells == 0 {
             if row.placements.is_empty() {
                 leading.get_or_insert(start);
@@ -1191,12 +1287,19 @@ fn place_truncated(text: &str, width: usize) -> ContentRow {
     row
 }
 
-fn place_scrolled(text: &str, width: usize, offset: usize) -> ContentRow {
+fn place_scrolled(text: &str, width: usize, offset: usize, tab_width: u16) -> ContentRow {
     let mut row: Option<ContentRow> = None;
     let mut position = (text.len(), text.graphemes(true).count());
     let mut absolute = 0;
     let mut previous_placed = false;
-    for (index, start, end, cells) in graphemes(text) {
+    for Grapheme {
+        index,
+        start,
+        end,
+        cells,
+        ..
+    } in graphemes(text, tab_width)
+    {
         if cells == 0 {
             if previous_placed && let Some(row) = row.as_mut() {
                 row.attach(end, index);
@@ -1275,7 +1378,17 @@ impl ContentStyles {
                 output.blank(placement.column - column, self.pad);
             }
             let style = self.grapheme_style(text, placement.start, placement.end);
-            output.push(&text.text[placement.start..placement.end], style);
+            let content = &text.text[placement.start..placement.end];
+            if content.contains('\t') {
+                // A tab is the placement's only non-zero-width grapheme and paints as the
+                // spaces of its expansion.
+                output.push(
+                    &content.replacen('\t', &" ".repeat(placement.width), 1),
+                    style,
+                );
+            } else {
+                output.push(content, style);
+            }
             column = placement.column + placement.width;
         }
         if let Some((ellipsis_column, source)) = row.ellipsis {

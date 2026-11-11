@@ -444,9 +444,17 @@ Geometry and mapping:
 * `DiffRowLayout::segments` maps every row of every present column to its
   `DiffSourceSide`, line number, content cells, UTF-8 byte range, grapheme
   range, and the column of its first painted grapheme. Rows added below the
-  shorter side of a pair map to the end of that side's line. Selection fragments
-  for a row can be registered with `selection::painted_text_fragments` over
-  `text[segment.bytes]` at `segment.x`.
+  shorter side of a pair map to the end of that side's line.
+  `DiffRowLayout::selection_cells(segment)` returns the row's selection units
+  (cells and source bytes of every painted grapheme, at item columns), to
+  register as a `selection::SelectionTextRun` with its origin at column zero of
+  the segment's row.
+* Tabs expand to tab stops: `DiffRowOptions::tab_width` (default
+  `DEFAULT_DIFF_TAB_WIDTH`, eight; `with_tab_width`) sets the interval, counted
+  in display columns of the whole line as if unwrapped. A tab paints as spaces,
+  stays one unit mapped to its source byte (hits, `source_cells`, and selection
+  units cover its whole expansion), moves to the next row whole when wrapping,
+  and never occupies more cells than the content area.
 * `diff_row_height(item, width, options)` returns the height `layout_diff_row`
   would produce, from the same wrap geometry, without building rows: one pass
   over the graphemes and no allocation. Use it to measure items that are not
@@ -455,7 +463,7 @@ Geometry and mapping:
   byte/grapheme under it; `source_cells` returns the painted cells covering a
   byte range. Graphemes are placed with `text_width::painted_grapheme_width`, so
   hit regions, selection geometry, and painted cells agree for CJK, emoji,
-  combining marks, zero-width characters, and control characters.
+  combining marks, zero-width characters, tabs, and control characters.
 
 `intraline_changed_ranges` compares a removed line with the added line that
 replaced it by token (word runs, whitespace runs, other graphemes) using the

@@ -5,7 +5,7 @@ use crate::diff_viewer::DiffViewerStyle;
 use bmux_tui::buffer::Buffer;
 use bmux_tui::geometry::{Point, Rect};
 use bmux_tui::prelude::Color;
-use bmux_tui::selection::painted_text_fragments;
+use bmux_tui::selection::painted_text_cells;
 
 const TEXTS: &[&str] = &[
     "",
@@ -220,10 +220,10 @@ fn wrapped_segments_cover_the_source_exactly_once() {
     }
 }
 
-/// Selection fragments registered from a segment, hit testing, and painted
-/// cells must all describe the same cells.
+/// Selection units of a segment, hit testing, and painted cells must all
+/// describe the same cells.
 #[test]
-fn hit_regions_selection_fragments_and_paint_agree() {
+fn hit_regions_selection_cells_and_paint_agree() {
     for text in TEXTS {
         for width in [0_u16, 1, 2, 5, 9, 14, 17, 23, 40] {
             for laid in all_layouts(text, width) {
@@ -244,56 +244,70 @@ fn assert_segment_agrees(
     segment: &DiffRowSegment,
     source: &str,
 ) {
-    let fragments = painted_text_fragments(
-        "scope",
-        "content",
-        Rect::new(
-            u16::try_from(segment.x).unwrap(),
-            u16::try_from(segment.row).unwrap(),
+    let units = layout.selection_cells(segment);
+    if !source[segment.bytes.clone()].contains('\t') {
+        // Without tabs the units are exactly the buffer's own advance over the row's text.
+        let painted = painted_text_cells(
+            &source[segment.bytes.clone()],
+            segment.bytes.start,
             u16::try_from(segment.content.end.saturating_sub(segment.x)).unwrap(),
-            1,
-        ),
-        0,
-        &source[segment.bytes.clone()],
-        segment.bytes.start,
-        0,
-    );
-    let mut painted_any = false;
-    for fragment in &fragments {
-        let Some(grapheme) = source[fragment.source_range.clone()]
-            .graphemes(true)
-            .find(|grapheme| painted_grapheme_width(grapheme) > 0)
-        else {
-            continue;
-        };
-        painted_any = true;
-        let x = usize::from(fragment.area.x);
-        let cell = symbol(buffer, x, segment.row);
-        if grapheme.chars().any(char::is_control) {
-            assert_eq!(cell, "\u{fffd}");
+        )
+        .into_iter()
+        .map(|cell| {
+            SelectionCell::new(
+                cell.x + u16::try_from(segment.x).unwrap(),
+                cell.width,
+                cell.source_range(),
+            )
+        })
+        .collect::<Vec<_>>();
+        if units.is_empty() {
+            // A row without painted graphemes has no units; the buffer helper reports one
+            // boundary unit for an empty or all-zero-width row instead.
+            assert!(painted.len() <= 1, "{source:?} {segment:?}");
         } else {
-            assert_eq!(cell, grapheme, "{source:?} {segment:?}");
+            assert_eq!(units, painted, "{source:?} {segment:?}");
         }
-        let cells = x..x + usize::from(fragment.area.width);
+    }
+    for unit in &units {
+        assert!(usize::from(unit.x) >= segment.content.start);
+        assert!(usize::from(unit.x + unit.width) <= segment.content.end);
+        let grapheme = source[unit.source_range()]
+            .graphemes(true)
+            .find(|grapheme| *grapheme == "\t" || painted_grapheme_width(grapheme) > 0)
+            .expect("a painted grapheme");
+        let x = usize::from(unit.x);
+        let cells = x..x + usize::from(unit.width);
+        if grapheme == "\t" {
+            assert_eq!(
+                row_text(buffer, cells.clone(), segment.row),
+                " ".repeat(cells.len())
+            );
+        } else if grapheme.chars().any(char::is_control) {
+            assert_eq!(symbol(buffer, x, segment.row), "\u{fffd}");
+        } else {
+            assert_eq!(
+                symbol(buffer, x, segment.row),
+                grapheme,
+                "{source:?} {segment:?}"
+            );
+        }
         for column in cells.clone() {
             let hit = layout.hit(segment.row, column).expect("content hit");
             assert_eq!(hit.target, DiffRowHitTarget::Content);
             assert_eq!(hit.side, segment.side);
             assert_eq!(hit.line, segment.line);
-            assert_eq!(
-                hit.byte_offset, fragment.source_range.start,
-                "{source:?} column={column}"
-            );
+            assert_eq!(hit.byte_offset, unit.start, "{source:?} column={column}");
         }
         assert!(
             layout
-                .source_cells(segment.side, fragment.source_range.clone())
+                .source_cells(segment.side, unit.source_range())
                 .iter()
                 .any(|covered| covered.row == segment.row && covered.cells == cells),
             "{source:?} {segment:?}"
         );
     }
-    if !painted_any {
+    if units.is_empty() {
         assert!(
             layout
                 .source_cells(segment.side, segment.bytes.clone())
@@ -305,6 +319,131 @@ fn assert_segment_agrees(
         let hit = layout.hit(segment.row, column).expect("gutter hit");
         assert_eq!(hit.target, DiffRowHitTarget::Gutter);
         assert_eq!(hit.byte_offset, segment.bytes.start);
+    }
+}
+
+/// Content text of a unified row (gutter excluded), as painted.
+fn content_rows(text: &str, width: u16, options: DiffRowOptions) -> Vec<String> {
+    let layout = layout_diff_row(
+        unified(DiffLineKind::Context, DiffRowText::plain(text)),
+        width,
+        options,
+        &style(),
+    );
+    let buffer = paint(&layout);
+    layout
+        .segments()
+        .iter()
+        .map(|segment| row_text(&buffer, segment.content.clone(), segment.row))
+        .collect()
+}
+
+#[test]
+fn tabs_expand_to_tab_stops_of_the_whole_line() {
+    let gutter = DiffRowGutter::for_max_line_number(9, DiffGutterShape::MarkerThenLineNumber);
+    let options = DiffRowOptions::new(gutter).with_tab_width(4);
+    let prefix = gutter.unified_width();
+    let width = u16::try_from(prefix + 12).unwrap();
+    // Stops every four columns, counted from the start of the line.
+    assert_eq!(content_rows("\tx", width, options), ["    x       "]);
+    assert_eq!(
+        content_rows("ab\tc\t界\td", width, options),
+        ["ab  c   界  ", "d           "]
+    );
+    // The default stop is eight cells; zero is treated as one.
+    assert_eq!(
+        content_rows(
+            "a\tb",
+            u16::try_from(prefix + 10).unwrap(),
+            DiffRowOptions::new(gutter)
+        ),
+        ["a       b "]
+    );
+    assert_eq!(
+        content_rows("a\t\tb", width, options.with_tab_width(0)),
+        ["a  b        "]
+    );
+    // Wrapping moves a tab to the next row whole, keeping line-relative stops: after the
+    // break at column 12 the tab (column 14) expands to column 16.
+    assert_eq!(
+        content_rows("0123456789ab\t\tz", width, options.with_tab_width(4)),
+        ["0123456789ab", "        z   "]
+    );
+    // A tab wider than the content area fills it rather than taking an unpainted row.
+    let narrow = u16::try_from(prefix + 3).unwrap();
+    assert_eq!(
+        content_rows("\tab", narrow, options.with_tab_width(8)),
+        ["   ", "ab "]
+    );
+    // Truncation and horizontal scrolling place tabs at the same columns.
+    assert_eq!(
+        content_rows(
+            "a\tbcdefghijk",
+            width,
+            options.with_overflow(DiffRowOverflow::Truncate)
+        ),
+        ["a   bcdefgh…"]
+    );
+    assert_eq!(
+        content_rows(
+            "a\tbc",
+            width,
+            options.with_overflow(DiffRowOverflow::Scroll { offset: 2 })
+        ),
+        ["  bc        "]
+    );
+}
+
+#[test]
+fn tab_selection_units_cover_the_whole_expansion() {
+    let gutter = DiffRowGutter::for_max_line_number(9, DiffGutterShape::MarkerThenLineNumber);
+    let options = DiffRowOptions::new(gutter).with_tab_width(4);
+    let layout = layout_diff_row(
+        unified(DiffLineKind::Added, DiffRowText::plain("a\t界\u{200b}\tb")),
+        40,
+        options,
+        &style(),
+    );
+    let start = gutter.unified_width();
+    let column = |offset: usize| u16::try_from(start + offset).unwrap();
+    assert_eq!(
+        layout.selection_cells(&layout.segments()[0]),
+        vec![
+            SelectionCell::new(column(0), 1, 0..1),
+            SelectionCell::new(column(1), 3, 1..2),
+            SelectionCell::new(column(4), 2, 2..8),
+            SelectionCell::new(column(6), 2, 8..9),
+            SelectionCell::new(column(8), 1, 9..10),
+        ]
+    );
+    // A hit anywhere in the expansion resolves to the tab's byte.
+    for offset in 1..4 {
+        assert_eq!(layout.hit(0, start + offset).unwrap().byte_offset, 1);
+    }
+    assert_eq!(
+        layout.source_cells(DiffSourceSide::New, 1..2),
+        vec![DiffRowCells {
+            row: 0,
+            cells: start + 1..start + 4
+        }]
+    );
+}
+
+#[test]
+fn tabs_measure_like_they_lay_out() {
+    for text in ["\t", "a\tb\tc\td", "\t\t\t\t\t\t", "界\t界\t界\t"] {
+        for tab_width in [1, 2, 4, 8] {
+            for width in 0..40_u16 {
+                let options = options(DiffGutterShape::MarkerThenLineNumber, DiffRowOverflow::Wrap)
+                    .with_tab_width(tab_width);
+                let item = unified(DiffLineKind::Context, DiffRowText::plain(text));
+                assert_eq!(
+                    diff_row_height(item, width, options),
+                    layout_diff_row(item, width, options, &style()).height(),
+                    "{text:?} tab={tab_width} width={width}"
+                );
+            }
+        }
     }
 }
 
