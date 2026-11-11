@@ -646,3 +646,59 @@ fn line_number_digits_are_computed_once() {
     assert_eq!(DiffRowGutter::line_number_digits(10), 2);
     assert_eq!(DiffRowGutter::line_number_digits(u32::MAX), 10);
 }
+
+#[test]
+fn height_only_measurement_matches_the_laid_out_rows() {
+    let gutters = [
+        DiffRowGutter::new(4, DiffGutterShape::LineNumbersThenMarker),
+        DiffRowGutter::new(2, DiffGutterShape::MarkerThenLineNumber),
+    ];
+    let overflows = [
+        DiffRowOverflow::Wrap,
+        DiffRowOverflow::Truncate,
+        DiffRowOverflow::Scroll { offset: 3 },
+    ];
+    for text in TEXTS {
+        for width in 0..48_u16 {
+            for gutter in gutters {
+                for overflow in overflows {
+                    for columns in [DiffSplitColumns::Even, DiffSplitColumns::OldWidth(5)] {
+                        let options = DiffRowOptions::new(gutter)
+                            .with_overflow(overflow)
+                            .with_columns(columns);
+                        let items = [
+                            unified(DiffLineKind::Added, DiffRowText::plain(text)),
+                            DiffRowItem::SideBySide {
+                                old: Some(DiffRowCell::new(
+                                    DiffLineKind::Removed,
+                                    Some(1),
+                                    DiffRowText::plain(text),
+                                )),
+                                new: Some(DiffRowCell::new(
+                                    DiffLineKind::Added,
+                                    Some(1),
+                                    DiffRowText::plain("short"),
+                                )),
+                            },
+                            DiffRowItem::SideBySide {
+                                old: None,
+                                new: Some(DiffRowCell::new(
+                                    DiffLineKind::Added,
+                                    Some(12_345),
+                                    DiffRowText::plain(text),
+                                )),
+                            },
+                        ];
+                        for item in items {
+                            assert_eq!(
+                                diff_row_height(item, width, options),
+                                layout_diff_row(item, width, options, &style()).height(),
+                                "{text:?} at {width} with {options:?}: {item:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

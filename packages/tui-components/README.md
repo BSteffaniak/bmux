@@ -447,6 +447,10 @@ Geometry and mapping:
   shorter side of a pair map to the end of that side's line. Selection fragments
   for a row can be registered with `selection::painted_text_fragments` over
   `text[segment.bytes]` at `segment.x`.
+* `diff_row_height(item, width, options)` returns the height `layout_diff_row`
+  would produce, from the same wrap geometry, without building rows: one pass
+  over the graphemes and no allocation. Use it to measure items that are not
+  painted, for example as a virtual-list `measure_hint`.
 * `DiffRowLayout::hit` resolves a cell to side, line, gutter or content, and the
   byte/grapheme under it; `source_cells` returns the painted cells covering a
   byte range. Graphemes are placed with `text_width::painted_grapheme_width`, so

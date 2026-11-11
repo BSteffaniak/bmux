@@ -536,6 +536,94 @@ pub fn layout_diff_row(
     }
 }
 
+/// Height in rows of `item` laid out at `width` cells with `options`, without producing rows.
+///
+/// Equals the height of the [`layout_diff_row`] result for the same item, width, and options
+/// under every style, and costs one pass over the item's graphemes with no allocation, so a
+/// virtualized caller can measure items it does not paint (for example lines far from the
+/// viewport) cheaply.
+#[must_use]
+pub fn diff_row_height(item: DiffRowItem<'_>, width: u16, options: DiffRowOptions) -> usize {
+    let width = usize::from(width);
+    match item {
+        DiffRowItem::Unified { text, .. } => {
+            cell_height(text.text, width, options.gutter.unified_width(), options).max(1)
+        }
+        DiffRowItem::SideBySide { old, new } => {
+            if width == 0 {
+                return 1;
+            }
+            let (old_width, _, new_width) = split_widths(width, options.columns);
+            let side = |cell: Option<DiffRowCell<'_>>, width| {
+                cell.map_or(1, |cell| {
+                    cell_height(cell.text.text, width, options.gutter.side_width(), options)
+                })
+            };
+            side(old, old_width).max(side(new, new_width)).max(1)
+        }
+    }
+}
+
+/// Content rows of one present cell (zero when the cell has no cells at all).
+fn cell_height(text: &str, width: usize, gutter_width: usize, options: DiffRowOptions) -> usize {
+    let (mode, prefix) = gutter_mode(width, gutter_width);
+    if mode == DiffGutterMode::Empty {
+        return 0;
+    }
+    let content_width = width - prefix;
+    match options.overflow {
+        DiffRowOverflow::Wrap if content_width > 0 => {
+            let mut rows = 1;
+            wrap_walk(text, content_width, |step| {
+                if matches!(step, WrapStep::Break { .. }) {
+                    rows += 1;
+                }
+            });
+            rows
+        }
+        _ => 1,
+    }
+}
+
+/// One step of wrapping a text at grapheme boundaries.
+#[derive(Clone, Copy)]
+enum WrapStep {
+    /// A new row starts at this grapheme.
+    Break { index: usize, start: usize },
+    /// A grapheme lands at `column` of the current row. Zero-width graphemes have zero
+    /// `cells`; a grapheme wider than the whole row takes a row of its own and is not
+    /// painted (`cells` exceeds the width).
+    Place {
+        column: usize,
+        cells: usize,
+        start: usize,
+        end: usize,
+        index: usize,
+    },
+}
+
+/// Wrap `text` into rows of `width` cells, reporting each step. The single source of wrap
+/// geometry for both [`layout_diff_row`] and [`diff_row_height`].
+fn wrap_walk(text: &str, width: usize, mut step: impl FnMut(WrapStep)) {
+    let mut column = 0;
+    for (index, start, end, cells) in graphemes(text) {
+        if cells > 0 && column > 0 && column + cells > width {
+            step(WrapStep::Break { index, start });
+            column = 0;
+        }
+        step(WrapStep::Place {
+            column,
+            cells,
+            start,
+            end,
+            index,
+        });
+        if cells > 0 {
+            column = if cells > width { width } else { column + cells };
+        }
+    }
+}
+
 #[derive(Default)]
 struct Builder {
     rows: Vec<Line>,
@@ -1030,11 +1118,20 @@ fn graphemes(text: &str) -> impl Iterator<Item = (usize, usize, usize, usize)> +
 fn place_wrapped(text: &str, width: usize) -> Vec<ContentRow> {
     let mut rows = Vec::new();
     let mut row = ContentRow::new(0, 0);
-    let mut column = 0;
     // Start of zero-width bytes that precede the row's first placement.
     let mut leading: Option<usize> = None;
-    for (index, start, end, cells) in graphemes(text) {
-        if cells == 0 {
+    wrap_walk(text, width, |step| match step {
+        WrapStep::Break { index, start } => {
+            rows.push(std::mem::replace(&mut row, ContentRow::new(start, index)));
+            leading = None;
+        }
+        WrapStep::Place {
+            cells: 0,
+            start,
+            end,
+            index,
+            ..
+        } => {
             if row.placements.is_empty() {
                 leading.get_or_insert(start);
                 row.bytes.end = end;
@@ -1042,24 +1139,23 @@ fn place_wrapped(text: &str, width: usize) -> Vec<ContentRow> {
             } else {
                 row.attach(end, index);
             }
-            continue;
         }
-        if column > 0 && column + cells > width {
-            rows.push(std::mem::replace(&mut row, ContentRow::new(start, index)));
-            column = 0;
-            leading = None;
-        }
-        if cells > width {
+        WrapStep::Place {
+            cells, end, index, ..
+        } if cells > width => {
             // An indivisible grapheme wider than the area: reserve its own
             // unpainted row so content never exceeds the area.
             row.bytes.end = end;
             row.graphemes.end = index + 1;
-            column = width;
-            continue;
         }
-        row.place(column, cells, leading.take().unwrap_or(start), end, index);
-        column += cells;
-    }
+        WrapStep::Place {
+            column,
+            cells,
+            start,
+            end,
+            index,
+        } => row.place(column, cells, leading.take().unwrap_or(start), end, index),
+    });
     rows.push(row);
     rows
 }
