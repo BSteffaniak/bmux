@@ -24,6 +24,42 @@ bound retained source bytes, not total token allocation or input size. Callers
 must bound input/work when rendering arbitrary large documents. Cache entries
 carry no authoritative application state. No Bcode runtime dependency is needed.
 
+## Whole-text projection
+
+`SyntaxHighlighter::highlight_text` highlights a complete text in one pass, so
+grammar state carries across lines (block comments, multi-line strings), and
+returns a `HighlightedText`: compact `SyntaxToken` byte ranges per line,
+addressable by 1-based line number (`line`, `line_at`). Lines split at `\n`;
+a trailing `\r` is not part of a line and a final terminator does not start
+another line. `line_matching` and `line_spans` return tokens only when the
+caller's line content matches the highlighted line exactly, so tokens are
+never projected onto different text.
+
+`DiffSyntax` holds the old and new side of a diff (either may be absent).
+`DiffSyntax::highlight` highlights each side once; `diff_line(old_line,
+new_line, content)` reads the new side when the line has a new line number
+and that side matches, otherwise the old side.
+
+```rust,ignore
+use bmux_syntax_render::{DiffSyntax, SyntaxHighlighter};
+
+// Off the render thread: results are owned `Send + Sync` data.
+let syntax = DiffSyntax::highlight(&highlighter, path, Some(old_blob), Some(new_blob));
+
+// Per visible diff line: a binary-searchable slice of byte-range tokens.
+if let Some(tokens) = syntax.diff_line(old_line, new_line, content) {
+    for token in tokens {
+        let style = token.style.to_tui();
+        // e.g. DiffSyntaxRange::new(token.start, token.end, style)
+    }
+}
+```
+
+`highlight_text` does not use the shared highlight cache and keeps no global
+mutable state; callers cache results by their own identity (for example blob
+id and palette). Cost is linear in the text, so bound input sizes for arbitrary
+files. `SyntaxStyle::to_tui` converts a token style to a terminal `Style`.
+
 ## Lint scope
 
 The source crate originally suppressed `clippy::multiple_crate_versions` at its

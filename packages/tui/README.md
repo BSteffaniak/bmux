@@ -53,6 +53,15 @@ controls or render callbacks. The runtime's
 that path for buttons, editable text, disabled controls, a modal, capture, and
 explicit shape overrides; see its [run instructions](../tui-runtime/README.md#interactive-pointer-controls).
 
+## Painted grapheme width
+
+`text_width::painted_grapheme_width` returns the cells `Buffer::write_line`
+advances for one grapheme: zero for zero-width graphemes, one for narrow and
+control-containing graphemes (painted as a replacement cell), two for wide
+ones. Components that place text grapheme by grapheme and register hit regions
+or selection geometry use it instead of `display_width`, so their geometry
+agrees with painted cells and with `selection::painted_text_fragments`.
+
 ## Color blending and easing
 
 `Color::mix` blends one color toward another in OKLab (via `bmux_color::mix`)

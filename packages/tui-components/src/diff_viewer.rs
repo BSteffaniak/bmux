@@ -4,12 +4,21 @@ use crate::selection::{
     ComponentSelectionOutcome, ComponentSelectionPolicy, ComponentSelectionState,
     paint_component_scope,
 };
-use crate::source_viewer::pad_card_spans;
 use bmux_tui::geometry::Rect;
 use bmux_tui::paint::PaintCx;
 use bmux_tui::prelude::{Color, Line, Modifier, Span, Style};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
+
+mod intraline;
+mod row_layout;
+
+pub use intraline::{IntralineChanges, intraline_changed_ranges};
+pub use row_layout::{
+    DiffGutterMode, DiffGutterShape, DiffRowCell, DiffRowCells, DiffRowColumn, DiffRowGutter,
+    DiffRowHit, DiffRowHitTarget, DiffRowItem, DiffRowLayout, DiffRowOptions, DiffRowOverflow,
+    DiffRowSegment, DiffRowText, DiffSplitColumns, DiffSyntaxRange, layout_diff_row,
+};
 
 /// Syntax-highlighted span content for diff lines.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -498,7 +507,7 @@ fn range_from_graphemes(
     )]
 }
 
-fn lcs_table(old_lines: &[&str], new_lines: &[&str]) -> Vec<Vec<usize>> {
+fn lcs_table<T: PartialEq>(old_lines: &[T], new_lines: &[T]) -> Vec<Vec<usize>> {
     let mut table =
         vec![vec![0usize; new_lines.len().saturating_add(1)]; old_lines.len().saturating_add(1)];
     for old_index in (0..old_lines.len()).rev() {
@@ -1588,6 +1597,60 @@ const fn preview_line<'a>(row: &'a PreviewRow<'a>) -> Option<&'a DiffLine> {
     }
 }
 
+/// Content of a document line in the form the row layout consumes.
+///
+/// Caller-supplied syntax spans replace the line content when present, as
+/// they always have for document rendering; changed ranges index that text.
+struct DocumentRowText {
+    text: String,
+    syntax: Vec<DiffSyntaxRange>,
+}
+
+impl DocumentRowText {
+    fn new(line: &DiffLine) -> Self {
+        if line.syntax_spans.is_empty() {
+            return Self {
+                text: line.content.clone(),
+                syntax: Vec::new(),
+            };
+        }
+        let mut text = String::new();
+        let mut syntax = Vec::with_capacity(line.syntax_spans.len());
+        for span in &line.syntax_spans {
+            let start = text.len();
+            text.push_str(&span.content);
+            syntax.push(DiffSyntaxRange::new(start, text.len(), span.style));
+        }
+        Self { text, syntax }
+    }
+
+    fn row_text<'a>(&'a self, line: &'a DiffLine) -> DiffRowText<'a> {
+        DiffRowText::plain(&self.text)
+            .with_changed_ranges(&line.changed_ranges)
+            .with_syntax(&self.syntax)
+    }
+}
+
+const fn compact_gutter(gutter: DiffGutter) -> DiffRowGutter {
+    DiffRowGutter::new(gutter.number_width, DiffGutterShape::MarkerThenLineNumber)
+}
+
+/// Side-by-side document cells show the old number for removed lines and the
+/// new number (falling back to the old one) otherwise.
+fn document_split_cell<'a>(
+    line: Option<&'a DiffLine>,
+    text: Option<&'a DocumentRowText>,
+) -> Option<DiffRowCell<'a>> {
+    let (line, text) = (line?, text?);
+    let number = (if line.kind == DiffLineKind::Removed {
+        line.old_line
+    } else {
+        line.new_line
+    })
+    .or(line.old_line);
+    Some(DiffRowCell::new(line.kind, number, text.row_text(line)))
+}
+
 fn render_split_row_with_style(
     old: Option<&DiffLine>,
     new: Option<&DiffLine>,
@@ -1596,111 +1659,66 @@ fn render_split_row_with_style(
     gutter: DiffGutter,
     style: DiffViewerStyle,
 ) -> Vec<Line> {
-    let old_chunks = split_cell_chunks_with_style(old, old_width, gutter, style);
-    let new_chunks = split_cell_chunks_with_style(new, new_width, gutter, style);
-    let height = old_chunks.len().max(new_chunks.len());
-    (0..height)
-        .map(|row| {
-            let mut spans = vec![
-                Span::styled("  ", style.muted),
-                Span::styled("│", style.muted),
-            ];
-            spans.extend(split_cell_row_with_style(
-                old,
-                old_chunks.get(row),
-                row,
-                old_width,
-                gutter,
-                style,
-            ));
-            spans.push(Span::styled("│", style.muted));
-            spans.extend(split_cell_row_with_style(
-                new,
-                new_chunks.get(row),
-                row,
-                new_width,
-                gutter,
-                style,
-            ));
-            spans.push(Span::styled("│", style.muted));
-            Line::from_spans(spans)
-        })
-        .collect()
+    let old_text = old.map(DocumentRowText::new);
+    let new_text = new.map(DocumentRowText::new);
+    let item = DiffRowItem::SideBySide {
+        old: document_split_cell(old, old_text.as_ref()),
+        new: document_split_cell(new, new_text.as_ref()),
+    };
+    let width = old_width.saturating_add(new_width).saturating_add(1);
+    let options = DiffRowOptions::new(compact_gutter(gutter))
+        .with_columns(DiffSplitColumns::OldWidth(old_width));
+    layout_diff_row(
+        item,
+        u16::try_from(width).unwrap_or(u16::MAX),
+        options,
+        &style,
+    )
+    .into_rows()
+    .into_iter()
+    .map(|row| {
+        let mut spans = vec![
+            Span::styled("  ", style.muted),
+            Span::styled("│", style.muted),
+        ];
+        spans.extend(row.spans);
+        spans.push(Span::styled("│", style.muted));
+        Line::from_spans(spans)
+    })
+    .collect()
 }
 
-fn split_cell_chunks_with_style(
-    line: Option<&DiffLine>,
-    width: usize,
+fn render_diff_line_with_style(
+    line: &DiffLine,
+    width: u16,
     gutter: DiffGutter,
     style: DiffViewerStyle,
-) -> Vec<Vec<Span>> {
-    let Some(line) = line else {
-        return vec![Vec::new()];
+) -> Vec<Line> {
+    let text = DocumentRowText::new(line);
+    let item = DiffRowItem::Unified {
+        kind: line.kind,
+        old_line: line.old_line,
+        new_line: line.new_line,
+        text: text.row_text(line),
     };
-    if width <= gutter.split_chrome() {
-        return vec![Vec::new()];
-    }
-    let body_width = width - gutter.split_chrome();
-    let (_, _, body_style) = style.line(line.kind);
-    let chunks = wrap_spans(
-        content_spans(line, style.row(line.kind).patch(body_style)),
-        &line.changed_ranges,
-        style.emphasis(line.kind),
-        body_width,
-    );
-    if chunks.is_empty() {
-        vec![Vec::new()]
-    } else {
-        chunks
-    }
-}
-
-fn split_cell_row_with_style(
-    line: Option<&DiffLine>,
-    chunk: Option<&Vec<Span>>,
-    row: usize,
-    width: usize,
-    gutter: DiffGutter,
-    style: DiffViewerStyle,
-) -> Vec<Span> {
-    let Some(line) = line else {
-        return vec![Span::styled(" ".repeat(width), style.text)];
-    };
-    let (sign, sign_style, body_style) = style.line(line.kind);
-    let background = style.row(line.kind);
-    let gutter_style = background.patch(style.muted);
-    let number = if row == 0 {
-        (if matches!(line.kind, DiffLineKind::Removed) {
-            line.old_line
-        } else {
-            line.new_line
-        })
-        .or(line.old_line)
-        .map_or_else(String::new, |number| number.to_string())
-    } else {
-        String::new()
-    };
-    let mut spans = vec![
-        Span::styled(" ", gutter_style),
-        Span::styled(
-            if row == 0 { sign } else { " " },
-            background.patch(sign_style.add_modifier(Modifier::BOLD)),
-        ),
-        Span::styled(
-            format!(
-                "{number:>number_width$}",
-                number_width = gutter.number_width
-            ),
-            gutter_style,
-        ),
-        Span::styled(" │ ", gutter_style),
-    ];
-    if let Some(chunk) = chunk {
-        spans.extend(chunk.iter().cloned());
-    }
-    spans = Line::from_spans(spans).viewport(0, width).spans;
-    pad_card_spans(&mut spans, width, background.patch(body_style));
-    spans
+    layout_diff_row(
+        item,
+        width.saturating_sub(4),
+        DiffRowOptions::new(compact_gutter(gutter)),
+        &style,
+    )
+    .into_rows()
+    .into_iter()
+    .map(|row| {
+        let mut spans = vec![
+            Span::styled("  ", style.muted),
+            Span::styled("│ ", style.muted),
+        ];
+        spans.extend(row.spans);
+        spans.push(Span::styled(" │", style.muted));
+        Line::from_spans(spans)
+    })
+    .collect()
 }
 
 #[cfg(test)]
@@ -1711,138 +1729,6 @@ fn render_diff_line(line: &DiffLine, width: u16) -> Vec<Line> {
         DiffGutter::for_preview(&[PreviewRow::Line(line)]),
         DiffViewerStyle::default(),
     )
-}
-
-fn render_diff_line_with_style(
-    line: &DiffLine,
-    width: u16,
-    gutter: DiffGutter,
-    style: DiffViewerStyle,
-) -> Vec<Line> {
-    let (sign, sign_style, body_style) = style.line(line.kind);
-    let row_style = style.row(line.kind);
-    let emphasis_style = style.emphasis(line.kind);
-    let gutter_style = row_style.patch(style.muted);
-    let body_width = usize::from(width)
-        .saturating_sub(gutter.unified_chrome())
-        .max(1);
-    let chunks = wrap_spans(
-        content_spans(line, row_style.patch(body_style)),
-        &line.changed_ranges,
-        emphasis_style,
-        body_width,
-    );
-    let chunks = if chunks.is_empty() {
-        vec![vec![Span::styled(
-            String::new(),
-            row_style.patch(body_style),
-        )]]
-    } else {
-        chunks
-    };
-    chunks
-        .into_iter()
-        .enumerate()
-        .map(|(index, chunk)| {
-            let mut spans = vec![Span::styled("  ", style.muted)];
-            let mut card_spans = if index == 0 {
-                vec![
-                    Span::styled("│ ", style.muted),
-                    Span::styled("  ", gutter_style),
-                    Span::styled(
-                        sign,
-                        row_style.patch(sign_style.add_modifier(Modifier::BOLD)),
-                    ),
-                    Span::styled(
-                        format!(
-                            "{:>number_width$}",
-                            line_number(line),
-                            number_width = gutter.number_width
-                        ),
-                        gutter_style,
-                    ),
-                    Span::styled(" │ ", gutter_style),
-                ]
-            } else {
-                continuation_prefix(gutter_style, style.muted, gutter.number_width)
-            };
-            card_spans.extend(chunk);
-            card_spans = Line::from_spans(card_spans)
-                .viewport(0, usize::from(width).saturating_sub(2))
-                .spans;
-            pad_card_spans(
-                &mut card_spans,
-                usize::from(width).saturating_sub(2),
-                row_style,
-            );
-            card_spans.push(Span::styled(" │", style.muted));
-            spans.extend(card_spans);
-            Line::from_spans(spans)
-        })
-        .collect()
-}
-
-fn continuation_prefix(gutter_style: Style, border_style: Style, number_width: usize) -> Vec<Span> {
-    vec![
-        Span::styled("│ ", border_style),
-        Span::styled("  ", gutter_style),
-        Span::styled(" ", gutter_style),
-        Span::styled(" ".repeat(number_width), gutter_style),
-        Span::styled(" │ ", gutter_style),
-    ]
-}
-
-fn content_spans(line: &DiffLine, fallback_style: Style) -> Vec<Span> {
-    if line.syntax_spans.is_empty() {
-        return vec![Span::styled(line.content.clone(), fallback_style)];
-    }
-    line.syntax_spans
-        .iter()
-        .map(|span| Span::styled(span.content.clone(), fallback_style.patch(span.style)))
-        .collect()
-}
-
-fn wrap_spans(
-    spans: Vec<Span>,
-    changed_ranges: &[ChangedRange],
-    emphasis_style: Style,
-    width: usize,
-) -> Vec<Vec<Span>> {
-    let width = width.max(1);
-    let mut rows = Vec::<Vec<Span>>::new();
-    let mut current = Vec::<Span>::new();
-    let mut current_width = 0usize;
-    let mut byte_offset = 0usize;
-    for span in spans {
-        let text = span.content.clone();
-        for grapheme in text.graphemes(true) {
-            let grapheme_width = UnicodeWidthStr::width(grapheme);
-            if current_width > 0 && current_width.saturating_add(grapheme_width) > width {
-                rows.push(std::mem::take(&mut current));
-                current_width = 0;
-            }
-            let start = byte_offset;
-            let end = byte_offset.saturating_add(grapheme.len());
-            byte_offset = end;
-            let mut style = span.style;
-            if changed_ranges
-                .iter()
-                .any(|range| ranges_overlap(start, end, range.start, range.end))
-            {
-                style = style.patch(emphasis_style);
-            }
-            current.push(Span::styled(grapheme.to_owned(), style));
-            current_width = current_width.saturating_add(grapheme_width);
-        }
-    }
-    if !current.is_empty() {
-        rows.push(current);
-    }
-    rows
-}
-
-const fn ranges_overlap(a_start: usize, a_end: usize, b_start: usize, b_end: usize) -> bool {
-    a_start < b_end && b_start < a_end
 }
 
 fn card_width(preview: &[PreviewRow<'_>], available_width: u16) -> u16 {
@@ -1934,12 +1820,6 @@ const fn mode_label(old_text_is_empty: bool) -> &'static str {
     } else {
         "Editing file"
     }
-}
-
-fn line_number(line: &DiffLine) -> String {
-    line.new_line
-        .or(line.old_line)
-        .map_or_else(|| "·".to_owned(), |line| line.to_string())
 }
 
 fn change_summary(added: u32, removed: u32) -> String {

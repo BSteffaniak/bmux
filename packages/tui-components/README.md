@@ -385,6 +385,84 @@ width, in place of the background its state style would give it (span
 backgrounds still apply), for row-level highlights such as a flash that fades
 out by blending with `Color::mix` each frame.
 
+## Diff row layout
+
+The `diff-viewer` feature exposes `diff_viewer::layout_diff_row`, which lays out
+one logical diff item at a given width so a virtualized caller (for example a
+`VirtualList` item) builds only the rows it shows. An item is either a unified
+line (`DiffRowItem::Unified`: kind, old/new line numbers, content) or a
+side-by-side pair (`DiffRowItem::SideBySide`: optional old and new
+`DiffRowCell`s, each with its own line number). Content is a `DiffRowText`:
+the line text, sorted intra-line `ChangedRange`s, and sorted caller-supplied
+`DiffSyntaxRange` byte ranges (for example syntax tokens).
+
+```rust,ignore
+use bmux_tui_components::diff_viewer::{
+    DiffGutterShape, DiffLineKind, DiffRowGutter, DiffRowItem, DiffRowOptions,
+    DiffRowOverflow, DiffRowText, DiffViewerStyle, intraline_changed_ranges,
+    layout_diff_row,
+};
+
+// Once per document: every row shares this gutter, so all rows align.
+let gutter = DiffRowGutter::for_max_line_number(max_line, DiffGutterShape::LineNumbersThenMarker);
+let options = DiffRowOptions::new(gutter).with_overflow(DiffRowOverflow::Wrap);
+
+// Once per changed line pair (cache it with the item).
+let changes = intraline_changed_ranges(old_text, new_text).unwrap_or_default();
+
+let layout = layout_diff_row(
+    DiffRowItem::Unified {
+        kind: DiffLineKind::Added,
+        old_line: None,
+        new_line: Some(42),
+        text: DiffRowText::plain(new_text).with_changed_ranges(&changes.new),
+    },
+    width,
+    options,
+    &DiffViewerStyle::default(),
+);
+let rows = layout.rows(); // each exactly `width` cells
+```
+
+Geometry and mapping:
+
+* `DiffRowGutter` is derived once per document from the largest line number.
+  `unified_width` and `side_width` report its cells. A number with more digits
+  than the gutter shows a right-aligned `…`, never a partial number.
+  `DiffGutterShape::LineNumbersThenMarker` shows both numbers then the marker;
+  `MarkerThenLineNumber` is the compact single-number shape used by the
+  whole-document card.
+* Overflow is explicit: `Wrap` (grapheme boundaries; a grapheme wider than the
+  whole content area gets its own unpainted row), `Truncate` (one row, `…` in
+  the last cell when clipped), or `Scroll { offset }` (one row from a display
+  column; graphemes cut by an edge leave blank cells).
+* Narrow columns degrade explicitly (`DiffGutterMode`): the full gutter when it
+  fits (content may then have no cells), otherwise only the marker cell from two
+  cells, content only at one cell. Width zero yields one empty row with no
+  segments. Side-by-side rows put a one-cell divider between the columns from
+  three cells; `DiffSplitColumns` chooses an even split or a fixed old width.
+* `DiffRowLayout::segments` maps every row of every present column to its
+  `DiffSourceSide`, line number, content cells, UTF-8 byte range, grapheme
+  range, and the column of its first painted grapheme. Rows added below the
+  shorter side of a pair map to the end of that side's line. Selection fragments
+  for a row can be registered with `selection::painted_text_fragments` over
+  `text[segment.bytes]` at `segment.x`.
+* `DiffRowLayout::hit` resolves a cell to side, line, gutter or content, and the
+  byte/grapheme under it; `source_cells` returns the painted cells covering a
+  byte range. Graphemes are placed with `text_width::painted_grapheme_width`, so
+  hit regions, selection geometry, and painted cells agree for CJK, emoji,
+  combining marks, zero-width characters, and control characters.
+
+`intraline_changed_ranges` compares a removed line with the added line that
+replaced it by token (word runs, whitespace runs, other graphemes) using the
+same LCS as line diffs, returning disjoint grapheme-aligned ranges per side and
+merging ranges separated only by whitespace. Lines without a shared
+non-whitespace token, or comparisons beyond the LCS budget, produce one range
+per side; lines over 2,000 graphemes return `None`.
+
+The whole-document APIs (`diff_viewer_rows*`, `diff_viewer_document_*`) render
+their card rows through `layout_diff_row` with unchanged output.
+
 ## Component conventions
 
 Interactive components should follow the same shape as the existing text input

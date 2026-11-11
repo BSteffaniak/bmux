@@ -9,6 +9,22 @@ pub fn display_width(text: &str) -> usize {
     UnicodeWidthStr::width(text)
 }
 
+/// Return the terminal cells [`Buffer::write_line`](crate::buffer::Buffer::write_line)
+/// advances for one grapheme.
+///
+/// * Zero-width graphemes (for example U+200B) occupy no cell and paint nothing.
+/// * Narrow graphemes, and graphemes containing control characters (painted as
+///   one replacement cell), occupy one cell.
+/// * Wide graphemes occupy two cells.
+///
+/// Use this, rather than [`display_width`], when computing cell positions that
+/// must agree with painted `Line` content, such as hit regions or selection
+/// geometry for text laid out grapheme by grapheme.
+#[must_use]
+pub fn painted_grapheme_width(grapheme: &str) -> u16 {
+    crate::buffer::grapheme_width(grapheme)
+}
+
 /// Wrap text at word boundaries with a distinct first-line width.
 ///
 /// Words longer than the target width fall back to grapheme wrapping, and
@@ -190,5 +206,43 @@ mod tests {
     #[test]
     fn truncates_at_grapheme_boundaries() {
         assert_eq!(truncate_to_display_width("ab👨‍👩‍👧‍👦cd", 5), "ab👨‍👩‍👧‍👦…");
+    }
+
+    #[test]
+    fn painted_grapheme_width_matches_buffer_painting() {
+        use crate::buffer::Buffer;
+        use crate::geometry::Rect;
+        use crate::text::Line;
+        use unicode_segmentation::UnicodeSegmentation;
+
+        let text = "a界e\u{301}\u{200b}\t👨‍👩‍👧‍👦x";
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 20, 1));
+        buffer.write_line(Rect::new(0, 0, 20, 1), &Line::raw(text));
+        let mut column = 0_u16;
+        for grapheme in text.graphemes(true) {
+            let width = super::painted_grapheme_width(grapheme);
+            if width > 0 {
+                let painted = buffer
+                    .get(crate::geometry::Point::new(column, 0))
+                    .expect("painted cell")
+                    .symbol
+                    .clone();
+                if grapheme == "\t" {
+                    assert_eq!(painted, "\u{fffd}");
+                } else {
+                    assert_eq!(painted, grapheme);
+                }
+            }
+            column += width;
+        }
+        assert_eq!(super::painted_grapheme_width("\u{200b}"), 0);
+        assert_eq!(super::painted_grapheme_width("界"), 2);
+        assert_eq!(super::painted_grapheme_width("\t"), 1);
+        let after = buffer
+            .get(crate::geometry::Point::new(column, 0))
+            .expect("trailing cell")
+            .symbol
+            .clone();
+        assert_eq!(after, " ");
     }
 }

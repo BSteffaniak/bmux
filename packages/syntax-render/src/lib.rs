@@ -19,6 +19,10 @@ use bmux_tui::prelude::{Color, Modifier, Span, Style};
 use syntect::easy::ScopeRegionIterator;
 use syntect::parsing::{ParseState, ScopeStack, SyntaxReference, SyntaxSet};
 
+mod projection;
+
+pub use projection::{DiffSide, DiffSyntax, HighlightedText, SyntaxToken};
+
 static SYNTAX_SET: OnceLock<SyntaxSet> = OnceLock::new();
 
 /// Maximum source bytes retained by the multi-line highlight cache.
@@ -196,6 +200,15 @@ pub struct SyntaxStyle {
     pub italic: bool,
     /// Whether text should be underlined.
     pub underline: bool,
+}
+
+impl SyntaxStyle {
+    /// Convert this renderer-neutral style to a terminal style: the foreground
+    /// color plus bold, italic, and underline modifiers.
+    #[must_use]
+    pub const fn to_tui(self) -> Style {
+        syntax_style_to_tui(self)
+    }
 }
 
 /// Terminal syntax highlighter backed by syntect's bundled syntaxes.
@@ -550,6 +563,43 @@ impl ScopeClassifier {
         } else {
             spans
         })
+    }
+
+    /// Classify one line, terminator included, appending tokens for its first
+    /// `content_len` bytes. Adjacent tokens with equal styles are merged.
+    /// Returns `false` when the grammar fails on this line.
+    fn classify_line_tokens(
+        &mut self,
+        line: &str,
+        content_len: usize,
+        tokens: &mut Vec<SyntaxToken>,
+    ) -> bool {
+        let Ok(operations) = self.parse_state.parse_line(line, syntax_set()) else {
+            return false;
+        };
+        let first = tokens.len();
+        let mut offset = 0;
+        for (region, operation) in ScopeRegionIterator::new(&operations, line) {
+            if self.scope_stack.apply(operation).is_err() {
+                return false;
+            }
+            let start = offset;
+            offset += region.len();
+            let end = offset.min(content_len);
+            if start >= end {
+                continue;
+            }
+            let (role, font) = classify_scope_stack(&self.scope_stack);
+            let style = syntax_style(role, self.palette.color(role), font);
+            let mergeable = tokens.len() > first;
+            match tokens.last_mut() {
+                Some(last) if mergeable && last.style == style && last.end == start => {
+                    last.end = end;
+                }
+                _ => tokens.push(SyntaxToken { start, end, style }),
+            }
+        }
+        true
     }
 }
 
