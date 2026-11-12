@@ -203,32 +203,82 @@ impl SyntaxHighlighter {
     /// produce plain-text tokens. Cost is linear in the text.
     #[must_use]
     pub fn highlight_text(&self, path_or_language: &str, text: &str) -> HighlightedText {
-        let mut grammar =
-            syntax_for(path_or_language).map(|syntax| ScopeClassifier::new(syntax, self.palette));
-        let plain = syntax_style(SyntaxRole::Text, self.palette.text, FontEmphasis::default());
-        let mut output = HighlightedText::default();
-        let mut buffer = String::new();
-        for raw in text.split_inclusive('\n') {
+        let mut progress = self.start_text(path_or_language);
+        progress.advance(text, usize::MAX);
+        progress.into_highlighted()
+    }
+
+    /// Start highlighting a text incrementally: [`TextHighlight::advance`]
+    /// classifies a bounded number of lines per call with the same grammar
+    /// state [`Self::highlight_text`] carries across lines, so a caller can
+    /// stop between calls (when the result is no longer wanted) or show the
+    /// lines highlighted so far. The finished result equals
+    /// [`Self::highlight_text`] of the same text.
+    #[must_use]
+    pub fn start_text(&self, path_or_language: &str) -> TextHighlight {
+        TextHighlight {
+            grammar: syntax_for(path_or_language)
+                .map(|syntax| ScopeClassifier::new(syntax, self.palette)),
+            plain: syntax_style(SyntaxRole::Text, self.palette.text, FontEmphasis::default()),
+            output: HighlightedText::default(),
+            consumed: 0,
+            buffer: String::new(),
+        }
+    }
+}
+
+/// An incremental whole-text highlight (see [`SyntaxHighlighter::start_text`]).
+pub struct TextHighlight {
+    grammar: Option<ScopeClassifier>,
+    plain: SyntaxStyle,
+    output: HighlightedText,
+    /// Bytes of the text classified so far (always at a line start).
+    consumed: usize,
+    buffer: String,
+}
+
+impl std::fmt::Debug for TextHighlight {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TextHighlight")
+            .field("lines", &self.output.line_count())
+            .field("consumed", &self.consumed)
+            .finish_non_exhaustive()
+    }
+}
+
+impl TextHighlight {
+    /// Classify up to `max_lines` further lines of `text`, which must be the
+    /// same text on every call. Returns whether the whole text is now
+    /// highlighted.
+    pub fn advance(&mut self, text: &str, max_lines: usize) -> bool {
+        let Some(rest) = text.get(self.consumed..) else {
+            return true;
+        };
+        for raw in rest.split_inclusive('\n').take(max_lines) {
+            self.consumed += raw.len();
             let content = raw.strip_suffix('\n').unwrap_or(raw);
             let content = content.strip_suffix('\r').unwrap_or(content);
+            let output = &mut self.output;
             let first_token = output.tokens.len();
-            let classified = grammar.as_mut().is_some_and(|active| {
+            let buffer = &mut self.buffer;
+            let classified = self.grammar.as_mut().is_some_and(|active| {
                 buffer.clear();
                 buffer.push_str(content);
                 buffer.push('\n');
-                active.classify_line_tokens(&buffer, content.len(), &mut output.tokens)
+                active.classify_line_tokens(buffer, content.len(), &mut output.tokens)
             });
             if !classified {
                 // A grammar failure leaves the parse state partially applied,
                 // so later lines would be classified from a corrupt state.
                 // Render the rest of the text as plain text instead.
-                grammar = None;
+                self.grammar = None;
                 output.tokens.truncate(first_token);
                 if !content.is_empty() {
                     output.tokens.push(SyntaxToken {
                         start: 0,
                         end: content.len(),
-                        style: plain,
+                        style: self.plain,
                     });
                 }
             }
@@ -238,7 +288,21 @@ impl SyntaxHighlighter {
                 fingerprint: fingerprint(content),
             });
         }
-        output
+        self.consumed >= text.len()
+    }
+
+    /// The lines highlighted so far, addressable like a finished result.
+    /// Lines not reached yet have no tokens ([`HighlightedText::line`] returns
+    /// `None` for them).
+    #[must_use]
+    pub const fn highlighted(&self) -> &HighlightedText {
+        &self.output
+    }
+
+    /// Finish, returning the lines highlighted so far.
+    #[must_use]
+    pub fn into_highlighted(self) -> HighlightedText {
+        self.output
     }
 }
 

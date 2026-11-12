@@ -201,3 +201,32 @@ fn styles_convert_to_terminal_styles() {
     assert_eq!(style.fg, Some(token.style.foreground.to_tui()));
     assert!(style.modifiers.contains(bmux_tui::prelude::Modifier::BOLD));
 }
+
+#[test]
+fn incremental_highlighting_matches_whole_text_and_exposes_progress() {
+    let source = "/* start\nstill comment fn x\nend */\nfn main() {}\nlet y = 1;\n";
+    let highlighter = SyntaxHighlighter::new();
+    let mut progress = highlighter.start_text("rust");
+    assert!(!progress.advance(source, 2));
+    assert_eq!(progress.highlighted().line_count(), 2);
+    assert_eq!(
+        roles(progress.highlighted(), 2, "still comment fn x"),
+        roles(
+            &highlighter.highlight_text("rust", source),
+            2,
+            "still comment fn x"
+        ),
+        "grammar state carries into the lines classified so far"
+    );
+    assert!(progress.highlighted().line(3).is_none());
+    assert!(!progress.advance(source, 2));
+    assert!(progress.advance(source, 2));
+    assert!(
+        progress.advance(source, 2),
+        "a finished highlight stays finished"
+    );
+    assert_eq!(
+        progress.into_highlighted(),
+        highlighter.highlight_text("rust", source)
+    );
+}

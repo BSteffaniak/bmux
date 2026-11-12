@@ -21,7 +21,7 @@ use syntect::parsing::{ParseState, ScopeStack, SyntaxReference, SyntaxSet};
 
 mod projection;
 
-pub use projection::{DiffSide, DiffSyntax, HighlightedText, SyntaxToken};
+pub use projection::{DiffSide, DiffSyntax, HighlightedText, SyntaxToken, TextHighlight};
 
 static SYNTAX_SET: OnceLock<SyntaxSet> = OnceLock::new();
 
