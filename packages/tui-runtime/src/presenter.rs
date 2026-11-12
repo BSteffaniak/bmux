@@ -179,9 +179,9 @@ pub trait CancellableOutput: Send + 'static {
     ) -> std::io::Result<()>;
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 // Independent O_NONBLOCK descriptor, bounded chunks/poll waits, no tcdrain.
-impl CancellableOutput for bmux_tui::terminal::LinuxTerminalOutput {
+impl CancellableOutput for bmux_tui::terminal::TtyOutput {
     fn deliver(
         &mut self,
         bytes: &[u8],

@@ -485,6 +485,22 @@ impl<'frame, 'buffer> PaintCx<'frame, 'buffer> {
         }
     }
 
+    /// Report that the content of local rows `area` moved by `rows` relative
+    /// to the previous frame (positive: toward the top, as when scrolling
+    /// down), for example a list whose viewport scrolled.
+    ///
+    /// The hint is translated and clipped like other contributions. It only
+    /// lets a presenter that enables scroll-region acceleration move the
+    /// terminal's existing rows instead of rewriting them; the result on
+    /// screen is the same with or without it, so an inaccurate hint costs
+    /// bytes, never correctness. Of several hints in one frame, the one
+    /// covering the most cells is kept.
+    pub fn hint_scroll(&mut self, area: LocalRect, rows: i64) {
+        if let Some(area) = self.project_rect(area) {
+            self.frame.hint_scroll(area, rows);
+        }
+    }
+
     /// Register a local interaction region after translation and clipping.
     pub fn push_hit(&mut self, mut region: HitRegion) {
         let Some(area) = self.project_rect(LocalRect::terminal(region.area)) else {

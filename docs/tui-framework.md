@@ -951,6 +951,18 @@ Source order equals index order. The construction contract is:
 - Retained layouts of removed keys are released in amortized batches once
   their number exceeds the collection length (minimum 64), so retained memory
   tracks the collection.
+- `VirtualSourceList::prepare_rows(rows, state, cx)` (and
+  `VirtualListComponent::prepare_around(before, after, cx)`, relative to the
+  last resolved viewport) give the items intersecting those collection rows
+  exact retained layouts at the synchronized width, building only stale items.
+  Call it outside the frame path, for example while idle after a presentation,
+  so a scroll or page reveals items without building them in its frame. It
+  does nothing before the first synchronization or while noted changes are
+  pending, and render statistics keep describing the last layout.
+- Painting reports how far the rows below the pinned headers moved since the
+  last paint at the same terminal rows (`PaintCx::hint_scroll`), so a
+  presenter with scroll-region acceleration moves them instead of rewriting
+  them.
 
 `VirtualSourceList` is the shared measurement, painting, and event
 implementation. The eager `VirtualList` builder implements `VirtualItemSource`
@@ -1690,6 +1702,19 @@ shift is only an output hint.
   or new frame. Otherwise it falls back to the cell diff. `Auto` assumes the
   presentation area spans the terminal's full width (full-screen presenters);
   narrower surfaces keep the default `Off`.
+- Components may also report a scroll while painting with
+  `PaintCx::hint_scroll(area, rows)` (virtual lists do so for their scrolled
+  rows); the frame keeps the hint covering the most cells. Unlike declared
+  scroll damage, a hint keeps full-repaint semantics and is only an estimate:
+  `Auto` evaluates the cells left to rewrite with and without the scroll and
+  scrolls only when that saves cells. A hint narrower than the presentation
+  scrolls its full rows when the columns beside it repeat or are cheap to
+  rewrite. `ScrollRegionAcceleration::AutoWithMargins` may also scroll only
+  the hint's columns with left/right margins (DEC private mode 69 with
+  DECSLRM), unless a wide grapheme crosses a margin; select it only for
+  terminals known to implement the mode, as detected by
+  `TerminalCapabilities::left_right_margins`, because other terminals misread
+  the margin sequence.
 - `Terminal::committed_damage` reports the effective damage of the last draw
   (after promotion to `Full` for the first frame, resets and resizes) and
   `Terminal::applied_scroll` the scroll it emitted, if any.

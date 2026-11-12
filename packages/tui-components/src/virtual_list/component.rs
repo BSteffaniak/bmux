@@ -176,6 +176,14 @@ pub(super) struct LayoutSnapshot {
     sticky_rows: u64,
 }
 
+/// The terminal rows a list's scrolled items were painted into, and the
+/// collection row on the first of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct PaintedRows {
+    area: Rect,
+    top: u64,
+}
+
 impl LayoutSnapshot {
     /// Rows of the content viewport hidden from scrolled items.
     fn occluded(&self) -> u16 {
@@ -611,6 +619,24 @@ where
         )
     }
 
+    /// Give the items within `before` rows above and `after` rows below the
+    /// last resolved viewport exact retained layouts, so a scroll or page
+    /// that reveals them paints without measuring them in its frame (see
+    /// [`VirtualSourceList::prepare_rows`]). Returns the number of items
+    /// measured; 0 before the first layout.
+    pub fn prepare_around(&self, before: u64, after: u64, cx: &mut LayoutCx) -> usize {
+        let mut state = self.state.borrow_mut();
+        let Some(resolved) = state.resolved() else {
+            return 0;
+        };
+        let rows = resolved.top_offset.saturating_sub(before)
+            ..resolved
+                .top_offset
+                .saturating_add(resolved.viewport_height)
+                .saturating_add(after);
+        self.list().prepare_rows(rows, &mut state, cx)
+    }
+
     /// Stable identity of one item's wrapper node (also its hit, focus, and
     /// semantic identifier, including while the item is a pinned header).
     #[must_use]
@@ -903,6 +929,46 @@ where
                 );
             }
         }
+    }
+
+    /// Report how far the rows below the pinned headers scrolled since the
+    /// last paint at the same terminal rows, so a presenter with scroll-region
+    /// acceleration can move them instead of rewriting them (see
+    /// [`PaintCx::hint_scroll`]).
+    fn hint_scroll(
+        state: &VirtualListState<K, S>,
+        snapshot: &LayoutSnapshot,
+        area: Rect,
+        cx: &mut PaintCx<'_, '_>,
+    ) {
+        let sticky = u16::try_from(snapshot.sticky_rows).unwrap_or(u16::MAX);
+        let rows = LocalRect::new(
+            i32::from(area.x),
+            i64::from(area.y).saturating_add(i64::from(sticky)),
+            area.width,
+            area.height.saturating_sub(sticky),
+        );
+        let painted = cx.project_raster_rect(rows).map(|projected| PaintedRows {
+            area: projected,
+            top: snapshot
+                .resolved
+                .top_offset
+                .saturating_add(snapshot.sticky_rows),
+        });
+        let mut last = state
+            .painted
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let (Some(previous), Some(current)) = (*last, painted)
+            && previous.area == current.area
+            && previous.top != current.top
+        {
+            let shift = i64::try_from(current.top)
+                .unwrap_or(i64::MAX)
+                .saturating_sub(i64::try_from(previous.top).unwrap_or(i64::MAX));
+            cx.hint_scroll(rows, shift);
+        }
+        *last = painted;
     }
 
     /// Hash a scrollbar mark's resolved rows and presentation.
@@ -1292,6 +1358,7 @@ where
         // Items paint while the state is borrowed immutably, so their retained
         // layouts are borrowed rather than copied.
         let state = self.state.borrow();
+        Self::hint_scroll(&state, &snapshot, area, cx);
         let content = snapshot.content;
         let base = Rect::new(0, 0, content.width, content.height);
         let width = u64::from(content.width);

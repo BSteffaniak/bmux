@@ -3,8 +3,7 @@
 use std::io::{self, Write};
 
 use crate::ansi::{
-    AnsiFrameDiffStats, write_ansi_frame_diff_with_color_depth,
-    write_ansi_frame_scroll_diff_with_color_depth, write_ansi_frame_with_color_depth,
+    AnsiFrameDiffStats, write_ansi_frame_diff_with_color_depth, write_ansi_frame_with_color_depth,
 };
 use crate::buffer::Buffer;
 use crate::capabilities::TerminalColorDepth;
@@ -61,33 +60,50 @@ impl From<AnsiFrameDiffStats> for DrawStats {
 
 /// Whether presentation may move rows with terminal scroll regions.
 ///
-/// Scroll acceleration applies to frames prepared with
-/// [`Damage::Scroll`]. It changes only the bytes written, never the visible
-/// result: the remaining cells are diffed against a model of the scrolled
-/// screen.
+/// Scroll acceleration applies to frames prepared with [`Damage::Scroll`] and
+/// to frames whose components reported a scroll while painting
+/// ([`crate::paint::PaintCx::hint_scroll`]). It changes only the bytes
+/// written, never the visible result: the remaining cells are diffed against
+/// a model of the scrolled screen.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub enum ScrollRegionAcceleration {
     /// Always repaint changed cells; never emit scroll regions.
     #[default]
     Off,
-    /// Emit a scroll region (DECSTBM with SU/SD) for scroll damage when it is
-    /// safe, and fall back to the cell diff otherwise.
+    /// Emit a scroll region (DECSTBM with SU/SD) when it is safe, and fall
+    /// back to the cell diff otherwise.
     ///
     /// It is safe when a committed frame is retained and is not being
-    /// repainted, the frame has no local grid fragments, the scrolled region
-    /// spans the full presentation width, the shift is smaller than the
-    /// region, and neither the committed nor the new frame has image
+    /// repainted, the frame has no local grid fragments, the shift is smaller
+    /// than the region, and neither the committed nor the new frame has image
     /// placements (graphics protocols do not scroll with text consistently).
-    /// The presentation area must span the terminal's full width, as it does
-    /// for full-screen presenters; surfaces narrower than the terminal must
-    /// keep this `Off`.
+    /// Declared [`Damage::Scroll`] must span the full presentation width. A
+    /// painted scroll hint narrower than the presentation scrolls its full
+    /// rows instead when that leaves fewer cells to rewrite than not
+    /// scrolling (for example when the columns beside it are blank or
+    /// repeat on every row). The presentation area must span the terminal's
+    /// full width, as it does for full-screen presenters; surfaces narrower
+    /// than the terminal must keep this `Off`.
     Auto,
+    /// [`Self::Auto`], and a painted scroll hint narrower than the
+    /// presentation may also scroll only its own columns with left/right
+    /// margins (DEC private mode 69, DECSLRM), whichever leaves the fewest
+    /// cells to rewrite. Select it only for terminals known to implement
+    /// left/right margin mode (see
+    /// [`crate::capabilities::TerminalCapabilities::left_right_margins`]):
+    /// elsewhere the margin sequence is misread and the screen is corrupted.
+    AutoWithMargins,
 }
+
+/// Rewritten cells a scroll must save before it is emitted, covering the
+/// scroll sequence itself.
+const SCROLL_MIN_SAVED_CELLS: usize = 16;
 
 /// A terminal scroll that moved committed rows during the last draw.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AppliedScroll {
-    /// Full-width rows that moved.
+    /// Cells that moved: full-width rows, or the columns inside left/right
+    /// margins under [`ScrollRegionAcceleration::AutoWithMargins`].
     pub region: Rect,
     /// Signed rows moved; positive moves content toward row 0.
     pub rows: i64,
@@ -101,6 +117,7 @@ fn encode_frame(
     prepared: &PreparedPresentation,
     depth: TerminalColorDepth,
     scroll: Option<AppliedScroll>,
+    model: &mut Buffer,
 ) -> io::Result<(DrawStats, Option<AppliedScroll>)> {
     let Some(previous) = previous else {
         write_ansi_frame_with_color_depth(encoded, prepared.buffer(), prepared.cursor(), depth)?;
@@ -116,14 +133,18 @@ fn encode_frame(
         )?;
         return Ok((stats.into(), None));
     };
-    let stats = write_ansi_frame_scroll_diff_with_color_depth(
+    let stats = crate::ansi::scroll_diff(
         encoded,
-        previous,
-        prepared.buffer(),
-        prepared.cursor(),
-        depth,
+        crate::ansi::ScrollFrames {
+            previous,
+            current: prepared.buffer(),
+            cursor: prepared.cursor(),
+            depth,
+        },
         scroll.region,
         scroll.rows,
+        true,
+        model,
     )?;
     Ok((stats.diff.into(), stats.scrolled.then_some(scroll)))
 }
@@ -138,6 +159,8 @@ pub struct Terminal<W> {
     /// write however small its pieces (unbuffered or line-buffered writers
     /// such as `Stdout` would otherwise make many system calls per frame).
     encoded: Vec<u8>,
+    /// Reused model of the screen after a terminal scroll, diffed against the next frame.
+    scroll_model: Buffer,
     state: PresentationState,
     pointer_output: PointerOutput,
     pointer_capability: PointerShapeCapability,
@@ -156,6 +179,7 @@ impl<W: Write> Terminal<W> {
         Self {
             writer,
             encoded: Vec::new(),
+            scroll_model: Buffer::empty(Rect::new(0, 0, 0, 0)),
             state: PresentationState::new(area),
             pointer_output: PointerOutput::new(
                 bmux_terminal_protocol::pointer_output::tmux_passthrough_enabled(),
@@ -177,7 +201,37 @@ impl<W: Write> Terminal<W> {
         Terminal {
             writer,
             encoded: Vec::new(),
+            scroll_model: Buffer::empty(Rect::new(0, 0, 0, 0)),
             state: self.state.clone(),
+            pointer_output: self.pointer_output.clone(),
+            pointer_capability: self.pointer_capability,
+            pointer_position: self.pointer_position,
+            pointer_context: self.pointer_context.clone(),
+            color_depth: self.color_depth,
+            scroll_acceleration: self.scroll_acceleration,
+            committed_damage: self.committed_damage.clone(),
+            applied_scroll: self.applied_scroll,
+        }
+    }
+
+    /// Move committed authority into a staging terminal with a different
+    /// writer, like [`Self::fork`] but taking over the retained cells instead
+    /// of copying them (see [`PresentationState::stage`]).
+    ///
+    /// Until the staging terminal is acknowledged ([`Self::acknowledge`]),
+    /// this terminal keeps its interactions and focus but no retained cells,
+    /// so it would repaint fully; a failed delivery is handled with
+    /// [`Self::invalidate_after_failed_delivery`] as for a fork.
+    #[must_use]
+    pub fn stage<V: Write>(&mut self, writer: V) -> Terminal<V> {
+        Terminal {
+            writer,
+            encoded: Vec::new(),
+            scroll_model: std::mem::replace(
+                &mut self.scroll_model,
+                Buffer::empty(Rect::new(0, 0, 0, 0)),
+            ),
+            state: self.state.stage(),
             pointer_output: self.pointer_output.clone(),
             pointer_capability: self.pointer_capability,
             pointer_position: self.pointer_position,
@@ -191,6 +245,7 @@ impl<W: Write> Terminal<W> {
 
     /// Adopt an exactly delivered staging terminal's authority, retaining this writer.
     pub fn acknowledge<V>(&mut self, staged: Terminal<V>) {
+        self.scroll_model = staged.scroll_model;
         self.state = staged.state;
         self.pointer_output = staged.pointer_output;
         self.committed_damage = staged.committed_damage;
@@ -568,6 +623,7 @@ impl<W: Write> Terminal<W> {
         }
         let writer = &mut self.writer;
         let encoded = &mut self.encoded;
+        let scroll_model = &mut self.scroll_model;
         let depth = self.color_depth;
         let mut applied = None;
         let result = self
@@ -601,6 +657,7 @@ impl<W: Write> Terminal<W> {
                                     prepared,
                                     depth,
                                     scroll,
+                                    scroll_model,
                                 )?;
                                 applied = scrolled;
                                 Ok(stats)
@@ -641,20 +698,46 @@ impl<W: Write> Terminal<W> {
     /// The scroll to emit for `prepared` under the selected acceleration, when
     /// every safety condition holds (see [`ScrollRegionAcceleration::Auto`]).
     fn scroll_plan(&self, prepared: &PreparedPresentation) -> Option<AppliedScroll> {
-        if self.scroll_acceleration != ScrollRegionAcceleration::Auto {
+        if self.scroll_acceleration == ScrollRegionAcceleration::Off {
             return None;
         }
-        let (region, rows) = prepared.damage().scroll_shift()?;
+        let previous = self.state.retained_buffer()?;
         let area = prepared.buffer().area();
-        let safe = self.state.retained_buffer().is_some()
+        let declared = prepared.damage().scroll_shift();
+        let (region, rows) = declared.or_else(|| prepared.scroll_hint())?;
+        let safe = previous.area() == area
+            && area.intersection(region) == region
             && prepared.grid_fragments().is_empty()
-            && region.x == area.x
-            && region.width == area.width
             && rows != 0
             && rows.unsigned_abs() < u64::from(region.height)
             && prepared.image_scene().placements().len() == 0
             && self.state.image_scene().placements().len() == 0;
-        safe.then_some(AppliedScroll { region, rows })
+        if !safe {
+            return None;
+        }
+        let full = Rect::new(area.x, region.y, area.width, region.height);
+        if declared.is_some() {
+            // Declared scroll damage keeps its contract: full-width regions only.
+            return (region == full).then_some(AppliedScroll { region, rows });
+        }
+        // A hint is an estimate: scroll only when it leaves fewer cells to rewrite.
+        let current = prepared.buffer();
+        let unscrolled = previous.band_changes(current, full, 0);
+        let mut best = (
+            previous.band_changes(current, full, rows),
+            AppliedScroll { region: full, rows },
+        );
+        if region != full
+            && self.scroll_acceleration == ScrollRegionAcceleration::AutoWithMargins
+            && previous.band_has_clean_margins(region)
+        {
+            let margins = unscrolled - previous.band_changes(current, region, 0)
+                + previous.band_changes(current, region, rows);
+            if margins < best.0 {
+                best = (margins, AppliedScroll { region, rows });
+            }
+        }
+        (best.0 + SCROLL_MIN_SAVED_CELLS <= unscrolled).then_some(best.1)
     }
 
     /// Return a reference to the backend writer.
@@ -697,20 +780,27 @@ impl<W: Write> Terminal<W> {
     }
 }
 
-/// Linux output owner opened independently from stdin/stdout.
+/// Terminal output owner opened independently from stdin/stdout.
+///
 /// Uses nonblocking writes and at most 10ms poll waits, so cancellation never
-/// waits for a terminal consumer to drain. Dropping does not flush.
-#[cfg(target_os = "linux")]
-pub struct LinuxTerminalOutput(std::fs::File);
+/// waits for a terminal consumer to drain. Dropping does not flush. The descriptor is a separate open of stdout's terminal device, so its
+/// nonblocking flag never affects stdout, stdin, or other processes sharing
+/// the terminal.
+#[cfg(unix)]
+pub struct TtyOutput(std::fs::File);
 
+/// The Linux name of [`TtyOutput`].
 #[cfg(target_os = "linux")]
-impl LinuxTerminalOutput {
+pub type LinuxTerminalOutput = TtyOutput;
+
+#[cfg(unix)]
+impl TtyOutput {
     /// Reopen the actual stdout tty with independent nonblocking flags.
     ///
     /// Does not use `/dev/tty`, which can differ from redirected stdout.
     /// # Errors
     /// Returns `Unsupported` for non-tty stdout or identity mismatch; otherwise
-    /// returns the procfs reopen/metadata error. No shared descriptor flags change.
+    /// returns the reopen/metadata error. No shared descriptor flags change.
     pub fn open() -> io::Result<Self> {
         Self::reopen_tty(libc::STDOUT_FILENO)
     }
@@ -727,16 +817,16 @@ impl LinuxTerminalOutput {
                 "stdout is not a tty",
             ));
         }
-        let source = std::fs::metadata(format!("/proc/self/fd/{fd}"))?;
+        let path = Self::device_path(fd)?;
+        let source = Self::identity(fd)?;
         let file = std::fs::OpenOptions::new()
             .write(true)
             .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
-            .open(format!("/proc/self/fd/{fd}"))?;
+            .open(&path)?;
         let reopened = file.metadata()?;
         // SAFETY: file owns a live descriptor for this entire call.
         if unsafe { libc::isatty(file.as_raw_fd()) } != 1
-            || (source.dev(), source.ino(), source.rdev())
-                != (reopened.dev(), reopened.ino(), reopened.rdev())
+            || source != (reopened.dev(), reopened.ino(), reopened.rdev())
         {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -744,6 +834,43 @@ impl LinuxTerminalOutput {
             ));
         }
         Ok(Self(file))
+    }
+
+    /// A path that opens the terminal device behind `fd` anew.
+    #[cfg(target_os = "linux")]
+    fn device_path(fd: std::os::fd::RawFd) -> io::Result<std::path::PathBuf> {
+        Ok(format!("/proc/self/fd/{fd}").into())
+    }
+
+    /// A path that opens the terminal device behind `fd` anew.
+    #[cfg(not(target_os = "linux"))]
+    fn device_path(fd: std::os::fd::RawFd) -> io::Result<std::path::PathBuf> {
+        use std::os::unix::ffi::OsStrExt;
+        let mut name = [0 as libc::c_char; 256];
+        // SAFETY: the buffer and its length describe writable memory owned here.
+        let result = unsafe { libc::ttyname_r(fd, name.as_mut_ptr(), name.len()) };
+        if result != 0 {
+            return Err(io::Error::from_raw_os_error(result));
+        }
+        // SAFETY: a successful ttyname_r wrote a NUL-terminated path into the buffer.
+        let name = unsafe { std::ffi::CStr::from_ptr(name.as_ptr()) };
+        Ok(std::ffi::OsStr::from_bytes(name.to_bytes()).into())
+    }
+
+    /// Device, inode, and represented device of the file behind `fd`.
+    fn identity(fd: std::os::fd::RawFd) -> io::Result<(u64, u64, u64)> {
+        // SAFETY: zeroed stat is a valid out-parameter for fstat.
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: fstat writes into the owned stat for a caller-provided descriptor.
+        if unsafe { libc::fstat(fd, &raw mut stat) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        #[allow(
+            clippy::unnecessary_cast,
+            clippy::cast_sign_loss,
+            reason = "stat field widths and signedness differ between platforms"
+        )]
+        Ok((stat.st_dev as u64, stat.st_ino as u64, stat.st_rdev as u64))
     }
 
     /// Deliver a complete terminal transaction with bounded cancellation latency.
@@ -856,10 +983,38 @@ mod tests {
         assert_eq!(terminal.writer().as_slice(), []);
     }
 
-    #[cfg(target_os = "linux")]
+    #[test]
+    fn staged_frames_move_retained_cells_and_hand_them_back_on_acknowledge() {
+        let area = Rect::new(0, 0, 4, 1);
+        let mut terminal = Terminal::new(Vec::new(), area);
+        let text = |text: &'static str| {
+            move |cx: &mut PaintCx<'_, '_>| {
+                cx.write_line(LocalRect::new(0, 0, 4, 1), &crate::text::Line::raw(text));
+            }
+        };
+        terminal.draw(text("abcd")).unwrap();
+        let mut staged = terminal.stage(Vec::new());
+        assert!(terminal.state.retained_buffer().is_none());
+        let stats = staged.draw(text("abce")).unwrap();
+        assert!(
+            !stats.full_repaint,
+            "the staged frame diffs against the moved cells"
+        );
+        assert_eq!(stats.changed_cells, 1);
+        terminal.acknowledge(staged);
+        let stats = terminal.draw(text("abcf")).unwrap();
+        assert!(!stats.full_repaint);
+        assert_eq!(stats.changed_cells, 1);
+
+        let staged = terminal.stage(Vec::new());
+        terminal.invalidate_after_failed_delivery(&staged);
+        assert!(terminal.draw(text("abcf")).unwrap().full_repaint);
+    }
+
+    #[cfg(unix)]
     #[test]
     fn stdout_reopen_rejects_redirects_and_preserves_tty_flags() {
-        use super::LinuxTerminalOutput;
+        use super::TtyOutput as LinuxTerminalOutput;
         use std::os::fd::{AsRawFd, FromRawFd};
         let regular = std::fs::File::open("/dev/null").unwrap();
         assert!(
@@ -874,8 +1029,8 @@ mod tests {
                     &raw mut master,
                     &raw mut slave,
                     std::ptr::null_mut(),
-                    std::ptr::null(),
-                    std::ptr::null(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
                 )
             },
             0
@@ -899,10 +1054,10 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     #[test]
     fn nonblocking_tty_backpressure_is_cancellable_without_drain() {
-        use super::LinuxTerminalOutput;
+        use super::TtyOutput as LinuxTerminalOutput;
         use std::os::fd::{AsRawFd, FromRawFd};
         use std::sync::{
             Arc,
@@ -917,8 +1072,8 @@ mod tests {
                     &raw mut master,
                     &raw mut slave,
                     std::ptr::null_mut(),
-                    std::ptr::null(),
-                    std::ptr::null(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
                 )
             },
             0

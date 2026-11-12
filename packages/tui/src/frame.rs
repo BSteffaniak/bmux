@@ -73,6 +73,7 @@ pub struct Frame<'buffer> {
     selection: SelectionScene,
     semantics: SemanticScene,
     damage: Vec<Rect>,
+    scroll_hint: Option<(Rect, i64)>,
     metadata_availability: Vec<SurfaceMetadataAvailability>,
     clock: Option<crate::clock::PresentationClock>,
 }
@@ -138,6 +139,7 @@ impl<'buffer> Frame<'buffer> {
             selection: SelectionScene::new(),
             semantics: SemanticScene::new(),
             damage: Vec::new(),
+            scroll_hint: None,
             metadata_availability: Vec::new(),
             clock: None,
         }
@@ -229,6 +231,14 @@ impl<'buffer> Frame<'buffer> {
         Damage::regions(self.damage.iter().copied(), self.area(), policy)
     }
 
+    /// The largest scroll a component reported for this frame (see
+    /// [`crate::paint::PaintCx::hint_scroll`]): terminal rows whose content
+    /// moved by the signed row count relative to the previous frame.
+    #[must_use]
+    pub const fn scroll_hint(&self) -> Option<(Rect, i64)> {
+        self.scroll_hint
+    }
+
     // Every mutator below is reachable only through `crate::paint::PaintCx`,
     // which translates and clips each contribution before staging it here.
 
@@ -289,6 +299,19 @@ impl<'buffer> Frame<'buffer> {
 
     pub(crate) fn push_semantic(&mut self, region: SemanticRegion) {
         self.semantics.push(region);
+    }
+
+    /// Keep the scroll hint covering the most cells.
+    pub(crate) fn hint_scroll(&mut self, area: Rect, rows: i64) {
+        let cells = |area: Rect| u32::from(area.width) * u32::from(area.height);
+        if rows != 0
+            && rows.unsigned_abs() < u64::from(area.height)
+            && self
+                .scroll_hint
+                .is_none_or(|(current, _)| cells(area) > cells(current))
+        {
+            self.scroll_hint = Some((area, rows));
+        }
     }
 
     pub(crate) fn push_damage(&mut self, area: Rect) {

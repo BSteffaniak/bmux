@@ -74,6 +74,41 @@ impl TerminalCapabilities {
     }
 }
 
+impl TerminalCapabilities {
+    /// Whether the terminal is known to implement left/right margin mode
+    /// (DEC private mode 69 with DECSLRM), detected from the current process
+    /// environment. See [`Self::left_right_margins_with`].
+    #[must_use]
+    pub fn left_right_margins() -> bool {
+        Self::left_right_margins_with(|name| std::env::var(name).ok())
+    }
+
+    /// Whether the terminal is known to implement left/right margin mode,
+    /// detected from an explicit environment lookup.
+    ///
+    /// Terminals that do not implement the mode misread its sequences, so
+    /// this is a conservative allowlist: true only for terminals identified
+    /// directly (iTerm2 and Ghostty through `TERM_PROGRAM`, Ghostty through
+    /// `TERM`, xterm through `XTERM_VERSION`) and never inside a multiplexer
+    /// (`TMUX`, `STY`, or a `screen`/`tmux` `TERM`), which presents its own
+    /// screen to the application.
+    #[must_use]
+    pub fn left_right_margins_with(mut value: impl FnMut(&str) -> Option<String>) -> bool {
+        let term = value("TERM").unwrap_or_default().to_ascii_lowercase();
+        if value("TMUX").is_some()
+            || value("STY").is_some()
+            || term.starts_with("screen")
+            || term.starts_with("tmux")
+        {
+            return false;
+        }
+        let program = value("TERM_PROGRAM").unwrap_or_default();
+        matches!(program.as_str(), "iTerm.app" | "ghostty")
+            || term == "xterm-ghostty"
+            || value("XTERM_VERSION").is_some()
+    }
+}
+
 fn parse_colorfgbg_background(value: &str) -> Option<TerminalBackground> {
     let index = value.rsplit(';').next()?.trim().parse::<u8>().ok()?;
     Some(if index <= 6 || index == 8 {
@@ -244,6 +279,33 @@ mod tests {
                 color_depth: TerminalColorDepth::Monochrome,
             }
         );
+    }
+
+    #[test]
+    fn left_right_margins_are_detected_only_for_known_terminals_outside_multiplexers() {
+        let margins = |values: &[(&str, &str)]| {
+            let values = values
+                .iter()
+                .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+                .collect::<BTreeMap<_, _>>();
+            TerminalCapabilities::left_right_margins_with(|name| values.get(name).cloned())
+        };
+        assert!(margins(&[("TERM_PROGRAM", "iTerm.app")]));
+        assert!(margins(&[("TERM", "xterm-ghostty")]));
+        assert!(margins(&[
+            ("TERM", "xterm-256color"),
+            ("XTERM_VERSION", "XTerm(390)")
+        ]));
+        assert!(!margins(&[("TERM_PROGRAM", "Apple_Terminal")]));
+        assert!(!margins(&[("TERM", "xterm-256color")]));
+        assert!(!margins(&[
+            ("TERM_PROGRAM", "iTerm.app"),
+            ("TMUX", "/tmp/tmux,1,0")
+        ]));
+        assert!(!margins(&[
+            ("TERM_PROGRAM", "iTerm.app"),
+            ("TERM", "screen-256color")
+        ]));
     }
 
     #[test]

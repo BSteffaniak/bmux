@@ -384,8 +384,16 @@ where
         if self.pending.is_some() {
             return Err(io::Error::other("presentation already in flight"));
         }
-        let mut candidate = self.terminal.fork(Vec::new());
-        let stats = candidate.draw(|cx| (self.render)(program, cx))?;
+        // The candidate takes over the retained cells (no copy); a successful delivery hands
+        // them back with the new frame, and a failed one repaints fully either way.
+        let mut candidate = self.terminal.stage(Vec::new());
+        let stats = match candidate.draw(|cx| (self.render)(program, cx)) {
+            Ok(stats) => stats,
+            Err(error) => {
+                self.terminal.invalidate_after_failed_delivery(&candidate);
+                return Err(error);
+            }
+        };
         let mut bytes = b"\x18\x1b\\\x1b[?2026l".to_vec();
         bytes.extend(std::mem::take(candidate.writer_mut()));
         let delivery = crate::presenter::Delivery::start(&mut self.output, bytes)?;

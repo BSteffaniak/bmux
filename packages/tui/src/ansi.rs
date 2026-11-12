@@ -246,34 +246,134 @@ pub fn write_ansi_frame_scroll_diff_with_color_depth(
     region: crate::geometry::Rect,
     rows: i64,
 ) -> io::Result<AnsiScrollDiffStats> {
+    let mut model = Buffer::empty(crate::geometry::Rect::new(0, 0, 0, 0));
+    scroll_diff(
+        writer,
+        ScrollFrames {
+            previous,
+            current,
+            cursor,
+            depth,
+        },
+        region,
+        rows,
+        false,
+        &mut model,
+    )
+}
+
+/// Write the changes from `previous` to `current` after moving the cells of
+/// `region` by `rows` inside left/right margins.
+///
+/// The scroll uses DECLRMM with DECSLRM, DECSTBM, and SU/SD, leaving the
+/// columns outside `region` untouched. Like [`write_ansi_frame_scroll_diff_with_color_depth`], the cells are then
+/// diffed against a model of the scrolled screen, so the visible result is
+/// exactly `current`. Only terminals that implement left/right margin mode
+/// (DEC private mode 69) may receive this: elsewhere the margin sequence is
+/// misread and the scroll moves whole rows, which the model does not expect.
+///
+/// The scroll is emitted only when it is expressible: equal buffer areas,
+/// `region` inside the area, `0 < |rows| < region.height`, and no wide
+/// grapheme of `previous` straddling either margin within the region's rows.
+/// Otherwise this falls back to the plain diff and reports
+/// `scrolled = false`.
+///
+/// # Errors
+///
+/// Returns any I/O error reported by `writer`.
+pub fn write_ansi_frame_margin_scroll_diff_with_color_depth(
+    writer: &mut impl Write,
+    previous: &Buffer,
+    current: &Buffer,
+    cursor: Option<Cursor>,
+    depth: TerminalColorDepth,
+    region: crate::geometry::Rect,
+    rows: i64,
+) -> io::Result<AnsiScrollDiffStats> {
+    let mut model = Buffer::empty(crate::geometry::Rect::new(0, 0, 0, 0));
+    scroll_diff(
+        writer,
+        ScrollFrames {
+            previous,
+            current,
+            cursor,
+            depth,
+        },
+        region,
+        rows,
+        true,
+        &mut model,
+    )
+}
+
+/// The frames one scroll diff compares, and the cursor it ends with.
+#[derive(Clone, Copy)]
+pub(crate) struct ScrollFrames<'a> {
+    pub(crate) previous: &'a Buffer,
+    pub(crate) current: &'a Buffer,
+    pub(crate) cursor: Option<Cursor>,
+    pub(crate) depth: TerminalColorDepth,
+}
+
+/// Move the terminal's cells of `region` by `rows` (full rows, or inside left/right margins
+/// when `margins`), then diff `current` against that model of the scrolled screen, built in
+/// the caller's reusable `model` (overwritten in place, so a retained model costs no
+/// allocation). Falls back to the plain diff, reporting `scrolled = false`, when the scroll is
+/// not expressible (see the public scroll diff functions).
+pub(crate) fn scroll_diff(
+    writer: &mut impl Write,
+    frames: ScrollFrames<'_>,
+    region: crate::geometry::Rect,
+    rows: i64,
+    margins: bool,
+    model: &mut Buffer,
+) -> io::Result<AnsiScrollDiffStats> {
+    let ScrollFrames {
+        previous,
+        current,
+        cursor,
+        depth,
+    } = frames;
     let area = current.area();
+    let full_width = region.x == area.x && region.width == area.width;
     let expressible = previous.area() == area
-        && region.x == area.x
-        && region.width == area.width
-        && region.y >= area.y
-        && region.bottom() <= area.bottom()
+        && area.intersection(region) == region
+        && !region.is_empty()
         && rows != 0
-        && rows.unsigned_abs() < u64::from(region.height);
+        && rows.unsigned_abs() < u64::from(region.height)
+        && (full_width || (margins && previous.band_has_clean_margins(region)));
     if !expressible {
         return Ok(AnsiScrollDiffStats {
             diff: write_ansi_frame_diff_with_color_depth(writer, previous, current, cursor, depth)?,
             scrolled: false,
         });
     }
-    // Reset attributes first so the rows the terminal exposes are erased with
-    // the default background, which is what the screen model below assumes.
-    write!(
-        writer,
-        "\x1b[?25l\x1b[0m\x1b[{};{}r\x1b[{}{}\x1b[r",
-        u32::from(region.y) + 1,
-        u32::from(region.bottom()),
-        rows.unsigned_abs(),
-        if rows > 0 { 'S' } else { 'T' },
-    )?;
-    let mut scrolled = previous.clone();
-    scrolled.shift_rows(region, rows);
+    let command = if rows > 0 { 'S' } else { 'T' };
+    // Reset attributes first so the cells the terminal exposes are erased with
+    // the default background, which is what the screen model assumes.
+    if full_width {
+        write!(
+            writer,
+            "\x1b[?25l\x1b[0m\x1b[{};{}r\x1b[{}{command}\x1b[r",
+            u32::from(region.y) + 1,
+            u32::from(region.bottom()),
+            rows.unsigned_abs(),
+        )?;
+    } else {
+        write!(
+            writer,
+            "\x1b[?25l\x1b[0m\x1b[?69h\x1b[{};{}s\x1b[{};{}r\x1b[{}{command}\x1b[r\x1b[s\x1b[?69l",
+            u32::from(region.x) + 1,
+            u32::from(region.right()),
+            u32::from(region.y) + 1,
+            u32::from(region.bottom()),
+            rows.unsigned_abs(),
+        )?;
+    }
+    model.clone_from(previous);
+    model.shift_band(region, rows);
     Ok(AnsiScrollDiffStats {
-        diff: write_ansi_cells_diff(writer, &scrolled, current, cursor, depth)?,
+        diff: write_ansi_cells_diff(writer, model, current, cursor, depth)?,
         scrolled: true,
     })
 }

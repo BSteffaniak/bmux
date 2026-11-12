@@ -119,6 +119,7 @@ struct Painted {
     rows: Vec<String>,
     hits: Vec<(String, Rect, HitRole)>,
     semantics: Vec<(String, Rect)>,
+    scroll_hint: Option<(Rect, i64)>,
 }
 
 fn paint(component: &impl Component, layout: &LayoutNode) -> Painted {
@@ -146,6 +147,7 @@ fn paint(component: &impl Component, layout: &LayoutNode) -> Painted {
         rows,
         hits,
         semantics,
+        scroll_hint: frame.scroll_hint(),
     }
 }
 
@@ -698,6 +700,104 @@ fn lazy_sources_construct_only_inserted_and_visible_items() {
     let tree = layout(&component, 12, 6);
     paint(&component, &tree);
     assert_eq!(cards.builds.get(), 3);
+}
+
+/// Cards whose heights are known without constructing them.
+struct HintedCards(Cards);
+
+impl VirtualItemSource<u64> for HintedCards {
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    fn key(&self, index: usize) -> u64 {
+        self.0.key(index)
+    }
+
+    fn layout_revision(&self, index: usize) -> u64 {
+        self.0.layout_revision(index)
+    }
+
+    fn build(&self, index: usize) -> Element<'_> {
+        self.0.build(index)
+    }
+
+    fn measure_hint(
+        &self,
+        index: usize,
+        _width: u64,
+        _environment: bmux_tui::component::LayoutEnvironment,
+    ) -> Option<u64> {
+        Some(self.0.items[index].1)
+    }
+}
+
+#[test]
+fn rows_prepared_ahead_scroll_into_view_without_being_measured() {
+    let cards = HintedCards(Cards::uniform(100, 2));
+    let state = RefCell::new(VirtualListState::new(0));
+    let component = VirtualListComponent::new("list", &cards, &state);
+    assert_eq!(
+        component.prepare_around(0, 6, &mut LayoutCx::new()),
+        0,
+        "nothing is prepared before the first layout"
+    );
+    let tree = layout(&component, 12, 6);
+    paint(&component, &tree);
+    cards.0.builds.set(0);
+    assert_eq!(component.prepare_around(0, 6, &mut LayoutCx::new()), 3);
+    assert_eq!(cards.0.builds.get(), 3, "only the next page is built");
+    assert_eq!(
+        component.prepare_around(0, 6, &mut LayoutCx::new()),
+        0,
+        "prepared items are not measured again"
+    );
+    state
+        .borrow_mut()
+        .set_position(ListPosition::Anchored(ListAnchor::top(3)));
+    cards.0.builds.set(0);
+    let tree = layout(&component, 12, 6);
+    assert_eq!(
+        cards.0.builds.get(),
+        0,
+        "the revealed page was measured ahead"
+    );
+    assert_eq!(state.borrow().render_stats().measured_items, 0);
+    let painted = paint(&component, &tree);
+    assert_eq!(&painted.rows[0][..3], "3:0");
+}
+
+#[test]
+fn painting_after_a_scroll_hints_how_far_the_rows_moved() {
+    let cards = Cards::uniform(100, 1);
+    let state = RefCell::new(VirtualListState::new(0));
+    let component = list(&cards, &state);
+    let tree = layout(&component, 12, 6);
+    assert_eq!(
+        paint(&component, &tree).scroll_hint,
+        None,
+        "nothing to compare yet"
+    );
+    let tree = layout(&component, 12, 6);
+    assert_eq!(paint(&component, &tree).scroll_hint, None, "nothing moved");
+    for (top, shift) in [(2, 2), (1, -1)] {
+        state
+            .borrow_mut()
+            .set_position(ListPosition::Anchored(ListAnchor::top(top)));
+        let tree = layout(&component, 12, 6);
+        let painted = paint(&component, &tree);
+        assert_eq!(painted.scroll_hint, Some((Rect::new(0, 0, 12, 6), shift)));
+        assert_eq!(&painted.rows[0][..3], format!("{top}:0"));
+    }
+    state
+        .borrow_mut()
+        .set_position(ListPosition::Anchored(ListAnchor::top(50)));
+    let tree = layout(&component, 12, 6);
+    assert_eq!(
+        paint(&component, &tree).scroll_hint,
+        None,
+        "a jump past the viewport moves no row"
+    );
 }
 
 #[test]

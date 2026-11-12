@@ -17,9 +17,10 @@ const HEIGHT: u16 = 8;
 const BODY: Rect = Rect::new(0, 0, WIDTH, HEIGHT - 1);
 const STATUS: Rect = Rect::new(0, HEIGHT - 1, WIDTH, 1);
 
-/// Minimal VT screen: CUP, SGR, DECSTBM, SU/SD, cursor visibility and
-/// synchronized-output modes. Any other control sequence fails the test, so
-/// the presenter cannot rely on behaviour the model does not check.
+/// Minimal VT screen: CUP, SGR, DECSTBM, left/right margins (DECLRMM with
+/// DECSLRM), SU/SD, cursor visibility and synchronized-output modes. Any
+/// other control sequence fails the test, so the presenter cannot rely on
+/// behaviour the model does not check.
 struct Screen {
     width: u16,
     height: u16,
@@ -30,6 +31,9 @@ struct Screen {
     sgr: String,
     top: u16,
     bottom: u16,
+    margins_mode: bool,
+    left: u16,
+    right: u16,
 }
 
 impl Screen {
@@ -43,6 +47,9 @@ impl Screen {
             sgr: "0".to_owned(),
             top: 0,
             bottom: height,
+            margins_mode: false,
+            left: 0,
+            right: width,
         }
     }
 
@@ -78,6 +85,21 @@ impl Screen {
         };
         match (params, command) {
             ("?25" | "?2026", 'h' | 'l') => {}
+            ("?69", 'h') => self.margins_mode = true,
+            ("?69", 'l') => {
+                self.margins_mode = false;
+                (self.left, self.right) = (0, self.width);
+            }
+            ("", 's') if self.margins_mode => {
+                (self.left, self.right) = (0, self.width);
+                (self.x, self.y) = (0, 0);
+            }
+            (_, 's') if self.margins_mode => {
+                let values = numbers(1);
+                self.left = values[0] - 1;
+                self.right = values[1];
+                (self.x, self.y) = (0, 0);
+            }
             (_, 'm') => self.sgr = if params.is_empty() { "0" } else { params }.to_owned(),
             (_, 'H') => {
                 let values = numbers(1);
@@ -103,15 +125,22 @@ impl Screen {
 
     fn scroll(&mut self, rows: i64) {
         let width = usize::from(self.width);
-        let band = &mut self.cells[usize::from(self.top) * width..usize::from(self.bottom) * width];
-        let moved = (usize::try_from(rows.unsigned_abs()).unwrap() * width).min(band.len());
-        if rows > 0 {
-            band.rotate_left(moved);
-            let start = band.len() - moved;
-            band[start..].fill(blank());
+        let (left, right) = (usize::from(self.left), usize::from(self.right));
+        let band: Vec<usize> = (usize::from(self.top)..usize::from(self.bottom)).collect();
+        let order: Vec<usize> = if rows > 0 {
+            band.clone()
         } else {
-            band.rotate_right(moved);
-            band[..moved].fill(blank());
+            band.iter().rev().copied().collect()
+        };
+        for y in order {
+            let source = i64::try_from(y).unwrap() + rows;
+            let source = usize::try_from(source)
+                .ok()
+                .filter(|source| band.contains(source));
+            for x in left..right {
+                self.cells[y * width + x] =
+                    source.map_or_else(blank, |source| self.cells[source * width + x].clone());
+            }
         }
     }
 
@@ -424,4 +453,178 @@ fn scroll_damage_retains_cells_and_metadata_outside_its_regions() {
             .iter()
             .any(|region| region.id.as_str() == "status")
     );
+}
+
+const SIDEBAR: u16 = 3;
+
+/// A list row whose every cell differs from its neighbours' cells.
+fn list_line(line: i64) -> String {
+    let letter = char::from(b'a' + u8::try_from(line.rem_euclid(26)).unwrap());
+    std::iter::repeat_n(letter, usize::from(LIST.width)).collect()
+}
+/// Body columns beside the sidebar.
+const LIST: Rect = Rect::new(SIDEBAR, 0, WIDTH - SIDEBAR, HEIGHT - 1);
+
+/// One frame with a sidebar: list lines starting at `first` beside sidebar
+/// rows that repeat (`uniform`) or differ per row, reporting the list's shift
+/// since `previous` as a paint-time scroll hint.
+fn paint_with_sidebar(cx: &mut PaintCx<'_, '_>, first: i64, previous: i64, uniform: bool) {
+    for row in 0..i64::from(LIST.height) {
+        let side = if uniform {
+            "|| ".to_owned()
+        } else {
+            format!("{row:02}|")
+        };
+        cx.write_line(LocalRect::new(0, row, SIDEBAR, 1), &Line::raw(side));
+        cx.write_line(
+            LocalRect::new(i32::from(SIDEBAR), row, LIST.width, 1),
+            &Line::raw(list_line(first + row)),
+        );
+    }
+    cx.write_line(
+        LocalRect::new(0, i64::from(STATUS.y), WIDTH, 1),
+        &Line::raw("status".to_owned()),
+    );
+    cx.hint_scroll(
+        LocalRect::new(i32::from(SIDEBAR), 0, LIST.width, LIST.height),
+        first - previous,
+    );
+}
+
+/// Draw `before`, then `after` with a paint-time hint (full damage), replaying
+/// both into a screen model; `expected` replays a full repaint of `after`.
+fn replay_hinted(mode: ScrollRegionAcceleration, before: i64, after: i64, uniform: bool) -> Replay {
+    let mut terminal = terminal(mode);
+    let mut screen = Screen::new(WIDTH, HEIGHT);
+    terminal
+        .draw(|cx| paint_with_sidebar(cx, before, before, uniform))
+        .unwrap();
+    screen.feed(terminal.writer());
+    terminal.writer_mut().clear();
+    let stats = terminal
+        .draw(|cx| paint_with_sidebar(cx, after, before, uniform))
+        .unwrap();
+    let output = terminal.writer().clone();
+    screen.feed(&output);
+    let mut reference = self::terminal(ScrollRegionAcceleration::Off);
+    reference
+        .draw(|cx| paint_with_sidebar(cx, after, after, uniform))
+        .unwrap();
+    let mut expected = Screen::new(WIDTH, HEIGHT);
+    expected.feed(reference.writer());
+    Replay {
+        screen,
+        expected,
+        output,
+        stats,
+        applied: terminal.applied_scroll(),
+    }
+}
+
+#[test]
+fn painted_scroll_hints_match_a_full_repaint_in_every_mode() {
+    let height = i64::from(LIST.height);
+    for mode in [
+        ScrollRegionAcceleration::Off,
+        ScrollRegionAcceleration::Auto,
+        ScrollRegionAcceleration::AutoWithMargins,
+    ] {
+        for uniform in [false, true] {
+            for rows in (1 - height)..height {
+                let replay = replay_hinted(mode, 100, 100 + rows, uniform);
+                assert_eq!(
+                    replay.screen.rows(),
+                    replay.expected.rows(),
+                    "{mode:?} shift {rows} (uniform sidebar {uniform})"
+                );
+                if mode == ScrollRegionAcceleration::Off || rows == 0 {
+                    assert_eq!(replay.applied, None);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn a_narrow_hint_scrolls_full_rows_when_the_columns_beside_it_repeat() {
+    let replay = replay_hinted(ScrollRegionAcceleration::Auto, 100, 101, true);
+    let full = Rect::new(0, LIST.y, WIDTH, LIST.height);
+    assert_eq!(
+        replay.applied,
+        Some(AppliedScroll {
+            region: full,
+            rows: 1
+        })
+    );
+    assert!(
+        replay.stats.changed_cells <= usize::from(WIDTH),
+        "only the exposed row is rewritten, got {}",
+        replay.stats.changed_cells
+    );
+}
+
+#[test]
+fn a_narrow_hint_beside_distinct_columns_scrolls_inside_margins_only_when_allowed() {
+    let plain = replay_hinted(ScrollRegionAcceleration::Off, 100, 101, false);
+    let auto = replay_hinted(ScrollRegionAcceleration::Auto, 100, 101, false);
+    let full = Rect::new(0, LIST.y, WIDTH, LIST.height);
+    assert_eq!(
+        auto.applied,
+        Some(AppliedScroll {
+            region: full,
+            rows: 1
+        }),
+        "rewriting the moved sidebar still costs less than rewriting the list"
+    );
+    assert!(!contains(&auto.output, "?69h"));
+    let margins = replay_hinted(ScrollRegionAcceleration::AutoWithMargins, 100, 101, false);
+    assert_eq!(
+        margins.applied,
+        Some(AppliedScroll {
+            region: LIST,
+            rows: 1
+        })
+    );
+    assert!(contains(
+        &margins.output,
+        &format!(
+            "\x1b[?69h\x1b[{};{}s\x1b[1;{}r\x1b[1S",
+            SIDEBAR + 1,
+            WIDTH,
+            LIST.bottom()
+        )
+    ));
+    assert!(margins.stats.changed_cells < auto.stats.changed_cells);
+    assert!(auto.stats.changed_cells < plain.stats.changed_cells);
+    assert_eq!(margins.screen.rows(), margins.expected.rows());
+    assert_eq!(auto.screen.rows(), auto.expected.rows());
+}
+
+#[test]
+fn wide_graphemes_across_a_margin_keep_rows_whole() {
+    let mut terminal = terminal(ScrollRegionAcceleration::AutoWithMargins);
+    let mut screen = Screen::new(WIDTH, HEIGHT);
+    let frame = |cx: &mut PaintCx<'_, '_>, first: i64, previous: i64| {
+        paint_with_sidebar(cx, first, previous, false);
+        // A wide grapheme straddling the left margin on one row.
+        cx.write_line(
+            LocalRect::new(i32::from(SIDEBAR) - 1, 2, 2, 1),
+            &Line::raw("界".to_owned()),
+        );
+    };
+    terminal.draw(|cx| frame(cx, 100, 100)).unwrap();
+    screen.feed(terminal.writer());
+    terminal.writer_mut().clear();
+    terminal.draw(|cx| frame(cx, 101, 100)).unwrap();
+    screen.feed(terminal.writer());
+    assert_ne!(
+        terminal.applied_scroll().map(|scroll| scroll.region),
+        Some(LIST),
+        "a margin through a wide grapheme would split it"
+    );
+    let mut reference = self::terminal(ScrollRegionAcceleration::Off);
+    reference.draw(|cx| frame(cx, 101, 101)).unwrap();
+    let mut expected = Screen::new(WIDTH, HEIGHT);
+    expected.feed(reference.writer());
+    assert_eq!(screen.rows(), expected.rows());
 }

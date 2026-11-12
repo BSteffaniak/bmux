@@ -369,6 +369,10 @@ impl Buffer {
         }
         let symbol = safe_symbol(symbol);
         let symbol_width = grapheme_width(symbol);
+        if symbol_width == 1 {
+            self.fill_narrow(clip, symbol, style);
+            return;
+        }
         let width = symbol_width.max(1);
         for y in clip.y..clip.bottom() {
             let mut x = clip.x;
@@ -384,6 +388,25 @@ impl Buffer {
                     self.put_symbol(Point::new(x, y), symbol, symbol_width, style);
                 }
                 x = x.saturating_add(width);
+            }
+        }
+    }
+
+    /// Fill `clip` (inside this buffer and non-empty) with a narrow sanitized
+    /// symbol. Wide graphemes cut by the clip edges are cleared, as
+    /// [`Self::put_symbol`] does cell by cell; every cell inside is replaced
+    /// one row slice at a time.
+    fn fill_narrow(&mut self, clip: Rect, symbol: &str, style: Style) {
+        let right = clip.right() - 1;
+        for y in clip.y..clip.bottom() {
+            self.clear_span_at(Point::new(clip.x, y));
+            self.clear_span_at(Point::new(right, y));
+            let Some(start) = self.index(Point::new(clip.x, y)) else {
+                continue;
+            };
+            let end = start + usize::from(clip.width);
+            for cell in &mut self.cells[start..end] {
+                cell.assign(symbol, 1, style);
             }
         }
     }
@@ -431,6 +454,15 @@ impl Buffer {
             let ascii = content
                 .bytes()
                 .all(|byte| byte.is_ascii() && !byte.is_ascii_control());
+            if ascii {
+                let end = x.saturating_add(u16::try_from(content.len()).unwrap_or(u16::MAX));
+                self.write_ascii_run(area.y, x, content, clip, style, overlay);
+                if end >= area.right() {
+                    return;
+                }
+                x = end;
+                continue;
+            }
             let mut graphemes = content.graphemes(true);
             let mut offset = 0;
             loop {
@@ -465,6 +497,47 @@ impl Buffer {
                     self.put_cell(Point::new(clip.x, area.y), " ", 1, style, overlay);
                 }
                 x = x.saturating_add(width);
+            }
+        }
+    }
+
+    /// Write printable ASCII `content` starting at column `x` of row `y`, one
+    /// narrow cell per byte, to the cells inside `clip`. Exactly what
+    /// [`Self::put_cell`] does byte by byte, without per-cell segmentation and
+    /// bounds work: narrow cells are replaced in place, and cells of wide
+    /// graphemes go through [`Self::put_symbol`], which clears their spans.
+    fn write_ascii_run(
+        &mut self,
+        y: u16,
+        x: u16,
+        content: &str,
+        clip: Rect,
+        style: Style,
+        overlay: bool,
+    ) {
+        let end = x.saturating_add(u16::try_from(content.len()).unwrap_or(u16::MAX));
+        let first = x.max(clip.x);
+        let last = end.min(clip.right());
+        if first >= last {
+            return;
+        }
+        let Some(start) = self.index(Point::new(first, y)) else {
+            return;
+        };
+        let skip = usize::from(first - x);
+        for offset in 0..usize::from(last - first) {
+            let symbol = &content[skip + offset..=skip + offset];
+            let cell = &mut self.cells[start + offset];
+            let style = if overlay {
+                cell.style.patch(style)
+            } else {
+                style
+            };
+            if cell.width == 1 && !cell.wide_continuation {
+                cell.assign(symbol, 1, style);
+            } else {
+                let column = first.saturating_add(u16::try_from(offset).unwrap_or(u16::MAX));
+                self.put_symbol(Point::new(column, y), symbol, 1, style);
             }
         }
     }
@@ -527,11 +600,101 @@ impl Buffer {
         if shift > 0 {
             band.rotate_left(moved);
             let blank = band.len() - moved;
-            band[blank..].fill(Cell::default());
+            band[blank..].iter_mut().for_each(Cell::reset);
         } else {
             band.rotate_right(moved);
-            band[..moved].fill(Cell::default());
+            band[..moved].iter_mut().for_each(Cell::reset);
         }
+    }
+
+    /// Move the cells of `band` by `shift` rows, as a terminal scroll inside
+    /// margins does: positive moves content toward row 0. Rows the shift
+    /// exposes become default cells; columns outside `band` do not move.
+    pub(crate) fn shift_band(&mut self, band: Rect, shift: i64) {
+        let band = self.area.intersection(band);
+        if band.is_empty() || shift == 0 {
+            return;
+        }
+        if band.x == self.area.x && band.width == self.area.width {
+            self.shift_rows(band, shift);
+            return;
+        }
+        let width = usize::from(self.area.width);
+        let left = usize::from(band.x - self.area.x);
+        let columns = usize::from(band.width);
+        let top = usize::from(band.y - self.area.y);
+        let height = usize::from(band.height);
+        let moved = usize::try_from(shift.unsigned_abs())
+            .unwrap_or(usize::MAX)
+            .min(height);
+        // Move each surviving row's cells into place by swapping (no copies), then
+        // blank the rows the shift exposes.
+        let row = |offset: usize| (top + offset) * width + left;
+        if shift > 0 {
+            for offset in 0..height - moved {
+                let (target, source) = (row(offset), row(offset + moved));
+                for column in 0..columns {
+                    self.cells.swap(target + column, source + column);
+                }
+            }
+            for offset in height - moved..height {
+                self.cells[row(offset)..row(offset) + columns]
+                    .iter_mut()
+                    .for_each(Cell::reset);
+            }
+        } else {
+            for offset in (moved..height).rev() {
+                let (target, source) = (row(offset), row(offset - moved));
+                for column in 0..columns {
+                    self.cells.swap(target + column, source + column);
+                }
+            }
+            for offset in 0..moved {
+                self.cells[row(offset)..row(offset) + columns]
+                    .iter_mut()
+                    .for_each(Cell::reset);
+            }
+        }
+    }
+
+    /// Whether no wide grapheme crosses the left or right edge of `band` in
+    /// any of its rows, so moving the band's cells keeps every grapheme whole.
+    pub(crate) fn band_has_clean_margins(&self, band: Rect) -> bool {
+        (band.y..band.bottom()).all(|y| {
+            let left = self.get(Point::new(band.x, y));
+            let right = self.get(Point::new(band.right().saturating_sub(1), y));
+            !left.is_some_and(Cell::is_wide_continuation)
+                && !right.is_some_and(Cell::is_wide_leader)
+        })
+    }
+
+    /// Cells of `band` in `current` that differ from this buffer once its
+    /// band is moved by `shift` rows (see [`Self::shift_band`]); `shift == 0`
+    /// counts plain differences. Both buffers must share one area.
+    pub(crate) fn band_changes(&self, current: &Self, band: Rect, shift: i64) -> usize {
+        let band = self.area.intersection(band);
+        let blank = Cell::default();
+        let mut changed = 0;
+        for y in band.y..band.bottom() {
+            let source = u16::try_from(i64::from(y) + shift)
+                .ok()
+                .filter(|source| (band.y..band.bottom()).contains(source));
+            let (Some(start), Some(end)) = (
+                current.index(Point::new(band.x, y)),
+                current.index(Point::new(band.right() - 1, y)),
+            ) else {
+                continue;
+            };
+            let new = &current.cells[start..=end];
+            match source.and_then(|source| self.index(Point::new(band.x, source))) {
+                Some(old) => {
+                    let old = &self.cells[old..old + new.len()];
+                    changed += new.iter().zip(old).filter(|(new, old)| new != old).count();
+                }
+                None => changed += new.iter().filter(|cell| **cell != blank).count(),
+            }
+        }
+        changed
     }
 
     fn index(&self, point: Point) -> Option<usize> {
@@ -844,6 +1007,31 @@ mod tests {
         buffer.set_cell(Point::new(2, 3), "y", Style::new());
 
         assert_eq!(buffer.row_symbols(3).as_deref(), Some("y   "));
+    }
+
+    #[test]
+    fn narrow_fill_clears_wide_graphemes_cut_by_its_edges() {
+        let area = Rect::new(0, 0, 8, 1);
+        let mut buffer = Buffer::empty(area);
+        buffer.write_line(area, &Line::raw("界界界界"));
+        let style = Style::new().bg(Color::Red);
+        // Columns 3..5 cut the second grapheme's continuation and the third's leader.
+        buffer.fill(Rect::new(3, 0, 2, 1), "x", style);
+        assert_eq!(buffer.row_symbols(0).as_deref(), Some("界 xx 界"));
+        for x in 3..5 {
+            assert_eq!(buffer.get(Point::new(x, 0)).unwrap().style, style);
+        }
+        buffer.debug_assert_valid_wide_spans();
+    }
+
+    #[test]
+    fn ascii_text_over_wide_graphemes_clears_the_halves_it_cuts() {
+        let area = Rect::new(0, 0, 4, 1);
+        let mut buffer = Buffer::empty(area);
+        buffer.write_line(area, &Line::raw("界界"));
+        buffer.write_line(Rect::new(1, 0, 2, 1), &Line::raw("abc"));
+        assert_eq!(buffer.row_symbols(0).as_deref(), Some(" ab "));
+        buffer.debug_assert_valid_wide_spans();
     }
 
     #[test]

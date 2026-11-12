@@ -168,9 +168,17 @@ pub struct PreparedPresentation {
     projected_metadata: Option<ProjectedMetadata>,
     metadata_availability: Vec<SurfaceMetadataAvailability>,
     damage: Damage,
+    scroll_hint: Option<(Rect, i64)>,
 }
 
 impl PreparedPresentation {
+    /// The scroll reported while painting this frame (see
+    /// [`crate::paint::PaintCx::hint_scroll`]), relative to the previous frame.
+    #[must_use]
+    pub const fn scroll_hint(&self) -> Option<(Rect, i64)> {
+        self.scroll_hint
+    }
+
     /// Exact metadata installed with this immutable output snapshot. `None` means
     /// no projection metadata was supplied, not an empty transformed scene.
     #[must_use]
@@ -840,6 +848,27 @@ impl PresentationState {
     pub const fn area(&self) -> Rect {
         self.area
     }
+    /// A copy of this state that takes over its retained cells and spare
+    /// buffer instead of cloning them, leaving this state with the same
+    /// metadata and no retained cells.
+    ///
+    /// Staging a frame this way costs no cell copies. Until the staged state
+    /// is adopted, this state's next frame is a full repaint, which is also
+    /// what a failed delivery of the staged frame requires.
+    #[must_use]
+    pub fn stage(&mut self) -> Self {
+        let previous = self.previous.take();
+        let spare = self.spare.take();
+        let staged = Self {
+            previous,
+            ..self.clone()
+        };
+        if let Some(spare) = spare {
+            staged.spare.put(spare);
+        }
+        staged
+    }
+
     /// Last committed cells, unless invalidated by reset or failed output.
     #[must_use]
     pub const fn retained_buffer(&self) -> Option<&Buffer> {
@@ -1106,6 +1135,7 @@ impl PresentationState {
             |_| true,
         );
         let metadata_availability;
+        let scroll_hint;
         let (
             cursor,
             hits,
@@ -1119,6 +1149,7 @@ impl PresentationState {
             let mut frame = Frame::new(&mut buffer);
             frame.set_clock(self.clock);
             PresentationPhase::Paint.measure(|| render(&mut PaintCx::new(&mut frame)), |()| true);
+            scroll_hint = frame.scroll_hint();
             let metadata = PresentationPhase::MetadataExtract.measure(
                 || {
                     // Modal transitions still replace the complete interaction tree.
@@ -1270,6 +1301,7 @@ impl PresentationState {
                     projected_metadata: None,
                     metadata_availability,
                     damage,
+                    scroll_hint,
                 })
             },
             |_| true,

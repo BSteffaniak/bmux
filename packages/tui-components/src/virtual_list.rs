@@ -315,6 +315,8 @@ pub struct VirtualListState<K, S = ()> {
     motion: Option<ScrollMotion<K, S>>,
     snapshot: Option<component::LayoutSnapshot>,
     pressed: Option<K>,
+    /// Where the scrolled rows were last painted, for the next paint's scroll hint.
+    painted: std::sync::Mutex<Option<component::PaintedRows>>,
 }
 
 impl<K> VirtualListState<K>
@@ -377,6 +379,7 @@ where
             motion: None,
             snapshot: None,
             pressed: None,
+            painted: std::sync::Mutex::new(None),
         }
     }
 
@@ -1690,6 +1693,54 @@ impl<'a, Src: ?Sized> VirtualSourceList<'a, Src> {
         Src: VirtualItemSource<K>,
     {
         state.reconcile(&self.id, self.source, width, environment, cx);
+    }
+
+    /// Give every item intersecting collection rows `rows` an exact retained
+    /// layout at the last synchronized width and environment, so it paints
+    /// without being built for measurement when it scrolls into view.
+    ///
+    /// Call it outside the frame path (for example while idle after a
+    /// presentation) to measure the items a scroll or page is about to reveal.
+    /// Only items that are stale or have no retained layout are built. It
+    /// does nothing, and returns 0, before the first synchronization or while
+    /// noted splices or invalidations are pending (the next layout reconciles
+    /// them first). Render statistics keep describing the last layout.
+    ///
+    /// A measured height that differs from the index updates it exactly as a
+    /// layout would, so the next layout re-resolves the position. Returns the
+    /// number of items measured.
+    pub fn prepare_rows<K, S>(
+        &self,
+        rows: Range<u64>,
+        state: &mut VirtualListState<K, S>,
+        cx: &mut LayoutCx,
+    ) -> usize
+    where
+        K: Clone + Ord + ToString,
+        S: Clone,
+        Src: VirtualItemSource<K>,
+    {
+        let pending = &state.pending;
+        if state.synced.is_none()
+            || pending.full
+            || !pending.regions.is_empty()
+            || !pending.invalidated.is_empty()
+            || rows.is_empty()
+        {
+            return 0;
+        }
+        let range = state.index.visible_range(rows.start, rows.end - rows.start);
+        let last_layout = state.stats.get();
+        let mut measured = BTreeSet::new();
+        state.prepare_visible(
+            &self.id,
+            self.source,
+            range.start..range.end,
+            &mut measured,
+            cx,
+        );
+        state.stats.set(last_layout);
+        measured.len()
     }
 
     /// Synchronize, resolve the position for a viewport, and make sure every

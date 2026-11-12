@@ -277,11 +277,19 @@ permits. Repeated invalidations coalesce. The next deadline is based on
 completion of the preceding presentation, so a delayed frame does not create
 catch-up bursts.
 
-Presentation is synchronous in the initial design. This keeps the committed
-terminal buffer, hit map, cursor, image scene, and application-visible
-presentation acknowledgement aligned. A future asynchronous presenter requires
-an owned frame snapshot and explicit commit acknowledgement; it must not be
-introduced merely to move a blocking write to another task.
+`TerminalPresenter` presents synchronously, which keeps the committed terminal
+buffer, hit map, cursor, image scene, and application-visible presentation
+acknowledgement aligned. `AsyncTerminalPresenter` keeps the same alignment
+with an owned frame snapshot and explicit commit acknowledgement: it paints a
+staging terminal (`Terminal::stage`, which takes over the retained cells
+instead of copying them), hands the encoded bytes to one output thread, and
+adopts the staged state only after the bytes were delivered. Its output owner
+implements `CancellableOutput`; `bmux_tui::terminal::TtyOutput` is the Unix
+implementation, a separate nonblocking open of stdout's terminal device (so no
+shared descriptor flag changes) whose writes stop promptly on cancellation.
+While one frame is in flight no further frame is prepared; the next frame
+paints the latest state once delivery settles, so frames superseded under
+backpressure are never written and a slow terminal never blocks input.
 
 Applications construct the canonical component tree and retain its caller-owned
 state and derived layout caches. The presenter's render callback receives the
