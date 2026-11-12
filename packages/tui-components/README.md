@@ -343,6 +343,21 @@ implements `scroll_view::ScrollSource` and the view lays out its viewport as
 `ScrollExtent` wheel handling; `scrollbar` draws one inside the view instead.
 Running the program (for example with `bmux_pty`) is the caller's concern.
 
+Views that are rows rather than components (a transcript entry, say) take the
+same output as styled lines:
+
+* `TerminalState::window(width, rows)` reflows the output to `width` and returns
+  the rows `TerminalRows` asks for (`Tail(n)`, a `Range`, or `From` an anchor of
+  an earlier window, so a position survives reflow at another width), with
+  where each row starts and what selecting it copies. A tail captures only the
+  output it shows, so following a running program stays cheap.
+* `TerminalState::screen_window(columns, rows)` crops the screen as drawn, for
+  full-screen programs, which cannot be reflowed.
+* `terminal_grid_line` turns one grid row into a styled line, the same way.
+
+`TerminalStatus` says how the program ended: `Exited` with its code,
+`Signaled`, `TimedOut` or `Cancelled`.
+
 `ScrollViewComponent::fill` makes a scroll view take whatever area layout gives
 it, measuring its content at that width, for scrolled content whose size is not
 known when the view is built.
@@ -516,7 +531,8 @@ disclosure marker, one separator cell, then the room holding the label and
 decorations. `TreeViewComponent::selection_bar(TreeViewSelectionBar::new("▌",
 accent))` reserves the symbol's width on every row and draws it, patched over
 the row style, on the selected row only, so the selection stays visible without
-relying on color; a row narrower than the bar shows blank cells. `TreeViewTrailingLayout`
+relying on color; a row narrower than the bar shows blank cells.
+`TreeViewTrailingLayout`
 makes narrow rows explicit:
 
 * Decorations sit against the row's right edge, `gap` cells after the label

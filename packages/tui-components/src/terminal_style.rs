@@ -1,7 +1,7 @@
 //! Conversion of terminal grid styles to TUI styles, shared by the terminal components.
 
-use bmux_terminal_grid::{Color as GridColor, Style as GridStyle};
-use bmux_tui::prelude::{Color, Style};
+use bmux_terminal_grid::{Color as GridColor, PhysicalRow, Style as GridStyle, TerminalGrid};
+use bmux_tui::prelude::{Color, Line, Span, Style};
 use bmux_tui::style::Modifier;
 
 /// The TUI style of a terminal grid style. ANSI indexed colors 0-15 map to the named
@@ -37,6 +37,33 @@ pub const fn terminal_grid_style(style: GridStyle) -> Style {
         output = output.add_modifier(Modifier::CROSSED_OUT);
     }
     output
+}
+
+/// A row of `grid` as a styled line, adjacent cells of one style joined into a span.
+#[must_use]
+pub fn terminal_grid_line(grid: &TerminalGrid, row: &PhysicalRow) -> Line {
+    let palette = grid.palette();
+    let mut spans = Vec::new();
+    let mut current: Option<(Style, String)> = None;
+    for cell in row.cells() {
+        if cell.is_wide_continuation() {
+            continue;
+        }
+        let style = terminal_grid_style(palette.get(cell.style()));
+        match &mut current {
+            Some((current_style, text)) if *current_style == style => text.push_str(cell.text()),
+            _ => {
+                if let Some((style, text)) = current.take() {
+                    spans.push(Span::styled(text, style));
+                }
+                current = Some((style, cell.text().to_owned()));
+            }
+        }
+    }
+    if let Some((style, text)) = current {
+        spans.push(Span::styled(text, style));
+    }
+    Line::from_spans(spans)
 }
 
 const fn terminal_grid_color(color: GridColor) -> Color {

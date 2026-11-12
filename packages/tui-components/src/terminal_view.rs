@@ -16,12 +16,18 @@
 //! [`crate::pane::PaneComponent::border_scrollbar`] and [`ScrollExtent`]-based wheel
 //! handling. It follows new output while scrolled to the bottom.
 //!
+//! Views that are not components (for example rows of a transcript) take the same output as
+//! styled lines through [`TerminalState::window`] (reflowed output, with selection rows and
+//! anchors that survive reflow) and [`TerminalState::screen_window`] (a crop of the screen).
+//!
 //! Running the process (for example with `bmux_pty`) is the caller's concern: feed what it
 //! writes with [`TerminalState::feed`] and report its end with [`TerminalState::finish`].
 
 use std::cell::{Cell, RefCell};
 use std::hash::{Hash, Hasher};
+use std::ops::Range;
 
+pub use bmux_terminal_grid::{ContentAnchor, SelectionCell};
 use bmux_terminal_grid::{
     ContentBudget, ContentProjection, GridLimits, GridMode, PhysicalRow, TerminalGrid,
     TerminalGridStream,
@@ -32,12 +38,14 @@ use bmux_tui::component::{
 };
 use bmux_tui::geometry::Rect;
 use bmux_tui::paint::PaintCx;
+use bmux_tui::prelude::Line;
 use bmux_tui::style::{Modifier, Style};
 
 use crate::scroll_view::{
     ScrollExtent, ScrollSource, ScrollViewComponent, ScrollViewState, TrackScrollbar,
 };
 use crate::scrollbar_layout::{ScrollbarAxisLayoutMode, ScrollbarLayoutPolicy, scrollbar_layout};
+pub use crate::terminal_style::terminal_grid_line;
 use crate::terminal_style::terminal_grid_style;
 
 /// Work and memory allowed for one reflow projection.
@@ -46,13 +54,19 @@ const REFLOW_BUDGET: ContentBudget = ContentBudget {
     bytes: 64 * 1024 * 1024,
 };
 
-/// Whether the program is still running.
+/// Whether the program is still running, or how it ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TerminalStatus {
     /// Output may still arrive.
     Running,
     /// The program ended, with its exit code when it exited normally.
     Exited(Option<i32>),
+    /// A signal ended the program.
+    Signaled(i32),
+    /// The program was stopped because it ran out of time.
+    TimedOut,
+    /// The program was stopped on request.
+    Cancelled,
 }
 
 impl TerminalStatus {
@@ -73,9 +87,64 @@ pub enum TerminalViewMode {
     Reflow,
 }
 
-/// Rows of output reflowed at one width, kept until the terminal changes.
+/// Which rows of reflowed output a [`TerminalWindow`] holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalRows {
+    /// The last `n` rows. Only the output they need is captured.
+    Tail(usize),
+    /// At most `count` rows from row `start`.
+    Range {
+        /// First row.
+        start: usize,
+        /// Most rows.
+        count: usize,
+    },
+    /// At most `count` rows from the row holding `anchor` (from an earlier window), so a
+    /// position survives reflow at another width. The tail when the anchor no longer
+    /// resolves (the output changed since).
+    From {
+        /// Where the window starts.
+        anchor: ContentAnchor,
+        /// Most rows.
+        count: usize,
+    },
+}
+
+/// One row's selectable text and how its display columns map to it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminalSelectionRow {
+    /// Identity of the source line or screen row, stable while the output does not change.
+    pub identity: String,
+    /// Where `text` starts in the source line or row, in bytes.
+    pub byte_start: usize,
+    /// The row's text.
+    pub text: String,
+    /// Display columns of each cell, and its bytes in the source line or row.
+    pub cells: Vec<SelectionCell>,
+}
+
+/// Rows of terminal output as styled lines; see [`TerminalState::window`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TerminalWindow {
+    /// The rows.
+    pub lines: Vec<Line>,
+    /// Index of the first row among all rows.
+    pub first: usize,
+    /// All rows at this width.
+    pub total: usize,
+    /// Where each row starts in the output (reflowed windows only).
+    pub anchors: Vec<ContentAnchor>,
+    /// Selection correspondence for each row, in order.
+    pub selection: Vec<TerminalSelectionRow>,
+    /// Older output was dropped from history.
+    pub history_truncated: bool,
+}
+
+/// Captured output reflowed at one width, kept until the terminal changes.
 struct Reflowed {
     revision: u64,
+    /// Logical lines captured from the end; `usize::MAX` for all.
+    lines: usize,
     width: usize,
     projection: ContentProjection,
     rows: usize,
@@ -90,6 +159,7 @@ pub struct TerminalState {
     scroll: Cell<ScrollViewState>,
     requested: Cell<Option<(u16, u16)>>,
     reflowed: RefCell<Option<Reflowed>>,
+    captures: Cell<u128>,
 }
 
 impl TerminalState {
@@ -114,6 +184,7 @@ impl TerminalState {
             scroll: Cell::new(scroll),
             requested: Cell::new(None),
             reflowed: RefCell::new(None),
+            captures: Cell::new(0),
         }
     }
 
@@ -208,28 +279,143 @@ impl TerminalState {
     /// Run `use_rows` on the output reflowed at `width`, projecting it when the terminal or
     /// width changed since the last projection. `None` when the output exceeds the budget.
     fn with_reflowed<T>(&self, width: usize, use_rows: impl FnOnce(&Reflowed) -> T) -> Option<T> {
+        self.with_projection(width, usize::MAX, use_rows)
+    }
+
+    /// [`Self::with_reflowed`] needing only the last `lines` logical lines captured.
+    fn with_projection<T>(
+        &self,
+        width: usize,
+        lines: usize,
+        use_rows: impl FnOnce(&Reflowed) -> T,
+    ) -> Option<T> {
         let grid = self.grid();
         let width = width.max(1);
         let mut cache = self.reflowed.borrow_mut();
-        let stale = cache
-            .as_ref()
-            .is_none_or(|cached| cached.revision != grid.revision() || cached.width != width);
+        let stale = cache.as_ref().is_none_or(|cached| {
+            cached.revision != grid.content_revision() || cached.lines < lines
+        });
         if stale {
-            let lines = grid.height().saturating_add(grid.max_scrollback_offset());
-            let projection = grid
-                .capture_content(u128::from(grid.revision()), lines, REFLOW_BUDGET)
-                .and_then(|mut projection| {
-                    projection.prepare(width, REFLOW_BUDGET)?;
-                    Ok(projection)
+            let capture = self.captures.get().wrapping_add(1);
+            self.captures.set(capture);
+            let all = grid.height().saturating_add(grid.max_scrollback_offset());
+            *cache = grid
+                .capture_content(capture, lines.min(all), REFLOW_BUDGET)
+                .ok()
+                .map(|projection| Reflowed {
+                    revision: grid.content_revision(),
+                    lines,
+                    width: 0,
+                    projection,
+                    rows: 0,
                 });
-            *cache = projection.ok().map(|projection| Reflowed {
-                revision: grid.revision(),
-                width,
-                rows: projection.row_count().unwrap_or(0),
-                projection,
-            });
+        }
+        let reflowed = cache.as_mut()?;
+        if reflowed.width != width {
+            if reflowed.projection.prepare(width, REFLOW_BUDGET).is_err() {
+                *cache = None;
+                return None;
+            }
+            reflowed.width = width;
+            reflowed.rows = reflowed.projection.row_count().unwrap_or(0);
         }
         cache.as_ref().map(use_rows)
+    }
+
+    /// Reflowed output at `width` columns as styled lines: the rows `rows` asks for, with
+    /// where each starts and what selecting it copies. `None` when the output exceeds the
+    /// projection budget. A [`TerminalRows::Tail`] captures only the output it shows, so
+    /// following a running program costs no more than the rows on view.
+    #[must_use]
+    pub fn window(&self, width: usize, rows: TerminalRows) -> Option<TerminalWindow> {
+        let lines = match rows {
+            TerminalRows::Tail(count) => count,
+            TerminalRows::Range { .. } | TerminalRows::From { .. } => usize::MAX,
+        };
+        let grid = self.grid();
+        let truncated = grid.history_truncated();
+        self.with_projection(width, lines, |reflowed| {
+            let projection = &reflowed.projection;
+            let total = reflowed.rows;
+            let range = match rows {
+                TerminalRows::Tail(count) => total.saturating_sub(count)..total,
+                TerminalRows::Range { start, count } => {
+                    start.min(total)..start.saturating_add(count).min(total)
+                }
+                TerminalRows::From { anchor, count } => projection.resolve(anchor).map_or_else(
+                    || total.saturating_sub(count)..total,
+                    |start| start..start.saturating_add(count).min(total),
+                ),
+            };
+            let window = projection.window(range.clone(), REFLOW_BUDGET.bytes).ok()?;
+            let mut selection = Vec::new();
+            for row in projection
+                .selection_window(range.clone(), REFLOW_BUDGET)
+                .ok()?
+            {
+                let start = row.source.start;
+                let text = projection
+                    .export_text(start.capture, start.line, row.bytes.clone(), REFLOW_BUDGET)
+                    .ok()?;
+                selection.push(TerminalSelectionRow {
+                    identity: format!("capture:{}:{}", start.capture, start.line),
+                    byte_start: row.bytes.start,
+                    text,
+                    cells: row.cells,
+                });
+            }
+            Some(TerminalWindow {
+                lines: window
+                    .rows
+                    .iter()
+                    .map(|row| terminal_grid_line(grid, row))
+                    .collect(),
+                first: range.start,
+                total,
+                anchors: window.anchors,
+                selection,
+                history_truncated: truncated || window.history_truncated,
+            })
+        })
+        .flatten()
+    }
+
+    /// The screen cropped to `columns` and `rows`, as the program drew it (for a full-screen
+    /// program, which cannot be reflowed), with what selecting each row copies. `None` when
+    /// the crop exceeds the projection budget.
+    #[must_use]
+    pub fn screen_window(
+        &self,
+        columns: Range<usize>,
+        rows: Range<usize>,
+    ) -> Option<TerminalWindow> {
+        let grid = self.grid();
+        let revision = grid.content_revision();
+        let lines = grid
+            .screen_window(columns.clone(), rows.clone(), REFLOW_BUDGET)
+            .ok()?;
+        let selection = grid
+            .screen_selection(revision, columns, rows.clone(), REFLOW_BUDGET)
+            .ok()?
+            .into_iter()
+            .map(|row| TerminalSelectionRow {
+                identity: format!("screen:{revision}:{}", row.source.row),
+                byte_start: row.byte_start,
+                text: row.text,
+                cells: row.cells,
+            })
+            .collect();
+        Some(TerminalWindow {
+            lines: lines
+                .iter()
+                .map(|row| terminal_grid_line(grid, row))
+                .collect(),
+            first: rows.start.min(grid.height()),
+            total: grid.height(),
+            anchors: Vec::new(),
+            selection,
+            history_truncated: false,
+        })
     }
 
     /// Rows `start..start + count` of the content in `mode` at `width`.
@@ -531,8 +717,8 @@ mod tests {
     use bmux_tui::style::{Color, Modifier};
 
     use super::{
-        ScrollSource, TerminalState, TerminalStatus, TerminalViewComponent, TerminalViewMode,
-        terminal_viewport_id,
+        ScrollSource, TerminalRows, TerminalState, TerminalStatus, TerminalViewComponent,
+        TerminalViewMode, terminal_viewport_id,
     };
     use crate::scroll_view::{ScrollExtent, ScrollViewState};
 
@@ -752,5 +938,99 @@ mod tests {
         drop(frame);
         // Following the bottom: the thumb is at the end of the track.
         assert_eq!(buffer.get(Point::new(9, 3)).unwrap().symbol, "┃");
+    }
+
+    fn text(line: &bmux_tui::prelude::Line) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn windows_reflow_output_as_styled_lines_with_selection() {
+        let state = state(20, 3, b"one\r\n\x1b[32mabcdefghij\x1b[0m\r\nthree\r\n");
+        let window = state.window(5, TerminalRows::Tail(10)).unwrap();
+        let lines: Vec<String> = window.lines.iter().map(text).collect();
+        // "abcdefghij" wraps at five columns; no row follows the output.
+        assert_eq!(lines, ["one", "abcde", "fghij", "three"]);
+        assert_eq!((window.first, window.total), (0, 4));
+        assert_eq!(window.lines[1].spans[0].style.fg, Some(Color::Green));
+        // Selection follows the source line across the wrap.
+        assert_eq!(window.selection.len(), 4);
+        assert_eq!(window.selection[1].text, "abcde");
+        assert_eq!(window.selection[2].text, "fghij");
+        assert_eq!(window.selection[2].byte_start, 5);
+        assert_eq!(window.selection[1].identity, window.selection[2].identity);
+        assert_eq!(window.anchors.len(), 4);
+    }
+
+    #[test]
+    fn tail_windows_show_the_end_and_anchors_survive_reflow() {
+        let bytes: Vec<u8> = (1..=30)
+            .flat_map(|n| format!("line number {n}\r\n").into_bytes())
+            .collect();
+        let state = state(40, 5, &bytes);
+        let tail = state.window(40, TerminalRows::Tail(2)).unwrap();
+        let lines: Vec<String> = tail.lines.iter().map(text).collect();
+        assert_eq!(lines, ["line number 29", "line number 30"]);
+
+        let all = state
+            .window(
+                40,
+                TerminalRows::Range {
+                    start: 10,
+                    count: 2,
+                },
+            )
+            .unwrap();
+        assert_eq!(text(&all.lines[0]), "line number 11");
+        assert_eq!(all.total, 30);
+        // The same source position at a narrower width, where every line wraps.
+        let anchor = all.anchors[0];
+        let narrow = state
+            .window(8, TerminalRows::From { anchor, count: 2 })
+            .unwrap();
+        assert_eq!(text(&narrow.lines[0]), "line num");
+        assert_eq!(text(&narrow.lines[1]), "ber 11");
+        assert_eq!(narrow.total, 60);
+    }
+
+    #[test]
+    fn stale_anchors_fall_back_to_the_tail() {
+        let mut state = state(20, 3, b"a\r\nb\r\n");
+        let anchor = state
+            .window(20, TerminalRows::Range { start: 0, count: 1 })
+            .unwrap()
+            .anchors[0];
+        state.feed(b"c\r\n");
+        let window = state
+            .window(20, TerminalRows::From { anchor, count: 1 })
+            .unwrap();
+        assert_eq!(text(&window.lines[0]), "c");
+    }
+
+    #[test]
+    fn screen_windows_crop_full_screen_programs() {
+        let state = state(10, 3, b"\x1b[?1049h\x1b[Habcdefghij\r\nsecond");
+        let window = state.screen_window(2..6, 0..2).unwrap();
+        let lines: Vec<String> = window.lines.iter().map(text).collect();
+        assert_eq!(lines, ["cdef", "cond"]);
+        assert_eq!(window.selection[0].text, "cdef");
+        assert_eq!(window.total, 3);
+    }
+
+    #[test]
+    fn statuses_say_how_the_program_ended() {
+        assert!(TerminalStatus::Exited(Some(0)).success());
+        for status in [
+            TerminalStatus::Exited(Some(1)),
+            TerminalStatus::Signaled(9),
+            TerminalStatus::TimedOut,
+            TerminalStatus::Cancelled,
+            TerminalStatus::Running,
+        ] {
+            assert!(!status.success(), "{status:?}");
+        }
     }
 }

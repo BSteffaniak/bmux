@@ -1,8 +1,6 @@
 //! Generic bounded terminal transcript viewer component.
 
-use bmux_terminal_grid::{
-    ContentBudget, GridLimits, GridMode, PhysicalRow, TerminalGrid, TerminalGridStream,
-};
+use bmux_terminal_grid::{ContentBudget, GridLimits, GridMode, TerminalGridStream};
 use bmux_tui::ansi::ansi_to_lines;
 use bmux_tui::geometry::Rect;
 use bmux_tui::paint::PaintCx;
@@ -264,7 +262,7 @@ fn terminal_output_lines(input: &TerminalViewerInput<'_>, width: u16) -> Vec<Lin
     };
     let mut lines = rows
         .iter()
-        .map(|row| terminal_grid_row_to_line(grid, row))
+        .map(|row| crate::terminal_style::terminal_grid_line(grid, row))
         .collect::<Vec<_>>();
     match input.sizing {
         TerminalViewerSizing::Compact => preview_lines(&lines, max_rows)
@@ -299,38 +297,6 @@ fn terminal_viewer_content_row_count(input: TerminalViewerInput<'_>, max_rows: u
     };
     stream.process(input.output.as_bytes());
     stream.grid().main_content_tail_rows(max_rows).len().max(1)
-}
-
-fn terminal_grid_row_to_line(grid: &TerminalGrid, row: &PhysicalRow) -> Line {
-    let mut spans = Vec::new();
-    let mut current_style = None;
-    let mut current_text = String::new();
-    for cell in row.cells() {
-        if cell.is_wide_continuation() {
-            continue;
-        }
-        let style = crate::terminal_style::terminal_grid_style(grid.palette().get(cell.style()));
-        if current_style == Some(style) {
-            current_text.push_str(cell.text());
-            continue;
-        }
-        if !current_text.is_empty() {
-            spans.push(Span::styled(
-                current_text,
-                current_style.unwrap_or_default(),
-            ));
-            current_text = String::new();
-        }
-        current_style = Some(style);
-        current_text.push_str(cell.text());
-    }
-    if !current_text.is_empty() {
-        spans.push(Span::styled(
-            current_text,
-            current_style.unwrap_or_default(),
-        ));
-    }
-    Line::from_spans(spans)
 }
 
 fn preview_lines<T>(lines: &[T], max_rows: usize) -> Vec<&T> {
