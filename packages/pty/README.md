@@ -37,6 +37,8 @@ for event in process.events() {
   error (where most tools write progress and diagnostics) stays a terminal. Such a process has no
   controlling terminal, so it cannot prompt through `/dev/tty`.
 * `input` feeds bytes to standard input through a pipe, then closes it.
+* Each process starts with default signal handling (whatever the caller ignores, such as
+  interrupts, is reset) and inherits no descriptors beyond standard input, output and error.
 * Each process starts its own session. `interrupt` (like `ctrl+c`) and `kill` signal its whole
   process group, so commands a shell started stop too, and they still reach what it started after
   it exits while that keeps the terminal open. Dropping a running `PtyProcess` kills it.
@@ -45,6 +47,9 @@ for event in process.events() {
   typing would: replies to terminal queries, or a user's keystrokes. Writes are queued and carried
   out on a thread of their own.
 * `capabilities` says what the platform supports (a real terminal, resizing, writing, signals).
+* `control` returns a cloneable `PtyControl` for another thread than the one reading events: it
+  resizes (and knows the current `size`), signals, stops output, makes writers, and reports the
+  `exit_status` as soon as the process is reaped, before its remaining output is delivered.
 
 ## Events
 

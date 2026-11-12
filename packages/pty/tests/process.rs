@@ -341,3 +341,78 @@ fn the_writer_types_into_the_running_process() {
     }
     assert!(text(&output).contains("got <hello>"), "{:?}", text(&output));
 }
+
+#[test]
+fn a_control_handle_works_from_another_thread_than_the_reader() {
+    let mut process =
+        sh("trap 'stty size; exit 0' WINCH; echo ready; while :; do sleep 0.05; done")
+            .spawn(PtySize::new(80, 24))
+            .unwrap();
+    let control = process.control();
+    assert_eq!(control.size(), PtySize::new(80, 24));
+    assert_eq!(control.exit_status(), None);
+    let (ready, ready_seen) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        let mut output = Vec::new();
+        let mut exit = None;
+        for event in process.events() {
+            match event {
+                PtyEvent::Output(bytes) => {
+                    output.extend(bytes);
+                    if text(&output).contains("ready") {
+                        let _ = ready.send(());
+                    }
+                }
+                PtyEvent::Exited(status) => exit = Some(status),
+                PtyEvent::Stdout(_) => {}
+            }
+        }
+        (output, exit)
+    });
+    ready_seen.recv_timeout(Duration::from_secs(10)).unwrap();
+    control.resize(PtySize::new(120, 50)).unwrap();
+    assert_eq!(control.size(), PtySize::new(120, 50));
+    let (output, exit) = reader.join().unwrap();
+    assert!(text(&output).contains("50 120"), "{:?}", text(&output));
+    let exit = exit.expect("an exit");
+    assert!(exit.success() && exit.output_complete());
+    assert_eq!(control.exit_status(), Some(exit));
+}
+
+#[test]
+fn programs_start_with_default_signal_handling_and_no_stray_descriptors() {
+    use std::os::fd::AsRawFd as _;
+    // An inheritable descriptor in the caller, and an ignored interrupt.
+    let (reader, writer) = std::io::pipe().unwrap();
+    // SAFETY: fcntl and signal on owned descriptors and a valid signal.
+    unsafe {
+        let flags = libc::fcntl(writer.as_raw_fd(), libc::F_GETFD);
+        libc::fcntl(writer.as_raw_fd(), libc::F_SETFD, flags & !libc::FD_CLOEXEC);
+    }
+    let leaked = writer.as_raw_fd();
+    let previous = unsafe { libc::signal(libc::SIGINT, libc::SIG_IGN) };
+    let mut process = sh(&format!(
+        "if [ -e /dev/fd/{leaked} ]; then echo leaked; else echo closed; fi; echo ready; while :; do sleep 0.05; done"
+    ))
+    .spawn(PtySize::new(80, 24))
+    .unwrap();
+    unsafe { libc::signal(libc::SIGINT, previous) };
+    let mut output = Vec::new();
+    while !text(&output).contains("ready") {
+        if let Some(PtyEvent::Output(bytes)) = process.next_event_timeout(Duration::from_secs(10)) {
+            output.extend(bytes);
+        }
+    }
+    assert!(text(&output).contains("closed"), "{:?}", text(&output));
+    // Interrupting works although the caller ignores interrupts.
+    process.interrupt().unwrap();
+    let exit = process
+        .events()
+        .find_map(|event| match event {
+            PtyEvent::Exited(exit) => Some(exit),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(exit.signal(), Some(libc::SIGINT));
+    drop((reader, writer));
+}

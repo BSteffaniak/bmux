@@ -29,7 +29,7 @@ use std::ffi::{OsStr, OsString};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, PoisonError, mpsc};
 use std::time::{Duration, Instant};
 
 /// Events queued between the reader threads and the consumer before readers wait.
@@ -273,8 +273,94 @@ impl PtyCommand {
 #[derive(Debug)]
 pub struct PtyProcess {
     events: mpsc::Receiver<PtyEvent>,
-    control: platform::Control,
+    control: PtyControl,
     exited: bool,
+}
+
+/// Controls a running process from anywhere: a cloneable, thread-safe handle for a caller that
+/// reads [`PtyProcess`] events on one thread and resizes, signals, writes or checks for the
+/// exit on another. See [`PtyProcess::control`].
+#[derive(Debug, Clone)]
+pub struct PtyControl {
+    platform: Arc<platform::Control>,
+    size: Arc<Mutex<PtySize>>,
+    status: Arc<Mutex<Option<PtyExit>>>,
+}
+
+impl PtyControl {
+    fn new(platform: platform::Control, size: PtySize) -> Self {
+        Self {
+            platform: Arc::new(platform),
+            size: Arc::new(Mutex::new(size)),
+            status: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Operating system process id.
+    #[must_use]
+    pub fn id(&self) -> u32 {
+        self.platform.id()
+    }
+
+    /// What the process's platform supports.
+    #[must_use]
+    pub const fn capabilities(&self) -> PtyCapabilities {
+        platform::CAPABILITIES
+    }
+
+    /// The terminal's current size.
+    #[must_use]
+    pub fn size(&self) -> PtySize {
+        *self.size.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// How the process ended, as soon as it is reaped: before its remaining output is
+    /// delivered and [`PtyEvent::Exited`] reports it. [`PtyExit::output_complete`] on it says
+    /// whether all output had been delivered when it was taken.
+    #[must_use]
+    pub fn exit_status(&self) -> Option<PtyExit> {
+        *self.status.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// See [`PtyProcess::resize`].
+    ///
+    /// # Errors
+    /// * [`io::Error`] when the terminal rejects the size.
+    pub fn resize(&self, size: PtySize) -> io::Result<()> {
+        self.platform.resize(size)?;
+        *self.size.lock().unwrap_or_else(PoisonError::into_inner) = size;
+        Ok(())
+    }
+
+    /// See [`PtyProcess::interrupt`].
+    ///
+    /// # Errors
+    /// * [`io::Error`] when the signal cannot be sent.
+    pub fn interrupt(&self) -> io::Result<()> {
+        self.platform.interrupt()
+    }
+
+    /// See [`PtyProcess::kill`].
+    ///
+    /// # Errors
+    /// * [`io::Error`] when the signal cannot be sent.
+    pub fn kill(&self) -> io::Result<()> {
+        self.platform.kill()
+    }
+
+    /// See [`PtyProcess::stop_output`].
+    pub fn stop_output(&self) {
+        self.platform.stop_output();
+    }
+
+    /// See [`PtyProcess::writer`].
+    ///
+    /// # Errors
+    /// * [`io::ErrorKind::Unsupported`] where processes run on pipes.
+    /// * [`io::Error`] when the terminal cannot be written.
+    pub fn writer(&self) -> io::Result<PtyWriter> {
+        self.platform.writer()
+    }
 }
 
 impl PtyProcess {
@@ -282,6 +368,12 @@ impl PtyProcess {
     #[must_use]
     pub fn id(&self) -> u32 {
         self.control.id()
+    }
+
+    /// A handle controlling this process from other threads.
+    #[must_use]
+    pub fn control(&self) -> PtyControl {
+        self.control.clone()
     }
 
     /// Whether [`PtyEvent::Exited`] has been received.
@@ -341,7 +433,7 @@ impl PtyProcess {
     /// What this process's platform supports.
     #[must_use]
     pub const fn capabilities(&self) -> PtyCapabilities {
-        platform::CAPABILITIES
+        self.control.capabilities()
     }
 
     /// A handle that writes to the terminal while the process runs, as typing would: the
@@ -500,7 +592,8 @@ mod platform {
     use std::sync::{Arc, Mutex, PoisonError, mpsc};
 
     use super::{
-        Events, Exit, PtyCapabilities, PtyCommand, PtyEvent, PtyProcess, PtySize, PtyWriter, QUEUE,
+        Events, Exit, PtyCapabilities, PtyCommand, PtyControl, PtyEvent, PtyProcess, PtySize,
+        PtyWriter, QUEUE,
     };
 
     pub const CAPABILITIES: PtyCapabilities = PtyCapabilities {
@@ -723,6 +816,53 @@ mod platform {
         Ok(())
     }
 
+    /// Most descriptors scanned for [`close_inherited_on_exec`] where they cannot be closed in
+    /// one call.
+    const DESCRIPTOR_SCAN_LIMIT: libc::c_int = 65_536;
+
+    /// Mark every descriptor above standard error close-on-exec, so descriptors the caller left
+    /// inheritable do not leak into the program. Marked rather than closed: a failed exec still
+    /// reports its error through the spawning library's own descriptor. Async-signal-safe.
+    fn close_inherited_on_exec() {
+        #[cfg(target_os = "linux")]
+        {
+            const CLOSE_RANGE_CLOEXEC: libc::c_uint = 1 << 2;
+            // SAFETY: close_range with the close-on-exec flag only changes descriptor flags.
+            if unsafe {
+                libc::syscall(
+                    libc::SYS_close_range,
+                    3,
+                    libc::c_uint::MAX,
+                    CLOSE_RANGE_CLOEXEC,
+                )
+            } == 0
+            {
+                return;
+            }
+        }
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: getrlimit writes one rlimit.
+        let highest = if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut limit) } == 0 {
+            libc::c_int::try_from(limit.rlim_cur)
+                .unwrap_or(DESCRIPTOR_SCAN_LIMIT)
+                .min(DESCRIPTOR_SCAN_LIMIT)
+        } else {
+            DESCRIPTOR_SCAN_LIMIT
+        };
+        for fd in 3..highest {
+            // SAFETY: fcntl on a descriptor number; unused numbers fail harmlessly.
+            unsafe {
+                let flags = libc::fcntl(fd, libc::F_GETFD);
+                if flags != -1 && flags & libc::FD_CLOEXEC == 0 {
+                    libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+                }
+            }
+        }
+    }
+
     fn close_on_exec(fd: RawFd) -> io::Result<()> {
         // SAFETY: fcntl on an owned, open descriptor.
         if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } == -1 {
@@ -761,6 +901,36 @@ mod platform {
         Ok((master, slave))
     }
 
+    /// Set up the child between fork and exec. Async-signal-safe (signal, setsid, ioctl,
+    /// getrlimit, fcntl, syscall only).
+    fn prepare_child(slave_fd: RawFd, controlling: bool) -> io::Result<()> {
+        // Start from default handling: dispositions the caller ignores (a terminal UI often
+        // ignores interrupts) would otherwise be inherited. The signal mask and SIGPIPE are
+        // already reset.
+        for signal in [
+            libc::SIGCHLD,
+            libc::SIGHUP,
+            libc::SIGINT,
+            libc::SIGQUIT,
+            libc::SIGTERM,
+            libc::SIGALRM,
+        ] {
+            // SAFETY: restoring a valid signal's default disposition.
+            unsafe { libc::signal(signal, libc::SIG_DFL) };
+        }
+        // A new session: the process leads its own group, so signals reach everything it
+        // starts, and it is detached from the caller's terminal.
+        // SAFETY: setsid has no memory-safety preconditions.
+        if unsafe { libc::setsid() } == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        if controlling {
+            take_controlling_terminal(slave_fd)?;
+        }
+        close_inherited_on_exec();
+        Ok(())
+    }
+
     pub fn spawn(spec: &PtyCommand, size: PtySize) -> io::Result<PtyProcess> {
         let (master, slave) = open(size)?;
         let mut command = spec.std_command();
@@ -780,19 +950,9 @@ mod platform {
             command.stdin(Stdio::piped());
         }
         let slave_fd = slave.as_raw_fd();
-        // SAFETY: only async-signal-safe calls (setsid, ioctl) run between fork and exec.
+        // SAFETY: `prepare_child` makes only async-signal-safe calls.
         unsafe {
-            command.pre_exec(move || {
-                // A new session: the process leads its own group, so signals reach everything
-                // it starts, and it is detached from the caller's terminal.
-                if libc::setsid() == -1 {
-                    return Err(io::Error::last_os_error());
-                }
-                if controlling {
-                    take_controlling_terminal(slave_fd)?;
-                }
-                Ok(())
-            });
+            command.pre_exec(move || prepare_child(slave_fd, controlling));
         }
         let mut child = command.spawn()?;
         super::feed_input(&mut child, spec.input.as_ref());
@@ -833,13 +993,24 @@ mod platform {
         }
         let closed = Arc::clone(&events.closed);
         let pid = child.id();
+        let control = PtyControl::new(
+            Control {
+                master,
+                pid,
+                exited: Arc::clone(&exited),
+                closed,
+                writer: Mutex::new(None),
+            },
+            size,
+        );
         super::report_exit(
             events,
             Exit {
                 readers,
                 finished,
-                exited: Arc::clone(&exited),
+                exited,
                 grace: spec.drain_grace,
+                status: Arc::clone(&control.status),
             },
             move || {
                 let mut child = child;
@@ -848,13 +1019,7 @@ mod platform {
         );
         Ok(PtyProcess {
             events: receiver,
-            control: Control {
-                master,
-                pid,
-                exited,
-                closed,
-                writer: Mutex::new(None),
-            },
+            control,
             exited: false,
         })
     }
@@ -869,8 +1034,8 @@ mod platform {
     use std::time::Duration;
 
     use super::{
-        Events, Exit, PtyCapabilities, PtyCommand, PtyEvent, PtyExit, PtyProcess, PtySize,
-        PtyWriter,
+        Events, Exit, PtyCapabilities, PtyCommand, PtyControl, PtyEvent, PtyExit, PtyProcess,
+        PtySize, PtyWriter,
     };
 
     pub const CAPABILITIES: PtyCapabilities = PtyCapabilities {
@@ -924,7 +1089,7 @@ mod platform {
         }
     }
 
-    pub fn spawn(spec: &PtyCommand, _size: PtySize) -> io::Result<PtyProcess> {
+    pub fn spawn(spec: &PtyCommand, size: PtySize) -> io::Result<PtyProcess> {
         let mut command = spec.std_command();
         command
             .stdin(if spec.input.is_some() {
@@ -954,11 +1119,21 @@ mod platform {
         let child = Arc::new(Mutex::new(child));
         let exited = Arc::new(AtomicBool::new(false));
         let waited = Arc::clone(&child);
+        let control = PtyControl::new(
+            Control {
+                child: Arc::clone(&child),
+                pid,
+                exited: Arc::clone(&exited),
+                closed,
+            },
+            size,
+        );
         let exit = Exit {
             readers: 2,
             finished,
-            exited: Arc::clone(&exited),
+            exited,
             grace: spec.drain_grace,
+            status: Arc::clone(&control.status),
         };
         super::report_exit(events, exit, move || {
             loop {
@@ -977,12 +1152,7 @@ mod platform {
         });
         Ok(PtyProcess {
             events: receiver,
-            control: Control {
-                child,
-                pid,
-                exited,
-                closed,
-            },
+            control,
             exited: false,
         })
     }
@@ -995,6 +1165,8 @@ struct Exit {
     finished: mpsc::Receiver<bool>,
     exited: Arc<AtomicBool>,
     grace: Duration,
+    /// Where the status is published as soon as the process is reaped.
+    status: Arc<Mutex<Option<PtyExit>>>,
 }
 
 /// Wait for the process with `wait`, give its readers `exit.grace` to deliver the last output,
@@ -1011,6 +1183,10 @@ fn report_exit(
             signal: None,
             complete: true,
         });
+        *exit.status.lock().unwrap_or_else(PoisonError::into_inner) = Some(PtyExit {
+            complete: false,
+            ..status
+        });
         exit.exited.store(true, Ordering::Release);
         let deadline = Instant::now() + exit.grace;
         for _ in 0..exit.readers {
@@ -1025,6 +1201,7 @@ fn report_exit(
             }
         }
         events.closed.store(true, Ordering::Release);
+        *exit.status.lock().unwrap_or_else(PoisonError::into_inner) = Some(status);
         let _ = events.sender.send(PtyEvent::Exited(status));
     });
 }
