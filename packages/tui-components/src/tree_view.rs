@@ -138,6 +138,33 @@ pub enum TreeViewLabelOverflow {
     Ellipsis,
 }
 
+/// A bar marking the selected row, drawn in a column reserved at the start of
+/// every row (before the indentation).
+///
+/// Every row reserves the symbol's display width; the selected row shows the
+/// symbol in `style` patched over its row style, other rows show spaces in
+/// their row style. Selection then stays visible without relying on color
+/// alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TreeViewSelectionBar {
+    /// Symbol drawn on the selected row, for example `▌`.
+    pub symbol: &'static str,
+    /// Style of the symbol, patched over the selected row's style.
+    pub style: Style,
+}
+
+impl TreeViewSelectionBar {
+    /// A selection bar of `symbol` in `style`.
+    #[must_use]
+    pub const fn new(symbol: &'static str, style: Style) -> Self {
+        Self { symbol, style }
+    }
+
+    fn width(self) -> u16 {
+        u16::try_from(bmux_tui::text_width::display_width(self.symbol)).unwrap_or(u16::MAX)
+    }
+}
+
 /// Placement of right-aligned trailing decorations and label overflow.
 ///
 /// For each row, the room after the indentation, disclosure marker, and
@@ -591,6 +618,7 @@ struct TreeView<'a> {
     trailing_layout: TreeViewTrailingLayout,
     focus_style: Style,
     toggle_on_click: bool,
+    selection_bar: Option<TreeViewSelectionBar>,
 }
 
 impl<'a> TreeView<'a> {
@@ -624,6 +652,7 @@ impl<'a> TreeView<'a> {
             },
             trailing_layout: TreeViewTrailingLayout::new(),
             toggle_on_click: false,
+            selection_bar: None,
         }
     }
 
@@ -713,7 +742,10 @@ impl<'a> TreeView<'a> {
 
     fn intrinsic_row_width(&self, item: &TreeViewItem) -> usize {
         let trailing = decorations_width(&item.trailing, usize::from(self.trailing_layout.spacing));
-        usize::from(item.depth.saturating_mul(self.policy.indent_width))
+        usize::from(self.bar_width())
+            .saturating_add(usize::from(
+                item.depth.saturating_mul(self.policy.indent_width),
+            ))
             .saturating_add(2) // disclosure marker and separating space
             .saturating_add(item.label_width())
             .saturating_add(if trailing == 0 {
@@ -769,7 +801,36 @@ impl<'a> TreeView<'a> {
         }
     }
 
+    /// Cells reserved for the selection bar at the start of every row.
+    fn bar_width(&self) -> u16 {
+        self.selection_bar.map_or(0, TreeViewSelectionBar::width)
+    }
+
     fn row_line(
+        &self,
+        item: &TreeViewItem,
+        state: &TreeViewState,
+        visible: usize,
+        width: u16,
+    ) -> Line {
+        let Some(bar) = self.selection_bar else {
+            return self.row_body(item, state, visible, width);
+        };
+        let bar_width = bar.width().min(width);
+        let style = self.row_style(item, state, visible);
+        let selected = state.selected_visible == Some(visible) && bar_width == bar.width();
+        let bar_span = if selected {
+            Span::styled(bar.symbol, style.patch(bar.style))
+        } else {
+            Span::styled(" ".repeat(usize::from(bar_width)), style)
+        };
+        let mut line = self.row_body(item, state, visible, width - bar_width);
+        line.spans.insert(0, bar_span);
+        line
+    }
+
+    /// The row after the selection bar: indentation, marker, label and decorations.
+    fn row_body(
         &self,
         item: &TreeViewItem,
         state: &TreeViewState,
@@ -1338,6 +1399,15 @@ impl<'a, 'state> TreeViewComponent<'a, 'state> {
         self.tree.styles = styles;
         self
     }
+
+    /// Reserve a column at the start of every row for a bar marking the
+    /// selected row. Labels, decorations and the intrinsic width move right
+    /// by the bar's width.
+    #[must_use]
+    pub const fn selection_bar(mut self, bar: TreeViewSelectionBar) -> Self {
+        self.tree.selection_bar = Some(bar);
+        self
+    }
 }
 
 impl Component for TreeViewComponent<'_, '_> {
@@ -1370,6 +1440,7 @@ impl Component for TreeViewComponent<'_, '_> {
         }
         self.tree.policy.indent_width.hash(&mut layout);
         self.tree.trailing_layout.hash(&mut layout);
+        self.tree.selection_bar.hash(&mut layout);
         state.expanded_ids().hash(&mut layout);
 
         let mut paint = std::collections::hash_map::DefaultHasher::new();
@@ -1536,7 +1607,13 @@ mod tests {
     use bmux_tui::hit::HitRole;
     use bmux_tui::paint::{LocalRect, PaintCx};
 
-    use super::{TreeViewComponent, TreeViewItem, TreeViewOutcome, TreeViewPolicy, TreeViewState};
+    use bmux_tui::geometry::Size;
+    use bmux_tui::style::{Color, Style};
+
+    use super::{
+        TreeViewComponent, TreeViewItem, TreeViewOutcome, TreeViewPolicy, TreeViewSelectionBar,
+        TreeViewState, TreeViewStyles,
+    };
 
     fn render_component(component: &TreeViewComponent<'_, '_>, area: Rect, frame: &mut Frame<'_>) {
         let layout = component.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
@@ -1842,6 +1919,55 @@ mod tests {
                 );
                 assert_eq!(frame.hits().regions().len(), 2);
             }
+        }
+    }
+
+    #[test]
+    fn selection_bar_marks_only_the_selected_row_and_shifts_every_row() {
+        let items = [
+            TreeViewItem::new("a", "Alpha", 0),
+            TreeViewItem::new("b", "Beta", 1),
+        ];
+        let state = RefCell::new(TreeViewState::new(Some(1)));
+        let bar_style = Style::new().fg(Color::Magenta);
+        let component = TreeViewComponent::new("tree", &items, &state)
+            .styles(TreeViewStyles {
+                selected: Style::new().bg(Color::Blue),
+                ..TreeViewStyles::default()
+            })
+            .selection_bar(TreeViewSelectionBar::new("▌", bar_style));
+        let layout = component.layout(Constraints::loose(Size::new(40, 4)), &mut LayoutCx::new());
+        // The intrinsic width counts the bar column.
+        assert_eq!(layout.size.width, 1 + 2 + 2 + 4);
+        let area = Rect::new(0, 0, 12, 2);
+        let mut buffer = Buffer::empty(area);
+        let mut frame = Frame::new(&mut buffer);
+        render_component(&component, area, &mut frame);
+        assert_eq!(
+            frame.buffer().row_symbols(0).as_deref(),
+            Some("   Alpha    ")
+        );
+        assert_eq!(
+            frame.buffer().row_symbols(1).as_deref(),
+            Some("▌    Beta   ")
+        );
+        let bar = frame
+            .buffer()
+            .get(Point::new(0, 1))
+            .expect("bar cell")
+            .style;
+        assert_eq!(bar.fg, Some(Color::Magenta));
+        assert_eq!(bar.bg, Some(Color::Blue));
+
+        // Narrower than the bar: nothing but blank cells, no partial symbol.
+        for width in [0, 1] {
+            assert_eq!(
+                component
+                    .tree
+                    .row_line(&items[1], &state.borrow(), 1, width)
+                    .width(),
+                usize::from(width)
+            );
         }
     }
 

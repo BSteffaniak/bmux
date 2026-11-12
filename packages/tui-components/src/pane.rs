@@ -306,12 +306,15 @@ pub struct PaneTitleLayout {
     pub title: Option<Rect>,
     /// Visible actions as `(index into the pane's actions, area)`, left to right.
     pub actions: Vec<(usize, Rect)>,
+    /// Where the right title is written, when it fits beside the whole title.
+    pub right_title: Option<Rect>,
 }
 
 /// Configurable pane renderer and event handler.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pane<'a> {
     title: Option<Line>,
+    right_title: Option<Line>,
     footer: Option<Line>,
     actions: Vec<PaneTitleAction>,
     title_hit: bool,
@@ -329,6 +332,7 @@ impl Pane<'_> {
     pub const fn new() -> Self {
         Self {
             title: None,
+            right_title: None,
             footer: None,
             actions: Vec::new(),
             title_hit: false,
@@ -363,6 +367,16 @@ impl Pane<'_> {
     #[must_use]
     pub fn title(mut self, title: impl Into<Line>) -> Self {
         self.title = Some(title.into());
+        self
+    }
+
+    /// Set a right title: text right-aligned on the title row, before any
+    /// actions, for status such as counts. It is not interactive. It is shown
+    /// only when the title fits whole beside it with a one-cell gap; otherwise
+    /// it is dropped and the title keeps the room.
+    #[must_use]
+    pub fn right_title(mut self, title: impl Into<Line>) -> Self {
+        self.right_title = Some(title.into());
         self
     }
 
@@ -422,6 +436,7 @@ impl Pane<'_> {
             return PaneTitleLayout {
                 title: None,
                 actions: Vec::new(),
+                right_title: None,
             };
         }
         // Inside the corners.
@@ -460,11 +475,26 @@ impl Pane<'_> {
         } else {
             actions_start.saturating_sub(1)
         };
+        // The right title ends where the title would, and needs the whole title beside it.
+        let right_title = self.right_title.as_ref().and_then(|right| {
+            let width = u16::try_from(right.width()).unwrap_or(u16::MAX);
+            let needed = title_width
+                .filter(|title| *title > 0)
+                .map_or(0, |title| title.saturating_add(1))
+                .saturating_add(width);
+            (width > 0 && needed <= title_end.saturating_sub(inner_start))
+                .then(|| Rect::new(title_end - width, size.y, width, 1))
+        });
+        let title_end = right_title.map_or(title_end, |right| right.x.saturating_sub(1));
         let title = title_width.and_then(|width| {
             let width = width.min(title_end.saturating_sub(inner_start));
             (width > 0).then(|| Rect::new(inner_start, size.y, width, 1))
         });
-        PaneTitleLayout { title, actions }
+        PaneTitleLayout {
+            title,
+            actions,
+            right_title,
+        }
     }
 
     /// Set pane padding.
@@ -913,6 +943,12 @@ impl PaneComponent<'_, '_> {
                 title_row
             }
         };
+        if let (Some(right), Some(area)) = (&self.pane.right_title, title_row.right_title) {
+            cx.write_line(
+                LocalRect::new(i32::from(area.x), i64::from(area.y), area.width, 1),
+                right,
+            );
+        }
         for (index, area) in title_row.actions {
             let action = &self.pane.actions[index];
             cx.write_line(
@@ -951,6 +987,7 @@ impl Component for PaneComponent<'_, '_> {
         format!("{:?}", self.pane.styles).hash(&mut paint);
         format!("{:?}", self.pane.actions).hash(&mut paint);
         format!("{:?}", self.pane.footer).hash(&mut paint);
+        format!("{:?}", self.pane.right_title).hash(&mut paint);
         self.pane.title_hit.hash(&mut paint);
         format!("{:?}", self.pane.policy).hash(&mut paint);
         format!("{:?}", state.interaction).hash(&mut paint);
@@ -1977,6 +2014,29 @@ mod tests {
         // Too narrow for even the corners and one cell: nothing is drawn or registered.
         let (_, hits) = rendered(with_actions("Files"), 2);
         assert!(!hits.iter().any(|(id, _)| id.starts_with("pane.action")));
+    }
+
+    #[test]
+    fn right_title_sits_before_the_actions_and_yields_to_the_title() {
+        let pane = || with_actions("Files").right_title("12");
+        // Room for everything: the right title ends a cell before the first action.
+        let (buffer, hits) = rendered(pane(), 16);
+        assert_eq!(buffer.row_symbols(0).as_deref(), Some("┌Files───12─▾─✕┐"));
+        // It is not interactive.
+        assert!(!hits.iter().any(|(id, _)| id.contains("right")));
+        // Exactly the title, a gap and the right title.
+        let (buffer, _) = rendered(pane(), 14);
+        assert_eq!(buffer.row_symbols(0).as_deref(), Some("┌Files─12─▾─✕┐"));
+        // One cell less: the right title goes and the title keeps its room.
+        let (buffer, _) = rendered(pane(), 13);
+        assert_eq!(buffer.row_symbols(0).as_deref(), Some("┌Files───▾─✕┐"));
+        // Without a title the right title needs only its own width.
+        let (buffer, _) = rendered(Pane::new().right_title("変更"), 7);
+        assert_eq!(buffer.row_symbols(0).as_deref(), Some("┌─変更┐"));
+        let layout = Pane::new()
+            .right_title("変更")
+            .title_layout(Rect::new(0, 0, 5, 3));
+        assert_eq!(layout.right_title, None);
     }
 
     #[cfg(feature = "tab-bar")]

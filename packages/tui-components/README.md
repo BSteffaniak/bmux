@@ -188,6 +188,11 @@ let chrome = Pane::new()
     .action(PaneTitleAction::new("close", "✕"));
 ```
 
+`Pane::right_title` writes non-interactive status (a count, a state) on the
+title row, right-aligned before the actions. It is shown only when the whole
+title fits beside it with a one-cell gap; otherwise it is dropped and the title
+keeps the room. Its geometry is `PaneTitleLayout::right_title`.
+
 `Pane::footer` writes text right-aligned on the bottom border, such as a count
 or total that would compete with tabs and actions in the title row. It is
 truncated with an ellipsis when the border is too short, and its geometry is
@@ -380,6 +385,10 @@ let item = SelectableListItem::rich("app", "src/app.rs").trailing(
 );
 ```
 
+`SelectableListHighlightPolicy::styled(style)` draws the highlight symbol in
+`style` patched over the selected row's style (for example an accent `▌` bar),
+while the separating space and the label keep the row style.
+
 `SelectableListItem::background` paints one row on a color across its whole
 width, in place of the background its state style would give it (span
 backgrounds still apply), for row-level highlights such as a flash that fades
@@ -502,8 +511,12 @@ let tree = TreeViewComponent::new("files", &items, &state)
     );
 ```
 
-Row geometry, in order: indentation, disclosure marker, one separator cell,
-then the room holding the label and decorations. `TreeViewTrailingLayout`
+Row geometry, in order: the selection bar column (when set), indentation,
+disclosure marker, one separator cell, then the room holding the label and
+decorations. `TreeViewComponent::selection_bar(TreeViewSelectionBar::new("▌",
+accent))` reserves the symbol's width on every row and draws it, patched over
+the row style, on the selected row only, so the selection stays visible without
+relying on color; a row narrower than the bar shows blank cells. `TreeViewTrailingLayout`
 makes narrow rows explicit:
 
 * Decorations sit against the row's right edge, `gap` cells after the label

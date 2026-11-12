@@ -209,6 +209,9 @@ pub struct SelectableListHighlightPolicy {
     pub symbol: &'static str,
     /// Whether non-selected rows reserve equivalent spacing.
     pub repeat_spacing: bool,
+    /// Style of the symbol, patched over the selected row's style; `None` draws
+    /// the symbol in the row style.
+    pub style: Option<Style>,
 }
 
 impl SelectableListHighlightPolicy {
@@ -218,7 +221,16 @@ impl SelectableListHighlightPolicy {
         Self {
             symbol,
             repeat_spacing,
+            style: None,
         }
+    }
+
+    /// Return this policy with the symbol drawn in `style`, patched over the
+    /// selected row's style (for example an accent selection bar).
+    #[must_use]
+    pub const fn styled(mut self, style: Style) -> Self {
+        self.style = Some(style);
+        self
     }
 }
 
@@ -792,7 +804,13 @@ impl<'a> SelectableList<'a> {
             String::new()
         };
         if !prefix.is_empty() || self.policy.highlight.repeat_spacing {
-            spans.push(Span::styled(format!("{prefix} "), style));
+            match self.policy.highlight.style {
+                Some(symbol_style) if line_index == 0 && state.selected == Some(index) => {
+                    spans.push(Span::styled(prefix, style.patch(symbol_style)));
+                    spans.push(Span::styled(" ", style));
+                }
+                _ => spans.push(Span::styled(format!("{prefix} "), style)),
+            }
         }
         let content = item.lines.get(line_index).cloned().unwrap_or_default();
         let content = match &item.trailing {
@@ -1465,6 +1483,7 @@ impl Component for SelectableListComponent<'_, '_> {
             item.background.hash(&mut paint);
         }
         format!("{:?}", self.list.styles).hash(&mut paint);
+        self.list.policy.highlight.style.hash(&mut paint);
         format!("{:?}", self.fallback).hash(&mut paint);
         format!("{:?}", self.state.get()).hash(&mut paint);
         ComponentRevision::new(layout.finish(), paint.finish())
@@ -1633,6 +1652,7 @@ mod tests {
     use bmux_tui::hit::HitRole;
     use bmux_tui::paint::{LocalRect, PaintCx};
     use bmux_tui::prelude::{Line, Span, Style};
+    use bmux_tui::style::Color;
 
     use crate::scrollbar_layout::ScrollbarAxisLayoutMode;
 
@@ -2449,6 +2469,46 @@ mod tests {
             frame.buffer().row_symbols(1).as_deref(),
             Some("» Published   ")
         );
+    }
+
+    #[test]
+    fn styled_highlight_symbol_patches_only_the_symbol() {
+        let items = vec![
+            SelectableListItem::new("draft", "Draft"),
+            SelectableListItem::new("published", "Published"),
+        ];
+        let list = SelectableList::new(&items)
+            .policy(SelectableListPolicy {
+                highlight: SelectableListHighlightPolicy::new("▌", true)
+                    .styled(Style::new().fg(Color::Magenta)),
+                ..SelectableListPolicy::default()
+            })
+            .styles(SelectableListStyles {
+                selected: Style::new().fg(Color::White).bg(Color::Blue),
+                ..SelectableListStyles::default()
+            });
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 14, 2));
+        let mut frame = Frame::new(&mut buffer);
+
+        list.render(
+            Rect::new(0, 0, 14, 2),
+            &SelectableListState::new(Some(1)),
+            &mut frame,
+        );
+
+        assert_eq!(
+            frame.buffer().row_symbols(0).as_deref(),
+            Some("  Draft       ")
+        );
+        assert_eq!(
+            frame.buffer().row_symbols(1).as_deref(),
+            Some("▌ Published   ")
+        );
+        let cell = |x| frame.buffer().get(Point::new(x, 1)).expect("cell").style;
+        assert_eq!(cell(0).fg, Some(Color::Magenta));
+        assert_eq!(cell(0).bg, Some(Color::Blue));
+        assert_eq!(cell(1).fg, Some(Color::White));
+        assert_eq!(cell(2).fg, Some(Color::White));
     }
 
     #[test]
