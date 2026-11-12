@@ -27,7 +27,7 @@ use std::cell::{Cell, RefCell};
 use std::hash::{Hash, Hasher};
 use std::ops::Range;
 
-pub use bmux_terminal_grid::{ContentAnchor, SelectionCell};
+pub use bmux_terminal_grid::{ContentAnchor, ContentRowSource, SelectionCell};
 use bmux_terminal_grid::{
     ContentBudget, ContentProjection, GridLimits, GridMode, PhysicalRow, TerminalGrid,
     TerminalGridStream,
@@ -92,6 +92,10 @@ pub enum TerminalViewMode {
 pub enum TerminalRows {
     /// The last `n` rows. Only the output they need is captured.
     Tail(usize),
+    /// The last `n` rows of the screen as it is now, without the history above it and keeping
+    /// the cursor's row even while blank: for following a running program. Unavailable while
+    /// a full-screen program runs (see [`TerminalState::screen_window`]).
+    Viewport(usize),
     /// At most `count` rows from row `start`.
     Range {
         /// First row.
@@ -99,9 +103,10 @@ pub enum TerminalRows {
         /// Most rows.
         count: usize,
     },
-    /// At most `count` rows from the row holding `anchor` (from an earlier window), so a
-    /// position survives reflow at another width. The tail when the anchor no longer
-    /// resolves (the output changed since).
+    /// At most `count` rows from the row holding `anchor` (from an earlier window, of any
+    /// kind), so a position survives reflow at another width. The tail of all output when the
+    /// anchor no longer resolves (the output changed since); its first row's source then
+    /// carries another capture than the anchor.
     From {
         /// Where the window starts.
         anchor: ContentAnchor,
@@ -132,19 +137,50 @@ pub struct TerminalWindow {
     pub first: usize,
     /// All rows at this width.
     pub total: usize,
-    /// Where each row starts in the output (reflowed windows only).
-    pub anchors: Vec<ContentAnchor>,
+    /// Where each row starts and ends in the output (reflowed windows only). A row's start
+    /// is an anchor for [`TerminalRows::From`].
+    pub sources: Vec<ContentRowSource>,
     /// Selection correspondence for each row, in order.
     pub selection: Vec<TerminalSelectionRow>,
     /// Older output was dropped from history.
     pub history_truncated: bool,
 }
 
+/// What a projection captured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Scope {
+    /// The last logical lines; `usize::MAX` for all.
+    Lines(usize),
+    /// The screen as it is now.
+    Viewport,
+}
+
+impl Scope {
+    /// Whether a capture of `self` serves a request for `wanted`.
+    const fn covers(self, wanted: Self) -> bool {
+        match (self, wanted) {
+            (Self::Lines(captured), Self::Lines(wanted)) => captured >= wanted,
+            (Self::Viewport, Self::Viewport) => true,
+            _ => false,
+        }
+    }
+
+    /// The grid revision a capture of this scope stays valid for: the viewport depends on
+    /// the cursor too.
+    const fn revision(self, grid: &TerminalGrid) -> u64 {
+        match self {
+            Self::Lines(_) => grid.content_revision(),
+            Self::Viewport => grid.revision(),
+        }
+    }
+}
+
 /// Captured output reflowed at one width, kept until the terminal changes.
 struct Reflowed {
     revision: u64,
-    /// Logical lines captured from the end; `usize::MAX` for all.
-    lines: usize,
+    scope: Scope,
+    /// Identity of the capture, as anchors from it carry.
+    capture: u128,
     width: usize,
     projection: ContentProjection,
     rows: usize,
@@ -279,36 +315,38 @@ impl TerminalState {
     /// Run `use_rows` on the output reflowed at `width`, projecting it when the terminal or
     /// width changed since the last projection. `None` when the output exceeds the budget.
     fn with_reflowed<T>(&self, width: usize, use_rows: impl FnOnce(&Reflowed) -> T) -> Option<T> {
-        self.with_projection(width, usize::MAX, use_rows)
+        self.with_projection(width, Scope::Lines(usize::MAX), use_rows)
     }
 
-    /// [`Self::with_reflowed`] needing only the last `lines` logical lines captured.
+    /// [`Self::with_reflowed`] for a capture of `scope`.
     fn with_projection<T>(
         &self,
         width: usize,
-        lines: usize,
+        scope: Scope,
         use_rows: impl FnOnce(&Reflowed) -> T,
     ) -> Option<T> {
         let grid = self.grid();
         let width = width.max(1);
         let mut cache = self.reflowed.borrow_mut();
         let stale = cache.as_ref().is_none_or(|cached| {
-            cached.revision != grid.content_revision() || cached.lines < lines
+            cached.revision != cached.scope.revision(grid) || !cached.scope.covers(scope)
         });
         if stale {
             let capture = self.captures.get().wrapping_add(1);
             self.captures.set(capture);
             let all = grid.height().saturating_add(grid.max_scrollback_offset());
-            *cache = grid
-                .capture_content(capture, lines.min(all), REFLOW_BUDGET)
-                .ok()
-                .map(|projection| Reflowed {
-                    revision: grid.content_revision(),
-                    lines,
-                    width: 0,
-                    projection,
-                    rows: 0,
-                });
+            let projection = match scope {
+                Scope::Lines(lines) => grid.capture_content(capture, lines.min(all), REFLOW_BUDGET),
+                Scope::Viewport => grid.capture_viewport(capture, REFLOW_BUDGET),
+            };
+            *cache = projection.ok().map(|projection| Reflowed {
+                revision: scope.revision(grid),
+                scope,
+                capture,
+                width: 0,
+                projection,
+                rows: 0,
+            });
         }
         let reflowed = cache.as_mut()?;
         if reflowed.width != width {
@@ -328,17 +366,31 @@ impl TerminalState {
     /// following a running program costs no more than the rows on view.
     #[must_use]
     pub fn window(&self, width: usize, rows: TerminalRows) -> Option<TerminalWindow> {
-        let lines = match rows {
-            TerminalRows::Tail(count) => count,
-            TerminalRows::Range { .. } | TerminalRows::From { .. } => usize::MAX,
-        };
         let grid = self.grid();
+        let scope = match rows {
+            TerminalRows::Tail(count) => Scope::Lines(count),
+            TerminalRows::Viewport(_) => Scope::Viewport,
+            TerminalRows::Range { .. } => Scope::Lines(usize::MAX),
+            // An anchor resolves in the capture it came from, whatever that captured, while
+            // the output is unchanged.
+            TerminalRows::From { anchor, .. } => self
+                .reflowed
+                .borrow()
+                .as_ref()
+                .filter(|cached| {
+                    cached.capture == anchor.capture
+                        && cached.revision == cached.scope.revision(grid)
+                })
+                .map_or(Scope::Lines(usize::MAX), |cached| cached.scope),
+        };
         let truncated = grid.history_truncated();
-        self.with_projection(width, lines, |reflowed| {
+        self.with_projection(width, scope, |reflowed| {
             let projection = &reflowed.projection;
             let total = reflowed.rows;
             let range = match rows {
-                TerminalRows::Tail(count) => total.saturating_sub(count)..total,
+                TerminalRows::Tail(count) | TerminalRows::Viewport(count) => {
+                    total.saturating_sub(count)..total
+                }
                 TerminalRows::Range { start, count } => {
                     start.min(total)..start.saturating_add(count).min(total)
                 }
@@ -372,7 +424,7 @@ impl TerminalState {
                     .collect(),
                 first: range.start,
                 total,
-                anchors: window.anchors,
+                sources: window.sources,
                 selection,
                 history_truncated: truncated || window.history_truncated,
             })
@@ -412,7 +464,7 @@ impl TerminalState {
                 .collect(),
             first: rows.start.min(grid.height()),
             total: grid.height(),
-            anchors: Vec::new(),
+            sources: Vec::new(),
             selection,
             history_truncated: false,
         })
@@ -962,7 +1014,10 @@ mod tests {
         assert_eq!(window.selection[2].text, "fghij");
         assert_eq!(window.selection[2].byte_start, 5);
         assert_eq!(window.selection[1].identity, window.selection[2].identity);
-        assert_eq!(window.anchors.len(), 4);
+        assert_eq!(window.sources.len(), 4);
+        // A wrapped line's rows share the line and continue across the wrap.
+        assert!(window.sources[1].continues);
+        assert_eq!(window.sources[2].start.column, 5);
     }
 
     #[test]
@@ -987,7 +1042,7 @@ mod tests {
         assert_eq!(text(&all.lines[0]), "line number 11");
         assert_eq!(all.total, 30);
         // The same source position at a narrower width, where every line wraps.
-        let anchor = all.anchors[0];
+        let anchor = all.sources[0].start;
         let narrow = state
             .window(8, TerminalRows::From { anchor, count: 2 })
             .unwrap();
@@ -1002,12 +1057,46 @@ mod tests {
         let anchor = state
             .window(20, TerminalRows::Range { start: 0, count: 1 })
             .unwrap()
-            .anchors[0];
+            .sources[0]
+            .start;
         state.feed(b"c\r\n");
         let window = state
             .window(20, TerminalRows::From { anchor, count: 1 })
             .unwrap();
         assert_eq!(text(&window.lines[0]), "c");
+    }
+
+    #[test]
+    fn viewport_windows_follow_the_screen_without_history() {
+        let bytes: Vec<u8> = (1..=6)
+            .flat_map(|n| format!("line {n}\r\n").into_bytes())
+            .collect();
+        let state = state(20, 3, &bytes);
+        let viewport = state.window(20, TerminalRows::Viewport(10)).unwrap();
+        let lines: Vec<String> = viewport.lines.iter().map(text).collect();
+        // The screen only, with the cursor's row after the last line.
+        assert_eq!(lines, ["line 5", "line 6", ""]);
+        // A tail of the content shows history and no trailing cursor row.
+        let tail = state.window(20, TerminalRows::Tail(3)).unwrap();
+        let lines: Vec<String> = tail.lines.iter().map(text).collect();
+        assert_eq!(lines, ["line 4", "line 5", "line 6"]);
+    }
+
+    #[test]
+    fn anchors_from_viewport_windows_resolve_in_their_capture() {
+        let bytes: Vec<u8> = (1..=6)
+            .flat_map(|n| format!("line {n}\r\n").into_bytes())
+            .collect();
+        let state = state(20, 3, &bytes);
+        let viewport = state.window(20, TerminalRows::Viewport(3)).unwrap();
+        let anchor = viewport.sources[0].start;
+        let window = state
+            .window(4, TerminalRows::From { anchor, count: 2 })
+            .unwrap();
+        // "line 5" at four columns, from the same capture.
+        assert_eq!(text(&window.lines[0]), "line");
+        assert_eq!(text(&window.lines[1]), " 5");
+        assert_eq!(window.sources[0].start.capture, anchor.capture);
     }
 
     #[test]
