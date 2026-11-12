@@ -124,6 +124,16 @@ bounded compatibility renderer. Performance-sensitive live consumers should
 retain the stream and capture themselves instead of passing cumulative bytes to
 that stateless convenience component on every draw.
 
+## Plain-text logs of unbounded output
+
+`content_text` gives the plain text of what the grid retains. For a complete log
+of output longer than the scrollback limit, call
+`TerminalGrid::collect_evicted_text(true)` and drain `take_evicted_text` as
+output is processed: it returns the text of history lines as they leave the grid
+(past the limit, or cleared by erasing scrollback or a reset), formatted as
+`content_text` formats lines. What was taken, followed by `content_text` at the
+end, is the whole log, however small the grid's history.
+
 ## Source-aware selection and copy
 
 `ContentProjection::selection_window` returns per-cell display-column geometry

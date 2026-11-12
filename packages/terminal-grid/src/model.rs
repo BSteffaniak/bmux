@@ -646,6 +646,8 @@ pub struct TerminalGrid {
     main_history: VecDeque<LogicalLine>,
     history_bytes: usize,
     history_truncated: bool,
+    /// Text of history lines dropped since last taken, while collected.
+    evicted_text: Option<String>,
     main_history_projected_rows: OnceLock<usize>,
     pending_history_cells: Vec<Cell>,
     main_rows: VecDeque<PhysicalRow>,
@@ -752,6 +754,7 @@ impl TerminalGrid {
             main_history: VecDeque::new(),
             history_bytes: 0,
             history_truncated: false,
+            evicted_text: None,
             main_history_projected_rows: OnceLock::from(0),
             pending_history_cells: Vec::new(),
             main_rows,
@@ -853,6 +856,8 @@ impl TerminalGrid {
                 .sum::<usize>()
                 .saturating_add(history_cells_bytes(&pending_history_cells)),
             history_truncated: snapshot.history_truncated.unwrap_or(true),
+            // Collection is the caller's runtime choice, not snapshotted state.
+            evicted_text: None,
             main_history,
             main_history_projected_rows: OnceLock::from(main_history_projected_rows),
             pending_history_cells,
@@ -1445,6 +1450,7 @@ impl TerminalGrid {
             3 if self.mode == GridMode::Main => {
                 self.history_erase_revision = self.history_erase_revision.wrapping_add(1);
                 self.history_truncated |= self.history_line_count() > 0;
+                self.hand_over_history();
                 self.history_bytes = 0;
                 self.main_history.clear();
                 self.main_history_projected_rows = OnceLock::from(0);
@@ -1766,6 +1772,8 @@ impl TerminalGrid {
         let width = u16::try_from(self.width).unwrap_or(u16::MAX);
         let height = u16::try_from(self.height).unwrap_or(u16::MAX);
         if let Ok(mut reset) = Self::new(width, height, self.limits) {
+            self.hand_over_history();
+            reset.evicted_text = self.evicted_text.take();
             reset.revision = self.revision;
             reset.content_revision = self.content_revision;
             reset.display_erase_revision = self.display_erase_revision.wrapping_add(1);
@@ -1908,6 +1916,57 @@ impl TerminalGrid {
     #[must_use]
     pub const fn history_truncated(&self) -> bool {
         self.history_truncated
+    }
+
+    /// Collect the text of history lines as they leave the grid (beyond the scrollback
+    /// limit, or cleared by erasing scrollback or a reset), for [`Self::take_evicted_text`].
+    /// With [`crate::content_text`] of what remains, this gives a complete plain-text log of
+    /// unbounded output from a bounded grid. Off by default; turning it off discards what was
+    /// collected.
+    pub fn collect_evicted_text(&mut self, enabled: bool) {
+        self.evicted_text = enabled.then(|| self.evicted_text.take().unwrap_or_default());
+    }
+
+    /// Text of the history lines that left the grid since last taken, in order, each line
+    /// ending in a newline (as [`crate::content_text`] formats lines). Empty unless collected.
+    pub fn take_evicted_text(&mut self) -> String {
+        self.evicted_text
+            .as_mut()
+            .map(std::mem::take)
+            .unwrap_or_default()
+    }
+
+    /// Collect the text of all retained history, which is about to be dropped.
+    fn hand_over_history(&mut self) {
+        if self.evicted_text.is_none() {
+            return;
+        }
+        let lines: Vec<Vec<Cell>> = self
+            .main_history
+            .iter()
+            .map(|line| line.cells.clone())
+            .collect();
+        for cells in &lines {
+            self.hand_over_line(cells, true);
+        }
+        let pending = self.pending_history_cells.clone();
+        self.hand_over_line(&pending, false);
+    }
+
+    /// Collect the text of `cells`, a whole line (`complete`) or the start of an open one.
+    fn hand_over_line(&mut self, cells: &[Cell], complete: bool) {
+        let Some(text) = self.evicted_text.as_mut() else {
+            return;
+        };
+        let start = text.len();
+        for cell in cells.iter().filter(|cell| !cell.is_wide_continuation()) {
+            text.push_str(cell.text());
+        }
+        if complete {
+            let end = text[start..].trim_end().len();
+            text.truncate(start + end);
+            text.push('\n');
+        }
     }
 
     /// Number of logical lines addressable by `history_slice` in this capture.
@@ -3243,6 +3302,8 @@ impl TerminalGrid {
             limits: self.limits,
             history_bytes: self.history_bytes,
             history_truncated: self.history_truncated,
+            // A bounded copy for presentation does not carry collected text.
+            evicted_text: None,
             main_history,
             main_history_projected_rows: OnceLock::new(),
             pending_history_cells: try_clone_cells(&self.pending_history_cells)?,
@@ -3338,6 +3399,7 @@ impl TerminalGrid {
         {
             self.history_truncated = true;
             if let Some(line) = self.main_history.pop_front() {
+                self.hand_over_line(&line.cells, true);
                 self.history_bytes = self
                     .history_bytes
                     .saturating_sub(history_cells_bytes(&line.cells));
@@ -3345,7 +3407,9 @@ impl TerminalGrid {
                     *count = count.saturating_sub(line.projected_row_count(self.width));
                 }
             } else {
-                self.pending_history_cells = Vec::new();
+                let pending = std::mem::take(&mut self.pending_history_cells);
+                // The rest of this open line follows in a later line.
+                self.hand_over_line(&pending, false);
                 self.history_bytes = 0;
                 break;
             }
