@@ -861,6 +861,12 @@ impl<'a> TreeView<'a> {
         } else {
             self.styles.marker
         };
+        // The marker sits on the row: its own background never breaks the fill of a
+        // selected, hovered or pressed row.
+        let marker_style = style.patch(Style {
+            bg: None,
+            ..marker_style
+        });
         let remaining = width - indent_width;
         let separator = if remaining > 1 { " " } else { "" };
         let mut spans = vec![
@@ -1968,6 +1974,44 @@ mod tests {
                     .width(),
                 usize::from(width)
             );
+        }
+    }
+
+    #[test]
+    fn row_fill_runs_under_the_disclosure_marker() {
+        let items = [
+            TreeViewItem::new("dir", "Dir", 0).expandable(true),
+            TreeViewItem::new("leaf", "Leaf", 0),
+        ];
+        let state = RefCell::new(TreeViewState::new(Some(0)));
+        let canvas = Color::Black;
+        let selected = Color::Blue;
+        let component = TreeViewComponent::new("tree", &items, &state).styles(TreeViewStyles {
+            normal: Style::new().bg(canvas),
+            selected: Style::new().bg(selected),
+            marker: Style::new().fg(Color::Green).bg(canvas),
+            ..TreeViewStyles::default()
+        });
+        let area = Rect::new(0, 0, 10, 2);
+        for row in [0_usize, 1] {
+            state.borrow_mut().selected_visible = Some(row);
+            let mut buffer = Buffer::empty(area);
+            let mut frame = Frame::new(&mut buffer);
+            render_component(&component, area, &mut frame);
+            let y = u16::try_from(row).expect("row");
+            let marker = frame
+                .buffer()
+                .get(Point::new(0, y))
+                .expect("marker cell")
+                .style;
+            assert_eq!(marker.bg, Some(selected), "row {row}");
+            assert_eq!(marker.fg, Some(Color::Green), "row {row}");
+            let other = frame
+                .buffer()
+                .get(Point::new(0, 1 - y))
+                .expect("other row")
+                .style;
+            assert_eq!(other.bg, Some(canvas), "row {row}");
         }
     }
 
