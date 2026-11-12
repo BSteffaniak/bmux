@@ -619,7 +619,11 @@ mod tests {
                 .chars()
                 .any(|ch| ('\u{2801}'..='\u{28ff}').contains(&ch))
         );
-        assert!(rendered.contains("Saved ×"));
+        // The toast's close button sits on its last column, after the title.
+        assert!(rendered.lines().any(|line| {
+            line.find("Saved")
+                .is_some_and(|title| line[title..].contains('×'))
+        }));
         assert!(rendered.contains("Changes persisted"));
         assert!(rendered.contains("Command Palette"));
         assert!(rendered.contains("Commands"));
