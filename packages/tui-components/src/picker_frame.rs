@@ -701,21 +701,11 @@ impl Component for PickerFrameComponent<'_> {
             let Some(component) = components.next_back() else {
                 break;
             };
-            let x = panel.x.saturating_add(child.x);
-            let y = panel.y.saturating_add(child.y);
-            let outcome = cx.with_transform(
-                x,
-                y,
-                i32::try_from(x).unwrap_or(i32::MAX),
-                i64::try_from(y).unwrap_or(i64::MAX),
-                Rect::new(
-                    u16::try_from(x).unwrap_or(u16::MAX),
-                    u16::try_from(y).unwrap_or(u16::MAX),
-                    child.node.size.width.try_into().unwrap_or(u16::MAX),
-                    u16::try_from(child.node.size.height).unwrap_or(u16::MAX),
-                ),
-                |cx| component.event(event, &child.node, cx),
-            );
+            // Project through the panel and the slot so the child's clip is in terminal space
+            // wherever the frame itself is placed.
+            let outcome = cx.with_child(panel, |cx| {
+                cx.with_child(child, |cx| component.event(event, &child.node, cx))
+            });
             if outcome != EventOutcome::Ignored {
                 return outcome;
             }
@@ -1132,6 +1122,93 @@ mod tests {
                 .row_symbols(6)
                 .is_some_and(|row| row.contains("query"))
         );
+    }
+
+    /// A child receives pointer events at its painted cells when the frame is routed at a
+    /// translated origin (inside a larger screen), not only at the terminal origin.
+    #[test]
+    fn translated_frames_route_pointer_events_to_the_painted_child() {
+        use bmux_tui::component::EventCx;
+        use bmux_tui::event::{Event, EventOutcome, MouseButton, MouseEvent, MouseEventKind};
+        use std::cell::Cell;
+
+        struct Probe<'a>(&'a Cell<Option<(u16, u16)>>);
+        impl Component for Probe<'_> {
+            fn layout(
+                &self,
+                constraints: Constraints,
+                _cx: &mut LayoutCx,
+            ) -> bmux_tui::component::LayoutNode {
+                bmux_tui::component::LayoutNode::leaf(
+                    bmux_tui::component::LayoutId::new("picker.list"),
+                    constraints.constrain(bmux_tui::component::LogicalSize::new(10, 3)),
+                )
+            }
+            fn paint(&self, _layout: &bmux_tui::component::LayoutNode, _cx: &mut PaintCx<'_, '_>) {}
+            fn event(
+                &self,
+                event: &Event,
+                _layout: &bmux_tui::component::LayoutNode,
+                cx: &mut EventCx<'_>,
+            ) -> EventOutcome {
+                let Event::Mouse(mouse) = event else {
+                    return EventOutcome::Ignored;
+                };
+                // Like any pointer target, only points inside the routed clip are this child's.
+                if cx.clip().is_some_and(|clip| !clip.contains(mouse.position)) {
+                    return EventOutcome::Ignored;
+                }
+                let (x, y) = cx.local_point(mouse.position);
+                let (Ok(x), Ok(y)) = (u16::try_from(x), u16::try_from(y)) else {
+                    return EventOutcome::Ignored;
+                };
+                self.0.set(Some((x, y)));
+                EventOutcome::Handled
+            }
+        }
+
+        let seen = Cell::new(None);
+        let component = PickerFrameComponent::new(
+            "picker",
+            PickerFrame::new().policy(PickerFramePolicy {
+                margin: Insets::all(0),
+                min_size: Size::new(20, 7),
+                max_size: Size::new(20, 7),
+                placement: PickerFramePlacement::Anchored(Point::new(4, 6)),
+                ..PickerFramePolicy::palette()
+            }),
+            Probe(&seen),
+        );
+        let area = Size::new(40, 20);
+        let layout = component.layout(Constraints::tight(area), &mut LayoutCx::new());
+        let panel = &layout.children[0];
+        let slot = &panel.node.children[0];
+        for origin in [Point::new(0, 0), Point::new(3, 5)] {
+            // The child's second cell, in terminal coordinates.
+            let x = origin.x + u16::try_from(panel.x + slot.x).unwrap() + 1;
+            let y = origin.y + u16::try_from(panel.y + slot.y).unwrap();
+            seen.set(None);
+            let mut cx = EventCx::new(&layout);
+            let outcome = cx.with_transform(
+                0,
+                0,
+                i32::from(origin.x),
+                i64::from(origin.y),
+                Rect::new(origin.x, origin.y, area.width, area.height),
+                |cx| {
+                    component.event(
+                        &Event::Mouse(MouseEvent::new(
+                            MouseEventKind::Down(MouseButton::Left),
+                            Point::new(x, y),
+                        )),
+                        &layout,
+                        cx,
+                    )
+                },
+            );
+            assert_eq!(outcome, EventOutcome::Handled, "{origin:?}");
+            assert_eq!(seen.get(), Some((1, 0)), "{origin:?}");
+        }
     }
 
     #[test]
