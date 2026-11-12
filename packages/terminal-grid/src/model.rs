@@ -385,11 +385,152 @@ impl ProtocolState {
     }
 }
 
+/// Bytes of cell text stored inline, without allocating.
+const INLINE_CELL_TEXT: usize = 15;
+
+/// Text of one cell. Nearly always one character, so short text is stored inline: printing
+/// does not allocate per cell. Longer grapheme clusters are stored on the heap.
+#[derive(Clone)]
+enum CellText {
+    Inline {
+        len: u8,
+        bytes: [u8; INLINE_CELL_TEXT],
+    },
+    Heap(String),
+}
+
+impl CellText {
+    const fn empty() -> Self {
+        Self::Inline {
+            len: 0,
+            bytes: [0; INLINE_CELL_TEXT],
+        }
+    }
+
+    fn from_str(text: &str) -> Self {
+        let mut stored = Self::empty();
+        if !stored.push_str(text) {
+            stored = Self::Heap(text.to_owned());
+        }
+        stored
+    }
+
+    fn from_char(ch: char) -> Self {
+        let mut stored = Self::empty();
+        let mut buffer = [0; 4];
+        stored.push_str(ch.encode_utf8(&mut buffer));
+        stored
+    }
+
+    /// `text`, inline when it fits, otherwise keeping its allocation.
+    fn from_string(text: String) -> Self {
+        let mut stored = Self::empty();
+        if stored.push_str(&text) {
+            stored
+        } else {
+            Self::Heap(text)
+        }
+    }
+
+    /// A copy, or `None` when its heap storage cannot be allocated.
+    fn try_clone(&self) -> Option<Self> {
+        match self {
+            Self::Inline { len, bytes } => Some(Self::Inline {
+                len: *len,
+                bytes: *bytes,
+            }),
+            Self::Heap(text) => {
+                let mut copy = String::new();
+                copy.try_reserve_exact(text.len()).ok()?;
+                copy.push_str(text);
+                Some(Self::Heap(copy))
+            }
+        }
+    }
+
+    fn as_str(&self) -> &str {
+        match self {
+            Self::Inline { len, bytes } => {
+                let bytes = &bytes[..usize::from(*len)];
+                debug_assert!(std::str::from_utf8(bytes).is_ok());
+                // SAFETY: inline bytes are only written by `push_str`, which copies whole
+                // `&str`s end to end, so the first `len` bytes are always valid UTF-8.
+                unsafe { std::str::from_utf8_unchecked(bytes) }
+            }
+            Self::Heap(text) => text,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.as_str().len()
+    }
+
+    /// Heap bytes held; inline text lives in the cell itself.
+    fn capacity(&self) -> usize {
+        match self {
+            Self::Inline { .. } => 0,
+            Self::Heap(text) => text.capacity(),
+        }
+    }
+
+    /// Append `text` inline; `false` (unchanged) when it does not fit.
+    fn push_str(&mut self, text: &str) -> bool {
+        match self {
+            Self::Inline { len, bytes } => {
+                let start = usize::from(*len);
+                let end = start + text.len();
+                if end > INLINE_CELL_TEXT {
+                    return false;
+                }
+                bytes[start..end].copy_from_slice(text.as_bytes());
+                *len = u8::try_from(end).unwrap_or(u8::MAX);
+                true
+            }
+            Self::Heap(stored) => {
+                stored.push_str(text);
+                true
+            }
+        }
+    }
+
+    fn push(&mut self, ch: char) {
+        let mut buffer = [0; 4];
+        let text = ch.encode_utf8(&mut buffer);
+        if !self.push_str(text) {
+            let mut heap = String::with_capacity(self.len() + text.len());
+            heap.push_str(self.as_str());
+            heap.push_str(text);
+            *self = Self::Heap(heap);
+        }
+    }
+
+    #[cfg(test)]
+    fn reserve_exact(&mut self, additional: usize) {
+        let mut heap = self.as_str().to_owned();
+        heap.reserve_exact(additional);
+        *self = Self::Heap(heap);
+    }
+}
+
+impl PartialEq for CellText {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_str() == other.as_str()
+    }
+}
+
+impl Eq for CellText {}
+
+impl std::fmt::Debug for CellText {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(self.as_str(), formatter)
+    }
+}
+
 /// One display cell. Wide-character spacer cells are represented with
 /// `wide_continuation = true` and empty text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Cell {
-    text: String,
+    text: CellText,
     style: StyleId,
     width: u8,
     wide_continuation: bool,
@@ -398,18 +539,28 @@ pub struct Cell {
 impl Cell {
     #[must_use]
     pub fn new(text: impl Into<String>, style: StyleId, width: u8) -> Self {
+        let text = text.into();
+        Self::with_text(CellText::from_str(&text), style, width)
+    }
+
+    /// A cell holding the one character `ch`, without allocating.
+    fn from_char(ch: char, style: StyleId, width: u8) -> Self {
+        Self::with_text(CellText::from_char(ch), style, width)
+    }
+
+    const fn with_text(text: CellText, style: StyleId, width: u8) -> Self {
         Self {
-            text: text.into(),
+            text,
             style,
-            width: width.max(1),
+            width: if width == 0 { 1 } else { width },
             wide_continuation: false,
         }
     }
 
     #[must_use]
-    pub fn spacer(style: StyleId) -> Self {
+    pub const fn spacer(style: StyleId) -> Self {
         Self {
-            text: String::new(),
+            text: CellText::empty(),
             style,
             width: 0,
             wide_continuation: true,
@@ -418,12 +569,12 @@ impl Cell {
 
     #[must_use]
     pub fn blank(style: StyleId) -> Self {
-        Self::new(" ", style, 1)
+        Self::from_char(' ', style, 1)
     }
 
     #[must_use]
     pub fn text(&self) -> &str {
-        &self.text
+        self.text.as_str()
     }
 
     #[must_use]
@@ -443,10 +594,7 @@ impl Cell {
 
     #[must_use]
     pub fn is_discardable_blank(&self) -> bool {
-        self.text.len() == 1
-            && self.text.as_bytes()[0] == b' '
-            && self.style == StyleId::DEFAULT
-            && !self.wide_continuation
+        self.text.as_str() == " " && self.style == StyleId::DEFAULT && !self.wide_continuation
     }
 }
 
@@ -488,18 +636,12 @@ impl PhysicalRow {
             .try_reserve_exact(end.saturating_sub(self.cells.len()))
             .ok()?;
         while self.cells.len() < end {
-            // Reserve blank text explicitly; projection can expose gaps after
-            // discardable cells have been trimmed.
-            let mut text = String::new();
-            text.try_reserve_exact(1).ok()?;
-            text.push(' ');
-            self.cells.push(Cell::new(text, StyleId::DEFAULT, 1));
+            // Blank text explicitly; projection can expose gaps after discardable cells have
+            // been trimmed.
+            self.cells.push(Cell::blank(StyleId::DEFAULT));
         }
-        let mut text = String::new();
-        text.try_reserve_exact(cell.text.len()).ok()?;
-        text.push_str(&cell.text);
         self.cells[col] = Cell {
-            text,
+            text: cell.text.try_clone()?,
             style: cell.style,
             width: cell.width,
             wide_continuation: cell.wide_continuation,
@@ -648,6 +790,8 @@ pub struct TerminalGrid {
     history_truncated: bool,
     /// Text of history lines dropped since last taken, while collected.
     evicted_text: Option<String>,
+    /// The style printing last interned, and its id: printed runs share one style.
+    interned_style: Option<(Style, StyleId)>,
     main_history_projected_rows: OnceLock<usize>,
     pending_history_cells: Vec<Cell>,
     main_rows: VecDeque<PhysicalRow>,
@@ -755,6 +899,7 @@ impl TerminalGrid {
             history_bytes: 0,
             history_truncated: false,
             evicted_text: None,
+            interned_style: None,
             main_history_projected_rows: OnceLock::from(0),
             pending_history_cells: Vec::new(),
             main_rows,
@@ -858,6 +1003,7 @@ impl TerminalGrid {
             history_truncated: snapshot.history_truncated.unwrap_or(true),
             // Collection is the caller's runtime choice, not snapshotted state.
             evicted_text: None,
+            interned_style: None,
             main_history,
             main_history_projected_rows: OnceLock::from(main_history_projected_rows),
             pending_history_cells,
@@ -1362,10 +1508,10 @@ impl TerminalGrid {
         if char_width == 0 {
             return;
         }
-        self.print_grapheme(ch.to_string(), char_width.min(2));
+        self.print_grapheme(CellText::from_char(ch), char_width.min(2));
     }
 
-    fn print_grapheme(&mut self, text: String, char_width: usize) {
+    fn print_grapheme(&mut self, text: CellText, char_width: usize) {
         if self.autowrap && self.pending_wrap {
             self.pending_wrap = false;
             self.mark_current_row_wrapped();
@@ -1378,7 +1524,14 @@ impl TerminalGrid {
             self.linefeed();
         }
 
-        let style = self.palette.intern(self.current_style);
+        let style = match self.interned_style {
+            Some((style, id)) if style == self.current_style => id,
+            _ => {
+                let id = self.palette.intern(self.current_style);
+                self.interned_style = Some((self.current_style, id));
+                id
+            }
+        };
         let row = self.cursor_absolute_row();
         let col = self.cursor.col;
         if char_width > self.width - col {
@@ -1391,7 +1544,7 @@ impl TerminalGrid {
         }
         self.active_row_mut(row)
             .clear_range(col, col + char_width, style);
-        let cell = Cell::new(text, style, u8::try_from(char_width).unwrap_or(1));
+        let cell = Cell::with_text(text, style, u8::try_from(char_width).unwrap_or(1));
         self.active_row_mut(row).set_cell(col, cell);
         if char_width == 2 && col + 1 < self.width {
             self.active_row_mut(row)
@@ -1889,7 +2042,7 @@ impl TerminalGrid {
         match self.mode {
             GridMode::Main => {
                 if let Some(row) = self.main_rows.pop_front() {
-                    self.push_history_row(&row);
+                    self.push_history_row(row);
                 }
                 self.main_rows
                     .push_back(PhysicalRow::erase_filled(self.width, fill));
@@ -2481,13 +2634,14 @@ impl TerminalGrid {
         })
     }
 
-    fn push_history_row(&mut self, row: &PhysicalRow) {
-        let cells = row_logical_cells(row, self.width);
+    fn push_history_row(&mut self, row: PhysicalRow) {
+        let wrapped = row.wrapped();
+        let cells = history_row_cells(row, self.width);
         self.history_bytes = self
             .history_bytes
             .saturating_add(history_cells_bytes(&cells));
         self.pending_history_cells.extend(cells);
-        if !row.wrapped() {
+        if !wrapped {
             let pending = std::mem::take(&mut self.pending_history_cells);
             self.history_bytes = self
                 .history_bytes
@@ -2983,7 +3137,7 @@ impl TerminalGrid {
         }
         while next_rows.len() > new_height {
             if let Some(row) = next_rows.pop_front() {
-                self.push_history_row(&row);
+                self.push_history_row(row);
             }
         }
         self.main_rows = next_rows;
@@ -3118,7 +3272,7 @@ impl TerminalGrid {
         }
         let width = UnicodeWidthStr::width(text.as_str()).clamp(1, 2);
         if width == old_width {
-            cell.text = text;
+            cell.text = CellText::from_string(text);
             return true;
         }
         let style = cell.style();
@@ -3133,7 +3287,7 @@ impl TerminalGrid {
         // the complete cluster, never leave half of it on the previous row.
         let saved_style = self.current_style;
         self.current_style = self.palette.get(style);
-        self.print_grapheme(text, width);
+        self.print_grapheme(CellText::from_string(text), width);
         self.current_style = saved_style;
         true
     }
@@ -3304,6 +3458,7 @@ impl TerminalGrid {
             history_truncated: self.history_truncated,
             // A bounded copy for presentation does not carry collected text.
             evicted_text: None,
+            interned_style: None,
             main_history,
             main_history_projected_rows: OnceLock::new(),
             pending_history_cells: try_clone_cells(&self.pending_history_cells)?,
@@ -3428,11 +3583,8 @@ fn try_clone_cells(cells: &[Cell]) -> Option<Vec<Cell>> {
     let mut cloned = Vec::new();
     cloned.try_reserve_exact(cells.len()).ok()?;
     for cell in cells {
-        let mut text = String::new();
-        text.try_reserve_exact(cell.text.len()).ok()?;
-        text.push_str(&cell.text);
         cloned.push(Cell {
-            text,
+            text: cell.text.try_clone()?,
             style: cell.style,
             width: cell.width,
             wide_continuation: cell.wide_continuation,
@@ -3569,6 +3721,19 @@ fn row_logical_cells(row: &PhysicalRow, width: usize) -> Vec<Cell> {
         .into_iter()
         .filter(|cell| !cell.is_wide_continuation())
         .collect()
+}
+
+/// [`row_logical_cells`] of a row leaving the screen for history, taking its cells. Padding is
+/// only needed for a soft-wrapped row, written up to the edge: its unstored tail is spaces
+/// that belong to the line. A row ending its line would have its trailing blanks trimmed.
+fn history_row_cells(row: PhysicalRow, width: usize) -> Vec<Cell> {
+    let wrapped = row.wrapped();
+    let mut cells = row.cells;
+    if wrapped && cells.len() < width {
+        cells.resize_with(width, || Cell::blank(StyleId::DEFAULT));
+    }
+    cells.retain(|cell| !cell.is_wide_continuation());
+    cells
 }
 
 fn trim_trailing_blank_cells(mut cells: Vec<Cell>) -> Vec<Cell> {

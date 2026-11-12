@@ -71,3 +71,22 @@ fn nothing_is_collected_unless_asked() {
     stream.process(b"one\r\ntwo\r\nthree\r\n");
     assert_eq!(stream.grid_mut().take_evicted_text(), "");
 }
+
+#[test]
+fn spaces_at_a_soft_wrap_are_kept() {
+    for scrollback in [0, 100] {
+        let mut stream = stream(4, 3, scrollback);
+        stream.grid_mut().collect_evicted_text(true);
+        stream.process(b"abc def ghi\r\nnext\r\nmore");
+        let mut text = stream.grid_mut().take_evicted_text();
+        text.push_str(&content_text(stream.grid()));
+        assert_eq!(
+            text, "abc def ghi\nnext\nmore",
+            "{scrollback} rows of history"
+        );
+    }
+    // On the screen too.
+    let mut stream = stream(4, 5, 100);
+    stream.process(b"abc def");
+    assert_eq!(content_text(stream.grid()), "abc def");
+}

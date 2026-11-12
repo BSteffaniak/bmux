@@ -59,7 +59,14 @@ pub fn content_text(grid: &TerminalGrid) -> String {
     let mut text = String::new();
     let mut line = String::new();
     for row in &rows {
-        line.push_str(&row_text(row, row.cells().len()));
+        // A soft-wrapped row was written up to the edge; rows do not store trailing spaces, so
+        // its unstored tail is the spaces before the wrap.
+        let width = if row.wrapped() {
+            grid.width().max(row.cells().len())
+        } else {
+            row.cells().len()
+        };
+        line.push_str(&row_text(row, width));
         if !row.wrapped() {
             text.push_str(line.trim_end());
             text.push('\n');
