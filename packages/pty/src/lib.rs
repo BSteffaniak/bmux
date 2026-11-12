@@ -11,12 +11,16 @@
 //! stays byte-exact for parsing while standard error (where most tools write progress and
 //! diagnostics) is still a terminal.
 //!
+//! [`PtyProcess::writer`] writes to the terminal while the process runs: replies to terminal
+//! queries, or a user's keystrokes.
+//!
 //! This crate only runs processes. Interpreting the terminal stream (for example with
 //! `bmux_terminal_grid`) and presenting it are the caller's concern.
 //!
-//! On platforms without pseudo-terminal support here (anything but Unix), processes run on
-//! plain pipes: output is still streamed, but programs see no terminal and resizing has no
-//! effect.
+//! What a platform supports is reported by [`PtyProcess::capabilities`]. On platforms without
+//! pseudo-terminal support here (anything but Unix), processes run on plain pipes: output is
+//! still streamed, but programs see no terminal, resizing has no effect, and nothing can be
+//! written while they run.
 
 #![cfg_attr(feature = "fail-on-warnings", deny(warnings))]
 #![warn(clippy::all, clippy::pedantic)]
@@ -26,15 +30,18 @@ use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Events queued between the reader threads and the consumer before readers wait.
 const QUEUE: usize = 64;
 /// Bytes read per output event at most.
 const CHUNK: usize = 16 * 1024;
-/// How long output still arriving after the process exits is waited for. Output written by
-/// descendants that outlive the process and keep the terminal open is not waited for.
-const DRAIN_GRACE: Duration = Duration::from_millis(250);
+/// How long output still arriving after the process exits is waited for, unless
+/// [`PtyCommand::drain_grace`] says otherwise.
+pub const DEFAULT_DRAIN_GRACE: Duration = Duration::from_millis(250);
+/// How often blocked reads and writes look up whether they should stop.
+#[cfg(unix)]
+const POLL: Duration = Duration::from_millis(10);
 
 /// Terminal size in character cells.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -61,6 +68,7 @@ impl PtySize {
 pub struct PtyExit {
     code: Option<i32>,
     signal: Option<i32>,
+    complete: bool,
 }
 
 impl PtyExit {
@@ -82,6 +90,15 @@ impl PtyExit {
         matches!(self.code, Some(0))
     }
 
+    /// Whether every byte written to the terminal (and captured standard output) was
+    /// delivered before this exit. `false` when output was still arriving when the drain
+    /// grace ran out, typically from descendants that outlive the process and keep its
+    /// terminal open; that output was dropped.
+    #[must_use]
+    pub const fn output_complete(self) -> bool {
+        self.complete
+    }
+
     fn from_status(status: std::process::ExitStatus) -> Self {
         #[cfg(unix)]
         let signal = std::os::unix::process::ExitStatusExt::signal(&status);
@@ -90,8 +107,26 @@ impl PtyExit {
         Self {
             code: status.code(),
             signal,
+            complete: true,
         }
     }
+}
+
+/// What a process's platform supports. Pipes stand in for a terminal where pseudo-terminals
+/// are not supported, and then only output streaming works.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+// Each flag is an independent capability.
+#[allow(clippy::struct_excessive_bools)]
+pub struct PtyCapabilities {
+    /// The process sees a terminal: colors, progress displays and line editing work.
+    pub terminal: bool,
+    /// [`PtyProcess::resize`] reaches the process.
+    pub resize: bool,
+    /// [`PtyProcess::writer`] can write while the process runs.
+    pub input: bool,
+    /// [`PtyProcess::interrupt`] interrupts rather than kills, and signals reach everything
+    /// the process started.
+    pub signals: bool,
 }
 
 /// Something that happened to a running process.
@@ -119,6 +154,7 @@ pub struct PtyCommand {
     env: Vec<(OsString, Option<OsString>)>,
     capture_stdout: bool,
     input: Option<Vec<u8>>,
+    drain_grace: Duration,
 }
 
 impl PtyCommand {
@@ -132,6 +168,7 @@ impl PtyCommand {
             env: Vec::new(),
             capture_stdout: false,
             input: None,
+            drain_grace: DEFAULT_DRAIN_GRACE,
         }
     }
 
@@ -190,6 +227,15 @@ impl PtyCommand {
     #[must_use]
     pub fn input(mut self, bytes: impl Into<Vec<u8>>) -> Self {
         self.input = Some(bytes.into());
+        self
+    }
+
+    /// Wait at most `grace` after the process exits for output still arriving
+    /// ([`DEFAULT_DRAIN_GRACE`] unless set). Output after that is dropped and the exit says so
+    /// ([`PtyExit::output_complete`]).
+    #[must_use]
+    pub const fn drain_grace(mut self, grace: Duration) -> Self {
+        self.drain_grace = grace;
         self
     }
 
@@ -282,6 +328,36 @@ impl PtyProcess {
         std::iter::from_fn(|| self.next_event())
     }
 
+    /// Stop delivering output: nothing more is delivered (it is still drained, so the process
+    /// cannot block on it), and once the process has exited its exit is reported without
+    /// waiting out the drain grace ([`PtyExit::output_complete`] is
+    /// then `false`). For giving up on output that descendants keep producing, for example
+    /// when a caller's deadline passes. The process itself is left running; see
+    /// [`Self::kill`].
+    pub fn stop_output(&self) {
+        self.control.stop_output();
+    }
+
+    /// What this process's platform supports.
+    #[must_use]
+    pub const fn capabilities(&self) -> PtyCapabilities {
+        platform::CAPABILITIES
+    }
+
+    /// A handle that writes to the terminal while the process runs, as typing would: the
+    /// process reads it from its terminal (with [`PtyCommand::input`], standard input is a
+    /// pipe instead and does not see it). Handles may be cloned and sent to other threads;
+    /// writes are queued in order and carried out on a thread of their own, so a process that
+    /// does not read cannot block the caller for long.
+    ///
+    /// # Errors
+    /// * [`io::ErrorKind::Unsupported`] where processes run on pipes
+    ///   ([`PtyCapabilities::input`]).
+    /// * [`io::Error`] when the terminal cannot be written.
+    pub fn writer(&self) -> io::Result<PtyWriter> {
+        self.control.writer()
+    }
+
     /// Resize the terminal; the process is notified as by a terminal window resize.
     ///
     /// # Errors
@@ -291,6 +367,8 @@ impl PtyProcess {
     }
 
     /// Interrupt the process and everything it started on its terminal, as `ctrl+c` would.
+    /// After the process exits, this still reaches what it started while that keeps its
+    /// terminal open.
     ///
     /// # Errors
     /// * [`io::Error`] when the signal cannot be sent.
@@ -298,7 +376,9 @@ impl PtyProcess {
         self.control.interrupt()
     }
 
-    /// Kill the process and everything it started on its terminal.
+    /// Kill the process and everything it started on its terminal. After the process exits,
+    /// this still reaches what it started while that keeps its terminal open (for example a
+    /// command a shell put in the background).
     ///
     /// # Errors
     /// * [`io::Error`] when the signal cannot be sent.
@@ -319,6 +399,30 @@ impl Drop for PtyProcess {
         if !self.exited {
             let _ = self.control.kill();
         }
+    }
+}
+
+/// Writes to a process's terminal while it runs; see [`PtyProcess::writer`].
+#[derive(Debug, Clone)]
+pub struct PtyWriter {
+    sender: mpsc::SyncSender<Vec<u8>>,
+}
+
+impl PtyWriter {
+    /// Queue `bytes` to be written to the terminal, after everything queued before. Waits
+    /// only while the queue is full.
+    ///
+    /// # Errors
+    /// * [`io::ErrorKind::BrokenPipe`] once the terminal can no longer be written (the process
+    ///   and everything that kept its terminal open have ended).
+    pub fn write(&self, bytes: impl Into<Vec<u8>>) -> io::Result<()> {
+        let bytes = bytes.into();
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        self.sender
+            .send(bytes)
+            .map_err(|_| io::Error::from(io::ErrorKind::BrokenPipe))
     }
 }
 
@@ -354,12 +458,14 @@ impl Events {
         )
     }
 
-    /// Forward everything `reader` produces as events, then report on `done`.
+    /// Forward everything `reader` produces as events, then report on `done`. The reader
+    /// should return end of file once [`Self::closed`] is set and the process has exited, or
+    /// its thread lingers until the far side closes.
     fn read(
         &self,
         mut reader: impl Read + Send + 'static,
         event: fn(Vec<u8>) -> PtyEvent,
-        done: mpsc::Sender<()>,
+        done: mpsc::Sender<bool>,
     ) {
         let events = self.clone();
         std::thread::spawn(move || {
@@ -368,16 +474,18 @@ impl Events {
                 match reader.read(&mut buffer) {
                     // A pseudo-terminal reports a closed far side as an error (EIO).
                     Ok(0) | Err(_) => break,
+                    // Once closed, output is still read (a process whose terminal output is
+                    // not drained can block, even in its exit) but no longer delivered.
+                    Ok(_) if events.closed.load(Ordering::Acquire) => {}
                     Ok(read) => {
-                        if events.closed.load(Ordering::Acquire)
-                            || events.sender.send(event(buffer[..read].to_vec())).is_err()
-                        {
+                        if events.sender.send(event(buffer[..read].to_vec())).is_err() {
                             break;
                         }
                     }
                 }
             }
-            let _ = done.send(());
+            // Reaching the end while not told to stop means everything was read.
+            let _ = done.send(!events.closed.load(Ordering::Acquire));
         });
     }
 }
@@ -385,20 +493,32 @@ impl Events {
 #[cfg(unix)]
 mod platform {
     use std::io;
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+    use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
     use std::os::unix::process::CommandExt;
     use std::process::Stdio;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::mpsc;
+    use std::sync::{Arc, Mutex, PoisonError, mpsc};
 
-    use super::{Events, PtyCommand, PtyEvent, PtyProcess, PtySize};
+    use super::{
+        Events, Exit, PtyCapabilities, PtyCommand, PtyEvent, PtyProcess, PtySize, PtyWriter, QUEUE,
+    };
+
+    pub const CAPABILITIES: PtyCapabilities = PtyCapabilities {
+        terminal: true,
+        resize: true,
+        input: true,
+        signals: true,
+    };
 
     #[derive(Debug)]
     pub struct Control {
-        master: OwnedFd,
+        /// The terminal's near side, non-blocking.
+        master: Arc<OwnedFd>,
         pid: u32,
         exited: Arc<AtomicBool>,
+        /// Set once the exit is reported; the reader and writer threads then stop.
+        closed: Arc<AtomicBool>,
+        writer: Mutex<Option<PtyWriter>>,
     }
 
     impl Control {
@@ -414,14 +534,41 @@ mod platform {
             self.signal(libc::SIGINT)
         }
 
+        pub fn stop_output(&self) {
+            self.closed.store(true, Ordering::Release);
+        }
+
         pub fn kill(&self) -> io::Result<()> {
             self.signal(libc::SIGKILL)
         }
 
+        // Fallible on every platform: where processes run on pipes, nothing can be written.
+        #[allow(clippy::unnecessary_wraps)]
+        pub fn writer(&self) -> io::Result<PtyWriter> {
+            let mut writer = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some(writer) = writer.as_ref() {
+                return Ok(writer.clone());
+            }
+            let (sender, queued) = mpsc::sync_channel::<Vec<u8>>(QUEUE);
+            let master = Arc::clone(&self.master);
+            std::thread::spawn(move || {
+                for bytes in queued {
+                    if write_all(master.as_fd(), &bytes).is_err() {
+                        break;
+                    }
+                }
+            });
+            let created = PtyWriter { sender };
+            *writer = Some(created.clone());
+            drop(writer);
+            Ok(created)
+        }
+
         /// Signal the process group the process leads (it started its own session).
         fn signal(&self, signal: libc::c_int) -> io::Result<()> {
-            // Once reaped, the id may belong to another process.
-            if self.exited.load(Ordering::Acquire) {
+            // Once the process is reaped its id may be reused, but not while its group still
+            // has members: something holding the terminal open is taken as one.
+            if self.exited.load(Ordering::Acquire) && !terminal_open(self.master.as_fd()) {
                 return Ok(());
             }
             let group = libc::pid_t::try_from(self.pid)
@@ -435,6 +582,118 @@ mod platform {
             }
             Ok(())
         }
+    }
+
+    impl Drop for Control {
+        fn drop(&mut self) {
+            self.closed.store(true, Ordering::Release);
+        }
+    }
+
+    /// Whether anything still holds the terminal's far side open.
+    fn terminal_open(master: BorrowedFd<'_>) -> bool {
+        let mut poll = libc::pollfd {
+            fd: master.as_raw_fd(),
+            events: 0,
+            revents: 0,
+        };
+        // SAFETY: one valid pollfd, no waiting.
+        let ready = unsafe { libc::poll(&raw mut poll, 1, 0) };
+        ready == 0 || (poll.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL)) == 0
+    }
+
+    /// Wait until `fd` is ready for `events`, at most [`POLL`]; whether it is.
+    fn wait_ready(fd: BorrowedFd<'_>, events: libc::c_short) -> io::Result<bool> {
+        let mut poll = libc::pollfd {
+            fd: fd.as_raw_fd(),
+            events,
+            revents: 0,
+        };
+        let timeout = libc::c_int::try_from(super::POLL.as_millis()).unwrap_or(10);
+        // SAFETY: one valid pollfd.
+        match unsafe { libc::poll(&raw mut poll, 1, timeout) } {
+            -1 => {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted {
+                    Ok(false)
+                } else {
+                    Err(error)
+                }
+            }
+            0 => Ok(false),
+            _ => Ok(true),
+        }
+    }
+
+    /// Write all of `bytes` to the non-blocking `fd`, waiting while it is full.
+    fn write_all(fd: BorrowedFd<'_>, mut bytes: &[u8]) -> io::Result<()> {
+        while !bytes.is_empty() {
+            // SAFETY: `bytes` is valid for reads of its length.
+            let written =
+                unsafe { libc::write(fd.as_raw_fd(), bytes.as_ptr().cast(), bytes.len()) };
+            if written >= 0 {
+                bytes = &bytes[usize::try_from(written).unwrap_or(0)..];
+                continue;
+            }
+            let error = io::Error::last_os_error();
+            match error.kind() {
+                io::ErrorKind::WouldBlock => {
+                    wait_ready(fd, libc::POLLOUT)?;
+                }
+                io::ErrorKind::Interrupted => {}
+                _ => return Err(error),
+            }
+        }
+        Ok(())
+    }
+
+    /// Reads a non-blocking descriptor, returning end of file once output is `closed` and the
+    /// process has `exited`: a reader thread never outlives the reported exit, even while
+    /// descendants keep the far side open, yet keeps draining while the process runs.
+    struct Polled {
+        fd: OwnedFd,
+        closed: Arc<AtomicBool>,
+        exited: Arc<AtomicBool>,
+    }
+
+    impl io::Read for Polled {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            loop {
+                if self.closed.load(Ordering::Acquire) && self.exited.load(Ordering::Acquire) {
+                    return Ok(0);
+                }
+                // SAFETY: `buffer` is valid for writes of its length.
+                let read = unsafe {
+                    libc::read(
+                        self.fd.as_raw_fd(),
+                        buffer.as_mut_ptr().cast(),
+                        buffer.len(),
+                    )
+                };
+                if read >= 0 {
+                    return Ok(usize::try_from(read).unwrap_or(0));
+                }
+                let error = io::Error::last_os_error();
+                match error.kind() {
+                    io::ErrorKind::WouldBlock => {
+                        wait_ready(self.fd.as_fd(), libc::POLLIN)?;
+                    }
+                    io::ErrorKind::Interrupted => {}
+                    _ => return Err(error),
+                }
+            }
+        }
+    }
+
+    fn set_nonblocking(fd: RawFd) -> io::Result<()> {
+        // SAFETY: fcntl on an owned, open descriptor.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        // SAFETY: as above.
+        if flags == -1 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
     }
 
     fn set_size(fd: RawFd, size: PtySize) -> io::Result<()> {
@@ -540,32 +799,61 @@ mod platform {
         // Only the process may keep the terminal's far side open, so its exit closes it.
         drop(command);
         drop(slave);
+        // Reads and writes poll, so neither can wedge on a terminal kept open elsewhere.
+        set_nonblocking(master.as_raw_fd())?;
+        let master = Arc::new(master);
+        let exited = Arc::new(AtomicBool::new(false));
         let (events, receiver) = Events::new();
         let (done, finished) = mpsc::channel();
         let mut readers = 1;
         events.read(
-            std::fs::File::from(master.try_clone()?),
+            Polled {
+                fd: master.try_clone()?,
+                closed: Arc::clone(&events.closed),
+                exited: Arc::clone(&exited),
+            },
             PtyEvent::Output,
             done.clone(),
         );
         if let Some(stdout) = child.stdout.take() {
+            let stdout = OwnedFd::from(stdout);
+            set_nonblocking(stdout.as_raw_fd())?;
             readers += 1;
-            events.read(stdout, PtyEvent::Stdout, done);
+            events.read(
+                Polled {
+                    fd: stdout,
+                    closed: Arc::clone(&events.closed),
+                    exited: Arc::clone(&exited),
+                },
+                PtyEvent::Stdout,
+                done,
+            );
         } else {
             drop(done);
         }
-        let exited = Arc::new(AtomicBool::new(false));
+        let closed = Arc::clone(&events.closed);
         let pid = child.id();
-        super::report_exit(events, readers, finished, Arc::clone(&exited), move || {
-            let mut child = child;
-            child.wait().map(super::PtyExit::from_status).ok()
-        });
+        super::report_exit(
+            events,
+            Exit {
+                readers,
+                finished,
+                exited: Arc::clone(&exited),
+                grace: spec.drain_grace,
+            },
+            move || {
+                let mut child = child;
+                child.wait().map(super::PtyExit::from_status).ok()
+            },
+        );
         Ok(PtyProcess {
             events: receiver,
             control: Control {
                 master,
                 pid,
                 exited,
+                closed,
+                writer: Mutex::new(None),
             },
             exited: false,
         })
@@ -580,13 +868,24 @@ mod platform {
     use std::sync::{Arc, Mutex, PoisonError, mpsc};
     use std::time::Duration;
 
-    use super::{Events, PtyCommand, PtyEvent, PtyExit, PtyProcess, PtySize};
+    use super::{
+        Events, Exit, PtyCapabilities, PtyCommand, PtyEvent, PtyExit, PtyProcess, PtySize,
+        PtyWriter,
+    };
+
+    pub const CAPABILITIES: PtyCapabilities = PtyCapabilities {
+        terminal: false,
+        resize: false,
+        input: false,
+        signals: false,
+    };
 
     #[derive(Debug)]
     pub struct Control {
         child: Arc<Mutex<std::process::Child>>,
         pid: u32,
         exited: Arc<AtomicBool>,
+        closed: Arc<AtomicBool>,
     }
 
     impl Control {
@@ -602,6 +901,16 @@ mod platform {
 
         pub fn interrupt(&self) -> io::Result<()> {
             self.kill()
+        }
+
+        pub fn stop_output(&self) {
+            self.closed.store(true, Ordering::Release);
+        }
+
+        // Pipes stand in for the terminal; nothing is written while the process runs.
+        #[allow(clippy::unused_self)]
+        pub fn writer(&self) -> io::Result<PtyWriter> {
+            Err(io::Error::from(io::ErrorKind::Unsupported))
         }
 
         pub fn kill(&self) -> io::Result<()> {
@@ -641,10 +950,17 @@ mod platform {
             events.read(stderr, PtyEvent::Output, done);
         }
         let pid = child.id();
+        let closed = Arc::clone(&events.closed);
         let child = Arc::new(Mutex::new(child));
         let exited = Arc::new(AtomicBool::new(false));
         let waited = Arc::clone(&child);
-        super::report_exit(events, 2, finished, Arc::clone(&exited), move || {
+        let exit = Exit {
+            readers: 2,
+            finished,
+            exited: Arc::clone(&exited),
+            grace: spec.drain_grace,
+        };
+        super::report_exit(events, exit, move || {
             loop {
                 // Polled so `kill` can take the lock between checks.
                 match waited
@@ -661,35 +977,54 @@ mod platform {
         });
         Ok(PtyProcess {
             events: receiver,
-            control: Control { child, pid, exited },
+            control: Control {
+                child,
+                pid,
+                exited,
+                closed,
+            },
             exited: false,
         })
     }
 }
 
-/// Wait for the process with `wait`, give its readers a moment to deliver the last output,
-/// and report the exit. Output arriving later is dropped: the exit is the last event.
+/// How the threads of one process learn that it ended.
+struct Exit {
+    readers: usize,
+    /// Whether each reader read to the end of its stream.
+    finished: mpsc::Receiver<bool>,
+    exited: Arc<AtomicBool>,
+    grace: Duration,
+}
+
+/// Wait for the process with `wait`, give its readers `exit.grace` to deliver the last output,
+/// and report the exit. Output arriving later is dropped (the exit says so): the exit is the
+/// last event.
 fn report_exit(
     events: Events,
-    readers: usize,
-    finished: mpsc::Receiver<()>,
-    exited: Arc<AtomicBool>,
+    exit: Exit,
     wait: impl FnOnce() -> Option<PtyExit> + Send + 'static,
 ) {
     std::thread::spawn(move || {
-        let exit = wait().unwrap_or(PtyExit {
+        let mut status = wait().unwrap_or(PtyExit {
             code: None,
             signal: None,
+            complete: true,
         });
-        exited.store(true, Ordering::Release);
-        let deadline = std::time::Instant::now() + DRAIN_GRACE;
-        for _ in 0..readers {
-            let left = deadline.saturating_duration_since(std::time::Instant::now());
-            if finished.recv_timeout(left).is_err() {
-                break;
+        exit.exited.store(true, Ordering::Release);
+        let deadline = Instant::now() + exit.grace;
+        for _ in 0..exit.readers {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match exit.finished.recv_timeout(left) {
+                Ok(true) => {}
+                Ok(false) => status.complete = false,
+                Err(_) => {
+                    status.complete = false;
+                    break;
+                }
             }
         }
         events.closed.store(true, Ordering::Release);
-        let _ = events.sender.send(PtyEvent::Exited(exit));
+        let _ = events.sender.send(PtyEvent::Exited(status));
     });
 }

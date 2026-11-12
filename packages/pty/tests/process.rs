@@ -197,3 +197,147 @@ fn input_is_fed_through_a_pipe_and_closed() {
     );
     assert!(exit.success());
 }
+
+#[cfg(target_os = "linux")]
+fn alive(pid: &str) -> bool {
+    std::process::Command::new("kill")
+        .args(["-0", pid])
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap()
+        .success()
+}
+
+#[cfg(target_os = "linux")]
+fn pid_in(output: &[u8]) -> String {
+    text(output)
+        .split("pid=")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .expect("background pid")
+        .to_owned()
+}
+
+// Linux keeps a terminal open while anything inherited it; macOS ends it with the session.
+#[cfg(target_os = "linux")]
+#[test]
+fn descendants_keeping_the_terminal_open_are_drained_within_the_grace() {
+    // The background job ignores the hangup the shell's exit sends (inherited at the fork, so it
+    // cannot lose a race with the exit), and keeps writing.
+    let script = "trap '' HUP; (sleep 0.4; echo late) & echo early";
+    let started = Instant::now();
+    let (output, _, exit) = run(sh(script), PtySize::new(80, 24));
+    assert!(!text(&output).contains("late"), "{:?}", text(&output));
+    assert!(!exit.output_complete());
+    assert!(started.elapsed() < Duration::from_secs(2));
+
+    let (output, _, exit) = run(
+        sh(script).drain_grace(Duration::from_secs(5)),
+        PtySize::new(80, 24),
+    );
+    let output = text(&output);
+    assert!(
+        output.contains("early") && output.contains("late"),
+        "{output:?}"
+    );
+    assert!(exit.output_complete());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn signals_reach_what_keeps_the_terminal_open_after_the_exit() {
+    let mut process = sh("trap '' HUP; sleep 30 & echo \"pid=$!\"")
+        .drain_grace(Duration::from_millis(50))
+        .spawn(PtySize::new(80, 24))
+        .unwrap();
+    let mut output = Vec::new();
+    for event in process.events() {
+        if let PtyEvent::Output(bytes) = event {
+            output.extend(bytes);
+        }
+    }
+    let pid = pid_in(&output);
+    assert!(alive(&pid));
+    process.kill().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while alive(&pid) {
+        assert!(Instant::now() < deadline, "the background process survived");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn stopping_output_reports_the_exit_without_waiting_for_the_rest() {
+    let mut process = sh("echo first; sleep 0.3; echo second")
+        .drain_grace(Duration::from_secs(30))
+        .spawn(PtySize::new(80, 24))
+        .unwrap();
+    let mut output = Vec::new();
+    while !text(&output).contains("first") {
+        if let Some(PtyEvent::Output(bytes)) = process.next_event_timeout(Duration::from_secs(10)) {
+            output.extend(bytes);
+        }
+    }
+    process.stop_output();
+    let started = Instant::now();
+    let mut exit = None;
+    for event in process.events() {
+        match event {
+            PtyEvent::Output(bytes) => output.extend(bytes),
+            PtyEvent::Exited(status) => exit = Some(status),
+            PtyEvent::Stdout(_) => {}
+        }
+    }
+    let exit = exit.expect("an exit");
+    assert!(!text(&output).contains("second"), "{:?}", text(&output));
+    assert!(!exit.output_complete());
+    assert!(exit.success());
+    assert!(started.elapsed() < Duration::from_secs(5));
+}
+
+#[test]
+fn complete_output_is_reported_complete() {
+    let (output, _, exit) = run(sh("echo all"), PtySize::new(80, 24));
+    assert!(text(&output).contains("all"));
+    assert!(exit.output_complete());
+}
+
+#[test]
+fn the_writer_types_into_the_running_process() {
+    let mut process = sh("echo ready; read line; echo \"got <$line>\"")
+        .spawn(PtySize::new(80, 24))
+        .unwrap();
+    assert_eq!(
+        process.capabilities(),
+        bmux_pty::PtyCapabilities {
+            terminal: true,
+            resize: true,
+            input: true,
+            signals: true,
+        }
+    );
+    let writer = process.writer().unwrap();
+    let mut output = Vec::new();
+    let mut sent = false;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match process
+            .next_event_timeout(left)
+            .expect("process exits in time")
+        {
+            PtyEvent::Output(bytes) => output.extend(bytes),
+            PtyEvent::Stdout(_) => {}
+            PtyEvent::Exited(exit) => {
+                assert!(exit.success());
+                break;
+            }
+        }
+        if !sent && text(&output).contains("ready") {
+            // Typed as at a keyboard: the terminal turns the carriage return into a newline.
+            writer.write("hello\r").unwrap();
+            sent = true;
+        }
+    }
+    assert!(text(&output).contains("got <hello>"), "{:?}", text(&output));
+}
