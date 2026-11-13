@@ -843,10 +843,14 @@ where
             // offers non-positional events to scrolled items bottom to top
             // and then to the pinned headers above them. Visible rows of
             // pinned headers and scrolled items never overlap.
-            let pinned = self
-                .placed_pinned(&state, snapshot)
+            let placed = self.placed_pinned(&state, snapshot);
+            let deepest = placed.len().checked_sub(1);
+            let pinned = placed
                 .into_iter()
-                .map(|(header, item)| ItemSlot::pinned(item, area, header));
+                .enumerate()
+                .map(|(order, (header, item))| {
+                    ItemSlot::pinned(item, area, header, Some(order) == deepest)
+                });
             let scrolled = self
                 .placed(&state, layout, snapshot, 0..usize::MAX)
                 .into_iter()
@@ -1376,12 +1380,17 @@ where
         // Pinned headers paint after (over) scrolled items; only those
         // intersecting the paint clip are built.
         let pinned = clip.map_or_else(Vec::new, |rows| {
-            self.placed_pinned(&state, &snapshot)
+            let placed = self.placed_pinned(&state, &snapshot);
+            let deepest = placed.len().checked_sub(1);
+            placed
                 .into_iter()
-                .filter(|(header, _)| {
+                .enumerate()
+                .filter(|(_, (header, _))| {
                     header.visible.start < rows.end && rows.start < header.visible.end
                 })
-                .map(|(header, item)| ItemSlot::pinned(item, base, header))
+                .map(|(order, (header, item))| {
+                    ItemSlot::pinned(item, base, header, Some(order) == deepest)
+                })
                 .collect()
         });
         let items = scrolled.chain(pinned).filter_map(|slot| {

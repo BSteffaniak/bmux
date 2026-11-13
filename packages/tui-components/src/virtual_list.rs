@@ -61,7 +61,7 @@ pub use position::{
 pub use selection::{
     ItemOrder, KeyOrder, LogicalSelection, LogicalSelectionEndpoint, LogicalSelectionFragment,
 };
-pub use source::VirtualItemSource;
+pub use source::{PinnedPlacement, VirtualItemSource};
 pub use sticky::StickyHeaders;
 
 pub use crate::resident_window::{EdgeRows, FractionTarget, PositionEstimate, WindowSplice};
@@ -1956,11 +1956,15 @@ impl<'a, Src: ?Sized> VirtualSourceList<'a, Src> {
                 item,
                 local_y,
                 visible,
+                pinned,
             },
             layout,
         ) in items
         {
-            let element = self.source.build(item.position);
+            let element = match pinned {
+                Some(placement) => self.source.build_pinned(item.position, placement),
+                None => self.source.build(item.position),
+            };
             report.built_items = report.built_items.saturating_add(1);
             cx.with_child(
                 0,
@@ -2074,6 +2078,7 @@ impl<'a, Src: ?Sized> VirtualSourceList<'a, Src> {
             item,
             local_y,
             visible,
+            pinned,
         } in items.into_iter().rev()
         {
             let item_area = cx.visible_rect(logical_rect(visible));
@@ -2084,7 +2089,10 @@ impl<'a, Src: ?Sized> VirtualSourceList<'a, Src> {
                 continue;
             };
             let layout = layout.as_ref();
-            let element = self.source.build(item.position);
+            let element = match pinned {
+                Some(placement) => self.source.build_pinned(item.position, placement),
+                None => self.source.build(item.position),
+            };
             routed.built = routed.built.saturating_add(1);
             let outcome = cx.with_transform(
                 0,
@@ -2112,6 +2120,8 @@ struct ItemSlot {
     /// Visible part of the item, in the coordinates of the area it is placed
     /// in. Painting, interaction regions, and routing use exactly this.
     visible: Rect,
+    /// How the item is pinned, for a pinned section header.
+    pinned: Option<PinnedPlacement>,
 }
 
 impl ItemSlot {
@@ -2127,11 +2137,13 @@ impl ItemSlot {
             item,
             local_y,
             visible: Rect::new(visible.x, first, visible.width, bottom - first),
+            pinned: None,
         }
     }
 
-    /// A header pinned in `area` at its sticky placement.
-    fn pinned(item: PlacedItem, area: Rect, header: &sticky::PinnedHeader) -> Self {
+    /// A header pinned in `area` at its sticky placement; `deepest` when no
+    /// pinned header is below it.
+    fn pinned(item: PlacedItem, area: Rect, header: &sticky::PinnedHeader, deepest: bool) -> Self {
         let row = |row: u64| {
             u16::try_from(row)
                 .unwrap_or(u16::MAX)
@@ -2143,6 +2155,10 @@ impl ItemSlot {
             item,
             local_y: header.local_y,
             visible: Rect::new(area.x, first, area.width, bottom.saturating_sub(first)),
+            pinned: Some(PinnedPlacement {
+                deepest,
+                pushed: header.local_y < i64::try_from(header.visible.start).unwrap_or(i64::MAX),
+            }),
         }
     }
 }

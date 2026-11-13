@@ -2,6 +2,17 @@
 
 use bmux_tui::component::{Element, LayoutEnvironment, LayoutNode};
 
+/// Where a pinned section header sits among the headers pinned at once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct PinnedPlacement {
+    /// The header is the deepest pinned one: content scrolls directly under
+    /// it.
+    pub deepest: bool,
+    /// The next section is pushing the header out (its first rows are above
+    /// the pinned region).
+    pub pushed: bool,
+}
+
 /// An ordered, indexable collection of keyed items whose components are
 /// constructed on demand.
 ///
@@ -42,6 +53,19 @@ pub trait VirtualItemSource<K> {
 
     /// Construct the component for the item at `index`.
     fn build(&self, index: usize) -> Element<'_>;
+
+    /// Construct the component for the section header at `index` while it is
+    /// pinned at the viewport top (see [`super::StickyHeaders`]), for painting
+    /// and events. Defaults to [`Self::build`].
+    ///
+    /// A source can paint a pinned header differently, for example with an
+    /// edge under the deepest pinned header that sets the pinned region apart
+    /// from the content scrolling under it. The component must lay out exactly
+    /// as [`Self::build`]'s does: pinning reuses the item's measured layout.
+    fn build_pinned(&self, index: usize, placement: PinnedPlacement) -> Element<'_> {
+        let _ = placement;
+        self.build(index)
+    }
 
     /// A caller-retained exact layout for this item at `width` and
     /// `environment`. When `Some`, the list uses it for measurement, painting,
@@ -146,6 +170,10 @@ impl<K, T: VirtualItemSource<K> + ?Sized> VirtualItemSource<K> for &T {
 
     fn build(&self, index: usize) -> Element<'_> {
         (**self).build(index)
+    }
+
+    fn build_pinned(&self, index: usize, placement: PinnedPlacement) -> Element<'_> {
+        (**self).build_pinned(index, placement)
     }
 
     fn retained_layout(

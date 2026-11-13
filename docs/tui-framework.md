@@ -142,7 +142,8 @@ Every composition container (`Surface`, `Keyed`, `HitArea`, `Padding`, `Fill`,
 `Flex`, `Row`, `Column`) and `bmux_tui_components::Disclosure` take the same
 child object type as a defaulted parameter, for example
 `Column<'a, C = dyn Component + 'a>`. A container is `Send` whenever its
-children are, and `Sync` whenever its children are `Sync`. The parameter is additive: unannotated code keeps the default
+children are, and `Sync` whenever its children are `Sync`. The parameter is
+additive: unannotated code keeps the default
 object type, and `new()` and `Default` stay on that type so unannotated
 `Column::default()` still infers it. Other object types use the generic
 `empty()` or `from_element` constructors.
@@ -182,7 +183,8 @@ Constructor conventions:
   type; `Element::from_box`/`into_box` move the boxed object in and out.
 
 Thread-safety is the only behavioral difference: layout, paint, hit regions,
-events, and revisions of a `SendElement` or `SyncElement` tree are identical to the same tree
+events, and revisions of a `SendElement` or `SyncElement` tree are identical to
+the same tree
 built from default elements.
 
 ## Text and selection
@@ -448,15 +450,15 @@ interprets.
 
 ### Placement and features
 
-| Capability | Crate and module | Feature |
-| --- | --- | --- |
-| Incremental measured index | `bmux_tui::measured_list` | always available |
-| Position model, overscroll, anchor policies | `bmux_tui_components::virtual_list` | `virtual-list` |
-| Lazy item source | `bmux_tui_components::virtual_list` | `virtual-list` |
-| Scroll motion | `bmux_tui_components::virtual_list` | `virtual-list` |
-| `VirtualListComponent`, chrome, actions | `bmux_tui_components::virtual_list` | `virtual-list` |
-| Sticky section headers, scrollbar marks | `bmux_tui_components::virtual_list` | `virtual-list` |
-| Resident windows, `PositionEstimate` | `bmux_tui_components::resident_window` | `resident-window` |
+| Capability                                  | Crate and module                       | Feature           |
+| ------------------------------------------- | -------------------------------------- | ----------------- |
+| Incremental measured index                  | `bmux_tui::measured_list`              | always available  |
+| Position model, overscroll, anchor policies | `bmux_tui_components::virtual_list`    | `virtual-list`    |
+| Lazy item source                            | `bmux_tui_components::virtual_list`    | `virtual-list`    |
+| Scroll motion                               | `bmux_tui_components::virtual_list`    | `virtual-list`    |
+| `VirtualListComponent`, chrome, actions     | `bmux_tui_components::virtual_list`    | `virtual-list`    |
+| Sticky section headers, scrollbar marks     | `bmux_tui_components::virtual_list`    | `virtual-list`    |
+| Resident windows, `PositionEstimate`        | `bmux_tui_components::resident_window` | `resident-window` |
 
 `virtual-list` enables `scroll-view` (and through it `scrollbar` and
 `keyboard-input`) and `resident-window`, so the list can accept a
@@ -563,7 +565,8 @@ measuring only new or invalidated items, so a prepend or append through `sync`
 does not rebuild the index; comparing the supplied entries is still `O(n)`.
 `remeasure` is the width and capability invalidation path and is inherently
 `O(n)`. Equality compares gap and items in order, not tree shape. A
-`resident_window::WindowSplice` maps directly onto `splice(splice.removed_range(),
+`resident_window::WindowSplice` maps directly onto
+`splice(splice.removed_range(),
 measured inserted items)`.
 
 `packages/tui/examples/measured_list_benchmark.rs` reports rebuild versus
@@ -870,6 +873,11 @@ pub trait VirtualItemSource<K> {
     /// Whether every synchronization must compare all keys and revisions
     /// (sources rebuilt per frame that do not note changes). Default false.
     fn always_reconcile(&self) -> bool { false }
+    /// The component of a section header while it is pinned (see "Sticky
+    /// section headers"); it must lay out as `build`'s does. Default `build`.
+    fn build_pinned(&self, index: usize, placement: PinnedPlacement) -> Element<'_> {
+        self.build(index)
+    }
     /// Nesting level when the item is a sticky section header (see
     /// "Sticky section headers"). Default `None`.
     fn section_header_level(&self, index: usize) -> Option<u16> { None }
@@ -969,7 +977,8 @@ implementation. The eager `VirtualList` builder implements `VirtualItemSource`
 (with `always_reconcile`) and delegates to it, so the builder and lazy paths
 share one implementation; its `section_header(key, level, layout_revision,
 component)` and `component_section_header(key, level, component)` append
-section headers and derive every item's `section_parent` while building; `VirtualList::layout` mirrors
+section headers and derive every item's `section_parent` while building;
+`VirtualList::layout` mirrors
 `VirtualSourceList::layout`. `bmux_tui_components::virtual_list` also
 re-exports `MeasuredListIndex`, `MeasuredListItem`, `MeasuredListError`,
 `VisibleItemRange`, and the `resident_window` types its signatures use
@@ -1188,6 +1197,19 @@ by runtime timers, overscroll, and activation.
 Sources declare sections; `VirtualListComponent` pins their headers. Nothing
 here knows what a section means: callers choose levels (for example 0 for an
 outer group and 1 for its subgroups).
+
+A pinned header is painted and receives events through
+`VirtualItemSource::build_pinned` (by default `build`), with a
+`PinnedPlacement`: whether it is the deepest pinned header (content scrolls
+directly under it) and whether the next section is pushing it out. A source can
+use it to set the pinned region apart, for example with an edge under the
+deepest pinned header. The pinned component reuses the item's measured layout,
+so it must lay out exactly as the built one does.
+
+```rust,ignore
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct PinnedPlacement { pub deepest: bool, pub pushed: bool }
+```
 
 ```rust,ignore
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1627,16 +1649,16 @@ impl<K> VirtualListAction<K> {
 The mechanics above combine into common list shapes without product-specific
 code in BMUX:
 
-| Use case | Composition |
-| --- | --- |
-| Chat or log view that follows new output | Uncontrolled `VirtualListComponent`, `ListPosition::FollowBottom`, appends noted with `note_splice` |
-| Caller-owned navigation policy | Controlled state, `drain_actions`, `anchor_for` / `resolve_position`, `set_position` |
-| Short content that can scroll its last row to the top | `Overscroll::ViewportMinus(1)` and `ListPosition::Overscrolled` |
-| Animated reveal or jump | `ScrollMotion` / `ScrollTarget` driven by runtime timers |
-| Very long or mutable collections | `MeasuredListIndex` splices, `VirtualItemSource` with `retained_layout` or `splice_measured` |
-| History larger than memory | `resident_window` paging and eviction replayed through `note_window_splice`, with `PositionEstimate` for the scrollbar |
-| Keyboard focus inside items | `FocusTraversal` over `ItemFocusTarget`s, `reveal_for_focus` for placement |
-| Selection that survives scrolling and eviction | `LogicalSelection` with `KeyOrder`, `highlights` per frame, `selection_auto_scroll` routing |
+| Use case                                              | Composition                                                                                                            |
+| ----------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| Chat or log view that follows new output              | Uncontrolled `VirtualListComponent`, `ListPosition::FollowBottom`, appends noted with `note_splice`                    |
+| Caller-owned navigation policy                        | Controlled state, `drain_actions`, `anchor_for` / `resolve_position`, `set_position`                                   |
+| Short content that can scroll its last row to the top | `Overscroll::ViewportMinus(1)` and `ListPosition::Overscrolled`                                                        |
+| Animated reveal or jump                               | `ScrollMotion` / `ScrollTarget` driven by runtime timers                                                               |
+| Very long or mutable collections                      | `MeasuredListIndex` splices, `VirtualItemSource` with `retained_layout` or `splice_measured`                           |
+| History larger than memory                            | `resident_window` paging and eviction replayed through `note_window_splice`, with `PositionEstimate` for the scrollbar |
+| Keyboard focus inside items                           | `FocusTraversal` over `ItemFocusTarget`s, `reveal_for_focus` for placement                                             |
+| Selection that survives scrolling and eviction        | `LogicalSelection` with `KeyOrder`, `highlights` per frame, `selection_auto_scroll` routing                            |
 
 ### Large hierarchical trees
 

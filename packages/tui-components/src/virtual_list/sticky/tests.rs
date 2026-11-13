@@ -16,8 +16,9 @@ use bmux_tui::text::Line;
 
 use super::StickyHeaders;
 use crate::virtual_list::{
-    AnchorPolicy, Edge, ItemFocusTarget, ListAnchor, ListPosition, NoSourceMap, VirtualItemSource,
-    VirtualList, VirtualListAction, VirtualListChrome, VirtualListComponent, VirtualListState,
+    AnchorPolicy, Edge, ItemFocusTarget, ListAnchor, ListPosition, NoSourceMap, PinnedPlacement,
+    VirtualItemSource, VirtualList, VirtualListAction, VirtualListChrome, VirtualListComponent,
+    VirtualListState,
 };
 
 /// A fixed-height block painting `"{key}:{row}"` on each row.
@@ -78,6 +79,8 @@ type Spec = (u64, Option<u16>, Body);
 struct Doc {
     entries: RefCell<Vec<Entry>>,
     builds: Cell<usize>,
+    /// Keys built as pinned headers, with their placement, in build order.
+    pinned_builds: RefCell<Vec<(u64, PinnedPlacement)>>,
 }
 
 const fn header(key: u64, level: u16, rows: u64) -> Spec {
@@ -93,6 +96,7 @@ impl Doc {
         let doc = Self {
             entries: RefCell::new(Vec::new()),
             builds: Cell::new(0),
+            pinned_builds: RefCell::new(Vec::new()),
         };
         doc.replace(spec);
         doc
@@ -158,6 +162,12 @@ impl VirtualItemSource<u64> for Doc {
             }),
             Body::Text(text) => Element::new(TextBlock::new(text)),
         }
+    }
+
+    fn build_pinned(&self, index: usize, placement: PinnedPlacement) -> Element<'_> {
+        let key = self.entries.borrow()[index].key;
+        self.pinned_builds.borrow_mut().push((key, placement));
+        self.build(index)
     }
 
     fn section_header_level(&self, index: usize) -> Option<u16> {
@@ -425,6 +435,42 @@ fn arriving_headers_push_pinned_headers_out_and_children_clip_below_parents() {
     assert_eq!(painted.items["list.item.0"], rect(0, 6, 1));
     assert_eq!(painted.items["list.item.10"], rect(1, 6, 2));
     assert_eq!(state.borrow().sticky_header_rows(), 1);
+}
+
+#[test]
+fn pinned_headers_are_built_as_pinned_with_their_placement() {
+    let doc = single_row_doc();
+    let state = RefCell::new(VirtualListState::new(0));
+    anchor(&state, 4);
+    let component = list(&doc, &state);
+    let tree = layout(&component, 8, 5);
+    doc.pinned_builds.borrow_mut().clear();
+    paint(&component, &tree);
+    // The group header pins above the subgroup header, which is the deepest.
+    let placement = |deepest, pushed| PinnedPlacement { deepest, pushed };
+    assert_eq!(
+        *doc.pinned_builds.borrow(),
+        [(0, placement(false, false)), (1, placement(true, false))]
+    );
+    // Events reach the same pinned components.
+    doc.pinned_builds.borrow_mut().clear();
+    click(&component, &tree, 3, 1);
+    assert!(
+        doc.pinned_builds
+            .borrow()
+            .iter()
+            .all(|(key, placement)| *key == 1 && placement.deepest)
+    );
+
+    // A header pushed out by the next section says so.
+    let doc = tall_header_doc();
+    let state = RefCell::new(VirtualListState::new(0));
+    anchor(&state, 9);
+    let component = list(&doc, &state);
+    let tree = layout(&component, 6, 6);
+    doc.pinned_builds.borrow_mut().clear();
+    paint(&component, &tree);
+    assert_eq!(*doc.pinned_builds.borrow(), [(0, placement(true, true))]);
 }
 
 #[test]
