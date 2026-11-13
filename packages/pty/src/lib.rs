@@ -304,8 +304,8 @@ impl PtyControl {
 
     /// What the process's platform supports.
     #[must_use]
-    pub const fn capabilities(&self) -> PtyCapabilities {
-        platform::CAPABILITIES
+    pub fn capabilities(&self) -> PtyCapabilities {
+        self.platform.capabilities()
     }
 
     /// The terminal's current size.
@@ -432,7 +432,7 @@ impl PtyProcess {
 
     /// What this process's platform supports.
     #[must_use]
-    pub const fn capabilities(&self) -> PtyCapabilities {
+    pub fn capabilities(&self) -> PtyCapabilities {
         self.control.capabilities()
     }
 
@@ -617,6 +617,12 @@ mod platform {
     impl Control {
         pub const fn id(&self) -> u32 {
             self.pid
+        }
+
+        // Uniform with platforms whose capabilities depend on the process.
+        #[allow(clippy::unused_self)]
+        pub const fn capabilities(&self) -> PtyCapabilities {
+            CAPABILITIES
         }
 
         pub fn resize(&self, size: PtySize) -> io::Result<()> {
@@ -1025,8 +1031,9 @@ mod platform {
     }
 }
 
+/// Plain pipes standing in for a terminal: output is streamed, nothing more.
 #[cfg(not(unix))]
-mod platform {
+mod pipes {
     use std::io;
     use std::process::Stdio;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1056,6 +1063,11 @@ mod platform {
     impl Control {
         pub const fn id(&self) -> u32 {
             self.pid
+        }
+
+        #[allow(clippy::unused_self)]
+        pub const fn capabilities(&self) -> PtyCapabilities {
+            CAPABILITIES
         }
 
         // Pipes have no terminal size.
@@ -1120,12 +1132,12 @@ mod platform {
         let exited = Arc::new(AtomicBool::new(false));
         let waited = Arc::clone(&child);
         let control = PtyControl::new(
-            Control {
+            super::platform::Control::Pipes(Control {
                 child: Arc::clone(&child),
                 pid,
                 exited: Arc::clone(&exited),
                 closed,
-            },
+            }),
             size,
         );
         let exit = Exit {
@@ -1155,6 +1167,92 @@ mod platform {
             control,
             exited: false,
         })
+    }
+}
+
+#[cfg(windows)]
+mod conpty;
+
+/// Where pseudo-terminals are not available, processes run on pipes; on Windows, on `ConPTY`
+/// unless standard output is captured or input is fed (a console cannot redirect only some of
+/// its streams).
+#[cfg(not(unix))]
+mod platform {
+    use std::io;
+
+    use super::{PtyCapabilities, PtyCommand, PtyProcess, PtySize, PtyWriter, pipes};
+
+    #[derive(Debug)]
+    pub enum Control {
+        Pipes(pipes::Control),
+        #[cfg(windows)]
+        Conpty(super::conpty::Control),
+    }
+
+    impl Control {
+        pub const fn id(&self) -> u32 {
+            match self {
+                Self::Pipes(control) => control.id(),
+                #[cfg(windows)]
+                Self::Conpty(control) => control.id(),
+            }
+        }
+
+        pub const fn capabilities(&self) -> PtyCapabilities {
+            match self {
+                Self::Pipes(control) => control.capabilities(),
+                #[cfg(windows)]
+                Self::Conpty(control) => control.capabilities(),
+            }
+        }
+
+        pub fn resize(&self, size: PtySize) -> io::Result<()> {
+            match self {
+                Self::Pipes(control) => control.resize(size),
+                #[cfg(windows)]
+                Self::Conpty(control) => control.resize(size),
+            }
+        }
+
+        pub fn interrupt(&self) -> io::Result<()> {
+            match self {
+                Self::Pipes(control) => control.interrupt(),
+                #[cfg(windows)]
+                Self::Conpty(control) => control.interrupt(),
+            }
+        }
+
+        pub fn kill(&self) -> io::Result<()> {
+            match self {
+                Self::Pipes(control) => control.kill(),
+                #[cfg(windows)]
+                Self::Conpty(control) => control.kill(),
+            }
+        }
+
+        pub fn stop_output(&self) {
+            match self {
+                Self::Pipes(control) => control.stop_output(),
+                #[cfg(windows)]
+                Self::Conpty(control) => control.stop_output(),
+            }
+        }
+
+        pub fn writer(&self) -> io::Result<PtyWriter> {
+            match self {
+                Self::Pipes(control) => control.writer(),
+                #[cfg(windows)]
+                Self::Conpty(control) => control.writer(),
+            }
+        }
+    }
+
+    pub fn spawn(spec: &PtyCommand, size: PtySize) -> io::Result<PtyProcess> {
+        #[cfg(windows)]
+        if !spec.capture_stdout && spec.input.is_none() {
+            return super::conpty::spawn(spec, size);
+        }
+        pipes::spawn(spec, size)
     }
 }
 

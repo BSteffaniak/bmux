@@ -63,11 +63,15 @@ for event in process.events() {
 
 ## Platforms
 
-Unix systems use `openpty`. Elsewhere processes run on plain pipes: output is
-still streamed, but
+Unix systems use `openpty`. Windows uses a pseudo-console (ConPTY): programs see
+a console, and `resize` and `writer` work; each process runs in a Job Object, so
+`kill` reaches everything it started. A console's `ctrl+c` cannot be raised from
+outside it, so on Windows `interrupt` stops the process tree as `kill` does.
+With
+`capture_stdout` or `input`, which a console cannot redirect separately, and on
+other platforms, processes run on plain pipes: output is still streamed, but
 programs see no terminal, `resize` has no effect and `writer` is unsupported.
-`capabilities`
-reports which applies.
+`capabilities` reports which applies to each process.
 
 Whether descendants can keep a terminal open after the process exits differs:
 Linux keeps it open
