@@ -32,6 +32,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, mpsc};
 use std::time::{Duration, Instant};
 
+#[cfg(any(unix, windows))]
+mod pair;
+#[cfg(any(unix, windows))]
+pub use pair::{
+    ChildExit, PtyChild, PtyChildKiller, PtyInput, PtyMaster, PtyPair, PtyReader, PtySlave,
+    SpawnCommand,
+};
+
 /// Events queued between the reader threads and the consumer before readers wait.
 const QUEUE: usize = 64;
 /// Bytes read per output event at most.
@@ -795,7 +803,7 @@ mod platform {
         Ok(())
     }
 
-    fn set_size(fd: RawFd, size: PtySize) -> io::Result<()> {
+    pub(crate) fn set_size(fd: RawFd, size: PtySize) -> io::Result<()> {
         let size = libc::winsize {
             ws_row: size.rows,
             ws_col: size.cols,
@@ -877,7 +885,7 @@ mod platform {
         Ok(())
     }
 
-    fn open(size: PtySize) -> io::Result<(OwnedFd, OwnedFd)> {
+    pub(crate) fn open(size: PtySize) -> io::Result<(OwnedFd, OwnedFd)> {
         let mut master: libc::c_int = -1;
         let mut slave: libc::c_int = -1;
         let mut size = libc::winsize {
@@ -909,7 +917,7 @@ mod platform {
 
     /// Set up the child between fork and exec. Async-signal-safe (signal, setsid, ioctl,
     /// getrlimit, fcntl, syscall only).
-    fn prepare_child(slave_fd: RawFd, controlling: bool) -> io::Result<()> {
+    pub(crate) fn prepare_child(slave_fd: RawFd, controlling: bool) -> io::Result<()> {
         // Start from default handling: dispositions the caller ignores (a terminal UI often
         // ignores interrupts) would otherwise be inherited. The signal mask and SIGPIPE are
         // already reset.

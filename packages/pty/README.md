@@ -61,6 +61,43 @@ for event in process.events() {
 * `stop_output` stops delivering output (it is still drained, so the process cannot block on it)
   and reports the exit without waiting out the grace, for a caller whose deadline passed.
 
+## Terminal pairs
+
+For a caller that supervises processes itself, `PtyPair::open(size)` returns both ends of a new
+terminal and runs nothing in the background:
+
+```rust
+use bmux_pty::{PtyPair, PtySize, SpawnCommand};
+
+let PtyPair { slave, master } = PtyPair::open(PtySize::new(120, 30))?;
+let mut command = SpawnCommand::new("zsh");
+command.env("TERM", "xterm-256color").cwd(root);
+let mut child = slave.spawn(&command)?;
+drop(slave); // only the processes keep the terminal open now
+let reader = master.try_clone_reader()?; // blocking reads; end of file once nothing holds it
+let writer = master.take_writer()?; // once
+master.resize(PtySize::new(100, 40))?;
+let exit = child.wait()?;
+```
+
+* `SpawnCommand` starts from the caller's environment, captured when it is created (on Unix with
+  `SHELL` from the user database when unset; on Windows with the system and user environment
+  registered for new sessions applied over it, user `PATH` appended). Every change can be read
+  back: `argv`, `get_env`, `get_cwd`, `environment`, `utf8_environment`.
+* `PtySlave::spawn` looks the program up on the command's `PATH`, runs in its directory (or the
+  home directory when that does not exist), and on Unix starts a new session with the terminal
+  as its controlling terminal, default signal handling and no stray descriptors.
+* `PtyChild` waits (`try_wait`, `wait`), and `kill` ends the process: on Unix `SIGHUP` as a closing
+  terminal sends, then `SIGKILL` if it has not exited shortly after. `killer` returns a cloneable
+  `PtyChildKiller` for other threads. Killing a process that has exited succeeds.
+* On Unix, `PtyMaster` also gives the slave device's path (`tty_name`) for handing the terminal to
+  another process, the `foreground_process_group`, and its descriptor. Dropping the writer types a
+  newline and the terminal's end-of-file character.
+* On Windows the console asks for the cursor position (`CSI 6 n`) before its first process runs,
+  and waits until the reader of the master answers (`CSI row ; col R`). The console stays open
+  until the master and slave are both dropped; reads then end. A `conpty.dll` shipped beside the
+  executable (with its `OpenConsole.exe`) is used in place of the system console host.
+
 ## Platforms
 
 Unix systems use `openpty`. Windows uses a pseudo-console (ConPTY): programs see

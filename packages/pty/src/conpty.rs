@@ -161,7 +161,7 @@ fn coord(size: PtySize) -> COORD {
 }
 
 /// A pipe's two ends.
-fn pipe() -> io::Result<(OwnedHandle, OwnedHandle)> {
+pub(crate) fn pipe() -> io::Result<(OwnedHandle, OwnedHandle)> {
     let mut read: HANDLE = null_mut();
     let mut write: HANDLE = null_mut();
     // SAFETY: valid out-pointers; default security, so the ends are not inheritable.
@@ -204,12 +204,12 @@ fn job() -> io::Result<OwnedHandle> {
     Ok(job)
 }
 
-fn wide(text: &OsStr) -> Vec<u16> {
+pub(crate) fn wide(text: &OsStr) -> Vec<u16> {
     text.encode_wide().chain(std::iter::once(0)).collect()
 }
 
 /// `arg` quoted as the C runtime splits command lines.
-fn quote(arg: &OsStr, line: &mut Vec<u16>) {
+pub(crate) fn quote(arg: &OsStr, line: &mut Vec<u16>) {
     let units: Vec<u16> = arg.encode_wide().collect();
     let needs_quotes = units.is_empty()
         || units
