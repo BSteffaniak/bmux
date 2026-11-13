@@ -1,13 +1,13 @@
 //! Input conversion boundaries for terminal and native hosts. Both feed the same
 //! attach reducers; neither invents binding, focus, hit-testing, or PTY policy.
 
-use crossterm::event::{
+use bmux_terminal::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 
 /// Terminal input normalized for attach UI reducers.
 ///
-/// Coordinates use the same 0-based row/column convention as crossterm and the
+/// Coordinates use the same 0-based row/column convention as `bmux_terminal` and the
 /// existing attach/status rendering code.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TerminalInputEvent {
@@ -65,7 +65,7 @@ pub enum TerminalKeyPhase {
 }
 
 // Keep modifiers as explicit booleans so simulation inputs are independent of
-// crossterm's bitflag representation and easy for playbooks to construct.
+// the terminal event bitflag representation and easy for playbooks to construct.
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TerminalModifiers {
@@ -113,28 +113,28 @@ pub struct TerminalGeometry {
 
 impl TerminalInputEvent {
     #[must_use]
-    pub fn from_crossterm_event(event: crossterm::event::Event) -> Option<Self> {
+    pub fn from_terminal_event(event: bmux_terminal::event::Event) -> Option<Self> {
         match event {
-            crossterm::event::Event::Key(key) => Some(Self::Key(TerminalKeyEvent::from(key))),
-            crossterm::event::Event::Mouse(mouse) => {
+            bmux_terminal::event::Event::Key(key) => Some(Self::Key(TerminalKeyEvent::from(key))),
+            bmux_terminal::event::Event::Mouse(mouse) => {
                 Some(Self::Mouse(TerminalMouseEvent::from(mouse)))
             }
-            crossterm::event::Event::Resize(cols, rows) => Some(Self::Resize { cols, rows }),
-            crossterm::event::Event::Paste(text) => Some(Self::Paste(text)),
-            crossterm::event::Event::FocusGained => Some(Self::FocusGained),
-            crossterm::event::Event::FocusLost => Some(Self::FocusLost),
+            bmux_terminal::event::Event::Resize(cols, rows) => Some(Self::Resize { cols, rows }),
+            bmux_terminal::event::Event::Paste(text) => Some(Self::Paste(text)),
+            bmux_terminal::event::Event::FocusGained => Some(Self::FocusGained),
+            bmux_terminal::event::Event::FocusLost => Some(Self::FocusLost),
         }
     }
 }
 
 impl TerminalKeyEvent {
     #[must_use]
-    pub fn to_crossterm(&self) -> Option<KeyEvent> {
-        let code = self.code.to_crossterm()?;
+    pub fn to_terminal(&self) -> Option<KeyEvent> {
+        let code = self.code.to_terminal()?;
         Some(KeyEvent::new_with_kind(
             code,
-            self.modifiers.to_crossterm(),
-            self.kind.to_crossterm(),
+            self.modifiers.to_terminal(),
+            self.kind.to_terminal(),
         ))
     }
 }
@@ -151,7 +151,7 @@ impl From<KeyEvent> for TerminalKeyEvent {
 
 impl TerminalKeyCode {
     #[must_use]
-    pub const fn to_crossterm(&self) -> Option<KeyCode> {
+    pub const fn to_terminal(&self) -> Option<KeyCode> {
         Some(match self {
             Self::Backspace => KeyCode::Backspace,
             Self::Enter => KeyCode::Enter,
@@ -219,7 +219,7 @@ impl From<KeyCode> for TerminalKeyCode {
 
 impl TerminalKeyPhase {
     #[must_use]
-    pub const fn to_crossterm(self) -> KeyEventKind {
+    pub const fn to_terminal(self) -> KeyEventKind {
         match self {
             Self::Press => KeyEventKind::Press,
             Self::Repeat => KeyEventKind::Repeat,
@@ -240,11 +240,11 @@ impl From<KeyEventKind> for TerminalKeyPhase {
 
 impl TerminalMouseEvent {
     #[must_use]
-    pub fn to_crossterm(self) -> Option<MouseEvent> {
+    pub fn to_terminal(self) -> Option<MouseEvent> {
         let kind = match self.phase {
-            TerminalMousePhase::Down => MouseEventKind::Down(self.button?.to_crossterm()),
-            TerminalMousePhase::Up => MouseEventKind::Up(self.button?.to_crossterm()),
-            TerminalMousePhase::Drag => MouseEventKind::Drag(self.button?.to_crossterm()),
+            TerminalMousePhase::Down => MouseEventKind::Down(self.button?.to_terminal()),
+            TerminalMousePhase::Up => MouseEventKind::Up(self.button?.to_terminal()),
+            TerminalMousePhase::Drag => MouseEventKind::Drag(self.button?.to_terminal()),
             TerminalMousePhase::Move => MouseEventKind::Moved,
             TerminalMousePhase::ScrollUp => MouseEventKind::ScrollUp,
             TerminalMousePhase::ScrollDown => MouseEventKind::ScrollDown,
@@ -255,7 +255,7 @@ impl TerminalMouseEvent {
             kind,
             column: self.col,
             row: self.row,
-            modifiers: self.modifiers.to_crossterm(),
+            modifiers: self.modifiers.to_terminal(),
         })
     }
 }
@@ -284,7 +284,7 @@ impl From<MouseEvent> for TerminalMouseEvent {
 
 impl TerminalMouseButton {
     #[must_use]
-    pub const fn to_crossterm(self) -> MouseButton {
+    pub const fn to_terminal(self) -> MouseButton {
         match self {
             Self::Left => MouseButton::Left,
             Self::Right => MouseButton::Right,
@@ -305,7 +305,7 @@ impl From<MouseButton> for TerminalMouseButton {
 
 impl TerminalModifiers {
     #[must_use]
-    pub fn to_crossterm(self) -> KeyModifiers {
+    pub const fn to_terminal(self) -> KeyModifiers {
         let mut modifiers = KeyModifiers::empty();
         if self.shift {
             modifiers.insert(KeyModifiers::SHIFT);
@@ -418,7 +418,7 @@ mod tests {
         TerminalInputEvent, TerminalModifiers, TerminalMouseButton, TerminalMouseEvent,
         TerminalMousePhase,
     };
-    use crossterm::event::{Event, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    use bmux_terminal::event::{Event, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
     #[test]
     fn native_keys_preserve_cli_binding_semantics_without_text_conversion() {
@@ -476,7 +476,7 @@ mod tests {
     }
 
     #[test]
-    fn maps_crossterm_mouse_down() {
+    fn maps_terminal_mouse_down() {
         let event = TerminalMouseEvent::from(MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column: 4,
@@ -504,7 +504,7 @@ mod tests {
     }
 
     #[test]
-    fn maps_crossterm_mouse_up_and_drag() {
+    fn maps_terminal_mouse_up_and_drag() {
         let up = TerminalMouseEvent::from(MouseEvent {
             kind: MouseEventKind::Up(MouseButton::Right),
             column: 5,
@@ -525,7 +525,7 @@ mod tests {
     }
 
     #[test]
-    fn maps_crossterm_mouse_motion_and_scroll() {
+    fn maps_terminal_mouse_motion_and_scroll() {
         let moved = TerminalMouseEvent::from(MouseEvent {
             kind: MouseEventKind::Moved,
             column: 8,
@@ -546,17 +546,17 @@ mod tests {
     }
 
     #[test]
-    fn maps_crossterm_paste_as_semantic_event() {
+    fn maps_terminal_paste_as_semantic_event() {
         assert_eq!(
-            TerminalInputEvent::from_crossterm_event(Event::Paste("hello\nworld".to_string())),
+            TerminalInputEvent::from_terminal_event(Event::Paste("hello\nworld".to_string())),
             Some(TerminalInputEvent::Paste("hello\nworld".to_string()))
         );
     }
 
     #[test]
-    fn maps_crossterm_event_resize() {
+    fn maps_terminal_event_resize() {
         assert_eq!(
-            TerminalInputEvent::from_crossterm_event(Event::Resize(120, 30)),
+            TerminalInputEvent::from_terminal_event(Event::Resize(120, 30)),
             Some(TerminalInputEvent::Resize {
                 cols: 120,
                 rows: 30

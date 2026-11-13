@@ -32,8 +32,8 @@ bmux_recording_protocol = { workspace = true, optional = true }
 bmux_session_models = { workspace = true, optional = true }
 bmux_sessions_plugin_api = { workspace = true, optional = true }
 bmux_tabs_plugin_api = { workspace = true, optional = true }
+bmux_terminal = { workspace = true, optional = true }
 bmux_terminal_grid = { workspace = true, optional = true }
-crossterm = { workspace = true, optional = true, features = ["events"] }
 regex = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true, features = [
@@ -111,7 +111,7 @@ runtime = [
     "dep:bmux_sessions_plugin_api",
     "dep:bmux_tabs_plugin_api",
     "dep:bmux_terminal_grid",
-    "dep:crossterm",
+    "dep:bmux_terminal",
     "dep:regex",
     "dep:serde_json",
     "dep:tokio",

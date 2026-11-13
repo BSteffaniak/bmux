@@ -18,9 +18,9 @@ use anyhow::{Context, Result};
 use bmux_scene_protocol::scene_protocol::{
     BorderGlyphs, Cell, GradientAxis, PaintCommand, Rect, Style, SurfaceDecoration,
 };
-use crossterm::cursor::MoveTo;
-use crossterm::queue;
-use crossterm::style::Print;
+use bmux_terminal::cursor::MoveTo;
+use bmux_terminal::queue;
+use bmux_terminal::style::Print;
 use std::io;
 use unicode_width::UnicodeWidthStr;
 

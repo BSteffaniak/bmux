@@ -1,7 +1,7 @@
 //! Linux-owned terminal ingress.
 //!
 //! This is an opt-in legacy keyboard backend, not
-//! a runtime replacement for a live Crossterm reader. Kitty/CSI-u, mouse, focus,
+//! a runtime replacement for the shared `bmux_terminal` reader. Kitty/CSI-u, mouse, focus,
 //! and capability-response decoding are deliberately unsupported. Do not issue
 //! input-reading terminal probes with this backend. Resize is application-owned.
 use std::fs::{File, OpenOptions};
@@ -98,7 +98,7 @@ impl LinuxInputReader {
     ///
     /// # Safety
     /// The application must not have created ANY other terminal input reader,
-    /// including Crossterm event streams, polling, reads or capability probes.
+    /// including `bmux_terminal` event streams, polling, reads or capability probes.
     /// It must use this owner for the entire terminal lifetime. The in-process
     /// singleton does not detect readers in other libraries or processes.
     /// # Errors

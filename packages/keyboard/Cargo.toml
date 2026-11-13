@@ -11,11 +11,9 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
-crossterm = { workspace = true, optional = true }
-serde     = { workspace = true, features = ["derive", "std"], optional = true }
+serde = { workspace = true, features = ["derive", "std"], optional = true }
 
 [features]
-crossterm        = ["dep:crossterm", "crossterm/events", "crossterm/windows"]
 csi-u            = []
 default          = ["csi-u"]
 fail-on-warnings = []

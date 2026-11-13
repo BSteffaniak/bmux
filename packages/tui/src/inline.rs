@@ -26,9 +26,9 @@ impl<W: Write> InlineTerminal<W> {
     /// # Errors
     /// Returns terminal mode or writer errors.
     pub fn enter(mut writer: W) -> io::Result<Self> {
-        let restore_raw = !crossterm::terminal::is_raw_mode_enabled()?;
+        let restore_raw = !bmux_terminal::terminal::is_raw_mode_enabled()?;
         if restore_raw {
-            crossterm::terminal::enable_raw_mode()?;
+            bmux_terminal::terminal::enable_raw_mode()?;
         }
         if let Err(error) = writer.write_all(if restore_raw {
             b"\x1b[?25l\x1b[?2004h"
@@ -36,7 +36,7 @@ impl<W: Write> InlineTerminal<W> {
             b"\x1b[?25l"
         }) {
             if restore_raw {
-                let _ = crossterm::terminal::disable_raw_mode();
+                let _ = bmux_terminal::terminal::disable_raw_mode();
             }
             return Err(error);
         }
@@ -53,7 +53,7 @@ impl<W: Write> InlineTerminal<W> {
     /// # Errors
     /// Returns terminal size, invalid frame size, or output errors.
     pub fn draw(&mut self, buffer: &Buffer) -> io::Result<()> {
-        let (width, height) = crossterm::terminal::size()?;
+        let (width, height) = bmux_terminal::terminal::size()?;
         if buffer.area().width >= width || buffer.area().height >= height {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -119,7 +119,7 @@ impl<W: Write> InlineTerminal<W> {
             })
             .and_then(|()| self.writer.flush());
         let raw = if self.restore_raw {
-            let result = crossterm::terminal::disable_raw_mode();
+            let result = bmux_terminal::terminal::disable_raw_mode();
             if result.is_ok() {
                 self.restore_raw = false;
             }
@@ -138,7 +138,7 @@ impl<W: Write> InlineTerminal<W> {
         if self.rows == 0 {
             return Ok(());
         }
-        let height = crossterm::terminal::size()?.1;
+        let height = bmux_terminal::terminal::size()?.1;
         let rows = self.rows.min(height.saturating_sub(1));
         if rows > 0 {
             write!(self.writer, "\r\x1b[{rows}A")?;
@@ -163,7 +163,7 @@ impl<W: Write> Drop for InlineTerminal<W> {
         });
         let _ = self.writer.flush();
         if self.restore_raw {
-            let _ = crossterm::terminal::disable_raw_mode();
+            let _ = bmux_terminal::terminal::disable_raw_mode();
         }
     }
 }

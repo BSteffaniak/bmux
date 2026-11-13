@@ -38,7 +38,7 @@ bmux_diagnostic_log = { workspace = true }
 bmux_env = { workspace = true }
 bmux_ipc = { workspace = true }
 bmux_keybind = { workspace = true }
-bmux_keyboard = { workspace = true, features = ["crossterm"] }
+bmux_keyboard = { workspace = true }
 bmux_pane_runtime_plugin_api = { workspace = true }
 bmux_performance_plugin_api = { workspace = true }
 bmux_performance_state = { workspace = true }
@@ -169,7 +169,7 @@ bmux_workspaces_plugin = { workspace = true, optional = true, features = [
 anyhow = { workspace = true, features = ["std"] }
 bmux_image = { workspace = true, optional = true }
 clap = { workspace = true, features = ["derive", "help", "std", "usage"] }
-crossterm = { workspace = true, features = ["events", "event-stream"] }
+bmux_terminal = { workspace = true }
 futures-util = { workspace = true }
 git_sshripped_recipient = { workspace = true }
 git_sshripped_ssh_agent = { workspace = true }

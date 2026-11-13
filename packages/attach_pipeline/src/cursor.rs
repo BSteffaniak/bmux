@@ -1,7 +1,7 @@
 use crate::types::AttachCursorState;
 use anyhow::{Context, Result};
-use crossterm::cursor::{Hide, MoveTo, RestorePosition, Show};
-use crossterm::queue;
+use bmux_terminal::cursor::{Hide, MoveTo, RestorePosition, Show};
+use bmux_terminal::queue;
 use std::io::Write;
 
 /// Apply cursor visibility/position updates for an attach-rendered frame.

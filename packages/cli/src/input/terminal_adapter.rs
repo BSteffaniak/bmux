@@ -1,17 +1,17 @@
-//! Crossterm event adapter.
+//! Terminal key event adapter.
 //!
-//! Converts crossterm `KeyEvent` types into the bmux-internal `InputEvent`
+//! Converts terminal `KeyEvent` types into the bmux-internal `InputEvent`
 //! representation, including both the logical `KeyStroke` (for keybind matching)
 //! and the raw byte encoding (for PTY forwarding).
 
-use bmux_keyboard::crossterm::crossterm_key_event_to_stroke;
+use bmux_terminal::keyboard::key_event_to_stroke;
 use bmux_keyboard::encode::{KeyEncodingModes, encode_key_with_modes};
-use crossterm::event::{Event, KeyEvent as CrosstermKeyEvent, KeyEventKind};
+use bmux_terminal::event::{Event, KeyEvent as TermKeyEvent, KeyEventKind};
 
 use super::{DecodedStroke, InputEvent};
 
-/// Convert a crossterm [`Event`] into an [`InputEvent`], if applicable.
-pub(super) fn crossterm_event_to_input_event(
+/// Convert a terminal [`Event`] into an [`InputEvent`], if applicable.
+pub(super) fn terminal_event_to_input_event(
     event: &Event,
     enhanced: bool,
     modes: KeyEncodingModes,
@@ -22,12 +22,12 @@ pub(super) fn crossterm_event_to_input_event(
     }
 }
 
-/// Convert a crossterm [`KeyEvent`] into an [`InputEvent`].
+/// Convert a terminal [`KeyEvent`] into an [`InputEvent`].
 ///
 /// Filters out `Release` events. Produces both the logical `KeyStroke`
 /// (for keybind matching) and the raw byte encoding (for PTY forwarding).
 fn key_event_to_input_event(
-    key: &CrosstermKeyEvent,
+    key: &TermKeyEvent,
     enhanced: bool,
     modes: KeyEncodingModes,
 ) -> Option<InputEvent> {
@@ -35,7 +35,7 @@ fn key_event_to_input_event(
         return None;
     }
 
-    let stroke = crossterm_key_event_to_stroke(key)?;
+    let stroke = key_event_to_stroke(key)?;
     let raw = key_event_to_bytes(key, enhanced, modes)?;
     Some(InputEvent::Key(DecodedStroke {
         kind: key.kind,
@@ -44,16 +44,16 @@ fn key_event_to_input_event(
     }))
 }
 
-/// Encode a crossterm `KeyEvent` to raw bytes for PTY forwarding.
+/// Encode a terminal `KeyEvent` to raw bytes for PTY forwarding.
 ///
 /// Delegates to `bmux_keyboard::encode::encode_key_with_modes()` which uses CSI u
 /// encoding when `enhanced` is true and needed, or legacy VT encoding
 /// otherwise.
 fn key_event_to_bytes(
-    key: &CrosstermKeyEvent,
+    key: &TermKeyEvent,
     enhanced: bool,
     modes: KeyEncodingModes,
 ) -> Option<Vec<u8>> {
-    let stroke = crossterm_key_event_to_stroke(key)?;
+    let stroke = key_event_to_stroke(key)?;
     encode_key_with_modes(&stroke, enhanced, modes)
 }

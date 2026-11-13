@@ -23,9 +23,9 @@ use bmux_attach_pipeline_models::{
 use bmux_attach_view_protocol::AttachViewComponent;
 use bmux_client::{AttachLayoutState, AttachPaneSnapshotState, AttachSnapshotState};
 use bmux_terminal_grid::{GridDeltaBatch, GridLimits, GridMode, GridSnapshot, TerminalGridStream};
-use crossterm::cursor::{Hide, SavePosition};
-use crossterm::queue;
-use crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};
+use bmux_terminal::cursor::{Hide, SavePosition};
+use bmux_terminal::queue;
+use bmux_terminal::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;

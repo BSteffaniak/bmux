@@ -9,7 +9,7 @@ use bmux_keyboard::csi_u;
 use bmux_keyboard::legacy;
 use bmux_keyboard::{KeyCode, KeyStroke};
 
-use crossterm::event::KeyEventKind;
+use bmux_terminal::event::KeyEventKind;
 
 use super::{DecodedStroke, InputEvent};
 
@@ -28,7 +28,7 @@ impl ByteDecoder {
         while let Some((stroke, consumed)) = decode_one(&self.pending) {
             self.pending.drain(0..consumed);
             // This decoder produces typing/keybinding actions, like the
-            // Crossterm adapter: releases are consumed but never type again.
+            // Terminal adapter: releases are consumed but never type again.
             if stroke.kind != KeyEventKind::Release {
                 events.push(InputEvent::Key(stroke));
             }

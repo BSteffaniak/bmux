@@ -13,7 +13,7 @@ version     = { workspace = true }
 [dependencies]
 anyhow              = { workspace = true }
 bmux_scene_protocol = { workspace = true }
-crossterm           = { workspace = true }
+bmux_terminal       = { workspace = true }
 unicode-width       = { workspace = true }
 
 [dev-dependencies]

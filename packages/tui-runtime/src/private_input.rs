@@ -3,7 +3,7 @@
 //! The capture owner must acknowledge suppression before acquisition, and must
 //! drain both decoded and raw pending input before resuming. Dropping a lease
 //! deliberately does NOT resume capture or ordinary input.
-#[cfg(all(target_os = "linux", feature = "crossterm"))]
+#[cfg(all(target_os = "linux", feature = "terminal-io"))]
 pub mod ingress;
 
 use std::fmt;
@@ -28,20 +28,20 @@ pub trait CaptureSuppression: Send {
     /// No second reader may be constructed. Default owners need no wire handshake.
     /// # Errors
     /// Returns failure unless the containing capture owner acknowledges suppression.
-    #[cfg(all(target_os = "linux", feature = "crossterm"))]
+    #[cfg(all(target_os = "linux", feature = "terminal-io"))]
     fn suppress_with_reader(
         &mut self,
-        _reader: &mut bmux_tui::crossterm::input::RawInput,
+        _reader: &mut bmux_tui::terminal_io::input::RawInput,
     ) -> Result<(), PrivateInputError> {
         self.suppress()
     }
     /// Restore an enclosing boundary through the same raw reader, after local reset.
     /// # Errors
     /// Returns failure unless restoration is acknowledged; quarantine remains active.
-    #[cfg(all(target_os = "linux", feature = "crossterm"))]
+    #[cfg(all(target_os = "linux", feature = "terminal-io"))]
     fn resume_with_reader(
         &mut self,
-        _reader: &mut bmux_tui::crossterm::input::RawInput,
+        _reader: &mut bmux_tui::terminal_io::input::RawInput,
     ) -> Result<(), PrivateInputError> {
         self.drain_and_resume()
     }

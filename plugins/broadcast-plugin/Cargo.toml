@@ -23,6 +23,7 @@ bmux_plugin = { workspace = true }
 bmux_plugin_sdk = { workspace = true }
 bmux_presentation_state = { workspace = true }
 bmux_sessions_plugin_api = { workspace = true }
+bmux_terminal = { workspace = true }
 bmux_text_edit = { workspace = true }
 bmux_tui = { workspace = true }
 bmux_tui_components = { workspace = true, features = [
@@ -30,9 +31,8 @@ bmux_tui_components = { workspace = true, features = [
     "text-input",
     "key-hint-bar",
 ] }
-bmux_tui_runtime = { workspace = true, features = ["crossterm"] }
+bmux_tui_runtime = { workspace = true, features = ["terminal-io"] }
 bmux_web_renderer = { workspace = true }
-crossterm = { workspace = true }
 futures-util = { workspace = true, features = ["sink"] }
 libc = { workspace = true }
 reqwest = { workspace = true }

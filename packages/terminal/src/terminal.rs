@@ -48,6 +48,31 @@ pub fn size() -> io::Result<(u16, u16)> {
     sys::size()
 }
 
+/// Terminal dimensions in cells and, where reported, pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct WindowSize {
+    /// Rows of cells.
+    pub rows: u16,
+    /// Columns of cells.
+    pub columns: u16,
+    /// Width in pixels; `0` when the terminal does not report it.
+    pub width: u16,
+    /// Height in pixels; `0` when the terminal does not report it.
+    pub height: u16,
+}
+
+/// The terminal size in cells and pixels.
+///
+/// Pixel dimensions come from the terminal driver and are `0` when the
+/// terminal does not report them.
+///
+/// # Errors
+///
+/// Returns the size query failure; Windows consoles report `Unsupported`.
+pub fn window_size() -> io::Result<WindowSize> {
+    sys::window_size()
+}
+
 /// Whether the terminal supports the kitty keyboard protocol.
 ///
 /// On Unix this writes a progressive-enhancement query followed by a

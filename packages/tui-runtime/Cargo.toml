@@ -24,11 +24,11 @@ required-features = ["image-iterm2"]
 
 [[example]]
 name              = "image_protocols"
-required-features = ["image-kitty", "image-sixel", "image-iterm2", "crossterm"]
+required-features = ["image-kitty", "image-sixel", "image-iterm2", "terminal-io"]
 
 [[example]]
 name              = "pointer_controls"
-required-features = ["crossterm"]
+required-features = ["terminal-io"]
 
 [dev-dependencies]
 bmux_text_edit = { workspace = true }
@@ -51,8 +51,7 @@ zeroize                = { workspace = true }
 [features]
 # Image protocol bundle, independent of the terminal input/lifecycle backend.
 all-protocols = ["image-kitty", "image-sixel", "image-iterm2"]
-crossterm = ["bmux_tui/crossterm", "bmux_keyboard/crossterm"]
-default = ["all-protocols", "crossterm"]
+default = ["all-protocols", "terminal-io"]
 fail-on-warnings = [
     "bmux_image?/fail-on-warnings",
     "bmux_keyboard/fail-on-warnings",
@@ -62,5 +61,6 @@ image-iterm2 = ["images", "bmux_image/iterm2"]
 image-kitty = ["images", "bmux_image/kitty"]
 image-sixel = ["images", "bmux_image/sixel"]
 images = ["dep:bmux_image"]
+terminal-io = ["bmux_tui/terminal-io"]
 # Deterministic `testing::ProgramHarness` for downstream test builds. Not for production.
 testing = ["tokio/test-util"]

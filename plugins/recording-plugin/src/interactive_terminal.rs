@@ -13,7 +13,7 @@ use bmux_recording_plugin_api::{
     recording_process_presentation_v1 as presentation, recording_process_v4 as process,
 };
 use bmux_terminal_grid::{GridLimits, GridSnapshot, TerminalGridStream};
-use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind};
+use bmux_terminal::event::{Event, KeyCode, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind};
 use uuid::Uuid;
 
 const MAX_INPUT: usize = 16_384;
@@ -107,7 +107,7 @@ fn encode_input(event: Event, modes: InputModes) -> Result<Option<Vec<u8>>> {
                     ),
                 );
             }
-            let stroke = bmux_keyboard::crossterm::crossterm_key_event_to_stroke(&key)
+            let stroke = bmux_terminal::keyboard::key_event_to_stroke(&key)
                 .context("unsupported interactive key; input suspended")?;
             encode_key_with_modes(
                 &stroke,
@@ -144,7 +144,7 @@ fn encode_input(event: Event, modes: InputModes) -> Result<Option<Vec<u8>>> {
 
 fn encode_mouse(mouse: MouseEvent, modes: InputModes) -> Result<Option<Vec<u8>>> {
     use bmux_terminal_grid::MouseProtocolMode;
-    use crossterm::event::MouseButton;
+    use bmux_terminal::event::MouseButton;
     let tracking = modes.mouse_mode();
     if tracking == MouseProtocolMode::None {
         return Ok(None);
@@ -961,7 +961,7 @@ async fn interact_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::{KeyEvent, MouseButton};
+    use bmux_terminal::event::{KeyEvent, MouseButton};
     use std::io::Write;
 
     fn live_frame() -> bmux_pane_runtime_plugin_api::pane_runtime_live_presentation_v1::LiveFrame {

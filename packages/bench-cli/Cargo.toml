@@ -16,7 +16,8 @@ path = "src/main.rs"
 
 [dependencies]
 bmux_bench = { workspace = true }
-bmux_tui = { workspace = true, features = ["crossterm"] }
+bmux_terminal = { workspace = true }
+bmux_tui = { workspace = true, features = ["terminal-io"] }
 bmux_tui_components = { workspace = true, features = ["badge"] }
 clap = { workspace = true, features = [
     "derive",
@@ -25,7 +26,6 @@ clap = { workspace = true, features = [
     "usage",
     "error-context",
 ] }
-crossterm = { workspace = true, features = ["events"] }
 serde_json = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]

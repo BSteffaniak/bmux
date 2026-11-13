@@ -21,8 +21,8 @@ use bmux_attach_layout_protocol::{
 use bmux_client::{AttachLayoutState, AttachOpenInfo};
 use bmux_config::BmuxConfig;
 use bmux_keyboard::{KeyCode as BmuxKeyCode, KeyStroke};
-use crossterm::event::{
-    Event as CrosstermEvent, KeyCode as CrosstermKeyCode, KeyEvent, KeyEventKind, KeyEventState,
+use bmux_terminal::event::{
+    Event as TermEvent, KeyCode as TermKeyCode, KeyEvent, KeyEventKind, KeyEventState,
     KeyModifiers,
 };
 use std::time::Instant;
@@ -136,7 +136,7 @@ impl AttachSimHarness {
                     Some(super::input::TerminalMouseButton::Left)
                 )
             )
-            && let Some(mouse_event) = event.to_crossterm()
+            && let Some(mouse_event) = event.to_terminal()
         {
             let target = self.mouse_content_target(event);
             if maybe_begin_attach_mouse_selection_drag(&mut self.view_state, target, mouse_event) {
@@ -192,7 +192,7 @@ impl AttachSimHarness {
         if self.view_state.mouse.pointer_owner().is_some() {
             return false;
         }
-        let Some(mouse_event) = event.to_crossterm() else {
+        let Some(mouse_event) = event.to_terminal() else {
             return false;
         };
         let target = self.mouse_content_target(event);
@@ -581,8 +581,8 @@ impl AttachSimHarness {
             .map_err(|error| anyhow::anyhow!("invalid attach key chord '{chord}': {error}"))?;
         let mut emitted = Vec::new();
         for stroke in strokes {
-            let event = crossterm_event_from_stroke(stroke);
-            let CrosstermEvent::Key(key) = event else {
+            let event = terminal_event_from_stroke(stroke);
+            let TermEvent::Key(key) = event else {
                 continue;
             };
             if self.view_state.prompt.is_active() {
@@ -777,25 +777,25 @@ fn append_sim_pane_output(buffer: &mut PaneRenderBuffer, bytes: &[u8]) {
     }
 }
 
-fn crossterm_event_from_stroke(stroke: KeyStroke) -> CrosstermEvent {
+fn terminal_event_from_stroke(stroke: KeyStroke) -> TermEvent {
     let code = match stroke.key {
-        BmuxKeyCode::Char(value) => CrosstermKeyCode::Char(value),
-        BmuxKeyCode::Enter => CrosstermKeyCode::Enter,
-        BmuxKeyCode::Tab => CrosstermKeyCode::Tab,
-        BmuxKeyCode::Backspace => CrosstermKeyCode::Backspace,
-        BmuxKeyCode::Delete => CrosstermKeyCode::Delete,
-        BmuxKeyCode::Escape => CrosstermKeyCode::Esc,
-        BmuxKeyCode::Space => CrosstermKeyCode::Char(' '),
-        BmuxKeyCode::Up => CrosstermKeyCode::Up,
-        BmuxKeyCode::Down => CrosstermKeyCode::Down,
-        BmuxKeyCode::Left => CrosstermKeyCode::Left,
-        BmuxKeyCode::Right => CrosstermKeyCode::Right,
-        BmuxKeyCode::Home => CrosstermKeyCode::Home,
-        BmuxKeyCode::End => CrosstermKeyCode::End,
-        BmuxKeyCode::PageUp => CrosstermKeyCode::PageUp,
-        BmuxKeyCode::PageDown => CrosstermKeyCode::PageDown,
-        BmuxKeyCode::Insert => CrosstermKeyCode::Insert,
-        BmuxKeyCode::F(value) => CrosstermKeyCode::F(value),
+        BmuxKeyCode::Char(value) => TermKeyCode::Char(value),
+        BmuxKeyCode::Enter => TermKeyCode::Enter,
+        BmuxKeyCode::Tab => TermKeyCode::Tab,
+        BmuxKeyCode::Backspace => TermKeyCode::Backspace,
+        BmuxKeyCode::Delete => TermKeyCode::Delete,
+        BmuxKeyCode::Escape => TermKeyCode::Esc,
+        BmuxKeyCode::Space => TermKeyCode::Char(' '),
+        BmuxKeyCode::Up => TermKeyCode::Up,
+        BmuxKeyCode::Down => TermKeyCode::Down,
+        BmuxKeyCode::Left => TermKeyCode::Left,
+        BmuxKeyCode::Right => TermKeyCode::Right,
+        BmuxKeyCode::Home => TermKeyCode::Home,
+        BmuxKeyCode::End => TermKeyCode::End,
+        BmuxKeyCode::PageUp => TermKeyCode::PageUp,
+        BmuxKeyCode::PageDown => TermKeyCode::PageDown,
+        BmuxKeyCode::Insert => TermKeyCode::Insert,
+        BmuxKeyCode::F(value) => TermKeyCode::F(value),
     };
 
     let mut modifiers = KeyModifiers::NONE;
@@ -818,7 +818,7 @@ fn crossterm_event_from_stroke(stroke: KeyStroke) -> CrosstermEvent {
         modifiers |= KeyModifiers::META;
     }
 
-    CrosstermEvent::Key(KeyEvent {
+    TermEvent::Key(KeyEvent {
         code,
         modifiers,
         kind: KeyEventKind::Press,

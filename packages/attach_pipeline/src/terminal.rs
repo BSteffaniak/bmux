@@ -11,13 +11,13 @@
 
 use std::io::{self, Write};
 
-use crossterm::event::{
+use bmux_terminal::event::{
     DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
     EnableFocusChange, EnableMouseCapture, Event, EventStream, KeyboardEnhancementFlags,
     PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
-use crossterm::queue;
-use crossterm::terminal::{
+use bmux_terminal::queue;
+use bmux_terminal::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use futures_util::StreamExt;
@@ -41,7 +41,7 @@ pub struct TerminalOptions {
 
 /// An exclusively owned terminal input backend with a real decoder/raw barrier.
 ///
-/// Implementations must not wrap Crossterm's global input reader: dropping its
+/// Implementations must not wrap the shared `bmux_terminal` input reader: dropping its
 /// event stream does not discard the global decoder or platform read thread.
 pub trait FencedTerminalInput: Send {
     /// Poll one event without blocking or recording its contents.
@@ -64,7 +64,7 @@ pub trait FencedTerminalInput: Send {
 
 #[cfg(target_os = "linux")]
 struct RawFencedInput {
-    reader: bmux_tui::crossterm::input::RawInput,
+    reader: bmux_tui::terminal_io::input::RawInput,
     paused: bool,
     wake: std::pin::Pin<Box<tokio::time::Sleep>>,
 }
@@ -81,7 +81,7 @@ impl FencedTerminalInput for RawFencedInput {
         loop {
             match self.reader.read_ready(std::time::Instant::now()) {
                 Ok(Some(packet)) => {
-                    if let Some(event) = packet.into_crossterm() {
+                    if let Some(event) = packet.into_terminal_event() {
                         return std::task::Poll::Ready(Ok(Some(event)));
                     }
                 }
@@ -226,7 +226,7 @@ impl<W: Write> TerminalIo<W> {
         #[cfg(not(target_os = "linux"))]
         if options.keyboard_enhanced {
             options.keyboard_enhanced =
-                crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
+                bmux_terminal::terminal::supports_keyboard_enhancement().unwrap_or(false);
         }
         // Mark requested modes before writing: a partial write can enable any
         // prefix, and every requested mode must then be undone during repair.
@@ -244,7 +244,7 @@ impl<W: Write> TerminalIo<W> {
         #[cfg(target_os = "linux")]
         if self.fenced_input.is_none() {
             self.fenced_input = Some(Box::new(RawFencedInput {
-                reader: bmux_tui::crossterm::input::RawInput::open_stdout_tty()?,
+                reader: bmux_tui::terminal_io::input::RawInput::open_stdout_tty()?,
                 paused: false,
                 wake: Box::pin(tokio::time::sleep(std::time::Duration::ZERO)),
             }));
@@ -313,7 +313,7 @@ impl<W: Write> TerminalIo<W> {
     /// Reports terminal geometry query errors.
     #[allow(clippy::unused_self)] // Geometry belongs to the terminal backend interface, not consumer policy.
     pub fn geometry(&self) -> io::Result<(u16, u16)> {
-        crossterm::terminal::size()
+        bmux_terminal::terminal::size()
     }
 
     /// Restore all owned modes, attempting raw-mode cleanup even if output fails.

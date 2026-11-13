@@ -1980,7 +1980,7 @@ fn install_native_selection_sources(
 
 async fn run_owned(mut player: Player, guard: &mut TerminalGuard) -> Result<()> {
     let reload_task = start_reloads(&mut player);
-    let (cols, rows) = crossterm::terminal::size()?;
+    let (cols, rows) = bmux_terminal::terminal::size()?;
     let terminal = Terminal::new(stdout(), Rect::new(0, 0, cols, rows));
     let presenter =
         ImageTerminalPresenter::detect(terminal, paint, bmux_image::ImageConfig::default())
@@ -2153,27 +2153,27 @@ impl TerminalGuard {
             raw: false,
             screen: false,
         };
-        crossterm::terminal::enable_raw_mode()?;
+        bmux_terminal::terminal::enable_raw_mode()?;
         guard.raw = true;
         // Claim cleanup before writing: partial writes also need restoration.
         guard.screen = true;
-        crossterm::execute!(
+        bmux_terminal::execute!(
             stdout(),
-            crossterm::terminal::EnterAlternateScreen,
-            crossterm::cursor::Hide,
-            crossterm::event::EnableBracketedPaste,
-            crossterm::event::EnableMouseCapture
+            bmux_terminal::terminal::EnterAlternateScreen,
+            bmux_terminal::cursor::Hide,
+            bmux_terminal::event::EnableBracketedPaste,
+            bmux_terminal::event::EnableMouseCapture
         )?;
         Ok(guard)
     }
     fn restore(&mut self) -> Result<()> {
         let screen = if self.screen {
-            crossterm::execute!(
+            bmux_terminal::execute!(
                 stdout(),
-                crossterm::event::DisableMouseCapture,
-                crossterm::event::DisableBracketedPaste,
-                crossterm::cursor::Show,
-                crossterm::terminal::LeaveAlternateScreen
+                bmux_terminal::event::DisableMouseCapture,
+                bmux_terminal::event::DisableBracketedPaste,
+                bmux_terminal::cursor::Show,
+                bmux_terminal::terminal::LeaveAlternateScreen
             )
         } else {
             Ok(())
@@ -2182,7 +2182,7 @@ impl TerminalGuard {
             self.screen = false;
         }
         let raw = if self.raw {
-            crossterm::terminal::disable_raw_mode()
+            bmux_terminal::terminal::disable_raw_mode()
         } else {
             Ok(())
         };

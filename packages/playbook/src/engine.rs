@@ -35,8 +35,8 @@ use bmux_recording_protocol::{DisplayActivityKind, RecordingSummary};
 use bmux_session_models::SessionSelector;
 use bmux_sessions_plugin_api::{sessions_commands, sessions_state};
 use bmux_tabs_plugin_api::tabs_commands;
-use crossterm::event::{
-    Event as CrosstermEvent, KeyCode as CrosstermKeyCode, KeyEvent, KeyEventKind, KeyEventState,
+use bmux_terminal::event::{
+    Event as TermEvent, KeyCode as TermKeyCode, KeyEvent, KeyEventKind, KeyEventState,
     KeyModifiers,
 };
 use regex::Regex;
@@ -217,18 +217,18 @@ const fn parse_visual_control_action(key: KeyEvent) -> Option<VisualControlActio
     }
 
     if key.modifiers.contains(KeyModifiers::CONTROL)
-        && matches!(key.code, CrosstermKeyCode::Char('c' | 'd'))
+        && matches!(key.code, TermKeyCode::Char('c' | 'd'))
     {
         return Some(VisualControlAction::Abort);
     }
 
     match key.code {
-        CrosstermKeyCode::Char(' ') => Some(VisualControlAction::TogglePause),
-        CrosstermKeyCode::Char('n') => Some(VisualControlAction::StepOnce),
-        CrosstermKeyCode::Char('c' | 'l') => Some(VisualControlAction::ContinueLive),
-        CrosstermKeyCode::Char('q') | CrosstermKeyCode::Esc => Some(VisualControlAction::Abort),
-        CrosstermKeyCode::Char(':') => Some(VisualControlAction::PromptDsl),
-        CrosstermKeyCode::Char('?' | 'h') => Some(VisualControlAction::Help),
+        TermKeyCode::Char(' ') => Some(VisualControlAction::TogglePause),
+        TermKeyCode::Char('n') => Some(VisualControlAction::StepOnce),
+        TermKeyCode::Char('c' | 'l') => Some(VisualControlAction::ContinueLive),
+        TermKeyCode::Char('q') | TermKeyCode::Esc => Some(VisualControlAction::Abort),
+        TermKeyCode::Char(':') => Some(VisualControlAction::PromptDsl),
+        TermKeyCode::Char('?' | 'h') => Some(VisualControlAction::Help),
         _ => None,
     }
 }
@@ -331,7 +331,7 @@ impl VisualInteractiveState {
             let Some(event) = self.terminal.poll_event()? else {
                 return Ok(None);
             };
-            if let CrosstermEvent::Key(key) = event
+            if let TermEvent::Key(key) = event
                 && let Some(action) = parse_visual_control_action(key)
             {
                 return Ok(Some(action));
@@ -4816,25 +4816,25 @@ async fn apply_attach_runtime_actions(
     Ok(())
 }
 
-pub fn crossterm_event_from_stroke(stroke: KeyStroke) -> CrosstermEvent {
+pub fn terminal_event_from_stroke(stroke: KeyStroke) -> TermEvent {
     let key_code = match stroke.key {
-        BmuxKeyCode::Char(c) => CrosstermKeyCode::Char(c),
-        BmuxKeyCode::Enter => CrosstermKeyCode::Enter,
-        BmuxKeyCode::Tab => CrosstermKeyCode::Tab,
-        BmuxKeyCode::Backspace => CrosstermKeyCode::Backspace,
-        BmuxKeyCode::Delete => CrosstermKeyCode::Delete,
-        BmuxKeyCode::Escape => CrosstermKeyCode::Esc,
-        BmuxKeyCode::Space => CrosstermKeyCode::Char(' '),
-        BmuxKeyCode::Up => CrosstermKeyCode::Up,
-        BmuxKeyCode::Down => CrosstermKeyCode::Down,
-        BmuxKeyCode::Left => CrosstermKeyCode::Left,
-        BmuxKeyCode::Right => CrosstermKeyCode::Right,
-        BmuxKeyCode::Home => CrosstermKeyCode::Home,
-        BmuxKeyCode::End => CrosstermKeyCode::End,
-        BmuxKeyCode::PageUp => CrosstermKeyCode::PageUp,
-        BmuxKeyCode::PageDown => CrosstermKeyCode::PageDown,
-        BmuxKeyCode::Insert => CrosstermKeyCode::Insert,
-        BmuxKeyCode::F(value) => CrosstermKeyCode::F(value),
+        BmuxKeyCode::Char(c) => TermKeyCode::Char(c),
+        BmuxKeyCode::Enter => TermKeyCode::Enter,
+        BmuxKeyCode::Tab => TermKeyCode::Tab,
+        BmuxKeyCode::Backspace => TermKeyCode::Backspace,
+        BmuxKeyCode::Delete => TermKeyCode::Delete,
+        BmuxKeyCode::Escape => TermKeyCode::Esc,
+        BmuxKeyCode::Space => TermKeyCode::Char(' '),
+        BmuxKeyCode::Up => TermKeyCode::Up,
+        BmuxKeyCode::Down => TermKeyCode::Down,
+        BmuxKeyCode::Left => TermKeyCode::Left,
+        BmuxKeyCode::Right => TermKeyCode::Right,
+        BmuxKeyCode::Home => TermKeyCode::Home,
+        BmuxKeyCode::End => TermKeyCode::End,
+        BmuxKeyCode::PageUp => TermKeyCode::PageUp,
+        BmuxKeyCode::PageDown => TermKeyCode::PageDown,
+        BmuxKeyCode::Insert => TermKeyCode::Insert,
+        BmuxKeyCode::F(value) => TermKeyCode::F(value),
     };
 
     let mut modifiers = KeyModifiers::NONE;
@@ -4857,7 +4857,7 @@ pub fn crossterm_event_from_stroke(stroke: KeyStroke) -> CrosstermEvent {
         modifiers |= KeyModifiers::META;
     }
 
-    CrosstermEvent::Key(KeyEvent {
+    TermEvent::Key(KeyEvent {
         code: key_code,
         modifiers,
         kind: KeyEventKind::Press,
@@ -5384,24 +5384,24 @@ mod tests {
         };
 
         assert_eq!(
-            parse_visual_control_action(make_key(CrosstermKeyCode::Char(' '), KeyModifiers::NONE)),
+            parse_visual_control_action(make_key(TermKeyCode::Char(' '), KeyModifiers::NONE)),
             Some(VisualControlAction::TogglePause)
         );
         assert_eq!(
-            parse_visual_control_action(make_key(CrosstermKeyCode::Char('l'), KeyModifiers::NONE)),
+            parse_visual_control_action(make_key(TermKeyCode::Char('l'), KeyModifiers::NONE)),
             Some(VisualControlAction::ContinueLive)
         );
         assert_eq!(
-            parse_visual_control_action(make_key(CrosstermKeyCode::Char('n'), KeyModifiers::NONE)),
+            parse_visual_control_action(make_key(TermKeyCode::Char('n'), KeyModifiers::NONE)),
             Some(VisualControlAction::StepOnce)
         );
         assert_eq!(
-            parse_visual_control_action(make_key(CrosstermKeyCode::Char(':'), KeyModifiers::NONE)),
+            parse_visual_control_action(make_key(TermKeyCode::Char(':'), KeyModifiers::NONE)),
             Some(VisualControlAction::PromptDsl)
         );
         assert_eq!(
             parse_visual_control_action(make_key(
-                CrosstermKeyCode::Char('c'),
+                TermKeyCode::Char('c'),
                 KeyModifiers::CONTROL
             )),
             Some(VisualControlAction::Abort)

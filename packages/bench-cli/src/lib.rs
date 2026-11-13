@@ -229,7 +229,7 @@ fn execute_run_with_cancel(
     #[cfg(not(feature = "internal"))]
     let portable = true;
     if portable && args.config.is_none() && args.columns.is_none() && args.rows.is_none() {
-        let (columns, rows) = crossterm::terminal::size()
+        let (columns, rows) = bmux_terminal::terminal::size()
             .map_err(|error| format!("detect terminal geometry: {error}"))?;
         resolved.geometry = bmux_bench::Geometry { columns, rows };
         config::validate(&resolved)?;

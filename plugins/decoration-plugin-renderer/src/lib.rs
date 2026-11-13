@@ -438,7 +438,7 @@ impl AttachRenderExtension for DecorationRenderExtension {
             return Ok(false);
         }
         // `apply_paint_commands` is generic over `W: io::Write` and
-        // requires `Sized` because of the `crossterm::queue!` macro's
+        // requires `Sized` because of the `bmux_terminal::queue!` macro's
         // internals. Rebinding our `&mut dyn io::Write` to a local
         // `&mut impl io::Write` (the reborrow `&mut *stdout` creates
         // a fresh `&mut dyn io::Write`, which is itself Sized) lets

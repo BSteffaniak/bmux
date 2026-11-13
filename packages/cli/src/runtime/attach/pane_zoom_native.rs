@@ -124,7 +124,7 @@ fn history_selected(
 
 fn history_hit(
     view: &AttachViewState,
-    event: crossterm::event::MouseEvent,
+    event: bmux_terminal::event::MouseEvent,
 ) -> Option<(
     Arc<PaneZoomHistoryProjection>,
     bmux_terminal_grid::ContentAnchor,
@@ -212,7 +212,7 @@ pub(super) fn root_point(view: &AttachViewState, x: u16, y: u16) -> [f64; 2] {
 
 fn selection_hit(
     view: &AttachViewState,
-    event: crossterm::event::MouseEvent,
+    event: bmux_terminal::event::MouseEvent,
 ) -> Option<(Arc<PaneZoomProjection>, bmux_terminal_grid::ContentAnchor)> {
     let point = root_point(view, event.column, event.row);
     let (pane, local) = view.retained_compositor.content_cell_at(point)?;
@@ -256,7 +256,7 @@ fn selection_hit(
 pub(super) fn begin_selection(
     view: &mut AttachViewState,
     pane: Uuid,
-    event: crossterm::event::MouseEvent,
+    event: bmux_terminal::event::MouseEvent,
 ) -> bool {
     if let Some((projection, anchor)) = history_hit(view, event) {
         if projection.source.pane != pane {
@@ -293,9 +293,9 @@ pub(super) fn begin_selection(
 
 pub(super) fn drag_selection(
     view: &mut AttachViewState,
-    event: crossterm::event::MouseEvent,
+    event: bmux_terminal::event::MouseEvent,
 ) -> bool {
-    use crossterm::event::{MouseButton, MouseEventKind};
+    use bmux_terminal::event::{MouseButton, MouseEventKind};
     if view
         .pane_zoom
         .history_selection
@@ -1374,11 +1374,11 @@ mod history_tests {
             .insert(lower_id, lower_projection);
         view.pane_zoom.committed_history.insert(id, top);
         view.pane_zoom.shared_pointer_root = Some([3.4, 0.2]);
-        let event = crossterm::event::MouseEvent {
-            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        let event = bmux_terminal::event::MouseEvent {
+            kind: bmux_terminal::event::MouseEventKind::Down(bmux_terminal::event::MouseButton::Left),
             column: 0,
             row: 0,
-            modifiers: crossterm::event::KeyModifiers::empty(),
+            modifiers: bmux_terminal::event::KeyModifiers::empty(),
         };
         let (projection, anchor) = history_hit(&view, event).unwrap();
         assert_eq!(projection.source.view, id);
@@ -1410,11 +1410,11 @@ mod history_tests {
     fn committed_history_fractional_selection_and_no_execution_mouse() {
         let (mut view, pane, id) = history_fixture();
         assert_eq!(history_fragments(&view).unwrap().len(), 1);
-        let event = crossterm::event::MouseEvent {
-            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        let event = bmux_terminal::event::MouseEvent {
+            kind: bmux_terminal::event::MouseEventKind::Down(bmux_terminal::event::MouseButton::Left),
             column: 0,
             row: 0,
-            modifiers: crossterm::event::KeyModifiers::empty(),
+            modifiers: bmux_terminal::event::KeyModifiers::empty(),
         };
         view.pane_zoom.shared_pointer_root = Some([3.4, 0.2]);
         assert!(history_hit(&view, event).is_none());

@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use bmux_recording_protocol::{
     DisplayActivityKind, DisplayCursorShape, DisplayTrackEnvelope, DisplayTrackEvent, write_frame,
 };
-use crossterm::terminal;
+use bmux_terminal::terminal;
 use std::collections::VecDeque;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};

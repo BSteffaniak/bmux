@@ -329,7 +329,7 @@ pub(super) async fn select(
             "interactive selection requires a TTY; pass --session or --source",
         ));
     }
-    let (width, height) = crossterm::terminal::size()?;
+    let (width, height) = bmux_terminal::terminal::size()?;
     let presenter = InlinePresenter {
         terminal: InlineTerminal::enter(io::stderr())?,
     };

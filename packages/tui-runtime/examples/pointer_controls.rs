@@ -1,5 +1,5 @@
 //! Standard-presenter pointer controls; no application-owned escape sequences.
-//! Run with `cargo run -p bmux_tui_runtime --example pointer_controls --no-default-features --features crossterm`.
+//! Run with `cargo run -p bmux_tui_runtime --example pointer_controls --no-default-features --features terminal-io`.
 
 use std::cell::{Cell, RefCell};
 use std::io::{self, Write};
@@ -9,7 +9,7 @@ use bmux_keyboard::KeyCode;
 use bmux_text_edit::TextEditBuffer;
 use bmux_tui::component::{Component, Constraints, Element, LayoutCx, LayoutNode};
 use bmux_tui::composition::{Column, Overlay, SizeBox, TextBlock};
-use bmux_tui::crossterm::{CrosstermTerminalGuard, poll_event, terminal_size};
+use bmux_tui::terminal_io::{TerminalGuard, poll_event, terminal_size};
 use bmux_tui::event::{Event, FocusEvent, MouseButton, MouseEventKind};
 use bmux_tui::focus::FocusTrap;
 use bmux_tui::geometry::{Insets, Rect, Size};
@@ -297,7 +297,7 @@ fn combine(result: io::Result<()>, cleanup: io::Result<()>) -> io::Result<()> {
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> io::Result<()> {
     let size = terminal_size()?;
-    let mut guard = CrosstermTerminalGuard::enter(io::stdout())?;
+    let mut guard = TerminalGuard::enter(io::stdout())?;
     let result = run(guard.writer_mut().expect("guard owns stdout"), size).await;
     // Attempt outer-mode restoration even when pointer restoration failed.
     combine(result, guard.leave().map(|_| ()))

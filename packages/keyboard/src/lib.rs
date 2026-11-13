@@ -10,8 +10,6 @@
 //! - Legacy VT/xterm encoding and decoding ([`legacy`])
 //! - Unified encoding entry point ([`encode`])
 
-#[cfg(feature = "crossterm")]
-pub mod crossterm;
 #[cfg(feature = "csi-u")]
 pub mod csi_u;
 pub mod encode;

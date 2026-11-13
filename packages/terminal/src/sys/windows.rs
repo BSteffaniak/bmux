@@ -120,6 +120,13 @@ pub fn size() -> io::Result<(u16, u16)> {
     Ok(window_dimensions(&info))
 }
 
+pub fn window_size() -> io::Result<crate::terminal::WindowSize> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "window pixel size is not available on Windows consoles",
+    ))
+}
+
 pub fn window_dimensions(info: &CONSOLE_SCREEN_BUFFER_INFO) -> (u16, u16) {
     let window = info.srWindow;
     let columns = i32::from(window.Right) - i32::from(window.Left) + 1;

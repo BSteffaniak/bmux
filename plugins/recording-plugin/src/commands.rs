@@ -16,8 +16,8 @@ use bmux_recording_protocol::{
     RecordingPayload as ProtocolRecordingPayload, RecordingRollingClearReport,
     RecordingRollingStatus, RecordingStatus, RecordingSummary, read_frames,
 };
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+use bmux_terminal::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use bmux_terminal::terminal::{disable_raw_mode, enable_raw_mode};
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashSet};
 use std::io::{self, IsTerminal, Write};
@@ -1918,7 +1918,7 @@ impl Drop for ReplayRawModeGuard {
 fn read_interactive_replay_action_timeout(
     timeout: Duration,
 ) -> Result<Option<InteractiveReplayAction>> {
-    if crossterm::event::poll(timeout)? {
+    if bmux_terminal::event::poll(timeout)? {
         read_interactive_replay_action_blocking()
     } else {
         Ok(None)
@@ -1927,7 +1927,7 @@ fn read_interactive_replay_action_timeout(
 
 fn read_interactive_replay_action_blocking() -> Result<Option<InteractiveReplayAction>> {
     loop {
-        let event = crossterm::event::read()?;
+        let event = bmux_terminal::event::read()?;
         if let Event::Key(key) = event
             && let Some(action) = replay_action_from_key_event(key)
         {

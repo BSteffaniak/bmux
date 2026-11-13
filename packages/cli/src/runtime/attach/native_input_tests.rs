@@ -460,11 +460,11 @@ async fn pane_zoom_selection_uses_logical_cells_and_rejects_changed_source() {
     let target = handle.pane_zoom_target(None).unwrap();
     let surface = view.retained_compositor.surfaces()[&target.view_id].clone();
     let transform = surface.content_transform.unwrap();
-    let event = |kind| crossterm::event::MouseEvent {
+    let event = |kind| bmux_terminal::event::MouseEvent {
         kind,
         column: surface.rect.x,
         row: surface.rect.y,
-        modifiers: crossterm::event::KeyModifiers::empty(),
+        modifiers: bmux_terminal::event::KeyModifiers::empty(),
     };
     // The fixed two-row allocation displays the reflowed tail: the wide glyph
     // begins at local column zero, despite execution column two.
@@ -805,7 +805,7 @@ async fn reduce_paste(
     normalized: bool,
 ) -> Result<AttachLoopControl> {
     let raw = Event::Paste(text.into());
-    let mut event = AttachTerminalEvent::from_crossterm(
+    let mut event = AttachTerminalEvent::from_terminal(
         raw,
         Instant::now(),
         TerminalGeometry { cols: 80, rows: 24 },

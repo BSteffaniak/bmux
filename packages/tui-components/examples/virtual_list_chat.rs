@@ -18,7 +18,7 @@ use std::time::Duration;
 use bmux_keyboard::KeyCode;
 use bmux_tui::component::{Component, Constraints, Element, EventCx, LayoutCx, LayoutNode};
 use bmux_tui::composition::{Column, Flex, TextBlock};
-use bmux_tui::crossterm::{CrosstermTerminalGuard, terminal_size};
+use bmux_tui::terminal_io::{TerminalGuard, terminal_size};
 use bmux_tui::event::Event;
 use bmux_tui::geometry::{Rect, Size};
 use bmux_tui::paint::PaintCx;
@@ -454,7 +454,7 @@ fn main() -> io::Result<()> {
         .enable_time()
         .build()?;
     let size = terminal_size()?;
-    let mut guard = CrosstermTerminalGuard::enter(io::stdout())?;
+    let mut guard = TerminalGuard::enter(io::stdout())?;
     let result = tasks.block_on(run(guard.writer_mut().expect("guard owns stdout"), size));
     let restored = guard.leave().map(|_| ());
     result.and(restored)

@@ -3,9 +3,9 @@
 //! On Unix every source shares one reader: [`RawInput`] on its own thread,
 //! blocked in event-driven waits (input, `SIGWINCH`, or a shutdown wake) and
 //! handing packets to async consumers through bounded channels. Other
-//! platforms read through Crossterm.
+//! platforms read through the shared `bmux_terminal` reader.
 
-use bmux_tui::crossterm::CrosstermEventStream;
+use bmux_tui::terminal_io::TerminalEventStream;
 use bmux_tui::event::Event;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
@@ -13,7 +13,7 @@ use tokio::task::JoinHandle;
 use crate::program::Program;
 use crate::runtime::RuntimeHandle;
 #[cfg(unix)]
-use bmux_tui::crossterm::input::{InputWaker, RawInput, RawInputPacket};
+use bmux_tui::terminal_io::input::{InputWaker, RawInput, RawInputPacket};
 
 /// Event tag delivered as [`Event::User`] when [`ManagedTerminalInput::terminal_colors`]
 /// changes after the terminal answers [`bmux_tui::capabilities::TerminalColorReport::QUERY`].
@@ -259,7 +259,7 @@ impl OpaqueInputQueue {
     }
 }
 
-/// Bounded opt-in packet reader. No Crossterm reader is constructed on this path.
+/// Bounded opt-in packet reader. No shared `bmux_terminal` reader is constructed on this path.
 #[cfg(unix)]
 pub struct ManagedRawInput {
     receiver: mpsc::Receiver<std::io::Result<RawInputPacket>>,
@@ -338,7 +338,7 @@ impl ManagedTerminalInput {
         #[cfg(unix)]
         let events = RawEventStream::open(capacity, Some(std::sync::Arc::clone(&colors)));
         #[cfg(not(unix))]
-        let events = CrosstermEventStream::new();
+        let events = TerminalEventStream::new();
         Self::start_stream(capacity, events, colors)
     }
 
@@ -516,7 +516,7 @@ impl TerminalInput {
         #[cfg(unix)]
         let events = RawEventStream::open(64, Some(std::sync::Arc::clone(&colors.0)));
         #[cfg(not(unix))]
-        let events = CrosstermEventStream::new();
+        let events = TerminalEventStream::new();
         let mut input = Self::start_stream::<P, _>(handle, map_error, events);
         input.colors = colors;
         input
@@ -547,7 +547,7 @@ impl TerminalInput {
         Self::start_routed_stream::<P, _>(
             handle,
             map_error,
-            CrosstermEventStream::new(),
+            TerminalEventStream::new(),
             Some((gate, Box::new(map_private))),
         )
     }

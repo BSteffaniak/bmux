@@ -30,7 +30,7 @@ fn decoration_allowed(
 
 pub(crate) fn announce(message: &str) -> Result<(), String> {
     let (columns, rows) =
-        crossterm::terminal::size().map_err(|e| format!("measure inline UI: {e}"))?;
+        bmux_terminal::terminal::size().map_err(|e| format!("measure inline UI: {e}"))?;
     if columns < 2 || rows < 3 {
         return Ok(());
     }
@@ -89,7 +89,7 @@ impl ProgressDisplay {
         if message == self.last {
             return Ok(());
         }
-        let result = crossterm::terminal::size()
+        let result = bmux_terminal::terminal::size()
             .and_then(|(columns, rows)| {
                 if columns < 2 || rows < 2 {
                     return Ok(());

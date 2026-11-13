@@ -13,7 +13,7 @@ use bmux_client::BmuxClient;
 use bmux_config::{BmuxConfig, ConfigPaths};
 use bmux_keybind::RuntimeAction;
 use bmux_keyboard::KeyStroke;
-use crossterm::event::Event;
+use bmux_terminal::event::Event;
 use uuid::Uuid;
 
 use crate::types::SandboxEnvMode;
@@ -164,7 +164,7 @@ impl RealAttachRuntime {
         let mut target = None;
         for stroke in strokes {
             target = Some(
-                self.send_event(crate::engine::crossterm_event_from_stroke(stroke), deadline)
+                self.send_event(crate::engine::terminal_event_from_stroke(stroke), deadline)
                     .await?,
             );
         }

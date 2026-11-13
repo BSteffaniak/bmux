@@ -1,27 +1,27 @@
-//! Crossterm terminal lifecycle and event adapter.
+//! Terminal lifecycle and event adapter over `bmux_terminal`.
 
 use std::io::{self, Write};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use crossterm::event::{
+use bmux_terminal::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    Event as CrosstermEvent, EventStream, KeyEvent as CrosstermKeyEvent,
-    KeyModifiers as CrosstermKeyModifiers, MouseButton as CrosstermMouseButton,
-    MouseEvent as CrosstermMouseEvent, MouseEventKind as CrosstermMouseEventKind,
-    poll as crossterm_poll, read as crossterm_read,
+    Event as TerminalEvent, EventStream, KeyEvent as TerminalKeyEvent,
+    KeyModifiers as TerminalKeyModifiers, MouseButton as TerminalMouseButton,
+    MouseEvent as TerminalMouseEvent, MouseEventKind as TerminalMouseEventKind,
+    poll as terminal_poll, read as terminal_read,
 };
-use crossterm::terminal::{
+use bmux_terminal::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-    size as crossterm_size,
+    size as terminal_dimensions,
 };
-use crossterm::{execute, queue};
+use bmux_terminal::{execute, queue};
 use futures_util::{Stream, StreamExt};
 
 use crate::event::{Event, FocusEvent, MouseButton, MouseEvent, MouseEventKind, MouseModifiers};
 use crate::geometry::{Point, Size};
-use bmux_keyboard::crossterm::{crossterm_key_event_is_release, crossterm_key_event_to_stroke};
+use bmux_terminal::keyboard::{key_event_is_release, key_event_to_stroke};
 
 /// Return the current physical terminal size.
 ///
@@ -31,9 +31,9 @@ use bmux_keyboard::crossterm::{crossterm_key_event_is_release, crossterm_key_eve
 ///
 /// # Errors
 ///
-/// Returns any error reported by crossterm while querying terminal dimensions.
+/// Returns any error reported while querying terminal dimensions.
 pub fn terminal_size() -> io::Result<Size> {
-    let (width, height) = crossterm_size()?;
+    let (width, height) = terminal_dimensions()?;
     Ok(size_from_dimensions(width, height))
 }
 
@@ -41,23 +41,23 @@ const fn size_from_dimensions(width: u16, height: u16) -> Size {
     Size::new(width, height)
 }
 
-/// RAII guard for crossterm raw mode and alternate-screen lifecycle.
+/// RAII guard for raw mode and alternate-screen lifecycle.
 ///
 /// The guard enables raw mode and enters the alternate screen on creation. On
 /// drop it attempts to leave the alternate screen and disable raw mode.
-pub struct CrosstermTerminalGuard<W: Write> {
+pub struct TerminalGuard<W: Write> {
     writer: Option<W>,
     active: bool,
     keyboard_enhanced: bool,
 }
 
-impl<W: Write> CrosstermTerminalGuard<W> {
+impl<W: Write> TerminalGuard<W> {
     /// Enter raw-mode alternate-screen terminal lifecycle.
     ///
     /// # Errors
     ///
-    /// Returns any error reported by crossterm while enabling raw mode or
-    /// entering the alternate screen.
+    /// Returns any error reported while enabling raw mode or entering the
+    /// alternate screen.
     pub fn enter(mut writer: W) -> io::Result<Self> {
         enable_raw_mode()?;
         if let Err(error) = execute!(
@@ -92,13 +92,13 @@ impl<W: Write> CrosstermTerminalGuard<W> {
     ///
     /// # Errors
     ///
-    /// Returns any error reported by crossterm while leaving the alternate
-    /// screen or disabling raw mode.
+    /// Returns any error reported while leaving the alternate screen or
+    /// disabling raw mode.
     pub fn leave(mut self) -> io::Result<W> {
         self.leave_inner()?;
         self.active = false;
         let Some(writer) = self.writer.take() else {
-            return Err(io::Error::other("crossterm guard writer already taken"));
+            return Err(io::Error::other("terminal guard writer already taken"));
         };
         Ok(writer)
     }
@@ -170,7 +170,7 @@ impl<W: Write> CrosstermTerminalGuard<W> {
     }
 }
 
-impl<W: Write> Drop for CrosstermTerminalGuard<W> {
+impl<W: Write> Drop for TerminalGuard<W> {
     fn drop(&mut self) {
         if self.active {
             if let Some(writer) = &mut self.writer {
@@ -191,7 +191,7 @@ impl<W: Write> Drop for CrosstermTerminalGuard<W> {
 }
 
 fn push_keyboard_enhancement_flags<W: Write>(writer: &mut W) -> io::Result<()> {
-    use crossterm::event::{KeyboardEnhancementFlags, PushKeyboardEnhancementFlags};
+    use bmux_terminal::event::{KeyboardEnhancementFlags, PushKeyboardEnhancementFlags};
 
     queue!(
         writer,
@@ -205,14 +205,14 @@ fn push_keyboard_enhancement_flags<W: Write>(writer: &mut W) -> io::Result<()> {
 }
 
 fn pop_keyboard_enhancement_flags<W: Write>(writer: &mut W) -> io::Result<()> {
-    queue!(writer, crossterm::event::PopKeyboardEnhancementFlags)?;
+    queue!(writer, bmux_terminal::event::PopKeyboardEnhancementFlags)?;
     writer.flush()
 }
 
 #[cfg(unix)]
 pub mod input;
 
-// 0: no owner, 1: exclusive raw owner, 2: permanent Crossterm global owner.
+// 0: no owner, 1: exclusive raw owner, 2: permanent shared-reader owner.
 static INPUT_OWNER: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 #[cfg(unix)]
@@ -242,18 +242,18 @@ fn claim_legacy_input() -> bool {
     )
 }
 
-/// Whether the process has initialized Crossterm's global input owner.
+/// Whether the process has initialized the shared `bmux_terminal` input reader.
 #[must_use]
 pub fn legacy_input_used() -> bool {
     INPUT_OWNER.load(std::sync::atomic::Ordering::SeqCst) == 2
 }
 
-/// Async Crossterm event stream converted into backend-neutral BMUX events.
-pub struct CrosstermEventStream {
+/// Async terminal event stream converted into backend-neutral BMUX events.
+pub struct TerminalEventStream {
     inner: Option<EventStream>,
 }
 
-impl CrosstermEventStream {
+impl TerminalEventStream {
     /// Create an event stream for the active terminal.
     #[must_use]
     pub fn new() -> Self {
@@ -264,12 +264,12 @@ impl CrosstermEventStream {
 
     /// Await the next supported terminal event.
     ///
-    /// Unsupported Crossterm event kinds are skipped. Dropping the future or stream cancels the
-    /// wait through Crossterm's platform event-reader waker.
+    /// Unsupported terminal event kinds are skipped. Dropping the future or stream cancels the
+    /// wait through the shared reader's platform waker.
     ///
     /// # Errors
     ///
-    /// Returns any error reported by Crossterm's event stream.
+    /// Returns any error reported by the terminal event stream.
     pub async fn next_event(&mut self) -> io::Result<Event> {
         loop {
             let event = self
@@ -282,14 +282,14 @@ impl CrosstermEventStream {
                 .ok_or_else(|| {
                     io::Error::new(io::ErrorKind::UnexpectedEof, "terminal event stream closed")
                 })?;
-            if let Some(event) = event_from_crossterm(event) {
+            if let Some(event) = event_from_terminal(event) {
                 return Ok(event);
             }
         }
     }
 }
 
-impl Stream for CrosstermEventStream {
+impl Stream for TerminalEventStream {
     type Item = io::Result<Event>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -299,7 +299,7 @@ impl Stream for CrosstermEventStream {
         loop {
             match Pin::new(&mut *inner).poll_next(cx) {
                 Poll::Ready(Some(Ok(event))) => {
-                    if let Some(event) = event_from_crossterm(event) {
+                    if let Some(event) = event_from_terminal(event) {
                         return Poll::Ready(Some(Ok(event)));
                     }
                 }
@@ -311,7 +311,7 @@ impl Stream for CrosstermEventStream {
     }
 }
 
-impl Default for CrosstermEventStream {
+impl Default for TerminalEventStream {
     fn default() -> Self {
         Self::new()
     }
@@ -320,16 +320,16 @@ impl Default for CrosstermEventStream {
 /// Poll for a terminal event and convert it to a BMUX TUI event.
 ///
 /// Returns `Ok(None)` when no terminal event is ready before `timeout`, or
-/// when crossterm reports an event kind that has no BMUX TUI representation.
+/// when the terminal reports an event kind that has no BMUX TUI representation.
 ///
 /// # Errors
 ///
-/// Returns any error reported by crossterm while polling or reading events.
+/// Returns any error reported while polling or reading events.
 pub fn poll_event(timeout: Duration) -> io::Result<Option<Event>> {
     if !claim_legacy_input() {
         return Err(io::Error::other("terminal input already owned"));
     }
-    if !crossterm_poll(timeout)? {
+    if !terminal_poll(timeout)? {
         return Ok(None);
     }
     read_event()
@@ -339,20 +339,20 @@ pub fn poll_event(timeout: Duration) -> io::Result<Option<Event>> {
 ///
 /// # Errors
 ///
-/// Returns any error reported by crossterm while reading events.
+/// Returns any error reported while reading events.
 pub fn read_event() -> io::Result<Option<Event>> {
     if !claim_legacy_input() {
         return Err(io::Error::other("terminal input already owned"));
     }
-    Ok(event_from_crossterm(crossterm_read()?))
+    Ok(event_from_terminal(terminal_read()?))
 }
 
-/// Convert backend-neutral input into Crossterm's event vocabulary for existing consumers.
+/// Convert backend-neutral input into the terminal event vocabulary for existing consumers.
 /// Internal tick/user events have no wire equivalent.
 #[must_use]
-pub fn event_to_crossterm(event: crate::event::Event) -> Option<CrosstermEvent> {
+pub fn event_to_terminal(event: crate::event::Event) -> Option<TerminalEvent> {
     use bmux_keyboard::KeyCode;
-    use crossterm::event::{
+    use bmux_terminal::event::{
         KeyCode as C, KeyEvent, KeyModifiers as M, MouseButton as B, MouseEvent as Mouse,
         MouseEventKind as K,
     };
@@ -390,12 +390,12 @@ pub fn event_to_crossterm(event: crate::event::Event) -> Option<CrosstermEvent> 
                     modifiers.insert(flag);
                 }
             }
-            CrosstermEvent::Key(KeyEvent::new(code, modifiers))
+            TerminalEvent::Key(KeyEvent::new(code, modifiers))
         }
-        crate::event::Event::Paste(text) => CrosstermEvent::Paste(text),
-        crate::event::Event::Resize(size) => CrosstermEvent::Resize(size.width, size.height),
-        crate::event::Event::Focus(crate::event::FocusEvent::Gained) => CrosstermEvent::FocusGained,
-        crate::event::Event::Focus(crate::event::FocusEvent::Lost) => CrosstermEvent::FocusLost,
+        crate::event::Event::Paste(text) => TerminalEvent::Paste(text),
+        crate::event::Event::Resize(size) => TerminalEvent::Resize(size.width, size.height),
+        crate::event::Event::Focus(crate::event::FocusEvent::Gained) => TerminalEvent::FocusGained,
+        crate::event::Event::Focus(crate::event::FocusEvent::Lost) => TerminalEvent::FocusLost,
         crate::event::Event::Mouse(mouse) => {
             let button = |button| match button {
                 crate::event::MouseButton::Left => B::Left,
@@ -422,7 +422,7 @@ pub fn event_to_crossterm(event: crate::event::Event) -> Option<CrosstermEvent> 
             if mouse.modifiers.shift {
                 modifiers.insert(M::SHIFT);
             }
-            CrosstermEvent::Mouse(Mouse {
+            TerminalEvent::Mouse(Mouse {
                 kind,
                 column: mouse.position.x,
                 row: mouse.position.y,
@@ -433,87 +433,87 @@ pub fn event_to_crossterm(event: crate::event::Event) -> Option<CrosstermEvent> 
     })
 }
 
-/// Convert a crossterm event into a BMUX TUI event.
+/// Convert a terminal event into a BMUX TUI event.
 #[must_use]
-pub fn event_from_crossterm(event: CrosstermEvent) -> Option<Event> {
+pub fn event_from_terminal(event: TerminalEvent) -> Option<Event> {
     match event {
-        CrosstermEvent::Key(key) => key_from_crossterm(key).map(Event::Key),
-        CrosstermEvent::Mouse(mouse) => Some(Event::Mouse(mouse_from_crossterm(mouse))),
-        CrosstermEvent::Resize(width, height) => Some(Event::Resize(Size::new(width, height))),
-        CrosstermEvent::FocusGained => Some(Event::Focus(FocusEvent::Gained)),
-        CrosstermEvent::FocusLost => Some(Event::Focus(FocusEvent::Lost)),
-        CrosstermEvent::Paste(text) => Some(Event::Paste(text)),
+        TerminalEvent::Key(key) => key_from_terminal(key).map(Event::Key),
+        TerminalEvent::Mouse(mouse) => Some(Event::Mouse(mouse_from_terminal(mouse))),
+        TerminalEvent::Resize(width, height) => Some(Event::Resize(Size::new(width, height))),
+        TerminalEvent::FocusGained => Some(Event::Focus(FocusEvent::Gained)),
+        TerminalEvent::FocusLost => Some(Event::Focus(FocusEvent::Lost)),
+        TerminalEvent::Paste(text) => Some(Event::Paste(text)),
     }
 }
 
-/// Convert a crossterm key event into a BMUX keyboard stroke.
+/// Convert a terminal key event into a BMUX keyboard stroke.
 #[must_use]
-pub const fn key_from_crossterm(key: CrosstermKeyEvent) -> Option<bmux_keyboard::KeyStroke> {
-    if crossterm_key_event_is_release(&key) {
+pub const fn key_from_terminal(key: TerminalKeyEvent) -> Option<bmux_keyboard::KeyStroke> {
+    if key_event_is_release(&key) {
         return None;
     }
 
-    crossterm_key_event_to_stroke(&key)
+    key_event_to_stroke(&key)
 }
 
-/// Convert crossterm mouse event data.
+/// Convert terminal mouse event data.
 #[must_use]
-pub const fn mouse_from_crossterm(mouse: CrosstermMouseEvent) -> MouseEvent {
+pub const fn mouse_from_terminal(mouse: TerminalMouseEvent) -> MouseEvent {
     MouseEvent::new(
-        mouse_kind_from_crossterm(mouse.kind),
+        mouse_kind_from_terminal(mouse.kind),
         Point::new(mouse.column, mouse.row),
     )
-    .with_modifiers(mouse_modifiers_from_crossterm(mouse.modifiers))
+    .with_modifiers(mouse_modifiers_from_terminal(mouse.modifiers))
 }
 
-const fn mouse_button_from_crossterm(button: CrosstermMouseButton) -> MouseButton {
+const fn mouse_button_from_terminal(button: TerminalMouseButton) -> MouseButton {
     match button {
-        CrosstermMouseButton::Left => MouseButton::Left,
-        CrosstermMouseButton::Right => MouseButton::Right,
-        CrosstermMouseButton::Middle => MouseButton::Middle,
+        TerminalMouseButton::Left => MouseButton::Left,
+        TerminalMouseButton::Right => MouseButton::Right,
+        TerminalMouseButton::Middle => MouseButton::Middle,
     }
 }
 
-const fn mouse_kind_from_crossterm(kind: CrosstermMouseEventKind) -> MouseEventKind {
+const fn mouse_kind_from_terminal(kind: TerminalMouseEventKind) -> MouseEventKind {
     match kind {
-        CrosstermMouseEventKind::Down(button) => {
-            MouseEventKind::Down(mouse_button_from_crossterm(button))
+        TerminalMouseEventKind::Down(button) => {
+            MouseEventKind::Down(mouse_button_from_terminal(button))
         }
-        CrosstermMouseEventKind::Up(button) => {
-            MouseEventKind::Up(mouse_button_from_crossterm(button))
+        TerminalMouseEventKind::Up(button) => {
+            MouseEventKind::Up(mouse_button_from_terminal(button))
         }
-        CrosstermMouseEventKind::Drag(button) => {
-            MouseEventKind::Drag(mouse_button_from_crossterm(button))
+        TerminalMouseEventKind::Drag(button) => {
+            MouseEventKind::Drag(mouse_button_from_terminal(button))
         }
-        CrosstermMouseEventKind::Moved => MouseEventKind::Move,
-        CrosstermMouseEventKind::ScrollUp => MouseEventKind::ScrollUp,
-        CrosstermMouseEventKind::ScrollDown => MouseEventKind::ScrollDown,
-        CrosstermMouseEventKind::ScrollLeft => MouseEventKind::ScrollLeft,
-        CrosstermMouseEventKind::ScrollRight => MouseEventKind::ScrollRight,
+        TerminalMouseEventKind::Moved => MouseEventKind::Move,
+        TerminalMouseEventKind::ScrollUp => MouseEventKind::ScrollUp,
+        TerminalMouseEventKind::ScrollDown => MouseEventKind::ScrollDown,
+        TerminalMouseEventKind::ScrollLeft => MouseEventKind::ScrollLeft,
+        TerminalMouseEventKind::ScrollRight => MouseEventKind::ScrollRight,
     }
 }
 
-const fn mouse_modifiers_from_crossterm(modifiers: CrosstermKeyModifiers) -> MouseModifiers {
+const fn mouse_modifiers_from_terminal(modifiers: TerminalKeyModifiers) -> MouseModifiers {
     MouseModifiers {
-        shift: modifiers.contains(CrosstermKeyModifiers::SHIFT),
-        alt: modifiers.contains(CrosstermKeyModifiers::ALT),
-        ctrl: modifiers.contains(CrosstermKeyModifiers::CONTROL),
+        shift: modifiers.contains(TerminalKeyModifiers::SHIFT),
+        alt: modifiers.contains(TerminalKeyModifiers::ALT),
+        ctrl: modifiers.contains(TerminalKeyModifiers::CONTROL),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crossterm::event::{KeyEvent, KeyEventKind, KeyEventState};
+    use bmux_terminal::event::{KeyEvent, KeyEventKind, KeyEventState};
 
     use super::{
-        event_from_crossterm, key_from_crossterm, poll_event, read_event, size_from_dimensions,
+        event_from_terminal, key_from_terminal, poll_event, read_event, size_from_dimensions,
         terminal_size,
     };
     use crate::event::{Event, FocusEvent, MouseButton, MouseEventKind};
 
     #[test]
-    fn crossterm_guard_module_compiles() {
-        let _ = core::mem::size_of::<Option<super::CrosstermTerminalGuard<Vec<u8>>>>();
+    fn terminal_guard_module_compiles() {
+        let _ = core::mem::size_of::<Option<super::TerminalGuard<Vec<u8>>>>();
         let _ = poll_event as fn(std::time::Duration) -> std::io::Result<Option<Event>>;
         let _ = read_event as fn() -> std::io::Result<Option<Event>>;
         let _ = terminal_size as fn() -> std::io::Result<crate::geometry::Size>;
@@ -530,13 +530,13 @@ mod tests {
     #[test]
     fn converts_key_events() {
         let key = KeyEvent {
-            code: crossterm::event::KeyCode::Char('x'),
-            modifiers: crossterm::event::KeyModifiers::CONTROL,
+            code: bmux_terminal::event::KeyCode::Char('x'),
+            modifiers: bmux_terminal::event::KeyModifiers::CONTROL,
             kind: KeyEventKind::Press,
             state: KeyEventState::NONE,
         };
 
-        let stroke = key_from_crossterm(key).expect("key should convert");
+        let stroke = key_from_terminal(key).expect("key should convert");
 
         assert_eq!(stroke.key, bmux_keyboard::KeyCode::Char('x'));
         assert!(stroke.modifiers.ctrl);
@@ -545,25 +545,25 @@ mod tests {
     #[test]
     fn ignores_key_release_events() {
         let key = KeyEvent {
-            code: crossterm::event::KeyCode::Char('x'),
-            modifiers: crossterm::event::KeyModifiers::NONE,
+            code: bmux_terminal::event::KeyCode::Char('x'),
+            modifiers: bmux_terminal::event::KeyModifiers::NONE,
             kind: KeyEventKind::Release,
             state: KeyEventState::NONE,
         };
 
-        assert_eq!(key_from_crossterm(key), None);
+        assert_eq!(key_from_terminal(key), None);
     }
 
     #[test]
     fn preserves_super_and_meta_char_modifiers() {
         let key = KeyEvent {
-            code: crossterm::event::KeyCode::Char('c'),
-            modifiers: crossterm::event::KeyModifiers::SUPER | crossterm::event::KeyModifiers::META,
+            code: bmux_terminal::event::KeyCode::Char('c'),
+            modifiers: bmux_terminal::event::KeyModifiers::SUPER | bmux_terminal::event::KeyModifiers::META,
             kind: KeyEventKind::Press,
             state: KeyEventState::NONE,
         };
 
-        let stroke = key_from_crossterm(key).expect("key should convert");
+        let stroke = key_from_terminal(key).expect("key should convert");
 
         assert_eq!(stroke.key, bmux_keyboard::KeyCode::Char('c'));
         assert!(stroke.modifiers.super_key);
@@ -573,27 +573,27 @@ mod tests {
     #[test]
     fn converts_resize_focus_and_paste_events() {
         assert_eq!(
-            event_from_crossterm(crossterm::event::Event::Resize(80, 24)),
+            event_from_terminal(bmux_terminal::event::Event::Resize(80, 24)),
             Some(Event::Resize(crate::geometry::Size::new(80, 24)))
         );
         assert_eq!(
-            event_from_crossterm(crossterm::event::Event::FocusGained),
+            event_from_terminal(bmux_terminal::event::Event::FocusGained),
             Some(Event::Focus(FocusEvent::Gained))
         );
         assert_eq!(
-            event_from_crossterm(crossterm::event::Event::Paste("hi".to_owned())),
+            event_from_terminal(bmux_terminal::event::Event::Paste("hi".to_owned())),
             Some(Event::Paste("hi".to_owned()))
         );
     }
 
     #[test]
     fn converts_mouse_events() {
-        let event = event_from_crossterm(crossterm::event::Event::Mouse(
-            crossterm::event::MouseEvent {
-                kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        let event = event_from_terminal(bmux_terminal::event::Event::Mouse(
+            bmux_terminal::event::MouseEvent {
+                kind: bmux_terminal::event::MouseEventKind::Down(bmux_terminal::event::MouseButton::Left),
                 column: 4,
                 row: 7,
-                modifiers: crossterm::event::KeyModifiers::ALT,
+                modifiers: bmux_terminal::event::KeyModifiers::ALT,
             },
         ));
 

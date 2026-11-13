@@ -15,8 +15,6 @@ pub mod chrome;
 pub mod clock;
 pub mod component;
 pub mod composition;
-#[cfg(feature = "crossterm")]
-pub mod crossterm;
 pub mod damage;
 pub mod embedded_surface;
 pub mod event;
@@ -29,7 +27,7 @@ pub mod grid_fragment;
 pub mod hit;
 pub mod image;
 pub mod image_scene;
-#[cfg(feature = "crossterm")]
+#[cfg(feature = "terminal-io")]
 pub mod inline;
 pub mod inline_output;
 pub mod input;
@@ -48,6 +46,8 @@ pub mod sensitive_input;
 pub mod source_map;
 pub mod style;
 pub mod terminal;
+#[cfg(feature = "terminal-io")]
+pub mod terminal_io;
 pub mod text;
 pub mod text_block;
 pub mod text_width;
@@ -74,10 +74,10 @@ pub mod prelude {
         SizeBox, Stack, StyleScope, Surface, TextBlock, TextProjectionRow, TextProjectionWindow,
         TextSourceRows, VerticalAlignment, Visibility,
     };
-    #[cfg(feature = "crossterm")]
-    pub use crate::crossterm::{
-        CrosstermTerminalGuard, event_from_crossterm, key_from_crossterm, mouse_from_crossterm,
-        poll_event, read_event, terminal_size,
+    #[cfg(feature = "terminal-io")]
+    pub use crate::terminal_io::{
+        TerminalGuard, event_from_terminal, key_from_terminal, mouse_from_terminal, poll_event,
+        read_event, terminal_size,
     };
     pub use crate::damage::{Damage, DamagePolicy};
     pub use crate::event::{

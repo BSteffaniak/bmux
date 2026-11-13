@@ -37,7 +37,7 @@ use bmux_tui_components::text_input_box::{
     TextInputBoxComponent, TextInputBoxPolicy, TextInputBoxStyles,
 };
 use bmux_tui_components::virtual_list::{VirtualList, VirtualListState};
-use crossterm::event::{
+use bmux_terminal::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use std::cell::Cell;
@@ -969,7 +969,7 @@ impl AttachPromptState {
     }
 
     pub fn handle_terminal_key_event(&mut self, key: &TerminalKeyEvent) -> PromptKeyDisposition {
-        key.to_crossterm()
+        key.to_terminal()
             .map_or(PromptKeyDisposition::Consumed, |key| {
                 self.handle_key_event(&key)
             })
@@ -981,7 +981,7 @@ impl AttachPromptState {
         geometry: TerminalGeometry,
     ) -> PromptKeyDisposition {
         mouse
-            .to_crossterm()
+            .to_terminal()
             .map_or(PromptKeyDisposition::Consumed, |mouse| {
                 self.handle_mouse_event(mouse, geometry)
             })
@@ -3022,7 +3022,7 @@ mod tests {
     use bmux_appearance::RuntimeAppearance;
     use bmux_plugin::prompt::PromptHostRequest;
     use bmux_tui::style::Color;
-    use crossterm::event::{
+    use bmux_terminal::event::{
         KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers, MouseButton, MouseEvent,
         MouseEventKind,
     };

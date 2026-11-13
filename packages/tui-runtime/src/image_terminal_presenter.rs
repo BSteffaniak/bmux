@@ -1203,7 +1203,7 @@ mod async_tests {
         drop(output);
     }
 
-    #[cfg(all(target_os = "linux", feature = "image-kitty", feature = "crossterm"))]
+    #[cfg(all(target_os = "linux", feature = "image-kitty", feature = "terminal-io"))]
     #[tokio::test]
     #[expect(
         clippy::too_many_lines,
@@ -1214,7 +1214,7 @@ mod async_tests {
         reason = "fixture-local PTY writer and parsers stay beside their setup and never escape test"
     )]
     async fn pty_raw_managed_probe_ack_upload_pixels_timeout_and_cleanup() {
-        use bmux_tui::crossterm::input::{RawInput, RawInputPacket};
+        use bmux_tui::terminal_io::input::{RawInput, RawInputPacket};
         use bmux_tui::image::*;
         use std::io::Read;
         use std::os::fd::{AsRawFd, FromRawFd};

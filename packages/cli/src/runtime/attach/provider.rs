@@ -532,15 +532,15 @@ mod tests {
         assert!(duplicate.to_string().contains("duplicate attach action"));
         let (mut terminal, handle) = super::super::runtime::HeadlessAttachTerminal::new(80, 24);
         handle
-            .send_event(crossterm::event::Event::Key(
-                crossterm::event::KeyEvent::new(
-                    crossterm::event::KeyCode::Char('t'),
-                    crossterm::event::KeyModifiers::ALT,
+            .send_event(bmux_terminal::event::Event::Key(
+                bmux_terminal::event::KeyEvent::new(
+                    bmux_terminal::event::KeyCode::Char('t'),
+                    bmux_terminal::event::KeyModifiers::ALT,
                 ),
             ))
             .unwrap();
         handle
-            .send_event(crossterm::event::Event::Paste("input".to_string()))
+            .send_event(bmux_terminal::event::Event::Paste("input".to_string()))
             .unwrap();
         let outcome = super::super::runtime::run_native_attach_session_with_terminal(
             native_session,

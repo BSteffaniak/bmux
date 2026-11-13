@@ -1,7 +1,7 @@
 //! Concrete Linux raw-reader capture barrier.
 //!
 //! Applications install this only when the Linux reader owns terminal input from
-//! startup, never after Crossterm.
+//! startup, never after the shared `bmux_terminal` reader.
 use crate::private_input::{CaptureSuppression, PrivateInputError};
 use bmux_tui::linux_input::LinuxInputReader;
 use std::sync::{Arc, Mutex};

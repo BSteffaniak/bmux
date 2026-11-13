@@ -5,7 +5,7 @@ use std::io::{self, Write};
 use std::time::Duration;
 
 use bmux_keyboard::KeyCode;
-use bmux_tui::crossterm::{CrosstermTerminalGuard, poll_event, terminal_size};
+use bmux_tui::terminal_io::{TerminalGuard, poll_event, terminal_size};
 use bmux_tui::event::Event;
 
 // Complete 2x2 RGBA checkerboard PNG for OSC 1337.
@@ -79,7 +79,7 @@ fn main() -> io::Result<()> {
     })
     .ok_or_else(|| io::Error::other("could not encode Sixel checkerboard"))?;
     let id = std::process::id().max(1);
-    let mut guard = CrosstermTerminalGuard::enter(io::stdout())?;
+    let mut guard = TerminalGuard::enter(io::stdout())?;
     let result = (|| {
         let out = guard.writer_mut().expect("guard owns stdout");
         render(out, id, &sixel)?;

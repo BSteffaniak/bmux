@@ -19,14 +19,14 @@ use bmux_playbook::host::{
 };
 use bmux_playbook::transport::{ClientFuture, PaneGridSnapshotResult, PaneTransport};
 use bmux_session_models::SessionSelector;
-use crossterm::cursor::{Hide, MoveTo, Show};
-use crossterm::event::Event as CrosstermEvent;
-use crossterm::style::Print;
-use crossterm::terminal::{
+use bmux_terminal::cursor::{Hide, MoveTo, Show};
+use bmux_terminal::event::Event as TermEvent;
+use bmux_terminal::style::Print;
+use bmux_terminal::terminal::{
     self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
     enable_raw_mode,
 };
-use crossterm::{execute, queue};
+use bmux_terminal::{execute, queue};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -34,7 +34,7 @@ use std::time::{Duration, Instant};
 use tracing::{debug, warn};
 use uuid::Uuid;
 
-use bmux_playbook::engine::crossterm_event_from_stroke;
+use bmux_playbook::engine::terminal_event_from_stroke;
 pub use bmux_playbook::engine::{
     AttachInputRuntime, PlaybookAttachRenderFrameFacts, VisualInteractiveState,
     drain_output_until_idle, drain_output_with_threshold, execute_step, recording_plugin_error,
@@ -205,7 +205,7 @@ impl KeyProcessor for CliKeyProcessor {
     }
     fn process_stroke(&mut self, stroke: KeyStroke) -> Vec<RuntimeAction> {
         self.0
-            .process_terminal_event(crossterm_event_from_stroke(stroke))
+            .process_terminal_event(terminal_event_from_stroke(stroke))
     }
     fn flush(&mut self) -> Vec<RuntimeAction> {
         self.0.process_stream_bytes(&[])
@@ -388,9 +388,9 @@ impl VisualTerminal for VisualTerminalGuard {
     fn size(&self) -> Result<(u16, u16)> {
         Ok(terminal::size()?)
     }
-    fn poll_event(&self) -> Result<Option<CrosstermEvent>> {
-        if crossterm::event::poll(Duration::ZERO)? {
-            Ok(Some(crossterm::event::read()?))
+    fn poll_event(&self) -> Result<Option<TermEvent>> {
+        if bmux_terminal::event::poll(Duration::ZERO)? {
+            Ok(Some(bmux_terminal::event::read()?))
         } else {
             Ok(None)
         }
@@ -414,7 +414,7 @@ impl VisualTerminal for VisualTerminalGuard {
 // boundary with the exact event it delivered, including actions that keep the
 // same target. Session changes alone cannot acknowledge an input action.
 struct AcknowledgedAttachEvent {
-    event: CrosstermEvent,
+    event: TermEvent,
     action: Option<String>,
     completed: tokio::sync::oneshot::Sender<Uuid>,
 }
@@ -514,13 +514,13 @@ impl RealAttachPlaybookRuntime {
         Ok(())
     }
 
-    async fn send_event(&self, event: CrosstermEvent, deadline: Instant) -> Result<Uuid> {
+    async fn send_event(&self, event: TermEvent, deadline: Instant) -> Result<Uuid> {
         self.send_input(event, None, deadline).await
     }
 
     async fn send_input(
         &self,
-        event: CrosstermEvent,
+        event: TermEvent,
         action: Option<String>,
         deadline: Instant,
     ) -> Result<Uuid> {
@@ -564,7 +564,7 @@ impl RealAttachPlaybookRuntime {
             .context("real attachment target missing")?;
         for stroke in strokes {
             committed_target = self
-                .send_event(crossterm_event_from_stroke(stroke), deadline)
+                .send_event(terminal_event_from_stroke(stroke), deadline)
                 .await?;
         }
         Ok(committed_target)
@@ -716,7 +716,7 @@ impl RealAttach for RealAttachPlaybookRuntime {
     fn prefix_chord(&self) -> &str {
         &self.prefix
     }
-    fn send_event(&self, event: CrosstermEvent, deadline: Instant) -> HostFuture<'_, Uuid> {
+    fn send_event(&self, event: TermEvent, deadline: Instant) -> HostFuture<'_, Uuid> {
         Box::pin(Self::send_event(self, event, deadline))
     }
     fn send_action(&self, action: String, deadline: Instant) -> HostFuture<'_, Uuid> {
@@ -724,7 +724,7 @@ impl RealAttach for RealAttachPlaybookRuntime {
             // Validate before admission; arbitrary malformed commands must not
             // be acknowledged as successful no-ops by the UI dispatcher.
             crate::input::parse_runtime_action_name(&action)?;
-            self.send_input(CrosstermEvent::FocusGained, Some(action), deadline)
+            self.send_input(TermEvent::FocusGained, Some(action), deadline)
                 .await
         })
     }
@@ -975,7 +975,7 @@ mod tests {
         let driver = async {
             assert!(matches!(
                 terminal.next_event().await.unwrap(),
-                Some(CrosstermEvent::Key(_))
+                Some(TermEvent::Key(_))
             ));
             terminal.set_attached_session_id(target);
         };
@@ -990,7 +990,7 @@ mod tests {
         let first = Uuid::new_v4();
         terminal.set_attached_session_id(first);
         let send = runtime.send_event(
-            CrosstermEvent::Paste("first".into()),
+            TermEvent::Paste("first".into()),
             Instant::now() + Duration::from_secs(5),
         );
         tokio::pin!(send);
@@ -1013,7 +1013,7 @@ mod tests {
         assert_eq!(send.await.unwrap(), first);
 
         let second = runtime.send_event(
-            CrosstermEvent::Paste("second".into()),
+            TermEvent::Paste("second".into()),
             Instant::now() + Duration::from_secs(5),
         );
         tokio::pin!(second);
@@ -1036,7 +1036,7 @@ mod tests {
     #[tokio::test]
     async fn uncommitted_action_times_out_and_disconnect_is_not_completion() {
         let (mut terminal, runtime) = acknowledged_test_runtime();
-        let send = runtime.send_event(CrosstermEvent::Paste("late".into()), Instant::now());
+        let send = runtime.send_event(TermEvent::Paste("late".into()), Instant::now());
         assert!(send.await.unwrap_err().to_string().contains("timed out"));
         terminal.next_event().await.unwrap().unwrap();
         // Late completion has only the expired action's receiver.
@@ -1044,7 +1044,7 @@ mod tests {
         assert!(runtime.ensure_input_resolved().is_err());
         assert!(
             runtime
-                .send_event(CrosstermEvent::Paste("blocked".into()), Instant::now())
+                .send_event(TermEvent::Paste("blocked".into()), Instant::now())
                 .await
                 .unwrap_err()
                 .to_string()
@@ -1054,7 +1054,7 @@ mod tests {
 
         let (mut terminal, runtime) = acknowledged_test_runtime();
         let send = runtime.send_event(
-            CrosstermEvent::Paste("lost".into()),
+            TermEvent::Paste("lost".into()),
             Instant::now() + Duration::from_secs(5),
         );
         tokio::pin!(send);

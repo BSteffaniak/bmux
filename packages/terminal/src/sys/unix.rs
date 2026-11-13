@@ -102,20 +102,34 @@ pub fn raw_mode_enabled() -> bool {
     RAW_MODE.load(Ordering::SeqCst)
 }
 
-fn window_size_of(fd: RawFd) -> io::Result<(u16, u16)> {
+fn winsize_of(fd: RawFd) -> io::Result<libc::winsize> {
     let mut size = std::mem::MaybeUninit::<libc::winsize>::zeroed();
     // SAFETY: valid descriptor and correctly sized output storage.
     check(unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, size.as_mut_ptr()) })?;
     // SAFETY: a successful ioctl initialized the value.
-    let size = unsafe { size.assume_init() };
-    Ok((size.ws_col, size.ws_row))
+    Ok(unsafe { size.assume_init() })
+}
+
+/// The window size of `/dev/tty`, or of stdout when it cannot be opened.
+fn terminal_winsize() -> io::Result<libc::winsize> {
+    let tty = File::open("/dev/tty");
+    let fd = tty.as_ref().map_or(libc::STDOUT_FILENO, AsRawFd::as_raw_fd);
+    winsize_of(fd)
+}
+
+pub fn window_size() -> io::Result<crate::terminal::WindowSize> {
+    let size = terminal_winsize()?;
+    Ok(crate::terminal::WindowSize {
+        rows: size.ws_row,
+        columns: size.ws_col,
+        width: size.ws_xpixel,
+        height: size.ws_ypixel,
+    })
 }
 
 pub fn size() -> io::Result<(u16, u16)> {
-    let tty = File::open("/dev/tty");
-    let fd = tty.as_ref().map_or(libc::STDOUT_FILENO, AsRawFd::as_raw_fd);
-    if let Ok(size) = window_size_of(fd) {
-        return Ok(size);
+    if let Ok(size) = terminal_winsize() {
+        return Ok((size.ws_col, size.ws_row));
     }
     let error = io::Error::last_os_error();
     tput_size().ok_or(error)

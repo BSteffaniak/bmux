@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use bmux_keyboard::{KeyCode, KeyStroke, Modifiers};
-use bmux_tui::crossterm::{CrosstermTerminalGuard, poll_event};
+use bmux_tui::terminal_io::{TerminalGuard, poll_event};
 use bmux_tui::event::Event;
 use bmux_tui::geometry::{Rect, Size};
 use bmux_tui::terminal::Terminal;
@@ -12,7 +12,7 @@ use bmux_tui_components_layout_playground::LayoutPlaygroundDemo;
 fn main() -> Result<()> {
     let initial_area = Rect::new(0, 0, 72, 18);
     let mut demo = LayoutPlaygroundDemo::new(initial_area);
-    let mut guard = CrosstermTerminalGuard::enter(stdout())?;
+    let mut guard = TerminalGuard::enter(stdout())?;
     let result = {
         let writer = guard.writer_mut().expect("guard should own stdout");
         let mut terminal = Terminal::new(writer, initial_area);

@@ -63,23 +63,23 @@ use bmux_tui::prelude::Line as TuiLine;
 use bmux_tui_components::key_hint_bar::{KeyHint, KeyHintBarComponent, KeyHintBarStyles};
 use bmux_tui_components::modal_frame::{ModalFrame, ModalFrameComponent, ModalSizing};
 use bmux_tui_components::theme::ComponentTheme;
-use crossterm::cursor::{Hide, MoveTo, SavePosition, Show};
-use crossterm::event::{
+use bmux_terminal::cursor::{Hide, MoveTo, SavePosition, Show};
+use bmux_terminal::event::{
     DisableBracketedPaste, DisableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
     KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 #[cfg(test)]
-use crossterm::event::{EnableBracketedPaste, EnableMouseCapture};
+use bmux_terminal::event::{EnableBracketedPaste, EnableMouseCapture};
 macro_rules! queue {
     ($($args:tt)*) => {
         if bmux_attach_pipeline::projection::encoding_terminal() {
-            crossterm::queue!($($args)*)
+            bmux_terminal::queue!($($args)*)
         } else { Ok::<(), std::io::Error>(()) }
     };
 }
-use crossterm::style::Print;
-use crossterm::terminal;
-use crossterm::terminal::{BeginSynchronizedUpdate, Clear, ClearType, EndSynchronizedUpdate};
+use bmux_terminal::style::Print;
+use bmux_terminal::terminal;
+use bmux_terminal::terminal::{BeginSynchronizedUpdate, Clear, ClearType, EndSynchronizedUpdate};
 
 use bmux_pane_runtime_plugin_api::attach_runtime_commands as attach_terminal_commands;
 use std::collections::{BTreeMap, BTreeSet};
@@ -1031,7 +1031,7 @@ async fn native_attach_input(
     match event {
         NativeAttachEvent::Input(InputEvent::Key(key)) => {
             if let Some(key) =
-                TerminalKeyEvent::from_native(&key).and_then(|key| key.to_crossterm())
+                TerminalKeyEvent::from_native(&key).and_then(|key| key.to_terminal())
             {
                 // The existing reducer handles bindings, plugin capture, prompt
                 // editing, and mode-aware encoding exactly once.
@@ -4446,7 +4446,7 @@ async fn handle_native_provider_terminal_event(
             for action in actions {
                 match action {
                     AttachEventAction::Send(bytes) => {
-                        let payload = bmux_keyboard::crossterm::crossterm_key_event_to_stroke(&key)
+                        let payload = bmux_terminal::keyboard::key_event_to_stroke(&key)
                             .map_or(AttachInputPayload::Bytes(bytes), |stroke| {
                                 AttachInputPayload::Key {
                                     stroke,
@@ -5567,7 +5567,7 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
                         event
                     }
                 };
-                let terminal_event = AttachTerminalEvent::from_crossterm(result,
+                let terminal_event = AttachTerminalEvent::from_terminal(result,
                     SystemAttachClock.now(), terminal.geometry());
                 perf_window.record_wake(AttachWakeSource::Terminal);
 
@@ -9665,7 +9665,7 @@ pub fn handle_help_overlay_terminal_key_event(
     view_state: &mut AttachViewState,
     geometry: TerminalGeometry,
 ) -> bool {
-    key.to_crossterm()
+    key.to_terminal()
         .is_some_and(|key| handle_help_overlay_key_event(&key, help_lines, view_state, geometry))
 }
 
@@ -13747,7 +13747,7 @@ pub async fn handle_attach_terminal_event(
     if view_state.prompt.is_active() {
         let prompt_disposition = match &normalized_event {
             Some(TerminalInputEvent::Key(key))
-                if prompt_accepts_key_kind(key.kind.to_crossterm()) =>
+                if prompt_accepts_key_kind(key.kind.to_terminal()) =>
             {
                 Some(view_state.prompt.handle_terminal_key_event(key))
             }
@@ -15574,7 +15574,7 @@ pub fn continue_attach_builtin_pointer_owner(
                     TerminalMousePhase::Drag | TerminalMousePhase::Up,
                     Some(TerminalMouseButton::Left)
                 )
-            ) && let Some(mouse_event) = mouse_event.to_crossterm()
+            ) && let Some(mouse_event) = mouse_event.to_terminal()
             {
                 let _ = handle_attach_mouse_selection_drag_at(view_state, mouse_event, now);
             }
@@ -17396,7 +17396,7 @@ pub fn restore_terminal_after_attach_ui() -> Result<()> {
     let mut stdout = io::stdout();
     // Safety net: restore terminal input flags in case the drop guard didn't run.
     #[cfg(feature = "kitty-keyboard")]
-    let _ = queue!(stdout, crossterm::event::PopKeyboardEnhancementFlags);
+    let _ = queue!(stdout, bmux_terminal::event::PopKeyboardEnhancementFlags);
     let _ = queue_attach_input_mode_restore(&mut stdout);
     queue!(
         stdout,
@@ -17435,7 +17435,7 @@ fn attach_terminal_input_event_actions(
         TerminalInputEvent::Key(key) => {
             attach_terminal_key_event_actions(key, attach_input_processor, ui_mode)
         }
-        TerminalInputEvent::Mouse(mouse) => mouse.to_crossterm().map_or_else(
+        TerminalInputEvent::Mouse(mouse) => mouse.to_terminal().map_or_else(
             || Ok(vec![AttachEventAction::Ignore]),
             |mouse| Ok(vec![AttachEventAction::Mouse(mouse)]),
         ),
@@ -17451,7 +17451,7 @@ fn attach_terminal_key_event_actions(
     attach_input_processor: &mut InputProcessor,
     ui_mode: AttachUiMode,
 ) -> Result<Vec<AttachEventAction>> {
-    let Some(key) = key.to_crossterm() else {
+    let Some(key) = key.to_terminal() else {
         return Ok(vec![AttachEventAction::Ignore]);
     };
     attach_key_event_actions(&key, attach_input_processor, ui_mode)
@@ -17475,7 +17475,7 @@ pub fn attach_key_event_actions(
     let _enter = span.enter();
 
     // Release events are filtered out here and also inside
-    // InputProcessor's crossterm adapter as a safety net.
+    // InputProcessor's terminal adapter as a safety net.
     if key.kind == KeyEventKind::Release {
         span.record("emitted", 0usize);
         return Ok(vec![AttachEventAction::Ignore]);
@@ -17910,7 +17910,7 @@ mod tests {
                 client,
                 state,
                 MouseEvent {
-                    kind: MouseEventKind::Down(crossterm::event::MouseButton::Right),
+                    kind: MouseEventKind::Down(bmux_terminal::event::MouseButton::Right),
                     column,
                     row,
                     modifiers: KeyModifiers::NONE,
@@ -18018,7 +18018,7 @@ mod tests {
             // serviced. Repeated acknowledgements must not suspend input.
             super::acknowledge_plugin_surface_output(state);
             let mut down = mouse;
-            down.kind = MouseEventKind::Down(crossterm::event::MouseButton::Left);
+            down.kind = MouseEventKind::Down(bmux_terminal::event::MouseButton::Left);
             assert!(!super::dismiss_plugin_focus_on_pointer_down(state, down));
             assert!(state.plugin_focus.focused().is_some());
             let lowered = super::retained_plugin_surfaces(state, viewport);
@@ -18247,7 +18247,7 @@ mod tests {
     ) {
         let mut client = disconnected_focus_test_client().await;
         let down = MouseEvent {
-            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            kind: MouseEventKind::Down(bmux_terminal::event::MouseButton::Left),
             column: hit.absolute_x,
             row: hit.absolute_y,
             modifiers: KeyModifiers::NONE,
@@ -18262,7 +18262,7 @@ mod tests {
             );
         }
         let up = MouseEvent {
-            kind: MouseEventKind::Up(crossterm::event::MouseButton::Left),
+            kind: MouseEventKind::Up(bmux_terminal::event::MouseButton::Left),
             ..down
         };
         assert!(
@@ -19412,9 +19412,9 @@ mod tests {
         AttachInputEndpoint, AttachInputHook, AttachInputHookFilter, AttachRenderExtension,
     };
 
-    use crossterm::event::{
-        Event as CrosstermEvent, KeyCode as CrosstermKeyCode, KeyEvent as CrosstermKeyEvent,
-        KeyEventKind as CrosstermKeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+    use bmux_terminal::event::{
+        Event as TermEvent, KeyCode as TermKeyCode, KeyEvent as TermKeyEvent,
+        KeyEventKind as TermKeyEventKind, KeyModifiers, MouseButton, MouseEvent,
         MouseEventKind,
     };
     use serial_test::serial;
@@ -19671,7 +19671,7 @@ mod tests {
                     text: Some("\r".to_string()),
                 };
                 let key = TerminalKeyEvent::from_native(&key)
-                    .and_then(|key| key.to_crossterm())
+                    .and_then(|key| key.to_terminal())
                     .unwrap();
                 let actions =
                     attach_key_event_actions(&key, &mut processor, AttachUiMode::Normal).unwrap();
@@ -19689,7 +19689,7 @@ mod tests {
 
     #[test]
     fn native_provider_key_encoding_respects_focused_application_cursor_mode() {
-        let stroke = bmux_keyboard::crossterm::crossterm_key_event_to_stroke(&KeyEvent::new(
+        let stroke = bmux_terminal::keyboard::key_event_to_stroke(&KeyEvent::new(
             KeyCode::Up,
             KeyModifiers::NONE,
         ))
@@ -22597,10 +22597,10 @@ mod tests {
     fn attach_key_event_action_detaches_on_prefix_d() {
         let mut processor = normal_mode_input_processor();
         let _ = attach_key_event_actions(
-            &CrosstermKeyEvent::new_with_kind(
-                CrosstermKeyCode::Char('a'),
+            &TermKeyEvent::new_with_kind(
+                TermKeyCode::Char('a'),
                 KeyModifiers::CONTROL,
-                CrosstermKeyEventKind::Press,
+                TermKeyEventKind::Press,
             ),
             &mut processor,
             AttachUiMode::Normal,
@@ -22608,10 +22608,10 @@ mod tests {
         .expect("attach key action should parse");
 
         let actions = attach_key_event_actions(
-            &CrosstermKeyEvent::new_with_kind(
-                CrosstermKeyCode::Char('d'),
+            &TermKeyEvent::new_with_kind(
+                TermKeyCode::Char('d'),
                 KeyModifiers::NONE,
-                CrosstermKeyEventKind::Press,
+                TermKeyEventKind::Press,
             ),
             &mut processor,
             AttachUiMode::Normal,
@@ -22625,10 +22625,10 @@ mod tests {
     fn attach_key_event_action_ctrl_d_forwards_to_pane() {
         let mut processor = normal_mode_input_processor();
         let actions = attach_key_event_actions(
-            &CrosstermKeyEvent::new_with_kind(
-                CrosstermKeyCode::Char('d'),
+            &TermKeyEvent::new_with_kind(
+                TermKeyCode::Char('d'),
                 KeyModifiers::CONTROL,
-                CrosstermKeyEventKind::Press,
+                TermKeyEventKind::Press,
             ),
             &mut processor,
             AttachUiMode::Normal,
@@ -22679,10 +22679,10 @@ mod tests {
         let mut processor = normal_mode_input_processor();
         // First simulate a Press so the InputProcessor is primed.
         let press = attach_key_event_actions(
-            &CrosstermKeyEvent::new_with_kind(
-                CrosstermKeyCode::Char('c'),
+            &TermKeyEvent::new_with_kind(
+                TermKeyCode::Char('c'),
                 KeyModifiers::NONE,
-                CrosstermKeyEventKind::Press,
+                TermKeyEventKind::Press,
             ),
             &mut processor,
             AttachUiMode::Normal,
@@ -22694,10 +22694,10 @@ mod tests {
         assert!(press_has_plugin, "press should emit a PluginCommand");
 
         let repeat = attach_key_event_actions(
-            &CrosstermKeyEvent::new_with_kind(
-                CrosstermKeyCode::Char('c'),
+            &TermKeyEvent::new_with_kind(
+                TermKeyCode::Char('c'),
                 KeyModifiers::NONE,
-                CrosstermKeyEventKind::Repeat,
+                TermKeyEventKind::Repeat,
             ),
             &mut processor,
             AttachUiMode::Normal,
@@ -22718,10 +22718,10 @@ mod tests {
         let mut processor =
             InputProcessor::new(attach_keymap_from_config(&BmuxConfig::default()), false);
         let repeat = attach_key_event_actions(
-            &CrosstermKeyEvent::new_with_kind(
-                CrosstermKeyCode::Left,
+            &TermKeyEvent::new_with_kind(
+                TermKeyCode::Left,
                 KeyModifiers::NONE,
-                CrosstermKeyEventKind::Repeat,
+                TermKeyEventKind::Repeat,
             ),
             &mut processor,
             AttachUiMode::Normal,
@@ -22747,20 +22747,20 @@ mod tests {
         let mut processor =
             InputProcessor::new(attach_keymap_from_config(&BmuxConfig::default()), false);
         let _ = attach_key_event_actions(
-            &CrosstermKeyEvent::new_with_kind(
-                CrosstermKeyCode::Char('i'),
+            &TermKeyEvent::new_with_kind(
+                TermKeyCode::Char('i'),
                 KeyModifiers::NONE,
-                CrosstermKeyEventKind::Press,
+                TermKeyEventKind::Press,
             ),
             &mut processor,
             AttachUiMode::Normal,
         )
         .expect("attach key action should parse");
         let actions = attach_key_event_actions(
-            &CrosstermKeyEvent::new_with_kind(
-                CrosstermKeyCode::Char('x'),
+            &TermKeyEvent::new_with_kind(
+                TermKeyCode::Char('x'),
                 KeyModifiers::NONE,
-                CrosstermKeyEventKind::Press,
+                TermKeyEventKind::Press,
             ),
             &mut processor,
             AttachUiMode::Normal,
@@ -22774,7 +22774,7 @@ mod tests {
     fn attach_event_actions_maps_paste_without_keymap_processing() {
         let mut processor =
             InputProcessor::new(attach_keymap_from_config(&BmuxConfig::default()), false);
-        let event = CrosstermEvent::Paste("ctrl+b detach".to_string());
+        let event = TermEvent::Paste("ctrl+b detach".to_string());
 
         let actions = attach_event_actions(&event, &mut processor, AttachUiMode::Normal)
             .expect("paste event should map");
@@ -22789,7 +22789,7 @@ mod tests {
     fn attach_event_actions_maps_mouse_events() {
         let mut processor =
             InputProcessor::new(attach_keymap_from_config(&BmuxConfig::default()), false);
-        let event = CrosstermEvent::Mouse(MouseEvent {
+        let event = TermEvent::Mouse(MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column: 12,
             row: 8,
@@ -23423,7 +23423,7 @@ mod tests {
         let mut view_state = attach_view_state_with_scrollback_fixture();
         let mut processor =
             InputProcessor::new(attach_keymap_from_config(&BmuxConfig::default()), false);
-        let event = CrosstermEvent::Mouse(MouseEvent {
+        let event = TermEvent::Mouse(MouseEvent {
             kind: MouseEventKind::Moved,
             column: 2,
             row: 2,
@@ -24589,10 +24589,10 @@ mod tests {
         let mut processor = normal_mode_input_processor();
 
         let new_tab = attach_key_event_actions(
-            &CrosstermKeyEvent::new_with_kind(
-                CrosstermKeyCode::Char('c'),
+            &TermKeyEvent::new_with_kind(
+                TermKeyCode::Char('c'),
                 KeyModifiers::NONE,
-                CrosstermKeyEventKind::Press,
+                TermKeyEventKind::Press,
             ),
             &mut processor,
             AttachUiMode::Normal,
@@ -24605,10 +24605,10 @@ mod tests {
         ));
 
         let next_window = attach_key_event_actions(
-            &CrosstermKeyEvent::new_with_kind(
-                CrosstermKeyCode::Char('s'),
+            &TermKeyEvent::new_with_kind(
+                TermKeyCode::Char('s'),
                 KeyModifiers::CONTROL,
-                CrosstermKeyEventKind::Press,
+                TermKeyEventKind::Press,
             ),
             &mut processor,
             AttachUiMode::Normal,
@@ -24621,10 +24621,10 @@ mod tests {
         ));
 
         let previous_window = attach_key_event_actions(
-            &CrosstermKeyEvent::new_with_kind(
-                CrosstermKeyCode::Char('h'),
+            &TermKeyEvent::new_with_kind(
+                TermKeyCode::Char('h'),
                 KeyModifiers::CONTROL,
-                CrosstermKeyEventKind::Press,
+                TermKeyEventKind::Press,
             ),
             &mut processor,
             AttachUiMode::Normal,
@@ -24637,10 +24637,10 @@ mod tests {
         ));
 
         let last_window = attach_key_event_actions(
-            &CrosstermKeyEvent::new_with_kind(
-                CrosstermKeyCode::Char('l'),
+            &TermKeyEvent::new_with_kind(
+                TermKeyCode::Char('l'),
                 KeyModifiers::CONTROL,
-                CrosstermKeyEventKind::Press,
+                TermKeyEventKind::Press,
             ),
             &mut processor,
             AttachUiMode::Normal,
@@ -24653,10 +24653,10 @@ mod tests {
         ));
 
         let split_vertical = attach_key_event_actions(
-            &CrosstermKeyEvent::new_with_kind(
-                CrosstermKeyCode::Char('%'),
+            &TermKeyEvent::new_with_kind(
+                TermKeyCode::Char('%'),
                 KeyModifiers::NONE,
-                CrosstermKeyEventKind::Press,
+                TermKeyEventKind::Press,
             ),
             &mut processor,
             AttachUiMode::Normal,
@@ -24671,10 +24671,10 @@ mod tests {
         ));
 
         let quit = attach_key_event_actions(
-            &CrosstermKeyEvent::new_with_kind(
-                CrosstermKeyCode::Char('q'),
+            &TermKeyEvent::new_with_kind(
+                TermKeyCode::Char('q'),
                 KeyModifiers::NONE,
-                CrosstermKeyEventKind::Press,
+                TermKeyEventKind::Press,
             ),
             &mut processor,
             AttachUiMode::Normal,
@@ -24686,10 +24686,10 @@ mod tests {
         ));
 
         let new_session = attach_key_event_actions(
-            &CrosstermKeyEvent::new_with_kind(
-                CrosstermKeyCode::Char('C'),
+            &TermKeyEvent::new_with_kind(
+                TermKeyCode::Char('C'),
                 KeyModifiers::SHIFT,
-                CrosstermKeyEventKind::Press,
+                TermKeyEventKind::Press,
             ),
             &mut processor,
             AttachUiMode::Normal,
@@ -24710,10 +24710,10 @@ mod tests {
         let mut processor =
             InputProcessor::new(attach_keymap_from_config(&BmuxConfig::default()), false);
         let actions = attach_key_event_actions(
-            &CrosstermKeyEvent::new_with_kind(
-                CrosstermKeyCode::Char('t'),
+            &TermKeyEvent::new_with_kind(
+                TermKeyCode::Char('t'),
                 KeyModifiers::CONTROL,
-                CrosstermKeyEventKind::Press,
+                TermKeyEventKind::Press,
             ),
             &mut processor,
             AttachUiMode::Normal,
@@ -24734,10 +24734,10 @@ mod tests {
         let mut processor = normal_mode_input_processor();
 
         let normal_actions = attach_key_event_actions(
-            &CrosstermKeyEvent::new_with_kind(
-                CrosstermKeyCode::Char('h'),
+            &TermKeyEvent::new_with_kind(
+                TermKeyCode::Char('h'),
                 KeyModifiers::NONE,
-                CrosstermKeyEventKind::Press,
+                TermKeyEventKind::Press,
             ),
             &mut processor,
             AttachUiMode::Normal,
@@ -24764,10 +24764,10 @@ mod tests {
         let mut processor = InputProcessor::new(attach_keymap_from_config(&config), false);
 
         let actions = attach_key_event_actions(
-            &CrosstermKeyEvent::new_with_kind(
-                CrosstermKeyCode::Char('1'),
+            &TermKeyEvent::new_with_kind(
+                TermKeyCode::Char('1'),
                 KeyModifiers::ALT,
-                CrosstermKeyEventKind::Press,
+                TermKeyEventKind::Press,
             ),
             &mut processor,
             AttachUiMode::Normal,
@@ -24793,20 +24793,20 @@ mod tests {
         let mut processor = normal_mode_input_processor();
 
         let _ = attach_key_event_actions(
-            &CrosstermKeyEvent::new_with_kind(
-                CrosstermKeyCode::Char('a'),
+            &TermKeyEvent::new_with_kind(
+                TermKeyCode::Char('a'),
                 KeyModifiers::CONTROL,
-                CrosstermKeyEventKind::Press,
+                TermKeyEventKind::Press,
             ),
             &mut processor,
             AttachUiMode::Normal,
         )
         .expect("attach key action should parse");
         let actions = attach_key_event_actions(
-            &CrosstermKeyEvent::new_with_kind(
-                CrosstermKeyCode::Char('['),
+            &TermKeyEvent::new_with_kind(
+                TermKeyCode::Char('['),
                 KeyModifiers::NONE,
-                CrosstermKeyEventKind::Press,
+                TermKeyEventKind::Press,
             ),
             &mut processor,
             AttachUiMode::Normal,
@@ -24827,10 +24827,10 @@ mod tests {
             InputProcessor::new(attach_keymap_from_config(&BmuxConfig::default()), false);
 
         let actions = attach_key_event_actions(
-            &CrosstermKeyEvent::new_with_kind(
-                CrosstermKeyCode::Char('h'),
+            &TermKeyEvent::new_with_kind(
+                TermKeyCode::Char('h'),
                 KeyModifiers::ALT,
-                CrosstermKeyEventKind::Press,
+                TermKeyEventKind::Press,
             ),
             &mut processor,
             AttachUiMode::Normal,
@@ -24850,10 +24850,10 @@ mod tests {
         let mut processor = normal_mode_input_processor();
 
         let normal_actions = attach_key_event_actions(
-            &CrosstermKeyEvent::new_with_kind(
-                CrosstermKeyCode::Char('n'),
+            &TermKeyEvent::new_with_kind(
+                TermKeyCode::Char('n'),
                 KeyModifiers::NONE,
-                CrosstermKeyEventKind::Press,
+                TermKeyEventKind::Press,
             ),
             &mut processor,
             AttachUiMode::Normal,
@@ -24872,10 +24872,10 @@ mod tests {
 
         let mut processor = InputProcessor::new(attach_keymap_from_config(&config), false);
         let actions = attach_key_event_actions(
-            &CrosstermKeyEvent::new_with_kind(
-                CrosstermKeyCode::Char('t'),
+            &TermKeyEvent::new_with_kind(
+                TermKeyCode::Char('t'),
                 KeyModifiers::CONTROL,
-                CrosstermKeyEventKind::Press,
+                TermKeyEventKind::Press,
             ),
             &mut processor,
             AttachUiMode::Normal,
@@ -25695,10 +25695,10 @@ mod tests {
         let mut processor = normal_mode_input_processor();
 
         let _ = attach_key_event_actions(
-            &CrosstermKeyEvent::new_with_kind(
-                CrosstermKeyCode::Char('a'),
+            &TermKeyEvent::new_with_kind(
+                TermKeyCode::Char('a'),
                 KeyModifiers::CONTROL,
-                CrosstermKeyEventKind::Press,
+                TermKeyEventKind::Press,
             ),
             &mut processor,
             AttachUiMode::Normal,
@@ -25706,10 +25706,10 @@ mod tests {
         .expect("attach key action should parse");
 
         let help_question = attach_key_event_actions(
-            &CrosstermKeyEvent::new_with_kind(
-                CrosstermKeyCode::Char('?'),
+            &TermKeyEvent::new_with_kind(
+                TermKeyCode::Char('?'),
                 KeyModifiers::NONE,
-                CrosstermKeyEventKind::Press,
+                TermKeyEventKind::Press,
             ),
             &mut processor,
             AttachUiMode::Normal,
@@ -25717,10 +25717,10 @@ mod tests {
         .expect("attach key action should parse");
 
         let _ = attach_key_event_actions(
-            &CrosstermKeyEvent::new_with_kind(
-                CrosstermKeyCode::Char('a'),
+            &TermKeyEvent::new_with_kind(
+                TermKeyCode::Char('a'),
                 KeyModifiers::CONTROL,
-                CrosstermKeyEventKind::Press,
+                TermKeyEventKind::Press,
             ),
             &mut processor,
             AttachUiMode::Normal,
@@ -25728,10 +25728,10 @@ mod tests {
         .expect("attach key action should parse");
 
         let help_shift_slash = attach_key_event_actions(
-            &CrosstermKeyEvent::new_with_kind(
-                CrosstermKeyCode::Char('/'),
+            &TermKeyEvent::new_with_kind(
+                TermKeyCode::Char('/'),
                 KeyModifiers::SHIFT,
-                CrosstermKeyEventKind::Press,
+                TermKeyEventKind::Press,
             ),
             &mut processor,
             AttachUiMode::Normal,
@@ -25825,10 +25825,10 @@ mod tests {
             .collect::<Vec<_>>();
 
         let handled = handle_help_overlay_key_event(
-            &CrosstermKeyEvent::new_with_kind(
-                CrosstermKeyCode::Down,
+            &TermKeyEvent::new_with_kind(
+                TermKeyCode::Down,
                 KeyModifiers::NONE,
-                CrosstermKeyEventKind::Repeat,
+                TermKeyEventKind::Repeat,
             ),
             &lines,
             &mut view_state,
@@ -25854,10 +25854,10 @@ mod tests {
             .collect::<Vec<_>>();
 
         let handled = handle_help_overlay_key_event(
-            &CrosstermKeyEvent::new_with_kind(
-                CrosstermKeyCode::Down,
+            &TermKeyEvent::new_with_kind(
+                TermKeyCode::Down,
                 KeyModifiers::NONE,
-                CrosstermKeyEventKind::Release,
+                TermKeyEventKind::Release,
             ),
             &lines,
             &mut view_state,
@@ -25880,10 +25880,10 @@ mod tests {
         view_state.dirty.overlay_needs_redraw = false;
 
         let handled = handle_help_overlay_key_event(
-            &CrosstermKeyEvent::new_with_kind(
-                CrosstermKeyCode::Esc,
+            &TermKeyEvent::new_with_kind(
+                TermKeyCode::Esc,
                 KeyModifiers::NONE,
-                CrosstermKeyEventKind::Press,
+                TermKeyEventKind::Press,
             ),
             &[],
             &mut view_state,

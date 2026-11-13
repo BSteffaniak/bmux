@@ -700,9 +700,9 @@ impl RetainedPointerRouter {
     pub fn route_terminal_mouse(
         &mut self,
         compositor: &RetainedCompositor,
-        event: crossterm::event::MouseEvent,
+        event: bmux_terminal::event::MouseEvent,
     ) -> Vec<RetainedPointerEvent> {
-        use crossterm::event::{MouseButton, MouseEventKind};
+        use bmux_terminal::event::{MouseButton, MouseEventKind};
 
         let button = |button| match button {
             MouseButton::Left => RetainedPointerButton::Primary,
@@ -2797,7 +2797,7 @@ mod tests {
 
     #[test]
     fn terminal_mouse_normalization_routes_into_semantic_pointer_phases() {
-        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        use bmux_terminal::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
         let mut compositor = RetainedCompositor::new();
         compositor.replace_surfaces(

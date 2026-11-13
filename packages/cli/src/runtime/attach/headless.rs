@@ -1,6 +1,6 @@
 //! Output-only attach lifecycle and bounded external viewport updates.
 use anyhow::{Result, bail};
-use crossterm::event::Event;
+use bmux_terminal::event::Event;
 use tokio::sync::watch;
 
 use super::input::TerminalGeometry;

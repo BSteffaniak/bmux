@@ -135,7 +135,7 @@ pub(super) async fn wait(
         // waiting here would deadlock that producer. Keep accepted != live.
         return Ok(false);
     }
-    let (width, height) = crossterm::terminal::size().map_err(|error| error.to_string())?;
+    let (width, height) = bmux_terminal::terminal::size().map_err(|error| error.to_string())?;
     let presenter = InlineProgress {
         terminal: InlineTerminal::enter(io::stderr()).map_err(|error| error.to_string())?,
     };

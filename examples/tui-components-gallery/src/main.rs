@@ -2,7 +2,7 @@ use std::io::{Stdout, stdout};
 
 use anyhow::Result;
 use bmux_keyboard::{KeyCode, KeyStroke, Modifiers};
-use bmux_tui::crossterm::{CrosstermTerminalGuard, terminal_size};
+use bmux_tui::terminal_io::{TerminalGuard, terminal_size};
 use bmux_tui::event::Event;
 use bmux_tui::geometry::Rect;
 use bmux_tui::interaction::InteractionRouter;
@@ -63,7 +63,7 @@ impl Program for GalleryProgram {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
-    let mut guard = CrosstermTerminalGuard::enter(stdout())?;
+    let mut guard = TerminalGuard::enter(stdout())?;
     let result: Result<()> = async {
         let writer = guard.writer_mut().expect("guard should own stdout");
         let size = terminal_size()?;

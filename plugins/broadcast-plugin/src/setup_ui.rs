@@ -90,7 +90,7 @@ pub(super) async fn text(label: &str) -> io::Result<Option<String>> {
             "interactive setup requires a TTY; use explicit setup flags",
         ));
     }
-    let (width, height) = crossterm::terminal::size()?;
+    let (width, height) = bmux_terminal::terminal::size()?;
     let presenter = FieldPresenter {
         terminal: InlineTerminal::enter(io::stderr())?,
     };

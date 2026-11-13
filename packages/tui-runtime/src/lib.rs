@@ -18,16 +18,16 @@ pub mod config;
 pub mod ids;
 #[cfg(feature = "images")]
 pub mod image_terminal_presenter;
-#[cfg(feature = "crossterm")]
+#[cfg(feature = "terminal-io")]
 pub mod input;
-#[cfg(feature = "crossterm")]
+#[cfg(feature = "terminal-io")]
 pub mod input_drain;
 pub mod invalidation;
-#[cfg(all(target_os = "linux", feature = "crossterm"))]
+#[cfg(all(target_os = "linux", feature = "terminal-io"))]
 pub mod linux_capture;
 mod mailbox;
 pub mod presenter;
-#[cfg(feature = "crossterm")]
+#[cfg(feature = "terminal-io")]
 pub mod private_input;
 pub mod program;
 pub mod runtime;
@@ -45,7 +45,7 @@ pub use ids::{CommandKey, MessageKey, SubscriptionKey, TimerId};
 pub use image_terminal_presenter::{
     AsyncImageTerminalPresenter, ImagePresentationError, ImageTerminalPresenter,
 };
-#[cfg(feature = "crossterm")]
+#[cfg(feature = "terminal-io")]
 pub use input::{ManagedTerminalInput, TERMINAL_COLORS_EVENT, TerminalColorsHandle, TerminalInput};
 pub use invalidation::InvalidationSignal;
 pub use mailbox::{LatestSendError, LatestSendOutcome, LatestSender, SendError, TrySendError};

@@ -1,6 +1,6 @@
 //! Single raw reader with synchronous capture barriers and generation-fenced admission.
 use super::{CaptureSuppression, PrivateInputError, PrivateInputGate, PrivateInputRoute};
-use bmux_tui::crossterm::input::RawInput;
+use bmux_tui::terminal_io::input::RawInput;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -112,7 +112,7 @@ pub struct PrivateIngress {
 }
 impl PrivateIngress {
     /// Adopt the sole startup reader and the owner of every cooperating capture surface.
-    /// This must replace, never accompany, Crossterm's global event reader.
+    /// This must replace, never accompany, the shared `bmux_terminal` event reader.
     /// Opaque protocol frames are discarded and wiped: this source is for applications
     /// without outstanding terminal query ownership, not a transparent protocol proxy.
     #[must_use]

@@ -1,4 +1,4 @@
-mod crossterm_adapter;
+mod terminal_adapter;
 mod decoder;
 mod parse;
 
@@ -9,11 +9,11 @@ use bmux_keybind::action_to_name;
 use bmux_keybind::{action_to_config_name, parse_action};
 use bmux_keyboard::encode::KeyEncodingModes;
 use bmux_keyboard::{KeyCode, KeyStroke};
-use crossterm::event::Event;
+use bmux_terminal::event::Event;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
-use crossterm_adapter::crossterm_event_to_input_event;
+use terminal_adapter::terminal_event_to_input_event;
 use decoder::ByteDecoder;
 use parse::{parse_chord, parse_stroke};
 
@@ -75,7 +75,7 @@ pub struct KeymapDoctorReport {
 
 #[derive(Debug, Clone)]
 pub struct DecodedStroke {
-    kind: crossterm::event::KeyEventKind,
+    kind: bmux_terminal::event::KeyEventKind,
     stroke: KeyStroke,
     raw: Vec<u8>,
 }
@@ -693,7 +693,7 @@ impl InputProcessor {
         }
 
         let Some(input_event) =
-            crossterm_event_to_input_event(&event, self.enhanced, self.key_encoding_modes)
+            terminal_event_to_input_event(&event, self.enhanced, self.key_encoding_modes)
         else {
             return actions;
         };
@@ -1199,7 +1199,7 @@ pub fn stroke_to_string(stroke: &KeyStroke) -> String {
 #[cfg(test)]
 mod tests {
     use super::{InputEvent, InputProcessor, Keymap, RuntimeAction, action_to_config_name};
-    use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+    use bmux_terminal::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
     use std::collections::BTreeMap;
     use std::thread;
     use std::time::Duration;

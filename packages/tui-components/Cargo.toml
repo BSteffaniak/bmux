@@ -39,8 +39,8 @@ unicode-width = { workspace = true, optional = true }
 
 [dev-dependencies]
 bmux_keyboard = { workspace = true }
-# `crossterm` serves the standalone `virtual_list_chat` example's terminal input.
-bmux_tui_runtime = { workspace = true, features = ["crossterm", "testing"] }
+# `terminal-io` serves the standalone `virtual_list_chat` example's terminal input.
+bmux_tui_runtime = { workspace = true, features = ["terminal-io", "testing"] }
 tokio = { workspace = true, features = ["rt", "time"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]

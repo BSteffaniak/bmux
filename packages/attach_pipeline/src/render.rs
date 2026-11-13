@@ -24,16 +24,16 @@ use bmux_plugin::{
 };
 use bmux_scene_protocol_render::paint::opaque_row_text as shared_opaque_row_text;
 use bmux_terminal_grid::{Cell, Color as GridColor, PhysicalRow, Style as GridStyle};
-use crossterm::cursor::MoveTo;
+use bmux_terminal::cursor::MoveTo;
 // Output-only composition never invokes a terminal encoder.
 macro_rules! queue {
     ($($args:tt)*) => {
         if crate::projection::encoding_terminal() {
-            crossterm::queue!($($args)*)
+            bmux_terminal::queue!($($args)*)
         } else { Ok::<(), std::io::Error>(()) }
     };
 }
-use crossterm::style::{
+use bmux_terminal::style::{
     Attribute, Color, Print, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor,
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -880,11 +880,11 @@ fn flush_pending_text_run_to_commands(
 /// hovered tabs render dim as well).
 fn queue_render_style<W: io::Write>(stdout: &mut W, style: RenderStyle) -> Result<()> {
     if let Some(fg) = style.fg {
-        queue!(stdout, SetForegroundColor(render_color_to_crossterm(fg)))
+        queue!(stdout, SetForegroundColor(render_color_to_terminal(fg)))
             .context("failed setting render op foreground color")?;
     }
     if let Some(bg) = style.bg {
-        queue!(stdout, SetBackgroundColor(render_color_to_crossterm(bg)))
+        queue!(stdout, SetBackgroundColor(render_color_to_terminal(bg)))
             .context("failed setting render op background color")?;
     }
     // Bold and dim share a single reset code (SGR 22, `NormalIntensity`), so
@@ -952,16 +952,16 @@ fn queue_render_style_toggle<W: io::Write>(
         .with_context(|| format!("failed setting render op {name} attribute"))
 }
 
-const fn render_color_to_crossterm(color: RenderColor) -> Color {
+const fn render_color_to_terminal(color: RenderColor) -> Color {
     match color {
         RenderColor::Default => Color::Reset,
-        RenderColor::Named(name) => render_named_color_to_crossterm(name),
+        RenderColor::Named(name) => render_named_color_to_terminal(name),
         RenderColor::Indexed(index) => Color::AnsiValue(index),
         RenderColor::Rgb { r, g, b } => Color::Rgb { r, g, b },
     }
 }
 
-const fn render_named_color_to_crossterm(color: RenderNamedColor) -> Color {
+const fn render_named_color_to_terminal(color: RenderNamedColor) -> Color {
     match color {
         RenderNamedColor::Black => Color::Black,
         RenderNamedColor::Red => Color::DarkRed,
@@ -5959,8 +5959,8 @@ mod tests {
     };
     #[cfg(feature = "image-kitty")]
     use bmux_plugin::{RenderLayerItem, TerminalGraphicFill, TerminalGraphicOverlay, TerminalRgba};
-    use crossterm::cursor::MoveTo;
-    use crossterm::style::Print;
+    use bmux_terminal::cursor::MoveTo;
+    use bmux_terminal::style::Print;
     use std::collections::{BTreeMap, BTreeSet};
     use uuid::Uuid;
 

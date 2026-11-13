@@ -20,7 +20,7 @@ use bmux_control_catalog_plugin_api::control_catalog_state::{
 use bmux_plugin::{AttachInputHook, AttachVisualProjectionUpdate, ExtensionRect};
 use bmux_tabs_plugin_api::tabs_commands::PaneResizeDirection;
 use bmux_tabs_plugin_api::tabs_list::TabListSnapshot;
-use crossterm::event::MouseEvent;
+use bmux_terminal::event::MouseEvent;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};

@@ -62,28 +62,24 @@ impl RawInputPacket {
 
     /// Convert to an attach event without losing press/repeat/release identity.
     #[must_use]
-    pub fn into_crossterm(self) -> Option<crossterm::event::Event> {
+    pub fn into_terminal_event(self) -> Option<bmux_terminal::event::Event> {
         match self {
             Self::Key { stroke, kind } => {
-                let crossterm::event::Event::Key(mut key) =
-                    super::event_to_crossterm(Event::Key(stroke))?
-                else {
-                    return None;
-                };
+                let mut key = bmux_terminal::keyboard::stroke_to_key_event(stroke);
                 key.kind = match kind {
                     bmux_keyboard::csi_u::KeyEventKind::Press => {
-                        crossterm::event::KeyEventKind::Press
+                        bmux_terminal::event::KeyEventKind::Press
                     }
                     bmux_keyboard::csi_u::KeyEventKind::Repeat => {
-                        crossterm::event::KeyEventKind::Repeat
+                        bmux_terminal::event::KeyEventKind::Repeat
                     }
                     bmux_keyboard::csi_u::KeyEventKind::Release => {
-                        crossterm::event::KeyEventKind::Release
+                        bmux_terminal::event::KeyEventKind::Release
                     }
                 };
-                Some(crossterm::event::Event::Key(key))
+                Some(bmux_terminal::event::Event::Key(key))
             }
-            other => other.into_event().and_then(super::event_to_crossterm),
+            other => other.into_event().and_then(super::event_to_terminal),
         }
     }
 }
@@ -449,7 +445,7 @@ impl InputWaker {
 struct Wake {
     receiver: std::os::unix::net::UnixStream,
     sender: std::sync::Arc<std::os::unix::net::UnixStream>,
-    resize: signal_hook::SigId,
+    _resize: bmux_terminal::unix::sigwinch::Registration,
 }
 
 impl Wake {
@@ -457,11 +453,13 @@ impl Wake {
         let (receiver, sender) = std::os::unix::net::UnixStream::pair()?;
         receiver.set_nonblocking(true)?;
         sender.set_nonblocking(true)?;
-        let resize = signal_hook::low_level::pipe::register(libc::SIGWINCH, sender.try_clone()?)?;
+        let resize = bmux_terminal::unix::sigwinch::register(std::os::fd::OwnedFd::from(
+            sender.try_clone()?,
+        ))?;
         Ok(Self {
             receiver,
             sender: std::sync::Arc::new(sender),
-            resize,
+            _resize: resize,
         })
     }
 
@@ -471,13 +469,8 @@ impl Wake {
     }
 }
 
-impl Drop for Wake {
-    fn drop(&mut self) {
-        signal_hook::low_level::unregister(self.resize);
-    }
-}
-
-/// Sole nonblocking raw input owner. Do not combine with Crossterm readers.
+/// Sole nonblocking raw input owner. Do not combine with the shared
+/// `bmux_terminal` event reader.
 pub struct RawInput {
     file: std::fs::File,
     decoder: Decoder,
@@ -716,7 +709,7 @@ mod tests {
 
     #[test]
     fn encoded_escape_survives_fragmentation_and_attach_conversion() {
-        use crossterm::event::{Event as CEvent, KeyCode as CCode, KeyEventKind as Kind};
+        use bmux_terminal::event::{Event as CEvent, KeyCode as CCode, KeyEventKind as Kind};
         let now = Instant::now();
         for (sequence, expected) in [
             (b"\x1b[27u".as_slice(), Kind::Press),
@@ -731,7 +724,7 @@ mod tests {
                 assert!(decoder.next(now).unwrap().is_none());
                 decoder.feed(&sequence[split..], now).unwrap();
                 let packet = decoder.next(now).unwrap().unwrap();
-                let Some(CEvent::Key(key)) = packet.clone().into_crossterm() else {
+                let Some(CEvent::Key(key)) = packet.clone().into_terminal_event() else {
                     panic!("encoded Escape lost at split {split}: {sequence:?}");
                 };
                 assert_eq!(key.code, CCode::Esc);
@@ -763,7 +756,7 @@ mod tests {
                 decoder.feed(b"q", now).unwrap();
                 let packet = decoder.next(now).unwrap().unwrap();
                 assert_eq!(packet, RawInputPacket::Opaque(sequence.to_vec()));
-                assert!(packet.into_crossterm().is_none());
+                assert!(packet.into_terminal_event().is_none());
                 assert_eq!(
                     decoder.next(now).unwrap(),
                     Some(RawInputPacket::Event(Event::Key(KeyStroke::simple(
@@ -777,7 +770,7 @@ mod tests {
 
     #[test]
     fn fragmented_key_kinds_survive_attach_and_filter_tui_actions() {
-        use crossterm::event::{Event as CEvent, KeyEventKind as CKind};
+        use bmux_terminal::event::{Event as CEvent, KeyEventKind as CKind};
         let now = Instant::now();
         for (code, final_byte) in [("97", 'u'), ("1", 'A'), ("3", '~')] {
             for (suffix, expected) in [
@@ -792,13 +785,13 @@ mod tests {
                     assert!(decoder.next(now).unwrap().is_none());
                     decoder.feed(&sequence.as_bytes()[split..], now).unwrap();
                     let packet = decoder.next(now).unwrap().unwrap();
-                    let Some(CEvent::Key(key)) = packet.clone().into_crossterm() else {
+                    let Some(CEvent::Key(key)) = packet.clone().into_terminal_event() else {
                         panic!("missing key");
                     };
                     assert_eq!(key.kind, expected);
                     assert!(
                         key.modifiers
-                            .contains(crossterm::event::KeyModifiers::CONTROL)
+                            .contains(bmux_terminal::event::KeyModifiers::CONTROL)
                     );
                     assert_eq!(packet.into_event().is_some(), expected != CKind::Release);
                     assert!(decoder.next(now).unwrap().is_none());
@@ -816,7 +809,7 @@ mod tests {
             decoder.feed(sequence, now).unwrap();
             let mut typed = 0;
             while let Some(packet) = decoder.next(now).unwrap() {
-                if let Some(CEvent::Key(key)) = packet.into_crossterm()
+                if let Some(CEvent::Key(key)) = packet.into_terminal_event()
                     && key.kind != CKind::Release
                 {
                     typed += 1;
@@ -895,7 +888,7 @@ mod tests {
     }
 
     fn assert_pty_key_kinds(master: &mut std::fs::File, reader: &mut RawInput) {
-        use crossterm::event::{Event as CEvent, KeyCode as CCode, KeyEventKind as Kind};
+        use bmux_terminal::event::{Event as CEvent, KeyCode as CCode, KeyEventKind as Kind};
         use std::io::Write;
         master
             .write_all(b"\x1b[97;1:1u\x1b[97;1:2u\x1b[97;1:3u")
@@ -904,7 +897,7 @@ mod tests {
         let mut kinds = Vec::new();
         while kinds.len() < 3 {
             if let Some(packet) = reader.read_ready(Instant::now()).unwrap()
-                && let Some(CEvent::Key(key)) = packet.into_crossterm()
+                && let Some(CEvent::Key(key)) = packet.into_terminal_event()
             {
                 assert_eq!(key.code, CCode::Char('a'));
                 kinds.push(key.kind);

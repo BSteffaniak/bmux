@@ -117,7 +117,7 @@ fn resolve_program(program: &str) -> Result<PathBuf> {
 
 fn launch_options(options: &Options) -> Result<process::ProgramOptions> {
     let program = resolve_program(&options.argv[0])?;
-    let (cols, rows) = crossterm::terminal::size()?;
+    let (cols, rows) = bmux_terminal::terminal::size()?;
     ensure!(
         cols > 0 && rows > 0,
         "outer terminal has zero-sized viewport"
