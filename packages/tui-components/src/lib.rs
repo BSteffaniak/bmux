@@ -34,6 +34,8 @@ pub mod breadcrumbs;
 pub mod button;
 #[cfg(feature = "canvas")]
 pub mod canvas;
+#[cfg(feature = "card")]
+pub mod card;
 #[cfg(feature = "chart")]
 pub mod chart;
 #[cfg(feature = "checkbox")]

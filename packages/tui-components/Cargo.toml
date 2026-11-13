@@ -63,6 +63,7 @@ bar-chart = []
 breadcrumbs = ["keyboard-input"]
 button = ["keyboard-input"]
 canvas = []
+card = []
 chart = ["dep:unicode-segmentation"]
 checkbox = ["keyboard-input"]
 compact = ["dep:unicode-segmentation", "dep:unicode-width"]
@@ -123,6 +124,7 @@ all = [
     "breadcrumbs",
     "button",
     "canvas",
+    "card",
     "chart",
     "compact",
     "checkbox",
