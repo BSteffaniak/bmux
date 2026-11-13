@@ -273,7 +273,7 @@ const fn right_button(state: u32) -> bool {
         != 0
 }
 
-fn modifiers(state: u32) -> KeyModifiers {
+const fn modifiers(state: u32) -> KeyModifiers {
     let mut modifiers = KeyModifiers::NONE;
     if state & SHIFT_PRESSED != 0 {
         modifiers.insert(KeyModifiers::SHIFT);
@@ -303,10 +303,10 @@ enum DecodedKey {
 /// The character a key produces with no modifiers held, in the foreground
 /// window's keyboard layout, cased for Shift and Caps Lock.
 fn layout_character(record: &KEY_EVENT_RECORD) -> Option<char> {
-    let key_state = [0u8; 256];
-    let mut produced = [0u16; 2];
     // Leave the kernel's keyboard state (dead keys) untouched.
     const KEEP_KERNEL_STATE: u32 = 0x4;
+    let key_state = [0u8; 256];
+    let mut produced = [0u16; 2];
     // SAFETY: querying the foreground thread's layout has no preconditions.
     let layout = unsafe {
         let window = GetForegroundWindow();
@@ -410,12 +410,10 @@ impl Source for WindowsSource {
     fn try_read(&mut self, timeout: Option<Duration>) -> io::Result<Option<InternalEvent>> {
         let deadline = timeout.map(|timeout| Instant::now() + timeout);
         loop {
-            if let Some(true) = self.wait(deadline)? {
-                if self.pending_records()? != 0 {
-                    let record = self.read_record()?;
-                    if let Some(event) = self.translate(&record)? {
-                        return Ok(Some(InternalEvent::Event(event)));
-                    }
+            if self.wait(deadline)? == Some(true) && self.pending_records()? != 0 {
+                let record = self.read_record()?;
+                if let Some(event) = self.translate(&record)? {
+                    return Ok(Some(InternalEvent::Event(event)));
                 }
             }
             if deadline.is_some_and(|deadline| Instant::now() >= deadline) {

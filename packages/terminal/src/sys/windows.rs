@@ -114,11 +114,6 @@ pub fn is_raw_mode_enabled() -> io::Result<bool> {
     Ok(ConsoleHandle::input()?.mode()? & COOKED_INPUT_MODES == 0)
 }
 
-/// Whether raw mode is enabled; `false` when the console cannot be queried.
-pub fn raw_mode_enabled() -> bool {
-    is_raw_mode_enabled().unwrap_or(false)
-}
-
 /// The visible window of the active screen buffer as `(columns, rows)`.
 pub fn size() -> io::Result<(u16, u16)> {
     let info = ConsoleHandle::output()?.screen_buffer_info()?;
@@ -135,9 +130,10 @@ pub fn window_dimensions(info: &CONSOLE_SCREEN_BUFFER_INFO) -> (u16, u16) {
     )
 }
 
-// Keeps the same signature as the Unix implementation, which can fail.
-#[allow(clippy::unnecessary_wraps)]
-pub const fn supports_keyboard_enhancement() -> io::Result<bool> {
+// Keeps the same non-const signature as the Unix implementation, which
+// queries the terminal and can fail.
+#[allow(clippy::unnecessary_wraps, clippy::missing_const_for_fn)]
+pub fn supports_keyboard_enhancement() -> io::Result<bool> {
     Ok(false)
 }
 
