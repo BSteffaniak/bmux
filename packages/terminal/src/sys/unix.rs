@@ -84,11 +84,25 @@ pub fn disable_raw_mode() -> io::Result<()> {
         let tty = TtyFd::open()?;
         // SAFETY: valid descriptor and termios.
         check(unsafe { libc::tcsetattr(tty.raw_fd(), libc::TCSANOW, original) })?;
+        settle_pending_input(tty.raw_fd());
         *saved = None;
         RAW_MODE.store(false, Ordering::SeqCst);
     }
     drop(saved);
     Ok(())
+}
+
+/// Let the terminal driver finish switching back to canonical input.
+///
+/// BSD-derived kernels (including macOS) mark pending input for retyping
+/// (`PENDIN`) whenever canonical mode is turned back on, and clear the mark
+/// the next time pending input is counted. Counting it here leaves the
+/// terminal attributes exactly as they were before raw mode. Elsewhere the
+/// query only reports the pending byte count.
+fn settle_pending_input(fd: RawFd) {
+    let mut pending: libc::c_int = 0;
+    // SAFETY: valid descriptor and output storage for FIONREAD.
+    unsafe { libc::ioctl(fd, libc::FIONREAD, &raw mut pending) };
 }
 
 // Keeps the same signature as the Windows implementation, which can fail.
