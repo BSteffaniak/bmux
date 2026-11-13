@@ -382,7 +382,7 @@ url = { version = "2.5.8", default-features = false }
 switchy = { version = "0.5.0", package = "switchy", default-features = false }
 
 moosicbox_log_runtime = { version = "0.5.0", package = "moosicbox_log_runtime", default-features = false }
-moosicbox_log_watch   = { version = "0.5.0", package = "moosicbox_log_watch", default-features = false }
+moosicbox_log_watch   = { git = "https://github.com/MoosicBox/MoosicBox", branch = "master", default-features = false }
 
 git_sshripped_recipient    = { version = "0.10.0", default-features = false }
 git_sshripped_ssh_agent    = { version = "0.10.0", default-features = false }
@@ -508,8 +508,15 @@ serial_test = { version = "4.0.1" }
 [profile.dev.package.sha2]
 opt-level = 3
 
-# [patch.crates-io]
-# moosicbox_log_watch = { path = "../MoosicBox/packages/log_watch" }
+# moosicbox_log_watch follows MoosicBox master and names the bmux crates it
+# uses by their crates.io versions; resolve those to this workspace so one
+# copy of each is built.
+[patch.crates-io]
+bmux_keyboard       = { path = "packages/keyboard" }
+bmux_terminal       = { path = "packages/terminal" }
+bmux_text_edit      = { path = "packages/text-edit" }
+bmux_tui            = { path = "packages/tui" }
+bmux_tui_components = { path = "packages/tui-components" }
 
 # [patch."https://github.com/MoosicBox/MoosicBox"]
 # moosicbox_log_runtime = { path = "../MoosicBox/packages/log_runtime" }

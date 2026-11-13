@@ -1512,8 +1512,8 @@ dependencies = [
  "bmux_sandbox_harness",
  "bmux_server",
  "bmux_terminal_protocol",
- "bmux_tui 0.0.1-alpha.4",
- "bmux_tui_components 0.0.1-alpha.4",
+ "bmux_tui",
+ "bmux_tui_components",
  "bmux_tui_runtime",
 ]
 
@@ -1522,7 +1522,7 @@ name = "bmux-live-relay"
 version = "0.0.1-alpha.4"
 dependencies = [
  "axum",
- "bmux_tui 0.0.1-alpha.4",
+ "bmux_tui",
  "bmux_web_renderer",
  "futures-util",
  "libc",
@@ -1605,7 +1605,7 @@ dependencies = [
  "bmux_terminal",
  "bmux_terminal_grid",
  "bmux_terminal_protocol",
- "bmux_tui 0.0.1-alpha.4",
+ "bmux_tui",
  "futures-util",
  "image",
  "tokio",
@@ -1643,7 +1643,7 @@ name = "bmux_bench"
 version = "0.0.1-alpha.4"
 dependencies = [
  "bmux_terminal_grid",
- "bmux_tui 0.0.1-alpha.4",
+ "bmux_tui",
  "libc",
  "serde",
  "serde_json",
@@ -1657,8 +1657,8 @@ version = "0.0.1-alpha.4"
 dependencies = [
  "bmux_bench",
  "bmux_terminal",
- "bmux_tui 0.0.1-alpha.4",
- "bmux_tui_components 0.0.1-alpha.4",
+ "bmux_tui",
+ "bmux_tui_components",
  "clap",
  "libc",
  "serde_json",
@@ -1672,16 +1672,16 @@ dependencies = [
  "bmux_client",
  "bmux_codec",
  "bmux_config",
- "bmux_keyboard 0.0.1-alpha.4",
+ "bmux_keyboard",
  "bmux_pane_runtime_plugin_api",
  "bmux_plugin",
  "bmux_plugin_sdk",
  "bmux_presentation_state",
  "bmux_sessions_plugin_api",
  "bmux_terminal",
- "bmux_text_edit 0.0.1-alpha.4",
- "bmux_tui 0.0.1-alpha.4",
- "bmux_tui_components 0.0.1-alpha.4",
+ "bmux_text_edit",
+ "bmux_tui",
+ "bmux_tui_components",
  "bmux_tui_runtime",
  "bmux_web_renderer",
  "futures-util",
@@ -1756,7 +1756,7 @@ dependencies = [
  "bmux_image",
  "bmux_ipc",
  "bmux_keybind",
- "bmux_keyboard 0.0.1-alpha.4",
+ "bmux_keyboard",
  "bmux_pane_runtime_plugin",
  "bmux_pane_runtime_plugin_api",
  "bmux_performance_plugin",
@@ -1791,10 +1791,10 @@ dependencies = [
  "bmux_terminal",
  "bmux_terminal_grid",
  "bmux_terminal_protocol",
- "bmux_text_edit 0.0.1-alpha.4",
+ "bmux_text_edit",
  "bmux_theme_plugin",
- "bmux_tui 0.0.1-alpha.4",
- "bmux_tui_components 0.0.1-alpha.4",
+ "bmux_tui",
+ "bmux_tui_components",
  "bmux_visual_adapters_plugin_renderer",
  "bmux_web_host",
  "bmux_web_renderer",
@@ -1858,7 +1858,7 @@ dependencies = [
  "bmux_codec",
  "bmux_config",
  "bmux_ipc",
- "bmux_keyboard 0.0.1-alpha.4",
+ "bmux_keyboard",
  "bmux_perf_telemetry",
  "bmux_plugin_sdk",
  "bmux_server",
@@ -1990,7 +1990,7 @@ dependencies = [
  "bmux_attach_pipeline",
  "bmux_client",
  "bmux_cluster_plugin_api",
- "bmux_keyboard 0.0.1-alpha.4",
+ "bmux_keyboard",
  "bmux_terminal_grid",
  "serde_json",
  "sha2 0.11.1",
@@ -2097,7 +2097,7 @@ dependencies = [
  "bmux_config",
  "bmux_connections_plugin_api",
  "bmux_ipc",
- "bmux_keyboard 0.0.1-alpha.4",
+ "bmux_keyboard",
  "bmux_pane_runtime_plugin",
  "bmux_pane_runtime_plugin_api",
  "bmux_permissions_plugin",
@@ -2369,7 +2369,7 @@ dependencies = [
  "bmux_attach_layout_protocol",
  "bmux_attach_pipeline",
  "bmux_client",
- "bmux_tui 0.0.1-alpha.4",
+ "bmux_tui",
  "uuid",
 ]
 
@@ -2386,7 +2386,7 @@ version = "0.0.1-alpha.4"
 dependencies = [
  "bmux_attach_image_protocol",
  "bmux_ipc",
- "bmux_tui 0.0.1-alpha.4",
+ "bmux_tui",
  "image",
  "png",
  "serde",
@@ -2421,12 +2421,6 @@ dependencies = [
 
 [[package]]
 name = "bmux_keyboard"
-version = "0.0.1-alpha.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4661ea5b4cf35c5b35267589ab1850f348c96591b6758d5e80194ba72faeb108"
-
-[[package]]
-name = "bmux_keyboard"
 version = "0.0.1-alpha.4"
 dependencies = [
  "serde",
@@ -2438,7 +2432,7 @@ version = "0.0.1-alpha.4"
 dependencies = [
  "bmux_mermaid_render",
  "bmux_syntax_render",
- "bmux_tui 0.0.1-alpha.4",
+ "bmux_tui",
  "hyperchad_color",
  "hyperchad_markdown",
  "hyperchad_transformer",
@@ -2599,7 +2593,7 @@ dependencies = [
  "bmux_plugin",
  "bmux_plugin_sdk",
  "bmux_server",
- "bmux_tui 0.0.1-alpha.4",
+ "bmux_tui",
  "bmux_tui_runtime",
  "serde",
  "serde_json",
@@ -2691,7 +2685,7 @@ dependencies = [
  "bmux_contexts_plugin_api",
  "bmux_ipc",
  "bmux_keybind",
- "bmux_keyboard 0.0.1-alpha.4",
+ "bmux_keyboard",
  "bmux_pane_runtime_plugin_api",
  "bmux_performance_plugin_api",
  "bmux_performance_state",
@@ -2747,11 +2741,11 @@ version = "0.0.1-alpha.4"
 dependencies = [
  "bmux_codec",
  "bmux_ipc",
- "bmux_keyboard 0.0.1-alpha.4",
+ "bmux_keyboard",
  "bmux_perf_telemetry",
  "bmux_plugin_runtime",
  "bmux_plugin_sdk",
- "bmux_tui 0.0.1-alpha.4",
+ "bmux_tui",
  "libc",
  "libloading 0.9.0",
  "semver",
@@ -2847,8 +2841,8 @@ name = "bmux_presenter"
 version = "0.0.1-alpha.4"
 dependencies = [
  "bmux_markdown",
- "bmux_tui 0.0.1-alpha.4",
- "bmux_tui_components 0.0.1-alpha.4",
+ "bmux_tui",
+ "bmux_tui_components",
  "bmux_web_renderer",
  "image",
  "pulldown-cmark",
@@ -2871,7 +2865,7 @@ dependencies = [
  "bmux_fonts",
  "bmux_image",
  "bmux_ipc",
- "bmux_keyboard 0.0.1-alpha.4",
+ "bmux_keyboard",
  "bmux_mermaid_render",
  "bmux_playbook",
  "bmux_playbook_plugin_api",
@@ -2882,9 +2876,9 @@ dependencies = [
  "bmux_presenter_runtime",
  "bmux_syntax_render",
  "bmux_terminal",
- "bmux_text_edit 0.0.1-alpha.4",
- "bmux_tui 0.0.1-alpha.4",
- "bmux_tui_components 0.0.1-alpha.4",
+ "bmux_text_edit",
+ "bmux_tui",
+ "bmux_tui_components",
  "bmux_tui_runtime",
  "bmux_web_host",
  "bmux_web_renderer",
@@ -2922,7 +2916,7 @@ version = "0.0.1-alpha.4"
 dependencies = [
  "bmux_mermaid_render",
  "bmux_presenter",
- "bmux_tui 0.0.1-alpha.4",
+ "bmux_tui",
  "image",
  "pulldown-cmark",
  "rcgen",
@@ -3003,7 +2997,7 @@ dependencies = [
  "bmux_config",
  "bmux_fonts",
  "bmux_ipc",
- "bmux_keyboard 0.0.1-alpha.4",
+ "bmux_keyboard",
  "bmux_pane_runtime_plugin_api",
  "bmux_plugin",
  "bmux_plugin_sdk",
@@ -3189,8 +3183,8 @@ dependencies = [
  "bmux_plugin_sdk",
  "bmux_presentation_state",
  "bmux_tabs_plugin_api",
- "bmux_tui 0.0.1-alpha.4",
- "bmux_tui_components 0.0.1-alpha.4",
+ "bmux_tui",
+ "bmux_tui_components",
  "tokio",
  "toml 1.1.8+spec-1.1.0",
  "tracing",
@@ -3267,7 +3261,7 @@ dependencies = [
 name = "bmux_syntax_render"
 version = "0.0.1-alpha.4"
 dependencies = [
- "bmux_tui 0.0.1-alpha.4",
+ "bmux_tui",
  "syntect",
  "two-face",
 ]
@@ -3277,15 +3271,15 @@ name = "bmux_tab_bar_plugin"
 version = "0.0.1-alpha.4"
 dependencies = [
  "bmux_attach_view_protocol",
- "bmux_keyboard 0.0.1-alpha.4",
+ "bmux_keyboard",
  "bmux_plugin",
  "bmux_plugin_sdk",
  "bmux_presentation_state",
  "bmux_tab_bar_plugin_api",
  "bmux_tabs_plugin_api",
- "bmux_text_edit 0.0.1-alpha.4",
- "bmux_tui 0.0.1-alpha.4",
- "bmux_tui_components 0.0.1-alpha.4",
+ "bmux_text_edit",
+ "bmux_tui",
+ "bmux_tui_components",
  "bmux_workspaces_plugin_api",
  "serde",
  "serde_json",
@@ -3353,7 +3347,7 @@ dependencies = [
 name = "bmux_terminal"
 version = "0.0.1-alpha.4"
 dependencies = [
- "bmux_keyboard 0.0.1-alpha.4",
+ "bmux_keyboard",
  "futures-core",
  "libc",
  "windows-sys 0.61.2",
@@ -3364,7 +3358,7 @@ name = "bmux_terminal_grid"
 version = "0.0.1-alpha.4"
 dependencies = [
  "bmux_terminal_protocol",
- "bmux_tui 0.0.1-alpha.4",
+ "bmux_tui",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
@@ -3381,20 +3375,9 @@ dependencies = [
 
 [[package]]
 name = "bmux_text_edit"
-version = "0.0.1-alpha.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5f42e280f55b45b82e92df82cb89357a536f97a73b7b017fba0729e3b246c90d"
-dependencies = [
- "bmux_keyboard 0.0.1-alpha.3",
- "unicode-segmentation",
- "unicode-width",
-]
-
-[[package]]
-name = "bmux_text_edit"
 version = "0.0.1-alpha.4"
 dependencies = [
- "bmux_keyboard 0.0.1-alpha.4",
+ "bmux_keyboard",
  "serde",
  "serde_json",
  "unicode-segmentation",
@@ -3428,28 +3411,13 @@ dependencies = [
 
 [[package]]
 name = "bmux_tui"
-version = "0.0.1-alpha.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f2cd9f464fb6fe9098cbd8499533f4dfa31002b77bac0b1ec17b7fcbc2087663"
-dependencies = [
- "bmux_keyboard 0.0.1-alpha.3",
- "bmux_text_edit 0.0.1-alpha.3",
- "image",
- "libc",
- "unicode-segmentation",
- "unicode-width",
- "zeroize",
-]
-
-[[package]]
-name = "bmux_tui"
 version = "0.0.1-alpha.4"
 dependencies = [
  "bmux_color",
- "bmux_keyboard 0.0.1-alpha.4",
+ "bmux_keyboard",
  "bmux_terminal",
  "bmux_terminal_protocol",
- "bmux_text_edit 0.0.1-alpha.4",
+ "bmux_text_edit",
  "futures-util",
  "image",
  "libc",
@@ -3462,22 +3430,13 @@ dependencies = [
 
 [[package]]
 name = "bmux_tui_components"
-version = "0.0.1-alpha.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "760bc3abf88b1eaa1c4d0fd3f4953c72ddbbeb405764ec87979dc33244bb22ef"
-dependencies = [
- "bmux_tui 0.0.1-alpha.3",
-]
-
-[[package]]
-name = "bmux_tui_components"
 version = "0.0.1-alpha.4"
 dependencies = [
  "bmux_color",
- "bmux_keyboard 0.0.1-alpha.4",
+ "bmux_keyboard",
  "bmux_terminal_grid",
- "bmux_text_edit 0.0.1-alpha.4",
- "bmux_tui 0.0.1-alpha.4",
+ "bmux_text_edit",
+ "bmux_tui",
  "bmux_tui_runtime",
  "chrono",
  "serde",
@@ -3493,10 +3452,10 @@ name = "bmux_tui_components_gallery"
 version = "0.0.1-alpha.4"
 dependencies = [
  "anyhow",
- "bmux_keyboard 0.0.1-alpha.4",
- "bmux_text_edit 0.0.1-alpha.4",
- "bmux_tui 0.0.1-alpha.4",
- "bmux_tui_components 0.0.1-alpha.4",
+ "bmux_keyboard",
+ "bmux_text_edit",
+ "bmux_tui",
+ "bmux_tui_components",
  "bmux_tui_runtime",
  "tokio",
 ]
@@ -3506,10 +3465,10 @@ name = "bmux_tui_components_inputs"
 version = "0.0.1-alpha.4"
 dependencies = [
  "anyhow",
- "bmux_keyboard 0.0.1-alpha.4",
- "bmux_text_edit 0.0.1-alpha.4",
- "bmux_tui 0.0.1-alpha.4",
- "bmux_tui_components 0.0.1-alpha.4",
+ "bmux_keyboard",
+ "bmux_text_edit",
+ "bmux_tui",
+ "bmux_tui_components",
  "chrono",
 ]
 
@@ -3518,9 +3477,9 @@ name = "bmux_tui_components_layout_playground"
 version = "0.0.1-alpha.4"
 dependencies = [
  "anyhow",
- "bmux_keyboard 0.0.1-alpha.4",
- "bmux_tui 0.0.1-alpha.4",
- "bmux_tui_components 0.0.1-alpha.4",
+ "bmux_keyboard",
+ "bmux_tui",
+ "bmux_tui_components",
 ]
 
 [[package]]
@@ -3528,9 +3487,9 @@ name = "bmux_tui_components_navigation"
 version = "0.0.1-alpha.4"
 dependencies = [
  "anyhow",
- "bmux_keyboard 0.0.1-alpha.4",
- "bmux_tui 0.0.1-alpha.4",
- "bmux_tui_components 0.0.1-alpha.4",
+ "bmux_keyboard",
+ "bmux_tui",
+ "bmux_tui_components",
 ]
 
 [[package]]
@@ -3538,11 +3497,11 @@ name = "bmux_tui_runtime"
 version = "0.0.1-alpha.4"
 dependencies = [
  "bmux_image",
- "bmux_keyboard 0.0.1-alpha.4",
+ "bmux_keyboard",
  "bmux_terminal_protocol",
- "bmux_text_edit 0.0.1-alpha.4",
- "bmux_tui 0.0.1-alpha.4",
- "bmux_tui_components 0.0.1-alpha.4",
+ "bmux_text_edit",
+ "bmux_tui",
+ "bmux_tui_components",
  "futures-util",
  "tokio",
  "zeroize",
@@ -3562,7 +3521,7 @@ name = "bmux_web_host"
 version = "0.0.1-alpha.4"
 dependencies = [
  "anyhow",
- "bmux_tui 0.0.1-alpha.4",
+ "bmux_tui",
  "bmux_web_renderer",
  "flate2",
  "getrandom 0.4.3",
@@ -3583,8 +3542,8 @@ name = "bmux_web_renderer"
 version = "0.0.1-alpha.4"
 dependencies = [
  "bmux_codec",
- "bmux_keyboard 0.0.1-alpha.4",
- "bmux_tui 0.0.1-alpha.4",
+ "bmux_keyboard",
+ "bmux_tui",
  "js-sys",
  "serde",
  "serde_json",
@@ -3693,7 +3652,7 @@ dependencies = [
  "bmux_pane_runtime_plugin_api",
  "bmux_plugin_sdk",
  "bmux_terminal_protocol",
- "bmux_tui 0.0.1-alpha.4",
+ "bmux_tui",
  "bterm_native_platform",
  "bterm_native_renderer",
  "clap",
@@ -3715,7 +3674,7 @@ dependencies = [
  "accesskit_winit",
  "arboard",
  "bmux_frontend_runtime",
- "bmux_tui 0.0.1-alpha.4",
+ "bmux_tui",
  "raw-window-handle",
  "thiserror 2.0.21",
  "winit",
@@ -3726,7 +3685,7 @@ name = "bterm_native_renderer"
 version = "0.0.1-alpha.4"
 dependencies = [
  "bmux_fonts",
- "bmux_tui 0.0.1-alpha.4",
+ "bmux_tui",
  "bterm_native_platform",
  "bytemuck",
  "fontdb",
@@ -4575,33 +4534,6 @@ name = "crossbeam-utils"
 version = "0.8.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a31eee39dddec8330830986fcd7625edb5a24ec90ea038215273bbc3adb08ac6"
-
-[[package]]
-name = "crossterm"
-version = "0.29.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d8b9f2e4c67f833b660cdb0a3523065869fb35570177239812ed4c905aeff87b"
-dependencies = [
- "bitflags 2.13.2",
- "crossterm_winapi",
- "derive_more 2.1.1",
- "document-features",
- "mio",
- "parking_lot",
- "rustix 1.1.5",
- "signal-hook",
- "signal-hook-mio",
- "winapi",
-]
-
-[[package]]
-name = "crossterm_winapi"
-version = "0.9.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "acdd7c62a3665c7f6830a51635d9ac9b23ed385797f70a83bb8bafe9c572ab2b"
-dependencies = [
- "winapi",
-]
 
 [[package]]
 name = "crunchy"
@@ -8323,13 +8255,12 @@ dependencies = [
 [[package]]
 name = "moosicbox_log_watch"
 version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "367bafe9922cf672cff48682870ce6a64f3e6181072aa5a3bdc13e812e155f84"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#ac3fca6c708adaf3f1689b4a0011110e2f6a22b5"
 dependencies = [
  "anyhow",
- "bmux_tui 0.0.1-alpha.3",
- "bmux_tui_components 0.0.1-alpha.2",
- "crossterm",
+ "bmux_terminal",
+ "bmux_tui",
+ "bmux_tui_components",
  "regex",
  "serde",
  "serde_json",
@@ -11726,27 +11657,6 @@ name = "shlex"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
-
-[[package]]
-name = "signal-hook"
-version = "0.3.18"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d881a16cf4426aa584979d30bd82cb33429027e42122b169753d6ef1085ed6e2"
-dependencies = [
- "libc",
- "signal-hook-registry",
-]
-
-[[package]]
-name = "signal-hook-mio"
-version = "0.2.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b75a19a7a740b25bc7944bdee6172368f988763b744e3d4dfe753f6b4ece40cc"
-dependencies = [
- "libc",
- "mio",
- "signal-hook",
-]
 
 [[package]]
 name = "signal-hook-registry"
