@@ -57,7 +57,7 @@ without
 ### Interactive pointer controls
 
 ```sh
-cargo run -p bmux_tui_runtime --example pointer_controls --no-default-features --features crossterm
+cargo run -p bmux_tui_runtime --example pointer_controls --no-default-features --features terminal-io
 ```
 
 The example uses `TerminalPresenter`, `PointerContextPresenter`, and one
@@ -82,7 +82,7 @@ The example's in-file tests exercise real standard-presenter commits, control
 actions and editing, capture release, modal exclusion, stationary-pointer
 overrides, disabled-state changes, and restoration error reporting. Run them
 with `cargo test -p bmux_tui_runtime --example pointer_controls
---no-default-features --features crossterm`.
+--no-default-features --features terminal-io`.
 
 ## Inline protocol examples
 
@@ -137,7 +137,7 @@ and terminal modes are restored on exit.
 
 With the `images` feature, `ImageTerminalPresenter` connects protocol-neutral
 `bmux_tui::image::ImageContribution` values to BMUX's host image compositor.
-All three protocols and Crossterm are enabled by default. With defaults
+All three protocols and terminal I/O are enabled by default. With defaults
 disabled,
 select protocols through `image-kitty`, `image-sixel`, and `image-iterm2`.
 
@@ -164,12 +164,12 @@ See [`../../docs/tui-runtime.md`](../../docs/tui-runtime.md) for the full archit
 
 ## Cargo features
 
-Defaults enable `all-protocols` and `crossterm` independently. Use
+Defaults enable `all-protocols` and `terminal-io` independently. Use
 `--no-default-features`
 (or `default-features = false` in a dependency declaration) for a minimal build,
 then opt into individual features as needed.
 
-- `crossterm`: managed Crossterm input and terminal event conversion.
+- `terminal-io`: managed `bmux_terminal` input and terminal event conversion.
 - `images`: generic image-aware presentation without enabling a host protocol.
 - `image-kitty`: Kitty graphics output.
 - `image-sixel`: Sixel output.

@@ -21,11 +21,11 @@ bmux = { version = "0.0.1-alpha.1", default-features = false, features = [
 
 These are crate re-exports, not another UI framework or backend. Backend and
 component selection remain features of the underlying crates. For example,
-`bmux_tui_runtime/crossterm` enables managed input and
+`bmux_tui_runtime/terminal-io` enables managed input and
 `bmux_tui_components/button` enables the button API. Enable those features on
 direct dependencies when needed; Cargo unifies them with the re-exported crates.
 Components have no default component set. The runtime currently defaults to
-Crossterm and image protocols; the umbrella export does not imply a minimal
+terminal I/O and image protocols; the umbrella export does not imply a minimal
 backend configuration.
 
 Pointer intent does not guarantee terminal support. In particular, the neutral

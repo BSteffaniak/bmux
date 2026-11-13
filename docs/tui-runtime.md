@@ -315,7 +315,7 @@ presentation.
 
 ## Managed terminal input
 
-With the `crossterm` feature, the runtime can own a blocking terminal reader
+With the `terminal-io` feature, the runtime can own a blocking terminal reader
 thread. It forwards events through bounded terminal admission. Dropping the
 input source requests shutdown and detaches a reader blocked in the
 operating-system backend; the thread exits after the next event or when runtime
@@ -333,7 +333,7 @@ interaction metadata only after both outputs succeed.
 Image support is split into additive Cargo features: `images` enables the
 presenter and individual `image-kitty`, `image-sixel`, and `image-iterm2`
 features enable host protocols. Defaults independently enable `all-protocols`
-(all three image protocols) and `crossterm`. Text-only runtime users can retain
+(all three image protocols) and `terminal-io`. Text-only runtime users can retain
 a minimal
 dependency graph with `default-features = false` (`--no-default-features` for
 Cargo commands).
