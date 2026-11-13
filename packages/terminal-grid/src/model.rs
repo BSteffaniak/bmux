@@ -1904,6 +1904,13 @@ impl TerminalGrid {
         rows
     }
 
+    /// The main screen's rows, by reference, when they are all its content: no history and no
+    /// unfinished line above the screen.
+    pub(crate) fn screen_only_main_rows(&self) -> Option<&VecDeque<PhysicalRow>> {
+        (self.main_history.is_empty() && self.pending_history_cells.is_empty())
+            .then_some(&self.main_rows)
+    }
+
     /// Materialize the tail of retained main-screen content rows.
     #[must_use]
     pub fn main_content_tail_rows(&self, max_rows: usize) -> Vec<PhysicalRow> {

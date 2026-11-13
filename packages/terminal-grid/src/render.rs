@@ -52,21 +52,38 @@ pub fn visible_text_trimmed(grid: &TerminalGrid, scrollback_offset: usize, rows:
 /// the content are omitted.
 #[must_use]
 pub fn content_text(grid: &TerminalGrid) -> String {
+    if grid.mode() == crate::GridMode::Main
+        && let Some(rows) = grid.screen_only_main_rows()
+    {
+        return rows_text(rows, grid.width());
+    }
     let rows = match grid.mode() {
         crate::GridMode::Main => grid.main_content_rows(),
         crate::GridMode::Alternate => grid.display_rows(0, grid.height()),
     };
+    rows_text(rows.iter(), grid.width())
+}
+
+/// Plain text of `rows`, soft-wrapped rows joined into their logical lines, trailing blanks
+/// dropped from each line and blank lines from the end.
+fn rows_text<'a>(rows: impl IntoIterator<Item = &'a PhysicalRow>, width: usize) -> String {
     let mut text = String::new();
     let mut line = String::new();
-    for row in &rows {
+    for row in rows {
         // A soft-wrapped row was written up to the edge; rows do not store trailing spaces, so
         // its unstored tail is the spaces before the wrap.
-        let width = if row.wrapped() {
-            grid.width().max(row.cells().len())
+        let row_width = if row.wrapped() {
+            width.max(row.cells().len())
         } else {
             row.cells().len()
         };
-        line.push_str(&row_text(row, width));
+        for col in 0..row_width {
+            match row.cells().get(col) {
+                Some(cell) if !cell.is_wide_continuation() => line.push_str(cell.text()),
+                Some(_) => {}
+                None => line.push(' '),
+            }
+        }
         if !row.wrapped() {
             text.push_str(line.trim_end());
             text.push('\n');
