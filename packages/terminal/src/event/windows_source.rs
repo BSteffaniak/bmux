@@ -259,10 +259,11 @@ fn translate_key(surrogate: &mut Option<u16>, record: &KEY_EVENT_RECORD) -> Opti
                 return None;
             };
             let character = char::decode_utf16([high, unit]).next()?.ok()?;
-            Some(Event::Key(KeyEvent::new_with_kind(
+            // Consoles split a pair across a key-down and a key-up record, so
+            // the completed character is always a press.
+            Some(Event::Key(KeyEvent::new(
                 KeyCode::Char(character),
                 modifiers(record.dwControlKeyState),
-                kind(record),
             )))
         }
     }
@@ -495,14 +496,11 @@ mod tests {
             translate_key(&mut surrogate, &record(0xe7, 0xde00, true, 0)),
             Some(Event::Key(KeyEvent::new(KeyCode::Char('😀'), KeyModifiers::NONE)))
         );
-        assert!(translate_key(&mut surrogate, &record(0xe7, 0xd83d, false, 0)).is_none());
+        // A pair split across key-down and key-up records is one press.
+        assert!(translate_key(&mut surrogate, &record(0xe7, 0xd83d, true, 0)).is_none());
         assert_eq!(
             translate_key(&mut surrogate, &record(0xe7, 0xde00, false, 0)),
-            Some(Event::Key(KeyEvent::new_with_kind(
-                KeyCode::Char('😀'),
-                KeyModifiers::NONE,
-                KeyEventKind::Release
-            )))
+            Some(Event::Key(KeyEvent::new(KeyCode::Char('😀'), KeyModifiers::NONE)))
         );
     }
 }
