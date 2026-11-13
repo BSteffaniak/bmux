@@ -9,6 +9,12 @@ authority.
 
 - `parse_markdown_document` returns parser-neutral semantic events and original
   UTF-8 byte ranges, including images, links, tables, math, alerts, and code fences.
+  `parse_markdown_document_with` takes `MarkdownParseOptions` (smart punctuation).
+- `MarkdownRenderOptions::with_presentation` takes a `MarkdownPresentation`:
+  unordered list bullet, marker gap, code block frame (`Framed` or `None`),
+  blockquote bar, table header alignment, and smart punctuation. Defaults match
+  the standard terminal look; render, provenance, and streaming parses all use
+  the presentation's punctuation setting.
 - `render_markdown` takes `MarkdownRenderOptions` and returns `MarkdownRenderResult`:
   terminal lines, semantic contributions, contribution/code geometry, and anchors.
 - `MarkdownRenderResult` lazily retains selection provenance, code selections,

@@ -26,6 +26,9 @@
 //! * Dangerous HTML is escaped by parser-level XSS protection; safe raw HTML is
 //!   displayed as text.
 //! * Footnotes and emoji aliases are intentionally disabled.
+//! * List markers, marker spacing, blockquote bars, code block frames, table
+//!   header alignment, and typographic punctuation are configurable through
+//!   [`MarkdownPresentation`].
 //! * Incomplete streaming input uses the same rendering path as finalized input;
 //!   incomplete fences, inline syntax, tables, and lists remain best-effort.
 
@@ -335,6 +338,95 @@ pub enum MermaidRenderMode {
     Inline,
 }
 
+/// Frame drawn around fenced and indented code blocks.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum MarkdownCodeBlockFrame {
+    /// Draw a header row with the language, a bar before every code row, and
+    /// a footer row.
+    #[default]
+    Framed,
+    /// Render code rows at the block's column without header, footer, or bar.
+    ///
+    /// Code remains syntax-highlighted and separated from surrounding blocks
+    /// by blank rows. No header or footer geometry is recorded because no
+    /// fence rows are displayed.
+    None,
+}
+
+/// Alignment of table header cells in bordered tables.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum MarkdownTableHeaderAlignment {
+    /// Header cells follow their column's alignment.
+    #[default]
+    Column,
+    /// Header cells are always centered.
+    Center,
+}
+
+/// Presentation choices for Markdown structure glyphs and spacing.
+///
+/// Every glyph is measured in terminal cells. Control characters in glyph
+/// strings are removed before rendering. A prefix wider than the available
+/// width is clipped at grapheme boundaries so content keeps at least one cell.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct MarkdownPresentation {
+    /// Marker glyph for unordered list items. Defaults to `•`.
+    pub list_bullet: String,
+    /// Spaces after an unordered or ordered list marker. Defaults to `2`.
+    pub list_marker_gap: u8,
+    /// Code block frame. Defaults to [`MarkdownCodeBlockFrame::Framed`].
+    pub code_block_frame: MarkdownCodeBlockFrame,
+    /// Blockquote bar glyph, followed by one space. Defaults to `│`.
+    pub blockquote_bar: String,
+    /// Bordered-table header cell alignment. Defaults to
+    /// [`MarkdownTableHeaderAlignment::Column`].
+    pub table_header_alignment: MarkdownTableHeaderAlignment,
+    /// Whether quotes, apostrophes, dashes, and ellipses are rendered as
+    /// typographic punctuation. Defaults to `true`.
+    pub smart_punctuation: bool,
+}
+
+impl Default for MarkdownPresentation {
+    /// Create the default terminal Markdown presentation.
+    fn default() -> Self {
+        Self {
+            list_bullet: "•".to_owned(),
+            list_marker_gap: 2,
+            code_block_frame: MarkdownCodeBlockFrame::Framed,
+            blockquote_bar: "│".to_owned(),
+            table_header_alignment: MarkdownTableHeaderAlignment::Column,
+            smart_punctuation: true,
+        }
+    }
+}
+
+impl MarkdownPresentation {
+    /// Return the parser options implied by this presentation.
+    #[must_use]
+    pub const fn parse_options(&self) -> MarkdownParseOptions {
+        MarkdownParseOptions {
+            smart_punctuation: self.smart_punctuation,
+        }
+    }
+}
+
+/// Options controlling Markdown parsing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct MarkdownParseOptions {
+    /// Whether quotes, apostrophes, dashes, and ellipses become typographic
+    /// punctuation. Defaults to `true`.
+    pub smart_punctuation: bool,
+}
+
+impl Default for MarkdownParseOptions {
+    /// Create default Markdown parse options.
+    fn default() -> Self {
+        Self {
+            smart_punctuation: true,
+        }
+    }
+}
+
 /// Options controlling terminal Markdown rendering.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct MarkdownRenderOptions {
@@ -366,6 +458,8 @@ pub struct MarkdownRenderOptions {
     pub details_interactive: bool,
     /// Explicit disclosure state keyed by stable details contribution identity.
     pub details_open: BTreeMap<String, bool>,
+    /// Structure glyphs, spacing, and punctuation presentation.
+    pub presentation: MarkdownPresentation,
 }
 
 impl Default for MarkdownRenderOptions {
@@ -386,6 +480,7 @@ impl Default for MarkdownRenderOptions {
             link_destination_presentation: MarkdownLinkDestinationPresentation::LabelOnly,
             details_interactive: false,
             details_open: BTreeMap::new(),
+            presentation: MarkdownPresentation::default(),
         }
     }
 }
@@ -468,6 +563,16 @@ impl MarkdownRenderOptions {
     pub fn with_rich_reserved_rows(mut self, image_rows: u16, mermaid_rows: u16) -> Self {
         self.image_reserved_rows = image_rows.max(1);
         self.mermaid_reserved_rows = mermaid_rows.max(1);
+        self
+    }
+
+    /// Return options with custom structure glyphs, spacing, and punctuation.
+    ///
+    /// The presentation participates in option equality and the layout
+    /// signature, so changing it invalidates retained renders.
+    #[must_use]
+    pub fn with_presentation(mut self, presentation: MarkdownPresentation) -> Self {
+        self.presentation = presentation;
         self
     }
 
@@ -754,9 +859,22 @@ pub enum MarkdownLinkKind {
     Unresolved,
 }
 
-/// Parse Markdown into renderer-owned source-order semantic events.
+/// Parse Markdown into renderer-owned source-order semantic events using
+/// default [`MarkdownParseOptions`].
 #[must_use]
 pub fn parse_markdown_document(markdown: &str) -> MarkdownDocument {
+    parse_markdown_document_with(markdown, &MarkdownParseOptions::default())
+}
+
+/// Parse Markdown into renderer-owned source-order semantic events.
+///
+/// Use the same options as the render whose source provenance the document
+/// describes, so parsed text agrees with the rendered text.
+#[must_use]
+pub fn parse_markdown_document_with(
+    markdown: &str,
+    parse_options: &MarkdownParseOptions,
+) -> MarkdownDocument {
     #[cfg(test)]
     MARKDOWN_PARSE_COUNT.set(MARKDOWN_PARSE_COUNT.get().saturating_add(1));
     let mut options = ParserOptions::empty();
@@ -764,7 +882,9 @@ pub fn parse_markdown_document(markdown: &str) -> MarkdownDocument {
     options.insert(ParserOptions::ENABLE_STRIKETHROUGH);
     options.insert(ParserOptions::ENABLE_TASKLISTS);
     options.insert(ParserOptions::ENABLE_FOOTNOTES);
-    options.insert(ParserOptions::ENABLE_SMART_PUNCTUATION);
+    if parse_options.smart_punctuation {
+        options.insert(ParserOptions::ENABLE_SMART_PUNCTUATION);
+    }
     options.insert(ParserOptions::ENABLE_HEADING_ATTRIBUTES);
     options.insert(ParserOptions::ENABLE_GFM);
     options.insert(ParserOptions::ENABLE_MATH);
@@ -1354,13 +1474,20 @@ struct MarkdownProvenanceInputs {
     source: String,
     /// Parsed semantic document, reused when the render already produced one.
     document: Option<MarkdownDocument>,
+    /// Parse options the render used, so a deferred parse matches it exactly.
+    parse_options: MarkdownParseOptions,
 }
 
 impl MarkdownProvenanceInputs {
     /// Return the parsed document, parsing `source` only if needed.
     fn document(&self) -> Cow<'_, MarkdownDocument> {
         self.document.as_ref().map_or_else(
-            || Cow::Owned(parse_markdown_document(&self.source)),
+            || {
+                Cow::Owned(parse_markdown_document_with(
+                    &self.source,
+                    &self.parse_options,
+                ))
+            },
             Cow::Borrowed,
         )
     }
@@ -1745,6 +1872,7 @@ impl MarkdownStreamingRenderState {
                 // Deferred: streaming tokens never parse the whole source unless
                 // a selection actually asks for provenance.
                 document: None,
+                parse_options: options.presentation.parse_options(),
             }),
             selection_source: markdown.to_owned(),
             selection_provenance: OnceLock::new(),
@@ -1833,7 +1961,8 @@ fn plain_paragraph_append_is_eligible(previous: &str, appended: &str) -> bool {
 pub fn render_markdown(markdown: &str, options: &MarkdownRenderOptions) -> MarkdownRenderResult {
     #[cfg(test)]
     let semantic_started = std::time::Instant::now();
-    let document = parse_markdown_document(markdown);
+    let parse_options = options.presentation.parse_options();
+    let document = parse_markdown_document_with(markdown, &parse_options);
     let mut selection_provenance = markdown_selection_provenance(&document);
     let details = collect_details_projections(markdown);
     let contributions = markdown_contributions(
@@ -1857,7 +1986,7 @@ pub fn render_markdown(markdown: &str, options: &MarkdownRenderOptions) -> Markd
     let projected_document = if destination_unchanged {
         document.clone()
     } else {
-        parse_markdown_document(projected_source)
+        parse_markdown_document_with(projected_source, &parse_options)
     };
     let projected_details_storage;
     let projected_details = if destination_unchanged {
@@ -1891,7 +2020,7 @@ pub fn render_markdown(markdown: &str, options: &MarkdownRenderOptions) -> Markd
     let final_document = if projected_markdown.as_ref() == projected_source {
         projected_document.clone()
     } else {
-        parse_markdown_document(&projected_markdown)
+        parse_markdown_document_with(&projected_markdown, &parse_options)
     };
     let (lines, mut geometry, heading_rows) =
         render_markdown_projection(&projected_markdown, options);
@@ -1948,6 +2077,7 @@ pub fn render_markdown(markdown: &str, options: &MarkdownRenderOptions) -> Markd
             source: markdown.to_owned(),
             // This render already parsed the source, so reuse it.
             document: Some(document.clone()),
+            parse_options,
         }
     });
     #[cfg(test)]
@@ -3338,7 +3468,10 @@ fn render_markdown_projection(
     MARKDOWN_PROJECTION_COUNT.set(MARKDOWN_PROJECTION_COUNT.get().saturating_add(1));
     let table_alignments = table_alignments(markdown);
     let alert_kinds = alert_kinds(markdown);
-    let container = markdown_to_container_with_options(markdown, hyperchad_markdown_options());
+    let container = markdown_to_container_with_options(
+        markdown,
+        hyperchad_markdown_options(options.presentation.smart_punctuation),
+    );
     let mut renderer = TerminalMarkdownRenderer::new(
         options.width,
         options.theme,
@@ -3347,6 +3480,7 @@ fn render_markdown_projection(
         alert_kinds,
         options.image_reserved_rows,
         options.mermaid_reserved_rows,
+        Rc::new(sanitized_presentation(&options.presentation)),
     );
     renderer.render_container_children(
         &container,
@@ -3905,13 +4039,13 @@ fn alert_kinds(markdown: &str) -> Vec<Option<BlockQuoteKind>> {
         .collect()
 }
 
-fn hyperchad_markdown_options() -> MarkdownOptions {
+fn hyperchad_markdown_options(smart_punctuation: bool) -> MarkdownOptions {
     MarkdownOptions {
         enable_tables: true,
         enable_strikethrough: true,
         enable_tasklists: true,
         enable_footnotes: false,
-        enable_smart_punctuation: true,
+        enable_smart_punctuation: smart_punctuation,
         emoji_enabled: false,
         xss_protection: true,
         syntax_highlighting: false,
@@ -4008,9 +4142,13 @@ struct TerminalMarkdownRenderer {
     mermaid_reserved_rows: usize,
     theme: MarkdownTheme,
     syntax: Option<SyntaxPalette>,
+    presentation: Rc<MarkdownPresentation>,
 }
 
 impl TerminalMarkdownRenderer {
+    // Each argument is an independent render input copied from the caller's
+    // options; grouping them would only rename the same inputs.
+    #[allow(clippy::too_many_arguments)]
     fn new(
         width: u16,
         theme: MarkdownTheme,
@@ -4019,6 +4157,7 @@ impl TerminalMarkdownRenderer {
         alert_kinds: Vec<Option<BlockQuoteKind>>,
         image_reserved_rows: u16,
         mermaid_reserved_rows: u16,
+        presentation: Rc<MarkdownPresentation>,
     ) -> Self {
         Self {
             width: usize::from(width.max(1)),
@@ -4042,6 +4181,7 @@ impl TerminalMarkdownRenderer {
             mermaid_reserved_rows: usize::from(mermaid_reserved_rows.max(1)),
             theme,
             syntax,
+            presentation,
         }
     }
 
@@ -4068,6 +4208,7 @@ impl TerminalMarkdownRenderer {
             mermaid_reserved_rows: self.mermaid_reserved_rows,
             theme: self.theme,
             syntax: self.syntax,
+            presentation: Rc::clone(&self.presentation),
         }
     }
 
@@ -4345,9 +4486,7 @@ impl TerminalMarkdownRenderer {
         let alert_kind = self.alert_kinds.get(blockquote_index).copied().flatten();
         self.next_blockquote_index
             .set(blockquote_index.saturating_add(1));
-        let prefix = Line::raw("│ ")
-            .viewport(0, self.width.saturating_sub(1))
-            .plain_text();
+        let prefix = self.bounded_prefix(&format!("{} ", self.presentation.blockquote_bar));
         let prefix_width = text_display_width(&prefix);
         let mut nested = self.nested(
             self.width.saturating_sub(prefix_width),
@@ -4387,18 +4526,25 @@ impl TerminalMarkdownRenderer {
         let language = container.data.get("language").map(String::as_str);
         let geometry_start = (language == Some("mermaid"))
             .then(|| (self.rows.len(), 0, self.geometry.borrow().len()));
-        let header = language.map_or_else(|| "┌─".to_owned(), |language| format!("┌─ {language}"));
+        let framed = self.presentation.code_block_frame == MarkdownCodeBlockFrame::Framed;
         let block_index = self.next_code_block_index.get();
         self.next_code_block_index
             .set(block_index.saturating_add(1));
-        let header_row = self.rows.len();
-        self.rows
-            .push(Line::from_spans(vec![Span::styled(header, border_style)]).truncate(self.width));
-        self.record_geometry(&format!("code-header:{block_index}"), header_row, 0);
+        if framed {
+            let header =
+                language.map_or_else(|| "┌─".to_owned(), |language| format!("┌─ {language}"));
+            let header_row = self.rows.len();
+            self.rows.push(
+                Line::from_spans(vec![Span::styled(header, border_style)]).truncate(self.width),
+            );
+            self.record_geometry(&format!("code-header:{block_index}"), header_row, 0);
+        }
 
-        let prefix = Line::raw("│ ")
-            .viewport(0, self.width.saturating_sub(1))
-            .plain_text();
+        let prefix = if framed {
+            self.bounded_prefix("│ ")
+        } else {
+            String::new()
+        };
         let prefix_width = text_display_width(&prefix);
         let nested_width = self.width.saturating_sub(prefix_width);
         let mut nested = self.nested(
@@ -4422,14 +4568,23 @@ impl TerminalMarkdownRenderer {
             code_rows.push(Line::default());
         }
         for line in code_rows {
-            let mut spans = vec![Span::styled(prefix.clone(), border_style)];
+            // Every code row keeps at least one span, even an empty one
+            // without a frame, so an empty block's row is never mistaken for
+            // a block separator or trimmed as a blank edge.
+            let mut spans = Vec::with_capacity(line.spans.len().saturating_add(1));
+            if !prefix.is_empty() || line.spans.is_empty() {
+                spans.push(Span::styled(prefix.clone(), border_style));
+            }
             spans.extend(line.spans);
             self.rows.push(Line::from_spans(spans));
         }
-        let footer_row = self.rows.len();
-        self.rows
-            .push(Line::from_spans(vec![Span::styled("└─", border_style)]).truncate(self.width));
-        self.record_geometry(&format!("code-footer:{block_index}"), footer_row, 0);
+        if framed {
+            let footer_row = self.rows.len();
+            self.rows.push(
+                Line::from_spans(vec![Span::styled("└─", border_style)]).truncate(self.width),
+            );
+            self.record_geometry(&format!("code-footer:{block_index}"), footer_row, 0);
+        }
         self.ensure_blank_line();
         if language == Some("mermaid") {
             while self
@@ -4454,6 +4609,16 @@ impl TerminalMarkdownRenderer {
                 contribution_id: format!("code-block:{block_index}"),
                 rects: Vec::new(),
             });
+    }
+
+    /// Clip a structure prefix so content keeps at least one cell.
+    ///
+    /// Clipping happens at grapheme boundaries, so a glyph wider than the
+    /// available width degrades to fewer cells rather than overflowing.
+    fn bounded_prefix(&self, prefix: &str) -> String {
+        Line::raw(prefix)
+            .viewport(0, self.width.saturating_sub(1))
+            .plain_text()
     }
 
     fn render_horizontal_rule(&mut self) {
@@ -4484,10 +4649,11 @@ impl TerminalMarkdownRenderer {
             0
         };
         for (index, child) in list_items.iter().enumerate() {
+            let gap = " ".repeat(usize::from(self.presentation.list_marker_gap));
             let marker = if ordered {
-                format!("{:>marker_digits$}.  ", index.saturating_add(1))
+                format!("{:>marker_digits$}.{gap}", index.saturating_add(1))
             } else {
-                "•  ".to_owned()
+                format!("{}{gap}", self.presentation.list_bullet)
             };
             self.render_prefixed_list_item(child, style, &marker);
         }
@@ -4495,9 +4661,7 @@ impl TerminalMarkdownRenderer {
     }
 
     fn render_prefixed_list_item(&mut self, item: &Container, style: TextStyle, marker: &str) {
-        let marker = Line::raw(marker)
-            .viewport(0, self.width.saturating_sub(1))
-            .plain_text();
+        let marker = self.bounded_prefix(marker);
         let marker_width = text_display_width(&marker);
         let nested_width = self.width.saturating_sub(marker_width);
         let mut nested = self.nested(
@@ -4528,7 +4692,7 @@ impl TerminalMarkdownRenderer {
 
     fn render_table(&mut self, container: &Container, style: TextStyle) {
         self.flush_line();
-        let rows = table_rows(container, style, self.theme);
+        let rows = table_rows(container, style, self.theme, &self.presentation);
         if rows.is_empty() {
             self.ensure_blank_line();
             return;
@@ -4553,6 +4717,10 @@ impl TerminalMarkdownRenderer {
             return;
         }
 
+        let header_alignments = match self.presentation.table_header_alignment {
+            MarkdownTableHeaderAlignment::Column => alignments.clone(),
+            MarkdownTableHeaderAlignment::Center => vec![Alignment::Center; column_count],
+        };
         let border_style = self.theme.table_border;
         self.rows
             .push(table_border_line('┌', '┬', '┐', &widths, border_style));
@@ -4563,7 +4731,11 @@ impl TerminalMarkdownRenderer {
                     &row.cells,
                     visual_row,
                     &widths,
-                    &alignments,
+                    if row.header {
+                        &header_alignments
+                    } else {
+                        &alignments
+                    },
                     border_style,
                     row.header.then_some(self.theme.strong),
                 ));
@@ -4745,6 +4917,17 @@ impl TerminalMarkdownRenderer {
     }
 }
 
+/// Remove control characters from presentation glyphs so they cannot move the
+/// cursor, break rows, or carry zero-width terminal controls into layout.
+fn sanitized_presentation(presentation: &MarkdownPresentation) -> MarkdownPresentation {
+    let glyph = |value: &str| value.chars().filter(|ch| !ch.is_control()).collect();
+    MarkdownPresentation {
+        list_bullet: glyph(&presentation.list_bullet),
+        blockquote_bar: glyph(&presentation.blockquote_bar),
+        ..presentation.clone()
+    }
+}
+
 fn markdown_cell_rect(column: usize, row: usize, width: usize) -> MarkdownCellRect {
     MarkdownCellRect {
         x: u16::try_from(column).unwrap_or(u16::MAX),
@@ -4764,9 +4947,14 @@ struct TableRow {
     header: bool,
 }
 
-fn table_rows(container: &Container, style: TextStyle, theme: MarkdownTheme) -> Vec<TableRow> {
+fn table_rows(
+    container: &Container,
+    style: TextStyle,
+    theme: MarkdownTheme,
+    presentation: &Rc<MarkdownPresentation>,
+) -> Vec<TableRow> {
     let mut rows = Vec::new();
-    collect_table_rows(container, style, theme, false, &mut rows);
+    collect_table_rows(container, style, theme, presentation, false, &mut rows);
     rows
 }
 
@@ -4774,6 +4962,7 @@ fn collect_table_rows(
     container: &Container,
     style: TextStyle,
     theme: MarkdownTheme,
+    presentation: &Rc<MarkdownPresentation>,
     in_header: bool,
     rows: &mut Vec<TableRow>,
 ) {
@@ -4783,7 +4972,7 @@ fn collect_table_rows(
         .children
         .iter()
         .filter(|child| matches!(child.element, Element::TH { .. } | Element::TD { .. }))
-        .map(|cell| lines_for_table_cell(cell, style, theme))
+        .map(|cell| lines_for_table_cell(cell, style, theme, presentation))
         .collect::<Vec<_>>();
     if matches!(container.element, Element::TR) || in_header && !cells.is_empty() {
         rows.push(TableRow {
@@ -4793,7 +4982,7 @@ fn collect_table_rows(
         return;
     }
     for child in &container.children {
-        collect_table_rows(child, style, theme, in_header, rows);
+        collect_table_rows(child, style, theme, presentation, in_header, rows);
     }
 }
 
@@ -4801,9 +4990,18 @@ fn lines_for_table_cell(
     container: &Container,
     style: TextStyle,
     theme: MarkdownTheme,
+    presentation: &Rc<MarkdownPresentation>,
 ) -> Vec<Vec<Span>> {
-    let mut renderer =
-        TerminalMarkdownRenderer::new(u16::MAX, theme, None, Vec::new(), Vec::new(), 1, 1);
+    let mut renderer = TerminalMarkdownRenderer::new(
+        u16::MAX,
+        theme,
+        None,
+        Vec::new(),
+        Vec::new(),
+        1,
+        1,
+        Rc::clone(presentation),
+    );
     renderer.in_table_collection = true;
     renderer.render_container_children(container, style.merge_container(container, theme));
     renderer.flush_line();
