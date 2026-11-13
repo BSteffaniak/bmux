@@ -81,6 +81,7 @@ members = [
     "packages/pty",
     "packages/terminal-grid",
     "packages/keyboard",
+    "packages/terminal",
     "packages/text-edit",
     "packages/tui",
     "packages/tui-components",
@@ -261,6 +262,7 @@ bmux_image = { version = "0.0.1-alpha.4", default-features = false, path = "pack
 bmux_ipc = { version = "0.0.1-alpha.4", default-features = false, path = "packages/ipc" }
 bmux_keybind = { version = "0.0.1-alpha.4", default-features = false, path = "packages/keybind" }
 bmux_keyboard = { version = "0.0.1-alpha.4", default-features = false, path = "packages/keyboard" }
+bmux_terminal = { version = "0.0.1-alpha.4", default-features = false, path = "packages/terminal" }
 bmux_markdown = { version = "0.0.1-alpha.4", default-features = false, path = "packages/markdown" }
 bmux_mermaid_render = { version = "0.0.1-alpha.4", default-features = false, path = "packages/mermaid-render" }
 bmux_mobile_core = { version = "0.0.1-alpha.4", default-features = false, path = "packages/mobile-core" }
@@ -402,6 +404,7 @@ flate2 = { version = "1", default-features = false, features = [
 ] }
 font8x8 = { version = "0.3.1", features = ["unicode"] }
 fontdb = { version = "0.24.0" }
+futures-core = { version = "0.3.34", default-features = false }
 futures-util = { version = "0.3.34", default-features = false }
 getrandom = "0.4.3"
 gif = { version = "0.14.2" }
