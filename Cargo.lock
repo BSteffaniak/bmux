@@ -8255,7 +8255,7 @@ dependencies = [
 [[package]]
 name = "moosicbox_log_watch"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#ac3fca6c708adaf3f1689b4a0011110e2f6a22b5"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#31ff9fc4e9e4c27a786715daa31335c42110d9cd"
 dependencies = [
  "anyhow",
  "bmux_terminal",
