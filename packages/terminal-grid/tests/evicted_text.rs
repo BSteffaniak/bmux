@@ -90,3 +90,24 @@ fn spaces_at_a_soft_wrap_are_kept() {
     stream.process(b"abc def");
     assert_eq!(content_text(stream.grid()), "abc def");
 }
+
+#[test]
+fn an_unfinished_line_leaving_the_screen_is_handed_over_as_it_goes() {
+    let mut stream = stream(10, 3, 0);
+    stream.grid_mut().collect_evicted_text(true);
+    // Fifty rows of one line: everything above the screen is handed over unfinished.
+    stream.process(&[b'x'; 500]);
+    let taken = stream.grid_mut().take_evicted_text();
+    assert_eq!(taken, "x".repeat(470));
+    // The screen holds the rest; together they are the line.
+    assert_eq!(
+        format!("{taken}{}", content_text(stream.grid())),
+        "x".repeat(500)
+    );
+    // Finishing it hands over the rest as the line it is.
+    stream.process(b"\r\nnext\r\n\r\n\r\n");
+    assert_eq!(
+        stream.grid_mut().take_evicted_text(),
+        "x".repeat(30) + "\nnext\n"
+    );
+}

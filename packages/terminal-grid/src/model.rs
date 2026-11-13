@@ -2647,6 +2647,13 @@ impl TerminalGrid {
     fn push_history_row(&mut self, row: PhysicalRow) {
         let wrapped = row.wrapped();
         let cells = history_row_cells(row, self.width);
+        // Kept nowhere, a row leaving the screen is final even within an unfinished line, so
+        // its text goes at once: an endless line is never held, nor rendered again.
+        if self.limits.scrollback_rows == 0 && self.evicted_text.is_some() {
+            self.history_truncated = true;
+            self.hand_over_line(&cells, !wrapped);
+            return;
+        }
         self.history_bytes = self
             .history_bytes
             .saturating_add(history_cells_bytes(&cells));
