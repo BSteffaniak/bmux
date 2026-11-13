@@ -687,6 +687,16 @@ impl PhysicalRow {
     }
 
     pub(crate) fn set_cell(&mut self, col: usize, cell: Cell) {
+        // Appending, as printing nearly always is: trailing blanks can only appear if this one
+        // is blank.
+        if col == self.cells.len() {
+            let blank = cell.is_discardable_blank();
+            self.cells.push(cell);
+            if blank {
+                self.trim_trailing_blanks();
+            }
+            return;
+        }
         if self.cells.len() <= col {
             self.cells
                 .resize_with(col + 1, || Cell::blank(StyleId::DEFAULT));
@@ -2652,6 +2662,12 @@ impl TerminalGrid {
     }
 
     fn push_history_line(&mut self, line: LogicalLine) {
+        // Without history, a completed line leaves at once.
+        if self.limits.scrollback_rows == 0 {
+            self.history_truncated = true;
+            self.hand_over_line(&line.cells, true);
+            return;
+        }
         self.history_bytes = self
             .history_bytes
             .saturating_add(history_cells_bytes(&line.cells));
