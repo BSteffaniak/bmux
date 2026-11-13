@@ -10,6 +10,7 @@ pub(crate) mod live_presentation;
 pub(crate) mod managed_idle;
 mod managed_scope;
 mod native_process;
+pub(crate) mod pty;
 pub(crate) mod reservations;
 mod shell_callback;
 mod startup_capture;
@@ -41,6 +42,7 @@ use bmux_pane_runtime_state::{
     PaneResizeDirection, PaneResurrectionSnapshot, PaneRuntimeMeta, RestoreRuntimeRequest,
     SessionRuntimeError,
 };
+use bmux_pty::{PtySize, SpawnCommand};
 use bmux_recording_protocol::{RecordingEventKind, RecordingPayload as ProtocolRecordingPayload};
 use bmux_recording_runtime::{RecordMeta, RecordingSinkHandle};
 use bmux_session_models::{ClientId, SessionId};
@@ -48,7 +50,7 @@ use bmux_session_state::SessionManagerHandle;
 use bmux_snapshot_runtime::{SnapshotDirtyFlag, SnapshotDirtyFlagHandle};
 use bmux_terminal_grid::{GridDeltaBatch, GridLimits, TerminalGrid, TerminalGridStream};
 use bmux_terminal_protocol::{ProtocolProfile, TerminalProtocolEngine, protocol_profile_for_term};
-use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+use pty::Slave as _;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{Read, Write};
 use std::path::Path;
@@ -1064,7 +1066,7 @@ fn mark_pane_startup_failed(
 // Killing only the receipt guardian during startup leaves its terminal owner
 // holding the slave and makes capture EOF/cleanup impossible.
 struct GuardianStartupChild {
-    child: Box<dyn portable_pty::Child + Send + Sync>,
+    child: Box<dyn crate::runtime::pty::Child + Send + Sync>,
     execution: Arc<execution::ExecutionCapture>,
     launch_attempted: Arc<AtomicBool>,
 }
@@ -1079,7 +1081,7 @@ impl std::fmt::Debug for GuardianStartupChild {
     }
 }
 
-impl portable_pty::ChildKiller for GuardianStartupChild {
+impl crate::runtime::pty::ChildKiller for GuardianStartupChild {
     fn kill(&mut self) -> std::io::Result<()> {
         if self.launch_attempted.load(Ordering::SeqCst) {
             self.execution
@@ -1094,43 +1096,39 @@ impl portable_pty::ChildKiller for GuardianStartupChild {
         self.child.kill()
     }
 
-    fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
+    fn clone_killer(&self) -> Box<dyn crate::runtime::pty::ChildKiller + Send + Sync> {
         // Published supervision performs its own authority handshake before
         // using this exact owned child killer.
         self.child.clone_killer()
     }
 }
 
-impl portable_pty::Child for GuardianStartupChild {
-    fn try_wait(&mut self) -> std::io::Result<Option<portable_pty::ExitStatus>> {
+impl crate::runtime::pty::Child for GuardianStartupChild {
+    fn try_wait(&mut self) -> std::io::Result<Option<bmux_pty::ChildExit>> {
         self.child.try_wait()
     }
-    fn wait(&mut self) -> std::io::Result<portable_pty::ExitStatus> {
+    fn wait(&mut self) -> std::io::Result<bmux_pty::ChildExit> {
         self.child.wait()
     }
     fn process_id(&self) -> Option<u32> {
         self.child.process_id()
     }
-    #[cfg(windows)]
-    fn as_raw_handle(&self) -> Option<std::os::windows::io::RawHandle> {
-        self.child.as_raw_handle()
-    }
 }
 
 struct StartupChild {
-    child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
+    child: Option<Box<dyn crate::runtime::pty::Child + Send + Sync>>,
     runtime: tokio::runtime::Handle,
 }
 
 impl StartupChild {
-    fn new(child: Box<dyn portable_pty::Child + Send + Sync>) -> Self {
+    fn new(child: Box<dyn crate::runtime::pty::Child + Send + Sync>) -> Self {
         Self {
             child: Some(child),
             runtime: tokio::runtime::Handle::current(),
         }
     }
 
-    fn take(&mut self) -> Box<dyn portable_pty::Child + Send + Sync> {
+    fn take(&mut self) -> Box<dyn crate::runtime::pty::Child + Send + Sync> {
         self.child
             .take()
             .expect("startup child ownership transferred once")
@@ -1138,7 +1136,7 @@ impl StartupChild {
 }
 
 impl std::ops::Deref for StartupChild {
-    type Target = dyn portable_pty::Child + Send + Sync;
+    type Target = dyn crate::runtime::pty::Child + Send + Sync;
     fn deref(&self) -> &Self::Target {
         self.child.as_deref().expect("startup child is owned")
     }
@@ -1167,7 +1165,7 @@ impl Drop for StartupChild {
 
 #[cfg(all(test, unix))]
 fn cleanup_failed_startup_child(
-    child: Box<dyn portable_pty::Child + Send + Sync>,
+    child: Box<dyn crate::runtime::pty::Child + Send + Sync>,
     failure: String,
 ) -> impl std::future::Future<Output = String> {
     let cleanup =
@@ -1176,7 +1174,7 @@ fn cleanup_failed_startup_child(
 }
 
 fn cleanup_failed_startup_child_acknowledged(
-    child: Box<dyn portable_pty::Child + Send + Sync>,
+    child: Box<dyn crate::runtime::pty::Child + Send + Sync>,
     failure: String,
     acknowledgement: &watch::Sender<Option<std::result::Result<(), String>>>,
 ) -> impl std::future::Future<Output = String> + use<> {
@@ -1191,7 +1189,7 @@ fn cleanup_failed_startup_child_acknowledged(
 
 fn cleanup_failed_startup_child_on(
     runtime: &tokio::runtime::Handle,
-    mut child: Box<dyn portable_pty::Child + Send + Sync>,
+    mut child: Box<dyn crate::runtime::pty::Child + Send + Sync>,
     failure: String,
     acknowledgement: Option<watch::Sender<Option<std::result::Result<(), String>>>>,
 ) -> impl std::future::Future<Output = (String, Result<(), String>)> + use<> {
@@ -1256,7 +1254,7 @@ async fn poll_failed_startup_child(
     }
 }
 
-fn format_pane_exit_reason(status: &portable_pty::ExitStatus) -> String {
+fn format_pane_exit_reason(status: &bmux_pty::ChildExit) -> String {
     if let Some(signal) = status.signal() {
         return format!("process terminated by signal {signal}");
     }
@@ -3087,7 +3085,7 @@ fn shell_kind_for_path(shell: &str) -> ShellKind {
 }
 
 fn configure_pane_terminal_env(
-    command: &mut CommandBuilder,
+    command: &mut SpawnCommand,
     pane_term: &str,
     image_protocol: Option<&str>,
 ) {
@@ -3109,7 +3107,7 @@ fn configure_pane_terminal_env(
     }
 }
 
-fn clear_managed_launch_env(command: &mut CommandBuilder) {
+fn clear_managed_launch_env(command: &mut SpawnCommand) {
     // Launch authority belongs to this server, not nested ordinary servers
     // started by its shells or detached programs.
     command.env_remove("BMUX_MANAGED_EXECUTABLE_SHA256");
@@ -3122,7 +3120,7 @@ fn clear_managed_launch_env(command: &mut CommandBuilder) {
     }
 }
 
-fn configure_device_seal_broker_env(command: &mut CommandBuilder) {
+fn configure_device_seal_broker_env(command: &mut SpawnCommand) {
     if std::env::var("BMUX_DEVICE_SEAL_SCOPE").as_deref() == Ok("client") {
         if let Ok(exe) = std::env::current_exe() {
             command.env(
@@ -3137,7 +3135,7 @@ fn configure_device_seal_broker_env(command: &mut CommandBuilder) {
 }
 
 fn configure_shell_integration_command(
-    command: &mut CommandBuilder,
+    command: &mut SpawnCommand,
     shell: &str,
     integration_root: Option<&std::path::Path>,
     token: &str,
@@ -3765,12 +3763,7 @@ impl PaneRuntimeHandle {
         master
             .as_ref()
             .ok_or_else(|| execution::failed("PTY master is unavailable"))?
-            .resize(PtySize {
-                rows,
-                cols,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
+            .resize(PtySize { rows, cols })
             .map_err(execution::failed)
     }
 
@@ -3814,14 +3807,9 @@ impl PaneRuntimeHandle {
     ) -> bool {
         if let Some(capture) = capture.as_mut() {
             let resized = self.execution.master.lock().ok().and_then(|master| {
-                master.as_ref().map(|master| {
-                    master.resize(PtySize {
-                        rows,
-                        cols,
-                        pixel_width: 0,
-                        pixel_height: 0,
-                    })
-                })
+                master
+                    .as_ref()
+                    .map(|master| master.resize(PtySize { rows, cols }))
             });
             if !matches!(resized, Some(Ok(()))) {
                 return false;
@@ -3907,16 +3895,9 @@ impl PaneRuntimeHandle {
         cols: u16,
     ) -> Option<capture_writer::Ticket> {
         let resized = self.execution.master.lock().is_ok_and(|master| {
-            master.as_ref().is_some_and(|master| {
-                master
-                    .resize(PtySize {
-                        rows,
-                        cols,
-                        pixel_width: 0,
-                        pixel_height: 0,
-                    })
-                    .is_ok()
-            })
+            master
+                .as_ref()
+                .is_some_and(|master| master.resize(PtySize { rows, cols }).is_ok())
         });
         if !resized || grid.resize(cols, rows).is_err() {
             self.execution
@@ -6836,12 +6817,9 @@ impl SessionRuntimeManager {
                 fail_startup!(reason);
                 return;
             }
-            let pty_system = native_pty_system();
-            let mut pty_pair = match pty_system.openpty(PtySize {
+            let mut pty_pair = match bmux_pty::PtyPair::open(PtySize {
                 rows: initial_rows,
                 cols: initial_cols,
-                pixel_width: 0,
-                pixel_height: 0,
             }) {
                 Ok(pair) => pair,
                 Err(error) => {
@@ -6927,7 +6905,7 @@ impl SessionRuntimeManager {
                     fail_startup!(error.to_string());
                     return;
                 }
-                let mut command = CommandBuilder::new(&launch.program);
+                let mut command = SpawnCommand::new(&launch.program);
                 configure_pane_terminal_env(&mut command, &pane_term, pane_image_protocol);
                 for arg in &launch.args {
                     command.arg(arg);
@@ -6948,7 +6926,7 @@ impl SessionRuntimeManager {
                 }
                 (command, format!("command {}", launch.program))
             } else {
-                let mut command = CommandBuilder::new(&shell);
+                let mut command = SpawnCommand::new(&shell);
                 configure_pane_terminal_env(&mut command, &pane_term, pane_image_protocol);
                 configure_device_seal_broker_env(&mut command);
                 if let Some(cwd) = initial_cwd.as_deref()
@@ -6998,7 +6976,9 @@ impl SessionRuntimeManager {
                     warn!(%error, "nested Fish integration unavailable");
                 }
                 match &shell_callback {
-                    Some(Ok(executable)) => command.env("BMUX_SHELL_CALLBACK", executable),
+                    Some(Ok(executable)) => {
+                        command.env("BMUX_SHELL_CALLBACK", executable);
+                    }
                     Some(Err(error)) => {
                         fail_startup!(format!("shell callback executable unavailable: {error}"));
                         return;
@@ -7017,7 +6997,7 @@ impl SessionRuntimeManager {
             // initial shells. Preserve the prepared argv/cwd/environment rather
             // than constructing a second shell command or idle ctty anchor.
             let argv = match command
-                .get_argv()
+                .argv()
                 .iter()
                 .map(|arg| {
                     arg.to_str().map(str::to_owned).ok_or_else(|| {
@@ -7052,7 +7032,7 @@ impl SessionRuntimeManager {
                     .and_then(|path| path.to_str())
                     .map(str::to_owned),
                 env: command
-                    .iter_full_env_as_str()
+                    .utf8_environment()
                     .map(|(key, value)| (key.to_owned(), value.to_owned()))
                     .collect(),
             };
@@ -7084,7 +7064,7 @@ impl SessionRuntimeManager {
                 return;
             }
             let raw_reader = match pty_pair.master.try_clone_reader() {
-                Ok(reader) => reader,
+                Ok(reader) => Box::new(reader) as Box<dyn Read + Send>,
                 Err(error) => {
                     fail_startup!(format!("failed to install PTY capture: {error}"));
                     return;
@@ -7095,7 +7075,9 @@ impl SessionRuntimeManager {
             // raw drain, not after waiting for guardian startup/publication.
             #[cfg(windows)]
             let early_writer = match pty_pair.master.take_writer() {
-                Ok(writer) => Arc::new(std::sync::Mutex::new(writer)),
+                Ok(writer) => Arc::new(std::sync::Mutex::new(
+                    Box::new(writer) as Box<dyn std::io::Write + Send>
+                )),
                 Err(error) => {
                     fail_startup!(format!("failed to open startup PTY writer: {error}"));
                     return;
@@ -7231,16 +7213,16 @@ impl SessionRuntimeManager {
                 let (returned_pair, spawned) = match tokio::task::spawn_blocking(move || {
                     #[cfg(windows)]
                     let observed_slave = native_process::conpty_startup::ObservedSlave {
-                        slave: pty_pair.slave.as_ref(),
+                        slave: &pty_pair.slave,
                         owner: pane_id,
                     };
                     #[cfg(windows)]
-                    let spawn_slave: &dyn portable_pty::SlavePty = &observed_slave;
+                    let spawn_slave: &dyn crate::runtime::pty::Slave = &observed_slave;
                     #[cfg(not(windows))]
-                    let spawn_slave = pty_pair.slave.as_ref();
+                    let spawn_slave = &pty_pair.slave;
                     let spawned = control
                         .spawn_terminal(
-                            pty_pair.master.as_ref(),
+                            &pty_pair.master,
                             spawn_slave,
                             guardian_command
                                 .expect("supervisor preparation retains guardian command"),
@@ -7290,7 +7272,11 @@ impl SessionRuntimeManager {
                 match execution_for_task.authorize_spawn() {
                     Ok(()) => {
                         launch_attempted.store(true, Ordering::SeqCst);
-                        pty_pair.slave.spawn_command(command).map(StartupChild::new)
+                        pty_pair
+                            .slave
+                            .spawn_command(command)
+                            .map(StartupChild::new)
+                            .map_err(anyhow::Error::from)
                     }
                     Err(error) => Err(error),
                 }
@@ -7426,7 +7412,7 @@ impl SessionRuntimeManager {
                 *pgid = if supervisor_control.is_some() {
                     // The helper's session-leader PID is not the owned target
                     // group. Startup acknowledged tcsetpgrp before this lookup.
-                    native_process::foreground_group(pty_pair.master.as_ref())
+                    native_process::foreground_group(&pty_pair.master)
                 } else {
                     child
                         .process_id()
@@ -7440,7 +7426,7 @@ impl SessionRuntimeManager {
 
             #[cfg(not(windows))]
             let writer = match master.take_writer() {
-                Ok(writer) => writer,
+                Ok(writer) => Box::new(writer) as Box<dyn std::io::Write + Send>,
                 Err(error) => {
                     let reason = cleanup_failed_startup_child_acknowledged(
                         child.take(),
@@ -14300,7 +14286,7 @@ exit 7"#
 
     #[test]
     fn nested_program_environment_cannot_inherit_managed_launch_authority() {
-        let mut command = CommandBuilder::new("sh");
+        let mut command = SpawnCommand::new("sh");
         for key in [
             "BMUX_MANAGED_TARGET_IDENTITY",
             "BMUX_MANAGED_TARGET_ID",
@@ -14322,7 +14308,7 @@ exit 7"#
 
     #[test]
     fn pane_terminal_environment_hides_outer_host_and_advertises_virtual_images() {
-        let mut command = CommandBuilder::new("sh");
+        let mut command = SpawnCommand::new("sh");
         command.env("TERM_PROGRAM", "ghostty");
         command.env("LC_TERMINAL", "iTerm2");
         command.env("KITTY_WINDOW_ID", "42");
@@ -14351,7 +14337,7 @@ exit 7"#
 
     #[test]
     fn pane_terminal_environment_does_not_advertise_disabled_images() {
-        let mut command = CommandBuilder::new("sh");
+        let mut command = SpawnCommand::new("sh");
         command.env("BMUX_IMAGE_PROTOCOL", "kitty");
 
         configure_pane_terminal_env(&mut command, "bmux-256color", None);
@@ -16417,19 +16403,12 @@ exit 7"#
     async fn failed_sweep_revokes_open_slave_even_when_shutdown_waiter_is_cancelled() {
         supervisor::install_test_artifact().unwrap();
         let (control, child, pty, endpoint) = tokio::task::spawn_blocking(|| {
-            let pty = portable_pty::native_pty_system()
-                .openpty(PtySize {
-                    rows: 24,
-                    cols: 80,
-                    pixel_width: 0,
-                    pixel_height: 0,
-                })
-                .unwrap();
+            let pty = bmux_pty::PtyPair::open(PtySize { rows: 24, cols: 80 }).unwrap();
             let (control, command) =
                 supervisor::SupervisorControl::prepare(Uuid::new_v4()).unwrap();
-            let endpoint = std::path::PathBuf::from(&command.get_argv()[3]);
+            let endpoint = std::path::PathBuf::from(&command.argv()[3]);
             let child = control
-                .spawn_guardian(&pty.master.tty_name().unwrap())
+                .spawn_guardian(pty.master.tty_name().unwrap())
                 .unwrap();
             control
                 .start(
@@ -16950,15 +16929,8 @@ exit 7"#
     #[cfg(unix)]
     #[tokio::test]
     async fn failed_startup_cleanup_reaps_spawned_child() {
-        let pair = native_pty_system()
-            .openpty(PtySize {
-                rows: 24,
-                cols: 80,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .unwrap();
-        let mut command = CommandBuilder::new("/bin/sh");
+        let pair = bmux_pty::PtyPair::open(PtySize { rows: 24, cols: 80 }).unwrap();
+        let mut command = SpawnCommand::new("/bin/sh");
         command.args(["-c", "exec sleep 60"]);
         let child = pair.slave.spawn_command(command).unwrap();
         let pid = child.process_id().unwrap();
@@ -16970,15 +16942,8 @@ exit 7"#
     #[cfg(unix)]
     #[tokio::test]
     async fn failed_startup_cleanup_survives_dropped_waiter() {
-        let pair = native_pty_system()
-            .openpty(PtySize {
-                rows: 24,
-                cols: 80,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .unwrap();
-        let mut command = CommandBuilder::new("/bin/sh");
+        let pair = bmux_pty::PtyPair::open(PtySize { rows: 24, cols: 80 }).unwrap();
+        let mut command = SpawnCommand::new("/bin/sh");
         command.args(["-c", "exec sleep 60"]);
         let child = pair.slave.spawn_command(command).unwrap();
         let pid = child.process_id().unwrap();
@@ -17007,15 +16972,8 @@ exit 7"#
     #[cfg(unix)]
     #[tokio::test]
     async fn aborting_startup_owner_reaps_child() {
-        let pair = native_pty_system()
-            .openpty(PtySize {
-                rows: 24,
-                cols: 80,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .unwrap();
-        let mut command = CommandBuilder::new("/bin/sh");
+        let pair = bmux_pty::PtyPair::open(PtySize { rows: 24, cols: 80 }).unwrap();
+        let mut command = SpawnCommand::new("/bin/sh");
         command.args(["-c", "exec sleep 60"]);
         let child = pair.slave.spawn_command(command).unwrap();
         let pid = child.process_id().unwrap();
@@ -17043,15 +17001,8 @@ exit 7"#
     #[cfg(unix)]
     #[tokio::test]
     async fn startup_child_drop_on_plain_thread_uses_owning_runtime() {
-        let pair = native_pty_system()
-            .openpty(PtySize {
-                rows: 24,
-                cols: 80,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .unwrap();
-        let mut command = CommandBuilder::new("/bin/sh");
+        let pair = bmux_pty::PtyPair::open(PtySize { rows: 24, cols: 80 }).unwrap();
+        let mut command = SpawnCommand::new("/bin/sh");
         command.args(["-c", "exec sleep 60"]);
         let child = pair.slave.spawn_command(command).unwrap();
         let pid = child.process_id().unwrap();
@@ -19668,14 +19619,7 @@ exit 7"#
     #[tokio::test]
     async fn alternate_resize_guard_is_atomic_and_preserves_last_writer_policy() {
         let pane = dummy_pane(Uuid::new_v4());
-        let pty = portable_pty::native_pty_system()
-            .openpty(PtySize {
-                rows: 1,
-                cols: 1,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .unwrap();
+        let pty = bmux_pty::PtyPair::open(PtySize { rows: 1, cols: 1 }).unwrap();
         *pane.execution.master.lock().unwrap() = Some(pty.master);
         let original = pane.terminal_grid.lock().unwrap().grid().revision();
         let mut ticket = None;
@@ -19712,14 +19656,7 @@ exit 7"#
         let mut pane = dummy_pane(Uuid::new_v4());
         let (input, mut queued) = mpsc::unbounded_channel();
         pane.input_tx = input;
-        let pty = portable_pty::native_pty_system()
-            .openpty(PtySize {
-                rows: 1,
-                cols: 1,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .unwrap();
+        let pty = bmux_pty::PtyPair::open(PtySize { rows: 1, cols: 1 }).unwrap();
         *pane.execution.master.lock().unwrap() = Some(pty.master);
         pane.terminal_grid.lock().unwrap().process(b"\x1b[?1049h");
         let revision = pane.terminal_grid.lock().unwrap().grid().revision();
@@ -19733,7 +19670,7 @@ exit 7"#
             .unwrap()
             .as_ref()
             .unwrap()
-            .get_size()
+            .size()
             .unwrap();
         assert_eq!((actual.rows, actual.cols), (7, 19));
         assert_eq!(*pane.last_requested_size.lock().unwrap(), (7, 19));
@@ -19762,7 +19699,7 @@ exit 7"#
             .unwrap()
             .as_ref()
             .unwrap()
-            .get_size()
+            .size()
             .unwrap();
         assert_eq!((actual.rows, actual.cols), (7, 19));
     }
@@ -19789,14 +19726,7 @@ exit 7"#
     #[tokio::test]
     async fn alternate_resize_commits_geometry_in_ordered_capture() {
         let pane = dummy_pane(Uuid::new_v4());
-        let pty = portable_pty::native_pty_system()
-            .openpty(PtySize {
-                rows: 1,
-                cols: 1,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .unwrap();
+        let pty = bmux_pty::PtyPair::open(PtySize { rows: 1, cols: 1 }).unwrap();
         *pane.execution.master.lock().unwrap() = Some(pty.master);
         let root = tempfile::tempdir().unwrap();
         let capture = durable_capture::DurableCapture::create(root.path()).unwrap();
@@ -19833,7 +19763,7 @@ exit 7"#
                 .unwrap()
                 .as_ref()
                 .unwrap()
-                .get_size()
+                .size()
                 .unwrap()
                 .cols,
             8
@@ -21808,37 +21738,31 @@ exit 7"#
         }
     }
 
-    impl portable_pty::ChildKiller for DelayedCleanupChild {
+    impl crate::runtime::pty::ChildKiller for DelayedCleanupChild {
         fn kill(&mut self) -> std::io::Result<()> {
             Ok(())
         }
 
-        fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
+        fn clone_killer(&self) -> Box<dyn crate::runtime::pty::ChildKiller + Send + Sync> {
             Box::new(self.clone())
         }
     }
 
-    impl portable_pty::Child for DelayedCleanupChild {
-        fn try_wait(&mut self) -> std::io::Result<Option<portable_pty::ExitStatus>> {
-            Ok((*self.exited.0.lock().unwrap())
-                .then(|| portable_pty::ExitStatus::with_exit_code(0)))
+    impl crate::runtime::pty::Child for DelayedCleanupChild {
+        fn try_wait(&mut self) -> std::io::Result<Option<bmux_pty::ChildExit>> {
+            Ok((*self.exited.0.lock().unwrap()).then(|| bmux_pty::ChildExit::with_exit_code(0)))
         }
 
-        fn wait(&mut self) -> std::io::Result<portable_pty::ExitStatus> {
+        fn wait(&mut self) -> std::io::Result<bmux_pty::ChildExit> {
             let (state, changed) = &*self.exited;
             let mut exited = state.lock().unwrap();
             while !*exited {
                 exited = changed.wait(exited).unwrap();
             }
-            Ok(portable_pty::ExitStatus::with_exit_code(0))
+            Ok(bmux_pty::ChildExit::with_exit_code(0))
         }
 
         fn process_id(&self) -> Option<u32> {
-            None
-        }
-
-        #[cfg(windows)]
-        fn as_raw_handle(&self) -> Option<std::os::windows::io::RawHandle> {
             None
         }
     }
@@ -21857,14 +21781,7 @@ exit 7"#
             *setup_execution.supervisor.lock().unwrap() = Some(Arc::clone(&control));
             // The guardian now opens the slave before readiness. Remove only a
             // test-owned alias after readiness to fail the later owner spawn.
-            let pty = portable_pty::native_pty_system()
-                .openpty(PtySize {
-                    rows: 24,
-                    cols: 80,
-                    pixel_width: 0,
-                    pixel_height: 0,
-                })
-                .unwrap();
+            let pty = bmux_pty::PtyPair::open(PtySize { rows: 24, cols: 80 }).unwrap();
             let root = tempfile::tempdir().unwrap();
             let alias = root.path().join("slave");
             std::os::unix::fs::symlink(pty.master.tty_name().unwrap(), &alias).unwrap();

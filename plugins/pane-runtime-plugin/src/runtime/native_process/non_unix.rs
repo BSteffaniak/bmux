@@ -1,5 +1,4 @@
 use super::StopAction;
-use portable_pty::MasterPty;
 use std::io;
 
 pub(in super::super) fn supports_cooperative_stop() -> bool {
@@ -8,12 +7,12 @@ pub(in super::super) fn supports_cooperative_stop() -> bool {
     false
 }
 
-pub(in super::super) fn foreground_group(_master: &dyn MasterPty) -> Option<i32> {
+pub(in super::super) fn foreground_group(_master: &bmux_pty::PtyMaster) -> Option<i32> {
     None
 }
 
 pub(in super::super) fn stop_foreground_group(
-    _master: &dyn MasterPty,
+    _master: &bmux_pty::PtyMaster,
     _action: StopAction,
 ) -> io::Result<Option<bool>> {
     Err(io::Error::new(

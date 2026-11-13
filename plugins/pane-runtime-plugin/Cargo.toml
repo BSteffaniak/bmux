@@ -32,6 +32,7 @@ bmux_image = { workspace = true, optional = true }
 bmux_ipc = { workspace = true }
 bmux_pane_runtime_plugin_api = { workspace = true }
 bmux_pane_runtime_state = { workspace = true }
+bmux_pty = { workspace = true }
 bmux_permissions_plugin_api = { workspace = true }
 bmux_plugin = { workspace = true }
 bmux_plugin_runtime = { workspace = true }
@@ -46,7 +47,6 @@ bmux_snapshot_runtime = { workspace = true }
 bmux_tabs_plugin_api = { workspace = true }
 bmux_terminal_grid = { workspace = true }
 bmux_terminal_protocol = { workspace = true }
-portable-pty = { workspace = true }
 serde = { workspace = true, features = ["derive", "std"] }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
@@ -83,6 +83,7 @@ fail-on-warnings = [
     "bmux_image?/fail-on-warnings",
     "bmux_pane_runtime_plugin_api/fail-on-warnings",
     "bmux_pane_runtime_state/fail-on-warnings",
+    "bmux_pty/fail-on-warnings",
     "bmux_recording_protocol/fail-on-warnings",
     "bmux_recording_runtime/fail-on-warnings",
     "bmux_session_models/fail-on-warnings",

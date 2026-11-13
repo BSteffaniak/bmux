@@ -413,7 +413,6 @@ libloading = { version = "0.9.0", default-features = false, features = ["std"] }
 log = { version = "0.4.34", default-features = false }
 lz4_flex = { version = "0.14", default-features = false }
 png = { version = "0.18.1", default-features = false }
-portable-pty = { version = "0.9.0" }
 proc-macro2 = { version = "1.0.107", default-features = false }
 proptest = { version = "1.12.0", default-features = false, features = ["std"] }
 qrcode = { version = "0.14.1", default-features = false }

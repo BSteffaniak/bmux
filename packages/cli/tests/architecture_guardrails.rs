@@ -1927,7 +1927,12 @@ fn pane_runtime_plugin_implements_stateful() {
         "pane-runtime plugin activation must construct/register the concrete runtime",
     );
     let server_cargo = include_str!("../../server/Cargo.toml");
-    for forbidden_dep in ["portable-pty", "vt100", "bmux_terminal_protocol"] {
+    for forbidden_dep in [
+        "bmux_pty",
+        "portable-pty",
+        "vt100",
+        "bmux_terminal_protocol",
+    ] {
         assert!(
             !server_cargo.contains(forbidden_dep),
             "packages/server/Cargo.toml must not depend on pane-runtime-only dependency `{forbidden_dep}`",

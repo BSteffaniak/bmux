@@ -11,7 +11,7 @@
 //!
 //! The heavier `SessionRuntimeManager` (pane PTY processes, snapshot
 //! plumbing, event fan-out) remains in `packages/server` — it is too
-//! entangled with server-specific runtime primitives (portable-pty,
+//! entangled with server-specific runtime primitives (`bmux_pty`,
 //! tokio channels, recording runtimes) to relocate without a
 //! dependency explosion.
 

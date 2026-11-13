@@ -193,8 +193,7 @@ impl Slave {
         unsafe {
             command.pre_exec(|| crate::platform::prepare_child(libc::STDIN_FILENO, true));
         }
-        let child = command.spawn()?;
-        Ok(Child { child })
+        Ok(Child::from(command.spawn()?))
     }
 }
 
@@ -416,6 +415,12 @@ impl Child {
         Ok(Killer {
             pid: self.child.id(),
         })
+    }
+}
+
+impl From<std::process::Child> for Child {
+    fn from(child: std::process::Child) -> Self {
+        Self { child }
     }
 }
 

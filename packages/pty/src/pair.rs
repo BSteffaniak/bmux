@@ -217,6 +217,15 @@ impl PtyChild {
     }
 }
 
+/// Adopt a process started some other way, such as a helper given the terminal's
+/// [`PtyMaster::tty_name`], so it is waited for and killed as a spawned one is.
+#[cfg(unix)]
+impl From<std::process::Child> for PtyChild {
+    fn from(child: std::process::Child) -> Self {
+        Self(native::Child::from(child))
+    }
+}
+
 #[cfg(windows)]
 impl std::os::windows::io::AsRawHandle for PtyChild {
     fn as_raw_handle(&self) -> std::os::windows::io::RawHandle {

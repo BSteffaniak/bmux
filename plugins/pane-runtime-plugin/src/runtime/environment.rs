@@ -32,7 +32,7 @@ pub(super) fn validate(entries: &[EnvironmentEntry]) -> Result<(), String> {
 /// Only emulated-terminal identity changes; no bootstrap directory or hooks.
 pub(super) fn terminal_environment(
     mut entries: Vec<EnvironmentEntry>,
-    command: &portable_pty::CommandBuilder,
+    command: &bmux_pty::SpawnCommand,
 ) -> Vec<EnvironmentEntry> {
     const OWNED: &[&str] = &[
         "TERM",
@@ -80,7 +80,7 @@ mod tests {
 
     #[test]
     fn caller_routing_survives_terminal_overlay() {
-        let mut command = portable_pty::CommandBuilder::new("fixture");
+        let mut command = bmux_pty::SpawnCommand::new("fixture");
         command.env("TERM", "screen-256color");
         let entries = vec![
             entry("NATIVE", "日本語"),
@@ -114,10 +114,8 @@ mod tests {
             entry("=ExitCodeAscii", "A"),
         ];
         assert!(validate(&entries).is_ok());
-        let overlaid = terminal_environment(
-            entries.clone(),
-            &portable_pty::CommandBuilder::new("cmd.exe"),
-        );
+        let overlaid =
+            terminal_environment(entries.clone(), &bmux_pty::SpawnCommand::new("cmd.exe"));
         for expected in entries {
             assert!(
                 overlaid

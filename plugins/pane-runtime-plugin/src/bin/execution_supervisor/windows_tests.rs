@@ -2,7 +2,7 @@
 //! BMUX_SUPERVISOR_TEST_HELPER to its absolute path, then run this bin's tests
 //! with `--ignored`. No existing runtime or user terminal is touched.
 use super::*;
-use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+use bmux_pty::{PtyPair, PtySize, SpawnCommand};
 use std::io::Write;
 use windows_sys::Win32::Foundation::{GENERIC_WRITE, WAIT_OBJECT_0};
 use windows_sys::Win32::Storage::FileSystem::CREATE_NEW;
@@ -140,8 +140,8 @@ fn starts_require_lifetime_and_retirement_requires_empty_scope() {
 
 struct Fixture {
     _directory: tempfile::TempDir,
-    child: Box<dyn portable_pty::Child + Send + Sync>,
-    master: Option<Box<dyn portable_pty::MasterPty + Send>>,
+    child: bmux_pty::PtyChild,
+    master: Option<bmux_pty::PtyMaster>,
     pipe: String,
     bootstrap: Bootstrap,
     output: std::sync::mpsc::Receiver<Vec<u8>>,
@@ -201,15 +201,8 @@ impl Fixture {
             .unwrap();
         drop(file);
         let pipe = format!(r"\\.\pipe\bmux-exec-{}", uuid::Uuid::new_v4());
-        let pair = native_pty_system()
-            .openpty(PtySize {
-                rows: 24,
-                cols: 80,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .unwrap();
-        let mut command = CommandBuilder::new(executable);
+        let pair = PtyPair::open(PtySize { rows: 24, cols: 80 }).unwrap();
+        let mut command = SpawnCommand::new(executable);
         command.arg("--guardian-windows-session-v1");
         command.arg(&path);
         command.arg(&pipe);
@@ -224,7 +217,7 @@ impl Fixture {
                 if count == 0 {
                     break;
                 }
-                // portable-pty enables PSEUDOCONSOLE_INHERIT_CURSOR. Conhost
+                // bmux_pty enables PSEUDOCONSOLE_INHERIT_CURSOR. Conhost
                 // requests the cursor before launching the attached process;
                 // a headless test must answer, just like the real VT renderer.
                 for byte in &bytes[..count] {
@@ -251,7 +244,7 @@ impl Fixture {
                 }
             }
         });
-        let child = pair.slave.spawn_command(command).unwrap();
+        let child = pair.slave.spawn(&command).unwrap();
         drop(pair.slave);
         Self {
             _directory: directory,
@@ -272,9 +265,8 @@ impl Fixture {
             {
                 Ok(connection) => break connection,
                 Err(error) => {
-                    let exited = self.child.as_raw_handle().is_some_and(|handle| unsafe {
-                        WaitForSingleObject(handle.cast(), 0) == WAIT_OBJECT_0
-                    });
+                    let handle = std::os::windows::io::AsRawHandle::as_raw_handle(&self.child);
+                    let exited = unsafe { WaitForSingleObject(handle.cast(), 0) == WAIT_OBJECT_0 };
                     if exited || Instant::now() >= deadline {
                         let mut diagnostic = Vec::new();
                         while let Ok(bytes) = self.output.try_recv() {

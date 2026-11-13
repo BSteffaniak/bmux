@@ -1,18 +1,17 @@
 use super::StopAction;
-use portable_pty::MasterPty;
 use std::io;
 
 pub(in super::super) fn supports_cooperative_stop() -> bool {
     true
 }
 
-pub(in super::super) fn foreground_group(master: &dyn MasterPty) -> Option<i32> {
-    master.process_group_leader().filter(|group| *group > 0)
+pub(in super::super) fn foreground_group(master: &bmux_pty::PtyMaster) -> Option<i32> {
+    master.foreground_process_group().filter(|group| *group > 0)
 }
 
 /// `None` means the live terminal supplies no foreground-group authority.
 pub(in super::super) fn stop_foreground_group(
-    master: &dyn MasterPty,
+    master: &bmux_pty::PtyMaster,
     action: StopAction,
 ) -> io::Result<Option<bool>> {
     let Some(group) = foreground_group(master) else {

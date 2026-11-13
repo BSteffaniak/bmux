@@ -415,7 +415,7 @@ impl Lifetime {
     }
 }
 /// Own the helper until authentication and lifetime binding both succeed.
-struct StartupChild(Option<Box<dyn portable_pty::Child + Send + Sync>>);
+struct StartupChild(Option<Box<dyn crate::runtime::pty::Child + Send + Sync>>);
 impl Drop for StartupChild {
     fn drop(&mut self) {
         if let Some(mut child) = self.0.take() {
@@ -439,10 +439,10 @@ impl Drop for StartupChild {
 impl SupervisorControl {
     pub(in crate::runtime) fn spawn_terminal(
         &self,
-        _master: &dyn portable_pty::MasterPty,
-        slave: &dyn portable_pty::SlavePty,
-        command: portable_pty::CommandBuilder,
-    ) -> anyhow::Result<Box<dyn portable_pty::Child + Send + Sync>> {
+        _master: &bmux_pty::PtyMaster,
+        slave: &dyn crate::runtime::pty::Slave,
+        command: bmux_pty::SpawnCommand,
+    ) -> anyhow::Result<Box<dyn crate::runtime::pty::Child + Send + Sync>> {
         anyhow::ensure!(
             self.version == protocol::VERSION,
             "guardian protocol mismatch"
@@ -454,7 +454,7 @@ impl SupervisorControl {
             self.endpoint.as_os_str().to_os_string(),
         ];
         anyhow::ensure!(
-            command.get_argv() == &expected,
+            command.argv() == expected.as_slice(),
             "unexpected guardian command"
         );
         // The helper itself is attached to ConPTY. It creates the application only

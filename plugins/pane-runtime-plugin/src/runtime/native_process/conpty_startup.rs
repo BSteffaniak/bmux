@@ -69,16 +69,16 @@ fn diagnostic(owner: uuid::Uuid, stage: &'static str, total: u64, bytes: &[u8]) 
 /// `CreateProcess` from subsequent supervisor pipe/lifetime negotiation.
 #[cfg(windows)]
 pub(in super::super) struct ObservedSlave<'a> {
-    pub(in super::super) slave: &'a dyn portable_pty::SlavePty,
+    pub(in super::super) slave: &'a dyn crate::runtime::pty::Slave,
     pub(in super::super) owner: uuid::Uuid,
 }
 
 #[cfg(windows)]
-impl portable_pty::SlavePty for ObservedSlave<'_> {
+impl crate::runtime::pty::Slave for ObservedSlave<'_> {
     fn spawn_command(
         &self,
-        command: portable_pty::CommandBuilder,
-    ) -> anyhow::Result<Box<dyn portable_pty::Child + Send + Sync>> {
+        command: bmux_pty::SpawnCommand,
+    ) -> io::Result<Box<dyn crate::runtime::pty::Child + Send + Sync>> {
         diagnostic(self.owner, "native-spawn-enter", 0, &[]);
         let result = self.slave.spawn_command(command);
         diagnostic(

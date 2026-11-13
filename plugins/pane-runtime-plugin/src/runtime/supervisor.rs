@@ -150,9 +150,9 @@ pub(super) fn install_test_artifact() -> anyhow::Result<()> {
 // Every execution requires the server-owned lifetime backend. A direct PTY
 // fallback cannot clean HUP-ignoring shell jobs after server death.
 pub(super) fn select_backend(
-    preparation: anyhow::Result<(SupervisorControl, portable_pty::CommandBuilder)>,
+    preparation: anyhow::Result<(SupervisorControl, bmux_pty::SpawnCommand)>,
     _required: bool,
-) -> anyhow::Result<Option<(SupervisorControl, portable_pty::CommandBuilder)>> {
+) -> anyhow::Result<Option<(SupervisorControl, bmux_pty::SpawnCommand)>> {
     preparation.map(Some)
 }
 
@@ -175,9 +175,7 @@ impl SupervisorControl {
             .revoke();
         Ok(())
     }
-    pub(super) fn prepare(
-        token: uuid::Uuid,
-    ) -> anyhow::Result<(Self, portable_pty::CommandBuilder)> {
+    pub(super) fn prepare(token: uuid::Uuid) -> anyhow::Result<(Self, bmux_pty::SpawnCommand)> {
         #[cfg(test)]
         install_test_artifact()?;
         super::reservations::check_authority()?;
@@ -233,7 +231,7 @@ impl SupervisorControl {
         // Keep the locator until explicit retirement. The execution itself is
         // bounded by the server-owned lifetime socket, not this directory.
         let _retained_directory = endpoint_directory.keep();
-        let mut command = portable_pty::CommandBuilder::new(&installation.path);
+        let mut command = bmux_pty::SpawnCommand::new(&installation.path);
         command.arg(backend::HELPER_ARGUMENT);
         command.arg(path);
         command.arg(&endpoint);

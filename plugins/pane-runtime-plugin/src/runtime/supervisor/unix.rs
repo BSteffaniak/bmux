@@ -100,7 +100,7 @@ pub(super) fn negotiate_guardian(
     mut child: StartupChild,
     mut readiness: std::os::unix::net::UnixStream,
     lifetime: &Mutex<Lifetime>,
-) -> anyhow::Result<Box<dyn portable_pty::Child + Send + Sync>> {
+) -> anyhow::Result<Box<dyn crate::runtime::pty::Child + Send + Sync>> {
     let version: u32 = protocol::read_frame(&mut readiness)?;
     anyhow::ensure!(
         version == protocol::VERSION,
@@ -112,26 +112,28 @@ pub(super) fn negotiate_guardian(
         .lock()
         .map_err(|_| anyhow::anyhow!("supervisor lifetime lock poisoned"))?
         .install(readiness)?;
-    Ok(Box::new(child.0.take().expect("negotiated guardian child")))
+    Ok(Box::new(bmux_pty::PtyChild::from(
+        child.0.take().expect("negotiated guardian child"),
+    )))
 }
 
 impl SupervisorControl {
     pub(in crate::runtime) fn spawn_terminal(
         &self,
-        master: &dyn portable_pty::MasterPty,
-        _slave: &dyn portable_pty::SlavePty,
-        _command: portable_pty::CommandBuilder,
-    ) -> anyhow::Result<Box<dyn portable_pty::Child + Send + Sync>> {
+        master: &bmux_pty::PtyMaster,
+        _slave: &dyn crate::runtime::pty::Slave,
+        _command: bmux_pty::SpawnCommand,
+    ) -> anyhow::Result<Box<dyn crate::runtime::pty::Child + Send + Sync>> {
         let slave = master
             .tty_name()
             .ok_or_else(|| anyhow::anyhow!("PTY slave path unavailable"))?;
-        self.spawn_guardian(&slave)
+        self.spawn_guardian(slave)
     }
 
     pub(in crate::runtime) fn spawn_guardian(
         &self,
         slave: &std::path::Path,
-    ) -> anyhow::Result<Box<dyn portable_pty::Child + Send + Sync>> {
+    ) -> anyhow::Result<Box<dyn crate::runtime::pty::Child + Send + Sync>> {
         use std::os::fd::AsRawFd;
         use std::os::unix::process::CommandExt;
 

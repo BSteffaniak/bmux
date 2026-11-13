@@ -40,16 +40,16 @@ fn selected_backend_retains_guardian_command_not_application_argv() {
         artifact: artifact.clone(),
         lifetime: std::sync::Mutex::new(super::Lifetime::default()),
     };
-    let mut command = portable_pty::CommandBuilder::new(&artifact);
+    let mut command = bmux_pty::SpawnCommand::new(&artifact);
     command.arg("--guardian-test");
     command.arg("bootstrap.json");
-    let expected = command.get_argv().clone();
+    let expected = command.argv().to_vec();
     let selected = super::select_backend(Ok((control, command)), true)
         .unwrap()
         .unwrap();
     assert_eq!(selected.0.artifact, artifact);
-    assert_eq!(selected.1.get_argv(), &expected);
-    assert_ne!(selected.1.get_argv()[0], std::ffi::OsStr::new("cmd.exe"));
+    assert_eq!(selected.1.argv(), expected.as_slice());
+    assert_ne!(selected.1.argv()[0], std::ffi::OsStr::new("cmd.exe"));
 }
 
 #[cfg(unix)]

@@ -42,7 +42,7 @@ pub(super) struct ExecutionCapture {
     projection_changed: std::sync::Condvar,
     pub(super) durable_capture: Mutex<Option<super::durable_capture::DurableCapture>>,
     pub(super) capture_writer: Mutex<Option<super::capture_writer::CaptureWriter>>,
-    pub(super) master: Mutex<Option<Box<dyn portable_pty::MasterPty + Send>>>,
+    pub(super) master: Mutex<Option<bmux_pty::PtyMaster>>,
     pub(super) output_drained: AtomicBool,
     pub(super) geometry_revision: AtomicU64,
     pub(super) output_watermark: AtomicU64,
@@ -108,12 +108,7 @@ impl ExecutionCapture {
             .map_err(|_| std::io::Error::other("PTY master lock poisoned"))?
             .as_ref()
             .ok_or_else(|| std::io::Error::other("PTY master unavailable"))?
-            .resize(portable_pty::PtySize {
-                rows,
-                cols,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
+            .resize(bmux_pty::PtySize { rows, cols })
             .map_err(std::io::Error::other)?;
         Ok(true)
     }
@@ -368,7 +363,7 @@ impl ExecutionCapture {
         };
         // Keep the retained PTY locked through the backend side effect. A saved
         // PID or PGID is never authority to signal a potentially recycled group.
-        let Some(signaled) = native_process::stop_foreground_group(master.as_ref(), action)? else {
+        let Some(signaled) = native_process::stop_foreground_group(master, action)? else {
             if self.output_drained.load(Ordering::SeqCst)
                 && !self.managed_program.load(Ordering::SeqCst)
             {
@@ -384,7 +379,7 @@ impl ExecutionCapture {
         Ok(signaled)
     }
 
-    pub(super) fn record_exit(&self, result: &std::io::Result<portable_pty::ExitStatus>) {
+    pub(super) fn record_exit(&self, result: &std::io::Result<bmux_pty::ChildExit>) {
         if let Ok(mut outcome) = self.outcome.lock() {
             match result {
                 Ok(status) => {
@@ -2036,7 +2031,7 @@ mod tests {
     #[test]
     fn eof_and_exit_are_independent() {
         let capture = ExecutionCapture::default();
-        capture.record_exit(&Ok(portable_pty::ExitStatus::with_exit_code(0)));
+        capture.record_exit(&Ok(bmux_pty::ChildExit::with_exit_code(0)));
         assert!(!capture.output_drained.load(Ordering::SeqCst));
         assert_eq!(capture.outcome.lock().unwrap().0, Some(0));
         capture.output_drained.store(true, Ordering::SeqCst);

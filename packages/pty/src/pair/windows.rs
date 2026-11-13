@@ -139,9 +139,13 @@ impl Drop for Console {
 }
 
 /// What the master and slave share: the console, closed with the last of them.
+/// The console is closed first, then the pipe ends; a writer never taken keeps the console's
+/// input open until both sides are gone.
 struct Shared {
     console: Console,
     size: Mutex<PtySize>,
+    output: File,
+    input: Mutex<Option<File>>,
 }
 
 impl std::fmt::Debug for Shared {
@@ -180,12 +184,12 @@ pub fn open(size: PtySize) -> io::Result<(Master, Slave)> {
     let shared = Arc::new(Shared {
         console: Console(console),
         size: Mutex::new(size),
+        output: File::from(output),
+        input: Mutex::new(Some(File::from(input))),
     });
     Ok((
         Master {
             shared: Arc::clone(&shared),
-            output: File::from(output),
-            input: Mutex::new(Some(File::from(input))),
         },
         Slave { shared },
     ))
@@ -194,8 +198,6 @@ pub fn open(size: PtySize) -> io::Result<(Master, Slave)> {
 #[derive(Debug)]
 pub struct Master {
     shared: Arc<Shared>,
-    output: File,
-    input: Mutex<Option<File>>,
 }
 
 impl Master {
@@ -225,11 +227,12 @@ impl Master {
     }
 
     pub fn try_clone_reader(&self) -> io::Result<Reader> {
-        Ok(Reader(self.output.try_clone()?))
+        Ok(Reader(self.shared.output.try_clone()?))
     }
 
     pub fn take_writer(&self) -> io::Result<Input> {
-        self.input
+        self.shared
+            .input
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take()
