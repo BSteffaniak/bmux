@@ -1,0 +1,13 @@
+error: validation error: imported plugin `provider` (alias `other`) has no type `missing`
+ --> tests/ui/fail/import_unknown_type.rs:1:1
+  |
+1 | / bmux_plugin_schema_macros::__schema_import! {
+2 | |     {
+3 | |         source: "plugin consumer version 1; import other = provider; interface i { record r { value: other.missing } }",
+4 | |         imports: { other: { schema: provider_schema, crate_path: ::provider } },
+5 | |     }
+6 | |     0, "plugin provider version 1; interface i { record r { id: uuid } }"
+7 | | }
+  | |_^
+  |
+  = note: this error originates in the macro `bmux_plugin_schema_macros::__schema_import` (in Nightly builds, run with -Z macro-backtrace for more info)

@@ -9,4 +9,5 @@
 
 bmux_plugin_schema_macros::schema! {
     source: "bpdl/workspaces-plugin.bpdl",
+    export: export_schema,
 }

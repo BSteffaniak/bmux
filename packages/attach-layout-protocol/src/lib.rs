@@ -247,9 +247,10 @@ pub enum PaneState {
 
 bmux_plugin_schema_macros::schema! {
     source: "bpdl/attach-layout-protocol.bpdl",
+    export: export_schema,
     imports: {
         scene: {
-            source: "../scene-protocol/bpdl/scene-protocol.bpdl",
+            schema: ::bmux_scene_protocol::export_schema,
             crate_path: ::bmux_scene_protocol,
         },
     },

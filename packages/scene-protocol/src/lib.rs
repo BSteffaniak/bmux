@@ -18,4 +18,5 @@ pub mod glyphs;
 
 bmux_plugin_schema_macros::schema! {
     source: "bpdl/scene-protocol.bpdl",
+    export: export_schema,
 }

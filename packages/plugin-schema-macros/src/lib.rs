@@ -1,29 +1,20 @@
-//! Proc macros that embed a BPDL schema into a Rust plugin-api crate and
-//! generate the typed bindings at compile time.
+//! Compile-time BPDL bindings and dependency-owned schema exports.
 //!
-//! The `schema!` macro accepts a braced argument block describing the
-//! schema source and any cross-plugin imports. Example:
+//! File sources are relative to the invoking crate's manifest directory.
+//! Cross-crate imports should use a dependency's exported schema macro:
 //!
 //! ```ignore
-//! // Simple schema with no imports.
-//! bmux_plugin_schema_macros::schema! {
-//!     source: "bpdl/tabs-plugin.bpdl",
-//! }
-//!
-//! // Schema that imports types from another plugin.
 //! bmux_plugin_schema_macros::schema! {
 //!     source: "bpdl/my-plugin.bpdl",
+//!     export: export_schema,
 //!     imports: {
 //!         windows: {
-//!             source: "../tabs-plugin-api/bpdl/tabs-plugin.bpdl",
+//!             schema: ::bmux_tabs_plugin_api::export_schema,
 //!             crate_path: ::bmux_tabs_plugin_api,
 //!         },
 //!     },
 //! }
 //! ```
-//!
-//! Paths are resolved relative to the invoking crate's root (matching
-//! `include_str!` semantics).
 
 #![cfg_attr(feature = "fail-on-warnings", deny(warnings))]
 #![warn(clippy::all, clippy::pedantic)]
@@ -33,232 +24,372 @@ use std::path::PathBuf;
 
 use bmux_plugin_schema::codegen_rust::{ImportInfo, ImportMap};
 use proc_macro::TokenStream;
-use quote::ToTokens;
+use quote::{ToTokens, quote};
 use syn::parse::{Parse, ParseStream};
 use syn::{Ident, LitStr, Path, Token, braced, parse_macro_input};
 
-/// Embed a BPDL schema and emit the generated Rust bindings in place.
-///
-/// See module docs for the invocation grammar.
+/// Embed a BPDL file, optionally exporting its source for dependency consumers.
 #[proc_macro]
 pub fn schema(input: TokenStream) -> TokenStream {
     let args = parse_macro_input!(input as SchemaArgs);
-    match expand(&args) {
-        Ok(tokens) => tokens,
-        Err(msg) => quote::quote!(compile_error!(#msg);).into(),
-    }
+    result_tokens(expand(args))
 }
 
-/// Embed an inline BPDL schema source string and emit the generated
-/// Rust bindings in place. No file I/O — the entire schema is the
-/// macro argument. Useful for small self-contained schemas and for
-/// proc-macro tests where path resolution against `CARGO_MANIFEST_DIR`
-/// is awkward.
-///
-/// # Example
-///
-/// ```ignore
-/// bmux_plugin_schema_macros::schema_inline!(r#"
-///     plugin my.plugin version 1;
-///     interface iface { record r { id: uuid } }
-/// "#);
-/// ```
+/// Continue expansion after a dependency supplies its literal schema text.
+/// This is an implementation detail of `schema!`, not a stable entry point.
+#[doc(hidden)]
+#[proc_macro]
+pub fn __schema_import(input: TokenStream) -> TokenStream {
+    let continuation = parse_macro_input!(input as ImportContinuation);
+    let mut args = continuation.args;
+    args.imports[continuation.index].source = ImportSource::Inline(continuation.source);
+    result_tokens(expand_resolved(&args))
+}
+
+fn result_tokens(result: Result<proc_macro2::TokenStream, String>) -> TokenStream {
+    result
+        .unwrap_or_else(|message| quote!(compile_error!(#message);))
+        .into()
+}
+
+/// Generate bindings from an inline BPDL literal without reading files.
 #[proc_macro]
 pub fn schema_inline(input: TokenStream) -> TokenStream {
-    let lit = parse_macro_input!(input as LitStr);
-    let source = lit.value();
-    let schema = match bmux_plugin_schema::compile(&source) {
-        Ok(s) => s,
-        Err(err) => {
-            let msg = err.to_string();
-            return quote::quote!(compile_error!(#msg);).into();
-        }
-    };
-    let rust = bmux_plugin_schema::codegen_rust::emit(&schema);
-    match rust.parse::<proc_macro2::TokenStream>() {
-        Ok(tokens) => tokens.into(),
-        Err(err) => {
-            let msg = format!("bmux_plugin_schema codegen produced invalid Rust: {err}");
-            quote::quote!(compile_error!(#msg);).into()
-        }
-    }
+    let source = parse_macro_input!(input as LitStr).value();
+    result_tokens((|| {
+        let schema = bmux_plugin_schema::compile(&source).map_err(|err| err.to_string())?;
+        bmux_plugin_schema::codegen_rust::emit(&schema)
+            .parse()
+            .map_err(|err| format!("bmux_plugin_schema codegen produced invalid Rust: {err}"))
+    })())
 }
 
-fn expand(args: &SchemaArgs) -> Result<TokenStream, String> {
-    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
-        .map_err(|err| format!("CARGO_MANIFEST_DIR not set: {err}"))?;
-    let manifest_dir = PathBuf::from(manifest_dir);
+fn literal(value: &str) -> LitStr {
+    LitStr::new(value, proc_macro2::Span::call_site())
+}
 
-    // Collect every BPDL path we touch so the generated code can
-    // reference them via `include_bytes!`. Cargo's dependency
-    // tracker doesn't see `std::fs::read_to_string` at macro-expand
-    // time, so without these markers a BPDL edit wouldn't invalidate
-    // the crate's incremental cache. Emitting `include_bytes!`
-    // paths in the output makes the files first-class compile-time
-    // deps, so any edit to the `.bpdl` triggers a rebuild.
-    let mut tracked_paths: Vec<PathBuf> = Vec::new();
+fn expand(mut args: SchemaArgs) -> Result<proc_macro2::TokenStream, String> {
+    let root = PathBuf::from(
+        std::env::var("CARGO_MANIFEST_DIR")
+            .map_err(|err| format!("CARGO_MANIFEST_DIR not set: {err}"))?,
+    );
+    let mut tracking = proc_macro2::TokenStream::new();
+    let mut read = |source: &str| {
+        let path = root.join(source);
+        let text = std::fs::read_to_string(&path)
+            .map_err(|err| format!("failed to read BPDL schema `{}`: {err}", path.display()))?;
+        let path = literal(&path.to_string_lossy());
+        // File reads performed by a proc macro alone are not tracked by rustc.
+        tracking.extend(quote!(
+            const _: &[u8] = include_bytes!(#path);
+        ));
+        Ok::<_, String>(text)
+    };
+    args.source = read(&args.source)?;
+    for import in &mut args.imports {
+        if let ImportSource::File(path) = &import.source {
+            import.source = ImportSource::Inline(read(path)?);
+        }
+    }
+    let generated = expand_resolved(&args)?;
+    Ok(quote!(#tracking #generated))
+}
 
-    // Resolve imports first so codegen can emit qualified type paths.
+fn expand_resolved(args: &SchemaArgs) -> Result<proc_macro2::TokenStream, String> {
+    // Rust expands the provider macro before invoking our continuation, giving
+    // us literal data without locating the dependency's source directory.
+    for (index, import) in args.imports.iter().enumerate() {
+        if let ImportSource::Dependency(provider) = &import.source {
+            let source = literal(&args.source);
+            let export = args.export.iter().map(|name| quote!(export: #name,));
+            let imports = &args.imports;
+            return Ok(quote! {
+                #provider! {
+                    ::bmux_plugin_schema_macros::__schema_import,
+                    { source: #source, #(#export)* imports: { #(#imports,)* } },
+                    #index
+                }
+            });
+        }
+    }
+
     let mut imports = ImportMap::new();
-    let mut import_schemas: BTreeMap<String, bmux_plugin_schema::ast::Schema> = BTreeMap::new();
+    let mut schemas = BTreeMap::new();
     for import in &args.imports {
-        let path = manifest_dir.join(&import.source);
-        tracked_paths.push(path.clone());
-        let source = std::fs::read_to_string(&path).map_err(|err| {
-            format!(
-                "failed to read imported BPDL schema `{}`: {err}",
-                path.display()
-            )
-        })?;
-        let schema = bmux_plugin_schema::compile(&source)
-            .map_err(|err| format!("imported schema `{}` failed: {err}", path.display()))?;
-        import_schemas.insert(import.alias.clone(), schema.clone());
+        let ImportSource::Inline(source) = &import.source else {
+            return Err("unresolved file import in schema continuation".into());
+        };
+        let schema = bmux_plugin_schema::compile(source)
+            .map_err(|err| format!("imported schema `{}` failed: {err}", import.alias))?;
+        let alias = import.alias.to_string();
+        schemas.insert(alias.clone(), schema.clone());
         imports.insert(
-            import.alias.clone(),
+            alias,
             ImportInfo {
-                crate_path: import.crate_path.clone(),
+                crate_path: import
+                    .crate_path
+                    .to_token_stream()
+                    .to_string()
+                    .replace(' ', ""),
                 schema,
             },
         );
     }
-
-    // Parse the primary schema with imports resolved.
-    let path = manifest_dir.join(&args.source);
-    tracked_paths.push(path.clone());
-    let source = std::fs::read_to_string(&path)
-        .map_err(|err| format!("failed to read BPDL schema `{}`: {err}", path.display()))?;
-    let schema = bmux_plugin_schema::compile_with_imports(&source, &import_schemas)
+    let schema = bmux_plugin_schema::compile_with_imports(&args.source, &schemas)
         .map_err(|err| err.to_string())?;
-
-    let rust = bmux_plugin_schema::codegen_rust::emit_with_imports(&schema, &imports);
-
-    // Prepend one `const _: &[u8] = include_bytes!("...");` per BPDL
-    // file the macro consumed. These anonymous consts are stripped
-    // from release artifacts (the compiler still parses and embeds
-    // the bytes, but nothing references them), and their sole
-    // purpose is to make the file paths first-class compile-time
-    // dependencies of the generated module. Without this, `cargo`
-    // doesn't notice BPDL edits — the `schema!` invocation tokens
-    // are unchanged, so cargo's incremental fingerprint considers
-    // the crate valid and reuses the old rlib. Re-encountered this
-    // after a BPDL variant removal triggered a non-exhaustive-match
-    // compile error in a consumer crate.
-    let mut tracking_block = String::new();
-    for p in &tracked_paths {
-        use std::fmt::Write as _;
-        let _ = writeln!(
-            tracking_block,
-            "const _: &[u8] = include_bytes!({:?});",
-            p.display().to_string(),
-        );
-    }
-    let combined = format!("{tracking_block}{rust}");
-
-    combined
-        .parse::<proc_macro2::TokenStream>()
-        .map(Into::into)
-        .map_err(|err| format!("bmux_plugin_schema codegen produced invalid Rust: {err}"))
+    let generated: proc_macro2::TokenStream =
+        bmux_plugin_schema::codegen_rust::emit_with_imports(&schema, &imports)
+            .parse()
+            .map_err(|err| format!("bmux_plugin_schema codegen produced invalid Rust: {err}"))?;
+    let export = args.export.iter().map(|name| {
+        let source = literal(&args.source);
+        quote! {
+            /// Supply this crate's BPDL source to a schema expansion callback.
+            #[macro_export]
+            macro_rules! #name {
+                ($callback:path, { $($context:tt)* }, $index:literal) => {
+                    $callback! { { $($context)* } $index, #source }
+                };
+            }
+        }
+    });
+    Ok(quote!(#(#export)* #generated))
 }
 
-/// Parsed arguments to the `schema!` macro.
+struct ImportContinuation {
+    args: SchemaArgs,
+    index: usize,
+    source: String,
+}
+
+impl Parse for ImportContinuation {
+    fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
+        let content;
+        braced!(content in input);
+        let args: SchemaArgs = content.parse()?;
+        let index: syn::LitInt = input.parse()?;
+        let value = index.base10_parse::<usize>()?;
+        if !matches!(
+            args.imports.get(value).map(|entry| &entry.source),
+            Some(ImportSource::Dependency(_))
+        ) {
+            return Err(syn::Error::new(
+                index.span(),
+                "invalid schema import continuation index",
+            ));
+        }
+        input.parse::<Token![,]>()?;
+        Ok(Self {
+            args,
+            index: value,
+            source: input.parse::<LitStr>()?.value(),
+        })
+    }
+}
+
 struct SchemaArgs {
     source: String,
+    export: Option<Ident>,
     imports: Vec<ImportEntry>,
 }
 
+enum ImportSource {
+    File(String),
+    Dependency(Path),
+    Inline(String),
+}
+
 struct ImportEntry {
-    alias: String,
-    source: String,
-    crate_path: String,
+    alias: Ident,
+    source: ImportSource,
+    crate_path: Path,
+}
+
+impl ToTokens for ImportEntry {
+    fn to_tokens(&self, tokens: &mut proc_macro2::TokenStream) {
+        let alias = &self.alias;
+        let crate_path = &self.crate_path;
+        let source = match &self.source {
+            ImportSource::File(path) => {
+                let path = literal(path);
+                quote!(source: #path)
+            }
+            ImportSource::Dependency(path) => quote!(schema: #path),
+            ImportSource::Inline(text) => {
+                let text = literal(text);
+                quote!(inline: #text)
+            }
+        };
+        tokens.extend(quote!(#alias: { #source, crate_path: #crate_path }));
+    }
+}
+
+impl Parse for ImportEntry {
+    fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
+        let alias: Ident = input.parse()?;
+        input.parse::<Token![:]>()?;
+        let body;
+        braced!(body in input);
+        let mut source = None;
+        let mut crate_path = None;
+        while !body.is_empty() {
+            let field: Ident = body.parse()?;
+            body.parse::<Token![:]>()?;
+            match field.to_string().as_str() {
+                "source" | "schema" | "inline" => {
+                    if source.is_some() {
+                        return Err(syn::Error::new(
+                            field.span(),
+                            "specify exactly one of `source`, `schema`, or `inline`",
+                        ));
+                    }
+                    source = Some(match field.to_string().as_str() {
+                        "source" => ImportSource::File(body.parse::<LitStr>()?.value()),
+                        "schema" => ImportSource::Dependency(body.parse()?),
+                        _ => ImportSource::Inline(body.parse::<LitStr>()?.value()),
+                    });
+                }
+                "crate_path" => {
+                    if crate_path.is_some() {
+                        return Err(syn::Error::new(field.span(), "duplicate `crate_path`"));
+                    }
+                    crate_path = Some(body.parse()?);
+                }
+                _ => {
+                    return Err(syn::Error::new(
+                        field.span(),
+                        "expected `source`, `schema`, or `crate_path`",
+                    ));
+                }
+            }
+            if !body.is_empty() {
+                body.parse::<Token![,]>()?;
+            }
+        }
+        Ok(Self {
+            source: source.ok_or_else(|| {
+                syn::Error::new(alias.span(), "import requires `source` or `schema`")
+            })?,
+            crate_path: crate_path.ok_or_else(|| {
+                syn::Error::new(alias.span(), "import missing `crate_path` field")
+            })?,
+            alias,
+        })
+    }
 }
 
 impl Parse for SchemaArgs {
     fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
-        // Parse a `key: value` list separated by commas, inside an
-        // ambient brace (the macro invocation's outer braces). `syn`
-        // already strips the outer braces when parsing the TokenStream,
-        // so we're reading the key/value pairs directly here.
-        let mut source: Option<String> = None;
-        let mut imports: Vec<ImportEntry> = Vec::new();
-
+        let mut source = None;
+        let mut export = None;
+        let mut imports = None;
         while !input.is_empty() {
             let key: Ident = input.parse()?;
             input.parse::<Token![:]>()?;
             match key.to_string().as_str() {
-                "source" => {
-                    let lit: LitStr = input.parse()?;
-                    source = Some(lit.value());
-                }
-                "imports" => {
+                "source" if source.is_none() => source = Some(input.parse::<LitStr>()?.value()),
+                "export" if export.is_none() => export = Some(input.parse()?),
+                "imports" if imports.is_none() => {
                     let content;
                     braced!(content in input);
+                    let mut entries: Vec<ImportEntry> = Vec::new();
                     while !content.is_empty() {
-                        let alias: Ident = content.parse()?;
-                        content.parse::<Token![:]>()?;
-                        let body;
-                        braced!(body in content);
-                        let mut entry_source: Option<String> = None;
-                        let mut entry_path: Option<String> = None;
-                        while !body.is_empty() {
-                            let field: Ident = body.parse()?;
-                            body.parse::<Token![:]>()?;
-                            match field.to_string().as_str() {
-                                "source" => {
-                                    let lit: LitStr = body.parse()?;
-                                    entry_source = Some(lit.value());
-                                }
-                                "crate_path" => {
-                                    let path: Path = body.parse()?;
-                                    entry_path = Some(path.to_token_stream().to_string());
-                                }
-                                other => {
-                                    return Err(syn::Error::new(
-                                        field.span(),
-                                        format!(
-                                            "unknown import field `{other}`; expected `source` or `crate_path`"
-                                        ),
-                                    ));
-                                }
-                            }
-                            if body.peek(Token![,]) {
-                                body.parse::<Token![,]>()?;
-                            }
+                        let entry: ImportEntry = content.parse()?;
+                        if entries.iter().any(|previous| previous.alias == entry.alias) {
+                            return Err(syn::Error::new(
+                                entry.alias.span(),
+                                "duplicate import alias",
+                            ));
                         }
-                        let src = entry_source.ok_or_else(|| {
-                            syn::Error::new(alias.span(), "import missing `source` field")
-                        })?;
-                        let cp = entry_path.ok_or_else(|| {
-                            syn::Error::new(alias.span(), "import missing `crate_path` field")
-                        })?;
-                        imports.push(ImportEntry {
-                            alias: alias.to_string(),
-                            source: src,
-                            // Normalize: syn emits `:: foo :: bar`
-                            // (spaces); remove them so downstream
-                            // string ops see a tidy path.
-                            crate_path: cp.replace(' ', ""),
-                        });
-                        if content.peek(Token![,]) {
+                        entries.push(entry);
+                        if !content.is_empty() {
                             content.parse::<Token![,]>()?;
                         }
                     }
+                    imports = Some(entries);
                 }
-                other => {
+                _ => {
                     return Err(syn::Error::new(
                         key.span(),
-                        format!(
-                            "unknown schema argument `{other}`; expected `source` or `imports`"
-                        ),
+                        "unknown or duplicate schema argument; expected `source`, `export`, or `imports`",
                     ));
                 }
             }
-            if input.peek(Token![,]) {
+            if !input.is_empty() {
                 input.parse::<Token![,]>()?;
             }
         }
+        Ok(Self {
+            source: source.ok_or_else(|| {
+                syn::Error::new(input.span(), "schema! requires a `source:` field")
+            })?,
+            export,
+            imports: imports.unwrap_or_default(),
+        })
+    }
+}
 
-        let source = source
-            .ok_or_else(|| syn::Error::new(input.span(), "schema! requires a `source:` field"))?;
-        Ok(Self { source, imports })
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_dependency_exports_and_multiple_imports() {
+        let args: SchemaArgs = syn::parse_str(
+            r#"
+            source: "schema.bpdl", export: export_schema,
+            imports: {
+                first: { schema: ::first::export_schema, crate_path: ::first },
+                second: { source: "local.bpdl", crate_path: ::second },
+            }
+        "#,
+        )
+        .unwrap();
+        assert_eq!(args.export.unwrap().to_string(), "export_schema");
+        assert_eq!(args.imports.len(), 2);
+        assert!(matches!(
+            args.imports[0].source,
+            ImportSource::Dependency(_)
+        ));
+        assert!(matches!(args.imports[1].source, ImportSource::File(_)));
+    }
+
+    #[test]
+    fn rejects_ambiguous_or_missing_sources() {
+        for entry in [
+            r#"source: "a.bpdl", schema: ::a::export_schema, crate_path: ::a"#,
+            r#"schema: ::a::export_schema, source: "a.bpdl", crate_path: ::a"#,
+            "crate_path: ::a",
+            "schema: ::a::export_schema",
+        ] {
+            assert!(
+                syn::parse_str::<SchemaArgs>(&format!(
+                    "source: \"s.bpdl\", imports: {{ a: {{ {entry} }} }}"
+                ))
+                .is_err(),
+                "accepted invalid import: {entry}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_duplicate_aliases_and_invalid_continuations() {
+        assert!(
+            syn::parse_str::<SchemaArgs>(
+                r#"
+            source: "s.bpdl", imports: {
+                a: { schema: ::a::export_schema, crate_path: ::a },
+                a: { schema: ::a::export_schema, crate_path: ::a },
+            }
+        "#
+            )
+            .is_err()
+        );
+        assert!(
+            syn::parse_str::<ImportContinuation>(
+                r#"{ source: "plugin p version 1;" } 0, "plugin q version 1;""#
+            )
+            .is_err()
+        );
     }
 }

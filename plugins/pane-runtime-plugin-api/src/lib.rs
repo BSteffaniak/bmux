@@ -26,6 +26,7 @@ pub mod input_capture;
 
 bmux_plugin_schema_macros::schema! {
     source: "bpdl/pane-runtime-plugin.bpdl",
+    export: export_schema,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
