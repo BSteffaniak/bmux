@@ -162,53 +162,72 @@ mod tests {
     use uuid::Uuid;
 
     thread_local! {
-        static TEST_CANCELLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         static TEST_ORIGIN: std::cell::RefCell<Arc<Mutex<StreamProvenance>>> =
             std::cell::RefCell::new(Arc::new(Mutex::new(StreamProvenance::Invalid)));
     }
 
-    unsafe extern "C" fn origin_bridge(
-        input_ptr: *const u8,
-        input_len: usize,
-        output_ptr: *mut u8,
-        output_capacity: usize,
-        output_len: *mut usize,
-    ) -> i32 {
-        // Live cancellation is owned by the bound host bridge, not the SDK's
-        // serialized cancellation snapshot retained in the cloned context.
-        if TEST_CANCELLED.with(std::cell::Cell::get) {
-            return 1;
-        }
-        let input = unsafe { std::slice::from_raw_parts(input_ptr, input_len) };
-        let Ok(request) = bmux_plugin_sdk::decode_service_message::<
-            bmux_plugin_sdk::HostKernelBridgeRequest,
-        >(input) else {
-            return 1;
-        };
-        let Ok(bmux_ipc::Request::CurrentStreamProvenance) = bmux_ipc::decode(&request.payload)
-        else {
-            return 1;
-        };
-        let provenance = TEST_ORIGIN.with(|current| current.borrow().lock().unwrap().clone());
-        let payload = bmux_ipc::encode(&bmux_ipc::Response::Ok(
-            bmux_ipc::ResponsePayload::CurrentStreamProvenance { provenance },
-        ))
-        .unwrap();
-        let output =
-            encode_service_message(&bmux_plugin_sdk::HostKernelBridgeResponse { payload }).unwrap();
-        if output.len() > output_capacity {
-            return 4;
-        }
-        unsafe {
-            std::ptr::copy_nonoverlapping(output.as_ptr(), output_ptr, output.len());
-            *output_len = output.len();
-        }
-        0
+    fn provenance_port(
+        origin: Arc<Mutex<StreamProvenance>>,
+        cancellation: bmux_plugin_sdk::ServiceCancellation,
+    ) -> bmux_plugin_sdk::PluginHostServices {
+        bmux_plugin_sdk::PluginHostServices::new(
+            // The SDK callback contract returns PluginError by value.
+            #[allow(clippy::result_large_err)]
+            move |request| {
+                use bmux_clients_plugin_api::clients_identity::{
+                    self, IdentityError, StreamProvenance as WireOrigin,
+                };
+                if cancellation.is_cancelled() {
+                    return Err(bmux_plugin_sdk::PluginError::ServiceProtocol {
+                        details: "fixture invocation cancelled".into(),
+                    });
+                }
+                assert_eq!(request.capability, "bmux.clients.read");
+                assert_eq!(request.kind, ServiceKind::Query);
+                assert_eq!(request.interface, clients_identity::INTERFACE_ID.as_str());
+                assert_eq!(request.operation, "current-stream-provenance");
+                bmux_plugin_sdk::service_contract::decode_for(
+                    request.interface,
+                    clients_identity::SERVICE_CONTRACT,
+                    request.payload,
+                )?;
+                let current = origin.lock().unwrap().clone();
+                let value = match current {
+                    StreamProvenance::HostInternal => WireOrigin::HostInternal,
+                    StreamProvenance::Local => WireOrigin::Local,
+                    StreamProvenance::Admitted {
+                        subject_id,
+                        lease_id,
+                    } => WireOrigin::Admitted {
+                        subject_id,
+                        lease_id,
+                    },
+                    StreamProvenance::Invalid => WireOrigin::Invalid,
+                };
+                let payload = encode_service_message(&Ok::<_, IdentityError>(value))?;
+                Ok(bmux_plugin_sdk::service_contract::encode_response(&payload))
+            },
+        )
     }
 
     fn context(interface: &str, operation: &str, payload: Vec<u8>) -> NativeServiceContext {
-        TEST_CANCELLED.with(|cancelled| cancelled.set(false));
+        context_with_cancellation(
+            interface,
+            operation,
+            payload,
+            bmux_plugin_sdk::ServiceCancellation::new(),
+        )
+    }
+
+    fn context_with_cancellation(
+        interface: &str,
+        operation: &str,
+        payload: Vec<u8>,
+        cancellation: bmux_plugin_sdk::ServiceCancellation,
+    ) -> NativeServiceContext {
+        let origin = TEST_ORIGIN.with(|current| Arc::clone(&current.borrow()));
         NativeServiceContext {
+            host_service_port: Some(provenance_port(origin, cancellation)),
             plugin_id: "bmux.pane_runtime".into(),
             request: ServiceRequest {
                 caller_plugin_id: "test.forged-owner".into(),
@@ -244,8 +263,29 @@ mod tests {
             plugin_settings_map: BTreeMap::new(),
             caller_client_id: Some(Uuid::new_v4()),
             cancellation: bmux_plugin_sdk::CancellationToken::default(),
-            host_kernel_bridge: Some(bmux_plugin_sdk::HostKernelBridge::from_fn(origin_bridge)),
+            host_kernel_bridge: None,
         }
+    }
+
+    #[test]
+    fn provenance_query_failure_never_becomes_local_authority() {
+        use bmux_clients_plugin_api::clients_identity::IdentityError;
+        let mut ctx = context("pane-runtime-execution-v4", "send", Vec::new());
+        ctx.host_service_port = None;
+        assert!(super::super::spawn::caller_provenance(&ctx).is_err());
+        let payload = encode_service_message(&Err::<
+            bmux_clients_plugin_api::clients_identity::StreamProvenance,
+            _,
+        >(IdentityError::UnsupportedContext))
+        .unwrap();
+        ctx.host_service_port = Some(bmux_plugin_sdk::PluginHostServices::new(move |_| {
+            Ok(bmux_plugin_sdk::service_contract::encode_response(&payload))
+        }));
+        assert!(super::super::spawn::caller_provenance(&ctx).is_err());
+        ctx.host_service_port = Some(bmux_plugin_sdk::PluginHostServices::new(|_| {
+            Ok(b"invalid checked response".to_vec())
+        }));
+        assert!(super::super::spawn::caller_provenance(&ctx).is_err());
     }
 
     #[test]
@@ -273,7 +313,7 @@ mod tests {
             };
             assert!(authorize_route(&ctx).is_err());
             *origin.lock().unwrap() = StreamProvenance::HostInternal;
-            ctx.host_kernel_bridge = None;
+            ctx.host_service_port = None;
             assert!(authorize_route(&ctx).is_err());
         }
         for (interface, operation) in [
@@ -294,7 +334,13 @@ mod tests {
     fn queued_service_input_rechecks_origin_and_cancellation() {
         let origin = Arc::new(Mutex::new(StreamProvenance::Local));
         TEST_ORIGIN.with(|current| *current.borrow_mut() = origin.clone());
-        let mut ctx = context("pane-runtime-execution-v4", "send", Vec::new());
+        let cancellation = bmux_plugin_sdk::ServiceCancellation::new();
+        let mut ctx = context_with_cancellation(
+            "pane-runtime-execution-v4",
+            "send",
+            Vec::new(),
+            cancellation.clone(),
+        );
         ctx.caller_client_id = None;
         let execution = ExecutionRef {
             session_id: Uuid::new_v4(),
@@ -313,8 +359,8 @@ mod tests {
         assert_eq!(output, b"local");
         *origin.lock().unwrap() = StreamProvenance::Local;
         let authority = input_authority(&ctx, &execution).unwrap();
-        ctx.cancellation.cancel();
-        TEST_CANCELLED.with(|cancelled| cancelled.set(true));
+        // The host port observes live cancellation; token clones are snapshots.
+        cancellation.cancel();
         assert!(authority.write(&mut output, b"cancelled").is_err());
         assert_eq!(output, b"local");
         *origin.lock().unwrap() = StreamProvenance::Admitted {
@@ -330,7 +376,13 @@ mod tests {
         use crate::runtime::input_authority::{local_command, with_local};
         let origin = Arc::new(Mutex::new(StreamProvenance::Local));
         TEST_ORIGIN.with(|current| *current.borrow_mut() = origin.clone());
-        let mut ctx = context("attach-runtime-commands", "attach-input", Vec::new());
+        let cancellation = bmux_plugin_sdk::ServiceCancellation::new();
+        let mut ctx = context_with_cancellation(
+            "attach-runtime-commands",
+            "attach-input",
+            Vec::new(),
+            cancellation.clone(),
+        );
         ctx.caller_client_id = None;
         let session = bmux_session_models::SessionId(Uuid::new_v4());
         let command = with_local(ctx.clone(), || local_command(b"queued".to_vec(), session));
@@ -340,14 +392,56 @@ mod tests {
         let mut output = Vec::new();
         authority.write(&mut output, &bytes).unwrap();
         assert_eq!(output, b"queued");
-        ctx.cancellation.cancel();
-        TEST_CANCELLED.with(|cancelled| cancelled.set(true));
+        cancellation.cancel();
         assert!(authority.write(&mut output, &bytes).is_err());
+        assert_eq!(output, b"queued");
         // Scope restoration keeps ordinary in-process terminal input unchanged.
         assert!(matches!(
             local_command(b"local".to_vec(), session),
             crate::runtime::PaneRuntimeCommand::Input(_)
         ));
+    }
+
+    #[test]
+    fn local_route_waits_after_handler_unlock_and_propagates_write_failure() {
+        use crate::runtime::input_authority::{settled_local_command, with_local_settled};
+        let origin = Arc::new(Mutex::new(StreamProvenance::Local));
+        TEST_ORIGIN.with(|current| *current.borrow_mut() = origin);
+        let mut ctx = context("attach-runtime-commands", "attach-input", Vec::new());
+        ctx.caller_client_id = None;
+        let session = bmux_session_models::SessionId(Uuid::new_v4());
+        let manager = Arc::new(Mutex::new(()));
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let writer_manager = manager.clone();
+        let writer = std::thread::spawn(move || {
+            let crate::runtime::PaneRuntimeCommand::AdmittedInput(
+                bytes,
+                acknowledgement,
+                _permit,
+                _authority,
+            ) = receiver.recv().unwrap()
+            else {
+                panic!("service input must be acknowledged");
+            };
+            // This would deadlock if receipt waiting happened in the handler
+            // while the manager was still locked.
+            let _manager = writer_manager.lock().unwrap();
+            assert_eq!(bytes, b"literal\r");
+            acknowledgement
+                .send(Err("partial write; do not replay".into()))
+                .unwrap();
+        });
+        let result = with_local_settled(ctx, || {
+            let _manager = manager.lock().unwrap();
+            assert!(
+                sender
+                    .send(settled_local_command(b"literal\r".to_vec(), session).unwrap())
+                    .is_ok()
+            );
+            "enqueue is not success"
+        });
+        assert_eq!(result.unwrap_err(), "partial write; do not replay");
+        writer.join().unwrap();
     }
 
     #[test]

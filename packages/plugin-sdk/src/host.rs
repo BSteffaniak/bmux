@@ -3,6 +3,584 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
+/// Explicit invocation-bound host dispatch.
+///
+/// Static implementations use safe Rust handles; a native
+/// ABI adapter implements this trait by owning opaque callback handles. Neither
+/// the trait object nor its callbacks are serialized into remote protocols.
+/// The implementation binds caller provenance, deadline and live cancellation
+/// from `invocation`, never from fields inside the operation payload. Nested
+/// calls must create distinct child invocation identities.
+pub trait HostServiceDispatch: Send + Sync {
+    /// Dispatch once through the selected host.
+    ///
+    /// # Errors
+    /// Returns admission, authorization, protocol or provider errors.
+    fn invoke(
+        &self,
+        invocation: &bmux_plugin_runtime::InvocationScope,
+        request: HostServiceRequest<'_>,
+    ) -> Result<Vec<u8>>;
+
+    /// Acquire an independent owner-scoped retained host capability.
+    ///
+    /// # Errors
+    /// Unsupported or stale authority must fail, never adapt `invoke` as a ledger.
+    fn open_retained_host(
+        &self,
+        _invocation: &bmux_plugin_runtime::InvocationScope,
+    ) -> Result<crate::abi::retained::RetainedHostPort> {
+        Err(PluginError::UnsupportedHostOperation {
+            operation: "open_retained_host",
+        })
+    }
+
+    /// Acquire explicitly negotiated recovery-v2 for the selected owner.
+    ///
+    /// # Errors
+    /// Missing V2 support or stale authority fails without V1 or service fallback.
+    fn open_retained_host_v2(
+        &self,
+        _invocation: &bmux_plugin_runtime::InvocationScope,
+    ) -> Result<crate::abi::retained::RetainedHostPort> {
+        Err(PluginError::UnsupportedHostOperation {
+            operation: "open_retained_host_v2",
+        })
+    }
+
+    /// Observe selected registry presence through an admitted host lookup.
+    ///
+    /// # Errors
+    /// Unsupported negotiation, denied access, stale scope and registry failures
+    /// are errors, never evidence that a provider is absent. Implementations own
+    /// authoritative lookup and must not infer presence from caller metadata.
+    fn selected_service_availability(
+        &self,
+        _invocation: &bmux_plugin_runtime::InvocationScope,
+        _key: crate::typed_dispatch::ServiceAvailabilityKey,
+    ) -> crate::definition::PluginFuture<
+        'static,
+        Result<crate::typed_dispatch::SelectedServiceAvailability>,
+    > {
+        Box::pin(async {
+            Err(PluginError::UnsupportedHostOperation {
+                operation: "selected_service_availability",
+            })
+        })
+    }
+
+    /// Dispatch through an explicitly supported asynchronous host executor.
+    /// Unsupported hosts never run a synchronous callback on the async worker.
+    ///
+    /// # Errors
+    /// Returns unsupported dispatch by default, or selected executor failures.
+    /// Implementations must retain admission for spawned work through settlement.
+    fn invoke_async(
+        &self,
+        _invocation: &bmux_plugin_runtime::InvocationScope,
+        _request: crate::HostServiceOwnedRequest,
+    ) -> crate::definition::PluginFuture<'static, Result<Vec<u8>>> {
+        Box::pin(async {
+            Err(PluginError::UnsupportedHostOperation {
+                operation: "invoke_async",
+            })
+        })
+    }
+}
+
+/// Operation metadata is not caller authority. Generated BPDL clients own the
+/// typed request/response encoding; this port does not invent a second envelope.
+pub struct HostServiceRequest<'a> {
+    pub capability: &'a str,
+    pub kind: ServiceKind,
+    pub interface: &'a str,
+    pub operation: &'a str,
+    pub payload: &'a [u8],
+}
+
+/// Invocation-bound host capability.
+///
+/// Supplied by trusted host wiring. It cannot
+/// be reconstructed from serializable scope IDs. A stale captured port fails
+/// closed once its invocation/activation closes. No global fallback is used.
+#[derive(Clone)]
+pub struct BoundHostServicePort {
+    invocation: bmux_plugin_runtime::InvocationScope,
+    dispatch: std::sync::Arc<dyn HostServiceDispatch>,
+}
+
+impl std::fmt::Debug for BoundHostServicePort {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BoundHostServicePort")
+            .field("invocation", &self.invocation.id())
+            .finish_non_exhaustive()
+    }
+}
+
+impl BoundHostServicePort {
+    #[must_use]
+    pub const fn invocation_scope(&self) -> &bmux_plugin_runtime::InvocationScope {
+        &self.invocation
+    }
+
+    /// Host/ABI adapter construction only. Plugins receive an already bound
+    /// capability; accepting payload-provided invocation IDs is not equivalent.
+    #[must_use]
+    pub fn new(
+        invocation: bmux_plugin_runtime::InvocationScope,
+        dispatch: std::sync::Arc<dyn HostServiceDispatch>,
+    ) -> Self {
+        Self {
+            invocation,
+            dispatch,
+        }
+    }
+
+    /// Acquire an independent retained table while this invocation is admitted.
+    ///
+    /// # Errors
+    /// Closed scopes and unnegotiated retained capability fail without fallback.
+    /// The returned table has its own lifetime and requires explicit release.
+    pub fn open_retained_host(&self) -> Result<crate::abi::retained::RetainedHostPort> {
+        let _admission =
+            self.invocation
+                .try_admit()
+                .map_err(|error| PluginError::ServiceProtocol {
+                    details: error.to_string(),
+                })?;
+        self.dispatch.open_retained_host(&self.invocation)
+    }
+
+    /// Open only recovery-v2 while this exact invocation is admitted.
+    ///
+    /// # Errors
+    /// Rejects closed admission and unnegotiated V2; never falls back to V1.
+    pub fn open_retained_host_v2(&self) -> Result<crate::abi::retained::RetainedHostPort> {
+        let _admission =
+            self.invocation
+                .try_admit()
+                .map_err(|error| PluginError::ServiceProtocol {
+                    details: error.to_string(),
+                })?;
+        self.dispatch.open_retained_host_v2(&self.invocation)
+    }
+
+    /// Query presence only through this capability's live invocation.
+    ///
+    /// # Errors
+    /// Rejects invalid keys, cancelled/closed scopes, unsupported negotiation,
+    /// access denial and registry errors; none are converted to `Absent`.
+    pub fn selected_service_availability(
+        &self,
+        key: crate::typed_dispatch::ServiceAvailabilityKey,
+    ) -> crate::definition::PluginFuture<
+        'static,
+        Result<crate::typed_dispatch::SelectedServiceAvailability>,
+    > {
+        let port = self.clone();
+        Box::pin(async move {
+            key.validate()?;
+            let cancelled =
+                port.invocation
+                    .is_cancelled()
+                    .map_err(|error| PluginError::ServiceProtocol {
+                        details: error.to_string(),
+                    })?;
+            if cancelled {
+                return Err(PluginError::ServiceProtocol {
+                    details: "service availability invocation cancelled".into(),
+                });
+            }
+            let _admission =
+                port.invocation
+                    .try_admit()
+                    .map_err(|error| PluginError::ServiceProtocol {
+                        details: error.to_string(),
+                    })?;
+            let presence = port
+                .dispatch
+                .selected_service_availability(&port.invocation, key)
+                .await?;
+            if port
+                .invocation
+                .is_cancelled()
+                .map_err(|error| PluginError::ServiceProtocol {
+                    details: error.to_string(),
+                })?
+            {
+                return Err(PluginError::ServiceProtocol {
+                    details: "service availability invocation cancelled during lookup".into(),
+                });
+            }
+            Ok(presence)
+        })
+    }
+
+    /// Dispatch owned data while retaining this exact invocation admission.
+    ///
+    /// # Errors
+    /// Rejects stale scopes, unsupported async hosts and oversized responses.
+    pub fn invoke_async(
+        &self,
+        request: crate::HostServiceOwnedRequest,
+    ) -> crate::definition::PluginFuture<'static, Result<Vec<u8>>> {
+        let port = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let _guard =
+                port.invocation
+                    .try_admit()
+                    .map_err(|error| PluginError::ServiceProtocol {
+                        details: format!("host port invocation admission rejected: {error}"),
+                    })?;
+            let response = port
+                .dispatch
+                .invoke_async(&port.invocation, request)
+                .await?;
+            if response.len() > crate::abi::MAX_BUFFER_BYTES {
+                return Err(PluginError::ServiceProtocol {
+                    details: "async host response exceeds bound; operation must not be replayed"
+                        .into(),
+                });
+            }
+            Ok(response)
+        })
+    }
+
+    /// Dispatch one bounded operation without replay.
+    ///
+    /// # Errors
+    /// Returns closed admission, oversized payload or selected dispatch errors.
+    pub fn invoke(&self, request: HostServiceRequest<'_>) -> Result<Vec<u8>> {
+        const MAX_PAYLOAD: usize = 16 * 1024 * 1024;
+        if request.payload.len() > MAX_PAYLOAD {
+            return Err(PluginError::ServiceProtocol {
+                details: "host port request exceeds bound".into(),
+            });
+        }
+        let _guard = self
+            .invocation
+            .try_admit()
+            .map_err(|error| PluginError::ServiceProtocol {
+                details: format!("host port invocation admission rejected: {error}"),
+            })?;
+        let response = self.dispatch.invoke(&self.invocation, request)?;
+        if response.len() > MAX_PAYLOAD {
+            // Do not retry: the operation may already have committed effects.
+            return Err(PluginError::ServiceProtocol {
+                details: "host port response exceeds bound; operation must not be replayed".into(),
+            });
+        }
+        Ok(response)
+    }
+}
+
+impl crate::TypedDispatchClient for BoundHostServicePort {
+    fn requires_service_contracts(&self) -> bool {
+        true
+    }
+
+    fn invoke_service_raw(
+        &mut self,
+        capability: &str,
+        kind: bmux_ipc::InvokeServiceKind,
+        interface_id: &str,
+        operation: &str,
+        payload: Vec<u8>,
+    ) -> impl std::future::Future<
+        Output = std::result::Result<Vec<u8>, crate::TypedDispatchClientError>,
+    > + Send {
+        let future = self.invoke_async(crate::HostServiceOwnedRequest {
+            capability: capability.into(),
+            kind: match kind {
+                bmux_ipc::InvokeServiceKind::Query => ServiceKind::Query,
+                bmux_ipc::InvokeServiceKind::Command => ServiceKind::Command,
+            },
+            interface: interface_id.into(),
+            operation: operation.into(),
+            payload,
+        });
+        let interface = interface_id.to_owned();
+        let operation = operation.to_owned();
+        async move {
+            future.await.map_err(|error| {
+                crate::TypedDispatchClientError::transport(interface, operation, error.to_string())
+            })
+        }
+    }
+}
+
+#[cfg(test)]
+mod host_service_port_tests {
+    use super::*;
+    use bmux_plugin_runtime::{InstanceScope, PluginConcurrencyConfig, PluginRuntimeScopeId};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    #[tokio::test]
+    async fn async_dispatch_has_no_sync_fallback_and_rejects_closed_scope() {
+        let owner = InstanceScope::new(PluginRuntimeScopeId::new());
+        let activation = owner
+            .begin_activation(PluginConcurrencyConfig::Concurrent)
+            .unwrap();
+        activation.mark_active().unwrap();
+        let invocation = activation.begin_invocation().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let port = BoundHostServicePort::new(invocation.clone(), Arc::new(Dispatch(calls.clone())));
+        let request = || crate::HostServiceOwnedRequest {
+            capability: "example.service".into(),
+            kind: ServiceKind::Query,
+            interface: "example-query/v1".into(),
+            operation: "read".into(),
+            payload: Vec::new(),
+        };
+        let services = crate::definition::PluginHostServices::from_bound(port.clone());
+        assert!(matches!(
+            services.call_service_async(request()).await,
+            Err(PluginError::UnsupportedHostOperation {
+                operation: "invoke_async"
+            })
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        invocation.close().unwrap();
+        invocation.finish().unwrap();
+        assert!(
+            port.invoke_async(request())
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("admission rejected")
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn retained_open_unsupported_and_closed_scope_never_use_sync_dispatch() {
+        let (activation, invocation) = availability_scope();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let port = BoundHostServicePort::new(invocation.clone(), Arc::new(Dispatch(calls.clone())));
+        let services = crate::definition::PluginHostServices::from_bound(port);
+        assert!(matches!(
+            services.open_retained_host(),
+            Err(PluginError::UnsupportedHostOperation {
+                operation: "open_retained_host"
+            })
+        ));
+        invocation.close().unwrap();
+        assert!(matches!(
+            services.open_retained_host(),
+            Err(PluginError::ServiceProtocol { .. })
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        invocation.drain().await.unwrap();
+        invocation.finish().unwrap();
+        activation.drain().await.unwrap();
+        activation.finish().unwrap();
+    }
+
+    #[tokio::test]
+    async fn retained_v2_open_never_calls_v1_and_checks_actual_scope() {
+        struct V1Only(Arc<AtomicUsize>);
+        impl HostServiceDispatch for V1Only {
+            fn invoke(
+                &self,
+                _: &bmux_plugin_runtime::InvocationScope,
+                _: HostServiceRequest<'_>,
+            ) -> Result<Vec<u8>> {
+                panic!("V2 open cannot invoke synchronous service fallback");
+            }
+            fn open_retained_host(
+                &self,
+                _: &bmux_plugin_runtime::InvocationScope,
+            ) -> Result<crate::abi::retained::RetainedHostPort> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Err(PluginError::ServiceProtocol {
+                    details: "V1 fallback forbidden".into(),
+                })
+            }
+        }
+        let (activation, invocation) = availability_scope();
+        let v1_calls = Arc::new(AtomicUsize::new(0));
+        let port =
+            BoundHostServicePort::new(invocation.clone(), Arc::new(V1Only(v1_calls.clone())));
+        assert!(matches!(
+            port.open_retained_host_v2(),
+            Err(PluginError::UnsupportedHostOperation {
+                operation: "open_retained_host_v2"
+            })
+        ));
+        assert_eq!(v1_calls.load(Ordering::SeqCst), 0);
+        invocation.close().unwrap();
+        assert!(matches!(
+            port.open_retained_host_v2(),
+            Err(PluginError::ServiceProtocol { .. })
+        ));
+        assert_eq!(v1_calls.load(Ordering::SeqCst), 0);
+        invocation.drain().await.unwrap();
+        invocation.finish().unwrap();
+        activation.drain().await.unwrap();
+        activation.finish().unwrap();
+    }
+
+    fn availability_key() -> crate::typed_dispatch::ServiceAvailabilityKey {
+        crate::typed_dispatch::ServiceAvailabilityKey {
+            capability: "example.service".into(),
+            kind: ServiceKind::Query,
+            interface_id: "example-query/v1".into(),
+        }
+    }
+
+    fn availability_scope() -> (
+        bmux_plugin_runtime::ActivationScope,
+        bmux_plugin_runtime::InvocationScope,
+    ) {
+        let instance = InstanceScope::new(PluginRuntimeScopeId::from_uuid(uuid::Uuid::new_v4()));
+        let activation = instance
+            .begin_activation(PluginConcurrencyConfig::Concurrent)
+            .unwrap();
+        activation.mark_active().unwrap();
+        let invocation = activation.begin_invocation().unwrap();
+        (activation, invocation)
+    }
+
+    #[tokio::test]
+    async fn availability_defaults_to_unsupported_never_absent_or_service_dispatch() {
+        let (activation, invocation) = availability_scope();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let port = BoundHostServicePort::new(invocation.clone(), Arc::new(Dispatch(calls.clone())));
+        let services = crate::definition::PluginHostServices::from_bound(port);
+        assert!(matches!(
+            services
+                .selected_service_availability(availability_key())
+                .await,
+            Err(PluginError::UnsupportedHostOperation {
+                operation: "selected_service_availability"
+            })
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        invocation.drain().await.unwrap();
+        invocation.finish().unwrap();
+        activation.drain().await.unwrap();
+        activation.finish().unwrap();
+    }
+
+    struct AvailabilityDispatch {
+        instance: bmux_plugin_runtime::PluginInstanceId,
+        calls: Arc<AtomicUsize>,
+    }
+    impl HostServiceDispatch for AvailabilityDispatch {
+        fn invoke(
+            &self,
+            _: &bmux_plugin_runtime::InvocationScope,
+            _: HostServiceRequest<'_>,
+        ) -> Result<Vec<u8>> {
+            panic!("availability must not invoke the service");
+        }
+        fn selected_service_availability(
+            &self,
+            invocation: &bmux_plugin_runtime::InvocationScope,
+            _: crate::typed_dispatch::ServiceAvailabilityKey,
+        ) -> crate::definition::PluginFuture<
+            'static,
+            Result<crate::typed_dispatch::SelectedServiceAvailability>,
+        > {
+            let matches = invocation.instance_id() == self.instance;
+            let calls = self.calls.clone();
+            Box::pin(async move {
+                if !matches {
+                    return Err(PluginError::ServiceProtocol {
+                        details: "availability caller instance mismatch".into(),
+                    });
+                }
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(crate::typed_dispatch::SelectedServiceAvailability::Present)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn availability_rejects_oversized_key_foreign_owner_and_closed_scope() {
+        let (activation, invocation) = availability_scope();
+        let (foreign_activation, foreign) = availability_scope();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let dispatch = Arc::new(AvailabilityDispatch {
+            instance: invocation.instance_id(),
+            calls: calls.clone(),
+        });
+        let port = BoundHostServicePort::new(invocation.clone(), dispatch.clone());
+        let mut oversized = availability_key();
+        oversized.interface_id = "x".repeat(crate::service_contract::MAX_INTERFACE_ID_BYTES + 1);
+        assert!(port.selected_service_availability(oversized).await.is_err());
+        let foreign_port = BoundHostServicePort::new(foreign.clone(), dispatch);
+        assert!(
+            foreign_port
+                .selected_service_availability(availability_key())
+                .await
+                .is_err()
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            port.selected_service_availability(availability_key())
+                .await
+                .unwrap(),
+            crate::typed_dispatch::SelectedServiceAvailability::Present
+        );
+        invocation.close().unwrap();
+        assert!(
+            port.selected_service_availability(availability_key())
+                .await
+                .is_err()
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        invocation.drain().await.unwrap();
+        invocation.finish().unwrap();
+        foreign.drain().await.unwrap();
+        foreign.finish().unwrap();
+        activation.drain().await.unwrap();
+        activation.finish().unwrap();
+        foreign_activation.drain().await.unwrap();
+        foreign_activation.finish().unwrap();
+    }
+
+    struct Dispatch(Arc<AtomicUsize>);
+    impl HostServiceDispatch for Dispatch {
+        fn invoke(
+            &self,
+            _invocation: &bmux_plugin_runtime::InvocationScope,
+            request: HostServiceRequest<'_>,
+        ) -> Result<Vec<u8>> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(request.payload.to_vec())
+        }
+    }
+
+    #[test]
+    fn closed_invocation_never_reaches_host_dispatch() {
+        let instance = InstanceScope::new(PluginRuntimeScopeId::from_uuid(uuid::Uuid::new_v4()));
+        let activation = instance
+            .begin_activation(PluginConcurrencyConfig::Concurrent)
+            .unwrap();
+        activation.mark_active().unwrap();
+        let invocation = activation.begin_invocation().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let port = BoundHostServicePort::new(invocation.clone(), Arc::new(Dispatch(calls.clone())));
+        let request = || HostServiceRequest {
+            capability: "example",
+            kind: ServiceKind::Query,
+            interface: "example/v1",
+            operation: "get",
+            payload: b"hello",
+        };
+        assert_eq!(port.invoke(request()).unwrap(), b"hello");
+        invocation.close().unwrap();
+        assert!(port.invoke(request()).is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostMetadata {
     pub product_name: String,

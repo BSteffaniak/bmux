@@ -199,6 +199,7 @@ impl ConfigLoadOverrides {
     }
 }
 
+pub mod artifact_approval;
 pub mod keybind;
 pub mod paths;
 pub mod web;
@@ -2779,6 +2780,11 @@ pub struct PluginConfig {
     /// plugin search path.
     /// Supports `~`, `$VAR`, and `${VAR}` interpolation.
     pub search_paths: Vec<PathBuf>,
+    /// Explicit implementation selection keyed by logical plugin ID. Omitted
+    /// IDs prefer the bundled implementation. Dynamic selections name one exact
+    /// manifest; failure never falls back to another artifact. Selection does
+    /// not enable an otherwise opt-in plugin.
+    pub sources: BTreeMap<String, PluginSourceConfig>,
     /// Per-plugin settings keyed by plugin ID. Each plugin defines its own
     /// accepted keys and values.
     pub settings: BTreeMap<String, toml::Value>,
@@ -2788,6 +2794,40 @@ pub struct PluginConfig {
     /// Command routing policy for plugin ownership and startup validation.
     #[config_doc(nested)]
     pub routing: PluginRoutingPolicyConfig,
+}
+
+/// Startup packaging choice, independent of plugin enablement and settings.
+///
+/// Example: `[plugins.sources."example.plugin"]` with `source = "dynamic"`
+/// and `manifest = "/opt/example/plugin.toml"`. Relative manifest paths resolve
+/// from the startup working directory, like additional plugin search paths.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(tag = "source", rename_all = "snake_case")]
+pub enum PluginSourceConfig {
+    /// Require the implementation compiled into this executable.
+    Bundled,
+    /// Load only the implementation described by this manifest.
+    Dynamic { manifest: PathBuf },
+}
+
+impl<'de> Deserialize<'de> for PluginSourceConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        // Serde's internally tagged unit variants discard remaining fields.
+        // An empty struct variant instead validates the complete selected shape,
+        // so bundled selection cannot silently ignore a dynamic artifact path.
+        #[derive(Deserialize)]
+        #[serde(tag = "source", rename_all = "snake_case", deny_unknown_fields)]
+        enum Source {
+            Bundled {},
+            Dynamic { manifest: PathBuf },
+        }
+        Ok(match Source::deserialize(deserializer)? {
+            Source::Bundled {} => Self::Bundled,
+            Source::Dynamic { manifest } => Self::Dynamic { manifest },
+        })
+    }
 }
 
 /// Native service output buffer sizing and retry behavior.
@@ -3080,6 +3120,15 @@ impl BmuxConfig {
                 Self::interpolate_path_tokens(search_path.as_path(), &field);
             *search_path = expanded;
             warnings.extend(field_warnings);
+        }
+
+        for (plugin_id, source) in &mut self.plugins.sources {
+            if let PluginSourceConfig::Dynamic { manifest } = source {
+                let field = format!("plugins.sources.{plugin_id}.manifest");
+                let (expanded, field_warnings) = Self::interpolate_path_tokens(manifest, &field);
+                *manifest = expanded;
+                warnings.extend(field_warnings);
+            }
         }
 
         warnings

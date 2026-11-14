@@ -1,3 +1,4 @@
+component_roles = ["frontend"]
 execution_class = "native_fast"
 id = "bmux.plugin_cli"
 name = "bmux Plugin CLI"

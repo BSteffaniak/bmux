@@ -1,12 +1,13 @@
 #![cfg_attr(feature = "fail-on-warnings", deny(warnings))]
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
-#![cfg_attr(feature = "static-bundled", allow(dead_code))]
 
 use bmux_keybind::{
     BindableActionArgument, RuntimeAction, action_to_config_name, bindable_action_catalog,
     parse_action,
 };
+mod activation_ports;
+
 use bmux_plugin::{action_dispatch, prompt};
 use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::prompt::PromptOrderedMatchMode;
@@ -18,19 +19,60 @@ use bmux_plugin_sdk::{
 use tracing::{debug, warn};
 
 #[derive(Default)]
-pub struct CommandPalettePlugin;
+pub struct CommandPalettePlugin {
+    binding: activation_ports::Binding,
+    task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+impl Drop for CommandPalettePlugin {
+    fn drop(&mut self) {
+        if let Ok(task) = self.task.get_mut()
+            && let Some(task) = task.take()
+        {
+            task.abort();
+        }
+    }
+}
+
+impl CommandPalettePlugin {
+    /// Supply ports for one subsequent scoped activation; no channels are live
+    /// until `PluginInstance::activate` binds that activation.
+    #[must_use]
+    pub fn with_ports(
+        prompt: prompt::PromptPort,
+        actions: action_dispatch::ActionDispatchPort,
+    ) -> Self {
+        Self {
+            binding: activation_ports::Binding::fixed(prompt, actions),
+            task: std::sync::Mutex::default(),
+        }
+    }
+
+    fn show(&self, context: &NativeCommandContext) -> Result<i32, PluginCommandError> {
+        let (prompt, actions) = self.binding.ports()?;
+        show_command_palette(context, &self.task, prompt, actions)
+    }
+}
 
 impl RustPlugin for CommandPalettePlugin {
     type Contract = bmux_plugin_sdk::NoPluginContract;
 
     fn run_command(&mut self, context: NativeCommandContext) -> Result<i32, PluginCommandError> {
         bmux_plugin_sdk::route_command!(context, {
-            "show" => show_command_palette(&context),
+            "show" => self.show(&context),
         })
     }
 }
 
-fn show_command_palette(context: &NativeCommandContext) -> Result<i32, PluginCommandError> {
+fn show_command_palette(
+    context: &NativeCommandContext,
+    task: &std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    prompt: prompt::PromptPort,
+    actions: action_dispatch::ActionDispatchPort,
+) -> Result<i32, PluginCommandError> {
+    let handle = tokio::runtime::Handle::try_current().map_err(|_| {
+        PluginCommandError::unavailable("command palette requires a frontend async runtime")
+    })?;
     let entries = build_palette_entries(context);
     if entries.is_empty() {
         warn!("command palette: no actions available");
@@ -51,15 +93,21 @@ fn show_command_palette(context: &NativeCommandContext) -> Result<i32, PluginCom
             relevance: true,
         })
         .search_placeholder("Search commands");
-    let response = prompt::submit(request).map_err(|error| {
+    let mut task = task.lock().map_err(|_| {
+        PluginCommandError::unavailable("command palette task owner requires recovery")
+    })?;
+    if task.as_ref().is_some_and(|task| !task.is_finished()) {
+        return Err(PluginCommandError::unavailable(
+            "command palette is already open",
+        ));
+    }
+    let response = prompt.submit(request).map_err(|error| {
         PluginCommandError::unavailable(format!("command palette prompt unavailable: {error}"))
     })?;
-    let handle = tokio::runtime::Handle::try_current().map_err(|_| {
-        PluginCommandError::unavailable(
-            "no tokio runtime available — command palette requires the attach runtime",
-        )
-    })?;
-    handle.spawn(handle_command_palette_response(entries, response));
+    *task = Some(handle.spawn(handle_command_palette_response(
+        entries, response, prompt, actions,
+    )));
+    drop(task);
     Ok(EXIT_OK)
 }
 
@@ -111,6 +159,8 @@ struct PaletteEntry {
 async fn handle_command_palette_response(
     entries: Vec<PaletteEntry>,
     response: tokio::sync::oneshot::Receiver<PromptResponse>,
+    prompt: prompt::PromptPort,
+    actions: action_dispatch::ActionDispatchPort,
 ) {
     let selected = match response.await {
         Ok(PromptResponse::Submitted(PromptValue::Single(value))) => value,
@@ -132,13 +182,14 @@ async fn handle_command_palette_response(
     match entry.kind {
         PaletteEntryKind::BindableAction { action, argument } => {
             if let Some(argument) = argument {
-                let Some(value) = prompt_for_bindable_action_argument(&action, argument).await
+                let Some(value) =
+                    prompt_for_bindable_action_argument(&prompt, &action, argument).await
                 else {
                     return;
                 };
-                dispatch_action(&format!("{action} {value}"));
+                dispatch_action(&actions, &format!("{action} {value}"));
             } else {
-                dispatch_action(&action);
+                dispatch_action(&actions, &action);
             }
         }
         PaletteEntryKind::PluginCommand {
@@ -149,20 +200,20 @@ async fn handle_command_palette_response(
             let args = if uses_default_palette_arguments(&plugin_id, &command_name) {
                 Vec::new()
             } else {
-                let Some(args) = collect_command_arguments(&schema).await else {
+                let Some(args) = collect_command_arguments(&prompt, &schema).await else {
                     return;
                 };
                 args
             };
             let action = plugin_action_string(&plugin_id, &command_name, &args);
-            dispatch_action(&action);
+            dispatch_action(&actions, &action);
         }
     }
 }
 
-fn dispatch_action(action: &str) {
+fn dispatch_action(actions: &action_dispatch::ActionDispatchPort, action: &str) {
     debug!(%action, "command palette: dispatching action");
-    if let Err(error) = action_dispatch::dispatch(action) {
+    if let Err(error) = actions.dispatch(action) {
         warn!(%action, %error, "command palette: dispatch failed");
     }
 }
@@ -286,22 +337,24 @@ fn key_hint_for_actions(
 }
 
 async fn prompt_for_bindable_action_argument(
+    prompt: &prompt::PromptPort,
     action: &str,
     argument: BindableActionArgument,
 ) -> Option<String> {
-    let response = prompt::request(
-        PromptRequest::text_input(format!("{action}: {}", argument.label))
-            .message(format!(
-                "Required keybinding action argument: {}",
-                argument.name
-            ))
-            .input_placeholder(argument.placeholder)
-            .input_required(true)
-            .input_validation(PromptValidation::NonEmpty)
-            .modal_id("command-palette-action-argument"),
-    )
-    .await
-    .ok()?;
+    let response = prompt
+        .request(
+            PromptRequest::text_input(format!("{action}: {}", argument.label))
+                .message(format!(
+                    "Required keybinding action argument: {}",
+                    argument.name
+                ))
+                .input_placeholder(argument.placeholder)
+                .input_required(true)
+                .input_validation(PromptValidation::NonEmpty)
+                .modal_id("command-palette-action-argument"),
+        )
+        .await
+        .ok()?;
     match response {
         PromptResponse::Submitted(PromptValue::Text(value)) => Some(value.trim().to_string()),
         PromptResponse::Cancelled | PromptResponse::RejectedBusy | PromptResponse::Submitted(_) => {
@@ -314,24 +367,33 @@ fn uses_default_palette_arguments(plugin_id: &str, command_name: &str) -> bool {
     plugin_id == "bmux.pane_runtime" && command_name == "pane-padding-configure"
 }
 
-async fn collect_command_arguments(command: &PluginCommand) -> Option<Vec<String>> {
+async fn collect_command_arguments(
+    prompt: &prompt::PromptPort,
+    command: &PluginCommand,
+) -> Option<Vec<String>> {
     let mut args = Vec::new();
     for argument in &command.arguments {
-        let values = prompt_for_argument(command, argument).await?;
+        let values = prompt_for_argument(prompt, command, argument).await?;
         append_argument_values(&mut args, argument, values);
     }
     Some(args)
 }
 
 async fn prompt_for_argument(
+    prompt: &prompt::PromptPort,
     command: &PluginCommand,
     argument: &PluginCommandArgument,
 ) -> Option<Vec<String>> {
     match argument.kind {
-        PluginCommandArgumentKind::Boolean => prompt_boolean_argument(command, argument).await,
-        PluginCommandArgumentKind::Choice => prompt_choice_argument(command, argument).await,
+        PluginCommandArgumentKind::Boolean => {
+            prompt_boolean_argument(prompt, command, argument).await
+        }
+        PluginCommandArgumentKind::Choice => {
+            prompt_choice_argument(prompt, command, argument).await
+        }
         PluginCommandArgumentKind::Integer => {
             prompt_text_argument(
+                prompt,
                 command,
                 argument,
                 Some(PromptValidation::Integer),
@@ -340,24 +402,26 @@ async fn prompt_for_argument(
             .await
         }
         PluginCommandArgumentKind::String | PluginCommandArgumentKind::Path => {
-            prompt_text_argument(command, argument, None, "value").await
+            prompt_text_argument(prompt, command, argument, None, "value").await
         }
     }
 }
 
 async fn prompt_boolean_argument(
+    prompt: &prompt::PromptPort,
     command: &PluginCommand,
     argument: &PluginCommandArgument,
 ) -> Option<Vec<String>> {
-    let response = prompt::request(
-        PromptRequest::confirm(argument_prompt_title(command, argument))
-            .message(optional_argument_message(argument))
-            .confirm_default(false)
-            .confirm_labels("Yes", "No")
-            .modal_id("command-palette-argument"),
-    )
-    .await
-    .ok()?;
+    let response = prompt
+        .request(
+            PromptRequest::confirm(argument_prompt_title(command, argument))
+                .message(optional_argument_message(argument))
+                .confirm_default(false)
+                .confirm_labels("Yes", "No")
+                .modal_id("command-palette-argument"),
+        )
+        .await
+        .ok()?;
     match response {
         PromptResponse::Submitted(PromptValue::Confirm(true)) => Some(vec!["true".to_string()]),
         PromptResponse::Submitted(PromptValue::Confirm(false)) => Some(Vec::new()),
@@ -368,6 +432,7 @@ async fn prompt_boolean_argument(
 }
 
 async fn prompt_choice_argument(
+    prompt: &prompt::PromptPort,
     command: &PluginCommand,
     argument: &PluginCommandArgument,
 ) -> Option<Vec<String>> {
@@ -381,13 +446,14 @@ async fn prompt_choice_argument(
             .iter()
             .map(|value| PromptOption::new(value.clone(), value.clone())),
     );
-    let response = prompt::request(
-        PromptRequest::single_select(argument_prompt_title(command, argument), options)
-            .message(optional_argument_message(argument))
-            .modal_id("command-palette-argument"),
-    )
-    .await
-    .ok()?;
+    let response = prompt
+        .request(
+            PromptRequest::single_select(argument_prompt_title(command, argument), options)
+                .message(optional_argument_message(argument))
+                .modal_id("command-palette-argument"),
+        )
+        .await
+        .ok()?;
     match response {
         PromptResponse::Submitted(PromptValue::Single(value)) if value.is_empty() => {
             Some(Vec::new())
@@ -400,6 +466,7 @@ async fn prompt_choice_argument(
 }
 
 async fn prompt_text_argument(
+    prompt: &prompt::PromptPort,
     command: &PluginCommand,
     argument: &PluginCommandArgument,
     validation: Option<PromptValidation>,
@@ -413,7 +480,7 @@ async fn prompt_text_argument(
     if let Some(validation) = validation {
         request = request.input_validation(validation);
     }
-    let response = prompt::request(request).await.ok()?;
+    let response = prompt.request(request).await.ok()?;
     match response {
         PromptResponse::Submitted(PromptValue::Text(value)) => {
             if value.is_empty() && !argument.required {
@@ -503,7 +570,134 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-bmux_plugin_sdk::export_plugin!(CommandPalettePlugin, include_str!("../plugin.toml"));
+impl bmux_plugin_sdk::definition::PluginInstance for CommandPalettePlugin {
+    fn activate(
+        &self,
+        context: bmux_plugin_sdk::definition::PluginLifecycleContext,
+    ) -> bmux_plugin_sdk::definition::PluginFuture<'_, bmux_plugin_sdk::definition::PluginResult<()>>
+    {
+        Box::pin(async move { self.binding.activate(&context) })
+    }
+
+    fn command(
+        &self,
+        call: bmux_plugin_sdk::definition::PluginCallContext,
+        context: NativeCommandContext,
+    ) -> bmux_plugin_sdk::definition::PluginFuture<'_, bmux_plugin_sdk::definition::CommandOutcome>
+    {
+        Box::pin(async move {
+            if call.cancellation.is_cancelled() {
+                return Err(PluginCommandError::unavailable(
+                    "command palette invocation cancelled",
+                ))
+                .into();
+            }
+            if context.command != "show" {
+                return Err(PluginCommandError::unknown_command(&context.command)).into();
+            }
+            self.show(&context).into()
+        })
+    }
+
+    fn deactivate(
+        &self,
+        context: bmux_plugin_sdk::definition::PluginLifecycleContext,
+    ) -> bmux_plugin_sdk::definition::PluginFuture<'_, bmux_plugin_sdk::definition::PluginResult<()>>
+    {
+        Box::pin(async move {
+            self.binding.close(&context)?;
+            let task = self
+                .task
+                .lock()
+                .map_err(|_| {
+                    PluginCommandError::unavailable("command palette task owner requires recovery")
+                })?
+                .take();
+            if let Some(task) = task {
+                task.abort();
+                let _ = task.await;
+            }
+            self.binding.drained(&context)
+        })
+    }
+}
+
+/// Define a frontend whose channels bind at activation time.
+///
+/// The trusted host must create both ports from the activation belonging to
+/// this lifecycle context, retain its inboxes, and never select global channels.
+#[must_use]
+pub fn plugin_definition_with_activation_ports(
+    bind: impl Fn(
+        &bmux_plugin_sdk::definition::PluginLifecycleContext,
+    ) -> Result<
+        (
+            bmux_plugin::prompt::PromptPort,
+            bmux_plugin::action_dispatch::ActionDispatchPort,
+        ),
+        PluginCommandError,
+    > + Send
+    + Sync
+    + 'static,
+) -> bmux_plugin_sdk::definition::PluginDefinition {
+    let metadata = plugin_definition().metadata;
+    let bind: activation_ports::Binder = std::sync::Arc::new(bind);
+    bmux_plugin_sdk::definition::PluginDefinition::new(metadata, move |scope| {
+        Ok(std::sync::Arc::new(CommandPalettePlugin {
+            binding: activation_ports::Binding::deferred(scope, bind.clone()),
+            task: std::sync::Mutex::default(),
+        })
+            as std::sync::Arc<
+                dyn bmux_plugin_sdk::definition::PluginInstance,
+            >)
+    })
+}
+
+/// Retain compatibility with the create-context injector signature.
+///
+/// Callers must supply the exact activation's channels. The injector now runs
+/// at activation, never at creation.
+#[must_use]
+pub fn plugin_definition_with_ports(
+    inject: impl Fn(
+        bmux_plugin_sdk::definition::PluginCreateContext,
+    ) -> Result<
+        (
+            bmux_plugin::prompt::PromptPort,
+            bmux_plugin::action_dispatch::ActionDispatchPort,
+        ),
+        PluginCommandError,
+    > + Send
+    + Sync
+    + 'static,
+) -> bmux_plugin_sdk::definition::PluginDefinition {
+    plugin_definition_with_activation_ports(move |context| inject(context.scope.clone()))
+}
+
+bmux_plugin_sdk::define_plugin!(
+    factory = |scope| Ok(std::sync::Arc::new(CommandPalettePlugin {
+        binding: activation_ports::Binding::unbound(scope),
+        task: std::sync::Mutex::default(),
+    })
+        as std::sync::Arc<dyn bmux_plugin_sdk::definition::PluginInstance>),
+    metadata = {
+        let manifest_toml = include_str!("../plugin.toml");
+        let manifest = bmux_plugin::PluginManifest::from_toml_str(manifest_toml)
+            .expect("embedded plugin declaration must be valid");
+        bmux_plugin_sdk::definition::PluginMetadata {
+            plugin_id: manifest.id,
+            version: manifest.version,
+            roles: manifest.component_roles,
+            required_capabilities: manifest
+                .required_capabilities
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            contracts: manifest.contracts,
+            manifest_toml: Some(manifest_toml.into()),
+        }
+    },
+);
 
 #[cfg(test)]
 mod tests {
@@ -513,6 +707,27 @@ mod tests {
         uses_default_palette_arguments,
     };
     use bmux_plugin_sdk::{ActiveKeybinding, PluginCommand, PromptOption};
+
+    #[test]
+    fn embedded_declaration_preserves_frontend_only_identity() {
+        let definition = super::plugin_definition();
+        let manifest = bmux_plugin::PluginManifest::from_toml_str(
+            definition
+                .metadata
+                .manifest_toml
+                .as_deref()
+                .expect("embedded declaration"),
+        )
+        .expect("valid embedded declaration");
+        assert_eq!(
+            manifest.component_roles,
+            vec![bmux_plugin_sdk::definition::ComponentRole::Frontend]
+        );
+        assert_eq!(definition.metadata.roles, manifest.component_roles);
+        assert_eq!(definition.metadata.contracts, manifest.contracts);
+        assert_eq!(definition.metadata.plugin_id, manifest.id);
+        assert_eq!(definition.metadata.version, manifest.version);
+    }
 
     #[test]
     fn palette_searches_primary_names_and_identifiers_not_shortcuts() {
@@ -612,7 +827,18 @@ mod tests {
     async fn argumentless_plugin_command_collects_no_arguments() {
         let command = PluginCommand::new("configure", "Open configurator");
 
-        assert_eq!(collect_command_arguments(&command).await, Some(Vec::new()));
+        let instance = bmux_plugin_runtime::InstanceScope::new(
+            bmux_plugin_runtime::PluginRuntimeScopeId::default(),
+        );
+        let owner = instance
+            .begin_activation(bmux_plugin_runtime::PluginConcurrencyConfig::Concurrent)
+            .unwrap();
+        owner.mark_active().unwrap();
+        let (prompt, _inbox) = bmux_plugin::prompt::PromptPort::channel(owner, 1).unwrap();
+        assert_eq!(
+            collect_command_arguments(&prompt, &command).await,
+            Some(Vec::new())
+        );
     }
 
     #[test]
@@ -702,5 +928,70 @@ mod tests {
             plugin_command_key_hint(&active, "bmux.tabs", "split-pane"),
             Some("Ctrl-A %".to_string())
         );
+    }
+}
+
+#[cfg(test)]
+mod embedded_declaration_identity_tests {
+    #[test]
+    fn definition_and_selected_manifest_have_one_identity() {
+        let definition = super::plugin_definition();
+        definition.validate().expect("definition validates");
+        let embedded = definition
+            .metadata
+            .manifest_toml
+            .as_deref()
+            .expect("embedded declaration");
+        let manifest =
+            bmux_plugin::PluginManifest::from_toml_str(embedded).expect("valid manifest");
+        assert_eq!(definition.metadata.plugin_id, manifest.id);
+        assert_eq!(definition.metadata.version, manifest.version);
+        assert_eq!(definition.metadata.roles, manifest.component_roles);
+        assert_eq!(definition.metadata.contracts, manifest.contracts);
+        assert_eq!(
+            definition.metadata.required_capabilities,
+            manifest
+                .required_capabilities
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        );
+
+        // Deterministic verifier fixtures, not claims about built executable bytes.
+        // Real selected artifact hashing remains the loader's responsibility.
+        let expected_digest = "a".repeat(64);
+        let wrong_digest = "b".repeat(64);
+        let pinned = format!("artifact_sha256 = \"{expected_digest}\"\n{embedded}");
+        let mut inventory = bmux_plugin::PluginCandidateInventory::new();
+        inventory
+            .add_bundled_manifest(&pinned, Vec::new())
+            .expect("inventory declaration");
+        for role in &manifest.component_roles {
+            let selected = inventory
+                .select(&bmux_plugin::PluginSelectionRequest {
+                    plugin_id: manifest.id.clone(),
+                    role: *role,
+                    preference: bmux_plugin::PluginCandidatePreference::Bundled,
+                    plugin_api: bmux_plugin_sdk::ApiVersion::new(1, 1),
+                    native_abi: bmux_plugin_sdk::ApiVersion::new(1, 1),
+                    contracts: manifest.contracts.clone(),
+                })
+                .expect("select declared role and contracts");
+            selected
+                .validate_embedded_metadata(&definition.metadata, &expected_digest)
+                .expect("selected declaration and embedded identity match");
+            assert!(
+                selected
+                    .validate_embedded_metadata(&definition.metadata, &wrong_digest)
+                    .is_err()
+            );
+            let mut conflicting = definition.metadata.clone();
+            conflicting.version.push_str("-conflict");
+            assert!(
+                selected
+                    .validate_embedded_metadata(&conflicting, &expected_digest)
+                    .is_err()
+            );
+        }
     }
 }

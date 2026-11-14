@@ -22,6 +22,9 @@ pub use bmux_plugin_sdk::action_dispatch::ActionDispatchRequest;
 pub enum ActionDispatchError {
     HostUnavailable,
     HostDisconnected,
+    Full,
+    TooLarge,
+    OwnerClosed,
 }
 
 impl fmt::Display for ActionDispatchError {
@@ -29,6 +32,9 @@ impl fmt::Display for ActionDispatchError {
         match self {
             Self::HostUnavailable => f.write_str("action dispatch host unavailable"),
             Self::HostDisconnected => f.write_str("action dispatch host disconnected"),
+            Self::Full => f.write_str("action dispatch queue full"),
+            Self::TooLarge => f.write_str("action dispatch exceeds size bound"),
+            Self::OwnerClosed => f.write_str("action dispatch owner closed"),
         }
     }
 }
@@ -98,6 +104,125 @@ pub fn dispatch(action: impl Into<String>) -> Result<(), ActionDispatchError> {
         .map_err(|_| ActionDispatchError::HostDisconnected)
 }
 
+/// Explicit activation-owned action channel. No singleton is consulted.
+#[derive(Clone)]
+pub struct ActionDispatchPort {
+    owner: bmux_plugin_runtime::ActivationScope,
+    sender: mpsc::Sender<ActionDispatchRequest>,
+}
+
+pub struct ActionDispatchInbox {
+    owner: bmux_plugin_runtime::ActivationScope,
+    receiver: mpsc::Receiver<ActionDispatchRequest>,
+}
+
+impl ActionDispatchPort {
+    /// The receiver belongs to exactly one frontend activation. Closing that
+    /// activation invalidates queued work as well as retained sender clones.
+    ///
+    /// # Errors
+    /// Returns an explicit error for unavailable/closed owners, invalid input,
+    /// capacity limits, or failed dispatch/cleanup; no alternate host is selected.
+    pub fn channel(
+        owner: bmux_plugin_runtime::ActivationScope,
+        capacity: usize,
+    ) -> Result<(Self, ActionDispatchInbox), ActionDispatchError> {
+        if !(1..=1024).contains(&capacity) {
+            return Err(ActionDispatchError::Full);
+        }
+        let _admission = owner
+            .try_admit()
+            .map_err(|_| ActionDispatchError::OwnerClosed)?;
+        let (sender, receiver) = mpsc::channel(capacity);
+        Ok((
+            Self {
+                owner: owner.clone(),
+                sender,
+            },
+            ActionDispatchInbox { owner, receiver },
+        ))
+    }
+
+    ///
+    /// # Errors
+    /// Returns an explicit error for unavailable/closed owners, invalid input,
+    /// capacity limits, or failed dispatch/cleanup; no alternate host is selected.
+    pub fn dispatch(&self, action: impl Into<String>) -> Result<(), ActionDispatchError> {
+        let request = ActionDispatchRequest::new(action);
+        if request.action.len() > 64 * 1024 {
+            return Err(ActionDispatchError::TooLarge);
+        }
+        let _admission = self
+            .owner
+            .try_admit()
+            .map_err(|_| ActionDispatchError::OwnerClosed)?;
+        self.sender.try_send(request).map_err(|error| match error {
+            mpsc::error::TrySendError::Full(_) => ActionDispatchError::Full,
+            mpsc::error::TrySendError::Closed(_) => ActionDispatchError::HostDisconnected,
+        })
+    }
+}
+
+impl ActionDispatchInbox {
+    /// Drain at most one queued action without suspending the frame loop.
+    ///
+    /// # Errors
+    /// Rejects closed owners and disconnected senders; empty is `Ok(None)`.
+    pub fn try_recv(&mut self) -> Result<Option<AdmittedAction>, ActionDispatchError> {
+        let admission = self
+            .owner
+            .try_admit()
+            .map_err(|_| ActionDispatchError::OwnerClosed)?;
+        match self.receiver.try_recv() {
+            Ok(request) => Ok(Some(AdmittedAction {
+                request,
+                _admission: admission,
+            })),
+            Err(mpsc::error::TryRecvError::Empty) => Ok(None),
+            Err(mpsc::error::TryRecvError::Disconnected) => {
+                Err(ActionDispatchError::HostDisconnected)
+            }
+        }
+    }
+
+    /// Runtime must dispatch through this admitted envelope, not detach queued
+    /// work from its owner. Closing admission stops subsequent receives.
+    ///
+    /// # Errors
+    /// Returns an explicit error for unavailable/closed owners, invalid input,
+    /// capacity limits, or failed dispatch/cleanup; no alternate host is selected.
+    pub async fn recv(&mut self) -> Result<AdmittedAction, ActionDispatchError> {
+        let request = tokio::select! {
+            result = self.owner.cancelled() => {
+                let _ = result;
+                self.receiver.close();
+                return Err(ActionDispatchError::OwnerClosed);
+            }
+            request = self.receiver.recv() => request.ok_or(ActionDispatchError::HostDisconnected)?,
+        };
+        let admission = self
+            .owner
+            .try_admit()
+            .map_err(|_| ActionDispatchError::OwnerClosed)?;
+        Ok(AdmittedAction {
+            request,
+            _admission: admission,
+        })
+    }
+}
+
+pub struct AdmittedAction {
+    request: ActionDispatchRequest,
+    _admission: bmux_plugin_runtime::AdmissionGuard,
+}
+
+impl std::ops::Deref for AdmittedAction {
+    type Target = ActionDispatchRequest;
+    fn deref(&self) -> &Self::Target {
+        &self.request
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -119,6 +244,34 @@ mod tests {
 
         let request = rx.recv().await.expect("host should receive request");
         assert_eq!(request.action, "plugin:bmux.tabs:goto-tab 3");
+    }
+
+    #[tokio::test]
+    async fn scoped_actions_reject_overflow_and_closed_owners() {
+        use bmux_plugin_runtime::{InstanceScope, PluginConcurrencyConfig, PluginRuntimeScopeId};
+        let instance = InstanceScope::new(PluginRuntimeScopeId::from_uuid(uuid::Uuid::new_v4()));
+        let owner = instance
+            .begin_activation(PluginConcurrencyConfig::Concurrent)
+            .unwrap();
+        owner.mark_active().unwrap();
+        let (port, mut inbox) = ActionDispatchPort::channel(owner.clone(), 1).unwrap();
+        port.dispatch("first").unwrap();
+        assert_eq!(port.dispatch("second"), Err(ActionDispatchError::Full));
+        let action = inbox.recv().await.unwrap();
+        assert_eq!(action.action, "first");
+        drop(action);
+        port.dispatch("queued").unwrap();
+        owner.close().unwrap();
+        assert_eq!(
+            port.dispatch("closed"),
+            Err(ActionDispatchError::OwnerClosed)
+        );
+        assert!(matches!(
+            inbox.recv().await,
+            Err(ActionDispatchError::OwnerClosed)
+        ));
+        owner.drain().await.unwrap();
+        owner.finish().unwrap();
     }
 
     #[tokio::test]

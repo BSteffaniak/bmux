@@ -2128,6 +2128,44 @@ fn playbook_diff_detects_changes() {
     // Run two different playbooks to get two result JSONs.
     let left_json = run_playbook_fixture_raw("echo_hello.dsl");
     let right_json = run_playbook_fixture_raw("failing_assert.dsl");
+    let left: serde_json::Value =
+        serde_json::from_str(&left_json).expect("successful diff input must contain playbook JSON");
+    let right: serde_json::Value = serde_json::from_str(&right_json)
+        .expect("intentional assertion failure must contain playbook JSON");
+    assert_eq!(
+        left["pass"], true,
+        "diff success input failed before comparison: {left:#}"
+    );
+    assert_eq!(
+        right["pass"], false,
+        "diff failure input unexpectedly passed: {right:#}"
+    );
+    let steps = right["steps"]
+        .as_array()
+        .expect("failure input must contain steps");
+    assert_eq!(
+        steps
+            .iter()
+            .map(|step| step["action"].as_str().unwrap_or(""))
+            .collect::<Vec<_>>(),
+        vec!["new-session", "send-keys", "wait-for", "assert-screen"],
+        "failure input did not execute the intended fixture: {right:#}"
+    );
+    let (assertion, setup) = steps
+        .split_last()
+        .expect("failure input must execute steps");
+    assert!(
+        setup.iter().all(|step| step["status"] == "pass"),
+        "failure input setup must succeed before the intentional assertion: {right:#}"
+    );
+    assert_eq!(
+        assertion["action"], "assert-screen",
+        "wrong failure site: {right:#}"
+    );
+    assert_eq!(
+        assertion["status"], "fail",
+        "intentional assertion did not fail: {right:#}"
+    );
 
     // Write to temp files.
     let dir = std::env::temp_dir().join(format!("bmux-diff-test-{}", std::process::id()));

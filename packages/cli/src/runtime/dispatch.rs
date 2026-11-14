@@ -1276,6 +1276,7 @@ pub(super) async fn dispatch_built_in_command(
                 shell.as_deref(),
                 vars,
                 *verbose,
+                None,
             )
             .await
         }

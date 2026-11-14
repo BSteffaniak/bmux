@@ -1,11 +1,16 @@
-execution_class       = "native_fast"
-id                    = "bmux.playbook"
-name                  = "bmux Playbook"
-owns_namespaces       = []
+component_roles = ["backend"]
+contracts = [
+    { interface_id = "playbook-state", major = 1, minor = 0 },
+    { interface_id = "playbook-commands", major = 1, minor = 0 },
+]
+execution_class = "native_fast"
+id = "bmux.playbook"
+name = "bmux Playbook"
+owns_namespaces = []
 provided_capabilities = ["bmux.playbook.read", "bmux.playbook.execute"]
-provided_features     = ["bmux.playbook"]
+provided_features = ["bmux.playbook"]
 required_capabilities = []
-version               = "0.0.1-alpha.0"
+version = "0.0.1-alpha.0"
 
 [[services]]
 capability   = "bmux.playbook.read"

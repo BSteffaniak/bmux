@@ -25,22 +25,27 @@ impl RustPlugin for PluginCliPlugin {
     type Contract = bmux_plugin_sdk::NoPluginContract;
 
     fn run_command(&mut self, context: NativeCommandContext) -> Result<i32, PluginCommandError> {
+        Self::command(&context)
+    }
+}
+
+impl PluginCliPlugin {
+    fn command(context: &NativeCommandContext) -> Result<i32, PluginCommandError> {
         let started = Instant::now();
         let result = match context.command.as_str() {
-            "list" => list_cmd::run_list_command(&context).map_err(PluginCommandError::from),
-            "run" => run_cmd::run_run_command(&context).map_err(PluginCommandError::from),
-            "rebuild" => rebuild::run_rebuild_command(&context).map_err(PluginCommandError::from),
-            "doctor" => doctor::run_doctor_command(&context).map_err(PluginCommandError::from),
-            _ => {
-                if let Some(command_path) = core_proxy_command_path(context.command.as_str()) {
-                    run_core_proxy_command(&context, command_path)
-                } else {
+            "list" => list_cmd::run_list_command(context).map_err(PluginCommandError::from),
+            "run" => run_cmd::run_run_command(context).map_err(PluginCommandError::from),
+            "rebuild" => rebuild::run_rebuild_command(context).map_err(PluginCommandError::from),
+            "doctor" => doctor::run_doctor_command(context).map_err(PluginCommandError::from),
+            _ => core_proxy_command_path(context.command.as_str()).map_or_else(
+                || {
                     Err(PluginCommandError::from(format!(
                         "unsupported command '{}'",
                         context.command
                     )))
-                }
-            }
+                },
+                |command_path| run_core_proxy_command(context, command_path),
+            ),
         };
         emit_phase_timing(&context.command, started.elapsed().as_micros(), &result);
         result
@@ -303,6 +308,37 @@ mod tests {
     };
     use std::collections::BTreeMap;
 
+    #[test]
+    fn selected_command_rejects_missing_execution_before_any_host_effect() {
+        use bmux_plugin_sdk::definition::PluginInstance;
+        let plugin = super::SelectedPluginCli {
+            instance: bmux_plugin_sdk::definition::LoadedInstanceId::from_uuid(
+                "00000000-0000-0000-0000-000000000001".parse().unwrap(),
+            ),
+        };
+        let call = bmux_plugin_sdk::definition::PluginCallContext {
+            callback_execution: None,
+            invocation_id: bmux_plugin_sdk::PluginInvocationId::new(),
+            cancellation: bmux_plugin_sdk::ServiceCancellation::new(),
+            host_services: None,
+        };
+        let mut work =
+            std::pin::pin!(plugin.command(call, test_context("playbook-run", Vec::new())));
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        let std::task::Poll::Ready(outcome) =
+            std::future::Future::poll(work.as_mut(), &mut context)
+        else {
+            panic!("missing execution must reject before queueing");
+        };
+        assert_ne!(outcome.exit_code, 0);
+        assert!(
+            outcome
+                .error
+                .unwrap()
+                .contains("callback authority missing")
+        );
+    }
+
     fn test_context(command: &str, arguments: Vec<String>) -> NativeCommandContext {
         NativeCommandContext {
             plugin_id: "bmux.plugin_cli".to_string(),
@@ -343,6 +379,7 @@ mod tests {
             caller_client_id: None,
             invocation_source: bmux_plugin_sdk::NativeCommandInvocationSource::Unknown,
             host_kernel_bridge: None,
+            host_service_port: None,
         }
     }
 
@@ -431,4 +468,88 @@ mod tests {
     }
 }
 
+struct SelectedPluginCli {
+    instance: bmux_plugin_sdk::definition::LoadedInstanceId,
+}
+
+impl bmux_plugin_sdk::definition::PluginInstance for SelectedPluginCli {
+    fn command(
+        &self,
+        call: bmux_plugin_sdk::definition::PluginCallContext,
+        context: NativeCommandContext,
+    ) -> bmux_plugin_sdk::definition::PluginFuture<'_, bmux_plugin_sdk::definition::CommandOutcome>
+    {
+        let instance = self.instance;
+        Box::pin(async move {
+            let result = async move {
+                let execution = call.callback_execution.ok_or_else(|| {
+                    PluginCommandError::unavailable("selected command callback authority missing")
+                })?;
+                if call.cancellation.is_cancelled() {
+                    return Err(PluginCommandError::unavailable("plugin command cancelled"));
+                }
+                let entry = execution.enter_adapter_entry(instance)?;
+                let output = std::sync::Arc::new(std::sync::Mutex::new(None));
+                let writer = output.clone();
+                execution
+                    .execute_entered(
+                        instance,
+                        entry,
+                        Box::new(move || {
+                            if call.cancellation.is_cancelled() {
+                                return Err(PluginCommandError::unavailable(
+                                    "plugin command cancelled",
+                                ));
+                            }
+                            let result = PluginCliPlugin::command(&context);
+                            *writer.lock().map_err(|_| {
+                                PluginCommandError::failed("command result poisoned")
+                            })? = Some(result);
+                            Ok(())
+                        }),
+                    )
+                    .await?;
+                let result = output
+                    .lock()
+                    .map_err(|_| PluginCommandError::failed("command result poisoned"))?
+                    .take();
+                result
+                    .ok_or_else(|| PluginCommandError::failed("command settled without result"))?
+            }
+            .await;
+            result.into()
+        })
+    }
+}
+
+bmux_plugin_sdk::define_plugin!(
+    factory = |scope: bmux_plugin_sdk::definition::PluginCreateContext| Ok(std::sync::Arc::new(
+        SelectedPluginCli {
+            instance: scope.instance
+        }
+    )
+        as std::sync::Arc<dyn bmux_plugin_sdk::definition::PluginInstance>),
+    metadata = definition_metadata(),
+);
+
 bmux_plugin_sdk::export_plugin!(PluginCliPlugin, include_str!("../plugin.toml"));
+
+fn definition_metadata() -> bmux_plugin_sdk::definition::PluginMetadata {
+    bmux_plugin_sdk::definition::PluginDefinition::from_rust_plugin::<PluginCliPlugin>(
+        include_str!("../plugin.toml"),
+        vec![bmux_plugin_sdk::definition::ComponentRole::Frontend],
+    )
+    .expect("plugin manifest must define valid canonical metadata")
+    .metadata
+}
+
+#[cfg(test)]
+mod canonical_metadata_tests {
+    #[test]
+    fn embedded_manifest_matches_definition_metadata() {
+        let definition = super::plugin_definition();
+        definition
+            .validate()
+            .expect("canonical embedded identity must validate");
+    }
+}

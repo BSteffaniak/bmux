@@ -122,6 +122,10 @@ pub struct SandboxManifestUpdate<'a> {
 /// Required, caller-owned execution infrastructure. There is intentionally no
 /// default adapter: a non-CLI consumer must supply real capabilities explicitly.
 pub trait HostAdapter: std::fmt::Debug + Send + Sync {
+    /// Explicit caller-selected application runtime. None retains standalone defaults.
+    fn selected_runtime(&self) -> Option<(BmuxConfig, ConfigPaths)> {
+        None
+    }
     fn executable(&self) -> Result<PathBuf>;
     fn pane_transport(&self) -> std::sync::Arc<dyn crate::transport::PaneTransport>;
     fn parse_key_chord(&self, chord: &str) -> Result<Vec<KeyStroke>>;

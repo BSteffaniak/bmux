@@ -443,10 +443,15 @@ impl ConsensusNodeRegistry {
     ///
     /// Returns an error when the registry lock is poisoned.
     pub fn insert(&self, node_id: NodeId, node: ConsensusNode) -> Result<(), String> {
-        self.nodes
+        let mut nodes = self
+            .nodes
             .write()
-            .map_err(|_| "consensus node registry lock is poisoned".to_string())?
-            .insert(node_id, node);
+            .map_err(|_| "consensus node registry lock is poisoned".to_string())?;
+        if nodes.contains_key(&node_id) {
+            return Err("consensus node already owned in this runtime scope".into());
+        }
+        nodes.insert(node_id, node);
+        drop(nodes);
         Ok(())
     }
 

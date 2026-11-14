@@ -11,6 +11,16 @@ pub struct CommittedComponentViewport {
 
 impl CommittedComponentViewport {
     pub fn stage(&mut self, revision: u64, viewport: Option<ComponentViewport>) {
+        if self
+            .committed_revision
+            .is_some_and(|current| revision <= current)
+            || self
+                .pending
+                .back()
+                .is_some_and(|(current, _)| revision <= *current)
+        {
+            return;
+        }
         if self.pending.len() == 32 {
             self.pending.pop_front();
         }
@@ -29,7 +39,9 @@ impl CommittedComponentViewport {
         self.committed_revision = Some(revision);
         if let Some((_, viewport)) = self.pending.iter().find(|(id, _)| *id == revision) {
             self.committed = viewport.clone();
-        } else if self.pending.front().is_some_and(|(id, _)| revision < *id) {
+        } else {
+            // Unknown output must never inherit geometry from an older frame.
+            // The caller must republish a complete newer viewport to recover.
             self.committed = None;
         }
         self.pending.retain(|(id, _)| *id > revision);
@@ -88,6 +100,31 @@ mod tests {
         state.acknowledge(12);
         state.acknowledge(11);
         assert!(state.get().is_none());
+    }
+
+    #[test]
+    fn unknown_acknowledgment_suspends_previous_geometry() {
+        let mut state = CommittedComponentViewport::default();
+        state.stage(1, viewport(2));
+        state.acknowledge(1);
+        state.acknowledge(4);
+        assert!(state.get().is_none());
+        state.stage(3, viewport(8));
+        state.acknowledge(3);
+        assert!(state.get().is_none());
+        state.stage(5, viewport(8));
+        state.acknowledge(5);
+        assert_eq!(state.get().unwrap().visible_rect().x, 8);
+    }
+
+    #[test]
+    fn duplicate_or_out_of_order_publications_cannot_replace_pending_geometry() {
+        let mut state = CommittedComponentViewport::default();
+        state.stage(3, viewport(2));
+        state.stage(3, viewport(8));
+        state.stage(2, viewport(8));
+        state.acknowledge(3);
+        assert_eq!(state.get().unwrap().visible_rect().x, 2);
     }
 
     #[test]

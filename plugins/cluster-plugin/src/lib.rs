@@ -91,17 +91,17 @@ pub(crate) const CLUSTER_CONNECTION_EVENTS_MAX: usize = 256;
 pub struct ClusterPlugin {
     node_identity: Option<NodeIdentity>,
     cluster_id: Option<ClusterId>,
+    nodes: consensus_network::ConsensusNodeRegistry,
+    bootstrap: Arc<tokio::sync::Mutex<()>>,
 }
 
 async fn ensure_persistent_consensus_runtime(
     caller: Arc<bmux_plugin::TypedServiceCaller>,
     state_dir: PathBuf,
+    nodes: consensus_network::ConsensusNodeRegistry,
+    bootstrap: Arc<tokio::sync::Mutex<()>>,
 ) -> Result<(), String> {
-    static START_GUARD: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
-    let _start_guard = START_GUARD
-        .get_or_init(|| tokio::sync::Mutex::new(()))
-        .lock()
-        .await;
+    let _start_guard = bootstrap.lock().await;
     let Some((cluster_id, identity, member, single_member)) =
         local_consensus_member(caller.as_ref())?
     else {
@@ -114,7 +114,6 @@ async fn ensure_persistent_consensus_runtime(
         )
     })?;
     let node_id = *identity.node_id();
-    let nodes = consensus_network::global_consensus_nodes();
     if nodes.contains(node_id)? {
         return Ok(());
     }
@@ -135,16 +134,20 @@ async fn ensure_persistent_consensus_runtime(
             Ok(true) => {}
             Ok(false) => {
                 if let Err(error) = node.initialize_single(node_id, endpoint.clone()).await {
+                    node.shutdown()
+                        .await
+                        .map_err(|cleanup| format!("consensus cleanup required: {cleanup}"))?;
                     let _ = nodes.remove(node_id);
-                    let _ = node.shutdown().await;
                     return Err(format!(
                         "failed initializing single-voter consensus cluster: {error}"
                     ));
                 }
             }
             Err(error) => {
+                node.shutdown()
+                    .await
+                    .map_err(|cleanup| format!("consensus cleanup required: {cleanup}"))?;
                 let _ = nodes.remove(node_id);
-                let _ = node.shutdown().await;
                 return Err(format!(
                     "failed reading consensus initialization state: {error}"
                 ));
@@ -174,8 +177,10 @@ async fn ensure_persistent_consensus_runtime(
         .map_err(|_| "timed out waiting for initial quorum authority".to_string())
         .and_then(std::convert::identity);
         if let Err(error) = ready {
+            node.shutdown()
+                .await
+                .map_err(|cleanup| format!("consensus cleanup required: {cleanup}"))?;
             let _ = nodes.remove(node_id);
-            let _ = node.shutdown().await;
             return Err(error);
         }
         consensus_membership::publish_members(
@@ -241,8 +246,12 @@ impl RustPlugin for ClusterPlugin {
             &context,
         ));
         let state_dir = PathBuf::from(&context.connection.state_dir);
+        let nodes = self.nodes.clone();
+        let bootstrap = Arc::clone(&self.bootstrap);
         async_handle.spawn_with_name("bmux-cluster-consensus-bootstrap", async move {
-            if let Err(error) = ensure_persistent_consensus_runtime(caller, state_dir).await {
+            if let Err(error) =
+                ensure_persistent_consensus_runtime(caller, state_dir, nodes, bootstrap).await
+            {
                 tracing::error!(%error, "failed ensuring persistent cluster consensus runtime");
             }
         });
@@ -252,7 +261,7 @@ impl RustPlugin for ClusterPlugin {
     fn deactivate(&mut self, _context: NativeLifecycleContext) -> Result<i32, PluginCommandError> {
         if let Some(identity) = self.node_identity.as_ref() {
             let node_id = *identity.node_id();
-            if let Ok(Some(node)) = consensus_network::global_consensus_nodes().remove(node_id) {
+            if let Ok(node) = self.nodes.get(node_id) {
                 let handle = tokio::runtime::Handle::try_current().map_err(|error| {
                     PluginCommandError::failed(format!(
                         "consensus shutdown requires the host runtime: {error}"
@@ -263,6 +272,9 @@ impl RustPlugin for ClusterPlugin {
                         PluginCommandError::failed(format!("consensus shutdown failed: {error}"))
                     },
                 )?;
+                self.nodes
+                    .remove(node_id)
+                    .map_err(PluginCommandError::failed)?;
             }
         }
         Ok(EXIT_OK)
@@ -284,7 +296,7 @@ impl RustPlugin for ClusterPlugin {
         let Ok(identity) = load_or_create_node_identity(caller.as_ref()) else {
             return;
         };
-        let nodes = consensus_network::global_consensus_nodes();
+        let nodes = self.nodes.clone();
         let raft_handle = Arc::new(consensus_network::RaftRpcServiceHandle::new(
             caller.clone(),
             *identity.node_id(),
@@ -488,11 +500,11 @@ impl RustPlugin for ClusterPlugin {
         if let Err(error) = durable_storage::configure(&context.connection.data_dir) {
             return ServiceResponse::error("storage_authority_unavailable", error);
         }
-        if let Some(response) = invoke_native_consensus_service(&context) {
+        if let Some(response) = invoke_native_consensus_service(&context, &self.nodes) {
             return response;
         }
         if is_cluster_lifecycle_service(&context) {
-            return invoke_cluster_lifecycle_service(&context);
+            return invoke_cluster_lifecycle_service(&context, &self.nodes, &self.bootstrap);
         }
         bmux_plugin_sdk::route_service!(context, {
             "cluster-query/v1", "list_clusters" => |(): (), ctx| {
@@ -608,7 +620,10 @@ fn is_cluster_lifecycle_service(context: &NativeServiceContext) -> bool {
     )
 }
 
-fn authoritative_members(ctx: &NativeServiceContext) -> Result<ClusterMemberList, String> {
+fn authoritative_members(
+    ctx: &NativeServiceContext,
+    nodes: &consensus_network::ConsensusNodeRegistry,
+) -> Result<ClusterMemberList, String> {
     let local = local_members(ctx)?;
     let Some(cluster_id) = local.cluster_id.clone() else {
         return Ok(local);
@@ -626,7 +641,7 @@ fn authoritative_members(ctx: &NativeServiceContext) -> Result<ClusterMemberList
     let handle = consensus_network::ControlServiceHandle::new(
         Arc::new(ctx.clone()),
         *identity.node_id(),
-        consensus_network::global_consensus_nodes(),
+        nodes.clone(),
     );
     let runtime = tokio::runtime::Handle::try_current().map_err(|error| {
         format!("authoritative membership read requires the host runtime: {error}")
@@ -643,18 +658,17 @@ fn authoritative_members(ctx: &NativeServiceContext) -> Result<ClusterMemberList
 fn service_peer_authentication_members(
     ctx: &NativeServiceContext,
     requested_node_id: &str,
+    nodes: &consensus_network::ConsensusNodeRegistry,
 ) -> Result<Vec<ClusterMember>, String> {
     let identity = load_or_create_node_identity(ctx)?;
-    let committed = consensus_network::global_consensus_nodes()
-        .get(*identity.node_id())
-        .map_or_else(
-            |_| Ok(Vec::new()),
-            |node| {
-                node.read_stale_view()
-                    .map(|view| view.members)
-                    .map_err(|error| format!("committed membership read failed: {error:?}"))
-            },
-        )?;
+    let committed = nodes.clone().get(*identity.node_id()).map_or_else(
+        |_| Ok(Vec::new()),
+        |node| {
+            node.read_stale_view()
+                .map(|view| view.members)
+                .map_err(|error| format!("committed membership read failed: {error:?}"))
+        },
+    )?;
     peer_authentication_members(
         ctx,
         committed,
@@ -666,48 +680,56 @@ fn service_peer_authentication_members(
 fn reconcile_consensus_members(
     ctx: &NativeServiceContext,
     req: bmux_cluster_plugin_api::cluster_command::client::ConsensusReconcileMembersRequest,
+    nodes: &consensus_network::ConsensusNodeRegistry,
 ) -> Result<ClusterMemberList, String> {
     if req.authorization.action
         != bmux_cluster_plugin_api::cluster_types::ConsensusVoterChangeAction::Add
     {
         return Err("membership reconciliation requires an add authorization".into());
     }
-    apply_signed_voter_transition(ctx, &req.authorization, req.members)
+    apply_signed_voter_transition(ctx, &req.authorization, req.members, nodes)
 }
 
 fn apply_signed_voter_transition(
     ctx: &NativeServiceContext,
     authorization: &bmux_cluster_plugin_api::cluster_types::ConsensusVoterChangeAuthorization,
     proposed: Vec<ClusterMember>,
+    nodes: &consensus_network::ConsensusNodeRegistry,
 ) -> Result<ClusterMemberList, String> {
     let identity = load_or_create_node_identity(ctx)?;
-    let node = consensus_network::global_consensus_nodes()
+    let node = nodes
+        .clone()
         .active(*identity.node_id())
         .map_err(|error| format!("consensus transition unavailable: {error:?}"))?;
     let handle = tokio::runtime::Handle::try_current().map_err(|error| error.to_string())?;
     tokio::task::block_in_place(|| {
         handle.block_on(node.apply_voter_transition(authorization, proposed))
     })?;
-    authoritative_members(ctx)
+    authoritative_members(ctx, nodes)
 }
 
 fn remove_consensus_voter(
     ctx: &NativeServiceContext,
     req: &bmux_cluster_plugin_api::cluster_command::client::ConsensusRemoveVoterRequest,
+    nodes: &consensus_network::ConsensusNodeRegistry,
 ) -> Result<ClusterMemberList, String> {
     if req.authorization.action
         != bmux_cluster_plugin_api::cluster_types::ConsensusVoterChangeAction::Remove
     {
         return Err("voter removal requires a remove authorization".into());
     }
-    let membership = authoritative_members(ctx)?;
+    let membership = authoritative_members(ctx, nodes)?;
     let proposed =
         consensus_membership::removal_plan(&membership.members, &req.authorization.target_node_id)?;
-    apply_signed_voter_transition(ctx, &req.authorization, proposed)
+    apply_signed_voter_transition(ctx, &req.authorization, proposed, nodes)
 }
 
 #[allow(clippy::too_many_lines)]
-fn invoke_cluster_lifecycle_service(context: &NativeServiceContext) -> ServiceResponse {
+fn invoke_cluster_lifecycle_service(
+    context: &NativeServiceContext,
+    nodes: &consensus_network::ConsensusNodeRegistry,
+    bootstrap: &Arc<tokio::sync::Mutex<()>>,
+) -> ServiceResponse {
     bmux_plugin_sdk::route_service!(context, {
         "cluster-command/v1", "join" => |req: ClusterCommandJoinRequest, ctx| {
             let result = adopt_join_result(ctx, &req)
@@ -718,7 +740,7 @@ fn invoke_cluster_lifecycle_service(context: &NativeServiceContext) -> ServiceRe
                 let handle = tokio::runtime::Handle::try_current()
                     .map_err(|error| ServiceResponse::error("join_failed", error.to_string()))?;
                 tokio::task::block_in_place(|| {
-                    handle.block_on(ensure_persistent_consensus_runtime(caller, state_dir))
+                    handle.block_on(ensure_persistent_consensus_runtime(caller, state_dir, nodes.clone(), Arc::clone(bootstrap)))
                 })
                 .map_err(|error| ServiceResponse::error("join_failed", error))?;
             }
@@ -735,7 +757,7 @@ fn invoke_cluster_lifecycle_service(context: &NativeServiceContext) -> ServiceRe
         "cluster-command/v1", "accept_leave" => |req: ClusterCommandAcceptLeaveRequest, ctx| {
             let prospective = accept_leave_prepare(ctx, &req)
                 .map_err(|error| ServiceResponse::error("accept_leave_failed", error))?;
-            if let Ok(node) = consensus_network::global_consensus_nodes().get(
+            if let Ok(node) = nodes.clone().get(
                 *load_or_create_node_identity(ctx)
                     .map_err(|error| ServiceResponse::error("accept_leave_failed", error))?
                     .node_id(),
@@ -776,7 +798,7 @@ fn invoke_cluster_lifecycle_service(context: &NativeServiceContext) -> ServiceRe
         "cluster-command/v1", "credential_rotate_accept" => |req: ClusterCommandCredentialRotateAcceptRequest, ctx| {
             let result = accept_credential_rotation(ctx, &req.request)
                 .map_err(|error| ServiceResponse::error("credential_rotate_accept_failed", error))?;
-            if let Ok(node) = consensus_network::global_consensus_nodes().get(
+            if let Ok(node) = nodes.clone().get(
                 *load_or_create_node_identity(ctx)
                     .map_err(|error| ServiceResponse::error("credential_rotate_accept_failed", error))?
                     .node_id(),
@@ -802,7 +824,7 @@ fn invoke_cluster_lifecycle_service(context: &NativeServiceContext) -> ServiceRe
         "cluster-command/v1", "member_revoke" => |req: ClusterCommandMemberRevokeRequest, ctx| {
             let result = revoke_member(ctx, &req.node_id)
                 .map_err(|error| ServiceResponse::error("member_revoke_failed", error))?;
-            if let Ok(node) = consensus_network::global_consensus_nodes().get(
+            if let Ok(node) = nodes.clone().get(
                 *load_or_create_node_identity(ctx)
                     .map_err(|error| ServiceResponse::error("member_revoke_failed", error))?
                     .node_id(),
@@ -825,10 +847,10 @@ fn invoke_cluster_lifecycle_service(context: &NativeServiceContext) -> ServiceRe
             let identity = load_or_create_node_identity(ctx)
                 .map_err(|error| ServiceResponse::error("consensus_reconcile_failed", error))?;
             let node_id = *identity.node_id();
-            let nodes = consensus_network::global_consensus_nodes();
+            let nodes = nodes.clone();
             let handle = tokio::runtime::Handle::try_current()
                 .map_err(|error| ServiceResponse::error("consensus_reconcile_failed", error.to_string()))?;
-            let membership = authoritative_members(ctx)
+            let membership = authoritative_members(ctx, &nodes)
                 .map_err(|error| ServiceResponse::error("consensus_reconcile_failed", error))?;
             tokio::task::block_in_place(|| {
                 handle.block_on(consensus_membership::reconcile_members(
@@ -848,21 +870,21 @@ fn invoke_cluster_lifecycle_service(context: &NativeServiceContext) -> ServiceRe
                 ))
             })
             .map_err(|error| ServiceResponse::error("consensus_reconcile_failed", error))?;
-            authoritative_members(ctx)
+            authoritative_members(ctx, &nodes)
                 .map_err(|error| ServiceResponse::error("consensus_reconcile_failed", error))
         },
         "cluster-command/v1", "consensus_reconcile_members" => |req: bmux_cluster_plugin_api::cluster_command::client::ConsensusReconcileMembersRequest, ctx| {
-            reconcile_consensus_members(ctx, req)
+            reconcile_consensus_members(ctx, req, nodes)
                 .map_err(|error| ServiceResponse::error("consensus_reconcile_failed", error))
         },
         "cluster-command/v1", "consensus_remove_voter" => |req: bmux_cluster_plugin_api::cluster_command::client::ConsensusRemoveVoterRequest, ctx| {
-            remove_consensus_voter(ctx, &req)
+            remove_consensus_voter(ctx, &req, nodes)
                 .map_err(|error| ServiceResponse::error("consensus_remove_voter_failed", error))
         },
         "cluster-command/v1", "redeem_enrollment" => |req: ClusterCommandRedeemEnrollmentRequest, ctx| {
             let mut result = redeem_enrollment(ctx, &req)
                 .map_err(|error| ServiceResponse::error("redeem_enrollment_failed", error))?;
-            if let Ok(node) = consensus_network::global_consensus_nodes().get(
+            if let Ok(node) = nodes.clone().get(
                 *load_or_create_node_identity(ctx)
                     .map_err(|error| ServiceResponse::error("redeem_enrollment_failed", error))?
                     .node_id(),
@@ -881,7 +903,7 @@ fn invoke_cluster_lifecycle_service(context: &NativeServiceContext) -> ServiceRe
                 }
             }
             if result.member.capabilities.consensus_role == ClusterConsensusRole::Voter {
-                let committed = authoritative_members(ctx)
+                let committed = authoritative_members(ctx, nodes)
                     .map_err(|error| ServiceResponse::error("redeem_enrollment_failed", error))?;
                 let epoch = committed.membership_epoch.as_deref().ok_or_else(||
                     ServiceResponse::error("redeem_enrollment_failed", "committed membership epoch unavailable"))?;
@@ -925,7 +947,7 @@ fn invoke_cluster_lifecycle_service(context: &NativeServiceContext) -> ServiceRe
                 let handle = tokio::runtime::Handle::try_current()
                     .map_err(|error| ServiceResponse::error("cluster_init_failed", error.to_string()))?;
                 tokio::task::block_in_place(|| {
-                    handle.block_on(ensure_persistent_consensus_runtime(caller, state_dir))
+                    handle.block_on(ensure_persistent_consensus_runtime(caller, state_dir, nodes.clone(), Arc::clone(bootstrap)))
                 })
                 .map_err(|error| ServiceResponse::error("cluster_init_failed", error))?;
             }
@@ -936,11 +958,11 @@ fn invoke_cluster_lifecycle_service(context: &NativeServiceContext) -> ServiceRe
                 .map_err(|error| ServiceResponse::error("identity_failed", error))
         },
         "cluster-query/v1", "members" => |(): (), ctx| {
-            authoritative_members(ctx)
+            authoritative_members(ctx, nodes)
                 .map_err(|error| ServiceResponse::error("members_failed", error))
         },
         "cluster-query/v1", "membership_status" => |(): (), ctx| {
-            let membership = authoritative_members(ctx)
+            let membership = authoritative_members(ctx, nodes)
                 .map_err(|error| ServiceResponse::error("membership_status_failed", error))?;
             membership_status_for_members(ctx, &membership.members)
                 .map_err(|error| ServiceResponse::error("membership_status_failed", error))
@@ -950,7 +972,7 @@ fn invoke_cluster_lifecycle_service(context: &NativeServiceContext) -> ServiceRe
                 .map_err(|error| ServiceResponse::error("enrollments_failed", error))
         },
         "cluster-peer-auth/v1", "challenge" => |req: ClusterPeerChallengeRequest, ctx| {
-            let members = service_peer_authentication_members(ctx, &req.claimant_node_id)
+            let members = service_peer_authentication_members(ctx, &req.claimant_node_id, nodes)
                 .map_err(|error| ServiceResponse::error("peer_auth_challenge_failed", error))?;
             create_peer_auth_challenge_for_members(ctx, &req, &members)
                 .map_err(|error| ServiceResponse::error("peer_auth_challenge_failed", error))
@@ -960,12 +982,153 @@ fn invoke_cluster_lifecycle_service(context: &NativeServiceContext) -> ServiceRe
                 .map_err(|error| ServiceResponse::error("peer_auth_proof_failed", error))
         },
         "cluster-peer-auth/v1", "authenticate" => |req: ClusterPeerAuthenticateRequest, ctx| {
-            let members = service_peer_authentication_members(ctx, &req.proof.claimant_node_id)
+            let members = service_peer_authentication_members(ctx, &req.proof.claimant_node_id, nodes)
                 .map_err(|error| ServiceResponse::error("peer_authentication_failed", error))?;
             authenticate_peer_for_members(ctx, &req, &members)
                 .map_err(|error| ServiceResponse::error("peer_authentication_failed", error))
         },
     })
+}
+
+/// Constructor-injected consensus authority. The supplied registry must belong
+/// to this runtime scope; it is not reconstructed from a logical plugin ID.
+#[must_use]
+pub fn plugin_definition(
+    nodes: consensus_network::ConsensusNodeRegistry,
+) -> bmux_plugin_sdk::definition::PluginDefinition {
+    use bmux_plugin_sdk::definition::{PluginDefinition, PluginInstance};
+    PluginDefinition::new(definition_metadata(), move |_scope| {
+        Ok(Arc::new(ClusterInstance {
+            plugin: std::sync::RwLock::new(ClusterPlugin {
+                nodes: nodes.clone(),
+                ..ClusterPlugin::default()
+            }),
+        }) as Arc<dyn PluginInstance>)
+    })
+}
+pub struct ClusterInstance {
+    plugin: std::sync::RwLock<ClusterPlugin>,
+}
+impl bmux_plugin_sdk::definition::PluginInstance for ClusterInstance {
+    fn register_typed_services_with_context(
+        &self,
+        context: bmux_plugin_sdk::TypedServiceRegistrationContext<'_>,
+        registry: &mut bmux_plugin_sdk::TypedServiceRegistry,
+    ) -> bmux_plugin_sdk::definition::PluginResult<()> {
+        self.plugin
+            .try_read()
+            .map_err(|_| PluginCommandError::unavailable("cluster registration busy"))?
+            .register_typed_services(context, registry);
+        Ok(())
+    }
+
+    fn service_contract_for(&self, interface: &str) -> Option<&'static [u8]> {
+        <bmux_cluster_plugin_api::Contract as bmux_plugin_sdk::PluginContract>::service_contract_for(
+            interface,
+        )
+    }
+
+    fn activate(
+        &self,
+        context: bmux_plugin_sdk::definition::PluginLifecycleContext,
+    ) -> bmux_plugin_sdk::definition::PluginFuture<'_, bmux_plugin_sdk::definition::PluginResult<()>>
+    {
+        Box::pin(async move {
+            let (nodes, bootstrap) = {
+                let mut plugin = self
+                    .plugin
+                    .try_write()
+                    .map_err(|_| PluginCommandError::unavailable("cluster lifecycle busy"))?;
+                RustPlugin::activate(&mut *plugin, context.native.clone())?;
+                (plugin.nodes.clone(), Arc::clone(&plugin.bootstrap))
+            };
+            let caller = Arc::new(bmux_plugin::TypedServiceCaller::from_lifecycle_context(
+                &context.native,
+            ));
+            ensure_persistent_consensus_runtime(
+                caller,
+                PathBuf::from(&context.native.connection.state_dir),
+                nodes,
+                bootstrap,
+            )
+            .await
+            .map_err(PluginCommandError::failed)
+        })
+    }
+    fn deactivate(
+        &self,
+        _context: bmux_plugin_sdk::definition::PluginLifecycleContext,
+    ) -> bmux_plugin_sdk::definition::PluginFuture<'_, bmux_plugin_sdk::definition::PluginResult<()>>
+    {
+        Box::pin(async move {
+            let (nodes, identity, bootstrap) = {
+                let plugin = self
+                    .plugin
+                    .try_read()
+                    .map_err(|_| PluginCommandError::unavailable("cluster lifecycle busy"))?;
+                (
+                    plugin.nodes.clone(),
+                    plugin
+                        .node_identity
+                        .as_ref()
+                        .map(|identity| *identity.node_id()),
+                    Arc::clone(&plugin.bootstrap),
+                )
+            };
+            let _bootstrap = bootstrap.lock().await;
+            if let Some(identity) = identity
+                && nodes
+                    .contains(identity)
+                    .map_err(PluginCommandError::failed)?
+            {
+                let node = nodes.get(identity).map_err(PluginCommandError::failed)?;
+                node.shutdown().await.map_err(|error| {
+                    PluginCommandError::failed(format!("consensus cleanup required: {error}"))
+                })?;
+                nodes.remove(identity).map_err(PluginCommandError::failed)?;
+            }
+            Ok(())
+        })
+    }
+    fn invoke(
+        &self,
+        call: bmux_plugin_sdk::definition::PluginCallContext,
+        context: NativeServiceContext,
+    ) -> bmux_plugin_sdk::definition::PluginFuture<
+        '_,
+        bmux_plugin_sdk::definition::PluginResult<ServiceResponse>,
+    > {
+        Box::pin(async move {
+            if call.cancellation.is_cancelled() {
+                return Err(PluginCommandError::unavailable(
+                    "cluster invocation cancelled",
+                ));
+            }
+            let plugin = self
+                .plugin
+                .try_read()
+                .map_err(|_| PluginCommandError::unavailable("cluster lifecycle busy"))?;
+            Ok(plugin.invoke_service(context))
+        })
+    }
+    fn command(
+        &self,
+        call: bmux_plugin_sdk::definition::PluginCallContext,
+        context: NativeCommandContext,
+    ) -> bmux_plugin_sdk::definition::PluginFuture<'_, bmux_plugin_sdk::definition::CommandOutcome>
+    {
+        Box::pin(async move {
+            if call.cancellation.is_cancelled() {
+                return Err(PluginCommandError::unavailable("cluster command cancelled")).into();
+            }
+            let result = self
+                .plugin
+                .try_write()
+                .map_err(|_| PluginCommandError::unavailable("cluster command busy"))
+                .and_then(|mut plugin| plugin.run_command(context));
+            result.into()
+        })
+    }
 }
 
 #[cfg(test)]
@@ -1447,6 +1610,7 @@ mod tests {
             caller_client_id: None,
             cancellation: bmux_plugin_sdk::CancellationToken::default(),
             host_kernel_bridge: None,
+            host_service_port: None,
         }
     }
 
@@ -3956,5 +4120,35 @@ mod tests {
             retarget_pane_name_with_cluster(Some("host:cache-a"), Some("prod"), "db-b").as_deref(),
             Some("prod:db-b")
         );
+    }
+}
+
+fn definition_metadata() -> bmux_plugin_sdk::definition::PluginMetadata {
+    bmux_plugin_sdk::definition::PluginDefinition::from_rust_plugin::<ClusterPlugin>(
+        include_str!("../plugin.toml"),
+        vec![
+            bmux_plugin_sdk::definition::ComponentRole::Backend,
+            bmux_plugin_sdk::definition::ComponentRole::Frontend,
+        ],
+    )
+    .expect("plugin manifest must define valid canonical metadata")
+    .metadata
+}
+
+#[cfg(test)]
+mod canonical_metadata_tests {
+    #[test]
+    fn embedded_manifest_matches_definition_metadata() {
+        let definition = bmux_plugin_sdk::definition::PluginDefinition::new(
+            super::definition_metadata(),
+            |_scope| {
+                Err(bmux_plugin_sdk::PluginCommandError::unavailable(
+                    "metadata-only regression",
+                ))
+            },
+        );
+        definition
+            .validate()
+            .expect("canonical embedded identity must validate");
     }
 }

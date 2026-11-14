@@ -1,3 +1,9 @@
+component_roles = ["backend", "frontend"]
+contracts = [
+    { interface_id = "clipboard-write/v1", major = 1, minor = 0 },
+    { interface_id = "clipboard-read/v1", major = 1, minor = 0 },
+    { interface_id = "clipboard-remote-sync/v1", major = 1, minor = 0 },
+]
 execution_class = "native_fast"
 id = "bmux.clipboard"
 name = "bmux Clipboard"

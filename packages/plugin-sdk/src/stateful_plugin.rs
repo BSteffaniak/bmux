@@ -55,7 +55,7 @@ pub type StatefulPluginResult<T> = std::result::Result<T, StatefulPluginError>;
 ///
 /// `bytes` is arbitrary; serde-JSON, bmux-codec, or a bespoke binary
 /// format are all valid. Core does not introspect it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct StatefulPluginSnapshot {
     pub id: PluginEventKind,
     pub version: u32,
@@ -173,6 +173,33 @@ pub trait StatefulPlugin: Send + Sync {
 pub struct StatefulPluginHandle(pub Arc<dyn StatefulPlugin>);
 
 impl StatefulPluginHandle {
+    /// Adapt plugin-declared generated BPDL endpoints into the existing snapshot
+    /// participant surface. These are the same typed services for static and ABI
+    /// dispatch, not a second handwritten persistence transport. Endpoint types
+    /// supply contract digests and encodings; no product declarations live here.
+    /// Validation and quiescence are mandatory endpoints, never silent no-ops.
+    /// The handle is invocation-scoped: create/bind it for each orchestration
+    /// round. Do not cache it across the originating invocation's retirement.
+    #[must_use]
+    pub fn from_typed_services<S, V, R, Q>(
+        id: PluginEventKind,
+        dependencies: Vec<PluginEventKind>,
+        port: crate::BoundHostServicePort,
+    ) -> Self
+    where
+        S: crate::TypedServiceEndpoint<Request = (), Response = StatefulPluginSnapshot> + 'static,
+        V: crate::TypedServiceEndpoint<Request = StatefulPluginSnapshot, Response = ()> + 'static,
+        R: crate::TypedServiceEndpoint<Request = StatefulPluginSnapshot, Response = ()> + 'static,
+        Q: crate::TypedServiceEndpoint<Request = (), Response = ()> + 'static,
+    {
+        Self::new(TypedStatefulParticipant::<S, V, R, Q> {
+            id,
+            dependencies,
+            port,
+            endpoints: std::marker::PhantomData,
+        })
+    }
+
     #[must_use]
     pub fn new<P: StatefulPlugin + 'static>(plugin: P) -> Self {
         Self(Arc::new(plugin))
@@ -187,6 +214,93 @@ impl StatefulPluginHandle {
     #[must_use]
     pub fn as_dyn(&self) -> &(dyn StatefulPlugin + 'static) {
         self.0.as_ref()
+    }
+}
+
+type StatefulEndpoints<S, V, R, Q> = std::marker::PhantomData<fn() -> (S, V, R, Q)>;
+
+struct TypedStatefulParticipant<S, V, R, Q> {
+    id: PluginEventKind,
+    dependencies: Vec<PluginEventKind>,
+    port: crate::BoundHostServicePort,
+    endpoints: StatefulEndpoints<S, V, R, Q>,
+}
+
+impl<S, V, R, Q> TypedStatefulParticipant<S, V, R, Q> {
+    fn invoke<E: crate::TypedServiceEndpoint>(
+        &self,
+        request: &E::Request,
+    ) -> StatefulPluginResult<E::Response> {
+        use std::{
+            future::Future,
+            pin::pin,
+            task::{Context, Poll, Waker},
+        };
+        let mut port = self.port.clone();
+        // BoundHostServicePort completes synchronous host dispatch immediately.
+        // Never block a runtime on an arbitrary asynchronous transport here.
+        let mut future = pin!(crate::invoke_typed_service::<_, E>(&mut port, request));
+        match future
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+        {
+            Poll::Ready(result) => result.map_err(|error| StatefulPluginError::RestoreFailed {
+                plugin: self.id.as_str().into(),
+                details: error.to_string(),
+            }),
+            Poll::Pending => Err(StatefulPluginError::RestoreFailed {
+                plugin: self.id.as_str().into(),
+                details: "state participant requires synchronous bound host dispatch".into(),
+            }),
+        }
+    }
+}
+
+impl<S, V, R, Q> StatefulPlugin for TypedStatefulParticipant<S, V, R, Q>
+where
+    S: crate::TypedServiceEndpoint<Request = (), Response = StatefulPluginSnapshot>,
+    V: crate::TypedServiceEndpoint<Request = StatefulPluginSnapshot, Response = ()>,
+    R: crate::TypedServiceEndpoint<Request = StatefulPluginSnapshot, Response = ()>,
+    Q: crate::TypedServiceEndpoint<Request = (), Response = ()>,
+{
+    fn id(&self) -> PluginEventKind {
+        self.id.clone()
+    }
+    fn restore_dependencies(&self) -> Vec<PluginEventKind> {
+        self.dependencies.clone()
+    }
+    fn prepare_final_snapshot(&self) -> StatefulPluginResult<()> {
+        self.invoke::<Q>(&())
+    }
+    fn snapshot(&self) -> StatefulPluginResult<StatefulPluginSnapshot> {
+        let snapshot =
+            self.invoke::<S>(&())
+                .map_err(|error| StatefulPluginError::SnapshotFailed {
+                    plugin: self.id.as_str().into(),
+                    details: error.to_string(),
+                })?;
+        if snapshot.id != self.id || snapshot.bytes.len() > 16 * 1024 * 1024 {
+            return Err(StatefulPluginError::SnapshotFailed {
+                plugin: self.id.as_str().into(),
+                details: "state participant returned mismatched identity or oversized snapshot"
+                    .into(),
+            });
+        }
+        Ok(snapshot)
+    }
+    fn validate_snapshot(&self, snapshot: &StatefulPluginSnapshot) -> StatefulPluginResult<()> {
+        if snapshot.id != self.id || snapshot.bytes.len() > 16 * 1024 * 1024 {
+            return Err(StatefulPluginError::RestoreFailed {
+                plugin: self.id.as_str().into(),
+                details: "state participant received mismatched identity or oversized snapshot"
+                    .into(),
+            });
+        }
+        self.invoke::<V>(snapshot)
+    }
+    fn restore_snapshot(&self, snapshot: StatefulPluginSnapshot) -> StatefulPluginResult<()> {
+        self.validate_snapshot(&snapshot)?;
+        self.invoke::<R>(&snapshot)
     }
 }
 

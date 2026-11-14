@@ -99,7 +99,7 @@ pub fn emit_with_imports(schema: &Schema, imports: &ImportMap) -> String {
         );
     }
     emit_versioned_interface_aliases(schema, &module_counts, &mut out);
-    emit_schema_service_declarations(schema, &mut out);
+    emit_schema_service_declarations(schema, imports, &mut out);
     out
 }
 
@@ -408,7 +408,7 @@ fn emit_enum(e: &EnumDef, out: &mut String) {
     }
 }
 
-fn emit_schema_service_declarations(schema: &Schema, out: &mut String) {
+fn emit_schema_service_declarations(schema: &Schema, imports: &ImportMap, out: &mut String) {
     let module_counts = interface_module_counts(schema);
     let modules = schema
         .interfaces
@@ -424,12 +424,54 @@ fn emit_schema_service_declarations(schema: &Schema, out: &mut String) {
 
     out.push_str("/// Type-level BPDL contract for this plugin API crate.\n");
     out.push_str("pub struct Contract;\n\n");
+    out.push_str("impl Contract {\n");
+    out.push_str(
+        "    /// Exact modeled service evidence for static and negotiated native declarations.\n",
+    );
+    out.push_str("    #[must_use]\n");
+    out.push_str("    pub const fn service_contract_descriptors() -> &'static [::bmux_plugin_sdk::typed_dispatch::ModeledServiceContractDescriptor] {\n");
+    out.push_str("        &[\n");
+    for iface in &schema.interfaces {
+        // Unresolved imported wire types have no compatibility evidence. Keep
+        // their legacy routing declarations, but never advertise negotiation.
+        if crate::canonical::interface_contract(schema, iface, imports).is_empty() {
+            continue;
+        }
+        let Some(capability_name) = iface.capability.as_deref() else {
+            continue;
+        };
+        let Some(kind) = interface_service_kind(iface) else {
+            continue;
+        };
+        let Some(capability) = schema
+            .capabilities
+            .iter()
+            .find(|capability| capability.name == capability_name)
+        else {
+            continue;
+        };
+        let module = interface_module_name(
+            iface,
+            module_counts.get(iface.name.as_str()).copied().unwrap_or(0) > 1,
+        );
+        let interface = iface.interface_version.map_or_else(
+            || iface.name.clone(),
+            |version| format!("{}/v{version}", iface.name),
+        );
+        let _ = writeln!(
+            out,
+            "            ::bmux_plugin_sdk::typed_dispatch::ModeledServiceContractDescriptor {{ capability: {:?}, kind: ::bmux_plugin_sdk::ServiceKind::{kind}, interface_id: {interface:?}, contract: {module}::SERVICE_CONTRACT }},",
+            capability.id
+        );
+    }
+    out.push_str("        ]\n    }\n}\n\n");
     out.push_str("impl ::bmux_plugin_sdk::PluginContract for Contract {\n");
+    out.push_str("    fn service_contract_descriptors() -> &'static [::bmux_plugin_sdk::typed_dispatch::ModeledServiceContractDescriptor] { Self::service_contract_descriptors() }\n");
     out.push_str("    fn service_contract_for(interface_id: &str) -> Option<&'static [u8]> {\n");
     for module in &modules {
         let _ = writeln!(
             out,
-            "        if interface_id == {module}::INTERFACE_ID.as_str() {{ return Some({module}::SERVICE_CONTRACT); }}"
+            "        if interface_id == {module}::INTERFACE_ID.as_str() && !{module}::SERVICE_CONTRACT.is_empty() {{ return Some({module}::SERVICE_CONTRACT); }}"
         );
     }
     out.push_str("        None\n    }\n");
@@ -530,6 +572,109 @@ fn emit_service_trait(
     out.push_str("    }\n\n");
 
     emit_service_client(iface, imports, own_types, out, &trait_name);
+    emit_provider_adapter(iface, imports, own_types, out, &trait_name);
+}
+
+/// Emit one checked byte adapter over the existing typed service object. No
+/// provider-specific transport implementation or duplicate operation model.
+fn emit_provider_adapter(
+    iface: &Interface,
+    _imports: &ImportMap,
+    _own_types: &OwnTypeMap,
+    out: &mut String,
+    trait_name: &str,
+) {
+    if iface.capability.is_none() || interface_service_kind(iface).is_none() {
+        return;
+    }
+    let adapter = format!("{}ProviderAdapter", pascal_case(&iface.name));
+    let _ = writeln!(
+        out,
+        "    pub struct {adapter} {{ inner: ::std::sync::Arc<dyn {trait_name} + Send + Sync> }}"
+    );
+    let _ = writeln!(out, "    impl {adapter} {{");
+    let _ = writeln!(
+        out,
+        "        #[must_use] pub fn new(inner: ::std::sync::Arc<dyn {trait_name} + Send + Sync>) -> Self {{ Self {{ inner }} }}"
+    );
+    out.push_str("    }\n");
+    let _ = writeln!(
+        out,
+        "    impl ::bmux_plugin_sdk::typed_dispatch::PortableServiceProvider for {adapter} {{"
+    );
+    out.push_str("        fn descriptor(&self) -> ::bmux_plugin_sdk::ServiceInterfaceDescriptor { SERVICE_DESCRIPTOR }\n");
+    let streaming = iface
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            InterfaceItem::Command(op) | InterfaceItem::Query(op) if op.emits.is_some() => {
+                Some(format!("\"{}\"", op.name))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if !streaming.is_empty() {
+        let _ = writeln!(
+            out,
+            "        fn supports_streaming(&self, operation: &str) -> bool {{ matches!(operation, {}) }}",
+            streaming.join(" | ")
+        );
+    }
+    out.push_str("        fn dispatch_checked<'a>(&'a self, operation: &'a str, payload: &'a [u8], stream: Option<::bmux_plugin_sdk::typed_dispatch::ServiceStreamContext>) -> ::std::pin::Pin<Box<dyn ::std::future::Future<Output = ::bmux_plugin_sdk::Result<Vec<u8>>> + Send + 'a>> {\n");
+    out.push_str("            Box::pin(async move {\n");
+    out.push_str("                let payload = ::bmux_plugin_sdk::service_contract::decode_for(INTERFACE_ID.as_str(), SERVICE_CONTRACT, payload)?;\n");
+    out.push_str("                match operation {\n");
+    for item in &iface.items {
+        let (InterfaceItem::Query(op) | InterfaceItem::Command(op)) = item else {
+            continue;
+        };
+        let name = snake_case(&op.name);
+        let request_ty = transport_request_type(op);
+        let request_ty = if op.params.is_empty() {
+            request_ty
+        } else {
+            format!("client::{request_ty}")
+        };
+        let _ = writeln!(out, "                    \"{}\" => {{", op.name);
+        if op.emits.is_some() {
+            out.push_str("                        let stream = stream.ok_or_else(|| ::bmux_plugin_sdk::PluginError::ServiceProtocol { details: \"streaming operation requires an event sink\".to_string() })?;\n");
+            out.push_str("                        let (stream, completion) = stream.scoped();\n");
+            out.push_str("                        if stream.cancellation.is_cancelled() { return Err(::bmux_plugin_sdk::PluginError::ServiceProtocol { details: \"service stream cancelled\".to_string() }); }\n");
+        } else {
+            out.push_str("                        if stream.is_some() { return Err(::bmux_plugin_sdk::PluginError::ServiceProtocol { details: \"unary operation does not accept streaming\".to_string() }); }\n");
+        }
+        let binding = if op.params.is_empty() {
+            "_request"
+        } else {
+            "request"
+        };
+        let _ = writeln!(
+            out,
+            "                        let {binding}: {request_ty} = ::bmux_plugin_sdk::decode_service_message(payload)?;"
+        );
+        let mut args = op
+            .params
+            .iter()
+            .map(|p| format!("request.{}", snake_case(&p.name)))
+            .collect::<Vec<_>>();
+        if op.emits.is_some() {
+            args.push("stream.typed_sink()".to_string());
+            args.push("stream.cancellation.clone()".to_string());
+        }
+        let _ = writeln!(
+            out,
+            "                        let response = self.inner.{name}({}).await;",
+            args.join(", ")
+        );
+        if op.emits.is_some() {
+            out.push_str("                        completion.finish()?;\n");
+            out.push_str("                        if stream.cancellation.is_cancelled() { return Err(::bmux_plugin_sdk::PluginError::ServiceProtocol { details: \"service stream cancelled\".to_string() }); }\n");
+        }
+        out.push_str("                        Ok(::bmux_plugin_sdk::service_contract::encode_response(&::bmux_plugin_sdk::encode_service_message(&response)?))\n");
+        out.push_str("                    }\n");
+    }
+    out.push_str("                    _ => Err(::bmux_plugin_sdk::PluginError::ServiceProtocol { details: format!(\"unknown service operation: {operation}\") }),\n");
+    out.push_str("                }\n            })\n        }\n    }\n\n");
 }
 
 fn emit_operation_constants(iface: &Interface, out: &mut String) {
@@ -619,7 +764,8 @@ fn emit_service_client(
     if iface.capability.is_some() && interface_service_kind(iface).is_some() {
         let _ = writeln!(
             out,
-            "    /// Register a provider for this interface using the BPDL-generated service descriptor.\n    ///\n    /// # Errors\n    ///\n    /// Returns if the generated capability id cannot be represented as a host scope.\n    pub fn register_provider(registry: &mut ::bmux_plugin_sdk::TypedServiceRegistry, provider: ::std::sync::Arc<dyn {trait_name} + Send + Sync>) -> ::bmux_plugin_sdk::Result<()> {{\n        registry.insert_typed_descriptor(SERVICE_DESCRIPTOR, provider)\n    }}\n"
+            "    /// Register a provider for this interface using the BPDL-generated service descriptor.\n    ///\n    /// # Errors\n    ///\n    /// Returns if the generated capability id cannot be represented as a host scope.\n    pub fn register_provider(registry: &mut ::bmux_plugin_sdk::TypedServiceRegistry, provider: ::std::sync::Arc<dyn {trait_name} + Send + Sync>) -> ::bmux_plugin_sdk::Result<()> {{\n        registry.insert_typed_provider(SERVICE_DESCRIPTOR, provider.clone(), ::std::sync::Arc::new({}ProviderAdapter::new(provider)))\n    }}\n",
+            pascal_case(&iface.name)
         );
     }
 
@@ -682,8 +828,58 @@ fn emit_transport_client(
     for (op, kind) in operations {
         emit_transport_endpoint(iface, op, kind, capability, imports, own_types, out);
         emit_transport_client_function(op, imports, own_types, out);
+        emit_dispatch_client_function(iface, op, out);
     }
     out.push_str("    }\n\n");
+}
+
+fn emit_dispatch_client_function(iface: &Interface, op: &Operation, out: &mut String) {
+    let name = snake_case(&op.name);
+    let endpoint = format!("{}Endpoint", pascal_case(&op.name));
+    let request = transport_request_type(op);
+    let service = format!("{}Service", pascal_case(&iface.name));
+    let stream_param = if op.emits.is_some() {
+        ", stream: ::bmux_plugin_sdk::typed_dispatch::ServiceStreamContext"
+    } else {
+        ""
+    };
+    let stream = if op.emits.is_some() {
+        "Some(stream)"
+    } else {
+        "None"
+    };
+    out.push_str("        /// Dispatch an admitted operation through native typed or checked portable transport.\n");
+    out.push_str("        ///\n        /// The caller must apply the same authorization, provenance and deadlines on either target.\n");
+    out.push_str("        ///\n        /// # Errors\n        ///\n        /// Returns contract mismatch, unavailable provider, stream negotiation, cancellation, event delivery or codec failures.\n");
+    let _ = writeln!(
+        out,
+        "        pub async fn {name}_dispatch(target: ::bmux_plugin_sdk::typed_dispatch::ServiceDispatchTarget<'_>, request: {request}{stream_param}) -> ::bmux_plugin_sdk::Result<<{endpoint} as ::bmux_plugin_sdk::TypedServiceEndpoint>::Response> {{"
+    );
+    let _ = writeln!(
+        out,
+        "            ::bmux_plugin_sdk::typed_dispatch::dispatch_service::<{endpoint}, dyn super::{service} + Send + Sync, _, _>(target, request, {stream}, |provider, request, stream| async move {{"
+    );
+    let mut args = op
+        .params
+        .iter()
+        .map(|field| format!("request.{}", snake_case(&field.name)))
+        .collect::<Vec<_>>();
+    if op.params.is_empty() {
+        out.push_str("                let _ = request;\n");
+    }
+    if op.emits.is_some() {
+        out.push_str("                let stream = stream.ok_or_else(|| ::bmux_plugin_sdk::PluginError::ServiceProtocol { details: \"streaming operation requires an event sink\".to_string() })?;\n");
+        args.push("stream.typed_sink()".to_string());
+        args.push("stream.cancellation.clone()".to_string());
+    } else {
+        out.push_str("                let _ = stream;\n");
+    }
+    let _ = writeln!(
+        out,
+        "                Ok(provider.{name}({}).await)",
+        args.join(", ")
+    );
+    out.push_str("            }).await\n        }\n\n");
 }
 
 fn emit_transport_endpoint(
@@ -704,7 +900,7 @@ fn emit_transport_endpoint(
         out.push_str("        /// Request-scoped event sink for streaming operation frames.\n");
         let _ = writeln!(
             out,
-            "        pub type {event_sink_name} = ::bmux_plugin_sdk::ServiceEventSinkHandle;"
+            "        pub type {event_sink_name} = ::bmux_plugin_sdk::typed_dispatch::TypedServiceEventSink<{event_ty}>;"
         );
         let _ = writeln!(
             out,
@@ -766,6 +962,9 @@ fn emit_transport_endpoint(
         "            const OPERATION: ::bmux_plugin_sdk::OperationId = super::{};",
         operation_const_name(&op.name)
     );
+    if op.emits.is_some() {
+        out.push_str("            const STREAMING: bool = true;\n");
+    }
     out.push_str("        }\n");
     if let Some(emits) = &op.emits {
         let event_ty = client_rust_type(emits, imports, own_types);
@@ -829,9 +1028,13 @@ fn emit_transport_client_function(
     if op.params.len() >= 7 {
         out.push_str("        #[allow(clippy::too_many_arguments)]\n");
     }
+    let stream_params = op.emits.as_ref().map_or_else(String::new, |emits| format!(
+        ", events: ::bmux_plugin_sdk::typed_dispatch::TypedServiceEventSink<{}>, cancellation: ::bmux_plugin_sdk::ServiceCancellation",
+        client_rust_type(emits, imports, own_types)
+    ));
     let _ = writeln!(
         out,
-        "        pub async fn {name}<C: ::bmux_plugin_sdk::TypedDispatchClient>(client: &mut C{sep}{params}) -> ::bmux_plugin_sdk::TypedServiceClientResult<{returns}> {{"
+        "        pub async fn {name}<C: ::bmux_plugin_sdk::TypedDispatchClient>(client: &mut C{sep}{params}{stream_params}) -> ::bmux_plugin_sdk::TypedServiceClientResult<{returns}> {{"
     );
     let _ = writeln!(out, "            let request = {request_expr};");
     let invoke_fn = if op.emits.is_some() {
@@ -839,9 +1042,14 @@ fn emit_transport_client_function(
     } else {
         "invoke_typed_service"
     };
+    let stream_args = if op.emits.is_some() {
+        ", events, cancellation"
+    } else {
+        ""
+    };
     let _ = writeln!(
         out,
-        "            ::bmux_plugin_sdk::{invoke_fn}::<C, {endpoint_name}>(client, &request).await"
+        "            ::bmux_plugin_sdk::{invoke_fn}::<C, {endpoint_name}>(client, &request{stream_args}).await"
     );
     out.push_str("        }\n\n");
 }
@@ -886,11 +1094,27 @@ fn emit_client_forwarder(
     if op.params.len() >= 7 {
         out.push_str("        #[allow(clippy::too_many_arguments)]\n");
     }
+    let stream_params = op.emits.as_ref().map_or_else(String::new, |emits| format!(
+        ", events: ::bmux_plugin_sdk::typed_dispatch::TypedServiceEventSink<{}>, cancellation: ::bmux_plugin_sdk::ServiceCancellation",
+        rust_type(emits, imports, own_types)
+    ));
+    let stream_args = if op.emits.is_some() {
+        if arg_names.is_empty() {
+            "events, cancellation"
+        } else {
+            ", events, cancellation"
+        }
+    } else {
+        ""
+    };
     let _ = writeln!(
         out,
-        "        pub fn {name}<'a>(&'a self{sep}{params}) -> ::std::pin::Pin<Box<dyn ::std::future::Future<Output = {returns}> + Send + 'a>> {{",
+        "        pub fn {name}<'a>(&'a self{sep}{params}{stream_params}) -> ::std::pin::Pin<Box<dyn ::std::future::Future<Output = {returns}> + Send + 'a>> {{",
     );
-    let _ = writeln!(out, "            self.inner.{name}({arg_names})");
+    let _ = writeln!(
+        out,
+        "            self.inner.{name}({arg_names}{stream_args})"
+    );
     out.push_str("        }\n");
 }
 
@@ -918,9 +1142,13 @@ fn emit_operation_signature(
     if op.params.len() >= 7 {
         out.push_str("        #[allow(clippy::too_many_arguments)]\n");
     }
+    let stream_params = op.emits.as_ref().map_or_else(String::new, |emits| format!(
+        ", events: ::bmux_plugin_sdk::typed_dispatch::TypedServiceEventSink<{}>, cancellation: ::bmux_plugin_sdk::ServiceCancellation",
+        rust_type(emits, imports, own_types)
+    ));
     let _ = writeln!(
         out,
-        "        fn {name}<'a>(&'a self{sep}{params}) -> ::std::pin::Pin<Box<dyn ::std::future::Future<Output = {returns}> + Send + 'a>>;"
+        "        fn {name}<'a>(&'a self{sep}{params}{stream_params}) -> ::std::pin::Pin<Box<dyn ::std::future::Future<Output = {returns}> + Send + 'a>>;"
     );
 }
 
@@ -1358,6 +1586,30 @@ mod tests {
     }
 
     #[test]
+    fn emits_one_checked_provider_adapter_and_real_stream_parameters() {
+        let schema = compile("plugin example version 1; capability WRITE = example.write; @capability(WRITE) @interface-version(2) interface stream { command run(value: u32) -> u32 emits u32; }").expect("valid streaming schema");
+        let rust = emit(&schema);
+        assert!(rust.contains("pub struct StreamProviderAdapter"));
+        assert!(rust.contains("PortableServiceProvider for StreamProviderAdapter"));
+        assert!(rust.contains("decode_for(INTERFACE_ID.as_str(), SERVICE_CONTRACT, payload)?"));
+        assert!(rust.contains("streaming operation requires an event sink"));
+        assert!(rust.contains("let response = self.inner.run(request.value, stream.typed_sink(), stream.cancellation.clone()).await"));
+        assert!(rust.contains("completion.finish()?"));
+        assert!(rust.contains("TypedServiceEventSink<u32>"));
+        assert!(rust.contains("const STREAMING: bool = true"));
+        assert!(rust.contains("fn supports_streaming(&self, operation: &str)"));
+        assert!(rust.contains("pub async fn run_dispatch(target:"));
+        assert!(
+            rust.contains("dispatch_service::<RunEndpoint, dyn super::StreamService + Send + Sync")
+        );
+        assert!(
+            rust.contains("registry.insert_typed_provider(SERVICE_DESCRIPTOR, provider.clone()")
+        );
+        assert!(rust.contains("client, &request, events, cancellation"));
+        assert!(!rust.contains("noop()"));
+    }
+
+    #[test]
     fn emits_interface_id_const() {
         let src = "plugin p version 1;\n\
                    capability TABS_READ = bmux.tabs.read;\n\
@@ -1421,6 +1673,61 @@ mod tests {
             rust.contains("pub const OP_FOCUS_PANE: ::bmux_plugin_sdk::OperationId = ::bmux_plugin_sdk::OperationId::from_static(\"focus-pane\");"),
             "codegen must emit command operation id constants; got: {rust}"
         );
+    }
+
+    #[test]
+    fn unversioned_hyphenated_route_keeps_its_exact_generated_identity() {
+        let schema = compile(
+            "plugin example version 1; capability READ = example.read; \
+             @capability(READ) interface example-state { \
+             record reply { value: u32 } query get() -> reply; }",
+        )
+        .expect("valid neutral contract");
+        let interface = schema
+            .interfaces
+            .iter()
+            .find(|interface| interface.name == "example-state")
+            .expect("modeled example interface");
+        assert_eq!(interface.interface_version, None);
+        let evidence = crate::canonical::interface_contract(&schema, interface, &ImportMap::new());
+        assert_eq!(evidence.len(), 32);
+        let rust = emit(&schema);
+        assert!(rust.contains(
+            "interface_id: \"example-state\", contract: example_state::SERVICE_CONTRACT"
+        ));
+        assert!(rust.contains("interface_id == example_state::INTERFACE_ID.as_str() && !example_state::SERVICE_CONTRACT.is_empty()"));
+        assert!(rust.contains("InterfaceId::from_static(\"example-state\")"));
+        assert!(
+            rust.contains(
+                "const INTERFACE_ID: ::bmux_plugin_sdk::InterfaceId = super::INTERFACE_ID;"
+            )
+        );
+        assert!(rust.contains("decode_for(INTERFACE_ID.as_str(), SERVICE_CONTRACT, payload)?"));
+        assert!(rust.contains(
+            "dispatch_service::<GetEndpoint, dyn super::ExampleStateService + Send + Sync"
+        ));
+        assert!(!rust.contains("interface_id: \"example-state/v1\", contract:"));
+    }
+
+    #[test]
+    fn modeled_contract_exports_preserve_versions_and_exclude_unmodeled_interfaces() {
+        // A type-only interface is valid without a capability; callable legacy
+        // aliases are host metadata, not undeclared BPDL service interfaces.
+        let schema = compile("plugin example version 1; capability READ = example.read; @capability(READ) @interface-version(1) interface state { query get() -> u32; } @capability(READ) @interface-version(2) interface state { query get() -> u64; } interface legacy-alias { record metadata { value: u32 } }").expect("valid");
+        let rust = emit(&schema);
+        assert!(rust.contains("impl Contract {"));
+        assert!(rust.contains("pub const fn service_contract_descriptors()"));
+        assert!(rust.contains("{ Self::service_contract_descriptors() }"));
+        assert!(!rust.contains("{ Contract::service_contract_descriptors() }"));
+        assert!(rust.contains("fn service_contract_descriptors() -> &'static [::bmux_plugin_sdk::typed_dispatch::ModeledServiceContractDescriptor]"));
+        assert!(rust.contains("interface_id: \"state/v1\", contract: state_v1::SERVICE_CONTRACT"));
+        assert!(rust.contains("interface_id: \"state/v2\", contract: state_v2::SERVICE_CONTRACT"));
+        assert!(rust.contains("pub mod legacy_alias"));
+        assert!(rust.contains("pub struct Metadata"));
+        assert!(rust.contains("pub use state_v1 as state;"));
+        assert!(!rust.contains("interface_id: \"legacy-alias\", contract:"));
+        assert!(!rust.contains("interface_id: \"state\", contract:"));
+        assert!(!rust.contains("MODELED_SERVICE_CONTRACT"));
     }
 
     #[test]
@@ -1634,6 +1941,11 @@ mod tests {
                               record pane-state { id: uuid }\n\
                             }";
         let schema = compile(importer).expect("valid");
+        let unresolved = emit(&schema);
+        assert!(unresolved.contains("pub const SERVICE_CONTRACT: &[u8] = &[]"));
+        assert!(!unresolved.contains("interface_id: \"my-iface\", contract:"));
+        assert!(unresolved.contains("my_iface::service_declaration()?"));
+        assert!(unresolved.contains("&& !my_iface::SERVICE_CONTRACT.is_empty()"));
         let imported_schema = compile(imported_src).expect("valid");
         let mut imports = ImportMap::new();
         imports.insert(
@@ -1644,6 +1956,7 @@ mod tests {
             },
         );
         let rust = emit_with_imports(&schema, &imports);
+        assert!(rust.contains("interface_id: \"my-iface\", contract: my_iface::SERVICE_CONTRACT"));
         assert!(
             rust.contains("::bmux_tabs_plugin_api::tabs_state::PaneState"),
             "qualified type should resolve to imported crate path; got: {rust}"

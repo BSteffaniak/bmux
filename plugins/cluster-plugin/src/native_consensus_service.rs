@@ -1,23 +1,31 @@
 use super::*;
 
-pub fn invoke_native_consensus_service(context: &NativeServiceContext) -> Option<ServiceResponse> {
+pub fn invoke_native_consensus_service(
+    context: &NativeServiceContext,
+    nodes: &consensus_network::ConsensusNodeRegistry,
+) -> Option<ServiceResponse> {
     let response = match (
         context.request.service.interface_id.as_str(),
         context.request.operation.as_str(),
     ) {
-        ("cluster-peer-read/v1", "read_linearizable") => invoke_peer_read(context),
-        ("cluster-control-command/v1", "mutate") => invoke_control_mutation(context),
-        ("cluster-control-state/v1", "read_linearizable") => invoke_control_read(context, true),
-        ("cluster-control-state/v1", "read_stale") => invoke_control_read(context, false),
+        ("cluster-peer-read/v1", "read_linearizable") => invoke_peer_read(context, nodes),
+        ("cluster-control-command/v1", "mutate") => invoke_control_mutation(context, nodes),
+        ("cluster-control-state/v1", "read_linearizable") => {
+            invoke_control_read(context, true, nodes)
+        }
+        ("cluster-control-state/v1", "read_stale") => invoke_control_read(context, false, nodes),
         ("cluster-raft-rpc/v1", operation @ ("append_entries" | "install_snapshot" | "vote")) => {
-            invoke_raft_rpc(context, operation)
+            invoke_raft_rpc(context, operation, nodes)
         }
         _ => return None,
     };
     Some(response)
 }
 
-fn invoke_peer_read(context: &NativeServiceContext) -> ServiceResponse {
+fn invoke_peer_read(
+    context: &NativeServiceContext,
+    nodes: &consensus_network::ConsensusNodeRegistry,
+) -> ServiceResponse {
     let result: Result<_, String> = (|| {
         let request: bmux_cluster_plugin_api::cluster_peer_read::client::ReadLinearizableRequest =
             bmux_plugin_sdk::decode_service_message(&context.request.payload)
@@ -32,7 +40,7 @@ fn invoke_peer_read(context: &NativeServiceContext) -> ServiceResponse {
         )?;
         // Query meaning is signed; no payload extensions or stale-read downgrade.
         bmux_plugin_sdk::decode_service_message::<()>(&query).map_err(|error| error.to_string())?;
-        let node = active_node(context)?;
+        let node = active_node(context, nodes)?;
         let runtime = tokio::runtime::Handle::try_current().map_err(|error| error.to_string())?;
         Ok(tokio::task::block_in_place(|| {
             runtime.block_on(node.read_linearizable_view())
@@ -44,12 +52,18 @@ fn invoke_peer_read(context: &NativeServiceContext) -> ServiceResponse {
     }
 }
 
-fn active_node(context: &NativeServiceContext) -> Result<consensus_runtime::ConsensusNode, String> {
+fn active_node(
+    context: &NativeServiceContext,
+    nodes: &consensus_network::ConsensusNodeRegistry,
+) -> Result<consensus_runtime::ConsensusNode, String> {
     let identity = load_or_create_node_identity(context)?;
-    consensus_network::global_consensus_nodes().get(*identity.node_id())
+    nodes.clone().get(*identity.node_id())
 }
 
-fn invoke_control_mutation(context: &NativeServiceContext) -> ServiceResponse {
+fn invoke_control_mutation(
+    context: &NativeServiceContext,
+    nodes: &consensus_network::ConsensusNodeRegistry,
+) -> ServiceResponse {
     let request = match bmux_plugin_sdk::decode_service_message::<
         bmux_cluster_plugin_api::cluster_control_command::client::MutateRequest,
     >(&context.request.payload)
@@ -57,7 +71,7 @@ fn invoke_control_mutation(context: &NativeServiceContext) -> ServiceResponse {
         Ok(request) => request,
         Err(error) => return ServiceResponse::error("invalid_control_request", error.to_string()),
     };
-    let result = active_node(context)
+    let result = active_node(context, nodes)
         .map_err(|reason| {
             bmux_cluster_plugin_api::cluster_types::ControlServiceError::RuntimeUnavailable {
                 reason,
@@ -74,7 +88,11 @@ fn invoke_control_mutation(context: &NativeServiceContext) -> ServiceResponse {
     typed_result(&result)
 }
 
-fn invoke_control_read(context: &NativeServiceContext, linearizable: bool) -> ServiceResponse {
+fn invoke_control_read(
+    context: &NativeServiceContext,
+    linearizable: bool,
+    nodes: &consensus_network::ConsensusNodeRegistry,
+) -> ServiceResponse {
     if let Err(error) = bmux_plugin_sdk::decode_service_message::<()>(&context.request.payload) {
         return ServiceResponse::error("invalid_control_request", error.to_string());
     }
@@ -90,7 +108,7 @@ fn invoke_control_read(context: &NativeServiceContext, linearizable: bool) -> Se
         let handle = consensus_network::ControlServiceHandle::new(
             Arc::new(context.clone()),
             *identity.node_id(),
-            consensus_network::global_consensus_nodes(),
+            nodes.clone(),
         );
         let runtime = tokio::runtime::Handle::try_current().map_err(|error| {
             bmux_cluster_plugin_api::cluster_types::ControlServiceError::RuntimeUnavailable {
@@ -116,7 +134,11 @@ fn invoke_control_read(context: &NativeServiceContext, linearizable: bool) -> Se
     typed_result(&result)
 }
 
-fn invoke_raft_rpc(context: &NativeServiceContext, operation: &str) -> ServiceResponse {
+fn invoke_raft_rpc(
+    context: &NativeServiceContext,
+    operation: &str,
+    nodes: &consensus_network::ConsensusNodeRegistry,
+) -> ServiceResponse {
     service_result((|| {
         let request = match bmux_plugin_sdk::decode_service_message::<
             bmux_cluster_plugin_api::cluster_raft_rpc::client::AppendEntriesRequest,
@@ -132,7 +154,7 @@ fn invoke_raft_rpc(context: &NativeServiceContext, operation: &str) -> ServiceRe
         let handle = consensus_network::RaftRpcServiceHandle::new(
             Arc::new(context.clone()),
             *identity.node_id(),
-            consensus_network::global_consensus_nodes(),
+            nodes.clone(),
         );
         let runtime = tokio::runtime::Handle::try_current().map_err(|error| error.to_string())?;
         Ok(tokio::task::block_in_place(|| match operation {

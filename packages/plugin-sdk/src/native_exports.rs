@@ -325,6 +325,35 @@ pub trait ConcurrentRustPlugin: Default + Send + Sync + 'static {
 }
 
 pub trait RustPlugin: Default + Send + 'static {
+    /// Migration hook for generic state/readiness/frontend registration
+    /// contracts. Consumed by the unified scoped definition, not a global slot.
+    /// # Errors
+    /// Returns an error if the bound scope is unavailable, the request is invalid,
+    /// or the implementation rejects the operation.
+    fn registration_contracts(
+        &self,
+    ) -> Result<Vec<crate::RegistrationContract>, PluginCommandError> {
+        Ok(Vec::new())
+    }
+    /// Native optimization for the same declared typed persistence contracts.
+    /// # Errors
+    /// Returns an error if the bound scope is unavailable, the request is invalid,
+    /// or the implementation rejects the operation.
+    fn stateful_participants(
+        &self,
+    ) -> Result<Vec<crate::StatefulPluginHandle>, PluginCommandError> {
+        Ok(Vec::new())
+    }
+    /// Generated portable dispatch adapters must wrap the same provider objects
+    /// registered through `register_typed_services`, never a second factory.
+    /// # Errors
+    /// Returns an error if the bound scope is unavailable, the request is invalid,
+    /// or the implementation rejects the operation.
+    fn portable_services(
+        &self,
+    ) -> Result<Vec<Arc<dyn crate::PortableServiceProvider>>, PluginCommandError> {
+        Ok(Vec::new())
+    }
     /// BPDL-generated contract this plugin implements.
     ///
     /// Use a generated `*_plugin_api::Contract` for BPDL-backed plugins or
@@ -489,6 +518,11 @@ pub trait RustPlugin: Default + Send + 'static {
 pub struct TypedServiceRegistrationContext<'a> {
     /// The plugin's own id (matches `plugin_id` everywhere else).
     pub plugin_id: &'a str,
+    /// Selected activation-owned host capability for registered typed handles.
+    /// The host must admit a fresh invocation for each subsequent call, not
+    /// capture the temporary registration invocation. `None` means unsupported;
+    /// inventory metadata never supplies replacement authority or absence proof.
+    pub host_service_port: Option<&'a crate::PluginHostServices>,
     /// Handle used to dispatch calls to the host kernel. `None` when
     /// the host is not wired for bridge-style dispatch (e.g. some
     /// test harnesses); typed handles that need host access should
@@ -1495,6 +1529,32 @@ mod concurrent_tests {
         }
     }
 
+    #[test]
+    fn selected_host_port_clones_but_never_crosses_serialization() {
+        let port = crate::PluginHostServices::new(|_request| Ok(vec![7]));
+        let context = service_context(Vec::new()).with_host_service_port(port.clone());
+        assert_eq!(context.host_service_port.as_ref(), Some(&port));
+        assert_eq!(context.host_service_port.as_ref(), Some(&port));
+        assert_eq!(context, context.clone());
+        let independent = crate::PluginHostServices::new(|_request| Ok(vec![7]));
+        assert_ne!(port, independent);
+        assert_ne!(context, context.clone().with_host_service_port(independent));
+        let with_registration = port.clone().with_registrations(|_mutation| Ok(Vec::new()));
+        assert_ne!(port, with_registration);
+        let mut wire = serde_json::to_value(&context).unwrap();
+        assert!(wire.get("host_service_port").is_none());
+        wire.as_object_mut().unwrap().insert(
+            "host_service_port".into(),
+            serde_json::json!({"handle": 42}),
+        );
+        let decoded: NativeServiceContext = serde_json::from_value(wire).unwrap();
+        assert!(decoded.host_service_port.is_none());
+        assert_ne!(context, decoded);
+        let mut unbound = context;
+        unbound.host_service_port = None;
+        assert_eq!(unbound, decoded);
+    }
+
     fn service_context(payload: Vec<u8>) -> NativeServiceContext {
         NativeServiceContext {
             plugin_id: "test.concurrent".to_string(),
@@ -1531,6 +1591,7 @@ mod concurrent_tests {
             settings: None,
             plugin_settings_map: BTreeMap::new(),
             caller_client_id: None,
+            host_service_port: None,
             cancellation: CancellationToken::new(),
             host_kernel_bridge: None,
         }
@@ -1539,6 +1600,7 @@ mod concurrent_tests {
     fn lifecycle_context() -> NativeLifecycleContext {
         NativeLifecycleContext {
             auxiliary_executables: BTreeMap::new(),
+            host_service_port: None,
             auxiliary_executable_errors: BTreeMap::new(),
             plugin_id: "test.concurrent".to_string(),
             host: HostMetadata {

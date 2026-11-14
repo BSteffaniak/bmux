@@ -1,3 +1,6 @@
+#[path = "loader/scoped.rs"]
+pub mod scoped;
+
 #[path = "auxiliary.rs"]
 mod auxiliary;
 pub use auxiliary::{executable_sha256, retain_executable};
@@ -17,11 +20,10 @@ use bmux_ipc::{
 use bmux_perf_telemetry::{PhaseChannel, PhasePayload, emit as emit_phase_timing};
 use bmux_plugin_runtime::{ConcurrencyGate, EffectiveConcurrencyPolicy};
 use bmux_plugin_sdk::{
-    CORE_CLI_BRIDGE_PROTOCOL_V1, CORE_CLI_COMMAND_INTERFACE_V1,
-    CORE_CLI_COMMAND_RUN_PATH_OPERATION_V1, CORE_CLI_COMMAND_RUN_PLUGIN_OPERATION_V1,
-    CoreCliCommandRequest, CoreCliCommandResponse, HostConnectionInfo, HostKernelBridge,
-    HostKernelBridgeRequest, HostKernelBridgeResponse, HostMetadata, HostScope, LogWriteLevel,
-    NativeCommandContext, NativeLifecycleContext, NativeServiceContext,
+    CORE_CLI_BRIDGE_PROTOCOL_V1, CORE_CLI_COMMAND_RUN_PATH_OPERATION_V1,
+    CORE_CLI_COMMAND_RUN_PLUGIN_OPERATION_V1, CoreCliCommandRequest, CoreCliCommandResponse,
+    HostConnectionInfo, HostKernelBridge, HostKernelBridgeRequest, HostKernelBridgeResponse,
+    HostMetadata, HostScope, NativeCommandContext, NativeLifecycleContext, NativeServiceContext,
     NativeStreamingServiceContext, PROCESS_RUNTIME_ENV_PERSISTENT_WORKER,
     PROCESS_RUNTIME_ENV_PLUGIN_ID, PROCESS_RUNTIME_ENV_PROTOCOL, PROCESS_RUNTIME_PROTOCOL_V1,
     PROCESS_RUNTIME_TRANSPORT_STDIO_V1, PluginCliCommandRequest, PluginCliCommandResponse,
@@ -37,7 +39,6 @@ use libloading::{Library, Symbol};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::ffi::{CStr, CString, c_char};
-use std::fs;
 use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -51,7 +52,7 @@ use std::time::{Duration, Instant};
 use std::{io::ErrorKind, os::unix::process::ExitStatusExt};
 #[cfg(windows)]
 use std::{io::ErrorKind, os::windows::process::ExitStatusExt};
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, warn};
 
 type PluginEntryFn = unsafe extern "C" fn() -> *const c_char;
 type NativeRunCommandFn = unsafe extern "C" fn(*const c_char, usize, *const *const c_char) -> i32;
@@ -387,7 +388,7 @@ impl ProcessPluginRuntime {
                 return Err(PluginError::ProcessPluginTimeout {
                     plugin_id: plugin_id.to_string(),
                     command: self.command.clone(),
-                    timeout_ms: timeout.as_millis(),
+                    timeout_ms: Box::new(timeout.as_millis()),
                     details: summarize_stderr(&stderr),
                 });
             }
@@ -763,17 +764,17 @@ fn summarize_stderr_suffix(stderr: &[u8]) -> String {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct CorePluginSettingsRequest {
-    plugin_id: String,
+pub struct CorePluginSettingsRequest {
+    pub(crate) plugin_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-struct CorePluginSettingsResponse {
+pub struct CorePluginSettingsResponse {
     #[serde(
         serialize_with = "serialize_toml_option",
         deserialize_with = "deserialize_toml_option"
     )]
-    settings: Option<toml::Value>,
+    pub(crate) settings: Option<toml::Value>,
 }
 
 #[allow(clippy::ref_option)]
@@ -860,26 +861,26 @@ fn load_static_service_provider_cached(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct CoreStorageGetRequest {
-    key: String,
+pub struct CoreStorageGetRequest {
+    pub(crate) key: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct CoreStorageGetResponse {
-    value: Option<Vec<u8>>,
+pub struct CoreStorageGetResponse {
+    pub(crate) value: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct CoreStorageSetRequest {
-    key: String,
-    value: Vec<u8>,
+pub struct CoreStorageSetRequest {
+    pub(crate) key: String,
+    pub(crate) value: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct PluginStateKey {
-    data_dir: String,
-    plugin_id: String,
-    key: String,
+pub struct PluginStateKey {
+    pub(crate) data_dir: String,
+    pub(crate) plugin_id: String,
+    pub(crate) key: String,
 }
 
 static VOLATILE_STATE: OnceLock<Mutex<BTreeMap<PluginStateKey, Vec<u8>>>> = OnceLock::new();
@@ -888,7 +889,11 @@ fn volatile_state() -> &'static Mutex<BTreeMap<PluginStateKey, Vec<u8>>> {
     VOLATILE_STATE.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
-fn plugin_state_key(connection: &HostConnectionInfo, plugin_id: &str, key: &str) -> PluginStateKey {
+pub fn plugin_state_key(
+    connection: &HostConnectionInfo,
+    plugin_id: &str,
+    key: &str,
+) -> PluginStateKey {
     PluginStateKey {
         data_dir: connection.data_dir.clone(),
         plugin_id: plugin_id.to_string(),
@@ -896,7 +901,47 @@ fn plugin_state_key(connection: &HostConnectionInfo, plugin_id: &str, key: &str)
     }
 }
 
+// Preserve selected invocation authority rather than consulting an inventory.
+async fn selected_context_availability(
+    port: Option<&bmux_plugin_sdk::PluginHostServices>,
+    cancellation: Option<&bmux_plugin_sdk::CancellationToken>,
+    key: bmux_plugin_sdk::typed_dispatch::ServiceAvailabilityKey,
+) -> Result<bmux_plugin_sdk::typed_dispatch::SelectedServiceAvailability> {
+    let check_cancellation = || {
+        if cancellation.is_some_and(bmux_plugin_sdk::CancellationToken::is_cancelled) {
+            Err(PluginError::InvocationCancelled)
+        } else {
+            Ok(())
+        }
+    };
+    check_cancellation()?;
+    key.validate()?;
+    let port = port.ok_or(PluginError::UnsupportedHostOperation {
+        operation: "selected_service_availability",
+    })?;
+    let presence = port.selected_service_availability(key).await?;
+    check_cancellation()?;
+    Ok(presence)
+}
+
 impl ServiceCaller for NativeCommandContext {
+    fn selected_service_availability(
+        &self,
+        key: bmux_plugin_sdk::typed_dispatch::ServiceAvailabilityKey,
+    ) -> bmux_plugin_sdk::definition::PluginFuture<
+        '_,
+        Result<bmux_plugin_sdk::typed_dispatch::SelectedServiceAvailability>,
+    > {
+        Box::pin(selected_context_availability(
+            self.host_service_port.as_ref(),
+            None,
+            key,
+        ))
+    }
+    fn host_connection(&self) -> Option<&HostConnectionInfo> {
+        Some(&self.connection)
+    }
+
     fn call_service_raw(
         &self,
         capability: &str,
@@ -905,37 +950,53 @@ impl ServiceCaller for NativeCommandContext {
         operation: &str,
         payload: Vec<u8>,
     ) -> Result<Vec<u8>> {
-        call_service_raw(
-            &self.plugin_id,
-            self.caller_client_id,
-            &self.required_capabilities,
-            &self.provided_capabilities,
-            &self.services,
-            &self.available_capabilities,
-            &self.enabled_plugins,
-            &self.plugin_search_roots,
-            &self.host,
-            &self.connection,
-            self.host_kernel_bridge.clone(),
-            &self.plugin_settings_map,
-            None,
+        let port = self
+            .host_service_port
+            .as_ref()
+            .ok_or_else(|| PluginError::ServiceProtocol {
+                details: "invocation-bound command host service port not selected".into(),
+            })?;
+        port.invoke(bmux_plugin_sdk::HostServiceRequest {
             capability,
             kind,
-            interface_id,
+            interface: interface_id,
             operation,
-            payload,
-        )
+            payload: &payload,
+        })
     }
 
     fn execute_kernel_request(
         &self,
         request: bmux_ipc::Request,
     ) -> Result<bmux_ipc::ResponsePayload> {
-        execute_kernel_request(self.host_kernel_bridge.clone(), request)
+        let port = self
+            .host_service_port
+            .as_ref()
+            .ok_or_else(|| PluginError::ServiceProtocol {
+                details: "invocation-bound command kernel port not selected".into(),
+            })?;
+        execute_selected_context_kernel(port, &request)
     }
 }
 
 impl ServiceCaller for NativeLifecycleContext {
+    fn selected_service_availability(
+        &self,
+        key: bmux_plugin_sdk::typed_dispatch::ServiceAvailabilityKey,
+    ) -> bmux_plugin_sdk::definition::PluginFuture<
+        '_,
+        Result<bmux_plugin_sdk::typed_dispatch::SelectedServiceAvailability>,
+    > {
+        Box::pin(selected_context_availability(
+            self.host_service_port.as_ref(),
+            None,
+            key,
+        ))
+    }
+    fn host_connection(&self) -> Option<&HostConnectionInfo> {
+        Some(&self.connection)
+    }
+
     fn call_service_raw(
         &self,
         capability: &str,
@@ -944,6 +1005,15 @@ impl ServiceCaller for NativeLifecycleContext {
         operation: &str,
         payload: Vec<u8>,
     ) -> Result<Vec<u8>> {
+        if let Some(port) = &self.host_service_port {
+            return port.invoke(bmux_plugin_sdk::HostServiceRequest {
+                capability,
+                kind,
+                interface: interface_id,
+                operation,
+                payload: &payload,
+            });
+        }
         call_service_raw(
             &self.plugin_id,
             None,
@@ -975,6 +1045,23 @@ impl ServiceCaller for NativeLifecycleContext {
 }
 
 impl ServiceCaller for NativeServiceContext {
+    fn selected_service_availability(
+        &self,
+        key: bmux_plugin_sdk::typed_dispatch::ServiceAvailabilityKey,
+    ) -> bmux_plugin_sdk::definition::PluginFuture<
+        '_,
+        Result<bmux_plugin_sdk::typed_dispatch::SelectedServiceAvailability>,
+    > {
+        Box::pin(selected_context_availability(
+            self.host_service_port.as_ref(),
+            Some(&self.cancellation),
+            key,
+        ))
+    }
+    fn host_connection(&self) -> Option<&HostConnectionInfo> {
+        Some(&self.connection)
+    }
+
     fn call_service_raw(
         &self,
         capability: &str,
@@ -988,26 +1075,19 @@ impl ServiceCaller for NativeServiceContext {
                 details: "service invocation cancelled before nested dispatch".into(),
             });
         }
-        call_service_raw(
-            &self.plugin_id,
-            self.caller_client_id,
-            &self.required_capabilities,
-            &self.provided_capabilities,
-            &self.services,
-            &self.available_capabilities,
-            &self.enabled_plugins,
-            &self.plugin_search_roots,
-            &self.host,
-            &self.connection,
-            self.host_kernel_bridge.clone(),
-            &self.plugin_settings_map,
-            Some(&self.cancellation),
+        let port = self
+            .host_service_port
+            .as_ref()
+            .ok_or_else(|| PluginError::ServiceProtocol {
+                details: "invocation-bound host service port not selected".into(),
+            })?;
+        port.invoke(bmux_plugin_sdk::HostServiceRequest {
             capability,
             kind,
-            interface_id,
+            interface: interface_id,
             operation,
-            payload,
-        )
+            payload: &payload,
+        })
     }
 
     fn execute_kernel_request(
@@ -1019,8 +1099,36 @@ impl ServiceCaller for NativeServiceContext {
                 details: "service invocation cancelled before kernel dispatch".into(),
             });
         }
-        execute_kernel_request(self.host_kernel_bridge.clone(), request)
+        let port = self
+            .host_service_port
+            .as_ref()
+            .ok_or_else(|| PluginError::ServiceProtocol {
+                details: "invocation-bound host kernel port not selected".into(),
+            })?;
+        execute_selected_context_kernel(port, &request)
     }
+}
+
+// Adapt only the selected invocation capability. Neither missing grants nor
+// failed/oversized responses authorize replay through a legacy executable bridge.
+fn execute_selected_context_kernel(
+    port: &bmux_plugin_sdk::PluginHostServices,
+    request: &bmux_ipc::Request,
+) -> Result<bmux_ipc::ResponsePayload> {
+    let protocol = |details: String| PluginError::ServiceProtocol { details };
+    let request = bmux_ipc::encode(request).map_err(|error| protocol(error.to_string()))?;
+    if request.len() > bmux_plugin_sdk::abi::MAX_BUFFER_BYTES {
+        return Err(protocol(
+            "kernel request exceeds negotiated buffer bound".into(),
+        ));
+    }
+    let response = port.execute_kernel_encoded(&request)?;
+    if response.len() > bmux_plugin_sdk::abi::MAX_BUFFER_BYTES {
+        return Err(protocol(
+            "kernel response exceeds negotiated buffer bound; do not replay operation".into(),
+        ));
+    }
+    bmux_ipc::decode(&response).map_err(|error| protocol(error.to_string()))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1119,7 +1227,7 @@ pub fn call_service_raw(
             &service,
             operation,
             &payload,
-            host_kernel_bridge,
+            host_kernel_bridge.as_ref(),
             plugin_settings_map,
         );
     }
@@ -1258,6 +1366,7 @@ pub fn call_service_raw(
         caller_client_id,
         cancellation: cancellation.cloned().unwrap_or_default(),
         host_kernel_bridge: None,
+        host_service_port: None,
     };
     let (provider_bridge, _provider_lease) =
         provider_host_bridge(&loaded, host_kernel_bridge, &provider_context);
@@ -1266,285 +1375,53 @@ pub fn call_service_raw(
 
     if let Some(error) = response.error {
         return Err(PluginError::ServiceInvocationFailed {
-            provider_plugin_id: service.provider.to_string(),
+            provider_plugin_id: service.provider.to_string().into(),
             capability: service.capability.as_str().to_string(),
             interface_id: service.interface_id,
-            operation: operation.to_string(),
-            code: error.code,
-            message: error.message,
+            operation: operation.to_string().into(),
+            code: error.code.into(),
+            message: error.message.into(),
         });
     }
 
     Ok(response.payload)
 }
 
-#[allow(clippy::too_many_lines)]
 fn handle_core_service_call(
     caller_plugin_id: &str,
     connection: &HostConnectionInfo,
     service: &RegisteredService,
     operation: &str,
     payload: &[u8],
-    host_kernel_bridge: Option<HostKernelBridge>,
+    host_kernel_bridge: Option<&HostKernelBridge>,
     plugin_settings_map: &BTreeMap<String, toml::Value>,
 ) -> Result<Vec<u8>> {
-    match (service.interface_id.as_str(), operation) {
-        ("config-query/v1", "plugin_settings") => {
-            let request: CorePluginSettingsRequest = decode_service_message(payload)?;
-            let settings = plugin_settings_map.get(&request.plugin_id).cloned();
-            encode_service_message(&CorePluginSettingsResponse { settings })
-        }
-        ("storage-query/v1", "get") => {
-            let total_started = Instant::now();
-            let decode_started = Instant::now();
-            let request: CoreStorageGetRequest = decode_service_message(payload)?;
-            let decode_us = decode_started.elapsed().as_micros();
-            let validate_started = Instant::now();
-            validate_storage_key(&request.key)?;
-            let validate_us = validate_started.elapsed().as_micros();
-            // Durable storage is authoritative across independent host processes.
-            // A process-local positive or negative cache cannot be coherent with
-            // domain-owned cross-process mutation transactions.
-            let cache_us = 0_u128;
-            let fs_started = Instant::now();
-            let path = storage_file_path(connection, caller_plugin_id, &request.key);
-            let value = match fs::read(path) {
-                Ok(bytes) => Some(bytes),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-                Err(error) => {
-                    return Err(PluginError::ServiceProtocol {
-                        details: format!("failed reading storage value: {error}"),
-                    });
-                }
-            };
-            let fs_us = fs_started.elapsed().as_micros();
-            let cache_hit = false;
-            let encode_started = Instant::now();
-            let response = encode_service_message(&CoreStorageGetResponse {
-                value: value.clone(),
-            });
-            let encode_us = encode_started.elapsed().as_micros();
-            emit_phase_timing(
-                PhaseChannel::Storage,
-                &PhasePayload::new("storage.get")
-                    .field("plugin_id", caller_plugin_id)
-                    .field("key", request.key.as_str())
-                    .field("cache_hit", cache_hit)
-                    .field("value_len", value.as_ref().map_or(0, Vec::len))
-                    .field("decode_us", decode_us)
-                    .field("validate_us", validate_us)
-                    .field("cache_us", cache_us)
-                    .field("fs_us", fs_us)
-                    .field("encode_us", encode_us)
-                    .field("total_us", total_started.elapsed().as_micros())
-                    .finish(),
-            );
-            response
-        }
-        ("storage-command/v1", "set") => {
-            let total_started = Instant::now();
-            let decode_started = Instant::now();
-            let request: CoreStorageSetRequest = decode_service_message(payload)?;
-            let decode_us = decode_started.elapsed().as_micros();
-            let validate_started = Instant::now();
-            validate_storage_key(&request.key)?;
-            let validate_us = validate_started.elapsed().as_micros();
-            let fs_started = Instant::now();
-            let path = storage_file_path(connection, caller_plugin_id, &request.key);
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent).map_err(|error| PluginError::ServiceProtocol {
-                    details: format!("failed creating storage directory: {error}"),
-                })?;
+    crate::host_builtins::handle_core_service_call(&crate::host_builtins::BuiltinCall {
+        owner: caller_plugin_id,
+        connection,
+        service,
+        operation,
+        payload,
+        volatile: volatile_state(),
+        cli: &|operation, payload| match operation {
+            CORE_CLI_COMMAND_RUN_PATH_OPERATION_V1 => {
+                encode_service_message(&execute_cli_command_request(
+                    host_kernel_bridge.cloned(),
+                    &decode_service_message(payload)?,
+                )?)
             }
-            write_storage_value(&path, &request.value).map_err(|error| {
-                PluginError::ServiceProtocol {
-                    details: format!("failed writing storage value: {error}"),
-                }
-            })?;
-            let fs_us = fs_started.elapsed().as_micros();
-            let cache_us = 0_u128;
-            let encode_started = Instant::now();
-            let response = encode_service_message(&());
-            let encode_us = encode_started.elapsed().as_micros();
-            emit_phase_timing(
-                PhaseChannel::Storage,
-                &PhasePayload::new("storage.set")
-                    .field("plugin_id", caller_plugin_id)
-                    .field("key", request.key.as_str())
-                    .field("value_len", request.value.len())
-                    .field("decode_us", decode_us)
-                    .field("validate_us", validate_us)
-                    .field("fs_us", fs_us)
-                    .field("cache_us", cache_us)
-                    .field("encode_us", encode_us)
-                    .field("total_us", total_started.elapsed().as_micros())
-                    .finish(),
-            );
-            response
-        }
-        ("volatile-state-query/v1", "get") => {
-            let total_started = Instant::now();
-            let request: bmux_plugin_sdk::VolatileStateGetRequest =
-                decode_service_message(payload)?;
-            validate_storage_key(request.key.as_str())?;
-            let map_started = Instant::now();
-            let value = volatile_state().lock().ok().and_then(|map| {
-                map.get(&plugin_state_key(
-                    connection,
-                    caller_plugin_id,
-                    request.key.as_str(),
-                ))
-                .cloned()
-            });
-            let map_us = map_started.elapsed().as_micros();
-            let response = encode_service_message(&bmux_plugin_sdk::VolatileStateGetResponse {
-                value: value.clone(),
-            });
-            emit_phase_timing(
-                PhaseChannel::Storage,
-                &PhasePayload::new("volatile_state.get")
-                    .field("plugin_id", caller_plugin_id)
-                    .field("key", request.key.as_str())
-                    .field("value_len", value.as_ref().map_or(0, Vec::len))
-                    .field("map_us", map_us)
-                    .field("total_us", total_started.elapsed().as_micros())
-                    .finish(),
-            );
-            response
-        }
-        ("volatile-state-command/v1", "set") => {
-            let total_started = Instant::now();
-            let request: bmux_plugin_sdk::VolatileStateSetRequest =
-                decode_service_message(payload)?;
-            validate_storage_key(request.key.as_str())?;
-            let map_started = Instant::now();
-            if let Ok(mut map) = volatile_state().lock() {
-                map.insert(
-                    plugin_state_key(connection, caller_plugin_id, request.key.as_str()),
-                    request.value.clone(),
-                );
+            CORE_CLI_COMMAND_RUN_PLUGIN_OPERATION_V1 => {
+                encode_service_message(&execute_plugin_command_request(
+                    host_kernel_bridge.cloned(),
+                    &decode_service_message(payload)?,
+                )?)
             }
-            let map_us = map_started.elapsed().as_micros();
-            let response = encode_service_message(&());
-            emit_phase_timing(
-                PhaseChannel::Storage,
-                &PhasePayload::new("volatile_state.set")
-                    .field("plugin_id", caller_plugin_id)
-                    .field("key", request.key.as_str())
-                    .field("value_len", request.value.len())
-                    .field("map_us", map_us)
-                    .field("total_us", total_started.elapsed().as_micros())
-                    .finish(),
-            );
-            response
-        }
-        ("volatile-state-command/v1", "clear") => {
-            let total_started = Instant::now();
-            let request: bmux_plugin_sdk::VolatileStateClearRequest =
-                decode_service_message(payload)?;
-            validate_storage_key(request.key.as_str())?;
-            let map_started = Instant::now();
-            if let Ok(mut map) = volatile_state().lock() {
-                map.remove(&plugin_state_key(
-                    connection,
-                    caller_plugin_id,
-                    request.key.as_str(),
-                ));
-            }
-            let map_us = map_started.elapsed().as_micros();
-            let response = encode_service_message(&());
-            emit_phase_timing(
-                PhaseChannel::Storage,
-                &PhasePayload::new("volatile_state.clear")
-                    .field("plugin_id", caller_plugin_id)
-                    .field("key", request.key.as_str())
-                    .field("map_us", map_us)
-                    .field("total_us", total_started.elapsed().as_micros())
-                    .finish(),
-            );
-            response
-        }
-        ("logging-command/v1", "write") => {
-            let request: bmux_plugin_sdk::LogWriteRequest = decode_service_message(payload)?;
-            emit_plugin_log(caller_plugin_id, &request)?;
-            encode_service_message(&())
-        }
-        (CORE_CLI_COMMAND_INTERFACE_V1, CORE_CLI_COMMAND_RUN_PATH_OPERATION_V1) => {
-            let request: CoreCliCommandRequest = decode_service_message(payload)?;
-            let response = execute_cli_command_request(host_kernel_bridge, &request)?;
-            encode_service_message(&response)
-        }
-        (CORE_CLI_COMMAND_INTERFACE_V1, CORE_CLI_COMMAND_RUN_PLUGIN_OPERATION_V1) => {
-            let request: PluginCliCommandRequest = decode_service_message(payload)?;
-            let response = execute_plugin_command_request(host_kernel_bridge, &request)?;
-            encode_service_message(&response)
-        }
-        _ => Err(PluginError::UnsupportedHostOperation {
-            operation: "call_service",
-        }),
-    }
-}
-
-fn emit_plugin_log(
-    caller_plugin_id: &str,
-    request: &bmux_plugin_sdk::LogWriteRequest,
-) -> Result<()> {
-    let requested_target = request
-        .target
-        .as_deref()
-        .filter(|entry| !entry.trim().is_empty())
-        .unwrap_or(caller_plugin_id);
-    let message = request.message.trim();
-    if message.is_empty() {
-        return Err(PluginError::ServiceProtocol {
-            details: "log message cannot be empty".to_string(),
-        });
-    }
-
-    match request.level {
-        LogWriteLevel::Error => {
-            error!(
-                plugin_id = caller_plugin_id,
-                plugin_target = requested_target,
-                "{}",
-                request.message
-            );
-        }
-        LogWriteLevel::Warn => {
-            warn!(
-                plugin_id = caller_plugin_id,
-                plugin_target = requested_target,
-                "{}",
-                request.message
-            );
-        }
-        LogWriteLevel::Info => {
-            info!(
-                plugin_id = caller_plugin_id,
-                plugin_target = requested_target,
-                "{}",
-                request.message
-            );
-        }
-        LogWriteLevel::Debug => {
-            debug!(
-                plugin_id = caller_plugin_id,
-                plugin_target = requested_target,
-                "{}",
-                request.message
-            );
-        }
-        LogWriteLevel::Trace => {
-            trace!(
-                plugin_id = caller_plugin_id,
-                plugin_target = requested_target,
-                "{}",
-                request.message
-            );
-        }
-    }
-
-    Ok(())
+            _ => Err(PluginError::UnsupportedHostOperation {
+                operation: "call_service",
+            }),
+        },
+        settings: plugin_settings_map,
+    })
 }
 
 /// Forward a typed plugin service call to whichever process owns the
@@ -1872,29 +1749,14 @@ fn invoke_host_kernel_bridge(bridge: &HostKernelBridge, payload: Vec<u8>) -> Res
     Ok(response.payload)
 }
 
-/// Commit a complete value with atomic, platform-specific durable publication.
-fn write_storage_value(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    crate::filesystem::replace(path, bytes)
-}
-
+#[cfg(test)]
 fn storage_file_path(connection: &HostConnectionInfo, plugin_id: &str, key: &str) -> PathBuf {
-    PathBuf::from(&connection.data_dir)
-        .join("plugin-storage")
-        .join(plugin_id)
-        .join(format!("{key}.bin"))
+    crate::host_builtins::storage_file_path(connection, plugin_id, key)
 }
 
+#[cfg(test)]
 fn validate_storage_key(key: &str) -> Result<()> {
-    if key.is_empty()
-        || !key
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
-    {
-        return Err(PluginError::ServiceProtocol {
-            details: "storage key must be non-empty and use [A-Za-z0-9._-]".to_string(),
-        });
-    }
-    Ok(())
+    crate::host_builtins::validate_storage_key(key)
 }
 
 pub struct LoadedPlugin {
@@ -1908,6 +1770,50 @@ pub struct LoadedPlugin {
     native_service_buffers: NativeServiceBufferConfig,
     background_tasks: Box<Mutex<Option<bmux_plugin_runtime::background::BackgroundTasks>>>,
     concurrency_gate: ConcurrencyGate,
+}
+
+// Resolve only declared auxiliary artifacts against an authoritative selected
+// base. Missing artifacts remain explicit diagnostics, never PATH fallbacks.
+fn resolve_lifecycle_auxiliaries(
+    registered: &RegisteredPlugin,
+    base: &std::result::Result<PathBuf, String>,
+    mut context: NativeLifecycleContext,
+) -> Result<NativeLifecycleContext> {
+    context.auxiliary_executables.clear();
+    context.auxiliary_executable_errors.clear();
+    let manifest = &registered.manifest;
+    manifest.validate_auxiliary_executables()?;
+    if manifest.auxiliary_executables.is_empty() {
+        return Ok(context);
+    }
+    let required = bmux_plugin_sdk::ApiVersion::new(1, 1);
+    if context.host.plugin_abi_version.major != 1 || context.host.plugin_abi_version < required {
+        return Err(PluginError::ServiceProtocol {
+            details: "auxiliary lifecycle metadata requires negotiated host native ABI 1.1".into(),
+        });
+    }
+    for declaration in &manifest.auxiliary_executables {
+        let resolved = base.as_ref().map_err(Clone::clone).and_then(|base| {
+            auxiliary::resolve_retained(base, declaration, &manifest.id, &context.connection)
+        });
+        match resolved {
+            Ok(value) => {
+                context
+                    .auxiliary_executables
+                    .insert(declaration.id.clone(), value);
+            }
+            Err(error) => {
+                context.auxiliary_executable_errors.insert(
+                    declaration.id.clone(),
+                    format!(
+                        "selected plugin {} auxiliary {} resolution failed: {error}",
+                        manifest.id, declaration.id
+                    ),
+                );
+            }
+        }
+    }
+    Ok(context)
 }
 
 impl LoadedPlugin {
@@ -1932,22 +1838,6 @@ impl LoadedPlugin {
         &self,
         context: &NativeLifecycleContext,
     ) -> Result<NativeLifecycleContext> {
-        let mut context = context.clone();
-        context.auxiliary_executables.clear();
-        context.auxiliary_executable_errors.clear();
-        let manifest = &self.registered.manifest;
-        manifest.validate_auxiliary_executables()?;
-        if manifest.auxiliary_executables.is_empty() {
-            return Ok(context);
-        }
-        let required = bmux_plugin_sdk::ApiVersion::new(1, 1);
-        if context.host.plugin_abi_version.major != 1 || context.host.plugin_abi_version < required
-        {
-            return Err(PluginError::ServiceProtocol {
-                details: "auxiliary lifecycle metadata requires negotiated host native ABI 1.1"
-                    .into(),
-            });
-        }
         let base = if matches!(self.backend, PluginBackend::Static(_)) {
             std::env::current_exe()
                 .and_then(|path| path.canonicalize())
@@ -1967,24 +1857,7 @@ impl LoadedPlugin {
                     "auxiliary package manifest has no absolute authoritative root".into()
                 })
         };
-        for declaration in &manifest.auxiliary_executables {
-            let resolved = base.as_ref().map_err(Clone::clone).and_then(|base| {
-                auxiliary::resolve_retained(base, declaration, &manifest.id, &context.connection)
-            });
-            match resolved {
-                Ok(value) => {
-                    context
-                        .auxiliary_executables
-                        .insert(declaration.id.clone(), value);
-                }
-                Err(error) => {
-                    context
-                        .auxiliary_executable_errors
-                        .insert(declaration.id.clone(), error);
-                }
-            }
-        }
-        Ok(context)
+        resolve_lifecycle_auxiliaries(&self.registered, &base, context.clone())
     }
 
     const fn backend_kind(&self) -> &'static str {
@@ -2134,7 +2007,25 @@ impl LoadedPlugin {
         argv: &[String],
         request: &ProcessInvocationRequest,
     ) -> Result<(Option<ProcessInvocationResponse>, std::process::ExitStatus)> {
-        runtime.invoke(self.declaration.id.as_str(), argv, request)
+        // v1's data envelope is preserved, but executable same-address-space
+        // bridge capabilities must never be sent to an external process.
+        let mut request = request.clone();
+        match &mut request {
+            ProcessInvocationRequest::Command {
+                context: Some(context),
+                ..
+            } => {
+                context.host_kernel_bridge = None;
+            }
+            ProcessInvocationRequest::Lifecycle { context, .. } => {
+                context.host_kernel_bridge = None;
+            }
+            ProcessInvocationRequest::Service { context, .. } => {
+                context.host_kernel_bridge = None;
+            }
+            _ => {}
+        }
+        runtime.invoke(self.declaration.id.as_str(), argv, &request)
     }
 
     #[must_use]
@@ -2609,16 +2500,13 @@ impl LoadedPlugin {
                 .map_err(|error| PluginError::ServiceProtocol {
                     details: error.to_string(),
                 })?;
-        if bmux_plugin_sdk::service_contract::is_checked(&context.service.request.payload) {
-            return Err(PluginError::ServiceProtocol {
-                details: "checked streaming provider calls are not yet supported".into(),
-            });
-        }
-        if let PluginBackend::Process(runtime) = &self.backend {
-            return self.invoke_process_service(runtime, &context.service);
-        }
-
-        self.invoke_native_service(&context.service, true)
+        // v1 cannot carry an executable event sink. Do not claim streaming
+        // while silently substituting unary execution (including process v1).
+        let _ = context;
+        Err(PluginError::ServiceProtocol {
+            details: "streaming requires a negotiated scoped event-port adapter; v1 is unary only"
+                .into(),
+        })
     }
 
     fn invoke_process_service(
@@ -2777,9 +2665,17 @@ impl LoadedPlugin {
         };
 
         let call_started = Instant::now();
+        // Frozen v1 has no retained-outcome retrieval contract. Allocate the
+        // configured maximum once and never reexecute a possibly mutating call
+        // merely because its response did not fit. v2 uses start/read/ack.
+        let buffers = NativeServiceBufferConfig {
+            initial_response_bytes: self.native_service_buffers.max_response_bytes,
+            buffer_resize_attempts: 0,
+            ..self.native_service_buffers
+        };
         let (output, buffer_resize_attempts) = invoke_native_service_resizing_output(
             self.declaration.id.as_str(),
-            self.native_service_buffers,
+            buffers,
             |output, output_len| call_service(&payload, output, output_len),
         )
         .map_err(|error| classify_native_service_error(error, checked))?;
@@ -3036,9 +2932,10 @@ fn lifecycle_hook_name(symbol: &str) -> &'static str {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct NativePluginLoader {
     native_service_buffers: NativeServiceBufferConfig,
+    bundled_executable: Arc<scoped::BundledExecutableCache>,
 }
 
 impl Default for NativePluginLoader {
@@ -3048,9 +2945,126 @@ impl Default for NativePluginLoader {
 }
 
 impl NativePluginLoader {
+    /// Resolve an already-selected candidate into a fresh scoped execution. This
+    /// path selects native v2 explicitly and never falls back to legacy symbols.
+    ///
+    /// # Safety
+    /// The selected artifact must be trusted native code.
+    ///
+    /// # Errors
+    /// Selected artifact validation or scoped creation fails.
+    pub unsafe fn load_selected_execution(
+        selected: &crate::SelectedPluginCandidate,
+        runtime: bmux_plugin_runtime::PluginRuntimeScopeId,
+        available_capabilities: &[String],
+        callback_runtime: tokio::runtime::Handle,
+    ) -> Result<Arc<scoped::LoadedExecution>> {
+        let artifact = unsafe { scoped::DefinitionArtifact::load_selected(selected) }?;
+        let execution = artifact.create(runtime, selected.role(), available_capabilities)?;
+        execution.bind_callback_runtime(callback_runtime)?;
+        Ok(execution)
+    }
+
+    /// Load with this startup/runtime owner's retained executable observation.
+    /// Clones share only the immutable artifact observation, never instances.
+    /// Dynamic artifacts are still copied and hashed independently on every load.
+    /// Use a new loader owner when deliberately selecting rebuilt executable bytes.
+    ///
+    /// # Safety
+    /// The selected artifact must be trusted native code.
+    ///
+    /// # Errors
+    /// Executable observation, selected artifact validation, or scoped creation fails.
+    pub unsafe fn load_selected_execution_with_owner(
+        &self,
+        selected: &crate::SelectedPluginCandidate,
+        runtime: bmux_plugin_runtime::PluginRuntimeScopeId,
+        available_capabilities: &[String],
+        callback_runtime: tokio::runtime::Handle,
+    ) -> Result<Arc<scoped::LoadedExecution>> {
+        let artifact = unsafe {
+            scoped::DefinitionArtifact::load_selected_with_owner(selected, &self.bundled_executable)
+        }?;
+        let execution = artifact.create(runtime, selected.role(), available_capabilities)?;
+        execution.bind_callback_runtime(callback_runtime)?;
+        Ok(execution)
+    }
+
+    /// Create from a host-local factory for an already-selected bundled artifact.
+    /// The supplied definition does not replace the global registration. Its full
+    /// embedded declaration is validated against selection and this loader's
+    /// retained executable identity before any factory runs. Dynamic selections
+    /// reject the override rather than changing packaging or falling back.
+    ///
+    /// # Safety
+    /// The factory must be trusted code belonging to the selected bundled executable.
+    /// Metadata validation alone cannot prove the provenance of executable closures.
+    ///
+    /// # Errors
+    /// Returns an error for a dynamic selection, executable observation or metadata
+    /// mismatch, unavailable role/capabilities, or failed scoped construction.
+    pub unsafe fn load_selected_execution_with_definition(
+        &self,
+        selected: &crate::SelectedPluginCandidate,
+        runtime: bmux_plugin_runtime::PluginRuntimeScopeId,
+        available_capabilities: &[String],
+        definition: bmux_plugin_sdk::definition::PluginDefinition,
+        callback_runtime: tokio::runtime::Handle,
+    ) -> Result<Arc<scoped::LoadedExecution>> {
+        let artifact = unsafe {
+            scoped::DefinitionArtifact::load_selected_with_definition(
+                selected,
+                &self.bundled_executable,
+                Some(definition),
+            )
+        }?;
+        let execution = artifact.create(runtime, selected.role(), available_capabilities)?;
+        execution.bind_callback_runtime(callback_runtime)?;
+        Ok(execution)
+    }
+
+    /// Inert unified static artifact; creation is explicit and host-scoped.
     #[must_use]
-    pub const fn new() -> Self {
+    pub fn definition_artifact(
+        definition: bmux_plugin_sdk::definition::PluginDefinition,
+    ) -> scoped::DefinitionArtifact {
+        scoped::DefinitionArtifact::from_definition(definition)
+    }
+
+    /// Explicit v2 selection. No v1 reinterpretation or activation during discovery.
+    ///
+    /// # Safety
+    /// The selected library must satisfy the trusted native descriptor ABI.
+    ///
+    /// # Errors
+    /// Loading or native descriptor validation fails.
+    pub unsafe fn load_definition_artifact(path: &Path) -> Result<scoped::DefinitionArtifact> {
+        unsafe { scoped::DefinitionArtifact::load(path) }
+    }
+
+    /// Register inert static factories, never process-global implementation state.
+    ///
+    /// # Errors
+    /// The definition is duplicated or the registry is poisoned.
+    pub fn register_definition(
+        definition: bmux_plugin_sdk::definition::PluginDefinition,
+    ) -> Result<()> {
+        crate::static_vtable_registry::register_static_definition(definition)
+    }
+
+    /// Look up an inert registered static definition without creating an instance.
+    ///
+    /// # Errors
+    /// The static definition registry is poisoned.
+    pub fn registered_definition(plugin_id: &str) -> Result<Option<scoped::DefinitionArtifact>> {
+        crate::static_vtable_registry::static_definition(plugin_id)
+            .map(|definition| definition.map(scoped::DefinitionArtifact::from_definition))
+    }
+
+    #[must_use]
+    pub fn new() -> Self {
         Self {
+            bundled_executable: Arc::new(scoped::BundledExecutableCache::default()),
             native_service_buffers: NativeServiceBufferConfig {
                 initial_response_bytes: NATIVE_SERVICE_INITIAL_RESPONSE_BYTES,
                 max_response_bytes: NATIVE_SERVICE_MAX_RESPONSE_BYTES,
@@ -3535,7 +3549,6 @@ mod tests {
     thread_local! {
         static KERNEL_REQUESTS: RefCell<Vec<bmux_ipc::Request>> = const { RefCell::new(Vec::new()) };
         static OMIT_CURRENT_CLIENT_FROM_LIST: Cell<bool> = const { Cell::new(false) };
-        static GROW_NATIVE_SERVICE_RESPONSE_ON_RETRY: Cell<bool> = const { Cell::new(false) };
         static NATIVE_SERVICE_INVOCATION_COUNT: Cell<usize> = const { Cell::new(0) };
     }
 
@@ -3623,18 +3636,8 @@ sleep 60
             NativeServiceContext,
         >(input, ServiceEnvelopeKind::Request)
         .expect("service request should decode");
-        let mut response_payload = context.request.payload;
-        if GROW_NATIVE_SERVICE_RESPONSE_ON_RETRY.with(Cell::get) {
-            let invocation = NATIVE_SERVICE_INVOCATION_COUNT.with(|count| {
-                let invocation = count.get().saturating_add(1);
-                count.set(invocation);
-                invocation
-            });
-            if invocation >= 2 {
-                response_payload.resize(response_payload.len().saturating_add(12_000), 0);
-            }
-        }
-        let response = ServiceResponse::ok(response_payload);
+        NATIVE_SERVICE_INVOCATION_COUNT.with(|count| count.set(count.get().saturating_add(1)));
+        let response = ServiceResponse::ok(context.request.payload);
         let encoded = encode_service_envelope_with_invocation_id(
             invocation_id,
             request_id,
@@ -4025,7 +4028,51 @@ minimum = "1.0"
         );
     }
 
-    fn native_test_service_context(payload: Vec<u8>) -> NativeServiceContext {
+    #[test]
+    fn native_service_nested_dispatch_requires_selected_port() {
+        let context = native_test_service_context(Vec::new());
+        let error = context
+            .call_service_raw(
+                "test.service",
+                bmux_plugin_sdk::ServiceKind::Query,
+                "test-service",
+                "echo",
+                vec![],
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("host service port not selected"));
+        let mut context =
+            context.with_host_service_port(bmux_plugin_sdk::PluginHostServices::new(|request| {
+                assert_eq!(request.operation, "echo");
+                Ok(request.payload.to_vec())
+            }));
+        assert_eq!(
+            context
+                .call_service_raw(
+                    "test.service",
+                    bmux_plugin_sdk::ServiceKind::Query,
+                    "test-service",
+                    "echo",
+                    vec![7]
+                )
+                .unwrap(),
+            vec![7]
+        );
+        context.cancellation.cancel();
+        assert!(
+            context
+                .call_service_raw(
+                    "test.service",
+                    bmux_plugin_sdk::ServiceKind::Query,
+                    "test-service",
+                    "echo",
+                    vec![]
+                )
+                .is_err()
+        );
+    }
+
+    pub(super) fn native_test_service_context(payload: Vec<u8>) -> NativeServiceContext {
         NativeServiceContext {
             plugin_id: "test.plugin".to_string(),
             request: bmux_plugin_sdk::ServiceRequest {
@@ -4064,6 +4111,7 @@ minimum = "1.0"
             caller_client_id: None,
             cancellation: bmux_plugin_sdk::CancellationToken::default(),
             host_kernel_bridge: None,
+            host_service_port: None,
         }
     }
 
@@ -4277,19 +4325,45 @@ minimum = "1.0"
 
     #[test]
     fn native_service_invocation_retries_when_response_outgrows_retry_buffer() {
-        GROW_NATIVE_SERVICE_RESPONSE_ON_RETRY.with(|enabled| enabled.set(true));
-        NATIVE_SERVICE_INVOCATION_COUNT.with(|count| count.set(0));
+        // Exercise the explicit resizing mechanism, not frozen v1 dispatch:
+        // v1 cannot safely replay author code when an output buffer is too small.
+        let mut calls = 0;
+        let (output, resizes) = super::invoke_native_service_resizing_output(
+            "test.plugin",
+            NativeServiceBufferConfig::default(),
+            |output, length| {
+                calls += 1;
+                let payload_len = if calls == 1 { 5_000 } else { 17_000 };
+                let response = ServiceResponse::ok(vec![b'x'; payload_len]);
+                let encoded = encode_service_envelope(0, ServiceEnvelopeKind::Response, &response)
+                    .expect("response should encode");
+                *length = encoded.len();
+                if encoded.len() > output.len() {
+                    return super::NATIVE_SERVICE_STATUS_BUFFER_TOO_SMALL;
+                }
+                output[..encoded.len()].copy_from_slice(&encoded);
+                super::NATIVE_SERVICE_STATUS_OK
+            },
+        )
+        .expect("resizing should handle a response that grows after its first size report");
+        let (_, response): (_, ServiceResponse) =
+            decode_service_envelope(&output, ServiceEnvelopeKind::Response).unwrap();
+        assert!(response.error.is_none());
+        assert_eq!(response.payload, vec![b'x'; 17_000]);
+        assert_eq!(calls, 3);
+        assert_eq!(resizes, 2);
+    }
 
+    #[test]
+    fn frozen_v1_service_dispatch_does_not_replay_for_buffer_growth() {
+        NATIVE_SERVICE_INVOCATION_COUNT.with(|count| count.set(0));
         let loaded = loaded_static_test_plugin();
         let response = loaded
-            .invoke_service(&native_test_service_context(vec![b'x'; 5_000]))
-            .expect("service should retry until the grown response fits");
-
-        GROW_NATIVE_SERVICE_RESPONSE_ON_RETRY.with(|enabled| enabled.set(false));
-        NATIVE_SERVICE_INVOCATION_COUNT.with(|count| count.set(0));
-
+            .invoke_service(&native_test_service_context(vec![b'x'; 17_000]))
+            .expect("maximum v1 buffer should receive a large response on its first call");
         assert!(response.error.is_none());
-        assert_eq!(response.payload.len(), 17_000);
+        assert_eq!(response.payload, vec![b'x'; 17_000]);
+        NATIVE_SERVICE_INVOCATION_COUNT.with(|count| assert_eq!(count.get(), 1));
     }
 
     #[cfg(unix)]
@@ -4597,6 +4671,7 @@ minimum = "1.0"
     fn lifecycle_context_serializes_settings_and_host() {
         let context = NativeLifecycleContext {
             auxiliary_executables: BTreeMap::new(),
+            host_service_port: None,
             auxiliary_executable_errors: BTreeMap::new(),
             plugin_id: "test.plugin".to_string(),
             required_capabilities: Vec::new(),
@@ -4672,6 +4747,38 @@ minimum = "1.0"
         );
     }
 
+    // Test-selected host implementation, explicitly bound rather than discovered
+    // by the command context. Exercise the generic host authorization separately.
+    fn bind_command_test_host(
+        mut context: super::NativeCommandContext,
+    ) -> super::NativeCommandContext {
+        let selected = context.clone();
+        context.host_service_port =
+            Some(bmux_plugin_sdk::PluginHostServices::new(move |request| {
+                super::call_service_raw(
+                    &selected.plugin_id,
+                    selected.caller_client_id,
+                    &selected.required_capabilities,
+                    &selected.provided_capabilities,
+                    &selected.services,
+                    &selected.available_capabilities,
+                    &selected.enabled_plugins,
+                    &selected.plugin_search_roots,
+                    &selected.host,
+                    &selected.connection,
+                    selected.host_kernel_bridge.clone(),
+                    &selected.plugin_settings_map,
+                    None,
+                    request.capability,
+                    request.kind,
+                    request.interface,
+                    request.operation,
+                    request.payload.to_vec(),
+                )
+            }));
+        context
+    }
+
     #[test]
     fn dynamic_command_outcome_fills_what_the_host_capture_missed() {
         let mut host = bmux_plugin_sdk::PluginCommandOutcome::default();
@@ -4742,7 +4849,22 @@ minimum = "1.0"
             caller_client_id: None,
             invocation_source: bmux_plugin_sdk::NativeCommandInvocationSource::Unknown,
             host_kernel_bridge: None,
+            host_service_port: None,
         };
+        assert!(
+            context
+                .call_service_raw(
+                    "example.read",
+                    bmux_plugin_sdk::ServiceKind::Query,
+                    "example-state/v1",
+                    "list",
+                    Vec::new(),
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("port not selected")
+        );
+        let context = bind_command_test_host(context);
 
         let error = context
             .call_service_raw(
@@ -4788,7 +4910,9 @@ minimum = "1.0"
             caller_client_id: None,
             invocation_source: bmux_plugin_sdk::NativeCommandInvocationSource::Unknown,
             host_kernel_bridge: None,
+            host_service_port: None,
         };
+        let context = bind_command_test_host(context);
 
         let error = context
             .call_service_raw(
@@ -4853,7 +4977,9 @@ minimum = "1.0"
             caller_client_id: None,
             invocation_source: bmux_plugin_sdk::NativeCommandInvocationSource::Unknown,
             host_kernel_bridge: None,
+            host_service_port: None,
         };
+        let context = bind_command_test_host(context);
 
         // A declared capability is not evidence that a particular interface
         // version or service kind is implemented. Reject before host dispatch.
@@ -4951,7 +5077,9 @@ minimum = "1.0"
             caller_client_id: None,
             invocation_source: bmux_plugin_sdk::NativeCommandInvocationSource::Unknown,
             host_kernel_bridge: None,
+            host_service_port: None,
         };
+        let context = bind_command_test_host(context);
 
         context
             .call_service_raw(
@@ -4988,7 +5116,7 @@ minimum = "1.0"
         let path = super::storage_file_path(&context.connection, "caller.plugin", "theme");
         for expected in [None, Some(b"other-host".to_vec())] {
             if let Some(bytes) = &expected {
-                super::write_storage_value(&path, bytes).unwrap();
+                crate::host_builtins::write_storage_value(&path, bytes).unwrap();
             } else {
                 std::fs::remove_file(&path).unwrap();
             }
@@ -5047,7 +5175,9 @@ minimum = "1.0"
             caller_client_id: None,
             invocation_source: bmux_plugin_sdk::NativeCommandInvocationSource::Unknown,
             host_kernel_bridge: None,
+            host_service_port: None,
         };
+        let context = bind_command_test_host(context);
 
         let response: () = context
             .call_service(
@@ -5103,7 +5233,9 @@ minimum = "1.0"
             caller_client_id: None,
             invocation_source: bmux_plugin_sdk::NativeCommandInvocationSource::Unknown,
             host_kernel_bridge: Some(super::HostKernelBridge::from_fn(test_host_kernel_bridge)),
+            host_service_port: None,
         };
+        let context = bind_command_test_host(context);
 
         let response: bmux_plugin_sdk::CoreCliCommandResponse = context
             .call_service(
@@ -5158,7 +5290,9 @@ minimum = "1.0"
             caller_client_id: None,
             invocation_source: bmux_plugin_sdk::NativeCommandInvocationSource::Unknown,
             host_kernel_bridge: Some(super::HostKernelBridge::from_fn(test_host_kernel_bridge)),
+            host_service_port: None,
         };
+        let context = bind_command_test_host(context);
 
         let mut request = bmux_plugin_sdk::CoreCliCommandRequest::new(
             vec!["playbook".to_string(), "run".to_string()],
@@ -5220,7 +5354,9 @@ minimum = "1.0"
             caller_client_id: None,
             invocation_source: bmux_plugin_sdk::NativeCommandInvocationSource::Unknown,
             host_kernel_bridge: Some(super::HostKernelBridge::from_fn(test_host_kernel_bridge)),
+            host_service_port: None,
         };
+        let context = bind_command_test_host(context);
 
         let response: bmux_plugin_sdk::PluginCliCommandResponse = context
             .call_service(
@@ -5276,7 +5412,9 @@ minimum = "1.0"
             caller_client_id: None,
             invocation_source: bmux_plugin_sdk::NativeCommandInvocationSource::Unknown,
             host_kernel_bridge: Some(super::HostKernelBridge::from_fn(test_host_kernel_bridge)),
+            host_service_port: None,
         };
+        let context = bind_command_test_host(context);
 
         let mut request = bmux_plugin_sdk::PluginCliCommandRequest::new(
             "bmux.tabs".to_string(),
@@ -5344,6 +5482,7 @@ minimum = "1.0"
             caller_client_id: None,
             cancellation: bmux_plugin_sdk::CancellationToken::default(),
             host_kernel_bridge: None,
+            host_service_port: None,
         };
 
         let bytes = encode_service_envelope(7, ServiceEnvelopeKind::Request, &context)

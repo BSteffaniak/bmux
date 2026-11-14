@@ -23,6 +23,8 @@ bmux_plugin_sdk                 = { workspace = true }
 bmux_session_state              = { workspace = true }
 bmux_sessions_plugin_api        = { workspace = true }
 serde                           = { workspace = true, features = ["derive", "std"] }
+tokio                           = { workspace = true, features = ["sync"] }
+tracing                         = { workspace = true }
 
 [features]
 fail-on-warnings = [

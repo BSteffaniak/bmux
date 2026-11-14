@@ -144,7 +144,11 @@ pub fn run_logs_profiles_rename(from: &str, to: &str) -> Result<u8> {
 }
 
 pub fn active_log_file_path() -> PathBuf {
-    let segmented = ConfigPaths::default()
+    active_log_file_path_at(&ConfigPaths::default())
+}
+
+pub(super) fn active_log_file_path_at(paths: &ConfigPaths) -> PathBuf {
+    let segmented = paths
         .logs_dir()
         .join("server")
         .join("latest")
@@ -152,10 +156,7 @@ pub fn active_log_file_path() -> PathBuf {
     if segmented.exists() {
         return segmented;
     }
-    moosicbox_log_watch::active_log_file_path(
-        &ConfigPaths::default().logs_dir(),
-        BMUX_LOG_FILE_PREFIX,
-    )
+    moosicbox_log_watch::active_log_file_path(&paths.logs_dir(), BMUX_LOG_FILE_PREFIX)
 }
 
 fn active_log_watch_dir() -> PathBuf {

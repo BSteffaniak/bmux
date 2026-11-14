@@ -36,6 +36,7 @@ bmux_decoration_plugin = { workspace = true, features = [
     "bundled-decoration-scripts",
     "scripting-luau",
 ] }
+serial_test = { workspace = true }
 uuid = { workspace = true }
 
 [package.metadata.cargo-machete]

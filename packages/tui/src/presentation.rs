@@ -8,6 +8,10 @@ pub use crate::grid_fragment::{
     GridTransform, PreparedGridFragment, PreparedGridOverlay, UnsupportedGridFragments,
 };
 
+/// Inert retained-scene transport and capture; no host lifecycle authority.
+#[cfg(feature = "serde")]
+pub mod portable;
+
 use crate::buffer::Buffer;
 use crate::damage::Damage;
 use crate::focus::{FocusScopeId, FocusTrap, ModalFocus, modal_transition};
@@ -169,6 +173,8 @@ pub struct PreparedPresentation {
     metadata_availability: Vec<SurfaceMetadataAvailability>,
     damage: Damage,
     scroll_hint: Option<(Rect, i64)>,
+    /// Producer occlusion geometry; visible images are already reconciled.
+    occluded_regions: Vec<Rect>,
 }
 
 impl PreparedPresentation {
@@ -332,6 +338,17 @@ impl PreparedPresentation {
             return Err(error);
         }
         Ok(())
+    }
+
+    /// Producer occlusion geometry, without image ordering from an earlier frame.
+    #[must_use]
+    pub fn occluded_regions(&self) -> &[Rect] {
+        &self.occluded_regions
+    }
+
+    /// Declared modal identities in outer-to-inner order, without navigation history.
+    pub fn modal_scopes(&self) -> impl ExactSizeIterator<Item = &FocusScopeId> {
+        self.modal_focus.iter().map(|modal| &modal.scope)
     }
 
     /// Stage caller-owned modal scopes in outer-to-inner order.
@@ -611,6 +628,9 @@ impl PreparedPresentation {
             {
                 add(1, size.saturating_add(32))?;
             }
+        }
+        for area in &self.occluded_regions {
+            add(1, std::mem::size_of_val(area))?;
         }
         for cell in self.buffer.cells() {
             add(0, cell.symbol.len())?;
@@ -1302,6 +1322,7 @@ impl PresentationState {
                     metadata_availability,
                     damage,
                     scroll_hint,
+                    occluded_regions: occlusions.iter().map(|(_, area)| *area).collect(),
                 })
             },
             |_| true,

@@ -1,5 +1,11 @@
+mod kernel_policy;
+#[cfg(feature = "bundled-plugin-recording")]
+pub(super) mod recording_binding;
+mod selected;
+pub(super) use selected::ProductionPlugin;
+
 use anyhow::{Context, Result};
-use bmux_config::{BmuxConfig, ConfigPaths};
+use bmux_config::{BmuxConfig, ConfigPaths, PluginSourceConfig};
 use bmux_plugin::{
     NativeServiceBufferConfig, PluginManifest, PluginRegistry, PluginRuntime,
     load_registered_plugin_with_native_service_buffer_config as load_native_registered_plugin,
@@ -31,6 +37,7 @@ use super::{
 
 #[derive(Debug, Clone)]
 pub(super) struct RuntimeCommandState {
+    pub(super) runtime_owner: Option<crate::runtime_owner::WeakRuntimeOwner>,
     pub(super) config: BmuxConfig,
     pub(super) paths: ConfigPaths,
     pub(super) registry: Arc<PluginRegistry>,
@@ -44,7 +51,10 @@ pub(super) struct RuntimeCommandState {
 
 thread_local! {
     static RUNTIME_COMMAND_STATE_CACHE: RefCell<Option<RuntimeCommandState>> = const { RefCell::new(None) };
-    static LOADED_PLUGIN_CACHE: RefCell<BTreeMap<String, Rc<bmux_plugin::LoadedPlugin>>> = const { RefCell::new(BTreeMap::new()) };
+    static LOADED_PLUGIN_CACHE: RefCell<BTreeMap<String, Rc<ProductionPlugin>>> = const { RefCell::new(BTreeMap::new()) };
+    static EXECUTION_LOADER: bmux_plugin::NativePluginLoader = bmux_plugin::NativePluginLoader::new();
+    static EXECUTION_SCOPE: bmux_plugin_runtime::PluginRuntimeScopeId = bmux_plugin_runtime::PluginRuntimeScopeId::new();
+    static HOST_STATE: Arc<bmux_plugin::PluginStateRegistry> = Arc::new(bmux_plugin::PluginStateRegistry::new());
 }
 
 pub(super) fn plugin_host_metadata() -> HostMetadata {
@@ -82,46 +92,66 @@ pub(super) fn validate_configured_plugins(config: &BmuxConfig, paths: &ConfigPat
 
 /// Declare statically-linked bundled plugins from a single table.
 ///
-/// This generates `register_static_bundled_plugins`, which registers each
-/// plugin's manifest into the [`PluginRegistry`] and its static vtable into the
-/// process-wide static vtable registry.
-///
-/// Each entry is only compiled when its Cargo feature flag is active, so the
-/// binary only includes the plugin code the user opted into (all bundled by
-/// default via the `bundled-plugins` feature).
-///
-/// To add a new bundled plugin, append one three-line entry here -- no need to
-/// touch two separate functions.
+/// Declares bundled implementations once for inert shared-definition registration
+/// and bundled client-adapter discovery. Explicit `definition` expressions use
+/// the plugin-owned factory; unmigrated entries temporarily use the SDK's scoped
+/// `RustPlugin` adapter, never a static vtable or process-global implementation.
+/// Each declaration remains feature-gated for no-plugin builds.
 macro_rules! declare_bundled_plugins {
     ($(
         feature = $feature:literal,
         id = $plugin_id:literal,
         manifest = $manifest:expr,
+        $(definition = $definition:expr,)?
+        $(kernel_policy = $kernel_policy:expr,)?
         plugin_type = $ty:ty;
     )*) => {
+        #[cfg(test)]
         #[allow(unused_variables, clippy::missing_const_for_fn)]
         fn register_static_bundled_plugins(registry: &mut PluginRegistry) {
+            register_selected_bundled_plugins(registry, &BTreeMap::new())
+                .expect("bundled declarations must register");
+        }
+
+        #[allow(unused_variables, clippy::missing_const_for_fn)]
+        fn register_selected_bundled_plugins(
+            registry: &mut PluginRegistry,
+            sources: &BTreeMap<String, PluginSourceConfig>,
+        ) -> Result<()> {
             $(
                 #[cfg(feature = $feature)]
-                {
-                    let vtable = bmux_plugin_sdk::bundled_plugin_vtable!($ty, $manifest);
-                    let declared_services = (vtable.declared_services)().unwrap_or_else(|error| {
-                        tracing::warn!(
-                            "failed collecting generated service declarations for bundled plugin '{}': {error}",
-                            $plugin_id,
-                        );
-                        Vec::new()
-                    });
-                    if let Err(e) = registry.register_bundled_manifest_with_services($manifest, declared_services) {
-                        let plugin_id = bmux_plugin::PluginManifest::from_toml_str($manifest)
-                            .ok()
-                            .map(|parsed| parsed.id)
-                            .unwrap_or_else(|| "<unknown-plugin-id>".to_string());
-                        tracing::warn!("failed to register bundled plugin '{plugin_id}': {e}");
-                    }
-                    bmux_plugin::register_static_vtable($plugin_id, vtable);
+                if !matches!(sources.get($plugin_id), Some(PluginSourceConfig::Dynamic { .. })) {
+                    let definition = declare_bundled_plugins!(@definition $ty, $manifest $(, $definition)?);
+                    let manifest = register_bundled_definition($plugin_id, $manifest, definition)?;
+                    registry.register_bundled_manifest(&manifest)
+                        .with_context(|| format!("failed registering bundled plugin '{}'", $plugin_id))?;
                 }
             )*
+            Ok(())
+        }
+
+        #[allow(unused_variables, clippy::missing_const_for_fn)]
+        fn trusted_bundled_kernel_policy(
+            plugin: &bmux_plugin::RegisteredPlugin,
+        ) -> bmux_plugin_sdk::Result<Option<kernel_policy::TrustedKernelPolicy>> {
+            if !plugin.bundled_static {
+                // A native override never inherits policy from its logical ID.
+                // Explicit selected-artifact approval requires a separate entry.
+                return Ok(None);
+            }
+            $(
+                $(
+                    #[cfg(feature = $feature)]
+                    if plugin.manifest.id == $plugin_id {
+                        let artifact = bmux_plugin::NativePluginLoader::registered_definition($plugin_id)?
+                            .ok_or_else(|| bmux_plugin_sdk::PluginError::ServiceProtocol {
+                                details: "trusted composition definition unavailable".into(),
+                            })?;
+                        return kernel_policy::TrustedKernelPolicy::bundled(artifact.metadata(), $kernel_policy).map(Some);
+                    }
+                )?
+            )*
+            Ok(None)
         }
 
         #[allow(unused_variables, clippy::missing_const_for_fn)]
@@ -139,6 +169,53 @@ macro_rules! declare_bundled_plugins {
         }
 
     };
+    (@definition $ty:ty, $manifest:expr, $definition:expr) => { $definition };
+    (@definition $ty:ty, $manifest:expr) => {{
+        let manifest: toml::Value = toml::from_str($manifest)
+            .context("failed parsing bundled component role declaration")?;
+        let roles = manifest.get("component_roles").cloned().map_or_else(
+            || Ok(vec![bmux_plugin_sdk::definition::ComponentRole::Backend]),
+            |roles| roles.try_into::<Vec<bmux_plugin_sdk::definition::ComponentRole>>()
+                .context("invalid bundled component role declaration"),
+        )?;
+        bmux_plugin_sdk::definition::PluginDefinition::from_rust_plugin::<$ty>(
+            $manifest, roles,
+        ).map_err(|error| anyhow::anyhow!(error.message))?
+    }};
+}
+
+fn register_bundled_definition(
+    plugin_id: &str,
+    manifest_toml: &str,
+    definition: bmux_plugin_sdk::definition::PluginDefinition,
+) -> Result<String> {
+    anyhow::ensure!(
+        definition.metadata.plugin_id == plugin_id,
+        "bundled definition identity differs from declaration '{plugin_id}'"
+    );
+    let embedded = definition
+        .metadata
+        .manifest_toml
+        .as_deref()
+        .context("bundled definition has no embedded manifest")?;
+    let manifest = PluginManifest::from_toml_str(embedded)?;
+    let original = PluginManifest::from_toml_str(manifest_toml)?;
+    anyhow::ensure!(
+        manifest.id == original.id && manifest.version == original.version,
+        "bundled definition identity differs from declaration '{plugin_id}'"
+    );
+    // Preserve the exact author declaration used by dynamic packaging; the
+    // application may not repair or rewrite its contract/role metadata.
+    let embedded = embedded.to_owned();
+    if let Some(existing) = bmux_plugin::NativePluginLoader::registered_definition(plugin_id)? {
+        anyhow::ensure!(
+            existing.metadata() == &definition.metadata,
+            "conflicting bundled definition for '{plugin_id}'"
+        );
+    } else {
+        bmux_plugin::NativePluginLoader::register_definition(definition)?;
+    }
+    Ok(embedded)
 }
 
 /// Register an optional client-side adapter owned by one bundled plugin.
@@ -216,11 +293,14 @@ declare_bundled_plugins! {
     feature = "bundled-plugin-clients",
     id = "bmux.clients",
     manifest = include_str!("../../../../plugins/clients-plugin/plugin.toml"),
+    definition = bmux_clients_plugin::plugin_definition(),
+    kernel_policy = bmux_clients_plugin::authorize_kernel_request,
     plugin_type = bmux_clients_plugin::ClientsPlugin;
 
     feature = "bundled-plugin-clipboard",
     id = "bmux.clipboard",
     manifest = include_str!("../../../../plugins/clipboard-plugin/plugin.toml"),
+    definition = bmux_clipboard_plugin::plugin_definition(),
     plugin_type = bmux_clipboard_plugin::ClipboardPlugin;
 
     feature = "bundled-plugin-cluster",
@@ -236,11 +316,13 @@ declare_bundled_plugins! {
     feature = "bundled-plugin-command-palette",
     id = "bmux.command_palette",
     manifest = include_str!("../../../../plugins/command-palette-plugin/plugin.toml"),
+    definition = bmux_command_palette_plugin::plugin_definition(),
     plugin_type = bmux_command_palette_plugin::CommandPalettePlugin;
 
     feature = "bundled-plugin-contexts",
     id = "bmux.contexts",
     manifest = include_str!("../../../../plugins/contexts-plugin/plugin.toml"),
+    definition = bmux_contexts_plugin::plugin_definition(),
     plugin_type = bmux_contexts_plugin::ContextsPlugin;
 
     feature = "bundled-plugin-control-catalog",
@@ -256,31 +338,37 @@ declare_bundled_plugins! {
     feature = "bundled-plugin-permissions",
     id = "bmux.permissions",
     manifest = include_str!("../../../../plugins/permissions-plugin/plugin.toml"),
+    definition = bmux_permissions_plugin::plugin_definition(),
     plugin_type = bmux_permissions_plugin::PermissionsPlugin;
 
     feature = "bundled-plugin-cli",
     id = "bmux.plugin_cli",
     manifest = include_str!("../../../../plugins/plugin-cli-plugin/plugin.toml"),
+    definition = bmux_plugin_cli_plugin::plugin_definition(),
     plugin_type = bmux_plugin_cli_plugin::PluginCliPlugin;
 
     feature = "bundled-plugin-prompted-actions",
     id = "bmux.prompted_actions",
     manifest = include_str!("../../../../plugins/prompted-actions-plugin/plugin.toml"),
+    definition = bmux_prompted_actions_plugin::plugin_definition(),
     plugin_type = bmux_prompted_actions_plugin::PromptedActionsPlugin;
 
     feature = "bundled-plugin-recording",
     id = "bmux.recording",
     manifest = include_str!("../../../../plugins/recording-plugin/plugin.toml"),
+    definition = recording_binding::unbound_definition(),
     plugin_type = bmux_recording_plugin::RecordingPlugin;
 
     feature = "bundled-plugin-sessions",
     id = "bmux.sessions",
     manifest = include_str!("../../../../plugins/sessions-plugin/plugin.toml"),
+    definition = bmux_sessions_plugin::plugin_definition(),
     plugin_type = bmux_sessions_plugin::SessionsPlugin;
 
     feature = "bundled-plugin-playbook",
     id = "bmux.playbook",
     manifest = include_str!("../../../../plugins/playbook-plugin/plugin.toml"),
+    definition = bmux_playbook_plugin::plugin_definition(),
     plugin_type = bmux_playbook_plugin::PlaybookPlugin;
 
     feature = "bundled-plugin-broadcast",
@@ -291,86 +379,124 @@ declare_bundled_plugins! {
     feature = "bundled-plugin-presenter",
     id = "bmux.presenter",
     manifest = include_str!("../../../../plugins/presenter-plugin/plugin.toml"),
+    definition = bmux_presenter_plugin::plugin_definition(),
     plugin_type = bmux_presenter_plugin::PresenterPlugin;
 
     feature = "bundled-plugin-finder",
     id = "bmux.finder",
     manifest = include_str!("../../../../plugins/finder-plugin/plugin.toml"),
+    definition = bmux_finder_plugin::plugin_definition(),
     plugin_type = bmux_finder_plugin::FinderPlugin;
 
     feature = "bundled-plugin-pane-runtime",
     id = "bmux.pane_runtime",
     manifest = include_str!("../../../../plugins/pane-runtime-plugin/plugin.toml"),
+    definition = bmux_pane_runtime_plugin::plugin_definition(),
     plugin_type = bmux_pane_runtime_plugin::PaneRuntimePlugin;
 
     feature = "bundled-plugin-application-resurrection",
     id = "bmux.application_resurrection",
     manifest = include_str!("../../../../plugins/application-resurrection-plugin/plugin.toml"),
+    definition = bmux_application_resurrection_plugin::plugin_definition(),
     plugin_type = bmux_application_resurrection_plugin::ApplicationResurrectionPlugin;
 
     feature = "bundled-plugin-snapshot",
     id = "bmux.snapshot",
     manifest = include_str!("../../../../plugins/snapshot-plugin/plugin.toml"),
+    definition = bmux_snapshot_plugin::plugin_definition(),
     plugin_type = bmux_snapshot_plugin::SnapshotPlugin;
 
     feature = "bundled-plugin-sidebar",
     id = "bmux.sidebar",
     manifest = include_str!("../../../../plugins/sidebar-plugin/plugin.toml"),
+    definition = bmux_sidebar_plugin::plugin_definition(),
     plugin_type = bmux_sidebar_plugin::SidebarPlugin;
 
     feature = "bundled-plugin-tab-bar",
     id = "bmux.tab_bar",
     manifest = include_str!("../../../../plugins/tab-bar-plugin/plugin.toml"),
+    definition = bmux_tab_bar_plugin::plugin_definition(),
     plugin_type = bmux_tab_bar_plugin::TabBarPlugin;
 
     feature = "bundled-plugin-theme",
     id = "bmux.theme",
     manifest = include_str!("../../../../plugins/theme-plugin/plugin.toml"),
+    definition = bmux_theme_plugin::plugin_definition(),
     plugin_type = bmux_theme_plugin::ThemePlugin;
 
     feature = "bundled-plugin-windows",
     id = "bmux.tabs",
     manifest = include_str!("../../../../plugins/tabs-plugin/plugin.toml"),
+    definition = bmux_tabs_plugin::plugin_definition(),
     plugin_type = bmux_tabs_plugin::TabsPlugin;
 
     feature = "bundled-plugin-workspaces",
     id = "bmux.workspaces",
     manifest = include_str!("../../../../plugins/workspaces-plugin/plugin.toml"),
+    definition = bmux_workspaces_plugin::plugin_definition(),
     plugin_type = bmux_workspaces_plugin::WorkspacesPlugin;
 
     feature = "bundled-plugin-decoration",
     id = "bmux.decoration",
     manifest = include_str!("../../../../plugins/decoration-plugin/plugin.toml"),
+    definition = bmux_decoration_plugin::plugin_definition(),
     plugin_type = bmux_decoration_plugin::DecorationPlugin;
 }
 
-/// Load a registered plugin, using the static vtable path for bundled plugins
-/// and the dynamic `dlopen` path for everything else.
+/// Load one selected implementation into this host's scoped executor.
 #[allow(clippy::result_large_err)] // Plugin error types carry context payloads
 pub(super) fn load_plugin(
     plugin: &bmux_plugin::RegisteredPlugin,
     host: &HostMetadata,
     available_capabilities: &std::collections::BTreeMap<HostScope, bmux_plugin::CapabilityProvider>,
     config: &BmuxConfig,
-) -> bmux_plugin_sdk::Result<bmux_plugin::LoadedPlugin> {
-    let native_service_buffers = native_service_buffer_config(config);
-    if plugin.bundled_static {
-        let vtable =
-            bmux_plugin::static_vtable(plugin.declaration.id.as_str()).ok_or_else(|| {
-                bmux_plugin_sdk::PluginError::MissingStaticVtable {
-                    plugin_id: plugin.declaration.id.as_str().to_string(),
-                }
-            })?;
-        bmux_plugin::load_trusted_static_plugin_with_native_service_buffer_config(
-            plugin,
-            vtable,
-            host,
-            available_capabilities,
-            native_service_buffers,
-        )
-    } else {
-        load_native_registered_plugin(plugin, host, available_capabilities, native_service_buffers)
-    }
+) -> bmux_plugin_sdk::Result<ProductionPlugin> {
+    load_plugin_with_definitions(
+        plugin,
+        host,
+        available_capabilities,
+        config,
+        &BTreeMap::new(),
+    )
+}
+
+#[allow(clippy::result_large_err)] // Preserve the loader's public error contract.
+fn load_plugin_with_definitions(
+    plugin: &bmux_plugin::RegisteredPlugin,
+    host: &HostMetadata,
+    available_capabilities: &BTreeMap<HostScope, bmux_plugin::CapabilityProvider>,
+    config: &BmuxConfig,
+    definitions: &BTreeMap<String, bmux_plugin_sdk::definition::PluginDefinition>,
+) -> bmux_plugin_sdk::Result<ProductionPlugin> {
+    let paths = selected_command_state()
+        .map_err(|error| bmux_plugin_sdk::PluginError::ServiceProtocol {
+            details: format!("selected loader requires resolved runtime paths: {error:#}"),
+        })?
+        .paths;
+    let approvals = kernel_policy::load_native_approvals(&paths)?;
+    EXECUTION_SCOPE.with(|scope| {
+        HOST_STATE.with(|state| {
+            EXECUTION_LOADER.with(|loader| {
+                ProductionPlugin::load(
+                    plugin,
+                    host,
+                    available_capabilities,
+                    config,
+                    selected::ExecutionOwner {
+                        runtime_owner: selected_command_state().ok().and_then(|state| {
+                            state.runtime_owner.and_then(|owner| owner.upgrade())
+                        }),
+                        runtime: *scope,
+                        host_state: Arc::clone(state),
+                        loader,
+                        definitions,
+                        approval_store: approvals.as_ref(),
+                        runtime_dir: &paths.runtime_dir,
+                    },
+                )
+            })
+        })
+    })
 }
 
 const fn native_service_buffer_config(config: &BmuxConfig) -> NativeServiceBufferConfig {
@@ -381,6 +507,8 @@ const fn native_service_buffer_config(config: &BmuxConfig) -> NativeServiceBuffe
     }
 }
 
+// Keep discovery, source precedence and its timing receipt in one auditable pass.
+#[allow(clippy::too_many_lines)]
 pub fn scan_available_plugins(config: &BmuxConfig, paths: &ConfigPaths) -> Result<PluginRegistry> {
     let total_started = Instant::now();
     let workspace_bundled_root = workspace_bundled_plugin_root();
@@ -397,7 +525,10 @@ pub fn scan_available_plugins(config: &BmuxConfig, paths: &ConfigPaths) -> Resul
 
     let static_started = Instant::now();
     // Register statically-linked bundled plugins first (behind feature flags).
-    register_static_bundled_plugins(&mut registry);
+    register_selected_bundled_plugins(&mut registry, &config.plugins.sources)?;
+    // Resolve explicit selections before ambient discovery. Neither duplicate
+    // search results nor workspace artifacts may replace a selected source.
+    register_selected_dynamic_plugins(&mut registry, config)?;
     let static_register_us = static_started.elapsed().as_micros();
     let static_bundled_count = registry
         .iter()
@@ -406,6 +537,10 @@ pub fn scan_available_plugins(config: &BmuxConfig, paths: &ConfigPaths) -> Resul
 
     let filesystem_started = Instant::now();
     let mut filesystem_registered_count = 0_usize;
+    let mut inventory = bmux_plugin::PluginCandidateInventory::new();
+    for plugin in registry.iter() {
+        inventory.add_registered_plugin(plugin)?;
+    }
     for report in reports {
         for manifest_path in report.manifest_paths {
             if workspace_bundled_root
@@ -417,6 +552,9 @@ pub fn scan_available_plugins(config: &BmuxConfig, paths: &ConfigPaths) -> Resul
             }
             match PluginManifest::from_path(&manifest_path) {
                 Ok(mut manifest) => {
+                    if config.plugins.sources.contains_key(&manifest.id) {
+                        continue;
+                    }
                     if let Some(entry_path) = manifest.resolve_entry_path(
                         manifest_path
                             .parent()
@@ -434,31 +572,11 @@ pub fn scan_available_plugins(config: &BmuxConfig, paths: &ConfigPaths) -> Resul
                             manifest.entry = Some(executable_candidate);
                         }
                     }
-                    if let Err(error) = registry.register_manifest_from_root(
-                        &report.search_root,
-                        &manifest_path,
-                        manifest,
-                    ) {
-                        // DuplicatePluginId is expected when a static-bundled
-                        // plugin is also discovered on the filesystem -- skip
-                        // since the static registration already won.
-                        if matches!(
-                            error,
-                            bmux_plugin_sdk::PluginError::DuplicatePluginId { .. }
-                        ) {
-                            debug!(
-                                "skipping filesystem plugin {} (duplicate of static-bundled plugin)",
-                                manifest_path.display()
-                            );
-                        } else {
-                            warn!(
-                                "skipping plugin manifest {} during enabled-plugin scan: {error}",
-                                manifest_path.display()
-                            );
-                        }
-                    } else {
-                        filesystem_registered_count += 1;
-                    }
+                    inventory
+                        .add_dynamic_manifest(&report.search_root, &manifest_path, manifest)
+                        .with_context(|| {
+                            format!("failed inventorying plugin {}", manifest_path.display())
+                        })?;
                 }
                 Err(error) => {
                     warn!(
@@ -468,6 +586,33 @@ pub fn scan_available_plugins(config: &BmuxConfig, paths: &ConfigPaths) -> Resul
                 }
             }
         }
+    }
+    // Default preference chooses bundled when present; otherwise more than one
+    // dynamic artifact is an explicit ambiguity, never directory-order policy.
+    let candidate_ids = inventory
+        .iter()
+        .map(|candidate| candidate.plugin.manifest.id.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    for plugin_id in candidate_ids {
+        if registry.get(&plugin_id).is_some() {
+            continue;
+        }
+        let selected = inventory
+            .select(&bmux_plugin::PluginSelectionRequest {
+                plugin_id: plugin_id.clone(),
+                role: inventory_component_role(
+                    &inventory,
+                    &plugin_id,
+                    &bmux_plugin::PluginCandidatePreference::Default,
+                )?,
+                preference: bmux_plugin::PluginCandidatePreference::Default,
+                plugin_api: CURRENT_PLUGIN_API_VERSION,
+                native_abi: CURRENT_PLUGIN_ABI_VERSION,
+                contracts: Vec::new(),
+            })
+            .with_context(|| format!("failed selecting plugin '{plugin_id}'"))?;
+        registry.register_selected_candidate(&selected)?;
+        filesystem_registered_count += 1;
     }
     let filesystem_register_us = filesystem_started.elapsed().as_micros();
     emit_plugin_runtime_phase_timing(
@@ -483,6 +628,115 @@ pub fn scan_available_plugins(config: &BmuxConfig, paths: &ConfigPaths) -> Resul
             .finish(),
     );
     Ok(registry)
+}
+
+/// Resolve explicit sources without modifying ambient discovery precedence.
+/// Errors are fatal: an unavailable selected artifact is never a fallback signal.
+fn register_selected_dynamic_plugins(
+    registry: &mut PluginRegistry,
+    config: &BmuxConfig,
+) -> Result<()> {
+    // Reuse the host inventory's canonical locator, identity, compatibility and
+    // role checks; source selection must not acquire a second CLI implementation.
+    let mut inventory = bmux_plugin::PluginCandidateInventory::new();
+    for plugin in registry.iter() {
+        inventory.add_registered_plugin(plugin)?;
+    }
+    for (plugin_id, source) in &config.plugins.sources {
+        let preference = match source {
+            PluginSourceConfig::Bundled => bmux_plugin::PluginCandidatePreference::Bundled,
+            PluginSourceConfig::Dynamic { manifest } => {
+                inventory
+                    .add_dynamic_manifest_path_for_plugin(plugin_id, manifest)
+                    .with_context(|| {
+                        format!("failed inventorying selected source for plugin '{plugin_id}'")
+                    })?;
+                bmux_plugin::PluginCandidatePreference::Dynamic {
+                    manifest_path: manifest.clone(),
+                }
+            }
+        };
+        let selected = inventory
+            .select(&bmux_plugin::PluginSelectionRequest {
+                plugin_id: plugin_id.clone(),
+                role: inventory_component_role(&inventory, plugin_id, &preference)?,
+                preference,
+                plugin_api: CURRENT_PLUGIN_API_VERSION,
+                native_abi: CURRENT_PLUGIN_ABI_VERSION,
+                contracts: Vec::new(),
+            })
+            .with_context(|| format!("failed selecting source for plugin '{plugin_id}'"))?;
+        if matches!(source, PluginSourceConfig::Dynamic { .. }) {
+            let plugin = &selected.candidate().plugin;
+            anyhow::ensure!(
+                plugin.manifest.runtime == PluginRuntime::Native,
+                "selected dynamic plugin '{plugin_id}' must declare native runtime"
+            );
+            anyhow::ensure!(
+                registered_plugin_entry_exists(plugin),
+                "selected dynamic plugin '{plugin_id}' entry is not a file or is missing"
+            );
+            registry.register_selected_candidate(&selected)?;
+        }
+    }
+    Ok(())
+}
+
+/// Select the deployed component before compatibility negotiation. Dual-role
+/// declarations explicitly provide a backend; frontend-only declarations must
+/// execute as frontend, never by retrying a failed backend selection.
+fn deployed_component_role(
+    manifest: &PluginManifest,
+) -> std::result::Result<
+    bmux_plugin_sdk::definition::ComponentRole,
+    Box<bmux_plugin_sdk::PluginError>,
+> {
+    use bmux_plugin_sdk::definition::ComponentRole;
+    match manifest.component_roles.as_slice() {
+        [ComponentRole::Frontend] => Ok(ComponentRole::Frontend),
+        roles if roles.contains(&ComponentRole::Backend) => Ok(ComponentRole::Backend),
+        _ => Err(Box::new(bmux_plugin_sdk::PluginError::ServiceProtocol {
+            details: format!(
+                "plugin '{}' has no unambiguous deployed component role",
+                manifest.id
+            ),
+        })),
+    }
+}
+
+fn inventory_component_role(
+    inventory: &bmux_plugin::PluginCandidateInventory,
+    plugin_id: &str,
+    preference: &bmux_plugin::PluginCandidatePreference,
+) -> Result<bmux_plugin_sdk::definition::ComponentRole> {
+    use bmux_plugin::{PluginCandidatePreference, PluginCandidateSource};
+    let candidates = inventory
+        .iter()
+        .filter(|candidate| candidate.plugin.manifest.id == plugin_id)
+        .collect::<Vec<_>>();
+    let bundled = candidates
+        .iter()
+        .any(|candidate| candidate.source == PluginCandidateSource::Bundled);
+    let override_path = match preference {
+        PluginCandidatePreference::Dynamic { manifest_path } => {
+            Some(std::fs::canonicalize(manifest_path)?)
+        }
+        PluginCandidatePreference::Default | PluginCandidatePreference::Bundled => None,
+    };
+    let mut eligible = candidates.into_iter().filter(|candidate| match preference {
+        PluginCandidatePreference::Default => !bundled || candidate.source == PluginCandidateSource::Bundled,
+        PluginCandidatePreference::Bundled => candidate.source == PluginCandidateSource::Bundled,
+        PluginCandidatePreference::Dynamic { .. } => matches!(&candidate.source,
+            PluginCandidateSource::Dynamic { manifest_path } if Some(manifest_path) == override_path.as_ref()),
+    });
+    let candidate = eligible
+        .next()
+        .with_context(|| format!("no candidates for '{plugin_id}'"))?;
+    anyhow::ensure!(
+        eligible.next().is_none(),
+        "ambiguous candidates for '{plugin_id}'; select an explicit manifest"
+    );
+    Ok(deployed_component_role(&candidate.plugin.manifest)?)
 }
 
 fn static_bundled_workspace_manifest_is_registered(manifest_path: &Path) -> bool {
@@ -557,6 +811,39 @@ pub(super) fn initialize_native_runtime_state(
     Ok(())
 }
 
+pub(super) fn initialize_server_command_state(
+    config: &BmuxConfig,
+    paths: &ConfigPaths,
+    registry: &PluginRegistry,
+) -> Result<()> {
+    let state =
+        build_runtime_command_state(config.clone(), paths.clone(), Arc::new(registry.clone()))?;
+    RUNTIME_COMMAND_STATE_CACHE.with(|slot| *slot.borrow_mut() = Some(state));
+    Ok(())
+}
+
+struct SelectedCommandStateGuard(Option<RuntimeCommandState>);
+
+impl SelectedCommandStateGuard {
+    fn enter(state: &RuntimeCommandState) -> Self {
+        Self(RUNTIME_COMMAND_STATE_CACHE.with(|slot| slot.replace(Some(state.clone()))))
+    }
+}
+
+impl Drop for SelectedCommandStateGuard {
+    fn drop(&mut self) {
+        RUNTIME_COMMAND_STATE_CACHE.with(|slot| {
+            slot.replace(self.0.take());
+        });
+    }
+}
+
+pub(super) fn selected_command_state() -> Result<RuntimeCommandState> {
+    RUNTIME_COMMAND_STATE_CACHE
+        .with(|slot| slot.borrow().clone())
+        .context("no explicitly initialized command runtime for scoped CLI executor")
+}
+
 fn runtime_command_state() -> Result<RuntimeCommandState> {
     RUNTIME_COMMAND_STATE_CACHE.with(|slot| {
         if let Some(state) = slot.borrow().clone() {
@@ -596,6 +883,7 @@ pub(super) fn build_runtime_command_state(
         .collect::<Vec<_>>();
     let registered_plugin_infos = registered_plugin_infos_from_registry(&registry);
     let state = RuntimeCommandState {
+        runtime_owner: crate::runtime_owner::selected().map(|owner| owner.downgrade()),
         config,
         paths,
         registry,
@@ -726,7 +1014,7 @@ pub fn registered_plugin_entry_exists(plugin: &bmux_plugin::RegisteredPlugin) ->
                 .parent()
                 .unwrap_or_else(|| std::path::Path::new(".")),
         )
-        .is_some_and(|path| path.exists())
+        .is_some_and(|path| path.is_file())
 }
 
 /// Discover bundled plugin IDs using the same dynamic discovery as the runtime.
@@ -791,7 +1079,11 @@ pub(super) fn effective_enabled_plugins(
         .filter(|&plugin| {
             !plugin.bundled_static
                 && plugin.manifest.enabled_by_default
-                && bundled_roots.contains(&plugin.search_root)
+                && (bundled_roots.contains(&plugin.search_root)
+                    || matches!(
+                        config.plugins.sources.get(plugin.declaration.id.as_str()),
+                        Some(PluginSourceConfig::Dynamic { .. })
+                    ))
                 && registered_plugin_entry_exists(plugin)
         })
         .map(|plugin| plugin.declaration.id.as_str().to_string())
@@ -828,11 +1120,14 @@ pub(super) fn install_enabled_client_adapters(
     registry: &PluginRegistry,
     paths: &ConfigPaths,
 ) {
-    install_static_bundled_client_adapters(
-        &effective_enabled_plugins(config, registry),
-        &config.plugins.settings,
-        paths,
-    );
+    // A logical ID match is insufficient: never install this executable's
+    // bundled frontend against a dynamically selected implementation. Frontend
+    // installation must come from the selected instance's negotiated contracts.
+    let bundled_enabled = effective_enabled_plugins(config, registry)
+        .into_iter()
+        .filter(|id| registry.get(id).is_some_and(|plugin| plugin.bundled_static))
+        .collect::<Vec<_>>();
+    install_static_bundled_client_adapters(&bundled_enabled, &config.plugins.settings, paths);
 }
 
 pub(super) fn validate_enabled_plugins(
@@ -962,12 +1257,44 @@ fn validate_required_path_claim(
     Ok(())
 }
 
-pub(super) fn load_enabled_plugins(
+/// Server deployment does not activate frontend-only code. The full registry
+/// remains available to attach/command selection; explicit wrong-role requests
+/// fail instead of substituting another implementation or component.
+pub(super) fn backend_enabled_plugins(
     config: &BmuxConfig,
     registry: &PluginRegistry,
-) -> Result<Vec<bmux_plugin::LoadedPlugin>> {
+) -> Result<Vec<String>> {
+    let mut backend = Vec::new();
+    for id in effective_enabled_plugins(config, registry) {
+        if let Some(plugin) = registry.get(&id)
+            && !plugin
+                .manifest
+                .component_roles
+                .contains(&bmux_plugin_sdk::definition::ComponentRole::Backend)
+        {
+            anyhow::ensure!(
+                !config.plugins.sources.contains_key(&id) && !config.plugins.enabled.contains(&id),
+                "plugin '{id}' was explicitly selected for server startup but does not export Backend; deploy its Frontend component in the attach host"
+            );
+            continue;
+        }
+        backend.push(id);
+    }
+    Ok(backend)
+}
+
+// Dependency ordering, load failures and shared startup cache must agree.
+#[allow(clippy::too_many_lines)]
+pub(super) fn load_enabled_plugins(
+    config: &BmuxConfig,
+    paths: &ConfigPaths,
+    registry: &PluginRegistry,
+    host_state: &Arc<bmux_plugin::PluginStateRegistry>,
+    definitions: &BTreeMap<String, bmux_plugin_sdk::definition::PluginDefinition>,
+) -> Result<Vec<ProductionPlugin>> {
     let total_started = Instant::now();
-    let enabled_plugins = effective_enabled_plugins(config, registry);
+    let approvals = kernel_policy::load_native_approvals(paths)?;
+    let enabled_plugins = backend_enabled_plugins(config, registry)?;
     if enabled_plugins.is_empty() {
         emit_plugin_runtime_phase_timing(
             &PhasePayload::new("plugin.load_all")
@@ -989,6 +1316,7 @@ pub(super) fn load_enabled_plugins(
         .plugins
         .enabled
         .iter()
+        .chain(config.plugins.sources.keys())
         .filter(|plugin_id| !disabled.contains(plugin_id.as_str()))
         .cloned()
         .collect::<std::collections::BTreeSet<_>>();
@@ -1009,6 +1337,11 @@ pub(super) fn load_enabled_plugins(
         .activation_order_for(&enabled_plugins)
         .context("enabled plugin dependency graph is invalid")?;
     let mut loaded_plugins = Vec::with_capacity(ordered_plugins.len());
+    // One authority per startup, not per OS thread or logical plugin name.
+    let runtime_owner = crate::runtime_owner::selected();
+    let runtime = bmux_plugin_runtime::PluginRuntimeScopeId::new();
+    let artifact_loader = bmux_plugin::NativePluginLoader::new();
+    LOADED_PLUGIN_CACHE.with(|cache| cache.borrow_mut().clear());
     for plugin in ordered_plugins {
         let plugin_id = plugin.declaration.id.as_str();
         let load_started = Instant::now();
@@ -1019,7 +1352,23 @@ pub(super) fn load_enabled_plugins(
         } else {
             "dynamic"
         };
-        let loaded = match load_plugin(plugin, &host, &available_capabilities, config) {
+        tracing::info!(plugin_id, backend, "server.startup.plugin.load.begin");
+        let loaded = match ProductionPlugin::load_component(
+            plugin,
+            &host,
+            &available_capabilities,
+            config,
+            selected::ExecutionOwner {
+                runtime_owner: runtime_owner.clone(),
+                runtime,
+                host_state: Arc::clone(host_state),
+                loader: &artifact_loader,
+                definitions,
+                approval_store: approvals.as_ref(),
+                runtime_dir: &paths.runtime_dir,
+            },
+            bmux_plugin_sdk::definition::ComponentRole::Backend,
+        ) {
             Ok(loaded) => {
                 emit_plugin_runtime_phase_timing(
                     &PhasePayload::new("plugin.load")
@@ -1041,14 +1390,20 @@ pub(super) fn load_enabled_plugins(
                         .field("total_us", load_started.elapsed().as_micros())
                         .finish(),
                 );
-                if explicitly_enabled.contains(plugin_id) {
-                    return Err(error)
-                        .with_context(|| format!("failed loading enabled plugin '{plugin_id}'"));
-                }
-                warn!("skipping bundled plugin '{plugin_id}': {error}");
-                continue;
+                // Every member of this set was selected for backend deployment.
+                // An invalid present provider must not become an apparently
+                // healthy missing-plugin installation (notably authorization).
+                return Err(error)
+                    .with_context(|| format!("failed loading enabled plugin '{plugin_id}'"));
             }
         };
+        // Command routing in this host must observe exactly the startup
+        // implementation, not invoke its factory a second time.
+        LOADED_PLUGIN_CACHE.with(|cache| {
+            cache
+                .borrow_mut()
+                .insert(plugin_id.to_string(), Rc::new(loaded.clone()));
+        });
         loaded_plugins.push(loaded);
     }
 
@@ -1064,7 +1419,7 @@ pub(super) fn load_enabled_plugins(
 }
 
 pub(super) fn registered_plugin_infos_from_loaded(
-    loaded_plugins: &[bmux_plugin::LoadedPlugin],
+    loaded_plugins: &[ProductionPlugin],
 ) -> Vec<bmux_plugin_sdk::RegisteredPluginInfo> {
     loaded_plugins
         .iter()
@@ -1133,7 +1488,7 @@ pub(super) fn registered_plugin_infos_from_registry(
 /// Capture an in-process caller for the existing execution service, without a
 /// transport client that could itself affect companion idleness.
 pub(super) fn managed_companion_caller(
-    loaded_plugins: &[bmux_plugin::LoadedPlugin],
+    loaded_plugins: &[ProductionPlugin],
     config: &BmuxConfig,
     paths: &ConfigPaths,
     bridge: bmux_plugin_sdk::HostKernelBridge,
@@ -1205,6 +1560,7 @@ fn plugin_lifecycle_context(
     let host = plugin_host_for_declaration(declaration, paths, config, available_services.clone());
     NativeLifecycleContext {
         auxiliary_executables: BTreeMap::default(),
+        host_service_port: None,
         auxiliary_executable_errors: BTreeMap::default(),
         plugin_id: declaration.id.as_str().to_string(),
         required_capabilities: declaration
@@ -1255,6 +1611,7 @@ pub(super) fn plugin_command_context(
 ) -> NativeCommandContext {
     let host = plugin_host_for_declaration(declaration, paths, config, available_services.clone());
     NativeCommandContext {
+        host_service_port: None,
         plugin_id: declaration.id.as_str().to_string(),
         command: command.to_string(),
         arguments: arguments.to_vec(),
@@ -1344,7 +1701,7 @@ thread_local! {
 // readiness declaration remain auditable as one startup phase.
 #[allow(clippy::too_many_lines)]
 fn install_typed_service_registry(
-    loaded_plugins: &[bmux_plugin::LoadedPlugin],
+    loaded_plugins: &[ProductionPlugin],
     config: &BmuxConfig,
     paths: &ConfigPaths,
 ) -> Result<()> {
@@ -1354,7 +1711,6 @@ fn install_typed_service_registry(
     // per-activation bridge in `plugin_lifecycle_context`, so host
     // calls from trait methods reach the same kernel routing as
     // host calls from `invoke_service` / `run_command`.
-    let bridge = bmux_plugin_sdk::HostKernelBridge::from_fn(host_kernel_bridge);
 
     // Shared data that every plugin's typed-services context references
     // read-only. Collected once and borrowed per plugin so typed handles
@@ -1405,6 +1761,10 @@ fn install_typed_service_registry(
         bmux_plugin_sdk::TypedServiceHandle,
     > = std::collections::BTreeMap::new();
     for plugin in loaded_plugins {
+        // Dynamic components use portable service dispatch, not native TypeId.
+        if !plugin.registered.bundled_static {
+            continue;
+        }
         let collect_started = Instant::now();
         let required_caps: Vec<String> = plugin
             .declaration
@@ -1420,8 +1780,9 @@ fn install_typed_service_registry(
             .map(ToString::to_string)
             .collect();
         let context = bmux_plugin_sdk::TypedServiceRegistrationContext {
+            host_service_port: None,
             plugin_id: plugin.declaration.id.as_str(),
-            host_kernel_bridge: Some(&bridge),
+            host_kernel_bridge: None,
             required_capabilities: &required_caps,
             provided_capabilities: &provided_caps,
             services: &available_services,
@@ -1432,7 +1793,15 @@ fn install_typed_service_registry(
             connection: &host_connection,
             plugin_settings_map: &plugin_settings_map,
         };
-        let entries = plugin.collect_typed_services(context).into_entries();
+        let entries = plugin
+            .collect_typed_services(context)
+            .with_context(|| {
+                format!(
+                    "failed collecting active typed registrations for '{}'",
+                    plugin.declaration.id.as_str()
+                )
+            })?
+            .into_entries();
         let service_count = entries.len();
         for (key, handle) in entries {
             ensure_typed_service_declared(plugin, &key)?;
@@ -1471,7 +1840,7 @@ fn install_typed_service_registry(
 }
 
 fn ensure_typed_service_declared(
-    plugin: &bmux_plugin::LoadedPlugin,
+    plugin: &ProductionPlugin,
     key: &bmux_plugin_sdk::TypedServiceKey,
 ) -> Result<()> {
     let (capability, kind, interface_id) = key;
@@ -1496,7 +1865,7 @@ fn ensure_typed_service_declared(
 /// of its signals can proceed. Plugins that need more granular control
 /// (e.g. waiting on async work beyond activation) will be extended
 /// with an explicit `mark_ready` host-kernel bridge operation later.
-fn mark_plugin_ready_signals(plugin: &bmux_plugin::LoadedPlugin) {
+fn mark_plugin_ready_signals(plugin: &ProductionPlugin) {
     READY_TRACKER.with(|cell| {
         let tracker = cell.borrow();
         for signal in &plugin.declaration.ready_signals {
@@ -1608,7 +1977,7 @@ fn block_on_future<T>(
 // stay consistent across all plugins.
 #[allow(clippy::too_many_lines)]
 pub(super) async fn activate_loaded_plugins(
-    loaded_plugins: &[bmux_plugin::LoadedPlugin],
+    loaded_plugins: &[ProductionPlugin],
     config: &BmuxConfig,
     paths: &ConfigPaths,
 ) -> Result<()> {
@@ -1618,10 +1987,10 @@ pub(super) async fn activate_loaded_plugins(
     // harvested without side effects, and consumers that resolve a
     // typed service observe a stable registry across the lifetime of
     // the attach session.
-    install_typed_service_registry(loaded_plugins, config, paths)?;
+    // Collect typed adapters only after their owning activation is active.
     install_plugin_identity_hooks();
 
-    let mut activated: Vec<&bmux_plugin::LoadedPlugin> = Vec::new();
+    let mut activated: Vec<&ProductionPlugin> = Vec::new();
     let connection_info = HostConnectionInfo {
         config_dir: paths.config_dir.to_string_lossy().into_owned(),
         config_dir_candidates: paths
@@ -1684,11 +2053,16 @@ pub(super) async fn activate_loaded_plugins(
         // `map_or_else` trips `result_large_err` here because plugin activation
         // returns the repository-wide `PluginError`; the explicit match keeps the
         // large error type out of closure signatures.
-        #[allow(clippy::option_if_let_else)]
-        let activate_result = match bmux_plugin_sdk::HostAsyncHandle::try_current() {
-            Ok(async_handle) => plugin.activate_with_async(&context, async_handle),
-            Err(_) => plugin.activate(&context),
-        };
+        tracing::info!(
+            plugin_id = plugin.declaration.id.as_str(),
+            "server.startup.plugin.activate.begin"
+        );
+        let activate_result = plugin.activate_async(&context).await;
+        tracing::info!(
+            plugin_id = plugin.declaration.id.as_str(),
+            succeeded = activate_result.is_ok(),
+            "server.startup.plugin.activate.complete"
+        );
         drop(activation_connection_guard);
         if let Err(error) = activate_result {
             end_plugin_activation_scope(plugin.declaration.id.as_str());
@@ -1711,7 +2085,12 @@ pub(super) async fn activate_loaded_plugins(
                     .then(|| bind_plugin_lifecycle_call(&mut context))
                     .transpose()?;
                 let _connection = enter_host_kernel_connection(connection_info.clone());
-                plugin.deactivate(&context)?;
+                if let Err(cleanup) = plugin.deactivate_async(&context).await {
+                    return Err(anyhow::anyhow!(
+                        "activation failed for '{}': {error}; partial activation cleanup failed: {cleanup}",
+                        plugin.declaration.id.as_str(),
+                    ));
+                }
             }
             emit_plugin_runtime_phase_timing(
                 &PhasePayload::new("plugin.lifecycle.activate")
@@ -1742,7 +2121,7 @@ pub(super) async fn activate_loaded_plugins(
                     .transpose()?;
                 let _host_kernel_connection_guard =
                     enter_host_kernel_connection(connection_info.clone());
-                let deactivate_result = activated_plugin.deactivate(&context);
+                let deactivate_result = activated_plugin.deactivate_async(&context).await;
                 bmux_plugin::layout::global_plugin_layout_registry()
                     .remove_owner(activated_plugin.declaration.id.as_str());
                 bmux_plugin::surface::global_plugin_surface_registry()
@@ -1782,6 +2161,7 @@ pub(super) async fn activate_loaded_plugins(
         bmux_plugin::global_service_locations().mark_local(plugin.declaration.id.as_str());
     }
 
+    install_typed_service_registry(loaded_plugins, config, paths)?;
     emit_plugin_runtime_phase_timing(
         &PhasePayload::new("plugin.lifecycle.activate_all")
             .field("plugin_count", loaded_plugins.len())
@@ -1794,7 +2174,7 @@ pub(super) async fn activate_loaded_plugins(
 }
 
 pub(super) async fn deactivate_loaded_plugins(
-    loaded_plugins: &[bmux_plugin::LoadedPlugin],
+    loaded_plugins: &[ProductionPlugin],
     config: &BmuxConfig,
     paths: &ConfigPaths,
 ) -> Result<()> {
@@ -1880,7 +2260,7 @@ pub(super) async fn deactivate_loaded_plugins(
             .then(|| bind_plugin_lifecycle_call(&mut context))
             .transpose()?;
         let _host_kernel_connection_guard = enter_host_kernel_connection(connection_info.clone());
-        let deactivate_result = plugin.deactivate(&context);
+        let deactivate_result = plugin.deactivate_async(&context).await;
         drop(deactivation_scope);
         bmux_plugin::layout::global_plugin_layout_registry()
             .remove_owner(plugin.declaration.id.as_str());
@@ -1901,7 +2281,7 @@ pub(super) async fn deactivate_loaded_plugins(
 }
 
 pub(super) fn dispatch_loaded_plugin_event(
-    loaded_plugins: &[bmux_plugin::LoadedPlugin],
+    loaded_plugins: &[ProductionPlugin],
     event: &PluginEvent,
 ) -> Result<()> {
     for plugin in loaded_plugins {
@@ -1930,7 +2310,7 @@ pub(super) fn dispatch_loaded_plugin_event(
 }
 
 pub(super) async fn plugin_event_bridge_loop(
-    loaded_plugins: std::sync::Arc<Vec<bmux_plugin::LoadedPlugin>>,
+    loaded_plugins: std::sync::Arc<Vec<ProductionPlugin>>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
     if loaded_plugins.is_empty() {
@@ -2082,27 +2462,8 @@ pub(super) async fn run_plugin_command(
     command_name: &str,
     args: &[String],
 ) -> Result<u8> {
-    let execution = run_plugin_command_internal(
-        plugin_id,
-        command_name,
-        args,
-        None,
-        None,
-        Vec::new(),
-        bmux_plugin_sdk::NativeCommandInvocationSource::Cli,
-    )?;
-    // Standalone CLI context: the process has no interactive TUI so
-    // writing the plugin's error text to this process's stderr is the
-    // natural user-facing surface. (The SDK intentionally does not
-    // write to its own stderr anymore so attach-mode in-process
-    // plugins can't corrupt an interactive terminal; see
-    // `native_exports::take_last_command_error`.)
-    if execution.status != 0
-        && let Some(error) = execution.outcome.error_message.as_deref()
-    {
-        eprintln!("{error}");
-    }
-    Ok(execution.status.clamp(0, i32::from(u8::MAX)) as u8)
+    let state = runtime_command_state()?;
+    run_plugin_command_with_state(&state, plugin_id, command_name, args).await
 }
 
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // Status clamped to 0..255 before cast
@@ -2112,22 +2473,94 @@ pub(super) async fn run_plugin_command_with_state(
     command_name: &str,
     args: &[String],
 ) -> Result<u8> {
-    let execution = run_plugin_command_internal_with_state(
-        Some(state),
-        plugin_id,
-        command_name,
-        args,
-        None,
-        None,
-        Vec::new(),
-        bmux_plugin_sdk::NativeCommandInvocationSource::Cli,
-    )?;
+    // Resolve once without requiring a live daemon. A host-independent command
+    // may run without opening any connection; an actual host request must use
+    // this exact selected target or fail, never reconnect to a later default.
+    let target =
+        crate::connection::StopTarget::resolve(crate::connection::ConnectionContext::default())
+            .await
+            .map_err(|error| format!("selected command target unavailable: {error:#}"));
+    let execution =
+        run_command_on_selected_target(state, plugin_id, command_name, args, target).await?;
     if execution.status != 0
         && let Some(error) = execution.outcome.error_message.as_deref()
     {
         eprintln!("{error}");
     }
     Ok(execution.status.clamp(0, i32::from(u8::MAX)) as u8)
+}
+
+async fn run_command_on_selected_target(
+    state: &RuntimeCommandState,
+    plugin_id: &str,
+    command_name: &str,
+    args: &[String],
+    target: std::result::Result<crate::connection::StopTarget, String>,
+) -> Result<PluginCommandExecution> {
+    let (dispatch, _owner, mut requests) = super::plugin_kernel::CommandDispatch::channel();
+    let state = state.clone();
+    let plugin_id = plugin_id.to_owned();
+    let command_name = command_name.to_owned();
+    let args = args.to_vec();
+    let command = tokio::task::spawn_blocking(move || {
+        run_plugin_command_internal_with_state(
+            Some(&state),
+            &plugin_id,
+            &command_name,
+            &args,
+            None,
+            None,
+            Vec::new(),
+            bmux_plugin_sdk::NativeCommandInvocationSource::Cli,
+            Some(dispatch),
+        )
+    });
+    let pump = tokio::spawn(async move {
+        let mut client = None;
+        let mut connection_failure = None;
+        let mut command = command;
+        let execution = loop {
+            tokio::select! {
+                result = &mut command => break result.context("selected command worker failed")?,
+                Some(request) = requests.recv() => {
+                    if request.is_cancelled() {
+                        request.reject();
+                    } else {
+                        if client.is_none() && connection_failure.is_none() {
+                            let connected = match &target {
+                                Ok(target) => target.connect("plugin-command").await
+                                    .map_err(|error| format!("selected command connection failed: {error:#}")),
+                                Err(error) => Err(error.clone()),
+                            };
+                            match connected {
+                                Ok(connected) => client = Some(connected),
+                                Err(error) => connection_failure = Some(error),
+                            }
+                        }
+                        if let Some(connection) = client.as_mut() {
+                            let result = connection.request_raw(request.request.clone()).await;
+                            if let Err(error) = &result {
+                                connection_failure = Some(format!("selected command transport failed; no reconnect: {error}"));
+                            }
+                            request.respond(result.map_err(anyhow::Error::from));
+                            if connection_failure.is_some() { client = None; }
+                        } else {
+                            request.reject_unavailable(connection_failure.as_deref()
+                                .unwrap_or("selected command connection unavailable"));
+                        }
+                    }
+                }
+            }
+        };
+        requests.close();
+        while let Some(request) = requests.recv().await {
+            request.reject();
+        }
+        execution
+    });
+    // Dropping this observer cancels new work through _owner, but never aborts
+    // the connection-owning pump or an already-dispatched effect.
+    pump.await.context("selected command pump failed")?
 }
 
 pub(super) fn run_plugin_keybinding_command(
@@ -2166,6 +2599,45 @@ pub(super) fn run_plugin_keybinding_command_with_active_bindings(
     )
 }
 
+pub(super) fn run_plugin_keybinding_command_with_dispatch(
+    plugin_id: &str,
+    command_name: &str,
+    args: &[String],
+    caller_client_id: Option<uuid::Uuid>,
+    active_keybindings: Vec<bmux_plugin_sdk::ActiveKeybinding>,
+    dispatch: super::plugin_kernel::CommandDispatch,
+) -> Result<PluginCommandExecution> {
+    run_plugin_command_internal_with_state(
+        None,
+        plugin_id,
+        command_name,
+        args,
+        None,
+        caller_client_id,
+        active_keybindings,
+        bmux_plugin_sdk::NativeCommandInvocationSource::AttachKeybinding,
+        Some(dispatch),
+    )
+}
+
+pub(super) fn run_plugin_command_with_selected_dispatch(
+    state: &RuntimeCommandState,
+    request: &bmux_plugin_sdk::PluginCliCommandRequest,
+    dispatch: super::plugin_kernel::CommandDispatch,
+) -> Result<PluginCommandExecution> {
+    run_plugin_command_internal_with_state(
+        Some(state),
+        &request.plugin_id,
+        &request.command_name,
+        &request.arguments,
+        None,
+        None,
+        Vec::new(),
+        bmux_plugin_sdk::NativeCommandInvocationSource::Cli,
+        Some(dispatch),
+    )
+}
+
 pub(super) fn run_plugin_keybinding_command_with_state(
     state: &RuntimeCommandState,
     plugin_id: &str,
@@ -2183,6 +2655,7 @@ pub(super) fn run_plugin_keybinding_command_with_state(
         caller_client_id,
         Vec::new(),
         bmux_plugin_sdk::NativeCommandInvocationSource::AttachKeybinding,
+        None,
     )
 }
 
@@ -2268,7 +2741,52 @@ pub(super) fn run_plugin_command_internal(
         caller_client_id,
         active_keybindings,
         invocation_source,
+        None,
     )
+}
+
+fn bind_captured_command_route(
+    context: &NativeCommandContext,
+) -> Result<Option<bmux_plugin::AsyncCommandRouteGuard>> {
+    bmux_plugin::capture_async_command_route(bmux_plugin::ASYNC_SERVICE_ROUTE_V1)
+        .ok()
+        .map(|route| {
+            let services = context
+                .services
+                .iter()
+                .filter(|service| {
+                    context
+                        .required_capabilities
+                        .iter()
+                        .chain(context.provided_capabilities.iter())
+                        .any(|capability| capability == service.capability.as_str())
+                })
+                .cloned()
+                .collect();
+            route
+                .with_services(services)
+                .map(bmux_plugin::enter_async_command_route)
+        })
+        .transpose()
+        .map_err(anyhow::Error::msg)
+}
+
+fn settle_command_cleanup<T>(work: impl std::future::Future<Output = T>) -> T {
+    struct Wake(std::thread::Thread);
+    impl std::task::Wake for Wake {
+        fn wake(self: Arc<Self>) {
+            self.0.unpark();
+        }
+    }
+    let waker = std::task::Waker::from(Arc::new(Wake(std::thread::current())));
+    let mut context = std::task::Context::from_waker(&waker);
+    let mut work = std::pin::pin!(work);
+    loop {
+        match std::future::Future::poll(work.as_mut(), &mut context) {
+            std::task::Poll::Ready(result) => return result,
+            std::task::Poll::Pending => std::thread::park(),
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)] // Command execution context is assembled from separate runtime subsystems.
@@ -2281,6 +2799,7 @@ fn run_plugin_command_internal_with_state(
     caller_client_id: Option<uuid::Uuid>,
     active_keybindings: Vec<bmux_plugin_sdk::ActiveKeybinding>,
     invocation_source: bmux_plugin_sdk::NativeCommandInvocationSource,
+    command_dispatch: Option<super::plugin_kernel::CommandDispatch>,
 ) -> Result<PluginCommandExecution> {
     let total_started = Instant::now();
     let runtime_state_started = Instant::now();
@@ -2291,6 +2810,11 @@ fn run_plugin_command_internal_with_state(
         cached_state = runtime_command_state()?;
         &cached_state
     };
+    // Select the caller's already-resolved snapshot before any factory load,
+    // lifecycle admission or host CLI binding. This synchronous guard also
+    // preserves the parent snapshot across nested selected command execution.
+    let command_dispatch = command_dispatch.map(|dispatch| dispatch.with_state(state.clone()));
+    let _selected_command_state = SelectedCommandStateGuard::enter(state);
     let runtime_state_us = runtime_state_started.elapsed().as_micros();
     let lookup_started = Instant::now();
     let config = &state.config;
@@ -2308,7 +2832,20 @@ fn run_plugin_command_internal_with_state(
     let lookup_us = lookup_started.elapsed().as_micros();
 
     let load_started = Instant::now();
-    let loaded = load_cached_plugin(plugin, state)?;
+    // A command-local activation must never cache a prior command's transport
+    // capability. Server-owned legacy callers retain their startup cache path.
+    let loaded = if command_dispatch.is_some() {
+        let definitions = standalone_provider_definitions(state);
+        Rc::new(load_plugin_with_definitions(
+            plugin,
+            &plugin_host_metadata(),
+            &state.available_capability_providers,
+            config,
+            &definitions,
+        )?)
+    } else {
+        load_cached_plugin(plugin, state)?
+    };
     let load_us = load_started.elapsed().as_micros();
     let context_started = Instant::now();
     let mut context = plugin_command_context(
@@ -2337,31 +2874,29 @@ fn run_plugin_command_internal_with_state(
     let _host_kernel_connection_guard = enter_host_kernel_connection(context.connection.clone());
     let _host_kernel_factory_guard =
         kernel_client_factory.map(|f| enter_host_kernel_client_factory(Arc::clone(f)));
-    let _async_route =
-        bmux_plugin::capture_async_command_route(bmux_plugin::ASYNC_SERVICE_ROUTE_V1)
-            .ok()
-            .map(|route| {
-                let services = context
-                    .services
-                    .iter()
-                    .filter(|service| {
-                        context
-                            .required_capabilities
-                            .iter()
-                            .chain(context.provided_capabilities.iter())
-                            .any(|capability| capability == service.capability.as_str())
-                    })
-                    .cloned()
-                    .collect();
-                route
-                    .with_services(services)
-                    .map(bmux_plugin::enter_async_command_route)
-            })
-            .transpose()
-            .map_err(anyhow::Error::msg)?;
+    let _async_route = bind_captured_command_route(&context)?;
     let run_started = Instant::now();
+    let command_local = command_dispatch.is_some();
     let run_result =
-        loaded.run_command_with_context_and_outcome(command_name, args, Some(&context));
+        loaded.run_command_with_dispatch(command_name, args, Some(&context), command_dispatch);
+    if command_local && run_result.is_ok() {
+        let lifecycle = plugin_lifecycle_context(
+            config,
+            paths,
+            &plugin.declaration,
+            PluginLifecycleAvailability {
+                services: state.available_services.clone(),
+                capabilities: state.available_capability_names.clone(),
+                enabled_plugins: state.enabled_plugins.clone(),
+                search_roots: state.plugin_search_roots.clone(),
+                registered_plugins: state.registered_plugin_infos.clone(),
+            },
+        );
+        // On this blocking command worker the connection owner remains pumping.
+        // Never destroy an uncertain/error operation or substitute timeout for
+        // settlement. Successful terminal work retires its fresh instance.
+        settle_command_cleanup(loaded.deactivate_async(&lifecycle))?;
+    }
     let run_us = run_started.elapsed().as_micros();
     let (status, outcome) = run_result.map_err(|error| {
         // Record the error on the current span so structured tracing
@@ -2418,21 +2953,48 @@ fn emit_plugin_phase_timing(
     emit_phase_timing(PhaseChannel::Plugin, &payload);
 }
 
+fn standalone_provider_definitions(
+    state: &RuntimeCommandState,
+) -> BTreeMap<String, bmux_plugin_sdk::definition::PluginDefinition> {
+    // Capture the selected invocation's configuration now. Lifecycle polling may
+    // run on another thread; factories must not consult command-state TLS.
+    #[cfg(feature = "bundled-plugin-recording")]
+    {
+        BTreeMap::from([(
+            "bmux.recording".to_string(),
+            HOST_STATE.with(|host| {
+                recording_binding::definition(
+                    recording_binding::configuration(&state.config, &state.paths),
+                    Arc::clone(host),
+                    Arc::new(bmux_plugin::EventBus::new()),
+                )
+            }),
+        )])
+    }
+    #[cfg(not(feature = "bundled-plugin-recording"))]
+    {
+        let _ = state;
+        BTreeMap::new()
+    }
+}
+
 fn load_cached_plugin(
     plugin: &bmux_plugin::RegisteredPlugin,
     state: &RuntimeCommandState,
-) -> Result<Rc<bmux_plugin::LoadedPlugin>> {
+) -> Result<Rc<ProductionPlugin>> {
     let plugin_id = plugin.declaration.id.as_str().to_string();
     LOADED_PLUGIN_CACHE.with(|slot| {
         if let Some(existing) = slot.borrow().get(&plugin_id) {
             return Ok(Rc::clone(existing));
         }
 
-        let loaded = load_plugin(
+        let definitions = standalone_provider_definitions(state);
+        let loaded = load_plugin_with_definitions(
             plugin,
             &plugin_host_metadata(),
             &state.available_capability_providers,
             &state.config,
+            &definitions,
         )
         .with_context(|| format!("failed loading enabled plugin '{plugin_id}'"))?;
         let loaded = Rc::new(loaded);
@@ -2577,6 +3139,76 @@ fn emit_external_plugin_phase_timing(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn selected_command_snapshot_is_available_before_binding_and_restored_after_nesting() {
+        std::thread::spawn(|| {
+            let state = RuntimeCommandState {
+                runtime_owner: None,
+                config: BmuxConfig::default(),
+                paths: ConfigPaths::new(
+                    "/selected/config".into(),
+                    "/selected/runtime".into(),
+                    "/selected/data".into(),
+                    "/selected/state".into(),
+                ),
+                registry: Arc::new(PluginRegistry::new()),
+                enabled_plugins: Vec::new(),
+                available_capability_providers: BTreeMap::new(),
+                available_capability_names: Vec::new(),
+                available_services: Vec::new(),
+                plugin_search_roots: Vec::new(),
+                registered_plugin_infos: Vec::new(),
+            };
+            assert!(selected_command_state().is_err());
+            {
+                let _outer = SelectedCommandStateGuard::enter(&state);
+                assert_eq!(
+                    selected_command_state().unwrap().paths.runtime_dir,
+                    state.paths.runtime_dir
+                );
+                let mut nested = state.clone();
+                nested.paths.runtime_dir = "/nested/runtime".into();
+                {
+                    let _inner = SelectedCommandStateGuard::enter(&nested);
+                    assert_eq!(
+                        selected_command_state().unwrap().paths.runtime_dir,
+                        nested.paths.runtime_dir
+                    );
+                    let _executor = super::super::plugin_kernel::scoped_cli_executor().unwrap();
+                }
+                assert_eq!(
+                    selected_command_state().unwrap().paths.runtime_dir,
+                    state.paths.runtime_dir
+                );
+            }
+            assert!(selected_command_state().is_err());
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[cfg(feature = "bundled-plugin-recording")]
+    #[test]
+    fn legacy_bundled_definition_preserves_declared_component_roles() {
+        fn definition() -> anyhow::Result<bmux_plugin_sdk::definition::PluginDefinition> {
+            Ok(declare_bundled_plugins!(@definition
+                bmux_recording_plugin::RecordingPlugin,
+                include_str!("../../../../plugins/recording-plugin/plugin.toml")
+            ))
+        }
+        let definition = definition().expect("bundled roles must match the author manifest");
+        definition
+            .validate()
+            .expect("bundled embedded metadata must validate");
+        assert_eq!(
+            definition.metadata.roles,
+            vec![
+                bmux_plugin_sdk::definition::ComponentRole::Backend,
+                bmux_plugin_sdk::definition::ComponentRole::Frontend,
+            ]
+        );
+    }
+
+    #[test]
     fn native_bootstrap_pins_explicit_paths_in_worker_local_actions() {
         let root = temp_dir();
         let paths = bmux_config::ConfigPaths::new(
@@ -2706,6 +3338,148 @@ mod tests {
             "id = \"{id}\"\nname = \"{id}\"\nversion = \"0.1.0\"\nentry = \"{entry}\"\n{commands}\n"
         );
         PluginManifest::from_toml_str(&manifest).expect("manifest should parse")
+    }
+
+    #[test]
+    fn source_configuration_round_trips_and_rejects_unknown_policy() {
+        let config: BmuxConfig = toml::from_str(
+            "[plugins.sources.'example.plugin']\nsource='dynamic'\nmanifest='plugins/example/plugin.toml'\n",
+        ).unwrap();
+        assert_eq!(
+            config.plugins.sources.get("example.plugin"),
+            Some(&PluginSourceConfig::Dynamic {
+                manifest: PathBuf::from("plugins/example/plugin.toml"),
+            })
+        );
+        let encoded = toml::to_string(&config).unwrap();
+        let decoded: BmuxConfig = toml::from_str(&encoded).unwrap();
+        assert_eq!(decoded.plugins.sources, config.plugins.sources);
+        assert!(
+            toml::from_str::<BmuxConfig>(
+                "[plugins.sources.'example.plugin']\nsource='automatic_fallback'\n"
+            )
+            .is_err()
+        );
+        assert!(
+            toml::from_str::<BmuxConfig>(
+                "[plugins.sources.'example.plugin']\nsource='bundled'\nmanifest='ignored.toml'\n"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn dynamic_selection_suppresses_compiled_bundled_registration() {
+        let mut bundled = PluginRegistry::new();
+        register_static_bundled_plugins(&mut bundled);
+        let sources = bundled
+            .iter()
+            .map(|plugin| {
+                (
+                    plugin.declaration.id.as_str().to_string(),
+                    PluginSourceConfig::Dynamic {
+                        manifest: PathBuf::from("selected.toml"),
+                    },
+                )
+            })
+            .collect();
+        let mut selected = PluginRegistry::new();
+        register_selected_bundled_plugins(&mut selected, &sources).unwrap();
+        assert_eq!(selected.iter().count(), 0);
+    }
+
+    #[test]
+    fn explicit_dynamic_source_requires_matching_logical_identity() {
+        let dir = temp_dir();
+        let manifest = dir.join("plugin.toml");
+        fs::write(
+            &manifest,
+            "id='actual.plugin'\nname='Actual'\nversion='0.1.0'\nentry='native.dylib'\n",
+        )
+        .unwrap();
+        let mut config = BmuxConfig::default();
+        config.plugins.sources.insert(
+            "expected.plugin".into(),
+            PluginSourceConfig::Dynamic { manifest },
+        );
+        let mut registry = PluginRegistry::new();
+        let error = register_selected_dynamic_plugins(&mut registry, &config).unwrap_err();
+        assert!(format!("{error:#}").contains("expected 'expected.plugin'"));
+        assert_eq!(registry.iter().count(), 0);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn explicit_dynamic_source_never_falls_back_when_entry_is_missing() {
+        let dir = temp_dir();
+        let manifest = dir.join("plugin.toml");
+        fs::write(
+            &manifest,
+            "id='example.plugin'\nname='Example'\nversion='0.1.0'\nentry='missing.dylib'\n",
+        )
+        .unwrap();
+        let mut config = BmuxConfig::default();
+        config.plugins.sources.insert(
+            "example.plugin".into(),
+            PluginSourceConfig::Dynamic { manifest },
+        );
+        let error =
+            register_selected_dynamic_plugins(&mut PluginRegistry::new(), &config).unwrap_err();
+        assert!(error.to_string().contains("entry is not a file"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn explicit_dynamic_source_preserves_defaults_and_disable_precedence() {
+        let dir = temp_dir();
+        let manifest = dir.join("plugin.toml");
+        fs::write(&manifest, "id='example.plugin'\nname='Example'\nversion='0.1.0'\nentry='native.dylib'\nenabled_by_default=true\n").unwrap();
+        // Registration only: this is not a loadable native artifact fixture.
+        fs::write(dir.join("native.dylib"), []).unwrap();
+        let mut config = BmuxConfig::default();
+        config.plugins.sources.insert(
+            "example.plugin".into(),
+            PluginSourceConfig::Dynamic { manifest },
+        );
+        let mut registry = PluginRegistry::new();
+        register_selected_dynamic_plugins(&mut registry, &config).unwrap();
+        let selected = registry.get("example.plugin").unwrap();
+        assert!(!selected.bundled_static);
+        assert_eq!(selected.search_root, fs::canonicalize(&dir).unwrap());
+        assert_eq!(
+            effective_enabled_plugins(&config, &registry),
+            vec!["example.plugin"]
+        );
+        config.plugins.disabled.push("example.plugin".into());
+        assert_eq!(
+            effective_enabled_plugins(&config, &registry),
+            Vec::<String>::new()
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn explicit_bundled_source_rejects_unavailable_implementation() {
+        let mut config = BmuxConfig::default();
+        config
+            .plugins
+            .sources
+            .insert("not.compiled".into(), PluginSourceConfig::Bundled);
+        let error =
+            register_selected_dynamic_plugins(&mut PluginRegistry::new(), &config).unwrap_err();
+        assert!(format!("{error:#}").contains("no candidates for 'not.compiled'"));
+    }
+
+    #[test]
+    fn empty_source_selection_keeps_no_plugin_registry_empty() {
+        let mut registry = PluginRegistry::new();
+        let config = BmuxConfig::default();
+        register_selected_dynamic_plugins(&mut registry, &config).unwrap();
+        assert_eq!(registry.iter().count(), 0);
+        assert_eq!(
+            effective_enabled_plugins(&config, &registry),
+            Vec::<String>::new()
+        );
     }
 
     #[test]
@@ -2904,37 +3678,215 @@ enabled_by_default = false
     }
 
     #[test]
-    fn static_bundled_load_uses_registered_vtable() {
-        let config = BmuxConfig::default();
-        let paths = ConfigPaths::new(
-            std::path::PathBuf::from("/config"),
-            std::path::PathBuf::from("/runtime"),
-            std::path::PathBuf::from("/data"),
-            std::path::PathBuf::from("/state"),
+    fn backend_deployment_retains_frontend_inventory_but_does_not_activate_it() {
+        let mut registry = PluginRegistry::new();
+        registry.register_bundled_manifest(
+            "id='example.frontend'\nname='Frontend'\nversion='1.0.0'\ncomponent_roles=['frontend']\n",
+        ).unwrap();
+        let mut config = BmuxConfig::default();
+        assert_eq!(
+            backend_enabled_plugins(&config, &registry).unwrap(),
+            Vec::<String>::new()
         );
-        let registry = scan_available_plugins(&config, &paths).expect("plugin scan should succeed");
-        let plugin = registry
-            .get("bmux.theme")
-            .expect("theme plugin should be registered");
-        assert!(plugin.bundled_static);
+        assert!(registry.get("example.frontend").is_some());
+        config.plugins.enabled.push("example.frontend".into());
         assert!(
-            bmux_plugin::static_vtable("bmux.theme").is_some(),
-            "scan should register the process-wide static vtable used by load_plugin"
+            backend_enabled_plugins(&config, &registry)
+                .unwrap_err()
+                .to_string()
+                .contains("does not export Backend")
         );
+    }
 
-        let enabled = effective_enabled_plugins(&config, &registry);
-        let providers = registry
-            .capability_providers_for(&enabled, &core_provided_capabilities())
-            .expect("providers should resolve");
-        let loaded = load_plugin(
-            plugin,
-            &plugin_host_metadata(),
-            &providers,
-            &BmuxConfig::default(),
+    #[test]
+    fn deployed_frontend_role_is_selected_without_backend_retry() {
+        use bmux_plugin_sdk::definition::ComponentRole;
+        let manifest = PluginManifest::from_toml_str(
+            "id='example.frontend'\nname='Frontend'\nversion='1.0.0'\ncomponent_roles=['frontend']\n",
+        ).unwrap();
+        assert_eq!(
+            deployed_component_role(&manifest).unwrap(),
+            ComponentRole::Frontend
+        );
+        let mut inventory = bmux_plugin::PluginCandidateInventory::new();
+        inventory.add_bundled_manifest(
+            "id='example.frontend'\nname='Frontend'\nversion='1.0.0'\ncomponent_roles=['frontend']\n", Vec::new(),
+        ).unwrap();
+        assert_eq!(
+            inventory_component_role(
+                &inventory,
+                "example.frontend",
+                &bmux_plugin::PluginCandidatePreference::Bundled
+            )
+            .unwrap(),
+            ComponentRole::Frontend
+        );
+    }
+
+    fn dispatch_probe_definition(
+        plugin_id: &str,
+        manifest: &str,
+    ) -> (
+        bmux_plugin_sdk::definition::PluginDefinition,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        use bmux_plugin_sdk::definition::{
+            CommandOutcome, ComponentRole, PluginCallContext, PluginDefinition, PluginFuture,
+            PluginInstance, PluginMetadata,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct DispatchProbe(Arc<AtomicUsize>);
+        impl PluginInstance for DispatchProbe {
+            fn command(
+                &self,
+                call: PluginCallContext,
+                context: NativeCommandContext,
+            ) -> PluginFuture<'_, CommandOutcome> {
+                // Both surfaces must carry the selected command's owned port,
+                // not an unbound loader port or ambient host-service fallback.
+                for port in [call.host_services, context.host_service_port] {
+                    let error = port
+                        .expect("selected command must have owned host services")
+                        .invoke(bmux_plugin_sdk::HostServiceRequest {
+                            capability: "example.undeclared",
+                            kind: bmux_plugin_sdk::ServiceKind::Query,
+                            interface: "example.undeclared/v1",
+                            operation: "probe",
+                            payload: &[],
+                        })
+                        .unwrap_err();
+                    assert!(error.to_string().contains("not declared by caller"));
+                }
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async {
+                    CommandOutcome {
+                        exit_code: 23,
+                        error: None,
+                    }
+                })
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let factory_calls = Arc::clone(&calls);
+        let definition = PluginDefinition::new(
+            PluginMetadata {
+                plugin_id: plugin_id.to_owned(),
+                version: "1.0.0".into(),
+                roles: vec![ComponentRole::Backend],
+                required_capabilities: Vec::new(),
+                contracts: Vec::new(),
+                manifest_toml: Some(manifest.to_owned()),
+            },
+            move |_scope| {
+                Ok(Arc::new(DispatchProbe(Arc::clone(&factory_calls))) as Arc<dyn PluginInstance>)
+            },
+        );
+        (definition, calls)
+    }
+
+    #[test]
+    fn static_bundled_load_uses_selected_definition_and_dispatches_command() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let driver = crate::runtime_owner::RuntimeDriver::new(runtime).unwrap();
+        let owner = driver.owner();
+        owner.handle().block_on(owner.run(async {
+        use std::sync::atomic::Ordering;
+        let plugin_id = format!("example.selected-{}", Uuid::new_v4());
+        let manifest = format!(
+            "id='{plugin_id}'\nname='Dispatch probe'\nversion='1.0.0'\ncomponent_roles=['backend']\n"
+        );
+        let (definition, calls) = dispatch_probe_definition(&plugin_id, &manifest);
+        let embedded = register_bundled_definition(&plugin_id, &manifest, definition)
+            .expect("selected definition should register");
+        assert!(
+            bmux_plugin::NativePluginLoader::registered_definition(&plugin_id)
+                .expect("definition lookup should succeed")
+                .is_some()
+        );
+        let mut registry = PluginRegistry::new();
+        registry
+            .register_bundled_manifest(&embedded)
+            .expect("manifest should register");
+        let plugin = registry
+            .get(&plugin_id)
+            .expect("probe should be registered");
+        assert!(plugin.bundled_static);
+        let config = BmuxConfig::default();
+        let root = temp_dir();
+        let paths = ConfigPaths::new(
+            root.join("config"),
+            root.join("runtime"),
+            root.join("data"),
+            root.join("state"),
+        );
+        let command_state = build_runtime_command_state(
+            config.clone(),
+            paths.clone(),
+            Arc::new(registry.clone()),
         )
-        .expect("registered static vtable should load bundled plugin");
-
-        assert_eq!(loaded.declaration.id.as_str(), "bmux.theme");
+        .expect("isolated selected command runtime should resolve");
+        let _selected_runtime = SelectedCommandStateGuard::enter(&command_state);
+        let loaded = load_plugin(plugin, &plugin_host_metadata(), &BTreeMap::new(), &config)
+            .expect("selected bundled definition should load");
+        assert_eq!(loaded.declaration.id.as_str(), plugin_id);
+        let context = plugin_command_context(
+            &config,
+            &paths,
+            &plugin.declaration,
+            "probe",
+            &[],
+            Vec::new(),
+            Vec::new(),
+            vec![plugin_id.clone()],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            None,
+            bmux_plugin_sdk::NativeCommandInvocationSource::Cli,
+        );
+        let (status, outcome) = loaded
+            .run_command_with_context_and_outcome("probe", &[], Some(&context))
+            .expect("shared execution should activate, acknowledge and dispatch");
+        assert_eq!(status, 23);
+        assert_eq!(outcome.error_message, None);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "selected implementation must execute exactly once"
+        );
+        let lifecycle = plugin_lifecycle_context(
+            &config,
+            &paths,
+            &plugin.declaration,
+            PluginLifecycleAvailability {
+                services: Vec::new(),
+                capabilities: Vec::new(),
+                enabled_plugins: vec![plugin.manifest.id.clone()],
+                search_roots: Vec::new(),
+                registered_plugins: Vec::new(),
+            },
+        );
+        loaded
+            .deactivate_async(&lifecycle)
+            .await
+            .expect("shared execution should deactivate and destroy");
+        let command = run_command_on_selected_target(
+            &command_state, &plugin_id, "probe", &[],
+            Err("test has no selected reachable daemon".into()),
+        ).await.expect("host-independent selected command must not connect");
+        assert_eq!(command.status, 23);
+        assert_eq!(calls.load(Ordering::SeqCst), 2,
+            "actual standalone worker must execute the selected author exactly once");
+        fs::remove_dir_all(root).expect("remove owned test directory");
+        }));
+        drop(owner);
+        driver.shutdown().unwrap();
     }
 
     #[test]

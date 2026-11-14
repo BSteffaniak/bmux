@@ -368,28 +368,66 @@ impl bmux_plugin_sdk::WireEventSink for Capture {
 }
 
 #[test]
+fn explicit_runtime_sink_does_not_cross_frontends() {
+    let preferences = Preferences::default();
+    let writes = Arc::new(Mutex::new(0));
+    let _router = install_test_service_router(router(&preferences, &writes));
+    let first_sink = Arc::new(Capture::default());
+    let second_sink = Arc::new(Capture::default());
+    let first =
+        ThemePlugin::with_runtime(Arc::new(bmux_plugin::EventBus::new()), first_sink.clone());
+    let second =
+        ThemePlugin::with_runtime(Arc::new(bmux_plugin::EventBus::new()), second_sink.clone());
+    let a = context(81);
+    let b = context(82);
+    let _: control_contract::theme_state::Appearance =
+        invoke(&first, &a, "theme-state", "active-appearance", &());
+    assert!(
+        first_sink
+            .values
+            .lock()
+            .unwrap()
+            .contains_key(&a.caller_client_id.unwrap())
+    );
+    assert!(second_sink.values.lock().unwrap().is_empty());
+    let _: control_contract::theme_state::Appearance =
+        invoke(&second, &b, "theme-state", "active-appearance", &());
+    assert!(
+        !second_sink
+            .values
+            .lock()
+            .unwrap()
+            .contains_key(&a.caller_client_id.unwrap())
+    );
+    drop(first);
+    assert!(first_sink.values.lock().unwrap().is_empty());
+    assert!(
+        second_sink
+            .values
+            .lock()
+            .unwrap()
+            .contains_key(&b.caller_client_id.unwrap())
+    );
+}
+
+#[test]
 fn publication_is_private_cached_and_close_cannot_reretain() {
     let preferences = Preferences::default();
     let writes = Arc::new(Mutex::new(0));
     let _router = install_test_service_router(router(&preferences, &writes));
     let capture = Arc::new(Capture::default());
-    let handle = Arc::new(std::sync::RwLock::new(
-        bmux_plugin_sdk::WireEventSinkHandle::from_arc(capture.clone()),
-    ));
-    let registry = bmux_plugin::global_plugin_state_registry();
-    let previous = registry.register(&handle);
+    let events = Arc::new(bmux_plugin::EventBus::new());
     let sentinel = crate::RuntimeAppearance {
         foreground: "#123456".into(),
         ..crate::RuntimeAppearance::default()
     };
-    let appearance_sender = bmux_plugin::global_event_bus()
-        .register_state_channel::<crate::RuntimeAppearance>(
-            crate::RUNTIME_APPEARANCE_STATE_KIND,
-            sentinel.clone(),
-        );
+    let appearance_sender = events.register_state_channel::<crate::RuntimeAppearance>(
+        crate::RUNTIME_APPEARANCE_STATE_KIND,
+        sentinel.clone(),
+    );
     appearance_sender.send_replace(Arc::new(sentinel.clone()));
     drop(appearance_sender);
-    let plugin = ThemePlugin::default();
+    let plugin = ThemePlugin::with_runtime(events.clone(), capture.clone());
     let a = context(5);
     current(&plugin, &a);
     let first = capture.publishes.load(std::sync::atomic::Ordering::Relaxed);
@@ -408,7 +446,7 @@ fn publication_is_private_cached_and_close_cannot_reretain() {
         capture.publishes.load(std::sync::atomic::Ordering::Relaxed),
         first + 1
     );
-    let global = bmux_plugin::global_event_bus()
+    let global = events
         .subscribe_state::<crate::RuntimeAppearance>(&crate::RUNTIME_APPEARANCE_STATE_KIND)
         .expect("global")
         .0;
@@ -433,13 +471,6 @@ fn publication_is_private_cached_and_close_cannot_reretain() {
             .contains_key(&a.caller_client_id.expect("caller"))
     );
     drop(plugin);
-    if let Some(previous) = previous {
-        registry.register(&previous);
-    } else {
-        registry.register(&Arc::new(std::sync::RwLock::new(
-            bmux_plugin_sdk::WireEventSinkHandle::noop(),
-        )));
-    }
 }
 
 #[test]

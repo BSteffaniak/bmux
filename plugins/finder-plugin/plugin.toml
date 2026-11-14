@@ -1,3 +1,5 @@
+component_roles = ["frontend"]
+contracts = []
 execution_class = "native_fast"
 id = "bmux.finder"
 name = "bmux Finder"

@@ -14,8 +14,10 @@ use std::sync::{Arc, Mutex};
 pub struct ThemePlugin {
     views: Arc<Mutex<BTreeMap<String, Arc<View>>>>,
     default: Mutex<Option<control_contract::theme_control_v1::Snapshot>>,
-    detach_task: Option<DetachTask>,
+    detach_task: Mutex<Option<DetachTask>>,
     preview_sequence: Arc<std::sync::atomic::AtomicU64>,
+    events: Option<Arc<bmux_plugin::EventBus>>,
+    sink: Option<Arc<dyn bmux_plugin_sdk::WireEventSink>>,
 }
 
 struct View {
@@ -23,6 +25,7 @@ struct View {
     operation: Mutex<()>,
     state: ThemeView,
     context: NativeServiceContext,
+    sink: Option<Arc<dyn bmux_plugin_sdk::WireEventSink>>,
     closed: std::sync::atomic::AtomicBool,
     published: Mutex<Option<super::RuntimeAppearance>>,
     explicit: std::sync::atomic::AtomicBool,
@@ -30,6 +33,44 @@ struct View {
 }
 
 impl ThemePlugin {
+    /// Supply this runtime's event bus and recipient sink.
+    ///
+    /// Explicit resources never fall back to another process-local host.
+    #[must_use]
+    pub fn with_runtime(
+        events: Arc<bmux_plugin::EventBus>,
+        sink: Arc<dyn bmux_plugin_sdk::WireEventSink>,
+    ) -> Self {
+        Self {
+            views: Arc::default(),
+            default: Mutex::default(),
+            detach_task: Mutex::default(),
+            preview_sequence: Arc::default(),
+            events: Some(events),
+            sink: Some(sink),
+        }
+    }
+
+    fn selected_sink(&self) -> Option<Arc<dyn bmux_plugin_sdk::WireEventSink>> {
+        self.sink.clone().or_else(|| {
+            bmux_plugin::global_plugin_state_registry()
+                .get::<bmux_plugin_sdk::WireEventSinkHandle>()
+                .and_then(|sink| sink.read().ok().map(|sink| sink.0.clone()))
+        })
+    }
+
+    pub(super) fn command_impl(context: &NativeCommandContext) -> Result<i32, PluginCommandError> {
+        if context.caller_client_id.is_none() {
+            return Err(PluginCommandError::unavailable(
+                "theme command requires an attachment; use explicit default control for persistence",
+            ));
+        }
+        bmux_plugin_sdk::route_command!(context, {
+            "pick-theme" => super::pick_theme(context),
+            "refresh-theme" => super::refresh_theme(context),
+        })
+    }
+
     fn view(&self, context: &NativeServiceContext) -> Result<Arc<View>, ServiceResponse> {
         let owner = context
             .caller_client_id
@@ -55,6 +96,7 @@ impl ThemePlugin {
                     ..ThemeView::default()
                 },
                 context: context.clone(),
+                sink: self.selected_sink(),
                 closed: std::sync::atomic::AtomicBool::new(false),
                 published: Mutex::new(None),
                 explicit: std::sync::atomic::AtomicBool::new(false),
@@ -129,20 +171,28 @@ impl ThemePlugin {
         Ok(snapshot)
     }
 
-    fn watch_detach(&mut self, _context: &NativeLifecycleContext) {
-        if self.detach_task.is_some() {
+    fn watch_detach(&self, _context: &NativeLifecycleContext) {
+        let Ok(mut task) = self.detach_task.lock() else {
+            return;
+        };
+        if task.is_some() {
             return;
         }
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             return;
         };
         let views = Arc::clone(&self.views);
-        let mut events = bmux_plugin::global_event_bus()
+        let bus = self
+            .events
+            .clone()
+            .unwrap_or_else(bmux_plugin::global_event_bus);
+        let sink = self.selected_sink();
+        let mut events = bus
             .subscribe::<bmux_clients_plugin_api::clients_events::ClientEvent>(
                 &bmux_clients_plugin_api::clients_events::EVENT_KIND,
             )
             .ok();
-        self.detach_task = Some(DetachTask(handle.spawn(async move {
+        *task = Some(DetachTask(handle.spawn(async move {
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
             loop {
                 let detached = tokio::select! {
@@ -154,17 +204,14 @@ impl ThemePlugin {
                             bmux_clients_plugin_api::clients_events::ClientEvent::Detached { client_id } => Some(client_id.to_string()),
                             _ => continue,
                         }
-                    } else { events = bmux_plugin::global_event_bus().subscribe::<bmux_clients_plugin_api::clients_events::ClientEvent>(&bmux_clients_plugin_api::clients_events::EVENT_KIND).ok(); None }
+                    } else { events = bus.subscribe::<bmux_clients_plugin_api::clients_events::ClientEvent>(&bmux_clients_plugin_api::clients_events::EVENT_KIND).ok(); None }
                 };
                 let mut retired = Vec::new();
                 if let Some(owner) = detached
                     && let Ok(mut registry) = views.lock()
                     && let Some(view) = registry.remove(&owner) { retired.push(view); }
                 // Transport liveness works even when the optional clients facade is absent.
-                let sink = bmux_plugin::global_plugin_state_registry()
-                    .get::<bmux_plugin_sdk::WireEventSinkHandle>()
-                    .and_then(|sink| sink.read().ok().map(|sink| sink.0.clone()));
-                if let Some(sink) = sink { retired.extend(retire_disconnected(&views, sink.as_ref())); }
+                if let Some(sink) = &sink { retired.extend(retire_disconnected(&views, sink.as_ref())); }
                 let snapshot = if let Ok(registry) = views.lock() {
                     registry.values().cloned().collect::<Vec<_>>()
                 } else { continue; };
@@ -218,6 +265,13 @@ fn retire_disconnected(
 }
 
 impl View {
+    fn selected_sink(&self) -> Option<Arc<dyn bmux_plugin_sdk::WireEventSink>> {
+        self.sink.clone().or_else(|| {
+            bmux_plugin::global_plugin_state_registry()
+                .get::<bmux_plugin_sdk::WireEventSinkHandle>()
+                .and_then(|sink| sink.read().ok().map(|sink| sink.0.clone()))
+        })
+    }
     fn publish(&self) {
         if self.closed.load(std::sync::atomic::Ordering::Acquire) {
             return;
@@ -232,20 +286,17 @@ impl View {
             }
             let payload =
                 serde_json::to_vec(&theme.appearance).map_err(|error| error.to_string())?;
-            let sink = bmux_plugin::global_plugin_state_registry()
-                .get::<bmux_plugin_sdk::WireEventSinkHandle>()
+            let sink = self
+                .selected_sink()
                 .ok_or("targeted appearance delivery unavailable")?;
-            let sink = sink.read().map_err(|_| "appearance sink poisoned")?;
-            sink.0
-                .publish_retained_to(
-                    self.context.caller_client_id.ok_or("attachment required")?,
-                    super::RUNTIME_APPEARANCE_STATE_KIND.as_str().to_string(),
-                    payload,
-                )
-                .map_err(|error| error.to_string())?;
+            sink.publish_retained_to(
+                self.context.caller_client_id.ok_or("attachment required")?,
+                super::RUNTIME_APPEARANCE_STATE_KIND.as_str().to_string(),
+                payload,
+            )
+            .map_err(|error| error.to_string())?;
             *published = Some(theme.appearance);
             drop(published);
-            drop(sink);
             Ok(())
         });
         if let Err(error) = result {
@@ -260,12 +311,9 @@ impl View {
         };
         self.closed
             .store(true, std::sync::atomic::Ordering::Release);
-        if let Some(sink) = bmux_plugin::global_plugin_state_registry()
-            .get::<bmux_plugin_sdk::WireEventSinkHandle>()
-            && let (Ok(sink), Some(owner)) = (sink.read(), self.context.caller_client_id)
-            && let Err(error) = sink
-                .0
-                .clear_retained_to(owner, super::RUNTIME_APPEARANCE_STATE_KIND.as_str())
+        if let (Some(sink), Some(owner)) = (self.selected_sink(), self.context.caller_client_id)
+            && let Err(error) =
+                sink.clear_retained_to(owner, super::RUNTIME_APPEARANCE_STATE_KIND.as_str())
         {
             tracing::warn!(%error, "private appearance cleanup failed");
         }
@@ -413,15 +461,7 @@ impl RustPlugin for ThemePlugin {
     }
 
     fn run_command(&mut self, context: NativeCommandContext) -> Result<i32, PluginCommandError> {
-        if context.caller_client_id.is_none() {
-            return Err(PluginCommandError::unavailable(
-                "theme command requires an attachment; use explicit default control for persistence",
-            ));
-        }
-        bmux_plugin_sdk::route_command!(context, {
-            "pick-theme" => super::pick_theme(&context),
-            "refresh-theme" => super::refresh_theme(&context),
-        })
+        Self::command_impl(&context)
     }
 
     fn invoke_service(&self, context: NativeServiceContext) -> ServiceResponse {
@@ -585,7 +625,9 @@ fn resolve_baseline_appearance(
 
 impl Drop for ThemePlugin {
     fn drop(&mut self) {
-        self.detach_task.take();
+        if let Ok(task) = self.detach_task.get_mut() {
+            task.take();
+        }
         let retired = self
             .views
             .lock()

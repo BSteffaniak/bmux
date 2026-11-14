@@ -705,6 +705,7 @@ pub async fn run_interactive(
         binary: None,
         sandbox_config_file: None,
         bundled_plugin_ids: &[],
+        recording_requested: record,
     })
     .await
     .context("failed starting sandbox server")?;
@@ -793,6 +794,22 @@ async fn run_interactive_session_managed(
     let mut runtime_vars = super::subst::RuntimeVars::new(std::collections::BTreeMap::new());
 
     let deadline = session_timeout.map(|d| Instant::now() + d);
+    // Requested recording is a prerequisite, not a best-effort side effect of
+    // the first DSL command. Attempt exactly once under the actual session
+    // deadline before any DSL effects or successful command acknowledgement.
+    if record {
+        let started = if let Some(deadline) = deadline {
+            tokio::time::timeout_at(
+                tokio::time::Instant::from_std(deadline),
+                start_recording(&mut client, None),
+            )
+            .await
+            .context("requested recording start exceeded session deadline")?
+        } else {
+            start_recording(&mut client, None).await
+        };
+        recording_id = Some(started.context("requested recording could not start")?);
+    }
 
     // Run the read-eval-respond loop.
     let loop_result = run_repl(
@@ -856,12 +873,12 @@ async fn run_repl(
     attached: &mut bool,
     events_subscribed: &mut bool,
     attach_runtime: &mut Option<super::engine::AttachInputRuntime>,
-    recording_id: &mut Option<Uuid>,
+    _recording_id: &mut Option<Uuid>,
     step_counter: &mut usize,
     snapshots: &mut Vec<SnapshotCapture>,
     viewport_cols: u16,
     viewport_rows: u16,
-    record: bool,
+    _record: bool,
     deadline: Option<Instant>,
     runtime_vars: &mut super::subst::RuntimeVars,
     sandbox: &super::sandbox::SandboxServer,
@@ -1212,7 +1229,6 @@ async fn run_repl(
         };
 
         let action_name = action.name().to_string();
-        let is_new_session = matches!(action, super::types::Action::NewSession { .. });
 
         let step = Step {
             index: *step_counter,
@@ -1341,17 +1357,6 @@ async fn run_repl(
 
         match result {
             Ok(detail) => {
-                // Start recording after first successful new-session.
-                if record && recording_id.is_none() && is_new_session {
-                    match start_recording(client, *session_id).await {
-                        Ok(rid) => {
-                            info!("recording started: {rid}");
-                            *recording_id = Some(rid);
-                        }
-                        Err(e) => warn!("failed to start recording: {e:#}"),
-                    }
-                }
-
                 let mut resp =
                     InteractiveResponse::ok_with_detail(&action_name, elapsed_ms, detail);
 

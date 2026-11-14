@@ -21,7 +21,8 @@ use bmux_control_catalog_plugin_api::control_catalog_state::{
     self, ContextRow, ContextSessionBinding, SessionRow, Snapshot,
 };
 use bmux_plugin::{
-    ServiceCaller, TypedServiceCaller, global_event_bus, global_plugin_state_registry,
+    EventBus, PluginStateRegistry, ServiceCaller, TypedServiceCaller, global_event_bus,
+    global_plugin_state_registry,
 };
 use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::{TypedServiceRegistrationContext, TypedServiceRegistry};
@@ -33,30 +34,29 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Process-wide revision counter for the control catalog.
-///
-/// Plugin lifecycle in a single process creates the plugin once at
-/// activation; the revision counter lives in a `static` so it survives
-/// any test-time reactivation while still starting from 1 on each
-/// process start (matches the pre-migration server-side counter).
-static CATALOG_REVISION: AtomicU64 = AtomicU64::new(1);
-
-fn current_revision() -> u64 {
-    CATALOG_REVISION.load(Ordering::SeqCst)
+/// Revisions are local to the catalog authority, not shared across hosts.
+struct CatalogState {
+    revision: AtomicU64,
+    stop: std::sync::atomic::AtomicBool,
+    events: Arc<EventBus>,
+    disconnected: std::sync::atomic::AtomicBool,
 }
 
-fn bump_revision_and_emit(scopes: Vec<CatalogScope>, full_resync: bool) {
-    let new_rev = CATALOG_REVISION
-        .fetch_add(1, Ordering::SeqCst)
-        .saturating_add(1);
-    let _ = global_event_bus().emit(
-        &control_catalog_events::EVENT_KIND,
-        CatalogEvent::Changed {
-            revision: new_rev,
-            scopes,
-            full_resync,
-        },
-    );
+impl CatalogState {
+    fn bump(&self, scopes: Vec<CatalogScope>, full_resync: bool) {
+        let revision = self
+            .revision
+            .fetch_add(1, Ordering::SeqCst)
+            .saturating_add(1);
+        let _ = self.events.emit(
+            &control_catalog_events::EVENT_KIND,
+            CatalogEvent::Changed {
+                revision,
+                scopes,
+                full_resync,
+            },
+        );
+    }
 }
 
 /// Argument record for the `snapshot` query.
@@ -66,8 +66,17 @@ struct SnapshotArgs {
     since_revision: Option<u64>,
 }
 
-#[derive(Default)]
-pub struct ControlCatalogPlugin;
+pub struct ControlCatalogPlugin {
+    catalog: Arc<CatalogState>,
+    state: Arc<PluginStateRegistry>,
+    subscriber: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+impl Default for ControlCatalogPlugin {
+    fn default() -> Self {
+        Self::with_host(global_event_bus(), global_plugin_state_registry())
+    }
+}
 
 impl RustPlugin for ControlCatalogPlugin {
     type Contract = bmux_control_catalog_plugin_api::Contract;
@@ -76,17 +85,7 @@ impl RustPlugin for ControlCatalogPlugin {
         &mut self,
         _context: NativeLifecycleContext,
     ) -> std::result::Result<i32, PluginCommandError> {
-        global_event_bus().register_channel::<CatalogEvent>(control_catalog_events::EVENT_KIND);
-
-        // Spawn background subscribers that tick the revision when any
-        // foundational-plugin event arrives. Each subscriber runs in a
-        // dedicated OS thread (plugins aren't guaranteed a tokio
-        // runtime; a bare thread + blocking recv is the simplest
-        // approach).
-        spawn_session_events_subscriber();
-        spawn_context_events_subscriber();
-        spawn_client_events_subscriber();
-
+        self.start_subscriber()?;
         Ok(bmux_plugin_sdk::EXIT_OK)
     }
 
@@ -97,13 +96,16 @@ impl RustPlugin for ControlCatalogPlugin {
         Err(PluginCommandError::unknown_command(""))
     }
 
+    fn deactivate(
+        &mut self,
+        _context: NativeLifecycleContext,
+    ) -> std::result::Result<i32, PluginCommandError> {
+        self.stop_subscriber()?;
+        Ok(bmux_plugin_sdk::EXIT_OK)
+    }
+
     fn invoke_service(&self, context: NativeServiceContext) -> ServiceResponse {
-        bmux_plugin_sdk::route_service!(context, {
-            "control-catalog-state", "snapshot" => |req: SnapshotArgs, _ctx| {
-                build_snapshot(req.since_revision)
-                    .map_err(|e| ServiceResponse::error("snapshot_failed", e))
-            },
-        })
+        self.service(&context)
     }
 
     fn register_typed_services(
@@ -119,64 +121,139 @@ impl RustPlugin for ControlCatalogPlugin {
     }
 }
 
-// ── Event subscribers ────────────────────────────────────────────────
-
-fn spawn_session_events_subscriber() {
-    let Ok(mut rx) = global_event_bus().subscribe::<SessionEvent>(&sessions_events::EVENT_KIND)
-    else {
-        return;
-    };
-    std::thread::spawn(move || {
-        while let Ok(_event) = rx.blocking_recv() {
-            bump_revision_and_emit(vec![CatalogScope::Sessions, CatalogScope::Bindings], false);
+impl ControlCatalogPlugin {
+    /// Bind explicit host mechanisms. Shared/native adapters must use this
+    /// constructor rather than the legacy process-global default.
+    pub fn with_host(events: Arc<EventBus>, state: Arc<PluginStateRegistry>) -> Self {
+        Self {
+            catalog: Arc::new(CatalogState {
+                revision: AtomicU64::new(1),
+                stop: std::sync::atomic::AtomicBool::new(false),
+                disconnected: std::sync::atomic::AtomicBool::new(false),
+                events,
+            }),
+            state,
+            subscriber: std::sync::Mutex::new(None),
         }
-    });
-}
+    }
 
-fn spawn_context_events_subscriber() {
-    let Ok(mut rx) = global_event_bus().subscribe::<ContextEvent>(&contexts_events::EVENT_KIND)
-    else {
-        return;
-    };
-    std::thread::spawn(move || {
-        while let Ok(_event) = rx.blocking_recv() {
-            bump_revision_and_emit(vec![CatalogScope::Contexts, CatalogScope::Bindings], false);
+    fn service(&self, context: &NativeServiceContext) -> ServiceResponse {
+        bmux_plugin_sdk::route_service!(context, {
+            "control-catalog-state", "snapshot" => |req: SnapshotArgs, _ctx| {
+                self.build_snapshot(req.since_revision)
+                    .map_err(|error| ServiceResponse::error("snapshot_failed", error))
+            },
+        })
+    }
+
+    fn start_subscriber(&self) -> std::result::Result<(), PluginCommandError> {
+        let mut worker = self
+            .subscriber
+            .lock()
+            .map_err(|_| PluginCommandError::failed("catalog subscriber lock poisoned"))?;
+        if worker.is_some() {
+            return Err(PluginCommandError::failed("catalog already active"));
         }
-    });
-}
+        let events = &self.catalog.events;
+        events.register_channel::<CatalogEvent>(control_catalog_events::EVENT_KIND);
+        let mut sessions = events
+            .subscribe::<SessionEvent>(&sessions_events::EVENT_KIND)
+            .map_err(|error| PluginCommandError::failed(error.to_string()))?;
+        let mut contexts = events
+            .subscribe::<ContextEvent>(&contexts_events::EVENT_KIND)
+            .map_err(|error| PluginCommandError::failed(error.to_string()))?;
+        let mut clients = events
+            .subscribe::<ClientEvent>(&clients_events::EVENT_KIND)
+            .map_err(|error| PluginCommandError::failed(error.to_string()))?;
+        self.catalog.stop.store(false, Ordering::Release);
+        self.catalog.disconnected.store(false, Ordering::Release);
+        let catalog = Arc::clone(&self.catalog);
+        *worker = Some(
+            std::thread::Builder::new()
+                .name("control-catalog".into())
+                .spawn(move || {
+                    while !catalog.stop.load(Ordering::Acquire) {
+                        // Bounded work per source per turn. Lag requests a complete
+                        // resync rather than silently terminating the subscriber.
+                        for (received, scopes) in [
+                            (
+                                sessions.try_recv().map(|_| ()),
+                                vec![CatalogScope::Sessions, CatalogScope::Bindings],
+                            ),
+                            (
+                                contexts.try_recv().map(|_| ()),
+                                vec![CatalogScope::Contexts, CatalogScope::Bindings],
+                            ),
+                            (clients.try_recv().map(|_| ()), vec![CatalogScope::Sessions]),
+                        ] {
+                            match received {
+                                Ok(()) => catalog.bump(scopes, false),
+                                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {
+                                    catalog.bump(scopes, true);
+                                }
+                                Err(tokio::sync::broadcast::error::TryRecvError::Closed) => {
+                                    catalog.bump(scopes, true);
+                                    catalog.disconnected.store(true, Ordering::Release);
+                                    catalog.stop.store(true, Ordering::Release);
+                                }
+                                Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {}
+                            }
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                })
+                .map_err(|error| PluginCommandError::failed(error.to_string()))?,
+        );
+        drop(worker);
+        Ok(())
+    }
 
-fn spawn_client_events_subscriber() {
-    let Ok(mut rx) = global_event_bus().subscribe::<ClientEvent>(&clients_events::EVENT_KIND)
-    else {
-        return;
-    };
-    std::thread::spawn(move || {
-        while let Ok(_event) = rx.blocking_recv() {
-            // Client events don't directly change sessions/contexts,
-            // but client_count on session-rows can shift. Tick sessions
-            // scope so UIs re-pull.
-            bump_revision_and_emit(vec![CatalogScope::Sessions], false);
+    fn stop_subscriber(&self) -> std::result::Result<(), PluginCommandError> {
+        self.catalog.stop.store(true, Ordering::Release);
+        let worker = self
+            .subscriber
+            .lock()
+            .map_err(|_| PluginCommandError::failed("catalog subscriber lock poisoned"))?
+            .take();
+        if let Some(worker) = worker {
+            worker
+                .join()
+                .map_err(|_| PluginCommandError::failed("catalog subscriber panicked"))?;
         }
-    });
+        Ok(())
+    }
+
+    fn build_snapshot(&self, _since_revision: Option<u64>) -> Result<Snapshot, String> {
+        if self.catalog.disconnected.load(Ordering::Acquire) {
+            return Err("catalog event source disconnected; reactivation required".into());
+        }
+        let revision = self.catalog.revision.load(Ordering::SeqCst);
+        let sessions = read_sessions(&self.state)?;
+        let contexts = read_contexts(&self.state)?;
+        let context_session_bindings = read_bindings(&self.state)?;
+        Ok(Snapshot {
+            revision,
+            sessions,
+            contexts,
+            context_session_bindings,
+        })
+    }
 }
 
-// ── Snapshot builder ─────────────────────────────────────────────────
-
-fn build_snapshot(_since_revision: Option<u64>) -> Result<Snapshot, String> {
-    let revision = current_revision();
-    let sessions = read_sessions()?;
-    let contexts = read_contexts()?;
-    let context_session_bindings = read_bindings()?;
-    Ok(Snapshot {
-        revision,
-        sessions,
-        contexts,
-        context_session_bindings,
-    })
+impl Drop for ControlCatalogPlugin {
+    fn drop(&mut self) {
+        self.catalog.stop.store(true, Ordering::Release);
+        if let Ok(worker) = self.subscriber.get_mut()
+            && let Some(worker) = worker.take()
+            && worker.join().is_err()
+        {
+            tracing::warn!("catalog subscriber panicked during destruction");
+        }
+    }
 }
 
-fn read_sessions() -> Result<Vec<SessionRow>, String> {
-    let Some(handle) = global_plugin_state_registry().get::<SessionManagerHandle>() else {
+fn read_sessions(state: &PluginStateRegistry) -> Result<Vec<SessionRow>, String> {
+    let Some(handle) = state.get::<SessionManagerHandle>() else {
         return Ok(Vec::new());
     };
     let guard = handle
@@ -194,8 +271,8 @@ fn read_sessions() -> Result<Vec<SessionRow>, String> {
         .collect())
 }
 
-fn read_contexts() -> Result<Vec<ContextRow>, String> {
-    let Some(handle) = global_plugin_state_registry().get::<ContextStateHandle>() else {
+fn read_contexts(state: &PluginStateRegistry) -> Result<Vec<ContextRow>, String> {
+    let Some(handle) = state.get::<ContextStateHandle>() else {
         return Ok(Vec::new());
     };
     let guard = handle
@@ -212,8 +289,8 @@ fn read_contexts() -> Result<Vec<ContextRow>, String> {
         .collect())
 }
 
-fn read_bindings() -> Result<Vec<ContextSessionBinding>, String> {
-    let Some(handle) = global_plugin_state_registry().get::<ContextStateHandle>() else {
+fn read_bindings(state: &PluginStateRegistry) -> Result<Vec<ContextSessionBinding>, String> {
+    let Some(handle) = state.get::<ContextStateHandle>() else {
         return Ok(Vec::new());
     };
     let guard = handle
@@ -267,4 +344,136 @@ impl control_catalog_state::ControlCatalogStateService for ControlCatalogStateHa
     }
 }
 
+impl bmux_plugin_sdk::definition::PluginInstance for ControlCatalogPlugin {
+    fn activate(
+        &self,
+        _context: bmux_plugin_sdk::definition::PluginLifecycleContext,
+    ) -> bmux_plugin_sdk::definition::PluginFuture<'_, bmux_plugin_sdk::definition::PluginResult<()>>
+    {
+        Box::pin(async move { self.start_subscriber() })
+    }
+    fn deactivate(
+        &self,
+        _context: bmux_plugin_sdk::definition::PluginLifecycleContext,
+    ) -> bmux_plugin_sdk::definition::PluginFuture<'_, bmux_plugin_sdk::definition::PluginResult<()>>
+    {
+        Box::pin(async move { self.stop_subscriber() })
+    }
+    fn invoke(
+        &self,
+        call: bmux_plugin_sdk::definition::PluginCallContext,
+        context: NativeServiceContext,
+    ) -> bmux_plugin_sdk::definition::PluginFuture<
+        '_,
+        bmux_plugin_sdk::definition::PluginResult<ServiceResponse>,
+    > {
+        Box::pin(async move {
+            if call.cancellation.is_cancelled() {
+                return Err(PluginCommandError::unavailable(
+                    "catalog invocation cancelled",
+                ));
+            }
+            Ok(self.service(&context))
+        })
+    }
+}
+
+/// Bind one host's neutral mechanisms before creating instances. The portable
+/// adapter must translate its host handles into these same mechanisms; it must
+/// not select the legacy global registry.
+pub fn plugin_definition(
+    events: Arc<EventBus>,
+    state: Arc<PluginStateRegistry>,
+) -> bmux_plugin_sdk::definition::PluginDefinition {
+    bmux_plugin_sdk::definition::PluginDefinition::new(definition_metadata(), move |_scope| {
+        Ok(Arc::new(ControlCatalogPlugin::with_host(
+            Arc::clone(&events),
+            Arc::clone(&state),
+        ))
+            as Arc<dyn bmux_plugin_sdk::definition::PluginInstance>)
+    })
+}
+
 bmux_plugin_sdk::export_plugin!(ControlCatalogPlugin, include_str!("../plugin.toml"));
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+
+    #[test]
+    fn catalog_revisions_do_not_cross_hosts() {
+        let first = ControlCatalogPlugin::with_host(
+            Arc::new(EventBus::new()),
+            Arc::new(PluginStateRegistry::new()),
+        );
+        let second = ControlCatalogPlugin::with_host(
+            Arc::new(EventBus::new()),
+            Arc::new(PluginStateRegistry::new()),
+        );
+        first.catalog.bump(vec![CatalogScope::Sessions], false);
+        assert_eq!(first.build_snapshot(None).unwrap().revision, 2);
+        assert_eq!(second.build_snapshot(None).unwrap().revision, 1);
+    }
+
+    #[test]
+    fn subscriber_is_joined_before_reactivation() {
+        let events = Arc::new(EventBus::new());
+        events.register_channel::<SessionEvent>(sessions_events::EVENT_KIND);
+        events.register_channel::<ContextEvent>(contexts_events::EVENT_KIND);
+        events.register_channel::<ClientEvent>(clients_events::EVENT_KIND);
+        let plugin = ControlCatalogPlugin::with_host(events, Arc::new(PluginStateRegistry::new()));
+        plugin.start_subscriber().unwrap();
+        assert!(plugin.start_subscriber().is_err());
+        plugin.stop_subscriber().unwrap();
+        assert!(plugin.subscriber.lock().unwrap().is_none());
+        plugin.start_subscriber().unwrap();
+        plugin.stop_subscriber().unwrap();
+    }
+
+    #[test]
+    fn disconnected_catalog_is_not_a_healthy_empty_snapshot() {
+        let plugin = ControlCatalogPlugin::with_host(
+            Arc::new(EventBus::new()),
+            Arc::new(PluginStateRegistry::new()),
+        );
+        plugin.catalog.disconnected.store(true, Ordering::Release);
+        assert!(plugin.build_snapshot(None).is_err());
+    }
+
+    #[test]
+    fn missing_dependency_channel_fails_activation_without_a_task() {
+        let plugin = ControlCatalogPlugin::with_host(
+            Arc::new(EventBus::new()),
+            Arc::new(PluginStateRegistry::new()),
+        );
+        assert!(plugin.start_subscriber().is_err());
+        assert!(plugin.subscriber.lock().unwrap().is_none());
+    }
+}
+
+fn definition_metadata() -> bmux_plugin_sdk::definition::PluginMetadata {
+    bmux_plugin_sdk::definition::PluginDefinition::from_rust_plugin::<ControlCatalogPlugin>(
+        include_str!("../plugin.toml"),
+        vec![bmux_plugin_sdk::definition::ComponentRole::Backend],
+    )
+    .expect("plugin manifest must define valid canonical metadata")
+    .metadata
+}
+
+#[cfg(test)]
+mod canonical_metadata_tests {
+    #[test]
+    fn embedded_manifest_matches_definition_metadata() {
+        let definition = bmux_plugin_sdk::definition::PluginDefinition::new(
+            super::definition_metadata(),
+            |_scope| {
+                Err(bmux_plugin_sdk::PluginCommandError::unavailable(
+                    "metadata-only regression",
+                ))
+            },
+        );
+        definition
+            .validate()
+            .expect("canonical embedded identity must validate");
+    }
+}

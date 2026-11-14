@@ -20,7 +20,7 @@ bmux_codec          = { workspace = true }
 bmux_ipc            = { workspace = true }
 bmux_keyboard       = { workspace = true }
 bmux_perf_telemetry = { workspace = true }
-bmux_tui            = { workspace = true }
+bmux_tui            = { workspace = true, features = ["serde"] }
 libloading          = { workspace = true }
 semver              = { workspace = true }
 serde               = { workspace = true, features = ["derive", "std"] }
@@ -46,7 +46,7 @@ windows-sys = { workspace = true, features = [
 
 [dev-dependencies]
 serial_test = { workspace = true }
-tokio       = { workspace = true, features = ["sync", "macros", "rt"] }
+tokio       = { workspace = true, features = ["sync", "macros", "rt", "time"] }
 
 
 [features]

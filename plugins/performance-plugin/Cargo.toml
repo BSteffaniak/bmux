@@ -23,6 +23,8 @@ bmux_presentation_state     = { workspace = true }
 serde                       = { workspace = true, features = ["derive", "std"] }
 serde_json                  = { workspace = true }
 sysinfo                     = { workspace = true }
+tokio                       = { workspace = true, features = ["rt"] }
+tracing                     = { workspace = true }
 uuid                        = { workspace = true, features = ["std"] }
 
 [features]

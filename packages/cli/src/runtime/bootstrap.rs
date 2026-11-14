@@ -539,9 +539,89 @@ async fn run_server_start_inner(
         return Ok(0);
     }
 
+    tracing::info!("server.startup.plugins.scan.begin");
     let registry = scan_available_plugins(&config, &paths)?;
+    tracing::info!(
+        plugin_count = registry.iter().count(),
+        "server.startup.plugins.scan.complete"
+    );
     validate_enabled_plugins(&config, &registry)?;
-    let loaded_plugins = std::sync::Arc::new(load_enabled_plugins(&config, &registry)?);
+    super::plugin_runtime::initialize_server_command_state(&config, &paths, &registry)?;
+    // Construct the actual runtime authority before provider factories. Besides
+    // supplying explicit ports, this prevents constructor fallback handles from
+    // overwriting authoritative handles published by activated providers.
+    let server = BmuxServer::from_config_paths_with_start_options(
+        &paths,
+        effective_rolling_enabled,
+        effective_rolling_settings.window_secs,
+        &effective_rolling_settings.event_kinds,
+        pane_shell_integration_override,
+    );
+    #[cfg(any(
+        feature = "bundled-plugin-snapshot",
+        feature = "bundled-plugin-recording"
+    ))]
+    let mut provider_definitions = std::collections::BTreeMap::new();
+    #[cfg(not(any(
+        feature = "bundled-plugin-snapshot",
+        feature = "bundled-plugin-recording"
+    )))]
+    let provider_definitions = std::collections::BTreeMap::new();
+    #[cfg(feature = "bundled-plugin-recording")]
+    provider_definitions.insert(
+        "bmux.recording".to_string(),
+        super::plugin_runtime::recording_binding::definition(
+            recording_plugin_config(
+                &config,
+                &paths,
+                effective_rolling_enabled,
+                &effective_rolling_settings,
+                startup_recording.clone(),
+            ),
+            server.plugin_state_registry(),
+            bmux_plugin::global_event_bus(),
+        ),
+    );
+    #[cfg(feature = "bundled-plugin-snapshot")]
+    let snapshot_runtime = {
+        register_snapshot_plugin_config(&config, &paths);
+        let managed = match (
+            std::env::var("BMUX_MANAGED_TARGET_ID"),
+            std::env::var("BMUX_MANAGED_TARGET_IDENTITY"),
+        ) {
+            (Err(std::env::VarError::NotPresent), Err(std::env::VarError::NotPresent)) => None,
+            (Ok(target), Ok(identity)) => Some((target, identity)),
+            _ => anyhow::bail!(
+                "snapshot managed target and public identity must both be present and UTF-8"
+            ),
+        };
+        let runtime = bmux_snapshot_plugin::SnapshotRuntime::from_host_registry(
+            server.plugin_state_registry(),
+            managed,
+        )
+        .map_err(|error| anyhow::anyhow!(error.message))?;
+        *runtime
+            .participant_restore_admitted
+            .write()
+            .map_err(|_| anyhow::anyhow!("snapshot startup admission poisoned"))? = true;
+        provider_definitions.insert(
+            "bmux.snapshot".to_string(),
+            bmux_snapshot_plugin::plugin_definition_with_runtime(runtime.clone()),
+        );
+        runtime
+    };
+    tracing::info!("server.startup.plugins.load.begin");
+    let loaded_plugins = std::sync::Arc::new(load_enabled_plugins(
+        &config,
+        &paths,
+        &registry,
+        &server.plugin_state_registry(),
+        &provider_definitions,
+    )?);
+    tracing::info!(
+        plugin_count = loaded_plugins.len(),
+        "server.startup.plugins.load.complete"
+    );
     register_recording_plugin_config(
         &config,
         &paths,
@@ -552,17 +632,13 @@ async fn run_server_start_inner(
     register_snapshot_plugin_config(&config, &paths);
     register_pane_runtime_plugin_config(&config, &paths, pane_shell_integration_override);
     super::dispatch::startup_future_marker("plugins.before_activate", 0);
+    for plugin in loaded_plugins.iter() {
+        plugin.bind_lifecycle_authority(server.host_service_context())?;
+    }
     Box::pin(activate_loaded_plugins(&loaded_plugins, &config, &paths)).await?;
     super::dispatch::startup_future_marker("plugins.after_activate", 0);
     dispatch_loaded_plugin_event(&loaded_plugins, &plugin_system_event("server_starting"))?;
-    let server = BmuxServer::from_config_paths_with_start_options(
-        &paths,
-        effective_rolling_enabled,
-        effective_rolling_settings.window_secs,
-        &effective_rolling_settings.event_kinds,
-        pane_shell_integration_override,
-    );
-    register_plugin_service_handlers(&server, &config, &paths, &registry)?;
+    register_plugin_service_handlers(&server, &config, &paths, &registry, &loaded_plugins)?;
     {
         use bmux_plugin::stream_admission::{
             STREAM_ADMISSION_PROVIDER_EXTENSION, STREAM_ADMITTED_ROUTES_EXTENSION,
@@ -824,7 +900,23 @@ async fn run_server_start_inner(
         .transpose()?;
     let (server_ready_tx, server_ready_rx) = tokio::sync::oneshot::channel();
     let managed_idle = async {
-        if !matches!(server_ready_rx.await, Ok(Ok(()))) {
+        let ready = matches!(server_ready_rx.await, Ok(Ok(())));
+        #[cfg(feature = "bundled-plugin-snapshot")]
+        {
+            let admission_closed = snapshot_runtime
+                .participant_restore_admitted
+                .write()
+                .is_ok_and(|mut admission| {
+                    *admission = false;
+                    true
+                });
+            if !admission_closed {
+                tracing::error!("snapshot startup admission poisoned; restore remains fail-closed");
+                server.request_shutdown();
+                return std::future::pending::<()>().await;
+            }
+        }
+        if !ready {
             return std::future::pending::<()>().await;
         }
         let Some(caller) = managed_idle_caller.as_ref() else {
@@ -878,6 +970,17 @@ async fn run_server_start_inner(
     drop(managed_idle_context);
     drop(server_loop);
     drop(gateway_loop);
+    #[cfg(feature = "bundled-plugin-snapshot")]
+    {
+        *snapshot_runtime
+            .participant_restore_admitted
+            .write()
+            .map_err(|_| anyhow::anyhow!("snapshot startup admission poisoned"))? = false;
+        *snapshot_runtime
+            .participant_quiesce_admitted
+            .write()
+            .map_err(|_| anyhow::anyhow!("snapshot shutdown admission poisoned"))? = true;
+    }
     if let Err(error) =
         dispatch_loaded_plugin_event(&loaded_plugins, &plugin_system_event("server_stopping"))
     {
@@ -886,6 +989,13 @@ async fn run_server_start_inner(
     tracing::info!("shutdown plugin teardown started");
     let shutdown_result =
         Box::pin(deactivate_loaded_plugins(&loaded_plugins, &config, &paths)).await;
+    #[cfg(feature = "bundled-plugin-snapshot")]
+    {
+        *snapshot_runtime
+            .participant_quiesce_admitted
+            .write()
+            .map_err(|_| anyhow::anyhow!("snapshot shutdown admission poisoned"))? = false;
+    }
     let result = match (run_result, shutdown_result) {
         (Ok(()), Ok(())) => Ok(()),
         (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
@@ -927,9 +1037,28 @@ fn register_recording_plugin_config(
     rolling_settings: &bmux_recording_plugin_api::RollingRecordingSettings,
     startup_recording: Option<ManualRecordingStartOptions>,
 ) {
+    let plugin_config = recording_plugin_config(
+        config,
+        paths,
+        rolling_auto_start,
+        rolling_settings,
+        startup_recording,
+    );
+    let handle = std::sync::Arc::new(std::sync::RwLock::new(plugin_config));
+    bmux_plugin::global_plugin_state_registry()
+        .register::<bmux_recording_plugin_api::RecordingPluginConfig>(&handle);
+}
+
+fn recording_plugin_config(
+    config: &BmuxConfig,
+    paths: &ConfigPaths,
+    rolling_auto_start: bool,
+    rolling_settings: &bmux_recording_plugin_api::RollingRecordingSettings,
+    startup_recording: Option<ManualRecordingStartOptions>,
+) -> bmux_recording_plugin_api::RecordingPluginConfig {
     use bmux_recording_plugin_api::RecordingPluginConfig;
     let auto_export_dir = config.recording_auto_export_dir(paths);
-    let plugin_config = RecordingPluginConfig {
+    RecordingPluginConfig {
         recordings_dir: config.recordings_dir(paths),
         rolling_recordings_dir: paths.rolling_recordings_dir(),
         rolling_segment_mb: config.recording.segment_mb,
@@ -940,9 +1069,7 @@ fn register_recording_plugin_config(
         auto_export_dir,
         auto_export_fps: config.recording.export.fps.max(1),
         startup_recording,
-    };
-    let handle = std::sync::Arc::new(std::sync::RwLock::new(plugin_config));
-    bmux_plugin::global_plugin_state_registry().register::<RecordingPluginConfig>(&handle);
+    }
 }
 
 fn set_startup_recording_env(

@@ -41,3 +41,41 @@ kind         = "event"
 [[event_publications]]
 forward_to_streaming_clients = true
 kind                         = "bmux.contexts/contexts-events"
+
+[[services]]
+capability   = "bmux.contexts.write"
+interface_id = "contexts-spawn-v1"
+kind         = "command"
+
+# Explicit immutable v1 contracts. Route IDs are wire identities, not version
+# syntax: retain legacy names and negotiate their major separately.
+
+[[contracts]]
+interface_id = "contexts-visits-v1"
+major        = 1
+minor        = 0
+
+[[contracts]]
+interface_id = "contexts-state"
+major        = 1
+minor        = 0
+
+[[contracts]]
+interface_id = "contexts-commands"
+major        = 1
+minor        = 0
+
+[[contracts]]
+interface_id = "contexts-activation-v1"
+major        = 1
+minor        = 0
+
+[[contracts]]
+interface_id = "contexts-events"
+major        = 1
+minor        = 0
+
+[[contracts]]
+interface_id = "contexts-spawn-v1"
+major        = 1
+minor        = 0

@@ -359,6 +359,7 @@ impl SerializedAdmissionAuthority {
                         .map_err(|_| StreamAdmissionError)?;
                     runtime.block_on(async {
                         let context = ServiceInvokeContext {
+                            host_dispatch_context: None,
                             host_internal: true,
                             state: Arc::clone(&state),
                             shutdown_tx: watch::channel(false).0,
@@ -438,6 +439,7 @@ impl bmux_plugin::stream_admission::StreamAdmissionAuthority for SerializedAdmis
 
 #[derive(Clone)]
 pub struct ServiceInvokeContext {
+    host_dispatch_context: Option<Arc<dyn std::any::Any + Send + Sync>>,
     host_internal: bool,
     state: Arc<ServerState>,
     shutdown_tx: watch::Sender<bool>,
@@ -449,6 +451,32 @@ pub struct ServiceInvokeContext {
 }
 
 impl ServiceInvokeContext {
+    /// Retain opaque Rust-local host context without changing transport authority.
+    /// This value is never decoded from or serialized into a request.
+    #[must_use]
+    pub fn with_host_dispatch_context(
+        mut self,
+        context: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> Self {
+        self.host_dispatch_context = Some(context);
+        self
+    }
+
+    /// Read a selected host context. A present value of the wrong type is an
+    /// error, never permission to fall back to a fresh root authority.
+    /// # Errors
+    /// Returns an error if the retained host context has a different Rust type.
+    pub fn host_dispatch_context<T: std::any::Any + Send + Sync>(&self) -> Result<Option<Arc<T>>> {
+        self.host_dispatch_context
+            .clone()
+            .map(|context| {
+                context
+                    .downcast::<T>()
+                    .map_err(|_| anyhow::anyhow!("host dispatch context type mismatch"))
+            })
+            .transpose()
+    }
+
     /// Connected-client id on whose behalf this service invocation is
     /// dispatched. Plugin handlers use this to know which client made
     /// a request without a separate `WhoAmI` round-trip.
@@ -480,6 +508,82 @@ impl ServiceInvokeContext {
 }
 
 impl ServiceInvokeContext {
+    /// Observe the exact selected tuple after checking retained transport access.
+    /// This does not invoke a provider or grant authority for a later request.
+    /// Opaque fallback resolvers cannot establish authoritative absence.
+    ///
+    /// # Errors
+    /// Returns an error for invalid routing metadata, unsupported service kinds,
+    /// denied or invalid retained transport access, unavailable registry locks,
+    /// or an opaque fallback resolver that prevents an authoritative answer.
+    /// These failures are never reported as provider absence.
+    pub fn selected_service_availability(
+        &self,
+        key: &bmux_plugin_sdk::typed_dispatch::ServiceAvailabilityKey,
+    ) -> Result<bmux_plugin_sdk::typed_dispatch::SelectedServiceAvailability> {
+        use bmux_plugin_sdk::typed_dispatch::SelectedServiceAvailability;
+        key.validate()?;
+        let kind = match key.kind {
+            bmux_plugin_sdk::ServiceKind::Query => bmux_ipc::InvokeServiceKind::Query,
+            bmux_plugin_sdk::ServiceKind::Command => bmux_ipc::InvokeServiceKind::Command,
+            bmux_plugin_sdk::ServiceKind::Event => anyhow::bail!("event availability unsupported"),
+        };
+        let matches = |route: &ServiceRoute| {
+            route.capability == key.capability
+                && route.kind == kind
+                && route.interface_id == key.interface_id
+        };
+        if !self.host_internal {
+            // Denial is decided before observing registry presence. Never expose
+            // private routes, even if no selected handler currently exists.
+            anyhow::ensure!(
+                !self
+                    .state
+                    .private_admission_routes
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("private routes unavailable"))?
+                    .iter()
+                    .any(&matches),
+                "host-private service availability"
+            );
+            match self.state.stream_provenance.lookup(self.client_id.0) {
+                bmux_plugin::stream_admission::StreamProvenance::Local => {}
+                bmux_plugin::stream_admission::StreamProvenance::Admitted(_) => {
+                    anyhow::ensure!(
+                        self.state
+                            .admitted_routes
+                            .lock()
+                            .map_err(|_| anyhow::anyhow!("admitted routes unavailable"))?
+                            .iter()
+                            .any(&matches),
+                        "service availability not admitted"
+                    );
+                }
+                bmux_plugin::stream_admission::StreamProvenance::Invalid => {
+                    anyhow::bail!("invalid stream origin")
+                }
+            }
+        }
+        let registry = self
+            .state
+            .service_registry
+            .lock()
+            .map_err(|_| anyhow::anyhow!("service registry unavailable"))?;
+        if registry.handlers.keys().any(matches) {
+            return Ok(SelectedServiceAvailability::Present);
+        }
+        drop(registry);
+        anyhow::ensure!(
+            self.state
+                .service_resolver
+                .lock()
+                .map_err(|_| anyhow::anyhow!("service resolver unavailable"))?
+                .is_none(),
+            "opaque service resolver cannot establish selected availability"
+        );
+        Ok(SelectedServiceAvailability::Absent)
+    }
+
     async fn execute_request(&self, request: Request) -> Result<Response> {
         if matches!(request, Request::StreamAdmissionBackend) {
             let backend = self
@@ -504,6 +608,35 @@ impl ServiceInvokeContext {
                 &self.state.stream_provenance,
                 self.client_id.0,
             ));
+        }
+        if self.host_dispatch_context.is_some()
+            && let Request::InvokeService {
+                capability,
+                kind,
+                interface_id,
+                operation,
+                payload,
+            } = &request
+        {
+            let route = ServiceRoute {
+                capability: capability.clone(),
+                kind: *kind,
+                interface_id: interface_id.clone(),
+                operation: operation.clone(),
+            };
+            if !self.host_internal {
+                check_stream_route(&self.state, self.client_id.0, &route)?;
+            }
+            let invocation = self
+                .state
+                .service_registry
+                .lock()
+                .map_err(|_| anyhow::anyhow!("service registry unavailable"))?
+                .dispatch(&route, self.clone(), payload.clone())
+                .context("bound in-process selected service unavailable")?;
+            return Ok(Response::Ok(ResponsePayload::ServiceInvoked {
+                payload: invocation.await?.payload,
+            }));
         }
         if self.host_internal {
             // Preserve host-internal origin across foundational facade calls;
@@ -707,6 +840,7 @@ async fn invoke_service_output_as(
     let interface_id = route.interface_id.clone();
     let operation = route.operation.clone();
     let invoke_context = ServiceInvokeContext {
+        host_dispatch_context: None,
         host_internal: false,
         state: Arc::clone(state),
         shutdown_tx: shutdown_tx.clone(),
@@ -1421,6 +1555,7 @@ impl BmuxServer {
     #[must_use]
     pub fn host_service_context(&self) -> ServiceInvokeContext {
         ServiceInvokeContext {
+            host_dispatch_context: None,
             host_internal: true,
             state: Arc::clone(&self.state),
             shutdown_tx: self.shutdown_tx.clone(),
@@ -2261,6 +2396,7 @@ mod admission_tests {
         let client_id = ClientId::new();
         let claimed = Uuid::new_v4();
         let context = ServiceInvokeContext {
+            host_dispatch_context: None,
             host_internal: false,
             state: Arc::clone(&server.state),
             shutdown_tx: server.shutdown_tx.clone(),
@@ -2492,6 +2628,7 @@ mod admission_tests {
             .is_err()
         );
         let host = ServiceInvokeContext {
+            host_dispatch_context: None,
             host_internal: true,
             state: Arc::clone(&server.state),
             shutdown_tx: server.shutdown_tx.clone(),
@@ -3746,6 +3883,7 @@ async fn handle_request(
             };
             check_stream_route(state, client_id.0, &route)?;
             let invoke_context = ServiceInvokeContext {
+                host_dispatch_context: None,
                 host_internal: false,
                 state: Arc::clone(state),
                 shutdown_tx: shutdown_tx.clone(),
@@ -4829,6 +4967,127 @@ mod tests {
         retention
             .publish(owner, "replacement".into(), vec![])
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn opaque_host_dispatch_context_survives_thread_and_await_without_wire_authority() {
+        struct Marker(u64);
+        let server = BmuxServer::new(IpcEndpoint::unix_socket(
+            std::env::temp_dir().join("bmux-opaque-host-context.sock"),
+        ));
+        let context = server
+            .host_service_context()
+            .with_host_dispatch_context(Arc::new(Marker(41)));
+        assert!(context.host_dispatch_context::<String>().is_err());
+        let moved = tokio::task::spawn_blocking(move || context.clone())
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+        assert_eq!(
+            moved.host_dispatch_context::<Marker>().unwrap().unwrap().0,
+            41
+        );
+        // A newly authenticated wire entry gets no host context. Neither the
+        // request codec nor payload can construct this Rust-local Arc.
+        assert!(
+            server
+                .host_service_context()
+                .host_dispatch_context::<Marker>()
+                .unwrap()
+                .is_none()
+        );
+        server
+            .register_checked_service_handler_with_metadata(
+                "example.read",
+                bmux_ipc::InvokeServiceKind::Query,
+                "example/v1",
+                "*",
+                |_, context, _| async move {
+                    tokio::task::yield_now().await;
+                    let marker = context
+                        .host_dispatch_context::<Marker>()?
+                        .context("expected opaque host dependency")?;
+                    Ok(ServiceInvokeOutput::from(vec![u8::try_from(marker.0)?]))
+                },
+            )
+            .unwrap();
+        let request = Request::InvokeService {
+            capability: "example.read".into(),
+            kind: bmux_ipc::InvokeServiceKind::Query,
+            interface_id: "example/v1".into(),
+            operation: "read".into(),
+            payload: vec![],
+        };
+        let result = moved.execute_raw(encode(&request).unwrap()).await.unwrap();
+        assert!(matches!(decode::<Response>(&result).unwrap(),
+            Response::Ok(ResponsePayload::ServiceInvoked { payload }) if payload == vec![41]));
+    }
+
+    #[test]
+    fn selected_availability_reads_exact_registry_and_denial_is_not_absence() {
+        use bmux_plugin_sdk::typed_dispatch::{
+            SelectedServiceAvailability, ServiceAvailabilityKey,
+        };
+        let server = BmuxServer::new(IpcEndpoint::unix_socket(
+            std::env::temp_dir().join("bmux-availability-unit.sock"),
+        ));
+        let context = server.host_service_context();
+        let key = ServiceAvailabilityKey {
+            capability: "example.read".into(),
+            kind: bmux_plugin_sdk::ServiceKind::Query,
+            interface_id: "example/v1".into(),
+        };
+        assert_eq!(
+            context.selected_service_availability(&key).unwrap(),
+            SelectedServiceAvailability::Absent
+        );
+        server
+            .register_checked_service_handler_with_metadata(
+                "example.read",
+                bmux_ipc::InvokeServiceKind::Query,
+                "example/v1",
+                "*",
+                |_, _, _| async { anyhow::bail!("availability must not execute provider") },
+            )
+            .unwrap();
+        assert_eq!(
+            context.selected_service_availability(&key).unwrap(),
+            SelectedServiceAvailability::Present
+        );
+        let mut other = key.clone();
+        other.interface_id = "example/v2".into();
+        assert_eq!(
+            context.selected_service_availability(&other).unwrap(),
+            SelectedServiceAvailability::Absent
+        );
+        let local_id = ClientId::new();
+        let mut external = context;
+        external.host_internal = false;
+        external.client_id = local_id;
+        // An invalid principal/stream cannot distinguish present from absent.
+        assert!(external.selected_service_availability(&key).is_err());
+        assert!(external.selected_service_availability(&other).is_err());
+        let _origin = server
+            .state
+            .stream_provenance
+            .record(local_id.0, None)
+            .unwrap();
+        assert_eq!(
+            external.selected_service_availability(&key).unwrap(),
+            SelectedServiceAvailability::Present
+        );
+        server
+            .state
+            .private_admission_routes
+            .lock()
+            .unwrap()
+            .insert(ServiceRoute {
+                capability: key.capability.clone(),
+                kind: bmux_ipc::InvokeServiceKind::Query,
+                interface_id: key.interface_id.clone(),
+                operation: "*".into(),
+            });
+        assert!(external.selected_service_availability(&key).is_err());
     }
 
     #[test]

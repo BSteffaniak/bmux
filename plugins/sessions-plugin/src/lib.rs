@@ -1050,7 +1050,25 @@ fn option_value(arguments: &[String], long_name: &str) -> Option<String> {
         .find_map(|chunk| (chunk[0] == long_flag).then(|| chunk[1].clone()))
 }
 
-bmux_plugin_sdk::export_plugin!(SessionsPlugin, include_str!("../plugin.toml"));
+bmux_plugin_sdk::define_plugin!(
+    factory = |scope: bmux_plugin_sdk::definition::PluginCreateContext| {
+        Ok(std::sync::Arc::new(
+            bmux_plugin_sdk::definition::RustPluginAdapter::for_instance(
+                SessionsPlugin,
+                scope.instance,
+            ),
+        )
+            as std::sync::Arc<
+                dyn bmux_plugin_sdk::definition::PluginInstance,
+            >)
+    },
+    metadata = bmux_plugin_sdk::definition::PluginDefinition::from_rust_plugin::<SessionsPlugin>(
+        include_str!("../plugin.toml"),
+        vec![bmux_plugin_sdk::definition::ComponentRole::Backend],
+    )
+    .expect("embedded foundational declaration must be valid")
+    .metadata,
+);
 
 #[cfg(test)]
 mod tests {
@@ -1312,5 +1330,52 @@ mod tests {
         assert_eq!(decoded.selector.id, Some(id));
         assert_eq!(decoded.selector.name, None);
         assert!(decoded.can_write);
+    }
+}
+
+#[cfg(test)]
+mod definition_contract_tests {
+    #[test]
+    fn explicit_contract_versions_preserve_service_wire_routes() {
+        let definition = super::plugin_definition();
+        let manifest =
+            bmux_plugin::PluginManifest::from_toml_str(include_str!("../plugin.toml")).unwrap();
+        let canonical = bmux_plugin_sdk::definition::PluginDefinition::from_rust_plugin::<
+            super::SessionsPlugin,
+        >(
+            include_str!("../plugin.toml"),
+            vec![bmux_plugin_sdk::definition::ComponentRole::Backend],
+        )
+        .unwrap();
+        definition.validate().unwrap();
+        assert_eq!(definition.metadata, canonical.metadata);
+        assert_eq!(definition.metadata.plugin_id, manifest.id);
+        assert_eq!(definition.metadata.version, manifest.version);
+        assert_eq!(definition.metadata.roles, manifest.component_roles);
+        let declared: std::collections::BTreeSet<_> = manifest
+            .contracts
+            .iter()
+            .map(|contract| (&contract.interface_id, contract.major, contract.minor))
+            .collect();
+        let embedded: std::collections::BTreeSet<_> = definition
+            .metadata
+            .contracts
+            .iter()
+            .map(|contract| (&contract.interface_id, contract.major, contract.minor))
+            .collect();
+        assert_eq!(embedded, declared);
+        let mut services = definition.declarations().unwrap().services;
+        services.extend(
+            <super::SessionsPlugin as bmux_plugin_sdk::RustPlugin>::declared_services().unwrap(),
+        );
+        for service in services {
+            let contract = definition
+                .metadata
+                .contracts
+                .iter()
+                .find(|contract| contract.interface_id == service.interface_id)
+                .expect("every retained route requires explicit compatibility metadata");
+            assert_eq!((contract.major, contract.minor), (1, 0));
+        }
     }
 }

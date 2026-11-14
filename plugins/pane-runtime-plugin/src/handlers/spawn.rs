@@ -117,8 +117,27 @@ pub(super) fn authorize_session(
 pub(super) fn caller_provenance(
     ctx: &NativeServiceContext,
 ) -> Result<bmux_plugin::StreamOrigin, SpawnError> {
-    bmux_plugin::ServiceCaller::current_stream_origin(ctx).map_err(|error| SpawnError::Denied {
+    use bmux_clients_plugin_api::clients_identity::{self, StreamProvenance};
+    let denied = |error| SpawnError::Denied {
         reason: format!("trusted provenance unavailable: {error}"),
+    };
+    let mut client = bmux_plugin::ServiceCallerDispatchClient::new(ctx);
+    let provenance = bmux_plugin::block_on_typed_dispatch(
+        clients_identity::client::current_stream_provenance(&mut client),
+    )
+    .map_err(|error| denied(error.to_string()))?
+    .map_err(|error| denied(format!("{error:?}")))?;
+    Ok(match provenance {
+        StreamProvenance::HostInternal => bmux_plugin::StreamOrigin::HostInternal,
+        StreamProvenance::Local => bmux_plugin::StreamOrigin::Local,
+        StreamProvenance::Admitted {
+            subject_id,
+            lease_id,
+        } => bmux_plugin::StreamOrigin::Admitted {
+            subject_id,
+            lease_id,
+        },
+        StreamProvenance::Invalid => bmux_plugin::StreamOrigin::Invalid,
     })
 }
 

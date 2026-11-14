@@ -1,8 +1,4 @@
-use crate::{
-    auto_export_output_path, current_auto_export_settings, export,
-    publish_recording_export_completed, publish_recording_export_failed,
-    publish_recording_export_started, recordings_root_for_command,
-};
+use crate::{RecordingOwner, auto_export_output_path, export};
 use anyhow::{Context, Result};
 use bmux_ipc::{InvokeServiceKind, Request, Response, ResponsePayload};
 use bmux_plugin_sdk::{
@@ -225,30 +221,34 @@ fn flag_takes_value(name: &str) -> bool {
 }
 
 pub(crate) fn run_recording_command(
+    owner: &RecordingOwner,
     context: &NativeCommandContext,
 ) -> std::result::Result<i32, PluginCommandError> {
-    run_recording_command_inner(context)
+    run_recording_command_inner(owner, context)
         .map_err(|error| PluginCommandError::failed(error.to_string()))
 }
 
-fn run_recording_command_inner(context: &NativeCommandContext) -> Result<i32> {
+fn run_recording_command_inner(
+    owner: &RecordingOwner,
+    context: &NativeCommandContext,
+) -> Result<i32> {
     let args = ArgCursor::new(&context.arguments);
     match context.command.as_str() {
         "recording-start" => run_start(context, &args),
-        "recording-stop" => run_stop(context, &args),
-        "recording-status" => run_status(context, &args),
-        "recording-path" => run_path(context, &args),
-        "recording-list" => run_list(context, &args),
-        "recording-delete" => run_delete(context, &args),
-        "recording-delete-all" => run_delete_all(context, &args),
+        "recording-stop" => run_stop(owner, context, &args),
+        "recording-status" => run_status(owner, context, &args),
+        "recording-path" => run_path(owner, context, &args),
+        "recording-list" => run_list(owner, context, &args),
+        "recording-delete" => run_delete(owner, context, &args),
+        "recording-delete-all" => run_delete_all(owner, context, &args),
         "recording-cut" => run_cut(context, &args),
-        "recording-inspect" => run_inspect(context, &args),
-        "recording-analyze" => run_analyze(context, &args),
-        "recording-replay" => run_replay(context, &args),
-        "recording-verify-smoke" => run_verify_smoke(context, &args),
-        "recording-prune" => run_prune(context, &args),
+        "recording-inspect" => run_inspect(owner, context, &args),
+        "recording-analyze" => run_analyze(owner, context, &args),
+        "recording-replay" => run_replay(owner, context, &args),
+        "recording-verify-smoke" => run_verify_smoke(owner, context, &args),
+        "recording-prune" => run_prune(owner, context, &args),
         "server-recording" => run_server_recording(context),
-        "playbook-from-recording" => run_playbook_from_recording(context, &args),
+        "playbook-from-recording" => run_playbook_from_recording(owner, context, &args),
         _ => Err(anyhow::anyhow!(
             "unknown recording command '{}'",
             context.command
@@ -446,7 +446,11 @@ fn run_start(context: &NativeCommandContext, args: &ArgCursor<'_>) -> Result<i32
     Ok(0)
 }
 
-fn run_stop(context: &NativeCommandContext, args: &ArgCursor<'_>) -> Result<i32> {
+fn run_stop(
+    owner: &RecordingOwner,
+    context: &NativeCommandContext,
+    args: &ArgCursor<'_>,
+) -> Result<i32> {
     let recording_id = args
         .positional()
         .first()
@@ -462,23 +466,27 @@ fn run_stop(context: &NativeCommandContext, args: &ArgCursor<'_>) -> Result<i32>
         )?;
     let stopped_id = response.map_err(recording_plugin_error)?;
     println!("recording stopped: {stopped_id}");
-    maybe_auto_export_stopped_recording(context, stopped_id);
+    maybe_auto_export_stopped_recording(owner, context, stopped_id);
     Ok(0)
 }
 
-fn maybe_auto_export_stopped_recording(context: &NativeCommandContext, recording_id: Uuid) {
-    let settings = current_auto_export_settings(None);
+fn maybe_auto_export_stopped_recording(
+    owner: &RecordingOwner,
+    context: &NativeCommandContext,
+    recording_id: Uuid,
+) {
+    let settings = owner.current_auto_export_settings(None);
     if !settings.enabled {
         return;
     }
-    let Ok(root) = recordings_root_for_command(context) else {
+    let Ok(root) = owner.recordings_root_for_command(context) else {
         return;
     };
     let recording_dir = root.join(recording_id.to_string());
     let output_path =
         auto_export_output_path(&recording_dir, settings.output_dir.as_deref(), recording_id);
     let output = output_path.display().to_string();
-    publish_recording_export_started(recording_id, output.clone());
+    owner.publish_recording_export_started(recording_id, output.clone());
     match export::export_recording_gif_from_root(
         &root,
         &recording_id.to_string(),
@@ -486,18 +494,22 @@ fn maybe_auto_export_stopped_recording(context: &NativeCommandContext, recording
         settings.fps,
     ) {
         Ok(()) => {
-            publish_recording_export_completed(recording_id, output.clone());
+            owner.publish_recording_export_completed(recording_id, output.clone());
             println!("recording GIF exported: {output}");
         }
         Err(error) => {
             let reason = error.to_string();
-            publish_recording_export_failed(recording_id, output.clone(), reason.clone());
+            owner.publish_recording_export_failed(recording_id, output.clone(), reason.clone());
             eprintln!("bmux warning: recording auto-export failed: {reason}");
         }
     }
 }
 
-fn run_status(context: &NativeCommandContext, args: &ArgCursor<'_>) -> Result<i32> {
+fn run_status(
+    owner: &RecordingOwner,
+    context: &NativeCommandContext,
+    args: &ArgCursor<'_>,
+) -> Result<i32> {
     let json = args.has_flag("json");
     let runtime_status: RecordingStatus =
         match invoke_recording_service::<_, recording_types::RecordingStatus>(
@@ -513,7 +525,7 @@ fn run_status(context: &NativeCommandContext, args: &ArgCursor<'_>) -> Result<i3
                 queue_len: 0,
             },
         };
-    let root = recordings_root_for_command(context)?;
+    let root = owner.recordings_root_for_command(context)?;
     let usage = collect_recording_storage_usage(&root)?;
     if json {
         let payload = serde_json::json!({
@@ -558,8 +570,12 @@ fn run_status(context: &NativeCommandContext, args: &ArgCursor<'_>) -> Result<i3
     Ok(0)
 }
 
-fn run_path(context: &NativeCommandContext, args: &ArgCursor<'_>) -> Result<i32> {
-    let root = recordings_root_for_command(context)?;
+fn run_path(
+    owner: &RecordingOwner,
+    context: &NativeCommandContext,
+    args: &ArgCursor<'_>,
+) -> Result<i32> {
+    let root = owner.recordings_root_for_command(context)?;
     if args.has_flag("json") {
         println!(
             "{}",
@@ -572,6 +588,7 @@ fn run_path(context: &NativeCommandContext, args: &ArgCursor<'_>) -> Result<i32>
 }
 
 fn run_playbook_from_recording(
+    owner: &RecordingOwner,
     context: &NativeCommandContext,
     args: &ArgCursor<'_>,
 ) -> Result<i32> {
@@ -579,7 +596,7 @@ fn run_playbook_from_recording(
     let Some(recording_id) = positional.first() else {
         anyhow::bail!("playbook from-recording requires a recording id/name or unique prefix");
     };
-    let events = load_recording_events(context, recording_id)?;
+    let events = load_recording_events(owner, context, recording_id)?;
     let playbook_dsl = crate::from_recording::events_to_playbook(&events);
     if let Some(output) = args.option("output").or_else(|| args.short_option("o")) {
         std::fs::write(&output, playbook_dsl)
@@ -849,7 +866,11 @@ fn bool_flag_override(enabled: bool, disabled: bool, name: &str) -> Result<Optio
     })
 }
 
-fn run_list(context: &NativeCommandContext, args: &ArgCursor<'_>) -> Result<i32> {
+fn run_list(
+    owner: &RecordingOwner,
+    context: &NativeCommandContext,
+    args: &ArgCursor<'_>,
+) -> Result<i32> {
     let json = args.has_flag("json");
     let sort = args
         .option("sort")
@@ -881,7 +902,7 @@ fn run_list(context: &NativeCommandContext, args: &ArgCursor<'_>) -> Result<i32>
             &(),
         ) {
             Ok(recordings) => recordings.into_iter().map(Into::into).collect(),
-            Err(_) => list_recordings_from_dir(&recordings_root_for_command(context)?)?,
+            Err(_) => list_recordings_from_dir(&owner.recordings_root_for_command(context)?)?,
         };
     recordings = filter_recordings(recordings, status, query.as_deref());
     sort_recordings(&mut recordings, sort, order);
@@ -921,11 +942,15 @@ fn run_list(context: &NativeCommandContext, args: &ArgCursor<'_>) -> Result<i32>
     Ok(0)
 }
 
-fn run_delete(context: &NativeCommandContext, args: &ArgCursor<'_>) -> Result<i32> {
+fn run_delete(
+    owner: &RecordingOwner,
+    context: &NativeCommandContext,
+    args: &ArgCursor<'_>,
+) -> Result<i32> {
     let Some(raw) = args.positional().first().copied() else {
         anyhow::bail!("recording delete requires a recording id/name");
     };
-    let recordings = list_or_query_recordings(context)?;
+    let recordings = list_or_query_recordings(owner, context)?;
     let resolved = resolve_recording_id_prefix(raw, &recordings)?;
     if let Ok(response) =
         invoke_recording_service::<_, std::result::Result<Uuid, recording_types::RecordingError>>(
@@ -941,13 +966,17 @@ fn run_delete(context: &NativeCommandContext, args: &ArgCursor<'_>) -> Result<i3
         let deleted = response.map_err(recording_plugin_error)?;
         println!("deleted recording {deleted}");
     } else {
-        delete_recording_dir_at(&recordings_root_for_command(context)?, resolved)?;
+        delete_recording_dir_at(&owner.recordings_root_for_command(context)?, resolved)?;
         println!("deleted recording {resolved}");
     }
     Ok(0)
 }
 
-fn run_delete_all(context: &NativeCommandContext, args: &ArgCursor<'_>) -> Result<i32> {
+fn run_delete_all(
+    owner: &RecordingOwner,
+    context: &NativeCommandContext,
+    args: &ArgCursor<'_>,
+) -> Result<i32> {
     if !args.has_flag("yes") && !confirm_delete_all_recordings()? {
         println!("skipped recording delete-all");
         return Ok(0);
@@ -960,7 +989,7 @@ fn run_delete_all(context: &NativeCommandContext, args: &ArgCursor<'_>) -> Resul
         &(),
     ) {
         Ok(count) => usize::try_from(count).unwrap_or(usize::MAX),
-        Err(_) => delete_all_recordings_from_dir(&recordings_root_for_command(context)?)?,
+        Err(_) => delete_all_recordings_from_dir(&owner.recordings_root_for_command(context)?)?,
     };
     println!("deleted {deleted_count} recordings");
     Ok(0)
@@ -1051,7 +1080,11 @@ fn queue_cut_generated_and_wait(
         .map_err(|_| anyhow::anyhow!("recording cut worker thread panicked"))?
 }
 
-fn run_prune(context: &NativeCommandContext, args: &ArgCursor<'_>) -> Result<i32> {
+fn run_prune(
+    owner: &RecordingOwner,
+    context: &NativeCommandContext,
+    args: &ArgCursor<'_>,
+) -> Result<i32> {
     let older_than = args
         .u64_option("older-than")?
         .or(args.u64_option("older-than-days")?);
@@ -1067,7 +1100,7 @@ fn run_prune(context: &NativeCommandContext, args: &ArgCursor<'_>) -> Result<i32
     ) {
         Ok(count) => usize::try_from(count).unwrap_or(usize::MAX),
         Err(_) => crate::prune_old_recordings(
-            &recordings_root_for_command(context)?,
+            &owner.recordings_root_for_command(context)?,
             older_than.unwrap_or(30),
         )?,
     };
@@ -1087,14 +1120,18 @@ fn run_prune(context: &NativeCommandContext, args: &ArgCursor<'_>) -> Result<i32
     Ok(0)
 }
 
-fn run_inspect(context: &NativeCommandContext, args: &ArgCursor<'_>) -> Result<i32> {
+fn run_inspect(
+    owner: &RecordingOwner,
+    context: &NativeCommandContext,
+    args: &ArgCursor<'_>,
+) -> Result<i32> {
     let Some(recording_id) = args.positional().first().copied() else {
         anyhow::bail!("recording inspect requires a recording id/name");
     };
     let limit = args.usize_option("limit")?.unwrap_or(20).max(1);
     let kind = args.option("kind").map(|value| value.to_ascii_lowercase());
     let json = args.has_flag("json");
-    let events = load_recording_events(context, recording_id)?;
+    let events = load_recording_events(owner, context, recording_id)?;
     let filtered = events
         .into_iter()
         .filter(|event| {
@@ -1116,7 +1153,11 @@ fn run_inspect(context: &NativeCommandContext, args: &ArgCursor<'_>) -> Result<i
     Ok(0)
 }
 
-fn run_analyze(context: &NativeCommandContext, args: &ArgCursor<'_>) -> Result<i32> {
+fn run_analyze(
+    owner: &RecordingOwner,
+    context: &NativeCommandContext,
+    args: &ArgCursor<'_>,
+) -> Result<i32> {
     let Some(recording_id) = args.positional().first().copied() else {
         anyhow::bail!("recording analyze requires a recording id/name");
     };
@@ -1124,8 +1165,8 @@ fn run_analyze(context: &NativeCommandContext, args: &ArgCursor<'_>) -> Result<i
         anyhow::bail!("recording analyze currently supports only --perf");
     }
     let json = args.has_flag("json");
-    let summary = resolve_recording_summary(context, recording_id)?;
-    let events = load_recording_events(context, recording_id)?;
+    let summary = resolve_recording_summary(owner, context, recording_id)?;
+    let events = load_recording_events(owner, context, recording_id)?;
     let report = analyze_perf_events(&events, event_kinds_include_custom(&summary.event_kinds));
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
@@ -1135,7 +1176,11 @@ fn run_analyze(context: &NativeCommandContext, args: &ArgCursor<'_>) -> Result<i
     Ok(0)
 }
 
-fn run_replay(context: &NativeCommandContext, args: &ArgCursor<'_>) -> Result<i32> {
+fn run_replay(
+    owner: &RecordingOwner,
+    context: &NativeCommandContext,
+    args: &ArgCursor<'_>,
+) -> Result<i32> {
     let Some(recording_id) = args.positional().first().copied() else {
         anyhow::bail!("recording replay requires a recording id/name");
     };
@@ -1146,12 +1191,13 @@ fn run_replay(context: &NativeCommandContext, args: &ArgCursor<'_>) -> Result<i3
         .transpose()?
         .unwrap_or(ReplayMode::Watch);
     let speed = normalize_replay_speed(args.f64_option("speed")?.unwrap_or(1.0));
-    let events = load_recording_events(context, recording_id)?;
+    let events = load_recording_events(owner, context, recording_id)?;
     match mode {
         ReplayMode::Watch => replay_watch(&events, speed),
         ReplayMode::Interactive => replay_interactive(&events, speed),
         ReplayMode::Verify => {
             let report = verify_recording_report(
+                owner,
                 context,
                 &events,
                 args.option("compare-recording").as_deref(),
@@ -1168,12 +1214,17 @@ fn run_replay(context: &NativeCommandContext, args: &ArgCursor<'_>) -> Result<i3
     }
 }
 
-fn run_verify_smoke(context: &NativeCommandContext, args: &ArgCursor<'_>) -> Result<i32> {
+fn run_verify_smoke(
+    owner: &RecordingOwner,
+    context: &NativeCommandContext,
+    args: &ArgCursor<'_>,
+) -> Result<i32> {
     let Some(recording_id) = args.positional().first().copied() else {
         anyhow::bail!("recording verify-smoke requires a recording id/name");
     };
-    let events = load_recording_events(context, recording_id)?;
+    let events = load_recording_events(owner, context, recording_id)?;
     let report = verify_recording_report(
+        owner,
         context,
         &events,
         args.option("compare-recording").as_deref(),
@@ -1479,7 +1530,10 @@ fn list_recordings_from_dir(recordings_root: &Path) -> Result<Vec<RecordingSumma
     Ok(recordings)
 }
 
-fn list_or_query_recordings(context: &NativeCommandContext) -> Result<Vec<RecordingSummary>> {
+fn list_or_query_recordings(
+    owner: &RecordingOwner,
+    context: &NativeCommandContext,
+) -> Result<Vec<RecordingSummary>> {
     match invoke_recording_service::<_, Vec<recording_types::RecordingSummary>>(
         context,
         "bmux.recording.read",
@@ -1488,15 +1542,16 @@ fn list_or_query_recordings(context: &NativeCommandContext) -> Result<Vec<Record
         &(),
     ) {
         Ok(recordings) => Ok(recordings.into_iter().map(Into::into).collect()),
-        Err(_) => list_recordings_from_dir(&recordings_root_for_command(context)?),
+        Err(_) => list_recordings_from_dir(&owner.recordings_root_for_command(context)?),
     }
 }
 
 fn resolve_recording_summary(
+    owner: &RecordingOwner,
     context: &NativeCommandContext,
     recording_id: &str,
 ) -> Result<RecordingSummary> {
-    let recordings = list_or_query_recordings(context)?;
+    let recordings = list_or_query_recordings(owner, context)?;
     let id = resolve_recording_id_prefix(recording_id, &recordings)?;
     recordings
         .into_iter()
@@ -1505,12 +1560,15 @@ fn resolve_recording_summary(
 }
 
 fn load_recording_events(
+    owner: &RecordingOwner,
     context: &NativeCommandContext,
     recording_id: &str,
 ) -> Result<Vec<RecordingEventEnvelope>> {
-    let recordings = list_or_query_recordings(context)?;
+    let recordings = list_or_query_recordings(owner, context)?;
     let id = resolve_recording_id_prefix(recording_id, &recordings)?;
-    let recording_dir = recordings_root_for_command(context)?.join(id.to_string());
+    let recording_dir = owner
+        .recordings_root_for_command(context)?
+        .join(id.to_string());
     let manifest_path = recording_dir.join("manifest.json");
     let segments = if manifest_path.exists() {
         let manifest_bytes = std::fs::read(&manifest_path)
@@ -1969,6 +2027,7 @@ struct VerifySmokeReport {
 }
 
 fn verify_recording_report(
+    owner: &RecordingOwner,
     context: &NativeCommandContext,
     baseline: &[RecordingEventEnvelope],
     compare_recording: Option<&str>,
@@ -1977,7 +2036,7 @@ fn verify_recording_report(
     let ignore_rules = parse_ignore_rules(ignore);
     let baseline_filtered = apply_ignore_rules(baseline, &ignore_rules);
     if let Some(other_id) = compare_recording {
-        let other = load_recording_events(context, other_id)?;
+        let other = load_recording_events(owner, context, other_id)?;
         let other_filtered = apply_ignore_rules(&other, &ignore_rules);
         let mismatch = baseline_filtered
             .iter()

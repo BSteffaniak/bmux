@@ -200,22 +200,95 @@ mod tests {
         );
     }
 
-    #[test]
-    fn selection_policy_denial_and_failure_are_not_missing_provider_fallback() {
-        struct PolicyHost(u8);
+    mod selection_policy_tests {
+        use super::*;
+        use bmux_plugin::StreamOrigin;
+        use bmux_plugin_sdk::typed_dispatch::{
+            SelectedServiceAvailability, ServiceAvailabilityKey,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct PolicyHost {
+            mode: u8,
+            origin: Option<StreamOrigin>,
+            calls: AtomicUsize,
+        }
         impl bmux_plugin::ServiceCaller for PolicyHost {
+            fn selected_service_availability(
+                &self,
+                key: ServiceAvailabilityKey,
+            ) -> bmux_plugin_sdk::definition::PluginFuture<
+                '_,
+                bmux_plugin_sdk::Result<SelectedServiceAvailability>,
+            > {
+                use bmux_plugin_sdk::TypedServiceEndpoint;
+
+                let descriptor = bmux_permissions_plugin_api::session_policy_state::client::CheckEndpoint::service_descriptor();
+                assert_eq!(key.capability, descriptor.capability.to_string());
+                assert_eq!(key.kind, descriptor.kind);
+                assert_eq!(key.interface_id, descriptor.interface_id.to_string());
+                Box::pin(async move {
+                    match self.mode {
+                        0 => Ok(SelectedServiceAvailability::Absent),
+                        6 => Err(bmux_plugin_sdk::PluginError::UnsupportedHostOperation {
+                            operation: "selected_service_availability",
+                        }),
+                        7 => Err(bmux_plugin_sdk::PluginError::ServiceProtocol {
+                            details: "selected registry unavailable".into(),
+                        }),
+                        _ => Ok(SelectedServiceAvailability::Present),
+                    }
+                })
+            }
+
+            fn current_stream_origin(&self) -> bmux_plugin_sdk::Result<StreamOrigin> {
+                self.origin
+                    .clone()
+                    .ok_or_else(|| bmux_plugin_sdk::PluginError::ServiceProtocol {
+                        details: "trusted origin unavailable".into(),
+                    })
+            }
+
             fn call_service_raw(
                 &self,
-                _: &str,
-                _: bmux_plugin_sdk::ServiceKind,
-                _: &str,
-                _: &str,
-                _: Vec<u8>,
+                capability: &str,
+                kind: bmux_plugin_sdk::ServiceKind,
+                interface: &str,
+                operation: &str,
+                payload: Vec<u8>,
             ) -> bmux_plugin_sdk::Result<Vec<u8>> {
-                match self.0 {
-                    0 => Err(bmux_plugin_sdk::PluginError::UnsupportedHostOperation { operation: "call_service" }),
-                    1 => bmux_plugin_sdk::encode_service_message(&bmux_permissions_plugin_api::session_policy_state::SessionPolicyCheckResponse { allowed: false, reason: Some("denied".into()) }),
-                    _ => Err(bmux_plugin_sdk::PluginError::ServiceProtocol { details: "policy storage failed".into() }),
+                use bmux_plugin_sdk::PluginContract;
+
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(capability, "bmux.sessions.policy");
+                assert_eq!(kind, bmux_plugin_sdk::ServiceKind::Query);
+                assert_eq!(interface, "session-policy-state");
+                assert_eq!(operation, "check");
+                bmux_plugin_sdk::service_contract::decode_for(
+                    interface,
+                    bmux_permissions_plugin_api::Contract::service_contract_for(interface).unwrap(),
+                    &payload,
+                )?;
+                match self.mode {
+                    1 | 3 => {
+                        let response = bmux_plugin_sdk::encode_service_message(
+                            &bmux_permissions_plugin_api::session_policy_state::SessionPolicyCheckResponse {
+                                allowed: self.mode == 3,
+                                reason: Some("policy decision".into()),
+                            },
+                        )?;
+                        Ok(bmux_plugin_sdk::service_contract::encode_response(
+                            &response,
+                        ))
+                    }
+                    2 => Err(bmux_plugin_sdk::PluginError::ServiceProtocol {
+                        details: "policy storage failed".into(),
+                    }),
+                    4 => Ok(b"corrupt checked policy response".to_vec()),
+                    5 => Err(bmux_plugin_sdk::PluginError::UnsupportedHostOperation {
+                        operation: "call_service",
+                    }),
+                    _ => panic!("policy must not be invoked without proven presence"),
                 }
             }
             fn execute_kernel_request(
@@ -225,11 +298,46 @@ mod tests {
                 panic!("policy must use typed services")
             }
         }
-        let client = Uuid::from_u128(1);
-        let session = Uuid::from_u128(2);
-        assert!(crate::authorize_selection(&PolicyHost(0), client, None, session).is_ok());
-        assert!(crate::authorize_selection(&PolicyHost(1), client, None, session).is_err());
-        assert!(crate::authorize_selection(&PolicyHost(2), client, None, session).is_err());
+        #[test]
+        fn optional_policy_requires_proven_absence_and_trusted_local_origin() {
+            let client = Uuid::from_u128(1);
+            let session = Uuid::from_u128(2);
+            let check = |mode, origin, allowed, calls| {
+                let host = PolicyHost {
+                    mode,
+                    origin,
+                    calls: AtomicUsize::new(0),
+                };
+                assert_eq!(
+                    crate::authorize_selection(&host, client, None, session).is_ok(),
+                    allowed,
+                );
+                assert_eq!(host.calls.load(Ordering::SeqCst), calls);
+            };
+            // Proven absence allows only independently trusted local callers.
+            check(0, Some(StreamOrigin::Local), true, 0);
+            for origin in [
+                None,
+                Some(StreamOrigin::Invalid),
+                Some(StreamOrigin::HostInternal),
+                Some(StreamOrigin::Admitted {
+                    subject_id: Uuid::from_u128(3),
+                    lease_id: Uuid::from_u128(4),
+                }),
+            ] {
+                check(0, origin, false, 0);
+            }
+            // Advertised denial, storage failure, corrupt response and unsupported
+            // dispatch never become the optional-provider fallback.
+            for mode in [1, 2, 4, 5] {
+                check(mode, Some(StreamOrigin::Local), false, 1);
+            }
+            check(3, Some(StreamOrigin::Local), true, 1);
+            // Unsupported negotiation and failed lookup are not absence.
+            for mode in [6, 7] {
+                check(mode, Some(StreamOrigin::Local), false, 0);
+            }
+        }
     }
 
     #[test]

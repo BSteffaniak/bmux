@@ -24,6 +24,7 @@ bmux_keyboard = { workspace = true }
 bmux_mermaid_render = { workspace = true }
 bmux_playbook = { workspace = true }
 bmux_playbook_plugin_api = { workspace = true }
+bmux_plugin = { workspace = true }
 bmux_plugin_sdk = { workspace = true }
 bmux_presenter = { workspace = true }
 bmux_presenter_plugin_api = { workspace = true }
@@ -90,7 +91,6 @@ uuid = { workspace = true, features = ["v4"] }
 # Paused-time capture tests must also compile outside workspace feature unification.
 bmux_cli_schema = { workspace = true }
 bmux_ipc        = { workspace = true }
-bmux_plugin     = { workspace = true }
 clap            = { workspace = true }
 tokio           = { workspace = true, features = ["test-util"] }
 ttf-parser      = { workspace = true }
@@ -106,6 +106,7 @@ fail-on-warnings = [
     "bmux_mermaid_render/fail-on-warnings",
     "bmux_playbook/fail-on-warnings",
     "bmux_playbook_plugin_api/fail-on-warnings",
+    "bmux_plugin/fail-on-warnings",
     "bmux_plugin_sdk/fail-on-warnings",
     "bmux_presenter/fail-on-warnings",
     "bmux_presenter_plugin_api/fail-on-warnings",

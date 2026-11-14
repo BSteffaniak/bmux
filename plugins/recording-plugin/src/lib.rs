@@ -15,6 +15,9 @@
 #![warn(clippy::all, clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
 
+mod activation_binding;
+pub use activation_binding::definition as plugin_definition_with_activation_configuration;
+
 mod commands;
 mod durable;
 mod export;
@@ -25,11 +28,13 @@ mod platform;
 mod process_artifacts;
 mod process_bootstrap;
 mod process_commands;
+mod process_dispatch;
 mod process_display;
 mod process_live_presentation;
 mod process_runtime;
 mod process_store;
 pub mod recording_runtime;
+mod services;
 pub use recording_runtime::{
     RecordingCutError, RecordingRuntime, cut_missing_active_recording_dir, execute_recording_cut,
     prune_old_recordings,
@@ -37,10 +42,7 @@ pub use recording_runtime::{
 
 use bmux_plugin::global_plugin_state_registry;
 use bmux_plugin_sdk::prelude::*;
-use bmux_plugin_sdk::{
-    HostScope, ProviderId, RegisteredService, ServiceKind, ServiceRequest,
-    TypedServiceRegistrationContext, TypedServiceRegistry,
-};
+use bmux_plugin_sdk::{TypedServiceRegistrationContext, TypedServiceRegistry};
 use bmux_recording_plugin_api::{
     ManualRecordingStartOptions, RecordingPluginConfig, recording_events, recording_types,
 };
@@ -54,7 +56,7 @@ use bmux_recording_runtime::{
 };
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 type RecordingPayload = ProtocolRecordingPayload<bmux_ipc::Event, bmux_ipc::ErrorCode>;
 
@@ -67,18 +69,6 @@ pub struct ManualRecordingRuntimeHandle(pub Arc<Mutex<RecordingRuntime>>);
 /// handle in [`bmux_plugin::PluginStateRegistry`]. The inner option
 /// is `None` when rolling recording is disabled in config.
 pub struct RollingRecordingRuntimeHandle(pub Arc<Mutex<Option<RecordingRuntime>>>);
-
-static CUT_FILESYSTEM_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-static RECORDING_JOBS: OnceLock<Mutex<BTreeMap<uuid::Uuid, recording_types::RecordingJob>>> =
-    OnceLock::new();
-
-fn cut_filesystem_lock() -> &'static Mutex<()> {
-    CUT_FILESYSTEM_LOCK.get_or_init(|| Mutex::new(()))
-}
-
-fn recording_jobs() -> &'static Mutex<BTreeMap<uuid::Uuid, recording_types::RecordingJob>> {
-    RECORDING_JOBS.get_or_init(|| Mutex::new(BTreeMap::new()))
-}
 
 #[derive(Debug, Clone, serde::Deserialize)]
 struct StartRequest {
@@ -194,7 +184,50 @@ impl RecordingSink for DualRuntimeSink {
 }
 
 #[derive(Default)]
-pub struct RecordingPlugin;
+pub struct RecordingPlugin {
+    owner: RwLock<Option<RecordingOwner>>,
+    // A selected scoped definition supplies this slot. None is legacy wiring;
+    // Some(empty) is explicitly unbound and must never select global state.
+    binding: Option<Arc<RwLock<Option<RecordingActivationConfiguration>>>>,
+}
+
+/// Product configuration selected through the actual lifecycle host port.
+/// The host owns config resolution; the plugin owns recording construction.
+#[derive(Clone)]
+pub struct RecordingActivationConfiguration {
+    /// Absolute recording roots and product-owned recording policy.
+    pub config: RecordingPluginConfig,
+    /// Actual sink registration and recording event authority for this activation.
+    pub host: Arc<dyn RecordingHost>,
+    /// Required on scoped definitions. None is reserved for legacy registration.
+    /// The host must supply a caller backed by a real bound service port.
+    pub process_caller: Option<Arc<bmux_plugin::TypedServiceCaller>>,
+}
+
+impl RecordingPlugin {
+    fn configuration(&self) -> Result<RecordingActivationConfiguration, PluginCommandError> {
+        if let Some(binding) = &self.binding {
+            return binding
+                .read()
+                .map_err(|_| PluginCommandError::failed("recording configuration poisoned"))?
+                .clone()
+                .ok_or_else(|| {
+                    PluginCommandError::unavailable("recording activation configuration not bound")
+                });
+        }
+        let config = config_handle()
+            .ok_or_else(|| PluginCommandError::unavailable("recording configuration missing"))?;
+        let config = config
+            .read()
+            .map_err(|_| PluginCommandError::failed("recording configuration poisoned"))?
+            .clone();
+        Ok(RecordingActivationConfiguration {
+            config,
+            host: Arc::new(LegacyRecordingHost),
+            process_caller: None,
+        })
+    }
+}
 
 impl RustPlugin for RecordingPlugin {
     type Contract = bmux_recording_plugin_api::Contract;
@@ -211,80 +244,26 @@ impl RustPlugin for RecordingPlugin {
         &mut self,
         _context: NativeLifecycleContext,
     ) -> std::result::Result<i32, PluginCommandError> {
-        // Read CLI-provided plugin config; silently succeed without
-        // constructing runtimes when missing so headless / test
-        // deployments still load the plugin.
-        let Some(config_handle) = global_plugin_state_registry().get::<RecordingPluginConfig>()
-        else {
-            return Ok(bmux_plugin_sdk::EXIT_OK);
-        };
-        bmux_plugin::global_event_bus()
-            .register_channel::<recording_events::RecordingEvent>(recording_events::EVENT_KIND);
-        let Ok(config) = config_handle.read() else {
-            return Ok(bmux_plugin_sdk::EXIT_OK);
-        };
-
-        let recordings_dir = config.recordings_dir.clone();
-        let rolling_recordings_dir = config.rolling_recordings_dir.clone();
-        let rolling_segment_mb = config.rolling_segment_mb;
-        let retention_days = config.retention_days;
-        let rolling_defaults = config.rolling_defaults.clone();
-        let rolling_auto_start = config.rolling_auto_start;
-        let startup_recording = config.startup_recording.clone();
-        drop(config);
-
-        let manual_runtime = Arc::new(Mutex::new(RecordingRuntime::new(
-            recordings_dir,
-            rolling_segment_mb,
-            retention_days,
-        )));
-
-        let rolling_runtime_available = rolling_defaults.is_available();
-        let rolling_runtime = Arc::new(Mutex::new(if rolling_runtime_available {
-            Some(RecordingRuntime::new_rolling(
-                rolling_recordings_dir.clone(),
-                rolling_segment_mb,
-                rolling_defaults.window_secs,
-            ))
-        } else {
-            None
-        }));
-
-        // Register the fan-out sink first so server can hot-path
-        // record as soon as its first pane event fires.
-        let sink: Arc<dyn RecordingSink> = Arc::new(DualRuntimeSink {
-            manual: Arc::clone(&manual_runtime),
-            rolling: Arc::clone(&rolling_runtime),
-        });
-        let sink_handle = Arc::new(RwLock::new(RecordingSinkHandle::from_arc(sink)));
-        global_plugin_state_registry().register::<RecordingSinkHandle>(&sink_handle);
-
-        // Register the lifecycle handles the plugin's own typed
-        // handlers read on every request.
-        let manual_handle = Arc::new(RwLock::new(ManualRecordingRuntimeHandle(Arc::clone(
-            &manual_runtime,
-        ))));
-        global_plugin_state_registry().register::<ManualRecordingRuntimeHandle>(&manual_handle);
-
-        let rolling_handle = Arc::new(RwLock::new(RollingRecordingRuntimeHandle(Arc::clone(
-            &rolling_runtime,
-        ))));
-        global_plugin_state_registry().register::<RollingRecordingRuntimeHandle>(&rolling_handle);
-
-        if let Some(options) = startup_recording.as_ref() {
-            auto_start_manual(&manual_runtime, options);
-        }
-
-        // Hourly prune loop. Runs on a bare OS thread (plugin
-        // activation can't assume a tokio runtime; bundled-rlib and
-        // dynamic-cdylib hosts both spawn threads the same way).
-        spawn_prune_loop(Arc::clone(&manual_runtime));
-
-        // Optional auto-start of the rolling recording.
-        if rolling_auto_start && rolling_runtime_available {
-            auto_start_rolling(&rolling_runtime, &rolling_defaults);
-        }
-
+        let binding = self.configuration()?;
+        let config = binding.config;
+        let mut selected = self
+            .owner
+            .write()
+            .map_err(|_| PluginCommandError::failed("recording owner poisoned"))?;
+        let owner = selected.get_or_insert_with(|| RecordingOwner::new(binding.host, config));
+        owner.activate_owner()?;
+        Ok(bmux_plugin_sdk::EXIT_OK)
+    }
+    fn deactivate(&mut self, _context: NativeLifecycleContext) -> Result<i32, PluginCommandError> {
+        let mut owner = self
+            .owner
+            .write()
+            .map_err(|_| PluginCommandError::failed("recording owner poisoned"))?;
+        owner
+            .as_ref()
+            .ok_or_else(|| PluginCommandError::unavailable("recording inactive"))?
+            .deactivate_owner()?;
+        *owner = None;
         Ok(bmux_plugin_sdk::EXIT_OK)
     }
 
@@ -298,167 +277,32 @@ impl RustPlugin for RecordingPlugin {
         if context.command.starts_with("recording-process-") {
             return Ok(process_commands::run(&context));
         }
+        let owner = self
+            .owner
+            .read()
+            .map_err(|_| PluginCommandError::failed("recording owner poisoned"))?
+            .clone()
+            .ok_or_else(|| PluginCommandError::unavailable("recording inactive"))?;
         if should_queue_recording_cut_for_non_cli(&context) {
-            return run_recording_cut_command_queued(&context);
+            return owner.run_recording_cut_command_queued(&context);
         }
         if context.command == "recording-export" {
-            return run_recording_export_command(&context);
+            return owner.run_recording_export_command(&context);
         }
-        commands::run_recording_command(&context)
+        commands::run_recording_command(&owner, &context)
     }
 
     // Keep generated interface routing together so each operation retains one
     // auditable typed dispatch boundary; splitting the route obscures fallback.
     #[allow(clippy::too_many_lines)]
     fn invoke_service(&self, context: NativeServiceContext) -> ServiceResponse {
-        use bmux_recording_plugin_api::recording_process_presentation_v1::RecordingProcessPresentationV1Service;
-        use bmux_recording_plugin_api::recording_process_v4::{
-            self as process, RecordingProcessV4Service,
-        };
-        bmux_plugin_sdk::route_service!(context, {
-            "recording-process-live-presentation-v1", "capabilities" => |_req: (), ctx| {
-                process_runtime::dispatch(ctx, move |service| Box::pin(async move { service.live_capabilities().await })).and_then(|value| value).map_err(|error| ServiceResponse::error("process_dispatch", error.to_string()))
+        match self.owner.read() {
+            Ok(owner) => match owner.as_ref() {
+                Some(owner) => owner.service(&context),
+                None => ServiceResponse::error("recording_unavailable", "recording inactive"),
             },
-            "recording-process-live-presentation-v1", "read" => |req: bmux_recording_plugin_api::recording_process_live_presentation_v1::client::ReadRequest, ctx| {
-                process_runtime::dispatch(ctx, move |service| Box::pin(async move { service.live_read(req.run_id, req.after, req.max_bytes).await })).map_err(|error| ServiceResponse::error("process_dispatch", error.to_string()))
-            },
-            "recording-process-live-presentation-v1", "wait-present" => |req: bmux_recording_plugin_api::recording_process_live_presentation_v1::client::WaitPresentRequest, ctx| {
-                process_runtime::dispatch(ctx, move |service| Box::pin(async move { service.live_wait_present(req.run_id, req.after, req.timeout_ms, req.max_bytes).await })).map_err(|error| ServiceResponse::error("process_dispatch", error.to_string()))
-            },
-            "recording-process-human-input-v1", "capabilities" => |_req: (), ctx| {
-                process_runtime::dispatch(ctx, move |service| Box::pin(async move { service.human_capabilities().await })).and_then(|value| value).map_err(|error| ServiceResponse::error("process_dispatch", error.to_string()))
-            },
-            "recording-process-human-input-v1", "open" => |req: bmux_recording_plugin_api::recording_process_human_input_v1::client::OpenRequest, ctx| {
-                process_runtime::dispatch(ctx, move |service| Box::pin(async move { service.human_open(req.run_id).await })).map_err(|error| ServiceResponse::error("process_dispatch", error.to_string()))
-            },
-            "recording-process-human-input-v1", "push" => |req: bmux_recording_plugin_api::recording_process_human_input_v1::client::PushRequest, ctx| {
-                process_runtime::dispatch(ctx, move |service| Box::pin(async move { service.human_push(req.run_id, req.stream, req.sequence, req.data).await })).map_err(|error| ServiceResponse::error("process_dispatch", error.to_string()))
-            },
-            "recording-process-human-input-v1", "close" => |req: bmux_recording_plugin_api::recording_process_human_input_v1::client::CloseRequest, ctx| {
-                process_runtime::dispatch(ctx, move |service| Box::pin(async move { service.human_close(req.run_id, req.stream).await })).map_err(|error| ServiceResponse::error("process_dispatch", error.to_string()))
-            },
-            "recording-process-presentation-wait-v1", "capabilities" => |_req: (), ctx| {
-                process_runtime::dispatch(ctx, move |service| Box::pin(async move { service.wait_capabilities().await })).and_then(|value| value).map_err(|error| ServiceResponse::error("process_dispatch", error.to_string()))
-            },
-            "recording-process-presentation-wait-v1", "wait-present" => |req: bmux_recording_plugin_api::recording_process_presentation_wait_v1::client::WaitPresentRequest, ctx| {
-                process_runtime::dispatch(ctx, move |service| Box::pin(async move { service.wait_present(req.run_id, req.after, req.timeout_ms, req.max_bytes).await })).map_err(|error| ServiceResponse::error("process_dispatch", error.to_string()))
-            },
-            "recording-process-presentation-v1", "capabilities" => |_req: (), ctx| {
-                process_runtime::dispatch(ctx, move |service| Box::pin(async move { service.capabilities().await })).map_err(|error| ServiceResponse::error("process_dispatch", error.to_string()))
-            },
-            "recording-process-presentation-v1", "resize" => |req: bmux_recording_plugin_api::recording_process_presentation_v1::client::ResizeRequest, ctx| {
-                process_runtime::dispatch(ctx, move |service| Box::pin(async move { service.resize(req.run_id, req.format, req.cols, req.rows).await })).map_err(|error| ServiceResponse::error("process_dispatch", error.to_string()))
-            },
-            "recording-process-presentation-v1", "present" => |req: bmux_recording_plugin_api::recording_process_presentation_v1::client::PresentRequest, ctx| {
-                process_runtime::dispatch(ctx, move |service| Box::pin(async move { service.present(req.run_id).await })).map_err(|error| ServiceResponse::error("process_dispatch", error.to_string()))
-            },
-            "recording-process-environment-v1", "capabilities" => |_req: (), ctx| {
-                process_runtime::dispatch(ctx, move |service| Box::pin(async move { service.environment_capabilities().await })).and_then(|value| value).map_err(|error| ServiceResponse::error("process_dispatch", error.to_string()))
-            },
-            "recording-process-environment-v1", "start" => |req: bmux_recording_plugin_api::recording_process_environment_v1::client::StartRequest, ctx| {
-                process_runtime::dispatch(ctx, move |service| Box::pin(async move { service.start_environment(req.launch_mutation_id, req.options, req.environment).await.map_err(|error| process::ProcessError::OperationFailed { reason: error.to_string() }) })).map_err(|error| ServiceResponse::error("process_dispatch", error.to_string()))
-            },
-            "recording-process-v4", "start" => |req: process::client::StartRequest, ctx| {
-                process_runtime::dispatch(ctx, move |service| Box::pin(async move { service.start(req.run_id, req.launch_mutation_id, req.options, req.runtime_root).await })).map_err(|error| ServiceResponse::error("process_dispatch", error.to_string()))
-            },
-            "recording-process-v4", "reconcile" => |req: process::client::ReconcileRequest, ctx| {
-                process_runtime::dispatch(ctx, move |service| Box::pin(async move { service.reconcile(req.run_id).await })).map_err(|error| ServiceResponse::error("process_dispatch", error.to_string()))
-            },
-            "recording-process-v4", "status" => |req: process::client::StatusRequest, ctx| {
-                process_runtime::dispatch(ctx, move |service| Box::pin(async move { service.status(req.run_id).await })).map_err(|error| ServiceResponse::error("process_dispatch", error.to_string()))
-            },
-            "recording-process-v4", "read" => |req: process::client::ReadRequest, ctx| {
-                process_runtime::dispatch(ctx, move |service| Box::pin(async move { service.read(req.run_id, req.since, req.max_bytes).await })).map_err(|error| ServiceResponse::error("process_dispatch", error.to_string()))
-            },
-            "recording-process-v4", "screen" => |req: process::client::ScreenRequest, ctx| {
-                process_runtime::dispatch(ctx, move |service| Box::pin(async move { service.screen(req.run_id).await })).map_err(|error| ServiceResponse::error("process_dispatch", error.to_string()))
-            },
-            "recording-process-v4", "send" => |req: process::client::SendRequest, ctx| {
-                process_runtime::dispatch(ctx, move |service| Box::pin(async move { service.send(req.run_id, req.data, req.mutation_id).await })).map_err(|error| ServiceResponse::error("process_dispatch", error.to_string()))
-            },
-            "recording-process-v4", "input_receipt" => |req: process::client::InputReceiptRequest, ctx| {
-                process_runtime::dispatch(ctx, move |service| Box::pin(async move { service.input_receipt(req.run_id, req.mutation_id).await })).map_err(|error| ServiceResponse::error("process_dispatch", error.to_string()))
-            },
-            "recording-process-v4", "resolve" => |req: process::client::ResolveRequest, ctx| {
-                process_runtime::dispatch(ctx, move |service| Box::pin(async move { service.resolve(req.run_id, req.mutation_id, req.expected_revision, req.action, req.input_mutation_id, req.grace_ms).await })).map_err(|error| ServiceResponse::error("process_dispatch", error.to_string()))
-            },
-            "recording-process-v4", "wait" => |req: process::client::WaitRequest, ctx| {
-                process_runtime::dispatch(ctx, move |service| Box::pin(async move { service.wait(req.run_id, req.timeout_ms).await })).map_err(|error| ServiceResponse::error("process_dispatch", error.to_string()))
-            },
-            "recording-process-v4", "terminate" => |req: process::client::TerminateRequest, ctx| {
-                process_runtime::dispatch(ctx, move |service| Box::pin(async move { service.terminate(req.run_id, req.grace_ms).await })).map_err(|error| ServiceResponse::error("process_dispatch", error.to_string()))
-            },
-            "recording-process-v4", "finish" => |req: process::client::FinishRequest, ctx| {
-                process_runtime::dispatch(ctx, move |service| Box::pin(async move { service.finish(req.run_id, req.expected_revision, req.terminate_running).await })).map_err(|error| ServiceResponse::error("process_dispatch", error.to_string()))
-            },
-            "recording-state", "status" => |_req: (), _ctx| {
-                Ok::<recording_types::RecordingStatus, ServiceResponse>(recording_status_generated())
-            },
-            "recording-state", "list-recordings" => |_req: (), _ctx| {
-                Ok::<Vec<recording_types::RecordingSummary>, ServiceResponse>(recording_list_generated())
-            },
-            "recording-state", "rolling-status" => |_req: (), _ctx| {
-                Ok::<recording_types::RecordingRollingStatus, ServiceResponse>(recording_rolling_status_generated())
-            },
-            "recording-state", "capture-targets" => |_req: (), _ctx| {
-                Ok::<Vec<recording_types::RecordingCaptureTarget>, ServiceResponse>(recording_capture_targets_generated())
-            },
-            "recording-state", "job-status" => |req: JobStatusRequest, _ctx| {
-                Ok::<Option<recording_types::RecordingJob>, ServiceResponse>(recording_job_status_generated(req.job_id))
-            },
-            "recording-state", "list-jobs" => |_req: (), _ctx| {
-                Ok::<Vec<recording_types::RecordingJob>, ServiceResponse>(recording_list_jobs_generated())
-            },
-            "recording-commands", "start" => |req: StartRequest, _ctx| {
-                Ok::<Result<recording_types::RecordingSummary, recording_types::RecordingError>, ServiceResponse>(
-                    recording_start_generated(req),
-                )
-            },
-            "recording-commands", "stop" => |req: StopRequest, _ctx| {
-                Ok::<Result<uuid::Uuid, recording_types::RecordingError>, ServiceResponse>(
-                    recording_stop_generated(req.recording_id),
-                )
-            },
-            "recording-commands", "write-custom-event" => |req: WriteCustomEventRequest, _ctx| {
-                Ok::<Result<(), recording_types::RecordingError>, ServiceResponse>(
-                    recording_write_custom_event_generated(req),
-                )
-            },
-            "recording-commands", "delete" => |req: DeleteRequest, _ctx| {
-                Ok::<Result<uuid::Uuid, recording_types::RecordingError>, ServiceResponse>(
-                    recording_delete_generated(req.recording_id),
-                )
-            },
-            "recording-commands", "delete-all" => |_req: (), _ctx| {
-                Ok::<u64, ServiceResponse>(recording_delete_all_generated())
-            },
-            "recording-commands", "cut" => |req: CutRequest, _ctx| {
-                Ok::<Result<recording_types::RecordingSummary, recording_types::RecordingError>, ServiceResponse>(
-                    recording_cut_generated(req),
-                )
-            },
-            "recording-commands", "queue-cut" => |req: QueueCutRequest, ctx| {
-                recording_queue_cut_generated(req, ctx).map_err(|error| recording_error_response(&error))
-            },
-            "recording-commands", "rolling-start" => |req: RollingStartRequest, _ctx| {
-                Ok::<Result<recording_types::RecordingSummary, recording_types::RecordingError>, ServiceResponse>(
-                    recording_rolling_start_generated(req.options),
-                )
-            },
-            "recording-commands", "rolling-stop" => |_req: (), _ctx| {
-                Ok::<Result<uuid::Uuid, recording_types::RecordingError>, ServiceResponse>(
-                    recording_rolling_stop_generated(),
-                )
-            },
-            "recording-commands", "rolling-clear" => |req: RollingClearRequest, _ctx| {
-                Ok::<recording_types::RecordingRollingClearReport, ServiceResponse>(
-                    recording_rolling_clear_generated(req.restart_if_active),
-                )
-            },
-            "recording-commands", "prune" => |req: PruneRequest, _ctx| {
-                Ok::<u64, ServiceResponse>(recording_prune_generated(req.older_than_days))
-            },
-        })
+            Err(_) => ServiceResponse::error("recording_unavailable", "recording owner poisoned"),
+        }
     }
 
     fn register_typed_services(
@@ -466,12 +310,25 @@ impl RustPlugin for RecordingPlugin {
         context: TypedServiceRegistrationContext<'_>,
         registry: &mut TypedServiceRegistry,
     ) {
-        let Some(config) = config_handle() else {
+        let Ok(binding) = self.configuration() else {
             return;
         };
-        let Ok(config) = config.read() else {
-            return;
+        let config = binding.config;
+        let owner = {
+            let Ok(mut selected) = self.owner.write() else {
+                return;
+            };
+            selected
+                .get_or_insert_with(|| {
+                    RecordingOwner::new(Arc::clone(&binding.host), config.clone())
+                })
+                .clone()
         };
+        bmux_recording_plugin_api::recording_state::register_provider(
+            registry,
+            Arc::new(owner.clone()),
+        )
+        .expect("recording state schema capability must be valid");
         // Explicit plugin configuration establishes opt-in. Never infer isolation
         // from an arbitrary caller-supplied path or mutate a normal user runtime.
         let configured = context
@@ -481,9 +338,13 @@ impl RustPlugin for RecordingPlugin {
             .and_then(|value| value.as_str());
         let isolated = configured.is_some_and(|root| root == context.connection.runtime_dir);
         let service = Arc::new(process_runtime::ProcessService::new(
-            Arc::new(bmux_plugin::TypedServiceCaller::from_registration_context(
-                &context,
-            )),
+            match binding.process_caller {
+                Some(caller) => caller,
+                None if self.binding.is_none() => Arc::new(
+                    bmux_plugin::TypedServiceCaller::from_registration_context(&context),
+                ),
+                None => return,
+            },
             config.recordings_dir.clone(),
             std::path::Path::new(&context.connection.runtime_dir)
                 .parent()
@@ -492,8 +353,11 @@ impl RustPlugin for RecordingPlugin {
                     |path| path.to_string_lossy().into_owned(),
                 ),
             isolated,
+            Arc::clone(&owner.manual),
         ));
-        process_runtime::register(Arc::clone(&service));
+        if let Ok(mut process) = owner.process.write() {
+            *process = Some(Arc::clone(&service));
+        }
         let presentation: Arc<dyn bmux_recording_plugin_api::recording_process_presentation_v1::RecordingProcessPresentationV1Service + Send + Sync> = service.clone();
         let _ = bmux_recording_plugin_api::recording_process_presentation_v1::register_provider(
             registry,
@@ -509,37 +373,1394 @@ impl RustPlugin for RecordingPlugin {
     }
 }
 
+/// Explicit owner-bound host mechanisms. The host installs/revokes the sink
+/// using its activation registration port; no `TypeId` lookup is used by owners.
+pub trait RecordingHost: Send + Sync {
+    /// # Errors
+    /// Reports unavailable or conflicting activation-owned sink registration.
+    fn install_sink(&self, sink: RecordingSinkHandle) -> Result<(), String>;
+    /// # Errors
+    /// Reports failure to revoke the activation-owned sink.
+    fn remove_sink(&self) -> Result<(), String>;
+    /// # Errors
+    /// Reports rejected or unavailable event publication.
+    fn publish(&self, event: recording_events::RecordingEvent) -> Result<(), String>;
+}
+type PruneWorker = (
+    Arc<std::sync::atomic::AtomicBool>,
+    std::thread::JoinHandle<()>,
+);
+
+#[derive(Clone)]
+pub struct RecordingOwner {
+    host: Arc<dyn RecordingHost>,
+    config: Arc<RwLock<RecordingPluginConfig>>,
+    manual: Arc<RwLock<ManualRecordingRuntimeHandle>>,
+    rolling: Arc<RwLock<RollingRecordingRuntimeHandle>>,
+    jobs: Arc<Mutex<BTreeMap<uuid::Uuid, recording_types::RecordingJob>>>,
+    cut_lock: Arc<Mutex<()>>,
+    tasks: Arc<Mutex<Vec<std::thread::JoinHandle<()>>>>,
+    prune: Arc<Mutex<Option<PruneWorker>>>,
+    process: Arc<RwLock<Option<Arc<process_runtime::ProcessService>>>>,
+    cleanup_failed: Arc<std::sync::atomic::AtomicBool>,
+    lifecycle: Arc<Mutex<()>>,
+    activation_claimed: Arc<std::sync::atomic::AtomicBool>,
+}
+impl RecordingOwner {
+    pub fn new(host: Arc<dyn RecordingHost>, config: RecordingPluginConfig) -> Self {
+        let manual = Arc::new(Mutex::new(RecordingRuntime::new(
+            config.recordings_dir.clone(),
+            config.rolling_segment_mb,
+            config.retention_days,
+        )));
+        let rolling = Arc::new(Mutex::new(if config.rolling_defaults.is_available() {
+            Some(RecordingRuntime::new_rolling(
+                config.rolling_recordings_dir.clone(),
+                config.rolling_segment_mb,
+                config.rolling_defaults.window_secs,
+            ))
+        } else {
+            None
+        }));
+        Self {
+            host,
+            config: Arc::new(RwLock::new(config)),
+            manual: Arc::new(RwLock::new(ManualRecordingRuntimeHandle(manual))),
+            rolling: Arc::new(RwLock::new(RollingRecordingRuntimeHandle(rolling))),
+            jobs: Arc::new(Mutex::new(BTreeMap::new())),
+            cut_lock: Arc::new(Mutex::new(())),
+            tasks: Arc::new(Mutex::new(Vec::new())),
+            prune: Arc::new(Mutex::new(None)),
+            process: Arc::new(RwLock::new(None)),
+            cleanup_failed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            lifecycle: Arc::new(Mutex::new(())),
+            activation_claimed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+    fn activate_owner(&self) -> Result<(), PluginCommandError> {
+        let _lifecycle = self
+            .lifecycle
+            .lock()
+            .map_err(|_| PluginCommandError::failed("recording lifecycle poisoned"))?;
+        // Claim before installing the sink or starting writers. Failed partial
+        // activation remains owned until explicit successful cleanup.
+        if self
+            .cleanup_failed
+            .load(std::sync::atomic::Ordering::Acquire)
+            || self
+                .activation_claimed
+                .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            return Err(PluginCommandError::unavailable(
+                "recording active or cleanup required",
+            ));
+        }
+        let mut prune = self
+            .prune
+            .lock()
+            .map_err(|_| PluginCommandError::failed("recording prune lock poisoned"))?;
+        if prune.is_some() {
+            return Err(PluginCommandError::failed("recording already active"));
+        }
+        let manual = Arc::clone(
+            &self
+                .manual
+                .read()
+                .map_err(|_| PluginCommandError::failed("manual handle poisoned"))?
+                .0,
+        );
+        let rolling = Arc::clone(
+            &self
+                .rolling
+                .read()
+                .map_err(|_| PluginCommandError::failed("rolling handle poisoned"))?
+                .0,
+        );
+        let config = self
+            .config
+            .read()
+            .map_err(|_| PluginCommandError::failed("recording configuration poisoned"))?;
+        self.host
+            .install_sink(RecordingSinkHandle::from_arc(Arc::new(DualRuntimeSink {
+                manual: Arc::clone(&manual),
+                rolling: Arc::clone(&rolling),
+            })))
+            .map_err(PluginCommandError::failed)?;
+        if let Some(options) = config.startup_recording.as_ref() {
+            auto_start_manual(&manual, options)?;
+        }
+        // Auto-start applies only to an available selected capture runtime.
+        // Standalone command hosts can carry enabled recording preferences but
+        // no capture settings; preserve that distinction rather than inventing
+        // a frame authority or failing unrelated recording-process commands.
+        if config.rolling_auto_start && config.rolling_defaults.is_available() {
+            auto_start_rolling(&rolling, &config.rolling_defaults)?;
+        }
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stopped = Arc::clone(&stop);
+        let task = std::thread::Builder::new()
+            .name("recording-prune".into())
+            .spawn(move || {
+                while !stopped.load(std::sync::atomic::Ordering::Acquire) {
+                    if let Ok(runtime) = manual.lock()
+                        && let Err(error) = runtime.prune(None)
+                    {
+                        tracing::warn!(%error, "recording prune failed");
+                    }
+                    std::thread::park_timeout(std::time::Duration::from_secs(3600));
+                }
+            })
+            .map_err(|error| PluginCommandError::failed(error.to_string()))?;
+        *prune = Some((stop, task));
+        Ok(())
+    }
+    fn deactivate_owner(&self) -> Result<(), PluginCommandError> {
+        let _lifecycle = self
+            .lifecycle
+            .lock()
+            .map_err(|_| PluginCommandError::failed("recording lifecycle poisoned"))?;
+        if self
+            .cleanup_failed
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(PluginCommandError::failed(
+                "recording producer failed; cleanup requires explicit recovery",
+            ));
+        }
+        // A managed process owns its recording writer until explicit finish or
+        // recovery finalization. Plugin retirement cannot truncate that work.
+        {
+            let manual = self
+                .manual
+                .read()
+                .map_err(|_| PluginCommandError::failed("manual handle poisoned"))?;
+            let runtime = manual
+                .0
+                .lock()
+                .map_err(|_| PluginCommandError::failed("manual runtime poisoned"))?;
+            if let Some(active) = runtime.status().active
+                && Path::new(&active.path).join("process-capture").exists()
+            {
+                return Err(PluginCommandError::unavailable(
+                    "recording cleanup required: managed process capture must finish explicitly",
+                ));
+            }
+        }
+        if let Some((stop, task)) = self
+            .prune
+            .lock()
+            .map_err(|_| PluginCommandError::failed("recording prune lock poisoned"))?
+            .take()
+        {
+            stop.store(true, std::sync::atomic::Ordering::Release);
+            task.thread().unpark();
+            if task.join().is_err() {
+                self.cleanup_failed
+                    .store(true, std::sync::atomic::Ordering::Release);
+                return Err(PluginCommandError::failed("recording prune task panicked"));
+            }
+        }
+        // The lifecycle host has already closed invocation admission. Complete
+        // admitted exports before stopping writers; failures retain owner state.
+        let tasks = std::mem::take(
+            &mut *self
+                .tasks
+                .lock()
+                .map_err(|_| PluginCommandError::failed("recording task lock poisoned"))?,
+        );
+        let mut task_failed = false;
+        for task in tasks {
+            task_failed |= task.join().is_err();
+        }
+        if task_failed {
+            self.cleanup_failed
+                .store(true, std::sync::atomic::Ordering::Release);
+            return Err(PluginCommandError::failed(
+                "recording export task panicked; cleanup required",
+            ));
+        }
+        {
+            let manual = self
+                .manual
+                .read()
+                .map_err(|_| PluginCommandError::failed("manual handle poisoned"))?;
+            let mut runtime = manual
+                .0
+                .lock()
+                .map_err(|_| PluginCommandError::failed("manual runtime poisoned"))?;
+            if runtime.status().active.is_some() {
+                runtime
+                    .stop(None)
+                    .map_err(|error| PluginCommandError::failed(error.to_string()))?;
+            }
+        }
+        {
+            let rolling = self
+                .rolling
+                .read()
+                .map_err(|_| PluginCommandError::failed("rolling handle poisoned"))?;
+            let mut runtime = rolling
+                .0
+                .lock()
+                .map_err(|_| PluginCommandError::failed("rolling runtime poisoned"))?;
+            if let Some(runtime) = runtime.as_mut()
+                && runtime.status().active.is_some()
+            {
+                runtime
+                    .stop(None)
+                    .map_err(|error| PluginCommandError::failed(error.to_string()))?;
+            }
+        }
+        self.host
+            .remove_sink()
+            .map_err(PluginCommandError::failed)?;
+        self.activation_claimed
+            .store(false, std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+    fn dispatch_process<T: Send + 'static>(
+        &self,
+        context: &NativeServiceContext,
+        operation: impl FnOnce(
+            Arc<process_runtime::ProcessService>,
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send>>
+        + Send
+        + 'static,
+    ) -> anyhow::Result<T> {
+        let process = self
+            .process
+            .read()
+            .map_err(|_| anyhow::anyhow!("process owner poisoned"))?
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("process service not bound"))?;
+        process_runtime::dispatch_on(&process, context, operation)
+    }
+    // Keep the explicit operation table together; splitting it obscures the
+    // checked interface/operation routing and shared owner delegation.
+    #[allow(clippy::too_many_lines)]
+    fn service(&self, context: &NativeServiceContext) -> ServiceResponse {
+        use bmux_recording_plugin_api::recording_process_presentation_v1::RecordingProcessPresentationV1Service;
+        use bmux_recording_plugin_api::recording_process_v4::{
+            self as process, RecordingProcessV4Service,
+        };
+        bmux_plugin_sdk::route_service!(context, {
+            "recording-process-live-presentation-v1", "capabilities" => |_req: (), ctx| {
+                self.dispatch_process(ctx, move |service| Box::pin(async move { service.live_capabilities().await })).and_then(|value| value).map_err(|error| ServiceResponse::error("process_dispatch", error.to_string()))
+            },
+            "recording-process-live-presentation-v1", "read" => |req: bmux_recording_plugin_api::recording_process_live_presentation_v1::client::ReadRequest, ctx| {
+                self.dispatch_process(ctx, move |service| Box::pin(async move { service.live_read(req.run_id, req.after, req.max_bytes).await })).map_err(|error| ServiceResponse::error("process_dispatch", error.to_string()))
+            },
+            "recording-process-live-presentation-v1", "wait-present" => |req: bmux_recording_plugin_api::recording_process_live_presentation_v1::client::WaitPresentRequest, ctx| {
+                self.dispatch_process(ctx, move |service| Box::pin(async move { service.live_wait_present(req.run_id, req.after, req.timeout_ms, req.max_bytes).await })).map_err(|error| ServiceResponse::error("process_dispatch", error.to_string()))
+            },
+            "recording-process-human-input-v1", "capabilities" => |_req: (), ctx| {
+                self.dispatch_process(ctx, move |service| Box::pin(async move { service.human_capabilities().await })).and_then(|value| value).map_err(|error| ServiceResponse::error("process_dispatch", error.to_string()))
+            },
+            "recording-process-human-input-v1", "open" => |req: bmux_recording_plugin_api::recording_process_human_input_v1::client::OpenRequest, ctx| {
+                self.dispatch_process(ctx, move |service| Box::pin(async move { service.human_open(req.run_id).await })).map_err(|error| ServiceResponse::error("process_dispatch", error.to_string()))
+            },
+            "recording-process-human-input-v1", "push" => |req: bmux_recording_plugin_api::recording_process_human_input_v1::client::PushRequest, ctx| {
+                self.dispatch_process(ctx, move |service| Box::pin(async move { service.human_push(req.run_id, req.stream, req.sequence, req.data).await })).map_err(|error| ServiceResponse::error("process_dispatch", error.to_string()))
+            },
+            "recording-process-human-input-v1", "close" => |req: bmux_recording_plugin_api::recording_process_human_input_v1::client::CloseRequest, ctx| {
+                self.dispatch_process(ctx, move |service| Box::pin(async move { service.human_close(req.run_id, req.stream).await })).map_err(|error| ServiceResponse::error("process_dispatch", error.to_string()))
+            },
+            "recording-process-presentation-wait-v1", "capabilities" => |_req: (), ctx| {
+                self.dispatch_process(ctx, move |service| Box::pin(async move { service.wait_capabilities().await })).and_then(|value| value).map_err(|error| ServiceResponse::error("process_dispatch", error.to_string()))
+            },
+            "recording-process-presentation-wait-v1", "wait-present" => |req: bmux_recording_plugin_api::recording_process_presentation_wait_v1::client::WaitPresentRequest, ctx| {
+                self.dispatch_process(ctx, move |service| Box::pin(async move { service.wait_present(req.run_id, req.after, req.timeout_ms, req.max_bytes).await })).map_err(|error| ServiceResponse::error("process_dispatch", error.to_string()))
+            },
+            "recording-process-presentation-v1", "capabilities" => |_req: (), ctx| {
+                self.dispatch_process(ctx, move |service| Box::pin(async move { service.capabilities().await })).map_err(|error| ServiceResponse::error("process_dispatch", error.to_string()))
+            },
+            "recording-process-presentation-v1", "resize" => |req: bmux_recording_plugin_api::recording_process_presentation_v1::client::ResizeRequest, ctx| {
+                self.dispatch_process(ctx, move |service| Box::pin(async move { service.resize(req.run_id, req.format, req.cols, req.rows).await })).map_err(|error| ServiceResponse::error("process_dispatch", error.to_string()))
+            },
+            "recording-process-presentation-v1", "present" => |req: bmux_recording_plugin_api::recording_process_presentation_v1::client::PresentRequest, ctx| {
+                self.dispatch_process(ctx, move |service| Box::pin(async move { service.present(req.run_id).await })).map_err(|error| ServiceResponse::error("process_dispatch", error.to_string()))
+            },
+            "recording-process-environment-v1", "capabilities" => |_req: (), ctx| {
+                self.dispatch_process(ctx, move |service| Box::pin(async move { service.environment_capabilities().await })).and_then(|value| value).map_err(|error| ServiceResponse::error("process_dispatch", error.to_string()))
+            },
+            "recording-process-environment-v1", "start" => |req: bmux_recording_plugin_api::recording_process_environment_v1::client::StartRequest, ctx| {
+                self.dispatch_process(ctx, move |service| Box::pin(async move { service.start_environment(req.launch_mutation_id, req.options, req.environment).await.map_err(|error| process::ProcessError::OperationFailed { reason: error.to_string() }) })).map_err(|error| ServiceResponse::error("process_dispatch", error.to_string()))
+            },
+            "recording-process-v4", "start" => |req: process::client::StartRequest, ctx| {
+                self.dispatch_process(ctx, move |service| Box::pin(async move { service.start(req.run_id, req.launch_mutation_id, req.options, req.runtime_root).await })).map_err(|error| ServiceResponse::error("process_dispatch", error.to_string()))
+            },
+            "recording-process-v4", "reconcile" => |req: process::client::ReconcileRequest, ctx| {
+                self.dispatch_process(ctx, move |service| Box::pin(async move { service.reconcile(req.run_id).await })).map_err(|error| ServiceResponse::error("process_dispatch", error.to_string()))
+            },
+            "recording-process-v4", "status" => |req: process::client::StatusRequest, ctx| {
+                self.dispatch_process(ctx, move |service| Box::pin(async move { service.status(req.run_id).await })).map_err(|error| ServiceResponse::error("process_dispatch", error.to_string()))
+            },
+            "recording-process-v4", "read" => |req: process::client::ReadRequest, ctx| {
+                self.dispatch_process(ctx, move |service| Box::pin(async move { service.read(req.run_id, req.since, req.max_bytes).await })).map_err(|error| ServiceResponse::error("process_dispatch", error.to_string()))
+            },
+            "recording-process-v4", "screen" => |req: process::client::ScreenRequest, ctx| {
+                self.dispatch_process(ctx, move |service| Box::pin(async move { service.screen(req.run_id).await })).map_err(|error| ServiceResponse::error("process_dispatch", error.to_string()))
+            },
+            "recording-process-v4", "send" => |req: process::client::SendRequest, ctx| {
+                self.dispatch_process(ctx, move |service| Box::pin(async move { service.send(req.run_id, req.data, req.mutation_id).await })).map_err(|error| ServiceResponse::error("process_dispatch", error.to_string()))
+            },
+            "recording-process-v4", "input_receipt" => |req: process::client::InputReceiptRequest, ctx| {
+                self.dispatch_process(ctx, move |service| Box::pin(async move { service.input_receipt(req.run_id, req.mutation_id).await })).map_err(|error| ServiceResponse::error("process_dispatch", error.to_string()))
+            },
+            "recording-process-v4", "resolve" => |req: process::client::ResolveRequest, ctx| {
+                self.dispatch_process(ctx, move |service| Box::pin(async move { service.resolve(req.run_id, req.mutation_id, req.expected_revision, req.action, req.input_mutation_id, req.grace_ms).await })).map_err(|error| ServiceResponse::error("process_dispatch", error.to_string()))
+            },
+            "recording-process-v4", "wait" => |req: process::client::WaitRequest, ctx| {
+                self.dispatch_process(ctx, move |service| Box::pin(async move { service.wait(req.run_id, req.timeout_ms).await })).map_err(|error| ServiceResponse::error("process_dispatch", error.to_string()))
+            },
+            "recording-process-v4", "terminate" => |req: process::client::TerminateRequest, ctx| {
+                self.dispatch_process(ctx, move |service| Box::pin(async move { service.terminate(req.run_id, req.grace_ms).await })).map_err(|error| ServiceResponse::error("process_dispatch", error.to_string()))
+            },
+            "recording-process-v4", "finish" => |req: process::client::FinishRequest, ctx| {
+                self.dispatch_process(ctx, move |service| Box::pin(async move { service.finish(req.run_id, req.expected_revision, req.terminate_running).await })).map_err(|error| ServiceResponse::error("process_dispatch", error.to_string()))
+            },
+            "recording-state", "status" => |_req: (), _ctx| {
+                Ok::<recording_types::RecordingStatus, ServiceResponse>(self.recording_status_generated())
+            },
+            "recording-state", "list-recordings" => |_req: (), _ctx| {
+                Ok::<Vec<recording_types::RecordingSummary>, ServiceResponse>(self.recording_list_generated())
+            },
+            "recording-state", "rolling-status" => |_req: (), _ctx| {
+                Ok::<recording_types::RecordingRollingStatus, ServiceResponse>(self.recording_rolling_status_generated())
+            },
+            "recording-state", "capture-targets" => |_req: (), _ctx| {
+                Ok::<Vec<recording_types::RecordingCaptureTarget>, ServiceResponse>(self.recording_capture_targets_generated())
+            },
+            "recording-state", "job-status" => |req: JobStatusRequest, _ctx| {
+                Ok::<Option<recording_types::RecordingJob>, ServiceResponse>(self.recording_job_status_generated(req.job_id))
+            },
+            "recording-state", "list-jobs" => |_req: (), _ctx| {
+                Ok::<Vec<recording_types::RecordingJob>, ServiceResponse>(self.recording_list_jobs_generated())
+            },
+            "recording-commands", "start" => |req: StartRequest, _ctx| {
+                Ok::<Result<recording_types::RecordingSummary, recording_types::RecordingError>, ServiceResponse>(
+                    self.recording_start_generated(req),
+                )
+            },
+            "recording-commands", "stop" => |req: StopRequest, _ctx| {
+                Ok::<Result<uuid::Uuid, recording_types::RecordingError>, ServiceResponse>(
+                    self.recording_stop_generated(req.recording_id),
+                )
+            },
+            "recording-commands", "write-custom-event" => |req: WriteCustomEventRequest, _ctx| {
+                Ok::<Result<(), recording_types::RecordingError>, ServiceResponse>(
+                    self.recording_write_custom_event_generated(req),
+                )
+            },
+            "recording-commands", "delete" => |req: DeleteRequest, _ctx| {
+                Ok::<Result<uuid::Uuid, recording_types::RecordingError>, ServiceResponse>(
+                    self.recording_delete_generated(req.recording_id),
+                )
+            },
+            "recording-commands", "delete-all" => |_req: (), _ctx| {
+                Ok::<u64, ServiceResponse>(self.recording_delete_all_generated())
+            },
+            "recording-commands", "cut" => |req: CutRequest, _ctx| {
+                Ok::<Result<recording_types::RecordingSummary, recording_types::RecordingError>, ServiceResponse>(
+                    self.recording_cut_generated(req),
+                )
+            },
+            "recording-commands", "queue-cut" => |req: QueueCutRequest, _ctx| {
+                self.recording_queue_cut_generated(req).map_err(|error| recording_error_response(&error))
+            },
+            "recording-commands", "rolling-start" => |req: RollingStartRequest, _ctx| {
+                Ok::<Result<recording_types::RecordingSummary, recording_types::RecordingError>, ServiceResponse>(
+                    self.recording_rolling_start_generated(req.options),
+                )
+            },
+            "recording-commands", "rolling-stop" => |_req: (), _ctx| {
+                Ok::<Result<uuid::Uuid, recording_types::RecordingError>, ServiceResponse>(
+                    self.recording_rolling_stop_generated(),
+                )
+            },
+            "recording-commands", "rolling-clear" => |req: RollingClearRequest, _ctx| {
+                Ok::<recording_types::RecordingRollingClearReport, ServiceResponse>(
+                    self.recording_rolling_clear_generated(req.restart_if_active),
+                )
+            },
+            "recording-commands", "prune" => |req: PruneRequest, _ctx| {
+                Ok::<u64, ServiceResponse>(self.recording_prune_generated(req.older_than_days))
+            },
+        })
+    }
+
+    fn config_handle(&self) -> Arc<RwLock<RecordingPluginConfig>> {
+        Arc::clone(&self.config)
+    }
+    pub(crate) fn current_auto_export_settings(
+        &self,
+        fps_override: Option<u32>,
+    ) -> AutoExportSettings {
+        let config_handle = self.config_handle();
+        let Ok(config) = config_handle.read() else {
+            return AutoExportSettings {
+                enabled: false,
+                output_dir: None,
+                fps: fps_override.unwrap_or(24).max(1),
+            };
+        };
+        AutoExportSettings {
+            enabled: config.auto_export || config.auto_export_dir.is_some(),
+            output_dir: config.auto_export_dir.clone(),
+            fps: fps_override.unwrap_or(config.auto_export_fps).max(1),
+        }
+    }
+    fn cut_filesystem_lock(&self) -> &Mutex<()> {
+        &self.cut_lock
+    }
+    fn handle_capture_targets(&self) -> Vec<RecordingCaptureTarget> {
+        let mut targets: Vec<RecordingCaptureTarget> = Vec::new();
+
+        let handle = self.manual_handle();
+        if let Ok(guard) = handle.read()
+            && let Ok(runtime) = guard.0.lock()
+            && let Some((id, path)) = runtime.active_capture_target()
+        {
+            targets.push(RecordingCaptureTarget {
+                recording_id: id,
+                path: path.display().to_string(),
+                rolling_window_secs: None,
+            });
+        }
+        let handle = self.rolling_handle();
+        if let Ok(guard) = handle.read()
+            && let Ok(rolling) = guard.0.lock()
+            && let Some(runtime) = rolling.as_ref()
+            && let Some((id, path)) = runtime.active_capture_target()
+        {
+            targets.push(RecordingCaptureTarget {
+                recording_id: id,
+                path: path.display().to_string(),
+                rolling_window_secs: runtime.rolling_window_secs(),
+            });
+        }
+
+        targets
+    }
+    fn handle_cut(
+        &self,
+        last_seconds: Option<u64>,
+        name: Option<String>,
+    ) -> anyhow::Result<RecordingSummary> {
+        let config = self.config_handle();
+        let cfg = config
+            .read()
+            .map_err(|_| anyhow::anyhow!("recording plugin config lock is poisoned"))?;
+        let output_root = cfg.recordings_dir.clone();
+        drop(cfg);
+
+        let plan = {
+            let handle = self.rolling_handle();
+            let guard = handle.read().map_err(|_| {
+                anyhow::anyhow!("recording rolling runtime handle lock is poisoned")
+            })?;
+            let mut rolling = guard
+                .0
+                .lock()
+                .map_err(|_| anyhow::anyhow!("recording rolling runtime lock is poisoned"))?;
+            let runtime = rolling.as_mut().ok_or_else(|| {
+                anyhow::anyhow!("recording cut requires rolling recording mode to be enabled")
+            })?;
+            runtime.prepare_cut(output_root, last_seconds, name)?
+        };
+
+        let _cut_guard = self
+            .cut_filesystem_lock()
+            .lock()
+            .map_err(|_| anyhow::anyhow!("recording cut filesystem lock is poisoned"))?;
+        execute_recording_cut(plan)
+    }
+    fn handle_delete(&self, recording_id: uuid::Uuid) -> Option<uuid::Uuid> {
+        let handle = self.manual_handle();
+        let guard = handle.read().ok()?;
+        let mut runtime = guard.0.lock().ok()?;
+        runtime.delete(recording_id).ok().map(|summary| summary.id)
+    }
+    fn handle_delete_all(&self) -> usize {
+        let handle = self.manual_handle();
+        let Ok(guard) = handle.read() else {
+            return 0;
+        };
+        let Ok(mut runtime) = guard.0.lock() else {
+            return 0;
+        };
+        runtime.delete_all().unwrap_or(0)
+    }
+    fn handle_list(&self) -> Vec<RecordingSummary> {
+        let handle = self.manual_handle();
+        let Ok(guard) = handle.read() else {
+            return Vec::new();
+        };
+        let Ok(runtime) = guard.0.lock() else {
+            return Vec::new();
+        };
+        runtime.list().unwrap_or_default()
+    }
+    fn handle_prune(&self, older_than_days: Option<u64>) -> usize {
+        let handle = self.manual_handle();
+        let Ok(guard) = handle.read() else {
+            return 0;
+        };
+        let Ok(runtime) = guard.0.lock() else {
+            return 0;
+        };
+        runtime.prune(older_than_days).unwrap_or(0)
+    }
+    fn handle_rolling_clear(&self, restart_if_active: bool) -> RecordingRollingClearReport {
+        let config = self.config_handle();
+        let Ok(cfg) = config.read() else {
+            return empty_clear_report();
+        };
+        let root = cfg.rolling_recordings_dir.clone();
+        let segment_mb = cfg.rolling_segment_mb;
+        let defaults = cfg.rolling_defaults.clone();
+        drop(cfg);
+
+        let usage_before = collect_rolling_usage(&root).unwrap_or_default();
+
+        // Stop the active rolling recording if any; capture enough state
+        // to restart it after clearing.
+        let (was_active, stopped_recording_id, restart_settings, restart_name) = {
+            let handle = self.rolling_handle();
+            let Ok(guard) = handle.read() else {
+                return clear_report_response(&root, false, false, None, None, &usage_before);
+            };
+            let Ok(mut rolling) = guard.0.lock() else {
+                return clear_report_response(&root, false, false, None, None, &usage_before);
+            };
+            let Some(runtime) = rolling.as_mut() else {
+                return clear_report_response(&root, false, false, None, None, &usage_before);
+            };
+            let Some(active) = runtime.status().active else {
+                return clear_report_response(&root, false, false, None, None, &usage_before);
+            };
+            let name = active.name.clone();
+            let settings = RollingRecordingSettings {
+                window_secs: runtime
+                    .rolling_window_secs()
+                    .unwrap_or(defaults.window_secs),
+                event_kinds: active.event_kinds.clone(),
+            };
+            let stopped_id = runtime.stop(None).ok().map(|summary| summary.id);
+            (true, stopped_id, Some(settings), name)
+        };
+
+        {
+            let Ok(_cut_guard) = self.cut_filesystem_lock().lock() else {
+                return empty_clear_report();
+            };
+            if clear_rolling_root(&root).is_err() {
+                return empty_clear_report();
+            }
+        }
+
+        let (restarted, restarted_recording) = if restart_if_active && was_active {
+            let settings = restart_settings.unwrap_or_else(|| defaults.clone());
+            if settings.is_available() {
+                let recording =
+                    self.try_restart_rolling(&root, segment_mb, &settings, restart_name);
+                match recording {
+                    Some(rec) => (true, Some(rec)),
+                    None => (false, None),
+                }
+            } else {
+                (false, None)
+            }
+        } else {
+            (false, None)
+        };
+
+        clear_report_response(
+            &root,
+            was_active,
+            restarted,
+            stopped_recording_id,
+            restarted_recording,
+            &usage_before,
+        )
+    }
+    fn handle_rolling_start(
+        &self,
+        options: RecordingRollingStartOptions,
+    ) -> Option<RecordingSummary> {
+        let config = self.config_handle();
+        let Ok(cfg) = config.read() else {
+            return None;
+        };
+        let resolved = apply_rolling_start_options(&cfg.rolling_defaults, &options);
+        let rolling_dir = cfg.rolling_recordings_dir.clone();
+        let segment_mb = cfg.rolling_segment_mb;
+        drop(cfg);
+
+        if !resolved.is_available() {
+            return None;
+        }
+
+        let handle = self.rolling_handle();
+        let Ok(guard) = handle.read() else {
+            return None;
+        };
+        let Ok(mut rolling) = guard.0.lock() else {
+            return None;
+        };
+
+        if rolling.is_none() {
+            *rolling = Some(RecordingRuntime::new_rolling(
+                rolling_dir.clone(),
+                segment_mb,
+                resolved.window_secs,
+            ));
+        }
+
+        let options_empty = rolling_start_options_is_empty(&options);
+        let runtime = rolling.as_mut()?;
+
+        if let Some(active) = runtime.status().active {
+            if options_empty {
+                return Some(active);
+            }
+            return None;
+        }
+
+        if runtime.rolling_window_secs() != Some(resolved.window_secs) {
+            *runtime = RecordingRuntime::new_rolling(rolling_dir, segment_mb, resolved.window_secs);
+        }
+
+        let Ok(recording) = runtime.start(
+            None,
+            resolved.capture_input(),
+            options.name,
+            RecordingProfile::Full,
+            resolved.event_kinds.clone(),
+        ) else {
+            return None;
+        };
+
+        Some(recording)
+    }
+    fn handle_rolling_status(&self) -> RecordingRollingStatus {
+        let config = self.config_handle();
+        let Ok(cfg) = config.read() else {
+            return empty_rolling_status(String::new());
+        };
+        let root_path = cfg.rolling_recordings_dir.display().to_string();
+        let defaults = cfg.rolling_defaults.clone();
+        drop(cfg);
+
+        let usage = collect_rolling_usage(Path::new(&root_path)).unwrap_or_default();
+
+        let handle = self.rolling_handle();
+        let (active, rolling_window_secs, event_kinds) = (|| {
+            let guard = handle.read().ok()?;
+            let rolling = guard.0.lock().ok()?;
+            let runtime = rolling.as_ref()?;
+            let status = runtime.status();
+            let window = runtime.rolling_window_secs();
+            let kinds = status.active.as_ref().map_or_else(
+                || defaults.event_kinds.clone(),
+                |summary| summary.event_kinds.clone(),
+            );
+            Some((status.active, window, kinds))
+        })()
+        .unwrap_or((None, None, defaults.event_kinds.clone()));
+
+        RecordingRollingStatus {
+            root_path,
+            auto_start: defaults.is_available(),
+            available: defaults.is_available(),
+            active,
+            rolling_window_secs: rolling_window_secs.or(Some(defaults.window_secs)),
+            event_kinds,
+            usage,
+        }
+    }
+    fn handle_rolling_stop(&self) -> Option<uuid::Uuid> {
+        let handle = self.rolling_handle();
+        let guard = handle.read().ok()?;
+        let mut rolling = guard.0.lock().ok()?;
+        let runtime = rolling.as_mut()?;
+        runtime.status().active.as_ref()?;
+        runtime.stop(None).ok().map(|summary| summary.id)
+    }
+    fn handle_start(
+        &self,
+        session_id: Option<uuid::Uuid>,
+        capture_input: bool,
+        name: Option<String>,
+        profile: Option<RecordingProfile>,
+        event_kinds: Option<Vec<RecordingEventKind>>,
+    ) -> Option<RecordingSummary> {
+        let handle = self.manual_handle();
+        let guard = handle.read().ok()?;
+        let mut runtime = guard.0.lock().ok()?;
+
+        let profile = profile.unwrap_or(RecordingProfile::Full);
+        let event_kinds = event_kinds.unwrap_or_else(default_event_kinds);
+        runtime
+            .start(session_id, capture_input, name, profile, event_kinds)
+            .ok()
+    }
+    fn handle_status(&self) -> RecordingStatus {
+        let handle = self.manual_handle();
+        let Ok(guard) = handle.read() else {
+            return empty_status();
+        };
+        let Ok(runtime) = guard.0.lock() else {
+            return empty_status();
+        };
+        runtime.status()
+    }
+    fn handle_stop(&self, recording_id: Option<uuid::Uuid>) -> Option<RecordingSummary> {
+        let handle = self.manual_handle();
+        let guard = handle.read().ok()?;
+        let mut runtime = guard.0.lock().ok()?;
+        runtime.stop(recording_id).ok()
+    }
+    fn handle_write_custom_event(
+        &self,
+        session_id: Option<uuid::Uuid>,
+        pane_id: Option<uuid::Uuid>,
+        source: String,
+        name: String,
+        payload: Vec<u8>,
+    ) -> bool {
+        let payload = RecordingPayload::Custom {
+            source,
+            name,
+            payload,
+        };
+        let meta = RecordMeta {
+            session_id,
+            pane_id,
+            client_id: None,
+        };
+
+        let mut accepted = false;
+        let handle = self.manual_handle();
+        if let Ok(guard) = handle.read()
+            && let Ok(runtime) = guard.0.lock()
+            && let Ok(recorded) = runtime.record(RecordingEventKind::Custom, payload.clone(), meta)
+        {
+            accepted |= recorded;
+        }
+        let handle = self.rolling_handle();
+        if let Ok(guard) = handle.read()
+            && let Ok(rolling) = guard.0.lock()
+            && let Some(runtime) = rolling.as_ref()
+            && let Ok(recorded) = runtime.record(RecordingEventKind::Custom, payload, meta)
+        {
+            accepted |= recorded;
+        }
+
+        accepted
+    }
+    fn manual_handle(&self) -> Arc<RwLock<ManualRecordingRuntimeHandle>> {
+        Arc::clone(&self.manual)
+    }
+    fn maybe_auto_export_stopped_recording(&self, summary: &RecordingSummary) {
+        let export_settings = self.current_auto_export_settings(None);
+        if !export_settings.enabled {
+            tracing::info!(recording_id = %summary.id, "recording stop auto-export disabled");
+            return;
+        }
+
+        let recording_dir = PathBuf::from(&summary.path);
+        let output_path = auto_export_output_path(
+            &recording_dir,
+            export_settings.output_dir.as_deref(),
+            summary.id,
+        );
+        let output = output_path.to_string_lossy().to_string();
+        tracing::info!(
+            recording_id = %summary.id,
+            output_path = %output,
+            fps = export_settings.fps,
+            "recording stop auto-export starting"
+        );
+        self.publish_recording_export_started(summary.id, output.clone());
+        match export::export_recording_gif_for_recording_dir(
+            &recording_dir,
+            summary.id,
+            &output,
+            export_settings.fps,
+        ) {
+            Ok(()) => {
+                tracing::info!(
+                    recording_id = %summary.id,
+                    output_path = %output,
+                    "recording stop auto-export completed"
+                );
+                self.publish_recording_export_completed(summary.id, output);
+            }
+            Err(error) => {
+                let reason = error.to_string();
+                tracing::warn!(
+                    recording_id = %summary.id,
+                    output_path = %output,
+                    error = %reason,
+                    "recording stop auto-export failed"
+                );
+                self.publish_recording_export_failed(summary.id, output, reason);
+            }
+        }
+    }
+    fn publish_recording_cut_completed(&self, summary: &RecordingSummary) {
+        let _ = self
+            .host
+            .publish(recording_events::RecordingEvent::CutCompleted {
+                summary: summary.clone().into(),
+            });
+    }
+    fn publish_recording_cut_failed(&self, reason: String) {
+        let _ = self
+            .host
+            .publish(recording_events::RecordingEvent::CutFailed { reason });
+    }
+    fn publish_recording_cut_started(&self, last_seconds: Option<u64>, name: Option<String>) {
+        let _ = self
+            .host
+            .publish(recording_events::RecordingEvent::CutStarted { last_seconds, name });
+    }
+    pub(crate) fn publish_recording_export_completed(
+        &self,
+        recording_id: uuid::Uuid,
+        output_path: String,
+    ) {
+        let _ = self
+            .host
+            .publish(recording_events::RecordingEvent::ExportCompleted {
+                recording_id,
+                output_path,
+            });
+    }
+    pub(crate) fn publish_recording_export_failed(
+        &self,
+        recording_id: uuid::Uuid,
+        output_path: String,
+        reason: String,
+    ) {
+        let _ = self
+            .host
+            .publish(recording_events::RecordingEvent::ExportFailed {
+                recording_id,
+                output_path,
+                reason,
+            });
+    }
+    pub(crate) fn publish_recording_export_started(
+        &self,
+        recording_id: uuid::Uuid,
+        output_path: String,
+    ) {
+        let _ = self
+            .host
+            .publish(recording_events::RecordingEvent::ExportStarted {
+                recording_id,
+                output_path,
+            });
+    }
+    fn publish_recording_job_updated(&self, job: &recording_types::RecordingJob) {
+        let _ = self
+            .host
+            .publish(recording_events::RecordingEvent::JobUpdated { job: job.clone() });
+    }
+    fn publish_recording_started(
+        &self,
+        recording: &RecordingSummary,
+        rolling_window_secs: Option<u64>,
+    ) {
+        let target = recording_types::RecordingCaptureTarget {
+            recording_id: recording.id,
+            path: recording.path.clone(),
+            rolling_window_secs,
+        };
+        let _ = self
+            .host
+            .publish(recording_events::RecordingEvent::Started { target });
+    }
+    fn publish_recording_stopped(&self, recording_id: uuid::Uuid) {
+        let _ = self
+            .host
+            .publish(recording_events::RecordingEvent::Stopped { recording_id });
+    }
+    fn recording_capture_targets_generated(&self) -> Vec<recording_types::RecordingCaptureTarget> {
+        self.handle_capture_targets()
+            .into_iter()
+            .map(Into::into)
+            .collect()
+    }
+    fn recording_cut_generated(
+        &self,
+        req: CutRequest,
+    ) -> Result<recording_types::RecordingSummary, recording_types::RecordingError> {
+        self.publish_recording_cut_started(req.last_seconds, req.name.clone());
+        match self.handle_cut(req.last_seconds, req.name) {
+            Ok(summary) => {
+                self.publish_recording_cut_completed(&summary);
+                Ok(summary.into())
+            }
+            Err(error) => {
+                let reason = error.to_string();
+                self.publish_recording_cut_failed(reason.clone());
+                Err(generated_failed(reason))
+            }
+        }
+    }
+    fn recording_delete_all_generated(&self) -> u64 {
+        u64::try_from(self.handle_delete_all()).unwrap_or(u64::MAX)
+    }
+    fn recording_delete_generated(
+        &self,
+        recording_id: uuid::Uuid,
+    ) -> Result<uuid::Uuid, recording_types::RecordingError> {
+        self.handle_delete(recording_id)
+            .ok_or_else(|| generated_failed("recording delete failed"))
+    }
+    fn recording_job_status_generated(
+        &self,
+        job_id: uuid::Uuid,
+    ) -> Option<recording_types::RecordingJob> {
+        self.recording_jobs()
+            .lock()
+            .ok()
+            .and_then(|jobs| jobs.get(&job_id).cloned())
+    }
+    fn recording_jobs(&self) -> &Mutex<BTreeMap<uuid::Uuid, recording_types::RecordingJob>> {
+        &self.jobs
+    }
+    fn recording_list_generated(&self) -> Vec<recording_types::RecordingSummary> {
+        self.handle_list().into_iter().map(Into::into).collect()
+    }
+    fn recording_list_jobs_generated(&self) -> Vec<recording_types::RecordingJob> {
+        self.recording_jobs()
+            .lock()
+            .map(|jobs| jobs.values().cloned().collect())
+            .unwrap_or_default()
+    }
+    fn recording_prune_generated(&self, older_than_days: Option<u64>) -> u64 {
+        u64::try_from(self.handle_prune(older_than_days)).unwrap_or(u64::MAX)
+    }
+    fn recording_queue_cut_generated(
+        &self,
+        req: QueueCutRequest,
+    ) -> Result<recording_types::RecordingJob, recording_types::RecordingError> {
+        // Validate preconditions synchronously so the caller gets fast failure when
+        // the plugin state is unavailable.
+        let config_handle = Some(Arc::clone(&self.config))
+            .ok_or_else(|| generated_failed("recording plugin config is unavailable"))?;
+        if config_handle.read().is_err() {
+            return Err(generated_failed("recording plugin config lock is poisoned"));
+        }
+
+        let rolling_handle = self.rolling_handle();
+        let guard = rolling_handle
+            .read()
+            .map_err(|_| generated_failed("recording rolling runtime handle lock is poisoned"))?;
+        let rolling = guard
+            .0
+            .lock()
+            .map_err(|_| generated_failed("recording rolling runtime lock is poisoned"))?;
+        let runtime = rolling.as_ref().ok_or_else(|| {
+            generated_failed("recording cut requires rolling recording mode to be enabled")
+        })?;
+        let has_active = runtime.status().active.is_some();
+        let _ = runtime;
+        drop(rolling);
+        drop(guard);
+        drop(rolling_handle);
+
+        if !has_active {
+            return Err(generated_failed(
+                "no active rolling recording available for cut",
+            ));
+        }
+
+        let mut tasks = self
+            .tasks
+            .lock()
+            .map_err(|_| generated_failed("recording tasks poisoned"))?;
+        let mut index = 0;
+        while index < tasks.len() {
+            if tasks[index].is_finished() {
+                tasks
+                    .remove(index)
+                    .join()
+                    .map_err(|_| generated_failed("prior recording task panicked"))?;
+            } else {
+                index += 1;
+            }
+        }
+        if tasks.len() >= 16 {
+            return Err(generated_failed("recording task limit reached"));
+        }
+        if self
+            .jobs
+            .lock()
+            .map_err(|_| generated_failed("recording jobs poisoned"))?
+            .len()
+            >= 256
+        {
+            return Err(generated_failed(
+                "recording outcome retention full; new jobs unavailable",
+            ));
+        }
+        let job = new_recording_job(recording_types::RecordingJobKind::Cut);
+        self.upsert_recording_job(job.clone());
+        self.publish_recording_job_updated(&job);
+        let job_id = job.id;
+        let owner = self.clone();
+        match std::thread::Builder::new()
+            .name("bmux-recording-cut-worker".to_string())
+            .spawn(move || owner.run_queued_cut_job(job_id, req))
+        {
+            Ok(task) => tasks.push(task),
+            Err(error) => {
+                let reason = format!("failed spawning cut worker thread: {error}");
+                let failed = self.update_recording_job(job_id, |job| {
+                    job.status = recording_types::RecordingJobStatus::Failed;
+                    job.error = Some(reason.clone());
+                });
+                self.publish_recording_job_updated(&failed);
+                self.publish_recording_cut_failed(reason.clone());
+                return Err(generated_failed(reason));
+            }
+        }
+
+        Ok(job)
+    }
+    fn recording_rolling_clear_generated(
+        &self,
+        restart_if_active: bool,
+    ) -> recording_types::RecordingRollingClearReport {
+        let report = self.handle_rolling_clear(restart_if_active);
+        if let Some(recording_id) = report.stopped_recording_id {
+            self.publish_recording_stopped(recording_id);
+        }
+        if let Some(recording) = report.restarted_recording.as_ref() {
+            self.publish_recording_started(
+                recording,
+                self.handle_rolling_status().rolling_window_secs,
+            );
+        }
+        report.into()
+    }
+    fn recording_rolling_start_generated(
+        &self,
+        options: recording_types::RecordingRollingStartOptions,
+    ) -> Result<recording_types::RecordingSummary, recording_types::RecordingError> {
+        let recording = self
+            .handle_rolling_start(options.into())
+            .ok_or(recording_types::RecordingError::Unavailable)?;
+        self.publish_recording_started(
+            &recording,
+            self.handle_rolling_status().rolling_window_secs,
+        );
+        Ok(recording.into())
+    }
+    fn recording_rolling_status_generated(&self) -> recording_types::RecordingRollingStatus {
+        self.handle_rolling_status().into()
+    }
+    fn recording_rolling_stop_generated(
+        &self,
+    ) -> Result<uuid::Uuid, recording_types::RecordingError> {
+        let recording_id = self
+            .handle_rolling_stop()
+            .ok_or(recording_types::RecordingError::NoActive)?;
+        self.publish_recording_stopped(recording_id);
+        Ok(recording_id)
+    }
+    fn recording_start_generated(
+        &self,
+        req: StartRequest,
+    ) -> Result<recording_types::RecordingSummary, recording_types::RecordingError> {
+        let recording = self
+            .handle_start(
+                req.session_id,
+                req.capture_input,
+                req.name,
+                req.profile.map(Into::into),
+                req.event_kinds
+                    .map(|kinds| kinds.into_iter().map(Into::into).collect()),
+            )
+            .ok_or_else(|| generated_failed("recording start failed"))?;
+        self.publish_recording_started(&recording, None);
+        Ok(recording.into())
+    }
+    fn recording_status_generated(&self) -> recording_types::RecordingStatus {
+        self.handle_status().into()
+    }
+    fn recording_stop_generated(
+        &self,
+        recording_id: Option<uuid::Uuid>,
+    ) -> Result<uuid::Uuid, recording_types::RecordingError> {
+        let summary = self
+            .handle_stop(recording_id)
+            .ok_or(recording_types::RecordingError::NoActive)?;
+        let recording_id = summary.id;
+        self.publish_recording_stopped(recording_id);
+        self.maybe_auto_export_stopped_recording(&summary);
+        Ok(recording_id)
+    }
+    fn recording_write_custom_event_generated(
+        &self,
+        req: WriteCustomEventRequest,
+    ) -> Result<(), recording_types::RecordingError> {
+        if self.handle_write_custom_event(
+            req.session_id,
+            req.pane_id,
+            req.source,
+            req.name,
+            req.payload,
+        ) {
+            Ok(())
+        } else {
+            Err(generated_failed("custom recording event was not accepted"))
+        }
+    }
+    pub(crate) fn recordings_root_for_command(
+        &self,
+        _context: &NativeCommandContext,
+    ) -> std::result::Result<PathBuf, PluginCommandError> {
+        Ok(self
+            .config
+            .read()
+            .map_err(|_| PluginCommandError::failed("recording plugin config lock is poisoned"))?
+            .recordings_dir
+            .clone())
+    }
+    fn rolling_handle(&self) -> Arc<RwLock<RollingRecordingRuntimeHandle>> {
+        Arc::clone(&self.rolling)
+    }
+    fn run_queued_cut_job(&self, job_id: uuid::Uuid, req: QueueCutRequest) {
+        let cutting = self.update_recording_job(job_id, |job| {
+            job.status = recording_types::RecordingJobStatus::Cutting;
+        });
+        self.publish_recording_job_updated(&cutting);
+        self.publish_recording_cut_started(req.last_seconds, req.name.clone());
+
+        let summary = match self.handle_cut(req.last_seconds, req.name) {
+            Ok(summary) => summary,
+            Err(error) => {
+                let reason = error.to_string();
+                let failed = self.update_recording_job(job_id, |job| {
+                    job.status = recording_types::RecordingJobStatus::Failed;
+                    job.error = Some(reason.clone());
+                });
+                self.publish_recording_job_updated(&failed);
+                self.publish_recording_cut_failed(reason);
+                return;
+            }
+        };
+
+        self.publish_recording_cut_completed(&summary);
+        let cut_completed = self.update_recording_job(job_id, |job| {
+            job.status = recording_types::RecordingJobStatus::CutCompleted;
+            job.recording_id = Some(summary.id);
+            job.recording_path = Some(summary.path.clone());
+        });
+        self.publish_recording_job_updated(&cut_completed);
+
+        let export_settings = self.current_auto_export_settings(req.export_fps);
+        if !export_settings.enabled {
+            tracing::info!(
+                job_id = %job_id,
+                recording_id = %summary.id,
+                "recording cut auto-export disabled"
+            );
+            let completed = self.update_recording_job(job_id, |job| {
+                job.status = recording_types::RecordingJobStatus::Completed;
+            });
+            self.publish_recording_job_updated(&completed);
+            return;
+        }
+
+        let recording_dir = PathBuf::from(&summary.path);
+        let output_path = auto_export_output_path(
+            &recording_dir,
+            export_settings.output_dir.as_deref(),
+            summary.id,
+        );
+        let output = output_path.to_string_lossy().to_string();
+        tracing::info!(
+            job_id = %job_id,
+            recording_id = %summary.id,
+            output_path = %output,
+            fps = export_settings.fps,
+            "recording cut auto-export starting"
+        );
+        self.publish_recording_export_started(summary.id, output.clone());
+        let exporting = self.update_recording_job(job_id, |job| {
+            job.status = recording_types::RecordingJobStatus::Exporting;
+            job.export_output_path = Some(output.clone());
+        });
+        self.publish_recording_job_updated(&exporting);
+
+        match export::export_recording_gif_for_recording_dir(
+            &recording_dir,
+            summary.id,
+            &output,
+            export_settings.fps,
+        ) {
+            Ok(()) => {
+                tracing::info!(
+                    job_id = %job_id,
+                    recording_id = %summary.id,
+                    output_path = %output,
+                    "recording cut auto-export completed"
+                );
+                self.publish_recording_export_completed(summary.id, output);
+                let completed = self.update_recording_job(job_id, |job| {
+                    job.status = recording_types::RecordingJobStatus::Completed;
+                });
+                self.publish_recording_job_updated(&completed);
+            }
+            Err(error) => {
+                let reason = error.to_string();
+                tracing::warn!(
+                    job_id = %job_id,
+                    recording_id = %summary.id,
+                    output_path = %output,
+                    error = %reason,
+                    "recording cut auto-export failed"
+                );
+                self.publish_recording_export_failed(summary.id, output, reason.clone());
+                let failed = self.update_recording_job(job_id, |job| {
+                    job.status = recording_types::RecordingJobStatus::Failed;
+                    job.error = Some(reason);
+                });
+                self.publish_recording_job_updated(&failed);
+            }
+        }
+    }
+    fn run_recording_cut_command_queued(
+        &self,
+        context: &NativeCommandContext,
+    ) -> std::result::Result<i32, PluginCommandError> {
+        let last_seconds = parse_u64_option(&context.arguments, "last-seconds");
+        let export_fps = parse_u32_option(&context.arguments, "export-fps");
+        let name = parse_string_option(&context.arguments, "name");
+        tracing::info!(
+            invocation_source = ?context.invocation_source,
+            ?last_seconds,
+            ?export_fps,
+            name = ?name,
+            "recording cut enqueue requested"
+        );
+
+        let job = self
+            .recording_queue_cut_generated(QueueCutRequest {
+                last_seconds,
+                name,
+                export_fps,
+            })
+            .map_err(|error| {
+                tracing::warn!(?error, "recording cut queue failed");
+                PluginCommandError::failed(format!("failed queueing recording cut: {error:?}"))
+            })?;
+
+        tracing::info!(job_id = %job.id, status = ?job.status, "recording cut queued");
+        bmux_plugin_sdk::record_command_outcome_metadata(
+            bmux_plugin_sdk::COMMAND_OUTCOME_STATUS_MESSAGE_KEY,
+            serde_json::json!(format!("recording cut queued: {}", job.id)),
+        );
+        Ok(0)
+    }
+    fn run_recording_export_command(
+        &self,
+        context: &NativeCommandContext,
+    ) -> std::result::Result<i32, PluginCommandError> {
+        reject_unsupported_recording_export_args(&context.arguments)?;
+        let recording_id = first_positional_argument(&context.arguments).ok_or_else(|| {
+            PluginCommandError::failed("recording export requires a recording id")
+        })?;
+        let format =
+            parse_string_option(&context.arguments, "format").unwrap_or_else(|| "gif".to_string());
+        if format != "gif" {
+            return Err(PluginCommandError::failed(format!(
+                "unsupported recording export format '{format}'; only gif is supported"
+            )));
+        }
+        let output = parse_string_option(&context.arguments, "output").ok_or_else(|| {
+            PluginCommandError::failed("recording export requires --output <PATH>")
+        })?;
+        let fps = parse_u32_option(&context.arguments, "fps")
+            .unwrap_or(24)
+            .max(1);
+        let recordings_root = self.recordings_root_for_command(context)?;
+
+        export::export_recording_gif_from_root(&recordings_root, &recording_id, &output, fps)
+            .map_err(|error| {
+                PluginCommandError::failed(format!("recording export failed: {error}"))
+            })?;
+        bmux_plugin_sdk::record_command_outcome_metadata(
+            bmux_plugin_sdk::COMMAND_OUTCOME_STATUS_MESSAGE_KEY,
+            serde_json::json!(format!("recording export complete: {output}")),
+        );
+        Ok(0)
+    }
+    fn try_restart_rolling(
+        &self,
+        root: &Path,
+        segment_mb: usize,
+        settings: &RollingRecordingSettings,
+        name: Option<String>,
+    ) -> Option<RecordingSummary> {
+        let handle = self.rolling_handle();
+        let guard = handle.read().ok()?;
+        let mut rolling = guard.0.lock().ok()?;
+        if rolling.is_none() {
+            *rolling = Some(RecordingRuntime::new_rolling(
+                root.to_path_buf(),
+                segment_mb,
+                settings.window_secs,
+            ));
+        }
+        let runtime = rolling.as_mut()?;
+        if runtime.rolling_window_secs() != Some(settings.window_secs) {
+            *runtime =
+                RecordingRuntime::new_rolling(root.to_path_buf(), segment_mb, settings.window_secs);
+        }
+        runtime
+            .start(
+                None,
+                settings.capture_input(),
+                name,
+                RecordingProfile::Full,
+                settings.event_kinds.clone(),
+            )
+            .ok()
+    }
+    fn update_recording_job(
+        &self,
+        job_id: uuid::Uuid,
+        update: impl FnOnce(&mut recording_types::RecordingJob),
+    ) -> recording_types::RecordingJob {
+        let mut jobs = self
+            .recording_jobs()
+            .lock()
+            .expect("recording jobs lock should not be poisoned");
+        let job = jobs.entry(job_id).or_insert_with(|| {
+            let mut job = new_recording_job(recording_types::RecordingJobKind::Cut);
+            job.id = job_id;
+            job
+        });
+        update(job);
+        job.clone()
+    }
+    fn upsert_recording_job(&self, job: recording_types::RecordingJob) {
+        if let Ok(mut jobs) = self.recording_jobs().lock() {
+            jobs.insert(job.id, job);
+        }
+    }
+}
 fn should_queue_recording_cut_for_non_cli(context: &NativeCommandContext) -> bool {
     context.command == "recording-cut" && !context.invocation_source.is_cli()
-}
-
-fn run_recording_export_command(
-    context: &NativeCommandContext,
-) -> std::result::Result<i32, PluginCommandError> {
-    reject_unsupported_recording_export_args(&context.arguments)?;
-    let recording_id = first_positional_argument(&context.arguments)
-        .ok_or_else(|| PluginCommandError::failed("recording export requires a recording id"))?;
-    let format =
-        parse_string_option(&context.arguments, "format").unwrap_or_else(|| "gif".to_string());
-    if format != "gif" {
-        return Err(PluginCommandError::failed(format!(
-            "unsupported recording export format '{format}'; only gif is supported"
-        )));
-    }
-    let output = parse_string_option(&context.arguments, "output")
-        .ok_or_else(|| PluginCommandError::failed("recording export requires --output <PATH>"))?;
-    let fps = parse_u32_option(&context.arguments, "fps")
-        .unwrap_or(24)
-        .max(1);
-    let recordings_root = recordings_root_for_command(context)?;
-
-    export::export_recording_gif_from_root(&recordings_root, &recording_id, &output, fps)
-        .map_err(|error| PluginCommandError::failed(format!("recording export failed: {error}")))?;
-    bmux_plugin_sdk::record_command_outcome_metadata(
-        bmux_plugin_sdk::COMMAND_OUTCOME_STATUS_MESSAGE_KEY,
-        serde_json::json!(format!("recording export complete: {output}")),
-    );
-    Ok(0)
 }
 
 fn reject_unsupported_recording_export_args(
@@ -560,22 +1781,6 @@ fn reject_unsupported_recording_export_args(
     Ok(())
 }
 
-pub(crate) fn recordings_root_for_command(
-    context: &NativeCommandContext,
-) -> std::result::Result<PathBuf, PluginCommandError> {
-    if let Some(config_handle) = config_handle() {
-        return Ok(config_handle
-            .read()
-            .map_err(|_| PluginCommandError::failed("recording plugin config lock is poisoned"))?
-            .recordings_dir
-            .clone());
-    }
-
-    Ok(Path::new(&context.connection.state_dir)
-        .join("runtime")
-        .join("recordings"))
-}
-
 fn first_positional_argument(arguments: &[String]) -> Option<String> {
     let mut iter = arguments.iter();
     while let Some(arg) = iter.next() {
@@ -589,74 +1794,6 @@ fn first_positional_argument(arguments: &[String]) -> Option<String> {
         return Some(arg.clone());
     }
     None
-}
-
-fn run_recording_cut_command_queued(
-    context: &NativeCommandContext,
-) -> std::result::Result<i32, PluginCommandError> {
-    let last_seconds = parse_u64_option(&context.arguments, "last-seconds");
-    let export_fps = parse_u32_option(&context.arguments, "export-fps");
-    let name = parse_string_option(&context.arguments, "name");
-    tracing::info!(
-        invocation_source = ?context.invocation_source,
-        ?last_seconds,
-        ?export_fps,
-        name = ?name,
-        "recording cut enqueue requested"
-    );
-
-    let service_context = queue_cut_service_context_from_command(context);
-    let job = recording_queue_cut_generated(
-        QueueCutRequest {
-            last_seconds,
-            name,
-            export_fps,
-        },
-        &service_context,
-    )
-    .map_err(|error| {
-        tracing::warn!(?error, "recording cut queue failed");
-        PluginCommandError::failed(format!("failed queueing recording cut: {error:?}"))
-    })?;
-
-    tracing::info!(job_id = %job.id, status = ?job.status, "recording cut queued");
-    bmux_plugin_sdk::record_command_outcome_metadata(
-        bmux_plugin_sdk::COMMAND_OUTCOME_STATUS_MESSAGE_KEY,
-        serde_json::json!(format!("recording cut queued: {}", job.id)),
-    );
-    Ok(0)
-}
-
-fn queue_cut_service_context_from_command(context: &NativeCommandContext) -> NativeServiceContext {
-    let service = RegisteredService {
-        capability: HostScope::new("bmux.recording.write")
-            .expect("recording write capability should be valid"),
-        kind: ServiceKind::Command,
-        interface_id: "recording-commands".to_string(),
-        provider: ProviderId::Plugin("bmux.recording".to_string()),
-    };
-    NativeServiceContext {
-        plugin_id: context.plugin_id.clone(),
-        request: ServiceRequest {
-            caller_plugin_id: context.plugin_id.clone(),
-            service,
-            operation: "queue-cut".to_string(),
-            payload: Vec::new(),
-        },
-        required_capabilities: context.required_capabilities.clone(),
-        provided_capabilities: context.provided_capabilities.clone(),
-        services: context.services.clone(),
-        available_capabilities: context.available_capabilities.clone(),
-        enabled_plugins: context.enabled_plugins.clone(),
-        plugin_search_roots: context.plugin_search_roots.clone(),
-        host: context.host.clone(),
-        connection: context.connection.clone(),
-        settings: context.settings.clone(),
-        plugin_settings_map: context.plugin_settings_map.clone(),
-        caller_client_id: context.caller_client_id,
-        cancellation: bmux_plugin_sdk::CancellationToken::default(),
-        host_kernel_bridge: context.host_kernel_bridge.clone(),
-    }
 }
 
 fn parse_u64_option(arguments: &[String], long_name: &str) -> Option<u64> {
@@ -688,65 +1825,59 @@ fn parse_string_option(arguments: &[String], long_name: &str) -> Option<String> 
     None
 }
 
-fn spawn_prune_loop(manual_runtime: Arc<Mutex<RecordingRuntime>>) {
-    std::thread::spawn(move || {
-        // Initial prune on startup.
-        if let Ok(runtime) = manual_runtime.lock() {
-            let _ = runtime.prune(None);
-        }
-        loop {
-            std::thread::sleep(std::time::Duration::from_hours(1));
-            if let Ok(runtime) = manual_runtime.lock() {
-                let _ = runtime.prune(None);
-            }
-        }
-    });
-}
-
 fn auto_start_manual(
     manual_runtime: &Arc<Mutex<RecordingRuntime>>,
     options: &ManualRecordingStartOptions,
-) {
-    let Ok(mut runtime) = manual_runtime.lock() else {
-        return;
-    };
+) -> Result<(), PluginCommandError> {
+    let mut runtime = manual_runtime
+        .lock()
+        .map_err(|_| PluginCommandError::failed("manual recording runtime poisoned"))?;
     if runtime.status().active.is_some() {
-        return;
+        return Err(PluginCommandError::failed(
+            "manual recording already active",
+        ));
     }
-    let profile = options.profile.unwrap_or(RecordingProfile::Full);
-    let event_kinds = options
-        .event_kinds
-        .clone()
-        .unwrap_or_else(default_event_kinds);
-    let _ = runtime.start(
-        None,
-        options.capture_input,
-        options.name.clone(),
-        profile,
-        event_kinds,
-    );
+    runtime
+        .start(
+            None,
+            options.capture_input,
+            options.name.clone(),
+            options.profile.unwrap_or(RecordingProfile::Full),
+            options
+                .event_kinds
+                .clone()
+                .unwrap_or_else(default_event_kinds),
+        )
+        .map_err(|error| PluginCommandError::failed(error.to_string()))?;
+    Ok(())
 }
-
 fn auto_start_rolling(
     rolling_runtime: &Arc<Mutex<Option<RecordingRuntime>>>,
     settings: &RollingRecordingSettings,
-) {
-    let Ok(mut guard) = rolling_runtime.lock() else {
-        return;
-    };
-    let Some(runtime) = guard.as_mut() else {
-        return;
-    };
+) -> Result<(), PluginCommandError> {
+    let mut guard = rolling_runtime
+        .lock()
+        .map_err(|_| PluginCommandError::failed("rolling recording runtime poisoned"))?;
+    let runtime = guard.as_mut().ok_or_else(|| {
+        PluginCommandError::unavailable(
+            "rolling recording requested without available capture settings",
+        )
+    })?;
     if runtime.status().active.is_some() {
-        return;
+        return Err(PluginCommandError::failed(
+            "rolling recording already active",
+        ));
     }
-    let _ = runtime.start(
-        None,
-        settings.capture_input(),
-        None,
-        RecordingProfile::Full,
-        settings.event_kinds.clone(),
-    );
+    runtime
+        .start(
+            None,
+            settings.capture_input(),
+            None,
+            RecordingProfile::Full,
+            settings.event_kinds.clone(),
+        )
+        .map_err(|error| PluginCommandError::failed(error.to_string()))?;
+    Ok(())
 }
 
 fn generated_failed(reason: impl Into<String>) -> recording_types::RecordingError {
@@ -767,167 +1898,6 @@ fn recording_error_message(error: &recording_types::RecordingError) -> String {
     }
 }
 
-fn recording_status_generated() -> recording_types::RecordingStatus {
-    handle_status().into()
-}
-
-fn recording_list_generated() -> Vec<recording_types::RecordingSummary> {
-    handle_list().into_iter().map(Into::into).collect()
-}
-
-fn recording_rolling_status_generated() -> recording_types::RecordingRollingStatus {
-    handle_rolling_status().into()
-}
-
-fn recording_capture_targets_generated() -> Vec<recording_types::RecordingCaptureTarget> {
-    handle_capture_targets()
-        .into_iter()
-        .map(Into::into)
-        .collect()
-}
-
-fn recording_start_generated(
-    req: StartRequest,
-) -> Result<recording_types::RecordingSummary, recording_types::RecordingError> {
-    let recording = handle_start(
-        req.session_id,
-        req.capture_input,
-        req.name,
-        req.profile.map(Into::into),
-        req.event_kinds
-            .map(|kinds| kinds.into_iter().map(Into::into).collect()),
-    )
-    .ok_or_else(|| generated_failed("recording start failed"))?;
-    publish_recording_started(&recording, None);
-    Ok(recording.into())
-}
-
-fn recording_stop_generated(
-    recording_id: Option<uuid::Uuid>,
-) -> Result<uuid::Uuid, recording_types::RecordingError> {
-    let summary = handle_stop(recording_id).ok_or(recording_types::RecordingError::NoActive)?;
-    let recording_id = summary.id;
-    publish_recording_stopped(recording_id);
-    maybe_auto_export_stopped_recording(&summary);
-    Ok(recording_id)
-}
-
-fn recording_write_custom_event_generated(
-    req: WriteCustomEventRequest,
-) -> Result<(), recording_types::RecordingError> {
-    if handle_write_custom_event(
-        req.session_id,
-        req.pane_id,
-        req.source,
-        req.name,
-        req.payload,
-    ) {
-        Ok(())
-    } else {
-        Err(generated_failed("custom recording event was not accepted"))
-    }
-}
-
-fn recording_delete_generated(
-    recording_id: uuid::Uuid,
-) -> Result<uuid::Uuid, recording_types::RecordingError> {
-    handle_delete(recording_id).ok_or_else(|| generated_failed("recording delete failed"))
-}
-
-fn recording_delete_all_generated() -> u64 {
-    u64::try_from(handle_delete_all()).unwrap_or(u64::MAX)
-}
-
-fn recording_cut_generated(
-    req: CutRequest,
-) -> Result<recording_types::RecordingSummary, recording_types::RecordingError> {
-    publish_recording_cut_started(req.last_seconds, req.name.clone());
-    match handle_cut(req.last_seconds, req.name) {
-        Ok(summary) => {
-            publish_recording_cut_completed(&summary);
-            Ok(summary.into())
-        }
-        Err(error) => {
-            let reason = error.to_string();
-            publish_recording_cut_failed(reason.clone());
-            Err(generated_failed(reason))
-        }
-    }
-}
-
-fn recording_job_status_generated(job_id: uuid::Uuid) -> Option<recording_types::RecordingJob> {
-    recording_jobs()
-        .lock()
-        .ok()
-        .and_then(|jobs| jobs.get(&job_id).cloned())
-}
-
-fn recording_list_jobs_generated() -> Vec<recording_types::RecordingJob> {
-    recording_jobs()
-        .lock()
-        .map(|jobs| jobs.values().cloned().collect())
-        .unwrap_or_default()
-}
-
-fn recording_queue_cut_generated(
-    req: QueueCutRequest,
-    _ctx: &NativeServiceContext,
-) -> Result<recording_types::RecordingJob, recording_types::RecordingError> {
-    // Validate preconditions synchronously so the caller gets fast failure when
-    // the plugin state is unavailable.
-    let config_handle = global_plugin_state_registry()
-        .get::<RecordingPluginConfig>()
-        .ok_or_else(|| generated_failed("recording plugin config is unavailable"))?;
-    if config_handle.read().is_err() {
-        return Err(generated_failed("recording plugin config lock is poisoned"));
-    }
-
-    let rolling_handle = rolling_handle()
-        .ok_or_else(|| generated_failed("recording rolling runtime handle is unavailable"))?;
-    let guard = rolling_handle
-        .read()
-        .map_err(|_| generated_failed("recording rolling runtime handle lock is poisoned"))?;
-    let rolling = guard
-        .0
-        .lock()
-        .map_err(|_| generated_failed("recording rolling runtime lock is poisoned"))?;
-    let runtime = rolling.as_ref().ok_or_else(|| {
-        generated_failed("recording cut requires rolling recording mode to be enabled")
-    })?;
-    let has_active = runtime.status().active.is_some();
-    let _ = runtime;
-    drop(rolling);
-    drop(guard);
-    drop(rolling_handle);
-
-    if !has_active {
-        return Err(generated_failed(
-            "no active rolling recording available for cut",
-        ));
-    }
-
-    let job = new_recording_job(recording_types::RecordingJobKind::Cut);
-    upsert_recording_job(job.clone());
-    publish_recording_job_updated(&job);
-
-    let job_id = job.id;
-    if let Err(error) = std::thread::Builder::new()
-        .name("bmux-recording-cut-worker".to_string())
-        .spawn(move || run_queued_cut_job(job_id, req))
-    {
-        let reason = format!("failed spawning cut worker thread: {error}");
-        let failed = update_recording_job(job_id, |job| {
-            job.status = recording_types::RecordingJobStatus::Failed;
-            job.error = Some(reason.clone());
-        });
-        publish_recording_job_updated(&failed);
-        publish_recording_cut_failed(reason.clone());
-        return Err(generated_failed(reason));
-    }
-
-    Ok(job)
-}
-
 fn new_recording_job(kind: recording_types::RecordingJobKind) -> recording_types::RecordingJob {
     recording_types::RecordingJob {
         id: uuid::Uuid::new_v4(),
@@ -940,204 +1910,10 @@ fn new_recording_job(kind: recording_types::RecordingJobKind) -> recording_types
     }
 }
 
-fn upsert_recording_job(job: recording_types::RecordingJob) {
-    if let Ok(mut jobs) = recording_jobs().lock() {
-        jobs.insert(job.id, job);
-    }
-}
-
-fn update_recording_job(
-    job_id: uuid::Uuid,
-    update: impl FnOnce(&mut recording_types::RecordingJob),
-) -> recording_types::RecordingJob {
-    let mut jobs = recording_jobs()
-        .lock()
-        .expect("recording jobs lock should not be poisoned");
-    let job = jobs.entry(job_id).or_insert_with(|| {
-        let mut job = new_recording_job(recording_types::RecordingJobKind::Cut);
-        job.id = job_id;
-        job
-    });
-    update(job);
-    job.clone()
-}
-
-fn run_queued_cut_job(job_id: uuid::Uuid, req: QueueCutRequest) {
-    let cutting = update_recording_job(job_id, |job| {
-        job.status = recording_types::RecordingJobStatus::Cutting;
-    });
-    publish_recording_job_updated(&cutting);
-    publish_recording_cut_started(req.last_seconds, req.name.clone());
-
-    let summary = match handle_cut(req.last_seconds, req.name) {
-        Ok(summary) => summary,
-        Err(error) => {
-            let reason = error.to_string();
-            let failed = update_recording_job(job_id, |job| {
-                job.status = recording_types::RecordingJobStatus::Failed;
-                job.error = Some(reason.clone());
-            });
-            publish_recording_job_updated(&failed);
-            publish_recording_cut_failed(reason);
-            return;
-        }
-    };
-
-    publish_recording_cut_completed(&summary);
-    let cut_completed = update_recording_job(job_id, |job| {
-        job.status = recording_types::RecordingJobStatus::CutCompleted;
-        job.recording_id = Some(summary.id);
-        job.recording_path = Some(summary.path.clone());
-    });
-    publish_recording_job_updated(&cut_completed);
-
-    let export_settings = current_auto_export_settings(req.export_fps);
-    if !export_settings.enabled {
-        tracing::info!(
-            job_id = %job_id,
-            recording_id = %summary.id,
-            "recording cut auto-export disabled"
-        );
-        let completed = update_recording_job(job_id, |job| {
-            job.status = recording_types::RecordingJobStatus::Completed;
-        });
-        publish_recording_job_updated(&completed);
-        return;
-    }
-
-    let recording_dir = PathBuf::from(&summary.path);
-    let output_path = auto_export_output_path(
-        &recording_dir,
-        export_settings.output_dir.as_deref(),
-        summary.id,
-    );
-    let output = output_path.to_string_lossy().to_string();
-    tracing::info!(
-        job_id = %job_id,
-        recording_id = %summary.id,
-        output_path = %output,
-        fps = export_settings.fps,
-        "recording cut auto-export starting"
-    );
-    publish_recording_export_started(summary.id, output.clone());
-    let exporting = update_recording_job(job_id, |job| {
-        job.status = recording_types::RecordingJobStatus::Exporting;
-        job.export_output_path = Some(output.clone());
-    });
-    publish_recording_job_updated(&exporting);
-
-    match export::export_recording_gif_for_recording_dir(
-        &recording_dir,
-        summary.id,
-        &output,
-        export_settings.fps,
-    ) {
-        Ok(()) => {
-            tracing::info!(
-                job_id = %job_id,
-                recording_id = %summary.id,
-                output_path = %output,
-                "recording cut auto-export completed"
-            );
-            publish_recording_export_completed(summary.id, output);
-            let completed = update_recording_job(job_id, |job| {
-                job.status = recording_types::RecordingJobStatus::Completed;
-            });
-            publish_recording_job_updated(&completed);
-        }
-        Err(error) => {
-            let reason = error.to_string();
-            tracing::warn!(
-                job_id = %job_id,
-                recording_id = %summary.id,
-                output_path = %output,
-                error = %reason,
-                "recording cut auto-export failed"
-            );
-            publish_recording_export_failed(summary.id, output, reason.clone());
-            let failed = update_recording_job(job_id, |job| {
-                job.status = recording_types::RecordingJobStatus::Failed;
-                job.error = Some(reason);
-            });
-            publish_recording_job_updated(&failed);
-        }
-    }
-}
-
 pub(crate) struct AutoExportSettings {
     pub(crate) enabled: bool,
     pub(crate) output_dir: Option<PathBuf>,
     pub(crate) fps: u32,
-}
-
-pub(crate) fn current_auto_export_settings(fps_override: Option<u32>) -> AutoExportSettings {
-    let Some(config_handle) = config_handle() else {
-        return AutoExportSettings {
-            enabled: false,
-            output_dir: None,
-            fps: fps_override.unwrap_or(24).max(1),
-        };
-    };
-    let Ok(config) = config_handle.read() else {
-        return AutoExportSettings {
-            enabled: false,
-            output_dir: None,
-            fps: fps_override.unwrap_or(24).max(1),
-        };
-    };
-    AutoExportSettings {
-        enabled: config.auto_export || config.auto_export_dir.is_some(),
-        output_dir: config.auto_export_dir.clone(),
-        fps: fps_override.unwrap_or(config.auto_export_fps).max(1),
-    }
-}
-
-fn maybe_auto_export_stopped_recording(summary: &RecordingSummary) {
-    let export_settings = current_auto_export_settings(None);
-    if !export_settings.enabled {
-        tracing::info!(recording_id = %summary.id, "recording stop auto-export disabled");
-        return;
-    }
-
-    let recording_dir = PathBuf::from(&summary.path);
-    let output_path = auto_export_output_path(
-        &recording_dir,
-        export_settings.output_dir.as_deref(),
-        summary.id,
-    );
-    let output = output_path.to_string_lossy().to_string();
-    tracing::info!(
-        recording_id = %summary.id,
-        output_path = %output,
-        fps = export_settings.fps,
-        "recording stop auto-export starting"
-    );
-    publish_recording_export_started(summary.id, output.clone());
-    match export::export_recording_gif_for_recording_dir(
-        &recording_dir,
-        summary.id,
-        &output,
-        export_settings.fps,
-    ) {
-        Ok(()) => {
-            tracing::info!(
-                recording_id = %summary.id,
-                output_path = %output,
-                "recording stop auto-export completed"
-            );
-            publish_recording_export_completed(summary.id, output);
-        }
-        Err(error) => {
-            let reason = error.to_string();
-            tracing::warn!(
-                recording_id = %summary.id,
-                output_path = %output,
-                error = %reason,
-                "recording stop auto-export failed"
-            );
-            publish_recording_export_failed(summary.id, output, reason);
-        }
-    }
 }
 
 pub(crate) fn auto_export_output_path(
@@ -1156,166 +1932,17 @@ pub(crate) fn auto_export_output_path(
     output_dir.join(format!("recording-{recording_id}.gif"))
 }
 
-fn recording_rolling_start_generated(
-    options: recording_types::RecordingRollingStartOptions,
-) -> Result<recording_types::RecordingSummary, recording_types::RecordingError> {
-    let recording =
-        handle_rolling_start(options.into()).ok_or(recording_types::RecordingError::Unavailable)?;
-    publish_recording_started(&recording, handle_rolling_status().rolling_window_secs);
-    Ok(recording.into())
-}
-
-fn recording_rolling_stop_generated() -> Result<uuid::Uuid, recording_types::RecordingError> {
-    let recording_id = handle_rolling_stop().ok_or(recording_types::RecordingError::NoActive)?;
-    publish_recording_stopped(recording_id);
-    Ok(recording_id)
-}
-
-fn recording_rolling_clear_generated(
-    restart_if_active: bool,
-) -> recording_types::RecordingRollingClearReport {
-    let report = handle_rolling_clear(restart_if_active);
-    if let Some(recording_id) = report.stopped_recording_id {
-        publish_recording_stopped(recording_id);
-    }
-    if let Some(recording) = report.restarted_recording.as_ref() {
-        publish_recording_started(recording, handle_rolling_status().rolling_window_secs);
-    }
-    report.into()
-}
-
-fn recording_prune_generated(older_than_days: Option<u64>) -> u64 {
-    u64::try_from(handle_prune(older_than_days)).unwrap_or(u64::MAX)
-}
-
 // ────────────────────────────────────────────────────────────────────
 // Registry lookup helpers
 // ────────────────────────────────────────────────────────────────────
-
-fn manual_handle() -> Option<Arc<RwLock<ManualRecordingRuntimeHandle>>> {
-    global_plugin_state_registry().get::<ManualRecordingRuntimeHandle>()
-}
-
-fn rolling_handle() -> Option<Arc<RwLock<RollingRecordingRuntimeHandle>>> {
-    global_plugin_state_registry().get::<RollingRecordingRuntimeHandle>()
-}
 
 fn config_handle() -> Option<Arc<RwLock<RecordingPluginConfig>>> {
     global_plugin_state_registry().get::<RecordingPluginConfig>()
 }
 
-fn publish_recording_started(recording: &RecordingSummary, rolling_window_secs: Option<u64>) {
-    let target = recording_types::RecordingCaptureTarget {
-        recording_id: recording.id,
-        path: recording.path.clone(),
-        rolling_window_secs,
-    };
-    let _ = bmux_plugin::global_event_bus().emit(
-        &recording_events::EVENT_KIND,
-        recording_events::RecordingEvent::Started { target },
-    );
-}
-
-fn publish_recording_stopped(recording_id: uuid::Uuid) {
-    let _ = bmux_plugin::global_event_bus().emit(
-        &recording_events::EVENT_KIND,
-        recording_events::RecordingEvent::Stopped { recording_id },
-    );
-}
-
-fn publish_recording_cut_started(last_seconds: Option<u64>, name: Option<String>) {
-    let _ = bmux_plugin::global_event_bus().emit(
-        &recording_events::EVENT_KIND,
-        recording_events::RecordingEvent::CutStarted { last_seconds, name },
-    );
-}
-
-fn publish_recording_cut_completed(summary: &RecordingSummary) {
-    let _ = bmux_plugin::global_event_bus().emit(
-        &recording_events::EVENT_KIND,
-        recording_events::RecordingEvent::CutCompleted {
-            summary: summary.clone().into(),
-        },
-    );
-}
-
-fn publish_recording_cut_failed(reason: String) {
-    let _ = bmux_plugin::global_event_bus().emit(
-        &recording_events::EVENT_KIND,
-        recording_events::RecordingEvent::CutFailed { reason },
-    );
-}
-
-pub(crate) fn publish_recording_export_started(recording_id: uuid::Uuid, output_path: String) {
-    let _ = bmux_plugin::global_event_bus().emit(
-        &recording_events::EVENT_KIND,
-        recording_events::RecordingEvent::ExportStarted {
-            recording_id,
-            output_path,
-        },
-    );
-}
-
-pub(crate) fn publish_recording_export_completed(recording_id: uuid::Uuid, output_path: String) {
-    let _ = bmux_plugin::global_event_bus().emit(
-        &recording_events::EVENT_KIND,
-        recording_events::RecordingEvent::ExportCompleted {
-            recording_id,
-            output_path,
-        },
-    );
-}
-
-pub(crate) fn publish_recording_export_failed(
-    recording_id: uuid::Uuid,
-    output_path: String,
-    reason: String,
-) {
-    let _ = bmux_plugin::global_event_bus().emit(
-        &recording_events::EVENT_KIND,
-        recording_events::RecordingEvent::ExportFailed {
-            recording_id,
-            output_path,
-            reason,
-        },
-    );
-}
-
-fn publish_recording_job_updated(job: &recording_types::RecordingJob) {
-    let _ = bmux_plugin::global_event_bus().emit(
-        &recording_events::EVENT_KIND,
-        recording_events::RecordingEvent::JobUpdated { job: job.clone() },
-    );
-}
-
 // ────────────────────────────────────────────────────────────────────
 // Simple operations against the manual runtime
 // ────────────────────────────────────────────────────────────────────
-
-fn handle_start(
-    session_id: Option<uuid::Uuid>,
-    capture_input: bool,
-    name: Option<String>,
-    profile: Option<RecordingProfile>,
-    event_kinds: Option<Vec<RecordingEventKind>>,
-) -> Option<RecordingSummary> {
-    let handle = manual_handle()?;
-    let guard = handle.read().ok()?;
-    let mut runtime = guard.0.lock().ok()?;
-
-    let profile = profile.unwrap_or(RecordingProfile::Full);
-    let event_kinds = event_kinds.unwrap_or_else(default_event_kinds);
-    runtime
-        .start(session_id, capture_input, name, profile, event_kinds)
-        .ok()
-}
-
-fn handle_stop(recording_id: Option<uuid::Uuid>) -> Option<RecordingSummary> {
-    let handle = manual_handle()?;
-    let guard = handle.read().ok()?;
-    let mut runtime = guard.0.lock().ok()?;
-    runtime.stop(recording_id).ok()
-}
 
 fn empty_status() -> RecordingStatus {
     RecordingStatus {
@@ -1324,140 +1951,13 @@ fn empty_status() -> RecordingStatus {
     }
 }
 
-fn handle_status() -> RecordingStatus {
-    let Some(handle) = manual_handle() else {
-        return empty_status();
-    };
-    let Ok(guard) = handle.read() else {
-        return empty_status();
-    };
-    let Ok(runtime) = guard.0.lock() else {
-        return empty_status();
-    };
-    runtime.status()
-}
-
-fn handle_list() -> Vec<RecordingSummary> {
-    let Some(handle) = manual_handle() else {
-        return Vec::new();
-    };
-    let Ok(guard) = handle.read() else {
-        return Vec::new();
-    };
-    let Ok(runtime) = guard.0.lock() else {
-        return Vec::new();
-    };
-    runtime.list().unwrap_or_default()
-}
-
-fn handle_delete(recording_id: uuid::Uuid) -> Option<uuid::Uuid> {
-    let handle = manual_handle()?;
-    let guard = handle.read().ok()?;
-    let mut runtime = guard.0.lock().ok()?;
-    runtime.delete(recording_id).ok().map(|summary| summary.id)
-}
-
-fn handle_delete_all() -> usize {
-    let Some(handle) = manual_handle() else {
-        return 0;
-    };
-    let Ok(guard) = handle.read() else {
-        return 0;
-    };
-    let Ok(mut runtime) = guard.0.lock() else {
-        return 0;
-    };
-    runtime.delete_all().unwrap_or(0)
-}
-
-fn handle_prune(older_than_days: Option<u64>) -> usize {
-    let Some(handle) = manual_handle() else {
-        return 0;
-    };
-    let Ok(guard) = handle.read() else {
-        return 0;
-    };
-    let Ok(runtime) = guard.0.lock() else {
-        return 0;
-    };
-    runtime.prune(older_than_days).unwrap_or(0)
-}
-
 // ────────────────────────────────────────────────────────────────────
 // Custom event writes (both manual + rolling runtimes)
 // ────────────────────────────────────────────────────────────────────
 
-fn handle_write_custom_event(
-    session_id: Option<uuid::Uuid>,
-    pane_id: Option<uuid::Uuid>,
-    source: String,
-    name: String,
-    payload: Vec<u8>,
-) -> bool {
-    let payload = RecordingPayload::Custom {
-        source,
-        name,
-        payload,
-    };
-    let meta = RecordMeta {
-        session_id,
-        pane_id,
-        client_id: None,
-    };
-
-    let mut accepted = false;
-    if let Some(handle) = manual_handle()
-        && let Ok(guard) = handle.read()
-        && let Ok(runtime) = guard.0.lock()
-        && let Ok(recorded) = runtime.record(RecordingEventKind::Custom, payload.clone(), meta)
-    {
-        accepted |= recorded;
-    }
-    if let Some(handle) = rolling_handle()
-        && let Ok(guard) = handle.read()
-        && let Ok(rolling) = guard.0.lock()
-        && let Some(runtime) = rolling.as_ref()
-        && let Ok(recorded) = runtime.record(RecordingEventKind::Custom, payload, meta)
-    {
-        accepted |= recorded;
-    }
-
-    accepted
-}
-
 // ────────────────────────────────────────────────────────────────────
 // Capture-targets query
 // ────────────────────────────────────────────────────────────────────
-
-fn handle_capture_targets() -> Vec<RecordingCaptureTarget> {
-    let mut targets: Vec<RecordingCaptureTarget> = Vec::new();
-
-    if let Some(handle) = manual_handle()
-        && let Ok(guard) = handle.read()
-        && let Ok(runtime) = guard.0.lock()
-        && let Some((id, path)) = runtime.active_capture_target()
-    {
-        targets.push(RecordingCaptureTarget {
-            recording_id: id,
-            path: path.display().to_string(),
-            rolling_window_secs: None,
-        });
-    }
-    if let Some(handle) = rolling_handle()
-        && let Ok(guard) = handle.read()
-        && let Ok(rolling) = guard.0.lock()
-        && let Some(runtime) = rolling.as_ref()
-        && let Some((id, path)) = runtime.active_capture_target()
-    {
-        targets.push(RecordingCaptureTarget {
-            recording_id: id,
-            path: path.display().to_string(),
-            rolling_window_secs: runtime.rolling_window_secs(),
-        });
-    }
-
-    targets
-}
 
 // ────────────────────────────────────────────────────────────────────
 // Rolling-recording operations
@@ -1473,219 +1973,6 @@ fn empty_rolling_status(root_path: String) -> RecordingRollingStatus {
         event_kinds: Vec::new(),
         usage: RecordingRollingUsage::default(),
     }
-}
-
-fn handle_rolling_status() -> RecordingRollingStatus {
-    let Some(config) = config_handle() else {
-        return empty_rolling_status(String::new());
-    };
-    let Ok(cfg) = config.read() else {
-        return empty_rolling_status(String::new());
-    };
-    let root_path = cfg.rolling_recordings_dir.display().to_string();
-    let defaults = cfg.rolling_defaults.clone();
-    drop(cfg);
-
-    let usage = collect_rolling_usage(Path::new(&root_path)).unwrap_or_default();
-
-    let (active, rolling_window_secs, event_kinds) = rolling_handle()
-        .and_then(|handle| {
-            let guard = handle.read().ok()?;
-            let rolling = guard.0.lock().ok()?;
-            let runtime = rolling.as_ref()?;
-            let status = runtime.status();
-            let window = runtime.rolling_window_secs();
-            let kinds = status.active.as_ref().map_or_else(
-                || defaults.event_kinds.clone(),
-                |summary| summary.event_kinds.clone(),
-            );
-            Some((status.active, window, kinds))
-        })
-        .unwrap_or((None, None, defaults.event_kinds.clone()));
-
-    RecordingRollingStatus {
-        root_path,
-        auto_start: defaults.is_available(),
-        available: defaults.is_available(),
-        active,
-        rolling_window_secs: rolling_window_secs.or(Some(defaults.window_secs)),
-        event_kinds,
-        usage,
-    }
-}
-
-fn handle_rolling_stop() -> Option<uuid::Uuid> {
-    let handle = rolling_handle()?;
-    let guard = handle.read().ok()?;
-    let mut rolling = guard.0.lock().ok()?;
-    let runtime = rolling.as_mut()?;
-    runtime.status().active.as_ref()?;
-    runtime.stop(None).ok().map(|summary| summary.id)
-}
-
-fn handle_rolling_start(options: RecordingRollingStartOptions) -> Option<RecordingSummary> {
-    let config = config_handle()?;
-    let Ok(cfg) = config.read() else {
-        return None;
-    };
-    let resolved = apply_rolling_start_options(&cfg.rolling_defaults, &options);
-    let rolling_dir = cfg.rolling_recordings_dir.clone();
-    let segment_mb = cfg.rolling_segment_mb;
-    drop(cfg);
-
-    if !resolved.is_available() {
-        return None;
-    }
-
-    let handle = rolling_handle()?;
-    let Ok(guard) = handle.read() else {
-        return None;
-    };
-    let Ok(mut rolling) = guard.0.lock() else {
-        return None;
-    };
-
-    if rolling.is_none() {
-        *rolling = Some(RecordingRuntime::new_rolling(
-            rolling_dir.clone(),
-            segment_mb,
-            resolved.window_secs,
-        ));
-    }
-
-    let options_empty = rolling_start_options_is_empty(&options);
-    let runtime = rolling.as_mut()?;
-
-    if let Some(active) = runtime.status().active {
-        if options_empty {
-            return Some(active);
-        }
-        return None;
-    }
-
-    if runtime.rolling_window_secs() != Some(resolved.window_secs) {
-        *runtime = RecordingRuntime::new_rolling(rolling_dir, segment_mb, resolved.window_secs);
-    }
-
-    let Ok(recording) = runtime.start(
-        None,
-        resolved.capture_input(),
-        options.name,
-        RecordingProfile::Full,
-        resolved.event_kinds.clone(),
-    ) else {
-        return None;
-    };
-
-    Some(recording)
-}
-
-fn handle_cut(last_seconds: Option<u64>, name: Option<String>) -> anyhow::Result<RecordingSummary> {
-    let config =
-        config_handle().ok_or_else(|| anyhow::anyhow!("recording plugin config is unavailable"))?;
-    let cfg = config
-        .read()
-        .map_err(|_| anyhow::anyhow!("recording plugin config lock is poisoned"))?;
-    let output_root = cfg.recordings_dir.clone();
-    drop(cfg);
-
-    let plan = {
-        let handle = rolling_handle()
-            .ok_or_else(|| anyhow::anyhow!("recording rolling runtime handle is unavailable"))?;
-        let guard = handle
-            .read()
-            .map_err(|_| anyhow::anyhow!("recording rolling runtime handle lock is poisoned"))?;
-        let mut rolling = guard
-            .0
-            .lock()
-            .map_err(|_| anyhow::anyhow!("recording rolling runtime lock is poisoned"))?;
-        let runtime = rolling.as_mut().ok_or_else(|| {
-            anyhow::anyhow!("recording cut requires rolling recording mode to be enabled")
-        })?;
-        runtime.prepare_cut(output_root, last_seconds, name)?
-    };
-
-    let _cut_guard = cut_filesystem_lock()
-        .lock()
-        .map_err(|_| anyhow::anyhow!("recording cut filesystem lock is poisoned"))?;
-    execute_recording_cut(plan)
-}
-
-fn handle_rolling_clear(restart_if_active: bool) -> RecordingRollingClearReport {
-    let Some(config) = config_handle() else {
-        return empty_clear_report();
-    };
-    let Ok(cfg) = config.read() else {
-        return empty_clear_report();
-    };
-    let root = cfg.rolling_recordings_dir.clone();
-    let segment_mb = cfg.rolling_segment_mb;
-    let defaults = cfg.rolling_defaults.clone();
-    drop(cfg);
-
-    let usage_before = collect_rolling_usage(&root).unwrap_or_default();
-
-    // Stop the active rolling recording if any; capture enough state
-    // to restart it after clearing.
-    let (was_active, stopped_recording_id, restart_settings, restart_name) = {
-        let Some(handle) = rolling_handle() else {
-            return clear_report_response(&root, false, false, None, None, &usage_before);
-        };
-        let Ok(guard) = handle.read() else {
-            return clear_report_response(&root, false, false, None, None, &usage_before);
-        };
-        let Ok(mut rolling) = guard.0.lock() else {
-            return clear_report_response(&root, false, false, None, None, &usage_before);
-        };
-        let Some(runtime) = rolling.as_mut() else {
-            return clear_report_response(&root, false, false, None, None, &usage_before);
-        };
-        let Some(active) = runtime.status().active else {
-            return clear_report_response(&root, false, false, None, None, &usage_before);
-        };
-        let name = active.name.clone();
-        let settings = RollingRecordingSettings {
-            window_secs: runtime
-                .rolling_window_secs()
-                .unwrap_or(defaults.window_secs),
-            event_kinds: active.event_kinds.clone(),
-        };
-        let stopped_id = runtime.stop(None).ok().map(|summary| summary.id);
-        (true, stopped_id, Some(settings), name)
-    };
-
-    {
-        let Ok(_cut_guard) = cut_filesystem_lock().lock() else {
-            return empty_clear_report();
-        };
-        if clear_rolling_root(&root).is_err() {
-            return empty_clear_report();
-        }
-    }
-
-    let (restarted, restarted_recording) = if restart_if_active && was_active {
-        let settings = restart_settings.unwrap_or_else(|| defaults.clone());
-        if settings.is_available() {
-            let recording = try_restart_rolling(&root, segment_mb, &settings, restart_name);
-            match recording {
-                Some(rec) => (true, Some(rec)),
-                None => (false, None),
-            }
-        } else {
-            (false, None)
-        }
-    } else {
-        (false, None)
-    };
-
-    clear_report_response(
-        &root,
-        was_active,
-        restarted,
-        stopped_recording_id,
-        restarted_recording,
-        &usage_before,
-    )
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -1787,38 +2074,6 @@ fn clear_rolling_root(root: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-fn try_restart_rolling(
-    root: &Path,
-    segment_mb: usize,
-    settings: &RollingRecordingSettings,
-    name: Option<String>,
-) -> Option<RecordingSummary> {
-    let handle = rolling_handle()?;
-    let guard = handle.read().ok()?;
-    let mut rolling = guard.0.lock().ok()?;
-    if rolling.is_none() {
-        *rolling = Some(RecordingRuntime::new_rolling(
-            root.to_path_buf(),
-            segment_mb,
-            settings.window_secs,
-        ));
-    }
-    let runtime = rolling.as_mut()?;
-    if runtime.rolling_window_secs() != Some(settings.window_secs) {
-        *runtime =
-            RecordingRuntime::new_rolling(root.to_path_buf(), segment_mb, settings.window_secs);
-    }
-    runtime
-        .start(
-            None,
-            settings.capture_input(),
-            name,
-            RecordingProfile::Full,
-            settings.event_kinds.clone(),
-        )
-        .ok()
-}
-
 fn clear_report_response(
     root: &Path,
     was_active: bool,
@@ -1851,6 +2106,185 @@ fn empty_clear_report() -> RecordingRollingClearReport {
     }
 }
 
+struct LegacyRecordingHost;
+impl RecordingHost for LegacyRecordingHost {
+    fn install_sink(&self, sink: RecordingSinkHandle) -> Result<(), String> {
+        bmux_plugin::global_event_bus()
+            .register_channel::<recording_events::RecordingEvent>(recording_events::EVENT_KIND);
+        global_plugin_state_registry().register(&Arc::new(RwLock::new(sink)));
+        Ok(())
+    }
+    fn remove_sink(&self) -> Result<(), String> {
+        // Existing server-held sink handles share the owned stopped runtimes.
+        // Revocation is supplied by activation-owned ports on the shared path.
+        Ok(())
+    }
+    fn publish(&self, event: recording_events::RecordingEvent) -> Result<(), String> {
+        bmux_plugin::global_event_bus()
+            .emit(&recording_events::EVENT_KIND, event)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+}
+
+/// Configuration and authenticated caller are selected explicitly by the host.
+/// The process runtime is real, uses this owner's writer, and never registers in
+/// a global singleton. Caller rebinding happens for every service invocation.
+pub fn plugin_definition(
+    host: Arc<dyn RecordingHost>,
+    config: RecordingPluginConfig,
+    caller: Arc<bmux_plugin::TypedServiceCaller>,
+    runtime_root: String,
+    isolated: bool,
+) -> bmux_plugin_sdk::definition::PluginDefinition {
+    use bmux_plugin_sdk::definition::{PluginDefinition, PluginInstance};
+    PluginDefinition::new(definition_metadata(), move |_scope| {
+        if !config.recordings_dir.is_absolute()
+            || !config.rolling_recordings_dir.is_absolute()
+            || !Path::new(&runtime_root).is_absolute()
+        {
+            return Err(PluginCommandError::failed(
+                "recording roots must be explicitly selected absolute paths",
+            ));
+        }
+        let owner = RecordingOwner::new(Arc::clone(&host), config.clone());
+        let process = Arc::new(process_runtime::ProcessService::new(
+            Arc::clone(&caller),
+            config.recordings_dir.clone(),
+            runtime_root.clone(),
+            isolated,
+            Arc::clone(&owner.manual),
+        ));
+        *owner
+            .process
+            .write()
+            .map_err(|_| PluginCommandError::failed("recording process owner poisoned"))? =
+            Some(process);
+        Ok(Arc::new(owner) as Arc<dyn PluginInstance>)
+    })
+}
+impl bmux_plugin_sdk::definition::PluginInstance for RecordingOwner {
+    fn portable_services(
+        &self,
+    ) -> bmux_plugin_sdk::definition::PluginResult<
+        Vec<Arc<dyn bmux_plugin_sdk::PortableServiceProvider>>,
+    > {
+        let process = self
+            .process
+            .read()
+            .map_err(|_| PluginCommandError::failed("recording process owner poisoned"))?
+            .clone()
+            .ok_or_else(|| PluginCommandError::unavailable("recording process service unbound"))?;
+        Ok(vec![
+            Arc::new(bmux_recording_plugin_api::recording_state::RecordingStateProviderAdapter::new(Arc::new(self.clone()))),
+            Arc::new(bmux_recording_plugin_api::recording_process_v4::RecordingProcessV4ProviderAdapter::new(process.clone())),
+            Arc::new(bmux_recording_plugin_api::recording_process_presentation_v1::RecordingProcessPresentationV1ProviderAdapter::new(process)),
+        ])
+    }
+
+    fn service_contract_for(&self, interface: &str) -> Option<&'static [u8]> {
+        <bmux_recording_plugin_api::Contract as bmux_plugin_sdk::PluginContract>::service_contract_for(interface)
+    }
+
+    fn activate(
+        &self,
+        _context: bmux_plugin_sdk::definition::PluginLifecycleContext,
+    ) -> bmux_plugin_sdk::definition::PluginFuture<'_, bmux_plugin_sdk::definition::PluginResult<()>>
+    {
+        Box::pin(async move { self.activate_owner() })
+    }
+    fn deactivate(
+        &self,
+        _context: bmux_plugin_sdk::definition::PluginLifecycleContext,
+    ) -> bmux_plugin_sdk::definition::PluginFuture<'_, bmux_plugin_sdk::definition::PluginResult<()>>
+    {
+        let owner = self.clone();
+        Box::pin(async move {
+            tokio::runtime::Handle::try_current().map_err(|_| {
+                PluginCommandError::unavailable("recording cleanup requires host async runtime")
+            })?;
+            tokio::task::spawn_blocking(move || owner.deactivate_owner())
+                .await
+                .map_err(|_| PluginCommandError::failed("recording cleanup task panicked"))?
+        })
+    }
+    fn invoke(
+        &self,
+        call: bmux_plugin_sdk::definition::PluginCallContext,
+        context: NativeServiceContext,
+    ) -> bmux_plugin_sdk::definition::PluginFuture<
+        '_,
+        bmux_plugin_sdk::definition::PluginResult<ServiceResponse>,
+    > {
+        Box::pin(async move {
+            if call.cancellation.is_cancelled() {
+                return Err(PluginCommandError::unavailable(
+                    "recording invocation cancelled",
+                ));
+            }
+            Ok(self.service(&context))
+        })
+    }
+    fn register_typed_services(
+        &self,
+        registry: &mut TypedServiceRegistry,
+    ) -> bmux_plugin_sdk::definition::PluginResult<()> {
+        bmux_recording_plugin_api::recording_state::register_provider(
+            registry,
+            Arc::new(self.clone()),
+        )
+        .map_err(|error| PluginCommandError::failed(error.to_string()))?;
+        let process = self
+            .process
+            .read()
+            .map_err(|_| PluginCommandError::failed("recording process owner poisoned"))?
+            .clone()
+            .ok_or_else(|| PluginCommandError::unavailable("recording process service unbound"))?;
+        let presentation: Arc<dyn bmux_recording_plugin_api::recording_process_presentation_v1::RecordingProcessPresentationV1Service + Send + Sync> = process.clone();
+        bmux_recording_plugin_api::recording_process_presentation_v1::register_provider(
+            registry,
+            presentation,
+        )
+        .map_err(|error| PluginCommandError::failed(error.to_string()))?;
+        let provider: Arc<
+            dyn bmux_recording_plugin_api::recording_process_v4::RecordingProcessV4Service
+                + Send
+                + Sync,
+        > = process;
+        bmux_recording_plugin_api::recording_process_v4::register_provider(registry, provider)
+            .map_err(|error| PluginCommandError::failed(error.to_string()))?;
+        Ok(())
+    }
+    fn command(
+        &self,
+        call: bmux_plugin_sdk::definition::PluginCallContext,
+        context: NativeCommandContext,
+    ) -> bmux_plugin_sdk::definition::PluginFuture<'_, bmux_plugin_sdk::definition::CommandOutcome>
+    {
+        Box::pin(async move {
+            if call.cancellation.is_cancelled() {
+                return Err(PluginCommandError::unavailable(
+                    "recording command cancelled",
+                ))
+                .into();
+            }
+            if context.command == "record" {
+                return Ok(interactive_command::run(&context)).into();
+            }
+            if context.command.starts_with("recording-process-") {
+                return Ok(process_commands::run(&context)).into();
+            }
+            if should_queue_recording_cut_for_non_cli(&context) {
+                return self.run_recording_cut_command_queued(&context).into();
+            }
+            if context.command == "recording-export" {
+                return self.run_recording_export_command(&context).into();
+            }
+            commands::run_recording_command(self, &context).into()
+        })
+    }
+}
+
 bmux_plugin_sdk::export_plugin!(RecordingPlugin, include_str!("../plugin.toml"));
 
 #[cfg(test)]
@@ -1863,9 +2297,88 @@ mod tests {
     use std::collections::BTreeMap;
     use std::path::Path;
 
+    struct Host;
+    impl super::RecordingHost for Host {
+        fn install_sink(&self, _sink: super::RecordingSinkHandle) -> Result<(), String> {
+            Ok(())
+        }
+        fn remove_sink(&self) -> Result<(), String> {
+            Ok(())
+        }
+        fn publish(&self, _event: super::recording_events::RecordingEvent) -> Result<(), String> {
+            Ok(())
+        }
+    }
+    fn owner(root: &Path) -> super::RecordingOwner {
+        super::RecordingOwner::new(
+            std::sync::Arc::new(Host),
+            super::RecordingPluginConfig {
+                recordings_dir: root.join("manual"),
+                rolling_recordings_dir: root.join("rolling"),
+                rolling_segment_mb: 8,
+                retention_days: 7,
+                rolling_defaults: super::RollingRecordingSettings {
+                    window_secs: 0,
+                    event_kinds: Vec::new(),
+                },
+                rolling_auto_start: false,
+                auto_export: false,
+                auto_export_dir: None,
+                auto_export_fps: 24,
+                startup_recording: None,
+            },
+        )
+    }
+    #[test]
+    fn recording_owner_has_separate_writers_jobs_and_cut_lock() {
+        let root = tempfile::tempdir().unwrap();
+        let first = owner(&root.path().join("first"));
+        let second = owner(&root.path().join("second"));
+        assert!(!std::sync::Arc::ptr_eq(&first.manual, &second.manual));
+        assert!(!std::sync::Arc::ptr_eq(&first.cut_lock, &second.cut_lock));
+        first.jobs.lock().unwrap().insert(
+            uuid::Uuid::new_v4(),
+            super::new_recording_job(super::recording_types::RecordingJobKind::Cut),
+        );
+        assert!(second.jobs.lock().unwrap().is_empty());
+    }
+    #[test]
+    fn standalone_activation_preserves_enabled_preference_without_capture_runtime() {
+        let root = tempfile::tempdir().unwrap();
+        let owner = owner(root.path());
+        {
+            let mut config = owner.config.write().unwrap();
+            config.rolling_auto_start = true;
+            assert!(!config.rolling_defaults.is_available());
+        }
+        owner.activate_owner().unwrap();
+        assert!(owner.config.read().unwrap().rolling_auto_start);
+        assert!(owner.rolling.read().unwrap().0.lock().unwrap().is_none());
+        assert!(owner.prune.lock().unwrap().is_some());
+        // An explicit request still rejects unavailable capture; only automatic
+        // activation is conditional on the actual runtime's availability.
+        let rolling = owner.rolling.read().unwrap().0.clone();
+        let settings = owner.config.read().unwrap().rolling_defaults.clone();
+        assert!(super::auto_start_rolling(&rolling, &settings).is_err());
+        owner.deactivate_owner().unwrap();
+    }
+
+    #[test]
+    fn prune_producer_is_retained_until_deactivation() {
+        let root = tempfile::tempdir().unwrap();
+        let owner = owner(root.path());
+        owner.activate_owner().unwrap();
+        assert!(owner.activate_owner().is_err());
+        owner.deactivate_owner().unwrap();
+        assert!(owner.prune.lock().unwrap().is_none());
+    }
     #[test]
     fn retired_process_interfaces_are_rejected_by_actual_plugin_dispatch() {
-        let plugin = RecordingPlugin;
+        let root = tempfile::tempdir().unwrap();
+        let plugin = RecordingPlugin {
+            owner: std::sync::RwLock::new(Some(owner(root.path()))),
+            binding: None,
+        };
         let command = command_context(
             "recording-process-status",
             &[],
@@ -1876,7 +2389,7 @@ mod tests {
             "recording-process-recovery-v2",
             "recording-process-terminal-v3",
         ] {
-            let mut context = super::queue_cut_service_context_from_command(&command);
+            let mut context = queue_cut_service_context_from_command(&command);
             context.request.service.interface_id = interface.into();
             context.request.operation = "start".into();
             // Invalid bytes must never be decoded as v4 or routed to an alias.
@@ -1893,13 +2406,17 @@ mod tests {
 
     #[test]
     fn cohesive_process_dispatch_uses_generated_v4_request_decoder() {
-        let plugin = RecordingPlugin;
+        let root = tempfile::tempdir().unwrap();
+        let plugin = RecordingPlugin {
+            owner: std::sync::RwLock::new(Some(owner(root.path()))),
+            binding: None,
+        };
         let command = command_context(
             "recording-process-status",
             &[],
             NativeCommandInvocationSource::AttachKeybinding,
         );
-        let mut context = super::queue_cut_service_context_from_command(&command);
+        let mut context = queue_cut_service_context_from_command(&command);
         context.request.service.interface_id =
             bmux_recording_plugin_api::recording_process_v4::INTERFACE_ID.into();
         context.request.operation = "start".into();
@@ -1967,7 +2484,7 @@ mod tests {
 
     #[test]
     fn non_cli_recording_cut_reports_queue_precondition_without_self_dispatch_deadlock() {
-        let mut plugin = RecordingPlugin;
+        let mut plugin = RecordingPlugin::default();
         let error = plugin
             .run_command(command_context(
                 "recording-cut",
@@ -1977,9 +2494,42 @@ mod tests {
             .expect_err("recording cut should report missing queue precondition");
 
         assert!(
-            error.to_string().contains("failed queueing recording cut"),
+            error.to_string().contains("recording inactive"),
             "unexpected error: {error}"
         );
+    }
+
+    fn queue_cut_service_context_from_command(
+        context: &NativeCommandContext,
+    ) -> bmux_plugin_sdk::NativeServiceContext {
+        bmux_plugin_sdk::NativeServiceContext {
+            plugin_id: context.plugin_id.clone(),
+            request: bmux_plugin_sdk::ServiceRequest {
+                caller_plugin_id: context.plugin_id.clone(),
+                service: bmux_plugin_sdk::RegisteredService {
+                    capability: bmux_plugin_sdk::HostScope::new("bmux.recording.write").unwrap(),
+                    kind: bmux_plugin_sdk::ServiceKind::Command,
+                    interface_id: "recording-commands".into(),
+                    provider: bmux_plugin_sdk::ProviderId::Plugin(context.plugin_id.clone()),
+                },
+                operation: "queue-cut".into(),
+                payload: Vec::new(),
+            },
+            required_capabilities: context.required_capabilities.clone(),
+            provided_capabilities: context.provided_capabilities.clone(),
+            services: context.services.clone(),
+            available_capabilities: context.available_capabilities.clone(),
+            enabled_plugins: context.enabled_plugins.clone(),
+            plugin_search_roots: context.plugin_search_roots.clone(),
+            host: context.host.clone(),
+            connection: context.connection.clone(),
+            settings: context.settings.clone(),
+            plugin_settings_map: context.plugin_settings_map.clone(),
+            caller_client_id: context.caller_client_id,
+            cancellation: bmux_plugin_sdk::CancellationToken::default(),
+            host_kernel_bridge: context.host_kernel_bridge.clone(),
+            host_service_port: None,
+        }
     }
 
     pub(crate) fn command_context(
@@ -2016,7 +2566,38 @@ mod tests {
             plugin_settings_map: BTreeMap::new(),
             caller_client_id: None,
             invocation_source,
+            host_service_port: None,
             host_kernel_bridge: None,
         }
+    }
+}
+
+fn definition_metadata() -> bmux_plugin_sdk::definition::PluginMetadata {
+    bmux_plugin_sdk::definition::PluginDefinition::from_rust_plugin::<RecordingPlugin>(
+        include_str!("../plugin.toml"),
+        vec![
+            bmux_plugin_sdk::definition::ComponentRole::Backend,
+            bmux_plugin_sdk::definition::ComponentRole::Frontend,
+        ],
+    )
+    .expect("plugin manifest must define valid canonical metadata")
+    .metadata
+}
+
+#[cfg(test)]
+mod canonical_metadata_tests {
+    #[test]
+    fn embedded_manifest_matches_definition_metadata() {
+        let definition = bmux_plugin_sdk::definition::PluginDefinition::new(
+            super::definition_metadata(),
+            |_scope| {
+                Err(bmux_plugin_sdk::PluginCommandError::unavailable(
+                    "metadata-only regression",
+                ))
+            },
+        );
+        definition
+            .validate()
+            .expect("canonical embedded identity must validate");
     }
 }

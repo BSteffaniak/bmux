@@ -45,6 +45,12 @@ pub struct ServiceInterfaceDescriptor {
 /// `RustPlugin::Contract`. Hosts then derive generated services from that type,
 /// so providers do not manually list BPDL services in manifests or plugin impls.
 pub trait PluginContract {
+    /// Exact modeled interfaces and generated evidence, separate from routing aliases.
+    #[must_use]
+    fn service_contract_descriptors()
+    -> &'static [crate::typed_dispatch::ModeledServiceContractDescriptor] {
+        &[]
+    }
     /// Resolve one interface against this actual provider's generated contract.
     /// Unknown interfaces have no evidence and must not dispatch checked calls.
     #[must_use]
@@ -294,6 +300,161 @@ pub struct NoopServiceEventSink;
 impl ServiceEventSink for NoopServiceEventSink {
     fn emit_event(&self, _event: ServiceEvent) -> Result<()> {
         Ok(())
+    }
+}
+
+/// A typed, fallible sink shared by direct and portable streaming calls.
+///
+/// Delivery is synchronous: returning an error applies backpressure or aborts the
+/// invocation; implementations must not silently drop events or queue without a bound.
+/// The callback owns application effects; the SDK owns no domain state.
+pub struct TypedServiceEventSink<E> {
+    deliver: Arc<dyn Fn(E) -> Result<()> + Send + Sync>,
+}
+
+impl<E> Clone for TypedServiceEventSink<E> {
+    fn clone(&self) -> Self {
+        Self {
+            deliver: self.deliver.clone(),
+        }
+    }
+}
+
+impl<E> TypedServiceEventSink<E> {
+    #[must_use]
+    pub fn new(deliver: impl Fn(E) -> Result<()> + Send + Sync + 'static) -> Self {
+        Self {
+            deliver: Arc::new(deliver),
+        }
+    }
+
+    /// Deliver one event, propagating consumer rejection to the producer.
+    ///
+    /// # Errors
+    /// Returns the consumer's delivery or backpressure error.
+    pub fn emit(&self, event: E) -> Result<()> {
+        (self.deliver)(event)
+    }
+}
+
+/// Request-scoped portable event output and live cancellation.
+///
+/// Constructed by the host for an admitted invocation, not decoded from plugin
+/// payloads. Transport adapters must retain caller/deadline authority separately.
+#[derive(Clone, Debug)]
+pub struct ServiceStreamContext {
+    pub invocation_id: PluginInvocationId,
+    pub cancellation: crate::ServiceCancellation,
+    pub events: ServiceEventSinkHandle,
+}
+
+impl ServiceStreamContext {
+    /// Close event admission on terminal return or future drop, and remember any
+    /// delivery failure even when a provider incorrectly ignores `emit` errors.
+    #[must_use]
+    pub fn scoped(self) -> (Self, ServiceStreamCompletion) {
+        let state = Arc::new(ServiceStreamState::default());
+        let events = ServiceEventSinkHandle::new(ScopedServiceEventSink {
+            context: self.clone(),
+            state: state.clone(),
+        });
+        (Self { events, ..self }, ServiceStreamCompletion { state })
+    }
+
+    /// Bind typed provider events to this invocation and its live cancellation.
+    #[must_use]
+    pub fn typed_sink<E: Serialize + 'static>(&self) -> TypedServiceEventSink<E> {
+        let context = self.clone();
+        TypedServiceEventSink::new(move |event| {
+            if context.cancellation.is_cancelled() {
+                return Err(PluginError::ServiceProtocol {
+                    details: "service stream cancelled".to_string(),
+                });
+            }
+            let result = encode_service_message(&event).and_then(|payload| {
+                context.events.emit_event(ServiceEvent {
+                    invocation_id: context.invocation_id.clone(),
+                    payload,
+                })
+            });
+            if result.is_err() {
+                context.cancellation.cancel();
+            }
+            result
+        })
+    }
+}
+
+#[derive(Default)]
+struct ServiceStreamState {
+    gate: Mutex<()>,
+    closed: std::sync::atomic::AtomicBool,
+    failed: std::sync::atomic::AtomicBool,
+}
+
+/// Invocation terminal guard. Dropping a cancelled future closes retained sinks.
+pub struct ServiceStreamCompletion {
+    state: Arc<ServiceStreamState>,
+}
+
+impl ServiceStreamCompletion {
+    /// Close admission and reject a terminal success after failed event delivery.
+    ///
+    /// # Errors
+    /// Returns an explicit stream failure on rejected events or poisoned state.
+    pub fn finish(self) -> Result<()> {
+        use std::sync::atomic::Ordering;
+        let _gate = self.state.gate.lock().map_err(|_| stream_failure())?;
+        self.state.closed.store(true, Ordering::Release);
+        if self.state.failed.load(Ordering::Acquire) {
+            return Err(stream_failure());
+        }
+        Ok(())
+    }
+}
+
+impl Drop for ServiceStreamCompletion {
+    fn drop(&mut self) {
+        self.state
+            .closed
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+struct ScopedServiceEventSink {
+    context: ServiceStreamContext,
+    state: Arc<ServiceStreamState>,
+}
+
+fn stream_failure() -> PluginError {
+    PluginError::ServiceProtocol {
+        details: "service stream closed or event delivery failed".to_string(),
+    }
+}
+
+impl ServiceEventSink for ScopedServiceEventSink {
+    fn emit_event(&self, event: ServiceEvent) -> Result<()> {
+        use std::sync::atomic::Ordering;
+        // No queue, no waiting on another producer, and no recursive callback
+        // deadlock. Concurrent producer contention is explicit backpressure.
+        let Ok(_gate) = self.state.gate.try_lock() else {
+            self.state.failed.store(true, Ordering::Release);
+            return Err(stream_failure());
+        };
+        if self.state.closed.load(Ordering::Acquire)
+            || self.state.failed.load(Ordering::Acquire)
+            || self.context.cancellation.is_cancelled()
+            || event.invocation_id != self.context.invocation_id
+            || event.payload.len() > SERVICE_STREAM_MAX_FRAME_BYTES
+        {
+            self.state.failed.store(true, Ordering::Release);
+            return Err(stream_failure());
+        }
+        let result = self.context.events.emit_event(event);
+        if result.is_err() {
+            self.state.failed.store(true, Ordering::Release);
+        }
+        result
     }
 }
 
@@ -878,6 +1039,56 @@ mod tests {
         let drained = sink.drain().expect("events should drain");
         assert_eq!(drained[0].payload, vec![1]);
         assert_eq!(drained[1].payload, vec![2]);
+    }
+
+    #[test]
+    fn scoped_stream_rejects_late_mismatched_and_failed_delivery() {
+        let invocation_id = crate::PluginInvocationId::new();
+        let context = super::ServiceStreamContext {
+            invocation_id: invocation_id.clone(),
+            cancellation: crate::ServiceCancellation::new(),
+            events: super::ServiceEventSinkHandle::new(BoundedServiceEventSink::new(1)),
+        };
+        let (context, completion) = context.scoped();
+        let sink = context.typed_sink::<u32>();
+        sink.emit(1).unwrap();
+        assert!(sink.emit(2).is_err());
+        assert!(completion.finish().is_err());
+        assert!(sink.emit(3).is_err());
+
+        let (context, completion) = super::ServiceStreamContext {
+            invocation_id,
+            cancellation: crate::ServiceCancellation::new(),
+            events: super::ServiceEventSinkHandle::new(BoundedServiceEventSink::new(1)),
+        }
+        .scoped();
+        assert!(
+            context
+                .events
+                .emit_event(ServiceEvent {
+                    invocation_id: crate::PluginInvocationId::new(),
+                    payload: vec![],
+                })
+                .is_err()
+        );
+        assert!(completion.finish().is_err());
+    }
+
+    #[test]
+    fn scoped_stream_success_and_drop_close_retained_sinks() {
+        let (context, completion) = super::ServiceStreamContext {
+            invocation_id: crate::PluginInvocationId::new(),
+            cancellation: crate::ServiceCancellation::new(),
+            events: super::ServiceEventSinkHandle::new(BoundedServiceEventSink::new(2)),
+        }
+        .scoped();
+        let sink = context.typed_sink::<u32>();
+        sink.emit(1).unwrap();
+        completion.finish().unwrap();
+        assert!(sink.emit(2).is_err());
+        let (context, completion) = context.scoped();
+        drop(completion);
+        assert!(context.typed_sink::<u32>().emit(3).is_err());
     }
 
     #[test]

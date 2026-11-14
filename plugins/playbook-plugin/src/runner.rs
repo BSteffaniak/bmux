@@ -77,6 +77,29 @@ pub(super) enum Command {
 type Result<T> = std::result::Result<T, String>;
 
 impl Owner {
+    /// Request cooperative shutdown without discarding recovery evidence. A failed
+    /// drain keeps every run and its child handle owned by this instance.
+    pub(super) fn request_shutdown(&mut self) -> Result<()> {
+        for run in self.runs.values_mut() {
+            if run.child.is_some() || !run.snapshot.cleanup_acknowledged {
+                run.control.stop = true;
+                run.stop_requested.get_or_insert_with(Instant::now);
+                run.write_control()?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn shutdown_settled(&mut self) -> Result<bool> {
+        for run in self.runs.values_mut() {
+            run.refresh()?;
+            if run.child.is_some() || !run.snapshot.cleanup_acknowledged {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     pub(super) fn poll(&mut self) {
         for run in self.runs.values_mut() {
             if let Err(error) = run.refresh() {

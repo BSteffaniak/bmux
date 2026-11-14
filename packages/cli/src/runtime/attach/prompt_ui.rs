@@ -78,11 +78,50 @@ pub enum AttachInternalPromptAction {
 
 #[derive(Debug)]
 pub enum AttachPromptOrigin {
+    Scoped(ScopedPrompt),
     External {
         response_tx: oneshot::Sender<PromptResponse>,
         event_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::runtime::prompt::PromptEvent>>,
     },
     Internal(AttachInternalPromptAction),
+}
+
+/// Retains the owner's admission until response/cancellation. Event backpressure
+/// disconnects the producer rather than silently discarding preview updates.
+pub struct ScopedPrompt(std::sync::Mutex<Option<Box<bmux_plugin::prompt::AdmittedPrompt>>>);
+impl std::fmt::Debug for ScopedPrompt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ScopedPrompt")
+    }
+}
+impl ScopedPrompt {
+    pub(super) fn respond(self, response: PromptResponse) {
+        match self.0.into_inner() {
+            Ok(Some(prompt)) => {
+                let _ = (*prompt).respond(response);
+            }
+            Ok(None) => {}
+            Err(_) => tracing::error!("scoped prompt state poisoned; response disconnected"),
+        }
+    }
+    fn emit(&self, event: crate::runtime::prompt::PromptEvent) {
+        let Ok(mut state) = self.0.lock() else {
+            tracing::error!("scoped prompt state poisoned; event rejected");
+            return;
+        };
+        if state
+            .as_ref()
+            .is_some_and(|prompt| prompt.emit(event).is_err())
+        {
+            state.take();
+        }
+    }
+    fn cancelled(&self) -> bool {
+        !self
+            .0
+            .lock()
+            .is_ok_and(|state| state.as_ref().is_some_and(|prompt| !prompt.is_cancelled()))
+    }
 }
 
 #[derive(Debug)]
@@ -250,6 +289,24 @@ impl AttachPromptState {
     #[must_use]
     pub fn is_busy(&self) -> bool {
         self.active.is_some() || !self.queue.is_empty()
+    }
+
+    pub(super) fn enqueue_scoped(&mut self, prompt: Box<bmux_plugin::prompt::AdmittedPrompt>) {
+        self.enqueue(AttachPromptEnvelope {
+            request: prompt.request().clone(),
+            origin: AttachPromptOrigin::Scoped(ScopedPrompt(std::sync::Mutex::new(Some(prompt)))),
+        });
+    }
+
+    pub(super) fn discard_cancelled_scoped(&mut self) -> bool {
+        let before = self.queue.len();
+        self.queue.retain(|envelope| !matches!(&envelope.origin, AttachPromptOrigin::Scoped(prompt) if prompt.cancelled()));
+        let active_cancelled = self.active.as_ref().is_some_and(|active|
+            matches!(&active.envelope.origin, AttachPromptOrigin::Scoped(prompt) if prompt.cancelled()));
+        if active_cancelled {
+            self.active = None;
+        }
+        active_cancelled || self.queue.len() != before
     }
 
     pub fn enqueue_external(&mut self, host_request: PromptHostRequest) {
@@ -2289,27 +2346,40 @@ pub const fn prompt_accepts_key_kind(kind: KeyEventKind) -> bool {
 }
 
 fn send_response(origin: AttachPromptOrigin, response: PromptResponse) {
-    if let AttachPromptOrigin::External { response_tx, .. } = origin {
-        let _ = response_tx.send(response);
+    match origin {
+        AttachPromptOrigin::External { response_tx, .. } => {
+            let _ = response_tx.send(response);
+        }
+        AttachPromptOrigin::Scoped(prompt) => prompt.respond(response),
+        AttachPromptOrigin::Internal(_) => {}
+    }
+}
+
+fn emit_origin_event(origin: &AttachPromptOrigin, event: crate::runtime::prompt::PromptEvent) {
+    match origin {
+        AttachPromptOrigin::External {
+            event_tx: Some(events),
+            ..
+        } => {
+            let _ = events.send(event);
+        }
+        AttachPromptOrigin::Scoped(prompt) => prompt.emit(event),
+        AttachPromptOrigin::External { event_tx: None, .. } | AttachPromptOrigin::Internal(_) => {}
     }
 }
 
 fn emit_selection_changed(envelope: &AttachPromptEnvelope, selected: usize) {
-    let AttachPromptOrigin::External {
-        event_tx: Some(event_tx),
-        ..
-    } = &envelope.origin
-    else {
-        return;
-    };
     if let PromptField::SingleSelect { options, .. } | PromptField::SearchSelect { options, .. } =
         &envelope.request.field
         && let Some(option) = options.get(selected)
     {
-        let _ = event_tx.send(crate::runtime::prompt::PromptEvent::SelectionChanged {
-            index: selected,
-            value: option.value.clone(),
-        });
+        emit_origin_event(
+            &envelope.origin,
+            crate::runtime::prompt::PromptEvent::SelectionChanged {
+                index: selected,
+                value: option.value.clone(),
+            },
+        );
     }
 }
 
@@ -2318,19 +2388,15 @@ fn emit_form_changed(
     field: &PromptFormField,
     values: &BTreeMap<String, PromptFormValue>,
 ) {
-    let AttachPromptOrigin::External {
-        event_tx: Some(event_tx),
-        ..
-    } = &envelope.origin
-    else {
-        return;
-    };
     if let Some(value) = values.get(&field.id) {
-        let _ = event_tx.send(crate::runtime::prompt::PromptEvent::FormChanged {
-            field_id: field.id.clone(),
-            value: value.clone(),
-            values: values.clone(),
-        });
+        emit_origin_event(
+            &envelope.origin,
+            crate::runtime::prompt::PromptEvent::FormChanged {
+                field_id: field.id.clone(),
+                value: value.clone(),
+                values: values.clone(),
+            },
+        );
     }
 }
 
@@ -3008,6 +3074,13 @@ fn run_prompt_validation(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn scoped_prompt_retention_preserves_send_and_sync() {
+        fn require_send_sync<T: Send + Sync>() {}
+        require_send_sync::<super::ScopedPrompt>();
+        require_send_sync::<super::AttachPromptState>();
+    }
+
     use super::{
         AttachInternalPromptAction, AttachPromptState, PromptKeyDisposition, PromptWidgetState,
         filtered_option_indices, prompt_overlay_layout, step_search_selection,

@@ -322,23 +322,23 @@ Directives set playbook-wide configuration. They must appear before any action
 lines (or be interspersed; order relative to actions does not matter since
 directives are processed in a first pass).
 
-| Directive         | Syntax                                           | Default         | Description                                                                                                                                                                        |
-| ----------------- | ------------------------------------------------ | --------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `@viewport`       | `@viewport cols=<u16> rows=<u16>`                | `80x24`         | Terminal viewport dimensions                                                                                                                                                       |
-| `@driver`         | `@driver sandbox\|real-attach\|attach-sim`       | `sandbox`       | Execution backend; `real-attach` runs the production attach runtime against a headless terminal adapter; `attach-sim` runs deterministic attach UI simulation without a server/PTY |
-| `@shell`          | `@shell <path>`                                  | system default  | Shell binary for the sandbox                                                                                                                                                       |
-| `@input-profile`  | `@input-profile vim\|tmux_compat\|zellij_compat` | product default | Select a built-in input profile inside the generated sandbox; TOML uses `playbook.input_profile`. Cannot combine with custom sandbox-config.                                       |
-| `@timeout`        | `@timeout <ms>`                                  | `30000`         | Max playbook execution time in milliseconds                                                                                                                                        |
-| `@record`         | `@record true\|false`                            | `false`         | Enable recording of the execution                                                                                                                                                  |
-| `@render-trace`   | `@render-trace true\|false`                      | `false`         | Enable per-step normalized render summaries                                                                                                                                        |
-| `@sandbox-config` | `@sandbox-config <path>`                         | generated       | Copy this bmux config file into the sandbox config dir instead of generating the deterministic default plugin-disabled config                                                      |
-| `@name`           | `@name <string>`                                 | none            | Playbook name (included in JSON output)                                                                                                                                            |
-| `@description`    | `@description <string>`                          | none            | Playbook description                                                                                                                                                               |
-| `@plugin`         | `@plugin enable=<id>` or `@plugin disable=<id>`  | all enabled     | Enable/disable specific plugins                                                                                                                                                    |
-| `@var`            | `@var NAME=VALUE`                                | none            | Define a static variable for `${NAME}` substitution                                                                                                                                |
-| `@env`            | `@env NAME=VALUE`                                | none            | Set an environment variable in the sandbox process                                                                                                                                 |
-| `@env-mode`       | `@env-mode inherit\|clean`                       | `inherit`       | Sandbox environment isolation mode                                                                                                                                                 |
-| `@include`        | `@include <path>`                                | none            | Include another playbook file (recursive, max depth 10)                                                                                                                            |
+| Directive         | Syntax                                           | Default                | Description                                                                                                                                                                        |
+| ----------------- | ------------------------------------------------ | ---------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `@viewport`       | `@viewport cols=<u16> rows=<u16>`                | `80x24`                | Terminal viewport dimensions                                                                                                                                                       |
+| `@driver`         | `@driver sandbox\|real-attach\|attach-sim`       | `sandbox`              | Execution backend; `real-attach` runs the production attach runtime against a headless terminal adapter; `attach-sim` runs deterministic attach UI simulation without a server/PTY |
+| `@shell`          | `@shell <path>`                                  | system default         | Shell binary for the sandbox                                                                                                                                                       |
+| `@input-profile`  | `@input-profile vim\|tmux_compat\|zellij_compat` | product default        | Select a built-in input profile inside the generated sandbox; TOML uses `playbook.input_profile`. Cannot combine with custom sandbox-config.                                       |
+| `@timeout`        | `@timeout <ms>`                                  | `30000`                | Max playbook execution time in milliseconds                                                                                                                                        |
+| `@record`         | `@record true\|false`                            | `false`                | Enable recording of the execution                                                                                                                                                  |
+| `@render-trace`   | `@render-trace true\|false`                      | `false`                | Enable per-step normalized render summaries                                                                                                                                        |
+| `@sandbox-config` | `@sandbox-config <path>`                         | generated              | Copy this bmux config file into the sandbox config dir instead of generating the deterministic typed-service baseline config                                                       |
+| `@name`           | `@name <string>`                                 | none                   | Playbook name (included in JSON output)                                                                                                                                            |
+| `@description`    | `@description <string>`                          | none                   | Playbook description                                                                                                                                                               |
+| `@plugin`         | `@plugin enable=<id>` or `@plugin disable=<id>`  | typed-service baseline | Enable additional plugins or disable optional plugins                                                                                                                              |
+| `@var`            | `@var NAME=VALUE`                                | none                   | Define a static variable for `${NAME}` substitution                                                                                                                                |
+| `@env`            | `@env NAME=VALUE`                                | none                   | Set an environment variable in the sandbox process                                                                                                                                 |
+| `@env-mode`       | `@env-mode inherit\|clean`                       | `inherit`              | Sandbox environment isolation mode                                                                                                                                                 |
+| `@include`        | `@include <path>`                                | none                   | Include another playbook file (recursive, max depth 10)                                                                                                                            |
 
 ### Environment Modes
 
@@ -1003,14 +1003,21 @@ contains = "hello_world"
 
 ### Plugin Configuration
 
-By default, all bundled plugins are available. Use `@plugin` to control this:
+By default, generated sandbox configuration enables the playbook's typed-service
+providers: sessions, contexts, clients, tabs, pane-runtime and workspaces.
+Other bundled plugins, including presentation plugins, are disabled unless
+enabled
+explicitly. Use `@plugin` to add optional plugins or disable optional providers:
 
 ```
-@plugin disable=bmux.tabs        # disable a specific plugin
-@plugin enable=bmux.permissions     # only enable specific plugins
+@plugin disable=bmux.tab_bar        # keep optional presentation disabled
+@plugin enable=bmux.permissions     # add permissions to the typed-service baseline
 ```
 
-When any `enable` is specified, all other plugins are implicitly disabled.
+Explicit disables are never overridden. Disabling a required typed-service
+provider produces a descriptive configuration error before server startup.
+An explicit `@sandbox-config` remains authoritative and is not rewritten to add
+these providers; its service availability is the caller's responsibility.
 
 ---
 

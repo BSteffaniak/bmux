@@ -31,7 +31,7 @@ pub type KernelClientFactory =
 
 use super::{
     ConnectionContext, build_runtime_command_state, dispatch::dispatch_built_in_command,
-    effective_enabled_plugins, load_plugin, plugin_host_metadata, resolve_plugin_search_paths,
+    effective_enabled_plugins, plugin_host_metadata, resolve_plugin_search_paths,
     run_keymap_doctor, run_logs_level, run_logs_path, run_plugin_keybinding_command,
     run_plugin_keybinding_command_with_state, run_terminal_install_terminfo,
 };
@@ -520,6 +520,243 @@ fn call_host_kernel_via_factory_as(
     bmux_ipc::encode(&response).context("failed encoding kernel bridge response payload")
 }
 
+/// Command-local transport authority. The issuing owner pumps this bounded
+/// channel on its already-selected authenticated connection; no callback can
+/// reconnect, create `HostInternal` authority, or substitute a payload principal.
+type CommandScopes = Arc<
+    Mutex<
+        BTreeMap<
+            bmux_plugin_runtime::RuntimeInvocationId,
+            (bmux_plugin_runtime::InvocationScope, usize),
+        >,
+    >,
+>;
+
+#[derive(Clone)]
+pub(in crate::runtime) struct CommandDispatch {
+    sender: tokio::sync::mpsc::Sender<CommandDispatchRequest>,
+    slots: Arc<tokio::sync::Semaphore>,
+    scopes: CommandScopes,
+    state: Option<Arc<super::plugin_runtime::RuntimeCommandState>>,
+    parent: Option<bmux_plugin::CallbackEntryLease>,
+    cancellation: bmux_plugin_sdk::ServiceCancellation,
+}
+pub(in crate::runtime) struct CommandDispatchOwner {
+    scopes: CommandScopes,
+    cancellation: bmux_plugin_sdk::ServiceCancellation,
+}
+impl Drop for CommandDispatchOwner {
+    fn drop(&mut self) {
+        self.cancellation.cancel();
+        let scopes = self
+            .scopes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .map(|(scope, _)| scope.clone())
+            .collect::<Vec<_>>();
+        for scope in scopes {
+            let _ = scope.close();
+        }
+    }
+}
+pub(in crate::runtime) struct CommandDispatchRequest {
+    pub request: bmux_ipc::Request,
+    response: std::sync::mpsc::SyncSender<bmux_plugin_sdk::Result<Vec<u8>>>,
+    registered: bool,
+    _admission: bmux_plugin_runtime::AdmissionGuard,
+    invocation: bmux_plugin_runtime::InvocationScope,
+    scopes: CommandScopes,
+    _parent: Option<bmux_plugin::CallbackEntryLease>,
+    _slot: tokio::sync::OwnedSemaphorePermit,
+    cancellation: bmux_plugin_sdk::ServiceCancellation,
+}
+impl Drop for CommandDispatchRequest {
+    fn drop(&mut self) {
+        if !self.registered {
+            return;
+        }
+        let mut scopes = self
+            .scopes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((_, count)) = scopes.get_mut(&self.invocation.id()) {
+            *count -= 1;
+            if *count == 0 {
+                scopes.remove(&self.invocation.id());
+            }
+        }
+    }
+}
+impl CommandDispatchRequest {
+    /// Consume the sole request owner into the queue. Its destructor cannot run
+    /// on this stack after a successful handoff; rejection drops that same owner.
+    fn enqueue(mut self, sender: &tokio::sync::mpsc::Sender<Self>) -> bmux_plugin_sdk::Result<()> {
+        {
+            let mut scopes = self
+                .scopes
+                .lock()
+                .map_err(|_| command_dispatch_error("command scope registry poisoned".into()))?;
+            if self.cancellation.is_cancelled() {
+                return Err(command_dispatch_error(
+                    "selected command lifetime ended".into(),
+                ));
+            }
+            let (_, count) = scopes
+                .entry(self.invocation.id())
+                .or_insert_with(|| (self.invocation.clone(), 0));
+            *count += 1;
+            self.registered = true;
+            drop(scopes);
+        }
+        sender.try_send(self).map_err(|_| {
+            command_dispatch_error(
+                "selected command queue unavailable; request not dispatched".into(),
+            )
+        })
+    }
+
+    pub(in crate::runtime) fn is_cancelled(&self) -> bool {
+        self.cancellation.is_cancelled()
+    }
+    pub(in crate::runtime) fn reject(self) {
+        let _ = self.response.clone().send(Err(command_dispatch_error(
+            "command ended or cancelled before dispatch".into(),
+        )));
+        drop(self);
+    }
+    pub(in crate::runtime) fn reject_unavailable(self, reason: &str) {
+        let _ = self
+            .response
+            .clone()
+            .send(Err(command_dispatch_error(reason.to_owned())));
+        drop(self);
+    }
+    pub(in crate::runtime) fn respond(self, result: Result<bmux_ipc::Response>) {
+        if result.is_err() {
+            // A transport failure is not proof that the server effect settled.
+            // Keep cleanup-required scope/code ownership, never authorize finish
+            // or replay from a lost response. Definitive server denials below
+            // are settled outcomes and do not enter this uncertain state.
+            let _ = self
+                .invocation
+                .fail_cleanup("selected command transport outcome unknown; do not replay".into());
+        }
+        let result = result
+            .map_err(|error| command_dispatch_error(error.to_string()))
+            .and_then(|response| match response {
+                bmux_ipc::Response::Ok(bmux_ipc::ResponsePayload::ServiceInvoked { payload }) => {
+                    Ok(payload)
+                }
+                bmux_ipc::Response::Err(error) => Err(command_dispatch_error(format!(
+                    "selected command request denied: {error:?}"
+                ))),
+                bmux_ipc::Response::Ok(_) => Err(command_dispatch_error(
+                    "unexpected selected command response".into(),
+                )),
+            });
+        // Ownership (including admission) remains in this request until the
+        // actual response settles, even if the synchronous observer disappeared.
+        let _ = self.response.clone().send(result);
+        drop(self);
+    }
+}
+const fn command_dispatch_error(details: String) -> bmux_plugin_sdk::PluginError {
+    bmux_plugin_sdk::PluginError::ServiceProtocol { details }
+}
+impl CommandDispatch {
+    pub(in crate::runtime) fn channel() -> (
+        Self,
+        CommandDispatchOwner,
+        tokio::sync::mpsc::Receiver<CommandDispatchRequest>,
+    ) {
+        let (sender, receiver) = tokio::sync::mpsc::channel(8);
+        let cancellation = bmux_plugin_sdk::ServiceCancellation::new();
+        let scopes = Arc::new(Mutex::new(BTreeMap::new()));
+        (
+            Self {
+                sender,
+                slots: Arc::new(tokio::sync::Semaphore::new(8)),
+                scopes: scopes.clone(),
+                state: None,
+                parent: None,
+                cancellation: cancellation.clone(),
+            },
+            CommandDispatchOwner {
+                scopes,
+                cancellation,
+            },
+            receiver,
+        )
+    }
+    pub(in crate::runtime) fn with_state(
+        mut self,
+        state: super::plugin_runtime::RuntimeCommandState,
+    ) -> Self {
+        self.state = Some(Arc::new(state));
+        self
+    }
+    pub(in crate::runtime) fn parent(&self) -> Option<bmux_plugin::CallbackEntryLease> {
+        self.parent.clone()
+    }
+    pub(in crate::runtime) fn with_parent(
+        mut self,
+        parent: bmux_plugin::CallbackEntryLease,
+    ) -> Self {
+        self.parent = Some(parent);
+        self
+    }
+    pub(in crate::runtime) fn invoke(
+        &self,
+        invocation: &bmux_plugin_runtime::InvocationScope,
+        request: &bmux_plugin_sdk::HostServiceRequest<'_>,
+    ) -> bmux_plugin_sdk::Result<Vec<u8>> {
+        if self.cancellation.is_cancelled() {
+            return Err(command_dispatch_error(
+                "selected command lifetime ended".into(),
+            ));
+        }
+        if request.payload.len() > bmux_plugin_sdk::abi::MAX_BUFFER_BYTES {
+            return Err(command_dispatch_error(
+                "selected command request exceeds bound".into(),
+            ));
+        }
+        let kind = invoke_kind_from_service_kind(request.kind)
+            .ok_or_else(|| command_dispatch_error("unsupported command service kind".into()))?;
+        let admission = invocation
+            .try_admit()
+            .map_err(|error| command_dispatch_error(error.to_string()))?;
+        let (response, receiver) = std::sync::mpsc::sync_channel(1);
+        CommandDispatchRequest {
+            request: bmux_ipc::Request::InvokeService {
+                capability: request.capability.into(),
+                kind,
+                interface_id: request.interface.into(),
+                operation: request.operation.into(),
+                payload: request.payload.to_vec(),
+            },
+            response,
+            registered: false,
+            _admission: admission,
+            invocation: invocation.clone(),
+            scopes: self.scopes.clone(),
+            _parent: self.parent.clone(),
+            _slot: self.slots.clone().try_acquire_owned().map_err(|_| {
+                command_dispatch_error(
+                    "selected command capacity exhausted; request not dispatched".into(),
+                )
+            })?,
+            cancellation: self.cancellation.clone(),
+        }
+        .enqueue(&self.sender)?;
+        receiver.recv().map_err(|_| {
+            command_dispatch_error(
+                "selected command response lost; outcome unknown, do not replay".into(),
+            )
+        })?
+    }
+}
+
 pub(super) struct InvokingTransportRequest {
     pub request: bmux_ipc::Request,
     pub response: std::sync::mpsc::SyncSender<Result<bmux_ipc::Response>>,
@@ -540,11 +777,465 @@ pub(super) fn enter_invoking_transport(
     InvokingTransportGuard
 }
 
+tokio::task_local! {
+    // Set only by the selected host dispatch below, never decoded from requests.
+    static SELECTED_PLUGIN_CALLER: String;
+}
+
+/// Server-authenticated authority retained for one provider dispatch. Only the
+/// service-handler entrypoint constructs this value; serialized plugin context
+/// fields neither create nor replace it. Moving it to a blocking worker retains
+/// the original internal/client principal and stream-provenance semantics.
+#[derive(Clone)]
+pub(in crate::runtime) struct CallbackDependency {
+    pub entry: bmux_plugin::CallbackEntryLease,
+}
+
+#[derive(Clone)]
+pub(in crate::runtime) struct AuthenticatedServiceInvocation {
+    caller_plugin: Option<String>,
+    context: bmux_server::ServiceInvokeContext,
+    runtime: tokio::runtime::Handle,
+    cancellation: bmux_plugin_sdk::ServiceCancellation,
+}
+
+struct CancelProviderOnDrop(bmux_plugin_sdk::ServiceCancellation);
+impl Drop for CancelProviderOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
+thread_local! {
+    // Execution-location guard only, never a kernel eligibility grant or origin.
+    static IN_BLOCKING_PLUGIN_WORKER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    // Set only at persistent host-thread startup, never by a callback guard.
+    // These threads execute synchronous jobs and never poll Tokio futures.
+    static ON_HOST_CALLBACK_THREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+struct BlockingPluginWorkerGuard(bool);
+impl BlockingPluginWorkerGuard {
+    fn enter() -> Self {
+        Self(IN_BLOCKING_PLUGIN_WORKER.with(|active| active.replace(true)))
+    }
+}
+impl Drop for BlockingPluginWorkerGuard {
+    fn drop(&mut self) {
+        IN_BLOCKING_PLUGIN_WORKER.with(|active| active.set(self.0));
+    }
+}
+
+type SelectedRequestJob = Box<dyn FnOnce() + Send + 'static>;
+
+struct HostCallbackExecutor {
+    sender: std::sync::mpsc::SyncSender<SelectedRequestJob>,
+    slots: Arc<tokio::sync::Semaphore>,
+}
+
+impl HostCallbackExecutor {
+    fn get() -> bmux_plugin_sdk::Result<&'static Self> {
+        static EXECUTOR: OnceLock<Result<HostCallbackExecutor, String>> = OnceLock::new();
+        EXECUTOR
+            .get_or_init(|| {
+                const WORKERS: usize = 16;
+                let (sender, receiver) =
+                    std::sync::mpsc::sync_channel::<SelectedRequestJob>(WORKERS);
+                let receiver = Arc::new(Mutex::new(receiver));
+                for index in 0..WORKERS {
+                    let receiver = receiver.clone();
+                    std::thread::Builder::new()
+                        .name(format!("bmux-host-callback-{index}"))
+                        .spawn(move || {
+                            ON_HOST_CALLBACK_THREAD.with(|location| location.set(true));
+                            loop {
+                                let job = match receiver.lock() {
+                                    Ok(receiver) => receiver.recv(),
+                                    Err(_) => break,
+                                };
+                                let Ok(job) = job else { break };
+                                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
+                            }
+                        })
+                        .map_err(|error| {
+                            format!("host callback executor startup failed: {error}")
+                        })?;
+                }
+                Ok(Self {
+                    sender,
+                    slots: Arc::new(tokio::sync::Semaphore::new(WORKERS)),
+                })
+            })
+            .as_ref()
+            .map_err(|details| bmux_plugin_sdk::PluginError::ServiceProtocol {
+                details: details.clone(),
+            })
+    }
+}
+
+/// Build a queue-owned job. An unaccepted job simply drops its unused admission.
+/// Once accepted, the admission moves with the effect future, never with the
+/// response receiver. Dropping/timing out that receiver cannot cancel the job.
+/// The selected runtime must remain alive until its admitted jobs have drained.
+fn selected_effect_job(
+    runtime: tokio::runtime::Handle,
+    admission: Option<bmux_plugin_runtime::AdmissionGuard>,
+    work: impl Future<Output = ()> + Send + 'static,
+) -> SelectedRequestJob {
+    Box::new(move || {
+        // Spawn rather than poll here: the dedicated dispatcher never blocks on
+        // domain callbacks and cannot deadlock recursive selected dispatch.
+        runtime.spawn(async move {
+            let _admission = admission;
+            work.await;
+        });
+    })
+}
+
+struct SelectedRequestExecutor {
+    sender: std::sync::mpsc::SyncSender<SelectedRequestJob>,
+    slots: Arc<tokio::sync::Semaphore>,
+}
+
+impl SelectedRequestExecutor {
+    fn get() -> bmux_plugin_sdk::Result<&'static Self> {
+        static EXECUTOR: std::sync::OnceLock<Result<SelectedRequestExecutor, String>> =
+            std::sync::OnceLock::new();
+        EXECUTOR
+            .get_or_init(|| {
+                const CAPACITY: usize = 64;
+                let (sender, receiver) =
+                    std::sync::mpsc::sync_channel::<SelectedRequestJob>(CAPACITY);
+                std::thread::Builder::new()
+                    .name("bmux-host-dispatch".into())
+                    .spawn(move || {
+                        while let Ok(job) = receiver.recv() {
+                            debug_assert!(tokio::runtime::Handle::try_current().is_err());
+                            // Losing a job response is explicitly uncertain, never a
+                            // reason to kill the dispatcher or replay another effect.
+                            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
+                        }
+                    })
+                    .map_err(|error| format!("selected host executor startup failed: {error}"))?;
+                Ok(Self {
+                    sender,
+                    slots: Arc::new(tokio::sync::Semaphore::new(CAPACITY)),
+                })
+            })
+            .as_ref()
+            .map_err(|details| bmux_plugin_sdk::PluginError::ServiceProtocol {
+                details: details.clone(),
+            })
+    }
+}
+
+impl bmux_plugin::InvocationKernelDispatch for AuthenticatedServiceInvocation {
+    fn execute(
+        &self,
+        invocation: &bmux_plugin_runtime::InvocationScope,
+        request: &[u8],
+    ) -> bmux_plugin_sdk::Result<Vec<u8>> {
+        let protocol = |details| bmux_plugin_sdk::PluginError::ServiceProtocol { details };
+        if self.cancellation.is_cancelled() {
+            return Err(protocol("authenticated kernel invocation cancelled".into()));
+        }
+        // Execution is handed to dispatch_selected_request's bounded selected
+        // executor below. Do not require a CLI thread-local worker marker here:
+        // the shared callback executor owns a different blocking thread and
+        // already carries explicit scope admission. Placement is validated at
+        // the executor seam; caller authority remains the retained server context.
+        if request.len() > bmux_plugin_sdk::abi::MAX_BUFFER_BYTES {
+            return Err(protocol(
+                "kernel request exceeds negotiated buffer bound".into(),
+            ));
+        }
+        let _admission = invocation
+            .try_admit()
+            .map_err(|error| protocol(error.to_string()))?;
+        // execute_raw uses this exact authenticated server context. It preserves
+        // HostInternal only when the server originally issued it, and performs
+        // the same authoritative client/stream checks for external requests.
+        // No bridge pointer, caller metadata or ambient connection is consulted.
+        let encoded = self.dispatch_selected_request(request, Some(invocation))?;
+        let response: bmux_ipc::Response =
+            bmux_ipc::decode(&encoded).map_err(|error| protocol(error.to_string()))?;
+        match response {
+            bmux_ipc::Response::Ok(payload) => {
+                let bytes =
+                    bmux_ipc::encode(&payload).map_err(|error| protocol(error.to_string()))?;
+                if bytes.len() > bmux_plugin_sdk::abi::MAX_BUFFER_BYTES {
+                    return Err(protocol(
+                        "kernel response exceeds bound; operation must not be replayed".into(),
+                    ));
+                }
+                Ok(bytes)
+            }
+            bmux_ipc::Response::Err(error) => Err(protocol(format!(
+                "authenticated kernel request denied: {error:?}"
+            ))),
+        }
+    }
+}
+
+impl AuthenticatedServiceInvocation {
+    pub(in crate::runtime) fn with_callback_parent(
+        mut self,
+        entry: bmux_plugin::CallbackEntryLease,
+    ) -> Self {
+        self.context = self
+            .context
+            .with_host_dispatch_context(Arc::new(CallbackDependency { entry }));
+        self
+    }
+    pub(in crate::runtime) fn callback_parent(
+        &self,
+    ) -> bmux_plugin_sdk::Result<Option<bmux_plugin::CallbackEntryLease>> {
+        self.context
+            .host_dispatch_context::<CallbackDependency>()
+            .map(|context| context.map(|context| context.entry.clone()))
+            .map_err(|error| command_dispatch_error(error.to_string()))
+    }
+
+    pub(in crate::runtime) fn selected_service_availability(
+        &self,
+        invocation: &bmux_plugin_runtime::InvocationScope,
+        key: &bmux_plugin_sdk::typed_dispatch::ServiceAvailabilityKey,
+    ) -> bmux_plugin_sdk::Result<bmux_plugin_sdk::typed_dispatch::SelectedServiceAvailability> {
+        let protocol = |details| bmux_plugin_sdk::PluginError::ServiceProtocol { details };
+        key.validate()?;
+        let _admission = invocation
+            .try_admit()
+            .map_err(|error| protocol(error.to_string()))?;
+        if self.cancellation.is_cancelled()
+            || invocation
+                .is_cancelled()
+                .map_err(|error| protocol(error.to_string()))?
+        {
+            return Err(protocol("availability invocation cancelled".into()));
+        }
+        self.context
+            .selected_service_availability(key)
+            .map_err(|error| {
+                protocol(format!(
+                    "selected availability denied or unavailable: {error:#}"
+                ))
+            })
+    }
+
+    /// Exercise selected transport dispatch without a plugin scope in host tests.
+    #[cfg(test)]
+    fn execute_response(
+        &self,
+        request: &[u8],
+    ) -> bmux_plugin_sdk::Result<bmux_ipc::ResponsePayload> {
+        self.execute_response_with_scope(request, None)
+    }
+
+    /// Retain an effect admission in the dispatcher job, independently of the
+    /// synchronous response observer. This is the scoped plugin service seam.
+    pub(in crate::runtime) fn execute_response_scoped(
+        &self,
+        invocation: &bmux_plugin_runtime::InvocationScope,
+        request: &[u8],
+    ) -> bmux_plugin_sdk::Result<bmux_ipc::ResponsePayload> {
+        self.execute_response_with_scope(request, Some(invocation))
+    }
+
+    fn execute_response_with_scope(
+        &self,
+        request: &[u8],
+        invocation: Option<&bmux_plugin_runtime::InvocationScope>,
+    ) -> bmux_plugin_sdk::Result<bmux_ipc::ResponsePayload> {
+        let protocol = |details| bmux_plugin_sdk::PluginError::ServiceProtocol { details };
+        if self.cancellation.is_cancelled() {
+            return Err(protocol("authenticated invocation cancelled".into()));
+        }
+        let bytes = self.dispatch_selected_request(request, invocation)?;
+        match bmux_ipc::decode(&bytes).map_err(|error| protocol(error.to_string()))? {
+            bmux_ipc::Response::Ok(payload) => Ok(payload),
+            bmux_ipc::Response::Err(error) => {
+                Err(protocol(format!("authenticated request denied: {error:?}")))
+            }
+        }
+    }
+
+    fn dispatch_selected_request(
+        &self,
+        request: &[u8],
+        invocation: Option<&bmux_plugin_runtime::InvocationScope>,
+    ) -> bmux_plugin_sdk::Result<Vec<u8>> {
+        let protocol = |details| bmux_plugin_sdk::PluginError::ServiceProtocol { details };
+        if request.len() > bmux_plugin_sdk::abi::MAX_BUFFER_BYTES {
+            return Err(protocol("authenticated request exceeds bound".into()));
+        }
+        // Validate placement before admission or dispatch. No worker marker can
+        // prove that a thread is outside an active Tokio future poll.
+        let current = tokio::runtime::Handle::try_current().ok();
+        let host_thread = ON_HOST_CALLBACK_THREAD.with(std::cell::Cell::get);
+        if !host_thread
+            && current.as_ref().is_some_and(|handle| {
+                handle.runtime_flavor() != tokio::runtime::RuntimeFlavor::MultiThread
+            })
+        {
+            return Err(protocol(
+                "synchronous host dispatch requires async port on current-thread runtime".into(),
+            ));
+        }
+        let executor = SelectedRequestExecutor::get()?;
+        let permit = executor.slots.clone().try_acquire_owned().map_err(|_| {
+            protocol("selected host executor saturated; request not dispatched".into())
+        })?;
+        // Admission belongs to the accepted job, not to recv_timeout below.
+        // Closure racing this acquisition either rejects before enqueue or must
+        // wait for the owned effect to settle. Queue rejection drops the unused
+        // job and its admission without executing or replaying the request.
+        let admission = invocation
+            .map(bmux_plugin_runtime::InvocationScope::try_admit)
+            .transpose()
+            .map_err(|error| protocol(error.to_string()))?;
+        let authority = self.clone();
+        let request = request.to_vec();
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        executor
+            .sender
+            .try_send(selected_effect_job(
+                self.runtime.clone(),
+                admission,
+                async move {
+                    let _permit = permit;
+                    let result = if authority.cancellation.is_cancelled() {
+                        Err(protocol("authenticated invocation cancelled".into()))
+                    } else {
+                        let execution = authority.context.execute_raw(request);
+                        let result = if let Some(caller) = authority.caller_plugin {
+                            SELECTED_PLUGIN_CALLER.scope(caller, execution).await
+                        } else {
+                            execution.await
+                        };
+                        result.map_err(|error| {
+                            protocol(format!("authenticated dispatch failed: {error:#}"))
+                        })
+                    };
+                    let result = result.and_then(|bytes| {
+                        if bytes.len() > bmux_plugin_sdk::abi::MAX_BUFFER_BYTES {
+                            Err(protocol(
+                                "host response exceeds bound; outcome unknown, do not replay"
+                                    .into(),
+                            ))
+                        } else {
+                            Ok(bytes)
+                        }
+                    });
+                    let _ = sender.send(result);
+                },
+            ))
+            .map_err(|_| {
+                protocol("selected host executor unavailable; request not dispatched".into())
+            })?;
+        let wait = move || {
+            receiver
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .map_err(|_| {
+                    protocol(
+                        "selected host response unconfirmed; outcome unknown, do not replay".into(),
+                    )
+                })?
+        };
+        if current.is_some() && !host_thread {
+            tokio::task::block_in_place(wait)
+        } else {
+            wait()
+        }
+    }
+
+    pub(in crate::runtime) fn with_legacy_process_context<T>(&self, run: impl FnOnce() -> T) -> T {
+        let _authority = enter_service_kernel_context(self.context.clone());
+        run()
+    }
+
+    pub(in crate::runtime) fn with_plugin_caller(mut self, caller: &bmux_plugin::PluginId) -> Self {
+        self.caller_plugin = Some(caller.as_str().to_string());
+        self
+    }
+
+    pub(in crate::runtime) fn new(context: bmux_server::ServiceInvokeContext) -> Self {
+        Self {
+            caller_plugin: None,
+            context,
+            runtime: tokio::runtime::Handle::current(),
+            cancellation: bmux_plugin_sdk::ServiceCancellation::new(),
+        }
+    }
+
+    /// Trusted asynchronous host entry. This changes execution location only;
+    /// the closure must still validate its captured invocation and selected
+    /// authority on the blocking worker before performing any effect.
+    pub(in crate::runtime) async fn dispatch_host_callback<T, F>(
+        callback: F,
+    ) -> bmux_plugin_sdk::Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> bmux_plugin_sdk::Result<T> + Send + 'static,
+    {
+        let protocol = |details| bmux_plugin_sdk::PluginError::ServiceProtocol { details };
+        let runtime = tokio::runtime::Handle::try_current()
+            .map_err(|error| protocol(format!("selected callback runtime unavailable: {error}")))?;
+        let executor = HostCallbackExecutor::get()?;
+        let permit = executor.slots.clone().try_acquire_owned().map_err(|_| {
+            protocol("host callback executor saturated; callback not dispatched".into())
+        })?;
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        executor
+            .sender
+            .try_send(Box::new(move || {
+                let _permit = permit;
+                let _entered = runtime.enter();
+                let _worker = BlockingPluginWorkerGuard::enter();
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(callback))
+                    .unwrap_or_else(|_| {
+                        Err(protocol(
+                            "host callback panicked; outcome unknown, do not replay".into(),
+                        ))
+                    });
+                let _ = sender.send(result);
+            }))
+            .map_err(|_| {
+                protocol("host callback executor unavailable; callback not dispatched".into())
+            })?;
+        receiver.await.map_err(|_| {
+            protocol("host callback response lost; outcome unknown, do not replay".into())
+        })?
+    }
+
+    pub(in crate::runtime) fn cancellation(&self) -> bmux_plugin_sdk::ServiceCancellation {
+        self.cancellation.clone()
+    }
+
+    /// Run existing synchronous callbacks only on a blocking worker. The
+    /// context guard is worker-local and is never retained across async yields.
+    pub(in crate::runtime) async fn dispatch(
+        self,
+        provider: super::plugin_runtime::ProductionPlugin,
+        context: bmux_plugin_sdk::NativeServiceContext,
+    ) -> Result<bmux_plugin_sdk::ServiceResponse> {
+        let _cancel_on_observer_drop = CancelProviderOnDrop(self.cancellation.clone());
+        Self::dispatch_host_callback(move || {
+            let kernel = provider.granted_kernel_dispatch(self.clone());
+            provider.invoke_service_authenticated_sync(&context, self.clone(), kernel)
+        })
+        .await
+        .map_err(anyhow::Error::from)
+    }
+}
+
 /// Route a raw kernel request. `attribution` names the plugin a bound
 /// registration authenticated for an `InvokeService` request; routes that can
 /// carry it do so, the borrowed invoking transport (whose peer and provenance
 /// are unknown here) keeps sending the plain request.
-fn call_host_kernel_bridge_payload(payload: &[u8], attribution: Option<&str>) -> Result<Vec<u8>> {
+pub(super) fn call_host_kernel_bridge_payload(
+    payload: &[u8],
+    attribution: Option<&str>,
+) -> Result<Vec<u8>> {
     if let Some(sender) = INVOKING_TRANSPORT.with(|slot| slot.borrow().clone()) {
         let request = bmux_ipc::decode(payload).context("invalid invoking transport request")?;
         let (response, receiver) = std::sync::mpsc::sync_channel(1);
@@ -847,6 +1538,146 @@ fn bridge_response_payload(
     call_host_kernel_bridge_payload(payload, attribution.as_deref()).map_err(|_| 5)
 }
 
+fn run_selected_core_command(
+    state: &super::plugin_runtime::RuntimeCommandState,
+    request: &bmux_plugin_sdk::CoreCliCommandRequest,
+) -> Result<i32> {
+    let mut argv = vec!["bmux".to_string(), "--core-builtins-only".to_string()];
+    argv.extend(request.command_path.clone());
+    argv.extend(request.arguments.clone());
+    let parsed = Cli::try_parse_from(argv).context("failed parsing selected core command")?;
+    match parsed.command.context("selected core command missing")? {
+        bmux_cli_schema::Command::Terminal {
+            command:
+                bmux_cli_schema::TerminalCommand::Doctor {
+                    json,
+                    trace,
+                    trace_limit,
+                    trace_family,
+                    trace_pane,
+                },
+        } => super::terminal_doctor::run_terminal_doctor_selected(
+            state,
+            json,
+            trace,
+            trace_limit,
+            trace_family,
+            trace_pane,
+        )
+        .map(i32::from),
+        bmux_cli_schema::Command::Keymap {
+            command: bmux_cli_schema::KeymapCommand::Doctor { json },
+        } => super::terminal_doctor::run_keymap_doctor_selected(json, state).map(i32::from),
+        bmux_cli_schema::Command::Terminal {
+            command: bmux_cli_schema::TerminalCommand::InstallTerminfo { yes, check },
+        } => super::terminal_doctor::run_terminal_install_terminfo_selected(
+            yes,
+            check,
+            &state.config,
+        )
+        .map(i32::from),
+        bmux_cli_schema::Command::Logs {
+            command: bmux_cli_schema::LogsCommand::Path { json },
+        } => super::logs_cli::run_logs_path_selected(json, &state.paths).map(i32::from),
+        bmux_cli_schema::Command::Logs {
+            command: bmux_cli_schema::LogsCommand::Level { json },
+        } => run_logs_level(json).map(i32::from),
+        command @ bmux_cli_schema::Command::Playbook { .. } => {
+            super::playbook_cli::run_selected(state, &command)
+        }
+        _ => anyhow::bail!(
+            "core command '{}' has no pinned runtime executor; ambient routing refused",
+            request.command_path.join(" ")
+        ),
+    }
+}
+
+/// Host-private CLI bridge. Captures the already selected command state; this
+/// is not a foundational kernel grant and never dispatches an IPC request.
+pub(super) fn scoped_cli_executor() -> Result<bmux_plugin_sdk::PluginHostServices> {
+    scoped_cli_executor_with_dispatch(None)
+}
+
+pub(super) fn scoped_cli_executor_with_dispatch(
+    dispatch: Option<CommandDispatch>,
+) -> Result<bmux_plugin_sdk::PluginHostServices> {
+    let state = if let Some(dispatch) = &dispatch {
+        dispatch
+            .state
+            .as_ref()
+            .map(|state| (**state).clone())
+            .ok_or_else(|| anyhow::anyhow!("selected command snapshot missing"))?
+    } else {
+        super::plugin_runtime::selected_command_state()?
+    };
+    Ok(bmux_plugin_sdk::PluginHostServices::new(move |request| {
+        let protocol = |error: anyhow::Error| bmux_plugin_sdk::PluginError::ServiceProtocol {
+            details: format!("selected CLI bridge failed: {error:#}"),
+        };
+        if request.capability != CORE_CLI_COMMAND_CAPABILITY
+            || request.kind != ServiceKind::Command
+            || request.interface != CORE_CLI_COMMAND_INTERFACE_V1
+        {
+            return Err(bmux_plugin_sdk::PluginError::UnsupportedHostOperation {
+                operation: "builtin_cli",
+            });
+        }
+        match request.operation {
+            bmux_plugin_sdk::CORE_CLI_COMMAND_RUN_PATH_OPERATION_V1 => {
+                let command: bmux_plugin_sdk::CoreCliCommandRequest =
+                    decode_service_message(request.payload)?;
+                if command.protocol_version != bmux_plugin_sdk::CORE_CLI_BRIDGE_PROTOCOL_V1 {
+                    return Err(bmux_plugin_sdk::PluginError::ServiceProtocol {
+                        details: "unsupported selected core CLI protocol version".into(),
+                    });
+                }
+                let response = match run_selected_core_command(&state, &command) {
+                    Ok(status) => bmux_plugin_sdk::CoreCliCommandResponse::new(status),
+                    Err(error) => {
+                        bmux_plugin_sdk::CoreCliCommandResponse::failed(1, format!("{error:#}"))
+                    }
+                };
+                encode_service_message(&response)
+            }
+            CORE_CLI_COMMAND_RUN_PLUGIN_OPERATION_V1 => {
+                let command: PluginCliCommandRequest = decode_service_message(request.payload)?;
+                if command.protocol_version != bmux_plugin_sdk::CORE_CLI_BRIDGE_PROTOCOL_V1 {
+                    return Err(bmux_plugin_sdk::PluginError::ServiceProtocol {
+                        details: "unsupported selected plugin CLI protocol version".into(),
+                    });
+                }
+                let execution = if let Some(dispatch) = &dispatch {
+                    super::plugin_runtime::run_plugin_command_with_selected_dispatch(
+                        &state,
+                        &command,
+                        dispatch.clone(),
+                    )
+                } else {
+                    run_plugin_bridge_command_execution_with_state(&state, &command, None)
+                }
+                .map_err(protocol)?;
+                let response = if execution.status == 0 {
+                    PluginCliCommandResponse::new(execution.status)
+                } else {
+                    PluginCliCommandResponse::failed(
+                        execution.status,
+                        execution.outcome.error_message.unwrap_or_else(|| {
+                            format!(
+                                "selected plugin command exited with status {}",
+                                execution.status
+                            )
+                        }),
+                    )
+                };
+                encode_service_message(&response)
+            }
+            _ => Err(bmux_plugin_sdk::PluginError::UnsupportedHostOperation {
+                operation: "builtin_cli",
+            }),
+        }
+    }))
+}
+
 fn run_core_built_in_command(request: &bmux_plugin_sdk::CoreCliCommandRequest) -> Result<i32> {
     if let Some(result) = run_core_built_in_command_fast_path(request)? {
         return Ok(result);
@@ -1097,10 +1928,17 @@ pub(super) fn register_plugin_service_handlers(
     config: &BmuxConfig,
     paths: &ConfigPaths,
     registry: &PluginRegistry,
+    loaded_plugins: &Arc<Vec<super::plugin_runtime::ProductionPlugin>>,
 ) -> Result<()> {
-    let enabled_plugins = effective_enabled_plugins(config, registry);
+    let enabled_plugins = super::plugin_runtime::backend_enabled_plugins(config, registry)?;
     let available_capabilities = available_capability_providers(config, registry)?;
-    let services = available_service_descriptors(config, registry)?;
+    let services = available_service_descriptors(config, registry)?
+        .into_iter()
+        .filter(|service| match &service.provider {
+            bmux_plugin_sdk::ProviderId::Plugin(id) => enabled_plugins.contains(id),
+            bmux_plugin_sdk::ProviderId::Host => true,
+        })
+        .collect::<Vec<_>>();
     let plugin_search_roots = resolve_plugin_search_paths(config, paths)?
         .into_iter()
         .map(|path| path.to_string_lossy().into_owned())
@@ -1122,8 +1960,6 @@ pub(super) fn register_plugin_service_handlers(
         .collect::<Vec<_>>();
     let command_state =
         build_runtime_command_state(config.clone(), paths.clone(), Arc::new(registry.clone()))?;
-    let mut loaded_provider_cache: BTreeMap<String, Arc<bmux_plugin::LoadedPlugin>> =
-        BTreeMap::new();
     let command_connection_info = connection_info.clone();
 
     server.register_checked_service_handler_with_metadata(
@@ -1195,23 +2031,15 @@ pub(super) fn register_plugin_service_handlers(
             continue;
         };
 
-        let loaded_provider = if let Some(loaded) = loaded_provider_cache.get(&provider_plugin_id) {
-            Arc::clone(loaded)
-        } else {
-            let host = plugin_host_metadata();
-            let loaded = Arc::new(
-                load_plugin(provider, &host, &available_capabilities, config).with_context(
-                    || {
-                        format!(
-                            "failed loading service provider plugin '{}'",
-                            provider.declaration.id.as_str()
-                        )
-                    },
-                )?,
-            );
-            loaded_provider_cache.insert(provider_plugin_id.clone(), Arc::clone(&loaded));
-            loaded
-        };
+        let index = loaded_plugins
+            .iter()
+            .position(|loaded| loaded.declaration.id.as_str() == provider_plugin_id)
+            .with_context(|| {
+                format!("service provider '{provider_plugin_id}' has no active startup instance")
+            })?;
+        // Services retain the same startup instance, never a second factory
+        // invocation whose state differs from activation and registrations.
+        let loaded_provider = Arc::clone(loaded_plugins);
         let provider_declaration = provider.declaration.clone();
         let host = plugin_host_metadata();
         let services_for_handler = available_service_descriptors(config, registry)?;
@@ -1238,17 +2066,21 @@ pub(super) fn register_plugin_service_handlers(
                 let enabled_plugins = enabled_plugins_for_handler.clone();
                 async move {
                     let started_at = Instant::now();
-                    let _kernel_context_guard =
-                        enter_service_kernel_context(invoke_context.clone());
-                    let _host_kernel_connection_guard =
-                        enter_host_kernel_connection(connection.clone());
-                    // The caller is the plugin the host authenticated for
-                    // this invocation, or the host itself.
-                    let caller_plugin_id = invoke_context
-                        .caller_plugin_id()
-                        .unwrap_or(HOST_CALLER_PLUGIN_ID)
-                        .to_string();
+                    let authority = AuthenticatedServiceInvocation::new(invoke_context.clone());
+                    // The caller is the plugin the server authenticated for this
+                    // invocation, the plugin a selected host dispatch is acting
+                    // for, or the host itself. Never decoded from the payload.
+                    let caller_plugin_id = invoke_context.caller_plugin_id().map_or_else(
+                        || {
+                            SELECTED_PLUGIN_CALLER
+                                .try_with(Clone::clone)
+                                .unwrap_or_else(|_| HOST_CALLER_PLUGIN_ID.to_string())
+                        },
+                        ToString::to_string,
+                    );
+                    let provider = &loaded_provider[index];
                     let mut service_context = bmux_plugin_sdk::NativeServiceContext {
+                        host_service_port: None,
                         plugin_id: provider_declaration.id.as_str().to_string(),
                         request: ServiceRequest {
                             caller_plugin_id,
@@ -1293,18 +2125,18 @@ pub(super) fn register_plugin_service_handlers(
                         cancellation: bmux_plugin_sdk::CancellationToken::default(),
                         host_kernel_bridge: None,
                     };
-                    // A relaying dynamic provider's nested calls act as the
-                    // provider, never as its caller. Bundled providers keep the
-                    // host-attributed registration.
+                    // A relaying dynamic provider's nested bridge calls act as
+                    // the provider, never as its caller. Bundled providers keep
+                    // the host-attributed registration.
                     let retained = RetainedKernelContext::register_with(
                         Some(invoke_context.clone()),
-                        loaded_provider.uses_host_relay().then(|| {
+                        provider.uses_host_relay().then(|| {
                             bmux_plugin::TypedServiceCaller::from_service_context(&service_context)
                         }),
                     )?;
                     service_context.cancellation = retained.cancellation();
                     service_context.host_kernel_bridge = Some(retained.bridge());
-                    let response = loaded_provider.invoke_service(&service_context)?;
+                    let response = provider.invoke_service(&service_context, authority).await?;
                     let elapsed_us = started_at.elapsed().as_micros();
                     tracing::trace!(
                         target: "bmux_cli::plugin_service",
@@ -1350,6 +2182,323 @@ pub(super) fn service_descriptors_from_declarations<'a>(
 mod tests {
     use super::*;
     use std::sync::{MutexGuard, OnceLock};
+
+    fn selected_effect_scope() -> (
+        bmux_plugin_runtime::InstanceScope,
+        bmux_plugin_runtime::ActivationScope,
+        bmux_plugin_runtime::InvocationScope,
+    ) {
+        let instance = bmux_plugin_runtime::InstanceScope::new(
+            bmux_plugin_runtime::PluginRuntimeScopeId::new(),
+        );
+        let activation = instance
+            .begin_activation(bmux_plugin_runtime::PluginConcurrencyConfig::Concurrent)
+            .unwrap();
+        activation.mark_active().unwrap();
+        let invocation = activation.begin_invocation().unwrap();
+        (instance, activation, invocation)
+    }
+
+    async fn retire_selected_effect_scope(
+        instance: bmux_plugin_runtime::InstanceScope,
+        activation: bmux_plugin_runtime::ActivationScope,
+        invocation: bmux_plugin_runtime::InvocationScope,
+    ) {
+        invocation.drain().await.unwrap();
+        invocation.finish().unwrap();
+        activation.drain().await.unwrap();
+        activation.finish().unwrap();
+        instance.drain().await.unwrap();
+        instance.finish().unwrap();
+    }
+
+    fn assert_effect_drain_pending(invocation: &bmux_plugin_runtime::InvocationScope) {
+        let mut drain = std::pin::pin!(invocation.drain());
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(matches!(
+            drain.as_mut().poll(&mut context),
+            std::task::Poll::Pending
+        ));
+        // Dropping this drain observer must not drop accepted effect ownership.
+    }
+
+    #[tokio::test]
+    async fn selected_effect_timeout_before_queue_start_retains_admission() {
+        let (instance, activation, invocation) = selected_effect_scope();
+        let admission = invocation.try_admit().unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let called = calls.clone();
+        let (response, observer) = std::sync::mpsc::sync_channel(1);
+        let (settled, settlement) = tokio::sync::oneshot::channel();
+        let job = selected_effect_job(
+            tokio::runtime::Handle::current(),
+            Some(admission),
+            async move {
+                called.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                // The response observer may have disappeared; effect is not replayed.
+                let _ = response.send(17);
+                settled.send(()).unwrap();
+            },
+        );
+        let (queue, queued) = std::sync::mpsc::sync_channel(1);
+        assert!(queue.try_send(job).is_ok());
+        assert!(matches!(
+            observer.recv_timeout(std::time::Duration::ZERO),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        drop(observer);
+        assert_effect_drain_pending(&invocation);
+        queued.recv().unwrap()();
+        settlement.await.unwrap();
+        retire_selected_effect_scope(instance, activation, invocation).await;
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn selected_effect_observer_loss_and_cancellation_do_not_release_running_work() {
+        let (instance, activation, invocation) = selected_effect_scope();
+        let (started, start) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let (response, observer) = std::sync::mpsc::sync_channel(1);
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let called = calls.clone();
+        let job = selected_effect_job(
+            tokio::runtime::Handle::current(),
+            Some(invocation.try_admit().unwrap()),
+            async move {
+                started.send(()).unwrap();
+                released.await.unwrap();
+                called.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let _ = response.send(23);
+            },
+        );
+        job();
+        start.await.unwrap();
+        drop(observer);
+        invocation.close().unwrap();
+        assert!(invocation.is_cancelled().unwrap());
+        assert!(matches!(
+            invocation.try_admit(),
+            Err(bmux_plugin_runtime::ScopeError::Closed)
+        ));
+        assert_effect_drain_pending(&invocation);
+        activation.close().unwrap();
+        assert!(matches!(
+            activation.finish(),
+            Err(bmux_plugin_runtime::ScopeError::Outstanding)
+        ));
+        release.send(()).unwrap();
+        retire_selected_effect_scope(instance, activation, invocation).await;
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn selected_effect_closed_scope_rejects_before_queueing() {
+        let (instance, activation, invocation) = selected_effect_scope();
+        invocation.close().unwrap();
+        let (queue, receiver) = std::sync::mpsc::sync_channel::<SelectedRequestJob>(1);
+        let admission = invocation.try_admit();
+        assert!(matches!(
+            admission,
+            Err(bmux_plugin_runtime::ScopeError::Closed)
+        ));
+        // The production seam propagates this admission error before constructing
+        // or submitting a job. Neither queue occupancy nor an effect is created.
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        drop(queue);
+        retire_selected_effect_scope(instance, activation, invocation).await;
+    }
+
+    #[tokio::test]
+    async fn selected_effect_success_preserves_the_single_actual_response() {
+        let (instance, activation, invocation) = selected_effect_scope();
+        let (response, observer) = tokio::sync::oneshot::channel();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let called = calls.clone();
+        let job = selected_effect_job(
+            tokio::runtime::Handle::current(),
+            Some(invocation.try_admit().unwrap()),
+            async move {
+                called.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                response.send(vec![3, 1, 4]).unwrap();
+            },
+        );
+        job();
+        assert_eq!(observer.await.unwrap(), vec![3, 1, 4]);
+        retire_selected_effect_scope(instance, activation, invocation).await;
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn selected_effect_queue_rejection_releases_only_unused_admission() {
+        for disconnected in [false, true] {
+            let (instance, activation, invocation) = selected_effect_scope();
+            let (queue, receiver) = std::sync::mpsc::sync_channel::<SelectedRequestJob>(1);
+            if disconnected {
+                drop(receiver);
+            } else {
+                assert!(queue.try_send(Box::new(|| {})).is_ok());
+                // Keep this receiver alive through rejection below.
+                let job = selected_effect_job(
+                    tokio::runtime::Handle::current(),
+                    Some(invocation.try_admit().unwrap()),
+                    async { panic!("rejected effect ran") },
+                );
+                assert!(matches!(
+                    queue.try_send(job),
+                    Err(std::sync::mpsc::TrySendError::Full(_))
+                ));
+                retire_selected_effect_scope(instance, activation, invocation).await;
+                continue;
+            }
+            let job = selected_effect_job(
+                tokio::runtime::Handle::current(),
+                Some(invocation.try_admit().unwrap()),
+                async { panic!("rejected effect ran") },
+            );
+            assert!(matches!(
+                queue.try_send(job),
+                Err(std::sync::mpsc::TrySendError::Disconnected(_))
+            ));
+            retire_selected_effect_scope(instance, activation, invocation).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn selected_availability_closed_and_cancelled_invocations_are_errors() {
+        let server = BmuxServer::new(bmux_ipc::IpcEndpoint::unix_socket(
+            std::env::temp_dir().join("bmux-selected-availability-unit.sock"),
+        ));
+        let authority = AuthenticatedServiceInvocation::new(server.host_service_context());
+        let key = bmux_plugin_sdk::typed_dispatch::ServiceAvailabilityKey {
+            capability: "example.read".into(),
+            kind: ServiceKind::Query,
+            interface_id: "example/v1".into(),
+        };
+        let (instance, activation, invocation) = selected_effect_scope();
+        assert_eq!(
+            authority
+                .selected_service_availability(&invocation, &key)
+                .unwrap(),
+            bmux_plugin_sdk::typed_dispatch::SelectedServiceAvailability::Absent
+        );
+        authority.cancellation.cancel();
+        assert!(
+            authority
+                .selected_service_availability(&invocation, &key)
+                .is_err()
+        );
+        let authority = AuthenticatedServiceInvocation::new(server.host_service_context());
+        invocation.close().unwrap();
+        assert!(
+            authority
+                .selected_service_availability(&invocation, &key)
+                .is_err()
+        );
+        retire_selected_effect_scope(instance, activation, invocation).await;
+    }
+
+    #[tokio::test]
+    async fn command_local_dispatch_retains_delayed_effect_after_owner_cancellation() {
+        let (instance, activation, invocation) = selected_effect_scope();
+        let (dispatch, owner, mut requests) = CommandDispatch::channel();
+        let scope = invocation.clone();
+        let caller = tokio::task::spawn_blocking(move || {
+            dispatch.invoke(
+                &scope,
+                &bmux_plugin_sdk::HostServiceRequest {
+                    capability: "example.write",
+                    kind: ServiceKind::Command,
+                    interface: "example/v1",
+                    operation: "mutate",
+                    payload: b"once",
+                },
+            )
+        });
+        {
+            let request = requests.recv().await.unwrap();
+            assert!(!request.is_cancelled());
+            assert!(
+                matches!(&request.request, bmux_ipc::Request::InvokeService { payload, .. } if payload == b"once")
+            );
+            // The request is now owned by the actual connection dispatcher. Losing
+            // its command observer may reject new input, never discard this effect.
+            drop(owner);
+            assert!(request.is_cancelled());
+            assert_effect_drain_pending(&invocation);
+            request.respond(Ok(bmux_ipc::Response::Ok(
+                bmux_ipc::ResponsePayload::ServiceInvoked { payload: vec![9] },
+            )));
+        }
+        assert_eq!(caller.await.unwrap().unwrap(), vec![9]);
+        retire_selected_effect_scope(instance, activation, invocation).await;
+    }
+
+    #[tokio::test]
+    async fn command_local_dispatch_predispatch_rejection_is_not_replayed_or_success() {
+        let (instance, activation, invocation) = selected_effect_scope();
+        let (dispatch, _owner, mut requests) = CommandDispatch::channel();
+        let scope = invocation.clone();
+        let caller = tokio::task::spawn_blocking(move || {
+            dispatch.invoke(
+                &scope,
+                &bmux_plugin_sdk::HostServiceRequest {
+                    capability: "example.write",
+                    kind: ServiceKind::Command,
+                    interface: "example/v1",
+                    operation: "denied",
+                    payload: &[],
+                },
+            )
+        });
+        {
+            let request = requests.recv().await.unwrap();
+            request.reject();
+        }
+        assert!(caller.await.unwrap().is_err());
+        assert!(requests.try_recv().is_err());
+        retire_selected_effect_scope(instance, activation, invocation).await;
+    }
+
+    #[tokio::test]
+    async fn command_local_dispatch_unknown_transport_outcome_blocks_retirement() {
+        let (instance, activation, invocation) = selected_effect_scope();
+        let (dispatch, _owner, mut requests) = CommandDispatch::channel();
+        let scope = invocation.clone();
+        let caller = tokio::task::spawn_blocking(move || {
+            dispatch.invoke(
+                &scope,
+                &bmux_plugin_sdk::HostServiceRequest {
+                    capability: "example.write",
+                    kind: ServiceKind::Command,
+                    interface: "example/v1",
+                    operation: "mutate",
+                    payload: &[],
+                },
+            )
+        });
+        requests
+            .recv()
+            .await
+            .unwrap()
+            .respond(Err(anyhow::anyhow!("connection lost after dispatch")));
+        assert!(caller.await.unwrap().is_err());
+        assert!(matches!(
+            invocation.drain().await,
+            Err(bmux_plugin_runtime::ScopeError::Cleanup(_))
+        ));
+        assert!(matches!(
+            invocation.finish(),
+            Err(bmux_plugin_runtime::ScopeError::Cleanup(_))
+        ));
+        // Only this test knows the injected effect never ran; production cannot
+        // infer this acknowledgement from a transport failure.
+        invocation.resolve_cleanup().unwrap();
+        retire_selected_effect_scope(instance, activation, invocation).await;
+    }
 
     static HOST_KERNEL_FALLBACK_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
@@ -1502,6 +2651,329 @@ mod tests {
             assert!(invoke_test_bridge(Some(second_bridge), &bmux_ipc::Request::CurrentStreamProvenance).is_ok());
             drop(second);
         }).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn selected_plugin_origin_is_scoped_and_not_request_metadata() {
+        assert!(SELECTED_PLUGIN_CALLER.try_with(Clone::clone).is_err());
+        SELECTED_PLUGIN_CALLER
+            .scope("test.owner".to_string(), async {
+                assert_eq!(SELECTED_PLUGIN_CALLER.with(Clone::clone), "test.owner");
+                let nested = SELECTED_PLUGIN_CALLER
+                    .scope("test.nested".to_string(), async {
+                        SELECTED_PLUGIN_CALLER.with(Clone::clone)
+                    })
+                    .await;
+                assert_eq!(nested, "test.nested");
+                assert_eq!(SELECTED_PLUGIN_CALLER.with(Clone::clone), "test.owner");
+            })
+            .await;
+        assert!(SELECTED_PLUGIN_CALLER.try_with(Clone::clone).is_err());
+    }
+
+    #[tokio::test]
+    async fn selected_host_dispatch_preserves_owner_and_restores_task_origin() {
+        let directory = private_scope_directory();
+        let server = BmuxServer::new(bmux_ipc::IpcEndpoint::unix_socket(
+            directory.path().join("s"),
+        ));
+        server
+            .register_service_handler(
+                "test.origin",
+                InvokeServiceKind::Query,
+                "origin/v1",
+                "read",
+                |_, _, _| async {
+                    Ok(SELECTED_PLUGIN_CALLER
+                        .try_with(Clone::clone)
+                        .unwrap_or_else(|_| "unbound".to_string())
+                        .into_bytes())
+                },
+            )
+            .unwrap();
+        let authority = AuthenticatedServiceInvocation::new(server.host_service_context())
+            .with_plugin_caller(&bmux_plugin::PluginId::new("test.owner").unwrap());
+        let request = bmux_ipc::encode(&bmux_ipc::Request::InvokeService {
+            capability: "test.origin".into(),
+            kind: InvokeServiceKind::Query,
+            interface_id: "origin/v1".into(),
+            operation: "read".into(),
+            payload: vec![],
+        })
+        .unwrap();
+        let response = AuthenticatedServiceInvocation::dispatch_host_callback(move || {
+            authority.execute_response(&request)
+        })
+        .await
+        .unwrap();
+        assert!(
+            matches!(response, bmux_ipc::ResponsePayload::ServiceInvoked { payload } if payload == b"test.owner")
+        );
+        assert!(SELECTED_PLUGIN_CALLER.try_with(Clone::clone).is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn selected_kernel_scope_dispatch_does_not_require_cli_worker_tls() {
+        use bmux_plugin::InvocationKernelDispatch;
+        let directory = private_scope_directory();
+        let server = BmuxServer::new(bmux_ipc::IpcEndpoint::unix_socket(
+            directory.path().join("s"),
+        ));
+        let effects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = effects.clone();
+        server
+            .register_service_handler(
+                "test.effect",
+                InvokeServiceKind::Command,
+                "effect/v1",
+                "once",
+                move |_, _, _| {
+                    let observed = observed.clone();
+                    async move {
+                        observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        Ok(vec![7])
+                    }
+                },
+            )
+            .unwrap();
+        let authority = AuthenticatedServiceInvocation::new(server.host_service_context());
+        let (instance, activation, invocation) = selected_effect_scope();
+        let scope = invocation.clone();
+        let request = bmux_ipc::encode(&bmux_ipc::Request::InvokeService {
+            capability: "test.effect".into(),
+            kind: InvokeServiceKind::Command,
+            interface_id: "effect/v1".into(),
+            operation: "once".into(),
+            payload: vec![],
+        })
+        .unwrap();
+        tokio::task::spawn_blocking(move || {
+            assert!(!IN_BLOCKING_PLUGIN_WORKER.with(std::cell::Cell::get));
+            let result = authority.execute(&scope, &request).unwrap();
+            assert!(
+                matches!(bmux_ipc::decode::<bmux_ipc::ResponsePayload>(&result).unwrap(),
+                bmux_ipc::ResponsePayload::ServiceInvoked { payload } if payload == vec![7])
+            );
+            scope.close().unwrap();
+            assert!(authority.execute(&scope, &request).is_err());
+        })
+        .await
+        .unwrap();
+        assert_eq!(effects.load(std::sync::atomic::Ordering::SeqCst), 1);
+        retire_selected_effect_scope(instance, activation, invocation).await;
+    }
+
+    #[tokio::test]
+    async fn synchronous_host_dispatch_rejects_current_thread_before_submission() {
+        let directory = private_scope_directory();
+        let server = BmuxServer::new(bmux_ipc::IpcEndpoint::unix_socket(
+            directory.path().join("s"),
+        ));
+        let authority = AuthenticatedServiceInvocation::new(server.host_service_context());
+        // The callback guard is not physical placement evidence.
+        let _misleading_worker = BlockingPluginWorkerGuard::enter();
+        assert!(!ON_HOST_CALLBACK_THREAD.with(std::cell::Cell::get));
+        let error = authority
+            .execute_response(&bmux_ipc::encode(&bmux_ipc::Request::Ping).unwrap())
+            .unwrap_err();
+        assert!(error.to_string().contains("current-thread runtime"));
+    }
+
+    #[tokio::test]
+    async fn persistent_callback_dispatch_supports_selected_current_thread_runtime() {
+        let directory = private_scope_directory();
+        let server = BmuxServer::new(bmux_ipc::IpcEndpoint::unix_socket(
+            directory.path().join("s"),
+        ));
+        let authority = AuthenticatedServiceInvocation::new(server.host_service_context());
+        let request = bmux_ipc::encode(&bmux_ipc::Request::CurrentStreamProvenance).unwrap();
+        let response = AuthenticatedServiceInvocation::dispatch_host_callback(move || {
+            assert!(ON_HOST_CALLBACK_THREAD.with(std::cell::Cell::get));
+            assert!(IN_BLOCKING_PLUGIN_WORKER.with(std::cell::Cell::get));
+            assert_eq!(
+                tokio::runtime::Handle::current().runtime_flavor(),
+                tokio::runtime::RuntimeFlavor::CurrentThread
+            );
+            authority.execute_response(&request)
+        })
+        .await
+        .unwrap();
+        assert!(matches!(
+            response,
+            bmux_ipc::ResponsePayload::CurrentStreamProvenance {
+                provenance: bmux_ipc::StreamProvenance::HostInternal,
+            }
+        ));
+        assert!(!ON_HOST_CALLBACK_THREAD.with(std::cell::Cell::get));
+    }
+
+    #[test]
+    fn selected_dispatcher_is_reused_and_runs_outside_tokio() {
+        let executor = SelectedRequestExecutor::get().unwrap();
+        assert!(std::ptr::eq(
+            executor,
+            SelectedRequestExecutor::get().unwrap()
+        ));
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        assert!(
+            executor
+                .sender
+                .try_send(Box::new(move || {
+                    assert!(tokio::runtime::Handle::try_current().is_err());
+                    assert!(!IN_BLOCKING_PLUGIN_WORKER.with(std::cell::Cell::get));
+                    sender.send(std::thread::current().id()).unwrap();
+                }))
+                .is_ok()
+        );
+        let first = receiver
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        assert!(
+            executor
+                .sender
+                .try_send(Box::new(move || {
+                    sender.send(std::thread::current().id()).unwrap();
+                }))
+                .is_ok()
+        );
+        assert_eq!(
+            first,
+            receiver
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap()
+        );
+    }
+
+    async fn check_nested_provenance_callbacks(context: ServiceInvokeContext) -> Result<()> {
+        // Exercise a synchronous typed callback both in this service poll and
+        // in a separately scheduled task. Neither may inherit worker TLS.
+        let request = bmux_ipc::encode(&bmux_ipc::Request::CurrentStreamProvenance)?;
+        assert!(!IN_BLOCKING_PLUGIN_WORKER.with(std::cell::Cell::get));
+        let direct =
+            AuthenticatedServiceInvocation::new(context.clone()).execute_response(&request)?;
+        assert!(matches!(
+            direct,
+            bmux_ipc::ResponsePayload::CurrentStreamProvenance {
+                provenance: bmux_ipc::StreamProvenance::HostInternal,
+            }
+        ));
+        assert!(!IN_BLOCKING_PLUGIN_WORKER.with(std::cell::Cell::get));
+        let nested_context = context.clone();
+        let nested_request = request.clone();
+        let nested = tokio::spawn(async move {
+            assert!(!IN_BLOCKING_PLUGIN_WORKER.with(std::cell::Cell::get));
+            let result = AuthenticatedServiceInvocation::new(nested_context)
+                .execute_response(&nested_request);
+            assert!(!IN_BLOCKING_PLUGIN_WORKER.with(std::cell::Cell::get));
+            result
+        })
+        .await??;
+        assert!(matches!(
+            nested,
+            bmux_ipc::ResponsePayload::CurrentStreamProvenance {
+                provenance: bmux_ipc::StreamProvenance::HostInternal,
+            }
+        ));
+        let origin = context.execute_raw(request).await?;
+        assert!(matches!(
+            bmux_ipc::decode::<bmux_ipc::Response>(&origin)?,
+            bmux_ipc::Response::Ok(bmux_ipc::ResponsePayload::CurrentStreamProvenance {
+                provenance: bmux_ipc::StreamProvenance::HostInternal,
+            })
+        ));
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn explicit_worker_kernel_dispatch_retains_server_context_without_tls() {
+        use bmux_plugin::InvocationKernelDispatch;
+        use bmux_plugin_runtime::{InstanceScope, PluginConcurrencyConfig, PluginRuntimeScopeId};
+        let first_dir = private_scope_directory();
+        let second_dir = private_scope_directory();
+        let first = BmuxServer::new(bmux_ipc::IpcEndpoint::unix_socket(
+            first_dir.path().join("private/s"),
+        ));
+        let second = BmuxServer::new(bmux_ipc::IpcEndpoint::unix_socket(
+            second_dir.path().join("private/s"),
+        ));
+        for (server, value) in [(&first, 31_u8), (&second, 47_u8)] {
+            server
+                .register_service_handler(
+                    "test.explicit",
+                    InvokeServiceKind::Query,
+                    "explicit/v1",
+                    "read",
+                    move |_, context, _| async move {
+                        check_nested_provenance_callbacks(context).await?;
+                        Ok(vec![value])
+                    },
+                )
+                .unwrap();
+        }
+        let request = bmux_ipc::encode(&bmux_ipc::Request::InvokeService {
+            capability: "test.explicit".into(),
+            kind: InvokeServiceKind::Query,
+            interface_id: "explicit/v1".into(),
+            operation: "read".into(),
+            payload: Vec::new(),
+        })
+        .unwrap();
+        for (server, expected) in [(&first, 31_u8), (&second, 47_u8)] {
+            let instance = InstanceScope::new(PluginRuntimeScopeId::new());
+            let activation = instance
+                .begin_activation(PluginConcurrencyConfig::Concurrent)
+                .unwrap();
+            activation.mark_active().unwrap();
+            let invocation = activation.begin_invocation().unwrap();
+            let authority = AuthenticatedServiceInvocation::new(server.host_service_context());
+            let nested_authority = authority.clone();
+            let nested_request = request.clone();
+            let nested = tokio::task::spawn_blocking(move || {
+                assert!(!IN_BLOCKING_PLUGIN_WORKER.with(std::cell::Cell::get));
+                let response = nested_authority.execute_response(&nested_request);
+                assert!(!IN_BLOCKING_PLUGIN_WORKER.with(std::cell::Cell::get));
+                response
+            })
+            .await
+            .unwrap()
+            .unwrap();
+            assert!(
+                matches!(nested, bmux_ipc::ResponsePayload::ServiceInvoked { payload } if payload == vec![expected])
+            );
+            assert!(
+                authority.execute(&invocation, &request).is_err(),
+                "async executor must not perform synchronous dispatch"
+            );
+            let request = request.clone();
+            let cancelled_authority = authority.clone();
+            let cancelled_request = request.clone();
+            let output = tokio::task::spawn_blocking(move || {
+                assert!(SERVICE_KERNEL_CONTEXT.with(|slot| slot.borrow().is_none()));
+                let _worker = BlockingPluginWorkerGuard::enter();
+                let result = authority.execute(&invocation, &request);
+                assert!(IN_BLOCKING_PLUGIN_WORKER.with(std::cell::Cell::get));
+                invocation.close().unwrap();
+                invocation.finish().unwrap();
+                result
+            })
+            .await
+            .unwrap()
+            .unwrap();
+            assert!(
+                matches!(bmux_ipc::decode::<bmux_ipc::ResponsePayload>(&output).unwrap(),
+                bmux_ipc::ResponsePayload::ServiceInvoked { payload } if payload == vec![expected])
+            );
+            cancelled_authority.cancellation.cancel();
+            assert!(
+                cancelled_authority
+                    .execute_response(&cancelled_request)
+                    .is_err()
+            );
+            activation.close().unwrap();
+            activation.drain().await.unwrap();
+            activation.finish().unwrap();
+        }
     }
 
     // One end-to-end scenario; splitting it would scatter the scope setup.

@@ -1573,10 +1573,84 @@ fn ipc_summary_to_typed(summary: PrimitiveContextSummary) -> ContextSummary {
     }
 }
 
-bmux_plugin_sdk::export_plugin!(ContextsPlugin, include_str!("../plugin.toml"));
+bmux_plugin_sdk::define_plugin!(
+    factory = |scope: bmux_plugin_sdk::definition::PluginCreateContext| {
+        Ok(std::sync::Arc::new(
+            bmux_plugin_sdk::definition::RustPluginAdapter::for_instance(
+                ContextsPlugin,
+                scope.instance,
+            ),
+        )
+            as std::sync::Arc<
+                dyn bmux_plugin_sdk::definition::PluginInstance,
+            >)
+    },
+    metadata = bmux_plugin_sdk::definition::PluginDefinition::from_rust_plugin::<ContextsPlugin>(
+        include_str!("../plugin.toml"),
+        vec![bmux_plugin_sdk::definition::ComponentRole::Backend],
+    )
+    .expect("embedded foundational declaration must be valid")
+    .metadata,
+);
 
 #[cfg(test)]
 mod tests {
+    #[derive(Clone)]
+    struct InvocationTestHost(bmux_plugin::test_support::TestServiceRouter);
+
+    struct InvocationTestDispatch {
+        router: bmux_plugin::test_support::TestServiceRouter,
+        caller: Option<Uuid>,
+        plugin: &'static str,
+    }
+
+    impl bmux_plugin_sdk::HostServiceDispatch for InvocationTestDispatch {
+        // The host dispatch contract requires the SDK's rich error type.
+        #[allow(clippy::result_large_err)]
+        fn invoke(
+            &self,
+            _: &bmux_plugin_runtime::InvocationScope,
+            request: bmux_plugin_sdk::HostServiceRequest<'_>,
+        ) -> bmux_plugin_sdk::Result<Vec<u8>> {
+            (self.router)(
+                self.plugin,
+                self.caller,
+                request.capability,
+                request.kind,
+                request.interface,
+                request.operation,
+                request.payload.to_vec(),
+            )
+        }
+    }
+
+    impl InvocationTestHost {
+        fn port(
+            &self,
+            plugin: &'static str,
+            caller: Option<Uuid>,
+        ) -> bmux_plugin_sdk::PluginHostServices {
+            let instance = bmux_plugin_runtime::InstanceScope::new(
+                bmux_plugin_runtime::PluginRuntimeScopeId::from_uuid(Uuid::new_v4()),
+            );
+            let activation = instance
+                .begin_activation(bmux_plugin_runtime::PluginConcurrencyConfig::Concurrent)
+                .unwrap();
+            activation.mark_active().unwrap();
+            let invocation = activation.begin_invocation().unwrap();
+            bmux_plugin_sdk::PluginHostServices::from_bound(
+                bmux_plugin_sdk::BoundHostServicePort::new(
+                    invocation,
+                    std::sync::Arc::new(InvocationTestDispatch {
+                        router: self.0.clone(),
+                        caller,
+                        plugin,
+                    }),
+                ),
+            )
+        }
+    }
+
     fn checked_test_router(
         router: bmux_plugin::test_support::TestServiceRouter,
     ) -> bmux_plugin::test_support::TestServiceRouter {
@@ -2007,13 +2081,11 @@ mod tests {
     // caller was reseated onto. These event pairs are what the attach
     // runtime subscribes to for deterministic focus switching.
 
-    /// Install a minimal cross-plugin test router that satisfies the
+    /// Create a minimal invocation-bound cross-plugin test host that satisfies the
     /// sessions-commands and clients-state calls contexts-plugin
     /// makes from its create / close / select paths.
-    fn install_contexts_test_router(
-        fixed_client_id: Uuid,
-    ) -> bmux_plugin::test_support::TestServiceRouterGuard {
-        use bmux_plugin::test_support::{TestServiceRouter, install_test_service_router};
+    fn install_contexts_test_router(fixed_client_id: Uuid) -> InvocationTestHost {
+        use bmux_plugin::test_support::TestServiceRouter;
         let router: TestServiceRouter = std::sync::Arc::new(
             move |_caller_plugin,
                   _caller_client,
@@ -2070,12 +2142,38 @@ mod tests {
                 }
             },
         );
-        install_test_service_router(checked_test_router(router))
+        InvocationTestHost(checked_test_router(router))
     }
 
-    /// Minimal `NativeServiceContext` wired to the fake router above.
-    fn test_service_context(caller_client_id: Uuid) -> bmux_plugin_sdk::NativeServiceContext {
+    #[test]
+    fn invocation_hosts_keep_generated_client_routes_isolated() {
+        let first = Uuid::from_u128(501);
+        let second = Uuid::from_u128(502);
+        let first_host = install_contexts_test_router(first);
+        let second_host = install_contexts_test_router(second);
+        for (host, caller, expected) in
+            [(&first_host, second, first), (&second_host, first, second)]
+        {
+            let mut context = test_service_context(host, expected);
+            // Serialized caller changes must not replace the selected host port.
+            context.caller_client_id = Some(caller);
+            let mut client = bmux_plugin::ServiceCallerDispatchClient::new(&context);
+            let summary = bmux_plugin::block_on_typed_dispatch(
+                bmux_clients_plugin_api::clients_state::client::current_client(&mut client),
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(summary.id, expected);
+        }
+    }
+
+    /// Minimal `NativeServiceContext` bound to the explicit host above.
+    fn test_service_context(
+        host: &InvocationTestHost,
+        caller_client_id: Uuid,
+    ) -> bmux_plugin_sdk::NativeServiceContext {
         bmux_plugin_sdk::NativeServiceContext {
+            host_service_port: Some(host.port("bmux.contexts", Some(caller_client_id))),
             plugin_id: "bmux.contexts".to_string(),
             request: bmux_plugin_sdk::ServiceRequest {
                 caller_plugin_id: "bmux.tabs".to_string(),
@@ -2182,9 +2280,9 @@ mod tests {
             .register_channel::<ContextEvent>(contexts_events::EVENT_KIND);
 
         let client_id = Uuid::new_v4();
-        let _router_guard = install_contexts_test_router(client_id);
+        let router_guard = install_contexts_test_router(client_id);
         let events_rx = subscribe_events();
-        let ctx = test_service_context(client_id);
+        let ctx = test_service_context(&router_guard, client_id);
 
         let ack = create_context_local(
             &ctx,
@@ -2257,5 +2355,52 @@ mod tests {
             Some(client_id),
             "SessionActiveContextChanged must carry the initiating client id",
         );
+    }
+}
+
+#[cfg(test)]
+mod definition_contract_tests {
+    #[test]
+    fn explicit_contract_versions_preserve_service_wire_routes() {
+        let definition = super::plugin_definition();
+        let manifest =
+            bmux_plugin::PluginManifest::from_toml_str(include_str!("../plugin.toml")).unwrap();
+        let canonical = bmux_plugin_sdk::definition::PluginDefinition::from_rust_plugin::<
+            super::ContextsPlugin,
+        >(
+            include_str!("../plugin.toml"),
+            vec![bmux_plugin_sdk::definition::ComponentRole::Backend],
+        )
+        .unwrap();
+        definition.validate().unwrap();
+        assert_eq!(definition.metadata, canonical.metadata);
+        assert_eq!(definition.metadata.plugin_id, manifest.id);
+        assert_eq!(definition.metadata.version, manifest.version);
+        assert_eq!(definition.metadata.roles, manifest.component_roles);
+        let declared: std::collections::BTreeSet<_> = manifest
+            .contracts
+            .iter()
+            .map(|contract| (&contract.interface_id, contract.major, contract.minor))
+            .collect();
+        let embedded: std::collections::BTreeSet<_> = definition
+            .metadata
+            .contracts
+            .iter()
+            .map(|contract| (&contract.interface_id, contract.major, contract.minor))
+            .collect();
+        assert_eq!(embedded, declared);
+        let mut services = definition.declarations().unwrap().services;
+        services.extend(
+            <super::ContextsPlugin as bmux_plugin_sdk::RustPlugin>::declared_services().unwrap(),
+        );
+        for service in services {
+            let contract = definition
+                .metadata
+                .contracts
+                .iter()
+                .find(|contract| contract.interface_id == service.interface_id)
+                .expect("every retained route requires explicit compatibility metadata");
+            assert_eq!((contract.major, contract.minor), (1, 0));
+        }
     }
 }

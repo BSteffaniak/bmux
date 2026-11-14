@@ -1,3 +1,4 @@
+component_roles = ["backend", "frontend"]
 execution_class = "native_fast"
 id = "bmux.broadcast"
 name = "bmux Broadcast"

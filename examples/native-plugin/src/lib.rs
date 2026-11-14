@@ -16,8 +16,9 @@ use bmux_permissions_plugin_api::permissions_state::client::ListPermissionsReque
 use bmux_permissions_plugin_api::permissions_state::{self, PermissionEntry as PermissionSummary};
 use bmux_permissions_plugin_api::{capabilities, permissions_commands};
 use bmux_plugin::ServiceCaller;
-use bmux_plugin_sdk::EXIT_USAGE;
-use bmux_plugin_sdk::prelude::*;
+use bmux_plugin_sdk::{
+    EXIT_ERROR, EXIT_OK, EXIT_USAGE, NativeCommandContext, PluginEvent, ServiceKind,
+};
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
 
@@ -29,61 +30,102 @@ struct ExamplePlugin;
 const PROMPT_HOST_WAIT_TIMEOUT: Duration = Duration::from_secs(8);
 const PROMPT_HOST_WAIT_POLL: Duration = Duration::from_millis(75);
 
-impl RustPlugin for ExamplePlugin {
-    type Contract = bmux_plugin_sdk::NoPluginContract;
-
-    fn run_command(&mut self, context: NativeCommandContext) -> Result<i32, PluginCommandError> {
-        bmux_plugin_sdk::route_command!(context, {
-            "permissions-list" => Ok(run_permissions_list(&context)),
-            "permissions-grant" => Ok(run_permissions_grant(&context)),
-            "permissions-revoke" => Ok(run_permissions_revoke(&context)),
-            "tabs-list" => Ok(run_windows_list(&context)),
-            "windows-new" => Ok(run_windows_new(&context)),
-            "settings-show" => Ok(run_settings_show(&context)),
-            "storage-put" => Ok(run_storage_put(&context)),
-            "storage-get" => Ok(run_storage_get(&context)),
-            "prompt-showcase" => Ok(run_prompt_showcase_command()),
-            "status-set" => Ok(tab_bar::run_status_set(&context)),
-            "status-clear" => Ok(tab_bar::run_status_clear(&context)),
-            "status-list" => Ok(tab_bar::run_status_list(&context)),
-            "notify" => Ok(tab_bar::run_notify(&context)),
-            "hello" => {
-                if context.arguments.is_empty() {
-                    println!("example.native: hello from bmux plugin");
-                } else {
-                    println!("example.native: hello {}", context.arguments.join(" "));
-                }
-                Ok(EXIT_OK)
-            },
+impl bmux_plugin_sdk::PluginInstance for ExamplePlugin {
+    fn command(
+        &self,
+        _call: bmux_plugin_sdk::PluginCallContext,
+        context: NativeCommandContext,
+    ) -> bmux_plugin_sdk::PluginFuture<'_, bmux_plugin_sdk::CommandOutcome> {
+        Box::pin(async move {
+            bmux_plugin_sdk::route_command!(context, {
+                "permissions-list" => Ok(run_permissions_list(&context)),
+                "permissions-grant" => Ok(run_permissions_grant(&context)),
+                "permissions-revoke" => Ok(run_permissions_revoke(&context)),
+                "tabs-list" => Ok(run_windows_list(&context)),
+                "windows-new" => Ok(run_windows_new(&context)),
+                "settings-show" => Ok(run_settings_show(&context)),
+                "storage-put" => Ok(run_storage_put(&context)),
+                "storage-get" => Ok(run_storage_get(&context)),
+                "prompt-showcase" => Ok(run_prompt_showcase_command()),
+                "status-set" => Ok(tab_bar::run_status_set(&context)),
+                "status-clear" => Ok(tab_bar::run_status_clear(&context)),
+                "status-list" => Ok(tab_bar::run_status_list(&context)),
+                "notify" => Ok(tab_bar::run_notify(&context)),
+                "hello" => {
+                    if context.arguments.is_empty() {
+                        println!("example.native: hello from bmux plugin");
+                    } else {
+                        println!("example.native: hello {}", context.arguments.join(" "));
+                    }
+                    Ok(EXIT_OK)
+                },
+            })
+            .into()
         })
     }
 
     fn activate(
-        &mut self,
-        context: bmux_plugin_sdk::NativeLifecycleContext,
-    ) -> Result<i32, PluginCommandError> {
-        println!("example.native: activated {}", context.plugin_id);
-        tab_bar::start_background_status(&context);
-        Ok(EXIT_OK)
+        &self,
+        context: bmux_plugin_sdk::PluginLifecycleContext,
+    ) -> bmux_plugin_sdk::PluginFuture<'_, bmux_plugin_sdk::PluginResult<()>> {
+        Box::pin(async move {
+            println!("example.native: activated {}", context.native.plugin_id);
+            tab_bar::start_background_status(&context.native);
+            Ok(())
+        })
     }
 
     fn deactivate(
-        &mut self,
-        context: bmux_plugin_sdk::NativeLifecycleContext,
-    ) -> Result<i32, PluginCommandError> {
-        tab_bar::stop_background_status();
-        tab_bar::clear_on_deactivate(&context);
-        println!("example.native: deactivated {}", context.plugin_id);
-        Ok(EXIT_OK)
+        &self,
+        context: bmux_plugin_sdk::PluginLifecycleContext,
+    ) -> bmux_plugin_sdk::PluginFuture<'_, bmux_plugin_sdk::PluginResult<()>> {
+        Box::pin(async move {
+            tab_bar::stop_background_status();
+            tab_bar::clear_on_deactivate(&context.native);
+            println!("example.native: deactivated {}", context.native.plugin_id);
+            Ok(())
+        })
     }
 
-    fn handle_event(&mut self, event: PluginEvent) -> Result<i32, PluginCommandError> {
-        println!("example.native: observed event {}", event.kind);
-        Ok(EXIT_OK)
+    fn event(
+        &self,
+        event: PluginEvent,
+    ) -> bmux_plugin_sdk::PluginFuture<'_, bmux_plugin_sdk::PluginResult<()>> {
+        Box::pin(async move {
+            println!("example.native: observed event {}", event.kind);
+            Ok(())
+        })
     }
 }
 
-bmux_plugin_sdk::export_plugin!(ExamplePlugin, include_str!("../plugin.toml"));
+bmux_plugin_sdk::define_plugin!(
+    factory =
+        |_scope| Ok(std::sync::Arc::new(ExamplePlugin)
+            as std::sync::Arc<dyn bmux_plugin_sdk::PluginInstance>),
+    metadata = bmux_plugin_sdk::PluginMetadata {
+        plugin_id: "example.native".into(),
+        version: "0.0.1-alpha.0".into(),
+        roles: vec![bmux_plugin_sdk::ComponentRole::Backend],
+        required_capabilities: [
+            "bmux.commands",
+            "bmux.config.read",
+            "bmux.events.subscribe",
+            "bmux.storage",
+            "bmux.permissions.read",
+            "bmux.permissions.write",
+            "bmux.tabs.read",
+            "bmux.tabs.write",
+            "bmux.tab_bar.notify",
+            "bmux.tab_bar.status.read",
+            "bmux.tab_bar.status.write",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect(),
+        contracts: vec![],
+        manifest_toml: Some(include_str!("../plugin.toml").into()),
+    },
+);
 
 fn run_permissions_list(context: &NativeCommandContext) -> i32 {
     let Some(session) = context.arguments.first() else {
@@ -556,6 +598,15 @@ where
             }
             Err(PromptSubmitError::HostDisconnected) => {
                 return Err("prompt host disconnected while running plugin showcase".to_string());
+            }
+            Err(PromptSubmitError::Full) => {
+                return Err("prompt host queue is full".to_string());
+            }
+            Err(PromptSubmitError::TooLarge) => {
+                return Err("prompt request exceeds host limits".to_string());
+            }
+            Err(PromptSubmitError::OwnerClosed) => {
+                return Err("prompt owner has closed".to_string());
             }
         }
     }

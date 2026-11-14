@@ -123,6 +123,16 @@ pub struct PaneCloseResponse {
 }
 
 pub trait ClusterRuntimeOps {
+    fn durable_mutation(&self) -> Result<crate::durable_storage::MutationGuard, String> {
+        #[cfg(test)]
+        {
+            crate::durable_storage::mutation_at(None)
+        }
+        #[cfg(not(test))]
+        {
+            Err("cluster storage scope unavailable".into())
+        }
+    }
     fn core_cli_command_run_path(
         &self,
         request: &CoreCliCommandRequest,
@@ -147,6 +157,15 @@ pub trait ClusterRuntimeOps {
 }
 
 impl<T: HostRuntimeApi + Sync> ClusterRuntimeOps for T {
+    fn durable_mutation(&self) -> Result<crate::durable_storage::MutationGuard, String> {
+        let connection = self
+            .host_connection()
+            .ok_or("cluster storage scope unavailable")?;
+        crate::durable_storage::configure(&connection.data_dir)?;
+        crate::durable_storage::mutation_at(Some(
+            &std::path::Path::new(&connection.data_dir).join("plugin-storage"),
+        ))
+    }
     fn core_cli_command_run_path(
         &self,
         request: &CoreCliCommandRequest,

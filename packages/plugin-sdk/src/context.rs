@@ -170,6 +170,9 @@ pub struct NativeLifecycleContext {
     /// Missing/invalid artifacts do not disable baseline activation.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub auxiliary_executable_errors: BTreeMap<String, String>,
+    /// Host-selected activation capability; never reconstructed from wire data.
+    #[serde(skip)]
+    pub host_service_port: Option<crate::PluginHostServices>,
 }
 
 /// Exact native ABI 1.0 lifecycle wire snapshot. Keep its field order and
@@ -279,9 +282,22 @@ pub struct NativeCommandContext {
     /// observation).
     #[serde(default)]
     pub invocation_source: NativeCommandInvocationSource,
+    /// Invocation-bound host-selected authority. Serialization never transfers
+    /// executable callbacks or discovers replacement authority from metadata.
+    #[serde(skip)]
+    pub host_service_port: Option<crate::PluginHostServices>,
     /// Opaque handle for dispatching calls to the host kernel (internal use).
     #[serde(default)]
     pub host_kernel_bridge: Option<HostKernelBridge>,
+}
+
+impl NativeCommandContext {
+    /// Bind the actual host-selected command capability without identity lookup.
+    #[must_use]
+    pub fn with_host_service_port(mut self, port: crate::PluginHostServices) -> Self {
+        self.host_service_port = Some(port);
+        self
+    }
 }
 
 /// How a plugin command was dispatched by the host.
@@ -331,6 +347,11 @@ impl NativeCommandInvocationSource {
 }
 
 /// Context passed to [`RustPlugin::invoke_service`].
+///
+/// Equality includes all wire fields and live service-port allocation identity.
+/// A clone preserves port identity. Independently bound ports compare unequal;
+/// a serialized round trip drops the live port and therefore does not compare
+/// equal to a bound source context. Equality is not an authorization check.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NativeServiceContext {
     /// The plugin's own ID (e.g. `"bmux.clipboard"`).
@@ -377,6 +398,21 @@ pub struct NativeServiceContext {
     /// Opaque handle for dispatching calls to the host kernel (internal use).
     #[serde(default)]
     pub host_kernel_bridge: Option<HostKernelBridge>,
+    /// Invocation-bound safe service authority selected by the host. Cloning
+    /// preserves that capability; serialization never transports or resolves it.
+    /// Static hosts wrap their actual bound port; native adapters wrap the
+    /// retained callback gate. An absent port never permits ambient fallback.
+    #[serde(skip)]
+    pub host_service_port: Option<crate::PluginHostServices>,
+}
+
+impl NativeServiceContext {
+    /// Bind the actual host-selected invocation capability without ID lookup.
+    #[must_use]
+    pub fn with_host_service_port(mut self, port: crate::PluginHostServices) -> Self {
+        self.host_service_port = Some(port);
+        self
+    }
 }
 
 /// Context passed to streaming service handlers.
@@ -953,6 +989,32 @@ pub fn decode_host_kernel_bridge_plugin_command_payload(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn command_host_port_is_cloned_but_never_deserialized_as_authority() {
+        let port = crate::PluginHostServices::new(|_| Ok(vec![7]));
+        let mut wire = serde_json::json!({
+            "plugin_id": "example.command", "command": "run", "arguments": [],
+            "host": { "product_name": "test", "product_version": "1", "plugin_api_version": { "major": 1, "minor": 0 }, "plugin_abi_version": { "major": 1, "minor": 0 } },
+            "connection": { "config_dir": "/config", "runtime_dir": "/runtime", "data_dir": "/data", "state_dir": "/state" }
+        });
+        let context: super::NativeCommandContext = serde_json::from_value(wire.clone()).unwrap();
+        assert!(context.host_service_port.is_none());
+        let context = context.with_host_service_port(port.clone());
+        let cloned = context.clone();
+        assert_eq!(cloned.host_service_port.as_ref(), Some(&port));
+        let serialized = serde_json::to_value(&context).unwrap();
+        assert!(serialized.get("host_service_port").is_none());
+        wire.as_object_mut().unwrap().insert(
+            "host_service_port".into(),
+            serde_json::json!({"forged": true}),
+        );
+        let untrusted: super::NativeCommandContext = serde_json::from_value(wire).unwrap();
+        assert!(untrusted.host_service_port.is_none());
+        let bytes = crate::encode_service_message(&context).unwrap();
+        let decoded: super::NativeCommandContext = crate::decode_service_message(&bytes).unwrap();
+        assert!(decoded.host_service_port.is_none());
+    }
+
     #[test]
     fn invocation_source_cli_classification_preserves_non_cli_silence() {
         use super::NativeCommandInvocationSource;

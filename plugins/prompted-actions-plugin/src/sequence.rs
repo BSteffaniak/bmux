@@ -18,13 +18,17 @@ use crate::config::{ActionDef, build_prompt_request, format_prompt_value};
 /// cancelled or fails, the entire sequence is aborted silently.
 /// On successful completion of all prompts, the action template is
 /// filled and dispatched to the attach loop.
-pub async fn run_prompted_sequence(action: ActionDef) {
+pub async fn run_prompted_sequence(
+    action: ActionDef,
+    prompt: prompt::PromptPort,
+    actions: action_dispatch::ActionDispatchPort,
+) {
     let mut values: BTreeMap<String, String> = BTreeMap::new();
 
     for prompt_def in &action.prompts {
         let request = build_prompt_request(prompt_def);
 
-        match prompt::request(request).await {
+        match prompt.request(request).await {
             Ok(PromptResponse::Submitted(value)) => {
                 let formatted = format_prompt_value(
                     &prompt_def_to_field_for_format(&prompt_def.field_type),
@@ -58,7 +62,7 @@ pub async fn run_prompted_sequence(action: ActionDef) {
     let action_string = substitute_template(&action.command, &values);
     debug!(action = %action.name, dispatched = %action_string, "prompted action dispatching");
 
-    if let Err(error) = action_dispatch::dispatch(&action_string) {
+    if let Err(error) = actions.dispatch(&action_string) {
         warn!(
             action = %action.name,
             %error,

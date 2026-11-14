@@ -1,7 +1,12 @@
 execution_class = "native_fast"
-id = "bmux.pane_runtime"
-name = "bmux Pane Runtime"
-optional_capabilities = ["bmux.application_resurrection.host"]
+id              = "bmux.pane_runtime"
+name            = "bmux Pane Runtime"
+# Policy is enforced when permissions is selected; absence preserves local
+# single-user operation and must not prevent this provider from loading.
+optional_capabilities = [
+    "bmux.application_resurrection.host",
+    "bmux.sessions.policy",
+]
 owns_namespaces = ["pane-padding"]
 provided_capabilities = [
     "bmux.pane_runtime.spawn.v1",
@@ -26,7 +31,6 @@ required_capabilities = [
     "bmux.contexts.write",
     "bmux.sessions.read",
     "bmux.sessions.write",
-    "bmux.sessions.policy",
 ]
 version = "0.0.1-alpha.0"
 
@@ -268,3 +272,91 @@ value_name = "UUID"
 capability   = "bmux.pane_runtime.environment.v1"
 interface_id = "pane-runtime-environment-v1"
 kind         = "command"
+
+[[services]]
+capability   = "bmux.pane_runtime.spawn.v1"
+interface_id = "pane-runtime-spawn-v1"
+kind         = "query"
+
+[[services]]
+capability   = "bmux.pane_runtime.spawn.v1"
+interface_id = "pane-runtime-spawn-commands-v1"
+kind         = "command"
+
+# Explicit immutable v1 contracts. Route IDs are wire identities, not version
+# syntax: retain legacy names and negotiate their major separately.
+
+[[contracts]]
+interface_id = "pane-runtime-pointer-grid-v1"
+major        = 1
+minor        = 0
+
+[[contracts]]
+interface_id = "pane-runtime-live-presentation-v1"
+major        = 1
+minor        = 0
+
+[[contracts]]
+interface_id = "pane-runtime-human-input-v1"
+major        = 1
+minor        = 0
+
+[[contracts]]
+interface_id = "pane-runtime-presentation-v1"
+major        = 1
+minor        = 0
+
+[[contracts]]
+interface_id = "pane-runtime-presentation-wait-v1"
+major        = 1
+minor        = 0
+
+[[contracts]]
+interface_id = "pane-runtime-execution-v4"
+major        = 1
+minor        = 0
+
+[[contracts]]
+interface_id = "pane-runtime-readiness-v1"
+major        = 1
+minor        = 0
+
+[[contracts]]
+interface_id = "pane-runtime-state"
+major        = 1
+minor        = 0
+
+[[contracts]]
+interface_id = "pane-runtime-commands"
+major        = 1
+minor        = 0
+
+[[contracts]]
+interface_id = "attach-runtime-commands"
+major        = 1
+minor        = 0
+
+[[contracts]]
+interface_id = "attach-runtime-state"
+major        = 1
+minor        = 0
+
+[[contracts]]
+interface_id = "pane-runtime-events"
+major        = 1
+minor        = 0
+
+[[contracts]]
+interface_id = "pane-runtime-environment-v1"
+major        = 1
+minor        = 0
+
+[[contracts]]
+interface_id = "pane-runtime-spawn-v1"
+major        = 1
+minor        = 0
+
+[[contracts]]
+interface_id = "pane-runtime-spawn-commands-v1"
+major        = 1
+minor        = 0

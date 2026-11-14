@@ -13,7 +13,7 @@ pub fn run_rebuild_command(context: &NativeCommandContext) -> Result<i32, String
     let options = parse_rebuild_options(&context.arguments)?;
     let resolved_base_ref = resolve_changed_base_ref(&options)?;
     let metadata = cargo_metadata()?;
-    let workspace_plugin_crates = workspace_plugin_cdylib_crates(&metadata);
+    let workspace_plugin_crates = workspace_plugin_implementation_crates(&metadata);
     let bundled_plugins = discover_bundled_plugins(context)?;
     let selector_index = build_selector_index(&bundled_plugins, &workspace_plugin_crates);
 
@@ -53,7 +53,7 @@ pub fn run_rebuild_command(context: &NativeCommandContext) -> Result<i32, String
         targets.join(" ")
     );
 
-    execute_rebuild_build(options.profile, &targets)?;
+    execute_rebuild_build(options.profile, &targets, &metadata)?;
 
     Ok(EXIT_OK)
 }
@@ -187,25 +187,62 @@ fn validate_selected_targets(
     Ok(())
 }
 
-fn execute_rebuild_build(profile: BuildProfile, targets: &[String]) -> Result<(), String> {
-    let mut command = ProcessCommand::new("cargo");
-    command.arg("build");
-    if matches!(profile, BuildProfile::Release) {
-        command.arg("--release");
-    }
+fn execute_rebuild_build(
+    profile: BuildProfile,
+    targets: &[String],
+    metadata: &serde_json::Value,
+) -> Result<(), String> {
+    let workspace = metadata
+        .get("workspace_root")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("cargo metadata omitted workspace_root")?;
+    let target_directory = metadata
+        .get("target_directory")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("cargo metadata omitted target_directory")?;
+    let packages = metadata
+        .get("packages")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("cargo metadata omitted packages")?;
+    let script = Path::new(workspace).join("scripts/package-plugin.py");
+    let sdk = Path::new(workspace).join("packages/plugin-sdk/Cargo.toml");
     for crate_name in targets {
-        command.arg("-p");
-        command.arg(crate_name);
+        let package = packages
+            .iter()
+            .find(|package| package["name"].as_str() == Some(crate_name.as_str()))
+            .ok_or_else(|| format!("selected package disappeared: {crate_name}"))?;
+        let manifest = package["manifest_path"]
+            .as_str()
+            .ok_or_else(|| format!("package has no manifest path: {crate_name}"))?;
+        let output = Path::new(target_directory)
+            .join("plugin-packaging")
+            .join(crate_name)
+            .join("backend");
+        let mut command = ProcessCommand::new("python3");
+        command
+            .arg(&script)
+            .arg("--implementation-manifest")
+            .arg(manifest)
+            .arg("--sdk-manifest")
+            .arg(&sdk)
+            .arg("--output")
+            .arg(output)
+            .arg("--component")
+            .arg("backend")
+            .arg("--build");
+        if matches!(profile, BuildProfile::Release) {
+            command.arg("--release");
+        }
+        let status = command.status().map_err(|error| {
+            format!("failed running shared plugin packager for {crate_name}: {error}")
+        })?;
+        if !status.success() {
+            return Err(format!(
+                "shared plugin packaging failed for {crate_name}; implementations must expose export-free plugin_definition()"
+            ));
+        }
     }
-
-    let status = command
-        .status()
-        .map_err(|error| format!("failed executing cargo build: {error}"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err("cargo build failed for selected plugin crates".to_string())
-    }
+    Ok(())
 }
 
 fn rebuild_profile_name(profile: BuildProfile) -> String {
@@ -518,7 +555,7 @@ fn cargo_metadata() -> Result<serde_json::Value, String> {
         .map_err(|error| format!("failed parsing cargo metadata json: {error}"))
 }
 
-fn workspace_plugin_cdylib_crates(metadata: &serde_json::Value) -> Vec<String> {
+fn workspace_plugin_implementation_crates(metadata: &serde_json::Value) -> Vec<String> {
     let mut crates = metadata
         .get("packages")
         .and_then(serde_json::Value::as_array)
@@ -527,23 +564,11 @@ fn workspace_plugin_cdylib_crates(metadata: &serde_json::Value) -> Vec<String> {
         .filter_map(|package| {
             let name = package.get("name")?.as_str()?.to_string();
             let manifest_path = package.get("manifest_path")?.as_str()?.to_string();
-            if !manifest_path.contains("/plugins/") {
+            if !manifest_path.contains("/plugins/") || !name.ends_with("_plugin") {
                 return None;
             }
-            let has_cdylib = package
-                .get("targets")
-                .and_then(serde_json::Value::as_array)
-                .is_some_and(|targets| {
-                    targets.iter().any(|target| {
-                        target
-                            .get("crate_types")
-                            .and_then(serde_json::Value::as_array)
-                            .is_some_and(|types| {
-                                types.iter().any(|crate_type| crate_type == "cdylib")
-                            })
-                    })
-                });
-            has_cdylib.then_some(name)
+            // Implementations are rlibs; generated wrappers own dynamic exports.
+            Some(name)
         })
         .collect::<Vec<_>>();
     crates.sort();
@@ -649,9 +674,24 @@ pub fn parse_rebuild_options(arguments: &[String]) -> Result<RebuildOptions, Str
 mod tests {
     use super::{
         build_rebuild_target_selection, build_selector_index, parse_rebuild_options,
-        resolve_selector,
+        resolve_selector, workspace_plugin_implementation_crates,
     };
     use crate::{BaseSelector, BuildProfile, BundledPlugin, RebuildMode, RebuildOptions};
+
+    #[test]
+    fn discovery_includes_export_free_rlib_implementations_not_api_crates() {
+        let metadata = serde_json::json!({"packages": [
+            {"name": "bmux_example_plugin", "manifest_path": "/repo/plugins/example-plugin/Cargo.toml",
+             "targets": [{"crate_types": ["rlib"]}]},
+            {"name": "bmux_example_plugin_api", "manifest_path": "/repo/plugins/example-plugin-api/Cargo.toml",
+             "targets": [{"crate_types": ["rlib"]}]},
+            {"name": "bmux_not_a_plugin", "manifest_path": "/repo/packages/not-a-plugin/Cargo.toml"}
+        ]});
+        assert_eq!(
+            workspace_plugin_implementation_crates(&metadata),
+            vec!["bmux_example_plugin"]
+        );
+    }
 
     #[test]
     fn parse_rebuild_options_supports_base_and_against_master() {

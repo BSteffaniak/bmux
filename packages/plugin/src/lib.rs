@@ -26,6 +26,7 @@ mod declaration;
 mod discovery;
 mod event_bus;
 pub mod filesystem;
+mod host_builtins;
 mod host_runtime;
 pub mod layout;
 mod loader;
@@ -65,15 +66,22 @@ pub use declaration::{
     PluginId, PluginLifecycle, PluginOwnedPath,
 };
 pub use discovery::{
-    DEFAULT_PLUGIN_MANIFEST_FILE, PluginDiscoveryReport, discover_plugin_manifests,
-    discover_plugin_manifests_in_roots, discover_registered_plugins,
+    DEFAULT_PLUGIN_MANIFEST_FILE, PluginDiscoveryReport, discover_plugin_candidates_in_roots,
+    discover_plugin_manifests, discover_plugin_manifests_in_roots, discover_registered_plugins,
     discover_registered_plugins_in_roots,
 };
 pub use event_bus::{
     DEFAULT_EVENT_BUS_CAPACITY, DeliveryMode, EventBus, EventBusBytesError, EventBusChannelOptions,
     EventBusError, EventBusResult, JsonPluginEvent, JsonProjectionPolicy, global_event_bus,
 };
-pub use host_runtime::{HostRuntimeApi, ServiceCaller};
+pub use host_builtins::InvocationHostBuiltins;
+pub use host_runtime::{
+    HostRuntimeApi, InvocationKernelDispatch, InvocationKernelPort, ServiceCaller,
+};
+pub use loader::scoped::{
+    CallbackBinding, CallbackEntryLease, DefinitionArtifact, LifecycleCallbackDispatch,
+    LifecycleCallbackFactory, LoadedExecution, LoaderCallbackHost, VerifiedArtifact,
+};
 pub use loader::{
     DynamicProviderBridgeBinder, LoadedPlugin, NativePluginLoader, NativeServiceBufferConfig,
     ProviderBridgeLease, executable_sha256, install_dynamic_provider_bridge_binder,
@@ -87,10 +95,15 @@ pub use manifest::{
     PluginManifestKeybindings, PluginRuntime,
 };
 pub use plugin_state::global_registry as global_plugin_state_registry;
-pub use plugin_state::{PluginStateRegistry, shutdown_progress};
+pub use plugin_state::{
+    ActivationRegistrationPort, ActivationRegistrationRegistry, AdmittedRegistration,
+    PluginStateRegistry, RegistrationError, RegistrationSnapshot, RegistrationSubscription,
+    RegistrationUpdate, RegistrationUpdateBatch, shutdown_progress,
+};
 pub use registry::{
-    CapabilityProvider, PluginCompatibilityReport, PluginRegistry, RegisteredPlugin,
-    ServiceProvider,
+    CapabilityProvider, PluginCandidate, PluginCandidateInventory, PluginCandidatePreference,
+    PluginCandidateSource, PluginCompatibilityReport, PluginRegistry, PluginSelectionRequest,
+    RegisteredPlugin, SelectedPluginCandidate, ServiceProvider,
 };
 pub use render::{
     AttachInputCodec, AttachInputEndpoint, AttachInputEvent, AttachInputHook,

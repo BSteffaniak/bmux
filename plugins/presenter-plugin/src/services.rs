@@ -12,7 +12,7 @@ use bmux_presenter_runtime::{
 use std::{
     collections::BTreeMap,
     path::PathBuf,
-    sync::{Mutex, OnceLock},
+    sync::{Arc, Mutex, OnceLock, Weak},
     time::{Duration, Instant},
 };
 
@@ -23,10 +23,30 @@ struct Managed {
     participants: BTreeMap<String, Option<uuid::Uuid>>,
     _playbook_approval: Option<crate::playbook::Approval>,
 }
-static HOSTS: OnceLock<Mutex<BTreeMap<String, Managed>>> = OnceLock::new();
-fn hosts() -> &'static Mutex<BTreeMap<String, Managed>> {
-    HOSTS.get_or_init(Mutex::default)
+type HostMap = Mutex<BTreeMap<String, Managed>>;
+
+/// Backend-instance authority, independent of other loaded instances.
+#[derive(Default)]
+pub(crate) struct ManagedHosts {
+    hosts: Arc<HostMap>,
 }
+impl ManagedHosts {
+    pub(crate) fn admit_retirement(&self) -> Result<(), bmux_plugin_sdk::PluginCommandError> {
+        let hosts = self.hosts.lock().map_err(|_| {
+            bmux_plugin_sdk::PluginCommandError::unavailable(
+                "managed host registry requires recovery",
+            )
+        })?;
+        if hosts.is_empty() {
+            Ok(())
+        } else {
+            Err(bmux_plugin_sdk::PluginCommandError::unavailable(
+                "managed presentations remain active; explicitly stop them before retiring the backend",
+            ))
+        }
+    }
+}
+
 fn demo_runtime() -> anyhow::Result<&'static tokio::runtime::Runtime> {
     static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
     if let Some(runtime) = RUNTIME.get() {
@@ -41,11 +61,14 @@ fn demo_runtime() -> anyhow::Result<&'static tokio::runtime::Runtime> {
         .get()
         .ok_or_else(|| anyhow::anyhow!("demo executor unavailable"))
 }
-fn advance_managed(id: String) {
+fn advance_managed(hosts: Weak<HostMap>, id: String) {
     std::thread::spawn(move || {
         loop {
             std::thread::sleep(Duration::from_millis(50));
-            let Ok(mut all) = hosts().lock() else {
+            let Some(hosts) = hosts.upgrade() else {
+                break;
+            };
+            let Ok(mut all) = hosts.lock() else {
                 break;
             };
             let Some(managed) = all.get_mut(&id) else {
@@ -142,7 +165,7 @@ pub(crate) fn reload(
     Ok(())
 }
 
-fn watch_source(id: String, source: PathBuf) {
+fn watch_source(hosts: Weak<HostMap>, id: String, source: PathBuf) {
     std::thread::spawn(move || {
         let fingerprint = |path: &std::path::Path| {
             std::fs::metadata(path)
@@ -152,6 +175,10 @@ fn watch_source(id: String, source: PathBuf) {
         let mut modified = fingerprint(&source);
         loop {
             std::thread::sleep(Duration::from_millis(300));
+            let Some(registry) = hosts.upgrade() else {
+                break;
+            };
+            let hosts = || registry.as_ref();
             if hosts().lock().map_or(true, |all| !all.contains_key(&id)) {
                 break;
             }
@@ -178,6 +205,7 @@ fn watch_source(id: String, source: PathBuf) {
 }
 
 fn access<T>(
+    registry: &HostMap,
     ctx: &NativeServiceContext,
     host_id: &str,
     participant: &str,
@@ -186,7 +214,7 @@ fn access<T>(
     if ctx.caller_client_id.is_none() {
         return Err(view::Error::Authentication);
     }
-    let mut hosts = hosts().lock().map_err(|_| view::Error::Invalid)?;
+    let mut hosts = registry.lock().map_err(|_| view::Error::Invalid)?;
     let managed = hosts.get_mut(host_id).ok_or(view::Error::NotFound)?;
     if managed.participants.get(participant) != Some(&ctx.caller_client_id) {
         return Err(view::Error::Authentication);
@@ -194,7 +222,9 @@ fn access<T>(
     operation(&mut managed.host).map_err(error)
 }
 
-pub(crate) fn invoke(context: NativeServiceContext) -> ServiceResponse {
+pub(crate) fn invoke(registry: &ManagedHosts, context: NativeServiceContext) -> ServiceResponse {
+    let hosts = || registry.hosts.as_ref();
+    let watch_source = |id, source| watch_source(Arc::downgrade(&registry.hosts), id, source);
     bmux_plugin_sdk::route_service!(context, {
         "presenter-host-v2", "start" => |r: trusted_manage::client::StartRequest, ctx| {
             let result = (|| -> anyhow::Result<manage::HostInfo> {
@@ -226,7 +256,7 @@ pub(crate) fn invoke(context: NativeServiceContext) -> ServiceResponse {
                 anyhow::ensure!(all.len() < 16, "managed host limit exceeded");
                 all.insert(id.clone(), Managed { host, source: source.clone(), run_id, participants: BTreeMap::new(), _playbook_approval: approval });
                 drop(all);
-                advance_managed(id.clone());
+                advance_managed(Arc::downgrade(&registry.hosts), id.clone());
                 if r.live_reload { watch_source(id, source); }
                 Ok(info)
             })().map_err(|error| error.to_string());
@@ -300,11 +330,11 @@ pub(crate) fn invoke(context: NativeServiceContext) -> ServiceResponse {
         },
         "presenter-view-v2", "poll" => |r: view::client::PollRequest, ctx| {
             let previous = r.cursor.map(runtime_cursor);
-            let result = access(ctx, &r.host_id, &r.participant_id, |host| host.poll(&r.participant_id, previous.as_ref())).and_then(project_poll);
+            let result = access(&registry.hosts, ctx, &r.host_id, &r.participant_id, |host| host.poll(&r.participant_id, previous.as_ref())).and_then(project_poll);
             Ok::<_, ServiceResponse>(result)
         },
         "presenter-view-v2", "snapshot" => |r: view::client::SnapshotRequest, ctx| {
-            let result = access(ctx, &r.host_id, &r.participant_id, |host| host.snapshot(&r.participant_id))
+            let result = access(&registry.hosts, ctx, &r.host_id, &r.participant_id, |host| host.snapshot(&r.participant_id))
                 .and_then(|snapshot| match project_poll(Poll::Snapshot { resync: true, snapshot: Box::new(snapshot) })? {
                     view::Poll::Snapshot { snapshot, .. } => Ok(snapshot), _ => Err(view::Error::Invalid),
                 });
@@ -312,12 +342,12 @@ pub(crate) fn invoke(context: NativeServiceContext) -> ServiceResponse {
         },
         "presenter-view-v2", "submit" => |r: view::client::SubmitRequest, ctx| {
             let submission = Submission { expected: runtime_cursor(r.expected), action: action(r.action), action_id: r.action_id };
-            let result = access(ctx, &r.host_id, &r.participant_id, |host| host.submit(&r.participant_id, submission))
+            let result = access(&registry.hosts, ctx, &r.host_id, &r.participant_id, |host| host.submit(&r.participant_id, submission))
                 .map(|ack| view::Acknowledgment { action_id: ack.action_id, cursor: wire_cursor(ack.cursor), outcome: ack.outcome });
             Ok::<_, ServiceResponse>(result)
         },
         "presenter-view-v2", "asset" => |r: view::client::AssetRequest, ctx| {
-            let result = access(ctx, &r.host_id, &r.participant_id, |host| {
+            let result = access(&registry.hosts, ctx, &r.host_id, &r.participant_id, |host| {
                 host.asset(&r.participant_id, &r.id, usize::try_from(r.offset).map_err(|_| HostError::Limit)?, usize::try_from(r.length).map_err(|_| HostError::Limit)?)
             }).and_then(|response| match response {
                 Response::Asset { id, offset, total, bytes } => Ok(view::AssetChunk { id, offset: offset as u64, total: total as u64, data: bytes }),
@@ -326,7 +356,7 @@ pub(crate) fn invoke(context: NativeServiceContext) -> ServiceResponse {
             Ok::<_, ServiceResponse>(result)
         },
         "presenter-view-v2", "leave" => |r: view::client::LeaveRequest, ctx| {
-            let _ = access(ctx, &r.host_id, &r.participant_id, |host| { host.disconnect(&r.participant_id); Ok(()) });
+            let _ = access(&registry.hosts, ctx, &r.host_id, &r.participant_id, |host| { host.disconnect(&r.participant_id); Ok(()) });
             if let Ok(mut all) = hosts().lock() && let Some(h) = all.get_mut(&r.host_id) && h.participants.get(&r.participant_id) == Some(&ctx.caller_client_id) { h.participants.remove(&r.participant_id); }
             Ok::<_, ServiceResponse>(())
         }
@@ -416,6 +446,18 @@ fn action(value: view::Action) -> Action {
             input,
         }),
         view::Action::Effect { name, input } => Action::Effect { name, input },
+    }
+}
+
+#[cfg(test)]
+mod definition_tests {
+    #[test]
+    fn managed_authority_is_not_shared_between_loaded_instances() {
+        let first = super::ManagedHosts::default();
+        let second = super::ManagedHosts::default();
+        assert!(!std::sync::Arc::ptr_eq(&first.hosts, &second.hosts));
+        assert!(first.admit_retirement().is_ok());
+        assert!(second.admit_retirement().is_ok());
     }
 }
 

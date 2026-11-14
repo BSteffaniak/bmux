@@ -213,7 +213,8 @@ pub enum PluginError {
     ProcessPluginTimeout {
         plugin_id: String,
         command: String,
-        timeout_ms: u128,
+        // Indirection also avoids imposing u128 alignment on every PluginError.
+        timeout_ms: Box<u128>,
         details: String,
     },
 
@@ -312,13 +313,21 @@ pub enum PluginError {
         "service call '{operation}' to '{provider_plugin_id}' failed for capability '{capability}' and interface '{interface_id}': [{code}] {message}"
     )]
     ServiceInvocationFailed {
-        provider_plugin_id: String,
+        provider_plugin_id: Box<str>,
         capability: String,
         interface_id: String,
-        operation: String,
-        code: String,
-        message: String,
+        operation: Box<str>,
+        // Keep infrequent diagnostic allocations off the Result fast path.
+        code: Box<str>,
+        message: Box<str>,
     },
+
+    /// Typed rejection before dispatch effects began. This does not describe
+    /// cancellation after admission, rollback, or an unknown execution outcome.
+    /// Native v3 maps this explicit classification to `abi::CANCELLED`; native
+    /// v2 must retain its failed/unknown contract rather than reinterpret it.
+    #[error("invocation cancelled before dispatch")]
+    InvocationCancelled,
 
     #[error("unsupported host operation: {operation}")]
     UnsupportedHostOperation { operation: &'static str },
@@ -341,8 +350,62 @@ pub enum PluginError {
     },
 
     #[error("failed to parse plugin manifest: {0}")]
-    ManifestParse(#[from] toml::de::Error),
+    ManifestParse(#[source] Box<toml::de::Error>),
 
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+}
+
+// Preserve `?` conversion while keeping the TOML parser's large diagnostic off
+// every successful service Result's stack footprint.
+impl From<toml::de::Error> for PluginError {
+    fn from(error: toml::de::Error) -> Self {
+        Self::ManifestParse(Box::new(error))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plugin_error_stays_small_for_generated_result_apis() {
+        assert!(std::mem::size_of::<PluginError>() < 128);
+    }
+
+    #[test]
+    fn boxed_service_diagnostics_keep_display_and_fields() {
+        let error = PluginError::ServiceInvocationFailed {
+            provider_plugin_id: "provider".into(),
+            capability: "example.read".to_string(),
+            interface_id: "state/v1".to_string(),
+            operation: "get".into(),
+            code: "denied".into(),
+            message: "not authorized".into(),
+        };
+        assert_eq!(
+            error.to_string(),
+            "service call 'get' to 'provider' failed for capability 'example.read' and interface 'state/v1': [denied] not authorized"
+        );
+        let PluginError::ServiceInvocationFailed { code, message, .. } = error else {
+            panic!("expected service failure");
+        };
+        assert_eq!(&*code, "denied");
+        assert_eq!(&*message, "not authorized");
+    }
+
+    #[test]
+    fn boxed_manifest_error_preserves_conversion_display_and_source() {
+        let original = toml::from_str::<toml::Value>("broken = [").unwrap_err();
+        let display = original.to_string();
+        let error = PluginError::from(original);
+        assert_eq!(
+            error.to_string(),
+            format!("failed to parse plugin manifest: {display}")
+        );
+        assert_eq!(
+            std::error::Error::source(&error).unwrap().to_string(),
+            display
+        );
+    }
 }

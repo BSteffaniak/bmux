@@ -1,7 +1,6 @@
 #![cfg_attr(feature = "fail-on-warnings", deny(warnings))]
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
-#![cfg_attr(feature = "static-bundled", allow(dead_code))]
 
 use bmux_plugin::layout::{
     LayoutEdge, LayoutExtent, PluginLayoutId, PluginLayoutRequest, PluginLayoutSnapshot,
@@ -177,6 +176,7 @@ struct CompanionState {
     // None selects the legacy process-local presentation until runtime ownership
     // is threaded through installation; explicit owners never publish globally.
     surfaces: Option<std::sync::Arc<bmux_plugin::surface::PluginSurfaceRegistry>>,
+    facts: Option<std::sync::Arc<bmux_presentation_state::PresentationFactRegistry>>,
     subscription: Option<tokio::task::JoinHandle<()>>,
     allocation: Option<ExtensionRect>,
     allocation_publication_pending: bool,
@@ -204,6 +204,7 @@ impl CompanionState {
     const fn new(settings: Settings) -> Self {
         Self {
             surfaces: None,
+            facts: None,
             subscription: None,
             allocation: None,
             allocation_publication_pending: false,
@@ -343,7 +344,7 @@ impl CompanionState {
 
     fn measured_tab(&self, index: usize) -> std::cell::Ref<'_, MeasuredSidebarItem> {
         let tab = &self.snapshot.tabs[index];
-        let fact = tab_fact(tab);
+        let fact = tab_fact(tab, self.facts.as_deref());
         let render = |template: &str| {
             render_template(
                 template,
@@ -492,6 +493,21 @@ fn input_endpoint() -> bmux_plugin::AttachInputEndpoint {
     }
 }
 
+/// Declare a frontend factory whose registrations and task belong to one runtime.
+#[must_use]
+pub fn frontend_companion(
+    settings: Option<toml::Value>,
+    facts: std::sync::Arc<bmux_presentation_state::PresentationFactRegistry>,
+) -> bmux_plugin::AttachCompanion {
+    bmux_plugin::AttachCompanion::from_factory(
+        OWNER,
+        std::sync::Arc::new(move |resources| {
+            SidebarPresentation::install_scoped(settings.as_ref(), resources, facts.clone())
+                .map(|presentation| Box::new(presentation) as Box<dyn Send + Sync>)
+        }),
+    )
+}
+
 /// An independently owned sidebar presentation. Hosts retain this value until
 /// teardown and route geometry/input through the supplied registries.
 pub struct SidebarPresentation {
@@ -502,6 +518,89 @@ pub struct SidebarPresentation {
 }
 
 impl SidebarPresentation {
+    /// Install and start an instance-owned frontend without global registries.
+    ///
+    /// Facts must be the registry used by this runtime's backend producer service.
+    /// Layout, input and surfaces retain the existing compositor contract.
+    ///
+    /// # Errors
+    /// Returns configuration, subscription, publication or runtime errors.
+    pub fn install_scoped(
+        settings: Option<&toml::Value>,
+        resources: &bmux_plugin::AttachPresentationResources,
+        facts: std::sync::Arc<bmux_presentation_state::PresentationFactRegistry>,
+    ) -> Result<Self, String> {
+        let handle = tokio::runtime::Handle::try_current()
+            .map_err(|error| format!("sidebar companion requires an async runtime: {error}"))?;
+        let (initial, mut tabs_rx) = resources
+            .events
+            .subscribe_state::<tabs_list::TabListSnapshot>(&tabs_list::STATE_KIND)
+            .map_err(|error| format!("subscribing to tabs list: {error}"))?;
+        let mut facts_rx = facts.subscribe_changes();
+        let presentation = Self::install(
+            settings,
+            resources.layouts.clone(),
+            resources.allocations.clone(),
+            resources.input.clone(),
+            resources.surfaces.clone(),
+        )?;
+        {
+            let mut guard = presentation
+                .owner
+                .lock()
+                .map_err(|_| "sidebar state lock poisoned".to_string())?;
+            let companion = guard
+                .as_mut()
+                .ok_or_else(|| "sidebar companion is closed".to_string())?;
+            companion.facts = Some(facts);
+            companion.replace_tabs(initial.as_ref().clone());
+            publish_companion(companion)?;
+            let owner = std::sync::Arc::downgrade(&presentation.owner);
+            companion.subscription = Some(handle.spawn(async move {
+                loop {
+                    let tabs = tokio::select! {
+                        result = tabs_rx.changed() => {
+                            if result.is_err() { break; }
+                            Some(tabs_rx.borrow_and_update().as_ref().clone())
+                        }
+                        result = facts_rx.changed() => {
+                            if result.is_err() { break; }
+                            facts_rx.borrow_and_update();
+                            None
+                        }
+                    };
+                    let Some(owner) = owner.upgrade() else {
+                        break;
+                    };
+                    let Ok(mut guard) = owner.lock() else {
+                        break;
+                    };
+                    let Some(companion) = guard.as_mut() else {
+                        break;
+                    };
+                    if let Some(tabs) = tabs {
+                        companion.replace_tabs(tabs);
+                    } else {
+                        // Fact text affects wrapping, row geometry and hit regions.
+                        companion.measured_items.get_mut().clear();
+                        companion.revision = companion.revision.saturating_add(1).max(1);
+                        if let Some(active) =
+                            companion.snapshot.tabs.iter().position(|tab| tab.active)
+                        {
+                            companion.reveal(active);
+                        }
+                    }
+                    companion.presentation_pending.set(true);
+                    if let Err(error) = publish_companion(companion) {
+                        tracing::warn!(%error, "sidebar publication failed");
+                    }
+                }
+            }));
+            drop(guard);
+        }
+        Ok(presentation)
+    }
+
     /// Install into presentation-local registries.
     ///
     /// # Errors
@@ -814,10 +913,13 @@ fn truncate_to_width(value: &str, maximum: usize) -> String {
     result
 }
 
-fn tab_fact(tab: &tabs_list::TabListEntry) -> Option<PresentationFact> {
+fn tab_fact(
+    tab: &tabs_list::TabListEntry,
+    facts: Option<&bmux_presentation_state::PresentationFactRegistry>,
+) -> Option<PresentationFact> {
     let entity = PresentationEntityRef::new("bmux.tabs", tab.id.to_string());
-    global_presentation_fact_host_service()
-        .registry()
+    facts
+        .unwrap_or_else(|| global_presentation_fact_host_service().registry())
         .facts_for_entity(&entity)
         .into_iter()
         .map(|(_, fact)| fact)
@@ -1108,7 +1210,7 @@ fn build_surface(state: &CompanionState, revision: u64) -> PluginSurface {
         else {
             continue;
         };
-        let fact = tab_fact(tab);
+        let fact = tab_fact(tab, state.facts.as_deref());
         let start_row = u16::try_from(projected.start + 1).unwrap_or(u16::MAX);
         let measured = state.measured_tab(index);
         let item_style = fact.as_ref().map_or_else(
@@ -1353,10 +1455,114 @@ fn handle_input(context: &NativeServiceContext, event: &AttachInputEvent) -> Att
     }
 }
 
-bmux_plugin_sdk::export_plugin!(SidebarPlugin, include_str!("../plugin.toml"));
+bmux_plugin_sdk::define_plugin!(
+    factory = |scope: bmux_plugin_sdk::definition::PluginCreateContext| Ok(std::sync::Arc::new(
+        bmux_plugin_sdk::definition::RustPluginAdapter::for_instance(SidebarPlugin, scope.instance)
+    )
+        as std::sync::Arc<dyn bmux_plugin_sdk::definition::PluginInstance>),
+    metadata = {
+        let manifest_toml = include_str!("../plugin.toml");
+        let manifest = bmux_plugin::PluginManifest::from_toml_str(manifest_toml)
+            .expect("embedded plugin declaration must be valid");
+        bmux_plugin_sdk::definition::PluginMetadata {
+            plugin_id: manifest.id,
+            version: manifest.version,
+            roles: manifest.component_roles,
+            required_capabilities: manifest
+                .required_capabilities
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            contracts: manifest.contracts,
+            manifest_toml: Some(manifest_toml.into()),
+        }
+    },
+);
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn scoped_frontends_keep_fact_geometry_and_lifetime_independent() {
+        use bmux_presentation_state::{PresentationFactRegistry, PresentationFactSnapshot};
+        use std::sync::Arc;
+
+        let first_resources = bmux_plugin::AttachPresentationResources::isolated(32);
+        let second_resources = bmux_plugin::AttachPresentationResources::isolated(32);
+        let tab_id = Uuid::from_u128(0x100);
+        let tabs = tabs_list::TabListSnapshot {
+            tabs: vec![tabs_list::TabListEntry {
+                id: tab_id,
+                name: "one".into(),
+                active: true,
+                workspace: "default".into(),
+                workspace_id: Uuid::nil(),
+            }],
+            revision: 1,
+        };
+        for resources in [&first_resources, &second_resources] {
+            let _sender = resources
+                .events
+                .register_state_channel::<tabs_list::TabListSnapshot>(
+                    tabs_list::STATE_KIND,
+                    tabs.clone(),
+                );
+        }
+        let first_facts = Arc::new(PresentationFactRegistry::new());
+        let second_facts = Arc::new(PresentationFactRegistry::new());
+        let first =
+            SidebarPresentation::install_scoped(None, &first_resources, first_facts.clone())
+                .unwrap();
+        let second =
+            SidebarPresentation::install_scoped(None, &second_resources, second_facts).unwrap();
+        let saved_second = second_resources.surfaces.owner_snapshot(OWNER).unwrap();
+        let before = first_resources
+            .surfaces
+            .owner_snapshot(OWNER)
+            .unwrap()
+            .revision;
+        first_facts
+            .publish(
+                "scoped-test",
+                PresentationFactSnapshot {
+                    revision: 1,
+                    facts: vec![PresentationFact {
+                        entity: PresentationEntityRef::new("bmux.tabs", tab_id.to_string()),
+                        key: "activity".into(),
+                        role: PresentationFactRole::Warning,
+                        short_text: "waiting for a very long scoped operation".into(),
+                        detail_text: None,
+                        icon_id: None,
+                        priority: 1,
+                    }],
+                },
+            )
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while first_resources
+                .surfaces
+                .owner_snapshot(OWNER)
+                .unwrap()
+                .revision
+                == before
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            second_resources.surfaces.owner_snapshot(OWNER).unwrap(),
+            saved_second
+        );
+        drop(first);
+        assert!(first_resources.surfaces.owner_snapshot(OWNER).is_none());
+        assert_eq!(
+            second_resources.surfaces.owner_snapshot(OWNER).unwrap(),
+            saved_second
+        );
+        drop(second);
+    }
+
     #[test]
     fn field_paints_visible_rows_beyond_terminal_coordinate_limit() {
         use bmux_tui::component::{ChildLayout, Component, Constraints, LayoutCx};
@@ -2184,5 +2390,70 @@ mod tests {
         let surface = build_surface(&state, 1);
         assert_eq!(surface.interactive_regions[0].local_id, format!("tab:{id}"));
         assert!(surface.accepts_input);
+    }
+}
+
+#[cfg(test)]
+mod embedded_declaration_identity_tests {
+    #[test]
+    fn definition_and_selected_manifest_have_one_identity() {
+        let definition = super::plugin_definition();
+        definition.validate().expect("definition validates");
+        let embedded = definition
+            .metadata
+            .manifest_toml
+            .as_deref()
+            .expect("embedded declaration");
+        let manifest =
+            bmux_plugin::PluginManifest::from_toml_str(embedded).expect("valid manifest");
+        assert_eq!(definition.metadata.plugin_id, manifest.id);
+        assert_eq!(definition.metadata.version, manifest.version);
+        assert_eq!(definition.metadata.roles, manifest.component_roles);
+        assert_eq!(definition.metadata.contracts, manifest.contracts);
+        assert_eq!(
+            definition.metadata.required_capabilities,
+            manifest
+                .required_capabilities
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        );
+
+        // Deterministic verifier fixtures, not claims about built executable bytes.
+        // Real selected artifact hashing remains the loader's responsibility.
+        let expected_digest = "a".repeat(64);
+        let wrong_digest = "b".repeat(64);
+        let pinned = format!("artifact_sha256 = \"{expected_digest}\"\n{embedded}");
+        let mut inventory = bmux_plugin::PluginCandidateInventory::new();
+        inventory
+            .add_bundled_manifest(&pinned, Vec::new())
+            .expect("inventory declaration");
+        for role in &manifest.component_roles {
+            let selected = inventory
+                .select(&bmux_plugin::PluginSelectionRequest {
+                    plugin_id: manifest.id.clone(),
+                    role: *role,
+                    preference: bmux_plugin::PluginCandidatePreference::Bundled,
+                    plugin_api: bmux_plugin_sdk::ApiVersion::new(1, 1),
+                    native_abi: bmux_plugin_sdk::ApiVersion::new(1, 1),
+                    contracts: manifest.contracts.clone(),
+                })
+                .expect("select declared role and contracts");
+            selected
+                .validate_embedded_metadata(&definition.metadata, &expected_digest)
+                .expect("selected declaration and embedded identity match");
+            assert!(
+                selected
+                    .validate_embedded_metadata(&definition.metadata, &wrong_digest)
+                    .is_err()
+            );
+            let mut conflicting = definition.metadata.clone();
+            conflicting.version.push_str("-conflict");
+            assert!(
+                selected
+                    .validate_embedded_metadata(&conflicting, &expected_digest)
+                    .is_err()
+            );
+        }
     }
 }

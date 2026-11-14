@@ -3,6 +3,8 @@ mod committed_source;
 pub mod cursor;
 mod display_capture;
 pub mod events;
+pub mod frontend_bindings;
+pub mod frontend_presentation;
 pub mod headless;
 pub mod input;
 pub mod layout;

@@ -1345,6 +1345,7 @@ mod selection_tests {
             ServiceKind, ServiceRequest,
         };
         let mut context = NativeServiceContext {
+            host_service_port: None,
             plugin_id: "bmux.pane_runtime".into(),
             request: ServiceRequest {
                 caller_plugin_id: String::new(),

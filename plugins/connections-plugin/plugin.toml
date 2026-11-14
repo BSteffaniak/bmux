@@ -1,3 +1,4 @@
+component_roles = ["backend", "frontend"]
 execution_class = "native_standard"
 id = "bmux.connections"
 name = "bmux Connections"

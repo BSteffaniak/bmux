@@ -2,9 +2,9 @@
 
 This crate is an in-repo example native bmux plugin.
 
-It demonstrates all currently supported native plugin surfaces:
+It demonstrates shared-definition native plugin surfaces:
 
-- descriptor export
+- inert export-free definition (descriptor exports live in generated wrappers)
 - activation and deactivation hooks
 - plugin commands
 - event subscriptions
@@ -18,25 +18,24 @@ cargo build -p bmux_example_native_plugin
 
 ## Install For Local Testing
 
-Use the helper script:
+Generate and build the thin packaging target from the repository root:
 
 ```bash
-./scripts/install-example-plugin.sh
+python3 scripts/package-plugin.py \
+  --implementation-manifest examples/native-plugin/Cargo.toml \
+  --sdk-manifest packages/plugin-sdk/Cargo.toml \
+  --output target/plugin-packaging/native/backend --component backend --build
 ```
 
-This builds the example plugin and writes a generated manifest into your local
-bmux plugins directory with the correct absolute dylib path for your machine.
-
-Useful variants:
-
-```bash
-./scripts/install-example-plugin.sh --release
-./scripts/install-example-plugin.sh --print-path
-./scripts/install-example-plugin.sh --force
-```
-
-The checked-in `examples/native-plugin/plugin.toml` remains as a reference
-manifest for the example source tree.
+Add `--install-root <directory> --declaration
+examples/native-plugin/plugin.toml`
+for immutable publication. See [hello-plugin](../hello-plugin/README.md) for
+artifact identity and loader integration constraints. The implementation build
+above produces only an rlib, not a loadable plugin. The former direct-dylib
+installation helper is not a supported path for this migrated example.
+The original declaration remains unchanged for domain metadata; shared ABI
+loading must be explicitly negotiated. Runtime examples below require that
+integration and have not been exercised in the initial source stage.
 
 ## Enable In Config
 

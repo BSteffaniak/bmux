@@ -1,17 +1,28 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Read the legacy keep-state opt-in before scrubbing ambient BMUX_* state.
 KEEP_SMOKE_STATE="${KEEP_SMOKE_STATE:-${BMUX_KEEP_SMOKE_TMP:-0}}"
-SMOKE_TIMEOUT_SECS="${SMOKE_TIMEOUT_SECS:-60}"
-SMOKE_MAX_RETRIES="${SMOKE_MAX_RETRIES:-2}"
-SMOKE_RETRY_DELAY_SECS="${SMOKE_RETRY_DELAY_SECS:-1}"
-declare -a SMOKE_SANDBOXES=()
 
 # Do not inherit a live runtime, attachment, target, or user configuration.
 while IFS= read -r key; do
   unset "$key"
 done < <(python3 -c 'import os; print("\n".join(k for k in os.environ if k.startswith("BMUX_")))')
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SMOKE_TIMEOUT_SECS="${SMOKE_TIMEOUT_SECS:-60}"
+SMOKE_MAX_RETRIES="${SMOKE_MAX_RETRIES:-2}"
+SMOKE_RETRY_DELAY_SECS="${SMOKE_RETRY_DELAY_SECS:-1}"
+declare -a SMOKE_SANDBOXES=()
+BMUX_SMOKE_BINARY=""
+
+if [[ $# -gt 0 ]]; then
+  if [[ $# -ne 2 || "$1" != "--binary" || "$2" != /* || ! -f "$2" || -L "$2" || ! -x "$2" ]]; then
+    echo "error: expected --binary <absolute executable regular file, not a symlink>" >&2
+    exit 1
+  fi
+  BMUX_SMOKE_BINARY="$2"
+fi
 
 sandbox_command() {
   local root="$1"
@@ -26,6 +37,9 @@ sandbox_command() {
 cleanup_sandboxes() {
   local sandbox
   for sandbox in "${SMOKE_SANDBOXES[@]}"; do
+    if [[ -z "$sandbox" ]]; then
+      continue
+    fi
     # Stop only the runtime created in this explicit sandbox, never ambient state.
     sandbox_command "$sandbox" python3 -c '
 import subprocess, sys
@@ -83,8 +97,29 @@ run_case() {
 
 cd "$ROOT_DIR"
 # Static plugins resolve declared auxiliary executables beside the host binary.
-cargo build -q --locked -p bmux_cli -p bmux_pane_runtime_plugin --bins
-BMUX_SMOKE_BINARY="${CARGO_TARGET_DIR:-$ROOT_DIR/target}/debug/bmux"
+# A CLI-only build can appear to work locally while failing on a clean runner.
+if [[ -z "$BMUX_SMOKE_BINARY" ]]; then
+  cargo build -q --locked -p bmux_cli -p bmux_pane_runtime_plugin --bins
+  BMUX_SMOKE_BINARY="${CARGO_TARGET_DIR:-$ROOT_DIR/target}/debug/bmux"
+fi
+if [[ ! -x "$(dirname "$BMUX_SMOKE_BINARY")/bmux-pane-execution-supervisor" ]]; then
+  echo "error: selected bmux requires its adjacent bmux-pane-execution-supervisor" >&2
+  exit 1
+fi
+# Record the actual selected pair, not whichever bmux happens to be on PATH.
+python3 - "$BMUX_SMOKE_BINARY" <<'PY'
+import hashlib
+import pathlib
+import sys
+binary = pathlib.Path(sys.argv[1])
+for path in (binary, binary.with_name('bmux-pane-execution-supervisor')):
+    digest = hashlib.sha256()
+    with path.open('rb') as artifact:
+        for chunk in iter(lambda: artifact.read(1024 * 1024), b''):
+            digest.update(chunk)
+    print(f"artifact: {path} sha256={digest.hexdigest()}")
+PY
+
 run_case /bin/sh
 run_case /bin/bash
 run_case /run/current-system/sw/bin/fish

@@ -233,6 +233,27 @@ mod contract_tests {
     }
 }
 
+bmux_plugin_sdk::define_plugin!(
+    factory = |scope: bmux_plugin_sdk::definition::PluginCreateContext| {
+        Ok(std::sync::Arc::new(
+            bmux_plugin_sdk::definition::RustPluginAdapter::for_instance(
+                PaneRuntimePlugin,
+                scope.instance,
+            ),
+        )
+            as std::sync::Arc<
+                dyn bmux_plugin_sdk::definition::PluginInstance,
+            >)
+    },
+    metadata =
+        bmux_plugin_sdk::definition::PluginDefinition::from_rust_plugin::<PaneRuntimePlugin>(
+            include_str!("../plugin.toml"),
+            vec![bmux_plugin_sdk::definition::ComponentRole::Backend],
+        )
+        .expect("embedded foundational declaration must be valid")
+        .metadata,
+);
+
 #[derive(Default)]
 pub struct PaneRuntimePlugin;
 
@@ -439,5 +460,78 @@ impl RustPlugin for PaneRuntimePlugin {
         _context: TypedServiceRegistrationContext<'_>,
         _registry: &mut TypedServiceRegistry,
     ) {
+    }
+}
+
+#[cfg(test)]
+mod definition_contract_tests {
+    #[test]
+    fn permissions_policy_is_declared_but_not_required_for_local_admission() {
+        let definition = super::plugin_definition();
+        let manifest =
+            bmux_plugin::PluginManifest::from_toml_str(include_str!("../plugin.toml")).unwrap();
+        assert!(
+            manifest
+                .optional_capabilities
+                .iter()
+                .any(|capability| capability.as_str() == "bmux.sessions.policy")
+        );
+        assert!(
+            !manifest
+                .required_capabilities
+                .iter()
+                .any(|capability| capability.as_str() == "bmux.sessions.policy")
+        );
+        assert!(
+            !definition
+                .metadata
+                .required_capabilities
+                .iter()
+                .any(|capability| capability == "bmux.sessions.policy")
+        );
+    }
+
+    #[test]
+    fn explicit_contract_versions_preserve_service_wire_routes() {
+        let definition = super::plugin_definition();
+        let manifest =
+            bmux_plugin::PluginManifest::from_toml_str(include_str!("../plugin.toml")).unwrap();
+        let canonical = bmux_plugin_sdk::definition::PluginDefinition::from_rust_plugin::<
+            super::PaneRuntimePlugin,
+        >(
+            include_str!("../plugin.toml"),
+            vec![bmux_plugin_sdk::definition::ComponentRole::Backend],
+        )
+        .unwrap();
+        definition.validate().unwrap();
+        assert_eq!(definition.metadata, canonical.metadata);
+        assert_eq!(definition.metadata.plugin_id, manifest.id);
+        assert_eq!(definition.metadata.version, manifest.version);
+        assert_eq!(definition.metadata.roles, manifest.component_roles);
+        let declared: std::collections::BTreeSet<_> = manifest
+            .contracts
+            .iter()
+            .map(|contract| (&contract.interface_id, contract.major, contract.minor))
+            .collect();
+        let embedded: std::collections::BTreeSet<_> = definition
+            .metadata
+            .contracts
+            .iter()
+            .map(|contract| (&contract.interface_id, contract.major, contract.minor))
+            .collect();
+        assert_eq!(embedded, declared);
+        let mut services = definition.declarations().unwrap().services;
+        services.extend(
+            <super::PaneRuntimePlugin as bmux_plugin_sdk::RustPlugin>::declared_services().unwrap(),
+        );
+        for service in services {
+            let contract = definition
+                .metadata
+                .contracts
+                .iter()
+                .find(|contract| contract.interface_id == service.interface_id)
+                .expect("every retained route requires explicit compatibility metadata");
+            assert_eq!((contract.major, contract.minor), (1, 0));
+        }
     }
 }

@@ -1223,6 +1223,7 @@ mod tests {
             HostMetadata,
         };
         NativeCommandContext {
+            host_service_port: None,
             plugin_id: "bmux.pane_runtime".to_string(),
             command: "pane-padding-show".to_string(),
             arguments: Vec::new(),

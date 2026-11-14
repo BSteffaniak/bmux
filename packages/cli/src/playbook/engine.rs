@@ -44,10 +44,17 @@ pub use bmux_playbook::engine::{
 use bmux_playbook::engine::{reconcile_real_attach_target, typed_new_session_playbook};
 
 #[derive(Debug)]
-pub struct CliHost;
+pub struct CliHost {
+    selected: Option<(BmuxConfig, ConfigPaths)>,
+}
 #[must_use]
 pub fn host() -> Arc<dyn HostAdapter> {
-    Arc::new(CliHost)
+    Arc::new(CliHost { selected: None })
+}
+pub(crate) fn selected_host(config: BmuxConfig, paths: ConfigPaths) -> Arc<dyn HostAdapter> {
+    Arc::new(CliHost {
+        selected: Some((config, paths)),
+    })
 }
 
 /// Execute with CLI terminal, signal and process-selection adapters.
@@ -58,8 +65,17 @@ pub async fn run_playbook(
     target_server: bool,
     options: RunOptions,
 ) -> Result<bmux_playbook::types::PlaybookResult> {
+    run_playbook_with_host(playbook, target_server, options, host()).await
+}
+
+pub(crate) async fn run_playbook_with_host(
+    playbook: bmux_playbook::types::Playbook,
+    target_server: bool,
+    options: RunOptions,
+    host: Arc<dyn HostAdapter>,
+) -> Result<bmux_playbook::types::PlaybookResult> {
     let managed = std::env::var_os("BMUX_PLAYBOOK_MANAGED_ROOT").is_some();
-    let run = bmux_playbook::run(playbook, target_server, options, host());
+    let run = bmux_playbook::run(playbook, target_server, options, host);
     if managed {
         return run.await;
     }
@@ -213,11 +229,16 @@ impl KeyProcessor for CliKeyProcessor {
 }
 
 impl HostAdapter for CliHost {
+    fn selected_runtime(&self) -> Option<(BmuxConfig, ConfigPaths)> {
+        self.selected.clone()
+    }
     fn executable(&self) -> Result<PathBuf> {
         std::env::current_exe().context("failed resolving bmux executable")
     }
     fn pane_transport(&self) -> Arc<dyn PaneTransport> {
-        Arc::new(Self)
+        Arc::new(Self {
+            selected: self.selected.clone(),
+        })
     }
     fn parse_key_chord(&self, chord: &str) -> Result<Vec<KeyStroke>> {
         crate::input::parse_key_chord(chord)
@@ -501,11 +522,23 @@ pub(super) struct RealAttachPlaybookRuntime {
     prefix: String,
     required_frame_after: std::sync::atomic::AtomicU64,
     observer: Option<crate::runtime::attach::observer::AttachObserver>,
+    task_exit: std::sync::Arc<std::sync::Mutex<Option<String>>>,
     task: tokio::task::JoinHandle<Result<crate::runtime::attach::runtime::AttachRunOutcome>>,
 }
 
 impl RealAttachPlaybookRuntime {
     fn ensure_input_resolved(&self) -> Result<()> {
+        if self.task.is_finished() {
+            let diagnostic = self
+                .task_exit
+                .lock()
+                .map_err(|_| anyhow::anyhow!("attachment exit diagnostics unavailable"))?
+                .clone()
+                .unwrap_or_else(|| {
+                    "attachment task ended before publishing its exit result".into()
+                });
+            anyhow::bail!("real attachment is no longer running: {diagnostic}");
+        }
         ensure!(
             self.input_resolved
                 .load(std::sync::atomic::Ordering::Acquire),
@@ -573,10 +606,7 @@ impl RealAttachPlaybookRuntime {
     async fn wait_until_ready(&self) -> Result<()> {
         tokio::time::timeout(Duration::from_secs(5), async {
             while self.terminal.attached_session_id().is_none() {
-                ensure!(
-                    !self.task.is_finished(),
-                    "real attachment exited before becoming ready"
-                );
+                self.ensure_input_resolved()?;
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
             Ok::<(), anyhow::Error>(())
@@ -611,6 +641,31 @@ impl RealAttachPlaybookRuntime {
             debug!(captured_bytes, "real-attach playbook runtime detached");
         }
     }
+}
+
+fn spawn_diagnosed_attach(
+    attach: impl std::future::Future<Output = Result<crate::runtime::attach::runtime::AttachRunOutcome>>
+    + Send
+    + 'static,
+    exit: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+) -> tokio::task::JoinHandle<Result<crate::runtime::attach::runtime::AttachRunOutcome>> {
+    tokio::spawn(async move {
+        let result = attach.await;
+        let diagnostic = match &result {
+            Ok(outcome) => format!("attachment exited: {outcome:?}"),
+            Err(error) => format!("attachment failed: {error:#}"),
+        };
+        if let Ok(mut status) = exit.lock() {
+            *status = Some(diagnostic);
+        }
+        match &result {
+            Ok(outcome) => tracing::info!(?outcome, "playbook real attachment exited"),
+            Err(error) => {
+                tracing::error!(error = %format!("{error:#}"), "playbook real attachment failed");
+            }
+        }
+        result
+    })
 }
 
 async fn start_cli_attach_runtime(
@@ -659,47 +714,53 @@ async fn start_cli_attach_runtime(
         pending: std::sync::Mutex::new(None),
     };
     let target = session_id.to_string();
-    let task = tokio::spawn(async move {
-        let attach =
-            crate::runtime::attach::runtime::run_session_attach_with_terminal_config_observer(
-                attach_client,
-                Some(target.as_str()),
-                None,
-                false,
-                kernel_client_factory,
-                &mut terminal,
-                attach_config,
-                managed.then_some(publisher),
-            );
-        let output = async move {
-            if let (Some(observer), Some((root, generation))) = (export.as_mut(), export_identity) {
-                loop {
-                    let snapshot = observer
-                        .changed()
-                        .await
-                        .context("managed attach output ended")?;
-                    let frame =
-                        crate::runtime::attach::observer::transport::project_frame(&snapshot)?;
-                    let packet = bmux_playbook::managed_display::DisplayPacket {
-                        generation,
-                        epoch: snapshot.epoch,
-                        session: snapshot.attached_id,
-                        frame: bmux_web_renderer::encode_binary(&frame)?,
-                    };
-                    let root = root.clone();
-                    tokio::task::spawn_blocking(move || packet.publish(&root)).await??;
+    let task_exit = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let task = spawn_diagnosed_attach(
+        async move {
+            let attach =
+                crate::runtime::attach::runtime::run_session_attach_with_terminal_config_observer(
+                    attach_client,
+                    Some(target.as_str()),
+                    None,
+                    false,
+                    kernel_client_factory,
+                    &mut terminal,
+                    attach_config,
+                    managed.then_some(publisher),
+                );
+            let output = async move {
+                if let (Some(observer), Some((root, generation))) =
+                    (export.as_mut(), export_identity)
+                {
+                    loop {
+                        let snapshot = observer
+                            .changed()
+                            .await
+                            .context("managed attach output ended")?;
+                        let frame =
+                            crate::runtime::attach::observer::transport::project_frame(&snapshot)?;
+                        let packet = bmux_playbook::managed_display::DisplayPacket {
+                            generation,
+                            epoch: snapshot.epoch,
+                            session: snapshot.attached_id,
+                            frame: bmux_web_renderer::encode_binary(&frame)?,
+                        };
+                        let root = root.clone();
+                        tokio::task::spawn_blocking(move || packet.publish(&root)).await??;
+                    }
+                }
+                std::future::pending::<Result<()>>().await
+            };
+            tokio::select! {
+                result = Box::pin(attach) => result,
+                result = output => {
+                    result?;
+                    anyhow::bail!("managed attach export ended")
                 }
             }
-            std::future::pending::<Result<()>>().await
-        };
-        tokio::select! {
-            result = Box::pin(attach) => result,
-            result = output => {
-                result?;
-                anyhow::bail!("managed attach export ended")
-            }
-        }
-    });
+        },
+        std::sync::Arc::clone(&task_exit),
+    );
     tokio::time::sleep(Duration::from_millis(50)).await;
     Ok(RealAttachPlaybookRuntime {
         terminal: handle,
@@ -708,6 +769,7 @@ async fn start_cli_attach_runtime(
         prefix,
         required_frame_after: std::sync::atomic::AtomicU64::new(0),
         observer: retained_observer,
+        task_exit,
         task,
     })
 }
@@ -883,6 +945,26 @@ mod tests {
     use super::super::screen::ScreenInspector;
     use super::*;
     use bmux_playbook::subst::RuntimeVars;
+
+    #[test]
+    fn selected_host_retains_configuration_and_all_roots() {
+        let paths = ConfigPaths::new(
+            "/test-selected/config".into(),
+            "/test-selected/runtime".into(),
+            "/test-selected/data".into(),
+            "/test-selected/state".into(),
+        );
+        let mut config = BmuxConfig::default();
+        config.general.server_timeout = 4321;
+        let host = selected_host(config, paths.clone());
+        let (config, actual) = host.selected_runtime().unwrap();
+        assert_eq!(config.general.server_timeout, 4321);
+        assert_eq!(actual.config_dir, paths.config_dir);
+        assert_eq!(actual.runtime_dir, paths.runtime_dir);
+        assert_eq!(actual.data_dir, paths.data_dir);
+        assert_eq!(actual.state_dir, paths.state_dir);
+        assert!(super::host().selected_runtime().is_none());
+    }
     use std::collections::BTreeMap;
     async fn start_real_attach_playbook_runtime(
         sandbox: Option<&SandboxServer>,
@@ -955,6 +1037,7 @@ mod tests {
                 prefix: "ctrl+b".into(),
                 required_frame_after: std::sync::atomic::AtomicU64::new(0),
                 observer: None,
+                task_exit: std::sync::Arc::new(std::sync::Mutex::new(None)),
                 task: tokio::spawn(std::future::pending()),
             },
         )
@@ -1120,6 +1203,7 @@ mod tests {
             binary: Some(&binary),
             sandbox_config_file: None,
             bundled_plugin_ids: &[],
+            recording_requested: false,
         })
         .await
         .unwrap();
@@ -1170,6 +1254,7 @@ mod tests {
             binary: Some(&binary),
             sandbox_config_file: None,
             bundled_plugin_ids: &[],
+            recording_requested: false,
         })
         .await
         .unwrap();
@@ -1239,6 +1324,7 @@ mod tests {
             binary: Some(&binary),
             sandbox_config_file: None,
             bundled_plugin_ids: &[],
+            recording_requested: false,
         })
         .await
         .unwrap();
@@ -1332,6 +1418,7 @@ mod tests {
             binary: Some(&binary),
             sandbox_config_file: None,
             bundled_plugin_ids: &[],
+            recording_requested: false,
         })
         .await
         .unwrap();
@@ -1569,7 +1656,17 @@ mod tests {
         loop {
             ensure!(
                 !first.task.is_finished() && !second.task.is_finished(),
-                "attachment exited before rendering {marker}"
+                "attachment exited before rendering {marker}: first={:?}, second={:?}",
+                first
+                    .task_exit
+                    .lock()
+                    .ok()
+                    .and_then(|status| status.clone()),
+                second
+                    .task_exit
+                    .lock()
+                    .ok()
+                    .and_then(|status| status.clone()),
             );
             let a = first.terminal.output_screen_text(size.0, size.1);
             let b = second.terminal.output_screen_text(120, 30);
@@ -1588,7 +1685,7 @@ mod tests {
     fn attach_input_uses_default_modal_window_bindings() {
         let mut config = BmuxConfig::default();
         "normal".clone_into(&mut config.keybindings.initial_mode);
-        let mut processor = CliHost.key_processor(&config);
+        let mut processor = host().key_processor(&config);
         let stroke = crate::input::parse_key_chord("c").unwrap()[0];
         assert_eq!(
             processor.process_stroke(stroke),
@@ -1604,7 +1701,7 @@ mod tests {
     fn attach_input_maps_ctrl_s_to_next_window_plugin_command() {
         let mut config = BmuxConfig::default();
         "normal".clone_into(&mut config.keybindings.initial_mode);
-        let mut processor = CliHost.key_processor(&config);
+        let mut processor = host().key_processor(&config);
         let stroke = crate::input::parse_key_chord("ctrl+s").unwrap()[0];
         assert_eq!(
             processor.process_stroke(stroke),

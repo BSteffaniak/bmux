@@ -20,6 +20,9 @@ bmux_plugin_sdk = { workspace = true }
 tokio           = { workspace = true }
 tracing         = { workspace = true }
 
+[dev-dependencies]
+bmux_plugin_runtime = { workspace = true }
+
 [features]
 fail-on-warnings = [
     "bmux_keybind/fail-on-warnings",

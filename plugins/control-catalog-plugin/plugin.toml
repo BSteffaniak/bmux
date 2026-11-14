@@ -1,3 +1,5 @@
+component_roles       = ["backend"]
+contracts             = [{ interface_id = "control-catalog-state", major = 1, minor = 0 }]
 execution_class       = "native_fast"
 id                    = "bmux.control_catalog"
 name                  = "bmux Control Catalog"

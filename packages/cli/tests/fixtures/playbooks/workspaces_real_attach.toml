@@ -1,5 +1,5 @@
 [plugins.settings."bmux.tab_bar"]
-tab_template = "<{name}>"
+tab_template = "<{active}:{name}>"
 
 [keybindings]
 initial_mode = "normal"
@@ -7,12 +7,17 @@ initial_mode = "normal"
 [keybindings.global]
 "alt+1" = "plugin:bmux.tabs:goto-tab 1"
 "alt+2" = "plugin:bmux.tabs:goto-tab 2"
+"alt+a" = "plugin:bmux.tabs:new-tab --name=tab-A_ONE"
+"alt+b" = "plugin:bmux.tabs:new-tab --name=tab-A_TWO"
 "alt+c" = "plugin:bmux.sessions:new-session"
+"alt+d" = "plugin:bmux.tabs:new-tab --name=tab-B_ONE"
+"alt+e" = "plugin:bmux.tabs:new-tab --name=tab-B_TWO"
 "alt+f" = "plugin:bmux.finder:show"
 "alt+h" = "plugin:bmux.tabs:prev-tab"
 "alt+j" = "plugin:bmux.tabs:next-tab"
 "alt+k" = "plugin:bmux.tabs:last-tab"
 "alt+l" = "plugin:bmux.workspaces:last-workspace"
+"alt+v" = "plugin:bmux.tabs:new-tab --name=nav-target"
 "alt+w" = "plugin:bmux.workspaces:new-workspace"
 
 [keybindings.modes.normal]

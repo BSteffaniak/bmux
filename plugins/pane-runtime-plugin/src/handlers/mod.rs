@@ -62,7 +62,12 @@ pub fn route(context: NativeServiceContext) -> ServiceResponse {
     if let Err(error) = execution::authorize_route(&context) {
         return error;
     }
-    crate::runtime::input_authority::with_local(context.clone(), || route_authorized(context))
+    match crate::runtime::input_authority::with_local_settled(context.clone(), || {
+        route_authorized(context)
+    }) {
+        Ok(response) => response,
+        Err(error) => ServiceResponse::error("input_settlement_failed", &error),
+    }
 }
 
 #[allow(

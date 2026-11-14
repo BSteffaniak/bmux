@@ -1,3 +1,8 @@
+component_roles = ["backend", "frontend"]
+contracts = [
+    { interface_id = "theme-control-v1", major = 1, minor = 0 },
+    { interface_id = "theme-state", major = 1, minor = 0 },
+]
 execution_class = "native_fast"
 id = "bmux.theme"
 name = "bmux Theme"

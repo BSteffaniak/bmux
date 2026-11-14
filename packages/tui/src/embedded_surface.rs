@@ -347,7 +347,11 @@ impl Component for EmbeddedSurface<'_> {
     }
 }
 
-fn validate_cells(buffer: &Buffer, limits: SurfaceLimits) -> Result<(), SurfaceError> {
+/// Validate a zero-origin cell projection before consuming decoded transport data.
+///
+/// # Errors
+/// Rejects malformed graphemes, wide-cell topology, geometry, or cell budgets.
+pub fn validate_cells(buffer: &Buffer, limits: SurfaceLimits) -> Result<(), SurfaceError> {
     let area = buffer.area();
     let count = usize::from(area.width) * usize::from(area.height);
     if area.x != 0

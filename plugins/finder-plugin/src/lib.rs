@@ -2,6 +2,8 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
+mod activation_ports;
+
 use bmux_plugin::{action_dispatch, prompt};
 use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::prompt::{PromptOrderedMatchMode, PromptSearchOrder};
@@ -16,14 +18,47 @@ use uuid::Uuid;
 const DEFAULT_ENTRY_FORMAT: &str = "{workspace}/{tab}";
 
 #[derive(Default)]
-pub struct FinderPlugin;
+pub struct FinderPlugin {
+    binding: activation_ports::Binding,
+    task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+impl Drop for FinderPlugin {
+    fn drop(&mut self) {
+        if let Ok(task) = self.task.get_mut()
+            && let Some(task) = task.take()
+        {
+            task.abort();
+        }
+    }
+}
+
+impl FinderPlugin {
+    /// Supply ports for one subsequent scoped activation; no channels are live
+    /// until `PluginInstance::activate` binds that activation.
+    #[must_use]
+    pub fn with_ports(
+        prompt: prompt::PromptPort,
+        actions: action_dispatch::ActionDispatchPort,
+    ) -> Self {
+        Self {
+            binding: activation_ports::Binding::fixed(prompt, actions),
+            task: std::sync::Mutex::default(),
+        }
+    }
+
+    fn show(&self, context: &NativeCommandContext) -> Result<i32, PluginCommandError> {
+        let (prompt, actions) = self.binding.ports()?;
+        show_finder(context, &self.task, &prompt, actions)
+    }
+}
 
 impl RustPlugin for FinderPlugin {
     type Contract = bmux_plugin_sdk::NoPluginContract;
 
     fn run_command(&mut self, context: NativeCommandContext) -> Result<i32, PluginCommandError> {
         bmux_plugin_sdk::route_command!(context, {
-            "show" => show_finder(&context),
+            "show" => self.show(&context),
         })
     }
 }
@@ -52,7 +87,14 @@ fn load_windows(context: &NativeCommandContext) -> Result<Vec<TabListEntry>, Plu
         .collect()
 }
 
-fn show_finder(context: &NativeCommandContext) -> Result<i32, PluginCommandError> {
+fn show_finder(
+    context: &NativeCommandContext,
+    task: &std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    prompt: &prompt::PromptPort,
+    actions: action_dispatch::ActionDispatchPort,
+) -> Result<i32, PluginCommandError> {
+    let handle = tokio::runtime::Handle::try_current()
+        .map_err(|_| PluginCommandError::unavailable("finder requires a frontend async runtime"))?;
     let _workspace_contract = bmux_workspaces_plugin_api::workspaces_state::INTERFACE_ID.as_str();
     let settings =
         FinderSettings::parse(context.settings.as_ref()).map_err(PluginCommandError::failed)?;
@@ -96,13 +138,17 @@ fn show_finder(context: &NativeCommandContext) -> Result<i32, PluginCommandError
         })
         .search_wrap_selection(settings.wrap_selection)
         .search_placeholder("Search workspace or tab");
-    let response = prompt::submit(request).map_err(|error| {
+    let mut task = task
+        .lock()
+        .map_err(|_| PluginCommandError::unavailable("finder task owner requires recovery"))?;
+    if task.as_ref().is_some_and(|task| !task.is_finished()) {
+        return Err(PluginCommandError::unavailable("finder is already open"));
+    }
+    let response = prompt.submit(request).map_err(|error| {
         PluginCommandError::unavailable(format!("finder prompt unavailable: {error}"))
     })?;
-    let handle = tokio::runtime::Handle::try_current().map_err(|_| {
-        PluginCommandError::unavailable("no tokio runtime available — finder requires attach")
-    })?;
-    handle.spawn(handle_response(entries, response));
+    *task = Some(handle.spawn(handle_response(entries, response, actions)));
+    drop(task);
     Ok(EXIT_OK)
 }
 
@@ -394,6 +440,7 @@ fn build_entries(
 async fn handle_response(
     entries: Vec<FinderEntry>,
     response: tokio::sync::oneshot::Receiver<PromptResponse>,
+    actions: action_dispatch::ActionDispatchPort,
 ) {
     let selected = match response.await {
         Ok(PromptResponse::Submitted(PromptValue::Single(value))) => value,
@@ -410,12 +457,139 @@ async fn handle_response(
         return;
     };
     let action = format!("plugin:bmux.workspaces:activate-tab {}", entry.context_id);
-    if let Err(error) = action_dispatch::dispatch(&action) {
+    if let Err(error) = actions.dispatch(&action) {
         warn!(%error, "finder: tab switch failed");
     }
 }
 
-bmux_plugin_sdk::export_plugin!(FinderPlugin, include_str!("../plugin.toml"));
+impl bmux_plugin_sdk::definition::PluginInstance for FinderPlugin {
+    fn activate(
+        &self,
+        context: bmux_plugin_sdk::definition::PluginLifecycleContext,
+    ) -> bmux_plugin_sdk::definition::PluginFuture<'_, bmux_plugin_sdk::definition::PluginResult<()>>
+    {
+        Box::pin(async move { self.binding.activate(&context) })
+    }
+
+    fn command(
+        &self,
+        call: bmux_plugin_sdk::definition::PluginCallContext,
+        context: NativeCommandContext,
+    ) -> bmux_plugin_sdk::definition::PluginFuture<'_, bmux_plugin_sdk::definition::CommandOutcome>
+    {
+        Box::pin(async move {
+            if call.cancellation.is_cancelled() {
+                return Err(PluginCommandError::unavailable(
+                    "finder invocation cancelled",
+                ))
+                .into();
+            }
+            if context.command != "show" {
+                return Err(PluginCommandError::unknown_command(&context.command)).into();
+            }
+            self.show(&context).into()
+        })
+    }
+
+    fn deactivate(
+        &self,
+        context: bmux_plugin_sdk::definition::PluginLifecycleContext,
+    ) -> bmux_plugin_sdk::definition::PluginFuture<'_, bmux_plugin_sdk::definition::PluginResult<()>>
+    {
+        Box::pin(async move {
+            self.binding.close(&context)?;
+            let task = self
+                .task
+                .lock()
+                .map_err(|_| {
+                    PluginCommandError::unavailable("finder task owner requires recovery")
+                })?
+                .take();
+            if let Some(task) = task {
+                task.abort();
+                let _ = task.await;
+            }
+            self.binding.drained(&context)
+        })
+    }
+}
+
+/// Define a frontend whose channels bind at activation time.
+///
+/// The trusted host must create both ports from the activation belonging to
+/// this lifecycle context, retain its inboxes, and never select global channels.
+#[must_use]
+pub fn plugin_definition_with_activation_ports(
+    bind: impl Fn(
+        &bmux_plugin_sdk::definition::PluginLifecycleContext,
+    ) -> Result<
+        (
+            bmux_plugin::prompt::PromptPort,
+            bmux_plugin::action_dispatch::ActionDispatchPort,
+        ),
+        PluginCommandError,
+    > + Send
+    + Sync
+    + 'static,
+) -> bmux_plugin_sdk::definition::PluginDefinition {
+    let metadata = plugin_definition().metadata;
+    let bind: activation_ports::Binder = std::sync::Arc::new(bind);
+    bmux_plugin_sdk::definition::PluginDefinition::new(metadata, move |scope| {
+        Ok(std::sync::Arc::new(FinderPlugin {
+            binding: activation_ports::Binding::deferred(scope, bind.clone()),
+            task: std::sync::Mutex::default(),
+        })
+            as std::sync::Arc<
+                dyn bmux_plugin_sdk::definition::PluginInstance,
+            >)
+    })
+}
+
+/// Retain compatibility with the create-context injector signature.
+///
+/// Callers must supply the exact activation's channels. The injector now runs
+/// at activation, never at creation.
+#[must_use]
+pub fn plugin_definition_with_ports(
+    inject: impl Fn(
+        bmux_plugin_sdk::definition::PluginCreateContext,
+    ) -> Result<
+        (
+            bmux_plugin::prompt::PromptPort,
+            bmux_plugin::action_dispatch::ActionDispatchPort,
+        ),
+        PluginCommandError,
+    > + Send
+    + Sync
+    + 'static,
+) -> bmux_plugin_sdk::definition::PluginDefinition {
+    plugin_definition_with_activation_ports(move |context| inject(context.scope.clone()))
+}
+
+bmux_plugin_sdk::define_plugin!(
+    factory = |scope| Ok(std::sync::Arc::new(FinderPlugin {
+        binding: activation_ports::Binding::unbound(scope),
+        task: std::sync::Mutex::default(),
+    })
+        as std::sync::Arc<dyn bmux_plugin_sdk::definition::PluginInstance>),
+    metadata = {
+        let manifest_toml = include_str!("../plugin.toml");
+        let manifest = bmux_plugin::PluginManifest::from_toml_str(manifest_toml)
+            .expect("embedded plugin declaration must be valid");
+        bmux_plugin_sdk::definition::PluginMetadata {
+            plugin_id: manifest.id,
+            version: manifest.version,
+            roles: manifest.component_roles,
+            required_capabilities: manifest
+                .required_capabilities
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            contracts: manifest.contracts,
+            manifest_toml: Some(manifest_toml.into()),
+        }
+    },
+);
 
 #[cfg(test)]
 mod tests {
@@ -423,8 +597,15 @@ mod tests {
 
     #[tokio::test]
     async fn finder_dispatches_one_exact_activation_action() {
-        let (actions, mut received) = tokio::sync::mpsc::unbounded_channel();
-        let _host = action_dispatch::register_host(actions);
+        let instance = bmux_plugin_runtime::InstanceScope::new(
+            bmux_plugin_runtime::PluginRuntimeScopeId::default(),
+        );
+        let owner = instance
+            .begin_activation(bmux_plugin_runtime::PluginConcurrencyConfig::Concurrent)
+            .unwrap();
+        owner.mark_active().unwrap();
+        let (actions, mut received) =
+            action_dispatch::ActionDispatchPort::channel(owner, 1).unwrap();
         let id = Uuid::from_u128(42);
         let (response, selection) = tokio::sync::oneshot::channel();
         response
@@ -440,13 +621,18 @@ mod tests {
                 search_text: String::new(),
             }],
             selection,
+            actions.clone(),
         )
         .await;
         assert_eq!(
             received.recv().await.unwrap().action,
             format!("plugin:bmux.workspaces:activate-tab {id}")
         );
-        assert!(received.try_recv().is_err());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), received.recv())
+                .await
+                .is_err()
+        );
     }
 
     fn window(
@@ -660,5 +846,70 @@ mod tests {
         assert!(FinderSettings::parse(Some(&invalid_scope)).is_err());
         let invalid_format = toml::toml! { entry_format = "{session}/{tab}" }.into();
         assert!(FinderSettings::parse(Some(&invalid_format)).is_err());
+    }
+}
+
+#[cfg(test)]
+mod embedded_declaration_identity_tests {
+    #[test]
+    fn definition_and_selected_manifest_have_one_identity() {
+        let definition = super::plugin_definition();
+        definition.validate().expect("definition validates");
+        let embedded = definition
+            .metadata
+            .manifest_toml
+            .as_deref()
+            .expect("embedded declaration");
+        let manifest =
+            bmux_plugin::PluginManifest::from_toml_str(embedded).expect("valid manifest");
+        assert_eq!(definition.metadata.plugin_id, manifest.id);
+        assert_eq!(definition.metadata.version, manifest.version);
+        assert_eq!(definition.metadata.roles, manifest.component_roles);
+        assert_eq!(definition.metadata.contracts, manifest.contracts);
+        assert_eq!(
+            definition.metadata.required_capabilities,
+            manifest
+                .required_capabilities
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        );
+
+        // Deterministic verifier fixtures, not claims about built executable bytes.
+        // Real selected artifact hashing remains the loader's responsibility.
+        let expected_digest = "a".repeat(64);
+        let wrong_digest = "b".repeat(64);
+        let pinned = format!("artifact_sha256 = \"{expected_digest}\"\n{embedded}");
+        let mut inventory = bmux_plugin::PluginCandidateInventory::new();
+        inventory
+            .add_bundled_manifest(&pinned, Vec::new())
+            .expect("inventory declaration");
+        for role in &manifest.component_roles {
+            let selected = inventory
+                .select(&bmux_plugin::PluginSelectionRequest {
+                    plugin_id: manifest.id.clone(),
+                    role: *role,
+                    preference: bmux_plugin::PluginCandidatePreference::Bundled,
+                    plugin_api: bmux_plugin_sdk::ApiVersion::new(1, 1),
+                    native_abi: bmux_plugin_sdk::ApiVersion::new(1, 1),
+                    contracts: manifest.contracts.clone(),
+                })
+                .expect("select declared role and contracts");
+            selected
+                .validate_embedded_metadata(&definition.metadata, &expected_digest)
+                .expect("selected declaration and embedded identity match");
+            assert!(
+                selected
+                    .validate_embedded_metadata(&definition.metadata, &wrong_digest)
+                    .is_err()
+            );
+            let mut conflicting = definition.metadata.clone();
+            conflicting.version.push_str("-conflict");
+            assert!(
+                selected
+                    .validate_embedded_metadata(&conflicting, &expected_digest)
+                    .is_err()
+            );
+        }
     }
 }

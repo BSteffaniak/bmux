@@ -633,59 +633,46 @@ fn commit_client_selection(
     })
 }
 
-struct SelectionPolicyCaller<'a, C> {
-    caller: &'a C,
-    missing: std::sync::atomic::AtomicBool,
-}
-impl<C: ServiceCaller + Sync> ServiceCaller for SelectionPolicyCaller<'_, C> {
-    fn call_service_raw(
-        &self,
-        capability: &str,
-        kind: ServiceKind,
-        interface: &str,
-        operation: &str,
-        payload: Vec<u8>,
-    ) -> bmux_plugin_sdk::Result<Vec<u8>> {
-        let result = self
-            .caller
-            .call_service_raw(capability, kind, interface, operation, payload);
-        if matches!(
-            &result,
-            Err(bmux_plugin_sdk::PluginError::UnsupportedHostOperation {
-                operation: "call_service"
-            })
-        ) {
-            self.missing
-                .store(true, std::sync::atomic::Ordering::Relaxed);
-        }
-        result
-    }
-    fn execute_kernel_request(
-        &self,
-        _request: bmux_ipc::Request,
-    ) -> bmux_plugin_sdk::Result<bmux_ipc::ResponsePayload> {
-        Err(bmux_plugin_sdk::PluginError::UnsupportedHostOperation {
-            operation: "selection policy kernel access",
-        })
-    }
-}
-
 fn authorize_selection(
     caller: &(impl ServiceCaller + Sync),
     client: Uuid,
     context: Option<Uuid>,
     session: Uuid,
 ) -> Result<(), SelectionError> {
+    use bmux_plugin_sdk::TypedServiceEndpoint;
+    use bmux_plugin_sdk::typed_dispatch::{SelectedServiceAvailability, ServiceAvailabilityKey};
+
+    let descriptor =
+        bmux_permissions_plugin_api::session_policy_state::client::CheckEndpoint::service_descriptor();
+    let availability = bmux_plugin::block_on_typed_dispatch(caller.selected_service_availability(
+        ServiceAvailabilityKey {
+            capability: descriptor.capability.to_string(),
+            kind: descriptor.kind,
+            interface_id: descriptor.interface_id.to_string(),
+        },
+    ))
+    .map_err(|error| SelectionError::Failed {
+        reason: format!("selection policy availability failed: {error}"),
+    })?;
+    if availability == SelectedServiceAvailability::Absent {
+        // Absence is not locality: only independently authenticated local input
+        // retains the optional permissions plugin's single-user fallback.
+        return match caller.current_stream_origin() {
+            Ok(bmux_plugin::StreamOrigin::Local) => Ok(()),
+            Ok(_) => Err(SelectionError::Failed {
+                reason: "selection policy absent for non-local caller".into(),
+            }),
+            Err(error) => Err(SelectionError::Failed {
+                reason: format!("selection caller origin unavailable: {error}"),
+            }),
+        };
+    }
     let principal = global_plugin_state_registry()
         .get::<bmux_client_state::ClientPrincipalHandle>()
         .and_then(|handle| handle.read().ok().map(|value| value.clone()))
         .and_then(|handle| handle.0.get(ClientId(client)))
         .unwrap_or_else(Uuid::nil);
-    let policy = SelectionPolicyCaller {
-        caller,
-        missing: std::sync::atomic::AtomicBool::new(false),
-    };
-    let mut dispatch = dispatch_client(&policy);
+    let mut dispatch = dispatch_client(caller);
     let decision = match bmux_plugin::block_on_typed_dispatch(
         bmux_permissions_plugin_api::session_policy_state::client::check(
             &mut dispatch,
@@ -700,7 +687,6 @@ fn authorize_selection(
         ),
     ) {
         Ok(decision) => decision,
-        Err(_) if policy.missing.load(std::sync::atomic::Ordering::Relaxed) => return Ok(()),
         Err(error) => {
             return Err(SelectionError::Failed {
                 reason: format!("selection authorization failed: {error}"),
@@ -1255,4 +1241,113 @@ const fn primitive_summary_to_typed(summary: &PrimitiveClientSummary) -> ClientS
     }
 }
 
-bmux_plugin_sdk::export_plugin!(ClientsPlugin, include_str!("../plugin.toml"));
+bmux_plugin_sdk::define_plugin!(
+    factory = |scope: bmux_plugin_sdk::definition::PluginCreateContext| {
+        Ok(std::sync::Arc::new(
+            bmux_plugin_sdk::definition::RustPluginAdapter::for_instance(
+                ClientsPlugin,
+                scope.instance,
+            ),
+        )
+            as std::sync::Arc<
+                dyn bmux_plugin_sdk::definition::PluginInstance,
+            >)
+    },
+    metadata = bmux_plugin_sdk::definition::PluginDefinition::from_rust_plugin::<ClientsPlugin>(
+        include_str!("../plugin.toml"),
+        vec![bmux_plugin_sdk::definition::ComponentRole::Backend],
+    )
+    .expect("embedded foundational declaration must be valid")
+    .metadata,
+);
+
+/// Request policy for this implementation's trusted application composition.
+///
+/// This function does not issue authority. The application must retain it against
+/// the verified selected artifact and exact loaded instance, then run it inside
+/// the admitted invocation before executing the request. Manifests and dynamic
+/// plugin exports cannot select this policy or approve their own replacement.
+/// Caller provenance is supplied by the host, never by the encoded request.
+///
+/// # Errors
+/// Rejects malformed IPC and operations outside this implementation's needs.
+// The composition callback contract uses the SDK's rich error type by value.
+#[allow(clippy::result_large_err)]
+pub fn authorize_kernel_request(encoded: &[u8]) -> bmux_plugin_sdk::Result<()> {
+    let request: bmux_ipc::Request = bmux_ipc::decode(encoded).map_err(|error| {
+        bmux_plugin_sdk::PluginError::ServiceProtocol {
+            details: error.to_string(),
+        }
+    })?;
+    if matches!(
+        request,
+        bmux_ipc::Request::CurrentStreamProvenance | bmux_ipc::Request::StreamAdmissionBackend
+    ) {
+        Ok(())
+    } else {
+        Err(bmux_plugin_sdk::PluginError::UnsupportedHostOperation {
+            operation: "clients_kernel_request_policy",
+        })
+    }
+}
+
+#[cfg(test)]
+mod kernel_request_policy_tests {
+    #[test]
+    fn composition_policy_is_narrow_and_rejects_invalid_requests() {
+        let provenance = bmux_ipc::encode(&bmux_ipc::Request::CurrentStreamProvenance).unwrap();
+        assert!(super::authorize_kernel_request(&provenance).is_ok());
+        let backend = bmux_ipc::encode(&bmux_ipc::Request::StreamAdmissionBackend).unwrap();
+        assert!(super::authorize_kernel_request(&backend).is_ok());
+        let unrelated = bmux_ipc::encode(&bmux_ipc::Request::Ping).unwrap();
+        assert!(super::authorize_kernel_request(&unrelated).is_err());
+        assert!(super::authorize_kernel_request(b"invalid IPC").is_err());
+    }
+}
+
+#[cfg(test)]
+mod definition_contract_tests {
+    #[test]
+    fn explicit_contract_versions_preserve_service_wire_routes() {
+        let definition = super::plugin_definition();
+        let manifest =
+            bmux_plugin::PluginManifest::from_toml_str(include_str!("../plugin.toml")).unwrap();
+        let canonical = bmux_plugin_sdk::definition::PluginDefinition::from_rust_plugin::<
+            super::ClientsPlugin,
+        >(
+            include_str!("../plugin.toml"),
+            vec![bmux_plugin_sdk::definition::ComponentRole::Backend],
+        )
+        .unwrap();
+        definition.validate().unwrap();
+        assert_eq!(definition.metadata, canonical.metadata);
+        assert_eq!(definition.metadata.plugin_id, manifest.id);
+        assert_eq!(definition.metadata.version, manifest.version);
+        assert_eq!(definition.metadata.roles, manifest.component_roles);
+        let declared: std::collections::BTreeSet<_> = manifest
+            .contracts
+            .iter()
+            .map(|contract| (&contract.interface_id, contract.major, contract.minor))
+            .collect();
+        let embedded: std::collections::BTreeSet<_> = definition
+            .metadata
+            .contracts
+            .iter()
+            .map(|contract| (&contract.interface_id, contract.major, contract.minor))
+            .collect();
+        assert_eq!(embedded, declared);
+        let mut services = definition.declarations().unwrap().services;
+        services.extend(
+            <super::ClientsPlugin as bmux_plugin_sdk::RustPlugin>::declared_services().unwrap(),
+        );
+        for service in services {
+            let contract = definition
+                .metadata
+                .contracts
+                .iter()
+                .find(|contract| contract.interface_id == service.interface_id)
+                .expect("every retained route requires explicit compatibility metadata");
+            assert_eq!((contract.major, contract.minor), (1, 0));
+        }
+    }
+}

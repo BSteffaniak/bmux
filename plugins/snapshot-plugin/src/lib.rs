@@ -16,13 +16,15 @@
 
 mod managed_catalog;
 mod orchestrator;
+mod participants;
+mod portable;
+pub use portable::portable_participant;
 
 pub use bmux_snapshot_plugin_api::envelope::{CombinedSnapshotEnvelope, SectionV1};
 pub use orchestrator::BmuxSnapshotOrchestrator;
 
 use std::sync::{Arc, RwLock};
 
-use bmux_plugin::global_plugin_state_registry;
 use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::{TypedServiceRegistrationContext, TypedServiceRegistry};
 use bmux_snapshot_plugin_api::{SnapshotPluginConfig, snapshot_types};
@@ -37,8 +39,152 @@ const DEFAULT_DEBOUNCE_MS: u64 = 1_000;
 /// Poll tick for the debounce-flush background thread.
 const DEBOUNCE_POLL_MS: u64 = 200;
 
-#[derive(Default)]
-pub struct SnapshotPlugin;
+/// Explicit host state port: the registry belongs to one host runtime.
+#[derive(Clone)]
+pub struct SnapshotRuntime {
+    pub state: Arc<bmux_plugin::PluginStateRegistry>,
+    pub progress: bmux_plugin_runtime::shutdown_progress::ShutdownProgress,
+    /// Exact managed target and public identity selected by the host.
+    /// None means explicitly non-managed, never environment fallback.
+    pub managed_target: Option<(String, String)>,
+    /// Host-owned startup admission. False during ordinary live operation.
+    /// The host takes the write lock to close admission and drain restores.
+    pub participant_restore_admitted: Arc<RwLock<bool>>,
+    /// Open only for the owning host's final-snapshot shutdown phase.
+    pub participant_quiesce_admitted: Arc<RwLock<bool>>,
+}
+
+impl SnapshotRuntime {
+    /// Bind production capture and storage to the registry selected by the host.
+    ///
+    /// This must be the same registry receiving `SnapshotPluginConfig`, live
+    /// `StatefulPluginRegistry` participants and `SnapshotDirtyFlagHandle`.
+    /// No registry, path, participant projection or managed identity is inferred
+    /// from process environment. The supplied managed pair is (target, identity).
+    /// Keep a clone to control restore/quiesce admission at host lifecycle edges.
+    ///
+    /// # Errors
+    /// Rejects an empty managed identity or poisoned shared progress state.
+    pub fn from_host_registry(
+        state: Arc<bmux_plugin::PluginStateRegistry>,
+        managed_target: Option<(String, String)>,
+    ) -> std::result::Result<Self, PluginCommandError> {
+        if managed_target
+            .as_ref()
+            .is_some_and(|(target, identity)| target.is_empty() || identity.is_empty())
+        {
+            return Err(PluginCommandError::failed(
+                "snapshot managed target and identity must be nonempty",
+            ));
+        }
+        let progress = state
+            .get_or_insert_with(bmux_plugin_runtime::shutdown_progress::ShutdownProgress::default)
+            .read()
+            .map_err(|_| PluginCommandError::failed("snapshot shutdown progress lock poisoned"))?
+            .clone();
+        Ok(Self {
+            progress,
+            managed_target,
+            ..Self::new(state)
+        })
+    }
+
+    /// Construct isolated ports; production hosts should use `from_host_registry`
+    /// so shutdown progress is shared with the selected lifecycle authority.
+    #[must_use]
+    pub fn new(state: Arc<bmux_plugin::PluginStateRegistry>) -> Self {
+        Self {
+            state,
+            progress: bmux_plugin_runtime::shutdown_progress::ShutdownProgress::default(),
+            managed_target: None,
+            participant_restore_admitted: Arc::new(RwLock::new(false)),
+            participant_quiesce_admitted: Arc::new(RwLock::new(false)),
+        }
+    }
+}
+
+pub struct SnapshotPlugin {
+    runtime: SnapshotRuntime,
+    orchestrator: Option<Arc<BmuxSnapshotOrchestrator>>,
+    bound: bool,
+}
+
+impl SnapshotPlugin {
+    #[must_use]
+    pub fn new(runtime: SnapshotRuntime) -> Self {
+        Self {
+            runtime,
+            orchestrator: None,
+            bound: true,
+        }
+    }
+
+    fn invoke_participant(&self, context: &NativeServiceContext) -> ServiceResponse {
+        let port = || {
+            self.runtime
+                .state
+                .get::<StatefulPluginRegistry>()
+                .map(participants::Participants)
+                .ok_or_else(|| participants::unavailable("participant registry not registered"))
+        };
+        bmux_plugin_sdk::route_service!(context, {
+            bmux_snapshot_plugin_api::snapshot_participant_state_v1::client::ParticipantsEndpoint => |_req, _ctx| {
+                Ok(port().and_then(|port| port.ids()))
+            },
+            bmux_snapshot_plugin_api::snapshot_participant_state_v1::client::RestoreDependenciesEndpoint => |req, _ctx| {
+                Ok(port().and_then(|port| port.dependencies(&req.participant_id)))
+            },
+            bmux_snapshot_plugin_api::snapshot_participant_state_v1::client::SnapshotEndpoint => |req, _ctx| {
+                Ok(port().and_then(|port| port.snapshot(&req.participant_id)))
+            },
+            bmux_snapshot_plugin_api::snapshot_participant_state_v1::client::ValidateEndpoint => |req, _ctx| {
+                Ok(port().and_then(|port| port.validate(req.snapshot)))
+            },
+            bmux_snapshot_plugin_api::snapshot_participant_commands_v1::client::QuiesceEndpoint => |req, _ctx| {
+                let quiesce = || {
+                    let admission = self.runtime.participant_quiesce_admitted.read()
+                        .map_err(|_| participants::unavailable("participant quiesce admission poisoned"))?;
+                    if !*admission {
+                        return Err(participants::unavailable("participant quiesce requires host shutdown admission"));
+                    }
+                    let result = port().and_then(|port| port.quiesce(&req.participant_id));
+                    drop(admission);
+                    result
+                };
+                Ok(quiesce())
+            },
+            bmux_snapshot_plugin_api::snapshot_participant_commands_v1::client::RestoreEndpoint => |req, _ctx| {
+                let restore = || {
+                    let admission = self.runtime.participant_restore_admitted.read()
+                        .map_err(|_| participants::unavailable("participant restore admission poisoned"))?;
+                    if !*admission {
+                        return Err(participants::unavailable("participant restore requires host startup admission"));
+                    }
+                    // Keep the read guard through validation/application. Closing
+                    // startup admission takes the write lock and drains restores.
+                    let result = port().and_then(|port| port.restore(req.snapshot));
+                    drop(admission);
+                    result
+                };
+                Ok(restore())
+            },
+        })
+    }
+
+    fn snapshot_handle(&self) -> Result<SnapshotOrchestratorHandle, snapshot_types::SnapshotError> {
+        snapshot_handle(&self.runtime.state)
+    }
+}
+
+impl Default for SnapshotPlugin {
+    fn default() -> Self {
+        Self {
+            runtime: SnapshotRuntime::new(Arc::new(bmux_plugin::PluginStateRegistry::new())),
+            orchestrator: None,
+            bound: false,
+        }
+    }
+}
 
 impl RustPlugin for SnapshotPlugin {
     type Contract = bmux_snapshot_plugin_api::Contract;
@@ -47,13 +193,29 @@ impl RustPlugin for SnapshotPlugin {
         &mut self,
         _context: NativeLifecycleContext,
     ) -> std::result::Result<i32, PluginCommandError> {
-        let registry = global_plugin_state_registry();
+        if !self.bound || self.orchestrator.is_some() {
+            return Err(PluginCommandError::unavailable(
+                "snapshot runtime unbound or already activated",
+            ));
+        }
+        let registry = &self.runtime.state;
+        if registry.get::<SnapshotOrchestratorHandle>().is_some() {
+            return Err(PluginCommandError::unavailable(
+                "snapshot authority already registered in this host",
+            ));
+        }
 
         // Pull the CLI-registered config if present; otherwise activate
         // in disabled mode (orchestrator ops return Ok(None) / Disabled).
         let config: Option<SnapshotPluginConfig> = registry
             .get::<SnapshotPluginConfig>()
-            .and_then(|handle| handle.read().ok().map(|g| (*g).clone()));
+            .map(|handle| {
+                handle
+                    .read()
+                    .map(|g| (*g).clone())
+                    .map_err(|_| PluginCommandError::failed("snapshot configuration lock poisoned"))
+            })
+            .transpose()?;
 
         // Ensure a shared dirty flag exists and is registered so every
         // server mutation site can flip it without needing to look the
@@ -81,12 +243,17 @@ impl RustPlugin for SnapshotPlugin {
             },
         );
 
-        let managed_catalog = config
-            .as_ref()
-            .map(|config| managed_catalog::ManagedCatalog::capture(&config.snapshot_path))
-            .transpose()
-            .map_err(|error| PluginCommandError::failed(error.to_string()))?
-            .flatten();
+        let managed_catalog = match (&config, &self.runtime.managed_target) {
+            (Some(config), Some((target, identity))) => Some(
+                managed_catalog::ManagedCatalog::new(
+                    &config.snapshot_path,
+                    target.clone(),
+                    identity,
+                )
+                .map_err(|error| PluginCommandError::failed(error.to_string()))?,
+            ),
+            _ => None,
+        };
         if let Some(catalog) = &managed_catalog {
             let discovery = catalog
                 .discovery()
@@ -99,8 +266,10 @@ impl RustPlugin for SnapshotPlugin {
             Arc::clone(&dirty_flag_arc),
             Arc::clone(&stateful_registry),
         )
-        .with_managed_catalog(managed_catalog);
+        .with_managed_catalog(managed_catalog)
+        .with_progress(self.runtime.progress.clone());
         let orchestrator = Arc::new(orchestrator);
+        self.orchestrator = Some(Arc::clone(&orchestrator));
         let handle = SnapshotOrchestratorHandle::from_shared(Arc::clone(&orchestrator));
         let handle_entry = Arc::new(RwLock::new(handle));
         registry.register::<SnapshotOrchestratorHandle>(&handle_entry);
@@ -129,6 +298,16 @@ impl RustPlugin for SnapshotPlugin {
         Ok(bmux_plugin_sdk::EXIT_OK)
     }
 
+    fn deactivate(&mut self, _context: NativeLifecycleContext) -> Result<i32, PluginCommandError> {
+        if let Some(orchestrator) = &self.orchestrator {
+            orchestrator
+                .stop_debounce()
+                .map_err(PluginCommandError::failed)?;
+        }
+        // Deactivation does not discard retained snapshot/recovery authority.
+        Ok(bmux_plugin_sdk::EXIT_OK)
+    }
+
     fn run_command(
         &mut self,
         _context: NativeCommandContext,
@@ -137,18 +316,24 @@ impl RustPlugin for SnapshotPlugin {
     }
 
     fn invoke_service(&self, context: NativeServiceContext) -> ServiceResponse {
+        if matches!(
+            context.request.service.interface_id.as_str(),
+            "snapshot-participant-state-v1" | "snapshot-participant-commands-v1"
+        ) {
+            return self.invoke_participant(&context);
+        }
         bmux_plugin_sdk::route_service!(context, {
             bmux_snapshot_plugin_api::snapshot_state::client::StatusEndpoint => |_req, _ctx| {
-                Ok(handle_status())
+                Ok(self.snapshot_handle().map(|handle| handle_status(&handle)))
             },
             bmux_snapshot_plugin_api::snapshot_state::client::RestoreDryRunEndpoint => |_req, _ctx| {
-                Ok(handle_restore_dry_run())
+                Ok(self.snapshot_handle().and_then(handle_restore_dry_run))
             },
             bmux_snapshot_plugin_api::snapshot_commands::client::SaveNowEndpoint => |_req, _ctx| {
-                Ok(handle_save_now())
+                Ok(self.snapshot_handle().and_then(handle_save_now))
             },
             bmux_snapshot_plugin_api::snapshot_commands::client::RestoreApplyEndpoint => |_req, _ctx| {
-                Ok(handle_restore_apply())
+                Ok(self.snapshot_handle().and_then(handle_restore_apply))
             },
         })
     }
@@ -163,8 +348,9 @@ impl RustPlugin for SnapshotPlugin {
     }
 }
 
-fn snapshot_handle() -> Result<SnapshotOrchestratorHandle, snapshot_types::SnapshotError> {
-    let registry = global_plugin_state_registry();
+fn snapshot_handle(
+    registry: &bmux_plugin::PluginStateRegistry,
+) -> Result<SnapshotOrchestratorHandle, snapshot_types::SnapshotError> {
     let Some(handle_entry) = registry.get::<SnapshotOrchestratorHandle>() else {
         return Err(snapshot_types::SnapshotError::NotRegistered {
             message: "snapshot orchestrator not registered".into(),
@@ -183,8 +369,9 @@ fn tokio_handle() -> Result<tokio::runtime::Handle, snapshot_types::SnapshotErro
     })
 }
 
-fn handle_save_now() -> Result<snapshot_types::SnapshotSaveResult, snapshot_types::SnapshotError> {
-    let orchestrator_handle = snapshot_handle()?;
+fn handle_save_now(
+    orchestrator_handle: SnapshotOrchestratorHandle,
+) -> Result<snapshot_types::SnapshotSaveResult, snapshot_types::SnapshotError> {
     let handle = tokio_handle()?;
     futures_block_on(&handle, async move {
         orchestrator_handle.as_dyn().save_now_boxed().await
@@ -195,22 +382,23 @@ fn handle_save_now() -> Result<snapshot_types::SnapshotSaveResult, snapshot_type
     .map_err(|err| error_response("save_failed", &err))
 }
 
-fn handle_status() -> Result<snapshot_types::SnapshotStatusPayload, snapshot_types::SnapshotError> {
-    let orchestrator_handle = snapshot_handle()?;
+fn handle_status(
+    orchestrator_handle: &SnapshotOrchestratorHandle,
+) -> snapshot_types::SnapshotStatusPayload {
     let report = orchestrator_handle.as_dyn().status();
-    Ok(snapshot_types::SnapshotStatusPayload {
+    snapshot_types::SnapshotStatusPayload {
         enabled: report.enabled,
         path: report.path,
         snapshot_exists: report.snapshot_exists,
         last_write_epoch_ms: report.last_write_epoch_ms,
         last_restore_epoch_ms: report.last_restore_epoch_ms,
         last_restore_error: report.last_restore_error,
-    })
+    }
 }
 
-fn handle_restore_dry_run()
--> Result<snapshot_types::SnapshotDryRunResult, snapshot_types::SnapshotError> {
-    let orchestrator_handle = snapshot_handle()?;
+fn handle_restore_dry_run(
+    orchestrator_handle: SnapshotOrchestratorHandle,
+) -> Result<snapshot_types::SnapshotDryRunResult, snapshot_types::SnapshotError> {
     let handle = tokio_handle()?;
     futures_block_on(&handle, async move {
         orchestrator_handle.as_dyn().dry_run_boxed().await
@@ -223,9 +411,9 @@ fn handle_restore_dry_run()
 }
 
 #[allow(clippy::cast_possible_truncation)]
-fn handle_restore_apply()
--> Result<snapshot_types::SnapshotApplySummary, snapshot_types::SnapshotError> {
-    let orchestrator_handle = snapshot_handle()?;
+fn handle_restore_apply(
+    orchestrator_handle: SnapshotOrchestratorHandle,
+) -> Result<snapshot_types::SnapshotApplySummary, snapshot_types::SnapshotError> {
     let handle = tokio_handle()?;
     futures_block_on(&handle, async move {
         orchestrator_handle.as_dyn().restore_apply_boxed().await
@@ -322,4 +510,153 @@ fn spawn_debounce_loop(
     owner.install_debounce(stop, thread);
 }
 
-bmux_plugin_sdk::export_plugin!(SnapshotPlugin, include_str!("../plugin.toml"));
+/// Build one host-scoped definition. All instances created from it use the
+/// explicitly selected host ports, while retaining separate implementation state.
+///
+/// # Panics
+/// Panics if the embedded manifest is rejected, including invalid contract declarations.
+#[must_use]
+pub fn plugin_definition_with_runtime(
+    runtime: SnapshotRuntime,
+) -> bmux_plugin_sdk::definition::PluginDefinition {
+    use bmux_plugin_sdk::definition::{
+        ComponentRole, PluginDefinition, PluginInstance, RustPluginAdapter,
+    };
+    PluginDefinition::new(
+        PluginDefinition::from_rust_plugin::<SnapshotPlugin>(
+            include_str!("../plugin.toml"),
+            vec![ComponentRole::Backend],
+        )
+        .expect("embedded snapshot declaration must be valid")
+        .metadata,
+        move |scope: bmux_plugin_sdk::definition::PluginCreateContext| {
+            Ok(Arc::new(RustPluginAdapter::for_instance(
+                SnapshotPlugin::new(runtime.clone()),
+                scope.instance,
+            )) as Arc<dyn PluginInstance>)
+        },
+    )
+}
+
+/// Unbound discovery remains inert. Creation fails rather than silently using an
+/// empty registry and accepting an apparently successful, incomplete snapshot.
+#[must_use]
+pub fn plugin_definition() -> bmux_plugin_sdk::definition::PluginDefinition {
+    let metadata = plugin_definition_with_runtime(SnapshotRuntime::new(Arc::new(
+        bmux_plugin::PluginStateRegistry::new(),
+    )))
+    .metadata;
+    bmux_plugin_sdk::definition::PluginDefinition::new(metadata, |_scope| {
+        Err(PluginCommandError::unavailable(
+            "snapshot requires explicit host runtime ports",
+        ))
+    })
+}
+
+#[cfg(test)]
+mod scoped_runtime_tests {
+    use super::*;
+
+    #[test]
+    fn production_ports_retain_selected_authority_and_target() {
+        let state = Arc::new(bmux_plugin::PluginStateRegistry::new());
+        let participants = state.get_or_insert_with(StatefulPluginRegistry::new);
+        let config = state.get_or_insert_with(|| SnapshotPluginConfig {
+            snapshot_path: std::path::PathBuf::from("selected-host/snapshot.json"),
+            debounce_ms: 1000,
+        });
+        let dirty = state.get_or_insert_with(SnapshotDirtyFlagHandle::new);
+        let runtime = SnapshotRuntime::from_host_registry(
+            Arc::clone(&state),
+            Some(("selected-target".into(), "selected-identity".into())),
+        )
+        .unwrap();
+        assert!(Arc::ptr_eq(&runtime.state, &state));
+        assert!(Arc::ptr_eq(
+            &runtime.state.get::<StatefulPluginRegistry>().unwrap(),
+            &participants
+        ));
+        assert!(Arc::ptr_eq(
+            &runtime.state.get::<SnapshotPluginConfig>().unwrap(),
+            &config
+        ));
+        assert!(Arc::ptr_eq(
+            &runtime.state.get::<SnapshotDirtyFlagHandle>().unwrap(),
+            &dirty
+        ));
+        assert_eq!(
+            runtime.managed_target,
+            Some(("selected-target".into(), "selected-identity".into()))
+        );
+        assert!(!*runtime.participant_restore_admitted.read().unwrap());
+        assert!(!*runtime.participant_quiesce_admitted.read().unwrap());
+        assert!(
+            SnapshotRuntime::from_host_registry(state, Some((String::new(), "identity".into())),)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn host_ports_are_explicit_and_lifecycle_admission_defaults_closed() {
+        let a = SnapshotRuntime::new(Arc::new(bmux_plugin::PluginStateRegistry::new()));
+        let b = SnapshotRuntime::new(Arc::new(bmux_plugin::PluginStateRegistry::new()));
+        assert!(!Arc::ptr_eq(&a.state, &b.state));
+        assert!(!*a.participant_restore_admitted.read().unwrap());
+        assert!(!*a.participant_quiesce_admitted.read().unwrap());
+        *a.participant_restore_admitted.write().unwrap() = true;
+        assert!(!*b.participant_restore_admitted.read().unwrap());
+        assert!(!SnapshotPlugin::default().bound);
+    }
+}
+
+#[cfg(test)]
+mod definition_contract_tests {
+    #[test]
+    fn explicit_contract_versions_preserve_service_wire_routes() {
+        let definition = super::plugin_definition();
+        let manifest =
+            bmux_plugin::PluginManifest::from_toml_str(include_str!("../plugin.toml")).unwrap();
+        let canonical = bmux_plugin_sdk::definition::PluginDefinition::from_rust_plugin::<
+            super::SnapshotPlugin,
+        >(
+            include_str!("../plugin.toml"),
+            vec![bmux_plugin_sdk::definition::ComponentRole::Backend],
+        )
+        .unwrap();
+        let injected = super::plugin_definition_with_runtime(super::SnapshotRuntime::new(
+            std::sync::Arc::new(bmux_plugin::PluginStateRegistry::new()),
+        ));
+        injected.validate().unwrap();
+        assert_eq!(injected.metadata, canonical.metadata);
+        definition.validate().unwrap();
+        assert_eq!(definition.metadata, canonical.metadata);
+        assert_eq!(definition.metadata.plugin_id, manifest.id);
+        assert_eq!(definition.metadata.version, manifest.version);
+        assert_eq!(definition.metadata.roles, manifest.component_roles);
+        let declared: std::collections::BTreeSet<_> = manifest
+            .contracts
+            .iter()
+            .map(|contract| (&contract.interface_id, contract.major, contract.minor))
+            .collect();
+        let embedded: std::collections::BTreeSet<_> = definition
+            .metadata
+            .contracts
+            .iter()
+            .map(|contract| (&contract.interface_id, contract.major, contract.minor))
+            .collect();
+        assert_eq!(embedded, declared);
+        let mut services = definition.declarations().unwrap().services;
+        services.extend(
+            <super::SnapshotPlugin as bmux_plugin_sdk::RustPlugin>::declared_services().unwrap(),
+        );
+        for service in services {
+            let contract = definition
+                .metadata
+                .contracts
+                .iter()
+                .find(|contract| contract.interface_id == service.interface_id)
+                .expect("every retained route requires explicit compatibility metadata");
+            assert_eq!((contract.major, contract.minor), (1, 0));
+        }
+    }
+}

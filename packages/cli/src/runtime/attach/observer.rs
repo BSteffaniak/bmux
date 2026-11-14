@@ -546,6 +546,9 @@ pub(super) fn deliver_prepared(
         output_failed = result.is_err();
         result
     });
+    if result.is_err() {
+        view.frontend_presentations.failed();
+    }
     if result.is_err()
         && let Some(previous) = previous
     {
@@ -611,8 +614,10 @@ fn deliver_prepared_inner(
                 .map_err(|error| anyhow::anyhow!("history metadata source rejected: {error:?}"))?,
         );
     }
-    let metadata =
+    let frontends = view.frontend_presentations.prepared()?;
+    let mut metadata =
         super::metadata::project_with_sources(&view.retained_compositor, area, &source_metadata)?;
+    let modal_scopes = merge_frontend_metadata(&frontends, &mut metadata.text)?;
     let zoom_grids = super::pane_zoom_native::fragments(view)?;
     let mut projected_grids = None;
     let mut prepared = view
@@ -646,6 +651,11 @@ fn deliver_prepared_inner(
             for region in metadata.semantics.regions() {
                 cx.push_semantic(region.clone());
             }
+            for (placement, frontend) in &frontends {
+                cx.with_child(i32::from(placement.x), i64::from(placement.y),
+                    bmux_tui::paint::LocalRect::terminal(Rect::new(0, 0, placement.width, placement.height)),
+                    |cx| frontend.paint(cx));
+            }
             if let Some(cursor) = view.last_cursor_state {
                 cx.set_cursor_local(cursor.x, cursor.y, cursor.visible);
             }
@@ -658,6 +668,10 @@ fn deliver_prepared_inner(
     prepared
         .set_grid_fragments(grids, limits)
         .map_err(|error| anyhow::anyhow!("zoom fragment admission failed: {error:?}"))?;
+    anyhow::ensure!(
+        prepared.set_modal_scopes(&modal_scopes),
+        "frontend modal declarations require coherent full output"
+    );
     prepared
         .set_selection_text(metadata.text)
         .map_err(|error| anyhow::anyhow!("logical source admission failed: {error:?}"))?;
@@ -683,6 +697,15 @@ fn deliver_prepared_inner(
     if !prepared.project_active_focus(active.as_ref()) {
         prepared.project_active_focus(None);
     }
+    commit_observed_presentation(view, prepared, output)
+}
+
+/// Deliver the prepared scene before acknowledging frontend interaction authority.
+fn commit_observed_presentation(
+    view: &mut super::state::AttachViewState,
+    prepared: bmux_tui::presentation::PreparedPresentation,
+    output: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
     let publisher = view
         .observer
         .as_mut()
@@ -695,12 +718,51 @@ fn deliver_prepared_inner(
     let attached = view.attached_id;
     let graph = &view.retained_compositor;
     let pointer_shape = view.pointer_shape;
-    view.presentation
+    let displayed = view
+        .presentation
         .present_prepared(Some(prepared), |frame, _| {
             output()?;
             publisher.publish(attached, frame.clone(), graph, &stream_ends, pointer_shape)
-        })?;
-    Ok(())
+        });
+    finish_frontend_display(&mut view.frontend_presentations, displayed)
+}
+
+/// Resource input authority advances only after the shared compositor output
+/// succeeds with an actual frame. A skipped presentation acknowledges nothing;
+/// any commit error revokes all affected frontend input leases.
+fn finish_frontend_display(
+    frontends: &mut super::frontend_presentation::FrontendPresentations,
+    displayed: anyhow::Result<Option<()>>,
+) -> anyhow::Result<()> {
+    let result = match displayed {
+        Ok(Some(())) => frontends.displayed(),
+        Ok(None) => Ok(()),
+        Err(error) => Err(error),
+    };
+    if result.is_err() {
+        frontends.failed();
+    }
+    result
+}
+
+fn merge_frontend_metadata(
+    frontends: &[(
+        Rect,
+        bmux_plugin::component_viewport::portable::PreparedFrontendPresentation,
+    )],
+    text: &mut std::collections::BTreeMap<bmux_tui::selection::SelectionContentId, String>,
+) -> anyhow::Result<Vec<bmux_tui::focus::FocusScopeId>> {
+    let mut scopes = Vec::new();
+    for (_, frontend) in frontends {
+        for (id, source) in frontend.selection_text() {
+            anyhow::ensure!(
+                text.insert(id, source).is_none(),
+                "duplicate frontend logical source identity"
+            );
+        }
+        scopes.extend(frontend.modal_scopes());
+    }
+    Ok(scopes)
 }
 
 fn region_identity(id: &bmux_plugin::surface::PluginSurfaceRegionId) -> String {

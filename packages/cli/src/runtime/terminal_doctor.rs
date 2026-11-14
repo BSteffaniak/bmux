@@ -19,6 +19,22 @@ pub(super) fn run_terminal_install_terminfo(yes: bool, check_only: bool) -> Resu
         |_| "bmux-256color".to_string(),
         |cfg| cfg.behavior.pane_term,
     );
+    run_terminal_install_terminfo_configured(yes, check_only, &configured)
+}
+
+pub(super) fn run_terminal_install_terminfo_selected(
+    yes: bool,
+    check_only: bool,
+    config: &BmuxConfig,
+) -> Result<u8> {
+    run_terminal_install_terminfo_configured(yes, check_only, &config.behavior.pane_term)
+}
+
+fn run_terminal_install_terminfo_configured(
+    yes: bool,
+    check_only: bool,
+    configured: &str,
+) -> Result<u8> {
     let is_installed = check_terminfo_available("bmux-256color") == Some(true);
 
     if check_only {
@@ -74,7 +90,6 @@ pub(super) const fn bracketed_paste_status(config_enabled: bool) -> (&'static st
     (status, available, effective)
 }
 
-#[allow(clippy::too_many_lines)]
 pub(super) fn run_terminal_doctor(
     as_json: bool,
     include_trace: bool,
@@ -92,6 +107,62 @@ pub(super) fn run_terminal_doctor(
         }
     };
 
+    run_terminal_doctor_with_config(
+        &config,
+        &ConfigPaths::default(),
+        TerminalDoctorOptions {
+            as_json,
+            include_trace,
+            trace_limit,
+            trace_family,
+            trace_pane,
+        },
+    )
+}
+
+pub(super) fn run_terminal_doctor_selected(
+    state: &super::plugin_runtime::RuntimeCommandState,
+    as_json: bool,
+    include_trace: bool,
+    trace_limit: usize,
+    trace_family: Option<TraceFamily>,
+    trace_pane: Option<u16>,
+) -> Result<u8> {
+    run_terminal_doctor_with_config(
+        &state.config,
+        &state.paths,
+        TerminalDoctorOptions {
+            as_json,
+            include_trace,
+            trace_limit,
+            trace_family,
+            trace_pane,
+        },
+    )
+}
+
+#[derive(Clone, Copy)]
+struct TerminalDoctorOptions {
+    as_json: bool,
+    include_trace: bool,
+    trace_limit: usize,
+    trace_family: Option<TraceFamily>,
+    trace_pane: Option<u16>,
+}
+
+#[allow(clippy::too_many_lines)] // Keep the diagnostic report and both output formats coherent.
+fn run_terminal_doctor_with_config(
+    config: &BmuxConfig,
+    paths: &ConfigPaths,
+    options: TerminalDoctorOptions,
+) -> Result<u8> {
+    let TerminalDoctorOptions {
+        as_json,
+        include_trace,
+        trace_limit,
+        trace_family,
+        trace_pane,
+    } = options;
     let (bracketed_paste_status, bracketed_paste_available, bracketed_paste_effective) =
         bracketed_paste_status(config.behavior.bracketed_paste);
     let pointer_capability =
@@ -104,7 +175,7 @@ pub(super) fn run_terminal_doctor(
     let protocol_profile = protocol_profile_for_terminal_profile(effective.profile);
     let last_declined_prompt_epoch_secs = last_prompt_decline_epoch_secs();
     let trace_data = if include_trace {
-        load_protocol_trace(10_000)?
+        load_protocol_trace_at(&paths.protocol_trace_file(), 10_000)?
     } else {
         ProtocolTraceData::default()
     };
@@ -308,7 +379,18 @@ pub(super) fn plugin_keybinding_proposals(
             );
         }
     };
-    let enabled_plugins = effective_enabled_plugins(config, &registry)
+    plugin_keybinding_proposals_from_registry(config, &registry)
+}
+
+fn plugin_keybinding_proposals_from_registry(
+    config: &BmuxConfig,
+    registry: &bmux_plugin::PluginRegistry,
+) -> (
+    std::collections::BTreeMap<String, String>,
+    std::collections::BTreeMap<String, String>,
+    std::collections::BTreeMap<String, String>,
+) {
+    let enabled_plugins = effective_enabled_plugins(config, registry)
         .into_iter()
         .collect::<std::collections::BTreeSet<_>>();
     let mut runtime = std::collections::BTreeMap::new();
@@ -360,8 +442,23 @@ pub(super) fn merged_runtime_keybindings(
     std::collections::BTreeMap<String, String>,
     std::collections::BTreeMap<String, String>,
 ) {
+    merged_keybindings_from_registry(config, None)
+}
+
+type KeybindingProposals = (
+    std::collections::BTreeMap<String, String>,
+    std::collections::BTreeMap<String, String>,
+    std::collections::BTreeMap<String, String>,
+);
+fn merged_keybindings_from_registry(
+    config: &BmuxConfig,
+    registry: Option<&bmux_plugin::PluginRegistry>,
+) -> KeybindingProposals {
     let defaults = BmuxConfig::default();
-    let (plugin_runtime, plugin_global, plugin_scroll) = plugin_keybinding_proposals(config);
+    let (plugin_runtime, plugin_global, plugin_scroll) = registry.map_or_else(
+        || plugin_keybinding_proposals(config),
+        |registry| plugin_keybinding_proposals_from_registry(config, registry),
+    );
 
     let mut runtime = canonicalize_keybindings(defaults.keybindings.runtime);
     runtime.extend(canonicalize_keybindings(plugin_runtime));
@@ -390,12 +487,11 @@ pub(super) struct ProtocolTraceData {
     pub(super) events: Vec<ProtocolTraceEvent>,
 }
 
-pub(super) fn load_protocol_trace(limit: usize) -> Result<ProtocolTraceData> {
-    let path = bmux_config::ConfigPaths::default().protocol_trace_file();
+fn load_protocol_trace_at(path: &std::path::Path, limit: usize) -> Result<ProtocolTraceData> {
     if !path.exists() {
         return Ok(ProtocolTraceData::default());
     }
-    let bytes = std::fs::read(&path)
+    let bytes = std::fs::read(path)
         .with_context(|| format!("failed reading protocol trace file at {}", path.display()))?;
     let file: ProtocolTraceFile = serde_json::from_slice(&bytes)
         .with_context(|| format!("failed parsing protocol trace file at {}", path.display()))?;
@@ -636,7 +732,23 @@ pub(super) fn run_keymap_doctor(as_json: bool) -> Result<u8> {
             BmuxConfig::default()
         }
     };
-    let (runtime_bindings, global_bindings, scroll_bindings) = merged_runtime_keybindings(&config);
+    run_keymap_doctor_with_config(as_json, &config, None)
+}
+
+pub(super) fn run_keymap_doctor_selected(
+    as_json: bool,
+    state: &super::plugin_runtime::RuntimeCommandState,
+) -> Result<u8> {
+    run_keymap_doctor_with_config(as_json, &state.config, Some(&state.registry))
+}
+
+fn run_keymap_doctor_with_config(
+    as_json: bool,
+    config: &BmuxConfig,
+    registry: Option<&bmux_plugin::PluginRegistry>,
+) -> Result<u8> {
+    let (runtime_bindings, global_bindings, scroll_bindings) =
+        merged_keybindings_from_registry(config, registry);
     let resolved_timeout = config
         .keybindings
         .resolve_timeout()
@@ -652,7 +764,7 @@ pub(super) fn run_keymap_doctor(as_json: bool) -> Result<u8> {
     .context("failed to compile keymap")?;
 
     let report = keymap.doctor_report();
-    let attach_effective = effective_attach_keybindings(&config);
+    let attach_effective = effective_attach_keybindings(config);
 
     if as_json {
         let payload = serde_json::json!({
@@ -814,6 +926,41 @@ pub(super) fn run_keymap_explain(key: &str, mode: Option<&str>, as_json: bool) -
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn selected_trace_and_keymap_use_supplied_roots_and_registry() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = ConfigPaths::new(
+            root.path().join("config"),
+            root.path().join("runtime"),
+            root.path().join("data"),
+            root.path().join("state"),
+        );
+        let file = paths.protocol_trace_file();
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(
+            &file,
+            serde_json::to_vec(&super::ProtocolTraceFile {
+                dropped: 19,
+                events: Vec::new(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let trace = super::load_protocol_trace_at(&file, 50).unwrap();
+        assert_eq!(trace.dropped, 19);
+        let mut config = BmuxConfig::default();
+        config
+            .keybindings
+            .runtime
+            .insert("ctrl+x".into(), "selected-action".into());
+        let registry = bmux_plugin::PluginRegistry::new();
+        let (runtime, _, _) = super::merged_keybindings_from_registry(&config, Some(&registry));
+        assert_eq!(
+            runtime.get("ctrl+x").map(String::as_str),
+            Some("selected-action")
+        );
+    }
+
     #[allow(clippy::wildcard_imports)]
     use super::*;
 

@@ -4,27 +4,23 @@
 @shell sh
 @sandbox-config packages/cli/tests/fixtures/playbooks/workspaces_real_attach.toml
 new-session name='bootstrap'
-send-attach key='c'
-# New tabs may have no chrome in this fixture; pane output below is readiness.
-sleep ms=400
+send-attach key='alt+a'
+wait-rendered contains='<active:tab-A_ONE>' timeout=10000
 send-keys keys='printf "\\033[2J\\033[HA_ONE\\n"\r'
 wait-for pattern='A_ONE'
-send-attach key='c'
-# New tabs may have no chrome in this fixture; pane output below is readiness.
-sleep ms=400
+send-attach key='alt+b'
+wait-rendered contains='<active:tab-A_TWO>' timeout=10000
 send-keys keys='printf "\\033[2J\\033[HA_TWO\\n"\r'
 wait-for pattern='A_TWO'
+# A new workspace creates and selects an empty tab-1 context, not a name prompt.
 send-attach key='alt+w'
-wait-rendered contains='workspace-2' timeout=10000
-send-attach key='b'
-send-attach key='enter'
-# New tabs may have no chrome in this fixture; pane output below is readiness.
-sleep ms=400
+wait-rendered contains='<active:tab-1>' timeout=10000
+send-attach key='alt+d'
+wait-rendered contains='<active:tab-B_ONE>' timeout=10000
 send-keys keys='printf "\\033[2J\\033[HB_ONE\\n"\r'
 wait-for pattern='B_ONE'
-send-attach key='c'
-# New tabs may have no chrome in this fixture; pane output below is readiness.
-sleep ms=400
+send-attach key='alt+e'
+wait-rendered contains='<active:tab-B_TWO>' timeout=10000
 send-keys keys='printf "\\033[2J\\033[HB_TWO\\n"\r'
 wait-for pattern='B_TWO'
 send-attach key='alt+l'

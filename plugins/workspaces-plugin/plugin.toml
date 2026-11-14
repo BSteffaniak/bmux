@@ -146,3 +146,26 @@ expose_in_cli = true
 name          = "last-workspace"
 path          = ["workspace", "last"]
 summary       = "Return to the previous workspace"
+
+# Explicit immutable v1 contracts. Route IDs are wire identities, not version
+# syntax: retain legacy names and negotiate their major separately.
+
+[[contracts]]
+interface_id = "workspaces-state"
+major        = 1
+minor        = 0
+
+[[contracts]]
+interface_id = "workspaces-commands"
+major        = 1
+minor        = 0
+
+[[contracts]]
+interface_id = "workspaces-events"
+major        = 1
+minor        = 0
+
+[[contracts]]
+interface_id = "workspaces-activation-v1"
+major        = 1
+minor        = 0

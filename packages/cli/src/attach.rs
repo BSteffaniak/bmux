@@ -2,6 +2,13 @@ use anyhow::Result;
 use bmux_client::BmuxClient;
 use tokio::sync::oneshot;
 
+pub use crate::runtime::attach::frontend_bindings::{
+    FrontendBindingRegistrar, FrontendBindings, FrontendPresentationPort,
+};
+pub use crate::runtime::attach::frontend_presentation::{
+    FrontendPresentationOwner, FrontendPresentations,
+};
+
 pub use crate::runtime::attach::runtime::{
     NativeAttachEvent, NativeAttachHandle, NativeAttachHost, NativeClipboardRequest,
     NativePanePointer, NativePaneZoomRefresh, NativePaneZoomRequestReceipt,

@@ -807,3 +807,36 @@ z         = "plugin:bmux.tabs:zoom-pane"
 "alt+shift+j" = "plugin:bmux.tabs:resize-active-floating-pane --direction down"
 "alt+shift+k" = "plugin:bmux.tabs:resize-active-floating-pane --direction up"
 "alt+shift+l" = "plugin:bmux.tabs:resize-active-floating-pane --direction right"
+
+[[services]]
+capability   = "bmux.tabs.write"
+interface_id = "tabs-placement-v1"
+kind         = "command"
+
+# Explicit immutable v1 contracts. Route IDs are wire identities, not version
+# syntax: retain legacy names and negotiate their major separately.
+
+[[contracts]]
+interface_id = "tabs-catalog-v1"
+major        = 1
+minor        = 0
+
+[[contracts]]
+interface_id = "tabs-state"
+major        = 1
+minor        = 0
+
+[[contracts]]
+interface_id = "tabs-commands"
+major        = 1
+minor        = 0
+
+[[contracts]]
+interface_id = "tabs-events"
+major        = 1
+minor        = 0
+
+[[contracts]]
+interface_id = "tabs-placement-v1"
+major        = 1
+minor        = 0

@@ -30,7 +30,9 @@ impl std::error::Error for BindFailure {
 
 pub struct Listener {
     endpoint: iroh::Endpoint,
-    task: JoinHandle<()>,
+    task: Option<JoinHandle<()>>,
+    stop: tokio::sync::watch::Sender<bool>,
+    cleanup_failure: Option<String>,
 }
 
 impl Listener {
@@ -52,20 +54,26 @@ impl Listener {
             "pairing listener identity mismatch"
         );
         let accepting = endpoint.clone();
+        let (stop, mut stopped) = tokio::sync::watch::channel(false);
         let task = tokio::spawn(async move {
             let mut connections = JoinSet::new();
             loop {
                 tokio::select! {
+                    _ = stopped.changed() => { break; }
                     incoming = accepting.accept(), if connections.len() < 64 => {
                         let Some(incoming) = incoming else { break };
                         let pairing = Arc::clone(&pairing);
                         let admission = Arc::clone(&admission);
                         let backend = backend.clone();
+                        let mut stopped = stopped.clone();
                         connections.spawn(async move {
+                            if *stopped.borrow() { return; }
                             let Ok(Ok(connection)) = tokio::time::timeout(PREAUTH_TIMEOUT, incoming).await else { return };
                             let mut streams = JoinSet::new();
                             loop {
+                                if *stopped.borrow() { connection.close(0u32.into(), b"listener stopping"); break; }
                                 tokio::select! {
+                                    _ = stopped.changed() => { connection.close(0u32.into(), b"listener stopping"); break; }
                                     stream = tokio::time::timeout(Duration::from_secs(15), connection.accept_bi()), if streams.len() < 16 => {
                                         let (send, receive) = match stream {
                                             Ok(Ok(stream)) => stream,
@@ -84,13 +92,22 @@ impl Listener {
                                     _ = streams.join_next(), if !streams.is_empty() => {}
                                 }
                             }
+                            streams.shutdown().await;
                         });
                     }
                     _ = connections.join_next(), if !connections.is_empty() => {}
                 }
             }
+            // Closing admission and draining every child share the same owner.
+            // Never detach authenticated stream work on plugin deactivation.
+            while connections.join_next().await.is_some() {}
         });
-        Ok(Self { endpoint, task })
+        Ok(Self {
+            endpoint,
+            task: Some(task),
+            stop,
+            cleanup_failure: None,
+        })
     }
 
     pub fn targets(&self) -> Vec<String> {
@@ -113,16 +130,31 @@ impl Listener {
         self.endpoint.addr()
     }
 
-    pub async fn stop(&mut self) {
-        self.task.abort();
-        let _ = (&mut self.task).await;
+    pub async fn stop(&mut self) -> Result<(), String> {
+        if let Some(error) = self.cleanup_failure.as_ref() {
+            return Err(error.clone());
+        }
+        self.stop.send_replace(true);
+        if let Some(task) = self.task.as_mut() {
+            if let Err(error) = task.await {
+                let error = format!("listener task failed during drain: {error}");
+                self.task = None;
+                self.cleanup_failure = Some(error.clone());
+                return Err(error);
+            }
+            self.task = None;
+        }
         self.endpoint.close().await;
+        Ok(())
     }
 }
 
 impl Drop for Listener {
     fn drop(&mut self) {
-        self.task.abort();
+        self.stop.send_replace(true);
+        if let Some(task) = self.task.as_ref() {
+            task.abort();
+        }
     }
 }
 

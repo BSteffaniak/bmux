@@ -1,10 +1,19 @@
-execution_class       = "native_fast"
-id                    = "bmux.decoration"
-name                  = "bmux Decoration"
+component_roles = ["backend"]
+contracts = [
+    { interface_id = "decoration-view-v1", major = 1, minor = 0 },
+    { interface_id = "decoration-state", major = 1, minor = 0 },
+    { interface_id = "theme-extension", major = 1, minor = 0 },
+    { interface_id = "decoration-commands", major = 1, minor = 0 },
+    { interface_id = "decoration-input-hooks/v2", major = 2, minor = 0 },
+    { interface_id = "scene-protocol", major = 1, minor = 0 },
+]
+execution_class = "native_fast"
+id = "bmux.decoration"
+name = "bmux Decoration"
 provided_capabilities = ["bmux.decoration.read", "bmux.decoration.write"]
-provided_features     = ["bmux.decoration"]
+provided_features = ["bmux.decoration"]
 required_capabilities = ["bmux.events.subscribe"]
-version               = "0.0.1-alpha.0"
+version = "0.0.1-alpha.0"
 
 [[dependencies]]
 plugin_id   = "bmux.pane_runtime"

@@ -516,7 +516,7 @@ mod tests {
             .unwrap();
         assert!(client.result(Duration::from_secs(3)).await.is_err());
         client.close().await;
-        listener.stop().await;
+        listener.stop().await.unwrap();
     }
 
     #[tokio::test]
@@ -577,7 +577,7 @@ mod tests {
         assert!(
             matches!(bmux_ipc::decode::<Request>(&envelope.payload).unwrap(), Request::AdmitStream { admission_version: 1, ticket } if ticket.len() == 32)
         );
-        listener.stop().await;
+        listener.stop().await.unwrap();
         // Stop must cancel established bridge tasks, not only future accepts.
         let closed =
             tokio::time::timeout(Duration::from_secs(2), backend_stream.recv_envelope()).await;
@@ -645,6 +645,7 @@ mod tests {
                     artifact_sha256: hash,
                 },
             )]),
+            host_service_port: None,
             auxiliary_executable_errors: std::collections::BTreeMap::new(),
         };
         bmux_sessions_plugin::SessionsPlugin
@@ -844,6 +845,7 @@ mod tests {
             caller_client_id: Some(host.client_id().0),
             cancellation: bmux_plugin_sdk::CancellationToken::default(),
             host_kernel_bridge: Some(fixture_bridge(host)),
+            host_service_port: None,
         }
     }
 
@@ -923,26 +925,116 @@ mod tests {
             if operation == "check" || interface.starts_with("pane-runtime") {
                 server.approve_admitted_route(route).unwrap();
             }
-            server.register_checked_service_handler_with_metadata(capability, kind, interface, operation, move |route, host, payload| {
-                let paths = paths.clone(); let pairing = Arc::clone(&pairing); let storage = Arc::clone(&storage);
-                async move {
-                    tokio::task::spawn_blocking(move || {
-                        let payload = bmux_plugin_sdk::service_contract::decode_for(interface, contract, &payload)?.to_vec();
-                        let context = native_fixture_context(&paths, &route, &host, payload);
-                        let _router = bmux_plugin::test_support::install_test_service_router(Arc::new(
-                            // TestServiceRouter fixes the SDK error ABI; it cannot be boxed here.
-                            #[allow(clippy::result_large_err)]
-                            move |caller, _, capability, kind, interface, operation, payload| {
-                            let result = fixture_nested_call(&host, &pairing, &storage, caller, (capability, kind, interface, operation), &payload);
-                            result.map_err(|_| bmux_plugin_sdk::PluginError::ServiceProtocol { details: "fixture nested dispatch failed".into() })
-                        }));
-                        let response = if interface.starts_with("pane-runtime") { bmux_pane_runtime_plugin::PaneRuntimePlugin.invoke_service(context) } else { bmux_permissions_plugin::PermissionsPlugin.invoke_service(context) };
-                        anyhow::ensure!(response.error.is_none(), "real handler rejected: {:?}", response.error);
-                        Ok::<_, anyhow::Error>(bmux_plugin_sdk::service_contract::encode_response(&response.payload).into())
-                    }).await?
-                }
-            }).unwrap();
+            server
+                .register_checked_service_handler_with_metadata(
+                    capability,
+                    kind,
+                    interface,
+                    operation,
+                    move |route, host, payload| {
+                        let paths = paths.clone();
+                        let pairing = Arc::clone(&pairing);
+                        let storage = Arc::clone(&storage);
+                        async move {
+                            tokio::task::spawn_blocking(move || {
+                                let payload = bmux_plugin_sdk::service_contract::decode_for(
+                                    interface, contract, &payload,
+                                )?
+                                .to_vec();
+                                let mut context =
+                                    native_fixture_context(&paths, &route, &host, payload);
+                                let selected_caller = context.plugin_id.clone();
+                                context.host_service_port = Some(fixture_selected_port(
+                                    host,
+                                    pairing,
+                                    storage,
+                                    selected_caller,
+                                ));
+                                let response = if interface.starts_with("pane-runtime") {
+                                    bmux_pane_runtime_plugin::PaneRuntimePlugin
+                                        .invoke_service(context)
+                                } else {
+                                    bmux_permissions_plugin::PermissionsPlugin::default()
+                                        .invoke_service(context)
+                                };
+                                anyhow::ensure!(
+                                    response.error.is_none(),
+                                    "real handler rejected: {:?}",
+                                    response.error
+                                );
+                                Ok::<_, anyhow::Error>(
+                                    bmux_plugin_sdk::service_contract::encode_response(
+                                        &response.payload,
+                                    )
+                                    .into(),
+                                )
+                            })
+                            .await?
+                        }
+                    },
+                )
+                .unwrap();
         }
+    }
+
+    fn fixture_selected_port(
+        host: bmux_server::ServiceInvokeContext,
+        pairing: Arc<PairingAuthority>,
+        storage: Arc<std::sync::Mutex<std::collections::BTreeMap<String, Vec<u8>>>>,
+        caller: String,
+    ) -> bmux_plugin_sdk::PluginHostServices {
+        type Dispatch = Arc<
+            dyn Fn(bmux_plugin_sdk::HostServiceOwnedRequest) -> bmux_plugin_sdk::HostServiceFuture
+                + Send
+                + Sync,
+        >;
+        let dispatch: Dispatch = Arc::new(move |request| {
+            let host = host.clone();
+            let pairing = pairing.clone();
+            let storage = storage.clone();
+            let caller = caller.clone();
+            Box::pin(async move {
+                tokio::task::spawn_blocking(move || {
+                    fixture_nested_call(
+                        &host,
+                        &pairing,
+                        &storage,
+                        &caller,
+                        (
+                            &request.capability,
+                            request.kind,
+                            &request.interface,
+                            &request.operation,
+                        ),
+                        &request.payload,
+                    )
+                    .map_err(|error| {
+                        bmux_plugin_sdk::PluginError::ServiceProtocol {
+                            details: format!("fixture selected nested dispatch failed: {error:#}"),
+                        }
+                    })
+                })
+                .await
+                .map_err(|error| {
+                    bmux_plugin_sdk::PluginError::ServiceProtocol {
+                        details: format!(
+                            "fixture nested worker did not settle: {error}; do not replay"
+                        ),
+                    }
+                })?
+            })
+        });
+        let synchronous = dispatch.clone();
+        bmux_plugin_sdk::PluginHostServices::new(
+            // SDK callback ABI returns PluginError by value.
+            #[allow(clippy::result_large_err)]
+            move |request| {
+                let request = bmux_plugin_sdk::HostServiceOwnedRequest::from(request);
+                let runtime = tokio::runtime::Handle::current();
+                tokio::task::block_in_place(|| runtime.block_on(synchronous(request)))
+            },
+        )
+        .with_async(move |request| dispatch(request))
     }
 
     fn fixture_nested_call(
@@ -975,6 +1067,43 @@ mod tests {
                     .unwrap()
                     .insert(format!("{caller}:{}", request.key.as_str()), request.value);
                 Ok(encode_service_message(&())?)
+            }
+            ("clients-identity/v1", "current-stream-provenance") => {
+                use bmux_clients_plugin_api::clients_identity::{self, StreamProvenance};
+                use bmux_plugin_sdk::PluginContract;
+                let contract =
+                    <bmux_clients_plugin_api::Contract as PluginContract>::service_contract_for(
+                        interface,
+                    )
+                    .ok_or_else(|| anyhow::anyhow!("missing clients identity contract"))?;
+                decode_service_message::<()>(bmux_plugin_sdk::service_contract::decode_for(
+                    interface, contract, payload,
+                )?)?;
+                // Query the actual admitted server context. Pairing payloads and
+                // caller-provided subject IDs cannot establish provenance.
+                let bytes = tokio::runtime::Handle::current().block_on(
+                    host.execute_raw(bmux_ipc::encode(&Request::CurrentStreamProvenance)?),
+                )?;
+                let Response::Ok(ResponsePayload::CurrentStreamProvenance { provenance }) =
+                    bmux_ipc::decode(&bytes)?
+                else {
+                    anyhow::bail!("authenticated fixture provenance unavailable");
+                };
+                let value = match provenance {
+                    bmux_plugin::StreamOrigin::HostInternal => StreamProvenance::HostInternal,
+                    bmux_plugin::StreamOrigin::Local => StreamProvenance::Local,
+                    bmux_plugin::StreamOrigin::Admitted {
+                        subject_id,
+                        lease_id,
+                    } => StreamProvenance::Admitted {
+                        subject_id,
+                        lease_id,
+                    },
+                    bmux_plugin::StreamOrigin::Invalid => StreamProvenance::Invalid,
+                };
+                Ok(bmux_plugin_sdk::service_contract::encode_response(
+                    &encode_service_message(&Ok::<_, clients_identity::IdentityError>(value))?,
+                ))
             }
             ("pairing-state", "check-device-access") => {
                 let request: bmux_connections_plugin_api::pairing_state::client::CheckDeviceAccessRequest = decode_service_message(bmux_plugin_sdk::service_contract::decode_for(
@@ -1411,7 +1540,7 @@ mod tests {
                 .await
                 .is_err()
         );
-        listener.stop().await;
+        listener.stop().await.unwrap();
         server.request_shutdown();
         task.await.unwrap().unwrap();
     }
@@ -1549,7 +1678,7 @@ mod tests {
             .redeem(&request.invitation_id, &request.secret, &request.signature)
             .unwrap();
         assert_eq!(valid.device_key, device.public_key());
-        listener.stop().await;
+        listener.stop().await.unwrap();
         endpoint.close().await;
     }
 }

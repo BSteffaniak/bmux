@@ -15,12 +15,12 @@ mod mirror;
 mod platform;
 mod presentation;
 mod profiles;
-pub use controller::DeliveryCounters;
+pub use controller::{DeliveryCounters, IndicatorPort};
 pub use presentation::BroadcastPresentation;
 
 /// In-process diagnostics only: no terminal writes and no controller startup.
 pub fn delivery_counters() -> Option<DeliveryCounters> {
-    let registry = CONTROLLER.get()?.lock().ok()?;
+    let registry = LEGACY.get()?.registry.lock().ok()?;
     registry.controller.as_ref()?.delivery_counters().ok()
 }
 mod guided;
@@ -51,137 +51,123 @@ impl Default for Registry {
         }
     }
 }
-static CONTROLLER: OnceLock<Mutex<Registry>> = OnceLock::new();
-fn controller() -> Result<Arc<controller::Controller>, ServiceResponse> {
-    let mut current = CONTROLLER
-        .get_or_init(Mutex::default)
-        .lock()
-        .map_err(|_| error("controller_unavailable"))?;
-    if !current.enabled {
-        return Err(error("controller_stopped"));
-    }
-    if let Some(controller) = current.controller.as_ref() {
-        return Ok(controller.clone());
-    }
-    let next = Arc::new(controller::Controller::new().map_err(error)?);
-    current.controller = Some(next.clone());
-    Ok(next)
+static LEGACY: OnceLock<BroadcastPlugin> = OnceLock::new();
+fn legacy() -> &'static BroadcastPlugin {
+    LEGACY.get_or_init(|| BroadcastPlugin::with_indicator(Arc::new(controller::LegacyIndicator)))
 }
 fn error(code: &'static str) -> ServiceResponse {
     ServiceResponse::error(code, "broadcast operation rejected")
 }
-fn authenticated(context: &NativeServiceContext) -> Result<uuid::Uuid, ServiceResponse> {
-    authorization::check(
-        context
-            .caller_client_id
-            .ok_or_else(|| error("authentication_required"))?,
-    )
-    .map_err(error)
+#[derive(Clone)]
+pub struct BroadcastPlugin {
+    registry: Arc<Mutex<Registry>>,
+    authorization: Arc<authorization::Authorization>,
+    indicator: Arc<dyn IndicatorPort>,
 }
-#[derive(Default)]
-pub struct BroadcastPlugin;
+impl Default for BroadcastPlugin {
+    fn default() -> Self {
+        legacy().clone()
+    }
+}
+impl BroadcastPlugin {
+    /// Diagnostics for this exact loaded instance; shared hosts must use this
+    /// rather than the legacy process facade.
+    pub fn delivery_counters(&self) -> Option<DeliveryCounters> {
+        self.registry
+            .lock()
+            .ok()?
+            .controller
+            .as_ref()?
+            .delivery_counters()
+            .ok()
+    }
+
+    pub fn with_indicator(indicator: Arc<dyn IndicatorPort>) -> Self {
+        Self {
+            registry: Arc::new(Mutex::new(Registry::default())),
+            authorization: Arc::new(authorization::Authorization::default()),
+            indicator,
+        }
+    }
+    fn controller(&self) -> Result<Arc<controller::Controller>, ServiceResponse> {
+        let mut registry = self
+            .registry
+            .lock()
+            .map_err(|_| error("controller_unavailable"))?;
+        if !registry.enabled {
+            return Err(error("controller_stopped"));
+        }
+        if let Some(controller) = registry.controller.as_ref() {
+            return Ok(Arc::clone(controller));
+        }
+        let next = Arc::new(
+            controller::Controller::with_indicator(Arc::clone(&self.indicator)).map_err(error)?,
+        );
+        registry.controller = Some(Arc::clone(&next));
+        Ok(next)
+    }
+    fn authenticated(&self, context: &NativeServiceContext) -> Result<uuid::Uuid, ServiceResponse> {
+        self.authorization
+            .check(
+                context
+                    .caller_client_id
+                    .ok_or_else(|| error("authentication_required"))?,
+            )
+            .map_err(error)
+    }
+    fn activate_owner(&self) -> Result<(), PluginCommandError> {
+        self.registry
+            .lock()
+            .map_err(|_| PluginCommandError::failed("broadcast activation unavailable"))?
+            .enabled = true;
+        self.indicator.update("stopped", "offline");
+        Ok(())
+    }
+    fn deactivate_owner(&self) -> Result<(), PluginCommandError> {
+        let controller = {
+            let mut registry = self
+                .registry
+                .lock()
+                .map_err(|_| PluginCommandError::failed("broadcast shutdown unavailable"))?;
+            registry.enabled = false;
+            registry.controller.clone()
+        };
+        // Retain the controller and relay on unacknowledged stop.
+        if let Some(controller) = controller {
+            controller
+                .shutdown_checked()
+                .map_err(PluginCommandError::failed)?;
+        }
+        self.authorization
+            .revoke()
+            .map_err(PluginCommandError::failed)?;
+        self.registry
+            .lock()
+            .map_err(|_| PluginCommandError::failed("broadcast shutdown unavailable"))?
+            .controller = None;
+        self.indicator.update("stopped", "offline");
+        self.indicator.remove();
+        Ok(())
+    }
+}
 impl RustPlugin for BroadcastPlugin {
     type Contract = bmux_broadcast_plugin_api::Contract;
     fn activate(
         &mut self,
         _context: bmux_plugin_sdk::NativeLifecycleContext,
     ) -> Result<i32, PluginCommandError> {
-        CONTROLLER
-            .get_or_init(Mutex::default)
-            .lock()
-            .map_err(|_| PluginCommandError::failed("broadcast activation unavailable"))?
-            .enabled = true;
-        indicator::update("stopped", "offline");
+        self.activate_owner()?;
         Ok(bmux_plugin_sdk::EXIT_OK)
     }
     fn deactivate(
         &mut self,
         _context: bmux_plugin_sdk::NativeLifecycleContext,
     ) -> Result<i32, PluginCommandError> {
-        authorization::revoke();
-        if let Some(current) = CONTROLLER.get() {
-            let controller = {
-                let mut registry = current
-                    .lock()
-                    .map_err(|_| PluginCommandError::failed("broadcast shutdown unavailable"))?;
-                registry.enabled = false;
-                registry.controller.take()
-            };
-            if let Some(controller) = controller {
-                controller.shutdown();
-            }
-        }
-        indicator::update("stopped", "offline");
-        indicator::remove();
+        self.deactivate_owner()?;
         Ok(bmux_plugin_sdk::EXIT_OK)
     }
     fn invoke_service(&self, context: NativeServiceContext) -> ServiceResponse {
-        bmux_plugin_sdk::route_service!(context, {
-            "broadcast-diagnostics-v1", "status" => |_r: (), ctx| { authenticated(ctx)?; controller()?.diagnostics().map_err(error) },
-            "broadcast-diagnostics-v1", "events" => |r: bmux_broadcast_plugin_api::broadcast_diagnostics_v1::client::EventsRequest, ctx| { authenticated(ctx)?; controller()?.events(r.last).map_err(error) },
-            "broadcast-presentation-v1", "status" => |_r: (), _ctx| { Ok::<_, ServiceResponse>(indicator::status()) },
-            "broadcast-turnkey-v1", "register" => |r: turnkey::client::RegisterRequest, ctx| { let owner = authenticated(ctx)?; controller()?.register_label(owner, &r.source_id, &r.label).map_err(error) },
-            "broadcast-turnkey-v1", "sources" => |_r: (), ctx| { authenticated(ctx)?; controller()?.sources().map_err(error) },
-            "broadcast-turnkey-v1", "status" => |_r: (), ctx| { authenticated(ctx)?; controller()?.turnkey_status().map_err(error) },
-            "broadcast-turnkey-v1", "start-profile" => |r: turnkey::client::StartProfileRequest, ctx| {
-                let owner = authenticated(ctx)?;
-                let profile = profiles::selected(std::path::Path::new(&ctx.connection.config_dir), r.profile.as_deref()).map_err(error)?;
-                let relay = relay::Relay::new(&profile.endpoint, &profile.channel, &profile.credential_file).map_err(error)?;
-                let url = guided::viewer_url(&profile.endpoint, &profile.channel).map_err(error)?;
-                controller()?.start_owned(owner, &r.source_id, r.profile, relay, url, std::path::Path::new(&ctx.connection.state_dir)).map_err(error)
-            },
-            "broadcast-turnkey-v1", "start-profile-publication" => |r: turnkey::client::StartProfilePublicationRequest, ctx| {
-                authenticated(ctx)?;
-                let profile = profiles::selected(std::path::Path::new(&ctx.connection.config_dir), r.profile.as_deref()).map_err(error)?;
-                let relay = relay::Relay::new(&profile.endpoint, &profile.channel, &profile.credential_file).map_err(error)?;
-                let url = guided::viewer_url(&profile.endpoint, &profile.channel).map_err(error)?;
-                controller()?.start_profile_publication(&r.source_id, relay, url, std::path::Path::new(&ctx.connection.state_dir)).map_err(error)
-            },
-            "broadcast-turnkey-v1", "stop-owned" => |r: turnkey::client::StopOwnedRequest, ctx| { let owner = authenticated(ctx)?; controller()?.stop_owned(owner, &r.token).map_err(error) },
-            "broadcast-control-v1", "prepare-local" => |_r: (), ctx| {
-                if ctx.caller_client_id.is_none() { return Err(error("authentication_required")); }
-                if !CONTROLLER.get_or_init(Mutex::default).lock().map_err(|_| error("controller_unavailable"))?.enabled { return Err(error("controller_stopped")); }
-                authorization::initialize(std::path::Path::new(&ctx.connection.runtime_dir)).map_err(error)?;
-                Ok::<_, ServiceResponse>(true)
-            },
-            "broadcast-control-v1", "authorize" => |r: control::client::AuthorizeRequest, ctx| {
-                let caller = ctx.caller_client_id.ok_or_else(|| error("authentication_required"))?;
-                if !CONTROLLER.get_or_init(Mutex::default).lock().map_err(|_| error("controller_unavailable"))?.enabled { return Err(error("controller_stopped")); }
-                authorization::authorize(caller, &r.local_proof).map_err(error)
-            },
-            "broadcast-control-v1", "start" => |r: control::client::StartRequest, ctx| {
-                let owner = authenticated(ctx)?;
-                let relay = relay::Relay::new(&r.endpoint, &r.channel, std::path::Path::new(&r.credential_file)).map_err(error)?;
-                controller()?.control_owned(owner, controller::Control::Start(Box::new(relay), r.source_id)).map_err(error)
-            },
-            "broadcast-control-v1", "pause" => |_r: (), ctx| { let owner = authenticated(ctx)?; controller()?.control_owned(owner, controller::Control::Pause).map_err(error) },
-            "broadcast-control-v1", "resume" => |_r: (), ctx| { let owner = authenticated(ctx)?; controller()?.control_owned(owner, controller::Control::Resume).map_err(error) },
-            "broadcast-control-v1", "stop" => |_r: (), ctx| { let owner = authenticated(ctx)?; controller()?.control_owned(owner, controller::Control::Stop).map_err(error) },
-            "broadcast-control-v1", "start-publication" => |r: control::client::StartPublicationRequest, ctx| {
-                authenticated(ctx)?;
-                let relay = relay::Relay::new(&r.endpoint, &r.channel, std::path::Path::new(&r.credential_file)).map_err(error)?;
-                controller()?.control_publication(controller::Control::Start(Box::new(relay), r.source_id)).map_err(error)
-            },
-            "broadcast-control-v1", "pause-publication" => |_r: (), ctx| { authenticated(ctx)?; controller()?.control_publication(controller::Control::Pause).map_err(error) },
-            "broadcast-control-v1", "resume-publication" => |_r: (), ctx| { authenticated(ctx)?; controller()?.control_publication(controller::Control::Resume).map_err(error) },
-            "broadcast-control-v1", "stop-publication" => |_r: (), ctx| { authenticated(ctx)?; controller()?.control_publication(controller::Control::Stop).map_err(error) },
-            "broadcast-control-v1", "source-publication" => |r: control::client::SourcePublicationRequest, ctx| { authenticated(ctx)?; controller()?.control_publication(controller::Control::Source(r.source_id)).map_err(error) },
-            "broadcast-control-v1", "status" => |_r: (), ctx| { authenticated(ctx)?; controller()?.status().map_err(error) },
-            "broadcast-control-v1", "terminal" => |r: control::client::TerminalRequest, ctx| {
-                let owner = authenticated(ctx)?;
-                let target = uuid::Uuid::parse_str(&r.session_id).map_err(|_| error("invalid_target"))?;
-                let cols = u16::try_from(r.cols).map_err(|_| error("viewport_bound"))?;
-                let rows = u16::try_from(r.rows).map_err(|_| error("viewport_bound"))?;
-                let selection = terminal::RuntimeSelection { executable: r.executable.into(), sha256: r.sha256, version: r.runtime_version, paths: bmux_config::ConfigPaths::new(ctx.connection.config_dir.clone().into(), ctx.connection.runtime_dir.clone().into(), ctx.connection.data_dir.clone().into(), ctx.connection.state_dir.clone().into()) };
-                let controller = controller()?;
-                std::thread::scope(|scope| scope.spawn(move || controller.terminal(owner, r.source_id, selection, target, cols, rows)).join().map_err(|_| "executor_unavailable")?).map_err(error)
-            },
-            "broadcast-control-v1", "source" => |r: control::client::SourceRequest, ctx| { let owner = authenticated(ctx)?; controller()?.control_owned(owner, controller::Control::Source(r.source_id)).map_err(error) },
-            "broadcast-output-v1", "register" => |r: output::client::RegisterRequest, ctx| { let owner = authenticated(ctx)?; controller()?.source(owner, &r.source_id, true).map_err(error) },
-            "broadcast-output-v1", "poll" => |r: output::client::PollRequest, ctx| { let owner = authenticated(ctx)?; controller()?.source(owner, &r.source_id, false).map_err(error) },
-            "broadcast-output-v1", "publish" => |r: output::client::PublishRequest, ctx| { let owner = authenticated(ctx)?; controller()?.publish(owner, &r.source_id, r.refresh, r.frame).map_err(error) },
-            "broadcast-output-v1", "unregister" => |r: output::client::UnregisterRequest, ctx| { let owner = authenticated(ctx)?; controller()?.unregister(owner, &r.source_id).map_err(error) },
-        })
+        self.service(context)
     }
     fn run_command(&mut self, context: NativeCommandContext) -> Result<i32, PluginCommandError> {
         if context.invocation_source
@@ -211,6 +197,76 @@ impl RustPlugin for BroadcastPlugin {
                 .spawn(move || run_command(context))
                 .join()
                 .map_err(|_| PluginCommandError::failed("broadcast caller failed"))?
+        })
+    }
+}
+impl BroadcastPlugin {
+    fn service(&self, context: NativeServiceContext) -> ServiceResponse {
+        bmux_plugin_sdk::route_service!(context, {
+            "broadcast-diagnostics-v1", "status" => |_r: (), ctx| { self.authenticated(ctx)?; self.controller()?.diagnostics().map_err(error) },
+            "broadcast-diagnostics-v1", "events" => |r: bmux_broadcast_plugin_api::broadcast_diagnostics_v1::client::EventsRequest, ctx| { self.authenticated(ctx)?; self.controller()?.events(r.last).map_err(error) },
+            "broadcast-presentation-v1", "status" => |_r: (), _ctx| { Ok::<_, ServiceResponse>(self.indicator.status()) },
+            "broadcast-turnkey-v1", "register" => |r: turnkey::client::RegisterRequest, ctx| { let owner = self.authenticated(ctx)?; self.controller()?.register_label(owner, &r.source_id, &r.label).map_err(error) },
+            "broadcast-turnkey-v1", "sources" => |_r: (), ctx| { self.authenticated(ctx)?; self.controller()?.sources().map_err(error) },
+            "broadcast-turnkey-v1", "status" => |_r: (), ctx| { self.authenticated(ctx)?; self.controller()?.turnkey_status().map_err(error) },
+            "broadcast-turnkey-v1", "start-profile" => |r: turnkey::client::StartProfileRequest, ctx| {
+                let owner = self.authenticated(ctx)?;
+                let profile = profiles::selected(std::path::Path::new(&ctx.connection.config_dir), r.profile.as_deref()).map_err(error)?;
+                let relay = relay::Relay::new(&profile.endpoint, &profile.channel, &profile.credential_file).map_err(error)?;
+                let url = guided::viewer_url(&profile.endpoint, &profile.channel).map_err(error)?;
+                self.controller()?.start_owned(owner, &r.source_id, r.profile, relay, url, std::path::Path::new(&ctx.connection.state_dir)).map_err(error)
+            },
+            "broadcast-turnkey-v1", "start-profile-publication" => |r: turnkey::client::StartProfilePublicationRequest, ctx| {
+                self.authenticated(ctx)?;
+                let profile = profiles::selected(std::path::Path::new(&ctx.connection.config_dir), r.profile.as_deref()).map_err(error)?;
+                let relay = relay::Relay::new(&profile.endpoint, &profile.channel, &profile.credential_file).map_err(error)?;
+                let url = guided::viewer_url(&profile.endpoint, &profile.channel).map_err(error)?;
+                self.controller()?.start_profile_publication(&r.source_id, relay, url, std::path::Path::new(&ctx.connection.state_dir)).map_err(error)
+            },
+            "broadcast-turnkey-v1", "stop-owned" => |r: turnkey::client::StopOwnedRequest, ctx| { let owner = self.authenticated(ctx)?; self.controller()?.stop_owned(owner, &r.token).map_err(error) },
+            "broadcast-control-v1", "prepare-local" => |_r: (), ctx| {
+                if ctx.caller_client_id.is_none() { return Err(error("authentication_required")); }
+                if !self.registry.lock().map_err(|_| error("controller_unavailable"))?.enabled { return Err(error("controller_stopped")); }
+                self.authorization.initialize(std::path::Path::new(&ctx.connection.runtime_dir)).map_err(error)?;
+                Ok::<_, ServiceResponse>(true)
+            },
+            "broadcast-control-v1", "authorize" => |r: control::client::AuthorizeRequest, ctx| {
+                let caller = ctx.caller_client_id.ok_or_else(|| error("authentication_required"))?;
+                if !self.registry.lock().map_err(|_| error("controller_unavailable"))?.enabled { return Err(error("controller_stopped")); }
+                self.authorization.authorize(caller, &r.local_proof).map_err(error)
+            },
+            "broadcast-control-v1", "start" => |r: control::client::StartRequest, ctx| {
+                let owner = self.authenticated(ctx)?;
+                let relay = relay::Relay::new(&r.endpoint, &r.channel, std::path::Path::new(&r.credential_file)).map_err(error)?;
+                self.controller()?.control_owned(owner, controller::Control::Start(Box::new(relay), r.source_id)).map_err(error)
+            },
+            "broadcast-control-v1", "pause" => |_r: (), ctx| { let owner = self.authenticated(ctx)?; self.controller()?.control_owned(owner, controller::Control::Pause).map_err(error) },
+            "broadcast-control-v1", "resume" => |_r: (), ctx| { let owner = self.authenticated(ctx)?; self.controller()?.control_owned(owner, controller::Control::Resume).map_err(error) },
+            "broadcast-control-v1", "stop" => |_r: (), ctx| { let owner = self.authenticated(ctx)?; self.controller()?.control_owned(owner, controller::Control::Stop).map_err(error) },
+            "broadcast-control-v1", "start-publication" => |r: control::client::StartPublicationRequest, ctx| {
+                self.authenticated(ctx)?;
+                let relay = relay::Relay::new(&r.endpoint, &r.channel, std::path::Path::new(&r.credential_file)).map_err(error)?;
+                self.controller()?.control_publication(controller::Control::Start(Box::new(relay), r.source_id)).map_err(error)
+            },
+            "broadcast-control-v1", "pause-publication" => |_r: (), ctx| { self.authenticated(ctx)?; self.controller()?.control_publication(controller::Control::Pause).map_err(error) },
+            "broadcast-control-v1", "resume-publication" => |_r: (), ctx| { self.authenticated(ctx)?; self.controller()?.control_publication(controller::Control::Resume).map_err(error) },
+            "broadcast-control-v1", "stop-publication" => |_r: (), ctx| { self.authenticated(ctx)?; self.controller()?.control_publication(controller::Control::Stop).map_err(error) },
+            "broadcast-control-v1", "source-publication" => |r: control::client::SourcePublicationRequest, ctx| { self.authenticated(ctx)?; self.controller()?.control_publication(controller::Control::Source(r.source_id)).map_err(error) },
+            "broadcast-control-v1", "status" => |_r: (), ctx| { self.authenticated(ctx)?; self.controller()?.status().map_err(error) },
+            "broadcast-control-v1", "terminal" => |r: control::client::TerminalRequest, ctx| {
+                let owner = self.authenticated(ctx)?;
+                let target = uuid::Uuid::parse_str(&r.session_id).map_err(|_| error("invalid_target"))?;
+                let cols = u16::try_from(r.cols).map_err(|_| error("viewport_bound"))?;
+                let rows = u16::try_from(r.rows).map_err(|_| error("viewport_bound"))?;
+                let selection = terminal::RuntimeSelection { executable: r.executable.into(), sha256: r.sha256, version: r.runtime_version, paths: bmux_config::ConfigPaths::new(ctx.connection.config_dir.clone().into(), ctx.connection.runtime_dir.clone().into(), ctx.connection.data_dir.clone().into(), ctx.connection.state_dir.clone().into()) };
+                let controller = self.controller()?;
+                std::thread::scope(|scope| scope.spawn(move || controller.terminal(owner, r.source_id, selection, target, cols, rows)).join().map_err(|_| "executor_unavailable")?).map_err(error)
+            },
+            "broadcast-control-v1", "source" => |r: control::client::SourceRequest, ctx| { let owner = self.authenticated(ctx)?; self.controller()?.control_owned(owner, controller::Control::Source(r.source_id)).map_err(error) },
+            "broadcast-output-v1", "register" => |r: output::client::RegisterRequest, ctx| { let owner = self.authenticated(ctx)?; self.controller()?.source(owner, &r.source_id, true).map_err(error) },
+            "broadcast-output-v1", "poll" => |r: output::client::PollRequest, ctx| { let owner = self.authenticated(ctx)?; self.controller()?.source(owner, &r.source_id, false).map_err(error) },
+            "broadcast-output-v1", "publish" => |r: output::client::PublishRequest, ctx| { let owner = self.authenticated(ctx)?; self.controller()?.publish(owner, &r.source_id, r.refresh, r.frame).map_err(error) },
+            "broadcast-output-v1", "unregister" => |r: output::client::UnregisterRequest, ctx| { let owner = self.authenticated(ctx)?; self.controller()?.unregister(owner, &r.source_id).map_err(error) },
         })
     }
 }
@@ -251,4 +307,114 @@ fn run_command(mut context: NativeCommandContext) -> Result<i32, PluginCommandEr
         Ok(bmux_plugin_sdk::EXIT_OK)
     })
 }
+impl bmux_plugin_sdk::definition::PluginInstance for BroadcastPlugin {
+    fn service_contract_for(&self, interface: &str) -> Option<&'static [u8]> {
+        <bmux_broadcast_plugin_api::Contract as bmux_plugin_sdk::PluginContract>::service_contract_for(interface)
+    }
+
+    fn activate(
+        &self,
+        _context: bmux_plugin_sdk::definition::PluginLifecycleContext,
+    ) -> bmux_plugin_sdk::definition::PluginFuture<'_, bmux_plugin_sdk::definition::PluginResult<()>>
+    {
+        Box::pin(async move { self.activate_owner() })
+    }
+    fn deactivate(
+        &self,
+        _context: bmux_plugin_sdk::definition::PluginLifecycleContext,
+    ) -> bmux_plugin_sdk::definition::PluginFuture<'_, bmux_plugin_sdk::definition::PluginResult<()>>
+    {
+        let owner = self.clone();
+        Box::pin(async move {
+            tokio::runtime::Handle::try_current().map_err(|_| {
+                PluginCommandError::unavailable("broadcast cleanup requires host async runtime")
+            })?;
+            tokio::task::spawn_blocking(move || owner.deactivate_owner())
+                .await
+                .map_err(|_| PluginCommandError::failed("broadcast cleanup task panicked"))?
+        })
+    }
+    fn invoke(
+        &self,
+        call: bmux_plugin_sdk::definition::PluginCallContext,
+        context: NativeServiceContext,
+    ) -> bmux_plugin_sdk::definition::PluginFuture<
+        '_,
+        bmux_plugin_sdk::definition::PluginResult<ServiceResponse>,
+    > {
+        Box::pin(async move {
+            if call.cancellation.is_cancelled() {
+                return Err(PluginCommandError::unavailable(
+                    "broadcast invocation cancelled",
+                ));
+            }
+            Ok(self.service(context))
+        })
+    }
+    fn command(
+        &self,
+        call: bmux_plugin_sdk::definition::PluginCallContext,
+        context: NativeCommandContext,
+    ) -> bmux_plugin_sdk::definition::PluginFuture<'_, bmux_plugin_sdk::definition::CommandOutcome>
+    {
+        Box::pin(async move {
+            if call.cancellation.is_cancelled() {
+                return Err(PluginCommandError::unavailable(
+                    "broadcast command cancelled",
+                ))
+                .into();
+            }
+            // Same command workflow; no new domain transport client or ABI.
+            std::thread::scope(|scope| {
+                scope
+                    .spawn(move || run_command(context))
+                    .join()
+                    .unwrap_or_else(|_| Err(PluginCommandError::failed("broadcast caller failed")))
+            })
+            .into()
+        })
+    }
+}
+pub fn plugin_definition(
+    indicator: Arc<dyn IndicatorPort>,
+) -> bmux_plugin_sdk::definition::PluginDefinition {
+    use bmux_plugin_sdk::definition::{PluginDefinition, PluginInstance};
+    PluginDefinition::new(definition_metadata(), move |_scope| {
+        Ok(
+            Arc::new(BroadcastPlugin::with_indicator(Arc::clone(&indicator)))
+                as Arc<dyn PluginInstance>,
+        )
+    })
+}
+
 bmux_plugin_sdk::export_plugin!(BroadcastPlugin, include_str!("../plugin.toml"));
+
+fn definition_metadata() -> bmux_plugin_sdk::definition::PluginMetadata {
+    bmux_plugin_sdk::definition::PluginDefinition::from_rust_plugin::<BroadcastPlugin>(
+        include_str!("../plugin.toml"),
+        vec![
+            bmux_plugin_sdk::definition::ComponentRole::Backend,
+            bmux_plugin_sdk::definition::ComponentRole::Frontend,
+        ],
+    )
+    .expect("plugin manifest must define valid canonical metadata")
+    .metadata
+}
+
+#[cfg(test)]
+mod canonical_metadata_tests {
+    #[test]
+    fn embedded_manifest_matches_definition_metadata() {
+        let definition = bmux_plugin_sdk::definition::PluginDefinition::new(
+            super::definition_metadata(),
+            |_scope| {
+                Err(bmux_plugin_sdk::PluginCommandError::unavailable(
+                    "metadata-only regression",
+                ))
+            },
+        );
+        definition
+            .validate()
+            .expect("canonical embedded identity must validate");
+    }
+}

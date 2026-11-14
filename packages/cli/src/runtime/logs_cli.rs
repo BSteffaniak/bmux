@@ -8,7 +8,14 @@ use tracing::Level;
 use super::{EFFECTIVE_LOG_LEVEL, active_log_file_path};
 
 pub(super) fn run_logs_path(as_json: bool) -> Result<u8> {
-    let path = active_log_file_path();
+    print_logs_path(as_json, &active_log_file_path())
+}
+
+pub(super) fn run_logs_path_selected(as_json: bool, paths: &ConfigPaths) -> Result<u8> {
+    print_logs_path(as_json, &super::logs_watch::active_log_file_path_at(paths))
+}
+
+fn print_logs_path(as_json: bool, path: &std::path::Path) -> Result<u8> {
     if as_json {
         println!(
             "{}",

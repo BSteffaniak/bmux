@@ -1,12 +1,12 @@
 //! Recording ownership facade for negotiated live presentation. Never refreshes
 //! capture/status or treats projected progress as a durable recording receipt.
+use crate::process_dispatch::ProcessDispatchClient;
 use bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::{
     TerminalExecutionError, TerminalExecutionRef,
 };
 use bmux_pane_runtime_plugin_api::pane_runtime_live_presentation_v1::{
     self as live, LiveCapabilities, LiveCursor, LiveError, LiveFrame,
 };
-use bmux_plugin::ServiceCallerDispatchClient;
 use uuid::Uuid;
 
 use crate::process_runtime::ProcessService;
@@ -58,7 +58,7 @@ impl ProcessService {
     /// # Errors
     /// Returns typed-dispatch transport or capability availability failures.
     pub(crate) async fn live_capabilities(&self) -> anyhow::Result<LiveCapabilities> {
-        let mut client = ServiceCallerDispatchClient::new(self.caller.as_ref());
+        let mut client = ProcessDispatchClient::new(&self.caller);
         Ok(live::client::capabilities(&mut client).await?)
     }
 
@@ -73,7 +73,7 @@ impl ProcessService {
         max_bytes: u32,
     ) -> Result<Option<LiveFrame>, LiveError> {
         let reference = self.live_reference(run_id)?;
-        let mut client = ServiceCallerDispatchClient::new(self.caller.as_ref());
+        let mut client = ProcessDispatchClient::new(&self.caller);
         let frame = bmux_pane_runtime_plugin_api::pane_runtime_pointer_grid_v1::client::live_read(
             &mut client,
             1,
@@ -98,7 +98,7 @@ impl ProcessService {
         max_bytes: u32,
     ) -> Result<Option<LiveFrame>, LiveError> {
         let reference = self.live_reference(run_id)?;
-        let mut client = ServiceCallerDispatchClient::new(self.caller.as_ref());
+        let mut client = ProcessDispatchClient::new(&self.caller);
         let frame =
             bmux_pane_runtime_plugin_api::pane_runtime_pointer_grid_v1::client::live_wait_present(
                 &mut client,

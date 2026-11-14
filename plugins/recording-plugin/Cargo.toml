@@ -45,6 +45,9 @@ tracing                      = { workspace = true, features = ["std"] }
 ttf-parser                   = { workspace = true }
 uuid                         = { workspace = true, features = ["serde", "std", "v4"] }
 
+[dev-dependencies]
+tempfile = { workspace = true }
+
 [features]
 bundled-fonts = ["bmux_fonts/bundled-fonts", "bmux_fonts/bundled-nerd-fonts"]
 fail-on-warnings = [

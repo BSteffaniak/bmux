@@ -30,6 +30,301 @@ use std::any::{Any, TypeId};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+pub use crate::service::{ServiceStreamContext, TypedServiceEventSink};
+
+/// Exact routing key for an invocation-bound selected-provider availability query.
+///
+/// The key carries no provider, caller identity or locality assertion. The host
+/// supplies those from its bound invocation and selected authoritative registry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServiceAvailabilityKey {
+    pub capability: String,
+    pub kind: ServiceKind,
+    pub interface_id: String,
+}
+
+impl ServiceAvailabilityKey {
+    /// Validate bounded routing metadata before consulting host state.
+    ///
+    /// # Errors
+    /// Rejects invalid capability syntax or empty, oversized or padded interface IDs.
+    pub fn validate(&self) -> Result<()> {
+        if self.capability.len() > crate::service_contract::MAX_INTERFACE_ID_BYTES {
+            return Err(dispatch_failure(
+                "service availability capability exceeds bound",
+            ));
+        }
+        HostScope::new(&self.capability)?;
+        if self.interface_id.is_empty()
+            || self.interface_id.len() > crate::service_contract::MAX_INTERFACE_ID_BYTES
+            || self.interface_id.trim() != self.interface_id
+        {
+            return Err(dispatch_failure("invalid service availability interface"));
+        }
+        Ok(())
+    }
+}
+
+/// Authoritative selected-provider presence, not an invocation authorization.
+///
+/// Returned only after bound invocation admission and caller access checks.
+/// Unsupported negotiation, denied lookup, corrupt registry, unavailable selected
+/// provider and failed queries are errors, never `Absent`. Consumers must not
+/// cache this observation as authority for later invocation or infer locality.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SelectedServiceAvailability {
+    /// The exact tuple resolves to a currently usable selected provider.
+    Present,
+    /// The authoritative selected registry has no provider for this exact tuple.
+    Absent,
+}
+
+/// Explicit native capability version for the availability contract.
+///
+/// Hosts must negotiate this separately from service invocation. Missing support
+/// is `UnsupportedHostOperation`; it must never synthesize an `Absent` response.
+pub const SELECTED_SERVICE_AVAILABILITY_VERSION: u16 = 1;
+
+/// Declaration-owned generated evidence for one modeled service interface.
+///
+/// This is Rust metadata, not an ABI layout. Native exporters serialize these
+/// fields through the negotiated table. Legacy routing aliases are deliberately
+/// absent: an alias cannot manufacture a modeled contract identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModeledServiceContractDescriptor {
+    pub capability: &'static str,
+    pub kind: ServiceKind,
+    pub interface_id: &'static str,
+    /// Existing canonical SHA-256 v2 evidence; empty means explicitly unavailable.
+    pub contract: &'static [u8],
+}
+
+impl ModeledServiceContractDescriptor {
+    /// Validate evidence before publication or negotiation.
+    ///
+    /// # Errors
+    /// Rejects invalid identifiers and unavailable evidence.
+    pub fn validate(&self) -> Result<()> {
+        HostScope::new(self.capability)?;
+        if self.interface_id.is_empty()
+            || self.interface_id.len() > crate::service_contract::MAX_INTERFACE_ID_BYTES
+            || self.interface_id.trim() != self.interface_id
+            || self.contract.len() != crate::service_contract::MAX_SERVICE_CONTRACT_BYTES
+        {
+            return Err(dispatch_failure(
+                "invalid or unavailable modeled service contract",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Generated portable adapter over the same typed provider used by native clients.
+///
+/// Host admission/authorization precedes this boundary; payloads never
+/// carry caller authority. Only checked v2 frames are admitted by this adapter.
+pub trait PortableServiceProvider: Send + Sync {
+    fn descriptor(&self) -> ServiceInterfaceDescriptor;
+
+    /// Operation-level negotiation. Implementations must never claim support
+    /// unless checked dispatch preserves events, cancellation and terminal failure.
+    fn supports_streaming(&self, _operation: &str) -> bool {
+        false
+    }
+
+    /// Decode, invoke once, then encode the terminal response. A missing stream
+    /// context for an emitting operation is rejected before invoking the provider.
+    fn dispatch_checked<'a>(
+        &'a self,
+        operation: &'a str,
+        payload: &'a [u8],
+        stream: Option<ServiceStreamContext>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>>> + Send + 'a>>;
+}
+
+/// Invoke a legacy body handler at an explicitly checked service boundary.
+///
+/// Generated portable providers already own checked framing and must not be
+/// passed as the handler. Raw legacy routing is a separate explicit path; this
+/// helper never accepts unchecked bytes or retries after provider effects.
+/// Host authorization and live invocation admission precede this boundary.
+///
+/// # Errors
+/// Rejects missing checked framing, mismatched routes, missing generated
+/// evidence or incompatible contracts before calling the handler.
+pub fn invoke_checked_service_body<C: crate::PluginContract>(
+    mut context: crate::NativeServiceContext,
+    body_handler: impl FnOnce(crate::NativeServiceContext) -> crate::ServiceResponse,
+) -> Result<crate::ServiceResponse> {
+    let interface = crate::service_contract::interface_id_for(
+        &context.request.service.interface_id,
+        &context.request.payload,
+    )?;
+    let evidence = C::service_contract_for(interface).ok_or_else(|| {
+        dispatch_failure("provider has no generated contract for checked interface")
+    })?;
+    context.request.payload = crate::service_contract::decode_for(
+        &context.request.service.interface_id,
+        evidence,
+        &context.request.payload,
+    )?
+    .to_vec();
+    let mut response = body_handler(context);
+    if response.error.is_none() {
+        response.payload = crate::service_contract::encode_response(&response.payload);
+    }
+    Ok(response)
+}
+
+/// A negotiated provider target.
+///
+/// Hosts select this only after lifecycle admission, authoritative authorization
+/// and caller/deadline inheritance. Static targets retain the native typed fast
+/// path; portable targets never expose Rust layout.
+#[derive(Clone, Copy)]
+pub enum ServiceDispatchTarget<'a> {
+    Static(&'a TypedServiceHandle),
+    Portable(&'a dyn PortableServiceProvider),
+}
+
+/// Shared generated dispatch helper.
+///
+/// Both paths enforce identical descriptor and stream-shape preconditions before
+/// invoking the implementation exactly once. No retry or fallback is performed
+/// after effects begin.
+///
+/// # Errors
+/// Rejects missing evidence, unsupported streams, type mismatch, cancellation,
+/// delivery failure and checked response/codec failures.
+pub async fn dispatch_service<E, S, F, Fut>(
+    target: ServiceDispatchTarget<'_>,
+    request: E::Request,
+    stream: Option<ServiceStreamContext>,
+    direct: F,
+) -> Result<E::Response>
+where
+    E: crate::TypedServiceEndpoint,
+    S: ?Sized + Send + Sync + 'static,
+    F: FnOnce(Arc<S>, E::Request, Option<ServiceStreamContext>) -> Fut,
+    Fut: std::future::Future<Output = Result<E::Response>>,
+{
+    let expected = E::service_descriptor();
+    let descriptor = match target {
+        ServiceDispatchTarget::Static(handle) => handle.descriptor_contract(),
+        ServiceDispatchTarget::Portable(provider) => Some(provider.descriptor()),
+    }
+    .ok_or_else(|| dispatch_failure("provider has no checked contract evidence"))?;
+    if descriptor != expected || descriptor.contract.len() != 32 {
+        return Err(dispatch_failure(
+            "provider descriptor or exact contract mismatch",
+        ));
+    }
+    if E::STREAMING != stream.is_some() {
+        return Err(dispatch_failure(
+            "operation stream context does not match declaration",
+        ));
+    }
+    if let ServiceDispatchTarget::Portable(provider) = target
+        && E::STREAMING
+        && !provider.supports_streaming(E::OPERATION.as_str())
+    {
+        return Err(dispatch_failure(
+            "portable provider has not negotiated streaming",
+        ));
+    }
+    let (stream, completion) = if let Some(stream) = stream {
+        if stream.cancellation.is_cancelled() {
+            return Err(dispatch_failure("service stream cancelled"));
+        }
+        let (stream, completion) = stream.scoped();
+        (Some(stream), Some(completion))
+    } else {
+        (None, None)
+    };
+    let cancellation = stream.as_ref().map(|stream| stream.cancellation.clone());
+    let response = match target {
+        ServiceDispatchTarget::Static(handle) => {
+            let provider = handle.provider_as_trait::<S>()?;
+            direct(provider, request, stream).await?
+        }
+        ServiceDispatchTarget::Portable(provider) => {
+            let payload = crate::encode_service_message(&request)?;
+            let payload = crate::service_contract::encode(
+                E::INTERFACE_ID.as_str(),
+                E::SERVICE_CONTRACT,
+                &payload,
+            )?;
+            let response =
+                dispatch_portable_checked(provider, E::OPERATION.as_str(), &payload, stream)
+                    .await?;
+            crate::decode_service_message(crate::service_contract::decode_response(&response)?)?
+        }
+    };
+    if let Some(completion) = completion {
+        completion.finish()?;
+    }
+    if cancellation.is_some_and(|cancellation| cancellation.is_cancelled()) {
+        return Err(dispatch_failure("service stream cancelled"));
+    }
+    Ok(response)
+}
+
+/// Dispatch an already checked byte request through a negotiated provider.
+///
+/// This is the common M1/M3 entry point for raw invocation paths; native typed
+/// callers use `dispatch_service` instead. Checked evidence is validated before effects.
+///
+/// # Errors
+/// Rejects incompatible evidence, stream negotiation, cancellation and delivery
+/// failures. Never retries provider work or substitutes a unary invocation.
+pub async fn dispatch_portable_checked(
+    provider: &dyn PortableServiceProvider,
+    operation: &str,
+    payload: &[u8],
+    stream: Option<ServiceStreamContext>,
+) -> Result<Vec<u8>> {
+    let descriptor = provider.descriptor();
+    crate::service_contract::decode_for(
+        descriptor.interface_id.as_str(),
+        descriptor.contract,
+        payload,
+    )?;
+    if provider.supports_streaming(operation) != stream.is_some() {
+        return Err(dispatch_failure(
+            "operation stream context does not match negotiation",
+        ));
+    }
+    let (stream, completion) = if let Some(stream) = stream {
+        if stream.cancellation.is_cancelled() {
+            return Err(dispatch_failure("service stream cancelled"));
+        }
+        let (stream, completion) = stream.scoped();
+        (Some(stream), Some(completion))
+    } else {
+        (None, None)
+    };
+    let cancellation = stream.as_ref().map(|stream| stream.cancellation.clone());
+    let response = provider
+        .dispatch_checked(operation, payload, stream)
+        .await?;
+    crate::service_contract::decode_response(&response)?;
+    if let Some(completion) = completion {
+        completion.finish()?;
+    }
+    if cancellation.is_some_and(|cancellation| cancellation.is_cancelled()) {
+        return Err(dispatch_failure("service stream cancelled"));
+    }
+    Ok(response)
+}
+
+fn dispatch_failure(details: &str) -> PluginError {
+    PluginError::ServiceProtocol {
+        details: details.to_string(),
+    }
+}
+
 /// Errors returned by typed-dispatch operations that are distinct from
 /// the plugin error domain (which is focused on capability gating and
 /// registry lookup).
@@ -97,6 +392,7 @@ pub struct TypedServiceHandle {
     provider: Arc<dyn Any + Send + Sync>,
     provider_type: TypeId,
     provider_type_name: &'static str,
+    portable: Option<Arc<dyn PortableServiceProvider>>,
 }
 
 impl std::fmt::Debug for TypedServiceHandle {
@@ -131,6 +427,7 @@ impl TypedServiceHandle {
             provider,
             provider_type,
             provider_type_name: "<Arc<dyn Any>>",
+            portable: None,
         }
     }
 
@@ -156,7 +453,20 @@ impl TypedServiceHandle {
             provider: erased,
             provider_type: TypeId::of::<TypedProviderCell<S>>(),
             provider_type_name: std::any::type_name::<TypedProviderCell<S>>(),
+            portable: None,
         }
+    }
+
+    /// Checked adapter registered atomically with this typed provider, when
+    /// generated by BPDL. Host-side admission is still required on either path.
+    #[must_use]
+    pub fn descriptor_contract(&self) -> Option<ServiceInterfaceDescriptor> {
+        self.portable.as_ref().map(|provider| provider.descriptor())
+    }
+
+    #[must_use]
+    pub fn portable_provider(&self) -> Option<Arc<dyn PortableServiceProvider>> {
+        self.portable.clone()
     }
 
     #[must_use]
@@ -291,6 +601,99 @@ impl TypedServiceRegistry {
         Ok(())
     }
 
+    /// Atomically register both native and checked adapters under one descriptor.
+    ///
+    /// # Errors
+    /// Rejects mismatched adapter evidence before changing the registry.
+    pub fn insert_typed_provider<S: ?Sized + Send + Sync + 'static>(
+        &mut self,
+        descriptor: ServiceInterfaceDescriptor,
+        provider: Arc<S>,
+        portable: Arc<dyn PortableServiceProvider>,
+    ) -> Result<()> {
+        let actual = portable.descriptor();
+        if actual.capability != descriptor.capability
+            || actual.kind != descriptor.kind
+            || actual.interface_id != descriptor.interface_id
+            || actual.contract != descriptor.contract
+        {
+            return Err(PluginError::ServiceProtocol {
+                details: "portable provider descriptor does not match typed provider".to_string(),
+            });
+        }
+        let service = descriptor.to_plugin_service()?;
+        let mut handle = TypedServiceHandle::new_typed(
+            service.capability,
+            descriptor.interface_id,
+            service.kind,
+            provider,
+        );
+        handle.portable = Some(portable);
+        self.insert(handle);
+        Ok(())
+    }
+
+    /// Generated portable adapters from the same registration snapshot as native
+    /// handles. M1 hosts use this instead of requiring duplicate provider lists.
+    #[must_use]
+    pub fn portable_providers(&self) -> Vec<Arc<dyn PortableServiceProvider>> {
+        self.entries
+            .values()
+            .filter_map(TypedServiceHandle::portable_provider)
+            .collect()
+    }
+
+    /// Exact interface evidence from this admitted provider registry. Ambiguous
+    /// interface identities fail closed rather than depending on map order.
+    #[must_use]
+    pub fn service_contract_for(&self, interface: &str) -> Option<&'static [u8]> {
+        let mut contract = None;
+        for handle in self
+            .entries
+            .values()
+            .filter(|handle| handle.interface_id().as_str() == interface)
+        {
+            let descriptor = handle.descriptor_contract()?;
+            if descriptor.contract.len() != 32 {
+                return None;
+            }
+            if contract.is_some_and(|previous| previous != descriptor.contract) {
+                return None;
+            }
+            contract = Some(descriptor.contract);
+        }
+        contract
+    }
+
+    /// Route a raw checked invocation using this exact registration snapshot.
+    /// M1/M3 must perform host lifecycle/authorization admission before calling.
+    /// The payload is still checked-v2 framed; the returned bytes retain provider
+    /// acceptance, so callers must not add or remove framing a second time.
+    ///
+    /// # Errors
+    /// Rejects missing providers/evidence, negotiation and invocation failures.
+    pub async fn dispatch_checked(
+        &self,
+        request: &crate::ServiceRequest,
+        stream: Option<ServiceStreamContext>,
+    ) -> Result<Vec<u8>> {
+        let provider = self
+            .get(
+                &request.service.capability,
+                request.service.kind,
+                &request.service.interface_id,
+            )
+            .and_then(TypedServiceHandle::portable_provider)
+            .ok_or_else(|| dispatch_failure("checked provider is not registered"))?;
+        dispatch_portable_checked(
+            provider.as_ref(),
+            &request.operation,
+            &request.payload,
+            stream,
+        )
+        .await
+    }
+
     /// Return the number of registered handles.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -379,6 +782,297 @@ mod tests {
         fn greet(&self) -> String {
             "hi".into()
         }
+    }
+
+    struct StreamingEndpoint;
+    impl crate::TypedServiceEndpoint for StreamingEndpoint {
+        type Request = u32;
+        type Response = u32;
+        const CAPABILITY: crate::CapabilityId = crate::CapabilityId::from_static("example.stream");
+        const KIND: bmux_ipc::InvokeServiceKind = bmux_ipc::InvokeServiceKind::Command;
+        const INTERFACE_ID: InterfaceId = InterfaceId::from_static("stream/v2");
+        const OPERATION: crate::OperationId = crate::OperationId::from_static("run");
+        const SERVICE_CONTRACT: &'static [u8] = &[5; 32];
+        const STREAMING: bool = true;
+    }
+
+    struct StreamProvider;
+    impl StreamProvider {
+        fn run(value: u32, stream: &ServiceStreamContext) -> Result<u32> {
+            stream.typed_sink::<u32>().emit(value)?;
+            Ok(value + 1)
+        }
+    }
+    impl PortableServiceProvider for StreamProvider {
+        fn descriptor(&self) -> ServiceInterfaceDescriptor {
+            <StreamingEndpoint as crate::TypedServiceEndpoint>::service_descriptor()
+        }
+        fn supports_streaming(&self, operation: &str) -> bool {
+            operation == "run"
+        }
+        fn dispatch_checked<'a>(
+            &'a self,
+            _: &'a str,
+            payload: &'a [u8],
+            stream: Option<ServiceStreamContext>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>>> + Send + 'a>>
+        {
+            Box::pin(async move {
+                let payload = crate::service_contract::decode_for("stream/v2", &[5; 32], payload)?;
+                let value = crate::decode_service_message(payload)?;
+                let response = Self::run(
+                    value,
+                    &stream.ok_or_else(|| dispatch_failure("missing stream"))?,
+                )?;
+                Ok(crate::service_contract::encode_response(
+                    &crate::encode_service_message(&response)?,
+                ))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn static_and_portable_selection_share_stream_and_terminal_semantics() {
+        let mut registry = TypedServiceRegistry::new();
+        let provider = Arc::new(StreamProvider);
+        registry
+            .insert_typed_provider(
+                <StreamingEndpoint as crate::TypedServiceEndpoint>::service_descriptor(),
+                provider.clone(),
+                provider.clone(),
+            )
+            .unwrap();
+        let capability = HostScope::new("example.stream").unwrap();
+        let handle = registry
+            .get(&capability, ServiceKind::Command, "stream/v2")
+            .unwrap();
+        assert_eq!(
+            registry.service_contract_for("stream/v2"),
+            Some(&[5; 32][..])
+        );
+        assert_eq!(registry.portable_providers().len(), 1);
+        for target in [
+            ServiceDispatchTarget::Static(handle),
+            ServiceDispatchTarget::Portable(provider.as_ref()),
+        ] {
+            for capacity in [0, 1] {
+                let events = crate::BoundedServiceEventSink::new(capacity);
+                let stream = ServiceStreamContext {
+                    invocation_id: crate::PluginInvocationId::new(),
+                    cancellation: crate::ServiceCancellation::new(),
+                    events: crate::ServiceEventSinkHandle::new(events.clone()),
+                };
+                let result = dispatch_service::<StreamingEndpoint, StreamProvider, _, _>(
+                    target,
+                    41,
+                    Some(stream),
+                    |_provider, request, stream| async move {
+                        StreamProvider::run(request, &stream.unwrap())
+                    },
+                )
+                .await;
+                if capacity == 0 {
+                    assert!(result.is_err());
+                } else {
+                    assert_eq!(result.unwrap(), 42);
+                    let events = events.drain().unwrap();
+                    assert_eq!(events.len(), 1);
+                    assert_eq!(
+                        crate::decode_service_message::<u32>(&events[0].payload).unwrap(),
+                        41
+                    );
+                }
+            }
+            let cancellation = crate::ServiceCancellation::new();
+            cancellation.cancel();
+            let stream = ServiceStreamContext {
+                invocation_id: crate::PluginInvocationId::new(),
+                cancellation,
+                events: crate::ServiceEventSinkHandle::new(crate::BoundedServiceEventSink::new(1)),
+            };
+            assert!(
+                dispatch_service::<StreamingEndpoint, StreamProvider, _, _>(
+                    target,
+                    1,
+                    Some(stream),
+                    |_, _, _| async { panic!("cancelled direct call") },
+                )
+                .await
+                .is_err()
+            );
+        }
+    }
+
+    struct BodyContract;
+    impl crate::PluginContract for BodyContract {
+        fn service_contract_for(interface: &str) -> Option<&'static [u8]> {
+            (interface == "body/v1").then_some(&[3; 32][..])
+        }
+        fn service_declarations() -> Result<Vec<crate::PluginService>> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn checked_body_context(payload: Vec<u8>) -> crate::NativeServiceContext {
+        crate::NativeServiceContext {
+            plugin_id: "example.body".into(),
+            request: crate::ServiceRequest {
+                caller_plugin_id: "example.caller".into(),
+                service: crate::RegisteredService {
+                    capability: HostScope::new("example.read").unwrap(),
+                    kind: ServiceKind::Query,
+                    interface_id: "body/v1".into(),
+                    provider: crate::ProviderId::Plugin("example.body".into()),
+                },
+                operation: "read".into(),
+                payload,
+            },
+            required_capabilities: vec![],
+            provided_capabilities: vec![],
+            services: vec![],
+            available_capabilities: vec![],
+            enabled_plugins: vec![],
+            plugin_search_roots: vec![],
+            host: crate::HostMetadata {
+                product_name: "test".into(),
+                product_version: "1".into(),
+                plugin_api_version: crate::ApiVersion::new(1, 0),
+                plugin_abi_version: crate::ApiVersion::new(2, 0),
+            },
+            connection: crate::HostConnectionInfo {
+                config_dir: String::new(),
+                config_dir_candidates: vec![],
+                runtime_dir: String::new(),
+                data_dir: String::new(),
+                state_dir: String::new(),
+            },
+            settings: None,
+            plugin_settings_map: BTreeMap::new(),
+            caller_client_id: None,
+            cancellation: crate::CancellationToken::new(),
+            host_kernel_bridge: None,
+            host_service_port: None,
+        }
+    }
+
+    #[test]
+    fn checked_body_boundary_validates_before_exactly_one_effect_and_one_response_frame() {
+        let body = crate::encode_service_message(&41_u32).unwrap();
+        let checked = crate::service_contract::encode("body/v1", &[3; 32], &body).unwrap();
+        let calls = std::cell::Cell::new(0);
+        let response =
+            invoke_checked_service_body::<BodyContract>(checked_body_context(checked), |context| {
+                calls.set(calls.get() + 1);
+                let value: u32 = crate::decode_service_message(&context.request.payload).unwrap();
+                crate::ServiceResponse::ok(crate::encode_service_message(&(value + 1)).unwrap())
+            })
+            .unwrap();
+        assert_eq!(calls.get(), 1);
+        let response = crate::service_contract::decode_response(&response.payload).unwrap();
+        assert_eq!(crate::decode_service_message::<u32>(response).unwrap(), 42);
+        assert!(crate::service_contract::decode_response(response).is_err());
+        for invalid in [
+            body,
+            crate::service_contract::encode("body/v1", &[4; 32], b"bad").unwrap(),
+            crate::service_contract::encode("other/v1", &[3; 32], b"bad").unwrap(),
+        ] {
+            assert!(
+                invoke_checked_service_body::<BodyContract>(checked_body_context(invalid), |_| {
+                    calls.set(calls.get() + 1);
+                    crate::ServiceResponse::ok(vec![])
+                })
+                .is_err()
+            );
+        }
+        assert_eq!(calls.get(), 1);
+        let checked = crate::service_contract::encode("body/v1", &[3; 32], b"body").unwrap();
+        let response =
+            invoke_checked_service_body::<BodyContract>(checked_body_context(checked), |_| {
+                crate::ServiceResponse::error("denied", "not authorized")
+            })
+            .unwrap();
+        assert!(response.error.is_some());
+        assert!(crate::service_contract::decode_response(&response.payload).is_err());
+    }
+
+    #[test]
+    fn service_availability_metadata_is_exact_bounded_and_has_no_default_absence() {
+        let key = ServiceAvailabilityKey {
+            capability: "example.read".into(),
+            kind: ServiceKind::Query,
+            interface_id: "example-state/v2".into(),
+        };
+        key.validate().unwrap();
+        let bytes = crate::encode_service_message(&key).unwrap();
+        assert_eq!(
+            crate::decode_service_message::<ServiceAvailabilityKey>(&bytes).unwrap(),
+            key
+        );
+        for interface_id in [String::new(), " example-state/v2".into(), "x".repeat(1025)] {
+            assert!(
+                ServiceAvailabilityKey {
+                    interface_id,
+                    ..key.clone()
+                }
+                .validate()
+                .is_err()
+            );
+        }
+        assert!(
+            ServiceAvailabilityKey {
+                capability: "x".repeat(1025),
+                ..key
+            }
+            .validate()
+            .is_err()
+        );
+        for presence in [
+            SelectedServiceAvailability::Present,
+            SelectedServiceAvailability::Absent,
+        ] {
+            let bytes = crate::encode_service_message(&presence).unwrap();
+            assert_eq!(
+                crate::decode_service_message::<SelectedServiceAvailability>(&bytes).unwrap(),
+                presence
+            );
+        }
+        assert!(serde_json::from_str::<SelectedServiceAvailability>("\"unsupported\"").is_err());
+        assert!(serde_json::from_str::<SelectedServiceAvailability>("null").is_err());
+        assert!(serde_json::from_str::<ServiceAvailabilityKey>(r#"{"capability":"example.read","kind":"query","interface_id":"example-state/v2","local":true}"#).is_err());
+    }
+
+    #[test]
+    fn modeled_evidence_validation_never_substitutes_missing_or_legacy_identity() {
+        let valid = ModeledServiceContractDescriptor {
+            capability: "example.read",
+            kind: ServiceKind::Query,
+            interface_id: "state/v2",
+            contract: &[7; 32],
+        };
+        valid.validate().unwrap();
+        for contract in [&[][..], &[7; 31][..], &[7; 33][..]] {
+            assert!(
+                ModeledServiceContractDescriptor { contract, ..valid }
+                    .validate()
+                    .is_err()
+            );
+        }
+        assert!(
+            ModeledServiceContractDescriptor {
+                interface_id: "",
+                ..valid
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            ModeledServiceContractDescriptor {
+                interface_id: " state/v2",
+                ..valid
+            }
+            .validate()
+            .is_err()
+        );
     }
 
     #[test]

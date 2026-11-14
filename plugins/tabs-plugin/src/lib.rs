@@ -4580,7 +4580,25 @@ struct RestartPaneArgs {
     target: Option<Selector>,
 }
 
-bmux_plugin_sdk::export_plugin!(TabsPlugin, include_str!("../plugin.toml"));
+bmux_plugin_sdk::define_plugin!(
+    factory = |scope: bmux_plugin_sdk::definition::PluginCreateContext| {
+        Ok(std::sync::Arc::new(
+            bmux_plugin_sdk::definition::RustPluginAdapter::for_instance(
+                TabsPlugin::default(),
+                scope.instance,
+            ),
+        )
+            as std::sync::Arc<
+                dyn bmux_plugin_sdk::definition::PluginInstance,
+            >)
+    },
+    metadata = bmux_plugin_sdk::definition::PluginDefinition::from_rust_plugin::<TabsPlugin>(
+        include_str!("../plugin.toml"),
+        vec![bmux_plugin_sdk::definition::ComponentRole::Backend],
+    )
+    .expect("embedded foundational declaration must be valid")
+    .metadata,
+);
 
 // Compile-time guards: ensure the string literals used in `route_service!`
 // and `plugin.toml` stay in sync with the BPDL-declared interface ids.
@@ -4597,6 +4615,62 @@ fn interface_ids_match_bpdl_constants() {
 
 #[cfg(test)]
 mod tests {
+    #[derive(Clone)]
+    struct InvocationTestHost(bmux_plugin::test_support::TestServiceRouter);
+
+    struct InvocationTestDispatch {
+        router: bmux_plugin::test_support::TestServiceRouter,
+        caller: Option<Uuid>,
+        plugin: &'static str,
+    }
+
+    impl bmux_plugin_sdk::HostServiceDispatch for InvocationTestDispatch {
+        // The host dispatch contract requires the SDK's rich error type.
+        #[allow(clippy::result_large_err)]
+        fn invoke(
+            &self,
+            _: &bmux_plugin_runtime::InvocationScope,
+            request: bmux_plugin_sdk::HostServiceRequest<'_>,
+        ) -> bmux_plugin_sdk::Result<Vec<u8>> {
+            (self.router)(
+                self.plugin,
+                self.caller,
+                request.capability,
+                request.kind,
+                request.interface,
+                request.operation,
+                request.payload.to_vec(),
+            )
+        }
+    }
+
+    impl InvocationTestHost {
+        fn port(
+            &self,
+            plugin: &'static str,
+            caller: Option<Uuid>,
+        ) -> bmux_plugin_sdk::PluginHostServices {
+            let instance = bmux_plugin_runtime::InstanceScope::new(
+                bmux_plugin_runtime::PluginRuntimeScopeId::from_uuid(Uuid::new_v4()),
+            );
+            let activation = instance
+                .begin_activation(bmux_plugin_runtime::PluginConcurrencyConfig::Concurrent)
+                .unwrap();
+            activation.mark_active().unwrap();
+            let invocation = activation.begin_invocation().unwrap();
+            bmux_plugin_sdk::PluginHostServices::from_bound(
+                bmux_plugin_sdk::BoundHostServicePort::new(
+                    invocation,
+                    std::sync::Arc::new(InvocationTestDispatch {
+                        router: self.0.clone(),
+                        caller,
+                        plugin,
+                    }),
+                ),
+            )
+        }
+    }
+
     fn checked_test_router(
         router: bmux_plugin::test_support::TestServiceRouter,
     ) -> bmux_plugin::test_support::TestServiceRouter {
@@ -4632,9 +4706,9 @@ mod tests {
     use bmux_contexts_plugin_api::contexts_state::ContextSummary as SessionSummary;
     use bmux_plugin::ServiceCaller;
     use bmux_plugin_sdk::{
-        ApiVersion, HostConnectionInfo, HostKernelBridge, HostMetadata, HostScope,
-        NativeServiceContext, ProviderId, RegisteredService, ServiceKind, ServiceRequest,
-        decode_service_message, encode_service_message,
+        ApiVersion, HostConnectionInfo, HostMetadata, HostScope, NativeServiceContext, ProviderId,
+        RegisteredService, ServiceKind, ServiceRequest, decode_service_message,
+        encode_service_message,
     };
     use std::sync::Mutex;
 
@@ -4722,61 +4796,7 @@ mod tests {
         assert_eq!(focus_direction_name(PaneDirection::Vertical), None);
     }
 
-    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-    struct BridgeRequest {
-        payload: Vec<u8>,
-    }
-
-    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-    struct BridgeResponse {
-        payload: Vec<u8>,
-    }
-
-    #[allow(clippy::too_many_lines)]
-    unsafe extern "C" fn service_test_kernel_bridge(
-        input_ptr: *const u8,
-        input_len: usize,
-        output_ptr: *mut u8,
-        output_capacity: usize,
-        output_len: *mut usize,
-    ) -> i32 {
-        let input = unsafe { std::slice::from_raw_parts(input_ptr, input_len) };
-        let bridge_request: BridgeRequest = match decode_service_message(input) {
-            Ok(request) => request,
-            Err(_) => return 1,
-        };
-        let _request: bmux_ipc::Request = match bmux_ipc::decode(&bridge_request.payload) {
-            Ok(request) => request,
-            Err(_) => return 1,
-        };
-
-        let response = bmux_ipc::Response::Err(bmux_ipc::ErrorResponse {
-            code: bmux_ipc::ErrorCode::InvalidRequest,
-            message: "unsupported request in service bridge test".to_string(),
-        });
-
-        let Ok(encoded) = bmux_ipc::encode(&response) else {
-            return 1;
-        };
-        let Ok(output) = encode_service_message(&BridgeResponse { payload: encoded }) else {
-            return 1;
-        };
-
-        if output.len() > output_capacity {
-            unsafe {
-                *output_len = output.len();
-            }
-            return 4;
-        }
-
-        unsafe {
-            std::ptr::copy_nonoverlapping(output.as_ptr(), output_ptr, output.len());
-            *output_len = output.len();
-        }
-        0
-    }
-
-    /// Install a thread-local router that answers the typed cross-
+    /// Create an explicit host fixture that answers the typed cross-
     /// plugin service calls tabs-plugin makes through
     /// `KernelOps`'s context/session helpers. Tests that exercise
     /// `invoke_service`-style service dispatch keep the returned
@@ -4790,11 +4810,8 @@ mod tests {
         clippy::items_after_statements,
         clippy::redundant_clone
     )]
-    fn install_context_test_router(
-        deny_create: bool,
-        deny_close: bool,
-    ) -> bmux_plugin::test_support::TestServiceRouterGuard {
-        use bmux_plugin::test_support::{TestServiceRouter, install_test_service_router};
+    fn install_context_test_router(deny_create: bool, deny_close: bool) -> InvocationTestHost {
+        use bmux_plugin::test_support::TestServiceRouter;
         let selected = Mutex::new(Uuid::from_u128(1));
         let router: TestServiceRouter = std::sync::Arc::new(
             move |_caller_plugin,
@@ -4932,10 +4949,11 @@ mod tests {
                 }
             },
         );
-        install_test_service_router(checked_test_router(router))
+        InvocationTestHost(checked_test_router(router))
     }
 
     fn service_test_context(
+        host: Option<&InvocationTestHost>,
         interface_id: &str,
         operation: &str,
         payload: Vec<u8>,
@@ -4988,6 +5006,7 @@ mod tests {
         ];
 
         NativeServiceContext {
+            host_service_port: host.map(|host| host.port("bmux.tabs", Some(Uuid::from_u128(99)))),
             plugin_id: "bmux.tabs".to_string(),
             request: ServiceRequest {
                 caller_plugin_id: "test.caller".to_string(),
@@ -5037,7 +5056,7 @@ mod tests {
             plugin_settings_map: std::collections::BTreeMap::new(),
             caller_client_id: None,
             cancellation: bmux_plugin_sdk::CancellationToken::default(),
-            host_kernel_bridge: Some(HostKernelBridge::from_fn(service_test_kernel_bridge)),
+            host_kernel_bridge: None,
         }
     }
 
@@ -6560,9 +6579,10 @@ mod tests {
 
     #[test]
     fn invoke_service_new_returns_ack_with_id() {
-        let _router = install_context_test_router(false, false);
+        let router = install_context_test_router(false, false);
         let plugin = TabsPlugin::default();
         let context = service_test_context(
+            Some(&router),
             "tabs-commands",
             "new-tab",
             encode_service_message(&NewTabArgs {
@@ -6588,9 +6608,10 @@ mod tests {
 
     #[test]
     fn invoke_service_new_tab_directory_requires_spawn_service_without_legacy_fallback() {
-        let _router = install_context_test_router(false, false);
+        let router = install_context_test_router(false, false);
         let plugin = TabsPlugin::default();
         let mut context = service_test_context(
+            Some(&router),
             "tabs-commands",
             "new-tab",
             encode_service_message(&NewTabArgs {
@@ -6614,9 +6635,10 @@ mod tests {
 
     #[test]
     fn invoke_service_new_surfaces_denied_error() {
-        let _router = install_context_test_router(false, false);
+        let router = install_context_test_router(false, false);
         let plugin = TabsPlugin::default();
         let context = service_test_context(
+            Some(&router),
             "tabs-commands",
             "new-tab",
             encode_service_message(&NewTabArgs {
@@ -6639,9 +6661,10 @@ mod tests {
 
     #[test]
     fn invoke_service_switch_returns_ack_with_selected_id() {
-        let _router = install_context_test_router(false, false);
+        let router = install_context_test_router(false, false);
         let plugin = TabsPlugin::default();
         let context = service_test_context(
+            Some(&router),
             "tabs-commands",
             "switch-tab",
             encode_service_message(&SwitchTabArgs {
@@ -6717,7 +6740,7 @@ mod tests {
 
     #[allow(clippy::result_large_err)] // TestServiceRouter requires the SDK's unboxed PluginError.
     fn real_context_router() -> (
-        bmux_plugin::test_support::TestServiceRouterGuard,
+        InvocationTestHost,
         Arc<std::sync::RwLock<bmux_contexts_plugin::ContextState>>,
         [Uuid; 2],
     ) {
@@ -6731,35 +6754,34 @@ mod tests {
             .id;
         let state = Arc::new(std::sync::RwLock::new(state));
         bmux_plugin::global_plugin_state_registry().register(&state);
-        let router =
-            bmux_plugin::test_support::install_test_service_router(checked_test_router(Arc::new(
-                move |_, _, capability, kind, interface, operation, payload| {
-                    if interface.starts_with("contexts-") {
-                        let mut context =
-                            service_test_context(interface, operation, payload, capability, kind);
-                        context.plugin_id = "bmux.contexts".into();
-                        context.caller_client_id = Some(client.0);
-                        let response = bmux_contexts_plugin::ContextsPlugin.invoke_service(context);
-                        assert!(response.error.is_none(), "{:?}", response.error);
-                        Ok(response.payload)
-                    } else if interface == "storage-query/v1" {
-                        encode_service_message(&bmux_plugin_sdk::StorageGetResponse { value: None })
-                    } else if interface == "volatile-state-query/v1" {
-                        encode_service_message(&bmux_plugin_sdk::VolatileStateGetResponse {
-                            value: None,
-                        })
-                    } else if matches!(
-                        interface,
-                        "storage-command/v1" | "volatile-state-command/v1"
-                    ) {
-                        encode_service_message(&())
-                    } else {
-                        Err(bmux_plugin_sdk::PluginError::UnsupportedHostOperation {
-                            operation: "real_context_router",
-                        })
-                    }
-                },
-            )));
+        let router = InvocationTestHost(checked_test_router(Arc::new(
+            move |_, _, capability, kind, interface, operation, payload| {
+                if interface.starts_with("contexts-") {
+                    let mut context =
+                        service_test_context(None, interface, operation, payload, capability, kind);
+                    context.plugin_id = "bmux.contexts".into();
+                    context.caller_client_id = Some(client.0);
+                    let response = bmux_contexts_plugin::ContextsPlugin.invoke_service(context);
+                    assert!(response.error.is_none(), "{:?}", response.error);
+                    Ok(response.payload)
+                } else if interface == "storage-query/v1" {
+                    encode_service_message(&bmux_plugin_sdk::StorageGetResponse { value: None })
+                } else if interface == "volatile-state-query/v1" {
+                    encode_service_message(&bmux_plugin_sdk::VolatileStateGetResponse {
+                        value: None,
+                    })
+                } else if matches!(
+                    interface,
+                    "storage-command/v1" | "volatile-state-command/v1"
+                ) {
+                    encode_service_message(&())
+                } else {
+                    Err(bmux_plugin_sdk::PluginError::UnsupportedHostOperation {
+                        operation: "real_context_router",
+                    })
+                }
+            },
+        )));
         (router, state, [alpha, beta])
     }
 
@@ -6777,7 +6799,7 @@ mod tests {
         );
     }
 
-    async fn dispatch_tab_over_transport(payload: Vec<u8>) -> Vec<u8> {
+    async fn dispatch_tab_over_transport(router: &InvocationTestHost, payload: Vec<u8>) -> Vec<u8> {
         use bmux_ipc::transport::ErasedIpcStream;
         use bmux_ipc::{Envelope, EnvelopeKind, Request, Response, ResponsePayload};
         let (client_stream, server_stream) = tokio::io::duplex(8192);
@@ -6821,6 +6843,7 @@ mod tests {
                     .expect("provider must accept the action contract before invocation")
                     .to_vec();
                     let response = TabsPlugin::default().invoke_service(service_test_context(
+                        Some(router),
                         &interface_id,
                         &operation,
                         payload,
@@ -6876,7 +6899,7 @@ mod tests {
             .build()
             .unwrap();
         runtime.block_on(async {
-            let (_router, context_state, [alpha, beta]) = real_context_router();
+            let (router, context_state, [alpha, beta]) = real_context_router();
             let events = bmux_plugin::global_event_bus();
             events.register_state_channel(
                 bmux_tabs_plugin_api::tabs_list::STATE_KIND,
@@ -6909,6 +6932,7 @@ mod tests {
                 bmux_tab_bar_plugin::TabBarPresentation::install(Some(&settings), &resources).unwrap();
             for (target, expected_id) in [("alpha", alpha), ("beta", beta)] {
                 let response = dispatch_tab_over_transport(
+                    &router,
                     if expected_id == alpha {
                         let request = encode_service_message(
                             &bmux_tabs_plugin_api::tabs_commands::client::SwitchTabRequest {
@@ -6982,8 +7006,10 @@ mod tests {
 
     #[test]
     fn invoke_service_rejects_invalid_payload() {
+        let router = install_context_test_router(false, false);
         let plugin = TabsPlugin::default();
         let context = service_test_context(
+            Some(&router),
             "tabs-commands",
             "kill-tab",
             vec![1, 2, 3],
@@ -6998,8 +7024,10 @@ mod tests {
 
     #[test]
     fn invoke_service_move_floating_pane_is_wired() {
+        let router = install_context_test_router(false, false);
         let plugin = TabsPlugin::default();
         let context = service_test_context(
+            Some(&router),
             "tabs-commands",
             "move-floating-pane",
             vec![1, 2, 3],
@@ -7019,9 +7047,10 @@ mod tests {
     /// proof the request was dispatched instead of rejected up front.
     #[test]
     fn invoke_service_restart_pane_is_wired() {
-        let _router = install_context_test_router(false, false);
+        let router = install_context_test_router(false, false);
         let plugin = TabsPlugin::default();
         let context = service_test_context(
+            Some(&router),
             "tabs-commands",
             "restart-pane",
             encode_service_message(&RestartPaneArgs {
@@ -7045,9 +7074,10 @@ mod tests {
 
     #[test]
     fn invoke_service_kill_surfaces_denied_error() {
-        let _router = install_context_test_router(false, true);
+        let router = install_context_test_router(false, true);
         let plugin = TabsPlugin::default();
         let context = service_test_context(
+            Some(&router),
             "tabs-commands",
             "kill-tab",
             encode_service_message(&KillTabArgs {
@@ -7071,8 +7101,10 @@ mod tests {
 
     #[test]
     fn invoke_service_rejects_unsupported_operation() {
+        let router = install_context_test_router(false, false);
         let plugin = TabsPlugin::default();
         let context = service_test_context(
+            Some(&router),
             "tabs-commands",
             "unknown",
             Vec::new(),
@@ -7343,6 +7375,7 @@ mod tests {
             state_dir: "/tmp".to_string(),
         };
         let context = TypedServiceRegistrationContext {
+            host_service_port: None,
             plugin_id: "bmux.tabs",
             host_kernel_bridge: None,
             required_capabilities: &empty_caps,
@@ -7580,5 +7613,51 @@ mod tests {
             in_memory_runtime_context_id(&second_runtime_state, ACTIVE_TAB_CONTEXT_KEY),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod definition_contract_tests {
+    #[test]
+    fn explicit_contract_versions_preserve_service_wire_routes() {
+        let definition = super::plugin_definition();
+        let manifest =
+            bmux_plugin::PluginManifest::from_toml_str(include_str!("../plugin.toml")).unwrap();
+        let canonical =
+            bmux_plugin_sdk::definition::PluginDefinition::from_rust_plugin::<super::TabsPlugin>(
+                include_str!("../plugin.toml"),
+                vec![bmux_plugin_sdk::definition::ComponentRole::Backend],
+            )
+            .unwrap();
+        definition.validate().unwrap();
+        assert_eq!(definition.metadata, canonical.metadata);
+        assert_eq!(definition.metadata.plugin_id, manifest.id);
+        assert_eq!(definition.metadata.version, manifest.version);
+        assert_eq!(definition.metadata.roles, manifest.component_roles);
+        let declared: std::collections::BTreeSet<_> = manifest
+            .contracts
+            .iter()
+            .map(|contract| (&contract.interface_id, contract.major, contract.minor))
+            .collect();
+        let embedded: std::collections::BTreeSet<_> = definition
+            .metadata
+            .contracts
+            .iter()
+            .map(|contract| (&contract.interface_id, contract.major, contract.minor))
+            .collect();
+        assert_eq!(embedded, declared);
+        let mut services = definition.declarations().unwrap().services;
+        services.extend(
+            <super::TabsPlugin as bmux_plugin_sdk::RustPlugin>::declared_services().unwrap(),
+        );
+        for service in services {
+            let contract = definition
+                .metadata
+                .contracts
+                .iter()
+                .find(|contract| contract.interface_id == service.interface_id)
+                .expect("every retained route requires explicit compatibility metadata");
+            assert_eq!((contract.major, contract.minor), (1, 0));
+        }
     }
 }

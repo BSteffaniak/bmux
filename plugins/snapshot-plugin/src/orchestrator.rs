@@ -52,9 +52,20 @@ pub struct BmuxSnapshotOrchestrator {
     // no writer may observe host teardown state or reopen persistence.
     finalized: Mutex<bool>,
     debounce: Mutex<Option<(std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>)>>,
+    progress: bmux_plugin_runtime::shutdown_progress::ShutdownProgress,
 }
 
 impl BmuxSnapshotOrchestrator {
+    /// Bind observational shutdown reporting to this host, not another runtime.
+    #[must_use]
+    pub fn with_progress(
+        mut self,
+        progress: bmux_plugin_runtime::shutdown_progress::ShutdownProgress,
+    ) -> Self {
+        self.progress = progress;
+        self
+    }
+
     /// Construct an orchestrator. `path` is `None` when snapshot
     /// persistence is disabled (no CLI config registered).
     #[must_use]
@@ -71,6 +82,7 @@ impl BmuxSnapshotOrchestrator {
             stateful_registry,
             finalized: Mutex::new(false),
             debounce: Mutex::new(None),
+            progress: bmux_plugin_runtime::shutdown_progress::ShutdownProgress::default(),
             status: Mutex::new(Status {
                 writes_allowed,
                 ..Status::default()
@@ -142,7 +154,7 @@ impl BmuxSnapshotOrchestrator {
         } else {
             write_envelope_atomic(&path, &envelope)?;
         }
-        if let Err(error) = bmux_plugin::shutdown_progress().advance("snapshot persisted") {
+        if let Err(error) = self.progress.advance("snapshot persisted") {
             warn!(%error, "shutdown progress publication failed");
         }
         if let Ok(mut status) = self.status.lock() {
@@ -215,9 +227,7 @@ impl BmuxSnapshotOrchestrator {
                     details: StatefulErrorDisplay(&error).to_string(),
                 }
             })?;
-            if let Err(error) =
-                bmux_plugin::shutdown_progress().advance("snapshot participant collected")
-            {
+            if let Err(error) = self.progress.advance("snapshot participant collected") {
                 warn!(%error, "shutdown progress publication failed");
             }
             sections.push(SectionV1 {
@@ -537,9 +547,7 @@ impl SnapshotOrchestrator for BmuxSnapshotOrchestrator {
                         details: StatefulErrorDisplay(&error).to_string(),
                     }
                 })?;
-                if let Err(error) =
-                    bmux_plugin::shutdown_progress().advance("snapshot participant prepared")
-                {
+                if let Err(error) = self.progress.advance("snapshot participant prepared") {
                     warn!(%error, "shutdown progress publication failed");
                 }
             }

@@ -128,6 +128,8 @@ pub trait TypedServiceEndpoint {
     const INTERFACE_ID: InterfaceId;
     const SERVICE_CONTRACT: &'static [u8] = &[];
     const OPERATION: OperationId;
+    /// Whether this operation requires request-scoped ordered event delivery.
+    const STREAMING: bool = false;
 
     /// Interface-level service descriptor for this endpoint.
     ///
@@ -154,29 +156,123 @@ pub trait TypedServiceEndpoint {
 /// Compile-time description of one request-scoped streaming typed endpoint.
 pub trait StreamingTypedServiceEndpoint: TypedServiceEndpoint {
     /// Typed event frame emitted zero or more times before the final response.
-    type Event: DeserializeOwned;
+    type Event: DeserializeOwned + 'static;
 }
 
-/// Invoke a generated request-scoped streaming endpoint.
-///
-/// The transport owns invocation-id cancellation/control frames and applies
-/// bounded backpressure to emitted event frames. This helper currently returns
-/// the final response through the canonical typed-dispatch path; generated
-/// streaming clients use endpoint metadata to wire event-frame sinks when the
-/// host transport supports them.
+/// Invoke a generated streaming endpoint with an explicit typed sink and live
+/// cancellation. Unsupported transports reject before sending the request.
 ///
 /// # Errors
-///
-/// Returns transport, request encoding, or response decoding failures.
+/// Returns encoding, event delivery, cancellation, transport or final decoding errors.
 pub async fn invoke_typed_streaming_service<C, E>(
     client: &mut C,
     request: &E::Request,
+    events: crate::service::TypedServiceEventSink<E::Event>,
+    cancellation: crate::ServiceCancellation,
 ) -> TypedServiceClientResult<E::Response>
 where
     C: TypedDispatchClient,
     E: StreamingTypedServiceEndpoint,
 {
-    invoke_typed_service::<C, E>(client, request).await
+    let operation_id = E::OPERATION;
+    let operation = operation_id.as_str();
+    if !client.supports_service_streaming() {
+        return Err(TypedDispatchClientError::unexpected_response(
+            E::INTERFACE_ID.as_str(),
+            operation,
+            "request-scoped streaming is not supported",
+        )
+        .into());
+    }
+    let payload =
+        crate::encode_service_message(request).map_err(|err| TypedServiceClientError::Encode {
+            op: operation.to_string(),
+            details: err.to_string(),
+        })?;
+    let checked = client.requires_service_contracts();
+    let payload = if checked {
+        crate::service_contract::encode(E::INTERFACE_ID.as_str(), E::SERVICE_CONTRACT, &payload)
+            .map_err(|err| TypedServiceClientError::Encode {
+                op: operation.to_string(),
+                details: err.to_string(),
+            })?
+    } else {
+        payload
+    };
+    let invocation_id = crate::PluginInvocationId::new();
+    let expected_id = invocation_id.clone();
+    let delivery_cancellation = cancellation.clone();
+    let sink = crate::ServiceEventSinkHandle::new(TypedClientEventSink(
+        move |event: crate::ServiceEvent| {
+            if delivery_cancellation.is_cancelled() || event.invocation_id != expected_id {
+                return Err(crate::PluginError::ServiceProtocol {
+                    details: "cancelled or mismatched service event invocation".to_string(),
+                });
+            }
+            let event = crate::decode_service_message::<E::Event>(&event.payload)?;
+            events.emit(event)
+        },
+    ));
+    if cancellation.is_cancelled() {
+        return Err(TypedDispatchClientError::transport(
+            E::INTERFACE_ID.as_str(),
+            operation,
+            "service stream cancelled",
+        )
+        .into());
+    }
+    let (context, completion) = crate::service::ServiceStreamContext {
+        invocation_id,
+        cancellation: cancellation.clone(),
+        events: sink,
+    }
+    .scoped();
+    let response = client
+        .invoke_service_stream_raw(
+            E::CAPABILITY.as_str(),
+            E::KIND,
+            E::INTERFACE_ID.as_str(),
+            operation,
+            payload,
+            context,
+        )
+        .await?;
+    completion.finish().map_err(|err| {
+        TypedDispatchClientError::transport(E::INTERFACE_ID.as_str(), operation, err.to_string())
+    })?;
+    if cancellation.is_cancelled() {
+        return Err(TypedDispatchClientError::transport(
+            E::INTERFACE_ID.as_str(),
+            operation,
+            "service stream cancelled",
+        )
+        .into());
+    }
+    let response = if checked {
+        crate::service_contract::decode_response(&response).map_err(|err| {
+            TypedServiceClientError::Decode {
+                op: operation.to_string(),
+                details: err.to_string(),
+            }
+        })?
+    } else {
+        &response
+    };
+    crate::decode_service_message(response).map_err(|err| TypedServiceClientError::Decode {
+        op: operation.to_string(),
+        details: err.to_string(),
+    })
+}
+
+struct TypedClientEventSink<F>(F);
+
+impl<F> crate::ServiceEventSink for TypedClientEventSink<F>
+where
+    F: Fn(crate::ServiceEvent) -> crate::Result<()> + Send + Sync,
+{
+    fn emit_event(&self, event: crate::ServiceEvent) -> crate::Result<()> {
+        (self.0)(event)
+    }
 }
 
 /// Invoke a generated typed service endpoint.
@@ -252,6 +348,36 @@ pub trait TypedDispatchClient: Send {
     /// Whether generated typed calls must use negotiated checked BPDL frames.
     fn requires_service_contracts(&self) -> bool {
         false
+    }
+
+    /// Explicit negotiation for request-scoped ordered events plus final response.
+    /// Advertising support requires implementing `invoke_service_stream_raw` without
+    /// dropping events, with bounded delivery and live cancellation propagation.
+    fn supports_service_streaming(&self) -> bool {
+        false
+    }
+
+    /// Dispatch one streaming invocation. Rejection is the default, never unary fallback.
+    ///
+    /// The context identity must survive retries/response growth. The transport
+    /// must finish all event callbacks before returning the single terminal result,
+    /// propagate sink failure, and stop new delivery after cancellation or return.
+    /// Existing caller provenance and deadlines must be inherited by this call.
+    fn invoke_service_stream_raw(
+        &mut self,
+        _capability: &str,
+        _kind: InvokeServiceKind,
+        interface_id: &str,
+        operation: &str,
+        _payload: Vec<u8>,
+        _context: crate::service::ServiceStreamContext,
+    ) -> impl Future<Output = TypedDispatchClientResult<Vec<u8>>> + Send {
+        let error = TypedDispatchClientError::unexpected_response(
+            interface_id,
+            operation,
+            "request-scoped streaming is not supported",
+        );
+        async move { Err(error) }
     }
 
     /// Dispatch an encoded typed invocation and return the encoded response.
@@ -381,6 +507,127 @@ mod tests {
                 .await
                 .unwrap(),
             42
+        );
+    }
+
+    struct StreamEndpoint;
+    impl TypedServiceEndpoint for StreamEndpoint {
+        type Request = u32;
+        type Response = u32;
+        const CAPABILITY: CapabilityId = CapabilityId::from_static("example.write");
+        const KIND: InvokeServiceKind = InvokeServiceKind::Command;
+        const INTERFACE_ID: InterfaceId = InterfaceId::from_static("stream/v1");
+        const OPERATION: OperationId = OperationId::from_static("run");
+        const SERVICE_CONTRACT: &'static [u8] = &[9; 32];
+    }
+    impl StreamingTypedServiceEndpoint for StreamEndpoint {
+        type Event = u32;
+    }
+
+    struct StreamDispatch;
+    impl TypedDispatchClient for StreamDispatch {
+        fn requires_service_contracts(&self) -> bool {
+            true
+        }
+        fn supports_service_streaming(&self) -> bool {
+            true
+        }
+        fn invoke_service_raw(
+            &mut self,
+            _: &str,
+            _: InvokeServiceKind,
+            _: &str,
+            _: &str,
+            _: Vec<u8>,
+        ) -> impl Future<Output = TypedDispatchClientResult<Vec<u8>>> + Send {
+            std::future::poll_fn(|_| panic!("stream must not use unary dispatch"))
+        }
+        fn invoke_service_stream_raw(
+            &mut self,
+            _: &str,
+            _: InvokeServiceKind,
+            interface: &str,
+            _: &str,
+            payload: Vec<u8>,
+            context: crate::service::ServiceStreamContext,
+        ) -> impl Future<Output = TypedDispatchClientResult<Vec<u8>>> + Send {
+            let request =
+                crate::service_contract::decode_for(interface, &[9; 32], &payload).unwrap();
+            let value: u32 = crate::decode_service_message(request).unwrap();
+            for event in [value, value + 1] {
+                // Deliberately ignore sink errors: the client guard must still
+                // prevent a success after a consumer rejects an event.
+                let _ = context.events.emit_event(crate::ServiceEvent {
+                    invocation_id: context.invocation_id.clone(),
+                    payload: crate::encode_service_message(&event).unwrap(),
+                });
+            }
+            std::future::ready(Ok(crate::service_contract::encode_response(
+                &crate::encode_service_message(&(value + 2)).unwrap(),
+            )))
+        }
+    }
+
+    #[tokio::test]
+    async fn streaming_delivers_ordered_events_then_checked_terminal() {
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = events.clone();
+        let sink = crate::service::TypedServiceEventSink::new(move |event| {
+            captured.lock().unwrap().push(event);
+            Ok(())
+        });
+        let result = invoke_typed_streaming_service::<_, StreamEndpoint>(
+            &mut StreamDispatch,
+            &40,
+            sink,
+            crate::ServiceCancellation::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(*events.lock().unwrap(), vec![40, 41]);
+        assert_eq!(result, 42);
+    }
+
+    #[tokio::test]
+    async fn streaming_rejection_and_cancellation_do_not_become_success() {
+        let sink = || {
+            crate::service::TypedServiceEventSink::new(|_: u32| {
+                Err(crate::PluginError::ServiceProtocol {
+                    details: "consumer full".to_string(),
+                })
+            })
+        };
+        assert!(
+            invoke_typed_streaming_service::<_, StreamEndpoint>(
+                &mut StreamDispatch,
+                &1,
+                sink(),
+                crate::ServiceCancellation::new(),
+            )
+            .await
+            .is_err()
+        );
+        let cancellation = crate::ServiceCancellation::new();
+        cancellation.cancel();
+        assert!(
+            invoke_typed_streaming_service::<_, StreamEndpoint>(
+                &mut StreamDispatch,
+                &1,
+                sink(),
+                cancellation,
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            invoke_typed_streaming_service::<_, StreamEndpoint>(
+                &mut CheckedDispatch,
+                &1,
+                sink(),
+                crate::ServiceCancellation::new(),
+            )
+            .await
+            .is_err()
         );
     }
 

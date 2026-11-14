@@ -19,6 +19,7 @@ bmux_terminal          = { workspace = true, optional = true }
 futures-util           = { workspace = true, optional = true, features = ["std"] }
 image                  = { workspace = true, features = ["png", "jpeg", "gif", "bmp"] }
 serde                  = { workspace = true, optional = true, features = ["derive"] }
+serde_json             = { workspace = true }
 unicode-segmentation   = { workspace = true }
 unicode-width          = { workspace = true }
 zeroize                = { workspace = true, features = ["alloc"] }

@@ -58,6 +58,9 @@ impl PluginManifestCompatibility {
             .as_deref()
             .map(str::parse::<ApiVersion>)
             .transpose()?;
+        if maximum.is_some_and(|maximum| maximum < minimum) {
+            return Err("maximum must be at least minimum".into());
+        }
         Ok(VersionRange { minimum, maximum })
     }
 }
@@ -157,6 +160,16 @@ pub struct PluginManifest {
     pub plugin_api: PluginManifestCompatibility,
     #[serde(default)]
     pub native_abi: PluginManifestCompatibility,
+    /// Component roles exported by the shared definition. Legacy manifests are backend-only.
+    #[serde(default = "default_component_roles")]
+    pub component_roles: Vec<bmux_plugin_sdk::definition::ComponentRole>,
+    /// Application-neutral interface versions exported by this component.
+    #[serde(default)]
+    pub contracts: Vec<bmux_plugin_sdk::definition::ContractDescriptor>,
+    /// Optional installation pin, checked only for the selected dynamic artifact.
+    /// This field is deliberately not part of the embedded manifest identity.
+    #[serde(default)]
+    pub artifact_sha256: Option<String>,
     /// Capabilities that may be invoked when a provider is available.
     #[serde(default)]
     pub optional_capabilities: BTreeSet<HostScope>,
@@ -204,12 +217,54 @@ pub struct PluginManifestKeybindings {
     pub scroll: BTreeMap<String, String>,
 }
 
+fn default_component_roles() -> Vec<bmux_plugin_sdk::definition::ComponentRole> {
+    vec![bmux_plugin_sdk::definition::ComponentRole::Backend]
+}
+
 impl PluginManifest {
+    /// Validate generic component identity without creating or loading an instance.
+    ///
+    /// # Errors
+    /// Returns an error for empty/duplicate roles or contracts, or an invalid artifact pin.
+    pub fn validate_component_identity(&self) -> Result<()> {
+        if self.component_roles.is_empty()
+            || self
+                .component_roles
+                .iter()
+                .enumerate()
+                .any(|(index, role)| self.component_roles[..index].contains(role))
+        {
+            return Err(PluginError::ServiceProtocol {
+                details: format!(
+                    "plugin '{}' has empty or duplicate component roles",
+                    self.id
+                ),
+            });
+        }
+        let mut ids = BTreeSet::new();
+        for contract in &self.contracts {
+            if contract.interface_id.trim().is_empty() || !ids.insert(&contract.interface_id) {
+                return Err(PluginError::ServiceProtocol {
+                    details: format!("plugin '{}' has empty or duplicate contract ids", self.id),
+                });
+            }
+        }
+        if self.artifact_sha256.as_ref().is_some_and(|digest| {
+            digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+        }) {
+            return Err(PluginError::ServiceProtocol {
+                details: format!("plugin '{}' has invalid artifact SHA-256", self.id),
+            });
+        }
+        Ok(())
+    }
+
     /// # Errors
     ///
     /// Returns an error when the manifest cannot be parsed.
     pub fn from_toml_str(value: &str) -> Result<Self> {
         let manifest: Self = toml::from_str(value)?;
+        manifest.validate_component_identity()?;
         manifest.validate_auxiliary_executables()?;
         Ok(manifest)
     }
@@ -227,6 +282,7 @@ impl PluginManifest {
     /// Returns an error when the manifest cannot be converted into a checked
     /// declaration.
     pub fn to_declaration(&self) -> Result<PluginDeclaration> {
+        self.validate_component_identity()?;
         self.validate_extensions()?;
         let declaration = PluginDeclaration {
             id: PluginId::new(self.id.clone())?,

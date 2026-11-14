@@ -1250,39 +1250,28 @@ impl WorkspacesCommandsService for WorkspacesCommandsHandle {
     }
 }
 
-bmux_plugin_sdk::export_plugin!(WorkspacesPlugin, include_str!("../plugin.toml"));
+bmux_plugin_sdk::define_plugin!(
+    factory = |scope: bmux_plugin_sdk::definition::PluginCreateContext| {
+        Ok(std::sync::Arc::new(
+            bmux_plugin_sdk::definition::RustPluginAdapter::for_instance(
+                WorkspacesPlugin,
+                scope.instance,
+            ),
+        )
+            as std::sync::Arc<
+                dyn bmux_plugin_sdk::definition::PluginInstance,
+            >)
+    },
+    metadata = bmux_plugin_sdk::definition::PluginDefinition::from_rust_plugin::<WorkspacesPlugin>(
+        include_str!("../plugin.toml"),
+        vec![bmux_plugin_sdk::definition::ComponentRole::Backend],
+    )
+    .expect("embedded foundational declaration must be valid")
+    .metadata,
+);
 
 #[cfg(test)]
 mod tests {
-    fn checked_test_router(
-        router: bmux_plugin::test_support::TestServiceRouter,
-    ) -> bmux_plugin::test_support::TestServiceRouter {
-        std::sync::Arc::new(
-            // The test router ABI returns PluginError by value.
-            #[allow(clippy::result_large_err)]
-            move |caller, client, capability, kind, interface, operation, payload| {
-                if !bmux_plugin_sdk::service_contract::is_checked(&payload) {
-                    return router(
-                        caller, client, capability, kind, interface, operation, payload,
-                    );
-                }
-                let contract = <bmux_clients_plugin_api::Contract as bmux_plugin_sdk::PluginContract>::service_contract_for(interface)
-                .or_else(|| <bmux_contexts_plugin_api::Contract as bmux_plugin_sdk::PluginContract>::service_contract_for(interface))
-                .or_else(|| <bmux_tabs_plugin_api::Contract as bmux_plugin_sdk::PluginContract>::service_contract_for(interface))
-                    .expect("mock service must have a declared generated contract");
-                let request =
-                    bmux_plugin_sdk::service_contract::decode_for(interface, contract, &payload)?
-                        .to_vec();
-                let response = router(
-                    caller, client, capability, kind, interface, operation, request,
-                )?;
-                Ok(bmux_plugin_sdk::service_contract::encode_response(
-                    &response,
-                ))
-            },
-        )
-    }
-
     #[test]
     fn catalog_write_failure_does_not_publish_new_workspace() {
         struct FailingStorage;
@@ -1339,7 +1328,6 @@ mod tests {
     use super::*;
     use bmux_clients_plugin_api::clients_state::{ClientQueryError, ClientSummary};
     use bmux_contexts_plugin_api::contexts_commands::{ContextAck, SetContextAttributesError};
-    use bmux_plugin::test_support::{TestServiceRouter, install_test_service_router};
     use bmux_plugin_sdk::{
         PluginError, ServiceKind, StorageGetResponse, decode_service_message,
         encode_service_message,
@@ -1543,20 +1531,6 @@ mod tests {
                 operation: "workspaces_test_kernel",
             })
         }
-    }
-
-    // The shared test router contract uses PluginError directly; boxing it here
-    // would make the closure incompatible with install_test_service_router.
-    #[allow(clippy::result_large_err)]
-    fn install_host_router(
-        host: Arc<MockHost>,
-    ) -> bmux_plugin::test_support::TestServiceRouterGuard {
-        let router: TestServiceRouter = Arc::new(
-            move |_plugin, _client, _capability, kind, interface, operation, payload| {
-                host.call_service_raw("", kind, interface, operation, payload)
-            },
-        );
-        install_test_service_router(checked_test_router(router))
     }
 
     fn context(id: u128, workspace_id: Uuid) -> contexts_state::ContextSummary {
@@ -1779,7 +1753,6 @@ mod tests {
                 context(103, other),
             ],
         ));
-        let _router = install_host_router(host.clone());
         install_workspace_state(WorkspaceState {
             records: vec![
                 WorkspaceRecord {
@@ -1827,7 +1800,6 @@ mod tests {
             first_client,
             vec![first_context.clone(), second_context.clone()],
         ));
-        let _router = install_host_router(Arc::clone(&host));
         install_workspace_state(WorkspaceState {
             records: vec![
                 WorkspaceRecord {
@@ -1897,7 +1869,6 @@ mod tests {
             deleting_client,
             vec![removed_context, fallback_context],
         ));
-        let _router = install_host_router(Arc::clone(&host));
         global_event_bus().register_channel::<WorkspaceEvent>(workspaces_events::EVENT_KIND);
         let mut events = global_event_bus()
             .subscribe::<WorkspaceEvent>(&workspaces_events::EVENT_KIND)
@@ -1978,5 +1949,52 @@ mod tests {
         assert_eq!(workspace_attribute(Uuid::nil()), "default");
         let id = Uuid::from_u128(42);
         assert_eq!(workspace_attribute(id), id.to_string());
+    }
+}
+
+#[cfg(test)]
+mod definition_contract_tests {
+    #[test]
+    fn explicit_contract_versions_preserve_service_wire_routes() {
+        let definition = super::plugin_definition();
+        let manifest =
+            bmux_plugin::PluginManifest::from_toml_str(include_str!("../plugin.toml")).unwrap();
+        let canonical = bmux_plugin_sdk::definition::PluginDefinition::from_rust_plugin::<
+            super::WorkspacesPlugin,
+        >(
+            include_str!("../plugin.toml"),
+            vec![bmux_plugin_sdk::definition::ComponentRole::Backend],
+        )
+        .unwrap();
+        definition.validate().unwrap();
+        assert_eq!(definition.metadata, canonical.metadata);
+        assert_eq!(definition.metadata.plugin_id, manifest.id);
+        assert_eq!(definition.metadata.version, manifest.version);
+        assert_eq!(definition.metadata.roles, manifest.component_roles);
+        let declared: std::collections::BTreeSet<_> = manifest
+            .contracts
+            .iter()
+            .map(|contract| (&contract.interface_id, contract.major, contract.minor))
+            .collect();
+        let embedded: std::collections::BTreeSet<_> = definition
+            .metadata
+            .contracts
+            .iter()
+            .map(|contract| (&contract.interface_id, contract.major, contract.minor))
+            .collect();
+        assert_eq!(embedded, declared);
+        let mut services = definition.declarations().unwrap().services;
+        services.extend(
+            <super::WorkspacesPlugin as bmux_plugin_sdk::RustPlugin>::declared_services().unwrap(),
+        );
+        for service in services {
+            let contract = definition
+                .metadata
+                .contracts
+                .iter()
+                .find(|contract| contract.interface_id == service.interface_id)
+                .expect("every retained route requires explicit compatibility metadata");
+            assert_eq!((contract.major, contract.minor), (1, 0));
+        }
     }
 }

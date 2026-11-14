@@ -5,6 +5,16 @@
 //! runtime rather than plugin API contracts or product-domain plugins.
 
 pub mod background;
+pub mod identity;
+pub mod scope;
+pub use identity::{
+    PluginActivationId, PluginInstanceId, PluginResourceId, PluginRuntimeScopeId,
+    RuntimeInvocationId,
+};
+pub use scope::{
+    ActivationScope, AdmissionGuard, CallbackAdmission, CallbackCapability, InstanceScope,
+    InvocationScope, LifecycleInvocationKind, LifecycleState, ScopeError,
+};
 pub mod shutdown;
 pub mod shutdown_progress;
 

@@ -130,34 +130,56 @@ mod tests {
         }
     }
 
-    // TestServiceRouter fixes the error type to the SDK's existing PluginError.
-    #[allow(clippy::result_large_err)]
-    #[test]
-    fn generated_client_reaches_native_caller_bound_provider() {
-        use bmux_clients_plugin_api::clients_identity;
+    // The fixture is the trusted host: caller provenance is captured here, not
+    // recovered from a consumer's serializable NativeServiceContext fields.
+    struct IdentityHostDispatch(bmux_plugin_sdk::NativeServiceContext);
+
+    impl bmux_plugin_sdk::HostServiceDispatch for IdentityHostDispatch {
+        // HostServiceDispatch fixes this return type to the SDK's PluginError.
+        #[allow(clippy::result_large_err)]
+        fn invoke(
+            &self,
+            _: &bmux_plugin_runtime::InvocationScope,
+            request: bmux_plugin_sdk::HostServiceRequest<'_>,
+        ) -> bmux_plugin_sdk::Result<Vec<u8>> {
+            use bmux_clients_plugin_api::clients_identity;
+            use bmux_plugin_sdk::RustPlugin;
+
+            assert_eq!(request.capability, "bmux.clients.read");
+            assert_eq!(request.kind, bmux_plugin_sdk::ServiceKind::Query);
+            assert_eq!(request.interface, "clients-identity/v1");
+            let mut invocation = self.0.clone();
+            invocation.request.operation = request.operation.into();
+            invocation.request.payload = bmux_plugin_sdk::service_contract::decode_for(
+                request.interface,
+                clients_identity::SERVICE_CONTRACT,
+                request.payload,
+            )?
+            .to_vec();
+            let response = crate::ClientsPlugin.invoke_service(invocation);
+            assert!(response.error.is_none(), "{:?}", response.error);
+            Ok(bmux_plugin_sdk::service_contract::encode_response(
+                &response.payload,
+            ))
+        }
+    }
+
+    fn identity_service_context(first: Uuid) -> bmux_plugin_sdk::NativeServiceContext {
         use bmux_plugin_sdk::{
             ApiVersion, HostConnectionInfo, HostMetadata, HostScope, NativeServiceContext,
-            ProviderId, RegisteredService, RustPlugin, ServiceKind, ServiceRequest,
+            ProviderId, RegisteredService, ServiceKind, ServiceRequest,
         };
-        use std::sync::{Arc, RwLock};
-
-        let first = Uuid::from_u128(101);
-        let second = Uuid::from_u128(102);
-        let owner = Uuid::from_u128(103);
-        let other_owner = Uuid::from_u128(104);
-        let lookup = ClientPrincipalHandle::new(Principals::default());
-        lookup.0.set(ClientId(first), owner);
-        lookup.0.set(ClientId(second), other_owner);
-        let state = Arc::new(RwLock::new(lookup.clone()));
-        bmux_plugin::global_plugin_state_registry().register(&state);
-        let context = NativeServiceContext {
+        NativeServiceContext {
+            host_service_port: None,
             plugin_id: "bmux.clients".into(),
             request: ServiceRequest {
                 caller_plugin_id: "test.consumer".into(),
                 service: RegisteredService {
                     capability: HostScope::new("bmux.clients.read").unwrap(),
                     kind: ServiceKind::Query,
-                    interface_id: clients_identity::INTERFACE_ID.as_str().into(),
+                    interface_id: bmux_clients_plugin_api::clients_identity::INTERFACE_ID
+                        .as_str()
+                        .into(),
                     provider: ProviderId::Plugin("bmux.clients".into()),
                 },
                 operation: "current-principal".into(),
@@ -187,33 +209,58 @@ mod tests {
             caller_client_id: Some(first),
             cancellation: bmux_plugin_sdk::CancellationToken::default(),
             host_kernel_bridge: None,
+        }
+    }
+
+    #[test]
+    fn generated_client_reaches_native_caller_bound_provider() {
+        use bmux_clients_plugin_api::clients_identity;
+        use std::sync::{Arc, RwLock};
+
+        let first = Uuid::from_u128(101);
+        let second = Uuid::from_u128(102);
+        let owner = Uuid::from_u128(103);
+        let other_owner = Uuid::from_u128(104);
+        let lookup = ClientPrincipalHandle::new(Principals::default());
+        lookup.0.set(ClientId(first), owner);
+        lookup.0.set(ClientId(second), other_owner);
+        let state = Arc::new(RwLock::new(lookup.clone()));
+        bmux_plugin::global_plugin_state_registry().register(&state);
+        let context = identity_service_context(first);
+        let instance = bmux_plugin_runtime::InstanceScope::new(
+            bmux_plugin_runtime::PluginRuntimeScopeId::from_uuid(Uuid::from_u128(105)),
+        );
+        let activation = instance
+            .begin_activation(bmux_plugin_runtime::PluginConcurrencyConfig::Concurrent)
+            .unwrap();
+        activation.mark_active().unwrap();
+        let bind = |caller| {
+            let invocation = activation.begin_invocation().unwrap();
+            let mut target = context.clone();
+            target.caller_client_id = Some(caller);
+            let port = bmux_plugin_sdk::BoundHostServicePort::new(
+                invocation.clone(),
+                Arc::new(IdentityHostDispatch(target)),
+            );
+            (
+                invocation,
+                bmux_plugin_sdk::PluginHostServices::from_bound(port),
+            )
         };
-        let target = context.clone();
-        let _router = bmux_plugin::test_support::install_test_service_router(Arc::new(
-            move |_, caller, capability, kind, interface, operation, payload| {
-                assert_eq!(capability, "bmux.clients.read");
-                assert_eq!(kind, ServiceKind::Query);
-                assert_eq!(interface, "clients-identity/v1");
-                let mut invocation = target.clone();
-                invocation.caller_client_id = caller;
-                invocation.request.operation = operation.into();
-                invocation.request.payload = bmux_plugin_sdk::service_contract::decode_for(
-                    interface,
-                    clients_identity::SERVICE_CONTRACT,
-                    &payload,
-                )
-                .unwrap()
-                .to_vec();
-                let response = crate::ClientsPlugin.invoke_service(invocation);
-                assert!(response.error.is_none(), "{:?}", response.error);
-                Ok(bmux_plugin_sdk::service_contract::encode_response(
-                    &response.payload,
-                ))
-            },
-        ));
+        let mut unbound = bmux_plugin::ServiceCallerDispatchClient::new(&context);
+        assert!(
+            bmux_plugin::block_on_typed_dispatch(clients_identity::client::current_principal(
+                &mut unbound
+            ),)
+            .is_err()
+        );
         for (caller, expected) in [(first, owner), (second, other_owner)] {
             let mut invocation = context.clone();
-            invocation.caller_client_id = Some(caller);
+            // Spoof the opposite connection in the consumer context: only the
+            // trusted bound port may determine the provider's caller.
+            invocation.caller_client_id = Some(if caller == first { second } else { first });
+            let (scope, port) = bind(caller);
+            invocation.host_service_port = Some(port);
             let mut client = bmux_plugin::ServiceCallerDispatchClient::new(&invocation);
             assert_eq!(
                 bmux_plugin::block_on_typed_dispatch(clients_identity::client::current_principal(
@@ -224,9 +271,18 @@ mod tests {
                     principal_id: expected
                 }),
             );
+            scope.close().unwrap();
+            assert!(
+                bmux_plugin::block_on_typed_dispatch(clients_identity::client::current_principal(
+                    &mut client
+                ),)
+                .is_err()
+            );
         }
         lookup.0.remove(ClientId(first));
-        let mut client = bmux_plugin::ServiceCallerDispatchClient::new(&context);
+        let (scope, port) = bind(first);
+        let disconnected = context.clone().with_host_service_port(port);
+        let mut client = bmux_plugin::ServiceCallerDispatchClient::new(&disconnected);
         assert_eq!(
             bmux_plugin::block_on_typed_dispatch(clients_identity::client::current_principal(
                 &mut client
@@ -234,6 +290,7 @@ mod tests {
             .unwrap(),
             Err(IdentityError::PrincipalUnavailable),
         );
+        scope.close().unwrap();
     }
 
     struct KernelCaller {

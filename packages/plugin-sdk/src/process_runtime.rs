@@ -292,6 +292,7 @@ mod tests {
             cancellation: cancellation.clone(),
             plugin_id: "test.plugin".to_string(),
             context: crate::NativeServiceContext {
+                host_service_port: None,
                 plugin_id: "test.plugin".to_string(),
                 request: crate::ServiceRequest {
                     caller_plugin_id: "caller.plugin".to_string(),

@@ -1,7 +1,6 @@
 #![cfg_attr(feature = "fail-on-warnings", deny(warnings))]
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
-#![cfg_attr(feature = "static-bundled", allow(dead_code))]
 
 use bmux_tab_bar_plugin_api as contract;
 
@@ -497,6 +496,12 @@ impl RustPlugin for TabBarPlugin {
     }
 
     fn invoke_service(&self, context: NativeServiceContext) -> ServiceResponse {
+        Self::service(&context)
+    }
+}
+
+impl TabBarPlugin {
+    fn service(context: &NativeServiceContext) -> ServiceResponse {
         bmux_plugin_sdk::route_service!(context, {
             "presentation-actions/v2", "move-selection" => |req: contract::presentation_actions::client::MoveSelectionRequest, ctx| {
                 group_actions::execute(req, ctx)
@@ -527,6 +532,30 @@ impl RustPlugin for TabBarPlugin {
         })
     }
 }
+
+bmux_plugin_sdk::define_plugin!(
+    factory = |scope: bmux_plugin_sdk::definition::PluginCreateContext| Ok(std::sync::Arc::new(
+        bmux_plugin_sdk::definition::RustPluginAdapter::for_instance(TabBarPlugin, scope.instance)
+    )
+        as std::sync::Arc<dyn bmux_plugin_sdk::definition::PluginInstance>),
+    metadata = {
+        let manifest_toml = include_str!("../plugin.toml");
+        let manifest = bmux_plugin::PluginManifest::from_toml_str(manifest_toml)
+            .expect("embedded plugin declaration must be valid");
+        bmux_plugin_sdk::definition::PluginMetadata {
+            plugin_id: manifest.id,
+            version: manifest.version,
+            roles: manifest.component_roles,
+            required_capabilities: manifest
+                .required_capabilities
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            contracts: manifest.contracts,
+            manifest_toml: Some(manifest_toml.into()),
+        }
+    },
+);
 
 fn input_endpoint() -> bmux_plugin::AttachInputEndpoint {
     bmux_plugin::AttachInputEndpoint {
@@ -639,6 +668,22 @@ fn register_presentation_input(
     );
 }
 
+/// Declare an instance-owned frontend factory for the invoking attach runtime.
+/// The caller binds the same fact registry to its backend producer service.
+#[must_use]
+pub fn frontend_companion(
+    settings: Option<toml::Value>,
+    facts: std::sync::Arc<bmux_presentation_state::PresentationFactRegistry>,
+) -> bmux_plugin::AttachCompanion {
+    bmux_plugin::AttachCompanion::from_factory(
+        OWNER,
+        std::sync::Arc::new(move |resources| {
+            TabBarPresentation::install_scoped(settings.as_ref(), resources, facts.clone())
+                .map(|presentation| Box::new(presentation) as Box<dyn Send + Sync>)
+        }),
+    )
+}
+
 /// One runtime-owned tab-bar installation and its subscriptions.
 pub struct TabBarPresentation {
     owner: CompanionHandle,
@@ -664,11 +709,33 @@ impl TabBarPresentation {
         )
     }
 
-    fn install_with_facts(
+    /// Install using facts owned by the same runtime as the presentation.
+    ///
+    /// Unlike the legacy `install` entry point, this never reads process-global
+    /// presentation facts. The producer registry must be shared explicitly with
+    /// the backend service for this runtime.
+    ///
+    /// # Errors
+    /// Returns configuration, subscription, publication or runtime errors.
+    pub fn install_scoped(
         settings: Option<&toml::Value>,
         resources: &bmux_plugin::AttachPresentationResources,
-        fact_registry: &'static bmux_presentation_state::PresentationFactRegistry,
+        facts: std::sync::Arc<bmux_presentation_state::PresentationFactRegistry>,
     ) -> Result<Self, String> {
+        Self::install_with_facts(settings, resources, facts)
+    }
+
+    fn install_with_facts<F>(
+        settings: Option<&toml::Value>,
+        resources: &bmux_plugin::AttachPresentationResources,
+        fact_registry: F,
+    ) -> Result<Self, String>
+    where
+        F: std::ops::Deref<Target = bmux_presentation_state::PresentationFactRegistry>
+            + Send
+            + Sync
+            + 'static,
+    {
         let settings = Settings::parse(settings).map_err(|error| error.to_string())?;
         let request = layout_request(&settings);
         let handle = tokio::runtime::Handle::try_current().map_err(|error| error.to_string())?;
@@ -697,7 +764,7 @@ impl TabBarPresentation {
         let mut facts_rx = fact_registry.subscribe_changes();
         let mut companion = CompanionState::new(settings);
         let mut external_feeds = ExternalFeeds::subscribe(&resources.events, &mut companion)?;
-        companion.live_indicator = live_indicator::read(fact_registry);
+        companion.live_indicator = live_indicator::read(&fact_registry);
         let mut workspaces_rx = workspace_subscription.map(|(snapshot, rx)| {
             companion.workspace_choices.clone_from(&snapshot.workspaces);
             rx
@@ -730,7 +797,7 @@ impl TabBarPresentation {
                     result = facts_rx.changed() => {
                         if result.is_err() { break; }
                         facts_rx.borrow_and_update();
-                        PresentationUpdate::Indicator(live_indicator::read(fact_registry))
+                        PresentationUpdate::Indicator(live_indicator::read(&fact_registry))
                     }
                     result = async {
                         match &mut workspaces_rx {
@@ -2261,8 +2328,6 @@ fn handle_local_input(
     None
 }
 
-bmux_plugin_sdk::export_plugin!(TabBarPlugin, include_str!("../plugin.toml"));
-
 #[cfg(test)]
 fn decode_action_payload<T: serde::de::DeserializeOwned>(
     invocation: &AttachInputServiceInvocation,
@@ -2288,6 +2353,32 @@ fn decode_action_payload<T: serde::de::DeserializeOwned>(
 #[cfg(test)]
 mod tests {
     use bmux_plugin_sdk::PluginContract;
+
+    #[test]
+    fn shared_definition_preserves_contract_and_capability_requirements() {
+        let definition = plugin_definition();
+        let manifest =
+            bmux_plugin::PluginManifest::from_toml_str(include_str!("../plugin.toml")).unwrap();
+        assert_eq!(definition.metadata.plugin_id, manifest.id);
+        assert_eq!(
+            definition.metadata.required_capabilities,
+            manifest
+                .required_capabilities
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            definition.metadata.contracts[0].interface_id,
+            "presentation-actions/v2"
+        );
+        assert_eq!(definition.metadata.contracts[0].major, 2);
+        assert_eq!(
+            definition.metadata.manifest_toml.as_deref(),
+            Some(include_str!("../plugin.toml"))
+        );
+    }
+
     #[test]
     fn retained_actions_bind_generated_request_and_interface_before_effects() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2355,9 +2446,10 @@ mod tests {
 
         // Isolated retained facts exercise the real attach companion subscription,
         // not a global publisher that could interfere with parallel UI tests.
-        let facts = Box::leak(Box::new(PresentationFactRegistry::new()));
+        let facts = std::sync::Arc::new(PresentationFactRegistry::new());
         let resources = populated_resources(900);
-        let presentation = TabBarPresentation::install_with_facts(None, &resources, facts).unwrap();
+        let presentation =
+            TabBarPresentation::install_scoped(None, &resources, facts.clone()).unwrap();
         let baseline = resources.surfaces.owner_snapshot(OWNER).unwrap();
         let text = |snapshot: &PluginSurfaceSnapshot| {
             snapshot
@@ -4176,5 +4268,70 @@ bar_bg = "#112233"
         );
         assert_eq!(surface.interactive_regions[1].local_id, format!("tab:{id}"));
         assert!(surface.accepts_input);
+    }
+}
+
+#[cfg(test)]
+mod embedded_declaration_identity_tests {
+    #[test]
+    fn definition_and_selected_manifest_have_one_identity() {
+        let definition = super::plugin_definition();
+        definition.validate().expect("definition validates");
+        let embedded = definition
+            .metadata
+            .manifest_toml
+            .as_deref()
+            .expect("embedded declaration");
+        let manifest =
+            bmux_plugin::PluginManifest::from_toml_str(embedded).expect("valid manifest");
+        assert_eq!(definition.metadata.plugin_id, manifest.id);
+        assert_eq!(definition.metadata.version, manifest.version);
+        assert_eq!(definition.metadata.roles, manifest.component_roles);
+        assert_eq!(definition.metadata.contracts, manifest.contracts);
+        assert_eq!(
+            definition.metadata.required_capabilities,
+            manifest
+                .required_capabilities
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        );
+
+        // Deterministic verifier fixtures, not claims about built executable bytes.
+        // Real selected artifact hashing remains the loader's responsibility.
+        let expected_digest = "a".repeat(64);
+        let wrong_digest = "b".repeat(64);
+        let pinned = format!("artifact_sha256 = \"{expected_digest}\"\n{embedded}");
+        let mut inventory = bmux_plugin::PluginCandidateInventory::new();
+        inventory
+            .add_bundled_manifest(&pinned, Vec::new())
+            .expect("inventory declaration");
+        for role in &manifest.component_roles {
+            let selected = inventory
+                .select(&bmux_plugin::PluginSelectionRequest {
+                    plugin_id: manifest.id.clone(),
+                    role: *role,
+                    preference: bmux_plugin::PluginCandidatePreference::Bundled,
+                    plugin_api: bmux_plugin_sdk::ApiVersion::new(1, 1),
+                    native_abi: bmux_plugin_sdk::ApiVersion::new(1, 1),
+                    contracts: manifest.contracts.clone(),
+                })
+                .expect("select declared role and contracts");
+            selected
+                .validate_embedded_metadata(&definition.metadata, &expected_digest)
+                .expect("selected declaration and embedded identity match");
+            assert!(
+                selected
+                    .validate_embedded_metadata(&definition.metadata, &wrong_digest)
+                    .is_err()
+            );
+            let mut conflicting = definition.metadata.clone();
+            conflicting.version.push_str("-conflict");
+            assert!(
+                selected
+                    .validate_embedded_metadata(&conflicting, &expected_digest)
+                    .is_err()
+            );
+        }
     }
 }

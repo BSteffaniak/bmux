@@ -1,7 +1,8 @@
 //! Typed process orchestration. This module never owns a PTY engine.
+use crate::process_dispatch::ProcessDispatchClient;
 use anyhow::{Context, Result, ensure};
 use bmux_pane_runtime_plugin_api::pane_runtime_execution_v4 as pane;
-use bmux_plugin::{ServiceCallerDispatchClient, TypedServiceCaller};
+use bmux_plugin::TypedServiceCaller;
 use bmux_recording_plugin_api::recording_process_v4 as process;
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -70,29 +71,20 @@ fn launch_intent(
 
 type Reply<'a, T> = Pin<Box<dyn Future<Output = Result<T, process::ProcessError>> + Send + 'a>>;
 
-static PROCESS_SERVICE: std::sync::OnceLock<Arc<ProcessService>> = std::sync::OnceLock::new();
-
-pub(crate) fn register(service: Arc<ProcessService>) {
-    let _ = PROCESS_SERVICE.set(service);
-}
-
-pub(crate) fn dispatch<T: Send + 'static>(
+pub(crate) fn dispatch_on<T: Send + 'static>(
+    service: &Arc<ProcessService>,
     context: &bmux_plugin_sdk::NativeServiceContext,
     operation: impl FnOnce(Arc<ProcessService>) -> Pin<Box<dyn Future<Output = T> + Send>>
     + Send
     + 'static,
 ) -> Result<T> {
-    let service = Arc::clone(
-        PROCESS_SERVICE
-            .get()
-            .context("process service unavailable")?,
-    );
     let service = Arc::new(ProcessService {
-        caller: Arc::new(TypedServiceCaller::from_service_context(context)),
+        caller: ProcessCaller::Invocation(Box::new(context.clone())),
         root: service.root.clone(),
         runtime_root: service.runtime_root.clone(),
         isolated: service.isolated,
         mutation: Arc::clone(&service.mutation),
+        manual: Arc::clone(&service.manual),
     });
     drive_process_operation(move || operation(service))
 }
@@ -129,11 +121,12 @@ where
 }
 
 pub(crate) struct ProcessService {
-    pub(super) caller: Arc<TypedServiceCaller>,
+    pub(super) caller: ProcessCaller,
     root: PathBuf,
     runtime_root: String,
     isolated: bool,
     mutation: Arc<Mutex<()>>,
+    manual: Arc<std::sync::RwLock<crate::ManualRecordingRuntimeHandle>>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -298,19 +291,80 @@ pub(crate) fn verified_launch_root(request: &str, owner: &str) -> Result<String>
     Ok(owner.to_owned())
 }
 
+#[derive(Clone)]
+pub(super) enum ProcessCaller {
+    Selected(Arc<TypedServiceCaller>),
+    Invocation(Box<bmux_plugin_sdk::NativeServiceContext>),
+}
+impl bmux_plugin::ServiceCaller for ProcessCaller {
+    fn call_service_async(
+        &self,
+        request: bmux_plugin_sdk::HostServiceOwnedRequest,
+    ) -> bmux_plugin_sdk::definition::PluginFuture<'_, bmux_plugin_sdk::Result<Vec<u8>>> {
+        match self {
+            Self::Selected(caller) => caller.call_service_async(request),
+            Self::Invocation(context) => Box::pin(async move {
+                context
+                    .host_service_port
+                    .as_ref()
+                    .ok_or(bmux_plugin_sdk::PluginError::UnsupportedHostOperation {
+                        operation: "call_service_async",
+                    })?
+                    .call_service_async(request)
+                    .await
+            }),
+        }
+    }
+
+    fn host_connection(&self) -> Option<&bmux_plugin_sdk::HostConnectionInfo> {
+        match self {
+            Self::Selected(caller) => caller.host_connection(),
+            Self::Invocation(context) => Some(&context.connection),
+        }
+    }
+    fn call_service_raw(
+        &self,
+        capability: &str,
+        kind: bmux_plugin_sdk::ServiceKind,
+        interface_id: &str,
+        operation: &str,
+        payload: Vec<u8>,
+    ) -> bmux_plugin_sdk::Result<Vec<u8>> {
+        match self {
+            Self::Selected(caller) => {
+                caller.call_service_raw(capability, kind, interface_id, operation, payload)
+            }
+            Self::Invocation(context) => {
+                context.call_service_raw(capability, kind, interface_id, operation, payload)
+            }
+        }
+    }
+    fn execute_kernel_request(
+        &self,
+        request: bmux_ipc::Request,
+    ) -> bmux_plugin_sdk::Result<bmux_ipc::ResponsePayload> {
+        match self {
+            Self::Selected(caller) => caller.execute_kernel_request(request),
+            Self::Invocation(context) => context.execute_kernel_request(request),
+        }
+    }
+}
+
 impl ProcessService {
     pub(crate) fn new(
         caller: Arc<TypedServiceCaller>,
         root: PathBuf,
         runtime_root: String,
         isolated: bool,
+        manual: Arc<std::sync::RwLock<crate::ManualRecordingRuntimeHandle>>,
     ) -> Self {
         Self {
-            caller,
+            caller: ProcessCaller::Selected(caller),
             root,
             runtime_root,
             isolated,
             mutation: Arc::new(Mutex::new(())),
+            manual,
         }
     }
 
@@ -375,7 +429,7 @@ impl ProcessService {
         &self,
     ) -> Result<bmux_pane_runtime_plugin_api::pane_runtime_human_input_v1::HumanInputCapabilities>
     {
-        let mut client = ServiceCallerDispatchClient::new(self.caller.as_ref());
+        let mut client = ProcessDispatchClient::new(&self.caller);
         Ok(
             bmux_pane_runtime_plugin_api::pane_runtime_human_input_v1::client::capabilities(
                 &mut client,
@@ -409,7 +463,7 @@ impl ProcessService {
     > {
         use bmux_pane_runtime_plugin_api::pane_runtime_human_input_v1 as human;
         let reference = self.human_reference(run_id)?;
-        let mut client = ServiceCallerDispatchClient::new(self.caller.as_ref());
+        let mut client = ProcessDispatchClient::new(&self.caller);
         human::client::open(&mut client, reference)
             .await
             .map_err(|error| human::HumanInputError::Closed {
@@ -433,7 +487,7 @@ impl ProcessService {
                 error: pane::TerminalExecutionError::StaleExecution,
             });
         }
-        let mut client = ServiceCallerDispatchClient::new(self.caller.as_ref());
+        let mut client = ProcessDispatchClient::new(&self.caller);
         human::client::push(&mut client, stream, sequence, data)
             .await
             .map_err(|error| human::HumanInputError::Uncertain {
@@ -453,7 +507,7 @@ impl ProcessService {
                 error: pane::TerminalExecutionError::StaleExecution,
             });
         }
-        let mut client = ServiceCallerDispatchClient::new(self.caller.as_ref());
+        let mut client = ProcessDispatchClient::new(&self.caller);
         human::client::close(&mut client, stream)
             .await
             .map_err(|error| human::HumanInputError::Closed {
@@ -465,7 +519,7 @@ impl ProcessService {
         &self,
     ) -> Result<bmux_pane_runtime_plugin_api::pane_runtime_presentation_wait_v1::WaitCapabilities>
     {
-        let mut client = ServiceCallerDispatchClient::new(self.caller.as_ref());
+        let mut client = ProcessDispatchClient::new(&self.caller);
         Ok(
             bmux_pane_runtime_plugin_api::pane_runtime_presentation_wait_v1::client::capabilities(
                 &mut client,
@@ -493,7 +547,7 @@ impl ProcessService {
         // Resolve durable ownership only; never refresh capture/status in this lane.
         let value = self.load(run_id).map_err(unavailable)?;
         let reference = execution(&value).map_err(unavailable)?;
-        let mut client = ServiceCallerDispatchClient::new(self.caller.as_ref());
+        let mut client = ProcessDispatchClient::new(&self.caller);
         let frame =
             bmux_pane_runtime_plugin_api::pane_runtime_pointer_grid_v1::client::wait_present(
                 &mut client,
@@ -538,10 +592,37 @@ impl ProcessService {
         Ok(value)
     }
 
+    /// Reconcile the durable launch before consulting transient process status.
+    /// A retained uncertain launch never authorizes a new reservation or replay;
+    /// callers retain it through `retain_incomplete_launch`.
+    async fn reconcile_launch_authority(
+        &self,
+        client: &mut impl bmux_plugin_sdk::TypedDispatchClient,
+        value: &process::RunStatus,
+    ) -> Result<pane::TerminalReconciliation> {
+        let mut authority = pane::client::reconcile(client, execution(value)?)
+            .await?
+            .map_err(|error| anyhow::anyhow!("reconcile: {error:?}"))?;
+        if matches!(authority.launch.phase, pane::TerminalLaunchPhase::Reserved) {
+            let reservation = self.store()?.reservation(value.run_id)?;
+            pane::client::launch(client, reservation)
+                .await?
+                .map_err(|error| anyhow::anyhow!("reserved launch: {error:?}"))?;
+            authority = pane::client::reconcile(client, execution(value)?)
+                .await?
+                .map_err(|error| anyhow::anyhow!("reconcile: {error:?}"))?;
+        }
+        // Canonical recovery authority is meaningful even when no live process
+        // exists. Persist it before querying transient status so NotFound cannot
+        // erase the actual fenced launch/authorization failure.
+        self.store()?.write_authority(value.run_id, &authority)?;
+        Ok(authority)
+    }
+
     async fn refresh(&self, id: Uuid) -> Result<process::RunStatus> {
         let mut value = self.load(id)?;
         if value.capture_finalized {
-            let mut client = ServiceCallerDispatchClient::new(self.caller.as_ref());
+            let mut client = ProcessDispatchClient::new(&self.caller);
             return refresh_finalized_cleanup(&mut client, &self.store()?, &self.mutation, value)
                 .await;
         }
@@ -554,34 +635,24 @@ impl ProcessService {
             });
             self.store()?.replace(value.revision, &mut value)?;
         }
-        let mut client = ServiceCallerDispatchClient::new(self.caller.as_ref());
-        let mut authority = pane::client::reconcile(&mut client, execution(&value)?)
-            .await?
-            .map_err(|error| anyhow::anyhow!("reconcile: {error:?}"))?;
-        if matches!(authority.launch.phase, pane::TerminalLaunchPhase::Reserved) {
-            let reservation = self.store()?.reservation(id)?;
-            pane::client::launch(&mut client, reservation)
-                .await?
-                .map_err(|error| anyhow::anyhow!("reserved launch: {error:?}"))?;
-            authority = pane::client::reconcile(&mut client, execution(&value)?)
-                .await?
-                .map_err(|error| anyhow::anyhow!("reconcile: {error:?}"))?;
-        }
-        self.store()?.write_authority(id, &authority)?;
+        let mut client = ProcessDispatchClient::new(&self.caller);
+        let authority = self.reconcile_launch_authority(&mut client, &value).await?;
         if retain_incomplete_launch(&mut value, &authority.launch) {
             return self.retain_launch_outcome(id, &authority.launch);
         }
-        let capture_active = crate::manual_handle()
-            .and_then(|handle| {
-                handle.read().ok().and_then(|handle| {
-                    handle
-                        .0
-                        .lock()
-                        .ok()
-                        .and_then(|runtime| runtime.active_capture_target())
-                })
-            })
-            .is_some_and(|(recording, _)| recording == value.recording_id);
+        let capture_active = {
+            let handle = self
+                .manual
+                .read()
+                .map_err(|_| anyhow::anyhow!("manual recording handle poisoned"))?;
+            let runtime = handle
+                .0
+                .lock()
+                .map_err(|_| anyhow::anyhow!("manual recording runtime poisoned"))?;
+            runtime
+                .active_capture_target()
+                .is_some_and(|(recording, _)| recording == value.recording_id)
+        };
         let original_closed =
             original_writer_closed(&self.root.join(value.recording_id.to_string()), &value)?;
         if !capture_active && !original_closed {
@@ -648,7 +719,7 @@ impl ProcessService {
             cursor.offset <= authority.continuation_cursor.offset,
             "capture cursor beyond authority"
         );
-        let mut client = ServiceCallerDispatchClient::new(self.caller.as_ref());
+        let mut client = ProcessDispatchClient::new(&self.caller);
         for _ in 0..64 {
             if cursor.offset == authority.continuation_cursor.offset {
                 return Ok(());
@@ -688,7 +759,7 @@ impl ProcessService {
         let store = self.store()?;
         let mut existing = store.load(id).context("admitted launch has no committed run metadata; recovery required; refusing blind relaunch")?;
         if existing.execution.is_none() {
-            let mut client = ServiceCallerDispatchClient::new(self.caller.as_ref());
+            let mut client = ProcessDispatchClient::new(&self.caller);
             // Reserve is idempotent against the exact persisted mutation/options;
             // it cannot spawn. Lost reserve replies recover the same identity.
             let reservation = reserve_program(
@@ -766,7 +837,7 @@ impl ProcessService {
     }
 
     pub(crate) async fn environment_capabilities(&self) -> Result<u32> {
-        let mut client = ServiceCallerDispatchClient::new(self.caller.as_ref());
+        let mut client = ProcessDispatchClient::new(&self.caller);
         Ok(
             bmux_pane_runtime_plugin_api::pane_runtime_environment_v1::client::capabilities(
                 &mut client,
@@ -837,10 +908,10 @@ impl ProcessService {
         let mut value = Self::initial_status(id, launch_mutation_id, recording.id, runtime_root);
         // Acknowledged metadata precedes launch; failure to persist prevents execution.
         if let Err(error) = self.store()?.create(&value) {
-            let _ = stop_capture(recording.id);
+            let _ = stop_capture(&self.manual, recording.id);
             return Err(error);
         }
-        let mut client = ServiceCallerDispatchClient::new(self.caller.as_ref());
+        let mut client = ProcessDispatchClient::new(&self.caller);
         let reservation = reserve_program(
             &mut client,
             environment,
@@ -897,7 +968,7 @@ impl ProcessService {
                 value
                     .errors
                     .push(format!("program launch failed: {result:?}"));
-                match stop_capture(recording.id) {
+                match stop_capture(&self.manual, recording.id) {
                     Ok(()) => value.capture_finalized = true,
                     Err(error) => value.errors.push(error.to_string()),
                 }
@@ -924,7 +995,8 @@ impl ProcessService {
                 .mutation
                 .lock()
                 .map_err(|_| anyhow::anyhow!("process authority lock poisoned"))?;
-            let handle = crate::manual_handle().context("manual recording runtime unavailable")?;
+            let handle =
+                Some(Arc::clone(&self.manual)).context("manual recording runtime unavailable")?;
             let handle = handle
                 .read()
                 .map_err(|_| anyhow::anyhow!("recording handle poisoned"))?;
@@ -950,7 +1022,7 @@ impl ProcessService {
             &Path::new(&recording.path).join("viewport.json"),
             &serde_json::to_vec(&(options.cols, options.rows))?,
         ) {
-            let _ = stop_capture(recording.id);
+            let _ = stop_capture(&self.manual, recording.id);
             return Err(error);
         }
         Ok(recording)
@@ -965,7 +1037,7 @@ impl ProcessService {
         let format: presentation::TerminalCaptureFormat =
             serde_json::from_slice(&std::fs::read(directory.join("capture-format.json"))?)?;
         let reference = execution(value)?;
-        let mut client = ServiceCallerDispatchClient::new(self.caller.as_ref());
+        let mut client = ProcessDispatchClient::new(&self.caller);
         let mut offset = 0;
         let mut bytes = Vec::new();
         loop {
@@ -1001,7 +1073,7 @@ impl ProcessService {
 
     async fn persist_raw_source(&self, value: &process::RunStatus, watermark: u64) -> Result<()> {
         let reservation = self.store()?.reservation(value.run_id)?;
-        let mut client = ServiceCallerDispatchClient::new(self.caller.as_ref());
+        let mut client = ProcessDispatchClient::new(&self.caller);
         let bytes = collect_raw_source(&mut client, reservation.initial_cursor, watermark).await?;
         let path = self
             .root
@@ -1023,7 +1095,7 @@ impl ProcessService {
         let manifest: crate::recording_runtime::Manifest =
             serde_json::from_slice(&std::fs::read(directory.join("manifest.json"))?)?;
         if manifest.summary.ended_epoch_ms.is_none() {
-            stop_capture(value.recording_id)?;
+            stop_capture(&self.manual, value.recording_id)?;
             // Persist original writer disposition independently of derived raw
             // verification: a later repair must not lose genuine event timing.
             let closure = closed_original_events(&directory, value, watermark)?;
@@ -1058,7 +1130,7 @@ impl ProcessService {
         if initial.capture_finalized {
             return Ok(initial);
         }
-        let mut client = ServiceCallerDispatchClient::new(self.caller.as_ref());
+        let mut client = ProcessDispatchClient::new(&self.caller);
         let status = self
             .execution_status(&mut client, execution(&initial)?, None)
             .await?;
@@ -1111,7 +1183,7 @@ impl ProcessService {
             serde_json::from_slice(&std::fs::read(directory.join("manifest.json"))?)?;
         // Recovery after a durable writer stop but interrupted derived artifact publication.
         if manifest.summary.ended_epoch_ms.is_none()
-            && let Err(error) = stop_capture(value.recording_id)
+            && let Err(error) = stop_capture(&self.manual, value.recording_id)
         {
             value.errors.push(error.to_string());
             store.replace(expected, &mut value)?;
@@ -1197,8 +1269,11 @@ fn execution(value: &process::RunStatus) -> Result<pane::TerminalExecutionRef> {
     })
 }
 
-pub(crate) fn stop_capture(id: Uuid) -> Result<()> {
-    let handle = crate::manual_handle().context("manual recording runtime unavailable")?;
+pub(crate) fn stop_capture(
+    manual: &Arc<std::sync::RwLock<crate::ManualRecordingRuntimeHandle>>,
+    id: Uuid,
+) -> Result<()> {
+    let handle = Some(Arc::clone(manual)).context("manual recording runtime unavailable")?;
     let handle = handle
         .read()
         .map_err(|_| anyhow::anyhow!("recording handle poisoned"))?;
@@ -1210,8 +1285,11 @@ pub(crate) fn stop_capture(id: Uuid) -> Result<()> {
     Ok(())
 }
 
-fn capture_writer_ack(id: Uuid) -> Result<Option<crate::recording_runtime::writer_ack::WriterAck>> {
-    let Some(handle) = crate::manual_handle() else {
+fn capture_writer_ack(
+    manual: &Arc<std::sync::RwLock<crate::ManualRecordingRuntimeHandle>>,
+    id: Uuid,
+) -> Result<Option<crate::recording_runtime::writer_ack::WriterAck>> {
+    let Some(handle) = Some(Arc::clone(manual)) else {
         return Ok(None);
     };
     let handle = handle
@@ -1235,7 +1313,7 @@ impl bmux_recording_plugin_api::recording_process_presentation_v1::RecordingProc
 {
     fn capabilities(&self) -> Reply<'_, bmux_pane_runtime_plugin_api::pane_runtime_presentation_v1::PresentationCapabilities> {
         Box::pin(async move {
-            let mut client = ServiceCallerDispatchClient::new(self.caller.as_ref());
+            let mut client = ProcessDispatchClient::new(&self.caller);
             bmux_pane_runtime_plugin_api::pane_runtime_presentation_v1::client::capabilities(&mut client)
                 .await.map_err(|error| failure(error.into()))?
                 .map_err(|error| failure(anyhow::anyhow!("presentation negotiation: {error:?}")))
@@ -1254,7 +1332,7 @@ impl bmux_recording_plugin_api::recording_process_presentation_v1::RecordingProc
             // Persist negotiated representation before the side effect. This is
             // selection metadata, never a second resize order or event journal.
             crate::durable::write_atomic(&directory.join("capture-format.json"), &serde_json::to_vec(&format).map_err(|error| failure(error.into()))?).map_err(failure)?;
-            let mut client = ServiceCallerDispatchClient::new(self.caller.as_ref());
+            let mut client = ProcessDispatchClient::new(&self.caller);
             bmux_pane_runtime_plugin_api::pane_runtime_presentation_v1::client::resize(
                 &mut client, execution(&value).map_err(failure)?, format, cols, rows,
             ).await.map_err(|error| failure(error.into()))?
@@ -1267,7 +1345,7 @@ impl bmux_recording_plugin_api::recording_process_presentation_v1::RecordingProc
             // independently authorizes read access and validates the exact token.
             let value = self.load(run_id).map_err(failure)?;
             let reference = execution(&value).map_err(failure)?;
-            let mut client = ServiceCallerDispatchClient::new(self.caller.as_ref());
+            let mut client = ProcessDispatchClient::new(&self.caller);
             let screen = bmux_pane_runtime_plugin_api::pane_runtime_pointer_grid_v1::client::screen(
                 &mut client,
                 1,
@@ -1315,7 +1393,9 @@ impl process::RecordingProcessV4Service for ProcessService {
                 )
                 .map_err(failure);
             }
-            if let Some(ack) = capture_writer_ack(value.recording_id).map_err(failure)? {
+            if let Some(ack) =
+                capture_writer_ack(&self.manual, value.recording_id).map_err(failure)?
+            {
                 crate::recording_runtime::writer_ack::wait_for_watermark(
                     ack,
                     0,
@@ -1332,7 +1412,7 @@ impl process::RecordingProcessV4Service for ProcessService {
                 .map_err(failure)?
                 .initial_cursor;
             cursor.offset = since;
-            let mut client = ServiceCallerDispatchClient::new(self.caller.as_ref());
+            let mut client = ProcessDispatchClient::new(&self.caller);
             let response = pane::client::capture_resume(
                 &mut client,
                 cursor.clone(),
@@ -1369,7 +1449,7 @@ impl process::RecordingProcessV4Service for ProcessService {
     fn screen(&self, run_id: Uuid) -> Reply<'_, String> {
         Box::pin(async move {
             let value = self.load(run_id).map_err(failure)?;
-            let mut client = ServiceCallerDispatchClient::new(self.caller.as_ref());
+            let mut client = ProcessDispatchClient::new(&self.caller);
             self.execution_screen(&mut client, execution(&value).map_err(failure)?)
                 .await
                 .map_err(failure)
@@ -1399,7 +1479,7 @@ impl process::RecordingProcessV4Service for ProcessService {
             {
                 return Ok(receipt);
             }
-            let mut client = ServiceCallerDispatchClient::new(self.caller.as_ref());
+            let mut client = ProcessDispatchClient::new(&self.caller);
             // send_admitted validates exact-token launch/runtime/capture
             // authority at fresh-effect admission without durable refresh.
             // Mutation admission and uncertain receipts remain durable.
@@ -1430,7 +1510,7 @@ impl process::RecordingProcessV4Service for ProcessService {
                             "original input event timing unavailable; cannot invent recovery events"
                         );
                         let reference = execution(&value)?;
-                        let handle = crate::manual_handle().context(
+                        let handle = Some(Arc::clone(&self.manual)).context(
                             "input capture owner unavailable; cannot invent original timing",
                         )?;
                         let handle = handle
@@ -1473,7 +1553,7 @@ impl process::RecordingProcessV4Service for ProcessService {
     ) -> Reply<'_, pane::TerminalInputReceipt> {
         Box::pin(async move {
             let value = self.load(run_id).map_err(failure)?;
-            let mut client = ServiceCallerDispatchClient::new(self.caller.as_ref());
+            let mut client = ProcessDispatchClient::new(&self.caller);
             pane::client::input_receipt(
                 &mut client,
                 execution(&value).map_err(failure)?,
@@ -1502,7 +1582,7 @@ impl process::RecordingProcessV4Service for ProcessService {
                 .map_err(failure)?
                 .admit_resolution(run_id, mutation_id, &intent)
                 .map_err(failure)?;
-            let mut client = ServiceCallerDispatchClient::new(self.caller.as_ref());
+            let mut client = ProcessDispatchClient::new(&self.caller);
             pane::client::resolve(
                 &mut client,
                 execution(&value).map_err(failure)?,
@@ -1528,7 +1608,7 @@ impl process::RecordingProcessV4Service for ProcessService {
             if value.capture_finalized || value.recovery_required {
                 return Ok(value);
             }
-            let mut client = ServiceCallerDispatchClient::new(self.caller.as_ref());
+            let mut client = ProcessDispatchClient::new(&self.caller);
             self.execution_status(
                 &mut client,
                 execution(&value).map_err(failure)?,
@@ -1550,7 +1630,7 @@ impl process::RecordingProcessV4Service for ProcessService {
             if value.capture_finalized {
                 return Ok(value);
             }
-            let mut client = ServiceCallerDispatchClient::new(self.caller.as_ref());
+            let mut client = ProcessDispatchClient::new(&self.caller);
             self.execution_terminate(&mut client, execution(&value).map_err(failure)?, grace_ms)
                 .await
                 .map_err(failure)?;

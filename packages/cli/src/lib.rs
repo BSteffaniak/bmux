@@ -9,6 +9,7 @@
 mod connection;
 mod pane_runtime_client;
 mod runtime;
+pub mod runtime_owner;
 pub(crate) mod sandbox_meta;
 mod ssh_access;
 
@@ -24,10 +25,21 @@ pub(crate) fn reqwest_client() -> reqwest::Client {
     reqwest::Client::new()
 }
 
-/// Run the bmux CLI runtime entrypoint.
-///
+/// Run with the actual selected primary runtime owner. The caller must keep its
+/// driver alive and join it outside asynchronous execution after this returns.
 /// # Errors
-/// Returns an error when CLI parsing, command execution, or runtime startup fails.
+/// Returns CLI startup/execution errors. Plugin admission requires this owner;
+/// a borrowed runtime handle alone cannot establish lifetime authority.
+pub async fn run_cli_with_runtime(owner: runtime_owner::RuntimeOwner) -> anyhow::Result<u8> {
+    owner.run(Box::pin(runtime::run())).await
+}
+
+/// Run under an externally owned runtime without asserting ownership of it.
+///
+/// Built-in baseline operations remain available. Selected plugin execution
+/// requires [`run_cli_with_runtime`] and fails explicitly without an owner.
+/// # Errors
+/// Returns parsing, execution, startup, or missing runtime-ownership errors.
 pub async fn run_cli() -> anyhow::Result<u8> {
     #[cfg(feature = "bench")]
     if let Some(arguments) = benchmark_arguments(std::env::args_os()) {

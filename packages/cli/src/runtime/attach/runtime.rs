@@ -171,6 +171,14 @@ pub trait AttachTerminal: Write {
 }
 
 trait AttachHost {
+    fn take_frontend_bindings(&mut self) -> Option<super::frontend_bindings::FrontendBindings> {
+        None
+    }
+    fn take_frontend_presentations(
+        &mut self,
+    ) -> super::frontend_presentation::FrontendPresentations {
+        super::frontend_presentation::FrontendPresentations::default()
+    }
     fn queue_native_event(&mut self, _event: NativeAttachEvent) {}
     fn viewport_generation(&self) -> Option<u64> {
         None
@@ -683,9 +691,25 @@ pub struct NativeAttachHost {
     attach_committed: Option<Box<dyn FnOnce() + Send>>,
     config_paths: Option<ConfigPaths>,
     config_loader: Option<NativeConfigLoader>,
+    frontend_bindings: Option<super::frontend_bindings::FrontendBindings>,
+    frontend_presentations: super::frontend_presentation::FrontendPresentations,
     clipboard: Option<NativeClipboardCallback>,
 }
 impl NativeAttachHost {
+    /// Install bounded activation-owned prompt/action receivers before running.
+    pub fn set_frontend_bindings(&mut self, bindings: super::frontend_bindings::FrontendBindings) {
+        self.frontend_bindings = Some(bindings);
+    }
+
+    /// Install activation-bound frontend output before attachment starts. The
+    /// runtime transfers the owned resources into its committed display path.
+    pub fn set_frontend_presentations(
+        &mut self,
+        presentations: super::frontend_presentation::FrontendPresentations,
+    ) {
+        self.frontend_presentations = presentations;
+    }
+
     /// One-shot notification after the server commits this native attachment.
     pub fn set_attach_committed(&mut self, callback: impl FnOnce() + Send + 'static) {
         self.attach_committed = Some(Box::new(callback));
@@ -777,12 +801,23 @@ impl NativeAttachHost {
                 attach_committed: None,
                 config_paths: None,
                 config_loader: None,
+                frontend_bindings: None,
+                frontend_presentations:
+                    super::frontend_presentation::FrontendPresentations::default(),
                 clipboard: None,
             },
         ))
     }
 }
 impl AttachHost for NativeAttachHost {
+    fn take_frontend_bindings(&mut self) -> Option<super::frontend_bindings::FrontendBindings> {
+        self.frontend_bindings.take()
+    }
+    fn take_frontend_presentations(
+        &mut self,
+    ) -> super::frontend_presentation::FrontendPresentations {
+        std::mem::take(&mut self.frontend_presentations)
+    }
     fn attachment_committed(&mut self) {
         if let Some(callback) = self.attach_committed.take() {
             callback();
@@ -992,6 +1027,7 @@ fn native_identity_is_current<T: AttachHost + ?Sized>(
         && identity.attached_id == view.attached_id
         && host.viewport_generation() == Some(identity.viewport_generation)
         && host.accepted_revision() == identity.revision
+        && view.frontend_presentations.input_is_current()
         && view
             .observer
             .as_ref()
@@ -1844,8 +1880,7 @@ use super::super::{
     command_accepts_repeat, effective_enabled_plugins, enter_host_kernel_connection,
     host_kernel_bridge, load_plugin, map_attach_client_error, merged_runtime_keybindings,
     parse_session_selector, parse_uuid_value, perf_telemetry, plugin_command_policy_hints,
-    plugin_host_metadata, resolve_plugin_search_paths,
-    run_plugin_keybinding_command_with_active_bindings, scan_available_plugins,
+    plugin_host_metadata, resolve_plugin_search_paths, scan_available_plugins,
 };
 use super::adapters::{AttachClock, SystemAttachClock};
 use super::cursor::apply_attach_cursor_state;
@@ -5096,6 +5131,8 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
     }
 
     let mut view_state = AttachViewState::with_private_presentation(attach_info);
+    view_state.frontend_presentations = terminal.take_frontend_presentations();
+    let mut frontend_bindings = terminal.take_frontend_bindings();
     view_state.presentation_only = terminal.presentation_only();
     view_state.observation_only = terminal.observation_only();
     if view_state.observation_only {
@@ -5249,11 +5286,23 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
     let (async_service_tx, mut async_service_rx) = tokio::sync::mpsc::channel(16);
     view_state.async_services = Some(attach_async_service_route(&client, async_service_tx)?);
     let (prompt_host_tx, mut prompt_host_rx) = tokio::sync::mpsc::unbounded_channel();
-    let _prompt_host_guard = prompt::register_host(prompt_host_tx);
-    let mut prompt_host_open = true;
+    let _prompt_host_guard = if frontend_bindings.is_none() {
+        Some(prompt::register_host(prompt_host_tx))
+    } else {
+        // A scoped frontend host never replaces or consults the process-global
+        // compatibility channel; unrelated legacy attachments keep their owner.
+        drop(prompt_host_tx);
+        None
+    };
+    let mut prompt_host_open = frontend_bindings.is_none();
     let (action_dispatch_tx, mut action_dispatch_rx) = tokio::sync::mpsc::unbounded_channel();
-    let _action_dispatch_guard = action_dispatch::register_host(action_dispatch_tx);
-    let mut action_dispatch_open = true;
+    let _action_dispatch_guard = if frontend_bindings.is_none() {
+        Some(action_dispatch::register_host(action_dispatch_tx))
+    } else {
+        drop(action_dispatch_tx);
+        None
+    };
+    let mut action_dispatch_open = frontend_bindings.is_none();
     // Default exit reason; always overwritten before the loop breaks, but the
     // compiler cannot prove this through the tokio::select! macro expansion.
     #[allow(unused_assignments)]
@@ -5366,6 +5415,12 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
     publication_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut observer_capture_pending = false;
     'attach_loop: loop {
+        if view_state.frontend_presentations.reconcile_closed() {
+            view_state.dirty.mark_overlay_dirty(AttachDirtySource::PromptOverlay);
+        }
+        if view_state.prompt.discard_cancelled_scoped() {
+            view_state.dirty.mark_overlay_dirty(AttachDirtySource::PromptOverlay);
+        }
         terminal.set_attached_session_id(view_state.attached_id);
         #[cfg(test)]
         terminal.observe_scrollback(view_state.scrollback_active());
@@ -5683,6 +5738,53 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
                     });
                     let _ = request.respond(result);
                     });
+                }
+            }
+
+            frontend_event = async {
+                match frontend_bindings.as_mut() {
+                    Some(bindings) => bindings.next().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                match frontend_event? {
+                    super::frontend_bindings::FrontendEvent::Presentation(update) => {
+                        match update {
+                            super::frontend_bindings::PresentationUpdate::Install { scope, instance, generation, area, order } => {
+                                let owner = super::frontend_presentation::FrontendPresentationOwner::bind(scope, instance, generation)?;
+                                view_state.frontend_presentations.install(owner, area, order)?;
+                            }
+                            super::frontend_bindings::PresentationUpdate::Publish { scope, admission, instance, revision, bytes } => {
+                                anyhow::ensure!(!scope.is_cancelled()?, "frontend publication owner closed before dequeue");
+                                view_state.frontend_presentations.publish_encoded(instance, revision, &bytes)?;
+                                drop(admission);
+                            }
+                        }
+                        view_state.dirty.mark_overlay_dirty(AttachDirtySource::PromptOverlay);
+                    }
+                    super::frontend_bindings::FrontendEvent::Prompt(prompt) => {
+                        perf_window.record_wake(AttachWakeSource::Prompt);
+                        view_state.prompt.enqueue_scoped(prompt);
+                        view_state.dirty.mark_overlay_dirty(AttachDirtySource::PromptOverlay);
+                    }
+                    super::frontend_bindings::FrontendEvent::Action(admitted) => {
+                        perf_window.record_wake(AttachWakeSource::ActionDispatch);
+                        let action = action_dispatch::ActionDispatchRequest::new(admitted.action.clone());
+                        match handle_attach_loop_event(
+                            AttachLoopEvent::ActionDispatch(action), &mut client, &mut attach_input_processor,
+                            follow_target_id, Some(self_client_id), global, &attach_help_lines,
+                            &mut view_state, &mut display_capture, kernel_client_factory.as_ref(),
+                        ).await? {
+                            AttachLoopControl::Continue => {}
+                            AttachLoopControl::Break(reason) => { exit_reason = reason; break; }
+                        }
+                        drop(admitted);
+                    }
+                    super::frontend_bindings::FrontendEvent::OwnerClosed(id) => {
+                        view_state.frontend_presentations.remove(id);
+                        view_state.prompt.discard_cancelled_scoped();
+                        view_state.dirty.mark_overlay_dirty(AttachDirtySource::PromptOverlay);
+                    }
                 }
             }
 
@@ -7739,33 +7841,6 @@ const fn attach_plugin_command_execution_route(
     }
 }
 
-fn run_attach_plugin_command_local(
-    plugin_id: &str,
-    command_name: &str,
-    args: &[String],
-    kernel_client_factory: Option<&KernelClientFactory>,
-    caller_client_id: Option<Uuid>,
-    active_keybindings: Vec<bmux_plugin_sdk::ActiveKeybinding>,
-) -> std::result::Result<AttachPluginCommandPipelineExecution, ClientError> {
-    let execution = run_plugin_keybinding_command_with_active_bindings(
-        plugin_id,
-        command_name,
-        args,
-        kernel_client_factory,
-        caller_client_id,
-        active_keybindings,
-    )
-    .map_err(|error| ClientError::ServerError {
-        code: bmux_ipc::ErrorCode::Internal,
-        message: format!("local plugin command failed: {error:#}"),
-    })?;
-
-    Ok(AttachPluginCommandPipelineExecution {
-        status: execution.status,
-        outcome: execution.outcome,
-    })
-}
-
 fn active_keybindings_for_context(
     keymap: &Keymap,
     mode_id: Option<&str>,
@@ -7789,7 +7864,7 @@ pub async fn handle_attach_plugin_command_action(
     command_name: &str,
     args: &[String],
     view_state: &mut AttachViewState,
-    kernel_client_factory: Option<&KernelClientFactory>,
+    _kernel_client_factory: Option<&KernelClientFactory>,
     active_keybindings: Vec<bmux_plugin_sdk::ActiveKeybinding>,
 ) -> std::result::Result<(), ClientError> {
     if plugin_id == "bmux.broadcast" {
@@ -7960,29 +8035,62 @@ pub async fn handle_attach_plugin_command_action(
             let plugin_id = plugin_id.to_string();
             let command_name = command_name.to_string();
             let args = args.to_vec();
-            let factory = kernel_client_factory.cloned();
             let caller = view_state.self_client_id;
-            let async_services = view_state.async_services.clone();
+            let (dispatch, _command_owner, mut selected_requests) =
+                super::super::plugin_kernel::CommandDispatch::channel();
             let command = tokio::task::spawn_blocking(move || {
-                let _async_route = async_services.map(bmux_plugin::enter_async_command_route);
                 let _transport = super::super::plugin_kernel::enter_invoking_transport(sender);
-                run_attach_plugin_command_local(
+                super::super::plugin_runtime::run_plugin_keybinding_command_with_dispatch(
                     &plugin_id,
                     &command_name,
                     &args,
-                    factory.as_ref(),
                     caller,
                     active_keybindings,
+                    dispatch,
                 )
+                .map(|execution| AttachPluginCommandPipelineExecution {
+                    status: execution.status,
+                    outcome: execution.outcome,
+                })
+                .map_err(|error| ClientError::ServerError {
+                    code: bmux_ipc::ErrorCode::Internal,
+                    message: format!("local plugin command failed: {error:#}"),
+                })
             });
-            while let Some(request) = requests.recv().await {
-                let response = client
-                    .request_raw(request.request)
-                    .await
-                    .map_err(anyhow::Error::from);
-                let _ = request.response.send(response);
+            let mut command = command;
+            let mut selected_effects = Vec::new();
+            let result = loop {
+                tokio::select! {
+                    result = &mut command => break result,
+                    Some(request) = selected_requests.recv() => {
+                        if request.is_cancelled() {
+                            request.reject();
+                        } else {
+                            let response = client.start_request(request.request.clone()).await;
+                            selected_effects.retain(|effect: &tokio::task::JoinHandle<()>| !effect.is_finished());
+                            selected_effects.push(tokio::spawn(async move {
+                                let result = match response {
+                                    Ok(response) => response.await.map_err(anyhow::Error::from),
+                                    Err(error) => Err(anyhow::Error::from(error)),
+                                };
+                                request.respond(result);
+                            }));
+                        }
+                    }
+                    Some(request) = requests.recv() => {
+                        let response = client.request_raw(request.request).await.map_err(anyhow::Error::from);
+                        let _ = request.response.send(response);
+                    }
+                }
+            };
+            for effect in selected_effects {
+                let _ = effect.await;
             }
-            command.await.map_err(|error| ClientError::ServerError {
+            selected_requests.close();
+            while let Some(request) = selected_requests.recv().await {
+                request.reject();
+            }
+            result.map_err(|error| ClientError::ServerError {
                 code: bmux_ipc::ErrorCode::Internal,
                 message: format!("caller command task failed: {error}"),
             })?
@@ -9031,7 +9139,8 @@ pub fn copy_text_with_clipboard_plugin(text: &str) -> Result<()> {
         state_dir: paths.state_dir.to_string_lossy().into_owned(),
     };
     let _host_kernel_connection_guard = enter_host_kernel_connection(connection.clone());
-    let response = loaded.invoke_service(&bmux_plugin_sdk::NativeServiceContext {
+    let response = loaded.invoke_service_sync(&bmux_plugin_sdk::NativeServiceContext {
+        host_service_port: None,
         plugin_id: provider_plugin_id.clone(),
         request: ServiceRequest {
             caller_plugin_id: "bmux.core".to_string(),
@@ -14251,6 +14360,7 @@ pub async fn handle_attach_prompt_completion_at(
 ) -> std::result::Result<Option<AttachLoopControl>, ClientError> {
     let mut requires_layout_refresh = false;
     match completion.origin {
+        AttachPromptOrigin::Scoped(prompt) => prompt.respond(completion.response),
         AttachPromptOrigin::External { response_tx, .. } => {
             let _ = response_tx.send(completion.response);
         }

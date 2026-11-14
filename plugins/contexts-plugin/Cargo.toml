@@ -28,8 +28,9 @@ tracing                  = { workspace = true, features = ["attributes"] }
 uuid                     = { workspace = true, features = ["serde", "std"] }
 
 [dev-dependencies]
-bmux_ipc = { workspace = true }
-tokio    = { workspace = true, features = ["macros", "rt"] }
+bmux_ipc            = { workspace = true }
+bmux_plugin_runtime = { workspace = true }
+tokio               = { workspace = true, features = ["macros", "rt"] }
 
 [features]
 fail-on-warnings = [

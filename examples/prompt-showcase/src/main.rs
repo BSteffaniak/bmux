@@ -204,6 +204,9 @@ where
             Err(PromptSubmitError::HostDisconnected) => {
                 bail!("prompt host disconnected during showcase")
             }
+            Err(PromptSubmitError::Full) => bail!("prompt host queue is full"),
+            Err(PromptSubmitError::TooLarge) => bail!("prompt request exceeds host limits"),
+            Err(PromptSubmitError::OwnerClosed) => bail!("prompt owner has closed"),
         }
     }
 }

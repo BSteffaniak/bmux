@@ -5,6 +5,38 @@ plugin bmux.snapshot version 1;
 capability SNAPSHOT_READ = bmux.snapshot.read;
 capability SNAPSHOT_WRITE = bmux.snapshot.write;
 
+capability SNAPSHOT_PARTICIPANT_READ_V1 = bmux.snapshot.participant.read.v1;
+capability SNAPSHOT_PARTICIPANT_WRITE_V1 = bmux.snapshot.participant.write.v1;
+
+// IDs identify retained participants, not executable handles. Listing preserves
+// authoritative registration order. Restore always validates before mutation.
+interface snapshot-participant-types-v1 {
+    record participant-snapshot {
+        participant_id: string,
+        schema_version: u32,
+        payload: bytes,
+    }
+    variant participant-error {
+        unavailable { message: string },
+        invalid { message: string },
+        failed { message: string },
+    }
+}
+
+@capability(SNAPSHOT_PARTICIPANT_READ_V1)
+interface snapshot-participant-state-v1 {
+    query participants() -> result<list<string>, snapshot-participant-types-v1.participant-error>;
+    query restore-dependencies(participant_id: string) -> result<list<string>, snapshot-participant-types-v1.participant-error>;
+    query snapshot(participant_id: string) -> result<snapshot-participant-types-v1.participant-snapshot, snapshot-participant-types-v1.participant-error>;
+    query validate(snapshot: snapshot-participant-types-v1.participant-snapshot) -> result<unit, snapshot-participant-types-v1.participant-error>;
+}
+
+@capability(SNAPSHOT_PARTICIPANT_WRITE_V1)
+interface snapshot-participant-commands-v1 {
+    command quiesce(participant_id: string) -> result<unit, snapshot-participant-types-v1.participant-error>;
+    command restore(snapshot: snapshot-participant-types-v1.participant-snapshot) -> result<unit, snapshot-participant-types-v1.participant-error>;
+}
+
 interface snapshot-types {
     record snapshot-status-payload {
         enabled: bool,

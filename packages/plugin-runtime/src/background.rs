@@ -96,6 +96,20 @@ impl BackgroundTasks {
         Ok(())
     }
 
+    /// Explicitly acknowledge repaired task failures after all handles settled.
+    /// This never cancels, detaches, or discards unfinished work.
+    pub(crate) fn acknowledge_failures(&self) -> Result<(), String> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "background task scope poisoned")?;
+        if !state.closing || !state.tasks.is_empty() {
+            return Err("background tasks have not drained".into());
+        }
+        state.failures.clear();
+        Ok(())
+    }
+
     /// Cancel and drain all work. A timeout retains task handles so shutdown can
     /// be retried; it does not authorize unloading plugin code or state.
     ///

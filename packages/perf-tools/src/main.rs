@@ -2551,6 +2551,7 @@ impl CoreServiceBenchContext {
         let plugin_search_roots = Vec::new();
         let plugin_settings_map = BTreeMap::new();
         let registration_context = bmux_plugin_sdk::TypedServiceRegistrationContext {
+            host_service_port: None,
             plugin_id: "bmux.perf-tools",
             host_kernel_bridge: None,
             required_capabilities: &required_capabilities,
@@ -2725,6 +2726,7 @@ fn invoke_performance_get_settings(loaded: &bmux_plugin::LoadedPlugin) -> Result
         .map_err(|error| format!("failed parsing noop capability: {error}"))?;
     let response = loaded
         .invoke_service(&bmux_plugin_sdk::NativeServiceContext {
+            host_service_port: None,
             plugin_id: "bmux.perf-tools.noop".to_string(),
             request: bmux_plugin_sdk::ServiceRequest {
                 caller_plugin_id: "bmux.perf-tools".to_string(),

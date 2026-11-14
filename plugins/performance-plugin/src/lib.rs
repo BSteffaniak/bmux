@@ -30,7 +30,7 @@ use bmux_presentation_state::{
     global_presentation_fact_host_service,
 };
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use sysinfo::System;
@@ -42,7 +42,6 @@ struct MetricsState {
     watches: BTreeMap<String, MetricWatch>,
     snapshot: MetricsSnapshot,
     theme_header_settings: ThemeHeaderSettings,
-    worker_started: bool,
 }
 
 impl Default for MetricsState {
@@ -56,21 +55,118 @@ impl Default for MetricsState {
                 ..MetricsSnapshot::default()
             },
             theme_header_settings: ThemeHeaderSettings::default(),
-            worker_started: false,
         }
     }
 }
 
-static METRICS_STATE: OnceLock<Mutex<MetricsState>> = OnceLock::new();
-static PRESENTATION_FACT_REVISION: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-
-fn metrics_state() -> &'static Mutex<MetricsState> {
-    METRICS_STATE.get_or_init(|| Mutex::new(MetricsState::default()))
+/// Host mechanisms are explicitly supplied by the selected host adapter. Errors
+/// are not converted to a healthy default installation. This trait belongs to
+/// the implementation, never to the plugin API or shared ABI.
+pub trait PerformanceHost: Send + Sync {
+    /// # Errors
+    /// Rejects unavailable or conflicting host channel registration.
+    fn activate_channels(&self, initial: MetricsSnapshot) -> Result<(), String>;
+    /// # Errors
+    /// Rejects unavailable or corrupt selected settings.
+    fn settings(&self) -> Result<PerformanceRuntimeSettings, String>;
+    /// # Errors
+    /// Rejects invalid settings or failure to commit the configuration.
+    fn set_settings(
+        &self,
+        settings: &PerformanceRuntimeSettings,
+    ) -> Result<PerformanceRuntimeSettings, String>;
+    /// # Errors
+    /// Reports unavailable selected pane-process observations.
+    fn pane_processes(&self) -> Result<Vec<bmux_pane_runtime_state::PaneProcessIdentity>, String>;
+    /// # Errors
+    /// Reports rejected or unavailable retained metrics publication.
+    fn publish_metrics(&self, snapshot: &MetricsSnapshot) -> Result<(), String>;
+    /// # Errors
+    /// Reports rejected or unavailable presentation-fact publication.
+    fn publish_facts(&self, snapshot: PresentationFactSnapshot) -> Result<(), String>;
 }
 
-#[derive(Default)]
-pub struct PerformancePlugin;
+pub struct PerformancePlugin {
+    host: Arc<dyn PerformanceHost>,
+    metrics: Arc<Mutex<MetricsState>>,
+    fact_revision: Arc<std::sync::atomic::AtomicU64>,
+    worker_error: Arc<Mutex<Option<String>>>,
+    worker: Arc<Mutex<Option<MetricsWorker>>>,
+    cleanup_pending: Arc<std::sync::atomic::AtomicBool>,
+}
+struct MetricsWorker {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    task: std::thread::JoinHandle<()>,
+}
+impl Default for PerformancePlugin {
+    fn default() -> Self {
+        Self::with_host(Arc::new(LegacyPerformanceHost))
+    }
+}
+impl PerformancePlugin {
+    pub fn with_host(host: Arc<dyn PerformanceHost>) -> Self {
+        Self {
+            host,
+            metrics: Arc::new(Mutex::new(MetricsState::default())),
+            fact_revision: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            worker_error: Arc::new(Mutex::new(None)),
+            worker: Arc::new(Mutex::new(None)),
+            cleanup_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+    fn activate_owner(&self) -> Result<(), PluginCommandError> {
+        if self
+            .cleanup_pending
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(PluginCommandError::unavailable(
+                "metrics cleanup pending or failed; recovery required",
+            ));
+        }
+        let snapshot = self
+            .metrics
+            .lock()
+            .map_err(|_| PluginCommandError::failed("metrics lock poisoned"))?
+            .snapshot
+            .clone();
+        self.host
+            .activate_channels(snapshot)
+            .map_err(PluginCommandError::failed)?;
+        self.ensure_metrics_worker()
+    }
+    fn stop_worker(&self) -> Result<(), PluginCommandError> {
+        if self
+            .cleanup_pending
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            return Err(PluginCommandError::unavailable(
+                "metrics cleanup pending or failed; recovery required",
+            ));
+        }
+        stop_metrics_worker(&self.worker)?;
+        self.cleanup_pending
+            .store(false, std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+}
+
+fn stop_metrics_worker(slot: &Mutex<Option<MetricsWorker>>) -> Result<(), PluginCommandError> {
+    let worker = slot
+        .lock()
+        .map_err(|_| PluginCommandError::failed("metrics worker lock poisoned"))?
+        .take();
+    if let Some(worker) = worker {
+        worker
+            .stop
+            .store(true, std::sync::atomic::Ordering::Release);
+        worker.task.thread().unpark();
+        worker
+            .task
+            .join()
+            .map_err(|_| PluginCommandError::failed("metrics worker panicked"))?;
+    }
+    Ok(())
+}
 
 impl RustPlugin for PerformancePlugin {
     type Contract = bmux_performance_plugin_api::Contract;
@@ -79,17 +175,12 @@ impl RustPlugin for PerformancePlugin {
         &mut self,
         _context: NativeLifecycleContext,
     ) -> std::result::Result<i32, PluginCommandError> {
-        global_event_bus().register_channel::<PerformanceEvent>(EVENT_KIND);
-        global_event_bus().register_channel::<MetricEvent>(METRIC_EVENT_KIND);
-        let initial_snapshot = metrics_state().lock().map_or_else(
-            |_| MetricsSnapshot::default(),
-            |state| state.snapshot.clone(),
-        );
-        global_event_bus().register_state_channel_with_json_projection::<MetricsSnapshot>(
-            METRICS_STATE_KIND,
-            initial_snapshot,
-        );
-        ensure_metrics_worker();
+        self.activate_owner()?;
+        Ok(bmux_plugin_sdk::EXIT_OK)
+    }
+
+    fn deactivate(&mut self, _context: NativeLifecycleContext) -> Result<i32, PluginCommandError> {
+        self.stop_worker()?;
         Ok(bmux_plugin_sdk::EXIT_OK)
     }
 
@@ -101,56 +192,7 @@ impl RustPlugin for PerformancePlugin {
     }
 
     fn invoke_service(&self, context: NativeServiceContext) -> ServiceResponse {
-        bmux_plugin_sdk::route_service!(context, {
-            "performance-state", "get-settings" => |_req: (), _ctx| {
-                Ok::<performance_types::PerformanceRuntimeSettings, ServiceResponse>(handle_get_settings().into())
-            },
-            "performance-commands", "set-settings" => |req: SetSettingsRequest, _ctx| {
-                Ok::<performance_types::PerformanceRuntimeSettings, ServiceResponse>(handle_set_settings(&req.settings.into()).into())
-            },
-            "performance-state", "list-watches" => |_req: (), _ctx| {
-                Ok::<Vec<performance_types::MetricWatch>, ServiceResponse>(handle_list_watches())
-            },
-            "performance-commands", "start-watch" => |req: StartWatchRequest, _ctx| {
-                Ok::<Vec<performance_types::MetricWatch>, ServiceResponse>(handle_start_watch(req.watch))
-            },
-            "performance-commands", "stop-watch" => |req: StopWatchRequest, _ctx| {
-                handle_stop_watch(&req.watch_id);
-                Ok::<(), ServiceResponse>(())
-            },
-            "performance-state", "get-snapshot" => |_req: (), _ctx| {
-                Ok::<performance_types::MetricsSnapshot, ServiceResponse>(handle_get_snapshot())
-            },
-            "performance-state", "get-metric-capabilities" => |_req: (), _ctx| {
-                Ok::<Vec<performance_types::MetricCapability>, ServiceResponse>(handle_get_metric_capabilities())
-            },
-            "performance-state", "get-theme-header-settings" => |_req: (), _ctx| {
-                Ok::<performance_types::ThemeHeaderSettings, ServiceResponse>(handle_get_theme_header_settings())
-            },
-            "performance-commands", "reset-theme-header-settings" => |_req: (), _ctx| {
-                handle_set_theme_header_settings(ThemeHeaderSettings::default());
-                Ok::<(), ServiceResponse>(())
-            },
-            "performance-commands", "set-theme-header-settings" => |req: SetThemeHeaderSettingsRequest, _ctx| {
-                Ok::<performance_types::ThemeHeaderSettings, ServiceResponse>(handle_set_theme_header_settings(req.settings))
-            },
-            "performance-state", "build-theme-header-settings-form" => |_req: (), _ctx| {
-                Ok::<performance_types::PromptForm, ServiceResponse>(handle_build_theme_header_settings_form().into())
-            },
-            "performance-commands", "apply-theme-header-settings-form" => |req: ApplyThemeHeaderSettingsFormRequest, _ctx| {
-                let values = req.values.into_iter().map(|(key, value)| (key, value.into())).collect();
-                Ok::<performance_types::ThemeHeaderSettings, ServiceResponse>(handle_apply_theme_header_settings_form(&values))
-            },
-            "performance-theme-settings", "build-form" => |defaults: ThemeSettingsPayload, _ctx| {
-                Ok::<bmux_plugin_sdk::PromptRequest, ServiceResponse>(handle_build_theme_header_settings_form_with_defaults(defaults))
-            },
-            "performance-theme-settings", "apply-form" => |values: BTreeMap<String, bmux_plugin_sdk::PromptFormValue>, _ctx| {
-                Ok::<ThemeSettingsPayload, ServiceResponse>(handle_apply_theme_header_settings_form_payload(&values))
-            },
-            "performance-theme-settings", "set-settings" => |settings: ThemeSettingsPayload, _ctx| {
-                Ok::<ThemeSettingsPayload, ServiceResponse>(handle_set_theme_header_settings_payload(settings))
-            },
-        })
+        self.service(&context)
     }
 
     fn register_typed_services(
@@ -160,6 +202,61 @@ impl RustPlugin for PerformancePlugin {
     ) {
         // No typed Arc<dyn Trait> surface today — performance operations
         // dispatch exclusively through the byte-service path.
+    }
+}
+
+impl PerformancePlugin {
+    fn service(&self, context: &NativeServiceContext) -> ServiceResponse {
+        bmux_plugin_sdk::route_service!(context, {
+            "performance-state", "get-settings" => |_req: (), _ctx| {
+                self.handle_get_settings().map(performance_types::PerformanceRuntimeSettings::from)
+            },
+            "performance-commands", "set-settings" => |req: SetSettingsRequest, _ctx| {
+                self.handle_set_settings(&req.settings.into()).map(performance_types::PerformanceRuntimeSettings::from)
+            },
+            "performance-state", "list-watches" => |_req: (), _ctx| {
+                Ok::<Vec<performance_types::MetricWatch>, ServiceResponse>(self.handle_list_watches())
+            },
+            "performance-commands", "start-watch" => |req: StartWatchRequest, _ctx| {
+                Ok::<Vec<performance_types::MetricWatch>, ServiceResponse>(self.handle_start_watch(req.watch))
+            },
+            "performance-commands", "stop-watch" => |req: StopWatchRequest, _ctx| {
+                self.handle_stop_watch(&req.watch_id);
+                Ok::<(), ServiceResponse>(())
+            },
+            "performance-state", "get-snapshot" => |_req: (), _ctx| {
+                self.handle_get_snapshot()
+            },
+            "performance-state", "get-metric-capabilities" => |_req: (), _ctx| {
+                Ok::<Vec<performance_types::MetricCapability>, ServiceResponse>(Self::handle_get_metric_capabilities())
+            },
+            "performance-state", "get-theme-header-settings" => |_req: (), _ctx| {
+                Ok::<performance_types::ThemeHeaderSettings, ServiceResponse>(self.handle_get_theme_header_settings())
+            },
+            "performance-commands", "reset-theme-header-settings" => |_req: (), _ctx| {
+                self.handle_set_theme_header_settings(ThemeHeaderSettings::default());
+                Ok::<(), ServiceResponse>(())
+            },
+            "performance-commands", "set-theme-header-settings" => |req: SetThemeHeaderSettingsRequest, _ctx| {
+                Ok::<performance_types::ThemeHeaderSettings, ServiceResponse>(self.handle_set_theme_header_settings(req.settings))
+            },
+            "performance-state", "build-theme-header-settings-form" => |_req: (), _ctx| {
+                Ok::<performance_types::PromptForm, ServiceResponse>(self.handle_build_theme_header_settings_form().into())
+            },
+            "performance-commands", "apply-theme-header-settings-form" => |req: ApplyThemeHeaderSettingsFormRequest, _ctx| {
+                let values = req.values.into_iter().map(|(key, value)| (key, value.into())).collect();
+                Ok::<performance_types::ThemeHeaderSettings, ServiceResponse>(self.handle_apply_theme_header_settings_form(&values))
+            },
+            "performance-theme-settings", "build-form" => |defaults: ThemeSettingsPayload, _ctx| {
+                Ok::<bmux_plugin_sdk::PromptRequest, ServiceResponse>(self.handle_build_theme_header_settings_form_with_defaults(defaults))
+            },
+            "performance-theme-settings", "apply-form" => |values: BTreeMap<String, bmux_plugin_sdk::PromptFormValue>, _ctx| {
+                Ok::<ThemeSettingsPayload, ServiceResponse>(self.handle_apply_theme_header_settings_form_payload(&values))
+            },
+            "performance-theme-settings", "set-settings" => |settings: ThemeSettingsPayload, _ctx| {
+                Ok::<ThemeSettingsPayload, ServiceResponse>(self.handle_set_theme_header_settings_payload(settings))
+            },
+        })
     }
 }
 
@@ -205,101 +302,115 @@ impl ThemeSettingsPayload {
     }
 }
 
-fn handle_list_watches() -> Vec<MetricWatch> {
-    metrics_state().lock().map_or_else(
-        |_| Vec::new(),
-        |state| state.watches.values().cloned().collect(),
-    )
-}
-
-fn handle_start_watch(watch: MetricWatch) -> Vec<MetricWatch> {
-    if watch.id.trim().is_empty() {
-        return handle_list_watches();
+impl PerformancePlugin {
+    fn handle_list_watches(&self) -> Vec<MetricWatch> {
+        self.metrics.lock().map_or_else(
+            |_| Vec::new(),
+            |state| state.watches.values().cloned().collect(),
+        )
     }
-    if let Ok(mut state) = metrics_state().lock() {
-        let watch = watch.normalized();
-        state.watches.insert(watch.id.clone(), watch);
-        state.snapshot.watches = state.watches.values().cloned().collect();
+
+    fn handle_start_watch(&self, watch: MetricWatch) -> Vec<MetricWatch> {
+        if watch.id.trim().is_empty() {
+            return self.handle_list_watches();
+        }
+        if let Ok(mut state) = self.metrics.lock() {
+            let watch = watch.normalized();
+            state.watches.insert(watch.id.clone(), watch);
+            state.snapshot.watches = state.watches.values().cloned().collect();
+        }
+        self.handle_list_watches()
     }
-    ensure_metrics_worker();
-    handle_list_watches()
-}
 
-fn handle_stop_watch(watch_id: &str) {
-    if let Ok(mut state) = metrics_state().lock() {
-        state.watches.remove(watch_id);
-        state.snapshot.watches = state.watches.values().cloned().collect();
+    fn handle_stop_watch(&self, watch_id: &str) {
+        if let Ok(mut state) = self.metrics.lock() {
+            state.watches.remove(watch_id);
+            state.snapshot.watches = state.watches.values().cloned().collect();
+        }
     }
-}
 
-fn handle_get_snapshot() -> MetricsSnapshot {
-    metrics_state().lock().map_or_else(
-        |_| MetricsSnapshot::default(),
-        |state| state.snapshot.clone(),
-    )
-}
-
-fn handle_get_metric_capabilities() -> Vec<MetricCapability> {
-    metric_capabilities()
-}
-
-fn handle_get_theme_header_settings() -> ThemeHeaderSettings {
-    metrics_state().lock().map_or_else(
-        |_| ThemeHeaderSettings::default(),
-        |state| state.theme_header_settings.clone(),
-    )
-}
-
-fn handle_set_theme_header_settings(settings: ThemeHeaderSettings) -> ThemeHeaderSettings {
-    let normalized = normalize_theme_header_settings(settings);
-    if let Ok(mut state) = metrics_state().lock() {
-        state.theme_header_settings = normalized.clone();
-        let watch = watch_from_theme_header_settings(&normalized);
-        state.watches.insert(watch.id.clone(), watch);
-        state.snapshot.watches = state.watches.values().cloned().collect();
+    fn handle_get_snapshot(&self) -> Result<MetricsSnapshot, ServiceResponse> {
+        let error = self.worker_error.lock().map_err(|_| {
+            ServiceResponse::error("metrics_unavailable", "worker error lock poisoned")
+        })?;
+        if let Some(error) = error.as_ref() {
+            return Err(ServiceResponse::error("metrics_unavailable", error.clone()));
+        }
+        self.metrics
+            .lock()
+            .map(|state| state.snapshot.clone())
+            .map_err(|_| ServiceResponse::error("metrics_unavailable", "metrics lock poisoned"))
     }
-    ensure_metrics_worker();
-    normalized
-}
 
-fn handle_build_theme_header_settings_form() -> bmux_plugin_sdk::PromptRequest {
-    let settings = metrics_state().lock().map_or_else(
-        |_| ThemeHeaderSettings::default(),
-        |state| state.theme_header_settings.clone(),
-    );
-    theme_header_settings_form(&settings)
-}
+    fn handle_get_metric_capabilities() -> Vec<MetricCapability> {
+        metric_capabilities()
+    }
 
-fn handle_build_theme_header_settings_form_with_defaults(
-    defaults: ThemeSettingsPayload,
-) -> bmux_plugin_sdk::PromptRequest {
-    let settings = theme_header_settings_from_value(&defaults.into_value()).unwrap_or_else(|| {
-        metrics_state().lock().map_or_else(
+    fn handle_get_theme_header_settings(&self) -> ThemeHeaderSettings {
+        self.metrics.lock().map_or_else(
             |_| ThemeHeaderSettings::default(),
             |state| state.theme_header_settings.clone(),
         )
-    });
-    theme_header_settings_form(&normalize_theme_header_settings(settings))
-}
+    }
 
-fn handle_apply_theme_header_settings_form(
-    values: &BTreeMap<String, bmux_plugin_sdk::PromptFormValue>,
-) -> ThemeHeaderSettings {
-    handle_set_theme_header_settings(settings_from_form_values(values))
-}
+    fn handle_set_theme_header_settings(
+        &self,
+        settings: ThemeHeaderSettings,
+    ) -> ThemeHeaderSettings {
+        let normalized = normalize_theme_header_settings(settings);
+        if let Ok(mut state) = self.metrics.lock() {
+            state.theme_header_settings = normalized.clone();
+            let watch = watch_from_theme_header_settings(&normalized);
+            state.watches.insert(watch.id.clone(), watch);
+            state.snapshot.watches = state.watches.values().cloned().collect();
+        }
+        normalized
+    }
 
-fn handle_apply_theme_header_settings_form_payload(
-    values: &BTreeMap<String, bmux_plugin_sdk::PromptFormValue>,
-) -> ThemeSettingsPayload {
-    ThemeSettingsPayload::from_settings(&handle_apply_theme_header_settings_form(values))
-}
+    fn handle_build_theme_header_settings_form(&self) -> bmux_plugin_sdk::PromptRequest {
+        let settings = self.metrics.lock().map_or_else(
+            |_| ThemeHeaderSettings::default(),
+            |state| state.theme_header_settings.clone(),
+        );
+        theme_header_settings_form(&settings)
+    }
 
-fn handle_set_theme_header_settings_payload(
-    settings: ThemeSettingsPayload,
-) -> ThemeSettingsPayload {
-    let settings_value = settings.into_value();
-    let settings = theme_header_settings_from_value(&settings_value).unwrap_or_default();
-    ThemeSettingsPayload::from_settings(&handle_set_theme_header_settings(settings))
+    fn handle_build_theme_header_settings_form_with_defaults(
+        &self,
+        defaults: ThemeSettingsPayload,
+    ) -> bmux_plugin_sdk::PromptRequest {
+        let settings =
+            theme_header_settings_from_value(&defaults.into_value()).unwrap_or_else(|| {
+                self.metrics.lock().map_or_else(
+                    |_| ThemeHeaderSettings::default(),
+                    |state| state.theme_header_settings.clone(),
+                )
+            });
+        theme_header_settings_form(&normalize_theme_header_settings(settings))
+    }
+
+    fn handle_apply_theme_header_settings_form(
+        &self,
+        values: &BTreeMap<String, bmux_plugin_sdk::PromptFormValue>,
+    ) -> ThemeHeaderSettings {
+        self.handle_set_theme_header_settings(settings_from_form_values(values))
+    }
+
+    fn handle_apply_theme_header_settings_form_payload(
+        &self,
+        values: &BTreeMap<String, bmux_plugin_sdk::PromptFormValue>,
+    ) -> ThemeSettingsPayload {
+        ThemeSettingsPayload::from_settings(&self.handle_apply_theme_header_settings_form(values))
+    }
+
+    fn handle_set_theme_header_settings_payload(
+        &self,
+        settings: ThemeSettingsPayload,
+    ) -> ThemeSettingsPayload {
+        let settings_value = settings.into_value();
+        let settings = theme_header_settings_from_value(&settings_value).unwrap_or_default();
+        ThemeSettingsPayload::from_settings(&self.handle_set_theme_header_settings(settings))
+    }
 }
 
 fn theme_header_settings_from_value(value: &serde_json::Value) -> Option<ThemeHeaderSettings> {
@@ -611,91 +722,94 @@ fn metric_from_form_value(value: &str) -> Option<ThemeHeaderMetric> {
     }
 }
 
-fn handle_get_settings() -> PerformanceRuntimeSettings {
-    let Some(handle) = global_plugin_state_registry().get::<PerformanceSettingsHandle>() else {
-        return PerformanceCaptureSettings::default().to_runtime_settings();
-    };
-    let Ok(guard) = handle.read() else {
-        return PerformanceCaptureSettings::default().to_runtime_settings();
-    };
-    guard.0.current().to_runtime_settings()
-}
-
-fn handle_set_settings(requested: &PerformanceRuntimeSettings) -> PerformanceRuntimeSettings {
-    let normalized_capture = PerformanceCaptureSettings::from_runtime_settings(requested);
-    let normalized = normalized_capture.to_runtime_settings();
-
-    let Some(handle) = global_plugin_state_registry().get::<PerformanceSettingsHandle>() else {
-        return normalized;
-    };
-    let Ok(guard) = handle.read() else {
-        return normalized;
-    };
-    guard.0.set(normalized_capture);
-
-    // Emit the typed event for plugin-local consumers. Server bootstrap
-    // forwards this generated BPDL event to streaming clients through
-    // the generic plugin-bus bridge.
-    let _ = global_event_bus().emit(
-        &EVENT_KIND,
-        PerformanceEvent::SettingsUpdated {
-            settings: normalized.clone().into(),
-        },
-    );
-
-    normalized
-}
-
-fn ensure_metrics_worker() {
-    let should_start = metrics_state().lock().is_ok_and(|mut state| {
-        if state.worker_started {
-            false
-        } else {
-            state.worker_started = true;
-            true
+impl PerformancePlugin {
+    fn handle_get_settings(&self) -> Result<PerformanceRuntimeSettings, ServiceResponse> {
+        self.host
+            .settings()
+            .map_err(|error| ServiceResponse::error("settings_unavailable", error))
+    }
+    fn handle_set_settings(
+        &self,
+        requested: &PerformanceRuntimeSettings,
+    ) -> Result<PerformanceRuntimeSettings, ServiceResponse> {
+        self.host
+            .set_settings(requested)
+            .map_err(|error| ServiceResponse::error("settings_failed", error))
+    }
+    fn ensure_metrics_worker(&self) -> Result<(), PluginCommandError> {
+        if self
+            .cleanup_pending
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(PluginCommandError::unavailable(
+                "metrics cleanup pending or failed; recovery required",
+            ));
         }
-    });
-    if !should_start {
-        return;
-    }
-
-    let _ = thread::Builder::new()
-        .name("bmux-performance-metrics".to_string())
-        .spawn(metrics_worker_loop);
-}
-
-fn metrics_worker_loop() {
-    let mut system = System::new_all();
-    loop {
-        thread::sleep(DEFAULT_SAMPLE_INTERVAL);
-        let watches = metrics_state().lock().map_or_else(
-            |_| Vec::new(),
-            |state| state.watches.values().cloned().collect::<Vec<_>>(),
-        );
-        if watches.is_empty() {
-            continue;
+        let mut worker = self
+            .worker
+            .lock()
+            .map_err(|_| PluginCommandError::failed("metrics worker lock poisoned"))?;
+        if worker.is_some() {
+            return Err(PluginCommandError::failed("metrics sampler already active"));
         }
-
-        let snapshot = sample_metrics(&mut system, watches);
-        publish_metrics_snapshot(&snapshot);
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stopped = Arc::clone(&stop);
+        let host = Arc::clone(&self.host);
+        let metrics = Arc::clone(&self.metrics);
+        let revision = Arc::clone(&self.fact_revision);
+        let errors = Arc::clone(&self.worker_error);
+        let task = thread::Builder::new()
+            .name("bmux-performance-metrics".into())
+            .spawn(move || {
+                let mut system = System::new_all();
+                while !stopped.load(std::sync::atomic::Ordering::Acquire) {
+                    thread::park_timeout(DEFAULT_SAMPLE_INTERVAL);
+                    if stopped.load(std::sync::atomic::Ordering::Acquire) {
+                        break;
+                    }
+                    let outcome = (|| -> Result<(), String> {
+                        let watches = metrics
+                            .lock()
+                            .map_err(|_| "metrics lock poisoned")?
+                            .watches
+                            .values()
+                            .cloned()
+                            .collect();
+                        let panes = host.pane_processes()?;
+                        let snapshot = sample_metrics(&mut system, watches, panes);
+                        host.publish_facts(performance_facts(
+                            &snapshot,
+                            revision
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                                .wrapping_add(1),
+                        ))?;
+                        host.publish_metrics(&snapshot)?;
+                        metrics
+                            .lock()
+                            .map_err(|_| "metrics lock poisoned")?
+                            .snapshot = snapshot;
+                        Ok(())
+                    })();
+                    if let Ok(mut error) = errors.lock() {
+                        *error = outcome.err();
+                    }
+                }
+            })
+            .map_err(|error| PluginCommandError::failed(error.to_string()))?;
+        *worker = Some(MetricsWorker { stop, task });
+        Ok(())
+    }
+}
+impl Drop for PerformancePlugin {
+    fn drop(&mut self) {
+        // Sampler owns no execution authority. Join before releasing host ports.
+        if let Err(error) = self.stop_worker() {
+            tracing::warn!(%error, "metrics sampler cleanup failed");
+        }
     }
 }
 
-fn publish_metrics_snapshot(snapshot: &MetricsSnapshot) {
-    if let Ok(mut state) = metrics_state().lock() {
-        state.snapshot = snapshot.clone();
-    }
-    publish_performance_facts(snapshot);
-    let _ = global_event_bus().publish_state(&METRICS_STATE_KIND, snapshot.clone());
-    let _ = global_event_bus().emit(
-        &METRIC_EVENT_KIND,
-        MetricEvent::SnapshotUpdated {
-            sampled_at_epoch_ms: snapshot.sampled_at_epoch_ms,
-        },
-    );
-}
-
-fn publish_performance_facts(snapshot: &MetricsSnapshot) {
+fn performance_facts(snapshot: &MetricsSnapshot, revision: u64) -> PresentationFactSnapshot {
     let facts = snapshot
         .panes
         .values()
@@ -719,24 +833,16 @@ fn publish_performance_facts(snapshot: &MetricsSnapshot) {
             priority: 10,
         })
         .collect();
-    let _ = global_presentation_fact_host_service()
-        .registry()
-        .publish_authorized(
-            "bmux.performance",
-            "bmux.performance",
-            PresentationFactSnapshot {
-                revision: PRESENTATION_FACT_REVISION
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                    .wrapping_add(1),
-                facts,
-            },
-        );
+    PresentationFactSnapshot { revision, facts }
 }
 
-fn sample_metrics(system: &mut System, watches: Vec<MetricWatch>) -> MetricsSnapshot {
+fn sample_metrics(
+    system: &mut System,
+    watches: Vec<MetricWatch>,
+    pane_identities: Vec<bmux_pane_runtime_state::PaneProcessIdentity>,
+) -> MetricsSnapshot {
     system.refresh_all();
 
-    let pane_identities = pane_process_identities();
     let mut process_roots = BTreeSet::new();
     for watch in &watches {
         if let MetricTarget::Process { pid } = watch.target {
@@ -827,18 +933,6 @@ fn display_cpu_percent(raw_percent: f32, normalized_percent: f32, mode: CpuPerce
     }
 }
 
-fn pane_process_identities() -> Vec<bmux_pane_runtime_state::PaneProcessIdentity> {
-    global_plugin_state_registry()
-        .get::<bmux_pane_runtime_state::SessionRuntimeManagerHandle>()
-        .and_then(|handle| {
-            handle
-                .read()
-                .ok()
-                .map(|guard| guard.0.list_pane_processes())
-        })
-        .unwrap_or_default()
-}
-
 #[allow(clippy::cast_possible_truncation)]
 fn epoch_millis_now() -> u64 {
     SystemTime::now()
@@ -924,12 +1018,203 @@ impl ProcessTree {
     }
 }
 
+struct LegacyPerformanceHost;
+impl PerformanceHost for LegacyPerformanceHost {
+    fn activate_channels(&self, initial: MetricsSnapshot) -> Result<(), String> {
+        let events = global_event_bus();
+        events.register_channel::<PerformanceEvent>(EVENT_KIND);
+        events.register_channel::<MetricEvent>(METRIC_EVENT_KIND);
+        events.register_state_channel_with_json_projection::<MetricsSnapshot>(
+            METRICS_STATE_KIND,
+            initial,
+        );
+        Ok(())
+    }
+    fn settings(&self) -> Result<PerformanceRuntimeSettings, String> {
+        let handle = global_plugin_state_registry()
+            .get::<PerformanceSettingsHandle>()
+            .ok_or("performance settings missing")?;
+        let settings = handle
+            .read()
+            .map_err(|_| "performance settings poisoned")?
+            .0
+            .current()
+            .to_runtime_settings();
+        Ok(settings)
+    }
+    fn set_settings(
+        &self,
+        requested: &PerformanceRuntimeSettings,
+    ) -> Result<PerformanceRuntimeSettings, String> {
+        let capture = PerformanceCaptureSettings::from_runtime_settings(requested);
+        let settings = capture.to_runtime_settings();
+        let handle = global_plugin_state_registry()
+            .get::<PerformanceSettingsHandle>()
+            .ok_or("performance settings missing")?;
+        handle
+            .read()
+            .map_err(|_| "performance settings poisoned")?
+            .0
+            .set(capture);
+        let _ = global_event_bus().emit(
+            &EVENT_KIND,
+            PerformanceEvent::SettingsUpdated {
+                settings: settings.clone().into(),
+            },
+        );
+        Ok(settings)
+    }
+    fn pane_processes(&self) -> Result<Vec<bmux_pane_runtime_state::PaneProcessIdentity>, String> {
+        let handle = global_plugin_state_registry()
+            .get::<bmux_pane_runtime_state::SessionRuntimeManagerHandle>()
+            .ok_or("pane process source missing")?;
+        let processes = handle
+            .read()
+            .map_err(|_| "pane process source poisoned")?
+            .0
+            .list_pane_processes();
+        Ok(processes)
+    }
+    fn publish_metrics(&self, snapshot: &MetricsSnapshot) -> Result<(), String> {
+        global_event_bus()
+            .publish_state(&METRICS_STATE_KIND, snapshot.clone())
+            .map_err(|error| error.to_string())?;
+        let _ = global_event_bus().emit(
+            &METRIC_EVENT_KIND,
+            MetricEvent::SnapshotUpdated {
+                sampled_at_epoch_ms: snapshot.sampled_at_epoch_ms,
+            },
+        );
+        Ok(())
+    }
+    fn publish_facts(&self, snapshot: PresentationFactSnapshot) -> Result<(), String> {
+        global_presentation_fact_host_service()
+            .registry()
+            .publish_authorized("bmux.performance", "bmux.performance", snapshot)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+}
+
+impl bmux_plugin_sdk::definition::PluginInstance for PerformancePlugin {
+    fn service_contract_for(&self, interface: &str) -> Option<&'static [u8]> {
+        <bmux_performance_plugin_api::Contract as bmux_plugin_sdk::PluginContract>::service_contract_for(interface)
+    }
+
+    fn activate(
+        &self,
+        _context: bmux_plugin_sdk::definition::PluginLifecycleContext,
+    ) -> bmux_plugin_sdk::definition::PluginFuture<'_, bmux_plugin_sdk::definition::PluginResult<()>>
+    {
+        Box::pin(async move { self.activate_owner() })
+    }
+    fn deactivate(
+        &self,
+        _context: bmux_plugin_sdk::definition::PluginLifecycleContext,
+    ) -> bmux_plugin_sdk::definition::PluginFuture<'_, bmux_plugin_sdk::definition::PluginResult<()>>
+    {
+        Box::pin(async move {
+            tokio::runtime::Handle::try_current().map_err(|_| {
+                PluginCommandError::unavailable("metrics cleanup requires host async runtime")
+            })?;
+            if self
+                .cleanup_pending
+                .swap(true, std::sync::atomic::Ordering::AcqRel)
+            {
+                return Err(PluginCommandError::unavailable(
+                    "metrics cleanup pending or failed; recovery required",
+                ));
+            }
+            let worker = Arc::clone(&self.worker);
+            let pending = Arc::clone(&self.cleanup_pending);
+            // The blocking task retains cleanup authority even if this future
+            // is cancelled. Only a successful join permits reactivation.
+            tokio::task::spawn_blocking(move || {
+                stop_metrics_worker(&worker)?;
+                pending.store(false, std::sync::atomic::Ordering::Release);
+                Ok(())
+            })
+            .await
+            .map_err(|_| PluginCommandError::failed("metrics cleanup task panicked"))?
+        })
+    }
+    fn invoke(
+        &self,
+        call: bmux_plugin_sdk::definition::PluginCallContext,
+        context: NativeServiceContext,
+    ) -> bmux_plugin_sdk::definition::PluginFuture<
+        '_,
+        bmux_plugin_sdk::definition::PluginResult<ServiceResponse>,
+    > {
+        Box::pin(async move {
+            if call.cancellation.is_cancelled() {
+                return Err(PluginCommandError::unavailable(
+                    "performance invocation cancelled",
+                ));
+            }
+            Ok(self.service(&context))
+        })
+    }
+}
+pub fn plugin_definition(
+    host: Arc<dyn PerformanceHost>,
+) -> bmux_plugin_sdk::definition::PluginDefinition {
+    use bmux_plugin_sdk::definition::{PluginDefinition, PluginInstance};
+    PluginDefinition::new(definition_metadata(), move |_scope| {
+        Ok(Arc::new(PerformancePlugin::with_host(Arc::clone(&host))) as Arc<dyn PluginInstance>)
+    })
+}
+
 bmux_plugin_sdk::export_plugin!(PerformancePlugin, include_str!("../plugin.toml"));
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    struct Host;
+    impl PerformanceHost for Host {
+        fn activate_channels(&self, _initial: MetricsSnapshot) -> Result<(), String> {
+            Ok(())
+        }
+        fn settings(&self) -> Result<PerformanceRuntimeSettings, String> {
+            Err("selected settings unavailable".into())
+        }
+        fn set_settings(
+            &self,
+            _settings: &PerformanceRuntimeSettings,
+        ) -> Result<PerformanceRuntimeSettings, String> {
+            Err("selected settings unavailable".into())
+        }
+        fn pane_processes(
+            &self,
+        ) -> Result<Vec<bmux_pane_runtime_state::PaneProcessIdentity>, String> {
+            Ok(Vec::new())
+        }
+        fn publish_metrics(&self, _snapshot: &MetricsSnapshot) -> Result<(), String> {
+            Ok(())
+        }
+        fn publish_facts(&self, _snapshot: PresentationFactSnapshot) -> Result<(), String> {
+            Ok(())
+        }
+    }
+    #[test]
+    fn selected_host_failure_is_not_default_settings() {
+        let plugin = PerformancePlugin::with_host(Arc::new(Host));
+        assert!(plugin.handle_get_settings().is_err());
+    }
+    #[test]
+    fn metrics_state_and_worker_are_instance_owned() {
+        let first = PerformancePlugin::with_host(Arc::new(Host));
+        let second = PerformancePlugin::with_host(Arc::new(Host));
+        first.handle_stop_watch(&MetricWatch::default().normalized().id);
+        assert_eq!(first.handle_list_watches().len(), 0);
+        assert_eq!(second.handle_list_watches().len(), 1);
+        first.activate_owner().unwrap();
+        assert!(first.activate_owner().is_err());
+        assert!(second.worker.lock().unwrap().is_none());
+        first.stop_worker().unwrap();
+        assert!(first.worker.lock().unwrap().is_none());
+    }
     #[test]
     fn performance_snapshot_projects_bounded_pane_facts() {
         let pane_id = uuid::Uuid::from_u128(42);
@@ -952,17 +1237,10 @@ mod tests {
             )]),
             ..MetricsSnapshot::default()
         };
-        publish_performance_facts(&snapshot);
-        let facts = global_presentation_fact_host_service()
-            .registry()
-            .facts_for_entity(&PresentationEntityRef::new(
-                "bmux.panes",
-                pane_id.to_string(),
-            ));
-        assert_eq!(facts.len(), 1);
-        assert_eq!(facts[0].0, "bmux.performance");
-        assert_eq!(facts[0].1.role, PresentationFactRole::Warning);
-        assert_eq!(facts[0].1.short_text, "cpu 95%");
+        let facts = performance_facts(&snapshot, 1);
+        assert_eq!(facts.facts.len(), 1);
+        assert_eq!(facts.facts[0].role, PresentationFactRole::Warning);
+        assert_eq!(facts.facts[0].short_text, "cpu 95%");
     }
 
     #[test]
@@ -1019,7 +1297,8 @@ mod tests {
 
     #[test]
     fn start_watch_clamps_and_stores_watch() {
-        let watches = handle_start_watch(MetricWatch {
+        let plugin = PerformancePlugin::default();
+        let watches = plugin.handle_start_watch(MetricWatch {
             id: "test-watch".to_string(),
             target: MetricTarget::System,
             metrics: Vec::new(),
@@ -1035,6 +1314,33 @@ mod tests {
             bmux_performance_plugin_api::MIN_METRICS_INTERVAL_MS
         );
 
-        handle_stop_watch("test-watch");
+        plugin.handle_stop_watch("test-watch");
+    }
+}
+
+fn definition_metadata() -> bmux_plugin_sdk::definition::PluginMetadata {
+    bmux_plugin_sdk::definition::PluginDefinition::from_rust_plugin::<PerformancePlugin>(
+        include_str!("../plugin.toml"),
+        vec![bmux_plugin_sdk::definition::ComponentRole::Backend],
+    )
+    .expect("plugin manifest must define valid canonical metadata")
+    .metadata
+}
+
+#[cfg(test)]
+mod canonical_metadata_tests {
+    #[test]
+    fn embedded_manifest_matches_definition_metadata() {
+        let definition = bmux_plugin_sdk::definition::PluginDefinition::new(
+            super::definition_metadata(),
+            |_scope| {
+                Err(bmux_plugin_sdk::PluginCommandError::unavailable(
+                    "metadata-only regression",
+                ))
+            },
+        );
+        definition
+            .validate()
+            .expect("canonical embedded identity must validate");
     }
 }

@@ -19,13 +19,25 @@ use crate::ServiceCaller;
 #[derive(Debug)]
 pub struct ServiceCallerDispatchClient<'a, C: ServiceCaller + ?Sized> {
     caller: &'a C,
+    asynchronous: bool,
 }
 
 impl<'a, C: ServiceCaller + ?Sized> ServiceCallerDispatchClient<'a, C> {
     /// Create a typed-dispatch client over an existing service caller.
     #[must_use]
     pub const fn new(caller: &'a C) -> Self {
-        Self { caller }
+        Self {
+            caller,
+            asynchronous: false,
+        }
+    }
+    /// Select the bound asynchronous host executor, never synchronous fallback.
+    #[must_use]
+    pub const fn new_async(caller: &'a C) -> Self {
+        Self {
+            caller,
+            asynchronous: true,
+        }
     }
 }
 
@@ -45,22 +57,30 @@ where
         operation: &str,
         payload: Vec<u8>,
     ) -> impl Future<Output = Result<Vec<u8>, TypedDispatchClientError>> + Send {
-        let result = self
-            .caller
-            .call_service_raw(
-                capability,
-                match kind {
-                    InvokeServiceKind::Query => ServiceKind::Query,
-                    InvokeServiceKind::Command => ServiceKind::Command,
-                },
-                interface_id,
-                operation,
-                payload,
-            )
-            .map_err(|err| {
-                TypedDispatchClientError::transport(interface_id, operation, err.to_string())
-            });
-        std::future::ready(result)
+        let asynchronous = self.asynchronous;
+        async move {
+            let kind = match kind {
+                InvokeServiceKind::Query => ServiceKind::Query,
+                InvokeServiceKind::Command => ServiceKind::Command,
+            };
+            let result = if asynchronous {
+                self.caller
+                    .call_service_async(bmux_plugin_sdk::HostServiceOwnedRequest {
+                        capability: capability.into(),
+                        kind,
+                        interface: interface_id.into(),
+                        operation: operation.into(),
+                        payload,
+                    })
+                    .await
+            } else {
+                self.caller
+                    .call_service_raw(capability, kind, interface_id, operation, payload)
+            };
+            result.map_err(|error| {
+                TypedDispatchClientError::transport(interface_id, operation, error.to_string())
+            })
+        }
     }
 }
 
@@ -576,6 +596,39 @@ mod tests {
                 operation: "execute_kernel_request",
             })
         }
+    }
+
+    #[test]
+    fn async_selection_rejects_sync_only_caller_without_dispatch() {
+        struct SyncOnly;
+        impl ServiceCaller for SyncOnly {
+            fn call_service_raw(
+                &self,
+                _: &str,
+                _: ServiceKind,
+                _: &str,
+                _: &str,
+                _: Vec<u8>,
+            ) -> PluginResult<Vec<u8>> {
+                panic!("async adapter must not invoke synchronous callback");
+            }
+            fn execute_kernel_request(
+                &self,
+                _: bmux_ipc::Request,
+            ) -> PluginResult<bmux_ipc::ResponsePayload> {
+                panic!("async adapter must not invoke kernel fallback");
+            }
+        }
+        let caller = SyncOnly;
+        let mut client = ServiceCallerDispatchClient::new_async(&caller);
+        let response = block_on_typed_dispatch(client.invoke_service_raw(
+            "example",
+            InvokeServiceKind::Query,
+            "example/v1",
+            "get",
+            Vec::new(),
+        ));
+        assert!(response.is_err());
     }
 
     #[test]

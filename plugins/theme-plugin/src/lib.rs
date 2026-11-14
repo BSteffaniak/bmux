@@ -1,7 +1,6 @@
 #![cfg_attr(feature = "fail-on-warnings", deny(warnings))]
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
-#![cfg_attr(feature = "static-bundled", allow(dead_code))]
 
 use bmux_appearance::{
     RUNTIME_APPEARANCE_STATE_KIND, RuntimeAppearance, RuntimeAppearancePatch,
@@ -1266,6 +1265,10 @@ struct PickerControl<'a> {
 }
 
 impl bmux_plugin_sdk::TypedDispatchClient for PickerControl<'_> {
+    fn requires_service_contracts(&self) -> bool {
+        true
+    }
+
     async fn invoke_service_raw(
         &mut self,
         capability: &str,
@@ -2873,14 +2876,22 @@ mod tests {
                         caller, client, capability, kind, interface, operation, payload,
                     );
                 }
-                let contract = <bmux_decoration_plugin_api::Contract as bmux_plugin_sdk::PluginContract>::service_contract_for(interface)
-                .or_else(|| <control_contract::Contract as bmux_plugin_sdk::PluginContract>::service_contract_for(interface))
+                let checked_interface =
+                    bmux_plugin_sdk::service_contract::interface_id_for(interface, &payload)?;
+                let contract = <bmux_decoration_plugin_api::Contract as bmux_plugin_sdk::PluginContract>::service_contract_for(checked_interface)
+                .or_else(|| <control_contract::Contract as bmux_plugin_sdk::PluginContract>::service_contract_for(checked_interface))
                     .expect("mock service must have a declared generated contract");
                 let request =
                     bmux_plugin_sdk::service_contract::decode_for(interface, contract, &payload)?
                         .to_vec();
                 let response = router(
-                    caller, client, capability, kind, interface, operation, request,
+                    caller,
+                    client,
+                    capability,
+                    kind,
+                    checked_interface,
+                    operation,
+                    request,
                 )?;
                 Ok(bmux_plugin_sdk::service_contract::encode_response(
                     &response,
@@ -3123,6 +3134,162 @@ mod tests {
         assert_eq!(selected_index(&catalog, CONFIGURED_SELECTION), 0);
     }
 
+    fn selected_test_services() -> bmux_plugin_sdk::PluginHostServices {
+        bmux_plugin_sdk::PluginHostServices::new(
+            // This fixture implements the SDK's by-value error callback ABI.
+            #[allow(clippy::result_large_err)]
+            |request| {
+                let router = bmux_plugin::test_support::test_service_router().ok_or_else(|| {
+                    bmux_plugin_sdk::PluginError::ServiceProtocol {
+                        details: "test service router not installed".into(),
+                    }
+                })?;
+                router(
+                    "bmux.theme",
+                    None,
+                    request.capability,
+                    request.kind,
+                    request.interface,
+                    request.operation,
+                    request.payload.to_vec(),
+                )
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn picker_checked_fixture_validates_before_mock_effects() {
+        use bmux_plugin_sdk::{HostServiceRequest, PluginContract};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let effects = Arc::new(AtomicUsize::new(0));
+        let observed = effects.clone();
+        let router: TestServiceRouter = Arc::new(
+            // Match the test host's required by-value error callback ABI.
+            #[allow(clippy::result_large_err)]
+            move |_, _, _, _, interface, operation, payload| {
+                assert_eq!(interface, "theme-control-v1");
+                assert_eq!(operation, "current");
+                decode_service_message::<()>(&payload).expect("unwrapped generated request");
+                observed.fetch_add(1, Ordering::SeqCst);
+                encode_service_message(&control_contract::theme_control_v1::Snapshot {
+                    revision: 0,
+                    selection: ThemeSelection::Configured,
+                })
+            },
+        );
+        let _router = install_test_service_router(checked_test_router(router));
+        let context = picker_context();
+        let wrong = bmux_plugin_sdk::service_contract::encode(
+            "theme-control-v1",
+            &[0; 32],
+            &encode_service_message(&()).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            context
+                .host_service_port
+                .as_ref()
+                .unwrap()
+                .invoke(HostServiceRequest {
+                    capability: "bmux.theme.write",
+                    kind: ServiceKind::Command,
+                    interface: "theme-control-v1",
+                    operation: "current",
+                    payload: &wrong,
+                })
+                .is_err()
+        );
+        assert_eq!(effects.load(Ordering::SeqCst), 0);
+        let mut control = PickerControl {
+            context: &context,
+            route: None,
+        };
+        assert_eq!(
+            control_contract::theme_control_v1::client::current(&mut control)
+                .await
+                .unwrap()
+                .revision,
+            0
+        );
+        assert_eq!(effects.load(Ordering::SeqCst), 1);
+        assert!(
+            <control_contract::Contract as PluginContract>::service_contract_for(
+                "theme-control-v1"
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn selected_theme_checkpoint_fixture_preserves_coordinator_authority() {
+        use bmux_plugin_sdk::definition::{PluginCallContext, PluginInstance, RustPluginAdapter};
+        let decoration = Arc::new(RustPluginAdapter::new(
+            bmux_decoration_plugin::DecorationPlugin::new(),
+        ));
+        let selected = decoration.clone();
+        let port = bmux_plugin_sdk::PluginHostServices::new(
+            // Host callback ABI fixes PluginError by value.
+            #[allow(clippy::result_large_err)]
+            move |request| {
+                let mut context = service_context(None);
+                context.plugin_id = "bmux.decoration".into();
+                context.caller_client_id = Some(uuid::Uuid::from_u128(0x72));
+                context.request.caller_plugin_id = "bmux.theme".into();
+                context.request.service.capability = HostScope::new(request.capability)?;
+                context.request.service.interface_id = request.interface.into();
+                context.request.service.kind = request.kind;
+                context.request.operation = request.operation.into();
+                context.request.payload = request.payload.to_vec();
+                let response = bmux_plugin::block_on_typed_dispatch(selected.invoke(
+                    PluginCallContext {
+                        invocation_id: context.cancellation.invocation_id.clone(),
+                        cancellation: bmux_plugin_sdk::ServiceCancellation::new(),
+                        host_services: None,
+                    },
+                    context,
+                ))
+                .map_err(|error| {
+                    bmux_plugin_sdk::PluginError::ServiceProtocol {
+                        details: error.message,
+                    }
+                })?;
+                if let Some(error) = response.error {
+                    return Err(bmux_plugin_sdk::PluginError::ServiceProtocol {
+                        details: error.message,
+                    });
+                }
+                Ok(response.payload)
+            },
+        );
+        let mut theme_context = picker_context();
+        theme_context.host_service_port = Some(port);
+        let mut client = bmux_plugin::ServiceCallerDispatchClient::new(&theme_context);
+        assert!(bmux_plugin::block_on_typed_dispatch(
+            bmux_decoration_plugin_api::decoration_commands::client::checkpoint_view_script_state(&mut client),
+        ).unwrap().is_ok());
+        let mut foreign = service_context(None);
+        foreign.caller_client_id = Some(uuid::Uuid::from_u128(0x72));
+        foreign.request.caller_plugin_id = "other.plugin".into();
+        foreign.request.service.interface_id = "decoration-commands".into();
+        foreign.request.operation = "checkpoint-view-script-state".into();
+        foreign.request.payload = bmux_plugin_sdk::service_contract::encode(
+            "decoration-commands",
+            bmux_decoration_plugin_api::decoration_commands::SERVICE_CONTRACT,
+            &encode_service_message(&()).unwrap(),
+        )
+        .unwrap();
+        let response = bmux_plugin::block_on_typed_dispatch(decoration.invoke(
+            PluginCallContext {
+                invocation_id: foreign.cancellation.invocation_id.clone(),
+                cancellation: bmux_plugin_sdk::ServiceCancellation::new(),
+                host_services: None,
+            },
+            foreign,
+        ))
+        .unwrap();
+        assert_eq!(response.error.unwrap().code, "checkpoint_owner_required");
+    }
+
     fn picker_context() -> NativeCommandContext {
         let lifecycle = lifecycle_context(None);
         NativeCommandContext {
@@ -3143,11 +3310,13 @@ mod tests {
             plugin_settings_map: BTreeMap::new(),
             caller_client_id: None,
             invocation_source: bmux_plugin_sdk::NativeCommandInvocationSource::Unknown,
+            host_service_port: Some(selected_test_services()),
             host_kernel_bridge: None,
         }
     }
 
     #[tokio::test]
+    #[serial_test::serial(theme_prompt_host)]
     #[allow(clippy::result_large_err)] // TestServiceRouter fixes the external error type.
     async fn picker_rejection_and_closed_events_do_not_apply_themes() {
         let calls = Arc::new(Mutex::new(0_usize));
@@ -3184,6 +3353,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(theme_prompt_host)]
     #[allow(clippy::result_large_err)] // TestServiceRouter fixes the external error type.
     async fn picker_delegates_failed_selection_to_control_authority() {
         let applied = Arc::new(Mutex::new(Vec::<String>::new()));
@@ -3248,7 +3418,11 @@ mod tests {
                 )))
                 .expect("response");
         };
-        tokio::join!(run_theme_picker(context), host);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            tokio::join!(run_theme_picker(context), host);
+        })
+        .await
+        .expect("picker and selected prompt host must settle");
         assert_eq!(&*applied.lock().expect("calls"), &["select"]);
     }
 
@@ -3283,6 +3457,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(theme_prompt_host)]
     #[allow(clippy::result_large_err)] // TestServiceRouter fixes the external error type.
     async fn rejected_decoration_is_not_persisted_by_picker() {
         let writes = Arc::new(Mutex::new(0));
@@ -3329,7 +3504,11 @@ mod tests {
                 )))
                 .expect("response");
         };
-        tokio::join!(run_theme_picker(context), host);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            tokio::join!(run_theme_picker(context), host);
+        })
+        .await
+        .expect("picker and selected prompt host must settle");
         assert_eq!(*writes.lock().expect("writes"), 0);
     }
 
@@ -5458,7 +5637,7 @@ mod tests {
         NativeServiceContext {
             plugin_id: "bmux.theme".to_string(),
             request: ServiceRequest {
-                caller_plugin_id: "test".to_string(),
+                caller_plugin_id: "bmux.theme".to_string(),
                 service: RegisteredService {
                     capability: HostScope::new("bmux.theme.read").expect("capability should parse"),
                     kind: ServiceKind::Query,
@@ -5491,6 +5670,7 @@ mod tests {
             plugin_settings_map: BTreeMap::new(),
             caller_client_id: None,
             cancellation: bmux_plugin_sdk::CancellationToken::default(),
+            host_service_port: Some(selected_test_services()),
             host_kernel_bridge: None,
         }
     }
@@ -5498,6 +5678,7 @@ mod tests {
     fn lifecycle_context(settings: Option<toml::Value>) -> NativeLifecycleContext {
         NativeLifecycleContext {
             auxiliary_executables: BTreeMap::new(),
+            host_service_port: None,
             auxiliary_executable_errors: BTreeMap::new(),
             plugin_id: "bmux.theme".to_string(),
             required_capabilities: vec![
@@ -5677,4 +5858,118 @@ mod tests {
     }
 }
 
-bmux_plugin_sdk::export_plugin!(ThemePlugin, include_str!("../plugin.toml"));
+/// Select this runtime's event bus and recipient sink for each theme instance.
+/// No explicit runtime binding falls back to a different host's registries.
+#[must_use]
+pub fn plugin_definition_with_runtime(
+    events: std::sync::Arc<bmux_plugin::EventBus>,
+    sink: std::sync::Arc<dyn bmux_plugin_sdk::WireEventSink>,
+) -> bmux_plugin_sdk::definition::PluginDefinition {
+    let metadata = plugin_definition().metadata;
+    bmux_plugin_sdk::definition::PluginDefinition::new(
+        metadata,
+        move |scope: bmux_plugin_sdk::definition::PluginCreateContext| {
+            Ok(std::sync::Arc::new(
+                bmux_plugin_sdk::definition::RustPluginAdapter::for_instance(
+                    ThemePlugin::with_runtime(events.clone(), sink.clone()),
+                    scope.instance,
+                ),
+            )
+                as std::sync::Arc<
+                    dyn bmux_plugin_sdk::definition::PluginInstance,
+                >)
+        },
+    )
+}
+
+bmux_plugin_sdk::define_plugin!(
+    factory = |scope: bmux_plugin_sdk::definition::PluginCreateContext| Ok(std::sync::Arc::new(
+        bmux_plugin_sdk::definition::RustPluginAdapter::for_instance(
+            ThemePlugin::default(),
+            scope.instance
+        )
+    )
+        as std::sync::Arc<dyn bmux_plugin_sdk::definition::PluginInstance>),
+    metadata = {
+        let manifest_toml = include_str!("../plugin.toml");
+        let manifest = bmux_plugin::PluginManifest::from_toml_str(manifest_toml)
+            .expect("embedded plugin declaration must be valid");
+        bmux_plugin_sdk::definition::PluginMetadata {
+            plugin_id: manifest.id,
+            version: manifest.version,
+            roles: manifest.component_roles,
+            required_capabilities: manifest
+                .required_capabilities
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            contracts: manifest.contracts,
+            manifest_toml: Some(manifest_toml.into()),
+        }
+    },
+);
+
+#[cfg(test)]
+mod embedded_declaration_identity_tests {
+    #[test]
+    fn definition_and_selected_manifest_have_one_identity() {
+        let definition = super::plugin_definition();
+        definition.validate().expect("definition validates");
+        let embedded = definition
+            .metadata
+            .manifest_toml
+            .as_deref()
+            .expect("embedded declaration");
+        let manifest =
+            bmux_plugin::PluginManifest::from_toml_str(embedded).expect("valid manifest");
+        assert_eq!(definition.metadata.plugin_id, manifest.id);
+        assert_eq!(definition.metadata.version, manifest.version);
+        assert_eq!(definition.metadata.roles, manifest.component_roles);
+        assert_eq!(definition.metadata.contracts, manifest.contracts);
+        assert_eq!(
+            definition.metadata.required_capabilities,
+            manifest
+                .required_capabilities
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        );
+
+        // Deterministic verifier fixtures, not claims about built executable bytes.
+        // Real selected artifact hashing remains the loader's responsibility.
+        let expected_digest = "a".repeat(64);
+        let wrong_digest = "b".repeat(64);
+        let pinned = format!("artifact_sha256 = \"{expected_digest}\"\n{embedded}");
+        let mut inventory = bmux_plugin::PluginCandidateInventory::new();
+        inventory
+            .add_bundled_manifest(&pinned, Vec::new())
+            .expect("inventory declaration");
+        for role in &manifest.component_roles {
+            let selected = inventory
+                .select(&bmux_plugin::PluginSelectionRequest {
+                    plugin_id: manifest.id.clone(),
+                    role: *role,
+                    preference: bmux_plugin::PluginCandidatePreference::Bundled,
+                    plugin_api: bmux_plugin_sdk::ApiVersion::new(1, 1),
+                    native_abi: bmux_plugin_sdk::ApiVersion::new(1, 1),
+                    contracts: manifest.contracts.clone(),
+                })
+                .expect("select declared role and contracts");
+            selected
+                .validate_embedded_metadata(&definition.metadata, &expected_digest)
+                .expect("selected declaration and embedded identity match");
+            assert!(
+                selected
+                    .validate_embedded_metadata(&definition.metadata, &wrong_digest)
+                    .is_err()
+            );
+            let mut conflicting = definition.metadata.clone();
+            conflicting.version.push_str("-conflict");
+            assert!(
+                selected
+                    .validate_embedded_metadata(&conflicting, &expected_digest)
+                    .is_err()
+            );
+        }
+    }
+}

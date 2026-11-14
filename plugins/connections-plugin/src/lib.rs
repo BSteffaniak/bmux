@@ -30,13 +30,31 @@ use bmux_connections_plugin_api::{
 };
 use bmux_plugin::stream_admission::StreamAdmissionAuthorityHandle;
 use bmux_plugin_sdk::{CancellationToken, prelude::*};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
+#[cfg(test)]
+use std::sync::OnceLock;
 
 pub use admission::AdmissionProviderCodec;
 use bmux_plugin::stream_admission::StreamAdmissionAuthority;
 pub use directory::LocalStatus;
 
-#[derive(Default)]
+impl Default for ConnectionsPlugin {
+    fn default() -> Self {
+        Self {
+            local_runtime: None,
+            pairing: None,
+            admission: None,
+            admission_handle: None,
+            listener: tokio::sync::Mutex::new(None),
+            listener_warning: std::sync::Mutex::new(None),
+            pool: Arc::new(
+                EndpointConnectionPool::new(ConnectionPoolLimits::default())
+                    .expect("default pool limits are valid"),
+            ),
+        }
+    }
+}
+
 pub struct ConnectionsPlugin {
     local_runtime: Option<directory::LocalRuntime>,
     pairing: Option<Arc<pairing::PairingAuthority>>,
@@ -44,6 +62,7 @@ pub struct ConnectionsPlugin {
     admission_handle: Option<StreamAdmissionAuthorityHandle>,
     listener: tokio::sync::Mutex<Option<listener::Listener>>,
     listener_warning: std::sync::Mutex<Option<String>>,
+    pool: Arc<EndpointConnectionPool<BmuxClient>>,
 }
 
 fn listener_start_warning(error: &anyhow::Error) -> String {
@@ -199,15 +218,20 @@ impl ConnectionsPlugin {
         let _owner = pairing_owner(context)?;
         block_on_connection(async {
             let mut listener = self.listener.lock().await;
-            if let Some(mut active) = listener.take() {
-                active.stop().await;
+            if let Some(active) = listener.as_mut() {
+                active
+                    .stop()
+                    .await
+                    .map_err(|error| ServiceResponse::error("listener_cleanup", error))?;
             }
+            *listener = None;
             drop(listener);
             *self
                 .listener_warning
                 .lock()
                 .expect("listener warning lock poisoned") = None;
-        });
+            Ok::<(), ServiceResponse>(())
+        })?;
         self.listener_status()
     }
 
@@ -505,11 +529,15 @@ impl RustPlugin for ConnectionsPlugin {
     }
 
     fn activate(&mut self, context: NativeLifecycleContext) -> Result<i32, PluginCommandError> {
+        if self.local_runtime.is_some() || self.listener.get_mut().is_some() {
+            return Err(PluginCommandError::failed(
+                "connections already active; deactivate before replacement",
+            ));
+        }
         *self
             .listener_warning
             .get_mut()
             .expect("listener warning lock poisoned") = None;
-        *self.listener.get_mut() = None;
         self.local_runtime = None;
         self.pairing = None;
         self.admission = None;
@@ -587,6 +615,9 @@ impl RustPlugin for ConnectionsPlugin {
     }
 
     fn deactivate(&mut self, _context: NativeLifecycleContext) -> Result<i32, PluginCommandError> {
+        if let Some(listener) = self.listener.get_mut().as_mut() {
+            block_on_connection(listener.stop())?;
+        }
         *self
             .listener_warning
             .get_mut()
@@ -603,6 +634,9 @@ impl RustPlugin for ConnectionsPlugin {
         remote_cli::run(&context).map_err(|e| PluginCommandError::failed(e.to_string()))
     }
 
+    // Keep the explicit generated-operation routing table and authorization
+    // together rather than splitting a single service dispatch.
+    #[allow(clippy::too_many_lines)]
     fn invoke_service(&self, context: NativeServiceContext) -> ServiceResponse {
         bmux_plugin_sdk::route_service!(context, {
             "pairing-state", "local-device-identity" => |(): (), ctx| {
@@ -696,7 +730,8 @@ impl RustPlugin for ConnectionsPlugin {
                 let config = target::load_config(&ctx.connection)
                     .map_err(|error| ServiceResponse::error("config_failed", error.to_string()))?;
                 let paths = target::context_paths(&ctx.connection);
-                Ok::<Result<Vec<u8>, ConnectionError>, ServiceResponse>(invoke_service(
+                Ok::<Result<Vec<u8>, ConnectionError>, ServiceResponse>(invoke_service_with_pool(
+                    &self.pool,
                     &config,
                     &paths,
                     &ctx.cancellation,
@@ -769,7 +804,18 @@ fn pairing_owner(context: &NativeServiceContext) -> Result<pairing::LocalOwner, 
     }
 }
 
+#[cfg(test)]
 fn invoke_service(
+    config: &bmux_config::BmuxConfig,
+    paths: &bmux_config::ConfigPaths,
+    cancellation: &CancellationToken,
+    request: InvokeServiceRequest,
+) -> Result<Vec<u8>, ConnectionError> {
+    invoke_service_with_pool(connection_pool(), config, paths, cancellation, request)
+}
+
+fn invoke_service_with_pool(
+    pool: &EndpointConnectionPool<BmuxClient>,
     config: &bmux_config::BmuxConfig,
     paths: &bmux_config::ConfigPaths,
     cancellation: &CancellationToken,
@@ -820,6 +866,7 @@ fn invoke_service(
             ServiceInvokeKind::InvokeCommand => bmux_ipc::InvokeServiceKind::Command,
         };
         let mut client = acquire_endpoint(
+            pool,
             config,
             paths,
             &resolved,
@@ -928,6 +975,7 @@ struct AcquisitionPolicy<'a> {
     timeout_ms: u64,
 }
 
+#[cfg(test)]
 fn connection_pool() -> &'static EndpointConnectionPool<BmuxClient> {
     static POOL: OnceLock<EndpointConnectionPool<BmuxClient>> = OnceLock::new();
     POOL.get_or_init(|| {
@@ -937,6 +985,7 @@ fn connection_pool() -> &'static EndpointConnectionPool<BmuxClient> {
 }
 
 async fn acquire_endpoint(
+    pool: &EndpointConnectionPool<BmuxClient>,
     config: &bmux_config::BmuxConfig,
     paths: &bmux_config::ConfigPaths,
     resolved: &target::ResolvedTarget,
@@ -958,7 +1007,7 @@ async fn acquire_endpoint(
             });
         }
         let resolved = resolved.clone();
-        match connection_pool()
+        match pool
             .acquire(endpoint_id.clone(), deadline, || async move {
                 transport::connect(config, paths, &resolved).await
             })
@@ -1349,6 +1398,7 @@ mod tests {
             caller_client_id: None,
             cancellation: CancellationToken::new(),
             host_kernel_bridge: None,
+            host_service_port: None,
         }
     }
 
@@ -2099,4 +2149,202 @@ mod tests {
     }
 }
 
+/// One scoped owner; service reads do not take an exclusive lifecycle lock.
+///
+/// The host closes admission before deactivation. Network cleanup is awaited
+/// outside the implementation lock and failed cleanup restores retained state.
+pub struct ConnectionsInstance {
+    plugin: std::sync::RwLock<ConnectionsPlugin>,
+}
+impl ConnectionsInstance {
+    #[must_use]
+    pub fn new(pool: Arc<EndpointConnectionPool<BmuxClient>>) -> Self {
+        Self {
+            plugin: std::sync::RwLock::new(ConnectionsPlugin {
+                pool,
+                local_runtime: None,
+                pairing: None,
+                admission: None,
+                admission_handle: None,
+                listener: tokio::sync::Mutex::new(None),
+                listener_warning: std::sync::Mutex::new(None),
+            }),
+        }
+    }
+}
+impl bmux_plugin_sdk::definition::PluginInstance for ConnectionsInstance {
+    fn service_contract_for(&self, interface: &str) -> Option<&'static [u8]> {
+        <bmux_connections_plugin_api::Contract as bmux_plugin_sdk::PluginContract>::service_contract_for(interface)
+    }
+
+    fn activate(
+        &self,
+        context: bmux_plugin_sdk::definition::PluginLifecycleContext,
+    ) -> bmux_plugin_sdk::definition::PluginFuture<'_, bmux_plugin_sdk::definition::PluginResult<()>>
+    {
+        Box::pin(async move {
+            let mut plugin = self
+                .plugin
+                .try_write()
+                .map_err(|_| PluginCommandError::unavailable("connections lifecycle busy"))?;
+            match RustPlugin::activate(&mut *plugin, context.native)? {
+                EXIT_OK => Ok(()),
+                code => Err(PluginCommandError::new(
+                    code,
+                    "connections activation failed",
+                )),
+            }
+        })
+    }
+    fn deactivate(
+        &self,
+        _context: bmux_plugin_sdk::definition::PluginLifecycleContext,
+    ) -> bmux_plugin_sdk::definition::PluginFuture<'_, bmux_plugin_sdk::definition::PluginResult<()>>
+    {
+        Box::pin(async move {
+            let mut listener = {
+                let mut plugin = self
+                    .plugin
+                    .try_write()
+                    .map_err(|_| PluginCommandError::unavailable("connections lifecycle busy"))?;
+                plugin.listener.get_mut().take()
+            };
+            if let Some(active) = listener.as_mut()
+                && let Err(error) = active.stop().await
+            {
+                let mut plugin = self
+                    .plugin
+                    .write()
+                    .map_err(|_| PluginCommandError::failed("connections cleanup lock poisoned"))?;
+                *plugin.listener.get_mut() = listener;
+                drop(plugin);
+                return Err(PluginCommandError::failed(error));
+            }
+            let mut plugin = self
+                .plugin
+                .try_write()
+                .map_err(|_| PluginCommandError::unavailable("connections lifecycle busy"))?;
+            *plugin
+                .listener_warning
+                .get_mut()
+                .map_err(|_| PluginCommandError::failed("listener warning lock poisoned"))? = None;
+            plugin.local_runtime = None;
+            plugin.pairing = None;
+            plugin.admission = None;
+            plugin.admission_handle = None;
+            drop(plugin);
+            Ok(())
+        })
+    }
+    fn command(
+        &self,
+        call: bmux_plugin_sdk::definition::PluginCallContext,
+        context: NativeCommandContext,
+    ) -> bmux_plugin_sdk::definition::PluginFuture<'_, bmux_plugin_sdk::definition::CommandOutcome>
+    {
+        Box::pin(async move {
+            if call.cancellation.is_cancelled() {
+                return Err(PluginCommandError::unavailable(
+                    "connections command cancelled",
+                ))
+                .into();
+            }
+            remote_cli::run(&context)
+                .map_err(|error| PluginCommandError::failed(error.to_string()))
+                .into()
+        })
+    }
+    fn invoke(
+        &self,
+        call: bmux_plugin_sdk::definition::PluginCallContext,
+        context: NativeServiceContext,
+    ) -> bmux_plugin_sdk::definition::PluginFuture<
+        '_,
+        bmux_plugin_sdk::definition::PluginResult<ServiceResponse>,
+    > {
+        Box::pin(async move {
+            if call.cancellation.is_cancelled() {
+                return Err(PluginCommandError::unavailable(
+                    "connections invocation cancelled",
+                ));
+            }
+            let plugin = self
+                .plugin
+                .try_read()
+                .map_err(|_| PluginCommandError::unavailable("connections lifecycle busy"))?;
+            Ok(plugin.invoke_service(context))
+        })
+    }
+    fn register_contributions(
+        &self,
+        registrar: &mut bmux_plugin_sdk::ContributionRegistrar,
+    ) -> bmux_plugin_sdk::definition::PluginResult<()> {
+        let plugin = self
+            .plugin
+            .try_read()
+            .map_err(|_| PluginCommandError::unavailable("connections lifecycle busy"))?;
+        plugin
+            .register_contributions(registrar)
+            .map_err(|error| PluginCommandError::failed(error.to_string()))
+    }
+}
+
+/// Pools are runtime-owned ports. The factory requires one explicitly rather
+/// than silently sharing the legacy process pool across independent runtimes.
+#[must_use]
+pub fn plugin_definition(
+    pool: Arc<EndpointConnectionPool<BmuxClient>>,
+) -> bmux_plugin_sdk::definition::PluginDefinition {
+    use bmux_plugin_sdk::definition::{PluginDefinition, PluginInstance};
+    PluginDefinition::new(definition_metadata(), move |_scope| {
+        Ok(Arc::new(ConnectionsInstance::new(Arc::clone(&pool))) as Arc<dyn PluginInstance>)
+    })
+}
+
+#[cfg(test)]
+mod scoped_instance_tests {
+    use super::*;
+    #[test]
+    fn constructor_retains_selected_pool_and_no_ingress_side_effects() {
+        let pool = Arc::new(EndpointConnectionPool::new(ConnectionPoolLimits::default()).unwrap());
+        let instance = ConnectionsInstance::new(Arc::clone(&pool));
+        let plugin = instance.plugin.read().unwrap();
+        assert!(Arc::ptr_eq(&pool, &plugin.pool));
+        assert!(plugin.local_runtime.is_none());
+        assert!(plugin.admission_handle.is_none());
+        assert!(plugin.listener.try_lock().unwrap().is_none());
+        drop(plugin);
+    }
+}
+
 bmux_plugin_sdk::export_plugin!(ConnectionsPlugin, include_str!("../plugin.toml"));
+
+fn definition_metadata() -> bmux_plugin_sdk::definition::PluginMetadata {
+    bmux_plugin_sdk::definition::PluginDefinition::from_rust_plugin::<ConnectionsPlugin>(
+        include_str!("../plugin.toml"),
+        vec![
+            bmux_plugin_sdk::definition::ComponentRole::Backend,
+            bmux_plugin_sdk::definition::ComponentRole::Frontend,
+        ],
+    )
+    .expect("plugin manifest must define valid canonical metadata")
+    .metadata
+}
+
+#[cfg(test)]
+mod canonical_metadata_tests {
+    #[test]
+    fn embedded_manifest_matches_definition_metadata() {
+        let definition = bmux_plugin_sdk::definition::PluginDefinition::new(
+            super::definition_metadata(),
+            |_scope| {
+                Err(bmux_plugin_sdk::PluginCommandError::unavailable(
+                    "metadata-only regression",
+                ))
+            },
+        );
+        definition
+            .validate()
+            .expect("canonical embedded identity must validate");
+    }
+}

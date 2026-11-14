@@ -23,6 +23,7 @@ switchy = { workspace = true, features = [
     "random-rand",
 ] }
 thiserror = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "time", "net"] }
 toml = { workspace = true, features = ["parse"] }
 tracing = { workspace = true }
 uuid = { workspace = true, features = ["serde", "std"] }

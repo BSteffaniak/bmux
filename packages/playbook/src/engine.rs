@@ -2201,9 +2201,18 @@ async fn run_playbook_inner(
     if target_server {
         sandbox = None;
         client = BmuxClient::new(
-            RawClient::connect_default("bmux-playbook-runner")
-                .await
-                .map_err(|e| anyhow::anyhow!("failed connecting to live server: {e}"))?,
+            match host.selected_runtime() {
+                Some((config, paths)) => {
+                    RawClient::connect_with_paths_and_timeout(
+                        &paths,
+                        "bmux-playbook-runner",
+                        Duration::from_millis(config.general.server_timeout.max(1)),
+                    )
+                    .await
+                }
+                None => RawClient::connect_default("bmux-playbook-runner").await,
+            }
+            .map_err(|e| anyhow::anyhow!("failed connecting to live server: {e}"))?,
             host.clone(),
         );
     } else {
@@ -2215,6 +2224,7 @@ async fn run_playbook_inner(
                 shell: playbook.config.shell.as_deref(),
                 input_profile: playbook.config.input_profile,
                 plugin_config: &playbook.config.plugins,
+                recording_requested: should_record,
                 startup_timeout: SERVER_STARTUP_TIMEOUT,
                 env: &application_environment,
                 env_mode: playbook.config.effective_env_mode(),
@@ -2242,8 +2252,17 @@ async fn run_playbook_inner(
     let mut events_subscribed = false;
     let mut attach_runtime: Option<AttachInputRuntime> = None;
     let mut display_track: Option<super::display_track::PlaybookDisplayTrackWriter> = None;
+    // Recording setup consumes the same execution budget as the DSL steps.
+    let playbook_start = Instant::now();
+    let deadline = playbook_start + playbook.config.timeout;
     let previous_perf_settings = if should_record {
-        set_playbook_perf_recording_level(&mut client).await
+        tokio::time::timeout_at(
+            tokio::time::Instant::from_std(deadline),
+            set_playbook_perf_recording_level(&mut client),
+        )
+        .await
+        .ok()
+        .flatten()
     } else {
         None
     };
@@ -2252,7 +2271,7 @@ async fn run_playbook_inner(
     // NewSession) are captured. Uses session_id: None since no session exists
     // yet — the sandbox is ephemeral so there's no noise from other sessions.
     if should_record {
-        match start_recording(&mut client, None).await {
+        match requested_recording_start(deadline, start_recording(&mut client, None)).await {
             Ok(rid) => {
                 info!("recording started: {rid}");
                 recording_id = Some(rid);
@@ -2282,16 +2301,14 @@ async fn run_playbook_inner(
                     }
                 }
             }
-            Err(e) => {
-                warn!("failed to start recording: {e:#}");
-                // Non-fatal — continue without recording.
+            Err(error) => {
+                error_msg = Some(format!("{error:#}"));
             }
         }
     }
 
-    // Execute each step
-    let playbook_start = Instant::now();
-    let deadline = playbook_start + playbook.config.timeout;
+    let recording_setup_failed = should_record && error_msg.is_some();
+    // Execute each step only after requested recording setup succeeds.
     let pacing_credit = std::sync::atomic::AtomicU64::new(0);
     let total_steps = playbook.steps.len();
     let interactive_mode = resolve_interactive_mode(
@@ -2300,11 +2317,12 @@ async fn run_playbook_inner(
         host.terminal_is_interactive(),
     );
     let mut interactive_prompt_active = matches!(interactive_mode, PlaybookInteractiveMode::Prompt);
-    let mut visual_interactive = if matches!(interactive_mode, PlaybookInteractiveMode::Visual) {
-        Some(VisualInteractiveState::enter(total_steps, host.clone())?)
-    } else {
-        None
-    };
+    let mut visual_interactive =
+        if error_msg.is_none() && matches!(interactive_mode, PlaybookInteractiveMode::Visual) {
+            Some(VisualInteractiveState::enter(total_steps, host.clone())?)
+        } else {
+            None
+        };
     let mut render_trace_state = PlaybookRenderTraceState::new(playbook.config.render_trace);
     let mut real_attach_runtime: Option<RealAttachPlaybookRuntime> = None;
     let mut interactive_abort_from_step: Option<usize> = None;
@@ -2319,6 +2337,13 @@ async fn run_playbook_inner(
     }
 
     for (step_position, step) in playbook.steps.iter().enumerate() {
+        if recording_setup_failed {
+            if let Some(error) = error_msg.as_deref() {
+                // Setup failure skips original actions, regardless of continue-on-error.
+                step_results.extend(recording_setup_skipped_steps(&playbook.steps, error));
+            }
+            break;
+        }
         if let Some(control) = managed.as_mut() {
             control.action(step.action.name(), total_steps);
             control.publish("running", step_position, session_id, false, None)?;
@@ -2772,7 +2797,8 @@ async fn run_playbook_inner(
                 // Managed recordings remain under the explicitly owned attempt.
                 src_dir.clone()
             } else {
-                bmux_config::ConfigPaths::default()
+                host.selected_runtime()
+                    .map_or_else(bmux_config::ConfigPaths::default, |(_, paths)| paths)
                     .recordings_dir()
                     .join(rid.to_string())
             };
@@ -3411,6 +3437,44 @@ pub fn recording_plugin_error(error: RecordingError) -> anyhow::Error {
     }
 }
 
+/// Admit one recording start within the original run budget. A timeout is an
+/// uncertain mutation, not permission to retry or execute the DSL unrecorded.
+async fn requested_recording_start(
+    deadline: Instant,
+    start: impl std::future::Future<Output = Result<Uuid>>,
+) -> Result<Uuid> {
+    ensure!(
+        Instant::now() < deadline,
+        "requested recording could not start: playbook deadline exceeded before recording admission"
+    );
+    tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), start)
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "requested recording could not start: playbook deadline exceeded; recording start outcome is uncertain and was not retried"
+            )
+        })?
+        .context("requested recording could not start")
+}
+
+fn recording_setup_skipped_steps(steps: &[Step], error: &str) -> Vec<StepResult> {
+    steps
+        .iter()
+        .map(|step| StepResult {
+            index: step.index,
+            action: step.action.name().to_owned(),
+            status: StepStatus::Skip,
+            elapsed_ms: 0,
+            detail: Some(format!("skipped: {error}")),
+            expected: None,
+            actual: None,
+            failure_captures: None,
+            render_summary: None,
+            continue_on_error: step.continue_on_error,
+        })
+        .collect()
+}
+
 /// Start a recording on the server, optionally filtered to a specific session.
 pub async fn start_recording(client: &mut BmuxClient, session_id: Option<Uuid>) -> Result<Uuid> {
     let summary: RecordingSummary = recording_commands::client::start(
@@ -3438,7 +3502,17 @@ async fn start_real_attach_playbook_runtime(
     let mut client = if let Some(sandbox) = sandbox {
         sandbox.connect("bmux-playbook-real-attach").await?
     } else {
-        RawClient::connect_default("bmux-playbook-real-attach").await?
+        match host.selected_runtime() {
+            Some((config, paths)) => {
+                RawClient::connect_with_paths_and_timeout(
+                    &paths,
+                    "bmux-playbook-real-attach",
+                    Duration::from_millis(config.general.server_timeout.max(1)),
+                )
+                .await?
+            }
+            None => RawClient::connect_default("bmux-playbook-real-attach").await?,
+        }
     };
     if let Some(context_id) = context_id {
         let mut execution_client = BmuxClient::new(client, host.clone());
@@ -3458,14 +3532,13 @@ async fn start_real_attach_playbook_runtime(
                 .context("failed loading sandbox config for real-attach driver")
         })
         .transpose()?;
+    let selected = host.selected_runtime();
+    let config = config.or_else(|| selected.as_ref().map(|(config, _)| config.clone()));
+    let paths = sandbox
+        .map(|sandbox| sandbox.paths().clone())
+        .or_else(|| selected.map(|(_, paths)| paths));
     let runtime = host
-        .start_real_attach(
-            client,
-            session_id,
-            config,
-            sandbox.map(|sandbox| sandbox.paths().clone()),
-            viewport,
-        )
+        .start_real_attach(client, session_id, config, paths, viewport)
         .await?;
     Ok(RealAttachPlaybookRuntime(runtime))
 }
@@ -5103,6 +5176,96 @@ fn session_plugin_bus_event_matches(kind: &str, payload: &[u8], name: &str) -> b
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn requested_recording_preserves_provider_id_and_starts_once() {
+        let id = Uuid::new_v4();
+        let starts = std::sync::atomic::AtomicUsize::new(0);
+        let actual = requested_recording_start(Instant::now() + Duration::from_secs(1), async {
+            starts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(id)
+        })
+        .await
+        .unwrap();
+        assert_eq!(actual, id);
+        assert_eq!(starts.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn requested_recording_errors_are_not_success_or_retried() {
+        for reason in [
+            "NotFound: no provider for recording-commands/start",
+            "recording runtime unavailable",
+            "corrupt recording response",
+        ] {
+            let starts = std::sync::atomic::AtomicUsize::new(0);
+            let error = requested_recording_start(Instant::now() + Duration::from_secs(1), async {
+                starts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err(anyhow::anyhow!(reason))
+            })
+            .await
+            .unwrap_err();
+            let message = format!("{error:#}");
+            assert!(message.contains("requested recording could not start"));
+            assert!(message.contains(reason));
+            assert_eq!(starts.load(std::sync::atomic::Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn requested_recording_timeout_is_uncertain_and_never_replayed() {
+        let starts = std::sync::atomic::AtomicUsize::new(0);
+        let error = requested_recording_start(Instant::now() + Duration::from_millis(20), async {
+            starts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::future::pending::<Result<Uuid>>().await
+        })
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("outcome is uncertain"));
+        assert!(error.to_string().contains("was not retried"));
+        assert_eq!(starts.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn requested_recording_expired_budget_does_not_admit_start() {
+        let starts = std::sync::atomic::AtomicUsize::new(0);
+        let error = requested_recording_start(Instant::now(), async {
+            starts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Uuid::new_v4())
+        })
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("before recording admission"));
+        assert_eq!(starts.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn recording_setup_failure_skips_original_actions_without_assertion_metadata() {
+        let (mut playbook, _) = super::super::parse_dsl::parse_dsl(
+            "new-session\nsend-keys keys='echo must-not-run'\nassert-screen contains='must-not-run'\n",
+        )
+        .unwrap();
+        playbook.steps[0].continue_on_error = true;
+        let results = recording_setup_skipped_steps(&playbook.steps, "recording start failed");
+        assert_eq!(results.len(), playbook.steps.len());
+        for (result, step) in results.iter().zip(&playbook.steps) {
+            assert_eq!(result.index, step.index);
+            assert_eq!(result.action, step.action.name());
+            assert_eq!(result.status, StepStatus::Skip);
+            assert_eq!(result.continue_on_error, step.continue_on_error);
+            assert_eq!(result.elapsed_ms, 0);
+            assert!(result.expected.is_none());
+            assert!(result.actual.is_none());
+            assert!(result.failure_captures.is_none());
+            assert!(
+                result
+                    .detail
+                    .as_deref()
+                    .unwrap()
+                    .contains("recording start failed")
+            );
+        }
+    }
 
     #[test]
     fn selecting_attachment_preserves_navigation_order_and_resets_scrollback() {

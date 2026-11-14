@@ -3,26 +3,12 @@ use std::cell::RefCell;
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-static ROOT: OnceLock<PathBuf> = OnceLock::new();
 static MUTATION: Mutex<()> = Mutex::new(());
 const CONTRACT: &[u8] = b"bmux.cluster/durable-writer-v1\n";
 
-#[cfg(not(test))]
-pub fn configure(data_dir: &str) -> Result<(), String> {
-    validate_data_dir(data_dir)?;
-    let root = Path::new(data_dir).join("plugin-storage");
-    if ROOT.get_or_init(|| root.clone()) != &root {
-        return Err("cluster durable installation changed inside one plugin instance".into());
-    }
-    Ok(())
-}
-
-// Unit service callers use synthetic roots and in-memory persistence. The
-// filesystem transaction and nested lease lifetime have direct tests.
-#[cfg(test)]
 pub fn configure(data_dir: &str) -> Result<(), String> {
     validate_data_dir(data_dir)
 }
@@ -44,21 +30,25 @@ thread_local! {
 struct MutationLease {
     _local: MutexGuard<'static, ()>,
     _file: Option<File>,
+    root: Option<PathBuf>,
 }
 
 pub struct MutationGuard {
     _lease: Rc<MutationLease>,
 }
 
-pub fn mutation() -> Result<MutationGuard, String> {
+pub fn mutation_at(root: Option<&Path>) -> Result<MutationGuard, String> {
     let active_lease = ACTIVE.with(|active| active.borrow().upgrade());
     if let Some(lease) = active_lease {
+        if lease.root.as_deref() != root {
+            return Err("nested cluster mutation changed storage authority".into());
+        }
         return Ok(MutationGuard { _lease: lease });
     }
     let local = MUTATION
         .lock()
         .map_err(|_| "cluster storage lock poisoned")?;
-    let file = match ROOT.get() {
+    let file = match root {
         Some(root) => Some(acquire(root, Duration::from_secs(2))?),
         #[cfg(test)]
         None => None,
@@ -68,6 +58,7 @@ pub fn mutation() -> Result<MutationGuard, String> {
     let lease = Rc::new(MutationLease {
         _local: local,
         _file: file,
+        root: root.map(Path::to_path_buf),
     });
     ACTIVE.with(|active| *active.borrow_mut() = Rc::downgrade(&lease));
     Ok(MutationGuard { _lease: lease })
@@ -113,6 +104,18 @@ fn acquire(root: &Path, timeout: Duration) -> Result<File, String> {
 mod tests {
     use super::*;
     #[test]
+    fn nested_mutation_cannot_switch_installations() {
+        let directory =
+            std::env::temp_dir().join(format!("bmux-cluster-scope-{}", uuid::Uuid::new_v4()));
+        let other = directory.join("other");
+        let outer = mutation_at(Some(&directory)).unwrap();
+        assert!(mutation_at(Some(&other)).is_err());
+        let same = mutation_at(Some(&directory)).unwrap();
+        drop(same);
+        drop(outer);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+    #[test]
     fn mutation_ownership_releases_after_full_transaction() {
         let root =
             std::env::temp_dir().join(format!("bmux-cluster-authority-{}", uuid::Uuid::new_v4()));
@@ -125,8 +128,8 @@ mod tests {
     }
     #[test]
     fn reentrant_read_side_migration_retains_outer_authority() {
-        let outer = mutation().unwrap();
-        let inner = mutation().unwrap();
+        let outer = mutation_at(None).unwrap();
+        let inner = mutation_at(None).unwrap();
         drop(outer);
         assert!(MUTATION.try_lock().is_err());
         drop(inner);

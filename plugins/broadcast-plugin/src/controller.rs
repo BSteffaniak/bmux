@@ -112,7 +112,27 @@ struct Request {
     control: Control,
     reply: std::sync::mpsc::SyncSender<Status>,
 }
+/// Owner-bound presentation mechanism. No process-global renderer is selected
+/// by the shared definition; both controller and worker use this exact port.
+pub trait IndicatorPort: Send + Sync {
+    fn update(&self, local: &str, remote: &str);
+    fn remove(&self);
+    fn status(&self) -> bmux_broadcast_plugin_api::broadcast_presentation_v1::Indicator;
+}
+pub struct LegacyIndicator;
+impl IndicatorPort for LegacyIndicator {
+    fn update(&self, local: &str, remote: &str) {
+        crate::indicator::update(local, remote);
+    }
+    fn remove(&self) {
+        crate::indicator::remove();
+    }
+    fn status(&self) -> bmux_broadcast_plugin_api::broadcast_presentation_v1::Indicator {
+        crate::indicator::status()
+    }
+}
 pub struct Controller {
+    indicator: Arc<dyn IndicatorPort>,
     state: Arc<Mutex<State>>,
     commands: mpsc::Sender<Request>,
     gate: tokio::sync::watch::Sender<u64>,
@@ -122,13 +142,18 @@ pub struct Controller {
     dirty: Arc<tokio::sync::Notify>,
 }
 impl Controller {
+    #[cfg(test)]
     pub fn new() -> Result<Self, &'static str> {
+        Self::with_indicator(Arc::new(LegacyIndicator))
+    }
+    pub fn with_indicator(indicator: Arc<dyn IndicatorPort>) -> Result<Self, &'static str> {
         let state = Arc::new(Mutex::new(State::default()));
         let (commands, receiver) = mpsc::channel(8);
         let worker_state = state.clone();
         let (gate, worker_gate) = tokio::sync::watch::channel(1);
         let dirty = Arc::new(tokio::sync::Notify::new());
         let worker_dirty = dirty.clone();
+        let worker_indicator = Arc::clone(&indicator);
         let worker = std::thread::Builder::new()
             .name("bmux-broadcast".into())
             .spawn(move || {
@@ -136,11 +161,18 @@ impl Controller {
                     .enable_all()
                     .build()
                 {
-                    runtime.block_on(worker(worker_state, receiver, worker_gate, worker_dirty));
+                    runtime.block_on(worker(
+                        worker_state,
+                        receiver,
+                        worker_gate,
+                        worker_dirty,
+                        worker_indicator,
+                    ));
                 }
             })
             .map_err(|_| "executor_unavailable")?;
         Ok(Self {
+            indicator,
             state,
             commands,
             gate,
@@ -355,7 +387,7 @@ impl Controller {
             }
         }
         state.invalidate();
-        crate::indicator::update(state.local, state.remote);
+        self.indicator.update(state.local, state.remote);
         self.gate.send_replace(state.refresh);
         permit.send(Request { control, reply });
         drop(state);
@@ -741,18 +773,39 @@ impl Controller {
         self.status()
     }
 
-    pub fn shutdown(&self) {
-        let _ = self.control(Control::Shutdown);
-        if let Ok(mut worker) = self.worker.lock()
-            && let Some(worker) = worker.take()
-        {
-            let _ = worker.join();
-        }
-        if let Ok(mut terminals) = self.terminals.lock() {
-            for terminal in terminals.drain(..) {
-                let _ = terminal.join();
+    pub fn shutdown_checked(&self) -> Result<(), &'static str> {
+        let worker_present = self
+            .worker
+            .lock()
+            .map_err(|_| "executor_unavailable")?
+            .is_some();
+        if worker_present {
+            let status = self.control(Control::Shutdown)?;
+            if status.remote != "offline" {
+                return Err("broadcast_cleanup_required");
             }
         }
+        if let Some(worker) = self
+            .worker
+            .lock()
+            .map_err(|_| "executor_unavailable")?
+            .take()
+        {
+            worker.join().map_err(|_| "executor_failed")?;
+        }
+        let mut terminals = self.terminals.lock().map_err(|_| "executor_unavailable")?;
+        let mut failed = false;
+        for terminal in terminals.drain(..) {
+            failed |= terminal.join().is_err();
+        }
+        if failed {
+            return Err("terminal_executor_failed");
+        }
+        Ok(())
+    }
+    #[cfg(test)]
+    pub fn shutdown(&self) {
+        let _ = self.shutdown_checked();
     }
 
     pub fn publish(
@@ -870,6 +923,7 @@ async fn worker(
     mut commands: mpsc::Receiver<Request>,
     mut gate: tokio::sync::watch::Receiver<u64>,
     dirty: Arc<tokio::sync::Notify>,
+    indicator: Arc<dyn IndicatorPort>,
 ) {
     let mut relay: Option<Box<Relay>> = None;
     let mut revision = 0_u64;
@@ -945,7 +999,7 @@ async fn worker(
                     }
                     let _ = request.reply.send(state.status());
                 }
-                if shutdown { break; }
+                if shutdown && result.is_ok() { break; }
                 gate.borrow_and_update();
                 heartbeat = Instant::now();
             }
@@ -1036,10 +1090,10 @@ async fn worker(
             if let Ok(mut observations) = state.observations.lock() {
                 observations.transition(state.local, state.remote);
             }
-            crate::indicator::update(state.local, state.remote);
+            indicator.update(state.local, state.remote);
         }
     }
-    crate::indicator::remove();
+    indicator.remove();
 }
 
 #[cfg(test)]

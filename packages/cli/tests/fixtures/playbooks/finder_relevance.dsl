@@ -5,13 +5,12 @@
 @sandbox-config packages/cli/tests/fixtures/playbooks/finder_relevance.toml
 new-session name='bootstrap'
 send-attach key='alt+a'
-# New tabs may have no chrome in this fixture; pane output below is readiness.
-sleep ms=400
+# Committed active-tab identity must change before writing into its PTY.
+wait-rendered contains='<active:deps>' timeout=10000
 send-keys keys='printf "\\033[2J\\033[HDEPS_READY\\n"\r'
 wait-for pattern='DEPS_READY' timeout=10000
 send-attach key='alt+r'
 wait-rendered contains='Rename tab' timeout=10000
-send-attach key='backspace'
 send-attach key='backspace'
 send-attach key='backspace'
 send-attach key='backspace'
@@ -23,12 +22,13 @@ send-attach key='s'
 send-attach key='enter'
 wait-rendered contains='DEPS_READY' timeout=10000
 send-attach key='alt+b'
-# New tabs may have no chrome in this fixture; pane output below is readiness.
-sleep ms=400
+wait-rendered contains='<active:d-e-p-s>' timeout=10000
 send-keys keys='printf "\\033[2J\\033[HLOOSE_READY\\n"\r'
 wait-for pattern='LOOSE_READY' timeout=10000
 send-attach key='alt+r'
 wait-rendered contains='Rename tab' timeout=10000
+send-attach key='backspace'
+send-attach key='backspace'
 send-attach key='backspace'
 send-attach key='backspace'
 send-attach key='backspace'
@@ -44,8 +44,7 @@ send-attach key='s'
 send-attach key='enter'
 wait-rendered contains='LOOSE_READY' timeout=10000
 send-attach key='alt+c'
-# New tabs may have no chrome in this fixture; pane output below is readiness.
-sleep ms=400
+wait-rendered contains='<active:current>' timeout=10000
 send-keys keys='printf "\\033[2J\\033[HCURRENT_READY\\n"\r'
 wait-for pattern='CURRENT_READY' timeout=10000
 send-attach key='alt+f'

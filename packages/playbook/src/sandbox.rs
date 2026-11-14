@@ -50,6 +50,8 @@ pub struct SandboxStartOptions<'a> {
     pub shell: Option<&'a str>,
     pub input_profile: Option<super::types::InputProfile>,
     pub plugin_config: &'a PluginConfig,
+    /// Require recording only for this explicitly requested sandbox run.
+    pub recording_requested: bool,
     pub startup_timeout: Duration,
     pub env: &'a std::collections::BTreeMap<String, String>,
     pub env_mode: super::types::SandboxEnvMode,
@@ -94,15 +96,8 @@ impl SandboxServer {
             create_private_directory(&paths.runtime_dir)?;
             (paths, root)
         };
-        write_sandbox_config(
-            &paths,
-            options.shell,
-            options.input_profile,
-            options.plugin_config,
-            options.sandbox_config_file,
-            options.bundled_plugin_ids,
-        )
-        .context("failed writing sandbox config")?;
+        write_sandbox_config_with_options(&paths, &options)
+            .context("failed writing sandbox config")?;
 
         let bmux_binary = if std::env::var_os("BMUX_PLAYBOOK_MANAGED_ROOT").is_some() {
             // Managed execution must use the already-selected isolated worker executable.
@@ -439,32 +434,26 @@ fn apply_sandbox_env(
 
 // ── Config writing ───────────────────────────────────────────────────────────
 
-fn write_sandbox_config(
+fn write_sandbox_config_with_options(
     paths: &ConfigPaths,
-    shell: Option<&str>,
-    input_profile: Option<super::types::InputProfile>,
-    plugin_config: &PluginConfig,
-    sandbox_config_file: Option<&Path>,
-    bundled_plugin_ids: &[String],
+    options: &SandboxStartOptions<'_>,
 ) -> Result<()> {
+    let SandboxStartOptions {
+        shell,
+        input_profile,
+        plugin_config,
+        recording_requested,
+        sandbox_config_file,
+        bundled_plugin_ids,
+        ..
+    } = *options;
     let config_path = paths.config_file();
     if let Some(parent) = config_path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed creating config dir {}", parent.display()))?;
     }
 
-    let mut toml = if let Some(source) = sandbox_config_file {
-        let source_toml = std::fs::read_to_string(source).with_context(|| {
-            format!("failed reading sandbox config source {}", source.display())
-        })?;
-        let mut copied = source_toml;
-        if !copied.ends_with('\n') {
-            copied.push('\n');
-        }
-        copied
-    } else {
-        String::new()
-    };
+    let mut toml = read_sandbox_config(sandbox_config_file)?;
 
     let explicit_plugin_directives =
         !plugin_config.enable.is_empty() || !plugin_config.disable.is_empty();
@@ -477,6 +466,28 @@ fn write_sandbox_config(
         anyhow::bail!(
             "@sandbox-config cannot be combined with @plugin directives when the copied config already contains a [plugins] table"
         );
+    }
+
+    let mut effective_plugins = plugin_config.clone();
+    if recording_requested {
+        anyhow::ensure!(
+            !plugin_config
+                .disable
+                .iter()
+                .any(|id| id == "bmux.recording"),
+            "requested recording conflicts with explicitly disabled plugin 'bmux.recording'"
+        );
+        if should_write_generated_plugin_config {
+            if !effective_plugins
+                .enable
+                .iter()
+                .any(|id| id == "bmux.recording")
+            {
+                effective_plugins.enable.push("bmux.recording".to_owned());
+            }
+        } else {
+            toml = enable_requested_recording(&toml)?;
+        }
     }
 
     // Shell override. Avoid appending a duplicate [general] table when a copied
@@ -492,8 +503,14 @@ fn write_sandbox_config(
     // config is supplied, preserve its plugin/theme settings unless the
     // playbook also supplies explicit @plugin directives.
     if should_write_generated_plugin_config {
-        let disabled = build_plugin_disabled_list(plugin_config, bundled_plugin_ids);
-        let enabled = build_plugin_enabled_list(plugin_config);
+        for required in REQUIRED_SANDBOX_PLUGINS {
+            anyhow::ensure!(
+                !plugin_config.disable.iter().any(|id| id == required),
+                "playbook typed services require plugin '{required}', but it was explicitly disabled; sandbox configuration was not overridden"
+            );
+        }
+        let disabled = build_plugin_disabled_list(&effective_plugins, bundled_plugin_ids);
+        let enabled = build_plugin_enabled_list(&effective_plugins);
 
         if !disabled.is_empty() || !enabled.is_empty() {
             toml.push_str("\n[plugins]\n");
@@ -523,6 +540,60 @@ fn write_sandbox_config(
         .with_context(|| format!("failed writing sandbox config {}", config_path.display()))
 }
 
+fn read_sandbox_config(source: Option<&Path>) -> Result<String> {
+    let Some(source) = source else {
+        return Ok(String::new());
+    };
+    let mut copied = std::fs::read_to_string(source)
+        .with_context(|| format!("failed reading sandbox config source {}", source.display()))?;
+    // Reject corrupt copied authority before generating or launching anything.
+    let parsed: toml::Value =
+        toml::from_str(&copied).context("invalid copied sandbox configuration")?;
+    let _: bmux_config::BmuxConfig = parsed
+        .clone()
+        .try_into()
+        .context("invalid copied sandbox configuration schema")?;
+    if !copied.ends_with('\n') {
+        copied.push('\n');
+    }
+    Ok(copied)
+}
+
+fn enable_requested_recording(source: &str) -> Result<String> {
+    let mut config: toml::Value =
+        toml::from_str(source).context("invalid copied sandbox configuration")?;
+    let root = config
+        .as_table_mut()
+        .context("sandbox configuration must be a table")?;
+    let plugins = root
+        .entry("plugins")
+        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+    let parsed: bmux_config::PluginConfig = plugins
+        .clone()
+        .try_into()
+        .context("invalid copied sandbox plugin configuration")?;
+    anyhow::ensure!(
+        !parsed.disabled.iter().any(|id| id == "bmux.recording"),
+        "requested recording conflicts with explicitly disabled plugin 'bmux.recording' in sandbox-config"
+    );
+    let table = plugins
+        .as_table_mut()
+        .context("sandbox plugins must be a table")?;
+    let enabled = table
+        .entry("enabled")
+        .or_insert_with(|| toml::Value::Array(Vec::new()));
+    let enabled = enabled
+        .as_array_mut()
+        .context("sandbox plugins.enabled must be an array")?;
+    if !enabled
+        .iter()
+        .any(|id| id.as_str() == Some("bmux.recording"))
+    {
+        enabled.push(toml::Value::String("bmux.recording".to_owned()));
+    }
+    toml::to_string(&config).context("failed serializing recording sandbox configuration")
+}
+
 fn toml_contains_table(toml: &str, table: &str) -> bool {
     let expected = format!("[{table}]");
     let nested_prefix = format!("[{table}.");
@@ -531,44 +602,48 @@ fn toml_contains_table(toml: &str, table: &str) -> bool {
         .any(|line| line == expected || line.starts_with(&nested_prefix))
 }
 
+// Product-owned requirements of the playbook's typed transport, not core
+// defaults. Sessions allocates work; contexts/clients/tabs supply attachment
+// grants, input and managed/real-attach navigation. Pane runtime and workspaces
+// close their declared service requirements. Presentation stays opt-in.
+const REQUIRED_SANDBOX_PLUGINS: [&str; 6] = [
+    "bmux.sessions",
+    "bmux.contexts",
+    "bmux.clients",
+    "bmux.tabs",
+    "bmux.pane_runtime",
+    "bmux.workspaces",
+];
+
 fn build_plugin_disabled_list(plugin_config: &PluginConfig, bundled_ids: &[String]) -> Vec<String> {
-    // If the user explicitly enabled specific plugins, disable everything else
-    // by using a blanket disable approach: disable all discovered bundled plugin IDs
-    // except those in the enable list.
-    if !plugin_config.enable.is_empty() {
-        let mut disabled: Vec<String> = bundled_ids
-            .iter()
-            .filter(|id| !plugin_config.enable.contains(id))
-            .cloned()
-            .collect();
-        // Also include explicitly disabled plugins
-        for id in &plugin_config.disable {
-            if !disabled.contains(id) {
-                disabled.push(id.clone());
-            }
+    let enabled = build_plugin_enabled_list(plugin_config);
+    let mut disabled: Vec<String> = bundled_ids
+        .iter()
+        .filter(|id| !enabled.contains(id))
+        .cloned()
+        .collect();
+    for id in &plugin_config.disable {
+        if !disabled.contains(id) {
+            disabled.push(id.clone());
         }
-        disabled.sort();
-        disabled
-    } else if plugin_config.disable.is_empty() {
-        // Default: disable all bundled plugins for clean deterministic baseline
-        let mut all = bundled_ids.to_vec();
-        all.sort();
-        all
-    } else {
-        let mut list = plugin_config.disable.clone();
-        list.sort();
-        list
     }
+    disabled.sort();
+    disabled
 }
 
 fn build_plugin_enabled_list(plugin_config: &PluginConfig) -> Vec<String> {
-    if plugin_config.enable.is_empty() {
-        Vec::new()
-    } else {
-        let mut list = plugin_config.enable.clone();
-        list.sort();
-        list
+    let mut enabled = plugin_config.enable.clone();
+    for required in REQUIRED_SANDBOX_PLUGINS {
+        if !plugin_config.disable.iter().any(|id| id == required)
+            && !enabled.iter().any(|id| id == required)
+        {
+            enabled.push(required.to_owned());
+        }
     }
+    enabled.retain(|id| !plugin_config.disable.contains(id));
+    enabled.sort();
+    enabled.dedup();
+    enabled
 }
 
 // ── Server startup ───────────────────────────────────────────────────────────
@@ -624,10 +699,9 @@ async fn start_foreground(
         .open(&stderr_log)?;
 
     let mut cmd = ProcessCommand::new(binary);
-    cmd.arg("server").arg("start");
-    if std::env::var_os("BMUX_PLAYBOOK_MANAGED_ROOT").is_some() {
-        cmd.arg("--foreground-internal");
-    }
+    // This handle must own the actual server through readiness and cleanup,
+    // not a launcher that silently backgrounds the process.
+    cmd.arg("server").arg("start").arg("--foreground-internal");
 
     apply_sandbox_env(&mut cmd, paths, root_dir, env, env_mode);
 
@@ -935,6 +1009,161 @@ mod tests {
         assert!(roots.iter().all(|root| root.is_dir()));
     }
 
+    fn write_sandbox_config(
+        paths: &ConfigPaths,
+        shell: Option<&str>,
+        input_profile: Option<super::super::types::InputProfile>,
+        plugin_config: &PluginConfig,
+        sandbox_config_file: Option<&Path>,
+        bundled_plugin_ids: &[String],
+    ) -> Result<()> {
+        write_sandbox_config_with_options(
+            paths,
+            &SandboxStartOptions {
+                shell,
+                input_profile,
+                plugin_config,
+                recording_requested: false,
+                startup_timeout: Duration::from_secs(1),
+                env: &std::collections::BTreeMap::new(),
+                env_mode: super::super::types::SandboxEnvMode::Clean,
+                binary: None,
+                sandbox_config_file,
+                bundled_plugin_ids,
+            },
+        )
+    }
+
+    fn recording_config(
+        paths: &ConfigPaths,
+        plugins: &PluginConfig,
+        source: Option<&Path>,
+        bundled: &[String],
+    ) -> Result<()> {
+        write_sandbox_config_with_options(
+            paths,
+            &SandboxStartOptions {
+                shell: None,
+                input_profile: None,
+                plugin_config: plugins,
+                recording_requested: true,
+                startup_timeout: Duration::from_secs(1),
+                env: &std::collections::BTreeMap::new(),
+                env_mode: super::super::types::SandboxEnvMode::Clean,
+                binary: None,
+                sandbox_config_file: source,
+                bundled_plugin_ids: bundled,
+            },
+        )
+    }
+
+    fn test_paths(root: &Path) -> ConfigPaths {
+        ConfigPaths::new(
+            root.join("c"),
+            root.join("r"),
+            root.join("d"),
+            root.join("s"),
+        )
+    }
+
+    #[test]
+    fn requested_recording_only_adds_recording_to_minimal_baseline() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = test_paths(root.path());
+        let mut bundled: Vec<String> = REQUIRED_SANDBOX_PLUGINS
+            .iter()
+            .map(|id| (*id).to_owned())
+            .collect();
+        bundled.extend(["bmux.recording".to_owned(), "bmux.tab_bar".to_owned()]);
+        recording_config(&paths, &PluginConfig::default(), None, &bundled).unwrap();
+        let config: toml::Value =
+            toml::from_str(&std::fs::read_to_string(paths.config_file()).unwrap()).unwrap();
+        let enabled = config["plugins"]["enabled"].as_array().unwrap();
+        assert_eq!(enabled.len(), REQUIRED_SANDBOX_PLUGINS.len() + 1);
+        assert!(
+            enabled
+                .iter()
+                .any(|id| id.as_str() == Some("bmux.recording"))
+        );
+        for id in REQUIRED_SANDBOX_PLUGINS {
+            assert!(enabled.iter().any(|value| value.as_str() == Some(id)));
+        }
+        let disabled = config["plugins"]["disabled"].as_array().unwrap();
+        assert!(
+            !disabled
+                .iter()
+                .any(|id| id.as_str() == Some("bmux.recording"))
+        );
+        assert!(
+            disabled
+                .iter()
+                .any(|id| id.as_str() == Some("bmux.tab_bar"))
+        );
+    }
+
+    #[test]
+    fn requested_recording_rejects_explicit_dsl_disable_without_writing_config() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = test_paths(root.path());
+        let plugins = PluginConfig {
+            enable: vec!["bmux.recording".to_owned()],
+            disable: vec!["bmux.recording".to_owned()],
+        };
+        let error = recording_config(&paths, &plugins, None, &[]).unwrap_err();
+        assert!(error.to_string().contains("explicitly disabled"));
+        assert!(!paths.config_file().exists());
+        assert_eq!(plugins.disable, vec!["bmux.recording"]);
+    }
+
+    #[test]
+    fn requested_recording_preserves_copied_config_and_exact_selection() {
+        let source = "[general]\ndefault_shell = 'sh'\n[plugins]\nenabled = ['bmux.finder']\ndisabled = ['bmux.cluster']\nsearch_paths = ['/selected/plugins']\n[plugins.sources.'bmux.recording']\nsource = 'dynamic'\nmanifest = '/selected/recording/plugin.toml'\n[plugins.settings.'bmux.recording']\ncustom = 'retained'\n";
+        let mut original: toml::Value = toml::from_str(source).unwrap();
+        let actual: toml::Value =
+            toml::from_str(&enable_requested_recording(source).unwrap()).unwrap();
+        original["plugins"]["enabled"]
+            .as_array_mut()
+            .unwrap()
+            .push(toml::Value::String("bmux.recording".to_owned()));
+        assert_eq!(actual, original);
+        let root = tempfile::tempdir().unwrap();
+        let paths = test_paths(root.path());
+        let source_path = root.path().join("source.toml");
+        std::fs::write(&source_path, source).unwrap();
+        recording_config(&paths, &PluginConfig::default(), Some(&source_path), &[]).unwrap();
+        let written: toml::Value =
+            toml::from_str(&std::fs::read_to_string(paths.config_file()).unwrap()).unwrap();
+        assert_eq!(written, original);
+        assert_eq!(std::fs::read_to_string(source_path).unwrap(), source);
+        assert_eq!(
+            enable_requested_recording(&enable_requested_recording(source).unwrap()).unwrap(),
+            enable_requested_recording(source).unwrap()
+        );
+    }
+
+    #[test]
+    fn requested_recording_rejects_copied_disable_and_corrupt_config() {
+        for source in [
+            "[plugins]\ndisabled = ['bmux.recording']\n",
+            "[plugins]\nenabled = ['bmux.recording']\ndisabled = ['bmux.recording']\n",
+            "[plugins]\nenabled = 42\n",
+            "[general]\ndefault_shell = 42\n",
+            "[plugins.sources.'bmux.recording']\nsource = 'unknown'\n",
+            "[plugins]\ndisabled = ['bmux.recording'\n",
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let paths = test_paths(root.path());
+            let source_path = root.path().join("source.toml");
+            std::fs::write(&source_path, source).unwrap();
+            assert!(
+                recording_config(&paths, &PluginConfig::default(), Some(&source_path), &[])
+                    .is_err()
+            );
+            assert!(!paths.config_file().exists());
+            assert_eq!(std::fs::read_to_string(source_path).unwrap(), source);
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn private_sandbox_creation_does_not_repair_or_follow_existing_paths() {
@@ -1026,6 +1255,59 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("cannot be combined"));
+    }
+
+    #[test]
+    fn default_sandbox_keeps_typed_session_providers_without_cosmetic_plugins() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = ConfigPaths::new(
+            root.path().join("c"),
+            root.path().join("r"),
+            root.path().join("d"),
+            root.path().join("s"),
+        );
+        let mut bundled: Vec<String> = REQUIRED_SANDBOX_PLUGINS
+            .iter()
+            .map(|id| (*id).to_owned())
+            .collect();
+        bundled.push("bmux.tab_bar".into());
+        write_sandbox_config(&paths, None, None, &PluginConfig::default(), None, &bundled).unwrap();
+        let config: toml::Value =
+            toml::from_str(&std::fs::read_to_string(paths.config_file()).unwrap()).unwrap();
+        let enabled = config["plugins"]["enabled"].as_array().unwrap();
+        let disabled = config["plugins"]["disabled"].as_array().unwrap();
+        for required in REQUIRED_SANDBOX_PLUGINS {
+            assert!(enabled.iter().any(|id| id.as_str() == Some(required)));
+            assert!(!disabled.iter().any(|id| id.as_str() == Some(required)));
+        }
+        assert!(
+            disabled
+                .iter()
+                .any(|id| id.as_str() == Some("bmux.tab_bar"))
+        );
+        assert_eq!(enabled.len(), REQUIRED_SANDBOX_PLUGINS.len());
+    }
+
+    #[test]
+    fn explicitly_disabled_typed_provider_is_preserved_and_rejected_before_config_write() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = ConfigPaths::new(
+            root.path().join("c"),
+            root.path().join("r"),
+            root.path().join("d"),
+            root.path().join("s"),
+        );
+        let plugins = PluginConfig {
+            enable: vec![],
+            disable: vec!["bmux.sessions".into()],
+        };
+        assert!(!build_plugin_enabled_list(&plugins).contains(&"bmux.sessions".into()));
+        assert!(build_plugin_disabled_list(&plugins, &[]).contains(&"bmux.sessions".into()));
+        let error = write_sandbox_config(&paths, None, None, &plugins, None, &[]).unwrap_err();
+        assert!(error.to_string().contains("require plugin 'bmux.sessions'"));
+        assert!(error.to_string().contains("explicitly disabled"));
+        assert!(!paths.config_file().exists());
+        assert_eq!(plugins.disable, vec!["bmux.sessions"]);
     }
 
     #[test]

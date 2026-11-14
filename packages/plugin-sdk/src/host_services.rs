@@ -1,3 +1,67 @@
+/// Host-selected independent retained capability opener. The callback must open
+/// the selected activation's actual ledger, not adapt invocation-local dispatch.
+pub type RetainedHostOpener =
+    dyn Fn() -> crate::Result<crate::abi::retained::RetainedHostPort> + Send + Sync;
+
+/// Owned future returned by a selected asynchronous host service callback.
+pub type HostServiceFuture = crate::definition::PluginFuture<'static, crate::Result<Vec<u8>>>;
+
+/// Owned operation data for an explicitly asynchronous host callback.
+/// Identity fields name an operation, never caller authority or a worker grant.
+#[derive(Debug, Clone)]
+pub struct HostServiceOwnedRequest {
+    pub capability: String,
+    pub kind: crate::ServiceKind,
+    pub interface: String,
+    pub operation: String,
+    pub payload: Vec<u8>,
+}
+
+impl HostServiceOwnedRequest {
+    /// Borrow for synchronous execution inside a trusted host worker.
+    #[must_use]
+    pub fn as_request(&self) -> crate::HostServiceRequest<'_> {
+        crate::HostServiceRequest {
+            capability: &self.capability,
+            kind: self.kind,
+            interface: &self.interface,
+            operation: &self.operation,
+            payload: &self.payload,
+        }
+    }
+
+    /// Check bounds before retaining or scheduling the operation.
+    ///
+    /// # Errors
+    /// Rejects oversized payloads or empty/oversized operation identifiers.
+    pub fn validate(&self) -> crate::Result<()> {
+        if self.payload.len() > crate::abi::MAX_BUFFER_BYTES
+            || [&self.capability, &self.interface, &self.operation]
+                .iter()
+                .any(|value| {
+                    value.is_empty() || value.len() > 1024 || value.chars().any(char::is_control)
+                })
+        {
+            return Err(crate::PluginError::ServiceProtocol {
+                details: "async host request exceeds bounds or has invalid identifiers".into(),
+            });
+        }
+        Ok(())
+    }
+}
+
+impl From<crate::HostServiceRequest<'_>> for HostServiceOwnedRequest {
+    fn from(request: crate::HostServiceRequest<'_>) -> Self {
+        Self {
+            capability: request.capability.into(),
+            kind: request.kind,
+            interface: request.interface.into(),
+            operation: request.operation.into(),
+            payload: request.payload.into(),
+        }
+    }
+}
+
 use std::{cell::RefCell, collections::BTreeMap, fmt, str::FromStr};
 
 use serde::{Deserialize, Serialize};
@@ -371,5 +435,136 @@ mod tests {
         let error = serde_json::from_str::<StorageGetRequest>(r#"{"key":"bad:key"}"#)
             .expect_err("invalid request key should fail");
         assert!(error.to_string().contains("storage key"));
+    }
+}
+
+#[cfg(test)]
+mod async_host_tests {
+    struct RetainedLedger;
+    impl crate::abi::retained::RetainedHostDispatch for RetainedLedger {
+        fn begin(
+            &self,
+            _: u64,
+            _: &crate::HostServiceRequest<'_>,
+            _: crate::abi::retained::NativeRetainedReservationV1,
+        ) -> crate::Result<u64> {
+            Ok(1)
+        }
+        fn observe(
+            &self,
+            _: u64,
+            _: u64,
+        ) -> crate::Result<crate::abi::retained::RetainedHostObservation> {
+            Err(crate::PluginError::UnsupportedHostOperation {
+                operation: "test_observe",
+            })
+        }
+        fn control(&self, _: u64, _: u32) -> crate::Result<bool> {
+            Ok(true)
+        }
+        fn acknowledge(&self, _: u64, _: u64) -> crate::Result<()> {
+            Ok(())
+        }
+        fn release(&self) -> crate::Result<bool> {
+            Ok(true)
+        }
+    }
+
+    #[test]
+    fn retained_host_is_explicit_and_preserved_by_other_capability_rebindings() {
+        let services = PluginHostServices::new(|_| panic!("retained open must not invoke service"));
+        assert!(matches!(
+            services.open_retained_host(),
+            Err(crate::PluginError::UnsupportedHostOperation {
+                operation: "open_retained_host"
+            })
+        ));
+        let opens = Arc::new(AtomicUsize::new(0));
+        let seen = opens.clone();
+        let bound = services.clone().with_retained_host(move || {
+            seen.fetch_add(1, Ordering::SeqCst);
+            Ok(crate::abi::retained::RetainedHostPort::new(Arc::new(
+                RetainedLedger,
+            )))
+        });
+        assert_ne!(services, bound);
+        assert_eq!(bound, bound.clone());
+        let decorated = bound
+            .clone()
+            .with_kernel(|_| Ok(Vec::new()))
+            .with_async(|_| Box::pin(async { Ok(Vec::new()) }))
+            .with_registrations(|_| Ok(Vec::new()));
+        assert!(decorated.open_retained_host().unwrap().release().unwrap());
+        assert_eq!(opens.load(Ordering::SeqCst), 1);
+        let failure = bound.with_retained_host(|| {
+            Err(crate::PluginError::ServiceProtocol {
+                details: "retained owner closed".into(),
+            })
+        });
+        assert!(
+            failure
+                .open_retained_host()
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("retained owner closed")
+        );
+        assert_eq!(opens.load(Ordering::SeqCst), 1);
+    }
+
+    use crate::{HostServiceOwnedRequest, PluginHostServices, ServiceKind};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    fn request() -> HostServiceOwnedRequest {
+        HostServiceOwnedRequest {
+            capability: "example".into(),
+            kind: ServiceKind::Query,
+            interface: "example/v1".into(),
+            operation: "get".into(),
+            payload: vec![1],
+        }
+    }
+
+    #[tokio::test]
+    async fn async_capability_is_optional_and_never_invokes_sync_fallback() {
+        let services = PluginHostServices::new(|_| panic!("no sync fallback"));
+        assert!(services.call_service_async(request()).await.is_err());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = calls.clone();
+        let asynchronous = services.clone().with_async(move |request| {
+            let seen = seen.clone();
+            Box::pin(async move {
+                seen.fetch_add(1, Ordering::SeqCst);
+                Ok(request.payload)
+            })
+        });
+        assert_ne!(services, asynchronous);
+        let future = asynchronous.call_service_async(request());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(future.await.unwrap(), vec![1]);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn async_bounds_precede_dispatch_and_oversized_responses_do_not_retry() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = calls.clone();
+        let services =
+            PluginHostServices::new(|_| panic!("no sync fallback")).with_async(move |_| {
+                let seen = seen.clone();
+                Box::pin(async move {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    Ok(vec![0; crate::abi::MAX_BUFFER_BYTES + 1])
+                })
+            });
+        let mut oversized = request();
+        oversized.payload = vec![0; crate::abi::MAX_BUFFER_BYTES + 1];
+        assert!(services.call_service_async(oversized).await.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(services.call_service_async(request()).await.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 }

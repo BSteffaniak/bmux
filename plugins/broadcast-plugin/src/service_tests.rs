@@ -7,6 +7,7 @@ mod tests {
             ApiVersion, HostConnectionInfo, HostMetadata, HostScope, ProviderId, RegisteredService,
             ServiceKind, ServiceRequest,
         };
+        let plugin = BroadcastPlugin::default();
         let caller = uuid::Uuid::new_v4();
         let context = NativeServiceContext {
             plugin_id: "bmux.broadcast".into(),
@@ -51,8 +52,9 @@ mod tests {
             caller_client_id: Some(caller),
             cancellation: bmux_plugin_sdk::CancellationToken::default(),
             host_kernel_bridge: None,
+            host_service_port: None,
         };
-        let response = BroadcastPlugin.invoke_service(context.clone());
+        let response = plugin.invoke_service(context.clone());
         assert_eq!(response.error.unwrap().code, "local_authorization_required");
         for operation in [
             "pause-publication",
@@ -71,7 +73,7 @@ mod tests {
                 bmux_codec::to_typed_vec(&()).unwrap()
             };
             assert_eq!(
-                BroadcastPlugin.invoke_service(operator).error.unwrap().code,
+                plugin.invoke_service(operator).error.unwrap().code,
                 "local_authorization_required",
                 "{operation} must require local proof before mutation"
             );
@@ -93,11 +95,7 @@ mod tests {
                 bmux_codec::to_typed_vec(&()).unwrap()
             };
             assert_eq!(
-                BroadcastPlugin
-                    .invoke_service(diagnostic)
-                    .error
-                    .unwrap()
-                    .code,
+                plugin.invoke_service(diagnostic).error.unwrap().code,
                 "local_authorization_required"
             );
         }
@@ -112,7 +110,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!(
-            BroadcastPlugin.invoke_service(explicit).error.unwrap().code,
+            plugin.invoke_service(explicit).error.unwrap().code,
             "local_authorization_required"
         );
         let mut profile = context.clone();
@@ -126,11 +124,7 @@ mod tests {
         for operation in ["start-profile", "start-profile-publication"] {
             profile.request.operation = operation.into();
             assert_eq!(
-                BroadcastPlugin
-                    .invoke_service(profile.clone())
-                    .error
-                    .unwrap()
-                    .code,
+                plugin.invoke_service(profile.clone()).error.unwrap().code,
                 "local_authorization_required"
             );
         }
@@ -142,7 +136,7 @@ mod tests {
         })
         .unwrap();
         assert_eq!(
-            BroadcastPlugin.invoke_service(register).error.unwrap().code,
+            plugin.invoke_service(register).error.unwrap().code,
             "local_authorization_required"
         );
     }

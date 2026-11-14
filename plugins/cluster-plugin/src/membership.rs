@@ -437,7 +437,7 @@ pub fn adopt_join_result(
     }
     validate_join_result(&token, &local_identity, &request.enrollment_result)?;
 
-    let _guard = identity_init_guard()?;
+    let _guard = identity_init_guard(caller)?;
     if let Some(existing_cluster) = load_cluster_id(caller)? {
         return existing_join_result(caller, &token, &local_identity, existing_cluster);
     }
@@ -524,7 +524,7 @@ fn existing_join_result(
 }
 
 pub fn prepare_leave(caller: &impl ClusterRuntimeOps) -> Result<ClusterLeaveRequest, String> {
-    let _guard = identity_init_guard()?;
+    let _guard = identity_init_guard(caller)?;
     let cluster_id =
         load_cluster_id(caller)?.ok_or_else(|| "this node is not a cluster member".to_string())?;
     let identity = load_node_identity(caller)?
@@ -559,7 +559,7 @@ pub fn commit_leave(
     caller: &impl ClusterRuntimeOps,
     leave_id: &str,
 ) -> Result<ClusterLeaveResult, String> {
-    let _guard = identity_init_guard()?;
+    let _guard = identity_init_guard(caller)?;
     let value = load_identity_record(caller, PENDING_LEAVE_STORAGE_KEY)?
         .ok_or_else(|| "no prepared cluster leave exists".to_string())?;
     let pending = serde_json::from_slice::<PendingLeave>(&value)
@@ -639,7 +639,7 @@ pub fn accept_leave(
     if request.cluster_id != cluster_id.to_string() {
         return Err("leave request belongs to a different cluster".to_string());
     }
-    let _guard = identity_init_guard()?;
+    let _guard = identity_init_guard(caller)?;
     let mut state = require_membership_state(caller, cluster_id)?;
     let member = state
         .members
@@ -823,7 +823,7 @@ pub fn create_peer_auth_challenge_for_members(
         signature: String::new(),
     };
     challenge.signature = encode_hex(&identity.sign(&canonical_peer_challenge(&challenge)?));
-    let _guard = identity_init_guard()?;
+    let _guard = identity_init_guard(caller)?;
     let mut auth_state = load_peer_auth_state(caller)?;
     prune_peer_auth_state(&mut auth_state, now);
     auth_state.challenges.insert(
@@ -949,7 +949,7 @@ pub fn authenticate_peer_for_members(
         .verify(&canonical_peer_proof(proof)?, &claimant_signature)
         .map_err(|_| "peer authentication proof signature verification failed".to_string())?;
 
-    let _guard = identity_init_guard()?;
+    let _guard = identity_init_guard(caller)?;
     let mut auth_state = load_peer_auth_state(caller)?;
     prune_peer_auth_state(&mut auth_state, now);
     if auth_state.consumed.contains_key(&proof.challenge.nonce) {
@@ -1312,7 +1312,7 @@ pub fn issue_test_member_with_protocol(
 pub fn initialize_cluster(
     caller: &impl ClusterRuntimeOps,
 ) -> Result<ClusterIdentityResponse, String> {
-    let _guard = identity_init_guard()?;
+    let _guard = identity_init_guard(caller)?;
     let cluster_id = load_cluster_id(caller)?.unwrap_or_else(ClusterId::generate);
     let node_identity = load_node_identity(caller)?
         .ok_or_else(|| "node identity must be initialized before cluster init".to_string())?;
@@ -1432,7 +1432,7 @@ pub fn revoke_enrollment(
     if enrollment_id.is_empty() {
         return Err("enrollment ID cannot be empty".to_string());
     }
-    let _guard = identity_init_guard()?;
+    let _guard = identity_init_guard(caller)?;
     let cluster_id = load_cluster_id(caller)?
         .ok_or_else(|| "cluster is not initialized; run 'cluster init' first".to_string())?;
     let mut state = require_membership_state(caller, cluster_id)?;
@@ -1490,7 +1490,7 @@ pub fn accept_credential_rotation(
     caller: &impl ClusterRuntimeOps,
     request: &CredentialRotationRequest,
 ) -> Result<MemberCredentialResult, String> {
-    let _guard = identity_init_guard()?;
+    let _guard = identity_init_guard(caller)?;
     let cluster_id =
         load_cluster_id(caller)?.ok_or_else(|| "cluster is not initialized".to_string())?;
     let issuer = load_node_identity(caller)?
@@ -1582,7 +1582,7 @@ pub fn commit_credential_rotation(
     caller: &impl ClusterRuntimeOps,
     member: &ClusterMember,
 ) -> Result<MemberCredentialResult, String> {
-    let _guard = identity_init_guard()?;
+    let _guard = identity_init_guard(caller)?;
     let cluster_id =
         load_cluster_id(caller)?.ok_or_else(|| "this node is not a cluster member".to_string())?;
     let identity = load_node_identity(caller)?
@@ -1623,7 +1623,7 @@ pub fn revoke_member(
     node_id: &str,
 ) -> Result<MemberCredentialResult, String> {
     let node_id = node_id.parse::<NodeId>()?.to_string();
-    let _guard = identity_init_guard()?;
+    let _guard = identity_init_guard(caller)?;
     let cluster_id =
         load_cluster_id(caller)?.ok_or_else(|| "cluster is not initialized".to_string())?;
     let local_identity = load_node_identity(caller)?
@@ -1920,7 +1920,7 @@ pub fn create_enrollment_token(
         ));
     }
     let capabilities = capabilities.unwrap_or_else(default_join_capabilities);
-    let _guard = identity_init_guard()?;
+    let _guard = identity_init_guard(caller)?;
     let cluster_id = load_cluster_id(caller)?
         .ok_or_else(|| "cluster is not initialized; run 'cluster init' first".to_string())?;
     let mut state = require_membership_state(caller, cluster_id)?;
@@ -2035,7 +2035,7 @@ pub fn redeem_enrollment(
     }
     verify_enrollment_possession(&token, request, request_public_key)?;
     let negotiated_protocol = negotiate_protocol(&current_protocol_offer(), &request.protocol)?;
-    let _guard = identity_init_guard()?;
+    let _guard = identity_init_guard(caller)?;
     let cluster_id =
         load_cluster_id(caller)?.ok_or_else(|| "issuer cluster is not initialized".to_string())?;
     if token.claims.cluster_id != cluster_id.to_string() {
@@ -2185,7 +2185,7 @@ pub fn configure_local_consensus_endpoint(
         return Ok(());
     };
     let endpoint = validate_advertised_endpoint(endpoint)?;
-    let _guard = identity_init_guard()?;
+    let _guard = identity_init_guard(caller)?;
     let Some(cluster_id) = load_cluster_id(caller)? else {
         return Ok(());
     };
@@ -2238,7 +2238,7 @@ pub fn local_consensus_member(
 }
 
 pub fn clear_pending_join(caller: &impl ClusterRuntimeOps) -> Result<(), String> {
-    let _guard = identity_init_guard()?;
+    let _guard = identity_init_guard(caller)?;
     clear_identity_record(caller, PENDING_JOIN_STORAGE_KEY)
 }
 
@@ -2294,7 +2294,7 @@ pub fn load_membership_state(
 ) -> Result<Option<MembershipState>, String> {
     // Reads can migrate legacy records, so they participate in the same full
     // domain transaction (including when nested inside an existing mutation).
-    let _guard = identity_init_guard()?;
+    let _guard = identity_init_guard(caller)?;
     let Some(value) = load_identity_record(caller, MEMBERSHIP_STATE_STORAGE_KEY)? else {
         return Ok(None);
     };
@@ -2505,7 +2505,7 @@ fn store_cluster_id(caller: &impl ClusterRuntimeOps, cluster_id: ClusterId) -> R
 pub fn load_or_create_node_identity(
     caller: &impl ClusterRuntimeOps,
 ) -> Result<NodeIdentity, String> {
-    let _guard = identity_init_guard()?;
+    let _guard = identity_init_guard(caller)?;
     if let Some(identity) = load_node_identity(caller)? {
         return Ok(identity);
     }
@@ -2553,8 +2553,10 @@ pub fn load_node_identity(caller: &impl ClusterRuntimeOps) -> Result<Option<Node
     }))
 }
 
-fn identity_init_guard() -> Result<durable_storage::MutationGuard, String> {
-    durable_storage::mutation()
+fn identity_init_guard(
+    caller: &impl ClusterRuntimeOps,
+) -> Result<durable_storage::MutationGuard, String> {
+    caller.durable_mutation()
 }
 
 fn ensure_identity_version(version: u8, kind: &str) -> Result<(), String> {

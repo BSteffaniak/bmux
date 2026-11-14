@@ -3,6 +3,69 @@ use std::time::Duration;
 
 use super::{discover_bundled_plugin_ids, run_plugin_command, sandbox_cli::run_sandbox_cleanup};
 
+pub(super) fn run_selected(
+    state: &super::plugin_runtime::RuntimeCommandState,
+    command: &bmux_cli_schema::Command,
+) -> Result<i32> {
+    anyhow::ensure!(
+        matches!(command, bmux_cli_schema::Command::Playbook { .. }),
+        "selected playbook executor received another command"
+    );
+    let run = async {
+        if let bmux_cli_schema::Command::Playbook {
+            command:
+                bmux_cli_schema::PlaybookCommand::Run {
+                    source,
+                    json,
+                    interactive,
+                    playback_speed,
+                    target_server,
+                    record,
+                    export_gif,
+                    viewport,
+                    timeout,
+                    shell,
+                    vars,
+                    verbose,
+                },
+        } = command
+        {
+            return run_playbook_run(
+                source,
+                *json,
+                *interactive,
+                playback_speed,
+                *target_server,
+                *record,
+                export_gif.as_deref(),
+                viewport.as_deref(),
+                *timeout,
+                shell.as_deref(),
+                vars,
+                *verbose,
+                Some(state),
+            )
+            .await;
+        }
+        Box::pin(super::dispatch::dispatch_built_in_command(
+            command,
+            super::ConnectionContext::new(None),
+        ))
+        .await
+    };
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(|| handle.block_on(run)).map(i32::from)
+        }
+        Ok(_) => anyhow::bail!("selected playbook executor requires a blocking execution context"),
+        Err(_) => tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(run)
+            .map(i32::from),
+    }
+}
+
 #[allow(
     clippy::too_many_lines,
     clippy::too_many_arguments,
@@ -23,6 +86,7 @@ pub(super) async fn run_playbook_run(
     shell: Option<&str>,
     cli_vars: &[String],
     verbose: bool,
+    selected: Option<&super::plugin_runtime::RuntimeCommandState>,
 ) -> Result<u8> {
     if let Some(probe) = std::env::var_os("BMUX_PLAYBOOK_PROTOCOL_PROBE") {
         let probe = std::path::PathBuf::from(probe);
@@ -72,18 +136,30 @@ pub(super) async fn run_playbook_run(
     }
 
     // Populate bundled plugin IDs so the sandbox can configure plugins.
-    playbook.config.bundled_plugin_ids = discover_bundled_plugin_ids();
+    playbook.config.bundled_plugin_ids =
+        selected.map_or_else(discover_bundled_plugin_ids, |state| {
+            state
+                .registry
+                .iter()
+                .filter(|plugin| plugin.bundled_static)
+                .map(|plugin| plugin.declaration.id.as_str().to_string())
+                .collect()
+        });
     playbook.config.verbose = verbose;
 
     let speed =
         bmux_playbook::PlaybackSpeed::parse(playback_speed).context("invalid playback speed")?;
-    let result = crate::playbook::run_with_options(
+    let host = selected.map_or_else(crate::playbook::engine::host, |state| {
+        crate::playbook::engine::selected_host(state.config.clone(), state.paths.clone())
+    });
+    let result = crate::playbook::engine::run_playbook_with_host(
         playbook,
         target_server,
         crate::playbook::RunOptions {
             interactive,
             playback_speed: speed,
         },
+        host,
     )
     .await?;
 
@@ -98,7 +174,18 @@ pub(super) async fn run_playbook_run(
                 "--output".to_string(),
                 gif_path.to_string(),
             ];
-            match run_plugin_command("bmux.recording", "recording-export", &args).await {
+            let export = if let Some(state) = selected {
+                super::plugin_runtime::run_plugin_command_with_state(
+                    state,
+                    "bmux.recording",
+                    "recording-export",
+                    &args,
+                )
+                .await
+            } else {
+                run_plugin_command("bmux.recording", "recording-export", &args).await
+            };
+            match export {
                 Ok(_) => {
                     if !json {
                         println!("exported GIF: {gif_path}");

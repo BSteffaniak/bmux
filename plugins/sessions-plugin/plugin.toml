@@ -67,3 +67,31 @@ long       = "name"
 name       = "name"
 short      = "n"
 value_name = "NAME"
+
+# Explicit immutable v1 contracts. Route IDs are wire identities, not version
+# syntax: retain legacy names and negotiate their major separately.
+
+[[contracts]]
+interface_id = "sessions-program-v1"
+major        = 1
+minor        = 0
+
+[[contracts]]
+interface_id = "sessions-state"
+major        = 1
+minor        = 0
+
+[[contracts]]
+interface_id = "sessions-commands"
+major        = 1
+minor        = 0
+
+[[contracts]]
+interface_id = "sessions-events"
+major        = 1
+minor        = 0
+
+[[contracts]]
+interface_id = "sessions-spawn-v1"
+major        = 1
+minor        = 0

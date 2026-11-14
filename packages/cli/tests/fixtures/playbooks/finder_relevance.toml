@@ -1,3 +1,6 @@
+[plugins.settings."bmux.tab_bar"]
+tab_template = "<{active}:{name}>"
+
 [keybindings]
 initial_mode = "normal"
 

@@ -332,3 +332,26 @@ kind  = "boolean"
 long  = "json"
 name  = "json"
 short = "j"
+
+# Explicit immutable v1 contracts. Route IDs are wire identities, not version
+# syntax: retain legacy names and negotiate their major separately.
+
+[[contracts]]
+interface_id = "permissions-state"
+major        = 1
+minor        = 0
+
+[[contracts]]
+interface_id = "permissions-commands"
+major        = 1
+minor        = 0
+
+[[contracts]]
+interface_id = "session-policy-state"
+major        = 1
+minor        = 0
+
+[[contracts]]
+interface_id = "session-policy-commands"
+major        = 1
+minor        = 0

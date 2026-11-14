@@ -1247,24 +1247,101 @@ fn recording_plugin_exists() {
          recording plugin owns runtime instances",
     );
 
-    // Plugin impl crate must register the sink + runtime handles
-    // on `activate`.
+    // Runtime handles now belong to RecordingOwner, not global typed
+    // registrations. Activation must publish the real dual-runtime sink through
+    // its injected host, and cleanup must revoke it only after draining writers.
     let plugin_lib = include_str!("../../../plugins/recording-plugin/src/lib.rs");
+    let constructor = plugin_lib
+        .split_once("impl RecordingOwner {")
+        .expect("recording plugin must own runtime construction")
+        .1
+        .split_once("fn activate_owner(")
+        .expect("recording owner must have activation")
+        .0;
+    for required in [
+        "RecordingRuntime::new(",
+        "RecordingRuntime::new_rolling(",
+        "ManualRecordingRuntimeHandle(manual)",
+        "RollingRecordingRuntimeHandle(rolling)",
+    ] {
+        assert!(
+            constructor.contains(required),
+            "recording owner must construct and retain {required}"
+        );
+    }
+    let activation = plugin_lib
+        .split_once("fn activate_owner(")
+        .unwrap()
+        .1
+        .split_once("fn deactivate_owner(")
+        .expect("recording owner must have cleanup")
+        .0;
+    // Formatting is not lifecycle behavior. Normalize whitespace, then enforce
+    // the atomic ownership claim and its ordering before any external effect.
+    let activation: String = activation
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect();
+    for required in [
+        "self.activation_claimed.swap(true,std::sync::atomic::Ordering::AcqRel)",
+        "self.host.install_sink(RecordingSinkHandle::from_arc(Arc::new(DualRuntimeSink",
+        "manual:Arc::clone(&manual)",
+        "rolling:Arc::clone(&rolling)",
+        ".map_err(PluginCommandError::failed)?",
+    ] {
+        assert!(
+            activation.contains(required),
+            "recording activation must preserve {required}"
+        );
+    }
+    let claim = activation.find("self.activation_claimed.swap(").unwrap();
+    for effect in [
+        "self.host.install_sink(",
+        "auto_start_manual(",
+        "auto_start_rolling(",
+        ".spawn(",
+    ] {
+        assert!(
+            claim
+                < activation
+                    .find(effect)
+                    .expect("activation effect must remain explicit"),
+            "recording ownership must be claimed before {effect}"
+        );
+    }
+    let cleanup = plugin_lib
+        .split_once("fn deactivate_owner(")
+        .unwrap()
+        .1
+        .split_once("fn dispatch_process<")
+        .expect("recording owner cleanup must precede dispatch helpers")
+        .0;
+    let cleanup: String = cleanup.chars().filter(|ch| !ch.is_whitespace()).collect();
+    let stop = cleanup
+        .find("runtime.stop(None)")
+        .expect("cleanup must stop owned writers");
+    let revoke = cleanup
+        .find("self.host.remove_sink().map_err(PluginCommandError::failed)?")
+        .expect("cleanup must acknowledge sink revocation");
+    let release = cleanup
+        .find("self.activation_claimed.store(false,std::sync::atomic::Ordering::Release)")
+        .expect("cleanup must release the activation claim only after success");
+    assert!(stop < revoke, "writer drain must precede sink revocation");
     assert!(
-        plugin_lib.contains("register::<RecordingSinkHandle>"),
-        "plugins/recording-plugin/src/lib.rs must register a \
-         `RecordingSinkHandle` into the plugin state registry on \
-         `activate`",
+        revoke < release,
+        "sink revocation must precede ownership release"
     );
+    let legacy_host = plugin_lib
+        .split_once("impl RecordingHost for LegacyRecordingHost {")
+        .expect("legacy host adapter must retain real sink registration")
+        .1
+        .split_once("fn remove_sink(")
+        .unwrap()
+        .0;
+    assert!(legacy_host.contains("sink: RecordingSinkHandle"));
     assert!(
-        plugin_lib.contains("register::<ManualRecordingRuntimeHandle>"),
-        "plugins/recording-plugin/src/lib.rs must register a \
-         `ManualRecordingRuntimeHandle` on `activate`",
-    );
-    assert!(
-        plugin_lib.contains("register::<RollingRecordingRuntimeHandle>"),
-        "plugins/recording-plugin/src/lib.rs must register a \
-         `RollingRecordingRuntimeHandle` on `activate`",
+        legacy_host
+            .contains("global_plugin_state_registry().register(&Arc::new(RwLock::new(sink)))")
     );
 }
 

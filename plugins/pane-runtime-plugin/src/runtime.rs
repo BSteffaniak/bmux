@@ -3727,7 +3727,10 @@ impl PaneInputHandle {
             return Err(SessionRuntimeError::Closed);
         }
         self.input_tx
-            .send(input_authority::local_command(data, self.session_id))
+            .send(input_authority::settled_local_command(
+                data,
+                self.session_id,
+            )?)
             .map_err(|_| SessionRuntimeError::Closed)
     }
 }
@@ -3747,7 +3750,7 @@ impl PaneRuntimeHandle {
         session_id: SessionId,
     ) -> std::result::Result<(), SessionRuntimeError> {
         self.input_tx
-            .send(input_authority::local_command(data, session_id))
+            .send(input_authority::settled_local_command(data, session_id)?)
             .map_err(|_| SessionRuntimeError::Closed)
     }
 
@@ -8088,7 +8091,13 @@ impl SessionRuntimeManager {
                         };
                         match input {
                             Some(PaneRuntimeCommand::AdmittedInput(bytes, acknowledgement, _permit, authority)) => {
-                                let result = writer.lock().map_err(|_| "PTY writer lock poisoned".to_string()).and_then(|mut writer| authority.write(&mut *writer, &bytes).map_err(|error| error.to_string()));
+                                let result = if execution_for_task.terminal_session_ended.load(Ordering::SeqCst)
+                                    || execution_for_task.terminal_owner_retired.load(Ordering::SeqCst)
+                                {
+                                    Err("PTY input target retired".to_string())
+                                } else {
+                                    writer.lock().map_err(|_| "PTY writer lock poisoned".to_string()).and_then(|mut writer| authority.write(&mut *writer, &bytes).map_err(|error| format!("PTY input write failed ({error}); do not replay")))
+                                };
                                 let _ = acknowledgement.send(result);
                             }
                             Some(PaneRuntimeCommand::AuthorizedInput(bytes, authority)) => {
@@ -18476,44 +18485,29 @@ exit 7"#
         }
     }
 
-    unsafe extern "C" fn history_fixture_origin(
-        input: *const u8,
-        length: usize,
-        output: *mut u8,
-        capacity: usize,
-        written: *mut usize,
-    ) -> i32 {
-        std::panic::catch_unwind(|| {
-            let request: bmux_plugin_sdk::HostKernelBridgeRequest =
-                bmux_plugin_sdk::decode_service_message(unsafe {
-                    std::slice::from_raw_parts(input, length)
-                })
-                .unwrap();
-            let request: bmux_ipc::Request = bmux_ipc::decode(&request.payload).unwrap();
-            assert!(matches!(
-                request,
-                bmux_ipc::Request::CurrentStreamProvenance
-            ));
-            let payload = bmux_ipc::encode(&bmux_ipc::Response::Ok(
-                bmux_ipc::ResponsePayload::CurrentStreamProvenance {
-                    provenance: bmux_ipc::StreamProvenance::Local,
-                },
-            ))
-            .unwrap();
-            let response = bmux_plugin_sdk::encode_service_message(
-                &bmux_plugin_sdk::HostKernelBridgeResponse { payload },
-            )
-            .unwrap();
-            if response.len() > capacity {
-                return 4;
-            }
-            unsafe {
-                std::ptr::copy_nonoverlapping(response.as_ptr(), output, response.len());
-                *written = response.len();
-            }
-            0
-        })
-        .unwrap_or(1)
+    fn history_fixture_origin() -> bmux_plugin_sdk::PluginHostServices {
+        bmux_plugin_sdk::PluginHostServices::new(
+            // The SDK callback contract returns PluginError by value.
+            #[allow(clippy::result_large_err)]
+            |request| {
+                use bmux_clients_plugin_api::clients_identity::{
+                    self, IdentityError, StreamProvenance,
+                };
+                assert_eq!(request.capability, "bmux.clients.read");
+                assert_eq!(request.kind, bmux_plugin_sdk::ServiceKind::Query);
+                assert_eq!(request.interface, clients_identity::INTERFACE_ID.as_str());
+                assert_eq!(request.operation, "current-stream-provenance");
+                bmux_plugin_sdk::service_contract::decode_for(
+                    request.interface,
+                    clients_identity::SERVICE_CONTRACT,
+                    request.payload,
+                )?;
+                let payload = bmux_plugin_sdk::encode_service_message(&Ok::<_, IdentityError>(
+                    StreamProvenance::Local,
+                ))?;
+                Ok(bmux_plugin_sdk::service_contract::encode_response(&payload))
+            },
+        )
     }
 
     struct HistoryDispatch(Uuid);
@@ -18538,6 +18532,7 @@ exit 7"#
                     };
                     assert_eq!(kind, bmux_ipc::InvokeServiceKind::Query);
                     let response = crate::handlers::route(NativeServiceContext {
+                        host_service_port: Some(history_fixture_origin()),
                         plugin_id: "bmux.pane-runtime".into(),
                         request: ServiceRequest {
                             caller_plugin_id: String::new(),
@@ -18573,9 +18568,7 @@ exit 7"#
                         plugin_settings_map: std::collections::BTreeMap::new(),
                         caller_client_id: Some(self.0),
                         cancellation: bmux_plugin_sdk::CancellationToken::default(),
-                        host_kernel_bridge: Some(bmux_plugin_sdk::HostKernelBridge::from_fn(
-                            history_fixture_origin,
-                        )),
+                        host_kernel_bridge: None,
                     });
                     assert_eq!(response.error, None);
                     Ok(response.payload)

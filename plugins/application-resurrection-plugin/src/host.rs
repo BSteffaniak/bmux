@@ -312,6 +312,17 @@ impl Host {
         Ok(Some(command))
     }
 
+    /// Fence and drain every writer before releasing the host. On failure the
+    /// entries remain owned so the lifecycle can report cleanup-required and retry.
+    pub fn shutdown(&self) -> Result<(), String> {
+        let mut entries = self.entries.lock().map_err(|error| error.to_string())?;
+        for entry in entries.values() {
+            stop_and_drain(entry)?;
+        }
+        entries.clear();
+        Ok(())
+    }
+
     pub fn close(&self, key: &str, endpoint: &str) -> Result<bool, String> {
         let mut entries = self.entries.lock().map_err(|e| e.to_string())?;
         let entry = entries

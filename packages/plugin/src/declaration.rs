@@ -183,11 +183,43 @@ impl PluginDeclaration {
         self.validate()
     }
 
+    fn validate_version_ranges(&self) -> Result<()> {
+        for (field, range) in [
+            ("plugin_api", self.plugin_api),
+            ("native_abi", self.native_abi),
+        ] {
+            if range.maximum.is_some_and(|maximum| maximum < range.minimum) {
+                return Err(PluginError::InvalidVersionRange {
+                    plugin_id: self.id.as_str().to_string(),
+                    field,
+                    details: "maximum must be at least minimum".into(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_runtime_hook_capability(&self, command: &PluginCommand) -> Result<()> {
+        if matches!(command.execution, CommandExecutionKind::RuntimeHook)
+            && !self
+                .required_capabilities
+                .iter()
+                .any(HostScope::is_hot_path)
+        {
+            return Err(PluginError::MissingRequiredCapability {
+                plugin_id: self.id.as_str().to_string(),
+                capability: "bmux.terminal.input_intercept".to_string(),
+            });
+        }
+        Ok(())
+    }
+
     /// # Errors
     ///
-    /// Returns an error when the declaration contains duplicate command names or
+    /// Returns an error for inverted version bounds, duplicate command names or
     /// runtime hook commands without a hot-path capability.
     pub fn validate(&self) -> Result<()> {
+        self.validate_version_ranges()?;
         let mut command_names = BTreeSet::new();
         let mut dependency_ids = BTreeSet::new();
         for command in &self.commands {
@@ -198,17 +230,7 @@ impl PluginDeclaration {
                 });
             }
 
-            if matches!(command.execution, CommandExecutionKind::RuntimeHook)
-                && !self
-                    .required_capabilities
-                    .iter()
-                    .any(HostScope::is_hot_path)
-            {
-                return Err(PluginError::MissingRequiredCapability {
-                    plugin_id: self.id.as_str().to_string(),
-                    capability: "bmux.terminal.input_intercept".to_string(),
-                });
-            }
+            self.validate_runtime_hook_capability(command)?;
 
             let canonical_path = command.canonical_path();
             if canonical_path.is_empty() || canonical_path.iter().any(std::string::String::is_empty)

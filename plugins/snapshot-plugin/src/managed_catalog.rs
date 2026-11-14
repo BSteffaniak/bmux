@@ -18,19 +18,6 @@ pub(crate) struct ManagedCatalog {
 }
 
 impl ManagedCatalog {
-    pub(crate) fn capture(legacy: &Path) -> Result<Option<Self>> {
-        match (
-            std::env::var("BMUX_MANAGED_TARGET_ID"),
-            std::env::var("BMUX_MANAGED_TARGET_IDENTITY"),
-        ) {
-            (Err(std::env::VarError::NotPresent), Err(std::env::VarError::NotPresent)) => Ok(None),
-            (Ok(target), Ok(identity)) => Self::new(legacy, target, &identity).map(Some),
-            _ => Err(Error::Other(
-                "snapshot managed scope requires target ID and identity together".into(),
-            )),
-        }
-    }
-
     pub(crate) fn new(legacy: &Path, target: String, identity: &str) -> Result<Self> {
         validate_target(&target)?;
         let identity: Value =

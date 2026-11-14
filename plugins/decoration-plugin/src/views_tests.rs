@@ -1,3 +1,6 @@
+#[path = "checked_service_tests.rs"]
+mod checked_service_tests;
+
 use super::*;
 use crate::{DecorationPlugin, State};
 use bmux_attach_layout_protocol::attach_layout_protocol::AttachSurfaceSummary;
@@ -75,6 +78,7 @@ fn context(
         plugin_settings_map: BTreeMap::new(),
         caller_client_id: caller,
         cancellation: CancellationToken::default(),
+        host_service_port: None,
         host_kernel_bridge: None,
     }
 }

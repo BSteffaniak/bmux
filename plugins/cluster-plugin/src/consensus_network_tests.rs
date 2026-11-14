@@ -9,12 +9,35 @@ use bmux_plugin_sdk::{PluginError, Result as PluginResult, ServiceKind};
 use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
 
-#[derive(Default)]
 struct ForwardingCaller {
+    // Retain the selected durable scope for the whole forwarding fixture.
+    _root: TempDir,
+    connection: bmux_plugin_sdk::HostConnectionInfo,
     storage: Mutex<std::collections::BTreeMap<String, Vec<u8>>>,
     leader: Mutex<Option<Arc<ControlServiceHandle<Self>>>>,
     forwarded: Mutex<Vec<String>>,
     drop_next_mutation_response: std::sync::atomic::AtomicBool,
+}
+
+impl Default for ForwardingCaller {
+    fn default() -> Self {
+        let root = tempfile::tempdir().expect("owned forwarding storage");
+        let data_dir = root.path().to_string_lossy().into_owned();
+        Self {
+            _root: root,
+            connection: bmux_plugin_sdk::HostConnectionInfo {
+                config_dir: data_dir.clone(),
+                config_dir_candidates: Vec::new(),
+                runtime_dir: data_dir.clone(),
+                state_dir: data_dir.clone(),
+                data_dir,
+            },
+            storage: Mutex::default(),
+            leader: Mutex::default(),
+            forwarded: Mutex::default(),
+            drop_next_mutation_response: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
 }
 
 impl ForwardingCaller {
@@ -64,6 +87,10 @@ impl ForwardingCaller {
 }
 
 impl ServiceCaller for ForwardingCaller {
+    fn host_connection(&self) -> Option<&bmux_plugin_sdk::HostConnectionInfo> {
+        Some(&self.connection)
+    }
+
     fn call_service_raw(
         &self,
         _capability: &str,

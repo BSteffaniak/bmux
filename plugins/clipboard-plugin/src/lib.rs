@@ -16,6 +16,12 @@ impl RustPlugin for ClipboardPlugin {
     type Contract = bmux_plugin_sdk::NoPluginContract;
 
     fn invoke_service(&self, context: NativeServiceContext) -> ServiceResponse {
+        Self::service(&context)
+    }
+}
+
+impl ClipboardPlugin {
+    fn service(context: &NativeServiceContext) -> ServiceResponse {
         let span = tracing::debug_span!(
             "clipboard_plugin_service",
             bmux.component = "clipboard.remote_sync",
@@ -57,7 +63,55 @@ impl RustPlugin for ClipboardPlugin {
     }
 }
 
+impl bmux_plugin_sdk::definition::PluginInstance for ClipboardPlugin {
+    fn invoke(
+        &self,
+        call: bmux_plugin_sdk::definition::PluginCallContext,
+        context: NativeServiceContext,
+    ) -> bmux_plugin_sdk::definition::PluginFuture<
+        '_,
+        bmux_plugin_sdk::definition::PluginResult<ServiceResponse>,
+    > {
+        Box::pin(async move {
+            if call.cancellation.is_cancelled() {
+                return Err(PluginCommandError::unavailable(
+                    "clipboard invocation cancelled",
+                ));
+            }
+            Ok(Self::service(&context))
+        })
+    }
+}
+
+bmux_plugin_sdk::define_plugin!(
+    factory = |_scope| Ok(std::sync::Arc::new(ClipboardPlugin)
+        as std::sync::Arc<dyn bmux_plugin_sdk::definition::PluginInstance>),
+    metadata = bmux_plugin_sdk::definition::PluginDefinition::from_rust_plugin::<ClipboardPlugin>(
+        include_str!("../plugin.toml"),
+        vec![
+            bmux_plugin_sdk::definition::ComponentRole::Backend,
+            bmux_plugin_sdk::definition::ComponentRole::Frontend
+        ],
+    )
+    .expect("clipboard declaration must be valid")
+    .metadata,
+);
+
+// Compatibility entry only; the shared definition and this entry call `service`.
 bmux_plugin_sdk::export_plugin!(ClipboardPlugin, include_str!("../plugin.toml"));
+
+#[cfg(test)]
+mod definition_tests {
+    #[test]
+    fn shared_definition_preserves_clipboard_contract_identity() {
+        let definition = super::plugin_definition();
+        assert_eq!(definition.metadata.plugin_id, "bmux.clipboard");
+        assert_eq!(definition.metadata.contracts.len(), 3);
+        definition
+            .validate()
+            .expect("embedded declaration must match metadata");
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct ClipboardCopyRequest {

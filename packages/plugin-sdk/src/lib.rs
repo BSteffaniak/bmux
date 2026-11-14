@@ -15,7 +15,17 @@
 //! loading.  The host-side machinery lives in the full `bmux_plugin` crate,
 //! which re-exports everything from this SDK.
 //!
-//! # Quick start
+//! # Unified author API
+//!
+//! Implement [`PluginInstance`] once, declare an inert definition with
+//! [`define_plugin!`], and create one instance per host scope. Implementation
+//! libraries export no native symbols. A separate thin cdylib calls
+//! [`export_plugin_entrypoint!`] to expose the explicitly selected v2 ABI.
+//! Typed static BPDL adapters register through the same scoped implementation.
+//! The older `RustPlugin` exports below remain only for migration; v1 wire
+//! semantics are unchanged.
+//!
+//! # Legacy quick start
 //!
 //! ```ignore
 //! use bmux_plugin_sdk::prelude::*;
@@ -37,7 +47,23 @@
 //! bmux_plugin_sdk::export_plugin!(MyPlugin, include_str!("../plugin.toml"));
 //! ```
 
+pub mod abi;
+pub mod definition;
+pub use definition::{
+    ActivationId, CommandOutcome, ComponentRole, ContractDescriptor, ContractEvidence,
+    DeclaredServiceContract, ExtensionDeclaration, InstanceRegistrations, LoadedInstanceId,
+    PluginCallContext, PluginCreateContext, PluginDeclarations, PluginDefinition, PluginFactory,
+    PluginFuture, PluginHostServices, PluginInstance, PluginLifecycleContext, PluginMetadata,
+    PluginResult, RegistrationMutation, RuntimeScopeId,
+};
+
 pub mod action_dispatch;
+pub mod callback_execution;
+pub use callback_execution::{
+    PluginBlockingCallback, PluginCallbackAuthority, PluginCallbackAuthoritySource,
+    PluginCallbackContext, PluginCallbackEntryGuard, PluginCallbackExecution,
+    PluginCallbackExecutor, PluginCallbackSettlement,
+};
 mod cancellation;
 mod capability;
 mod command;
@@ -93,19 +119,24 @@ pub use context::{
     encode_host_kernel_bridge_plugin_command_payload,
     encode_host_kernel_bridge_service_relay_payload,
 };
-pub use contribution::{ContributionRegistrar, PluginContribution};
+pub use contribution::{
+    ContributionRegistrar, PluginContribution, RegistrationContract, RegistrationKind,
+};
 pub use error::{CapabilityAccessDeniedHint, PluginError, Result};
 pub use event::{
     PluginEvent, PluginEventDelivery, PluginEventPayload, PluginEventPublication,
     PluginEventSubscription,
 };
-pub use host::{HostConnectionInfo, HostMetadata, PluginContext, PluginHost, ResolvedService};
+pub use host::{
+    BoundHostServicePort, HostConnectionInfo, HostMetadata, HostServiceDispatch,
+    HostServiceRequest, PluginContext, PluginHost, ResolvedService,
+};
 pub use host_services::{
-    COMMAND_OUTCOME_STATUS_MESSAGE_KEY, LogWriteLevel, LogWriteRequest, PluginCommandOutcome,
-    StorageGetRequest, StorageGetResponse, StorageKey, StorageKeyError, StorageSetRequest,
-    VolatileStateClearRequest, VolatileStateGetRequest, VolatileStateGetResponse,
-    VolatileStateSetRequest, begin_command_outcome_capture, finish_command_outcome_capture,
-    record_command_outcome_metadata, storage_key_is_valid,
+    COMMAND_OUTCOME_STATUS_MESSAGE_KEY, HostServiceFuture, HostServiceOwnedRequest, LogWriteLevel,
+    LogWriteRequest, PluginCommandOutcome, StorageGetRequest, StorageGetResponse, StorageKey,
+    StorageKeyError, StorageSetRequest, VolatileStateClearRequest, VolatileStateGetRequest,
+    VolatileStateGetResponse, VolatileStateSetRequest, begin_command_outcome_capture,
+    finish_command_outcome_capture, record_command_outcome_metadata, storage_key_is_valid,
 };
 pub use ident::{CapabilityId, InterfaceId, OperationId, PluginEventKind};
 
@@ -138,8 +169,9 @@ pub use service::{
     PluginService, ProviderId, RegisteredService, ServiceEnvelope, ServiceEnvelopeKind,
     ServiceError, ServiceEvent, ServiceEventSink, ServiceEventSinkHandle,
     ServiceInterfaceDescriptor, ServiceKind, ServiceProtocolVersion, ServiceRequest,
-    ServiceResponse, decode_service_envelope, decode_service_envelope_with_invocation_id,
-    decode_service_message, decode_service_stream_envelopes, encode_service_envelope,
+    ServiceResponse, ServiceStreamCompletion, ServiceStreamContext, TypedServiceEventSink,
+    decode_service_envelope, decode_service_envelope_with_invocation_id, decode_service_message,
+    decode_service_stream_envelopes, encode_service_envelope,
     encode_service_envelope_with_invocation_id, encode_service_message,
     encode_service_stream_envelopes,
 };
@@ -148,8 +180,8 @@ pub use stateful_plugin::{
     StatefulPluginSnapshot,
 };
 pub use typed_dispatch::{
-    InProcessTypedDispatch, TypedDispatchError, TypedProviderCell, TypedServiceHandle,
-    TypedServiceKey, TypedServiceRegistry,
+    InProcessTypedDispatch, PortableServiceProvider, TypedDispatchError, TypedProviderCell,
+    TypedServiceHandle, TypedServiceKey, TypedServiceRegistry,
 };
 pub use typed_dispatch_client::{
     StreamingTypedServiceEndpoint, TypedDispatchClient, TypedDispatchClientError,
@@ -319,6 +351,12 @@ macro_rules! route_command {
 /// with a single `use bmux_plugin_sdk::prelude::*;` to get everything needed
 /// for commands, services, lifecycle hooks, and host-runtime calls.
 pub mod prelude {
+    pub use crate::definition::{
+        ActivationId, CommandOutcome, ComponentRole, ContractDescriptor, LoadedInstanceId,
+        PluginCallContext, PluginCreateContext, PluginDefinition, PluginFactory, PluginFuture,
+        PluginHostServices, PluginInstance, PluginLifecycleContext, PluginMetadata, PluginResult,
+        RuntimeScopeId,
+    };
     pub use crate::{
         // Action dispatch
         ActionDispatchRequest,

@@ -58,3 +58,36 @@ kind         = "query"
 delivery                     = "broadcast"
 forward_to_streaming_clients = true
 kind                         = "bmux.clients/clients-events"
+
+# Explicit immutable v1 contracts. Route IDs are wire identities, not version
+# syntax: retain legacy names and negotiate their major separately.
+
+[[contracts]]
+interface_id = "clients-identity/v1"
+major        = 1
+minor        = 0
+
+[[contracts]]
+interface_id = "clients-state"
+major        = 1
+minor        = 0
+
+[[contracts]]
+interface_id = "clients-commands"
+major        = 1
+minor        = 0
+
+[[contracts]]
+interface_id = "clients-events"
+major        = 1
+minor        = 0
+
+[[contracts]]
+interface_id = "clients-selection-commands-v1"
+major        = 1
+minor        = 0
+
+[[contracts]]
+interface_id = "clients-selection-state-v1"
+major        = 1
+minor        = 0
