@@ -980,7 +980,10 @@ mod tests {
                 )
                 .is_err()
         );
-        assert_eq!(terminal.writer().as_slice(), []);
+        assert!(
+            terminal.writer().is_empty(),
+            "rejected frame must not emit any output bytes"
+        );
     }
 
     #[test]

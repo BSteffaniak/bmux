@@ -193,14 +193,19 @@ impl bmux_plugin_sdk::HostServiceDispatch for KernelServices {
         {
             // Nested commands must inherit this actual entry's issuing route,
             // never the instance-cached builtin executor or another TLS route.
-            let route = self.command_route.clone().ok_or_else(|| {
-                failure("nested plugin command requires selected invocation transport")
-            })?;
-            if route.parent().is_none() {
-                return Err(failure(
-                    "nested plugin command requires live callback dependency",
-                ));
-            }
+            let route = match &self.command_route {
+                Some(route) if route.parent().is_some() => route.clone(),
+                Some(_) => {
+                    return Err(failure(
+                        "nested plugin command requires live callback dependency",
+                    ));
+                }
+                None => {
+                    return Err(failure(
+                        "nested plugin command requires selected invocation transport",
+                    ));
+                }
+            };
             return crate::runtime::plugin_kernel::scoped_cli_executor_with_dispatch(Some(route))
                 .map_err(|error| failure(error.to_string()))?
                 .invoke(request);
@@ -247,7 +252,9 @@ impl bmux_plugin_sdk::HostServiceDispatch for KernelServices {
             };
         }
         if let Some(route) = &self.command_route {
-            return route.invoke(invocation, &request);
+            // Attribution is the declaration this host bound to the admitted
+            // instance (checked above), never anything in the request.
+            return route.invoke(invocation, Some(&self.declaration.id), &request);
         }
         Err(failure(
             "scoped host service invocation has no explicit authenticated dispatch context",
@@ -527,16 +534,6 @@ impl ProductionPlugin {
         Ok(())
     }
 
-    /// Whether the upstream host-relay bridge applies to this plugin. Scoped
-    /// executions receive authority through explicitly bound host services,
-    /// so the relay is only meaningful for the process-loaded backend.
-    pub(in crate::runtime) const fn uses_host_relay(&self) -> bool {
-        match &self.backend {
-            Backend::Process(plugin) => plugin.uses_host_relay(),
-            Backend::Scoped(_) => false,
-        }
-    }
-
     pub(in crate::runtime) fn bind_lifecycle_authority(
         &self,
         context: bmux_server::ServiceInvokeContext,
@@ -715,12 +712,76 @@ impl ProductionPlugin {
         self.run_command_with_dispatch(command, args, context, None)
     }
 
+    /// Activate a command-only scoped instance before its first command.
+    /// Command-only activation needs the same selected host dispatcher as
+    /// async lifecycle activation. The loader derives each command's owned
+    /// port from this binding.
+    fn activate_scoped_command(
+        &self,
+        execution: &Arc<bmux_plugin::LoadedExecution>,
+        context: &NativeCommandContext,
+        command_route: Option<&crate::runtime::plugin_kernel::CommandDispatch>,
+    ) -> bmux_plugin_sdk::Result<()> {
+        let lifecycle_host = Arc::new(KernelServices {
+            declaration: self.declaration.clone(),
+            instance: execution.scope().id(),
+            authority: self.lifecycle_authority.get().cloned(),
+            services: context.services.clone(),
+            builtins: Arc::clone(&self.builtins),
+            command_route: command_route.cloned(),
+        });
+        let lifecycle_execution = Arc::downgrade(execution);
+        execution.bind_lifecycle_callback_factory(Arc::new(move |root| {
+            let callback = if let Some(parent) = lifecycle_host
+                .command_route
+                .as_ref()
+                .and_then(crate::runtime::plugin_kernel::CommandDispatch::parent)
+            {
+                Some(
+                    lifecycle_execution
+                        .upgrade()
+                        .ok_or_else(|| failure("nested lifecycle execution unavailable"))?
+                        .bind_child_callback(
+                            &parent,
+                            root.invocation().clone(),
+                            bmux_plugin_sdk::ServiceCancellation::new(),
+                        )?,
+                )
+            } else {
+                None
+            };
+            let binding = callback.as_ref().unwrap_or(root);
+            let selected = lifecycle_host.clone();
+            let host = binding.host_dispatch(Arc::new(move |entry| {
+                Ok(Arc::new((selected).with_callback_parent(entry)))
+            }));
+            Ok(bmux_plugin::LifecycleCallbackDispatch {
+                callback,
+                host: Some(host),
+                kernel: None,
+            })
+        }))?;
+        let activation =
+            execution.begin_command_activation(context, self.registered.manifest.concurrency)?;
+        if !matches!(
+            Self::observe_sync(execution, activation)?,
+            NativeOutcome::Unit
+        ) {
+            return Err(failure("unexpected command activation outcome"));
+        }
+        // observe_sync acknowledges the lifecycle operation before
+        // command admission on this same scoped implementation.
+        self.active
+            .store(true, std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+
     pub(in crate::runtime) fn run_command_with_dispatch(
         &self,
         command: &str,
         args: &[String],
         context: Option<&NativeCommandContext>,
-        command_route: Option<crate::runtime::plugin_kernel::CommandDispatch>,
+        command_route: Option<&crate::runtime::plugin_kernel::CommandDispatch>,
     ) -> bmux_plugin_sdk::Result<(i32, PluginCommandOutcome)> {
         match &self.backend {
             Backend::Process(plugin) => {
@@ -737,62 +798,7 @@ impl ProductionPlugin {
                 )?;
                 context.host_kernel_bridge = None;
                 if !self.active.load(std::sync::atomic::Ordering::Acquire) {
-                    // Command-only activation needs the same selected host
-                    // dispatcher as async lifecycle activation. The loader
-                    // derives each command's owned port from this binding.
-                    let lifecycle_host = Arc::new(KernelServices {
-                        declaration: self.declaration.clone(),
-                        instance: execution.scope().id(),
-                        authority: self.lifecycle_authority.get().cloned(),
-                        services: context.services.clone(),
-                        builtins: Arc::clone(&self.builtins),
-                        command_route: command_route.clone(),
-                    });
-                    let lifecycle_execution = Arc::downgrade(execution);
-                    execution.bind_lifecycle_callback_factory(Arc::new(move |root| {
-                        let callback = if let Some(parent) = lifecycle_host
-                            .command_route
-                            .as_ref()
-                            .and_then(|route| route.parent())
-                        {
-                            Some(
-                                lifecycle_execution
-                                    .upgrade()
-                                    .ok_or_else(|| {
-                                        failure("nested lifecycle execution unavailable")
-                                    })?
-                                    .bind_child_callback(
-                                        &parent,
-                                        root.invocation().clone(),
-                                        bmux_plugin_sdk::ServiceCancellation::new(),
-                                    )?,
-                            )
-                        } else {
-                            None
-                        };
-                        let binding = callback.as_ref().unwrap_or(root);
-                        let selected = lifecycle_host.clone();
-                        let host = binding.host_dispatch(Arc::new(move |entry| {
-                            Ok(Arc::new((selected).with_callback_parent(entry)))
-                        }));
-                        Ok(bmux_plugin::LifecycleCallbackDispatch {
-                            callback,
-                            host: Some(host),
-                            kernel: None,
-                        })
-                    }))?;
-                    let activation = execution
-                        .begin_command_activation(&context, self.registered.manifest.concurrency)?;
-                    if !matches!(
-                        Self::observe_sync(execution, activation)?,
-                        NativeOutcome::Unit
-                    ) {
-                        return Err(failure("unexpected command activation outcome"));
-                    }
-                    // observe_sync acknowledges the lifecycle operation before
-                    // command admission on this same scoped implementation.
-                    self.active
-                        .store(true, std::sync::atomic::Ordering::Release);
+                    self.activate_scoped_command(execution, &context, command_route)?;
                 }
                 let invocation = execution.begin_invocation_scope()?;
                 let dispatch = Arc::new(KernelServices {
@@ -801,10 +807,11 @@ impl ProductionPlugin {
                     authority: self.lifecycle_authority.get().cloned(),
                     services: context.services.clone(),
                     builtins: Arc::clone(&self.builtins),
-                    command_route: command_route.clone(),
+                    command_route: command_route.cloned(),
                 });
                 let cancellation = bmux_plugin_sdk::ServiceCancellation::new();
-                let callback_parent = command_route.as_ref().and_then(|route| route.parent());
+                let callback_parent =
+                    command_route.and_then(crate::runtime::plugin_kernel::CommandDispatch::parent);
                 let binding = if let Some(parent) = callback_parent {
                     execution.bind_child_callback(&parent, invocation.clone(), cancellation)?
                 } else {
@@ -839,7 +846,7 @@ impl ProductionPlugin {
                         outcome.exit_code,
                         PluginCommandOutcome {
                             error_message: outcome.error,
-                            metadata: BTreeMap::new(),
+                            metadata: outcome.metadata,
                         },
                     )),
                     _ => Err(failure("unexpected command outcome")),

@@ -3222,10 +3222,11 @@ mod tests {
 
     #[test]
     fn selected_theme_checkpoint_fixture_preserves_coordinator_authority() {
-        use bmux_plugin_sdk::definition::{PluginCallContext, PluginInstance, RustPluginAdapter};
-        let decoration = Arc::new(RustPluginAdapter::new(
-            bmux_decoration_plugin::DecorationPlugin::new(),
-        ));
+        // Drive the decoration provider's own service boundary directly: this
+        // fixture covers coordinator (caller plugin) authority. Selected callback
+        // execution authority is covered by the SDK adapter and loader tests;
+        // an unbound adapter with no admitted invocation scope must refuse calls.
+        let decoration = Arc::new(bmux_decoration_plugin::DecorationPlugin::new());
         let selected = decoration.clone();
         let port = bmux_plugin_sdk::PluginHostServices::new(
             // Host callback ABI fixes PluginError by value.
@@ -3240,19 +3241,8 @@ mod tests {
                 context.request.service.kind = request.kind;
                 context.request.operation = request.operation.into();
                 context.request.payload = request.payload.to_vec();
-                let response = bmux_plugin::block_on_typed_dispatch(selected.invoke(
-                    PluginCallContext {
-                        invocation_id: context.cancellation.invocation_id.clone(),
-                        cancellation: bmux_plugin_sdk::ServiceCancellation::new(),
-                        host_services: None,
-                    },
-                    context,
-                ))
-                .map_err(|error| {
-                    bmux_plugin_sdk::PluginError::ServiceProtocol {
-                        details: error.message,
-                    }
-                })?;
+                let response = invoke_decoration_checked(&selected, context)
+                    .map_err(|details| bmux_plugin_sdk::PluginError::ServiceProtocol { details })?;
                 if let Some(error) = response.error {
                     return Err(bmux_plugin_sdk::PluginError::ServiceProtocol {
                         details: error.message,
@@ -3278,16 +3268,43 @@ mod tests {
             &encode_service_message(&()).unwrap(),
         )
         .unwrap();
-        let response = bmux_plugin::block_on_typed_dispatch(decoration.invoke(
-            PluginCallContext {
-                invocation_id: foreign.cancellation.invocation_id.clone(),
-                cancellation: bmux_plugin_sdk::ServiceCancellation::new(),
-                host_services: None,
-            },
-            foreign,
-        ))
-        .unwrap();
+        let response = invoke_decoration_checked(&decoration, foreign).unwrap();
         assert_eq!(response.error.unwrap().code, "checkpoint_owner_required");
+    }
+
+    /// Apply the provider's checked BPDL contract boundary, then dispatch to the
+    /// decoration provider with the caller identity carried in `context`.
+    fn invoke_decoration_checked(
+        plugin: &bmux_decoration_plugin::DecorationPlugin,
+        mut context: NativeServiceContext,
+    ) -> Result<ServiceResponse, String> {
+        use bmux_plugin_sdk::{PluginContract, service_contract};
+        let checked = service_contract::is_checked(&context.request.payload);
+        if checked {
+            let interface = service_contract::interface_id_for(
+                &context.request.service.interface_id,
+                &context.request.payload,
+            )
+            .map_err(|error| error.to_string())?
+            .to_owned();
+            let evidence =
+                <bmux_decoration_plugin_api::Contract as PluginContract>::service_contract_for(
+                    &interface,
+                )
+                .ok_or_else(|| format!("decoration has no checked contract for {interface}"))?;
+            context.request.payload = service_contract::decode_for(
+                &context.request.service.interface_id,
+                evidence,
+                &context.request.payload,
+            )
+            .map_err(|error| error.to_string())?
+            .to_vec();
+        }
+        let mut response = RustPlugin::invoke_service(plugin, context);
+        if checked && response.error.is_none() {
+            response.payload = service_contract::encode_response(&response.payload);
+        }
+        Ok(response)
     }
 
     fn picker_context() -> NativeCommandContext {

@@ -37,30 +37,34 @@ impl bmux_plugin_sdk::PluginInstance for ExamplePlugin {
         context: NativeCommandContext,
     ) -> bmux_plugin_sdk::PluginFuture<'_, bmux_plugin_sdk::CommandOutcome> {
         Box::pin(async move {
-            bmux_plugin_sdk::route_command!(context, {
-                "permissions-list" => Ok(run_permissions_list(&context)),
-                "permissions-grant" => Ok(run_permissions_grant(&context)),
-                "permissions-revoke" => Ok(run_permissions_revoke(&context)),
-                "tabs-list" => Ok(run_windows_list(&context)),
-                "windows-new" => Ok(run_windows_new(&context)),
-                "settings-show" => Ok(run_settings_show(&context)),
-                "storage-put" => Ok(run_storage_put(&context)),
-                "storage-get" => Ok(run_storage_get(&context)),
-                "prompt-showcase" => Ok(run_prompt_showcase_command()),
-                "status-set" => Ok(tab_bar::run_status_set(&context)),
-                "status-clear" => Ok(tab_bar::run_status_clear(&context)),
-                "status-list" => Ok(tab_bar::run_status_list(&context)),
-                "notify" => Ok(tab_bar::run_notify(&context)),
-                "hello" => {
-                    if context.arguments.is_empty() {
-                        println!("example.native: hello from bmux plugin");
-                    } else {
-                        println!("example.native: hello {}", context.arguments.join(" "));
-                    }
-                    Ok(EXIT_OK)
-                },
+            // The synchronous command body runs inside one capture, so status
+            // metadata it records returns as part of the outcome value on
+            // both static and dynamic packaging (no exported outcome slot).
+            bmux_plugin_sdk::CommandOutcome::capture(|| {
+                bmux_plugin_sdk::route_command!(context, {
+                    "permissions-list" => Ok(run_permissions_list(&context)),
+                    "permissions-grant" => Ok(run_permissions_grant(&context)),
+                    "permissions-revoke" => Ok(run_permissions_revoke(&context)),
+                    "tabs-list" => Ok(run_windows_list(&context)),
+                    "windows-new" => Ok(run_windows_new(&context)),
+                    "settings-show" => Ok(run_settings_show(&context)),
+                    "storage-put" => Ok(run_storage_put(&context)),
+                    "storage-get" => Ok(run_storage_get(&context)),
+                    "prompt-showcase" => Ok(run_prompt_showcase_command()),
+                    "status-set" => Ok(tab_bar::run_status_set(&context)),
+                    "status-clear" => Ok(tab_bar::run_status_clear(&context)),
+                    "status-list" => Ok(tab_bar::run_status_list(&context)),
+                    "notify" => Ok(tab_bar::run_notify(&context)),
+                    "hello" => {
+                        if context.arguments.is_empty() {
+                            println!("example.native: hello from bmux plugin");
+                        } else {
+                            println!("example.native: hello {}", context.arguments.join(" "));
+                        }
+                        Ok(EXIT_OK)
+                    },
+                })
             })
-            .into()
         })
     }
 
@@ -70,7 +74,13 @@ impl bmux_plugin_sdk::PluginInstance for ExamplePlugin {
     ) -> bmux_plugin_sdk::PluginFuture<'_, bmux_plugin_sdk::PluginResult<()>> {
         Box::pin(async move {
             println!("example.native: activated {}", context.native.plugin_id);
-            tab_bar::start_background_status(&context.native);
+            // Hand the activation's own host services to background work
+            // explicitly. They mint a fresh invocation per call and fail
+            // closed once deactivation begins; nothing is ambient.
+            tab_bar::start_background_status(
+                &context.native,
+                context.native.host_service_port.clone(),
+            );
             Ok(())
         })
     }
@@ -81,7 +91,6 @@ impl bmux_plugin_sdk::PluginInstance for ExamplePlugin {
     ) -> bmux_plugin_sdk::PluginFuture<'_, bmux_plugin_sdk::PluginResult<()>> {
         Box::pin(async move {
             tab_bar::stop_background_status();
-            tab_bar::clear_on_deactivate(&context.native);
             println!("example.native: deactivated {}", context.native.plugin_id);
             Ok(())
         })

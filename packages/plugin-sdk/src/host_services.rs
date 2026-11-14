@@ -338,15 +338,33 @@ pub fn begin_command_outcome_capture() {
     });
 }
 
-/// Whether a command outcome capture is active on the current thread.
+/// Run `body` with a fresh capture active on this thread and return its
+/// result with the metadata it recorded. Restores any enclosing capture.
 ///
-/// Statically bundled plugins share the host's capture slot; a dynamically
-/// loaded plugin links its own SDK copy and sees no active capture, so its
-/// export wrapper captures locally and hands the outcome back across the ABI.
-#[doc(hidden)]
-#[must_use]
-pub fn command_outcome_capture_active() -> bool {
-    COMMAND_OUTCOME_CAPTURE.with(|slot| slot.borrow().is_some())
+/// This is the plugin-side half of the explicit command outcome path: the
+/// captured map becomes part of [`crate::definition::CommandOutcome`], which
+/// the shared ABI returns as data.
+pub fn capture_command_outcome_metadata<T>(
+    body: impl FnOnce() -> T,
+) -> (T, BTreeMap<String, Value>) {
+    struct Restore(Option<PluginCommandOutcome>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let previous = self.0.take();
+            COMMAND_OUTCOME_CAPTURE.with(|slot| *slot.borrow_mut() = previous);
+        }
+    }
+    let restore = Restore(
+        COMMAND_OUTCOME_CAPTURE
+            .with(|slot| slot.borrow_mut().replace(PluginCommandOutcome::default())),
+    );
+    let result = body();
+    let metadata = COMMAND_OUTCOME_CAPTURE
+        .with(|slot| slot.borrow_mut().take())
+        .unwrap_or_default()
+        .metadata;
+    drop(restore);
+    (result, metadata)
 }
 
 #[doc(hidden)]

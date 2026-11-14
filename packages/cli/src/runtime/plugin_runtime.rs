@@ -24,10 +24,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, instrument, warn};
 
-use super::plugin_kernel::{
-    begin_plugin_activation_scope, bind_plugin_command_call, bind_plugin_lifecycle_call,
-    end_plugin_activation_scope, install_plugin_identity_hooks,
-};
 use super::{
     KernelClientFactory, available_capability_providers, available_service_descriptors,
     connect_raw, core_provided_capabilities, enter_host_kernel_client_factory,
@@ -895,7 +891,6 @@ pub(super) fn build_runtime_command_state(
         registered_plugin_infos,
     };
     mark_runtime_command_state_remote(&state);
-    install_plugin_identity_hooks();
     Ok(state)
 }
 
@@ -1988,7 +1983,6 @@ pub(super) async fn activate_loaded_plugins(
     // typed service observe a stable registry across the lifetime of
     // the attach session.
     // Collect typed adapters only after their owning activation is active.
-    install_plugin_identity_hooks();
 
     let mut activated: Vec<&ProductionPlugin> = Vec::new();
     let connection_info = HostConnectionInfo {
@@ -2030,7 +2024,7 @@ pub(super) async fn activate_loaded_plugins(
         }
 
         let activate_started = Instant::now();
-        let mut context = plugin_lifecycle_context(
+        let context = plugin_lifecycle_context(
             config,
             paths,
             &plugin.declaration,
@@ -2042,13 +2036,6 @@ pub(super) async fn activate_loaded_plugins(
                 registered_plugins: registered_plugins.clone(),
             },
         );
-        // A relaying dynamic plugin's host authority for this activation: the
-        // context and any clone the plugin keeps act as this plugin until
-        // deactivation. Bundled plugins are host code and keep the legacy
-        // host bridge.
-        if plugin.uses_host_relay() {
-            begin_plugin_activation_scope(&mut context)?;
-        }
         let activation_connection_guard = enter_host_kernel_connection(connection_info.clone());
         // `map_or_else` trips `result_large_err` here because plugin activation
         // returns the repository-wide `PluginError`; the explicit match keeps the
@@ -2065,7 +2052,6 @@ pub(super) async fn activate_loaded_plugins(
         );
         drop(activation_connection_guard);
         if let Err(error) = activate_result {
-            end_plugin_activation_scope(plugin.declaration.id.as_str());
             plugin.cancel_background_tasks()?;
             for activated_plugin in &activated {
                 activated_plugin.cancel_background_tasks()?;
@@ -2079,11 +2065,6 @@ pub(super) async fn activate_loaded_plugins(
                 activated_plugin.drain_background_tasks().await?;
             }
             {
-                let mut context = context;
-                let _deactivation = plugin
-                    .uses_host_relay()
-                    .then(|| bind_plugin_lifecycle_call(&mut context))
-                    .transpose()?;
                 let _connection = enter_host_kernel_connection(connection_info.clone());
                 if let Err(cleanup) = plugin.deactivate_async(&context).await {
                     return Err(anyhow::anyhow!(
@@ -2101,7 +2082,7 @@ pub(super) async fn activate_loaded_plugins(
                     .finish(),
             );
             for activated_plugin in activated.into_iter().rev() {
-                let mut context = plugin_lifecycle_context(
+                let context = plugin_lifecycle_context(
                     config,
                     paths,
                     &activated_plugin.declaration,
@@ -2114,11 +2095,6 @@ pub(super) async fn activate_loaded_plugins(
                     },
                 );
                 activated_plugin.drain_background_tasks().await?;
-                end_plugin_activation_scope(activated_plugin.declaration.id.as_str());
-                let _deactivation = activated_plugin
-                    .uses_host_relay()
-                    .then(|| bind_plugin_lifecycle_call(&mut context))
-                    .transpose()?;
                 let _host_kernel_connection_guard =
                     enter_host_kernel_connection(connection_info.clone());
                 let deactivate_result = activated_plugin.deactivate_async(&context).await;
@@ -2237,7 +2213,7 @@ pub(super) async fn deactivate_loaded_plugins(
             continue;
         }
 
-        let mut context = plugin_lifecycle_context(
+        let context = plugin_lifecycle_context(
             config,
             paths,
             &plugin.declaration,
@@ -2250,18 +2226,8 @@ pub(super) async fn deactivate_loaded_plugins(
             },
         );
         plugin.drain_background_tasks().await?;
-        // Deactivation revokes the activation scope first: anything the
-        // plugin kept from activation (background threads included) fails
-        // closed from here. `deactivate` itself gets a scope that ends when
-        // it returns, so it can still clean up.
-        end_plugin_activation_scope(plugin.declaration.id.as_str());
-        let deactivation_scope = plugin
-            .uses_host_relay()
-            .then(|| bind_plugin_lifecycle_call(&mut context))
-            .transpose()?;
         let _host_kernel_connection_guard = enter_host_kernel_connection(connection_info.clone());
         let deactivate_result = plugin.deactivate_async(&context).await;
-        drop(deactivation_scope);
         bmux_plugin::layout::global_plugin_layout_registry()
             .remove_owner(plugin.declaration.id.as_str());
         bmux_plugin::surface::global_plugin_surface_registry()
@@ -2538,7 +2504,8 @@ async fn run_command_on_selected_target(
                             }
                         }
                         if let Some(connection) = client.as_mut() {
-                            let result = connection.request_raw(request.request.clone()).await;
+                            let wire = request.wire_request(connection.negotiated_protocol());
+                            let result = connection.request_raw(wire).await;
                             if let Err(error) = &result {
                                 connection_failure = Some(format!("selected command transport failed; no reconnect: {error}"));
                             }
@@ -2832,23 +2799,10 @@ fn run_plugin_command_internal_with_state(
     let lookup_us = lookup_started.elapsed().as_micros();
 
     let load_started = Instant::now();
-    // A command-local activation must never cache a prior command's transport
-    // capability. Server-owned legacy callers retain their startup cache path.
-    let loaded = if command_dispatch.is_some() {
-        let definitions = standalone_provider_definitions(state);
-        Rc::new(load_plugin_with_definitions(
-            plugin,
-            &plugin_host_metadata(),
-            &state.available_capability_providers,
-            config,
-            &definitions,
-        )?)
-    } else {
-        load_cached_plugin(plugin, state)?
-    };
+    let loaded = load_command_plugin(plugin, state, command_dispatch.is_some())?;
     let load_us = load_started.elapsed().as_micros();
     let context_started = Instant::now();
-    let mut context = plugin_command_context(
+    let context = plugin_command_context(
         config,
         paths,
         &plugin.declaration,
@@ -2863,13 +2817,6 @@ fn run_plugin_command_internal_with_state(
         caller_client_id,
         invocation_source,
     );
-    // A relaying dynamic plugin's host authority for this command ends when
-    // the invocation returns. Bundled plugins keep the legacy host bridge,
-    // which their work may outlive the command with (for example overlays).
-    let _command_scope = loaded
-        .uses_host_relay()
-        .then(|| bind_plugin_command_call(&mut context))
-        .transpose()?;
     let context_us = context_started.elapsed().as_micros();
     let _host_kernel_connection_guard = enter_host_kernel_connection(context.connection.clone());
     let _host_kernel_factory_guard =
@@ -2877,25 +2824,17 @@ fn run_plugin_command_internal_with_state(
     let _async_route = bind_captured_command_route(&context)?;
     let run_started = Instant::now();
     let command_local = command_dispatch.is_some();
-    let run_result =
-        loaded.run_command_with_dispatch(command_name, args, Some(&context), command_dispatch);
+    let run_result = loaded.run_command_with_dispatch(
+        command_name,
+        args,
+        Some(&context),
+        command_dispatch.as_ref(),
+    );
+    // The issuing route (and its callback parent lease) ends with the command
+    // invocation; deactivation below binds its own lifecycle route.
+    drop(command_dispatch);
     if command_local && run_result.is_ok() {
-        let lifecycle = plugin_lifecycle_context(
-            config,
-            paths,
-            &plugin.declaration,
-            PluginLifecycleAvailability {
-                services: state.available_services.clone(),
-                capabilities: state.available_capability_names.clone(),
-                enabled_plugins: state.enabled_plugins.clone(),
-                search_roots: state.plugin_search_roots.clone(),
-                registered_plugins: state.registered_plugin_infos.clone(),
-            },
-        );
-        // On this blocking command worker the connection owner remains pumping.
-        // Never destroy an uncertain/error operation or substitute timeout for
-        // settlement. Successful terminal work retires its fresh instance.
-        settle_command_cleanup(loaded.deactivate_async(&lifecycle))?;
+        retire_command_local_plugin(state, plugin, &loaded)?;
     }
     let run_us = run_started.elapsed().as_micros();
     let (status, outcome) = run_result.map_err(|error| {
@@ -2925,6 +2864,54 @@ fn run_plugin_command_internal_with_state(
         total_started.elapsed().as_micros(),
     );
     Ok(PluginCommandExecution { status, outcome })
+}
+
+/// Load the plugin implementation for one command. A command-local activation
+/// must never cache a prior command's transport capability, so selected
+/// command routes always load a fresh instance; server-owned legacy callers
+/// retain their startup cache path.
+fn load_command_plugin(
+    plugin: &bmux_plugin::RegisteredPlugin,
+    state: &RuntimeCommandState,
+    command_local: bool,
+) -> Result<Rc<ProductionPlugin>> {
+    if command_local {
+        let definitions = standalone_provider_definitions(state);
+        Ok(Rc::new(load_plugin_with_definitions(
+            plugin,
+            &plugin_host_metadata(),
+            &state.available_capability_providers,
+            &state.config,
+            &definitions,
+        )?))
+    } else {
+        load_cached_plugin(plugin, state)
+    }
+}
+
+/// Retire a fresh command-local instance after its command succeeded.
+fn retire_command_local_plugin(
+    state: &RuntimeCommandState,
+    plugin: &bmux_plugin::RegisteredPlugin,
+    loaded: &ProductionPlugin,
+) -> Result<()> {
+    let lifecycle = plugin_lifecycle_context(
+        &state.config,
+        &state.paths,
+        &plugin.declaration,
+        PluginLifecycleAvailability {
+            services: state.available_services.clone(),
+            capabilities: state.available_capability_names.clone(),
+            enabled_plugins: state.enabled_plugins.clone(),
+            search_roots: state.plugin_search_roots.clone(),
+            registered_plugins: state.registered_plugin_infos.clone(),
+        },
+    );
+    // On this blocking command worker the connection owner remains pumping.
+    // Never destroy an uncertain/error operation or substitute timeout for
+    // settlement. Successful terminal work retires its fresh instance.
+    settle_command_cleanup(loaded.deactivate_async(&lifecycle))?;
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3763,6 +3750,7 @@ enabled_by_default = false
                     CommandOutcome {
                         exit_code: 23,
                         error: None,
+                        metadata: std::collections::BTreeMap::new(),
                     }
                 })
             }

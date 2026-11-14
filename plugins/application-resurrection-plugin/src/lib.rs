@@ -306,6 +306,7 @@ mod lifecycle_tests {
         };
         let plugin = ApplicationResurrectionPlugin::default();
         let call = PluginCallContext {
+            callback_execution: None,
             invocation_id: bmux_plugin_sdk::PluginInvocationId::new(),
             cancellation: bmux_plugin_sdk::ServiceCancellation::new(),
             host_services: None,

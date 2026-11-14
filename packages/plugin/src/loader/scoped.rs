@@ -3000,7 +3000,9 @@ fn outcome_is_bounded(outcome: &NativeOutcome) -> bool {
         }
         NativeOutcome::Unit => 0,
         NativeOutcome::Bytes(bytes) => bytes.len(),
-        NativeOutcome::Command(outcome) => outcome.error.as_ref().map_or(0, String::len),
+        NativeOutcome::Command(outcome) => {
+            serde_json::to_vec(outcome).map_or(usize::MAX, |bytes| bytes.len())
+        }
         NativeOutcome::Error { message, .. } => message.len(),
         NativeOutcome::Service(response) => {
             response

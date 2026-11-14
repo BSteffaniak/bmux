@@ -1,11 +1,13 @@
-//! Real `cdylib` plugin against a real, fully sandboxed bmux server.
+//! Real dynamically packaged plugin against a real, fully sandboxed server.
 //!
-//! Builds `examples/native-plugin` as a dynamic library, loads it into an
-//! isolated server, and checks that its tab-bar service calls are relayed by
-//! the host and attributed to `example.native` (never `bmux.core`): from CLI
-//! commands, from `activate`, and from a background thread holding the
-//! activation context. Also checks that the activation context stops working
-//! once deactivation begins and that calls fail once the server is gone.
+//! Packages the export-free `examples/native-plugin` implementation through
+//! the shared generator (`scripts/package-plugin.py`) into a thin `cdylib`
+//! wrapper, loads it into an isolated server through the shared v2 ABI, and
+//! checks that its tab-bar service calls are attributed to `example.native`
+//! (never `bmux.core`): from CLI commands, from `activate`, and from a
+//! background thread that was handed the activation's host services. Also
+//! checks that those activation services fail closed once deactivation
+//! begins and that calls fail once the server is gone.
 #![cfg(unix)]
 #[allow(dead_code)] // Reuse isolated paths and binary selection only.
 mod support;
@@ -19,11 +21,6 @@ const READY_TIMEOUT: Duration = Duration::from_secs(30);
 const STOP_TIMEOUT: Duration = Duration::from_secs(20);
 const POLL: Duration = Duration::from_millis(100);
 
-#[cfg(target_os = "macos")]
-const LIBRARY: &str = "libbmux_example_native_plugin.dylib";
-#[cfg(not(target_os = "macos"))]
-const LIBRARY: &str = "libbmux_example_native_plugin.so";
-
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .ancestors()
@@ -32,29 +29,110 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
-/// Build the example as a cdylib into the same target directory and profile
-/// as the `bmux` binary under test, and return the library path.
+/// Generate the thin dynamic wrapper for the example with the shared
+/// packaging generator, build it into the same target directory and profile
+/// as the `bmux` binary under test, and return the library Cargo reported.
+///
+/// The implementation crate stays an export-free rlib; only the generated
+/// wrapper is a `cdylib`. The wrapper reuses the workspace lockfile so it
+/// links exactly the dependency versions the host was built with.
 fn build_example_cdylib() -> PathBuf {
+    let root = workspace_root();
     let profile_dir = support::bmux_binary()
         .parent()
         .expect("bmux binary directory")
         .to_path_buf();
     let target_dir = profile_dir.parent().expect("cargo target directory");
+    let release = profile_dir
+        .file_name()
+        .is_some_and(|name| name == "release");
+    let wrapper = target_dir.join("plugin-packaging/native-plugin-identity/backend");
+    // Regenerate from scratch: the generator refuses to overwrite a
+    // directory it does not own, and stale sources must never be reused.
+    if wrapper.exists() {
+        std::fs::remove_dir_all(&wrapper).expect("remove previous generated wrapper");
+    }
+    let generate = Command::new("python3")
+        .current_dir(&root)
+        .arg("-B")
+        .arg("scripts/package-plugin.py")
+        .args([
+            "--implementation-manifest",
+            "examples/native-plugin/Cargo.toml",
+            "--sdk-manifest",
+            "packages/plugin-sdk/Cargo.toml",
+            "--component",
+            "backend",
+            "--artifact-id",
+            "native-plugin-identity-test",
+            "--output",
+        ])
+        .arg(&wrapper)
+        .output()
+        .expect("run shared plugin packaging generator (python3 3.11+ required)");
+    support::assert_success(&generate, "generate example dynamic wrapper");
+    std::fs::copy(root.join("Cargo.lock"), wrapper.join("Cargo.lock"))
+        .expect("pin wrapper to the workspace lockfile");
+    let wrapper_package = serde_json::from_str::<serde_json::Value>(
+        &std::fs::read_to_string(wrapper.join("packaging.json")).expect("read packaging.json"),
+    )
+    .expect("parse packaging.json")["wrapper_package"]
+        .as_str()
+        .expect("wrapper package name")
+        .to_owned();
+
     let mut build = Command::new(env!("CARGO"));
     build
-        .current_dir(workspace_root())
-        .args(["build", "-p", "bmux_example_native_plugin", "--lib"])
+        .current_dir(&root)
+        .args([
+            "build",
+            "--message-format=json-render-diagnostics",
+            "--manifest-path",
+        ])
+        .arg(wrapper.join("Cargo.toml"))
         .arg("--target-dir")
-        .arg(target_dir);
-    if profile_dir
-        .file_name()
-        .is_some_and(|name| name == "release")
-    {
+        .arg(target_dir)
+        .stderr(Stdio::inherit());
+    if release {
         build.arg("--release");
     }
-    let output = build.output().expect("run cargo build for example plugin");
-    support::assert_success(&output, "build example cdylib");
-    let library = profile_dir.join(LIBRARY);
+    let output = build.output().expect("run cargo build for example wrapper");
+    assert!(
+        output.status.success(),
+        "build example dynamic wrapper failed: {}",
+        output.status
+    );
+    // Cargo reports the emitted library; never guess a platform file name.
+    let libraries = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|message| {
+            message["reason"] == "compiler-artifact"
+                && message["target"]["name"] == wrapper_package.as_str()
+                && message["target"]["crate_types"]
+                    .as_array()
+                    .is_some_and(|types| types.iter().any(|kind| kind == "cdylib"))
+        })
+        .flat_map(|message| {
+            message["filenames"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|name| name.as_str().map(PathBuf::from))
+                .collect::<Vec<_>>()
+        })
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "dylib" || extension == "so")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        libraries.len(),
+        1,
+        "expected one wrapper library: {libraries:?}"
+    );
+    let library = libraries.into_iter().next().expect("wrapper library");
     assert!(library.is_file(), "missing {}", library.display());
     library
 }
@@ -236,7 +314,7 @@ impl Drop for Sandbox {
 }
 
 #[test]
-fn cdylib_plugin_service_calls_are_relayed_and_attributed_to_the_plugin() {
+fn native_plugin_identity_dynamic_service_calls_are_attributed_to_the_plugin() {
     let library = build_example_cdylib();
     let mut sandbox = Sandbox::new(&library);
     sandbox.start();
@@ -291,7 +369,7 @@ fn cdylib_plugin_service_calls_are_relayed_and_attributed_to_the_plugin() {
         );
     }
 
-    // No server: the host has nowhere to relay to.
+    // No server: the command's selected connection is gone; never a fallback.
     let late = sandbox.plugin(&["status-set", "late", "after stop"]);
     assert!(
         !late.status.success(),

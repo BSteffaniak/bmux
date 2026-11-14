@@ -262,6 +262,7 @@ mod tests {
         let result = plugin
             .command(
                 PluginCallContext {
+                    callback_execution: None,
                     invocation_id: bmux_plugin_sdk::PluginInvocationId::new(),
                     cancellation: bmux_plugin_sdk::ServiceCancellation::new(),
                     host_services: None,

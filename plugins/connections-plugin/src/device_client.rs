@@ -854,65 +854,12 @@ mod tests {
         paths: &bmux_config::ConfigPaths,
         pairing: &Arc<PairingAuthority>,
     ) {
-        use bmux_plugin_sdk::{PluginContract, RustPlugin};
+        use bmux_plugin_sdk::RustPlugin;
         let storage = Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::<
             String,
             Vec<u8>,
         >::new()));
-        for (interface, operation, capability, kind, contract) in [
-            (
-                "permissions-commands",
-                "grant-resource",
-                "bmux.permissions.write",
-                InvokeServiceKind::Command,
-                bmux_permissions_plugin_api::permissions_commands::SERVICE_CONTRACT,
-            ),
-            (
-                "permissions-commands",
-                "revoke-resource",
-                "bmux.permissions.write",
-                InvokeServiceKind::Command,
-                bmux_permissions_plugin_api::permissions_commands::SERVICE_CONTRACT,
-            ),
-            (
-                "session-policy-state",
-                "check",
-                "bmux.sessions.policy",
-                InvokeServiceKind::Query,
-                bmux_permissions_plugin_api::session_policy_state::SERVICE_CONTRACT,
-            ),
-            (
-                "pane-runtime-spawn-v1",
-                "home-directory",
-                "bmux.pane_runtime.spawn.v1",
-                InvokeServiceKind::Query,
-                bmux_pane_runtime_plugin_api::Contract::service_contract_for(
-                    "pane-runtime-spawn-v1",
-                )
-                .unwrap(),
-            ),
-            (
-                "pane-runtime-execution-v4",
-                "new-program-session",
-                "bmux.pane_runtime.execution.v4",
-                InvokeServiceKind::Command,
-                bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::SERVICE_CONTRACT,
-            ),
-            (
-                "pane-runtime-execution-v4",
-                "send",
-                "bmux.pane_runtime.execution.v4",
-                InvokeServiceKind::Command,
-                bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::SERVICE_CONTRACT,
-            ),
-            (
-                "pane-runtime-execution-v4",
-                "terminate",
-                "bmux.pane_runtime.execution.v4",
-                InvokeServiceKind::Command,
-                bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::SERVICE_CONTRACT,
-            ),
-        ] {
+        for (interface, operation, capability, kind, contract) in resource_fixture_routes() {
             let paths = paths.clone();
             let pairing = Arc::clone(pairing);
             let storage = Arc::clone(&storage);
@@ -975,6 +922,75 @@ mod tests {
                 )
                 .unwrap();
         }
+    }
+
+    type ResourceFixtureRoute = (
+        &'static str,
+        &'static str,
+        &'static str,
+        InvokeServiceKind,
+        &'static [u8],
+    );
+
+    /// Checked service routes (interface, operation, capability, kind,
+    /// wire contract) served by the real permissions and pane-runtime
+    /// handlers in the resource fixture.
+    fn resource_fixture_routes() -> [ResourceFixtureRoute; 7] {
+        use bmux_plugin_sdk::PluginContract;
+        [
+            (
+                "permissions-commands",
+                "grant-resource",
+                "bmux.permissions.write",
+                InvokeServiceKind::Command,
+                bmux_permissions_plugin_api::permissions_commands::SERVICE_CONTRACT,
+            ),
+            (
+                "permissions-commands",
+                "revoke-resource",
+                "bmux.permissions.write",
+                InvokeServiceKind::Command,
+                bmux_permissions_plugin_api::permissions_commands::SERVICE_CONTRACT,
+            ),
+            (
+                "session-policy-state",
+                "check",
+                "bmux.sessions.policy",
+                InvokeServiceKind::Query,
+                bmux_permissions_plugin_api::session_policy_state::SERVICE_CONTRACT,
+            ),
+            (
+                "pane-runtime-spawn-v1",
+                "home-directory",
+                "bmux.pane_runtime.spawn.v1",
+                InvokeServiceKind::Query,
+                bmux_pane_runtime_plugin_api::Contract::service_contract_for(
+                    "pane-runtime-spawn-v1",
+                )
+                .unwrap(),
+            ),
+            (
+                "pane-runtime-execution-v4",
+                "new-program-session",
+                "bmux.pane_runtime.execution.v4",
+                InvokeServiceKind::Command,
+                bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::SERVICE_CONTRACT,
+            ),
+            (
+                "pane-runtime-execution-v4",
+                "send",
+                "bmux.pane_runtime.execution.v4",
+                InvokeServiceKind::Command,
+                bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::SERVICE_CONTRACT,
+            ),
+            (
+                "pane-runtime-execution-v4",
+                "terminate",
+                "bmux.pane_runtime.execution.v4",
+                InvokeServiceKind::Command,
+                bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::SERVICE_CONTRACT,
+            ),
+        ]
     }
 
     fn fixture_selected_port(

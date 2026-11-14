@@ -137,15 +137,16 @@ Semantics:
 
 - Items are namespaced by the caller plugin id the host authenticated
   (`ServiceRequest::caller_plugin_id`), so plugins cannot replace, clear, or
-  dismiss each other's entries. The host derives the id from the bound context
-  it gave the calling plugin, never from the request, and keeps it when it
-  relays a dynamic plugin's call in-process or over IPC. Only calls the host
-  originates itself (for example the CLI) are owned by `bmux.core`. See
-  [Calling services from dynamic plugins](../../docs/plugins.md#calling-services-from-dynamic-plugins).
-- Use the context the host handed you: the `activate` context (and clones of
-  it, for example in a background thread) works until deactivation begins,
-  `deactivate`'s context works for that call, and a command's context works
-  for that command. Calls through an expired context fail.
+  dismiss each other's entries. The host derives the id from the plugin
+  declaration bound to the admitted invocation or activation scope, never from
+  the request, and keeps it whether the call is dispatched in-process or over
+  IPC. Only calls the host originates itself (for example the CLI) are owned by
+  `bmux.core`. See
+  [Calling services from plugins](../../docs/plugins.md#calling-services-from-plugins).
+- Use the host services bound to your scope: the activation's services (which
+  a plugin may hand to a background thread) work until deactivation begins,
+  `deactivate`'s work for that call, and a command's work for that command.
+  Calls through expired services fail.
 - Limits: 8 items per plugin, 64 total (`limit-exceeded` beyond that); ids are
   1..=64 bytes; text is trimmed, control characters become spaces, and text is
   truncated to 64 graphemes (tooltips 256). Toast titles are truncated to 80

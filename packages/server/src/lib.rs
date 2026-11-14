@@ -584,7 +584,10 @@ impl ServiceInvokeContext {
         Ok(SelectedServiceAvailability::Absent)
     }
 
-    async fn execute_request(&self, request: Request) -> Result<Response> {
+    /// Answer stream-metadata kernel requests (admission backend and
+    /// current stream provenance) that never reach service dispatch.
+    /// `None` when the request is not a stream-metadata request.
+    fn execute_stream_metadata_request(&self, request: &Request) -> Result<Option<Response>> {
         if matches!(request, Request::StreamAdmissionBackend) {
             let backend = self
                 .state
@@ -594,20 +597,29 @@ impl ServiceInvokeContext {
                 .clone();
             let authority_id = backend
                 .and_then(|backend| backend.probe().ok().filter(|id| *id == backend.instance));
-            return Ok(Response::Ok(ResponsePayload::StreamAdmissionBackend {
-                authority_id,
-            }));
+            return Ok(Some(Response::Ok(
+                ResponsePayload::StreamAdmissionBackend { authority_id },
+            )));
         }
         if matches!(request, Request::CurrentStreamProvenance) {
             if self.host_internal {
-                return Ok(Response::Ok(ResponsePayload::CurrentStreamProvenance {
-                    provenance: bmux_ipc::StreamProvenance::HostInternal,
-                }));
+                return Ok(Some(Response::Ok(
+                    ResponsePayload::CurrentStreamProvenance {
+                        provenance: bmux_ipc::StreamProvenance::HostInternal,
+                    },
+                )));
             }
-            return Ok(current_stream_provenance(
+            return Ok(Some(current_stream_provenance(
                 &self.state.stream_provenance,
                 self.client_id.0,
-            ));
+            )));
+        }
+        Ok(None)
+    }
+
+    async fn execute_request(&self, request: Request) -> Result<Response> {
+        if let Some(response) = self.execute_stream_metadata_request(&request)? {
+            return Ok(response);
         }
         if self.host_dispatch_context.is_some()
             && let Request::InvokeService {
@@ -4979,9 +4991,7 @@ mod tests {
             .host_service_context()
             .with_host_dispatch_context(Arc::new(Marker(41)));
         assert!(context.host_dispatch_context::<String>().is_err());
-        let moved = tokio::task::spawn_blocking(move || context.clone())
-            .await
-            .unwrap();
+        let moved = tokio::task::spawn_blocking(move || context).await.unwrap();
         tokio::task::yield_now().await;
         assert_eq!(
             moved.host_dispatch_context::<Marker>().unwrap().unwrap().0,
@@ -5213,6 +5223,7 @@ mod tests {
             client_id: local_id,
             client_principal_id: Uuid::new_v4(),
             caller_plugin_id: None,
+            host_dispatch_context: None,
         };
         let raw = encode(&plain).unwrap();
         for (context, expected) in [

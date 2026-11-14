@@ -1,13 +1,14 @@
-//! Cross-dylib use of the tab-bar plugin's typed services.
+//! Cross-plugin use of the tab-bar plugin's typed services.
 //!
-//! This example is built as a `cdylib`, so it links its own copy of the bmux
-//! plugin crates and cannot touch the host's in-process registries. It
-//! reaches the tab bar only through the BPDL-generated clients in
-//! `bmux_tab_bar_plugin_api`, which serialize each call over the plugin
-//! service boundary. The tab-bar plugin namespaces every item by this
-//! plugin's id (`example.native`), so ids here never clobber other plugins.
+//! The same implementation is linked statically or packaged as a thin
+//! dynamic wrapper. Either way it reaches the tab bar only through the
+//! BPDL-generated clients in `bmux_tab_bar_plugin_api`, dispatched through
+//! the host services the host bound to the current invocation or
+//! activation. The host attributes every call to the plugin that owns the
+//! admitted scope, and the tab-bar plugin namespaces items by that id
+//! (`example.native`), so ids here never clobber other plugins.
 
-use bmux_plugin::{ServiceCallerDispatchClient, block_on_typed_dispatch};
+use bmux_plugin::{ServiceCaller, ServiceCallerDispatchClient, block_on_typed_dispatch};
 use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::{
     COMMAND_OUTCOME_STATUS_MESSAGE_KEY, EXIT_USAGE, record_command_outcome_metadata,
@@ -31,7 +32,8 @@ fn parse_severity(value: &str) -> Option<Severity> {
 }
 
 /// Report a short status line to the attach UI when this command was run
-/// from a keybinding. The host carries it back across the dylib boundary.
+/// from a keybinding. It travels back as part of the returned command
+/// outcome (see `CommandOutcome::capture` in `lib.rs`).
 fn report(message: impl Into<String>) {
     record_command_outcome_metadata(
         COMMAND_OUTCOME_STATUS_MESSAGE_KEY,
@@ -214,7 +216,7 @@ pub fn run_status_list(context: &NativeCommandContext) -> i32 {
     }
 }
 
-fn set_item(caller: &NativeLifecycleContext, id: &str, text: &str) -> Result<(), String> {
+fn set_item<C: ServiceCaller + Sync>(caller: &C, id: &str, text: &str) -> Result<(), String> {
     let mut client = ServiceCallerDispatchClient::new(caller);
     match block_on_typed_dispatch(status_items::client::set_status_item(
         &mut client,
@@ -230,9 +232,8 @@ fn set_item(caller: &NativeLifecycleContext, id: &str, text: &str) -> Result<(),
     }
 }
 
-/// Background thread started from `activate` that keeps a clone of the
-/// activation context, the pattern a plugin uses for periodic status
-/// updates.
+/// Background thread started from `activate` that owns the activation's
+/// host services, the pattern a plugin uses for periodic status updates.
 struct BackgroundStatus {
     stop: mpsc::Sender<()>,
     thread: JoinHandle<String>,
@@ -245,12 +246,17 @@ fn background_status() -> &'static Mutex<Option<BackgroundStatus>> {
 
 /// Opt-in demo (`[plugins.settings."example.native"] background_status =
 /// true`): publish a status item from `activate` itself and another from a
-/// background thread holding a clone of the activation context.
+/// background thread that was handed the activation's host services.
 ///
-/// Both calls are attributed to this plugin by the host. The activation
-/// context stops working once deactivation begins, which the thread reports
-/// when `deactivate` stops it.
-pub fn start_background_status(context: &NativeLifecycleContext) {
+/// `services` is the activation-scoped handle the host bound for this
+/// activation. Both calls are attributed to this plugin by the host. The
+/// handle fails closed once deactivation begins, which the thread reports
+/// when `deactivate` stops it. Without a bound handle the demo does nothing:
+/// there is no ambient fallback to reach the host.
+pub fn start_background_status(
+    context: &NativeLifecycleContext,
+    services: Option<bmux_plugin_sdk::PluginHostServices>,
+) {
     // Compare the rendered value so this example need not depend on `toml`.
     let enabled = context
         .settings
@@ -260,21 +266,24 @@ pub fn start_background_status(context: &NativeLifecycleContext) {
     if !enabled {
         return;
     }
-    match set_item(context, "activate", "set during activate") {
+    let Some(services) = services else {
+        println!("example.native: no activation host services bound; background demo disabled");
+        return;
+    };
+    match set_item(&services, "activate", "set during activate") {
         Ok(()) => println!("example.native: status item set during activate"),
         Err(error) => println!("example.native: status item during activate failed: {error}"),
     }
     let (stop, stopped) = mpsc::channel::<()>();
-    let caller = context.clone();
     let thread = std::thread::spawn(move || {
-        match set_item(&caller, "background", "set from a background thread") {
+        match set_item(&services, "background", "set from a background thread") {
             Ok(()) => println!("example.native: status item set from background thread"),
             Err(error) => {
                 println!("example.native: background status item failed: {error}");
             }
         }
         let _ = stopped.recv();
-        match set_item(&caller, "background", "set after deactivation") {
+        match set_item(&services, "background", "set after deactivation") {
             Ok(()) => "was accepted".to_string(),
             Err(error) => format!("was rejected: {error}"),
         }
@@ -285,8 +294,8 @@ pub fn start_background_status(context: &NativeLifecycleContext) {
 }
 
 /// Stop the background thread and report whether its post-deactivation call
-/// went through. Runs from `deactivate`, after the host ended the activation
-/// scope.
+/// went through. Runs from `deactivate`, after the host closed the
+/// activation scope, so the thread's retained handle must be rejected.
 pub fn stop_background_status() {
     let background = background_status()
         .lock()
@@ -301,13 +310,6 @@ pub fn stop_background_status() {
             Err(_) => println!("example.native: background status thread panicked"),
         }
     }
-}
-
-/// Drop this plugin's status items; the host has no per-plugin unload signal,
-/// so well-behaved plugins clean up from `deactivate`.
-pub fn clear_on_deactivate(caller: &NativeLifecycleContext) {
-    let mut client = ServiceCallerDispatchClient::new(caller);
-    let _ = block_on_typed_dispatch(status_items::client::clear_status_items(&mut client));
 }
 
 #[cfg(test)]

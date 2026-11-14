@@ -136,16 +136,16 @@ impl<P: RustPlugin + Sync> PluginInstance for RustPluginAdapter<P> {
         call: PluginCallContext,
         context: NativeCommandContext,
     ) -> PluginFuture<'_, CommandOutcome> {
+        // The synchronous legacy body runs inside one bracketed capture, so
+        // metadata it records returns as part of the outcome value.
         let future = self.schedule(call.callback_execution, true, move |state| {
             if call.cancellation.is_cancelled() {
                 return Err(unavailable());
             }
-            state
-                .write()
-                .map_err(|_| unavailable())?
-                .run_command(context)
+            let mut plugin = state.write().map_err(|_| unavailable())?;
+            Ok(CommandOutcome::capture(|| plugin.run_command(context)))
         });
-        Box::pin(async move { future.await.into() })
+        Box::pin(async move { future.await.unwrap_or_else(|error| Err(error).into()) })
     }
     fn invoke(
         &self,

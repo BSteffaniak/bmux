@@ -454,12 +454,20 @@ pub struct PluginLifecycleContext {
     pub native: NativeLifecycleContext,
 }
 
-/// Command failures are carried with their text on both static and native paths.
-/// No thread-local error slot is involved.
+/// A command's exit code, error text and generic metadata, returned as data.
+///
+/// The same value is produced on static and native paths. No exported "take
+/// last outcome" symbol or cross-call thread-local slot is involved: the value
+/// itself crosses the native ABI.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommandOutcome {
     pub exit_code: i32,
     pub error: Option<String>,
+    /// Generic, host-interpreted metadata (for example
+    /// [`crate::COMMAND_OUTCOME_STATUS_MESSAGE_KEY`]). The SDK attaches no
+    /// domain meaning to keys.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub metadata: std::collections::BTreeMap<String, serde_json::Value>,
 }
 impl From<PluginResult<i32>> for CommandOutcome {
     fn from(result: PluginResult<i32>) -> Self {
@@ -467,12 +475,31 @@ impl From<PluginResult<i32>> for CommandOutcome {
             Ok(exit_code) => Self {
                 exit_code,
                 error: None,
+                metadata: std::collections::BTreeMap::new(),
             },
             Err(error) => Self {
                 exit_code: error.code,
                 error: Some(error.message),
+                metadata: std::collections::BTreeMap::new(),
             },
         }
+    }
+}
+impl CommandOutcome {
+    /// Run one synchronous command body and return its result together with
+    /// any metadata it recorded through
+    /// [`crate::record_command_outcome_metadata`].
+    ///
+    /// The capture is bracketed around `body` on the current thread, in the
+    /// SDK copy linked into the plugin, so it works identically for
+    /// statically bundled and dynamically loaded plugins. Any enclosing
+    /// capture is restored afterwards. `body` must not suspend: metadata
+    /// recorded after an `.await` on another thread is not observed.
+    pub fn capture(body: impl FnOnce() -> PluginResult<i32>) -> Self {
+        let (result, metadata) = crate::host_services::capture_command_outcome_metadata(body);
+        let mut outcome = Self::from(result);
+        outcome.metadata = metadata;
+        outcome
     }
 }
 
@@ -1003,5 +1030,43 @@ mod tests {
         let outcome = CommandOutcome::from(Err(PluginCommandError::invalid_arguments("bad input")));
         assert_eq!(outcome.exit_code, crate::EXIT_USAGE);
         assert_eq!(outcome.error.as_deref(), Some("bad input"));
+        assert!(outcome.metadata.is_empty());
+    }
+    #[test]
+    fn captured_command_metadata_is_part_of_the_returned_outcome() {
+        let status = || serde_json::Value::String("ran".into());
+        let outcome = CommandOutcome::capture(|| {
+            crate::record_command_outcome_metadata(
+                crate::COMMAND_OUTCOME_STATUS_MESSAGE_KEY,
+                status(),
+            );
+            Err(PluginCommandError::failed("boom"))
+        });
+        assert_eq!(outcome.error.as_deref(), Some("boom"));
+        assert_eq!(
+            outcome
+                .metadata
+                .get(crate::COMMAND_OUTCOME_STATUS_MESSAGE_KEY),
+            Some(&status())
+        );
+        // Travels as data: the serialized value carries the metadata.
+        let decoded: CommandOutcome =
+            serde_json::from_slice(&serde_json::to_vec(&outcome).unwrap()).unwrap();
+        assert_eq!(decoded, outcome);
+        // Nothing lingers for a later command on this thread.
+        let next = CommandOutcome::capture(|| Ok(crate::EXIT_OK));
+        assert!(next.metadata.is_empty());
+        // An enclosing capture is restored and unaffected by the nested one.
+        crate::begin_command_outcome_capture();
+        let nested = CommandOutcome::capture(|| {
+            crate::record_command_outcome_metadata("inner", status());
+            Ok(crate::EXIT_OK)
+        });
+        crate::record_command_outcome_metadata("outer", status());
+        let enclosing = crate::finish_command_outcome_capture();
+        assert!(nested.metadata.contains_key("inner"));
+        assert!(!nested.metadata.contains_key("outer"));
+        assert!(enclosing.metadata.contains_key("outer"));
+        assert!(!enclosing.metadata.contains_key("inner"));
     }
 }

@@ -355,7 +355,7 @@ mod tests {
         let mut declaration = declaration();
         declaration
             .required_capabilities
-            .push(HostScope::new(bmux_plugin_sdk::CORE_CLI_COMMAND_CAPABILITY).unwrap());
+            .insert(HostScope::new(bmux_plugin_sdk::CORE_CLI_COMMAND_CAPABILITY).unwrap());
         let (route, _lifetime, mut requests) =
             crate::runtime::plugin_kernel::CommandDispatch::channel();
         let port = KernelServices {
@@ -387,6 +387,74 @@ mod tests {
             requests.try_recv().is_err(),
             "missing ancestry must dispatch no request"
         );
+        invocation.close().unwrap();
+        invocation.finish().unwrap();
+        activation.close().unwrap();
+        activation.finish().unwrap();
+        owner.close().unwrap();
+        owner.finish().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn command_route_service_calls_carry_the_bound_declaration_identity() {
+        let owner = bmux_plugin_runtime::InstanceScope::new(PluginRuntimeScopeId::new());
+        let activation = owner
+            .begin_activation(bmux_plugin_runtime::PluginConcurrencyConfig::Concurrent)
+            .unwrap();
+        activation.mark_active().unwrap();
+        let invocation = activation.begin_invocation().unwrap();
+        let mut declaration = declaration();
+        declaration
+            .required_capabilities
+            .insert(HostScope::new("example.status.write").unwrap());
+        let (route, _lifetime, mut requests) =
+            crate::runtime::plugin_kernel::CommandDispatch::channel();
+        let port = KernelServices {
+            declaration,
+            instance: owner.id(),
+            authority: None,
+            services: Vec::new(),
+            builtins: Arc::new(std::sync::OnceLock::new()),
+            command_route: Some(route),
+        };
+        let scope = invocation.clone();
+        let worker = tokio::task::spawn_blocking(move || {
+            port.invoke(
+                &scope,
+                bmux_plugin_sdk::HostServiceRequest {
+                    capability: "example.status.write",
+                    kind: bmux_plugin_sdk::ServiceKind::Command,
+                    interface: "example.status/v1",
+                    operation: "set",
+                    payload: b"item",
+                },
+            )
+        });
+        let negotiated = bmux_ipc::NegotiatedProtocol {
+            wire_epoch: 0,
+            revision: 0,
+            capabilities: vec![bmux_ipc::CAPABILITY_SERVICE_CALLER_PLUGIN_V1.to_string()],
+        };
+        let wire = {
+            let request = requests.recv().await.expect("selected request");
+            let wire = request.wire_request(Some(&negotiated));
+            request.respond(Ok(bmux_ipc::Response::Ok(
+                bmux_ipc::ResponsePayload::ServiceInvoked {
+                    payload: Vec::new(),
+                },
+            )));
+            wire
+        };
+        // The identity is the declaration bound to the admitted instance.
+        assert!(
+            matches!(
+                &wire,
+                bmux_ipc::Request::InvokeServiceAsPlugin { caller_plugin_id, payload, .. }
+                    if caller_plugin_id == "example.owner" && payload == b"item"
+            ),
+            "selected command calls must be attributed to the bound plugin: {wire:?}"
+        );
+        worker.await.unwrap().unwrap();
         invocation.close().unwrap();
         invocation.finish().unwrap();
         activation.close().unwrap();

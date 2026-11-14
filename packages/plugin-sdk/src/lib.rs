@@ -109,15 +109,12 @@ pub use context::{
     CoreCliCommandRequest, CoreCliCommandResponse, HostKernelBridge, HostKernelBridgeRequest,
     HostKernelBridgeResponse, NativeCommandContext, NativeCommandInvocationSource,
     NativeLifecycleContext, NativeLifecycleContextV1, NativeServiceContext,
-    NativeStreamingServiceContext, PLUGIN_CLI_BRIDGE_MAGIC_V1, PLUGIN_SERVICE_RELAY_MAGIC_V1,
-    PLUGIN_SERVICE_RELAY_PROTOCOL_V1, PluginCliCommandRequest, PluginCliCommandResponse,
-    PluginServiceRelayError, PluginServiceRelayRequest, PluginServiceRelayResponse,
-    RegisteredPluginInfo, ResolvedAuxiliaryExecutable, SERVICE_ERROR_CANCELLED,
-    decode_host_kernel_bridge_cli_command_payload,
+    NativeStreamingServiceContext, PLUGIN_CLI_BRIDGE_MAGIC_V1, PluginCliCommandRequest,
+    PluginCliCommandResponse, RegisteredPluginInfo, ResolvedAuxiliaryExecutable,
+    SERVICE_ERROR_CANCELLED, decode_host_kernel_bridge_cli_command_payload,
     decode_host_kernel_bridge_plugin_command_payload,
-    decode_host_kernel_bridge_service_relay_payload, encode_host_kernel_bridge_cli_command_payload,
+    encode_host_kernel_bridge_cli_command_payload,
     encode_host_kernel_bridge_plugin_command_payload,
-    encode_host_kernel_bridge_service_relay_payload,
 };
 pub use contribution::{
     ContributionRegistrar, PluginContribution, RegistrationContract, RegistrationKind,
@@ -152,8 +149,7 @@ macro_rules! storage_key {
 }
 pub use native_exports::{
     ConcurrentRustPlugin, EXIT_ERROR, EXIT_OK, EXIT_UNAVAILABLE, EXIT_USAGE, HostAsyncHandle,
-    PluginCommandError, RustPlugin, TypedServiceRegistrationContext, host_relay_enabled,
-    take_last_command_error,
+    PluginCommandError, RustPlugin, TypedServiceRegistrationContext, take_last_command_error,
 };
 pub use process_runtime::{
     PROCESS_RUNTIME_ENV_PERSISTENT_WORKER, PROCESS_RUNTIME_ENV_PLUGIN_ID,
@@ -415,16 +411,7 @@ pub mod __private {
         manifest_toml_ptr, plugin_instance, register_contributions_bundled,
         register_contributions_concurrent_bundled, register_contributions_concurrent_export,
         register_contributions_export, register_typed_services_bundled, run_command_export,
-        take_command_outcome_export,
     };
-
-    /// Opt-in export called by the host right after it loads a dynamic
-    /// plugin library. See [`crate::host_relay_enabled`].
-    #[must_use]
-    pub fn enable_host_relay_export() -> u32 {
-        crate::native_exports::enable_host_relay();
-        crate::PLUGIN_SERVICE_RELAY_PROTOCOL_V1
-    }
 }
 
 #[macro_export]
@@ -449,14 +436,6 @@ macro_rules! export_plugin {
                 $crate::__private::manifest_toml_ptr($manifest_toml, &MANIFEST)
             }
 
-            /// Host opt-in: route this dylib's plugin service calls through
-            /// its bound host context. Presence also tells the host that this
-            /// library decodes bound host bridges.
-            #[unsafe(no_mangle)]
-            pub extern "C" fn bmux_plugin_enable_host_relay_v1() -> u32 {
-                $crate::__private::enable_host_relay_export()
-            }
-
             #[unsafe(no_mangle)]
             pub extern "C" fn bmux_plugin_run_command_with_context_v1(
                 input_ptr: *const u8,
@@ -466,22 +445,6 @@ macro_rules! export_plugin {
                     __bmux_plugin_instance(),
                     input_ptr,
                     input_len,
-                )
-            }
-
-            /// Hand the last command's outcome (generic metadata and error
-            /// text) back to the host. The host's capture slot is not shared
-            /// with this dylib's SDK copy.
-            #[unsafe(no_mangle)]
-            pub extern "C" fn bmux_plugin_take_command_outcome_v1(
-                output_ptr: *mut u8,
-                output_capacity: usize,
-                output_len: *mut usize,
-            ) -> i32 {
-                $crate::__private::take_command_outcome_export(
-                    output_ptr,
-                    output_capacity,
-                    output_len,
                 )
             }
 
@@ -603,14 +566,6 @@ macro_rules! export_concurrent_plugin {
                 static MANIFEST: ::std::sync::OnceLock<Option<::std::ffi::CString>> =
                     ::std::sync::OnceLock::new();
                 $crate::__private::manifest_toml_ptr($manifest_toml, &MANIFEST)
-            }
-
-            /// Host opt-in: route this dylib's plugin service calls through
-            /// its bound host context. Presence also tells the host that this
-            /// library decodes bound host bridges.
-            #[unsafe(no_mangle)]
-            pub extern "C" fn bmux_plugin_enable_host_relay_v1() -> u32 {
-                $crate::__private::enable_host_relay_export()
             }
 
             #[unsafe(no_mangle)]

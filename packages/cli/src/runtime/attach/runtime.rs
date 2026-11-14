@@ -8066,7 +8066,8 @@ pub async fn handle_attach_plugin_command_action(
                         if request.is_cancelled() {
                             request.reject();
                         } else {
-                            let response = client.start_request(request.request.clone()).await;
+                            let wire = request.wire_request(client.negotiated_protocol());
+                            let response = client.start_request(wire).await;
                             selected_effects.retain(|effect: &tokio::task::JoinHandle<()>| !effect.is_finished());
                             selected_effects.push(tokio::spawn(async move {
                                 let result = match response {

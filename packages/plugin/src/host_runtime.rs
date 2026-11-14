@@ -276,6 +276,60 @@ impl ServiceCaller for bmux_plugin_sdk::BoundHostServicePort {
     }
 }
 
+/// Explicitly bound host services are a complete caller on their own.
+///
+/// Authority is exactly what the host bound into the value: an invocation's
+/// scope, or an activation's scope that mints a fresh invocation per call and
+/// fails closed once the activation ends. Plugins hand this value to
+/// background work instead of relying on any ambient context. There is no
+/// fallback route when a capability is missing.
+impl ServiceCaller for bmux_plugin_sdk::PluginHostServices {
+    fn open_retained_host(&self) -> Result<bmux_plugin_sdk::abi::retained::RetainedHostPort> {
+        Self::open_retained_host(self)
+    }
+
+    fn selected_service_availability(
+        &self,
+        key: bmux_plugin_sdk::typed_dispatch::ServiceAvailabilityKey,
+    ) -> bmux_plugin_sdk::definition::PluginFuture<
+        '_,
+        Result<bmux_plugin_sdk::typed_dispatch::SelectedServiceAvailability>,
+    > {
+        Self::selected_service_availability(self, key)
+    }
+
+    fn call_service_async(
+        &self,
+        request: bmux_plugin_sdk::HostServiceOwnedRequest,
+    ) -> bmux_plugin_sdk::definition::PluginFuture<'_, Result<Vec<u8>>> {
+        Self::call_service_async(self, request)
+    }
+
+    fn call_service_raw(
+        &self,
+        capability: &str,
+        kind: ServiceKind,
+        interface_id: &str,
+        operation: &str,
+        payload: Vec<u8>,
+    ) -> Result<Vec<u8>> {
+        self.invoke(bmux_plugin_sdk::HostServiceRequest {
+            capability,
+            kind,
+            interface: interface_id,
+            operation,
+            payload: &payload,
+        })
+    }
+
+    fn execute_kernel_request(
+        &self,
+        request: bmux_ipc::Request,
+    ) -> Result<bmux_ipc::ResponsePayload> {
+        crate::loader::execute_selected_context_kernel(self, &request)
+    }
+}
+
 /// Generic host runtime API.
 ///
 /// Carries only domain-agnostic primitives: core-CLI command dispatch,
@@ -467,5 +521,48 @@ mod kernel_port_tests {
         invocation.finish().unwrap();
         activation.drain().await.unwrap();
         activation.finish().unwrap();
+    }
+
+    #[test]
+    fn bound_host_services_are_a_caller_without_fallback_routes() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let services = bmux_plugin_sdk::PluginHostServices::new(move |request| {
+            observed.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(request.capability, "example.status.write");
+            assert_eq!(request.operation, "set");
+            Ok(request.payload.iter().rev().copied().collect())
+        });
+        let response = services
+            .call_service_raw(
+                "example.status.write",
+                ServiceKind::Command,
+                "example.status/v1",
+                "set",
+                vec![1, 2, 3],
+            )
+            .unwrap();
+        assert_eq!(response, vec![3, 2, 1]);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        // Capabilities the host did not bind fail explicitly.
+        assert!(
+            services
+                .execute_kernel_request(bmux_ipc::Request::Ping)
+                .is_err()
+        );
+        let with_kernel = services.with_kernel(|request| {
+            assert!(matches!(
+                bmux_ipc::decode::<bmux_ipc::Request>(request).unwrap(),
+                bmux_ipc::Request::Ping
+            ));
+            Ok(bmux_ipc::encode(&bmux_ipc::ResponsePayload::Pong).unwrap())
+        });
+        assert!(matches!(
+            with_kernel
+                .execute_kernel_request(bmux_ipc::Request::Ping)
+                .unwrap(),
+            bmux_ipc::ResponsePayload::Pong
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 }

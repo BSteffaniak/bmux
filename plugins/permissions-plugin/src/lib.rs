@@ -2622,6 +2622,69 @@ mod tests {
         assert!(!decision.allowed);
     }
 
+    /// Test-only selected callback authority: always live, never cancelled.
+    struct LiveTestAuthority;
+    impl bmux_plugin_sdk::PluginCallbackAuthoritySource for LiveTestAuthority {
+        fn check_live(&self) -> bmux_plugin_sdk::definition::PluginResult<()> {
+            Ok(())
+        }
+        fn enter_adapter_entry(
+            &self,
+            _: bmux_plugin_runtime::PluginInstanceId,
+        ) -> bmux_plugin_sdk::definition::PluginResult<bmux_plugin_sdk::PluginCallbackEntryGuard>
+        {
+            Ok(bmux_plugin_sdk::PluginCallbackEntryGuard::from_host(()))
+        }
+        fn cancelled(&self) -> bmux_plugin_sdk::PluginCallbackSettlement {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    /// Test-only selected executor. It validates the entered dependency and
+    /// runs the author callback on a dedicated worker thread, joining before
+    /// settling so the single-poll typed-dispatch bridge observes completion.
+    struct WorkerThreadTestExecutor;
+    impl bmux_plugin_sdk::PluginCallbackExecution for WorkerThreadTestExecutor {
+        fn execute(
+            &self,
+            _: bmux_plugin_sdk::PluginCallbackAuthority,
+            _: bmux_plugin_runtime::PluginInstanceId,
+            _: bmux_plugin_sdk::PluginBlockingCallback,
+        ) -> bmux_plugin_sdk::PluginCallbackSettlement {
+            Box::pin(async {
+                Err(PluginCommandError::unavailable(
+                    "test executor requires an entered dependency",
+                ))
+            })
+        }
+        fn execute_entered(
+            &self,
+            authority: bmux_plugin_sdk::PluginCallbackAuthority,
+            instance: bmux_plugin_runtime::PluginInstanceId,
+            entry: bmux_plugin_sdk::PluginCallbackEntryGuard,
+            callback: bmux_plugin_sdk::PluginBlockingCallback,
+        ) -> bmux_plugin_sdk::PluginCallbackSettlement {
+            Box::pin(async move {
+                entry.validate_for(&authority, instance)?;
+                std::thread::spawn(move || {
+                    entry.validate_for(&authority, instance)?;
+                    let result = callback();
+                    drop(entry);
+                    result
+                })
+                .join()
+                .map_err(|_| PluginCommandError::failed("test callback worker panicked"))?
+            })
+        }
+    }
+
+    fn selected_test_execution() -> bmux_plugin_sdk::PluginCallbackContext {
+        bmux_plugin_sdk::PluginCallbackContext::from_host(
+            bmux_plugin_sdk::PluginCallbackAuthority::from_host(Arc::new(LiveTestAuthority)),
+            bmux_plugin_sdk::PluginCallbackExecutor::from_host(Arc::new(WorkerThreadTestExecutor)),
+        )
+    }
+
     #[test]
     fn checked_instance_mutation_is_validated_and_applied_once() {
         use bmux_plugin_sdk::definition::{PluginCallContext, PluginInstance};
@@ -2641,7 +2704,12 @@ mod tests {
                 )
             },
         ));
-        let plugin = PermissionsPlugin::default();
+        // Exercise the selected definition instance (the same adapter the
+        // `define_plugin!` factory produces), not the raw RustPlugin body.
+        let plugin = bmux_plugin_sdk::definition::RustPluginAdapter::for_instance(
+            PermissionsPlugin::default(),
+            bmux_plugin_sdk::definition::LoadedInstanceId::from_uuid(Uuid::new_v4()),
+        );
         let body = encode_service_message(&GrantRequest {
             session: service_test_session_id().to_string(),
             client_id: Uuid::new_v4().to_string(),
@@ -2664,6 +2732,7 @@ mod tests {
         };
         let invoke = |context: NativeServiceContext| {
             let call = PluginCallContext {
+                callback_execution: Some(selected_test_execution()),
                 invocation_id: context.cancellation.invocation_id.clone(),
                 cancellation: bmux_plugin_sdk::ServiceCancellation::new(),
                 host_services: context.host_service_port.clone(),
@@ -3215,7 +3284,9 @@ mod definition_contract_tests {
     fn custom_instance_exposes_generated_contracts_without_alias_guessing() {
         use bmux_plugin_sdk::PluginContract;
         use bmux_plugin_sdk::definition::PluginInstance;
-        let plugin = super::PermissionsPlugin::default();
+        let plugin = bmux_plugin_sdk::definition::RustPluginAdapter::new(
+            super::PermissionsPlugin::default(),
+        );
         let generated =
             bmux_permissions_plugin_api::Contract::service_contract_for("session-policy-state")
                 .expect("modeled policy query must have a generated contract");

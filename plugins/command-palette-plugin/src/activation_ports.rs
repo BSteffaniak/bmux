@@ -211,6 +211,7 @@ mod tests {
 
     fn lifecycle(scope: PluginCreateContext, activation: ActivationId) -> PluginLifecycleContext {
         PluginLifecycleContext {
+            callback_execution: None,
             scope,
             activation,
             native: NativeLifecycleContext {

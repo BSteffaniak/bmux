@@ -1,7 +1,76 @@
 //! Checked transport regressions execute the actual legacy decoration handler.
 use super::*;
-use bmux_plugin_sdk::definition::{PluginCallContext, PluginCreateContext, PluginInstance};
+use bmux_plugin_sdk::definition::{
+    LoadedInstanceId, PluginCallContext, PluginCreateContext, PluginInstance,
+};
+use bmux_plugin_sdk::{
+    PluginBlockingCallback, PluginCallbackAuthority, PluginCallbackAuthoritySource,
+    PluginCallbackContext, PluginCallbackEntryGuard, PluginCallbackExecution,
+    PluginCallbackExecutor, PluginCallbackSettlement, PluginCommandError,
+};
 use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// Test-only host authority: always live, never cancelled. Stands in for the
+/// admitted invocation scope a real host binds per call.
+struct TestAuthority;
+impl PluginCallbackAuthoritySource for TestAuthority {
+    fn check_live(&self) -> bmux_plugin_sdk::definition::PluginResult<()> {
+        Ok(())
+    }
+    fn enter_adapter_entry(
+        &self,
+        _: LoadedInstanceId,
+    ) -> bmux_plugin_sdk::definition::PluginResult<PluginCallbackEntryGuard> {
+        Ok(PluginCallbackEntryGuard::from_host(()))
+    }
+    fn cancelled(&self) -> PluginCallbackSettlement {
+        Box::pin(std::future::pending())
+    }
+}
+
+/// Test-only selected executor that only accepts already entered callbacks and
+/// runs them on a tokio blocking worker after revalidating the entry.
+struct TestExecutor;
+impl PluginCallbackExecution for TestExecutor {
+    fn execute(
+        &self,
+        _: PluginCallbackAuthority,
+        _: LoadedInstanceId,
+        _: PluginBlockingCallback,
+    ) -> PluginCallbackSettlement {
+        Box::pin(async {
+            Err(PluginCommandError::unavailable(
+                "test executor requires a prepared entry",
+            ))
+        })
+    }
+    fn execute_entered(
+        &self,
+        authority: PluginCallbackAuthority,
+        instance: LoadedInstanceId,
+        entry: PluginCallbackEntryGuard,
+        callback: PluginBlockingCallback,
+    ) -> PluginCallbackSettlement {
+        Box::pin(async move {
+            entry.validate_for(&authority, instance)?;
+            tokio::task::spawn_blocking(move || {
+                entry.validate_for(&authority, instance)?;
+                let result = callback();
+                drop(entry);
+                result
+            })
+            .await
+            .map_err(|error| PluginCommandError::failed(error.to_string()))?
+        })
+    }
+}
+
+fn test_callback_execution() -> PluginCallbackContext {
+    PluginCallbackContext::from_host(
+        PluginCallbackAuthority::from_host(Arc::new(TestAuthority)),
+        PluginCallbackExecutor::from_host(Arc::new(TestExecutor)),
+    )
+}
 
 #[derive(Default)]
 struct CountedDecoration {
@@ -39,6 +108,7 @@ fn apply_context(contract: &[u8]) -> NativeServiceContext {
 
 fn invocation(context: &NativeServiceContext) -> PluginCallContext {
     PluginCallContext {
+        callback_execution: Some(test_callback_execution()),
         invocation_id: context.cancellation.invocation_id.clone(),
         cancellation: bmux_plugin_sdk::ServiceCancellation::new(),
         host_services: context.host_service_port.clone(),
@@ -49,7 +119,10 @@ fn invocation(context: &NativeServiceContext) -> PluginCallContext {
 async fn wrong_schema_has_no_effect_and_checked_apply_executes_once() {
     let counted = CountedDecoration::default();
     let effects = counted.effects.clone();
-    let adapter = bmux_plugin_sdk::definition::RustPluginAdapter::new(counted);
+    let adapter = bmux_plugin_sdk::definition::RustPluginAdapter::for_instance(
+        counted,
+        LoadedInstanceId::from_uuid(Uuid::from_u128(0x43)),
+    );
     let wrong = apply_context(&[0; 32]);
     assert!(adapter.invoke(invocation(&wrong), wrong).await.is_err());
     assert_eq!(effects.load(Ordering::SeqCst), 0);
