@@ -1,0 +1,9 @@
+[keybindings]
+initial_mode = "normal"
+
+[keybindings.global]
+"alt+t" = "plugin:bmux.theme:pick-theme"
+
+[keybindings.modes.normal]
+label       = "NORMAL"
+passthrough = true

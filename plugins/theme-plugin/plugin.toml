@@ -48,6 +48,20 @@ summary        = "Open the runtime theme picker"
 accepts_repeat = false
 execution      = "caller_process"
 expose_in_cli  = true
+name           = "show-theme"
+path           = ["theme", "show"]
+summary        = "Show the theme in effect"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "note"
+name       = "note"
+value_name = "TEXT"
+
+[[commands]]
+accepts_repeat = false
+execution      = "caller_process"
+expose_in_cli  = true
 name           = "refresh-theme"
 path           = ["theme", "refresh"]
 summary        = "Refresh the selected theme from configuration and files"

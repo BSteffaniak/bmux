@@ -68,6 +68,7 @@ impl ThemePlugin {
         bmux_plugin_sdk::route_command!(context, {
             "pick-theme" => super::pick_theme(context),
             "refresh-theme" => super::refresh_theme(context),
+            "show-theme" => super::show_theme(context),
         })
     }
 

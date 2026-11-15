@@ -304,6 +304,16 @@ fn playbook_real_attach_pane_padding_configure_previews_cancels_and_commits() {
 
 #[test]
 #[serial]
+fn playbook_real_attach_theme_picker_previews_restores_and_commits() {
+    let (json, pass) = run_playbook_fixture("theme_picker_real_attach.dsl");
+    assert!(
+        pass,
+        "theme picker should preview, restore and commit after its command returns: {json:#}"
+    );
+}
+
+#[test]
+#[serial]
 fn playbook_real_attach_prompted_tab_rename_applies() {
     let (json, pass) = run_playbook_fixture("tab_rename_prompt_real_attach.dsl");
     assert!(pass, "prompted tab rename should apply: {json:#}");
