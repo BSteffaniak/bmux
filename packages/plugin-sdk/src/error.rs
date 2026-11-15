@@ -63,12 +63,6 @@ pub enum PluginError {
     #[error("invalid plugin feature '{feature}'")]
     InvalidPluginFeature { feature: String },
 
-    #[error("plugin '{plugin_id}' provides duplicate capability '{capability}'")]
-    DuplicateProvidedCapability {
-        plugin_id: String,
-        capability: String,
-    },
-
     #[error("plugin '{plugin_id}' both requires and provides capability '{capability}'")]
     CapabilitySelfRequirement {
         plugin_id: String,
@@ -177,26 +171,6 @@ pub enum PluginError {
     MissingRequiredCapability {
         plugin_id: String,
         capability: String,
-    },
-
-    #[error(
-        "capability '{capability}' has multiple providers: '{first_provider}' and '{second_provider}'"
-    )]
-    DuplicateCapabilityProvider {
-        capability: String,
-        first_provider: String,
-        second_provider: String,
-    },
-
-    #[error(
-        "service '{interface_id}' for capability '{capability}' and kind '{kind:?}' has multiple providers: '{first_provider}' and '{second_provider}'"
-    )]
-    DuplicateServiceProvider {
-        capability: String,
-        kind: ServiceKind,
-        interface_id: String,
-        first_provider: String,
-        second_provider: String,
     },
 
     #[error("failed to spawn process plugin '{plugin_id}' command '{command}': {details}")]
