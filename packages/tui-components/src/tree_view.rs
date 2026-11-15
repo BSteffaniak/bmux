@@ -58,6 +58,11 @@ pub struct TreeViewItem {
     pub expandable: bool,
     /// Whether this item ignores selection/activation.
     pub disabled: bool,
+    /// Span of `rich_label` that gives way first when the label does not fit under
+    /// [`TreeViewLabelOverflow::Ellipsis`]: it is shortened from its start, behind a leading
+    /// ellipsis, before the label's end is cut (a path's directories, say, so the file name
+    /// stays visible). See [`Line::truncate_shrinking`].
+    pub shrink_span: Option<usize>,
 }
 
 impl TreeViewItem {
@@ -72,6 +77,7 @@ impl TreeViewItem {
             depth,
             expandable: false,
             disabled: false,
+            shrink_span: None,
         }
     }
 
@@ -115,6 +121,14 @@ impl TreeViewItem {
     #[must_use]
     pub const fn disabled(mut self, disabled: bool) -> Self {
         self.disabled = disabled;
+        self
+    }
+
+    /// Return this item with span `span` of its rich label giving way first when the label does
+    /// not fit (see [`Self::shrink_span`]).
+    #[must_use]
+    pub const fn shrink_span(mut self, span: usize) -> Self {
+        self.shrink_span = Some(span);
         self
     }
 
@@ -918,7 +932,10 @@ impl<'a> TreeView<'a> {
         };
         let label = match layout.label_overflow {
             TreeViewLabelOverflow::Clip => label.viewport(0, label_room),
-            TreeViewLabelOverflow::Ellipsis => label.truncate(label_room),
+            TreeViewLabelOverflow::Ellipsis => item.shrink_span.map_or_else(
+                || label.truncate(label_room),
+                |span| label.truncate_shrinking(label_room, span),
+            ),
         };
         let mut line = if decorations.is_empty() {
             label
@@ -3193,6 +3210,26 @@ mod rich_and_scale_tests {
         let (_, buffer, _, _) = paint_window(&component, 16, 0, 2);
         assert_eq!(row(&buffer, 0), "  main_mo… M +12");
         assert_eq!(row(&buffer, 1), "  README.markdo…");
+    }
+
+    #[test]
+    fn a_shrinking_span_keeps_the_label_end_visible() {
+        let items = [TreeViewItem::rich(
+            "path",
+            Line::from_spans([
+                Span::raw("M "),
+                Span::raw("src/review/"),
+                Span::raw("files.rs"),
+            ]),
+            0,
+        )
+        .shrink_span(1)];
+        let state = RefCell::new(TreeViewState::new(None));
+        let component = TreeViewComponent::new("tree", &items, &state).trailing_layout(
+            TreeViewTrailingLayout::new().label_overflow(TreeViewLabelOverflow::Ellipsis),
+        );
+        let (_, buffer, _, _) = paint_window(&component, 18, 0, 1);
+        assert_eq!(row(&buffer, 0), "  M …view/files.rs");
     }
 
     #[test]

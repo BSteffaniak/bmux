@@ -142,6 +142,14 @@ impl Line {
         truncate_line_to_display_width(self, width)
     }
 
+    /// Return a copy that fits `width` cells by shortening span `span` from its start first.
+    ///
+    /// See [`truncate_line_shrinking_span`].
+    #[must_use]
+    pub fn truncate_shrinking(&self, width: usize, span: usize) -> Self {
+        truncate_line_shrinking_span(self, width, span)
+    }
+
     /// Return this line with `trailing` placed after it within `width` cells.
     ///
     /// See [`place_trailing`].
@@ -247,6 +255,46 @@ pub fn truncate_line_to_display_width(line: &Line, width: usize) -> Line {
         .or_else(|| spans.last().map(|span| span.style))
         .unwrap_or_else(Style::new);
     push_or_merge_span(&mut spans, "…".to_owned(), style);
+    Line::from_spans(spans)
+}
+
+/// Return a copy of a styled line that fits `width` cells, shortening span `span` from its start
+/// before anything else is cut.
+///
+/// The span keeps its end behind a leading ellipsis in its own style, so the rest of the line
+/// stays whole: a path's directories give way while the file name and what precedes it stay
+/// visible (`M …/review/files.rs`). When even an ellipsis alone in place of the span does not
+/// make the line fit, the span becomes that ellipsis and the line's end is cut as by
+/// [`truncate_line_to_display_width`]. A `span` past the line's spans cuts the end only.
+#[must_use]
+pub fn truncate_line_shrinking_span(line: &Line, width: usize, span: usize) -> Line {
+    let total = line.width();
+    if total <= width {
+        return line.clone();
+    }
+    let Some(target) = line.spans.get(span) else {
+        return truncate_line_to_display_width(line, width);
+    };
+    let excess = total - width;
+    // Room left for the span's tail after its ellipsis.
+    let room = target.width().checked_sub(excess.saturating_add(1));
+    let mut spans = line.spans.clone();
+    let Some(room) = room.filter(|room| *room > 0) else {
+        spans[span] = Span::styled("…", target.style);
+        return truncate_line_to_display_width(&Line::from_spans(spans), width);
+    };
+    let mut kept: Vec<&str> = Vec::new();
+    let mut used = 0usize;
+    for grapheme in target.content.graphemes(true).rev() {
+        let grapheme_width = display_width(grapheme);
+        if used.saturating_add(grapheme_width) > room {
+            break;
+        }
+        used = used.saturating_add(grapheme_width);
+        kept.push(grapheme);
+    }
+    kept.reverse();
+    spans[span] = Span::styled(format!("…{}", kept.concat()), target.style);
     Line::from_spans(spans)
 }
 
@@ -1638,6 +1686,29 @@ mod tests {
         let line = Line::from("a👨‍👩‍👧‍👦b");
 
         assert_eq!(line.truncate(3).plain_text(), "a…");
+    }
+
+    #[test]
+    fn truncate_shrinking_gives_way_in_the_chosen_span_first() {
+        let status = Style::new().fg(Color::Red);
+        let directory = Style::new().fg(Color::Blue);
+        let name = Style::new();
+        let line = Line::from_spans([
+            Span::styled("M ", status),
+            Span::styled("src/review/", directory),
+            Span::styled("files.rs", name),
+        ]);
+        // Fits: unchanged.
+        assert_eq!(line.truncate_shrinking(21, 1), line);
+        // The directory shortens from its start; what precedes and follows it stays whole.
+        let shortened = line.truncate_shrinking(17, 1);
+        assert_eq!(shortened.plain_text(), "M …eview/files.rs");
+        assert_eq!(shortened.width(), 17);
+        assert_eq!(shortened.spans[1], Span::styled("…eview/", directory));
+        // Too narrow for the span to help: it becomes an ellipsis and the end is cut.
+        assert_eq!(line.truncate_shrinking(8, 1).plain_text(), "M …file…");
+        // A span the line does not have cuts the end.
+        assert_eq!(line.truncate_shrinking(8, 9), line.truncate(8));
     }
 
     #[test]
