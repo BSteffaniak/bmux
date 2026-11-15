@@ -101,8 +101,13 @@ Expose one author macro `define_plugin!` producing a module-local
 `plugin_definition()` factory. It never emits global no-mangle symbols in the
 implementation crate. A separate `export_plugin_entrypoint!` in a thin dynamic
 packaging target exports the common versioned descriptor/operations ABI.
-Existing export macros may temporarily adapt, but final migrated implementation
-crates must be export-free. X1 owns concrete thin packaging targets or
+Implementation crates are export-free rlibs with no static/dynamic features;
+`scripts/package-plugin.py` generates every dynamic wrapper, and hosts bundle
+the
+same `plugin_definition()` through the shared definition registry. The former
+native v1 exports (`export_plugin!`, `export_concurrent_plugin!`, the
+`bundled_*_vtable!` macros and `StaticPluginVtable`) are deleted, with no
+compatibility path. X1 owns concrete thin packaging targets or
 generation tooling: do not create speculative crates. Plugin workers use the
 shared declaration and expose their implementation; do not each invent
 wrapper/build machinery.
@@ -113,9 +118,11 @@ explicit create/destroy operations. Document allocation/deallocation owner,
 borrowed buffer validity, thread/reentrancy rules, callback closure and panic
 behavior. No Rust strings/trait objects/futures/Arc/TypeId/Tokio handles cross
 it. Metadata discovery does not activate a plugin. Abort/native faults cannot be
-contained by catch_unwind; unwinding panics must not cross extern C. Keep v1
-semantics frozen; new capabilities require explicit selection, not fallback
-reinterpretation.
+contained by catch_unwind; unwinding panics must not cross extern C. The
+native v1 ABI and its loader are removed; native plugins load only through the
+scoped definition ABI, and new capabilities require explicit selection, not
+fallback reinterpretation. The process plugin protocol is separate and keeps its
+existing wire format.
 
 ### Invocation and BPDL (M3/M4)
 
@@ -193,14 +200,17 @@ attach commands. No output or command errors depend on shared SDK TLS.
 
 ## Ownership map
 
-M1: BMUX SDK `lib.rs`, `native_exports.rs`, `native_exports/**`, `context.rs`,
-`error.rs`, new definition/abi modules, and SDK README. Excludes M4
+M1: BMUX SDK `lib.rs`, `rust_plugin.rs` (the `RustPlugin` author trait and its
+supporting types, formerly `native_exports.rs`), `context.rs`, `error.rs`,
+`definition.rs`/`definition/**`, `abi.rs`/`abi/**`, and SDK README. Excludes M4
 dispatch/contracts and M6 host/event/state/readiness modules.
 M2: BMUX `packages/plugin-runtime/**`, including its module root/manifests
 (non-root manifests allowed only this lane).
-M3: BMUX plugin `loader.rs`, loader-specific new modules,
-`static_vtable_registry.rs`, `stream_admission.rs`; excludes other plugin
-modules and plugin lib root.
+M3: BMUX plugin `loader.rs` (process-plugin adapter and host service
+dispatch), `loader/scoped.rs`+submodules (the scoped definition loader),
+`auxiliary.rs`+submodules, `static_definition_registry.rs` (inert bundled
+definitions; formerly `static_vtable_registry.rs`), `stream_admission.rs`;
+excludes other plugin modules and plugin lib root.
 M4: BMUX `packages/plugin-schema/**`, `packages/plugin-schema-macros/**`, SDK
 `typed_dispatch.rs`, `typed_dispatch_client.rs`, `service.rs`,
 `service_contract.rs`, `capability.rs`; no SDK root.
