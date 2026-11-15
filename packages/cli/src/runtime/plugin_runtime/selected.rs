@@ -3,7 +3,7 @@
 #[cfg(test)]
 #[path = "selected_tests.rs"]
 mod selected_tests;
-use super::{load_native_registered_plugin, native_service_buffer_config};
+use super::load_process_plugin;
 use bmux_config::BmuxConfig;
 use bmux_plugin::PluginRuntime;
 use bmux_plugin_runtime::PluginRuntimeScopeId;
@@ -358,12 +358,7 @@ impl ProductionPlugin {
         let mut kernel_grant = None;
         let builtins = Arc::new(std::sync::OnceLock::new());
         let backend = if plugin.manifest.runtime == PluginRuntime::Process {
-            Backend::Process(Arc::new(load_native_registered_plugin(
-                plugin,
-                host,
-                capabilities,
-                native_service_buffer_config(config),
-            )?))
+            Backend::Process(Arc::new(load_process_plugin(plugin, host, capabilities)?))
         } else {
             let runtime_owner = owner.runtime_owner.ok_or_else(|| failure(
                 "selected plugin execution requires actual primary runtime owner; use run_cli_with_runtime"))?;
@@ -718,13 +713,14 @@ impl ProductionPlugin {
     }
     pub(in crate::runtime) fn cancel_background_tasks(&self) -> bmux_plugin_sdk::Result<()> {
         match &self.backend {
-            Backend::Process(plugin) => plugin.cancel_background_tasks(),
+            // Process plugins own no host activation tasks.
+            Backend::Process(_) => Ok(()),
             Backend::Scoped(execution) => execution.cancel_background_tasks(),
         }
     }
     pub(in crate::runtime) async fn drain_background_tasks(&self) -> bmux_plugin_sdk::Result<()> {
         match &self.backend {
-            Backend::Process(plugin) => plugin.drain_background_tasks().await,
+            Backend::Process(_) => Ok(()),
             Backend::Scoped(execution) => execution.drain_background_tasks().await,
         }
     }

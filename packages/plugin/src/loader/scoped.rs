@@ -418,7 +418,7 @@ impl DefinitionArtifact {
             observed_identity.push_str(&executable.identity);
             let definition = match definition {
                 Some(definition) => definition,
-                None => crate::static_vtable_registry::static_definition(
+                None => crate::static_definition_registry::static_definition(
                     plugin.declaration.id.as_str(),
                 )?
                 .ok_or_else(|| failure("selected bundled plugin has no unified definition"))?,

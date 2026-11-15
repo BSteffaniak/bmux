@@ -154,8 +154,6 @@ pub struct PluginManifest {
     pub entry_args: Vec<String>,
     #[serde(default)]
     pub process_persistent_worker: bool,
-    #[serde(default = "default_entry_symbol")]
-    pub entry_symbol: String,
     #[serde(default)]
     pub plugin_api: PluginManifestCompatibility,
     #[serde(default)]
@@ -303,9 +301,7 @@ impl PluginManifest {
                 }
             })?,
             entrypoint: match self.runtime {
-                PluginRuntime::Native => PluginEntrypoint::Native {
-                    symbol: self.entry_symbol.clone(),
-                },
+                PluginRuntime::Native => PluginEntrypoint::Native,
                 PluginRuntime::Process => {
                     let command = self
                         .entry
@@ -552,10 +548,6 @@ fn extension_point_id_is_valid(value: &str) -> bool {
         && version.strip_prefix('v').is_some_and(|digits| {
             !digits.is_empty() && digits.chars().all(|ch| ch.is_ascii_digit())
         })
-}
-
-fn default_entry_symbol() -> String {
-    bmux_plugin_sdk::DEFAULT_NATIVE_ENTRY_SYMBOL.to_string()
 }
 
 const fn default_true() -> bool {

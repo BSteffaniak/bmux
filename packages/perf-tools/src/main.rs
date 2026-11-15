@@ -2686,7 +2686,14 @@ fn core_service_scenario_json(name: &str, samples_us: Vec<f64>, max_p99_us: Opti
     })
 }
 
-fn load_performance_plugin() -> Result<bmux_plugin::LoadedPlugin, String> {
+/// One bundled-style scoped instance created from its inert definition, the
+/// same static path hosts use for bundled plugins.
+struct StaticNoopService {
+    instance: std::sync::Arc<dyn bmux_plugin_sdk::definition::PluginInstance>,
+    runtime: tokio::runtime::Runtime,
+}
+
+fn load_performance_plugin() -> Result<StaticNoopService, String> {
     const NOOP_MANIFEST: &str = r#"
 id = "bmux.perf-tools.noop"
 name = "bmux Perf Tools Noop"
@@ -2701,72 +2708,87 @@ interface_id = "perf-noop/v1"
 kind = "query"
 "#;
 
-    let mut registry = bmux_plugin::PluginRegistry::new();
-    registry
-        .register_bundled_manifest(NOOP_MANIFEST)
-        .map_err(|error| format!("failed registering noop manifest: {error}"))?;
-    let registered = registry
-        .get("bmux.perf-tools.noop")
-        .ok_or_else(|| "noop plugin was not registered".to_string())?;
-    let host = bmux_plugin_sdk::HostMetadata {
-        product_name: "bmux".to_string(),
-        product_version: env!("CARGO_PKG_VERSION").to_string(),
-        plugin_api_version: bmux_plugin_sdk::CURRENT_PLUGIN_API_VERSION,
-        plugin_abi_version: bmux_plugin_sdk::CURRENT_PLUGIN_ABI_VERSION,
+    use bmux_plugin_sdk::definition::{
+        ComponentRole, LoadedInstanceId, PluginCreateContext, PluginDefinition, PluginInstance,
+        RuntimeScopeId,
     };
-    let vtable = bmux_plugin_sdk::bundled_plugin_vtable!(PerfNoopPlugin, NOOP_MANIFEST);
-    bmux_plugin::load_static_plugin(registered, vtable, &host, &BTreeMap::new())
-        .map_err(|error| format!("failed loading noop plugin: {error}"))
+    let metadata = PluginDefinition::from_rust_plugin::<PerfNoopPlugin>(
+        NOOP_MANIFEST,
+        vec![ComponentRole::Backend],
+    )
+    .map_err(|error| format!("invalid noop definition: {}", error.message))?
+    .metadata;
+    let definition = PluginDefinition::new(metadata, |_scope| {
+        Ok(std::sync::Arc::new(PerfNoopPlugin) as std::sync::Arc<dyn PluginInstance>)
+    });
+    let instance = definition
+        .create(PluginCreateContext {
+            runtime_scope: RuntimeScopeId::new(),
+            // This tool is the host here: mint a fresh, unrelated instance id.
+            instance: LoadedInstanceId::from_uuid(RuntimeScopeId::new().as_uuid()),
+            role: ComponentRole::Backend,
+        })
+        .map_err(|error| format!("failed creating noop instance: {}", error.message))?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .map_err(|error| format!("failed building noop runtime: {error}"))?;
+    Ok(StaticNoopService { instance, runtime })
 }
 
-fn invoke_performance_get_settings(loaded: &bmux_plugin::LoadedPlugin) -> Result<(), String> {
+fn invoke_performance_get_settings(loaded: &StaticNoopService) -> Result<(), String> {
     let payload = bmux_plugin_sdk::encode_service_message(&())
         .map_err(|error| format!("failed encoding noop request: {error}"))?;
     let capability = bmux_plugin_sdk::HostScope::new("bmux.perf_tools.noop")
         .map_err(|error| format!("failed parsing noop capability: {error}"))?;
+    let context = bmux_plugin_sdk::NativeServiceContext {
+        host_service_port: None,
+        plugin_id: "bmux.perf-tools.noop".to_string(),
+        request: bmux_plugin_sdk::ServiceRequest {
+            caller_plugin_id: "bmux.perf-tools".to_string(),
+            service: bmux_plugin_sdk::RegisteredService {
+                capability,
+                kind: bmux_plugin_sdk::ServiceKind::Query,
+                interface_id: "perf-noop/v1".to_string(),
+                provider: bmux_plugin_sdk::ProviderId::Plugin("bmux.perf-tools.noop".to_string()),
+            },
+            operation: "ping".to_string(),
+            payload,
+        },
+        required_capabilities: Vec::new(),
+        provided_capabilities: vec!["bmux.perf_tools.noop".to_string()],
+        services: Vec::new(),
+        available_capabilities: Vec::new(),
+        enabled_plugins: vec!["bmux.perf-tools.noop".to_string()],
+        plugin_search_roots: Vec::new(),
+        host: bmux_plugin_sdk::HostMetadata {
+            product_name: "bmux".to_string(),
+            product_version: env!("CARGO_PKG_VERSION").to_string(),
+            plugin_api_version: bmux_plugin_sdk::CURRENT_PLUGIN_API_VERSION,
+            plugin_abi_version: bmux_plugin_sdk::CURRENT_PLUGIN_ABI_VERSION,
+        },
+        connection: bmux_plugin_sdk::HostConnectionInfo {
+            config_dir: String::new(),
+            config_dir_candidates: Vec::new(),
+            runtime_dir: String::new(),
+            data_dir: String::new(),
+            state_dir: String::new(),
+        },
+        settings: None,
+        plugin_settings_map: BTreeMap::new(),
+        caller_client_id: None,
+        cancellation: bmux_plugin_sdk::CancellationToken::default(),
+        host_kernel_bridge: None,
+    };
+    let call = bmux_plugin_sdk::definition::PluginCallContext {
+        callback_execution: None,
+        invocation_id: context.cancellation.invocation_id.clone(),
+        cancellation: bmux_plugin_sdk::ServiceCancellation::new(),
+        host_services: None,
+    };
     let response = loaded
-        .invoke_service(&bmux_plugin_sdk::NativeServiceContext {
-            host_service_port: None,
-            plugin_id: "bmux.perf-tools.noop".to_string(),
-            request: bmux_plugin_sdk::ServiceRequest {
-                caller_plugin_id: "bmux.perf-tools".to_string(),
-                service: bmux_plugin_sdk::RegisteredService {
-                    capability,
-                    kind: bmux_plugin_sdk::ServiceKind::Query,
-                    interface_id: "perf-noop/v1".to_string(),
-                    provider: bmux_plugin_sdk::ProviderId::Plugin(
-                        "bmux.perf-tools.noop".to_string(),
-                    ),
-                },
-                operation: "ping".to_string(),
-                payload,
-            },
-            required_capabilities: Vec::new(),
-            provided_capabilities: vec!["bmux.perf_tools.noop".to_string()],
-            services: Vec::new(),
-            available_capabilities: Vec::new(),
-            enabled_plugins: vec!["bmux.perf-tools.noop".to_string()],
-            plugin_search_roots: Vec::new(),
-            host: bmux_plugin_sdk::HostMetadata {
-                product_name: "bmux".to_string(),
-                product_version: env!("CARGO_PKG_VERSION").to_string(),
-                plugin_api_version: bmux_plugin_sdk::CURRENT_PLUGIN_API_VERSION,
-                plugin_abi_version: bmux_plugin_sdk::CURRENT_PLUGIN_ABI_VERSION,
-            },
-            connection: bmux_plugin_sdk::HostConnectionInfo {
-                config_dir: String::new(),
-                config_dir_candidates: Vec::new(),
-                runtime_dir: String::new(),
-                data_dir: String::new(),
-                state_dir: String::new(),
-            },
-            settings: None,
-            plugin_settings_map: BTreeMap::new(),
-            caller_client_id: None,
-            cancellation: bmux_plugin_sdk::CancellationToken::default(),
-            host_kernel_bridge: None,
-        })
-        .map_err(|error| format!("noop service invocation failed: {error}"))?;
+        .runtime
+        .block_on(loaded.instance.invoke(call, context))
+        .map_err(|error| format!("noop service invocation failed: {}", error.message))?;
     if let Some(error) = response.error {
         return Err(format!("noop service returned error: {}", error.message));
     }
@@ -2778,6 +2800,17 @@ fn invoke_performance_get_settings(loaded: &bmux_plugin::LoadedPlugin) -> Result
 #[derive(Default)]
 struct PerfNoopPlugin;
 
+impl PerfNoopPlugin {
+    fn route(context: bmux_plugin_sdk::NativeServiceContext) -> bmux_plugin_sdk::ServiceResponse {
+        bmux_plugin_sdk::route_service!(context, {
+            "perf-noop/v1", "ping" => |_req: (), _ctx| {
+                Ok::<(), bmux_plugin_sdk::ServiceResponse>(())
+            },
+        })
+    }
+}
+
+// Declares the noop's (empty) service contract for definition metadata.
 impl bmux_plugin_sdk::RustPlugin for PerfNoopPlugin {
     type Contract = bmux_plugin_sdk::NoPluginContract;
 
@@ -2785,11 +2818,20 @@ impl bmux_plugin_sdk::RustPlugin for PerfNoopPlugin {
         &self,
         context: bmux_plugin_sdk::NativeServiceContext,
     ) -> bmux_plugin_sdk::ServiceResponse {
-        bmux_plugin_sdk::route_service!(context, {
-            "perf-noop/v1", "ping" => |_req: (), _ctx| {
-                Ok::<(), bmux_plugin_sdk::ServiceResponse>(())
-            },
-        })
+        Self::route(context)
+    }
+}
+
+impl bmux_plugin_sdk::definition::PluginInstance for PerfNoopPlugin {
+    fn invoke(
+        &self,
+        _call: bmux_plugin_sdk::definition::PluginCallContext,
+        context: bmux_plugin_sdk::NativeServiceContext,
+    ) -> bmux_plugin_sdk::definition::PluginFuture<
+        '_,
+        bmux_plugin_sdk::definition::PluginResult<bmux_plugin_sdk::ServiceResponse>,
+    > {
+        Box::pin(async move { Ok(Self::route(context)) })
     }
 }
 

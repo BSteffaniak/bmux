@@ -41,7 +41,7 @@ mod registry;
 pub mod render;
 mod service_location;
 mod startup_gate;
-mod static_vtable_registry;
+mod static_definition_registry;
 pub mod stream_admission;
 #[cfg(feature = "tui")]
 pub mod surface;
@@ -90,11 +90,7 @@ pub use loader::scoped::{
     OperationSignal, VerifiedArtifact, WeakCallbackEntryLease,
 };
 pub use loader::{
-    LoadedPlugin, NativePluginLoader, NativeServiceBufferConfig, executable_sha256,
-    load_registered_plugin, load_registered_plugin_with_native_service_buffer_config,
-    load_static_plugin, load_static_plugin_with_native_service_buffer_config,
-    load_trusted_static_plugin, load_trusted_static_plugin_with_native_service_buffer_config,
-    retain_executable,
+    LoadedPlugin, NativePluginLoader, executable_sha256, load_process_plugin, retain_executable,
 };
 pub use manifest::{
     PluginManifest, PluginManifestCompatibility, PluginManifestExtension,
@@ -136,36 +132,9 @@ pub use startup_gate::{
     StartupReadyGate, StartupReadyGateRegistry, global_startup_ready_gate_registry,
     register_startup_ready_gate, registered_startup_ready_gates,
 };
-pub use static_vtable_registry::{register_static_vtable, static_vtable};
 pub use typed_dispatch_bridge::{
     ASYNC_SERVICE_ROUTE_V1, AsyncCommandRouteGuard, AsyncServiceClient, AsyncServiceRequest,
     ServiceCallerDispatchClient, block_on_typed_dispatch, capture_async_command_route,
     enter_async_command_route,
 };
 pub use typed_service_caller::TypedServiceCaller;
-
-/// Default exported symbol used to invoke a plugin command.
-pub const DEFAULT_NATIVE_COMMAND_SYMBOL: &str = "bmux_plugin_run_command_v1";
-
-/// Default exported symbol used to invoke a plugin command with host context.
-pub const DEFAULT_NATIVE_COMMAND_WITH_CONTEXT_SYMBOL: &str =
-    "bmux_plugin_run_command_with_context_v1";
-
-/// Default exported symbol used to activate a plugin lifecycle hook.
-pub const DEFAULT_NATIVE_ACTIVATE_SYMBOL: &str = "bmux_plugin_activate_v1";
-
-/// Default exported symbol used to deactivate a plugin lifecycle hook.
-pub const DEFAULT_NATIVE_DEACTIVATE_SYMBOL: &str = "bmux_plugin_deactivate_v1";
-
-/// Default exported symbol used to deliver plugin events.
-pub const DEFAULT_NATIVE_EVENT_SYMBOL: &str = "bmux_plugin_handle_event_v1";
-
-/// Default exported symbol used to register activation-time plugin contributions.
-pub const DEFAULT_NATIVE_REGISTER_CONTRIBUTIONS_SYMBOL: &str =
-    "bmux_plugin_register_contributions_v1";
-
-/// Default exported symbol used to invoke a plugin-provided service.
-pub const DEFAULT_NATIVE_SERVICE_SYMBOL: &str = "bmux_plugin_invoke_service_v1";
-
-/// Default exported symbol used to invoke a plugin-provided streaming service.
-pub const DEFAULT_NATIVE_STREAMING_SERVICE_SYMBOL: &str = "bmux_plugin_invoke_streaming_service_v1";

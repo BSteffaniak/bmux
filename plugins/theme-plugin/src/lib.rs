@@ -2913,7 +2913,7 @@ mod tests {
     #[derive(Default)]
     struct CountedTheme {
         plugin: ThemePlugin,
-        calls: std::sync::atomic::AtomicUsize,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     impl RustPlugin for CountedTheme {
@@ -2925,10 +2925,86 @@ mod tests {
         }
     }
 
-    #[test]
-    fn checked_theme_mismatch_prevents_actual_provider_invocation() {
-        use bmux_plugin_sdk::{PluginContract, PluginInvocationId, ServiceEnvelopeKind};
-        let plugin = Box::leak(Box::new(std::sync::RwLock::new(CountedTheme::default())));
+    /// Test-only host authority: always live, never cancelled. Stands in for
+    /// the admitted invocation scope a real host binds per call.
+    struct TestAuthority;
+    impl bmux_plugin_sdk::PluginCallbackAuthoritySource for TestAuthority {
+        fn check_live(&self) -> bmux_plugin_sdk::definition::PluginResult<()> {
+            Ok(())
+        }
+        fn enter_adapter_entry(
+            &self,
+            _: bmux_plugin_sdk::definition::LoadedInstanceId,
+        ) -> bmux_plugin_sdk::definition::PluginResult<bmux_plugin_sdk::PluginCallbackEntryGuard>
+        {
+            Ok(bmux_plugin_sdk::PluginCallbackEntryGuard::from_host(()))
+        }
+        fn cancelled(&self) -> bmux_plugin_sdk::PluginCallbackSettlement {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    /// Test-only selected executor that runs already entered callbacks on a
+    /// blocking worker after revalidating the entry.
+    struct TestExecutor;
+    impl bmux_plugin_sdk::PluginCallbackExecution for TestExecutor {
+        fn execute(
+            &self,
+            _: bmux_plugin_sdk::PluginCallbackAuthority,
+            _: bmux_plugin_sdk::definition::LoadedInstanceId,
+            _: bmux_plugin_sdk::PluginBlockingCallback,
+        ) -> bmux_plugin_sdk::PluginCallbackSettlement {
+            Box::pin(async {
+                Err(PluginCommandError::unavailable(
+                    "test executor requires a prepared entry",
+                ))
+            })
+        }
+        fn execute_entered(
+            &self,
+            authority: bmux_plugin_sdk::PluginCallbackAuthority,
+            instance: bmux_plugin_sdk::definition::LoadedInstanceId,
+            entry: bmux_plugin_sdk::PluginCallbackEntryGuard,
+            callback: bmux_plugin_sdk::PluginBlockingCallback,
+        ) -> bmux_plugin_sdk::PluginCallbackSettlement {
+            Box::pin(async move {
+                entry.validate_for(&authority, instance)?;
+                tokio::task::spawn_blocking(move || {
+                    entry.validate_for(&authority, instance)?;
+                    let result = callback();
+                    drop(entry);
+                    result
+                })
+                .await
+                .map_err(|error| PluginCommandError::failed(error.to_string()))?
+            })
+        }
+    }
+
+    fn checked_invocation(
+        context: &NativeServiceContext,
+    ) -> bmux_plugin_sdk::definition::PluginCallContext {
+        bmux_plugin_sdk::definition::PluginCallContext {
+            callback_execution: Some(bmux_plugin_sdk::PluginCallbackContext::from_host(
+                bmux_plugin_sdk::PluginCallbackAuthority::from_host(Arc::new(TestAuthority)),
+                bmux_plugin_sdk::PluginCallbackExecutor::from_host(Arc::new(TestExecutor)),
+            )),
+            invocation_id: context.cancellation.invocation_id.clone(),
+            cancellation: bmux_plugin_sdk::ServiceCancellation::new(),
+            host_services: None,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn checked_theme_mismatch_prevents_actual_provider_invocation() {
+        use bmux_plugin_sdk::PluginContract;
+        use bmux_plugin_sdk::definition::PluginInstance;
+        let counted = CountedTheme::default();
+        let calls = Arc::clone(&counted.calls);
+        let adapter = bmux_plugin_sdk::definition::RustPluginAdapter::for_instance(
+            counted,
+            bmux_plugin_sdk::definition::LoadedInstanceId::from_uuid(uuid::Uuid::from_u128(0x7e)),
+        );
         assert_eq!(
             <<ThemePlugin as RustPlugin>::Contract as PluginContract>::service_contract_for(
                 "theme-state"
@@ -2938,8 +3014,8 @@ mod tests {
         assert_ne!(SERVICE_CONTRACT, [] as [u8; 0]);
         assert!(bmux_plugin_sdk::service_contract::encode("theme-state", &[], b"request").is_err());
         assert!(bmux_plugin_sdk::service_contract::decode_response(b"legacy response").is_err());
-        for (contract, expected_status, expected_calls) in
-            [(&[0_u8; 32][..], 6, 0), (SERVICE_CONTRACT, 0, 1)]
+        for (contract, accepted, expected_calls) in
+            [(&[0_u8; 32][..], false, 0), (SERVICE_CONTRACT, true, 1)]
         {
             let mut context = service_context(None);
             context.request.payload = bmux_plugin_sdk::service_contract::encode(
@@ -2948,41 +3024,13 @@ mod tests {
                 &context.request.payload,
             )
             .unwrap();
-            let request = bmux_plugin_sdk::encode_service_envelope_with_invocation_id(
-                PluginInvocationId::new(),
-                1,
-                ServiceEnvelopeKind::Request,
-                &context,
-            )
-            .unwrap();
-            let mut output = vec![0; 65536];
-            let mut output_len = 0;
-            let status = bmux_plugin_sdk::__private::invoke_service_export(
-                plugin,
-                request.as_ptr(),
-                request.len(),
-                output.as_mut_ptr(),
-                output.len(),
-                &raw mut output_len,
-            );
-            assert_eq!(status, expected_status);
+            let result = adapter.invoke(checked_invocation(&context), context).await;
+            assert_eq!(result.is_ok(), accepted, "{result:?}");
             assert_eq!(
-                plugin
-                    .read()
-                    .unwrap()
-                    .calls
-                    .load(std::sync::atomic::Ordering::SeqCst),
+                calls.load(std::sync::atomic::Ordering::SeqCst),
                 expected_calls
             );
-            if expected_calls == 0 {
-                assert_eq!(output_len, 0);
-            } else {
-                let (_, _, response): (_, _, ServiceResponse) =
-                    bmux_plugin_sdk::decode_service_envelope_with_invocation_id(
-                        &output[..output_len],
-                        ServiceEnvelopeKind::Response,
-                    )
-                    .unwrap();
+            if let Ok(response) = result {
                 assert!(response.error.is_none(), "{:?}", response.error);
                 let payload =
                     bmux_plugin_sdk::service_contract::decode_response(&response.payload).unwrap();

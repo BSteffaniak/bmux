@@ -51,9 +51,8 @@ impl PluginId {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PluginEntrypoint {
-    Native {
-        symbol: String,
-    },
+    /// Loaded through the shared scoped definition ABI.
+    Native,
     Process {
         command: String,
         args: Vec<String>,
@@ -390,9 +389,7 @@ mod tests {
             plugin_version: "0.1.0".to_string(),
             plugin_api: VersionRange::at_least(ApiVersion::new(1, 0)),
             native_abi: VersionRange::at_least(ApiVersion::new(1, 0)),
-            entrypoint: PluginEntrypoint::Native {
-                symbol: "bmux_plugin_entry_v1".to_string(),
-            },
+            entrypoint: PluginEntrypoint::Native,
             description: None,
             homepage: None,
             provider_priority: 0,
@@ -451,9 +448,7 @@ mod tests {
             plugin_version: "0.1.0".to_string(),
             plugin_api: VersionRange::at_least(ApiVersion::new(1, 0)),
             native_abi: VersionRange::at_least(ApiVersion::new(1, 0)),
-            entrypoint: PluginEntrypoint::Native {
-                symbol: "bmux_plugin_entry_v1".to_string(),
-            },
+            entrypoint: PluginEntrypoint::Native,
             description: None,
             homepage: None,
             provider_priority: 0,
@@ -495,9 +490,7 @@ mod tests {
             plugin_version: "0.1.0".to_string(),
             plugin_api: VersionRange::at_least(ApiVersion::new(1, 0)),
             native_abi: VersionRange::at_least(ApiVersion::new(1, 0)),
-            entrypoint: PluginEntrypoint::Native {
-                symbol: "bmux_plugin_entry_v1".to_string(),
-            },
+            entrypoint: PluginEntrypoint::Native,
             description: None,
             homepage: None,
             provider_priority: 0,

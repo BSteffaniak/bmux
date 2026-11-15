@@ -446,7 +446,11 @@ impl RustPlugin for HelloPlugin {
     }
 }
 
-bmux_plugin_sdk::export_plugin!(HelloPlugin, include_str!("../plugin.toml"));
+bmux_plugin_sdk::define_plugin!(
+    rust_plugin = HelloPlugin,
+    manifest = include_str!("../plugin.toml"),
+    roles = vec![bmux_plugin_sdk::ComponentRole::Backend],
+);
 ```
 
 ### 3. `Cargo.toml`
@@ -457,18 +461,13 @@ name    = "my_plugin"
 edition = "2024"
 version = "0.1.0"
 
-[lib]
-crate-type = ["cdylib", "rlib"]
-
 [dependencies]
 bmux_plugin_sdk = { version = "..." }
-
-[features]
-static-bundled = []
 ```
 
-`crate-type` must include `cdylib` (for dynamic loading) and `rlib` (for static
-bundling into the host binary).
+The implementation is a plain export-free `rlib` with no static or dynamic
+features. Hosts bundle it by calling `plugin_definition()`; dynamic artifacts
+come only from the thin wrapper `scripts/package-plugin.py` generates.
 
 ## The `RustPlugin` Trait
 
@@ -707,20 +706,19 @@ need `bmux_plugin`.
 
 ### Top-Level Fields
 
-| Field                   | Type    | Required | Default                  | Description                                                |
-| ----------------------- | ------- | -------- | ------------------------ | ---------------------------------------------------------- |
-| `id`                    | string  | **Yes**  | --                       | Unique plugin identifier (e.g. `"bmux.clipboard"`)         |
-| `name`                  | string  | **Yes**  | --                       | Human-readable display name                                |
-| `version`               | string  | **Yes**  | --                       | Plugin version (semver)                                    |
-| `description`           | string  | No       | --                       | Optional description                                       |
-| `homepage`              | string  | No       | --                       | Optional URL                                               |
-| `runtime`               | string  | No       | `"native"`               | Runtime type (only `"native"` supported)                   |
-| `entry`                 | path    | No       | --                       | Path to `.dylib`/`.so` (only for external plugins)         |
-| `entry_symbol`          | string  | No       | `"bmux_plugin_entry_v1"` | FFI entry symbol                                           |
-| `provider_priority`     | integer | No       | `0`                      | Ordering when multiple plugins provide the same capability |
-| `required_capabilities` | list    | No       | `[]`                     | Host capabilities this plugin needs                        |
-| `provided_capabilities` | list    | No       | `[]`                     | Capabilities this plugin provides                          |
-| `provided_features`     | list    | No       | `[]`                     | Feature flags this plugin provides                         |
+| Field                   | Type    | Required | Default    | Description                                                |
+| ----------------------- | ------- | -------- | ---------- | ---------------------------------------------------------- |
+| `id`                    | string  | **Yes**  | --         | Unique plugin identifier (e.g. `"bmux.clipboard"`)         |
+| `name`                  | string  | **Yes**  | --         | Human-readable display name                                |
+| `version`               | string  | **Yes**  | --         | Plugin version (semver)                                    |
+| `description`           | string  | No       | --         | Optional description                                       |
+| `homepage`              | string  | No       | --         | Optional URL                                               |
+| `runtime`               | string  | No       | `"native"` | Runtime type (only `"native"` supported)                   |
+| `entry`                 | path    | No       | --         | Path to `.dylib`/`.so` (only for external plugins)         |
+| `provider_priority`     | integer | No       | `0`        | Ordering when multiple plugins provide the same capability |
+| `required_capabilities` | list    | No       | `[]`       | Host capabilities this plugin needs                        |
+| `provided_capabilities` | list    | No       | `[]`       | Capabilities this plugin provides                          |
+| `provided_features`     | list    | No       | `[]`       | Feature flags this plugin provides                         |
 
 ### Compatibility (optional)
 

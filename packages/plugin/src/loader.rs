@@ -6,12 +6,8 @@ mod auxiliary;
 pub use auxiliary::{executable_sha256, retain_executable};
 
 use crate::{
-    CapabilityProvider, DEFAULT_NATIVE_ACTIVATE_SYMBOL, DEFAULT_NATIVE_COMMAND_SYMBOL,
-    DEFAULT_NATIVE_COMMAND_WITH_CONTEXT_SYMBOL, DEFAULT_NATIVE_DEACTIVATE_SYMBOL,
-    DEFAULT_NATIVE_EVENT_SYMBOL, DEFAULT_NATIVE_REGISTER_CONTRIBUTIONS_SYMBOL,
-    DEFAULT_NATIVE_SERVICE_SYMBOL, DEFAULT_NATIVE_STREAMING_SERVICE_SYMBOL, PluginDeclaration,
-    PluginEntrypoint, PluginRegistry, RegisteredPlugin, ServiceCaller,
-    discover_registered_plugins_in_roots, test_support::test_service_router,
+    CapabilityProvider, PluginDeclaration, PluginEntrypoint, PluginRegistry, RegisteredPlugin,
+    ServiceCaller, discover_registered_plugins_in_roots, test_support::test_service_router,
 };
 use bmux_ipc::{
     InvokeServiceKind, Request as IpcRequest, Response as IpcResponse,
@@ -24,21 +20,17 @@ use bmux_plugin_sdk::{
     CORE_CLI_COMMAND_RUN_PLUGIN_OPERATION_V1, CoreCliCommandRequest, CoreCliCommandResponse,
     HostConnectionInfo, HostKernelBridge, HostKernelBridgeRequest, HostKernelBridgeResponse,
     HostMetadata, HostScope, NativeCommandContext, NativeLifecycleContext, NativeServiceContext,
-    NativeStreamingServiceContext, PROCESS_RUNTIME_ENV_PERSISTENT_WORKER,
-    PROCESS_RUNTIME_ENV_PLUGIN_ID, PROCESS_RUNTIME_ENV_PROTOCOL, PROCESS_RUNTIME_PROTOCOL_V1,
-    PROCESS_RUNTIME_TRANSPORT_STDIO_V1, PluginCliCommandRequest, PluginCliCommandResponse,
-    PluginError, PluginEvent, PluginInvocationId, ProcessInvocationRequest,
-    ProcessInvocationResponse, RegisteredService, Result, ServiceEnvelopeKind, ServiceKind,
-    ServiceRequest, ServiceResponse, StaticPluginVtable, decode_process_invocation_response,
-    decode_service_envelope_with_invocation_id, decode_service_message,
-    encode_host_kernel_bridge_cli_command_payload,
+    PROCESS_RUNTIME_ENV_PERSISTENT_WORKER, PROCESS_RUNTIME_ENV_PLUGIN_ID,
+    PROCESS_RUNTIME_ENV_PROTOCOL, PROCESS_RUNTIME_PROTOCOL_V1, PROCESS_RUNTIME_TRANSPORT_STDIO_V1,
+    PluginCliCommandRequest, PluginCliCommandResponse, PluginError, PluginEvent,
+    PluginInvocationId, ProcessInvocationRequest, ProcessInvocationResponse, RegisteredService,
+    Result, ServiceKind, ServiceRequest, ServiceResponse, decode_process_invocation_response,
+    decode_service_message, encode_host_kernel_bridge_cli_command_payload,
     encode_host_kernel_bridge_plugin_command_payload, encode_process_invocation_request,
-    encode_service_envelope_with_invocation_id, encode_service_message,
+    encode_service_message,
 };
-use libloading::{Library, Symbol};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::ffi::{CStr, CString, c_char};
 use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -54,145 +46,10 @@ use std::{io::ErrorKind, os::unix::process::ExitStatusExt};
 use std::{io::ErrorKind, os::windows::process::ExitStatusExt};
 use tracing::{debug, warn};
 
-type PluginEntryFn = unsafe extern "C" fn() -> *const c_char;
-type NativeRunCommandFn = unsafe extern "C" fn(*const c_char, usize, *const *const c_char) -> i32;
-type NativeRunCommandWithContextFn = unsafe extern "C" fn(*const u8, usize) -> i32;
-type NativeLifecycleFn = unsafe extern "C" fn(*const u8, usize) -> i32;
-type NativeEventFn = unsafe extern "C" fn(*const u8, usize) -> i32;
-type NativeRegisterContributionsFn = unsafe extern "C" fn(*mut u8, usize, *mut usize) -> i32;
-type NativeInvokeServiceFn =
-    unsafe extern "C" fn(*const u8, usize, *mut u8, usize, *mut usize) -> i32;
-
-const NATIVE_SERVICE_STATUS_OK: i32 = 0;
-const NATIVE_SERVICE_STATUS_BUFFER_TOO_SMALL: i32 = 4;
-// Checked-export ABI rejection; ordinary decode status 3 is not reinterpreted.
-const NATIVE_SERVICE_STATUS_CONTRACT_REJECTED: i32 = 6;
-const NATIVE_SERVICE_INITIAL_RESPONSE_BYTES: usize = 4096;
-const NATIVE_SERVICE_MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
-const NATIVE_SERVICE_BUFFER_RESIZE_ATTEMPTS: usize = 8;
 const KERNEL_STATUS_OK: i32 = 0;
 const KERNEL_STATUS_BUFFER_TOO_SMALL: i32 = 4;
 const PROCESS_PLUGIN_TIMEOUT_ENV_VAR: &str = "BMUX_PROCESS_PLUGIN_TIMEOUT_MS";
 const PROCESS_PLUGIN_TIMEOUT_DEFAULT_MS: u64 = 30_000;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct NativeServiceBufferConfig {
-    pub initial_response_bytes: usize,
-    pub max_response_bytes: usize,
-    pub buffer_resize_attempts: usize,
-}
-
-impl Default for NativeServiceBufferConfig {
-    fn default() -> Self {
-        Self {
-            initial_response_bytes: NATIVE_SERVICE_INITIAL_RESPONSE_BYTES,
-            max_response_bytes: NATIVE_SERVICE_MAX_RESPONSE_BYTES,
-            buffer_resize_attempts: NATIVE_SERVICE_BUFFER_RESIZE_ATTEMPTS,
-        }
-    }
-}
-
-fn classify_native_service_error(error: PluginError, checked: bool) -> PluginError {
-    if checked
-        && matches!(
-            &error,
-            PluginError::NativeServiceInvocation {
-                status: NATIVE_SERVICE_STATUS_CONTRACT_REJECTED,
-                ..
-            }
-        )
-    {
-        PluginError::ServiceProtocol {
-            details: "checked provider rejected generated interface contract before execution"
-                .into(),
-        }
-    } else {
-        error
-    }
-}
-
-fn invoke_native_service_resizing_output<F>(
-    plugin_id: &str,
-    config: NativeServiceBufferConfig,
-    mut call_service: F,
-) -> Result<(Vec<u8>, usize)>
-where
-    F: FnMut(&mut [u8], &mut usize) -> i32,
-{
-    let mut output = vec![0_u8; config.initial_response_bytes];
-    let mut buffer_resize_attempts = 0_usize;
-    let output_len = loop {
-        let mut output_len = 0_usize;
-        let status = call_service(&mut output, &mut output_len);
-        if status == NATIVE_SERVICE_STATUS_OK {
-            break output_len;
-        }
-        if status != NATIVE_SERVICE_STATUS_BUFFER_TOO_SMALL {
-            return Err(PluginError::NativeServiceInvocation {
-                plugin_id: plugin_id.to_string(),
-                status,
-            });
-        }
-
-        buffer_resize_attempts += 1;
-        if buffer_resize_attempts > config.buffer_resize_attempts {
-            return Err(PluginError::InvalidNativeServiceOutput {
-                plugin_id: plugin_id.to_string(),
-                details: format!(
-                    "service response kept outgrowing buffers after {buffer_resize_attempts} attempts; last required {output_len} bytes for {} byte buffer",
-                    output.len(),
-                ),
-            });
-        }
-
-        let doubled = output.len().saturating_mul(2);
-        let next_len = output_len.max(doubled);
-        if next_len > config.max_response_bytes {
-            return Err(PluginError::InvalidNativeServiceOutput {
-                plugin_id: plugin_id.to_string(),
-                details: format!(
-                    "service response requires {next_len} bytes, exceeding max native service response size of {} bytes",
-                    config.max_response_bytes,
-                ),
-            });
-        }
-        if next_len <= output.len() {
-            return Err(PluginError::InvalidNativeServiceOutput {
-                plugin_id: plugin_id.to_string(),
-                details: format!(
-                    "service reported buffer too small but requested non-growing buffer size {next_len} bytes",
-                ),
-            });
-        }
-        output.resize(next_len, 0);
-    };
-
-    if output_len > output.len() {
-        return Err(PluginError::InvalidNativeServiceOutput {
-            plugin_id: plugin_id.to_string(),
-            details: format!(
-                "service returned {output_len} bytes into {} byte buffer",
-                output.len(),
-            ),
-        });
-    }
-    output.truncate(output_len);
-    Ok((output, buffer_resize_attempts))
-}
-
-static LOCAL_STATIC_SERVICE_PROVIDER_CACHE: OnceLock<Mutex<BTreeMap<String, Arc<LoadedPlugin>>>> =
-    OnceLock::new();
-
-/// Backend that a [`LoadedPlugin`] uses to dispatch calls.
-#[derive(Debug)]
-enum PluginBackend {
-    /// Dynamically loaded shared library (third-party / filesystem plugins).
-    Dynamic(Library),
-    /// Statically linked into the binary (bundled plugins behind feature flags).
-    Static(StaticPluginVtable),
-    /// External process plugin runtime.
-    Process(ProcessPluginRuntime),
-}
 
 #[derive(Debug, Clone)]
 struct ProcessPluginRuntime {
@@ -797,67 +654,6 @@ fn deserialize_toml_option<'de, D: serde::Deserializer<'de>>(
         .map_err(serde::de::Error::custom)
 }
 
-fn local_static_service_provider_cache() -> &'static Mutex<BTreeMap<String, Arc<LoadedPlugin>>> {
-    LOCAL_STATIC_SERVICE_PROVIDER_CACHE.get_or_init(|| Mutex::new(BTreeMap::new()))
-}
-
-fn load_static_service_provider_cached(
-    provider_plugin_id: &str,
-    host: &HostMetadata,
-    available_capability_map: &BTreeMap<HostScope, CapabilityProvider>,
-) -> Result<Option<Arc<LoadedPlugin>>> {
-    let Some(vtable) = crate::static_vtable(provider_plugin_id) else {
-        return Ok(None);
-    };
-
-    if let Ok(cache) = local_static_service_provider_cache().lock()
-        && let Some(loaded) = cache.get(provider_plugin_id)
-    {
-        return Ok(Some(Arc::clone(loaded)));
-    }
-
-    let manifest_ptr = (vtable.entry)();
-    if manifest_ptr.is_null() {
-        return Err(PluginError::NullPluginEntry {
-            plugin_id: provider_plugin_id.to_string(),
-            symbol: "static_vtable::entry".to_string(),
-        });
-    }
-    let manifest_cstr = unsafe { std::ffi::CStr::from_ptr(manifest_ptr) };
-    let manifest_text = manifest_cstr
-        .to_str()
-        .map_err(|_| PluginError::InvalidPluginEntry {
-            plugin_id: provider_plugin_id.to_string(),
-            symbol: "static_vtable::entry".to_string(),
-            details: "embedded manifest is not valid UTF-8".to_string(),
-        })?;
-    let embedded_manifest = crate::PluginManifest::from_toml_str(manifest_text)?;
-    let mut declaration = embedded_manifest.to_declaration()?;
-    declaration.merge_services((vtable.declared_services)()?)?;
-    let synthetic = RegisteredPlugin {
-        search_root: PathBuf::new(),
-        manifest_path: PathBuf::new(),
-        manifest: embedded_manifest,
-        declaration,
-        bundled_static: true,
-    };
-    let loaded = Arc::new(load_static_plugin(
-        &synthetic,
-        vtable,
-        host,
-        available_capability_map,
-    )?);
-
-    if let Ok(mut cache) = local_static_service_provider_cache().lock() {
-        let entry = cache
-            .entry(provider_plugin_id.to_string())
-            .or_insert_with(|| Arc::clone(&loaded));
-        return Ok(Some(Arc::clone(entry)));
-    }
-
-    Ok(Some(loaded))
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CoreStorageGetRequest {
     pub(crate) key: String,
@@ -1279,32 +1075,33 @@ pub fn call_service_raw(
         })
         .collect::<BTreeMap<_, _>>();
 
-    // Bundled static providers are already registered in-process. Keep
-    // them off the filesystem discovery path entirely and reuse the
-    // loaded dispatch wrapper across local plugin-to-plugin calls.
-    let loaded = if let Some(loaded) =
-        load_static_service_provider_cached(&provider_plugin_id, host, &available_capability_map)?
-    {
-        loaded
-    } else {
-        let search_roots = plugin_search_roots
-            .iter()
-            .map(PathBuf::from)
-            .collect::<Vec<_>>();
-        let registry = discover_registered_plugins_in_roots(&search_roots)?;
-        let registered = registry.get(&provider_plugin_id).ok_or_else(|| {
-            PluginError::MissingServiceProvider {
+    // Native providers are reachable only through the caller's selected host
+    // service port. Only an explicitly process-packaged provider is started on
+    // demand; nothing else is loaded or substituted here.
+    let search_roots = plugin_search_roots
+        .iter()
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
+    let registry = discover_registered_plugins_in_roots(&search_roots)?;
+    let registered =
+        registry
+            .get(&provider_plugin_id)
+            .ok_or_else(|| PluginError::MissingServiceProvider {
                 provider_plugin_id: provider_plugin_id.clone(),
                 capability: service.capability.as_str().to_string(),
                 interface_id: service.interface_id.clone(),
-            }
-        })?;
-        Arc::new(load_registered_plugin(
-            registered,
-            host,
-            &available_capability_map,
-        )?)
-    };
+            })?;
+    if !matches!(
+        registered.declaration.entrypoint,
+        PluginEntrypoint::Process { .. }
+    ) {
+        return Err(PluginError::ServiceProtocol {
+            details: format!(
+                "native provider '{provider_plugin_id}' is reachable only through a selected host service port"
+            ),
+        });
+    }
+    let loaded = load_process_plugin(registered, host, &available_capability_map)?;
     let mut provider_context = NativeServiceContext {
         plugin_id: provider_plugin_id,
         request: ServiceRequest {
@@ -1577,12 +1374,18 @@ fn validate_storage_key(key: &str) -> Result<()> {
     crate::host_builtins::validate_storage_key(key)
 }
 
+/// Process lifecycle hook names carried by the process wire protocol. They keep
+/// their historical values for protocol compatibility; nothing resolves them
+/// as native symbols.
+const PROCESS_ACTIVATE_HOOK: &str = "bmux_plugin_activate_v1";
+const PROCESS_DEACTIVATE_HOOK: &str = "bmux_plugin_deactivate_v1";
+
+/// An explicitly process-packaged plugin. Native implementations never load
+/// here: bundled and dynamic native plugins use the scoped definition loader.
 pub struct LoadedPlugin {
     pub registered: RegisteredPlugin,
     pub declaration: PluginDeclaration,
-    backend: PluginBackend,
-    native_service_buffers: NativeServiceBufferConfig,
-    background_tasks: Box<Mutex<Option<bmux_plugin_runtime::background::BackgroundTasks>>>,
+    runtime: ProcessPluginRuntime,
     concurrency_gate: ConcurrencyGate,
 }
 
@@ -1635,34 +1438,14 @@ impl LoadedPlugin {
         &self,
         context: &NativeLifecycleContext,
     ) -> Result<NativeLifecycleContext> {
-        let base = if matches!(self.backend, PluginBackend::Static(_)) {
-            std::env::current_exe()
-                .and_then(|path| path.canonicalize())
-                .map_err(|error| error.to_string())
-                .and_then(|path| {
-                    path.parent()
-                        .map(PathBuf::from)
-                        .ok_or_else(|| "canonical host executable has no parent".into())
-                })
-        } else {
-            self.registered
-                .manifest_path
-                .parent()
-                .filter(|path| path.is_absolute())
-                .map(PathBuf::from)
-                .ok_or_else(|| {
-                    "auxiliary package manifest has no absolute authoritative root".into()
-                })
-        };
+        let base = self
+            .registered
+            .manifest_path
+            .parent()
+            .filter(|path| path.is_absolute())
+            .map(PathBuf::from)
+            .ok_or_else(|| "auxiliary package manifest has no absolute authoritative root".into());
         resolve_lifecycle_auxiliaries(&self.registered, &base, context.clone())
-    }
-
-    const fn backend_kind(&self) -> &'static str {
-        match &self.backend {
-            PluginBackend::Static(_) => "static",
-            PluginBackend::Dynamic(_) => "dynamic",
-            PluginBackend::Process(_) => "process",
-        }
     }
 
     #[must_use]
@@ -1680,56 +1463,29 @@ impl LoadedPlugin {
             .collect()
     }
 
-    /// Collect activation-time contributions without running cheap manifest discovery.
+    /// Process plugins have no activation-time contribution hook.
     ///
     /// # Errors
     ///
-    /// Returns when a plugin contribution hook fails or returns invalid transport data.
-    pub fn collect_activation_contributions(
+    /// Never fails; the result type matches scoped executions.
+    pub const fn collect_activation_contributions(
         &self,
     ) -> bmux_plugin_sdk::Result<Vec<bmux_plugin_sdk::PluginContribution>> {
-        match &self.backend {
-            PluginBackend::Static(vtable) => (vtable.register_contributions)(),
-            PluginBackend::Dynamic(library) => {
-                let symbol: Symbol<'_, NativeRegisterContributionsFn> = match lookup_dynamic_symbol(
-                    library,
-                    self.declaration.id.as_str(),
-                    DEFAULT_NATIVE_REGISTER_CONTRIBUTIONS_SYMBOL,
-                ) {
-                    Ok(symbol) => symbol,
-                    Err(_) => return Ok(Vec::new()),
-                };
-                let (bytes, _) = invoke_native_service_resizing_output(
-                    self.declaration.id.as_str(),
-                    self.native_service_buffers,
-                    |output, output_len| unsafe {
-                        symbol(output.as_mut_ptr(), output.len(), output_len)
-                    },
-                )?;
-                decode_service_message(&bytes)
-            }
-            PluginBackend::Process(_) => Ok(Vec::new()),
-        }
+        Ok(Vec::new())
     }
 
-    /// Collect manifest and activation-time contributions, rejecting duplicates deterministically.
+    /// Collect manifest contributions, rejecting duplicates deterministically.
     ///
     /// # Errors
     ///
-    /// Returns when contribution registration fails or duplicate contribution IDs are found.
+    /// Returns when duplicate contribution IDs are found.
     pub fn collect_contributions(&self) -> Result<Vec<bmux_plugin_sdk::PluginContribution>> {
         let mut registrar = bmux_plugin_sdk::ContributionRegistrar::new();
-        for contribution in self.manifest_contributions() {
-            registrar
-                .register(contribution)
-                .map_err(|details| PluginError::ServiceProtocol {
-                    details: format!(
-                        "plugin '{}' contribution registration failed: {details}",
-                        self.declaration.id.as_str()
-                    ),
-                })?;
-        }
-        for contribution in self.collect_activation_contributions()? {
+        for contribution in self
+            .manifest_contributions()
+            .into_iter()
+            .chain(self.collect_activation_contributions()?)
+        {
             registrar
                 .register(contribution)
                 .map_err(|details| PluginError::ServiceProtocol {
@@ -1742,30 +1498,13 @@ impl LoadedPlugin {
         Ok(registrar.into_contributions())
     }
 
-    /// Collect the typed service registrations exposed by this plugin.
-    ///
-    /// For statically-linked bundled plugins that share the process
-    /// address space, this invokes the SDK's `register_typed_services`
-    /// hook via the static vtable and returns the populated registry.
-    ///
-    /// `context` is forwarded to the plugin's hook so providers that
-    /// need host access from inside their trait methods can capture
-    /// the bridge and capability metadata at registration time.
-    ///
-    /// Dynamic (`dlopen`) and out-of-process backends cannot currently
-    /// register in-process typed providers; this method returns an
-    /// empty registry for those backends.
+    /// Out-of-process plugins cannot register in-process typed providers.
     #[must_use]
     pub fn collect_typed_services(
         &self,
-        context: bmux_plugin_sdk::TypedServiceRegistrationContext<'_>,
+        _context: bmux_plugin_sdk::TypedServiceRegistrationContext<'_>,
     ) -> bmux_plugin_sdk::TypedServiceRegistry {
-        match &self.backend {
-            PluginBackend::Static(vtable) => (vtable.register_typed_services)(context),
-            PluginBackend::Dynamic(_) | PluginBackend::Process(_) => {
-                bmux_plugin_sdk::TypedServiceRegistry::new()
-            }
-        }
+        bmux_plugin_sdk::TypedServiceRegistry::new()
     }
     fn ensure_process_protocol_version(operation: &str, protocol_version: u16) -> Result<()> {
         if protocol_version == PROCESS_RUNTIME_PROTOCOL_V1 {
@@ -1800,7 +1539,6 @@ impl LoadedPlugin {
 
     fn invoke_process(
         &self,
-        runtime: &ProcessPluginRuntime,
         argv: &[String],
         request: &ProcessInvocationRequest,
     ) -> Result<(Option<ProcessInvocationResponse>, std::process::ExitStatus)> {
@@ -1822,7 +1560,8 @@ impl LoadedPlugin {
             }
             _ => {}
         }
-        runtime.invoke(self.declaration.id.as_str(), argv, &request)
+        self.runtime
+            .invoke(self.declaration.id.as_str(), argv, &request)
     }
 
     #[must_use]
@@ -1840,23 +1579,16 @@ impl LoadedPlugin {
 
     /// # Errors
     ///
-    /// Returns an error when the plugin does not declare the command, the
-    /// command symbol cannot be loaded, or any command input contains an
-    /// interior NUL byte.
-    ///
-    /// **Note:** Static plugins always require a command context.  Calling
-    /// this method (which passes `context: None`) on a static plugin will
-    /// return [`PluginError::NativeCommandSymbol`].  Use
-    /// [`run_command_with_context`](Self::run_command_with_context) instead.
+    /// Returns an error when the plugin does not declare the command or the
+    /// process invocation fails.
     pub fn run_command(&self, command_name: &str, arguments: &[String]) -> Result<i32> {
         self.run_command_with_context(command_name, arguments, None)
     }
 
     /// # Errors
     ///
-    /// Returns an error when the plugin does not declare the command, the
-    /// command symbol cannot be loaded, or any command input contains an
-    /// interior NUL byte.
+    /// Returns an error when the plugin does not declare the command or the
+    /// process invocation fails.
     pub fn run_command_with_context(
         &self,
         command_name: &str,
@@ -1870,305 +1602,37 @@ impl LoadedPlugin {
 
     /// # Errors
     ///
-    /// Returns an error when the plugin does not declare the command, the
-    /// command symbol cannot be loaded, or any command input contains an
-    /// interior NUL byte.
-    ///
-    // Keep command dispatch in one place so static, dynamic, process, and
-    // legacy-symbol paths share identical validation and telemetry behavior.
-    #[allow(clippy::too_many_lines)]
+    /// Returns an error when the plugin does not declare the command or the
+    /// process invocation fails.
     pub fn run_command_with_context_and_outcome(
         &self,
         command_name: &str,
         arguments: &[String],
         context: Option<&NativeCommandContext>,
     ) -> Result<(i32, bmux_plugin_sdk::PluginCommandOutcome)> {
-        let total_started = Instant::now();
         if !self.supports_command(command_name) {
             return Err(PluginError::UnknownPluginCommand {
                 plugin_id: self.declaration.id.as_str().to_string(),
                 command: command_name.to_string(),
             });
         }
-
-        if let Some(context) = context {
-            let encode_started = Instant::now();
-            let payload = encode_service_message(context).map_err(|_| {
-                PluginError::InvalidNativeCommandInput {
-                    plugin_id: self.declaration.id.as_str().to_string(),
-                    field: "context",
-                }
-            })?;
-            let encode_us = encode_started.elapsed().as_micros();
-
-            match &self.backend {
-                PluginBackend::Static(vtable) => {
-                    let call_started = Instant::now();
-                    bmux_plugin_sdk::begin_command_outcome_capture();
-                    let _ = bmux_plugin_sdk::take_last_command_error();
-                    let status = (vtable.run_command_with_context)(payload.as_ptr(), payload.len());
-                    let call_us = call_started.elapsed().as_micros();
-                    let outcome_started = Instant::now();
-                    let mut outcome = bmux_plugin_sdk::finish_command_outcome_capture();
-                    if let Some(error) = bmux_plugin_sdk::take_last_command_error() {
-                        outcome.error_message = Some(error.message);
-                    }
-                    emit_plugin_command_invoke_phase(
-                        self,
-                        command_name,
-                        payload.len(),
-                        encode_us,
-                        0,
-                        call_us,
-                        outcome_started.elapsed().as_micros(),
-                        total_started.elapsed().as_micros(),
-                        status,
-                        outcome.error_message.as_deref(),
-                    );
-                    return Ok((status, outcome));
-                }
-                PluginBackend::Dynamic(library) => {
-                    let symbol_started = Instant::now();
-                    if let Ok(command_symbol) = unsafe {
-                        library.get::<NativeRunCommandWithContextFn>(
-                            DEFAULT_NATIVE_COMMAND_WITH_CONTEXT_SYMBOL.as_bytes(),
-                        )
-                    } {
-                        let symbol_resolve_us = symbol_started.elapsed().as_micros();
-                        let call_started = Instant::now();
-                        bmux_plugin_sdk::begin_command_outcome_capture();
-                        let _ = bmux_plugin_sdk::take_last_command_error();
-                        let status = unsafe { command_symbol(payload.as_ptr(), payload.len()) };
-                        let call_us = call_started.elapsed().as_micros();
-                        let outcome_started = Instant::now();
-                        let mut outcome = bmux_plugin_sdk::finish_command_outcome_capture();
-                        if let Some(error) = bmux_plugin_sdk::take_last_command_error() {
-                            outcome.error_message = Some(error.message);
-                        }
-                        emit_plugin_command_invoke_phase(
-                            self,
-                            command_name,
-                            payload.len(),
-                            encode_us,
-                            symbol_resolve_us,
-                            call_us,
-                            outcome_started.elapsed().as_micros(),
-                            total_started.elapsed().as_micros(),
-                            status,
-                            outcome.error_message.as_deref(),
-                        );
-                        return Ok((status, outcome));
-                    }
-                }
-                PluginBackend::Process(_) => {
-                    return self.run_process_command(command_name, arguments, Some(context));
-                }
-            }
-        }
-
-        if matches!(self.backend, PluginBackend::Process(_)) {
-            return self.run_process_command(command_name, arguments, None);
-        }
-
-        // Fallback: use the legacy run_command symbol (dynamic only)
-        let PluginBackend::Dynamic(library) = &self.backend else {
-            return Err(PluginError::NativeCommandSymbol {
-                plugin_id: self.declaration.id.as_str().to_string(),
-                symbol: DEFAULT_NATIVE_COMMAND_SYMBOL.to_string(),
-                details: "static plugins require context-based command dispatch".to_string(),
-            });
-        };
-
-        let command_name_for_metrics = command_name;
-        let command_name =
-            CString::new(command_name).map_err(|_| PluginError::InvalidNativeCommandInput {
-                plugin_id: self.declaration.id.as_str().to_string(),
-                field: "command_name",
-            })?;
-        let argument_values = arguments
-            .iter()
-            .map(|argument| {
-                CString::new(argument.as_str()).map_err(|_| {
-                    PluginError::InvalidNativeCommandInput {
-                        plugin_id: self.declaration.id.as_str().to_string(),
-                        field: "arguments",
-                    }
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let argument_ptrs = argument_values
-            .iter()
-            .map(|value| value.as_ptr())
-            .collect::<Vec<_>>();
-
-        let symbol_started = Instant::now();
-        let command_symbol: Symbol<'_, NativeRunCommandFn> = unsafe {
-            library.get(DEFAULT_NATIVE_COMMAND_SYMBOL.as_bytes())
-        }
-        .map_err(|error| PluginError::NativeCommandSymbol {
-            plugin_id: self.declaration.id.as_str().to_string(),
-            symbol: DEFAULT_NATIVE_COMMAND_SYMBOL.to_string(),
-            details: error.to_string(),
-        })?;
-        let symbol_resolve_us = symbol_started.elapsed().as_micros();
-
-        let call_started = Instant::now();
-        let status = unsafe {
-            command_symbol(
-                command_name.as_ptr(),
-                argument_ptrs.len(),
-                argument_ptrs.as_ptr(),
-            )
-        };
-        let call_us = call_started.elapsed().as_micros();
-
-        emit_plugin_command_invoke_phase(
-            self,
-            command_name_for_metrics,
-            0,
-            0,
-            symbol_resolve_us,
-            call_us,
-            0,
-            total_started.elapsed().as_micros(),
-            status,
-            None,
-        );
-
-        Ok((status, bmux_plugin_sdk::PluginCommandOutcome::default()))
+        self.run_process_command(command_name, arguments, context)
     }
 
     /// # Errors
     ///
-    /// Returns an error when the lifecycle symbol cannot be loaded or the
-    /// lifecycle payload cannot be encoded.
+    /// Returns an error when the lifecycle payload cannot be encoded or the
+    /// process invocation fails.
     pub fn activate(&self, context: &NativeLifecycleContext) -> Result<i32> {
-        self.run_lifecycle_symbol(DEFAULT_NATIVE_ACTIVATE_SYMBOL, context)
-    }
-
-    /// Activate an in-process static plugin with access to the host async
-    /// runtime. Non-static backends fall back to the serialized lifecycle path.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when static activation reports failure or when fallback
-    /// lifecycle dispatch fails.
-    pub fn activate_with_async(
-        &self,
-        context: &NativeLifecycleContext,
-        async_handle: bmux_plugin_sdk::HostAsyncHandle,
-    ) -> Result<i32> {
-        let context = self.resolved_lifecycle_context(context)?;
-        if let PluginBackend::Static(vtable) = &self.backend {
-            let mut scope =
-                self.background_tasks
-                    .lock()
-                    .map_err(|_| PluginError::ServiceProtocol {
-                        details: "activation task scope poisoned".into(),
-                    })?;
-            if scope.is_some() {
-                return Err(PluginError::ServiceProtocol {
-                    details: "plugin activation already owns background tasks".into(),
-                });
-            }
-            let tasks = bmux_plugin_runtime::background::BackgroundTasks::new();
-            *scope = Some(tasks.clone());
-            drop(scope);
-            let _ = bmux_plugin_sdk::take_last_command_error();
-            let status =
-                (vtable.activate_with_async)(context, async_handle.with_background_tasks(tasks));
-            let error = bmux_plugin_sdk::take_last_command_error();
-            if status != 0 {
-                return Err(PluginError::ServiceProtocol {
-                    details: error.map_or_else(
-                        || format!("plugin activation failed with status {status}"),
-                        |error| {
-                            format!(
-                                "plugin activation failed with status {status}: {}",
-                                error.message
-                            )
-                        },
-                    ),
-                });
-            }
-            Ok(status)
-        } else {
-            self.activate(&context)
-        }
+        self.run_lifecycle(PROCESS_ACTIVATE_HOOK, context)
     }
 
     /// # Errors
     ///
-    /// Returns an error when the lifecycle symbol cannot be loaded or the
-    /// lifecycle payload cannot be encoded.
-    /// Signal cancellation before any provider is deactivated.
-    ///
-    /// # Errors
-    /// Reports poisoned activation scope state.
-    pub fn cancel_background_tasks(&self) -> Result<()> {
-        let scope = self
-            .background_tasks
-            .lock()
-            .map_err(|_| PluginError::ServiceProtocol {
-                details: "activation task scope poisoned".into(),
-            })?;
-        if let Some(tasks) = scope.as_ref() {
-            tasks
-                .cancel()
-                .map_err(|details| PluginError::ServiceProtocol { details })?;
-        }
-        drop(scope);
-        Ok(())
-    }
-
-    /// Drain activation work before calling synchronous plugin cleanup.
-    ///
-    /// # Errors
-    /// A failed drain leaves ownership intact and does not run cleanup.
-    pub async fn drain_background_tasks(&self) -> Result<()> {
-        let tasks = self
-            .background_tasks
-            .lock()
-            .map_err(|_| PluginError::ServiceProtocol {
-                details: "activation task scope poisoned".into(),
-            })?
-            .clone();
-        if let Some(tasks) = tasks {
-            tasks
-                .shutdown_until(
-                    bmux_plugin_runtime::teardown_deadline(),
-                    Some(crate::shutdown_progress()),
-                )
-                .await
-                .map_err(|details| PluginError::ServiceProtocol { details })?;
-            *self
-                .background_tasks
-                .lock()
-                .map_err(|_| PluginError::ServiceProtocol {
-                    details: "activation task scope poisoned".into(),
-                })? = None;
-        }
-        Ok(())
-    }
-
-    /// Run cleanup for a plugin with no outstanding activation scope.
-    ///
-    /// # Errors
-    /// Rejects scoped work that has not been drained, or lifecycle dispatch failure.
+    /// Returns an error when the lifecycle payload cannot be encoded or the
+    /// process invocation fails.
     pub fn deactivate(&self, context: &NativeLifecycleContext) -> Result<i32> {
-        if self
-            .background_tasks
-            .lock()
-            .map_err(|_| PluginError::ServiceProtocol {
-                details: "activation task scope poisoned".into(),
-            })?
-            .is_some()
-        {
-            return Err(PluginError::ServiceProtocol {
-                details: "activation tasks require async deactivation".into(),
-            });
-        }
-        self.run_lifecycle_symbol(DEFAULT_NATIVE_DEACTIVATE_SYMBOL, context)
+        self.run_lifecycle(PROCESS_DEACTIVATE_HOOK, context)
     }
 
     #[must_use]
@@ -2183,79 +1647,49 @@ impl LoadedPlugin {
 
     /// # Errors
     ///
-    /// Returns an error when the event symbol cannot be loaded or the event
-    /// payload cannot be encoded.
-    ///
+    /// Returns an error when the event payload cannot be encoded or the
+    /// process invocation fails.
     pub fn dispatch_event(&self, event: &PluginEvent) -> Result<Option<i32>> {
         if !self.receives_event(event) {
             return Ok(None);
         }
-
-        let payload =
-            encode_service_message(event).map_err(|_| PluginError::InvalidNativeEventInput {
-                plugin_id: self.declaration.id.as_str().to_string(),
-            })?;
-
-        let status = match &self.backend {
-            PluginBackend::Static(vtable) => (vtable.handle_event)(payload.as_ptr(), payload.len()),
-            PluginBackend::Dynamic(library) => {
-                let event_symbol: Symbol<'_, NativeEventFn> = lookup_dynamic_symbol(
-                    library,
-                    self.declaration.id.as_str(),
-                    DEFAULT_NATIVE_EVENT_SYMBOL,
-                )?;
-                unsafe { event_symbol(payload.as_ptr(), payload.len()) }
-            }
-            PluginBackend::Process(runtime) => {
-                let request = ProcessInvocationRequest::Event {
-                    protocol_version: PROCESS_RUNTIME_PROTOCOL_V1,
-                    invocation_id: PluginInvocationId::new(),
-                    plugin_id: self.declaration.id.as_str().to_string(),
-                    event: event.clone(),
-                };
-                let empty_argv: Vec<String> = Vec::new();
-                let (response, _) = self.invoke_process(runtime, &empty_argv, &request)?;
-                match response {
-                    None => return Ok(None),
-                    Some(ProcessInvocationResponse::Event {
-                        protocol_version,
-                        status,
-                        ..
-                    }) => {
-                        Self::ensure_process_protocol_version("event", protocol_version)?;
-                        return Ok(status);
-                    }
-                    Some(ProcessInvocationResponse::Error {
-                        protocol_version,
-                        details,
-                        status,
-                        ..
-                    }) => {
-                        Self::ensure_process_protocol_version("error", protocol_version)?;
-                        if let Some(status) = status {
-                            return Ok(Some(status));
-                        }
-                        return Err(PluginError::ServiceProtocol { details });
-                    }
-                    Some(other) => {
-                        return Err(Self::unexpected_process_response("event", &other));
-                    }
-                }
-            }
+        let request = ProcessInvocationRequest::Event {
+            protocol_version: PROCESS_RUNTIME_PROTOCOL_V1,
+            invocation_id: PluginInvocationId::new(),
+            plugin_id: self.declaration.id.as_str().to_string(),
+            event: event.clone(),
         };
-
-        Ok(Some(status))
+        let empty_argv: Vec<String> = Vec::new();
+        let (response, _) = self.invoke_process(&empty_argv, &request)?;
+        match response {
+            None => Ok(None),
+            Some(ProcessInvocationResponse::Event {
+                protocol_version,
+                status,
+                ..
+            }) => {
+                Self::ensure_process_protocol_version("event", protocol_version)?;
+                Ok(status)
+            }
+            Some(ProcessInvocationResponse::Error {
+                protocol_version,
+                details,
+                status,
+                ..
+            }) => {
+                Self::ensure_process_protocol_version("error", protocol_version)?;
+                status.map_or(Err(PluginError::ServiceProtocol { details }), |status| {
+                    Ok(Some(status))
+                })
+            }
+            Some(other) => Err(Self::unexpected_process_response("event", &other)),
+        }
     }
 
     /// # Errors
     ///
-    /// Returns an error when the service symbol cannot be loaded, the service
-    /// payload cannot be encoded, or the plugin returns invalid transport data.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the resolved dynamic library symbol is unexpectedly `None`
-    /// for a `Dynamic` backend (should not happen in practice).
+    /// Returns an error when the payload uses checked contracts (unsupported by
+    /// the process protocol) or the process invocation fails.
     pub fn invoke_service(&self, context: &NativeServiceContext) -> Result<ServiceResponse> {
         let _permit =
             self.concurrency_gate
@@ -2263,47 +1697,15 @@ impl LoadedPlugin {
                 .map_err(|error| PluginError::ServiceProtocol {
                     details: error.to_string(),
                 })?;
-        if bmux_plugin_sdk::service_contract::is_checked(&context.request.payload)
-            && matches!(&self.backend, PluginBackend::Process(_))
-        {
+        if bmux_plugin_sdk::service_contract::is_checked(&context.request.payload) {
             return Err(PluginError::ServiceProtocol {
                 details: "checked service contracts unsupported by process provider".into(),
             });
         }
-        if let PluginBackend::Process(runtime) = &self.backend {
-            return self.invoke_process_service(runtime, context);
-        }
-
-        self.invoke_native_service(context, false)
+        self.invoke_process_service(context)
     }
 
-    /// # Errors
-    ///
-    /// Returns an error when streaming or fallback service invocation fails.
-    pub fn invoke_streaming_service(
-        &self,
-        context: &NativeStreamingServiceContext,
-    ) -> Result<ServiceResponse> {
-        let _permit =
-            self.concurrency_gate
-                .acquire()
-                .map_err(|error| PluginError::ServiceProtocol {
-                    details: error.to_string(),
-                })?;
-        // v1 cannot carry an executable event sink. Do not claim streaming
-        // while silently substituting unary execution (including process v1).
-        let _ = context;
-        Err(PluginError::ServiceProtocol {
-            details: "streaming requires a negotiated scoped event-port adapter; v1 is unary only"
-                .into(),
-        })
-    }
-
-    fn invoke_process_service(
-        &self,
-        runtime: &ProcessPluginRuntime,
-        context: &NativeServiceContext,
-    ) -> Result<ServiceResponse> {
+    fn invoke_process_service(&self, context: &NativeServiceContext) -> Result<ServiceResponse> {
         let invocation_id = context.cancellation.invocation_id.clone();
         let request = ProcessInvocationRequest::Service {
             protocol_version: PROCESS_RUNTIME_PROTOCOL_V1,
@@ -2313,7 +1715,7 @@ impl LoadedPlugin {
             context: context.clone(),
         };
         let empty_argv: Vec<String> = Vec::new();
-        let (response, _) = self.invoke_process(runtime, &empty_argv, &request)?;
+        let (response, _) = self.invoke_process(&empty_argv, &request)?;
         match response {
             Some(ProcessInvocationResponse::Service {
                 protocol_version,
@@ -2346,177 +1748,7 @@ impl LoadedPlugin {
         }
     }
 
-    #[allow(clippy::too_many_lines)]
-    fn invoke_native_service(
-        &self,
-        context: &NativeServiceContext,
-        streaming: bool,
-    ) -> Result<ServiceResponse> {
-        let total_started = Instant::now();
-        let backend = match &self.backend {
-            PluginBackend::Static(_) => "static",
-            PluginBackend::Dynamic(_) => "dynamic",
-            PluginBackend::Process(_) => "process",
-        };
-        let encode_started = Instant::now();
-        // Cancellation IDs identify an inherited scope, not an individual call:
-        // nested/sibling operations legitimately share them. Allocate transport
-        // identity once per dispatch, outside the buffer-growth retry loop. Do not
-        // rewrite context cancellation/authority or derive identity from input.
-        let invocation_id = bmux_plugin_sdk::PluginInvocationId::new();
-        let payload = encode_service_envelope_with_invocation_id(
-            invocation_id.clone(),
-            0,
-            ServiceEnvelopeKind::Request,
-            context,
-        )?;
-        let encode_us = encode_started.elapsed().as_micros();
-
-        let checked = bmux_plugin_sdk::service_contract::is_checked(&context.request.payload);
-        if checked && streaming {
-            return Err(PluginError::ServiceProtocol {
-                details: "checked streaming service representation is not supported".into(),
-            });
-        }
-        if checked
-            && matches!(&self.backend, PluginBackend::Static(table) if !table.checked_service_contracts)
-        {
-            return Err(PluginError::ServiceProtocol {
-                details: "provider has no checked service export".into(),
-            });
-        }
-        let resolved_symbol = match &self.backend {
-            PluginBackend::Dynamic(library) => {
-                let symbol = if checked {
-                    "bmux_plugin_invoke_service_checked_v1"
-                } else if streaming {
-                    DEFAULT_NATIVE_STREAMING_SERVICE_SYMBOL
-                } else {
-                    DEFAULT_NATIVE_SERVICE_SYMBOL
-                };
-                let sym: Symbol<'_, NativeInvokeServiceFn> =
-                    lookup_dynamic_symbol(library, self.declaration.id.as_str(), symbol).or_else(
-                        |error| {
-                            if streaming {
-                                lookup_dynamic_symbol(
-                                    library,
-                                    self.declaration.id.as_str(),
-                                    DEFAULT_NATIVE_SERVICE_SYMBOL,
-                                )
-                            } else {
-                                Err(error)
-                            }
-                        },
-                    )?;
-                Some(sym)
-            }
-            PluginBackend::Static(_) | PluginBackend::Process(_) => None,
-        };
-
-        let call_service = |payload: &[u8], output: &mut [u8], output_len: &mut usize| -> i32 {
-            match &self.backend {
-                PluginBackend::Static(vtable) => {
-                    let invoke = if streaming {
-                        vtable.invoke_streaming_service
-                    } else {
-                        vtable.invoke_service
-                    };
-                    invoke(
-                        payload.as_ptr(),
-                        payload.len(),
-                        output.as_mut_ptr(),
-                        output.len(),
-                        output_len,
-                    )
-                }
-                PluginBackend::Dynamic(_) => {
-                    let service_fn = resolved_symbol
-                        .as_ref()
-                        .expect("resolved_symbol is Some for Dynamic backend");
-                    unsafe {
-                        service_fn(
-                            payload.as_ptr(),
-                            payload.len(),
-                            output.as_mut_ptr(),
-                            output.len(),
-                            output_len,
-                        )
-                    }
-                }
-                PluginBackend::Process(_) => NATIVE_SERVICE_STATUS_OK,
-            }
-        };
-
-        let call_started = Instant::now();
-        // Frozen v1 has no retained-outcome retrieval contract. Allocate the
-        // configured maximum once and never reexecute a possibly mutating call
-        // merely because its response did not fit. v2 uses start/read/ack.
-        let buffers = NativeServiceBufferConfig {
-            initial_response_bytes: self.native_service_buffers.max_response_bytes,
-            buffer_resize_attempts: 0,
-            ..self.native_service_buffers
-        };
-        let (output, buffer_resize_attempts) = invoke_native_service_resizing_output(
-            self.declaration.id.as_str(),
-            buffers,
-            |output, output_len| call_service(&payload, output, output_len),
-        )
-        .map_err(|error| classify_native_service_error(error, checked))?;
-        let call_elapsed = call_started.elapsed();
-        let call_us = call_elapsed.as_micros();
-        let output_len = output.len();
-        if call_elapsed > std::time::Duration::from_millis(100) {
-            tracing::warn!(
-                plugin_id = self.declaration.id.as_str(),
-                backend,
-                capability = context.request.service.capability.as_str(),
-                interface = context.request.service.interface_id.as_str(),
-                operation = context.request.operation.as_str(),
-                call_us,
-                "plugin native service call exceeded latency budget",
-            );
-        }
-
-        let decode_started = Instant::now();
-        let (response_invocation_id, _, response) = decode_service_envelope_with_invocation_id::<
-            ServiceResponse,
-        >(
-            &output, ServiceEnvelopeKind::Response
-        )?;
-        if response_invocation_id != invocation_id {
-            return Err(PluginError::ServiceProtocol {
-                details: format!(
-                    "native service response invocation id mismatch: expected {invocation_id}, got {response_invocation_id}",
-                ),
-            });
-        }
-        let decode_us = decode_started.elapsed().as_micros();
-        emit_phase_timing(
-            PhaseChannel::Service,
-            &PhasePayload::new("plugin.native_service_invoke")
-                .field("plugin_id", self.declaration.id.as_str())
-                .field("backend", backend)
-                .field("streaming", streaming)
-                .service_fields(
-                    context.request.service.capability.as_str(),
-                    format!("{:?}", context.request.service.kind),
-                    context.request.service.interface_id.as_str(),
-                    context.request.operation.as_str(),
-                )
-                .field("request_payload_len", context.request.payload.len())
-                .field("encoded_request_len", payload.len())
-                .field("encoded_response_len", output_len)
-                .field("response_buffer_resize_attempts", buffer_resize_attempts)
-                .field("encode_us", encode_us)
-                .field("call_us", call_us)
-                .field("decode_us", decode_us)
-                .field("total_us", total_started.elapsed().as_micros())
-                .finish(),
-        );
-        Ok(response)
-    }
-
-    fn run_lifecycle_symbol(&self, symbol: &str, context: &NativeLifecycleContext) -> Result<i32> {
+    fn run_lifecycle(&self, hook: &str, context: &NativeLifecycleContext) -> Result<i32> {
         let total_started = Instant::now();
         let encode_started = Instant::now();
         let context = self.resolved_lifecycle_context(context)?;
@@ -2532,70 +1764,42 @@ impl LoadedPlugin {
         let encode_us = encode_started.elapsed().as_micros();
 
         let call_started = Instant::now();
-        let status = match &self.backend {
-            PluginBackend::Static(vtable) => {
-                let func = if symbol == DEFAULT_NATIVE_ACTIVATE_SYMBOL {
-                    vtable.activate
-                } else if symbol == DEFAULT_NATIVE_DEACTIVATE_SYMBOL {
-                    vtable.deactivate
-                } else {
-                    return Err(PluginError::NativeLifecycleSymbol {
-                        plugin_id: self.declaration.id.as_str().to_string(),
-                        symbol: symbol.to_string(),
-                        details: "unknown lifecycle symbol for static plugin".to_string(),
-                    });
-                };
-                func(payload.as_ptr(), payload.len())
-            }
-            PluginBackend::Dynamic(library) => {
-                let lifecycle_symbol: Symbol<'_, NativeLifecycleFn> = lookup_dynamic_symbol(
-                    library,
-                    self.declaration.id.as_str(),
-                    if symbol == DEFAULT_NATIVE_ACTIVATE_SYMBOL {
-                        DEFAULT_NATIVE_ACTIVATE_SYMBOL
-                    } else {
-                        DEFAULT_NATIVE_DEACTIVATE_SYMBOL
-                    },
-                )?;
-                unsafe { lifecycle_symbol(payload.as_ptr(), payload.len()) }
-            }
-            PluginBackend::Process(runtime) => {
-                let invocation_id = PluginInvocationId::new();
-                let request = ProcessInvocationRequest::Lifecycle {
-                    protocol_version: PROCESS_RUNTIME_PROTOCOL_V1,
-                    invocation_id,
-                    plugin_id: self.declaration.id.as_str().to_string(),
-                    symbol: symbol.to_string(),
-                    context,
-                };
-                let empty_argv: Vec<String> = Vec::new();
-                let (response, status) = self.invoke_process(runtime, &empty_argv, &request)?;
-                match response {
-                    Some(ProcessInvocationResponse::Lifecycle {
-                        protocol_version,
-                        status,
-                        ..
-                    }) => {
-                        Self::ensure_process_protocol_version("lifecycle", protocol_version)?;
+        let status = {
+            let invocation_id = PluginInvocationId::new();
+            let request = ProcessInvocationRequest::Lifecycle {
+                protocol_version: PROCESS_RUNTIME_PROTOCOL_V1,
+                invocation_id,
+                plugin_id: self.declaration.id.as_str().to_string(),
+                symbol: hook.to_string(),
+                context,
+            };
+            let empty_argv: Vec<String> = Vec::new();
+            let (response, status) = self.invoke_process(&empty_argv, &request)?;
+            match response {
+                Some(ProcessInvocationResponse::Lifecycle {
+                    protocol_version,
+                    status,
+                    ..
+                }) => {
+                    Self::ensure_process_protocol_version("lifecycle", protocol_version)?;
+                    status
+                }
+                Some(ProcessInvocationResponse::Error {
+                    protocol_version,
+                    details,
+                    status,
+                    ..
+                }) => {
+                    Self::ensure_process_protocol_version("error", protocol_version)?;
+                    if let Some(status) = status {
                         status
+                    } else {
+                        return Err(PluginError::ServiceProtocol { details });
                     }
-                    Some(ProcessInvocationResponse::Error {
-                        protocol_version,
-                        details,
-                        status,
-                        ..
-                    }) => {
-                        Self::ensure_process_protocol_version("error", protocol_version)?;
-                        if let Some(status) = status {
-                            status
-                        } else {
-                            return Err(PluginError::ServiceProtocol { details });
-                        }
-                    }
-                    None => status.code().unwrap_or(0),
-                    Some(other) => {
-                        return Err(Self::unexpected_process_response("lifecycle", &other));
-                    }
+                }
+                None => status.code().unwrap_or(0),
+                Some(other) => {
+                    return Err(Self::unexpected_process_response("lifecycle", &other));
                 }
             }
         };
@@ -2605,8 +1809,8 @@ impl LoadedPlugin {
             PhaseChannel::Plugin,
             &PhasePayload::new("plugin.lifecycle.invoke")
                 .field("plugin_id", self.declaration.id.as_str())
-                .field("hook", lifecycle_hook_name(symbol))
-                .field("backend", self.backend_kind())
+                .field("hook", lifecycle_hook_name(hook))
+                .field("backend", "process")
                 .field("encoded_context_len", payload.len())
                 .field("encode_us", encode_us)
                 .field("call_us", call_us)
@@ -2624,12 +1828,6 @@ impl LoadedPlugin {
         arguments: &[String],
         context: Option<&NativeCommandContext>,
     ) -> Result<(i32, bmux_plugin_sdk::PluginCommandOutcome)> {
-        let PluginBackend::Process(runtime) = &self.backend else {
-            return Err(PluginError::ServiceProtocol {
-                details: "run_process_command called for non-process backend".to_string(),
-            });
-        };
-
         let request = ProcessInvocationRequest::Command {
             protocol_version: PROCESS_RUNTIME_PROTOCOL_V1,
             invocation_id: PluginInvocationId::new(),
@@ -2641,7 +1839,7 @@ impl LoadedPlugin {
         let argv = std::iter::once(command_name.to_string())
             .chain(arguments.iter().cloned())
             .collect::<Vec<_>>();
-        let (response, status) = self.invoke_process(runtime, &argv, &request)?;
+        let (response, status) = self.invoke_process(&argv, &request)?;
 
         if let Some(response) = response {
             return match response {
@@ -2673,48 +1871,17 @@ impl LoadedPlugin {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn emit_plugin_command_invoke_phase(
-    plugin: &LoadedPlugin,
-    command_name: &str,
-    encoded_context_len: usize,
-    encode_us: u128,
-    symbol_resolve_us: u128,
-    call_us: u128,
-    outcome_us: u128,
-    total_us: u128,
-    status: i32,
-    error: Option<&str>,
-) {
-    let mut payload = PhasePayload::new("plugin.command.invoke")
-        .field("plugin_id", plugin.declaration.id.as_str())
-        .field("command_name", command_name)
-        .field("backend", plugin.backend_kind())
-        .field("encoded_context_len", encoded_context_len)
-        .field("encode_us", encode_us)
-        .field("symbol_resolve_us", symbol_resolve_us)
-        .field("call_us", call_us)
-        .field("outcome_us", outcome_us)
-        .field("status", status)
-        .field("total_us", total_us);
-    if let Some(error) = error {
-        payload = payload.field("error", error);
-    }
-    emit_phase_timing(PhaseChannel::Plugin, &payload.finish());
-}
-
 #[allow(clippy::missing_const_for_fn)] // const str matching is not stable on this toolchain.
-fn lifecycle_hook_name(symbol: &str) -> &'static str {
-    match symbol {
-        DEFAULT_NATIVE_ACTIVATE_SYMBOL => "activate",
-        DEFAULT_NATIVE_DEACTIVATE_SYMBOL => "deactivate",
+fn lifecycle_hook_name(hook: &str) -> &'static str {
+    match hook {
+        PROCESS_ACTIVATE_HOOK => "activate",
+        PROCESS_DEACTIVATE_HOOK => "deactivate",
         _ => "unknown",
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct NativePluginLoader {
-    native_service_buffers: NativeServiceBufferConfig,
     bundled_executable: Arc<scoped::BundledExecutableCache>,
 }
 
@@ -2829,7 +1996,7 @@ impl NativePluginLoader {
     pub fn register_definition(
         definition: bmux_plugin_sdk::definition::PluginDefinition,
     ) -> Result<()> {
-        crate::static_vtable_registry::register_static_definition(definition)
+        crate::static_definition_registry::register_static_definition(definition)
     }
 
     /// Look up an inert registered static definition without creating an instance.
@@ -2837,7 +2004,7 @@ impl NativePluginLoader {
     /// # Errors
     /// The static definition registry is poisoned.
     pub fn registered_definition(plugin_id: &str) -> Result<Option<scoped::DefinitionArtifact>> {
-        crate::static_vtable_registry::static_definition(plugin_id)
+        crate::static_definition_registry::static_definition(plugin_id)
             .map(|definition| definition.map(scoped::DefinitionArtifact::from_definition))
     }
 
@@ -2845,28 +2012,16 @@ impl NativePluginLoader {
     pub fn new() -> Self {
         Self {
             bundled_executable: Arc::new(scoped::BundledExecutableCache::default()),
-            native_service_buffers: NativeServiceBufferConfig {
-                initial_response_bytes: NATIVE_SERVICE_INITIAL_RESPONSE_BYTES,
-                max_response_bytes: NATIVE_SERVICE_MAX_RESPONSE_BYTES,
-                buffer_resize_attempts: NATIVE_SERVICE_BUFFER_RESIZE_ATTEMPTS,
-            },
         }
     }
 
-    #[must_use]
-    pub const fn with_native_service_buffer_config(
-        mut self,
-        config: NativeServiceBufferConfig,
-    ) -> Self {
-        self.native_service_buffers = config;
-        self
-    }
-
+    /// Start an explicitly process-packaged plugin. Native plugins are never
+    /// loaded here; they use the scoped selected-execution paths above.
+    ///
     /// # Errors
     ///
-    /// Returns an error when the plugin is incompatible, missing, fails to load,
-    /// or returns a descriptor that conflicts with its manifest.
-    pub fn load_registered_plugin(
+    /// Returns an error when the plugin is incompatible or is not a process plugin.
+    pub fn load_process_plugin(
         &self,
         registered_plugin: &RegisteredPlugin,
         host: &HostMetadata,
@@ -2887,7 +2042,7 @@ impl NativePluginLoader {
             return Ok(LoadedPlugin {
                 registered: registered_plugin.clone(),
                 declaration: registered_plugin.declaration.clone(),
-                backend: PluginBackend::Process(ProcessPluginRuntime {
+                runtime: ProcessPluginRuntime {
                     command: command.clone(),
                     args: args.clone(),
                     current_dir: registered_plugin
@@ -2898,421 +2053,44 @@ impl NativePluginLoader {
                     persistent_worker: *persistent_worker,
                     persistent: Arc::new(Mutex::new(None)),
                     metrics: Arc::new(ProcessRuntimeMetrics::default()),
-                }),
-                native_service_buffers: self.native_service_buffers,
-                background_tasks: Box::default(),
+                },
                 concurrency_gate: concurrency_gate_for(&registered_plugin.declaration),
             });
         }
 
-        let entry_path = registered_plugin
-            .manifest
-            .resolve_entry_path(
-                registered_plugin
-                    .manifest_path
-                    .parent()
-                    .unwrap_or_else(|| Path::new(".")),
-            )
-            .ok_or_else(|| PluginError::MissingEntryPath {
-                plugin_id: registered_plugin.declaration.id.as_str().to_string(),
-            })?;
-        let library = unsafe { Library::new(&entry_path) }.map_err(|error| {
-            PluginError::NativeLibraryLoad {
-                plugin_id: registered_plugin.declaration.id.as_str().to_string(),
-                path: entry_path.clone(),
-                details: error.to_string(),
-            }
-        })?;
-
-        let declaration = load_native_declaration(&library, registered_plugin)?;
-        PluginRegistry::validate_registered_plugin(
-            &RegisteredPlugin {
-                declaration: declaration.clone(),
-                ..registered_plugin.clone()
-            },
-            host,
-            available_capabilities,
-        )?;
-        compare_manifest_and_embedded(registered_plugin, &declaration)?;
-
-        Ok(LoadedPlugin {
-            registered: registered_plugin.clone(),
-            declaration: declaration.clone(),
-            backend: PluginBackend::Dynamic(library),
-            native_service_buffers: self.native_service_buffers,
-            background_tasks: Box::default(),
-            concurrency_gate: concurrency_gate_for(&declaration),
+        Err(PluginError::UnsupportedPluginRuntime {
+            plugin_id: registered_plugin.declaration.id.as_str().to_string(),
+            runtime: "native outside the scoped definition loader".to_string(),
         })
     }
 }
 
 /// # Errors
 ///
-/// Returns an error when the plugin cannot be loaded.
-pub fn load_registered_plugin(
+/// Returns an error when the plugin is incompatible or is not a process plugin.
+pub fn load_process_plugin(
     registered_plugin: &RegisteredPlugin,
     host: &HostMetadata,
     available_capabilities: &BTreeMap<HostScope, crate::CapabilityProvider>,
 ) -> Result<LoadedPlugin> {
-    NativePluginLoader::new().load_registered_plugin(
-        registered_plugin,
-        host,
-        available_capabilities,
-    )
-}
-
-/// # Errors
-///
-/// Returns an error when the plugin cannot be loaded.
-pub fn load_registered_plugin_with_native_service_buffer_config(
-    registered_plugin: &RegisteredPlugin,
-    host: &HostMetadata,
-    available_capabilities: &BTreeMap<HostScope, crate::CapabilityProvider>,
-    native_service_buffers: NativeServiceBufferConfig,
-) -> Result<LoadedPlugin> {
-    NativePluginLoader::new()
-        .with_native_service_buffer_config(native_service_buffers)
-        .load_registered_plugin(registered_plugin, host, available_capabilities)
-}
-
-/// Load a statically-linked bundled plugin from its vtable.
-///
-/// This bypasses filesystem discovery and `dlopen` entirely.  The plugin's
-/// manifest TOML is obtained by calling the vtable's `entry` function pointer
-/// directly, and the resulting [`LoadedPlugin`] dispatches all subsequent calls
-/// through the same vtable.
-///
-/// # Errors
-///
-/// Returns an error when the manifest cannot be parsed or validated.
-pub fn load_static_plugin(
-    registered_plugin: &RegisteredPlugin,
-    vtable: StaticPluginVtable,
-    host: &HostMetadata,
-    available_capabilities: &BTreeMap<HostScope, crate::CapabilityProvider>,
-) -> Result<LoadedPlugin> {
-    load_static_plugin_with_native_service_buffer_config(
-        registered_plugin,
-        vtable,
-        host,
-        available_capabilities,
-        NativeServiceBufferConfig::default(),
-    )
-}
-
-/// Load a statically-linked bundled plugin from its vtable with explicit native service buffering.
-///
-/// # Errors
-///
-/// Returns an error when the manifest cannot be parsed or validated.
-pub fn load_static_plugin_with_native_service_buffer_config(
-    registered_plugin: &RegisteredPlugin,
-    vtable: StaticPluginVtable,
-    host: &HostMetadata,
-    available_capabilities: &BTreeMap<HostScope, crate::CapabilityProvider>,
-    native_service_buffers: NativeServiceBufferConfig,
-) -> Result<LoadedPlugin> {
-    let manifest_ptr = (vtable.entry)();
-    if manifest_ptr.is_null() {
-        return Err(PluginError::NullPluginEntry {
-            plugin_id: registered_plugin.declaration.id.as_str().to_string(),
-            symbol: "static_vtable::entry".to_string(),
-        });
-    }
-    let manifest_cstr = unsafe { CStr::from_ptr(manifest_ptr) };
-    let manifest_text = manifest_cstr
-        .to_str()
-        .map_err(|_| PluginError::InvalidPluginEntry {
-            plugin_id: registered_plugin.declaration.id.as_str().to_string(),
-            symbol: "static_vtable::entry".to_string(),
-            details: "embedded manifest is not valid UTF-8".to_string(),
-        })?;
-
-    let embedded_manifest = crate::PluginManifest::from_toml_str(manifest_text)?;
-    let mut declaration = embedded_manifest.to_declaration()?;
-    declaration.merge_services((vtable.declared_services)()?)?;
-
-    // Validate against host capabilities (skip entry file existence check
-    // since there is no file -- the plugin is compiled into the binary).
-    let synthetic = RegisteredPlugin {
-        declaration: declaration.clone(),
-        ..registered_plugin.clone()
-    };
-    PluginRegistry::validate_static_plugin(&synthetic, host, available_capabilities)?;
-
-    compare_manifest_and_embedded(registered_plugin, &declaration)?;
-
-    Ok(LoadedPlugin {
-        registered: registered_plugin.clone(),
-        declaration: declaration.clone(),
-        backend: PluginBackend::Static(vtable),
-        native_service_buffers,
-        background_tasks: Box::default(),
-        concurrency_gate: concurrency_gate_for(&declaration),
-    })
-}
-
-/// Load a statically-linked plugin whose declaration was already parsed and
-/// registered by the host from the same embedded manifest.
-///
-/// # Errors
-///
-/// Returns an error when the registered declaration is incompatible with the
-/// current host or declared available capabilities.
-pub fn load_trusted_static_plugin(
-    registered_plugin: &RegisteredPlugin,
-    vtable: StaticPluginVtable,
-    host: &HostMetadata,
-    available_capabilities: &BTreeMap<HostScope, crate::CapabilityProvider>,
-) -> Result<LoadedPlugin> {
-    load_trusted_static_plugin_with_native_service_buffer_config(
-        registered_plugin,
-        vtable,
-        host,
-        available_capabilities,
-        NativeServiceBufferConfig::default(),
-    )
-}
-
-/// Load a trusted statically-linked plugin with explicit native service buffering.
-///
-/// # Errors
-///
-/// Returns an error when the registered declaration is incompatible with the
-/// current host or declared available capabilities.
-pub fn load_trusted_static_plugin_with_native_service_buffer_config(
-    registered_plugin: &RegisteredPlugin,
-    vtable: StaticPluginVtable,
-    host: &HostMetadata,
-    available_capabilities: &BTreeMap<HostScope, crate::CapabilityProvider>,
-    native_service_buffers: NativeServiceBufferConfig,
-) -> Result<LoadedPlugin> {
-    PluginRegistry::validate_static_plugin(registered_plugin, host, available_capabilities)?;
-    Ok(LoadedPlugin {
-        registered: registered_plugin.clone(),
-        declaration: registered_plugin.declaration.clone(),
-        backend: PluginBackend::Static(vtable),
-        native_service_buffers,
-        background_tasks: Box::default(),
-        concurrency_gate: concurrency_gate_for(&registered_plugin.declaration),
-    })
-}
-
-fn lookup_dynamic_symbol<'lib, T>(
-    library: &'lib Library,
-    plugin_id: &str,
-    canonical: &'static str,
-) -> Result<Symbol<'lib, T>> {
-    unsafe { library.get(canonical.as_bytes()) }.map_err(|error| PluginError::NativeServiceSymbol {
-        plugin_id: plugin_id.to_string(),
-        symbol: canonical.to_string(),
-        details: error.to_string(),
-    })
+    NativePluginLoader::new().load_process_plugin(registered_plugin, host, available_capabilities)
 }
 
 fn concurrency_gate_for(declaration: &PluginDeclaration) -> ConcurrencyGate {
     ConcurrencyGate::new(declaration.concurrency)
 }
 
-fn load_native_declaration(
-    library: &Library,
-    registered_plugin: &RegisteredPlugin,
-) -> Result<PluginDeclaration> {
-    let symbol = match &registered_plugin.declaration.entrypoint {
-        PluginEntrypoint::Native { symbol } => symbol.as_str(),
-        PluginEntrypoint::Process { .. } => {
-            return Err(PluginError::UnsupportedPluginRuntime {
-                plugin_id: registered_plugin.declaration.id.as_str().to_string(),
-                runtime: "process".to_string(),
-            });
-        }
-    };
-
-    let descriptor_symbol: Symbol<'_, PluginEntryFn> =
-        if symbol == bmux_plugin_sdk::DEFAULT_NATIVE_ENTRY_SYMBOL {
-            lookup_dynamic_symbol(
-                library,
-                registered_plugin.declaration.id.as_str(),
-                bmux_plugin_sdk::DEFAULT_NATIVE_ENTRY_SYMBOL,
-            )
-            .map_err(|error| PluginError::NativeEntrySymbol {
-                plugin_id: registered_plugin.declaration.id.as_str().to_string(),
-                symbol: symbol.to_string(),
-                details: error.to_string(),
-            })?
-        } else {
-            unsafe { library.get(symbol.as_bytes()) }.map_err(|error| {
-                PluginError::NativeEntrySymbol {
-                    plugin_id: registered_plugin.declaration.id.as_str().to_string(),
-                    symbol: symbol.to_string(),
-                    details: error.to_string(),
-                }
-            })?
-        };
-
-    let descriptor_ptr = unsafe { descriptor_symbol() };
-    let symbol = match &registered_plugin.declaration.entrypoint {
-        PluginEntrypoint::Native { symbol } => symbol.clone(),
-        PluginEntrypoint::Process { .. } => "process-entrypoint".to_string(),
-    };
-    if descriptor_ptr.is_null() {
-        return Err(PluginError::NullPluginEntry {
-            plugin_id: registered_plugin.declaration.id.as_str().to_string(),
-            symbol,
-        });
-    }
-
-    let manifest_text = unsafe { CStr::from_ptr(descriptor_ptr) }
-        .to_str()
-        .map_err(|_| PluginError::InvalidPluginEntryUtf8 {
-            plugin_id: registered_plugin.declaration.id.as_str().to_string(),
-            symbol: symbol.clone(),
-        })?;
-
-    let embedded_manifest =
-        crate::PluginManifest::from_toml_str(manifest_text).map_err(|error| {
-            PluginError::InvalidPluginEntry {
-                plugin_id: registered_plugin.declaration.id.as_str().to_string(),
-                symbol: symbol.clone(),
-                details: error.to_string(),
-            }
-        })?;
-
-    embedded_manifest.to_declaration()
-}
-
-fn compare_manifest_and_embedded(
-    registered_plugin: &RegisteredPlugin,
-    declaration: &PluginDeclaration,
-) -> Result<()> {
-    ensure_match(
-        registered_plugin.declaration.id.as_str(),
-        "id",
-        registered_plugin.declaration.id.as_str(),
-        declaration.id.as_str(),
-    )?;
-    ensure_match(
-        registered_plugin.declaration.id.as_str(),
-        "display_name",
-        &registered_plugin.declaration.display_name,
-        &declaration.display_name,
-    )?;
-    ensure_match(
-        registered_plugin.declaration.id.as_str(),
-        "plugin_version",
-        &registered_plugin.declaration.plugin_version,
-        &declaration.plugin_version,
-    )?;
-    ensure_match(
-        registered_plugin.declaration.id.as_str(),
-        "plugin_api",
-        &registered_plugin.declaration.plugin_api.to_string(),
-        &declaration.plugin_api.to_string(),
-    )?;
-    ensure_match(
-        registered_plugin.declaration.id.as_str(),
-        "native_abi",
-        &registered_plugin.declaration.native_abi.to_string(),
-        &declaration.native_abi.to_string(),
-    )?;
-    ensure_match(
-        registered_plugin.declaration.id.as_str(),
-        "provider_priority",
-        &registered_plugin.declaration.provider_priority.to_string(),
-        &declaration.provider_priority.to_string(),
-    )?;
-    ensure_match(
-        registered_plugin.declaration.id.as_str(),
-        "optional_capabilities",
-        &format!("{:?}", registered_plugin.declaration.optional_capabilities),
-        &format!("{:?}", declaration.optional_capabilities),
-    )?;
-    ensure_match(
-        registered_plugin.declaration.id.as_str(),
-        "required_capabilities",
-        &format!("{:?}", registered_plugin.declaration.required_capabilities),
-        &format!("{:?}", declaration.required_capabilities),
-    )?;
-    ensure_match(
-        registered_plugin.declaration.id.as_str(),
-        "provided_capabilities",
-        &format!("{:?}", registered_plugin.declaration.provided_capabilities),
-        &format!("{:?}", declaration.provided_capabilities),
-    )?;
-    ensure_match(
-        registered_plugin.declaration.id.as_str(),
-        "provided_features",
-        &format!("{:?}", registered_plugin.declaration.provided_features),
-        &format!("{:?}", declaration.provided_features),
-    )?;
-    ensure_match(
-        registered_plugin.declaration.id.as_str(),
-        "services",
-        &serde_json::to_string(&registered_plugin.declaration.services)
-            .expect("plugin services should serialize"),
-        &serde_json::to_string(&declaration.services).expect("plugin services should serialize"),
-    )?;
-    ensure_match(
-        registered_plugin.declaration.id.as_str(),
-        "commands",
-        &serde_json::to_string(&registered_plugin.declaration.commands)
-            .expect("plugin commands should serialize"),
-        &serde_json::to_string(&declaration.commands).expect("plugin commands should serialize"),
-    )?;
-    ensure_match(
-        registered_plugin.declaration.id.as_str(),
-        "event_subscriptions",
-        &serde_json::to_string(&registered_plugin.declaration.event_subscriptions)
-            .expect("plugin event subscriptions should serialize"),
-        &serde_json::to_string(&declaration.event_subscriptions)
-            .expect("plugin event subscriptions should serialize"),
-    )?;
-    ensure_match(
-        registered_plugin.declaration.id.as_str(),
-        "dependencies",
-        &serde_json::to_string(&registered_plugin.declaration.dependencies)
-            .expect("plugin dependencies should serialize"),
-        &serde_json::to_string(&declaration.dependencies)
-            .expect("plugin dependencies should serialize"),
-    )?;
-
-    Ok(())
-}
-
-fn ensure_match(
-    plugin_id: &str,
-    field: &'static str,
-    manifest_value: &str,
-    embedded_value: &str,
-) -> Result<()> {
-    if manifest_value == embedded_value {
-        Ok(())
-    } else {
-        Err(PluginError::ManifestMismatch {
-            plugin_id: plugin_id.to_string(),
-            field,
-            manifest_value: manifest_value.to_string(),
-            embedded_value: embedded_value.to_string(),
-        })
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{ConcurrencyGate, LoadedPlugin, NativeServiceBufferConfig, PluginBackend};
-    use crate::{PluginEntrypoint, PluginManifest, PluginRegistry, ServiceCaller};
+    use super::{ConcurrencyGate, LoadedPlugin};
+    use crate::{PluginManifest, PluginRegistry, ServiceCaller};
     use bmux_plugin_sdk::{
-        ApiVersion, DEFAULT_NATIVE_ENTRY_SYMBOL, HostMetadata, NativeLifecycleContext,
-        NativeServiceContext, PluginEvent, PluginEventKind, PluginEventSubscription,
-        ServiceEnvelopeKind, ServiceResponse, decode_service_envelope,
-        decode_service_envelope_with_invocation_id, decode_service_message,
-        encode_service_envelope, encode_service_envelope_with_invocation_id,
-        encode_service_message,
+        ApiVersion, HostMetadata, NativeLifecycleContext, NativeServiceContext, PluginEvent,
+        PluginEventKind, ServiceEnvelopeKind, decode_service_envelope, decode_service_message,
+        encode_service_envelope, encode_service_message,
     };
-    use libloading::Library;
     use std::cell::{Cell, RefCell};
-    use std::collections::{BTreeMap, BTreeSet};
-    use std::ffi::c_char;
+    use std::collections::BTreeMap;
     #[cfg(unix)]
     use std::process::{Command, Stdio};
     use std::ptr;
@@ -3324,7 +2102,6 @@ mod tests {
     thread_local! {
         static KERNEL_REQUESTS: RefCell<Vec<bmux_ipc::Request>> = const { RefCell::new(Vec::new()) };
         static OMIT_CURRENT_CLIENT_FROM_LIST: Cell<bool> = const { Cell::new(false) };
-        static NATIVE_SERVICE_INVOCATION_COUNT: Cell<usize> = const { Cell::new(0) };
     }
 
     #[test]
@@ -3334,19 +2111,6 @@ mod tests {
         assert!(super::validate_storage_key("bad/key").is_err());
         assert!(super::validate_storage_key("").is_err());
     }
-
-    const TEST_MANIFEST_TEXT: &str = concat!(
-        "id = \"test.plugin\"\n",
-        "name = \"Test Plugin\"\n",
-        "version = \"0.1.0\"\n",
-        "entry = \"unused.dylib\"\n",
-        "required_capabilities = [\"bmux.commands\"]\n\n",
-        "[[commands]]\n",
-        "name = \"hello\"\n",
-        "summary = \"hello\"\n",
-        "execution = \"provider_exec\"\n",
-        "\0"
-    );
 
     #[cfg(unix)]
     const PERSISTENT_WORKER_REUSE_SCRIPT: &str = r"#!/bin/sh
@@ -3392,45 +2156,6 @@ printf '%s' "$$" > {pid_file:?}
 printf 'BMUXPRC1\000\000\000\004\000\001\002\000'
 sleep 60
 "#;
-
-    #[unsafe(no_mangle)]
-    extern "C" fn bmux_plugin_entry_v1() -> *const c_char {
-        TEST_MANIFEST_TEXT.as_ptr().cast()
-    }
-
-    #[unsafe(no_mangle)]
-    extern "C" fn bmux_plugin_invoke_service_v1(
-        input_ptr: *const u8,
-        input_len: usize,
-        output_ptr: *mut u8,
-        output_capacity: usize,
-        output_len: *mut usize,
-    ) -> i32 {
-        let input = unsafe { std::slice::from_raw_parts(input_ptr, input_len) };
-        let (invocation_id, request_id, context) = decode_service_envelope_with_invocation_id::<
-            NativeServiceContext,
-        >(input, ServiceEnvelopeKind::Request)
-        .expect("service request should decode");
-        NATIVE_SERVICE_INVOCATION_COUNT.with(|count| count.set(count.get().saturating_add(1)));
-        let response = ServiceResponse::ok(context.request.payload);
-        let encoded = encode_service_envelope_with_invocation_id(
-            invocation_id,
-            request_id,
-            ServiceEnvelopeKind::Response,
-            &response,
-        )
-        .expect("service response should encode");
-        unsafe {
-            *output_len = encoded.len();
-        }
-        if output_ptr.is_null() || encoded.len() > output_capacity {
-            return 4;
-        }
-        unsafe {
-            ptr::copy_nonoverlapping(encoded.as_ptr(), output_ptr, encoded.len());
-        }
-        0
-    }
 
     #[allow(clippy::too_many_lines)]
     unsafe extern "C" fn test_host_kernel_bridge(
@@ -3539,14 +2264,41 @@ sleep 60
         0
     }
 
-    #[test]
-    fn loaded_plugin_reports_declared_commands() {
-        let manifest = PluginManifest::from_toml_str(
-            r#"
+    /// A process-packaged plugin that is never started: tests below exercise
+    /// only declaration-level behavior.
+    fn unstarted_process_test_plugin(manifest_toml: &str) -> LoadedPlugin {
+        let manifest = PluginManifest::from_toml_str(manifest_toml).expect("manifest should parse");
+        let declaration = manifest.to_declaration().expect("declaration should build");
+        let mut registry = PluginRegistry::new();
+        registry
+            .register_manifest(std::path::Path::new("plugin.toml"), manifest)
+            .expect("manifest should register");
+        LoadedPlugin {
+            registered: registry
+                .get(declaration.id.as_str())
+                .expect("plugin should exist")
+                .clone(),
+            declaration,
+            runtime: super::ProcessPluginRuntime {
+                command: "unused-test-process".to_string(),
+                args: Vec::new(),
+                current_dir: None,
+                persistent_worker: false,
+                persistent: std::sync::Arc::new(std::sync::Mutex::new(None)),
+                metrics: std::sync::Arc::new(super::ProcessRuntimeMetrics::default()),
+            },
+            concurrency_gate: ConcurrencyGate::new(
+                bmux_plugin_runtime::PluginConcurrencyConfig::Concurrent,
+            ),
+        }
+    }
+
+    const PROCESS_COMMAND_MANIFEST: &str = r#"
 id = "test.plugin"
 name = "Test Plugin"
 version = "0.1.0"
-entry = "unused.dylib"
+runtime = "process"
+entry = "unused-test-process"
 required_capabilities = ["bmux.commands"]
 
 [[commands]]
@@ -3559,154 +2311,54 @@ minimum = "1.0"
 
 [native_abi]
 minimum = "1.0"
-"#,
-        )
-        .expect("manifest should parse");
-        let mut registry = PluginRegistry::new();
-        registry
-            .register_manifest(std::path::Path::new("plugin.toml"), manifest)
-            .expect("manifest should register");
+"#;
 
-        #[cfg(unix)]
-        let library = Library::from(libloading::os::unix::Library::this());
-        #[cfg(windows)]
-        let library = Library::from(
-            libloading::os::windows::Library::this().expect("current library should load"),
-        );
-
-        let loaded = LoadedPlugin {
-            registered: registry
-                .get("test.plugin")
-                .expect("plugin should exist")
-                .clone(),
-            declaration: PluginManifest::from_toml_str(TEST_MANIFEST_TEXT.trim_end_matches('\0'))
-                .expect("manifest should parse")
-                .to_declaration()
-                .expect("declaration should build"),
-            backend: PluginBackend::Dynamic(library),
-            native_service_buffers: NativeServiceBufferConfig::default(),
-            background_tasks: Box::default(),
-            concurrency_gate: ConcurrencyGate::new(
-                bmux_plugin_runtime::PluginConcurrencyConfig::Concurrent,
-            ),
-        };
-
+    #[test]
+    fn loaded_plugin_reports_declared_commands() {
+        let loaded = unstarted_process_test_plugin(PROCESS_COMMAND_MANIFEST);
         assert_eq!(loaded.commands().len(), 1);
         assert!(loaded.supports_command("hello"));
         assert!(loaded.run_command("missing", &[]).is_err());
     }
 
-    fn test_static_plugin_entry() -> *const c_char {
-        TEST_MANIFEST_TEXT.as_ptr().cast()
+    #[test]
+    fn process_plugin_contributes_only_manifest_commands() {
+        let loaded = unstarted_process_test_plugin(PROCESS_COMMAND_MANIFEST);
+        let contributions = loaded
+            .collect_contributions()
+            .expect("contributions should collect");
+        let ids: Vec<&str> = contributions
+            .iter()
+            .map(bmux_plugin_sdk::PluginContribution::id)
+            .collect();
+        assert_eq!(ids, ["command:hello"]);
     }
 
-    fn test_static_plugin_command_with_context(_input_ptr: *const u8, _input_len: usize) -> i32 {
-        0
-    }
-
-    fn test_static_plugin_lifecycle(_input_ptr: *const u8, _input_len: usize) -> i32 {
-        0
-    }
-
-    fn test_static_plugin_event(_input_ptr: *const u8, _input_len: usize) -> i32 {
-        0
-    }
-
-    fn test_static_plugin_service(
-        input_ptr: *const u8,
-        input_len: usize,
-        output_ptr: *mut u8,
-        output_capacity: usize,
-        output_len: *mut usize,
-    ) -> i32 {
-        bmux_plugin_invoke_service_v1(
-            input_ptr,
-            input_len,
-            output_ptr,
-            output_capacity,
-            output_len,
-        )
-    }
-
-    fn test_static_plugin_typed_services(
-        _context: bmux_plugin_sdk::TypedServiceRegistrationContext<'_>,
-    ) -> bmux_plugin_sdk::TypedServiceRegistry {
-        bmux_plugin_sdk::TypedServiceRegistry::new()
-    }
-
-    #[allow(clippy::unnecessary_wraps)]
-    fn test_static_plugin_activation_contributions()
-    -> bmux_plugin_sdk::Result<Vec<bmux_plugin_sdk::PluginContribution>> {
-        Ok(vec![bmux_plugin_sdk::PluginContribution::command(
-            bmux_plugin_sdk::PluginCommand::new("activation", "activation contribution"),
-        )])
-    }
-
-    #[allow(clippy::unnecessary_wraps)]
-    fn test_static_plugin_duplicate_contributions()
-    -> bmux_plugin_sdk::Result<Vec<bmux_plugin_sdk::PluginContribution>> {
-        Ok(vec![bmux_plugin_sdk::PluginContribution::command(
-            bmux_plugin_sdk::PluginCommand::new("hello", "duplicate contribution"),
-        )])
-    }
-
-    fn loaded_static_test_plugin() -> LoadedPlugin {
-        let manifest = PluginManifest::from_toml_str(
-            r#"
-id = "test.plugin"
-name = "Test Plugin"
-version = "0.1.0"
-entry = "unused.dylib"
-required_capabilities = ["bmux.commands"]
-
-[[commands]]
-name = "hello"
-summary = "hello"
-execution = "provider_exec"
-
-[plugin_api]
-minimum = "1.0"
-
-[native_abi]
-minimum = "1.0"
-"#,
-        )
-        .expect("manifest should parse");
+    #[test]
+    fn native_plugins_never_load_through_the_process_loader() {
         let mut registry = PluginRegistry::new();
         registry
-            .register_manifest(std::path::Path::new("plugin.toml"), manifest)
+            .register_bundled_manifest(
+                "id = 'test.native'\nname = 'Native'\nversion = '0.1.0'\n[plugin_api]\nminimum = '1.0'\n[native_abi]\nminimum = '1.0'\n",
+            )
             .expect("manifest should register");
-        let vtable = bmux_plugin_sdk::StaticPluginVtable {
-            entry: test_static_plugin_entry,
-            run_command_with_context: test_static_plugin_command_with_context,
-            activate: test_static_plugin_lifecycle,
-            activate_with_async: |_context, _async_handle| 0,
-            deactivate: test_static_plugin_lifecycle,
-            handle_event: test_static_plugin_event,
-            checked_service_contracts: false,
-            invoke_service: test_static_plugin_service,
-            invoke_streaming_service: test_static_plugin_service,
-            register_typed_services: test_static_plugin_typed_services,
-            declared_services: || Ok(Vec::new()),
-            register_contributions: test_static_plugin_activation_contributions,
-        };
-
-        LoadedPlugin {
-            registered: registry
-                .get("test.plugin")
-                .expect("plugin should exist")
-                .clone(),
-            declaration: PluginManifest::from_toml_str(TEST_MANIFEST_TEXT.trim_end_matches('\0'))
-                .expect("manifest should parse")
-                .to_declaration()
-                .expect("declaration should build"),
-            backend: PluginBackend::Static(vtable),
-            native_service_buffers: NativeServiceBufferConfig::default(),
-            background_tasks: Box::default(),
-            concurrency_gate: ConcurrencyGate::new(
-                bmux_plugin_runtime::PluginConcurrencyConfig::Concurrent,
-            ),
-        }
+        let registered = registry.get("test.native").expect("plugin should exist");
+        let error = super::load_process_plugin(
+            registered,
+            &HostMetadata {
+                product_name: "bmux".to_string(),
+                product_version: "0.1.0".to_string(),
+                plugin_api_version: ApiVersion::new(1, 0),
+                plugin_abi_version: ApiVersion::new(1, 1),
+            },
+            &BTreeMap::new(),
+        )
+        .err()
+        .expect("native plugin must be rejected");
+        assert!(matches!(
+            error,
+            bmux_plugin_sdk::PluginError::UnsupportedPluginRuntime { .. }
+        ));
     }
 
     #[test]
@@ -3840,257 +2492,6 @@ minimum = "1.0"
         }
     }
 
-    #[test]
-    fn activation_time_command_contribution_registers() {
-        let loaded = loaded_static_test_plugin();
-        let contributions = loaded
-            .collect_contributions()
-            .expect("contributions should collect");
-        let ids: Vec<&str> = contributions
-            .iter()
-            .map(bmux_plugin_sdk::PluginContribution::id)
-            .collect();
-        assert!(ids.contains(&"command:hello"));
-        assert!(ids.contains(&"command:activation"));
-    }
-
-    #[test]
-    fn contribution_registration_failure_reports_plugin_and_contribution() {
-        let mut loaded = loaded_static_test_plugin();
-        if let PluginBackend::Static(vtable) = &mut loaded.backend {
-            vtable.register_contributions = test_static_plugin_duplicate_contributions;
-        }
-        let error = loaded
-            .collect_contributions()
-            .expect_err("duplicate contribution should fail");
-        let message = error.to_string();
-        assert!(message.contains("test.plugin"));
-        assert!(message.contains("command:hello"));
-    }
-
-    #[test]
-    fn native_contract_rejection_classification_requires_checked_call_and_distinct_status() {
-        for (checked, status, incompatible) in [
-            (true, 6, true),
-            (true, 3, false),
-            (false, 6, false),
-            (false, 3, false),
-            (true, 70, false),
-        ] {
-            let error = super::invoke_native_service_resizing_output(
-                "test.plugin",
-                NativeServiceBufferConfig::default(),
-                |_, _| status,
-            )
-            .unwrap_err();
-            let classified = super::classify_native_service_error(error, checked);
-            if incompatible {
-                assert!(matches!(
-                    classified,
-                    bmux_plugin_sdk::PluginError::ServiceProtocol { .. }
-                ));
-            } else {
-                assert!(
-                    matches!(classified, bmux_plugin_sdk::PluginError::NativeServiceInvocation { status: actual, .. } if actual == status)
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn nested_and_sibling_calls_share_cancellation_not_replay_identity() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use std::sync::{Arc, OnceLock};
-
-        #[derive(Default)]
-        struct ReentrantPlugin {
-            effects: AtomicUsize,
-            calls: AtomicUsize,
-        }
-        static INSTANCE: OnceLock<Arc<ReentrantPlugin>> = OnceLock::new();
-        static LOADED: OnceLock<LoadedPlugin> = OnceLock::new();
-        static SCOPE: OnceLock<bmux_plugin_sdk::PluginInvocationId> = OnceLock::new();
-
-        impl bmux_plugin_sdk::ConcurrentRustPlugin for ReentrantPlugin {
-            type Contract = bmux_plugin_sdk::NoPluginContract;
-            fn invoke_service_concurrent(&self, context: NativeServiceContext) -> ServiceResponse {
-                assert_eq!(&context.cancellation.invocation_id, SCOPE.get().unwrap());
-                self.calls.fetch_add(1, Ordering::SeqCst);
-                if context.request.operation == "outer" {
-                    // A nested query then mutation through the SAME provider and
-                    // cancellation scope must not collide with the outer call.
-                    let mut nested = context;
-                    if let Some(depth) = nested
-                        .request
-                        .payload
-                        .first_mut()
-                        .filter(|depth| **depth > 0)
-                    {
-                        *depth -= 1;
-                        return LOADED.get().unwrap().invoke_service(&nested).unwrap();
-                    }
-                    nested.request.operation = "query".into();
-                    assert_eq!(
-                        LOADED
-                            .get()
-                            .unwrap()
-                            .invoke_service(&nested)
-                            .unwrap()
-                            .payload,
-                        vec![0]
-                    );
-                    nested.request.operation = "mutate".into();
-                    assert_eq!(
-                        LOADED
-                            .get()
-                            .unwrap()
-                            .invoke_service(&nested)
-                            .unwrap()
-                            .payload,
-                        vec![42; 17_000]
-                    );
-                    ServiceResponse::ok(vec![42; 17_000])
-                } else if context.request.operation == "mutate" {
-                    self.effects.fetch_add(1, Ordering::SeqCst);
-                    // Forces the loader to retry; effect still occurs just once.
-                    ServiceResponse::ok(vec![42; 17_000])
-                } else {
-                    ServiceResponse::ok(vec![0])
-                }
-            }
-        }
-        fn export(
-            input: *const u8,
-            len: usize,
-            output: *mut u8,
-            capacity: usize,
-            written: *mut usize,
-        ) -> i32 {
-            bmux_plugin_sdk::__private::invoke_service_concurrent_export(
-                INSTANCE.get().unwrap(),
-                input,
-                len,
-                output,
-                capacity,
-                written,
-            )
-        }
-        let instance = INSTANCE.get_or_init(|| Arc::new(ReentrantPlugin::default()));
-        let mut loaded = loaded_static_test_plugin();
-        let PluginBackend::Static(table) = &mut loaded.backend else {
-            panic!("static fixture")
-        };
-        table.invoke_service = export;
-        let loaded = LOADED.get_or_init(|| loaded);
-        let mut context = native_test_service_context(vec![32]);
-        SCOPE
-            .set(context.cancellation.invocation_id.clone())
-            .unwrap();
-        context.request.operation = "outer".into();
-        assert_eq!(
-            loaded.invoke_service(&context).unwrap().payload,
-            vec![42; 17_000]
-        );
-        // A later identical logical operation must execute again rather than
-        // replaying a prior call merely because cancellation metadata is shared.
-        context.request.operation = "mutate".into();
-        for _ in 0..2 {
-            assert_eq!(
-                loaded.invoke_service(&context).unwrap().payload,
-                vec![42; 17_000]
-            );
-        }
-        assert_eq!(instance.effects.load(Ordering::SeqCst), 3);
-        assert_eq!(instance.calls.load(Ordering::SeqCst), 37);
-    }
-
-    #[test]
-    fn sdk_buffer_growth_retains_one_mutation_outcome() {
-        #[derive(Default)]
-        struct Mutation(std::sync::atomic::AtomicUsize);
-        impl bmux_plugin_sdk::ConcurrentRustPlugin for Mutation {
-            type Contract = bmux_plugin_sdk::NoPluginContract;
-            fn invoke_service_concurrent(&self, _: NativeServiceContext) -> ServiceResponse {
-                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                ServiceResponse::ok(vec![42; 17_000])
-            }
-        }
-        let instance: &'static std::sync::Arc<Mutation> =
-            Box::leak(Box::new(std::sync::Arc::new(Mutation::default())));
-        let context = native_test_service_context(Vec::new());
-        let input = encode_service_envelope_with_invocation_id(
-            context.cancellation.invocation_id.clone(),
-            0,
-            ServiceEnvelopeKind::Request,
-            &context,
-        )
-        .unwrap();
-        let (output, resizes) = super::invoke_native_service_resizing_output(
-            "test.plugin",
-            NativeServiceBufferConfig::default(),
-            |output, len| {
-                bmux_plugin_sdk::__private::invoke_service_concurrent_export(
-                    instance,
-                    input.as_ptr(),
-                    input.len(),
-                    output.as_mut_ptr(),
-                    output.len(),
-                    len,
-                )
-            },
-        )
-        .unwrap();
-        assert_eq!(resizes, 1);
-        let (_, _, response): (_, _, ServiceResponse) =
-            decode_service_envelope_with_invocation_id(&output, ServiceEnvelopeKind::Response)
-                .unwrap();
-        assert_eq!(response.payload, vec![42; 17_000]);
-        assert_eq!(instance.0.load(std::sync::atomic::Ordering::SeqCst), 1);
-    }
-
-    #[test]
-    fn native_service_invocation_retries_when_response_outgrows_retry_buffer() {
-        // Exercise the explicit resizing mechanism, not frozen v1 dispatch:
-        // v1 cannot safely replay author code when an output buffer is too small.
-        let mut calls = 0;
-        let (output, resizes) = super::invoke_native_service_resizing_output(
-            "test.plugin",
-            NativeServiceBufferConfig::default(),
-            |output, length| {
-                calls += 1;
-                let payload_len = if calls == 1 { 5_000 } else { 17_000 };
-                let response = ServiceResponse::ok(vec![b'x'; payload_len]);
-                let encoded = encode_service_envelope(0, ServiceEnvelopeKind::Response, &response)
-                    .expect("response should encode");
-                *length = encoded.len();
-                if encoded.len() > output.len() {
-                    return super::NATIVE_SERVICE_STATUS_BUFFER_TOO_SMALL;
-                }
-                output[..encoded.len()].copy_from_slice(&encoded);
-                super::NATIVE_SERVICE_STATUS_OK
-            },
-        )
-        .expect("resizing should handle a response that grows after its first size report");
-        let (_, response): (_, ServiceResponse) =
-            decode_service_envelope(&output, ServiceEnvelopeKind::Response).unwrap();
-        assert!(response.error.is_none());
-        assert_eq!(response.payload, vec![b'x'; 17_000]);
-        assert_eq!(calls, 3);
-        assert_eq!(resizes, 2);
-    }
-
-    #[test]
-    fn frozen_v1_service_dispatch_does_not_replay_for_buffer_growth() {
-        NATIVE_SERVICE_INVOCATION_COUNT.with(|count| count.set(0));
-        let loaded = loaded_static_test_plugin();
-        let response = loaded
-            .invoke_service(&native_test_service_context(vec![b'x'; 17_000]))
-            .expect("maximum v1 buffer should receive a large response on its first call");
-        assert!(response.error.is_none());
-        assert_eq!(response.payload, vec![b'x'; 17_000]);
-        NATIVE_SERVICE_INVOCATION_COUNT.with(|count| assert_eq!(count.get(), 1));
-    }
-
     #[cfg(unix)]
     fn unix_process_exists(pid: u32) -> bool {
         Command::new("kill")
@@ -4146,7 +2547,7 @@ minimum = "1.0"
             .expect("plugin should register")
             .clone();
 
-        super::load_registered_plugin(
+        super::load_process_plugin(
             &registered,
             &HostMetadata {
                 product_name: "bmux".to_string(),
@@ -4163,12 +2564,7 @@ minimum = "1.0"
     fn process_runtime_metrics_snapshot(
         loaded: &LoadedPlugin,
     ) -> super::ProcessRuntimeMetricsSnapshot {
-        match &loaded.backend {
-            PluginBackend::Process(runtime) => runtime.metrics.snapshot(),
-            PluginBackend::Dynamic(_) | PluginBackend::Static(_) => {
-                panic!("expected process backend")
-            }
-        }
+        loaded.runtime.metrics.snapshot()
     }
 
     #[cfg(unix)]
@@ -4206,7 +2602,7 @@ minimum = "1.0"
             .expect("plugin should register")
             .clone();
 
-        let loaded = super::load_registered_plugin(
+        let loaded = super::load_process_plugin(
             &registered,
             &HostMetadata {
                 product_name: "bmux".to_string(),
@@ -4292,9 +2688,7 @@ minimum = "1.0"
             .expect("first worker command should run");
         // Observe this exact owned child, not a PID probe or a guessed delay.
         // Keep a deadline so a broken fixture cannot hang the test indefinitely.
-        let PluginBackend::Process(runtime) = &loaded.backend else {
-            panic!("expected process backend");
-        };
+        let runtime = &loaded.runtime;
         {
             let mut guard = runtime.persistent.lock().expect("worker lock");
             let worker = guard.as_mut().expect("first worker retained");
@@ -5189,12 +3583,13 @@ minimum = "1.0"
 
     #[test]
     fn loaded_plugin_filters_events_by_subscription() {
-        let manifest = PluginManifest::from_toml_str(
+        let loaded = unstarted_process_test_plugin(
             r#"
 id = "test.plugin"
 name = "Test Plugin"
 version = "0.1.0"
-entry = "unused.dylib"
+runtime = "process"
+entry = "unused-test-process"
 
 [[event_subscriptions]]
 kinds = ["bmux.core/server-started"]
@@ -5205,62 +3600,7 @@ minimum = "1.0"
 [native_abi]
 minimum = "1.0"
 "#,
-        )
-        .expect("manifest should parse");
-        let mut registry = PluginRegistry::new();
-        registry
-            .register_manifest(std::path::Path::new("plugin.toml"), manifest)
-            .expect("manifest should register");
-
-        #[cfg(unix)]
-        let library = Library::from(libloading::os::unix::Library::this());
-        #[cfg(windows)]
-        let library = Library::from(
-            libloading::os::windows::Library::this().expect("current library should load"),
         );
-
-        let loaded = LoadedPlugin {
-            registered: registry
-                .get("test.plugin")
-                .expect("plugin should exist")
-                .clone(),
-            declaration: crate::PluginDeclaration {
-                id: crate::PluginId::new("test.plugin").expect("plugin id should parse"),
-                display_name: "Test Plugin".to_string(),
-                plugin_version: "0.1.0".to_string(),
-                plugin_api: bmux_plugin_sdk::VersionRange::at_least(ApiVersion::new(1, 0)),
-                native_abi: bmux_plugin_sdk::VersionRange::at_least(ApiVersion::new(1, 0)),
-                entrypoint: PluginEntrypoint::Native {
-                    symbol: DEFAULT_NATIVE_ENTRY_SYMBOL.to_string(),
-                },
-                description: None,
-                homepage: None,
-                provider_priority: 0,
-                execution_class: crate::PluginExecutionClass::NativeStandard,
-                concurrency: bmux_plugin_runtime::PluginConcurrencyConfig::Concurrent,
-                owns_namespaces: BTreeSet::new(),
-                owns_paths: BTreeSet::new(),
-                optional_capabilities: BTreeSet::new(),
-                required_capabilities: BTreeSet::new(),
-                provided_capabilities: BTreeSet::new(),
-                provided_features: BTreeSet::new(),
-                services: Vec::new(),
-                commands: Vec::new(),
-                event_subscriptions: vec![PluginEventSubscription::for_kind(
-                    PluginEventKind::from_static("bmux.core/server-started"),
-                )],
-                event_publications: Vec::new(),
-                dependencies: Vec::new(),
-                lifecycle: crate::PluginLifecycle::default(),
-                ready_signals: Vec::new(),
-            },
-            backend: PluginBackend::Dynamic(library),
-            native_service_buffers: NativeServiceBufferConfig::default(),
-            background_tasks: Box::default(),
-            concurrency_gate: ConcurrencyGate::new(
-                bmux_plugin_runtime::PluginConcurrencyConfig::Concurrent,
-            ),
-        };
 
         assert!(loaded.receives_event(&PluginEvent {
             kind: PluginEventKind::from_static("bmux.core/server-started"),

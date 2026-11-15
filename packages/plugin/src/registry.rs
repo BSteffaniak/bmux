@@ -401,7 +401,7 @@ impl PluginRegistry {
         Self::validate_plugin_compat(registered_plugin, host, available_capabilities)?;
 
         match &registered_plugin.declaration.entrypoint {
-            PluginEntrypoint::Native { .. } => {
+            PluginEntrypoint::Native => {
                 if let Some(entry_path) = registered_plugin.manifest.resolve_entry_path(
                     registered_plugin
                         .manifest_path
@@ -1034,7 +1034,6 @@ impl SelectedPluginCandidate {
         // Only executable locators and installation pins are packaging metadata;
         // runtime kind, arguments and worker semantics remain part of the contract.
         embedded.entry.clone_from(&expected.entry);
-        embedded.entry_symbol.clone_from(&expected.entry_symbol);
         embedded
             .artifact_sha256
             .clone_from(&expected.artifact_sha256);

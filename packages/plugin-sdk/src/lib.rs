@@ -22,10 +22,10 @@
 //! libraries export no native symbols. A separate thin cdylib calls
 //! [`export_plugin_entrypoint!`] to expose the explicitly selected v2 ABI.
 //! Typed static BPDL adapters register through the same scoped implementation.
-//! The older `RustPlugin` exports below remain only for migration; v1 wire
-//! semantics are unchanged.
+//! Existing `RustPlugin` implementations are adapted per scoped instance by
+//! `define_plugin!(rust_plugin = ...)`; there is no other export path.
 //!
-//! # Legacy quick start
+//! # Quick start
 //!
 //! ```ignore
 //! use bmux_plugin_sdk::prelude::*;
@@ -44,7 +44,11 @@
 //!     }
 //! }
 //!
-//! bmux_plugin_sdk::export_plugin!(MyPlugin, include_str!("../plugin.toml"));
+//! bmux_plugin_sdk::define_plugin!(
+//!     rust_plugin = MyPlugin,
+//!     manifest = include_str!("../plugin.toml"),
+//!     roles = vec![bmux_plugin_sdk::ComponentRole::Backend],
+//! );
 //! ```
 
 pub mod abi;
@@ -74,10 +78,10 @@ mod event;
 mod host;
 mod host_services;
 mod ident;
-mod native_exports;
 mod process_runtime;
 pub mod prompt;
 mod ready;
+mod rust_plugin;
 mod service;
 extern crate self as bmux_plugin_sdk;
 
@@ -149,10 +153,6 @@ macro_rules! storage_key {
         $crate::StorageKey::from_validated_literal($key)
     }};
 }
-pub use native_exports::{
-    ConcurrentRustPlugin, EXIT_ERROR, EXIT_OK, EXIT_UNAVAILABLE, EXIT_USAGE, HostAsyncHandle,
-    PluginCommandError, RustPlugin, TypedServiceRegistrationContext, take_last_command_error,
-};
 pub use process_runtime::{
     PROCESS_RUNTIME_ENV_PERSISTENT_WORKER, PROCESS_RUNTIME_ENV_PLUGIN_ID,
     PROCESS_RUNTIME_ENV_PROTOCOL, PROCESS_RUNTIME_MAGIC_V1, PROCESS_RUNTIME_PROTOCOL_V1,
@@ -162,6 +162,10 @@ pub use process_runtime::{
     encode_process_runtime_frame,
 };
 pub use ready::{ReadySignalDecl, ReadyStatus, ReadyTracker};
+pub use rust_plugin::{
+    EXIT_ERROR, EXIT_OK, EXIT_UNAVAILABLE, EXIT_USAGE, HostAsyncHandle, PluginCommandError,
+    RustPlugin, TypedServiceRegistrationContext,
+};
 pub use service::{
     BoundedServiceEventSink, CURRENT_SERVICE_PROTOCOL_VERSION, NoPluginContract, PluginContract,
     PluginService, ProviderId, RegisteredService, ServiceEnvelope, ServiceEnvelopeKind,
@@ -206,9 +210,6 @@ pub const CURRENT_PLUGIN_API_VERSION: ApiVersion = ApiVersion::new(1, 0);
 
 /// Stable native entrypoint ABI version exposed by this crate.
 pub const CURRENT_PLUGIN_ABI_VERSION: ApiVersion = ApiVersion::new(1, 1);
-
-/// Default exported symbol that a native plugin should expose.
-pub const DEFAULT_NATIVE_ENTRY_SYMBOL: &str = "bmux_plugin_entry_v1";
 
 /// Convenience helper for implementing a service operation.
 ///
@@ -358,7 +359,6 @@ pub mod prelude {
     pub use crate::{
         // Action dispatch
         ActionDispatchRequest,
-        ConcurrentRustPlugin,
         ContributionRegistrar,
         // Exit codes
         EXIT_ERROR,
@@ -400,497 +400,4 @@ pub mod prelude {
         // Service helpers
         handle_service,
     };
-}
-
-#[doc(hidden)]
-pub mod __private {
-    pub use crate::native_exports::{
-        activate_concurrent_export, activate_export, activate_with_async_bundled,
-        concurrent_plugin_instance, deactivate_concurrent_export, deactivate_export,
-        declared_services_bundled, declared_services_concurrent_bundled, handle_event_export,
-        invoke_service_concurrent_export, invoke_service_export,
-        invoke_streaming_service_concurrent_export, invoke_streaming_service_export,
-        manifest_toml_ptr, plugin_instance, register_contributions_bundled,
-        register_contributions_concurrent_bundled, register_contributions_concurrent_export,
-        register_contributions_export, register_typed_services_bundled, run_command_export,
-    };
-}
-
-#[macro_export]
-macro_rules! export_plugin {
-    ($plugin_ty:ty, $manifest_toml:expr $(,)?) => {
-        /// When the `static-bundled` feature is active the plugin is compiled
-        /// into the host binary and the [`bundled_plugin_vtable!`] macro
-        /// provides the symbols instead.  The `export_plugin!` body is
-        /// suppressed to avoid duplicate `#[no_mangle]` symbol collisions.
-        #[cfg(not(feature = "static-bundled"))]
-        const _: () = {
-            fn __bmux_plugin_instance() -> &'static ::std::sync::RwLock<$plugin_ty> {
-                static INSTANCE: ::std::sync::OnceLock<::std::sync::RwLock<$plugin_ty>> =
-                    ::std::sync::OnceLock::new();
-                $crate::__private::plugin_instance(&INSTANCE)
-            }
-
-            #[unsafe(no_mangle)]
-            pub extern "C" fn bmux_plugin_entry_v1() -> *const ::std::ffi::c_char {
-                static MANIFEST: ::std::sync::OnceLock<Option<::std::ffi::CString>> =
-                    ::std::sync::OnceLock::new();
-                $crate::__private::manifest_toml_ptr($manifest_toml, &MANIFEST)
-            }
-
-            #[unsafe(no_mangle)]
-            pub extern "C" fn bmux_plugin_run_command_with_context_v1(
-                input_ptr: *const u8,
-                input_len: usize,
-            ) -> i32 {
-                $crate::__private::run_command_export(
-                    __bmux_plugin_instance(),
-                    input_ptr,
-                    input_len,
-                )
-            }
-
-            #[unsafe(no_mangle)]
-            pub extern "C" fn bmux_plugin_activate_v1(
-                input_ptr: *const u8,
-                input_len: usize,
-            ) -> i32 {
-                $crate::__private::activate_export(__bmux_plugin_instance(), input_ptr, input_len)
-            }
-
-            #[unsafe(no_mangle)]
-            pub extern "C" fn bmux_plugin_deactivate_v1(
-                input_ptr: *const u8,
-                input_len: usize,
-            ) -> i32 {
-                $crate::__private::deactivate_export(__bmux_plugin_instance(), input_ptr, input_len)
-            }
-
-            #[unsafe(no_mangle)]
-            pub extern "C" fn bmux_plugin_handle_event_v1(
-                input_ptr: *const u8,
-                input_len: usize,
-            ) -> i32 {
-                $crate::__private::handle_event_export(
-                    __bmux_plugin_instance(),
-                    input_ptr,
-                    input_len,
-                )
-            }
-
-            #[unsafe(no_mangle)]
-            pub extern "C" fn bmux_plugin_register_contributions_v1(
-                output_ptr: *mut u8,
-                output_capacity: usize,
-                output_len: *mut usize,
-            ) -> i32 {
-                $crate::__private::register_contributions_export(
-                    __bmux_plugin_instance(),
-                    output_ptr,
-                    output_capacity,
-                    output_len,
-                )
-            }
-
-            #[unsafe(no_mangle)]
-            pub extern "C" fn bmux_plugin_invoke_service_checked_v1(
-                input_ptr: *const u8,
-                input_len: usize,
-                output_ptr: *mut u8,
-                output_capacity: usize,
-                output_len: *mut usize,
-            ) -> i32 {
-                $crate::__private::invoke_service_export(
-                    __bmux_plugin_instance(),
-                    input_ptr,
-                    input_len,
-                    output_ptr,
-                    output_capacity,
-                    output_len,
-                )
-            }
-
-            #[unsafe(no_mangle)]
-            pub extern "C" fn bmux_plugin_invoke_service_v1(
-                input_ptr: *const u8,
-                input_len: usize,
-                output_ptr: *mut u8,
-                output_capacity: usize,
-                output_len: *mut usize,
-            ) -> i32 {
-                $crate::__private::invoke_service_export(
-                    __bmux_plugin_instance(),
-                    input_ptr,
-                    input_len,
-                    output_ptr,
-                    output_capacity,
-                    output_len,
-                )
-            }
-
-            #[unsafe(no_mangle)]
-            pub extern "C" fn bmux_plugin_invoke_streaming_service_v1(
-                input_ptr: *const u8,
-                input_len: usize,
-                output_ptr: *mut u8,
-                output_capacity: usize,
-                output_len: *mut usize,
-            ) -> i32 {
-                $crate::__private::invoke_streaming_service_export(
-                    __bmux_plugin_instance(),
-                    input_ptr,
-                    input_len,
-                    output_ptr,
-                    output_capacity,
-                    output_len,
-                )
-            }
-        };
-    };
-}
-
-#[macro_export]
-macro_rules! export_concurrent_plugin {
-    ($plugin_ty:ty, $manifest_toml:expr $(,)?) => {
-        /// When the `static-bundled` feature is active the plugin is compiled
-        /// into the host binary and the [`bundled_concurrent_plugin_vtable!`]
-        /// macro provides the symbols instead.
-        #[cfg(not(feature = "static-bundled"))]
-        const _: () = {
-            fn __bmux_plugin_instance() -> &'static ::std::sync::Arc<$plugin_ty> {
-                static INSTANCE: ::std::sync::OnceLock<::std::sync::Arc<$plugin_ty>> =
-                    ::std::sync::OnceLock::new();
-                $crate::__private::concurrent_plugin_instance(&INSTANCE)
-            }
-
-            #[unsafe(no_mangle)]
-            pub extern "C" fn bmux_plugin_entry_v1() -> *const ::std::ffi::c_char {
-                static MANIFEST: ::std::sync::OnceLock<Option<::std::ffi::CString>> =
-                    ::std::sync::OnceLock::new();
-                $crate::__private::manifest_toml_ptr($manifest_toml, &MANIFEST)
-            }
-
-            #[unsafe(no_mangle)]
-            pub extern "C" fn bmux_plugin_activate_v1(
-                input_ptr: *const u8,
-                input_len: usize,
-            ) -> i32 {
-                $crate::__private::activate_concurrent_export(
-                    __bmux_plugin_instance(),
-                    input_ptr,
-                    input_len,
-                )
-            }
-
-            #[unsafe(no_mangle)]
-            pub extern "C" fn bmux_plugin_deactivate_v1(
-                input_ptr: *const u8,
-                input_len: usize,
-            ) -> i32 {
-                $crate::__private::deactivate_concurrent_export(
-                    __bmux_plugin_instance(),
-                    input_ptr,
-                    input_len,
-                )
-            }
-
-            #[unsafe(no_mangle)]
-            pub extern "C" fn bmux_plugin_register_contributions_v1(
-                output_ptr: *mut u8,
-                output_capacity: usize,
-                output_len: *mut usize,
-            ) -> i32 {
-                $crate::__private::register_contributions_concurrent_export(
-                    __bmux_plugin_instance(),
-                    output_ptr,
-                    output_capacity,
-                    output_len,
-                )
-            }
-
-            #[unsafe(no_mangle)]
-            pub extern "C" fn bmux_plugin_invoke_service_checked_v1(
-                input_ptr: *const u8,
-                input_len: usize,
-                output_ptr: *mut u8,
-                output_capacity: usize,
-                output_len: *mut usize,
-            ) -> i32 {
-                $crate::__private::invoke_service_concurrent_export(
-                    __bmux_plugin_instance(),
-                    input_ptr,
-                    input_len,
-                    output_ptr,
-                    output_capacity,
-                    output_len,
-                )
-            }
-
-            #[unsafe(no_mangle)]
-            pub extern "C" fn bmux_plugin_invoke_service_v1(
-                input_ptr: *const u8,
-                input_len: usize,
-                output_ptr: *mut u8,
-                output_capacity: usize,
-                output_len: *mut usize,
-            ) -> i32 {
-                $crate::__private::invoke_service_concurrent_export(
-                    __bmux_plugin_instance(),
-                    input_ptr,
-                    input_len,
-                    output_ptr,
-                    output_capacity,
-                    output_len,
-                )
-            }
-
-            #[unsafe(no_mangle)]
-            pub extern "C" fn bmux_plugin_invoke_streaming_service_v1(
-                input_ptr: *const u8,
-                input_len: usize,
-                output_ptr: *mut u8,
-                output_capacity: usize,
-                output_len: *mut usize,
-            ) -> i32 {
-                $crate::__private::invoke_streaming_service_concurrent_export(
-                    __bmux_plugin_instance(),
-                    input_ptr,
-                    input_len,
-                    output_ptr,
-                    output_capacity,
-                    output_len,
-                )
-            }
-        };
-    };
-}
-
-#[macro_export]
-macro_rules! bundled_concurrent_plugin_vtable {
-    ($plugin_ty:ty, $manifest_toml:expr $(,)?) => {{
-        fn __instance() -> &'static ::std::sync::Arc<$plugin_ty> {
-            static INSTANCE: ::std::sync::OnceLock<::std::sync::Arc<$plugin_ty>> =
-                ::std::sync::OnceLock::new();
-            $crate::__private::concurrent_plugin_instance(&INSTANCE)
-        }
-
-        fn __entry() -> *const ::std::ffi::c_char {
-            static MANIFEST: ::std::sync::OnceLock<Option<::std::ffi::CString>> =
-                ::std::sync::OnceLock::new();
-            $crate::__private::manifest_toml_ptr($manifest_toml, &MANIFEST)
-        }
-
-        fn __activate(input_ptr: *const u8, input_len: usize) -> i32 {
-            $crate::__private::activate_concurrent_export(__instance(), input_ptr, input_len)
-        }
-
-        fn __deactivate(input_ptr: *const u8, input_len: usize) -> i32 {
-            $crate::__private::deactivate_concurrent_export(__instance(), input_ptr, input_len)
-        }
-
-        fn __invoke_service(
-            input_ptr: *const u8,
-            input_len: usize,
-            output_ptr: *mut u8,
-            output_capacity: usize,
-            output_len: *mut usize,
-        ) -> i32 {
-            $crate::__private::invoke_service_concurrent_export(
-                __instance(),
-                input_ptr,
-                input_len,
-                output_ptr,
-                output_capacity,
-                output_len,
-            )
-        }
-
-        fn __invoke_streaming_service(
-            input_ptr: *const u8,
-            input_len: usize,
-            output_ptr: *mut u8,
-            output_capacity: usize,
-            output_len: *mut usize,
-        ) -> i32 {
-            $crate::__private::invoke_streaming_service_concurrent_export(
-                __instance(),
-                input_ptr,
-                input_len,
-                output_ptr,
-                output_capacity,
-                output_len,
-            )
-        }
-
-        fn __register_typed_services(
-            _context: $crate::TypedServiceRegistrationContext<'_>,
-        ) -> $crate::TypedServiceRegistry {
-            $crate::TypedServiceRegistry::new()
-        }
-
-        fn __declared_services() -> $crate::Result<Vec<$crate::PluginService>> {
-            $crate::__private::declared_services_concurrent_bundled::<$plugin_ty>()
-        }
-
-        fn __register_contributions() -> $crate::Result<Vec<$crate::PluginContribution>> {
-            $crate::__private::register_contributions_concurrent_bundled(__instance())
-        }
-
-        $crate::StaticPluginVtable {
-            entry: __entry,
-            run_command_with_context: |_input_ptr, _input_len| $crate::EXIT_USAGE,
-            activate: __activate,
-            activate_with_async: |_context, _async_handle| $crate::EXIT_OK,
-            deactivate: __deactivate,
-            handle_event: |_input_ptr, _input_len| $crate::EXIT_OK,
-            checked_service_contracts: true,
-            invoke_service: __invoke_service,
-            invoke_streaming_service: __invoke_streaming_service,
-            register_typed_services: __register_typed_services,
-            declared_services: __declared_services,
-            register_contributions: __register_contributions,
-        }
-    }};
-}
-
-/// Build a [`StaticPluginVtable`] for a [`RustPlugin`] type.
-///
-/// Unlike [`export_plugin!`], the generated functions are module-scoped
-/// (not `#[no_mangle] extern "C"`), so multiple plugins can coexist in
-/// the same binary without symbol collisions.
-///
-/// # Example
-///
-/// ```ignore
-/// let vtable = bmux_plugin_sdk::bundled_plugin_vtable!(
-///     MyPlugin,
-///     include_str!("../plugin.toml"),
-/// );
-/// ```
-#[macro_export]
-macro_rules! bundled_plugin_vtable {
-    ($plugin_ty:ty, $manifest_toml:expr $(,)?) => {{
-        fn __instance() -> &'static ::std::sync::RwLock<$plugin_ty> {
-            static INSTANCE: ::std::sync::OnceLock<::std::sync::RwLock<$plugin_ty>> =
-                ::std::sync::OnceLock::new();
-            $crate::__private::plugin_instance(&INSTANCE)
-        }
-
-        fn __entry() -> *const ::std::ffi::c_char {
-            static MANIFEST: ::std::sync::OnceLock<Option<::std::ffi::CString>> =
-                ::std::sync::OnceLock::new();
-            $crate::__private::manifest_toml_ptr($manifest_toml, &MANIFEST)
-        }
-
-        fn __run_command_with_context(input_ptr: *const u8, input_len: usize) -> i32 {
-            $crate::__private::run_command_export(__instance(), input_ptr, input_len)
-        }
-
-        fn __activate(input_ptr: *const u8, input_len: usize) -> i32 {
-            $crate::__private::activate_export(__instance(), input_ptr, input_len)
-        }
-
-        fn __activate_with_async(
-            context: $crate::NativeLifecycleContext,
-            async_handle: $crate::HostAsyncHandle,
-        ) -> i32 {
-            $crate::__private::activate_with_async_bundled(__instance(), context, async_handle)
-        }
-
-        fn __deactivate(input_ptr: *const u8, input_len: usize) -> i32 {
-            $crate::__private::deactivate_export(__instance(), input_ptr, input_len)
-        }
-
-        fn __handle_event(input_ptr: *const u8, input_len: usize) -> i32 {
-            $crate::__private::handle_event_export(__instance(), input_ptr, input_len)
-        }
-
-        fn __invoke_service(
-            input_ptr: *const u8,
-            input_len: usize,
-            output_ptr: *mut u8,
-            output_capacity: usize,
-            output_len: *mut usize,
-        ) -> i32 {
-            $crate::__private::invoke_service_export(
-                __instance(),
-                input_ptr,
-                input_len,
-                output_ptr,
-                output_capacity,
-                output_len,
-            )
-        }
-
-        fn __invoke_streaming_service(
-            input_ptr: *const u8,
-            input_len: usize,
-            output_ptr: *mut u8,
-            output_capacity: usize,
-            output_len: *mut usize,
-        ) -> i32 {
-            $crate::__private::invoke_streaming_service_export(
-                __instance(),
-                input_ptr,
-                input_len,
-                output_ptr,
-                output_capacity,
-                output_len,
-            )
-        }
-
-        fn __register_typed_services(
-            context: $crate::TypedServiceRegistrationContext<'_>,
-        ) -> $crate::TypedServiceRegistry {
-            $crate::__private::register_typed_services_bundled(__instance(), context)
-        }
-
-        fn __declared_services() -> $crate::Result<Vec<$crate::PluginService>> {
-            $crate::__private::declared_services_bundled::<$plugin_ty>()
-        }
-
-        fn __register_contributions() -> $crate::Result<Vec<$crate::PluginContribution>> {
-            $crate::__private::register_contributions_bundled(__instance())
-        }
-
-        $crate::StaticPluginVtable {
-            entry: __entry,
-            run_command_with_context: __run_command_with_context,
-            activate: __activate,
-            activate_with_async: __activate_with_async,
-            deactivate: __deactivate,
-            handle_event: __handle_event,
-            checked_service_contracts: true,
-            invoke_service: __invoke_service,
-            invoke_streaming_service: __invoke_streaming_service,
-            register_typed_services: __register_typed_services,
-            declared_services: __declared_services,
-            register_contributions: __register_contributions,
-        }
-    }};
-}
-
-/// Function table for a statically-linked bundled plugin.
-#[derive(Clone, Copy)]
-pub struct StaticPluginVtable {
-    pub entry: fn() -> *const std::ffi::c_char,
-    pub run_command_with_context: fn(*const u8, usize) -> i32,
-    pub activate: fn(*const u8, usize) -> i32,
-    pub activate_with_async: fn(NativeLifecycleContext, HostAsyncHandle) -> i32,
-    pub deactivate: fn(*const u8, usize) -> i32,
-    pub handle_event: fn(*const u8, usize) -> i32,
-    pub invoke_service: fn(*const u8, usize, *mut u8, usize, *mut usize) -> i32,
-    /// Export validates checked BPDL payloads before provider code runs.
-    pub checked_service_contracts: bool,
-    pub invoke_streaming_service: fn(*const u8, usize, *mut u8, usize, *mut usize) -> i32,
-    pub register_typed_services:
-        fn(context: TypedServiceRegistrationContext<'_>) -> TypedServiceRegistry,
-    pub declared_services: fn() -> Result<Vec<PluginService>>,
-    pub register_contributions: fn() -> Result<Vec<PluginContribution>>,
-}
-
-impl std::fmt::Debug for StaticPluginVtable {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("StaticPluginVtable").finish_non_exhaustive()
-    }
 }
