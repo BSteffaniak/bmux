@@ -1954,7 +1954,11 @@ fn handle_command(plugin: &TabsPlugin, context: &NativeCommandContext) -> Result
             ) {
                 return Err("rename-tab requires --name when not invoked from attach".to_string());
             }
-            spawn_rename_tab_prompt(context.clone(), Arc::clone(&plugin.runtime_state))?;
+            // Resolve the target while this command's host route is live; the
+            // prompt outlives the command and must not reuse its context.
+            let target = current_tab(context, &plugin.runtime_state)?
+                .ok_or_else(|| "no current tab to rename".to_string())?;
+            spawn_rename_tab_prompt(target)?;
             Ok(())
         }
         "rename-tab-by-id" => {
@@ -2671,34 +2675,37 @@ fn rename_tab_context(
     })
 }
 
-fn current_tab_label(
+/// The invoking client's current tab, as `(id, label)`.
+fn current_tab(
     caller: &(impl HostRuntimeApi + Sync),
     runtime_state: &TabRuntimeStateHandle,
-) -> Option<String> {
-    list_tabs(caller, runtime_state, None)
-        .ok()?
+) -> Result<Option<(Uuid, String)>, String> {
+    list_tabs(caller, runtime_state, None)?
         .into_iter()
         .find(|tab| tab.active)
-        .map(|tab| tab.name)
+        .map(|tab| {
+            Uuid::parse_str(&tab.id)
+                .map(|id| (id, tab.name))
+                .map_err(|error| format!("invalid tab id: {error}"))
+        })
+        .transpose()
 }
 
-fn spawn_rename_tab_prompt(
-    context: NativeCommandContext,
-    runtime_state: TabRuntimeStateHandle,
-) -> Result<(), String> {
+/// Ask for the new name without holding any command-scoped host route.
+///
+/// The prompt resolves after the `rename-tab` command has returned, so its
+/// context (and the dispatch route the attach loop serves only while the
+/// command runs) is gone. The rename runs as its own command instead.
+fn spawn_rename_tab_prompt((id, initial): (Uuid, String)) -> Result<(), String> {
     let handle = tokio::runtime::Handle::try_current()
         .map_err(|_| "rename-tab prompt requires attach runtime".to_string())?;
     handle.spawn(async move {
-        prompt_and_rename_tab(context, runtime_state).await;
+        prompt_and_rename_tab(id, initial).await;
     });
     Ok(())
 }
 
-async fn prompt_and_rename_tab(
-    context: NativeCommandContext,
-    runtime_state: TabRuntimeStateHandle,
-) {
-    let initial = current_tab_label(&context, &runtime_state).unwrap_or_default();
+async fn prompt_and_rename_tab(id: Uuid, initial: String) {
     let request = PromptRequest::text_input("Rename tab")
         .message("Enter a new name for the current tab.")
         .submit_label("Rename")
@@ -2711,16 +2718,30 @@ async fn prompt_and_rename_tab(
     let response = match prompt::request(request).await {
         Ok(response) => response,
         Err(error) => {
-            log_tab_rename_error(&context, format!("failed opening rename prompt: {error}"));
+            tracing::warn!(%error, "bmux.tabs: failed opening rename prompt");
             return;
         }
     };
     let PromptResponse::Submitted(PromptValue::Text(name)) = response else {
         return;
     };
-    if let Err(error) = rename_tab(&context, &runtime_state, &name) {
-        log_tab_rename_error(&context, format!("rename-tab failed: {error}"));
+    if let Err(error) = bmux_plugin::action_dispatch::dispatch(rename_tab_by_id_action(id, &name)) {
+        tracing::warn!(%error, "bmux.tabs: rename-tab dispatch failed");
     }
+}
+
+/// Keymap action renaming `id`; the name is double-quoted for the action parser.
+fn rename_tab_by_id_action(id: Uuid, name: &str) -> String {
+    let mut quoted = String::with_capacity(name.len() + 2);
+    quoted.push('"');
+    for ch in name.chars() {
+        if matches!(ch, '"' | '\\') {
+            quoted.push('\\');
+        }
+        quoted.push(ch);
+    }
+    quoted.push('"');
+    format!("plugin:bmux.tabs:rename-tab-by-id --id {id} --name {quoted}")
 }
 
 fn log_tab_rename_error(context: &impl HostRuntimeApi, message: String) {
@@ -4611,6 +4632,33 @@ bmux_plugin_sdk::define_plugin!(
 fn interface_ids_match_bpdl_constants() {
     assert_eq!(tabs_state::INTERFACE_ID.as_str(), "tabs-state");
     assert_eq!(tabs_commands::INTERFACE_ID.as_str(), "tabs-commands");
+}
+
+#[cfg(test)]
+#[test]
+fn rename_action_round_trips_names_through_the_action_parser() {
+    let id = Uuid::from_u128(9);
+    for name in [
+        "plain",
+        "two words",
+        "quote \" and \\ slash",
+        "it's",
+        "--flag-like",
+    ] {
+        let action = bmux_keybind::parse_action(&rename_tab_by_id_action(id, name)).unwrap();
+        let bmux_keybind::RuntimeAction::PluginCommand {
+            plugin_id,
+            command_name,
+            args,
+        } = action
+        else {
+            panic!("expected a plugin command for {name:?}");
+        };
+        assert_eq!(plugin_id, "bmux.tabs");
+        assert_eq!(command_name, "rename-tab-by-id");
+        assert_eq!(option_value(&args, "id"), Some(id.to_string()));
+        assert_eq!(option_value(&args, "name").as_deref(), Some(name));
+    }
 }
 
 #[cfg(test)]

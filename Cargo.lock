@@ -3327,6 +3327,7 @@ dependencies = [
  "bmux_contexts_plugin",
  "bmux_contexts_plugin_api",
  "bmux_ipc",
+ "bmux_keybind",
  "bmux_pane_runtime_plugin_api",
  "bmux_plugin",
  "bmux_plugin_runtime",

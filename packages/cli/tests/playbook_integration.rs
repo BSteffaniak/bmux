@@ -294,6 +294,13 @@ fn finder_recency_uses_invoking_attachment_across_workspaces() {
 
 #[test]
 #[serial]
+fn playbook_real_attach_prompted_tab_rename_applies() {
+    let (json, pass) = run_playbook_fixture("tab_rename_prompt_real_attach.dsl");
+    assert!(pass, "prompted tab rename should apply: {json:#}");
+}
+
+#[test]
+#[serial]
 fn playbook_real_attach_finder_switches_sandbox_tabs() {
     let (json, pass) = run_playbook_fixture("tab_navigation_finder_real_attach.dsl");
     assert!(
