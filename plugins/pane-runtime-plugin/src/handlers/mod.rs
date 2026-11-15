@@ -260,6 +260,9 @@ fn route_authorized(context: NativeServiceContext) -> ServiceResponse {
         "pane-runtime-state", "pane-padding" => |req: padding::PanePaddingArgs, _ctx| {
             Ok::<_, ServiceResponse>(padding::get(&req))
         },
+        "pane-runtime-state", "padding-target-panes" => |req: padding::PaddingTargetPanesArgs, _ctx| {
+            Ok::<_, ServiceResponse>(padding::target_panes(&req))
+        },
         "pane-runtime-state", "list-panes" => |req: pane_state::ListPanesArgs, ctx| {
             Ok::<_, ServiceResponse>(pane_state::list_panes(&req, ctx))
         },
@@ -294,6 +297,12 @@ fn route_authorized(context: NativeServiceContext) -> ServiceResponse {
         },
         "pane-runtime-commands", "commit-pane-padding-preview" => |req: padding::CommitPanePaddingPreviewArgs, ctx| {
             Ok::<_, ServiceResponse>(padding::commit_preview(&req, ctx))
+        },
+        "pane-runtime-commands", "clear-pane-padding-overrides" => |req: padding::ClearPanePaddingOverridesArgs, _ctx| {
+            Ok::<_, ServiceResponse>(padding::clear_overrides(&req))
+        },
+        "pane-runtime-commands", "set-global-pane-padding" => |req: padding::SetGlobalPanePaddingArgs, _ctx| {
+            Ok::<_, ServiceResponse>(padding::set_global(&req))
         },
         "pane-runtime-commands", "split-pane" => |req: pane_commands::SplitPaneArgs, ctx| {
             Ok::<_, ServiceResponse>(pane_commands::split_pane(&req, ctx))

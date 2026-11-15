@@ -6,6 +6,8 @@ name            = "bmux Pane Runtime"
 optional_capabilities = [
     "bmux.application_resurrection.host",
     "bmux.sessions.policy",
+    # Current-window padding scope; absent tabs plugin hides that scope.
+    "bmux.tabs.read",
 ]
 owns_namespaces = ["pane-padding"]
 provided_capabilities = [

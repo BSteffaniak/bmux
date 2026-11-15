@@ -1,0 +1,9 @@
+[keybindings]
+initial_mode = "normal"
+
+[keybindings.global]
+"alt+p" = "plugin:bmux.pane_runtime:pane-padding-configure"
+
+[keybindings.modes.normal]
+label       = "NORMAL"
+passthrough = true

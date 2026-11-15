@@ -13065,6 +13065,19 @@ impl PanePaddingRuntimeHandle {
         self.replace_padding_config_with_hook(padding_config, || Ok(()))
     }
 
+    /// Install a new global padding default live, keeping configured rules.
+    pub(crate) fn replace_padding_defaults(&self, defaults: PanePaddingSpec) -> Result<(), String> {
+        let config = {
+            let manager = self
+                .0
+                .lock()
+                .map_err(|_| SessionRuntimeError::Closed.to_string())?;
+            manager.padding_config.with_defaults(defaults)?
+        };
+        self.replace_padding_config(config)
+            .map_err(|error| error.to_string())
+    }
+
     fn replace_padding_config_with_hook(
         &self,
         padding_config: PanePaddingConfig,
@@ -13209,6 +13222,18 @@ pub fn activate_pane_runtime(
         persist_runtime_overrides = padding_config.persist_runtime_overrides,
         "activating pane padding configuration"
     );
+    // One runtime per process, released by its shutdown participant. A later
+    // activation in the same process (each caller-process command loads a
+    // fresh command-local instance) adopts it instead of registering a
+    // duplicate participant and a second manager.
+    if let Some(existing) = bmux_plugin::global_plugin_state_registry()
+        .get::<PanePaddingRuntimeHandle>()
+        .and_then(|handle| handle.read().ok().map(|guard| (*guard).clone()))
+    {
+        return existing
+            .replace_padding_config(padding_config)
+            .map_err(|error| error.to_string());
+    }
     let (pane_exit_tx, pane_exit_rx) = mpsc::unbounded_channel();
     let manager = Arc::new(Mutex::new(SessionRuntimeManager::new(
         config.shell,
@@ -15371,7 +15396,7 @@ exit 7"#
     }
 
     #[tokio::test]
-    async fn dropping_caller_guard_cancels_preview_and_restores_geometry() {
+    async fn cancelled_preview_restores_geometry() {
         let session_id = SessionId(Uuid::new_v4());
         let pane_id = Uuid::new_v4();
         let owner = ClientId(Uuid::new_v4());
@@ -15389,15 +15414,41 @@ exit 7"#
             )
             .unwrap();
 
-        drop(crate::commands::PreviewCancelGuard::new(
-            handle.clone(),
-            owner,
-            token,
-        ));
+        handle.cancel_preview(owner, token).unwrap();
 
         assert_eq!(
             handle.state(session_id, Some(pane_id)).unwrap().effective,
             baseline
+        );
+    }
+
+    #[tokio::test]
+    async fn replacing_padding_defaults_applies_live_and_rejects_zero_limits() {
+        let session_id = SessionId(Uuid::new_v4());
+        let pane_id = Uuid::new_v4();
+        let manager = manager_with_runtime(session_id, runtime_with_panes(&[pane_id]));
+        let handle = PanePaddingRuntimeHandle::from_manager_for_test(manager);
+        let defaults = PanePaddingSpec {
+            left: 4,
+            right: 2,
+            ..PanePaddingSpec::default()
+        };
+
+        handle.replace_padding_defaults(defaults).unwrap();
+
+        assert_eq!(
+            handle.state(session_id, Some(pane_id)).unwrap().effective,
+            defaults
+        );
+        handle
+            .replace_padding_defaults(PanePaddingSpec {
+                max_content_width: Some(0),
+                ..PanePaddingSpec::default()
+            })
+            .expect_err("zero width limit must be rejected");
+        assert_eq!(
+            handle.state(session_id, Some(pane_id)).unwrap().effective,
+            defaults
         );
     }
 

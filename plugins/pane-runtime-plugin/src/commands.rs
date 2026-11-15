@@ -250,6 +250,11 @@ fn set_spec(
 }
 
 pub(crate) fn run(context: &NativeCommandContext) -> Result<(), PluginCommandError> {
+    if context.command == "pane-padding-configure" {
+        // Runs in the caller process: it reaches the pane runtime only through
+        // typed services, never this process's local runtime handle.
+        return configure(context);
+    }
     let session_id = selected_session(context)?;
     let pane_id = target_pane(&context.arguments)?;
     let handle = handle()?;
@@ -269,9 +274,6 @@ pub(crate) fn run(context: &NativeCommandContext) -> Result<(), PluginCommandErr
                 .set_override(session_id, pane_id, Some(spec))
                 .map_err(|error| PluginCommandError::failed(error.to_string()))?;
             emit_result(context, state.into_api());
-        }
-        "pane-padding-configure" => {
-            configure(context)?;
         }
         "pane-padding-reset" => {
             let state = handle
@@ -635,56 +637,55 @@ fn non_empty_targets(targets: Vec<Uuid>) -> Result<Vec<Uuid>, PluginCommandError
     }
 }
 
-fn resolve_scope(
-    context: &NativeCommandContext,
+/// Async service route captured from the issuing command. Detached configure
+/// work holds this, never the command's context or its host route.
+type ConfigureRoute = bmux_plugin::AsyncServiceClient;
+
+fn route_error(error: impl std::fmt::Display) -> PluginCommandError {
+    PluginCommandError::failed(error.to_string())
+}
+
+async fn padding_target_panes(
+    route: &mut ConfigureRoute,
+    session: Option<Uuid>,
+) -> Result<Vec<Uuid>, PluginCommandError> {
+    pane_runtime_state::client::padding_target_panes(route, session)
+        .await
+        .map_err(route_error)?
+        .map_err(|error| {
+            PluginCommandError::failed(format!("padding targets unavailable: {error:?}"))
+        })
+}
+
+async fn resolve_scope(
+    route: &mut ConfigureRoute,
+    windows_available: bool,
     session_id: SessionId,
     pane_id: Uuid,
     scope: ConfigureScope,
 ) -> Result<Vec<Uuid>, PluginCommandError> {
-    let handle = handle()?;
-    match scope {
-        ConfigureScope::Pane => non_empty_targets(vec![pane_id]),
-        ConfigureScope::Session => handle
-            .pane_ids(session_id)
-            .map_err(|error| PluginCommandError::failed(error.to_string()))
-            .and_then(non_empty_targets),
-        ConfigureScope::All | ConfigureScope::Global => handle
-            .all_pane_ids()
-            .map_err(|error| PluginCommandError::failed(error.to_string()))
-            .and_then(non_empty_targets),
+    let targets = match scope {
+        ConfigureScope::Pane => vec![pane_id],
+        ConfigureScope::Session => padding_target_panes(route, Some(session_id.0)).await?,
+        ConfigureScope::All | ConfigureScope::Global => padding_target_panes(route, None).await?,
         ConfigureScope::Window => {
-            if !context
-                .available_capabilities
-                .iter()
-                .any(|capability| capability == "bmux.tabs.read")
-            {
+            if !windows_available {
                 return Err(PluginCommandError::unavailable(
                     "current-window scope requires the windows plugin",
                 ));
             }
-            let mut window_context = context.clone();
-            if !window_context
-                .required_capabilities
-                .iter()
-                .any(|capability| capability == "bmux.tabs.read")
-            {
-                window_context
-                    .required_capabilities
-                    .push("bmux.tabs.read".to_string());
-            }
-            let mut client = ServiceCallerDispatchClient::new(&window_context);
-            let result = bmux_plugin::block_on_typed_dispatch(
-                bmux_tabs_plugin_api::tabs_state::client::active_tab_panes(&mut client),
-            )
-            .map_err(|error| {
-                PluginCommandError::failed(format!("window target lookup failed: {error}"))
-            })?
-            .map_err(|error| {
-                PluginCommandError::failed(format!("window target unavailable: {error:?}"))
-            })?;
-            non_empty_targets(result.pane_ids)
+            bmux_tabs_plugin_api::tabs_state::client::active_tab_panes(route)
+                .await
+                .map_err(|error| {
+                    PluginCommandError::failed(format!("window target lookup failed: {error}"))
+                })?
+                .map_err(|error| {
+                    PluginCommandError::failed(format!("window target unavailable: {error:?}"))
+                })?
+                .pane_ids
         }
-    }
+    };
+    non_empty_targets(targets)
 }
 
 fn padding_settings_value(existing: Option<&toml::Value>, spec: PanePaddingSpec) -> toml::Value {
@@ -808,14 +809,14 @@ fn atomic_replace(path: &Path, contents: &[u8]) -> Result<(), PluginCommandError
     result
 }
 
-fn persist_and_install_global_padding(
+async fn persist_and_install_global_padding(
     path: &Path,
     original: &[u8],
     edited: &[u8],
-    install: impl FnOnce() -> Result<(), PluginCommandError>,
+    install: impl std::future::Future<Output = Result<(), PluginCommandError>>,
 ) -> Result<(), PluginCommandError> {
     atomic_replace(path, edited)?;
-    if let Err(error) = install() {
+    if let Err(error) = install.await {
         atomic_replace(path, original).map_err(|rollback| {
             PluginCommandError::failed(format!(
                 "{error}; additionally failed restoring bmux.toml: {rollback}"
@@ -836,26 +837,33 @@ fn verify_config_unchanged(path: &Path, original: &[u8]) -> Result<(), PluginCom
     }
 }
 
-fn install_global_padding(
-    context: &NativeCommandContext,
+async fn install_global_padding(
+    route: &mut ConfigureRoute,
+    plugin_settings: Option<&toml::Value>,
+    path: &Path,
     spec: PanePaddingSpec,
 ) -> Result<(), PluginCommandError> {
-    let settings = padding_settings_value(context.settings.as_ref(), spec);
-    let config = crate::padding::PanePaddingConfig::parse(Some(&settings))
+    let settings = padding_settings_value(plugin_settings, spec);
+    crate::padding::PanePaddingConfig::parse(Some(&settings))
         .map_err(PluginCommandError::invalid_arguments)?;
-    let path = config_path(context);
-    let original = fs::read(&path).unwrap_or_default();
+    let original = fs::read(path).unwrap_or_default();
     let source = String::from_utf8(original.clone())
         .map_err(|_| PluginCommandError::failed("bmux.toml is not valid UTF-8"))?;
     let edited = set_padding_document(&source, spec)?
         .to_string()
         .into_bytes();
-    verify_config_unchanged(&path, &original)?;
-    persist_and_install_global_padding(&path, &original, &edited, || {
-        handle()?.replace_padding_config(config).map_err(|error| {
-            PluginCommandError::failed(format!("failed installing live pane padding: {error}"))
-        })
+    verify_config_unchanged(path, &original)?;
+    persist_and_install_global_padding(path, &original, &edited, async {
+        pane_runtime_commands::client::set_global_pane_padding(route, preview_spec(spec))
+            .await
+            .map_err(route_error)?
+            .map_err(|error| {
+                PluginCommandError::failed(format!(
+                    "failed installing live pane padding: {error:?}"
+                ))
+            })
     })
+    .await
 }
 
 const NUMERIC_PREVIEW_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(60);
@@ -871,14 +879,7 @@ fn is_numeric_configure_field(field_id: &str) -> bool {
     )
 }
 
-fn clear_target_overrides(targets: &[Uuid]) -> Result<(), PluginCommandError> {
-    handle()?
-        .clear_overrides(targets)
-        .map_err(|error| PluginCommandError::failed(error.to_string()))?;
-    Ok(())
-}
-
-fn preview_feedback(states: &[crate::padding_api::RuntimePanePaddingState]) -> String {
+fn preview_feedback(states: &[PanePaddingState]) -> String {
     let Some(first) = states.first() else {
         return "Targets: 0 panes".to_string();
     };
@@ -892,7 +893,12 @@ fn preview_feedback(states: &[crate::padding_api::RuntimePanePaddingState]) -> S
         .count();
     let clamped = states
         .iter()
-        .filter(|state| state.effective_content_rect.w <= 1 || state.effective_content_rect.h <= 1)
+        .filter(|state| {
+            state
+                .effective_content_rect
+                .as_ref()
+                .is_some_and(|rect| rect.w <= 1 || rect.h <= 1)
+        })
         .count();
     format!(
         "Targets: {} pane{} | {} constrained | {} unchanged | {} clamped | Values: {}",
@@ -905,32 +911,42 @@ fn preview_feedback(states: &[crate::padding_api::RuntimePanePaddingState]) -> S
     )
 }
 
+/// Cancels an open preview through the captured route unless disarmed.
 pub(crate) struct PreviewCancelGuard {
-    handle: PanePaddingRuntimeHandle,
-    owner: ClientId,
+    route: Option<ConfigureRoute>,
     token: Uuid,
-    armed: bool,
 }
 
 impl PreviewCancelGuard {
-    pub(crate) fn new(handle: PanePaddingRuntimeHandle, owner: ClientId, token: Uuid) -> Self {
+    pub(crate) const fn new(route: ConfigureRoute, token: Uuid) -> Self {
         Self {
-            handle,
-            owner,
+            route: Some(route),
             token,
-            armed: true,
         }
     }
 
     fn disarm(&mut self) {
-        self.armed = false;
+        self.route = None;
     }
 }
 
 impl Drop for PreviewCancelGuard {
     fn drop(&mut self) {
-        if self.armed {
-            let _ = self.handle.cancel_preview(self.owner, self.token);
+        let Some(mut route) = self.route.take() else {
+            return;
+        };
+        let token = self.token;
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                let result =
+                    pane_runtime_commands::client::cancel_pane_padding_preview(&mut route, token)
+                        .await;
+                if !matches!(result, Ok(Ok(_))) {
+                    tracing::warn!(?result, "abandoned pane padding preview requires recovery");
+                }
+            });
+        } else {
+            tracing::warn!("abandoned pane padding preview requires recovery");
         }
     }
 }
@@ -939,229 +955,301 @@ fn preview_spec(spec: PanePaddingSpec) -> pane_runtime_state::PanePaddingSpec {
     crate::padding_api::spec_to_api(spec)
 }
 
-#[allow(clippy::too_many_lines)] // The prompt transaction loop keeps submit, cancel, and live-update ownership visibly together.
+fn rect_size(rect: Option<&pane_runtime_state::PanePaddingRect>) -> String {
+    rect.map_or_else(|| "?".to_string(), |rect| format!("{}x{}", rect.w, rect.h))
+}
+
+/// Open the live configurator. Everything the detached transaction needs is
+/// gathered here while this command's host route is live; the transaction then
+/// holds only the captured async route, so it never blocks on a route the
+/// attach loop serves only while a command runs, and it outlives the command.
 fn configure(context: &NativeCommandContext) -> Result<(), PluginCommandError> {
+    let route = bmux_plugin::capture_async_command_route(bmux_plugin::ASYNC_SERVICE_ROUTE_V1)
+        .map_err(|error| {
+            PluginCommandError::unavailable(format!(
+                "pane padding configurator requires an attach service route: {error}"
+            ))
+        })?
+        .with_backpressure();
+    let runtime = tokio::runtime::Handle::try_current().map_err(|_| {
+        PluginCommandError::unavailable("pane padding configurator requires the attach runtime")
+    })?;
     let session_id = selected_session(context)?;
     let explicit_pane = target_pane(&context.arguments)?;
-    let current = handle()?
-        .state(session_id, explicit_pane)
-        .map_err(|error| PluginCommandError::failed(error.to_string()))?;
+    let mut client = ServiceCallerDispatchClient::new(context);
+    let current = bmux_plugin::block_on_typed_dispatch(pane_runtime_state::client::pane_padding(
+        &mut client,
+        session_id.0,
+        explicit_pane,
+    ))
+    .map_err(|error| PluginCommandError::failed(format!("pane padding lookup failed: {error}")))?
+    .map_err(|error| PluginCommandError::failed(format!("pane padding unavailable: {error:?}")))?;
     let pane_id = current.pane_id;
-    let initial_spec = current.effective;
+    let initial_spec = crate::padding_api::spec_from_api(&current.effective)
+        .map_err(PluginCommandError::failed)?;
     let windows_available = context
         .available_capabilities
         .iter()
         .any(|capability| capability == "bmux.tabs.read");
     let target_summary = format!(
-        "Targets: 1 pane | Outer: {}x{} | Base: {}x{} | Content/PTY: {}x{} | Source: {}",
-        current.outer_rect.w,
-        current.outer_rect.h,
-        current.base_content_rect.w,
-        current.base_content_rect.h,
-        current.effective_content_rect.w,
-        current.effective_content_rect.h,
-        if current.runtime_override.is_some() {
-            "runtime override"
-        } else if current.matched_rule_index.is_some() {
-            "rule"
-        } else {
-            "global"
+        "Targets: 1 pane | Outer: {} | Base: {} | Content/PTY: {} | Source: {}",
+        rect_size(current.outer_rect.as_ref()),
+        rect_size(current.base_content_rect.as_ref()),
+        rect_size(current.effective_content_rect.as_ref()),
+        match current.source.as_str() {
+            "runtime_override" => "runtime override",
+            other => other,
         },
     );
+    let started = bmux_plugin::block_on_typed_dispatch(
+        pane_runtime_commands::client::begin_pane_padding_preview(
+            &mut client,
+            vec![pane_id],
+            preview_spec(initial_spec),
+        ),
+    )
+    .map_err(|error| PluginCommandError::failed(format!("padding preview failed: {error}")))?
+    .map_err(|error| PluginCommandError::failed(format!("padding preview rejected: {error:?}")))?;
+    // Armed until the transaction settles; dropping it (including on a failed
+    // submission below) cancels the preview through the async route.
+    let guard = PreviewCancelGuard::new(route.clone(), started.token);
+    record_command_outcome_metadata(
+        COMMAND_OUTCOME_STATUS_MESSAGE_KEY,
+        preview_feedback(&started.panes).into(),
+    );
     let prompt = configure_request(initial_spec, windows_available, Some(target_summary));
-    let (mut response_rx, mut event_rx) = prompt::submit_with_events(prompt)
+    let (responses, events) = prompt::submit_with_events(prompt)
         .map_err(|error| PluginCommandError::unavailable(error.to_string()))?;
-    let context = context.clone();
-    tokio::spawn(async move {
-        let mut scope = ConfigureScope::Pane;
-        let mut spec = initial_spec;
-        let Ok(initial_targets) = resolve_scope(&context, session_id, pane_id, scope) else {
-            return;
-        };
-        let mut targets = initial_targets.clone();
-        let mut client = ServiceCallerDispatchClient::new(&context);
-        let Ok(Ok(started)) = bmux_plugin::block_on_typed_dispatch(
-            pane_runtime_commands::client::begin_pane_padding_preview(
-                &mut client,
-                initial_targets,
-                preview_spec(spec),
-            ),
-        ) else {
-            return;
-        };
-        let token = started.token;
-        record_command_outcome_metadata(
-            COMMAND_OUTCOME_STATUS_MESSAGE_KEY,
-            preview_feedback(
-                &started
-                    .panes
-                    .into_iter()
-                    .filter_map(|state| {
-                        handle()
-                            .ok()?
-                            .state(SessionId(state.session_id), Some(state.pane_id))
-                            .ok()
-                    })
-                    .collect::<Vec<_>>(),
-            )
-            .into(),
-        );
-        let owner = context
-            .caller_client_id
-            .map(ClientId)
-            .expect("preview begin requires the caller client id");
-        let mut cancel_guard =
-            PreviewCancelGuard::new(handle().expect("runtime handle"), owner, token);
-        let mut lifetime = pane_runtime_commands::PanePaddingPersistence::Runtime;
-        let mut refresh_value = false;
+    let transaction = ConfigureTransaction {
+        route,
+        guard,
+        token: started.token,
+        session_id,
+        pane_id,
+        windows_available,
+        spec: initial_spec,
+        targets: vec![pane_id],
+        scope: ConfigureScope::Pane,
+        refresh: false,
+        plugin_settings: context.settings.clone(),
+        config_path: config_path(context),
+    };
+    runtime.spawn(transaction.run(responses, events));
+    Ok(())
+}
+
+/// One configurator session after its command returned.
+struct ConfigureTransaction {
+    route: ConfigureRoute,
+    guard: PreviewCancelGuard,
+    token: Uuid,
+    session_id: SessionId,
+    pane_id: Uuid,
+    windows_available: bool,
+    spec: PanePaddingSpec,
+    targets: Vec<Uuid>,
+    scope: ConfigureScope,
+    refresh: bool,
+    plugin_settings: Option<toml::Value>,
+    config_path: PathBuf,
+}
+
+impl ConfigureTransaction {
+    async fn run(
+        mut self,
+        mut responses: tokio::sync::oneshot::Receiver<PromptResponse>,
+        mut events: tokio::sync::mpsc::UnboundedReceiver<PromptEvent>,
+    ) {
+        let mut events_open = true;
         let mut pending_numeric: Option<(String, BTreeMap<String, PromptFormValue>)> = None;
         let numeric_debounce = tokio::time::sleep(std::time::Duration::MAX);
         tokio::pin!(numeric_debounce);
         loop {
             tokio::select! {
-                response = &mut response_rx => {
-                    match response {
-                        Ok(PromptResponse::Submitted(PromptValue::Form(values))) => {
-                            let final_spec = spec_from_form(&values, spec).unwrap_or(spec);
-                            let final_scope = single_value(&values, "scope")
-                                .and_then(|value| ConfigureScope::parse(value).ok())
-                                .unwrap_or(scope);
-                            let final_targets = resolve_scope(
-                                &context,
-                                session_id,
-                                pane_id,
-                                final_scope,
-                            )
-                            .unwrap_or_else(|_| targets.clone());
-                            if final_targets != targets || final_spec != spec
-                            {
-                                let updated = bmux_plugin::block_on_typed_dispatch(
-                                    pane_runtime_commands::client::update_pane_padding_preview(
-                                        &mut client,
-                                        token,
-                                        final_targets.clone(),
-                                        preview_spec(final_spec),
-                                    ),
-                                );
-                                if !matches!(updated, Ok(Ok(_))) {
-                                    let _ = bmux_plugin::block_on_typed_dispatch(
-                                        pane_runtime_commands::client::cancel_pane_padding_preview(
-                                            &mut client, token,
-                                        ),
-                                    );
-                                    break;
-                                }
-                            }
-                            if let Some(value) = single_value(&values, "lifetime") {
-                                lifetime = if value == "snapshot" {
-                                    pane_runtime_commands::PanePaddingPersistence::Snapshot
-                                } else {
-                                    pane_runtime_commands::PanePaddingPersistence::Runtime
-                                };
-                            }
-                            let use_declarative =
-                                bool_value(&values, "use-declarative") == Some(true);
-                            if use_declarative {
-                                let cancelled = bmux_plugin::block_on_typed_dispatch(
-                                    pane_runtime_commands::client::cancel_pane_padding_preview(
-                                        &mut client, token,
-                                    ),
-                                );
-                                if matches!(cancelled, Ok(Ok(_))) {
-                                    let _ = clear_target_overrides(&final_targets);
-                                }
-                            } else if final_scope == ConfigureScope::Global {
-                                let cancelled = bmux_plugin::block_on_typed_dispatch(
-                                    pane_runtime_commands::client::cancel_pane_padding_preview(
-                                        &mut client, token,
-                                    ),
-                                );
-                                if matches!(cancelled, Ok(Ok(_))) {
-                                    let _ = install_global_padding(&context, final_spec);
-                                }
-                            } else {
-                                let _ = bmux_plugin::block_on_typed_dispatch(
-                                    pane_runtime_commands::client::commit_pane_padding_preview(
-                                        &mut client, token, lifetime,
-                                    ),
-                                );
-                            }
-                        }
-                        _ => {
-                            let _ = bmux_plugin::block_on_typed_dispatch(
-                                pane_runtime_commands::client::cancel_pane_padding_preview(
-                                    &mut client, token,
-                                ),
-                            );
-                        }
-                    }
-                    cancel_guard.disarm();
-                    break;
+                response = &mut responses => {
+                    self.finish(response.ok()).await;
+                    return;
                 }
                 () = &mut numeric_debounce, if pending_numeric.is_some() => {
                     let Some((field_id, values)) = pending_numeric.take() else {
                         continue;
                     };
-                    let Ok(parsed_spec) = spec_from_form(&values, spec) else {
+                    let Ok(parsed_spec) = spec_from_form(&values, self.spec) else {
                         continue;
                     };
                     let next_spec = apply_linked_edge(&values, &field_id, parsed_spec);
-                    let result = bmux_plugin::block_on_typed_dispatch(
-                        pane_runtime_commands::client::update_pane_padding_preview(
-                            &mut client, token, targets.clone(), preview_spec(next_spec),
-                        ),
-                    );
-                    if matches!(result, Ok(Ok(_))) {
-                        spec = next_spec;
+                    if self.update(self.targets.clone(), next_spec).await {
+                        self.spec = next_spec;
                     }
                 }
-                event = event_rx.recv() => {
-                    let Some(PromptEvent::FormChanged {
-                        field_id, values, ..
-                    }) = event
-                    else {
+                event = events.recv(), if events_open => {
+                    let Some(event) = event else {
+                        events_open = false;
+                        continue;
+                    };
+                    let PromptEvent::FormChanged { field_id, values, .. } = event else {
                         continue;
                     };
                     if is_numeric_configure_field(&field_id) {
                         pending_numeric = Some((field_id, values));
-                        numeric_debounce.as_mut().reset(numeric_preview_deadline(tokio::time::Instant::now()));
+                        numeric_debounce
+                            .as_mut()
+                            .reset(numeric_preview_deadline(tokio::time::Instant::now()));
                         continue;
                     }
                     pending_numeric = None;
-                    let Ok(parsed_spec) = spec_from_form(&values, spec) else {
-                        continue;
-                    };
-                    let next_spec = apply_linked_edge(&values, &field_id, parsed_spec);
-                    let next_scope = single_value(&values, "scope")
-                        .and_then(|value| ConfigureScope::parse(value).ok())
-                        .unwrap_or(scope);
-                    let next_refresh = bool_value(&values, "refresh-targets").unwrap_or(refresh_value);
-                    let refresh_requested = next_refresh != refresh_value;
-                    let next_targets = if next_scope == scope && !refresh_requested {
-                        targets.clone()
-                    } else {
-                        let Ok(resolved) = resolve_scope(&context, session_id, pane_id, next_scope)
-                        else {
-                            continue;
-                        };
-                        resolved
-                    };
-                    let result = bmux_plugin::block_on_typed_dispatch(
-                        pane_runtime_commands::client::update_pane_padding_preview(
-                            &mut client, token, next_targets.clone(), preview_spec(next_spec),
-                        ),
-                    );
-                    if matches!(result, Ok(Ok(_))) {
-                        scope = next_scope;
-                        refresh_value = next_refresh;
-                        spec = next_spec;
-                        targets = next_targets;
-                    }
+                    self.form_changed(&field_id, &values).await;
                 }
             }
         }
-    });
-    Ok(())
+    }
+
+    async fn form_changed(&mut self, field_id: &str, values: &BTreeMap<String, PromptFormValue>) {
+        let Ok(parsed_spec) = spec_from_form(values, self.spec) else {
+            return;
+        };
+        let next_spec = apply_linked_edge(values, field_id, parsed_spec);
+        let next_scope = single_value(values, "scope")
+            .and_then(|value| ConfigureScope::parse(value).ok())
+            .unwrap_or(self.scope);
+        let next_refresh = bool_value(values, "refresh-targets").unwrap_or(self.refresh);
+        let next_targets = if next_scope == self.scope && next_refresh == self.refresh {
+            self.targets.clone()
+        } else {
+            let Ok(resolved) = self.resolve(next_scope).await else {
+                return;
+            };
+            resolved
+        };
+        if self.update(next_targets.clone(), next_spec).await {
+            self.scope = next_scope;
+            self.refresh = next_refresh;
+            self.spec = next_spec;
+            self.targets = next_targets;
+        }
+    }
+
+    async fn resolve(&mut self, scope: ConfigureScope) -> Result<Vec<Uuid>, PluginCommandError> {
+        resolve_scope(
+            &mut self.route,
+            self.windows_available,
+            self.session_id,
+            self.pane_id,
+            scope,
+        )
+        .await
+    }
+
+    async fn update(&mut self, targets: Vec<Uuid>, spec: PanePaddingSpec) -> bool {
+        matches!(
+            pane_runtime_commands::client::update_pane_padding_preview(
+                &mut self.route,
+                self.token,
+                targets,
+                preview_spec(spec),
+            )
+            .await,
+            Ok(Ok(_))
+        )
+    }
+
+    async fn cancel(&mut self) -> bool {
+        matches!(
+            pane_runtime_commands::client::cancel_pane_padding_preview(&mut self.route, self.token)
+                .await,
+            Ok(Ok(_))
+        )
+    }
+
+    async fn finish(mut self, response: Option<PromptResponse>) {
+        let outcome = if let Some(PromptResponse::Submitted(PromptValue::Form(values))) = response {
+            self.apply(&values).await.map(|()| true)
+        } else {
+            self.cancel().await;
+            Ok(false)
+        };
+        // Every path above settled the preview explicitly.
+        self.guard.disarm();
+        match outcome {
+            // Report the applied result as its own command: this transaction's
+            // command has returned, so it has no outcome to record into.
+            Ok(true) => {
+                let show = format!(
+                    "plugin:bmux.pane_runtime:pane-padding-show --pane-id {}",
+                    self.pane_id
+                );
+                if let Err(error) = bmux_plugin::action_dispatch::dispatch(show) {
+                    tracing::warn!(%error, "applied pane padding could not be reported");
+                }
+            }
+            Ok(false) => {}
+            Err(error) => {
+                tracing::warn!(%error, "pane padding configuration was not applied");
+            }
+        }
+    }
+
+    async fn apply(
+        &mut self,
+        values: &BTreeMap<String, PromptFormValue>,
+    ) -> Result<(), PluginCommandError> {
+        let final_spec = spec_from_form(values, self.spec).unwrap_or(self.spec);
+        let final_scope = single_value(values, "scope")
+            .and_then(|value| ConfigureScope::parse(value).ok())
+            .unwrap_or(self.scope);
+        let final_targets = match self.resolve(final_scope).await {
+            Ok(targets) => targets,
+            Err(_) => self.targets.clone(),
+        };
+        if (final_targets != self.targets || final_spec != self.spec)
+            && !self.update(final_targets.clone(), final_spec).await
+        {
+            self.cancel().await;
+            return Err(PluginCommandError::failed(
+                "final pane padding preview update was rejected",
+            ));
+        }
+        let lifetime = if single_value(values, "lifetime") == Some("snapshot") {
+            pane_runtime_commands::PanePaddingPersistence::Snapshot
+        } else {
+            pane_runtime_commands::PanePaddingPersistence::Runtime
+        };
+        if bool_value(values, "use-declarative") == Some(true) {
+            if self.cancel().await {
+                pane_runtime_commands::client::clear_pane_padding_overrides(
+                    &mut self.route,
+                    final_targets,
+                )
+                .await
+                .map_err(route_error)?
+                .map_err(|error| {
+                    PluginCommandError::failed(format!("clearing overrides failed: {error:?}"))
+                })?;
+            }
+        } else if final_scope == ConfigureScope::Global {
+            if self.cancel().await {
+                install_global_padding(
+                    &mut self.route,
+                    self.plugin_settings.as_ref(),
+                    &self.config_path,
+                    final_spec,
+                )
+                .await?;
+            }
+        } else {
+            pane_runtime_commands::client::commit_pane_padding_preview(
+                &mut self.route,
+                self.token,
+                lifetime,
+            )
+            .await
+            .map_err(route_error)?
+            .map_err(|error| {
+                PluginCommandError::failed(format!("padding commit failed: {error:?}"))
+            })?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -1301,12 +1389,51 @@ mod tests {
             ..first
         };
 
-        let feedback = preview_feedback(&[first, second]);
+        let feedback = preview_feedback(&[first.into_api(), second.into_api()]);
 
         assert_eq!(
             feedback,
             "Targets: 2 panes | 1 constrained | 1 unchanged | 1 clamped | Values: mixed"
         );
+    }
+
+    fn test_route() -> (
+        ConfigureRoute,
+        tokio::sync::mpsc::Receiver<bmux_plugin::AsyncServiceRequest>,
+    ) {
+        let (sender, receiver) = tokio::sync::mpsc::channel(4);
+        (
+            bmux_plugin::AsyncServiceClient::bind(bmux_plugin::ASYNC_SERVICE_ROUTE_V1, sender)
+                .unwrap(),
+            receiver,
+        )
+    }
+
+    #[tokio::test]
+    async fn dropped_preview_guard_cancels_through_the_captured_route() {
+        let (route, mut requests) = test_route();
+        let token = Uuid::new_v4();
+
+        drop(PreviewCancelGuard::new(route, token));
+
+        let request = requests.recv().await.expect("cancel request");
+        assert_eq!(request.interface_id, "pane-runtime-commands");
+        assert_eq!(request.operation, "cancel-pane-padding-preview");
+        let args = bmux_plugin_sdk::decode_service_message::<
+            crate::handlers::padding::PreviewTokenArgs,
+        >(&request.payload)
+        .unwrap();
+        assert_eq!(args.token, token);
+    }
+
+    #[tokio::test]
+    async fn disarmed_preview_guard_sends_nothing() {
+        let (route, mut requests) = test_route();
+        let mut guard = PreviewCancelGuard::new(route, Uuid::new_v4());
+        guard.disarm();
+        drop(guard);
+        tokio::task::yield_now().await;
+        assert!(requests.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -1391,16 +1518,17 @@ mod tests {
         assert_eq!(fs::read(&path).unwrap(), b"second\n");
     }
 
-    #[test]
-    fn global_padding_install_restores_file_when_live_install_fails() {
+    #[tokio::test]
+    async fn global_padding_install_restores_file_when_live_install_fails() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("bmux.toml");
         let original = b"# original\n";
         fs::write(&path, original).unwrap();
 
-        let error = persist_and_install_global_padding(&path, original, b"# edited\n", || {
+        let error = persist_and_install_global_padding(&path, original, b"# edited\n", async {
             Err(PluginCommandError::failed("injected install failure"))
         })
+        .await
         .expect_err("install should fail");
 
         assert!(error.to_string().contains("injected install failure"));

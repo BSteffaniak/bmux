@@ -282,6 +282,23 @@ impl PanePaddingConfig {
         })
     }
 
+    /// This configuration with a new global default; rules are kept.
+    ///
+    /// # Errors
+    /// Rejects zero content limits, like configured defaults.
+    pub fn with_defaults(&self, defaults: PanePaddingSpec) -> Result<Self, String> {
+        if defaults.max_content_width == Some(0) {
+            return Err("padding.max_content_width must be positive or 'none'".to_string());
+        }
+        if defaults.max_content_height == Some(0) {
+            return Err("padding.max_content_height must be positive or 'none'".to_string());
+        }
+        Ok(Self {
+            defaults,
+            ..self.clone()
+        })
+    }
+
     pub fn resolve(
         &self,
         metadata: PanePaddingMetadata<'_>,

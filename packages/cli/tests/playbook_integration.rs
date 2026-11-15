@@ -294,6 +294,16 @@ fn finder_recency_uses_invoking_attachment_across_workspaces() {
 
 #[test]
 #[serial]
+fn playbook_real_attach_pane_padding_configure_previews_cancels_and_commits() {
+    let (json, pass) = run_playbook_fixture("pane_padding_configure_real_attach.dsl");
+    assert!(
+        pass,
+        "pane padding configurator should apply after its command returns: {json:#}"
+    );
+}
+
+#[test]
+#[serial]
 fn playbook_real_attach_prompted_tab_rename_applies() {
     let (json, pass) = run_playbook_fixture("tab_rename_prompt_real_attach.dsl");
     assert!(pass, "prompted tab rename should apply: {json:#}");

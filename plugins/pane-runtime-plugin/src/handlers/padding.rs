@@ -211,3 +211,51 @@ pub fn clear(req: &PanePaddingArgs) -> Result<PanePaddingState, PaneCommandError
         .map(crate::padding_api::RuntimePanePaddingState::into_api)
         .map_err(|_| map_command_error(&handle, session_id))
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PaddingTargetPanesArgs {
+    #[serde(default)]
+    pub session_id: Option<Uuid>,
+}
+
+pub fn target_panes(req: &PaddingTargetPanesArgs) -> Result<Vec<Uuid>, PanePaddingStateError> {
+    let handle = handle().ok_or(PanePaddingStateError::SessionNotFound)?;
+    match req.session_id {
+        Some(session_id) => handle
+            .pane_ids(SessionId(session_id))
+            .map_err(|_| PanePaddingStateError::SessionNotFound),
+        None => handle
+            .all_pane_ids()
+            .map_err(|_| PanePaddingStateError::SessionNotFound),
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClearPanePaddingOverridesArgs {
+    pub pane_ids: Vec<Uuid>,
+}
+
+pub fn clear_overrides(req: &ClearPanePaddingOverridesArgs) -> Result<Vec<Uuid>, PaneCommandError> {
+    let handle = handle().ok_or(PaneCommandError::SessionNotFound)?;
+    handle
+        .clear_overrides(&req.pane_ids)
+        .map(|_| req.pane_ids.clone())
+        .map_err(|error| PaneCommandError::Failed {
+            reason: error.to_string(),
+        })
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SetGlobalPanePaddingArgs {
+    pub padding: PanePaddingSpec,
+}
+
+pub fn set_global(req: &SetGlobalPanePaddingArgs) -> Result<(), PaneCommandError> {
+    let spec = spec_from_api(&req.padding).map_err(|reason| PaneCommandError::Failed { reason })?;
+    let handle = handle().ok_or(PaneCommandError::SessionNotFound)?;
+    handle
+        .replace_padding_defaults(spec)
+        .map_err(|error| PaneCommandError::Failed {
+            reason: format!("failed installing live pane padding: {error}"),
+        })
+}
