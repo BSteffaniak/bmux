@@ -6303,6 +6303,7 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
                 render_geometry,
                 None,
             )?;
+            view_state.transient_status_presented(Instant::now());
             terminal.present_pointer_shape(view_state.pointer_shape)?;
             flush_visual_projection_updates(&mut client, &mut view_state).await;
 
@@ -6598,6 +6599,7 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
             render_geometry,
             None,
         )?;
+        view_state.transient_status_presented(Instant::now());
         terminal.present_pointer_shape(view_state.pointer_shape)?;
         flush_visual_projection_updates(&mut client, &mut view_state).await;
 

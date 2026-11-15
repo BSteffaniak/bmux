@@ -305,6 +305,9 @@ pub struct AttachViewState {
     pub prompt: AttachPromptState,
     pub transient_status: Option<String>,
     pub transient_status_until: Option<Instant>,
+    /// Display time owed to the current status. Its expiry starts when a
+    /// frame first presents it, so a slow frame cannot consume it unseen.
+    pub transient_status_ttl: Option<Duration>,
     pub control_catalog_revision: u64,
     /// Latest ordered window list received from the tabs-plugin
     /// `tabs-list` state channel. `None` until the first snapshot
@@ -699,6 +702,7 @@ impl AttachViewState {
             prompt: AttachPromptState::default(),
             transient_status: None,
             transient_status_until: None,
+            transient_status_ttl: None,
             control_catalog_revision: 0,
             cached_tab_list: None,
             cached_contexts: Vec::new(),
@@ -786,11 +790,22 @@ impl AttachViewState {
     pub fn set_transient_status(
         &mut self,
         message: impl Into<String>,
-        now: Instant,
+        _now: Instant,
         ttl: Duration,
     ) {
         self.transient_status = Some(message.into());
-        self.transient_status_until = Some(now + ttl);
+        self.transient_status_until = None;
+        self.transient_status_ttl = Some(ttl);
+    }
+
+    /// A frame presented the current status: start its display time.
+    pub fn transient_status_presented(&mut self, now: Instant) {
+        if self.transient_status.is_some()
+            && self.transient_status_until.is_none()
+            && let Some(ttl) = self.transient_status_ttl
+        {
+            self.transient_status_until = Some(now + ttl);
+        }
     }
 
     pub fn clear_expired_transient_status(&mut self, now: Instant) -> bool {
@@ -802,6 +817,7 @@ impl AttachViewState {
         }
         self.transient_status = None;
         self.transient_status_until = None;
+        self.transient_status_ttl = None;
         true
     }
 
@@ -1011,6 +1027,31 @@ impl AttachViewState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transient_status_display_time_starts_when_presented() {
+        let mut state = AttachViewState::new(bmux_client::AttachOpenInfo {
+            session_id: Uuid::new_v4(),
+            context_id: None,
+            can_write: true,
+        });
+        let set_at = Instant::now();
+        let ttl = Duration::from_millis(100);
+        state.set_transient_status("applied", set_at, ttl);
+        // A frame that arrives long after the status was set still shows it.
+        let late = set_at + Duration::from_secs(10);
+        assert!(!state.clear_expired_transient_status(late));
+        state.transient_status_presented(late);
+        // Later frames keep the first presentation time.
+        state.transient_status_presented(late + ttl);
+        assert!(!state.clear_expired_transient_status(late + ttl / 2));
+        assert_eq!(state.transient_status.as_deref(), Some("applied"));
+        assert!(state.clear_expired_transient_status(late + ttl));
+        assert!(state.transient_status.is_none());
+        // A replacement owes its own full display time.
+        state.set_transient_status("next", late, ttl);
+        assert!(!state.clear_expired_transient_status(late + ttl * 3));
+    }
 
     #[test]
     fn decoded_replicas_are_pane_scoped_and_bounded() {
