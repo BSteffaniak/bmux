@@ -777,6 +777,11 @@ impl PluginCallbackExecution for SelectedExecutor {
     ) -> PluginCallbackSettlement {
         let binding = self.binding.clone();
         let selected = self.authority.clone();
+        // The callback body runs on a dedicated worker thread. Carry the
+        // issuing command's async service route (a thread-local on the
+        // scheduling thread) across that hop so work the body leaves running
+        // can still reach host services after the command returns.
+        let async_route = crate::capture_async_command_route(crate::ASYNC_SERVICE_ROUTE_V1).ok();
         Box::pin(async move {
             entry.validate_for(&selected, instance)?;
             entry.validate_for(&authority, instance)?;
@@ -832,6 +837,7 @@ impl PluginCallbackExecution for SelectedExecutor {
                 .name("plugin-callback".into())
                 .spawn(move || {
                     let _permit = permit;
+                    let _async_route = async_route.map(crate::enter_async_command_route);
                     let result = entry
                         .validate_for(&selected, instance)
                         .and_then(|()| entry.validate_for(&authority, instance))

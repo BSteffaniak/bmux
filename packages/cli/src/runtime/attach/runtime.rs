@@ -8083,8 +8083,12 @@ pub async fn handle_attach_plugin_command_action(
             // the attachment's selected command runtime moves to it explicitly.
             let command_state = view_state.command_state.clone();
             let owned_frontends = view_state.owned_frontends.clone();
+            // Work a command leaves running after it returns needs a route the
+            // attach loop serves independently of this command's lifetime.
+            let async_services = view_state.async_services.clone();
             let command = tokio::task::spawn_blocking(move || {
                 let _transport = super::super::plugin_kernel::enter_invoking_transport(sender);
+                let _async_route = async_services.map(bmux_plugin::enter_async_command_route);
                 let command_state = command_state.ok_or_else(|| ClientError::ServerError {
                     code: bmux_ipc::ErrorCode::Internal,
                     message: "attach has no selected command runtime for plugin commands"
