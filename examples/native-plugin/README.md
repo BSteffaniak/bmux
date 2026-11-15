@@ -34,8 +34,7 @@ Add `--install-root <directory> --declaration
 examples/native-plugin/plugin.toml`
 for immutable publication. See [hello-plugin](../hello-plugin/README.md) for
 artifact identity and loader integration constraints. The implementation build
-above produces only an rlib, not a loadable plugin. The former direct-dylib
-installation helper is not a supported path for this migrated example.
+above produces only an rlib, not a loadable plugin.
 For a quick local run, point the declaration's `entry` at the library the
 generator built. `packages/cli/tests/native_plugin_identity_integration.rs`
 does exactly that against a sandboxed server.

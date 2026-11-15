@@ -149,9 +149,6 @@ pub enum PluginError {
     #[error("plugin '{plugin_id}' process entry is not executable: {path:?}")]
     ProcessEntryNotExecutable { plugin_id: String, path: PathBuf },
 
-    #[error("plugin '{plugin_id}' is registered as bundled-static but has no compiled vtable")]
-    MissingStaticVtable { plugin_id: String },
-
     #[error("plugin '{plugin_id}' uses unsupported runtime '{runtime}'")]
     UnsupportedPluginRuntime { plugin_id: String, runtime: String },
 
@@ -202,13 +199,6 @@ pub enum PluginError {
         second_provider: String,
     },
 
-    #[error("failed to load native plugin '{plugin_id}' from {path:?}: {details}")]
-    NativeLibraryLoad {
-        plugin_id: String,
-        path: PathBuf,
-        details: String,
-    },
-
     #[error("failed to spawn process plugin '{plugin_id}' command '{command}': {details}")]
     ProcessPluginSpawn {
         plugin_id: String,
@@ -227,78 +217,11 @@ pub enum PluginError {
         details: String,
     },
 
-    #[error("failed to resolve entry symbol '{symbol}' for plugin '{plugin_id}': {details}")]
-    NativeEntrySymbol {
-        plugin_id: String,
-        symbol: String,
-        details: String,
-    },
-
-    #[error("plugin '{plugin_id}' returned a null entry from symbol '{symbol}'")]
-    NullPluginEntry { plugin_id: String, symbol: String },
-
-    #[error("plugin '{plugin_id}' returned invalid UTF-8 entry text from '{symbol}'")]
-    InvalidPluginEntryUtf8 { plugin_id: String, symbol: String },
-
-    #[error("plugin '{plugin_id}' returned invalid entry from '{symbol}': {details}")]
-    InvalidPluginEntry {
-        plugin_id: String,
-        symbol: String,
-        details: String,
-    },
-
-    #[error(
-        "plugin '{plugin_id}' embedded manifest field '{field}' does not match registered manifest (registered: {manifest_value}, embedded: {embedded_value})"
-    )]
-    ManifestMismatch {
-        plugin_id: String,
-        field: &'static str,
-        manifest_value: String,
-        embedded_value: String,
-    },
-
     #[error("plugin '{plugin_id}' does not declare command '{command}'")]
     UnknownPluginCommand { plugin_id: String, command: String },
 
-    #[error("failed to resolve command symbol '{symbol}' for plugin '{plugin_id}': {details}")]
-    NativeCommandSymbol {
-        plugin_id: String,
-        symbol: String,
-        details: String,
-    },
-
-    #[error("plugin '{plugin_id}' command input contains interior NUL in {field}")]
-    InvalidNativeCommandInput {
-        plugin_id: String,
-        field: &'static str,
-    },
-
-    #[error("failed to resolve lifecycle symbol '{symbol}' for plugin '{plugin_id}': {details}")]
-    NativeLifecycleSymbol {
-        plugin_id: String,
-        symbol: String,
-        details: String,
-    },
-
     #[error("plugin '{plugin_id}' lifecycle payload contains interior NUL")]
     InvalidNativeLifecycleInput { plugin_id: String },
-
-    #[error("failed to resolve event symbol '{symbol}' for plugin '{plugin_id}': {details}")]
-    NativeEventSymbol {
-        plugin_id: String,
-        symbol: String,
-        details: String,
-    },
-
-    #[error("plugin '{plugin_id}' event payload contains interior NUL")]
-    InvalidNativeEventInput { plugin_id: String },
-
-    #[error("failed to resolve service symbol '{symbol}' for plugin '{plugin_id}': {details}")]
-    NativeServiceSymbol {
-        plugin_id: String,
-        symbol: String,
-        details: String,
-    },
 
     #[error("plugin '{plugin_id}' service invocation failed with status {status}")]
     NativeServiceInvocation { plugin_id: String, status: i32 },

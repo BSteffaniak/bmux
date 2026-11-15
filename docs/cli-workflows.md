@@ -294,11 +294,14 @@ are documented in [Window presentation plugins](tab-presentations.md).
   cargo run -p bmux_prompt_plugin_showcase
   ```
 
-- Native plugin example:
+- Native plugin example (the crate is an rlib; the shared packager generates
+  the loadable artifact, see [examples/native-plugin](../examples/native-plugin/README.md)):
 
   ```bash
-  cargo build -p bmux_example_native_plugin
-  ./scripts/install-example-plugin.sh
+  python3 scripts/package-plugin.py \
+    --implementation-manifest examples/native-plugin/Cargo.toml \
+    --sdk-manifest packages/plugin-sdk/Cargo.toml \
+    --output target/plugin-packaging/native/backend --component backend --build
   ```
 
 - Minimal hello plugin example:
