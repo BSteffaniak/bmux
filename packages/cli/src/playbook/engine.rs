@@ -450,7 +450,8 @@ impl VisualTerminal for VisualTerminalGuard {
     }
 }
 // The attach loop publishes its committed target at the start of each turn,
-// after handling the preceding event. A playbook-owned terminal pairs that
+// after handling the preceding event, and again before presenting each frame
+// so rendered output never precedes its target. A playbook-owned terminal pairs that
 // boundary with the exact event it delivered, including actions that keep the
 // same target. Session changes alone cannot acknowledge an input action.
 struct AcknowledgedAttachEvent {

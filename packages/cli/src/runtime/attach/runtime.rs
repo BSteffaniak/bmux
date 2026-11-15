@@ -54,6 +54,13 @@ use bmux_plugin_sdk::{
 use bmux_recording_plugin_api::recording_state;
 use bmux_recording_protocol::{DisplayActivityKind, RecordingCaptureTarget};
 use bmux_session_models::SessionSelector;
+use bmux_terminal::cursor::{Hide, MoveTo, SavePosition, Show};
+use bmux_terminal::event::{
+    DisableBracketedPaste, DisableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
+#[cfg(test)]
+use bmux_terminal::event::{EnableBracketedPaste, EnableMouseCapture};
 use bmux_tui::component::{Component, Constraints, LayoutCx};
 use bmux_tui::composition::TextBlock;
 use bmux_tui::frame::Frame as TuiFrame;
@@ -63,13 +70,6 @@ use bmux_tui::prelude::Line as TuiLine;
 use bmux_tui_components::key_hint_bar::{KeyHint, KeyHintBarComponent, KeyHintBarStyles};
 use bmux_tui_components::modal_frame::{ModalFrame, ModalFrameComponent, ModalSizing};
 use bmux_tui_components::theme::ComponentTheme;
-use bmux_terminal::cursor::{Hide, MoveTo, SavePosition, Show};
-use bmux_terminal::event::{
-    DisableBracketedPaste, DisableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
-};
-#[cfg(test)]
-use bmux_terminal::event::{EnableBracketedPaste, EnableMouseCapture};
 macro_rules! queue {
     ($($args:tt)*) => {
         if bmux_attach_pipeline::projection::encoding_terminal() {
@@ -1067,8 +1067,7 @@ async fn native_attach_input(
     }
     match event {
         NativeAttachEvent::Input(InputEvent::Key(key)) => {
-            if let Some(key) =
-                TerminalKeyEvent::from_native(&key).and_then(|key| key.to_terminal())
+            if let Some(key) = TerminalKeyEvent::from_native(&key).and_then(|key| key.to_terminal())
             {
                 // The existing reducer handles bindings, plugin capture, prompt
                 // editing, and mode-aware encoding exactly once.
@@ -4523,13 +4522,13 @@ async fn handle_native_provider_terminal_event(
             for action in actions {
                 match action {
                     AttachEventAction::Send(bytes) => {
-                        let payload = bmux_terminal::keyboard::key_event_to_stroke(&key)
-                            .map_or(AttachInputPayload::Bytes(bytes), |stroke| {
-                                AttachInputPayload::Key {
-                                    stroke,
-                                    enhanced: keyboard_enhanced,
-                                }
-                            });
+                        let payload = bmux_terminal::keyboard::key_event_to_stroke(&key).map_or(
+                            AttachInputPayload::Bytes(bytes),
+                            |stroke| AttachInputPayload::Key {
+                                stroke,
+                                enhanced: keyboard_enhanced,
+                            },
+                        );
                         send_native_provider_input(
                             session,
                             continuity,
@@ -6286,6 +6285,9 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
             perf_window.record_dirty_reasons(dirty_reasons);
             let dirty_events = view_state.dirty.dirty_events().to_vec();
             let help_scroll = view_state.help_overlay_scroll;
+            // Publish the committed target before presenting a frame that
+            // shows it; observers must never see the frame first.
+            terminal.set_attached_session_id(view_state.attached_id);
             let render_started_at = SystemAttachClock.now();
             let render_geometry = terminal.geometry();
             let frame_stats = render_attach_frame_to_output(
@@ -6578,6 +6580,9 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
         perf_window.record_dirty_reasons(dirty_reasons);
         let dirty_events = view_state.dirty.dirty_events().to_vec();
         let help_scroll = view_state.help_overlay_scroll;
+        // Publish the committed target before presenting a frame that shows
+        // it; observers must never see the frame first.
+        terminal.set_attached_session_id(view_state.attached_id);
         let render_started_at = SystemAttachClock.now();
         let render_geometry = terminal.geometry();
         let frame_stats = render_attach_frame_to_output(
@@ -19573,8 +19578,7 @@ mod tests {
 
     use bmux_terminal::event::{
         Event as TermEvent, KeyCode as TermKeyCode, KeyEvent as TermKeyEvent,
-        KeyEventKind as TermKeyEventKind, KeyModifiers, MouseButton, MouseEvent,
-        MouseEventKind,
+        KeyEventKind as TermKeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     };
     use serial_test::serial;
     use std::collections::{BTreeMap, BTreeSet};

@@ -12,6 +12,8 @@ use bmux_plugin_sdk::{
 };
 use bmux_tabs_plugin_api::tabs_list::TabListEntry;
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::warn;
 use uuid::Uuid;
 
@@ -20,15 +22,33 @@ const DEFAULT_ENTRY_FORMAT: &str = "{workspace}/{tab}";
 #[derive(Default)]
 pub struct FinderPlugin {
     binding: activation_ports::Binding,
-    task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    tasks: FinderTasks,
+}
+
+/// A finder is open from prompt submission until its response is delivered,
+/// not until its response task exits: the task's follow-up switch dispatch
+/// must never keep a later invocation (made after that switch) closed.
+#[derive(Default)]
+struct FinderTasks {
+    open: Arc<AtomicBool>,
+    running: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+}
+
+/// Releases the open finder when its response is delivered or its task drops.
+struct OpenFinder(Arc<AtomicBool>);
+
+impl Drop for OpenFinder {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 impl Drop for FinderPlugin {
     fn drop(&mut self) {
-        if let Ok(task) = self.task.get_mut()
-            && let Some(task) = task.take()
-        {
-            task.abort();
+        if let Ok(running) = self.tasks.running.get_mut() {
+            for task in running.drain(..) {
+                task.abort();
+            }
         }
     }
 }
@@ -43,13 +63,13 @@ impl FinderPlugin {
     ) -> Self {
         Self {
             binding: activation_ports::Binding::fixed(prompt, actions),
-            task: std::sync::Mutex::default(),
+            tasks: FinderTasks::default(),
         }
     }
 
     fn show(&self, context: &NativeCommandContext) -> Result<i32, PluginCommandError> {
         let (prompt, actions) = self.binding.ports()?;
-        show_finder(context, &self.task, &prompt, actions)
+        show_finder(context, &self.tasks, &prompt, actions)
     }
 }
 
@@ -89,7 +109,7 @@ fn load_windows(context: &NativeCommandContext) -> Result<Vec<TabListEntry>, Plu
 
 fn show_finder(
     context: &NativeCommandContext,
-    task: &std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    tasks: &FinderTasks,
     prompt: &prompt::PromptPort,
     actions: action_dispatch::ActionDispatchPort,
 ) -> Result<i32, PluginCommandError> {
@@ -138,17 +158,21 @@ fn show_finder(
         })
         .search_wrap_selection(settings.wrap_selection)
         .search_placeholder("Search workspace or tab");
-    let mut task = task
+    let mut running = tasks
+        .running
         .lock()
         .map_err(|_| PluginCommandError::unavailable("finder task owner requires recovery"))?;
-    if task.as_ref().is_some_and(|task| !task.is_finished()) {
+    running.retain(|task| !task.is_finished());
+    if tasks.open.swap(true, Ordering::AcqRel) {
         return Err(PluginCommandError::unavailable("finder is already open"));
     }
+    // Dropped on a failed submission, so the finder never stays open unused.
+    let open = OpenFinder(tasks.open.clone());
     let response = prompt.submit(request).map_err(|error| {
         PluginCommandError::unavailable(format!("finder prompt unavailable: {error}"))
     })?;
-    *task = Some(handle.spawn(handle_response(entries, response, actions)));
-    drop(task);
+    running.push(handle.spawn(handle_response(entries, response, actions, open)));
+    drop(running);
     Ok(EXIT_OK)
 }
 
@@ -441,8 +465,13 @@ async fn handle_response(
     entries: Vec<FinderEntry>,
     response: tokio::sync::oneshot::Receiver<PromptResponse>,
     actions: action_dispatch::ActionDispatchPort,
+    open: OpenFinder,
 ) {
-    let selected = match response.await {
+    let response = response.await;
+    // The prompt closed when it delivered this response. Release before the
+    // switch dispatch so an invocation after the switch cannot be rejected.
+    drop(open);
+    let selected = match response {
         Ok(PromptResponse::Submitted(PromptValue::Single(value))) => value,
         Ok(
             PromptResponse::Cancelled | PromptResponse::RejectedBusy | PromptResponse::Submitted(_),
@@ -504,14 +533,10 @@ impl bmux_plugin_sdk::definition::PluginInstance for FinderPlugin {
     {
         Box::pin(async move {
             self.binding.close(&context)?;
-            let task = self
-                .task
-                .lock()
-                .map_err(|_| {
-                    PluginCommandError::unavailable("finder task owner requires recovery")
-                })?
-                .take();
-            if let Some(task) = task {
+            let running = std::mem::take(&mut *self.tasks.running.lock().map_err(|_| {
+                PluginCommandError::unavailable("finder task owner requires recovery")
+            })?);
+            for task in running {
                 task.abort();
                 let _ = task.await;
             }
@@ -543,7 +568,7 @@ pub fn plugin_definition_with_activation_ports(
     bmux_plugin_sdk::definition::PluginDefinition::new(metadata, move |scope| {
         Ok(std::sync::Arc::new(FinderPlugin {
             binding: activation_ports::Binding::deferred(scope, bind.clone()),
-            task: std::sync::Mutex::default(),
+            tasks: FinderTasks::default(),
         })
             as std::sync::Arc<
                 dyn bmux_plugin_sdk::definition::PluginInstance,
@@ -575,7 +600,7 @@ pub fn plugin_definition_with_ports(
 bmux_plugin_sdk::define_plugin!(
     factory = |scope| Ok(std::sync::Arc::new(FinderPlugin {
         binding: activation_ports::Binding::from_activation(scope),
-        task: std::sync::Mutex::default(),
+        tasks: FinderTasks::default(),
     })
         as std::sync::Arc<dyn bmux_plugin_sdk::definition::PluginInstance>),
     metadata = {
@@ -628,6 +653,7 @@ mod tests {
             }],
             selection,
             actions.clone(),
+            OpenFinder(Arc::new(AtomicBool::new(true))),
         )
         .await;
         assert_eq!(
@@ -639,6 +665,67 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn finder_closes_before_dispatching_its_switch() {
+        let instance = bmux_plugin_runtime::InstanceScope::new(
+            bmux_plugin_runtime::PluginRuntimeScopeId::default(),
+        );
+        let owner = instance
+            .begin_activation(bmux_plugin_runtime::PluginConcurrencyConfig::Concurrent)
+            .unwrap();
+        owner.mark_active().unwrap();
+        let (actions, mut received) =
+            action_dispatch::ActionDispatchPort::channel(owner, 1).unwrap();
+        let id = Uuid::from_u128(7);
+        let (response, selection) = tokio::sync::oneshot::channel();
+        let open = Arc::new(AtomicBool::new(true));
+        let task = tokio::spawn(handle_response(
+            vec![FinderEntry {
+                context_id: id,
+                label: "other/tab".into(),
+                detail: String::new(),
+                search_text: String::new(),
+            }],
+            selection,
+            actions,
+            OpenFinder(open.clone()),
+        ));
+        assert!(open.load(Ordering::Acquire));
+        response
+            .send(PromptResponse::Submitted(PromptValue::Single(
+                id.to_string(),
+            )))
+            .unwrap();
+        // Observing the switch implies the finder already accepts a reopen,
+        // whether or not its response task has exited.
+        received.recv().await.unwrap();
+        assert!(!open.load(Ordering::Acquire));
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn aborted_response_task_releases_the_finder() {
+        let (_response, selection) = tokio::sync::oneshot::channel::<PromptResponse>();
+        let instance = bmux_plugin_runtime::InstanceScope::new(
+            bmux_plugin_runtime::PluginRuntimeScopeId::default(),
+        );
+        let owner = instance
+            .begin_activation(bmux_plugin_runtime::PluginConcurrencyConfig::Concurrent)
+            .unwrap();
+        owner.mark_active().unwrap();
+        let (actions, _received) = action_dispatch::ActionDispatchPort::channel(owner, 1).unwrap();
+        let open = Arc::new(AtomicBool::new(true));
+        let task = tokio::spawn(handle_response(
+            Vec::new(),
+            selection,
+            actions,
+            OpenFinder(open.clone()),
+        ));
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(!open.load(Ordering::Acquire));
     }
 
     fn window(
