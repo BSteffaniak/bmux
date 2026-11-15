@@ -375,7 +375,18 @@ impl bmux_plugin_sdk::definition::PluginInstance for BroadcastPlugin {
         })
     }
 }
-pub fn plugin_definition(
+// The one definition both bundling and generated dynamic packaging use:
+// fresh default author state per created instance.
+bmux_plugin_sdk::define_plugin!(
+    rust_plugin = BroadcastPlugin,
+    manifest = include_str!("../plugin.toml"),
+    roles = vec![
+        bmux_plugin_sdk::definition::ComponentRole::Backend,
+        bmux_plugin_sdk::definition::ComponentRole::Frontend
+    ],
+);
+
+pub fn plugin_definition_with_indicator(
     indicator: Arc<dyn IndicatorPort>,
 ) -> bmux_plugin_sdk::definition::PluginDefinition {
     use bmux_plugin_sdk::definition::{PluginDefinition, PluginInstance};
@@ -386,8 +397,6 @@ pub fn plugin_definition(
         )
     })
 }
-
-bmux_plugin_sdk::export_plugin!(BroadcastPlugin, include_str!("../plugin.toml"));
 
 fn definition_metadata() -> bmux_plugin_sdk::definition::PluginMetadata {
     bmux_plugin_sdk::definition::PluginDefinition::from_rust_plugin::<BroadcastPlugin>(

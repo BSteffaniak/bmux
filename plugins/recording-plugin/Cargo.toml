@@ -10,9 +10,6 @@ readme      = "README.md"
 repository  = { workspace = true }
 version     = { workspace = true }
 
-[lib]
-crate-type = ["cdylib", "rlib"]
-
 [dependencies]
 ab_glyph                     = { workspace = true }
 anyhow                       = { workspace = true, features = ["std"] }
@@ -23,13 +20,13 @@ bmux_config                  = { workspace = true }
 bmux_fonts                   = { workspace = true }
 bmux_ipc                     = { workspace = true }
 bmux_keyboard                = { workspace = true }
-bmux_terminal                = { workspace = true }
 bmux_pane_runtime_plugin_api = { workspace = true }
 bmux_plugin                  = { workspace = true }
 bmux_plugin_sdk              = { workspace = true }
 bmux_recording_plugin_api    = { workspace = true }
 bmux_recording_protocol      = { workspace = true }
 bmux_recording_runtime       = { workspace = true }
+bmux_terminal                = { workspace = true }
 bmux_terminal_grid           = { workspace = true }
 font8x8                      = { workspace = true }
 fontdb                       = { workspace = true }
@@ -65,7 +62,6 @@ fail-on-warnings = [
     "bmux_recording_runtime/fail-on-warnings",
     "bmux_terminal_grid/fail-on-warnings",
 ]
-static-bundled = []
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = [

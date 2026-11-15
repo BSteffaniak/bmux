@@ -266,8 +266,6 @@ bmux_plugin_sdk::define_plugin!(
     metadata = definition_metadata(),
 );
 
-bmux_plugin_sdk::export_plugin!(PlaybookPlugin, include_str!("../plugin.toml"));
-
 #[cfg(test)]
 mod lifecycle_tests {
     use super::*;

@@ -1,7 +1,6 @@
 #![cfg_attr(feature = "fail-on-warnings", deny(warnings))]
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
-#![cfg_attr(feature = "static-bundled", allow(dead_code))]
 
 use bmux_cli::attach::{
     self as attach_prompt, PromptOption, PromptRequest, PromptResponse, PromptSubmitError,

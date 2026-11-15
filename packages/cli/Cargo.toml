@@ -79,92 +79,41 @@ bmux_web_renderer = { workspace = true }
 sshenv_vault = { workspace = true }
 
 # Bundled plugins (optional, statically linked as rlib when enabled)
-bmux_application_resurrection_plugin = { workspace = true, optional = true, features = [
-    "static-bundled",
-] }
-bmux_broadcast_plugin = { workspace = true, optional = true, features = [
-    "static-bundled",
-] }
+bmux_application_resurrection_plugin = { workspace = true, optional = true }
+bmux_broadcast_plugin = { workspace = true, optional = true }
 bmux_broadcast_plugin_api = { workspace = true }
-bmux_clients_plugin = { workspace = true, optional = true, features = [
-    "static-bundled",
-] }
+bmux_clients_plugin = { workspace = true, optional = true }
 bmux_clipboard = { workspace = true }
-bmux_clipboard_plugin = { workspace = true, optional = true, features = [
-    "static-bundled",
-] }
-bmux_cluster_plugin = { workspace = true, optional = true, features = [
-    "static-bundled",
-] }
+bmux_clipboard_plugin = { workspace = true, optional = true }
+bmux_cluster_plugin = { workspace = true, optional = true }
 bmux_cluster_plugin_client = { workspace = true, optional = true }
-bmux_command_palette_plugin = { workspace = true, optional = true, features = [
-    "static-bundled",
-] }
-bmux_connections_plugin = { workspace = true, optional = true, features = [
-    "static-bundled",
-] }
-bmux_contexts_plugin = { workspace = true, optional = true, features = [
-    "static-bundled",
-] }
-bmux_control_catalog_plugin = { workspace = true, optional = true, features = [
-    "static-bundled",
-] }
+bmux_command_palette_plugin = { workspace = true, optional = true }
+bmux_connections_plugin = { workspace = true, optional = true }
+bmux_contexts_plugin = { workspace = true, optional = true }
+bmux_control_catalog_plugin = { workspace = true, optional = true }
 bmux_decoration_plugin = { workspace = true, optional = true, features = [
     "bundled-decoration-scripts",
     "scripting-luau",
-    "static-bundled",
 ] }
 bmux_decoration_plugin_api = { workspace = true }
 bmux_decoration_plugin_renderer = { workspace = true, optional = true }
-bmux_finder_plugin = { workspace = true, optional = true, features = [
-    "static-bundled",
-] }
-bmux_pane_runtime_plugin = { workspace = true, optional = true, features = [
-    "static-bundled",
-] }
-bmux_performance_plugin = { workspace = true, optional = true, features = [
-    "static-bundled",
-] }
-bmux_permissions_plugin = { workspace = true, optional = true, features = [
-    "static-bundled",
-] }
-bmux_playbook_plugin = { workspace = true, optional = true, features = [
-    "static-bundled",
-] }
-bmux_plugin_cli_plugin = { workspace = true, optional = true, features = [
-    "static-bundled",
-] }
-bmux_presenter_plugin = { workspace = true, optional = true, features = [
-    "static-bundled",
-] }
-bmux_prompted_actions_plugin = { workspace = true, optional = true, features = [
-    "static-bundled",
-] }
-bmux_recording_plugin = { workspace = true, optional = true, features = [
-    "static-bundled",
-] }
-bmux_sessions_plugin = { workspace = true, optional = true, features = [
-    "static-bundled",
-] }
-bmux_sidebar_plugin = { workspace = true, optional = true, features = [
-    "static-bundled",
-] }
-bmux_snapshot_plugin = { workspace = true, optional = true, features = [
-    "static-bundled",
-] }
-bmux_tab_bar_plugin = { workspace = true, optional = true, features = [
-    "static-bundled",
-] }
-bmux_tabs_plugin = { workspace = true, optional = true, features = [
-    "static-bundled",
-] }
-bmux_theme_plugin = { workspace = true, optional = true, features = [
-    "static-bundled",
-] }
+bmux_finder_plugin = { workspace = true, optional = true }
+bmux_pane_runtime_plugin = { workspace = true, optional = true }
+bmux_performance_plugin = { workspace = true, optional = true }
+bmux_permissions_plugin = { workspace = true, optional = true }
+bmux_playbook_plugin = { workspace = true, optional = true }
+bmux_plugin_cli_plugin = { workspace = true, optional = true }
+bmux_presenter_plugin = { workspace = true, optional = true }
+bmux_prompted_actions_plugin = { workspace = true, optional = true }
+bmux_recording_plugin = { workspace = true, optional = true }
+bmux_sessions_plugin = { workspace = true, optional = true }
+bmux_sidebar_plugin = { workspace = true, optional = true }
+bmux_snapshot_plugin = { workspace = true, optional = true }
+bmux_tab_bar_plugin = { workspace = true, optional = true }
+bmux_tabs_plugin = { workspace = true, optional = true }
+bmux_theme_plugin = { workspace = true, optional = true }
 bmux_visual_adapters_plugin_renderer = { workspace = true, optional = true }
-bmux_workspaces_plugin = { workspace = true, optional = true, features = [
-    "static-bundled",
-] }
+bmux_workspaces_plugin = { workspace = true, optional = true }
 
 # Image protocol support (optional, feature-gated per protocol)
 anyhow = { workspace = true, features = ["std"] }

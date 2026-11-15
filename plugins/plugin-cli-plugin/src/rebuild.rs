@@ -206,6 +206,10 @@ fn execute_rebuild_build(
         .ok_or("cargo metadata omitted packages")?;
     let script = Path::new(workspace).join("scripts/package-plugin.py");
     let sdk = Path::new(workspace).join("packages/plugin-sdk/Cargo.toml");
+    let packaging_root = Path::new(target_directory).join("plugin-packaging");
+    // Generated wrappers spell every path dependency the same way, so they
+    // share one dedicated target directory (never the workspace's own).
+    let wrapper_target = packaging_root.join("target");
     for crate_name in targets {
         let package = packages
             .iter()
@@ -214,35 +218,58 @@ fn execute_rebuild_build(
         let manifest = package["manifest_path"]
             .as_str()
             .ok_or_else(|| format!("package has no manifest path: {crate_name}"))?;
-        let output = Path::new(target_directory)
-            .join("plugin-packaging")
-            .join(crate_name)
-            .join("backend");
-        let mut command = ProcessCommand::new("python3");
-        command
-            .arg(&script)
-            .arg("--implementation-manifest")
-            .arg(manifest)
-            .arg("--sdk-manifest")
-            .arg(&sdk)
-            .arg("--output")
-            .arg(output)
-            .arg("--component")
-            .arg("backend")
-            .arg("--build");
-        if matches!(profile, BuildProfile::Release) {
-            command.arg("--release");
-        }
-        let status = command.status().map_err(|error| {
-            format!("failed running shared plugin packager for {crate_name}: {error}")
-        })?;
-        if !status.success() {
-            return Err(format!(
-                "shared plugin packaging failed for {crate_name}; implementations must expose export-free plugin_definition()"
-            ));
+        for role in declared_component_roles(Path::new(manifest), crate_name)? {
+            let output = packaging_root.join(crate_name).join(role);
+            let mut command = ProcessCommand::new("python3");
+            command
+                .arg(&script)
+                .arg("--implementation-manifest")
+                .arg(manifest)
+                .arg("--sdk-manifest")
+                .arg(&sdk)
+                .arg("--output")
+                .arg(output)
+                .arg("--component")
+                .arg(role)
+                .arg("--build")
+                .arg("--cargo-target-dir")
+                .arg(&wrapper_target);
+            if matches!(profile, BuildProfile::Release) {
+                command.arg("--release");
+            }
+            let status = command.status().map_err(|error| {
+                format!("failed running shared plugin packager for {crate_name} ({role}): {error}")
+            })?;
+            if !status.success() {
+                return Err(format!(
+                    "shared plugin packaging failed for {crate_name} ({role}); implementations must expose export-free plugin_definition()"
+                ));
+            }
         }
     }
     Ok(())
+}
+
+/// Every component the implementation's own `plugin.toml` declares; each is
+/// packaged separately because a packaged artifact carries exactly one role.
+fn declared_component_roles(
+    cargo_manifest: &Path,
+    crate_name: &str,
+) -> Result<Vec<&'static str>, String> {
+    let declaration = cargo_manifest
+        .parent()
+        .ok_or_else(|| format!("package manifest has no directory: {crate_name}"))?
+        .join(bmux_plugin::DEFAULT_PLUGIN_MANIFEST_FILE);
+    let manifest = bmux_plugin::PluginManifest::from_path(&declaration)
+        .map_err(|error| format!("failed parsing {}: {error}", declaration.display()))?;
+    Ok(manifest
+        .component_roles
+        .iter()
+        .map(|role| match role {
+            bmux_plugin_sdk::definition::ComponentRole::Backend => "backend",
+            bmux_plugin_sdk::definition::ComponentRole::Frontend => "frontend",
+        })
+        .collect())
 }
 
 fn rebuild_profile_name(profile: BuildProfile) -> String {

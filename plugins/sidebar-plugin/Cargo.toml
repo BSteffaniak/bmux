@@ -9,9 +9,6 @@ name        = "bmux_sidebar_plugin"
 repository  = { workspace = true }
 version     = { workspace = true }
 
-[lib]
-crate-type = ["cdylib", "rlib"]
-
 [dependencies]
 bmux_plugin             = { workspace = true, features = ["tui"] }
 bmux_plugin_sdk         = { workspace = true }
@@ -35,4 +32,3 @@ fail-on-warnings = [
     "bmux_tui/fail-on-warnings",
     "bmux_tui_components/fail-on-warnings",
 ]
-static-bundled = []

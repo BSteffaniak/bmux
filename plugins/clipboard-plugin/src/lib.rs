@@ -97,9 +97,6 @@ bmux_plugin_sdk::define_plugin!(
     .metadata,
 );
 
-// Compatibility entry only; the shared definition and this entry call `service`.
-bmux_plugin_sdk::export_plugin!(ClipboardPlugin, include_str!("../plugin.toml"));
-
 #[cfg(test)]
 mod definition_tests {
     #[test]

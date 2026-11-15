@@ -532,8 +532,6 @@ bmux_plugin_sdk::define_plugin!(
     metadata = definition_metadata(),
 );
 
-bmux_plugin_sdk::export_plugin!(PluginCliPlugin, include_str!("../plugin.toml"));
-
 fn definition_metadata() -> bmux_plugin_sdk::definition::PluginMetadata {
     bmux_plugin_sdk::definition::PluginDefinition::from_rust_plugin::<PluginCliPlugin>(
         include_str!("../plugin.toml"),

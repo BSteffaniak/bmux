@@ -10,9 +10,6 @@ readme      = "README.md"
 repository  = { workspace = true }
 version     = { workspace = true }
 
-[lib]
-crate-type = ["cdylib", "rlib"]
-
 [dependencies]
 anyhow = { workspace = true }
 bmux_broadcast_plugin_api = { workspace = true }
@@ -119,4 +116,3 @@ fail-on-warnings = [
     "bmux_web_host/fail-on-warnings",
     "bmux_web_renderer/fail-on-warnings",
 ]
-static-bundled = []

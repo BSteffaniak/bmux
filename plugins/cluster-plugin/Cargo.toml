@@ -10,9 +10,6 @@ readme      = "README.md"
 repository  = { workspace = true }
 version     = { workspace = true }
 
-[lib]
-crate-type = ["cdylib", "rlib"]
-
 [dependencies]
 anyhow = { workspace = true, features = ["std"] }
 bmux_attach_layout_protocol = { workspace = true }
@@ -58,7 +55,6 @@ fail-on-warnings = [
     "bmux_pane_runtime_state/fail-on-warnings",
     "bmux_sessions_plugin_api/fail-on-warnings",
 ]
-static-bundled = []
 
 [dev-dependencies]
 serial_test = { workspace = true }

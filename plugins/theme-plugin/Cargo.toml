@@ -10,9 +10,6 @@ readme      = "README.md"
 repository  = { workspace = true }
 version     = { workspace = true }
 
-[lib]
-crate-type = ["cdylib", "rlib"]
-
 [dependencies]
 bmux_appearance            = { workspace = true }
 bmux_clients_plugin_api    = { workspace = true }
@@ -32,7 +29,6 @@ tracing                    = { workspace = true }
 
 [dev-dependencies]
 bmux_decoration_plugin = { workspace = true, features = [
-    "static-bundled",
     "bundled-decoration-scripts",
     "scripting-luau",
 ] }
@@ -55,4 +51,3 @@ fail-on-warnings = [
     "bmux_plugin/fail-on-warnings",
     "bmux_plugin_schema_macros/fail-on-warnings",
 ]
-static-bundled = []

@@ -10,9 +10,6 @@ readme      = "README.md"
 repository  = { workspace = true }
 version     = { workspace = true }
 
-[lib]
-crate-type = ["cdylib", "rlib"]
-
 [dependencies]
 bmux_broadcast_plugin_api = { workspace = true }
 bmux_client = { workspace = true }
@@ -72,7 +69,6 @@ fail-on-warnings = [
     "bmux_sessions_plugin_api/fail-on-warnings",
     "bmux_web_renderer/fail-on-warnings",
 ]
-static-bundled = []
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = [

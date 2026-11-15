@@ -1,9 +1,9 @@
 # Hello plugin: one implementation, two packages
 
 `src/lib.rs` is an export-free rlib. `plugin_definition()` is inert metadata
-plus
-a fresh scoped factory; bundled registration calls that same function. No
-`static-bundled` feature may change plugin behavior or emit dynamic exports.
+plus a fresh scoped factory; bundled registration calls that same function.
+There is no static or dynamic feature: packaging never changes plugin behavior,
+and only the generated wrapper emits dynamic exports.
 
 Dynamic packaging uses the shared generator from the repository root:
 

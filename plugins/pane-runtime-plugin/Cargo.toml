@@ -10,9 +10,6 @@ readme      = "README.md"
 repository  = { workspace = true }
 version     = { workspace = true }
 
-[lib]
-crate-type = ["cdylib", "rlib"]
-
 [[bin]]
 name = "bmux-pane-execution-supervisor"
 path = "src/bin/execution_supervisor.rs"
@@ -32,12 +29,12 @@ bmux_image = { workspace = true, optional = true }
 bmux_ipc = { workspace = true }
 bmux_pane_runtime_plugin_api = { workspace = true }
 bmux_pane_runtime_state = { workspace = true }
-bmux_pty = { workspace = true }
 bmux_permissions_plugin_api = { workspace = true }
 bmux_plugin = { workspace = true }
 bmux_plugin_runtime = { workspace = true }
 bmux_plugin_sdk = { workspace = true }
 bmux_presentation_state = { workspace = true }
+bmux_pty = { workspace = true }
 bmux_recording_protocol = { workspace = true }
 bmux_recording_runtime = { workspace = true }
 bmux_session_models = { workspace = true }
@@ -99,7 +96,6 @@ image-registry = [
     "bmux_image/kitty",
     "bmux_image/iterm2",
 ]
-static-bundled = []
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }

@@ -2289,10 +2289,21 @@ impl bmux_plugin_sdk::definition::PluginInstance for ConnectionsInstance {
     }
 }
 
+// The one definition both bundling and generated dynamic packaging use:
+// fresh default author state per created instance.
+bmux_plugin_sdk::define_plugin!(
+    rust_plugin = ConnectionsPlugin,
+    manifest = include_str!("../plugin.toml"),
+    roles = vec![
+        bmux_plugin_sdk::definition::ComponentRole::Backend,
+        bmux_plugin_sdk::definition::ComponentRole::Frontend
+    ],
+);
+
 /// Pools are runtime-owned ports. The factory requires one explicitly rather
 /// than silently sharing the legacy process pool across independent runtimes.
 #[must_use]
-pub fn plugin_definition(
+pub fn plugin_definition_with_pool(
     pool: Arc<EndpointConnectionPool<BmuxClient>>,
 ) -> bmux_plugin_sdk::definition::PluginDefinition {
     use bmux_plugin_sdk::definition::{PluginDefinition, PluginInstance};
@@ -2316,8 +2327,6 @@ mod scoped_instance_tests {
         drop(plugin);
     }
 }
-
-bmux_plugin_sdk::export_plugin!(ConnectionsPlugin, include_str!("../plugin.toml"));
 
 fn definition_metadata() -> bmux_plugin_sdk::definition::PluginMetadata {
     bmux_plugin_sdk::definition::PluginDefinition::from_rust_plugin::<ConnectionsPlugin>(

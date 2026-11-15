@@ -195,11 +195,6 @@ bmux_plugin_sdk::define_plugin!(
     .metadata,
 );
 
-bmux_plugin_sdk::export_plugin!(
-    ApplicationResurrectionPlugin,
-    include_str!("../plugin.toml")
-);
-
 #[cfg(all(test, unix))]
 mod lifecycle_tests {
     use super::*;

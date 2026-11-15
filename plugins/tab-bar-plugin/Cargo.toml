@@ -9,9 +9,6 @@ name        = "bmux_tab_bar_plugin"
 repository  = { workspace = true }
 version     = { workspace = true }
 
-[lib]
-crate-type = ["cdylib", "rlib"]
-
 [dependencies]
 bmux_attach_view_protocol = { workspace = true }
 bmux_keyboard = { workspace = true }
@@ -54,4 +51,3 @@ fail-on-warnings = [
     "bmux_tui_components/fail-on-warnings",
     "bmux_workspaces_plugin_api/fail-on-warnings",
 ]
-static-bundled = []

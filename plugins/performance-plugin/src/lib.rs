@@ -1156,7 +1156,15 @@ impl bmux_plugin_sdk::definition::PluginInstance for PerformancePlugin {
         })
     }
 }
-pub fn plugin_definition(
+// The one definition both bundling and generated dynamic packaging use:
+// fresh default author state per created instance.
+bmux_plugin_sdk::define_plugin!(
+    rust_plugin = PerformancePlugin,
+    manifest = include_str!("../plugin.toml"),
+    roles = vec![bmux_plugin_sdk::definition::ComponentRole::Backend],
+);
+
+pub fn plugin_definition_with_host(
     host: Arc<dyn PerformanceHost>,
 ) -> bmux_plugin_sdk::definition::PluginDefinition {
     use bmux_plugin_sdk::definition::{PluginDefinition, PluginInstance};
@@ -1164,8 +1172,6 @@ pub fn plugin_definition(
         Ok(Arc::new(PerformancePlugin::with_host(Arc::clone(&host))) as Arc<dyn PluginInstance>)
     })
 }
-
-bmux_plugin_sdk::export_plugin!(PerformancePlugin, include_str!("../plugin.toml"));
 
 #[cfg(test)]
 mod tests {

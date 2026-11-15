@@ -10,9 +10,6 @@ readme      = "README.md"
 repository  = { workspace = true }
 version     = { workspace = true }
 
-[lib]
-crate-type = ["cdylib", "rlib"]
-
 [dependencies]
 bmux_pane_runtime_state     = { workspace = true }
 bmux_performance_plugin_api = { workspace = true }
@@ -36,4 +33,3 @@ fail-on-warnings = [
     "bmux_performance_plugin_api/fail-on-warnings",
     "bmux_performance_state/fail-on-warnings",
 ]
-static-bundled = []

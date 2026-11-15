@@ -10,9 +10,6 @@ readme      = "README.md"
 repository  = { workspace = true }
 version     = { workspace = true }
 
-[lib]
-crate-type = ["cdylib", "rlib"]
-
 [dependencies]
 arc-swap                     = { workspace = true }
 bmux_attach_layout_protocol  = { workspace = true }
@@ -37,6 +34,11 @@ uuid                         = { workspace = true, features = ["serde", "std"] }
 # source.
 ignored = ["serde"]
 
+# Generated dynamic wrappers disable default features; the backend component
+# is the same build the bundled host composes.
+[package.metadata.bmux-plugin.components.backend]
+features = ["bundled-decoration-scripts", "scripting-luau"]
+
 [features]
 default = ["bundled-decoration-scripts", "scripting-luau"]
 # Bundle the decoration plugin's sample Lua scripts via `include_str!`.
@@ -60,4 +62,3 @@ fail-on-warnings = [
 scripting-lua54 = ["dep:mlua", "mlua/lua54", "mlua/vendored", "mlua/send"]
 scripting-luajit = ["dep:mlua", "mlua/luajit", "mlua/vendored", "mlua/send"]
 scripting-luau = ["dep:mlua", "mlua/luau", "mlua/vendored", "mlua/send"]
-static-bundled = []

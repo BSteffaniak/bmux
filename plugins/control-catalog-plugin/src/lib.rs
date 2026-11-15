@@ -378,10 +378,18 @@ impl bmux_plugin_sdk::definition::PluginInstance for ControlCatalogPlugin {
     }
 }
 
+// The one definition both bundling and generated dynamic packaging use:
+// fresh default author state per created instance.
+bmux_plugin_sdk::define_plugin!(
+    rust_plugin = ControlCatalogPlugin,
+    manifest = include_str!("../plugin.toml"),
+    roles = vec![bmux_plugin_sdk::definition::ComponentRole::Backend],
+);
+
 /// Bind one host's neutral mechanisms before creating instances. The portable
 /// adapter must translate its host handles into these same mechanisms; it must
 /// not select the legacy global registry.
-pub fn plugin_definition(
+pub fn plugin_definition_with_host(
     events: Arc<EventBus>,
     state: Arc<PluginStateRegistry>,
 ) -> bmux_plugin_sdk::definition::PluginDefinition {
@@ -393,8 +401,6 @@ pub fn plugin_definition(
             as Arc<dyn bmux_plugin_sdk::definition::PluginInstance>)
     })
 }
-
-bmux_plugin_sdk::export_plugin!(ControlCatalogPlugin, include_str!("../plugin.toml"));
 
 #[cfg(test)]
 mod lifecycle_tests {

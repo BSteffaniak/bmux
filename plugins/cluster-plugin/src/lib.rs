@@ -1064,10 +1064,21 @@ pub fn command_scoped_plugin_definition()
     ))
 }
 
+// The one definition both bundling and generated dynamic packaging use:
+// fresh default author state per created instance.
+bmux_plugin_sdk::define_plugin!(
+    rust_plugin = ClusterPlugin,
+    manifest = include_str!("../plugin.toml"),
+    roles = vec![
+        bmux_plugin_sdk::definition::ComponentRole::Backend,
+        bmux_plugin_sdk::definition::ComponentRole::Frontend
+    ],
+);
+
 /// Constructor-injected consensus authority. The supplied registry must belong
 /// to this runtime scope; it is not reconstructed from a logical plugin ID.
 #[must_use]
-pub fn plugin_definition(
+pub fn plugin_definition_with_nodes(
     nodes: consensus_network::ConsensusNodeRegistry,
 ) -> bmux_plugin_sdk::definition::PluginDefinition {
     use bmux_plugin_sdk::definition::{PluginDefinition, PluginInstance};

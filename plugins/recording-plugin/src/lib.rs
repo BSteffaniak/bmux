@@ -2127,10 +2127,21 @@ impl RecordingHost for LegacyRecordingHost {
     }
 }
 
+// The one definition both bundling and generated dynamic packaging use:
+// fresh default author state per created instance.
+bmux_plugin_sdk::define_plugin!(
+    rust_plugin = RecordingPlugin,
+    manifest = include_str!("../plugin.toml"),
+    roles = vec![
+        bmux_plugin_sdk::definition::ComponentRole::Backend,
+        bmux_plugin_sdk::definition::ComponentRole::Frontend
+    ],
+);
+
 /// Configuration and authenticated caller are selected explicitly by the host.
 /// The process runtime is real, uses this owner's writer, and never registers in
 /// a global singleton. Caller rebinding happens for every service invocation.
-pub fn plugin_definition(
+pub fn plugin_definition_with_host(
     host: Arc<dyn RecordingHost>,
     config: RecordingPluginConfig,
     caller: Arc<bmux_plugin::TypedServiceCaller>,
@@ -2284,8 +2295,6 @@ impl bmux_plugin_sdk::definition::PluginInstance for RecordingOwner {
         })
     }
 }
-
-bmux_plugin_sdk::export_plugin!(RecordingPlugin, include_str!("../plugin.toml"));
 
 #[cfg(test)]
 mod tests {
