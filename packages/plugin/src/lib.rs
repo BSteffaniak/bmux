@@ -17,10 +17,14 @@
 pub type StreamOrigin = bmux_ipc::StreamProvenance;
 
 pub mod action_dispatch;
+#[cfg(feature = "tui")]
 mod attach_companion;
 mod attach_presentation_input;
+#[cfg(feature = "tui")]
 pub mod component_input;
+#[cfg(feature = "tui")]
 pub mod component_render;
+#[cfg(feature = "tui")]
 pub mod component_viewport;
 mod declaration;
 mod discovery;
@@ -39,11 +43,13 @@ mod service_location;
 mod startup_gate;
 mod static_vtable_registry;
 pub mod stream_admission;
+#[cfg(feature = "tui")]
 pub mod surface;
 pub mod test_support;
 mod typed_dispatch_bridge;
 mod typed_service_caller;
 
+#[cfg(feature = "tui")]
 pub use attach_companion::{
     AttachCompanion, AttachCompanionCallback, AttachCompanionFactory, AttachCompanionRegistry,
     AttachPresentationResources, global_attach_companion_registry, register_attach_companion,

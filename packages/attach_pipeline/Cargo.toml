@@ -18,7 +18,7 @@ bmux_attach_pipeline_models = { workspace = true }
 bmux_attach_view_protocol = { workspace = true }
 bmux_client = { workspace = true }
 bmux_image = { workspace = true, optional = true }
-bmux_plugin = { workspace = true }
+bmux_plugin = { workspace = true, features = ["tui"] }
 bmux_scene_protocol = { workspace = true }
 bmux_scene_protocol_render = { workspace = true }
 bmux_terminal = { workspace = true }
@@ -32,12 +32,12 @@ image = { workspace = true, default-features = false, features = [
     "bmp",
 ] }
 
-anyhow = { workspace = true, features = ["std"] }
-futures-util = { workspace = true, features = ["std"] }
-tokio = { workspace = true, features = ["time"] }
-tracing = { workspace = true, features = ["std"] }
+anyhow        = { workspace = true, features = ["std"] }
+futures-util  = { workspace = true, features = ["std"] }
+tokio         = { workspace = true, features = ["time"] }
+tracing       = { workspace = true, features = ["std"] }
 unicode-width = { workspace = true }
-uuid = { workspace = true, features = ["std"] }
+uuid          = { workspace = true, features = ["std"] }
 
 [features]
 default = []

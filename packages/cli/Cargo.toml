@@ -44,7 +44,7 @@ bmux_performance_plugin_api = { workspace = true }
 bmux_performance_state = { workspace = true }
 bmux_permissions_plugin_api = { workspace = true }
 bmux_playbook = { workspace = true, features = ["runtime"] }
-bmux_plugin = { workspace = true }
+bmux_plugin = { workspace = true, features = ["tui"] }
 bmux_plugin_sdk = { workspace = true }
 bmux_recording_plugin_api = { workspace = true }
 bmux_recording_protocol = { workspace = true }
@@ -169,8 +169,8 @@ bmux_workspaces_plugin = { workspace = true, optional = true, features = [
 # Image protocol support (optional, feature-gated per protocol)
 anyhow = { workspace = true, features = ["std"] }
 bmux_image = { workspace = true, optional = true }
-clap = { workspace = true, features = ["derive", "help", "std", "usage"] }
 bmux_terminal = { workspace = true }
+clap = { workspace = true, features = ["derive", "help", "std", "usage"] }
 futures-util = { workspace = true }
 git_sshripped_recipient = { workspace = true }
 git_sshripped_ssh_agent = { workspace = true }
