@@ -16482,6 +16482,7 @@ exit 7"#
         let mut pane = dummy_pane(Uuid::new_v4());
         *pane.execution.supervisor.lock().unwrap() = Some(control);
         let execution = Arc::clone(&pane.execution);
+        let mut execution_changes = execution.subscribe();
         let state = Arc::clone(&pane.resurrection_state);
         let observed_state = Arc::clone(&state);
         let (done, mut completion) = watch::channel(false);
@@ -16518,10 +16519,24 @@ exit 7"#
         .await
         .expect("failed Sweep retained a live slave holder");
         assert!(state.lock().unwrap().frozen);
-        // Losing the control endpoint is observation uncertainty, not a
-        // permanently recorded cleanup failure. The explicit failed receipt
-        // still prevents this fixture from claiming completed cleanup.
-        assert!(!execution.cleanup_failed.load(Ordering::SeqCst));
+        // The cancelled waiter's cleanup owner still records the fixture's
+        // explicit failed receipt; wait for that recording rather than racing
+        // it. Losing the control endpoint is observation uncertainty, not a
+        // cleanup failure: anything revocation recorded would precede the
+        // receipt (it happens before the lease EOF that lets the child exit),
+        // so the first retained cleanup error must be the receipt itself.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while execution.cleanup_error().is_none() {
+                execution_changes.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("cleanup owner never recorded the failed receipt");
+        assert_eq!(
+            execution.cleanup_error().as_deref(),
+            Some("Sweep failed; lease fallback used"),
+            "lost control endpoint must not be recorded as a cleanup failure"
+        );
         assert!(
             !execution.cleanup_complete(true),
             "fallback must not fabricate cleanup success"
