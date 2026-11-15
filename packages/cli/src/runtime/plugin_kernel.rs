@@ -2429,13 +2429,18 @@ mod tests {
         let mut output = vec![0; 65536];
         let mut len = 0;
         anyhow::ensure!(
-            bridge.invoke(
-                bytes.as_ptr(),
-                bytes.len(),
-                output.as_mut_ptr(),
-                output.len(),
-                &raw mut len
-            ) == 0,
+            // SAFETY: the bridge came from this process's host; the request buffer is
+            // readable for its length, `output` is writable for `output.len()` bytes and
+            // the length out-parameter is a live local, all valid for the call.
+            unsafe {
+                bridge.invoke(
+                    bytes.as_ptr(),
+                    bytes.len(),
+                    output.as_mut_ptr(),
+                    output.len(),
+                    &raw mut len,
+                )
+            } == 0,
             "bridge denied"
         );
         let response: bmux_plugin_sdk::HostKernelBridgeResponse =

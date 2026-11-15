@@ -4,7 +4,6 @@
 #![allow(clippy::module_name_repetitions)]
 #![allow(clippy::large_enum_variant)]
 #![allow(clippy::struct_excessive_bools)]
-#![allow(clippy::not_unsafe_ptr_arg_deref)]
 #![allow(clippy::result_large_err)]
 #![allow(clippy::unsafe_derive_deserialize)]
 

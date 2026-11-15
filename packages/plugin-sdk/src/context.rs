@@ -585,11 +585,20 @@ impl HostKernelBridge {
 
     /// Invoke the kernel bridge function pointer.
     ///
+    /// Returns status `2` without calling anything when the bridge is unbound
+    /// or uses an unsupported version.
+    ///
     /// # Safety
     ///
-    /// The caller must ensure the bridge pointer is still valid (i.e. the host
-    /// process has not been terminated or the function unmapped).
-    pub fn invoke(
+    /// - The bridge must have been issued by the host in this process and its
+    ///   function must still be mapped (the host has not unloaded it).
+    /// - `input_ptr` must be valid for reads of `input_len` bytes.
+    /// - `output_ptr` must be valid for writes of `output_capacity` bytes (it
+    ///   may be null only when `output_capacity` is 0).
+    /// - `output_len` must be valid for a single `usize` write.
+    ///
+    /// All buffers must stay valid for the duration of the call.
+    pub unsafe fn invoke(
         &self,
         input_ptr: *const u8,
         input_len: usize,

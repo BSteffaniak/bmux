@@ -1331,23 +1331,33 @@ fn invoke_host_kernel_bridge(bridge: &HostKernelBridge, payload: Vec<u8>) -> Res
     let mut output = vec![0u8; request.len().saturating_mul(4).max(1024)];
     let mut output_len = 0usize;
 
-    let status = bridge.invoke(
-        request.as_ptr(),
-        request.len(),
-        output.as_mut_ptr(),
-        output.len(),
-        &raw mut output_len,
-    );
-
-    if status == KERNEL_STATUS_BUFFER_TOO_SMALL {
-        output.resize(output_len, 0);
-        let status = bridge.invoke(
+    // SAFETY: the bridge came from this process's host; the request buffer is
+    // readable for its length, `output` is writable for `output.len()` bytes and
+    // the length out-parameter is a live local, all valid for the call.
+    let status = unsafe {
+        bridge.invoke(
             request.as_ptr(),
             request.len(),
             output.as_mut_ptr(),
             output.len(),
             &raw mut output_len,
-        );
+        )
+    };
+
+    if status == KERNEL_STATUS_BUFFER_TOO_SMALL {
+        output.resize(output_len, 0);
+        // SAFETY: the bridge came from this process's host; the request buffer is
+        // readable for its length, `output` is writable for `output.len()` bytes and
+        // the length out-parameter is a live local, all valid for the call.
+        let status = unsafe {
+            bridge.invoke(
+                request.as_ptr(),
+                request.len(),
+                output.as_mut_ptr(),
+                output.len(),
+                &raw mut output_len,
+            )
+        };
         if status != KERNEL_STATUS_OK {
             return Err(PluginError::ServiceProtocol {
                 details: format!("kernel bridge invocation failed with status {status}"),
