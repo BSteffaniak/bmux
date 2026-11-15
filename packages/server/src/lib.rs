@@ -30,7 +30,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex as AsyncMutex, mpsc, oneshot, watch};
-use tracing::{debug, info, warn};
+use tracing::{Instrument as _, debug, info, warn};
 use uuid::Uuid;
 
 use bmux_performance_state::{
@@ -3871,170 +3871,176 @@ async fn handle_request(
                     client_id = ?client_id,
                 ),
             };
-            let _span_guard = span.enter();
-            let started_at = std::time::Instant::now();
-            // Explicit observable entry log for Command-kind typed
-            // dispatches only. Query kind fires too frequently
-            // (catalog polls, current-context reads) to log per-call
-            // at `info`; they still participate in the surrounding
-            // `trace_span!` for context when someone enables trace.
-            //
-            // Counting `invoke command` lines per keystroke answers
-            // "did a single user action fan out into the expected
-            // number of mutating calls?" without dragging in the
-            // query noise.
-            if matches!(kind, bmux_ipc::InvokeServiceKind::Command) {
-                tracing::info!(
-                    target: "bmux_server::invoke_service",
-                    capability = %capability,
-                    interface = %interface_id,
-                    operation = %operation,
-                    client_id = ?client_id,
-                    "invoke command",
-                );
-            }
-            // Typed service calls don't acquire the global operation
-            // lock here: many handlers re-enter `handle_request`
-            // through `execute_kernel_request`, which takes the lock
-            // at the inner `Request::*` level. A dedicated
-            // `OperationLockHandle` will gate pure typed mutations
-            // once the legacy IPC surface deletes.
-            let route = ServiceRoute {
-                capability: capability.clone(),
-                kind,
-                interface_id: interface_id.clone(),
-                operation: operation.clone(),
-            };
-            check_stream_route(state, client_id.0, &route)?;
-            let invoke_context = ServiceInvokeContext {
-                host_dispatch_context: None,
-                host_internal: false,
-                state: Arc::clone(state),
-                shutdown_tx: shutdown_tx.clone(),
-                client_id,
-                client_principal_id,
-                caller_plugin_id: None,
-            };
-            let registry_started = std::time::Instant::now();
-            let dispatch = {
-                let registry = state
-                    .service_registry
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("service registry lock poisoned"))?;
-                registry.dispatch(&route, invoke_context.clone(), payload.clone())
-            };
-            let registry_us = registry_started.elapsed().as_micros();
-            let resolver_started = std::time::Instant::now();
-            let invocation = if let Some(invocation) = dispatch {
-                Some(invocation)
-            } else {
-                let resolver = state
-                    .service_resolver
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("service resolver lock poisoned"))?
-                    .clone();
-                if bmux_plugin_sdk::service_contract::is_checked(&payload) {
-                    // A provider exists, but this fallback cannot validate checked
-                    // evidence. Never classify that as optional provider absence.
-                    resolver.map(|_| -> ServiceInvokeFuture {
-                        Box::pin(async {
-                            Err(ServiceCompatibilityError(
-                                "fallback provider has no checked contract boundary",
-                            )
-                            .into())
+            // The dispatch below awaits (and may re-enter `handle_request`), so
+            // the span must follow the future: an entered guard held across an
+            // await corrupts the subscriber's span stack when tasks interleave.
+            async {
+                let started_at = std::time::Instant::now();
+                // Explicit observable entry log for Command-kind typed
+                // dispatches only. Query kind fires too frequently
+                // (catalog polls, current-context reads) to log per-call
+                // at `info`; they still participate in the surrounding
+                // `trace_span!` for context when someone enables trace.
+                //
+                // Counting `invoke command` lines per keystroke answers
+                // "did a single user action fan out into the expected
+                // number of mutating calls?" without dragging in the
+                // query noise.
+                if matches!(kind, bmux_ipc::InvokeServiceKind::Command) {
+                    tracing::info!(
+                        target: "bmux_server::invoke_service",
+                        capability = %capability,
+                        interface = %interface_id,
+                        operation = %operation,
+                        client_id = ?client_id,
+                        "invoke command",
+                    );
+                }
+                // Typed service calls don't acquire the global operation
+                // lock here: many handlers re-enter `handle_request`
+                // through `execute_kernel_request`, which takes the lock
+                // at the inner `Request::*` level. A dedicated
+                // `OperationLockHandle` will gate pure typed mutations
+                // once the legacy IPC surface deletes.
+                let route = ServiceRoute {
+                    capability: capability.clone(),
+                    kind,
+                    interface_id: interface_id.clone(),
+                    operation: operation.clone(),
+                };
+                check_stream_route(state, client_id.0, &route)?;
+                let invoke_context = ServiceInvokeContext {
+                    host_dispatch_context: None,
+                    host_internal: false,
+                    state: Arc::clone(state),
+                    shutdown_tx: shutdown_tx.clone(),
+                    client_id,
+                    client_principal_id,
+                    caller_plugin_id: None,
+                };
+                let registry_started = std::time::Instant::now();
+                let dispatch = {
+                    let registry = state
+                        .service_registry
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("service registry lock poisoned"))?;
+                    registry.dispatch(&route, invoke_context.clone(), payload.clone())
+                };
+                let registry_us = registry_started.elapsed().as_micros();
+                let resolver_started = std::time::Instant::now();
+                let invocation = if let Some(invocation) = dispatch {
+                    Some(invocation)
+                } else {
+                    let resolver = state
+                        .service_resolver
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("service resolver lock poisoned"))?
+                        .clone();
+                    if bmux_plugin_sdk::service_contract::is_checked(&payload) {
+                        // A provider exists, but this fallback cannot validate checked
+                        // evidence. Never classify that as optional provider absence.
+                        resolver.map(|_| -> ServiceInvokeFuture {
+                            Box::pin(async {
+                                Err(ServiceCompatibilityError(
+                                    "fallback provider has no checked contract boundary",
+                                )
+                                .into())
+                            })
                         })
-                    })
-                } else {
-                    resolver.map(|resolver| resolver(route.clone(), payload))
-                }
-            };
-            let resolver_us = resolver_started.elapsed().as_micros();
+                    } else {
+                        resolver.map(|resolver| resolver(route.clone(), payload))
+                    }
+                };
+                let resolver_us = resolver_started.elapsed().as_micros();
 
-            let invocation_started = std::time::Instant::now();
-            let response = if let Some(invocation) = invocation {
-                match invocation.await {
-                    Ok(output) => Response::Ok(ResponsePayload::ServiceInvoked {
-                        payload: output.payload,
-                    }),
-                    Err(error) => Response::Err(ErrorResponse {
-                        code: service_invocation_error_code(&error),
-                        message: format!("service invocation failed: {error:#}"),
-                    }),
-                }
-            } else {
-                Response::Err(ErrorResponse {
-                    code: ErrorCode::NotFound,
-                    message: format!(
-                        "no provider for service capability='{capability}' kind='{kind:?}' interface='{interface_id}' operation='{operation}'"
-                    ),
-                })
-            };
-            let invocation_us = invocation_started.elapsed().as_micros();
-            let elapsed = started_at.elapsed();
-            #[allow(clippy::cast_possible_truncation)]
-            let elapsed_ms = elapsed.as_millis() as u64;
-            #[allow(clippy::cast_possible_truncation)]
-            let dispatch_micros = elapsed.as_micros() as u64;
-            // Companion completion log for Command-kind dispatches so
-            // pair-up analysis ("which invoke begin matches which
-            // outcome?") is direct. The surrounding span is retained
-            // for field context on any nested events the handler
-            // emitted; we don't `span.record(...)` the outcome /
-            // elapsed_ms here because the explicit `info!` already
-            // carries them and double-recording produces a noisy
-            // `outcome="ok" outcome="ok"` in the log.
-            if elapsed > Duration::from_millis(100) {
-                let level = if elapsed > Duration::from_secs(1) {
-                    "severe"
+                let invocation_started = std::time::Instant::now();
+                let response = if let Some(invocation) = invocation {
+                    match invocation.await {
+                        Ok(output) => Response::Ok(ResponsePayload::ServiceInvoked {
+                            payload: output.payload,
+                        }),
+                        Err(error) => Response::Err(ErrorResponse {
+                            code: service_invocation_error_code(&error),
+                            message: format!("service invocation failed: {error:#}"),
+                        }),
+                    }
                 } else {
-                    "degraded"
+                    Response::Err(ErrorResponse {
+                        code: ErrorCode::NotFound,
+                        message: format!(
+                            "no provider for service capability='{capability}' kind='{kind:?}' interface='{interface_id}' operation='{operation}'"
+                        ),
+                    })
                 };
-                tracing::warn!(
-                    target: "bmux_server::invoke_service",
-                    capability = %capability,
-                    interface = %interface_id,
-                    operation = %operation,
-                    kind = ?kind,
-                    client_id = ?client_id,
-                    elapsed_ms,
-                    dispatch_micros,
-                    registry_us,
-                    resolver_us,
-                    invocation_us,
-                    level,
-                    "typed service invocation exceeded latency budget",
+                let invocation_us = invocation_started.elapsed().as_micros();
+                let elapsed = started_at.elapsed();
+                #[allow(clippy::cast_possible_truncation)]
+                let elapsed_ms = elapsed.as_millis() as u64;
+                #[allow(clippy::cast_possible_truncation)]
+                let dispatch_micros = elapsed.as_micros() as u64;
+                // Companion completion log for Command-kind dispatches so
+                // pair-up analysis ("which invoke begin matches which
+                // outcome?") is direct. The surrounding span is retained
+                // for field context on any nested events the handler
+                // emitted; we don't `span.record(...)` the outcome /
+                // elapsed_ms here because the explicit `info!` already
+                // carries them and double-recording produces a noisy
+                // `outcome="ok" outcome="ok"` in the log.
+                if elapsed > Duration::from_millis(100) {
+                    let level = if elapsed > Duration::from_secs(1) {
+                        "severe"
+                    } else {
+                        "degraded"
+                    };
+                    tracing::warn!(
+                        target: "bmux_server::invoke_service",
+                        capability = %capability,
+                        interface = %interface_id,
+                        operation = %operation,
+                        kind = ?kind,
+                        client_id = ?client_id,
+                        elapsed_ms,
+                        dispatch_micros,
+                        registry_us,
+                        resolver_us,
+                        invocation_us,
+                        level,
+                        "typed service invocation exceeded latency budget",
+                    );
+                }
+                if matches!(kind, bmux_ipc::InvokeServiceKind::Command) {
+                    let outcome_str = match &response {
+                        Response::Ok(_) => "ok",
+                        Response::Err(err) if err.code == ErrorCode::NotFound => "err:not_found",
+                        Response::Err(_) => "err:internal",
+                    };
+                    tracing::info!(
+                        target: "bmux_server::invoke_service",
+                        capability = %capability,
+                        interface = %interface_id,
+                        operation = %operation,
+                        client_id = ?client_id,
+                        elapsed_ms,
+                        dispatch_micros,
+                        outcome = outcome_str,
+                        "invoke command complete",
+                    );
+                }
+                emit_phase_timing(
+                    PhaseChannel::Service,
+                    &PhasePayload::new("service.server_invoke")
+                        .service_fields(capability, format!("{kind:?}"), interface_id, operation)
+                        .field("client_id", client_id)
+                        .field("registry_us", registry_us)
+                        .field("resolver_us", resolver_us)
+                        .field("invocation_us", invocation_us)
+                        .field("total_us", elapsed.as_micros())
+                        .finish(),
                 );
+                Ok::<_, anyhow::Error>(response)
             }
-            if matches!(kind, bmux_ipc::InvokeServiceKind::Command) {
-                let outcome_str = match &response {
-                    Response::Ok(_) => "ok",
-                    Response::Err(err) if err.code == ErrorCode::NotFound => "err:not_found",
-                    Response::Err(_) => "err:internal",
-                };
-                tracing::info!(
-                    target: "bmux_server::invoke_service",
-                    capability = %capability,
-                    interface = %interface_id,
-                    operation = %operation,
-                    client_id = ?client_id,
-                    elapsed_ms,
-                    dispatch_micros,
-                    outcome = outcome_str,
-                    "invoke command complete",
-                );
-            }
-            emit_phase_timing(
-                PhaseChannel::Service,
-                &PhasePayload::new("service.server_invoke")
-                    .service_fields(capability, format!("{kind:?}"), interface_id, operation)
-                    .field("client_id", client_id)
-                    .field("registry_us", registry_us)
-                    .field("resolver_us", resolver_us)
-                    .field("invocation_us", invocation_us)
-                    .field("total_us", elapsed.as_micros())
-                    .finish(),
-            );
-            response
+            .instrument(span)
+            .await?
         }
         Request::InvokeServicePipeline { pipeline } => {
             match execute_service_pipeline(
