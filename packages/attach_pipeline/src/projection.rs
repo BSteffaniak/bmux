@@ -27,6 +27,52 @@ pub enum PaintOperation {
         rect: Rect,
         style: Style,
     },
+    /// The cells of `area` move by `rows` (positive up), as a terminal scroll inside it moves
+    /// them, and the rows it exposes are blank; the operations that follow paint them.
+    Scroll {
+        area: Rect,
+        rows: i64,
+    },
+    /// A run of cells from column `x` of row `y` as a pane's grid shows them: graphemes laid
+    /// end to end in `text`, each with the columns its grid measured and its whole style.
+    Cells {
+        x: u16,
+        y: u16,
+        text: String,
+        cells: Vec<CapturedCell>,
+    },
+}
+
+/// One cell of [`PaintOperation::Cells`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CapturedCell {
+    /// Where its grapheme ends in the run's text (it starts where the previous one ends).
+    pub end: u32,
+    /// Columns it occupies: 2 for a wide grapheme, otherwise 1.
+    pub width: u8,
+    /// Its whole style.
+    pub style: Style,
+}
+
+/// Paint a captured run of cells, each replacing the cell it covers.
+fn paint_cells(cx: &mut PaintCx<'_, '_>, x: u16, y: u16, text: &str, cells: &[CapturedCell]) {
+    let mut start = 0_usize;
+    cx.replace_cells(
+        i32::from(x),
+        i64::from(y),
+        cells.iter().map(|cell| {
+            let end = usize::try_from(cell.end)
+                .unwrap_or(text.len())
+                .min(text.len());
+            let symbol = text.get(start..end).unwrap_or(" ");
+            start = end;
+            bmux_tui::paint::SizedCell {
+                symbol,
+                width: cell.width,
+                style: cell.style,
+            }
+        }),
+    );
 }
 
 /// Content-free capture failure; never conflates unsupported output with admission.
@@ -190,6 +236,11 @@ fn operation_bytes(operation: &PaintOperation) -> usize {
             |bytes, cell| bytes.saturating_add(cell.symbol.len()),
         ),
         PaintOperation::Text { text, .. } => text.len(),
+        PaintOperation::Cells { text, cells, .. } => text.len().saturating_add(
+            cells
+                .len()
+                .saturating_mul(std::mem::size_of::<CapturedCell>()),
+        ),
         PaintOperation::Image(image) => match &image.payload {
             bmux_tui::image::ImagePayload::Png { bytes, .. }
             | bmux_tui::image::ImagePayload::Pixels { bytes, .. } => bytes.len(),
@@ -346,9 +397,83 @@ pub fn paint_with_grid_fragments(
             PaintOperation::Fill { rect, style } => {
                 cx.fill(LocalRect::terminal(*rect), " ", *style);
             }
+            PaintOperation::Scroll { area, rows } => {
+                cx.move_cells(LocalRect::terminal(*area), *rows);
+            }
+            PaintOperation::Cells { x, y, text, cells } => paint_cells(cx, *x, *y, text, cells),
         }
     }
     Ok(fragments)
+}
+
+/// Paint captured operations over the frame a terminal shows, as their terminal output would
+/// change it.
+///
+/// Each text run replaces the cells it covers with exactly its style: colors it leaves unset
+/// are the terminal's defaults, as the reset before every run makes them. A pane deferred
+/// inside an unfinished synchronized update keeps what it showed.
+///
+/// # Errors
+/// Returns the first operation a terminal frame cannot show: a local grid, an image, a
+/// rejection other than a deferred pane, or legacy imperative output.
+pub fn paint_over(
+    cx: &mut PaintCx<'_, '_>,
+    operations: &[PaintOperation],
+) -> Result<(), ProjectionFailure> {
+    for operation in operations {
+        match operation {
+            PaintOperation::Rejected(ProjectionFailure::Deferred { .. })
+            | PaintOperation::Text { .. }
+            | PaintOperation::Fill { .. }
+            | PaintOperation::Scroll { .. }
+            | PaintOperation::Cells { .. } => {}
+            PaintOperation::Rejected(reason) => return Err(reason.clone()),
+            PaintOperation::Unsupported => {
+                return Err(ProjectionFailure::Unsupported {
+                    reason: "legacy imperative capture",
+                });
+            }
+            PaintOperation::Grid(_) => {
+                return Err(ProjectionFailure::Unsupported {
+                    reason: "terminal frames have no local grids",
+                });
+            }
+            PaintOperation::Image(_) => {
+                return Err(ProjectionFailure::Unsupported {
+                    reason: "terminal frames do not place images yet",
+                });
+            }
+        }
+    }
+    let explicit = |color: Option<Color>| Some(color.unwrap_or(Color::Default));
+    for operation in operations {
+        match operation {
+            PaintOperation::Text { x, y, text, style } => {
+                let width = bmux_plugin::render_text_width_u16(text);
+                let style = Style {
+                    fg: explicit(style.fg),
+                    bg: explicit(style.bg),
+                    ..*style
+                };
+                cx.write_line(
+                    LocalRect::new(i32::from(*x), i64::from(*y), width, 1),
+                    &Line::from_spans(vec![Span::styled(text.clone(), style)]),
+                );
+            }
+            PaintOperation::Fill { rect, style } => {
+                cx.fill(LocalRect::terminal(*rect), " ", *style);
+            }
+            PaintOperation::Scroll { area, rows } => {
+                cx.move_cells(LocalRect::terminal(*area), *rows);
+            }
+            PaintOperation::Cells { x, y, text, cells } => paint_cells(cx, *x, *y, text, cells),
+            PaintOperation::Rejected(_)
+            | PaintOperation::Unsupported
+            | PaintOperation::Grid(_)
+            | PaintOperation::Image(_) => {}
+        }
+    }
+    Ok(())
 }
 
 /// Lower only original retained paint, never flattened root cells.

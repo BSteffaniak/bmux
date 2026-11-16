@@ -3207,7 +3207,8 @@ impl ShownRow {
         let mut col = 0u16;
         while col < width {
             let cell = context.row.cells().get(usize::from(col));
-            let selected = cell_selected(context.selection, context.selection_line, usize::from(col));
+            let selected =
+                cell_selected(context.selection, context.selection_line, usize::from(col));
             let raw_style = cell.map_or_else(CellStyle::default, |cell| {
                 grid_cell_style(context.palette.get(cell.style()))
             });
@@ -3276,6 +3277,50 @@ impl ShownRow {
         }
     }
 
+    /// Capture columns `start..end` (whole graphemes) as one run of cells at terminal column `x`
+    /// of row `y`.
+    fn capture(&self, x: u16, y: u16, start: u16, end: u16) {
+        let cells = self
+            .cells
+            .get(usize::from(start)..usize::from(end).min(self.cells.len()))
+            .unwrap_or_default();
+        let mut text = String::with_capacity(cells.len());
+        let mut captured: Vec<crate::projection::CapturedCell> = Vec::with_capacity(cells.len());
+        let mut memo: Option<(CellStyle, bmux_tui::style::Style)> = None;
+        for cell in cells {
+            match &cell.text {
+                ShownText::Continuation => {
+                    if let Some(last) = captured.last_mut() {
+                        last.width = 2;
+                        continue;
+                    }
+                    text.push(' ');
+                }
+                ShownText::Char(ch) => text.push(*ch),
+                ShownText::Cluster(cluster) => text.push_str(cluster),
+            }
+            let style = match memo {
+                Some((key, style)) if key == cell.style => style,
+                _ => {
+                    let style = cell_style_to_tui(cell.style);
+                    memo = Some((cell.style, style));
+                    style
+                }
+            };
+            captured.push(crate::projection::CapturedCell {
+                end: u32::try_from(text.len()).unwrap_or(u32::MAX),
+                width: 1,
+                style,
+            });
+        }
+        crate::projection::record(crate::projection::PaintOperation::Cells {
+            x: x.saturating_add(start),
+            y,
+            text,
+            cells: captured,
+        });
+    }
+
     /// Column runs `[start, end)` to draw so the host shows this row, given it shows `previous`
     /// and must also redraw `damaged`: changed columns, widened to whole wide characters and
     /// joined across short unchanged gaps.
@@ -3309,7 +3354,8 @@ impl ShownRow {
             {
                 run_start -= 1;
             }
-            while run_end < width && (self.continuation(run_end) || previous.continuation(run_end)) {
+            while run_end < width && (self.continuation(run_end) || previous.continuation(run_end))
+            {
                 run_end += 1;
             }
             if run_start >= run_end {
@@ -3331,15 +3377,6 @@ fn render_grid_row_segment(
     start_col: u16,
     end_col: u16,
 ) -> String {
-    resolve_grid_row_segment(context, start_col, end_col).0
-}
-
-fn resolve_grid_row_segment(
-    context: GridRowRenderContext<'_>,
-    start_col: u16,
-    end_col: u16,
-) -> (String, Vec<(u16, String, CellStyle)>) {
-    let mut resolved = Vec::new();
     let mut line = String::new();
     let mut current = CellStyle::default();
     let mut emitted_cols = 0_usize;
@@ -3362,7 +3399,6 @@ fn resolve_grid_row_segment(
                 under_cell,
                 (!matches!(background, CellColor::Default)).then_some(background),
             );
-            resolved.push((col, under_cell.ch.to_string(), current));
             emitted_cols = emitted_cols.saturating_add(1);
             col = col.saturating_add(1);
             continue;
@@ -3381,7 +3417,6 @@ fn resolve_grid_row_segment(
         if let Some(cell) = cell {
             if cell.is_wide_continuation() {
                 line.push(' ');
-                resolved.push((col, " ".to_string(), style));
                 emitted_cols = emitted_cols.saturating_add(1);
                 col = col.saturating_add(1);
                 continue;
@@ -3392,7 +3427,6 @@ fn resolve_grid_row_segment(
                 cell.text()
             };
             line.push_str(text);
-            resolved.push((col, text.to_string(), style));
             emitted_cols = emitted_cols.saturating_add(UnicodeWidthStr::width(text).max(1));
             col = col.saturating_add(u16::from(cell.width()).max(1));
         } else {
@@ -3401,7 +3435,6 @@ fn resolve_grid_row_segment(
             } else {
                 1
             };
-            resolved.push((col, " ".repeat(usize::from(run_width)), style));
             line.push_str(&" ".repeat(usize::from(run_width)));
             emitted_cols = emitted_cols.saturating_add(usize::from(run_width));
             col = col.saturating_add(run_width);
@@ -3422,56 +3455,12 @@ fn resolve_grid_row_segment(
             line.push_str(&style_sgr(style));
             current = style;
         }
-        resolved.push((
-            start_col.saturating_add(u16::try_from(emitted_cols).unwrap_or(u16::MAX)),
-            " ".repeat(target_cols - emitted_cols),
-            style,
-        ));
         line.push_str(&" ".repeat(target_cols - emitted_cols));
     }
     if current != CellStyle::default() && crate::projection::encoding_terminal() {
         line.push_str("\x1b[0m");
     }
-    (line, resolved)
-}
-
-fn capture_grid_row(context: GridRowRenderContext<'_>, x: u16, y: u16, start: u16, end: u16) {
-    if !crate::projection::capturing() {
-        return;
-    }
-    let mut run: Option<(u16, u16, String, CellStyle)> = None;
-    for (col, text, style) in resolve_grid_row_segment(context, start, end).1 {
-        if let Some((_, next_col, content, current_style)) = run.as_mut()
-            && *next_col == col
-            && *current_style == style
-        {
-            content.push_str(&text);
-            *next_col = col.saturating_add(
-                u16::try_from(UnicodeWidthStr::width(text.as_str()).max(1)).unwrap_or(u16::MAX),
-            );
-            continue;
-        }
-        if let Some((start_col, _, content, current_style)) = run.take() {
-            crate::projection::record(crate::projection::PaintOperation::Text {
-                x: x.saturating_add(start_col),
-                y,
-                text: content,
-                style: cell_style_to_tui(current_style),
-            });
-        }
-        let next_col = col.saturating_add(
-            u16::try_from(UnicodeWidthStr::width(text.as_str()).max(1)).unwrap_or(u16::MAX),
-        );
-        run = Some((col, next_col, text, style));
-    }
-    if let Some((start_col, _, text, style)) = run {
-        crate::projection::record(crate::projection::PaintOperation::Text {
-            x: x.saturating_add(start_col),
-            y,
-            text,
-            style: cell_style_to_tui(style),
-        });
-    }
+    line
 }
 
 fn cell_style_to_tui(value: CellStyle) -> bmux_tui::style::Style {
@@ -5396,18 +5385,18 @@ fn build_surface_output_plan<'a>(
         }
     };
 
-    // Paint operations have no scroll, and what is written into the content before it this frame
-    // (extension output under it, cleanup of an extension that left it) would move with its rows.
+    // What is written into the content before it this frame (extension output under it, cleanup
+    // of an extension that left it) would move with its rows.
     let host_scroll = host_scroll_for_surface(
         surface.id,
         ext_rect,
         content,
         viewport,
         damage_policy.scroll_passthrough
-            && !crate::projection::capturing()
             && before_content_output_plan.damage_rects.is_empty()
             && surface_plan.after_content_cleanup.content_damage.is_empty(),
-        render_context.capabilities.left_right_margins,
+        // A captured move is presented by a terminal frame that picks how to show it.
+        render_context.capabilities.left_right_margins || !crate::projection::encoding_terminal(),
         render_extensions,
     );
 
@@ -5886,6 +5875,15 @@ fn scroll_host_rows<W: io::Write>(
     ) else {
         return Ok(0);
     };
+    crate::projection::record(crate::projection::PaintOperation::Scroll {
+        area: bmux_tui::geometry::Rect::new(
+            stage.content.x,
+            stage.content.y.saturating_add(first),
+            stage.content.w,
+            last - first + 1,
+        ),
+        rows,
+    });
     let first = stage.content.y.saturating_add(first).saturating_add(1);
     let last = stage.content.y.saturating_add(last).saturating_add(1);
     let direction = if rows > 0 { 'S' } else { 'T' };
@@ -6050,16 +6048,29 @@ fn queue_pane_content_for_surface<W: io::Write>(
                 // Cell diff against what the host shows; damage from outside the pane (a
                 // surface that left, decorations) redraws cells the copy cannot vouch for.
                 shown.resolve(context, inner_width);
-                let damaged =
-                    damaged_grid_row_ranges(grid_row, row_u16, inner_width, &effective_content_damage);
+                let damaged = damaged_grid_row_ranges(
+                    grid_row,
+                    row_u16,
+                    inner_width,
+                    &effective_content_damage,
+                );
                 let runs = shown.runs_to_draw(entry.prev_rows.get(row), damaged);
+                // Terminal bytes are built only when they are written.
+                let encoding = crate::projection::encoding_terminal();
+                let segment = |start_col: u16, end_col: u16| {
+                    if encoding {
+                        render_grid_row_segment(context, start_col, end_col)
+                    } else {
+                        String::new()
+                    }
+                };
                 let row_plan = match runs.as_slice() {
                     [] => PaneContentRowOutputPlan::cache_skip(row_u16),
                     [(0, end)] if *end >= inner_width => PaneContentRowOutputPlan::full(
                         row_u16,
                         y,
                         inner_width,
-                        render_grid_row_segment(context, 0, inner_width),
+                        segment(0, inner_width),
                     ),
                     _ => PaneContentRowOutputPlan::segments(
                         row_u16,
@@ -6068,7 +6079,7 @@ fn queue_pane_content_for_surface<W: io::Write>(
                             .map(|&(start_col, end_col)| PaneContentRowSegmentOutput {
                                 start_col,
                                 width: end_col - start_col,
-                                text: render_grid_row_segment(context, start_col, end_col),
+                                text: segment(start_col, end_col),
                             })
                             .collect(),
                     ),
@@ -6076,12 +6087,11 @@ fn queue_pane_content_for_surface<W: io::Write>(
                 if crate::projection::capturing() {
                     match &row_plan.action {
                         PaneContentRowOutputAction::Full { width, .. } => {
-                            capture_grid_row(context, stage.content.x, y, 0, *width);
+                            shown.capture(stage.content.x, y, 0, *width);
                         }
                         PaneContentRowOutputAction::Segments { segments } => {
                             for segment in segments {
-                                capture_grid_row(
-                                    context,
+                                shown.capture(
                                     stage.content.x,
                                     y,
                                     segment.start_col,
@@ -9974,7 +9984,10 @@ mod tests {
         let near = row("a\u{4e2d}>x     y              c");
         assert_eq!(near.runs_to_draw(Some(&before), Vec::new()), [(3, 10)]);
         let far = row("a\u{4e2d}>x                    z");
-        assert_eq!(far.runs_to_draw(Some(&before), Vec::new()), [(3, 4), (24, 25)]);
+        assert_eq!(
+            far.runs_to_draw(Some(&before), Vec::new()),
+            [(3, 4), (24, 25)]
+        );
     }
 
     #[test]
@@ -10359,7 +10372,7 @@ mod tests {
     }
 
     #[test]
-    fn neutral_grid_capture_groups_large_viewport_into_style_runs() {
+    fn neutral_grid_capture_records_each_row_as_one_run_of_cells() {
         let mut buffer = PaneRenderBuffer::default();
         buffer.terminal_grid.resize(600, 300).unwrap();
         for row in 1..=300 {
@@ -10372,8 +10385,9 @@ mod tests {
         let grid = buffer.terminal_grid.grid();
         let rows = grid.viewport_rows();
         let ((), operations) = crate::projection::capture_neutral(|| {
+            let mut shown = super::ShownRow::blank(0);
             for (index, row) in rows.iter().enumerate() {
-                super::capture_grid_row(
+                shown.resolve(
                     GridRowRenderContext {
                         row,
                         selection: None,
@@ -10382,20 +10396,15 @@ mod tests {
                         palette: grid.palette(),
                         before_content_cells: &under,
                     },
-                    0,
-                    u16::try_from(index).unwrap(),
-                    0,
                     600,
                 );
+                shown.capture(0, u16::try_from(index).unwrap(), 0, 600);
             }
         });
         assert_eq!(operations.len(), 300);
         assert!(operations.iter().all(|op| matches!(op,
-            crate::projection::PaintOperation::Text { text, .. } if text.len() == 600)));
-        assert!(
-            matches!(&operations[0], crate::projection::PaintOperation::Text { text, .. }
-            if text == &"x".repeat(600))
-        );
+            crate::projection::PaintOperation::Cells { text, cells, .. }
+                if text == &"x".repeat(600) && cells.len() == 600)));
     }
 
     #[test]
