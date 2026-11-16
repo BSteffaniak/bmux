@@ -34,7 +34,7 @@ image = { workspace = true, default-features = false, features = [
 
 anyhow        = { workspace = true, features = ["std"] }
 futures-util  = { workspace = true, features = ["std"] }
-tokio         = { workspace = true, features = ["time"] }
+tokio         = { workspace = true, features = ["sync", "time"] }
 tracing       = { workspace = true, features = ["std"] }
 unicode-width = { workspace = true }
 uuid          = { workspace = true, features = ["std"] }

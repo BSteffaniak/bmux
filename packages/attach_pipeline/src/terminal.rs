@@ -123,6 +123,16 @@ pub struct TerminalIo<W: Write> {
 }
 
 impl<W: Write> TerminalIo<W> {
+    /// The writer this terminal's output goes to.
+    pub const fn writer(&self) -> &W {
+        &self.writer
+    }
+
+    /// The writer this terminal's output goes to.
+    pub const fn writer_mut(&mut self) -> &mut W {
+        &mut self.writer
+    }
+
     #[must_use]
     pub const fn new(writer: W) -> Self {
         Self {

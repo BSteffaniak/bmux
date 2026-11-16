@@ -8,6 +8,7 @@ use bmux_attach_layout_protocol::{
     AttachScene, AttachSurface, AttachSurfaceKind,
 };
 use bmux_attach_pipeline::TerminalGraphicsCache;
+use bmux_attach_pipeline::host_writer::HostWriter;
 use bmux_attach_pipeline::mouse as attach_mouse;
 use bmux_attach_pipeline::reconcile::{
     apply_attach_output_chunk_with, attach_scene_damage_between,
@@ -108,6 +109,15 @@ pub trait AttachTerminal: Write {
     fn observation_only(&self) -> bool {
         false
     }
+    /// Whether the host has not yet taken all output handed to it. No new frame is rendered
+    /// meanwhile, so a slow host is shown the newest screen instead of every frame.
+    fn output_backlogged(&self) -> bool {
+        false
+    }
+    /// Notified when the host has taken all output handed to it.
+    fn output_caught_up(&self) -> Option<Arc<tokio::sync::Notify>> {
+        None
+    }
     /// Output-only drivers bypass terminal encoding and lifecycle entirely.
     fn presentation_only(&self) -> bool {
         false
@@ -193,6 +203,14 @@ trait AttachHost {
         anyhow::bail!("terminal host cannot receive native resize")
     }
     fn output(&mut self) -> Option<&mut dyn Write>;
+    /// Whether the host has not yet taken all output handed to it (see `AttachTerminal`).
+    fn output_backlogged(&self) -> bool {
+        false
+    }
+    /// Notified when the host has taken all output handed to it.
+    fn output_caught_up(&self) -> Option<Arc<tokio::sync::Notify>> {
+        None
+    }
     /// Independent observers never acquire input, focus, or viewport authority.
     fn observation_only(&self) -> bool {
         false
@@ -264,6 +282,12 @@ struct TerminalAttachHost<'a, T: AttachTerminal + ?Sized>(&'a mut T);
 impl<T: AttachTerminal + ?Sized> AttachHost for TerminalAttachHost<'_, T> {
     fn observation_only(&self) -> bool {
         self.0.observation_only()
+    }
+    fn output_backlogged(&self) -> bool {
+        self.0.output_backlogged()
+    }
+    fn output_caught_up(&self) -> Option<Arc<tokio::sync::Notify>> {
+        self.0.output_caught_up()
     }
     fn output(&mut self) -> Option<&mut dyn Write> {
         Some(&mut self.0)
@@ -1369,15 +1393,19 @@ async fn native_committed_text(
 }
 
 pub struct RealAttachTerminal {
-    terminal: bmux_attach_pipeline::terminal::TerminalIo<io::Stdout>,
+    terminal: bmux_attach_pipeline::terminal::TerminalIo<HostWriter>,
 }
 
 impl RealAttachTerminal {
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
+    /// The process's terminal, written from its own thread.
+    ///
+    /// # Errors
+    /// Returns an error when the writer thread cannot be started.
+    pub fn new() -> Result<Self> {
+        let output = HostWriter::spawn(io::stdout()).context("failed starting terminal writer")?;
+        Ok(Self {
             terminal: bmux_attach_pipeline::terminal::TerminalIo::new_with_pointer_tmux_passthrough(
-                io::stdout(),
+                output,
                 pointer_tmux_passthrough_enabled(
                     std::env::var("TMUX").ok().as_deref(),
                     std::env::var("BMUX_POINTER_SHAPE_TMUX_PASSTHROUGH")
@@ -1385,7 +1413,7 @@ impl RealAttachTerminal {
                         .as_deref(),
                 ),
             ),
-        }
+        })
     }
 }
 
@@ -1394,12 +1422,6 @@ impl RealAttachTerminal {
 /// `allow-passthrough`; BMUX never rewrites tmux configuration.
 fn pointer_tmux_passthrough_enabled(tmux: Option<&str>, opt_in: Option<&str>) -> bool {
     tmux.is_some_and(|value| !value.is_empty()) && opt_in == Some("1")
-}
-
-impl Default for RealAttachTerminal {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 impl Write for RealAttachTerminal {
@@ -1751,6 +1773,14 @@ fn headless_image_capabilities_from_env() -> bmux_image::host_caps::HostImageCap
 }
 
 impl AttachTerminal for RealAttachTerminal {
+    fn output_backlogged(&self) -> bool {
+        self.terminal.writer().backlogged()
+    }
+
+    fn output_caught_up(&self) -> Option<Arc<tokio::sync::Notify>> {
+        Some(self.terminal.writer().caught_up())
+    }
+
     fn fence_private_input(&mut self) -> Result<u64> {
         // A nested attach client has another cooperating capture boundary. Until
         // recursive producer negotiation is available, never attest on its behalf.
@@ -1829,8 +1859,14 @@ impl AttachTerminal for RealAttachTerminal {
             .terminal
             .restore()
             .context("failed restoring attach terminal modes");
+        // What follows writes to the terminal directly: everything queued goes first.
+        let drained = self
+            .terminal
+            .writer_mut()
+            .drain()
+            .context("failed writing attach output");
         let display = restore_terminal_after_attach_ui();
-        modes.and(display)
+        modes.and(drained).and(display)
     }
 
     #[cfg(any(
@@ -1839,6 +1875,8 @@ impl AttachTerminal for RealAttachTerminal {
         feature = "image-iterm2"
     ))]
     fn detect_image_capabilities(&mut self) -> bmux_image::host_caps::HostImageCapabilities {
+        // The queries are written to the terminal directly, after everything queued.
+        let _ = self.terminal.writer_mut().drain();
         let mut caps = bmux_image::host_caps::detect_with_queries();
         let (cpw, cph) = bmux_image::host_caps::query_cell_pixel_size();
         caps.cell_pixel_width = cpw;
@@ -4140,7 +4178,7 @@ pub async fn run_session_attach_with_client_observer(
     let effective_target = session.target.as_deref().or(target);
     match session.backend {
         AttachProviderBackend::Legacy(client) => {
-            let mut terminal = RealAttachTerminal::new();
+            let mut terminal = RealAttachTerminal::new()?;
             Box::pin(run_session_attach_with_terminal_config_observer(
                 client,
                 effective_target,
@@ -4198,7 +4236,7 @@ pub async fn run_session_attach_with_provider_session_config(
     let effective_target = session.target.as_deref().or(original_target);
     match session.backend {
         AttachProviderBackend::Legacy(client) => {
-            let mut terminal = RealAttachTerminal::new();
+            let mut terminal = RealAttachTerminal::new()?;
             Box::pin(run_session_attach_with_terminal_config_observer(
                 client,
                 effective_target,
@@ -4221,7 +4259,7 @@ pub async fn run_session_attach_with_provider_session_config(
                     NATIVE_CONFIG_LOADER.with(|slot| slot.replace(Some(loader))),
                 )
             });
-            let mut terminal = RealAttachTerminal::new();
+            let mut terminal = RealAttachTerminal::new()?;
             run_native_attach_session_with_terminal(provider_session, &mut terminal).await
         }
     }
@@ -5438,6 +5476,9 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
     }
 
     let mut producer_barrier_tick = tokio::time::interval(Duration::from_millis(20));
+    let output_caught_up = terminal.output_caught_up();
+    // A frame was due while the host was still taking the last one; render it when it catches up.
+    let mut render_deferred = false;
     producer_barrier_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut producer_fences = BTreeMap::<(Uuid, Uuid, u64), u64>::new();
     let mut publication_tick = tokio::time::interval(Duration::from_secs(1));
@@ -5459,6 +5500,9 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
             .values()
             .filter_map(bmux_attach_pipeline::types::PaneRenderBuffer::sync_update_deadline)
             .min();
+        // While the host is still taking the last frame, nothing new is rendered; its catching up
+        // wakes the loop to render once, against what the host then shows.
+        let output_backlogged = terminal.output_backlogged();
         let capture_deadline = if observer_capture_pending {
             view_state
                 .observer
@@ -5505,6 +5549,12 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
                 match capture_deadline {
                     Some(deadline) => tokio::time::sleep_until(deadline.into()).await,
                     None => std::future::pending().await,
+                }
+            } => {}
+            () = async {
+                match output_caught_up.as_ref() {
+                    Some(caught_up) if output_backlogged => caught_up.notified().await,
+                    _ => std::future::pending().await,
                 }
             } => {}
             // Armed only while a pane's synchronized update is open.
@@ -6135,7 +6185,7 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
         if pointer_shape != view_state.last_pointer_shape {
             view_state.dirty.mark_full_frame(AttachDirtySource::PluginCommand);
         }
-        let mut frame_needs_render = view_state.dirty.needs_render();
+        let mut frame_needs_render = view_state.dirty.needs_render() || render_deferred;
 
         let mut scene_hydrated = false;
 
@@ -6579,7 +6629,8 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
             }
         }
 
-        if !frame_needs_render {
+        render_deferred = frame_needs_render && terminal.output_backlogged();
+        if !frame_needs_render || render_deferred {
             maybe_emit_attach_perf_window(
                 &mut perf_emitter,
                 &mut client,

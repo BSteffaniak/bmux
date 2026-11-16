@@ -4,6 +4,7 @@
 
 pub mod compositor;
 pub mod cursor;
+pub mod host_writer;
 pub mod mouse;
 #[cfg(test)]
 mod pipeline_bench;
