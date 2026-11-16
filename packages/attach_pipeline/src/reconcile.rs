@@ -38,7 +38,11 @@ pub fn apply_attach_output_chunk_with(
 
     let buffer = pane_buffers.entry(pane_id).or_default();
     let had_data = apply_bytes(buffer, bytes);
-    buffer.sync_update_in_progress = meta.sync_update_active;
+    // The parser that followed these bytes knows whether they leave a synchronized update open,
+    // exactly at this point in the stream; the server's flag was read at fetch time and may
+    // already describe the application's next frame.
+    let open = buffer.protocol_tracker.synchronized_update();
+    buffer.set_sync_update(open, std::time::Instant::now());
     buffer.expected_stream_start = Some(meta.stream_end);
 
     AttachChunkApplyOutcome::Applied { had_data }

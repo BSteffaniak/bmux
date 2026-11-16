@@ -1923,20 +1923,19 @@ use crate::pane_runtime_client::{
 };
 use bmux_plugin::{RenderDamage, RenderExtensionContext, RenderExtensionLayer, RenderOp};
 
-const ATTACH_OUTPUT_BATCH_MAX_BYTES: usize = 8 * 1024;
+/// Bytes of pane output one request may return: enough for a large application frame in one
+/// round trip, well inside the IPC response budget.
+const ATTACH_OUTPUT_BATCH_MAX_BYTES: usize = 512 * 1024;
 const ATTACH_STRUCTURED_SNAPSHOT_MAX_BYTES_PER_PANE: usize = 0;
 const ATTACH_GRID_SNAPSHOT_FALLBACK_ROWS_PER_PANE: usize = 1;
 const ATTACH_GRID_DELTA_MAX_BATCHES_PER_PANE: usize = 128;
-const ATTACH_OUTPUT_DRAIN_MAX_ROUNDS: usize = 8;
+/// Requests one drain may make; with the batch size above, a drain normally takes one.
+const ATTACH_OUTPUT_DRAIN_MAX_ROUNDS: usize = 32;
 const COMMAND_OUTCOME_SELECTED_CONTEXT_ID_KEY: &str = "bmux.contexts.selected_context_id";
 const ATTACH_PLUGIN_STATUS_MESSAGE_MAX_CHARS: usize = 180;
-/// Maximum wall-clock time the drain loop may spend waiting for an in-
-/// progress output burst to complete (e.g. when the server indicates
-/// `output_still_pending` or the inner application is mid-synchronized-
-/// update).  Each IPC round-trip (~50-200 µs on a local Unix socket)
-/// naturally yields CPU time to the PTY reader thread, so no explicit
-/// sleep/yield is needed between rounds.
-const ATTACH_OUTPUT_DRAIN_TIME_BUDGET: Duration = Duration::from_millis(4);
+/// Wall-clock time one drain may spend reading output the server still has before it renders,
+/// so an application that writes without pause still gets frames drawn.
+const ATTACH_OUTPUT_DRAIN_TIME_BUDGET: Duration = Duration::from_millis(8);
 const ATTACH_OVERRENDER_MIN_FRAMES: u64 = 10;
 const ATTACH_OVERRENDER_WINDOW_RATIO_PERCENT: u64 = 20;
 const ATTACH_OVERRENDER_CACHED_SKIP_RATIO_PERCENT: u64 = 90;
@@ -5445,6 +5444,12 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
         terminal.set_attached_session_id(view_state.attached_id);
         #[cfg(test)]
         terminal.observe_scrollback(view_state.scrollback_active());
+        // A synchronized update left open too long stops holding its pane's frame back then.
+        let sync_deadline = view_state
+            .pane_buffers
+            .values()
+            .filter_map(bmux_attach_pipeline::types::PaneRenderBuffer::sync_update_deadline)
+            .min();
         let capture_deadline = if observer_capture_pending {
             view_state
                 .observer
@@ -5493,6 +5498,26 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
                     None => std::future::pending().await,
                 }
             } => {}
+            // Armed only while a pane's synchronized update is open.
+            () = async {
+                match sync_deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline.into()).await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                let now = Instant::now();
+                let expired: Vec<Uuid> = view_state
+                    .pane_buffers
+                    .iter()
+                    .filter(|(_, buffer)| buffer.sync_update_deadline().is_some_and(|at| at <= now))
+                    .map(|(pane_id, _)| *pane_id)
+                    .collect();
+                for pane_id in expired {
+                    view_state
+                        .dirty
+                        .mark_pane_dirty(pane_id, AttachDirtySource::PaneOutput);
+                }
+            }
             // Server-pushed events (layout changes, session events, pane output)
             event = client.event_receiver().recv() => {
                 let Some(server_event) = event else {
@@ -6375,19 +6400,12 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
                 .pane_images
                 .retain(|pane_id, _| active_pane_ids.contains(pane_id));
 
-            // Drain all available pane output before rendering to avoid
-            // visible tearing from partial redraws.  TUI programs like
-            // lazygit can emit 20-30 KB when switching views; with 8 KB
-            // per fetch we need a few rounds to consume the full burst.
-            //
-            // Two server-side signals tell us the burst is not yet complete:
-            //  1. `output_still_pending` — the PTY reader has flagged new
-            //     data that was not included in the batch.
-            //  2. `sync_update_active` per pane — the server's byte-by-byte
-            //     CSI parser has seen `\x1b[?2026h` but not `\x1b[?2026l`.
-            //
-            // We keep draining while either signal is active, bounded by a
-            // time budget to keep the event loop responsive.
+            // Drain the pane output the server has before rendering, so a frame is drawn
+            // whole. One request normally returns all of it; the server says whether output
+            // remains (left unread at the budget, or arrived during the read), and the loop
+            // reads until it does not, within a time budget. A pane inside a synchronized
+            // update is not polled: its next bytes wake the loop with an output event, and
+            // the renderer holds the pane's last finished frame meanwhile.
             let mut last_round_had_data = false;
             let mut drained_any_data = false;
             let mut recovered_output_desync = false;
@@ -6469,22 +6487,13 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
                 }
 
                 perf_window.record_drain_result(had_data, any_sync_active);
-                last_round_had_data = had_data;
-
-                if !had_data {
-                    // No data this round.  Check whether the burst is truly
-                    // complete before breaking out of the drain loop.
-                    if !result.output_still_pending && !any_sync_active {
-                        break; // Burst complete.
-                    }
-
-                    // More data expected — continue if within time budget.
-                    // Each IPC round-trip gives the PTY reader thread CPU
-                    // time to push pending data, so no explicit yield needed.
-                    if drain_start.elapsed() >= ATTACH_OUTPUT_DRAIN_TIME_BUDGET {
-                        perf_window.record_drain_budget_hit();
-                        break; // Safety valve.
-                    }
+                last_round_had_data = result.output_still_pending;
+                if !result.output_still_pending {
+                    break;
+                }
+                if drain_start.elapsed() >= ATTACH_OUTPUT_DRAIN_TIME_BUDGET {
+                    perf_window.record_drain_budget_hit();
+                    break;
                 }
             }
             if !recovered_output_desync && !drained_any_data {
@@ -6497,14 +6506,9 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
                 frame_needs_render |= structured_delta_applied;
             }
 
-            // Keep output pending if the last round still produced bytes OR
-            // if any pane is mid-synchronized-update so the next iteration
-            // re-enters the drain immediately.
-            let any_sync_still_active = view_state
-                .pane_buffers
-                .values()
-                .any(|b| b.sync_update_in_progress);
-            pane_output_pending = last_round_had_data || any_sync_still_active;
+            // Output the server still holds is read on the next iteration; a pane that is
+            // only mid-update waits for its next output event.
+            pane_output_pending = last_round_had_data;
             if drained_any_data
                 && !view_state.pane_scrollback.is_empty()
                 && let Err(error) =
@@ -13117,7 +13121,7 @@ async fn hydrate_attach_state_from_snapshot_mode(
     for chunk in chunks {
         if structured_hydrated.contains(&chunk.pane_id) {
             if let Some(buffer) = view_state.pane_buffers.get_mut(&chunk.pane_id) {
-                buffer.sync_update_in_progress = chunk.sync_update_active;
+                buffer.adopt_sync_update(chunk.sync_update_active, Instant::now());
                 buffer.expected_stream_start = Some(chunk.stream_end);
             }
             continue;
@@ -13137,7 +13141,7 @@ async fn hydrate_attach_state_from_snapshot_mode(
             },
         );
         if let Some(buffer) = view_state.pane_buffers.get_mut(&chunk.pane_id) {
-            buffer.sync_update_in_progress = chunk.sync_update_active;
+            buffer.adopt_sync_update(chunk.sync_update_active, Instant::now());
             buffer.expected_stream_start = Some(chunk.stream_end);
         }
     }
@@ -13195,7 +13199,7 @@ async fn hydrate_attach_revealed_panes_from_snapshot(
         }
         if structured_hydrated.contains(&chunk.pane_id) {
             if let Some(buffer) = view_state.pane_buffers.get_mut(&chunk.pane_id) {
-                buffer.sync_update_in_progress = chunk.sync_update_active;
+                buffer.adopt_sync_update(chunk.sync_update_active, Instant::now());
                 buffer.expected_stream_start = Some(chunk.stream_end);
             }
             continue;
@@ -13213,7 +13217,7 @@ async fn hydrate_attach_revealed_panes_from_snapshot(
             },
         );
         if let Some(buffer) = view_state.pane_buffers.get_mut(&chunk.pane_id) {
-            buffer.sync_update_in_progress = chunk.sync_update_active;
+            buffer.adopt_sync_update(chunk.sync_update_active, Instant::now());
             buffer.expected_stream_start = Some(chunk.stream_end);
         }
     }
@@ -22507,13 +22511,14 @@ mod tests {
             .expect("focused pane id");
 
         let mut frame_needs_render = false;
+        let opening = b"\x1b[?2026habc";
         let outcome = super::apply_attach_output_chunk(
             &mut view_state,
             pane_id,
-            b"abc",
+            opening,
             super::AttachOutputChunkMeta {
                 stream_start: 100,
-                stream_end: 103,
+                stream_end: 100 + opening.len() as u64,
                 stream_gap: false,
                 sync_update_active: true,
             },
@@ -22529,8 +22534,29 @@ mod tests {
             .pane_buffers
             .get(&pane_id)
             .expect("pane render buffer");
-        assert_eq!(buffer.expected_stream_start, Some(103));
+        assert_eq!(buffer.expected_stream_start, Some(111));
         assert!(buffer.sync_update_in_progress);
+
+        // The frame ends in the next chunk. A server flag read after the application began its
+        // next frame still says "open"; the bytes the client applied say the frame is finished.
+        let closing = b"\x1b[?2026l";
+        super::apply_attach_output_chunk(
+            &mut view_state,
+            pane_id,
+            closing,
+            super::AttachOutputChunkMeta {
+                stream_start: 111,
+                stream_end: 111 + closing.len() as u64,
+                stream_gap: false,
+                sync_update_active: true,
+            },
+            &mut frame_needs_render,
+        );
+        let buffer = view_state
+            .pane_buffers
+            .get(&pane_id)
+            .expect("pane render buffer");
+        assert!(!buffer.sync_update_in_progress);
     }
 
     #[test]

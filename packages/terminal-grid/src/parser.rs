@@ -381,6 +381,9 @@ impl TerminalGridStream {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProtocolProcessOutcome {
     pub toggled_alternate: bool,
+    /// A synchronized update (DEC mode 2026) ended in these bytes: the application finished a
+    /// frame, which can be shown now.
+    pub ended_synchronized_update: bool,
 }
 
 /// Streaming parser for terminal protocol/input hints without retaining pane cells.
@@ -388,6 +391,9 @@ pub struct TerminalProtocolTracker {
     parser: Parser,
     protocol: ProtocolState,
     alternate_screen: bool,
+    /// Inside a synchronized update (DEC mode 2026): the application has begun a frame and not
+    /// finished it. Transient presentation state, not part of [`ProtocolState`].
+    synchronized_update: bool,
     pending_bytes: Vec<u8>,
 }
 
@@ -404,6 +410,7 @@ impl TerminalProtocolTracker {
             parser: Parser::new(),
             protocol: ProtocolState::default(),
             alternate_screen: false,
+            synchronized_update: false,
             pending_bytes: Vec::new(),
         }
     }
@@ -416,6 +423,18 @@ impl TerminalProtocolTracker {
     #[must_use]
     pub const fn alternate_screen(&self) -> bool {
         self.alternate_screen
+    }
+
+    /// Whether the bytes processed so far leave a synchronized update (DEC mode 2026) open.
+    #[must_use]
+    pub const fn synchronized_update(&self) -> bool {
+        self.synchronized_update
+    }
+
+    /// Set whether a synchronized update is open, from an authoritative watermark (a snapshot
+    /// taken at a known stream offset).
+    pub const fn set_synchronized_update(&mut self, open: bool) {
+        self.synchronized_update = open;
     }
 
     /// Replace protocol state and parser continuity at an authoritative watermark.
@@ -444,17 +463,21 @@ impl TerminalProtocolTracker {
         if bytes.is_empty() {
             return ProtocolProcessOutcome {
                 toggled_alternate: false,
+                ended_synchronized_update: false,
             };
         }
         let mut performer = ProtocolPerformer {
             protocol: &mut self.protocol,
             alternate_screen: &mut self.alternate_screen,
+            synchronized_update: &mut self.synchronized_update,
             toggled_alternate: false,
+            ended_synchronized_update: false,
         };
         self.parser.advance(&mut performer, bytes);
         self.parser.write_replay_prefix(&mut self.pending_bytes);
         ProtocolProcessOutcome {
             toggled_alternate: performer.toggled_alternate,
+            ended_synchronized_update: performer.ended_synchronized_update,
         }
     }
 }
@@ -491,10 +514,19 @@ impl Perform for ParserRestore {}
 struct ProtocolPerformer<'a> {
     protocol: &'a mut ProtocolState,
     alternate_screen: &'a mut bool,
+    synchronized_update: &'a mut bool,
     toggled_alternate: bool,
+    ended_synchronized_update: bool,
 }
 
 impl ProtocolPerformer<'_> {
+    fn set_synchronized_update(&mut self, open: bool) {
+        if *self.synchronized_update && !open {
+            self.ended_synchronized_update = true;
+        }
+        *self.synchronized_update = open;
+    }
+
     fn set_alternate_screen(&mut self, enabled: bool) {
         if *self.alternate_screen != enabled {
             *self.alternate_screen = enabled;
@@ -560,6 +592,7 @@ impl Perform for ProtocolPerformer<'_> {
                 1006 => self.set_mouse_encoding(MouseProtocolEncoding::Sgr, enabled),
                 1015 => self.protocol.mouse_urxvt = enabled,
                 2004 => self.protocol.bracketed_paste = enabled,
+                2026 => self.set_synchronized_update(enabled),
                 _ => {}
             }
         }
@@ -575,6 +608,7 @@ impl Perform for ProtocolPerformer<'_> {
             b'c' => {
                 *self.protocol = ProtocolState::default();
                 self.set_alternate_screen(false);
+                self.set_synchronized_update(false);
             }
             _ => {}
         }
@@ -1030,6 +1064,25 @@ mod tests {
         );
         stream.process(b"mred");
         assert_eq!(stream.snapshot(0, 2).pending_bytes, [] as [u8; 0]);
+    }
+
+    #[test]
+    fn protocol_tracker_follows_synchronized_updates_across_chunks() {
+        let mut tracker = crate::TerminalProtocolTracker::new();
+        assert!(!tracker.synchronized_update());
+        let outcome = tracker.process(b"\x1b[?2026hframe one");
+        assert!(tracker.synchronized_update() && !outcome.ended_synchronized_update);
+        // The end arrives split across chunks.
+        assert!(!tracker.process(b"\x1b[?20").ended_synchronized_update);
+        assert!(tracker.synchronized_update());
+        let outcome = tracker.process(b"26l");
+        assert!(outcome.ended_synchronized_update && !tracker.synchronized_update());
+        // A frame ending and the next beginning in one chunk: it ended, and one is open again.
+        let outcome = tracker.process(b"\x1b[?2026hA\x1b[?2026l\x1b[?2026hB");
+        assert!(outcome.ended_synchronized_update && tracker.synchronized_update());
+        // A full reset closes it.
+        assert!(tracker.process(b"\x1bc").ended_synchronized_update);
+        assert!(!tracker.synchronized_update());
     }
 
     #[test]

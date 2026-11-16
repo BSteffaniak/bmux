@@ -283,7 +283,7 @@ impl AttachScenePipeline {
             let pane_id = chunk.pane_id;
             let buffer = self.pane_buffers.entry(pane_id).or_default();
             let _ = buffer.protocol_tracker.process(&chunk.data);
-            buffer.sync_update_in_progress = chunk.sync_update_active;
+            buffer.adopt_sync_update(chunk.sync_update_active, std::time::Instant::now());
             buffer.expected_stream_start = Some(chunk.stream_end);
             sync_protocol_hints_from_buffer(
                 &mut self.pane_mouse_protocol_hints,
@@ -378,7 +378,7 @@ impl AttachScenePipeline {
             }
             let buffer = self.pane_buffers.entry(chunk.pane_id).or_default();
             let _ = buffer.protocol_tracker.process(&chunk.data);
-            buffer.sync_update_in_progress = chunk.sync_update_active;
+            buffer.adopt_sync_update(chunk.sync_update_active, std::time::Instant::now());
             buffer.expected_stream_start = Some(chunk.stream_end);
             sync_protocol_hints_from_buffer(
                 &mut self.pane_mouse_protocol_hints,

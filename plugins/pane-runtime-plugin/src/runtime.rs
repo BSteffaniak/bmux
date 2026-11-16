@@ -1924,10 +1924,6 @@ struct PaneRuntimeHandle {
     /// event is only emitted on the `false→true` transition, coalescing
     /// thousands of per-chunk writes into ~1 event per fetch cycle.
     output_dirty: Arc<AtomicBool>,
-    /// True while the inner application is inside a DEC mode 2026
-    /// synchronized update (`\x1b[?2026h` seen, `\x1b[?2026l` not yet).
-    /// Set by the PTY reader thread via the terminal mode tracker.
-    sync_update_in_progress: Arc<AtomicBool>,
     mouse_protocol_state: Arc<std::sync::Mutex<AttachMouseProtocolState>>,
     input_mode_state: Arc<std::sync::Mutex<AttachInputModeState>>,
     padding_override: Option<PanePaddingSpec>,
@@ -4100,7 +4096,6 @@ struct PaneAttachDataRef {
     terminal_grid: Arc<std::sync::Mutex<TerminalGridStream>>,
     terminal_grid_deltas: Arc<std::sync::Mutex<TerminalGridDeltaLog>>,
     output_dirty: Arc<AtomicBool>,
-    sync_update_in_progress: Arc<AtomicBool>,
     mouse_protocol_state: Arc<std::sync::Mutex<AttachMouseProtocolState>>,
     input_mode_state: Arc<std::sync::Mutex<AttachInputModeState>>,
     #[cfg(feature = "image-registry")]
@@ -4162,7 +4157,6 @@ fn pane_attach_data_ref(
         terminal_grid: Arc::clone(&pane.terminal_grid),
         terminal_grid_deltas: Arc::clone(&pane.terminal_grid_deltas),
         output_dirty: Arc::clone(&pane.output_dirty),
-        sync_update_in_progress: Arc::clone(&pane.sync_update_in_progress),
         mouse_protocol_state: Arc::clone(&pane.mouse_protocol_state),
         input_mode_state: Arc::clone(&pane.input_mode_state),
         #[cfg(feature = "image-registry")]
@@ -4200,19 +4194,36 @@ fn attach_pane_chunk_for_client(
     client_id: ClientId,
     max_bytes: usize,
 ) -> Result<AttachPaneChunk, SessionRuntimeError> {
-    let read = pane
+    attach_pane_chunk_and_remainder_for_client(pane, client_id, max_bytes).map(|(chunk, _)| chunk)
+}
+
+/// A client's next chunk of pane output, and whether output it has not read remains buffered
+/// (the read stopped at its byte budget). The chunk says whether a synchronized update is open
+/// at its own end, not at the latest output.
+fn attach_pane_chunk_and_remainder_for_client(
+    pane: &PaneAttachDataRef,
+    client_id: ClientId,
+    max_bytes: usize,
+) -> Result<(AttachPaneChunk, bool), SessionRuntimeError> {
+    let mut output = pane
         .output_buffer
         .lock()
-        .map_err(|_| SessionRuntimeError::Closed)?
-        .read_for_client(client_id, max_bytes);
-    Ok(AttachPaneChunk {
-        pane_id: pane.pane_id,
-        data: read.bytes,
-        stream_start: read.stream_start,
-        stream_end: read.stream_end,
-        stream_gap: read.stream_gap,
-        sync_update_active: pane.sync_update_in_progress.load(Ordering::SeqCst),
-    })
+        .map_err(|_| SessionRuntimeError::Closed)?;
+    let read = output.read_for_client(client_id, max_bytes);
+    let sync_update_active = output.sync_update_open_at(read.stream_end);
+    let remainder = read.stream_end < output.end_offset();
+    drop(output);
+    Ok((
+        AttachPaneChunk {
+            pane_id: pane.pane_id,
+            data: read.bytes,
+            stream_start: read.stream_start,
+            stream_end: read.stream_end,
+            stream_gap: read.stream_gap,
+            sync_update_active,
+        },
+        remainder,
+    ))
 }
 
 fn attach_pane_recent_chunk(
@@ -4220,14 +4231,15 @@ fn attach_pane_recent_chunk(
     client_id: ClientId,
     max_bytes: usize,
 ) -> Result<AttachPaneChunk, SessionRuntimeError> {
-    let read = {
+    let (read, sync_update_active) = {
         let mut output = pane
             .output_buffer
             .lock()
             .map_err(|_| SessionRuntimeError::Closed)?;
         let read = output.read_recent_with_offsets(max_bytes);
         output.advance_client_to_end(client_id);
-        read
+        let sync_update_active = output.sync_update_open_at(read.stream_end);
+        (read, sync_update_active)
     };
     pane.output_dirty.store(false, Ordering::SeqCst);
     Ok(AttachPaneChunk {
@@ -4236,7 +4248,7 @@ fn attach_pane_recent_chunk(
         stream_start: read.stream_start,
         stream_end: read.stream_end,
         stream_gap: read.stream_gap,
-        sync_update_active: pane.sync_update_in_progress.load(Ordering::SeqCst),
+        sync_update_active,
     })
 }
 
@@ -4841,6 +4853,64 @@ impl EscSeqPhase {
     }
 }
 
+/// Where synchronized updates (DEC mode 2026) open and close in a pane's output stream, so a
+/// read can say whether the application is mid-frame exactly at the read's end, rather than
+/// whatever the reader thread saw last (which may already be the application's next frame).
+///
+/// Recognizes the sequences applications emit, `ESC [ ? 2026 h` and `ESC [ ? 2026 l`, across
+/// chunk boundaries.
+#[derive(Debug, Default)]
+struct SyncUpdateMarks {
+    /// `(offset just after the sequence, open)`, ascending.
+    marks: VecDeque<(u64, bool)>,
+    /// The state before the first retained mark.
+    base: bool,
+    /// Bytes of `ESC [ ? 2026` matched so far.
+    matched: usize,
+}
+
+impl SyncUpdateMarks {
+    const PREFIX: &'static [u8] = b"\x1b[?2026";
+
+    /// Feed one stream byte; `after` is the stream offset just after it.
+    fn scan(&mut self, byte: u8, after: u64) {
+        if self.matched == Self::PREFIX.len() {
+            self.matched = 0;
+            match byte {
+                b'h' => self.marks.push_back((after, true)),
+                b'l' => self.marks.push_back((after, false)),
+                _ => {}
+            }
+            return;
+        }
+        if byte == Self::PREFIX[self.matched] {
+            self.matched += 1;
+        } else {
+            self.matched = usize::from(byte == Self::PREFIX[0]);
+        }
+    }
+
+    /// Whether an update is open at stream `offset`.
+    fn open_at(&self, offset: u64) -> bool {
+        self.marks
+            .iter()
+            .rev()
+            .find(|(at, _)| *at <= offset)
+            .map_or(self.base, |(_, open)| *open)
+    }
+
+    /// Fold marks at or before `offset` (no longer retained) into the base state.
+    fn forget_before(&mut self, offset: u64) {
+        while let Some(&(at, open)) = self.marks.front() {
+            if at > offset {
+                break;
+            }
+            self.base = open;
+            self.marks.pop_front();
+        }
+    }
+}
+
 struct OutputFanoutBuffer {
     max_bytes: usize,
     start_offset: u64,
@@ -4849,6 +4919,8 @@ struct OutputFanoutBuffer {
     retained_output_bytes: Arc<AtomicUsize>,
     /// Running escape-sequence phase at the end of the buffer.
     esc_phase: EscSeqPhase,
+    /// Where synchronized updates (DEC mode 2026) open and close in the retained stream.
+    sync_updates: SyncUpdateMarks,
     /// Escape-sequence spans: `(esc_start, safe_resume)` pairs where
     /// `esc_start` is the offset of the ESC byte that began a sequence and
     /// `safe_resume` is the first offset after the sequence completed
@@ -4886,7 +4958,13 @@ impl OutputFanoutBuffer {
             retained_output_bytes,
             esc_phase: EscSeqPhase::Ground,
             esc_spans: VecDeque::new(),
+            sync_updates: SyncUpdateMarks::default(),
         }
+    }
+
+    /// Whether a synchronized update is open at stream `offset` (after the bytes before it).
+    fn sync_update_open_at(&self, offset: u64) -> bool {
+        self.sync_updates.open_at(offset)
     }
 
     fn end_offset(&self) -> u64 {
@@ -4938,6 +5016,7 @@ impl OutputFanoutBuffer {
         // the ESC (e.g. the `[` in CSI, the `]` in OSC) and extends to the
         // byte after the final/terminator byte.
         for (i, &byte) in chunk.iter().enumerate() {
+            self.sync_updates.scan(byte, base_offset + i as u64 + 1);
             let prev = self.esc_phase;
             self.esc_phase = prev.advance(byte);
 
@@ -5005,6 +5084,8 @@ impl OutputFanoutBuffer {
                 break;
             }
         }
+
+        self.sync_updates.forget_before(self.start_offset);
 
         // Do not mutate per-client cursors here.  `read_for_client` performs
         // clamping and reports `stream_gap` so clients can recover parser
@@ -6728,8 +6809,6 @@ impl SessionRuntimeManager {
         let output_dirty_for_reader = Arc::clone(&output_dirty);
         let last_requested_size_for_reader = Arc::clone(&last_requested_size);
         let last_requested_size_for_input = Arc::clone(&last_requested_size);
-        let sync_update_in_progress = Arc::new(AtomicBool::new(false));
-        let sync_update_for_reader = Arc::clone(&sync_update_in_progress);
         let mouse_protocol_state =
             Arc::new(std::sync::Mutex::new(AttachMouseProtocolState::default()));
         let mouse_protocol_state_for_reader = Arc::clone(&mouse_protocol_state);
@@ -7810,8 +7889,6 @@ impl SessionRuntimeManager {
                                 if let Ok(mut mode_state) = input_mode_state_for_reader.lock() {
                                     *mode_state = terminal_mode_tracker.current_input_modes();
                                 }
-                                sync_update_for_reader
-                                    .store(terminal_mode_tracker.sync_update, Ordering::SeqCst);
 
                                 let Ok(pointer_reply) = process_pane_output_with_pointer_queries(
                                     &terminal_grid_for_reader,
@@ -8285,7 +8362,6 @@ impl SessionRuntimeManager {
             last_requested_size,
             cursor_tracker,
             output_dirty,
-            sync_update_in_progress,
             mouse_protocol_state,
             input_mode_state,
             padding_override,
@@ -9446,11 +9522,12 @@ impl SessionRuntimeManager {
                 .map_err(|_| SessionRuntimeError::Closed)?;
             let read = output.read_recent_with_offsets(allowed);
             output.advance_client_to_end(client_id);
+            let sync_at_read_end = output.sync_update_open_at(read.stream_end);
             drop(output);
 
             budget_remaining = budget_remaining.saturating_sub(read.bytes.len());
             pane.output_dirty.store(false, Ordering::SeqCst);
-            let sync_update_active = pane.sync_update_in_progress.load(Ordering::SeqCst);
+            let sync_update_active = sync_at_read_end;
             chunks.push(AttachPaneChunk {
                 pane_id,
                 data: read.bytes,
@@ -9518,9 +9595,10 @@ impl SessionRuntimeManager {
                     .lock()
                     .map_err(|_| SessionRuntimeError::Closed)?;
                 let read = output.read_for_client(client_id, allowed);
+                let sync_at_read_end = output.sync_update_open_at(read.stream_end);
                 drop(output);
                 budget_remaining = budget_remaining.saturating_sub(read.bytes.len());
-                let sync_update_active = pane.sync_update_in_progress.load(Ordering::SeqCst);
+                let sync_update_active = sync_at_read_end;
                 chunks.push(AttachPaneChunk {
                     pane_id: *pane_id,
                     data: read.bytes,
@@ -9604,11 +9682,12 @@ impl SessionRuntimeManager {
                 .map_err(|_| SessionRuntimeError::Closed)?;
             let read = output.read_recent_with_offsets(allowed);
             output.advance_client_to_end(client_id);
+            let sync_at_read_end = output.sync_update_open_at(read.stream_end);
             drop(output);
 
             budget_remaining = budget_remaining.saturating_sub(read.bytes.len());
             pane.output_dirty.store(false, Ordering::SeqCst);
-            let sync_update_active = pane.sync_update_in_progress.load(Ordering::SeqCst);
+            let sync_update_active = sync_at_read_end;
             chunks.push(AttachPaneChunk {
                 pane_id: *pane_id,
                 data: read.bytes,
@@ -10833,19 +10912,24 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
         let per_pane_budget = (RESPONSE_OUTPUT_BUDGET / num_panes).min(max_bytes);
         let mut budget_remaining = RESPONSE_OUTPUT_BUDGET;
         let mut chunks = Vec::new();
+        // Output left unread because a read reached its budget is pending too, not only output
+        // that arrived during the reads.
+        let mut remainder = false;
         for pane in &panes {
             let allowed = per_pane_budget.min(budget_remaining);
-            match attach_pane_chunk_for_client(pane, client_id, allowed) {
-                Ok(chunk) => {
+            match attach_pane_chunk_and_remainder_for_client(pane, client_id, allowed) {
+                Ok((chunk, more)) => {
                     budget_remaining = budget_remaining.saturating_sub(chunk.data.len());
+                    remainder |= more;
                     chunks.push(chunk);
                 }
                 Err(err) => return (Err(err), false),
             }
         }
-        let still_pending = panes
-            .iter()
-            .any(|pane| pane.output_dirty.load(Ordering::SeqCst));
+        let still_pending = remainder
+            || panes
+                .iter()
+                .any(|pane| pane.output_dirty.load(Ordering::SeqCst));
         (Ok(chunks), still_pending)
     }
 
@@ -12004,8 +12088,9 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
         let retained_start = output.start_offset;
         let source_end = output.end_offset();
         let inner_read = output.read_for_client(client_id, budget);
+        let sync_at_read_end = output.sync_update_open_at(inner_read.stream_end);
         drop(output);
-        let sync_update_active = pane.sync_update_in_progress.load(Ordering::SeqCst);
+        let sync_update_active = sync_at_read_end;
         Some((
             bmux_pane_runtime_state::OutputRead {
                 bytes: inner_read.bytes,
@@ -16786,7 +16871,6 @@ exit 7"#
             last_requested_size: Arc::new(std::sync::Mutex::new((1, 1))),
             cursor_tracker: Arc::new(std::sync::Mutex::new(PaneCursorTracker::new(1, 1))),
             output_dirty: Arc::new(AtomicBool::new(false)),
-            sync_update_in_progress: Arc::new(AtomicBool::new(false)),
             mouse_protocol_state: Arc::new(std::sync::Mutex::new(
                 AttachMouseProtocolState::default(),
             )),
@@ -23014,6 +23098,25 @@ exit 7"#
         let next = output.read_for_client(client, 1024);
         assert!(!next.stream_gap);
         assert_eq!(next.bytes, b"next");
+    }
+
+    #[test]
+    fn reads_report_synchronized_updates_at_their_own_end() {
+        let mut buf = OutputFanoutBuffer::new(1 << 16);
+        let client = ClientId(Uuid::new_v4());
+        buf.register_client_at_tail(client);
+        // Frame one complete, frame two begun, with its opening split across chunks.
+        buf.push_chunk(b"\x1b[?2026hone\x1b[?2026l\x1b[?20");
+        buf.push_chunk(b"26htwo");
+        let first = buf.read_for_client(client, 3 + 8 + 8);
+        assert!(!buf.sync_update_open_at(first.stream_end), "frame one is complete");
+        let rest = buf.read_for_client(client, 1024);
+        assert!(buf.sync_update_open_at(rest.stream_end), "frame two is open");
+        assert!(buf.sync_update_open_at(8), "inside frame one");
+        // Evicted marks fold into the state before the retained stream.
+        let mut small = OutputFanoutBuffer::new(8);
+        small.push_chunk(b"\x1b[?2026hpadding-padding");
+        assert!(small.sync_update_open_at(small.end_offset()));
     }
 
     #[test]

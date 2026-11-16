@@ -5,6 +5,12 @@ use bmux_plugin::{
 use bmux_terminal_grid::{GridLimits, PhysicalRow, TerminalGridStream, TerminalProtocolTracker};
 use std::collections::BTreeMap;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
+/// How long a pane's synchronized update (DEC mode 2026) may hold its last finished frame on
+/// screen before what it has drawn is shown anyway, so an application that never ends one
+/// cannot freeze its pane.
+pub const SYNC_UPDATE_TIMEOUT: Duration = Duration::from_millis(150);
 use uuid::Uuid;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -240,7 +246,12 @@ pub struct PaneRenderBuffer {
         BTreeMap<(String, Uuid), Vec<crate::projection::PaintOperation>>,
     pub protocol_tracker: TerminalProtocolTracker,
     pub prev_rows: Vec<String>,
+    /// The pane's application is inside a synchronized update (DEC mode 2026) at the end of the
+    /// output applied so far: it began a frame and has not finished it.
     pub sync_update_in_progress: bool,
+    /// When the open synchronized update began; `None` when none is open, or when the flag was
+    /// set without a time (it then holds until it ends).
+    pub sync_update_since: Option<Instant>,
     pub expected_stream_start: Option<u64>,
     /// A caller-owned screen copy, independent of live geometry and history.
     pub retained_screen_copy: bool,
@@ -635,6 +646,44 @@ impl PaneRenderBuffer {
     }
 }
 
+impl PaneRenderBuffer {
+    /// Note whether a synchronized update is open after the output applied so far.
+    pub const fn set_sync_update(&mut self, open: bool, now: Instant) {
+        if open && !self.sync_update_in_progress {
+            self.sync_update_since = Some(now);
+        } else if !open {
+            self.sync_update_since = None;
+        }
+        self.sync_update_in_progress = open;
+    }
+
+    /// Adopt an authoritative synchronized-update state for a stream position (a snapshot or
+    /// hydration chunk), for both the renderer and the parser that follows the stream.
+    pub const fn adopt_sync_update(&mut self, open: bool, now: Instant) {
+        self.protocol_tracker.set_synchronized_update(open);
+        self.set_sync_update(open, now);
+    }
+
+    /// Whether the pane's last finished frame stays on screen: a synchronized update is open
+    /// and has not outlived [`SYNC_UPDATE_TIMEOUT`].
+    #[must_use]
+    pub fn sync_update_deferring(&self, now: Instant) -> bool {
+        self.sync_update_in_progress
+            && self
+                .sync_update_since
+                .is_none_or(|since| now.saturating_duration_since(since) < SYNC_UPDATE_TIMEOUT)
+    }
+
+    /// When an open synchronized update stops holding the pane's frame back.
+    #[must_use]
+    pub fn sync_update_deadline(&self) -> Option<Instant> {
+        self.sync_update_in_progress
+            .then_some(self.sync_update_since)
+            .flatten()
+            .map(|since| since + SYNC_UPDATE_TIMEOUT)
+    }
+}
+
 impl Default for PaneRenderBuffer {
     fn default() -> Self {
         Self {
@@ -644,6 +693,7 @@ impl Default for PaneRenderBuffer {
             protocol_tracker: TerminalProtocolTracker::new(),
             prev_rows: Vec::new(),
             sync_update_in_progress: false,
+            sync_update_since: None,
             expected_stream_start: None,
             extension_projection_cache: BTreeMap::new(),
             retained_screen_copy: false,
@@ -915,5 +965,30 @@ mod tests {
             Some(2)
         );
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+}
+
+#[cfg(test)]
+mod sync_update_tests {
+    use super::{PaneRenderBuffer, SYNC_UPDATE_TIMEOUT};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn an_open_update_holds_the_frame_until_it_ends_or_times_out() {
+        let start = Instant::now();
+        let mut buffer = PaneRenderBuffer::default();
+        assert!(!buffer.sync_update_deferring(start));
+        buffer.set_sync_update(true, start);
+        assert!(buffer.sync_update_deferring(start + Duration::from_millis(10)));
+        assert_eq!(buffer.sync_update_deadline(), Some(start + SYNC_UPDATE_TIMEOUT));
+        // Staying open does not restart the clock.
+        buffer.set_sync_update(true, start + Duration::from_millis(100));
+        assert!(!buffer.sync_update_deferring(start + SYNC_UPDATE_TIMEOUT));
+        buffer.set_sync_update(false, start + SYNC_UPDATE_TIMEOUT);
+        assert!(!buffer.sync_update_deferring(start + SYNC_UPDATE_TIMEOUT));
+        assert_eq!(buffer.sync_update_deadline(), None);
+        // A snapshot's state also reaches the parser that follows the stream.
+        buffer.adopt_sync_update(true, start);
+        assert!(buffer.protocol_tracker.synchronized_update());
     }
 }
