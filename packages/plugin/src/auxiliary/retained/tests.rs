@@ -95,3 +95,26 @@ fn unsafe_directories_and_symlink_images_are_rejected() {
     assert!(retain(&source, &linked_cache, "owner", &hash).is_err());
     assert!(retain(&source, Path::new("relative"), "owner", &hash).is_err());
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+fn immutable_source_retains_a_removable_image() {
+    use std::os::macos::fs::MetadataExt as _;
+    use std::os::unix::ffi::OsStrExt as _;
+    let (_root, source, cache, hash) = fixture();
+    let path = std::ffi::CString::new(source.as_os_str().as_bytes()).unwrap();
+    let set_flags = |flags| {
+        // SAFETY: `path` is a NUL-terminated path owned by this test.
+        assert_eq!(unsafe { libc::chflags(path.as_ptr(), flags) }, 0);
+    };
+    set_flags(libc::UF_IMMUTABLE);
+    let image = retain(&source, &cache, "owner", &hash);
+    set_flags(0);
+    let image = image.unwrap();
+    assert_eq!(std::fs::metadata(&image).unwrap().st_flags(), 0);
+    assert_eq!(
+        std::fs::metadata(&image).unwrap().permissions().mode() & 0o777,
+        0o500
+    );
+    assert_eq!(retain(&source, &cache, "owner", &hash).unwrap(), image);
+}

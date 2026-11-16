@@ -133,7 +133,7 @@ fn sha256_reader(mut input: impl std::io::Read) -> std::io::Result<String> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn running_executable_sha256() -> Option<String> {
+pub(crate) fn running_executable_sha256() -> Option<String> {
     // This is an explicit startup attestation, not a hash of current_exe(). The
     // application must verify its immutable bundle/manifest before activation.
     std::env::var("BMUX_MANAGED_EXECUTABLE_SHA256")

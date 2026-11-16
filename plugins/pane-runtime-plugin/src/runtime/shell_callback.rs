@@ -25,7 +25,17 @@ pub(super) fn prepare(root: &Path) -> Result<PathBuf> {
     let source = std::env::current_exe()
         .context("locate shell callback executable")?
         .canonicalize()?;
-    let hash = bmux_plugin::executable_sha256(&source).map_err(anyhow::Error::msg)?;
+    // A managed launch already attested this image's digest before activation;
+    // retention still verifies the copied bytes against it, so reuse it rather
+    // than reading the whole executable an extra time on the startup path.
+    #[cfg(not(target_os = "linux"))]
+    let attested = crate::readiness::running_executable_sha256();
+    #[cfg(target_os = "linux")]
+    let attested = None;
+    let hash = match attested {
+        Some(hash) => hash,
+        None => bmux_plugin::executable_sha256(&source).map_err(anyhow::Error::msg)?,
+    };
     let path = bmux_plugin::retain_executable(&source, &directory, "shell-callback", &hash)
         .map_err(anyhow::Error::msg)?;
     // Images outlive this manager: nested shells and recovery can still need

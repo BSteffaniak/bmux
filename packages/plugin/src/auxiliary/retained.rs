@@ -47,10 +47,7 @@ pub fn retain(source: &Path, root: &Path, owner: &str, expected: &str) -> Result
             Err(error) => return Err(error.to_string()),
         }
         let (mut input, _) = open_auxiliary_artifact(source)?;
-        let mut staging =
-            tempfile::NamedTempFile::new_in(&directory).map_err(|error| error.to_string())?;
-        // Always copy from an opened source, never hard-link mutable build output.
-        std::io::copy(&mut input, staging.as_file_mut()).map_err(|error| error.to_string())?;
+        let mut staging = stage(&mut input, &directory)?;
         verify_file(staging.as_file_mut(), expected)?;
         #[cfg(unix)]
         {
@@ -64,18 +61,23 @@ pub fn retain(source: &Path, root: &Path, owner: &str, expected: &str) -> Result
             .as_file()
             .sync_all()
             .map_err(|error| error.to_string())?;
-        match staging.persist_noclobber(&destination) {
-            Ok(_) => {}
+        // The rename keeps the staged inode verified above; only an image
+        // published concurrently by someone else still needs checking.
+        let published = match staging.persist_noclobber(&destination) {
+            Ok(_) => true,
             Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
                 // A concurrent publisher won. Never overwrite even a corrupt image.
+                false
             }
             Err(error) => return Err(error.to_string()),
-        }
+        };
         #[cfg(unix)]
         File::open(&directory)
             .and_then(|file| file.sync_all())
             .map_err(|error| error.to_string())?;
-        verify(&destination, expected)?;
+        if !published {
+            verify(&destination, expected)?;
+        }
         Ok(destination)
     })();
     result.map_err(|error: String| {
@@ -85,6 +87,46 @@ pub fn retain(source: &Path, root: &Path, owner: &str, expected: &str) -> Result
             root.display()
         )
     })
+}
+
+/// Stage a private copy of the opened source, never a hard link to mutable
+/// build output. On APFS a clone shares the source's blocks instead of
+/// rewriting and syncing a whole (possibly very large) executable.
+fn stage(input: &mut File, directory: &Path) -> Result<tempfile::NamedTempFile, String> {
+    #[cfg(target_os = "macos")]
+    if let Ok(staging) = tempfile::Builder::new().make_in(directory, |path| clone(input, path)) {
+        return Ok(staging);
+    }
+    let mut staging =
+        tempfile::NamedTempFile::new_in(directory).map_err(|error| error.to_string())?;
+    std::io::copy(input, staging.as_file_mut()).map_err(|error| error.to_string())?;
+    Ok(staging)
+}
+
+/// Clone the already-opened source (not its path) to `path`. Clones inherit
+/// file flags, so an immutable source must not yield an immutable staging file.
+#[cfg(target_os = "macos")]
+fn clone(input: &File, path: &Path) -> std::io::Result<File> {
+    use std::os::unix::{ffi::OsStrExt as _, io::AsRawFd as _};
+    let invalid = || std::io::Error::from(std::io::ErrorKind::InvalidInput);
+    let parent = File::open(path.parent().ok_or_else(invalid)?)?;
+    let name = std::ffi::CString::new(path.file_name().ok_or_else(invalid)?.as_bytes())
+        .map_err(|_| invalid())?;
+    // SAFETY: both descriptors stay open for the call and `name` is NUL-terminated.
+    if unsafe { libc::fclonefileat(input.as_raw_fd(), parent.as_raw_fd(), name.as_ptr(), 0) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let cloned = File::open(path).and_then(|file| {
+        // SAFETY: `file` is an open descriptor owned by this process.
+        if unsafe { libc::fchflags(file.as_raw_fd(), 0) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(file)
+    });
+    if cloned.is_err() {
+        let _ = std::fs::remove_file(path);
+    }
+    cloned
 }
 
 fn private_directory(path: &Path) -> Result<(), String> {
