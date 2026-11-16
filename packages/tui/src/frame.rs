@@ -73,7 +73,7 @@ pub struct Frame<'buffer> {
     selection: SelectionScene,
     semantics: SemanticScene,
     damage: Vec<Rect>,
-    scroll_hint: Option<(Rect, i64)>,
+    scroll_hints: Vec<(Rect, i64)>,
     metadata_availability: Vec<SurfaceMetadataAvailability>,
     clock: Option<crate::clock::PresentationClock>,
     written: Option<WrittenSpans>,
@@ -186,7 +186,7 @@ impl<'buffer> Frame<'buffer> {
             selection: SelectionScene::new(),
             semantics: SemanticScene::new(),
             damage: Vec::new(),
-            scroll_hint: None,
+            scroll_hints: Vec::new(),
             metadata_availability: Vec::new(),
             clock: None,
             written: None,
@@ -299,8 +299,14 @@ impl<'buffer> Frame<'buffer> {
     /// [`crate::paint::PaintCx::hint_scroll`]): terminal rows whose content
     /// moved by the signed row count relative to the previous frame.
     #[must_use]
-    pub const fn scroll_hint(&self) -> Option<(Rect, i64)> {
-        self.scroll_hint
+    pub fn scroll_hint(&self) -> Option<(Rect, i64)> {
+        self.scroll_hints.first().copied()
+    }
+
+    /// Every scroll reported while painting, largest first; no two overlap.
+    #[must_use]
+    pub fn scroll_hints(&self) -> &[(Rect, i64)] {
+        &self.scroll_hints
     }
 
     // Every mutator below is reachable only through `crate::paint::PaintCx`,
@@ -368,17 +374,27 @@ impl<'buffer> Frame<'buffer> {
         self.semantics.push(region);
     }
 
-    /// Keep the scroll hint covering the most cells.
+    /// Keep scroll hints that do not overlap, largest first: a hint overlapping others replaces
+    /// them only when it covers more cells than each of them.
     pub(crate) fn hint_scroll(&mut self, area: Rect, rows: i64) {
         let cells = |area: Rect| u32::from(area.width) * u32::from(area.height);
-        if rows != 0
-            && rows.unsigned_abs() < u64::from(area.height)
-            && self
-                .scroll_hint
-                .is_none_or(|(current, _)| cells(area) > cells(current))
-        {
-            self.scroll_hint = Some((area, rows));
+        if rows == 0 || rows.unsigned_abs() >= u64::from(area.height) {
+            return;
         }
+        let overlaps = |(other, _): &(Rect, i64)| !other.intersection(area).is_empty();
+        if self
+            .scroll_hints
+            .iter()
+            .filter(|hint| overlaps(hint))
+            .any(|(other, _)| cells(*other) >= cells(area))
+        {
+            return;
+        }
+        self.scroll_hints.retain(|hint| !overlaps(hint));
+        let at = self
+            .scroll_hints
+            .partition_point(|(other, _)| cells(*other) >= cells(area));
+        self.scroll_hints.insert(at, (area, rows));
     }
 
     pub(crate) fn push_damage(&mut self, area: Rect) {

@@ -495,7 +495,8 @@ impl<'frame, 'buffer> PaintCx<'frame, 'buffer> {
     /// lets a presenter that enables scroll-region acceleration move the
     /// terminal's existing rows instead of rewriting them; the result on
     /// screen is the same with or without it, so an inaccurate hint costs
-    /// bytes, never correctness. Of several hints in one frame, the one
+    /// bytes, never correctness. Several hints in one frame each scroll their
+    /// own area (one per pane, for example); of hints that overlap, the one
     /// covering the most cells is kept.
     pub fn hint_scroll(&mut self, area: LocalRect, rows: i64) {
         if let Some(area) = self.project_rect(area) {

@@ -73,8 +73,11 @@ pub enum ScrollRegionAcceleration {
     ///
     /// It is safe when a committed frame is retained and is not being
     /// repainted, the frame has no local grid fragments, the shift is smaller
-    /// than the region, and neither the committed nor the new frame has image
-    /// placements (graphics protocols do not scroll with text consistently).
+    /// than the region, and no image placement of the committed or the new
+    /// frame overlaps the moved cells (graphics protocols do not scroll with
+    /// text consistently). Each painted hint is scrolled on its own, so
+    /// several panes can scroll in one frame, as long as the cells they move
+    /// do not overlap.
     /// Declared [`Damage::Scroll`] must span the full presentation width. A
     /// painted scroll hint narrower than the presentation scrolls its full
     /// rows instead when that leaves fewer cells to rewrite than not
@@ -107,19 +110,19 @@ pub struct AppliedScroll {
     pub rows: i64,
 }
 
-/// Encode `prepared` as a diff against `previous` (moving rows first when
-/// `scroll` is planned), or as a full frame without a retained frame.
+/// Encode `prepared` as a diff against `previous` (moving rows first for the planned
+/// `scrolls`), or as a full frame without a retained frame. Returns the scrolls emitted.
 fn encode_frame(
     encoded: &mut Vec<u8>,
     previous: Option<&Buffer>,
     prepared: &PreparedPresentation,
     depth: TerminalColorDepth,
-    scroll: Option<AppliedScroll>,
+    scrolls: &[AppliedScroll],
     model: &mut Buffer,
-) -> io::Result<(DrawStats, Option<AppliedScroll>)> {
+) -> io::Result<(DrawStats, Vec<AppliedScroll>)> {
     let Some(previous) = previous else {
         write_ansi_frame_with_color_depth(encoded, prepared.buffer(), prepared.cursor(), depth)?;
-        return Ok((DrawStats::full(prepared.buffer().cells().len()), None));
+        return Ok((DrawStats::full(prepared.buffer().cells().len()), Vec::new()));
     };
     // A regional frame's cells equal the previous frame's outside its regions, so only the
     // regions are compared.
@@ -127,18 +130,11 @@ fn encode_frame(
         .damage()
         .is_regional()
         .then(|| prepared.damage().retained_regions());
-    let Some(scroll) = scroll else {
-        let stats = crate::ansi::write_ansi_frame_diff_within(
-            encoded,
-            previous,
-            prepared.buffer(),
-            prepared.cursor(),
-            depth,
-            scope,
-        )?;
-        return Ok((stats.into(), None));
-    };
-    let stats = crate::ansi::scroll_diff(
+    let moves: Vec<(Rect, i64)> = scrolls
+        .iter()
+        .map(|scroll| (scroll.region, scroll.rows))
+        .collect();
+    let (stats, emitted) = crate::ansi::scroll_moves_diff(
         encoded,
         crate::ansi::ScrollFrames {
             previous,
@@ -147,12 +143,17 @@ fn encode_frame(
             depth,
             scope,
         },
-        scroll.region,
-        scroll.rows,
+        &moves,
         true,
         model,
     )?;
-    Ok((stats.diff.into(), stats.scrolled.then_some(scroll)))
+    let applied = scrolls
+        .iter()
+        .zip(emitted)
+        .filter(|(_, emitted)| *emitted)
+        .map(|(scroll, _)| *scroll)
+        .collect();
+    Ok((stats.into(), applied))
 }
 
 /// A simple ANSI terminal runtime backed by an arbitrary writer.
@@ -175,7 +176,7 @@ pub struct Terminal<W> {
     color_depth: TerminalColorDepth,
     scroll_acceleration: ScrollRegionAcceleration,
     committed_damage: Damage,
-    applied_scroll: Option<AppliedScroll>,
+    applied_scrolls: Vec<AppliedScroll>,
 }
 
 impl<W: Write> Terminal<W> {
@@ -196,7 +197,7 @@ impl<W: Write> Terminal<W> {
             color_depth: TerminalColorDepth::TrueColor,
             scroll_acceleration: ScrollRegionAcceleration::Off,
             committed_damage: Damage::None,
-            applied_scroll: None,
+            applied_scrolls: Vec::new(),
         }
     }
 
@@ -216,7 +217,7 @@ impl<W: Write> Terminal<W> {
             color_depth: self.color_depth,
             scroll_acceleration: self.scroll_acceleration,
             committed_damage: self.committed_damage.clone(),
-            applied_scroll: self.applied_scroll,
+            applied_scrolls: self.applied_scrolls.clone(),
         }
     }
 
@@ -245,7 +246,7 @@ impl<W: Write> Terminal<W> {
             color_depth: self.color_depth,
             scroll_acceleration: self.scroll_acceleration,
             committed_damage: self.committed_damage.clone(),
-            applied_scroll: self.applied_scroll,
+            applied_scrolls: self.applied_scrolls.clone(),
         }
     }
 
@@ -255,7 +256,7 @@ impl<W: Write> Terminal<W> {
         self.state = staged.state;
         self.pointer_output = staged.pointer_output;
         self.committed_damage = staged.committed_damage;
-        self.applied_scroll = staged.applied_scroll;
+        self.applied_scrolls = staged.applied_scrolls;
     }
 
     /// Write raw control bytes (for example terminal capability queries)
@@ -292,10 +293,16 @@ impl<W: Write> Terminal<W> {
         &self.committed_damage
     }
 
-    /// The terminal scroll the most recent successful draw emitted, if any.
+    /// The largest terminal scroll the most recent successful draw emitted, if any.
     #[must_use]
-    pub const fn applied_scroll(&self) -> Option<AppliedScroll> {
-        self.applied_scroll
+    pub fn applied_scroll(&self) -> Option<AppliedScroll> {
+        self.applied_scrolls.first().copied()
+    }
+
+    /// Every terminal scroll the most recent successful draw emitted, largest first.
+    #[must_use]
+    pub fn applied_scrolls(&self) -> &[AppliedScroll] {
+        &self.applied_scrolls
     }
 
     /// Color depth frames are reduced to when encoded.
@@ -601,16 +608,17 @@ impl<W: Write> Terminal<W> {
         let damage = prepared
             .as_ref()
             .map_or(Damage::None, |prepared| prepared.damage().clone());
-        let scroll = prepared
+        let scrolls = prepared
             .as_ref()
-            .and_then(|prepared| self.scroll_plan(prepared));
+            .map(|prepared| self.scroll_plan(prepared))
+            .unwrap_or_default();
         let position = self.pointer_position;
         let context = &self.pointer_context;
         let pointer_output = &mut self.pointer_output;
         let capability = self.pointer_capability;
         if prepared.is_none() {
             self.committed_damage = Damage::None;
-            self.applied_scroll = None;
+            self.applied_scrolls.clear();
             let intent = resolve_pointer_intent(
                 self.state.hits(),
                 position,
@@ -631,7 +639,7 @@ impl<W: Write> Terminal<W> {
         let encoded = &mut self.encoded;
         let scroll_model = &mut self.scroll_model;
         let depth = self.color_depth;
-        let mut applied = None;
+        let mut applied = Vec::new();
         let result = self
             .state
             .present_prepared(prepared, |prepared, previous| {
@@ -662,7 +670,7 @@ impl<W: Write> Terminal<W> {
                                     previous.filter(|_| !repaint),
                                     prepared,
                                     depth,
-                                    scroll,
+                                    &scrolls,
                                     scroll_model,
                                 )?;
                                 applied = scrolled;
@@ -696,54 +704,95 @@ impl<W: Write> Terminal<W> {
             });
         if result.is_ok() {
             self.committed_damage = damage;
-            self.applied_scroll = applied;
+            self.applied_scrolls = applied;
         }
         result
     }
 
-    /// The scroll to emit for `prepared` under the selected acceleration, when
-    /// every safety condition holds (see [`ScrollRegionAcceleration::Auto`]).
-    fn scroll_plan(&self, prepared: &PreparedPresentation) -> Option<AppliedScroll> {
+    /// The scrolls to emit for `prepared` under the selected acceleration: a declared scroll,
+    /// or one per painted hint that passes every safety condition (see
+    /// [`ScrollRegionAcceleration::Auto`]), largest first, none overlapping another.
+    fn scroll_plan(&self, prepared: &PreparedPresentation) -> Vec<AppliedScroll> {
         if self.scroll_acceleration == ScrollRegionAcceleration::Off {
-            return None;
+            return Vec::new();
         }
-        let previous = self.state.retained_buffer()?;
+        let Some(previous) = self.state.retained_buffer() else {
+            return Vec::new();
+        };
         let area = prepared.buffer().area();
-        let declared = prepared.damage().scroll_shift();
-        let (region, rows) = declared.or_else(|| prepared.scroll_hint())?;
-        let safe = previous.area() == area
-            && area.intersection(region) == region
-            && prepared.grid_fragments().is_empty()
-            && rows != 0
-            && rows.unsigned_abs() < u64::from(region.height)
-            && prepared.image_scene().placements().len() == 0
-            && self.state.image_scene().placements().len() == 0;
-        if !safe {
-            return None;
+        if previous.area() != area || !prepared.grid_fragments().is_empty() {
+            return Vec::new();
         }
-        let full = Rect::new(area.x, region.y, area.width, region.height);
-        if declared.is_some() {
+        // Graphics protocols do not scroll with text consistently: nothing that moves may
+        // overlap an image, shown or about to be.
+        let images: Vec<Rect> = prepared
+            .image_scene()
+            .placements()
+            .chain(self.state.image_scene().placements())
+            .map(|placement| placement.destination.intersection(placement.clip))
+            .collect();
+        let clear = |region: Rect| {
+            images
+                .iter()
+                .all(|image| image.intersection(region).is_empty())
+        };
+        let movable = |region: Rect, rows: i64| {
+            area.intersection(region) == region
+                && rows != 0
+                && rows.unsigned_abs() < u64::from(region.height)
+                && clear(region)
+        };
+        if let Some((region, rows)) = prepared.damage().scroll_shift() {
             // Declared scroll damage keeps its contract: full-width regions only.
-            return (region == full).then_some(AppliedScroll { region, rows });
+            let full = Rect::new(area.x, region.y, area.width, region.height);
+            return (movable(region, rows) && region == full)
+                .then_some(AppliedScroll { region, rows })
+                .into_iter()
+                .collect();
         }
         // A hint is an estimate: scroll only when it leaves fewer cells to rewrite.
         let current = prepared.buffer();
-        let unscrolled = previous.band_changes(current, full, 0);
-        let mut best = (
-            previous.band_changes(current, full, rows),
-            AppliedScroll { region: full, rows },
-        );
-        if region != full
-            && self.scroll_acceleration == ScrollRegionAcceleration::AutoWithMargins
-            && previous.band_has_clean_margins(region)
-        {
-            let margins = unscrolled - previous.band_changes(current, region, 0)
-                + previous.band_changes(current, region, rows);
-            if margins < best.0 {
-                best = (margins, AppliedScroll { region, rows });
+        let mut planned: Vec<AppliedScroll> = Vec::new();
+        for &(region, rows) in prepared.scroll_hints() {
+            if !movable(region, rows) {
+                continue;
+            }
+            let free = |candidate: Rect| {
+                planned
+                    .iter()
+                    .all(|scroll| scroll.region.intersection(candidate).is_empty())
+            };
+            let full = Rect::new(area.x, region.y, area.width, region.height);
+            let unscrolled = previous.band_changes(current, full, 0);
+            let full_rows = (clear(full) && free(full)).then(|| {
+                (
+                    previous.band_changes(current, full, rows),
+                    AppliedScroll { region: full, rows },
+                )
+            });
+            let margins = (region != full
+                && self.scroll_acceleration == ScrollRegionAcceleration::AutoWithMargins
+                && free(region)
+                && previous.band_has_clean_margins(region))
+            .then(|| {
+                (
+                    unscrolled - previous.band_changes(current, region, 0)
+                        + previous.band_changes(current, region, rows),
+                    AppliedScroll { region, rows },
+                )
+            });
+            // Full rows win a tie: they need no margin mode.
+            let best = [full_rows, margins]
+                .into_iter()
+                .flatten()
+                .min_by_key(|(cells, _)| *cells);
+            if let Some((cells, scroll)) = best
+                && cells + SCROLL_MIN_SAVED_CELLS <= unscrolled
+            {
+                planned.push(scroll);
             }
         }
-        (best.0 + SCROLL_MIN_SAVED_CELLS <= unscrolled).then_some(best.1)
+        planned
     }
 
     /// Return a reference to the backend writer.

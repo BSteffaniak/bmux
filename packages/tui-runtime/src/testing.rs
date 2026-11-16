@@ -873,7 +873,7 @@ impl<'a> FrameView<'a> {
     /// Return the terminal scroll the committed frame's output used, if
     /// scroll acceleration was enabled and safe for its scroll damage.
     #[must_use]
-    pub const fn applied_scroll(&self) -> Option<AppliedScroll> {
+    pub fn applied_scroll(&self) -> Option<AppliedScroll> {
         self.terminal.applied_scroll()
     }
 

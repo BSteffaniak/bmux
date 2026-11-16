@@ -173,17 +173,23 @@ pub struct PreparedPresentation {
     projected_metadata: Option<ProjectedMetadata>,
     metadata_availability: Vec<SurfaceMetadataAvailability>,
     damage: Damage,
-    scroll_hint: Option<(Rect, i64)>,
+    scroll_hints: Vec<(Rect, i64)>,
     /// Producer occlusion geometry; visible images are already reconciled.
     occluded_regions: Vec<Rect>,
 }
 
 impl PreparedPresentation {
-    /// The scroll reported while painting this frame (see
+    /// The largest scroll reported while painting this frame (see
     /// [`crate::paint::PaintCx::hint_scroll`]), relative to the previous frame.
     #[must_use]
-    pub const fn scroll_hint(&self) -> Option<(Rect, i64)> {
-        self.scroll_hint
+    pub fn scroll_hint(&self) -> Option<(Rect, i64)> {
+        self.scroll_hints.first().copied()
+    }
+
+    /// Every scroll reported while painting this frame, largest first; no two overlap.
+    #[must_use]
+    pub fn scroll_hints(&self) -> &[(Rect, i64)] {
+        &self.scroll_hints
     }
 
     /// Exact metadata installed with this immutable output snapshot. `None` means
@@ -1195,7 +1201,7 @@ impl PresentationState {
         );
         let written;
         let metadata_availability;
-        let scroll_hint;
+        let scroll_hints;
         let (
             cursor,
             hits,
@@ -1216,7 +1222,7 @@ impl PresentationState {
             }
             PresentationPhase::Paint.measure(|| render(&mut PaintCx::new(&mut frame)), |()| true);
             written = frame.take_written();
-            scroll_hint = frame.scroll_hint();
+            scroll_hints = frame.scroll_hints().to_vec();
             let metadata = PresentationPhase::MetadataExtract.measure(
                 || {
                     // Modal transitions still replace the complete interaction tree.
@@ -1375,7 +1381,7 @@ impl PresentationState {
                     projected_metadata: None,
                     metadata_availability,
                     damage,
-                    scroll_hint,
+                    scroll_hints,
                     occluded_regions: occlusions.iter().map(|(_, area)| *area).collect(),
                 })
             },
@@ -1596,16 +1602,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn regional_frames_painted_in_place_match_blank_and_restore() {
-        let area = Rect::new(0, 0, 12, 5);
-        let mut seed = 0x2545_f491_4f6c_dd1d_u64;
-        let mut next = move |bound: u64| {
-            seed ^= seed << 13;
-            seed ^= seed >> 7;
-            seed ^= seed << 17;
-            seed % bound
-        };
+    /// Up to 13 paint operations at random places, some partly outside `area`.
+    fn random_ops(next: &mut dyn FnMut(u64) -> u64, area: Rect) -> Vec<PaintOp> {
         let symbols = ["a", "b", " ", "\u{754c}", "x"];
         let texts = [
             "hello",
@@ -1620,6 +1618,41 @@ mod tests {
             Style::new().bg(crate::style::Color::Blue),
             Style::new().add_modifier(crate::style::Modifier::BOLD),
         ];
+        let rect = |next: &mut dyn FnMut(u64) -> u64| {
+            let x = u16::try_from(next(13)).unwrap();
+            let y = u16::try_from(next(6)).unwrap();
+            let width = u16::try_from(next(9)).unwrap() + 1;
+            let height = u16::try_from(next(3)).unwrap() + 1;
+            LocalRect::terminal(Rect::new(x, y, width, height).intersection(area))
+        };
+        (0..next(14))
+            .map(|_| {
+                let symbol = symbols[usize::try_from(next(5)).unwrap()];
+                let style = styles[usize::try_from(next(4)).unwrap()];
+                let x = i32::try_from(next(13)).unwrap() - 1;
+                let y = i64::try_from(next(6)).unwrap();
+                match next(6) {
+                    0 => PaintOp::Set(x, y, symbol, style),
+                    1 => PaintOp::Replace(x, y, symbol, style),
+                    2 => PaintOp::Fill(rect(next), symbol, style),
+                    3 => PaintOp::Line(rect(next), texts[usize::try_from(next(5)).unwrap()]),
+                    4 => PaintOp::Restyle(rect(next), style),
+                    _ => PaintOp::Occlude(rect(next)),
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn regional_frames_painted_in_place_match_blank_and_restore() {
+        let area = Rect::new(0, 0, 12, 5);
+        let mut seed = 0x2545_f491_4f6c_dd1d_u64;
+        let mut next = move |bound: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % bound
+        };
         let mut state = PresentationState::new(area);
         for frame in 0..2_000 {
             let rect = |next: &mut dyn FnMut(u64) -> u64| {
@@ -1629,26 +1662,7 @@ mod tests {
                 let height = u16::try_from(next(3)).unwrap() + 1;
                 Rect::new(x, y, width, height).intersection(area)
             };
-            let local = |rect: Rect| LocalRect::terminal(rect);
-            let ops: Vec<PaintOp> = (0..next(14))
-                .map(|_| {
-                    let symbol = symbols[usize::try_from(next(5)).unwrap()];
-                    let style = styles[usize::try_from(next(4)).unwrap()];
-                    let x = i32::try_from(next(13)).unwrap() - 1;
-                    let y = i64::try_from(next(6)).unwrap();
-                    match next(6) {
-                        0 => PaintOp::Set(x, y, symbol, style),
-                        1 => PaintOp::Replace(x, y, symbol, style),
-                        2 => PaintOp::Fill(local(rect(&mut next)), symbol, style),
-                        3 => PaintOp::Line(
-                            local(rect(&mut next)),
-                            texts[usize::try_from(next(5)).unwrap()],
-                        ),
-                        4 => PaintOp::Restyle(local(rect(&mut next)), style),
-                        _ => PaintOp::Occlude(local(rect(&mut next))),
-                    }
-                })
-                .collect();
+            let ops = random_ops(&mut next, area);
             let full = frame == 0 || next(10) == 0;
             let regions: Vec<Rect> = (0..=next(3))
                 .map(|_| rect(&mut next))

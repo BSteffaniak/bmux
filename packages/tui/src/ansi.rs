@@ -373,6 +373,23 @@ pub(crate) fn scroll_diff(
     margins: bool,
     model: &mut Buffer,
 ) -> io::Result<AnsiScrollDiffStats> {
+    let (diff, moved) = scroll_moves_diff(writer, frames, &[(region, rows)], margins, model)?;
+    Ok(AnsiScrollDiffStats {
+        diff,
+        scrolled: moved.first().copied().unwrap_or(false),
+    })
+}
+
+/// [`scroll_diff`] for several moves, each of a region none of the others overlaps: the
+/// expressible ones are emitted in order, then `current` is diffed once against the model with
+/// all of them applied. Reports which moves were emitted.
+pub(crate) fn scroll_moves_diff(
+    writer: &mut impl Write,
+    frames: ScrollFrames<'_>,
+    moves: &[(crate::geometry::Rect, i64)],
+    margins: bool,
+    model: &mut Buffer,
+) -> io::Result<(AnsiFrameDiffStats, Vec<bool>)> {
     let ScrollFrames {
         previous,
         current,
@@ -381,46 +398,58 @@ pub(crate) fn scroll_diff(
         scope,
     } = frames;
     let area = current.area();
-    let full_width = region.x == area.x && region.width == area.width;
-    let expressible = previous.area() == area
-        && area.intersection(region) == region
-        && !region.is_empty()
-        && rows != 0
-        && rows.unsigned_abs() < u64::from(region.height)
-        && (full_width || (margins && previous.band_has_clean_margins(region)));
-    if !expressible {
-        return Ok(AnsiScrollDiffStats {
-            diff: write_ansi_frame_diff_within(writer, previous, current, cursor, depth, scope)?,
-            scrolled: false,
-        });
+    let full_width =
+        |region: crate::geometry::Rect| region.x == area.x && region.width == area.width;
+    let emitted: Vec<bool> = moves
+        .iter()
+        .map(|(region, rows)| {
+            previous.area() == area
+                && area.intersection(*region) == *region
+                && !region.is_empty()
+                && *rows != 0
+                && rows.unsigned_abs() < u64::from(region.height)
+                && (full_width(*region) || (margins && previous.band_has_clean_margins(*region)))
+        })
+        .collect();
+    if !emitted.contains(&true) {
+        let diff = write_ansi_frame_diff_within(writer, previous, current, cursor, depth, scope)?;
+        return Ok((diff, emitted));
     }
-    let command = if rows > 0 { 'S' } else { 'T' };
-    // Reset attributes first so the cells the terminal exposes are erased with
-    // the default background, which is what the screen model assumes.
-    if full_width {
-        write!(
-            writer,
-            "\x1b[?25l\x1b[0m\x1b[{};{}r\x1b[{}{command}\x1b[r",
-            u32::from(region.y) + 1,
-            u32::from(region.bottom()),
-            rows.unsigned_abs(),
-        )?;
-    } else {
-        write!(
-            writer,
-            "\x1b[?25l\x1b[0m\x1b[?69h\x1b[{};{}s\x1b[{};{}r\x1b[{}{command}\x1b[r\x1b[s\x1b[?69l",
-            u32::from(region.x) + 1,
-            u32::from(region.right()),
-            u32::from(region.y) + 1,
-            u32::from(region.bottom()),
-            rows.unsigned_abs(),
-        )?;
+    let applied: Vec<(crate::geometry::Rect, i64)> = moves
+        .iter()
+        .zip(&emitted)
+        .filter(|(_, emitted)| **emitted)
+        .map(|(scroll, _)| *scroll)
+        .collect();
+    for (region, rows) in &applied {
+        let command = if *rows > 0 { 'S' } else { 'T' };
+        // Reset attributes first so the cells the terminal exposes are erased with
+        // the default background, which is what the screen model assumes.
+        if full_width(*region) {
+            write!(
+                writer,
+                "\x1b[?25l\x1b[0m\x1b[{};{}r\x1b[{}{command}\x1b[r",
+                u32::from(region.y) + 1,
+                u32::from(region.bottom()),
+                rows.unsigned_abs(),
+            )?;
+        } else {
+            write!(
+                writer,
+                "\x1b[?25l\x1b[0m\x1b[?69h\x1b[{};{}s\x1b[{};{}r\x1b[{}{command}\x1b[r\x1b[s\x1b[?69l",
+                u32::from(region.x) + 1,
+                u32::from(region.right()),
+                u32::from(region.y) + 1,
+                u32::from(region.bottom()),
+                rows.unsigned_abs(),
+            )?;
+        }
     }
     // The diff reads the model only in its scope (and a wide grapheme's other half beside it),
     // so only those cells of the previous frame are copied when the scope is known.
     let scope = scope.map(|scope| {
         let mut scope = scope.to_vec();
-        scope.push(region);
+        scope.extend(applied.iter().map(|(region, _)| *region));
         scope
     });
     match scope.as_deref() {
@@ -433,11 +462,11 @@ pub(crate) fn scroll_diff(
         }
         _ => model.clone_from(previous),
     }
-    model.shift_band(region, rows);
-    Ok(AnsiScrollDiffStats {
-        diff: write_ansi_cells_diff(writer, model, current, cursor, depth, scope.as_deref())?,
-        scrolled: true,
-    })
+    for (region, rows) in &applied {
+        model.shift_band(*region, *rows);
+    }
+    let diff = write_ansi_cells_diff(writer, model, current, cursor, depth, scope.as_deref())?;
+    Ok((diff, emitted))
 }
 
 fn write_ansi_cells_diff(

@@ -628,3 +628,114 @@ fn wide_graphemes_across_a_margin_keep_rows_whole() {
     expected.feed(reference.writer());
     assert_eq!(screen.rows(), expected.rows());
 }
+
+/// Two panes side by side over the body, each showing its own lines from `left` and `right`,
+/// each reporting how far it scrolled since `previous`.
+fn paint_panes(cx: &mut PaintCx<'_, '_>, (left, right): (i64, i64), previous: Option<(i64, i64)>) {
+    let half = WIDTH / 2;
+    for (column, first, tag) in [(0, left, 'L'), (half, right, 'R')] {
+        for row in 0..i64::from(BODY.height) {
+            cx.write_line(
+                LocalRect::new(i32::from(column), row, half, 1),
+                &Line::raw(format!("{tag}{}", &list_line(first + row)[..5])),
+            );
+        }
+    }
+    cx.write_line(
+        LocalRect::new(0, i64::from(STATUS.y), WIDTH, 1),
+        &Line::raw("status"),
+    );
+    if let Some((was_left, was_right)) = previous {
+        for (column, moved) in [(0, left - was_left), (half, right - was_right)] {
+            cx.hint_scroll(
+                LocalRect::new(i32::from(column), 0, half, BODY.height),
+                moved,
+            );
+        }
+    }
+}
+
+/// Draw the panes at `before`, then at `after` (with `extra` painted over both frames),
+/// replaying the output into a screen model and a full repaint of `after` into another.
+fn replay_panes(
+    before: (i64, i64),
+    after: (i64, i64),
+    extra: impl Fn(&mut PaintCx<'_, '_>),
+) -> (Screen, Screen, Vec<AppliedScroll>) {
+    let mut terminal = terminal(ScrollRegionAcceleration::AutoWithMargins);
+    let mut screen = Screen::new(WIDTH, HEIGHT);
+    terminal
+        .draw(|cx| {
+            paint_panes(cx, before, None);
+            extra(cx);
+        })
+        .unwrap();
+    screen.feed(terminal.writer());
+    terminal.writer_mut().clear();
+    terminal
+        .draw(|cx| {
+            paint_panes(cx, after, Some(before));
+            extra(cx);
+        })
+        .unwrap();
+    screen.feed(terminal.writer());
+    let mut reference = self::terminal(ScrollRegionAcceleration::Off);
+    reference
+        .draw(|cx| {
+            paint_panes(cx, after, None);
+            extra(cx);
+        })
+        .unwrap();
+    let mut expected = Screen::new(WIDTH, HEIGHT);
+    expected.feed(reference.writer());
+    (screen, expected, terminal.applied_scrolls().to_vec())
+}
+
+#[test]
+fn panes_scrolling_by_different_amounts_each_scroll_in_one_frame() {
+    let (screen, expected, applied) = replay_panes((10, 50), (11, 48), |_| {});
+    let half = WIDTH / 2;
+    assert_eq!(
+        applied,
+        [
+            AppliedScroll {
+                region: Rect::new(0, 0, half, BODY.height),
+                rows: 1,
+            },
+            AppliedScroll {
+                region: Rect::new(half, 0, half, BODY.height),
+                rows: -2,
+            },
+        ]
+    );
+    assert_eq!(screen.rows(), expected.rows());
+}
+
+#[test]
+fn an_image_stops_only_the_scroll_it_overlaps() {
+    let half = WIDTH / 2;
+    let image = |cx: &mut PaintCx<'_, '_>| {
+        cx.push_image(ImageContribution::Present(ImagePlacement {
+            key: ImageKey::new("picture"),
+            payload: ImagePayload::Png {
+                bytes: Vec::new(),
+                width: 1,
+                height: 1,
+            },
+            destination: Rect::new(half + 1, 2, 2, 1),
+            fit: ImageFit::Contain,
+            allocation: None,
+            clip: Rect::new(half + 1, 2, 2, 1),
+            lifecycle: ImageLifecycle::Frame,
+        }));
+    };
+    let (screen, expected, applied) = replay_panes((10, 50), (11, 48), image);
+    assert_eq!(
+        applied,
+        [AppliedScroll {
+            region: Rect::new(0, 0, half, BODY.height),
+            rows: 1,
+        }]
+    );
+    assert_eq!(screen.rows(), expected.rows());
+}
