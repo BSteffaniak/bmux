@@ -104,7 +104,7 @@ pub mod prelude {
         FramedLines, LineFrame, LineFrameGeometry, LineFrameOverflow, LineFrameWidth,
     };
     pub use crate::measured_list::{MeasuredListIndex, MeasuredListItem, VisibleItemRange};
-    pub use crate::paint::{LocalRect, PaintCx};
+    pub use crate::paint::{LocalRect, PaintCx, SizedCell};
     pub use crate::pointer::{PointerIntent, PointerShape, resolve_pointer_intent};
     pub use crate::selection::{
         SelectionAffinity, SelectionAutoScrollPolicy, SelectionAutoScrollRequest, SelectionCapture,

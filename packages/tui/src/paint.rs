@@ -55,6 +55,18 @@ impl LocalRect {
     }
 }
 
+/// A grapheme to paint with [`PaintCx::replace_cells`], the columns it occupies
+/// and its style.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SizedCell<'symbol> {
+    /// One grapheme cluster.
+    pub symbol: &'symbol str,
+    /// Columns it occupies: 2 for a wide grapheme, otherwise 1.
+    pub width: u8,
+    /// Its whole style.
+    pub style: Style,
+}
+
 /// Mutable paint context carrying the effective origin, clip, and inherited style.
 pub struct PaintCx<'frame, 'buffer> {
     frame: &'frame mut Frame<'buffer>,
@@ -323,6 +335,63 @@ impl<'frame, 'buffer> PaintCx<'frame, 'buffer> {
             symbol,
             self.inherited_style.patch(style),
         );
+    }
+
+    /// Paint a row of cells from a local coordinate, each a grapheme with the
+    /// number of columns it occupies, replacing each cell's whole style as
+    /// [`Self::replace_cell`] does.
+    ///
+    /// The widths are the caller's, not recomputed: a terminal emulator's grid
+    /// already measured each grapheme, and the screen must agree with it (an
+    /// emoji with a variation selector, for example). A width of 2 makes the
+    /// next column the grapheme's continuation, so the row skips it; any other
+    /// width counts as 1. A wide grapheme cut by the clip leaves its visible
+    /// column blank in its style.
+    pub fn replace_cells<'symbol>(
+        &mut self,
+        x: i32,
+        y: i64,
+        cells: impl IntoIterator<Item = SizedCell<'symbol>>,
+    ) {
+        let Some(row) = self.project_rect(LocalRect::new(x, y, u16::MAX, 1)) else {
+            return;
+        };
+        let style = self.inherited_style;
+        let buffer = self.frame.buffer_mut(row);
+        let mut cells = cells
+            .into_iter()
+            .map(|cell| {
+                (
+                    crate::buffer::safe_symbol(cell.symbol),
+                    if cell.width == 2 { 2 } else { 1 },
+                    style.patch(cell.style),
+                )
+            })
+            .peekable();
+        let mut column = projected_unclipped_x(self.origin_x, x);
+        while let Some(&(symbol, width, cell_style)) = cells.peek() {
+            let end = column + i64::from(width);
+            if column >= i64::from(row.right()) {
+                break;
+            }
+            if column >= i64::from(row.x) && end <= i64::from(row.right()) {
+                let point = Point::new(u16::try_from(column).unwrap_or(u16::MAX), row.y);
+                // Narrow cells over narrow cells, the bulk of a terminal grid, go straight in.
+                let set = buffer.put_narrow_run(point.x, row.right(), point.y, &mut cells);
+                if set > 0 {
+                    column += i64::from(set);
+                    continue;
+                }
+                buffer.put_symbol(point, symbol, width, cell_style);
+            } else if end > i64::from(row.x) {
+                // A wide grapheme with one column clipped: blank the visible one.
+                let visible = column.max(i64::from(row.x));
+                let point = Point::new(u16::try_from(visible).unwrap_or(u16::MAX), row.y);
+                buffer.put_symbol(point, " ", 1, cell_style);
+            }
+            cells.next();
+            column = end;
+        }
     }
 
     /// Layer `style` over the cells of a local rectangle after translation and
@@ -1327,5 +1396,116 @@ mod tests {
         let mut frame = Frame::new(&mut buffer);
         PaintCx::new(&mut frame).paint_component(&Fill, Rect::new(0, 0, 0, 1));
         assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("   "));
+    }
+
+    fn sized(symbol: &str, width: u8) -> super::SizedCell<'_> {
+        super::SizedCell {
+            symbol,
+            width,
+            style: crate::style::Style::new().fg(crate::style::Color::Indexed(7)),
+        }
+    }
+
+    #[test]
+    fn replaced_cells_match_replacing_each_cell() {
+        let area = Rect::new(0, 0, 8, 1);
+        let mut rows = Buffer::empty(area);
+        let mut each = Buffer::empty(area);
+        let cells = [
+            sized("a", 1),
+            sized("\u{754c}", 2),
+            sized("b", 1),
+            sized("c", 1),
+        ];
+        {
+            let mut frame = Frame::new(&mut rows);
+            PaintCx::new(&mut frame).replace_cells(1, 0, cells);
+        }
+        {
+            let mut frame = Frame::new(&mut each);
+            let mut cx = PaintCx::new(&mut frame);
+            let mut x = 1;
+            for cell in cells {
+                cx.replace_cell(x, 0, cell.symbol, cell.style);
+                x += i32::from(cell.width);
+            }
+        }
+        assert_eq!(rows, each);
+    }
+
+    #[test]
+    fn replaced_cells_keep_the_callers_width() {
+        // A grapheme measured wide by an emulator stays wide, even where Unicode width says one.
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 4, 1));
+        {
+            let mut frame = Frame::new(&mut buffer);
+            PaintCx::new(&mut frame).replace_cells(
+                0,
+                0,
+                [sized("\u{2764}\u{fe0f}", 2), sized("x", 1)],
+            );
+        }
+        let cells = buffer.cells();
+        assert_eq!(
+            (cells[0].symbol.as_str(), cells[0].width()),
+            ("\u{2764}\u{fe0f}", 2)
+        );
+        assert!(cells[1].is_wide_continuation());
+        assert_eq!(cells[2].symbol, "x");
+    }
+
+    #[test]
+    fn replaced_cells_blank_the_visible_half_of_a_clipped_wide_grapheme() {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 6, 1));
+        {
+            let mut frame = Frame::new(&mut buffer);
+            let mut cx = PaintCx::new(&mut frame);
+            cx.with_child(1, 0, LocalRect::new(0, 0, 3, 1), |cx| {
+                cx.replace_cells(
+                    -1,
+                    0,
+                    [sized("\u{754c}", 2), sized("a", 1), sized("\u{754c}", 2)],
+                );
+            });
+        }
+        let symbols: Vec<&str> = buffer
+            .cells()
+            .iter()
+            .map(|cell| cell.symbol.as_str())
+            .collect();
+        assert_eq!(symbols, [" ", " ", "a", " ", " ", " "]);
+        assert_eq!(
+            buffer.cells()[1].style.fg,
+            Some(crate::style::Color::Indexed(7))
+        );
+        assert_eq!(
+            buffer.cells()[3].style.fg,
+            Some(crate::style::Color::Indexed(7))
+        );
+    }
+
+    #[test]
+    fn replaced_cells_stop_at_the_clip() {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 6, 1));
+        {
+            let mut frame = Frame::new(&mut buffer);
+            let mut cx = PaintCx::new(&mut frame);
+            cx.with_child(0, 0, LocalRect::new(1, 0, 3, 1), |cx| {
+                cx.replace_cells(
+                    0,
+                    0,
+                    "abcdef"
+                        .split("")
+                        .filter(|s| !s.is_empty())
+                        .map(|s| sized(s, 1)),
+                );
+            });
+        }
+        let symbols: Vec<&str> = buffer
+            .cells()
+            .iter()
+            .map(|cell| cell.symbol.as_str())
+            .collect();
+        assert_eq!(symbols, [" ", "b", "c", "d", " ", " "]);
     }
 }

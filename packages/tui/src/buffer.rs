@@ -382,8 +382,38 @@ impl Buffer {
         self.put_symbol(point, symbol, grapheme_width(symbol), style);
     }
 
+    /// Set the narrow cells of row `y`, columns `x..end`, to already sanitized narrow symbols,
+    /// one per cell, until `cells` ends or the columns do. Returns how many were set: it stops at
+    /// the first cell that is not narrow over a narrow cell, which the caller sets with
+    /// [`Self::put_symbol`], as wide-span repair needs.
+    pub(crate) fn put_narrow_run<'symbol>(
+        &mut self,
+        x: u16,
+        end: u16,
+        y: u16,
+        cells: &mut std::iter::Peekable<impl Iterator<Item = (&'symbol str, u16, Style)>>,
+    ) -> u16 {
+        let Some(start) = self.index(Point::new(x, y)) else {
+            return 0;
+        };
+        let row_end = start + usize::from(end.min(self.area.right()).saturating_sub(x));
+        let mut set = 0;
+        for cell in &mut self.cells[start..row_end] {
+            let Some(&(symbol, width, style)) = cells.peek() else {
+                break;
+            };
+            if width != 1 || cell.width != 1 || cell.wide_continuation {
+                break;
+            }
+            cell.assign(symbol, 1, style);
+            cells.next();
+            set += 1;
+        }
+        set
+    }
+
     /// Set a cell to an already sanitized symbol of known grapheme width.
-    fn put_symbol(&mut self, point: Point, symbol: &str, width: u16, style: Style) {
+    pub(crate) fn put_symbol(&mut self, point: Point, symbol: &str, width: u16, style: Style) {
         let Some(index) = self.index(point) else {
             return;
         };
@@ -781,7 +811,7 @@ fn is_safe_symbol(symbol: &str) -> bool {
     }
 }
 
-fn safe_symbol(symbol: &str) -> &str {
+pub(crate) fn safe_symbol(symbol: &str) -> &str {
     if is_safe_symbol(symbol) {
         symbol
     } else {

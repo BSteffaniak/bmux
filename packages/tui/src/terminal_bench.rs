@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use crate::damage::{Damage, DamagePolicy};
 use crate::geometry::Rect;
-use crate::paint::{LocalRect, PaintCx};
+use crate::paint::{LocalRect, PaintCx, SizedCell};
 use crate::presentation::with_presentation_observer;
 use crate::style::{Color, Modifier, Style};
 use crate::terminal::{ScrollRegionAcceleration, Terminal};
@@ -53,8 +53,14 @@ fn line_cells(line: u64, width: u16) -> Vec<(char, Style)> {
 const LINES: usize = 4096;
 
 thread_local! {
-    static CONTENT: Vec<Vec<(char, Style)>> =
-        (0..LINES).map(|line| line_cells(line as u64, WIDTH)).collect();
+    static CONTENT: Vec<Vec<(String, Style)>> = (0..LINES)
+        .map(|line| {
+            line_cells(line as u64, WIDTH)
+                .into_iter()
+                .map(|(ch, style)| (ch.to_string(), style))
+                .collect()
+        })
+        .collect();
 }
 
 /// A pane: a rect on screen showing lines `top..top + height` of its content.
@@ -66,15 +72,19 @@ struct Pane {
 impl Pane {
     fn paint(&self, cx: &mut PaintCx<'_, '_>) {
         CONTENT.with(|content| {
-            let mut symbol = [0_u8; 4];
             for row in 0..self.rect.height {
                 let line = usize::try_from((self.top + u64::from(row)) % LINES as u64).unwrap_or(0);
                 let cells = &content[line][..usize::from(self.rect.width)];
                 let y = i64::from(self.rect.y + row);
-                for (column, (ch, style)) in cells.iter().enumerate() {
-                    let x = i32::from(self.rect.x) + i32::try_from(column).unwrap_or(i32::MAX);
-                    cx.replace_cell(x, y, ch.encode_utf8(&mut symbol), *style);
-                }
+                cx.replace_cells(
+                    i32::from(self.rect.x),
+                    y,
+                    cells.iter().map(|(symbol, style)| SizedCell {
+                        symbol,
+                        width: 1,
+                        style: *style,
+                    }),
+                );
             }
         });
     }
