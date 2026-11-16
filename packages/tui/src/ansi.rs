@@ -133,7 +133,7 @@ pub fn write_ansi_inline_frame_diff_with_color_depth(
     let mut style = Style::new();
     let mut started = false;
     for y in area.y..area.bottom() {
-        if let Some((start, end)) = changed_row_suffix(previous, current, y) {
+        if let Some((start, end)) = changed_row_suffix(previous, current, y, area.x..area.right()) {
             if !started {
                 write_ansi_style(writer, style, depth)?;
                 started = true;
@@ -206,7 +206,47 @@ pub fn write_ansi_frame_diff_with_color_depth(
         });
     }
 
-    write_ansi_cells_diff(writer, previous, current, cursor, depth)
+    write_ansi_cells_diff(writer, previous, current, cursor, depth, None)
+}
+
+/// Write only changed cells like [`write_ansi_frame_diff_with_color_depth`], comparing only the
+/// cells of `scope`: every cell outside it must be equal in `previous` and `current`.
+pub(crate) fn write_ansi_frame_diff_within(
+    writer: &mut impl Write,
+    previous: &Buffer,
+    current: &Buffer,
+    cursor: Option<Cursor>,
+    depth: TerminalColorDepth,
+    scope: Option<&[crate::geometry::Rect]>,
+) -> io::Result<AnsiFrameDiffStats> {
+    if previous.area() != current.area() {
+        return write_ansi_frame_diff_with_color_depth(writer, previous, current, cursor, depth);
+    }
+    write_ansi_cells_diff(writer, previous, current, cursor, depth, scope)
+}
+
+/// The columns of each row of `area` inside any of `regions`, widened by `widen` columns each
+/// side, as one `start..end` span per row (empty when `start >= end`).
+fn row_spans(
+    area: crate::geometry::Rect,
+    regions: &[crate::geometry::Rect],
+    widen: u16,
+) -> Vec<(u16, u16)> {
+    let mut rows = vec![(u16::MAX, 0); usize::from(area.height)];
+    for region in regions {
+        let region = region.intersection(area);
+        if region.is_empty() {
+            continue;
+        }
+        let start = region.x.saturating_sub(widen).max(area.x);
+        let end = region.right().saturating_add(widen).min(area.right());
+        for y in region.y..region.bottom() {
+            let row = &mut rows[usize::from(y - area.y)];
+            row.0 = row.0.min(start);
+            row.1 = row.1.max(end);
+        }
+    }
+    rows
 }
 
 /// Outcome of [`write_ansi_frame_scroll_diff_with_color_depth`].
@@ -254,6 +294,7 @@ pub fn write_ansi_frame_scroll_diff_with_color_depth(
             current,
             cursor,
             depth,
+            scope: None,
         },
         region,
         rows,
@@ -298,6 +339,7 @@ pub fn write_ansi_frame_margin_scroll_diff_with_color_depth(
             current,
             cursor,
             depth,
+            scope: None,
         },
         region,
         rows,
@@ -313,6 +355,9 @@ pub(crate) struct ScrollFrames<'a> {
     pub(crate) current: &'a Buffer,
     pub(crate) cursor: Option<Cursor>,
     pub(crate) depth: TerminalColorDepth,
+    /// The only cells that may differ between `previous` and `current` (`None`: any), so the
+    /// only ones compared, with the scrolled region.
+    pub(crate) scope: Option<&'a [crate::geometry::Rect]>,
 }
 
 /// Move the terminal's cells of `region` by `rows` (full rows, or inside left/right margins
@@ -333,6 +378,7 @@ pub(crate) fn scroll_diff(
         current,
         cursor,
         depth,
+        scope,
     } = frames;
     let area = current.area();
     let full_width = region.x == area.x && region.width == area.width;
@@ -344,7 +390,7 @@ pub(crate) fn scroll_diff(
         && (full_width || (margins && previous.band_has_clean_margins(region)));
     if !expressible {
         return Ok(AnsiScrollDiffStats {
-            diff: write_ansi_frame_diff_with_color_depth(writer, previous, current, cursor, depth)?,
+            diff: write_ansi_frame_diff_within(writer, previous, current, cursor, depth, scope)?,
             scrolled: false,
         });
     }
@@ -370,10 +416,26 @@ pub(crate) fn scroll_diff(
             rows.unsigned_abs(),
         )?;
     }
-    model.clone_from(previous);
+    // The diff reads the model only in its scope (and a wide grapheme's other half beside it),
+    // so only those cells of the previous frame are copied when the scope is known.
+    let scope = scope.map(|scope| {
+        let mut scope = scope.to_vec();
+        scope.push(region);
+        scope
+    });
+    match scope.as_deref() {
+        Some(scope) if model.area() == area => {
+            for ((start, end), y) in row_spans(area, scope, 2).into_iter().zip(area.y..) {
+                if start < end {
+                    model.copy_span_from(previous, y, start..end);
+                }
+            }
+        }
+        _ => model.clone_from(previous),
+    }
     model.shift_band(region, rows);
     Ok(AnsiScrollDiffStats {
-        diff: write_ansi_cells_diff(writer, model, current, cursor, depth)?,
+        diff: write_ansi_cells_diff(writer, model, current, cursor, depth, scope.as_deref())?,
         scrolled: true,
     })
 }
@@ -384,13 +446,22 @@ fn write_ansi_cells_diff(
     current: &Buffer,
     cursor: Option<Cursor>,
     depth: TerminalColorDepth,
+    scope: Option<&[crate::geometry::Rect]>,
 ) -> io::Result<AnsiFrameDiffStats> {
     let area = current.area();
     let mut active_style = Style::new();
     let mut changed_cells = 0usize;
+    let spans = scope.map(|scope| row_spans(area, scope, 0));
     write!(writer, "\x1b[?25l")?;
     for y in area.y..area.bottom() {
-        if let Some((start, end)) = changed_row_suffix(previous, current, y) {
+        let columns = spans.as_ref().map_or_else(
+            || area.x..area.right(),
+            |spans| {
+                let (start, end) = spans[usize::from(y - area.y)];
+                start..end.max(start)
+            },
+        );
+        if let Some((start, end)) = changed_row_suffix(previous, current, y, columns) {
             changed_cells = changed_cells.saturating_add(emit_sparse_row_span(
                 writer,
                 previous,
@@ -479,14 +550,26 @@ fn emit_sparse_row_span(
     Ok(written + usize::from(span.end - start))
 }
 
-fn changed_row_suffix(previous: &Buffer, current: &Buffer, y: u16) -> Option<(u16, u16)> {
+fn changed_row_suffix(
+    previous: &Buffer,
+    current: &Buffer,
+    y: u16,
+    columns: std::ops::Range<u16>,
+) -> Option<(u16, u16)> {
     let area = current.area();
-    let mut changed = (area.x..area.right()).filter(|x| {
-        let point = Point::new(*x, y);
-        previous.get(point) != current.get(point)
-    });
-    let first_changed = changed.next()?;
-    let last_changed = changed.next_back().unwrap_or(first_changed);
+    if columns.is_empty() {
+        return None;
+    }
+    let row = usize::from(y - area.y) * usize::from(area.width);
+    let start = row + usize::from(columns.start - area.x);
+    let end = row + usize::from(columns.end - area.x);
+    let old = previous.cells().get(start..end)?;
+    let new = current.cells().get(start..end)?;
+    let first = old.iter().zip(new).position(|(old, new)| old != new)?;
+    let last = old.iter().zip(new).rposition(|(old, new)| old != new)?;
+    let column = |offset: usize| columns.start + u16::try_from(offset).unwrap_or(u16::MAX);
+    let first_changed = column(first);
+    let last_changed = column(last);
     let mut start = first_changed;
     let mut end = last_changed.saturating_add(1).min(area.right());
     for buffer in [previous, current] {
@@ -1056,7 +1139,12 @@ mod tests {
         let mut wire = Vec::new();
         let mut style = Style::new();
         for y in current.area().y..current.area().bottom() {
-            if let Some((start, end)) = super::changed_row_suffix(previous, current, y) {
+            if let Some((start, end)) = super::changed_row_suffix(
+                previous,
+                current,
+                y,
+                current.area().x..current.area().right(),
+            ) {
                 super::emit_row_span(
                     &mut wire,
                     current,

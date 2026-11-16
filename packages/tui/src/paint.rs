@@ -305,7 +305,7 @@ impl<'frame, 'buffer> PaintCx<'frame, 'buffer> {
         let Some(area) = self.project_rect(LocalRect::new(x, y, 1, 1)) else {
             return;
         };
-        self.frame.buffer_mut().overlay_cell(
+        self.frame.buffer_mut(area).overlay_cell(
             Point::new(area.x, area.y),
             symbol,
             self.inherited_style.patch(style),
@@ -318,7 +318,7 @@ impl<'frame, 'buffer> PaintCx<'frame, 'buffer> {
         let Some(area) = self.project_rect(LocalRect::new(x, y, 1, 1)) else {
             return;
         };
-        self.frame.buffer_mut().set_cell(
+        self.frame.buffer_mut(area).set_cell(
             Point::new(area.x, area.y),
             symbol,
             self.inherited_style.patch(style),
@@ -333,7 +333,7 @@ impl<'frame, 'buffer> PaintCx<'frame, 'buffer> {
         let Some(area) = self.project_rect(area) else {
             return;
         };
-        let buffer = self.frame.buffer_mut();
+        let buffer = self.frame.buffer_mut(area);
         for y in area.y..area.bottom() {
             for x in area.x..area.right() {
                 if let Some(cell) = buffer.get_mut(Point::new(x, y)) {
@@ -370,9 +370,11 @@ impl<'frame, 'buffer> PaintCx<'frame, 'buffer> {
         )
         .unwrap_or(usize::MAX);
         let line = visible_line(line, left_clip, usize::from(projected.width));
-        self.frame
-            .buffer_mut()
-            .overlay_line_with_fallback(projected, &line, self.inherited_style);
+        self.frame.buffer_mut(projected).overlay_line_with_fallback(
+            projected,
+            &line,
+            self.inherited_style,
+        );
     }
 
     /// Fill `area` with the supplied style (replacing what was there), then

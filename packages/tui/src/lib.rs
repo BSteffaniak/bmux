@@ -46,6 +46,8 @@ pub mod sensitive_input;
 pub mod source_map;
 pub mod style;
 pub mod terminal;
+#[cfg(test)]
+mod terminal_bench;
 #[cfg(feature = "terminal-io")]
 pub mod terminal_io;
 pub mod text;

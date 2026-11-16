@@ -310,6 +310,69 @@ impl Buffer {
         }
     }
 
+    /// Copy the cells of `regions` from `source`, which must have this buffer's area.
+    pub(crate) fn copy_regions_from(&mut self, source: &Self, regions: &[Rect]) {
+        debug_assert_eq!(self.area, source.area);
+        for region in regions {
+            let region = region.intersection(self.area);
+            for y in region.y..region.bottom() {
+                self.copy_span_from(source, y, region.x..region.right());
+            }
+        }
+    }
+
+    /// Copy row `y`, columns `columns`, from `source`, which must have this buffer's area.
+    pub(crate) fn copy_span_from(&mut self, source: &Self, y: u16, columns: std::ops::Range<u16>) {
+        let (Some(start), Some(_)) = (
+            self.index(Point::new(columns.start, y)),
+            self.index(Point::new(columns.end.saturating_sub(1), y)),
+        ) else {
+            return;
+        };
+        let end = start + usize::from(columns.end - columns.start);
+        for (destination, source) in self.cells[start..end]
+            .iter_mut()
+            .zip(&source.cells[start..end])
+        {
+            destination.clone_from(source);
+        }
+    }
+
+    /// Restore from `retained` the cells of row `y`, columns `columns`, that lie outside every
+    /// one of `regions`.
+    pub(crate) fn restore_span_outside(
+        &mut self,
+        retained: &Self,
+        y: u16,
+        columns: std::ops::Range<u16>,
+        regions: &[Rect],
+    ) {
+        let on_row = |region: &&Rect| region.y <= y && y < region.bottom();
+        let mut x = columns.start;
+        while x < columns.end {
+            if let Some(end) = regions
+                .iter()
+                .filter(on_row)
+                .filter(|region| region.x <= x && x < region.right())
+                .map(|region| region.right())
+                .max()
+            {
+                x = end;
+                continue;
+            }
+            let stop = regions
+                .iter()
+                .filter(on_row)
+                .filter(|region| region.x > x)
+                .map(|region| region.x)
+                .min()
+                .unwrap_or(columns.end)
+                .min(columns.end);
+            self.copy_span_from(retained, y, x..stop);
+            x = stop;
+        }
+    }
+
     /// Set a standalone cell if the point is inside this buffer.
     ///
     /// Existing wide spans touching the destination are cleared first. Width-two graphemes are

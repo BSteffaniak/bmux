@@ -15,7 +15,7 @@ pub mod portable;
 use crate::buffer::Buffer;
 use crate::damage::Damage;
 use crate::focus::{FocusScopeId, FocusTrap, ModalFocus, modal_transition};
-use crate::frame::{Cursor, Frame, SurfaceMetadataAvailability};
+use crate::frame::{Cursor, Frame, SurfaceMetadataAvailability, WrittenSpans};
 use crate::geometry::Rect;
 use crate::hit::HitMap;
 use crate::image::{ImageContribution, ImageKey, ImagePayload};
@@ -23,6 +23,7 @@ use crate::image_scene::{ImageScene, ImageSceneDelta};
 use crate::paint::PaintCx;
 use crate::selection::SelectionScene;
 use crate::semantic::SemanticScene;
+use crate::style::Style;
 
 /// Fixed diagnostic boundaries.
 ///
@@ -769,8 +770,15 @@ impl<E: std::error::Error + 'static> std::error::Error for PresentationError<E> 
 /// A retired cell grid kept for the next preparation to repaint in place, so
 /// steady-state frames allocate no cells. Clones start empty: the spare is a
 /// cache, not state.
+///
+/// A spare retired by a regional frame also records the regions where it may differ from the
+/// cells that frame committed, so the next regional frame brings it up to date by copying those
+/// regions instead of every cell.
 #[derive(Debug, Default)]
-struct SpareBuffer(std::sync::Mutex<Option<Buffer>>);
+struct SpareBuffer(std::sync::Mutex<Option<Spare>>);
+
+/// A spare grid and where it may differ from the committed cells (`None`: anywhere).
+type Spare = (Buffer, Option<Vec<Rect>>);
 
 impl Clone for SpareBuffer {
     fn clone(&self) -> Self {
@@ -779,7 +787,7 @@ impl Clone for SpareBuffer {
 }
 
 impl SpareBuffer {
-    fn take(&self) -> Option<Buffer> {
+    fn take(&self) -> Option<Spare> {
         self.0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -787,10 +795,14 @@ impl SpareBuffer {
     }
 
     fn put(&self, buffer: Buffer) {
+        self.put_spare((buffer, None));
+    }
+
+    fn put_spare(&self, spare: Spare) {
         *self
             .0
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(buffer);
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(spare);
     }
 }
 
@@ -884,7 +896,7 @@ impl PresentationState {
             ..self.clone()
         };
         if let Some(spare) = spare {
-            staged.spare.put(spare);
+            staged.spare.put_spare(spare);
         }
         staged
     }
@@ -1091,11 +1103,15 @@ impl PresentationState {
     }
 
     /// Repair unchanged cells and expand regional damage to complete wide spans.
+    ///
+    /// With `written`, the buffer began as the retained cells and only the written spans can
+    /// differ from them outside the regions, so only those are restored.
     fn restore_retained_cells(
         &self,
         buffer: &mut Buffer,
         damage: Damage,
         regions: &[Rect],
+        written: Option<&WrittenSpans>,
     ) -> Damage {
         let previous = self.previous.as_ref().filter(|_| damage.is_regional());
         let retained_regions = previous.map_or_else(
@@ -1103,7 +1119,14 @@ impl PresentationState {
             |previous| buffer.expand_regions_to_cell_spans(previous, regions),
         );
         if let Some(previous) = previous {
-            buffer.restore_outside(previous, &retained_regions);
+            match written {
+                Some(written) => {
+                    for (y, columns) in written.spans() {
+                        buffer.restore_span_outside(previous, y, columns, &retained_regions);
+                    }
+                }
+                None => buffer.restore_outside(previous, &retained_regions),
+            }
         }
         buffer.debug_assert_valid_wide_spans();
         damage.with_regions(retained_regions)
@@ -1136,16 +1159,32 @@ impl PresentationState {
             return None;
         }
         let mut requested_regions = damage.retained_regions().to_vec();
+        // A regional frame starts from the committed cells with its regions blanked, which is
+        // what painting a blank frame and restoring everything outside the regions produces,
+        // at the cost of the regions instead of the screen.
+        // Modal scopes turn the frame into a full one after painting, which must start blank.
+        let in_place = (!repair && damage.is_regional() && self.modal_focus.is_empty())
+            .then_some(self.previous.as_ref())
+            .flatten();
         let mut buffer = PresentationPhase::BufferAlloc.measure(
             || {
                 let spare = self.spare.take();
-                match (repair.then_some(self.previous.as_ref()).flatten(), spare) {
-                    (Some(previous), Some(mut spare)) => {
+                match (
+                    in_place.or_else(|| repair.then_some(self.previous.as_ref()).flatten()),
+                    spare,
+                ) {
+                    (Some(previous), Some((mut spare, Some(stale))))
+                        if in_place.is_some() && spare.area() == previous.area() =>
+                    {
+                        spare.copy_regions_from(previous, &stale);
+                        spare
+                    }
+                    (Some(previous), Some((mut spare, _))) => {
                         spare.clone_from(previous);
                         spare
                     }
                     (Some(previous), None) => previous.clone(),
-                    (None, Some(mut spare)) => {
+                    (None, Some((mut spare, _))) => {
                         spare.reset(self.area);
                         spare
                     }
@@ -1154,6 +1193,7 @@ impl PresentationState {
             },
             |_| true,
         );
+        let written;
         let metadata_availability;
         let scroll_hint;
         let (
@@ -1168,7 +1208,14 @@ impl PresentationState {
         ) = {
             let mut frame = Frame::new(&mut buffer);
             frame.set_clock(self.clock);
+            if in_place.is_some() {
+                frame.track_writes();
+                for region in &requested_regions {
+                    frame.fill(*region, " ", Style::new());
+                }
+            }
             PresentationPhase::Paint.measure(|| render(&mut PaintCx::new(&mut frame)), |()| true);
+            written = frame.take_written();
             scroll_hint = frame.scroll_hint();
             let metadata = PresentationPhase::MetadataExtract.measure(
                 || {
@@ -1280,7 +1327,14 @@ impl PresentationState {
             )
         };
         let damage = PresentationPhase::RetainedCellRepair.measure(
-            || self.restore_retained_cells(&mut buffer, damage, &requested_regions),
+            || {
+                self.restore_retained_cells(
+                    &mut buffer,
+                    damage,
+                    &requested_regions,
+                    written.as_ref(),
+                )
+            },
             |_| true,
         );
         let mut image_scene =
@@ -1419,8 +1473,14 @@ impl PresentationState {
         PresentationPhase::TerminalCommit.measure(
             || {
                 self.grid_fragments = prepared.grid_fragments;
+                // A regional frame changed only its regions, so the retired cells differ from
+                // the new ones only there.
+                let changed = prepared
+                    .damage
+                    .is_regional()
+                    .then(|| prepared.damage.retained_regions().to_vec());
                 if let Some(retired) = self.previous.replace(prepared.buffer) {
-                    self.spare.put(retired);
+                    self.spare.put_spare((retired, changed));
                 }
                 self.hits = prepared.hits;
                 self.focus = prepared.focus;
@@ -1449,6 +1509,206 @@ mod tests {
     use crate::hit::HitRegion;
     use crate::paint::LocalRect;
     use crate::style::Style;
+
+    /// A paint operation of the in-place equivalence test.
+    #[derive(Clone, Debug)]
+    enum PaintOp {
+        Set(i32, i64, &'static str, Style),
+        Replace(i32, i64, &'static str, Style),
+        Fill(LocalRect, &'static str, Style),
+        Line(LocalRect, &'static str),
+        Restyle(LocalRect, Style),
+        Occlude(LocalRect),
+    }
+
+    fn apply_ops(cx: &mut PaintCx<'_, '_>, ops: &[PaintOp]) {
+        for op in ops {
+            match op.clone() {
+                PaintOp::Set(x, y, symbol, style) => cx.set_cell(x, y, symbol, style),
+                PaintOp::Replace(x, y, symbol, style) => cx.replace_cell(x, y, symbol, style),
+                PaintOp::Fill(area, symbol, style) => cx.fill(area, symbol, style),
+                PaintOp::Line(area, text) => cx.write_line(area, &crate::text::Line::raw(text)),
+                PaintOp::Restyle(area, style) => cx.restyle(area, style),
+                PaintOp::Occlude(area) => cx.occlude(area),
+            }
+        }
+    }
+
+    /// A regional frame computed over the whole screen, without written spans or a recycled
+    /// spare: `canvas` (blank, or the previous cells with the requested regions blanked) is
+    /// painted, and every cell outside the requested, occluded and wide-span-expanded regions is
+    /// restored. Returns the frame and the regions that only wide-span expansion added.
+    fn restore_outside_regions(
+        previous: &Buffer,
+        mut canvas: Buffer,
+        regions: &[Rect],
+        ops: &[PaintOp],
+    ) -> (Buffer, Vec<Rect>) {
+        let mut regions = regions.to_vec();
+        {
+            let mut frame = Frame::new(&mut canvas);
+            apply_ops(&mut PaintCx::new(&mut frame), ops);
+            for (_, area) in frame.occlusions() {
+                if !regions.contains(area) {
+                    regions.push(*area);
+                }
+            }
+        }
+        let expanded = canvas.expand_regions_to_cell_spans(previous, &regions);
+        canvas.restore_outside(previous, &expanded);
+        let added = expanded
+            .iter()
+            .flat_map(|expanded| {
+                regions.iter().fold(vec![*expanded], |pieces, region| {
+                    pieces
+                        .into_iter()
+                        .flat_map(|piece| crate::image_scene::subtract_rect(piece, *region))
+                        .collect()
+                })
+            })
+            .collect();
+        (canvas, added)
+    }
+
+    /// The frame `ops` should produce over `previous`, painted over the previous cells with the
+    /// requested regions blanked; the regions where that may differ from painting over a blank
+    /// screen (where wide-span expansion widened past what was requested, which a blank screen
+    /// erased even where nothing was painted); and that blank-screen frame, for regional damage.
+    fn expected_frames(
+        damage: &Damage,
+        previous: Option<&Buffer>,
+        area: Rect,
+        ops: &[PaintOp],
+    ) -> (Buffer, Vec<Rect>, Option<Buffer>) {
+        if let (Damage::Regions(regions), Some(previous)) = (damage, previous) {
+            let mut canvas = previous.clone();
+            for region in regions {
+                canvas.fill(*region, " ", Style::new());
+            }
+            let (expected, widened) = restore_outside_regions(previous, canvas, regions, ops);
+            let (blank_screen, _) =
+                restore_outside_regions(previous, Buffer::empty(area), regions, ops);
+            (expected, widened, Some(blank_screen))
+        } else {
+            let mut buffer = Buffer::empty(area);
+            apply_ops(&mut PaintCx::new(&mut Frame::new(&mut buffer)), ops);
+            (buffer, Vec::new(), None)
+        }
+    }
+
+    #[test]
+    fn regional_frames_painted_in_place_match_blank_and_restore() {
+        let area = Rect::new(0, 0, 12, 5);
+        let mut seed = 0x2545_f491_4f6c_dd1d_u64;
+        let mut next = move |bound: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % bound
+        };
+        let symbols = ["a", "b", " ", "\u{754c}", "x"];
+        let texts = [
+            "hello",
+            "\u{754c}\u{754c}a",
+            "a\u{754c}b\u{754c}",
+            "zz",
+            "\u{754c}",
+        ];
+        let styles = [
+            Style::new(),
+            Style::new().fg(crate::style::Color::Red),
+            Style::new().bg(crate::style::Color::Blue),
+            Style::new().add_modifier(crate::style::Modifier::BOLD),
+        ];
+        let mut state = PresentationState::new(area);
+        for frame in 0..2_000 {
+            let rect = |next: &mut dyn FnMut(u64) -> u64| {
+                let x = u16::try_from(next(13)).unwrap();
+                let y = u16::try_from(next(6)).unwrap();
+                let width = u16::try_from(next(9)).unwrap() + 1;
+                let height = u16::try_from(next(3)).unwrap() + 1;
+                Rect::new(x, y, width, height).intersection(area)
+            };
+            let local = |rect: Rect| LocalRect::terminal(rect);
+            let ops: Vec<PaintOp> = (0..next(14))
+                .map(|_| {
+                    let symbol = symbols[usize::try_from(next(5)).unwrap()];
+                    let style = styles[usize::try_from(next(4)).unwrap()];
+                    let x = i32::try_from(next(13)).unwrap() - 1;
+                    let y = i64::try_from(next(6)).unwrap();
+                    match next(6) {
+                        0 => PaintOp::Set(x, y, symbol, style),
+                        1 => PaintOp::Replace(x, y, symbol, style),
+                        2 => PaintOp::Fill(local(rect(&mut next)), symbol, style),
+                        3 => PaintOp::Line(
+                            local(rect(&mut next)),
+                            texts[usize::try_from(next(5)).unwrap()],
+                        ),
+                        4 => PaintOp::Restyle(local(rect(&mut next)), style),
+                        _ => PaintOp::Occlude(local(rect(&mut next))),
+                    }
+                })
+                .collect();
+            let full = frame == 0 || next(10) == 0;
+            let regions: Vec<Rect> = (0..=next(3))
+                .map(|_| rect(&mut next))
+                .filter(|rect| !rect.is_empty())
+                .collect();
+            let previous = state.retained_buffer().cloned();
+            let damage = if full || regions.is_empty() {
+                Damage::Full
+            } else {
+                Damage::Regions(regions.clone())
+            };
+            let (expected, widened, blank_screen) =
+                expected_frames(&damage, previous.as_ref(), area, &ops);
+            let prepared = state.prepare(damage, |cx| apply_ops(cx, &ops));
+            state
+                .present_prepared(prepared, |_, _| Ok::<(), ()>(()))
+                .unwrap();
+            let actual = state.retained_buffer().unwrap();
+            let differences =
+                |other: &Buffer,
+                 skip: &[Rect]|
+                 -> Vec<(u16, u16, crate::buffer::Cell, crate::buffer::Cell)> {
+                    actual
+                        .cells()
+                        .iter()
+                        .zip(other.cells())
+                        .zip((0..5_u16).flat_map(|y| (0..12_u16).map(move |x| (x, y))))
+                        .filter(|((actual, other), (x, y))| {
+                            actual != other
+                                && !skip
+                                    .iter()
+                                    .any(|rect| rect.contains(crate::geometry::Point::new(*x, *y)))
+                        })
+                        .map(|((actual, other), (x, y))| (x, y, actual.clone(), other.clone()))
+                        .collect()
+                };
+            let mismatched = differences(&expected, &[]);
+            assert!(
+                mismatched.is_empty(),
+                "frame {frame}, damage {regions:?}, ops {ops:?}: {mismatched:?}"
+            );
+            if let Some(blank_screen) = blank_screen {
+                // A wide grapheme painted over a widened cell carries its style into its other
+                // half, so the cells beside the widened regions may differ too.
+                let beside: Vec<Rect> = widened
+                    .iter()
+                    .map(|rect| {
+                        let x = rect.x.saturating_sub(1);
+                        Rect::new(x, rect.y, rect.right() + 1 - x, rect.height)
+                    })
+                    .collect();
+                let mismatched = differences(&blank_screen, &beside);
+                assert!(
+                    mismatched.is_empty(),
+                    "frame {frame} differs from a blank screen outside {beside:?}, damage \
+                     {regions:?}, ops {ops:?}: {mismatched:?}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn recycled_frames_match_freshly_allocated_ones() {

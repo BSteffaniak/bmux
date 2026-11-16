@@ -2,9 +2,7 @@
 
 use std::io::{self, Write};
 
-use crate::ansi::{
-    AnsiFrameDiffStats, write_ansi_frame_diff_with_color_depth, write_ansi_frame_with_color_depth,
-};
+use crate::ansi::{AnsiFrameDiffStats, write_ansi_frame_with_color_depth};
 use crate::buffer::Buffer;
 use crate::capabilities::TerminalColorDepth;
 use crate::damage::Damage;
@@ -123,13 +121,20 @@ fn encode_frame(
         write_ansi_frame_with_color_depth(encoded, prepared.buffer(), prepared.cursor(), depth)?;
         return Ok((DrawStats::full(prepared.buffer().cells().len()), None));
     };
+    // A regional frame's cells equal the previous frame's outside its regions, so only the
+    // regions are compared.
+    let scope = prepared
+        .damage()
+        .is_regional()
+        .then(|| prepared.damage().retained_regions());
     let Some(scroll) = scroll else {
-        let stats = write_ansi_frame_diff_with_color_depth(
+        let stats = crate::ansi::write_ansi_frame_diff_within(
             encoded,
             previous,
             prepared.buffer(),
             prepared.cursor(),
             depth,
+            scope,
         )?;
         return Ok((stats.into(), None));
     };
@@ -140,6 +145,7 @@ fn encode_frame(
             current: prepared.buffer(),
             cursor: prepared.cursor(),
             depth,
+            scope,
         },
         scroll.region,
         scroll.rows,

@@ -76,6 +76,53 @@ pub struct Frame<'buffer> {
     scroll_hint: Option<(Rect, i64)>,
     metadata_availability: Vec<SurfaceMetadataAvailability>,
     clock: Option<crate::clock::PresentationClock>,
+    written: Option<WrittenSpans>,
+}
+
+/// The columns each row of a frame's buffer may have been written in, one `start..end` span
+/// per row (empty when `start >= end`).
+///
+/// A span covers every cell a write may change, including the halves of wide graphemes a
+/// write next to them repairs, so cells outside every span are exactly as the frame began.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WrittenSpans {
+    area: Rect,
+    rows: Vec<(u16, u16)>,
+}
+
+impl WrittenSpans {
+    fn new(area: Rect) -> Self {
+        Self {
+            area,
+            rows: vec![(u16::MAX, 0); usize::from(area.height)],
+        }
+    }
+
+    /// Note a write to `area`, widened by the wide-grapheme repair a write may do beside it: the
+    /// leader left of a continuation it overwrites, and a continuation (and the one after a wide
+    /// grapheme it places) to its right.
+    fn note(&mut self, area: Rect) {
+        let area = area.intersection(self.area);
+        if area.is_empty() {
+            return;
+        }
+        let start = area.x.saturating_sub(1).max(self.area.x);
+        let end = area.right().saturating_add(2).min(self.area.right());
+        for y in area.y..area.bottom() {
+            let row = &mut self.rows[usize::from(y - self.area.y)];
+            row.0 = row.0.min(start);
+            row.1 = row.1.max(end);
+        }
+    }
+
+    /// The written `(y, start..end)` spans, top to bottom.
+    pub(crate) fn spans(&self) -> impl Iterator<Item = (u16, std::ops::Range<u16>)> + '_ {
+        self.rows
+            .iter()
+            .zip(self.area.y..)
+            .filter(|((start, end), _)| start < end)
+            .map(|((start, end), y)| (y, *start..*end))
+    }
 }
 
 /// Apply opaque coverage to metadata preceding an overlay, whether staged or retained.
@@ -142,6 +189,23 @@ impl<'buffer> Frame<'buffer> {
             scroll_hint: None,
             metadata_availability: Vec::new(),
             clock: None,
+            written: None,
+        }
+    }
+
+    /// Record which cells painting writes, for [`Self::take_written`].
+    pub(crate) fn track_writes(&mut self) {
+        self.written = Some(WrittenSpans::new(self.buffer.area()));
+    }
+
+    /// The cells written since [`Self::track_writes`], or `None` when writes were not tracked.
+    pub(crate) const fn take_written(&mut self) -> Option<WrittenSpans> {
+        self.written.take()
+    }
+
+    fn note_written(&mut self, area: Rect) {
+        if let Some(written) = self.written.as_mut() {
+            written.note(area);
         }
     }
 
@@ -251,6 +315,7 @@ impl<'buffer> Frame<'buffer> {
             return;
         }
         self.occlusions.push((self.images.len(), area));
+        self.note_written(area);
         self.buffer.fill(area, " ", Style::new());
         occlude_metadata(
             area,
@@ -262,7 +327,9 @@ impl<'buffer> Frame<'buffer> {
         );
     }
 
-    pub(crate) const fn buffer_mut(&mut self) -> &mut Buffer {
+    /// The buffer, to write the cells of `area` (a projected, clipped rectangle).
+    pub(crate) fn buffer_mut(&mut self, area: Rect) -> &mut Buffer {
+        self.note_written(area);
         self.buffer
     }
 
@@ -333,14 +400,19 @@ impl<'buffer> Frame<'buffer> {
     }
 
     pub(crate) fn paint_selection(&mut self, highlights: &[Rect], style: Style) {
+        for highlight in highlights {
+            self.note_written(*highlight);
+        }
         paint_selection_highlights(self.buffer, highlights, style);
     }
 
     pub(crate) fn fill(&mut self, area: Rect, symbol: &str, style: Style) {
+        self.note_written(area);
         self.buffer.fill(area, symbol, style);
     }
 
     pub(crate) fn write_line_with_fallback_style(&mut self, area: Rect, line: &Line, style: Style) {
+        self.note_written(area);
         self.buffer
             .write_line_with_fallback_style(area, line, style);
     }
