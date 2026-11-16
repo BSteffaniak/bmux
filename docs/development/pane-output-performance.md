@@ -1,6 +1,7 @@
 # Pane output performance plan
 
-Status: plan. Nothing here is implemented yet.
+Status: phases 0 through 4 are implemented except phase 4's single renderer (see
+[Progress](#progress)).
 
 A full-screen application in a large pane (420×90, 37,800 cells) feels laggy inside bmux and
 smooth in the same terminal without it. The application is not the cost: a code review scrolled
@@ -170,3 +171,36 @@ the end of each phase.
 * **Query answering from the main grid** must give the same replies at the same stream positions
   as the cursor tracker does now; the replay corpus includes queries, and both are compared
   before the tracker is removed.
+
+## Progress
+
+Implemented, each with its numbers in its commit:
+
+* Phase 0: frame corpora, `pipeline_bench` (client) and `ingest_bench` (server) in process, and
+  `bmux-bench replay` live: frames carry a private OSC marker, and with `BMUX_REPLAY_LOG` the
+  server logs when it reads each marker and the attach client when it applies it, starts rendering
+  it and hands the frame to the host, with the frame's bytes and rows moved.
+* Phase 1: synchronized updates tracked by the client and exact on the server, the 150 ms bound,
+  and finished frames drawn at once.
+* Phase 2: one request per frame, then push (`attach-pane-output-push`): the server reads a
+  client's output when it can queue it a message, so a slow client gets fewer, larger batches
+  instead of a queue. Flow control is that read-at-send, not an explicit credit; a client past the
+  buffer's retention resynchronizes from a snapshot as before. Input producer barriers are
+  announced the same way instead of polled every 20 ms.
+* Phase 3: queries answered from spans, region scrolls in one rotation, parsing outside the output
+  lock, recording copies only while recording.
+* Phase 4: scroll passthrough (inside left/right margins for a narrower pane), cell diffs, and the
+  host writer thread with render deferral while the host is behind. A pane whose own content
+  changed no longer gets a repair rect over all of it from the retained compositor.
+
+At 420x90, SU scroll, the attach client renders in about 1 ms and writes 12 KB a frame (from
+2.9 ms and 169 KB); a review scroll writes about what the application wrote (x1.0, from x4.2).
+
+Not done:
+
+* Phase 4's single renderer (attach panes presented through bmux_tui's `Terminal`). It is a
+  rewrite of the attach renderer, its extensions, overlays and images, and is a project of its own.
+* Output events (`OutputAvailable`) are still JSON-encoded and broadcast; clients that have their
+  output pushed ignore them.
+* The end-to-end budget (p95 4 ms) was measured only on a loaded machine; quiet-machine numbers
+  are still to be taken with `bmux-bench replay`.
