@@ -39,6 +39,9 @@ tracing       = { workspace = true, features = ["std"] }
 unicode-width = { workspace = true }
 uuid          = { workspace = true, features = ["std"] }
 
+[dev-dependencies]
+bmux_bench = { workspace = true }
+
 [features]
 default = []
 

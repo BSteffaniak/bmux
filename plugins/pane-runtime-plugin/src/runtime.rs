@@ -3,6 +3,8 @@
 mod capture_writer;
 mod durable_capture;
 mod environment;
+#[cfg(test)]
+mod ingest_bench;
 pub(crate) mod execution;
 pub(crate) mod human_input;
 pub(crate) mod input_authority;

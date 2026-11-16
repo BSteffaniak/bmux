@@ -60,6 +60,9 @@ toml_edit = { workspace = true }
 tracing = { workspace = true, features = ["std"] }
 uuid = { workspace = true, features = ["serde", "std"] }
 
+[dev-dependencies]
+bmux_bench = { workspace = true }
+
 [features]
 default = []
 fail-on-warnings = [

@@ -5,6 +5,8 @@
 pub mod compositor;
 pub mod cursor;
 pub mod mouse;
+#[cfg(test)]
+mod pipeline_bench;
 pub mod pointer_capabilities;
 pub mod pointer_shape;
 pub mod projection;

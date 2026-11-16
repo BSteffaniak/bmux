@@ -2,6 +2,7 @@
 pub mod analysis;
 pub mod artifact;
 pub mod config;
+pub mod corpus;
 #[cfg(feature = "internal")]
 pub mod internal;
 pub mod model;
