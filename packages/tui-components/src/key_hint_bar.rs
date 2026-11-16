@@ -290,7 +290,9 @@ impl<'a> KeyHintBar<'a> {
         hint_text(self.hints, self.policy.separator)
     }
 
-    fn styled_line(&self) -> Line {
+    /// Build the untruncated styled display line.
+    #[must_use]
+    pub fn styled_line(&self) -> Line {
         let mut spans = Vec::new();
         for (index, hint) in self.hints.iter().copied().enumerate() {
             if index > 0 {

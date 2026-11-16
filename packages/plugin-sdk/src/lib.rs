@@ -196,8 +196,8 @@ pub use wire_event_sink::{
 
 // Prompt types — re-exported at the crate root for convenience.
 pub use prompt::{
-    PromptEvent, PromptField, PromptFormField, PromptFormFieldKind, PromptFormSection,
-    PromptFormValue, PromptOption, PromptPolicy, PromptRequest, PromptResponse,
+    PromptEvent, PromptField, PromptFormField, PromptFormFieldKind, PromptFormLayout,
+    PromptFormSection, PromptFormValue, PromptOption, PromptPolicy, PromptRequest, PromptResponse,
     PromptSearchMatchMode, PromptValidation, PromptValue, PromptWidth,
 };
 

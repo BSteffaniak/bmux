@@ -251,7 +251,21 @@ pub enum PromptField {
         /// Present form sections as pages on tiny terminals.
         #[serde(default)]
         paged_on_small: bool,
+        /// Preferred field layout. Users can override this in their config.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        layout: Option<PromptFormLayout>,
     },
+}
+
+/// Visual arrangement of form fields.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptFormLayout {
+    /// One row per field with a right-aligned label column.
+    #[default]
+    Compact,
+    /// Labels above bordered controls, with help text always shown.
+    Stacked,
 }
 
 /// Matching strategy for searchable select prompts.
@@ -321,6 +335,10 @@ pub struct PromptFormField {
     pub disabled_reason: Option<String>,
     pub required: bool,
     pub kind: PromptFormFieldKind,
+    /// Error shown when the form opens, e.g. after a plugin rejected a value
+    /// and reopened the form with the user's previous input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 impl PromptFormField {
@@ -334,7 +352,94 @@ impl PromptFormField {
             disabled_reason: None,
             required: false,
             kind,
+            error: None,
         }
+    }
+
+    /// Text field with an initial value.
+    #[must_use]
+    pub fn text(
+        id: impl Into<String>,
+        label: impl Into<String>,
+        initial: impl Into<String>,
+    ) -> Self {
+        Self::new(
+            id,
+            label,
+            PromptFormFieldKind::Text {
+                initial_value: initial.into(),
+                placeholder: None,
+                validation: None,
+            },
+        )
+    }
+
+    /// Boolean toggle.
+    #[must_use]
+    pub fn toggle(id: impl Into<String>, label: impl Into<String>, default: bool) -> Self {
+        Self::new(id, label, PromptFormFieldKind::Bool { default })
+    }
+
+    /// Single choice among `options`.
+    #[must_use]
+    pub fn choice(
+        id: impl Into<String>,
+        label: impl Into<String>,
+        options: Vec<PromptOption>,
+        default_index: usize,
+    ) -> Self {
+        Self::new(
+            id,
+            label,
+            PromptFormFieldKind::SingleSelect {
+                options,
+                default_index,
+            },
+        )
+    }
+
+    /// Any number of `options`.
+    #[must_use]
+    pub fn multi(
+        id: impl Into<String>,
+        label: impl Into<String>,
+        options: Vec<PromptOption>,
+        default_indices: Vec<usize>,
+    ) -> Self {
+        Self::new(
+            id,
+            label,
+            PromptFormFieldKind::MultiToggle {
+                options,
+                default_indices,
+                min_selected: 0,
+            },
+        )
+    }
+
+    /// Set the placeholder of a text field.
+    #[must_use]
+    pub fn placeholder(mut self, value: impl Into<String>) -> Self {
+        if let PromptFormFieldKind::Text { placeholder, .. } = &mut self.kind {
+            *placeholder = Some(value.into());
+        }
+        self
+    }
+
+    /// Set the validation rule of a text field.
+    #[must_use]
+    pub fn validation(mut self, rule: PromptValidation) -> Self {
+        if let PromptFormFieldKind::Text { validation, .. } = &mut self.kind {
+            *validation = Some(rule);
+        }
+        self
+    }
+
+    /// Show `message` on this field when the form opens.
+    #[must_use]
+    pub fn error(mut self, message: impl Into<String>) -> Self {
+        self.error = Some(message.into());
+        self
     }
 
     #[must_use]
@@ -558,6 +663,7 @@ impl PromptRequest {
                 live_preview: false,
                 resettable: false,
                 paged_on_small: false,
+                layout: None,
             },
         }
     }
@@ -777,6 +883,15 @@ impl PromptRequest {
         self
     }
 
+    /// Prefer a field layout for a form prompt.
+    #[must_use]
+    pub const fn form_layout(mut self, value: PromptFormLayout) -> Self {
+        if let PromptField::Form { layout, .. } = &mut self.field {
+            *layout = Some(value);
+        }
+        self
+    }
+
     #[must_use]
     pub const fn form_paged_on_small(mut self, enabled: bool) -> Self {
         if let PromptField::Form { paged_on_small, .. } = &mut self.field {
@@ -865,6 +980,48 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<PromptRequest>(value).expect("bounded request"),
             bounded
+        );
+    }
+
+    #[test]
+    fn form_layout_and_field_error_preserve_legacy_forms() {
+        let legacy = PromptRequest::form(
+            "Settings",
+            vec![PromptFormSection::new(
+                "general",
+                "General",
+                vec![PromptFormField::text("name", "Name", "")],
+            )],
+        );
+        let value = serde_json::to_value(&legacy).expect("serialize");
+        let form = &value["field"]["form"];
+        assert!(form.get("layout").is_none());
+        assert!(form["sections"][0]["fields"][0].get("error").is_none());
+        assert_eq!(
+            serde_json::from_value::<PromptRequest>(value).expect("legacy form"),
+            legacy
+        );
+
+        let hinted = legacy.form_layout(PromptFormLayout::Stacked);
+        let PromptField::Form { sections, .. } = &hinted.field else {
+            panic!("form field");
+        };
+        let mut sections = sections.clone();
+        sections[0].fields[0] = sections[0].fields[0].clone().error("taken");
+        let hinted = PromptRequest {
+            field: PromptField::Form {
+                sections,
+                live_preview: false,
+                resettable: false,
+                paged_on_small: false,
+                layout: Some(PromptFormLayout::Stacked),
+            },
+            ..hinted
+        };
+        let value = serde_json::to_value(&hinted).expect("serialize hinted form");
+        assert_eq!(
+            serde_json::from_value::<PromptRequest>(value).expect("hinted form"),
+            hinted
         );
     }
 

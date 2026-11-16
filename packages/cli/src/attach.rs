@@ -50,8 +50,9 @@ pub use crate::runtime::attach::input::{
 };
 pub use crate::runtime::{
     ActionDispatchError, ActionDispatchRequest, AttachExitReason, AttachRunOutcome, PromptEvent,
-    PromptField, PromptOption, PromptPolicy, PromptRequest, PromptResponse, PromptSubmitError,
-    PromptValidation, PromptValue, PromptWidth,
+    PromptField, PromptFormField, PromptFormLayout, PromptFormSection, PromptFormValue,
+    PromptOption, PromptPolicy, PromptRequest, PromptResponse, PromptSubmitError, PromptValidation,
+    PromptValue, PromptWidth,
 };
 
 /// Run the attach TUI using an already-connected client.

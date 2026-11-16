@@ -101,6 +101,7 @@ The generic prompt host provides an `F6` hide/show toggle while a form is
 active. Hiding removes only the overlay; the prompt remains active, keeps modal
 input ownership, and consumes keys instead of forwarding them to the pane PTY.
 Press `F6` again to restore the form without cancelling its live preview.
+`ctrl+r` resets the form to the values it opened with.
 
 Runtime-only changes disappear when the pane runtime is recreated. **Restore
 with pane** changes enter pane snapshots. **Global default** edits only

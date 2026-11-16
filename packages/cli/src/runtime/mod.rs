@@ -110,8 +110,9 @@ use plugin_runtime::{
     run_plugin_keybinding_command_with_state, scan_available_plugins, validate_enabled_plugins,
 };
 pub use prompt::{
-    PromptEvent, PromptField, PromptOption, PromptPolicy, PromptRequest, PromptResponse,
-    PromptSubmitError, PromptValidation, PromptValue, PromptWidth,
+    PromptEvent, PromptField, PromptFormField, PromptFormLayout, PromptFormSection,
+    PromptFormValue, PromptOption, PromptPolicy, PromptRequest, PromptResponse, PromptSubmitError,
+    PromptValidation, PromptValue, PromptWidth,
 };
 use remote_cli::{
     SSH_RECONNECT_MAX_ATTEMPTS, connect_attach_target_with_kernel, reconnect_backoff_ms,

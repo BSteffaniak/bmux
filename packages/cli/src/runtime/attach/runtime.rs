@@ -5363,6 +5363,9 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
     view_state.command_state =
         command_state.or_else(|| super::super::plugin_runtime::selected_command_state().ok());
     view_state.mouse.config = attach_config.attach_mouse_config();
+    view_state
+        .prompt
+        .set_form_layout(attach_config.appearance.prompt_form_layout);
     view_state.outer_paste_capture_enabled =
         outer_paste_capture_enabled(attach_config.behavior.bracketed_paste);
     // Register the generic attach-layout state channel so any plugin

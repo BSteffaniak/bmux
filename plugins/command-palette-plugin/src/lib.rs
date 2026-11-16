@@ -13,8 +13,8 @@ use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::prompt::PromptOrderedMatchMode;
 use bmux_plugin_sdk::{
     ActiveKeybinding, PluginCommand, PluginCommandArgument, PluginCommandArgumentKind,
-    PromptOption, PromptRequest, PromptResponse, PromptSearchMatchMode, PromptValidation,
-    PromptValue, RegisteredPluginInfo,
+    PromptFormField, PromptFormSection, PromptFormValue, PromptOption, PromptRequest,
+    PromptResponse, PromptSearchMatchMode, PromptValidation, PromptValue, RegisteredPluginInfo,
 };
 use tracing::{debug, warn};
 
@@ -367,150 +367,123 @@ fn uses_default_palette_arguments(plugin_id: &str, command_name: &str) -> bool {
     plugin_id == "bmux.pane_runtime" && command_name == "pane-padding-configure"
 }
 
+/// Collect every argument of `command` with one form.
 async fn collect_command_arguments(
     prompt: &prompt::PromptPort,
     command: &PluginCommand,
 ) -> Option<Vec<String>> {
-    let mut args = Vec::new();
-    for argument in &command.arguments {
-        let values = prompt_for_argument(prompt, command, argument).await?;
-        append_argument_values(&mut args, argument, values);
+    if command.arguments.is_empty() {
+        return Some(Vec::new());
     }
-    Some(args)
+    match prompt.request(argument_form(command)).await.ok()? {
+        PromptResponse::Submitted(PromptValue::Form(values)) => {
+            Some(arguments_from_form(command, &values))
+        }
+        PromptResponse::Cancelled | PromptResponse::RejectedBusy | PromptResponse::Submitted(_) => {
+            None
+        }
+    }
 }
 
-async fn prompt_for_argument(
-    prompt: &prompt::PromptPort,
-    command: &PluginCommand,
-    argument: &PluginCommandArgument,
-) -> Option<Vec<String>> {
-    match argument.kind {
-        PluginCommandArgumentKind::Boolean => {
-            prompt_boolean_argument(prompt, command, argument).await
-        }
+fn argument_field_id(index: usize) -> String {
+    format!("arg{index}")
+}
+
+fn argument_field(index: usize, argument: &PluginCommandArgument) -> PromptFormField {
+    let id = argument_field_id(index);
+    let label = argument_display_name(argument);
+    let mut field = match argument.kind {
+        PluginCommandArgumentKind::Boolean => PromptFormField::toggle(id, label, false),
         PluginCommandArgumentKind::Choice => {
-            prompt_choice_argument(prompt, command, argument).await
+            let none = (!argument.required).then(|| PromptOption::new(String::new(), "none"));
+            let options = none
+                .into_iter()
+                .chain(
+                    argument
+                        .choice_values
+                        .iter()
+                        .map(|value| PromptOption::new(value.clone(), value.clone())),
+                )
+                .collect();
+            PromptFormField::choice(id, label, options, 0)
         }
-        PluginCommandArgumentKind::Integer => {
-            prompt_text_argument(
-                prompt,
-                command,
-                argument,
-                Some(PromptValidation::Integer),
-                "integer value",
-            )
-            .await
-        }
-        PluginCommandArgumentKind::String | PluginCommandArgumentKind::Path => {
-            prompt_text_argument(prompt, command, argument, None, "value").await
-        }
-    }
-}
-
-async fn prompt_boolean_argument(
-    prompt: &prompt::PromptPort,
-    command: &PluginCommand,
-    argument: &PluginCommandArgument,
-) -> Option<Vec<String>> {
-    let response = prompt
-        .request(
-            PromptRequest::confirm(argument_prompt_title(command, argument))
-                .message(optional_argument_message(argument))
-                .confirm_default(false)
-                .confirm_labels("Yes", "No")
-                .modal_id("command-palette-argument"),
-        )
-        .await
-        .ok()?;
-    match response {
-        PromptResponse::Submitted(PromptValue::Confirm(true)) => Some(vec!["true".to_string()]),
-        PromptResponse::Submitted(PromptValue::Confirm(false)) => Some(Vec::new()),
-        PromptResponse::Cancelled | PromptResponse::RejectedBusy | PromptResponse::Submitted(_) => {
-            None
-        }
-    }
-}
-
-async fn prompt_choice_argument(
-    prompt: &prompt::PromptPort,
-    command: &PluginCommand,
-    argument: &PluginCommandArgument,
-) -> Option<Vec<String>> {
-    let mut options = Vec::new();
-    if !argument.required {
-        options.push(PromptOption::new(String::new(), "Skip"));
-    }
-    options.extend(
-        argument
-            .choice_values
-            .iter()
-            .map(|value| PromptOption::new(value.clone(), value.clone())),
-    );
-    let response = prompt
-        .request(
-            PromptRequest::single_select(argument_prompt_title(command, argument), options)
-                .message(optional_argument_message(argument))
-                .modal_id("command-palette-argument"),
-        )
-        .await
-        .ok()?;
-    match response {
-        PromptResponse::Submitted(PromptValue::Single(value)) if value.is_empty() => {
-            Some(Vec::new())
-        }
-        PromptResponse::Submitted(PromptValue::Single(value)) => Some(vec![value]),
-        PromptResponse::Cancelled | PromptResponse::RejectedBusy | PromptResponse::Submitted(_) => {
-            None
-        }
-    }
-}
-
-async fn prompt_text_argument(
-    prompt: &prompt::PromptPort,
-    command: &PluginCommand,
-    argument: &PluginCommandArgument,
-    validation: Option<PromptValidation>,
-    placeholder: &str,
-) -> Option<Vec<String>> {
-    let mut request = PromptRequest::text_input(argument_prompt_title(command, argument))
-        .message(optional_argument_message(argument))
-        .input_placeholder(placeholder)
-        .input_required(argument.required)
-        .modal_id("command-palette-argument");
-    if let Some(validation) = validation {
-        request = request.input_validation(validation);
-    }
-    let response = prompt.request(request).await.ok()?;
-    match response {
-        PromptResponse::Submitted(PromptValue::Text(value)) => {
-            if value.is_empty() && !argument.required {
-                Some(Vec::new())
-            } else if argument.multiple || argument.trailing_var_arg {
-                Some(value.split_whitespace().map(ToString::to_string).collect())
+        PluginCommandArgumentKind::Integer
+        | PluginCommandArgumentKind::String
+        | PluginCommandArgumentKind::Path => {
+            let placeholder = if argument.multiple || argument.trailing_var_arg {
+                "space-separated values".to_owned()
             } else {
-                Some(vec![value])
+                argument.value_name.clone().unwrap_or_else(|| {
+                    match argument.kind {
+                        PluginCommandArgumentKind::Integer => "integer",
+                        PluginCommandArgumentKind::Path => "path",
+                        _ => "value",
+                    }
+                    .to_owned()
+                })
+            };
+            let field = PromptFormField::text(id, label, "").placeholder(placeholder);
+            if matches!(argument.kind, PluginCommandArgumentKind::Integer)
+                && !argument.multiple
+                && !argument.trailing_var_arg
+            {
+                field.validation(PromptValidation::Integer)
+            } else {
+                field
             }
         }
-        PromptResponse::Cancelled | PromptResponse::RejectedBusy | PromptResponse::Submitted(_) => {
-            None
-        }
     }
+    .required(argument.required && !matches!(argument.kind, PluginCommandArgumentKind::Boolean));
+    if let Some(summary) = &argument.summary {
+        field = field.description(summary.as_str());
+    }
+    field
 }
 
-fn argument_prompt_title(command: &PluginCommand, argument: &PluginCommandArgument) -> String {
-    format!("{}: {}", command.name, argument_display_name(argument))
-}
-
-fn optional_argument_message(argument: &PluginCommandArgument) -> String {
-    let requirement = if argument.required {
-        "Required argument."
-    } else {
-        "Optional argument; leave blank or choose Skip to omit."
-    };
-    argument.summary.as_ref().map_or_else(
-        || requirement.to_string(),
-        |summary| format!("{summary}\n{requirement}"),
+/// One form with a field per command argument, in declaration order.
+fn argument_form(command: &PluginCommand) -> PromptRequest {
+    let fields = command
+        .arguments
+        .iter()
+        .enumerate()
+        .map(|(index, argument)| argument_field(index, argument))
+        .collect();
+    let mut request = PromptRequest::form(
+        command.name.clone(),
+        vec![PromptFormSection::new("arguments", "Arguments", fields)],
     )
+    .submit_label("Run")
+    .modal_id("command-palette-argument");
+    if !command.summary.trim().is_empty() {
+        request = request.message(command.summary.clone());
+    }
+    request
+}
+
+fn arguments_from_form(
+    command: &PluginCommand,
+    values: &std::collections::BTreeMap<String, PromptFormValue>,
+) -> Vec<String> {
+    let mut args = Vec::new();
+    for (index, argument) in command.arguments.iter().enumerate() {
+        let collected = match values.get(&argument_field_id(index)) {
+            Some(PromptFormValue::Bool(true)) => vec!["true".to_owned()],
+            Some(PromptFormValue::Single(value)) if !value.is_empty() => vec![value.clone()],
+            Some(PromptFormValue::Text(value)) => {
+                let value = value.trim();
+                if value.is_empty() {
+                    Vec::new()
+                } else if argument.multiple || argument.trailing_var_arg {
+                    value.split_whitespace().map(ToString::to_string).collect()
+                } else {
+                    vec![value.to_owned()]
+                }
+            }
+            _ => Vec::new(),
+        };
+        append_argument_values(&mut args, argument, collected);
+    }
+    args
 }
 
 fn argument_display_name(argument: &PluginCommandArgument) -> String {
@@ -708,8 +681,9 @@ bmux_plugin_sdk::define_plugin!(
 #[cfg(test)]
 mod tests {
     use super::{
-        PaletteEntry, PaletteEntryKind, bindable_action_key_hint, collect_command_arguments,
-        plugin_action_string, plugin_command_entries, plugin_command_key_hint, shell_quote,
+        PaletteEntry, PaletteEntryKind, argument_form, arguments_from_form,
+        bindable_action_key_hint, collect_command_arguments, plugin_action_string,
+        plugin_command_entries, plugin_command_key_hint, shell_quote,
         uses_default_palette_arguments,
     };
     use bmux_plugin_sdk::{ActiveKeybinding, PluginCommand, PromptOption};
@@ -844,6 +818,79 @@ mod tests {
         assert_eq!(
             collect_command_arguments(&prompt, &command).await,
             Some(Vec::new())
+        );
+    }
+
+    fn sample_command() -> PluginCommand {
+        use bmux_plugin_sdk::{PluginCommandArgument as Arg, PluginCommandArgumentKind as Kind};
+        let mut command = PluginCommand::new("recording-cut", "Export part of a recording");
+        command.arguments = vec![
+            Arg::option("last-seconds", Kind::Integer)
+                .required(true)
+                .summary("Seconds to keep"),
+            Arg::option("format", Kind::Choice).choice_values(["gif", "mp4"]),
+            Arg::flag("open"),
+            Arg::positional("tags", Kind::String).multiple(true),
+        ];
+        command
+    }
+
+    #[test]
+    fn command_arguments_become_one_form() {
+        use bmux_plugin_sdk::{PromptField, PromptFormFieldKind as Kind};
+        let request = argument_form(&sample_command());
+        assert_eq!(request.title, "recording-cut");
+        assert_eq!(
+            request.message.as_deref(),
+            Some("Export part of a recording")
+        );
+        let PromptField::Form { sections, .. } = &request.field else {
+            panic!("expected a form");
+        };
+        let fields = &sections[0].fields;
+        assert_eq!(fields.len(), 4);
+        assert_eq!(fields[0].label, "--last-seconds");
+        assert!(fields[0].required);
+        assert_eq!(fields[0].description.as_deref(), Some("Seconds to keep"));
+        assert!(matches!(
+            fields[0].kind,
+            Kind::Text {
+                validation: Some(bmux_plugin_sdk::PromptValidation::Integer),
+                ..
+            }
+        ));
+        assert!(matches!(
+            &fields[1].kind,
+            Kind::SingleSelect { options, default_index: 0 }
+                if options.len() == 3 && options[0].value.is_empty()
+        ));
+        assert!(matches!(fields[2].kind, Kind::Bool { default: false }));
+        assert_eq!(fields[3].label, "tags");
+    }
+
+    #[test]
+    fn submitted_form_values_become_command_arguments() {
+        use bmux_plugin_sdk::PromptFormValue as Value;
+        let command = sample_command();
+        let values = std::collections::BTreeMap::from([
+            ("arg0".to_owned(), Value::Text(" 30 ".into())),
+            ("arg1".to_owned(), Value::Single(String::new())),
+            ("arg2".to_owned(), Value::Bool(true)),
+            ("arg3".to_owned(), Value::Text("a b".into())),
+        ]);
+        assert_eq!(
+            arguments_from_form(&command, &values),
+            ["--last-seconds", "30", "--open", "a", "b"]
+        );
+        let values = std::collections::BTreeMap::from([
+            ("arg0".to_owned(), Value::Text("5".into())),
+            ("arg1".to_owned(), Value::Single("gif".into())),
+            ("arg2".to_owned(), Value::Bool(false)),
+            ("arg3".to_owned(), Value::Text(String::new())),
+        ]);
+        assert_eq!(
+            arguments_from_form(&command, &values),
+            ["--last-seconds", "5", "--format", "gif"]
         );
     }
 

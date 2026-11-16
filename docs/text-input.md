@@ -8,15 +8,19 @@ fields use shared Unicode-aware text editing primitives from `bmux_text_edit`.
 Prompt text inputs support standard terminal editor behavior where the terminal
 reports the corresponding key event:
 
-| Binding                    | Behavior                                |
-| -------------------------- | --------------------------------------- |
-| `left` / `right`           | Move one grapheme left or right         |
-| `alt+left` / `ctrl+left`   | Move one word left                      |
-| `alt+right` / `ctrl+right` | Move one word right                     |
-| `home` / `end`             | Move to start or end of the text field  |
-| `ctrl+a` / `ctrl+e`        | Move to start or end of the text field  |
-| `backspace` / `delete`     | Delete one grapheme backward or forward |
-| `ctrl+u`                   | Clear search-select query text          |
+| Binding                     | Behavior                                |
+| --------------------------- | --------------------------------------- |
+| `left` / `right`            | Move one grapheme left or right         |
+| `alt+left` / `ctrl+left`    | Move one word left                      |
+| `alt+right` / `ctrl+right`  | Move one word right                     |
+| `home` / `end`              | Move to start or end of the text field  |
+| `ctrl+a` / `ctrl+e`         | Move to start or end of the text field  |
+| `backspace` / `delete`      | Delete one grapheme backward or forward |
+| `ctrl+w` / `ctrl+backspace` | Delete one word backward (form fields)  |
+| `ctrl+u`                    | Clear search query or form field text   |
+
+Form navigation keys (`tab`, `enter`, `esc`, and so on) are listed in
+[Prompts and forms](prompts.md#keys).
 
 The reusable `bmux_text_edit` crate owns text storage, cursor movement,
 deletion, word boundaries, Unicode grapheme handling, and terminal-width

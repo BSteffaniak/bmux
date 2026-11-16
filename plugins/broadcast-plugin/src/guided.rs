@@ -158,59 +158,289 @@ async fn output(context: &NativeCommandContext, text: &str) {
         .await;
     }
 }
+/// Values the setup command needs, from flags or the user.
+struct SetupAnswers {
+    key: String,
+    endpoint: String,
+    source: String,
+    terminal: profiles::TerminalDefaults,
+}
+
+fn wants_advanced(map: &BTreeMap<String, String>) -> bool {
+    map.contains_key("--advanced")
+        && !map.contains_key("--cols")
+        && !map.contains_key("--rows")
+        && !map.contains_key("--executable")
+}
+
+async fn setup_answers(
+    context: &NativeCommandContext,
+    map: &BTreeMap<String, String>,
+    channel: &str,
+) -> Result<SetupAnswers, PluginCommandError> {
+    if context.invocation_source == NativeCommandInvocationSource::AttachKeybinding {
+        return setup_form(map, channel).await;
+    }
+    let key = value(context, map, "--profile", "Profile name").await?;
+    profiles::name(&key).map_err(failed)?;
+    let endpoint = value(
+        context,
+        map,
+        "--endpoint",
+        "HTTPS relay endpoint (loopback HTTP allowed)",
+    )
+    .await?;
+    relay::validate_endpoint(&endpoint, channel).map_err(failed)?;
+    let source = value(
+        context,
+        map,
+        "--credential-file",
+        "Absolute private credential FILE path (not key text)",
+    )
+    .await?;
+    if !Path::new(&source).is_absolute() {
+        return Err(failed("absolute credential file required"));
+    }
+    let mut terminal = terminal_defaults(map)?;
+    if wants_advanced(map) {
+        terminal.cols = prompt(context, "Terminal columns")
+            .await?
+            .parse()
+            .map_err(|_| failed("invalid columns"))?;
+        terminal.rows = prompt(context, "Terminal rows")
+            .await?
+            .parse()
+            .map_err(|_| failed("invalid rows"))?;
+        let executable = prompt(
+            context,
+            "Absolute executable path (empty uses this installed bmux)",
+        )
+        .await?;
+        if !executable.is_empty() {
+            terminal.executable = Some(executable.into());
+        }
+    }
+    Ok(SetupAnswers {
+        key,
+        endpoint,
+        source,
+        terminal,
+    })
+}
+
+type FormValues = BTreeMap<String, bmux_plugin_sdk::PromptFormValue>;
+
+fn form_text(values: &FormValues, id: &str) -> Option<String> {
+    match values.get(id) {
+        Some(bmux_plugin_sdk::PromptFormValue::Text(text)) => Some(text.trim().to_owned()),
+        _ => None,
+    }
+}
+
+fn form_integer(values: &FormValues, id: &str) -> Option<i64> {
+    match values.get(id) {
+        Some(bmux_plugin_sdk::PromptFormValue::Integer(value)) => Some(*value),
+        _ => None,
+    }
+}
+
+/// One form for every setup value not given as a flag, keeping `previous`
+/// input and showing `errors` inline when it is reopened.
+fn setup_request(
+    map: &BTreeMap<String, String>,
+    previous: &FormValues,
+    errors: &BTreeMap<&'static str, String>,
+) -> bmux_plugin_sdk::PromptRequest {
+    use bmux_plugin_sdk::{PromptFormField, PromptFormFieldKind, PromptFormSection};
+    let text = |id: &'static str, label: &str, placeholder: &str, help: &str| {
+        let mut field =
+            PromptFormField::text(id, label, form_text(previous, id).unwrap_or_default())
+                .placeholder(placeholder)
+                .description(help)
+                .required(true);
+        if let Some(error) = errors.get(id) {
+            field = field.error(error.as_str());
+        }
+        field
+    };
+    let mut profile = Vec::new();
+    if !map.contains_key("--profile") {
+        profile.push(text(
+            "profile",
+            "Profile name",
+            "work",
+            "Up to 48 characters.",
+        ));
+    }
+    if !map.contains_key("--endpoint") {
+        profile.push(text(
+            "endpoint",
+            "Relay endpoint",
+            "https://relay.example.com",
+            "HTTPS relay URL. Plain HTTP is allowed only for loopback.",
+        ));
+    }
+    if !map.contains_key("--credential-file") {
+        profile.push(text(
+            "credential",
+            "Credential file",
+            "/absolute/path/to/credential",
+            "Absolute path to the private credential file, not the key text.",
+        ));
+    }
+    let mut sections = vec![PromptFormSection::new("profile", "Profile", profile)];
+    if wants_advanced(map) {
+        let size = |id: &'static str, label: &str, default: i64| {
+            let mut field = PromptFormField::new(
+                id,
+                label,
+                PromptFormFieldKind::Integer {
+                    initial_value: form_integer(previous, id).unwrap_or(default),
+                    min: Some(1),
+                    max: Some(i64::from(u16::MAX)),
+                },
+            );
+            if let Some(error) = errors.get(id) {
+                field = field.error(error.as_str());
+            }
+            field
+        };
+        let mut executable = PromptFormField::text(
+            "executable",
+            "Executable",
+            form_text(previous, "executable").unwrap_or_default(),
+        )
+        .placeholder("this installed bmux")
+        .description("Absolute path of the bmux the viewer terminal runs.");
+        if let Some(error) = errors.get("executable") {
+            executable = executable.error(error.as_str());
+        }
+        sections.push(PromptFormSection::new(
+            "terminal",
+            "Terminal",
+            vec![
+                size("cols", "Columns", 80),
+                size("rows", "Rows", 24),
+                executable,
+            ],
+        ));
+    }
+    bmux_plugin_sdk::PromptRequest::form("Broadcast setup", sections)
+        .message("Save a relay profile for sharing terminals.")
+        .submit_label("Save")
+}
+
+fn check_setup(
+    map: &BTreeMap<String, String>,
+    channel: &str,
+    values: &FormValues,
+) -> Result<SetupAnswers, BTreeMap<&'static str, String>> {
+    let mut errors = BTreeMap::new();
+    let pick = |flag: &str, id: &str| {
+        map.get(flag)
+            .cloned()
+            .or_else(|| form_text(values, id))
+            .unwrap_or_default()
+    };
+    let key = pick("--profile", "profile");
+    if profiles::name(&key).is_err() {
+        errors.insert(
+            "profile",
+            "use up to 48 letters, digits, '-' or '_'".to_owned(),
+        );
+    }
+    let endpoint = pick("--endpoint", "endpoint");
+    if relay::validate_endpoint(&endpoint, channel).is_err() {
+        errors.insert(
+            "endpoint",
+            "must be an https:// URL (http:// only for loopback)".to_owned(),
+        );
+    }
+    let source = pick("--credential-file", "credential");
+    if !Path::new(&source).is_absolute() {
+        errors.insert("credential", "must be an absolute path".to_owned());
+    }
+    let mut terminal = terminal_defaults(map).map_err(|_| errors.clone())?;
+    if wants_advanced(map) {
+        for (id, slot) in [("cols", &mut terminal.cols), ("rows", &mut terminal.rows)] {
+            match form_integer(values, id).map(u32::try_from) {
+                Some(Ok(value)) => *slot = value,
+                _ => {
+                    errors.insert(id, "enter a size from 1 to 65535".to_owned());
+                }
+            }
+        }
+        if u64::from(terminal.cols) * u64::from(terminal.rows) > 262_144 {
+            errors.insert("rows", "columns × rows must be at most 262144".to_owned());
+        }
+        let executable = form_text(values, "executable").unwrap_or_default();
+        if !executable.is_empty() {
+            if Path::new(&executable).is_absolute() {
+                terminal.executable = Some(executable.into());
+            } else {
+                errors.insert("executable", "must be an absolute path".to_owned());
+            }
+        }
+    }
+    if errors.is_empty() {
+        Ok(SetupAnswers {
+            key,
+            endpoint,
+            source,
+            terminal,
+        })
+    } else {
+        Err(errors)
+    }
+}
+
+async fn setup_form(
+    map: &BTreeMap<String, String>,
+    channel: &str,
+) -> Result<SetupAnswers, PluginCommandError> {
+    use bmux_plugin::prompt::{PromptResponse, PromptValue};
+    let mut previous = FormValues::new();
+    let mut errors = BTreeMap::new();
+    loop {
+        let request = setup_request(map, &previous, &errors);
+        let values = match bmux_plugin::prompt::request(request)
+            .await
+            .map_err(|_| failed("broadcast prompt unavailable"))?
+        {
+            PromptResponse::Submitted(PromptValue::Form(values)) => values,
+            _ => return Err(failed("broadcast cancelled")),
+        };
+        if values
+            .values()
+            .any(|value| matches!(value, bmux_plugin_sdk::PromptFormValue::Text(text) if text.len() > 4096))
+        {
+            return Err(failed("broadcast argument exceeds limit"));
+        }
+        match check_setup(map, channel, &values) {
+            Ok(answers) => return Ok(answers),
+            Err(found) => {
+                errors = found;
+                previous = values;
+            }
+        }
+    }
+}
 pub(crate) async fn local(context: &NativeCommandContext) -> Result<bool, PluginCommandError> {
     let command = context.arguments.first().map(String::as_str);
     let root = Path::new(&context.connection.config_dir);
     match command {
         Some("setup") => {
             let map = options(&context.arguments[1..])?;
-            let key = value(context, &map, "--profile", "Profile name").await?;
-            profiles::name(&key).map_err(failed)?;
-            let endpoint = value(
-                context,
-                &map,
-                "--endpoint",
-                "HTTPS relay endpoint (loopback HTTP allowed)",
-            )
-            .await?;
             let channel = map
                 .get("--channel")
                 .cloned()
                 .unwrap_or_else(|| "main".into());
-            relay::validate_endpoint(&endpoint, &channel).map_err(failed)?;
-            let source = value(
-                context,
-                &map,
-                "--credential-file",
-                "Absolute private credential FILE path (not key text)",
-            )
-            .await?;
-            if !Path::new(&source).is_absolute() {
-                return Err(failed("absolute credential file required"));
-            }
-            let mut terminal = terminal_defaults(&map)?;
-            if map.contains_key("--advanced")
-                && !map.contains_key("--cols")
-                && !map.contains_key("--rows")
-                && !map.contains_key("--executable")
-            {
-                terminal.cols = prompt(context, "Terminal columns")
-                    .await?
-                    .parse()
-                    .map_err(|_| failed("invalid columns"))?;
-                terminal.rows = prompt(context, "Terminal rows")
-                    .await?
-                    .parse()
-                    .map_err(|_| failed("invalid rows"))?;
-                let executable = prompt(
-                    context,
-                    "Absolute executable path (empty uses this installed bmux)",
-                )
-                .await?;
-                if !executable.is_empty() {
-                    terminal.executable = Some(executable.into());
-                }
-            }
+            let SetupAnswers {
+                key,
+                endpoint,
+                source,
+                terminal,
+            } = setup_answers(context, &map, &channel).await?;
             profiles::Profile {
                 endpoint: endpoint.clone(),
                 channel: channel.clone(),
@@ -739,6 +969,82 @@ pub(crate) async fn connected(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn setup_form_reopens_with_values_and_inline_errors() {
+        use bmux_plugin_sdk::{PromptField, PromptFormValue};
+        let map = std::collections::BTreeMap::from([("--advanced".to_owned(), "true".to_owned())]);
+        let values = super::FormValues::from([
+            (
+                "profile".to_owned(),
+                PromptFormValue::Text("bad name!".into()),
+            ),
+            (
+                "endpoint".to_owned(),
+                PromptFormValue::Text("ftp://nope".into()),
+            ),
+            (
+                "credential".to_owned(),
+                PromptFormValue::Text("relative/key".into()),
+            ),
+            ("cols".to_owned(), PromptFormValue::Integer(80)),
+            ("rows".to_owned(), PromptFormValue::Integer(24)),
+            (
+                "executable".to_owned(),
+                PromptFormValue::Text(String::new()),
+            ),
+        ]);
+        let Err(errors) = super::check_setup(&map, "main", &values) else {
+            panic!("invalid answers must be rejected");
+        };
+        assert_eq!(
+            errors.keys().copied().collect::<Vec<_>>(),
+            ["credential", "endpoint", "profile"]
+        );
+        let request = super::setup_request(&map, &values, &errors);
+        let PromptField::Form { sections, .. } = &request.field else {
+            panic!("setup uses one form");
+        };
+        assert_eq!(sections.len(), 2, "advanced adds the terminal section");
+        let profile = &sections[0].fields[0];
+        assert!(profile.error.is_some());
+        assert!(matches!(
+            &profile.kind,
+            bmux_plugin_sdk::PromptFormFieldKind::Text { initial_value, .. } if initial_value == "bad name!"
+        ));
+    }
+
+    #[test]
+    fn setup_form_skips_flagged_values_and_accepts_valid_answers() {
+        use bmux_plugin_sdk::{PromptField, PromptFormValue};
+        let map = std::collections::BTreeMap::from([(
+            "--endpoint".to_owned(),
+            "https://relay.example.com".to_owned(),
+        )]);
+        let request = super::setup_request(&map, &super::FormValues::new(), &Default::default());
+        let PromptField::Form { sections, .. } = &request.field else {
+            panic!("setup uses one form");
+        };
+        let ids = sections[0]
+            .fields
+            .iter()
+            .map(|field| field.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, ["profile", "credential"]);
+        let values = super::FormValues::from([
+            ("profile".to_owned(), PromptFormValue::Text("work".into())),
+            (
+                "credential".to_owned(),
+                PromptFormValue::Text("/keys/relay".into()),
+            ),
+        ]);
+        let Ok(answers) = super::check_setup(&map, "main", &values) else {
+            panic!("valid answers are accepted");
+        };
+        assert_eq!(answers.key, "work");
+        assert_eq!(answers.endpoint, "https://relay.example.com");
+        assert_eq!(answers.terminal.cols, 80);
+    }
+
     use super::*;
     #[test]
     fn picker_resolves_numbers_and_pasted_uuids_only_in_displayed_snapshot() {

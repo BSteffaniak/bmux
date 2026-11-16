@@ -2157,6 +2157,22 @@ pub struct AppearanceConfig {
     /// Format string for the outer terminal's title bar. Empty string leaves
     /// the title unset.
     pub window_title_format: String,
+    /// Field arrangement for multi-field prompt forms. AUTO follows the
+    /// requesting plugin's hint and otherwise uses COMPACT.
+    pub prompt_form_layout: PromptFormLayoutSetting,
+}
+
+/// Field arrangement for multi-field prompt forms.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, ConfigDocEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptFormLayoutSetting {
+    /// Follow the requesting plugin's hint; compact when it gives none.
+    #[default]
+    Auto,
+    /// One row per field with a right-aligned label column.
+    Compact,
+    /// Labels above bordered controls, with help text always shown.
+    Stacked,
 }
 
 /// How pane history behaves while a client is in scrollback.

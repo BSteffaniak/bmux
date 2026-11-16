@@ -4,9 +4,9 @@
 
 //! Prompted Actions plugin for bmux.
 //!
-//! Provides config-driven prompted action sequences — keybinding-triggered
-//! flows that show one or more prompts, collect values, substitute them into
-//! an action template, and dispatch the result to the attach loop.
+//! Provides config-driven prompted actions — keybinding-triggered flows that
+//! collect values with one form, substitute them into an action template, and
+//! dispatch the result to the attach loop.
 //!
 //! # Configuration
 //!
@@ -17,20 +17,21 @@
 //!
 //! [[plugins.settings."bmux.prompted_actions".actions]]
 //! name = "recording-cut"
+//! title = "Cut Recording"
+//! submit_label = "Export"
 //! command = "plugin:bmux.recording:recording-cut --last-seconds {seconds} --export-fps {fps}"
 //!
 //! [[plugins.settings."bmux.prompted_actions".actions.prompts]]
 //! key = "seconds"
 //! type = "text"
-//! title = "Cut Recording"
+//! title = "Seconds"
 //! placeholder = "last N seconds"
 //! validation = "positive_integer"
 //!
 //! [[plugins.settings."bmux.prompted_actions".actions.prompts]]
 //! key = "fps"
 //! type = "text"
-//! title = "GIF Frame Rate"
-//! placeholder = "24"
+//! title = "Frame rate"
 //! default = "24"
 //! validation = "positive_integer"
 //! ```

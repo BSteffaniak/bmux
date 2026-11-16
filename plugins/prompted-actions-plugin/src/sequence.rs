@@ -1,44 +1,33 @@
-//! Async prompted-action sequence runner.
+//! Async prompted-action runner.
 //!
 //! Spawned on a tokio task from [`run_command`](super::PromptedActionsPlugin::run_command).
-//! Iterates through the prompt definitions, collects values, substitutes
-//! them into the action template, and dispatches the final action.
+//! Shows one form with a field per prompt definition, substitutes the
+//! submitted values into the action template, and dispatches the result.
 
 use std::collections::BTreeMap;
 
 use bmux_plugin::{action_dispatch, prompt};
-use bmux_plugin_sdk::PromptResponse;
+use bmux_plugin_sdk::{PromptResponse, PromptValue};
 use tracing::{debug, warn};
 
-use crate::config::{ActionDef, build_prompt_request, format_prompt_value};
+use crate::config::{ActionDef, build_form_request, template_values};
 
-/// Run a prompted action sequence to completion.
+/// Collect every value with one form, then dispatch the filled template.
 ///
-/// Shows each prompt in order, collecting values.  If any prompt is
-/// cancelled or fails, the entire sequence is aborted silently.
-/// On successful completion of all prompts, the action template is
-/// filled and dispatched to the attach loop.
+/// Cancelling, a busy prompt host, or a prompt error aborts silently.
 pub async fn run_prompted_sequence(
     action: ActionDef,
     prompt: prompt::PromptPort,
     actions: action_dispatch::ActionDispatchPort,
 ) {
-    let mut values: BTreeMap<String, String> = BTreeMap::new();
-
-    for prompt_def in &action.prompts {
-        let request = build_prompt_request(prompt_def);
-
-        match prompt.request(request).await {
-            Ok(PromptResponse::Submitted(value)) => {
-                let formatted = format_prompt_value(
-                    &prompt_def_to_field_for_format(&prompt_def.field_type),
-                    &value,
-                );
-                values.insert(prompt_def.key.clone(), formatted);
-                debug!(
-                    key = %prompt_def.key,
-                    "prompted action: collected value"
-                );
+    let values = if action.prompts.is_empty() {
+        BTreeMap::new()
+    } else {
+        match prompt.request(build_form_request(&action)).await {
+            Ok(PromptResponse::Submitted(PromptValue::Form(values))) => template_values(&values),
+            Ok(PromptResponse::Submitted(other)) => {
+                warn!(action = %action.name, ?other, "prompted action: unexpected prompt value");
+                return;
             }
             Ok(PromptResponse::Cancelled) => {
                 debug!(action = %action.name, "prompted action cancelled by user");
@@ -57,7 +46,7 @@ pub async fn run_prompted_sequence(
                 return;
             }
         }
-    }
+    };
 
     let action_string = substitute_template(&action.command, &values);
     debug!(action = %action.name, dispatched = %action_string, "prompted action dispatching");
@@ -68,23 +57,6 @@ pub async fn run_prompted_sequence(
             %error,
             "prompted action failed: dispatch error"
         );
-    }
-}
-
-/// Minimal helper to pass a dummy `PromptField` to `format_prompt_value`.
-///
-/// The format function only matches on the `PromptValue` variant, not the
-/// field, so the field type is only used for future extensibility.
-const fn prompt_def_to_field_for_format(
-    _field_type: &crate::config::PromptFieldType,
-) -> bmux_plugin_sdk::PromptField {
-    // The format function dispatches on the PromptValue enum, not the field.
-    // Return a minimal placeholder.
-    bmux_plugin_sdk::PromptField::TextInput {
-        initial_value: String::new(),
-        placeholder: None,
-        required: false,
-        validation: None,
     }
 }
 

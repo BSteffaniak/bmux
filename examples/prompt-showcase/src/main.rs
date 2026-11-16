@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
 use bmux_cli::attach::{
-    self, AttachExitReason, PromptOption, PromptRequest, PromptResponse, PromptSubmitError,
-    PromptValue,
+    self, AttachExitReason, PromptFormField, PromptFormSection, PromptOption, PromptRequest,
+    PromptResponse, PromptSubmitError, PromptValidation, PromptValue,
 };
 use bmux_client::BmuxClient;
 use bmux_sandbox_harness::SandboxHarness;
@@ -109,7 +109,9 @@ async fn run_prompt_sequence() -> Result<Vec<String>> {
 
     let confirm = request_prompt_with_retry(|| {
         PromptRequest::confirm("Prompt Showcase")
-            .message("We will run confirm, text input, single select, and multi toggle prompts.")
+            .message(
+                "We will run confirm, text input, single select, multi toggle, and form prompts.",
+            )
             .submit_label("Continue")
             .cancel_label("Stop")
             .confirm_default(true)
@@ -169,6 +171,57 @@ async fn run_prompt_sequence() -> Result<Vec<String>> {
     })
     .await?;
     lines.push(format_prompt_line("multi_toggle", &multi_toggle));
+
+    let form = request_prompt_with_retry(|| {
+        PromptRequest::form(
+            "Session Setup",
+            vec![
+                PromptFormSection::new(
+                    "basics",
+                    "Basics",
+                    vec![
+                        PromptFormField::text("name", "Name", "")
+                            .placeholder("demo-session")
+                            .required(true)
+                            .description("Shown in the status bar and session list."),
+                        PromptFormField::text("panes", "Panes", "2")
+                            .validation(PromptValidation::PositiveInteger),
+                        PromptFormField::choice(
+                            "layout",
+                            "Layout",
+                            vec![
+                                PromptOption::new("tall", "Tall"),
+                                PromptOption::new("wide", "Wide"),
+                                PromptOption::new("grid", "Grid"),
+                            ],
+                            1,
+                        ),
+                    ],
+                ),
+                PromptFormSection::new(
+                    "extras",
+                    "Extras",
+                    vec![
+                        PromptFormField::multi(
+                            "features",
+                            "Features",
+                            vec![
+                                PromptOption::new("line-numbers", "Line numbers"),
+                                PromptOption::new("timestamps", "Timestamps"),
+                                PromptOption::new("soft-wrap", "Soft wrap"),
+                            ],
+                            vec![0],
+                        ),
+                        PromptFormField::toggle("attach", "Attach now", true),
+                    ],
+                ),
+            ],
+        )
+        .message("Every value in one modal: Tab moves, Enter submits.")
+        .submit_label("Create")
+    })
+    .await?;
+    lines.push(format_prompt_line("form", &form));
 
     let done = request_prompt_with_retry(|| {
         PromptRequest::confirm("Showcase Complete")
