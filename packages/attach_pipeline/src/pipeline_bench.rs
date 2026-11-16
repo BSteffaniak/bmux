@@ -16,7 +16,8 @@
 
 use crate::reconcile::apply_attach_output_chunk_with;
 use crate::render::{
-    DamageCoalescingPolicy, FrameDamage, append_pane_output, render_attach_scene_with_stats,
+    AttachSceneRenderStats, DamageCoalescingPolicy, FrameDamage, append_pane_output,
+    render_attach_scene_with_stats,
 };
 use crate::types::{PaneRenderBuffer, PaneScrollbackViews};
 use bmux_attach_layout_protocol::{
@@ -68,7 +69,11 @@ fn scene(pane_id: Uuid, (cols, rows): (u16, u16)) -> AttachScene {
 
 /// Whether a synchronized update is open after `bytes`, given it was `open` before.
 fn sync_after(open: bool, bytes: &[u8]) -> bool {
-    let last = |marker: &[u8]| bytes.windows(marker.len()).rposition(|window| window == marker);
+    let last = |marker: &[u8]| {
+        bytes
+            .windows(marker.len())
+            .rposition(|window| window == marker)
+    };
     match (last(SYNC_BEGIN), last(SYNC_END)) {
         (Some(begin), Some(end)) => begin > end,
         (Some(_), None) => true,
@@ -84,6 +89,7 @@ struct Costs {
     bytes_in: usize,
     bytes_out: usize,
     deferred: usize,
+    scrolled: usize,
 }
 
 fn percentile(samples: &mut [Duration], percent: usize) -> Duration {
@@ -109,80 +115,130 @@ fn average(samples: &[Duration]) -> Duration {
     samples.iter().sum::<Duration>() / count
 }
 
-fn run(name: &str, size: (u16, u16), frames: &[Frame]) {
-    let pane_id = Uuid::from_u128(2);
-    let scene = scene(pane_id, size);
-    let mut buffers = BTreeMap::new();
-    let mut buffer = PaneRenderBuffer::default();
-    buffer
-        .terminal_grid
-        .resize(size.0, size.1)
-        .expect("grid size");
-    buffers.insert(pane_id, buffer);
-    let chunk_size = delivery();
-    let mut offset = 0u64;
-    let mut open = false;
-    let mut costs = Costs::default();
-    let mut output = Vec::new();
-    for (index, frame) in frames.iter().enumerate() {
+/// A pane fed corpus frames as a client receives them, and rendered once per frame.
+struct Replay {
+    pane_id: Uuid,
+    size: (u16, u16),
+    scene: AttachScene,
+    buffers: BTreeMap<Uuid, PaneRenderBuffer>,
+    policy: DamageCoalescingPolicy,
+    chunk_size: usize,
+    offset: u64,
+    open: bool,
+    frames: usize,
+}
+
+struct Rendered {
+    apply: Duration,
+    render: Duration,
+    stats: AttachSceneRenderStats,
+}
+
+impl Replay {
+    fn new(size: (u16, u16), scroll_passthrough: bool, chunk_size: usize) -> Self {
+        let pane_id = Uuid::from_u128(2);
+        let mut buffer = PaneRenderBuffer::default();
+        buffer
+            .terminal_grid
+            .resize(size.0, size.1)
+            .expect("grid size");
+        Self {
+            pane_id,
+            size,
+            scene: scene(pane_id, size),
+            buffers: BTreeMap::from([(pane_id, buffer)]),
+            policy: DamageCoalescingPolicy {
+                scroll_passthrough,
+                ..DamageCoalescingPolicy::default()
+            },
+            chunk_size: chunk_size.max(1),
+            offset: 0,
+            open: false,
+            frames: 0,
+        }
+    }
+
+    /// Apply `frame` and render, writing what the host terminal receives to `output`.
+    fn frame(&mut self, frame: &[u8], output: &mut Vec<u8>) -> Rendered {
         let started = Instant::now();
-        for chunk in frame.chunks(chunk_size.max(1)) {
-            open = sync_after(open, chunk);
-            let end = offset + chunk.len() as u64;
+        for chunk in frame.chunks(self.chunk_size) {
+            self.open = sync_after(self.open, chunk);
+            let end = self.offset + chunk.len() as u64;
             apply_attach_output_chunk_with(
-                &mut buffers,
-                pane_id,
+                &mut self.buffers,
+                self.pane_id,
                 chunk,
                 AttachOutputChunkMeta {
-                    stream_start: offset,
+                    stream_start: self.offset,
                     stream_end: end,
                     stream_gap: false,
-                    sync_update_active: open,
+                    sync_update_active: self.open,
                 },
                 append_pane_output,
             );
-            offset = end;
+            self.offset = end;
         }
         let applied = started.elapsed();
         let mut damage = FrameDamage::default();
-        if index == 0 {
+        if self.frames == 0 {
             damage.mark_full_frame();
         } else {
-            damage.mark_content_surface(pane_id);
+            damage.mark_content_surface(self.pane_id);
         }
-        output.clear();
+        self.frames += 1;
         let started = Instant::now();
         let (_, stats) = render_attach_scene_with_stats(
-            &mut output,
-            &scene,
+            output,
+            &self.scene,
             &[],
-            &mut buffers,
+            &mut self.buffers,
             &damage,
             0,
             0,
             &PaneScrollbackViews::new(),
             false,
-            size,
+            self.size,
             &bmux_appearance::RuntimeAppearance::default(),
-            DamageCoalescingPolicy::default(),
+            self.policy,
             &[],
         )
         .expect("render");
-        let rendered = started.elapsed();
+        Rendered {
+            apply: applied,
+            render: started.elapsed(),
+            stats,
+        }
+    }
+
+    fn pane(&self) -> &bmux_terminal_grid::TerminalGrid {
+        self.buffers[&self.pane_id].terminal_grid.grid()
+    }
+}
+
+fn run(name: &str, size: (u16, u16), frames: &[Frame], scroll_passthrough: bool) {
+    let mut replay = Replay::new(size, scroll_passthrough, delivery());
+    let mut costs = Costs::default();
+    let mut output = Vec::new();
+    for (index, frame) in frames.iter().enumerate() {
+        output.clear();
+        let rendered = replay.frame(frame, &mut output);
         // The first frame is the full repaint every corpus starts with; it is not a scroll.
         if index > 0 {
-            costs.apply.push(applied);
-            costs.render.push(rendered);
+            costs.apply.push(rendered.apply);
+            costs.render.push(rendered.render);
             costs.bytes_in += frame.len();
             costs.bytes_out += output.len();
-            costs.deferred += usize::from(stats.pane_rows_sync_deferred > 0);
+            costs.deferred += usize::from(rendered.stats.pane_rows_sync_deferred > 0);
+            costs.scrolled += usize::try_from(rendered.stats.pane_rows_scrolled).unwrap_or(0);
         }
     }
     let frames = costs.apply.len();
     println!(
-        "{name} {}x{} ({frames} frames, {chunk_size} B chunks): apply avg {} p95 {} | render avg {} p95 {} | in {} B/frame, out {} B/frame, x{:.2} | deferred {}",
+        "{name} {}x{} ({frames} frames, {} B chunks, passthrough {}): apply avg {} p95 {} | render avg {} p95 {} | in {} B/frame, out {} B/frame, x{:.2} | rows scrolled {} | deferred {}",
         size.0,
         size.1,
+        replay.chunk_size,
+        if scroll_passthrough { "on" } else { "off" },
         ms(average(&costs.apply)),
         ms(percentile(&mut costs.apply, 95)),
         ms(average(&costs.render)),
@@ -190,8 +246,102 @@ fn run(name: &str, size: (u16, u16), frames: &[Frame]) {
         costs.bytes_in / frames.max(1),
         costs.bytes_out / frames.max(1),
         ratio(costs.bytes_out, costs.bytes_in),
+        costs.scrolled,
         costs.deferred,
     );
+}
+
+/// A cell as a terminal shows it: its text (blank when empty) and resolved style.
+fn shown(
+    grid: &bmux_terminal_grid::TerminalGrid,
+    row: usize,
+    col: usize,
+) -> (String, bmux_terminal_grid::Style) {
+    grid.viewport_row_ref(row)
+        .and_then(|cells| cells.cells().get(col))
+        .map_or_else(
+            || (" ".to_string(), bmux_terminal_grid::Style::default()),
+            |cell| {
+                let text = if cell.text().is_empty() {
+                    " "
+                } else {
+                    cell.text()
+                };
+                (text.to_string(), grid.palette().get(cell.style()))
+            },
+        )
+}
+
+#[test]
+fn scroll_passthrough_leaves_the_host_screen_as_a_full_repaint_would() {
+    let size = (60, 16);
+    for corpus in corpus::generated(size, 24) {
+        // Small deliveries, so frames also arrive split across chunks.
+        let mut replay = Replay::new(size, true, 97);
+        let mut host = bmux_terminal_grid::TerminalGridStream::new(
+            size.0,
+            size.1,
+            bmux_terminal_grid::GridLimits::default(),
+        )
+        .expect("host terminal");
+        let mut scrolled = 0;
+        let mut output = Vec::new();
+        for (index, frame) in corpus.frames.iter().enumerate() {
+            output.clear();
+            let rendered = replay.frame(frame, &mut output);
+            host.process(&output);
+            scrolled += rendered.stats.pane_rows_scrolled;
+            if rendered.stats.pane_rows_sync_deferred > 0 {
+                continue;
+            }
+            for row in 0..usize::from(size.1) {
+                for col in 0..usize::from(size.0) {
+                    assert_eq!(
+                        shown(host.grid(), row, col),
+                        shown(replay.pane(), row, col),
+                        "{} frame {index}: host differs from the pane at row {row} column {col}",
+                        corpus.name,
+                    );
+                }
+            }
+        }
+        if matches!(
+            corpus.name,
+            "su-scroll" | "region-linefeed" | "plain-stream"
+        ) {
+            assert!(
+                scrolled > 0,
+                "{}: no rows were moved on the host",
+                corpus.name
+            );
+        }
+    }
+}
+
+#[test]
+fn nothing_scrolls_on_the_host_under_a_surface_drawn_over_the_pane() {
+    let size = (60, 16);
+    let mut replay = Replay::new(size, true, 8192);
+    let mut floating = replay.scene.surfaces[0].clone();
+    floating.id = Uuid::from_u128(3);
+    floating.kind = AttachSurfaceKind::FloatingPane;
+    floating.z = 1;
+    floating.pane_id = Some(Uuid::from_u128(4));
+    floating.cursor_owner = false;
+    floating.rect = AttachRect {
+        x: 10,
+        y: 4,
+        w: 20,
+        h: 6,
+    };
+    floating.content_rect = floating.rect;
+    replay.scene.surfaces.push(floating);
+    let mut output = Vec::new();
+    for frame in corpus::su_scroll(size, 5) {
+        output.clear();
+        let rendered = replay.frame(&frame, &mut output);
+        assert_eq!(rendered.stats.pane_rows_scrolled, 0);
+    }
 }
 
 #[test]
@@ -199,7 +349,8 @@ fn run(name: &str, size: (u16, u16), frames: &[Frame]) {
 fn pipeline_bench() {
     let size = size();
     for corpus in corpus::generated(size, 300) {
-        run(corpus.name, corpus.size, &corpus.frames);
+        run(corpus.name, corpus.size, &corpus.frames, false);
+        run(corpus.name, corpus.size, &corpus.frames, true);
     }
     if let Ok(paths) = std::env::var("BMUX_BENCH_CORPUS") {
         for path in paths.split(',').filter(|path| !path.is_empty()) {
@@ -208,7 +359,8 @@ fn pipeline_bench() {
                 .file_stem()
                 .and_then(|stem| stem.to_str())
                 .unwrap_or("captured");
-            run(name, size, &frames);
+            run(name, size, &frames, false);
+            run(name, size, &frames, true);
         }
     }
 }

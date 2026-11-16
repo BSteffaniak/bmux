@@ -2773,6 +2773,7 @@ struct AttachPerfWindow {
     pane_row_segments_emitted: u64,
     pane_rows_cached_skipped: u64,
     pane_rows_sync_deferred: u64,
+    pane_rows_scrolled: u64,
     pane_cells_emitted: u64,
     extension_render_calls: u64,
     extension_render_op_calls: u64,
@@ -2856,6 +2857,7 @@ impl AttachPerfWindow {
             pane_row_segments_emitted: 0,
             pane_rows_cached_skipped: 0,
             pane_rows_sync_deferred: 0,
+            pane_rows_scrolled: 0,
             pane_cells_emitted: 0,
             extension_render_calls: 0,
             extension_render_op_calls: 0,
@@ -2991,6 +2993,9 @@ impl AttachPerfWindow {
         self.pane_rows_sync_deferred = self
             .pane_rows_sync_deferred
             .saturating_add(stats.pane_rows_sync_deferred);
+        self.pane_rows_scrolled = self
+            .pane_rows_scrolled
+            .saturating_add(stats.pane_rows_scrolled);
         self.pane_cells_emitted = self
             .pane_cells_emitted
             .saturating_add(stats.pane_cells_emitted);
@@ -3598,6 +3603,10 @@ fn insert_attach_render_work_payload(
     object.insert(
         "pane_rows_sync_deferred".to_string(),
         window.pane_rows_sync_deferred.into(),
+    );
+    object.insert(
+        "pane_rows_scrolled".to_string(),
+        window.pane_rows_scrolled.into(),
     );
     object.insert(
         "pane_cells_emitted".to_string(),
@@ -6215,6 +6224,7 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
                                         .behavior
                                         .damage
                                         .max_area_percent,
+                                    scroll_passthrough: false,
                                 };
                                 let scene_damage = attach_scene_damage_between(
                                     &previous.scene,
@@ -10349,6 +10359,7 @@ fn terminal_render_capabilities(
                 || view_state.host_image_caps.iterm2_inline,
             cell_pixel_width: view_state.host_image_caps.cell_pixel_width,
             cell_pixel_height: view_state.host_image_caps.cell_pixel_height,
+            left_right_margins: host_left_right_margins(),
             ..bmux_plugin::TerminalRenderCapabilities::default()
         }
     }
@@ -10359,8 +10370,18 @@ fn terminal_render_capabilities(
     )))]
     {
         let _ = view_state;
-        bmux_plugin::TerminalRenderCapabilities::default()
+        bmux_plugin::TerminalRenderCapabilities {
+            left_right_margins: host_left_right_margins(),
+            ..bmux_plugin::TerminalRenderCapabilities::default()
+        }
     }
+}
+
+/// Whether the host terminal implements left/right margins, so a pane narrower than the screen
+/// can be scrolled in place (detected once from the client's environment).
+fn host_left_right_margins() -> bool {
+    static MARGINS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *MARGINS.get_or_init(bmux_tui::capabilities::TerminalCapabilities::left_right_margins)
 }
 
 struct RetainedDamagePlan {
@@ -10980,10 +11001,14 @@ fn render_attach_frame_inner(
     mut render_trace: Option<&mut AttachRenderTrace>,
 ) -> Result<AttachFrameRenderStats> {
     let frame_started_at = PhaseChannel::Attach.enabled().then(Instant::now);
-    let damage_policy = DamageCoalescingPolicy {
+    let mut damage_policy = DamageCoalescingPolicy {
         max_rects: damage_config.max_rects,
         max_area_percent: damage_config.max_area_percent,
+        scroll_passthrough: false,
     };
+    // Rows may be moved on the host only when nothing was or will be drawn over pane content.
+    let content_was_covered =
+        view_state.retained_compositor.covers_content() || view_state.pane_images_presented;
     let appearance_resolver = AttachAppearanceResolver {
         fallback: runtime_appearance,
         view_state,
@@ -11062,6 +11087,9 @@ fn render_attach_frame_inner(
     );
     let frame_plan =
         RenderFramePlan::from_damage(retained_plan, &frame_damage, damage_config.visualize);
+    damage_policy.scroll_passthrough = !content_was_covered
+        && !view_state.retained_compositor.covers_content()
+        && !view_state.has_presented_images();
     let retained_repaint_by_id = frame_plan.retained.repaint_by_id();
 
     let mut frame_bytes = Vec::new();

@@ -23,8 +23,10 @@ use bmux_plugin::{
     render_text_width_u16,
 };
 use bmux_scene_protocol_render::paint::opaque_row_text as shared_opaque_row_text;
-use bmux_terminal_grid::{Cell, Color as GridColor, PhysicalRow, Style as GridStyle};
 use bmux_terminal::cursor::MoveTo;
+use bmux_terminal_grid::{
+    Cell, Color as GridColor, PhysicalRow, Style as GridStyle, ViewportScroll,
+};
 // Output-only composition never invokes a terminal encoder.
 macro_rules! queue {
     ($($args:tt)*) => {
@@ -94,6 +96,10 @@ pub fn plugin_scene_items_to_render_items(
 pub struct DamageCoalescingPolicy {
     pub max_rects: usize,
     pub max_area_percent: u16,
+    /// A pane whose application scrolled may have its rows moved on the host terminal with a
+    /// scroll region instead of redrawn. Allowed only when nothing the host draws after the
+    /// scene (prompts, popups) can sit over a pane, since moving rows would move it too.
+    pub scroll_passthrough: bool,
 }
 
 impl Default for DamageCoalescingPolicy {
@@ -101,6 +107,7 @@ impl Default for DamageCoalescingPolicy {
         Self {
             max_rects: 64,
             max_area_percent: 60,
+            scroll_passthrough: false,
         }
     }
 }
@@ -1871,6 +1878,8 @@ pub struct AttachSceneRenderStats {
     pub pane_row_segments_emitted: u64,
     pub pane_rows_cached_skipped: u64,
     pub pane_rows_sync_deferred: u64,
+    /// Pane rows moved on the host terminal with a scroll region instead of redrawn.
+    pub pane_rows_scrolled: u64,
     pub pane_cells_emitted: u64,
     pub vacated_regions_cleared: u64,
     pub vacated_cells_cleared: u64,
@@ -4845,6 +4854,18 @@ struct PaneContentRenderStage<'a> {
     runtime_appearance: &'a RuntimeAppearance,
     before_content_cells: &'a BeforeContentCells,
     content_damage: &'a PaneContentDamagePlan,
+    host_scroll: HostScroll,
+}
+
+/// How a pane's rows may be moved on the host terminal this frame when its application scrolled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HostScroll {
+    /// Not at all: changed rows are redrawn.
+    Off,
+    /// With a scroll region of whole rows (the pane spans the terminal's width).
+    Rows,
+    /// With a scroll region inside left/right margins (DECSLRM).
+    Margins,
 }
 
 struct RenderFrameOutputPlan<'a> {
@@ -4870,6 +4891,7 @@ struct SurfaceOutputPlan<'a> {
     /// This surface's pane scrollback view, resolved during planning.
     scrollback: Option<PaneScrollbackView>,
     runtime_appearance: &'a RuntimeAppearance,
+    host_scroll: HostScroll,
 }
 
 struct SurfaceOutputStages {
@@ -4950,10 +4972,11 @@ fn build_render_frame_output_plan<'a>(
             .map(|surface| surface.surface_id)
             .collect::<BTreeSet<_>>();
 
-    let surfaces: Vec<_> = ordered_surfaces
-        .into_iter()
-        .filter_map(|(surface_index, surface)| {
-            build_surface_output_plan(
+    let mut surfaces: Vec<_> = ordered_surfaces
+        .iter()
+        .enumerate()
+        .filter_map(|(order, &(surface_index, surface))| {
+            let mut plan = build_surface_output_plan(
                 surface_index,
                 surface,
                 viewport,
@@ -4967,7 +4990,25 @@ fn build_render_frame_output_plan<'a>(
                 damage_policy,
                 render_extensions,
                 render_context,
-            )
+            )?;
+            // Whatever is drawn after this pane over its content would move with its rows.
+            let content = DamageRect::new(
+                plan.content.x,
+                plan.content.y,
+                plan.content.w,
+                plan.content.h,
+            );
+            let covered = ordered_surfaces[order + 1..].iter().any(|(_, later)| {
+                later.visible
+                    && damage_rects_intersect(
+                        DamageRect::new(later.rect.x, later.rect.y, later.rect.w, later.rect.h),
+                        content,
+                    )
+            });
+            if covered {
+                plan.host_scroll = HostScroll::Off;
+            }
+            Some(plan)
         })
         .collect();
 
@@ -4975,6 +5016,11 @@ fn build_render_frame_output_plan<'a>(
         && !surfaces
             .iter()
             .any(|surface| surface.surface_plan.sync_deferred);
+    if full_frame_clear {
+        for surface in &mut surfaces {
+            surface.host_scroll = HostScroll::Off;
+        }
+    }
 
     RenderFrameOutputPlan {
         full_frame_clear,
@@ -5146,6 +5192,19 @@ fn build_surface_output_plan<'a>(
         }
     };
 
+    // Paint operations have no scroll, and output written before the content would move.
+    let host_scroll = host_scroll_for_surface(
+        surface.id,
+        ext_rect,
+        content,
+        viewport,
+        damage_policy.scroll_passthrough
+            && !crate::projection::capturing()
+            && before_content_output_plan.plans.is_empty(),
+        render_context.capabilities.left_right_margins,
+        render_extensions,
+    );
+
     Some(SurfaceOutputPlan {
         pane_id,
         surface_id: surface.id,
@@ -5161,7 +5220,56 @@ fn build_surface_output_plan<'a>(
         after_content_output_plan,
         scrollback: scrollback_views.get(&pane_id).copied(),
         runtime_appearance,
+        host_scroll,
     })
+}
+
+/// Whether this pane's rows may be moved on the host terminal, before what later surfaces draw
+/// over it is known: when the frame `allows` it, no extension paints inside the content, and the
+/// host can confine a scroll to the pane's columns (the pane spans the terminal, or the host has
+/// left/right `margins`).
+fn host_scroll_for_surface(
+    surface_id: Uuid,
+    ext_rect: ExtensionRect,
+    content: PaneRect,
+    viewport: DamageRect,
+    allows: bool,
+    margins: bool,
+    render_extensions: &[std::sync::Arc<dyn AttachRenderExtension>],
+) -> HostScroll {
+    let content_rect = ExtensionRect::new(content.x, content.y, content.w, content.h);
+    let allowed = allows
+        && !render_extensions.iter().any(|extension| {
+            extension.paints_inside_content(
+                surface_id,
+                &ext_rect,
+                RenderExtensionLayer::AfterPaneContent,
+                &content_rect,
+            )
+        });
+    if !allowed {
+        HostScroll::Off
+    } else if content.x == viewport.x && content.w == viewport.w {
+        HostScroll::Rows
+    } else if margins {
+        HostScroll::Margins
+    } else {
+        HostScroll::Off
+    }
+}
+
+fn damage_rects_intersect(a: DamageRect, b: DamageRect) -> bool {
+    let span = |start: u16, length: u16| (u32::from(start), u32::from(start) + u32::from(length));
+    let ((ax0, ax1), (bx0, bx1)) = (span(a.x, a.w), span(b.x, b.w));
+    let ((ay0, ay1), (by0, by1)) = (span(a.y, a.h), span(b.y, b.h));
+    ax0 < ax1
+        && bx0 < bx1
+        && ay0 < ay1
+        && by0 < by1
+        && ax0 < bx1
+        && bx0 < ax1
+        && ay0 < by1
+        && by0 < ay1
 }
 
 fn surface_output_stages(surface_plan: &PaneSurfaceFramePlan) -> SurfaceOutputStages {
@@ -5380,6 +5488,7 @@ fn execute_surface_output_plan<W: io::Write>(
                         runtime_appearance: plan.runtime_appearance,
                         before_content_cells: &before_content_cells,
                         content_damage: &plan.surface_plan.content_damage,
+                        host_scroll: plan.host_scroll,
                     },
                     render_stats,
                     render_trace,
@@ -5546,6 +5655,68 @@ fn execute_pane_content_row_output_plan<W: io::Write>(
     Ok(())
 }
 
+/// Move a pane's rows on the host terminal the way its application scrolled them, and the
+/// renderer's copy of the host's rows to match, so the row diff that follows redraws only the
+/// rows the move did not account for. Rows exposed by the move are forgotten, so they are drawn.
+/// Returns the rows moved (0 when the move is not allowed or not worth doing).
+fn scroll_host_rows<W: io::Write>(
+    stdout: &mut W,
+    stage: &PaneContentRenderStage<'_>,
+    prev_rows: &mut [String],
+    moved: ViewportScroll,
+) -> Result<u64> {
+    let ViewportScroll::Region { top, bottom, rows } = moved else {
+        return Ok(0);
+    };
+    // The copy must describe every row the host shows for the pane, at its current size.
+    if stage.host_scroll == HostScroll::Off
+        || prev_rows.len() != usize::from(stage.content.h)
+        || top > bottom
+        || bottom >= prev_rows.len()
+    {
+        return Ok(0);
+    }
+    let height = bottom - top + 1;
+    let lines = usize::try_from(rows.unsigned_abs()).unwrap_or(usize::MAX);
+    if lines == 0 || lines >= height {
+        return Ok(0);
+    }
+    let (Ok(first), Ok(last), Ok(count)) = (
+        u16::try_from(top),
+        u16::try_from(bottom),
+        u16::try_from(lines),
+    ) else {
+        return Ok(0);
+    };
+    let first = stage.content.y.saturating_add(first).saturating_add(1);
+    let last = stage.content.y.saturating_add(last).saturating_add(1);
+    let direction = if rows > 0 { 'S' } else { 'T' };
+    let margins = stage.host_scroll == HostScroll::Margins;
+    // Default colors, so the host blanks exposed rows plainly (they are redrawn below anyway).
+    stdout.write_all(b"\x1b[0m")?;
+    if margins {
+        let left = stage.content.x.saturating_add(1);
+        let right = stage.content.x.saturating_add(stage.content.w);
+        write!(stdout, "\x1b[?69h\x1b[{left};{right}s")?;
+    }
+    write!(stdout, "\x1b[{first};{last}r\x1b[{count}{direction}\x1b[r")?;
+    if margins {
+        stdout.write_all(b"\x1b[?69l")?;
+    }
+    let region = &mut prev_rows[top..=bottom];
+    let exposed = if rows > 0 {
+        region.rotate_left(lines);
+        height - lines..height
+    } else {
+        region.rotate_right(lines);
+        0..lines
+    };
+    for row in &mut region[exposed] {
+        row.clear();
+    }
+    Ok(u64::try_from(height - lines).unwrap_or(u64::MAX))
+}
+
 #[allow(clippy::too_many_lines)] // Preserve pane-row byte emission order while extracting the content stage.
 fn queue_pane_content_for_surface<W: io::Write>(
     stdout: &mut W,
@@ -5581,6 +5752,18 @@ fn queue_pane_content_for_surface<W: io::Write>(
             if !entry.retained_screen_copy && stage.scrollback.is_none_or(|view| view.pin.is_none())
             {
                 entry.scrollback_window = None;
+            }
+        }
+        // Rows the application scrolled since the last drawn frame: move the host's copy instead
+        // of redrawing them. Taken only when this frame draws, so moves accumulate across
+        // frames that do not.
+        if stage.content_damage.requires_redraw() && !stage.sync_deferred {
+            let moved = entry.terminal_grid.grid_mut().take_viewport_scroll();
+            if stage.scrollback.is_none() {
+                let scrolled = scroll_host_rows(stdout, stage, &mut entry.prev_rows, moved)?;
+                if let Some(stats) = render_stats.as_deref_mut() {
+                    stats.pane_rows_scrolled = stats.pane_rows_scrolled.saturating_add(scrolled);
+                }
             }
         }
         // Per-pane scrollback: a pane renders frozen history if and only if it
@@ -6447,6 +6630,7 @@ mod tests {
             DamageCoalescingPolicy {
                 max_rects: 1,
                 max_area_percent: 100,
+                scroll_passthrough: false,
             },
         );
 
@@ -6747,6 +6931,7 @@ mod tests {
             },
             scrollback: None,
             runtime_appearance: &runtime_appearance,
+            host_scroll: super::HostScroll::Off,
         };
 
         assert!(plan.should_execute());
@@ -7302,6 +7487,7 @@ mod tests {
         let policy = DamageCoalescingPolicy {
             max_rects: 1,
             max_area_percent: 100,
+            scroll_passthrough: false,
         };
         damage.mark_content_surface_rect(pane_id, DamageRect::new(0, 0, 1, 1), (20, 10), policy);
         damage.mark_content_surface_rect(pane_id, DamageRect::new(4, 0, 1, 1), (20, 10), policy);
@@ -7320,6 +7506,7 @@ mod tests {
         let policy = DamageCoalescingPolicy {
             max_rects: 64,
             max_area_percent: 50,
+            scroll_passthrough: false,
         };
         damage.mark_extension_surface_rect(
             surface_id,
@@ -9628,6 +9815,101 @@ mod tests {
     }
 
     #[test]
+    fn a_pane_beside_others_scrolls_inside_margins_and_its_row_copy_follows() {
+        use super::{HostScroll, PaneContentRenderStage, scroll_host_rows};
+        use bmux_terminal_grid::ViewportScroll;
+        let appearance = RuntimeAppearance::default();
+        let before_content_cells = BTreeMap::new();
+        let damage = PaneContentDamagePlan::from_frame(
+            Uuid::from_u128(1),
+            &FrameDamage::default(),
+            Vec::new(),
+            Vec::new(),
+        );
+        let mut stage = PaneContentRenderStage {
+            pane_id: Uuid::from_u128(1),
+            surface_index: 0,
+            content: PaneRect {
+                x: 10,
+                y: 2,
+                w: 20,
+                h: 5,
+            },
+            focus: false,
+            sync_deferred: false,
+            scrollback: None,
+            runtime_appearance: &appearance,
+            before_content_cells: &before_content_cells,
+            content_damage: &damage,
+            host_scroll: HostScroll::Margins,
+        };
+        let rows = || ["a", "b", "c", "d", "e"].map(String::from).to_vec();
+        let mut copy = rows();
+        let mut output = Vec::new();
+        let moved = ViewportScroll::Region {
+            top: 1,
+            bottom: 4,
+            rows: 2,
+        };
+        assert_eq!(
+            scroll_host_rows(&mut output, &stage, &mut copy, moved).unwrap(),
+            2
+        );
+        // Columns 11 through 30, rows 4 through 7 (one-based), up two lines.
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "\x1b[0m\x1b[?69h\x1b[11;30s\x1b[4;7r\x1b[2S\x1b[r\x1b[?69l"
+        );
+        assert_eq!(copy, ["a", "d", "e", "", ""]);
+
+        // Down, as whole rows.
+        stage.host_scroll = HostScroll::Rows;
+        let mut copy = rows();
+        let mut output = Vec::new();
+        let moved = ViewportScroll::Region {
+            top: 0,
+            bottom: 4,
+            rows: -1,
+        };
+        assert_eq!(
+            scroll_host_rows(&mut output, &stage, &mut copy, moved).unwrap(),
+            4
+        );
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "\x1b[0m\x1b[3;7r\x1b[1T\x1b[r"
+        );
+        assert_eq!(copy, ["", "a", "b", "c", "d"]);
+
+        // Nothing moves when it is off, the copy is stale, or the move clears the region.
+        for (host_scroll, copy_rows, moved) in [
+            (HostScroll::Off, 5, moved),
+            (HostScroll::Rows, 4, moved),
+            (
+                HostScroll::Rows,
+                5,
+                ViewportScroll::Region {
+                    top: 0,
+                    bottom: 4,
+                    rows: 5,
+                },
+            ),
+            (HostScroll::Rows, 5, ViewportScroll::Unknown),
+        ] {
+            stage.host_scroll = host_scroll;
+            let mut copy = rows()[..copy_rows].to_vec();
+            let before = copy.clone();
+            let mut output = Vec::new();
+            assert_eq!(
+                scroll_host_rows(&mut output, &stage, &mut copy, moved).unwrap(),
+                0
+            );
+            assert_eq!(output, [] as [u8; 0]);
+            assert_eq!(copy, before);
+        }
+    }
+
+    #[test]
     fn merged_repair_damage_repaints_cached_rows() {
         use super::{PaneContentRenderStage, queue_pane_content_for_surface};
         let pane_id = Uuid::from_u128(1);
@@ -9664,6 +9946,7 @@ mod tests {
             runtime_appearance: &appearance,
             before_content_cells: &before_content_cells,
             content_damage: &damage,
+            host_scroll: super::HostScroll::Off,
         };
         queue_pane_content_for_surface(&mut Vec::new(), &mut buffers, &stage, &mut None, &mut None)
             .unwrap();

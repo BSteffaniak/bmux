@@ -1434,6 +1434,28 @@ impl RetainedCompositor {
             .collect()
     }
 
+    /// Whether any painted surface that is not pane content sits above pane content it
+    /// overlaps, opaque or not. While one does, pane rows must not be moved on the host terminal,
+    /// since moving them would move what is drawn over them.
+    #[must_use]
+    pub fn covers_content(&self) -> bool {
+        let content = self
+            .surfaces
+            .values()
+            .filter(|surface| matches!(surface.payload, RetainedSurfacePayload::Content { .. }))
+            .collect::<Vec<_>>();
+        self.surfaces.values().any(|surface| {
+            !matches!(surface.payload, RetainedSurfacePayload::Content { .. })
+                && surface.paint_rect().is_some_and(|rect| {
+                    content.iter().any(|source| {
+                        surface.z_key() > source.z_key()
+                            && intersect_rects(rect, source.content_rect.unwrap_or(source.rect))
+                                .is_some()
+                    })
+                })
+        })
+    }
+
     /// A visible modal without a focusable child still excludes background keys.
     #[must_use]
     pub fn has_modal_scope(&self) -> bool {
@@ -1751,6 +1773,7 @@ pub fn retained_repaint_plan_from_frame_damage(
         DamageCoalescingPolicy {
             max_rects: usize::MAX,
             max_area_percent: 100,
+            scroll_passthrough: false,
         },
     );
     compositor.repaint_plan(&damage)
@@ -3199,6 +3222,47 @@ mod tests {
     }
 
     #[test]
+    fn content_is_covered_only_by_surfaces_painted_over_it() {
+        let pane = RetainedSurface::with_payload(
+            Uuid::from_u128(1),
+            DamageRect::new(0, 0, 80, 23),
+            10,
+            0,
+            RetainedOpacity::Opaque,
+            RetainedSurfacePayload::Content {
+                content_id: Uuid::from_u128(1),
+            },
+        )
+        .with_content_rect(DamageRect::new(1, 1, 78, 21));
+        let compositor = |others: Vec<RetainedSurface>| {
+            let mut compositor = RetainedCompositor::new();
+            compositor.replace_surfaces(
+                std::iter::once(pane.clone()).chain(others),
+                DamageRect::new(0, 0, 80, 24),
+                DamageCoalescingPolicy::default(),
+            );
+            compositor
+        };
+        assert!(!compositor(Vec::new()).covers_content());
+        // A status line below the pane, and a surface on its border only.
+        let status = RetainedSurface::builder(Uuid::from_u128(2), DamageRect::new(0, 23, 80, 1))
+            .layer(100)
+            .build();
+        let border = RetainedSurface::builder(Uuid::from_u128(3), DamageRect::new(0, 0, 80, 1))
+            .layer(100)
+            .build();
+        assert!(!compositor(vec![status.clone(), border]).covers_content());
+        // A see-through popup over the content still covers it; one beneath it does not.
+        let popup = RetainedSurface::builder(Uuid::from_u128(4), DamageRect::new(20, 5, 30, 8))
+            .layer(100)
+            .build();
+        assert!(compositor(vec![status, popup]).covers_content());
+        let underlay =
+            RetainedSurface::builder(Uuid::from_u128(5), DamageRect::new(0, 0, 80, 24)).build();
+        assert!(!compositor(vec![underlay]).covers_content());
+    }
+
+    #[test]
     fn nested_modal_focus_transfers_and_restores_only_present_targets() {
         fn surface(id: u128, layer: i16) -> RetainedSurface {
             let mut surface =
@@ -4215,6 +4279,7 @@ mod tests {
             DamageCoalescingPolicy {
                 max_rects: 64,
                 max_area_percent: 60,
+                scroll_passthrough: false,
             },
         );
 

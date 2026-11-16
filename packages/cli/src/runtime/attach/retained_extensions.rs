@@ -87,6 +87,16 @@ impl AttachRenderExtension for RetainedExtension {
         self.layer(id, *rect, layer)
             .map_or(RenderDamage::None, |value| value.damage.clone())
     }
+    fn paints_inside_content(
+        &self,
+        id: Uuid,
+        rect: &ExtensionRect,
+        layer: RenderExtensionLayer,
+        _: &ExtensionRect,
+    ) -> bool {
+        // Retained layers do not report their extent here; any layer on the surface counts.
+        self.layer(id, *rect, layer).is_some()
+    }
     fn render_layer_revision(&self, id: Uuid, layer: RenderExtensionLayer) -> Option<u64> {
         self.surfaces
             .iter()

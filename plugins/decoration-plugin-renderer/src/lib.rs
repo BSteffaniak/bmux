@@ -383,6 +383,28 @@ impl AttachRenderExtension for DecorationRenderExtension {
         decoration_surface_layer_damage(previous, current, layer)
     }
 
+    fn paints_inside_content(
+        &self,
+        surface_id: Uuid,
+        _surface_rect: &ExtensionRect,
+        layer: RenderExtensionLayer,
+        content: &ExtensionRect,
+    ) -> bool {
+        let Ok(cache) = self.cache.lock() else {
+            return true;
+        };
+        // What is on the terminal now and what the next render draws.
+        [
+            cache.rendered_surface_layer(&surface_id, layer),
+            cache.surface(&surface_id),
+        ]
+        .into_iter()
+        .flatten()
+        .flat_map(|surface| layer_paint_commands(surface, layer))
+        .flat_map(paint_command_damage)
+        .any(|rect| rect.intersects(*content))
+    }
+
     fn surface_damage(&self, surface_id: Uuid, _surface_rect: &ExtensionRect) -> RenderDamage {
         let Ok(cache) = self.cache.lock() else {
             return RenderDamage::None;

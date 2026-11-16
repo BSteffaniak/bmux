@@ -1090,7 +1090,11 @@ mod tests {
                 (b"\x1b[3;1H\x1b[2L", b"\x1b[3;1H\x1b[L\x1b[L"),
             ] {
                 let scrolled = screen(many, alternate);
-                assert_eq!(scrolled, screen(one, alternate), "{many:?} alternate={alternate}");
+                assert_eq!(
+                    scrolled,
+                    screen(one, alternate),
+                    "{many:?} alternate={alternate}"
+                );
             }
             // Rows outside the region stay; the region moved and its exposed rows are blank.
             let scrolled = screen(b"\x1b[2S", alternate);
@@ -1101,6 +1105,61 @@ mod tests {
             assert_eq!(lines[5], "");
             assert_eq!(lines[7], "line 8");
         }
+    }
+
+    #[test]
+    fn the_grid_reports_how_its_rows_moved_since_last_asked() {
+        use crate::ViewportScroll;
+        let mut stream =
+            crate::TerminalGridStream::new(10, 8, crate::GridLimits::default()).unwrap();
+        assert_eq!(
+            stream.grid_mut().take_viewport_scroll(),
+            ViewportScroll::None
+        );
+        stream.process(b"\x1b[2;7r\x1b[3S\x1b[S\x1b[T");
+        assert_eq!(
+            stream.grid_mut().take_viewport_scroll(),
+            ViewportScroll::Region {
+                top: 1,
+                bottom: 6,
+                rows: 3
+            }
+        );
+        assert_eq!(
+            stream.grid_mut().take_viewport_scroll(),
+            ViewportScroll::None
+        );
+        // A linefeed at the bottom of the full screen scrolls it.
+        stream.process(b"\x1b[r\x1b[8;1H\n\n");
+        assert_eq!(
+            stream.grid_mut().take_viewport_scroll(),
+            ViewportScroll::Region {
+                top: 0,
+                bottom: 7,
+                rows: 2
+            }
+        );
+        // Two regions, a screen switch, or a resize cannot be replayed as one scroll.
+        stream.process(b"\x1b[2;4r\x1b[S\x1b[5;7r\x1b[S");
+        assert_eq!(
+            stream.grid_mut().take_viewport_scroll(),
+            ViewportScroll::Unknown
+        );
+        stream.process(b"\x1b[?1049h");
+        assert_eq!(
+            stream.grid_mut().take_viewport_scroll(),
+            ViewportScroll::Unknown
+        );
+        stream.resize(10, 8).unwrap();
+        assert_eq!(
+            stream.grid_mut().take_viewport_scroll(),
+            ViewportScroll::None
+        );
+        stream.resize(12, 8).unwrap();
+        assert_eq!(
+            stream.grid_mut().take_viewport_scroll(),
+            ViewportScroll::Unknown
+        );
     }
 
     #[test]

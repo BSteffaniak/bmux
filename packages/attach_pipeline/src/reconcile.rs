@@ -608,6 +608,7 @@ mod tests {
         let policy = DamageCoalescingPolicy {
             max_rects: 64,
             max_area_percent: 100,
+            scroll_passthrough: false,
         };
 
         let damage = attach_scene_damage_between(&previous_scene, &next_scene, policy);

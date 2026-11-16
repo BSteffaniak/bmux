@@ -1037,6 +1037,10 @@ pub struct TerminalRenderCapabilities {
     pub graphics_alpha: bool,
     pub cell_pixel_width: u16,
     pub cell_pixel_height: u16,
+    /// The terminal implements left/right margins (DEC private mode 69 with DECSLRM), so a
+    /// rectangle narrower than the screen can be scrolled in place.
+    #[serde(default)]
+    pub left_right_margins: bool,
 }
 
 impl Default for TerminalRenderCapabilities {
@@ -1051,6 +1055,7 @@ impl Default for TerminalRenderCapabilities {
             graphics_alpha: false,
             cell_pixel_width: 0,
             cell_pixel_height: 0,
+            left_right_margins: false,
         }
     }
 }
@@ -1545,6 +1550,20 @@ pub trait AttachRenderExtension: Send + Sync {
     /// damage to a full-surface repaint. The default is conservative for
     /// overlay-style extensions and existing implementations.
     fn redraws_on_content_damage(&self, _layer: RenderExtensionLayer) -> bool {
+        true
+    }
+
+    /// Whether this extension painted, or will paint, cells inside `content` of the surface on
+    /// `layer`. The host moves a pane's rows on the terminal with a scroll region only when no
+    /// extension paints inside its content, since moving the rows would move those cells too.
+    /// The default is conservative: an extension that cannot tell is treated as painting there.
+    fn paints_inside_content(
+        &self,
+        _surface_id: Uuid,
+        _surface_rect: &ExtensionRect,
+        _layer: RenderExtensionLayer,
+        _content: &ExtensionRect,
+    ) -> bool {
         true
     }
 

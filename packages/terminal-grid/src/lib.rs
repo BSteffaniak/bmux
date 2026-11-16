@@ -44,7 +44,7 @@ pub use model::{
     GridRowWindow, HistoryLineAssembly, HistorySlice, HistorySliceEnd, HistorySliceError,
     MouseProtocolEncoding, MouseProtocolMode, PhysicalRow, ProjectedRows, ProtocolState,
     ScreenRowSource, ScreenRows, ScreenSelectionRow, SelectionCell, TerminalGrid,
-    TerminalGridError, physical_row_is_blank,
+    TerminalGridError, ViewportScroll, physical_row_is_blank,
 };
 pub use parser::{
     ProtocolProcessOutcome, TerminalGridStream, TerminalGridStreamDeltaError,

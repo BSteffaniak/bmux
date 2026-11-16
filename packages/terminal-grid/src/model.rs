@@ -784,6 +784,48 @@ pub enum TerminalGridError {
     InvalidSnapshot(&'static str),
 }
 
+/// How a grid's viewport rows moved: what a renderer must do to its copy of the previous frame
+/// before redrawing what changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ViewportScroll {
+    /// No row moved.
+    #[default]
+    None,
+    /// Rows `top..=bottom` moved by `rows`, positive toward row `top` (content scrolled up), and
+    /// the rows exposed at the other end were blanked. Rows outside the region did not move.
+    Region {
+        /// First row of the region.
+        top: usize,
+        /// Last row of the region.
+        bottom: usize,
+        /// Rows moved, positive up.
+        rows: i64,
+    },
+    /// Rows moved in ways one region scroll does not describe (several regions, a resize, a
+    /// screen switch, a reset): the previous frame must be redrawn.
+    Unknown,
+}
+
+impl ViewportScroll {
+    /// This followed by a scroll of rows `top..=bottom` by `rows`.
+    #[must_use]
+    pub const fn then(self, top: usize, bottom: usize, rows: i64) -> Self {
+        match self {
+            Self::None => Self::Region { top, bottom, rows },
+            Self::Region {
+                top: known_top,
+                bottom: known_bottom,
+                rows: known,
+            } if known_top == top && known_bottom == bottom => Self::Region {
+                top,
+                bottom,
+                rows: known.saturating_add(rows),
+            },
+            Self::Region { .. } | Self::Unknown => Self::Unknown,
+        }
+    }
+}
+
 /// Structured terminal state with bounded main-screen scrollback and isolated
 /// alternate-screen viewport.
 #[derive(Debug, Clone)]
@@ -824,6 +866,8 @@ pub struct TerminalGrid {
     total_scrolled_rows: u64,
     /// Local full-viewport scroll events, including alternate-screen scrolling.
     viewport_scroll_revision: u64,
+    /// How the viewport's rows moved since a renderer last took it.
+    viewport_scroll: ViewportScroll,
     autowrap: bool,
     pending_wrap: bool,
     scroll_region: Option<(usize, usize)>,
@@ -934,6 +978,7 @@ impl TerminalGrid {
             reset_revision: 0,
             total_scrolled_rows: 0,
             viewport_scroll_revision: 0,
+            viewport_scroll: ViewportScroll::None,
             autowrap: true,
             pending_wrap: false,
             scroll_region: None,
@@ -1038,6 +1083,8 @@ impl TerminalGrid {
             history_erase_revision: 0,
             reset_revision: 0,
             viewport_scroll_revision: 0,
+            // Rebuilt from a snapshot: nothing is known about how rows moved before it.
+            viewport_scroll: ViewportScroll::Unknown,
             total_scrolled_rows: snapshot
                 .total_scrolled_rows
                 .unwrap_or(u64::from(snapshot.scrollback_rows)),
@@ -1083,6 +1130,13 @@ impl TerminalGrid {
     #[must_use]
     pub const fn viewport_scroll_revision(&self) -> u64 {
         self.viewport_scroll_revision
+    }
+
+    /// How the viewport's rows moved since this was last taken, and start over. A renderer that
+    /// keeps the previous frame on a terminal can move those rows there instead of redrawing
+    /// them.
+    pub const fn take_viewport_scroll(&mut self) -> ViewportScroll {
+        std::mem::replace(&mut self.viewport_scroll, ViewportScroll::None)
     }
 
     #[must_use]
@@ -1139,6 +1193,10 @@ impl TerminalGrid {
         self.resize_with_main_row_shift(width, height).map(|_| ())
     }
 
+    fn note_viewport_scroll(&mut self, top: usize, bottom: usize, rows: i64) {
+        self.viewport_scroll = self.viewport_scroll.then(top, bottom, rows);
+    }
+
     /// Resize, returning the signed main viewport shift for unchanged columns.
     /// Positive values move old viewport positions toward history. The shift
     /// excludes history eviction; width reflow returns `None`.
@@ -1158,6 +1216,8 @@ impl TerminalGrid {
         if self.width == width && self.height == height {
             return Ok(Some(0));
         }
+        // A size change rewraps or crops rows; a renderer's previous frame no longer lines up.
+        self.viewport_scroll = ViewportScroll::Unknown;
         let same_width = self.width == width;
         let main_cursor = match self.mode {
             GridMode::Main => self.cursor,
@@ -1223,6 +1283,8 @@ impl TerminalGrid {
         if !matches!(mode, 47 | 1047 | 1049) {
             return;
         }
+        // The other screen's rows replace these; nothing moved within one screen.
+        self.viewport_scroll = ViewportScroll::Unknown;
         if enabled {
             if self.mode == GridMode::Alternate {
                 return;
@@ -1949,6 +2011,7 @@ impl TerminalGrid {
             reset.display_erase_revision = self.display_erase_revision.wrapping_add(1);
             reset.history_erase_revision = self.history_erase_revision.wrapping_add(1);
             reset.viewport_scroll_revision = self.viewport_scroll_revision;
+            reset.viewport_scroll = ViewportScroll::Unknown;
             reset.reset_revision = self.reset_revision.wrapping_add(1);
             reset.bump_content_revision();
             *self = reset;
@@ -2024,6 +2087,7 @@ impl TerminalGrid {
         }
         let fill = self.erase_style();
         let lines = count.min(bottom - top + 1);
+        self.note_viewport_scroll(top, bottom, i64::try_from(lines).unwrap_or(i64::MAX));
         // One rotation of the region's rows, then the exposed rows blanked: O(rows), not
         // O(lines x rows) clones of every cell.
         self.viewport_rows_mut(top, bottom).rotate_left(lines);
@@ -2050,6 +2114,7 @@ impl TerminalGrid {
         }
         let fill = self.erase_style();
         let lines = count.min(bottom - top + 1);
+        self.note_viewport_scroll(top, bottom, -i64::try_from(lines).unwrap_or(i64::MAX));
         self.viewport_rows_mut(top, bottom).rotate_right(lines);
         for row in top..top + lines {
             self.fill_viewport_row(row, fill);
@@ -2058,6 +2123,7 @@ impl TerminalGrid {
 
     fn scroll_up_one(&mut self) {
         self.viewport_scroll_revision = self.viewport_scroll_revision.wrapping_add(1);
+        self.note_viewport_scroll(0, self.height.saturating_sub(1), 1);
         let fill = self.erase_style();
         match self.mode {
             GridMode::Main => {
@@ -3512,6 +3578,7 @@ impl TerminalGrid {
             history_erase_revision: self.history_erase_revision,
             reset_revision: self.reset_revision,
             viewport_scroll_revision: self.viewport_scroll_revision,
+            viewport_scroll: ViewportScroll::Unknown,
             total_scrolled_rows: self.total_scrolled_rows,
             autowrap: self.autowrap,
             pending_wrap: self.pending_wrap,
