@@ -1,7 +1,7 @@
 # Pane output performance plan
 
-Status: phases 0 through 4 are implemented except phase 4's single renderer (see
-[Progress](#progress)).
+Status: phases 0 through 4 are implemented except phase 4's single renderer, which is planned
+in [Phase 5](#phase-5-one-renderer) (see [Progress](#progress)).
 
 A full-screen application in a large pane (420×90, 37,800 cells) feels laggy inside bmux and
 smooth in the same terminal without it. The application is not the cost: a code review scrolled
@@ -148,6 +148,71 @@ Nothing below lands without before and after numbers from these.
   terminal, which already has cell diffs, scroll-region acceleration, synchronized output and
   frame pacing, so improvements land once.
 
+## Phase 5: one renderer
+
+The attach client draws its frame into a bmux_tui buffer and presents it through bmux_tui's
+`Terminal`, replacing the attach renderer's own row diff, SGR encoder, scroll emission and
+cursor handling (`packages/attach_pipeline/src/render.rs`, about 6,200 lines without tests).
+bcode's TUI and the attach client then share one renderer, and an improvement to either is an
+improvement to both.
+
+### Where the two renderers stand
+
+`Terminal` already has what the attach renderer had to grow by hand: a retained buffer and cell
+diff, scroll-region acceleration with DECSLRM, synchronized output, image scenes with Kitty,
+Sixel and iTerm2, pointer shapes, and a staged commit for asynchronous delivery. The attach
+client already paints parts of its frame into bmux_tui buffers (help and prompt overlays, and the
+observer's `PreparedPresentation` for browser delivery), only to turn them back into render ops.
+
+At 420×90 `Terminal` is slower than the attach renderer now is, so moving onto it first would
+undo phase 4:
+
+* **Every frame touches every cell, several times.** Preparing a frame blanks or clones the
+  spare buffer, partial damage copies retained cells back with a per-cell region test
+  (`Buffer::restore_outside`), and the diff compares all cells. Damage limits only what is
+  painted and written.
+* **One scroll per frame, none with images.** `Frame` keeps only the largest scroll hint, and any
+  image placement in the old or new scene turns acceleration off. The attach renderer scrolls
+  each pane on its own and keeps scrolling while an image is elsewhere on screen.
+* **Cells cost an allocation and a width lookup.** `Cell::symbol` is a `String`, and each
+  `set_cell` recomputes the grapheme's width, which can disagree with the pane's emulator (an
+  emoji with VS16, ambiguous widths). There is no bulk copy and no way to give a width.
+* **Every style change resets.** The encoder writes `ESC[0;...m` and all attributes where the
+  attach renderer writes only what changed.
+
+### Steps
+
+Each step lands on its own, with numbers from `pipeline_bench`, bcode's screen benchmark and
+`bmux-bench replay`, and the pipeline benchmark's host-screen comparison after every frame.
+
+1. **Damage-limited frames in `Terminal`.** A regional frame paints into the retained buffer in
+   place (the damaged regions reset first) and diffs only the damaged rows and columns, so a
+   frame costs its damage, not the screen. Full frames are unchanged.
+2. **A scroll per region.** `Frame` keeps every non-overlapping scroll hint, and `Terminal`
+   emits one scroll per hint that still saves cells. Images turn acceleration off only where
+   they intersect the scrolled region.
+3. **Cheaper cells.** Graphemes are stored inline up to a small size (as the grid's `CellText`
+   is), and a `PaintCx` row write takes cells with their width, for callers that already know it.
+4. **Incremental SGR.** The encoder writes the difference between the current and next style.
+5. **Pane content through `Terminal`.** The attach client paints each pane's visible rows into
+   the frame (with under-cells, content effects and selection) as damage from the rows its grid
+   marked dirty, and gives the pane's viewport scroll as a scroll hint. A pane inside an open
+   synchronized update is not painted or damaged, so its previous cells stay on screen.
+   `ShownRow`, `scroll_host_rows` and the row output plans go away.
+6. **Everything else through the buffer.** Borders, plugin surfaces, extension layers and the
+   damage overlay are painted as render ops into the frame (`projection::prepare_content_overlays`
+   already does this); help and prompt overlays paint directly instead of round-tripping through
+   render ops. The retained compositor stays as the source of damage, occlusion and hit-testing.
+7. **Images, cursor and pointer.** Pane images and Kitty overlays become image placements or the
+   output hooks; the cursor and pointer shape come from the frame. The host writer stays the
+   writer, with render deferral while it is behind.
+8. **One frame for the terminal and the observer.** The observer takes its presentation from the
+   same frame instead of capturing the renderer's output, and the capture machinery goes away.
+   Render statistics and traces map onto the new stages, so `bmux perf` keeps its fields.
+
+Steps 1 to 4 change only bmux_tui and are measured in bcode first. Steps 5 to 8 change the
+attach client, keep the old renderer reachable until step 8, and delete it then.
+
 ## Order
 
 1. Phase 0: the corpus and `bmux-bench pipeline`; then `replay` with end-to-end markers.
@@ -155,7 +220,7 @@ Nothing below lands without before and after numbers from these.
 3. Phase 3: region scrolls and the single server emulator.
 4. Phase 4: scroll passthrough, cell diffs and the writer thread.
 5. Phase 2's push and credit-based flow control.
-6. Phase 4's single renderer.
+6. Phase 4's single renderer, as phase 5.
 
 Each step is its own change with its benchmark numbers, and the budgets above are checked at
 the end of each phase.
@@ -198,8 +263,7 @@ At 420x90, SU scroll, the attach client renders in about 1 ms and writes 12 KB a
 
 Not done:
 
-* Phase 4's single renderer (attach panes presented through bmux_tui's `Terminal`). It is a
-  rewrite of the attach renderer, its extensions, overlays and images, and is a project of its own.
+* Phase 4's single renderer, planned as [phase 5](#phase-5-one-renderer).
 * Output events (`OutputAvailable`) are still JSON-encoded and broadcast; clients that have their
   output pushed ignore them.
 * The end-to-end budget (p95 4 ms) was measured only on a loaded machine; quiet-machine numbers
