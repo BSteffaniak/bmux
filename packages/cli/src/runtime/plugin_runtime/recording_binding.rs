@@ -20,6 +20,14 @@ impl bmux_recording_runtime::RecordingSink for OwnedSink {
             sink.0.record(kind, payload, meta);
         }
     }
+    fn accepts(
+        &self,
+        kind: bmux_recording_protocol::RecordingEventKind,
+        meta: bmux_recording_runtime::RecordMeta,
+    ) -> bool {
+        let sink = self.0.lock().ok().and_then(|slot| slot.clone());
+        sink.is_some_and(|sink| sink.0.accepts(kind, meta))
+    }
     fn record_checked(
         &self,
         kind: bmux_recording_protocol::RecordingEventKind,

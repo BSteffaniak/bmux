@@ -43,6 +43,13 @@ pub trait RecordingSink: Send + Sync {
     /// channel) and must not block on disk I/O.
     fn record(&self, kind: RecordingEventKind, payload: RecordingPayload, meta: RecordMeta);
 
+    /// Whether a record of `kind` with `meta` would be kept now. Hot paths ask before building
+    /// a payload (copying pane output, say) that would be dropped. Sinks that cannot tell
+    /// answer `true`.
+    fn accepts(&self, _kind: RecordingEventKind, _meta: RecordMeta) -> bool {
+        true
+    }
+
     /// Enqueue with explicit failure reporting, without a durability claim.
     ///
     /// # Errors

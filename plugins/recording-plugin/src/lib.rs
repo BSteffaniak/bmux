@@ -171,11 +171,42 @@ impl RecordingSink for DualRuntimeSink {
         Ok(())
     }
 
+    fn accepts(&self, kind: RecordingEventKind, meta: RecordMeta) -> bool {
+        let manual = self
+            .manual
+            .lock()
+            .is_ok_and(|runtime| runtime.accepts(kind, meta));
+        manual
+            || self.rolling.lock().is_ok_and(|runtime| {
+                runtime
+                    .as_ref()
+                    .is_some_and(|runtime| runtime.accepts(kind, meta))
+            })
+    }
+
     fn record(&self, kind: RecordingEventKind, payload: RecordingPayload, meta: RecordMeta) {
-        if let Ok(runtime) = self.manual.lock() {
-            let _ = runtime.record(kind, payload.clone(), meta);
+        // Copy the payload only when both runtimes keep it.
+        let rolling_accepts = self.rolling.lock().is_ok_and(|runtime| {
+            runtime
+                .as_ref()
+                .is_some_and(|runtime| runtime.accepts(kind, meta))
+        });
+        let mut payload = Some(payload);
+        if let Ok(runtime) = self.manual.lock()
+            && runtime.accepts(kind, meta)
+        {
+            let event = if rolling_accepts {
+                payload.clone()
+            } else {
+                payload.take()
+            };
+            if let Some(event) = event {
+                let _ = runtime.record(kind, event, meta);
+            }
         }
-        if let Ok(runtime) = self.rolling.lock()
+        if rolling_accepts
+            && let Some(payload) = payload
+            && let Ok(runtime) = self.rolling.lock()
             && let Some(runtime) = runtime.as_ref()
         {
             let _ = runtime.record(kind, payload, meta);

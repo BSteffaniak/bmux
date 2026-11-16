@@ -1067,6 +1067,43 @@ mod tests {
     }
 
     #[test]
+    fn scrolling_a_region_by_n_lines_equals_n_single_line_scrolls() {
+        let screen = |bytes: &[u8], alternate: bool| {
+            let mut stream =
+                crate::TerminalGridStream::new(12, 8, crate::GridLimits::default()).unwrap();
+            if alternate {
+                stream.process(b"\x1b[?1049h");
+            }
+            for row in 1..=8 {
+                stream.process(format!("\x1b[{row};1Hline {row}").as_bytes());
+            }
+            stream.process(b"\x1b[2;7r");
+            stream.process(bytes);
+            crate::render::visible_text(stream.grid(), 0, 8)
+        };
+        for alternate in [false, true] {
+            for (many, one) in [
+                (&b"\x1b[3S"[..], &b"\x1b[S\x1b[S\x1b[S"[..]),
+                (b"\x1b[3T", b"\x1b[T\x1b[T\x1b[T"),
+                (b"\x1b[9S", b"\x1b[6S"),
+                (b"\x1b[3;1H\x1b[2M", b"\x1b[3;1H\x1b[M\x1b[M"),
+                (b"\x1b[3;1H\x1b[2L", b"\x1b[3;1H\x1b[L\x1b[L"),
+            ] {
+                let scrolled = screen(many, alternate);
+                assert_eq!(scrolled, screen(one, alternate), "{many:?} alternate={alternate}");
+            }
+            // Rows outside the region stay; the region moved and its exposed rows are blank.
+            let scrolled = screen(b"\x1b[2S", alternate);
+            let lines: Vec<&str> = scrolled.lines().map(str::trim_end).collect();
+            assert_eq!(lines[0], "line 1");
+            assert_eq!(lines[1], "line 4");
+            assert_eq!(lines[4], "line 7");
+            assert_eq!(lines[5], "");
+            assert_eq!(lines[7], "line 8");
+        }
+    }
+
+    #[test]
     fn protocol_tracker_follows_synchronized_updates_across_chunks() {
         let mut tracker = crate::TerminalProtocolTracker::new();
         assert!(!tracker.synchronized_update());

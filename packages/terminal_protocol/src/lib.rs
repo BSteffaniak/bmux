@@ -143,9 +143,21 @@ impl TerminalProtocolEngine {
 
     #[must_use]
     pub fn process_output(&mut self, bytes: &[u8], cursor_pos: (u16, u16)) -> Vec<u8> {
+        self.process_output_with_cursor(bytes, |_| cursor_pos)
+    }
+
+    /// [`Self::process_output`] for a run of output whose cursor moves within it: `cursor_at`
+    /// is asked for the cursor position after the byte at a given index of `bytes`, only when a
+    /// cursor-position query ends there. A caller following the cursor with an emulator can then
+    /// feed it whole spans between queries instead of one byte at a time.
+    pub fn process_output_with_cursor(
+        &mut self,
+        bytes: &[u8],
+        mut cursor_at: impl FnMut(usize) -> (u16, u16),
+    ) -> Vec<u8> {
         let mut replies = Vec::new();
 
-        for byte in bytes {
+        for (index, byte) in bytes.iter().enumerate() {
             match self.state {
                 ParseState::Ground => {
                     if *byte == 0x1b {
@@ -200,6 +212,11 @@ impl TerminalProtocolEngine {
                         }
 
                         self.update_private_modes();
+                        let cursor_pos = if matches!(self.csi_buffer.as_slice(), b"6n" | b"?6n") {
+                            cursor_at(index)
+                        } else {
+                            (0, 0)
+                        };
                         if let Some((name, reply)) = csi_query_reply(
                             &self.csi_buffer,
                             cursor_pos,

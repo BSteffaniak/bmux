@@ -119,6 +119,18 @@ impl ImageHistorySnapshot {
 }
 
 impl ImageRegistry {
+    /// Whether the registry holds no image anywhere: live, in history, or on a hidden normal
+    /// screen. Screen changes then only flip state, so a caller may apply a run of them at once.
+    #[must_use]
+    pub fn holds_nothing(&self) -> bool {
+        self.images.is_empty()
+            && self.history.is_empty()
+            && self
+                .normal_screen
+                .as_deref()
+                .is_none_or(Self::holds_nothing)
+    }
+
     /// Whether normal-screen placements need remapping, including hidden history.
     #[must_use]
     pub fn has_main_images(&self) -> bool {

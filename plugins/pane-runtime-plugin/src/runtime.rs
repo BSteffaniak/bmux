@@ -350,6 +350,21 @@ pub(crate) fn publish_pane_event(event: PaneEvent) {
     }
 }
 
+/// Record an event built by `payload` only when a recording would keep it: pane output is
+/// copied for recording only while something records it.
+fn record_lazily_to_all_runtimes(
+    kind: RecordingEventKind,
+    meta: RecordMeta,
+    payload: impl FnOnce() -> RecordingPayload,
+) {
+    let Some(handle) = recording_sink() else {
+        return;
+    };
+    if handle.0.accepts(kind, meta) {
+        handle.0.record(kind, payload(), meta);
+    }
+}
+
 fn record_to_all_runtimes(kind: RecordingEventKind, payload: RecordingPayload, meta: RecordMeta) {
     let Some(handle) = bmux_plugin::global_plugin_state_registry()
         .get::<RecordingSinkHandle>()
@@ -795,13 +810,12 @@ fn process_pane_output_with_pointer_queries(
         PointerShape, PointerShapeQueryContext, encode_pointer_shape_query_reply,
     };
 
-    // All combined captures and writes acquire grid before output. Holding both
-    // guards prevents snapshots from pairing parsed state with another chunk's offset.
-    // Only collect replies here: PTY writes must happen after capture locks release.
+    // All combined captures and writes acquire grid before output. The grid guard is held from
+    // the parse through the push, so a snapshot (grid, then output) never pairs parsed state with
+    // another chunk's offset; the output guard is taken only for the push, so a client reading
+    // output does not wait for a parse. Only collect replies here: PTY writes must happen after
+    // capture locks release.
     let mut grid = terminal_grid
-        .lock()
-        .map_err(|_| SessionRuntimeError::Closed)?;
-    let mut output = output_buffer
         .lock()
         .map_err(|_| SessionRuntimeError::Closed)?;
     let mut replies = Vec::new();
@@ -819,7 +833,11 @@ fn process_pane_output_with_pointer_queries(
             );
         }
     });
-    output.push_chunk(bytes);
+    output_buffer
+        .lock()
+        .map_err(|_| SessionRuntimeError::Closed)?
+        .push_chunk(bytes);
+    drop(grid);
     Ok(replies)
 }
 
@@ -2378,15 +2396,18 @@ fn image_terminal_bytes(
     bytes: &[u8],
     replies: &mut Vec<u8>,
 ) -> std::io::Result<()> {
-    for byte in bytes {
+    // With no image anywhere, screen changes only flip registry state: apply the chunk's in
+    // one pass. Images move with each change in order, so then the chunk goes byte by byte.
+    let units: Box<dyn Iterator<Item = &[u8]>> = if registry.holds_nothing() {
+        Box::new(std::iter::once(bytes))
+    } else {
+        Box::new(bytes.chunks(1))
+    };
+    for unit in units {
         let erase = tracker.terminal_grid.grid().display_erase_revision();
         let history_erase = tracker.terminal_grid.grid().history_erase_revision();
         let reset = tracker.terminal_grid.grid().reset_revision();
-        replies.extend(protocol_reply_for_chunk(
-            protocol,
-            tracker,
-            std::slice::from_ref(byte),
-        ));
+        replies.extend(protocol_reply_for_chunk(protocol, tracker, unit));
         if reset != tracker.terminal_grid.grid().reset_revision() {
             registry.reset();
         }
@@ -2741,60 +2762,28 @@ fn protocol_reply_for_chunk(
     cursor_tracker: &mut PaneCursorTracker,
     chunk: &[u8],
 ) -> Vec<u8> {
-    let mut reply = Vec::new();
-    for byte in chunk {
-        let byte_slice = std::slice::from_ref(byte);
-        cursor_tracker.process(byte_slice);
-        let byte_reply =
-            protocol_engine.process_output(byte_slice, cursor_tracker.cursor_position());
-        if let Some((query_kind, reply_row, reply_col)) = parse_cpr_reply(&byte_reply) {
-            let (tracked_row, tracked_col) = cursor_tracker.cursor_position();
-            trace!(
-                query_kind,
-                reply_row,
-                reply_col,
-                tracked_row = tracked_row.saturating_add(1),
-                tracked_col = tracked_col.saturating_add(1),
-                pane_rows = cursor_tracker.rows,
-                pane_cols = cursor_tracker.cols,
-                alternate_screen = matches!(
-                    cursor_tracker.terminal_grid.grid().mode(),
-                    bmux_terminal_grid::GridMode::Alternate
-                ),
-                "pane protocol reply: cursor position report"
-            );
-        }
-        reply.extend(byte_reply);
-    }
+    // The tracker follows the chunk in whole spans, split only where a cursor-position query
+    // ends, so each reply still sees the cursor exactly as of its query.
+    let mut fed = 0;
+    let reply = protocol_engine.process_output_with_cursor(chunk, |index| {
+        cursor_tracker.process(&chunk[fed..=index]);
+        fed = index + 1;
+        let (row, col) = cursor_tracker.cursor_position();
+        trace!(
+            tracked_row = row.saturating_add(1),
+            tracked_col = col.saturating_add(1),
+            pane_rows = cursor_tracker.rows,
+            pane_cols = cursor_tracker.cols,
+            alternate_screen = matches!(
+                cursor_tracker.terminal_grid.grid().mode(),
+                bmux_terminal_grid::GridMode::Alternate
+            ),
+            "pane protocol reply: cursor position report"
+        );
+        (row, col)
+    });
+    cursor_tracker.process(&chunk[fed..]);
     reply
-}
-
-fn parse_cpr_reply(reply: &[u8]) -> Option<(&'static str, u16, u16)> {
-    if let Some(body) = reply.strip_prefix(b"\x1b[?")
-        && let Some((row, col)) = parse_cpr_coords(body, true)
-    {
-        return Some(("dec_cpr", row, col));
-    }
-    let body = reply.strip_prefix(b"\x1b[")?;
-    parse_cpr_coords(body, false).map(|(row, col)| ("cpr", row, col))
-}
-
-fn parse_cpr_coords(body: &[u8], dec: bool) -> Option<(u16, u16)> {
-    let body = body.strip_suffix(b"R")?;
-    if !dec && body.starts_with(b"?") {
-        return None;
-    }
-
-    let mut parts = body.splitn(2, |byte| *byte == b';');
-    let row = std::str::from_utf8(parts.next()?)
-        .ok()?
-        .parse::<u16>()
-        .ok()?;
-    let col = std::str::from_utf8(parts.next()?)
-        .ok()?
-        .parse::<u16>()
-        .ok()?;
-    Some((row, col))
 }
 
 fn parse_private_mode_number(bytes: &[u8]) -> Option<u16> {
@@ -7799,10 +7788,10 @@ impl SessionRuntimeManager {
                                     } else { break; }
                                 }
                                 let chunk = capture_output.as_slice();
-                                record_to_all_runtimes(
+                                record_lazily_to_all_runtimes(
                                     RecordingEventKind::PaneOutputRaw,
-                                    RecordingPayload::Bytes { data: chunk.to_vec() },
                                     RecordMeta { session_id: Some(session_id.0), pane_id: Some(pane_id), client_id: None },
+                                    || RecordingPayload::Bytes { data: chunk.to_vec() },
                                 );
                                 // Keep resize requests out until both image state
                                 // and the shared grid have consumed this chunk.

@@ -1990,13 +1990,6 @@ impl TerminalGrid {
         row
     }
 
-    fn viewport_row(&self, row: usize) -> PhysicalRow {
-        match self.mode {
-            GridMode::Main => self.main_rows[Self::viewport_absolute_row(row)].clone(),
-            GridMode::Alternate => self.alt_rows[row].clone(),
-        }
-    }
-
     fn set_viewport_row(&mut self, row: usize, value: PhysicalRow) {
         let absolute = Self::viewport_absolute_row(row);
         *self.active_row_mut(absolute) = value;
@@ -2030,12 +2023,24 @@ impl TerminalGrid {
                 .wrapping_add(u64::try_from(count.min(bottom - top + 1)).unwrap_or(u64::MAX));
         }
         let fill = self.erase_style();
-        for _ in 0..count.min(bottom - top + 1) {
-            for row in top..bottom {
-                let next = self.viewport_row(row + 1);
-                self.set_viewport_row(row, next);
-            }
-            self.fill_viewport_row(bottom, fill);
+        let lines = count.min(bottom - top + 1);
+        // One rotation of the region's rows, then the exposed rows blanked: O(rows), not
+        // O(lines x rows) clones of every cell.
+        self.viewport_rows_mut(top, bottom).rotate_left(lines);
+        for row in bottom + 1 - lines..=bottom {
+            self.fill_viewport_row(row, fill);
+        }
+    }
+
+    /// Viewport rows `top..=bottom` of the active screen as one slice.
+    fn viewport_rows_mut(&mut self, top: usize, bottom: usize) -> &mut [PhysicalRow] {
+        let (top, bottom) = (
+            Self::viewport_absolute_row(top),
+            Self::viewport_absolute_row(bottom),
+        );
+        match self.mode {
+            GridMode::Main => &mut self.main_rows.make_contiguous()[top..=bottom],
+            GridMode::Alternate => &mut self.alt_rows[top..=bottom],
         }
     }
 
@@ -2044,12 +2049,10 @@ impl TerminalGrid {
             return;
         }
         let fill = self.erase_style();
-        for _ in 0..count.min(bottom - top + 1) {
-            for row in (top + 1..=bottom).rev() {
-                let previous = self.viewport_row(row - 1);
-                self.set_viewport_row(row, previous);
-            }
-            self.fill_viewport_row(top, fill);
+        let lines = count.min(bottom - top + 1);
+        self.viewport_rows_mut(top, bottom).rotate_right(lines);
+        for row in top..top + lines {
+            self.fill_viewport_row(row, fill);
         }
     }
 

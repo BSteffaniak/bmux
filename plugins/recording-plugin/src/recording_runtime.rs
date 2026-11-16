@@ -401,6 +401,18 @@ impl RecordingRuntime {
         Ok(deleted)
     }
 
+    /// Whether [`Self::record`] would keep an event of `kind` with `meta` now.
+    #[must_use]
+    pub fn accepts(&self, kind: RecordingEventKind, meta: RecordMeta) -> bool {
+        self.active.as_ref().is_some_and(|active| {
+            active
+                .session_filter
+                .is_none_or(|filter| meta.session_id == Some(filter))
+                && active.event_kinds.contains(&kind)
+                && (!matches!(kind, RecordingEventKind::PaneInputRaw) || active.capture_input)
+        })
+    }
+
     /// Record a single event into the active recording.
     ///
     /// # Errors
