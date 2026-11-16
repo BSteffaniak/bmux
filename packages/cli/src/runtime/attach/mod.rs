@@ -16,6 +16,7 @@ mod pane_zoom;
 mod pane_zoom_native;
 mod pane_zoom_receipt;
 mod pointer_shape;
+mod presenter;
 mod prompt_search;
 pub mod prompt_ui;
 pub mod provider;

@@ -2492,7 +2492,8 @@ async fn sync_input_producer_barriers<T: AttachHost + ?Sized>(
     attach_input_processor: &mut InputProcessor,
     keyboard_enhanced: bool,
 ) -> Result<()> {
-    let Ok(Ok(barriers)) = attach_terminal_commands::client::input_producer_barriers_v2(client).await
+    let Ok(Ok(barriers)) =
+        attach_terminal_commands::client::input_producer_barriers_v2(client).await
     else {
         return Ok(());
     };
@@ -2509,10 +2510,8 @@ async fn sync_input_producer_barriers<T: AttachHost + ?Sized>(
             || {
                 let generation = terminal.fence_private_input()?;
                 // Drop chord/decoder state before acknowledging the application barrier.
-                *attach_input_processor = InputProcessor::new(
-                    attach_input_processor.keymap().clone(),
-                    keyboard_enhanced,
-                );
+                *attach_input_processor =
+                    InputProcessor::new(attach_input_processor.keymap().clone(), keyboard_enhanced);
                 Ok(generation)
             },
             Ok,
@@ -2594,8 +2593,9 @@ async fn update_output_push(
     if view_state.output_push.unsupported {
         return;
     }
-    let wanted: std::collections::BTreeSet<Uuid> =
-        output_batch_pane_ids(scene, view_state).into_iter().collect();
+    let wanted: std::collections::BTreeSet<Uuid> = output_batch_pane_ids(scene, view_state)
+        .into_iter()
+        .collect();
     if wanted == view_state.output_push.panes {
         return;
     }
@@ -11092,7 +11092,16 @@ fn render_attach_frame_to_output(
     let previous = view_state.retained_compositor.clone();
     let previous_focus = view_state.plugin_focus.clone();
     let observing = view_state.observer.is_some();
-    let (result, _operations) = if view_state.presentation_only {
+    let was_presenting = view_state.presenting;
+    view_state.presenting = super::presenter::usable(view_state);
+    if view_state.presenting && !was_presenting {
+        // The renderer's own bytes changed the host behind the terminal's back: repaint it all.
+        super::presenter::forget(view_state);
+        view_state
+            .dirty
+            .mark_full_frame(AttachDirtySource::ManualRedraw);
+    }
+    let (result, _operations) = if view_state.presentation_only || view_state.presenting {
         bmux_attach_pipeline::projection::capture_neutral(|| {
             render_attach_frame_inner(
                 terminal_writer,
@@ -11659,7 +11668,7 @@ fn render_attach_frame_inner(
     }
 
     if view_state.help_overlay_open || view_state.prompt.is_active() {
-        if view_state.presentation_only {
+        if view_state.presentation_only || view_state.presenting {
             pending_cursor_state = overlay_cursor_state;
         } else {
             apply_attach_cursor_state(
@@ -11684,7 +11693,7 @@ fn render_attach_frame_inner(
                 });
             cursor
         });
-        if view_state.presentation_only {
+        if view_state.presentation_only || view_state.presenting {
             pending_cursor_state = cursor_state;
         } else {
             apply_attach_cursor_state(
@@ -11728,6 +11737,40 @@ fn render_attach_frame_inner(
         && view_state.pointer_shape == view_state.last_pointer_shape;
     let write_result = if observer_unchanged {
         Ok(())
+    } else if view_state.presenting {
+        let operations = bmux_attach_pipeline::projection::staged_operations();
+        let margins = terminal_render_capabilities(view_state).left_right_margins;
+        match super::presenter::present(
+            view_state,
+            &operations,
+            pending_cursor_state,
+            frame_damage.is_full_frame(),
+            terminal_size,
+            margins,
+        ) {
+            super::presenter::Presented::Frame(bytes) => {
+                frame_bytes = bytes;
+                bmux_attach_pipeline::terminal::write_frame(
+                    terminal_writer
+                        .context("terminal output is unavailable for encoded presentation")?,
+                    &frame_bytes,
+                )
+                .context("failed writing or flushing attach frame")
+            }
+            super::presenter::Presented::Unchanged => Ok(()),
+            super::presenter::Presented::Unsupported(reason) => {
+                // Nothing reached the host: render everything as bytes from the next frame.
+                tracing::debug!(%reason, "attach frame needs the renderer's own bytes");
+                view_state.presenter_paused = true;
+                for buffer in view_state.pane_buffers.values_mut() {
+                    buffer.prev_rows.clear();
+                }
+                view_state
+                    .dirty
+                    .mark_full_frame(AttachDirtySource::ManualRedraw);
+                return Ok(AttachFrameRenderStats::default());
+            }
+        }
     } else if view_state.observer.is_some() || view_state.presentation_only {
         let cursor = view_state.last_cursor_state;
         view_state.last_cursor_state = pending_cursor_state;
@@ -11776,6 +11819,7 @@ fn render_attach_frame_inner(
         for buffer in view_state.pane_buffers.values_mut() {
             buffer.prev_rows.clear();
         }
+        super::presenter::forget(view_state);
         view_state
             .dirty
             .mark_full_frame(AttachDirtySource::ManualRedraw);
@@ -11790,6 +11834,9 @@ fn render_attach_frame_inner(
     view_state.last_cursor_state = pending_cursor_state;
     view_state.last_pointer_shape = view_state.pointer_shape;
     view_state.terminal_graphics_cache = pending_graphics_cache;
+    if !view_state.presenting {
+        super::presenter::rendered_as_bytes(view_state);
+    }
     #[cfg(any(
         feature = "image-sixel",
         feature = "image-kitty",
@@ -19045,6 +19092,205 @@ mod tests {
             .mark_extension_dirty(AttachDirtySource::PluginCommand);
         screen.process(&render(&mut state));
         assert!(bmux_terminal_grid::visible_text(screen.grid(), 0, 24).contains("default/tab-2"));
+    }
+
+    /// Two bordered panes side by side, the first owning the cursor, with their grids sized.
+    fn presenter_test_layout(state: &mut AttachViewState, panes: [Uuid; 2]) -> AttachLayoutState {
+        let session_id = Uuid::new_v4();
+        let mut surfaces = Vec::new();
+        for (index, pane) in panes.into_iter().enumerate() {
+            let x = u16::try_from(index).unwrap() * 40;
+            let mut surface = test_pane_surface(
+                pane,
+                AttachRect {
+                    x,
+                    y: 0,
+                    w: 40,
+                    h: 24,
+                },
+            );
+            surface.content_rect = AttachRect {
+                x: x + 1,
+                y: 1,
+                w: 38,
+                h: 22,
+            };
+            surface.cursor_owner = index == 0;
+            surfaces.push(surface);
+            let mut buffer = PaneRenderBuffer::default();
+            buffer.terminal_grid.resize(38, 22).unwrap();
+            state.pane_buffers.insert(pane, buffer);
+        }
+        AttachLayoutState {
+            context_id: None,
+            session_id,
+            focused_pane_id: panes[0],
+            panes: Vec::new(),
+            layout_root: PaneLayoutNode::Leaf { pane_id: panes[0] },
+            scene: AttachScene {
+                session_id,
+                focus: AttachFocusTarget::Pane { pane_id: panes[0] },
+                surfaces,
+            },
+            zoomed: false,
+        }
+    }
+
+    /// One step of the presenter test: output to a pane, or the prompt opening or closing.
+    enum PresenterTestStep {
+        Output(usize, Vec<u8>),
+        OpenPrompt,
+        ClosePrompt,
+    }
+
+    fn apply_presenter_test_step(
+        state: &mut AttachViewState,
+        panes: [Uuid; 2],
+        step: &PresenterTestStep,
+    ) {
+        match step {
+            PresenterTestStep::Output(pane, bytes) => {
+                let buffer = state.pane_buffers.get_mut(&panes[*pane]).unwrap();
+                buffer.terminal_grid.process(bytes);
+                state
+                    .dirty
+                    .mark_pane_dirty(panes[*pane], AttachDirtySource::PaneOutput);
+            }
+            PresenterTestStep::OpenPrompt => state.prompt.enqueue_internal(
+                PromptRequest::search_select(
+                    "Find Tab",
+                    vec![PromptOption::new("tab-2", "default/tab-2")],
+                ),
+                super::super::prompt_ui::AttachInternalPromptAction::QuitSession,
+            ),
+            PresenterTestStep::ClosePrompt => {
+                let _ = state.prompt.handle_key_event(&TermKeyEvent::new_with_kind(
+                    TermKeyCode::Esc,
+                    KeyModifiers::NONE,
+                    TermKeyEventKind::Press,
+                ));
+                state.dirty.overlay_needs_redraw = true;
+            }
+        }
+    }
+
+    /// Row `row` of `screen` as it looks: each cell's text and style, with glyph attributes on
+    /// a plain blank dropped (they are invisible, and the renderer and the presenter carry them
+    /// differently).
+    fn presenter_test_row(
+        screen: &bmux_terminal_grid::TerminalGridStream,
+        row: usize,
+    ) -> Vec<(String, bmux_terminal_grid::Style)> {
+        let grid = screen.grid();
+        let cells = grid.viewport_row_ref(row).unwrap();
+        (0..grid.width())
+            .map(|col| {
+                cells.cells().get(col).map_or_else(
+                    || (" ".to_string(), bmux_terminal_grid::Style::default()),
+                    |cell| {
+                        let text = if cell.text().is_empty() {
+                            " "
+                        } else {
+                            cell.text()
+                        };
+                        let mut style = grid.palette().get(cell.style());
+                        if text == " " && !style.underline && !style.strike && !style.inverse {
+                            style = bmux_terminal_grid::Style {
+                                bg: style.bg,
+                                ..bmux_terminal_grid::Style::default()
+                            };
+                        }
+                        (text.to_string(), style)
+                    },
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn frames_presented_through_a_terminal_show_what_the_renderer_draws() {
+        let panes = [Uuid::new_v4(), Uuid::new_v4()];
+        let open = || {
+            let mut state = AttachViewState::with_private_presentation(AttachOpenInfo {
+                session_id: Uuid::new_v4(),
+                context_id: None,
+                can_write: true,
+            });
+            install_bundled_render_extensions(&mut state);
+            state
+        };
+        let mut drawn = open();
+        let mut presented = open();
+        presented.terminal_presenter = Some(super::super::presenter::terminal());
+        let layout = presenter_test_layout(&mut drawn, panes);
+        presenter_test_layout(&mut presented, panes);
+        let screen = || {
+            bmux_terminal_grid::TerminalGridStream::new(
+                80,
+                24,
+                bmux_terminal_grid::GridLimits::default(),
+            )
+            .unwrap()
+        };
+        let mut screens = [screen(), screen()];
+        let lines = (0..40).fold(String::new(), |mut lines, line| {
+            let _ = std::fmt::Write::write_fmt(
+                &mut lines,
+                format_args!(
+                    "\x1b[3{}mline {line} \u{4e2d}\u{6587} text\x1b[0m\r\n",
+                    line % 8
+                ),
+            );
+            lines
+        });
+        let steps = [
+            PresenterTestStep::Output(0, Vec::new()),
+            PresenterTestStep::Output(0, b"left pane\r\nsecond row".to_vec()),
+            PresenterTestStep::Output(1, b"\x1b[44mright\x1b[0m pane \xe4\xb8\xad".to_vec()),
+            PresenterTestStep::Output(0, lines.clone().into_bytes()),
+            PresenterTestStep::Output(1, lines.into_bytes()),
+            PresenterTestStep::Output(0, b"\x1b[5;3H\x1b[1;31medit\x1b[0m\x1b[K".to_vec()),
+            PresenterTestStep::OpenPrompt,
+            PresenterTestStep::Output(0, b"\r\nmore\r\nlines\r\nunder the prompt".to_vec()),
+            PresenterTestStep::ClosePrompt,
+            PresenterTestStep::Output(1, b"\r\nafter the prompt".to_vec()),
+        ];
+        for (index, step) in steps.iter().enumerate() {
+            for (state, screen) in [&mut drawn, &mut presented].into_iter().zip(&mut screens) {
+                apply_presenter_test_step(state, panes, step);
+                let mut bytes = Vec::new();
+                render_attach_frame_to_writer(
+                    &mut bytes,
+                    state,
+                    &layout,
+                    &RuntimeAppearance::default(),
+                    &[],
+                    0,
+                    &bmux_config::DamageBehaviorConfig::default(),
+                    u64::MAX,
+                    &mut DisplayCaptureFanout::default(),
+                    TerminalGeometry { cols: 80, rows: 24 },
+                    None,
+                )
+                .unwrap();
+                screen.process(&bytes);
+            }
+            assert!(presented.presenting, "step {index} was not presented");
+            for row in 0..24 {
+                assert_eq!(
+                    presenter_test_row(&screens[1], row),
+                    presenter_test_row(&screens[0], row),
+                    "step {index}, row {row}: presented\n{}\ndrawn\n{}",
+                    bmux_terminal_grid::visible_text(screens[1].grid(), 0, 24),
+                    bmux_terminal_grid::visible_text(screens[0].grid(), 0, 24),
+                );
+            }
+        }
+        let shown = bmux_terminal_grid::visible_text(screens[1].grid(), 0, 24);
+        assert!(
+            !shown.contains("default/tab-2") && shown.contains("after the prompt"),
+            "{shown}"
+        );
     }
 
     fn render_observed_test_frame(state: &mut AttachViewState, layout: &AttachLayoutState) {

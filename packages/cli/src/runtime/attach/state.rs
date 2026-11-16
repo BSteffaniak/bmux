@@ -257,6 +257,14 @@ pub struct AttachViewState {
     pub(super) producer_barriers_changed: bool,
     /// Opt-in end-to-end latency log for replayed frames.
     pub(super) replay_log: super::replay_log::ReplayLog,
+    /// Present frames on the host through a `bmux_tui` terminal from what the renderer captures,
+    /// instead of the renderer's own bytes (`BMUX_ATTACH_PRESENTER=terminal`).
+    pub(super) terminal_presenter: Option<bmux_tui::terminal::Terminal<Vec<u8>>>,
+    /// The frame being rendered is presented through `terminal_presenter`.
+    pub(super) presenting: bool,
+    /// Frames use the renderer's own bytes until graphics a terminal frame cannot hold yet
+    /// are gone from the host.
+    pub(super) presenter_paused: bool,
     pub(super) prepared_extensions:
         Option<Vec<std::sync::Arc<dyn bmux_plugin::AttachRenderExtension>>>,
     pub(super) presentation_only: bool,
@@ -677,6 +685,9 @@ impl AttachViewState {
             output_push: OutputPush::default(),
             producer_barriers_changed: false,
             replay_log: super::replay_log::ReplayLog::from_env(),
+            terminal_presenter: super::presenter::from_env(),
+            presenting: false,
+            presenter_paused: false,
             prepared_extensions: None,
             presentation_only: false,
             allow_retarget: true,
