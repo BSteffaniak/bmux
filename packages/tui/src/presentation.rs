@@ -783,6 +783,17 @@ impl<E: std::error::Error + 'static> std::error::Error for PresentationError<E> 
 #[derive(Debug, Default)]
 struct SpareBuffer(std::sync::Mutex<Option<Spare>>);
 
+/// What a prepared frame's cells start as before painting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Start {
+    /// Blank in the damaged regions (all of a full frame), the committed cells elsewhere.
+    Blank,
+    /// The committed cells, painted over, with the damage given.
+    Repair,
+    /// The committed cells, painted over, with the painted cells as the damage.
+    Over,
+}
+
 /// A spare grid and where it may differ from the committed cells (`None`: anywhere).
 type Spare = (Buffer, Option<Vec<Rect>>);
 
@@ -1032,7 +1043,27 @@ impl PresentationState {
         damage: Damage,
         render: impl FnOnce(&mut PaintCx<'_, '_>),
     ) -> Option<PreparedPresentation> {
-        self.prepare_from(damage, false, render)
+        self.prepare_from(damage, Start::Blank, render)
+    }
+
+    /// Prepare a frame painted over the committed cells: what `render` paints replaces what was
+    /// shown, and every other cell stays as it is. The frame's damage is the cells painted, so
+    /// its cost is what was painted, not the screen.
+    ///
+    /// This is how output already planned as changes (an attach client's captured operations,
+    /// for example) is presented. Without committed cells the frame is a full one painted over
+    /// a blank screen.
+    #[must_use]
+    pub fn prepare_over(
+        &self,
+        render: impl FnOnce(&mut PaintCx<'_, '_>),
+    ) -> Option<PreparedPresentation> {
+        let damage = if self.previous.is_some() {
+            Damage::Regions(Vec::new())
+        } else {
+            Damage::Full
+        };
+        self.prepare_from(damage, Start::Over, render)
     }
 
     /// Repair committed cells with already-clipped output operations while
@@ -1053,7 +1084,7 @@ impl PresentationState {
             return Err(PresentationLimitError::Cells);
         }
         let prepared = self
-            .prepare_from(Damage::Full, true, render)
+            .prepare_from(Damage::Full, Start::Repair, render)
             .expect("full damage always prepares output");
         prepared.validate_limits(limits)?;
         Ok(prepared)
@@ -1144,7 +1175,7 @@ impl PresentationState {
     fn prepare_from(
         &self,
         damage: Damage,
-        repair: bool,
+        start: Start,
         render: impl FnOnce(&mut PaintCx<'_, '_>),
     ) -> Option<PreparedPresentation> {
         // Local-grid contributions are full replacements. A regional caller must
@@ -1169,9 +1200,12 @@ impl PresentationState {
         // what painting a blank frame and restoring everything outside the regions produces,
         // at the cost of the regions instead of the screen.
         // Modal scopes turn the frame into a full one after painting, which must start blank.
-        let in_place = (!repair && damage.is_regional() && self.modal_focus.is_empty())
-            .then_some(self.previous.as_ref())
-            .flatten();
+        let repair = start == Start::Repair;
+        let over = start == Start::Over && damage.is_regional();
+        let in_place = (over
+            || (start == Start::Blank && damage.is_regional() && self.modal_focus.is_empty()))
+        .then_some(self.previous.as_ref())
+        .flatten();
         let mut buffer = PresentationPhase::BufferAlloc.measure(
             || {
                 let spare = self.spare.take();
@@ -1222,6 +1256,17 @@ impl PresentationState {
             }
             PresentationPhase::Paint.measure(|| render(&mut PaintCx::new(&mut frame)), |()| true);
             written = frame.take_written();
+            if over {
+                // What was painted is the frame's damage.
+                requested_regions = written.as_ref().map_or_else(Vec::new, |written| {
+                    written
+                        .spans()
+                        .map(|(y, columns)| {
+                            Rect::new(columns.start, y, columns.end - columns.start, 1)
+                        })
+                        .collect()
+                });
+            }
             scroll_hints = frame.scroll_hints().to_vec();
             let metadata = PresentationPhase::MetadataExtract.measure(
                 || {
@@ -1721,6 +1766,57 @@ mod tests {
                      {regions:?}, ops {ops:?}: {mismatched:?}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn frames_painted_over_match_painting_over_the_committed_cells() {
+        let area = Rect::new(0, 0, 12, 5);
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = move |bound: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % bound
+        };
+        let mut state = PresentationState::new(area);
+        for frame in 0..2_000 {
+            let ops = random_ops(&mut next, area);
+            let expected = state.retained_buffer().map_or_else(
+                || {
+                    let mut buffer = Buffer::empty(area);
+                    apply_ops(&mut PaintCx::new(&mut Frame::new(&mut buffer)), &ops);
+                    buffer
+                },
+                |previous| {
+                    let mut buffer = previous.clone();
+                    apply_ops(&mut PaintCx::new(&mut Frame::new(&mut buffer)), &ops);
+                    buffer
+                },
+            );
+            // Now and then a full frame, so painting over follows other frames too.
+            let prepared = if frame % 7 == 3 {
+                state.prepare(Damage::Full, |cx| apply_ops(cx, &ops))
+            } else {
+                state.prepare_over(|cx| apply_ops(cx, &ops))
+            };
+            if frame % 7 == 3 {
+                let mut buffer = Buffer::empty(area);
+                apply_ops(&mut PaintCx::new(&mut Frame::new(&mut buffer)), &ops);
+                state
+                    .present_prepared(prepared, |_, _| Ok::<(), ()>(()))
+                    .unwrap();
+                assert_eq!(state.retained_buffer(), Some(&buffer), "frame {frame}");
+                continue;
+            }
+            state
+                .present_prepared(prepared, |_, _| Ok::<(), ()>(()))
+                .unwrap();
+            assert_eq!(
+                state.retained_buffer(),
+                Some(&expected),
+                "frame {frame}: {ops:?}"
+            );
         }
     }
 

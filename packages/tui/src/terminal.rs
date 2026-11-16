@@ -587,6 +587,35 @@ impl<W: Write> Terminal<W> {
         self.draw_prepared_with_output_hooks(prepared, before, overlay)
     }
 
+    /// Draw a frame painted over the committed one: what `render` paints replaces what the
+    /// terminal shows and nothing else changes (see [`PresentationState::prepare_over`]). Only
+    /// the painted cells are compared and written, so output already planned as changes, such
+    /// as a multiplexer's, costs what it changed.
+    ///
+    /// # Errors
+    /// Returns any I/O error reported by the backend writer.
+    pub fn draw_over(
+        &mut self,
+        render: impl FnOnce(&mut PaintCx<'_, '_>),
+    ) -> io::Result<DrawStats> {
+        self.draw_over_with_output_hooks(render, |_| Ok(false), |_, _, _| Ok(()))
+    }
+
+    /// [`Self::draw_over`] with the output hooks of
+    /// [`Self::draw_damage_with_output_hooks`].
+    ///
+    /// # Errors
+    /// Returns output or hook errors without committing failed output.
+    pub fn draw_over_with_output_hooks(
+        &mut self,
+        render: impl FnOnce(&mut PaintCx<'_, '_>),
+        before: impl FnOnce(&mut W) -> io::Result<bool>,
+        overlay: impl FnOnce(&mut W, &ImageScene, &ImageSceneDelta) -> io::Result<()>,
+    ) -> io::Result<DrawStats> {
+        let prepared = self.state.prepare_over(render);
+        self.draw_prepared_with_output_hooks(prepared, before, overlay)
+    }
+
     /// Paint an owned frame without encoding or committing it.
     pub fn prepare_frame(
         &self,

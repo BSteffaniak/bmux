@@ -143,7 +143,7 @@ fn assert_host_shows(host: &TerminalGridStream, expected: &Buffer, context: &str
     }
 }
 
-fn run(acceleration: ScrollRegionAcceleration) {
+fn run(acceleration: ScrollRegionAcceleration, over: bool) {
     let area = Rect::new(0, 0, WIDTH, HEIGHT);
     let mut panes = [
         Pane {
@@ -198,18 +198,21 @@ fn run(acceleration: ScrollRegionAcceleration) {
         };
         let full = matches!(damage, Damage::Full);
         terminal.writer_mut().clear();
-        terminal
-            .draw_damage(damage, |cx| {
-                for (index, pane) in panes.iter().enumerate() {
-                    if full || changed.contains(&index) {
-                        pane.paint(cx);
-                    }
+        let paint = |cx: &mut PaintCx<'_, '_>| {
+            for (index, pane) in panes.iter().enumerate() {
+                if full || changed.contains(&index) {
+                    pane.paint(cx);
                 }
-                for (index, rows) in &scrolls {
-                    cx.hint_scroll(LocalRect::terminal(panes[*index].rect), *rows);
-                }
-            })
-            .expect("draw");
+            }
+            for (index, rows) in &scrolls {
+                cx.hint_scroll(LocalRect::terminal(panes[*index].rect), *rows);
+            }
+        };
+        if over && !full {
+            terminal.draw_over(paint).expect("draw over");
+        } else {
+            terminal.draw_damage(damage, paint).expect("draw");
+        }
         host.process(terminal.writer());
         let mut expected = Buffer::empty(area);
         {
@@ -225,10 +228,15 @@ fn run(acceleration: ScrollRegionAcceleration) {
 
 #[test]
 fn the_host_shows_every_frame_without_scroll_regions() {
-    run(ScrollRegionAcceleration::Off);
+    run(ScrollRegionAcceleration::Off, false);
 }
 
 #[test]
 fn the_host_shows_every_frame_with_full_row_scrolls() {
-    run(ScrollRegionAcceleration::Auto);
+    run(ScrollRegionAcceleration::Auto, false);
+}
+
+#[test]
+fn the_host_shows_every_frame_painted_over_the_last() {
+    run(ScrollRegionAcceleration::Auto, true);
 }
