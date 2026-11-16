@@ -3,8 +3,9 @@
 //!
 //! With `BMUX_REPLAY_LOG` naming a file, the attach client notes each replay marker in the pane
 //! output it applies, and when the host frame that shows it is handed to the host terminal,
-//! appends `C frame written_ns applied_ns render_started_ns presented_ns` to the file
-//! (nanoseconds since the Unix epoch). Without
+//! appends `C frame written_ns applied_ns render_started_ns presented_ns host_bytes rows_scrolled`
+//! to the file (times in nanoseconds since the Unix epoch; the frame's bytes to the host and pane
+//! rows it moved there instead of redrawing). Without
 //! it, nothing is scanned or written.
 
 use std::io::Write;
@@ -57,7 +58,7 @@ impl ReplayLog {
     }
 
     /// The host frame showing everything applied so far was handed to the host terminal.
-    pub fn presented(&mut self) {
+    pub fn presented(&mut self, host_bytes: usize, rows_scrolled: u64) {
         let Some(file) = self.file.as_mut() else {
             return;
         };
@@ -68,7 +69,10 @@ impl ReplayLog {
         let mut lines = Vec::new();
         for (frame, written, applied) in self.pending.drain(..) {
             let started = self.render_started.max(applied);
-            let _ = writeln!(lines, "C {frame} {written} {applied} {started} {now}");
+            let _ = writeln!(
+                lines,
+                "C {frame} {written} {applied} {started} {now} {host_bytes} {rows_scrolled}"
+            );
         }
         // Best effort: a measurement aid must never disturb attach.
         let _ = file.write_all(&lines);

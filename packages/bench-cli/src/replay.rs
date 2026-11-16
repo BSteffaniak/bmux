@@ -72,6 +72,7 @@ fn latencies(log: &str, written: &BTreeMap<u64, u128>) -> (Vec<f64>, usize) {
     let mut found = Vec::new();
     let mut presentations = std::collections::BTreeSet::new();
     for line in log.lines() {
+        // `C frame written applied started presented [host bytes, rows scrolled]`.
         let Some(client) = line.strip_prefix("C ") else {
             continue;
         };

@@ -1315,6 +1315,92 @@ pub enum RenderSceneItemKind {
     },
 }
 
+/// The cells a border around `rect` paints: its outline, not its inside.
+#[must_use]
+pub fn border_outline_rects(rect: ExtensionRect) -> Vec<ExtensionRect> {
+    if rect.w <= 2 || rect.h <= 2 {
+        return vec![rect];
+    }
+    let bottom = rect.y.saturating_add(rect.h - 1);
+    let right = rect.x.saturating_add(rect.w - 1);
+    let inner = rect.h - 2;
+    vec![
+        ExtensionRect::new(rect.x, rect.y, rect.w, 1),
+        ExtensionRect::new(rect.x, bottom, rect.w, 1),
+        ExtensionRect::new(rect.x, rect.y + 1, 1, inner),
+        ExtensionRect::new(right, rect.y + 1, 1, inner),
+    ]
+}
+
+fn text_rect(x: u16, y: u16, width: u16) -> ExtensionRect {
+    ExtensionRect::new(x, y, width, u16::from(width > 0))
+}
+
+fn spans_width(spans: &[RenderTextSpan]) -> u16 {
+    spans
+        .iter()
+        .map(|span| render_text_width_u16(&span.text))
+        .fold(0, u16::saturating_add)
+}
+
+fn grid_rect<T>(x: u16, y: u16, rows: &[Vec<T>]) -> ExtensionRect {
+    let width = rows
+        .iter()
+        .map(|row| u16::try_from(row.len()).unwrap_or(u16::MAX))
+        .max()
+        .unwrap_or(0);
+    ExtensionRect::new(x, y, width, u16::try_from(rows.len()).unwrap_or(u16::MAX))
+}
+
+impl RenderOp {
+    /// The cells this operation paints (a border paints only its outline).
+    #[must_use]
+    pub fn painted_rects(&self) -> Vec<ExtensionRect> {
+        match self {
+            Self::TextRun { x, y, text, .. } => vec![text_rect(*x, *y, render_text_width_u16(text))],
+            Self::StyledText { x, y, spans } => vec![text_rect(*x, *y, spans_width(spans))],
+            Self::ClearRect { rect, .. } | Self::FillRect { rect, .. } => vec![*rect],
+            Self::Border { rect, .. } => border_outline_rects(*rect),
+            Self::EraseRowSegment { x, y, width, .. } => vec![ExtensionRect::new(*x, *y, *width, 1)],
+            Self::CellGrid { x, y, rows } => vec![grid_rect(*x, *y, rows)],
+        }
+    }
+}
+
+impl RenderLayerItem {
+    /// The cells this item paints.
+    #[must_use]
+    pub fn painted_rects(&self) -> Vec<ExtensionRect> {
+        match self {
+            Self::Op(op) => op.painted_rects(),
+            Self::Graphic(graphic) => vec![graphic.cell_rect],
+        }
+    }
+}
+
+impl RenderSceneItem {
+    /// The cells this item paints (a border paints only its outline).
+    #[must_use]
+    pub fn painted_rects(&self) -> Vec<ExtensionRect> {
+        match &self.kind {
+            RenderSceneItemKind::Text { x, y, text, .. } => {
+                vec![text_rect(*x, *y, render_text_width_u16(text))]
+            }
+            RenderSceneItemKind::StyledText { x, y, spans } => {
+                vec![text_rect(*x, *y, spans_width(spans))]
+            }
+            RenderSceneItemKind::FillRect { rect, .. } => vec![*rect],
+            RenderSceneItemKind::Border { rect, .. } => border_outline_rects(*rect),
+            RenderSceneItemKind::CellGrid { x, y, rows } => vec![grid_rect(*x, *y, rows)],
+            RenderSceneItemKind::TerminalGraphic { graphic } => vec![graphic.cell_rect],
+            RenderSceneItemKind::UnderCells { cells } => cells
+                .iter()
+                .map(|(x, y, _)| ExtensionRect::new(*x, *y, 1, 1))
+                .collect(),
+        }
+    }
+}
+
 /// Retained visual intent for one extension layer on one surface.
 ///
 /// A scene should contain the full current set of items for the queried layer,
@@ -1980,6 +2066,19 @@ pub fn registered_render_extensions() -> Vec<Arc<dyn AttachRenderExtension>> {
 mod tests {
     use super::*;
     use std::sync::Mutex;
+
+    #[test]
+    fn a_border_paints_its_outline_and_text_its_width() {
+        let pane = ExtensionRect::new(0, 0, 20, 10);
+        let content = ExtensionRect::new(1, 1, 18, 8);
+        let border = RenderOp::border(pane, BorderGlyphs::ascii(), RenderStyle::default());
+        assert!(!border.painted_rects().iter().any(|rect| rect.intersects(content)));
+        assert_eq!(border_outline_rects(pane).len(), 4);
+        let title = RenderOp::text_run(2, 0, "title", RenderStyle::default());
+        assert_eq!(title.painted_rects(), [ExtensionRect::new(2, 0, 5, 1)]);
+        let badge = RenderOp::text_run(3, 4, "!", RenderStyle::default());
+        assert!(badge.painted_rects().iter().any(|rect| rect.intersects(content)));
+    }
 
     struct RecordingExtension {
         name: String,

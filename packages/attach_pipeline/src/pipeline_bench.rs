@@ -17,7 +17,7 @@
 use crate::reconcile::apply_attach_output_chunk_with;
 use crate::render::{
     AttachSceneRenderStats, DamageCoalescingPolicy, FrameDamage, append_pane_output,
-    render_attach_scene_with_stats,
+    render_attach_scene_with_stats_and_trace_with_capabilities_and_occluders,
 };
 use crate::types::{PaneRenderBuffer, PaneScrollbackViews};
 use bmux_attach_layout_protocol::{
@@ -126,6 +126,7 @@ struct Replay {
     offset: u64,
     open: bool,
     frames: usize,
+    margins: bool,
 }
 
 struct Rendered {
@@ -155,7 +156,30 @@ impl Replay {
             offset: 0,
             open: false,
             frames: 0,
+            margins: false,
         }
+    }
+
+    /// A pane inside a one-cell border, on a host with left/right margins: frames are written for
+    /// `size`, the pane's content is two cells smaller each way.
+    fn bordered(size: (u16, u16), chunk_size: usize) -> Self {
+        let mut replay = Self::new(size, true, chunk_size);
+        let content = AttachRect {
+            x: 1,
+            y: 1,
+            w: size.0,
+            h: size.1,
+        };
+        replay.scene.surfaces[0].rect = AttachRect {
+            x: 0,
+            y: 0,
+            w: size.0 + 2,
+            h: size.1 + 2,
+        };
+        replay.scene.surfaces[0].content_rect = content;
+        replay.size = (size.0 + 2, size.1 + 2);
+        replay.margins = true;
+        replay
     }
 
     /// Apply `frame` and render, writing what the host terminal receives to `output`.
@@ -187,11 +211,12 @@ impl Replay {
         }
         self.frames += 1;
         let started = Instant::now();
-        let (_, stats) = render_attach_scene_with_stats(
+        let (_, stats) = render_attach_scene_with_stats_and_trace_with_capabilities_and_occluders(
             output,
             &self.scene,
             &[],
             &mut self.buffers,
+            &mut crate::TerminalGraphicsCache::new(),
             &damage,
             0,
             0,
@@ -201,6 +226,12 @@ impl Replay {
             &bmux_appearance::RuntimeAppearance::default(),
             self.policy,
             &[],
+            bmux_plugin::TerminalRenderCapabilities {
+                left_right_margins: self.margins,
+                ..bmux_plugin::TerminalRenderCapabilities::default()
+            },
+            &[],
+            None,
         )
         .expect("render");
         Rendered {
@@ -406,6 +437,29 @@ fn nothing_scrolls_on_the_host_under_a_surface_drawn_over_the_pane() {
         let rendered = replay.frame(&frame, &mut output);
         assert_eq!(rendered.stats.pane_rows_scrolled, 0);
     }
+}
+
+#[test]
+fn a_bordered_pane_scrolls_inside_margins_and_writes_about_what_the_application_did() {
+    let size = (60, 16);
+    let mut replay = Replay::bordered(size, 8192);
+    let frames = corpus::su_scroll(size, 20);
+    let mut output = Vec::new();
+    let (mut bytes_in, mut bytes_out, mut scrolled) = (0, 0, 0);
+    for (index, frame) in frames.iter().enumerate() {
+        output.clear();
+        let rendered = replay.frame(frame, &mut output);
+        if index > 0 {
+            bytes_in += frame.len();
+            bytes_out += output.len();
+            scrolled += rendered.stats.pane_rows_scrolled;
+        }
+    }
+    assert_eq!(scrolled, 20 * 13);
+    assert!(
+        bytes_out < bytes_in * 3 / 2,
+        "{bytes_out} bytes out for {bytes_in} in"
+    );
 }
 
 #[test]

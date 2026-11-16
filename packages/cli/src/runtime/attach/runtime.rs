@@ -10639,11 +10639,16 @@ fn build_retained_frame_plan(
     let scene_repaint = repaint_plan
         .iter()
         .any(|repaint| scene_surface_ids.contains(&repaint.surface_id));
-    frame_damage.merge_from(&frame_damage_from_retained_repaint_plan(
-        &layout_state.scene,
+    let repair = retained_repair_damage(
+        view_state,
+        layout_state,
+        frame_damage,
         &repaint_plan,
+        [explicit_ui_damage.clone(), graph_damage.clone()],
+        viewport,
         damage_policy,
-    ));
+    );
+    frame_damage.merge_from(&repair);
     RetainedFramePlan {
         help_surface,
         prompt_overlay_render,
@@ -10657,6 +10662,47 @@ fn build_retained_frame_plan(
         },
         repaint_plan,
     }
+}
+
+/// Repair rects for the surfaces `repaint_plan` repaints. A pane whose own content changed is the
+/// exception: it redraws whatever differs from what the host shows, so it is given repair rects
+/// only for damage it did not cause (its content flagged as changed would otherwise come back as a
+/// rect over all of it and force every row to be rewritten).
+fn retained_repair_damage(
+    view_state: &AttachViewState,
+    layout_state: &AttachLayoutState,
+    frame_damage: &bmux_attach_pipeline::FrameDamage,
+    repaint_plan: &[bmux_attach_pipeline::compositor::RetainedRepaintSurface],
+    other_damage: [RetainedDamage; 2],
+    viewport: DamageRect,
+    damage_policy: DamageCoalescingPolicy,
+) -> bmux_attach_pipeline::FrameDamage {
+    let mut repair =
+        frame_damage_from_retained_repaint_plan(&layout_state.scene, repaint_plan, damage_policy);
+    if !frame_damage.content_surfaces().is_empty() {
+        let [explicit_ui_damage, graph_damage] = other_damage;
+        let foreign = merge_retained_damages(
+            [
+                retained_frame_damage_from_frame_damage(
+                    &layout_state.scene,
+                    &frame_damage.without_content_changes(),
+                    viewport,
+                    damage_policy,
+                ),
+                explicit_ui_damage,
+                graph_damage,
+            ],
+            viewport,
+            damage_policy,
+        );
+        let foreign_repair = frame_damage_from_retained_repaint_plan(
+            &layout_state.scene,
+            &view_state.retained_compositor.repaint_plan(&foreign),
+            damage_policy,
+        );
+        repair.take_content_rects_from(frame_damage.content_surfaces(), &foreign_repair);
+    }
+    repair
 }
 
 struct AttachAppearanceResolver<'a> {
@@ -11582,7 +11628,9 @@ fn render_attach_frame_inner(
             .mark_full_frame(AttachDirtySource::ManualRedraw);
         return Err(error);
     }
-    view_state.replay_log.presented();
+    view_state
+        .replay_log
+        .presented(frame_bytes.len(), scene_render_stats.pane_rows_scrolled);
     let output_elapsed = terminal_write_started_at.elapsed();
     let terminal_write_ms = duration_millis_u64(output_elapsed);
     let output_acceptance_ns = u64::try_from(output_elapsed.as_nanos()).unwrap_or(u64::MAX);
@@ -21256,6 +21304,74 @@ mod tests {
         });
         assert!(view_state.dirty.layout_needs_refresh);
         assert!(!damage.is_full_frame());
+    }
+
+    #[test]
+    #[serial]
+    fn a_pane_whose_content_changed_gets_repair_rects_only_for_damage_from_elsewhere() {
+        let session_id = Uuid::new_v4();
+        let pane_id = Uuid::new_v4();
+        let rect = AttachRect {
+            x: 0,
+            y: 0,
+            w: 80,
+            h: 24,
+        };
+        let layout_state = AttachLayoutState {
+            context_id: None,
+            session_id,
+            focused_pane_id: pane_id,
+            panes: Vec::new(),
+            layout_root: PaneLayoutNode::Leaf { pane_id },
+            scene: AttachScene {
+                session_id,
+                focus: AttachFocusTarget::Pane { pane_id },
+                surfaces: vec![test_pane_surface(pane_id, rect)],
+            },
+            zoomed: false,
+        };
+        let viewport = DamageRect::new(0, 0, 80, 24);
+        let plan = |frame_damage: &mut bmux_attach_pipeline::FrameDamage| {
+            let mut view_state = AttachViewState::new(AttachOpenInfo {
+                context_id: None,
+                session_id,
+                can_write: true,
+            });
+            let _ = view_state.retained_compositor.replace_surfaces(
+                retained_surfaces_from_attach_scene(&layout_state.scene),
+                viewport,
+                DamageCoalescingPolicy::default(),
+            );
+            let _ = build_retained_frame_plan(
+                &mut view_state,
+                &layout_state,
+                frame_damage,
+                None,
+                None,
+                viewport,
+                DamageCoalescingPolicy::default(),
+            );
+        };
+        // Output alone: the pane diffs its rows itself, nothing forces them.
+        let mut output = bmux_attach_pipeline::FrameDamage::default();
+        output.mark_content_surface(pane_id);
+        plan(&mut output);
+        assert_eq!(output.content_surface_rects(pane_id), []);
+        // Output plus a repair from elsewhere: the repair stays.
+        let mut repaired = bmux_attach_pipeline::FrameDamage::default();
+        repaired.mark_content_surface(pane_id);
+        repaired.mark_content_surface_rect(
+            pane_id,
+            DamageRect::new(10, 5, 4, 2),
+            (80, 24),
+            DamageCoalescingPolicy::default(),
+        );
+        plan(&mut repaired);
+        assert!(
+            repaired
+                .content_surface_rects(pane_id)
+                .contains(&DamageRect::new(10, 5, 4, 2))
+        );
     }
 
     #[test]

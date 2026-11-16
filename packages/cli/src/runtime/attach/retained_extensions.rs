@@ -92,10 +92,26 @@ impl AttachRenderExtension for RetainedExtension {
         id: Uuid,
         rect: &ExtensionRect,
         layer: RenderExtensionLayer,
-        _: &ExtensionRect,
+        content: &ExtensionRect,
     ) -> bool {
-        // Retained layers do not report their extent here; any layer on the surface counts.
-        self.layer(id, *rect, layer).is_some()
+        let Some(value) = self.layer(id, *rect, layer) else {
+            return false;
+        };
+        let scene = value
+            .scene
+            .iter()
+            .flat_map(|scene| &scene.items)
+            .flat_map(bmux_plugin::RenderSceneItem::painted_rects);
+        let items = value
+            .items
+            .iter()
+            .flatten()
+            .flat_map(RenderLayerItem::painted_rects);
+        let ops = value.ops.iter().flatten().flat_map(RenderOp::painted_rects);
+        scene
+            .chain(items)
+            .chain(ops)
+            .any(|painted| painted.intersects(*content))
     }
     fn render_layer_revision(&self, id: Uuid, layer: RenderExtensionLayer) -> Option<u64> {
         self.surfaces

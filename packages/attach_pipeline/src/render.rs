@@ -2404,6 +2404,30 @@ impl FrameDamage {
         &self.content_surfaces
     }
 
+    /// This damage without panes' own content changes: what other surfaces, the layout and the
+    /// interface damaged. A pane whose content changed redraws what differs from what the host
+    /// shows by itself; only damage from elsewhere needs repair rects on it.
+    #[must_use]
+    pub fn without_content_changes(&self) -> Self {
+        let mut damage = self.clone();
+        damage.content_surfaces.clear();
+        damage
+    }
+
+    /// Use `source`'s content rects for `panes` in place of this damage's own.
+    pub fn take_content_rects_from(&mut self, panes: &BTreeSet<Uuid>, source: &Self) {
+        for pane in panes {
+            match source.content_surface_rects.get(pane) {
+                Some(rects) => {
+                    self.content_surface_rects.insert(*pane, rects.clone());
+                }
+                None => {
+                    self.content_surface_rects.remove(pane);
+                }
+            }
+        }
+    }
+
     #[must_use]
     pub const fn extension_surfaces(&self) -> &BTreeSet<Uuid> {
         &self.extension_surfaces
@@ -5372,7 +5396,8 @@ fn build_surface_output_plan<'a>(
         }
     };
 
-    // Paint operations have no scroll, and output written before the content would move.
+    // Paint operations have no scroll, and what is written into the content before it this frame
+    // (extension output under it, cleanup of an extension that left it) would move with its rows.
     let host_scroll = host_scroll_for_surface(
         surface.id,
         ext_rect,
@@ -5380,7 +5405,8 @@ fn build_surface_output_plan<'a>(
         viewport,
         damage_policy.scroll_passthrough
             && !crate::projection::capturing()
-            && before_content_output_plan.plans.is_empty(),
+            && before_content_output_plan.damage_rects.is_empty()
+            && surface_plan.after_content_cleanup.content_damage.is_empty(),
         render_context.capabilities.left_right_margins,
         render_extensions,
     );
