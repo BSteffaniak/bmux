@@ -959,7 +959,7 @@ mod tests {
 
         let mut buffers = BTreeMap::new();
         let mut buffer = PaneRenderBuffer {
-            prev_rows: vec!["cached row".to_string()],
+            prev_rows: vec![bmux_attach_pipeline::ShownRow::blank(10)],
             ..PaneRenderBuffer::default()
         };
         buffer.extension_render_cache.insert(
@@ -1037,7 +1037,10 @@ mod tests {
             terminal_grid_to_text(synced.terminal_grid.grid(), 3),
             "first\nsecond"
         );
-        assert_eq!(synced.prev_rows, vec!["cached row".to_string()]);
+        assert_eq!(
+            synced.prev_rows,
+            vec![bmux_attach_pipeline::ShownRow::blank(10)]
+        );
         assert_eq!(synced.extension_render_cache.len(), 1);
         assert_eq!(synced.expected_stream_start, Some(42));
         assert!(synced.sync_update_in_progress);

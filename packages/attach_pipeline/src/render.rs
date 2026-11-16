@@ -2852,7 +2852,7 @@ pub fn queue_layer_fill<W: io::Write>(stdout: &mut W, surface: AttachLayerSurfac
     Ok(())
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 #[allow(clippy::struct_excessive_bools)]
 struct CellStyle {
     fg: CellColor,
@@ -2880,7 +2880,7 @@ const fn grid_cell_style(style: GridStyle) -> CellStyle {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 enum CellColor {
     #[default]
     Default,
@@ -3120,6 +3120,186 @@ struct GridRowRenderContext<'a> {
     runtime_appearance: &'a RuntimeAppearance,
     palette: &'a bmux_terminal_grid::StylePalette,
     before_content_cells: &'a BTreeMap<u16, RenderUnderCell>,
+}
+
+/// One pane row as the host terminal shows it: for each column, what is drawn there.
+///
+/// Two equal rows print identically, so comparing a row with the copy of what the host shows
+/// finds exactly the columns to redraw. An empty row stands for one the copy cannot vouch for.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ShownRow {
+    cells: Vec<ShownCell>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ShownCell {
+    text: ShownText,
+    style: CellStyle,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ShownText {
+    Char(char),
+    Cluster(Box<str>),
+    /// The right half of a wide character drawn in the column before.
+    Continuation,
+}
+
+/// Unchanged cells between two changed runs that are cheaper to rewrite than to move the cursor
+/// over (a cursor move and a style reset cost about this many bytes).
+const SHOWN_RUN_GAP: u16 = 8;
+
+impl ShownRow {
+    /// A row of `width` blank cells in default colors, as a cleared terminal shows.
+    #[must_use]
+    pub fn blank(width: u16) -> Self {
+        Self {
+            cells: vec![
+                ShownCell {
+                    text: ShownText::Char(' '),
+                    style: CellStyle::default(),
+                };
+                usize::from(width)
+            ],
+        }
+    }
+
+    /// Forget what the host shows here, so the row is drawn in full.
+    pub fn forget(&mut self) {
+        self.cells.clear();
+    }
+
+    fn continuation(&self, col: u16) -> bool {
+        self.cells
+            .get(usize::from(col))
+            .is_some_and(|cell| cell.text == ShownText::Continuation)
+    }
+
+    /// Resolve what columns `0..width` of `context`'s row show, as `render_grid_row_segment`
+    /// draws them, reusing this row's allocation.
+    fn resolve(&mut self, context: GridRowRenderContext<'_>, width: u16) {
+        self.cells.clear();
+        let mut memo: Option<((bmux_terminal_grid::StyleId, bool), CellStyle)> = None;
+        let mut col = 0u16;
+        while col < width {
+            let cell = context.row.cells().get(usize::from(col));
+            let selected = cell_selected(context.selection, context.selection_line, usize::from(col));
+            let raw_style = cell.map_or_else(CellStyle::default, |cell| {
+                grid_cell_style(context.palette.get(cell.style()))
+            });
+            let coverage = pane_cell_coverage(cell, raw_style, selected);
+            if let Some(under_cell) = context.before_content_cells.get(&col)
+                && !matches!(coverage, CellCoverage::Opaque)
+            {
+                let background = apply_content_effects(raw_style, context.runtime_appearance).bg;
+                let mut style = render_style_to_cell_style(under_cell.style);
+                if !matches!(background, CellColor::Default) {
+                    style.bg = background;
+                }
+                self.cells.push(ShownCell {
+                    text: ShownText::Char(under_cell.ch),
+                    style,
+                });
+                col = col.saturating_add(1);
+                continue;
+            }
+            let style = match (cell, memo) {
+                (Some(cell), Some((key, style))) if key == (cell.style(), selected) => style,
+                _ => {
+                    let mut style = raw_style;
+                    if selected {
+                        style = selected_style(style);
+                    }
+                    let style = apply_content_effects(style, context.runtime_appearance);
+                    if let Some(cell) = cell {
+                        memo = Some(((cell.style(), selected), style));
+                    }
+                    style
+                }
+            };
+            let Some(cell) = cell else {
+                self.cells.push(ShownCell {
+                    text: ShownText::Char(' '),
+                    style,
+                });
+                col = col.saturating_add(1);
+                continue;
+            };
+            if cell.is_wide_continuation() {
+                self.cells.push(ShownCell {
+                    text: ShownText::Char(' '),
+                    style,
+                });
+                col = col.saturating_add(1);
+                continue;
+            }
+            let text = cell.text();
+            let mut chars = text.chars();
+            let shown = match (chars.next(), chars.next()) {
+                (None, _) => ShownText::Char(' '),
+                (Some(only), None) => ShownText::Char(only),
+                (Some(_), Some(_)) => ShownText::Cluster(text.into()),
+            };
+            self.cells.push(ShownCell { text: shown, style });
+            let span = u16::from(cell.width()).max(1);
+            for _ in 1..span.min(width - col) {
+                self.cells.push(ShownCell {
+                    text: ShownText::Continuation,
+                    style,
+                });
+            }
+            col = col.saturating_add(span);
+        }
+    }
+
+    /// Column runs `[start, end)` to draw so the host shows this row, given it shows `previous`
+    /// and must also redraw `damaged`: changed columns, widened to whole wide characters and
+    /// joined across short unchanged gaps.
+    fn runs_to_draw(&self, previous: Option<&Self>, damaged: Vec<(u16, u16)>) -> Vec<(u16, u16)> {
+        let width = u16::try_from(self.cells.len()).unwrap_or(u16::MAX);
+        let Some(previous) = previous.filter(|previous| previous.cells.len() == self.cells.len())
+        else {
+            return vec![(0, width)];
+        };
+        let mut runs = damaged;
+        let mut start = None;
+        for (col, (now, before)) in (0u16..).zip(self.cells.iter().zip(&previous.cells)) {
+            match (now == before, start) {
+                (false, None) => start = Some(col),
+                (true, Some(run_start)) => {
+                    runs.push((run_start, col));
+                    start = None;
+                }
+                _ => {}
+            }
+        }
+        if let Some(run_start) = start {
+            runs.push((run_start, width));
+        }
+        runs.sort_unstable();
+        let mut joined: Vec<(u16, u16)> = Vec::with_capacity(runs.len());
+        for (mut run_start, mut run_end) in runs {
+            run_end = run_end.min(width);
+            while run_start > 0
+                && (self.continuation(run_start) || previous.continuation(run_start))
+            {
+                run_start -= 1;
+            }
+            while run_end < width && (self.continuation(run_end) || previous.continuation(run_end)) {
+                run_end += 1;
+            }
+            if run_start >= run_end {
+                continue;
+            }
+            match joined.last_mut() {
+                Some((_, last_end)) if run_start <= last_end.saturating_add(SHOWN_RUN_GAP) => {
+                    *last_end = (*last_end).max(run_end);
+                }
+                _ => joined.push((run_start, run_end)),
+            }
+        }
+        joined
+    }
 }
 
 fn render_grid_row_segment(
@@ -5536,13 +5716,13 @@ fn execute_surface_output_plan<W: io::Write>(
 struct PaneContentRowOutputPlan {
     row: u16,
     y: u16,
-    line: String,
     action: PaneContentRowOutputAction,
 }
 
 enum PaneContentRowOutputAction {
     Full {
         width: u16,
+        text: String,
     },
     Segments {
         segments: Vec<PaneContentRowSegmentOutput>,
@@ -5557,34 +5737,26 @@ struct PaneContentRowSegmentOutput {
 }
 
 impl PaneContentRowOutputPlan {
-    const fn full(row: u16, y: u16, width: u16, line: String) -> Self {
+    const fn full(row: u16, y: u16, width: u16, text: String) -> Self {
         Self {
             row,
             y,
-            line,
-            action: PaneContentRowOutputAction::Full { width },
+            action: PaneContentRowOutputAction::Full { width, text },
         }
     }
 
-    const fn segments(
-        row: u16,
-        y: u16,
-        line: String,
-        segments: Vec<PaneContentRowSegmentOutput>,
-    ) -> Self {
+    const fn segments(row: u16, y: u16, segments: Vec<PaneContentRowSegmentOutput>) -> Self {
         Self {
             row,
             y,
-            line,
             action: PaneContentRowOutputAction::Segments { segments },
         }
     }
 
-    const fn cache_skip(row: u16, line: String) -> Self {
+    const fn cache_skip(row: u16) -> Self {
         Self {
             row,
             y: 0,
-            line,
             action: PaneContentRowOutputAction::CacheSkip,
         }
     }
@@ -5599,8 +5771,8 @@ fn execute_pane_content_row_output_plan<W: io::Write>(
     render_trace: &mut Option<&mut AttachRenderTrace>,
 ) -> Result<()> {
     match &plan.action {
-        PaneContentRowOutputAction::Full { width } => {
-            queue!(stdout, MoveTo(content_x, plan.y), Print(&plan.line))
+        PaneContentRowOutputAction::Full { width, text } => {
+            queue!(stdout, MoveTo(content_x, plan.y), Print(text))
                 .context("failed drawing pane content")?;
             if let Some(stats) = render_stats.as_deref_mut() {
                 stats.pane_rows_emitted = stats.pane_rows_emitted.saturating_add(1);
@@ -5662,7 +5834,7 @@ fn execute_pane_content_row_output_plan<W: io::Write>(
 fn scroll_host_rows<W: io::Write>(
     stdout: &mut W,
     stage: &PaneContentRenderStage<'_>,
-    prev_rows: &mut [String],
+    prev_rows: &mut [ShownRow],
     moved: ViewportScroll,
 ) -> Result<u64> {
     let ViewportScroll::Region { top, bottom, rows } = moved else {
@@ -5712,7 +5884,7 @@ fn scroll_host_rows<W: io::Write>(
         0..lines
     };
     for row in &mut region[exposed] {
-        row.clear();
+        row.forget();
     }
     Ok(u64::try_from(height - lines).unwrap_or(u64::MAX))
 }
@@ -5831,6 +6003,8 @@ fn queue_pane_content_for_surface<W: io::Write>(
             }
         } else {
             let effective_content_damage = stage.content_damage.effective_rects();
+            let blank_row = PhysicalRow::new();
+            let mut shown = ShownRow::default();
             for row in 0..inner_h {
                 if let Some(stats) = render_stats.as_deref_mut() {
                     stats.pane_rows_examined = stats.pane_rows_examined.saturating_add(1);
@@ -5838,112 +6012,44 @@ fn queue_pane_content_for_surface<W: io::Write>(
                 let row_u16 = u16::try_from(row).unwrap_or(u16::MAX);
                 let y = stage.content.y.saturating_add(row_u16);
                 let before_cells = before_content_row_cells(stage.before_content_cells, y);
-                let damaged_ranges = grid_rows.get(row).map_or_else(Vec::new, |grid_row| {
-                    damaged_grid_row_ranges(
-                        grid_row,
+                let grid_row = grid_rows.get(row).unwrap_or(&blank_row);
+                let context = GridRowRenderContext {
+                    row: grid_row,
+                    selection,
+                    selection_line: viewport_base.line_for_viewport_row(row),
+                    runtime_appearance: stage.runtime_appearance,
+                    palette: entry.scrollback_palette(scrollback.as_ref()),
+                    before_content_cells: &before_cells,
+                };
+                // Cell diff against what the host shows; damage from outside the pane (a
+                // surface that left, decorations) redraws cells the copy cannot vouch for.
+                shown.resolve(context, inner_width);
+                let damaged =
+                    damaged_grid_row_ranges(grid_row, row_u16, inner_width, &effective_content_damage);
+                let runs = shown.runs_to_draw(entry.prev_rows.get(row), damaged);
+                let row_plan = match runs.as_slice() {
+                    [] => PaneContentRowOutputPlan::cache_skip(row_u16),
+                    [(0, end)] if *end >= inner_width => PaneContentRowOutputPlan::full(
                         row_u16,
+                        y,
                         inner_width,
-                        &effective_content_damage,
-                    )
-                });
-                let force_row_damage = !damaged_ranges.is_empty();
-                let line = grid_rows.get(row).map_or_else(
-                    || {
-                        let blank_row = PhysicalRow::new();
-                        render_grid_row_segment(
-                            GridRowRenderContext {
-                                row: &blank_row,
-                                selection,
-                                selection_line: viewport_base.line_for_viewport_row(row),
-                                runtime_appearance: stage.runtime_appearance,
-                                palette: entry.scrollback_palette(scrollback.as_ref()),
-                                before_content_cells: &before_cells,
-                            },
-                            0,
-                            inner_width,
-                        )
-                    },
-                    |grid_row| {
-                        render_grid_row_segment(
-                            GridRowRenderContext {
-                                row: grid_row,
-                                selection,
-                                selection_line: viewport_base.line_for_viewport_row(row),
-                                runtime_appearance: stage.runtime_appearance,
-                                palette: entry.scrollback_palette(scrollback.as_ref()),
-                                before_content_cells: &before_cells,
-                            },
-                            0,
-                            inner_width,
-                        )
-                    },
-                );
-
-                // Row-level diff: skip emitting if the rendered string matches
-                // the previous frame's cached version for this row.
-                let cached = entry.prev_rows.get(row);
-                let row_plan = if cached.is_none_or(|c| *c != line) {
-                    PaneContentRowOutputPlan::full(row_u16, y, inner_width, line)
-                } else if force_row_damage {
-                    let segments = damaged_ranges
-                        .into_iter()
-                        .map(|(start_col, end_col)| {
-                            let text = grid_rows.get(row).map_or_else(
-                                || {
-                                    let blank_row = PhysicalRow::new();
-                                    render_grid_row_segment(
-                                        GridRowRenderContext {
-                                            row: &blank_row,
-                                            selection,
-                                            selection_line: viewport_base
-                                                .line_for_viewport_row(row),
-                                            runtime_appearance: stage.runtime_appearance,
-                                            palette: entry.scrollback_palette(scrollback.as_ref()),
-                                            before_content_cells: &before_cells,
-                                        },
-                                        start_col,
-                                        end_col,
-                                    )
-                                },
-                                |grid_row| {
-                                    render_grid_row_segment(
-                                        GridRowRenderContext {
-                                            row: grid_row,
-                                            selection,
-                                            selection_line: viewport_base
-                                                .line_for_viewport_row(row),
-                                            runtime_appearance: stage.runtime_appearance,
-                                            palette: entry.scrollback_palette(scrollback.as_ref()),
-                                            before_content_cells: &before_cells,
-                                        },
-                                        start_col,
-                                        end_col,
-                                    )
-                                },
-                            );
-                            PaneContentRowSegmentOutput {
+                        render_grid_row_segment(context, 0, inner_width),
+                    ),
+                    _ => PaneContentRowOutputPlan::segments(
+                        row_u16,
+                        y,
+                        runs.iter()
+                            .map(|&(start_col, end_col)| PaneContentRowSegmentOutput {
                                 start_col,
-                                width: end_col.saturating_sub(start_col),
-                                text,
-                            }
-                        })
-                        .collect();
-                    PaneContentRowOutputPlan::segments(row_u16, y, line, segments)
-                } else {
-                    PaneContentRowOutputPlan::cache_skip(row_u16, line)
+                                width: end_col - start_col,
+                                text: render_grid_row_segment(context, start_col, end_col),
+                            })
+                            .collect(),
+                    ),
                 };
                 if crate::projection::capturing() {
-                    let blank = PhysicalRow::new();
-                    let context = GridRowRenderContext {
-                        row: grid_rows.get(row).unwrap_or(&blank),
-                        selection,
-                        selection_line: viewport_base.line_for_viewport_row(row),
-                        runtime_appearance: stage.runtime_appearance,
-                        palette: entry.scrollback_palette(scrollback.as_ref()),
-                        before_content_cells: &before_cells,
-                    };
                     match &row_plan.action {
-                        PaneContentRowOutputAction::Full { width } => {
+                        PaneContentRowOutputAction::Full { width, .. } => {
                             capture_grid_row(context, stage.content.x, y, 0, *width);
                         }
                         PaneContentRowOutputAction::Segments { segments } => {
@@ -5968,10 +6074,10 @@ fn queue_pane_content_for_surface<W: io::Write>(
                     render_stats,
                     render_trace,
                 )?;
-                if row < entry.prev_rows.len() {
-                    entry.prev_rows[row] = row_plan.line;
+                if let Some(previous) = entry.prev_rows.get_mut(row) {
+                    std::mem::swap(previous, &mut shown);
                 } else {
-                    entry.prev_rows.push(row_plan.line);
+                    entry.prev_rows.push(std::mem::take(&mut shown));
                 }
             }
             // Trim stale cache entries if the visible row count shrank.
@@ -6951,7 +7057,6 @@ mod tests {
         let plan = PaneContentRowOutputPlan::segments(
             2,
             4,
-            "unchanged row".to_string(),
             vec![PaneContentRowSegmentOutput {
                 start_col: 3,
                 width: 4,
@@ -9623,12 +9728,12 @@ mod tests {
     #[test]
     fn append_output_detects_alternate_screen_toggle() {
         let mut buffer = PaneRenderBuffer::default();
-        buffer.prev_rows.push("cached".to_string());
+        buffer.prev_rows.push(super::ShownRow::blank(1));
 
         let toggled = append_pane_output(&mut buffer, b"\x1b[?1049h");
         assert!(toggled);
         assert!(buffer.protocol_tracker.alternate_screen());
-        assert_eq!(buffer.prev_rows, [] as [std::string::String; 0]);
+        assert_eq!(buffer.prev_rows, Vec::<super::ShownRow>::new());
     }
 
     #[test]
@@ -9815,6 +9920,38 @@ mod tests {
     }
 
     #[test]
+    fn only_changed_cells_are_drawn_in_whole_characters_and_short_gaps_are_joined() {
+        use super::{CellStyle, ShownCell, ShownRow, ShownText};
+        let row = |text: &str| ShownRow {
+            cells: text
+                .chars()
+                .map(|character| ShownCell {
+                    text: match character {
+                        '>' => ShownText::Continuation,
+                        other => ShownText::Char(other),
+                    },
+                    style: CellStyle::default(),
+                })
+                .collect(),
+        };
+        let before = row("a\u{4e2d}>b                    c");
+        // Unchanged: nothing; unknown or resized: everything.
+        assert_eq!(before.runs_to_draw(Some(&before), Vec::new()), []);
+        assert_eq!(before.runs_to_draw(None, Vec::new()), [(0, 25)]);
+        assert_eq!(
+            before.runs_to_draw(Some(&ShownRow::default()), Vec::new()),
+            [(0, 25)]
+        );
+        // Damage on the right half of a wide character redraws all of it.
+        assert_eq!(before.runs_to_draw(Some(&before), vec![(2, 3)]), [(1, 3)]);
+        // Nearby changes join; distant ones stay apart.
+        let near = row("a\u{4e2d}>x     y              c");
+        assert_eq!(near.runs_to_draw(Some(&before), Vec::new()), [(3, 10)]);
+        let far = row("a\u{4e2d}>x                    z");
+        assert_eq!(far.runs_to_draw(Some(&before), Vec::new()), [(3, 4), (24, 25)]);
+    }
+
+    #[test]
     fn a_pane_beside_others_scrolls_inside_margins_and_its_row_copy_follows() {
         use super::{HostScroll, PaneContentRenderStage, scroll_host_rows};
         use bmux_terminal_grid::ViewportScroll;
@@ -9843,7 +9980,8 @@ mod tests {
             content_damage: &damage,
             host_scroll: HostScroll::Margins,
         };
-        let rows = || ["a", "b", "c", "d", "e"].map(String::from).to_vec();
+        let rows = || (1..=5).map(super::ShownRow::blank).collect::<Vec<_>>();
+        let unknown = super::ShownRow::default;
         let mut copy = rows();
         let mut output = Vec::new();
         let moved = ViewportScroll::Region {
@@ -9860,7 +9998,17 @@ mod tests {
             String::from_utf8(output).unwrap(),
             "\x1b[0m\x1b[?69h\x1b[11;30s\x1b[4;7r\x1b[2S\x1b[r\x1b[?69l"
         );
-        assert_eq!(copy, ["a", "d", "e", "", ""]);
+        let original = rows();
+        assert_eq!(
+            copy,
+            [
+                original[0].clone(),
+                original[3].clone(),
+                original[4].clone(),
+                unknown(),
+                unknown()
+            ]
+        );
 
         // Down, as whole rows.
         stage.host_scroll = HostScroll::Rows;
@@ -9879,7 +10027,10 @@ mod tests {
             String::from_utf8(output).unwrap(),
             "\x1b[0m\x1b[3;7r\x1b[1T\x1b[r"
         );
-        assert_eq!(copy, ["", "a", "b", "c", "d"]);
+        let mut expected = rows();
+        expected.rotate_right(1);
+        expected[0] = unknown();
+        assert_eq!(copy, expected);
 
         // Nothing moves when it is off, the copy is stale, or the move clears the region.
         for (host_scroll, copy_rows, moved) in [

@@ -245,7 +245,8 @@ pub struct PaneRenderBuffer {
     pub extension_projection_cache:
         BTreeMap<(String, Uuid), Vec<crate::projection::PaintOperation>>,
     pub protocol_tracker: TerminalProtocolTracker,
-    pub prev_rows: Vec<String>,
+    /// What the host terminal shows for each of the pane's rows, as last drawn.
+    pub prev_rows: Vec<crate::render::ShownRow>,
     /// The pane's application is inside a synchronized update (DEC mode 2026) at the end of the
     /// output applied so far: it began a frame and has not finished it.
     pub sync_update_in_progress: bool,

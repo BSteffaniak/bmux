@@ -272,48 +272,112 @@ fn shown(
         )
 }
 
-#[test]
-fn scroll_passthrough_leaves_the_host_screen_as_a_full_repaint_would() {
-    let size = (60, 16);
-    for corpus in corpus::generated(size, 24) {
-        // Small deliveries, so frames also arrive split across chunks.
-        let mut replay = Replay::new(size, true, 97);
-        let mut host = bmux_terminal_grid::TerminalGridStream::new(
-            size.0,
-            size.1,
-            bmux_terminal_grid::GridLimits::default(),
-        )
-        .expect("host terminal");
-        let mut scrolled = 0;
-        let mut output = Vec::new();
-        for (index, frame) in corpus.frames.iter().enumerate() {
-            output.clear();
-            let rendered = replay.frame(frame, &mut output);
-            host.process(&output);
-            scrolled += rendered.stats.pane_rows_scrolled;
-            if rendered.stats.pane_rows_sync_deferred > 0 {
-                continue;
-            }
-            for row in 0..usize::from(size.1) {
-                for col in 0..usize::from(size.0) {
-                    assert_eq!(
-                        shown(host.grid(), row, col),
-                        shown(replay.pane(), row, col),
-                        "{} frame {index}: host differs from the pane at row {row} column {col}",
-                        corpus.name,
-                    );
-                }
+/// Replay `frames` into a host terminal emulator and check, after every frame that is drawn, that
+/// the host shows exactly the pane. Returns the rows moved on the host.
+fn assert_host_matches(
+    name: &str,
+    size: (u16, u16),
+    frames: &[Frame],
+    scroll_passthrough: bool,
+    chunk_size: usize,
+) -> u64 {
+    let mut replay = Replay::new(size, scroll_passthrough, chunk_size);
+    let mut host = bmux_terminal_grid::TerminalGridStream::new(
+        size.0,
+        size.1,
+        bmux_terminal_grid::GridLimits::default(),
+    )
+    .expect("host terminal");
+    let mut scrolled = 0;
+    let mut output = Vec::new();
+    for (index, frame) in frames.iter().enumerate() {
+        output.clear();
+        let rendered = replay.frame(frame, &mut output);
+        host.process(&output);
+        scrolled += rendered.stats.pane_rows_scrolled;
+        if rendered.stats.pane_rows_sync_deferred > 0 {
+            continue;
+        }
+        for row in 0..usize::from(size.1) {
+            for col in 0..usize::from(size.0) {
+                assert_eq!(
+                    shown(host.grid(), row, col),
+                    shown(replay.pane(), row, col),
+                    "{name} (passthrough {scroll_passthrough}) frame {index}: host differs from \
+                     the pane at row {row} column {col}",
+                );
             }
         }
-        if matches!(
-            corpus.name,
-            "su-scroll" | "region-linefeed" | "plain-stream"
-        ) {
-            assert!(
+    }
+    scrolled
+}
+
+/// Scattered edits that change parts of rows: colored words, wide characters written over narrow
+/// ones and back, erased spans, all at pseudo-random places.
+fn scattered_edits((cols, rows): (u16, u16), frames: usize) -> Vec<Frame> {
+    let mut seed = 0x2545_f491_u32;
+    let mut next = |bound: u16| {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        u16::try_from(seed % u32::from(bound.max(1))).unwrap_or(0)
+    };
+    let mut out = vec![b"\x1b[H\x1b[2J".to_vec()];
+    for _ in 0..frames {
+        let mut frame = SYNC_BEGIN.to_vec();
+        for _ in 0..6 {
+            let (row, col) = (next(rows) + 1, next(cols) + 1);
+            let text = match next(5) {
+                0 => format!("\x1b[38;5;{}mword\x1b[0m", next(255)),
+                1 => "\u{4e2d}\u{6587}x".to_string(),
+                2 => "ab".to_string(),
+                3 => format!("\x1b[{}X", next(12) + 1),
+                _ => format!("\x1b[48;5;{}m  \x1b[0m\x1b[K", next(255)),
+            };
+            frame.extend_from_slice(format!("\x1b[{row};{col}H{text}").as_bytes());
+        }
+        frame.extend_from_slice(SYNC_END);
+        out.push(frame);
+    }
+    out
+}
+
+#[test]
+fn the_host_screen_matches_the_pane_after_every_frame() {
+    let size = (60, 16);
+    for scroll_passthrough in [false, true] {
+        for corpus in corpus::generated(size, 24) {
+            // Small deliveries, so frames also arrive split across chunks.
+            let scrolled =
+                assert_host_matches(corpus.name, size, &corpus.frames, scroll_passthrough, 97);
+            let scrolls = matches!(corpus.name, "su-scroll" | "region-linefeed" | "plain-stream");
+            assert_eq!(
                 scrolled > 0,
-                "{}: no rows were moved on the host",
+                scroll_passthrough && scrolls,
+                "{}: rows moved on the host: {scrolled}",
                 corpus.name
             );
+        }
+        assert_host_matches(
+            "scattered-edits",
+            size,
+            &scattered_edits(size, 200),
+            scroll_passthrough,
+            97,
+        );
+    }
+}
+
+/// The same check over captured corpora (`BMUX_BENCH_CORPUS` at `BMUX_BENCH_SIZE`).
+#[test]
+#[ignore = "checks captured corpora; run explicitly with --ignored"]
+fn the_host_screen_matches_the_pane_for_captured_corpora() {
+    let size = size();
+    let paths = std::env::var("BMUX_BENCH_CORPUS").unwrap_or_default();
+    for path in paths.split(',').filter(|path| !path.is_empty()) {
+        let frames = corpus::read(std::path::Path::new(path)).expect("corpus");
+        for scroll_passthrough in [false, true] {
+            assert_host_matches(path, size, &frames, scroll_passthrough, delivery());
         }
     }
 }

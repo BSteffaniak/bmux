@@ -497,13 +497,13 @@ mod tests {
         )]);
         let mut pane_buffers: BTreeMap<Uuid, PaneRenderBuffer> = BTreeMap::new();
         let buffer = pane_buffers.entry(pane_id).or_default();
-        buffer.prev_rows.push("cached".to_string());
+        buffer.prev_rows.push(crate::render::ShownRow::blank(1));
 
         resize_attach_grids_for_scene_with_size(&mut pane_buffers, &test_scene, 10, 3);
 
         assert_eq!(
             pane_buffers[&pane_id].prev_rows,
-            [] as [std::string::String; 0]
+            Vec::<crate::render::ShownRow>::new()
         );
     }
 
@@ -524,7 +524,7 @@ mod tests {
                 if alternate {
                     buffer.terminal_grid.process(b"\x1b[?1049halt");
                 }
-                buffer.prev_rows.push("cached".into());
+                buffer.prev_rows.push(crate::render::ShownRow::blank(1));
             }
             let before = buffers[&pane].terminal_grid.grid().snapshot(0, 5);
             resize_attach_grids_for_scene_with_size_preserving(
@@ -535,12 +535,21 @@ mod tests {
                 &BTreeSet::from([pane]),
             );
             assert_eq!(buffers[&pane].terminal_grid.grid().snapshot(0, 5), before);
-            assert_eq!(buffers[&pane].prev_rows, ["cached"]);
+            assert_eq!(
+                buffers[&pane].prev_rows,
+                [crate::render::ShownRow::blank(1)]
+            );
             assert_ne!(buffers[&uniform].terminal_grid.grid().width(), 20);
-            assert_eq!(buffers[&uniform].prev_rows, Vec::<String>::new());
+            assert_eq!(
+                buffers[&uniform].prev_rows,
+                Vec::<crate::render::ShownRow>::new()
+            );
             resize_attach_grids_for_scene_with_size(&mut buffers, &test_scene, 10, 3);
             assert_ne!(buffers[&pane].terminal_grid.grid().width(), 20);
-            assert_eq!(buffers[&pane].prev_rows, Vec::<String>::new());
+            assert_eq!(
+                buffers[&pane].prev_rows,
+                Vec::<crate::render::ShownRow>::new()
+            );
         }
     }
 
