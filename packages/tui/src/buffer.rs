@@ -338,6 +338,51 @@ impl Buffer {
         }
     }
 
+    /// Copy row `from` of `source` into row `to` of this buffer, columns `columns`; `source`
+    /// must have this buffer's area.
+    pub(crate) fn copy_row_span_from(
+        &mut self,
+        source: &Self,
+        from: u16,
+        to: u16,
+        columns: std::ops::Range<u16>,
+    ) {
+        let (Some(start), Some(source_start)) = (
+            self.index(Point::new(columns.start, to)),
+            source.index(Point::new(columns.start, from)),
+        ) else {
+            return;
+        };
+        let len = usize::from(
+            columns
+                .end
+                .min(self.area.right())
+                .saturating_sub(columns.start),
+        );
+        for (destination, source) in self.cells[start..start + len]
+            .iter_mut()
+            .zip(&source.cells[source_start..source_start + len])
+        {
+            destination.clone_from(source);
+        }
+    }
+
+    /// Reset row `y`, columns `columns`, to default cells.
+    pub(crate) fn reset_span(&mut self, y: u16, columns: std::ops::Range<u16>) {
+        let Some(start) = self.index(Point::new(columns.start, y)) else {
+            return;
+        };
+        let len = usize::from(
+            columns
+                .end
+                .min(self.area.right())
+                .saturating_sub(columns.start),
+        );
+        self.cells[start..start + len]
+            .iter_mut()
+            .for_each(Cell::reset);
+    }
+
     /// Restore from `retained` the cells of row `y`, columns `columns`, that lie outside every
     /// one of `regions`.
     pub(crate) fn restore_span_outside(
@@ -747,6 +792,32 @@ impl Buffer {
                     .iter_mut()
                     .for_each(Cell::reset);
             }
+        }
+    }
+
+    /// Move the cells of `band` by `shift` rows like [`Self::shift_band`], first blanking any
+    /// wide grapheme its left or right edge cuts, so every grapheme stays whole.
+    pub(crate) fn move_band(&mut self, band: Rect, shift: i64) {
+        let band = self.area.intersection(band);
+        if band.is_empty() {
+            return;
+        }
+        for y in band.y..band.bottom() {
+            if self
+                .get(Point::new(band.x, y))
+                .is_some_and(Cell::is_wide_continuation)
+            {
+                self.clear_span_at(Point::new(band.x, y));
+            }
+            let last = Point::new(band.right() - 1, y);
+            if self.get(last).is_some_and(Cell::is_wide_leader) {
+                self.clear_span_at(last);
+            }
+        }
+        if shift.unsigned_abs() >= u64::from(band.height) {
+            self.fill(band, " ", Style::new());
+        } else {
+            self.shift_band(band, shift);
         }
     }
 

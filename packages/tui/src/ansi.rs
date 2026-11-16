@@ -373,22 +373,36 @@ pub(crate) fn scroll_diff(
     margins: bool,
     model: &mut Buffer,
 ) -> io::Result<AnsiScrollDiffStats> {
-    let (diff, moved) = scroll_moves_diff(writer, frames, &[(region, rows)], margins, model)?;
+    let (diff, moved) = scroll_moves_diff(writer, frames, &[(region, rows)], margins, model, None)?;
     Ok(AnsiScrollDiffStats {
         diff,
         scrolled: moved.first().copied().unwrap_or(false),
     })
 }
 
+/// Cells a frame painted while its other cells only moved (see
+/// [`crate::presentation::PreparedPresentation::painted`]).
+#[derive(Clone, Copy)]
+pub(crate) struct PaintedOver<'a> {
+    /// The regions painted.
+    pub(crate) painted: &'a [crate::geometry::Rect],
+    /// The moves the frame made, in order.
+    pub(crate) moves: &'a [(crate::geometry::Rect, i64)],
+}
+
 /// [`scroll_diff`] for several moves, each of a region none of the others overlaps: the
 /// expressible ones are emitted in order, then `current` is diffed once against the model with
 /// all of them applied. Reports which moves were emitted.
+///
+/// With `painted_over`, when every move the frame made is emitted, the cells it only moved
+/// already match the model, so only the painted ones are compared.
 pub(crate) fn scroll_moves_diff(
     writer: &mut impl Write,
     frames: ScrollFrames<'_>,
     moves: &[(crate::geometry::Rect, i64)],
     margins: bool,
     model: &mut Buffer,
+    painted_over: Option<PaintedOver<'_>>,
 ) -> io::Result<(AnsiFrameDiffStats, Vec<bool>)> {
     let ScrollFrames {
         previous,
@@ -446,27 +460,81 @@ pub(crate) fn scroll_moves_diff(
         }
     }
     // The diff reads the model only in its scope (and a wide grapheme's other half beside it),
-    // so only those cells of the previous frame are copied when the scope is known.
-    let scope = scope.map(|scope| {
-        let mut scope = scope.to_vec();
-        scope.extend(applied.iter().map(|(region, _)| *region));
-        scope
-    });
+    // so only those cells of the scrolled screen are built when the scope is known.
+    let scope = match painted_over {
+        Some(painted_over)
+            if painted_over
+                .moves
+                .iter()
+                .all(|scroll| applied.contains(scroll)) =>
+        {
+            Some(painted_over.painted.to_vec())
+        }
+        _ => scope.map(|scope| {
+            let mut scope = scope.to_vec();
+            scope.extend(applied.iter().map(|(region, _)| *region));
+            scope
+        }),
+    };
     match scope.as_deref() {
         Some(scope) if model.area() == area => {
             for ((start, end), y) in row_spans(area, scope, 2).into_iter().zip(area.y..) {
                 if start < end {
-                    model.copy_span_from(previous, y, start..end);
+                    scrolled_model_span(model, previous, &applied, y, start..end);
                 }
             }
         }
-        _ => model.clone_from(previous),
-    }
-    for (region, rows) in &applied {
-        model.shift_band(*region, *rows);
+        _ => {
+            model.clone_from(previous);
+            for (region, rows) in &applied {
+                model.shift_band(*region, *rows);
+            }
+        }
     }
     let diff = write_ansi_cells_diff(writer, model, current, cursor, depth, scope.as_deref())?;
     Ok((diff, emitted))
+}
+
+/// Set row `y`, `columns`, of `model` to what the terminal shows there after `moves` (regions
+/// none of which overlap, each moved by its rows, positive up) scroll `previous`.
+fn scrolled_model_span(
+    model: &mut Buffer,
+    previous: &Buffer,
+    moves: &[(crate::geometry::Rect, i64)],
+    y: u16,
+    columns: std::ops::Range<u16>,
+) {
+    let mut x = columns.start;
+    while x < columns.end {
+        let on_row =
+            |(region, _): &&(crate::geometry::Rect, i64)| region.y <= y && y < region.bottom();
+        if let Some((region, rows)) = moves
+            .iter()
+            .filter(on_row)
+            .find(|(region, _)| region.x <= x && x < region.right())
+        {
+            let end = columns.end.min(region.right());
+            let source = i64::from(y) + rows;
+            if source >= i64::from(region.y) && source < i64::from(region.bottom()) {
+                let source = u16::try_from(source).unwrap_or(y);
+                model.copy_row_span_from(previous, source, y, x..end);
+            } else {
+                model.reset_span(y, x..end);
+            }
+            x = end;
+        } else {
+            let end = moves
+                .iter()
+                .filter(on_row)
+                .map(|(region, _)| region.x)
+                .filter(|start| *start > x)
+                .min()
+                .unwrap_or(columns.end)
+                .min(columns.end);
+            model.copy_row_span_from(previous, y, y, x..end);
+            x = end;
+        }
+    }
 }
 
 fn write_ansi_cells_diff(

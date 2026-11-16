@@ -74,9 +74,11 @@ pub struct Frame<'buffer> {
     semantics: SemanticScene,
     damage: Vec<Rect>,
     scroll_hints: Vec<(Rect, i64)>,
+    moves: Vec<(Rect, i64)>,
     metadata_availability: Vec<SurfaceMetadataAvailability>,
     clock: Option<crate::clock::PresentationClock>,
     written: Option<WrittenSpans>,
+    painted: Option<WrittenSpans>,
 }
 
 /// The columns each row of a frame's buffer may have been written in, one `start..end` span
@@ -187,15 +189,23 @@ impl<'buffer> Frame<'buffer> {
             semantics: SemanticScene::new(),
             damage: Vec::new(),
             scroll_hints: Vec::new(),
+            moves: Vec::new(),
             metadata_availability: Vec::new(),
             clock: None,
             written: None,
+            painted: None,
         }
     }
 
     /// Record which cells painting writes, for [`Self::take_written`].
     pub(crate) fn track_writes(&mut self) {
         self.written = Some(WrittenSpans::new(self.buffer.area()));
+        self.painted = Some(WrittenSpans::new(self.buffer.area()));
+    }
+
+    /// The cells painted since [`Self::track_writes`]: those written, less the ones only moved.
+    pub(crate) const fn take_painted(&mut self) -> Option<WrittenSpans> {
+        self.painted.take()
     }
 
     /// The cells written since [`Self::track_writes`], or `None` when writes were not tracked.
@@ -204,6 +214,13 @@ impl<'buffer> Frame<'buffer> {
     }
 
     fn note_written(&mut self, area: Rect) {
+        self.note_moved(area);
+        if let Some(painted) = self.painted.as_mut() {
+            painted.note(area);
+        }
+    }
+
+    fn note_moved(&mut self, area: Rect) {
         if let Some(written) = self.written.as_mut() {
             written.note(area);
         }
@@ -309,6 +326,12 @@ impl<'buffer> Frame<'buffer> {
         &self.scroll_hints
     }
 
+    /// The cell moves painted ([`crate::paint::PaintCx::move_cells`]), in order.
+    #[must_use]
+    pub fn moves(&self) -> &[(Rect, i64)] {
+        &self.moves
+    }
+
     // Every mutator below is reachable only through `crate::paint::PaintCx`,
     // which translates and clips each contribution before staging it here.
 
@@ -395,6 +418,25 @@ impl<'buffer> Frame<'buffer> {
             .scroll_hints
             .partition_point(|(other, _)| cells(*other) >= cells(area));
         self.scroll_hints.insert(at, (area, rows));
+    }
+
+    /// Move the cells of an already projected `area` by `rows` (positive up), blanking the rows
+    /// it exposes, and report the move as a scroll hint.
+    pub(crate) fn move_cells(&mut self, area: Rect, rows: i64) {
+        let area = area.intersection(self.area());
+        if area.is_empty() || rows == 0 {
+            return;
+        }
+        self.note_moved(area);
+        // Wide graphemes the edges cut are blanked: painted, not moved.
+        if let Some(painted) = self.painted.as_mut() {
+            for column in [area.x, area.right().saturating_sub(1)] {
+                painted.note(Rect::new(column, area.y, 1, area.height));
+            }
+        }
+        self.buffer.move_band(area, rows);
+        self.moves.push((area, rows));
+        self.hint_scroll(area, rows);
     }
 
     pub(crate) fn push_damage(&mut self, area: Rect) {

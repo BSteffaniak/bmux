@@ -174,6 +174,9 @@ pub struct PreparedPresentation {
     metadata_availability: Vec<SurfaceMetadataAvailability>,
     damage: Damage,
     scroll_hints: Vec<(Rect, i64)>,
+    moves: Vec<(Rect, i64)>,
+    /// Regions painted (not only moved) in a frame painted over the last one with moves.
+    painted: Option<Vec<Rect>>,
     /// Producer occlusion geometry; visible images are already reconciled.
     occluded_regions: Vec<Rect>,
 }
@@ -190,6 +193,19 @@ impl PreparedPresentation {
     #[must_use]
     pub fn scroll_hints(&self) -> &[(Rect, i64)] {
         &self.scroll_hints
+    }
+
+    /// The cell moves painted in this frame, in order: scroll hints known to be exact.
+    #[must_use]
+    pub fn moves(&self) -> &[(Rect, i64)] {
+        &self.moves
+    }
+
+    /// For a frame painted over the last one with cell moves, the regions painted: every other
+    /// cell is the last frame's, moved. `None` otherwise.
+    #[must_use]
+    pub fn painted(&self) -> Option<&[Rect]> {
+        self.painted.as_deref()
     }
 
     /// Exact metadata installed with this immutable output snapshot. `None` means
@@ -1236,6 +1252,8 @@ impl PresentationState {
         let written;
         let metadata_availability;
         let scroll_hints;
+        let moves;
+        let painted;
         let (
             cursor,
             hits,
@@ -1256,6 +1274,17 @@ impl PresentationState {
             }
             PresentationPhase::Paint.measure(|| render(&mut PaintCx::new(&mut frame)), |()| true);
             written = frame.take_written();
+            painted = frame
+                .take_painted()
+                .filter(|_| over && !frame.moves().is_empty())
+                .map(|painted| {
+                    painted
+                        .spans()
+                        .map(|(y, columns)| {
+                            Rect::new(columns.start, y, columns.end - columns.start, 1)
+                        })
+                        .collect::<Vec<_>>()
+                });
             if over {
                 // What was painted is the frame's damage.
                 requested_regions = written.as_ref().map_or_else(Vec::new, |written| {
@@ -1268,6 +1297,7 @@ impl PresentationState {
                 });
             }
             scroll_hints = frame.scroll_hints().to_vec();
+            moves = frame.moves().to_vec();
             let metadata = PresentationPhase::MetadataExtract.measure(
                 || {
                     // Modal transitions still replace the complete interaction tree.
@@ -1427,6 +1457,8 @@ impl PresentationState {
                     metadata_availability,
                     damage,
                     scroll_hints,
+                    moves,
+                    painted,
                     occluded_regions: occlusions.iter().map(|(_, area)| *area).collect(),
                 })
             },

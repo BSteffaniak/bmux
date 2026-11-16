@@ -146,6 +146,10 @@ fn encode_frame(
         &moves,
         true,
         model,
+        prepared.painted().map(|painted| crate::ansi::PaintedOver {
+            painted,
+            moves: prepared.moves(),
+        }),
     )?;
     let applied = scrolls
         .iter()
@@ -792,6 +796,22 @@ impl<W: Write> Terminal<W> {
                     .all(|scroll| scroll.region.intersection(candidate).is_empty())
             };
             let full = Rect::new(area.x, region.y, area.width, region.height);
+            // A move already happened in the frame: scrolling the same cells costs nothing to
+            // weigh, unless only full rows can show it and they would move other columns too.
+            if prepared.moves().contains(&(region, rows)) {
+                if region == full && clear(full) && free(full) {
+                    planned.push(AppliedScroll { region, rows });
+                    continue;
+                }
+                if self.scroll_acceleration == ScrollRegionAcceleration::AutoWithMargins
+                    && clear(region)
+                    && free(region)
+                    && previous.band_has_clean_margins(region)
+                {
+                    planned.push(AppliedScroll { region, rows });
+                    continue;
+                }
+            }
             let unscrolled = previous.band_changes(current, full, 0);
             let full_rows = (clear(full) && free(full)).then(|| {
                 (

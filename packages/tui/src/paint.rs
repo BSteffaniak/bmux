@@ -573,6 +573,20 @@ impl<'frame, 'buffer> PaintCx<'frame, 'buffer> {
         }
     }
 
+    /// Move the cells of a local rectangle (after translation and clipping) by `rows`, positive
+    /// toward its top, as a terminal scroll inside it would: the rows it exposes become blank in
+    /// the default style, and cells outside it do not move. A wide grapheme its edges cut is
+    /// blanked first.
+    ///
+    /// Unlike [`Self::hint_scroll`], this changes the frame: it is for output that describes
+    /// changes to what was shown (a terminal's own scroll, for example), so a presenter can move
+    /// the terminal's rows as well.
+    pub fn move_cells(&mut self, area: LocalRect, rows: i64) {
+        if let Some(area) = self.project_rect(area) {
+            self.frame.move_cells(area, rows);
+        }
+    }
+
     /// Register a local interaction region after translation and clipping.
     pub fn push_hit(&mut self, mut region: HitRegion) {
         let Some(area) = self.project_rect(LocalRect::terminal(region.area)) else {

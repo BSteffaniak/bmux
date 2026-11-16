@@ -75,7 +75,24 @@ struct Pane {
 impl Pane {
     fn paint(&self, cx: &mut PaintCx<'_, '_>) {
         cx.fill(LocalRect::terminal(self.rect), " ", Style::new());
-        for row in 0..self.rect.height {
+        self.paint_rows(cx, 0..self.rect.height);
+    }
+
+    /// Repaint rows `rows` (pane-relative) over whatever they show.
+    fn paint_rows(&self, cx: &mut PaintCx<'_, '_>, rows: std::ops::Range<u16>) {
+        for row in rows.clone() {
+            cx.fill(
+                LocalRect::terminal(Rect::new(
+                    self.rect.x,
+                    self.rect.y + row,
+                    self.rect.width,
+                    1,
+                )),
+                " ",
+                Style::new(),
+            );
+        }
+        for row in rows {
             let mut x = i32::from(self.rect.x);
             for (symbol, style) in line_cells(self.top + u64::from(row), self.rect.width) {
                 cx.replace_cell(x, i64::from(self.rect.y + row), symbol, style);
@@ -179,8 +196,11 @@ fn run(acceleration: ScrollRegionAcceleration, over: bool) {
         let mut scrolls = Vec::new();
         for (index, pane) in panes.iter_mut().enumerate() {
             if frame == 0 || next(3) == 0 {
-                let rows = i64::try_from(next(7)).unwrap() - 3;
-                pane.top = pane.top.saturating_add_signed(rows);
+                let was = pane.top;
+                pane.top = pane
+                    .top
+                    .saturating_add_signed(i64::try_from(next(7)).unwrap() - 3);
+                let rows = i64::try_from(pane.top).unwrap() - i64::try_from(was).unwrap();
                 changed.push(index);
                 if rows != 0 {
                     scrolls.push((index, rows));
@@ -208,8 +228,36 @@ fn run(acceleration: ScrollRegionAcceleration, over: bool) {
                 cx.hint_scroll(LocalRect::terminal(panes[*index].rect), *rows);
             }
         };
+        let extra = u16::try_from(next(u64::from(HEIGHT))).unwrap();
         if over && !full {
-            terminal.draw_over(paint).expect("draw over");
+            // Scrolling panes move their cells and repaint only the rows the move exposed (and
+            // one more); other changed panes repaint in full.
+            terminal
+                .draw_over(|cx| {
+                    for (index, pane) in panes.iter().enumerate() {
+                        if !changed.contains(&index) {
+                            continue;
+                        }
+                        let Some((_, rows)) =
+                            scrolls.iter().find(|(scrolled, _)| *scrolled == index)
+                        else {
+                            pane.paint(cx);
+                            continue;
+                        };
+                        cx.move_cells(LocalRect::terminal(pane.rect), *rows);
+                        let height = pane.rect.height;
+                        let moved = u16::try_from(rows.unsigned_abs()).unwrap().min(height);
+                        let exposed = if *rows > 0 {
+                            height - moved..height
+                        } else {
+                            0..moved
+                        };
+                        pane.paint_rows(cx, exposed);
+                        let extra = extra % height;
+                        pane.paint_rows(cx, extra..extra + 1);
+                    }
+                })
+                .expect("draw over");
         } else {
             terminal.draw_damage(damage, paint).expect("draw");
         }
