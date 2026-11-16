@@ -187,12 +187,15 @@ fn register_bundled_definition(
         .manifest_toml
         .as_deref()
         .context("bundled definition has no embedded manifest")?;
-    let manifest = PluginManifest::from_toml_str(embedded)?;
-    let original = PluginManifest::from_toml_str(manifest_toml)?;
-    anyhow::ensure!(
-        manifest.id == original.id && manifest.version == original.version,
-        "bundled definition identity differs from declaration '{plugin_id}'"
-    );
+    // Identical text needs no second parse; the registry parses it once more.
+    if embedded != manifest_toml {
+        let manifest = PluginManifest::from_toml_str(embedded)?;
+        let original = PluginManifest::from_toml_str(manifest_toml)?;
+        anyhow::ensure!(
+            manifest.id == original.id && manifest.version == original.version,
+            "bundled definition identity differs from declaration '{plugin_id}'"
+        );
+    }
     // Preserve the exact author declaration used by dynamic packaging; the
     // application may not repair or rewrite its contract/role metadata.
     let embedded = embedded.to_owned();
