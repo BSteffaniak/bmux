@@ -1020,6 +1020,40 @@ mod pointer_query_tests {
     }
 }
 
+/// Opt-in end-to-end latency log for `bmux-bench replay` (see
+/// `docs/development/pane-output-performance.md`): with `BMUX_REPLAY_LOG` naming a file, each
+/// replay marker read from a pane appends `S frame written_ns read_ns`, beside the attach client's
+/// lines for when the frame reached the host.
+fn note_replay_markers_read(bytes: &[u8]) {
+    static LOG: std::sync::OnceLock<Option<std::sync::Mutex<std::fs::File>>> =
+        std::sync::OnceLock::new();
+    let Some(file) = LOG.get_or_init(|| {
+        let path = std::env::var_os("BMUX_REPLAY_LOG")?;
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .ok()
+            .map(std::sync::Mutex::new)
+    }) else {
+        return;
+    };
+    let markers = bmux_bench::corpus::markers(bytes);
+    if markers.is_empty() {
+        return;
+    }
+    let read = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_nanos());
+    let mut lines = Vec::new();
+    for (frame, written) in markers {
+        let _ = writeln!(lines, "S {frame} {written} {read}");
+    }
+    if let Ok(mut file) = file.lock() {
+        let _ = file.write_all(&lines);
+    }
+}
+
 fn push_pane_runtime_notice(
     session_id: SessionId,
     pane_id: Uuid,
@@ -7865,6 +7899,7 @@ impl SessionRuntimeManager {
                                 let metadata = shell_metadata_parser.process_chunk(chunk);
                                 let chunk = metadata.filtered;
                                 let chunk = chunk.as_slice();
+                                note_replay_markers_read(chunk);
 
                                 // Update terminal mode tracking (mouse protocol,
                                 // cursor/keypad modes, synchronized update) BEFORE

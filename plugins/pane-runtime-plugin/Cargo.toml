@@ -15,6 +15,7 @@ name = "bmux-pane-execution-supervisor"
 path = "src/bin/execution_supervisor.rs"
 
 [dependencies]
+bmux_bench = { workspace = true }
 anyhow = { workspace = true, features = ["std"] }
 bmux_application_resurrection_plugin_api = { workspace = true }
 bmux_attach_image_protocol = { workspace = true }
@@ -61,7 +62,6 @@ tracing = { workspace = true, features = ["std"] }
 uuid = { workspace = true, features = ["serde", "std"] }
 
 [dev-dependencies]
-bmux_bench = { workspace = true }
 
 [features]
 default = []

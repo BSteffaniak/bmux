@@ -15,6 +15,7 @@ name = "bmux"
 path = "src/main.rs"
 
 [dependencies]
+bmux_bench                  = { workspace = true }
 bmux_bench_cli              = { workspace = true, optional = true }
 bmux_connections_plugin_api = { workspace = true }
 bmux_frontend_runtime       = { workspace = true }

@@ -240,6 +240,8 @@ impl AttachDirtyFlags {
 
 #[allow(clippy::struct_excessive_bools)]
 pub struct AttachViewState {
+    /// Opt-in end-to-end latency log for replayed frames.
+    pub(super) replay_log: super::replay_log::ReplayLog,
     pub(super) prepared_extensions:
         Option<Vec<std::sync::Arc<dyn bmux_plugin::AttachRenderExtension>>>,
     pub(super) presentation_only: bool,
@@ -657,6 +659,7 @@ impl AttachViewState {
     #[allow(clippy::too_many_lines)]
     pub fn new(attach_info: bmux_client::AttachOpenInfo) -> Self {
         Self {
+            replay_log: super::replay_log::ReplayLog::from_env(),
             prepared_extensions: None,
             presentation_only: false,
             allow_retarget: true,

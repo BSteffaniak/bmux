@@ -2422,6 +2422,7 @@ fn apply_attach_output_chunk(
 ) -> AttachChunkApplyOutcome {
     let pane_mouse_protocol_hints = &mut view_state.pane_mouse_protocol_hints;
     let pane_input_mode_hints = &mut view_state.pane_input_mode_hints;
+    let replay_log = &mut view_state.replay_log;
     let mut toggled_alternate = false;
     let outcome = apply_attach_output_chunk_with(
         &mut view_state.pane_buffers,
@@ -2433,6 +2434,7 @@ fn apply_attach_output_chunk(
                 return false;
             }
 
+            replay_log.applied(data);
             toggled_alternate =
                 super::render::append_pane_output(buffer, data) || toggled_alternate;
             update_protocol_hints_from_state(
@@ -11051,6 +11053,7 @@ fn render_attach_frame_inner(
     geometry: TerminalGeometry,
     mut render_trace: Option<&mut AttachRenderTrace>,
 ) -> Result<AttachFrameRenderStats> {
+    view_state.replay_log.rendering();
     let frame_started_at = PhaseChannel::Attach.enabled().then(Instant::now);
     let mut damage_policy = DamageCoalescingPolicy {
         max_rects: damage_config.max_rects,
@@ -11579,6 +11582,7 @@ fn render_attach_frame_inner(
             .mark_full_frame(AttachDirtySource::ManualRedraw);
         return Err(error);
     }
+    view_state.replay_log.presented();
     let output_elapsed = terminal_write_started_at.elapsed();
     let terminal_write_ms = duration_millis_u64(output_elapsed);
     let output_acceptance_ns = u64::try_from(output_elapsed.as_nanos()).unwrap_or(u64::MAX);

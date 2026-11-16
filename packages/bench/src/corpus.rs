@@ -20,6 +20,58 @@ pub const SYNC_BEGIN: &[u8] = b"\x1b[?2026h";
 /// End a synchronized update.
 pub const SYNC_END: &[u8] = b"\x1b[?2026l";
 
+/// Start of a replay marker: a private OSC naming a frame and when it was written, which a
+/// terminal ignores. `bmux-bench replay` puts one in each frame it plays; an attach client run with
+/// `BMUX_REPLAY_LOG` logs when the host frame showing it is written, for end-to-end latency.
+pub const MARKER_PREFIX: &[u8] = b"\x1b]7771;bmux-replay;";
+
+/// The marker for frame `frame` written at `written_ns` (nanoseconds since the Unix epoch).
+#[must_use]
+pub fn marker(frame: u64, written_ns: u128) -> Vec<u8> {
+    let mut bytes = MARKER_PREFIX.to_vec();
+    bytes.extend_from_slice(format!("{frame};{written_ns}\x07").as_bytes());
+    bytes
+}
+
+/// The complete markers in `bytes`: frame and write time of each, in order.
+#[must_use]
+pub fn markers(bytes: &[u8]) -> Vec<(u64, u128)> {
+    let mut found = Vec::new();
+    let mut rest = bytes;
+    while let Some(start) = rest
+        .windows(MARKER_PREFIX.len())
+        .position(|window| window == MARKER_PREFIX)
+    {
+        rest = &rest[start + MARKER_PREFIX.len()..];
+        let Some(end) = rest.iter().position(|byte| *byte == 0x07) else {
+            break;
+        };
+        let fields = std::str::from_utf8(&rest[..end]).ok().and_then(|text| {
+            let (frame, written) = text.split_once(';')?;
+            Some((frame.parse().ok()?, written.parse().ok()?))
+        });
+        found.extend(fields);
+        rest = &rest[end + 1..];
+    }
+    found
+}
+
+/// `frame` with `marker` inside its synchronized update (before its end) when it has one, else
+/// after it, so the marker arrives with the frame it names.
+#[must_use]
+pub fn with_marker(frame: &[u8], marker: &[u8]) -> Frame {
+    let split = if frame.ends_with(SYNC_END) {
+        frame.len() - SYNC_END.len()
+    } else {
+        frame.len()
+    };
+    let mut marked = Vec::with_capacity(frame.len() + marker.len());
+    marked.extend_from_slice(&frame[..split]);
+    marked.extend_from_slice(marker);
+    marked.extend_from_slice(&frame[split..]);
+    marked
+}
+
 /// Read a corpus file.
 ///
 /// # Errors
@@ -249,6 +301,20 @@ pub fn unclosed_sync(size: (u16, u16), frames: usize) -> Vec<Frame> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn markers_ride_inside_their_frame_and_are_found_again() {
+        let frame = su_scroll((40, 10), 1).pop().unwrap();
+        let marked = with_marker(&frame, &marker(7, 123_456_789));
+        assert!(marked.starts_with(SYNC_BEGIN) && marked.ends_with(SYNC_END));
+        let plain = with_marker(b"text", &marker(8, 1));
+        assert!(plain.starts_with(b"text"));
+        let mut both = marked.clone();
+        both.extend_from_slice(&plain);
+        // A marker cut off at the end is not reported.
+        both.extend_from_slice(&marker(9, 2)[..MARKER_PREFIX.len() + 2]);
+        assert_eq!(markers(&both), [(7, 123_456_789), (8, 1)]);
+    }
 
     #[test]
     fn records_round_trip_and_truncation_is_an_error() {

@@ -1725,6 +1725,7 @@ dependencies = [
  "bmux_attach_pipeline",
  "bmux_attach_token_state",
  "bmux_attach_view_protocol",
+ "bmux_bench",
  "bmux_bench_cli",
  "bmux_broadcast_plugin",
  "bmux_broadcast_plugin_api",

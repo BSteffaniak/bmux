@@ -1,5 +1,6 @@
 //! Reusable, daemon-free frontend for BMUX portable terminal benchmarks.
 mod args;
+mod replay;
 mod signals;
 mod ui;
 
@@ -130,6 +131,10 @@ where
                 emit(&text)?;
             }
             Ok(0)
+        }
+        Command::Replay(args) => {
+            let report = replay::run(&args)?;
+            emit(&report).map(|()| 0)
         }
         Command::Report { run, format } => {
             let record = artifact::read_bundle(&run)?;

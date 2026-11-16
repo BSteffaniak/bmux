@@ -34,6 +34,9 @@ pub(crate) enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Play a frame corpus into this terminal at a fixed rate; inside a BMUX pane whose attach
+    /// client runs with BMUX_REPLAY_LOG, report end-to-end latency per frame.
+    Replay(ReplayArgs),
     /// Render a stored run without opening a terminal.
     Report {
         run: PathBuf,
@@ -94,4 +97,21 @@ pub(crate) struct RunArgs {
     /// Explicitly enable/disable synchronized-update workloads; not auto-detected.
     #[arg(long, num_args = 0..=1, default_missing_value = "true", require_equals = true)]
     pub synchronized_updates: Option<bool>,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct ReplayArgs {
+    /// Corpus file (records of an 8-byte little-endian length, then a frame).
+    pub corpus: Option<std::path::PathBuf>,
+    /// A generated corpus at this terminal's size, when no file is given.
+    #[arg(long, conflicts_with = "corpus")]
+    pub generated: Option<String>,
+    /// Frames to generate.
+    #[arg(long, default_value_t = 300)]
+    pub frames: usize,
+    #[arg(long, default_value_t = 60)]
+    pub fps: u32,
+    /// The attach client's BMUX_REPLAY_LOG file, read after playing.
+    #[arg(long)]
+    pub log: Option<std::path::PathBuf>,
 }
