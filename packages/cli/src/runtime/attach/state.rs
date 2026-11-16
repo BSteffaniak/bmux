@@ -892,6 +892,28 @@ impl AttachViewState {
             .any(|pane| !self.presented_images(*pane).is_empty())
     }
 
+    /// Whether graphics are, or were last frame, on the host terminal: pane rows must then not
+    /// be moved there, since moving them would move or orphan the graphics.
+    #[must_use]
+    pub fn graphics_on_host(&self) -> bool {
+        #[cfg(any(
+            feature = "image-sixel",
+            feature = "image-kitty",
+            feature = "image-iterm2"
+        ))]
+        {
+            self.pane_images_presented || self.has_presented_images()
+        }
+        #[cfg(not(any(
+            feature = "image-sixel",
+            feature = "image-kitty",
+            feature = "image-iterm2"
+        )))]
+        {
+            false
+        }
+    }
+
     /// Whether the *focused* pane is in scrollback.
     ///
     /// This derives the UI-level "scroll mode" from the focused pane rather

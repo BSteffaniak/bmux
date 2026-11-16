@@ -11059,7 +11059,7 @@ fn render_attach_frame_inner(
     };
     // Rows may be moved on the host only when nothing was or will be drawn over pane content.
     let content_was_covered =
-        view_state.retained_compositor.covers_content() || view_state.pane_images_presented;
+        view_state.retained_compositor.covers_content() || view_state.graphics_on_host();
     let appearance_resolver = AttachAppearanceResolver {
         fallback: runtime_appearance,
         view_state,
@@ -11140,7 +11140,7 @@ fn render_attach_frame_inner(
         RenderFramePlan::from_damage(retained_plan, &frame_damage, damage_config.visualize);
     damage_policy.scroll_passthrough = !content_was_covered
         && !view_state.retained_compositor.covers_content()
-        && !view_state.has_presented_images();
+        && !view_state.graphics_on_host();
     let retained_repaint_by_id = frame_plan.retained.repaint_by_id();
 
     let mut frame_bytes = Vec::new();
