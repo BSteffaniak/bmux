@@ -666,7 +666,7 @@ fn emit_row_cells(
             continue;
         }
         if cell.style != *active_style {
-            write_ansi_style(writer, cell.style, depth)?;
+            write_ansi_style_change(writer, *active_style, cell.style, depth)?;
             *active_style = cell.style;
         }
         if cell.symbol.is_empty() {
@@ -960,12 +960,96 @@ fn write_ansi_move_to(writer: &mut impl Write, point: Point) -> io::Result<()> {
     )
 }
 
+/// Change the terminal's style from `from` to `to`, writing whichever is shorter: the
+/// attributes that differ, or a reset with all of `to`. A change from the default style always
+/// resets, so attributes something else left on the terminal never reach a cell.
+fn write_ansi_style_change(
+    writer: &mut impl Write,
+    from: Style,
+    to: Style,
+    depth: TerminalColorDepth,
+) -> io::Result<()> {
+    let (from, to) = (from.quantized(depth), to.quantized(depth));
+    let mut reset = io::Cursor::new([0_u8; 96]);
+    write_quantized_style(&mut reset, to)?;
+    let reset_len = usize::try_from(reset.position()).unwrap_or(usize::MAX);
+    if from == Style::new() {
+        return writer.write_all(&reset.get_ref()[..reset_len]);
+    }
+    let mut change = io::Cursor::new([0_u8; 96]);
+    write_style_difference(&mut change, from, to)?;
+    let change_len = usize::try_from(change.position()).unwrap_or(usize::MAX);
+    if change_len < reset_len {
+        writer.write_all(&change.get_ref()[..change_len])
+    } else {
+        writer.write_all(&reset.get_ref()[..reset_len])
+    }
+}
+
+/// The SGR sequence that changes quantized `from` to quantized `to` without a reset, or nothing
+/// when they look the same.
+fn write_style_difference(writer: &mut impl Write, from: Style, to: Style) -> io::Result<()> {
+    let shown = |color: Option<Color>| color.filter(|color| *color != Color::Default);
+    let mut codes = io::Cursor::new([0_u8; 96]);
+    let removed = from.modifiers.difference(to.modifiers);
+    let mut added = to.modifiers.difference(from.modifiers);
+    // One code turns off both bold and dim; whichever stays is turned back on.
+    if removed.contains(Modifier::BOLD) || removed.contains(Modifier::DIM) {
+        codes.write_all(b";22")?;
+        added = added.union(
+            to.modifiers
+                .difference(Modifier::ITALIC)
+                .difference(Modifier::UNDERLINE)
+                .difference(Modifier::SLOW_BLINK)
+                .difference(Modifier::REVERSED)
+                .difference(Modifier::HIDDEN)
+                .difference(Modifier::CROSSED_OUT),
+        );
+    }
+    for (modifier, off) in [
+        (Modifier::ITALIC, &b";23"[..]),
+        (Modifier::UNDERLINE, b";24"),
+        (Modifier::SLOW_BLINK, b";25"),
+        (Modifier::REVERSED, b";27"),
+        (Modifier::HIDDEN, b";28"),
+        (Modifier::CROSSED_OUT, b";29"),
+    ] {
+        if removed.contains(modifier) {
+            codes.write_all(off)?;
+        }
+    }
+    write_ansi_modifier(&mut codes, added)?;
+    if shown(from.fg) != shown(to.fg) {
+        match shown(to.fg) {
+            Some(fg) => write_ansi_color(&mut codes, fg, ColorRole::Foreground)?,
+            None => codes.write_all(b";39")?,
+        }
+    }
+    if shown(from.bg) != shown(to.bg) {
+        match shown(to.bg) {
+            Some(bg) => write_ansi_color(&mut codes, bg, ColorRole::Background)?,
+            None => codes.write_all(b";49")?,
+        }
+    }
+    let len = usize::try_from(codes.position()).unwrap_or(0);
+    if len == 0 {
+        return Ok(());
+    }
+    // Drop the leading separator.
+    writer.write_all(b"\x1b[")?;
+    writer.write_all(&codes.get_ref()[1..len])?;
+    writer.write_all(b"m")
+}
+
 fn write_ansi_style(
     writer: &mut impl Write,
     style: Style,
     depth: TerminalColorDepth,
 ) -> io::Result<()> {
-    let style = style.quantized(depth);
+    write_quantized_style(writer, style.quantized(depth))
+}
+
+fn write_quantized_style(writer: &mut impl Write, style: Style) -> io::Result<()> {
     writer.write_all(b"\x1b[0")?;
     write_ansi_modifier(writer, style.modifiers)?;
     if let Some(fg) = style.fg {

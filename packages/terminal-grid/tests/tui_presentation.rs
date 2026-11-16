@@ -10,7 +10,7 @@ use bmux_tui::damage::{Damage, DamagePolicy};
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Point, Rect};
 use bmux_tui::paint::{LocalRect, PaintCx};
-use bmux_tui::style::{Color, Style};
+use bmux_tui::style::{Color, Modifier, Style};
 use bmux_tui::terminal::{ScrollRegionAcceleration, Terminal};
 
 const WIDTH: u16 = 40;
@@ -30,12 +30,27 @@ fn line_cells(line: u64, width: u16) -> Vec<(&'static str, Style)> {
     let mut used = 0;
     while used < width {
         let word = words[usize::try_from(next() % 7).unwrap()];
-        let style = match next() % 4 {
+        let mut style = match next() % 4 {
             0 => Style::new(),
             1 => Style::new().fg(Color::Indexed(100)),
             2 => Style::new().bg(Color::Indexed(200)),
             _ => Style::new().fg(Color::Indexed(30)).bg(Color::Indexed(60)),
         };
+        for (bit, modifier) in [
+            Modifier::BOLD,
+            Modifier::DIM,
+            Modifier::ITALIC,
+            Modifier::UNDERLINE,
+            Modifier::REVERSED,
+            Modifier::CROSSED_OUT,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if next() >> (bit * 3) & 3 == 0 {
+                style = style.add_modifier(modifier);
+            }
+        }
         let mut chars = word.char_indices().peekable();
         while let Some((start, ch)) = chars.next() {
             let end = chars.peek().map_or(word.len(), |(end, _)| *end);
@@ -98,12 +113,29 @@ fn assert_host_shows(host: &TerminalGridStream, expected: &Buffer, context: &str
             let style = shown
                 .map(|cell| grid.palette().get(cell.style()))
                 .unwrap_or_default();
+            let modifiers = cell.style.modifiers;
             assert_eq!(
-                (text, style.fg, style.bg),
+                (
+                    text,
+                    style.fg,
+                    style.bg,
+                    [style.bold, style.dim, style.italic, style.underline],
+                    [style.inverse, style.strike]
+                ),
                 (
                     cell.symbol.as_str(),
                     grid_color(cell.style.fg),
-                    grid_color(cell.style.bg)
+                    grid_color(cell.style.bg),
+                    [
+                        modifiers.contains(Modifier::BOLD),
+                        modifiers.contains(Modifier::DIM),
+                        modifiers.contains(Modifier::ITALIC),
+                        modifiers.contains(Modifier::UNDERLINE)
+                    ],
+                    [
+                        modifiers.contains(Modifier::REVERSED),
+                        modifiers.contains(Modifier::CROSSED_OUT)
+                    ]
                 ),
                 "{context}: host differs at column {x} row {y}"
             );
