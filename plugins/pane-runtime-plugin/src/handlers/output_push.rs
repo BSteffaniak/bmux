@@ -6,6 +6,9 @@
 //! everything the client has not seen for its panes, as one batch. A client that falls behind is
 //! not queued messages: its output collects in the pane's buffer and is read later, together, or
 //! reported as a gap past the buffer's retention (the client then resynchronizes from a snapshot).
+//!
+//! The same mechanism tells a client that its input producer barriers changed, so it reads them
+//! when they do instead of polling.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
@@ -15,7 +18,7 @@ use bmux_plugin_sdk::WireEventSink;
 use bmux_session_models::{ClientId, SessionId};
 use uuid::Uuid;
 
-use bmux_pane_runtime_plugin_api::OUTPUT_PUSH_KIND;
+use bmux_pane_runtime_plugin_api::{OUTPUT_PUSH_KIND, PRODUCER_BARRIERS_CHANGED_KIND};
 
 struct Subscription {
     session_id: Uuid,
@@ -37,15 +40,49 @@ fn sink() -> Option<Arc<dyn WireEventSink>> {
         .and_then(|sink| sink.read().ok().map(|sink| sink.0.clone()))
 }
 
-/// Register the pull source with the host once. False when the host cannot push.
+fn barriers_changed() -> std::sync::MutexGuard<'static, std::collections::BTreeSet<Uuid>> {
+    static CHANGED: OnceLock<Mutex<std::collections::BTreeSet<Uuid>>> = OnceLock::new();
+    CHANGED
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Register the pull sources with the host once. False when the host cannot push.
 fn source_registered() -> bool {
     static REGISTERED: OnceLock<bool> = OnceLock::new();
     *REGISTERED.get_or_init(|| {
         sink().is_some_and(|sink| {
             sink.register_pull_source(OUTPUT_PUSH_KIND.to_string(), Arc::new(pull))
                 .is_ok()
+                && sink
+                    .register_pull_source(
+                        PRODUCER_BARRIERS_CHANGED_KIND.to_string(),
+                        Arc::new(pull_barriers_changed),
+                    )
+                    .is_ok()
         })
     })
+}
+
+/// Input producer barriers of these clients began or settled: tell them.
+pub fn producer_barriers_changed(clients: impl IntoIterator<Item = Uuid>) {
+    if !source_registered() {
+        return;
+    }
+    let Some(sink) = sink() else {
+        return;
+    };
+    for client in clients {
+        barriers_changed().insert(client);
+        if sink.wake(client).is_err() {
+            barriers_changed().remove(&client);
+        }
+    }
+}
+
+fn pull_barriers_changed(client: Uuid) -> Option<Vec<u8>> {
+    barriers_changed().remove(&client).then(Vec::new)
 }
 
 /// Push `client`'s output for `pane_ids` in `session_id` (replacing any earlier set; empty

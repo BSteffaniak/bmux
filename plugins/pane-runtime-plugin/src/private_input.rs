@@ -139,7 +139,11 @@ pub(crate) fn begin_barrier(pane: Uuid, nonce: Uuid, entering: bool) -> Option<u
         acknowledged: BTreeSet::new(),
         denied: state.members.is_empty(),
     });
-    Some(state.generation)
+    let generation = state.generation;
+    let members = state.members.clone();
+    drop(panes);
+    crate::handlers::output_push::producer_barriers_changed(members);
+    Some(generation)
 }
 
 pub(crate) fn pending_barriers(
@@ -235,8 +239,11 @@ pub(crate) fn finish_barrier(pane: Uuid, nonce: Uuid, generation: u64) -> bool {
         return false;
     }
     state.active_nonce = barrier.entering.then_some(nonce);
+    let members = barrier.expected.clone();
     state.barrier = None;
     state.blocked = false;
+    drop(panes);
+    crate::handlers::output_push::producer_barriers_changed(members);
     true
 }
 

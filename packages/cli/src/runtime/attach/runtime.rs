@@ -2483,6 +2483,63 @@ fn chunk_may_disable_mouse_protocol(bytes: &[u8]) -> bool {
         .any(|sequence| bytes_contain_sequence(bytes, sequence))
 }
 
+/// Read this client's input producer barriers and acknowledge new ones: the first pauses private
+/// input (fencing the terminal), and input resumes once none remain.
+async fn sync_input_producer_barriers<T: AttachHost + ?Sized>(
+    client: &mut StreamingBmuxClient,
+    terminal: &mut T,
+    producer_fences: &mut BTreeMap<(Uuid, Uuid, u64), u64>,
+    attach_input_processor: &mut InputProcessor,
+    keyboard_enhanced: bool,
+) -> Result<()> {
+    let Ok(Ok(barriers)) = attach_terminal_commands::client::input_producer_barriers_v2(client).await
+    else {
+        return Ok(());
+    };
+    let current = barriers
+        .iter()
+        .map(|barrier| (barrier.pane_id, barrier.nonce, barrier.generation))
+        .collect::<std::collections::BTreeSet<_>>();
+    for barrier in barriers {
+        let key = (barrier.pane_id, barrier.nonce, barrier.generation);
+        if producer_fences.contains_key(&key) {
+            continue;
+        }
+        let fence: Result<u64> = producer_fences.values().next().copied().map_or_else(
+            || {
+                let generation = terminal.fence_private_input()?;
+                // Drop chord/decoder state before acknowledging the application barrier.
+                *attach_input_processor = InputProcessor::new(
+                    attach_input_processor.keymap().clone(),
+                    keyboard_enhanced,
+                );
+                Ok(generation)
+            },
+            Ok,
+        );
+        let supported = fence.is_ok();
+        if let Ok(generation) = fence {
+            producer_fences.insert(key, generation);
+        }
+        let _ = attach_terminal_commands::client::acknowledge_input_producer_barrier_v2(
+            client,
+            barrier.pane_id,
+            barrier.nonce,
+            barrier.generation,
+            supported,
+        )
+        .await;
+    }
+    let generation = producer_fences.values().next().copied();
+    producer_fences.retain(|key, _| current.contains(key));
+    if producer_fences.is_empty()
+        && let Some(generation) = generation
+    {
+        terminal.resume_private_input(generation)?;
+    }
+    Ok(())
+}
+
 /// What applying a run of output chunks did.
 #[derive(Default)]
 struct AppliedChunks {
@@ -5553,7 +5610,10 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
             .publish_state(&bmux_tabs_plugin_api::tabs_list::STATE_KIND, snapshot);
     }
 
+    // Barriers are polled until the server says it tells this client when they change (it
+    // pushes output); then only as a safety net.
     let mut producer_barrier_tick = tokio::time::interval(Duration::from_millis(20));
+    let mut producer_barriers_announced = false;
     let output_caught_up = terminal.output_caught_up();
     // A frame was due while the host was still taking the last one; render it when it catches up.
     let mut render_deferred = false;
@@ -5591,30 +5651,14 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
         };
         tokio::select! {
             _ = producer_barrier_tick.tick() => {
-                let barriers = attach_terminal_commands::client::input_producer_barriers_v2(&mut client).await;
-                if let Ok(Ok(barriers)) = barriers {
-                    let current = barriers.iter().map(|b| (b.pane_id, b.nonce, b.generation)).collect::<std::collections::BTreeSet<_>>();
-                    for barrier in barriers {
-                        let key = (barrier.pane_id, barrier.nonce, barrier.generation);
-                        if producer_fences.contains_key(&key) { continue; }
-                        let fence: Result<u64> = producer_fences.values().next().copied().map_or_else(|| {
-                            let generation = terminal.fence_private_input()?;
-                            // Drop chord/decoder state before acknowledging the application barrier.
-                            attach_input_processor = InputProcessor::new(attach_input_processor.keymap().clone(), keyboard_enhanced);
-                            Ok(generation)
-                        }, Ok);
-                        let supported = fence.is_ok();
-                        if let Ok(generation) = fence { producer_fences.insert(key, generation); }
-                        let _ = attach_terminal_commands::client::acknowledge_input_producer_barrier_v2(
-                            &mut client, barrier.pane_id, barrier.nonce, barrier.generation, supported,
-                        ).await;
-                    }
-                    let generation = producer_fences.values().next().copied();
-                    producer_fences.retain(|key, _| current.contains(key));
-                    if producer_fences.is_empty() && let Some(generation) = generation {
-                        terminal.resume_private_input(generation)?;
-                    }
-                }
+                sync_input_producer_barriers(
+                    &mut client,
+                    terminal,
+                    &mut producer_fences,
+                    &mut attach_input_processor,
+                    keyboard_enhanced,
+                )
+                .await?;
             }
             _ = publication_tick.tick(), if view_state.committed_source.is_some() => {
                 let snapshot = super::committed_source::latest(&view_state);
@@ -6521,6 +6565,20 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
         // pane-output IPC on their own.
         // Keep pushed output on the panes output is read for (asks the server only on a change).
         update_output_push(&mut client, &mut view_state, &layout_state.scene).await;
+        if !producer_barriers_announced && !view_state.output_push.panes.is_empty() {
+            producer_barriers_announced = true;
+            producer_barrier_tick = tokio::time::interval(Duration::from_secs(1));
+        }
+        if std::mem::take(&mut view_state.producer_barriers_changed) {
+            sync_input_producer_barriers(
+                &mut client,
+                terminal,
+                &mut producer_fences,
+                &mut attach_input_processor,
+                keyboard_enhanced,
+            )
+            .await?;
+        }
         if pane_output_pending
             || view_state.scrollback_replay_pending
             || !view_state.output_push.received.is_empty()
@@ -7093,6 +7151,8 @@ async fn handle_attach_stream_server_event(
                     );
                 }
             }
+        } else if kind.as_str() == bmux_pane_runtime_plugin_api::PRODUCER_BARRIERS_CHANGED_KIND {
+            view_state.producer_barriers_changed = true;
         } else if kind.as_str() == bmux_pane_runtime_plugin_api::OUTPUT_PUSH_KIND {
             if let Some(chunks) = crate::pane_runtime_client::decode_pushed_output(payload) {
                 view_state.output_push.received.extend(chunks);

@@ -28,6 +28,11 @@ pub mod input_capture;
 /// encoded `attach_runtime_state::AttachPaneOutputBatch`.
 pub const OUTPUT_PUSH_KIND: &str = "bmux.pane_runtime/output-push";
 
+/// Plugin bus kind telling an attach client that its input producer barriers changed (one began
+/// or settled), so it reads them with `input-producer-barriers-v2` instead of polling. The
+/// payload is empty.
+pub const PRODUCER_BARRIERS_CHANGED_KIND: &str = "bmux.pane_runtime/producer-barriers-changed";
+
 bmux_plugin_schema_macros::schema! {
     source: "bpdl/pane-runtime-plugin.bpdl",
     export: export_schema,

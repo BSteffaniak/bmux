@@ -253,6 +253,8 @@ pub struct OutputPush {
 pub struct AttachViewState {
     /// Pane output pushed by the server.
     pub(super) output_push: OutputPush,
+    /// The server said this client's input producer barriers changed.
+    pub(super) producer_barriers_changed: bool,
     /// Opt-in end-to-end latency log for replayed frames.
     pub(super) replay_log: super::replay_log::ReplayLog,
     pub(super) prepared_extensions:
@@ -673,6 +675,7 @@ impl AttachViewState {
     pub fn new(attach_info: bmux_client::AttachOpenInfo) -> Self {
         Self {
             output_push: OutputPush::default(),
+            producer_barriers_changed: false,
             replay_log: super::replay_log::ReplayLog::from_env(),
             prepared_extensions: None,
             presentation_only: false,
