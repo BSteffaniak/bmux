@@ -53,6 +53,8 @@ const RETAINED_TOTAL_BYTES: usize = 1024 * 1024;
 #[derive(Default)]
 struct RetainedWireEvents {
     recipients: Mutex<BTreeMap<Uuid, RetainedRecipient>>,
+    /// Plugin sources the push task pulls from for a recipient after a wake.
+    pull_sources: Mutex<Vec<(String, bmux_plugin_sdk::WirePullSource)>>,
 }
 
 #[derive(Default)]
@@ -60,6 +62,8 @@ struct RetainedRecipient {
     values: BTreeMap<String, (Vec<u8>, bool)>,
     bytes: usize,
     ready: Arc<tokio::sync::Notify>,
+    /// A pull source asked to be read for this recipient.
+    woken: bool,
 }
 
 fn retained_error(message: &str) -> WireEventSinkError {
@@ -139,6 +143,39 @@ impl RetainedWireEvents {
         }
         drop(recipients);
         Ok(())
+    }
+
+    fn wake(&self, recipient: Uuid) -> std::result::Result<(), WireEventSinkError> {
+        let mut recipients = self
+            .recipients
+            .lock()
+            .map_err(|_| retained_error("poisoned retention lock"))?;
+        let entry = recipients
+            .get_mut(&recipient)
+            .ok_or_else(|| retained_error("recipient disconnected"))?;
+        entry.woken = true;
+        entry.ready.notify_one();
+        drop(recipients);
+        Ok(())
+    }
+
+    /// Whether the recipient was woken since last asked, clearing it.
+    fn take_wake(&self, recipient: Uuid) -> bool {
+        self.recipients
+            .lock()
+            .ok()
+            .and_then(|mut recipients| {
+                recipients
+                    .get_mut(&recipient)
+                    .map(|entry| std::mem::take(&mut entry.woken))
+            })
+            .unwrap_or(false)
+    }
+
+    fn pull_sources(&self) -> Vec<(String, bmux_plugin_sdk::WirePullSource)> {
+        self.pull_sources
+            .lock()
+            .map_or_else(|_| Vec::new(), |sources| sources.clone())
     }
 
     fn take_pending(&self, recipient: Uuid) -> Option<Event> {
@@ -3326,6 +3363,27 @@ async fn handle_connection(
                                     permit.send(frame);
                                 }
                                 retained_ready.notify_one();
+                            } else if push_state.retained_wire_events.take_wake(push_client_id.0) {
+                                // Read at send time: with room to queue a message, pull what the
+                                // sources have for this client now.
+                                let mut permit = Some(permit);
+                                for (kind, source) in push_state.retained_wire_events.pull_sources() {
+                                    let Some(payload) = source(push_client_id.0) else {
+                                        continue;
+                                    };
+                                    let event = Event::PluginBusEvent { kind, payload };
+                                    let Some(frame) = encode_event_frame(&event, push_frame_codec.as_deref()) else {
+                                        continue;
+                                    };
+                                    let permit = match permit.take() {
+                                        Some(permit) => permit,
+                                        None => match push_frame_tx.reserve().await {
+                                            Ok(permit) => permit,
+                                            Err(_) => return,
+                                        },
+                                    };
+                                    permit.send(frame);
+                                }
                             }
                             continue;
                         }
@@ -3613,6 +3671,27 @@ impl WireEventSink for ServerWireEventSink {
         kind: &str,
     ) -> std::result::Result<(), WireEventSinkError> {
         self.state.retained_wire_events.clear(recipient, kind)
+    }
+
+    fn register_pull_source(
+        &self,
+        kind: String,
+        source: bmux_plugin_sdk::WirePullSource,
+    ) -> std::result::Result<(), WireEventSinkError> {
+        if kind.len() > RETAINED_KIND_BYTES {
+            return Err(retained_error("pull source kind limit exceeded"));
+        }
+        self.state
+            .retained_wire_events
+            .pull_sources
+            .lock()
+            .map_err(|_| retained_error("poisoned pull source lock"))?
+            .push((kind, source));
+        Ok(())
+    }
+
+    fn wake(&self, recipient: Uuid) -> std::result::Result<(), WireEventSinkError> {
+        self.state.retained_wire_events.wake(recipient)
     }
 }
 
@@ -4740,6 +4819,24 @@ mod tests {
                 .ino(),
             identity
         );
+    }
+
+    #[tokio::test]
+    async fn a_wake_reaches_only_its_recipient_once_and_needs_a_connection() {
+        let retention = Arc::new(RetainedWireEvents::default());
+        let woken = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        let woken_registration = retention.register(woken).unwrap();
+        let _other_registration = retention.register(other).unwrap();
+        retention.wake(woken).unwrap();
+        retention.wake(woken).unwrap();
+        woken_registration.ready.notified().await;
+        assert!(!retention.take_wake(other));
+        assert!(retention.take_wake(woken));
+        assert!(!retention.take_wake(woken));
+        assert!(retention.wake(Uuid::new_v4()).is_err());
+        drop(woken_registration);
+        assert!(retention.wake(woken).is_err());
     }
 
     #[tokio::test]

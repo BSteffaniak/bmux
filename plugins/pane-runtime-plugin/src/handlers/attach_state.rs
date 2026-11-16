@@ -12,7 +12,7 @@ use bmux_attach_layout_protocol::{
 };
 use bmux_pane_runtime_plugin_api::attach_runtime_state::{
     AttachLayout as AttachLayoutRecord, AttachPaneGridDelta, AttachPaneGridSnapshot,
-    AttachPaneGridWindow, AttachPaneImages, AttachPaneOutputBatch,
+    AttachPaneGridWindow, AttachPaneImages, AttachPaneOutputBatch, AttachPaneOutputPush,
     AttachPaneSnapshot as AttachPaneSnapshotRecord, AttachSnapshot as AttachSnapshotRecord,
     AttachStateError, PaneChunk, PaneGridDelta, PaneGridSnapshot, PaneGridWindow,
     PaneGridWindowRequest, PaneInputMode, PaneMouseProtocol, PaneOutputCursorRead,
@@ -404,6 +404,31 @@ pub fn attach_pane_output_batch(
     })
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AttachPaneOutputPushArgs {
+    pub session_id: Uuid,
+    pub pane_ids: Vec<Uuid>,
+    pub max_bytes: u32,
+}
+
+/// Push the caller's output for the panes instead of it reading them (see `output_push`).
+pub fn attach_pane_output_push(
+    req: &AttachPaneOutputPushArgs,
+    ctx: &NativeServiceContext,
+) -> Result<AttachPaneOutputPush, AttachStateError> {
+    let client = ctx
+        .caller_client_id
+        .ok_or(AttachStateError::NotAttached)?;
+    Ok(AttachPaneOutputPush {
+        enabled: super::output_push::subscribe(
+            client,
+            req.session_id,
+            req.pane_ids.clone(),
+            req.max_bytes as usize,
+        ),
+    })
+}
+
 pub fn pane_output_cursor_state(
     req: &PaneOutputCursorArgs,
 ) -> Result<PaneOutputCursorRead, AttachStateError> {
@@ -717,7 +742,7 @@ pub fn attach_pane_images(
     Ok(AttachPaneImages { encoded })
 }
 
-fn chunk_to_record(chunk: AttachPaneChunk) -> PaneChunk {
+pub(super) fn chunk_to_record(chunk: AttachPaneChunk) -> PaneChunk {
     PaneChunk {
         pane_id: chunk.pane_id,
         data: chunk.data,

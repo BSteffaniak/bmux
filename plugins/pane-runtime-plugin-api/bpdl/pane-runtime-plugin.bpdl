@@ -1331,6 +1331,23 @@ interface attach-runtime-state {
         max_bytes: u32,
     ) -> result<attach-pane-output-batch, attach-state-error>;
 
+    record attach-pane-output-push {
+        // Whether this client's output for the panes is now pushed; false means keep reading it
+        // with attach-pane-output-batch.
+        enabled: bool,
+    }
+
+    // Push this client's output for `pane_ids` instead of it reading with
+    // attach-pane-output-batch. Whenever a pane has output and the client can take a message,
+    // the server sends what is available (at most `max_bytes` a pane) as an encoded
+    // attach-pane-output-batch, plugin bus kind "bmux.pane_runtime/output-push". Each call
+    // replaces the set of panes; an empty list stops pushing.
+    query attach-pane-output-push(
+        session_id: uuid,
+        pane_ids: list<uuid>,
+        max_bytes: u32,
+    ) -> result<attach-pane-output-push, attach-state-error>;
+
     record pane-output-cursor-read {
         data: list<u8>,
         retained_start: u64,

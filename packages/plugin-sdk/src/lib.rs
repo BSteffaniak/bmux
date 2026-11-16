@@ -191,7 +191,7 @@ pub use typed_dispatch_client::{
 };
 pub use version::{ApiVersion, VersionRange};
 pub use wire_event_sink::{
-    NoopWireEventSink, WireEventSink, WireEventSinkError, WireEventSinkHandle,
+    NoopWireEventSink, WireEventSink, WireEventSinkError, WireEventSinkHandle, WirePullSource,
 };
 
 // Prompt types — re-exported at the crate root for convenience.

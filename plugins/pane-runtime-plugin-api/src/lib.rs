@@ -24,6 +24,10 @@
 
 pub mod input_capture;
 
+/// Plugin bus kind of pane output pushed to an attach client after `attach-pane-output-push`: an
+/// encoded `attach_runtime_state::AttachPaneOutputBatch`.
+pub const OUTPUT_PUSH_KIND: &str = "bmux.pane_runtime/output-push";
+
 bmux_plugin_schema_macros::schema! {
     source: "bpdl/pane-runtime-plugin.bpdl",
     export: export_schema,

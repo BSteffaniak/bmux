@@ -238,8 +238,21 @@ impl AttachDirtyFlags {
     }
 }
 
+/// Pane output the server pushes instead of this client reading it.
+#[derive(Default)]
+pub struct OutputPush {
+    /// Panes whose output is pushed.
+    pub(super) panes: std::collections::BTreeSet<Uuid>,
+    /// The server cannot push: output is read instead, without asking again.
+    pub(super) unsupported: bool,
+    /// Pushed chunks not yet applied.
+    pub(super) received: Vec<bmux_attach_layout_protocol::AttachPaneChunk>,
+}
+
 #[allow(clippy::struct_excessive_bools)]
 pub struct AttachViewState {
+    /// Pane output pushed by the server.
+    pub(super) output_push: OutputPush,
     /// Opt-in end-to-end latency log for replayed frames.
     pub(super) replay_log: super::replay_log::ReplayLog,
     pub(super) prepared_extensions:
@@ -659,6 +672,7 @@ impl AttachViewState {
     #[allow(clippy::too_many_lines)]
     pub fn new(attach_info: bmux_client::AttachOpenInfo) -> Self {
         Self {
+            output_push: OutputPush::default(),
             replay_log: super::replay_log::ReplayLog::from_env(),
             prepared_extensions: None,
             presentation_only: false,

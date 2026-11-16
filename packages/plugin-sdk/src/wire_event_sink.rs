@@ -82,7 +82,39 @@ pub trait WireEventSink: Send + Sync {
             "recipient-scoped retained delivery is unsupported".into(),
         ))
     }
+
+    /// Register a pull source for `kind`. After [`Self::wake`] for a recipient, once the host can
+    /// send to that recipient (it has room to queue a message), it calls the source and sends what
+    /// it returns as a `PluginBusEvent` of this kind. Reading at send time instead of queueing
+    /// keeps a slow recipient from accumulating messages: what it has not taken is read later,
+    /// together.
+    ///
+    /// # Errors
+    /// Returns an error when pull delivery is unsupported.
+    fn register_pull_source(
+        &self,
+        _kind: String,
+        _source: WirePullSource,
+    ) -> Result<(), WireEventSinkError> {
+        Err(WireEventSinkError::PublishFailed(
+            "recipient-scoped pull delivery is unsupported".into(),
+        ))
+    }
+
+    /// Ask the host to pull from the registered sources for `recipient` when it can send to them.
+    ///
+    /// # Errors
+    /// Returns an error when pull delivery is unsupported or the recipient is disconnected.
+    fn wake(&self, _recipient: uuid::Uuid) -> Result<(), WireEventSinkError> {
+        Err(WireEventSinkError::PublishFailed(
+            "recipient-scoped pull delivery is unsupported".into(),
+        ))
+    }
 }
+
+/// A per-recipient source of wire payloads that the host pulls from when it can send to that
+/// recipient: given the recipient, it returns the payload to send now, if any.
+pub type WirePullSource = Arc<dyn Fn(uuid::Uuid) -> Option<Vec<u8>> + Send + Sync>;
 
 /// Errors returned by [`WireEventSink::publish`].
 #[derive(Debug, thiserror::Error)]

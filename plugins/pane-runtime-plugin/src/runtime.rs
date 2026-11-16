@@ -1071,6 +1071,7 @@ fn push_pane_runtime_notice(
         session_id: session_id.0,
         pane_id,
     });
+    crate::handlers::output_push::pane_output_available(session_id.0, pane_id);
 }
 
 struct PaneFailureTargets<'a> {
@@ -8009,6 +8010,10 @@ impl SessionRuntimeManager {
                                         session_id: session_id.0,
                                         pane_id,
                                     });
+                                    crate::handlers::output_push::pane_output_available(
+                                        session_id.0,
+                                        pane_id,
+                                    );
                                 }
                                 #[cfg(feature = "image-registry")]
                                 let mut reply = image_protocol_reply;

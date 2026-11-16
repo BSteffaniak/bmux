@@ -19,6 +19,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 pub mod attach_commands;
 pub mod attach_state;
+pub(crate) mod output_push;
 pub(crate) mod execution;
 pub(crate) mod human_input;
 pub(crate) mod live_presentation;
@@ -442,6 +443,9 @@ fn route_authorized(context: NativeServiceContext) -> ServiceResponse {
         },
         "attach-runtime-state", "attach-pane-output-batch" => |req: attach_state::AttachPaneOutputBatchArgs, ctx| {
             Ok::<_, ServiceResponse>(attach_state::attach_pane_output_batch(&req, ctx))
+        },
+        "attach-runtime-state", "attach-pane-output-push" => |req: attach_state::AttachPaneOutputPushArgs, ctx| {
+            Ok::<_, ServiceResponse>(attach_state::attach_pane_output_push(&req, ctx))
         },
         "attach-runtime-state", "pane-output-cursor-state" => |req: attach_state::PaneOutputCursorArgs, _ctx| {
             Ok::<_, ServiceResponse>(attach_state::pane_output_cursor_state(&req))
