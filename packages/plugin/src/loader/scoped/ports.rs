@@ -524,12 +524,12 @@ fn host_start_admission(
             abi::FAILED
         }
     };
-    if let Some(activation) = &port.activation
-        && !matches!(
-            activation.state(),
-            Ok(bmux_plugin_runtime::LifecycleState::Activating)
-        )
-    {
+    if let Some(activation) = &port.activation {
+        // A retained activation port is admitted on the activation, never on
+        // the setup invocation it was installed with: a call can outlive that
+        // invocation (background work racing `activate` returning), and
+        // settlement drains the setup invocation before marking the
+        // activation active, which the call itself may be waiting for.
         // Retained activation services fail closed once deactivation begins.
         // That rejection precedes any effect and retains no child, so it is
         // reported as the explicit pre-dispatch rejection, never a transport

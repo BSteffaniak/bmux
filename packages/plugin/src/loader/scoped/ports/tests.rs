@@ -1119,3 +1119,110 @@ async fn opaque_port_retention_and_read_growth_do_not_repeat_host_effects() {
     instance.drain().await.unwrap();
     instance.finish().unwrap();
 }
+
+/// A guest call through the retained activation port that races `activate`
+/// returning (the setup invocation closes after the port admitted the call)
+/// must wait for the activation to become active without holding the setup
+/// invocation open: settlement drains the setup invocation first, so a held
+/// setup admission would deadlock the call against its own wait.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn activation_port_call_in_the_settlement_window_never_holds_setup_open() {
+    // `Entered` once the host dispatch has the call, i.e. after the port
+    // took its admission and before the activation services wait to settle;
+    // `Done` when the native call returned (possibly without dispatching).
+    enum Step {
+        Entered,
+        Done(i32, u64),
+    }
+    struct Echo;
+    impl bmux_plugin_sdk::HostServiceDispatch for Echo {
+        fn invoke(
+            &self,
+            _: &bmux_plugin_runtime::InvocationScope,
+            _: bmux_plugin_sdk::HostServiceRequest<'_>,
+        ) -> Result<Vec<u8>> {
+            Ok(vec![7])
+        }
+    }
+    let instance = InstanceScope::new(PluginRuntimeScopeId::from_uuid(uuid::Uuid::from_u128(395)));
+    let activation = instance
+        .begin_activation(PluginConcurrencyConfig::Concurrent)
+        .unwrap();
+    let setup = activation
+        .begin_lifecycle_invocation(bmux_plugin_runtime::LifecycleInvocationKind::Activation)
+        .unwrap();
+    let services = crate::loader::scoped::activation_ports::services(
+        activation.clone(),
+        Arc::new(Echo),
+        Some(setup.clone()),
+    );
+    let (events, steps) = std::sync::mpsc::channel::<Step>();
+    let entered = Mutex::new(events.clone());
+    let returning = setup.clone();
+    let host = bmux_plugin_sdk::PluginHostServices::new(move |request| {
+        // `activate` returns exactly now: the setup invocation stops
+        // admitting while this call is already past the port's admission.
+        returning.close().unwrap();
+        let _ = entered.lock().unwrap().send(Step::Entered);
+        services.invoke(request)
+    });
+    let table = HostPorts::for_activation(setup.clone(), activation.clone(), host)
+        .install_for(abi::ABI_VERSION, None)
+        .unwrap();
+    assert_eq!(unsafe { (table.retain)(table.handle) }, abi::OK);
+    let handle = table.handle;
+    let host_begin = table.host_begin;
+    let call = std::thread::spawn(move || {
+        let request = abi::NativeHostRequest {
+            size: u32::try_from(std::mem::size_of::<abi::NativeHostRequest>()).unwrap(),
+            kind: 0,
+            capability: abi::NativeSlice {
+                pointer: b"test".as_ptr(),
+                length: 4,
+            },
+            interface: abi::NativeSlice {
+                pointer: b"test/v1".as_ptr(),
+                length: 7,
+            },
+            operation: abi::NativeSlice {
+                pointer: b"read".as_ptr(),
+                length: 4,
+            },
+            payload: abi::NativeSlice {
+                pointer: b"".as_ptr(),
+                length: 0,
+            },
+        };
+        let mut child = 0;
+        let status = unsafe { host_begin(handle, &raw const request, &raw mut child) };
+        let _ = events.send(Step::Done(status, child));
+    });
+    let (steps, first) = tokio::task::spawn_blocking(move || {
+        let first = steps.recv().unwrap();
+        (steps, first)
+    })
+    .await
+    .unwrap();
+    if let Step::Done(status, _) = first {
+        panic!("the call ended before reaching the host dispatch with status {status}");
+    }
+    // Settlement: drain and finish the setup invocation, then mark active.
+    tokio::time::timeout(std::time::Duration::from_secs(30), setup.drain())
+        .await
+        .expect("the setup invocation drains while the call waits")
+        .unwrap();
+    setup.finish().unwrap();
+    activation.mark_active().unwrap();
+    let done = tokio::task::spawn_blocking(move || steps.recv().unwrap())
+        .await
+        .unwrap();
+    call.join().unwrap();
+    let Step::Done(status, child) = done else {
+        panic!("the host dispatch was entered twice");
+    };
+    assert_eq!(status, abi::OK);
+    assert_eq!(unsafe { (table.host_ack)(table.handle, child) }, abi::OK);
+    assert_eq!(unsafe { (table.release)(table.handle) }, abi::OK);
+    HostPorts::retire(&table).unwrap();
+    activation.close().unwrap();
+}
