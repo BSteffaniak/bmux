@@ -4594,25 +4594,49 @@ fn render_native_provider_scene<W: AttachTerminal>(
         )
         .collect::<Vec<_>>();
     let geometry = terminal.geometry();
-    let _ = render_attach_scene_with_stats_and_trace_with_capabilities(
-        terminal,
-        scene,
-        &panes,
-        pane_buffers,
-        terminal_graphics_cache,
-        &bmux_attach_pipeline::FrameDamage::full_frame(),
-        0,
-        0,
-        // Diagnostic scene dump renders live pane content only.
-        &bmux_attach_pipeline::PaneScrollbackViews::new(),
-        false,
-        (geometry.cols, geometry.rows),
-        &RuntimeAppearance::default(),
-        DamageCoalescingPolicy::default(),
-        &[],
-        bmux_plugin::TerminalRenderCapabilities::default(),
-        None,
-    )?;
+    let size = (geometry.cols, geometry.rows);
+    let (rendered, operations, graphics) =
+        bmux_attach_pipeline::frame_presenter::capture_frame(|| {
+            render_attach_scene_with_stats_and_trace_with_capabilities(
+                &mut Vec::new(),
+                scene,
+                &panes,
+                pane_buffers,
+                terminal_graphics_cache,
+                &bmux_attach_pipeline::FrameDamage::full_frame(),
+                0,
+                0,
+                // Diagnostic scene dump renders live pane content only.
+                &bmux_attach_pipeline::PaneScrollbackViews::new(),
+                false,
+                size,
+                &RuntimeAppearance::default(),
+                DamageCoalescingPolicy::default(),
+                &[],
+                bmux_plugin::TerminalRenderCapabilities::default(),
+                None,
+            )
+        });
+    let (cursor, _) = rendered?;
+    // Every scene is drawn in full, from a blank screen.
+    match bmux_attach_pipeline::frame_presenter::FramePresenter::new().present(
+        &bmux_attach_pipeline::frame_presenter::CapturedFrame {
+            operations: &operations,
+            cursor,
+            full: true,
+            size,
+            margins: false,
+            graphics: (&graphics).into(),
+        },
+    ) {
+        bmux_attach_pipeline::frame_presenter::Presented::Frame(bytes) => {
+            terminal.write_all(&bytes)?;
+        }
+        bmux_attach_pipeline::frame_presenter::Presented::Unchanged => {}
+        bmux_attach_pipeline::frame_presenter::Presented::Unsupported(reason) => {
+            anyhow::bail!("attach provider scene cannot be presented: {reason}")
+        }
+    }
     terminal.flush()?;
     Ok(())
 }
