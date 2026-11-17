@@ -449,12 +449,25 @@ pub fn paint_over(
     for operation in operations {
         match operation {
             PaintOperation::Text { x, y, text, style } => {
-                let width = bmux_plugin::render_text_width_u16(text);
                 let style = Style {
                     fg: explicit(style.fg),
                     bg: explicit(style.bg),
                     ..*style
                 };
+                if text.is_ascii() {
+                    // Each ASCII byte is one narrow cell: no grapheme segmentation needed.
+                    cx.replace_cells(
+                        i32::from(*x),
+                        i64::from(*y),
+                        (0..text.len()).map(|index| bmux_tui::paint::SizedCell {
+                            symbol: &text[index..=index],
+                            width: 1,
+                            style,
+                        }),
+                    );
+                    continue;
+                }
+                let width = bmux_plugin::render_text_width_u16(text);
                 cx.write_line(
                     LocalRect::new(i32::from(*x), i64::from(*y), width, 1),
                     &Line::from_spans(vec![Span::styled(text.clone(), style)]),

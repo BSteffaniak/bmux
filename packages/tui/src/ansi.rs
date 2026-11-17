@@ -732,11 +732,16 @@ fn emit_row_cells(
     active_style: &mut Style,
     depth: TerminalColorDepth,
 ) -> io::Result<()> {
-    let mut x = start;
+    let area = buffer.area();
+    if y < area.y || y >= area.bottom() || start >= end {
+        return Ok(());
+    }
+    let row = usize::from(y - area.y) * usize::from(area.width);
+    let end = end.min(area.right());
+    let cells = &buffer.cells()[row..row + usize::from(area.width)];
+    let mut x = start.max(area.x);
     while x < end {
-        let Some(cell) = buffer.get(Point::new(x, y)) else {
-            break;
-        };
+        let cell = &cells[usize::from(x - area.x)];
         if cell.is_wide_continuation() {
             // A valid span never starts on a continuation. If malformed input reaches here, clear
             // the physical column rather than emitting an empty symbol without cursor progress.
@@ -748,13 +753,24 @@ fn emit_row_cells(
             write_ansi_style_change(writer, *active_style, cell.style, depth)?;
             *active_style = cell.style;
         }
-        if cell.symbol.is_empty() {
+        let symbol = cell.symbol.as_bytes();
+        // `Cell::symbol` is public, so defend even against callers bypassing buffer
+        // setters. Never let cell text inject terminal protocol or shift the cursor.
+        if let [byte] = symbol {
+            // Most cells: one ASCII byte, one column.
+            writer.write_all(if byte.is_ascii_control() {
+                b" "
+            } else {
+                symbol
+            })?;
+            x = x.saturating_add(1);
+            continue;
+        }
+        if symbol.is_empty() {
             writer.write_all(b" ")?;
             x = x.saturating_add(1);
             continue;
         }
-        // `Cell::symbol` is public, so defend even against callers bypassing buffer
-        // setters. Never let cell text inject terminal protocol or shift the cursor.
         if cell.symbol.chars().any(char::is_control) {
             let width = u16::from(cell.width()).max(1).min(end - x);
             for _ in 0..width {
@@ -763,17 +779,12 @@ fn emit_row_cells(
             x = x.saturating_add(width);
             continue;
         }
-        writer.write_all(cell.symbol.as_bytes())?;
-        // A one-byte symbol is one printable ASCII character: one column.
-        let width = if cell.symbol.len() == 1 {
-            1
-        } else {
-            u16::from(cell.width()).max(
-                u16::try_from(display_width(&cell.symbol))
-                    .unwrap_or(u16::MAX)
-                    .min(2),
-            )
-        };
+        writer.write_all(symbol)?;
+        let width = u16::from(cell.width()).max(
+            u16::try_from(display_width(&cell.symbol))
+                .unwrap_or(u16::MAX)
+                .min(2),
+        );
         x = x.saturating_add(width.max(1));
     }
     Ok(())
