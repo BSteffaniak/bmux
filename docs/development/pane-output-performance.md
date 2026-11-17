@@ -232,20 +232,32 @@ paints into a bmux_tui presentation:
 * `BMUX_ATTACH_PRESENTER=terminal` presents frames this way in the attach client; frames with
   graphics on the host still use the renderer's own bytes (step 7).
 
-At 420x90 (pipeline benchmark, render time and bytes out per byte in, then live with
-`bmux-bench replay`, render start to host p50 and bytes a frame):
+Since then:
+
+* Frames painted over the last one are painted in place in the committed cells, which are
+  marked where they change (the marks move with cell moves) and written without being compared
+  to what they replaced: no spare copy, no model of the scrolled screen.
+* Cell symbols are stored inline, the encoder writes styles and cursor moves without the
+  formatting machinery, and buffer rows move in bulk.
+* Grid rows carry a changed flag, so the renderer resolves only the rows the grid changed since
+  they were drawn, in both paths.
+* Pane images (Kitty, Sixel, iTerm2) are placed through the terminal's output hooks; extension
+  graphic overlays and imperative extensions still fall back to the renderer's own bytes.
+
+Instructions per frame at 420x90 (`pipeline_bench_loop` under `/usr/bin/time -l`, which other
+load does not change), and bytes out per byte the application wrote:
 
 | Corpus | Renderer's bytes | Presenter |
 |---|---|---|
-| SU scroll | 0.47 ms, x1.31 | 0.73 ms, x1.00 |
-| Full repaint | 1.89 ms, x1.31 | 1.58 ms, x0.99 |
-| Review, unified | 0.67 ms, x1.01 | 0.89 ms, x0.73 |
-| Review, side by side | 0.70 ms, x0.96 | 0.91 ms, x0.70 |
-| Live SU scroll | 0.95 ms | 1.31 ms |
-| Live review | 1.41 ms, 46 KB | 1.56 ms, 33 KB |
+| SU scroll | 2.0M, x1.31 | 1.6M (0.77), x1.00 |
+| Plain stream | 1.9M, x1.41 | 1.6M (0.87), x1.10 |
+| Full repaint | 54M, x1.31 | 30M (0.56), x0.99 |
+| Review, unified | 15.9M, x1.01 | 14.8M (0.93), x0.68 |
+| Review, side by side | 16.6M, x0.96 | 14.9M (0.90), x0.61 |
 
-The presenter writes up to 30% fewer bytes but still takes about 0.2 ms more client time on
-scrolling frames, so it is not the default yet.
+Live with `bmux-bench replay` (render start to host p50), the presenter matches the renderer's
+own bytes on a review (1.05 to 1.23 ms against 1.07 to 1.56 ms) and on a scroll (0.39 ms
+against 0.30 to 0.46 ms, within run-to-run noise), writing 17 to 21% fewer bytes.
 
 ## Order
 
@@ -297,10 +309,10 @@ At 420x90, SU scroll, the attach client renders in about 1 ms and writes 12 KB a
 
 Not done:
 
-* Phase 5: bmux_tui's `Terminal` frames cost their damage, scroll several regions, take
-  grid-measured widths and write minimal SGR; the attach client can present through it
-  (`BMUX_ATTACH_PRESENTER=terminal`). Left: matching the renderer's client time, images
-  (step 7), making it the default and deleting the renderer's byte encoding (step 8).
+* Phase 5: the attach client can present through bmux_tui's `Terminal`
+  (`BMUX_ATTACH_PRESENTER=terminal`), at fewer instructions and bytes than the renderer's own
+  output on every corpus, with pane images. Left: extension graphic overlays, making it the
+  default, and deleting the renderer's byte encoding (step 8).
 * Output events (`OutputAvailable`) are still JSON-encoded and broadcast; clients that have their
   output pushed ignore them.
 * The end-to-end budget (p95 4 ms) was measured only on a loaded machine; quiet-machine numbers
