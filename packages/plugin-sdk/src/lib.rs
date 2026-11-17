@@ -147,7 +147,8 @@ pub use host::{
     HostServiceRequest, PluginContext, PluginHost, ResolvedService,
 };
 pub use host_services::{
-    COMMAND_OUTCOME_STATUS_MESSAGE_KEY, HostServiceFuture, HostServiceOwnedRequest, LogWriteLevel,
+    COMMAND_OUTCOME_STATUS_MESSAGE_KEY, EventSubscriptionInvocation, HostEventStream,
+    HostEventSubscription, HostServiceFuture, HostServiceOwnedRequest, LogWriteLevel,
     LogWriteRequest, PluginCommandOutcome, StorageGetRequest, StorageGetResponse, StorageKey,
     StorageKeyError, StorageSetRequest, VolatileStateClearRequest, VolatileStateGetRequest,
     VolatileStateGetResponse, VolatileStateSetRequest, begin_command_outcome_capture,

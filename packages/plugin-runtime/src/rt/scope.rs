@@ -56,6 +56,13 @@ pub fn enter_instance(handle: u64) -> ScopeGuard {
     enter(Current::Remote(handle))
 }
 
+/// The plugin instance handle whose scope is entered on this thread inside a
+/// dynamic plugin, or 0 for none.
+#[must_use]
+pub fn current_instance() -> u64 {
+    current_remote()
+}
+
 /// The instance handle of the scope entered on this thread, or 0 for none.
 #[cfg_attr(not(bmux_plugin_dylib), allow(dead_code))]
 pub(crate) fn current_remote() -> u64 {

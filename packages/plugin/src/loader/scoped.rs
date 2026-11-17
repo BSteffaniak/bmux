@@ -341,6 +341,8 @@ impl DefinitionArtifact {
         // unloaded (`DynamicArtifact::_library` is never dropped).
         unsafe { host.install(install) }
             .map_err(|details| PluginError::DynamicRuntimeUnavailable { plugin_id, details })?;
+        // Asynchronous host calls resolve the plugin's invocation ports.
+        host.set_port_services(Arc::new(ports::AsyncHostRoute));
         Arc::get_mut(owner)
             .ok_or_else(|| failure("artifact unexpectedly shared during loading"))?
             .plug_rt = Some(host);
@@ -734,8 +736,9 @@ enum ExecutionBackend {
 /// Host-owned scoped execution. IDs are local lookup keys, never wire credentials.
 pub struct LoadedExecution {
     activation_binders: Mutex<Vec<Arc<ActivationBinder>>>,
-    /// Host bus whose activation-scoped view a dynamic instance reaches
-    /// through the serialized plug-rt event port.
+    /// Host bus whose activation-scoped view this instance reaches: as an
+    /// activation capability plus host-service subscriptions (in-process),
+    /// or through the serialized plug-rt event port (dynamic).
     remote_event_bus: Mutex<Option<Arc<crate::EventBus>>>,
     lifecycle_callback_factory: Mutex<Option<Arc<callbacks::LifecycleCallbackFactory>>>,
     callback_runtime: std::sync::OnceLock<tokio::runtime::Handle>,
@@ -1005,7 +1008,13 @@ impl LoadedExecution {
     pub fn bind_event_bus(&self, bus: &Arc<crate::EventBus>) -> Result<()> {
         match &self.backend {
             ExecutionBackend::Static(_) => {
-                self.bind_activation_binder(crate::event_bus_activation_binder(Arc::clone(bus)))
+                self.bind_activation_binder(crate::event_bus_activation_binder(Arc::clone(bus)))?;
+                // Host services subscribe through the same activation scope.
+                *self
+                    .remote_event_bus
+                    .lock()
+                    .map_err(|_| failure("remote event bus poisoned"))? = Some(Arc::clone(bus));
+                Ok(())
             }
             ExecutionBackend::Dynamic { artifact, .. } => {
                 let _control = self.control()?;
@@ -1640,8 +1649,10 @@ impl LoadedExecution {
         let invocation = activation
             .begin_lifecycle_invocation(LifecycleInvocationKind::Activation)
             .map_err(scope_error)?;
-        context.native.host_service_port =
-            self.activation_host_services(&activation, Some(&invocation))?;
+        context.native.host_service_port = self
+            .activation_host_services(&activation, Some(&invocation))?
+            .map(|services| self.with_event_route(services))
+            .transpose()?;
         let admission = invocation.try_admit().map_err(scope_error)?;
         self.start(
             NativeOperation::Activate(context),
@@ -2326,7 +2337,35 @@ impl LoadedExecution {
         } else {
             services
         };
-        Ok(Some(services))
+        Ok(Some(self.with_event_route(services)?))
+    }
+
+    /// Give in-process host services the activation's event subscriptions
+    /// ([`bmux_plugin_sdk::PluginHostServices::subscribe_event`]) over a view
+    /// of the bound bus scoped to the current activation. Dynamic instances
+    /// subscribe through the serialized event port in the library instead.
+    fn with_event_route(
+        &self,
+        services: bmux_plugin_sdk::PluginHostServices,
+    ) -> Result<bmux_plugin_sdk::PluginHostServices> {
+        if !matches!(self.backend, ExecutionBackend::Static(_)) {
+            return Ok(services);
+        }
+        let Some(bus) = self
+            .remote_event_bus
+            .lock()
+            .map_err(|_| failure("remote event bus poisoned"))?
+            .clone()
+        else {
+            return Ok(services);
+        };
+        let Ok(activation) = self.activation() else {
+            return Ok(services);
+        };
+        let view = bus.scoped(activation);
+        Ok(services.with_event_subscriptions(move |kind, state| {
+            crate::event_bus::remote::subscribe_payloads(&view, kind, state)
+        }))
     }
     fn registration_port(&self) -> Result<Option<crate::ActivationRegistrationPort>> {
         Ok(self
@@ -2417,7 +2456,9 @@ impl LoadedExecution {
                             }),
                     ),
                     None => services,
-                };
+                }
+                .map(|services| self.with_event_route(services))
+                .transpose()?;
             }
             NativeOperation::Deactivate(context) => {
                 context.native.host_service_port =

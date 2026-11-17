@@ -20,7 +20,9 @@
 //! through this ABI. New host ports enter only through a separately retained
 //! C table; executable bridge fields are rejected before JSON context decoding.
 
+pub mod async_host;
 pub mod callback_authority;
+pub mod host_events;
 pub use callback_authority::{
     CALLBACK_AUTHORITY_VERSION, CAP_CALLBACK_AUTHORITY_V1, MAX_AUTHORITY_CANCEL_SUBSCRIPTIONS,
     NativeCallbackAuthorityV1, NativeCallbackCancelNotifyV1,

@@ -462,7 +462,22 @@ fn services(owner: &Arc<Authority>) -> PluginHostServices {
     let retained = Arc::clone(owner);
     let retained_v1 = Arc::clone(owner);
     let availability = Arc::clone(owner);
+    let asynchronous = Arc::clone(owner);
+    let subscriptions = Arc::clone(owner);
     PluginHostServices::new(move |request| invoke.ports()?.host_port().invoke(request))
+        // Like the synchronous route, an asynchronous call is made through
+        // the live callback entry, resolved when the call starts; the entry's
+        // ports stay retained by the call until it settles or is dropped.
+        .with_async(move |request| match asynchronous.ports() {
+            Ok(ports) => ports.host_port().call_service_async(request),
+            Err(error) => Box::pin(async move { Err(error) }),
+        })
+        .with_event_subscriptions(move |kind, state| {
+            subscriptions
+                .ports()?
+                .host_port()
+                .subscribe_event(kind, state)
+        })
         .with_kernel(move |request| kernel.ports()?.host_port().execute_kernel_encoded(request))
         .with_registrations(move |mutation| {
             registration.ports()?.host_port().registration(mutation)

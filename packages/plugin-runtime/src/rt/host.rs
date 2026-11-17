@@ -12,6 +12,7 @@ use super::abi::{
     RtStatus, RtStr, RtTask, size_u32,
 };
 use super::events::{EventPortError, EventStream, ScopeEvents};
+use super::services::PortServices;
 use super::waker;
 use crate::background::{BackgroundTasks, Ticket};
 use std::{
@@ -41,6 +42,15 @@ fn deadline(nanos: u64) -> tokio::time::Instant {
 
 type Timer = Arc<Mutex<Pin<Box<tokio::time::Sleep>>>>;
 
+/// One asynchronous service call: its outcome once ready, or the waker of
+/// the plugin waiting for it.
+struct CallSlot {
+    scope: u64,
+    outcome: Option<Vec<u8>>,
+    waiter: Option<std::task::Waker>,
+    abort: Option<tokio::task::AbortHandle>,
+}
+
 /// One plugin subscription: the host stream plus an item the plugin's
 /// buffer could not hold yet.
 struct Subscription {
@@ -61,6 +71,8 @@ pub struct PlugRtHost {
     timers: Mutex<HashMap<u64, Timer>>,
     events: Mutex<HashMap<u64, Arc<dyn ScopeEvents>>>,
     subscriptions: Mutex<HashMap<u64, Arc<Mutex<Subscription>>>>,
+    port_services: OnceLock<Arc<dyn PortServices>>,
+    calls: Mutex<HashMap<u64, Arc<Mutex<CallSlot>>>>,
     next: AtomicU64,
 }
 impl std::fmt::Debug for PlugRtHost {
@@ -102,6 +114,9 @@ impl PlugRtHost {
                 event_subscribe: host_event_subscribe,
                 event_poll: host_event_poll,
                 event_unsubscribe: host_event_unsubscribe,
+                service_call: host_service_call,
+                service_poll: host_service_poll,
+                service_cancel: host_service_cancel,
             },
             label: label.into(),
             runtime,
@@ -111,6 +126,8 @@ impl PlugRtHost {
             timers: Mutex::new(HashMap::new()),
             events: Mutex::new(HashMap::new()),
             subscriptions: Mutex::new(HashMap::new()),
+            port_services: OnceLock::new(),
+            calls: Mutex::new(HashMap::new()),
             next: AtomicU64::new(1),
         }));
         host.table.host = std::ptr::from_ref::<Self>(host).cast();
@@ -190,6 +207,18 @@ impl PlugRtHost {
         lock(&self.scopes).insert(handle, tasks);
     }
 
+    /// Resolve this library's invocation ports for asynchronous host service
+    /// calls. Set once, when the library is loaded.
+    pub fn set_port_services(&self, services: Arc<dyn PortServices>) {
+        let _ = self.port_services.set(services);
+    }
+
+    /// Asynchronous host service calls still owned by plugin scopes.
+    #[must_use]
+    pub fn service_call_count(&self) -> usize {
+        lock(&self.calls).len()
+    }
+
     /// Serve the serialized event port of plugin instance `handle`.
     pub fn bind_scope_events(&self, handle: u64, events: Arc<dyn ScopeEvents>) {
         lock(&self.events).insert(handle, events);
@@ -213,6 +242,20 @@ impl PlugRtHost {
         };
         // Host streams drop outside the registry lock.
         drop(released);
+        let calls: Vec<_> = {
+            let mut calls = lock(&self.calls);
+            let ids: Vec<u64> = calls
+                .iter()
+                .filter(|(_, slot)| lock(slot).scope == handle)
+                .map(|(id, _)| *id)
+                .collect();
+            ids.into_iter().filter_map(|id| calls.remove(&id)).collect()
+        };
+        for call in calls {
+            if let Some(abort) = lock(&call).abort.take() {
+                abort.abort();
+            }
+        }
     }
 
     /// Live plugin event subscriptions (diagnostics and teardown checks).
@@ -627,5 +670,117 @@ unsafe extern "C" fn host_event_unsubscribe(host: *const c_void, id: u64) {
         let host = unsafe { host_ref(host) };
         let released = lock(&host.subscriptions).remove(&id);
         drop(released);
+    });
+}
+
+unsafe extern "C" fn host_service_call(
+    host: *const c_void,
+    scope: u64,
+    port: u64,
+    request: *const u8,
+    length: usize,
+    out: *mut u64,
+) -> RtStatus {
+    catch_unwind(AssertUnwindSafe(|| {
+        if out.is_null() || (request.is_null() && length != 0) {
+            return RT_INVALID;
+        }
+        let host = unsafe { host_ref(host) };
+        let Some(services) = host.port_services.get().cloned() else {
+            return RT_UNSUPPORTED;
+        };
+        let request = if length == 0 {
+            Vec::new()
+        } else {
+            unsafe { std::slice::from_raw_parts(request, length) }.to_vec()
+        };
+        // The call is work of the plugin scope: refused once it closes, and
+        // aborted with the scope's other raw tasks at teardown.
+        let (tasks, ticket) = match host.admit(scope, "host-service-call", false) {
+            Ok(Some((tasks, ticket))) => (Some(tasks), Some(ticket)),
+            Ok(None) => (None, None),
+            Err(status) => return status,
+        };
+        let id = host.id();
+        let slot = Arc::new(Mutex::new(CallSlot {
+            scope,
+            outcome: None,
+            waiter: None,
+            abort: None,
+        }));
+        let outcome = services.call(port, request);
+        let completed = Arc::clone(&slot);
+        let ticket_id = ticket.as_ref().map(Ticket::id);
+        let handle = host.runtime.spawn(async move {
+            let _ticket = ticket;
+            let bytes = outcome.await;
+            let waiter = {
+                let mut slot = lock(&completed);
+                slot.outcome = Some(bytes);
+                slot.waiter.take()
+            };
+            if let Some(waiter) = waiter {
+                waiter.wake();
+            }
+        });
+        let abort = handle.abort_handle();
+        lock(&slot).abort = Some(abort.clone());
+        if let (Some(tasks), Some(ticket_id)) = (tasks, ticket_id) {
+            tasks.bind_abort(ticket_id, Box::new(move || abort.abort()));
+        }
+        lock(&host.calls).insert(id, slot);
+        unsafe { out.write(id) };
+        RT_READY
+    }))
+    .unwrap_or(RT_PANICKED)
+}
+
+unsafe extern "C" fn host_service_poll(
+    host: *const c_void,
+    id: u64,
+    cx: *const RtCx,
+    buffer: *mut u8,
+    capacity: usize,
+    length: *mut usize,
+) -> RtStatus {
+    catch_unwind(AssertUnwindSafe(|| {
+        if cx.is_null() || length.is_null() || (capacity > 0 && buffer.is_null()) {
+            return RT_INVALID;
+        }
+        let host = unsafe { host_ref(host) };
+        let Some(slot) = lock(&host.calls).get(&id).cloned() else {
+            return RT_CLOSED;
+        };
+        let mut guard = lock(&slot);
+        let Some(outcome) = guard.outcome.as_ref() else {
+            // Registered under the slot lock the completing task takes, so a
+            // completion cannot slip between this check and the wait.
+            let waiter = unsafe { waker::with_waker(cx, Clone::clone) };
+            guard.waiter = Some(waiter);
+            return RT_PENDING;
+        };
+        unsafe { length.write(outcome.len()) };
+        if outcome.len() > capacity {
+            return RT_TOO_SMALL;
+        }
+        if !outcome.is_empty() {
+            unsafe { std::ptr::copy_nonoverlapping(outcome.as_ptr(), buffer, outcome.len()) };
+        }
+        drop(guard);
+        lock(&host.calls).remove(&id);
+        RT_READY
+    }))
+    .unwrap_or(RT_PANICKED)
+}
+
+unsafe extern "C" fn host_service_cancel(host: *const c_void, id: u64) {
+    let _ = catch_unwind(|| {
+        let host = unsafe { host_ref(host) };
+        let released = lock(&host.calls).remove(&id);
+        if let Some(slot) = released
+            && let Some(abort) = lock(&slot).abort.take()
+        {
+            abort.abort();
+        }
     });
 }

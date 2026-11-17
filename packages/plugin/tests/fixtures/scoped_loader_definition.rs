@@ -25,6 +25,22 @@ type JsonEvents = tokio::sync::broadcast::Receiver<Arc<bmux_plugin::JsonPluginEv
 struct Events {
     bus: Option<Arc<bmux_plugin::EventBus>>,
     host: Option<JsonEvents>,
+    /// The activation's host services (async route and subscriptions).
+    services: Option<bmux_plugin_sdk::PluginHostServices>,
+    subscription: Option<bmux_plugin_sdk::HostEventSubscription>,
+}
+
+/// Interface the acceptance host serves asynchronously.
+pub const ECHO_INTERFACE: &str = "acceptance.echo/v1";
+
+fn echo_request(operation: &str, payload: &[u8]) -> bmux_plugin_sdk::HostServiceOwnedRequest {
+    bmux_plugin_sdk::HostServiceOwnedRequest {
+        capability: "acceptance.allowed".into(),
+        kind: bmux_plugin_sdk::ServiceKind::Query,
+        interface: ECHO_INTERFACE.into(),
+        operation: operation.into(),
+        payload: payload.to_vec(),
+    }
 }
 
 fn unavailable(error: impl std::fmt::Display) -> bmux_plugin_sdk::PluginCommandError {
@@ -110,6 +126,64 @@ impl Counter {
             .ok_or_else(|| unavailable("activation has no event bus"))
     }
 
+    fn services(&self) -> PluginResult<bmux_plugin_sdk::PluginHostServices> {
+        self.events
+            .lock()
+            .map_err(unavailable)?
+            .services
+            .clone()
+            .ok_or_else(|| unavailable("activation has no host services"))
+    }
+
+    /// Host-service behaviors with identical source in both packaging modes:
+    /// the asynchronous host route and the host subscription handle.
+    async fn service_behavior(&self, contract: &str) -> PluginResult<Option<Vec<u8>>> {
+        let reply = match contract {
+            "svc-async" => {
+                let reply = self
+                    .services()?
+                    .call_service_async(echo_request("echo", b"ping"))
+                    .await
+                    .map_err(unavailable)?;
+                [b"echo:".as_slice(), &reply].concat()
+            }
+            "svc-cancel" => {
+                // Give up on a call the host never answers: dropping it must
+                // cancel the host's work.
+                let call = self
+                    .services()?
+                    .call_service_async(echo_request("hang", b""));
+                let timed_out = rt::time::timeout(Duration::from_millis(20), call)
+                    .await
+                    .is_err();
+                timed_out.to_string().into_bytes()
+            }
+            "ev-host-subscribe" => {
+                let subscription = self
+                    .services()?
+                    .subscribe_event(HOST_EVENTS, false)
+                    .map_err(unavailable)?;
+                self.events.lock().map_err(unavailable)?.subscription = Some(subscription);
+                b"subscribed".to_vec()
+            }
+            "ev-host-receive" => {
+                let mut subscription = self
+                    .events
+                    .lock()
+                    .map_err(unavailable)?
+                    .subscription
+                    .take()
+                    .ok_or_else(|| unavailable("not subscribed"))?;
+                subscription
+                    .next()
+                    .await
+                    .ok_or_else(|| unavailable("subscription ended"))?
+            }
+            _ => return Ok(None),
+        };
+        Ok(Some(reply))
+    }
+
     /// Event behaviors with identical source in both packaging modes.
     async fn event_behavior(&self, contract: &str) -> PluginResult<Option<Vec<u8>>> {
         let reply: &[u8] = match contract {
@@ -157,8 +231,9 @@ impl PluginInstance for Counter {
     fn activate(&self, context: PluginLifecycleContext) -> PluginFuture<'_, PluginResult<()>> {
         Box::pin(async move {
             // Optional: hosts that bind no bus leave events disabled.
-            self.events.lock().map_err(unavailable)?.bus =
-                bmux_plugin::take_activation_event_bus(&context.capabilities).ok();
+            let mut events = self.events.lock().map_err(unavailable)?;
+            events.bus = bmux_plugin::take_activation_event_bus(&context.capabilities).ok();
+            events.services = context.native.host_service_port.clone();
             Ok(())
         })
     }
@@ -196,6 +271,9 @@ impl PluginInstance for Counter {
                 return Ok(reply);
             }
             if let Some(reply) = self.event_behavior(&contract).await? {
+                return Ok(reply);
+            }
+            if let Some(reply) = self.service_behavior(&contract).await? {
                 return Ok(reply);
             }
             match contract.as_str() {

@@ -27,11 +27,12 @@ pub mod guest;
 // graph, and the host side never depends on the packaging mode.
 pub mod host;
 pub(crate) mod scope;
+pub mod services;
 mod task;
 pub mod time;
 mod waker;
 
-pub use scope::{ScopeGuard, enter_instance};
+pub use scope::{ScopeGuard, current_instance, enter_instance};
 pub use task::{
     JoinError, JoinHandle, spawn, spawn_blocking, spawn_blocking_for_operation,
     spawn_blocking_named, spawn_named, yield_now,

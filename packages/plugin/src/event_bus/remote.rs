@@ -15,36 +15,26 @@ use bmux_plugin_runtime::rt::{
     events::{EventPortError, EventStream, RemoteEvents, ScopeEvents},
 };
 use bmux_plugin_sdk::PluginEventKind;
-use serde::{Deserialize, Serialize};
-use serde_json::Value as JsonValue;
 use std::sync::Arc;
 use tokio::sync::{broadcast, watch};
 
-/// One serialized event.
-#[derive(Debug, Serialize, Deserialize)]
-struct WireEvent {
-    state: bool,
-    payload: JsonValue,
-}
-
 fn encode(event: &JsonPluginEvent) -> Option<Vec<u8>> {
-    serde_json::to_vec(&WireEvent {
-        state: event.delivery == DeliveryMode::State,
-        payload: event.payload.clone(),
-    })
-    .ok()
+    bmux_plugin_sdk::abi::host_events::encode_event(
+        event.delivery == DeliveryMode::State,
+        &event.payload,
+    )
 }
 
 fn decode(interface: &PluginEventKind, bytes: &[u8]) -> Option<JsonPluginEvent> {
-    let wire: WireEvent = serde_json::from_slice(bytes).ok()?;
+    let (state, payload) = bmux_plugin_sdk::abi::host_events::decode_event(bytes)?;
     Some(JsonPluginEvent {
         interface: interface.clone(),
-        delivery: if wire.state {
+        delivery: if state {
             DeliveryMode::State
         } else {
             DeliveryMode::Broadcast
         },
-        payload: wire.payload,
+        payload,
     })
 }
 
@@ -189,4 +179,41 @@ impl ScopeEvents for BusScopeEvents {
             }))
         }
     }
+}
+
+/// An in-process host-service subscription: each event's JSON payload.
+struct PayloadStream(Box<dyn EventStream>);
+impl bmux_plugin_sdk::HostEventStream for PayloadStream {
+    fn poll_next(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<Option<Vec<u8>>> {
+        self.0.poll_next(cx)
+    }
+}
+
+fn payload(event: &JsonPluginEvent) -> Option<Vec<u8>> {
+    serde_json::to_vec(&event.payload).ok()
+}
+
+/// Subscribe through `view` for [`bmux_plugin_sdk::PluginHostServices::subscribe_event`].
+pub fn subscribe_payloads(
+    view: &Arc<EventBus>,
+    kind: &str,
+    state: bool,
+) -> bmux_plugin_sdk::Result<bmux_plugin_sdk::HostEventSubscription> {
+    let kind = PluginEventKind::from(kind.to_string());
+    let refused = |error: EventBusError| match error {
+        EventBusError::Closed => bmux_plugin_sdk::PluginError::InvocationCancelled,
+        other => bmux_plugin_sdk::PluginError::ServiceProtocol {
+            details: other.to_string(),
+        },
+    };
+    let stream = if state {
+        let (_, receiver) = view.subscribe_state_json(&kind).map_err(refused)?;
+        rt::events::watch_stream(receiver, |event| payload(&event))
+    } else {
+        let receiver = view.subscribe_json(&kind).map_err(refused)?;
+        rt::events::broadcast_stream(receiver, |event| payload(&event))
+    };
+    Ok(bmux_plugin_sdk::HostEventSubscription::new(PayloadStream(
+        stream,
+    )))
 }

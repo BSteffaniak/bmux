@@ -586,3 +586,44 @@ mod async_host_tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 }
+
+/// A serialized host event stream behind a [`HostEventSubscription`].
+pub trait HostEventStream: Send {
+    /// The next event's JSON payload, `None` once the stream ended.
+    fn poll_next(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<Option<Vec<u8>>>;
+}
+
+/// A subscription to one host event channel, reached through
+/// [`crate::PluginHostServices::subscribe_event`].
+///
+/// Items are the events' JSON payloads in order; a state channel yields its
+/// current value first. The subscription belongs to the activation that
+/// subscribed: it ends (`None`) when that activation's scope is released,
+/// and dropping it releases it. Waits are woken by the host; nothing polls.
+/// Generated clients decode payloads into the interface's event type.
+pub struct HostEventSubscription(Box<dyn HostEventStream>);
+impl std::fmt::Debug for HostEventSubscription {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("HostEventSubscription")
+    }
+}
+impl HostEventSubscription {
+    #[must_use]
+    pub fn new(stream: impl HostEventStream + 'static) -> Self {
+        Self(Box::new(stream))
+    }
+    pub fn poll_next(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Vec<u8>>> {
+        self.0.poll_next(cx)
+    }
+    /// The next event's JSON payload, or `None` once the stream ended.
+    pub async fn next(&mut self) -> Option<Vec<u8>> {
+        std::future::poll_fn(|cx| self.0.poll_next(cx)).await
+    }
+}
+
+/// Host-selected event subscription route: `(kind, state)`.
+pub type EventSubscriptionInvocation =
+    dyn Fn(&str, bool) -> crate::Result<HostEventSubscription> + Send + Sync;

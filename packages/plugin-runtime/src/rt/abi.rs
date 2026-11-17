@@ -156,6 +156,27 @@ pub struct PlugRtV1 {
         *mut usize,
     ) -> RtStatus,
     pub event_unsubscribe: unsafe extern "C" fn(*const c_void, u64),
+    /// Asynchronous host service calls (see `rt::services`). `scope` is the
+    /// instance handle that owns the call, `port` the invocation port the
+    /// call is made through (its authority), and the request is the SDK's
+    /// encoded host request. The call runs as a host task owned by the
+    /// scope.
+    pub service_call:
+        unsafe extern "C" fn(*const c_void, u64, u64, *const u8, usize, *mut u64) -> RtStatus,
+    /// Copy the encoded outcome into `buf`: `RT_READY` (length written; the
+    /// call is finished and released), `RT_PENDING` (the waker in `cx` is
+    /// woken on completion), `RT_TOO_SMALL` (length written, outcome
+    /// retained) or `RT_CLOSED` (unknown or aborted call).
+    pub service_poll: unsafe extern "C" fn(
+        *const c_void,
+        u64,
+        *const RtCx,
+        *mut u8,
+        usize,
+        *mut usize,
+    ) -> RtStatus,
+    /// Cancel and release a call; its host future is dropped.
+    pub service_cancel: unsafe extern "C" fn(*const c_void, u64),
 }
 // SAFETY: the table is immutable after installation and its functions are
 // thread-safe; `host` is only interpreted by the host.

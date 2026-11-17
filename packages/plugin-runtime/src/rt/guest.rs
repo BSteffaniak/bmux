@@ -28,6 +28,12 @@ pub(crate) const NOT_INSTALLED: &str =
 
 static INSTALLED: OnceLock<Client> = OnceLock::new();
 
+/// The client installed into this image, if any (dynamic plugins only).
+#[must_use]
+pub fn installed_client() -> Option<&'static Client> {
+    installed()
+}
+
 /// The client installed into this image, if any.
 #[cfg_attr(not(bmux_plugin_dylib), allow(dead_code))]
 pub(crate) fn installed() -> Option<&'static Client> {
@@ -225,6 +231,18 @@ impl Client {
     #[must_use]
     pub fn events(&'static self, scope: u64) -> super::events::RemoteEvents {
         super::events::RemoteEvents::new(self.table, scope, self.matched)
+    }
+
+    /// Start an asynchronous host service call through invocation port
+    /// `port`, owned by instance scope `scope`.
+    #[must_use]
+    pub fn service_call(
+        &'static self,
+        scope: u64,
+        port: u64,
+        request: &[u8],
+    ) -> super::services::ServiceCall {
+        super::services::ServiceCall::start(self.table, self.matched, scope, port, request)
     }
 
     /// The host clock.

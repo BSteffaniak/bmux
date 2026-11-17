@@ -129,6 +129,7 @@ pub struct PluginHostServices {
     availability: Option<Arc<ServiceAvailabilityInvocation>>,
     registration: Option<Arc<RegistrationInvocation>>,
     kernel: Option<Arc<KernelInvocation>>,
+    subscriptions: Option<Arc<crate::EventSubscriptionInvocation>>,
 }
 // Capability equality is identity equality, never equality of payload metadata.
 impl PartialEq for PluginHostServices {
@@ -164,6 +165,11 @@ impl PartialEq for PluginHostServices {
                 (Some(left), Some(right)) => Arc::ptr_eq(left, right),
                 _ => false,
             }
+            && match (&self.subscriptions, &other.subscriptions) {
+                (None, None) => true,
+                (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+                _ => false,
+            }
     }
 }
 
@@ -187,7 +193,42 @@ impl PluginHostServices {
             availability: None,
             registration: None,
             kernel: None,
+            subscriptions: None,
         }
+    }
+
+    /// Bind the host's event subscription route for this activation.
+    #[must_use]
+    pub fn with_event_subscriptions(
+        mut self,
+        subscribe: impl Fn(&str, bool) -> crate::Result<crate::HostEventSubscription>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
+        self.subscriptions = Some(Arc::new(subscribe));
+        self
+    }
+
+    /// Subscribe to a host event channel (`state` for a retained state
+    /// channel). Works in both packaging modes; the handle is what generated
+    /// clients build `subscribe_<event>()` on.
+    ///
+    /// # Errors
+    /// The host bound no event route to these services, the activation is
+    /// closed, or the channel cannot be observed serialized.
+    pub fn subscribe_event(
+        &self,
+        kind: &str,
+        state: bool,
+    ) -> crate::Result<crate::HostEventSubscription> {
+        let subscribe =
+            self.subscriptions
+                .as_ref()
+                .ok_or(crate::PluginError::UnsupportedHostOperation {
+                    operation: "subscribe_event",
+                })?;
+        subscribe(kind, state)
     }
     /// Bind an invocation-scoped encoded kernel capability. The host is
     /// responsible for foundational-plugin authorization and live cancellation.

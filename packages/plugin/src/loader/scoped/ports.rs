@@ -1133,3 +1133,45 @@ unsafe extern "C" fn host_ack(handle: u64, child: u64) -> AbiStatus {
         Ok(())
     })
 }
+
+/// Asynchronous host service calls a dynamic plugin makes through one of
+/// its invocation ports (`rt::services`). Each call takes the port's own
+/// admission (the same one the synchronous route takes), so authority,
+/// fail-closed deactivation and drain semantics match, then awaits the
+/// port's asynchronous host services. Refusals are encoded, typed, in the
+/// outcome.
+pub(super) struct AsyncHostRoute;
+
+impl bmux_plugin_runtime::rt::services::PortServices for AsyncHostRoute {
+    fn call(
+        &self,
+        port: u64,
+        request: Vec<u8>,
+    ) -> bmux_plugin_runtime::rt::services::ServiceOutcome {
+        Box::pin(async move {
+            let outcome = async {
+                let request = abi::async_host::decode_request(&request)?;
+                let port = lookup(port)?;
+                // Rejected before dispatch: no effect, typed for the plugin.
+                let Ok(_admission) = host_start_admission(&port)? else {
+                    return Err(bmux_plugin_sdk::PluginError::InvocationCancelled);
+                };
+                let host = port
+                    .activation_host
+                    .clone()
+                    .or_else(|| {
+                        port.host
+                            .clone()
+                            .map(super::LoadedExecution::bound_host_services)
+                    })
+                    .ok_or_else(|| failure("host service port not negotiated"))?;
+                host.call_service_async(request).await
+            }
+            .await;
+            if let Err(error) = &outcome {
+                tracing::debug!(%error, "asynchronous native host call failed");
+            }
+            abi::async_host::encode_outcome(&outcome)
+        })
+    }
+}

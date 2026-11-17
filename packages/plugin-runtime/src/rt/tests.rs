@@ -360,3 +360,80 @@ async fn dynamic_events_publish_subscribe_with_wakes_and_release_with_the_scope(
         super::events::EventPortError::Unsupported
     );
 }
+
+// ---- Asynchronous host service calls ---------------------------------------
+
+/// Echoes the request after the host releases it, recording host futures
+/// that were dropped before completing.
+struct EchoPorts {
+    release: Arc<tokio::sync::Notify>,
+    cancelled: Arc<AtomicUsize>,
+}
+impl super::services::PortServices for EchoPorts {
+    fn call(&self, port: u64, request: Vec<u8>) -> super::services::ServiceOutcome {
+        let release = Arc::clone(&self.release);
+        let cancelled = Arc::clone(&self.cancelled);
+        Box::pin(async move {
+            struct Unfinished(Arc<AtomicUsize>, bool);
+            impl Drop for Unfinished {
+                fn drop(&mut self) {
+                    if !self.1 {
+                        self.0.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+            }
+            let mut guard = Unfinished(cancelled, false);
+            release.notified().await;
+            guard.1 = true;
+            let mut reply = port.to_le_bytes().to_vec();
+            reply.extend_from_slice(&request);
+            reply
+        })
+    }
+}
+
+#[tokio::test]
+async fn dynamic_service_calls_wake_on_completion_cancel_and_close_with_the_scope() {
+    let (host, client) = dynamic(false);
+    let tasks = BackgroundTasks::new();
+    host.bind_scope(31, tasks.clone());
+    // No resolver installed: an explicit refusal, never a fallback.
+    assert!(client.service_call(31, 1, b"x").await.is_err());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let cancelled = Arc::new(AtomicUsize::new(0));
+    host.set_port_services(Arc::new(EchoPorts {
+        release: Arc::clone(&release),
+        cancelled: Arc::clone(&cancelled),
+    }));
+    // Completion wakes the plugin; the outcome may exceed its first buffer.
+    let large = vec![b'y'; 10_000];
+    let (polls, call) = counted(client.service_call(31, 7, &large));
+    let waiter = tokio::spawn(call);
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(
+        polls.load(Ordering::SeqCst) <= 1,
+        "pending call is not repolled"
+    );
+    release.notify_one();
+    let reply = waiter.await.unwrap().unwrap();
+    assert_eq!(&reply[..8], &7_u64.to_le_bytes());
+    assert_eq!(&reply[8..], &large[..]);
+    assert_eq!(host.service_call_count(), 0);
+    // Dropping the plugin future cancels the call: the host future drops.
+    let call = client.service_call(31, 8, b"never");
+    tokio::task::yield_now().await;
+    drop(call);
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert_eq!(cancelled.load(Ordering::SeqCst), 1);
+    assert_eq!(host.service_call_count(), 0);
+    // A call in flight at teardown is aborted with the scope.
+    let pending = client.service_call(31, 9, b"teardown");
+    // Let the host task start the call before teardown aborts it.
+    tokio::task::yield_now().await;
+    tasks.shutdown(Duration::from_secs(1)).await.unwrap();
+    assert_eq!(cancelled.load(Ordering::SeqCst), 2);
+    host.unbind_scope(31);
+    assert!(pending.await.is_err());
+    // Closed scope: refused before any host work.
+    assert!(client.service_call(31, 10, b"late").await.is_err());
+}

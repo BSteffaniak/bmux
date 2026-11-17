@@ -447,3 +447,123 @@ async fn scoped_static_event_bus_publish_subscribe_and_release() {
 async fn scoped_dynamic_event_bus_publish_subscribe_and_release() {
     event_parity(dynamic_artifact()).await;
 }
+
+/// Serves the acceptance echo interface asynchronously; `hang` never answers
+/// and records when the host drops (cancels) it.
+struct EchoHost {
+    cancelled: Arc<std::sync::atomic::AtomicUsize>,
+}
+impl bmux_plugin_sdk::HostServiceDispatch for EchoHost {
+    fn invoke(
+        &self,
+        _: &bmux_plugin_runtime::InvocationScope,
+        request: bmux_plugin_sdk::HostServiceRequest<'_>,
+    ) -> bmux_plugin_sdk::Result<Vec<u8>> {
+        Ok(request.payload.to_vec())
+    }
+    fn invoke_async(
+        &self,
+        _: &bmux_plugin_runtime::InvocationScope,
+        request: bmux_plugin_sdk::HostServiceOwnedRequest,
+    ) -> bmux_plugin_sdk::definition::PluginFuture<'static, bmux_plugin_sdk::Result<Vec<u8>>> {
+        struct Unanswered(Arc<std::sync::atomic::AtomicUsize>);
+        impl Drop for Unanswered {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let cancelled = Arc::clone(&self.cancelled);
+        Box::pin(async move {
+            assert_eq!(request.interface, fixture::ECHO_INTERFACE);
+            if request.operation == "hang" {
+                let _unanswered = Unanswered(cancelled);
+                std::future::pending::<()>().await;
+            }
+            Ok(request.payload)
+        })
+    }
+}
+
+/// The host's services work the same in both modes: the asynchronous route
+/// (with cancellation reaching the host) and the host subscription handle.
+async fn host_service_parity(artifact: DefinitionArtifact) {
+    let bus = Arc::new(bmux_plugin::EventBus::new());
+    bus.register_json_channel(fixture::HOST_EVENTS.into())
+        .unwrap();
+    let cancelled = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let execution = artifact
+        .create(
+            PluginRuntimeScopeId::new(),
+            ComponentRole::Backend,
+            &["acceptance.allowed".into()],
+        )
+        .unwrap();
+    execution.bind_event_bus(&bus).unwrap();
+    execution
+        .bind_host_dispatch(Arc::new(EchoHost {
+            cancelled: Arc::clone(&cancelled),
+        }))
+        .unwrap();
+    let id = execution
+        .begin_activation(native_context(), PluginConcurrencyConfig::Concurrent)
+        .unwrap();
+    assert!(matches!(outcome(&execution, id).await, NativeOutcome::Unit));
+    execution.acknowledge(id).await.unwrap();
+
+    let call = begin(&execution, "svc-async");
+    let (reply, polls) = tokio::time::timeout(Duration::from_secs(10), observe(&execution, call))
+        .await
+        .expect("asynchronous host call settles");
+    assert!(
+        matches!(&reply, NativeOutcome::Bytes(bytes) if bytes == b"echo:ping"),
+        "{reply:?}"
+    );
+    assert!(polls <= 12, "observed {polls} polls");
+    execution.acknowledge(call).await.unwrap();
+
+    assert_eq!(extension(&execution, "svc-cancel").await, b"true");
+    // The plugin dropped its call; the host's future is dropped with it.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while cancelled.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("cancellation reaches the host");
+
+    assert_eq!(
+        extension(&execution, "ev-host-subscribe").await,
+        b"subscribed"
+    );
+    let receive = begin(&execution, "ev-host-receive");
+    assert!(
+        bus.emit_json(&fixture::HOST_EVENTS.into(), &serde_json::json!({"n": 7}))
+            .unwrap()
+    );
+    let (event, _) = tokio::time::timeout(Duration::from_secs(10), observe(&execution, receive))
+        .await
+        .expect("host event delivered");
+    assert!(
+        matches!(&event, NativeOutcome::Bytes(bytes) if bytes == br#"{"n":7}"#),
+        "{event:?}"
+    );
+    execution.acknowledge(receive).await.unwrap();
+
+    execution.cancel_background_tasks().unwrap();
+    execution.drain_background_tasks().await.unwrap();
+    retire(&execution).await;
+    assert_eq!(execution.event_port_subscriptions(), 0);
+    assert_eq!(execution.pending_background_work(), Vec::<String>::new());
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scoped_static_host_services_async_route_and_subscriptions() {
+    host_service_parity(DefinitionArtifact::from_definition(
+        fixture::plugin_definition(),
+    ))
+    .await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires explicitly built native fixture; run during integration with BMUX_ACCEPTANCE_NATIVE_ARTIFACT"]
+async fn scoped_dynamic_host_services_async_route_and_subscriptions() {
+    host_service_parity(dynamic_artifact()).await;
+}

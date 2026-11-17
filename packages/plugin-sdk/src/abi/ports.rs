@@ -504,6 +504,35 @@ impl InvocationPorts {
             let owner = Arc::clone(self);
             port = port.with_retained_host(move || owner.open_retained_host());
         }
+        if let Some(scope) = Self::async_route_scope() {
+            // Inside a dynamic plugin: asynchronous calls run as host tasks
+            // owned by this instance's scope and are awaited with real
+            // wakers; the synchronous route stays the blocking host callback.
+            let owner = Arc::clone(self);
+            port = port.with_async(move |request| owner.invoke_async(scope, request));
+            // Event subscriptions through the instance's serialized event
+            // port, owned by its scope.
+            if let Some(client) = bmux_plugin_runtime::rt::guest::installed_client() {
+                let events = client.events(scope);
+                port = port.with_event_subscriptions(move |kind, state| {
+                    events
+                        .subscribe(kind, state)
+                        .map(|subscription| {
+                            crate::HostEventSubscription::new(
+                                super::host_events::RemoteEventStream(subscription),
+                            )
+                        })
+                        .map_err(|error| match error {
+                            bmux_plugin_runtime::rt::events::EventPortError::Closed => {
+                                PluginError::InvocationCancelled
+                            }
+                            other => PluginError::ServiceProtocol {
+                                details: other.to_string(),
+                            },
+                        })
+                });
+            }
+        }
         if self.table.capabilities & CAP_RETAINED_HOST_LOOKUP_V2 != 0 {
             let owner = Arc::clone(self);
             port = port.with_retained_host_v2(move || owner.open_retained_host_v2());
@@ -520,6 +549,41 @@ impl InvocationPorts {
         }
         let owner = Arc::clone(self);
         port.with_kernel(move |request| owner.kernel(request))
+    }
+    /// The instance scope asynchronous calls are owned by, when this image is
+    /// a dynamic plugin whose host installed plug-rt.
+    fn async_route_scope() -> Option<u64> {
+        let scope = bmux_plugin_runtime::rt::current_instance();
+        (bmux_plugin_runtime::rt::is_dynamic_build()
+            && scope != 0
+            && bmux_plugin_runtime::rt::runtime_available())
+        .then_some(scope)
+    }
+
+    /// One asynchronous host call through this port. The port stays admitted
+    /// until the call settles or is dropped, which cancels it on the host.
+    fn invoke_async(
+        self: &Arc<Self>,
+        scope: u64,
+        request: crate::HostServiceOwnedRequest,
+    ) -> crate::definition::PluginFuture<'static, crate::Result<Vec<u8>>> {
+        let owner = Arc::clone(self);
+        Box::pin(async move {
+            let _admitted = owner.admit(CAP_HOST_SERVICES)?;
+            let request = super::async_host::encode_request(&request)?;
+            let client = bmux_plugin_runtime::rt::guest::installed_client().ok_or(
+                PluginError::UnsupportedHostOperation {
+                    operation: "call_service_async",
+                },
+            )?;
+            let outcome = client
+                .service_call(scope, owner.table.handle, &request)
+                .await
+                .map_err(|error| PluginError::ServiceProtocol {
+                    details: error.to_string(),
+                })?;
+            super::async_host::decode_outcome(&outcome)
+        })
     }
     fn availability(
         self: &Arc<Self>,
