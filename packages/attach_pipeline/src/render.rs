@@ -1183,7 +1183,7 @@ fn active_terminal_graphic_keys(
     items: &[RenderLayerItem],
     capabilities: TerminalRenderCapabilities,
 ) -> BTreeSet<u64> {
-    if !terminal_graphic_can_render(capabilities) && crate::projection::encoding_terminal() {
+    if !terminal_graphic_can_render(capabilities) && encoding_graphics() {
         return BTreeSet::new();
     }
     items
@@ -1221,7 +1221,7 @@ fn terminal_graphic_needs_reconcile(
     graphics_cache: &TerminalGraphicsCache,
     capabilities: TerminalRenderCapabilities,
 ) -> bool {
-    if (!terminal_graphic_can_render(capabilities) && crate::projection::encoding_terminal())
+    if (!terminal_graphic_can_render(capabilities) && encoding_graphics())
         || !graphic.cell_rect.intersects(surface_rect)
     {
         return false;
@@ -1364,6 +1364,12 @@ fn capture_graphic_overlay(surface_id: Uuid, instance_key: u64, graphic: &Termin
     )));
 }
 
+/// Whether graphics protocol bytes are written: while encoding the terminal, and beside captured
+/// cells for a presenter that writes them around its frame.
+fn encoding_graphics() -> bool {
+    crate::projection::encoding_terminal() || crate::projection::graphics_output()
+}
+
 #[cfg(feature = "image-kitty")]
 #[allow(clippy::too_many_arguments)] // Kitty reconciliation needs identity, payload, cache, capability, and stats state.
 fn queue_kitty_graphic_overlay<W: io::Write>(
@@ -1376,9 +1382,8 @@ fn queue_kitty_graphic_overlay<W: io::Write>(
     capabilities: TerminalRenderCapabilities,
     resource_stats: Option<&mut TerminalGraphicsResourceStats>,
 ) -> Result<bool> {
-    // Graphics are encoded while encoding the terminal, and also beside captured cells for a
-    // presenter that writes them around its frame; otherwise the capture places them.
-    let encoding = crate::projection::encoding_terminal() || crate::projection::graphics_output();
+    // Otherwise the capture places them.
+    let encoding = encoding_graphics();
     if !terminal_graphic_can_render(capabilities) && encoding {
         return Ok(false);
     }
@@ -1448,8 +1453,10 @@ fn write_kitty_graphic_overlay(
     }
     let needs_place = previous_placement != Some(placement);
     if needs_place {
+        // Graphics bytes are written wherever they go (the terminal or a presenter's graphics
+        // output), never gated on encoding cells.
         let mut writer = &mut *stdout;
-        queue!(
+        bmux_terminal::queue!(
             &mut writer,
             MoveTo(graphic.cell_rect.x, graphic.cell_rect.y)
         )
@@ -6164,20 +6171,24 @@ fn queue_pane_content_for_surface<W: io::Write>(
             let y = stage.content.y.saturating_add(row_u16);
             let before_cells = before_content_row_cells(stage.before_content_cells, y);
             let blank_row = PhysicalRow::new();
-            let line = render_grid_row_segment(
-                GridRowRenderContext {
-                    row: &blank_row,
-                    selection: None,
-                    selection_line: 0,
-                    runtime_appearance: stage.runtime_appearance,
-                    palette: &palette,
-                    before_content_cells: &before_cells,
-                },
-                0,
-                inner_width,
-            );
-            queue!(stdout, MoveTo(stage.content.x, y), Print(line))
-                .context("failed clearing pane content")?;
+            let context = GridRowRenderContext {
+                row: &blank_row,
+                selection: None,
+                selection_line: 0,
+                runtime_appearance: stage.runtime_appearance,
+                palette: &palette,
+                before_content_cells: &before_cells,
+            };
+            if crate::projection::capturing() {
+                let mut shown = ShownRow::default();
+                shown.resolve(context, inner_width);
+                shown.capture(stage.content.x, y, 0, inner_width);
+            }
+            if crate::projection::encoding_terminal() {
+                let line = render_grid_row_segment(context, 0, inner_width);
+                queue!(stdout, MoveTo(stage.content.x, y), Print(line))
+                    .context("failed clearing pane content")?;
+            }
             if let Some(stats) = render_stats.as_deref_mut() {
                 stats.pane_rows_emitted = stats.pane_rows_emitted.saturating_add(1);
                 stats.pane_cells_emitted = stats
@@ -6294,18 +6305,19 @@ mod tests {
         AttachLayer, AttachLayerSurface, AttachRenderTrace, AttachRenderTraceOp,
         BeforeContentExtensionOutputAction, BeforeContentSurfaceOutputPlan, DamageCoalescingPolicy,
         DamageRect, ExtensionLayerSnapshot, FrameDamage, GridRowRenderContext,
-        PaneContentDamagePlan, PaneContentRowOutputPlan, PaneContentRowSegmentOutput,
-        PaneSurfaceFramePlan, PreviousExtensionSnapshotCleanupQuery, RenderVisibleCell,
-        RenderVisibleCellPlan, SurfaceOutputPlan, SurfaceOutputStage, SurfaceOutputStages,
-        TerminalCommand, append_pane_output, build_after_content_extension_output_plan,
-        build_before_content_extension_output_plan, build_render_ops_output_plan,
-        coalesce_render_damage, commit_extension_layer_snapshots_for_surface,
-        execute_pane_content_row_output_plan, frame_damage_overlay_render_ops, opaque_row_text,
-        optimize_terminal_commands, previous_extension_snapshot_cleanup_damage,
+        PaneContentDamagePlan, PaneSurfaceFramePlan, PreviousExtensionSnapshotCleanupQuery,
+        RenderVisibleCell, RenderVisibleCellPlan, SurfaceOutputPlan, SurfaceOutputStage,
+        SurfaceOutputStages, TerminalCommand, append_pane_output,
+        build_after_content_extension_output_plan, build_before_content_extension_output_plan,
+        build_render_ops_output_plan, coalesce_render_damage,
+        commit_extension_layer_snapshots_for_surface, frame_damage_overlay_render_ops,
+        opaque_row_text, optimize_terminal_commands, previous_extension_snapshot_cleanup_damage,
         queue_frame_damage_overlay, queue_layer_fill, queue_render_ops,
-        queue_render_ops_with_capabilities, queue_render_style, render_attach_scene,
-        render_attach_scene_with_stats_and_trace, render_grid_row_segment,
+        queue_render_ops_with_capabilities, render_attach_scene,
+        render_attach_scene_with_stats_and_trace,
     };
+    use crate::frame_presenter::{CapturedFrame, FramePresenter, Presented};
+    use crate::projection::{GraphicsOutput, PaintOperation};
     use crate::types::{
         AttachScrollbackCursor, AttachScrollbackPosition, PaneRect, PaneRenderBuffer,
         PaneScrollbackView, PaneScrollbackViews,
@@ -6322,8 +6334,8 @@ mod tests {
     };
     #[cfg(feature = "image-kitty")]
     use bmux_plugin::{RenderLayerItem, TerminalGraphicFill, TerminalGraphicOverlay, TerminalRgba};
-    use bmux_terminal::cursor::MoveTo;
-    use bmux_terminal::style::Print;
+    use bmux_tui::geometry::Rect as TuiRect;
+    use bmux_tui::style::{Color as TuiColor, Modifier, Style as TuiStyle};
     use std::collections::{BTreeMap, BTreeSet};
     use uuid::Uuid;
 
@@ -6390,6 +6402,220 @@ mod tests {
         }
     }
 
+    /// A simulated host terminal: each frame the renderer draws is captured, presented over the
+    /// frame presented before it (as the attach client presents them) and fed to an emulated
+    /// screen.
+    struct TestHost {
+        size: (u16, u16),
+        presenter: FramePresenter,
+        screen: bmux_terminal_grid::TerminalGridStream,
+    }
+
+    /// One frame drawn on a [`TestHost`]: what the render returned, the operations it captured,
+    /// the graphics protocol bytes it wrote and the bytes presented to the host.
+    struct HostFrame<T> {
+        result: T,
+        operations: Vec<PaintOperation>,
+        graphics: GraphicsOutput,
+        bytes: Vec<u8>,
+    }
+
+    impl TestHost {
+        fn new(cols: u16, rows: u16) -> Self {
+            Self {
+                size: (cols, rows),
+                presenter: FramePresenter::new(),
+                screen: bmux_terminal_grid::TerminalGridStream::new(
+                    cols,
+                    rows,
+                    bmux_terminal_grid::GridLimits::default(),
+                )
+                .expect("host screen dimensions should be valid"),
+            }
+        }
+
+        /// Draw one frame: `full` for the renderer's full frames, which start from a blank
+        /// screen.
+        fn frame<T>(&mut self, full: bool, render: impl FnOnce() -> T) -> HostFrame<T> {
+            let (result, operations, graphics) = crate::frame_presenter::capture_frame(render);
+            let bytes = match self.presenter.present(&CapturedFrame {
+                operations: &operations,
+                cursor: None,
+                full,
+                size: self.size,
+                margins: false,
+                graphics: (&graphics).into(),
+            }) {
+                Presented::Frame(bytes) => bytes,
+                Presented::Unchanged => Vec::new(),
+                Presented::Unsupported(reason) => {
+                    panic!("the frame should be presentable: {reason}")
+                }
+            };
+            self.screen.process(&bytes);
+            HostFrame {
+                result,
+                operations,
+                graphics,
+                bytes,
+            }
+        }
+
+        /// Text of row `y` as the host shows it, one character per column (blank where empty).
+        fn row(&self, y: u16) -> String {
+            (0..self.size.0).map(|x| self.cell(x, y).0).collect()
+        }
+
+        /// The host's whole screen, rows joined by newlines.
+        fn text(&self) -> String {
+            (0..self.size.1)
+                .map(|y| self.row(y))
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+
+        /// What the host shows at column `x` of row `y`: its text (blank when empty, empty
+        /// for the right half of a wide character) and resolved style.
+        fn cell(&self, x: u16, y: u16) -> (String, bmux_terminal_grid::Style) {
+            let grid = self.screen.grid();
+            grid.viewport_row_ref(usize::from(y))
+                .and_then(|row| row.cells().get(usize::from(x)))
+                .map_or_else(
+                    || (" ".to_string(), bmux_terminal_grid::Style::default()),
+                    |cell| {
+                        let text = if cell.is_wide_continuation() {
+                            ""
+                        } else if cell.text().is_empty() {
+                            " "
+                        } else {
+                            cell.text()
+                        };
+                        (text.to_string(), grid.palette().get(cell.style()))
+                    },
+                )
+        }
+    }
+
+    /// Graphics protocol bytes written before a frame's cells and after them, as text.
+    fn graphics_text(graphics: &GraphicsOutput) -> (String, String) {
+        (
+            String::from_utf8(graphics.before.clone()).expect("graphics bytes should be utf8"),
+            String::from_utf8(graphics.after.clone()).expect("graphics bytes should be utf8"),
+        )
+    }
+
+    /// Run `render` with graphics protocol output collected; returns its result and every
+    /// graphics byte in the order a presenter writes them (removals, then placements).
+    fn with_graphics<T>(render: impl FnOnce() -> T) -> (T, String) {
+        let (result, _, graphics) = crate::frame_presenter::capture_frame(render);
+        let (before, after) = graphics_text(&graphics);
+        (result, before + &after)
+    }
+
+    /// Where an operation draws text, and the text: captured text runs and runs of cells.
+    fn drawn(operation: &PaintOperation) -> Option<(u16, u16, &str)> {
+        match operation {
+            PaintOperation::Text { x, y, text, .. } | PaintOperation::Cells { x, y, text, .. } => {
+                Some((*x, *y, text.as_str()))
+            }
+            _ => None,
+        }
+    }
+
+    /// The character an operation draws starting at column `x` of row `y`, if any.
+    fn drawn_char_at(operation: &PaintOperation, x: u16, y: u16) -> Option<char> {
+        let (start, row, text) = drawn(operation)?;
+        if row != y {
+            return None;
+        }
+        let mut col = start;
+        for ch in text.chars() {
+            let width = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+            if width == 0 {
+                continue;
+            }
+            if col == x {
+                return Some(ch);
+            }
+            col = col.saturating_add(u16::try_from(width).unwrap_or(1));
+        }
+        None
+    }
+
+    /// Every text run captured, with where it starts.
+    fn drawn_runs(operations: &[PaintOperation]) -> Vec<(u16, u16, String)> {
+        operations
+            .iter()
+            .filter_map(drawn)
+            .map(|(x, y, text)| (x, y, text.to_string()))
+            .collect()
+    }
+
+    /// Index of the first operation drawing text that contains `needle`.
+    fn position_of_text(operations: &[PaintOperation], needle: &str) -> Option<usize> {
+        operations.iter().position(|operation| {
+            drawn(operation).is_some_and(|(_, _, text)| text.contains(needle))
+        })
+    }
+
+    /// The cells an operation blanks: a fill, or text that is only spaces.
+    fn blanked(operation: &PaintOperation) -> Option<TuiRect> {
+        match operation {
+            PaintOperation::Fill { rect, .. } => Some(*rect),
+            PaintOperation::Text { x, y, text, .. } | PaintOperation::Cells { x, y, text, .. }
+                if !text.is_empty() && text.chars().all(|ch| ch == ' ') =>
+            {
+                Some(TuiRect::new(
+                    *x,
+                    *y,
+                    u16::try_from(text.len()).expect("blank run fits a row"),
+                    1,
+                ))
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether `outer` covers every cell of `inner`.
+    fn covers(outer: TuiRect, inner: TuiRect) -> bool {
+        outer.x <= inner.x
+            && outer.y <= inner.y
+            && outer.x + outer.width >= inner.x + inner.width
+            && outer.y + outer.height >= inner.y + inner.height
+    }
+
+    /// Index of the first operation blanking every cell of `rect`.
+    fn position_of_blank(operations: &[PaintOperation], rect: TuiRect) -> Option<usize> {
+        operations
+            .iter()
+            .position(|operation| blanked(operation).is_some_and(|blank| covers(blank, rect)))
+    }
+
+    /// The style a captured run draws its first cell in.
+    fn drawn_style(operation: &PaintOperation) -> Option<TuiStyle> {
+        match operation {
+            PaintOperation::Text { style, .. } | PaintOperation::Fill { style, .. } => Some(*style),
+            PaintOperation::Cells { cells, .. } => cells.first().map(|cell| cell.style),
+            _ => None,
+        }
+    }
+
+    /// Assert columns `0..width` of row `y` show the default foreground over the background
+    /// [`red_wash_appearance`] blends.
+    fn assert_washed_row(host: &TestHost, y: u16, width: u16) {
+        for x in 0..width {
+            let (_, style) = host.cell(x, y);
+            assert_eq!(
+                (style.fg, style.bg),
+                (
+                    None,
+                    Some(bmux_terminal_grid::Color::Rgb { r: 25, g: 0, b: 0 })
+                ),
+                "column {x} of row {y}"
+            );
+        }
+    }
+
     fn red_wash_appearance() -> RuntimeAppearance {
         let mut appearance = RuntimeAppearance {
             background: "#000000".to_string(),
@@ -6408,17 +6634,12 @@ mod tests {
         appearance
     }
 
-    fn render_row_with_before_content_cell(content_bytes: &[u8]) -> String {
-        render_row_with_before_content_cell_and_appearance(
-            content_bytes,
-            &RuntimeAppearance::default(),
-        )
-    }
-
-    fn render_row_with_before_content_cell_and_appearance(
+    /// The one cell a pane row showing `content_bytes`, with a before-content glyph under it,
+    /// is captured as: its text and style.
+    fn captured_cell_with_before_content_cell(
         content_bytes: &[u8],
         appearance: &RuntimeAppearance,
-    ) -> String {
+    ) -> (String, bmux_tui::style::Style) {
         let mut stream = bmux_terminal_grid::TerminalGridStream::new(
             1,
             1,
@@ -6443,44 +6664,59 @@ mod tests {
                 },
             },
         );
-
-        render_grid_row_segment(
-            GridRowRenderContext {
-                row,
-                selection: None,
-                selection_line: 0,
-                runtime_appearance: appearance,
-                palette: grid.palette(),
-                before_content_cells: &before_content_cells,
-            },
-            0,
-            1,
-        )
+        let ((), operations) = crate::projection::capture_neutral(|| {
+            let mut shown = super::ShownRow::blank(0);
+            shown.resolve(
+                GridRowRenderContext {
+                    row,
+                    selection: None,
+                    selection_line: 0,
+                    runtime_appearance: appearance,
+                    palette: grid.palette(),
+                    before_content_cells: &before_content_cells,
+                },
+                1,
+            );
+            shown.capture(0, 0, 0, 1);
+        });
+        let [PaintOperation::Cells { text, cells, .. }] = operations.as_slice() else {
+            panic!("one run of cells should be captured: {operations:?}");
+        };
+        let [cell] = cells.as_slice() else {
+            panic!("one cell should be captured: {cells:?}");
+        };
+        (text.clone(), cell.style)
     }
 
     #[test]
     fn before_content_glyph_shows_through_background_only_cell() {
-        let rendered = render_row_with_before_content_cell(b"\x1b[48;2;10;20;30m \x1b[0m");
+        let (text, style) = captured_cell_with_before_content_cell(
+            b"\x1b[48;2;10;20;30m \x1b[0m",
+            &RuntimeAppearance::default(),
+        );
 
-        assert!(rendered.contains("●"), "{rendered:?}");
-        assert!(rendered.contains("48;2;10;20;30m●"), "{rendered:?}");
+        assert_eq!(text, "●");
+        assert_eq!(style.bg, Some(TuiColor::Rgb(10, 20, 30)), "{style:?}");
+        assert_eq!(style.fg, Some(TuiColor::Rgb(95, 175, 255)), "{style:?}");
     }
 
     #[test]
     fn before_content_glyph_stays_hidden_by_text_cell_with_background() {
-        let rendered = render_row_with_before_content_cell(b"\x1b[48;2;10;20;30mA\x1b[0m");
+        let (text, style) = captured_cell_with_before_content_cell(
+            b"\x1b[48;2;10;20;30mA\x1b[0m",
+            &RuntimeAppearance::default(),
+        );
 
-        assert!(rendered.contains('A'), "{rendered:?}");
-        assert!(!rendered.contains('●'), "{rendered:?}");
+        assert_eq!(text, "A");
+        assert_eq!(style.bg, Some(TuiColor::Rgb(10, 20, 30)), "{style:?}");
     }
 
     #[test]
     fn before_content_glyph_preserves_runtime_effect_background() {
-        let appearance = red_wash_appearance();
-        let rendered = render_row_with_before_content_cell_and_appearance(b" ", &appearance);
+        let (text, style) = captured_cell_with_before_content_cell(b" ", &red_wash_appearance());
 
-        assert!(rendered.contains('●'), "{rendered:?}");
-        assert!(rendered.contains("48;2;25;0;0m●"), "{rendered:?}");
+        assert_eq!(text, "●");
+        assert_eq!(style.bg, Some(TuiColor::Rgb(25, 0, 0)), "{style:?}");
     }
 
     #[test]
@@ -6537,28 +6773,31 @@ mod tests {
         let extensions: Vec<Arc<dyn AttachRenderExtension>> =
             vec![Arc::new(RetainedBeforeUnderlay) as Arc<dyn AttachRenderExtension>];
 
-        let mut output = Vec::new();
-        render_attach_scene(
-            &mut output,
-            &scene,
-            &[],
-            &mut pane_buffers,
-            &FrameDamage::full_frame(),
-            0,
-            0,
-            &PaneScrollbackViews::new(),
-            false,
-            (4, 2),
-            &RuntimeAppearance::default(),
-            DamageCoalescingPolicy::default(),
-            &extensions,
-        )
-        .expect("retained before-content underlay should render");
+        let mut host = TestHost::new(4, 2);
+        host.frame(true, || {
+            render_attach_scene(
+                &mut Vec::new(),
+                &scene,
+                &[],
+                &mut pane_buffers,
+                &FrameDamage::full_frame(),
+                0,
+                0,
+                &PaneScrollbackViews::new(),
+                false,
+                (4, 2),
+                &RuntimeAppearance::default(),
+                DamageCoalescingPolicy::default(),
+                &extensions,
+            )
+            .expect("retained before-content underlay should render")
+        });
 
-        let rendered = String::from_utf8(output).expect("render output should be utf8");
-        assert!(
-            rendered.contains('U'),
-            "underlay should show through blank content: {rendered:?}"
+        assert_eq!(
+            host.row(0),
+            "U   ",
+            "underlay should show through blank content:\n{}",
+            host.text()
         );
     }
 
@@ -6616,32 +6855,34 @@ mod tests {
         let extensions: Vec<Arc<dyn AttachRenderExtension>> =
             vec![Arc::new(RetainedBeforeUnderlay) as Arc<dyn AttachRenderExtension>];
 
-        let mut output = Vec::new();
-        render_attach_scene(
-            &mut output,
-            &scene,
-            &[],
-            &mut pane_buffers,
-            &FrameDamage::full_frame(),
-            0,
-            0,
-            &PaneScrollbackViews::new(),
-            false,
-            (4, 2),
-            &RuntimeAppearance::default(),
-            DamageCoalescingPolicy::default(),
-            &extensions,
-        )
-        .expect("retained before-content underlay should render behind text");
+        let mut host = TestHost::new(4, 2);
+        host.frame(true, || {
+            render_attach_scene(
+                &mut Vec::new(),
+                &scene,
+                &[],
+                &mut pane_buffers,
+                &FrameDamage::full_frame(),
+                0,
+                0,
+                &PaneScrollbackViews::new(),
+                false,
+                (4, 2),
+                &RuntimeAppearance::default(),
+                DamageCoalescingPolicy::default(),
+                &extensions,
+            )
+            .expect("retained before-content underlay should render behind text")
+        });
 
-        let rendered = String::from_utf8(output).expect("render output should be utf8");
+        let screen = host.text();
         assert!(
-            rendered.contains('A'),
-            "content should render: {rendered:?}"
+            host.row(0).starts_with('A'),
+            "content should render:\n{screen}"
         );
         assert!(
-            !rendered.contains('U'),
-            "text content should hide underlay: {rendered:?}"
+            !screen.contains('U'),
+            "text content should hide underlay:\n{screen}"
         );
     }
 
@@ -6706,47 +6947,59 @@ mod tests {
         let extensions: Vec<Arc<dyn AttachRenderExtension>> =
             vec![Arc::new(MovingBeforeUnderlay { x: x.clone() }) as Arc<dyn AttachRenderExtension>];
 
-        render_attach_scene(
-            &mut Vec::new(),
-            &scene,
-            &[],
-            &mut pane_buffers,
-            &FrameDamage::full_frame(),
-            0,
-            0,
-            &PaneScrollbackViews::new(),
-            false,
-            (4, 2),
-            &RuntimeAppearance::default(),
-            DamageCoalescingPolicy::default(),
-            &extensions,
-        )
-        .expect("initial retained before-content render should commit previous snapshot");
+        let mut host = TestHost::new(4, 2);
+        host.frame(true, || {
+            render_attach_scene(
+                &mut Vec::new(),
+                &scene,
+                &[],
+                &mut pane_buffers,
+                &FrameDamage::full_frame(),
+                0,
+                0,
+                &PaneScrollbackViews::new(),
+                false,
+                (4, 2),
+                &RuntimeAppearance::default(),
+                DamageCoalescingPolicy::default(),
+                &extensions,
+            )
+            .expect("initial retained before-content render should commit previous snapshot")
+        });
+        assert_eq!(host.row(0), "U   ");
 
         x.store(2, Ordering::Relaxed);
-        let mut output = Vec::new();
-        let (_cursor, stats) = render_attach_scene_with_stats_and_trace(
-            &mut output,
-            &scene,
-            &[],
-            &mut pane_buffers,
-            &FrameDamage::default(),
-            0,
-            0,
-            &PaneScrollbackViews::new(),
-            false,
-            (4, 2),
-            &RuntimeAppearance::default(),
-            DamageCoalescingPolicy::default(),
-            &extensions,
-            None,
-        )
-        .expect("retained before-content move should repaint changed cells");
+        let moved = host.frame(false, || {
+            render_attach_scene_with_stats_and_trace(
+                &mut Vec::new(),
+                &scene,
+                &[],
+                &mut pane_buffers,
+                &FrameDamage::default(),
+                0,
+                0,
+                &PaneScrollbackViews::new(),
+                false,
+                (4, 2),
+                &RuntimeAppearance::default(),
+                DamageCoalescingPolicy::default(),
+                &extensions,
+                None,
+            )
+            .expect("retained before-content move should repaint changed cells")
+        });
+        let (_cursor, stats) = moved.result;
 
-        let rendered = String::from_utf8(output).expect("render output should be utf8");
         assert!(
-            rendered.contains('U'),
-            "moved underlay should render: {rendered:?}"
+            position_of_text(&moved.operations, "U").is_some(),
+            "moved underlay should render: {:?}",
+            moved.operations
+        );
+        assert_eq!(
+            host.row(0),
+            "  U ",
+            "the underlay should move:\n{}",
+            host.text()
         );
         assert!(
             stats.pane_rows_emitted + stats.pane_row_segments_emitted > 0,
@@ -6916,11 +7169,9 @@ mod tests {
             text: "e\u{301}".to_string(),
             style: RenderStyle::default(),
         }];
-        let mut output = Vec::new();
-
-        assert!(
+        let (queued, operations) = crate::projection::capture_neutral(|| {
             queue_render_ops(
-                &mut output,
+                &mut Vec::new(),
                 ExtensionRect {
                     x: 0,
                     y: 0,
@@ -6931,10 +7182,14 @@ mod tests {
                 &ops,
             )
             .expect("combining text should queue through direct path")
-        );
+        });
 
-        let output = String::from_utf8(output).expect("render op bytes should be utf8");
-        assert!(output.contains("e\u{301}"), "{output:?}");
+        assert!(queued);
+        assert_eq!(
+            drawn_runs(&operations),
+            [(0, 0, "e\u{301}".to_string())],
+            "{operations:?}"
+        );
     }
 
     #[test]
@@ -6958,11 +7213,9 @@ mod tests {
                 style: RenderStyle::default().named_foreground(RenderNamedColor::Cyan),
             },
         ];
-        let mut output = Vec::new();
-
-        assert!(
+        let (queued, operations) = crate::projection::capture_neutral(|| {
             queue_render_ops(
-                &mut output,
+                &mut Vec::new(),
                 surface_rect,
                 &RenderDamage::Regions(vec![ExtensionRect {
                     x: 2,
@@ -6973,11 +7226,14 @@ mod tests {
                 &ops,
             )
             .expect("visible damage segment should queue")
-        );
+        });
 
-        let output = String::from_utf8(output).expect("render op bytes should be utf8");
-        assert!(output.contains("\u{1b}[1;3HHEAD"), "{output:?}");
-        assert!(!output.contains('.'), "{output:?}");
+        assert!(queued);
+        assert_eq!(
+            drawn_runs(&operations),
+            [(2, 0, "HEAD".to_string())],
+            "{operations:?}"
+        );
     }
 
     #[test]
@@ -7094,28 +7350,6 @@ mod tests {
                 SurfaceOutputStage::CommitAfterContentSnapshot,
             ]
         ));
-    }
-
-    #[test]
-    fn pane_content_row_output_plan_executes_planned_segments() {
-        let plan = PaneContentRowOutputPlan::segments(
-            2,
-            4,
-            vec![PaneContentRowSegmentOutput {
-                start_col: 3,
-                width: 4,
-                text: "diff".to_string(),
-            }],
-        );
-        let mut output = Vec::new();
-        let mut stats = None;
-        let mut trace = None;
-
-        execute_pane_content_row_output_plan(&mut output, 10, 7, &plan, &mut stats, &mut trace)
-            .expect("planned row segment should emit");
-
-        let output = String::from_utf8(output).expect("row output should be utf8");
-        assert!(output.contains("\u{1b}[5;14Hdiff"), "{output:?}");
     }
 
     #[test]
@@ -7677,15 +7911,18 @@ mod tests {
             DamageCoalescingPolicy::default(),
         );
 
-        let mut bytes = Vec::new();
-        assert!(
-            queue_frame_damage_overlay(&mut bytes, &scene, &damage, (80, 24), 0, 1)
+        let (queued, operations) = crate::projection::capture_neutral(|| {
+            queue_frame_damage_overlay(&mut Vec::new(), &scene, &damage, (80, 24), 0, 1)
                 .expect("damage overlay should queue")
-        );
-        let output = String::from_utf8(bytes).expect("overlay bytes should be utf8");
+        });
 
-        assert!(output.contains("\u{1b}[8;14H"));
-        assert!(output.contains('█'));
+        assert!(queued);
+        let runs = drawn_runs(&operations);
+        assert!(
+            runs.iter()
+                .any(|(x, y, text)| (*x, *y) == (13, 7) && text.contains('█')),
+            "the damaged content rect should be marked at its absolute position: {runs:?}"
+        );
     }
 
     #[test]
@@ -7900,11 +8137,9 @@ mod tests {
                 style: RenderStyle::default(),
             },
         ];
-        let mut output = Vec::new();
-
-        assert!(
+        let (queued, operations) = crate::projection::capture_neutral(|| {
             queue_render_ops(
-                &mut output,
+                &mut Vec::new(),
                 ExtensionRect {
                     x: 0,
                     y: 0,
@@ -7915,11 +8150,14 @@ mod tests {
                 &ops,
             )
             .expect("render ops should queue")
-        );
-        let output = String::from_utf8(output).expect("render op bytes should be utf8");
+        });
 
-        assert!(output.contains("\u{1b}[1;1Habcd"), "{output:?}");
-        assert!(!output.contains("\u{1b}[1;3H"), "{output:?}");
+        assert!(queued);
+        assert_eq!(
+            drawn_runs(&operations),
+            [(0, 0, "abcd".to_string())],
+            "{operations:?}"
+        );
     }
 
     #[cfg(feature = "image-kitty")]
@@ -8005,8 +8243,25 @@ mod tests {
         }
     }
 
+    /// Render one frame of [`RetainedGraphicExtension`]'s scene; returns the graphics protocol
+    /// bytes it wrote, removals first.
     #[cfg(feature = "image-kitty")]
     fn render_retained_graphic_frame(
+        state: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        cache: &mut TerminalGraphicsCache,
+        pane_buffers: &mut BTreeMap<Uuid, PaneRenderBuffer>,
+        frame_damage: &FrameDamage,
+    ) -> (String, AttachSceneRenderStats) {
+        let ((_, frame_stats), graphics) = with_graphics(|| {
+            render_retained_graphic_frame_to_writer(state, cache, pane_buffers, frame_damage)
+        });
+        (graphics, frame_stats)
+    }
+
+    /// Render one frame of [`RetainedGraphicExtension`]'s scene; returns what reached the
+    /// writer the renderer was given.
+    #[cfg(feature = "image-kitty")]
+    fn render_retained_graphic_frame_to_writer(
         state: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
         cache: &mut TerminalGraphicsCache,
         pane_buffers: &mut BTreeMap<Uuid, PaneRenderBuffer>,
@@ -8124,7 +8379,7 @@ mod tests {
         let mut frame = |damage: &FrameDamage| {
             crate::projection::capture_neutral(|| {
                 crate::projection::with_graphics_output(|| {
-                    let (cells, _) = render_retained_graphic_frame(
+                    let (cells, _) = render_retained_graphic_frame_to_writer(
                         &state,
                         &mut cache,
                         &mut pane_buffers,
@@ -8195,23 +8450,25 @@ mod tests {
         let surface_rect = ExtensionRect::new(0, 0, 10, 4);
         let pane_items = [RenderLayerItem::Graphic(test_graphic_overlay(2))];
         let mut cache = TerminalGraphicsCache::new();
-        queue_render_items(
-            &mut Vec::new(),
-            pane_surface_id,
-            surface_rect,
-            &RenderDamage::FullSurface,
-            &pane_items,
-            &mut cache,
-            capabilities,
-            None,
-        )
-        .expect("initial pane graphic should queue");
+        with_graphics(|| {
+            queue_render_items(
+                &mut Vec::new(),
+                pane_surface_id,
+                surface_rect,
+                &RenderDamage::FullSurface,
+                &pane_items,
+                &mut cache,
+                capabilities,
+                None,
+            )
+            .expect("initial pane graphic should queue")
+        });
         let cached_keys = cache.keys().copied().collect::<BTreeSet<_>>();
+        assert_eq!(cached_keys.len(), 1);
 
-        let mut menu_output = Vec::new();
-        assert!(
+        let (queued, menu_output) = with_graphics(|| {
             queue_render_items_for_surface(
-                &mut menu_output,
+                &mut Vec::new(),
                 menu_surface_id,
                 surface_rect,
                 &RenderDamage::FullSurface,
@@ -8226,8 +8483,8 @@ mod tests {
                 None,
             )
             .expect("menu surface should render without global cleanup")
-        );
-        let menu_output = String::from_utf8(menu_output).expect("terminal output should be utf8");
+        });
+        assert!(queued);
         assert!(!menu_output.contains("Ga=d,"), "{menu_output:?}");
         assert_eq!(cache.keys().copied().collect::<BTreeSet<_>>(), cached_keys);
     }
@@ -8238,22 +8495,24 @@ mod tests {
         let items = [RenderLayerItem::Graphic(test_graphic_overlay(2))];
         let capabilities = test_kitty_capabilities();
         let mut cache = BTreeMap::new();
-        queue_render_items(
-            &mut Vec::new(),
-            Uuid::from_u128(7),
-            ExtensionRect {
-                x: 0,
-                y: 0,
-                w: 10,
-                h: 4,
-            },
-            &RenderDamage::FullSurface,
-            &items,
-            &mut cache,
-            capabilities,
-            None,
-        )
-        .expect("initial kitty graphic should queue");
+        with_graphics(|| {
+            queue_render_items(
+                &mut Vec::new(),
+                Uuid::from_u128(7),
+                ExtensionRect {
+                    x: 0,
+                    y: 0,
+                    w: 10,
+                    h: 4,
+                },
+                &RenderDamage::FullSurface,
+                &items,
+                &mut cache,
+                capabilities,
+                None,
+            )
+            .expect("initial kitty graphic should queue")
+        });
 
         let active = BTreeSet::new();
         let plan = TerminalGraphicsCleanupPlan::for_frame(&active, &cache);
@@ -8278,17 +8537,19 @@ mod tests {
         };
         let mut cache = BTreeMap::new();
         let mut initial_stats = AttachSceneRenderStats::default();
-        queue_render_items(
-            &mut Vec::new(),
-            Uuid::from_u128(7),
-            surface_rect,
-            &RenderDamage::FullSurface,
-            &items,
-            &mut cache,
-            capabilities,
-            Some(&mut initial_stats),
-        )
-        .expect("initial kitty graphic should queue");
+        with_graphics(|| {
+            queue_render_items(
+                &mut Vec::new(),
+                Uuid::from_u128(7),
+                surface_rect,
+                &RenderDamage::FullSurface,
+                &items,
+                &mut cache,
+                capabilities,
+                Some(&mut initial_stats),
+            )
+            .expect("initial kitty graphic should queue")
+        });
 
         assert_eq!(initial_stats.terminal_graphic_transmits, 1);
         assert_eq!(initial_stats.terminal_graphic_places, 1);
@@ -8296,17 +8557,19 @@ mod tests {
         assert!(initial_stats.terminal_graphic_bytes > 0);
 
         let mut cleanup_stats = AttachSceneRenderStats::default();
-        queue_render_items(
-            &mut Vec::new(),
-            Uuid::from_u128(7),
-            surface_rect,
-            &RenderDamage::FullSurface,
-            &[],
-            &mut cache,
-            capabilities,
-            Some(&mut cleanup_stats),
-        )
-        .expect("stale kitty graphic should clean up");
+        with_graphics(|| {
+            queue_render_items(
+                &mut Vec::new(),
+                Uuid::from_u128(7),
+                surface_rect,
+                &RenderDamage::FullSurface,
+                &[],
+                &mut cache,
+                capabilities,
+                Some(&mut cleanup_stats),
+            )
+            .expect("stale kitty graphic should clean up")
+        });
 
         assert_eq!(cleanup_stats.terminal_graphic_transmits, 0);
         assert_eq!(cleanup_stats.terminal_graphic_places, 0);
@@ -8320,10 +8583,9 @@ mod tests {
         let items = [RenderLayerItem::Graphic(test_graphic_overlay(2))];
         let capabilities = test_kitty_capabilities();
         let mut cache = BTreeMap::new();
-        let mut first = Vec::new();
-        assert!(
+        let (queued, first) = with_graphics(|| {
             queue_render_items(
-                &mut first,
+                &mut Vec::new(),
                 Uuid::from_u128(7),
                 ExtensionRect {
                     x: 0,
@@ -8338,17 +8600,16 @@ mod tests {
                 None,
             )
             .expect("kitty graphic should queue")
-        );
-        let first = String::from_utf8(first).expect("kitty command should be utf8");
+        });
+        assert!(queued);
         assert!(first.contains("\u{1b}_Ga=t,"), "{first:?}");
         assert!(first.contains(",q=2;"), "{first:?}");
         assert!(first.contains("\u{1b}[2;3H\u{1b}_Ga=p,"), "{first:?}");
         assert!(first.contains(",z=8,c=4,r=1,q=2"), "{first:?}");
 
-        let mut second = Vec::new();
-        assert!(
-            !queue_render_items(
-                &mut second,
+        let (queued, second) = with_graphics(|| {
+            queue_render_items(
+                &mut Vec::new(),
                 Uuid::from_u128(7),
                 ExtensionRect {
                     x: 0,
@@ -8363,14 +8624,14 @@ mod tests {
                 None,
             )
             .expect("unchanged cached kitty graphic should not queue")
-        );
-        assert_eq!(second, [] as [u8; 0]);
+        });
+        assert!(!queued);
+        assert_eq!(second, "");
 
         let moved_items = [RenderLayerItem::Graphic(test_graphic_overlay(4))];
-        let mut third = Vec::new();
-        assert!(
+        let (queued, third) = with_graphics(|| {
             queue_render_items(
-                &mut third,
+                &mut Vec::new(),
                 Uuid::from_u128(7),
                 ExtensionRect {
                     x: 0,
@@ -8385,17 +8646,16 @@ mod tests {
                 None,
             )
             .expect("moved cached kitty graphic should place")
-        );
-        let third = String::from_utf8(third).expect("kitty command should be utf8");
+        });
+        assert!(queued);
         assert!(!third.contains("Ga=d,d=i,"), "{third:?}");
         assert!(!third.contains("Ga=t,"), "{third:?}");
         assert!(third.contains("Ga=p,"), "{third:?}");
         assert!(third.contains("\u{1b}[2;5H\u{1b}_Ga=p,"), "{third:?}");
 
-        let mut fourth = Vec::new();
-        assert!(
+        let (queued, fourth) = with_graphics(|| {
             queue_render_items(
-                &mut fourth,
+                &mut Vec::new(),
                 Uuid::from_u128(7),
                 ExtensionRect {
                     x: 0,
@@ -8410,8 +8670,8 @@ mod tests {
                 None,
             )
             .expect("stale kitty graphic delete should queue")
-        );
-        let fourth = String::from_utf8(fourth).expect("kitty command should be utf8");
+        });
+        assert!(queued);
         assert!(fourth.contains("Ga=d,d=i,"), "{fourth:?}");
         assert!(fourth.contains("Ga=d,d=i,"), "{fourth:?}");
         assert!(cache.is_empty());
@@ -8447,11 +8707,9 @@ mod tests {
             ..inside
         };
         let mut cache = BTreeMap::new();
-        let mut output = Vec::new();
-
-        assert!(
+        let (queued, rendered) = with_graphics(|| {
             queue_render_items(
-                &mut output,
+                &mut Vec::new(),
                 Uuid::from_u128(7),
                 content,
                 &RenderDamage::FullSurface,
@@ -8461,8 +8719,8 @@ mod tests {
                 None,
             )
             .expect("inside graphic placement")
-        );
-        let rendered = String::from_utf8(output).expect("kitty output");
+        });
+        assert!(queued);
         assert!(
             rendered.contains("\u{1b}[6;10H\u{1b}_Ga=p,"),
             "{rendered:?}"
@@ -8479,10 +8737,9 @@ mod tests {
             "graphics wholly outside padded content must be clipped"
         );
 
-        let mut clipped_output = Vec::new();
-        assert!(
+        let (queued, clipped_output) = with_graphics(|| {
             queue_render_items(
-                &mut clipped_output,
+                &mut Vec::new(),
                 Uuid::from_u128(7),
                 content,
                 &RenderDamage::FullSurface,
@@ -8495,8 +8752,8 @@ mod tests {
                 None,
             )
             .expect("clipped graphic cleanup")
-        );
-        let clipped_output = String::from_utf8(clipped_output).expect("kitty cleanup output");
+        });
+        assert!(queued);
         assert!(clipped_output.contains("Ga=d,d=i,"), "{clipped_output:?}");
         assert!(cache.is_empty());
     }
@@ -8512,24 +8769,25 @@ mod tests {
             h: 4,
         };
         let mut cache = BTreeMap::new();
-        queue_render_items(
-            &mut Vec::new(),
-            Uuid::from_u128(7),
-            surface_rect,
-            &RenderDamage::FullSurface,
-            &[RenderLayerItem::Graphic(test_graphic_overlay(2))],
-            &mut cache,
-            capabilities,
-            None,
-        )
-        .expect("initial kitty graphic should queue");
+        with_graphics(|| {
+            queue_render_items(
+                &mut Vec::new(),
+                Uuid::from_u128(7),
+                surface_rect,
+                &RenderDamage::FullSurface,
+                &[RenderLayerItem::Graphic(test_graphic_overlay(2))],
+                &mut cache,
+                capabilities,
+                None,
+            )
+            .expect("initial kitty graphic should queue")
+        });
 
         let mut changed_graphic = test_graphic_overlay(2);
         changed_graphic.color.r = 9;
-        let mut changed = Vec::new();
-        assert!(
+        let (queued, changed) = with_graphics(|| {
             queue_render_items(
-                &mut changed,
+                &mut Vec::new(),
                 Uuid::from_u128(7),
                 surface_rect,
                 &RenderDamage::FullSurface,
@@ -8539,8 +8797,8 @@ mod tests {
                 None,
             )
             .expect("changed kitty source should retransmit")
-        );
-        let changed = String::from_utf8(changed).expect("kitty command should be utf8");
+        });
+        assert!(queued);
         assert!(changed.contains("Ga=t,"), "{changed:?}");
         assert!(!changed.contains("Ga=d,"), "{changed:?}");
         assert!(!changed.contains("Ga=p,"), "{changed:?}");
@@ -8563,23 +8821,23 @@ mod tests {
             w: 10,
             h: 4,
         };
-        let mut first = Vec::new();
-        queue_render_items(
-            &mut first,
-            Uuid::from_u128(7),
-            surface_rect,
-            &RenderDamage::FullSurface,
-            &[RenderLayerItem::Graphic(test_graphic_overlay(2))],
-            &mut cache,
-            capabilities,
-            None,
-        )
-        .expect("initial kitty graphic should queue");
-
-        let mut moved = Vec::new();
-        assert!(
+        with_graphics(|| {
             queue_render_items(
-                &mut moved,
+                &mut Vec::new(),
+                Uuid::from_u128(7),
+                surface_rect,
+                &RenderDamage::FullSurface,
+                &[RenderLayerItem::Graphic(test_graphic_overlay(2))],
+                &mut cache,
+                capabilities,
+                None,
+            )
+            .expect("initial kitty graphic should queue");
+        });
+
+        let (queued, moved) = with_graphics(|| {
+            queue_render_items(
+                &mut Vec::new(),
                 Uuid::from_u128(7),
                 surface_rect,
                 &RenderDamage::None,
@@ -8589,8 +8847,8 @@ mod tests {
                 None,
             )
             .expect("moved graphic should reconcile despite no text damage")
-        );
-        let moved = String::from_utf8(moved).expect("kitty command should be utf8");
+        });
+        assert!(queued);
         assert!(!moved.contains("Ga=d,d=i,"), "{moved:?}");
         assert!(!moved.contains("Ga=t,"), "{moved:?}");
         assert!(moved.contains("\u{1b}[2;5H\u{1b}_Ga=p,"), "{moved:?}");
@@ -8612,40 +8870,41 @@ mod tests {
         };
         let items = [RenderLayerItem::Graphic(test_graphic_overlay(2))];
         let mut terminal_graphics = TerminalGraphicsFrameResources::default();
-        let mut first = Vec::new();
-        queue_render_items_for_frame(
-            &mut first,
-            pane_a,
-            surface_id,
-            surface_rect,
-            &RenderDamage::FullSurface,
-            &items,
-            &mut cache,
-            &mut terminal_graphics,
-            capabilities,
-        )
-        .expect("initial pane graphic should queue");
+        with_graphics(|| {
+            queue_render_items_for_frame(
+                &mut Vec::new(),
+                pane_a,
+                surface_id,
+                surface_rect,
+                &RenderDamage::FullSurface,
+                &items,
+                &mut cache,
+                &mut terminal_graphics,
+                capabilities,
+            )
+            .expect("initial pane graphic should queue");
+        });
         assert_eq!(cache.len(), 1);
         assert_eq!(cache.values().next().expect("cache entry").pane_id, pane_a);
 
         let mut terminal_graphics = TerminalGraphicsFrameResources::default();
-        let mut second = Vec::new();
-        queue_render_items_for_frame(
-            &mut second,
-            pane_b,
-            surface_id,
-            surface_rect,
-            &RenderDamage::FullSurface,
-            &items,
-            &mut cache,
-            &mut terminal_graphics,
-            capabilities,
-        )
-        .expect("new pane graphic should queue despite same surface/key");
-        terminal_graphics
-            .cleanup_stale(&mut second, &mut cache, capabilities)
-            .expect("old pane graphic should be deleted");
-        let second = String::from_utf8(second).expect("kitty command should be utf8");
+        let ((), second) = with_graphics(|| {
+            queue_render_items_for_frame(
+                &mut Vec::new(),
+                pane_b,
+                surface_id,
+                surface_rect,
+                &RenderDamage::FullSurface,
+                &items,
+                &mut cache,
+                &mut terminal_graphics,
+                capabilities,
+            )
+            .expect("new pane graphic should queue despite same surface/key");
+            terminal_graphics
+                .cleanup_stale(&mut Vec::new(), &mut cache, capabilities)
+                .expect("old pane graphic should be deleted");
+        });
         assert!(second.contains("Ga=t,"), "{second:?}");
         assert!(second.contains("Ga=d,d=i,"), "{second:?}");
         assert!(second.contains("Ga=d,d=i,"), "{second:?}");
@@ -8665,26 +8924,28 @@ mod tests {
             h: 4,
         };
         let mut terminal_graphics = TerminalGraphicsFrameResources::default();
-        queue_render_items_for_frame(
-            &mut Vec::new(),
-            Uuid::from_u128(101),
-            Uuid::from_u128(7),
-            surface_rect,
-            &RenderDamage::FullSurface,
-            &[RenderLayerItem::Graphic(test_graphic_overlay(2))],
-            &mut cache,
-            &mut terminal_graphics,
-            capabilities,
-        )
-        .expect("initial pane graphic should queue");
+        with_graphics(|| {
+            queue_render_items_for_frame(
+                &mut Vec::new(),
+                Uuid::from_u128(101),
+                Uuid::from_u128(7),
+                surface_rect,
+                &RenderDamage::FullSurface,
+                &[RenderLayerItem::Graphic(test_graphic_overlay(2))],
+                &mut cache,
+                &mut terminal_graphics,
+                capabilities,
+            )
+            .expect("initial pane graphic should queue")
+        });
         assert_eq!(cache.len(), 1);
 
         let mut terminal_graphics = TerminalGraphicsFrameResources::default();
-        let mut deleted = Vec::new();
-        terminal_graphics
-            .cleanup_stale(&mut deleted, &mut cache, capabilities)
-            .expect("terminal-scoped cleanup should delete stale image");
-        let deleted = String::from_utf8(deleted).expect("kitty command should be utf8");
+        let ((), deleted) = with_graphics(|| {
+            terminal_graphics
+                .cleanup_stale(&mut Vec::new(), &mut cache, capabilities)
+                .expect("terminal-scoped cleanup should delete stale image");
+        });
         assert!(deleted.contains("Ga=d,d=i,"), "{deleted:?}");
         assert!(deleted.contains("Ga=d,d=i,"), "{deleted:?}");
         assert!(cache.is_empty());
@@ -8704,51 +8965,61 @@ mod tests {
         };
         let mut cache = BTreeMap::new();
         let mut terminal_graphics = TerminalGraphicsFrameResources::default();
-        queue_render_items_for_frame(
-            &mut Vec::new(),
-            pane_id,
-            surface_id,
-            surface_rect,
-            &RenderDamage::FullSurface,
-            &[RenderLayerItem::Graphic(test_graphic_overlay(2))],
-            &mut cache,
-            &mut terminal_graphics,
-            capabilities,
-        )
-        .expect("initial pane graphic should queue");
+        let mut host = TestHost::new(10, 4);
+        host.frame(true, || {
+            queue_render_items_for_frame(
+                &mut Vec::new(),
+                pane_id,
+                surface_id,
+                surface_rect,
+                &RenderDamage::FullSurface,
+                &[RenderLayerItem::Graphic(test_graphic_overlay(2))],
+                &mut cache,
+                &mut terminal_graphics,
+                capabilities,
+            )
+            .expect("initial pane graphic should queue")
+        });
         assert_eq!(cache.len(), 1);
 
         let mut terminal_graphics = TerminalGraphicsFrameResources::default();
-        let mut replacement = Vec::new();
-        queue_render_items_for_frame(
-            &mut replacement,
-            pane_id,
-            surface_id,
-            surface_rect,
-            &RenderDamage::FullSurface,
-            &[RenderLayerItem::Op(RenderOp::TextRun {
-                x: 2,
-                y: 1,
-                text: "HEADER".to_string(),
-                style: RenderStyle::default(),
-            })],
-            &mut cache,
-            &mut terminal_graphics,
-            capabilities,
-        )
-        .expect("replacement text should queue after stale graphic cleanup");
-        let replacement = String::from_utf8(replacement).expect("kitty command should be utf8");
-        let delete_at = replacement
+        let replacement = host.frame(false, || {
+            queue_render_items_for_frame(
+                &mut Vec::new(),
+                pane_id,
+                surface_id,
+                surface_rect,
+                &RenderDamage::FullSurface,
+                &[RenderLayerItem::Op(RenderOp::TextRun {
+                    x: 2,
+                    y: 1,
+                    text: "HEADER".to_string(),
+                    style: RenderStyle::default(),
+                })],
+                &mut cache,
+                &mut terminal_graphics,
+                capabilities,
+            )
+            .expect("replacement text should queue after stale graphic cleanup");
+        });
+        // Removals are written before the frame's cells; the presented frame shows the order.
+        let (before, after) = graphics_text(&replacement.graphics);
+        assert!(before.contains("Ga=d,d=i,"), "{before:?}");
+        assert!(!after.contains("Ga=d,"), "{after:?}");
+        assert!(
+            position_of_text(&replacement.operations, "HEADER").is_some(),
+            "replacement text should be drawn: {:?}",
+            replacement.operations
+        );
+        let presented = String::from_utf8_lossy(&replacement.bytes);
+        let delete_at = presented
             .find("Ga=d,d=i,")
-            .expect("stale graphic placement should be deleted before text");
-        let image_delete_at = replacement
-            .find("Ga=d,d=i,")
-            .expect("stale graphic image should be deleted before text");
-        let text_at = replacement
+            .expect("stale graphic should be deleted before text");
+        let text_at = presented
             .find("HEADER")
             .expect("replacement text should be written");
-        assert!(delete_at < text_at, "{replacement:?}");
-        assert!(image_delete_at < text_at, "{replacement:?}");
+        assert!(delete_at < text_at, "{presented:?}");
+        assert_eq!(host.row(1), "  HEADER  ");
         assert!(cache.is_empty());
     }
 
@@ -8836,29 +9107,28 @@ mod tests {
         let mut cache = TerminalGraphicsCache::new();
         let extensions: Vec<Arc<dyn AttachRenderExtension>> =
             vec![Arc::new(BeforeGraphicsExtension)];
-        let mut bytes = Vec::new();
+        let (_, output) = with_graphics(|| {
+            render_attach_scene_with_stats_and_trace_with_capabilities(
+                &mut Vec::new(),
+                &scene,
+                &panes,
+                &mut pane_buffers,
+                &mut cache,
+                &FrameDamage::full_frame(),
+                0,
+                0,
+                &PaneScrollbackViews::new(),
+                false,
+                (10, 4),
+                &RuntimeAppearance::default(),
+                DamageCoalescingPolicy::default(),
+                &extensions,
+                test_kitty_capabilities(),
+                None,
+            )
+            .expect("before-content graphic should render")
+        });
 
-        render_attach_scene_with_stats_and_trace_with_capabilities(
-            &mut bytes,
-            &scene,
-            &panes,
-            &mut pane_buffers,
-            &mut cache,
-            &FrameDamage::full_frame(),
-            0,
-            0,
-            &PaneScrollbackViews::new(),
-            false,
-            (10, 4),
-            &RuntimeAppearance::default(),
-            DamageCoalescingPolicy::default(),
-            &extensions,
-            test_kitty_capabilities(),
-            None,
-        )
-        .expect("before-content graphic should render");
-
-        let output = String::from_utf8(bytes).expect("kitty output should be utf8");
         assert!(output.contains("Ga=t,"), "{output:?}");
         assert!(output.contains("z=-1"), "{output:?}");
     }
@@ -8972,50 +9242,52 @@ mod tests {
         let mut graphics_cache = TerminalGraphicsCache::new();
         let capabilities = test_kitty_capabilities();
 
-        render_attach_scene_with_stats_and_trace_with_capabilities(
-            &mut Vec::new(),
-            &scene,
-            &[],
-            &mut pane_buffers,
-            &mut graphics_cache,
-            &FrameDamage::full_frame(),
-            0,
-            0,
-            &PaneScrollbackViews::new(),
-            false,
-            (40, 6),
-            &RuntimeAppearance::default(),
-            DamageCoalescingPolicy::default(),
-            &extensions,
-            capabilities,
-            None,
-        )
-        .expect("initial full render should queue both graphics");
+        with_graphics(|| {
+            render_attach_scene_with_stats_and_trace_with_capabilities(
+                &mut Vec::new(),
+                &scene,
+                &[],
+                &mut pane_buffers,
+                &mut graphics_cache,
+                &FrameDamage::full_frame(),
+                0,
+                0,
+                &PaneScrollbackViews::new(),
+                false,
+                (40, 6),
+                &RuntimeAppearance::default(),
+                DamageCoalescingPolicy::default(),
+                &extensions,
+                capabilities,
+                None,
+            )
+            .expect("initial full render should queue both graphics")
+        });
         assert_eq!(graphics_cache.len(), 2);
 
         let mut damage = FrameDamage::default();
         damage.mark_content_surface(pane_a);
-        let mut partial = Vec::new();
-        render_attach_scene_with_stats_and_trace_with_capabilities(
-            &mut partial,
-            &scene,
-            &[],
-            &mut pane_buffers,
-            &mut graphics_cache,
-            &damage,
-            0,
-            0,
-            &PaneScrollbackViews::new(),
-            false,
-            (40, 6),
-            &RuntimeAppearance::default(),
-            DamageCoalescingPolicy::default(),
-            &extensions,
-            capabilities,
-            None,
-        )
-        .expect("partial render should keep undamaged graphics active");
-        let partial = String::from_utf8(partial).expect("kitty command should be utf8");
+        let (_, partial) = with_graphics(|| {
+            render_attach_scene_with_stats_and_trace_with_capabilities(
+                &mut Vec::new(),
+                &scene,
+                &[],
+                &mut pane_buffers,
+                &mut graphics_cache,
+                &damage,
+                0,
+                0,
+                &PaneScrollbackViews::new(),
+                false,
+                (40, 6),
+                &RuntimeAppearance::default(),
+                DamageCoalescingPolicy::default(),
+                &extensions,
+                capabilities,
+                None,
+            )
+            .expect("partial render should keep undamaged graphics active")
+        });
         assert!(!partial.contains("Ga=d,d=i,"), "{partial:?}");
         assert!(!partial.contains("Ga=d,d=i,"), "{partial:?}");
         assert_eq!(graphics_cache.len(), 2);
@@ -9109,49 +9381,51 @@ mod tests {
         let mut graphics_cache = TerminalGraphicsCache::new();
         let capabilities = test_kitty_capabilities();
 
-        render_attach_scene_with_stats_and_trace_with_capabilities(
-            &mut Vec::new(),
-            &first_scene,
-            &[],
-            &mut pane_buffers,
-            &mut graphics_cache,
-            &FrameDamage::full_frame(),
-            0,
-            0,
-            &PaneScrollbackViews::new(),
-            false,
-            (12, 4),
-            &RuntimeAppearance::default(),
-            DamageCoalescingPolicy::default(),
-            &extensions,
-            capabilities,
-            None,
-        )
-        .expect("initial tab render should queue a graphic");
+        with_graphics(|| {
+            render_attach_scene_with_stats_and_trace_with_capabilities(
+                &mut Vec::new(),
+                &first_scene,
+                &[],
+                &mut pane_buffers,
+                &mut graphics_cache,
+                &FrameDamage::full_frame(),
+                0,
+                0,
+                &PaneScrollbackViews::new(),
+                false,
+                (12, 4),
+                &RuntimeAppearance::default(),
+                DamageCoalescingPolicy::default(),
+                &extensions,
+                capabilities,
+                None,
+            )
+            .expect("initial tab render should queue a graphic")
+        });
         assert_eq!(graphics_cache.len(), 1);
 
-        let mut switched = Vec::new();
-        render_attach_scene_with_stats_and_trace_with_capabilities(
-            &mut switched,
-            &second_scene,
-            &[],
-            &mut pane_buffers,
-            &mut graphics_cache,
-            &FrameDamage::full_frame(),
-            0,
-            0,
-            &PaneScrollbackViews::new(),
-            false,
-            (12, 4),
-            &RuntimeAppearance::default(),
-            DamageCoalescingPolicy::default(),
-            &extensions,
-            capabilities,
-            None,
-        )
-        .expect("tab switch render should delete stale graphic and queue replacement");
+        let (_, switched) = with_graphics(|| {
+            render_attach_scene_with_stats_and_trace_with_capabilities(
+                &mut Vec::new(),
+                &second_scene,
+                &[],
+                &mut pane_buffers,
+                &mut graphics_cache,
+                &FrameDamage::full_frame(),
+                0,
+                0,
+                &PaneScrollbackViews::new(),
+                false,
+                (12, 4),
+                &RuntimeAppearance::default(),
+                DamageCoalescingPolicy::default(),
+                &extensions,
+                capabilities,
+                None,
+            )
+            .expect("tab switch render should delete stale graphic and queue replacement")
+        });
 
-        let switched = String::from_utf8(switched).expect("kitty command should be utf8");
         let placement_delete_at = switched
             .find("Ga=d,d=i,")
             .expect("stale placement should be deleted on tab switch");
@@ -9180,23 +9454,23 @@ mod tests {
             h: 4,
         };
         let items = [RenderLayerItem::Graphic(test_graphic_overlay(2))];
-        let mut first = Vec::new();
-        queue_render_items(
-            &mut first,
-            Uuid::from_u128(7),
-            surface_rect,
-            &RenderDamage::FullSurface,
-            &items,
-            &mut cache,
-            capabilities,
-            None,
-        )
-        .expect("initial kitty graphic should queue");
-
-        let mut deleted = Vec::new();
-        assert!(
+        with_graphics(|| {
             queue_render_items(
-                &mut deleted,
+                &mut Vec::new(),
+                Uuid::from_u128(7),
+                surface_rect,
+                &RenderDamage::FullSurface,
+                &items,
+                &mut cache,
+                capabilities,
+                None,
+            )
+            .expect("initial kitty graphic should queue");
+        });
+
+        let (queued, deleted) = with_graphics(|| {
+            queue_render_items(
+                &mut Vec::new(),
                 Uuid::from_u128(7),
                 surface_rect,
                 &RenderDamage::FullSurface,
@@ -9206,8 +9480,8 @@ mod tests {
                 None,
             )
             .expect("lost graphics capability should delete cached image")
-        );
-        let deleted = String::from_utf8(deleted).expect("kitty command should be utf8");
+        });
+        assert!(queued);
         assert!(deleted.contains("Ga=d,d=i,"), "{deleted:?}");
         assert!(deleted.contains("Ga=d,d=i,"), "{deleted:?}");
         assert!(cache.is_empty());
@@ -9221,11 +9495,9 @@ mod tests {
             text: "界".to_string(),
             style: RenderStyle::default(),
         }];
-        let mut output = Vec::new();
-
-        assert!(
+        let (queued, operations) = crate::projection::capture_neutral(|| {
             queue_render_ops(
-                &mut output,
+                &mut Vec::new(),
                 ExtensionRect {
                     x: 0,
                     y: 0,
@@ -9241,10 +9513,14 @@ mod tests {
                 &ops,
             )
             .expect("wide text run should intersect damage")
-        );
+        });
 
-        let output = String::from_utf8(output).expect("render op bytes should be utf8");
-        assert!(output.contains('界'), "{output:?}");
+        assert!(queued);
+        assert_eq!(
+            drawn_runs(&operations),
+            [(0, 0, "界".to_string())],
+            "{operations:?}"
+        );
     }
 
     #[test]
@@ -9266,11 +9542,9 @@ mod tests {
                 style: RenderStyle::default(),
             },
         ];
-        let mut output = Vec::new();
-
-        assert!(
+        let (queued, operations) = crate::projection::capture_neutral(|| {
             queue_render_ops(
-                &mut output,
+                &mut Vec::new(),
                 ExtensionRect {
                     x: 0,
                     y: 0,
@@ -9281,12 +9555,19 @@ mod tests {
                 &ops,
             )
             .expect("clear ops should queue")
-        );
+        });
 
-        let output = String::from_utf8(output).expect("render op bytes should be utf8");
-        assert!(output.contains("\u{1b}[1;2H   "), "{output:?}");
-        assert!(output.contains("\u{1b}[2;2H   "), "{output:?}");
-        assert!(output.contains("\u{1b}[2;6H  "), "{output:?}");
+        assert!(queued);
+        for rect in [
+            TuiRect::new(1, 0, 3, 1),
+            TuiRect::new(1, 1, 3, 1),
+            TuiRect::new(5, 1, 2, 1),
+        ] {
+            assert!(
+                position_of_blank(&operations, rect).is_some(),
+                "{rect:?} should be cleared: {operations:?}"
+            );
+        }
     }
 
     #[test]
@@ -9304,25 +9585,41 @@ mod tests {
             unicode_box_drawing: false,
             ..TerminalRenderCapabilities::default()
         };
-        let mut output = Vec::new();
-
-        assert!(
+        let (queued, operations) = crate::projection::capture_neutral(|| {
             queue_render_ops_with_capabilities(
-                &mut output,
+                &mut Vec::new(),
                 ExtensionRect::new(0, 0, 8, 4),
                 &RenderDamage::FullSurface,
                 &ops,
                 capabilities,
             )
             .expect("fallback render ops should queue")
-        );
+        });
 
-        let output = String::from_utf8(output).expect("render op bytes should be utf8");
-        assert!(output.contains("\u{1b}[38;5;196m"), "{output:?}");
-        assert!(!output.contains("38;2;255;0;0"), "{output:?}");
-        assert!(output.contains('+'), "{output:?}");
-        assert!(output.contains('-'), "{output:?}");
-        assert!(!output.contains('╭'), "{output:?}");
+        assert!(queued);
+        let x = position_of_text(&operations, "x").expect("text should be drawn");
+        assert_eq!(
+            drawn_style(&operations[x]).and_then(|style| style.fg),
+            Some(TuiColor::Indexed(196)),
+            "{operations:?}"
+        );
+        assert!(
+            !operations
+                .iter()
+                .filter_map(drawn_style)
+                .any(|style| matches!(
+                    (style.fg, style.bg),
+                    (Some(TuiColor::Rgb(..)), _) | (_, Some(TuiColor::Rgb(..)))
+                )),
+            "{operations:?}"
+        );
+        let text = drawn_runs(&operations)
+            .into_iter()
+            .map(|(_, _, text)| text)
+            .collect::<String>();
+        assert!(text.contains('+'), "{text:?}");
+        assert!(text.contains('-'), "{text:?}");
+        assert!(!text.contains('╭'), "{text:?}");
     }
 
     #[test]
@@ -9347,11 +9644,9 @@ mod tests {
                 },
             ],
         }];
-        let mut output = Vec::new();
-
-        assert!(
+        let (queued, operations) = crate::projection::capture_neutral(|| {
             queue_render_ops(
-                &mut output,
+                &mut Vec::new(),
                 ExtensionRect {
                     x: 0,
                     y: 0,
@@ -9362,27 +9657,34 @@ mod tests {
                 &ops,
             )
             .expect("styled text op should queue")
-        );
+        });
 
-        let output = String::from_utf8(output).expect("render op bytes should be utf8");
-        // Styles now fully specify their attribute state, so the enabling code
-        // is no longer byte-adjacent to the text. Assert the intent instead:
-        // bold is in effect for "hi" and is not cancelled before it.
-        let hi_at = output.find("hi").expect("first span should render");
-        let bold_at = output[..hi_at]
-            .rfind("\u{1b}[1m")
-            .expect("first span should be bold");
-        assert!(
-            !output[bold_at..hi_at].contains("\u{1b}[22m"),
-            "bold must not be cleared before the text it applies to: {output:?}"
+        assert!(queued);
+        // Bold is in effect for "hi"; the second span, right after it, is bright red and not
+        // bold.
+        let spans = operations
+            .iter()
+            .filter_map(|operation| Some((drawn(operation)?, drawn_style(operation)?)))
+            .map(|((x, y, text), style)| (x, y, text.to_string(), style))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            spans,
+            [
+                (
+                    0,
+                    0,
+                    "hi".to_string(),
+                    TuiStyle::new().add_modifier(Modifier::BOLD)
+                ),
+                (
+                    2,
+                    0,
+                    "!".to_string(),
+                    TuiStyle::new().fg(TuiColor::BrightRed)
+                ),
+            ],
+            "{operations:?}"
         );
-        // The second span switches foreground colour and is not repositioned.
-        let bang_at = output.find('!').expect("second span should render");
-        let red_at = output[..bang_at]
-            .rfind("\u{1b}[38;5;9m")
-            .expect("second span should set bright red");
-        assert!(red_at < bang_at, "{output:?}");
-        assert!(!output.contains("\u{1b}[1;3H!"), "{output:?}");
     }
 
     #[test]
@@ -9405,11 +9707,9 @@ mod tests {
                 },
             ]],
         }];
-        let mut output = Vec::new();
-
-        assert!(
+        let (queued, operations) = crate::projection::capture_neutral(|| {
             queue_render_ops(
-                &mut output,
+                &mut Vec::new(),
                 ExtensionRect {
                     x: 0,
                     y: 0,
@@ -9420,12 +9720,17 @@ mod tests {
                 &ops,
             )
             .expect("sparse cell grid should queue")
-        );
+        });
 
-        let output = String::from_utf8(output).expect("render op bytes should be utf8");
-        assert!(output.contains("\u{1b}[1;1HA"), "{output:?}");
-        assert!(output.contains("\u{1b}[1;3HB"), "{output:?}");
-        assert!(!output.contains("\u{1b}[1;2H"), "{output:?}");
+        assert!(queued);
+        assert_eq!(
+            operations
+                .iter()
+                .map(|operation| (drawn(operation), blanked(operation)))
+                .collect::<Vec<_>>(),
+            [(Some((0, 0, "A")), None), (Some((2, 0, "B")), None)],
+            "the empty cell should be skipped: {operations:?}"
+        );
     }
 
     #[test]
@@ -9439,11 +9744,9 @@ mod tests {
                 ..RenderStyle::default()
             },
         }];
-        let mut output = Vec::new();
-
-        assert!(
+        let (queued, operations) = crate::projection::capture_neutral(|| {
             queue_render_ops(
-                &mut output,
+                &mut Vec::new(),
                 ExtensionRect {
                     x: 0,
                     y: 0,
@@ -9454,10 +9757,17 @@ mod tests {
                 &ops,
             )
             .expect("named color op should queue")
-        );
+        });
 
-        let output = String::from_utf8(output).expect("render op bytes should be utf8");
-        assert!(output.contains("\u{1b}[38;5;11m"), "{output:?}");
+        assert!(queued);
+        let [operation] = operations.as_slice() else {
+            panic!("one text run should be captured: {operations:?}");
+        };
+        assert_eq!(drawn(operation), Some((0, 0, "named")));
+        assert_eq!(
+            drawn_style(operation).and_then(|style| style.fg),
+            Some(TuiColor::BrightYellow)
+        );
     }
 
     #[test]
@@ -9485,11 +9795,10 @@ mod tests {
                 style: bright,
             },
         ];
-        let mut output = Vec::new();
-
-        assert!(
+        let mut host = TestHost::new(10, 1);
+        let frame = host.frame(true, || {
             queue_render_ops(
-                &mut output,
+                &mut Vec::new(),
                 ExtensionRect {
                     x: 0,
                     y: 0,
@@ -9500,63 +9809,21 @@ mod tests {
                 &ops,
             )
             .expect("styled ops should queue")
-        );
+        });
 
-        let output = String::from_utf8(output).expect("render op bytes should be utf8");
-        let dim_at = output.find("\u{1b}[2m").expect("dim span should set SGR 2");
-        let lit_at = output.find("lit").expect("second span should render");
-        let cleared_at = output[dim_at..lit_at]
-            .find("\u{1b}[22m")
-            .expect("intensity must be cleared before the non-dim span");
+        assert!(frame.result);
+        let operations = &frame.operations;
+        let lit = position_of_text(operations, "lit").expect("second span should render");
         assert!(
-            dim_at + cleared_at < lit_at,
-            "SGR 22 should precede the bright span: {output:?}"
+            drawn_style(&operations[lit])
+                .is_some_and(|style| !style.modifiers.contains(Modifier::DIM)),
+            "the non-dim span must not carry dim: {operations:?}"
         );
-    }
-
-    #[test]
-    fn queue_render_style_negates_every_unset_attribute() {
-        let mut output = Vec::new();
-        queue_render_style(&mut output, RenderStyle::default())
-            .expect("default style should queue");
-        let output = String::from_utf8(output).expect("render style bytes should be utf8");
-
-        // Intensity (22), italic (23), underline (24), blink (25), reverse (27),
-        // strikethrough (29) are all explicitly turned off.
-        for code in ["22", "23", "24", "25", "27", "29"] {
-            assert!(
-                output.contains(&format!("\u{1b}[{code}m")),
-                "default style should clear SGR {code}: {output:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn queue_render_style_keeps_enabled_attributes_after_clearing() {
-        let style = RenderStyle {
-            bold: true,
-            underline: true,
-            ..RenderStyle::default()
-        };
-        let mut output = Vec::new();
-        queue_render_style(&mut output, style).expect("style should queue");
-        let output = String::from_utf8(output).expect("render style bytes should be utf8");
-
-        let bold_at = output.find("\u{1b}[1m").expect("bold should be set");
-        let clear_at = output
-            .find("\u{1b}[22m")
-            .expect("intensity clear should be emitted for the unset dim flag");
+        assert_eq!(host.row(0), "dimlit    ");
+        assert!(host.cell(0, 0).1.dim, "the dim span should show dim");
         assert!(
-            clear_at < bold_at,
-            "intensity clear must not cancel bold: {output:?}"
-        );
-        assert!(
-            output.contains("\u{1b}[4m"),
-            "underline should be set: {output:?}"
-        );
-        assert!(
-            !output.contains("\u{1b}[24m"),
-            "underline should not be cleared when enabled: {output:?}"
+            (3..6).all(|x| !host.cell(x, 0).1.dim),
+            "dim must not leak into the following span"
         );
     }
 
@@ -9568,11 +9835,9 @@ mod tests {
             text: "界a".to_string(),
             style: RenderStyle::default(),
         }];
-        let mut output = Vec::new();
-
-        assert!(
+        let (queued, operations) = crate::projection::capture_neutral(|| {
             queue_render_ops(
-                &mut output,
+                &mut Vec::new(),
                 ExtensionRect {
                     x: 1,
                     y: 0,
@@ -9583,11 +9848,15 @@ mod tests {
                 &ops,
             )
             .expect("clipped text op should queue")
-        );
+        });
 
-        let output = String::from_utf8(output).expect("render op bytes should be utf8");
-        assert!(output.contains("\u{1b}[1;3Ha"), "{output:?}");
-        assert!(!output.contains('界'), "{output:?}");
+        assert!(queued);
+        let runs = drawn_runs(&operations);
+        assert!(runs.contains(&(2, 0, "a".to_string())), "{runs:?}");
+        assert!(
+            !runs.iter().any(|(_, _, text)| text.contains('界')),
+            "{runs:?}"
+        );
     }
 
     #[test]
@@ -9607,11 +9876,9 @@ mod tests {
                 ..RenderStyle::default()
             },
         }];
-        let mut output = Vec::new();
-
-        assert!(
+        let (queued, operations) = crate::projection::capture_neutral(|| {
             queue_render_ops(
-                &mut output,
+                &mut Vec::new(),
                 ExtensionRect {
                     x: 0,
                     y: 0,
@@ -9622,19 +9889,24 @@ mod tests {
                 &ops,
             )
             .expect("styled op should queue")
-        );
+        });
 
-        let output = String::from_utf8(output).expect("render op bytes should be utf8");
-        for sgr in [
-            "\u{1b}[1m",
-            "\u{1b}[2m",
-            "\u{1b}[3m",
-            "\u{1b}[4m",
-            "\u{1b}[5m",
-            "\u{1b}[7m",
-            "\u{1b}[9m",
+        assert!(queued);
+        let styled = position_of_text(&operations, "styled").expect("text should be drawn");
+        let style = drawn_style(&operations[styled]).expect("text should be styled");
+        for modifier in [
+            Modifier::BOLD,
+            Modifier::DIM,
+            Modifier::ITALIC,
+            Modifier::UNDERLINE,
+            Modifier::SLOW_BLINK,
+            Modifier::REVERSED,
+            Modifier::CROSSED_OUT,
         ] {
-            assert!(output.contains(sgr), "missing {sgr:?} in {output:?}");
+            assert!(
+                style.modifiers.contains(modifier),
+                "missing {modifier:?} in {style:?}"
+            );
         }
     }
 
@@ -9654,19 +9926,32 @@ mod tests {
         };
         let surface = AttachLayerSurface::new(rect, content_rect, AttachLayer::Overlay, true);
 
-        let mut bytes = Vec::new();
-        queue_layer_fill(&mut bytes, surface).expect("overlay fill should succeed");
-        queue!(
-            bytes,
-            MoveTo(1, 1),
-            Print(opaque_row_text("help", usize::from(surface.content_rect.w)))
-        )
-        .expect("overlay text should queue");
+        // What the overlay covers is on the host before it.
+        let mut host = TestHost::new(12, 4);
+        host.frame(true, || {
+            for y in 0..4 {
+                crate::projection::record(PaintOperation::Text {
+                    x: 0,
+                    y,
+                    text: "X".repeat(12),
+                    style: TuiStyle::new(),
+                });
+            }
+        });
+        host.frame(false, || {
+            queue_layer_fill(&mut Vec::new(), surface).expect("overlay fill should succeed");
+            crate::projection::record(PaintOperation::Text {
+                x: 1,
+                y: 1,
+                text: opaque_row_text("help", usize::from(surface.content_rect.w)),
+                style: TuiStyle::new(),
+            });
+        });
 
-        let output = String::from_utf8(bytes).expect("overlay bytes should be utf8");
-        assert!(output.contains("\u{1b}[2;2H          "), "{output:?}");
-        assert!(output.contains("\u{1b}[3;2H          "), "{output:?}");
-        assert!(output.contains("\u{1b}[2;2Hhelp      "), "{output:?}");
+        assert_eq!(
+            host.text(),
+            "XXXXXXXXXXXX\nXhelp      X\nX          X\nXXXXXXXXXXXX"
+        );
     }
 
     #[test]
@@ -9688,14 +9973,18 @@ mod tests {
         };
         let surface = AttachLayerSurface::new(rect, content_rect, AttachLayer::Overlay, true);
 
-        let mut bytes = Vec::new();
-        queue_layer_fill(&mut bytes, surface).expect("overlay fill should succeed");
+        let ((), operations) = crate::projection::capture_neutral(|| {
+            queue_layer_fill(&mut Vec::new(), surface).expect("overlay fill should succeed");
+        });
 
-        let output = String::from_utf8(bytes).expect("overlay bytes should be utf8");
-        assert!(output.contains("\u{1b}[2;3H        "), "{output:?}");
-        assert!(output.contains("\u{1b}[3;3H        "), "{output:?}");
-        assert!(!output.contains("\u{1b}[1;"), "{output:?}");
-        assert!(!output.contains("\u{1b}[4;"), "{output:?}");
+        assert_eq!(
+            operations.iter().map(blanked).collect::<Vec<_>>(),
+            [
+                Some(TuiRect::new(2, 1, 8, 1)),
+                Some(TuiRect::new(2, 2, 8, 1))
+            ],
+            "only the content rect should be filled: {operations:?}"
+        );
     }
 
     #[test]
@@ -9714,11 +10003,12 @@ mod tests {
         };
         let surface = AttachLayerSurface::new(rect, empty, AttachLayer::Overlay, true);
 
-        let mut bytes = Vec::new();
-        queue_layer_fill(&mut bytes, surface).expect("empty fill should succeed");
+        let ((), operations) = crate::projection::capture_neutral(|| {
+            queue_layer_fill(&mut Vec::new(), surface).expect("empty fill should succeed");
+        });
         assert!(
-            bytes.is_empty(),
-            "zero-width content should produce no output"
+            operations.is_empty(),
+            "zero-width content should produce no output: {operations:?}"
         );
     }
 
@@ -9786,27 +10076,27 @@ mod tests {
         append_pane_output(&mut buffer, b"abcdefghij");
         pane_buffers.insert(pane_id, buffer);
 
-        let mut output = Vec::new();
-        render_attach_scene(
-            &mut output,
-            &scene,
-            &[],
-            &mut pane_buffers,
-            &FrameDamage::full_frame(),
-            0,
-            0,
-            &PaneScrollbackViews::new(),
-            false,
-            (5, 3),
-            &RuntimeAppearance::default(),
-            DamageCoalescingPolicy::default(),
-            &[],
-        )
-        .expect("structured render should succeed");
+        let mut host = TestHost::new(5, 3);
+        host.frame(true, || {
+            render_attach_scene(
+                &mut Vec::new(),
+                &scene,
+                &[],
+                &mut pane_buffers,
+                &FrameDamage::full_frame(),
+                0,
+                0,
+                &PaneScrollbackViews::new(),
+                false,
+                (5, 3),
+                &RuntimeAppearance::default(),
+                DamageCoalescingPolicy::default(),
+                &[],
+            )
+            .expect("structured render should succeed")
+        });
 
-        let output = String::from_utf8(output).expect("output should be utf8");
-        assert!(output.contains("abcde"), "{output:?}");
-        assert!(output.contains("fghij"), "{output:?}");
+        assert_eq!(host.text(), "abcde\nfghij\n     ");
     }
 
     #[test]
@@ -9870,31 +10160,32 @@ mod tests {
             (8, 3),
             DamageCoalescingPolicy::default(),
         );
-        let mut output = Vec::new();
         let mut trace = AttachRenderTrace::new();
-        let (_cursor, stats) = render_attach_scene_with_stats_and_trace(
-            &mut output,
-            &scene,
-            &[],
-            &mut pane_buffers,
-            &damage,
-            0,
-            0,
-            &PaneScrollbackViews::new(),
-            false,
-            (8, 3),
-            &RuntimeAppearance::default(),
-            DamageCoalescingPolicy::default(),
-            &[],
-            Some(&mut trace),
-        )
-        .expect("rect-damaged render should succeed");
+        let ((_cursor, stats), operations) = crate::projection::capture_neutral(|| {
+            render_attach_scene_with_stats_and_trace(
+                &mut Vec::new(),
+                &scene,
+                &[],
+                &mut pane_buffers,
+                &damage,
+                0,
+                0,
+                &PaneScrollbackViews::new(),
+                false,
+                (8, 3),
+                &RuntimeAppearance::default(),
+                DamageCoalescingPolicy::default(),
+                &[],
+                Some(&mut trace),
+            )
+            .expect("rect-damaged render should succeed")
+        });
 
-        let output = String::from_utf8(output).expect("output should be utf8");
-        assert!(output.contains("\u{1b}[2;3Hkl"));
-        assert!(!output.contains("ijklmnop"));
-        assert!(!output.contains("abcdefgh"));
-        assert!(!output.contains("qrstuvwx"));
+        assert_eq!(
+            drawn_runs(&operations),
+            [(2, 1, "kl".to_string())],
+            "only the damaged cells should be redrawn: {operations:?}"
+        );
         assert_eq!(stats.pane_rows_examined, 3);
         assert_eq!(stats.pane_rows_emitted, 0);
         assert_eq!(stats.pane_row_segments_emitted, 1);
@@ -10099,15 +10390,31 @@ mod tests {
             content_damage: &damage,
             host_scroll: super::HostScroll::Off,
         };
-        queue_pane_content_for_surface(&mut Vec::new(), &mut buffers, &stage, &mut None, &mut None)
-            .unwrap();
-        let mut output = Vec::new();
-        queue_pane_content_for_surface(&mut output, &mut buffers, &stage, &mut None, &mut None)
-            .unwrap();
-        let output = String::from_utf8(output).unwrap();
+        crate::projection::capture_neutral(|| {
+            queue_pane_content_for_surface(
+                &mut Vec::new(),
+                &mut buffers,
+                &stage,
+                &mut None,
+                &mut None,
+            )
+            .unwrap()
+        });
+        let (_, operations) = crate::projection::capture_neutral(|| {
+            queue_pane_content_for_surface(
+                &mut Vec::new(),
+                &mut buffers,
+                &stage,
+                &mut None,
+                &mut None,
+            )
+            .unwrap()
+        });
         assert!(
-            output.contains("hello"),
-            "full content damage must repaint cached cells: {output:?}"
+            drawn_runs(&operations)
+                .iter()
+                .any(|(x, y, text)| (*x, *y) == (0, 0) && text.starts_with("hello")),
+            "full content damage must repaint cached cells: {operations:?}"
         );
     }
 
@@ -10171,27 +10478,30 @@ mod tests {
             (8, 1),
             DamageCoalescingPolicy::default(),
         );
-        let mut output = Vec::new();
-        render_attach_scene(
-            &mut output,
-            &scene,
-            &[],
-            &mut pane_buffers,
-            &damage,
-            0,
-            0,
-            &PaneScrollbackViews::new(),
-            false,
-            (8, 2),
-            &RuntimeAppearance::default(),
-            DamageCoalescingPolicy::default(),
-            &[],
-        )
-        .expect("wide-damaged render should succeed");
+        let (_, operations) = crate::projection::capture_neutral(|| {
+            render_attach_scene(
+                &mut Vec::new(),
+                &scene,
+                &[],
+                &mut pane_buffers,
+                &damage,
+                0,
+                0,
+                &PaneScrollbackViews::new(),
+                false,
+                (8, 2),
+                &RuntimeAppearance::default(),
+                DamageCoalescingPolicy::default(),
+                &[],
+            )
+            .expect("wide-damaged render should succeed")
+        });
 
-        let output = String::from_utf8(output).expect("output should be utf8");
-        assert!(output.contains("\u{1b}[1;3H界"), "{output:?}");
-        assert!(!output.contains("ab界ef"), "{output:?}");
+        assert_eq!(
+            drawn_runs(&operations),
+            [(2, 0, "界".to_string())],
+            "damage on the right half of a wide glyph should redraw all of it: {operations:?}"
+        );
     }
 
     /// Regression guard for per-pane scrollback rendering.
@@ -10303,33 +10613,29 @@ mod tests {
             },
         );
 
-        let mut output = Vec::new();
-        let _ = render_attach_scene(
-            &mut output,
-            &scene,
-            &[],
-            &mut pane_buffers,
-            &FrameDamage::full_frame(),
-            0,
-            0,
-            &scrollback_views,
-            false,
-            (20, 2),
-            &RuntimeAppearance::default(),
-            DamageCoalescingPolicy::default(),
-            &[],
-        )
-        .expect("render should succeed");
+        let mut host = TestHost::new(20, 2);
+        host.frame(true, || {
+            render_attach_scene(
+                &mut Vec::new(),
+                &scene,
+                &[],
+                &mut pane_buffers,
+                &FrameDamage::full_frame(),
+                0,
+                0,
+                &scrollback_views,
+                false,
+                (20, 2),
+                &RuntimeAppearance::default(),
+                DamageCoalescingPolicy::default(),
+                &[],
+            )
+            .expect("render should succeed")
+        });
 
-        let rendered = String::from_utf8(output).expect("output should be utf8");
-        assert!(
-            rendered.contains("FROZEN"),
-            "pane with a scrollback view must render frozen history rows: {rendered:?}"
-        );
-        assert!(
-            rendered.contains("LIVEROW"),
-            "focused pane without a scrollback view must render live rows: {rendered:?}"
-        );
+        // The pane with a scrollback view renders frozen history rows; the focused pane
+        // without one renders live rows.
+        assert_eq!(host.row(0), "FROZEN    LIVEROW   ", "{}", host.text());
     }
 
     #[test]
@@ -10486,30 +10792,26 @@ mod tests {
         let mut buffer = PaneRenderBuffer::default();
         feed_pane_buffer(&mut buffer, 2, 20, b"XXXXXXXXXXXXXXXXXXXX");
         pane_buffers.insert(pane_id, buffer);
-        let mut display = bmux_terminal_grid::TerminalGridStream::new(
-            30,
-            8,
-            bmux_terminal_grid::GridLimits::default(),
-        )
-        .expect("display grid");
-        let mut first = Vec::new();
-        render_attach_scene(
-            &mut first,
-            &previous,
-            &[],
-            &mut pane_buffers,
-            &FrameDamage::full_frame(),
-            0,
-            0,
-            &PaneScrollbackViews::new(),
-            false,
-            (30, 8),
-            &RuntimeAppearance::default(),
-            DamageCoalescingPolicy::default(),
-            &[],
-        )
-        .expect("initial render");
-        display.process(&first);
+        let mut host = TestHost::new(30, 8);
+        host.frame(true, || {
+            render_attach_scene(
+                &mut Vec::new(),
+                &previous,
+                &[],
+                &mut pane_buffers,
+                &FrameDamage::full_frame(),
+                0,
+                0,
+                &PaneScrollbackViews::new(),
+                false,
+                (30, 8),
+                &RuntimeAppearance::default(),
+                DamageCoalescingPolicy::default(),
+                &[],
+            )
+            .expect("initial render")
+        });
+        assert!(host.row(1).starts_with(&"X".repeat(20)), "{}", host.text());
 
         let damage = crate::reconcile::attach_scene_damage_between(
             &previous,
@@ -10517,41 +10819,46 @@ mod tests {
             DamageCoalescingPolicy::default(),
         );
         let mut trace = AttachRenderTrace::new();
-        let mut second = Vec::new();
         let appearance = RuntimeAppearance {
             background: "#123456".to_string(),
             ..RuntimeAppearance::default()
         };
-        render_attach_scene_with_stats_and_trace(
-            &mut second,
-            &next,
-            &[],
-            &mut pane_buffers,
-            &damage,
-            0,
-            0,
-            &PaneScrollbackViews::new(),
-            false,
-            (30, 8),
-            &appearance,
-            DamageCoalescingPolicy::default(),
-            &[],
-            Some(&mut trace),
-        )
-        .expect("constrained render");
-        let rendered = String::from_utf8(second.clone()).expect("render output");
-        assert!(rendered.contains("48;2;18;52;86"), "{rendered:?}");
+        let second = host.frame(false, || {
+            render_attach_scene_with_stats_and_trace(
+                &mut Vec::new(),
+                &next,
+                &[],
+                &mut pane_buffers,
+                &damage,
+                0,
+                0,
+                &PaneScrollbackViews::new(),
+                false,
+                (30, 8),
+                &appearance,
+                DamageCoalescingPolicy::default(),
+                &[],
+                Some(&mut trace),
+            )
+            .expect("constrained render")
+        });
+        assert!(
+            second
+                .operations
+                .iter()
+                .filter_map(drawn_style)
+                .any(|style| style.bg == Some(TuiColor::Rgb(18, 52, 86))),
+            "{:?}",
+            second.operations
+        );
         assert!(trace.ops().iter().any(|op| matches!(
             op,
             AttachRenderTraceOp::VacatedCellsCleared { cells, .. } if *cells > 0
         )));
-        display.process(&second);
 
-        let rows = display.grid().viewport_rows();
-        let row = rows[1].cells();
-        assert_eq!(row.first().map(bmux_terminal_grid::Cell::text), Some(" "));
-        assert_eq!(row.get(4).map(bmux_terminal_grid::Cell::text), Some(" "));
-        assert!(row.get(15).is_none_or(|cell| cell.text() == " "));
+        assert_eq!(host.cell(0, 1).0, " ", "{}", host.text());
+        assert_eq!(host.cell(4, 1).0, " ", "{}", host.text());
+        assert_eq!(host.cell(15, 1).0, " ", "{}", host.text());
     }
 
     #[test]
@@ -10590,31 +10897,34 @@ mod tests {
         let mut buffer = PaneRenderBuffer::default();
         feed_pane_buffer(&mut buffer, content.h, content.w, b"hello");
         pane_buffers.insert(pane_id, buffer);
-        let mut output = Vec::new();
-
-        let cursor = render_attach_scene(
-            &mut output,
-            &scene,
-            &[],
-            &mut pane_buffers,
-            &FrameDamage::full_frame(),
-            1,
-            0,
-            &PaneScrollbackViews::new(),
-            false,
-            (80, 24),
-            &bmux_appearance::RuntimeAppearance::default(),
-            DamageCoalescingPolicy::default(),
-            &[],
-        )
-        .expect("render padded scene")
-        .expect("focused pane cursor");
+        let mut host = TestHost::new(80, 24);
+        let cursor = host
+            .frame(true, || {
+                render_attach_scene(
+                    &mut Vec::new(),
+                    &scene,
+                    &[],
+                    &mut pane_buffers,
+                    &FrameDamage::full_frame(),
+                    1,
+                    0,
+                    &PaneScrollbackViews::new(),
+                    false,
+                    (80, 24),
+                    &bmux_appearance::RuntimeAppearance::default(),
+                    DamageCoalescingPolicy::default(),
+                    &[],
+                )
+                .expect("render padded scene")
+            })
+            .result
+            .expect("focused pane cursor");
 
         assert_eq!((cursor.x, cursor.y), (content.x + 5, content.y));
         assert!(
-            output
-                .windows(b"\x1b[5;8Hhello".len())
-                .any(|window| window == b"\x1b[5;8Hhello")
+            host.row(content.y)[usize::from(content.x)..].starts_with("hello"),
+            "{}",
+            host.text()
         );
         let grid = pane_buffers[&pane_id].terminal_grid.grid();
         assert_eq!(
@@ -10767,27 +11077,28 @@ mod tests {
         pane_buffers.insert(pane_id, buffer);
         let appearance = red_wash_appearance();
 
-        let mut output = Vec::new();
-        let _ = render_attach_scene(
-            &mut output,
-            &scene,
-            &[],
-            &mut pane_buffers,
-            &FrameDamage::full_frame(),
-            0,
-            0,
-            &PaneScrollbackViews::new(),
-            false,
-            (80, 24),
-            &appearance,
-            DamageCoalescingPolicy::default(),
-            &[],
-        )
-        .expect("render should succeed");
+        let mut host = TestHost::new(80, 24);
+        host.frame(true, || {
+            render_attach_scene(
+                &mut Vec::new(),
+                &scene,
+                &[],
+                &mut pane_buffers,
+                &FrameDamage::full_frame(),
+                0,
+                0,
+                &PaneScrollbackViews::new(),
+                false,
+                (80, 24),
+                &appearance,
+                DamageCoalescingPolicy::default(),
+                &[],
+            )
+            .expect("render should succeed")
+        });
 
-        let rendered = String::from_utf8(output).expect("render output should be utf8");
-        assert!(rendered.contains("\x1b[0;39;48;2;25;0;0m"));
-        assert!(rendered.contains("x       \x1b[0m"), "{rendered:?}");
+        assert!(host.row(0).starts_with("x       "), "{}", host.text());
+        assert_washed_row(&host, 0, 8);
     }
 
     #[test]
@@ -10800,27 +11111,69 @@ mod tests {
         pane_buffers.insert(pane_id, buffer);
         let appearance = red_wash_appearance();
 
-        let mut output = Vec::new();
-        render_attach_scene(
-            &mut output,
-            &scene,
-            &[],
-            &mut pane_buffers,
-            &FrameDamage::full_frame(),
-            0,
-            0,
-            &PaneScrollbackViews::new(),
-            false,
-            (8, 3),
-            &appearance,
-            DamageCoalescingPolicy::default(),
-            &[],
-        )
-        .expect("render should succeed");
+        let mut host = TestHost::new(8, 3);
+        host.frame(true, || {
+            render_attach_scene(
+                &mut Vec::new(),
+                &scene,
+                &[],
+                &mut pane_buffers,
+                &FrameDamage::full_frame(),
+                0,
+                0,
+                &PaneScrollbackViews::new(),
+                false,
+                (8, 3),
+                &appearance,
+                DamageCoalescingPolicy::default(),
+                &[],
+            )
+            .expect("render should succeed")
+        });
 
-        let rendered = String::from_utf8(output).expect("render output should be utf8");
-        let blank_row = "\x1b[0;39;48;2;25;0;0m        \x1b[0m";
-        assert!(rendered.contains(blank_row), "{rendered:?}");
+        for y in 1..3 {
+            assert_eq!(host.row(y), "        ");
+            assert_washed_row(&host, y, 8);
+        }
+    }
+
+    #[test]
+    fn a_pane_without_a_buffer_shows_blank_rows_with_its_content_effect() {
+        let pane_id = Uuid::from_u128(35);
+        let scene = single_pane_scene(pane_id, 8, 3);
+        let appearance = red_wash_appearance();
+        let mut host = TestHost::new(8, 3);
+        // The host shows stale text where the pane's rows must be blanked.
+        host.frame(true, || {
+            crate::projection::record(crate::projection::PaintOperation::Text {
+                x: 0,
+                y: 1,
+                text: "stale!!!".to_owned(),
+                style: bmux_tui::style::Style::new(),
+            });
+        });
+        host.frame(false, || {
+            render_attach_scene(
+                &mut Vec::new(),
+                &scene,
+                &[],
+                &mut BTreeMap::new(),
+                &FrameDamage::full_frame(),
+                0,
+                0,
+                &PaneScrollbackViews::new(),
+                false,
+                (8, 3),
+                &appearance,
+                DamageCoalescingPolicy::default(),
+                &[],
+            )
+            .expect("render should succeed")
+        });
+        for y in 1..3 {
+            assert_eq!(host.row(y), "        ");
+            assert_washed_row(&host, y, 8);
+        }
     }
 
     #[test]
@@ -10883,45 +11236,54 @@ mod tests {
         feed_pane_buffer(&mut buffer, 1, 8, b"x");
         pane_buffers.insert(pane_id, buffer);
 
-        render_attach_scene(
-            &mut Vec::new(),
-            &scene,
-            &[],
-            &mut pane_buffers,
-            &FrameDamage::full_frame(),
-            0,
-            0,
-            &PaneScrollbackViews::new(),
-            false,
-            (8, 3),
-            &RuntimeAppearance::default(),
-            DamageCoalescingPolicy::default(),
-            &[],
-        )
-        .expect("initial render should populate row cache");
+        let mut host = TestHost::new(8, 3);
+        host.frame(true, || {
+            render_attach_scene(
+                &mut Vec::new(),
+                &scene,
+                &[],
+                &mut pane_buffers,
+                &FrameDamage::full_frame(),
+                0,
+                0,
+                &PaneScrollbackViews::new(),
+                false,
+                (8, 3),
+                &RuntimeAppearance::default(),
+                DamageCoalescingPolicy::default(),
+                &[],
+            )
+            .expect("initial render should populate row cache")
+        });
+        assert_eq!(host.cell(0, 0).1.bg, None);
 
-        let mut output = Vec::new();
-        let (_cursor, stats) = render_attach_scene_with_stats_and_trace(
-            &mut output,
-            &scene,
-            &[],
-            &mut pane_buffers,
-            &FrameDamage::full_frame(),
-            0,
-            0,
-            &PaneScrollbackViews::new(),
-            false,
-            (8, 3),
-            &red_wash_appearance(),
-            DamageCoalescingPolicy::default(),
-            &[],
-            None,
-        )
-        .expect("appearance render should succeed");
+        let (_cursor, stats) = host
+            .frame(true, || {
+                render_attach_scene_with_stats_and_trace(
+                    &mut Vec::new(),
+                    &scene,
+                    &[],
+                    &mut pane_buffers,
+                    &FrameDamage::full_frame(),
+                    0,
+                    0,
+                    &PaneScrollbackViews::new(),
+                    false,
+                    (8, 3),
+                    &red_wash_appearance(),
+                    DamageCoalescingPolicy::default(),
+                    &[],
+                    None,
+                )
+                .expect("appearance render should succeed")
+            })
+            .result;
 
-        let rendered = String::from_utf8(output).expect("render output should be utf8");
         assert_eq!(stats.pane_rows_emitted, 3);
-        assert!(rendered.contains("x       \x1b[0m"), "{rendered:?}");
+        assert_eq!(host.row(0), "x       ");
+        for y in 0..3 {
+            assert_washed_row(&host, y, 8);
+        }
     }
 
     #[test]
@@ -11043,28 +11405,29 @@ mod tests {
         let mut damage = FrameDamage::default();
         damage.mark_extension_query();
 
-        let mut output = Vec::new();
-        let (_cursor, stats) = render_attach_scene_with_stats_and_trace(
-            &mut output,
-            &scene,
-            &[],
-            &mut pane_buffers,
-            &damage,
-            0,
-            0,
-            &PaneScrollbackViews::new(),
-            false,
-            (80, 24),
-            &RuntimeAppearance::default(),
-            DamageCoalescingPolicy::default(),
-            &extensions,
-            None,
-        )
-        .expect("query render should succeed");
+        let ((_cursor, stats), operations) = crate::projection::capture_neutral(|| {
+            render_attach_scene_with_stats_and_trace(
+                &mut Vec::new(),
+                &scene,
+                &[],
+                &mut pane_buffers,
+                &damage,
+                0,
+                0,
+                &PaneScrollbackViews::new(),
+                false,
+                (80, 24),
+                &RuntimeAppearance::default(),
+                DamageCoalescingPolicy::default(),
+                &extensions,
+                None,
+            )
+            .expect("query render should succeed")
+        });
 
-        let rendered = String::from_utf8(output).expect("render output should be utf8");
-        assert!(rendered.contains("FOCUS"), "{rendered:?}");
-        assert!(rendered.contains("OTHER"), "{rendered:?}");
+        let runs = drawn_runs(&operations);
+        assert!(runs.contains(&(0, 0, "FOCUS".to_string())), "{runs:?}");
+        assert!(runs.contains(&(12, 0, "OTHER".to_string())), "{runs:?}");
         assert_eq!(stats.damaged_extension_surfaces, 2);
     }
 
@@ -11139,35 +11502,36 @@ mod tests {
                 .expect("pane buffer should exist"),
             b"!",
         );
-        let mut output = Vec::new();
-        let (_cursor, stats) = render_attach_scene_with_stats_and_trace(
-            &mut output,
-            &scene,
-            &[],
-            &mut pane_buffers,
-            &content_damage(pane_id),
-            0,
-            0,
-            &PaneScrollbackViews::new(),
-            false,
-            (10, 2),
-            &RuntimeAppearance::default(),
-            DamageCoalescingPolicy::default(),
-            &extensions,
-            None,
-        )
-        .expect("content-damaged render should replay after-content overlay");
+        let ((_cursor, stats), operations) = crate::projection::capture_neutral(|| {
+            render_attach_scene_with_stats_and_trace(
+                &mut Vec::new(),
+                &scene,
+                &[],
+                &mut pane_buffers,
+                &content_damage(pane_id),
+                0,
+                0,
+                &PaneScrollbackViews::new(),
+                false,
+                (10, 2),
+                &RuntimeAppearance::default(),
+                DamageCoalescingPolicy::default(),
+                &extensions,
+                None,
+            )
+            .expect("content-damaged render should replay after-content overlay")
+        });
 
-        let rendered = String::from_utf8(output).expect("render output should be utf8");
-        let content_at = rendered
-            .find("abc!")
+        // The content's changed cell is redrawn, and the overlay over it replayed after it.
+        let content_at = operations
+            .iter()
+            .position(|operation| drawn_char_at(operation, 3, 0) == Some('!'))
             .expect("pane content should be emitted after content damage");
-        let overlay_at = rendered
-            .find("OVR")
+        let overlay_at = position_of_text(&operations, "OVR")
             .expect("after-content overlay should be replayed after content damage");
         assert!(
             content_at < overlay_at,
-            "after-content overlay must render after pane content: {rendered:?}"
+            "after-content overlay must render after pane content: {operations:?}"
         );
         assert_eq!(stats.damaged_content_surfaces, 1);
         assert_eq!(stats.damaged_extension_surfaces, 1);
@@ -11239,35 +11603,37 @@ mod tests {
 
         let extensions: Vec<Arc<dyn AttachRenderExtension>> =
             vec![Arc::new(StaleAfterContentCells) as Arc<dyn AttachRenderExtension>];
-        let mut output = Vec::new();
-        let (_cursor, stats) = render_attach_scene_with_stats_and_trace(
-            &mut output,
-            &scene,
-            &[],
-            &mut pane_buffers,
-            &FrameDamage::default(),
-            0,
-            0,
-            &PaneScrollbackViews::new(),
-            false,
-            (8, 2),
-            &RuntimeAppearance::default(),
-            DamageCoalescingPolicy::default(),
-            &extensions,
-            None,
-        )
-        .expect("stale after-content cleanup should render");
+        let ((_cursor, stats), operations) = crate::projection::capture_neutral(|| {
+            render_attach_scene_with_stats_and_trace(
+                &mut Vec::new(),
+                &scene,
+                &[],
+                &mut pane_buffers,
+                &FrameDamage::default(),
+                0,
+                0,
+                &PaneScrollbackViews::new(),
+                false,
+                (8, 2),
+                &RuntimeAppearance::default(),
+                DamageCoalescingPolicy::default(),
+                &extensions,
+                None,
+            )
+            .expect("stale after-content cleanup should render")
+        });
 
-        let rendered = String::from_utf8(output).expect("render output should be utf8");
-        let clear_at = rendered
-            .find("\u{1b}[1;2H   ")
+        let clear_at = position_of_blank(&operations, TuiRect::new(1, 0, 3, 1))
             .expect("stale after-content cells should be cleared");
-        let repaint_at = rendered
-            .rfind("bcd")
+        let repaint_at = operations
+            .iter()
+            .rposition(|operation| {
+                drawn(operation).is_some_and(|(_, _, text)| text.contains("bcd"))
+            })
             .expect("underlying pane content should be replayed after cleanup");
         assert!(
             clear_at < repaint_at,
-            "cleanup must precede content repaint: {rendered:?}"
+            "cleanup must precede content repaint: {operations:?}"
         );
         assert_eq!(stats.damaged_content_surfaces, 1);
         assert_eq!(stats.pane_row_segments_emitted, 1);
@@ -11337,52 +11703,62 @@ mod tests {
                 state: state.clone(),
             }) as Arc<dyn AttachRenderExtension>];
 
-        render_attach_scene(
-            &mut Vec::new(),
-            &scene,
-            &[],
-            &mut pane_buffers,
-            &FrameDamage::full_frame(),
-            0,
-            0,
-            &PaneScrollbackViews::new(),
-            false,
-            (8, 2),
-            &RuntimeAppearance::default(),
-            DamageCoalescingPolicy::default(),
-            &extensions,
-        )
-        .expect("initial retained render should commit previous snapshot");
+        let mut host = TestHost::new(8, 2);
+        host.frame(true, || {
+            render_attach_scene(
+                &mut Vec::new(),
+                &scene,
+                &[],
+                &mut pane_buffers,
+                &FrameDamage::full_frame(),
+                0,
+                0,
+                &PaneScrollbackViews::new(),
+                false,
+                (8, 2),
+                &RuntimeAppearance::default(),
+                DamageCoalescingPolicy::default(),
+                &extensions,
+            )
+            .expect("initial retained render should commit previous snapshot")
+        });
 
         state.store(2, Ordering::Relaxed);
-        let mut output = Vec::new();
-        let (_cursor, update_stats) = render_attach_scene_with_stats_and_trace(
-            &mut output,
-            &scene,
-            &[],
-            &mut pane_buffers,
-            &FrameDamage::default(),
-            0,
-            0,
-            &PaneScrollbackViews::new(),
-            false,
-            (8, 2),
-            &RuntimeAppearance::default(),
-            DamageCoalescingPolicy::default(),
-            &extensions,
-            None,
-        )
-        .expect("retained update should render through retained diff path");
-
-        let rendered = String::from_utf8(output).expect("render output should be utf8");
+        let second = host.frame(false, || {
+            render_attach_scene_with_stats_and_trace(
+                &mut Vec::new(),
+                &scene,
+                &[],
+                &mut pane_buffers,
+                &FrameDamage::default(),
+                0,
+                0,
+                &PaneScrollbackViews::new(),
+                false,
+                (8, 2),
+                &RuntimeAppearance::default(),
+                DamageCoalescingPolicy::default(),
+                &extensions,
+                None,
+            )
+            .expect("retained update should render through retained diff path")
+        });
+        let (_cursor, update_stats) = second.result;
+        let operations = &second.operations;
         assert!(
-            rendered.contains('B'),
-            "updated retained text should render: {rendered:?}"
+            operations
+                .iter()
+                .any(|operation| drawn_char_at(operation, 1, 0) == Some('B')),
+            "updated retained text should render: {operations:?}"
         );
         assert!(
-            !rendered.contains("        "),
-            "retained update should not clear full rows: {rendered:?}"
+            !operations
+                .iter()
+                .filter_map(blanked)
+                .any(|rect| rect.width >= 8),
+            "retained update should not clear full rows: {operations:?}"
         );
+        assert_eq!(host.row(0), "aBcdef  ");
         assert_eq!(update_stats.extension_full_surface_calls, 0);
         assert_eq!(update_stats.retained_scene_calls, 1);
         assert_eq!(update_stats.retained_scene_items, 1);
@@ -11462,54 +11838,57 @@ mod tests {
                 visible: visible.clone(),
             }) as Arc<dyn AttachRenderExtension>];
 
-        render_attach_scene(
-            &mut Vec::new(),
-            &scene,
-            &[],
-            &mut pane_buffers,
-            &FrameDamage::full_frame(),
-            0,
-            0,
-            &PaneScrollbackViews::new(),
-            false,
-            (8, 2),
-            &RuntimeAppearance::default(),
-            DamageCoalescingPolicy::default(),
-            &extensions,
-        )
-        .expect("initial retained render should commit previous snapshot");
+        let mut host = TestHost::new(8, 2);
+        host.frame(true, || {
+            render_attach_scene(
+                &mut Vec::new(),
+                &scene,
+                &[],
+                &mut pane_buffers,
+                &FrameDamage::full_frame(),
+                0,
+                0,
+                &PaneScrollbackViews::new(),
+                false,
+                (8, 2),
+                &RuntimeAppearance::default(),
+                DamageCoalescingPolicy::default(),
+                &extensions,
+            )
+            .expect("initial retained render should commit previous snapshot")
+        });
 
         visible.store(false, Ordering::Relaxed);
-        let mut output = Vec::new();
-        let (_cursor, stats) = render_attach_scene_with_stats_and_trace(
-            &mut output,
-            &scene,
-            &[],
-            &mut pane_buffers,
-            &FrameDamage::default(),
-            0,
-            0,
-            &PaneScrollbackViews::new(),
-            false,
-            (8, 2),
-            &RuntimeAppearance::default(),
-            DamageCoalescingPolicy::default(),
-            &extensions,
-            None,
-        )
-        .expect("retained removal should clean stale cells");
-
-        let rendered = String::from_utf8(output).expect("render output should be utf8");
-        let clear_at = rendered
-            .find("\u{1b}[1;2H   ")
+        let second = host.frame(false, || {
+            render_attach_scene_with_stats_and_trace(
+                &mut Vec::new(),
+                &scene,
+                &[],
+                &mut pane_buffers,
+                &FrameDamage::default(),
+                0,
+                0,
+                &PaneScrollbackViews::new(),
+                false,
+                (8, 2),
+                &RuntimeAppearance::default(),
+                DamageCoalescingPolicy::default(),
+                &extensions,
+                None,
+            )
+            .expect("retained removal should clean stale cells")
+        });
+        let (_cursor, stats) = second.result;
+        let operations = &second.operations;
+        let clear_at = position_of_blank(operations, TuiRect::new(1, 0, 3, 1))
             .expect("retained stale cells should be cleared");
-        let repaint_at = rendered
-            .find("bcd")
+        let repaint_at = position_of_text(operations, "bcd")
             .expect("pane content under removed retained text should replay");
         assert!(
             clear_at < repaint_at,
-            "cleanup should precede replay: {rendered:?}"
+            "cleanup should precede replay: {operations:?}"
         );
+        assert_eq!(host.row(0), "abcdef  ");
         assert_eq!(stats.extension_full_surface_calls, 0);
         assert_eq!(stats.pane_row_segments_emitted, 1);
     }
@@ -11576,60 +11955,65 @@ mod tests {
             vec![Arc::new(MovingRetainedTextExtension { x: x.clone() })
                 as Arc<dyn AttachRenderExtension>];
 
-        render_attach_scene(
-            &mut Vec::new(),
-            &scene,
-            &[],
-            &mut pane_buffers,
-            &FrameDamage::full_frame(),
-            0,
-            0,
-            &PaneScrollbackViews::new(),
-            false,
-            (8, 2),
-            &RuntimeAppearance::default(),
-            DamageCoalescingPolicy::default(),
-            &extensions,
-        )
-        .expect("initial retained render should commit previous snapshot");
+        let mut host = TestHost::new(8, 2);
+        host.frame(true, || {
+            render_attach_scene(
+                &mut Vec::new(),
+                &scene,
+                &[],
+                &mut pane_buffers,
+                &FrameDamage::full_frame(),
+                0,
+                0,
+                &PaneScrollbackViews::new(),
+                false,
+                (8, 2),
+                &RuntimeAppearance::default(),
+                DamageCoalescingPolicy::default(),
+                &extensions,
+            )
+            .expect("initial retained render should commit previous snapshot")
+        });
 
         x.store(3, Ordering::Relaxed);
-        let mut output = Vec::new();
-        render_attach_scene(
-            &mut output,
-            &scene,
-            &[],
-            &mut pane_buffers,
-            &FrameDamage::default(),
-            0,
-            0,
-            &PaneScrollbackViews::new(),
-            false,
-            (8, 2),
-            &RuntimeAppearance::default(),
-            DamageCoalescingPolicy::default(),
-            &extensions,
-        )
-        .expect("retained move should clean stale cells and draw new position");
-
-        let rendered = String::from_utf8(output).expect("render output should be utf8");
-        let clear_at = rendered
-            .find(' ')
+        let second = host.frame(false, || {
+            render_attach_scene(
+                &mut Vec::new(),
+                &scene,
+                &[],
+                &mut pane_buffers,
+                &FrameDamage::default(),
+                0,
+                0,
+                &PaneScrollbackViews::new(),
+                false,
+                (8, 2),
+                &RuntimeAppearance::default(),
+                DamageCoalescingPolicy::default(),
+                &extensions,
+            )
+            .expect("retained move should clean stale cells and draw new position")
+        });
+        let operations = &second.operations;
+        let clear_at = position_of_blank(operations, TuiRect::new(0, 0, 1, 1))
             .expect("old retained cell should be cleared");
-        let repaint_at = rendered
-            .find('a')
+        let repaint_at = operations
+            .iter()
+            .position(|operation| drawn_char_at(operation, 0, 0) == Some('a'))
             .expect("underlying content under old retained cell should replay");
-        let paint_at = rendered
-            .rfind('P')
+        let paint_at = operations
+            .iter()
+            .rposition(|operation| drawn_char_at(operation, 3, 0) == Some('P'))
             .expect("new retained cell should render");
         assert!(
             clear_at < repaint_at,
-            "cleanup should precede content replay: {rendered:?}"
+            "cleanup should precede content replay: {operations:?}"
         );
         assert!(
             repaint_at < paint_at,
-            "new retained output should follow content replay: {rendered:?}"
+            "new retained output should follow content replay: {operations:?}"
         );
+        assert_eq!(host.row(0), "abcPef  ");
     }
 
     #[test]
@@ -11686,54 +12070,58 @@ mod tests {
         let extensions: Vec<Arc<dyn AttachRenderExtension>> =
             vec![Arc::new(ContentReplayRetainedTextExtension) as Arc<dyn AttachRenderExtension>];
 
-        render_attach_scene(
-            &mut Vec::new(),
-            &scene,
-            &[],
-            &mut pane_buffers,
-            &FrameDamage::full_frame(),
-            0,
-            0,
-            &PaneScrollbackViews::new(),
-            false,
-            (8, 2),
-            &RuntimeAppearance::default(),
-            DamageCoalescingPolicy::default(),
-            &extensions,
-        )
-        .expect("initial retained render should commit previous snapshot");
+        let mut host = TestHost::new(8, 2);
+        host.frame(true, || {
+            render_attach_scene(
+                &mut Vec::new(),
+                &scene,
+                &[],
+                &mut pane_buffers,
+                &FrameDamage::full_frame(),
+                0,
+                0,
+                &PaneScrollbackViews::new(),
+                false,
+                (8, 2),
+                &RuntimeAppearance::default(),
+                DamageCoalescingPolicy::default(),
+                &extensions,
+            )
+            .expect("initial retained render should commit previous snapshot")
+        });
 
         let mut frame_damage = FrameDamage::default();
         frame_damage.mark_content_surface(pane_id);
-        let mut output = Vec::new();
-        let (_cursor, stats) = render_attach_scene_with_stats_and_trace(
-            &mut output,
-            &scene,
-            &[],
-            &mut pane_buffers,
-            &frame_damage,
-            0,
-            0,
-            &PaneScrollbackViews::new(),
-            false,
-            (8, 2),
-            &RuntimeAppearance::default(),
-            DamageCoalescingPolicy::default(),
-            &extensions,
-            None,
-        )
-        .expect("content damage should replay retained after-content output");
-
-        let rendered = String::from_utf8(output).expect("render output should be utf8");
-        let content_at = rendered
-            .find("abcdef")
+        let second = host.frame(false, || {
+            render_attach_scene_with_stats_and_trace(
+                &mut Vec::new(),
+                &scene,
+                &[],
+                &mut pane_buffers,
+                &frame_damage,
+                0,
+                0,
+                &PaneScrollbackViews::new(),
+                false,
+                (8, 2),
+                &RuntimeAppearance::default(),
+                DamageCoalescingPolicy::default(),
+                &extensions,
+                None,
+            )
+            .expect("content damage should replay retained after-content output")
+        });
+        let (_cursor, stats) = second.result;
+        let operations = &second.operations;
+        let content_at = position_of_text(operations, "abcdef")
             .expect("pane content should repaint for content damage");
-        let overlay_at = rendered
-            .rfind("OV")
+        let overlay_at = operations
+            .iter()
+            .rposition(|operation| drawn(operation).is_some_and(|(_, _, text)| text.contains("OV")))
             .expect("unchanged retained overlay should replay after content repaint");
         assert!(
             content_at < overlay_at,
-            "retained overlay must render after content: {rendered:?}"
+            "retained overlay must render after content: {operations:?}"
         );
         assert_eq!(stats.retained_scene_update_cells, 0);
         assert_eq!(stats.retained_scene_content_replay_cells, 2);
@@ -11807,52 +12195,60 @@ mod tests {
                 lower_changed: lower_changed.clone(),
             }) as Arc<dyn AttachRenderExtension>];
 
-        render_attach_scene(
-            &mut Vec::new(),
-            &scene,
-            &[],
-            &mut pane_buffers,
-            &FrameDamage::full_frame(),
-            0,
-            0,
-            &PaneScrollbackViews::new(),
-            false,
-            (8, 2),
-            &RuntimeAppearance::default(),
-            DamageCoalescingPolicy::default(),
-            &extensions,
-        )
-        .expect("initial retained render should commit previous snapshot");
+        let mut host = TestHost::new(8, 2);
+        host.frame(true, || {
+            render_attach_scene(
+                &mut Vec::new(),
+                &scene,
+                &[],
+                &mut pane_buffers,
+                &FrameDamage::full_frame(),
+                0,
+                0,
+                &PaneScrollbackViews::new(),
+                false,
+                (8, 2),
+                &RuntimeAppearance::default(),
+                DamageCoalescingPolicy::default(),
+                &extensions,
+            )
+            .expect("initial retained render should commit previous snapshot")
+        });
 
         lower_changed.store(true, Ordering::Relaxed);
-        let mut output = Vec::new();
-        render_attach_scene(
-            &mut output,
-            &scene,
-            &[],
-            &mut pane_buffers,
-            &FrameDamage::default(),
-            0,
-            0,
-            &PaneScrollbackViews::new(),
-            false,
-            (8, 2),
-            &RuntimeAppearance::default(),
-            DamageCoalescingPolicy::default(),
-            &extensions,
-        )
-        .expect("lower retained update should preserve higher-z item");
-
-        let rendered = String::from_utf8(output).expect("render output should be utf8");
-        let higher_at = rendered
-            .rfind('H')
+        let second = host.frame(false, || {
+            render_attach_scene(
+                &mut Vec::new(),
+                &scene,
+                &[],
+                &mut pane_buffers,
+                &FrameDamage::default(),
+                0,
+                0,
+                &PaneScrollbackViews::new(),
+                false,
+                (8, 2),
+                &RuntimeAppearance::default(),
+                DamageCoalescingPolicy::default(),
+                &extensions,
+            )
+            .expect("lower retained update should preserve higher-z item")
+        });
+        let operations = &second.operations;
+        let higher_at = operations
+            .iter()
+            .rposition(|operation| drawn_char_at(operation, 0, 1) == Some('H'))
             .expect("higher-z retained item should render");
-        if let Some(lower_at) = rendered.rfind('l') {
+        if let Some(lower_at) = operations
+            .iter()
+            .rposition(|operation| drawn_char_at(operation, 0, 1) == Some('l'))
+        {
             assert!(
                 lower_at < higher_at,
-                "higher-z item must be emitted after lower-z item: {rendered:?}"
+                "higher-z item must be emitted after lower-z item: {operations:?}"
             );
         }
+        assert_eq!(host.cell(0, 1).0, "H", "{}", host.text());
     }
 
     #[test]
@@ -11934,58 +12330,61 @@ mod tests {
                 revision: revision.clone(),
             }) as Arc<dyn AttachRenderExtension>];
 
-        render_attach_scene(
-            &mut Vec::new(),
-            &scene,
-            &[],
-            &mut pane_buffers,
-            &FrameDamage::full_frame(),
-            0,
-            0,
-            &PaneScrollbackViews::new(),
-            false,
-            (8, 2),
-            &RuntimeAppearance::default(),
-            DamageCoalescingPolicy::default(),
-            &extensions,
-        )
-        .expect("initial snapshot render should commit after-content metadata");
+        let mut host = TestHost::new(8, 2);
+        host.frame(true, || {
+            render_attach_scene(
+                &mut Vec::new(),
+                &scene,
+                &[],
+                &mut pane_buffers,
+                &FrameDamage::full_frame(),
+                0,
+                0,
+                &PaneScrollbackViews::new(),
+                false,
+                (8, 2),
+                &RuntimeAppearance::default(),
+                DamageCoalescingPolicy::default(),
+                &extensions,
+            )
+            .expect("initial snapshot render should commit after-content metadata")
+        });
 
         revision.store(2, Ordering::Relaxed);
-        let mut output = Vec::new();
-        let (_cursor, stats) = render_attach_scene_with_stats_and_trace(
-            &mut output,
-            &scene,
-            &[],
-            &mut pane_buffers,
-            &FrameDamage::default(),
-            0,
-            0,
-            &PaneScrollbackViews::new(),
-            false,
-            (8, 2),
-            &RuntimeAppearance::default(),
-            DamageCoalescingPolicy::default(),
-            &extensions,
-            None,
-        )
-        .expect("snapshot diff should clean stale after-content cells");
-
-        let rendered = String::from_utf8(output).expect("render output should be utf8");
-        let clear_at = rendered
-            .find("\u{1b}[1;1H        ")
+        let second = host.frame(false, || {
+            render_attach_scene_with_stats_and_trace(
+                &mut Vec::new(),
+                &scene,
+                &[],
+                &mut pane_buffers,
+                &FrameDamage::default(),
+                0,
+                0,
+                &PaneScrollbackViews::new(),
+                false,
+                (8, 2),
+                &RuntimeAppearance::default(),
+                DamageCoalescingPolicy::default(),
+                &extensions,
+                None,
+            )
+            .expect("snapshot diff should clean stale after-content cells")
+        });
+        let (_cursor, stats) = second.result;
+        let operations = &second.operations;
+        let clear_at = position_of_blank(operations, TuiRect::new(0, 0, 8, 1))
             .expect("previous after-content snapshot should be cleared");
-        let repaint_at = rendered
-            .find("abcdef")
+        let repaint_at = position_of_text(operations, "abcdef")
             .expect("underlying pane content should be replayed after snapshot cleanup");
         assert!(
             clear_at < repaint_at,
-            "cleanup must precede content: {rendered:?}"
+            "cleanup must precede content: {operations:?}"
         );
         assert!(
-            !rendered.contains("OLD"),
-            "stale overlay should not be redrawn: {rendered:?}"
+            position_of_text(operations, "OLD").is_none(),
+            "stale overlay should not be redrawn: {operations:?}"
         );
+        assert_eq!(host.row(0), "abcdef  ");
         assert_eq!(stats.damaged_content_surfaces, 1);
         assert_eq!(stats.damaged_extension_surfaces, 1);
     }
@@ -12124,38 +12523,43 @@ mod tests {
         })
             as Arc<dyn AttachRenderExtension>];
 
-        let mut output = Vec::new();
         let mut trace = AttachRenderTrace::new();
-        let (_cursor, stats) = render_attach_scene_with_stats_and_trace(
-            &mut output,
-            &scene,
-            &[],
-            &mut pane_buffers,
-            &FrameDamage::full_frame(),
-            0,
-            0,
-            &PaneScrollbackViews::new(),
-            false,
-            (80, 24),
-            &bmux_appearance::RuntimeAppearance::default(),
-            DamageCoalescingPolicy::default(),
-            &extensions,
-            Some(&mut trace),
-        )
-        .expect("render should succeed");
+        let ((_cursor, stats), operations) = crate::projection::capture_neutral(|| {
+            render_attach_scene_with_stats_and_trace(
+                &mut Vec::new(),
+                &scene,
+                &[],
+                &mut pane_buffers,
+                &FrameDamage::full_frame(),
+                0,
+                0,
+                &PaneScrollbackViews::new(),
+                false,
+                (80, 24),
+                &bmux_appearance::RuntimeAppearance::default(),
+                DamageCoalescingPolicy::default(),
+                &extensions,
+                Some(&mut trace),
+            )
+            .expect("render should succeed")
+        });
 
-        let rendered = String::from_utf8(output).expect("render output should be utf8");
-        assert!(rendered.contains("OPS"));
-        assert!(rendered.contains("PANE"));
+        let pane_at = position_of_text(&operations, "PANE").expect("pane content should render");
+        let ops_at =
+            position_of_text(&operations, "OPS").expect("after-pane extension should render");
         assert!(
-            rendered.find("PANE").expect("pane content should render")
-                < rendered
-                    .find("OPS")
-                    .expect("after-pane extension should render"),
-            "after-pane extension must be emitted after pane content: {rendered:?}"
+            pane_at < ops_at,
+            "after-pane extension must be emitted after pane content: {operations:?}"
         );
-        assert!(rendered.contains("\x1b[38;2;1;2;3m"));
-        assert!(rendered.contains("\x1b[1m"));
+        assert_eq!(drawn(&operations[ops_at]), Some((2, 1, "OPS")));
+        assert_eq!(
+            drawn_style(&operations[ops_at]),
+            Some(
+                TuiStyle::new()
+                    .fg(TuiColor::Rgb(1, 2, 3))
+                    .add_modifier(Modifier::BOLD)
+            )
+        );
         assert_eq!(calls.load(Ordering::Relaxed), 1);
         assert_eq!(refreshes.load(Ordering::Relaxed), 1);
         assert_eq!(stats.extension_render_op_calls, 1);
@@ -12166,29 +12570,30 @@ mod tests {
             full_surface: true,
         }));
 
-        let mut cached_output = Vec::new();
         let mut cached_trace = AttachRenderTrace::new();
-        let (_cursor, cached_stats) = render_attach_scene_with_stats_and_trace(
-            &mut cached_output,
-            &scene,
-            &[],
-            &mut pane_buffers,
-            &FrameDamage::full_frame(),
-            0,
-            0,
-            &PaneScrollbackViews::new(),
-            false,
-            (80, 24),
-            &bmux_appearance::RuntimeAppearance::default(),
-            DamageCoalescingPolicy::default(),
-            &extensions,
-            Some(&mut cached_trace),
-        )
-        .expect("cached render should succeed");
+        let ((_cursor, cached_stats), cached_operations) =
+            crate::projection::capture_neutral(|| {
+                render_attach_scene_with_stats_and_trace(
+                    &mut Vec::new(),
+                    &scene,
+                    &[],
+                    &mut pane_buffers,
+                    &FrameDamage::full_frame(),
+                    0,
+                    0,
+                    &PaneScrollbackViews::new(),
+                    false,
+                    (80, 24),
+                    &bmux_appearance::RuntimeAppearance::default(),
+                    DamageCoalescingPolicy::default(),
+                    &extensions,
+                    Some(&mut cached_trace),
+                )
+                .expect("cached render should succeed")
+            });
         assert!(
-            String::from_utf8(cached_output)
-                .expect("cached render output should be utf8")
-                .contains("OPS")
+            position_of_text(&cached_operations, "OPS").is_some(),
+            "{cached_operations:?}"
         );
         assert_eq!(calls.load(Ordering::Relaxed), 1);
         assert_eq!(refreshes.load(Ordering::Relaxed), 2);
@@ -12293,25 +12698,31 @@ mod tests {
         feed_pane_buffer(&mut buffer, 2, 10, b"hello");
 
         // Populate prev_rows with an initial render.
-        let mut output1 = Vec::new();
         pane_buffers.insert(pane_id, buffer);
-        let _ = render_attach_scene(
-            &mut output1,
-            &scene,
-            &[],
-            &mut pane_buffers,
-            &FrameDamage::full_frame(),
-            1,
-            0,
-            &PaneScrollbackViews::new(),
-            false,
-            (80, 24),
-            &bmux_appearance::RuntimeAppearance::default(),
-            DamageCoalescingPolicy::default(),
-            &[],
-        )
-        .expect("initial render should succeed");
-        assert!(!output1.is_empty(), "initial render should produce output");
+        let mut host = TestHost::new(80, 24);
+        let first = host.frame(true, || {
+            render_attach_scene(
+                &mut Vec::new(),
+                &scene,
+                &[],
+                &mut pane_buffers,
+                &FrameDamage::full_frame(),
+                1,
+                0,
+                &PaneScrollbackViews::new(),
+                false,
+                (80, 24),
+                &bmux_appearance::RuntimeAppearance::default(),
+                DamageCoalescingPolicy::default(),
+                &[],
+            )
+            .expect("initial render should succeed")
+        });
+        assert!(
+            !first.operations.is_empty(),
+            "initial render should produce output"
+        );
+        assert!(host.row(1).starts_with("hello "), "{}", host.text());
 
         // Simulate a sync update in progress: set the server-sourced flag
         // directly (as the drain loop would after reading a chunk with
@@ -12321,30 +12732,36 @@ mod tests {
         entry.sync_update_in_progress = true;
 
         // Render with the pane dirty but NOT a full redraw.
-        let mut output2 = Vec::new();
-        let _ = render_attach_scene(
-            &mut output2,
-            &scene,
-            &[],
-            &mut pane_buffers,
-            &content_damage(pane_id),
-            1,
-            0,
-            &PaneScrollbackViews::new(),
-            false,
-            (80, 24),
-            &bmux_appearance::RuntimeAppearance::default(),
-            DamageCoalescingPolicy::default(),
-            &[],
-        )
-        .expect("deferred render should succeed");
+        let deferred = host.frame(false, || {
+            render_attach_scene(
+                &mut Vec::new(),
+                &scene,
+                &[],
+                &mut pane_buffers,
+                &content_damage(pane_id),
+                1,
+                0,
+                &PaneScrollbackViews::new(),
+                false,
+                (80, 24),
+                &bmux_appearance::RuntimeAppearance::default(),
+                DamageCoalescingPolicy::default(),
+                &[],
+            )
+            .expect("deferred render should succeed")
+        });
 
-        // The output should NOT contain the partial content "partial" because
-        // the pane was sync-deferred.
-        let rendered2 = String::from_utf8(output2).expect("render output should be utf8");
+        // The frame should NOT draw the partial content "partial" because the pane was
+        // sync-deferred.
         assert!(
-            !rendered2.contains("partial"),
-            "sync-deferred render should not contain partial pane content"
+            position_of_text(&deferred.operations, "partial").is_none(),
+            "sync-deferred render should not contain partial pane content: {:?}",
+            deferred.operations
+        );
+        assert!(
+            host.row(1).starts_with("hello "),
+            "the host should keep showing the last complete frame:\n{}",
+            host.text()
         );
 
         // Complete the sync update (server clears the flag).
@@ -12352,27 +12769,33 @@ mod tests {
         append_pane_output(entry, b" done");
         entry.sync_update_in_progress = false;
 
-        let mut output3 = Vec::new();
-        let _ = render_attach_scene(
-            &mut output3,
-            &scene,
-            &[],
-            &mut pane_buffers,
-            &content_damage(pane_id),
-            1,
-            0,
-            &PaneScrollbackViews::new(),
-            false,
-            (80, 24),
-            &bmux_appearance::RuntimeAppearance::default(),
-            DamageCoalescingPolicy::default(),
-            &[],
-        )
-        .expect("completed render should succeed");
+        let completed = host.frame(false, || {
+            render_attach_scene(
+                &mut Vec::new(),
+                &scene,
+                &[],
+                &mut pane_buffers,
+                &content_damage(pane_id),
+                1,
+                0,
+                &PaneScrollbackViews::new(),
+                false,
+                (80, 24),
+                &bmux_appearance::RuntimeAppearance::default(),
+                DamageCoalescingPolicy::default(),
+                &[],
+            )
+            .expect("completed render should succeed")
+        });
 
         assert!(
-            !output3.is_empty(),
+            !completed.operations.is_empty(),
             "completed render should produce output"
+        );
+        assert!(
+            host.row(1).starts_with("hellopartial") && host.row(2).starts_with(" done "),
+            "{}",
+            host.text()
         );
     }
 
@@ -12416,32 +12839,32 @@ mod tests {
         buffer.sync_update_in_progress = true;
         pane_buffers.insert(pane_id, buffer);
 
-        let mut output = Vec::new();
-        let _ = render_attach_scene(
-            &mut output,
-            &scene,
-            &[],
-            &mut pane_buffers,
-            &FrameDamage::full_frame(),
-            1,
-            0,
-            &PaneScrollbackViews::new(),
-            false,
-            (80, 24),
-            &bmux_appearance::RuntimeAppearance::default(),
-            DamageCoalescingPolicy::default(),
-            &[],
-        )
-        .expect("full redraw should defer while sync flag is active");
+        let (_, operations) = crate::projection::capture_neutral(|| {
+            render_attach_scene(
+                &mut Vec::new(),
+                &scene,
+                &[],
+                &mut pane_buffers,
+                &FrameDamage::full_frame(),
+                1,
+                0,
+                &PaneScrollbackViews::new(),
+                false,
+                (80, 24),
+                &bmux_appearance::RuntimeAppearance::default(),
+                DamageCoalescingPolicy::default(),
+                &[],
+            )
+            .expect("full redraw should defer while sync flag is active")
+        });
 
-        let rendered = String::from_utf8(output).expect("render output should be utf8");
         assert!(
-            !rendered.contains("content"),
-            "full-frame redraw must not draw partial pane content while sync_update_in_progress is set"
+            position_of_text(&operations, "content").is_none(),
+            "full-frame redraw must not draw partial pane content while sync_update_in_progress is set: {operations:?}"
         );
         assert!(
-            !rendered.contains("\x1b[2J"),
-            "full-frame redraw must not clear the host terminal while pane content is sync-deferred"
+            position_of_blank(&operations, TuiRect::new(0, 1, 12, 4)).is_none(),
+            "full-frame redraw must not clear the pane while its content is sync-deferred: {operations:?}"
         );
     }
 
@@ -12465,19 +12888,27 @@ mod tests {
             tui.modifiers
                 .contains(bmux_tui::style::Modifier::CROSSED_OUT)
         );
-        {
-            let ansi = super::style_sgr(lowered);
-            let mut restored = bmux_terminal_grid::TerminalGridStream::new(
+        // The row as captured and presented on a host keeps both attributes.
+        let appearance = RuntimeAppearance::default();
+        let under = BTreeMap::new();
+        let mut host = TestHost::new(8, 2);
+        host.frame(true, || {
+            let mut shown = super::ShownRow::blank(0);
+            shown.resolve(
+                GridRowRenderContext {
+                    row: &rows[0],
+                    selection: None,
+                    selection_line: 0,
+                    runtime_appearance: &appearance,
+                    palette: stream.grid().palette(),
+                    before_content_cells: &under,
+                },
                 8,
-                2,
-                bmux_terminal_grid::GridLimits::default(),
-            )
-            .unwrap();
-            restored.process(format!("{ansi}X").as_bytes());
-            let rows = restored.grid().viewport_rows();
-            let style = restored.grid().palette().get(rows[0].cells()[0].style());
-            assert!(style.hidden);
-            assert!(style.strike);
-        }
+            );
+            shown.capture(0, 0, 0, 8);
+        });
+        let (_, style) = host.cell(0, 0);
+        assert!(style.hidden, "{style:?}");
+        assert!(style.strike, "{style:?}");
     }
 }

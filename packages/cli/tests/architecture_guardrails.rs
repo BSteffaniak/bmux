@@ -123,7 +123,7 @@ fn assert_no_raw_host_kernel_coupling(source: &str, context: &str) {
     }
 }
 
-fn runtime_sources() -> [(&'static str, &'static str); 12] {
+fn runtime_sources() -> [(&'static str, &'static str); 11] {
     [
         (
             "packages/cli/src/runtime/mod.rs",
@@ -144,10 +144,6 @@ fn runtime_sources() -> [(&'static str, &'static str); 12] {
         (
             "packages/cli/src/runtime/attach/mod.rs",
             include_str!("../src/runtime/attach/mod.rs"),
-        ),
-        (
-            "packages/cli/src/runtime/attach/cursor.rs",
-            include_str!("../src/runtime/attach/cursor.rs"),
         ),
         (
             "packages/cli/src/runtime/attach/events.rs",

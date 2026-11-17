@@ -366,7 +366,6 @@ pub struct AttachViewState {
     pub last_help_overlay_surface: Option<AttachSurface>,
     pub last_prompt_overlay_surface: Option<AttachSurface>,
     pub last_cursor_state: Option<AttachCursorState>,
-    pub force_cursor_move_next_frame: bool,
     /// Pointer intent resolved from committed interaction metadata.
     pub(super) pointer_shape: Option<bmux_attach_pipeline::pointer_shape::ResolvedPointerShape>,
     pub(super) last_pointer_shape:
@@ -754,7 +753,6 @@ impl AttachViewState {
             last_help_overlay_surface: None,
             last_prompt_overlay_surface: None,
             last_cursor_state: None,
-            force_cursor_move_next_frame: false,
             pointer_shape: None,
             last_pointer_shape: None,
             mouse: AttachMouseState {

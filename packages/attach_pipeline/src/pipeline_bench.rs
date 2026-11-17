@@ -385,8 +385,9 @@ fn shown(
         )
 }
 
-/// Replay `frames` into a host terminal emulator and check, after every frame that is drawn, that
-/// the host shows exactly the pane. Returns the rows moved on the host.
+/// Replay `frames` into a host terminal emulator, presenting what the renderer captures, and
+/// check, after every frame that is drawn, that the host shows exactly the pane. Returns the rows
+/// moved on the host.
 fn assert_host_matches(
     name: &str,
     size: (u16, u16),
@@ -396,7 +397,7 @@ fn assert_host_matches(
 ) -> u64 {
     assert_replay_matches(
         name,
-        Replay::new(size, scroll_passthrough, chunk_size),
+        Replay::new(size, scroll_passthrough, chunk_size).presented(),
         frames,
     )
 }

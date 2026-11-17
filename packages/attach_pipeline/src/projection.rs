@@ -116,7 +116,7 @@ impl std::fmt::Display for ProjectionFailure {
 }
 
 thread_local! {
-    static ENCODE_TERMINAL: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    static ENCODE_TERMINAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Whether synchronous composition should lower terminal control bytes.

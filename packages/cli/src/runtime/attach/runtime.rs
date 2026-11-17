@@ -55,13 +55,17 @@ use bmux_plugin_sdk::{
 use bmux_recording_plugin_api::recording_state;
 use bmux_recording_protocol::{DisplayActivityKind, RecordingCaptureTarget};
 use bmux_session_models::SessionSelector;
-use bmux_terminal::cursor::{Hide, MoveTo, SavePosition, Show};
+use bmux_terminal::cursor::{MoveTo, Show};
 use bmux_terminal::event::{
     DisableBracketedPaste, DisableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
     KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 #[cfg(test)]
 use bmux_terminal::event::{EnableBracketedPaste, EnableMouseCapture};
+use bmux_terminal::queue;
+use bmux_terminal::style::Print;
+use bmux_terminal::terminal;
+use bmux_terminal::terminal::{Clear, ClearType};
 use bmux_tui::component::{Component, Constraints, LayoutCx};
 use bmux_tui::composition::TextBlock;
 use bmux_tui::frame::Frame as TuiFrame;
@@ -71,16 +75,6 @@ use bmux_tui::prelude::Line as TuiLine;
 use bmux_tui_components::key_hint_bar::{KeyHint, KeyHintBarComponent, KeyHintBarStyles};
 use bmux_tui_components::modal_frame::{ModalFrame, ModalFrameComponent, ModalSizing};
 use bmux_tui_components::theme::ComponentTheme;
-macro_rules! queue {
-    ($($args:tt)*) => {
-        if bmux_attach_pipeline::projection::encoding_terminal() {
-            bmux_terminal::queue!($($args)*)
-        } else { Ok::<(), std::io::Error>(()) }
-    };
-}
-use bmux_terminal::style::Print;
-use bmux_terminal::terminal;
-use bmux_terminal::terminal::{BeginSynchronizedUpdate, Clear, ClearType, EndSynchronizedUpdate};
 
 use bmux_pane_runtime_plugin_api::attach_runtime_commands as attach_terminal_commands;
 use std::collections::{BTreeMap, BTreeSet};
@@ -1921,7 +1915,6 @@ use super::super::{
     plugin_host_metadata, resolve_plugin_search_paths, scan_available_plugins,
 };
 use super::adapters::{AttachClock, SystemAttachClock};
-use super::cursor::apply_attach_cursor_state;
 use super::display_capture;
 
 const ATTACH_LOCAL_PRESENTATION_STATE_KIND: bmux_plugin_sdk::PluginEventKind =
@@ -2458,7 +2451,6 @@ fn apply_attach_output_chunk(
         view_state
             .dirty
             .mark_full_frame(AttachDirtySource::AlternateScreenTransition);
-        view_state.force_cursor_move_next_frame = true;
     }
 
     outcome
@@ -2664,7 +2656,6 @@ fn apply_attach_output_chunk_protocol_only(
         view_state
             .dirty
             .mark_full_frame(AttachDirtySource::AlternateScreenTransition);
-        view_state.force_cursor_move_next_frame = true;
     }
 
     outcome
@@ -3273,12 +3264,8 @@ impl AttachPerfWindow {
             self.full_frame_fallback_flagged_frames =
                 self.full_frame_fallback_flagged_frames.saturating_add(1);
         }
-        if inefficiency_flags
-            .contains(AttachRenderInefficiencyFlags::EXTENSION_CACHE_MISS)
-        {
-            self.extension_cache_miss_frames = self
-                .extension_cache_miss_frames
-                .saturating_add(1);
+        if inefficiency_flags.contains(AttachRenderInefficiencyFlags::EXTENSION_CACHE_MISS) {
+            self.extension_cache_miss_frames = self.extension_cache_miss_frames.saturating_add(1);
         }
         if inefficiency_flags
             .contains(AttachRenderInefficiencyFlags::STATUS_OVERLAY_ONLY_EMITS_PANE_WORK)
@@ -10400,15 +10387,11 @@ fn render_damage_from_retained_damage_rects(rects: &[DamageRect]) -> RenderDamag
     )
 }
 
-fn queue_retained_background_clear(
-    stdout: &mut impl Write,
-    damage: &RetainedDamage,
-) -> Result<bool> {
-    let rects = match damage {
-        RetainedDamage::None | RetainedDamage::Full { .. } => return Ok(false),
-        RetainedDamage::Regions(rects) => rects,
+/// Clear the retained background where the graph changed, before surfaces repaint over it.
+fn clear_retained_background(damage: &RetainedDamage) {
+    let RetainedDamage::Regions(rects) = damage else {
+        return;
     };
-    let mut wrote = false;
     for rect in rects {
         bmux_attach_pipeline::projection::record(
             bmux_attach_pipeline::projection::PaintOperation::Fill {
@@ -10416,14 +10399,7 @@ fn queue_retained_background_clear(
                 style: bmux_tui::style::Style::new(),
             },
         );
-        let blank = " ".repeat(usize::from(rect.w));
-        for row in rect.y..rect.y.saturating_add(rect.h) {
-            queue!(stdout, MoveTo(rect.x, row), Print(&blank))
-                .context("failed clearing retained background damage")?;
-            wrote = true;
-        }
     }
-    Ok(wrote)
 }
 
 fn queue_retained_render_ops(
@@ -11367,28 +11343,16 @@ fn render_attach_frame_inner(
     // Reconciliation describes encoded output, not yet-presented resources.
     // Keep the committed cache intact until the terminal accepts the frame.
     let mut pending_graphics_cache = view_state.terminal_graphics_cache.clone();
-    // Wrap multi-region scene/overlay frames in a synchronized update so the
-    // terminal buffers output and displays it atomically (Mode 2026). Status-only
-    // frames are tiny and safe to write directly, avoiding two extra control
-    // sequences on the common low-damage path.
-    if frame_plan.use_synchronized_update {
-        queue!(frame_bytes, BeginSynchronizedUpdate)
-            .context("failed queuing begin synchronized update")?;
-    }
     // Deletion belongs to the same synchronized frame as replacement pixels.
     #[cfg(any(
         feature = "image-sixel",
         feature = "image-kitty",
         feature = "image-iterm2"
     ))]
-    if bmux_attach_pipeline::projection::encoding_terminal() || view_state.presenting {
+    if view_state.presenting {
         // Capability changes release resources even on partial frames. Visibility
         // reconciliation, however, requires a complete image scene.
-        let out = if view_state.presenting {
-            &mut images_before
-        } else {
-            &mut frame_bytes
-        };
+        let out = &mut images_before;
         pending_kitty_state
             .select_protocol(out, view_state.host_image_caps.preferred_protocol())?;
         if frame_plan.render_scene {
@@ -11396,10 +11360,6 @@ fn render_attach_frame_inner(
             pending_kitty_state.clear_placements(out)?;
         }
     }
-    queue!(frame_bytes, SavePosition).context("failed queuing cursor save for attach frame")?;
-    // Hide the cursor during the frame render to prevent it from visibly
-    // jumping to every MoveTo position as pane content is drawn.
-    queue!(frame_bytes, Hide).context("failed queuing cursor hide for attach frame")?;
     #[cfg(any(
         feature = "image-sixel",
         feature = "image-kitty",
@@ -11415,20 +11375,13 @@ fn render_attach_frame_inner(
                 style: bmux_tui::style::Style::new(),
             },
         );
-        queue!(frame_bytes, Clear(ClearType::All))
-            .context("failed clearing previous image frame")?;
         if view_state.presenting {
             images_before.extend_from_slice(b"\x1b[2J");
         }
     }
-    // Reflect the forced-hide in tracked state so apply_attach_cursor_state
-    // will re-emit Show if the cursor should be visible after the frame.
-    let cursor_state_before_forced_hide = view_state.last_cursor_state;
-    let mut pending_cursor_state = view_state.last_cursor_state;
-    if let Some(ref mut cs) = pending_cursor_state {
-        cs.visible = false;
-    }
-    queue_retained_background_clear(&mut frame_bytes, &frame_plan.retained.damage.graph)?;
+    // The cursor the host shows now, kept while nothing moves it.
+    let previous_cursor_state = view_state.last_cursor_state;
+    clear_retained_background(&frame_plan.retained.damage.graph);
     let retained_capabilities = terminal_render_capabilities(view_state);
     let status_rendered = false;
     let appearance_mode_id = if view_state.help_overlay_open {
@@ -11490,7 +11443,7 @@ fn render_attach_frame_inner(
         scene_render_stats = stats;
         cursor_state
     } else {
-        cursor_state_before_forced_hide
+        previous_cursor_state
     };
 
     // Image overlay: render terminal images (Sixel, Kitty, iTerm2) on top
@@ -11524,11 +11477,7 @@ fn render_attach_frame_inner(
                     .collect::<Vec<_>>();
                 if !view_state.presentation_only {
                     bmux_image::compositor::render_pane_images_clipped(
-                        if view_state.presenting {
-                            &mut images_after
-                        } else {
-                            &mut frame_bytes
-                        },
+                        &mut images_after,
                         &pane_images,
                         pane_rect,
                         &covers,
@@ -11541,7 +11490,6 @@ fn render_attach_frame_inner(
         }
     }
 
-    let previous_cursor_state = cursor_state_before_forced_hide;
     let mut overlay_rendered = false;
     let retained_extensions = view_state
         .prepared_extensions
@@ -11641,7 +11589,7 @@ fn render_attach_frame_inner(
             &mut pending_graphics_cache,
         )?;
     } else if view_state.prompt.is_active() {
-        overlay_cursor_state = cursor_state_before_forced_hide.map(|mut cursor| {
+        overlay_cursor_state = previous_cursor_state.map(|mut cursor| {
             cursor.visible = true;
             cursor
         });
@@ -11680,20 +11628,10 @@ fn render_attach_frame_inner(
         }
     }
 
-    if view_state.help_overlay_open || view_state.prompt.is_active() {
-        if view_state.presentation_only || view_state.presenting {
-            pending_cursor_state = overlay_cursor_state;
-        } else {
-            apply_attach_cursor_state(
-                &mut frame_bytes,
-                overlay_cursor_state,
-                &mut pending_cursor_state,
-                false,
-            )?;
-        }
+    let pending_cursor_state = if view_state.help_overlay_open || view_state.prompt.is_active() {
+        overlay_cursor_state
     } else {
-        let force_cursor_move = std::mem::take(&mut view_state.force_cursor_move_next_frame);
-        let cursor_state = cursor_state.map(|mut cursor| {
+        cursor_state.map(|mut cursor| {
             cursor.visible &= layout_state
                 .scene
                 .surfaces
@@ -11705,37 +11643,16 @@ fn render_attach_frame_inner(
                         .point_visible_from(surface.id, cursor.x, cursor.y)
                 });
             cursor
-        });
-        if view_state.presentation_only || view_state.presenting {
-            pending_cursor_state = cursor_state;
-        } else {
-            apply_attach_cursor_state(
-                &mut frame_bytes,
-                cursor_state,
-                &mut pending_cursor_state,
-                force_cursor_move,
-            )?;
-        }
-    }
+        })
+    };
 
     #[cfg(any(
         feature = "image-sixel",
         feature = "image-kitty",
         feature = "image-iterm2"
     ))]
-    if frame_plan.render_scene
-        && (bmux_attach_pipeline::projection::encoding_terminal() || view_state.presenting)
-    {
-        pending_kitty_state.finish_frame(if view_state.presenting {
-            &mut images_after
-        } else {
-            &mut frame_bytes
-        })?;
-    }
-
-    if frame_plan.use_synchronized_update {
-        queue!(frame_bytes, EndSynchronizedUpdate)
-            .context("failed queuing end synchronized update")?;
+    if frame_plan.render_scene && view_state.presenting {
+        pending_kitty_state.finish_frame(&mut images_after)?;
     }
 
     let composition_ns = frame_started_at.map_or(0, |start| {
@@ -11794,7 +11711,8 @@ fn render_attach_frame_inner(
                 return Ok(());
             }
             bmux_attach_pipeline::terminal::write_frame(
-                terminal_writer.context("terminal output is unavailable for encoded presentation")?,
+                terminal_writer
+                    .context("terminal output is unavailable for encoded presentation")?,
                 bytes,
             )
             .context("failed writing or flushing attach frame")
@@ -18450,17 +18368,18 @@ mod tests {
             DamageCoalescingPolicy::default(),
         );
         assert_eq!(state.plugin_focus.focused(), focused.as_ref());
-        let mut output = Vec::new();
-        for surface in state.retained_compositor.surfaces().values() {
-            queue_retained_render_ops(
-                &mut output,
-                surface,
-                &retained_full_surface_repaint(surface),
-                bmux_plugin::TerminalRenderCapabilities::default(),
-            )
-            .unwrap();
-        }
-        let rendered = String::from_utf8_lossy(&output);
+        let ((), lines) = presented_lines((80, 24), || {
+            for surface in state.retained_compositor.surfaces().values() {
+                queue_retained_render_ops(
+                    &mut Vec::new(),
+                    surface,
+                    &retained_full_surface_repaint(surface),
+                    bmux_plugin::TerminalRenderCapabilities::default(),
+                )
+                .unwrap();
+            }
+        });
+        let rendered = lines.join("\n");
         for label in ["Switch", "Rename", "Close"] {
             assert!(rendered.contains(label), "missing menu label: {label}");
         }
@@ -20284,13 +20203,44 @@ mod tests {
         InputProcessor::new(attach_keymap_from_config(&config), false)
     }
 
+    /// The rows a blank host of `size` shows once `render`'s captured frame is presented on it.
+    fn presented_lines<T>(size: (u16, u16), render: impl FnOnce() -> T) -> (T, Vec<String>) {
+        let (result, operations, graphics) =
+            bmux_attach_pipeline::frame_presenter::capture_frame(render);
+        let mut screen = bmux_terminal_grid::TerminalGridStream::new(
+            size.0,
+            size.1,
+            bmux_terminal_grid::GridLimits::default(),
+        )
+        .unwrap();
+        match bmux_attach_pipeline::frame_presenter::FramePresenter::new().present(
+            &bmux_attach_pipeline::frame_presenter::CapturedFrame {
+                operations: &operations,
+                cursor: None,
+                full: true,
+                size,
+                margins: false,
+                graphics: (&graphics).into(),
+            },
+        ) {
+            bmux_attach_pipeline::frame_presenter::Presented::Frame(bytes) => {
+                screen.process(&bytes);
+            }
+            bmux_attach_pipeline::frame_presenter::Presented::Unchanged => {}
+            bmux_attach_pipeline::frame_presenter::Presented::Unsupported(reason) => {
+                panic!("the frame should be presentable: {reason}")
+            }
+        }
+        let lines = bmux_terminal_grid::visible_text_lines(screen.grid(), 0, usize::from(size.1));
+        (result, lines)
+    }
+
     struct RetainedOverlayExtension;
 
     impl AttachRenderExtension for RetainedOverlayExtension {
         fn name(&self) -> &'static str {
             "test.retained-overlay"
         }
-
 
         fn render_layer_ops_with_context(
             &self,
@@ -20322,17 +20272,18 @@ mod tests {
             )])
             .build();
         let repaint = retained_full_surface_repaint(&surface);
-        let mut output = Vec::new();
 
-        queue_retained_render_ops(
-            &mut output,
-            &surface,
-            &repaint,
-            bmux_plugin::TerminalRenderCapabilities::default(),
-        )
-        .expect("plugin surface render");
+        let ((), lines) = presented_lines((80, 30), || {
+            queue_retained_render_ops(
+                &mut Vec::new(),
+                &surface,
+                &repaint,
+                bmux_plugin::TerminalRenderCapabilities::default(),
+            )
+            .expect("plugin surface render");
+        });
 
-        assert!(String::from_utf8_lossy(&output).contains("tab-1 NORMAL write"));
+        assert!(lines[29].starts_with("tab-1 NORMAL write"), "{lines:#?}");
     }
 
     #[test]
@@ -20344,21 +20295,27 @@ mod tests {
         let repaint = retained_full_surface_repaint(&surface);
         let extensions: Vec<Arc<dyn AttachRenderExtension>> =
             vec![Arc::new(RetainedOverlayExtension)];
-        let mut output = Vec::new();
         let mut graphics_cache = TerminalGraphicsCache::new();
 
-        let wrote = queue_retained_extension_ops(
-            &mut output,
-            &surface,
-            &repaint,
-            &extensions,
-            bmux_plugin::TerminalRenderCapabilities::default(),
-            &mut graphics_cache,
-        )
-        .expect("extension render");
+        let (wrote, lines) = presented_lines((20, 10), || {
+            queue_retained_extension_ops(
+                &mut Vec::new(),
+                &surface,
+                &repaint,
+                &extensions,
+                bmux_plugin::TerminalRenderCapabilities::default(),
+                &mut graphics_cache,
+            )
+            .expect("extension render")
+        });
 
         assert!(wrote);
-        assert_ne!(output, [] as [u8; 0]);
+        // The extension's rounded border frames the surface.
+        let corner = |line: usize, col: usize| lines[line].chars().nth(col);
+        assert_eq!(corner(3, 2), Some('╭'), "{lines:#?}");
+        assert_eq!(corner(3, 13), Some('╮'), "{lines:#?}");
+        assert_eq!(corner(7, 2), Some('╰'), "{lines:#?}");
+        assert_eq!(corner(7, 13), Some('╯'), "{lines:#?}");
     }
 
     #[test]
@@ -23060,7 +23017,6 @@ mod tests {
     fn protocol_only_output_marks_full_redraw_on_alt_screen_toggle() {
         let mut view_state = attach_view_state_with_scrollback_fixture();
         view_state.dirty.full_pane_redraw = false;
-        view_state.force_cursor_move_next_frame = false;
 
         let pane_id = view_state
             .cached_layout_state
@@ -23094,7 +23050,6 @@ mod tests {
         ));
         assert!(!view_state.dirty.pane_dirty_ids.contains(&pane_id));
         assert!(view_state.dirty.full_pane_redraw);
-        assert!(view_state.force_cursor_move_next_frame);
 
         let buffer = view_state
             .pane_buffers
@@ -24509,7 +24464,7 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     fn attach_mouse_forward_honors_render_extension_content_rect() {
         use bmux_plugin::{AttachRenderExtension, ExtensionRect};
-        
+
         use std::sync::Arc;
 
         // Test-only render extension that reports a fixed
@@ -24524,7 +24479,6 @@ mod tests {
             fn name(&self) -> &str {
                 "test.fixed_inset"
             }
-
 
             fn content_rect_override(&self, surface_id: Uuid) -> Option<ExtensionRect> {
                 if surface_id == self.surface_id {

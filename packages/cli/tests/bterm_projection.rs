@@ -14,21 +14,13 @@ fn fill() -> PaintOperation {
 }
 
 #[test]
-fn neutral_capture_preserves_operations_without_enabling_terminal_encoding() {
-    assert!(projection::encoding_terminal());
-    let (value, neutral) = projection::capture_neutral(|| {
-        assert!(!projection::encoding_terminal());
+fn capture_records_operations_and_returns_the_value() {
+    let (value, operations) = projection::capture_neutral(|| {
         projection::record(fill());
         42
     });
-    let (_, terminal) = projection::capture(|| {
-        assert!(projection::encoding_terminal());
-        projection::record(fill());
-    });
     assert_eq!(value, 42);
-    assert_eq!(neutral, terminal);
-    assert_eq!(neutral, vec![fill()]);
-    assert!(projection::encoding_terminal());
+    assert_eq!(operations, vec![fill()]);
     assert!(!projection::capturing());
 }
 
@@ -41,30 +33,26 @@ fn unwind_does_not_poison_the_next_output_capture() {
         });
     });
     assert!(failure.is_err());
-    assert!(projection::encoding_terminal());
     assert!(!projection::capturing());
     let (_, operations) = projection::capture_neutral(|| projection::record(fill()));
     assert_eq!(operations, vec![fill()]);
 }
 
 #[test]
-fn rejected_nested_capture_preserves_outer_capture_and_encoding_mode() {
+fn rejected_nested_capture_preserves_outer_capture() {
     let (_, operations) = projection::capture_neutral(|| {
         projection::record(fill());
         assert!(std::panic::catch_unwind(|| projection::capture_neutral(|| ())).is_err());
         assert!(projection::capturing());
-        assert!(!projection::encoding_terminal());
         projection::record(fill());
     });
     assert_eq!(operations, vec![fill(), fill()]);
-    assert!(projection::encoding_terminal());
 }
 
 #[test]
 fn capture_scope_does_not_leak_to_another_composition_thread() {
     let (_, operations) = projection::capture_neutral(|| {
         std::thread::spawn(|| {
-            assert!(projection::encoding_terminal());
             assert!(!projection::capturing());
             projection::record(PaintOperation::Unsupported);
             let (_, other) = projection::capture_neutral(|| projection::record(fill()));

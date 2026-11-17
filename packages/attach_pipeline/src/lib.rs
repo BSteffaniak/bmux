@@ -3,7 +3,6 @@
 #![allow(clippy::multiple_crate_versions)]
 
 pub mod compositor;
-pub mod cursor;
 pub mod frame_presenter;
 pub mod host_writer;
 pub mod mouse;
