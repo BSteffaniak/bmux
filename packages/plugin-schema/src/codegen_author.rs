@@ -448,10 +448,25 @@ impl<'a> Author<'a> {
         }
         let _ = writeln!(
             out,
-            "            fn dispatch_checked<'a>(&'a self, operation: &'a str, payload: &'a [u8], stream: Option<{SDK}::typed_dispatch::ServiceStreamContext>) -> ::std::pin::Pin<Box<dyn ::std::future::Future<Output = {SDK}::Result<Vec<u8>>> + Send + 'a>> {{\n                Box::pin(async move {{\n                    let payload = {SDK}::service_contract::decode_for(INTERFACE_ID.as_str(), SERVICE_CONTRACT, payload)?;\n                    let call = self.base.clone();\n                    let failed = |error: {SDK}::author::Error| {SDK}::PluginError::ServiceProtocol {{ details: error.message }};\n                    match operation {{"
+            "            fn dispatch_checked<'a>(&'a self, operation: &'a str, payload: &'a [u8], stream: Option<{SDK}::typed_dispatch::ServiceStreamContext>) -> ::std::pin::Pin<Box<dyn ::std::future::Future<Output = {SDK}::Result<Vec<u8>>> + Send + 'a>> {{\n                Box::pin(async move {{\n                    let payload = {SDK}::service_contract::decode_for(INTERFACE_ID.as_str(), SERVICE_CONTRACT, payload)?;\n                    let call = self.base.clone();\n                    let failed = |error: {SDK}::author::Error| {SDK}::PluginError::ServiceProtocol {{ details: error.message }};"
         );
+        // A single operation is an `if`/`else`: a one-arm `match` trips
+        // `clippy::single_match_else` wherever the output is `include!`d
+        // rather than expanded from a macro.
+        let single = functions.len() == 1;
+        if !single {
+            out.push_str("                    match operation {\n");
+        }
         for function in functions {
-            let _ = writeln!(out, "                        {:?} => {{", function.name);
+            if single {
+                let _ = writeln!(
+                    out,
+                    "                        if operation == {:?} {{",
+                    function.name
+                );
+            } else {
+                let _ = writeln!(out, "                        {:?} => {{", function.name);
+            }
             if function.emits.is_some() {
                 let _ = writeln!(
                     out,
@@ -481,9 +496,14 @@ impl<'a> Author<'a> {
                 "                            Ok({SDK}::service_contract::encode_response(&{SDK}::encode_service_message(&response)?))\n                        }}"
             );
         }
+        let (fallback, close) = if single {
+            ("else", "")
+        } else {
+            ("_ =>", "                    }\n")
+        };
         let _ = writeln!(
             out,
-            "                        _ => {{ let _ = (&call, failed, stream); Err({SDK}::PluginError::ServiceProtocol {{ details: format!(\"unknown service operation: {{operation}}\") }}) }}\n                    }}\n                }})\n            }}\n        }}\n"
+            "                        {fallback} {{ let _ = (&call, failed, stream); Err({SDK}::PluginError::ServiceProtocol {{ details: format!(\"unknown service operation: {{operation}}\") }}) }}\n{close}                }})\n            }}\n        }}\n"
         );
         let _ = writeln!(
             out,

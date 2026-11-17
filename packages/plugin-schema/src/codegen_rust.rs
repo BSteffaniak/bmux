@@ -2202,6 +2202,37 @@ mod tests {
         world counter { provide counter; provide changes capability acme.counter.read; }";
 
     #[test]
+    fn single_operation_portable_dispatch_is_an_if_else() {
+        let rust = emit(
+            &compile(
+                "plugin p version 1; capability READ = p.read; @capability(READ) interface one { query get() -> u32; } world w { provide one; }",
+            )
+            .expect("valid"),
+        );
+        let portable = rust
+            .split("fn dispatch_checked<'a>")
+            .nth(2)
+            .expect("author portable adapter");
+        assert!(portable.contains("if operation == \"get\" {"), "{portable}");
+        assert!(
+            portable.contains("else { let _ = (&call, failed, stream);"),
+            "{portable}"
+        );
+        assert!(!portable.contains("match operation {"), "{portable}");
+
+        let rust = emit(&compile(AUTHOR_SCHEMA).expect("valid"));
+        let portable = rust
+            .split("fn dispatch_checked<'a>")
+            .nth(2)
+            .expect("author portable adapter");
+        assert!(portable.contains("match operation {"), "{portable}");
+        assert!(
+            portable.contains("_ => { let _ = (&call, failed, stream);"),
+            "{portable}"
+        );
+    }
+
+    #[test]
     fn author_provider_traits_are_async_dyn_markers_with_adapters() {
         let rust = emit(&compile(AUTHOR_SCHEMA).expect("valid"));
         // The interface's own `counter` record keeps its name; the trait yields.
