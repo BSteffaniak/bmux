@@ -987,7 +987,7 @@ fn place_graphic_overlay(
         });
         return;
     };
-    canvas.image(std::sync::Arc::new(bmux_tui::image::ImagePlacement {
+    canvas.image(bmux_tui::image::ImagePlacement {
         fit: bmux_tui::image::ImageFit::Stretch,
         allocation: None,
         key: bmux_tui::image::ImageKey::new(format!("{surface_id}:{instance_key}")),
@@ -1005,7 +1005,7 @@ fn place_graphic_overlay(
             graphic.cell_rect.h,
         ),
         lifecycle: bmux_tui::image::ImageLifecycle::Frame,
-    }));
+    });
 }
 
 #[cfg(feature = "image-kitty")]

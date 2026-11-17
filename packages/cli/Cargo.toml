@@ -377,6 +377,7 @@ serde = [
 image-iterm2 = [
     "dep:bmux_image",
     "bmux_image/iterm2",
+    "bmux_attach_pipeline/image-iterm2",
     "bmux_decoration_plugin_renderer?/image-iterm2",
     "bmux_pane_runtime_plugin/image-registry",
 ]
@@ -396,6 +397,7 @@ image-protocols = [
 image-sixel = [
     "dep:bmux_image",
     "bmux_image/sixel",
+    "bmux_attach_pipeline/image-sixel",
     "bmux_decoration_plugin_renderer?/image-sixel",
     "bmux_pane_runtime_plugin/image-registry",
 ]

@@ -44,7 +44,9 @@ bmux_bench = { workspace = true }
 [features]
 default = []
 
-image-kitty = ["dep:bmux_image", "bmux_image/kitty"]
+image-iterm2 = ["dep:bmux_image", "bmux_image/iterm2"]
+image-kitty  = ["dep:bmux_image", "bmux_image/kitty"]
+image-sixel  = ["dep:bmux_image", "bmux_image/sixel"]
 
 fail-on-warnings = [
     "bmux_attach_layout_protocol/fail-on-warnings",

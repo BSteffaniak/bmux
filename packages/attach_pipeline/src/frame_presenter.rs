@@ -26,6 +26,9 @@ use crate::projection::ProjectionFailure;
 /// Presents frames through a `bmux_tui` terminal.
 pub struct FramePresenter {
     terminal: Terminal<Vec<u8>>,
+    /// Encodes the terminal's image scene for the host.
+    #[cfg(image_protocols)]
+    images: Images,
     /// A frame was presented since the presenter was made or last forgot: the next frame can be
     /// painted over it rather than over a blank screen.
     shown: bool,
@@ -36,6 +39,86 @@ pub struct FramePresenter {
 impl Default for FramePresenter {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// The host's image protocols and the compositor that writes them: the only encoder of image
+/// protocol bytes, fed the terminal's image scene through its output hooks.
+#[cfg(image_protocols)]
+#[derive(Default)]
+struct Images {
+    compositor: bmux_image::tui::TuiImageCompositor,
+    /// The host's image capabilities and limits; without them, no image is written.
+    host: Option<(
+        bmux_image::host_caps::HostImageCapabilities,
+        bmux_image::ImageConfig,
+    )>,
+}
+
+/// One frame's image output: the compositor it works on once it is written, committed with it.
+#[cfg(image_protocols)]
+struct ImageFrame<'images> {
+    images: &'images Images,
+    staged: RefCell<Option<bmux_image::tui::TuiImageCompositor>>,
+}
+
+#[cfg(image_protocols)]
+impl ImageFrame<'_> {
+    /// Before the frame's cells: clear raster footprints; whether every cell must be repainted.
+    fn prepare_output(&self, writer: &mut Vec<u8>) -> std::io::Result<bool> {
+        if self.images.host.is_none() {
+            return Ok(false);
+        }
+        let mut compositor = self.images.compositor.clone();
+        let repaint = compositor.prepare_output(writer)?;
+        *self.staged.borrow_mut() = Some(compositor);
+        Ok(repaint)
+    }
+
+    /// After the frame's cells: write the image scene, keeping the frame's cursor.
+    fn render(
+        &self,
+        writer: &mut Vec<u8>,
+        scene: &bmux_tui::image_scene::ImageScene,
+        (cols, rows): (u16, u16),
+    ) -> std::io::Result<()> {
+        let mut staged = self.staged.borrow_mut();
+        let (Some((capabilities, config)), Some(compositor)) = (&self.images.host, staged.as_mut())
+        else {
+            return Ok(());
+        };
+        let terminal = bmux_image::compositor::PaneRect {
+            x: 0,
+            y: 0,
+            w: cols,
+            h: rows,
+        };
+        writer.write_all(b"\x1b7")?;
+        compositor
+            .render(writer, scene, terminal, capabilities, config)
+            .map_err(image_output_error)?;
+        writer.write_all(b"\x1b8")
+    }
+}
+
+#[cfg(image_protocols)]
+impl Images {
+    /// Commit a frame's staged compositor when the frame was written, or mark what a failed
+    /// one may have written for repair.
+    fn settle(
+        &mut self,
+        staged: Option<bmux_image::tui::TuiImageCompositor>,
+        written: bool,
+        failed: bool,
+    ) {
+        let Some(staged) = staged else {
+            return;
+        };
+        if written {
+            self.compositor = staged;
+        } else if failed {
+            self.compositor.invalidate_after_failed_output(&staged);
+        }
     }
 }
 
@@ -116,9 +199,28 @@ impl FramePresenter {
         terminal.set_pointer_capability(PointerShapeCapability::Unsupported);
         Self {
             terminal,
+            #[cfg(image_protocols)]
+            images: Images::default(),
             shown: false,
             last: Last::Unknown,
         }
+    }
+
+    /// Select the host's image capabilities and limits: the image scene is written with them.
+    #[cfg(image_protocols)]
+    pub const fn set_image_host(
+        &mut self,
+        capabilities: bmux_image::host_caps::HostImageCapabilities,
+        config: bmux_image::ImageConfig,
+    ) {
+        self.images.host = Some((capabilities, config));
+    }
+
+    /// The image compositor, for host protocol exchanges outside frames (a Kitty shared-memory
+    /// probe and its reply).
+    #[cfg(image_protocols)]
+    pub const fn image_compositor(&mut self) -> &mut bmux_image::tui::TuiImageCompositor {
+        &mut self.images.compositor
     }
 
     /// Select whether frames are wrapped in a synchronized update (DEC mode 2026).
@@ -164,6 +266,12 @@ impl FramePresenter {
             FrameOutput::default()
         });
         let mut result = None;
+        // The image compositor is staged when the frame is written and committed with it.
+        #[cfg(image_protocols)]
+        let images = ImageFrame {
+            images: &self.images,
+            staged: RefCell::new(None),
+        };
         let drawn = self.terminal.try_draw_over_with_output_hooks(
             |cx| {
                 let mut output = output.borrow_mut();
@@ -178,24 +286,55 @@ impl FramePresenter {
                 if let Some(graphics) = output.borrow().graphics() {
                     writer.write_all(&graphics.before)?;
                 }
+                // Raster images leave footprints only a cleared screen and a full repaint remove.
+                #[cfg(image_protocols)]
+                return images.prepare_output(writer);
+                #[cfg(not(image_protocols))]
                 Ok(false)
             },
-            |writer, _, _| {
-                let output = output.borrow();
-                let Some(graphics) = output
+            |writer, scene, _| {
+                // Placing images moves the cursor: keep the frame's.
+                if let Some(graphics) = output
+                    .borrow()
                     .graphics()
                     .filter(|graphics| !graphics.after.is_empty())
-                else {
-                    return Ok(());
-                };
-                // Placing images moves the cursor: keep the frame's.
-                writer.write_all(b"\x1b7")?;
-                writer.write_all(&graphics.after)?;
-                writer.write_all(b"\x1b8")
+                {
+                    writer.write_all(b"\x1b7")?;
+                    writer.write_all(&graphics.after)?;
+                    writer.write_all(b"\x1b8")?;
+                }
+                #[cfg(image_protocols)]
+                images.render(writer, scene, (cols, rows))?;
+                #[cfg(not(image_protocols))]
+                let _ = scene;
+                Ok(())
             },
         );
+        #[cfg(image_protocols)]
+        self.images.settle(
+            images.staged.into_inner(),
+            matches!(drawn, Ok(Some(_))),
+            matches!(drawn, Err(TryDrawError::Io(_))),
+        );
         let mut output = output.into_inner();
-        let presented = match drawn {
+        let presented = self.settle(drawn, &mut output)?;
+        let Some(result) = result else {
+            unreachable!("a frame that was painted returned the render's result");
+        };
+        Ok(PresentedFrame {
+            result,
+            presented,
+            output,
+        })
+    }
+
+    /// What a drawn (or abandoned) frame presented, recording it as the frame shown.
+    fn settle<E>(
+        &mut self,
+        drawn: Result<Option<bmux_tui::terminal::DrawStats>, TryDrawError<Abandoned<E>>>,
+        output: &mut FrameOutput,
+    ) -> Result<Presented, E> {
+        Ok(match drawn {
             Ok(Some(_)) => {
                 self.shown = true;
                 self.last = if self.terminal.last_changes().is_some() {
@@ -226,20 +365,15 @@ impl FramePresenter {
                 self.forget();
                 Presented::Unchanged
             }
-        };
-        let Some(result) = result else {
-            unreachable!("a frame that was painted returned the render's result");
-        };
-        Ok(PresentedFrame {
-            result,
-            presented,
-            output,
         })
     }
 
     /// Forget what was presented, so the next frame repaints in full: after its bytes failed to
     /// reach the host, or after the host was changed some other way.
     pub fn forget(&mut self) {
+        // The host's images are uncertain too: the next frame removes and places them anew.
+        #[cfg(image_protocols)]
+        self.images.compositor.clear();
         self.terminal.reset();
         self.shown = false;
         self.last = Last::Unknown;
@@ -279,6 +413,20 @@ impl FramePresenter {
             (Last::Over, Some(cells), Some(changes)) => ShownChanges::Changed { cells, changes },
             (Last::Full, Some(cells), _) => ShownChanges::All { cells },
             _ => ShownChanges::Unknown,
+        }
+    }
+}
+
+/// An image compositor failure as the output error a terminal hook returns.
+#[cfg(image_protocols)]
+fn image_output_error(error: bmux_image::tui::TuiImageError) -> std::io::Error {
+    match error {
+        bmux_image::tui::TuiImageError::Io(error) => error,
+        bmux_image::tui::TuiImageError::Cancelled => {
+            std::io::Error::new(std::io::ErrorKind::Interrupted, "image output cancelled")
+        }
+        error @ bmux_image::tui::TuiImageError::InvalidPayload { .. } => {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, error)
         }
     }
 }

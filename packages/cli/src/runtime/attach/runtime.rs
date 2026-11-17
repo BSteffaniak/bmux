@@ -5525,6 +5525,18 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
             cell_pixel_height = view_state.host_image_caps.cell_pixel_height,
             "detected host image capabilities"
         );
+        // The presenter's image compositor writes the frame's image scene with these.
+        let images = &attach_config.behavior.images;
+        view_state.terminal_presenter.set_image_host(
+            view_state.host_image_caps.clone(),
+            bmux_image::ImageConfig {
+                enabled: images.enabled,
+                max_image_bytes: usize::try_from(images.max_image_bytes).unwrap_or(usize::MAX),
+                max_images_per_pane: usize::try_from(images.max_images_per_pane)
+                    .unwrap_or(usize::MAX),
+                ..bmux_image::ImageConfig::default()
+            },
+        );
         // Cache the decode mode from config so we don't read config per-frame.
         let img_cfg = attach_config.behavior.images.decode_mode;
         view_state.image_decode_mode = match img_cfg {

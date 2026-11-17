@@ -164,10 +164,23 @@ impl<'canvas, 'frame, 'buffer> Canvas<'canvas, 'frame, 'buffer> {
         self.cx.move_cells(LocalRect::terminal(area), rows);
     }
 
-    /// Place an image, for a client whose host takes no graphics protocol output (one that does
-    /// is written graphics protocol bytes instead).
-    pub fn image(&mut self, placement: Arc<ImagePlacement>) {
-        self.output.images.push(placement);
+    /// Contribute an image to the frame: the terminal's image scene keeps it, the presenter's
+    /// image compositor writes it for the host, and observers mirror it.
+    pub fn image(&mut self, placement: ImagePlacement) {
+        self.output.images.push(Arc::new(placement.clone()));
+        self.cx
+            .push_image(bmux_tui::image::ImageContribution::Present(placement));
+    }
+
+    /// Declare this frame's images its complete image set (see
+    /// [`bmux_tui::paint::PaintCx::declare_images`]).
+    pub const fn declare_images(&mut self) {
+        self.cx.declare_images();
+    }
+
+    /// Occlude images contributed so far by an opaque surface over `area`, leaving cells alone.
+    pub fn occlude_images(&mut self, area: Rect) {
+        self.cx.occlude_images(LocalRect::terminal(area));
     }
 
     /// The frame cannot be shown: the first reason is kept. A pane deferred inside an
