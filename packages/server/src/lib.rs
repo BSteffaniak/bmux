@@ -434,6 +434,56 @@ impl SerializedAdmissionAuthority {
             .map_err(|_| StreamAdmissionError)?
     }
 
+    /// Probe from async host code without parking a runtime worker.
+    ///
+    /// The synchronous [`Self::probe`] blocks its calling thread until a
+    /// helper thread's invocation settles. Called from a kernel request that
+    /// a provider issued from inside one of its own invocations (a listener
+    /// start confirming its admission backend), that blocked worker can be
+    /// the one the provider's probe invocation needs, so the probe stalls
+    /// until its deadline. This dispatches on the current runtime instead,
+    /// under the same capacity bound and deadline.
+    async fn probe_async(
+        &self,
+    ) -> Result<Uuid, bmux_plugin::stream_admission::StreamAdmissionError> {
+        use bmux_plugin::stream_admission::StreamAdmissionError;
+        let state = self.state.upgrade().ok_or(StreamAdmissionError)?;
+        let _permit = Arc::clone(&self.capacity)
+            .try_acquire_owned()
+            .map_err(|_| StreamAdmissionError)?;
+        let payload = self.codec.encode_probe().inspect_err(|error| {
+            tracing::warn!(%error, "stream admission probe encoding failed");
+        })?;
+        let context = ServiceInvokeContext {
+            host_dispatch_context: None,
+            host_internal: true,
+            state: Arc::clone(&state),
+            shutdown_tx: watch::channel(false).0,
+            client_id: ClientId::new(),
+            client_principal_id: Uuid::nil(),
+            caller_plugin_id: None,
+        };
+        let invocation = state
+            .service_registry
+            .lock()
+            .map_err(|_| StreamAdmissionError)?
+            .dispatch(&self.routes.probe, context, payload)
+            .ok_or(StreamAdmissionError)?;
+        let response = tokio::time::timeout(self.deadline, invocation)
+            .await
+            .map_err(|_| StreamAdmissionError)?
+            .map_err(|error| {
+                tracing::warn!(interface = %self.routes.probe.interface_id,
+                    operation = %self.routes.probe.operation, error = %error,
+                    "stream admission provider invocation failed");
+                StreamAdmissionError
+            })?
+            .payload;
+        self.codec.decode_probe(&response).inspect_err(|error| {
+            tracing::warn!(%error, response_len = response.len(), "stream admission probe decoding failed");
+        })
+    }
+
     fn probe(&self) -> Result<Uuid, bmux_plugin::stream_admission::StreamAdmissionError> {
         let payload = self.codec.encode_probe().inspect_err(|error| {
             tracing::warn!(%error, "stream admission probe encoding failed");
@@ -639,7 +689,7 @@ impl ServiceInvokeContext {
     /// Answer stream-metadata kernel requests (admission backend and
     /// current stream provenance) that never reach service dispatch.
     /// `None` when the request is not a stream-metadata request.
-    fn execute_stream_metadata_request(&self, request: &Request) -> Result<Option<Response>> {
+    async fn execute_stream_metadata_request(&self, request: &Request) -> Result<Option<Response>> {
         if matches!(request, Request::StreamAdmissionBackend) {
             let backend = self
                 .state
@@ -647,8 +697,16 @@ impl ServiceInvokeContext {
                 .lock()
                 .map_err(|_| anyhow::anyhow!("admission backend unavailable"))?
                 .clone();
-            let authority_id = backend
-                .and_then(|backend| backend.probe().ok().filter(|id| *id == backend.instance));
+            // The live provider must still answer with the installed
+            // instance; only how the probe waits differs from admission.
+            let authority_id = match backend {
+                Some(backend) => backend
+                    .probe_async()
+                    .await
+                    .ok()
+                    .filter(|id| *id == backend.instance),
+                None => None,
+            };
             return Ok(Some(Response::Ok(
                 ResponsePayload::StreamAdmissionBackend { authority_id },
             )));
@@ -670,7 +728,7 @@ impl ServiceInvokeContext {
     }
 
     async fn execute_request(&self, request: Request) -> Result<Response> {
-        if let Some(response) = self.execute_stream_metadata_request(&request)? {
+        if let Some(response) = self.execute_stream_metadata_request(&request).await? {
             return Ok(response);
         }
         if self.host_dispatch_context.is_some()
