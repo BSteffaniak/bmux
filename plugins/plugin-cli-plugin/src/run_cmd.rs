@@ -71,6 +71,10 @@ pub fn run_run_command(context: &NativeCommandContext) -> Result<i32, String> {
     let response: PluginCliCommandResponse = context
         .plugin_command_run(&request)
         .map_err(|error| format_plugin_command_run_error(&plugin_id, &command_name, &error))?;
+    // The command's typed error is the user's only diagnostic; keep its exit code.
+    if let Some(error) = response.error.as_deref() {
+        eprintln!("{error}");
+    }
     Ok(response.exit_code)
 }
 
