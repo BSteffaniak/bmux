@@ -229,8 +229,10 @@ paints into a bmux_tui presentation:
 * A pane's scroll is captured as a cell move (`PaintCx::move_cells`), which `Terminal` emits as a
   scroll region (one per pane, inside margins where the host has them) and diffs only the cells
   painted besides; pane rows are captured as runs of cells with the widths their grid measured.
-* `BMUX_ATTACH_PRESENTER=terminal` presents frames this way in the attach client; frames with
-  graphics on the host still use the renderer's own bytes (step 7).
+* The attach client presents frames this way by default (`BMUX_ATTACH_PRESENTER=bytes` asks
+  for the renderer's own bytes). A frame holding what a terminal frame cannot show is rendered
+  again at once as the renderer's own bytes, and frames stay on bytes until a full frame holds
+  none of it.
 
 Since then:
 
@@ -241,8 +243,9 @@ Since then:
   formatting machinery, and buffer rows move in bulk.
 * Grid rows carry a changed flag, so the renderer resolves only the rows the grid changed since
   they were drawn, in both paths.
-* Pane images (Kitty, Sixel, iTerm2) are placed through the terminal's output hooks; extension
-  graphic overlays and imperative extensions still fall back to the renderer's own bytes.
+* Pane images (Kitty, Sixel, iTerm2) and extension graphic overlays are placed through the
+  terminal's output hooks; only imperative extensions and rejected projections fall back to the
+  renderer's own bytes.
 
 Instructions per frame at 420x90 (`pipeline_bench_loop` under `/usr/bin/time -l`, which other
 load does not change), and bytes out per byte the application wrote:
@@ -309,10 +312,9 @@ At 420x90, SU scroll, the attach client renders in about 1 ms and writes 12 KB a
 
 Not done:
 
-* Phase 5: the attach client can present through bmux_tui's `Terminal`
-  (`BMUX_ATTACH_PRESENTER=terminal`), at fewer instructions and bytes than the renderer's own
-  output on every corpus, with pane images. Left: extension graphic overlays, making it the
-  default, and deleting the renderer's byte encoding (step 8).
+* Phase 5: the attach client presents through bmux_tui's `Terminal` by default, at fewer
+  instructions and bytes than the renderer's own output on every corpus, with pane images.
+  Left: deleting the renderer's byte encoding (step 8).
 * Output events (`OutputAvailable`) are still JSON-encoded and broadcast; clients that have their
   output pushed ignore them.
 * The end-to-end budget (p95 4 ms) was measured only on a loaded machine; quiet-machine numbers

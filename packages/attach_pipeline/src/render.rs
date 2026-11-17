@@ -1374,17 +1374,43 @@ fn queue_kitty_graphic_overlay<W: io::Write>(
     graphic: &TerminalGraphicOverlay,
     graphics_cache: &mut TerminalGraphicsCache,
     capabilities: TerminalRenderCapabilities,
-    mut resource_stats: Option<&mut TerminalGraphicsResourceStats>,
+    resource_stats: Option<&mut TerminalGraphicsResourceStats>,
 ) -> Result<bool> {
-    if !terminal_graphic_can_render(capabilities) && crate::projection::encoding_terminal() {
+    // Graphics are encoded while encoding the terminal, and also beside captured cells for a
+    // presenter that writes them around its frame; otherwise the capture places them.
+    let encoding = crate::projection::encoding_terminal() || crate::projection::graphics_output();
+    if !terminal_graphic_can_render(capabilities) && encoding {
         return Ok(false);
     }
-    if crate::projection::capturing() {
+    if crate::projection::capturing() && !crate::projection::graphics_output() {
         capture_graphic_overlay(surface_id, instance_key, graphic);
     }
-    if !crate::projection::encoding_terminal() {
+    if !encoding {
         return Ok(true);
     }
+    crate::projection::write_graphics(stdout, false, |stdout| {
+        write_kitty_graphic_overlay(
+            stdout,
+            pane_id,
+            surface_id,
+            instance_key,
+            graphic,
+            graphics_cache,
+            resource_stats,
+        )
+    })
+}
+
+#[cfg(feature = "image-kitty")]
+fn write_kitty_graphic_overlay(
+    stdout: &mut dyn io::Write,
+    pane_id: Uuid,
+    surface_id: Uuid,
+    instance_key: u64,
+    graphic: &TerminalGraphicOverlay,
+    graphics_cache: &mut TerminalGraphicsCache,
+    mut resource_stats: Option<&mut TerminalGraphicsResourceStats>,
+) -> Result<bool> {
     let source = terminal_graphic_source_signature(graphic);
     let placement = terminal_graphic_placement_signature(graphic);
     let host_image_id = terminal_graphic_host_image_id(instance_key);
@@ -1422,7 +1448,8 @@ fn queue_kitty_graphic_overlay<W: io::Write>(
     }
     let needs_place = previous_placement != Some(placement);
     if needs_place {
-        queue!(stdout, MoveTo(graphic.cell_rect.x, graphic.cell_rect.y))
+        let mut writer = &mut *stdout;
+        queue!(&mut writer, MoveTo(graphic.cell_rect.x, graphic.cell_rect.y))
             .context("failed moving cursor for kitty graphic placement")?;
         stdout.write_all(b"\x1b_")?;
         stdout.write_all(&bmux_image::codec::kitty::encode_place_with_z_and_cells(
@@ -1599,7 +1626,7 @@ fn cleanup_stale_terminal_graphics_by_plan<W: io::Write>(
     capabilities: TerminalRenderCapabilities,
     resource_stats: Option<&mut TerminalGraphicsResourceStats>,
 ) -> Result<bool> {
-    if !crate::projection::encoding_terminal() {
+    if !crate::projection::encoding_terminal() && !crate::projection::graphics_output() {
         return Ok(false);
     }
     if plan.is_empty() {
@@ -1608,13 +1635,16 @@ fn cleanup_stale_terminal_graphics_by_plan<W: io::Write>(
     match plan.policy {
         #[cfg(feature = "image-kitty")]
         TerminalGraphicsStaleCleanupPolicy::DeleteKittyPlacementAndImageSource => {
-            cleanup_stale_kitty_graphics(
-                stdout,
-                &plan.stale,
-                graphics_cache,
-                capabilities,
-                resource_stats,
-            )
+            // Removals go before a presented frame's cells, as they go before its text here.
+            crate::projection::write_graphics(stdout, true, |stdout| {
+                cleanup_stale_kitty_graphics(
+                    stdout,
+                    &plan.stale,
+                    graphics_cache,
+                    capabilities,
+                    resource_stats,
+                )
+            })
         }
         #[cfg(not(feature = "image-kitty"))]
         TerminalGraphicsStaleCleanupPolicy::DropCacheOnly => {
@@ -1628,8 +1658,8 @@ fn cleanup_stale_terminal_graphics_by_plan<W: io::Write>(
 }
 
 #[cfg(feature = "image-kitty")]
-fn cleanup_stale_kitty_graphics<W: io::Write>(
-    stdout: &mut W,
+fn cleanup_stale_kitty_graphics(
+    stdout: &mut dyn io::Write,
     stale: &[(u64, u32)],
     graphics_cache: &mut TerminalGraphicsCache,
     _capabilities: TerminalRenderCapabilities,
@@ -8225,6 +8255,49 @@ mod tests {
         assert!(removed.contains("Ga=d,d=i,"), "{removed:?}");
         assert!(removed.contains("Ga=d,d=i,"), "{removed:?}");
         assert_eq!(removed_stats.terminal_graphic_deletes, 1);
+        assert!(cache.is_empty());
+    }
+
+    #[cfg(feature = "image-kitty")]
+    #[test]
+    fn captured_frames_write_graphics_around_their_cells_instead_of_capturing_them() {
+        let state = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut cache = TerminalGraphicsCache::new();
+        let pane_id = Uuid::from_u128(7_777);
+        let mut pane_buffers = BTreeMap::from([(pane_id, PaneRenderBuffer::default())]);
+        let mut frame = |damage: &FrameDamage| {
+            crate::projection::capture_neutral(|| {
+                crate::projection::with_graphics_output(|| {
+                    let (cells, _) = render_retained_graphic_frame(
+                        &state,
+                        &mut cache,
+                        &mut pane_buffers,
+                        damage,
+                    );
+                    (cells, crate::projection::take_graphics_output())
+                })
+            })
+        };
+        let ((cells, placed), operations) = frame(&FrameDamage::full_frame());
+        let after = String::from_utf8_lossy(&placed.after);
+        assert!(after.contains("Ga=t,"), "{after:?}");
+        assert!(after.contains("Ga=p,"), "{after:?}");
+        assert_eq!(String::from_utf8_lossy(&placed.before), "");
+        assert!(!cells.contains("\u{1b}_G"), "{cells:?}");
+        assert!(
+            !operations.iter().any(|operation| matches!(
+                operation,
+                crate::projection::PaintOperation::Image(_)
+                    | crate::projection::PaintOperation::Rejected(_)
+            )),
+            "{operations:?}"
+        );
+
+        state.store(2, std::sync::atomic::Ordering::Relaxed);
+        let ((_, removed), _) = frame(&FrameDamage::default());
+        let before = String::from_utf8_lossy(&removed.before);
+        assert!(before.contains("Ga=d,d=i,"), "{before:?}");
+        assert_eq!(String::from_utf8_lossy(&removed.after), "");
         assert!(cache.is_empty());
     }
 

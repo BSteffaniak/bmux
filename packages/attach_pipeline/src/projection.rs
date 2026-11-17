@@ -125,6 +125,103 @@ pub fn encoding_terminal() -> bool {
     ENCODE_TERMINAL.with(std::cell::Cell::get)
 }
 
+/// Graphics protocol bytes of a frame whose cells are captured, not encoded: removals, written
+/// before the frame's cells, and transmissions and placements, written after them.
+#[derive(Debug, Default)]
+pub struct GraphicsOutput {
+    pub before: Vec<u8>,
+    pub after: Vec<u8>,
+}
+
+thread_local! {
+    static GRAPHICS_OUTPUT: RefCell<Option<GraphicsOutput>> = const { RefCell::new(None) };
+}
+
+/// Run `run` with graphics protocol output encoded into a [`GraphicsOutput`].
+///
+/// Cells are captured meanwhile: a presenter that shows them writes these bytes around them, so
+/// graphics need no captured placement of their own.
+///
+/// # Panics
+/// Panics if called inside another graphics output scope.
+pub fn with_graphics_output<T>(run: impl FnOnce() -> T) -> T {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            GRAPHICS_OUTPUT.with(|slot| slot.borrow_mut().take());
+        }
+    }
+    GRAPHICS_OUTPUT.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        assert!(slot.is_none(), "nested graphics output");
+        *slot = Some(GraphicsOutput::default());
+    });
+    let reset = Reset;
+    let result = run();
+    drop(reset);
+    result
+}
+
+/// Whether graphics protocol output is encoded into a [`GraphicsOutput`] scope.
+#[must_use]
+pub fn graphics_output() -> bool {
+    GRAPHICS_OUTPUT.with(|slot| slot.borrow().is_some())
+}
+
+/// Write graphics protocol bytes: into `stdout` while encoding the terminal, otherwise into the
+/// open [`GraphicsOutput`] (`before` the frame's cells or after them), otherwise nowhere.
+///
+/// # Errors
+/// Returns what `write` returns.
+pub fn write_graphics<W: std::io::Write + ?Sized, T: Default>(
+    stdout: &mut W,
+    before: bool,
+    write: impl FnOnce(&mut dyn std::io::Write) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    if encoding_terminal() {
+        return write(&mut StdoutRef(stdout));
+    }
+    GRAPHICS_OUTPUT.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let Some(output) = slot.as_mut() else {
+            return Ok(T::default());
+        };
+        write(if before {
+            &mut output.before
+        } else {
+            &mut output.after
+        })
+    })
+}
+
+/// Take the graphics bytes written so far in the open [`GraphicsOutput`] scope.
+#[must_use]
+pub fn take_graphics_output() -> GraphicsOutput {
+    GRAPHICS_OUTPUT.with(|slot| {
+        slot.borrow_mut()
+            .as_mut()
+            .map(std::mem::take)
+            .unwrap_or_default()
+    })
+}
+
+/// A sized writer over an unsized one, to pass as `&mut dyn Write`.
+struct StdoutRef<'writer, W: ?Sized>(&'writer mut W);
+
+impl<W: std::io::Write + ?Sized> std::io::Write for StdoutRef<'_, W> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.write(bytes)
+    }
+
+    fn write_all(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        self.0.write_all(bytes)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.flush()
+    }
+}
+
 /// Run the same lowering plans without invoking terminal encoders.
 ///
 /// # Panics

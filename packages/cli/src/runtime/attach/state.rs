@@ -258,7 +258,7 @@ pub struct AttachViewState {
     /// Opt-in end-to-end latency log for replayed frames.
     pub(super) replay_log: super::replay_log::ReplayLog,
     /// Present frames on the host through a `bmux_tui` terminal from what the renderer captures,
-    /// instead of the renderer's own bytes (`BMUX_ATTACH_PRESENTER=terminal`).
+    /// instead of the renderer's own bytes; `None` with `BMUX_ATTACH_PRESENTER=bytes`.
     pub(super) terminal_presenter: Option<bmux_tui::terminal::Terminal<Vec<u8>>>,
     /// The frame being rendered is presented through `terminal_presenter`.
     pub(super) presenting: bool,
@@ -681,12 +681,14 @@ impl AttachViewState {
     // per-view resource isolation, not orchestration to split apart.
     #[allow(clippy::too_many_lines)]
     pub fn new(attach_info: bmux_client::AttachOpenInfo) -> Self {
+        let terminal_presenter = super::presenter::from_env();
         Self {
             output_push: OutputPush::default(),
             producer_barriers_changed: false,
             replay_log: super::replay_log::ReplayLog::from_env(),
-            terminal_presenter: super::presenter::from_env(),
-            presenting: false,
+            // The first frame repaints everything anyway: no need to force it.
+            presenting: terminal_presenter.is_some(),
+            terminal_presenter,
             presenter_paused: false,
             prepared_extensions: None,
             presentation_only: false,
