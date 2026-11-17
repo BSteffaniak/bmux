@@ -2736,7 +2736,7 @@ mod tests {
         (0..width)
             .filter_map(|x| {
                 let cell = buffer.get(Point::new(x, 0))?;
-                (!cell.is_wide_continuation()).then(|| (x, cell.symbol.clone()))
+                (!cell.is_wide_continuation()).then(|| (x, cell.symbol.to_string()))
             })
             .collect()
     }

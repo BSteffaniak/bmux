@@ -894,7 +894,7 @@ mod tests {
                     frame
                         .buffer()
                         .get(Point::new(x, area.y))
-                        .map(|cell| cell.symbol.clone())
+                        .map(|cell| cell.symbol.to_string())
                         .unwrap_or_default()
                 })
                 .collect();

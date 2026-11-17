@@ -84,7 +84,7 @@ fn column(component: &impl Component, tree: &LayoutNode, x: u16) -> Vec<(String,
     (0..height)
         .map(|y| {
             let cell = frame.buffer().get(Point::new(x, y)).expect("cell");
-            (cell.symbol.clone(), cell.style)
+            (cell.symbol.to_string(), cell.style)
         })
         .collect()
 }

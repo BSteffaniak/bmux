@@ -48,7 +48,7 @@ fn symbol(buffer: &Buffer, column: usize, row: usize) -> String {
             u16::try_from(column).unwrap(),
             u16::try_from(row).unwrap(),
         ))
-        .map(|cell| cell.symbol.clone())
+        .map(|cell| cell.symbol.to_string())
         .unwrap_or_default()
 }
 

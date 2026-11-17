@@ -11,17 +11,18 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::geometry::{Point, Rect, Size};
 use crate::style::Style;
+use crate::symbol::Symbol;
 use crate::text::Line;
 
 /// One render-buffer cell.
 ///
-/// Setters reuse the symbol's allocation, so repainting a buffer in place does
-/// not allocate per cell.
+/// Its symbol is stored inline unless it is unusually long, so comparing, copying and
+/// repainting cells allocates nothing and follows no pointers.
 #[derive(Debug, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Cell {
     /// Cell symbol.
-    pub symbol: String,
+    pub symbol: Symbol,
     /// Cell style.
     pub style: Style,
     width: u8,
@@ -35,10 +36,7 @@ impl PartialEq for Cell {
         self.style == other.style
             && self.width == other.width
             && self.wide_continuation == other.wide_continuation
-            && match (self.symbol.as_bytes(), other.symbol.as_bytes()) {
-                ([left], [right]) => left == right,
-                (left, right) => left == right,
-            }
+            && self.symbol == other.symbol
     }
 }
 
@@ -63,7 +61,7 @@ impl Clone for Cell {
 impl Default for Cell {
     fn default() -> Self {
         Self {
-            symbol: " ".to_owned(),
+            symbol: Symbol::SPACE,
             style: Style::new(),
             width: 1,
             wide_continuation: false,
@@ -77,16 +75,11 @@ impl Cell {
     /// Control-containing symbols become a visible replacement character. Parse ANSI
     /// into styled text before constructing cells when terminal styling is intended.
     #[must_use]
-    pub fn new(symbol: impl Into<String>, style: Style) -> Self {
-        let symbol = symbol.into();
-        let symbol = if is_safe_symbol(&symbol) {
-            symbol
-        } else {
-            REPLACEMENT.to_owned()
-        };
+    pub fn new(symbol: impl AsRef<str>, style: Style) -> Self {
+        let symbol = safe_symbol(symbol.as_ref());
         Self {
-            width: u8::try_from(grapheme_width(&symbol).max(1)).unwrap_or(2),
-            symbol,
+            width: u8::try_from(grapheme_width(symbol).max(1)).unwrap_or(2),
+            symbol: Symbol::new(symbol),
             style,
             wide_continuation: false,
         }
@@ -102,12 +95,10 @@ impl Cell {
         );
     }
 
-    /// Install an already sanitized symbol of known width, reusing the
-    /// symbol's allocation.
+    /// Install an already sanitized symbol of known width.
     fn assign(&mut self, symbol: &str, width: u8, style: Style) {
         if self.symbol != symbol {
-            self.symbol.clear();
-            self.symbol.push_str(symbol);
+            self.symbol.set(symbol);
         }
         self.style = style;
         self.width = width;
@@ -137,7 +128,7 @@ impl Cell {
     }
 
     fn set_continuation(&mut self, style: Style) {
-        self.symbol.clear();
+        self.symbol = Symbol::EMPTY;
         self.style = style;
         self.width = 0;
         self.wide_continuation = true;

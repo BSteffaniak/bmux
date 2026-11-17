@@ -45,6 +45,7 @@ pub mod semantic;
 pub mod sensitive_input;
 pub mod source_map;
 pub mod style;
+pub mod symbol;
 pub mod terminal;
 #[cfg(test)]
 mod terminal_bench;

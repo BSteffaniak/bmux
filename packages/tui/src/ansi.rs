@@ -1378,7 +1378,7 @@ mod tests {
         for payload in ["\x1b[2J", "\x1b]0;injected\x07", "\r\n", "\t", "\u{9b}2J"] {
             let previous = Buffer::empty(Rect::new(0, 0, 8, 1));
             let mut current = previous.clone();
-            current.get_mut(Point::new(0, 0)).unwrap().symbol = payload.to_owned();
+            current.get_mut(Point::new(0, 0)).unwrap().symbol = payload.into();
             current.set_cell(Point::new(1, 0), "X", Style::new());
             let mut output = Vec::new();
             let mut style = Style::new();

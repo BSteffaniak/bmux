@@ -180,7 +180,7 @@ impl MirrorFrame {
             .cells()
             .iter()
             .map(|cell| WireCell {
-                symbol: cell.symbol.clone(),
+                symbol: cell.symbol.to_string(),
                 width: cell.width(),
                 continuation: cell.is_wide_continuation(),
                 fg: cell.style.fg.map(color),

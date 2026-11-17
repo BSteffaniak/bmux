@@ -997,7 +997,7 @@ impl<'a> FrameView<'a> {
                     start: x,
                     width: 1,
                     style: cell.style,
-                    text: cell.symbol.clone(),
+                    text: cell.symbol.to_string(),
                 }),
             }
         }
