@@ -6,6 +6,7 @@
 
 pub mod background;
 pub mod identity;
+pub mod rt;
 pub mod scope;
 pub use identity::{
     PluginActivationId, PluginInstanceId, PluginResourceId, PluginRuntimeScopeId,
