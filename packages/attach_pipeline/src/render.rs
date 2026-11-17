@@ -7468,7 +7468,7 @@ mod tests {
         assert!(result.unwrap());
         let mut projected = Buffer::empty(area);
         let mut frame = Frame::new(&mut projected);
-        crate::projection::paint(&mut PaintCx::new(&mut frame), &operations)
+        crate::projection::paint_over(&mut PaintCx::new(&mut frame), &operations)
             .expect("paint projected fixture");
         for y in area.y..area.bottom() {
             assert_eq!(projected.row_symbols(y), source.row_symbols(y), "row {y}");

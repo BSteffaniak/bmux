@@ -513,7 +513,7 @@ impl<W: Write> Terminal<W> {
 
     /// Return the last successfully committed cell buffer, if one exists.
     #[must_use]
-    pub const fn retained_buffer(&self) -> Option<&Buffer> {
+    pub fn retained_buffer(&self) -> Option<&Buffer> {
         self.state.retained_buffer()
     }
 
@@ -1342,12 +1342,12 @@ mod tests {
             terminal.set_synchronized_output(synchronized);
             terminal
                 .draw(|cx| {
-                    cx.write_line(LocalRect::new(0, 0, 4, 1), &crate::text::Line::raw("full"))
+                    cx.write_line(LocalRect::new(0, 0, 4, 1), &crate::text::Line::raw("full"));
                 })
                 .unwrap();
             terminal
                 .draw_over(|cx| {
-                    cx.write_line(LocalRect::new(0, 1, 4, 1), &crate::text::Line::raw("over"))
+                    cx.write_line(LocalRect::new(0, 1, 4, 1), &crate::text::Line::raw("over"));
                 })
                 .unwrap();
             let output = String::from_utf8_lossy(terminal.writer()).into_owned();

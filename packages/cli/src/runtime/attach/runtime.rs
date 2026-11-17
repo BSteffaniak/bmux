@@ -10969,14 +10969,18 @@ fn finish_presented_scroll_tracking(view: &mut AttachViewState) {
     });
 }
 
+/// An observed frame waits for every visible pane's synchronized update to finish, so an
+/// observer never sees one half drawn; an update left open past its bound stops holding it, as
+/// it stops holding the pane back on the host.
 fn retained_frame_sync_pending(view: &AttachViewState, layout: &AttachLayoutState) -> bool {
+    let now = Instant::now();
     (view.observer.is_some() || view.presentation_only)
         && layout.scene.surfaces.iter().any(|surface| {
             surface.visible
                 && surface.pane_id.is_some_and(|id| {
                     view.pane_buffers
                         .get(&id)
-                        .is_some_and(|buffer| buffer.sync_update_in_progress)
+                        .is_some_and(|buffer| buffer.sync_update_deferring(now))
                 })
         })
 }
@@ -18794,6 +18798,51 @@ mod tests {
             .is_ok()
         );
         assert!(Arc::ptr_eq(&committed, &output.latest().unwrap()));
+    }
+
+    /// A synchronized update left open past its bound stops holding an observed frame back, as
+    /// it stops holding the pane back on the host: an application that never closes one cannot
+    /// freeze the client.
+    #[test]
+    fn an_observed_frame_is_not_held_by_an_update_left_open_past_its_bound() {
+        for headless in [false, true] {
+            let session_id = Uuid::new_v4();
+            let pane_id = Uuid::new_v4();
+            let mut state = AttachViewState::with_private_presentation(AttachOpenInfo {
+                context_id: None,
+                session_id,
+                can_write: true,
+            });
+            let layout = retry_test_layout(&mut state, pane_id, session_id);
+            state.presentation_extensions = Arc::new(bmux_plugin::RenderExtensionRegistry::new());
+            state.presentation_only = headless;
+            let (publisher, observer) = super::super::observer::attach_observer_channel();
+            state.set_observer(publisher);
+            let buffer = state.pane_buffers.get_mut(&pane_id).unwrap();
+            buffer.sync_update_in_progress = true;
+            buffer.sync_update_since = Some(Instant::now());
+            render_observed_test_frame(&mut state, &layout);
+            assert!(
+                observer.latest().is_none(),
+                "held while the update is fresh"
+            );
+            state
+                .pane_buffers
+                .get_mut(&pane_id)
+                .unwrap()
+                .sync_update_since =
+                Instant::now().checked_sub(bmux_attach_pipeline::types::SYNC_UPDATE_TIMEOUT * 2);
+            render_observed_test_frame(&mut state, &layout);
+            let frame = observer.latest().expect("published once the bound passed");
+            assert!(
+                frame
+                    .prepared
+                    .buffer()
+                    .row_symbols(0)
+                    .unwrap()
+                    .contains("retry-visible-content")
+            );
+        }
     }
 
     #[test]

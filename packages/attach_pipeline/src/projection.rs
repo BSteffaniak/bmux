@@ -395,36 +395,25 @@ pub fn capturing() -> bool {
     CAPTURE.with(|slot| slot.borrow().is_some())
 }
 
-/// Replay uniform output, rejecting local grids before painting anything.
-/// # Errors
-/// Returns unsupported for local-grid output; use `paint_with_grid_fragments`.
-pub fn paint(
-    cx: &mut PaintCx<'_, '_>,
-    operations: &[PaintOperation],
-) -> Result<(), ProjectionFailure> {
-    if operations
-        .iter()
-        .any(|operation| matches!(operation, PaintOperation::Grid(_)))
-    {
-        return Err(ProjectionFailure::Unsupported {
-            reason: "backend requires uniform grid",
-        });
-    }
-    paint_with_grid_fragments(cx, operations).map(|_| ())
-}
-
-/// Replay root operations and return retained grids for bounded frame admission.
+/// Paint captured operations over the frame a terminal shows, as their terminal output would
+/// change it, and return the local grids among them for the caller to install.
 ///
-/// The caller must install the returned grids with `set_grid_fragments` before
-/// output; silently discarding them is not a supported backend fallback.
+/// Each text run replaces the cells it covers with exactly its style: colors it leaves unset
+/// are the terminal's defaults, as the reset before every run makes them. A pane deferred
+/// inside an unfinished synchronized update keeps what it showed. Images are contributed to
+/// the frame. The host terminal and an observer paint the same operations with this, so they
+/// show the same cells.
+///
 /// # Errors
-/// Returns captured rejection before painting anything.
-pub fn paint_with_grid_fragments(
+/// Returns the first rejection other than a deferred pane, or legacy imperative output, before
+/// painting anything.
+pub fn paint_frame(
     cx: &mut PaintCx<'_, '_>,
     operations: &[PaintOperation],
 ) -> Result<Vec<bmux_tui::presentation::PreparedGridFragment>, ProjectionFailure> {
     for operation in operations {
         match operation {
+            PaintOperation::Rejected(ProjectionFailure::Deferred { .. }) => {}
             PaintOperation::Rejected(reason) => return Err(reason.clone()),
             PaintOperation::Unsupported => {
                 return Err(ProjectionFailure::Unsupported {
@@ -435,73 +424,6 @@ pub fn paint_with_grid_fragments(
         }
     }
     let mut fragments = Vec::new();
-    for operation in operations {
-        match operation {
-            PaintOperation::Grid(fragment) => fragments.push(fragment.as_ref().clone()),
-            PaintOperation::Unsupported | PaintOperation::Rejected(_) => {}
-            PaintOperation::Image(image) => {
-                cx.push_image(bmux_tui::image::ImageContribution::Present(
-                    image.as_ref().clone(),
-                ));
-            }
-            PaintOperation::Text { x, y, text, style } => {
-                let width = bmux_plugin::render_text_width_u16(text);
-                cx.write_line(
-                    LocalRect::new(i32::from(*x), i64::from(*y), width, 1),
-                    &Line::from_spans(vec![Span::styled(text.clone(), *style)]),
-                );
-            }
-            PaintOperation::Fill { rect, style } => {
-                cx.fill(LocalRect::terminal(*rect), " ", *style);
-            }
-            PaintOperation::Scroll { area, rows } => {
-                cx.move_cells(LocalRect::terminal(*area), *rows);
-            }
-            PaintOperation::Cells { x, y, text, cells } => paint_cells(cx, *x, *y, text, cells),
-        }
-    }
-    Ok(fragments)
-}
-
-/// Paint captured operations over the frame a terminal shows, as their terminal output would
-/// change it.
-///
-/// Each text run replaces the cells it covers with exactly its style: colors it leaves unset
-/// are the terminal's defaults, as the reset before every run makes them. A pane deferred
-/// inside an unfinished synchronized update keeps what it showed.
-///
-/// # Errors
-/// Returns the first operation a terminal frame cannot show: a local grid, an image, a
-/// rejection other than a deferred pane, or legacy imperative output.
-pub fn paint_over(
-    cx: &mut PaintCx<'_, '_>,
-    operations: &[PaintOperation],
-) -> Result<(), ProjectionFailure> {
-    for operation in operations {
-        match operation {
-            PaintOperation::Rejected(ProjectionFailure::Deferred { .. })
-            | PaintOperation::Text { .. }
-            | PaintOperation::Fill { .. }
-            | PaintOperation::Scroll { .. }
-            | PaintOperation::Cells { .. } => {}
-            PaintOperation::Rejected(reason) => return Err(reason.clone()),
-            PaintOperation::Unsupported => {
-                return Err(ProjectionFailure::Unsupported {
-                    reason: "legacy imperative capture",
-                });
-            }
-            PaintOperation::Grid(_) => {
-                return Err(ProjectionFailure::Unsupported {
-                    reason: "terminal frames have no local grids",
-                });
-            }
-            PaintOperation::Image(_) => {
-                return Err(ProjectionFailure::Unsupported {
-                    reason: "terminal frames do not place images yet",
-                });
-            }
-        }
-    }
     let explicit = |color: Option<Color>| Some(color.unwrap_or(Color::Default));
     for operation in operations {
         match operation {
@@ -554,13 +476,43 @@ pub fn paint_over(
                 cx.move_cells(LocalRect::terminal(*area), *rows);
             }
             PaintOperation::Cells { x, y, text, cells } => paint_cells(cx, *x, *y, text, cells),
-            PaintOperation::Rejected(_)
-            | PaintOperation::Unsupported
-            | PaintOperation::Grid(_)
-            | PaintOperation::Image(_) => {}
+            PaintOperation::Grid(fragment) => fragments.push(fragment.as_ref().clone()),
+            PaintOperation::Image(image) => {
+                cx.push_image(bmux_tui::image::ImageContribution::Present(
+                    image.as_ref().clone(),
+                ));
+            }
+            PaintOperation::Rejected(_) | PaintOperation::Unsupported => {}
         }
     }
-    Ok(())
+    Ok(fragments)
+}
+
+/// [`paint_frame`] for a terminal frame, which has no local grids and places no images.
+///
+/// # Errors
+/// Returns the first operation a terminal frame cannot show: a local grid, an image, a
+/// rejection other than a deferred pane, or legacy imperative output.
+pub fn paint_over(
+    cx: &mut PaintCx<'_, '_>,
+    operations: &[PaintOperation],
+) -> Result<(), ProjectionFailure> {
+    for operation in operations {
+        match operation {
+            PaintOperation::Grid(_) => {
+                return Err(ProjectionFailure::Unsupported {
+                    reason: "terminal frames have no local grids",
+                });
+            }
+            PaintOperation::Image(_) => {
+                return Err(ProjectionFailure::Unsupported {
+                    reason: "terminal frames do not place images yet",
+                });
+            }
+            _ => {}
+        }
+    }
+    paint_frame(cx, operations).map(|_| ())
 }
 
 /// Lower only original retained paint, never flattened root cells.
@@ -1033,13 +985,10 @@ mod tests {
         state
             .prepare(Damage::Full, |cx| {
                 assert!(matches!(
-                    paint(cx, &operations),
+                    paint_over(cx, &operations),
                     Err(ProjectionFailure::Unsupported { .. })
                 ));
-                assert_eq!(
-                    paint_with_grid_fragments(cx, &operations).unwrap(),
-                    vec![fragment]
-                );
+                assert_eq!(paint_frame(cx, &operations).unwrap(), vec![fragment]);
             })
             .unwrap();
     }

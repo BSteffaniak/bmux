@@ -129,6 +129,12 @@ struct Replay {
     margins: bool,
     /// Presents captured frames, as the attach client does.
     presenter: bmux_tui::terminal::Terminal<Vec<u8>>,
+    /// Also prepares and publishes each frame as an observed client does.
+    observer: Option<bmux_tui::presentation::PresentationState>,
+    /// Published frames an observer still holds, every other one kept (its cells cannot then be
+    /// reused for the next frame).
+    held: Vec<std::sync::Arc<bmux_tui::presentation::PreparedPresentation>>,
+    hold: bool,
 }
 
 struct Rendered {
@@ -168,6 +174,9 @@ impl Replay {
                     .set_pointer_capability(bmux_tui::pointer::PointerShapeCapability::Unsupported);
                 terminal
             },
+            observer: None,
+            held: Vec::new(),
+            hold: false,
         }
     }
 
@@ -247,7 +256,7 @@ impl Replay {
             )
             .expect("render")
         };
-        let stats = {
+        let (stats, operations) = {
             let terminal = &mut self.presenter;
             terminal.set_scroll_region_acceleration(if self.margins {
                 bmux_tui::terminal::ScrollRegionAcceleration::AutoWithMargins
@@ -270,12 +279,50 @@ impl Replay {
                     u64::from(scroll.region.height).saturating_sub(scroll.rows.unsigned_abs())
                 })
                 .sum();
-            stats
+            (stats, operations)
         };
+        self.observe(&operations);
         Rendered {
             apply: applied,
             render: started.elapsed(),
             stats,
+        }
+    }
+
+    /// Prepare and publish `operations` as an observed client's observer does, when this replay
+    /// has one: repaired over the last frame, with its local grids installed (each staging
+    /// rechecks the frame's limits).
+    fn observe(&mut self, operations: &[crate::projection::PaintOperation]) {
+        let size = self.size;
+        let Some(observer) = &mut self.observer else {
+            return;
+        };
+        observer.resize(bmux_tui::geometry::Rect::new(0, 0, size.0, size.1));
+        let limits = bmux_tui::presentation::PresentationLimits {
+            max_cells: 262_144,
+            max_entries: 262_144,
+            max_bytes: 32 * 1024 * 1024,
+        };
+        let mut grids = None;
+        let mut prepared = observer
+            .prepare_repaired_bounded(limits, |cx| {
+                grids =
+                    Some(crate::projection::paint_frame(cx, operations).expect("observed frame"));
+            })
+            .expect("prepared");
+        prepared
+            .set_grid_fragments(grids.unwrap_or_default(), limits)
+            .expect("grids");
+        let published = observer
+            .present_prepared(Some(prepared), |frame, _| {
+                Ok::<_, ()>(std::hint::black_box(std::sync::Arc::new(frame.clone())))
+            })
+            .expect("published");
+        if self.hold && self.frames.is_multiple_of(2) {
+            self.held.extend(published);
+            if self.held.len() > 2 {
+                self.held.remove(0);
+            }
         }
     }
 
@@ -509,6 +556,38 @@ fn a_terminal_presenting_captured_frames_shows_the_pane_after_every_frame() {
     );
 }
 
+/// An observer paints the frames the host terminal presents into its own published frames: after
+/// every frame both hold the same cells, whether or not the observer still holds earlier frames.
+#[test]
+fn an_observer_shows_the_cells_the_host_terminal_does() {
+    let size = (60, 16);
+    let corpora = corpus::generated(size, 24)
+        .into_iter()
+        .map(|corpus| (corpus.name, corpus.frames))
+        .chain([("scattered-edits", scattered_edits(size, 200))]);
+    for (name, frames) in corpora {
+        for hold in [false, true] {
+            let mut replay = Replay::new(size, true, 97);
+            replay.observer = Some(bmux_tui::presentation::PresentationState::new(
+                bmux_tui::geometry::Rect::new(0, 0, size.0, size.1),
+            ));
+            replay.hold = hold;
+            let mut output = Vec::new();
+            for (index, frame) in frames.iter().enumerate() {
+                output.clear();
+                replay.frame(frame, &mut output);
+                let observed = replay.observer.as_ref().and_then(|o| o.retained_buffer());
+                assert_eq!(
+                    observed,
+                    replay.presenter.retained_buffer(),
+                    "{name} (holding frames {hold}) frame {index}: the observer's cells differ \
+                     from the host's"
+                );
+            }
+        }
+    }
+}
+
 /// The same check over captured corpora (`BMUX_BENCH_CORPUS` at `BMUX_BENCH_SIZE`).
 #[test]
 #[ignore = "checks captured corpora; run explicitly with --ignored"]
@@ -615,7 +694,8 @@ fn pipeline_bench() {
 /// ```
 ///
 /// A corpus named `generated:NAME` is that generated corpus. `BMUX_BENCH_MODE` is `terminal`
-/// (rendered and presented, the default) or `apply` (applying only, to subtract). The first
+/// (rendered and presented, the default), `observed` (presented and also prepared and published
+/// as an observed client does) or `apply` (applying only, to subtract). The first
 /// corpus in `BMUX_BENCH_CORPUS` is played `BMUX_BENCH_ROUNDS` times (5 by default).
 #[test]
 #[ignore = "instruction-count workload; run explicitly"]
@@ -637,6 +717,11 @@ fn pipeline_bench_loop() {
         std::env::var("BMUX_BENCH_ROUNDS").map_or(5, |rounds| rounds.parse().expect("rounds"));
     for _ in 0..rounds {
         let mut replay = Replay::new(size(), true, delivery());
+        if mode == "observed" {
+            replay.observer = Some(bmux_tui::presentation::PresentationState::new(
+                bmux_tui::geometry::Rect::new(0, 0, replay.size.0, replay.size.1),
+            ));
+        }
         let mut output = Vec::new();
         for frame in &frames {
             output.clear();

@@ -580,6 +580,11 @@ fn deliver_prepared_inner(
     use bmux_tui::{image::ImageContribution, presentation::PresentationLimits};
     for op in operations {
         match op {
+            // A pane inside an unfinished synchronized update keeps the cells it showed, here as
+            // on the host.
+            bmux_attach_pipeline::projection::PaintOperation::Rejected(
+                bmux_attach_pipeline::projection::ProjectionFailure::Deferred { .. },
+            ) => {}
             bmux_attach_pipeline::projection::PaintOperation::Rejected(reason) => {
                 anyhow::bail!("{reason}")
             }
@@ -623,7 +628,7 @@ fn deliver_prepared_inner(
     let mut prepared = view
         .presentation
         .prepare_repaired_bounded(limits, |cx| {
-            projected_grids = Some(bmux_attach_pipeline::projection::paint_with_grid_fragments(cx, operations));
+            projected_grids = Some(bmux_attach_pipeline::projection::paint_frame(cx, operations));
             // Root output owns chrome only in winning local-grid clips. Clear
             // retained uniform text there so scale reset/removal cannot expose
             // a second, stale copy of the source below the fragment.

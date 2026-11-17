@@ -12,6 +12,8 @@ pub use crate::grid_fragment::{
 #[cfg(feature = "serde")]
 pub mod portable;
 
+use std::sync::Arc;
+
 use crate::buffer::Buffer;
 use crate::damage::Damage;
 use crate::focus::{FocusScopeId, FocusTrap, ModalFocus, modal_transition};
@@ -157,7 +159,11 @@ pub struct ProjectedMetadata {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreparedPresentation {
     grid_fragments: Vec<PreparedGridFragment>,
-    buffer: Buffer,
+    /// Shared, so a frame handed to an observer and kept as the committed cells is one grid.
+    buffer: Arc<Buffer>,
+    /// The bytes of the cells' text, counted once: a frame is checked against its limits after
+    /// every piece of metadata staged on it, and its cells do not change after preparation.
+    symbol_bytes: SymbolBytes,
     cursor: Option<Cursor>,
     hits: HitMap,
     focus_scope: Option<FocusScopeId>,
@@ -175,7 +181,9 @@ pub struct PreparedPresentation {
     damage: Damage,
     scroll_hints: Vec<(Rect, i64)>,
     moves: Vec<(Rect, i64)>,
-    /// Regions painted (not only moved) in a frame painted over the last one with moves.
+    /// Regions painted (not only moved) in a frame painted over the last one with moves, or in
+    /// a repaired frame (see [`PresentationState::prepare_repaired_bounded`]), whose cells differ
+    /// from the committed ones only by its moves and these regions.
     painted: Option<Vec<Rect>>,
     /// Producer occlusion geometry; visible images are already reconciled.
     occluded_regions: Vec<Rect>,
@@ -456,7 +464,7 @@ impl PreparedPresentation {
 
     /// Complete final cell grid, including retained cells outside damage.
     #[must_use]
-    pub const fn buffer(&self) -> &Buffer {
+    pub fn buffer(&self) -> &Buffer {
         &self.buffer
     }
     /// Cursor to display.
@@ -599,17 +607,13 @@ impl PreparedPresentation {
                         .checked_mul(std::mem::size_of::<crate::buffer::Cell>())
                         .ok_or(PresentationLimitError::Bytes)?,
                 )?;
-                for cell in overlay.buffer().cells() {
-                    add(0, cell.symbol.len())?;
-                }
+                add(0, symbol_bytes(overlay.buffer()))?;
             }
             for image in fragment.images() {
                 add(1, image.key.as_str().len())?;
                 add(0, crate::grid_fragment::image_payload_bytes(&image.payload))?;
             }
-            for cell in fragment.buffer().cells() {
-                add(0, cell.symbol.len())?;
-            }
+            add(0, symbol_bytes(fragment.buffer()))?;
         }
         Ok(())
     }
@@ -655,9 +659,14 @@ impl PreparedPresentation {
         for area in &self.occluded_regions {
             add(1, std::mem::size_of_val(area))?;
         }
-        for cell in self.buffer.cells() {
-            add(0, cell.symbol.len())?;
-        }
+        // One charge for every cell's text: per-cell charging costs more than the frame's paint.
+        add(
+            0,
+            *self
+                .symbol_bytes
+                .0
+                .get_or_init(|| symbol_bytes(&self.buffer)),
+        )?;
         for hit in self.hits.regions() {
             add(1, hit.id.as_str().len())?;
             if let Some(scope) = &hit.focus_scope {
@@ -810,6 +819,26 @@ enum Start {
     Over,
 }
 
+/// A cache of [`symbol_bytes`] for a prepared frame's cells, which are part of its value; the
+/// cache is not.
+#[derive(Debug, Clone, Default)]
+struct SymbolBytes(std::sync::OnceLock<usize>);
+
+impl PartialEq for SymbolBytes {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for SymbolBytes {}
+
+/// The bytes of every cell's text in `buffer`, saturating.
+fn symbol_bytes(buffer: &Buffer) -> usize {
+    buffer.cells().iter().fold(0_usize, |total, cell| {
+        total.saturating_add(cell.symbol.len())
+    })
+}
+
 /// A spare grid and how it differs from the committed cells.
 type Spare = (Buffer, Stale);
 
@@ -861,7 +890,7 @@ impl SpareBuffer {
 pub struct PresentationState {
     grid_fragments: Vec<PreparedGridFragment>,
     area: Rect,
-    previous: Option<Buffer>,
+    previous: Option<Arc<Buffer>>,
     spare: SpareBuffer,
     hits: HitMap,
     focus: FocusTrap,
@@ -950,8 +979,8 @@ impl PresentationState {
 
     /// Last committed cells, unless invalidated by reset or failed output.
     #[must_use]
-    pub const fn retained_buffer(&self) -> Option<&Buffer> {
-        self.previous.as_ref()
+    pub fn retained_buffer(&self) -> Option<&Buffer> {
+        self.previous.as_deref()
     }
     /// Last successfully delivered local grids, including their transforms/clips.
     #[must_use]
@@ -1045,12 +1074,13 @@ impl PresentationState {
         self.previous
             .take()
             .filter(|previous| previous.area() == self.area)
+            .map(|previous| Arc::try_unwrap(previous).unwrap_or_else(|shared| (*shared).clone()))
     }
 
     /// Commit cells painted in place over the committed ones, and the cursor they show; every
     /// other piece of committed state stays as it was.
     pub(crate) fn install_painted_over(&mut self, buffer: Buffer, cursor: Option<Cursor>) {
-        self.previous = Some(buffer);
+        self.previous = Some(Arc::new(buffer));
         self.cursor = cursor;
     }
 
@@ -1061,7 +1091,11 @@ impl PresentationState {
 
     /// Invalidate cells without discarding interaction authority.
     pub fn reset(&mut self) {
-        if let Some(previous) = self.previous.take() {
+        if let Some(previous) = self
+            .previous
+            .take()
+            .and_then(|previous| Arc::try_unwrap(previous).ok())
+        {
             self.spare.put(previous);
         }
     }
@@ -1200,7 +1234,7 @@ impl PresentationState {
         regions: &[Rect],
         written: Option<&WrittenSpans>,
     ) -> Damage {
-        let previous = self.previous.as_ref().filter(|_| damage.is_regional());
+        let previous = self.previous.as_deref().filter(|_| damage.is_regional());
         let retained_regions = previous.map_or_else(
             || regions.to_vec(),
             |previous| buffer.expand_regions_to_cell_spans(previous, regions),
@@ -1254,23 +1288,23 @@ impl PresentationState {
         let over = start == Start::Over && damage.is_regional();
         let in_place = (over
             || (start == Start::Blank && damage.is_regional() && self.modal_focus.is_empty()))
-        .then_some(self.previous.as_ref())
+        .then_some(self.previous.as_deref())
         .flatten();
         let mut buffer = PresentationPhase::BufferAlloc.measure(
             || {
                 let spare = self.spare.take();
                 match (
-                    in_place.or_else(|| repair.then_some(self.previous.as_ref()).flatten()),
+                    in_place.or_else(|| repair.then_some(self.previous.as_deref()).flatten()),
                     spare,
                 ) {
                     (Some(previous), Some((mut spare, Stale::Regions(stale))))
-                        if in_place.is_some() && spare.area() == previous.area() =>
+                        if spare.area() == previous.area() =>
                     {
                         spare.copy_regions_from(previous, &stale);
                         spare
                     }
                     (Some(previous), Some((mut spare, Stale::Moved { moves, painted })))
-                        if in_place.is_some() && spare.area() == previous.area() =>
+                        if spare.area() == previous.area() =>
                     {
                         // Moving rows costs less than copying them.
                         for (area, rows) in moves {
@@ -1315,12 +1349,16 @@ impl PresentationState {
                 for region in &requested_regions {
                     frame.fill(*region, " ", Style::new());
                 }
+            } else if repair {
+                // What the frame paints over the committed cells is all that differs from them,
+                // which the next frame's start needs to know to update the spare grid.
+                frame.track_writes();
             }
             PresentationPhase::Paint.measure(|| render(&mut PaintCx::new(&mut frame)), |()| true);
             written = frame.take_written();
             painted = frame
                 .take_painted()
-                .filter(|_| over && !frame.moves().is_empty())
+                .filter(|_| (over && !frame.moves().is_empty()) || repair)
                 .map(|painted| {
                     painted
                         .spans()
@@ -1484,7 +1522,8 @@ impl PresentationState {
                 let focus = FocusTrap::from_hits(&hits, focus_scope.as_ref(), self.focus.active());
                 Some(PreparedPresentation {
                     grid_fragments: Vec::new(),
-                    buffer,
+                    buffer: Arc::new(buffer),
+                    symbol_bytes: SymbolBytes::default(),
                     cursor,
                     hits,
                     focus_scope,
@@ -1588,9 +1627,10 @@ impl PresentationState {
         let Some(prepared) = prepared else {
             return Ok(None);
         };
-        let result = match PresentationPhase::TerminalOutputTotal
-            .measure(|| output(&prepared, self.previous.as_ref()), Result::is_ok)
-        {
+        let result = match PresentationPhase::TerminalOutputTotal.measure(
+            || output(&prepared, self.previous.as_deref()),
+            Result::is_ok,
+        ) {
             Ok(result) => result,
             Err(error) => {
                 self.reset();
@@ -1603,15 +1643,22 @@ impl PresentationState {
                 // A regional frame changed only its regions, so the retired cells differ from
                 // the new ones only there; a frame that moved cells and painted others differs
                 // by those moves and paints.
+                // A repaired frame is full, but changed only what it moved and painted.
                 let changed = match (&prepared.painted, prepared.damage.is_regional()) {
-                    (Some(painted), true) => Stale::Moved {
+                    (Some(painted), _) => Stale::Moved {
                         moves: prepared.moves.clone(),
                         painted: painted.clone(),
                     },
                     (None, true) => Stale::Regions(prepared.damage.retained_regions().to_vec()),
-                    (_, false) => Stale::Unknown,
+                    (None, false) => Stale::Unknown,
                 };
-                if let Some(retired) = self.previous.replace(prepared.buffer) {
+                // The retired cells are reused only when nothing else (an observer still
+                // holding the frame) shares them.
+                if let Some(retired) = self
+                    .previous
+                    .replace(prepared.buffer)
+                    .and_then(|retired| Arc::try_unwrap(retired).ok())
+                {
                     self.spare.put_spare((retired, changed));
                 }
                 self.hits = prepared.hits;
@@ -2530,6 +2577,65 @@ mod tests {
         );
         assert!(state.hits().hit_test(Point::new(0, 0)).is_none());
         assert!(state.cursor().is_none());
+    }
+
+    /// Repaired frames start from the spare grid brought up to date by the last frame's moves
+    /// and paints, or from a copy of the committed cells while an observer still holds them:
+    /// either way each shows the committed cells with its own operations painted over them.
+    #[test]
+    fn repaired_frames_show_their_operations_over_the_committed_cells() {
+        let area = Rect::new(0, 0, 12, 5);
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = move |bound: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % bound
+        };
+        let limits = PresentationLimits {
+            max_cells: 1024,
+            max_entries: 1024,
+            max_bytes: 1 << 20,
+        };
+        let mut state = PresentationState::new(area);
+        // Frames an observer still holds, with the cells each was published with.
+        let mut held: Vec<(Arc<PreparedPresentation>, Buffer)> = Vec::new();
+        for frame in 0..2_000 {
+            let ops = random_ops(&mut next, area, true);
+            let mut expected = state
+                .retained_buffer()
+                .cloned()
+                .unwrap_or_else(|| Buffer::empty(area));
+            apply_ops(&mut PaintCx::new(&mut Frame::new(&mut expected)), &ops);
+            let prepared = state
+                .prepare_repaired_bounded(limits, |cx| apply_ops(cx, &ops))
+                .unwrap();
+            let published = state
+                .present_prepared(Some(prepared), |prepared, _| {
+                    Ok::<_, ()>(Arc::new(prepared.clone()))
+                })
+                .unwrap();
+            match next(3) {
+                0 => held.extend(published.map(|frame| {
+                    let cells = frame.buffer().clone();
+                    (frame, cells)
+                })),
+                1 => held.clear(),
+                _ => {}
+            }
+            assert_eq!(
+                state.retained_buffer(),
+                Some(&expected),
+                "frame {frame}: {ops:?}"
+            );
+            for (published, cells) in &held {
+                assert_eq!(
+                    published.buffer(),
+                    cells,
+                    "frame {frame}: later frames changed a published one"
+                );
+            }
+        }
     }
 
     #[test]

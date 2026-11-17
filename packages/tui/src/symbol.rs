@@ -78,6 +78,21 @@ impl Symbol {
         }
     }
 
+    /// The text's length in bytes, without making a `&str` of it.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        match &self.0 {
+            Repr::Inline { len, .. } => usize::from(*len),
+            Repr::Heap(text) => text.len(),
+        }
+    }
+
+    /// Whether the text is empty (a wide grapheme's continuation).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     /// Replace the text with `text`, keeping the heap allocation when both are long.
     pub fn set(&mut self, text: &str) {
         if let Repr::Heap(current) = &self.0
@@ -298,6 +313,7 @@ mod tests {
         ] {
             let symbol = Symbol::new(text);
             assert_eq!(symbol.as_str(), text);
+            assert_eq!(symbol.len(), text.len());
             assert_eq!(symbol, text);
             assert_eq!(symbol, Symbol::from(text.to_owned()));
         }
