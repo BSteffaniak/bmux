@@ -13,6 +13,12 @@ pub fn bmux_binary() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_bmux"))
 }
 
+/// Short root for isolated process trees: `/tmp` unless `BMUX_TEST_TMP_ROOT` names
+/// another short directory, for volumes where `/tmp` can't hold a full run.
+fn test_tmp_root() -> PathBuf {
+    std::env::var_os("BMUX_TEST_TMP_ROOT").map_or_else(|| PathBuf::from("/tmp"), PathBuf::from)
+}
+
 #[derive(Debug)]
 pub struct TempDirGuard {
     path: PathBuf,
@@ -21,8 +27,8 @@ pub struct TempDirGuard {
 impl TempDirGuard {
     #[must_use]
     pub fn new(label: &str) -> Self {
-        let path = PathBuf::from("/tmp")
-            .join(format!("bmux-cp-{label}-{}", uuid::Uuid::new_v4().simple()));
+        let path =
+            test_tmp_root().join(format!("bmux-cp-{label}-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&path).expect("create isolated process root");
         Self { path }
     }

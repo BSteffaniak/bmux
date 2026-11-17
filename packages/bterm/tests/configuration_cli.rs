@@ -20,7 +20,10 @@ struct Inspection {
 impl Inspection {
     fn new() -> Self {
         #[cfg(unix)]
-        let temporary = Path::new("/tmp").canonicalize().unwrap();
+        let temporary = std::env::var_os("BMUX_TEST_TMP_ROOT")
+            .map_or_else(|| PathBuf::from("/tmp"), PathBuf::from)
+            .canonicalize()
+            .unwrap();
         #[cfg(not(unix))]
         let temporary = std::env::temp_dir().canonicalize().unwrap();
         let root = loop {

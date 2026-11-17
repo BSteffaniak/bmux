@@ -9,14 +9,15 @@
 # roots push Unix socket paths past the platform limit (104 bytes on macOS).
 #
 # One private per-user directory under /tmp, resolved to its real path, keeps
-# temporary paths short and symlink-free for the whole run. Tests still create
+# temporary paths short and symlink-free for the whole run. BMUX_TEST_TMP_ROOT
+# moves it to another short root when /tmp's volume is too small for a full run. Tests still create
 # their own unique directories inside it (tempfile), so concurrent runs share it
 # safely, and nothing accumulates beyond what tests fail to clean up.
 set -eu
 
 : "${NEXTEST_ENV:?nextest setup scripts receive NEXTEST_ENV}"
 
-dir="/tmp/bmux-test-$(id -u)"
+dir="${BMUX_TEST_TMP_ROOT:-/tmp}/bmux-test-$(id -u)"
 if [ ! -e "$dir" ]; then
     mkdir -m 700 "$dir" 2>/dev/null || true
 fi

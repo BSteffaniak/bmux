@@ -25,7 +25,13 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
-        let base = Path::new("/tmp").canonicalize().unwrap();
+        let base = std::env::var_os("BMUX_TEST_TMP_ROOT")
+            .map_or_else(
+                || std::path::PathBuf::from("/tmp"),
+                std::path::PathBuf::from,
+            )
+            .canonicalize()
+            .unwrap();
         let root = loop {
             let id = NEXT_ROOT.fetch_add(1, Ordering::Relaxed);
             let root = base.join(format!("bts-{}-{id}", std::process::id()));

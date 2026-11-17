@@ -62,7 +62,13 @@ impl Fixture {
 
     fn with_idle_grace(idle_grace_seconds: u64) -> Self {
         assert!((30..=120).contains(&idle_grace_seconds));
-        let base = Path::new("/tmp").canonicalize().unwrap();
+        let base = std::env::var_os("BMUX_TEST_TMP_ROOT")
+            .map_or_else(
+                || std::path::PathBuf::from("/tmp"),
+                std::path::PathBuf::from,
+            )
+            .canonicalize()
+            .unwrap();
         let root = loop {
             let id = NEXT_ROOT.fetch_add(1, Ordering::Relaxed);
             let root = base.join(format!("bta-{}-{id}", std::process::id()));
