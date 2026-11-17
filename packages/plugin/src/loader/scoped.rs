@@ -322,12 +322,7 @@ impl DefinitionArtifact {
         let ArtifactBackend::Dynamic(owner) = &mut artifact.backend else {
             return Err(failure("native load produced a static artifact"));
         };
-        if let Some(reason) = &owner.bundled_only {
-            return Err(PluginError::BundledOnlyPlugin {
-                plugin_id,
-                reason: reason.clone(),
-            });
-        }
+        refuse_bundled_only(&plugin_id, owner.bundled_only.as_deref())?;
         let install = install.ok_or_else(|| PluginError::DynamicRuntimeUnavailable {
             plugin_id: plugin_id.clone(),
             details: format!(
@@ -1042,6 +1037,13 @@ impl LoadedExecution {
     #[must_use]
     pub const fn verified_artifact(&self) -> Option<&VerifiedArtifact> {
         self.verified_artifact.as_ref()
+    }
+
+    /// Work the activation scope still owns: cooperative tasks, raw plug-rt
+    /// tasks (bundled or dynamic) and running blocking jobs. Diagnostics only.
+    #[must_use]
+    pub fn pending_background_work(&self) -> Vec<String> {
+        self.background.pending_names()
     }
 
     /// Close the actual activation task/callback tree and propagate cooperative
@@ -3321,6 +3323,17 @@ fn artifact_version(backend: &ExecutionBackend) -> u32 {
     }
 }
 
+/// A plugin that declared `bundled_only` needs host facilities plug-rt does
+/// not proxy into dynamic libraries; refuse it before any instance exists.
+fn refuse_bundled_only(plugin_id: &str, bundled_only: Option<&str>) -> Result<()> {
+    bundled_only.map_or(Ok(()), |reason| {
+        Err(PluginError::BundledOnlyPlugin {
+            plugin_id: plugin_id.to_string(),
+            reason: reason.to_string(),
+        })
+    })
+}
+
 fn validate_native_service_contracts(
     descriptors: &[bmux_plugin_sdk::definition::DeclaredServiceContract],
 ) -> Result<()> {
@@ -3619,6 +3632,20 @@ fn read_bounded(mut read: impl FnMut(&mut [u8], &mut usize) -> i32) -> Result<Op
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn bundled_only_declarations_refuse_dynamic_loading_with_a_typed_error() {
+        let declarations: bmux_plugin_sdk::definition::PluginDeclarations =
+            toml::from_str("bundled_only = \"opens host sockets directly\"\n").unwrap();
+        let error =
+            refuse_bundled_only("example.net", declarations.bundled_only.as_deref()).unwrap_err();
+        assert!(matches!(
+            &error,
+            PluginError::BundledOnlyPlugin { plugin_id, reason }
+                if plugin_id == "example.net" && reason == "opens host sockets directly"
+        ));
+        assert!(refuse_bundled_only("example.any", None).is_ok());
+    }
 
     #[tokio::test]
     async fn unverified_static_definition_has_no_artifact_receipt() {

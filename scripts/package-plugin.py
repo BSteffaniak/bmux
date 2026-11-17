@@ -164,6 +164,30 @@ def wrapper_target_dir(manifest: Path, cargo_target_dir: Path | None) -> Path:
     return (cargo_target_dir or manifest.parent / "target").resolve()
 
 
+DYNAMIC_MODE_CFG = "bmux_plugin_dylib"
+
+
+def dynamic_mode_environment(base: dict[str, str] | None = None) -> dict[str, str]:
+    """Select plug-rt dynamic mode (``--cfg bmux_plugin_dylib``) for a wrapper build.
+
+    Dynamic mode routes the plugin's spawns and timers through the host's
+    runtime table instead of Tokio. It is a compiler cfg, never a Cargo
+    feature, and is applied only to wrapper builds, which own their target
+    directory (see ``wrapper_target_dir``), so a workspace build can never
+    unify it into the host. Existing flags are preserved; Cargo prefers
+    ``CARGO_ENCODED_RUSTFLAGS`` over ``RUSTFLAGS`` when both are set.
+    """
+    environment = dict(os.environ if base is None else base)
+    encoded = environment.get("CARGO_ENCODED_RUSTFLAGS")
+    if encoded is not None:
+        flags = [flag for flag in encoded.split("\x1f") if flag]
+        environment["CARGO_ENCODED_RUSTFLAGS"] = "\x1f".join(flags + ["--cfg", DYNAMIC_MODE_CFG])
+    else:
+        flags = environment.get("RUSTFLAGS", "").strip()
+        environment["RUSTFLAGS"] = f"{flags} --cfg {DYNAMIC_MODE_CFG}".strip()
+    return environment
+
+
 def build(manifest: Path, release: bool, target: str | None,
           cargo_target_dir: Path | None = None) -> Path:
     """Return the actual cdylib emitted for the wrapper, not a dependency artifact."""
@@ -176,7 +200,8 @@ def build(manifest: Path, release: bool, target: str | None,
         command.extend(["--target", target])
     wrapper = tomllib.loads(manifest.read_text())["package"]["name"]
     artifacts = set()
-    with subprocess.Popen(command, stdout=subprocess.PIPE, text=True) as process:
+    with subprocess.Popen(command, stdout=subprocess.PIPE, text=True,
+                          env=dynamic_mode_environment()) as process:
         assert process.stdout is not None
         for line in process.stdout:
             message = json.loads(line)

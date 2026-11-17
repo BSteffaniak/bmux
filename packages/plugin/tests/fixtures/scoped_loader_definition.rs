@@ -3,14 +3,82 @@ use bmux_plugin_sdk::definition::{
     ComponentRole, PluginCallContext, PluginCreateContext, PluginDefinition, PluginFuture,
     PluginInstance, PluginMetadata, PluginResult,
 };
-use std::sync::{
-    Arc,
-    atomic::{AtomicUsize, Ordering},
+use bmux_plugin_sdk::rt;
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
+    time::Duration,
 };
+
+/// Records that a plugin future was dropped (completed, aborted or torn down).
+struct DropGuard(Arc<AtomicBool>);
+impl Drop for DropGuard {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+/// plug-rt behaviors shared by the bundled and dynamic fixture builds. The
+/// source is identical in both modes; only the packaging cfg differs.
+async fn runtime_behavior(contract: &str) -> Option<Vec<u8>> {
+    let reply = match contract {
+        "rt-timer" => {
+            let started = rt::time::Instant::now();
+            rt::time::sleep(Duration::from_millis(30)).await;
+            let timed_out =
+                rt::time::timeout(Duration::from_millis(5), std::future::pending::<()>())
+                    .await
+                    .is_err();
+            let mut ticks = rt::time::interval(Duration::from_millis(5));
+            ticks.tick().await;
+            ticks.tick().await;
+            let waited = started.elapsed() >= Duration::from_millis(35);
+            format!("{waited}:{timed_out}")
+        }
+        "rt-spawn" => {
+            let producer = rt::spawn_named("producer", async {
+                rt::time::sleep(Duration::from_millis(20)).await;
+                41
+            });
+            let consumer =
+                rt::spawn_named(
+                    "consumer",
+                    async move { producer.await.map(|value| value + 1) },
+                );
+            let spawned = consumer.await.ok().and_then(Result::ok).unwrap_or_default();
+            let blocking = rt::spawn_blocking(|| 6 * 7).await.unwrap_or_default();
+            format!("{spawned}:{blocking}")
+        }
+        "rt-abort" => {
+            let dropped = Arc::new(AtomicBool::new(false));
+            let guard = DropGuard(dropped.clone());
+            let task = rt::spawn_named("aborted", async move {
+                let _guard = guard;
+                std::future::pending::<()>().await;
+            });
+            rt::time::sleep(Duration::from_millis(5)).await;
+            task.abort();
+            let cancelled = task.await.err().is_some_and(|error| error.is_cancelled());
+            format!("{cancelled}:{}", dropped.load(Ordering::SeqCst))
+        }
+        "rt-panic" => {
+            let task = rt::spawn_named("panics", async { panic!("fixture task panic") });
+            task.await
+                .err()
+                .is_some_and(|error| error.is_panic())
+                .to_string()
+        }
+        _ => return None,
+    };
+    Some(reply.into_bytes())
+}
 
 struct Counter {
     scope: PluginCreateContext,
     mutations: AtomicUsize,
+    orphan_dropped: Arc<AtomicBool>,
 }
 impl PluginInstance for Counter {
     fn invoke(
@@ -36,7 +104,20 @@ impl PluginInstance for Counter {
         _payload: Vec<u8>,
     ) -> PluginFuture<'_, PluginResult<Vec<u8>>> {
         Box::pin(async move {
+            if let Some(reply) = runtime_behavior(&contract).await {
+                return Ok(reply);
+            }
             match contract.as_str() {
+                // A raw task left running: teardown must abort it and drop
+                // its future through the plugin.
+                "rt-orphan" => {
+                    let guard = DropGuard(self.orphan_dropped.clone());
+                    drop(rt::spawn_named("orphan", async move {
+                        let _guard = guard;
+                        std::future::pending::<()>().await;
+                    }));
+                    Ok(b"spawned".to_vec())
+                }
                 "scope" => Ok(serde_json::to_vec(&self.scope).unwrap()),
                 "mutate" => {
                     self.mutations.fetch_add(1, Ordering::SeqCst);
@@ -79,6 +160,7 @@ pub fn plugin_definition() -> PluginDefinition {
             Ok(Arc::new(Counter {
                 scope,
                 mutations: AtomicUsize::new(0),
+                orphan_dropped: Arc::new(AtomicBool::new(false)),
             }) as Arc<dyn PluginInstance>)
         },
     )

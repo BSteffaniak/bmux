@@ -210,6 +210,16 @@ class PublicationTests(unittest.TestCase):
 
 
 class GenerationTests(unittest.TestCase):
+    def test_wrapper_builds_select_dynamic_mode_by_cfg_not_feature(self):
+        plain = pack.dynamic_mode_environment({"RUSTFLAGS": "-C debuginfo=1"})
+        self.assertEqual(plain["RUSTFLAGS"], "-C debuginfo=1 --cfg bmux_plugin_dylib")
+        empty = pack.dynamic_mode_environment({})
+        self.assertEqual(empty["RUSTFLAGS"], "--cfg bmux_plugin_dylib")
+        encoded = pack.dynamic_mode_environment({"CARGO_ENCODED_RUSTFLAGS": "-Cdebuginfo=1"})
+        self.assertEqual(encoded["CARGO_ENCODED_RUSTFLAGS"].split("\x1f"),
+                         ["-Cdebuginfo=1", "--cfg", "bmux_plugin_dylib"])
+        self.assertNotIn("RUSTFLAGS", encoded)
+
     def test_component_features_come_from_implementation_metadata(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

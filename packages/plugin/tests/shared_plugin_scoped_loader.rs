@@ -2,7 +2,7 @@
 //! Dynamic cases are explicitly ignored until X1 supplies the native artifact.
 #[path = "fixtures/scoped_loader_definition.rs"]
 mod fixture;
-use bmux_plugin::{DefinitionArtifact, LoadedExecution};
+use bmux_plugin::{DefinitionArtifact, LoadedExecution, OperationSignal};
 use bmux_plugin_runtime::{PluginConcurrencyConfig, PluginRuntimeScopeId};
 use bmux_plugin_sdk::abi::{NativeOperation, NativeOutcome};
 use bmux_plugin_sdk::definition::{ComponentRole, PluginCreateContext};
@@ -292,4 +292,75 @@ fn creation_rejects_role_and_capability_mismatches_before_factory_effects() {
             .is_err()
     );
     assert_eq!(created.load(Ordering::SeqCst), 0);
+}
+
+/// Observe one operation through its waker only, counting polls. Progress
+/// must come from real wakes (timers, task completion), never repolling.
+async fn observe(execution: &LoadedExecution, id: u64) -> (NativeOutcome, usize) {
+    let signal = OperationSignal::new();
+    let waker = signal.waker();
+    let mut polls = 0;
+    loop {
+        polls += 1;
+        if let Poll::Ready(outcome) = execution
+            .poll(id, &mut Context::from_waker(&waker))
+            .unwrap()
+        {
+            return (outcome, polls);
+        }
+        signal.wait().await.unwrap();
+    }
+}
+async fn runtime_parity(artifact: DefinitionArtifact) {
+    let execution = activate(
+        &artifact,
+        PluginRuntimeScopeId::new(),
+        ComponentRole::Backend,
+    )
+    .await;
+    for (contract, expected) in [
+        ("rt-timer", "true:true"),
+        ("rt-spawn", "42:42"),
+        ("rt-abort", "true:true"),
+        ("rt-panic", "true"),
+    ] {
+        let id = begin(&execution, contract);
+        // Test guard only: a lost wake fails the test instead of hanging it.
+        let (outcome, polls) =
+            tokio::time::timeout(Duration::from_secs(10), observe(&execution, id))
+                .await
+                .expect("operation is woken");
+        assert!(
+            matches!(&outcome, NativeOutcome::Bytes(bytes) if bytes == expected.as_bytes()),
+            "{contract}: {outcome:?}"
+        );
+        // ~35 ms of timers at a 1-2 ms repoll would take dozens of polls.
+        assert!(polls <= 12, "{contract} observed {polls} polls");
+        execution.acknowledge(id).await.unwrap();
+    }
+    // A panicking plugin task leaves the instance serving calls.
+    assert_eq!(extension(&execution, "count").await, b"0");
+    assert_eq!(extension(&execution, "rt-orphan").await, b"spawned");
+    assert!(
+        execution
+            .pending_background_work()
+            .contains(&"orphan".to_string()),
+        "plug-rt task joined the activation scope"
+    );
+    retire(&execution).await;
+    // Teardown aborted the orphan and its future was dropped through the
+    // plugin before its scope registration settled.
+    assert!(execution.pending_background_work().is_empty());
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scoped_static_runtime_spawn_timer_cancel_panic_and_wake() {
+    runtime_parity(DefinitionArtifact::from_definition(
+        fixture::plugin_definition(),
+    ))
+    .await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires explicitly built native fixture; run during integration with BMUX_ACCEPTANCE_NATIVE_ARTIFACT"]
+async fn scoped_dynamic_runtime_spawn_timer_cancel_panic_and_wake() {
+    runtime_parity(dynamic_artifact()).await;
 }
